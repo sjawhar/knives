@@ -1,0 +1,211 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  # Attestation lets a consumer verify the archive's provenance against GitHub's
+  # trust root before it gets write access to their repositories.
+  id-token: write
+  attestations: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    name: Determine Version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.bump.outputs.version }}
+      should_release: ${{ steps.bump.outputs.should_release }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine version bump
+        id: bump
+        run: |
+          LATEST_TAG=$(git tag -l 'v*' --sort=-v:refname | head -1)
+
+          if [ -z "$LATEST_TAG" ]; then
+            # No tags yet — the first release uses the version already in Cargo.toml.
+            VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+            echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+            echo "First release: v$VERSION"
+            exit 0
+          fi
+
+          COMMITS=$(git log "${LATEST_TAG}..HEAD" --format='%s')
+
+          if [ -z "$COMMITS" ]; then
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            echo "No commits since $LATEST_TAG"
+            exit 0
+          fi
+
+          MAJOR=false
+          MINOR=false
+          PATCH=false
+
+          while IFS= read -r msg; do
+            if echo "$msg" | grep -qE '^[a-z]+(\(.+\))?!:' || echo "$msg" | grep -q 'BREAKING CHANGE'; then
+              MAJOR=true
+            elif echo "$msg" | grep -qE '^feat(\(.+\))?:'; then
+              MINOR=true
+            elif echo "$msg" | grep -qE '^(fix|refactor|perf)(\(.+\))?:'; then
+              PATCH=true
+            fi
+          done <<< "$COMMITS"
+
+          if ! $MAJOR && ! $MINOR && ! $PATCH; then
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            echo "No version-bumping commits since $LATEST_TAG"
+            exit 0
+          fi
+
+          CURRENT="${LATEST_TAG#v}"
+          IFS='.' read -r major minor patch <<< "$CURRENT"
+
+          if $MAJOR; then
+            major=$((major + 1)); minor=0; patch=0
+          elif $MINOR; then
+            minor=$((minor + 1)); patch=0
+          else
+            patch=$((patch + 1))
+          fi
+
+          VERSION="${major}.${minor}.${patch}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "should_release=true" >> "$GITHUB_OUTPUT"
+          echo "Bumping $CURRENT → $VERSION"
+
+  build:
+    name: Build
+    needs: version
+    if: needs.version.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-x86_64
+
+      - name: Set release version
+        run: sed -i '0,/^version = ".*"/s//version = "${{ needs.version.outputs.version }}"/' Cargo.toml
+
+      - run: cargo build --release
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          staging="knives-v${{ needs.version.outputs.version }}-linux-x86_64"
+          mkdir -p "$staging/bin" \
+                   "$staging/share/knives/opencode/plugins/lib" \
+                   "$staging/share/knives/opencode/skills"
+          install -m 0755 target/release/knives "$staging/bin/knives"
+          # knives.ts imports ./lib/internals.ts, so both ship, and internals stays
+          # in a subdirectory: OpenCode's plugin auto-discovery globs `*.ts` at the
+          # top level only, and it calls every export of anything it finds.
+          install -m 0644 plugin/knives.ts "$staging/share/knives/opencode/plugins/knives.ts"
+          install -m 0644 plugin/lib/internals.ts "$staging/share/knives/opencode/plugins/lib/internals.ts"
+          # Every skill, each in its own directory, which is how they are discovered.
+          cp -r skill/. "$staging/share/knives/opencode/skills/"
+          tar czf "${staging}.tar.gz" "$staging"
+
+      - name: Verify release archive
+        run: |
+          set -euo pipefail
+          staging="knives-v${{ needs.version.outputs.version }}-linux-x86_64"
+          archive="${staging}.tar.gz"
+          for artifact in \
+            "$staging/bin/knives" \
+            "$staging/share/knives/opencode/plugins/knives.ts" \
+            "$staging/share/knives/opencode/plugins/lib/internals.ts" \
+            "$staging/share/knives/opencode/skills/fork-work/SKILL.md" \
+            "$staging/share/knives/opencode/skills/using-knives/SKILL.md" \
+            "$staging/share/knives/opencode/skills/pr-preflight/SKILL.md"; do
+            if ! tar --list --gzip --file="$archive" | grep --fixed-strings --line-regexp -- "$artifact" >/dev/null; then
+              printf 'release archive is missing required artifact: %s\n' "$artifact" >&2
+              exit 1
+            fi
+          done
+
+      - name: Smoke-test the packaged binary
+        run: |
+          set -euo pipefail
+          staging="knives-v${{ needs.version.outputs.version }}-linux-x86_64"
+          "./$staging/bin/knives" --help >/dev/null
+          "./$staging/bin/knives" --version
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: knives-linux-x86_64
+          path: knives-*-linux-x86_64.tar.gz
+
+  release:
+    name: Create Release
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ssh-key: ${{ secrets.DEPLOY_KEY }}
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Bump version in repo
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.version.outputs.version }}"
+          # The plugin shells out to the binary, so both carry the same version
+          # and are released together.
+          sed -i '0,/^version = ".*"/s//version = "'"$VERSION"'"/' Cargo.toml
+          sed -i '0,/"version": ".*"/s//"version": "'"$VERSION"'"/' package.json
+          cargo update --workspace
+
+      - name: Commit and tag
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.version.outputs.version }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock package.json
+          # The first release takes its version from Cargo.toml, so the files can
+          # already be at VERSION and there is nothing to commit. Tag either way.
+          if git diff --cached --quiet; then
+            echo "version files already at v${VERSION}; tagging without a bump commit"
+          else
+            git commit -m "chore: release v${VERSION} [skip ci]"
+          fi
+          git tag "v${VERSION}"
+          git push origin main --tags
+
+      - uses: actions/download-artifact@v4
+
+      - name: Generate checksums
+        run: |
+          set -euo pipefail
+          (cd knives-linux-x86_64 && sha256sum ./*.tar.gz > ../SHA256SUMS)
+
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: knives-linux-x86_64/knives-*-linux-x86_64.tar.gz
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.version.outputs.version }}"
+          gh release create "v${VERSION}" \
+            --title "v${VERSION}" \
+            --generate-notes \
+            knives-linux-x86_64/knives-*-linux-x86_64.tar.gz \
+            SHA256SUMS

@@ -1,0 +1,921 @@
+[
+  {
+    "baseRefName": "main",
+    "headRefName": "bugfix/reasoning-effort-mapping",
+    "headRefOid": "90a0a53849ce6261dd2d8019f9ba51b71693b9b3",
+    "headRepositoryOwner": {
+      "id": "OWNER-ID",
+      "name": "Our Organization",
+      "login": "our-org"
+    },
+    "isDraft": true,
+    "mergeStateStatus": "BLOCKED",
+    "mergeable": "MERGEABLE",
+    "number": 4708,
+    "reviewDecision": "REVIEW_REQUIRED",
+    "state": "OPEN",
+    "statusCheckRollup": [
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-31T05:28:50Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30606913833/job/91080989924",
+        "name": "gate",
+        "startedAt": "2026-07-31T05:28:51Z",
+        "status": "COMPLETED",
+        "workflowName": "PR Gate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-31T05:29:34Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30606914682/job/91080990944",
+        "name": "ruff",
+        "startedAt": "2026-07-31T05:29:00Z",
+        "status": "COMPLETED",
+        "workflowName": "Build"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-31T05:29:12Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30606914676/job/91080990883",
+        "name": "entries-under-unreleased",
+        "startedAt": "2026-07-31T05:28:57Z",
+        "status": "COMPLETED",
+        "workflowName": "Changelog Lint"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-31T05:30:14Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30606914647/job/91080990784",
+        "name": "check-schema-and-types",
+        "startedAt": "2026-07-31T05:28:54Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate Embedded Viewer"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-31T05:30:40Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30606914682/job/91080990947",
+        "name": "mypy (3.10)",
+        "startedAt": "2026-07-31T05:28:53Z",
+        "status": "COMPLETED",
+        "workflowName": "Build"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-31T05:29:00Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30606914647/job/91080991220",
+        "name": "submodule-on-main",
+        "startedAt": "2026-07-31T05:28:54Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate Embedded Viewer"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-31T05:31:03Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30606914682/job/91080990931",
+        "name": "mypy (3.11)",
+        "startedAt": "2026-07-31T05:29:00Z",
+        "status": "COMPLETED",
+        "workflowName": "Build"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-31T05:29:40Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30606914682/job/91080990953",
+        "name": "pre-commit",
+        "startedAt": "2026-07-31T05:28:53Z",
+        "status": "COMPLETED",
+        "workflowName": "Build"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-31T05:30:00Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30606914647/job/91080990693",
+        "name": "viewer-tests",
+        "startedAt": "2026-07-31T05:28:55Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate Embedded Viewer"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-31T05:29:03Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30606914682/job/91080990945",
+        "name": "changes",
+        "startedAt": "2026-07-31T05:28:54Z",
+        "status": "COMPLETED",
+        "workflowName": "Build"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-31T05:29:27Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30606914647/job/91080990761",
+        "name": "dist-validation",
+        "startedAt": "2026-07-31T05:28:54Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate Embedded Viewer"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-31T05:29:02Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30606914682/job/91080990926",
+        "name": "detect-slow",
+        "startedAt": "2026-07-31T05:28:53Z",
+        "status": "COMPLETED",
+        "workflowName": "Build"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-31T05:29:56Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30606914682/job/91080991155",
+        "name": "Build & inspect the package.",
+        "startedAt": "2026-07-31T05:29:01Z",
+        "status": "COMPLETED",
+        "workflowName": "Build"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-31T05:35:44Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30606914682/job/91081015357",
+        "name": "docs",
+        "startedAt": "2026-07-31T05:29:10Z",
+        "status": "COMPLETED",
+        "workflowName": "Build"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-31T05:38:08Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30606914682/job/91081015356",
+        "name": "test (3.10)",
+        "startedAt": "2026-07-31T05:29:11Z",
+        "status": "COMPLETED",
+        "workflowName": "Build"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-31T05:37:15Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30606914682/job/91081015368",
+        "name": "test (3.11)",
+        "startedAt": "2026-07-31T05:29:10Z",
+        "status": "COMPLETED",
+        "workflowName": "Build"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-31T05:29:03Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30606914682/job/91081017328",
+        "name": "sandbox-tools-unit",
+        "startedAt": "2026-07-31T05:29:04Z",
+        "status": "COMPLETED",
+        "workflowName": "Build"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-31T05:29:02Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30606914682/job/91081029284",
+        "name": "check-version-bump",
+        "startedAt": "2026-07-31T05:29:09Z",
+        "status": "COMPLETED",
+        "workflowName": "Build"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-31T05:29:02Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30606914682/job/91081013227",
+        "name": "slow-tests",
+        "startedAt": "2026-07-31T05:29:02Z",
+        "status": "COMPLETED",
+        "workflowName": "Build"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-31T05:29:02Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30606914682/job/91081032133",
+        "name": "slow-tool-tests-dev",
+        "startedAt": "2026-07-31T05:29:10Z",
+        "status": "COMPLETED",
+        "workflowName": "Build"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-31T05:29:02Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30606914682/job/91081020814",
+        "name": "slow-tool-tests-release",
+        "startedAt": "2026-07-31T05:29:06Z",
+        "status": "COMPLETED",
+        "workflowName": "Build"
+      }
+    ],
+    "updatedAt": "2026-07-31T05:28:47Z",
+    "url": "https://forge.invalid/our-org/recorded-repo/pull/4708"
+  },
+  {
+    "baseRefName": "main",
+    "headRefName": "fix/bridge-client-named-eval-model",
+    "headRefOid": "6bbbd9d2b276aa13d73fe05ccbf8f839c2a4aa0d",
+    "headRepositoryOwner": {
+      "id": "OWNER-ID",
+      "name": "Our Organization",
+      "login": "our-org"
+    },
+    "isDraft": false,
+    "mergeStateStatus": "BLOCKED",
+    "mergeable": "MERGEABLE",
+    "number": 4706,
+    "reviewDecision": "REVIEW_REQUIRED",
+    "state": "OPEN",
+    "statusCheckRollup": [
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-31T00:48:43Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30594581593/job/91044057177",
+        "name": "ruff",
+        "startedAt": "2026-07-31T00:48:12Z",
+        "status": "COMPLETED",
+        "workflowName": "Build"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-31T00:48:20Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30594581578/job/91044056763",
+        "name": "entries-under-unreleased",
+        "startedAt": "2026-07-31T00:48:13Z",
+        "status": "COMPLETED",
+        "workflowName": "Changelog Lint"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-31T00:48:25Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30594581554/job/91044056823",
+        "name": "gate",
+        "startedAt": "2026-07-31T00:48:19Z",
+        "status": "COMPLETED",
+        "workflowName": "PR Gate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-31T00:49:16Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30594581602/job/91044057112",
+        "name": "check-schema-and-types",
+        "startedAt": "2026-07-31T00:48:12Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate Embedded Viewer"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-31T00:49:55Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30594581593/job/91044057156",
+        "name": "mypy (3.10)",
+        "startedAt": "2026-07-31T00:48:12Z",
+        "status": "COMPLETED",
+        "workflowName": "Build"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-31T00:48:18Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30594581602/job/91044057052",
+        "name": "submodule-on-main",
+        "startedAt": "2026-07-31T00:48:12Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate Embedded Viewer"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-31T00:49:41Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30594581593/job/91044057170",
+        "name": "mypy (3.11)",
+        "startedAt": "2026-07-31T00:48:13Z",
+        "status": "COMPLETED",
+        "workflowName": "Build"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-31T00:48:58Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30594581593/job/91044057185",
+        "name": "pre-commit",
+        "startedAt": "2026-07-31T00:48:12Z",
+        "status": "COMPLETED",
+        "workflowName": "Build"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-31T00:49:08Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30594581602/job/91044057030",
+        "name": "viewer-tests",
+        "startedAt": "2026-07-31T00:48:12Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate Embedded Viewer"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-31T00:48:19Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30594581593/job/91044057164",
+        "name": "changes",
+        "startedAt": "2026-07-31T00:48:13Z",
+        "status": "COMPLETED",
+        "workflowName": "Build"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-31T00:48:42Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30594581602/job/91044057072",
+        "name": "dist-validation",
+        "startedAt": "2026-07-31T00:48:13Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate Embedded Viewer"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-31T00:48:19Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30594581593/job/91044057172",
+        "name": "detect-slow",
+        "startedAt": "2026-07-31T00:48:12Z",
+        "status": "COMPLETED",
+        "workflowName": "Build"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-31T00:49:15Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30594581593/job/91044057162",
+        "name": "Build & inspect the package.",
+        "startedAt": "2026-07-31T00:48:19Z",
+        "status": "COMPLETED",
+        "workflowName": "Build"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-31T00:48:19Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30594581593/job/91044077514",
+        "name": "docs",
+        "startedAt": "2026-07-31T00:48:20Z",
+        "status": "COMPLETED",
+        "workflowName": "Build"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-31T00:55:54Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30594581593/job/91044077130",
+        "name": "test (3.10)",
+        "startedAt": "2026-07-31T00:48:28Z",
+        "status": "COMPLETED",
+        "workflowName": "Build"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-31T00:55:18Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30594581593/job/91044077147",
+        "name": "test (3.11)",
+        "startedAt": "2026-07-31T00:48:26Z",
+        "status": "COMPLETED",
+        "workflowName": "Build"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-31T00:48:19Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30594581593/job/91044077507",
+        "name": "sandbox-tools-unit",
+        "startedAt": "2026-07-31T00:48:20Z",
+        "status": "COMPLETED",
+        "workflowName": "Build"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-31T00:48:19Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30594581593/job/91044076567",
+        "name": "check-version-bump",
+        "startedAt": "2026-07-31T00:48:19Z",
+        "status": "COMPLETED",
+        "workflowName": "Build"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-31T00:48:19Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30594581593/job/91044076615",
+        "name": "slow-tests",
+        "startedAt": "2026-07-31T00:48:19Z",
+        "status": "COMPLETED",
+        "workflowName": "Build"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-31T00:48:19Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30594581593/job/91044077083",
+        "name": "slow-tool-tests-dev",
+        "startedAt": "2026-07-31T00:48:19Z",
+        "status": "COMPLETED",
+        "workflowName": "Build"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-31T00:48:19Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30594581593/job/91044077264",
+        "name": "slow-tool-tests-release",
+        "startedAt": "2026-07-31T00:48:19Z",
+        "status": "COMPLETED",
+        "workflowName": "Build"
+      }
+    ],
+    "updatedAt": "2026-07-31T00:48:24Z",
+    "url": "https://forge.invalid/our-org/recorded-repo/pull/4706"
+  },
+  {
+    "baseRefName": "main",
+    "headRefName": "fix/cache-ttl-1h-cost-4703",
+    "headRefOid": "9157ed472158eb3179a4c469b04358312072cb07",
+    "headRepositoryOwner": {
+      "id": "OWNER-ID",
+      "name": "Our Organization",
+      "login": "our-org"
+    },
+    "isDraft": false,
+    "mergeStateStatus": "BLOCKED",
+    "mergeable": "MERGEABLE",
+    "number": 4705,
+    "reviewDecision": "REVIEW_REQUIRED",
+    "state": "OPEN",
+    "statusCheckRollup": [
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-30T22:15:44Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30586472615/job/91018915046",
+        "name": "ruff",
+        "startedAt": "2026-07-30T22:15:12Z",
+        "status": "COMPLETED",
+        "workflowName": "Build"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-30T22:15:16Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30586472333/job/91018914532",
+        "name": "entries-under-unreleased",
+        "startedAt": "2026-07-30T22:15:11Z",
+        "status": "COMPLETED",
+        "workflowName": "Changelog Lint"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-30T22:15:23Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30586472277/job/91018914125",
+        "name": "gate",
+        "startedAt": "2026-07-30T22:15:12Z",
+        "status": "COMPLETED",
+        "workflowName": "PR Gate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-30T22:16:31Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30586472351/job/91018914311",
+        "name": "check-schema-and-types",
+        "startedAt": "2026-07-30T22:15:11Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate Embedded Viewer"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-30T22:16:48Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30586472615/job/91018915074",
+        "name": "mypy (3.10)",
+        "startedAt": "2026-07-30T22:15:11Z",
+        "status": "COMPLETED",
+        "workflowName": "Build"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-30T22:15:17Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30586472351/job/91018914421",
+        "name": "submodule-on-main",
+        "startedAt": "2026-07-30T22:15:11Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate Embedded Viewer"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-30T22:17:07Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30586472615/job/91018915115",
+        "name": "mypy (3.11)",
+        "startedAt": "2026-07-30T22:15:18Z",
+        "status": "COMPLETED",
+        "workflowName": "Build"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-30T22:16:07Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30586472615/job/91018915061",
+        "name": "pre-commit",
+        "startedAt": "2026-07-30T22:15:18Z",
+        "status": "COMPLETED",
+        "workflowName": "Build"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-30T22:16:17Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30586472351/job/91018914330",
+        "name": "viewer-tests",
+        "startedAt": "2026-07-30T22:15:18Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate Embedded Viewer"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-30T22:15:17Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30586472615/job/91018915070",
+        "name": "changes",
+        "startedAt": "2026-07-30T22:15:11Z",
+        "status": "COMPLETED",
+        "workflowName": "Build"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-30T22:15:49Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30586472351/job/91018914340",
+        "name": "dist-validation",
+        "startedAt": "2026-07-30T22:15:18Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate Embedded Viewer"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-30T22:15:18Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30586472615/job/91018915082",
+        "name": "detect-slow",
+        "startedAt": "2026-07-30T22:15:12Z",
+        "status": "COMPLETED",
+        "workflowName": "Build"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-30T22:16:04Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30586472615/job/91018915060",
+        "name": "Build & inspect the package.",
+        "startedAt": "2026-07-30T22:15:12Z",
+        "status": "COMPLETED",
+        "workflowName": "Build"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-30T22:15:17Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30586472615/job/91018941925",
+        "name": "docs",
+        "startedAt": "2026-07-30T22:15:18Z",
+        "status": "COMPLETED",
+        "workflowName": "Build"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-30T22:22:48Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30586472615/job/91018941364",
+        "name": "test (3.10)",
+        "startedAt": "2026-07-30T22:15:20Z",
+        "status": "COMPLETED",
+        "workflowName": "Build"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-30T22:22:54Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30586472615/job/91018941466",
+        "name": "test (3.11)",
+        "startedAt": "2026-07-30T22:15:19Z",
+        "status": "COMPLETED",
+        "workflowName": "Build"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-30T22:15:17Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30586472615/job/91018942016",
+        "name": "sandbox-tools-unit",
+        "startedAt": "2026-07-30T22:15:18Z",
+        "status": "COMPLETED",
+        "workflowName": "Build"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-30T22:15:18Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30586472615/job/91018944689",
+        "name": "check-version-bump",
+        "startedAt": "2026-07-30T22:15:19Z",
+        "status": "COMPLETED",
+        "workflowName": "Build"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-30T22:15:18Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30586472615/job/91018944305",
+        "name": "slow-tests",
+        "startedAt": "2026-07-30T22:15:18Z",
+        "status": "COMPLETED",
+        "workflowName": "Build"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-30T22:15:18Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30586472615/job/91018944679",
+        "name": "slow-tool-tests-dev",
+        "startedAt": "2026-07-30T22:15:19Z",
+        "status": "COMPLETED",
+        "workflowName": "Build"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-30T22:15:18Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30586472615/job/91018944502",
+        "name": "slow-tool-tests-release",
+        "startedAt": "2026-07-30T22:15:19Z",
+        "status": "COMPLETED",
+        "workflowName": "Build"
+      }
+    ],
+    "updatedAt": "2026-07-30T22:15:05Z",
+    "url": "https://forge.invalid/our-org/recorded-repo/pull/4705"
+  },
+  {
+    "baseRefName": "main",
+    "headRefName": "claude/issue-183-flaky-retry-skip",
+    "headRefOid": "dddeebac438ef17692185aa0a535560f4e4759a5",
+    "headRepositoryOwner": {
+      "id": "OWNER-ID",
+      "login": "our-org",
+      "name": "Our Organization"
+    },
+    "isDraft": false,
+    "mergeStateStatus": "UNKNOWN",
+    "mergeable": "UNKNOWN",
+    "number": 4702,
+    "reviewDecision": "APPROVED",
+    "state": "MERGED",
+    "statusCheckRollup": [
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-30T18:53:34Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30572347678/job/90972017349",
+        "name": "ruff",
+        "startedAt": "2026-07-30T18:52:55Z",
+        "status": "COMPLETED",
+        "workflowName": "Build"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-30T18:53:50Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30572347676/job/90971945379",
+        "name": "check-schema-and-types",
+        "startedAt": "2026-07-30T18:52:38Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate Embedded Viewer"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-30T18:54:45Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30572347678/job/90972017367",
+        "name": "mypy (3.10)",
+        "startedAt": "2026-07-30T18:52:56Z",
+        "status": "COMPLETED",
+        "workflowName": "Build"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-30T18:52:50Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30572347676/job/90971945515",
+        "name": "submodule-on-main",
+        "startedAt": "2026-07-30T18:52:44Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate Embedded Viewer"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-30T18:54:34Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30572347678/job/90972017386",
+        "name": "mypy (3.11)",
+        "startedAt": "2026-07-30T18:52:55Z",
+        "status": "COMPLETED",
+        "workflowName": "Build"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-30T18:53:59Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30572347678/job/90972017335",
+        "name": "pre-commit",
+        "startedAt": "2026-07-30T18:52:58Z",
+        "status": "COMPLETED",
+        "workflowName": "Build"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-30T18:53:48Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30572347676/job/90971945422",
+        "name": "viewer-tests",
+        "startedAt": "2026-07-30T18:52:46Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate Embedded Viewer"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-30T18:53:08Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30572347678/job/90972017340",
+        "name": "changes",
+        "startedAt": "2026-07-30T18:53:01Z",
+        "status": "COMPLETED",
+        "workflowName": "Build"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-30T18:53:06Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30572347676/job/90971945478",
+        "name": "dist-validation",
+        "startedAt": "2026-07-30T18:52:38Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate Embedded Viewer"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-30T18:53:09Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30572347678/job/90972017506",
+        "name": "detect-slow",
+        "startedAt": "2026-07-30T18:53:01Z",
+        "status": "COMPLETED",
+        "workflowName": "Build"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-30T18:53:39Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30572347678/job/90972017470",
+        "name": "Build & inspect the package.",
+        "startedAt": "2026-07-30T18:52:55Z",
+        "status": "COMPLETED",
+        "workflowName": "Build"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-30T18:53:08Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30572347678/job/90972085554",
+        "name": "docs",
+        "startedAt": "2026-07-30T18:53:08Z",
+        "status": "COMPLETED",
+        "workflowName": "Build"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-30T19:00:35Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30572347678/job/90972084123",
+        "name": "test (3.10)",
+        "startedAt": "2026-07-30T18:53:10Z",
+        "status": "COMPLETED",
+        "workflowName": "Build"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-30T19:01:22Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30572347678/job/90972084146",
+        "name": "test (3.11)",
+        "startedAt": "2026-07-30T18:53:10Z",
+        "status": "COMPLETED",
+        "workflowName": "Build"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-30T18:53:08Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30572347678/job/90972085050",
+        "name": "sandbox-tools-unit",
+        "startedAt": "2026-07-30T18:53:08Z",
+        "status": "COMPLETED",
+        "workflowName": "Build"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-30T18:53:09Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30572347678/job/90972090498",
+        "name": "check-version-bump",
+        "startedAt": "2026-07-30T18:53:09Z",
+        "status": "COMPLETED",
+        "workflowName": "Build"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-30T18:53:09Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30572347678/job/90972090346",
+        "name": "slow-tests",
+        "startedAt": "2026-07-30T18:53:09Z",
+        "status": "COMPLETED",
+        "workflowName": "Build"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-30T18:53:09Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30572347678/job/90972090665",
+        "name": "slow-tool-tests-dev",
+        "startedAt": "2026-07-30T18:53:09Z",
+        "status": "COMPLETED",
+        "workflowName": "Build"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-07-30T18:53:09Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://forge.invalid/our-org/recorded-repo/actions/runs/30572347678/job/90972091152",
+        "name": "slow-tool-tests-release",
+        "startedAt": "2026-07-30T18:53:09Z",
+        "status": "COMPLETED",
+        "workflowName": "Build"
+      }
+    ],
+    "updatedAt": "2026-07-30T19:01:25Z",
+    "url": "https://forge.invalid/our-org/recorded-repo/pull/4702"
+  },
+  {
+    "baseRefName": "main",
+    "headRefName": "fix-recover-trio-async-list",
+    "headRefOid": "a46251d02fb6f99c66edebe5746ad1e7ca8c1ebd",
+    "headRepositoryOwner": {
+      "id": "OWNER-ID",
+      "name": "Our Organization",
+      "login": "our-org"
+    },
+    "isDraft": false,
+    "mergeStateStatus": "DIRTY",
+    "mergeable": "CONFLICTING",
+    "number": 4634,
+    "reviewDecision": "CHANGES_REQUESTED",
+    "state": "CLOSED",
+    "statusCheckRollup": [],
+    "updatedAt": "2026-07-29T20:53:54Z",
+    "url": "https://forge.invalid/our-org/recorded-repo/pull/4634"
+  }
+]

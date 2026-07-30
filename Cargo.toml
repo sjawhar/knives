@@ -1,0 +1,80 @@
+[package]
+name = "knives"
+version = "0.1.0"
+description = "Multi-fork, multi-agent maintenance"
+edition = "2024"
+rust-version = "1.90"
+license = "MIT"
+
+[[bin]]
+name = "knives"
+path = "src/main.rs"
+
+[dependencies]
+# Upstream jj-lib from crates.io, deliberately: this tool uses only stable public
+# API (CommitId, Commit, StackedConfig, repo, SymbolResolver, UserSettings) and
+# needs nothing from any fork, so it should not depend on one.
+#
+# Pinned exactly rather than floating because jj-lib's API is explicitly unstable
+# between releases, and because the library has to agree with the installed `jj`
+# binary about the on-disk repository format.
+#
+# No `watchman` feature: that was only ever a workaround for an unreleased tree
+# where gitattributes.rs used tokio while tokio was optional. The published crate
+# does not carry that code, so the workaround is not needed here.
+jj-lib = "=0.43.0"
+
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+jiff = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+thiserror = "2"
+toml = "0.9"
+
+[dev-dependencies]
+insta = "1"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+debug = "line-tables-only"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+unused_must_use = "deny"
+elided_lifetimes_in_paths = "warn"
+non_ascii_idents = "deny"
+trivial_numeric_casts = "warn"
+unused_lifetimes = "warn"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+indexing_slicing = "deny"
+as_underscore = "deny"
+allow_attributes_without_reason = "warn"
+dbg_macro = "warn"
+
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+
+# Printing to stdout is this program's entire user interface, not a debugging
+# leftover. Rendering stays pure: every command builds a String and one call
+# site prints it.
+print_stdout = "allow"
+print_stderr = "allow"

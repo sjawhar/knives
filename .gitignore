@@ -1,0 +1,9 @@
+/target
+/.superpowers
+node_modules/
+
+# patch(1) failure artifacts. One was committed into src/ once: 596 lines of stale
+# source carrying the OPPOSITE semantics of the code under review, invisible to every
+# gate because the identity guard filters on extension.
+*.orig
+*.rej

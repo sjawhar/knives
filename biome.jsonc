@@ -1,0 +1,55 @@
+{
+  "$schema": "https://biomejs.dev/schemas/2.5.6/schema.json",
+  "vcs": {
+    "enabled": true,
+    "clientKind": "git",
+    "useIgnoreFile": true
+  },
+  "files": {
+    "ignoreUnknown": false
+  },
+  "formatter": {
+    "enabled": true,
+    "formatWithErrors": false,
+    "indentStyle": "space",
+    "indentWidth": 2,
+    "lineWidth": 100,
+    "lineEnding": "lf"
+  },
+  "linter": {
+    "enabled": true,
+    "rules": {
+      "preset": "recommended",
+      "complexity": {
+        // Off deliberately, and it must stay off: plugin/tsconfig.json sets
+        // `noPropertyAccessFromIndexSignature`, which *requires* bracket access
+        // for index signatures (`process.env["FORK_CONFIG_HOME"]`,
+        // `args["path"]`). Applying this rule's fix makes `tsc --noEmit` fail.
+        "useLiteralKeys": "off"
+      }
+    }
+  },
+  "javascript": {
+    "formatter": {
+      "quoteStyle": "double",
+      "semicolons": "always",
+      "trailingCommas": "es5",
+      "arrowParentheses": "always"
+    }
+  },
+  "overrides": [
+    {
+      // `noUncheckedIndexedAccess` makes every index read `T | undefined`.
+      // Asserting presence is the point of an assertion in a test: the test
+      // fails loudly either way, and the alternative is a guard clause per read.
+      "includes": ["**/*.test.ts"],
+      "linter": {
+        "rules": {
+          "style": {
+            "noNonNullAssertion": "off"
+          }
+        }
+      }
+    }
+  ]
+}
