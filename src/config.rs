@@ -433,13 +433,13 @@ release = "https://example.invalid/releases.git"
     fn a_trusted_entry_needs_only_a_path() {
         // Given: a repository we do not maintain and have no upstream for
         let dir = tempfile::tempdir().unwrap();
-        let text = "[trusted.agent-c]\npath = \"/tmp/agent-c\"\n";
+        let text = "[trusted.workbench]\npath = \"/tmp/workbench\"\n";
         // When: the registry is loaded
         let registry = load(&write(dir.path(), text)).unwrap();
         // Then: it parses, with no remotes demanded of it
         assert_eq!(
-            registry.trusted["agent-c"].path,
-            PathBuf::from("/tmp/agent-c")
+            registry.trusted["workbench"].path,
+            PathBuf::from("/tmp/workbench")
         );
     }
 
@@ -448,9 +448,9 @@ release = "https://example.invalid/releases.git"
         // The parse-time guarantee that a fork entry carries its remotes only holds
         // if trusted entries never reach the code that assumes it.
         let dir = tempfile::tempdir().unwrap();
-        let text = "[trusted.agent-c]\npath = \"/tmp/agent-c\"\n";
+        let text = "[trusted.workbench]\npath = \"/tmp/workbench\"\n";
         let registry = load(&write(dir.path(), text)).unwrap();
-        assert!(registry.get(&RepoName::new("agent-c")).is_none());
+        assert!(registry.get(&RepoName::new("workbench")).is_none());
         assert!(registry.repos.is_empty());
     }
 
@@ -458,11 +458,11 @@ release = "https://example.invalid/releases.git"
     fn a_trusted_tilde_path_resolves_like_a_fork_path() {
         unsafe { std::env::set_var("HOME", "/home/someone") };
         let dir = tempfile::tempdir().unwrap();
-        let text = "[trusted.agent-c]\npath = \"~/agent-c/default\"\n";
+        let text = "[trusted.workbench]\npath = \"~/workbench/default\"\n";
         let registry = load(&write(dir.path(), text)).unwrap();
         assert_eq!(
-            registry.trusted["agent-c"].path,
-            PathBuf::from("/home/someone/agent-c/default")
+            registry.trusted["workbench"].path,
+            PathBuf::from("/home/someone/workbench/default")
         );
     }
 
@@ -472,7 +472,7 @@ release = "https://example.invalid/releases.git"
         // serde ignored the section on read and `save` then wrote it away.
         let dir = tempfile::tempdir().unwrap();
         let text = "[repos.demo]\npath = \"/tmp/demo\"\nupstream = \"u\"\norigin = \"o\"\n\n\
-                    [trusted.agent-c]\npath = \"/tmp/agent-c\"\n";
+                    [trusted.workbench]\npath = \"/tmp/workbench\"\n";
         let path = write(dir.path(), text);
         let registry = load(&path).unwrap();
 
@@ -480,8 +480,8 @@ release = "https://example.invalid/releases.git"
 
         let reloaded = load(&path).unwrap();
         assert_eq!(
-            reloaded.trusted["agent-c"].path,
-            PathBuf::from("/tmp/agent-c")
+            reloaded.trusted["workbench"].path,
+            PathBuf::from("/tmp/workbench")
         );
         assert!(reloaded.repos.contains_key("demo"));
     }

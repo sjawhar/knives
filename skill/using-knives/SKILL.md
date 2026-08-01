@@ -138,10 +138,10 @@ path = "~/forks/scout/default"
 upstream = "https://forge.invalid/org/scout"
 origin = "https://forge.invalid/ours/scout"
 base = "main"                         # optional: branch upstream expects PRs against (defaults to main)
-consumers = ["~/agent-c/default"] # optional: who pins this repo's releases
+consumers = ["~/workbench/default"] # optional: who pins this repo's releases
 
-[trusted.agent-c]
-path = "~/agent-c/default"       # instructions read, not maintained
+[trusted.workbench]
+path = "~/workbench/default"       # instructions read, not maintained
 ```
 
 `[repos.*]` is what we maintain forks of, and a fork entry must carry its remotes: that is enforced when the file parses. `base` is optional and defaults to `main`, specifying the branch upstream expects pull requests against. A fork whose trunk is `develop` needs `base = "develop"` set, or every pull request triggers a `wrong-base` finding.

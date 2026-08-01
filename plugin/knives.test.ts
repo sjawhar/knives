@@ -450,10 +450,10 @@ test("reads guidance from a trusted repo that is not a fork", async () => {
   const temporary = await mkdtemp(join(tmpdir(), "knives-trusted-"));
   try {
     const configHome = join(temporary, "config");
-    const trusted = join(temporary, "agent-c");
+    const trusted = join(temporary, "workbench");
     await write(join(trusted, "AGENTS.md"), rootGuidance);
     await write(join(trusted, "src", "x.ts"), "export {}\n");
-    await write(join(configHome, "repos.toml"), `[trusted.agent-c]\npath = "${trusted}"\n`);
+    await write(join(configHome, "repos.toml"), `[trusted.workbench]\npath = "${trusted}"\n`);
 
     const output = await invoke(configHome, join(trusted, "src", "x.ts"));
 
@@ -470,14 +470,14 @@ test("a trusted section does not disable guidance for forks", async () => {
   try {
     const configHome = join(temporary, "config");
     const managed = join(temporary, "managed");
-    const trusted = join(temporary, "agent-c");
+    const trusted = join(temporary, "workbench");
     await write(join(managed, "AGENTS.md"), rootGuidance);
     await write(join(managed, "t.ts"), "export {}\n");
     await write(join(trusted, "AGENTS.md"), "TRUSTED_GUIDANCE_SENTINEL");
     await write(
       join(configHome, "repos.toml"),
       `[repos.managed]\npath = "${managed}"\nupstream = "u"\norigin = "o"\n\n` +
-        `[trusted.agent-c]\npath = "${trusted}"\n`
+        `[trusted.workbench]\npath = "${trusted}"\n`
     );
 
     const output = await invoke(configHome, join(managed, "t.ts"));
