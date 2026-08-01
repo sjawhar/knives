@@ -123,6 +123,26 @@ pub struct TrustedEntry {
     pub path: PathBuf,
 }
 
+/// Whether a guidance root comes from a maintained fork or trusted instructions.
+///
+/// The distinction survives resolution because callers may surface contribution
+/// guidance for either kind without treating a trusted repository as a fork.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuidanceRootKind {
+    /// A maintained fork declared under `[repos.*]`.
+    Managed,
+    /// A repository whose instructions are trusted under `[trusted.*]`.
+    Trusted,
+}
+
+/// A canonical repository root eligible to provide agent guidance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuidanceRoot {
+    pub name: String,
+    pub root: PathBuf,
+    pub kind: GuidanceRootKind,
+}
+
 impl TrustedEntry {
     /// Resolved exactly as `RepoEntry::resolved_path` resolves, and for the same
     /// reason: the CLI and the plugin must agree on which directory an entry names.
@@ -149,6 +169,28 @@ impl Registry {
 
     pub fn is_empty(&self) -> bool {
         self.repos.is_empty()
+    }
+
+    /// Return the existing registry entries that may provide guidance.
+    ///
+    /// Resolve and skip each entry independently: a moved checkout must not disable
+    /// guidance for the remaining registered repositories.
+    pub fn guidance_roots(&self) -> Vec<GuidanceRoot> {
+        let managed = self.repos.iter().filter_map(|(name, entry)| {
+            entry.path.canonicalize().ok().map(|root| GuidanceRoot {
+                name: name.clone(),
+                root,
+                kind: GuidanceRootKind::Managed,
+            })
+        });
+        let trusted = self.trusted.iter().filter_map(|(name, entry)| {
+            entry.path.canonicalize().ok().map(|root| GuidanceRoot {
+                name: name.clone(),
+                root,
+                kind: GuidanceRootKind::Trusted,
+            })
+        });
+        managed.chain(trusted).collect()
     }
 
     /// The managed repo that contains `path`, if any.
@@ -452,6 +494,63 @@ release = "https://example.invalid/releases.git"
         let registry = load(&write(dir.path(), text)).unwrap();
         assert!(registry.get(&RepoName::new("workbench")).is_none());
         assert!(registry.repos.is_empty());
+    }
+
+    #[test]
+    fn guidance_roots_preserve_managed_and_trusted_kinds() {
+        // Given: one managed fork and one trusted repository that both exist.
+        let dir = tempfile::tempdir().unwrap();
+        let managed = dir.path().join("managed");
+        let trusted = dir.path().join("trusted");
+        std::fs::create_dir_all(&managed).unwrap();
+        std::fs::create_dir_all(&trusted).unwrap();
+        let text = format!(
+            "[repos.managed]\npath = \"{}\"\nupstream = \"u\"\norigin = \"o\"\n\n\
+             [trusted.workbench]\npath = \"{}\"\n",
+            managed.display(),
+            trusted.display()
+        );
+        let registry = load(&write(dir.path(), &text)).unwrap();
+
+        // When: their guidance roots are collected.
+        let roots = registry.guidance_roots();
+
+        // Then: the roots retain their distinct registry roles.
+        assert_eq!(roots.len(), 2);
+        assert!(roots.iter().any(|root| {
+            root.name == "managed"
+                && root.root == managed.canonicalize().unwrap()
+                && root.kind == GuidanceRootKind::Managed
+        }));
+        assert!(roots.iter().any(|root| {
+            root.name == "workbench"
+                && root.root == trusted.canonicalize().unwrap()
+                && root.kind == GuidanceRootKind::Trusted
+        }));
+    }
+
+    #[test]
+    fn guidance_roots_skip_an_unresolvable_entry_without_dropping_others() {
+        // Given: one existing managed fork and one trusted checkout that was moved away.
+        let dir = tempfile::tempdir().unwrap();
+        let managed = dir.path().join("managed");
+        std::fs::create_dir_all(&managed).unwrap();
+        let missing = dir.path().join("missing");
+        let text = format!(
+            "[repos.managed]\npath = \"{}\"\nupstream = \"u\"\norigin = \"o\"\n\n\
+             [trusted.moved]\npath = \"{}\"\n",
+            managed.display(),
+            missing.display()
+        );
+        let registry = load(&write(dir.path(), &text)).unwrap();
+
+        // When: roots are resolved from the registry.
+        let roots = registry.guidance_roots();
+
+        // Then: the moved entry is skipped without disabling the existing one.
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].name, "managed");
+        assert_eq!(roots[0].kind, GuidanceRootKind::Managed);
     }
 
     #[test]
