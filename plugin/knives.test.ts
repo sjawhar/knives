@@ -514,6 +514,34 @@ test("stays out of the prompt that carries no session", async () => {
   });
 });
 
+test("two instances relying on the default record do not inject the same repo twice", async () => {
+  // The sibling test above passes a shared Set in explicitly, so it proves the dedupe
+  // MECHANISM and never the WIRING. Production takes the default, and a module-level Set is
+  // per module load rather than per process: each plugin instance can arrive through its own
+  // import, hold its own empty record, and deduplicate nothing. A field report measured
+  // exactly that after the first fix — guidance repeating across five repositories in one
+  // session, ~35KB each time. This test omits the argument, so it fails if the default record
+  // is not genuinely process-wide.
+  await withFixture(async ({ configHome, target }) => {
+    const first = createKnivesHooks(configHome);
+    const second = createKnivesHooks(configHome);
+    const call = {
+      tool: "read",
+      sessionID: `default-record-${Math.random()}`,
+      callID: "c",
+      args: { path: target },
+    };
+
+    const a = toolOutput();
+    const b = toolOutput();
+    await first["tool.execute.after"](call, a);
+    await second["tool.execute.after"](call, b);
+
+    expect(a.output).toContain(rootGuidance);
+    expect(b.output).toBe("tool output");
+  });
+});
+
 test("two plugin instances in one session do not inject the same repo twice", async () => {
   // OpenCode builds plugin state per instance, keyed by directory, so an agent working
   // across several repositories gets several instances of this plugin. Holding the record

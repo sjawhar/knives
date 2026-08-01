@@ -503,7 +503,24 @@ async function ownerFor(
 /// went into one session three times, which for a 35KB file is most of a context window
 /// spent on repetition. Keyed by session and repository, so a genuinely new session still
 /// gets its guidance.
-const injected = new Set<string>();
+///
+/// Hung off `globalThis` rather than left as a module-level binding, because a module-level
+/// `Set` is per module LOAD, not per process. Each plugin instance can arrive through its
+/// own import of this file, and then every instance holds its own empty record and
+/// deduplicates nothing — which is what a field report measured after the first fix: the
+/// guidance arriving repeatedly across five repositories in one session, ~35KB each time.
+/// The unit test that covered this passed a shared `Set` in explicitly, so it proved the
+/// mechanism and never the wiring.
+const sharedRecordKey = "__knives_injected_repos__";
+
+function processWideRecord(): Set<string> {
+  const carrier = globalThis as { [sharedRecordKey]?: Set<string> };
+  const existing = carrier[sharedRecordKey];
+  if (existing !== undefined) return existing;
+  const created = new Set<string>();
+  carrier[sharedRecordKey] = created;
+  return created;
+}
 
 /// The skills that ship beside this plugin.
 ///
@@ -527,7 +544,7 @@ export function createKnivesHooks(
   environment: Readonly<Record<string, string | undefined>> = process.env,
   sessionDirectory?: string,
   /// Overridable so tests do not share one process-wide record.
-  sent: Set<string> = injected,
+  sent: Set<string> = processWideRecord(),
   options: KnivesOptions = { notice: true, guidance: true, owner: true, skills: true }
 ): KnivesHooks {
   return {
