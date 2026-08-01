@@ -257,6 +257,14 @@ fn git<const N: usize>(directory: &Path, args: [&str; N]) {
         .env("GIT_AUTHOR_EMAIL", "knives-lab@example.test")
         .env("GIT_COMMITTER_NAME", "Knives Lab")
         .env("GIT_COMMITTER_EMAIL", "knives-lab@example.test")
+        // Pin the initial branch name instead of inheriting `init.defaultBranch` from
+        // whoever is running the tests. Without this the lab's branch is `main` on a
+        // machine that configures it and `master` on one that does not, so every push of
+        // `main` fails with "src refspec main does not match any" — green locally, red in
+        // CI, which is exactly the class of difference a test harness must not have.
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "init.defaultBranch")
+        .env("GIT_CONFIG_VALUE_0", "main")
         .status()
         .expect("run git");
     assert!(status.success(), "git command failed");
