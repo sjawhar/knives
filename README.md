@@ -31,7 +31,7 @@ libcore
 The first branch there reads as finished from every angle a person checks: approved, pushed,
 nothing left to write. It is a draft, its CI is red, and the forge cannot merge it.
 
-## It reports facts and does not advise
+## No suggested fixes
 
 Every finding used to carry a suggested fix. The suggestions were wrong often enough to be a
 liability: drop a branch that had never landed, open a pull request that already existed,
