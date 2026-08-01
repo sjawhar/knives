@@ -503,6 +503,10 @@ Response (stdout, one JSON object):
 - [ ] **Step 2: Create the plugin files.**
 
 `.claude-plugin/plugin.json`:
+
+Replace the placeholder with the real repository URL when creating this metadata file;
+`.claude-plugin/` is exempt from the identity scan.
+
 ```json
 {
   "name": "knives",

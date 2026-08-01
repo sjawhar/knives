@@ -12,7 +12,9 @@ const PRUNE_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepoFlags {
+    #[serde(default)]
     pub noticed: bool,
+    #[serde(default)]
     pub guided: bool,
 }
 
@@ -29,7 +31,8 @@ pub struct SessionState {
 
 impl SessionState {
     pub fn load(home: &Path, harness: &str, session_id: &str) -> Self {
-        Self::load_path(&state_path(home, harness, session_id))
+        let directory = session_directory(home);
+        Self::load_path(&state_path(&directory, harness, session_id))
     }
 
     pub fn repo(&self, root: &Path) -> RepoFlags {
@@ -42,12 +45,13 @@ impl SessionState {
         session_id: &str,
         apply: impl FnOnce(&mut Self),
     ) -> anyhow::Result<Self> {
-        let path = state_path(home, harness, session_id);
+        let directory = session_directory(home);
+        let path = state_path(&directory, harness, session_id);
         let _lock = StoreLock::acquire(&path)?;
         let mut state = Self::load_path(&path);
         apply(&mut state);
-        state.persist(&path)?;
-        prune_stale_siblings(path.parent().unwrap_or(home))?;
+        state.persist(&directory, &path)?;
+        prune_stale_siblings(&directory);
         Ok(state)
     }
 
@@ -62,7 +66,8 @@ impl SessionState {
     }
 
     pub fn delete(home: &Path, harness: &str, session_id: &str) {
-        let _ = std::fs::remove_file(state_path(home, harness, session_id));
+        let directory = session_directory(home);
+        let _ = std::fs::remove_file(state_path(&directory, harness, session_id));
     }
 
     fn load_path(path: &Path) -> Self {
@@ -72,8 +77,7 @@ impl SessionState {
             .map_or_else(Self::default, |disk| Self { repos: disk.repos })
     }
 
-    fn persist(&self, path: &Path) -> anyhow::Result<()> {
-        let directory = path.parent().unwrap_or_else(|| Path::new("."));
+    fn persist(&self, directory: &Path, path: &Path) -> anyhow::Result<()> {
         std::fs::create_dir_all(directory)?;
         let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
         serde_json::to_writer(
@@ -88,8 +92,12 @@ impl SessionState {
     }
 }
 
-fn state_path(home: &Path, harness: &str, session_id: &str) -> PathBuf {
-    home.join(SESSIONS_DIRECTORY).join(format!(
+fn session_directory(home: &Path) -> PathBuf {
+    home.join(SESSIONS_DIRECTORY)
+}
+
+fn state_path(directory: &Path, harness: &str, session_id: &str) -> PathBuf {
+    directory.join(format!(
         "{harness}-{}.json",
         sanitize_session_id(session_id)
     ))
@@ -105,16 +113,22 @@ fn sanitize_session_id(session_id: &str) -> String {
         .collect()
 }
 
-fn prune_stale_siblings(directory: &Path) -> anyhow::Result<()> {
+fn prune_stale_siblings(directory: &Path) {
     let stale_before = SystemTime::now() - PRUNE_AGE;
-    for entry in std::fs::read_dir(directory)? {
-        let entry = entry?;
-        let metadata = entry.metadata()?;
-        if metadata.is_file() && metadata.modified()? < stale_before {
-            std::fs::remove_file(entry.path())?;
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(metadata) = std::fs::metadata(entry.path()) else {
+            continue;
+        };
+        let Ok(modified) = metadata.modified() else {
+            continue;
+        };
+        if metadata.is_file() && modified < stale_before {
+            let _ = std::fs::remove_file(entry.path());
         }
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -249,3 +263,7 @@ mod tests {
         assert!(!stale.exists());
     }
 }
+
+#[cfg(test)]
+#[path = "state_regression_tests.rs"]
+mod regression_tests;
