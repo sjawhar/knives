@@ -19,6 +19,7 @@ pub mod commands;
 pub mod config;
 pub mod detect;
 pub mod forge;
+pub mod hook;
 pub mod ids;
 pub mod jj;
 pub mod pins;

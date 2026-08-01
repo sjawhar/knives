@@ -510,7 +510,7 @@ Response (stdout, one JSON object):
   "version": "0.1.2",
   "description": "Fork maintenance status across many repos: announces knives-managed repositories and their contribution guidance in your session.",
   "author": { "name": "Sami Jawhar" },
-  "repository": "https://github.com/sjawhar/knives",
+  "repository": "<marketplace repository URL>",
   "license": "MIT"
 }
 ```
