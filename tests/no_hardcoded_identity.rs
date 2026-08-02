@@ -17,7 +17,7 @@
 //! needles are assembled from fragments for the same reason.
 //!
 //! Scope is deliberately the shipped source and guidance: `src/`, `plugin/`,
-//! `docs/`, and `skill/`. It is NOT the build manifest or the package metadata.
+//! `docs/`, and `skills/`. It is NOT the build manifest or the package metadata.
 //! `Cargo.toml` pins a library version and `package.json` records where this
 //! tool is published; both are toolchain facts rather than subject matter,
 //! saying what we link and where we ship, not which repositories this tool
@@ -46,7 +46,7 @@ fn scanned_roots() -> Vec<PathBuf> {
         base.join("src"),
         base.join("plugin"),
         base.join("docs"),
-        base.join("skill"),
+        base.join("skills"),
     ]
     .into_iter()
     .filter(|path| path.exists())

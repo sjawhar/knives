@@ -525,7 +525,7 @@ function processWideRecord(): Set<string> {
 /// The skills that ship beside this plugin.
 ///
 /// Two layouts, because the same file runs from both: the working copy, where this module
-/// sits at `plugin/lib/` and the skills at `skill/`, and the release archive, where it
+/// sits at `plugin/lib/` and the skills at `skills/`, and the release archive, where it
 /// sits at `opencode/plugins/lib/` and the skills at `opencode/skills/`. Whichever exists
 /// is the one in use.
 async function bundledSkillDirectory(): Promise<string | null> {

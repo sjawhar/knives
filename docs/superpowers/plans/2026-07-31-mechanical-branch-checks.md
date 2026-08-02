@@ -1759,12 +1759,12 @@ Do not create a second commit.
 ### Task 8: Update the reference documents
 
 **Files:**
-- Modify: `skill/using-knives/SKILL.md`
+- Modify: `skills/using-knives/SKILL.md`
 - Modify: `docs/design.md`
 
 - [ ] **Step 1: Document every new token and finding**
 
-In `skill/using-knives/SKILL.md`, under `knives status`, extend the branch-line description with: `draft`, `checks-failing`, `no-checks`, `unpushed-commits`, `behind-base`, `CONFLICTING`. Add to the findings list: `checks-failing`, `wrong-base`, `carried-elsewhere`, `branch-overlap`. State plainly that `no-checks` and an empty rollup are not failures, and that `carried-elsewhere` says where a tip was found and nothing about what it means.
+In `skills/using-knives/SKILL.md`, under `knives status`, extend the branch-line description with: `draft`, `checks-failing`, `no-checks`, `unpushed-commits`, `behind-base`, `CONFLICTING`. Add to the findings list: `checks-failing`, `wrong-base`, `carried-elsewhere`, `branch-overlap`. State plainly that `no-checks` and an empty rollup are not failures, and that `carried-elsewhere` says where a tip was found and nothing about what it means.
 
 - [ ] **Step 2: Record the checks in the design doc**
 
@@ -1772,7 +1772,7 @@ In `docs/design.md`, under `## Detection rules`, add one line per new check nami
 
 - [ ] **Step 3: Confirm no stale command names**
 
-Run: `grep -rnE 'knives (cut|wip|claim|release-claim) ' docs/ skill/ | grep -v release`
+Run: `grep -rnE 'knives (cut|wip|claim|release-claim) ' docs/ skills/ | grep -v release`
 Expected: no output.
 
 - [ ] **Step 4: Verify the tree is clean and record the work**

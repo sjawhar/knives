@@ -4,7 +4,7 @@
 
 **Goal:** Make the knives guidance/notice behavior and the three skills available to Claude Code users, with one implementation of the logic living in the Rust binary and thin per-harness adapters.
 
-**Architecture:** The behavior currently implemented in the OpenCode TypeScript plugin (announce a managed repo on first touch, inject its contribution guidance, dedup per session, reset on compaction) moves into the binary as `knives hook <harness>`: a subcommand that reads one hook event as JSON on stdin and writes the harness's response JSON on stdout. Claude Code calls it directly from a plugin-bundled `hooks/hooks.json` (Shape A: shell hook). The OpenCode plugin becomes a shim that spawns the same subcommand (Shape B: in-process adapter around the same core). Skills are already harness-agnostic files; they move from `skill/` to `skills/` so Claude Code's plugin auto-discovery finds them, and the repo gains `.claude-plugin/plugin.json` + `marketplace.json` so it is installable with `/plugin marketplace add sjawhar/knives`.
+**Architecture:** The behavior currently implemented in the OpenCode TypeScript plugin (announce a managed repo on first touch, inject its contribution guidance, dedup per session, reset on compaction) moves into the binary as `knives hook <harness>`: a subcommand that reads one hook event as JSON on stdin and writes the harness's response JSON on stdout. Claude Code calls it directly from a plugin-bundled `hooks/hooks.json` (Shape A: shell hook). The OpenCode plugin becomes a shim that spawns the same subcommand (Shape B: in-process adapter around the same core). Skills are harness-agnostic files at `skills/`, where Claude Code's plugin auto-discovery finds them, and the repo gains `.claude-plugin/plugin.json` + `marketplace.json` so it is installable with `/plugin marketplace add sjawhar/knives`.
 
 **Tech Stack:** Rust (serde_json, existing config.rs/store.rs), Claude Code plugin format (hooks.json, SKILL.md auto-discovery), Bun/TypeScript for the OpenCode shim.
 
@@ -577,16 +577,16 @@ Expected: the reply quotes the knives notice (and, for a foreign repo, guidance)
 
 ---
 
-### Task 7: `skill/` → `skills/` rename
+### Task 7: `skills/` discovery layout
 
 Claude Code auto-discovers `skills/<name>/SKILL.md` at the plugin root; OpenCode reads whatever directory the plugin's `config` hook names (it already probes both spellings). **This task runs BEFORE Task 6** so the first live plugin verification includes the skills.
 
 **Files:**
-- Rename: `skill/` → `skills/` (jj tracks moves automatically; `jj status` will show the rename)
-- Modify: `.github/workflows/release.yml` line 118 (`cp -r skill/.` → `cp -r skills/.`)
-- Modify: `package.json` `files` array (`"skill/"` → `"skills/"`)
-- Modify: `tests/no_hardcoded_identity.rs` scanned roots (`skill/` → `skills/`)
-- Modify: any other references — find them all: `rg -n '\bskill/' --hidden -g '!.jj' -g '!target'` and fix every hit (README.md, docs/design.md, skill cross-references, plugin comments at internals.ts lines 527–530).
+- Directory: `skills/` (jj tracks moves automatically; `jj status` will show the rename)
+- Modify: `.github/workflows/release.yml` line 118 (`cp -r skills/.`)
+- Modify: `package.json` `files` array (`"skills/"`)
+- Modify: `tests/no_hardcoded_identity.rs` scanned roots (`skills/`)
+- Modify: any other stale singular-directory references — find and fix every hit with `rg -n '\bskill[\/]' --hidden -g '!.jj' -g '!target'` (README.md, docs/design.md, skill cross-references, plugin comments at internals.ts lines 527–530).
 
 **Interfaces:**
 - Consumes: nothing. Produces: the layout Task 6's auto-discovery and Task 9's docs assume.

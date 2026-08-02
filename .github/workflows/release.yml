@@ -115,7 +115,7 @@ jobs:
           install -m 0644 plugin/knives.ts "$staging/share/knives/opencode/plugins/knives.ts"
           install -m 0644 plugin/lib/internals.ts "$staging/share/knives/opencode/plugins/lib/internals.ts"
           # Every skill, each in its own directory, which is how they are discovered.
-          cp -r skill/. "$staging/share/knives/opencode/skills/"
+          cp -r skills/. "$staging/share/knives/opencode/skills/"
           tar czf "${staging}.tar.gz" "$staging"
 
       - name: Verify release archive
