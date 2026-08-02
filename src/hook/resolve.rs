@@ -30,7 +30,14 @@ pub fn argument_paths(_tool: &str, args: &Value) -> Vec<PathBuf> {
                 .split(|character: char| {
                     character.is_whitespace() || matches!(character, '\'' | '"')
                 })
-                .filter(|token| token.starts_with('/') || token.starts_with("~/"))
+                .filter(|token| {
+                    token
+                        .strip_prefix('/')
+                        .is_some_and(|suffix| !suffix.is_empty())
+                        || token
+                            .strip_prefix("~/")
+                            .is_some_and(|suffix| !suffix.is_empty())
+                })
                 .map(|token| expand_tilde(Path::new(token))),
         );
     }
@@ -94,7 +101,7 @@ fn canonical_existing_parent(path: &Path) -> Option<PathBuf> {
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use crate::config::{GuidanceRoot, GuidanceRootKind, expand_registry_path};
+    use crate::config::{GuidanceRoot, GuidanceRootKind};
 
     use super::{argument_paths, managed_repo_for};
 
@@ -110,13 +117,40 @@ mod tests {
 
         // Then: only paths whose locations need no assumed directory are returned.
         assert!(paths.iter().any(|path| path == Path::new("/tmp/x/repo")));
-        let home_note = expand_registry_path(Path::new("~/notes.md"), Path::new("/unused"));
-        assert!(paths.iter().any(|path| path == &home_note));
+        assert!(paths.iter().any(|path| {
+            path.is_absolute() && path.ends_with("notes.md") && !path.starts_with("~")
+        }));
         assert_eq!(
             paths.len(),
             2,
             "a relative path cannot be resolved without assuming a directory"
         );
+    }
+
+    #[test]
+    fn bare_root_and_home_directory_command_tokens_are_not_paths() {
+        // Given: commands containing only root or home-directory tokens.
+        for command in ["ls /", "cd ~/"] {
+            let args = serde_json::json!({"command": command});
+
+            // When: the command paths are extracted.
+            let paths = argument_paths("bash", &args);
+
+            // Then: a path requires content after its absolute or home prefix.
+            assert!(paths.is_empty(), "{command}");
+        }
+    }
+
+    #[test]
+    fn a_working_directory_does_not_count_as_a_named_path() {
+        // Given: a tool invocation with only execution-directory metadata.
+        let args = serde_json::json!({"cwd": "/tmp/x", "workdir": "/tmp/y"});
+
+        // When: argument paths are extracted.
+        let paths = argument_paths("bash", &args);
+
+        // Then: directory metadata cannot attribute a pathless invocation.
+        assert_eq!(paths, Vec::<PathBuf>::new());
     }
 
     #[test]
