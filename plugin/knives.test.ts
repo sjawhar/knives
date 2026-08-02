@@ -1,20 +1,22 @@
 import { expect, test } from "bun:test";
 import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join } from "node:path";
 
+import * as knivesEntry from "./knives.ts";
 import {
   bundledSkillDirectory,
   createKnivesHooks,
   readOptions,
   resolveBinary,
-  siblingBinary,
 } from "./lib/internals.ts";
 
 // allow: SIZE_OK — Task 8 constrains both fake and real integration layers to this test file.
-const realBinary = process.env["KNIVES_BIN"];
+const realBinary = process.env["KNIVES_BIN"] ?? "";
 const originalEnvironment = { ...process.env };
 type Repository = { readonly home: string; readonly root: string; readonly file: string };
+const mockRecordGuard =
+  'case "$MOCK_RECORD" in\n  /*) ;;\n  *) printf \'%s\\n\' "MOCK_RECORD must be an absolute path" >&2; exit 1 ;;\nesac\n';
 
 async function write(path: string, contents: string): Promise<void> {
   await mkdir(dirname(path), { recursive: true });
@@ -49,7 +51,7 @@ async function mockBinary(): Promise<{ readonly binary: string; readonly record:
   const record = join(directory, "requests");
   await write(
     binary,
-    '#!/bin/sh\nprintf \'%s\\n\' "$@" >> "$MOCK_RECORD.args"\ninput=$(cat)\nprintf \'%s\\n\' "$input" >> "$MOCK_RECORD.stdin"\nprintf \'%s\' "$MOCK_RESPONSE"\n'
+    `#!/bin/sh\n${mockRecordGuard}printf '%s\\n' "$@" >> "$MOCK_RECORD.args"\ninput=$(cat)\nprintf '%s\\n' "$input" >> "$MOCK_RECORD.stdin"\nprintf '%s' "$MOCK_RESPONSE"\n`
   );
   await chmod(binary, 0o755);
   return { binary, record };
@@ -61,10 +63,18 @@ async function oldBinary(): Promise<{ readonly binary: string; readonly record: 
   const record = join(directory, "requests");
   await write(
     binary,
-    "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"$MOCK_RECORD.args\"\ncat >/dev/null\nprintf '%s\\n' \"error: unrecognized subcommand 'hook'\" >&2\nprintf '%s\\n' \"CHILD_STDERR_MUST_NOT_LEAK\" >&2\nexit 2\n"
+    `#!/bin/sh\n${mockRecordGuard}printf '%s\\n' "$@" >> "$MOCK_RECORD.args"\ncat >/dev/null\nprintf '%s\\n' "error: unrecognized subcommand 'hook'" >&2\nprintf '%s\\n' "CHILD_STDERR_MUST_NOT_LEAK" >&2\nexit 2\n`
   );
   await chmod(binary, 0o755);
   return { binary, record };
+}
+
+async function immediatelyExitingBinary(): Promise<string> {
+  const directory = await mkdtemp(join(tmpdir(), "knives-exiting-binary-"));
+  const binary = join(directory, "exiting-knives.sh");
+  await write(binary, "#!/bin/sh\nexit 0\n");
+  await chmod(binary, 0o755);
+  return binary;
 }
 
 function restoreEnvironment(): void {
@@ -72,6 +82,11 @@ function restoreEnvironment(): void {
     if (!(key in originalEnvironment)) delete process.env[key];
   }
   Object.assign(process.env, originalEnvironment);
+}
+
+function resetBinaryFailureState(): void {
+  Reflect.deleteProperty(globalThis, "__knives_opencode_failed_binaries__");
+  Reflect.deleteProperty(globalThis, "__knives_opencode_binary_warning_emitted__");
 }
 
 async function mockRequest(
@@ -92,6 +107,25 @@ async function mockRequest(
 
 function output(): { title: string; output: string; metadata: unknown } {
   return { title: "tool", output: "tool output", metadata: null };
+}
+
+async function realHook(
+  input: Record<string, unknown>
+): Promise<{ readonly status: number; readonly output: string }> {
+  const child = Bun.spawn([realBinary, "hook", "opencode"], {
+    stdin: "pipe",
+    stdout: "pipe",
+    stderr: "pipe",
+    env: process.env,
+  });
+  await child.stdin.write(JSON.stringify(input));
+  await child.stdin.end();
+  const [status, output] = await Promise.all([
+    child.exited,
+    child.stdout.text(),
+    child.stderr.text(),
+  ]);
+  return { status, output };
 }
 
 test.serial("does not spawn for an irrelevant tool", async () => {
@@ -166,6 +200,14 @@ test.serial("sets owner, forwards compaction, and skips chat without a session",
   });
 });
 
+test.serial("does not export an empty owner", async () => {
+  await mockRequest('{"owner":""}', async () => {
+    const shell = { env: {} as Record<string, string> };
+    await createKnivesHooks("/repo", readOptions(undefined))["shell.env"]({ cwd: "/repo" }, shell);
+    expect(shell.env).toEqual({});
+  });
+});
+
 test.serial("does not spawn shell owner lookup when owner is disabled", async () => {
   await mockRequest('{"owner":"owner-from-binary"}', async (record) => {
     const shell = { env: {} as Record<string, string> };
@@ -201,7 +243,8 @@ test.serial("fails soft once without inheriting an old binary's stderr", async (
     expect(await readFile(`${old.record}.args`, "utf8")).toBe("hook\nopencode\n");
     expect(warnings).toHaveLength(1);
     expect(warnings[0]).toContain(old.binary);
-    expect(warnings[0]).toContain("binary missing or too old for this plugin");
+    expect(warnings[0]).toContain("ran but exited nonzero");
+    expect(warnings[0]).toContain("likely too old for this plugin");
     expect(warnings[0]).toContain("needs the `hook` subcommand");
     expect(warnings[0]).toContain("update knives or set KNIVES_BIN");
     expect(warnings[0]).toContain("error: unrecognized subcommand 'hook'");
@@ -214,7 +257,11 @@ test.serial("fails soft once without inheriting an old binary's stderr", async (
 });
 
 test.serial("fails soft when the configured binary is absent", async () => {
+  const warnings: string[] = [];
+  const originalError = console.error;
+  resetBinaryFailureState();
   process.env["KNIVES_BIN"] = "/definitely/not/knives";
+  console.error = (message?: unknown) => warnings.push(String(message));
   try {
     const hooks = createKnivesHooks("/repo", readOptions(undefined));
     const tool = output();
@@ -228,8 +275,47 @@ test.serial("fails soft when the configured binary is absent", async () => {
     await hooks["experimental.session.compacting"]({ sessionID: "s" }, { context: [] });
     expect(tool.output).toBe("tool output");
     expect(shell.env).toEqual({});
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain("could not start");
+    expect(warnings[0]).toContain("binary is missing");
   } finally {
+    console.error = originalError;
     restoreEnvironment();
+    resetBinaryFailureState();
+  }
+});
+
+test.serial("contains an early stdin close without an unhandled rejection", async () => {
+  const binary = await immediatelyExitingBinary();
+  const warnings: string[] = [];
+  const unhandled: unknown[] = [];
+  const originalError = console.error;
+  const captureUnhandled = (reason: unknown) => unhandled.push(reason);
+  resetBinaryFailureState();
+  process.env["KNIVES_BIN"] = binary;
+  console.error = (message?: unknown) => warnings.push(String(message));
+  process.on("unhandledRejection", captureUnhandled);
+  try {
+    const result = output();
+    await createKnivesHooks("/repo", readOptions(undefined))["tool.execute.after"](
+      {
+        tool: "read",
+        sessionID: "s",
+        callID: "c",
+        args: { payload: "x".repeat(16 * 1024 * 1024) },
+      },
+      result
+    );
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(result.output).toBe("tool output");
+    expect(warnings).toHaveLength(1);
+    expect(unhandled).toEqual([]);
+  } finally {
+    process.off("unhandledRejection", captureUnhandled);
+    console.error = originalError;
+    restoreEnvironment();
+    resetBinaryFailureState();
+    await rm(dirname(binary), { recursive: true, force: true });
   }
 });
 
@@ -244,18 +330,11 @@ test("keeps config skills purely in TypeScript", async () => {
   expect(disabled).toEqual({});
 });
 
-test("discovers a sibling install binary from the release archive layout", () => {
-  const module = resolve(
-    tmpdir(),
-    "prefix",
-    "share",
-    "knives",
-    "opencode",
-    "plugins",
-    "lib",
-    "internals.ts"
-  );
-  expect(siblingBinary(module)).toBe(resolve(tmpdir(), "prefix", "bin", "knives"));
+test("exports only the plugin entry point", () => {
+  expect(Object.keys(knivesEntry)).toEqual(["knivesPlugin"]);
+});
+
+test("keeps option defaults independent from binary discovery", () => {
   expect(readOptions({ guidance: false })).toEqual({
     notice: true,
     guidance: false,
@@ -264,117 +343,193 @@ test("discovers a sibling install binary from the release archive layout", () =>
   });
 });
 
-test.serial("prefers the built development-tree binary over PATH", async () => {
-  const root = await mkdtemp(join(tmpdir(), "knives-dev-tree-"));
-  const module = join(root, "plugin", "lib", "internals.ts");
-  const developmentBinary = join(root, "target", "debug", "knives");
-  const pathBinary = join(root, "path", "knives");
-  await write(module, "");
+test.serial("resolves packaged and development binaries through real file probes", async () => {
+  const root = await mkdtemp(join(tmpdir(), "knives-binary-layout-"));
+  const packagedModule = join(
+    root,
+    "prefix",
+    "share",
+    "knives",
+    "opencode",
+    "plugins",
+    "lib",
+    "internals.ts"
+  );
+  const packagedBinary = join(root, "prefix", "bin", "knives");
+  const developmentModule = join(root, "development", "plugin", "lib", "internals.ts");
+  const developmentBinary = join(root, "development", "target", "debug", "knives");
+  await write(packagedModule, "");
+  await write(packagedBinary, "#!/bin/sh\n");
+  await chmod(packagedBinary, 0o755);
+  await write(developmentModule, "");
   await write(developmentBinary, "#!/bin/sh\n");
-  await write(pathBinary, "#!/bin/sh\n");
   await chmod(developmentBinary, 0o755);
-  await chmod(pathBinary, 0o755);
-  delete process.env["KNIVES_BIN"];
-  process.env["PATH"] = dirname(pathBinary);
+  process.env["KNIVES_BIN"] = "";
   try {
-    expect(await resolveBinary(module)).toBe(developmentBinary);
+    expect(await resolveBinary(packagedModule)).toBe(packagedBinary);
+    await rm(packagedBinary);
+    expect(await resolveBinary(packagedModule)).toBe("knives");
+    expect(await resolveBinary(developmentModule)).toBe(developmentBinary);
+    await rm(developmentBinary);
+    expect(await resolveBinary(developmentModule)).toBe("knives");
   } finally {
     restoreEnvironment();
     await rm(root, { recursive: true, force: true });
   }
 });
 
-test.serial.skipIf(realBinary === undefined)("injects once through the real binary", async () => {
-  await withRepository(async ({ home, root, file }) => {
-    process.env["KNIVES_CONFIG_HOME"] = home;
-    const hooks = createKnivesHooks(undefined, readOptions(undefined));
-    const first = output();
-    const second = output();
-    await hooks["tool.execute.after"](
-      { tool: "read", sessionID: "real", callID: "one", args: { filePath: file } },
-      first
-    );
-    await hooks["tool.execute.after"](
-      { tool: "read", sessionID: "real", callID: "two", args: { filePath: file } },
-      second
-    );
-    expect(first.output).toContain("<knives-notice-");
-    expect(first.output).toContain("PLUGIN_GUIDANCE");
-    expect(second.output).toBe("tool output");
-    const outside = join(home, "outside");
-    await write(join(outside, "AGENTS.md"), "OUTSIDE");
-    await symlink(outside, join(root, "outside-link"));
-    const escaped = output();
-    await hooks["tool.execute.after"](
-      {
-        tool: "apply_patch",
-        sessionID: "escape",
-        callID: "three",
-        args: { filePath: join(root, "outside-link", "file.ts") },
-      },
-      escaped
-    );
-    expect(escaped.output).toBe("tool output");
-  });
-  restoreEnvironment();
-});
-
-test.serial.skipIf(realBinary === undefined)(
-  "preserves the binary budget after pathless bash",
+test.serial.skipIf(realBinary.length === 0)(
+  "adds managed chat guidance from the real binary",
   async () => {
-    await withRepository(async ({ home, file }) => {
-      process.env["KNIVES_CONFIG_HOME"] = home;
-      const hooks = createKnivesHooks(undefined, readOptions(undefined));
-      const pathless = output();
-      const named = output();
-      await hooks["tool.execute.after"](
-        { tool: "bash", sessionID: "budget", callID: "one", args: { command: "gh pr list" } },
-        pathless
-      );
-      await hooks["tool.execute.after"](
-        { tool: "apply_patch", sessionID: "budget", callID: "two", args: { filePath: file } },
-        named
-      );
-      expect(pathless.output).toBe("tool output");
-      expect(named.output).toContain("PLUGIN_GUIDANCE");
-    });
-    restoreEnvironment();
+    try {
+      await withRepository(async ({ home, root }) => {
+        process.env["KNIVES_CONFIG_HOME"] = home;
+        const request = { event: "chat.system", session_id: "chat", directory: root };
+        const response = await realHook(request);
+        const payload = JSON.parse(response.output);
+        expect(response.status).toBe(0);
+        expect(payload.system).toContain("<knives-guidance-");
+        expect(payload.bodies).not.toHaveLength(0);
+
+        const system = { system: [] as string[] };
+        await createKnivesHooks(root, readOptions(undefined))["experimental.chat.system.transform"](
+          { sessionID: "chat" },
+          system
+        );
+        expect(system.system).toHaveLength(1);
+        expect(system.system[0]).toContain("<knives-guidance-");
+      });
+    } finally {
+      restoreEnvironment();
+    }
   }
 );
 
-test.serial.skipIf(realBinary === undefined)(
-  "fails closed and keeps valid roots through the real binary",
+test.serial.skipIf(realBinary.length === 0)(
+  "passes through unmanaged chat responses without a shim insertion",
   async () => {
+    try {
+      await withRepository(async ({ home }) => {
+        const unmanaged = join(home, "unmanaged");
+        await write(join(unmanaged, "file.ts"), "export {}\n");
+        process.env["KNIVES_CONFIG_HOME"] = home;
+        const request = { event: "chat.system", session_id: "chat", directory: unmanaged };
+        const response = await realHook(request);
+        expect(response.status).toBe(0);
+        expect(JSON.parse(response.output)).toEqual({ system: "", bodies: [] });
+
+        const system = { system: ["base"] };
+        await createKnivesHooks(unmanaged, readOptions(undefined))[
+          "experimental.chat.system.transform"
+        ]({ sessionID: "chat" }, system);
+        expect(system.system).toEqual(["base"]);
+      });
+    } finally {
+      restoreEnvironment();
+    }
+  }
+);
+
+test.serial.skipIf(realBinary.length === 0)("injects once through the real binary", async () => {
+  try {
     await withRepository(async ({ home, root, file }) => {
       process.env["KNIVES_CONFIG_HOME"] = home;
       const hooks = createKnivesHooks(undefined, readOptions(undefined));
-      await rm(join(home, "repos.toml"));
-      const missing = output();
+      const first = output();
+      const second = output();
       await hooks["tool.execute.after"](
-        { tool: "read", sessionID: "missing", callID: "one", args: { filePath: file } },
-        missing
+        { tool: "read", sessionID: "real", callID: "one", args: { filePath: file } },
+        first
       );
-      expect(missing.output).toBe("tool output");
-      await write(join(home, "repos.toml"), "[[[invalid");
-      const malformed = output();
       await hooks["tool.execute.after"](
-        { tool: "read", sessionID: "malformed", callID: "two", args: { filePath: file } },
-        malformed
+        { tool: "read", sessionID: "real", callID: "two", args: { filePath: file } },
+        second
       );
-      expect(malformed.output).toBe("tool output");
-      const trusted = join(home, "trusted");
-      await write(join(trusted, "AGENTS.md"), "TRUSTED_GUIDANCE");
-      await write(
-        join(home, "repos.toml"),
-        `[repos.gone]\npath = "/not/here"\nupstream = "u"\norigin = "o"\n\n[repos.managed]\npath = "${root}"\nupstream = "u"\norigin = "o"\n\n[trusted.work]\npath = "${trusted}"\n`
-      );
-      const valid = output();
+      expect(first.output).toContain("<knives-notice-");
+      expect(first.output).toContain("PLUGIN_GUIDANCE");
+      expect(second.output).toBe("tool output");
+      const outside = join(home, "outside");
+      await write(join(outside, "AGENTS.md"), "OUTSIDE");
+      await symlink(outside, join(root, "outside-link"));
+      const escaped = output();
       await hooks["tool.execute.after"](
-        { tool: "apply_patch", sessionID: "valid", callID: "three", args: { filePath: file } },
-        valid
+        {
+          tool: "apply_patch",
+          sessionID: "escape",
+          callID: "three",
+          args: { filePath: join(root, "outside-link", "file.ts") },
+        },
+        escaped
       );
-      expect(valid.output).toContain("PLUGIN_GUIDANCE");
+      expect(escaped.output).toBe("tool output");
     });
+  } finally {
     restoreEnvironment();
+  }
+});
+
+test.serial.skipIf(realBinary.length === 0)(
+  "preserves the binary budget after pathless bash",
+  async () => {
+    try {
+      await withRepository(async ({ home, file }) => {
+        process.env["KNIVES_CONFIG_HOME"] = home;
+        const hooks = createKnivesHooks(undefined, readOptions(undefined));
+        const pathless = output();
+        const named = output();
+        await hooks["tool.execute.after"](
+          { tool: "bash", sessionID: "budget", callID: "one", args: { command: "gh pr list" } },
+          pathless
+        );
+        await hooks["tool.execute.after"](
+          { tool: "apply_patch", sessionID: "budget", callID: "two", args: { filePath: file } },
+          named
+        );
+        expect(pathless.output).toBe("tool output");
+        expect(named.output).toContain("PLUGIN_GUIDANCE");
+      });
+    } finally {
+      restoreEnvironment();
+    }
+  }
+);
+
+test.serial.skipIf(realBinary.length === 0)(
+  "fails closed and keeps valid roots through the real binary",
+  async () => {
+    try {
+      await withRepository(async ({ home, root, file }) => {
+        process.env["KNIVES_CONFIG_HOME"] = home;
+        const hooks = createKnivesHooks(undefined, readOptions(undefined));
+        await rm(join(home, "repos.toml"));
+        const missing = output();
+        await hooks["tool.execute.after"](
+          { tool: "read", sessionID: "missing", callID: "one", args: { filePath: file } },
+          missing
+        );
+        expect(missing.output).toBe("tool output");
+        await write(join(home, "repos.toml"), "[[[invalid");
+        const malformed = output();
+        await hooks["tool.execute.after"](
+          { tool: "read", sessionID: "malformed", callID: "two", args: { filePath: file } },
+          malformed
+        );
+        expect(malformed.output).toBe("tool output");
+        const trusted = join(home, "trusted");
+        await write(join(trusted, "AGENTS.md"), "TRUSTED_GUIDANCE");
+        await write(
+          join(home, "repos.toml"),
+          `[repos.gone]\npath = "/not/here"\nupstream = "u"\norigin = "o"\n\n[repos.managed]\npath = "${root}"\nupstream = "u"\norigin = "o"\n\n[trusted.work]\npath = "${trusted}"\n`
+        );
+        const valid = output();
+        await hooks["tool.execute.after"](
+          { tool: "apply_patch", sessionID: "valid", callID: "three", args: { filePath: file } },
+          valid
+        );
+        expect(valid.output).toContain("PLUGIN_GUIDANCE");
+      });
+    } finally {
+      restoreEnvironment();
+    }
   }
 );

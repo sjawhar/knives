@@ -1,4 +1,0 @@
-{"event":"tool.execute.after","session_id":"s","tool":"apply_patch","args":{"filePath":"/tmp/a"},"parts":{"notice":false,"guidance":true}}
-{"event":"chat.system","session_id":"s","directory":"/repo"}
-{"event":"chat.system","session_id":"s","directory":"/repo"}
-{"event":"shell.env","cwd":"/repo"}

@@ -2,6 +2,7 @@ import { stat } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+// allow: SIZE_OK — the adapter's OpenCode hook contracts and binary boundary are one seam.
 const relevantTools = new Set(["read", "grep", "glob", "edit", "write", "apply_patch", "bash"]);
 const binaryCacheKey = "__knives_opencode_failed_binaries__";
 const warningKey = "__knives_opencode_binary_warning_emitted__";
@@ -21,6 +22,7 @@ type ConfigDraft = Record<string, unknown>;
 type CompactingInput = { readonly sessionID: string };
 type CompactingOutput = { context: string[]; prompt?: string };
 type JsonRecord = Record<string, unknown>;
+type BinaryFailure = "missing" | "outdated" | "invalid_response";
 
 export type KnivesHooks = {
   readonly "tool.execute.after": (input: ToolInput, output: ToolOutput) => Promise<void>;
@@ -57,7 +59,7 @@ function isRecord(value: unknown): value is JsonRecord {
 }
 
 function stringValue(value: unknown): string | null {
-  return typeof value === "string" ? value : null;
+  return typeof value === "string" && value.length > 0 ? value : null;
 }
 
 function stringArray(value: unknown): readonly string[] | null {
@@ -65,6 +67,8 @@ function stringArray(value: unknown): readonly string[] | null {
 }
 
 function failedBinaries(): Set<string> {
+  // Cache only each failed path: a later KNIVES_BIN override selects a fresh candidate.
+  // Spawn failures mean that path is missing; a nonzero hook exit usually means an old binary.
   const carrier = globalThis as GlobalCarrier;
   const existing = carrier[binaryCacheKey];
   if (existing !== undefined) return existing;
@@ -73,7 +77,7 @@ function failedBinaries(): Set<string> {
   return created;
 }
 
-function warnOnce(candidate: string, stderr: string): void {
+function warnOnce(candidate: string, failure: BinaryFailure, stderr: string): void {
   const carrier = globalThis as GlobalCarrier;
   if (carrier[warningKey] === true) return;
   carrier[warningKey] = true;
@@ -86,9 +90,13 @@ function warnOnce(candidate: string, stderr: string): void {
       return code < 32 || code === 127 ? " " : character;
     })
     .join("");
-  console.error(
-    `knives OpenCode plugin could not run \`${binaryPath}\`: binary missing or too old for this plugin (needs the \`hook\` subcommand); update knives or set KNIVES_BIN.${diagnostic}`
-  );
+  const message =
+    failure === "missing"
+      ? `could not start \`${binaryPath}\`: binary is missing; update knives or set KNIVES_BIN.`
+      : failure === "outdated"
+        ? `ran but exited nonzero: \`${binaryPath}\` is likely too old for this plugin (needs the \`hook\` subcommand); update knives or set KNIVES_BIN.`
+        : `received no valid hook response from \`${binaryPath}\`; update knives or set KNIVES_BIN.`;
+  console.error(`knives OpenCode plugin ${message}${diagnostic}`);
 }
 
 async function isFile(path: string): Promise<boolean> {
@@ -133,9 +141,9 @@ async function binary(): Promise<string | null> {
   return failedBinaries().has(candidate) ? null : candidate;
 }
 
-function failBinary(candidate: string, stderr = ""): null {
+function failBinary(candidate: string, failure: BinaryFailure, stderr = ""): null {
   failedBinaries().add(candidate);
-  warnOnce(candidate, stderr);
+  warnOnce(candidate, failure, stderr);
   return null;
 }
 
@@ -148,19 +156,32 @@ async function invoke(request: JsonRecord): Promise<JsonRecord | null> {
       stderr: "pipe",
       env: process.env,
     });
-    child.stdin.write(JSON.stringify(request));
-    child.stdin.end();
+    try {
+      await child.stdin.write(JSON.stringify(request));
+      await child.stdin.end();
+    } catch {
+      const [, stderr, exitCode] = await Promise.all([
+        child.stdout.text(),
+        child.stderr.text(),
+        child.exited,
+      ]);
+      return failBinary(candidate, exitCode === 0 ? "invalid_response" : "outdated", stderr);
+    }
     const [stdout, stderr, exitCode] = await Promise.all([
       child.stdout.text(),
       child.stderr.text(),
       child.exited,
     ]);
-    if (exitCode !== 0) return failBinary(candidate, stderr);
-    const parsed: unknown = JSON.parse(stdout);
-    return isRecord(parsed) ? parsed : failBinary(candidate, stderr);
+    if (exitCode !== 0) return failBinary(candidate, "outdated", stderr);
+    try {
+      const parsed: unknown = JSON.parse(stdout);
+      return isRecord(parsed) ? parsed : failBinary(candidate, "invalid_response", stderr);
+    } catch {
+      return failBinary(candidate, "invalid_response", stderr);
+    }
   } catch {
     // no-excuse-ok: catch -- the plugin boundary intentionally degrades when the optional binary is unavailable.
-    return failBinary(candidate);
+    return failBinary(candidate, "missing");
   }
 }
 
@@ -178,8 +199,9 @@ export function readOptions(raw: unknown): KnivesOptions {
 export async function bundledSkillDirectory(): Promise<string | null> {
   const here = dirname(fileURLToPath(import.meta.url));
   for (const candidate of [
-    resolve(here, "..", "..", "skill"),
     resolve(here, "..", "..", "skills"),
+    // Legacy archives used `skill`; retain it only after the release `skills` directory.
+    resolve(here, "..", "..", "skill"),
   ]) {
     if (await isDirectory(candidate)) return candidate;
   }

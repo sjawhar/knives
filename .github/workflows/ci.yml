@@ -74,7 +74,7 @@ jobs:
         run: bun run lint
       - name: Typecheck plugin
         run: bun run typecheck
-      # Includes the guard test pinning the entry module's export surface:
+      # The suite includes an import guard pinning the entry module's export surface:
       # OpenCode calls every exported function as a plugin, so a second export
       # breaks plugin loading. See plugin/knives.ts.
       - name: Test plugin
