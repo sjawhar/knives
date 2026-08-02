@@ -63,8 +63,8 @@ fn guidance_format_matches_the_plugin_prose_exactly() {
 
 #[test]
 fn notice_format_matches_the_plugin_prose_exactly() {
-    // Given: claimed and unclaimed variants for one repository.
-    let claims = ["feature/guidance (alex): review fixes".to_owned()];
+    // Given: multiple claimed branches and an unclaimed variant for one repository.
+    let claims = ["a (x)".to_owned(), "b (y)".to_owned()];
 
     // When: the formatter produces both notice forms.
     let actual = [
@@ -80,7 +80,7 @@ fn notice_format_matches_the_plugin_prose_exactly() {
 
     // Then: every non-nonce byte equals the TypeScript formatter's text.
     assert_eq!(actual, [
-        "\n\n<knives-notice-NONCE repo=\"example-repo\">\n/example/repo is a fork managed by knives, and another agent may be working in it.\nBranches claimed here: feature/guidance (alex): review fixes.\nUse knives rather than jj or git directly here: `knives status` for the state of\nevery branch, `knives start <branch>` to take a branch and get your own workspace,\n`knives finish <branch>` when you are done with it.\n</knives-notice-NONCE>".to_owned(),
+        "\n\n<knives-notice-NONCE repo=\"example-repo\">\n/example/repo is a fork managed by knives, and another agent may be working in it.\nBranches claimed here: a (x); b (y).\nUse knives rather than jj or git directly here: `knives status` for the state of\nevery branch, `knives start <branch>` to take a branch and get your own workspace,\n`knives finish <branch>` when you are done with it.\n</knives-notice-NONCE>".to_owned(),
         "\n\n<knives-notice-NONCE repo=\"example-repo\">\n/example/repo is a fork managed by knives, and another agent may be working in it.\nNo branch is claimed here right now.\nUse knives rather than jj or git directly here: `knives status` for the state of\nevery branch, `knives start <branch>` to take a branch and get your own workspace,\n`knives finish <branch>` when you are done with it.\n</knives-notice-NONCE>".to_owned(),
     ]);
 }
@@ -106,11 +106,16 @@ fn sibling_path_with_a_shared_prefix_is_not_inside_the_repository() {
     std::fs::create_dir_all(&root).expect("create repository");
     std::fs::create_dir_all(&sibling).expect("create sibling");
     std::fs::write(root.join("AGENTS.md"), "root rules").expect("write rules");
-    let candidate = sibling.join("file.txt");
+    std::fs::write(sibling.join("AGENTS.md"), "sibling rules").expect("write sibling rules");
+    let canonical_root = root.canonicalize().expect("canonical root");
+    let candidate = canonical_root
+        .parent()
+        .expect("canonical root parent")
+        .join("repo-other/file.txt");
     std::fs::write(&candidate, "content").expect("write sibling file");
     let repo = GuidanceRoot {
         name: "repo".to_owned(),
-        root: root.canonicalize().expect("canonical root"),
+        root: canonical_root,
         kind: GuidanceRootKind::Managed,
     };
 
@@ -119,6 +124,18 @@ fn sibling_path_with_a_shared_prefix_is_not_inside_the_repository() {
 
     // Then: component-wise containment rejects it.
     assert!(guidance.is_none());
+}
+
+#[test]
+fn claude_md_wins_over_context_md_in_one_directory() {
+    // Given: the second- and third-priority instruction files in one directory.
+    let (_directory, repo) = repo(&[("CLAUDE.md", "from claude"), ("CONTEXT.md", "from context")]);
+
+    // When: guidance is discovered for that directory.
+    let guidance = guidance_for(&repo, &repo.root).expect("guidance");
+
+    // Then: CLAUDE.md wins over CONTEXT.md.
+    assert_eq!(guidance.bodies[0].body, "from claude");
 }
 
 #[test]

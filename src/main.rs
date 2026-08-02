@@ -2,7 +2,7 @@
 //!
 //! Dispatch only. Every command owns its own logic and returns an [`Exit`], so
 //! this file never grows a decision.
-// allow: SIZE_OK — the binary's exhaustive CLI dispatch remains centralized at its entrypoint.
+// allow: SIZE_OK: 735 lines - dispatch-only, splitting would scatter the exhaustive match.
 
 use std::process::ExitCode;
 
