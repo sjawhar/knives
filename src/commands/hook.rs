@@ -250,7 +250,10 @@ fn post_tool_use(event: &Event, home: &Path) -> anyhow::Result<Option<String>> {
     let state = SessionState::load(home, CLAUDE_CODE, session_id);
     let flags = state.repo(&matched.repo.root);
     let include_notice = matched.repo.kind == GuidanceRootKind::Managed && !flags.noticed;
-    let include_guidance = !flags.guided && !contains_cwd(&matched.repo, event.cwd());
+    let include_guidance = !flags.guided
+        && event
+            .cwd()
+            .is_some_and(|cwd| !contains_cwd(&matched.repo, cwd));
     if !include_notice && !include_guidance {
         return Ok(None);
     }
@@ -305,10 +308,8 @@ fn pre_compact(event: &Event, home: &Path) -> anyhow::Result<Option<String>> {
     Ok(None)
 }
 
-fn contains_cwd(repo: &GuidanceRoot, cwd: Option<&str>) -> bool {
-    cwd.map(PathBuf::from)
-        .and_then(|cwd| managed_repo_for(&[cwd], std::slice::from_ref(repo)))
-        .is_some()
+fn contains_cwd(repo: &GuidanceRoot, cwd: &str) -> bool {
+    managed_repo_for(&[PathBuf::from(cwd)], std::slice::from_ref(repo)).is_some()
 }
 
 fn config_home() -> PathBuf {

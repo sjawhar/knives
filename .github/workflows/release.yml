@@ -169,6 +169,12 @@ jobs:
           sed -i '0,/^version = ".*"/s//version = "'"$VERSION"'"/' Cargo.toml
           sed -i '0,/"version": ".*"/s//"version": "'"$VERSION"'"/' package.json
           sed -i '0,/"version": ".*"/s//"version": "'"$VERSION"'"/' .claude-plugin/plugin.json
+          for version_file in Cargo.toml package.json .claude-plugin/plugin.json; do
+            if ! grep --fixed-strings --quiet "$VERSION" "$version_file"; then
+              printf 'release version %s was not written to %s\n' "$VERSION" "$version_file" >&2
+              exit 1
+            fi
+          done
           cargo update --workspace
 
       - name: Commit and tag

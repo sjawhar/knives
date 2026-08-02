@@ -78,7 +78,8 @@ Install the Claude Code plugin separately:
 ```
 
 The Claude Code plugin ships its hooks and skills. The binary still comes from the release archive
-above. Without that binary, the hooks exit silently.
+above. Without that binary, the hooks exit silently. An old binary emits a SessionStart system
+message that asks you to update knives or set `KNIVES_BIN`.
 
 Or build from source with a Rust toolchain:
 

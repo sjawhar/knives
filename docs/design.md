@@ -294,7 +294,8 @@ The OpenCode shim resolves the binary in this order: `KNIVES_BIN`, the sibling
 `<prefix>/bin/knives` in an installed release tree, the development tree's
 `target/debug/knives`, then `knives` on `PATH`. The development tree comes before `PATH` so a
 `file://` development install uses the checkout build instead of an older installed binary.
-The Claude Code shell hook resolves `knives` from `PATH` and exits silently when it is absent.
+The Claude Code shell hook uses an executable `KNIVES_BIN`, then `knives` from `PATH`. It always
+exits zero, so failures never break the session.
 
 ## Enforcement
 

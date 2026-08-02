@@ -22,10 +22,8 @@ pub struct InstructionFile {
 
 /// Returns instructions that govern a candidate path, ordered from nearest to root.
 pub fn guidance_for(repo: &GuidanceRoot, candidate: &Path) -> Option<Guidance> {
-    let directory = candidate_directory(candidate)?;
-    if !directory.starts_with(&repo.root) {
-        return None;
-    }
+    let directory =
+        candidate_directory(candidate).filter(|directory| directory.starts_with(&repo.root))?;
 
     let mut bodies = Vec::new();
     let mut current = directory;
@@ -48,11 +46,7 @@ pub fn guidance_for(repo: &GuidanceRoot, candidate: &Path) -> Option<Guidance> {
     let contributing = repo.root.join("CONTRIBUTING.md");
     // Unlike the TypeScript plugin's fail-closed stat path, this boolean helper treats a
     // metadata error as absent so readable instruction files still reach the agent.
-    let mentions: Vec<PathBuf> = contributing
-        .is_file()
-        .then_some(contributing)
-        .into_iter()
-        .collect();
+    let mentions: Vec<_> = Vec::from_iter(contributing.is_file().then_some(contributing));
     if bodies.is_empty() && mentions.is_empty() {
         None
     } else {
@@ -155,7 +149,7 @@ fn directory_guidance(directory: &Path) -> Option<InstructionFile> {
         match std::fs::read_to_string(&path) {
             Ok(body) => return Some(InstructionFile { path, body }),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => return None,
+            Err(_) => {}
         }
     }
     None
@@ -195,6 +189,8 @@ mod tests {
         reason = "tests index known non-empty fixture results"
     )]
 
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
 
     use tempfile::TempDir;
@@ -228,6 +224,23 @@ mod tests {
 
         assert_eq!(guidance.bodies.len(), 1);
         assert_eq!(guidance.bodies[0].body, "from agents");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_agents_md_falls_back_to_claude_md() {
+        // Given: an unreadable higher-priority file and a readable fallback.
+        let (_dir, repo) = root(&[("AGENTS.md", "from agents"), ("CLAUDE.md", "from claude")]);
+        let agents = repo.root.join("AGENTS.md");
+        std::fs::set_permissions(&agents, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read_to_string(&agents).is_ok() {
+            std::fs::remove_file(&agents).unwrap();
+            std::fs::create_dir(&agents).unwrap();
+        }
+        // When: guidance is discovered. Root reads mode 000, so a directory simulates its error.
+        let guidance = guidance_for(&repo, &repo.root).unwrap();
+        // Then: the next readable file remains available.
+        assert_eq!(guidance.bodies[0].body, "from claude");
     }
 
     #[test]

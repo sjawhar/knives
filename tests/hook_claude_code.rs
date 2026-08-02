@@ -241,6 +241,26 @@ fn post_tool_use_on_a_foreign_repo_emits_notice_and_guidance_once() {
 }
 
 #[test]
+fn post_tool_use_without_cwd_emits_notice_without_guidance() {
+    // Given: a managed file in a PostToolUse event that has no session cwd.
+    let repos = Repositories::new();
+    repos.configure(false);
+    let mut read = event(
+        "post-tool-read",
+        &repos.alpha,
+        Some(&repos.beta.join("file.txt")),
+    );
+    read.as_object_mut().expect("event object").remove("cwd");
+
+    // When: the foreign file is read.
+    let context = additional_context(&run_hook(repos.home.path(), &read));
+
+    // Then: the managed-repository notice remains but repository guidance is omitted.
+    assert!(context.contains("fork managed by knives"), "was: {context}");
+    assert!(!context.contains("beta instructions"), "was: {context}");
+}
+
+#[test]
 fn post_tool_use_on_the_session_repo_never_injects_its_guidance() {
     // Given: a session that reads a file in its own repository.
     let repos = Repositories::new();
