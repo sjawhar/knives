@@ -73,11 +73,22 @@ function failedBinaries(): Set<string> {
   return created;
 }
 
-function warnOnce(): void {
+function warnOnce(candidate: string, stderr: string): void {
   const carrier = globalThis as GlobalCarrier;
   if (carrier[warningKey] === true) return;
   carrier[warningKey] = true;
-  console.error("knives OpenCode plugin could not run `knives hook opencode`; hooks are disabled");
+  const firstLine = stderr.split(/\r?\n/, 1)[0] ?? "";
+  const detail = JSON.stringify(firstLine).slice(1, -1).trim().slice(0, 120);
+  const diagnostic = detail.length === 0 ? "" : ` Detail: ${detail}`;
+  const binaryPath = [...candidate]
+    .map((character) => {
+      const code = character.charCodeAt(0);
+      return code < 32 || code === 127 ? " " : character;
+    })
+    .join("");
+  console.error(
+    `knives OpenCode plugin could not run \`${binaryPath}\`: binary missing or too old for this plugin (needs the \`hook\` subcommand); update knives or set KNIVES_BIN.${diagnostic}`
+  );
 }
 
 async function isFile(path: string): Promise<boolean> {
@@ -102,16 +113,29 @@ export function siblingBinary(modulePath: string): string {
   return resolve(dirname(modulePath), "..", "..", "..", "..", "..", "bin", "knives");
 }
 
-async function binary(): Promise<string | null> {
+function developmentBinary(modulePath: string): string {
+  return resolve(dirname(modulePath), "..", "..", "target", "debug", "knives");
+}
+
+export async function resolveBinary(modulePath: string): Promise<string> {
   const configured = stringValue(process.env["KNIVES_BIN"]);
-  const sibling = siblingBinary(fileURLToPath(import.meta.url));
-  const candidate = configured ?? ((await isFile(sibling)) ? sibling : "knives");
+  if (configured !== null) return configured;
+  const sibling = siblingBinary(modulePath);
+  if (await isFile(sibling)) return sibling;
+  // A file:// dev install must use its checkout's build before any stale PATH binary.
+  const development = developmentBinary(modulePath);
+  if (await isFile(development)) return development;
+  return "knives";
+}
+
+async function binary(): Promise<string | null> {
+  const candidate = await resolveBinary(fileURLToPath(import.meta.url));
   return failedBinaries().has(candidate) ? null : candidate;
 }
 
-function failBinary(candidate: string): null {
+function failBinary(candidate: string, stderr = ""): null {
   failedBinaries().add(candidate);
-  warnOnce();
+  warnOnce(candidate, stderr);
   return null;
 }
 
@@ -121,15 +145,19 @@ async function invoke(request: JsonRecord): Promise<JsonRecord | null> {
   try {
     const child = Bun.spawn([candidate, "hook", "opencode"], {
       stdin: "pipe",
-      stderr: "ignore",
+      stderr: "pipe",
       env: process.env,
     });
     child.stdin.write(JSON.stringify(request));
     child.stdin.end();
-    const [stdout, exitCode] = await Promise.all([child.stdout.text(), child.exited]);
-    if (exitCode !== 0) return failBinary(candidate);
+    const [stdout, stderr, exitCode] = await Promise.all([
+      child.stdout.text(),
+      child.stderr.text(),
+      child.exited,
+    ]);
+    if (exitCode !== 0) return failBinary(candidate, stderr);
     const parsed: unknown = JSON.parse(stdout);
-    return isRecord(parsed) ? parsed : failBinary(candidate);
+    return isRecord(parsed) ? parsed : failBinary(candidate, stderr);
   } catch {
     // no-excuse-ok: catch -- the plugin boundary intentionally degrades when the optional binary is unavailable.
     return failBinary(candidate);

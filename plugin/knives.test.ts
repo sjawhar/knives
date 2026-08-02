@@ -7,6 +7,7 @@ import {
   bundledSkillDirectory,
   createKnivesHooks,
   readOptions,
+  resolveBinary,
   siblingBinary,
 } from "./lib/internals.ts";
 
@@ -49,6 +50,18 @@ async function mockBinary(): Promise<{ readonly binary: string; readonly record:
   await write(
     binary,
     '#!/bin/sh\nprintf \'%s\\n\' "$@" >> "$MOCK_RECORD.args"\ninput=$(cat)\nprintf \'%s\\n\' "$input" >> "$MOCK_RECORD.stdin"\nprintf \'%s\' "$MOCK_RESPONSE"\n'
+  );
+  await chmod(binary, 0o755);
+  return { binary, record };
+}
+
+async function oldBinary(): Promise<{ readonly binary: string; readonly record: string }> {
+  const directory = await mkdtemp(join(tmpdir(), "knives-old-binary-"));
+  const binary = join(directory, "old-knives.sh");
+  const record = join(directory, "requests");
+  await write(
+    binary,
+    "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"$MOCK_RECORD.args\"\ncat >/dev/null\nprintf '%s\\n' \"error: unrecognized subcommand 'hook'\" >&2\nprintf '%s\\n' \"CHILD_STDERR_MUST_NOT_LEAK\" >&2\nexit 2\n"
   );
   await chmod(binary, 0o755);
   return { binary, record };
@@ -165,6 +178,41 @@ test.serial("does not spawn shell owner lookup when owner is disabled", async ()
   });
 });
 
+test.serial("fails soft once without inheriting an old binary's stderr", async () => {
+  const old = await oldBinary();
+  const warnings: string[] = [];
+  const originalError = console.error;
+  process.env["KNIVES_BIN"] = old.binary;
+  process.env["MOCK_RECORD"] = old.record;
+  console.error = (message?: unknown) => warnings.push(String(message));
+  try {
+    const hooks = createKnivesHooks("/repo", readOptions(undefined));
+    const tool = output();
+    const shell = { env: {} as Record<string, string> };
+    await hooks["tool.execute.after"](
+      { tool: "read", sessionID: "s", callID: "c", args: {} },
+      tool
+    );
+    await hooks["shell.env"]({ cwd: "/repo" }, shell);
+    await hooks["experimental.chat.system.transform"]({ sessionID: "s" }, { system: [] });
+    await hooks["experimental.session.compacting"]({ sessionID: "s" }, { context: [] });
+    expect(tool.output).toBe("tool output");
+    expect(shell.env).toEqual({});
+    expect(await readFile(`${old.record}.args`, "utf8")).toBe("hook\nopencode\n");
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain(old.binary);
+    expect(warnings[0]).toContain("binary missing or too old for this plugin");
+    expect(warnings[0]).toContain("needs the `hook` subcommand");
+    expect(warnings[0]).toContain("update knives or set KNIVES_BIN");
+    expect(warnings[0]).toContain("error: unrecognized subcommand 'hook'");
+    expect(warnings[0]).not.toContain("CHILD_STDERR_MUST_NOT_LEAK");
+  } finally {
+    console.error = originalError;
+    restoreEnvironment();
+    await rm(dirname(old.binary), { recursive: true, force: true });
+  }
+});
+
 test.serial("fails soft when the configured binary is absent", async () => {
   process.env["KNIVES_BIN"] = "/definitely/not/knives";
   try {
@@ -214,6 +262,26 @@ test("discovers a sibling install binary from the release archive layout", () =>
     owner: true,
     skills: true,
   });
+});
+
+test.serial("prefers the built development-tree binary over PATH", async () => {
+  const root = await mkdtemp(join(tmpdir(), "knives-dev-tree-"));
+  const module = join(root, "plugin", "lib", "internals.ts");
+  const developmentBinary = join(root, "target", "debug", "knives");
+  const pathBinary = join(root, "path", "knives");
+  await write(module, "");
+  await write(developmentBinary, "#!/bin/sh\n");
+  await write(pathBinary, "#!/bin/sh\n");
+  await chmod(developmentBinary, 0o755);
+  await chmod(pathBinary, 0o755);
+  delete process.env["KNIVES_BIN"];
+  process.env["PATH"] = dirname(pathBinary);
+  try {
+    expect(await resolveBinary(module)).toBe(developmentBinary);
+  } finally {
+    restoreEnvironment();
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test.serial.skipIf(realBinary === undefined)("injects once through the real binary", async () => {
