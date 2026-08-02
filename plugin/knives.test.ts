@@ -224,6 +224,7 @@ test.serial("fails soft once without inheriting an old binary's stderr", async (
   const old = await oldBinary();
   const warnings: string[] = [];
   const originalError = console.error;
+  resetBinaryFailureState();
   process.env["KNIVES_BIN"] = old.binary;
   process.env["MOCK_RECORD"] = old.record;
   console.error = (message?: unknown) => warnings.push(String(message));
@@ -252,6 +253,7 @@ test.serial("fails soft once without inheriting an old binary's stderr", async (
   } finally {
     console.error = originalError;
     restoreEnvironment();
+    resetBinaryFailureState();
     await rm(dirname(old.binary), { recursive: true, force: true });
   }
 });
@@ -356,11 +358,23 @@ test.serial("resolves packaged and development binaries through real file probes
     "internals.ts"
   );
   const packagedBinary = join(root, "prefix", "bin", "knives");
+  const packagedDevelopmentBinary = join(
+    root,
+    "prefix",
+    "share",
+    "knives",
+    "opencode",
+    "target",
+    "debug",
+    "knives"
+  );
   const developmentModule = join(root, "development", "plugin", "lib", "internals.ts");
   const developmentBinary = join(root, "development", "target", "debug", "knives");
   await write(packagedModule, "");
   await write(packagedBinary, "#!/bin/sh\n");
   await chmod(packagedBinary, 0o755);
+  await write(packagedDevelopmentBinary, "#!/bin/sh\n");
+  await chmod(packagedDevelopmentBinary, 0o755);
   await write(developmentModule, "");
   await write(developmentBinary, "#!/bin/sh\n");
   await chmod(developmentBinary, 0o755);
@@ -368,6 +382,8 @@ test.serial("resolves packaged and development binaries through real file probes
   try {
     expect(await resolveBinary(packagedModule)).toBe(packagedBinary);
     await rm(packagedBinary);
+    expect(await resolveBinary(packagedModule)).toBe(packagedDevelopmentBinary);
+    await rm(packagedDevelopmentBinary);
     expect(await resolveBinary(packagedModule)).toBe("knives");
     expect(await resolveBinary(developmentModule)).toBe(developmentBinary);
     await rm(developmentBinary);
