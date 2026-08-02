@@ -39,10 +39,15 @@ pub fn guidance_for(repo: &GuidanceRoot, candidate: &Path) -> Option<Guidance> {
         if current == repo.root {
             break;
         }
-        current = current.parent()?.to_path_buf();
+        let Some(parent) = current.parent() else {
+            break;
+        };
+        current = parent.to_path_buf();
     }
 
     let contributing = repo.root.join("CONTRIBUTING.md");
+    // Unlike the TypeScript plugin's fail-closed stat path, this boolean helper treats a
+    // metadata error as absent so readable instruction files still reach the agent.
     let mentions: Vec<PathBuf> = contributing
         .is_file()
         .then_some(contributing)
@@ -136,6 +141,8 @@ pub fn claim_lines(claims: &[Claim], repo_name: &str) -> Vec<String> {
 }
 
 fn candidate_directory(candidate: &Path) -> Option<PathBuf> {
+    // Unlike the TypeScript plugin's fail-closed stat path, `is_dir` treats metadata errors
+    // as a file candidate so the parent directory's readable guidance remains available.
     candidate
         .is_dir()
         .then(|| candidate.to_path_buf())
