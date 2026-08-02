@@ -83,15 +83,18 @@ fn session_start(event: &Event, home: &Path) -> anyhow::Result<Option<String>> {
     if state.repo(&matched.repo.root).noticed {
         return Ok(None);
     }
-    let store = Store::open(default_state_path())?;
-    let claims = claim_lines(&claims(&store), &matched.repo.name);
-    let notice = format_notice(&matched.repo.name, &matched.repo.root, &claims);
+    let notice = notice_for(&matched.repo)?;
     let _ = SessionState::update(home, CLAUDE_CODE, session_id, |state| {
         state.mark(&matched.repo.root, true, false);
     })?;
-    response("SessionStart", &notice)
-        .map(Some)
-        .map_err(Into::into)
+    response(
+        event
+            .hook_event_name()
+            .ok_or_else(|| anyhow::anyhow!("session-start event has no name"))?,
+        &notice,
+    )
+    .map(Some)
+    .map_err(Into::into)
 }
 
 fn post_tool_use(event: &Event, home: &Path) -> anyhow::Result<Option<String>> {
@@ -126,26 +129,28 @@ fn post_tool_use(event: &Event, home: &Path) -> anyhow::Result<Option<String>> {
 
     let mut parts = Vec::new();
     if include_notice {
-        let store = Store::open(default_state_path())?;
-        let claims = claim_lines(&claims(&store), &matched.repo.name);
-        parts.push(format_notice(
-            &matched.repo.name,
-            &matched.repo.root,
-            &claims,
-        ));
+        parts.push(notice_for(&matched.repo)?);
     }
-    if include_guidance && let Some(guidance) = guidance_for(&matched.repo, &matched.candidate) {
-        parts.push(format_guidance(&matched.repo.name, &guidance));
+    let guidance = include_guidance
+        .then(|| guidance_for(&matched.repo, &matched.candidate))
+        .flatten();
+    if let Some(guidance) = &guidance {
+        parts.push(format_guidance(&matched.repo.name, guidance));
     }
     if parts.is_empty() {
         return Ok(None);
     }
     let _ = SessionState::update(home, CLAUDE_CODE, session_id, |state| {
-        state.mark(&matched.repo.root, include_notice, include_guidance);
+        state.mark(&matched.repo.root, include_notice, guidance.is_some());
     })?;
-    response("PostToolUse", &parts.join("\n"))
-        .map(Some)
-        .map_err(Into::into)
+    response(
+        event
+            .hook_event_name()
+            .ok_or_else(|| anyhow::anyhow!("post-tool-use event has no name"))?,
+        &parts.join("\n"),
+    )
+    .map(Some)
+    .map_err(Into::into)
 }
 
 fn pre_compact(event: &Event, home: &Path) -> anyhow::Result<Option<String>> {
@@ -156,8 +161,9 @@ fn pre_compact(event: &Event, home: &Path) -> anyhow::Result<Option<String>> {
 }
 
 fn contains_cwd(repo: &GuidanceRoot, cwd: Option<&str>) -> bool {
-    cwd.and_then(|cwd| Path::new(cwd).canonicalize().ok())
-        .is_some_and(|cwd| cwd.strip_prefix(&repo.root).is_ok())
+    cwd.map(PathBuf::from)
+        .and_then(|cwd| managed_repo_for(&[cwd], std::slice::from_ref(repo)))
+        .is_some()
 }
 
 fn config_home() -> PathBuf {
@@ -166,7 +172,13 @@ fn config_home() -> PathBuf {
         .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
 }
 
-fn claims(store: &Store) -> Vec<crate::store::Claim> {
+fn notice_for(repo: &GuidanceRoot) -> anyhow::Result<String> {
+    let store = Store::open(default_state_path())?;
+    let visible_claims = claim_lines(&all_claims(&store), &repo.name);
+    Ok(format_notice(&repo.name, &repo.root, &visible_claims))
+}
+
+fn all_claims(store: &Store) -> Vec<crate::store::Claim> {
     store.claims(None).into_iter().cloned().collect()
 }
 

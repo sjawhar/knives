@@ -35,6 +35,10 @@ impl Event {
         self.kind
     }
 
+    pub fn hook_event_name(&self) -> Option<&str> {
+        self.text("hook_event_name")
+    }
+
     pub fn session_id(&self) -> Option<&str> {
         self.text("session_id")
     }

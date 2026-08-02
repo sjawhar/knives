@@ -19,7 +19,11 @@ pub fn current_owner() -> String {
     std::env::var("KNIVES_OWNER")
         .ok()
         .filter(|value| !value.trim().is_empty())
-        .or_else(|| std::env::var("CLAUDE_CODE_SESSION_ID").ok())
+        .or_else(|| {
+            std::env::var("CLAUDE_CODE_SESSION_ID")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
         .or_else(|| std::env::var("USER").ok())
         .unwrap_or_else(|| "unknown".to_owned())
 }
@@ -150,10 +154,45 @@ mod tests {
         clippy::indexing_slicing,
         reason = "indexing a result in a test is the assertion; a panic is the failure"
     )]
+    use std::ffi::OsString;
     use std::path::PathBuf;
 
     use super::*;
     use crate::config::RepoEntry;
+
+    struct EnvironmentGuard {
+        values: Vec<(&'static str, Option<OsString>)>,
+    }
+
+    impl EnvironmentGuard {
+        fn capture(names: &[&'static str]) -> Self {
+            Self {
+                values: names
+                    .iter()
+                    .map(|name| (*name, std::env::var_os(name)))
+                    .collect(),
+            }
+        }
+
+        fn set(name: &str, value: &str) {
+            unsafe { std::env::set_var(name, value) };
+        }
+
+        fn remove(name: &str) {
+            unsafe { std::env::remove_var(name) };
+        }
+    }
+
+    impl Drop for EnvironmentGuard {
+        fn drop(&mut self) {
+            for (name, value) in &self.values {
+                match value {
+                    Some(value) => unsafe { std::env::set_var(name, value) },
+                    None => unsafe { std::env::remove_var(name) },
+                }
+            }
+        }
+    }
 
     fn registry() -> Registry {
         Registry {
@@ -239,17 +278,33 @@ mod tests {
     fn the_owner_falls_back_when_the_injected_token_is_blank() {
         // A blank KNIVES_OWNER is a plugin bug, not an identity. Treating it as one
         // would let two agents share a claim.
-        unsafe { std::env::set_var("KNIVES_OWNER", "   ") };
+        let _environment = EnvironmentGuard::capture(&["KNIVES_OWNER"]);
+        EnvironmentGuard::set("KNIVES_OWNER", "   ");
         let owner = current_owner();
-        unsafe { std::env::remove_var("KNIVES_OWNER") };
         assert_ne!(owner.trim(), "");
     }
 
     #[test]
     fn claude_session_id_is_the_owner_when_knives_owner_is_absent() {
-        unsafe { std::env::remove_var("KNIVES_OWNER") };
-        unsafe { std::env::set_var("CLAUDE_CODE_SESSION_ID", "abc-123") };
+        let _environment = EnvironmentGuard::capture(&["KNIVES_OWNER", "CLAUDE_CODE_SESSION_ID"]);
+        EnvironmentGuard::remove("KNIVES_OWNER");
+        EnvironmentGuard::set("CLAUDE_CODE_SESSION_ID", "abc-123");
         assert_eq!(current_owner(), "abc-123");
-        unsafe { std::env::remove_var("CLAUDE_CODE_SESSION_ID") };
+    }
+
+    #[test]
+    fn a_blank_claude_session_id_falls_back_to_the_user() {
+        // Given: plugin identity is absent and Claude Code reports only whitespace.
+        let _environment =
+            EnvironmentGuard::capture(&["KNIVES_OWNER", "CLAUDE_CODE_SESSION_ID", "USER"]);
+        EnvironmentGuard::remove("KNIVES_OWNER");
+        EnvironmentGuard::set("CLAUDE_CODE_SESSION_ID", "   ");
+        EnvironmentGuard::set("USER", "terminal-user");
+
+        // When: a claim owner is chosen.
+        let owner = current_owner();
+
+        // Then: the user identity wins rather than a shared blank owner.
+        assert_eq!(owner, "terminal-user");
     }
 }
