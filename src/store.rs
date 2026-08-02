@@ -268,6 +268,15 @@ impl Store {
             .collect()
     }
 
+    pub fn current_agent(&self) -> Option<&str> {
+        self.state
+            .extra
+            .get("currentAgent")
+            .or_else(|| self.state.extra.get("current_agent"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|agent| !agent.trim().is_empty())
+    }
+
     pub fn mark_fork_only(&mut self, target: &BranchTarget, why: &str) {
         let _ = self
             .state

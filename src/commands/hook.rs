@@ -11,7 +11,7 @@ use crate::hook::claude_code::{
 };
 use crate::hook::guidance::{claim_lines, format_guidance, format_notice, guidance_for};
 use crate::hook::opencode::{self, Event as OpenCodeEvent, EventKind as OpenCodeEventKind};
-use crate::hook::resolve::{argument_paths, managed_repo_for};
+use crate::hook::resolve::{Match, argument_paths, managed_repo_for};
 use crate::hook::state::SessionState;
 use crate::store::{Store, default_state_path};
 
@@ -64,37 +64,40 @@ fn run_opencode() -> anyhow::Result<Option<String>> {
             return opencode::empty_response().map(Some).map_err(Into::into);
         }
     };
+    let kind = event.kind();
     let home = config_home();
-    let response = match event.kind() {
+    let response = match kind {
         OpenCodeEventKind::ToolExecuteAfter => opencode_tool_after(&event, &home),
         OpenCodeEventKind::ChatSystem => opencode_chat_system(&event),
         OpenCodeEventKind::ShellEnv => opencode_shell_env(&event),
         OpenCodeEventKind::Compacting => opencode_compacting(&event, &home),
         OpenCodeEventKind::Other => opencode::empty_response().map_err(Into::into),
-    }?;
-    Ok(Some(response))
+    };
+    match response {
+        Ok(response) => Ok(Some(response)),
+        Err(error) => {
+            eprintln!("knives hook: {error:#}");
+            empty_opencode_response(kind).map(Some)
+        }
+    }
+}
+
+fn empty_opencode_response(kind: OpenCodeEventKind) -> anyhow::Result<String> {
+    match kind {
+        OpenCodeEventKind::ToolExecuteAfter => opencode::tool_response(""),
+        OpenCodeEventKind::ChatSystem => opencode::system_response("", &[]),
+        OpenCodeEventKind::ShellEnv => opencode::environment_response(None),
+        OpenCodeEventKind::Compacting | OpenCodeEventKind::Other => opencode::empty_response(),
+    }
+    .map_err(Into::into)
 }
 
 fn opencode_tool_after(event: &OpenCodeEvent, home: &Path) -> anyhow::Result<String> {
     let Some(session_id) = event.session_id() else {
         return opencode::tool_response("").map_err(Into::into);
     };
-    let Some(tool) = event.tool() else {
-        return opencode::tool_response("").map_err(Into::into);
-    };
-    if !OPENCODE_RELEVANT_TOOLS.contains(&tool) {
-        return opencode::tool_response("").map_err(Into::into);
-    }
-    let Some(args) = event.args() else {
-        return opencode::tool_response("").map_err(Into::into);
-    };
-    let paths = argument_paths(tool, args);
-    if paths.is_empty() {
-        return opencode::tool_response("").map_err(Into::into);
-    }
-
-    let registry = load(&default_config_path())?;
-    let Some(matched) = managed_repo_for(&paths, &registry.guidance_roots()) else {
+    let Some(matched) = relevant_tool_match(event.tool(), event.args(), OPENCODE_RELEVANT_TOOLS)?
+    else {
         return opencode::tool_response("").map_err(Into::into);
     };
     let flags = SessionState::load(home, OPENCODE, session_id).repo(&matched.repo.root);
@@ -148,6 +151,12 @@ fn opencode_shell_env(event: &OpenCodeEvent) -> anyhow::Result<String> {
 }
 
 fn owner_for(cwd: &str) -> anyhow::Result<Option<String>> {
+    if let Some(owner) = std::env::var("KNIVES_OWNER")
+        .ok()
+        .filter(|owner| !owner.trim().is_empty())
+    {
+        return Ok(Some(owner));
+    }
     let registry = load(&default_config_path())?;
     let Some(matched) = managed_repo_for(&[PathBuf::from(cwd)], &registry.guidance_roots()) else {
         return Ok(None);
@@ -155,16 +164,10 @@ fn owner_for(cwd: &str) -> anyhow::Result<Option<String>> {
     if matched.repo.kind != GuidanceRootKind::Managed {
         return Ok(None);
     }
-    if let Some(owner) = std::env::var("KNIVES_OWNER")
-        .ok()
-        .filter(|owner| !owner.trim().is_empty())
-    {
-        return Ok(Some(owner));
-    }
-    if let Some(owner) = current_agent()? {
-        return Ok(Some(owner));
-    }
     let store = Store::open(default_state_path())?;
+    if let Some(owner) = store.current_agent() {
+        return Ok(Some(owner.to_owned()));
+    }
     let owners = store
         .claims(None)
         .into_iter()
@@ -176,24 +179,9 @@ fn owner_for(cwd: &str) -> anyhow::Result<Option<String>> {
         .flatten())
 }
 
-fn current_agent() -> anyhow::Result<Option<String>> {
-    let path = default_state_path();
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
-    };
-    let state: serde_json::Value = serde_json::from_str(&text)?;
-    Ok(["currentAgent", "current_agent"]
-        .into_iter()
-        .find_map(|key| state.get(key).and_then(serde_json::Value::as_str))
-        .filter(|owner| !owner.trim().is_empty())
-        .map(str::to_owned))
-}
-
 fn opencode_compacting(event: &OpenCodeEvent, home: &Path) -> anyhow::Result<String> {
     if let Some(session_id) = event.session_id() {
-        SessionState::delete(home, OPENCODE, session_id);
+        let _ = SessionState::update(home, OPENCODE, session_id, SessionState::clear)?;
     }
     opencode::empty_response().map_err(Into::into)
 }
@@ -252,22 +240,8 @@ fn post_tool_use(event: &Event, home: &Path) -> anyhow::Result<Option<String>> {
     let Some(session_id) = event.session_id() else {
         return Ok(None);
     };
-    let Some(tool_name) = event.tool_name() else {
-        return Ok(None);
-    };
-    if !RELEVANT_TOOLS.contains(&tool_name) {
-        return Ok(None);
-    }
-    let Some(tool_input) = event.tool_input() else {
-        return Ok(None);
-    };
-    let paths = argument_paths(tool_name, tool_input);
-    if paths.is_empty() {
-        return Ok(None);
-    }
-
-    let registry = load(&default_config_path())?;
-    let Some(matched) = managed_repo_for(&paths, &registry.guidance_roots()) else {
+    let Some(matched) = relevant_tool_match(event.tool_name(), event.tool_input(), RELEVANT_TOOLS)?
+    else {
         return Ok(None);
     };
     let state = SessionState::load(home, CLAUDE_CODE, session_id);
@@ -297,6 +271,28 @@ fn post_tool_use(event: &Event, home: &Path) -> anyhow::Result<Option<String>> {
     response(POST_TOOL_USE_WIRE_NAME, &parts.join("\n"))
         .map(Some)
         .map_err(Into::into)
+}
+
+fn relevant_tool_match(
+    tool: Option<&str>,
+    args: Option<&serde_json::Value>,
+    relevant_tools: &[&str],
+) -> anyhow::Result<Option<Match>> {
+    let Some(tool) = tool else {
+        return Ok(None);
+    };
+    if !relevant_tools.contains(&tool) {
+        return Ok(None);
+    }
+    let Some(args) = args else {
+        return Ok(None);
+    };
+    let paths = argument_paths(tool, args);
+    if paths.is_empty() {
+        return Ok(None);
+    }
+    let registry = load(&default_config_path())?;
+    Ok(managed_repo_for(&paths, &registry.guidance_roots()))
 }
 
 fn pre_compact(event: &Event, home: &Path) -> anyhow::Result<Option<String>> {

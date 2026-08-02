@@ -13,15 +13,26 @@ use serde_json::{Value, json};
 const SESSION_ID: &str = "opencode-hook-test-session";
 
 fn run_hook_input(home: &Path, input: &str) -> (bool, String, String) {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_knives"))
+    run_hook_input_with_owner(home, input, None)
+}
+
+fn run_hook_input_with_owner(
+    home: &Path,
+    input: &str,
+    owner: Option<&str>,
+) -> (bool, String, String) {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_knives"));
+    command
         .args(["hook", "opencode"])
         .env("KNIVES_CONFIG_HOME", home)
         .env_remove("KNIVES_OWNER")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn hook");
+        .stderr(Stdio::piped());
+    if let Some(owner) = owner {
+        command.env("KNIVES_OWNER", owner);
+    }
+    let mut child = command.spawn().expect("spawn hook");
     child
         .stdin
         .take()
@@ -37,7 +48,11 @@ fn run_hook_input(home: &Path, input: &str) -> (bool, String, String) {
 }
 
 fn run_hook(home: &Path, event: &Value) -> Value {
-    let (success, output, errors) = run_hook_input(home, &event.to_string());
+    run_hook_with_owner(home, event, None)
+}
+
+fn run_hook_with_owner(home: &Path, event: &Value, owner: Option<&str>) -> Value {
+    let (success, output, errors) = run_hook_input_with_owner(home, &event.to_string(), owner);
     assert!(success, "a hook must never fail the session: {errors}");
     serde_json::from_str(&output).expect("hook output JSON")
 }
@@ -55,11 +70,9 @@ struct Repositories {
 impl Repositories {
     fn new() -> Self {
         let home = tempfile::tempdir().expect("config home");
-        let alpha = home.path().join("alpha");
         let beta = home.path().join("beta");
         let trusted = home.path().join("trusted");
         for (root, instructions) in [
-            (&alpha, "alpha instructions"),
             (&beta, "beta instructions"),
             (&trusted, "trusted instructions"),
         ] {
@@ -68,10 +81,8 @@ impl Repositories {
             std::fs::write(root.join("file.txt"), "content").expect("write file");
         }
         let config = format!(
-            "[repos.alpha]\npath = \"{}\"\nupstream = \"u\"\norigin = \"o\"\n\n\
-             [repos.beta]\npath = \"{}\"\nupstream = \"u\"\norigin = \"o\"\n\n\
+            "[repos.beta]\npath = \"{}\"\nupstream = \"u\"\norigin = \"o\"\n\n\
              [trusted.trusted]\npath = \"{}\"\n",
-            alpha.display(),
             beta.display(),
             trusted.display()
         );
@@ -86,6 +97,11 @@ impl Repositories {
             beta,
             trusted,
         }
+    }
+
+    fn write_state(&self, state: &Value) {
+        std::fs::write(self.home.path().join("state.json"), state.to_string())
+            .expect("write state");
     }
 }
 
@@ -127,7 +143,7 @@ fn tool_after_honors_disabled_notice_and_trusted_roots() {
     // Given: managed and trusted repositories with instructions.
     let repos = Repositories::new();
 
-    // When: managed guidance disables its notice and trusted guidance permits all parts.
+    // When: managed guidance disables its notice and trusted guidance explicitly permits all parts.
     let managed = run_hook(
         repos.home.path(),
         &tool(
@@ -137,7 +153,10 @@ fn tool_after_honors_disabled_notice_and_trusted_roots() {
     );
     let trusted = run_hook(
         repos.home.path(),
-        &tool(&repos.trusted.join("file.txt"), None),
+        &tool(
+            &repos.trusted.join("file.txt"),
+            Some(json!({"notice": true, "guidance": true})),
+        ),
     );
 
     // Then: guidance is emitted without a managed-fork notice in both cases.
@@ -172,6 +191,25 @@ fn chat_system_returns_formatted_guidance_and_raw_bodies() {
 }
 
 #[test]
+fn chat_system_returns_guidance_for_a_trusted_directory() {
+    // Given: a trusted repository whose root has instructions.
+    let repos = Repositories::new();
+    let event =
+        json!({"event": "chat.system", "session_id": SESSION_ID, "directory": repos.trusted});
+
+    // When: OpenCode requests its system context.
+    let output = run_hook(repos.home.path(), &event);
+
+    // Then: trusted guidance has the same system response shape as managed guidance.
+    assert!(
+        output["system"]
+            .as_str()
+            .is_some_and(|text| text.contains("<knives-guidance-"))
+    );
+    assert_eq!(output["bodies"], json!(["trusted instructions"]));
+}
+
+#[test]
 fn shell_env_returns_the_managed_claim_owner_only() {
     // Given: a managed root with one claim, a trusted root, and an outside directory.
     let repos = Repositories::new();
@@ -199,6 +237,77 @@ fn shell_env_returns_the_managed_claim_owner_only() {
 }
 
 #[test]
+fn shell_env_returns_an_environment_owner_outside_any_root() {
+    // Given: an outside directory and an explicit owner override.
+    let repos = Repositories::new();
+    let outside = repos.home.path().join("outside");
+    std::fs::create_dir_all(&outside).expect("create outside directory");
+    let event = json!({"event": "shell.env", "cwd": outside});
+
+    // When: OpenCode requests its shell environment.
+    let output = run_hook_with_owner(repos.home.path(), &event, Some("env-owner"));
+
+    // Then: the explicit owner does not require a managed repository match.
+    assert_eq!(output, json!({"owner": "env-owner"}));
+}
+
+#[test]
+fn shell_env_returns_an_environment_owner_for_a_trusted_root() {
+    // Given: a trusted root and an explicit owner override.
+    let repos = Repositories::new();
+    let event = json!({"event": "shell.env", "cwd": repos.trusted});
+
+    // When: OpenCode requests its shell environment.
+    let output = run_hook_with_owner(repos.home.path(), &event, Some("env-owner"));
+
+    // Then: the explicit owner wins before managed-root filtering.
+    assert_eq!(output, json!({"owner": "env-owner"}));
+}
+
+#[test]
+fn shell_env_prefers_current_agent_over_claim_owners() {
+    // Given: a managed root with both a current agent and a distinct claim owner.
+    let repos = Repositories::new();
+    repos.write_state(&json!({
+        "currentAgent": "current-agent",
+        "claims": {"beta/feat/claimed": {
+            "repo": "beta", "branch": "feat/claimed", "owner": "claim-agent",
+            "why": "porting", "started": "2026-01-01T00:00:00Z", "files": []
+        }}
+    }));
+    let event = json!({"event": "shell.env", "cwd": repos.beta});
+
+    // When: OpenCode requests the owner.
+    let output = run_hook(repos.home.path(), &event);
+
+    // Then: the state-level current agent wins.
+    assert_eq!(output, json!({"owner": "current-agent"}));
+}
+
+#[test]
+fn shell_env_returns_no_owner_for_distinct_claim_owners() {
+    // Given: a managed root with claims held by two different owners.
+    let repos = Repositories::new();
+    repos.write_state(&json!({"claims": {
+        "beta/feat/one": {
+            "repo": "beta", "branch": "feat/one", "owner": "agent-one",
+            "why": "one", "started": "2026-01-01T00:00:00Z", "files": []
+        },
+        "beta/feat/two": {
+            "repo": "beta", "branch": "feat/two", "owner": "agent-two",
+            "why": "two", "started": "2026-01-01T00:00:00Z", "files": []
+        }
+    }}));
+    let event = json!({"event": "shell.env", "cwd": repos.beta});
+
+    // When: OpenCode requests the owner.
+    let output = run_hook(repos.home.path(), &event);
+
+    // Then: an ambiguous claim set does not select an owner.
+    assert_eq!(output, json!({"owner": null}));
+}
+
+#[test]
 fn compacting_resets_the_tool_after_budget() {
     // Given: a session that has spent its managed-repository budget.
     let repos = Repositories::new();
@@ -219,24 +328,86 @@ fn compacting_resets_the_tool_after_budget() {
 }
 
 #[test]
-fn malformed_and_pathless_input_return_empty_responses_without_failing() {
-    // Given: malformed input and a pathless Bash event with an invalid registry.
+fn malformed_input_returns_an_empty_response_without_failing() {
+    // Given: malformed hook input.
     let home = tempfile::tempdir().expect("config home");
-    std::fs::write(home.path().join("repos.toml"), "[[[garbage").expect("write malformed registry");
 
-    // When: each reaches the hook binary.
+    // When: it reaches the hook binary.
     let (success, malformed, errors) = run_hook_input(home.path(), "not json");
-    let pathless = run_hook(
-        home.path(),
-        &json!({"event": "tool.execute.after", "session_id": SESSION_ID, "tool": "bash", "args": {}}),
-    );
 
-    // Then: neither can interrupt OpenCode, and the pathless fast path skips the registry.
+    // Then: it cannot interrupt OpenCode and has an empty envelope.
     assert!(success);
     assert_eq!(
         serde_json::from_str::<Value>(&malformed).expect("empty JSON response"),
         json!({})
     );
     assert!(!errors.is_empty(), "malformed input is reported on stderr");
-    assert_eq!(pathless, json!({"addition": ""}));
+}
+
+#[test]
+fn pathless_tool_after_skips_the_registry_without_stderr() {
+    // Given: a pathless Bash event and a malformed registry.
+    let home = tempfile::tempdir().expect("config home");
+    std::fs::write(home.path().join("repos.toml"), "[[[garbage").expect("write malformed registry");
+    let event = json!({"event": "tool.execute.after", "session_id": SESSION_ID, "tool": "bash", "args": {}});
+
+    // When: the event reaches the hook binary.
+    let (success, output, errors) = run_hook_input(home.path(), &event.to_string());
+
+    // Then: the pathless fast path returns its envelope without loading the registry.
+    assert!(success);
+    assert_eq!(output, r#"{"addition":""}"#);
+    assert!(
+        errors.is_empty(),
+        "pathless fast path must stay quiet: {errors}"
+    );
+}
+
+#[test]
+fn pathful_tool_after_returns_an_empty_envelope_when_the_registry_is_malformed() {
+    // Given: a pathful tool event and a malformed registry.
+    let home = tempfile::tempdir().expect("config home");
+    std::fs::write(home.path().join("repos.toml"), "[[[garbage").expect("write malformed registry");
+    let event = tool(&home.path().join("named.txt"), None);
+
+    // When: the event reaches the hook binary.
+    let (success, output, errors) = run_hook_input(home.path(), &event.to_string());
+
+    // Then: the tool envelope remains parseable and the error is on stderr.
+    assert!(success);
+    assert_eq!(output, r#"{"addition":""}"#);
+    assert!(!errors.is_empty(), "registry failure is reported on stderr");
+}
+
+#[test]
+fn shell_env_returns_an_empty_envelope_when_the_registry_is_malformed() {
+    // Given: a shell-environment event and a malformed registry.
+    let home = tempfile::tempdir().expect("config home");
+    std::fs::write(home.path().join("repos.toml"), "[[[garbage").expect("write malformed registry");
+    let event = json!({"event": "shell.env", "cwd": home.path()});
+
+    // When: the event reaches the hook binary.
+    let (success, output, errors) = run_hook_input(home.path(), &event.to_string());
+
+    // Then: the environment envelope remains parseable and the error is on stderr.
+    assert!(success);
+    assert_eq!(output, r#"{"owner":null}"#);
+    assert!(!errors.is_empty(), "registry failure is reported on stderr");
+}
+
+#[test]
+fn shell_env_returns_an_empty_envelope_when_the_state_is_malformed() {
+    // Given: a managed shell-environment event and malformed state.
+    let repos = Repositories::new();
+    std::fs::write(repos.home.path().join("state.json"), "[[[garbage")
+        .expect("write malformed state");
+    let event = json!({"event": "shell.env", "cwd": repos.beta});
+
+    // When: the event reaches the hook binary.
+    let (success, output, errors) = run_hook_input(repos.home.path(), &event.to_string());
+
+    // Then: the environment envelope remains parseable and the error is on stderr.
+    assert!(success);
+    assert_eq!(output, r#"{"owner":null}"#);
+    assert!(!errors.is_empty(), "state failure is reported on stderr");
 }
