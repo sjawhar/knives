@@ -87,14 +87,9 @@ fn session_start(event: &Event, home: &Path) -> anyhow::Result<Option<String>> {
     let _ = SessionState::update(home, CLAUDE_CODE, session_id, |state| {
         state.mark(&matched.repo.root, true, false);
     })?;
-    response(
-        event
-            .hook_event_name()
-            .ok_or_else(|| anyhow::anyhow!("session-start event has no name"))?,
-        &notice,
-    )
-    .map(Some)
-    .map_err(Into::into)
+    response(EventKind::SessionStart.wire_name(), &notice)
+        .map(Some)
+        .map_err(Into::into)
 }
 
 fn post_tool_use(event: &Event, home: &Path) -> anyhow::Result<Option<String>> {
@@ -143,14 +138,9 @@ fn post_tool_use(event: &Event, home: &Path) -> anyhow::Result<Option<String>> {
     let _ = SessionState::update(home, CLAUDE_CODE, session_id, |state| {
         state.mark(&matched.repo.root, include_notice, guidance.is_some());
     })?;
-    response(
-        event
-            .hook_event_name()
-            .ok_or_else(|| anyhow::anyhow!("post-tool-use event has no name"))?,
-        &parts.join("\n"),
-    )
-    .map(Some)
-    .map_err(Into::into)
+    response(EventKind::PostToolUse.wire_name(), &parts.join("\n"))
+        .map(Some)
+        .map_err(Into::into)
 }
 
 fn pre_compact(event: &Event, home: &Path) -> anyhow::Result<Option<String>> {

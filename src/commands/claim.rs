@@ -148,6 +148,7 @@ pub fn run_release(target: &BranchTarget, superseded_by: Option<&str>) -> anyhow
     Ok(Exit::Ok)
 }
 
+// allow: SIZE_OK: 321 lines - claim coordination keeps private environment-restoration tests beside the owner resolver.
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -156,9 +157,18 @@ mod tests {
     )]
     use std::ffi::OsString;
     use std::path::PathBuf;
+    use std::sync::{Mutex, MutexGuard};
 
     use super::*;
     use crate::config::RepoEntry;
+
+    static ENVIRONMENT_LOCK: Mutex<()> = Mutex::new(());
+
+    fn environment_lock() -> MutexGuard<'static, ()> {
+        ENVIRONMENT_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 
     struct EnvironmentGuard {
         values: Vec<(&'static str, Option<OsString>)>,
@@ -174,11 +184,20 @@ mod tests {
             }
         }
 
-        fn set(name: &str, value: &str) {
+        fn assert_captures(&self, name: &str) {
+            assert!(
+                self.values.iter().any(|(captured, _)| *captured == name),
+                "{name} was not captured"
+            );
+        }
+
+        fn set(&self, name: &str, value: &str) {
+            self.assert_captures(name);
             unsafe { std::env::set_var(name, value) };
         }
 
-        fn remove(name: &str) {
+        fn remove(&self, name: &str) {
+            self.assert_captures(name);
             unsafe { std::env::remove_var(name) };
         }
     }
@@ -275,36 +294,28 @@ mod tests {
     }
 
     #[test]
-    fn the_owner_falls_back_when_the_injected_token_is_blank() {
-        // A blank KNIVES_OWNER is a plugin bug, not an identity. Treating it as one
-        // would let two agents share a claim.
-        let _environment = EnvironmentGuard::capture(&["KNIVES_OWNER"]);
-        EnvironmentGuard::set("KNIVES_OWNER", "   ");
-        let owner = current_owner();
-        assert_ne!(owner.trim(), "");
-    }
-
-    #[test]
-    fn claude_session_id_is_the_owner_when_knives_owner_is_absent() {
-        let _environment = EnvironmentGuard::capture(&["KNIVES_OWNER", "CLAUDE_CODE_SESSION_ID"]);
-        EnvironmentGuard::remove("KNIVES_OWNER");
-        EnvironmentGuard::set("CLAUDE_CODE_SESSION_ID", "abc-123");
-        assert_eq!(current_owner(), "abc-123");
-    }
-
-    #[test]
-    fn a_blank_claude_session_id_falls_back_to_the_user() {
-        // Given: plugin identity is absent and Claude Code reports only whitespace.
-        let _environment =
+    fn current_owner_skips_blank_plugin_values_then_uses_claude_and_user() {
+        let _lock = environment_lock();
+        let environment =
             EnvironmentGuard::capture(&["KNIVES_OWNER", "CLAUDE_CODE_SESSION_ID", "USER"]);
-        EnvironmentGuard::remove("KNIVES_OWNER");
-        EnvironmentGuard::set("CLAUDE_CODE_SESSION_ID", "   ");
-        EnvironmentGuard::set("USER", "terminal-user");
+        environment.set("KNIVES_OWNER", "   ");
+        environment.remove("CLAUDE_CODE_SESSION_ID");
+        environment.set("USER", "terminal-user");
+        assert_eq!(current_owner(), "terminal-user");
 
-        // When: a claim owner is chosen.
-        let owner = current_owner();
+        environment.remove("KNIVES_OWNER");
+        environment.set("CLAUDE_CODE_SESSION_ID", "abc-123");
+        assert_eq!(current_owner(), "abc-123");
+        environment.set("CLAUDE_CODE_SESSION_ID", "   ");
+        assert_eq!(current_owner(), "terminal-user");
+    }
 
-        // Then: the user identity wins rather than a shared blank owner.
-        assert_eq!(owner, "terminal-user");
+    #[test]
+    #[should_panic(expected = "CLAUDE_CODE_SESSION_ID was not captured")]
+    fn environment_guard_rejects_mutation_of_an_uncaptured_variable() {
+        let _lock = environment_lock();
+        let environment = EnvironmentGuard::capture(&["KNIVES_OWNER"]);
+
+        environment.set("CLAUDE_CODE_SESSION_ID", "abc-123");
     }
 }

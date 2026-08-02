@@ -4,7 +4,7 @@
     clippy::unreachable,
     reason = "fixture setup failures and JSON shape mismatches are test failures"
 )]
-// allow: SIZE_OK — real-binary adapter scenarios share one fixture and process harness.
+// allow: SIZE_OK: 417 lines - real-binary adapter scenarios share one fixture and process harness.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -201,13 +201,14 @@ fn session_start_inside_a_trusted_root_emits_nothing() {
 
 #[test]
 fn an_unknown_hook_event_emits_nothing() {
-    // Given: an event name the adapter does not recognize.
-    let home = tempfile::tempdir().expect("config home");
-    let mut unknown = event("session-start", home.path(), None);
+    // Given: an event name the adapter does not recognize inside a managed repository.
+    let repos = Repositories::new();
+    repos.configure(false);
+    let mut unknown = event("session-start", &repos.beta, None);
     unknown["hook_event_name"] = json!("UnknownEvent");
 
     // When: it reaches the hook binary.
-    let output = run_hook(home.path(), &unknown);
+    let output = run_hook(repos.home.path(), &unknown);
 
     // Then: unsupported events are ignored.
     assert!(output.is_empty(), "was: {output}");

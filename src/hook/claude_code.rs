@@ -12,6 +12,18 @@ pub enum EventKind {
     Other,
 }
 
+impl EventKind {
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            Self::SessionStart => "SessionStart",
+            Self::PostToolUse => "PostToolUse",
+            Self::PreCompact => "PreCompact",
+            Self::SessionEnd => "SessionEnd",
+            Self::Other => "Other",
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Event {
     value: Value,
@@ -33,10 +45,6 @@ impl Event {
 
     pub const fn kind(&self) -> EventKind {
         self.kind
-    }
-
-    pub fn hook_event_name(&self) -> Option<&str> {
-        self.text("hook_event_name")
     }
 
     pub fn session_id(&self) -> Option<&str> {
