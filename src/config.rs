@@ -11,6 +11,64 @@ use serde::{Deserialize, Serialize};
 
 use crate::ids::RepoName;
 
+#[cfg(test)]
+pub mod test_support {
+    use std::ffi::OsString;
+    use std::sync::{Mutex, MutexGuard};
+
+    pub(crate) static ENVIRONMENT_LOCK: Mutex<()> = Mutex::new(());
+
+    pub(crate) fn environment_lock() -> MutexGuard<'static, ()> {
+        ENVIRONMENT_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[derive(Debug)]
+    pub(crate) struct EnvironmentGuard {
+        values: Vec<(&'static str, Option<OsString>)>,
+    }
+
+    impl EnvironmentGuard {
+        pub(crate) fn capture(names: &[&'static str]) -> Self {
+            Self {
+                values: names
+                    .iter()
+                    .map(|name| (*name, std::env::var_os(name)))
+                    .collect(),
+            }
+        }
+
+        fn assert_captures(&self, name: &str) {
+            assert!(
+                self.values.iter().any(|(captured, _)| *captured == name),
+                "{name} was not captured"
+            );
+        }
+
+        pub(crate) fn set(&self, name: &str, value: &str) {
+            self.assert_captures(name);
+            unsafe { std::env::set_var(name, value) };
+        }
+
+        pub(crate) fn remove(&self, name: &str) {
+            self.assert_captures(name);
+            unsafe { std::env::remove_var(name) };
+        }
+    }
+
+    impl Drop for EnvironmentGuard {
+        fn drop(&mut self) {
+            for (name, value) in &self.values {
+                match value {
+                    Some(value) => unsafe { std::env::set_var(name, value) },
+                    None => unsafe { std::env::remove_var(name) },
+                }
+            }
+        }
+    }
+}
+
 /// What a remote is for, rather than what it is called.
 ///
 /// An enum, so an unknown role cannot be requested and no runtime lookup error
@@ -340,6 +398,7 @@ mod tests {
         clippy::indexing_slicing,
         reason = "indexing a result in a test is the assertion; a panic is the failure"
     )]
+    use super::test_support::{EnvironmentGuard, environment_lock};
     use super::*;
 
     const SAMPLE: &str = r#"
@@ -456,7 +515,9 @@ release = "https://example.invalid/releases.git"
     fn consumer_paths_are_expanded_like_the_repo_path() {
         // An unexpanded `~` made a recorded consumer look like one pinning nothing,
         // which reads identically to having no consumer at all.
-        unsafe { std::env::set_var("HOME", "/home/someone") };
+        let _lock = environment_lock();
+        let environment = EnvironmentGuard::capture(&["HOME"]);
+        environment.set("HOME", "/home/someone");
         let dir = tempfile::tempdir().unwrap();
         let text = "[repos.demo]\npath = \"/tmp/demo\"\nupstream = \"u\"\norigin = \"o\"\n\
                     consumers = [\"~/one/default\", \"~/two/default\"]\n";
@@ -555,7 +616,9 @@ release = "https://example.invalid/releases.git"
 
     #[test]
     fn a_trusted_tilde_path_resolves_like_a_fork_path() {
-        unsafe { std::env::set_var("HOME", "/home/someone") };
+        let _lock = environment_lock();
+        let environment = EnvironmentGuard::capture(&["HOME"]);
+        environment.set("HOME", "/home/someone");
         let dir = tempfile::tempdir().unwrap();
         let text = "[trusted.workbench]\npath = \"~/workbench/default\"\n";
         let registry = load(&write(dir.path(), text)).unwrap();
@@ -590,7 +653,9 @@ release = "https://example.invalid/releases.git"
         // The two sides disagreeing meant `path = "~/repos/x"` was a working
         // allowlist entry and a broken CLI entry, so the trust set and the tool
         // covered different directories.
-        unsafe { std::env::set_var("HOME", "/home/someone") };
+        let _lock = environment_lock();
+        let environment = EnvironmentGuard::capture(&["HOME"]);
+        environment.set("HOME", "/home/someone");
         assert_eq!(
             expand_registry_path(Path::new("~/repos/x"), Path::new("/cfg")),
             PathBuf::from("/home/someone/repos/x")

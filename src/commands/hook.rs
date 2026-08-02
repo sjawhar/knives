@@ -6,7 +6,9 @@ use std::path::{Path, PathBuf};
 
 use crate::cli::{Exit, HookHarness};
 use crate::config::{GuidanceRoot, GuidanceRootKind, default_config_path, load};
-use crate::hook::claude_code::{Event, EventKind, response};
+use crate::hook::claude_code::{
+    Event, EventKind, POST_TOOL_USE_WIRE_NAME, SESSION_START_WIRE_NAME, response,
+};
 use crate::hook::guidance::{claim_lines, format_guidance, format_notice, guidance_for};
 use crate::hook::opencode::{self, Event as OpenCodeEvent, EventKind as OpenCodeEventKind};
 use crate::hook::resolve::{argument_paths, managed_repo_for};
@@ -241,7 +243,7 @@ fn session_start(event: &Event, home: &Path) -> anyhow::Result<Option<String>> {
     let _ = SessionState::update(home, CLAUDE_CODE, session_id, |state| {
         state.mark(&matched.repo.root, true, false);
     })?;
-    response(EventKind::SessionStart.wire_name(), &notice)
+    response(SESSION_START_WIRE_NAME, &notice)
         .map(Some)
         .map_err(Into::into)
 }
@@ -292,7 +294,7 @@ fn post_tool_use(event: &Event, home: &Path) -> anyhow::Result<Option<String>> {
     let _ = SessionState::update(home, CLAUDE_CODE, session_id, |state| {
         state.mark(&matched.repo.root, include_notice, guidance.is_some());
     })?;
-    response(EventKind::PostToolUse.wire_name(), &parts.join("\n"))
+    response(POST_TOOL_USE_WIRE_NAME, &parts.join("\n"))
         .map(Some)
         .map_err(Into::into)
 }

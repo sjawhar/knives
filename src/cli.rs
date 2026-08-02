@@ -284,10 +284,13 @@ mod tests {
         reason = "indexing a result in a test is the assertion; a panic is the failure"
     )]
     use super::*;
+    use crate::config::test_support::{EnvironmentGuard, environment_lock};
     use clap::CommandFactory as _;
 
     #[test]
     fn json_is_chosen_for_an_agent_and_text_for_a_person() {
+        let _lock = environment_lock();
+        let environment = EnvironmentGuard::capture(&["KNIVES_OWNER"]);
         // Agents were grepping human output to count findings by detector. Explicit
         // flags win; otherwise the environment decides.
         assert!(machine_readable(true, false), "--json is explicit");
@@ -295,10 +298,10 @@ mod tests {
         // Neither flag: the environment decides, and this tool's own plugin exports
         // `KNIVES_OWNER` into every agent shell, so it is a direct signal rather than a
         // guess about terminals.
-        unsafe { std::env::set_var("KNIVES_OWNER", "someone") };
+        environment.set("KNIVES_OWNER", "someone");
         assert!(machine_readable(false, false), "an agent shell gets JSON");
         assert!(!machine_readable(false, true), "--text still wins there");
-        unsafe { std::env::remove_var("KNIVES_OWNER") };
+        environment.remove("KNIVES_OWNER");
     }
 
     #[test]

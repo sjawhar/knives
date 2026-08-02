@@ -12,17 +12,8 @@ pub enum EventKind {
     Other,
 }
 
-impl EventKind {
-    pub const fn wire_name(self) -> &'static str {
-        match self {
-            Self::SessionStart => "SessionStart",
-            Self::PostToolUse => "PostToolUse",
-            Self::PreCompact => "PreCompact",
-            Self::SessionEnd => "SessionEnd",
-            Self::Other => "Other",
-        }
-    }
-}
+pub const SESSION_START_WIRE_NAME: &str = "SessionStart";
+pub const POST_TOOL_USE_WIRE_NAME: &str = "PostToolUse";
 
 #[derive(Debug)]
 pub struct Event {

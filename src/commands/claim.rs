@@ -3,6 +3,7 @@
 //! Enforcement layer three. Advisory on purpose: layers one and two are
 //! default-correct paths and detectors, and hard refusal waits for evidence
 //! that advice was insufficient.
+// allow: SIZE_OK: 288 lines - claim coordination keeps owner-resolution behavior beside branch claim outcomes.
 
 use crate::cli::Exit;
 use crate::config::{Registry, default_config_path, load};
@@ -15,6 +16,8 @@ use crate::store::{Store, default_state_path};
 /// provides its session ID. A claim cannot live in a shell environment variable:
 /// each tool call is its own process and subagents are spawned by the harness, so
 /// an `export` reaches nothing. The OS user is the fallback for a human at a terminal.
+/// A blank `KNIVES_OWNER` is a plugin bug, not an identity. Treating it as one
+/// would let two agents share a claim. The same applies to `CLAUDE_CODE_SESSION_ID`.
 pub fn current_owner() -> String {
     std::env::var("KNIVES_OWNER")
         .ok()
@@ -148,70 +151,19 @@ pub fn run_release(target: &BranchTarget, superseded_by: Option<&str>) -> anyhow
     Ok(Exit::Ok)
 }
 
-// allow: SIZE_OK: 321 lines - claim coordination keeps private environment-restoration tests beside the owner resolver.
 #[cfg(test)]
 mod tests {
     #![allow(
         clippy::indexing_slicing,
         reason = "indexing a result in a test is the assertion; a panic is the failure"
     )]
-    use std::ffi::OsString;
     use std::path::PathBuf;
-    use std::sync::{Mutex, MutexGuard};
 
     use super::*;
-    use crate::config::RepoEntry;
-
-    static ENVIRONMENT_LOCK: Mutex<()> = Mutex::new(());
-
-    fn environment_lock() -> MutexGuard<'static, ()> {
-        ENVIRONMENT_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    struct EnvironmentGuard {
-        values: Vec<(&'static str, Option<OsString>)>,
-    }
-
-    impl EnvironmentGuard {
-        fn capture(names: &[&'static str]) -> Self {
-            Self {
-                values: names
-                    .iter()
-                    .map(|name| (*name, std::env::var_os(name)))
-                    .collect(),
-            }
-        }
-
-        fn assert_captures(&self, name: &str) {
-            assert!(
-                self.values.iter().any(|(captured, _)| *captured == name),
-                "{name} was not captured"
-            );
-        }
-
-        fn set(&self, name: &str, value: &str) {
-            self.assert_captures(name);
-            unsafe { std::env::set_var(name, value) };
-        }
-
-        fn remove(&self, name: &str) {
-            self.assert_captures(name);
-            unsafe { std::env::remove_var(name) };
-        }
-    }
-
-    impl Drop for EnvironmentGuard {
-        fn drop(&mut self) {
-            for (name, value) in &self.values {
-                match value {
-                    Some(value) => unsafe { std::env::set_var(name, value) },
-                    None => unsafe { std::env::remove_var(name) },
-                }
-            }
-        }
-    }
+    use crate::config::{
+        RepoEntry,
+        test_support::{EnvironmentGuard, environment_lock},
+    };
 
     fn registry() -> Registry {
         Registry {
@@ -294,7 +246,7 @@ mod tests {
     }
 
     #[test]
-    fn current_owner_skips_blank_plugin_values_then_uses_claude_and_user() {
+    fn current_owner_filters_a_blank_knives_owner() {
         let _lock = environment_lock();
         let environment =
             EnvironmentGuard::capture(&["KNIVES_OWNER", "CLAUDE_CODE_SESSION_ID", "USER"]);
@@ -302,11 +254,29 @@ mod tests {
         environment.remove("CLAUDE_CODE_SESSION_ID");
         environment.set("USER", "terminal-user");
         assert_eq!(current_owner(), "terminal-user");
+    }
+
+    #[test]
+    fn current_owner_uses_the_session_id_when_knives_owner_is_absent() {
+        let _lock = environment_lock();
+        let environment =
+            EnvironmentGuard::capture(&["KNIVES_OWNER", "CLAUDE_CODE_SESSION_ID", "USER"]);
 
         environment.remove("KNIVES_OWNER");
         environment.set("CLAUDE_CODE_SESSION_ID", "abc-123");
+        environment.set("USER", "terminal-user");
         assert_eq!(current_owner(), "abc-123");
+    }
+
+    #[test]
+    fn current_owner_falls_back_to_user_when_the_session_id_is_blank() {
+        let _lock = environment_lock();
+        let environment =
+            EnvironmentGuard::capture(&["KNIVES_OWNER", "CLAUDE_CODE_SESSION_ID", "USER"]);
+
+        environment.remove("KNIVES_OWNER");
         environment.set("CLAUDE_CODE_SESSION_ID", "   ");
+        environment.set("USER", "terminal-user");
         assert_eq!(current_owner(), "terminal-user");
     }
 
