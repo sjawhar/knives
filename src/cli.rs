@@ -7,7 +7,7 @@
 
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 /// Process exit codes, as a type so a command cannot invent one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,6 +95,11 @@ pub fn machine_readable(json: bool, text: bool) -> bool {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Receive a hook event from an agent harness. Always exits successfully.
+    Hook {
+        #[arg(value_enum)]
+        harness: HookHarness,
+    },
     /// Configure remote roles for a repo. Writes the registry.
     Init {
         /// Repo directory. Defaults to the current directory.
@@ -221,6 +226,12 @@ pub enum Command {
     },
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum HookHarness {
+    ClaudeCode,
+    Opencode,
+}
+
 #[derive(Debug, Subcommand)]
 pub enum ReleaseAction {
     /// Cut the release. The only thing knives writes, and it still never pushes.
@@ -300,6 +311,7 @@ mod tests {
         // Given: the command surface from the design, with minimum arguments
         let invocations: Vec<Vec<&str>> = vec![
             vec!["knives", "init"],
+            vec!["knives", "hook", "claude-code"],
             vec!["knives", "repos"],
             vec!["knives", "sync", "--all"],
             vec!["knives", "preflight"],

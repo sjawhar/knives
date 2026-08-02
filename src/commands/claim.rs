@@ -11,14 +11,15 @@ use crate::store::{Store, default_state_path};
 
 /// Who is claiming.
 ///
-/// `KNIVES_OWNER` is what the `OpenCode` plugin injects. A claim cannot live in a
-/// shell environment variable: each tool call is its own process and subagents
-/// are spawned by the harness, so an `export` reaches nothing. The OS user is
-/// the fallback for a human at a terminal.
+/// `KNIVES_OWNER` is what the `OpenCode` plugin injects. Claude Code instead
+/// provides its session ID. A claim cannot live in a shell environment variable:
+/// each tool call is its own process and subagents are spawned by the harness, so
+/// an `export` reaches nothing. The OS user is the fallback for a human at a terminal.
 pub fn current_owner() -> String {
     std::env::var("KNIVES_OWNER")
         .ok()
         .filter(|value| !value.trim().is_empty())
+        .or_else(|| std::env::var("CLAUDE_CODE_SESSION_ID").ok())
         .or_else(|| std::env::var("USER").ok())
         .unwrap_or_else(|| "unknown".to_owned())
 }
@@ -242,5 +243,13 @@ mod tests {
         let owner = current_owner();
         unsafe { std::env::remove_var("KNIVES_OWNER") };
         assert_ne!(owner.trim(), "");
+    }
+
+    #[test]
+    fn claude_session_id_is_the_owner_when_knives_owner_is_absent() {
+        unsafe { std::env::remove_var("KNIVES_OWNER") };
+        unsafe { std::env::set_var("CLAUDE_CODE_SESSION_ID", "abc-123") };
+        assert_eq!(current_owner(), "abc-123");
+        unsafe { std::env::remove_var("CLAUDE_CODE_SESSION_ID") };
     }
 }
