@@ -4,6 +4,7 @@
     reason = "fixture setup failures and JSON shape mismatches are test failures"
 )]
 
+use std::fs::File;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -345,6 +346,29 @@ fn malformed_input_returns_an_empty_response_without_failing() {
 }
 
 #[test]
+fn unreadable_stdin_returns_an_empty_response_without_failing() {
+    // Given: a hook whose standard input is a directory rather than readable event data.
+    let home = tempfile::tempdir().expect("config home");
+    let stdin = File::open(home.path()).expect("open config directory");
+
+    // When: OpenCode invokes the hook.
+    let output = Command::new(env!("CARGO_BIN_EXE_knives"))
+        .args(["hook", "opencode"])
+        .env("KNIVES_CONFIG_HOME", home.path())
+        .stdin(Stdio::from(stdin))
+        .output()
+        .expect("run hook");
+
+    // Then: the hook reports the read failure but preserves OpenCode's empty envelope.
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"{}");
+    assert!(
+        !output.stderr.is_empty(),
+        "stdin failure is reported on stderr"
+    );
+}
+
+#[test]
 fn pathless_tool_after_skips_the_registry_without_stderr() {
     // Given: a pathless Bash event and a malformed registry.
     let home = tempfile::tempdir().expect("config home");
@@ -380,6 +404,22 @@ fn pathful_tool_after_returns_an_empty_envelope_when_the_registry_is_malformed()
 }
 
 #[test]
+fn chat_system_returns_an_empty_envelope_when_the_registry_is_malformed() {
+    // Given: a chat-system event and a malformed registry.
+    let home = tempfile::tempdir().expect("config home");
+    std::fs::write(home.path().join("repos.toml"), "[[[garbage").expect("write malformed registry");
+    let event = json!({"event": "chat.system", "directory": home.path()});
+
+    // When: OpenCode requests system context.
+    let (success, output, errors) = run_hook_input(home.path(), &event.to_string());
+
+    // Then: its system envelope remains parseable and the error is on stderr.
+    assert!(success);
+    assert_eq!(output, r#"{"system":"","bodies":[]}"#);
+    assert!(!errors.is_empty(), "registry failure is reported on stderr");
+}
+
+#[test]
 fn shell_env_returns_an_empty_envelope_when_the_registry_is_malformed() {
     // Given: a shell-environment event and a malformed registry.
     let home = tempfile::tempdir().expect("config home");
@@ -409,5 +449,22 @@ fn shell_env_returns_an_empty_envelope_when_the_state_is_malformed() {
     // Then: the environment envelope remains parseable and the error is on stderr.
     assert!(success);
     assert_eq!(output, r#"{"owner":null}"#);
+    assert!(!errors.is_empty(), "state failure is reported on stderr");
+}
+
+#[test]
+fn compacting_returns_an_empty_envelope_when_its_state_path_is_invalid() {
+    // Given: compaction whose session-state directory is a regular file.
+    let home = tempfile::tempdir().expect("config home");
+    std::fs::write(home.path().join("hook-sessions"), "not a directory")
+        .expect("write invalid state path");
+    let event = json!({"event": "compacting", "session_id": SESSION_ID});
+
+    // When: OpenCode compacts the session.
+    let (success, output, errors) = run_hook_input(home.path(), &event.to_string());
+
+    // Then: it receives the empty envelope while the state error is reported on stderr.
+    assert!(success);
+    assert_eq!(output, "{}");
     assert!(!errors.is_empty(), "state failure is reported on stderr");
 }

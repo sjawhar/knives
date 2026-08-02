@@ -12,11 +12,15 @@ use serde::{Deserialize, Serialize};
 use crate::ids::RepoName;
 
 #[cfg(test)]
-pub mod test_support {
+#[allow(
+    clippy::redundant_pub_crate,
+    reason = "crate-visible test helpers are consumed from sibling test modules"
+)]
+pub(crate) mod test_support {
     use std::ffi::OsString;
     use std::sync::{Mutex, MutexGuard};
 
-    pub(crate) static ENVIRONMENT_LOCK: Mutex<()> = Mutex::new(());
+    static ENVIRONMENT_LOCK: Mutex<()> = Mutex::new(());
 
     pub(crate) fn environment_lock() -> MutexGuard<'static, ()> {
         ENVIRONMENT_LOCK

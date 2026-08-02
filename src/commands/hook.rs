@@ -56,7 +56,10 @@ pub fn run(harness: HookHarness) -> Exit {
 
 fn run_opencode() -> anyhow::Result<Option<String>> {
     let mut input = String::new();
-    std::io::stdin().read_to_string(&mut input)?;
+    if let Err(error) = std::io::stdin().read_to_string(&mut input) {
+        eprintln!("knives hook: {error:#}");
+        return opencode::empty_response().map(Some).map_err(Into::into);
+    }
     let event = match OpenCodeEvent::parse(&input) {
         Ok(event) => event,
         Err(error) => {
