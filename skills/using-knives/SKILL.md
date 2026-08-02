@@ -13,6 +13,8 @@ It reports. It does not advise: an earlier version attached a suggested fix to e
 
 Every command takes its repo from the directory you are standing in. Name one only when you are somewhere else, or want a different one.
 
+`knives hook claude-code` and `knives hook opencode` are harness plumbing, not commands for people to run.
+
 ## The commands
 
 ### `knives repos`

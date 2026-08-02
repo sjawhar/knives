@@ -70,6 +70,16 @@ tar xzf knives-v0.1.2-linux-x86_64.tar.gz
 install -m755 knives-*/bin/knives ~/.local/bin/
 ```
 
+Install the Claude Code plugin separately:
+
+```
+/plugin marketplace add sjawhar/knives
+/plugin install knives@knives
+```
+
+The Claude Code plugin ships its hooks and skills. The binary still comes from the release archive
+above. Without that binary, the hooks exit silently.
+
 Or build from source with a Rust toolchain:
 
 ```
@@ -119,6 +129,7 @@ are somewhere else.
 | `knives depends` | record that a branch cannot land before another repo's pull request |
 | `knives release` | plan a dated release, or cut one |
 | `knives init` | register a checkout |
+| `knives hook` | harness plumbing, not for humans |
 
 `--json` works on any of them, and is the default when the environment indicates an agent is
 running it. `--text` forces prose.
@@ -132,19 +143,24 @@ An agent working in a fork does not receive that fork's `AGENTS.md`, because ins
 injection is bounded to the directory the session started in. It can therefore read, edit, and
 open pull requests against a repository whose contribution rules it has never seen.
 
-The OpenCode plugin shipped in the release closes that. The first time a call names a file
-inside a managed repository, it says the repository is managed and shared, names any branches
-other agents hold, and appends that repository's own root guidance as data. Once per repository
-per session.
+Knives has adapters for OpenCode and Claude Code. The OpenCode plugin is a thin shim that calls
+`knives hook opencode` in the binary. The Claude Code plugin installs shell hooks that call
+`knives hook claude-code` in the same binary.
 
-The boundary that made the gap is a security control, so the plugin re-establishes an
-equivalent one rather than removing it. The registry is the allowlist: only repositories listed
-there contribute guidance, containment is checked by path components rather than string prefix,
+Both adapters identify managed repositories and report branches other agents hold. OpenCode
+adds the notice and repository guidance on the first relevant tool call that names a file there.
+Claude Code adds guidance when a relevant tool call reaches a foreign repository. It does not
+add separate guidance for the session repository because Claude Code already loads that
+repository's `CLAUDE.md`.
+
+The boundary that made the gap is a security control, so both adapters re-establish an equivalent
+one rather than removing it. The registry is the allowlist: only repositories listed there
+contribute guidance, containment is checked by path components rather than string prefix,
 symlinks are resolved first, and nested guidance inside a repository is mentioned rather than
 injected. Guidance arrives wrapped in a per-injection nonce and framed as data, so a repository
 whose files you are reading cannot forge an instruction to you.
 
-Three skills ship alongside it: `fork-work` for what to check before touching a fork,
+Three skills ship with both adapters: `fork-work` for what to check before touching a fork,
 `using-knives` for the CLI, and `pr-preflight` for contributing upstream.
 
 ## What it does not do

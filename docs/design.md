@@ -53,7 +53,7 @@ internally and should not sit in a personal fork; the release remote is optional
 falls back to `origin` when absent, because not every fork is consumed by anything.
 
 `consumers` is optional too: the checkouts that pin this repo's releases. A list, because
-a fork can be consumed by several things at once and they can sit on different releases —
+a fork can be consumed by several things at once and they can sit on different releases.
 the pin logic always reasoned about that while the registry could only record one of them,
 so one consumer being current silently answered for all of them. Recorded so that
 `knives repos` can say which consumer is pinned behind the newest cut without being asked,
@@ -196,7 +196,29 @@ Cuts or repairs a dated release. Everything here is a check, never a prompt: a C
 
 Releases stay **flat**. A nested integration node was considered and rejected: it makes dropping a landed parent harder, forces staleness detection to recurse, creates code that cannot be upstreamed until several PRs land, and destroys the empty-merge invariant that makes a cut verifiable. The case that prompted it dissolved by exposing an object rather than copying its fields.
 
-## The OpenCode plugin
+## Harness adapters
+
+`knives hook` holds the hook core. `knives hook claude-code` and `knives hook opencode` read one
+event from standard input, apply the same repository and guidance logic, and write their
+harness-specific response. The command logs failures but exits successfully, so a hook failure
+does not interrupt an agent session.
+
+| Shape | Harness | Adapter | Event behavior |
+|---|---|---|---|
+| A | Claude Code | A plugin-bundled shell hook calls `knives hook claude-code`. | `SessionStart` emits a notice when the working directory is a managed repository. `PostToolUse` handles relevant tools that name a path, adding an unspent notice and guidance. `PreCompact` and a compact `SessionStart` clear session state. `SessionEnd` deletes it. |
+| B | OpenCode | The in-process TypeScript plugin is a shim that spawns `knives hook opencode`. | `tool.execute.after` uses the notice and guidance parts in one response budget. `chat.system` returns formatted guidance and its raw bodies. `shell.env` uses `KNIVES_OWNER` when set, then resolves an owner from a managed working directory. `compacting` clears session state. |
+
+Each session records `noticed` and `guided` flags for every repository. The Claude Code adapter
+marks only `noticed` at `SessionStart`, then marks guidance after a relevant foreign-repository
+tool use. It omits guidance when the event working directory is in that repository, because
+Claude Code already loads the session repository's `CLAUDE.md`. The OpenCode adapter marks both
+flags after any nonempty addition, so its notice and guidance consume one budget.
+
+The OpenCode protocol fails soft. For a parsed event, a processing failure returns that event's
+empty response envelope. Malformed input returns an empty object. Both cases keep the hook exit
+successful.
+
+### Trust boundary
 
 Instruction injection is bounded to the instance directory:
 
@@ -208,27 +230,32 @@ For a session rooted in one repo reading a file in another, that is false on ent
 
 **The boundary is a security control and this design must not defeat it.** If any read injected the read file's directory guidance, reading untrusted content would become a prompt-injection vector: an adversarial `AGENTS.md` arrives as a `<system-reminder>`, which a model treats as instruction rather than data. The risk is acute for anyone who authors adversarial fixture trees on purpose.
 
-So the plugin re-establishes an equivalent boundary rather than removing it:
+So the adapters re-establish an equivalent boundary rather than removing it:
 
-- **The allowlist is the registry, which names two kinds of tree.** `[repos.*]` is what we maintain forks of. `[trusted.*]` is a repository whose instructions we want an agent to see but which we do not maintain — a company repo with no upstream to contribute to. Both are trust roots for guidance; only the first is touched by any fork command. Any other tree gets nothing: fixtures, scratch clones, downloaded repos.
-  - Two sections rather than one section with optional remotes. A fork entry must carry `upstream` and `origin`, enforced when the file is parsed; relaxing that to fit a non-fork repository would trade a parse-time failure for a failure at the first query. Both sides of the tool have to know the section exists: an unrecognised header invalidates the whole registry in the plugin's parser, so one trusted entry would otherwise disable guidance everywhere, and serde would drop the section the next time `init` rewrote the file.
+- **The allowlist is the registry, which names two kinds of tree.** `[repos.*]` is what we maintain forks of. `[trusted.*]` is a repository whose instructions we want an agent to see but which we do not maintain, such as a company repo with no upstream to contribute to. Both are trust roots for guidance; only the first is touched by any fork command. Any other tree gets nothing: fixtures, scratch clones, downloaded repos.
+  - Two sections rather than one section with optional remotes. A fork entry must carry `upstream` and `origin`, enforced when the file is parsed; relaxing that to fit a non-fork repository would trade a parse-time failure for a failure at the first query. Both sides of the tool have to know the section exists: an unrecognised header invalidates the whole registry in the configuration parser, so one trusted entry would otherwise disable guidance everywhere, and serde would drop the section the next time `init` rewrote the file.
 - **Inject only root-level guidance from a managed repo**, plus our own overlay, which lives outside the repo. A nested `AGENTS.md` inside a managed repo is *mentioned, not injected*.
 - **Mention `CONTRIBUTING.md` rather than injecting it.** Flagging that it exists is what the agent needs; its contents are long, and every injected byte is instruction-channel surface.
 - **Containment by `relative()`, never string prefix**, so a sibling path like `<dir>-2` cannot pass as `<dir>`.
 - **Canonicalise symlinks before the containment test**, or a symlink inside a managed repo can smuggle an untrusted tree's guidance in.
 
-Hook the write-side tools too, not just `read`: `grep`, `glob`, `edit`, `write`, `patch` and `bash` inject nothing today, so grep-then-edit sees nothing even in-tree.
+Both adapters inspect write-side tools as well as reads, so a grep-then-edit sequence can reach
+the same notice and guidance path as a read.
 
-The plugin's second job is **claim-token injection**. Claims cannot live in shell environment variables, because each tool call is its own process and subagents are spawned by the harness rather than by that shell, so an `export` reaches nothing.
+The OpenCode adapter also supports **claim-token injection**. Claims cannot live in shell
+environment variables, because each tool call is its own process and subagents are spawned by
+the harness rather than by that shell, so an `export` reaches nothing.
 
-`config.instructions` is the non-plugin alternative and does support absolute out-of-tree paths, but it is static: pointing it at every managed repo injects all of them into every session regardless of relevance.
+`config.instructions` is the non-adapter alternative and does support absolute out-of-tree
+paths, but it is static: pointing it at every managed repo injects all of them into every session
+regardless of relevance.
 
 One genuine upstream bug found nearby: the boundary test uses a raw string prefix, which widens the trust boundary past intent. A `relative()`-based containment check already exists elsewhere in the same codebase and is the model to copy. A second issue, guidance being silently dropped for image and PDF reads, fails closed and is low severity.
 
 ### What it injects, and when
 
-Once per repository per session, the first time a call names a file inside a managed
-repository:
+When a relevant call names a file inside a managed repository, the adapters can produce these
+two parts:
 
 - **A notice.** That this is a knives-managed fork, that another agent may be working in
   it, which branches are claimed and by whom, and to use knives rather than jj or git
@@ -237,19 +264,17 @@ repository:
   all and an agent was never told where it had walked into.
 - **The repository's own guidance**, when it has any, framed as data.
 
-Triggered by files a call actually names — `path`, `filePath`, or an absolute or
-`~`-rooted path in a command — and deliberately not by a command's working directory. A
+Triggered by files a call actually names, `path`, `filePath`, or an absolute or `~`-rooted path
+in a command, and deliberately not by a command's working directory. A
 batch of `gh` and `git` calls whose working directory sat inside a repository used to
 spend that repository's one injection while touching no repository content, so a later
 read of a real file got nothing.
 
-The record of what has been injected is shared across every plugin instance in the
-process. OpenCode builds plugin state per instance, keyed by directory, so an agent
-working across several repositories gets several instances; keeping the record inside one
-of them deduplicated nothing between them, and one session received the same 35KB
-`AGENTS.md` three times.
+The record is stored in a file for each harness and session. Its per-repository `noticed` and
+`guided` flags survive calls made through different OpenCode plugin instances and prevent a
+repository from spending the same announcement budget more than once.
 
-### Configuration
+### OpenCode configuration
 
 ```jsonc
 "plugin": [
@@ -262,6 +287,14 @@ All default to on, and a plain string entry keeps them that way. They are separa
 because they cost very different amounts: the notice is a couple of hundred bytes,
 the guidance can be 35KB of somebody else's contribution rules, and `owner` only exports
 `KNIVES_OWNER` into shell environments.
+
+### OpenCode binary discovery
+
+The OpenCode shim resolves the binary in this order: `KNIVES_BIN`, the sibling
+`<prefix>/bin/knives` in an installed release tree, the development tree's
+`target/debug/knives`, then `knives` on `PATH`. The development tree comes before `PATH` so a
+`file://` development install uses the checkout build instead of an older installed binary.
+The Claude Code shell hook resolves `knives` from `PATH` and exits silently when it is absent.
 
 ## Enforcement
 
