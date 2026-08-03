@@ -174,6 +174,137 @@ fn tool_after_honors_disabled_notice_and_trusted_roots() {
 }
 
 #[test]
+fn tool_after_trust_roots_injects_guidance_without_managed_notice() {
+    // Given: an unregistered checkout with AGENTS.md and a [trust].roots config entry.
+    let home = tempfile::tempdir().expect("config home");
+    let trust_root = home.path().join("unregistered-trust-root");
+    std::fs::create_dir_all(trust_root.join(".jj")).expect("create checkout");
+    std::fs::write(trust_root.join("AGENTS.md"), "trust root instructions")
+        .expect("write trust instructions");
+    std::fs::write(trust_root.join("file.txt"), "content").expect("write file");
+    std::fs::write(
+        home.path().join("repos.toml"),
+        format!("[trust]\nroots = [\"{}\"]\n", trust_root.display()),
+    )
+    .expect("write trust config");
+
+    // When: a tool.execute.after event reads a file under the [trust].roots path.
+    let output = run_hook(
+        home.path(),
+        &tool(
+            &trust_root.join("file.txt"),
+            Some(json!({"notice": true, "guidance": true})),
+        ),
+    );
+
+    // Then: guidance is injected but the managed notice is never emitted.
+    assert!(
+        addition(&output).contains("<knives-guidance-"),
+        "trust roots must inject guidance: {output}"
+    );
+    assert!(
+        !addition(&output).contains("<knives-notice-"),
+        "trust roots must not emit managed notice: {output}"
+    );
+}
+
+#[test]
+fn trusted_owner_guidance_requires_the_checkout_to_be_the_git_toplevel() {
+    // Given: an attacker-controlled nested `.jj` directory under a Git checkout
+    // whose remote self-declares a trusted owner.
+    let home = tempfile::tempdir().expect("config home");
+    let git_root = home.path().join("parent-git");
+    let nested = git_root.join("node_modules/evil");
+    let initialized = std::process::Command::new("git")
+        .args(["init", git_root.to_str().expect("utf-8 test path")])
+        .status()
+        .expect("run git init");
+    assert!(initialized.success());
+    let remote_added = std::process::Command::new("git")
+        .args([
+            "-C",
+            git_root.to_str().expect("utf-8 test path"),
+            "remote",
+            "add",
+            "origin",
+            "https://forge.invalid/trusted-owner/parent.git",
+        ])
+        .status()
+        .expect("add trusted remote");
+    assert!(remote_added.success());
+    std::fs::create_dir_all(nested.join(".jj")).expect("create nested pseudo-checkout");
+    std::fs::write(nested.join("AGENTS.md"), "attacker instructions").expect("write guidance");
+    std::fs::write(nested.join("file.txt"), "content").expect("write file");
+    std::fs::write(
+        home.path().join("repos.toml"),
+        "[trust]\nowners = [\"trusted-owner\"]\n",
+    )
+    .expect("write trust config");
+
+    // When: the hook reads the nested attacker's file.
+    let output = run_hook(
+        home.path(),
+        &tool(
+            &nested.join("file.txt"),
+            Some(json!({"notice": true, "guidance": true})),
+        ),
+    );
+
+    // Then: the parent checkout's remote identity cannot trust nested guidance.
+    assert_eq!(addition(&output), "");
+}
+
+#[test]
+fn a_git_toplevel_with_a_trusted_origin_injects_guidance() {
+    // Given: a real Git checkout whose own origin claims a trusted owner.
+    let home = tempfile::tempdir().expect("config home");
+    let root = home.path().join("trusted-git");
+    let initialized = std::process::Command::new("git")
+        .args(["init", root.to_str().expect("utf-8 test path")])
+        .status()
+        .expect("run git init");
+    assert!(initialized.success());
+    let remote_added = std::process::Command::new("git")
+        .args([
+            "-C",
+            root.to_str().expect("utf-8 test path"),
+            "remote",
+            "add",
+            "origin",
+            "https://forge.invalid/trusted-owner/repo.git",
+        ])
+        .status()
+        .expect("add trusted remote");
+    assert!(remote_added.success());
+    std::fs::write(root.join("AGENTS.md"), "trusted owner instructions").expect("write guidance");
+    std::fs::write(root.join("file.txt"), "content").expect("write file");
+    std::fs::write(
+        home.path().join("repos.toml"),
+        "[trust]\nowners = [\"trusted-owner\"]\n",
+    )
+    .expect("write trust config");
+
+    // When: the hook reads a file in that checkout.
+    let output = run_hook(
+        home.path(),
+        &tool(
+            &root.join("file.txt"),
+            Some(json!({"notice": true, "guidance": true})),
+        ),
+    );
+
+    // Then: the documented self-declared-owner grant injects guidance only.
+    assert!(
+        addition(&output).contains("<knives-guidance-"),
+        "was: {output}"
+    );
+    assert!(
+        !addition(&output).contains("<knives-notice-"),
+        "was: {output}"
+    );
+}
+
+#[test]
 fn chat_system_returns_formatted_guidance_and_raw_bodies() {
     // Given: a repository whose root has instructions.
     let repos = Repositories::new();
@@ -235,6 +366,25 @@ fn shell_env_returns_the_managed_claim_owner_only() {
     assert_eq!(managed, json!({"owner": "agent-one"}));
     assert_eq!(trusted, json!({"owner": null}));
     assert_eq!(outside, json!({"owner": null}));
+}
+
+#[test]
+fn shell_env_never_exports_a_claim_owner_for_a_trusted_repo() {
+    // Given: a trusted root with a claim that otherwise looks owner-exportable.
+    let repos = Repositories::new();
+    repos.write_state(&json!({"claims": {"trusted/feat/claimed": {
+        "repo": "trusted", "branch": "feat/claimed", "owner": "attacker",
+        "why": "claim", "started": "2026-01-01T00:00:00Z", "files": []
+    }}}));
+
+    // When: OpenCode requests shell ownership for the trusted root.
+    let output = run_hook(
+        repos.home.path(),
+        &json!({"event": "shell.env", "cwd": repos.trusted}),
+    );
+
+    // Then: trusted guidance roots do not acquire managed owner exports.
+    assert_eq!(output, json!({"owner": null}));
 }
 
 #[test]

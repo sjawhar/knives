@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 
 use crate::cli::Exit;
 use crate::commands::claim::current_owner;
-use crate::commands::status::UPSTREAM_TRUNK;
 use crate::config::{default_config_path, load};
 use crate::ids::{BranchName, BranchTarget, RepoName};
 use crate::jj::{add_workspace, fetch_all};
@@ -26,6 +25,7 @@ pub fn run(repo_name: &RepoName, branch: &BranchName, why: Option<&str>) -> anyh
         eprintln!("unknown repo {repo_name}");
         return Ok(Exit::Usage);
     };
+    let upstream_trunk = entry.upstream_trunk();
 
     let mut store = Store::open_for_update(default_state_path())?;
     let owner = current_owner();
@@ -56,7 +56,7 @@ pub fn run(repo_name: &RepoName, branch: &BranchName, why: Option<&str>) -> anyh
         &entry.path,
         &branch.as_str().replace('/', "-"),
         &destination,
-        UPSTREAM_TRUNK,
+        &upstream_trunk,
     )?;
 
     let reason = why.unwrap_or("started work");
@@ -68,7 +68,7 @@ pub fn run(repo_name: &RepoName, branch: &BranchName, why: Option<&str>) -> anyh
     store.save()?;
 
     println!(
-        "workspace {} based on {UPSTREAM_TRUNK}\nclaimed {repo_name}/{branch} for {owner}",
+        "workspace {} based on {upstream_trunk}\nclaimed {repo_name}/{branch} for {owner}",
         destination.display()
     );
     Ok(Exit::Ok)

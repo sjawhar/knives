@@ -107,11 +107,15 @@ pub struct RepoEntry {
     pub path: PathBuf,
     pub upstream: String,
     pub origin: String,
-    /// The branch upstream expects pull requests against. Defaults to `main`.
+    /// Upstream's trunk: the branch we fork from, measure landed against, and
+    /// target pull requests at. Defaults to "main". Configurable because not
+    /// every upstream calls its default branch `main`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub release: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_branch: Option<String>,
     /// A command whose output ends in the number of tests, used to check that a
     /// release cut did not drop a branch's tests.
     ///
@@ -155,16 +159,50 @@ impl RepoEntry {
         }
     }
 
+    /// The branch upstream treats as its trunk: what we fork from, measure
+    /// landed against, and target pull requests at. One field, not two, because
+    /// no repo we manage has ever split them; `base` keeps its name for
+    /// compatibility with existing registries.
+    pub fn trunk(&self) -> &str {
+        self.base.as_deref().unwrap_or("main")
+    }
+
+    /// How releases are named, derived from `release_branch`.
+    pub fn release_scheme(&self) -> crate::ids::ReleaseScheme {
+        self.release_branch
+            .as_deref()
+            .map_or(crate::ids::ReleaseScheme::Dated, |name| {
+                crate::ids::ReleaseScheme::Fixed(crate::ids::BranchName::new(name))
+            })
+    }
+
+    /// The upstream remote's view of the trunk, e.g. `dev@upstream`.
+    ///
+    /// Every landed probe and fork point measures against this, never the local
+    /// trunk: our fork's trunk answers about the wrong repository.
+    pub fn upstream_trunk(&self) -> String {
+        format!("{}@{}", self.trunk(), Role::Upstream)
+    }
+
     /// The branch a pull request from this repo should target.
     ///
-    /// Configurable because not every upstream calls its default branch `main`.
+    /// Kept for existing PR-base callers; trunk is the branch they target.
     pub fn default_base(&self) -> &str {
-        self.base.as_deref().unwrap_or("main")
+        self.trunk()
     }
 
     /// Whether releases live somewhere other than our branches.
     pub const fn has_split_release(&self) -> bool {
         self.release.is_some()
+    }
+
+    /// The remote role that publishes releases for this repository.
+    pub const fn publish_remote(&self) -> &str {
+        if self.has_split_release() {
+            "release"
+        } else {
+            "origin"
+        }
     }
 }
 
@@ -183,6 +221,31 @@ impl RepoEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TrustedEntry {
     pub path: PathBuf,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrustRules {
+    /// Directory subtrees whose repositories are all trusted for guidance.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roots: Vec<PathBuf>,
+    /// Forge owners whose repositories are trusted for guidance, matched
+    /// against remote URLs case-insensitively.
+    ///
+    /// SECURITY: matches SELF-DECLARED remote URLs read from the candidate
+    /// checkout's own git config — not forge-authenticated; any cloned repo can
+    /// claim any owner; grants guidance-as-data injection only (same grant as a
+    /// `[trusted]` entry), never fork-command access; prefer roots when in doubt.
+    /// The probe accepts only the checkout's own Git toplevel, so nested directories
+    /// cannot inherit an enclosing checkout's identity. Owner rules read Git remote
+    /// config, so jj-only checkouts match only through `roots`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub owners: Vec<String>,
+}
+
+impl TrustRules {
+    pub const fn is_empty(&self) -> bool {
+        self.roots.is_empty() && self.owners.is_empty()
+    }
 }
 
 /// Whether a guidance root comes from a maintained fork or trusted instructions.
@@ -222,6 +285,10 @@ pub struct Registry {
     /// does not know about would be silently deleted the next time `init` runs.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub trusted: BTreeMap<String, TrustedEntry>,
+    /// Trust rules stay on this type because `save` rewrites the whole file;
+    /// an unknown section would otherwise be silently deleted by `init`.
+    #[serde(default, skip_serializing_if = "TrustRules::is_empty")]
+    pub trust: TrustRules,
 }
 
 impl Registry {
@@ -298,6 +365,8 @@ pub enum ConfigError {
         path: PathBuf,
         source: Box<toml::de::Error>,
     },
+    #[error("{path} is not a valid registry: {detail}")]
+    Invalid { path: PathBuf, detail: String },
     #[error("serialising the registry: {source}")]
     Serialise {
         #[from]
@@ -367,6 +436,34 @@ pub fn load(path: &Path) -> Result<Registry, ConfigError> {
     let home = path.parent().unwrap_or_else(|| Path::new(".")).to_owned();
     for entry in registry.repos.values_mut() {
         entry.path = entry.resolved_path(&home);
+        if let Some(name) = entry.release_branch.as_deref() {
+            if name.is_empty() {
+                return Err(ConfigError::Invalid {
+                    path: path.to_owned(),
+                    detail: "release_branch is empty; a fixed release scheme needs a branch name"
+                        .to_owned(),
+                });
+            }
+            if name == entry.trunk() {
+                return Err(ConfigError::Invalid {
+                    path: path.to_owned(),
+                    detail: format!(
+                        "release_branch {name:?} names the trunk; a release branch shadowing the \
+                         trunk corrupts every trunk exclusion"
+                    ),
+                });
+            }
+            if name.starts_with(crate::ids::RELEASE_PREFIX) {
+                return Err(ConfigError::Invalid {
+                    path: path.to_owned(),
+                    detail: format!(
+                        "release_branch {name:?} sits in the dated {} namespace; the two schemes \
+                         must not collide",
+                        crate::ids::RELEASE_PREFIX
+                    ),
+                });
+            }
+        }
         // Consumer paths get the same treatment as the repo path. Leaving `~` unexpanded
         // made a recorded consumer read as pinning nothing, which is the same wrong answer
         // as having no consumer at all.
@@ -378,6 +475,9 @@ pub fn load(path: &Path) -> Result<Registry, ConfigError> {
     }
     for entry in registry.trusted.values_mut() {
         entry.path = entry.resolved_path(&home);
+    }
+    for root in &mut registry.trust.roots {
+        *root = expand_registry_path(root, &home);
     }
     Ok(registry)
 }
@@ -441,7 +541,61 @@ release = "https://example.invalid/releases.git"
         let registry = load(&write(dir.path(), SAMPLE)).unwrap();
         let entry = &registry.repos["example"];
         assert_eq!(entry.remote(Role::Release), entry.remote(Role::Origin));
+        assert_eq!(entry.publish_remote(), "origin");
         assert!(!entry.has_split_release());
+    }
+
+    #[test]
+    fn the_release_scheme_is_dated_unless_a_fixed_branch_is_stated() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = "[repos.demo]\npath = \"/tmp/d\"\nupstream = \"u\"\norigin = \"o\"\n";
+        let registry = load(&write(dir.path(), plain)).unwrap();
+        assert_eq!(
+            registry.repos["demo"].release_scheme(),
+            crate::ids::ReleaseScheme::Dated
+        );
+
+        let fixed = "[repos.demo]\npath = \"/tmp/d\"\nupstream = \"u\"\norigin = \"o\"\n\
+                     release_branch = \"integration\"\n";
+        let registry = load(&write(dir.path(), fixed)).unwrap();
+        assert_eq!(
+            registry.repos["demo"].release_scheme(),
+            crate::ids::ReleaseScheme::Fixed(crate::ids::BranchName::new("integration"))
+        );
+    }
+
+    #[test]
+    fn an_invalid_release_branch_fails_to_parse() {
+        // A release branch named for the trunk would make every trunk exclusion
+        // also exclude the release, and one under release/ would collide with the
+        // dated scheme's namespace. Both corrupt every downstream check, so the
+        // registry refuses at parse time, the same place a missing role fails.
+        let dir = tempfile::tempdir().unwrap();
+        for (text, needle) in [
+            (
+                "[repos.d]\npath = \"/tmp/d\"\nupstream = \"u\"\norigin = \"o\"\n\
+                 release_branch = \"\"\n",
+                "empty",
+            ),
+            (
+                "[repos.d]\npath = \"/tmp/d\"\nupstream = \"u\"\norigin = \"o\"\n\
+                 release_branch = \"main\"\n",
+                "trunk",
+            ),
+            (
+                "[repos.d]\npath = \"/tmp/d\"\nupstream = \"u\"\norigin = \"o\"\n\
+                 base = \"dev\"\nrelease_branch = \"dev\"\n",
+                "trunk",
+            ),
+            (
+                "[repos.d]\npath = \"/tmp/d\"\nupstream = \"u\"\norigin = \"o\"\n\
+                 release_branch = \"release/2026-01-01\"\n",
+                "release/",
+            ),
+        ] {
+            let message = load(&write(dir.path(), text)).unwrap_err().to_string();
+            assert!(message.contains(needle), "for {text}: was {message}");
+        }
     }
 
     #[test]
@@ -461,6 +615,24 @@ release = "https://example.invalid/releases.git"
     }
 
     #[test]
+    fn the_trunk_is_the_base_field_and_defaults_to_main() {
+        // The trunk we fork from, measure landed against, and target PRs at are the
+        // same branch in every repo we know of, so one field serves both meanings.
+        let dir = tempfile::tempdir().unwrap();
+        let plain = "[repos.demo]\npath = \"/tmp/d\"\nupstream = \"u\"\norigin = \"o\"\n";
+        let registry = load(&write(dir.path(), plain)).unwrap();
+        assert_eq!(registry.repos["demo"].trunk(), "main");
+        assert_eq!(registry.repos["demo"].upstream_trunk(), "main@upstream");
+
+        let stated = "[repos.demo]\npath = \"/tmp/d\"\nupstream = \"u\"\norigin = \"o\"\n\
+                      base = \"dev\"\n";
+        let registry = load(&write(dir.path(), stated)).unwrap();
+        assert_eq!(registry.repos["demo"].trunk(), "dev");
+        assert_eq!(registry.repos["demo"].upstream_trunk(), "dev@upstream");
+        assert_eq!(registry.repos["demo"].default_base(), "dev");
+    }
+
+    #[test]
     fn a_split_release_remote_is_used_when_present() {
         let dir = tempfile::tempdir().unwrap();
         let registry = load(&write(dir.path(), SAMPLE)).unwrap();
@@ -469,6 +641,7 @@ release = "https://example.invalid/releases.git"
             entry.remote(Role::Release),
             "https://example.invalid/releases.git"
         );
+        assert_eq!(entry.publish_remote(), "release");
         assert!(entry.has_split_release());
     }
 
@@ -653,6 +826,30 @@ release = "https://example.invalid/releases.git"
     }
 
     #[test]
+    fn trust_rules_parse_expand_and_survive_a_save() {
+        let _lock = environment_lock();
+        let environment = EnvironmentGuard::capture(&["HOME"]);
+        environment.set("HOME", "/home/someone");
+        let dir = tempfile::tempdir().unwrap();
+        let text = "[trust]\nroots = [\"~/agent-c\"]\nowners = [\"some-owner\", \"some-org\"]\n";
+        let path = write(dir.path(), text);
+        let registry = load(&path).unwrap();
+        assert_eq!(
+            registry.trust.roots,
+            vec![PathBuf::from("/home/someone/agent-c")]
+        );
+        assert_eq!(
+            registry.trust.owners,
+            vec!["some-owner".to_owned(), "some-org".to_owned()]
+        );
+        // `init` rewrites the whole file; a section serde does not know about
+        // would be silently deleted the next time it runs.
+        save(&registry, &path).unwrap();
+        let reloaded = load(&path).unwrap();
+        assert_eq!(reloaded.trust.owners.len(), 2);
+    }
+
+    #[test]
     fn a_tilde_path_resolves_the_same_way_the_plugin_resolves_it() {
         // The two sides disagreeing meant `path = "~/repos/x"` was a working
         // allowlist entry and a broken CLI entry, so the trust set and the tool
@@ -706,6 +903,15 @@ release = "https://example.invalid/releases.git"
         let original = load(&write(dir.path(), SAMPLE)).unwrap();
         let target = dir.path().join("out").join("repos.toml");
         save(&original, &target).unwrap();
+        let text = std::fs::read_to_string(&target).unwrap();
+        assert!(
+            !text.contains("release_branch"),
+            "saved registry unexpectedly names release_branch: {text}"
+        );
+        assert!(
+            !text.contains("[trust]"),
+            "saved registry unexpectedly names [trust]: {text}"
+        );
         assert_eq!(load(&target).unwrap(), original);
     }
 }

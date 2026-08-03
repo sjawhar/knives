@@ -3,7 +3,7 @@
 Reports the state of several forks worked by several agents at once.
 
 If you maintain forks of upstream projects, carry patches on branches, and integrate them into
-dated release branches, the state you need is spread across jj, the forge, and whatever your
+release branches, the state you need is spread across jj, the forge, and whatever your
 consumers pin. Answering "is this branch still worth carrying" by hand means several commands
 and a guess. Agents guess instead of asking, and two of them working the same repository
 collide without noticing.
@@ -15,9 +15,10 @@ $ knives status
 libcore
   releases    2 checked: release/2026-07-30, release/2026-07-28.2@origin
   branches    12
-    feat/client-headers   d9ae60977  pushed  #4565  REVIEW_REQUIRED  draft  checks-failing  CONFLICTING
-    feat/response-filter  5da4e7a7a  origin=4c94fb019 (diverged)  #4561  REVIEW_REQUIRED  behind-base
-    fix/session-isolation 4e8975585  pushed  #4559  CHANGES_REQUESTED  stale-review
+    branch                 tip        push                         pr           review             checks   landed  flags
+    feat/client-headers    d9ae60977  pushed                       #4565 draft  REVIEW_REQUIRED    failing  -       CONFLICTING
+    feat/response-filter   5da4e7a7a  origin=4c94fb019 (diverged)  #4561        REVIEW_REQUIRED    ok       -       behind-base
+    fix/session-isolation  4e8975585  pushed                       #4559        CHANGES_REQUESTED  ok       -       review-stale
   findings    6
     divergence          2  qnslzxkkrmnl, qwpowwlkzuym
     checks-failing      2  #4526, #4565
@@ -50,9 +51,7 @@ yours.
 
 ## What it checks
 
-Per branch: the local tip, where origin has it and in which direction they differ, the pull
-request and its state, the review decision, whether that review predates the newest commit,
-whether CI is red, and how the branch relates to the upstream trunk.
+Per branch: local tip, push status, pull request and state, review decision, CI check status, landed verdict against upstream trunk, and flags.
 
 Across branches: divergent bookmarks, release parents that are no longer their branch tip, two
 workspaces holding the same change, two branches changing the same file, commits carried into
@@ -113,11 +112,15 @@ knives init ~/forks/libcore/default
 path = "~/forks/libcore/default"
 upstream = "https://forge.example/org/libcore"
 origin = "https://forge.example/ours/libcore"
-base = "main"                       # optional, the branch upstream expects pull requests against
-consumers = ["~/workbench/default"] # optional, who pins this repo's releases
+base = "main"                         # optional: upstream's trunk (defaults to main)
+release_branch = "release"            # optional: fixed release branch scheme (omit for dated release/YYYY-MM-DD)
+consumers = ["~/workbench/default"] # optional: who pins this repo's releases
 
 [trusted.workbench]
-path = "~/workbench/default"        # instructions read, not maintained
+path = "~/workbench/default"       # instructions read, not maintained
+
+[trust]
+roots = ["~/projects/company"]      # optional: subtrees whose repos are trusted for guidance
 ```
 
 A fork entry must carry `upstream` and `origin`. That is enforced when the file parses, so a
@@ -132,14 +135,14 @@ are somewhere else.
 
 | | |
 |---|---|
-| `knives repos` | what is managed, the newest release each has cut, and which consumers are pinned behind it |
+| `knives repos` | what is managed, the newest release each has cut, and whether consumer origin trunks are pinned behind it |
 | `knives status` | the main report |
 | `knives sync` | fetch, then classify what happened to each tracked pull request |
 | `knives preflight` | the facts to check before contributing upstream |
 | `knives start` / `finish` | take a branch and get your own workspace, then hand it back |
 | `knives track` | state which pull request a branch belongs to, when inference cannot find it |
 | `knives depends` | record that a branch cannot land before another repo's pull request |
-| `knives release` | plan a dated release, or cut one |
+| `knives release` | plan a release, or cut one |
 | `knives init` | register a checkout |
 | `knives hook` | harness plumbing, not for humans |
 

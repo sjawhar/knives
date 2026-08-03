@@ -6,6 +6,8 @@
 
 use std::fmt;
 
+use crate::ids::ReleaseScheme;
+
 /// How a site pins, which decides what repairing in place actually does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PinKind {
@@ -33,6 +35,7 @@ pub struct Pin {
     pub line: usize,
     pub reference: String,
     pub kind: PinKind,
+    pub locked: Option<String>,
     /// The line the pin was read from.
     ///
     /// Kept because a release name alone cannot say which repository it belongs to:
@@ -42,29 +45,67 @@ pub struct Pin {
     pub source: String,
 }
 
-/// Every dated release reference in one file's text.
+/// Every release reference in one file's text under the configured scheme.
 ///
 /// Handles all four observed syntaxes:
 ///   `rev = "release/..."`, `branch = "release/..."`,
 ///   a direct reference `...git@release/...`, and a lockfile's
 ///   `?rev=release%2F...`.
-pub fn scan(file: &str, text: &str) -> Vec<Pin> {
+pub fn scan(file: &str, text: &str, scheme: &ReleaseScheme) -> Vec<Pin> {
     let mut pins = Vec::new();
     for (index, line) in text.lines().enumerate() {
         // The lockfile writes the slash percent-encoded, so a scanner matching
         // only the plain form concludes the lockfile carries no pin. That is a
         // false negative on the exact question this command exists to answer.
         let decoded = line.replace("%2F", "/").replace("%2f", "/");
-        let Some(start) = decoded.find("release/") else {
+        let start = match scheme {
+            ReleaseScheme::Dated => decoded.find("release/"),
+            ReleaseScheme::Fixed(name) => {
+                decoded.match_indices(name.as_str()).find_map(|(start, _)| {
+                    let preceding = decoded[..start].chars().next_back();
+                    if preceding.is_none_or(|character| {
+                        matches!(character, '\"' | '\'' | '=' | '/' | '@' | ' ')
+                    }) {
+                        Some(start).filter(|start| {
+                            decoded[*start..]
+                                .chars()
+                                .take_while(|character| {
+                                    !character.is_whitespace()
+                                        && !matches!(character, '"' | '\'' | ',' | '#' | ')')
+                                })
+                                .collect::<String>()
+                                == name.as_str()
+                        })
+                    } else {
+                        None
+                    }
+                })
+            }
+        };
+        let Some(start) = start else {
             continue;
         };
         let reference: String = decoded[start..]
             .chars()
             .take_while(|c| !c.is_whitespace() && !matches!(c, '"' | '\'' | ',' | '#' | ')'))
             .collect();
-        if reference.len() <= "release/".len() {
+        let is_valid = match scheme {
+            ReleaseScheme::Dated => reference.len() > "release/".len(),
+            ReleaseScheme::Fixed(name) => reference == name.as_str(),
+        };
+        if !is_valid {
             continue;
         }
+        let end = start + reference.len();
+        let locked = decoded[end..]
+            .strip_prefix('#')
+            .map(|suffix| {
+                suffix
+                    .chars()
+                    .take_while(char::is_ascii_hexdigit)
+                    .collect::<String>()
+            })
+            .filter(|commit| commit.len() >= 6);
         let lowered = decoded.to_lowercase();
         let kind = if lowered.contains("branch") {
             PinKind::Follows
@@ -76,6 +117,7 @@ pub fn scan(file: &str, text: &str) -> Vec<Pin> {
             line: index + 1,
             reference,
             kind,
+            locked,
             source: decoded.trim().to_owned(),
         });
     }
@@ -117,7 +159,7 @@ mod tests {
     #[test]
     fn a_rev_pin_is_frozen() {
         let text = r#"hawk-infra = { git = "https://x/y", rev = "release/2026-07-28" }"#;
-        let pins = scan("pyproject.toml", text);
+        let pins = scan("pyproject.toml", text, &crate::ids::ReleaseScheme::Dated);
         assert_eq!(pins.len(), 1);
         assert_eq!(pins[0].reference, "release/2026-07-28");
         assert_eq!(pins[0].kind, PinKind::Frozen);
@@ -127,7 +169,7 @@ mod tests {
     fn a_branch_pin_follows() {
         let text =
             r#"sandbox-runner = { git = "https://x/y.git", branch = "release/2026-07-28.2" }"#;
-        let pins = scan("pyproject.toml", text);
+        let pins = scan("pyproject.toml", text, &crate::ids::ReleaseScheme::Dated);
         assert_eq!(pins[0].kind, PinKind::Follows);
         assert_eq!(pins[0].reference, "release/2026-07-28.2");
     }
@@ -135,7 +177,7 @@ mod tests {
     #[test]
     fn a_direct_reference_is_found() {
         let text = r#"    "sandbox-runner @ git+https://x/y.git@release/2026-07-28.2","#;
-        let pins = scan("pyproject.toml", text);
+        let pins = scan("pyproject.toml", text, &crate::ids::ReleaseScheme::Dated);
         assert_eq!(pins.len(), 1);
         assert_eq!(pins[0].reference, "release/2026-07-28.2");
     }
@@ -146,7 +188,7 @@ mod tests {
         // because the slash is written `%2F`. A scanner that misses this reports
         // "not pinned" for a file that pins.
         let text = "url = \"https://x/y.git?rev=release%2F2026-07-28.2#548aaafb\"";
-        let pins = scan("uv.lock", text);
+        let pins = scan("uv.lock", text, &crate::ids::ReleaseScheme::Dated);
         assert_eq!(pins.len(), 1, "percent-encoded pin was missed");
         assert_eq!(pins[0].reference, "release/2026-07-28.2");
         assert_eq!(pins[0].kind, PinKind::Frozen);
@@ -154,7 +196,14 @@ mod tests {
 
     #[test]
     fn a_line_merely_mentioning_releases_is_not_a_pin() {
-        assert!(scan("README.md", "See release/ for details").is_empty());
+        assert!(
+            scan(
+                "README.md",
+                "See release/ for details",
+                &crate::ids::ReleaseScheme::Dated,
+            )
+            .is_empty()
+        );
     }
 
     #[test]
@@ -165,8 +214,53 @@ mod tests {
             "a = { git = \"u\", branch = \"release/2026-07-28.2\" }\n",
             "b = { git = \"u\", branch = \"release/2026-07-20\" }\n"
         );
-        let pins = scan("pyproject.toml", text);
+        let pins = scan("pyproject.toml", text, &crate::ids::ReleaseScheme::Dated);
         assert_eq!(pins.len(), 2);
         assert_ne!(pins[0].reference, pins[1].reference);
+    }
+
+    #[test]
+    fn a_fixed_branch_pin_is_found_with_its_locked_commit() {
+        use crate::ids::{BranchName, ReleaseScheme};
+
+        let fixed = ReleaseScheme::Fixed(BranchName::new("integration"));
+        let text = "url = \"https://forge.invalid/o/r.git?branch=integration#548aaafb99\"";
+        let pins = scan("uv.lock", text, &fixed);
+
+        assert_eq!(pins.len(), 1, "was: {pins:?}");
+        assert_eq!(pins[0].reference, "integration");
+        assert_eq!(pins[0].kind, PinKind::Follows);
+        assert_eq!(pins[0].locked.as_deref(), Some("548aaafb99"));
+    }
+
+    #[test]
+    fn a_repository_named_after_the_fixed_branch_still_yields_its_pin() {
+        use crate::ids::{BranchName, ReleaseScheme};
+
+        let fixed = ReleaseScheme::Fixed(BranchName::new("integration"));
+        let text =
+            "url = \"https://forge.invalid/o/integration.git?branch=integration#548aaafb99\"";
+        let pins = scan("uv.lock", text, &fixed);
+
+        assert_eq!(pins.len(), 1, "was: {pins:?}");
+        assert_eq!(pins[0].reference, "integration");
+        assert_eq!(pins[0].locked.as_deref(), Some("548aaafb99"));
+    }
+
+    #[test]
+    fn a_word_containing_the_fixed_name_is_not_a_pin() {
+        use crate::ids::{BranchName, ReleaseScheme};
+
+        let fixed = ReleaseScheme::Fixed(BranchName::new("integration"));
+        assert!(scan("pyproject.toml", "mode = \"reintegration\"", &fixed).is_empty());
+    }
+
+    #[test]
+    fn dated_scanning_is_unchanged_by_the_scheme_parameter() {
+        let text = "url = \"https://x/y.git?rev=release%2F2026-07-28.2#548aaafb\"";
+        let pins = scan("uv.lock", text, &crate::ids::ReleaseScheme::Dated);
+
+        assert_eq!(pins[0].reference, "release/2026-07-28.2");
+        assert_eq!(pins[0].locked.as_deref(), Some("548aaafb"));
     }
 }

@@ -22,11 +22,14 @@ pub struct RepoFlags {
 struct DiskState {
     #[serde(default)]
     repos: HashMap<PathBuf, RepoFlags>,
+    #[serde(default)]
+    owner_remotes: HashMap<PathBuf, Vec<String>>,
 }
 
 #[derive(Debug, Default)]
 pub struct SessionState {
     repos: HashMap<PathBuf, RepoFlags>,
+    owner_remotes: HashMap<PathBuf, Vec<String>>,
 }
 
 impl SessionState {
@@ -37,6 +40,14 @@ impl SessionState {
 
     pub fn repo(&self, root: &Path) -> RepoFlags {
         self.repos.get(root).copied().unwrap_or_default()
+    }
+
+    /// Returns the raw remote owners previously resolved for this checkout.
+    ///
+    /// These facts, rather than a trust verdict, are cached because a cached verdict
+    /// outlived the registry edit that should have revoked it.
+    pub fn owner_remotes(&self, root: &Path) -> Option<&[String]> {
+        self.owner_remotes.get(root).map(Vec::as_slice)
     }
 
     pub fn update(
@@ -61,8 +72,17 @@ impl SessionState {
         flags.guided |= guided;
     }
 
+    /// Caches resolved remote owners so registry changes can be re-evaluated without Git.
+    ///
+    /// Retaining the facts prevents a cached verdict from outliving the registry edit
+    /// that should have revoked it.
+    pub fn record_owner_remotes(&mut self, root: &Path, owners: Vec<String>) {
+        self.owner_remotes.insert(root.to_owned(), owners);
+    }
+
     pub fn clear(&mut self) {
         self.repos.clear();
+        self.owner_remotes.clear();
     }
 
     pub fn delete(home: &Path, harness: &str, session_id: &str) {
@@ -74,7 +94,10 @@ impl SessionState {
         std::fs::read_to_string(path)
             .ok()
             .and_then(|text| serde_json::from_str::<DiskState>(&text).ok())
-            .map_or_else(Self::default, |disk| Self { repos: disk.repos })
+            .map_or_else(Self::default, |disk| Self {
+                repos: disk.repos,
+                owner_remotes: disk.owner_remotes,
+            })
     }
 
     fn persist(&self, directory: &Path, path: &Path) -> anyhow::Result<()> {
@@ -84,6 +107,7 @@ impl SessionState {
             &mut temporary,
             &DiskState {
                 repos: self.repos.clone(),
+                owner_remotes: self.owner_remotes.clone(),
             },
         )?;
         temporary.write_all(b"\n")?;
@@ -217,6 +241,29 @@ mod tests {
             !SessionState::load(home.path(), "claude-code", "s1")
                 .repo(Path::new("/r"))
                 .noticed
+        );
+    }
+
+    #[test]
+    fn owner_remotes_survive_updates_and_clear() {
+        // Given: remote owners recorded for an otherwise untracked repository root.
+        let home = tempfile::tempdir().unwrap();
+        let root = Path::new("/some/repo");
+        SessionState::update(home.path(), "claude-code", "s1", |state| {
+            state.record_owner_remotes(root, vec!["trusted-owner".to_owned()]);
+        })
+        .unwrap();
+
+        // When: the session is reloaded, then cleared through the persisted update path.
+        let reloaded = SessionState::load(home.path(), "claude-code", "s1");
+        SessionState::update(home.path(), "claude-code", "s1", SessionState::clear).unwrap();
+
+        // Then: the raw owners round-trip before clear and are absent afterwards.
+        let expected = vec!["trusted-owner".to_owned()];
+        assert_eq!(reloaded.owner_remotes(root), Some(expected.as_slice()));
+        assert_eq!(
+            SessionState::load(home.path(), "claude-code", "s1").owner_remotes(root),
+            None
         );
     }
 

@@ -20,7 +20,7 @@ If the repository you are in, or the one you were about to clone, is in that lis
 a managed fork. It is shared with other agents, it has an upstream you may be
 contributing to, and there is already a right way to get a working copy of it.
 
-If it is not in that list, this skill does not apply — carry on normally.
+If it is not in that list, this skill does not apply — carry on normally. If a repository should be managed but is unregistered, run `knives register` inside it and hand the snippet to the human to paste into `repos.toml`. Do not edit `repos.toml` yourself.
 
 ## Then find out what is going on in it
 

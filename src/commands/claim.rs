@@ -175,6 +175,7 @@ mod tests {
                     origin: "o".to_owned(),
                     base: None,
                     release: None,
+                    release_branch: None,
                     test_count_command: None,
                     consumers: Vec::new(),
                 },

@@ -18,8 +18,8 @@ use thiserror::Error;
 use crate::detect::landed::RebaseOutcome;
 use crate::detect::stale_parents::{BookmarkTips, ReleaseParent};
 use crate::ids::{
-    BookmarkRef, BranchName, ChangeId, CommitId, RemoteName, WorkspaceName, is_our_release,
-    pull_number_from_bookmark,
+    BookmarkRef, BranchName, ChangeId, CommitId, ReleaseScheme, RemoteName, WorkspaceName,
+    is_our_release, pull_number_from_bookmark,
 };
 
 #[derive(Debug, Error)]
@@ -268,7 +268,11 @@ impl Repo {
     /// Answers where work went when it was not merged: a maintainer building their own
     /// branch on our commits leaves the branch itself untouched, so the only trace is that
     /// its tip is reachable from somewhere else.
-    pub fn branches_containing(&self, commit: &CommitId) -> Result<Vec<BookmarkRef>, JjError> {
+    pub fn branches_containing(
+        &self,
+        commit: &CommitId,
+        scheme: &ReleaseScheme,
+    ) -> Result<Vec<BookmarkRef>, JjError> {
         let mut found = Vec::new();
         for (reference, tip) in self.bookmark_tips()? {
             if &tip == commit {
@@ -284,7 +288,7 @@ impl Repo {
             // `@git` is jj's internal git-tracking view rather than a remote, and is
             // excluded everywhere else in this codebase for the same reason.
             // A fetched head is our own pull request, not someone else carrying the work.
-            if is_our_release(&reference)
+            if is_our_release(&reference, scheme)
                 || matches!(&reference, BookmarkRef::Remote { remote, .. } if remote.as_str() == "git")
                 || pull_number_from_bookmark(reference.branch().as_str()).is_some()
             {
@@ -500,6 +504,12 @@ pub fn add_workspace(
 }
 
 /// Reads git's remote configuration because jj-lib does not expose remote URLs as a typed repository view.
+pub fn git_toplevel(repo: &Path) -> Result<PathBuf, JjError> {
+    let repo = path(repo);
+    let output = command("git", ["-C", &repo, "rev-parse", "--show-toplevel"])?;
+    Ok(PathBuf::from(output.trim()))
+}
+
 pub fn git_remotes(repo: &Path) -> Result<BTreeMap<String, String>, JjError> {
     let repo = path(repo);
     let output = command(
@@ -521,6 +531,92 @@ pub fn git_remotes(repo: &Path) -> Result<BTreeMap<String, String>, JjError> {
             remotes.insert(name.to_owned(), url.to_owned());
             Ok(remotes)
         })
+}
+
+pub(crate) enum OriginTrunk {
+    NotRepository,
+    Missing,
+    Reference(String),
+}
+
+pub(crate) fn origin_trunk(consumer: &Path) -> Result<OriginTrunk, JjError> {
+    let consumer = path(consumer);
+    let Some(inside_work_tree) = command_or_none(command(
+        "git",
+        ["-C", &consumer, "rev-parse", "--is-inside-work-tree"],
+    ))?
+    else {
+        return Ok(OriginTrunk::NotRepository);
+    };
+    if inside_work_tree.trim() != "true" {
+        return Ok(OriginTrunk::NotRepository);
+    }
+
+    if let Some(branch) = command_or_none(command(
+        "git",
+        ["-C", &consumer, "rev-parse", "--abbrev-ref", "origin/HEAD"],
+    ))? {
+        let branch = branch.trim();
+        if branch.starts_with("origin/") && branch != "origin/HEAD" {
+            return Ok(OriginTrunk::Reference(branch.to_owned()));
+        }
+    }
+
+    for branch in ["origin/main", "origin/master"] {
+        if command_or_none(command(
+            "git",
+            ["-C", &consumer, "rev-parse", "--verify", branch],
+        ))?
+        .is_some()
+        {
+            return Ok(OriginTrunk::Reference(branch.to_owned()));
+        }
+    }
+    Ok(OriginTrunk::Missing)
+}
+
+/// Reads a consumer pin file from the published default branch so a stale checkout
+/// cannot produce a false BEHIND finding.
+///
+/// Returns `Ok(None)` when the path is not a repository or its origin trunk, ref,
+/// or file is absent. Propagates process and parsing failures rather than treating
+/// an unavailable Git command as missing consumer data.
+pub fn file_at_origin_trunk(
+    consumer: &Path,
+    file: &str,
+) -> Result<Option<(String, usize)>, JjError> {
+    let OriginTrunk::Reference(branch) = origin_trunk(consumer)? else {
+        return Ok(None);
+    };
+    file_at_ref(consumer, &branch, file)
+}
+
+pub(crate) fn file_at_ref(
+    consumer: &Path,
+    branch: &str,
+    file: &str,
+) -> Result<Option<(String, usize)>, JjError> {
+    let consumer = path(consumer);
+    let revision = format!("{branch}:{file}");
+    let Some(content) = command_or_none(command("git", ["-C", &consumer, "show", &revision]))?
+    else {
+        return Ok(None);
+    };
+    let behind = match command(
+        "git",
+        ["-C", &consumer, "rev-list", "--count", branch, "^HEAD"],
+    ) {
+        Ok(behind) => behind,
+        Err(JjError::Command { .. }) => return Ok(Some((content, 0))),
+        Err(error) => return Err(error),
+    };
+    let behind = behind
+        .trim()
+        .parse::<usize>()
+        .map_err(|error| JjError::Parse {
+            detail: error.to_string(),
+        })?;
+    Ok(Some((content, behind)))
 }
 
 /// Uses jj porcelain because jj-lib's tree-diff iterator exposes repository paths, not CLI-normalized strings.
@@ -638,6 +734,14 @@ fn command_args(program: &str, args: &[&str]) -> Result<String, JjError> {
             status: output.status.to_string(),
             stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
         })
+    }
+}
+
+fn command_or_none(result: Result<String, JjError>) -> Result<Option<String>, JjError> {
+    match result {
+        Ok(output) => Ok(Some(output)),
+        Err(JjError::Command { .. }) => Ok(None),
+        Err(error) => Err(error),
     }
 }
 
@@ -783,6 +887,32 @@ pub fn set_bookmark(repo: &Path, name: &str, revision: &str) -> Result<(), JjErr
             "--ignore-working-copy",
             "bookmark",
             "set",
+            name,
+            "-r",
+            revision,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Move a release bookmark even when its fresh flat merge is sideways.
+///
+/// [`set_bookmark`] refuses sideways movement to preserve ordinary dated-release history.
+/// Call this only after the caller has established that an in-place move is safe: fixed cuts
+/// retain the preceding published cut through its remote-tracking ref, while `run_rebase` first
+/// checks `repair_effect` so a followed consumer will receive the repair. The failed sideways
+/// move that motivated this distinction means these helpers are not interchangeable.
+pub fn set_bookmark_anywhere(repo: &Path, name: &str, revision: &str) -> Result<(), JjError> {
+    let repo_path = path(repo);
+    command(
+        "jj",
+        [
+            "--repository",
+            &repo_path,
+            "--ignore-working-copy",
+            "bookmark",
+            "set",
+            "--allow-backwards",
             name,
             "-r",
             revision,

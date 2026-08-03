@@ -4,7 +4,7 @@
 
 Make the state of a fork cheap enough to query that no agent has a reason to guess, and make collisions between agents visible before they cost work.
 
-The motivating setup is seven forks of one upstream ecosystem, each carrying between one and thirteen open upstream PRs as independent branches, integrated into dated flat octopus merges that a consumer repo pins. Several agents work these repos concurrently on one machine. Nothing below is specific to that setup; the tool is configured per repo and holds no knowledge of any particular user, org, or upstream.
+The motivating setup is seven forks of one upstream ecosystem, each carrying between one and thirteen open upstream PRs as independent branches, integrated into flat octopus merges (dated or fixed) that a consumer repo pins. Several agents work these repos concurrently on one machine. Nothing below is specific to that setup; the tool is configured per repo and holds no knowledge of any particular user, org, or upstream.
 
 ## Non-goals
 
@@ -32,15 +32,19 @@ A fifth, raised from experience rather than observed in the audit: **two agents 
 
 Everything user-specific is configuration. No user, org, or repository name appears in the tool.
 
-Per repo, `fork` knows a set of **remotes by role**:
+Per repo, `knives` knows a set of **remotes by role**:
 
 | Role | Purpose | Required |
 |---|---|---|
 | `upstream` | the repo we contribute to; fetch only, including `pull/N/head` | yes |
 | `origin` | where our branches get pushed | yes |
-| `release` | where dated `release/*` bookmarks get pushed | no, defaults to `origin` |
+| `release` | where release bookmarks get pushed | no, defaults to `origin` |
 
 Most repos need two roles. A third exists only when branches and releases must live in different places, which happens when the upstream cannot push to our fork (GitHub does not offer "allow edits by maintainers" for organisation-owned forks, so PR branches sometimes have to live on a fork the maintainer can push to, while releases live somewhere with different ownership). That is one configuration, not the model.
+
+**Trunk is configuration.** `base` configures upstream's trunk branch (default `main`), which is the branch we fork from, measure landed against, and target pull requests at. It is accessible via `entry.trunk()` and `entry.upstream_trunk()`. Configurable per repository when an upstream default branch uses a name like `dev`.
+
+**Two release schemes.** `release_branch` configures an optional fixed release branch name (`ReleaseScheme::Fixed`). When absent, the repository uses dated releases (`ReleaseScheme::Dated`, e.g. `release/YYYY-MM-DD`). Parse-time validation rejects an empty `release_branch`, a name matching trunk, or a name in the `release/` namespace.
 
 **Verified:** splitting the roles across two remotes works with no mirroring step. A branch pushed only to the branch remote, made a parent of a release octopus pushed only to the release remote, was fully resolvable from a fresh repo fetching only the release ref. The push carries parent commits as objects.
 
@@ -48,16 +52,16 @@ Release parents are **upstream PR refs, not necessarily our branches**. `git fet
 
 Two remotes are required and a third is optional. `upstream` is what we contribute to.
 `origin` is our own copy, which for most people is the whole story. `release` is a
-separate remote that dated releases are cut on, for the case where releases are consumed
+separate remote that releases are cut on, for the case where releases are consumed
 internally and should not sit in a personal fork; the release remote is optional, and it
 falls back to `origin` when absent, because not every fork is consumed by anything.
 
-`consumers` is optional too: the checkouts that pin this repo's releases. A list, because
-a fork can be consumed by several things at once and they can sit on different releases.
-the pin logic always reasoned about that while the registry could only record one of them,
-so one consumer being current silently answered for all of them. Recorded so that
-`knives repos` can say which consumer is pinned behind the newest cut without being asked,
-since nobody runs a command to answer a question they have not thought of.
+`consumers` is optional too: the checkouts that pin this repo's releases. Consumer pins are read directly from the consumer repository's origin trunk reference rather than its working copy, avoiding false reports caused by an unpushed or unpulled working copy. Notes report if a consumer checkout is behind its branch, if no origin trunk resolves, or if it is not a repository. Recorded so that `knives repos` can say which consumer is pinned behind the newest cut without being asked, since nobody runs a command to answer a question they have not thought of.
+
+`[trust]` configures automated guidance rules for repositories outside `[repos.*]` and `[trusted.*]`:
+- `roots`: Directory subtrees where all contained repositories are trusted for instruction guidance.
+- `owners`: Remote URL owners trusted for instruction guidance, matched case-insensitively against git remote URLs.
+- **Security posture:** Owner matching reads self-declared remote URLs from the candidate checkout's git config. It is not forge-authenticated and grants guidance-as-data only, never fork-command access. The probe accepts only a directory that is its own git toplevel, so nested directories cannot inherit an enclosing repo's identity. Owner rules read git remote config, so jj-only checkouts match only via `roots`. Verdicts are recomputed from `repos.toml` on every hook event, so human edits to the file act as the approval mechanism.
 
 ## State
 
@@ -76,7 +80,7 @@ Eight detection rules, all resting on mechanical fields and graph queries rather
 
 **1. Stale release parent (`stale-parent`).** Rests on `Repo::bookmark_tips` compared against release parent commits. When a PR branch is rebased upstream, jj moves the local bookmark to the new commit but the octopus keeps the old one, leaving a parent whose bookmark has moved to a descendant. The release then ships pre-rebase code with nothing in the bookmark list saying so.
 
-**2. Landed upstream (`landed`).** Rests on `classify_landed`, which replays the branch onto `main` in a temporary commit and inspects the tree diff:
+**2. Landed upstream (`landed`).** Rests on `classify_landed`, which replays the branch onto the upstream trunk (defaulting to `main`) in a temporary commit and inspects the tree diff:
 
 | Result | Meaning |
 |---|---|
@@ -92,7 +96,7 @@ Authorship- and PR-number-agnostic, which matters because our work sometimes lan
 
 **5. Failing CI checks (`checks-failing`).** Rests on `ChecksSummary::failing()`, checking for red conclusion states (`FAILURE`, `TIMED_OUT`, `CANCELLED`, `STARTUP_FAILURE`, `ACTION_REQUIRED`, or `ERROR`) on open pull requests. The `ERROR` conclusion is what external CI posting commit statuses emits for an aborted or infrastructure-failed build, and missing it made a red pull request read as clean green.
 
-**6. Wrong target base (`wrong-base`).** Rests on `PullRequest::base_ref_name` against `RepoEntry::default_base()`, flagging open pull requests targeting a branch name other than the expected base. It cannot tell a pull request aimed at our fork's `main` from one aimed at upstream's `main` because both are named `main`, the forge exposes no base-repository field, and `gh` resolves to upstream anyway. An empty base is unknown, not wrong. Only open pull requests are checked.
+**6. Wrong target base (`wrong-base`).** Rests on `PullRequest::base_ref_name` against `RepoEntry::default_base()`, flagging open pull requests targeting a branch name other than the expected base. It cannot tell a pull request aimed at our fork's trunk from one aimed at upstream's trunk because both are usually named `main`, the forge exposes no base-repository field, and `gh` resolves to upstream anyway. An empty base is unknown, not wrong. Only open pull requests are checked.
 
 **7. Commits carried elsewhere (`carried-elsewhere`).** Rests on `Repo::branches_containing(tip)`, querying whether the branch tip is reachable from another reference. It reports where found and says nothing about what it means: whether a maintainer took the work, rebased it, or coincidentally landed the same content is the reader's judgment. Our own release cuts, `@git` refs, and trunk are excluded because releases contain these tips by construction, and reporting that buried the real signal.
 
@@ -114,7 +118,7 @@ evidence is kept because it is what the rules rest on.
 
 The contrast is the whole rule: a **local** rewrite auto-rebases the octopus and carries the bookmark with it, while a **remote** rewrite does not. This is problem 2 above.
 
-**2. Landed upstream.** Ancestry-based detection fails for squash merges, which is the common path. Verified: after a squash merge the branch's content was in `main` while `main..branch` still reported one file changed, indistinguishable from an unlanded branch. Rebase the branch onto `main` and read the result:
+**2. Landed upstream.** Ancestry-based detection fails for squash merges, which is the common path. Verified: after a squash merge the branch's content was in trunk while `trunk..branch` still reported one file changed, indistinguishable from an unlanded branch. Rebase the branch onto trunk and read the result:
 
 | Result | Meaning |
 |---|---|
@@ -127,29 +131,33 @@ The contrast is the whole rule: a **local** rewrite auto-rebases the octopus and
 Every command takes the repo from the directory you are standing in. Naming it is for when you are somewhere else, or want a different one. Requiring the name everywhere was the loudest complaint from actually using this.
 
 ```
-knives init [DIR]              configure remote roles for a repo; verify one repo per fork
+knives init [DIR]              configure remote roles for a repo; warn when untracked remotes look like upstream forks
+knives register [DIR]          print a paste-ready [repos.<name>] snippet on stdout without writing to disk
 knives repos                   the repos knives manages, their release state, and whether a
                                recorded consumer is pinned behind the newest cut
 knives sync [REPO|--all]       fetch all remotes and tracked pull/N/head refs; classify each
                                tracked PR as new | unchanged | advanced | merged | closed
 knives preflight [REPO]        programmatic pre-contribution facts (see below)
-knives status [REPO|--all]     per branch: local tip, origin tip, PR number, review decision,
-                               whether the review predates the head, claims, active workspaces,
-                               and the detectors. One line per kind of finding; --verbose for one per finding
-knives start BRANCH            claim, create the workspace, base it on fetched main
+knives status [REPO|--all]     aligned table per branch (branch, tip, push, pr, review, checks,
+                               landed, flags); claims, active workspaces, and detectors
+knives start BRANCH            claim, create the workspace, base it on fetched trunk (defaulting to main)
 knives finish BRANCH           hand back claim and remove workspace
 knives track BRANCH --pr N     state which PR a branch belongs to, overriding inference
 knives depends BRANCH --on R#N  record that a branch cannot land before something else
-knives release                 plan a dated release
-knives release cut NAME        cut it; the only thing knives writes, and it never pushes
+knives release [NAME]          plan or cut a release under the configured scheme
+knives release cut [NAME]      cut a release; NAME is the dated name, and a fixed scheme needs none;
+                               the only thing knives writes, and it never pushes
 knives release include BRANCH  state that a branch belongs in the next release
 knives release drop BRANCH     state that it does not; survives the every-branch fallback
-knives release rebase [REF]    add an upstream commit, keeping the branch parents
+knives release rebase [REF]    add an upstream commit, keeping the branch parents; repair in place
+                               when a following consumer can receive it, otherwise require a new dated cut
 ```
 
 `--json` on any command, and it is the default when the environment says an agent is running it. Agents were grepping human output to count findings by detector.
 
-`knives repos` and `knives status` are deliberately separate: one answers "what am I maintaining", the other "what is the current state and what is being worked on right now". Conflating them was an earlier mistake in this design.
+`knives repos` and `knives status` are deliberately separate: one answers "what am I maintaining", the other "what is the current state and what is being worked on right now". Conflating them was an earlier mistake in this design. `knives status` outputs an aligned table for branch rows (`branch`, `tip`, `push`, `pr`, `review`, `checks`, `landed`, `flags`) with empty cells as `-`. On-screen status display tokens use `failing` for failing checks and `none-ran` when no checks run.
+
+`knives register [DIR]` prints a paste-ready `[repos.<name>]` TOML snippet to stdout and diagnostic notes to stderr without writing to disk, because registration is a trust grant. An existing entry of the same name must be replaced rather than appended.
 
 ### Which PR belongs to a branch
 
@@ -181,13 +189,15 @@ Everything of the form "have you read the contributing guide, and does this PR c
 
 Workspaces are effectively free: 0.15 to 0.55s to create, because tracked content is small even in large repos (one 3.2G checkout was 19M across 1278 tracked files, the rest being virtualenvs and the shared `.jj` store). The real cost of a new workspace is rebuilding language environments, not checkout.
 
-`knives start` always bases new work on **fetched `main`**, never on the current `@`. That single default removes the most common accident: an agent sitting in a release workspace runs `jj new` and silently inherits the release merge as a parent.
+`knives start` always bases new work on the **fetched trunk** (defaulting to `main`), never on the current `@`. That single default removes the most common accident: an agent sitting in a release workspace runs `jj new` and silently inherits the release merge as a parent.
 
 ### `knives release`
 
-Cuts or repairs a dated release. Everything here is a check, never a prompt: a CLI in a non-interactive agent session has nobody to ask.
+Cuts or repairs a release under the repository's configured scheme. Everything here is a check, never a prompt: a CLI in a non-interactive agent session has nobody to ask.
 
-- **Determine whether the release is pinned by inspecting the consumer's pin locations.** Pinned means frozen and the next cut takes a new dated suffix; unpinned means repair in place. Nothing about this requires asking a human, and a needless dated name burns the name and forces a re-pin nobody wanted.
+- **Support both dated and fixed release schemes.**
+  - **Dated scheme (default):** `knives release` inspects consumer pins to decide whether a release is pinned. Pinned releases require a new dated suffix (`release/YYYY-MM-DD`); unpinned releases repair in place. `knives release cut NAME` executes the cut.
+  - **Fixed scheme (`release_branch` set):** `knives release` takes no name argument, rebuilds the flat octopus merge, and advances the fixed branch in place via a sideways bookmark move (`jj::set_bookmark_anywhere`). Publishing remains a manual `jj git push`. The previous fixed release position is read from the publish remote-tracking reference (`{fixed}@release` or `{fixed}@origin`) prior to push (`release::previous_position`). Fixed release selection considers only the local fixed branch and its publish-remote counterpart.
 - Build from explicit commit IDs and verify the parent count before pushing.
 - Expect a real conflict and resolve it in the merge. Independent branches that each append a config key land in the same regions; one ten-parent cut carried a 4-sided conflict in one file and a 3-sided one in another. Resolve as a union, keep a shared helper defined exactly once, and land a config key in every loader.
 - Compare the merged test count against a single contributing branch. A total lower than one branch's own count means a branch's tests were dropped.
@@ -232,8 +242,9 @@ For a session rooted in one repo reading a file in another, that is false on ent
 
 So the adapters re-establish an equivalent boundary rather than removing it:
 
-- **The allowlist is the registry, which names two kinds of tree.** `[repos.*]` is what we maintain forks of. `[trusted.*]` is a repository whose instructions we want an agent to see but which we do not maintain, such as a company repo with no upstream to contribute to. Both are trust roots for guidance; only the first is touched by any fork command. Any other tree gets nothing: fixtures, scratch clones, downloaded repos.
-  - Two sections rather than one section with optional remotes. A fork entry must carry `upstream` and `origin`, enforced when the file is parsed; relaxing that to fit a non-fork repository would trade a parse-time failure for a failure at the first query. Both sides of the tool have to know the section exists: an unrecognised header invalidates the whole registry in the configuration parser, so one trusted entry would otherwise disable guidance everywhere, and serde would drop the section the next time `init` rewrote the file.
+- **The allowlist is the registry, which provides three ways to configure guidance roots.** `[repos.*]` names maintained forks. `[trusted.*]` names repositories whose instructions we want an agent to see but which we do not maintain, such as a company repo with no upstream to contribute to. `[trust]` configures automated rules via `roots` (subtree paths) and `owners` (remote URL owners matched case-insensitively). All act as trust roots for guidance;
+  only `[repos.*]` entries are touched by fork commands. Any unlisted tree receives no guidance.
+  - Distinct sections preserve parse-time invariants. A fork entry requires `upstream` and `origin` so malformed entries fail on load. `[trust]` rules stay in the registry struct so `init` rewrites preserve them rather than silently dropping unknown TOML tables.
 - **Inject only root-level guidance from a managed repo**, plus our own overlay, which lives outside the repo. A nested `AGENTS.md` inside a managed repo is *mentioned, not injected*.
 - **Mention `CONTRIBUTING.md` rather than injecting it.** Flagging that it exists is what the agent needs; its contents are long, and every injected byte is instruction-channel surface.
 - **Containment by `relative()`, never string prefix**, so a sibling path like `<dir>-2` cannot pass as `<dir>`.
@@ -312,7 +323,7 @@ exits zero, so failures never break the session.
 
 Layered, cheapest first, escalating only on evidence:
 
-1. **Default-correct paths.** `knives start` bases on `main`; `knives preflight` before contributing.
+1. **Default-correct paths.** `knives start` bases on the fetched trunk (defaulting to `main`); `knives preflight` before contributing.
 2. **Detectors in `knives status`**, including two workspaces on one change.
 3. **Advisory claims** with a description, plus `knives wip` showing file overlap between active claims. File overlap is the strongest duplicate-work signal available and is what the prior art converged on; every real collision observed was same-file.
 4. **Hard refusal**, only if 1 to 3 prove insufficient. A `jj` shim is the mechanism and follows an established local pattern, where a shims directory sits first on `PATH` and already contains a `gh` wrapper written for jj, with tests.
