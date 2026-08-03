@@ -136,12 +136,12 @@ pub enum StoreError {
 /// An exclusive-create lockfile rather than a dependency: `create_new` is atomic
 /// on every platform this runs on.
 #[derive(Debug)]
-struct StoreLock {
+pub(crate) struct StoreLock {
     path: PathBuf,
 }
 
 impl StoreLock {
-    fn acquire(target: &Path) -> Result<Self, StoreError> {
+    pub(crate) fn acquire(target: &Path) -> Result<Self, StoreError> {
         let path = target.with_extension("lock");
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|source| StoreError::Write {
@@ -266,6 +266,15 @@ impl Store {
             .values()
             .filter(|claim| repo.is_none_or(|name| claim.repo == name.as_str()))
             .collect()
+    }
+
+    pub fn current_agent(&self) -> Option<&str> {
+        self.state
+            .extra
+            .get("currentAgent")
+            .or_else(|| self.state.extra.get("current_agent"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|agent| !agent.trim().is_empty())
     }
 
     pub fn mark_fork_only(&mut self, target: &BranchTarget, why: &str) {

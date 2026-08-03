@@ -1,0 +1,8 @@
+{
+  "name": "knives",
+  "description": "Fork maintenance tools and guidance for coordinated multi-repository work.",
+  "owner": { "name": "Sami Jawhar" },
+  "plugins": [
+    { "name": "knives", "source": "./", "description": "Fork maintenance status across many repos at once." }
+  ]
+}

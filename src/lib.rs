@@ -13,12 +13,14 @@
 //! - [`forge`] is the only module that talks to a hosting service.
 //! - [`config`] and [`store`] own the two things that cannot be recomputed:
 //!   which repos are managed, and who is working on what and why.
+//! - [`hook`] owns harness-facing session state and behavior.
 
 pub mod cli;
 pub mod commands;
 pub mod config;
 pub mod detect;
 pub mod forge;
+pub mod hook;
 pub mod ids;
 pub mod jj;
 pub mod pins;

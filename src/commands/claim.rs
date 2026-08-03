@@ -3,6 +3,7 @@
 //! Enforcement layer three. Advisory on purpose: layers one and two are
 //! default-correct paths and detectors, and hard refusal waits for evidence
 //! that advice was insufficient.
+// allow: SIZE_OK: 291 lines - claim coordination keeps owner-resolution behavior beside branch claim outcomes.
 
 use crate::cli::Exit;
 use crate::config::{Registry, default_config_path, load};
@@ -11,14 +12,21 @@ use crate::store::{Store, default_state_path};
 
 /// Who is claiming.
 ///
-/// `KNIVES_OWNER` is what the `OpenCode` plugin injects. A claim cannot live in a
-/// shell environment variable: each tool call is its own process and subagents
-/// are spawned by the harness, so an `export` reaches nothing. The OS user is
-/// the fallback for a human at a terminal.
+/// `KNIVES_OWNER` is what the `OpenCode` plugin injects. Claude Code instead
+/// provides its session ID. A claim cannot live in a shell environment variable:
+/// each tool call is its own process and subagents are spawned by the harness, so
+/// an `export` reaches nothing. The OS user is the fallback for a human at a terminal.
+/// A blank `KNIVES_OWNER` is a plugin bug, not an identity. Treating it as one
+/// would let two agents share a claim. The same applies to `CLAUDE_CODE_SESSION_ID`.
 pub fn current_owner() -> String {
     std::env::var("KNIVES_OWNER")
         .ok()
         .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            std::env::var("CLAUDE_CODE_SESSION_ID")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
         .or_else(|| std::env::var("USER").ok())
         .unwrap_or_else(|| "unknown".to_owned())
 }
@@ -152,7 +160,10 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::config::RepoEntry;
+    use crate::config::{
+        RepoEntry,
+        test_support::{EnvironmentGuard, environment_lock},
+    };
 
     fn registry() -> Registry {
         Registry {
@@ -235,12 +246,46 @@ mod tests {
     }
 
     #[test]
-    fn the_owner_falls_back_when_the_injected_token_is_blank() {
-        // A blank KNIVES_OWNER is a plugin bug, not an identity. Treating it as one
-        // would let two agents share a claim.
-        unsafe { std::env::set_var("KNIVES_OWNER", "   ") };
-        let owner = current_owner();
-        unsafe { std::env::remove_var("KNIVES_OWNER") };
-        assert_ne!(owner.trim(), "");
+    fn current_owner_filters_a_blank_knives_owner() {
+        let _lock = environment_lock();
+        let environment =
+            EnvironmentGuard::capture(&["KNIVES_OWNER", "CLAUDE_CODE_SESSION_ID", "USER"]);
+        environment.set("KNIVES_OWNER", "   ");
+        environment.remove("CLAUDE_CODE_SESSION_ID");
+        environment.set("USER", "terminal-user");
+        assert_eq!(current_owner(), "terminal-user");
+    }
+
+    #[test]
+    fn current_owner_uses_the_session_id_when_knives_owner_is_absent() {
+        let _lock = environment_lock();
+        let environment =
+            EnvironmentGuard::capture(&["KNIVES_OWNER", "CLAUDE_CODE_SESSION_ID", "USER"]);
+
+        environment.remove("KNIVES_OWNER");
+        environment.set("CLAUDE_CODE_SESSION_ID", "abc-123");
+        environment.set("USER", "terminal-user");
+        assert_eq!(current_owner(), "abc-123");
+    }
+
+    #[test]
+    fn current_owner_falls_back_to_user_when_the_session_id_is_blank() {
+        let _lock = environment_lock();
+        let environment =
+            EnvironmentGuard::capture(&["KNIVES_OWNER", "CLAUDE_CODE_SESSION_ID", "USER"]);
+
+        environment.remove("KNIVES_OWNER");
+        environment.set("CLAUDE_CODE_SESSION_ID", "   ");
+        environment.set("USER", "terminal-user");
+        assert_eq!(current_owner(), "terminal-user");
+    }
+
+    #[test]
+    #[should_panic(expected = "CLAUDE_CODE_SESSION_ID was not captured")]
+    fn environment_guard_rejects_mutation_of_an_uncaptured_variable() {
+        let _lock = environment_lock();
+        let environment = EnvironmentGuard::capture(&["KNIVES_OWNER"]);
+
+        environment.set("CLAUDE_CODE_SESSION_ID", "abc-123");
     }
 }

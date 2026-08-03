@@ -115,7 +115,7 @@ jobs:
           install -m 0644 plugin/knives.ts "$staging/share/knives/opencode/plugins/knives.ts"
           install -m 0644 plugin/lib/internals.ts "$staging/share/knives/opencode/plugins/lib/internals.ts"
           # Every skill, each in its own directory, which is how they are discovered.
-          cp -r skill/. "$staging/share/knives/opencode/skills/"
+          cp -r skills/. "$staging/share/knives/opencode/skills/"
           tar czf "${staging}.tar.gz" "$staging"
 
       - name: Verify release archive
@@ -168,6 +168,13 @@ jobs:
           # and are released together.
           sed -i '0,/^version = ".*"/s//version = "'"$VERSION"'"/' Cargo.toml
           sed -i '0,/"version": ".*"/s//"version": "'"$VERSION"'"/' package.json
+          sed -i '0,/"version": ".*"/s//"version": "'"$VERSION"'"/' .claude-plugin/plugin.json
+          for version_file in Cargo.toml package.json .claude-plugin/plugin.json; do
+            if ! grep --fixed-strings --quiet "$VERSION" "$version_file"; then
+              printf 'release version %s was not written to %s\n' "$VERSION" "$version_file" >&2
+              exit 1
+            fi
+          done
           cargo update --workspace
 
       - name: Commit and tag
@@ -176,7 +183,7 @@ jobs:
           VERSION="${{ needs.version.outputs.version }}"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add Cargo.toml Cargo.lock package.json
+          git add Cargo.toml Cargo.lock package.json .claude-plugin/plugin.json
           # The first release takes its version from Cargo.toml, so the files can
           # already be at VERSION and there is nothing to commit. Tag either way.
           if git diff --cached --quiet; then

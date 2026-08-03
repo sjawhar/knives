@@ -2,12 +2,13 @@
 //!
 //! Dispatch only. Every command owns its own logic and returns an [`Exit`], so
 //! this file never grows a decision.
+// allow: SIZE_OK: 735 lines - dispatch-only, splitting would scatter the exhaustive match.
 
 use std::process::ExitCode;
 
 use clap::Parser as _;
 use knives::cli::{Cli, Command, Exit, ReleaseAction};
-use knives::commands::{init, preflight, release, repos, start, status, sync};
+use knives::commands::{hook, init, preflight, release, repos, start, status, sync};
 use knives::config::{default_config_path, load};
 use knives::forge::{CliForge, Forge};
 use knives::ids::{BranchName, BranchTarget, RepoName, Requirement};
@@ -27,6 +28,7 @@ fn dispatch() -> anyhow::Result<Exit> {
     let cli = Cli::parse();
     let json = knives::cli::machine_readable(cli.json, cli.text);
     match cli.command {
+        Command::Hook { harness } => Ok(hook::run(harness)),
         Command::Init { repo } => init::run(repo),
         Command::Repos => repos::run(),
         Command::Status {

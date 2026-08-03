@@ -1,0 +1,1 @@
+{"session_id":"9bb4dd8c-0b6e-4c13-9034-5943fd6ed889","cwd":"/tmp/opencode","hook_event_name":"PostToolUse","tool_name":"Bash","tool_input":{"command":"echo hi","description":"Print hi"}}

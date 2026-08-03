@@ -11,7 +11,7 @@
   "files": [
     "plugin/knives.ts",
     "plugin/lib/",
-    "skill/"
+    "skills/"
   ],
   "repository": {
     "type": "git",

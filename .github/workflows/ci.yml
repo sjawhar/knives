@@ -65,17 +65,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build
       - uses: oven-sh/setup-bun@v2
       - run: bun install --frozen-lockfile
       - name: Lint plugin
         run: bun run lint
       - name: Typecheck plugin
         run: bun run typecheck
-      # Includes the guard test pinning the entry module's export surface:
+      # The suite includes an import guard pinning the entry module's export surface:
       # OpenCode calls every exported function as a plugin, so a second export
       # breaks plugin loading. See plugin/knives.ts.
       - name: Test plugin
         run: bun run test:knives-plugin
+        env:
+          KNIVES_BIN: target/debug/knives
 
   machete:
     runs-on: ubuntu-latest

@@ -7,7 +7,7 @@
 
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 /// Process exit codes, as a type so a command cannot invent one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,6 +95,11 @@ pub fn machine_readable(json: bool, text: bool) -> bool {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Receive a hook event from an agent harness. Always exits successfully.
+    Hook {
+        #[arg(value_enum)]
+        harness: HookHarness,
+    },
     /// Configure remote roles for a repo. Writes the registry.
     Init {
         /// Repo directory. Defaults to the current directory.
@@ -221,6 +226,12 @@ pub enum Command {
     },
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum HookHarness {
+    ClaudeCode,
+    Opencode,
+}
+
 #[derive(Debug, Subcommand)]
 pub enum ReleaseAction {
     /// Cut the release. The only thing knives writes, and it still never pushes.
@@ -273,10 +284,13 @@ mod tests {
         reason = "indexing a result in a test is the assertion; a panic is the failure"
     )]
     use super::*;
+    use crate::config::test_support::{EnvironmentGuard, environment_lock};
     use clap::CommandFactory as _;
 
     #[test]
     fn json_is_chosen_for_an_agent_and_text_for_a_person() {
+        let _lock = environment_lock();
+        let environment = EnvironmentGuard::capture(&["KNIVES_OWNER"]);
         // Agents were grepping human output to count findings by detector. Explicit
         // flags win; otherwise the environment decides.
         assert!(machine_readable(true, false), "--json is explicit");
@@ -284,10 +298,10 @@ mod tests {
         // Neither flag: the environment decides, and this tool's own plugin exports
         // `KNIVES_OWNER` into every agent shell, so it is a direct signal rather than a
         // guess about terminals.
-        unsafe { std::env::set_var("KNIVES_OWNER", "someone") };
+        environment.set("KNIVES_OWNER", "someone");
         assert!(machine_readable(false, false), "an agent shell gets JSON");
         assert!(!machine_readable(false, true), "--text still wins there");
-        unsafe { std::env::remove_var("KNIVES_OWNER") };
+        environment.remove("KNIVES_OWNER");
     }
 
     #[test]
@@ -300,6 +314,7 @@ mod tests {
         // Given: the command surface from the design, with minimum arguments
         let invocations: Vec<Vec<&str>> = vec![
             vec!["knives", "init"],
+            vec!["knives", "hook", "claude-code"],
             vec!["knives", "repos"],
             vec!["knives", "sync", "--all"],
             vec!["knives", "preflight"],

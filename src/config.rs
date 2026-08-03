@@ -11,6 +11,68 @@ use serde::{Deserialize, Serialize};
 
 use crate::ids::RepoName;
 
+#[cfg(test)]
+#[allow(
+    clippy::redundant_pub_crate,
+    reason = "crate-visible test helpers are consumed from sibling test modules"
+)]
+pub(crate) mod test_support {
+    use std::ffi::OsString;
+    use std::sync::{Mutex, MutexGuard};
+
+    static ENVIRONMENT_LOCK: Mutex<()> = Mutex::new(());
+
+    pub(crate) fn environment_lock() -> MutexGuard<'static, ()> {
+        ENVIRONMENT_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[derive(Debug)]
+    pub(crate) struct EnvironmentGuard {
+        values: Vec<(&'static str, Option<OsString>)>,
+    }
+
+    impl EnvironmentGuard {
+        pub(crate) fn capture(names: &[&'static str]) -> Self {
+            Self {
+                values: names
+                    .iter()
+                    .map(|name| (*name, std::env::var_os(name)))
+                    .collect(),
+            }
+        }
+
+        fn assert_captures(&self, name: &str) {
+            assert!(
+                self.values.iter().any(|(captured, _)| *captured == name),
+                "{name} was not captured"
+            );
+        }
+
+        pub(crate) fn set(&self, name: &str, value: &str) {
+            self.assert_captures(name);
+            unsafe { std::env::set_var(name, value) };
+        }
+
+        pub(crate) fn remove(&self, name: &str) {
+            self.assert_captures(name);
+            unsafe { std::env::remove_var(name) };
+        }
+    }
+
+    impl Drop for EnvironmentGuard {
+        fn drop(&mut self) {
+            for (name, value) in &self.values {
+                match value {
+                    Some(value) => unsafe { std::env::set_var(name, value) },
+                    None => unsafe { std::env::remove_var(name) },
+                }
+            }
+        }
+    }
+}
+
 /// What a remote is for, rather than what it is called.
 ///
 /// An enum, so an unknown role cannot be requested and no runtime lookup error
@@ -123,6 +185,26 @@ pub struct TrustedEntry {
     pub path: PathBuf,
 }
 
+/// Whether a guidance root comes from a maintained fork or trusted instructions.
+///
+/// The distinction survives resolution because callers may surface contribution
+/// guidance for either kind without treating a trusted repository as a fork.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuidanceRootKind {
+    /// A maintained fork declared under `[repos.*]`.
+    Managed,
+    /// A repository whose instructions are trusted under `[trusted.*]`.
+    Trusted,
+}
+
+/// A canonical repository root eligible to provide agent guidance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuidanceRoot {
+    pub name: String,
+    pub root: PathBuf,
+    pub kind: GuidanceRootKind,
+}
+
 impl TrustedEntry {
     /// Resolved exactly as `RepoEntry::resolved_path` resolves, and for the same
     /// reason: the CLI and the plugin must agree on which directory an entry names.
@@ -149,6 +231,28 @@ impl Registry {
 
     pub fn is_empty(&self) -> bool {
         self.repos.is_empty()
+    }
+
+    /// Return the existing registry entries that may provide guidance.
+    ///
+    /// Resolve and skip each entry independently: a moved checkout must not disable
+    /// guidance for the remaining registered repositories.
+    pub fn guidance_roots(&self) -> Vec<GuidanceRoot> {
+        let managed = self.repos.iter().filter_map(|(name, entry)| {
+            entry.path.canonicalize().ok().map(|root| GuidanceRoot {
+                name: name.clone(),
+                root,
+                kind: GuidanceRootKind::Managed,
+            })
+        });
+        let trusted = self.trusted.iter().filter_map(|(name, entry)| {
+            entry.path.canonicalize().ok().map(|root| GuidanceRoot {
+                name: name.clone(),
+                root,
+                kind: GuidanceRootKind::Trusted,
+            })
+        });
+        managed.chain(trusted).collect()
     }
 
     /// The managed repo that contains `path`, if any.
@@ -298,6 +402,7 @@ mod tests {
         clippy::indexing_slicing,
         reason = "indexing a result in a test is the assertion; a panic is the failure"
     )]
+    use super::test_support::{EnvironmentGuard, environment_lock};
     use super::*;
 
     const SAMPLE: &str = r#"
@@ -414,7 +519,9 @@ release = "https://example.invalid/releases.git"
     fn consumer_paths_are_expanded_like_the_repo_path() {
         // An unexpanded `~` made a recorded consumer look like one pinning nothing,
         // which reads identically to having no consumer at all.
-        unsafe { std::env::set_var("HOME", "/home/someone") };
+        let _lock = environment_lock();
+        let environment = EnvironmentGuard::capture(&["HOME"]);
+        environment.set("HOME", "/home/someone");
         let dir = tempfile::tempdir().unwrap();
         let text = "[repos.demo]\npath = \"/tmp/demo\"\nupstream = \"u\"\norigin = \"o\"\n\
                     consumers = [\"~/one/default\", \"~/two/default\"]\n";
@@ -455,8 +562,67 @@ release = "https://example.invalid/releases.git"
     }
 
     #[test]
+    fn guidance_roots_preserve_managed_and_trusted_kinds() {
+        // Given: one managed fork and one trusted repository that both exist.
+        let dir = tempfile::tempdir().unwrap();
+        let managed = dir.path().join("managed");
+        let trusted = dir.path().join("trusted");
+        std::fs::create_dir_all(&managed).unwrap();
+        std::fs::create_dir_all(&trusted).unwrap();
+        let text = format!(
+            "[repos.managed]\npath = \"{}\"\nupstream = \"u\"\norigin = \"o\"\n\n\
+             [trusted.workbench]\npath = \"{}\"\n",
+            managed.display(),
+            trusted.display()
+        );
+        let registry = load(&write(dir.path(), &text)).unwrap();
+
+        // When: their guidance roots are collected.
+        let roots = registry.guidance_roots();
+
+        // Then: the roots retain their distinct registry roles.
+        assert_eq!(roots.len(), 2);
+        assert!(roots.iter().any(|root| {
+            root.name == "managed"
+                && root.root == managed.canonicalize().unwrap()
+                && root.kind == GuidanceRootKind::Managed
+        }));
+        assert!(roots.iter().any(|root| {
+            root.name == "workbench"
+                && root.root == trusted.canonicalize().unwrap()
+                && root.kind == GuidanceRootKind::Trusted
+        }));
+    }
+
+    #[test]
+    fn guidance_roots_skip_an_unresolvable_entry_without_dropping_others() {
+        // Given: one existing managed fork and one trusted checkout that was moved away.
+        let dir = tempfile::tempdir().unwrap();
+        let managed = dir.path().join("managed");
+        std::fs::create_dir_all(&managed).unwrap();
+        let missing = dir.path().join("missing");
+        let text = format!(
+            "[repos.managed]\npath = \"{}\"\nupstream = \"u\"\norigin = \"o\"\n\n\
+             [trusted.moved]\npath = \"{}\"\n",
+            managed.display(),
+            missing.display()
+        );
+        let registry = load(&write(dir.path(), &text)).unwrap();
+
+        // When: roots are resolved from the registry.
+        let roots = registry.guidance_roots();
+
+        // Then: the moved entry is skipped without disabling the existing one.
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].name, "managed");
+        assert_eq!(roots[0].kind, GuidanceRootKind::Managed);
+    }
+
+    #[test]
     fn a_trusted_tilde_path_resolves_like_a_fork_path() {
-        unsafe { std::env::set_var("HOME", "/home/someone") };
+        let _lock = environment_lock();
+        let environment = EnvironmentGuard::capture(&["HOME"]);
+        environment.set("HOME", "/home/someone");
         let dir = tempfile::tempdir().unwrap();
         let text = "[trusted.workbench]\npath = \"~/workbench/default\"\n";
         let registry = load(&write(dir.path(), text)).unwrap();
@@ -491,7 +657,9 @@ release = "https://example.invalid/releases.git"
         // The two sides disagreeing meant `path = "~/repos/x"` was a working
         // allowlist entry and a broken CLI entry, so the trust set and the tool
         // covered different directories.
-        unsafe { std::env::set_var("HOME", "/home/someone") };
+        let _lock = environment_lock();
+        let environment = EnvironmentGuard::capture(&["HOME"]);
+        environment.set("HOME", "/home/someone");
         assert_eq!(
             expand_registry_path(Path::new("~/repos/x"), Path::new("/cfg")),
             PathBuf::from("/home/someone/repos/x")

@@ -7,3 +7,6 @@ node_modules/
 # gate because the identity guard filters on extension.
 *.orig
 *.rej
+
+# omo runtime state the agent harness writes into the working copy
+/.omo

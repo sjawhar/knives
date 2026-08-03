@@ -6,6 +6,7 @@
 //! printed nothing and exited zero.
 
 pub mod claim;
+pub mod hook;
 pub mod init;
 pub mod preflight;
 pub mod release;
