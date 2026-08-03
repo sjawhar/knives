@@ -14,7 +14,10 @@ if output=$(printf '%s' "$payload" | "$bin" hook claude-code 2>/dev/null); then
   printf '%s' "$output"
 else
   case $payload in
-    *'"hook_event_name":"SessionStart"'*)
+    # Require the event key, then its colon, then SessionStart. A PostToolUse
+    # tool_input can contain that exact JSON fragment and cause one harmless
+    # extra systemMessage for a stale binary; avoiding it needs JSON parsing.
+    *'"hook_event_name"'*':'*'"SessionStart"'*)
       printf '%s\n' '{"systemMessage":"knives: installed binary cannot serve this plugin (needs the hook subcommand). Update knives or set KNIVES_BIN."}'
       ;;
   esac

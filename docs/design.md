@@ -276,6 +276,17 @@ repository from spending the same announcement budget more than once.
 
 ### OpenCode configuration
 
+An OpenCode installation from the release archive loads this plugin:
+
+```jsonc
+"plugin": [
+  ["file:///<prefix>/share/knives/opencode/plugins/knives.ts",
+   { "notice": true, "guidance": true, "owner": true }]
+]
+```
+
+For development from a checkout, use its plugin path instead:
+
 ```jsonc
 "plugin": [
   ["file://{env:HOME}/knives/default/plugin/knives.ts",

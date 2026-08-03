@@ -81,6 +81,17 @@ The Claude Code plugin ships its hooks and skills. The binary still comes from t
 above. Without that binary, the hooks exit silently. An old binary emits a SessionStart system
 message that asks you to update knives or set `KNIVES_BIN`.
 
+Install the OpenCode plugin from the release archive by adding its path to `opencode.json`:
+
+```jsonc
+"plugin": [
+  "file:///<prefix>/share/knives/opencode/plugins/knives.ts"
+]
+```
+
+The plugin finds `<prefix>/bin/knives` automatically. It registers the skills included in the
+archive without another configuration step.
+
 Or build from source with a Rust toolchain:
 
 ```
