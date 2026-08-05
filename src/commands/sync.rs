@@ -152,7 +152,10 @@ fn sync_pull_requests(
         return Ok(BTreeMap::new());
     };
     match forge.pull_requests(&entry.path) {
-        Ok(found) => Ok(ours_only(found, entry.remote(Role::Origin))),
+        Ok(found) => Ok(ours_only(
+            found,
+            &[entry.remote(Role::Origin), entry.remote(Role::Release)],
+        )),
         Err(error) => {
             report
                 .problems
@@ -629,6 +632,7 @@ mod comment_activity_tests {
             origin: origin.to_string_lossy().into_owned(),
             base: None,
             release: None,
+            release_branch: None,
             test_count_command: None,
             consumers: Vec::new(),
         }

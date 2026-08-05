@@ -1,6 +1,6 @@
 ---
 name: using-knives
-description: "Reference manual for the knives CLI, which reports and coordinates state across several forks of upstream repositories worked by several agents. Use when running any knives command, when interpreting what one printed, or when you need the detail behind it: what the upstream, origin and release remotes mean, how a branch is matched to a pull request and how to state one it cannot find, recording that one branch cannot land before another, planning and cutting dated releases, JSON output, and the OpenCode plugin's options. For the shorter question of what to do before touching a fork at all, use the fork-work skill."
+description: "Reference manual for the knives CLI, which reports and coordinates state across several forks of upstream repositories worked by several agents. Use when running any knives command, when interpreting what one printed, or when you need the detail behind it: what the upstream, origin and release remotes mean, how a branch is matched to a pull request and how to state one it cannot find, recording that one branch cannot land before another, planning and cutting releases, JSON output, and the OpenCode plugin's options. For the shorter question of what to do before touching a fork at all, use the fork-work skill."
 ---
 
 # The knives CLI
@@ -19,46 +19,48 @@ Every command takes its repo from the directory you are standing in. Name one on
 
 ### `knives repos`
 
-What is managed, where each checkout is, the newest release each has cut, and, where a consumer is recorded, whether that consumer is pinned behind the newest cut. Trusted entries, which are repositories whose instructions we read but do not maintain, are listed separately.
+What is managed, where each checkout is, the newest release each has cut, and, where consumers are recorded, whether those consumers are pinned behind the newest cut. Trusted entries, which are repositories whose instructions we read but do not maintain, are listed separately.
 
+Pins are read from each consumer's origin trunk rather than its working copy. Notes report when a consumer checkout is behind its origin trunk (`checkout is N commit(s) behind its <branch>`), when no origin trunk resolves (`no origin trunk resolved; pins read from the working copy`), or when a consumer is not a repository (`not a repository; pins read from the working copy`). Under a fixed scheme, a branch-name pin with no locked commit is current by definition, and a locked commit is behind when it is an ancestor of the branch tip.
 ### `knives status [REPO|--all]`
 
-The main report. Per branch: local tip, where origin has it, the pull request and its state, the review decision, whether the review predates the newest commit, and how the branch relates to the upstream trunk. Plus claims other agents hold, the releases scanned, findings grouped one line per kind, and anything it could not answer.
+The main report. Per branch: local tip, push status, pull request and its state, review decision, CI check status, landed verdict against upstream trunk, and flags. Plus claims other agents hold, the releases scanned, findings grouped one line per kind, and anything it could not answer.
 
 `--verbose` prints one block per finding instead of one line per kind. `--no-landed` skips the trunk probe, which is the slow part. `--no-github` skips pull request lookups.
 
-#### Branch-line tokens
+#### Branch table columns
 
-A branch line renders tokens in order:
+Branch rows are rendered as an aligned table with 8 columns. Empty cells render as `-` for `review`, `checks`, `landed`, and `flags` columns (`branch`, `tip`, `push`, and `pr` always carry values or state tokens).
 
-- Local tip: short commit hash, or `divergent` when local working copy has multiple commits for this change.
-- Origin relation:
-  - `unpushed` if origin has no counterpart for this branch.
-  - `unpushed-commits` if local is ahead of origin.
-  - `origin=<id> (behind)` if origin is ahead of local.
-  - `origin=<id> (diverged)` if local and origin histories have forked, usually after a rewrite post-push.
-  - `origin=<id> (unresolved)` if ancestry could not be determined. A matching entry appears under `unanswered`. This is not a claim about history.
-  - `pushed` if local tip matches origin tip.
-- Pull request tokens:
-  - `#<n>` followed by lowercased state when closed or merged (for example, `closed`, `merged`).
-  - Review decision: `no-review` or forge decision (`APPROVED`, `CHANGES_REQUESTED`).
-  - `draft` if the pull request is marked as draft.
-  - `checks-failing` if the forge reported failing CI checks on an open pull request.
-  - `no-checks` if we asked the forge and no checks had run on an open pull request. A branch whose checks were not consulted shows no token at all. CI still in flight renders the same as all-green (no token) because the vocabulary has no `checks-running`. Checks are consulted only for open pull requests.
-  - `CONFLICTING` if the forge reports merge conflicts with the base branch.
-  - `behind-base` if the pull request base branch has moved on, which is not a conflict.
-- Landed verdict: `in-trunk`, `conflicts-with-trunk`, `not-in-trunk`, or `landed?`.
-- `review-stale` if the newest review predates the newest commit on the branch.
-- `#<n> <state> (stated)` if a pull request was explicitly stated for this branch rather than inferred.
-- `fork-only` if marked as deliberately having no upstream pull request.
-- `no-pr` if no pull request was inferred or stated.
+1. `branch`: local bookmark name.
+2. `tip`: short commit hash, or `divergent` if the bookmark has multiple tips.
+3. `push`: relation between local and origin tips:
+   - `pushed` if local matches origin tip.
+   - `unpushed` if origin has no remote-tracking ref for this branch.
+   - `unpushed-commits` if local is ahead of origin.
+   - `origin=<id> (behind)` if origin is ahead of local.
+   - `origin=<id> (diverged)` if local and origin have diverged.
+   - `origin=<id> (unresolved)` if ancestry could not be determined.
+4. `pr`: pull request details:
+   - `#<n>` or `#<n> <state>` for closed/merged pull requests.
+   - `#<n> draft` for draft pull requests.
+   - `#<n> <state> (stated)` for explicitly tracked pull requests.
+   - `no-pr` if no pull request is associated.
+5. `review`: `APPROVED`, `CHANGES_REQUESTED`, `no-review`, or `-` if no PR exists.
+6. `checks`: CI check status for open pull requests:
+   - `ok` if checks passed.
+   - `failing` if CI checks failed.
+   - `none-ran` if no checks ran.
+   - `-` if no open PR exists or checks were not consulted. CI still in flight renders the same as all-green (`ok`) because the vocabulary has no `checks-running`. Checks are consulted only for open pull requests.
+7. `landed`: verdict against upstream's trunk (`in-trunk`, `conflicts-with-trunk`, `not-in-trunk`, `landed?`, or `-`).
+8. `flags`: comma-separated flags (`CONFLICTING`, `behind-base`, `review-stale`, `fork-only`) or `-`.
 
 Trunk verdicts say what was observed, not what it means:
 
 - `in-trunk`: replaying the branch onto the trunk produced nothing, so the trunk has it.
 - `conflicts-with-trunk`: replaying it conflicts. This does not mean the maintainer took it and modified it: a branch declined upstream, whose files were later touched by unrelated work, conflicts identically. The tool cannot tell those apart and does not try.
 - `not-in-trunk`: it applies cleanly and is not empty, so the trunk lacks it.
-- `landed?`: local differs from origin, so replaying would judge content the pull request does not contain. Refusing to answer beats guessing here, because the answer used to be "already upstream, drop it".
+- `landed?`: local differs from origin, so replaying would judge content the pull request does not contain. Refusing to answer beats guessing.
 
 An `unanswered` section means the run is incomplete and some of the report is missing. Read it before trusting the rest.
 
@@ -74,10 +76,9 @@ Findings appear grouped one line per kind at the end of the status report:
 - `unmet-dependency`: a required pull request dependency is not merged yet.
 - `unmergeable`: the pull request conflicts with its base branch according to the forge.
 - `checks-failing`: the forge reported a red CI conclusion (`FAILURE`, `TIMED_OUT`, `CANCELLED`, `STARTUP_FAILURE`, `ACTION_REQUIRED`, or `ERROR`).
-- `wrong-base`: the pull request targets a branch whose name differs from the repo's configured base branch. It cannot tell a pull request aimed at our fork's `main` from one aimed at upstream's `main` because both are named `main` and `gh` resolves to upstream anyway. An empty base is unknown, not wrong. Only open pull requests are checked.
-- `carried-elsewhere`: the branch tip is reachable from another reference. It reports where it was found and says nothing about what it means, whether a maintainer rebased it, took it, or coincidentally landed the same content. Our own release cuts, `@git` refs, and trunk are excluded.
-- `branch-overlap`: two or more of our branches change the same file, which conflicts when a release merges them. One finding per file, naming every branch. It is a path comparison and nothing more.
-
+- `wrong-base`: the pull request targets a branch whose name differs from the repo's configured base branch. Only open pull requests are checked; an empty base is unknown, not wrong.
+- `carried-elsewhere`: the branch tip is reachable from another reference. Trunk, `@git` refs, and our own release cuts are excluded.
+- `branch-overlap`: two or more of our branches change the same file, which conflicts when a release merges them. One finding per file, naming every branch.
 ### `knives sync [REPO|--all]`
 
 Fetches every remote and every tracked pull request head, then classifies each tracked pull request as `new`, `unchanged`, `advanced`, `merged` or `closed`. Forge state wins over head movement: a merged pull request whose head also moved is merged.
@@ -114,15 +115,34 @@ knives track <branch> --forget       # back to inference
 
 That the branch cannot land before that pull request does. Dependencies cross forks, which is the case that motivated it: dropping a required change from a release without dropping the branch that needs it ships a release that cannot work. `status` reports the ones that are not merged yet.
 
-### `knives release`
+### `knives release [REPO]`
 
-With no name, plans: what a cut would contain, whether every parent is still its branch tip, and who pins the current release. With a name, cuts it. Planning is the default because cutting is the only thing knives writes, and it still never pushes.
+With no arguments or subcommand, plans a release: reports what a cut would contain, whether every parent is still at its branch tip, and consumer pin state. Planning is the default because cutting is the only thing knives writes, and it still never pushes.
 
-A cut is a flat octopus merge whose parents are the branch tips, pushed to the release remote. Nothing needs mirroring first: the push carries the parent commits.
+A release cut is a flat octopus merge combining the tips of all maintained branches. Publishing remains a manual `jj git push --bookmark <name>` operation.
+
+#### Scheme variants
+
+- Dated scheme (default, when `release_branch` is absent): cuts create a new dated branch named `release/YYYY-MM-DD` (or `.1`, `.2` for repair cuts). Cutting requires an explicit name argument: `knives release cut release/YYYY-MM-DD`.
+- Fixed scheme (when `release_branch = "<name>"` is set): cuts rebuild the flat octopus merge and advance the configured release branch in place using jj's internal `--allow-backwards` mechanism. Cutting needs no name argument (`knives release cut` alone); passing a dated name is refused. The previous release position is read from the publish remote (`release` when set in the entry, falling back to `origin`).
+
+#### Release subcommands and options
+
+- `knives release rebase [REF]`: adds an upstream commit (defaulting to upstream's trunk) to the release in hand, keeping its branch parents — it does not re-cut. For when a pull request has merged upstream: until the release contains the commit that merge landed in, dropping the local branch takes the change out of the release with it. Whether this can happen in place or needs a new dated name follows from consumer pin state (a consumer following the branch sees a repair; one frozen on a revision does not). A permitted in-place repair rebuilds the flat merge and moves the release bookmark, including when jj considers that move sideways; integration coverage verifies that parent topology is retained.
+- `knives release include <branch> --why "..."` and `knives release drop <branch> --why "..."`: state whether a branch belongs in the next release. Membership is every branch until anything is stated, after which membership is **exactly** what was stated — stating one `include` or `drop` converts the cut from "all branches" to "only stated branches". `drop` records the reason so subsequent cuts do not re-include the branch.
+- `knives release --consumer <DIR>`: scans an extra consumer checkout directory alongside any consumers recorded in `repos.toml`. Repeatable (`--consumer <DIR1> --consumer <DIR2>`), because a fork can be consumed by several checkouts sitting on different releases.
+
+### `knives register [DIR]`
+
+Prints a paste-ready `[repos.<name>]` TOML entry to stdout, with diagnostic instructions on stderr.
+
+Writes nothing to `repos.toml` directly. The human or caller pastes the stdout snippet into `repos.toml`. Replace any existing `[repos.<name>]` section rather than appending a duplicate entry. Registry edits take effect on the next hook event or tool call without needing a daemon or service restart.
 
 ### `knives init [DIR]`
 
-Reads the remotes of a checkout and writes it into the registry.
+Reads a checkout's remotes and outputs a registry entry or adopts the repository into the registry.
+
+Expects remotes named for their roles: `upstream` (what we contribute to) and `origin` (our fork where branches push and PR heads live), plus an optional `release` remote. Warns if an untracked remote looks like another fork of upstream (detected via case-insensitive owner and slug comparison on the same host), reminding that `origin` must point to your own fork.
 
 ## The three remotes
 
@@ -132,23 +152,41 @@ Reads the remotes of a checkout and writes it into the registry.
 
 ## The registry
 
-`~/.config/knives/repos.toml`. Two kinds of entry:
+`~/.config/knives/repos.toml`. Managed fork entries, trusted entries, and trust rules:
 
 ```toml
 [repos.scout]
 path = "~/forks/scout/default"
 upstream = "https://forge.invalid/org/scout"
 origin = "https://forge.invalid/ours/scout"
-base = "main"                         # optional: branch upstream expects PRs against (defaults to main)
-consumers = ["~/workbench/default"] # optional: who pins this repo's releases
+base = "main"                         # optional: upstream's trunk (defaults to main; set e.g. "dev" for opencode-style forks)
+release_branch = "release"            # optional: fixed release branch scheme (omit for dated release/YYYY-MM-DD)
+consumers = ["~/workbench/default"] # optional: consumer checkouts pinning this repo's releases
 
 [trusted.workbench]
 path = "~/workbench/default"       # instructions read, not maintained
+
+[trust]
+roots = ["~/projects/company"]      # subtrees whose repos are all trusted for guidance
+owners = ["orgname"]               # forge owners whose repos are trusted for guidance
 ```
 
-`[repos.*]` is what we maintain forks of, and a fork entry must carry its remotes: that is enforced when the file parses. `base` is optional and defaults to `main`, specifying the branch upstream expects pull requests against. A fork whose trunk is `develop` needs `base = "develop"` set, or every pull request triggers a `wrong-base` finding.
+### Registry fields
 
-`[trusted.*]` is a repository whose agent instructions should reach an agent but which we do not maintain, so it needs only a path. No fork command touches a trusted entry.
+- `[repos.*]`: managed forks. `upstream` and `origin` are required.
+  - `base`: upstream's trunk — the branch we fork from, measure landed state against, and target pull requests at. Defaults to `main`. Configurable because upstreams use different trunk names (for example, opencode-style forks set `base = "dev"`).
+  - `release_branch`: configures a fixed release branch scheme (e.g., `"release"` or `"integration"`). Must not be empty, equal to `base`, or sit under the `release/` prefix.
+  - `consumers`: checkouts that pin this repository's releases.
+
+- `[trusted.*]`: unmaintained repositories whose agent instructions are trusted for reading.
+
+- `[trust]`: rules for trusting instructions from unmanaged repositories.
+  - `roots`: array of directory paths; any repository inside these subtrees is trusted for guidance.
+  - `owners`: array of forge organization or user names.
+
+> **SECURITY:** `owners` matches self-declared remote URLs read from the candidate checkout's own git config — not forge-authenticated; any repo that declares itself a checkout of a trusted owner's repo (by remote URL or a `gitdir:` pointer) is accepted; the probe verifies the directory is the repository's own git toplevel, so nested directories do NOT inherit an enclosing repo's identity; owner rules read GIT remote config, so jj-only (non-colocated) checkouts match only via `roots`; grants guidance-as-data injection only (same grant as a `[trusted]` entry), never fork-command access; prefer `roots` when in doubt.
+
+Edits to `repos.toml` take effect on the next hook event or tool call (reloaded per event) — no restart required.
 
 ## JSON
 

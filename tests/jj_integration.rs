@@ -9,16 +9,19 @@
 mod lab;
 
 use knives::commands::{
+    repos,
     status::{self, OriginRelation},
     sync,
 };
 use knives::config::RepoEntry;
 use knives::detect::landed::RebaseOutcome;
 use knives::forge::{ChecksSummary, Forge, ForgeError, PullRequest};
-use knives::ids::{BookmarkRef, BranchName, CommitId, RemoteName};
+use knives::ids::{BookmarkRef, BranchName, CommitId, ReleaseScheme, RemoteName};
 use knives::jj::{Repo, changed_files, changed_files_between, probe_landed, pull_heads};
 use knives::store::Store;
+use lab::Lab;
 use std::collections::BTreeMap;
+use std::process::Command;
 
 struct StateUnavailableForge;
 
@@ -77,6 +80,33 @@ fn relation_to_origin(lab: &lab::Lab) -> Result<Option<OriginRelation>, knives::
         .expect("origin tip");
 
     status::relation_to_origin(&repo, &tip, Some(&origin_tip))
+}
+
+#[test]
+fn a_fork_whose_trunk_is_dev_probes_and_forks_against_dev() {
+    // Given: an upstream whose only branch is dev, and a feature branch on it
+    let lab = Lab::with_trunk("dev");
+    lab.branch("feat/alpha", "feature.txt", "content\n");
+    // When: the landed probe measures against dev@upstream
+    let outcome = knives::jj::probe_landed(
+        lab.work_path(),
+        &knives::ids::BranchName::new("feat/alpha"),
+        "dev@upstream",
+    )
+    .expect("probe runs");
+    // Then: unmerged work replays clean and non-empty — the probe found the
+    // trunk rather than erroring on a nonexistent main
+    assert_eq!(outcome, RebaseOutcome::CleanNonEmpty);
+
+    lab.publish_pull("feat/alpha", 1);
+    lab.squash_merge_pull(1, None);
+    let outcome = knives::jj::probe_landed(
+        lab.work_path(),
+        &knives::ids::BranchName::new("feat/alpha"),
+        "dev@upstream",
+    )
+    .expect("probe runs after squash merge");
+    assert_eq!(outcome, RebaseOutcome::Empty);
 }
 
 #[test]
@@ -175,6 +205,136 @@ fn ancestry_is_answered_in_both_directions() {
 }
 
 #[test]
+fn a_fixed_pin_locked_to_an_ancestor_is_behind() {
+    let lab = Lab::new();
+    lab.branch("integration", "base.txt", "base\n");
+    let repo = Repo::open(&lab.work).expect("open ancestor");
+    let ancestor = repo.resolve_commit("integration").expect("ancestor");
+    lab.jj_work(["new", "-r", "integration", "-m", "advance integration"]);
+    std::fs::write(lab.work.join("advance.txt"), "advance\n").expect("advance integration");
+    lab.jj_work(["bookmark", "set", "integration", "-r", "@"]);
+    lab.jj_work(["new"]);
+
+    let consumer = tempfile::tempdir().expect("consumer directory");
+    let locked: String = ancestor.as_str().chars().take(12).collect();
+    std::fs::write(
+        consumer.path().join("uv.lock"),
+        format!("url = \"https://forge.invalid/o/repo.git?branch=integration#{locked}\"\n"),
+    )
+    .expect("consumer pin");
+    let entry = RepoEntry {
+        path: lab.work.clone(),
+        upstream: "https://forge.invalid/up/repo.git".to_owned(),
+        origin: "https://forge.invalid/o/repo.git".to_owned(),
+        base: None,
+        release: None,
+        release_branch: Some("integration".to_owned()),
+        test_count_command: None,
+        consumers: vec![consumer.path().to_owned()],
+    };
+    let repo = Repo::open(&lab.work).expect("open advanced branch");
+
+    let lag = repos::pin_lag(&entry, None, Some(&repo));
+
+    assert!(
+        lag.notes
+            .iter()
+            .any(|note| note.contains("pins read from the working copy")),
+        "notes: {:?}",
+        lag.notes
+    );
+    assert!(
+        lag.lag.as_ref().is_some_and(|lag| lag.contains(&locked)),
+        "lag: {:?}",
+        lag.lag
+    );
+}
+
+#[test]
+fn a_consumer_checkout_parked_behind_its_origin_does_not_produce_a_false_behind() {
+    // Given: a consumer repo whose origin trunk pins the newest release while
+    // the checkout's working copy still shows an older pin — the exact state
+    // that produced false BEHIND findings twice.
+    let lab = Lab::new();
+    let consumer = lab.consumer_with_pin_history(
+        "uv.lock",
+        "url = \"https://forge.invalid/o/tool.git?rev=release%2F2026-07-20\"\n",
+        "url = \"https://forge.invalid/o/tool.git?rev=release%2F2026-07-28\"\n",
+    );
+
+    // When: the consumer is scanned.
+    let (pins, notes) = knives::commands::release::scan_consumer_for(
+        &consumer,
+        Some("tool"),
+        &knives::ids::ReleaseScheme::Dated,
+    );
+
+    // Then: the pin is the origin trunk's, and the checkout's lag is a note.
+    assert_eq!(pins.len(), 1, "was: {pins:?}");
+    assert_eq!(pins[0].reference, "release/2026-07-28");
+    assert!(
+        notes.iter().any(|note| note.contains("behind")),
+        "the stale checkout is annotated, not silently trusted: {notes:?}"
+    );
+}
+
+#[test]
+fn a_dev_trunk_consumer_checkout_uses_its_origin_head_pin() {
+    let lab = Lab::with_trunk("dev");
+    let consumer = lab.consumer_with_pin_history(
+        "uv.lock",
+        "url = \"https://forge.invalid/o/tool.git?rev=release%2F2026-07-20\"\n",
+        "url = \"https://forge.invalid/o/tool.git?rev=release%2F2026-07-28\"\n",
+    );
+
+    let (pins, notes) = knives::commands::release::scan_consumer_for(
+        &consumer,
+        Some("tool"),
+        &knives::ids::ReleaseScheme::Dated,
+    );
+
+    assert_eq!(pins.len(), 1, "was: {pins:?}");
+    assert_eq!(pins[0].reference, "release/2026-07-28");
+    assert!(
+        notes.iter().any(|note| note.contains("origin/dev")),
+        "the origin default branch is preserved: {notes:?}"
+    );
+}
+
+#[test]
+fn a_consumer_without_an_origin_remote_uses_its_current_working_copy_pin() {
+    let lab = Lab::new();
+    let consumer = lab.consumer_with_pin_history(
+        "uv.lock",
+        "url = \"https://forge.invalid/o/tool.git?rev=release%2F2026-07-20\"\n",
+        "url = \"https://forge.invalid/o/tool.git?rev=release%2F2026-07-28\"\n",
+    );
+    lab.reset_consumer_to_origin(&consumer);
+    lab.rename_consumer_remote(&consumer, "origin", "upstream");
+    let entry = RepoEntry {
+        path: lab.work,
+        upstream: "https://forge.invalid/up/tool.git".to_owned(),
+        origin: "https://forge.invalid/o/tool.git".to_owned(),
+        base: None,
+        release: None,
+        release_branch: None,
+        test_count_command: None,
+        consumers: vec![consumer.clone()],
+    };
+
+    let pin_lag = repos::pin_lag(&entry, Some(&"release/2026-07-28@origin".to_owned()), None);
+
+    assert_eq!(pin_lag.lag, None, "was: {pin_lag:?}");
+    assert_eq!(
+        pin_lag.notes,
+        vec![format!(
+            "{}: no origin trunk resolved; pins read from the working copy",
+            consumer.display()
+        )]
+    );
+}
+
+#[test]
 fn a_tip_carried_into_another_branch_is_found() {
     // Given: a maintainer branch built on our branch's tip
     let lab = lab::Lab::new();
@@ -187,7 +347,9 @@ fn a_tip_carried_into_another_branch_is_found() {
 
     // When: bookmarks carrying the original tip are listed
     let repo = Repo::open(&lab.work).expect("reopen");
-    let carriers = repo.branches_containing(&tip).expect("carriers");
+    let carriers = repo
+        .branches_containing(&tip, &ReleaseScheme::Dated)
+        .expect("carriers");
     let named: Vec<String> = carriers.iter().map(ToString::to_string).collect();
 
     // Then: the other branch is included and the branch itself is not
@@ -215,7 +377,7 @@ fn a_release_cut_is_not_a_carrier_locally_or_at_origin() {
     // When: carriers of the feature tip are listed.
     let carriers = Repo::open(&lab.work)
         .expect("reopen")
-        .branches_containing(&tip)
+        .branches_containing(&tip, &ReleaseScheme::Dated)
         .expect("carriers");
 
     // Then: the release is not reported through either representation we own.
@@ -246,7 +408,7 @@ fn git_tracking_refs_are_not_carriers_but_other_branches_are() {
     // When: carriers of our tip are listed.
     let carriers = Repo::open(&lab.work)
         .expect("reopen")
-        .branches_containing(&tip)
+        .branches_containing(&tip, &ReleaseScheme::Dated)
         .expect("carriers");
 
     // Then: the real branch remains useful evidence, but jj's duplicate does not.
@@ -280,7 +442,7 @@ fn fetched_pull_request_heads_are_not_carriers() {
     // When: carriers of the feature tip are listed.
     let carriers = Repo::open(&lab.work)
         .expect("reopen")
-        .branches_containing(&tip)
+        .branches_containing(&tip, &ReleaseScheme::Dated)
         .expect("carriers");
 
     // Then: our fetched pull request is not mistaken for someone else's carrier.
@@ -302,6 +464,7 @@ fn unavailable_state_for_a_tracked_pull_request_is_incomplete() {
         origin: lab.work.display().to_string(),
         base: None,
         release: None,
+        release_branch: None,
         test_count_command: None,
         consumers: Vec::new(),
     };
@@ -651,7 +814,8 @@ fn a_cut_is_flat_and_carries_its_provenance() {
             (beta, "feat/beta".to_owned()),
         ],
     };
-    let created = knives::commands::release::cut(&lab.work, &request).expect("cut");
+    let created =
+        knives::commands::release::cut(&lab.work, &request, &ReleaseScheme::Dated).expect("cut");
 
     // Flat: exactly two parents, no nested integration node.
     let parents = knives::jj::Repo::open(&lab.work)
@@ -686,7 +850,7 @@ fn a_cut_refuses_when_the_merge_did_not_get_the_parents_it_asked_for() {
         parents: vec![alpha.clone(), alpha.clone()],
         provenance: vec![(alpha, "feat/alpha".to_owned())],
     };
-    let outcome = knives::commands::release::cut(&lab.work, &request);
+    let outcome = knives::commands::release::cut(&lab.work, &request, &ReleaseScheme::Dated);
     assert!(
         outcome.is_err(),
         "a parent-count mismatch must refuse, got {outcome:?}"
@@ -707,6 +871,203 @@ fn a_cut_refuses_when_the_merge_did_not_get_the_parents_it_asked_for() {
 }
 
 #[test]
+fn fixed_previous_position_keeps_the_published_remote_after_a_local_cut() {
+    // Given: a fixed integration cut published to origin, then advanced only locally.
+    let lab = lab::Lab::new();
+    lab.branch("integration", "integration.txt", "published\n");
+    lab.push_branch("integration");
+    let published = Repo::open(&lab.work)
+        .expect("open published repo")
+        .resolve_commit("integration@origin")
+        .expect("published integration tip");
+    lab.jj_work(["new", "-r", "integration", "-m", "local integration cut"]);
+    std::fs::write(lab.work.join("integration.txt"), "local cut\n").expect("write local cut");
+    lab.jj_work(["bookmark", "set", "integration", "-r", "@"]);
+    lab.jj_work(["new"]);
+    let entry = RepoEntry {
+        path: lab.work.clone(),
+        upstream: lab.upstream.display().to_string(),
+        origin: lab.work.display().to_string(),
+        base: None,
+        release: None,
+        release_branch: Some("integration".to_owned()),
+        test_count_command: None,
+        consumers: Vec::new(),
+    };
+    let repo = Repo::open(&lab.work).expect("open after local cut");
+    let local = repo
+        .resolve_commit("integration")
+        .expect("local integration tip");
+
+    // When: the previous fixed release position is read after the local cut.
+    let previous = knives::commands::release::previous_position(&repo, &entry);
+
+    // Then: it is the unchanged published remote, not the new local cut.
+    assert_ne!(local, published);
+    assert_eq!(previous, Some(("integration@origin".to_owned(), published)));
+}
+
+#[test]
+fn a_fixed_release_branch_is_cut_in_place_and_its_previous_position_is_the_old_cut() {
+    // Given: a fork with one feature branch and a fixed integration branch scheme.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "one\n");
+    let entry = lab.repo_entry_with_release_branch("integration");
+    let scheme = entry.release_scheme();
+
+    // When: the first fixed cut is made and pushed.
+    let opened = Repo::open(lab.work_path()).expect("open");
+    let carried = knives::commands::release::carried_branches(&opened, entry.trunk(), &scheme)
+        .expect("carried branches");
+    let trunk = opened
+        .resolve_commit(&entry.upstream_trunk())
+        .expect("upstream trunk");
+    let mut parents = vec![trunk];
+    parents.extend(carried.into_iter().map(|(_, commit)| commit));
+    let first = knives::commands::release::cut(
+        lab.work_path(),
+        &knives::commands::release::Cut {
+            name: "integration".to_owned(),
+            parents,
+            provenance: vec![],
+        },
+        &scheme,
+    )
+    .expect("first cut");
+    lab.push_branch("integration");
+    lab.fetch_work();
+
+    // MANDATORY reopen: Repo::open reads state at call time, and the first handle
+    // predates the push/fetch that made integration@origin available locally.
+    let opened = Repo::open(lab.work_path()).expect("reopen after fetch");
+    let previous = knives::commands::release::previous_position(&opened, &entry)
+        .expect("a pushed cut is a previous position");
+
+    // Then: the remote-tracking ref is the old cut before any subsequent push.
+    assert_eq!(
+        previous,
+        ("integration@origin".to_owned(), first.clone()),
+        "the old cut is the previous release"
+    );
+
+    lab.branch("feat/beta", "beta.txt", "two\n");
+    let opened = Repo::open(lab.work_path()).expect("reopen for second cut");
+    let carried = knives::commands::release::carried_branches(&opened, entry.trunk(), &scheme)
+        .expect("carried branches for second cut");
+    let trunk = opened
+        .resolve_commit(&entry.upstream_trunk())
+        .expect("upstream trunk for second cut");
+    let mut parents = vec![trunk];
+    parents.extend(carried.into_iter().map(|(_, commit)| commit));
+    let second = knives::commands::release::cut(
+        lab.work_path(),
+        &knives::commands::release::Cut {
+            name: "integration".to_owned(),
+            parents,
+            provenance: vec![],
+        },
+        &scheme,
+    )
+    .expect("second fixed cut may move integration sideways");
+    let opened = Repo::open(lab.work_path()).expect("reopen after second cut");
+
+    assert_eq!(
+        opened
+            .resolve_commit("integration")
+            .expect("integration tip"),
+        second,
+        "the fixed bookmark advances to the fresh flat merge"
+    );
+    assert_eq!(
+        knives::commands::release::previous_position(&opened, &entry),
+        Some(("integration@origin".to_owned(), first)),
+        "the still-unpushed second cut keeps the first published cut as previous"
+    );
+}
+
+#[test]
+fn a_dated_cut_refuses_a_sideways_bookmark_move() {
+    // Given: two unrelated flat dated cuts.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "one\n");
+    lab.branch("feat/beta", "beta.txt", "two\n");
+    lab.octopus("release/2026-08-01", "feat/alpha", "feat/beta");
+    lab.branch("feat/gamma", "gamma.txt", "three\n");
+    lab.octopus("release/2026-08-02", "feat/alpha", "feat/gamma");
+    let replacement = Repo::open(lab.work_path())
+        .expect("open")
+        .parents_of("release/2026-08-02")
+        .expect("replacement dated cut parents")
+        .into_iter()
+        .map(|parent| parent.commit)
+        .collect();
+
+    // When: cut rebuilds the second merge under the first dated name.
+    let moved = knives::commands::release::cut(
+        lab.work_path(),
+        &knives::commands::release::Cut {
+            name: "release/2026-08-01".to_owned(),
+            parents: replacement,
+            provenance: vec![],
+        },
+        &ReleaseScheme::Dated,
+    );
+
+    // Then: Dated routing retains jj's sideways-move protection.
+    assert!(moved.is_err(), "dated cuts must not move sideways");
+}
+
+#[test]
+fn plan_for_a_fixed_release_ignores_a_non_publish_remote() {
+    // Given: the same fixed release exists on both the publish remote and upstream.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "one\n");
+    let entry = lab.repo_entry_with_release_branch("integration");
+    let scheme = entry.release_scheme();
+    let opened = Repo::open(lab.work_path()).expect("open");
+    let carried = knives::commands::release::carried_branches(&opened, entry.trunk(), &scheme)
+        .expect("carried branches");
+    let trunk = opened
+        .resolve_commit(&entry.upstream_trunk())
+        .expect("upstream trunk");
+    let mut parents = vec![trunk];
+    parents.extend(carried.into_iter().map(|(_, commit)| commit));
+    knives::commands::release::cut(
+        lab.work_path(),
+        &knives::commands::release::Cut {
+            name: "integration".to_owned(),
+            parents,
+            provenance: vec![],
+        },
+        &scheme,
+    )
+    .expect("cut");
+    lab.push_branch("integration");
+    lab.jj_work(["bookmark", "track", "integration", "--remote", "upstream"]);
+    lab.jj_work([
+        "git",
+        "push",
+        "--remote",
+        "upstream",
+        "--bookmark",
+        "integration",
+    ]);
+    lab.fetch_work();
+    let upstream = Repo::open(lab.work_path())
+        .expect("reopen after fetch")
+        .resolve_commit("integration@upstream");
+    assert!(upstream.is_ok(), "upstream fixed release must be present");
+    lab.jj_work(["bookmark", "delete", "integration"]);
+
+    // When: planning selects the newest fixed release without a local bookmark.
+    let plan = knives::commands::release::plan(&knives::ids::RepoName::new("a-repo"), &entry, &[])
+        .expect("plan");
+
+    // Then: upstream cannot be mistaken for the publish remote's release.
+    assert_eq!(plan.release.as_deref(), Some("integration@origin"));
+}
+
+#[test]
 fn status_with_the_landed_probe_reports_a_merged_branch_and_leaves_no_trace() {
     // The probe path through `knives status` end to end. It is exercised here and
     // deliberately never against a live shared repository, because it mutates.
@@ -722,6 +1083,7 @@ fn status_with_the_landed_probe_reports_a_merged_branch_and_leaves_no_trace() {
         origin: lab.work.display().to_string(),
         base: None,
         release: None,
+        release_branch: None,
         test_count_command: None,
         consumers: Vec::new(),
     };
@@ -772,6 +1134,7 @@ fn status_reports_branch_overlap_after_upstream_advances_without_landed_probe() 
         origin: lab.work.display().to_string(),
         base: None,
         release: None,
+        release_branch: None,
         test_count_command: None,
         consumers: Vec::new(),
     };
@@ -823,6 +1186,7 @@ fn status_reports_a_branch_carried_elsewhere() {
         origin: lab.work.display().to_string(),
         base: None,
         release: None,
+        release_branch: None,
         test_count_command: None,
         consumers: Vec::new(),
     };
@@ -865,6 +1229,7 @@ fn status_reports_a_carrier_for_a_closed_pull_request() {
         origin: lab.work.display().to_string(),
         base: None,
         release: None,
+        release_branch: None,
         test_count_command: None,
         consumers: Vec::new(),
     };
@@ -936,6 +1301,7 @@ fn status_does_not_report_trunk_as_a_carrier_without_landed_probe() {
         origin: lab.work.display().to_string(),
         base: None,
         release: None,
+        release_branch: None,
         test_count_command: None,
         consumers: Vec::new(),
     };
@@ -973,7 +1339,8 @@ fn a_fresh_cut_carries_every_branch_and_nothing_else() {
     lab.octopus("release/2026-07-29", "feat/alpha", "feat/beta");
 
     let repo = knives::jj::Repo::open(&lab.work).expect("open");
-    let carried = knives::commands::release::carried_branches(&repo).expect("carried");
+    let carried = knives::commands::release::carried_branches(&repo, "main", &ReleaseScheme::Dated)
+        .expect("carried");
     let names: Vec<&str> = carried.iter().map(|(branch, _)| branch.as_str()).collect();
 
     assert!(names.contains(&"feat/alpha"));
@@ -985,6 +1352,166 @@ fn a_fresh_cut_carries_every_branch_and_nothing_else() {
     assert!(
         !names.contains(&"main"),
         "the trunk is not a branch we carry"
+    );
+}
+
+#[test]
+fn release_rebase_repairs_a_followed_dated_release_with_a_sideways_merge() {
+    // Given: an existing dated release, a consumer that follows it, and a new upstream commit.
+    let lab = Lab::new();
+    let release = "release/2026-08-04";
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    lab.octopus(release, "feat/alpha", "feat/beta");
+    let previous_parents = Repo::open(&lab.work)
+        .expect("open release repository")
+        .parents_of(release)
+        .expect("read existing release parents");
+    let consumer = lab.consumer_with_pin_history(
+        "pyproject.toml",
+        "work = { git = \"https://forge.invalid/acme/work.git\", branch = \"release/2026-08-03\" }\n",
+        "work = { git = \"https://forge.invalid/acme/work.git\", branch = \"release/2026-08-04\" }\n",
+    );
+    lab.advance_upstream("upstream advance\n");
+    let upstream = Repo::open(&lab.work)
+        .expect("reopen release repository")
+        .resolve_commit("main@upstream")
+        .expect("resolve advanced upstream");
+    let home = tempfile::tempdir().expect("create config home");
+    std::fs::write(
+        home.path().join("repos.toml"),
+        format!(
+            "[repos.demo]\npath = \"{}\"\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/work.git\"\nconsumers = [\"{}\"]\n",
+            lab.work.display(),
+            lab.upstream.display(),
+            consumer.display(),
+        ),
+    )
+    .expect("write registry");
+
+    // When: the repair command moves the existing release onto a new flat merge.
+    let output = Command::new(env!("CARGO_BIN_EXE_knives"))
+        .args(["--text", "release", "--repo", "demo", "rebase"])
+        .current_dir(&lab.work)
+        .env("KNIVES_CONFIG_HOME", home.path())
+        .output()
+        .expect("run release rebase");
+
+    // Then: the command succeeds and the moved bookmark retains all prior parents plus upstream.
+    assert!(
+        output.status.success(),
+        "release rebase failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let parents = Repo::open(&lab.work)
+        .expect("reopen repaired release repository")
+        .parents_of(release)
+        .expect("read repaired release parents");
+    assert_eq!(
+        parents.len(),
+        previous_parents.len() + 1,
+        "was: {parents:?}"
+    );
+    assert!(
+        parents.iter().any(|parent| parent.commit == upstream),
+        "upstream parent missing: {parents:?}"
+    );
+    for parent in previous_parents {
+        assert!(
+            parents.iter().any(|actual| actual.commit == parent.commit),
+            "original parent {} missing from {parents:?}",
+            parent.commit
+        );
+    }
+}
+
+#[test]
+fn preflight_reports_main_when_a_repo_configures_dev_as_its_trunk() {
+    // Given: an upstream whose trunk is dev while main is a local work branch.
+    let lab = lab::Lab::new();
+    lab.jj_work(["bookmark", "set", "dev", "-r", "main"]);
+    let entry = RepoEntry {
+        path: lab.work.clone(),
+        upstream: lab.upstream.display().to_string(),
+        origin: lab.work.display().to_string(),
+        base: Some("dev".to_owned()),
+        release: None,
+        release_branch: None,
+        test_count_command: None,
+        consumers: Vec::new(),
+    };
+
+    // When: preflight collects locally maintained branches.
+    let states = knives::commands::preflight::branch_states(&entry, &[]).expect("branch states");
+
+    // Then: dev is the only excluded trunk; main remains work to report.
+    assert!(
+        states.iter().any(|state| state.branch == "main"),
+        "a non-trunk main branch must be reported, got {states:#?}"
+    );
+    assert!(
+        !states.iter().any(|state| state.branch == "dev"),
+        "the configured trunk is not a branch we maintain, got {states:#?}"
+    );
+}
+
+#[test]
+fn preflight_treats_a_fixed_release_branch_as_a_release_not_a_branch() {
+    // Given: a fixed release bookmark and ordinary feature work.
+    let lab = lab::Lab::new();
+    lab.jj_work(["bookmark", "set", "integration", "-r", "main"]);
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let entry = RepoEntry {
+        path: lab.work.clone(),
+        upstream: lab.upstream.display().to_string(),
+        origin: lab.work.display().to_string(),
+        base: None,
+        release: None,
+        release_branch: Some("integration".to_owned()),
+        test_count_command: None,
+        consumers: Vec::new(),
+    };
+
+    // When: preflight collects locally maintained branches.
+    let states = knives::commands::preflight::branch_states(&entry, &[]).expect("branch states");
+
+    // Then: the fixed cut is excluded while feature work remains visible.
+    assert!(
+        !states.iter().any(|state| state.branch == "integration"),
+        "a fixed release is not a branch to preflight, got {states:#?}"
+    );
+    assert!(
+        states.iter().any(|state| state.branch == "feat/alpha"),
+        "feature work must still be preflighted, got {states:#?}"
+    );
+}
+
+#[test]
+fn preflight_hides_a_divergent_configured_trunk_bookmark() {
+    // Given: the configured trunk has independently rewritten local and origin tips.
+    let lab = lab::Lab::new();
+    lab.branch("dev", "dev.txt", "dev\n");
+    lab.rewrite_in_both_clones("dev");
+    let entry = RepoEntry {
+        path: lab.work.clone(),
+        upstream: lab.upstream.display().to_string(),
+        origin: lab.work.display().to_string(),
+        base: Some("dev".to_owned()),
+        release: None,
+        release_branch: None,
+        test_count_command: None,
+        consumers: Vec::new(),
+    };
+
+    // When: preflight reads divergent bookmarks before regular branch tips.
+    let states = knives::commands::preflight::branch_states(&entry, &[]).expect("branch states");
+
+    // Then: the trunk is excluded even when it is divergent.
+    assert!(
+        !states
+            .iter()
+            .any(|state| state.branch == "dev" && state.divergent),
+        "the trunk must not appear as divergent work, got {states:#?}"
     );
 }
 
@@ -1004,6 +1531,7 @@ fn preflight_flags_a_branch_whose_tip_is_divergent() {
         origin: lab.work.display().to_string(),
         base: None,
         release: None,
+        release_branch: None,
         test_count_command: None,
         consumers: Vec::new(),
     };

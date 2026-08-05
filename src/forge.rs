@@ -218,15 +218,20 @@ pub fn remote_owner(remote: &str) -> Option<&str> {
 /// Keep only the pull requests that come from our own copy of the repository.
 pub fn ours_only(
     pull_requests: BTreeMap<BranchName, PullRequest>,
-    origin_remote: &str,
+    remotes: &[&str],
 ) -> BTreeMap<BranchName, PullRequest> {
-    let Some(owner) = remote_owner(origin_remote) else {
-        // An origin we cannot parse is not a licence to claim everyone's work.
+    let owners: Vec<&str> = remotes
+        .iter()
+        .filter_map(|remote| remote_owner(remote))
+        .collect();
+    if owners.is_empty() {
+        // A set of remotes we cannot parse is not a licence to claim everyone's work,
+        // and not a reason to claim nobody's either: keep today's fail-open answer.
         return pull_requests;
-    };
+    }
     pull_requests
         .into_iter()
-        .filter(|(_, pr)| pr.is_from(owner))
+        .filter(|(_, pr)| owners.iter().any(|owner| pr.is_from(owner)))
         .collect()
 }
 
@@ -535,17 +540,45 @@ mod tests {
         };
         let mut pull_requests = BTreeMap::new();
         let _ = pull_requests.insert(BranchName::new("main"), make(4554, Some("outsider")));
-        let kept = ours_only(pull_requests, &origin);
+        let kept = ours_only(pull_requests, &[&origin]);
         assert!(kept.is_empty(), "another owner's branch is not our work");
 
         let mut mine = BTreeMap::new();
         let _ = mine.insert(BranchName::new("main"), make(1, Some("our-org")));
-        assert_eq!(ours_only(mine, &origin).len(), 1);
+        assert_eq!(ours_only(mine, &[&origin]).len(), 1);
 
         // A deleted head repository cannot be ours, and must not be assumed to be.
         let mut gone = BTreeMap::new();
         let _ = gone.insert(BranchName::new("main"), make(2, None));
-        assert!(ours_only(gone, &origin).is_empty());
+        assert!(ours_only(gone, &[&origin]).is_empty());
+    }
+
+    #[test]
+    fn a_head_on_the_release_remotes_owner_is_ours_too() {
+        // Six real forks had origin pointed at an org copy while PR heads lived on a
+        // personal fork recorded under another role. Matching only origin's owner
+        // reported those PRs as nobody's and their branches as unpushed for months.
+        use super::{Account, PullRequest, ours_only};
+        use crate::ids::BranchName;
+        use std::collections::BTreeMap;
+        let origin = format!("https://{HOST}/org-copy/some-repo.git");
+        let release = format!("https://{HOST}/personal/some-repo.git");
+        let mut prs = BTreeMap::new();
+        let _ = prs.insert(
+            BranchName::new("feat/a"),
+            PullRequest {
+                number: 7,
+                head_repository_owner: Some(Account {
+                    login: "personal".to_owned(),
+                }),
+                ..PullRequest::default()
+            },
+        );
+        assert_eq!(ours_only(prs.clone(), &[&origin, &release]).len(), 1);
+        assert!(
+            ours_only(prs, &[&origin]).is_empty(),
+            "origin alone must not match"
+        );
     }
 
     use super::*;

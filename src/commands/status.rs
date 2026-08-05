@@ -11,16 +11,13 @@ use crate::detect::{
 };
 use crate::forge::{ChecksSummary, Forge, PullRequest, ours_only};
 use crate::ids::{
-    BookmarkRef, BranchName, BranchTarget, CommitId, RepoName, pull_number_from_bookmark,
+    BookmarkRef, BranchName, BranchTarget, CommitId, ReleaseScheme, RepoName, is_release_name,
+    pull_number_from_bookmark,
 };
 use crate::jj::{JjError, Repo, branches_past, probe_landed};
 use crate::store::Store;
 
 pub use crate::ids::{RELEASE_PREFIX, is_our_release};
-pub const TRUNK: &str = "main";
-/// Landed means landed on the UPSTREAM trunk. Our fork's trunk answers about the
-/// wrong repository, and on a real fork the two differ.
-pub const UPSTREAM_TRUNK: &str = "main@upstream";
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct BranchRow {
@@ -139,16 +136,22 @@ impl fmt::Debug for Options<'_> {
     }
 }
 
+struct ReleaseScan<'a> {
+    path: &'a std::path::Path,
+    tips: &'a BookmarkTips,
+    scheme: &'a ReleaseScheme,
+    publish_remote: &'a str,
+}
+
 /// Which releases were scanned, what was found, and how many were skipped.
 ///
 /// Extracted from `gather` because that function had grown past what one
 /// reviewer can hold at once, not to be reused.
 fn scan_releases(
     repo: &Repo,
-    path: &std::path::Path,
-    tips: &BookmarkTips,
+    input: &ReleaseScan<'_>,
 ) -> anyhow::Result<(Vec<String>, Vec<Finding>, usize)> {
-    let (releases, skipped) = releases_to_scan(tips);
+    let (releases, skipped) = releases_to_scan(input.tips, input.scheme, input.publish_remote);
     let mut names = Vec::new();
     let mut findings = Vec::new();
     for (release, commit) in &releases {
@@ -156,7 +159,7 @@ fn scan_releases(
         // Resolve by commit id, never by the bookmark's display form. A remote
         // bookmark rendered `name@remote` is not reliably resolvable as a
         // revset, and the tip map already carries the commit.
-        let mut stale = stale_parents(&repo.parents_of(commit.as_str())?, tips);
+        let mut stale = stale_parents(&repo.parents_of(commit.as_str())?, input.tips);
         // Say where the branch went, not just that nothing points at the parent.
         // `parents_of` only reports bookmarks pointing AT a parent, so the pure
         // detector can never produce the "feat/x is now <id>" payload.
@@ -164,7 +167,7 @@ fn scan_releases(
             let Subject::Commit(parent) = finding.subject.clone() else {
                 continue;
             };
-            if let Ok(moved) = branches_past(path, &parent)
+            if let Ok(moved) = branches_past(input.path, &parent)
                 && !moved.is_empty()
             {
                 let where_now = moved
@@ -189,12 +192,17 @@ fn scan_releases(
 /// bookmark, so when local and origin disagree it answers about content nobody has
 /// pushed, and stale content replays clean and reads as landed. Refusing to judge is
 /// cheap; the `landed` advice is to delete the branch and its release parent.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the approved interface separately names the probe inputs and configured upstream trunk"
+)]
 fn landed_verdict(
     path: &std::path::Path,
     branch: &BranchName,
     // Local tip, and the origin tip when the branch has been pushed.
     tips: (&CommitId, Option<&CommitId>),
     options: &Options<'_>,
+    upstream_trunk: &str,
 ) -> Result<Option<LandedVerdict>, JjError> {
     let (tip, origin_tip) = tips;
     if !options.probe {
@@ -206,7 +214,7 @@ fn landed_verdict(
     Ok(Some(classify_landed(probe_landed(
         path,
         branch,
-        UPSTREAM_TRUNK,
+        upstream_trunk,
     )?)))
 }
 
@@ -338,20 +346,24 @@ fn add_dependency_findings(
     report.problems.extend(unanswered);
 }
 
-/// Branches we maintain, and how many fetched pull request heads were skipped.
+/// Branches we maintain apart from the configured trunk, and fetched pull request heads skipped.
 ///
 /// A `pr-<n>` bookmark is not a branch of ours: it is a pull request head this tool
 /// fetched so a release could carry it. Treating fetch artifacts as our work is most of
 /// why this report was unreadable — on one repository they were 16 of 28 rows and 10 of
 /// 24 findings, every one of the latter advising us to drop a branch that was never
 /// ours. They also each cost a landed probe, which is most of the runtime.
-fn maintained_branches(tips: &BookmarkTips) -> (Vec<(BranchName, CommitId)>, usize) {
+fn maintained_branches(
+    tips: &BookmarkTips,
+    trunk: &str,
+    scheme: &ReleaseScheme,
+) -> (Vec<(BranchName, CommitId)>, usize) {
     let mut fetched_heads = 0_usize;
     let branches = tips
         .iter()
         .filter_map(|(reference, commit)| match reference {
             BookmarkRef::Local(branch)
-                if !branch.as_str().starts_with(RELEASE_PREFIX) && branch.as_str() != TRUNK =>
+                if !is_release_name(branch, scheme) && branch.as_str() != trunk =>
             {
                 if pull_number_from_bookmark(branch.as_str()).is_some() {
                     fetched_heads += 1;
@@ -416,7 +428,10 @@ fn pull_requests_from_forge(
             report.forge_consulted = true;
             // Ours means it comes from our copy of the repository, not that its branch
             // happens to share a name with one of ours.
-            ours_only(found, entry.remote(Role::Origin))
+            ours_only(
+                found,
+                &[entry.remote(Role::Origin), entry.remote(Role::Release)],
+            )
         }
         Err(error) => {
             report
@@ -500,12 +515,13 @@ struct DivergentInput<'a> {
 /// divergence. Proven by before-and-after on #228.
 fn divergent_rows(input: &DivergentInput<'_>) -> anyhow::Result<Vec<BranchRow>> {
     let mut rows = Vec::new();
+    let scheme = input.entry.release_scheme();
     for (reference, _) in input.repo.conflicted_bookmarks()? {
         let BookmarkRef::Local(branch) = reference else {
             continue;
         };
-        if branch.as_str().starts_with(RELEASE_PREFIX)
-            || branch.as_str() == TRUNK
+        if is_release_name(&branch, &scheme)
+            || branch.as_str() == input.entry.trunk()
             || pull_number_from_bookmark(branch.as_str()).is_some()
         {
             continue;
@@ -616,7 +632,13 @@ fn record_repository_health(
     Ok(())
 }
 
-fn carried_findings(report: &Report, repo: &Repo) -> anyhow::Result<Vec<Finding>> {
+/// Reports branches carried by another branch, excluding the configured trunk.
+fn carried_findings(
+    report: &Report,
+    repo: &Repo,
+    trunk: &str,
+    scheme: &ReleaseScheme,
+) -> anyhow::Result<Vec<Finding>> {
     let mut findings = Vec::new();
     for row in &report.branches {
         let Some(tip) = row.tip.as_ref() else {
@@ -626,12 +648,12 @@ fn carried_findings(report: &Report, repo: &Repo) -> anyhow::Result<Vec<Finding>
             continue;
         }
         let carriers = repo
-            .branches_containing(tip)?
+            .branches_containing(tip, scheme)?
             .into_iter()
             // A same-named upstream ref can contain commits ahead of ours, but this
             // deliberately treats every same-named ref as the branch itself.
             .filter(|reference| {
-                reference.branch() != &row.name && reference.branch().as_str() != TRUNK
+                reference.branch() != &row.name && reference.branch().as_str() != trunk
             })
             .collect::<Vec<_>>();
         if let Some(finding) = crate::detect::superseded::carried_elsewhere(&row.name, &carriers) {
@@ -653,7 +675,7 @@ fn add_branch_overlap_findings(report: &mut Report, entry: &RepoEntry) {
             ));
             continue;
         }
-        let from = format!("fork_point({UPSTREAM_TRUNK} | {0})", row.name);
+        let from = format!("fork_point({} | {})", entry.upstream_trunk(), row.name);
         match crate::jj::changed_files_between(&entry.path, &from, row.name.as_str()) {
             Ok(files) => {
                 let _ = touching.insert(row.name.to_string(), files);
@@ -684,9 +706,20 @@ pub fn gather(
     record_repository_health(&mut report, &repo, &entry.path)?;
 
     let tips = repo.bookmark_tips()?;
+    let trunk = entry.trunk();
+    let scheme = entry.release_scheme();
+    let upstream_trunk = entry.upstream_trunk();
     // Releases are scanned local AND remote: what a consumer pins is the remote
     // ref, and scanning only local silently skipped the actually-pinned release.
-    let (names, release_findings, skipped) = scan_releases(&repo, &entry.path, &tips)?;
+    let (names, release_findings, skipped) = scan_releases(
+        &repo,
+        &ReleaseScan {
+            path: &entry.path,
+            tips: &tips,
+            scheme: &scheme,
+            publish_remote: entry.publish_remote(),
+        },
+    )?;
     report.releases = names;
     report.findings.extend(release_findings);
     if skipped > 0 {
@@ -695,7 +728,7 @@ pub fn gather(
             .push(format!("{skipped} superseded release(s) not scanned"));
     }
 
-    let (branches, fetched_heads) = maintained_branches(&tips);
+    let (branches, fetched_heads) = maintained_branches(&tips, trunk, &scheme);
     let mut unjudged: Vec<String> = Vec::new();
     note_fetched_heads(&mut report, fetched_heads);
     let pull_requests = pull_requests_from_forge(options.forge, entry, &mut report);
@@ -716,7 +749,13 @@ pub fn gather(
             &branch,
             relation_to_origin(&repo, &tip, origin_tip.as_ref()),
         );
-        let landed = landed_verdict(&entry.path, &branch, (&tip, origin_tip.as_ref()), options)?;
+        let landed = landed_verdict(
+            &entry.path,
+            &branch,
+            (&tip, origin_tip.as_ref()),
+            options,
+            &upstream_trunk,
+        )?;
         if landed == Some(LandedVerdict::Unjudged) {
             unjudged.push(branch.to_string());
         }
@@ -748,7 +787,9 @@ pub fn gather(
     report
         .branches
         .sort_by(|left, right| left.name.cmp(&right.name));
-    report.findings.extend(carried_findings(&report, &repo)?);
+    report
+        .findings
+        .extend(carried_findings(&report, &repo, trunk, &scheme)?);
     add_branch_overlap_findings(&mut report, entry);
 
     add_claims(&mut report, &repo, name, store);
@@ -789,37 +830,66 @@ pub fn release_order(name: &str) -> (String, u32) {
 /// plausibly pinning. Dated names sort correctly as strings. `@git` refs are
 /// excluded outright: they are jj's internal git-tracking view, not a remote.
 /// The count of what was skipped is reported rather than silently dropped.
-fn releases_to_scan(tips: &BookmarkTips) -> (Vec<(BookmarkRef, CommitId)>, usize) {
-    let all: Vec<(&BookmarkRef, &CommitId)> = tips
-        .iter()
-        .filter(|(reference, _)| is_our_release(reference))
-        .collect();
+/// Under `Fixed` this is instead exactly the local branch and its publish-remote counterpart: there is no accumulated history to skip, so nothing is superseded.
+fn releases_to_scan(
+    tips: &BookmarkTips,
+    scheme: &ReleaseScheme,
+    publish_remote: &str,
+) -> (Vec<(BookmarkRef, CommitId)>, usize) {
+    match scheme {
+        ReleaseScheme::Dated => {
+            let all: Vec<(&BookmarkRef, &CommitId)> = tips
+                .iter()
+                .filter(|(reference, _)| is_our_release(reference, scheme))
+                .collect();
 
-    let newest = |local: bool| {
-        all.iter()
-            .filter(|(reference, _)| reference.is_local() == local)
-            .max_by_key(|(reference, _)| release_order(reference.branch().as_str()))
-            .map(|(reference, _)| (*reference).clone())
-    };
-    // Only the newest cut on each side. Every local release a fork ever cut used to
-    // be scanned, and their parents have all moved on by definition, so the report
-    // filled with stale-parent findings for releases nothing pins: 47 of 89 in a real
-    // repository, nearly all against cuts a fortnight old. The remedy attached to a stale
-    // parent is to re-cut the release onto current tips, which is right for the release in
-    // use and wrong for frozen history, where the answer is to forget it.
-    let newest_local = newest(true);
-    let newest_remote = newest(false);
+            let newest = |local: bool| {
+                all.iter()
+                    .filter(|(reference, _)| reference.is_local() == local)
+                    .max_by_key(|(reference, _)| release_order(reference.branch().as_str()))
+                    .map(|(reference, _)| (*reference).clone())
+            };
+            // Only the newest cut on each side. Every local release a fork ever cut used to
+            // be scanned, and their parents have all moved on by definition, so the report
+            // filled with stale-parent findings for releases nothing pins: 47 of 89 in a real
+            // repository, nearly all against cuts a fortnight old. The remedy attached to a stale
+            // parent is to re-cut the release onto current tips, which is right for the release in
+            // use and wrong for frozen history, where the answer is to forget it.
+            let newest_local = newest(true);
+            let newest_remote = newest(false);
 
-    let chosen: Vec<(BookmarkRef, CommitId)> = all
-        .iter()
-        .filter(|(reference, _)| {
-            newest_local.as_ref() == Some(*reference) || newest_remote.as_ref() == Some(*reference)
-        })
-        .map(|(reference, commit)| ((*reference).clone(), (*commit).clone()))
-        .collect();
+            let chosen: Vec<(BookmarkRef, CommitId)> = all
+                .iter()
+                .filter(|(reference, _)| {
+                    newest_local.as_ref() == Some(*reference)
+                        || newest_remote.as_ref() == Some(*reference)
+                })
+                .map(|(reference, commit)| ((*reference).clone(), (*commit).clone()))
+                .collect();
 
-    let skipped = all.len() - chosen.len();
-    (chosen, skipped)
+            let skipped = all.len() - chosen.len();
+            (chosen, skipped)
+        }
+        ReleaseScheme::Fixed(branch) => {
+            // Fixed releases advance in place, so only their local and published positions matter.
+            let references = [
+                BookmarkRef::Local(branch.clone()),
+                BookmarkRef::Remote {
+                    branch: branch.clone(),
+                    remote: crate::ids::RemoteName::new(publish_remote),
+                },
+            ];
+            let chosen = references
+                .into_iter()
+                .filter_map(|reference| {
+                    tips.get(&reference)
+                        .cloned()
+                        .map(|commit| (reference, commit))
+                })
+                .collect();
+            (chosen, 0)
+        }
+    }
 }
 
 /// Short form for display. Full ids are correct and unreadable.
@@ -974,80 +1044,190 @@ fn claim_lines(claims: &[crate::store::Claim]) -> Vec<String> {
     lines
 }
 
-fn branch_line(row: &BranchRow) -> String {
-    let mut bits = vec![format!("    {}", row.name)];
-    match &row.tip {
-        Some(tip) => bits.push(short(tip.as_str())),
-        None => bits.push("divergent".to_owned()),
-    }
+fn branch_cell(row: &BranchRow) -> String {
+    row.name.to_string()
+}
+
+fn tip_cell(row: &BranchRow) -> String {
+    row.tip
+        .as_ref()
+        .map_or_else(|| "divergent".to_owned(), |tip| short(tip.as_str()))
+}
+
+fn push_cell(row: &BranchRow) -> String {
     match (&row.origin_tip, &row.tip) {
-        (None, _) => bits.push("unpushed".to_owned()),
-        (Some(origin), Some(tip)) if origin != tip => {
-            bits.push(match row.origin_relation {
-                Some(OriginRelation::Ahead) => "unpushed-commits".to_owned(),
-                Some(OriginRelation::Behind) => {
-                    format!("origin={} (behind)", short(origin.as_str()))
-                }
-                Some(OriginRelation::Diverged) => {
-                    format!("origin={} (diverged)", short(origin.as_str()))
-                }
-                None => format!("origin={} (unresolved)", short(origin.as_str())),
-            });
-        }
-        (Some(_), _) => bits.push("pushed".to_owned()),
+        (None, _) => "unpushed".to_owned(),
+        (Some(origin), Some(tip)) if origin != tip => match row.origin_relation {
+            Some(OriginRelation::Ahead) => "unpushed-commits".to_owned(),
+            Some(OriginRelation::Behind) => format!("origin={} (behind)", short(origin.as_str())),
+            Some(OriginRelation::Diverged) => {
+                format!("origin={} (diverged)", short(origin.as_str()))
+            }
+            None => format!("origin={} (unresolved)", short(origin.as_str())),
+        },
+        (Some(_), _) => "pushed".to_owned(),
     }
-    match &row.pull_request {
-        Some(pr) => {
-            bits.push(format!("#{}", pr.number));
-            // State first, and only when it is not open: a declined pull request
-            // reported as REVIEW_REQUIRED reads as still in play. #222 was closed
-            // as declined and showed only its review decision.
+}
+
+fn stated_pull_cell(stated: &StatedPull) -> String {
+    format!("#{} {}", stated.number, stated_pull_details(stated))
+}
+
+fn stated_pull_details(stated: &StatedPull) -> String {
+    format!("{} (stated)", stated.state.to_lowercase())
+}
+
+fn pull_request_cell(row: &BranchRow) -> String {
+    row.pull_request.as_ref().map_or_else(
+        || {
+            row.stated_pull
+                .as_ref()
+                .map_or_else(|| "no-pr".to_owned(), stated_pull_cell)
+        },
+        |pr| {
+            let mut details = vec![format!("#{}", pr.number)];
             if !pr.is_open() {
-                bits.push(pr.state.to_lowercase());
+                details.push(pr.state.to_lowercase());
             }
-            bits.push(if pr.review_decision.is_empty() {
-                "no-review".to_owned()
-            } else {
-                pr.review_decision.clone()
-            });
             if pr.is_draft {
-                bits.push("draft".to_owned());
+                details.push("draft".to_owned());
             }
-            if pr.is_open() {
-                if row.checks.as_ref().is_some_and(ChecksSummary::failing) {
-                    bits.push("checks-failing".to_owned());
-                } else if row.checks.as_ref().is_some_and(|checks| !checks.ran()) {
-                    bits.push("no-checks".to_owned());
+            if let Some(stated) = &row.stated_pull {
+                if stated.number == pr.number {
+                    details.push(stated_pull_details(stated));
+                } else {
+                    details.push(stated_pull_cell(stated));
                 }
             }
-            // Only when it is not simply mergeable. A pull request that cannot
-            // merge reads as finished from every other angle.
-            if pr.conflicting() {
-                bits.push("CONFLICTING".to_owned());
-            } else if pr.merge_state_status.eq_ignore_ascii_case("BEHIND") {
-                bits.push("behind-base".to_owned());
-            }
-        }
-        None if row.stated_pull.is_none() => bits.push("no-pr".to_owned()),
-        None => {}
+            details.join(" ")
+        },
+    )
+}
+
+fn review_cell(row: &BranchRow) -> String {
+    match &row.pull_request {
+        Some(pr) if pr.review_decision.is_empty() => "no-review".to_owned(),
+        Some(pr) => pr.review_decision.clone(),
+        None => "-".to_owned(),
     }
-    if let Some(verdict) = row.landed {
-        bits.push(verdict.to_string());
+}
+
+fn checks_cell(row: &BranchRow) -> String {
+    match row.pull_request.as_ref() {
+        Some(pr) if pr.is_open() => match row.checks.as_ref() {
+            Some(checks) if checks.failing() => "failing".to_owned(),
+            Some(checks) if !checks.ran() => "none-ran".to_owned(),
+            Some(_) => "ok".to_owned(),
+            None => "-".to_owned(),
+        },
+        Some(_) | None => "-".to_owned(),
+    }
+}
+
+fn landed_cell(row: &BranchRow) -> String {
+    row.landed
+        .map_or_else(|| "-".to_owned(), |verdict| verdict.to_string())
+}
+
+fn flags_cell(row: &BranchRow) -> String {
+    let mut flags = Vec::new();
+    if let Some(pr) = &row.pull_request {
+        if pr.conflicting() {
+            flags.push("CONFLICTING");
+        } else if pr.merge_state_status.eq_ignore_ascii_case("BEHIND") {
+            flags.push("behind-base");
+        }
     }
     if row.review_stale == Some(true) {
-        bits.push("review-stale".to_owned());
-    }
-    if let Some(stated) = &row.stated_pull {
-        bits.push(format!(
-            "#{} {} (stated)",
-            stated.number,
-            stated.state.to_lowercase()
-        ));
+        flags.push("review-stale");
     }
     if row.fork_only {
-        bits.push("fork-only".to_owned());
+        flags.push("fork-only");
     }
-    bits.join("  ")
+    if flags.is_empty() {
+        "-".to_owned()
+    } else {
+        flags.join(",")
+    }
+}
+
+fn branch_table(rows: &[BranchRow]) -> Vec<String> {
+    const HEADER: [&str; 8] = [
+        "branch", "tip", "push", "pr", "review", "checks", "landed", "flags",
+    ];
+
+    let cells: Vec<[String; 8]> = rows
+        .iter()
+        .map(|row| {
+            [
+                branch_cell(row),
+                tip_cell(row),
+                push_cell(row),
+                pull_request_cell(row),
+                review_cell(row),
+                checks_cell(row),
+                landed_cell(row),
+                flags_cell(row),
+            ]
+        })
+        .collect();
+    let mut widths = HEADER.map(str::len);
+    for row in &cells {
+        for (width, cell) in widths.iter_mut().zip(row) {
+            *width = (*width).max(cell.len());
+        }
+    }
+    let format_row = |cells: [&str; 8]| {
+        let [
+            branch,
+            tip,
+            push,
+            pull_request,
+            review,
+            checks,
+            landed,
+            flags,
+        ] = cells;
+        let [
+            branch_width,
+            tip_width,
+            push_width,
+            pull_request_width,
+            review_width,
+            checks_width,
+            landed_width,
+            flags_width,
+        ] = widths;
+        format!(
+            "    {branch:<branch_width$}  {tip:<tip_width$}  {push:<push_width$}  {pull_request:<pull_request_width$}  {review:<review_width$}  {checks:<checks_width$}  {landed:<landed_width$}  {flags:<flags_width$}"
+        )
+        .trim_end()
+        .to_owned()
+    };
+    let mut lines = vec![format_row(HEADER)];
+    lines.extend(cells.iter().map(|row| {
+        let [
+            branch,
+            tip,
+            push,
+            pull_request,
+            review,
+            checks,
+            landed,
+            flags,
+        ] = row.each_ref();
+        format_row([
+            branch.as_str(),
+            tip.as_str(),
+            push.as_str(),
+            pull_request.as_str(),
+            review.as_str(),
+            checks.as_str(),
+            landed.as_str(),
+            flags.as_str(),
+        ])
+    }));
+    lines
 }
 
 pub fn render(report: &Report, verbose: bool) -> String {
@@ -1066,7 +1246,7 @@ pub fn render(report: &Report, verbose: bool) -> String {
         lines.push("  branches    none".to_owned());
     } else {
         lines.push(format!("  branches    {}", report.branches.len()));
-        lines.extend(report.branches.iter().map(branch_line));
+        lines.extend(branch_table(&report.branches));
     }
     if report.findings.is_empty() {
         lines.push("  findings    none".to_owned());
@@ -1172,6 +1352,117 @@ mod tests {
     }
 
     #[test]
+    fn branch_rows_render_as_an_aligned_table_with_a_header() {
+        // Vertical alignment without horizontal alignment made ten-branch reports
+        // unreadable: every fact was present and nothing lined up.
+        let with_pr = row(
+            "feat/alpha",
+            Some(LandedVerdict::InTrunk),
+            Some(pull_request(1128)),
+        );
+        let bare = row("fix/a-much-longer-branch-name", None, None);
+
+        let lines = branch_table(&[with_pr, bare]);
+
+        assert_eq!(lines.len(), 3, "header plus one row per branch: {lines:?}");
+        let header = &lines[0];
+        assert!(header.contains("branch") && header.contains("pr") && header.contains("landed"));
+        // Every row starts each column at the same offset as the header.
+        let column_start = |line: &str, word: &str| line.find(word).unwrap_or(usize::MAX);
+        let tip_at = column_start(header, "tip");
+        for line in &lines[1..] {
+            assert!(line.len() >= tip_at, "short row breaks alignment: {line:?}");
+        }
+        assert!(lines[1].contains("#1128"), "was: {}", lines[1]);
+        assert!(lines[1].contains("APPROVED"));
+        assert!(lines[2].contains("no-pr"));
+        assert!(
+            lines[2].contains('-'),
+            "empty cells render as placeholders, not gaps"
+        );
+    }
+
+    /// The offset at which each column's content begins, and the gap that precedes it.
+    ///
+    /// Cells never contain two consecutive spaces, so a run of two or more spaces is
+    /// unambiguously a column separator plus that column's padding.
+    fn columns(line: &str) -> Vec<(usize, usize)> {
+        let mut found = Vec::new();
+        let mut gap = 0;
+        for (offset, ch) in line.char_indices() {
+            if ch == ' ' {
+                gap += 1;
+            } else {
+                if gap >= 2 || offset == 0 {
+                    found.push((offset, gap));
+                }
+                gap = 0;
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn an_empty_cell_never_shifts_its_neighbours() {
+        let with_flags = {
+            let mut pr = pull_request(7);
+            pr.mergeable = "CONFLICTING".to_owned();
+            row("feat/conflicted", None, Some(pr))
+        };
+        let plain = row("feat/plain", None, None);
+
+        let lines = branch_table(&[with_flags, plain]);
+
+        let header_columns = columns(&lines[0]);
+        let header_offsets: Vec<usize> = header_columns.iter().map(|(offset, _)| *offset).collect();
+        assert_eq!(header_offsets.len(), 8, "was: {}", lines[0]);
+        for line in &lines {
+            assert_eq!(
+                line.chars().take_while(|ch| *ch == ' ').count(),
+                4,
+                "was: {line}"
+            );
+            let row_columns = columns(line);
+            let row_offsets: Vec<usize> = row_columns.iter().map(|(offset, _)| *offset).collect();
+            assert_eq!(row_offsets, header_offsets, "was: {line}");
+            assert_eq!(
+                row_columns
+                    .iter()
+                    .skip(1)
+                    .map(|(_, gap)| *gap)
+                    .min()
+                    .expect("a table row has separators"),
+                2,
+                "was: {line}"
+            );
+        }
+        assert_eq!(columns(&lines[2]).len(), 8, "was: {}", lines[2]);
+        assert!(lines[2].ends_with(" -"), "was: {}", lines[2]);
+        assert!(lines[1].contains("CONFLICTING"));
+    }
+
+    #[test]
+    fn the_trunk_exclusion_follows_the_repo_entry_not_the_name_main() {
+        // Given: a repo whose upstream trunk is dev, carrying a branch named main
+        let map = tips(&[
+            (local("dev"), "aaa"),
+            (local("main"), "bbb"),
+            (local("feat/alpha"), "ccc"),
+        ]);
+        // When: maintained branches are collected with dev as the trunk
+        let (branches, _) = maintained_branches(&map, "dev", &ReleaseScheme::Dated);
+        let names: Vec<String> = branches
+            .iter()
+            .map(|(branch, _)| branch.to_string())
+            .collect();
+        // Then: dev is excluded as the trunk, and a branch that merely shares the
+        // name main is ours to report
+        assert!(!names.contains(&"dev".to_owned()), "was: {names:?}");
+        assert!(names.contains(&"main".to_owned()), "was: {names:?}");
+        assert!(names.contains(&"feat/alpha".to_owned()));
+    }
+
+    #[test]
     fn only_the_newest_release_on_each_side_is_scanned() {
         // A fork accumulates every release it ever cut, and every one of their parents
         // has moved on, so scanning them all filled the report with stale-parent
@@ -1185,7 +1476,7 @@ mod tests {
             (remote("release/2026-07-29", "origin"), "ddd"),
             (local("feat/alpha"), "eee"),
         ]);
-        let (chosen, skipped) = releases_to_scan(&map);
+        let (chosen, skipped) = releases_to_scan(&map, &ReleaseScheme::Dated, "origin");
         let names: Vec<String> = chosen.iter().map(|(r, _)| r.to_string()).collect();
         assert!(names.contains(&"release/2026-07-28".to_owned()));
         assert!(names.contains(&"release/2026-07-29@origin".to_owned()));
@@ -1209,7 +1500,7 @@ mod tests {
                 "zzz",
             ),
         ]);
-        let (chosen, _) = releases_to_scan(&map);
+        let (chosen, _) = releases_to_scan(&map, &ReleaseScheme::Dated, "origin");
         assert!(
             chosen
                 .iter()
@@ -1221,12 +1512,27 @@ mod tests {
     fn only_releases_we_cut_count_as_ours() {
         // `repos` and `status` each grew their own version of this, and `repos`
         // promptly picked an upstream release as ours. One predicate now.
-        assert!(is_our_release(&local("release/2026-07-29")));
-        assert!(is_our_release(&remote("release/2026-07-29", "origin")));
-        assert!(is_our_release(&remote("release/2026-07-29", "release")));
-        assert!(!is_our_release(&remote("release/2026-07-29", "upstream")));
-        assert!(!is_our_release(&remote("release/2026-07-29", "git")));
-        assert!(!is_our_release(&local("feat/alpha")));
+        assert!(is_our_release(
+            &local("release/2026-07-29"),
+            &ReleaseScheme::Dated
+        ));
+        assert!(is_our_release(
+            &remote("release/2026-07-29", "origin"),
+            &ReleaseScheme::Dated
+        ));
+        assert!(is_our_release(
+            &remote("release/2026-07-29", "release"),
+            &ReleaseScheme::Dated
+        ));
+        assert!(!is_our_release(
+            &remote("release/2026-07-29", "upstream"),
+            &ReleaseScheme::Dated
+        ));
+        assert!(!is_our_release(
+            &remote("release/2026-07-29", "git"),
+            &ReleaseScheme::Dated
+        ));
+        assert!(!is_our_release(&local("feat/alpha"), &ReleaseScheme::Dated));
     }
 
     #[test]
@@ -1245,7 +1551,7 @@ mod tests {
             (remote("release/2026-07-28.2", "origin"), "aaa"),
             (remote("release/2026-07-28.10", "origin"), "bbb"),
         ]);
-        let (chosen, _) = releases_to_scan(&map);
+        let (chosen, _) = releases_to_scan(&map, &ReleaseScheme::Dated, "origin");
         let names: Vec<String> = chosen.iter().map(|(r, _)| r.to_string()).collect();
         assert_eq!(names, vec!["release/2026-07-28.10@origin".to_owned()]);
     }
@@ -1253,8 +1559,72 @@ mod tests {
     #[test]
     fn jj_internal_git_refs_are_not_releases() {
         let map = tips(&[(remote("release/2026-07-29", "git"), "aaa")]);
-        let (chosen, _) = releases_to_scan(&map);
+        let (chosen, _) = releases_to_scan(&map, &ReleaseScheme::Dated, "origin");
         assert!(chosen.is_empty());
+    }
+
+    #[test]
+    fn under_a_fixed_scheme_the_fixed_branch_is_scanned_and_is_not_a_maintained_branch() {
+        // Given: a fixed release branch, its publish remote, a different release-role remote,
+        // and a dated leftover from before the scheme changed.
+        let fixed = crate::ids::ReleaseScheme::Fixed(BranchName::new("integration"));
+        let map = tips(&[
+            (local("integration"), "aaa"),
+            (remote("integration", "origin"), "bbb"),
+            (remote("integration", "release"), "eee"),
+            (local("feat/alpha"), "ccc"),
+            (local("release/2026-07-28"), "ddd"),
+        ]);
+        // When: releases are chosen and branches collected under the fixed scheme.
+        let (chosen, skipped) = releases_to_scan(&map, &fixed, "origin");
+        let names: Vec<String> = chosen
+            .iter()
+            .map(|(reference, _)| reference.to_string())
+            .collect();
+        let (branches, _) = maintained_branches(&map, "main", &fixed);
+        let branch_names: Vec<String> = branches
+            .iter()
+            .map(|(branch, _)| branch.to_string())
+            .collect();
+        // Then: local and publish-remote positions are the complete scan set, while the fixed
+        // branch is a cut rather than carried work.
+        assert!(names.contains(&"integration".to_owned()), "was: {names:?}");
+        assert!(
+            names.contains(&"integration@origin".to_owned()),
+            "was: {names:?}"
+        );
+        assert!(
+            !names.contains(&"integration@release".to_owned()),
+            "only the publish remote's counterpart is a release candidate: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|name| name.contains("release/")),
+            "was: {names:?}"
+        );
+        assert_eq!(skipped, 0);
+        assert!(
+            !branch_names.contains(&"integration".to_owned()),
+            "was: {branch_names:?}"
+        );
+        assert!(
+            branch_names.contains(&"release/2026-07-28".to_owned()),
+            "was: {branch_names:?}"
+        );
+    }
+
+    #[test]
+    fn the_dated_scheme_still_scans_only_the_newest_release_on_each_side() {
+        // Given: dated releases with one superseded local cut.
+        let map = tips(&[
+            (local("release/2026-07-17.5"), "aaa"),
+            (local("release/2026-07-28"), "bbb"),
+            (remote("release/2026-07-29", "origin"), "ddd"),
+        ]);
+        // When: releases are chosen under the dated scheme.
+        let (chosen, skipped) = releases_to_scan(&map, &ReleaseScheme::Dated, "origin");
+        // Then: exactly the latest local and remote cuts are kept.
+        assert_eq!(chosen.len(), 2);
+        assert_eq!(skipped, 1);
     }
 
     #[test]
@@ -1287,6 +1657,7 @@ mod tests {
             origin: String::new(),
             base: None,
             release: None,
+            release_branch: None,
             test_count_command: None,
             consumers: Vec::new(),
         };
@@ -1320,6 +1691,7 @@ mod tests {
             origin: String::new(),
             base: None,
             release: None,
+            release_branch: None,
             test_count_command: None,
             consumers: Vec::new(),
         };
@@ -1464,7 +1836,7 @@ mod tests {
     }
 
     #[test]
-    fn ci_readiness_tokens_follow_draft() {
+    fn ci_readiness_cells_preserve_draft_and_check_facts() {
         // Given: a draft with red CI and a draft whose checks have not run
         let mut failing = pull_request(11);
         failing.is_draft = true;
@@ -1496,19 +1868,19 @@ mod tests {
             .find(|line| line.contains("feat/never-ran"))
             .expect("the never-ran branch line");
 
-        // Then: both CI readiness facts immediately follow draft
+        // Then: each row retains its draft and CI facts in separate table cells
         assert!(
-            failing_line.contains("draft  checks-failing"),
+            failing_line.contains("draft") && failing_line.contains("failing"),
             "was: {failing_line}"
         );
         assert!(
-            never_ran_line.contains("draft  no-checks"),
+            never_ran_line.contains("draft") && never_ran_line.contains("none-ran"),
             "was: {never_ran_line}"
         );
     }
 
     #[test]
-    fn not_consulted_checks_do_not_render_as_no_checks() {
+    fn not_consulted_checks_do_not_render_as_none_ran() {
         // Given: matching pull requests whose checks were and were not consulted
         let mut no_checks = row("feat/no-checks", None, Some(pull_request(11)));
         no_checks.checks = Some(crate::forge::ChecksSummary::default());
@@ -1531,16 +1903,13 @@ mod tests {
             .expect("the unconsulted branch line");
 
         // Then: the three states stay distinct
+        assert!(no_checks_line.contains("none-ran"), "was: {no_checks_line}");
         assert!(
-            no_checks_line.contains("no-checks"),
-            "was: {no_checks_line}"
-        );
-        assert!(
-            !not_consulted_line.contains("no-checks"),
+            !not_consulted_line.contains("none-ran"),
             "not consulted is not nothing-ran: {not_consulted_line}"
         );
         assert!(
-            !not_consulted_line.contains("checks-failing"),
+            !not_consulted_line.contains("failing"),
             "not consulted is not failing: {not_consulted_line}"
         );
     }
@@ -1559,12 +1928,12 @@ mod tests {
         });
 
         // When: the settled branch is rendered and analysed
-        let rendered = branch_line(&closed);
+        let rendered = branch_table(std::slice::from_ref(&closed)).join("\n");
         let findings = branch_findings(&[closed]);
 
         // Then: no action-oriented CI token or finding is emitted
-        assert!(!rendered.contains("no-checks"), "was: {rendered}");
-        assert!(!rendered.contains("checks-failing"), "was: {rendered}");
+        assert!(!rendered.contains("none-ran"), "was: {rendered}");
+        assert!(!rendered.contains("failing"), "was: {rendered}");
         assert!(
             !findings
                 .iter()
@@ -1590,6 +1959,38 @@ mod tests {
             "was: {}",
             render(&report, false)
         );
+    }
+
+    #[test]
+    fn the_same_inferred_and_stated_pull_number_is_rendered_once_with_its_provenance() {
+        // Given: an open inferred pull request and a stated record for that same pull request.
+        let mut row = row("feat/alpha", None, Some(pull_request(106)));
+        row.stated_pull = Some(StatedPull {
+            number: 106,
+            state: "OPEN".to_owned(),
+        });
+
+        // When: the pull-request cell combines inference with the stated record.
+        let cell = pull_request_cell(&row);
+
+        // Then: the number is shown once while the stated state and provenance remain visible.
+        assert_eq!(cell, "#106 open (stated)");
+    }
+
+    #[test]
+    fn different_inferred_and_stated_pull_numbers_are_both_rendered() {
+        // Given: an inferred pull request and a distinct stated pull request.
+        let mut row = row("feat/alpha", None, Some(pull_request(106)));
+        row.stated_pull = Some(StatedPull {
+            number: 107,
+            state: "OPEN".to_owned(),
+        });
+
+        // When: the pull-request cell combines inference with the stated record.
+        let cell = pull_request_cell(&row);
+
+        // Then: both numbers remain visible because they identify different pull requests.
+        assert_eq!(cell, "#106 #107 open (stated)");
     }
 
     #[test]

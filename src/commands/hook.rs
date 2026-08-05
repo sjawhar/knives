@@ -5,13 +5,13 @@ use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 
 use crate::cli::{Exit, HookHarness};
-use crate::config::{GuidanceRoot, GuidanceRootKind, default_config_path, load};
+use crate::config::{GuidanceRoot, GuidanceRootKind, Registry, default_config_path, load};
 use crate::hook::claude_code::{
     Event, EventKind, POST_TOOL_USE_WIRE_NAME, SESSION_START_WIRE_NAME, response,
 };
 use crate::hook::guidance::{claim_lines, format_guidance, format_notice, guidance_for};
 use crate::hook::opencode::{self, Event as OpenCodeEvent, EventKind as OpenCodeEventKind};
-use crate::hook::resolve::{Match, argument_paths, managed_repo_for};
+use crate::hook::resolve::{Match, argument_paths, managed_repo_for, trust_rule_match, url_owner};
 use crate::hook::state::SessionState;
 use crate::store::{Store, default_state_path};
 
@@ -71,7 +71,7 @@ fn run_opencode() -> anyhow::Result<Option<String>> {
     let home = config_home();
     let response = match kind {
         OpenCodeEventKind::ToolExecuteAfter => opencode_tool_after(&event, &home),
-        OpenCodeEventKind::ChatSystem => opencode_chat_system(&event),
+        OpenCodeEventKind::ChatSystem => opencode_chat_system(&event, &home),
         OpenCodeEventKind::ShellEnv => opencode_shell_env(&event),
         OpenCodeEventKind::Compacting => opencode_compacting(&event, &home),
         OpenCodeEventKind::Other => opencode::empty_response().map_err(Into::into),
@@ -99,7 +99,12 @@ fn opencode_tool_after(event: &OpenCodeEvent, home: &Path) -> anyhow::Result<Str
     let Some(session_id) = event.session_id() else {
         return opencode::tool_response("").map_err(Into::into);
     };
-    let Some(matched) = relevant_tool_match(event.tool(), event.args(), OPENCODE_RELEVANT_TOOLS)?
+    let Some(matched) = relevant_tool_match(
+        event.tool(),
+        event.args(),
+        OPENCODE_RELEVANT_TOOLS,
+        Some((home, OPENCODE, session_id)),
+    )?
     else {
         return opencode::tool_response("").map_err(Into::into);
     };
@@ -127,13 +132,15 @@ fn opencode_tool_after(event: &OpenCodeEvent, home: &Path) -> anyhow::Result<Str
     opencode::tool_response(&addition).map_err(Into::into)
 }
 
-fn opencode_chat_system(event: &OpenCodeEvent) -> anyhow::Result<String> {
+fn opencode_chat_system(event: &OpenCodeEvent, home: &Path) -> anyhow::Result<String> {
     let Some(directory) = event.directory() else {
         return opencode::system_response("", &[]).map_err(Into::into);
     };
     let registry = load(&default_config_path())?;
-    let Some(matched) = managed_repo_for(&[PathBuf::from(directory)], &registry.guidance_roots())
-    else {
+    let cache = event
+        .session_id()
+        .map(|session_id| (home, OPENCODE, session_id));
+    let Some(matched) = match_with_trust(&[PathBuf::from(directory)], &registry, cache)? else {
         return opencode::system_response("", &[]).map_err(Into::into);
     };
     let Some(guidance) = guidance_for(&matched.repo, &matched.candidate) else {
@@ -220,7 +227,12 @@ fn session_start(event: &Event, home: &Path) -> anyhow::Result<Option<String>> {
         return Ok(None);
     };
     let registry = load(&default_config_path())?;
-    let Some(matched) = managed_repo_for(&[PathBuf::from(cwd)], &registry.guidance_roots()) else {
+    let Some(matched) = match_with_trust(
+        &[PathBuf::from(cwd)],
+        &registry,
+        Some((home, CLAUDE_CODE, session_id)),
+    )?
+    else {
         return Ok(None);
     };
     if matched.repo.kind != GuidanceRootKind::Managed {
@@ -243,7 +255,12 @@ fn post_tool_use(event: &Event, home: &Path) -> anyhow::Result<Option<String>> {
     let Some(session_id) = event.session_id() else {
         return Ok(None);
     };
-    let Some(matched) = relevant_tool_match(event.tool_name(), event.tool_input(), RELEVANT_TOOLS)?
+    let Some(matched) = relevant_tool_match(
+        event.tool_name(),
+        event.tool_input(),
+        RELEVANT_TOOLS,
+        Some((home, CLAUDE_CODE, session_id)),
+    )?
     else {
         return Ok(None);
     };
@@ -283,6 +300,7 @@ fn relevant_tool_match(
     tool: Option<&str>,
     args: Option<&serde_json::Value>,
     relevant_tools: &[&str],
+    cache: Option<(&Path, &str, &str)>,
 ) -> anyhow::Result<Option<Match>> {
     let Some(tool) = tool else {
         return Ok(None);
@@ -298,7 +316,82 @@ fn relevant_tool_match(
         return Ok(None);
     }
     let registry = load(&default_config_path())?;
-    Ok(managed_repo_for(&paths, &registry.guidance_roots()))
+    match_with_trust(&paths, &registry, cache)
+}
+
+fn match_with_trust(
+    paths: &[PathBuf],
+    registry: &Registry,
+    cache: Option<(&Path, &str, &str)>,
+) -> anyhow::Result<Option<Match>> {
+    if let Some(matched) = managed_repo_for(paths, &registry.guidance_roots()) {
+        return Ok(Some(matched));
+    }
+
+    let mut cache_error = None;
+    let mut probe = |root: &Path| {
+        let cached_owners = cache.and_then(|(home, harness, session_id)| {
+            SessionState::load(home, harness, session_id)
+                .owner_remotes(root)
+                .map(<[String]>::to_owned)
+        });
+        let cache_miss = cached_owners.is_none();
+        let owners = cached_owners.map_or_else(
+            || match crate::jj::git_toplevel(root) {
+                Ok(toplevel) if toplevel.canonicalize().ok().as_deref() == Some(root) => crate::jj::git_remotes(root)
+                    .map_or_else(
+                        |_| {
+                            if root.join(".jj").exists() {
+                                eprintln!("knives hook: owner-rule matching requires a colocated .git checkout");
+                            }
+                            None
+                        },
+                        |remotes| {
+                            Some(
+                                remotes
+                                    .values()
+                                    .filter_map(|url| url_owner(url).map(str::to_owned))
+                                    .collect(),
+                            )
+                        },
+                    ),
+                Ok(_) => None,
+                Err(_) => {
+                    if root.join(".jj").exists() {
+                        eprintln!("knives hook: owner-rule matching requires a colocated .git checkout");
+                    }
+                    None
+                }
+            },
+            Some,
+        );
+
+        let Some(owners) = owners else {
+            return Some(false);
+        };
+
+        if cache_miss
+            && let Some((home, harness, session_id)) = cache
+            && let Err(error) = SessionState::update(home, harness, session_id, |state| {
+                state.record_owner_remotes(root, owners.clone());
+            })
+        {
+            cache_error = Some(error);
+            return None;
+        }
+        Some(owners.iter().any(|owner| {
+            registry
+                .trust
+                .owners
+                .iter()
+                .any(|trusted| trusted.eq_ignore_ascii_case(owner))
+        }))
+    };
+    let matched = trust_rule_match(paths, &registry.trust, &mut probe);
+    if let Some(error) = cache_error {
+        return Err(error);
+    }
+    Ok(matched)
 }
 
 fn pre_compact(event: &Event, home: &Path) -> anyhow::Result<Option<String>> {
@@ -333,3 +426,7 @@ fn write_output(output: &str) -> anyhow::Result<()> {
     stdout.write_all(output.as_bytes())?;
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "hook_regression_tests.rs"]
+mod regression_tests;

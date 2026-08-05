@@ -105,6 +105,12 @@ pub enum Command {
         /// Repo directory. Defaults to the current directory.
         repo: Option<PathBuf>,
     },
+    /// Print a registry snippet for this repo. Writes nothing: registration is a trust grant, so a human pastes it.
+    /// Output is TOML regardless of `--json`.
+    Register {
+        /// Repo directory. Defaults to the current directory.
+        repo: Option<PathBuf>,
+    },
     /// List the repos knives manages, with their release state.
     Repos,
     /// Fetch every remote and tracked pull ref, and classify each pull request.
@@ -208,7 +214,7 @@ pub enum Command {
         #[arg(long)]
         repo: Option<String>,
     },
-    /// Plan, curate and cut dated releases.
+    /// Plan, curate and cut releases.
     ///
     /// With no subcommand, plans: what a cut would contain, whether every parent is
     /// still its branch tip, and who pins the current release.
@@ -236,8 +242,8 @@ pub enum HookHarness {
 pub enum ReleaseAction {
     /// Cut the release. The only thing knives writes, and it still never pushes.
     Cut {
-        /// The dated release name.
-        name: String,
+        /// The dated release name. Omit it for a configured fixed release branch.
+        name: Option<String>,
     },
     /// Add an upstream commit to the release in hand, keeping its branch parents.
     ///
@@ -314,6 +320,7 @@ mod tests {
         // Given: the command surface from the design, with minimum arguments
         let invocations: Vec<Vec<&str>> = vec![
             vec!["knives", "init"],
+            vec!["knives", "register"],
             vec!["knives", "hook", "claude-code"],
             vec!["knives", "repos"],
             vec!["knives", "sync", "--all"],
@@ -322,6 +329,7 @@ mod tests {
             vec!["knives", "start", "a-branch"],
             vec!["knives", "finish", "a-branch"],
             vec!["knives", "release"],
+            vec!["knives", "release", "cut"],
             vec!["knives", "release", "cut", "2026-08-01"],
             vec!["knives", "release", "rebase"],
             vec!["knives", "release", "include", "feat/x"],

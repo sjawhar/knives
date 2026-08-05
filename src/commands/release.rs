@@ -1,4 +1,4 @@
-//! `knives release`: cut or repair a dated release.
+//! `knives release`: cut or repair a release.
 //!
 //! Everything here is a check, never a prompt. A CLI in a non-interactive agent
 //! session has nobody to ask, so it decides from evidence and says what it
@@ -8,11 +8,10 @@
 use std::path::{Path, PathBuf};
 
 use crate::cli::Exit;
-use crate::commands::status::UPSTREAM_TRUNK;
 use crate::config::{RepoEntry, Role};
-use crate::detect::{Finding, stale_parents};
-use crate::ids::{BookmarkRef, CommitId, RepoName};
-use crate::jj::Repo;
+use crate::detect::{BookmarkTips, Finding, stale_parents};
+use crate::ids::{BookmarkRef, CommitId, ReleaseScheme, RepoName, is_our_release, is_release_name};
+use crate::jj::{self, OriginTrunk, Repo};
 use crate::pins::{PIN_FILES, Pin, PinKind, scan};
 
 /// What repairing this release would actually reach.
@@ -45,19 +44,80 @@ pub fn repair_effect(pins: &[Pin]) -> RepairEffect {
 /// them at once; an unscoped scan attributed a sibling's pin to this repo, which reads
 /// as "pinned at the newest cut" when it is not pinned here at all. `None` keeps every
 /// pin, for a caller that genuinely wants the whole file.
-pub fn scan_consumer_for(consumer: &Path, slug: Option<&str>) -> Vec<Pin> {
+pub fn scan_consumer_for(
+    consumer: &Path,
+    slug: Option<&str>,
+    scheme: &ReleaseScheme,
+) -> (Vec<Pin>, Vec<String>) {
     let mut pins = Vec::new();
+    let mut notes = Vec::new();
+    match jj::origin_trunk(consumer) {
+        Ok(OriginTrunk::Reference(branch)) => {
+            let mut checkout_lag = None;
+            for name in PIN_FILES {
+                match jj::file_at_ref(consumer, &branch, name) {
+                    Ok(Some((text, behind))) => {
+                        pins.extend(scanned_pins(name, &text, slug, scheme));
+                        checkout_lag = checkout_lag.or_else(|| (behind > 0).then_some(behind));
+                    }
+                    Ok(None) => {}
+                    Err(error) => notes.push(format!(
+                        "{}: could not read {name} at {branch}: {error}",
+                        consumer.display()
+                    )),
+                }
+            }
+            if let Some(behind) = checkout_lag {
+                notes.push(format!(
+                    "{} checkout is {behind} commit(s) behind its {branch}",
+                    consumer.display()
+                ));
+            }
+        }
+        Ok(OriginTrunk::Missing) => {
+            extend_working_copy_pins(&mut pins, consumer, slug, scheme);
+            notes.push(format!(
+                "{}: no origin trunk resolved; pins read from the working copy",
+                consumer.display()
+            ));
+        }
+        Ok(OriginTrunk::NotRepository) => {
+            extend_working_copy_pins(&mut pins, consumer, slug, scheme);
+            notes.push(format!(
+                "{}: not a repository; pins read from the working copy",
+                consumer.display()
+            ));
+        }
+        Err(error) => {
+            extend_working_copy_pins(&mut pins, consumer, slug, scheme);
+            notes.push(format!(
+                "{}: could not resolve its origin trunk ({error}); pins read from the working copy",
+                consumer.display()
+            ));
+        }
+    }
+    (pins, notes)
+}
+
+fn extend_working_copy_pins(
+    pins: &mut Vec<Pin>,
+    consumer: &Path,
+    slug: Option<&str>,
+    scheme: &ReleaseScheme,
+) {
     for name in PIN_FILES {
         let path = consumer.join(name);
         if let Ok(text) = std::fs::read_to_string(&path) {
-            pins.extend(
-                scan(name, &text)
-                    .into_iter()
-                    .filter(|pin| slug.is_none_or(|slug| pin.source.contains(slug))),
-            );
+            pins.extend(scanned_pins(name, &text, slug, scheme));
         }
     }
-    pins
+}
+
+fn scanned_pins(file: &str, text: &str, slug: Option<&str>, scheme: &ReleaseScheme) -> Vec<Pin> {
+    scan(file, text, scheme)
+        .into_iter()
+        .filter(|pin| slug.is_none_or(|slug| pin.source.contains(slug)))
+        .collect()
 }
 
 /// The repository's name as it appears in a dependency line, e.g. `sandbox-runner`.
@@ -65,6 +125,61 @@ pub fn repo_slug(entry: &RepoEntry) -> Option<String> {
     let last = entry.remote(Role::Origin).rsplit('/').next()?;
     let trimmed = last.trim_end_matches(".git");
     (!trimmed.is_empty()).then(|| trimmed.to_owned())
+}
+
+pub fn cut_name(scheme: &ReleaseScheme, requested: Option<&str>) -> Result<String, String> {
+    match (scheme, requested) {
+        (ReleaseScheme::Dated, Some(name)) => Ok(name.to_owned()),
+        (ReleaseScheme::Dated, None) => {
+            Err("a dated release cut needs a name, e.g. release/2026-08-03".to_owned())
+        }
+        (ReleaseScheme::Fixed(fixed), Some(name)) if name != fixed.as_str() => Err(format!(
+            "this repo cuts the fixed release branch {fixed}; drop the name or use {fixed}"
+        )),
+        (ReleaseScheme::Fixed(fixed), None | Some(_)) => Ok(fixed.to_string()),
+    }
+}
+
+/// Return the publish remote's previous fixed release position, if it exists.
+///
+/// This resolves only the remote-tracking reference, never the local bookmark: [`cut`]
+/// creates a merge and moves only that local bookmark via `set_bookmark`; it neither pushes
+/// nor fetches. It is therefore sound before a push, and is the seam issue #4's pre/post-cut
+/// checks will attach to.
+pub fn previous_position(repo: &Repo, entry: &RepoEntry) -> Option<(String, CommitId)> {
+    let ReleaseScheme::Fixed(fixed) = entry.release_scheme() else {
+        return None;
+    };
+    let remote = entry.publish_remote();
+    let reference = format!("{fixed}@{remote}");
+    repo.resolve_commit(&reference)
+        .ok()
+        .map(|commit| (reference, commit))
+}
+
+#[cfg(test)]
+mod scheme_tests {
+    use super::*;
+    use crate::ids::{BranchName, ReleaseScheme};
+
+    #[test]
+    fn a_dated_cut_requires_a_name_and_a_fixed_cut_supplies_its_own() {
+        let dated = ReleaseScheme::Dated;
+        let fixed = ReleaseScheme::Fixed(BranchName::new("integration"));
+        assert!(cut_name(&dated, None).is_err());
+        assert_eq!(
+            cut_name(&dated, Some("release/2026-08-03")).unwrap(),
+            "release/2026-08-03"
+        );
+        assert_eq!(cut_name(&fixed, None).unwrap(), "integration");
+        assert_eq!(
+            cut_name(&fixed, Some("integration")).unwrap(),
+            "integration"
+        );
+        // A stray dated name under the fixed scheme would silently fork the
+        // naming; refusing is the only answer that cannot lose a cut.
+        assert!(cut_name(&fixed, Some("release/2026-08-03")).is_err());
+    }
 }
 
 #[derive(Debug, Default)]
@@ -88,19 +203,31 @@ impl Plan {}
 ///
 /// A fresh cut is a flat merge of the upstream trunk and exactly these. Explicit commit
 /// ids are read here, once, so a branch moving mid-cut cannot change what gets merged.
-pub fn carried_branches(repo: &Repo) -> anyhow::Result<Vec<(String, CommitId)>> {
+pub fn carried_branches(
+    repo: &Repo,
+    trunk: &str,
+    scheme: &ReleaseScheme,
+) -> anyhow::Result<Vec<(String, CommitId)>> {
     let tips = repo.bookmark_tips()?;
-    Ok(tips
-        .iter()
+    Ok(carried_from_tips(&tips, trunk, scheme))
+}
+
+/// Pure seam so the trunk filter is testable without opening a repository.
+fn carried_from_tips(
+    tips: &BookmarkTips,
+    trunk: &str,
+    scheme: &ReleaseScheme,
+) -> Vec<(String, CommitId)> {
+    tips.iter()
         .filter_map(|(reference, commit)| match reference {
             BookmarkRef::Local(branch)
-                if !branch.as_str().starts_with("release/") && branch.as_str() != "main" =>
+                if !is_release_name(branch, scheme) && branch.as_str() != trunk =>
             {
                 Some((branch.to_string(), commit.clone()))
             }
             BookmarkRef::Local(_) | BookmarkRef::Remote { .. } => None,
         })
-        .collect())
+        .collect()
 }
 
 /// Whether the release in hand already contains the upstream trunk.
@@ -110,8 +237,11 @@ pub fn carried_branches(repo: &Repo) -> anyhow::Result<Vec<(String, CommitId)>> 
 /// pull request has merged upstream, because until the release contains the commit that
 /// merge landed in, dropping the local branch removes the change from the release too.
 /// `knives release rebase` is the operation; this only says where things stand.
-pub fn trunk_lag(repo: &Repo, release: Option<&str>) -> Option<String> {
-    let trunk = repo.resolve_commit(UPSTREAM_TRUNK).ok()?;
+///
+/// Landed measures against upstream, never our fork's trunk: the local branch can lag or
+/// differ from the repository where the pull request was merged.
+pub fn trunk_lag(repo: &Repo, release: Option<&str>, upstream_trunk: &str) -> Option<String> {
+    let trunk = repo.resolve_commit(upstream_trunk).ok()?;
     let release = release?;
     let parents = repo.parents_of(release).ok()?;
     if parents.iter().any(|parent| parent.commit == trunk) {
@@ -132,27 +262,42 @@ pub fn plan(name: &RepoName, entry: &RepoEntry, consumers: &[PathBuf]) -> anyhow
     let tips = repo.bookmark_tips()?;
 
     // The newest release we cut. Historical ones are frozen and not our concern.
-    let newest = tips
-        .iter()
-        .filter(|(reference, _)| reference.branch().as_str().starts_with("release/"))
-        .filter(|(reference, _)| match reference {
-            BookmarkRef::Local(_) => true,
-            BookmarkRef::Remote { remote, .. } => matches!(remote.as_str(), "origin" | "release"),
-        })
-        // The same ordering `status` uses. These two commands answering "which
-        // is the current release?" differently was a real divergence.
-        .max_by_key(|(reference, _)| {
-            (
-                crate::commands::status::release_order(reference.branch().as_str()),
-                // On a tie prefer the local ref, deterministically. `max_by_key`
-                // otherwise returns whichever came last in iteration order.
-                u8::from(reference.is_local()),
-            )
-        });
+    let scheme = entry.release_scheme();
+    let publish_remote = entry.publish_remote();
+    let newest = match &scheme {
+        ReleaseScheme::Dated => tips
+            .iter()
+            .filter(|(reference, _)| is_our_release(reference, &scheme))
+            // The same ordering `status` uses. These two commands answering "which
+            // is the current release?" differently was a real divergence.
+            .max_by_key(|(reference, _)| {
+                (
+                    crate::commands::status::release_order(reference.branch().as_str()),
+                    // On a tie prefer the local ref, deterministically. `max_by_key`
+                    // otherwise returns whichever came last in iteration order.
+                    u8::from(reference.is_local()),
+                )
+            }),
+        ReleaseScheme::Fixed(fixed) => tips
+            .iter()
+            .filter(|(reference, _)| match reference {
+                BookmarkRef::Local(branch) => branch == fixed,
+                BookmarkRef::Remote { branch, remote } => {
+                    branch == fixed && remote.as_str() == publish_remote
+                }
+            })
+            .max_by_key(|(reference, _)| u8::from(reference.is_local())),
+    };
 
     let Some((reference, commit)) = newest else {
-        plan.notes
-            .push("no dated release found; the first cut has nothing to repair".to_owned());
+        plan.notes.push(match scheme {
+            ReleaseScheme::Dated => {
+                "no dated release found; the first cut has nothing to repair".to_owned()
+            }
+            ReleaseScheme::Fixed(fixed) => {
+                format!("fixed release branch {fixed} has no cut yet; the first cut has nothing to repair")
+            }
+        });
         return Ok(plan);
     };
     plan.release = Some(reference.to_string());
@@ -179,8 +324,9 @@ pub fn plan(name: &RepoName, entry: &RepoEntry, consumers: &[PathBuf]) -> anyhow
     // the first would call a release unpinned while something else was frozen on it.
     let slug = repo_slug(entry);
     for consumer in consumers {
-        plan.pins
-            .extend(scan_consumer_for(consumer, slug.as_deref()));
+        let (pins, notes) = scan_consumer_for(consumer, slug.as_deref(), &scheme);
+        plan.pins.extend(pins);
+        plan.notes.extend(notes);
     }
     Ok(plan)
 }
@@ -230,7 +376,7 @@ pub fn render(plan: &Plan) -> String {
         RepairEffect::Unpinned => "  nothing pins this release: either is safe".to_owned(),
     });
     lines.push(
-        "  planning by default. `knives release cut <name>` cuts a flat release from \
+        "  planning by default. `knives release cut [name]` cuts a flat release from \
            the branches stated as members, or every branch when none is stated, and \
            verifies the parent count. Nothing here ever pushes."
             .to_owned(),
@@ -259,6 +405,7 @@ mod tests {
         reason = "indexing a result in a test is the assertion; a panic is the failure"
     )]
     use super::*;
+    use crate::ids::BranchName;
 
     fn pin(kind: PinKind) -> Pin {
         Pin {
@@ -266,6 +413,7 @@ mod tests {
             line: 1,
             reference: "release/2026-07-28".to_owned(),
             kind,
+            locked: None,
             source: String::new(),
         }
     }
@@ -288,6 +436,61 @@ mod tests {
     #[test]
     fn nothing_pinning_it_leaves_the_choice_open() {
         assert_eq!(repair_effect(&[]), RepairEffect::Unpinned);
+    }
+
+    #[test]
+    fn carried_branches_excludes_the_configured_trunk_not_the_name_main() {
+        // A fork of a dev-trunk upstream may carry a branch literally named main;
+        // that branch is work, and dev is the one that is not.
+        // (Constructed through the pure filter, mirroring maintained_branches.)
+        let tips: crate::detect::BookmarkTips = [
+            (
+                BookmarkRef::Local(BranchName::new("dev")),
+                CommitId::new("aaa"),
+            ),
+            (
+                BookmarkRef::Local(BranchName::new("main")),
+                CommitId::new("bbb"),
+            ),
+            (
+                BookmarkRef::Local(BranchName::new("feat/x")),
+                CommitId::new("ccc"),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let names: Vec<String> = carried_from_tips(&tips, "dev", &crate::ids::ReleaseScheme::Dated)
+            .into_iter()
+            .map(|(branch, _)| branch)
+            .collect();
+        assert!(!names.contains(&"dev".to_owned()));
+        assert!(names.contains(&"main".to_owned()));
+    }
+
+    #[test]
+    fn a_fixed_release_branch_is_a_cut_not_carried_cargo() {
+        // Given: a fixed integration cut alongside the configured trunk and feature work.
+        let fixed = crate::ids::ReleaseScheme::Fixed(BranchName::new("integration"));
+        let tips: crate::detect::BookmarkTips = [
+            (
+                BookmarkRef::Local(BranchName::new("integration")),
+                CommitId::new("aaa"),
+            ),
+            (
+                BookmarkRef::Local(BranchName::new("feat/x")),
+                CommitId::new("bbb"),
+            ),
+            (
+                BookmarkRef::Local(BranchName::new("dev")),
+                CommitId::new("ccc"),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        // When: the next cut's carried branches are gathered.
+        let carried = carried_from_tips(&tips, "dev", &fixed);
+        // Then: only the feature is cargo; the fixed branch advances in place.
+        assert_eq!(carried, vec![("feat/x".to_owned(), CommitId::new("bbb"))]);
     }
 }
 
@@ -332,8 +535,12 @@ pub fn workspaces_to_clean(workspaces: &[String], carried: &[String]) -> Vec<Str
 /// catches is silent: a cut that dropped a parent looks exactly like one that
 /// did not, until work goes missing downstream.
 ///
+/// Dated cuts retain ordinary bookmark movement protection because each name is
+/// immutable. Fixed cuts rebuild a fresh flat merge, so their bookmark moves
+/// sideways while the publish remote retains the previous cut.
+///
 /// This never pushes. Publishing a release is a separate, deliberate act.
-pub fn cut(repo: &Path, request: &Cut) -> anyhow::Result<CommitId> {
+pub fn cut(repo: &Path, request: &Cut, scheme: &ReleaseScheme) -> anyhow::Result<CommitId> {
     let created = crate::jj::create_merge(repo, &request.parents, &request.message())?;
     let actual = Repo::open(repo)?.parents_of(created.as_str())?;
     anyhow::ensure!(
@@ -343,7 +550,12 @@ pub fn cut(repo: &Path, request: &Cut) -> anyhow::Result<CommitId> {
         actual.len(),
         request.parents.len()
     );
-    crate::jj::set_bookmark(repo, &request.name, created.as_str())?;
+    match scheme {
+        ReleaseScheme::Dated => crate::jj::set_bookmark(repo, &request.name, created.as_str())?,
+        ReleaseScheme::Fixed(_) => {
+            crate::jj::set_bookmark_anywhere(repo, &request.name, created.as_str())?;
+        }
+    }
     Ok(created)
 }
 
@@ -565,12 +777,33 @@ mod consumer_scope_tests {
         )
         .unwrap();
 
-        let ours = scan_consumer_for(dir.path(), Some("sandbox-runner"));
+        let (ours, notes) =
+            scan_consumer_for(dir.path(), Some("sandbox-runner"), &ReleaseScheme::Dated);
         assert_eq!(ours.len(), 1, "only our own pin: {ours:?}");
         assert_eq!(ours[0].reference, "release/2026-07-20");
+        assert_eq!(
+            notes,
+            vec![format!(
+                "{}: not a repository; pins read from the working copy",
+                dir.path().display()
+            )]
+        );
 
-        let unscoped = scan_consumer_for(dir.path(), None);
+        let (unscoped, _) = scan_consumer_for(dir.path(), None, &ReleaseScheme::Dated);
         assert_eq!(unscoped.len(), 2, "without a slug, every pin is kept");
+    }
+
+    #[test]
+    fn consumer_notes_render_with_the_alert_prefix() {
+        let plan = Plan {
+            notes: vec!["consumer checkout is 1 commit behind its origin/main".to_owned()],
+            ..Plan::default()
+        };
+
+        assert_eq!(
+            render(&plan),
+            "! consumer checkout is 1 commit behind its origin/main"
+        );
     }
 }
 

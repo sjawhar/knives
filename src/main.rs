@@ -8,10 +8,10 @@ use std::process::ExitCode;
 
 use clap::Parser as _;
 use knives::cli::{Cli, Command, Exit, ReleaseAction};
-use knives::commands::{hook, init, preflight, release, repos, start, status, sync};
+use knives::commands::{hook, init, preflight, register, release, repos, start, status, sync};
 use knives::config::{default_config_path, load};
 use knives::forge::{CliForge, Forge};
-use knives::ids::{BranchName, BranchTarget, RepoName, Requirement};
+use knives::ids::{BranchName, BranchTarget, ReleaseScheme, RepoName, Requirement};
 use knives::store::{Store, default_state_path};
 
 fn main() -> ExitCode {
@@ -30,6 +30,7 @@ fn dispatch() -> anyhow::Result<Exit> {
     match cli.command {
         Command::Hook { harness } => Ok(hook::run(harness)),
         Command::Init { repo } => init::run(repo),
+        Command::Register { repo } => register::run(repo),
         Command::Repos => repos::run(),
         Command::Status {
             repo,
@@ -156,10 +157,12 @@ fn dispatch_release(
     extra_consumers: &[&std::path::Path],
 ) -> anyhow::Result<Exit> {
     match action {
-        None => run_release(chosen.as_str(), extra_consumers, None),
-        Some(ReleaseAction::Cut { name }) => {
-            run_release(chosen.as_str(), extra_consumers, Some(&name))
-        }
+        None => run_release(chosen.as_str(), extra_consumers, &ReleaseInvocation::Plan),
+        Some(ReleaseAction::Cut { name }) => run_release(
+            chosen.as_str(),
+            extra_consumers,
+            &ReleaseInvocation::Cut(name),
+        ),
         Some(ReleaseAction::Rebase { reference }) => {
             run_rebase(chosen.as_str(), reference.as_deref())
         }
@@ -185,15 +188,15 @@ fn run_rebase(name: &str, reference: Option<&str>) -> anyhow::Result<Exit> {
         Ok(list) => list,
         Err(exit) => return Ok(exit),
     };
-    let reference = reference.unwrap_or(knives::commands::status::UPSTREAM_TRUNK);
     for (repo, entry) in chosen {
+        let reference = reference.map_or_else(|| entry.upstream_trunk(), str::to_owned);
         let opened = knives::jj::Repo::open(&entry.path)?;
         let plan = release::plan(&repo, &entry, &entry.consumers)?;
         let Some(release_name) = plan.release.clone() else {
             println!("{repo}: no release to move");
             continue;
         };
-        let onto = opened.resolve_commit(reference)?;
+        let onto = opened.resolve_commit(&reference)?;
         let parents = opened.parents_of(&release_name)?;
         if parents.iter().any(|parent| parent.commit == onto) {
             println!("{repo}: {release_name} already contains {reference}");
@@ -212,7 +215,7 @@ fn run_rebase(name: &str, reference: Option<&str>) -> anyhow::Result<Exit> {
         carried.push(onto.clone());
         let message = format!("chore(release): {release_name} rebased onto {reference}");
         let created = knives::jj::create_merge(&entry.path, &carried, &message)?;
-        knives::jj::set_bookmark(&entry.path, &release_name, created.as_str())?;
+        knives::jj::set_bookmark_anywhere(&entry.path, &release_name, created.as_str())?;
         println!(
             "{repo}: {release_name} now contains {reference} ({}), keeping its {} branch parent(s)",
             &onto.as_str()[..12.min(onto.as_str().len())],
@@ -481,10 +484,15 @@ fn run_status(requested: Option<&str>, view: StatusView) -> anyhow::Result<Exit>
     Ok(worst)
 }
 
+enum ReleaseInvocation {
+    Plan,
+    Cut(Option<String>),
+}
+
 fn run_release(
     name: &str,
     extra_consumers: &[&std::path::Path],
-    cut: Option<&str>,
+    invocation: &ReleaseInvocation,
 ) -> anyhow::Result<Exit> {
     let chosen = match selected(Some(name), false)? {
         Ok(list) => list,
@@ -500,15 +508,30 @@ fn run_release(
         let mut consumers = entry.consumers.clone();
         consumers.extend(extra_consumers.iter().map(|path| path.to_path_buf()));
         let opened = knives::jj::Repo::open(&entry.path)?;
+        let scheme = entry.release_scheme();
+        let cut_name = match invocation {
+            ReleaseInvocation::Plan => None,
+            ReleaseInvocation::Cut(requested) => {
+                match release::cut_name(&scheme, requested.as_deref()) {
+                    Ok(name) => Some(name),
+                    Err(message) => {
+                        eprintln!("{message}");
+                        return Ok(Exit::Usage);
+                    }
+                }
+            }
+        };
         let plan = release::plan(&repo, &entry, &consumers)?;
         println!("{}", release::render(&plan));
-        if let Some(lag) = release::trunk_lag(&opened, plan.release.as_deref()) {
+        if let Some(lag) =
+            release::trunk_lag(&opened, plan.release.as_deref(), &entry.upstream_trunk())
+        {
             println!("  !! {lag}");
         }
         worst = worst.worst(release::exit_for(&plan));
 
         // What the plan said it would include, so a cut cannot quietly differ from it.
-        let all = release::carried_branches(&opened)?;
+        let all = release::carried_branches(&opened, entry.trunk(), &scheme)?;
         let names: Vec<String> = all.iter().map(|(branch, _)| branch.clone()).collect();
         let (chosen, left_out) = store.release_membership(&repo, &names);
         if !left_out.is_empty() {
@@ -520,7 +543,7 @@ fn run_release(
                 println!("  {branch}  {why}");
             }
         }
-        if let Some(name) = cut {
+        if let Some(name) = cut_name {
             let mut carried: Vec<_> = all
                 .iter()
                 .filter(|(branch, _)| chosen.contains(branch))
@@ -530,20 +553,19 @@ fn run_release(
             // whatever upstream its branches were based on, so dropping a branch whose
             // pull request had merged took the change out of the release with it: the
             // merge commit lived upstream and had never been merged in here.
-            let trunk = opened.resolve_commit(knives::commands::status::UPSTREAM_TRUNK)?;
-            carried.insert(
-                0,
-                (knives::commands::status::UPSTREAM_TRUNK.to_owned(), trunk),
-            );
+            let trunk_name = entry.upstream_trunk();
+            let trunk = opened.resolve_commit(&trunk_name)?;
+            carried.insert(0, (trunk_name, trunk));
             let request = release::Cut {
-                name: name.to_owned(),
+                name: name.clone(),
                 parents: carried.iter().map(|(_, commit)| commit.clone()).collect(),
                 provenance: carried
                     .iter()
                     .map(|(branch, commit)| (commit.clone(), branch.clone()))
                     .collect(),
             };
-            let created = release::cut(&entry.path, &request)?;
+            let created = release::cut(&entry.path, &request, &scheme)?;
+            print_previous_release_position(&opened, &entry);
             println!(
                 "  cut {name} as {} with {} parent(s), flat, not pushed",
                 created.as_str().chars().take(12).collect::<String>(),
@@ -589,6 +611,17 @@ fn run_release(
         }
     }
     Ok(worst)
+}
+
+fn print_previous_release_position(opened: &knives::jj::Repo, entry: &knives::config::RepoEntry) {
+    if let Some((reference, commit)) = release::previous_position(opened, entry) {
+        println!(
+            "  previous release position: {reference} at {}",
+            &commit.as_str()[..12.min(commit.as_str().len())]
+        );
+    } else if matches!(entry.release_scheme(), ReleaseScheme::Fixed(_)) {
+        println!("  no previous release position: this is the first cut of the fixed branch");
+    }
 }
 
 fn run_preflight(name: &str) -> anyhow::Result<Exit> {
@@ -676,7 +709,7 @@ fn sync_targets(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use knives::config::{Registry, RepoEntry};
+    use knives::config::{Registry, RepoEntry, TrustRules};
     use std::collections::BTreeMap;
     use std::path::PathBuf;
 
@@ -691,6 +724,7 @@ mod tests {
                 origin: "https://example.test/ours/scout".to_string(),
                 base: None,
                 release: None,
+                release_branch: None,
                 test_count_command: None,
                 consumers: vec![],
             },
@@ -698,6 +732,7 @@ mod tests {
         let registry = Registry {
             repos,
             trusted: BTreeMap::new(),
+            trust: TrustRules::default(),
         };
 
         let cwd = PathBuf::from("/path/to/scout/subdirectory");
@@ -719,6 +754,7 @@ mod tests {
                 origin: "https://example.test/ours/scout".to_string(),
                 base: None,
                 release: None,
+                release_branch: None,
                 test_count_command: None,
                 consumers: vec![],
             },
@@ -726,6 +762,7 @@ mod tests {
         let registry = Registry {
             repos,
             trusted: BTreeMap::new(),
+            trust: TrustRules::default(),
         };
 
         let cwd = PathBuf::from("/path/to/other");

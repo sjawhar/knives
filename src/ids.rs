@@ -97,13 +97,38 @@ pub const RELEASE_PREFIX: &str = "release/";
 /// promptly picked an upstream release as ours. Only local releases and the
 /// `origin` or `release` remotes are ours: `upstream` is somebody else's cut,
 /// while `git` is jj's internal tracking view rather than a remote.
-pub fn is_our_release(reference: &BookmarkRef) -> bool {
-    if !reference.branch().as_str().starts_with(RELEASE_PREFIX) {
+/// Naming is scheme-dependent: dated releases share a prefix, while fixed releases
+/// are the one configured branch.
+pub fn is_our_release(reference: &BookmarkRef, scheme: &ReleaseScheme) -> bool {
+    if !is_release_name(reference.branch(), scheme) {
         return false;
     }
     match reference {
         BookmarkRef::Local(_) => true,
         BookmarkRef::Remote { remote, .. } => matches!(remote.as_str(), "origin" | "release"),
+    }
+}
+
+/// How this fork names its releases.
+///
+/// Derived from configuration and matched exhaustively at every release-aware
+/// site, so the compiler forces each of them — including ones added later — to
+/// answer "what does this mean when the release is one fixed branch?".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReleaseScheme {
+    /// Dated `release/YYYY-MM-DD[.n]` cuts. The default, and the historical behavior.
+    Dated,
+    /// One integration branch that is rebuilt and advanced in place. The branch's
+    /// previous position plays the role of the previous release.
+    Fixed(BranchName),
+}
+
+/// Whether a branch name is a release under this scheme: the dated prefix, or the
+/// one fixed integration branch.
+pub fn is_release_name(branch: &BranchName, scheme: &ReleaseScheme) -> bool {
+    match scheme {
+        ReleaseScheme::Dated => branch.as_str().starts_with(RELEASE_PREFIX),
+        ReleaseScheme::Fixed(name) => branch == name,
     }
 }
 
@@ -229,5 +254,33 @@ mod tests {
             remote: RemoteName::new("origin"),
         };
         assert_eq!(reference.to_string(), "feat/alpha@origin");
+    }
+
+    #[test]
+    fn under_a_fixed_scheme_the_fixed_branch_is_the_release_and_dated_names_are_not() {
+        use super::{BookmarkRef, BranchName, ReleaseScheme, RemoteName, is_our_release};
+        let fixed = ReleaseScheme::Fixed(BranchName::new("integration"));
+        let local = |name: &str| BookmarkRef::Local(BranchName::new(name));
+        let remote = |name: &str, r: &str| BookmarkRef::Remote {
+            branch: BranchName::new(name),
+            remote: RemoteName::new(r),
+        };
+        // The fixed branch is a cut wherever we publish it, never on upstream.
+        assert!(is_our_release(&local("integration"), &fixed));
+        assert!(is_our_release(&remote("integration", "origin"), &fixed));
+        assert!(is_our_release(&remote("integration", "release"), &fixed));
+        assert!(!is_our_release(&remote("integration", "upstream"), &fixed));
+        assert!(!is_our_release(&remote("integration", "git"), &fixed));
+        // Under Fixed, a dated name is not one of this repo's releases.
+        assert!(!is_our_release(&local("release/2026-07-29"), &fixed));
+        // Dated behavior is unchanged.
+        assert!(is_our_release(
+            &local("release/2026-07-29"),
+            &ReleaseScheme::Dated
+        ));
+        assert!(!is_our_release(
+            &local("integration"),
+            &ReleaseScheme::Dated
+        ));
     }
 }

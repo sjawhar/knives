@@ -12,7 +12,7 @@ use crate::cli::Exit;
 use crate::config::RepoEntry;
 use crate::detect::{divergent_changes, stale_parents};
 use crate::forge::{Forge, PullRequest};
-use crate::ids::{BookmarkRef, BranchName, RepoName};
+use crate::ids::{BookmarkRef, BranchName, RepoName, is_release_name};
 use crate::jj::Repo;
 use crate::store::Store;
 
@@ -246,6 +246,7 @@ pub fn branch_states(
 ) -> anyhow::Result<Vec<BranchState>> {
     let repo = Repo::open(&entry.path)?;
     let tips = repo.bookmark_tips()?;
+    let scheme = entry.release_scheme();
     let divergent: std::collections::BTreeSet<String> =
         divergent_changes(&repo.divergent_changes()?)
             .into_iter()
@@ -255,7 +256,7 @@ pub fn branch_states(
     // Which branches a release still pins an older commit of.
     let mut stale_branches = std::collections::BTreeSet::new();
     for (reference, commit) in &tips {
-        if !reference.branch().as_str().starts_with("release/") {
+        if !is_release_name(reference.branch(), &scheme) {
             continue;
         }
         for finding in stale_parents(&repo.parents_of(commit.as_str())?, &tips) {
@@ -270,7 +271,9 @@ pub fn branch_states(
     // Divergent branches first: their bookmarks are conflicted, so they are
     // absent from the tip map below and would otherwise never be reported.
     for (reference, _) in repo.conflicted_bookmarks()? {
-        if reference.branch().as_str().starts_with("release/") {
+        if is_release_name(reference.branch(), &scheme)
+            || reference.branch().as_str() == entry.trunk()
+        {
             continue;
         }
         states.push(BranchState {
@@ -288,7 +291,7 @@ pub fn branch_states(
     states.extend(tips.iter().filter_map(|(reference, commit)| {
         match reference {
             BookmarkRef::Local(branch)
-                if !branch.as_str().starts_with("release/") && branch.as_str() != "main" =>
+                if !is_release_name(branch, &scheme) && branch.as_str() != entry.trunk() =>
             {
                 Some(BranchState {
                     branch: branch.to_string(),
