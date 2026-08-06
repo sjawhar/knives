@@ -361,6 +361,10 @@ impl Lab {
         &self.work
     }
 
+    pub(crate) fn temp_origin(&self) -> PathBuf {
+        self.temp.path().join("origin.git")
+    }
+
     pub(crate) fn repo_entry_with_release_branch(&self, name: &str) -> knives::config::RepoEntry {
         knives::config::RepoEntry {
             path: self.work.clone(),

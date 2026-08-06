@@ -140,17 +140,16 @@ knives sync [REPO|--all]       fetch all remotes and tracked pull/N/head refs; c
 knives preflight [REPO]        programmatic pre-contribution facts (see below)
 knives status [REPO|--all]     aligned table per branch (branch, tip, push, pr, review, checks,
                                landed, flags); claims, active workspaces, and detectors
-knives start BRANCH            claim, create the workspace, base it on fetched trunk (defaulting to main)
+knives start BRANCH            claim, create the workspace, base it on the release's shared base (falling back to fetched trunk)
 knives finish BRANCH           hand back claim and remove workspace
 knives track BRANCH --pr N     state which PR a branch belongs to, overriding inference
 knives depends BRANCH --on R#N  record that a branch cannot land before something else
-knives release [NAME]          plan or cut a release under the configured scheme
-knives release cut [NAME]      cut a release; NAME is the dated name, and a fixed scheme needs none;
-                               the only thing knives writes, and it never pushes
+knives release [NAME]          plan, cut, or reap a release under the configured scheme
+knives release cut [NAME]      cut a release after audit; NAME is the dated name, fixed needs none; [--allow-drop] overrides orphan refusal; never pushes
+knives release reap            reap superseded dated release bookmarks everywhere locally and abandon their commits
 knives release include BRANCH  state that a branch belongs in the next release
 knives release drop BRANCH     state that it does not; survives the every-branch fallback
-knives release rebase [REF]    add an upstream commit, keeping the branch parents; repair in place
-                               when a following consumer can receive it, otherwise require a new dated cut
+knives release rebase [REF]    replace superseded base, keeping branch parents; repair in place when possible, else require new dated cut
 ```
 
 `--json` on any command, and it is the default when the environment says an agent is running it. Agents were grepping human output to count findings by detector.
@@ -189,7 +188,7 @@ Everything of the form "have you read the contributing guide, and does this PR c
 
 Workspaces are effectively free: 0.15 to 0.55s to create, because tracked content is small even in large repos (one 3.2G checkout was 19M across 1278 tracked files, the rest being virtualenvs and the shared `.jj` store). The real cost of a new workspace is rebuilding language environments, not checkout.
 
-`knives start` always bases new work on the **fetched trunk** (defaulting to `main`), never on the current `@`. That single default removes the most common accident: an agent sitting in a release workspace runs `jj new` and silently inherits the release merge as a parent.
+`knives start` bases new work on the release's **shared base** when a release exists, falling back to the fetched trunk when none does, never on the current `@`. That preserves the shared-base invariant while preventing an agent in a release workspace from running `jj new` and inheriting the release merge as a parent.
 
 ### `knives release`
 

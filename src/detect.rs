@@ -33,6 +33,8 @@ pub enum FindingKind {
     WrongBase,
     ChecksFailing,
     CarriedElsewhere,
+    MixedBase,
+    SupersededBase,
 }
 
 impl fmt::Display for FindingKind {
@@ -49,6 +51,8 @@ impl fmt::Display for FindingKind {
             Self::ClaimOverlap => "claim-overlap",
             Self::BranchOverlap => "branch-overlap",
             Self::CarriedElsewhere => "carried-elsewhere",
+            Self::MixedBase => "mixed-base",
+            Self::SupersededBase => "superseded-base",
         };
         f.write_str(text)
     }
@@ -147,6 +151,8 @@ mod tests {
             FindingKind::WrongBase => "wrong-base",
             FindingKind::ChecksFailing => "checks-failing",
             FindingKind::CarriedElsewhere => "carried-elsewhere",
+            FindingKind::MixedBase => "mixed-base",
+            FindingKind::SupersededBase => "superseded-base",
         }
     }
 
@@ -166,6 +172,8 @@ mod tests {
             FindingKind::WrongBase,
             FindingKind::ChecksFailing,
             FindingKind::CarriedElsewhere,
+            FindingKind::MixedBase,
+            FindingKind::SupersededBase,
         ];
         // When: each is rendered
         let labels: Vec<String> = kinds

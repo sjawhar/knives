@@ -257,6 +257,10 @@ pub enum ReleaseAction {
     Cut {
         /// The dated release name. Omit it for a configured fixed release branch.
         name: Option<String>,
+        /// Proceed even when commits reachable only from the previous release
+        /// lineage would be dropped. The refusal lists exactly what.
+        #[arg(long)]
+        allow_drop: bool,
     },
     /// Add an upstream commit to the release in hand, keeping its branch parents.
     ///
@@ -294,6 +298,15 @@ pub enum ReleaseAction {
         #[arg(long)]
         why: Option<String>,
     },
+    /// Reap superseded dated cuts: forget their bookmarks everywhere, abandon their commits.
+    /// The remote is never touched.
+    ///
+    /// Runs automatically after every cut; exists standalone for pre-knives repos carrying
+    /// years of historical refs, and as the unlock when a rebase needs old-lineage commits
+    /// mutable (superseded release refs are immutable heads, and they freeze every member
+    /// commit in their ancestry). A later fetch re-materializes forgotten refs as untracked;
+    /// re-run to clear them.
+    Reap,
 }
 
 #[cfg(test)]
@@ -378,6 +391,7 @@ mod tests {
             vec!["knives", "release", "cut"],
             vec!["knives", "release", "cut", "2026-08-01"],
             vec!["knives", "release", "rebase"],
+            vec!["knives", "release", "reap"],
             vec!["knives", "release", "include", "feat/x"],
             vec!["knives", "release", "drop", "feat/y"],
             vec!["knives", "depends", "a-branch", "--on", "other#1"],

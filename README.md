@@ -142,7 +142,7 @@ are somewhere else.
 | `knives start` / `finish` | take a branch and get your own workspace, then hand it back |
 | `knives track` | state which pull request a branch belongs to, when inference cannot find it |
 | `knives depends` | record that a branch cannot land before another repo's pull request |
-| `knives release` | plan a release, or cut one |
+| `knives release` | plan a release, cut one, or reap superseded cuts |
 | `knives init` | register a checkout |
 | `knives hook` | harness plumbing, not for humans |
 | `knives gh` | fork-aware `gh` passthrough |
@@ -170,6 +170,13 @@ Escape hatches:
 * `KNIVES_GH_BYPASS` on the shim bypasses `knives gh` entirely.
 * `KNIVES_REAL_GH` points `knives gh` at a specific real `gh` binary.
 
+## Release workflow
+
+`knives release cut` verifies that no commits exist reachable only from the previous release lineage or its descendants. If commits would be stranded without a remaining bookmark or upstream trunk reaching them, the cut refuses and lists the exact commit IDs. Passing `--allow-drop` overrides this refusal when dropping those commits from the new release line is intentional.
+
+After creating candidate merge commits, `knives release cut` audits the merge tree before assigning the release bookmark. The audit replays each member branch net diff against the candidate cut tree to ensure no carried content was lost in an auto-merge or lockfile resolution, and checks for unexplained diff drift against the previous release. Any audit failure abandons the candidate merge without moving bookmarks or altering published state.
+
+`knives release reap` cleans up superseded dated release bookmarks by forgetting their refs locally and across tracking remotes before abandoning their merge commits. Reaping also runs automatically after every successful dated cut. It never modifies remote repositories; subsequent fetches may re-materialize forgotten remote refs as untracked bookmarks, which is harmless and cleared by the next reap.
 ## For agents
 
 An agent working in a fork does not receive that fork's `AGENTS.md`, because instruction

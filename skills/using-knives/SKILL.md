@@ -95,7 +95,7 @@ The facts you need before contributing upstream: convention files present and wh
 
 ### `knives start <branch>` and `knives finish <branch>`
 
-`start` claims the branch and opens a jj workspace for it, based on the fetched upstream trunk rather than wherever `@` happens to be. An agent sitting in a release workspace who runs `jj new` silently inherits the release merge as a parent.
+`start` claims the branch and opens a jj workspace for it, based on the release's shared base (or fetched upstream trunk if no release exists) rather than wherever `@` happens to be. An agent sitting in a release workspace who runs `jj new` silently inherits the release merge as a parent.
 
 `finish` hands the claim back and removes the workspace. No work is lost: jj snapshots a working copy into a commit, so it is in the repository and reachable by change id. `--no-cleanup` keeps the directory, which matters only for files jj never tracked, such as build output or an untracked `.env`. `--superseded-by <branch>` records where the work went.
 
@@ -123,13 +123,15 @@ A release cut is a flat octopus merge combining the tips of all maintained branc
 
 #### Scheme variants
 
-- Dated scheme (default, when `release_branch` is absent): cuts create a new dated branch named `release/YYYY-MM-DD` (or `.1`, `.2` for repair cuts). Cutting requires an explicit name argument: `knives release cut release/YYYY-MM-DD`.
+- Dated scheme (default, when `release_branch` is absent): cuts create a new dated branch named `release/YYYY-MM-DD` (or `.1`, `.2` for repair cuts). Cutting requires an explicit name argument: `knives release cut release/YYYY-MM-DD`. Use `--allow-drop` if intentionally dropping stranded commits from the previous release line.
 - Fixed scheme (when `release_branch = "<name>"` is set): cuts rebuild the flat octopus merge and advance the configured release branch in place using jj's internal `--allow-backwards` mechanism. Cutting needs no name argument (`knives release cut` alone); passing a dated name is refused. The previous release position is read from the publish remote (`release` when set in the entry, falling back to `origin`).
 
 #### Release subcommands and options
 
-- `knives release rebase [REF]`: adds an upstream commit (defaulting to upstream's trunk) to the release in hand, keeping its branch parents — it does not re-cut. For when a pull request has merged upstream: until the release contains the commit that merge landed in, dropping the local branch takes the change out of the release with it. Whether this can happen in place or needs a new dated name follows from consumer pin state (a consumer following the branch sees a repair; one frozen on a revision does not). A permitted in-place repair rebuilds the flat merge and moves the release bookmark, including when jj considers that move sideways; integration coverage verifies that parent topology is retained.
-- `knives release include <branch> --why "..."` and `knives release drop <branch> --why "..."`: state whether a branch belongs in the next release. Membership is every branch until anything is stated, after which membership is **exactly** what was stated — stating one `include` or `drop` converts the cut from "all branches" to "only stated branches". `drop` records the reason so subsequent cuts do not re-include the branch.
+- `knives release cut [NAME] [--allow-drop]`: cuts a release after checking for orphaned commits and auditing content. `--allow-drop` overrides the pre-cut gate if dropping stranded commits from the previous release lineage is intended.
+- `knives release reap`: reaps superseded dated release bookmarks by forgetting their refs locally and across tracking remotes, then abandoning their merge commits. Reaping also runs automatically after every successful dated cut and never modifies remote repositories.
+- `knives release rebase [REF]`: replaces the superseded base (defaulting to upstream's trunk), never accumulating bases. It retains parents held by a live branch bookmark and refuses an unheld stale parent with `Incomplete`; fix the branch or drop it first. The repair duplicates the previous release onto that parent set, preserving conflict resolutions instead of building a fresh merge. Whether this can happen in place or needs a new dated name follows from consumer pin state (a consumer following the branch sees a repair; one frozen on a revision does not).
+- `knives release include <branch> --why "..."` and `knives release drop <branch> --why "..."`: state whether a branch belongs in the next release. Membership is every branch until anything is stated, after which membership is **exactly** what was stated: stating one `include` or `drop` converts the cut from "all branches" to "only stated branches". `drop` records the reason so subsequent cuts do not re-include the branch.
 - `knives release --consumer <DIR>`: scans an extra consumer checkout directory alongside any consumers recorded in `repos.toml`. Repeatable (`--consumer <DIR1> --consumer <DIR2>`), because a fork can be consumed by several checkouts sitting on different releases.
 
 ### `knives register [DIR]`

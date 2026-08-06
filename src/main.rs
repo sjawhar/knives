@@ -2,7 +2,7 @@
 //!
 //! Dispatch only. Every command owns its own logic and returns an [`Exit`], so
 //! this file never grows a decision.
-// allow: SIZE_OK: 735 lines - dispatch-only, splitting would scatter the exhaustive match.
+// allow: SIZE_OK: 1070 lines - dispatch-only, splitting would scatter the exhaustive match.
 
 use std::process::ExitCode;
 
@@ -159,14 +159,15 @@ fn dispatch_release(
 ) -> anyhow::Result<Exit> {
     match action {
         None => run_release(chosen.as_str(), extra_consumers, &ReleaseInvocation::Plan),
-        Some(ReleaseAction::Cut { name }) => run_release(
+        Some(ReleaseAction::Cut { name, allow_drop }) => run_release(
             chosen.as_str(),
             extra_consumers,
-            &ReleaseInvocation::Cut(name),
+            &ReleaseInvocation::Cut { name, allow_drop },
         ),
         Some(ReleaseAction::Rebase { reference }) => {
             run_rebase(chosen.as_str(), reference.as_deref())
         }
+        Some(ReleaseAction::Reap) => run_reap(chosen.as_str()),
         Some(ReleaseAction::Include { branch, why }) => run_membership(
             &BranchTarget::new(chosen, BranchName::new(branch)),
             Membership::In(why),
@@ -178,7 +179,7 @@ fn dispatch_release(
     }
 }
 
-/// Add an upstream commit to the release in hand, keeping its branch parents.
+/// Replace superseded release bases with an upstream commit, keeping branch parents.
 ///
 /// A cut deliberately does not do this: which upstream commit a release should contain,
 /// and whether to move it at all, is a judgment. What this exists for is the case where a
@@ -189,6 +190,7 @@ fn run_rebase(name: &str, reference: Option<&str>) -> anyhow::Result<Exit> {
         Ok(list) => list,
         Err(exit) => return Ok(exit),
     };
+    let mut worst = Exit::Ok;
     for (repo, entry) in chosen {
         let reference = reference.map_or_else(|| entry.upstream_trunk(), str::to_owned);
         let opened = knives::jj::Repo::open(&entry.path)?;
@@ -198,32 +200,112 @@ fn run_rebase(name: &str, reference: Option<&str>) -> anyhow::Result<Exit> {
             continue;
         };
         let onto = opened.resolve_commit(&reference)?;
-        let parents = opened.parents_of(&release_name)?;
-        if parents.iter().any(|parent| parent.commit == onto) {
+        let release_commit = opened.resolve_commit(&release_name)?;
+        // Ancestry, not parent identity: a commit already reachable through a
+        // parent's history is contained, and adding it again grows the octopus.
+        if opened.is_ancestor(&onto, &release_commit)? {
             println!("{repo}: {release_name} already contains {reference}");
             continue;
         }
         // Follows from who pins it, rather than from an opinion: a consumer that follows
         // the branch sees a repair in place, one frozen on the revision does not.
+        let scheme = entry.release_scheme();
         if release::repair_effect(&plan.pins) == release::RepairEffect::NewDatedName {
-            println!(
-                "{repo}: every pin of {release_name} is frozen, so moving it would reach \
-                 nobody; cut a new dated release instead"
-            );
+            match &scheme {
+                ReleaseScheme::Dated => println!(
+                    "{repo}: every pin of {release_name} is frozen, so moving it would reach \
+                     nobody; cut a new dated release instead"
+                ),
+                ReleaseScheme::Fixed(_) => println!(
+                    "{repo}: every pin of {release_name} is frozen, so moving the fixed branch \
+                     would reach nobody; update the frozen consumer pins, or change the release \
+                     scheme before advancing it (fixed branches cannot reach revision pins)"
+                ),
+            }
+            worst = worst.worst(Exit::Incomplete);
             continue;
         }
-        let mut carried: Vec<_> = parents.iter().map(|parent| parent.commit.clone()).collect();
+        let parents = opened.parents_of(&release_name)?;
+        let tips = opened.bookmark_tips()?;
+        let mut carried: Vec<knives::ids::CommitId> = Vec::new();
+        let mut replaced = 0usize;
+        for parent in &parents {
+            // Oracle amendment: a parent HELD by a live branch bookmark is kept
+            // even when onto already reaches it — a landed branch remains a
+            // member with its parent and provenance intact (spec 1.7 "keeping
+            // branch parents"; dropping members is `release drop`'s job, never
+            // the rebase's). Held = any bookmark still pointing at the parent
+            // whose branch is neither a release name nor the trunk.
+            let held = parent.bookmarks.iter().any(|reference| {
+                tips.get(reference) == Some(&parent.commit)
+                    && !knives::ids::is_release_name(reference.branch(), &scheme)
+                    && reference.branch().as_str() != entry.trunk()
+            });
+            if held {
+                carried.push(parent.commit.clone());
+                continue;
+            }
+            // Ancestry, not parent identity: an unheld parent reachable through
+            // the replacement's history is a superseded base, even when it is
+            // not a direct parent of that replacement.
+            if opened.is_ancestor(&parent.commit, &onto)? {
+                replaced += 1;
+                continue;
+            }
+
+            let no_bookmark = if parent.bookmarks.is_empty() {
+                "; no bookmark points at it"
+            } else {
+                ""
+            };
+            let moved = stale_parent_moved_branches(&entry, &scheme, &parent.commit)?;
+            let moved = moved.map_or_else(String::new, |moved| format!("; moved tip(s): {moved}"));
+            eprintln!(
+                "{repo}: refusing to rebase {release_name}: parent {} is stale{no_bookmark}{moved}. \
+                 Fix the branch or drop it from the release, then re-run; carrying it could ship \
+                 pre-rewrite code.",
+                parent.commit.as_str().chars().take(12).collect::<String>(),
+            );
+            return Ok(Exit::Incomplete);
+        }
         carried.push(onto.clone());
         let message = format!("chore(release): {release_name} rebased onto {reference}");
-        let created = knives::jj::create_merge(&entry.path, &carried, &message)?;
+        // #12: the repair is the OLD release duplicated onto the new parent set,
+        // never a from-scratch merge — prior conflict resolutions carry over, so
+        // a rebase surfaces only conflicts the new base itself introduces.
+        let duplicated = knives::jj::duplicate_onto(&entry.path, &release_commit, &carried)?;
+        let created = knives::jj::describe_commit(&entry.path, &duplicated, &message)?;
         knives::jj::set_bookmark_anywhere(&entry.path, &release_name, created.as_str())?;
         println!(
-            "{repo}: {release_name} now contains {reference} ({}), keeping its {} branch parent(s)",
+            "{repo}: {release_name} now contains {reference} ({}), {} base parent(s) replaced, \
+             {} branch parent(s) kept",
             &onto.as_str()[..12.min(onto.as_str().len())],
-            parents.len()
+            replaced,
+            carried.len() - 1
         );
     }
-    Ok(Exit::Ok)
+    Ok(worst)
+}
+
+fn stale_parent_moved_branches(
+    entry: &knives::config::RepoEntry,
+    scheme: &ReleaseScheme,
+    parent: &knives::ids::CommitId,
+) -> Result<Option<String>, knives::jj::JjError> {
+    let moved = knives::jj::branches_past(&entry.path, parent)?;
+    let moved: Vec<String> = moved
+        .into_iter()
+        .filter(|(branch, _)| {
+            !knives::ids::is_release_name(branch, scheme) && branch.as_str() != "@git"
+        })
+        .map(|(branch, tip)| {
+            format!(
+                "{branch} (now {})",
+                tip.as_str().chars().take(12).collect::<String>()
+            )
+        })
+        .collect();
+    Ok((!moved.is_empty()).then(|| moved.join(", ")))
 }
 
 /// What was stated about a branch's place in the next release.
@@ -487,7 +569,10 @@ fn run_status(requested: Option<&str>, view: StatusView) -> anyhow::Result<Exit>
 
 enum ReleaseInvocation {
     Plan,
-    Cut(Option<String>),
+    Cut {
+        name: Option<String>,
+        allow_drop: bool,
+    },
 }
 
 fn run_release(
@@ -510,40 +595,17 @@ fn run_release(
         consumers.extend(extra_consumers.iter().map(|path| path.to_path_buf()));
         let opened = knives::jj::Repo::open(&entry.path)?;
         let scheme = entry.release_scheme();
-        let cut_name = match invocation {
-            ReleaseInvocation::Plan => None,
-            ReleaseInvocation::Cut(requested) => {
-                match release::cut_name(&scheme, requested.as_deref()) {
-                    Ok(name) => Some(name),
-                    Err(message) => {
-                        eprintln!("{message}");
-                        return Ok(Exit::Usage);
-                    }
-                }
-            }
+        let (cut_name, allow_drop) = match requested_cut(invocation, &scheme) {
+            Ok(request) => request,
+            Err(exit) => return Ok(exit),
         };
-        let plan = release::plan(&repo, &entry, &consumers)?;
-        println!("{}", release::render(&plan));
-        if let Some(lag) =
-            release::trunk_lag(&opened, plan.release.as_deref(), &entry.upstream_trunk())
-        {
-            println!("  !! {lag}");
-        }
-        worst = worst.worst(release::exit_for(&plan));
+        worst = worst.worst(release_plan_exit(&repo, &entry, &consumers, &opened)?);
 
         // What the plan said it would include, so a cut cannot quietly differ from it.
         let all = release::carried_branches(&opened, entry.trunk(), &scheme)?;
         let names: Vec<String> = all.iter().map(|(branch, _)| branch.clone()).collect();
         let (chosen, left_out) = store.release_membership(&repo, &names);
-        if !left_out.is_empty() {
-            println!(
-                "{repo}: {} branch(es) left out of the release",
-                left_out.len()
-            );
-            for (branch, why) in &left_out {
-                println!("  {branch}  {why}");
-            }
-        }
+        report_left_out(&repo, &left_out);
         if let Some(name) = cut_name {
             let mut carried: Vec<_> = all
                 .iter()
@@ -556,62 +618,320 @@ fn run_release(
             // merge commit lived upstream and had never been merged in here.
             let trunk_name = entry.upstream_trunk();
             let trunk = opened.resolve_commit(&trunk_name)?;
-            carried.insert(0, (trunk_name, trunk));
-            let request = release::Cut {
-                name: name.clone(),
-                parents: carried.iter().map(|(_, commit)| commit.clone()).collect(),
-                provenance: carried
-                    .iter()
-                    .map(|(branch, commit)| (commit.clone(), branch.clone()))
-                    .collect(),
+            carried.insert(0, (trunk_name, trunk.clone()));
+            if let Some(orphaned) = check_orphan_commits_before_cut(&opened, &entry, trunk.clone())?
+                && let Some(exit) = report_orphaned_cut(&repo, &orphaned, allow_drop)
+            {
+                return Ok(exit);
+            }
+            let request = cut_request(name.clone(), &carried);
+            let previous_commit =
+                release::previous_release_for_cut(&opened, &entry, &opened.bookmark_tips()?)
+                    .map(|(_, commit)| commit);
+            let created = release::build_cut(&entry.path, &request, previous_commit.as_ref())?;
+            let member_tips: Vec<_> = carried.iter().skip(1).cloned().collect();
+            let audit = match release::audit_cut(
+                &entry.path,
+                &member_tips,
+                &created,
+                release::AuditContext {
+                    previous: previous_commit.as_ref(),
+                    trunk: &trunk,
+                },
+            ) {
+                Ok(audit) => audit,
+                Err(error) => {
+                    let _ =
+                        knives::jj::abandon_commits(&entry.path, std::slice::from_ref(&created));
+                    return Err(error);
+                }
             };
-            let created = release::cut(&entry.path, &request, &scheme)?;
-            print_previous_release_position(&opened, &entry);
-            println!(
-                "  cut {name} as {} with {} parent(s), flat, not pushed",
-                created.as_str().chars().take(12).collect::<String>(),
-                request.parents.len()
-            );
-
-            match knives::jj::conflicted_files(&entry.path, created.as_str()) {
-                Ok(files) => println!("{}", release::conflict_guidance(&files)),
-                Err(error) => println!("  could not list conflicts: {error}"),
-            }
-
-            // A merged total below one branch's own count means the cut dropped
-            // that branch's tests, which is silent: everything still compiles
-            // and the suite still passes, just with less in it.
-            if let Some(first) = request.parents.first() {
+            for name in &audit.inconclusive {
                 println!(
-                    "{}",
-                    release::check_test_count(&entry.path, &entry, &created, first).render()
+                    "  {name}: content check inconclusive (replay conflicted; \
+                     re-check after resolving the cut's conflicts)"
                 );
             }
-
-            // Workspaces for branches this cut did not carry. Reported, never
-            // deleted: they may hold uncommitted work, and this tool does not
-            // remove another agent's checkout on its own initiative.
-            let present: Vec<String> = opened
-                .workspaces()?
-                .into_iter()
-                .map(|(workspace, _)| workspace.to_string())
-                .collect();
-            let carried_names: Vec<String> =
-                carried.iter().map(|(branch, _)| branch.clone()).collect();
-            let orphans = release::workspaces_to_clean(&present, &carried_names);
-            if orphans.is_empty() {
-                println!("  no workspaces left by dropped branches");
-            } else {
+            if !audit.passed() {
+                for name in &audit.missing {
+                    println!(
+                        "  !! {name}: the cut tree is missing or diverges from the member's content"
+                    );
+                }
+                for file in &audit.unexplained {
+                    println!(
+                        "  !! {file}: changed between the previous release and this cut \
+                         with no member or trunk explaining it"
+                    );
+                }
+                knives::jj::abandon_commits(&entry.path, std::slice::from_ref(&created))?;
                 println!(
-                    "  {} workspace(s) belong to branches this cut dropped: {}",
-                    orphans.len(),
-                    orphans.join(", ")
+                    "{repo}: cut abandoned; nothing was named or pushed. Fix the inputs and re-cut."
                 );
-                println!("  remove with `jj workspace forget <name>` once you have checked them");
+                return Ok(Exit::Incomplete);
             }
+            release::name_cut(&entry.path, &request.name, &created, &scheme)?;
+            worst = worst.worst(report_completed_cut(
+                &repo,
+                &entry,
+                &opened,
+                &CompletedCut {
+                    name: &name,
+                    request: &request,
+                    carried: &carried,
+                    created: &created,
+                    audit: &audit,
+                },
+            )?);
         }
     }
     Ok(worst)
+}
+
+fn requested_cut(
+    invocation: &ReleaseInvocation,
+    scheme: &knives::ids::ReleaseScheme,
+) -> Result<(Option<String>, bool), Exit> {
+    match invocation {
+        ReleaseInvocation::Plan => Ok((None, false)),
+        ReleaseInvocation::Cut { name, allow_drop } => {
+            match release::cut_name(scheme, name.as_deref()) {
+                Ok(name) => Ok((Some(name), *allow_drop)),
+                Err(message) => {
+                    eprintln!("{message}");
+                    Err(Exit::Usage)
+                }
+            }
+        }
+    }
+}
+
+fn release_plan_exit(
+    repo: &RepoName,
+    entry: &knives::config::RepoEntry,
+    consumers: &[std::path::PathBuf],
+    opened: &knives::jj::Repo,
+) -> anyhow::Result<Exit> {
+    let plan = release::plan(repo, entry, consumers)?;
+    println!("{}", release::render(&plan));
+    let mut exit = release::exit_for(&plan);
+    if let Some(lag) = release::trunk_lag(opened, plan.release.as_deref(), &entry.upstream_trunk())
+    {
+        println!("  !! {lag}");
+        exit = exit.worst(Exit::Findings);
+    }
+    Ok(exit)
+}
+
+fn report_left_out(repo: &RepoName, left_out: &[(String, String)]) {
+    if left_out.is_empty() {
+        return;
+    }
+    println!(
+        "{repo}: {} branch(es) left out of the release",
+        left_out.len()
+    );
+    for (branch, why) in left_out {
+        println!("  {branch}  {why}");
+    }
+}
+
+struct CompletedCut<'a> {
+    name: &'a str,
+    request: &'a release::Cut,
+    carried: &'a [(String, knives::ids::CommitId)],
+    created: &'a knives::ids::CommitId,
+    audit: &'a release::CutAudit,
+}
+
+fn report_completed_cut(
+    repo: &RepoName,
+    entry: &knives::config::RepoEntry,
+    opened: &knives::jj::Repo,
+    cut: &CompletedCut<'_>,
+) -> anyhow::Result<Exit> {
+    let mut post_cut_exit = if cut.audit.inconclusive.is_empty() {
+        Exit::Ok
+    } else {
+        Exit::Findings
+    };
+    print_previous_release_position(opened, entry);
+    println!(
+        "  cut {} as {} with {} parent(s), flat, not pushed",
+        cut.name,
+        cut.created.as_str().chars().take(12).collect::<String>(),
+        cut.request.parents.len()
+    );
+    match knives::jj::conflicted_files(&entry.path, cut.created.as_str()) {
+        Ok(files) => println!("{}", release::conflict_guidance(&files)),
+        Err(error) => println!("  could not list conflicts: {error}"),
+    }
+    if let Some(first) = cut.request.parents.first() {
+        let test_count = release::check_test_count(&entry.path, entry, cut.created, first);
+        println!("{}", test_count.render());
+        if matches!(test_count, release::TestCountCheck::Dropped { .. }) {
+            post_cut_exit = post_cut_exit.worst(Exit::Findings);
+        }
+    }
+    let present: Vec<String> = opened
+        .workspaces()?
+        .into_iter()
+        .map(|(workspace, _)| workspace.to_string())
+        .collect();
+    let carried_names: Vec<String> = cut
+        .carried
+        .iter()
+        .map(|(branch, _)| branch.clone())
+        .collect();
+    let orphans = release::workspaces_to_clean(&present, &carried_names);
+    if orphans.is_empty() {
+        println!("  no workspaces left by dropped branches");
+    } else {
+        println!(
+            "  {} workspace(s) belong to branches this cut dropped: {}",
+            orphans.len(),
+            orphans.join(", ")
+        );
+        println!("  remove with `jj workspace forget <name>` once you have checked them");
+    }
+    Ok(post_cut_exit.worst(reap_after_cut(repo, entry)?))
+}
+
+struct OrphanedLineage {
+    previous: String,
+    commits: Vec<knives::ids::CommitId>,
+}
+
+fn report_orphaned_cut(
+    repo: &RepoName,
+    orphaned: &OrphanedLineage,
+    allow_drop: bool,
+) -> Option<Exit> {
+    if allow_drop {
+        println!(
+            "{repo}: --allow-drop: dropping {} commit(s) from the old lineage",
+            orphaned.commits.len()
+        );
+        return None;
+    }
+    println!(
+        "{repo}: refusing to cut: {} commit(s) are reachable only from \
+         {} or its descendants and would be dropped:",
+        orphaned.commits.len(),
+        orphaned.previous
+    );
+    for commit in &orphaned.commits {
+        println!(
+            "    {}",
+            commit.as_str().chars().take(12).collect::<String>()
+        );
+    }
+    println!("  re-run with --allow-drop to state this is intended");
+    Some(Exit::Incomplete)
+}
+
+fn check_orphan_commits_before_cut(
+    opened: &knives::jj::Repo,
+    entry: &knives::config::RepoEntry,
+    trunk: knives::ids::CommitId,
+) -> anyhow::Result<Option<OrphanedLineage>> {
+    let scheme = entry.release_scheme();
+    let tips = opened.bookmark_tips()?;
+    let Some(previous) = release::previous_release_for_cut(opened, entry, &tips) else {
+        return Ok(None);
+    };
+    let mut keep: Vec<knives::ids::CommitId> = tips
+        .iter()
+        .filter_map(|(reference, commit)| match reference {
+            knives::ids::BookmarkRef::Local(branch)
+                if !knives::ids::is_release_name(branch, &scheme) =>
+            {
+                Some(commit.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    keep.push(trunk);
+    let orphans = release::orphaned_commits(&entry.path, &previous.1, &keep, &tips)?;
+    if orphans.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(OrphanedLineage {
+        previous: previous.0,
+        commits: orphans,
+    }))
+}
+
+fn cut_request(name: String, carried: &[(String, knives::ids::CommitId)]) -> release::Cut {
+    release::Cut {
+        name,
+        parents: carried.iter().map(|(_, commit)| commit.clone()).collect(),
+        provenance: carried
+            .iter()
+            .map(|(branch, commit)| (commit.clone(), branch.clone()))
+            .collect(),
+    }
+}
+
+/// Reap superseded dated cuts now that a newer one exists.
+///
+/// Under `Fixed` the enumeration is empty by construction (no dated names), so
+/// this is a no-op there. Opens the repository again deliberately: the caller's
+/// handle predates the cut and reads stale tips, under which the superseded cut
+/// is still the newest dated name and nothing is reaped at all.
+fn reap_after_cut(repo: &RepoName, entry: &knives::config::RepoEntry) -> anyhow::Result<Exit> {
+    let reopened = knives::jj::Repo::open(&entry.path)?;
+    let report = release::reap_superseded(&entry.path, &reopened)?;
+    print_reap(&repo.to_string(), &report);
+    Ok(reap_exit(&report))
+}
+
+/// Reap superseded dated cuts on demand.
+fn run_reap(name: &str) -> anyhow::Result<Exit> {
+    let chosen = match selected(Some(name), false)? {
+        Ok(list) => list,
+        Err(exit) => return Ok(exit),
+    };
+    let mut worst = Exit::Ok;
+    for (repo, entry) in chosen {
+        let opened = knives::jj::Repo::open(&entry.path)?;
+        let report = release::reap_superseded(&entry.path, &opened)?;
+        print_reap(&repo.to_string(), &report);
+        worst = worst.worst(reap_exit(&report));
+    }
+    Ok(worst)
+}
+
+/// Return a finding when reaping leaves work or reports an incomplete cleanup.
+///
+/// `reap_superseded` records every `forgotten_only` entry with a corresponding
+/// note, so `notes` covers that state without a redundant condition here.
+const fn reap_exit(report: &knives::commands::release::ReapReport) -> Exit {
+    if report.kept.is_empty() && report.notes.is_empty() {
+        Exit::Ok
+    } else {
+        Exit::Findings
+    }
+}
+
+fn print_reap(repo: &str, report: &knives::commands::release::ReapReport) {
+    if report.reaped.is_empty() && report.forgotten_only.is_empty() && report.kept.is_empty() {
+        println!("{repo}: nothing to reap");
+    }
+    for name in &report.reaped {
+        println!(
+            "{repo}: reaped {name} (refs forgotten everywhere, commit abandoned; remote untouched)"
+        );
+    }
+    for name in &report.forgotten_only {
+        println!("{repo}: {name}: refs forgotten; commit abandon refused (see note)");
+    }
+    for (name, reason) in &report.kept {
+        println!("{repo}: kept {name}: {reason}");
+    }
+    for note in &report.notes {
+        println!("{repo}: ! {note}");
+    }
 }
 
 fn print_previous_release_position(opened: &knives::jj::Repo, entry: &knives::config::RepoEntry) {

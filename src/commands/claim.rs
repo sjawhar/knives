@@ -3,7 +3,7 @@
 //! Enforcement layer three. Advisory on purpose: layers one and two are
 //! default-correct paths and detectors, and hard refusal waits for evidence
 //! that advice was insufficient.
-// allow: SIZE_OK: 291 lines - claim coordination keeps owner-resolution behavior beside branch claim outcomes.
+// allow: SIZE_OK: 292 lines - claim coordination keeps owner-resolution behavior beside branch claim outcomes.
 
 use crate::cli::Exit;
 use crate::config::{Registry, default_config_path, load};
