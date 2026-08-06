@@ -116,6 +116,7 @@ fn dispatch() -> anyhow::Result<Exit> {
                 consumer.iter().map(std::path::PathBuf::as_path).collect();
             dispatch_release(chosen, action, &extra)
         }
+        Command::Gh { args } => match knives::commands::gh::run(&args)? {},
     }
 }
 

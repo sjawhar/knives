@@ -230,6 +230,19 @@ pub enum Command {
         #[arg(long)]
         consumer: Vec<PathBuf>,
     },
+    /// Run the real gh with fork-aware fixes applied. Plumbing for the gh shim.
+    ///
+    /// Three fixes, in order: export a GitHub-App token for the repo the
+    /// invocation targets (when git's credential config routes it to
+    /// `gh-app-token`), compensate for jj's detached HEAD on `gh pr`
+    /// subcommands that need a current branch, then exec the real gh. Output
+    /// and exit code are gh's own, untouched. The `--` is required so gh's
+    /// flags (its own --json among them) are never parsed as ours.
+    Gh {
+        /// Everything after `--`, passed to gh verbatim.
+        #[arg(last = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -316,6 +329,39 @@ mod tests {
     }
 
     #[test]
+    fn gh_passthrough_keeps_ghs_own_flags_after_the_separator() {
+        // Given: a gh invocation whose flags collide with our globals (--json).
+        let cli = Cli::try_parse_from([
+            "knives",
+            "gh",
+            "--",
+            "pr",
+            "list",
+            "--json",
+            "state",
+            "-R",
+            "acme/work",
+        ])
+        .expect("parse");
+        // Then: everything after -- arrives verbatim, and OUR json flag is unset.
+        let Command::Gh { args } = cli.command else {
+            panic!("parsed into the wrong command");
+        };
+        assert_eq!(
+            args,
+            vec!["pr", "list", "--json", "state", "-R", "acme/work"]
+        );
+        assert!(!cli.json, "gh's --json leaked into the global flag");
+    }
+
+    #[test]
+    fn gh_without_the_separator_takes_no_arguments() {
+        // Given: a gh invocation without its required separator.
+        // When / Then: clap refuses to guess where its arguments begin.
+        assert!(Cli::try_parse_from(["knives", "gh", "pr", "list"]).is_err());
+    }
+
+    #[test]
     fn every_designed_command_is_reachable() {
         // Given: the command surface from the design, with minimum arguments
         let invocations: Vec<Vec<&str>> = vec![
@@ -336,6 +382,7 @@ mod tests {
             vec!["knives", "release", "drop", "feat/y"],
             vec!["knives", "depends", "a-branch", "--on", "other#1"],
             vec!["knives", "track", "a-branch", "--pr", "7"],
+            vec!["knives", "gh", "--", "pr", "list"],
         ];
         // When / Then: each parses
         for argv in invocations {
