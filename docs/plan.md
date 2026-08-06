@@ -43,7 +43,7 @@ Confirmed against the live machine and real repositories, not recalled.
 | `jj` | 0.43.0, built from `sjawhar/jj` at `66c5253e` |
 | `jj-lib` on crates.io | 0.43.0, matching, but the fork is the pin |
 | `gh` / `cargo` / `rustc` | 2.96.0 / 1.97.1 / 1.97.1 |
-| `jj duplicate` | takes `--onto`, not `-d` |
+| `jj duplicate` | accepts repeated `-d` destinations |
 | `empty` and `conflict` | valid commit template keywords |
 | `divergent()` | a real revset, and the managed repos have divergence today |
 | `jj git push` | `-b` tracks a new bookmark; `--allow-new` does not exist at 0.43 |

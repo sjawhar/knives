@@ -132,6 +132,32 @@ pub fn is_release_name(branch: &BranchName, scheme: &ReleaseScheme) -> bool {
     }
 }
 
+/// Parse `release/YYYY-MM-DD[.N]`, the one shape our dated cuts take.
+///
+/// Stricter than [`is_release_name`] on purpose: the reaper enumerates release
+/// refs on any remote, where upstream's own `release/0.3.190` style branches
+/// also live, and a prefix test would hand those to `bookmark forget`. Returns
+/// the `(date, suffix)` ordering key so "newest" is one `max_by_key` away.
+/// The suffix follows `u32::from_str` semantics rather than strict digits, so
+/// leading `+` signs and zeroes parse; every such name is still ours by shape,
+/// leaving the reap safety property unaffected.
+pub fn strict_dated_release(name: &str) -> Option<(String, u32)> {
+    let bare = name.strip_prefix(RELEASE_PREFIX)?;
+    let (date, suffix) = match bare.split_once('.') {
+        Some((date, suffix)) => (date, suffix.parse::<u32>().ok()?),
+        None => (bare, 0),
+    };
+    let bytes = date.as_bytes();
+    let dated = bytes.len() == 10
+        && bytes.get(4) == Some(&b'-')
+        && bytes.get(7) == Some(&b'-')
+        && date
+            .bytes()
+            .enumerate()
+            .all(|(i, b)| matches!(i, 4 | 7) || b.is_ascii_digit());
+    dated.then(|| (date.to_owned(), suffix))
+}
+
 impl BookmarkRef {
     pub const fn branch(&self) -> &BranchName {
         match self {
@@ -226,6 +252,29 @@ mod tests {
         // A real branch that merely starts with the same letters is not a head.
         assert_eq!(pull_number_from_bookmark("pr-fix/thing"), None);
         assert_eq!(pull_number_from_bookmark("feat/alpha"), None);
+    }
+
+    #[test]
+    fn only_our_dated_shape_parses_as_a_dated_release() {
+        use super::strict_dated_release;
+        // Ours, with and without a same-day suffix.
+        assert_eq!(
+            strict_dated_release("release/2026-08-05"),
+            Some(("2026-08-05".to_owned(), 0))
+        );
+        assert_eq!(
+            strict_dated_release("release/2026-08-05.2"),
+            Some(("2026-08-05".to_owned(), 2))
+        );
+        // Upstream's semver release branches are NOT ours to reap.
+        assert_eq!(strict_dated_release("release/0.3.190"), None);
+        // Shape violations.
+        assert_eq!(strict_dated_release("release/"), None);
+        assert_eq!(strict_dated_release("release/2026-8-5"), None);
+        assert_eq!(strict_dated_release("release/2026-08-05."), None);
+        assert_eq!(strict_dated_release("release/2026-08-05.x"), None);
+        assert_eq!(strict_dated_release("release/2026-08-05.1.2"), None);
+        assert_eq!(strict_dated_release("feat/2026-08-05"), None);
     }
 
     use super::*;

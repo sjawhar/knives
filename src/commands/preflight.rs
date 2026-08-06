@@ -10,7 +10,7 @@ use std::path::Path;
 
 use crate::cli::Exit;
 use crate::config::RepoEntry;
-use crate::detect::{divergent_changes, stale_parents};
+use crate::detect::{Finding, divergent_changes, stale_parents};
 use crate::forge::{Forge, PullRequest};
 use crate::ids::{BookmarkRef, BranchName, RepoName, is_release_name};
 use crate::jj::Repo;
@@ -161,6 +161,7 @@ pub struct Report {
     /// when the probe was not run: the probe mutates, so it is opt-in, and
     /// "not checked" must never render as "not landed".
     pub branch_state: Vec<BranchState>,
+    pub findings: Vec<Finding>,
     pub notes: Vec<String>,
 }
 
@@ -229,8 +230,11 @@ pub fn gather(name: &RepoName, entry: &RepoEntry, store: &mut Store, forge: &dyn
     // The spec asks for claimed, stale, landed, or divergent. Everything but
     // landed is answerable read-only, so it is answered here; landed needs the
     // mutating probe and is reported as "not probed" rather than guessed.
-    match branch_states(entry, &claims) {
-        Ok(states) => report.branch_state = states,
+    match branch_states_with_findings(entry, &claims) {
+        Ok((states, findings)) => {
+            report.branch_state = states;
+            report.findings.extend(findings);
+        }
         Err(error) => report
             .notes
             .push(format!("branch state unavailable: {error}")),
@@ -244,11 +248,23 @@ pub fn branch_states(
     entry: &RepoEntry,
     claims: &[&crate::store::Claim],
 ) -> anyhow::Result<Vec<BranchState>> {
+    branch_states_with_findings(entry, claims).map(|(states, _)| states)
+}
+
+fn branch_states_with_findings(
+    entry: &RepoEntry,
+    claims: &[&crate::store::Claim],
+) -> anyhow::Result<(Vec<BranchState>, Vec<Finding>)> {
     let repo = Repo::open(&entry.path)?;
     let tips = repo.bookmark_tips()?;
     let scheme = entry.release_scheme();
+    let ignored: BTreeSet<crate::ids::BookmarkRef> =
+        crate::commands::release::superseded_dated_releases(&tips)
+            .into_iter()
+            .map(|(reference, _)| reference)
+            .collect();
     let divergent: std::collections::BTreeSet<String> =
-        divergent_changes(&repo.divergent_changes()?)
+        divergent_changes(&repo.divergent_changes(&ignored)?)
             .into_iter()
             .map(|finding| finding.subject.to_string())
             .collect();
@@ -307,7 +323,21 @@ pub fn branch_states(
             BookmarkRef::Local(_) | BookmarkRef::Remote { .. } => None,
         }
     }));
-    Ok(states)
+    let mut findings = Vec::new();
+    if let (Some((_, release)), Ok(trunk_tip)) = (
+        crate::commands::release::newest_release(&tips, &scheme, entry.publish_remote()),
+        repo.resolve_commit(&entry.upstream_trunk()),
+    ) && let Some(base) = crate::commands::release::shared_base(&repo, &release, &trunk_tip)?
+    {
+        let members = crate::commands::release::carried_from_tips(&tips, entry.trunk(), &scheme);
+        findings.extend(crate::commands::release::mixed_base_findings(
+            &entry.path,
+            &members,
+            &base,
+            &trunk_tip,
+        )?);
+    }
+    Ok((states, findings))
 }
 
 pub fn render(report: &Report) -> String {
@@ -343,16 +373,25 @@ pub fn render(report: &Report) -> String {
         lines.push("  branch state:".to_owned());
         lines.extend(report.branch_state.iter().map(BranchState::render));
     }
+    for finding in &report.findings {
+        lines.push(format!("  !! {}", finding.detail));
+    }
     lines.push("  judgment is not this command's job: run the pre-PR skill next".to_owned());
     lines.join("\n")
 }
 
 pub const fn exit_for(report: &Report) -> Exit {
-    if report.notes.is_empty() {
+    let notes = if report.notes.is_empty() {
         Exit::Ok
     } else {
         Exit::Incomplete
-    }
+    };
+    let findings = if report.findings.is_empty() {
+        Exit::Ok
+    } else {
+        Exit::Findings
+    };
+    notes.worst(findings)
 }
 
 /// Convenience for callers that only have a path.

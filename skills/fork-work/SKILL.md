@@ -64,8 +64,9 @@ has a knives command that does the same job safely:
   `knives start` and get a real workspace that other agents can see you are using.
 - **Do not start a branch in the default workspace of a managed fork.** Another agent may
   be working there. `knives start` gives you your own workspace and bases it on the
-  fetched upstream trunk, which also avoids silently inheriting a release merge as a
-  parent. This is about these shared forks specifically — branching normally in your own
+  release's shared base (or fetched upstream trunk if no release exists), which also avoids
+  silently inheriting a release merge as a parent. This is about these shared forks specifically,
+  branching normally in your own projects is fine.
   projects is fine.
 - **Do not `jj op restore`.** It discards other agents' operations along with your own
   mistake.

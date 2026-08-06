@@ -43,6 +43,30 @@ fn missing_flag_fields_default_independently() -> anyhow::Result<()> {
 }
 
 #[test]
+fn a_document_predating_owner_remotes_survives_update_and_reload() -> anyhow::Result<()> {
+    // Given: state written before `owner_remotes` existed.
+    let home = tempfile::tempdir()?;
+    let directory = home.path().join("hook-sessions");
+    std::fs::create_dir_all(&directory)?;
+    std::fs::write(
+        directory.join("claude-code-s1.json"),
+        r#"{"repos":{"/r":{"noticed":true,"guided":true}}}"#,
+    )?;
+
+    // When: the legacy record is updated, then loaded through the public API.
+    SessionState::update(home.path(), "claude-code", "s1", |state| {
+        state.mark(Path::new("/other"), true, false);
+    })?;
+    let state = SessionState::load(home.path(), "claude-code", "s1");
+
+    // Then: existing flags survive and the missing owner map remains absent.
+    assert!(state.repo(Path::new("/r")).noticed);
+    assert!(state.repo(Path::new("/r")).guided);
+    assert!(state.owner_remotes(Path::new("/r")).is_none());
+    Ok(())
+}
+
+#[test]
 fn a_legacy_owner_verdict_document_loads_without_reusing_its_verdict() -> anyhow::Result<()> {
     // Given: a session record written by the boolean owner-verdict cache.
     let home = tempfile::tempdir()?;

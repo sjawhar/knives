@@ -2,7 +2,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 use std::task::{Context, Poll, Waker};
 
 use jj_lib::backend::CommitId as JjCommitId;
@@ -21,6 +24,8 @@ use crate::ids::{
     BookmarkRef, BranchName, ChangeId, CommitId, ReleaseScheme, RemoteName, WorkspaceName,
     is_our_release, pull_number_from_bookmark,
 };
+
+static PROBE_BOOKMARK_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Error)]
 pub enum JjError {
@@ -213,9 +218,43 @@ impl Repo {
             .collect()
     }
 
-    pub fn divergent_changes(&self) -> Result<Vec<(ChangeId, CommitId)>, JjError> {
-        let mut changes = BTreeMap::<ChangeId, BTreeSet<CommitId>>::new();
+    /// One change existing as several visible commits, ignoring nominated refs.
+    ///
+    /// `ignored` names refs whose testimony does not count — in practice the
+    /// superseded dated releases, which any `jj git fetch` re-materializes as
+    /// untracked refs forever (they exist on the remote and jj keeps no memory of
+    /// forgetting them). A head every one of whose refs is ignored cannot vouch for
+    /// a divergent copy, which is only reported while some non-ignored head can reach it.
+    /// Filtering the reader instead of re-cleaning the graph is deliberate: the
+    /// repo must stay correct under bare fetches by any tool.
+    pub fn divergent_changes(
+        &self,
+        ignored: &BTreeSet<BookmarkRef>,
+    ) -> Result<Vec<(ChangeId, CommitId)>, JjError> {
+        let tips = self.bookmark_tips()?;
+        // Refs per commit, so "every ref on this head is ignored" is answerable.
+        let mut refs_at: BTreeMap<&CommitId, Vec<&BookmarkRef>> = BTreeMap::new();
+        for (reference, commit) in &tips {
+            refs_at.entry(commit).or_default().push(reference);
+        }
+        // Kept heads are the vouching authorities; enumeration walks all heads.
+        // An ignored-only head can still identify a change with copies reached by
+        // live heads, so excluding it here would erase that real divergence.
+        let mut kept_heads = Vec::new();
+        let mut all_heads: Vec<(CommitId, &JjCommitId)> = Vec::new();
         for head in self.repo.view().heads() {
+            let commit = commit_id(head);
+            let all_ignored = refs_at
+                .get(&commit)
+                .is_some_and(|refs| refs.iter().all(|reference| ignored.contains(reference)));
+            if !all_ignored {
+                kept_heads.push(commit.clone());
+            }
+            all_heads.push((commit, head));
+        }
+
+        let mut changes = BTreeMap::<ChangeId, BTreeSet<CommitId>>::new();
+        for (_, head) in &all_heads {
             let commit = self
                 .repo
                 .store()
@@ -235,7 +274,21 @@ impl Repo {
             {
                 let commits = changes.entry(change).or_default();
                 for (_, id) in targets.visible_with_offsets() {
-                    commits.insert(commit_id(id));
+                    let candidate = commit_id(id);
+                    // A copy only an ignored ref can reach does not count. Errors
+                    // propagate so an index failure cannot silently suppress a finding.
+                    let mut vouched = kept_heads.contains(&candidate);
+                    if !vouched {
+                        for kept in &kept_heads {
+                            if self.is_ancestor(&candidate, kept)? {
+                                vouched = true;
+                                break;
+                            }
+                        }
+                    }
+                    if vouched {
+                        commits.insert(candidate);
+                    }
                 }
             }
         }
@@ -398,12 +451,178 @@ pub fn probe_landed(
     branch: &BranchName,
     onto: &str,
 ) -> Result<RebaseOutcome, JjError> {
+    probe_revision(repo, onto, branch.as_str(), onto)
+}
+
+/// Replays the net tree effect of `base..revision` onto a target.
+///
+/// A scratch child of `base` is restored to `revision`'s tree, so its diff is the
+/// range's net effect by construction. That synthetic commit is then replayed onto
+/// `onto`; replaying each source commit directly manufactures conflicts when an
+/// intermediate commit is applied to a tree that already has the range's final
+/// content.
+pub fn probe_net_diff(
+    repo: &Path,
+    base: &str,
+    revision: &str,
+    onto: &str,
+) -> Result<RebaseOutcome, JjError> {
+    let repo_path = path(repo);
+    let range = format!("{base}..{revision}");
+    let range_commits = command(
+        "jj",
+        [
+            "--repository",
+            &repo_path,
+            "--ignore-working-copy",
+            "log",
+            "--no-graph",
+            "-r",
+            &range,
+            "-T",
+            "commit_id ++ \"\\n\"",
+        ],
+    )?;
+    if range_commits.trim().is_empty() {
+        return Ok(RebaseOutcome::Empty);
+    }
+    let mut cleanup = ProbeCleanup {
+        repo,
+        created: Vec::new(),
+        bookmarks: Vec::new(),
+    };
+    let probe_id = PROBE_BOOKMARK_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let synthetic_description = format!("knives probe net root {}-{probe_id}", std::process::id());
+    let (_, reported) = command_output(
+        "jj",
+        &[
+            "--repository",
+            &repo_path,
+            "--ignore-working-copy",
+            "new",
+            "--no-edit",
+            "-r",
+            base,
+            "-m",
+            &synthetic_description,
+        ],
+    )?;
+    let Some(synthetic) = parse_created(&reported) else {
+        recover_unreported_probe_root(repo, &synthetic_description, &mut cleanup)?;
+        return Err(JjError::ProbeRoot);
+    };
+    cleanup.created.push(synthetic.clone());
+    let bookmark = format!("knives-probe-net-{}-{}", std::process::id(), probe_id);
+    command(
+        "jj",
+        [
+            "--repository",
+            &repo_path,
+            "--ignore-working-copy",
+            "bookmark",
+            "create",
+            &bookmark,
+            "-r",
+            synthetic.as_str(),
+        ],
+    )?;
+    cleanup.bookmarks.push(bookmark.clone());
+    command(
+        "jj",
+        [
+            "--repository",
+            &repo_path,
+            "--ignore-working-copy",
+            "restore",
+            "--from",
+            revision,
+            "--into",
+            &bookmark,
+        ],
+    )?;
+    let source = resolve_commit_id(&repo_path, &bookmark)?;
+    let (_, reported) = command_output(
+        "jj",
+        &[
+            "--repository",
+            &repo_path,
+            "--ignore-working-copy",
+            "duplicate",
+            "-r",
+            source.as_str(),
+            "-d",
+            onto,
+        ],
+    )?;
+    let replayed = parse_duplicated(&reported);
+    cleanup.created.extend(replayed.iter().cloned());
+    let replayed = match replayed.as_slice() {
+        [replayed] => replayed.clone(),
+        _ => return Err(JjError::ProbeRoot),
+    };
+    let outcome = classify_single_replay(&repo_path, &replayed)?;
+    drop(cleanup);
+    Ok(outcome)
+}
+
+fn recover_unreported_probe_root(
+    repo: &Path,
+    synthetic_description: &str,
+    cleanup: &mut ProbeCleanup<'_>,
+) -> Result<(), JjError> {
+    let synthetic_pattern = format!("{synthetic_description}*");
+    cleanup.created.extend(commits_matching(
+        repo,
+        &format!("all() & description(glob:{synthetic_pattern:?})"),
+    )?);
+    Ok(())
+}
+
+fn classify_single_replay(repo_path: &str, replayed: &CommitId) -> Result<RebaseOutcome, JjError> {
+    let state = command(
+        "jj",
+        [
+            "--repository",
+            repo_path,
+            "--ignore-working-copy",
+            "log",
+            "--no-graph",
+            "-r",
+            replayed.as_str(),
+            "-T",
+            "empty ++ \"\\t\" ++ conflict ++ \"\\n\"",
+        ],
+    )?;
+    let mut rows = state.lines().filter(|line| !line.trim().is_empty());
+    let row = rows.next().ok_or(JjError::ProbeRoot)?;
+    if rows.next().is_some() {
+        return Err(JjError::ProbeRoot);
+    }
+    let mut parts = row.split('\t');
+    let empty = parts.next() == Some("true");
+    let conflicted = parts.next() == Some("true");
+    Ok(if conflicted {
+        RebaseOutcome::Conflicted
+    } else if empty {
+        RebaseOutcome::Empty
+    } else {
+        RebaseOutcome::CleanNonEmpty
+    })
+}
+
+/// Replays `base..revision` onto a target and classifies the resulting content.
+pub fn probe_revision(
+    repo: &Path,
+    base: &str,
+    revision: &str,
+    onto: &str,
+) -> Result<RebaseOutcome, JjError> {
     let repo_path = path(repo);
 
     // `--ignore-working-copy` on the duplicate too. Without it the command
     // snapshots, which rewrites a dirty `@`'s commit id and, in the old set
     // difference cleanup, made another agent's working commit look like ours.
-    let range = format!("{onto}..{branch}");
+    let range = format!("{base}..{revision}");
     let (_, reported) = command_output(
         "jj",
         &[
@@ -413,7 +632,7 @@ pub fn probe_landed(
             "duplicate",
             "-r",
             &range,
-            "--onto",
+            "-d",
             onto,
         ],
     )?;
@@ -423,6 +642,7 @@ pub fn probe_landed(
     let cleanup = ProbeCleanup {
         repo,
         created: created.clone(),
+        bookmarks: Vec::new(),
     };
 
     if created.is_empty() {
@@ -674,9 +894,7 @@ fn command<const N: usize>(program: &str, args: [&str; N]) -> Result<String, JjE
     command_args(program, &args)
 }
 
-/// Slice form, for invocations whose length is not known at compile time, such
-/// as a merge over a variable number of parents.
-/// Both streams, for the few commands whose useful output is on stderr.
+/// Runs a dynamically shaped command and returns both output streams on success.
 fn command_output(program: &str, args: &[&str]) -> Result<(String, String), JjError> {
     let output = Command::new(program)
         .args(args)
@@ -696,6 +914,37 @@ fn command_output(program: &str, args: &[&str]) -> Result<(String, String), JjEr
         String::from_utf8_lossy(&output.stdout).into_owned(),
         String::from_utf8_lossy(&output.stderr).into_owned(),
     ))
+}
+
+fn resolve_commit_id(repo_path: &str, revision: &str) -> Result<CommitId, JjError> {
+    let full = command(
+        "jj",
+        [
+            "--repository",
+            repo_path,
+            "--ignore-working-copy",
+            "log",
+            "--no-graph",
+            "-r",
+            revision,
+            "-T",
+            "commit_id ++ \"\\n\"",
+        ],
+    )?;
+    parse_resolved_commit_id(&full)
+}
+
+fn parse_resolved_commit_id(output: &str) -> Result<CommitId, JjError> {
+    let mut commit_ids = output.lines().filter(|line| !line.trim().is_empty());
+    let commit_id = commit_ids.next().ok_or_else(|| JjError::Parse {
+        detail: "expected exactly one commit id, found none".to_owned(),
+    })?;
+    if commit_ids.next().is_some() {
+        return Err(JjError::Parse {
+            detail: "expected exactly one commit id, found multiple".to_owned(),
+        });
+    }
+    Ok(CommitId::new(commit_id.trim()))
 }
 
 /// Commit ids `jj duplicate` reports creating.
@@ -769,6 +1018,8 @@ struct ProbeCleanup<'a> {
     repo: &'a Path,
     /// Exactly what this probe created, by id.
     created: Vec<CommitId>,
+    /// Temporary bookmarks that follow a scratch commit when jj rewrites it.
+    bookmarks: Vec<String>,
 }
 
 impl Drop for ProbeCleanup<'_> {
@@ -783,11 +1034,47 @@ impl Drop for ProbeCleanup<'_> {
         // concurrent agent's new commit and a dirty `@` whose id a snapshot
         // rewrote, and abandoning those destroys their work. Never
         // `jj op restore` either, for the same reason.
-        if self.created.is_empty() {
+        let mut created = self.created.clone();
+        let repo_path = path(self.repo);
+        for bookmark in &self.bookmarks {
+            match resolve_commit_id(&repo_path, bookmark) {
+                // `jj` reports short ids while bookmarks resolve to full ids. Keep
+                // both spellings: the one batched abandon revset safely handles a
+                // duplicate, whereas comparing the strings cannot deduplicate them.
+                Ok(commit) => created.push(commit),
+                Err(error) => eprintln!(
+                    "knives: could not resolve probe bookmark {bookmark} for cleanup: {error}"
+                ),
+            }
+        }
+        if !self.bookmarks.is_empty() {
+            let output = Command::new("jj")
+                .args([
+                    "--repository",
+                    &repo_path,
+                    "--ignore-working-copy",
+                    "bookmark",
+                    "forget",
+                ])
+                .args(&self.bookmarks)
+                .output();
+            match output {
+                Ok(done) if done.status.success() => {}
+                Ok(done) => eprintln!(
+                    "knives: could not forget probe bookmarks {}: {}",
+                    self.bookmarks.join(", "),
+                    String::from_utf8_lossy(&done.stderr).trim()
+                ),
+                Err(error) => eprintln!(
+                    "knives: could not forget probe bookmarks {}: {error}",
+                    self.bookmarks.join(", ")
+                ),
+            }
+        }
+        if created.is_empty() {
             return;
         }
-        let revset = self
-            .created
+        let revset = created
             .iter()
             .map(|commit| commit.as_str().to_owned())
             .collect::<Vec<_>>()
@@ -851,7 +1138,40 @@ pub fn create_merge(repo: &Path, parents: &[CommitId], message: &str) -> Result<
     // jj reports a short id; widen it to the full one so a single id width
     // circulates through the rest of the program.
     let short = parse_created(&reported).ok_or(JjError::ProbeRoot)?;
-    let full = command(
+    resolve_commit_id(&repo_path, short.as_str())
+}
+
+/// Duplicates a prior cut onto an exact new parent set without moving a workspace.
+pub fn duplicate_onto(
+    repo: &Path,
+    source: &CommitId,
+    parents: &[CommitId],
+) -> Result<CommitId, JjError> {
+    let repo_path = path(repo);
+    let mut args = vec![
+        "--repository".to_owned(),
+        repo_path.clone(),
+        "--ignore-working-copy".to_owned(),
+        "duplicate".to_owned(),
+        "-r".to_owned(),
+        source.as_str().to_owned(),
+    ];
+    for parent in parents {
+        args.extend(["-d".to_owned(), parent.as_str().to_owned()]);
+    }
+    let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+    let (output, reported) = command_output("jj", &borrowed)?;
+    let short = parse_duplicated(&format!("{output}\n{reported}"))
+        .into_iter()
+        .next()
+        .ok_or(JjError::ProbeRoot)?;
+    resolve_commit_id(&repo_path, short.as_str())
+}
+
+/// Rewrites a commit's message and returns its replacement commit id.
+pub fn describe_commit(repo: &Path, commit: &CommitId, message: &str) -> Result<CommitId, JjError> {
+    let repo_path = path(repo);
+    let change_id = command(
         "jj",
         [
             "--repository",
@@ -860,12 +1180,25 @@ pub fn create_merge(repo: &Path, parents: &[CommitId], message: &str) -> Result<
             "log",
             "--no-graph",
             "-r",
-            short.as_str(),
+            commit.as_str(),
             "-T",
-            "commit_id",
+            "change_id",
         ],
     )?;
-    Ok(CommitId::new(full.trim()))
+    command_output(
+        "jj",
+        &[
+            "--repository",
+            &repo_path,
+            "--ignore-working-copy",
+            "describe",
+            "-r",
+            commit.as_str(),
+            "-m",
+            message,
+        ],
+    )?;
+    resolve_commit_id(&repo_path, &format!("change_id({})", change_id.trim()))
 }
 
 /// The commit id `jj new` reports creating.
@@ -916,6 +1249,91 @@ pub fn set_bookmark_anywhere(repo: &Path, name: &str, revision: &str) -> Result<
             name,
             "-r",
             revision,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Commits matching a revset, resolved through jj porcelain.
+///
+/// Exists for queries jj-lib makes hard (glob descriptions, `empty()`,
+/// ancestry set arithmetic) and for callers that need "no matches" as an
+/// empty answer rather than an error: `jj log` on an EMPTY REVSET prints
+/// nothing and exits zero (verified with `none()`). Note that naming a hidden
+/// commit id in a revset resurrects it into the resolution (even through
+/// `all() & <id>`, verified); callers asking about visibility must list a
+/// visibility-scoped revset and test membership themselves.
+pub fn commits_matching(repo: &Path, revset: &str) -> Result<Vec<CommitId>, JjError> {
+    let repo_path = path(repo);
+    let output = command(
+        "jj",
+        [
+            "--repository",
+            &repo_path,
+            "--ignore-working-copy",
+            "log",
+            "--no-graph",
+            "-r",
+            revset,
+            "-T",
+            "commit_id ++ \"\\n\"",
+        ],
+    )?;
+    Ok(output
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| CommitId::new(line.trim()))
+        .collect())
+}
+
+/// Forget a bookmark AND its remote-tracking refs, releasing the pin they hold.
+///
+/// `bookmark forget` alone leaves the `@remote` ref, which keeps the commit
+/// immutable so a following abandon refuses. `--include-remotes` is the whole
+/// point; verified by experiment (spec, evidence item 1). Erases local
+/// knowledge only: nothing is deleted on any remote.
+pub fn forget_bookmark_include_remotes(repo: &Path, name: &str) -> Result<(), JjError> {
+    let repo_path = path(repo);
+    command(
+        "jj",
+        [
+            "--repository",
+            &repo_path,
+            "--ignore-working-copy",
+            "bookmark",
+            "forget",
+            "--include-remotes",
+            name,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Abandon commits by explicit id, in ONE invocation.
+///
+/// One at a time does not work: abandoning a commit rebases its descendants,
+/// which rewrites the ids of the later ones (same lesson as `ProbeCleanup`).
+/// A commit pinned by a remote-tracking ref refuses abandon, so call
+/// [`forget_bookmark_include_remotes`] first. An empty slice is a no-op.
+pub fn abandon_commits(repo: &Path, commits: &[CommitId]) -> Result<(), JjError> {
+    if commits.is_empty() {
+        return Ok(());
+    }
+    let revset = commits
+        .iter()
+        .map(|commit| commit.as_str().to_owned())
+        .collect::<Vec<_>>()
+        .join("|");
+    let repo_path = path(repo);
+    command(
+        "jj",
+        [
+            "--repository",
+            &repo_path,
+            "--ignore-working-copy",
+            "abandon",
+            "-r",
+            &revset,
         ],
     )?;
     Ok(())
@@ -1108,4 +1526,33 @@ pub fn conflicted_files(repo: &Path, revision: &str) -> Result<Vec<String>, JjEr
         .filter_map(|line| line.split_whitespace().next())
         .map(ToOwned::to_owned)
         .collect())
+}
+
+#[cfg(test)]
+mod resolve_commit_id_tests {
+    use super::*;
+
+    #[test]
+    fn parse_resolved_commit_id_rejects_ambiguous_output() {
+        // Given: a divergent change-id query that renders two commit ids.
+        let output = "aabbcc\nddeeff\n";
+
+        // When: the resolver parses the porcelain output.
+        let result = parse_resolved_commit_id(output);
+
+        // Then: it refuses to concatenate or select an arbitrary commit.
+        assert!(matches!(result, Err(JjError::Parse { .. })));
+    }
+
+    #[test]
+    fn parse_resolved_commit_id_rejects_empty_output() {
+        // Given: a revset that matched no commits and therefore printed no id.
+        let output = "";
+
+        // When: the resolver parses the porcelain output.
+        let result = parse_resolved_commit_id(output);
+
+        // Then: it refuses to construct an empty commit id.
+        assert!(matches!(result, Err(JjError::Parse { .. })));
+    }
 }

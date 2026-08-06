@@ -4,13 +4,18 @@
 //! session has nobody to ask, so it decides from evidence and says what it
 //! decided. Cutting is opt-in: planning is the default because this is the only
 //! command that writes to a remote.
+// allow: SIZE_OK: 1383 lines - the release lifecycle's plan, cut, audit, reap, and rebase operations are one domain seam.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use crate::cli::Exit;
 use crate::config::{RepoEntry, Role};
-use crate::detect::{BookmarkTips, Finding, stale_parents};
-use crate::ids::{BookmarkRef, CommitId, ReleaseScheme, RepoName, is_our_release, is_release_name};
+use crate::detect::{BookmarkTips, Finding, FindingKind, RebaseOutcome, Subject, stale_parents};
+use crate::ids::{
+    BookmarkRef, CommitId, ReleaseScheme, RepoName, is_our_release, is_release_name,
+    strict_dated_release,
+};
 use crate::jj::{self, OriginTrunk, Repo};
 use crate::pins::{PIN_FILES, Pin, PinKind, scan};
 
@@ -157,6 +162,23 @@ pub fn previous_position(repo: &Repo, entry: &RepoEntry) -> Option<(String, Comm
         .map(|commit| (reference, commit))
 }
 
+/// The release the next cut supersedes: the newest dated cut, or under the
+/// fixed scheme the publish remote's current position.
+///
+/// The local fixed bookmark may already have moved, whereas consumers observe
+/// the publish remote that [`previous_position`] reads.
+pub fn previous_release_for_cut(
+    repo: &Repo,
+    entry: &RepoEntry,
+    tips: &BookmarkTips,
+) -> Option<(String, CommitId)> {
+    match entry.release_scheme() {
+        ReleaseScheme::Dated => newest_release(tips, &ReleaseScheme::Dated, entry.publish_remote())
+            .map(|(reference, commit)| (reference.to_string(), commit)),
+        ReleaseScheme::Fixed(_) => previous_position(repo, entry),
+    }
+}
+
 #[cfg(test)]
 mod scheme_tests {
     use super::*;
@@ -185,6 +207,8 @@ mod scheme_tests {
 #[derive(Debug, Default)]
 pub struct Plan {
     pub repo: String,
+    pub base: Option<CommitId>,
+    pub base_findings: Vec<Finding>,
     pub release: Option<String>,
     pub parents: Vec<(CommitId, Vec<String>)>,
     pub stale: Vec<Finding>,
@@ -213,7 +237,7 @@ pub fn carried_branches(
 }
 
 /// Pure seam so the trunk filter is testable without opening a repository.
-fn carried_from_tips(
+pub fn carried_from_tips(
     tips: &BookmarkTips,
     trunk: &str,
     scheme: &ReleaseScheme,
@@ -243,14 +267,300 @@ fn carried_from_tips(
 pub fn trunk_lag(repo: &Repo, release: Option<&str>, upstream_trunk: &str) -> Option<String> {
     let trunk = repo.resolve_commit(upstream_trunk).ok()?;
     let release = release?;
-    let parents = repo.parents_of(release).ok()?;
-    if parents.iter().any(|parent| parent.commit == trunk) {
+    let commit = repo.resolve_commit(release).ok()?;
+    if repo.is_ancestor(&trunk, &commit).unwrap_or(false) {
         return None;
     }
     Some(format!(
         "{release} does not contain the upstream trunk ({})",
         &trunk.as_str()[..12.min(trunk.as_str().len())]
     ))
+}
+
+/// The newest release we cut under this repository's configured scheme.
+///
+/// Uses the same ordering as `status`: otherwise those commands could report
+/// different current releases for the same set of refs.
+pub fn newest_release(
+    tips: &BookmarkTips,
+    scheme: &ReleaseScheme,
+    publish_remote: &str,
+) -> Option<(BookmarkRef, CommitId)> {
+    match scheme {
+        ReleaseScheme::Dated => tips
+            .iter()
+            .filter(|(reference, _)| is_our_release(reference, scheme))
+            // The same ordering `status` uses. These two commands answering "which
+            // is the current release?" differently was a real divergence.
+            .max_by_key(|(reference, _)| {
+                (
+                    crate::commands::status::release_order(reference.branch().as_str()),
+                    // On a tie prefer the local ref, deterministically. `max_by_key`
+                    // otherwise returns whichever came last in iteration order.
+                    u8::from(reference.is_local()),
+                )
+            })
+            .map(|(reference, commit)| (reference.clone(), commit.clone())),
+        ReleaseScheme::Fixed(fixed) => tips
+            .iter()
+            .filter(|(reference, _)| match reference {
+                BookmarkRef::Local(branch) => branch == fixed,
+                BookmarkRef::Remote { branch, remote } => {
+                    branch == fixed && remote.as_str() == publish_remote
+                }
+            })
+            .max_by_key(|(reference, _)| u8::from(reference.is_local()))
+            .map(|(reference, commit)| (reference.clone(), commit.clone())),
+    }
+}
+
+/// The newest parent of `release` that is reachable from `trunk_tip`.
+///
+/// A release carries the shared base that every member branch forks from as a
+/// parent. If a release also contains older bases, the shared base is the
+/// newest — the one that every other trunk-reachable parent is an ancestor of
+/// (older bases are #11's accumulation damage).
+/// A member that lands upstream by merge is itself selected as the shared base,
+/// so the real fork point is then reported as a superseded base.
+pub fn shared_base(
+    repo: &Repo,
+    release: &CommitId,
+    trunk_tip: &CommitId,
+) -> anyhow::Result<Option<CommitId>> {
+    let parents = repo.parents_of(release.as_str())?;
+    let mut bases = Vec::new();
+    for parent in parents {
+        if repo.is_ancestor(&parent.commit, trunk_tip)? {
+            bases.push(parent.commit);
+        }
+    }
+
+    'candidates: for candidate in &bases {
+        for other in &bases {
+            if other != candidate && !repo.is_ancestor(other, candidate)? {
+                continue 'candidates;
+            }
+        }
+        return Ok(Some(candidate.clone()));
+    }
+    Ok(None)
+}
+
+/// Members whose trunk ancestry exceeds the shared base (#10).
+///
+/// A member based past the base drags newer upstream into the next cut through
+/// itself alone, which surfaces as a conflict storm blamed on everything else.
+/// The finding names the branch so the fix (rebase it onto the base, or move
+/// the base deliberately) happens before the cut.
+pub fn mixed_base_findings(
+    repo_path: &Path,
+    members: &[(String, CommitId)],
+    base: &CommitId,
+    trunk_tip: &CommitId,
+) -> Result<Vec<Finding>, crate::jj::JjError> {
+    let mut findings = Vec::new();
+    for (name, tip) in members {
+        let beyond = crate::jj::commits_matching(
+            repo_path,
+            &format!(
+                "(::{tip} & ::{trunk}) ~ ::{base}",
+                tip = tip.as_str(),
+                trunk = trunk_tip.as_str(),
+                base = base.as_str()
+            ),
+        )?;
+        if !beyond.is_empty() {
+            findings.push(Finding::new(
+                FindingKind::MixedBase,
+                Subject::Branch(crate::ids::BranchName::new(name)),
+                format!(
+                    "branch {name} carries {} trunk commit(s) beyond the shared base {}; \
+                     it is based on a different upstream than that shared base",
+                    beyond.len(),
+                    short(base)
+                ),
+            ));
+        }
+    }
+    Ok(findings)
+}
+
+/// Commits the recut would strand: reachable from the previous release or its
+/// local descendants, and from no keeper.
+///
+/// Keepers are every non-release local bookmark tip plus the upstream trunk.
+/// The previous cut itself, parked working copies, and commits identified by
+/// our strict dated release bookmarks are excluded as release machinery, not
+/// work. A legacy commit that only *describes* itself like release machinery
+/// is deliberately reported: refusing it is safer than dropping real work.
+pub fn orphaned_commits(
+    repo_path: &Path,
+    previous: &CommitId,
+    keep: &[CommitId],
+    tips: &BookmarkTips,
+) -> Result<Vec<CommitId>, crate::jj::JjError> {
+    let keepers = keep
+        .iter()
+        .map(|commit| commit.as_str().to_owned())
+        .collect::<Vec<_>>()
+        .join("|");
+    let release_commits = our_dated_release_commits(tips);
+    let release_commits = if release_commits.is_empty() {
+        "none()".to_owned()
+    } else {
+        release_commits
+            .iter()
+            .map(CommitId::as_str)
+            .collect::<Vec<_>>()
+            .join("|")
+    };
+    let revset = format!(
+        "::( {}:: ) ~ ::({}) ~ {} ~ ({release_commits}) ~ (empty() & description(exact:\"\"))",
+        previous.as_str(),
+        keepers,
+        previous.as_str(),
+    );
+    crate::jj::commits_matching(repo_path, &revset)
+}
+
+/// Commit identities currently named by our strict dated release references.
+///
+/// This shares the release-name trust boundary used by reap: local, `origin`,
+/// and `release` refs count; names merely resembling a release on other
+/// remotes do not. Callers subtract these ids rather than trusting descriptions.
+pub fn our_dated_release_commits(tips: &BookmarkTips) -> BTreeSet<CommitId> {
+    tips.iter()
+        .filter(|(reference, _)| {
+            is_our_release(reference, &ReleaseScheme::Dated)
+                && strict_dated_release(reference.branch().as_str()).is_some()
+        })
+        .map(|(_, commit)| commit.clone())
+        .collect()
+}
+
+/// Which refs are ours to reap: everything except `upstream` (somebody
+/// else's repository) and `git` (jj's internal tracking view). Applied to
+/// the output; the newest-name vote uses [`is_our_release`] so someone else's
+/// cut cannot classify the live release as superseded.
+fn ours_to_reap(reference: &BookmarkRef) -> bool {
+    !matches!(
+        reference,
+        BookmarkRef::Remote { remote, .. } if matches!(remote.as_str(), "upstream" | "git")
+    )
+}
+
+/// Every ref of every superseded dated cut, on any remote that is ours.
+///
+/// Superseded means "not the newest dated name voted by a local, `origin`, or
+/// `release` ref". The broader output excludes `upstream` and jj's `git`
+/// tracking view, but keeps historical refs on every other remote for cleanup.
+/// [`crate::ids::strict_dated_release`] keeps upstream-style semver names out
+/// even on our remotes.
+pub fn superseded_dated_releases(tips: &BookmarkTips) -> Vec<(BookmarkRef, CommitId)> {
+    let newest = tips
+        .keys()
+        // The vote is an allowlist, so someone else's cut cannot reap ours;
+        // output remains broader to clean up our historical odd-remote refs.
+        .filter(|reference| is_our_release(reference, &ReleaseScheme::Dated))
+        .filter_map(|reference| strict_dated_release(reference.branch().as_str()))
+        .max();
+    let Some(newest) = newest else {
+        return Vec::new();
+    };
+    let mut found: Vec<(BookmarkRef, CommitId)> = tips
+        .iter()
+        .filter(|(reference, _)| {
+            ours_to_reap(reference)
+                && strict_dated_release(reference.branch().as_str())
+                    .is_some_and(|parsed| parsed != newest)
+        })
+        .map(|(reference, commit)| (reference.clone(), commit.clone()))
+        .collect();
+    // Name-major order keeps refs of one name adjacent; derived `Ord` is
+    // variant-major and would interleave names.
+    found.sort_by(|(a, _), (b, _)| (a.branch(), a).cmp(&(b.branch(), b)));
+    found
+}
+
+#[derive(Debug)]
+pub struct ReapReport {
+    /// Bookmark names whose refs were forgotten AND commits abandoned. A name
+    /// whose abandon refused lands in `forgotten_only`, never here (oracle
+    /// amendment: reaped must not overstate).
+    pub reaped: Vec<String>,
+    /// Refs forgotten but the commit abandon refused (still pinned by a ref
+    /// outside the enumeration, e.g. a tag); details in `notes`.
+    pub forgotten_only: Vec<String>,
+    /// (name, reason) pairs that were deliberately left alone.
+    pub kept: Vec<(String, String)>,
+    /// Non-fatal notes from abandon refusals.
+    pub notes: Vec<String>,
+}
+
+/// Reap every superseded dated cut: forget its refs everywhere, abandon its commits.
+///
+/// The newest dated name never appears in the enumeration, and the
+/// `previous_position` seam is `Fixed`-scheme-only while dated names are the
+/// only thing enumerated, so neither needs a runtime gate here. What does:
+/// a cut with local descendants is someone's stacked work (#4's third loss
+/// mode) and is refused with the descendants named. Parked workspace working
+/// copies — empty, undescribed — do not block: they sit on release merges as a
+/// matter of course and jj rebases them harmlessly.
+///
+/// Never touches a remote. A later fetch re-materializes forgotten refs as
+/// untracked (jj keeps no memory of forgetting); that is expected, harmless to
+/// the default log, and cleared by the next reap. Correctness never depends on
+/// reaping having run: the divergence detector ignores these refs regardless.
+pub fn reap_superseded(repo_path: &Path, repo: &Repo) -> anyhow::Result<ReapReport> {
+    let tips = repo.bookmark_tips()?;
+    let mut by_name = std::collections::BTreeMap::<String, Vec<CommitId>>::default();
+    for (reference, commit) in superseded_dated_releases(&tips) {
+        let targets = by_name.entry(reference.branch().to_string()).or_default();
+        if !targets.contains(&commit) {
+            targets.push(commit);
+        }
+    }
+
+    let mut report = ReapReport {
+        reaped: Vec::new(),
+        forgotten_only: Vec::new(),
+        kept: Vec::new(),
+        notes: Vec::new(),
+    };
+    'names: for (name, targets) in by_name {
+        for target in &targets {
+            let descendants = crate::jj::commits_matching(
+                repo_path,
+                &format!(
+                    "(descendants({id}) ~ {id}) ~ (empty() & description(exact:\"\"))",
+                    id = target.as_str()
+                ),
+            )?;
+            if !descendants.is_empty() {
+                let sample: Vec<String> = descendants
+                    .iter()
+                    .take(3)
+                    .map(|commit| commit.as_str().chars().take(12).collect())
+                    .collect();
+                report.kept.push((
+                    name.clone(),
+                    format!("has local descendant(s): {}", sample.join(", ")),
+                ));
+                continue 'names;
+            }
+        }
+        crate::jj::forget_bookmark_include_remotes(repo_path, &name)?;
+        match crate::jj::abandon_commits(repo_path, &targets) {
+            Ok(()) => report.reaped.push(name),
+            Err(error) => {
+                report
+                    .notes
+                    .push(format!("{name}: refs forgotten, abandon refused: {error}"));
+                report.forgotten_only.push(name);
+            }
+        }
+    }
+    Ok(report)
 }
 
 pub fn plan(name: &RepoName, entry: &RepoEntry, consumers: &[PathBuf]) -> anyhow::Result<Plan> {
@@ -264,30 +574,7 @@ pub fn plan(name: &RepoName, entry: &RepoEntry, consumers: &[PathBuf]) -> anyhow
     // The newest release we cut. Historical ones are frozen and not our concern.
     let scheme = entry.release_scheme();
     let publish_remote = entry.publish_remote();
-    let newest = match &scheme {
-        ReleaseScheme::Dated => tips
-            .iter()
-            .filter(|(reference, _)| is_our_release(reference, &scheme))
-            // The same ordering `status` uses. These two commands answering "which
-            // is the current release?" differently was a real divergence.
-            .max_by_key(|(reference, _)| {
-                (
-                    crate::commands::status::release_order(reference.branch().as_str()),
-                    // On a tie prefer the local ref, deterministically. `max_by_key`
-                    // otherwise returns whichever came last in iteration order.
-                    u8::from(reference.is_local()),
-                )
-            }),
-        ReleaseScheme::Fixed(fixed) => tips
-            .iter()
-            .filter(|(reference, _)| match reference {
-                BookmarkRef::Local(branch) => branch == fixed,
-                BookmarkRef::Remote { branch, remote } => {
-                    branch == fixed && remote.as_str() == publish_remote
-                }
-            })
-            .max_by_key(|(reference, _)| u8::from(reference.is_local())),
-    };
+    let newest = newest_release(&tips, &scheme, publish_remote);
 
     let Some((reference, commit)) = newest else {
         plan.notes.push(match scheme {
@@ -303,7 +590,42 @@ pub fn plan(name: &RepoName, entry: &RepoEntry, consumers: &[PathBuf]) -> anyhow
     plan.release = Some(reference.to_string());
 
     let parents = repo.parents_of(commit.as_str())?;
-    plan.stale = stale_parents(&parents, &tips);
+    let trunk_tip = repo.resolve_commit(&entry.upstream_trunk()).ok();
+    let base = match &trunk_tip {
+        Some(trunk) => shared_base(&repo, &commit, trunk)?,
+        None => None,
+    };
+    plan.base.clone_from(&base);
+    let mut member_parents = Vec::new();
+    for parent in &parents {
+        let trunk_reachable = match &trunk_tip {
+            Some(trunk) => repo.is_ancestor(&parent.commit, trunk)?,
+            None => false,
+        };
+        if !trunk_reachable {
+            member_parents.push(parent.clone());
+        } else if base
+            .as_ref()
+            .is_some_and(|candidate| candidate != &parent.commit)
+        {
+            plan.base_findings.push(Finding::new(
+                FindingKind::SupersededBase,
+                Subject::Commit(parent.commit.clone()),
+                format!(
+                    "parent {} is an older upstream base superseded by {}; \
+                     `knives release rebase` self-heals this",
+                    short(&parent.commit),
+                    base.as_ref().map_or_else(String::new, short),
+                ),
+            ));
+        }
+    }
+    plan.stale = stale_parents(&member_parents, &tips);
+    if let (Some(base), Some(trunk)) = (&base, &trunk_tip) {
+        let members = carried_from_tips(&tips, entry.trunk(), &scheme);
+        plan.base_findings
+            .extend(mixed_base_findings(&entry.path, &members, base, trunk)?);
+    }
     plan.parents = parents
         .into_iter()
         .map(|parent| {
@@ -331,6 +653,10 @@ pub fn plan(name: &RepoName, entry: &RepoEntry, consumers: &[PathBuf]) -> anyhow
     Ok(plan)
 }
 
+fn short(commit: &CommitId) -> String {
+    commit.as_str().chars().take(12).collect()
+}
+
 pub fn render(plan: &Plan) -> String {
     let mut lines: Vec<String> = plan
         .problems
@@ -345,22 +671,24 @@ pub fn render(plan: &Plan) -> String {
     lines.push(format!("{}: {release}", plan.repo));
     lines.push(format!("  {} parent(s), flat", plan.parents.len()));
     for (commit, names) in &plan.parents {
-        let short: String = commit.as_str().chars().take(12).collect();
         let held = if names.is_empty() {
             "no bookmark".to_owned()
         } else {
             names.join(", ")
         };
-        lines.push(format!("    {short}  {held}"));
+        lines.push(format!("    {}  {held}", short(commit)));
     }
 
-    if plan.stale.is_empty() {
+    if plan.stale.is_empty() && plan.base_findings.is_empty() {
         lines.push("  every parent is still its branch tip".to_owned());
     } else {
         lines.push(format!("  {} stale parent(s):", plan.stale.len()));
         for finding in &plan.stale {
             lines.push(format!("    {}", finding.detail));
         }
+    }
+    for finding in &plan.base_findings {
+        lines.push(format!("  !! {}", finding.detail));
     }
 
     lines.push("  pinned by:".to_owned());
@@ -391,10 +719,156 @@ pub const fn exit_for(plan: &Plan) -> Exit {
     if !plan.problems.is_empty() {
         return Exit::Incomplete;
     }
-    if plan.stale.is_empty() {
+    if plan.stale.is_empty() && plan.base_findings.is_empty() {
         Exit::Ok
     } else {
         Exit::Findings
+    }
+}
+
+#[cfg(test)]
+mod reap_enumeration_tests {
+    #![allow(
+        clippy::indexing_slicing,
+        reason = "indexing a result in a test is the assertion; a panic is the failure"
+    )]
+    use super::*;
+    use crate::ids::{BookmarkRef, BranchName, CommitId, RemoteName};
+
+    fn local(name: &str, commit: &str) -> (BookmarkRef, CommitId) {
+        (
+            BookmarkRef::Local(BranchName::new(name)),
+            CommitId::new(commit),
+        )
+    }
+
+    fn remote(name: &str, remote: &str, commit: &str) -> (BookmarkRef, CommitId) {
+        (
+            BookmarkRef::Remote {
+                branch: BranchName::new(name),
+                remote: RemoteName::new(remote),
+            },
+            CommitId::new(commit),
+        )
+    }
+
+    #[test]
+    fn every_ref_of_a_superseded_dated_name_is_enumerated_on_any_remote_but_upstream() {
+        // Given: two dated cuts with refs scattered across remotes (the shape a
+        // pre-knives fork accumulates), upstream's own semver branch, and a work branch.
+        let tips: BookmarkTips = [
+            local("release/2026-08-04", "aaa"),
+            remote("release/2026-08-04", "release", "aaa"),
+            remote("release/2026-08-04", "publish2", "aaa"),
+            remote("release/2026-08-04", "git", "aaa"),
+            local("release/2026-08-05", "bbb"),
+            remote("release/2026-08-05", "release", "bbb"),
+            remote("release/0.3.190", "upstream", "ccc"),
+            remote("release/2026-07-01", "upstream", "ddd"),
+            local("feat/x", "eee"),
+        ]
+        .into_iter()
+        .collect();
+
+        let superseded = superseded_dated_releases(&tips);
+        let names: Vec<String> = superseded.iter().map(|(r, _)| r.to_string()).collect();
+
+        // Then: only the older dated name, on every remote except upstream and git.
+        assert_eq!(
+            names,
+            vec![
+                "release/2026-08-04".to_owned(),
+                "release/2026-08-04@publish2".to_owned(),
+                "release/2026-08-04@release".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_upstream_dated_ref_never_votes_on_which_cut_is_newest() {
+        // Given: upstream carries a dated-shaped name NEWER than our newest cut.
+        // It must neither appear in the output nor make OUR newest look superseded
+        // — the reaper would otherwise forget and abandon the live release.
+        let tips: BookmarkTips = [
+            local("release/2026-08-05", "aaa"),
+            remote("release/2026-08-05", "release", "aaa"),
+            remote("release/2026-09-01", "upstream", "bbb"),
+            local("release/2026-08-04", "ccc"),
+        ]
+        .into_iter()
+        .collect();
+        let names: Vec<String> = superseded_dated_releases(&tips)
+            .iter()
+            .map(|(r, _)| r.to_string())
+            .collect();
+        assert_eq!(names, vec!["release/2026-08-04".to_owned()]);
+    }
+
+    #[test]
+    fn a_third_remotes_dated_ref_never_votes_on_which_cut_is_newest() {
+        // Given: a mirror/colleague remote carries a dated name newer than our
+        // live cut. It must not outrank the live release (the vote trusts only
+        // local/origin/release, like newest_release); its own stale ref is still
+        // enumerated for cleanup.
+        let tips: BookmarkTips = [
+            local("release/2026-08-05", "aaa"),
+            remote("release/2026-08-05", "release", "aaa"),
+            remote("release/2026-09-01", "publish2", "bbb"),
+        ]
+        .into_iter()
+        .collect();
+        let names: Vec<String> = superseded_dated_releases(&tips)
+            .iter()
+            .map(|(r, _)| r.to_string())
+            .collect();
+        assert_eq!(names, vec!["release/2026-09-01@publish2".to_owned()]);
+    }
+
+    #[test]
+    fn superseded_refs_are_sorted_by_name_before_ref_kind() {
+        // Given: two superseded names, each represented locally and on a remote.
+        let tips: BookmarkTips = [
+            local("release/2026-08-04", "aaa"),
+            remote("release/2026-08-04", "release", "aaa"),
+            local("release/2026-08-03", "bbb"),
+            remote("release/2026-08-03", "release", "bbb"),
+            local("release/2026-08-05", "ccc"),
+        ]
+        .into_iter()
+        .collect();
+
+        // When: the reaper candidates are enumerated.
+        let names: Vec<String> = superseded_dated_releases(&tips)
+            .iter()
+            .map(|(r, _)| r.to_string())
+            .collect();
+
+        // Then: refs for each dated name remain adjacent.
+        assert_eq!(
+            names,
+            vec![
+                "release/2026-08-03".to_owned(),
+                "release/2026-08-03@release".to_owned(),
+                "release/2026-08-04".to_owned(),
+                "release/2026-08-04@release".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_newest_dated_name_is_never_superseded_even_when_only_remote() {
+        // The newest cut may exist only as a remote ref in a fresh clone.
+        let tips: BookmarkTips = [
+            local("release/2026-08-04", "aaa"),
+            remote("release/2026-08-05.2", "release", "bbb"),
+        ]
+        .into_iter()
+        .collect();
+        let names: Vec<String> = superseded_dated_releases(&tips)
+            .iter()
+            .map(|(r, _)| r.to_string())
+            .collect();
+        assert_eq!(names, vec!["release/2026-08-04".to_owned()]);
     }
 }
 
@@ -515,6 +989,27 @@ impl Cut {
     }
 }
 
+/// The post-construction checks that determine whether a cut is safe to name.
+#[derive(Debug, Default)]
+pub struct CutAudit {
+    pub missing: Vec<String>,
+    pub unexplained: Vec<String>,
+    pub inconclusive: Vec<String>,
+}
+
+impl CutAudit {
+    pub const fn passed(&self) -> bool {
+        self.missing.is_empty() && self.unexplained.is_empty()
+    }
+}
+
+/// The baseline commits used to explain a cut audit's file-level drift.
+#[derive(Debug, Clone, Copy)]
+pub struct AuditContext<'a> {
+    pub previous: Option<&'a CommitId>,
+    pub trunk: &'a CommitId,
+}
+
 /// Workspaces belonging to branches this cut has dropped.
 ///
 /// They are cheap to create, which is why they accumulate; nothing else reaps
@@ -528,20 +1023,31 @@ pub fn workspaces_to_clean(workspaces: &[String], carried: &[String]) -> Vec<Str
         .collect()
 }
 
-/// Make the cut, after checking it.
+/// Build the candidate cut and verify it has exactly the parents asked for.
+/// Public seam so the audit can run between creation and naming.
 ///
-/// Refuses if the merge did not come out with exactly the parents asked for.
-/// That check runs BEFORE anything could be pushed, because the failure it
-/// catches is silent: a cut that dropped a parent looks exactly like one that
-/// did not, until work goes missing downstream.
-///
-/// Dated cuts retain ordinary bookmark movement protection because each name is
-/// immutable. Fixed cuts rebuild a fresh flat merge, so their bookmark moves
-/// sideways while the publish remote retains the previous cut.
+/// `Some(previous)` duplicates the previous release onto the new parent set,
+/// preserving its recorded conflict resolutions. Adding a branch or advancing
+/// the base therefore avoids replaying old conflicts; dropping an entangled
+/// branch surfaces a focused conflict rather than silently retaining its
+/// content. `None` builds a fresh flat merge. Both paths produce a flat octopus
+/// of exactly `request.parents`.
+/// The parent-count guard catches a silent failure: a cut that dropped a parent
+/// looks exactly like one that did not, until work goes missing downstream.
 ///
 /// This never pushes. Publishing a release is a separate, deliberate act.
-pub fn cut(repo: &Path, request: &Cut, scheme: &ReleaseScheme) -> anyhow::Result<CommitId> {
-    let created = crate::jj::create_merge(repo, &request.parents, &request.message())?;
+pub fn build_cut(
+    repo: &Path,
+    request: &Cut,
+    previous: Option<&CommitId>,
+) -> anyhow::Result<CommitId> {
+    let created = match previous {
+        Some(previous) => {
+            let duplicated = crate::jj::duplicate_onto(repo, previous, &request.parents)?;
+            crate::jj::describe_commit(repo, &duplicated, &request.message())?
+        }
+        None => crate::jj::create_merge(repo, &request.parents, &request.message())?,
+    };
     let actual = Repo::open(repo)?.parents_of(created.as_str())?;
     anyhow::ensure!(
         actual.len() == request.parents.len(),
@@ -550,12 +1056,84 @@ pub fn cut(repo: &Path, request: &Cut, scheme: &ReleaseScheme) -> anyhow::Result
         actual.len(),
         request.parents.len()
     );
+    Ok(created)
+}
+
+/// Point the release name at an already-checked merge.
+///
+/// Dated cuts retain ordinary bookmark-movement protection because each name
+/// records a new release. Fixed cuts deliberately move their existing release
+/// name, which may already exist on the remote.
+pub fn name_cut(
+    repo: &Path,
+    name: &str,
+    commit: &CommitId,
+    scheme: &ReleaseScheme,
+) -> anyhow::Result<()> {
     match scheme {
-        ReleaseScheme::Dated => crate::jj::set_bookmark(repo, &request.name, created.as_str())?,
+        ReleaseScheme::Dated => crate::jj::set_bookmark(repo, name, commit.as_str())?,
         ReleaseScheme::Fixed(_) => {
-            crate::jj::set_bookmark_anywhere(repo, &request.name, created.as_str())?;
+            crate::jj::set_bookmark_anywhere(repo, name, commit.as_str())?;
         }
     }
+    Ok(())
+}
+
+/// Verify the cut actually contains what it merged (spec 1.3).
+///
+/// For each member, a scratch child of `trunk` is restored to the member tip's
+/// tree, producing a synthetic commit whose diff is `trunk..member_tip`; that
+/// single net commit is replayed onto the fresh cut.
+/// An empty replay means its hunks are present; a clean, non-empty replay means
+/// the cut silently lacks them. A conflicted replay is inconclusive only when
+/// the cut itself has unresolved conflicts; otherwise its tree diverges from the
+/// member and fails the audit.
+/// Changes from the previous release that no member or trunk explains are
+/// merge-invented drift.
+pub fn audit_cut(
+    repo: &Path,
+    members: &[(String, CommitId)],
+    cut: &CommitId,
+    context: AuditContext<'_>,
+) -> anyhow::Result<CutAudit> {
+    let mut audit = CutAudit::default();
+    let cut_is_conflicted = !crate::jj::conflicted_files(repo, cut.as_str())?.is_empty();
+    for (name, tip) in members {
+        match crate::jj::probe_net_diff(repo, context.trunk.as_str(), tip.as_str(), cut.as_str())? {
+            RebaseOutcome::Empty => {}
+            RebaseOutcome::Conflicted if cut_is_conflicted => audit.inconclusive.push(name.clone()),
+            RebaseOutcome::CleanNonEmpty | RebaseOutcome::Conflicted => {
+                audit.missing.push(name.clone());
+            }
+        }
+    }
+    if let Some(previous) = context.previous {
+        let drifted = crate::jj::changed_files_between(repo, previous.as_str(), cut.as_str())?;
+        let mut explained = BTreeSet::new();
+        for (_, tip) in members {
+            explained.extend(crate::jj::changed_files_between(
+                repo,
+                previous.as_str(),
+                tip.as_str(),
+            )?);
+        }
+        explained.extend(crate::jj::changed_files_between(
+            repo,
+            previous.as_str(),
+            context.trunk.as_str(),
+        )?);
+        audit.unexplained = drifted
+            .into_iter()
+            .filter(|file| !explained.contains(file))
+            .collect();
+    }
+    Ok(audit)
+}
+
+/// Create and name a fresh cut for direct callers that do not need an audit.
+pub fn cut(repo: &Path, request: &Cut, scheme: &ReleaseScheme) -> anyhow::Result<CommitId> {
+    let created = build_cut(repo, request, None)?;
+    name_cut(repo, &request.name, &created, scheme)?;
     Ok(created)
 }
 

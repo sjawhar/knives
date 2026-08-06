@@ -618,6 +618,7 @@ fn record_repository_health(
     report: &mut Report,
     repo: &Repo,
     path: &std::path::Path,
+    tips: &BookmarkTips,
 ) -> anyhow::Result<()> {
     // Recorded before conclusions from this repository: detectors replay commits, so a stale
     // working copy can invalidate their answers.
@@ -625,9 +626,14 @@ fn record_repository_health(
         report.problems.push(stale);
     }
     report.findings.extend(double_checkout(&repo.workspaces()?));
+    let ignored: std::collections::BTreeSet<crate::ids::BookmarkRef> =
+        crate::commands::release::superseded_dated_releases(tips)
+            .into_iter()
+            .map(|(reference, _)| reference)
+            .collect();
     report
         .findings
-        .extend(divergent_changes(&repo.divergent_changes()?));
+        .extend(divergent_changes(&repo.divergent_changes(&ignored)?));
     report.findings.extend(conflicted_bookmark_findings(repo)?);
     Ok(())
 }
@@ -703,9 +709,8 @@ pub fn gather(
         repo: name.to_string(),
         ..Report::default()
     };
-    record_repository_health(&mut report, &repo, &entry.path)?;
-
     let tips = repo.bookmark_tips()?;
+    record_repository_health(&mut report, &repo, &entry.path, &tips)?;
     let trunk = entry.trunk();
     let scheme = entry.release_scheme();
     let upstream_trunk = entry.upstream_trunk();
