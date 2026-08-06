@@ -23,6 +23,23 @@ type CompactingInput = { readonly sessionID: string };
 type CompactingOutput = { context: string[]; prompt?: string };
 type JsonRecord = Record<string, unknown>;
 type BinaryFailure = "missing" | "outdated" | "invalid_response";
+type ToastVariant = "info" | "success" | "warning" | "error";
+type KnivesClient = {
+  readonly tui: {
+    readonly showToast: (options: {
+      readonly body: {
+        readonly title?: string;
+        readonly message: string;
+        readonly variant: ToastVariant;
+      };
+    }) => unknown;
+  };
+};
+type BinaryWarning = {
+  readonly candidate: string;
+  readonly failure: BinaryFailure;
+  readonly stderr: string;
+};
 
 export type KnivesHooks = {
   readonly "tool.execute.after": (input: ToolInput, output: ToolOutput) => Promise<void>;
@@ -39,7 +56,7 @@ export type KnivesHooks = {
 };
 
 export type Plugin = (
-  input: { readonly directory?: string },
+  input: { readonly directory?: string; readonly client?: KnivesClient },
   options?: Readonly<Record<string, unknown>>
 ) => Promise<KnivesHooks>;
 export type KnivesOptions = {
@@ -77,25 +94,44 @@ function failedBinaries(): Set<string> {
   return created;
 }
 
-function warnOnce(candidate: string, failure: BinaryFailure, stderr: string): void {
+function warnOnce(client: KnivesClient | undefined, warning: BinaryWarning): void {
   const carrier = globalThis as GlobalCarrier;
   if (carrier[warningKey] === true) return;
   carrier[warningKey] = true;
-  const firstLine = stderr.split(/\r?\n/, 1)[0] ?? "";
+  const firstLine = warning.stderr.split(/\r?\n/, 1)[0] ?? "";
   const detail = JSON.stringify(firstLine).slice(1, -1).trim().slice(0, 120);
   const diagnostic = detail.length === 0 ? "" : ` Detail: ${detail}`;
-  const binaryPath = [...candidate]
+  const binaryPath = [...warning.candidate]
     .map((character) => {
       const code = character.charCodeAt(0);
       return code < 32 || code === 127 ? " " : character;
     })
     .join("");
   const message =
-    failure === "missing"
+    warning.failure === "missing"
       ? `could not start \`${binaryPath}\`: binary is missing; update knives or set KNIVES_BIN.`
-      : failure === "outdated"
+      : warning.failure === "outdated"
         ? `ran but exited nonzero: \`${binaryPath}\` is likely too old for this plugin (needs the \`hook\` subcommand); update knives or set KNIVES_BIN.`
         : `received no valid hook response from \`${binaryPath}\`; update knives or set KNIVES_BIN.`;
+  const toastMessage =
+    warning.failure === "missing"
+      ? `Could not start ${binaryPath}: binary is missing; update knives or set KNIVES_BIN.`
+      : warning.failure === "outdated"
+        ? `Ran but exited nonzero: ${binaryPath} is likely too old for this plugin (needs the hook subcommand); update knives or set KNIVES_BIN.`
+        : `Received no valid hook response from ${binaryPath}; update knives or set KNIVES_BIN.`;
+  if (client !== undefined) {
+    try {
+      void Promise.resolve(
+        client.tui.showToast({
+          body: { title: "knives", message: `${toastMessage}${diagnostic}`, variant: "warning" },
+        })
+      ).catch(() => undefined);
+    } catch {
+      // no-excuse-ok: catch -- a nonconforming client must not break the hook that warns through it.
+    }
+    return;
+  }
+  // Headless callers, tests, and older OpenCode versions have no TUI client, so stderr is their only warning surface.
   console.error(`knives OpenCode plugin ${message}${diagnostic}`);
 }
 
@@ -141,13 +177,16 @@ async function binary(): Promise<string | null> {
   return failedBinaries().has(candidate) ? null : candidate;
 }
 
-function failBinary(candidate: string, failure: BinaryFailure, stderr = ""): null {
-  failedBinaries().add(candidate);
-  warnOnce(candidate, failure, stderr);
+function failBinary(client: KnivesClient | undefined, warning: BinaryWarning): null {
+  failedBinaries().add(warning.candidate);
+  warnOnce(client, warning);
   return null;
 }
 
-async function invoke(request: JsonRecord): Promise<JsonRecord | null> {
+async function invoke(
+  client: KnivesClient | undefined,
+  request: JsonRecord
+): Promise<JsonRecord | null> {
   const candidate = await binary();
   if (candidate === null) return null;
   try {
@@ -165,23 +204,29 @@ async function invoke(request: JsonRecord): Promise<JsonRecord | null> {
         child.stderr.text(),
         child.exited,
       ]);
-      return failBinary(candidate, exitCode === 0 ? "invalid_response" : "outdated", stderr);
+      return failBinary(client, {
+        candidate,
+        failure: exitCode === 0 ? "invalid_response" : "outdated",
+        stderr,
+      });
     }
     const [stdout, stderr, exitCode] = await Promise.all([
       child.stdout.text(),
       child.stderr.text(),
       child.exited,
     ]);
-    if (exitCode !== 0) return failBinary(candidate, "outdated", stderr);
+    if (exitCode !== 0) return failBinary(client, { candidate, failure: "outdated", stderr });
     try {
       const parsed: unknown = JSON.parse(stdout);
-      return isRecord(parsed) ? parsed : failBinary(candidate, "invalid_response", stderr);
+      return isRecord(parsed)
+        ? parsed
+        : failBinary(client, { candidate, failure: "invalid_response", stderr });
     } catch {
-      return failBinary(candidate, "invalid_response", stderr);
+      return failBinary(client, { candidate, failure: "invalid_response", stderr });
     }
   } catch {
     // no-excuse-ok: catch -- the plugin boundary intentionally degrades when the optional binary is unavailable.
-    return failBinary(candidate, "missing");
+    return failBinary(client, { candidate, failure: "missing", stderr: "" });
   }
 }
 
@@ -224,7 +269,8 @@ function addSkillPath(config: ConfigDraft, directory: string): void {
 
 export function createKnivesHooks(
   sessionDirectory: string | undefined,
-  options: KnivesOptions
+  options: KnivesOptions,
+  client?: KnivesClient
 ): KnivesHooks {
   return {
     config: async (config) => {
@@ -234,13 +280,13 @@ export function createKnivesHooks(
     },
     "shell.env": async (input, output) => {
       if (!options.owner) return;
-      const response = await invoke({ event: "shell.env", cwd: input.cwd });
+      const response = await invoke(client, { event: "shell.env", cwd: input.cwd });
       const owner = response === null ? null : stringValue(response["owner"]);
       if (owner !== null) output.env["KNIVES_OWNER"] = owner;
     },
     "tool.execute.after": async (input, output) => {
       if (!relevantTools.has(input.tool)) return;
-      const response = await invoke({
+      const response = await invoke(client, {
         event: "tool.execute.after",
         session_id: input.sessionID,
         tool: input.tool,
@@ -252,7 +298,7 @@ export function createKnivesHooks(
     },
     "experimental.chat.system.transform": async (input, output) => {
       if (input.sessionID === undefined || sessionDirectory === undefined) return;
-      const response = await invoke({
+      const response = await invoke(client, {
         event: "chat.system",
         session_id: input.sessionID,
         directory: sessionDirectory,
@@ -269,10 +315,10 @@ export function createKnivesHooks(
       output.system.push(system);
     },
     "experimental.session.compacting": async (input) => {
-      await invoke({ event: "compacting", session_id: input.sessionID });
+      await invoke(client, { event: "compacting", session_id: input.sessionID });
     },
   };
 }
 
 export const knivesPlugin: Plugin = async (input, options) =>
-  createKnivesHooks(input.directory, readOptions(options));
+  createKnivesHooks(input.directory, readOptions(options), input.client);

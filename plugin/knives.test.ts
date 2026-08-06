@@ -15,6 +15,13 @@ import {
 const realBinary = process.env["KNIVES_BIN"] ?? "";
 const originalEnvironment = { ...process.env };
 type Repository = { readonly home: string; readonly root: string; readonly file: string };
+type Toast = {
+  readonly body: {
+    readonly title?: string;
+    readonly message: string;
+    readonly variant: "info" | "success" | "warning" | "error";
+  };
+};
 const mockRecordGuard =
   'case "$MOCK_RECORD" in\n  /*) ;;\n  *) printf \'%s\\n\' "MOCK_RECORD must be an absolute path" >&2; exit 1 ;;\nesac\n';
 
@@ -255,6 +262,206 @@ test.serial("fails soft once without inheriting an old binary's stderr", async (
     restoreEnvironment();
     resetBinaryFailureState();
     await rm(dirname(old.binary), { recursive: true, force: true });
+  }
+});
+
+test.serial(
+  "shows one warning toast for binary failures when the client is available",
+  async () => {
+    const first = await oldBinary();
+    const second = await oldBinary();
+    const toasts: Toast[] = [];
+    const errors: string[] = [];
+    const originalError = console.error;
+    const client = {
+      tui: {
+        showToast: async (toast: Toast) => {
+          toasts.push(toast);
+        },
+      },
+    };
+    resetBinaryFailureState();
+    console.error = (message?: unknown) => errors.push(String(message));
+    try {
+      const hooks = createKnivesHooks("/repo", readOptions(undefined), client);
+      process.env["KNIVES_BIN"] = first.binary;
+      process.env["MOCK_RECORD"] = first.record;
+      await hooks["tool.execute.after"](
+        { tool: "read", sessionID: "first", callID: "c", args: {} },
+        output()
+      );
+      process.env["KNIVES_BIN"] = second.binary;
+      process.env["MOCK_RECORD"] = second.record;
+      await hooks["tool.execute.after"](
+        { tool: "read", sessionID: "second", callID: "c", args: {} },
+        output()
+      );
+
+      const [toast] = toasts;
+      expect(toasts).toHaveLength(1);
+      expect(toast?.body).toMatchObject({ title: "knives", variant: "warning" });
+      expect(toast?.body.message).toStartWith("Ran but exited nonzero:");
+      expect(toast?.body.message).toContain(first.binary);
+      expect(toast?.body.message).not.toContain(`\`${first.binary}\``);
+      expect(toast?.body.message).toContain("needs the hook subcommand");
+      expect(toast?.body.message).toContain("update knives or set KNIVES_BIN");
+      expect(toast?.body.message).toContain("error: unrecognized subcommand 'hook'");
+      expect(errors).toEqual([]);
+    } finally {
+      console.error = originalError;
+      restoreEnvironment();
+      resetBinaryFailureState();
+      await rm(dirname(first.binary), { recursive: true, force: true });
+      await rm(dirname(second.binary), { recursive: true, force: true });
+    }
+  }
+);
+
+test.serial("fails soft once when the client toast throws synchronously", async () => {
+  const attempts: Toast[] = [];
+  const errors: string[] = [];
+  const originalError = console.error;
+  const client = {
+    tui: {
+      showToast: (toast: Toast) => {
+        attempts.push(toast);
+        throw new Error("toast client failed");
+      },
+    },
+  };
+  resetBinaryFailureState();
+  process.env["KNIVES_BIN"] = "/definitely/not/knives-sync-throw";
+  console.error = (message?: unknown) => errors.push(String(message));
+  try {
+    const hooks = createKnivesHooks("/repo", readOptions(undefined), client);
+    const result = output();
+    await hooks["tool.execute.after"](
+      { tool: "read", sessionID: "first", callID: "c", args: {} },
+      result
+    );
+    await hooks["tool.execute.after"](
+      { tool: "read", sessionID: "second", callID: "c", args: {} },
+      output()
+    );
+    expect(result.output).toBe("tool output");
+    expect(attempts).toHaveLength(1);
+    expect(errors).toEqual([]);
+  } finally {
+    console.error = originalError;
+    restoreEnvironment();
+    resetBinaryFailureState();
+  }
+});
+
+test.serial("fails soft once when the client toast returns a non-thenable", async () => {
+  const toasts: Toast[] = [];
+  const errors: string[] = [];
+  const originalError = console.error;
+  const client = {
+    tui: {
+      showToast: async (toast: Toast) => {
+        toasts.push(toast);
+      },
+    },
+  };
+  Reflect.set(client.tui, "showToast", (toast: Toast) => {
+    toasts.push(toast);
+    return undefined;
+  });
+  resetBinaryFailureState();
+  process.env["KNIVES_BIN"] = "/definitely/not/knives-non-thenable";
+  console.error = (message?: unknown) => errors.push(String(message));
+  try {
+    const hooks = createKnivesHooks("/repo", readOptions(undefined), client);
+    const result = output();
+    await hooks["tool.execute.after"](
+      { tool: "read", sessionID: "first", callID: "c", args: {} },
+      result
+    );
+    await hooks["tool.execute.after"](
+      { tool: "read", sessionID: "second", callID: "c", args: {} },
+      output()
+    );
+    expect(result.output).toBe("tool output");
+    expect(toasts).toHaveLength(1);
+    expect(toasts[0]?.body.message).toBe(
+      "Could not start /definitely/not/knives-non-thenable: binary is missing; update knives or set KNIVES_BIN."
+    );
+    expect(errors).toEqual([]);
+  } finally {
+    console.error = originalError;
+    restoreEnvironment();
+    resetBinaryFailureState();
+  }
+});
+
+test.serial("a_rejecting_toast_promise_never_surfaces_as_an_unhandled_rejection", async () => {
+  const toasts: Toast[] = [];
+  const errors: string[] = [];
+  const unhandled: unknown[] = [];
+  const originalError = console.error;
+  const captureUnhandled = (reason: unknown) => unhandled.push(reason);
+  const client = {
+    tui: {
+      showToast: async (toast: Toast) => {
+        toasts.push(toast);
+        return Promise.reject(new Error("toast transport down"));
+      },
+    },
+  };
+  resetBinaryFailureState();
+  process.env["KNIVES_BIN"] = "/definitely/not/knives-rejecting-toast";
+  console.error = (message?: unknown) => errors.push(String(message));
+  process.on("unhandledRejection", captureUnhandled);
+  try {
+    const hooks = createKnivesHooks("/repo", readOptions(undefined), client);
+    const result = output();
+    await hooks["tool.execute.after"](
+      { tool: "read", sessionID: "first", callID: "c", args: {} },
+      result
+    );
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    expect(result.output).toBe("tool output");
+    expect(toasts).toHaveLength(1);
+    expect(toasts[0]?.body).toMatchObject({ title: "knives", variant: "warning" });
+    expect(unhandled).toEqual([]);
+    expect(errors).toEqual([]);
+  } finally {
+    process.off("unhandledRejection", captureUnhandled);
+    console.error = originalError;
+    restoreEnvironment();
+    resetBinaryFailureState();
+  }
+});
+
+test.serial("threads the OpenCode client through knivesPlugin binary warnings", async () => {
+  const directory = "/repo";
+  const toasts: Toast[] = [];
+  const errors: string[] = [];
+  const originalError = console.error;
+  const client = {
+    tui: {
+      showToast: async (toast: Toast) => {
+        toasts.push(toast);
+      },
+    },
+  };
+  resetBinaryFailureState();
+  process.env["KNIVES_BIN"] = "/definitely/not/knives-plugin-entry";
+  console.error = (message?: unknown) => errors.push(String(message));
+  try {
+    const hooks = await knivesEntry.knivesPlugin({ directory, client }, {});
+    await hooks["tool.execute.after"](
+      { tool: "read", sessionID: "entry", callID: "c", args: {} },
+      output()
+    );
+    expect(toasts).toHaveLength(1);
+    expect(toasts[0]?.body).toMatchObject({ title: "knives", variant: "warning" });
+    expect(errors).toEqual([]);
+  } finally {
+    console.error = originalError;
+    restoreEnvironment();
+    resetBinaryFailureState();
   }
 });
 
