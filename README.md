@@ -145,12 +145,30 @@ are somewhere else.
 | `knives release` | plan a release, or cut one |
 | `knives init` | register a checkout |
 | `knives hook` | harness plumbing, not for humans |
+| `knives gh` | fork-aware `gh` passthrough |
 
 `--json` works on any of them, and is the default when the environment indicates an agent is
 running it. `--text` forces prose.
 
 Exit codes: `0` nothing to report, `1` findings, `2` usage, `3` something could not be
 answered.
+
+## GitHub CLI passthrough
+
+`knives gh -- <args...>` absorbs the fork-routing logic of the `gh` bash shim:
+
+* **Target resolution**: `-R` passthrough, `gh repo set-default` markers, remote preference, and `gh api` owner extraction.
+* **Token export**: queries git credential config for `gh-app-token` and exports `GH_TOKEN` for the child process.
+* **Detached HEAD compensation**: injects the active jj bookmark into `gh pr` subcommands when git reports no symbolic HEAD.
+
+The `--` delimiter is required. All arguments after `--` are passed to `gh` verbatim.
+
+The routing table stays in gitconfig (`gh-resolved` markers, credential helpers). Knives reads it, does not own it.
+
+Escape hatches:
+
+* `KNIVES_GH_BYPASS` on the shim bypasses `knives gh` entirely.
+* `KNIVES_REAL_GH` points `knives gh` at a specific real `gh` binary.
 
 ## For agents
 
