@@ -1,7 +1,7 @@
 {
   "name": "knives",
   "displayName": "knives",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Fork maintenance status across many repos: announces knives-managed repositories and their contribution guidance in your session.",
   "author": { "name": "Sami Jawhar" },
   "repository": "https://github.com/sjawhar/knives",
