@@ -218,6 +218,15 @@ impl Repo {
             .collect()
     }
 
+    /// The full description of `revision`.
+    ///
+    /// Release cuts record member provenance in their description, so the next
+    /// cut can ask what its predecessor carried long after the member
+    /// bookmarks have moved or gone.
+    pub fn description_of(&self, revision: &str) -> Result<String, JjError> {
+        Ok(self.commit(revision)?.description().to_owned())
+    }
+
     /// One change existing as several visible commits, ignoring nominated refs.
     ///
     /// `ignored` names refs whose testimony does not count — in practice the
@@ -1142,12 +1151,23 @@ pub fn create_merge(repo: &Path, parents: &[CommitId], message: &str) -> Result<
 }
 
 /// Duplicates a prior cut onto an exact new parent set without moving a workspace.
+///
+/// An empty parent set is refused rather than passed on: with no `-d`, jj
+/// duplicates in place and keeps the source's own parents, so a caller that
+/// computed its way to no parents would report the change it meant to make while
+/// the composition stayed exactly as it was.
 pub fn duplicate_onto(
     repo: &Path,
     source: &CommitId,
     parents: &[CommitId],
 ) -> Result<CommitId, JjError> {
     let repo_path = path(repo);
+    if parents.is_empty() {
+        return Err(JjError::Revision {
+            revision: source.as_str().to_owned(),
+            detail: "a duplicate needs at least one destination parent".to_owned(),
+        });
+    }
     let mut args = vec![
         "--repository".to_owned(),
         repo_path.clone(),
@@ -1166,6 +1186,30 @@ pub fn duplicate_onto(
         .next()
         .ok_or(JjError::ProbeRoot)?;
     resolve_commit_id(&repo_path, short.as_str())
+}
+
+/// Rebase a whole branch onto `dest`: `jj rebase -b rev -d dest`.
+///
+/// Moves `rev`'s ancestry not already reachable from `dest`, plus all its
+/// descendants. Bookmarks and working copies follow their rewritten commits;
+/// conflicts are recorded in the commits rather than blocking.
+pub fn rebase_branch_onto(repo: &Path, rev: &str, dest: &CommitId) -> Result<(), JjError> {
+    // No --ignore-working-copy: this rewrites checked-out ancestry, and the
+    // invoking workspace must move with the operation rather than go stale.
+    let repo_path = path(repo);
+    let _ = command_output(
+        "jj",
+        &[
+            "--repository",
+            &repo_path,
+            "rebase",
+            "-b",
+            rev,
+            "-d",
+            dest.as_str(),
+        ],
+    )?;
+    Ok(())
 }
 
 /// Rewrites a commit's message and returns its replacement commit id.

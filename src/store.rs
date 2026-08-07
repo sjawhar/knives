@@ -77,24 +77,14 @@ pub struct State {
     /// state from any author.
     #[serde(default)]
     pub tracked_pulls: BTreeMap<String, u64>,
-    /// Branches stated as belonging in the next release, keyed by `<repo>/<branch>`.
-    ///
-    /// Empty means fall back to every branch, which is what a cut always did. Once
-    /// anything is stated, the release is exactly what was stated: curating a release
-    /// by hand and then having the fallback quietly re-add everything would be worse
-    /// than no curation at all.
-    #[serde(default)]
-    pub release_included: BTreeMap<String, String>,
-    /// Branches stated as not belonging in the next release.
-    ///
-    /// Separate from `release_included` because an exclusion has to survive the
-    /// fallback. Dropping a change from a release and having the next cut pick it up
-    /// again because nobody had listed the other twenty branches is exactly the
-    /// accident this exists to prevent.
-    #[serde(default)]
-    pub release_excluded: BTreeMap<String, String>,
     #[serde(default)]
     pub comment_marks: BTreeMap<String, String>,
+    /// Keys this version does not know, kept verbatim through a round trip.
+    ///
+    /// Release membership is the release commit's own parent set, edited by
+    /// `release include|drop|advance`, so nothing states it here; whatever an
+    /// older version wrote lands in this map and rides along rather than
+    /// failing the read.
     #[serde(flatten)]
     pub extra: BTreeMap<String, serde_json::Value>,
 }
@@ -380,58 +370,6 @@ impl Store {
         self.state.tracked_pulls.get(&target.to_string()).copied()
     }
 
-    /// State that `target` belongs in the next release.
-    pub fn include_in_release(&mut self, target: &BranchTarget, why: &str) {
-        let _ = self.state.release_excluded.remove(&target.to_string());
-        let _ = self
-            .state
-            .release_included
-            .insert(target.to_string(), why.to_owned());
-    }
-
-    /// State that `target` does not belong in the next release.
-    pub fn drop_from_release(&mut self, target: &BranchTarget, why: &str) {
-        let _ = self.state.release_included.remove(&target.to_string());
-        let _ = self
-            .state
-            .release_excluded
-            .insert(target.to_string(), why.to_owned());
-    }
-
-    /// Which of `branches` belong in `repo`'s next release, and why each was left out.
-    ///
-    /// With nothing stated this is every branch, which is what a cut always did. With
-    /// anything stated it is exactly the stated set. Exclusions apply either way.
-    pub fn release_membership(
-        &self,
-        repo: &RepoName,
-        branches: &[String],
-    ) -> (Vec<String>, Vec<(String, String)>) {
-        let key = |branch: &str| {
-            BranchTarget::new(repo.clone(), crate::ids::BranchName::new(branch)).to_string()
-        };
-        let stated: Vec<&String> = self
-            .state
-            .release_included
-            .keys()
-            .filter(|entry| entry.starts_with(&format!("{repo}/")))
-            .collect();
-        let mut carried = Vec::new();
-        let mut left_out = Vec::new();
-        for branch in branches {
-            if let Some(why) = self.state.release_excluded.get(&key(branch)) {
-                left_out.push((branch.clone(), format!("dropped: {why}")));
-                continue;
-            }
-            if !stated.is_empty() && !self.state.release_included.contains_key(&key(branch)) {
-                left_out.push((branch.clone(), "not included".to_owned()));
-                continue;
-            }
-            carried.push(branch.clone());
-        }
-        (carried, left_out)
-    }
-
     pub fn convention_digest(&self, repo: &RepoName, file: &str) -> Option<&str> {
         self.state
             .conventions
@@ -548,74 +486,6 @@ mod tests {
         let only = subject.claims(Some(&RepoName::new("one")));
         assert_eq!(only.len(), 1);
         assert_eq!(only[0].repo, "one");
-    }
-
-    #[test]
-    fn nothing_stated_means_every_branch_belongs() {
-        // Which is what a cut always did, and stays the default so curation is opt-in.
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path().join("state.json")).unwrap();
-        let branches = vec!["feat/a".to_owned(), "feat/b".to_owned()];
-        let (carried, left_out) = store.release_membership(&RepoName::new("ai"), &branches);
-        assert_eq!(carried, branches);
-        assert!(left_out.is_empty());
-    }
-
-    #[test]
-    fn a_dropped_branch_stays_out_even_under_the_fallback() {
-        // The accident this prevents: dropping a change from a release, then the next cut
-        // picking it up again because nobody had listed the other twenty branches.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("state.json");
-        let target = BranchTarget::new(RepoName::new("ai"), crate::ids::BranchName::new("feat/b"));
-        {
-            let mut store = Store::open_for_update(path.clone()).unwrap();
-            store.drop_from_release(&target, "depends on a change we dropped");
-            store.save().unwrap();
-        }
-        let store = Store::open(path).unwrap();
-        let branches = vec!["feat/a".to_owned(), "feat/b".to_owned()];
-        let (carried, left_out) = store.release_membership(&RepoName::new("ai"), &branches);
-        assert_eq!(carried, vec!["feat/a".to_owned()]);
-        assert_eq!(left_out.len(), 1);
-        assert!(left_out[0].1.contains("depends on a change we dropped"));
-    }
-
-    #[test]
-    fn stating_one_branch_makes_the_release_exactly_what_was_stated() {
-        // Curating by hand and then having the fallback re-add everything would be worse
-        // than no curation at all.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("state.json");
-        let target = BranchTarget::new(RepoName::new("ai"), crate::ids::BranchName::new("feat/a"));
-        {
-            let mut store = Store::open_for_update(path.clone()).unwrap();
-            store.include_in_release(&target, "ready");
-            store.save().unwrap();
-        }
-        let store = Store::open(path).unwrap();
-        let branches = vec!["feat/a".to_owned(), "feat/b".to_owned()];
-        let (carried, left_out) = store.release_membership(&RepoName::new("ai"), &branches);
-        assert_eq!(carried, vec!["feat/a".to_owned()]);
-        assert_eq!(
-            left_out,
-            vec![("feat/b".to_owned(), "not included".to_owned())]
-        );
-    }
-
-    #[test]
-    fn including_a_branch_undoes_a_drop_and_the_reverse() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("state.json");
-        let target = BranchTarget::new(RepoName::new("ai"), crate::ids::BranchName::new("feat/a"));
-        let mut store = Store::open_for_update(path).unwrap();
-        store.drop_from_release(&target, "no");
-        store.include_in_release(&target, "yes");
-        let branches = vec!["feat/a".to_owned()];
-        assert_eq!(
-            store.release_membership(&RepoName::new("ai"), &branches).0,
-            branches
-        );
     }
 
     #[test]

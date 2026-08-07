@@ -253,7 +253,7 @@ pub enum HookHarness {
 
 #[derive(Debug, Subcommand)]
 pub enum ReleaseAction {
-    /// Cut the release. The only thing knives writes, and it still never pushes.
+    /// Name a new cut of the composition in hand, verbatim. Never pushes.
     Cut {
         /// The dated release name. Omit it for a configured fixed release branch.
         name: Option<String>,
@@ -262,41 +262,52 @@ pub enum ReleaseAction {
         #[arg(long)]
         allow_drop: bool,
     },
-    /// Add an upstream commit to the release in hand, keeping its branch parents.
+    /// Rebase the composition onto an upstream commit: `jj rebase -b <release> -d <target>`.
     ///
-    /// For when a pull request has merged upstream: until the release contains the commit
-    /// the merge landed in, dropping the local branch takes the change out of the release
-    /// with it. Which upstream commit, and whether to do this at all, is a decision — a
-    /// cut does not do it for you.
-    ///
-    /// Whether this can happen in place or needs a new dated name follows from who pins
-    /// the release: a consumer that follows the branch sees a repair, one frozen on the
-    /// revision does not.
+    /// Every member branch's commits move onto the target and the release
+    /// merge moves with them, bookmarks and workspaces following; recorded
+    /// conflict resolutions replay as ordinary rebase semantics. The base is
+    /// never a release parent — this is how the members change theirs. Which
+    /// upstream commit, and whether to move at all, is a decision — a cut does
+    /// not do it for you.
     Rebase {
-        /// The upstream revision to include. Defaults to the upstream trunk.
+        /// The rebase target. Defaults to the upstream trunk.
         reference: Option<String>,
     },
-    /// State that a branch belongs in the next release.
+    /// Add a branch (or commit) to the release in hand as one new parent.
     ///
-    /// Membership is every branch until something is stated, after which it is exactly
-    /// what was stated: curating by hand and then having the fallback re-add everything
-    /// would be worse than not curating.
+    /// Nothing else changes: every other parent stays at the commit the release
+    /// already has. A member whose branch has advanced is not moved — that is a
+    /// content change beyond including it, and `advance` is how it is asked for.
     Include {
+        /// A branch name, or any revision when no bookmark fits.
         branch: String,
-        /// Why it belongs.
+        /// Why it belongs. Recorded on the release itself.
         #[arg(long)]
         why: Option<String>,
     },
-    /// State that a branch does not belong in the next release.
+    /// Remove a branch's parent from the release in hand.
     ///
-    /// Survives the fallback, so dropping a change does not get undone by the next cut
-    /// picking it up again because nobody listed the other twenty branches.
+    /// The branch and its bookmark are untouched — only the release changes. When
+    /// the branch has advanced past its released parent, ancestry finds the
+    /// parent; a commit id works when no bookmark does.
     Drop {
+        /// A branch name, or the parent's commit id when no bookmark fits.
         branch: String,
-        /// Why it was dropped. Worth recording: the reason is usually that something else
-        /// was dropped too.
+        /// Why it was dropped. Required, and recorded on the release itself:
+        /// dropping shipped content without a reason is how a release becomes
+        /// unexplainable later.
         #[arg(long)]
-        why: Option<String>,
+        why: String,
+    },
+    /// Advance member parents to their branches' current tips.
+    ///
+    /// Moving a member is a content change, so it happens only when asked for:
+    /// named branches move, and a bare `advance` moves every member whose branch
+    /// has advanced. The trunk parent is `rebase`'s job.
+    Advance {
+        /// Branches to advance. Empty means every member that has advanced.
+        branches: Vec<String>,
     },
     /// Reap superseded dated cuts: forget their bookmarks everywhere, abandon their commits.
     /// The remote is never touched.
@@ -306,6 +317,9 @@ pub enum ReleaseAction {
     /// mutable (superseded release refs are immutable heads, and they freeze every member
     /// commit in their ancestry). A later fetch re-materializes forgotten refs as untracked;
     /// re-run to clear them.
+    ///
+    /// Keeps every superseded cut while the live one still carries conflicts: the previous
+    /// cut is the only record of how they were last resolved.
     Reap,
 }
 
@@ -393,7 +407,9 @@ mod tests {
             vec!["knives", "release", "rebase"],
             vec!["knives", "release", "reap"],
             vec!["knives", "release", "include", "feat/x"],
-            vec!["knives", "release", "drop", "feat/y"],
+            vec!["knives", "release", "drop", "feat/y", "--why", "because"],
+            vec!["knives", "release", "advance"],
+            vec!["knives", "release", "advance", "feat/x"],
             vec!["knives", "depends", "a-branch", "--on", "other#1"],
             vec!["knives", "track", "a-branch", "--pr", "7"],
             vec!["knives", "gh", "--", "pr", "list"],
