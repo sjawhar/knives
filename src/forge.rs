@@ -18,7 +18,7 @@ const PR_STATE: &str = "all";
 // it, ownership was inferred from the head branch name, so an outside contributor
 // whose branch is called `main` was tracked as our work.
 const PR_FIELDS: &str = "number,state,reviewDecision,headRefName,headRefOid,updatedAt,isDraft,url,\
-     headRepositoryOwner,mergeable,mergeStateStatus,baseRefName";
+     headRepositoryOwner,mergeable,mergeStateStatus,baseRefName,mergeCommit";
 const PR_LIST_ARGS: [&str; 8] = [
     "pr", "list", "--state", PR_STATE, "--limit", "300", "--json", PR_FIELDS,
 ];
@@ -152,6 +152,13 @@ pub struct PullRequest {
     /// The branch this pull request targets.
     #[serde(default)]
     pub base_ref_name: String,
+    /// The commit that landed this pull request on its base branch, present only
+    /// once merged. For every merge method — merge commit, squash, rebase — this
+    /// is the base-branch commit that carries the work, which is exactly the
+    /// "where did it land" the bare rebase default needs. The head commit is not
+    /// that: a squash-merged head never appears in the base's history at all.
+    #[serde(default)]
+    pub merge_commit: Option<MergeCommit>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, serde::Serialize)]
@@ -159,10 +166,22 @@ pub struct Account {
     pub login: String,
 }
 
+/// The base-branch commit a merged pull request landed as.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, serde::Serialize)]
+pub struct MergeCommit {
+    pub oid: String,
+}
+
 impl PullRequest {
     /// Whether the forge says this pull request is open.
     pub fn is_open(&self) -> bool {
         self.state.eq_ignore_ascii_case("OPEN")
+    }
+
+    /// Whether the forge says this pull request merged. Closed-without-merging
+    /// is not this: only merged work constrains where the composition rebases.
+    pub fn is_merged(&self) -> bool {
+        self.state.eq_ignore_ascii_case("MERGED")
     }
 
     /// Whether the forge says this cannot be merged as it stands.
@@ -202,6 +221,7 @@ impl Default for PullRequest {
             mergeable: String::new(),
             merge_state_status: String::new(),
             base_ref_name: "main".to_owned(),
+            merge_commit: None,
         }
     }
 }
@@ -233,6 +253,31 @@ pub fn ours_only(
         .into_iter()
         .filter(|(_, pr)| owners.iter().any(|owner| pr.is_from(owner)))
         .collect()
+}
+
+/// Where each merged pull request landed on `trunk`, in number order.
+///
+/// Merged means merged: a closed pull request landed nothing, and a merge onto
+/// some other base is not on the trunk. A merged pull request whose landing
+/// commit the forge did not record stays listed with `None` — the caller cannot
+/// place it and must say so, rather than choose a target that quietly leaves
+/// merged work out.
+pub fn merged_onto(
+    pull_requests: &BTreeMap<BranchName, PullRequest>,
+    trunk: &str,
+) -> Vec<(u64, Option<String>)> {
+    let mut landed: Vec<(u64, Option<String>)> = pull_requests
+        .values()
+        .filter(|pr| pr.is_merged() && pr.base_ref_name == trunk)
+        .map(|pr| {
+            (
+                pr.number,
+                pr.merge_commit.as_ref().map(|merge| merge.oid.clone()),
+            )
+        })
+        .collect();
+    landed.sort_unstable();
+    landed
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -624,6 +669,78 @@ mod tests {
         assert_eq!(indexed.len(), 2);
         assert_eq!(indexed[&BranchName::new("feat/alpha")].number, 1128);
         assert!(indexed[&BranchName::new("feat/beta")].is_draft);
+    }
+
+    #[test]
+    fn a_merge_commit_parses_when_present_and_defaults_when_absent() {
+        // Given: one merged pull request naming its merge commit, one open without
+        let payload = r#"[
+          {"number":7,"state":"MERGED","headRefName":"feat/alpha",
+           "headRefOid":"53a0e91f","updatedAt":"2026-08-01T00:00:00Z",
+           "mergeCommit":{"oid":"feedfacefeedfacefeedfacefeedfacefeedface"}},
+          {"number":8,"state":"OPEN","headRefName":"feat/beta",
+           "headRefOid":"e433eca5","updatedAt":"2026-08-01T00:00:00Z",
+           "mergeCommit":null}
+        ]"#;
+
+        // When: the list payload is parsed
+        let parsed = parse_pull_requests(payload).expect("parse");
+        let indexed = index_by_branch(&parsed);
+
+        // Then: the merge commit survives, and its absence stays None
+        let merged = &indexed[&BranchName::new("feat/alpha")];
+        assert!(merged.is_merged(), "a MERGED state is merged");
+        assert_eq!(
+            merged.merge_commit.as_ref().map(|merge| merge.oid.as_str()),
+            Some("feedfacefeedfacefeedfacefeedfacefeedface")
+        );
+        let open = &indexed[&BranchName::new("feat/beta")];
+        assert!(!open.is_merged());
+        assert_eq!(open.merge_commit, None);
+    }
+
+    #[test]
+    fn only_merged_pull_requests_onto_the_trunk_mark_landing_points() {
+        // Given: pull requests in every state, plus a merge onto another base
+        let record = |number: u64, state: &str, base: &str, oid: Option<&str>| PullRequest {
+            number,
+            state: state.to_owned(),
+            base_ref_name: base.to_owned(),
+            merge_commit: oid.map(|oid| MergeCommit {
+                oid: oid.to_owned(),
+            }),
+            ..PullRequest::default()
+        };
+        let mut pull_requests = BTreeMap::new();
+        let _ = pull_requests.insert(
+            BranchName::new("e"),
+            record(5, "merged", "main", Some("e5")),
+        );
+        let _ = pull_requests.insert(
+            BranchName::new("a"),
+            record(9, "MERGED", "main", Some("a9")),
+        );
+        let _ = pull_requests.insert(BranchName::new("b"), record(2, "OPEN", "main", None));
+        let _ = pull_requests.insert(BranchName::new("c"), record(3, "CLOSED", "main", None));
+        let _ = pull_requests.insert(BranchName::new("d"), record(4, "MERGED", "dev", Some("d4")));
+        let _ = pull_requests.insert(BranchName::new("f"), record(6, "MERGED", "main", None));
+
+        // When: the landing points on the trunk are read
+        let landed = merged_onto(&pull_requests, "main");
+
+        // Then: only trunk-based merges remain, in number order. A merged pull
+        // request without a recorded merge commit stays listed with no landing
+        // point: the caller cannot place it, and must refuse rather than rebase
+        // to a target that quietly leaves merged work out.
+        assert_eq!(
+            landed,
+            vec![
+                (5, Some("e5".to_owned())),
+                (6, None),
+                (9, Some("a9".to_owned())),
+            ],
+            "case-insensitive state, trunk base only, sorted by number"
+        );
     }
 
     #[test]

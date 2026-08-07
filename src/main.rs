@@ -4,7 +4,7 @@
 //! here because each is one jj sequence over a parent set rather than a report
 //! with a renderer. Every other command owns its own logic and returns an
 //! [`Exit`], so the match stays a table.
-// allow: SIZE_OK: 1712 lines - dispatch plus the release-edit verbs; splitting would scatter the exhaustive match.
+// allow: SIZE_OK: 1837 lines - dispatch plus the release-edit verbs; splitting would scatter the exhaustive match.
 
 use std::process::ExitCode;
 
@@ -198,7 +198,6 @@ fn run_rebase(name: &str, reference: Option<&str>) -> anyhow::Result<Exit> {
     };
     let mut worst = Exit::Ok;
     for (repo, entry) in chosen {
-        let reference = reference.map_or_else(|| entry.upstream_trunk(), str::to_owned);
         let opened = knives::jj::Repo::open(&entry.path)?;
         let plan = release::plan(&repo, &entry, &entry.consumers)?;
         let Some(release_name) = plan.release.clone() else {
@@ -209,7 +208,10 @@ fn run_rebase(name: &str, reference: Option<&str>) -> anyhow::Result<Exit> {
             worst = worst.worst(Exit::Incomplete);
             continue;
         }
-        let onto = opened.resolve_commit(&reference)?;
+        let Some((onto, reference)) = rebase_target(&repo, &entry, &opened, reference)? else {
+            worst = worst.worst(Exit::Incomplete);
+            continue;
+        };
         let release_commit = opened.resolve_commit(&release_name)?;
         let parents = opened.parents_of(&release_name)?;
         // Ancestry, not parent identity: a commit already reachable through a
@@ -296,6 +298,129 @@ fn run_rebase(name: &str, reference: Option<&str>) -> anyhow::Result<Exit> {
         )?;
     }
     Ok(worst)
+}
+
+/// The commit a rebase moves onto, with the label the report and provenance use.
+///
+/// An explicit reference is taken at its word. Without one, the default is the
+/// first upstream trunk commit that contains every merged pull request — merged,
+/// not closed, because closed landed nothing.
+fn rebase_target(
+    repo: &RepoName,
+    entry: &knives::config::RepoEntry,
+    opened: &knives::jj::Repo,
+    reference: Option<&str>,
+) -> anyhow::Result<Option<(knives::ids::CommitId, String)>> {
+    if let Some(explicit) = reference {
+        return Ok(Some((
+            opened.resolve_commit(explicit)?,
+            explicit.to_owned(),
+        )));
+    }
+    merged_rebase_target(repo, entry, opened)
+}
+
+/// The bare-rebase default target, or `None` with its reason already printed.
+///
+/// Rebasing to this point makes every merged branch's work part of the members'
+/// shared history without carrying anything upstream has not accepted. With
+/// nothing merged there is no such point, and which commit to move onto goes
+/// back to being a judgment the caller must make.
+fn merged_rebase_target(
+    repo: &RepoName,
+    entry: &knives::config::RepoEntry,
+    opened: &knives::jj::Repo,
+) -> anyhow::Result<Option<(knives::ids::CommitId, String)>> {
+    let trunk = entry.upstream_trunk();
+    let pull_requests = match CliForge.pull_requests(&entry.path) {
+        Ok(found) => knives::forge::ours_only(
+            found,
+            &[
+                entry.remote(knives::config::Role::Origin),
+                entry.remote(knives::config::Role::Release),
+            ],
+        ),
+        Err(error) => {
+            eprintln!(
+                "{repo}: could not ask the forge which pull requests merged: {error}; \
+                 provide a commit to rebase onto"
+            );
+            return Ok(None);
+        }
+    };
+    let landed = knives::forge::merged_onto(&pull_requests, entry.trunk());
+    if landed.is_empty() {
+        println!(
+            "{repo}: no pull request has merged, so there is no default target; \
+             provide a commit to rebase onto"
+        );
+        return Ok(None);
+    }
+    let tip = opened.resolve_commit(&trunk)?;
+    let mut placed: Vec<(u64, knives::ids::CommitId)> = Vec::new();
+    let mut unplaced: Vec<u64> = Vec::new();
+    for (number, oid) in landed {
+        // Unrecorded, unresolvable and out-of-trunk merge commits are one fact
+        // here: the local trunk does not carry that landing yet.
+        match oid.and_then(|oid| opened.resolve_commit(&oid).ok()) {
+            Some(commit) if opened.is_ancestor(&commit, &tip)? => placed.push((number, commit)),
+            _ => unplaced.push(number),
+        }
+    }
+    if !unplaced.is_empty() {
+        println!(
+            "{repo}: the merge commit(s) of {} are not in the local {trunk}; \
+             run knives sync, or provide a commit to rebase onto",
+            numbered(&unplaced)
+        );
+        return Ok(None);
+    }
+    covering_commit(repo, opened, &placed, &trunk)
+}
+
+/// The first trunk commit containing every landing in `placed`: their maximum
+/// by ancestry, which on a trunk is the newest of them.
+fn covering_commit(
+    repo: &RepoName,
+    opened: &knives::jj::Repo,
+    placed: &[(u64, knives::ids::CommitId)],
+    trunk: &str,
+) -> anyhow::Result<Option<(knives::ids::CommitId, String)>> {
+    let Some(((_, first), rest)) = placed.split_first() else {
+        anyhow::bail!("{repo}: no landed merge commit to cover; this is a bug");
+    };
+    let mut covering = first.clone();
+    for (_, commit) in rest {
+        if opened.is_ancestor(&covering, commit)? {
+            covering = commit.clone();
+        }
+    }
+    let numbers: Vec<u64> = placed.iter().map(|(number, _)| *number).collect();
+    for (_, commit) in placed {
+        if commit != &covering && !opened.is_ancestor(commit, &covering)? {
+            // Merge commits that do not sit on one line cannot all be covered by
+            // one of them; picking any would leave merged work out silently.
+            println!(
+                "{repo}: the merge commits of {} do not sit on one line of {trunk}; \
+                 provide a commit to rebase onto",
+                numbered(&numbers)
+            );
+            return Ok(None);
+        }
+    }
+    println!(
+        "{repo}: every merged pull request ({}) is in {trunk} by {}; rebasing onto it",
+        numbered(&numbers),
+        short12(&covering)
+    );
+    let label = short12(&covering);
+    Ok(Some((covering, label)))
+}
+
+/// `#7, #12` — pull requests named the way the forge shows them.
+fn numbered(numbers: &[u64]) -> String {
+    let numbers: Vec<String> = numbers.iter().map(|number| format!("#{number}")).collect();
+    numbers.join(", ")
 }
 
 /// A composition rebase that just happened: what moved, and onto what.

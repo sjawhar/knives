@@ -56,6 +56,13 @@ fn every_field_we_request_survives_a_real_payload() {
         parsed.iter().any(|pr| pr.head_repository_owner.is_some()),
         "headRepositoryOwner"
     );
+    assert!(
+        parsed.iter().any(|pr| pr
+            .merge_commit
+            .as_ref()
+            .is_some_and(|merge| !merge.oid.is_empty())),
+        "mergeCommit"
+    );
 }
 
 #[test]
