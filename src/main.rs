@@ -1,8 +1,10 @@
 //! The `knives` binary.
 //!
-//! Dispatch only. Every command owns its own logic and returns an [`Exit`], so
-//! this file never grows a decision.
-// allow: SIZE_OK: 1070 lines - dispatch-only, splitting would scatter the exhaustive match.
+//! Dispatch, plus the release-edit verbs: `include`, `drop` and `advance` decide
+//! here because each is one jj sequence over a parent set rather than a report
+//! with a renderer. Every other command owns its own logic and returns an
+//! [`Exit`], so the match stays a table.
+// allow: SIZE_OK: 1712 lines - dispatch plus the release-edit verbs; splitting would scatter the exhaustive match.
 
 use std::process::ExitCode;
 
@@ -114,7 +116,7 @@ fn dispatch() -> anyhow::Result<Exit> {
             };
             let extra: Vec<&std::path::Path> =
                 consumer.iter().map(std::path::PathBuf::as_path).collect();
-            dispatch_release(chosen, action, &extra)
+            dispatch_release(&chosen, action, &extra)
         }
         Command::Gh { args } => match knives::commands::gh::run(&args)? {},
     }
@@ -153,7 +155,7 @@ fn one_repo(requested: Option<&str>) -> anyhow::Result<Option<RepoName>> {
 
 /// Plan, curate or cut a release.
 fn dispatch_release(
-    chosen: RepoName,
+    chosen: &RepoName,
     action: Option<ReleaseAction>,
     extra_consumers: &[&std::path::Path],
 ) -> anyhow::Result<Exit> {
@@ -168,23 +170,27 @@ fn dispatch_release(
             run_rebase(chosen.as_str(), reference.as_deref())
         }
         Some(ReleaseAction::Reap) => run_reap(chosen.as_str()),
-        Some(ReleaseAction::Include { branch, why }) => run_membership(
-            &BranchTarget::new(chosen, BranchName::new(branch)),
-            Membership::In(why),
-        ),
-        Some(ReleaseAction::Drop { branch, why }) => run_membership(
-            &BranchTarget::new(chosen, BranchName::new(branch)),
-            Membership::Out(why),
-        ),
+        Some(ReleaseAction::Include { branch, why }) => {
+            run_release_edit(chosen.as_str(), &ReleaseEdit::Include { branch, why })
+        }
+        Some(ReleaseAction::Drop { branch, why }) => {
+            run_release_edit(chosen.as_str(), &ReleaseEdit::Drop { branch, why })
+        }
+        Some(ReleaseAction::Advance { branches }) => {
+            let branches = branches.into_iter().map(BranchName::new).collect();
+            run_release_edit(chosen.as_str(), &ReleaseEdit::Advance { branches })
+        }
     }
 }
 
-/// Replace superseded release bases with an upstream commit, keeping branch parents.
+/// Rebase the whole composition onto an upstream commit: `jj rebase -b <release> -d <target>`.
 ///
-/// A cut deliberately does not do this: which upstream commit a release should contain,
-/// and whether to move it at all, is a judgment. What this exists for is the case where a
-/// pull request has merged upstream — until the release contains the commit that merge
-/// landed in, dropping the local branch removes the change from the release too.
+/// Every member branch's commits move onto the target and the release merge
+/// moves with them, bookmarks following their rewritten commits — recorded
+/// conflict resolutions replay as ordinary rebase semantics. The upstream base
+/// is never a release parent; this is how the release's members change theirs.
+/// A cut deliberately does not do this: which upstream commit to move onto,
+/// and whether to move at all, is a judgment.
 fn run_rebase(name: &str, reference: Option<&str>) -> anyhow::Result<Exit> {
     let chosen = match selected(Some(name), false)? {
         Ok(list) => list,
@@ -199,8 +205,13 @@ fn run_rebase(name: &str, reference: Option<&str>) -> anyhow::Result<Exit> {
             println!("{repo}: no release to move");
             continue;
         };
+        if !release_is_locally_movable(&opened, &repo, &release_name)? {
+            worst = worst.worst(Exit::Incomplete);
+            continue;
+        }
         let onto = opened.resolve_commit(&reference)?;
         let release_commit = opened.resolve_commit(&release_name)?;
+        let parents = opened.parents_of(&release_name)?;
         // Ancestry, not parent identity: a commit already reachable through a
         // parent's history is contained, and adding it again grows the octopus.
         if opened.is_ancestor(&onto, &release_commit)? {
@@ -225,34 +236,29 @@ fn run_rebase(name: &str, reference: Option<&str>) -> anyhow::Result<Exit> {
             worst = worst.worst(Exit::Incomplete);
             continue;
         }
-        let parents = opened.parents_of(&release_name)?;
         let tips = opened.bookmark_tips()?;
-        let mut carried: Vec<knives::ids::CommitId> = Vec::new();
-        let mut replaced = 0usize;
+        // A stale parent is the old tip of a branch that has moved on: rebasing
+        // carries pre-rewrite code onto the new base. A held parent — any
+        // bookmark still on it whose branch is neither a release name nor the
+        // trunk — is a member and moves. An unheld parent already reachable
+        // from the target is a legacy trunk parent: the base is never a parent,
+        // so it is shed before the rebase.
+        let mut members: Vec<knives::ids::CommitId> = Vec::new();
+        let mut shed = 0usize;
         for parent in &parents {
-            // Oracle amendment: a parent HELD by a live branch bookmark is kept
-            // even when onto already reaches it — a landed branch remains a
-            // member with its parent and provenance intact (spec 1.7 "keeping
-            // branch parents"; dropping members is `release drop`'s job, never
-            // the rebase's). Held = any bookmark still pointing at the parent
-            // whose branch is neither a release name nor the trunk.
             let held = parent.bookmarks.iter().any(|reference| {
                 tips.get(reference) == Some(&parent.commit)
                     && !knives::ids::is_release_name(reference.branch(), &scheme)
                     && reference.branch().as_str() != entry.trunk()
             });
             if held {
-                carried.push(parent.commit.clone());
+                members.push(parent.commit.clone());
                 continue;
             }
-            // Ancestry, not parent identity: an unheld parent reachable through
-            // the replacement's history is a superseded base, even when it is
-            // not a direct parent of that replacement.
             if opened.is_ancestor(&parent.commit, &onto)? {
-                replaced += 1;
+                shed += 1;
                 continue;
             }
-
             let no_bookmark = if parent.bookmarks.is_empty() {
                 "; no bookmark points at it"
             } else {
@@ -264,27 +270,80 @@ fn run_rebase(name: &str, reference: Option<&str>) -> anyhow::Result<Exit> {
                 "{repo}: refusing to rebase {release_name}: parent {} is stale{no_bookmark}{moved}. \
                  Fix the branch or drop it from the release, then re-run; carrying it could ship \
                  pre-rewrite code.",
-                parent.commit.as_str().chars().take(12).collect::<String>(),
+                short12(&parent.commit),
             );
             return Ok(Exit::Incomplete);
         }
-        carried.push(onto.clone());
-        let message = format!("chore(release): {release_name} rebased onto {reference}");
-        // #12: the repair is the OLD release duplicated onto the new parent set,
-        // never a from-scratch merge — prior conflict resolutions carry over, so
-        // a rebase surfaces only conflicts the new base itself introduces.
-        let duplicated = knives::jj::duplicate_onto(&entry.path, &release_commit, &carried)?;
-        let created = knives::jj::describe_commit(&entry.path, &duplicated, &message)?;
-        knives::jj::set_bookmark_anywhere(&entry.path, &release_name, created.as_str())?;
-        println!(
-            "{repo}: {release_name} now contains {reference} ({}), {} base parent(s) replaced, \
-             {} branch parent(s) kept",
-            &onto.as_str()[..12.min(onto.as_str().len())],
-            replaced,
-            carried.len() - 1
-        );
+        if members.is_empty() {
+            println!("{repo}: {release_name} has no member parents to move; nothing to rebase");
+            worst = worst.worst(Exit::Incomplete);
+            continue;
+        }
+        if shed > 0 {
+            let trimmed = knives::jj::duplicate_onto(&entry.path, &release_commit, &members)?;
+            knives::jj::set_bookmark_anywhere(&entry.path, &release_name, trimmed.as_str())?;
+        }
+        knives::jj::rebase_branch_onto(&entry.path, &release_name, &onto)?;
+        report_rebased_release(
+            &repo,
+            &entry,
+            &RebasedRelease {
+                name: &release_name,
+                reference: &reference,
+                onto: &onto,
+                shed,
+            },
+        )?;
     }
     Ok(worst)
+}
+
+/// A composition rebase that just happened: what moved, and onto what.
+struct RebasedRelease<'a> {
+    name: &'a str,
+    reference: &'a str,
+    onto: &'a knives::ids::CommitId,
+    shed: usize,
+}
+
+/// Re-describe the rebased release so the recorded provenance names the
+/// rewritten parents, and report what moved.
+fn report_rebased_release(
+    repo: &RepoName,
+    entry: &knives::config::RepoEntry,
+    rebased: &RebasedRelease<'_>,
+) -> anyhow::Result<()> {
+    let reopened = knives::jj::Repo::open(&entry.path)?;
+    let created = reopened.resolve_commit(rebased.name)?;
+    let new_parents: Vec<knives::ids::CommitId> = reopened
+        .parents_of(rebased.name)?
+        .into_iter()
+        .map(|parent| parent.commit)
+        .collect();
+    let provenance = parent_sources(&reopened, entry, &entry.release_scheme(), &new_parents)?;
+    let message = format!(
+        "{}\n\nrebased onto {}",
+        cut_request(rebased.name.to_owned(), &provenance).message(),
+        rebased.reference
+    );
+    let described = knives::jj::describe_commit(&entry.path, &created, &message)?;
+    let stale_bases = if rebased.shed > 0 {
+        format!(", {} stale base parent(s) shed", rebased.shed)
+    } else {
+        String::new()
+    };
+    println!(
+        "{repo}: {} rebased onto {} ({}), {} member(s) moved with it{stale_bases}",
+        rebased.name,
+        rebased.reference,
+        short12(rebased.onto),
+        new_parents.len()
+    );
+    match knives::jj::conflicted_files(&entry.path, described.as_str()) {
+        Ok(files) => println!("{}", release::conflict_guidance(&files)),
+        Err(error) => println!("  could not list conflicts: {error}"),
+    }
+    Ok(())
 }
 
 fn stale_parent_moved_branches(
@@ -298,40 +357,583 @@ fn stale_parent_moved_branches(
         .filter(|(branch, _)| {
             !knives::ids::is_release_name(branch, scheme) && branch.as_str() != "@git"
         })
-        .map(|(branch, tip)| {
-            format!(
-                "{branch} (now {})",
-                tip.as_str().chars().take(12).collect::<String>()
-            )
-        })
+        .map(|(branch, tip)| format!("{branch} (now {})", short12(&tip)))
         .collect();
     Ok((!moved.is_empty()).then(|| moved.join(", ")))
 }
 
-/// What was stated about a branch's place in the next release.
-enum Membership {
-    In(Option<String>),
-    Out(Option<String>),
+/// One deliberate change to the release in hand.
+enum ReleaseEdit {
+    Include { branch: String, why: Option<String> },
+    Drop { branch: String, why: String },
+    Advance { branches: Vec<BranchName> },
 }
 
-/// State, or forget, whether a branch belongs in the next release.
-fn run_membership(target: &BranchTarget, membership: Membership) -> anyhow::Result<Exit> {
-    let mut store = Store::open_for_update(default_state_path())?;
-    match membership {
-        Membership::In(why) => {
-            let why = why.unwrap_or_else(|| "stated".to_owned());
-            store.include_in_release(target, &why);
-            store.save()?;
-            println!("{target} is in the next release ({why})");
+/// What an edit decided: a new parent set to write with the delta that describes
+/// it, or an already-reported end.
+enum EditOutcome {
+    Done(Vec<knives::ids::CommitId>, String),
+    Settled(Exit),
+}
+
+/// The release in hand: a flat merge of feature and fix branches.
+///
+/// Every parent is a member. The upstream base is never a direct parent — it
+/// is reachable through every member, because members fork from it — so there
+/// is no role to classify and nothing for a landed member to be mistaken for.
+struct ReleaseInHand {
+    name: String,
+    commit: knives::ids::CommitId,
+    parents: Vec<knives::ids::CommitId>,
+    /// Where the trunk sits, upstream and locally. The trunk is not a feature
+    /// branch, so neither position is ever a member.
+    trunk_tips: Vec<knives::ids::CommitId>,
+}
+
+impl ReleaseInHand {
+    /// Read the release's parents: the members.
+    fn read(
+        opened: &knives::jj::Repo,
+        entry: &knives::config::RepoEntry,
+        name: String,
+        trunk_tip: knives::ids::CommitId,
+    ) -> anyhow::Result<Self> {
+        let commit = opened.resolve_commit(&name)?;
+        let parents: Vec<knives::ids::CommitId> = opened
+            .parents_of(&name)?
+            .into_iter()
+            .map(|parent| parent.commit)
+            .collect();
+        let mut trunk_tips = vec![trunk_tip];
+        if let Some(local) = bookmark_tip(opened, entry.trunk())? {
+            trunk_tips.push(local);
         }
-        Membership::Out(why) => {
-            let why = why.unwrap_or_else(|| "stated".to_owned());
-            store.drop_from_release(target, &why);
-            store.save()?;
-            println!("{target} is out of the next release ({why})");
+        Ok(Self {
+            name,
+            commit,
+            parents,
+            trunk_tips,
+        })
+    }
+
+    /// The member parents: all of them.
+    fn members(&self) -> impl Iterator<Item = &knives::ids::CommitId> {
+        self.parents.iter()
+    }
+}
+
+/// Everything an edit reads: whose release, which repository, which release.
+struct EditContext<'a> {
+    repo: &'a RepoName,
+    opened: &'a knives::jj::Repo,
+    release: &'a ReleaseInHand,
+}
+
+/// Apply one stated change to each chosen repo's release in hand.
+fn run_release_edit(name: &str, change: &ReleaseEdit) -> anyhow::Result<Exit> {
+    let chosen = match selected(Some(name), false)? {
+        Ok(list) => list,
+        Err(exit) => return Ok(exit),
+    };
+    let mut worst = Exit::Ok;
+    for (repo, entry) in chosen {
+        worst = worst.worst(edit_release(&repo, &entry, change)?);
+    }
+    Ok(worst)
+}
+
+/// Edit the release in hand: one change, nothing else moves.
+///
+/// The whole command is the jj sequence agents fumble — duplicate the release
+/// onto the changed parent set, describe it, move its name — with the same pin
+/// gate a rebase has. The duplicate preserves recorded conflict resolutions;
+/// only the change itself can surface new conflicts, and they are reported.
+fn edit_release(
+    repo: &RepoName,
+    entry: &knives::config::RepoEntry,
+    change: &ReleaseEdit,
+) -> anyhow::Result<Exit> {
+    let opened = knives::jj::Repo::open(&entry.path)?;
+    let plan = release::plan(repo, entry, &entry.consumers)?;
+    let Some(release_name) = plan.release.clone() else {
+        println!("{repo}: no release to edit; cut one first");
+        return Ok(Exit::Incomplete);
+    };
+    // Follows from who pins it, exactly as for a rebase: a consumer that follows
+    // the branch sees the edit, one frozen on a revision does not. The way out
+    // differs by scheme, because a fixed branch cannot take a dated name.
+    if release::repair_effect(&plan.pins) == release::RepairEffect::NewDatedName {
+        match entry.release_scheme() {
+            ReleaseScheme::Dated => println!(
+                "{repo}: every pin of {release_name} is frozen, so editing it would reach \
+                 nobody; cut a new dated release first"
+            ),
+            ReleaseScheme::Fixed(_) => println!(
+                "{repo}: every pin of {release_name} is frozen, so editing the fixed branch \
+                 would reach nobody; update the frozen consumer pins, or change the release \
+                 scheme before editing it (fixed branches cannot reach revision pins)"
+            ),
         }
+        return Ok(Exit::Incomplete);
+    }
+    // Fail closed: parents are classified against the upstream trunk, and an
+    // unresolvable trunk would make every base look like a member — include
+    // would refuse for the wrong reason, and drop or advance could touch the
+    // base, which is `rebase`'s domain.
+    let Ok(trunk_tip) = opened.resolve_commit(&entry.upstream_trunk()) else {
+        println!(
+            "{repo}: cannot resolve {}; release edits classify parents against the upstream \
+             trunk, so fetch upstream first",
+            entry.upstream_trunk()
+        );
+        return Ok(Exit::Incomplete);
+    };
+    if !release_is_locally_movable(&opened, repo, &release_name)? {
+        return Ok(Exit::Incomplete);
+    }
+    let release = ReleaseInHand::read(&opened, entry, release_name, trunk_tip)?;
+    let context = EditContext {
+        repo,
+        opened: &opened,
+        release: &release,
+    };
+    let outcome = match change {
+        ReleaseEdit::Include { branch, why } => include_edit(&context, branch, why.as_deref())?,
+        ReleaseEdit::Drop { branch, why } => drop_edit(&context, branch, why)?,
+        ReleaseEdit::Advance { branches } => advance_edit(&context, entry, branches)?,
+    };
+    let (new_parents, delta) = match outcome {
+        EditOutcome::Settled(exit) => return Ok(exit),
+        EditOutcome::Done(parents, delta) => (parents, delta),
+    };
+    // Built through `cut_request` so an edited release's description reads exactly
+    // like a fresh cut's, from the same (source, commit) pairs.
+    let provenance = parent_sources(&opened, entry, &entry.release_scheme(), &new_parents)?;
+    let message = format!(
+        "{}\n\n{delta}",
+        cut_request(release.name.clone(), &provenance).message()
+    );
+    let duplicated = knives::jj::duplicate_onto(&entry.path, &release.commit, &new_parents)?;
+    let created = knives::jj::describe_commit(&entry.path, &duplicated, &message)?;
+    knives::jj::set_bookmark_anywhere(&entry.path, &release.name, created.as_str())?;
+    println!(
+        "{repo}: {} now has {} parent(s): {delta}",
+        release.name,
+        new_parents.len()
+    );
+    match knives::jj::conflicted_files(&entry.path, created.as_str()) {
+        Ok(files) => println!("{}", release::conflict_guidance(&files)),
+        Err(error) => println!("  could not list conflicts: {error}"),
     }
     Ok(Exit::Ok)
+}
+
+/// Add one parent. Nothing else moves: an advanced member is `advance`'s job.
+/// Whether the release name has one local position to move, saying why not when
+/// it has none.
+///
+/// Editing and rebasing both move a local bookmark. A release held only as a
+/// remote-tracking ref — what a fetch of somebody else's cut leaves, since jj
+/// creates no local bookmark for an untracked remote one — and one whose local
+/// bookmark is divergent both lack a single local position. jj rejects
+/// `name@remote` as a bookmark name outright, and it did so only after the
+/// duplicate had been made and described.
+fn release_is_locally_movable(
+    opened: &knives::jj::Repo,
+    repo: &RepoName,
+    name: &str,
+) -> anyhow::Result<bool> {
+    if bookmark_tip(opened, name)?.is_some() {
+        return Ok(true);
+    }
+    match name.split_once('@') {
+        Some((branch, remote)) => println!(
+            "{repo}: {name} is here only as a remote ref, so there is no local bookmark to \
+             move; `jj bookmark track {branch}@{remote}` first"
+        ),
+        None => println!(
+            "{repo}: {name} has no single local position, so there is nothing to move; \
+             resolve its divergence first"
+        ),
+    }
+    Ok(false)
+}
+
+fn include_edit(
+    context: &EditContext<'_>,
+    target: &str,
+    why: Option<&str>,
+) -> anyhow::Result<EditOutcome> {
+    let (repo, opened, release) = (context.repo, context.opened, context.release);
+    let tip = bookmark_tip(opened, target)?.or_else(|| opened.resolve_commit(target).ok());
+    let Some(tip) = tip else {
+        println!("{repo}: {target} is neither a local bookmark nor a resolvable revision");
+        return Ok(EditOutcome::Settled(Exit::Incomplete));
+    };
+    if release.parents.contains(&tip) {
+        println!("{repo}: {} already carries {target}", release.name);
+        return Ok(EditOutcome::Settled(Exit::Ok));
+    }
+    if opened.is_ancestor(&release.commit, &tip)? {
+        // Built on top of the release, not off the trunk. Including it would put
+        // the cut in its own successor's ancestry, and it carries the whole
+        // release with it rather than one branch's work.
+        println!(
+            "{repo}: {target} is stacked on {}, so it is not a member of it; rebase it off \
+             the trunk to include it",
+            release.name
+        );
+        return Ok(EditOutcome::Settled(Exit::Incomplete));
+    }
+    if opened.is_ancestor(&tip, &release.commit)? {
+        // Reachable through another parent's history — a stacked branch, or one
+        // whose content landed in the base. Membership is the parent set, so
+        // this is not a member; say which situation holds rather than
+        // pretending the include happened.
+        println!(
+            "{repo}: {target}'s content is already in {} through another parent's history; \
+             it is not a member parent itself, and whichever parent carries it represents it",
+            release.name
+        );
+        return Ok(EditOutcome::Settled(Exit::Ok));
+    }
+    if release.trunk_tips.contains(&tip) {
+        // A release is a flat merge of feature and fix branches; upstream enters
+        // through the members' bases, never as a parent. Checked before the
+        // member scan below, because a member that landed upstream is an
+        // ancestor of the trunk and would otherwise answer for it.
+        println!(
+            "{repo}: {target} is the trunk, not a feature or fix branch; {} carries \
+             upstream through its members' bases, never as a parent",
+            release.name
+        );
+        return Ok(EditOutcome::Settled(Exit::Incomplete));
+    }
+    for parent in release.members() {
+        if opened.is_ancestor(parent, &tip)? {
+            println!(
+                "{repo}: {} carries {} of {target}, and the branch has advanced; moving a \
+                 member is its own decision: `knives release advance {target}`",
+                release.name,
+                short12(parent)
+            );
+            return Ok(EditOutcome::Settled(Exit::Incomplete));
+        }
+    }
+    let mut parents = release.parents.clone();
+    parents.push(tip);
+    let why = why.map_or_else(String::new, |why| format!(" ({why})"));
+    let delta = format!("included {target}{why}");
+    Ok(EditOutcome::Done(parents, delta))
+}
+
+/// Remove one member parent. The branch and its bookmark are untouched.
+fn drop_edit(context: &EditContext<'_>, target: &str, why: &str) -> anyhow::Result<EditOutcome> {
+    let (repo, opened, release) = (context.repo, context.opened, context.release);
+    let mut candidates = Vec::new();
+    if let Some(tip) = bookmark_tip(opened, target)? {
+        if release.parents.contains(&tip) {
+            // The bookmark sits exactly on a parent: that parent is the branch.
+            candidates.push(tip);
+        } else {
+            // Ancestry is the fallback for a branch that has advanced past its
+            // released parent. It can be ambiguous — a parent whose history the
+            // branch shares also matches — and ambiguity refuses below.
+            for parent in release.members() {
+                if opened.is_ancestor(parent, &tip)? {
+                    candidates.push(parent.clone());
+                }
+            }
+        }
+    } else if let Ok(commit) = opened.resolve_commit(target) {
+        if release.parents.contains(&commit) {
+            candidates.push(commit);
+        }
+    } else {
+        println!("{repo}: {target} is neither a local bookmark nor a resolvable revision");
+        return Ok(EditOutcome::Settled(Exit::Incomplete));
+    }
+    match candidates.as_slice() {
+        [] => {
+            println!(
+                "{repo}: {} carries no parent of {target}; name the parent's commit id",
+                release.name
+            );
+            Ok(EditOutcome::Settled(Exit::Incomplete))
+        }
+        [parent] => {
+            let mut parents = release.parents.clone();
+            parents.retain(|kept| kept != parent);
+            // A drop only removes the parent; whether the content survives
+            // depends on the remaining members' ancestry. Losing it is often
+            // the point (a bad fix) and sometimes a surprise (a landed pull
+            // the members' bases do not reach yet), so the fact is stated
+            // rather than judged.
+            let mut carried_elsewhere = false;
+            for kept in &parents {
+                if opened.is_ancestor(parent, kept)? {
+                    carried_elsewhere = true;
+                    break;
+                }
+            }
+            if !carried_elsewhere {
+                println!(
+                    "{repo}: no remaining member carries {target}'s content; the release \
+                     loses it"
+                );
+            }
+            let delta = format!("dropped {target}: {why}");
+            Ok(EditOutcome::Done(parents, delta))
+        }
+        many => {
+            let listed: Vec<String> = many.iter().map(short12).collect();
+            println!(
+                "{repo}: {target} matches {} parents of {} ({}); name one by commit id",
+                many.len(),
+                release.name,
+                listed.join(", ")
+            );
+            Ok(EditOutcome::Settled(Exit::Incomplete))
+        }
+    }
+}
+
+/// Move member parents to their branches' current tips, and only those named.
+///
+/// Bare `advance` is parent-driven: every member whose branch moved on. Named
+/// branches are strict — asking to advance something that is not a member is
+/// answered, not improvised around. Both work from the same population, the
+/// branches a release can carry: the trunk and our release names are not among
+/// them, and a member advanced onto either would leave the release carrying a
+/// second base or its own predecessor.
+fn advance_edit(
+    context: &EditContext<'_>,
+    entry: &knives::config::RepoEntry,
+    branches: &[BranchName],
+) -> anyhow::Result<EditOutcome> {
+    let tips = context.opened.bookmark_tips()?;
+    let carried = release::carried_from_tips(&tips, entry.trunk(), &entry.release_scheme());
+    let outcome = if branches.is_empty() {
+        advance_every_member(context, &carried)?
+    } else {
+        advance_named_members(context, &carried, branches)?
+    };
+    let Some((parents, moved)) = outcome else {
+        return Ok(EditOutcome::Settled(Exit::Incomplete));
+    };
+    if moved.is_empty() {
+        // Only a bare advance looked at every member, so only it can say so; a
+        // named advance has already reported each branch it found at its tip.
+        if branches.is_empty() {
+            println!(
+                "{}: every member of {} is at its branch tip",
+                context.repo, context.release.name
+            );
+        }
+        return Ok(EditOutcome::Settled(Exit::Ok));
+    }
+    // Stacked members advanced to one tip collapse into a single parent.
+    let mut deduped = Vec::new();
+    for parent in parents {
+        if !deduped.contains(&parent) {
+            deduped.push(parent);
+        }
+    }
+    let delta = format!("advanced {}", moved.join(", "));
+    Ok(EditOutcome::Done(deduped, delta))
+}
+
+/// Advance every member whose branch has moved on. `None` is a refusal that
+/// has already said why.
+///
+/// Two-phase: every move and every ambiguity is found first, and any ambiguity
+/// refuses the whole edit. A bare `advance` promises "every advanced member",
+/// and advancing some while skipping others would deliver a composition nobody
+/// asked for while reporting success.
+fn advance_every_member(
+    context: &EditContext<'_>,
+    carried: &[(String, knives::ids::CommitId)],
+) -> anyhow::Result<Option<(Vec<knives::ids::CommitId>, Vec<String>)>> {
+    let (repo, opened, release) = (context.repo, context.opened, context.release);
+    // A branch built on top of the release descends from every member, so
+    // ancestry alone would call it their advanced tip. Advancing onto one folds
+    // work nobody included into the release and puts the cut in its own
+    // successor's ancestry, so it is not a candidate at all.
+    let mut off_release: Vec<(String, knives::ids::CommitId)> = Vec::new();
+    for (branch, tip) in carried {
+        if !opened.is_ancestor(&release.commit, tip)? {
+            off_release.push((branch.clone(), tip.clone()));
+        }
+    }
+    let mut parents = release.parents.clone();
+    let mut advances: Vec<(usize, String, knives::ids::CommitId)> = Vec::new();
+    let mut ambiguous: Vec<String> = Vec::new();
+    for (index, parent) in parents.iter().enumerate() {
+        let mut successors = Vec::new();
+        for (branch, tip) in &off_release {
+            if tip != parent && opened.is_ancestor(parent, tip)? {
+                successors.push((branch.clone(), tip.clone()));
+            }
+        }
+        match successors.as_slice() {
+            [] => {}
+            [(branch, tip)] => advances.push((index, branch.clone(), tip.clone())),
+            many => {
+                let names: Vec<String> = many.iter().map(|(branch, _)| branch.clone()).collect();
+                ambiguous.push(format!(
+                    "parent {} has several advanced branches ({})",
+                    short12(parent),
+                    names.join(", ")
+                ));
+            }
+        }
+    }
+    if !ambiguous.is_empty() {
+        for line in &ambiguous {
+            println!("{repo}: {line}");
+        }
+        println!("{repo}: nothing advanced; advance the ambiguous members by name");
+        return Ok(None);
+    }
+    let mut moved: Vec<String> = Vec::new();
+    for (index, branch, tip) in advances {
+        if let Some(slot) = parents.get_mut(index) {
+            *slot = tip;
+        }
+        moved.push(branch);
+    }
+    Ok(Some((parents, moved)))
+}
+
+/// Advance exactly the named branches, refusing anything unanswerable: `None`
+/// is a refusal that has already said why.
+fn advance_named_members(
+    context: &EditContext<'_>,
+    carried: &[(String, knives::ids::CommitId)],
+    branches: &[BranchName],
+) -> anyhow::Result<Option<(Vec<knives::ids::CommitId>, Vec<String>)>> {
+    let (repo, opened, release) = (context.repo, context.opened, context.release);
+    let mut parents = release.parents.clone();
+    let mut moved: Vec<String> = Vec::new();
+    for branch in branches {
+        let named = carried
+            .iter()
+            .find(|(carried, _)| carried == branch.as_str())
+            .map(|(_, tip)| tip.clone());
+        let Some(tip) = named else {
+            if bookmark_tip(opened, branch.as_str())?.is_some() {
+                // The trunk and our release names are the two bookmarks a release
+                // can never carry, and naming one here reached the same mover the
+                // bare advance deliberately keeps them away from.
+                println!(
+                    "{repo}: {branch} is the trunk or a release name, so it is never a member \
+                     of {}",
+                    release.name
+                );
+            } else {
+                println!("{repo}: no local bookmark named {branch}");
+            }
+            return Ok(None);
+        };
+        if parents.contains(&tip) {
+            println!("{repo}: {branch} is already at its tip in {}", release.name);
+            continue;
+        }
+        if opened.is_ancestor(&release.commit, &tip)? {
+            println!(
+                "{repo}: {branch} is stacked on {}, so advancing a member onto it would fold \
+                 in work nobody included and put the cut in its own ancestry",
+                release.name
+            );
+            return Ok(None);
+        }
+        // Matched by commit rather than by position, so no index invariant has to
+        // hold and the count and the listing below cannot disagree.
+        let mut matched = Vec::new();
+        for parent in &parents {
+            if parent != &tip && opened.is_ancestor(parent, &tip)? {
+                matched.push(parent.clone());
+            }
+        }
+        match matched.as_slice() {
+            [] => {
+                println!(
+                    "{repo}: {} carries no parent of {branch}; `knives release include \
+                     {branch}` adds it",
+                    release.name
+                );
+                return Ok(None);
+            }
+            [parent] => {
+                for slot in parents.iter_mut().filter(|slot| **slot == *parent) {
+                    *slot = tip.clone();
+                }
+                moved.push(branch.to_string());
+            }
+            many => {
+                let listed: Vec<String> = many.iter().map(short12).collect();
+                println!(
+                    "{repo}: {branch} descends from {} parents of {} ({}); drop and \
+                     include instead",
+                    many.len(),
+                    release.name,
+                    listed.join(", ")
+                );
+                return Ok(None);
+            }
+        }
+    }
+    Ok(Some((parents, moved)))
+}
+
+/// A local bookmark's tip, when the name is one.
+fn bookmark_tip(
+    opened: &knives::jj::Repo,
+    name: &str,
+) -> anyhow::Result<Option<knives::ids::CommitId>> {
+    Ok(opened
+        .bookmark_tips()?
+        .get(&knives::ids::BookmarkRef::Local(
+            knives::ids::BranchName::new(name),
+        ))
+        .cloned())
+}
+
+/// Name each parent for the release description: the branch holding it, the
+/// trunk it descends from, or its own id when nothing else does.
+fn parent_sources(
+    opened: &knives::jj::Repo,
+    entry: &knives::config::RepoEntry,
+    scheme: &ReleaseScheme,
+    parents: &[knives::ids::CommitId],
+) -> anyhow::Result<Vec<(String, knives::ids::CommitId)>> {
+    let tips = opened.bookmark_tips()?;
+    let carried = release::carried_from_tips(&tips, entry.trunk(), scheme);
+    let trunk_tip = opened.resolve_commit(&entry.upstream_trunk()).ok();
+    let mut sources = Vec::new();
+    for commit in parents {
+        let named = carried
+            .iter()
+            .find(|(_, tip)| tip == commit)
+            .map(|(branch, _)| branch.clone());
+        let source = if let Some(named) = named {
+            named
+        } else if let Some(trunk) = &trunk_tip
+            && opened.is_ancestor(commit, trunk)?
+        {
+            entry.upstream_trunk()
+        } else {
+            short12(commit)
+        };
+        sources.push((source, commit.clone()));
+    }
+    Ok(sources)
+}
+
+/// A commit id at the length this program shows them: enough to be unique in a
+/// fork, short enough to read in a line of prose.
+fn short12(commit: &knives::ids::CommitId) -> String {
+    commit.as_str().chars().take(12).collect()
 }
 
 /// Hand a branch back and remove its workspace. The inverse of `start`.
@@ -584,7 +1186,6 @@ fn run_release(
         Ok(list) => list,
         Err(exit) => return Ok(exit),
     };
-    let store = Store::open(default_state_path())?;
     let mut worst = Exit::Ok;
     for (repo, entry) in chosen {
         // Consumers recorded in the registry are the answer to `--consumer`; asking for
@@ -601,42 +1202,55 @@ fn run_release(
         };
         worst = worst.worst(release_plan_exit(&repo, &entry, &consumers, &opened)?);
 
-        // What the plan said it would include, so a cut cannot quietly differ from it.
-        let all = release::carried_branches(&opened, entry.trunk(), &scheme)?;
-        let names: Vec<String> = all.iter().map(|(branch, _)| branch.clone()).collect();
-        let (chosen, left_out) = store.release_membership(&repo, &names);
-        report_left_out(&repo, &left_out);
         if let Some(name) = cut_name {
-            let mut carried: Vec<_> = all
-                .iter()
-                .filter(|(branch, _)| chosen.contains(branch))
-                .cloned()
-                .collect();
-            // The upstream trunk is a parent of every cut. Without it a release held only
-            // whatever upstream its branches were based on, so dropping a branch whose
-            // pull request had merged took the change out of the release with it: the
-            // merge commit lived upstream and had never been merged in here.
             let trunk_name = entry.upstream_trunk();
             let trunk = opened.resolve_commit(&trunk_name)?;
-            carried.insert(0, (trunk_name, trunk.clone()));
             if let Some(orphaned) = check_orphan_commits_before_cut(&opened, &entry, trunk.clone())?
                 && let Some(exit) = report_orphaned_cut(&repo, &orphaned, allow_drop)
             {
                 return Ok(exit);
             }
-            let request = cut_request(name.clone(), &carried);
             let previous_commit =
-                release::previous_release_for_cut(&opened, &entry, &opened.bookmark_tips()?)
+                release::previous_release_for_cut(&entry, &opened.bookmark_tips()?)
                     .map(|(_, commit)| commit);
+            // A cut is a new name for the composition in hand, never a recomputation:
+            // with a previous release its parents are carried verbatim — nothing joins,
+            // nothing advances, and a branch enters through `release include`. Only the
+            // first cut has no composition to carry, so it starts from every branch: a
+            // release is a flat merge of feature and fix branches, and the upstream
+            // base is never a direct parent — it is reachable through every member.
+            let (carried, members, audit_base) = if let Some(previous) = &previous_commit {
+                let parents: Vec<knives::ids::CommitId> = opened
+                    .parents_of(previous.as_str())?
+                    .into_iter()
+                    .map(|parent| parent.commit)
+                    .collect();
+                let carried = parent_sources(&opened, &entry, &scheme, &parents)?;
+                let members = carried.clone();
+                let base = release::shared_base(&opened, previous, &trunk)?
+                    .unwrap_or_else(|| trunk.clone());
+                (carried, members, base)
+            } else {
+                let carried = release::carried_branches(&opened, entry.trunk(), &scheme)?;
+                if carried.is_empty() {
+                    println!(
+                        "{repo}: no branches to cut; a release is a flat merge of feature \
+                         and fix branches, and there are none"
+                    );
+                    return Ok(Exit::Incomplete);
+                }
+                let members = carried.clone();
+                (carried, members, trunk.clone())
+            };
+            let request = cut_request(name.clone(), &carried);
             let created = release::build_cut(&entry.path, &request, previous_commit.as_ref())?;
-            let member_tips: Vec<_> = carried.iter().skip(1).cloned().collect();
             let audit = match release::audit_cut(
                 &entry.path,
-                &member_tips,
+                &members,
                 &created,
                 release::AuditContext {
                     previous: previous_commit.as_ref(),
-                    trunk: &trunk,
+                    trunk: &audit_base,
                 },
             ) {
                 Ok(audit) => audit,
@@ -646,29 +1260,8 @@ fn run_release(
                     return Err(error);
                 }
             };
-            for name in &audit.inconclusive {
-                println!(
-                    "  {name}: content check inconclusive (replay conflicted; \
-                     re-check after resolving the cut's conflicts)"
-                );
-            }
-            if !audit.passed() {
-                for name in &audit.missing {
-                    println!(
-                        "  !! {name}: the cut tree is missing or diverges from the member's content"
-                    );
-                }
-                for file in &audit.unexplained {
-                    println!(
-                        "  !! {file}: changed between the previous release and this cut \
-                         with no member or trunk explaining it"
-                    );
-                }
-                knives::jj::abandon_commits(&entry.path, std::slice::from_ref(&created))?;
-                println!(
-                    "{repo}: cut abandoned; nothing was named or pushed. Fix the inputs and re-cut."
-                );
-                return Ok(Exit::Incomplete);
+            if let Some(exit) = report_cut_audit(&repo, &entry, &created, &audit)? {
+                return Ok(exit);
             }
             release::name_cut(&entry.path, &request.name, &created, &scheme)?;
             worst = worst.worst(report_completed_cut(
@@ -723,17 +1316,39 @@ fn release_plan_exit(
     Ok(exit)
 }
 
-fn report_left_out(repo: &RepoName, left_out: &[(String, String)]) {
-    if left_out.is_empty() {
-        return;
+/// Say what the audit found; abandon and refuse when it failed.
+///
+/// Inconclusive members are reported without failing the cut: a conflicted
+/// replay onto a conflicted cut answers nothing either way. Missing or
+/// unexplained content abandons the cut, because naming it would look exactly
+/// like success while work is gone.
+fn report_cut_audit(
+    repo: &RepoName,
+    entry: &knives::config::RepoEntry,
+    created: &knives::ids::CommitId,
+    audit: &release::CutAudit,
+) -> anyhow::Result<Option<Exit>> {
+    for name in &audit.inconclusive {
+        println!(
+            "  {name}: content check inconclusive (replay conflicted; \
+             re-check after resolving the cut's conflicts)"
+        );
     }
-    println!(
-        "{repo}: {} branch(es) left out of the release",
-        left_out.len()
-    );
-    for (branch, why) in left_out {
-        println!("  {branch}  {why}");
+    if audit.passed() {
+        return Ok(None);
     }
+    for name in &audit.missing {
+        println!("  !! {name}: the cut tree is missing or diverges from the member's content");
+    }
+    for file in &audit.unexplained {
+        println!(
+            "  !! {file}: changed between the previous release and this cut \
+             with no member or trunk explaining it"
+        );
+    }
+    knives::jj::abandon_commits(&entry.path, std::slice::from_ref(created))?;
+    println!("{repo}: cut abandoned; nothing was named or pushed. Fix the inputs and re-cut.");
+    Ok(Some(Exit::Incomplete))
 }
 
 struct CompletedCut<'a> {
@@ -759,7 +1374,7 @@ fn report_completed_cut(
     println!(
         "  cut {} as {} with {} parent(s), flat, not pushed",
         cut.name,
-        cut.created.as_str().chars().take(12).collect::<String>(),
+        short12(cut.created),
         cut.request.parents.len()
     );
     match knives::jj::conflicted_files(&entry.path, cut.created.as_str()) {
@@ -778,17 +1393,24 @@ fn report_completed_cut(
         .into_iter()
         .map(|(workspace, _)| workspace.to_string())
         .collect();
-    let carried_names: Vec<String> = cut
+    // A branch that still exists locally is not dropped, merely not carried;
+    // only a workspace whose branch is gone entirely is left-behind cruft.
+    let mut carried_names: Vec<String> = cut
         .carried
         .iter()
         .map(|(branch, _)| branch.clone())
         .collect();
+    carried_names.extend(
+        release::carried_branches(opened, entry.trunk(), &entry.release_scheme())?
+            .into_iter()
+            .map(|(branch, _)| branch),
+    );
     let orphans = release::workspaces_to_clean(&present, &carried_names);
     if orphans.is_empty() {
-        println!("  no workspaces left by dropped branches");
+        println!("  every workspace still has a branch");
     } else {
         println!(
-            "  {} workspace(s) belong to branches this cut dropped: {}",
+            "  {} workspace(s) belong to branches that no longer exist: {}",
             orphans.len(),
             orphans.join(", ")
         );
@@ -821,10 +1443,7 @@ fn report_orphaned_cut(
         orphaned.previous
     );
     for commit in &orphaned.commits {
-        println!(
-            "    {}",
-            commit.as_str().chars().take(12).collect::<String>()
-        );
+        println!("    {}", short12(commit));
     }
     println!("  re-run with --allow-drop to state this is intended");
     Some(Exit::Incomplete)
@@ -837,7 +1456,7 @@ fn check_orphan_commits_before_cut(
 ) -> anyhow::Result<Option<OrphanedLineage>> {
     let scheme = entry.release_scheme();
     let tips = opened.bookmark_tips()?;
-    let Some(previous) = release::previous_release_for_cut(opened, entry, &tips) else {
+    let Some(previous) = release::previous_release_for_cut(entry, &tips) else {
         return Ok(None);
     };
     let mut keep: Vec<knives::ids::CommitId> = tips
@@ -938,7 +1557,7 @@ fn print_previous_release_position(opened: &knives::jj::Repo, entry: &knives::co
     if let Some((reference, commit)) = release::previous_position(opened, entry) {
         println!(
             "  previous release position: {reference} at {}",
-            &commit.as_str()[..12.min(commit.as_str().len())]
+            short12(&commit)
         );
     } else if matches!(entry.release_scheme(), ReleaseScheme::Fixed(_)) {
         println!("  no previous release position: this is the first cut of the fixed branch");

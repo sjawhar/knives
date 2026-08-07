@@ -193,6 +193,31 @@ impl Lab {
         jj(&self.work, ["git", "fetch", "--remote", "upstream"]);
     }
 
+    /// Merge a published pull into upstream's trunk with a real merge commit,
+    /// the way a merge-commit forge button does: the branch tip itself becomes
+    /// an ancestor of the trunk.
+    pub(crate) fn merge_pull_with_merge_commit(&self, number: u64) {
+        let pull = format!("refs/pull/{number}/head:refs/remotes/origin/pull/{number}/head");
+        git(&self.maintainer, &self.trunk, ["fetch", "origin", &pull]);
+        git(
+            &self.maintainer,
+            &self.trunk,
+            ["checkout", self.trunk.as_str()],
+        );
+        let pull = format!("origin/pull/{number}/head");
+        git(
+            &self.maintainer,
+            &self.trunk,
+            ["merge", "--no-ff", "-m", "merge pull", &pull],
+        );
+        git(
+            &self.maintainer,
+            &self.trunk,
+            ["push", "origin", self.trunk.as_str()],
+        );
+        jj(&self.work, ["git", "fetch", "--remote", "upstream"]);
+    }
+
     pub(crate) fn rebase_and_force_push(&self, branch: &str) {
         jj(&self.work, ["git", "fetch", "--remote", "upstream"]);
         let upstream_trunk = format!("{}@upstream", self.trunk);

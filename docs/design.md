@@ -144,12 +144,13 @@ knives start BRANCH            claim, create the workspace, base it on the relea
 knives finish BRANCH           hand back claim and remove workspace
 knives track BRANCH --pr N     state which PR a branch belongs to, overriding inference
 knives depends BRANCH --on R#N  record that a branch cannot land before something else
-knives release [NAME]          plan, cut, or reap a release under the configured scheme
-knives release cut [NAME]      cut a release after audit; NAME is the dated name, fixed needs none; [--allow-drop] overrides orphan refusal; never pushes
-knives release reap            reap superseded dated release bookmarks everywhere locally and abandon their commits
-knives release include BRANCH  state that a branch belongs in the next release
-knives release drop BRANCH     state that it does not; survives the every-branch fallback
-knives release rebase [REF]    replace superseded base, keeping branch parents; repair in place when possible, else require new dated cut
+knives release [NAME]          plan, cut, edit or reap a release under the configured scheme
+knives release cut [NAME]      name a new cut of the composition in hand, verbatim (first cut: every branch); refuses to orphan commits ([--allow-drop] overrides); never pushes
+knives release reap            reap superseded dated release bookmarks everywhere locally and abandon their commits; all kept while the live cut carries conflicts
+knives release include BRANCH  add a branch (or revision) to the release as one new parent; nothing else moves
+knives release drop BRANCH     remove a branch's parent from the release; the branch and its bookmark are untouched
+knives release advance [BR..]  move member parents to their branches' tips; named branches only, or every advanced member when bare
+knives release rebase [REF]    jj rebase -b <release> -d REF (default upstream trunk): members and release move together, bookmarks following
 ```
 
 `--json` on any command, and it is the default when the environment says an agent is running it. Agents were grepping human output to count findings by detector.
@@ -192,16 +193,18 @@ Workspaces are effectively free: 0.15 to 0.55s to create, because tracked conten
 
 ### `knives release`
 
-Cuts or repairs a release under the repository's configured scheme. Everything here is a check, never a prompt: a CLI in a non-interactive agent session has nobody to ask.
+Cuts, edits or repairs a release under the repository's configured scheme. Everything here is a check, never a prompt: a CLI in a non-interactive agent session has nobody to ask.
+
+A release's parent set is its membership: a flat merge of feature and fix branches, never the upstream base — members fork from it, so it is reachable through every one of them, and no base/member role exists to classify. `include`, `drop` and `advance` are the membership edits, each duplicating the release onto the changed parent set so recorded conflict resolutions carry forward; a cut names the composition in hand verbatim. Nothing recomputes membership from the branch list after the first cut.
 
 - **Support both dated and fixed release schemes.**
   - **Dated scheme (default):** `knives release` inspects consumer pins to decide whether a release is pinned. Pinned releases require a new dated suffix (`release/YYYY-MM-DD`); unpinned releases repair in place. `knives release cut NAME` executes the cut.
-  - **Fixed scheme (`release_branch` set):** `knives release` takes no name argument, rebuilds the flat octopus merge, and advances the fixed branch in place via a sideways bookmark move (`jj::set_bookmark_anywhere`). Publishing remains a manual `jj git push`. The previous fixed release position is read from the publish remote-tracking reference (`{fixed}@release` or `{fixed}@origin`) prior to push (`release::previous_position`). Fixed release selection considers only the local fixed branch and its publish-remote counterpart.
+  - **Fixed scheme (`release_branch` set):** `knives release` takes no name argument and advances the fixed branch in place via a sideways bookmark move (`jj::set_bookmark_anywhere`). Publishing remains a manual `jj git push`. The cut carries the *local* composition in hand under this scheme as under the dated one (`release::previous_release_for_cut`), unpushed edits included; reading the publish remote instead once made a fixed cut duplicate the stale published position and silently revert them. The published position is read separately from the publish remote-tracking reference (`{fixed}@release` or `{fixed}@origin`) and reported alongside (`release::previous_position`). Fixed release selection considers only the local fixed branch and its publish-remote counterpart.
 - Build from explicit commit IDs and verify the parent count before pushing.
 - Expect a real conflict and resolve it in the merge. Independent branches that each append a config key land in the same regions; one ten-parent cut carried a 4-sided conflict in one file and a 3-sided one in another. Resolve as a union, keep a shared helper defined exactly once, and land a config key in every loader.
 - Compare the merged test count against a single contributing branch. A total lower than one branch's own count means a branch's tests were dropped.
-- Stamp per-parent provenance recording which PR ref each parent came from, so `knives sync` knows what to check. This records provenance and pins nothing, since a jj octopus's parents are already specific commits.
-- **Clean up workspaces belonging to branches the cut has dropped.**
+- Stamp per-parent provenance recording where each parent came from — the branch holding it, the trunk it descends from, or its own id — so `knives sync` knows what to check. This records provenance and pins nothing, since a jj octopus's parents are already specific commits.
+- **Clean up workspaces whose branch no longer exists anywhere.** A branch the cut did not carry is not dropped, merely not a member; only a workspace with no bookmark left holding its branch is cruft.
 
 Releases stay **flat**. A nested integration node was considered and rejected: it makes dropping a landed parent harder, forces staleness detection to recurse, creates code that cannot be upstreamed until several PRs land, and destroys the empty-merge invariant that makes a cut verifiable. The case that prompted it dissolved by exposing an object rather than copying its fields.
 

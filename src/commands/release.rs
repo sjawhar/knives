@@ -1,19 +1,22 @@
-//! `knives release`: cut or repair a release.
+//! `knives release`: plan, cut, edit or repair a release.
 //!
 //! Everything here is a check, never a prompt. A CLI in a non-interactive agent
 //! session has nobody to ask, so it decides from evidence and says what it
-//! decided. Cutting is opt-in: planning is the default because this is the only
-//! command that writes to a remote.
-// allow: SIZE_OK: 1383 lines - the release lifecycle's plan, cut, audit, reap, and rebase operations are one domain seam.
+//! decided. Planning is the default because everything else here writes: a cut
+//! names a composition, and `include`, `drop`, `advance` and `rebase` change
+//! one. Every one of them writes locally only, and none of them pushes.
+// allow: SIZE_OK: 1496 lines - the release lifecycle's plan, cut, edit, audit, reap, and rebase operations are one domain seam.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use crate::cli::Exit;
 use crate::config::{RepoEntry, Role};
-use crate::detect::{BookmarkTips, Finding, FindingKind, RebaseOutcome, Subject, stale_parents};
+use crate::detect::{
+    BookmarkTips, Finding, FindingKind, RebaseOutcome, ReleaseParent, Subject, stale_parents,
+};
 use crate::ids::{
-    BookmarkRef, CommitId, ReleaseScheme, RepoName, is_our_release, is_release_name,
+    BookmarkRef, BranchName, CommitId, ReleaseScheme, RepoName, is_our_release, is_release_name,
     strict_dated_release,
 };
 use crate::jj::{self, OriginTrunk, Repo};
@@ -162,21 +165,20 @@ pub fn previous_position(repo: &Repo, entry: &RepoEntry) -> Option<(String, Comm
         .map(|commit| (reference, commit))
 }
 
-/// The release the next cut supersedes: the newest dated cut, or under the
-/// fixed scheme the publish remote's current position.
+/// The release the next cut carries: the composition in hand.
 ///
-/// The local fixed bookmark may already have moved, whereas consumers observe
-/// the publish remote that [`previous_position`] reads.
+/// Local-preferred under both schemes, because a cut names what is here —
+/// including edits (`include`, `drop`, `advance`) not yet pushed. Reading the
+/// publish remote instead once made a fixed-scheme cut duplicate the stale
+/// published position and silently revert unpushed local edits.
+/// [`previous_position`] remains the seam for what consumers observe.
 pub fn previous_release_for_cut(
-    repo: &Repo,
     entry: &RepoEntry,
     tips: &BookmarkTips,
 ) -> Option<(String, CommitId)> {
-    match entry.release_scheme() {
-        ReleaseScheme::Dated => newest_release(tips, &ReleaseScheme::Dated, entry.publish_remote())
-            .map(|(reference, commit)| (reference.to_string(), commit)),
-        ReleaseScheme::Fixed(_) => previous_position(repo, entry),
-    }
+    let scheme = entry.release_scheme();
+    newest_release(tips, &scheme, entry.publish_remote())
+        .map(|(reference, commit)| (reference.to_string(), commit))
 }
 
 #[cfg(test)]
@@ -207,7 +209,6 @@ mod scheme_tests {
 #[derive(Debug, Default)]
 pub struct Plan {
     pub repo: String,
-    pub base: Option<CommitId>,
     pub base_findings: Vec<Finding>,
     pub release: Option<String>,
     pub parents: Vec<(CommitId, Vec<String>)>,
@@ -221,12 +222,13 @@ pub struct Plan {
     pub problems: Vec<String>,
 }
 
-impl Plan {}
-
-/// Everything we carry: the current tip of each of our branches.
+/// Every branch we hold: the current tip of each of them.
 ///
-/// A fresh cut is a flat merge of the upstream trunk and exactly these. Explicit commit
-/// ids are read here, once, so a branch moving mid-cut cannot change what gets merged.
+/// This is the *first* cut's membership — trunk plus exactly these — and after
+/// that it is only the candidate set an `include` can be asked for, because a
+/// later cut carries the composition in hand instead of recomputing it.
+/// Explicit commit ids are read here, once, so a branch moving mid-cut cannot
+/// change what gets merged.
 pub fn carried_branches(
     repo: &Repo,
     trunk: &str,
@@ -273,7 +275,7 @@ pub fn trunk_lag(repo: &Repo, release: Option<&str>, upstream_trunk: &str) -> Op
     }
     Some(format!(
         "{release} does not contain the upstream trunk ({})",
-        &trunk.as_str()[..12.min(trunk.as_str().len())]
+        short(&trunk)
     ))
 }
 
@@ -346,20 +348,20 @@ pub fn shared_base(
     Ok(None)
 }
 
-/// Members whose trunk ancestry exceeds the shared base (#10).
+/// Branches whose trunk ancestry exceeds the shared base (#10).
 ///
-/// A member based past the base drags newer upstream into the next cut through
+/// A branch based past the base drags newer upstream into the next cut through
 /// itself alone, which surfaces as a conflict storm blamed on everything else.
 /// The finding names the branch so the fix (rebase it onto the base, or move
 /// the base deliberately) happens before the cut.
 pub fn mixed_base_findings(
     repo_path: &Path,
-    members: &[(String, CommitId)],
+    branches: &[(String, CommitId)],
     base: &CommitId,
     trunk_tip: &CommitId,
 ) -> Result<Vec<Finding>, crate::jj::JjError> {
     let mut findings = Vec::new();
-    for (name, tip) in members {
+    for (name, tip) in branches {
         let beyond = crate::jj::commits_matching(
             repo_path,
             &format!(
@@ -501,11 +503,16 @@ pub struct ReapReport {
 ///
 /// The newest dated name never appears in the enumeration, and the
 /// `previous_position` seam is `Fixed`-scheme-only while dated names are the
-/// only thing enumerated, so neither needs a runtime gate here. What does:
+/// only thing enumerated, so neither needs a runtime gate here. Two things do:
 /// a cut with local descendants is someone's stacked work (#4's third loss
-/// mode) and is refused with the descendants named. Parked workspace working
-/// copies — empty, undescribed — do not block: they sit on release merges as a
-/// matter of course and jj rebases them harmlessly.
+/// mode) and is refused with the descendants named; and while the live cut
+/// still carries conflicts, every superseded cut is kept, because the previous
+/// cut is the only record of how those conflicts were last resolved — reaping
+/// it while the successor is unsettled destroys the record exactly when an
+/// abandon-and-recut would need it.
+///
+/// Parked workspace working copies — empty, undescribed — do not block: they sit
+/// on release merges as a matter of course and jj rebases them harmlessly.
 ///
 /// Never touches a remote. A later fetch re-materializes forgotten refs as
 /// untracked (jj keeps no memory of forgetting); that is expected, harmless to
@@ -519,6 +526,28 @@ pub fn reap_superseded(repo_path: &Path, repo: &Repo) -> anyhow::Result<ReapRepo
         if !targets.contains(&commit) {
             targets.push(commit);
         }
+    }
+    if !by_name.is_empty()
+        && let Some((live, commit)) = live_dated_release(&tips)
+        && !crate::jj::conflicted_files(repo_path, commit.as_str())?.is_empty()
+    {
+        return Ok(ReapReport {
+            reaped: Vec::new(),
+            forgotten_only: Vec::new(),
+            kept: by_name
+                .into_keys()
+                .map(|name| {
+                    (
+                        name,
+                        format!(
+                            "the live cut {live} still carries conflicts; a superseded cut \
+                             is the record of their last resolution"
+                        ),
+                    )
+                })
+                .collect(),
+            notes: Vec::new(),
+        });
     }
 
     let mut report = ReapReport {
@@ -537,11 +566,7 @@ pub fn reap_superseded(repo_path: &Path, repo: &Repo) -> anyhow::Result<ReapRepo
                 ),
             )?;
             if !descendants.is_empty() {
-                let sample: Vec<String> = descendants
-                    .iter()
-                    .take(3)
-                    .map(|commit| commit.as_str().chars().take(12).collect())
-                    .collect();
+                let sample: Vec<String> = descendants.iter().take(3).map(short).collect();
                 report.kept.push((
                     name.clone(),
                     format!("has local descendant(s): {}", sample.join(", ")),
@@ -561,6 +586,24 @@ pub fn reap_superseded(repo_path: &Path, repo: &Repo) -> anyhow::Result<ReapRepo
         }
     }
     Ok(report)
+}
+
+/// The newest dated cut's branch name — unqualified, unlike
+/// [`previous_release_for_cut`]'s — and its live commit: the local ref when
+/// present, otherwise whichever of our remotes carries it.
+fn live_dated_release(tips: &BookmarkTips) -> Option<(BranchName, CommitId)> {
+    let newest = tips
+        .keys()
+        .filter(|reference| is_our_release(reference, &ReleaseScheme::Dated))
+        .filter_map(|reference| strict_dated_release(reference.branch().as_str()))
+        .max()?;
+    tips.iter()
+        .filter(|(reference, _)| {
+            is_our_release(reference, &ReleaseScheme::Dated)
+                && strict_dated_release(reference.branch().as_str()).as_ref() == Some(&newest)
+        })
+        .max_by_key(|(reference, _)| u8::from(reference.is_local()))
+        .map(|(reference, commit)| (reference.branch().clone(), commit.clone()))
 }
 
 pub fn plan(name: &RepoName, entry: &RepoEntry, consumers: &[PathBuf]) -> anyhow::Result<Plan> {
@@ -595,7 +638,6 @@ pub fn plan(name: &RepoName, entry: &RepoEntry, consumers: &[PathBuf]) -> anyhow
         Some(trunk) => shared_base(&repo, &commit, trunk)?,
         None => None,
     };
-    plan.base.clone_from(&base);
     let mut member_parents = Vec::new();
     for parent in &parents {
         let trunk_reachable = match &trunk_tip {
@@ -621,10 +663,37 @@ pub fn plan(name: &RepoName, entry: &RepoEntry, consumers: &[PathBuf]) -> anyhow
         }
     }
     plan.stale = stale_parents(&member_parents, &tips);
+    // Branches a cut will not carry: membership is the release's parent set,
+    // and a branch joins or moves only through a stated `include` or `advance`.
+    // Saying so here is what keeps "it exists locally" from silently meaning
+    // "it ships", without anyone having to remember to ask.
+    let local_branches = carried_from_tips(&tips, entry.trunk(), &scheme);
+    for (branch, tip) in &local_branches {
+        if repo.is_ancestor(tip, &commit)? {
+            continue;
+        }
+        // A branch built on top of the release descends from every member, which
+        // ancestry alone reads as "advanced". It is neither advanced nor
+        // includable as it stands: both verbs refuse it, because carrying it would
+        // put the cut in its own successor's ancestry.
+        let note = if repo.is_ancestor(&commit, tip)? {
+            format!(
+                "{branch} is stacked on {reference} rather than the trunk; rebase it off the \
+                 trunk before including it"
+            )
+        } else if any_ancestor_of(&repo, &member_parents, tip)? {
+            format!(
+                "{branch} has advanced past its parent in {reference}; \
+                 `knives release advance {branch}` moves it"
+            )
+        } else {
+            format!("{branch} is not in {reference}; `knives release include {branch}` adds it")
+        };
+        plan.notes.push(note);
+    }
     if let (Some(base), Some(trunk)) = (&base, &trunk_tip) {
-        let members = carried_from_tips(&tips, entry.trunk(), &scheme);
-        plan.base_findings
-            .extend(mixed_base_findings(&entry.path, &members, base, trunk)?);
+        let findings = mixed_base_findings(&entry.path, &local_branches, base, trunk)?;
+        plan.base_findings.extend(findings);
     }
     plan.parents = parents
         .into_iter()
@@ -651,6 +720,20 @@ pub fn plan(name: &RepoName, entry: &RepoEntry, consumers: &[PathBuf]) -> anyhow
         plan.notes.extend(notes);
     }
     Ok(plan)
+}
+
+/// Whether any of `parents` is an ancestor of `tip`.
+///
+/// A loop rather than `any`, because an ancestry jj cannot answer has to
+/// surface as an error: read as "no" it would label an advanced branch as
+/// never included, and send someone to `include` where `advance` is the answer.
+fn any_ancestor_of(repo: &Repo, parents: &[ReleaseParent], tip: &CommitId) -> anyhow::Result<bool> {
+    for parent in parents {
+        if repo.is_ancestor(&parent.commit, tip)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn short(commit: &CommitId) -> String {
@@ -704,9 +787,9 @@ pub fn render(plan: &Plan) -> String {
         RepairEffect::Unpinned => "  nothing pins this release: either is safe".to_owned(),
     });
     lines.push(
-        "  planning by default. `knives release cut [name]` cuts a flat release from \
-           the branches stated as members, or every branch when none is stated, and \
-           verifies the parent count. Nothing here ever pushes."
+        "  planning by default. `knives release cut [name]` names a new cut of this \
+           composition verbatim; `include`, `drop` and `advance` edit it. Nothing here \
+           ever pushes."
             .to_owned(),
     );
     lines.join("\n")
@@ -973,8 +1056,10 @@ mod tests {
 pub struct Cut {
     pub name: String,
     pub parents: Vec<CommitId>,
-    /// Which pull ref each parent came from. Records provenance and pins
-    /// nothing: a jj octopus's parents are already specific commits.
+    /// Where each parent came from: the branch holding it, the trunk it
+    /// descends from, or its own id when nothing else names it. Records
+    /// provenance and pins nothing: a jj octopus's parents are already
+    /// specific commits.
     pub provenance: Vec<(CommitId, String)>,
 }
 
@@ -1010,12 +1095,13 @@ pub struct AuditContext<'a> {
     pub trunk: &'a CommitId,
 }
 
-/// Workspaces belonging to branches this cut has dropped.
+/// Workspaces with no branch left among `branches`.
 ///
 /// They are cheap to create, which is why they accumulate; nothing else reaps
-/// them.
-pub fn workspaces_to_clean(workspaces: &[String], carried: &[String]) -> Vec<String> {
-    let kept: Vec<String> = carried.iter().map(|b| b.replace('/', "-")).collect();
+/// them. What counts as "left" is the caller's list, so a cut can decide
+/// whether a branch it did not carry still has a bookmark holding it.
+pub fn workspaces_to_clean(workspaces: &[String], branches: &[String]) -> Vec<String> {
+    let kept: Vec<String> = branches.iter().map(|b| b.replace('/', "-")).collect();
     workspaces
         .iter()
         .filter(|name| name.as_str() != "default" && !kept.contains(name))
@@ -1308,17 +1394,19 @@ pub fn check_test_count(
     }
 }
 
-/// What a cut's conflicts mean, and what to do about them.
+/// What a release's conflicts mean, and what to do about them.
 ///
 /// Reported, never auto-resolved. Independent branches that each append a config
 /// key land in the same regions, so a real cut carries real conflicts: one
 /// ten-parent cut had a four-sided conflict in one file and a three-sided one in
 /// another. Resolving those correctly is a semantic judgement about the config,
 /// which a tool cannot make. Saying exactly where they are, and what shape the
-/// resolution takes, is the part a tool can do.
+/// resolution takes, is the part a tool can do. An edit reports the same way: a
+/// duplicate carries the old resolutions forward, so what is left is the
+/// conflict the edit itself introduced.
 pub fn conflict_guidance(files: &[String]) -> String {
     if files.is_empty() {
-        return "  no conflicts in this cut".to_owned();
+        return "  no conflicts in this release".to_owned();
     }
     let mut lines = vec![format!(
         "  {} conflicted file(s), which is expected:",
