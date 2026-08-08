@@ -1691,6 +1691,223 @@ fn shared_base_selects_the_newest_of_multiple_trunk_reachable_release_parents() 
 }
 
 #[test]
+fn a_flat_releases_shared_base_is_the_members_fork_point() {
+    // Given: a doctrine-flat release — members only, the base never a parent —
+    // and an upstream that has advanced past the members' fork point.
+    let lab = lab::Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    lab.jj_work([
+        "new",
+        "-r",
+        "feat/alpha",
+        "-r",
+        "feat/beta",
+        "-m",
+        "flat release",
+    ]);
+    lab.jj_work(["bookmark", "create", "release/2026-08-04", "-r", "@"]);
+    lab.jj_work(["new"]);
+    let repo = Repo::open(&lab.work).expect("open");
+    let fork_point = repo
+        .resolve_commit("main@origin")
+        .expect("resolve fork point");
+    lab.advance_upstream("upstream advance\n");
+    let reopened = Repo::open(&lab.work).expect("reopen");
+    let release = reopened
+        .resolve_commit("release/2026-08-04")
+        .expect("resolve release");
+    let trunk_tip = reopened
+        .resolve_commit("main@upstream")
+        .expect("resolve trunk tip");
+
+    // When: the release's shared base is selected.
+    let shared_base = knives::commands::release::shared_base(&reopened, &release, &trunk_tip)
+        .expect("select shared base");
+
+    // Then: it is the commit every member forks from, not the advanced tip and
+    // not nothing — a flat release still has exactly one fork point.
+    assert_eq!(shared_base, Some(fork_point));
+}
+
+#[test]
+fn a_flat_release_recuts_after_upstream_drift_collides_with_a_member() {
+    // Given: a flat two-member cut, then upstream lands a squash that rewrites
+    // the same file alpha creates. Auditing against the trunk tip instead of
+    // the fork point made innocent beta read as diverging: its synthetic diff
+    // deletes the drifted file while the cut modifies it.
+    let lab = lab::Lab::new();
+    lab.branch("feat/alpha", "feature.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let (home, _consumer) = release_test_home(&lab);
+    let first = knives_release(&lab, &home, &["cut", "release/2026-08-04"]);
+    assert!(first.status.success(), "{first:?}");
+    lab.branch("feat/gamma", "gamma.txt", "gamma\n");
+    lab.publish_pull("feat/gamma", 9);
+    lab.squash_merge_pull(9, Some("upstream drift\n"));
+
+    // When: the identical composition is re-cut under the new name.
+    let output = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
+
+    // Then: the cut lands — each member's content is measured from the fork
+    // point, so upstream drift is not charged to the members. (The overall exit
+    // still reports the unrelated lagging-trunk finding; only the audit is under
+    // test here.)
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("cut release/2026-08-05 as"),
+        "re-cut was refused: {stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !stdout.contains("missing or diverges"),
+        "audit false positive: {stdout}"
+    );
+    assert_eq!(
+        release_parent_commits(&lab, "release/2026-08-05"),
+        vec![commit_at(&lab, "feat/alpha"), commit_at(&lab, "feat/beta")],
+        "the re-cut must carry the composition verbatim"
+    );
+}
+
+#[test]
+fn a_recut_carries_a_recorded_resolution_that_dropped_content() {
+    // Given: two members conflicting on one file, the conflict resolved by hand
+    // ON the release with content that matches neither side — a published
+    // judgment that deliberately diverges from both members.
+    let lab = lab::Lab::new();
+    lab.branch("feat/alpha", "shared.txt", "alpha\n");
+    lab.branch("feat/beta", "shared.txt", "beta\n");
+    let (home, _consumer) = release_test_home(&lab);
+    let first = knives_release(&lab, &home, &["cut", "release/2026-08-04"]);
+    assert!(
+        String::from_utf8_lossy(&first.stdout).contains("cut release/2026-08-04 as"),
+        "first cut was refused: {first:?}"
+    );
+    lab.jj_work(["edit", "release/2026-08-04"]);
+    std::fs::write(lab.work.join("shared.txt"), "merged\n").expect("resolve by hand");
+    lab.jj_work(["new"]);
+
+    // When: the identical composition is re-cut under a new name.
+    let output = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
+
+    // Then: the recorded resolution is carried, reported, and not refused —
+    // the audit charges a cut only with divergence it introduces.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("cut release/2026-08-05 as"),
+        "re-cut was refused: {stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !stdout.contains("missing or diverges"),
+        "a recorded resolution was refused as a loss: {stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "feat/alpha: diverges where the previous release already did \
+             (a recorded resolution); carried forward"
+        ) && stdout.contains(
+            "feat/beta: diverges where the previous release already did \
+             (a recorded resolution); carried forward"
+        ),
+        "missing carried-resolution report: {stdout}"
+    );
+    assert_eq!(
+        file_at_revision(&lab, "release/2026-08-05", "shared.txt"),
+        "merged\n",
+        "the resolution must survive the re-cut"
+    );
+}
+
+#[test]
+fn a_first_cut_audits_members_from_their_fork_point_not_the_trunk_tip() {
+    // Given: three branches forked from the seed, one of them squash-merged
+    // upstream with maintainer edits that rewrite alpha's file. The first cut
+    // has no previous composition, so its audit base is chosen from scratch.
+    let lab = lab::Lab::new();
+    lab.branch("feat/alpha", "feature.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    lab.branch("feat/gamma", "gamma.txt", "gamma\n");
+    let (home, _consumer) = release_test_home(&lab);
+    lab.publish_pull("feat/gamma", 9);
+    lab.squash_merge_pull(9, Some("upstream drift\n"));
+
+    // When: the first cut merges every branch.
+    let output = knives_release(&lab, &home, &["cut", "release/2026-08-04"]);
+
+    // Then: it succeeds, flat, with exactly the three branches as parents.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "first cut failed: {stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let parents = release_parent_commits(&lab, "release/2026-08-04");
+    assert_eq!(parents.len(), 3, "parents: {parents:?}");
+    assert!(
+        !parents.contains(&commit_at(&lab, "main@upstream")),
+        "the trunk must not be a parent"
+    );
+}
+
+#[test]
+fn start_bases_a_new_branch_on_a_flat_releases_fork_point() {
+    // Given: a doctrine-flat release — no trunk parent to find — and an
+    // upstream that has advanced past the members' fork point.
+    let lab = lab::Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    lab.jj_work([
+        "new",
+        "-r",
+        "feat/alpha",
+        "-r",
+        "feat/beta",
+        "-m",
+        "flat release",
+    ]);
+    lab.jj_work(["bookmark", "create", "release/2026-08-04", "-r", "@"]);
+    lab.jj_work(["new"]);
+    let fork_point = Repo::open(&lab.work)
+        .expect("open")
+        .resolve_commit("main@origin")
+        .expect("resolve fork point");
+    lab.advance_upstream("upstream advance\n");
+    let (home, _consumer) = release_test_home(&lab);
+
+    // When: a branch is started through the binary.
+    let output = Command::new(env!("CARGO_BIN_EXE_knives"))
+        .args([
+            "--text",
+            "start",
+            "feat/gamma",
+            "--repo",
+            "demo",
+            "--why",
+            "test",
+        ])
+        .current_dir(&lab.work)
+        .env("KNIVES_CONFIG_HOME", home.path())
+        .output()
+        .expect("run start");
+    assert!(
+        output.status.success(),
+        "start failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Then: the workspace's @ sits on the members' fork point, not the tip.
+    let workspace = lab.work.parent().expect("parent").join("feat-gamma");
+    let parent = lab.revision(&workspace, "@-", "commit_id");
+    assert_eq!(
+        parent,
+        fork_point.as_str(),
+        "based on {parent}, expected the flat release's fork point"
+    );
+}
+
+#[test]
 fn release_plan_exits_with_findings_when_the_current_release_lags_the_upstream_trunk() {
     // Given: a clean dated release that was cut before upstream advanced.
     let lab = lab::Lab::new();
@@ -4641,6 +4858,128 @@ fn the_audit_passes_a_faithful_cut() {
 
     // Then: every member's content is present.
     assert!(audit.passed(), "{audit:?}");
+}
+
+#[test]
+fn divergence_the_previous_release_already_carried_is_not_a_loss() {
+    // Given: a previous release whose recorded resolution dropped beta's file,
+    // and a fresh cut duplicated from it — the same published divergence.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let repo = Repo::open(&lab.work).expect("open");
+    let alpha = repo.resolve_commit("feat/alpha").expect("resolve alpha");
+    let beta = repo.resolve_commit("feat/beta").expect("resolve beta");
+    let trunk = repo.resolve_commit("main@origin").expect("resolve trunk");
+    let request = knives::commands::release::Cut {
+        name: "release/2026-08-04".to_owned(),
+        parents: vec![alpha.clone(), beta.clone()],
+        provenance: vec![
+            (alpha.clone(), "feat/alpha".to_owned()),
+            (beta.clone(), "feat/beta".to_owned()),
+        ],
+    };
+    let previous =
+        knives::commands::release::build_cut(&lab.work, &request, None).expect("build previous");
+    lab.jj_work([
+        "bookmark",
+        "create",
+        "resolved-previous",
+        "-r",
+        previous.as_str(),
+    ]);
+    lab.jj_work(["edit", "resolved-previous"]);
+    std::fs::remove_file(lab.work.join("beta.txt")).expect("drop beta by resolution");
+    lab.jj_work(["bookmark", "set", "resolved-previous", "-r", "@"]);
+    lab.jj_work(["new"]);
+    let previous = Repo::open(&lab.work)
+        .expect("reopen")
+        .resolve_commit("resolved-previous")
+        .expect("resolve doctored previous");
+    let recut = knives::commands::release::Cut {
+        name: "release/2026-08-05".to_owned(),
+        ..request
+    };
+    let cut = knives::commands::release::build_cut(&lab.work, &recut, Some(&previous))
+        .expect("build recut");
+
+    // When: the recut is audited with the previous release in view.
+    let audit = knives::commands::release::audit_cut(
+        &lab.work,
+        &[
+            ("feat/alpha".to_owned(), alpha),
+            ("feat/beta".to_owned(), beta),
+        ],
+        &cut,
+        knives::commands::release::AuditContext {
+            previous: Some(&previous),
+            trunk: &trunk,
+        },
+    )
+    .expect("audit cut");
+
+    // Then: the carried divergence is reported without failing the audit.
+    assert_eq!(audit.carried, vec!["feat/beta".to_owned()], "{audit:?}");
+    assert!(audit.missing.is_empty(), "{audit:?}");
+    assert!(audit.passed(), "{audit:?}");
+}
+
+#[test]
+fn a_loss_the_previous_release_did_not_have_still_fails_the_audit() {
+    // Given: a previous release that faithfully carries beta, and a recut whose
+    // tree lost beta's file — new divergence, the incident the audit exists for.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let repo = Repo::open(&lab.work).expect("open");
+    let alpha = repo.resolve_commit("feat/alpha").expect("resolve alpha");
+    let beta = repo.resolve_commit("feat/beta").expect("resolve beta");
+    let trunk = repo.resolve_commit("main@origin").expect("resolve trunk");
+    let request = knives::commands::release::Cut {
+        name: "release/2026-08-04".to_owned(),
+        parents: vec![alpha.clone(), beta.clone()],
+        provenance: vec![
+            (alpha.clone(), "feat/alpha".to_owned()),
+            (beta.clone(), "feat/beta".to_owned()),
+        ],
+    };
+    let previous =
+        knives::commands::release::build_cut(&lab.work, &request, None).expect("build previous");
+    let recut = knives::commands::release::Cut {
+        name: "release/2026-08-05".to_owned(),
+        ..request
+    };
+    let cut = knives::commands::release::build_cut(&lab.work, &recut, Some(&previous))
+        .expect("build recut");
+    lab.jj_work(["bookmark", "create", "lossy-recut", "-r", cut.as_str()]);
+    lab.jj_work(["edit", "lossy-recut"]);
+    std::fs::remove_file(lab.work.join("beta.txt")).expect("lose beta from the recut");
+    lab.jj_work(["bookmark", "set", "lossy-recut", "-r", "@"]);
+    lab.jj_work(["new"]);
+    let cut = Repo::open(&lab.work)
+        .expect("reopen")
+        .resolve_commit("lossy-recut")
+        .expect("resolve lossy recut");
+
+    // When: the recut is audited with the previous release in view.
+    let audit = knives::commands::release::audit_cut(
+        &lab.work,
+        &[
+            ("feat/alpha".to_owned(), alpha),
+            ("feat/beta".to_owned(), beta),
+        ],
+        &cut,
+        knives::commands::release::AuditContext {
+            previous: Some(&previous),
+            trunk: &trunk,
+        },
+    )
+    .expect("audit cut");
+
+    // Then: the new loss fails the audit; nothing about it is "carried".
+    assert_eq!(audit.missing, vec!["feat/beta".to_owned()], "{audit:?}");
+    assert!(audit.carried.is_empty(), "{audit:?}");
+    assert!(!audit.passed(), "{audit:?}");
 }
 
 #[test]

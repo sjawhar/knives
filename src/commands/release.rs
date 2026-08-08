@@ -5,7 +5,7 @@
 //! decided. Planning is the default because everything else here writes: a cut
 //! names a composition, and `include`, `drop`, `advance` and `rebase` change
 //! one. Every one of them writes locally only, and none of them pushes.
-// allow: SIZE_OK: 1496 lines - the release lifecycle's plan, cut, edit, audit, reap, and rebase operations are one domain seam.
+// allow: SIZE_OK: 1531 lines - the release lifecycle's plan, cut, edit, audit, reap, and rebase operations are one domain seam.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -316,14 +316,19 @@ pub fn newest_release(
     }
 }
 
-/// The newest parent of `release` that is reachable from `trunk_tip`.
+/// The commit every member of `release` forks from.
 ///
-/// A release carries the shared base that every member branch forks from as a
-/// parent. If a release also contains older bases, the shared base is the
-/// newest — the one that every other trunk-reachable parent is an ancestor of
-/// (older bases are #11's accumulation damage).
-/// A member that lands upstream by merge is itself selected as the shared base,
-/// so the real fork point is then reported as a superseded base.
+/// A legacy release carries its base as a trunk-reachable parent; when it also
+/// contains older bases, the shared base is the newest — the one every other
+/// trunk-reachable parent is an ancestor of (older bases are #11's accumulation
+/// damage). A member that lands upstream by merge is itself selected, so the
+/// real fork point is then reported as a superseded base.
+///
+/// A doctrine-flat release names no base among its parents — the base is never
+/// a parent — so its fork point is the newest commit every member and the
+/// trunk share. Falling back to the trunk tip here once charged all upstream
+/// drift since the fork to the members: a published composition failed its own
+/// re-cut, and `start` based new branches on the drifted tip.
 pub fn shared_base(
     repo: &Repo,
     release: &CommitId,
@@ -331,9 +336,9 @@ pub fn shared_base(
 ) -> anyhow::Result<Option<CommitId>> {
     let parents = repo.parents_of(release.as_str())?;
     let mut bases = Vec::new();
-    for parent in parents {
+    for parent in &parents {
         if repo.is_ancestor(&parent.commit, trunk_tip)? {
-            bases.push(parent.commit);
+            bases.push(parent.commit.clone());
         }
     }
 
@@ -345,7 +350,13 @@ pub fn shared_base(
         }
         return Ok(Some(candidate.clone()));
     }
-    Ok(None)
+    if !bases.is_empty() {
+        // Trunk-reachable parents that do not contain each other: histories
+        // criss-cross, and guessing a base here would misattribute content.
+        return Ok(None);
+    }
+    let members: Vec<CommitId> = parents.into_iter().map(|parent| parent.commit).collect();
+    Ok(repo.common_ancestor(&members, trunk_tip)?)
 }
 
 /// Branches whose trunk ancestry exceeds the shared base (#10).
@@ -1080,6 +1091,11 @@ pub struct CutAudit {
     pub missing: Vec<String>,
     pub unexplained: Vec<String>,
     pub inconclusive: Vec<String>,
+    /// Members the cut diverges from exactly as the previous release already
+    /// did: a recorded conflict resolution, published and deliberate. Reported,
+    /// never refused — the audit charges a cut only with divergence it
+    /// introduces.
+    pub carried: Vec<String>,
 }
 
 impl CutAudit {
@@ -1189,7 +1205,26 @@ pub fn audit_cut(
             RebaseOutcome::Empty => {}
             RebaseOutcome::Conflicted if cut_is_conflicted => audit.inconclusive.push(name.clone()),
             RebaseOutcome::CleanNonEmpty | RebaseOutcome::Conflicted => {
-                audit.missing.push(name.clone());
+                // Divergence the previous release already carried is a recorded
+                // resolution, not a loss: refusing it would make every release
+                // with a hand-resolved conflict fail its own re-cut forever.
+                let carried_before = match context.previous {
+                    Some(previous) => !matches!(
+                        crate::jj::probe_net_diff(
+                            repo,
+                            context.trunk.as_str(),
+                            tip.as_str(),
+                            previous.as_str(),
+                        )?,
+                        RebaseOutcome::Empty
+                    ),
+                    None => false,
+                };
+                if carried_before {
+                    audit.carried.push(name.clone());
+                } else {
+                    audit.missing.push(name.clone());
+                }
             }
         }
     }

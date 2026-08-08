@@ -4,7 +4,7 @@
 //! here because each is one jj sequence over a parent set rather than a report
 //! with a renderer. Every other command owns its own logic and returns an
 //! [`Exit`], so the match stays a table.
-// allow: SIZE_OK: 2006 lines - dispatch plus the release-edit verbs; splitting would scatter the exhaustive match.
+// allow: SIZE_OK: 2019 lines - dispatch plus the release-edit verbs; splitting would scatter the exhaustive match.
 
 use std::process::ExitCode;
 
@@ -1533,7 +1533,15 @@ fn run_release(
                     return Ok(Exit::Incomplete);
                 }
                 let members = carried.clone();
-                (carried, members, trunk.clone())
+                // The first cut audits each branch from the fork point too:
+                // measuring from the trunk tip charges every commit upstream
+                // landed since the fork to the branches themselves.
+                let tips: Vec<knives::ids::CommitId> =
+                    carried.iter().map(|(_, tip)| tip.clone()).collect();
+                let base = opened
+                    .common_ancestor(&tips, &trunk)?
+                    .unwrap_or_else(|| trunk.clone());
+                (carried, members, base)
             };
             let request = cut_request(name.clone(), &carried);
             let created = release::build_cut(&entry.path, &request, previous_commit.as_ref())?;
@@ -1621,6 +1629,12 @@ fn report_cut_audit(
     created: &knives::ids::CommitId,
     audit: &release::CutAudit,
 ) -> anyhow::Result<Option<Exit>> {
+    for name in &audit.carried {
+        println!(
+            "  {name}: diverges where the previous release already did \
+             (a recorded resolution); carried forward"
+        );
+    }
     for name in &audit.inconclusive {
         println!(
             "  {name}: content check inconclusive (replay conflicted; \
