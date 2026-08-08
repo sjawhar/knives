@@ -269,12 +269,16 @@ pub enum ReleaseAction {
     /// conflict resolutions replay as ordinary rebase semantics. The base is
     /// never a release parent — this is how the members change theirs. Bare,
     /// it targets the first upstream trunk commit that contains every merged
-    /// pull request; with nothing merged there is no default, and which commit
+    /// pull request, then drops the members whose landed branches carry
+    /// nothing more; with nothing merged there is no default, and which commit
     /// to move onto is a decision — a cut does not make it for you.
     Rebase {
         /// The rebase target. Bare, the first upstream trunk commit containing
         /// every merged pull request; required when nothing has merged.
         reference: Option<String>,
+        /// Keep members whose pull requests landed instead of dropping them.
+        #[arg(long)]
+        no_drop: bool,
     },
     /// Add a branch (or commit) to the release in hand as one new parent.
     ///

@@ -463,6 +463,31 @@ pub fn probe_landed(
     probe_revision(repo, onto, branch.as_str(), onto)
 }
 
+/// Whether any commit in `base..tip` is non-empty: work the base does not have.
+///
+/// An empty range carries nothing — a tip the base already contains needs no
+/// replay to answer. A rebased-but-landed chain is all empty commits, so this
+/// one reading covers merge-commit, squash and rebase landings alike.
+pub fn carries_work_past(repo: &Path, base: &CommitId, tip: &CommitId) -> Result<bool, JjError> {
+    let repo_path = path(repo);
+    let range = format!("{}..{}", base.as_str(), tip.as_str());
+    let states = command(
+        "jj",
+        [
+            "--repository",
+            &repo_path,
+            "--ignore-working-copy",
+            "log",
+            "--no-graph",
+            "-r",
+            &range,
+            "-T",
+            "empty ++ \"\\n\"",
+        ],
+    )?;
+    Ok(states.lines().any(|line| line.trim() == "false"))
+}
+
 /// Replays the net tree effect of `base..revision` onto a target.
 ///
 /// A scratch child of `base` is restored to `revision`'s tree, so its diff is the
