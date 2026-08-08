@@ -2285,6 +2285,7 @@ fn status_reports_a_carrier_for_a_closed_pull_request() {
                 mergeable: String::new(),
                 merge_state_status: String::new(),
                 base_ref_name: "main".to_owned(),
+                merge_commit: None,
             },
         ))
         .collect(),
@@ -2519,7 +2520,7 @@ fn release_rebase_refuses_when_every_pin_is_frozen() {
         .expect("resolve release before refusal");
 
     // When: the real binary is asked to rebase the release onto upstream.
-    let output = knives_release(&lab, &home, &["rebase"]);
+    let output = knives_release(&lab, &home, &["rebase", "main@upstream"]);
 
     // Then: it directs the caller to a dated cut, exits incomplete, and does not move it.
     assert_eq!(
@@ -2568,7 +2569,7 @@ fn release_rebase_refusal_for_fixed_release_explains_that_revision_pins_cannot_f
     lab.advance_upstream("upstream advance\n");
 
     // When: the fixed release is asked to move in place.
-    let output = knives_release(&lab, &home, &["rebase"]);
+    let output = knives_release(&lab, &home, &["rebase", "main@upstream"]);
 
     // Then: it is incomplete and names the only viable remediation.
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -2604,7 +2605,7 @@ fn release_rebase_repairs_a_followed_dated_release_with_a_sideways_merge() {
         .resolve_commit("main@upstream")
         .expect("resolve advanced upstream");
     // When: the repair command moves the existing release onto a new flat merge.
-    let output = knives_release(&lab, &home, &["rebase"]);
+    let output = knives_release(&lab, &home, &["rebase", "main@upstream"]);
 
     // Then: the command succeeds; the legacy trunk parent is shed — the base is
     // never a parent — and the members were rebased onto the new upstream,
@@ -2650,7 +2651,7 @@ fn a_second_rebase_does_not_grow_the_release() {
     // When: the release is rebased after each upstream advance.
     for advance in ["first advance\n", "second advance\n"] {
         lab.advance_upstream(advance);
-        let output = knives_release(&lab, &home, &["rebase"]);
+        let output = knives_release(&lab, &home, &["rebase", "main@upstream"]);
         assert!(
             output.status.success(),
             "rebase failed: {}",
@@ -2690,7 +2691,7 @@ fn a_rebase_refuses_a_stale_parent_it_cannot_map() {
         .expect("resolve release before refusal");
 
     // When: the real binary attempts to replace the release base.
-    let output = knives_release(&lab, &home, &["rebase"]);
+    let output = knives_release(&lab, &home, &["rebase", "main@upstream"]);
 
     // Then: it refuses rather than carrying the stale parent or moving the release.
     let text = format!(
@@ -2785,7 +2786,7 @@ fn a_rebase_moves_the_whole_composition_onto_the_target() {
     lab.advance_upstream("advance\n");
 
     // When: the composition is rebased onto the advanced trunk.
-    let output = knives_release(&lab, &home, &["rebase"]);
+    let output = knives_release(&lab, &home, &["rebase", "main@upstream"]);
     assert!(
         output.status.success(),
         "rebase failed: {}\n{}",
@@ -2820,6 +2821,242 @@ fn a_rebase_moves_the_whole_composition_onto_the_target() {
         file_at_revision(&lab, "release/2026-08-04", "shared.txt"),
         "resolved\n"
     );
+}
+
+/// Run the knives binary's release command with a fake forge CLI on the PATH:
+/// `pr list` answers from `pulls`, and any other forge call fails the test loudly.
+/// The bare rebase default is the only release path that consults the forge.
+fn knives_release_with_forge(
+    lab: &Lab,
+    home: &tempfile::TempDir,
+    pulls: &str,
+    args: &[&str],
+) -> std::process::Output {
+    let shim = tempfile::tempdir().expect("create forge shim directory");
+    let payload = shim.path().join("pulls.json");
+    std::fs::write(&payload, pulls).expect("write pull request payload");
+    let gh = shim.path().join("gh");
+    std::fs::write(
+        &gh,
+        format!(
+            "#!/bin/sh\ncase \" $* \" in\n  *\" pr list \"*) cat \"{}\" ;;\n  *) echo \"unexpected gh invocation: $*\" >&2; exit 1 ;;\nesac\n",
+            payload.display()
+        ),
+    )
+    .expect("write gh shim");
+    let mut permissions = std::fs::metadata(&gh)
+        .expect("read gh shim permissions")
+        .permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+    std::fs::set_permissions(&gh, permissions).expect("make gh shim executable");
+    let path = std::env::join_paths(std::iter::once(shim.path().to_owned()).chain(
+        std::env::split_paths(&std::env::var_os("PATH").expect("PATH is set")),
+    ))
+    .expect("construct shim PATH");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_knives"));
+    command.args(["--text", "release", "--repo", "demo"]);
+    command.args(args);
+    command
+        .current_dir(&lab.work)
+        .env("KNIVES_CONFIG_HOME", home.path())
+        .env("PATH", path)
+        .output()
+        .expect("run knives release with a forge shim")
+}
+
+/// One forge pull request record with the fields the binary requires.
+fn pull_record(number: u64, state: &str, branch: &str, merge_oid: Option<&str>) -> String {
+    let merge = merge_oid.map_or_else(String::new, |oid| {
+        format!(",\"mergeCommit\":{{\"oid\":\"{oid}\"}}")
+    });
+    format!(
+        "{{\"number\":{number},\"state\":\"{state}\",\"headRefName\":\"{branch}\",\
+         \"headRefOid\":\"0123456789abcdef0123456789abcdef01234567\",\
+         \"updatedAt\":\"2026-08-07T00:00:00Z\",\"baseRefName\":\"main\"{merge}}}"
+    )
+}
+
+#[test]
+fn a_bare_rebase_with_no_merged_pull_request_requires_a_commit() {
+    // Given: a release in hand, and a forge whose only pull request is still open.
+    let lab = Lab::new();
+    let release = "release/2026-08-04";
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    lab.octopus(release, "feat/alpha", "feat/beta");
+    let (home, _consumer) = release_test_home(&lab);
+    lab.advance_upstream("upstream advance\n");
+    let before = commit_at(&lab, release);
+    let pulls = format!("[{}]", pull_record(7, "OPEN", "feat/alpha", None));
+
+    // When: the bare rebase asks the forge for a default target.
+    let output = knives_release_with_forge(&lab, &home, &pulls, &["rebase"]);
+
+    // Then: with nothing merged there is no default, and the release stays put.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "stdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains(
+            "demo: no pull request has merged, so there is no default target; \
+             provide a commit to rebase onto"
+        ),
+        "missing refusal guidance: {stdout}"
+    );
+    assert_eq!(before, commit_at(&lab, release), "the release moved anyway");
+}
+
+#[test]
+fn a_bare_rebase_targets_the_trunk_commit_that_holds_every_merged_pull_request() {
+    // Given: alpha merged upstream by a merge commit, beta still open, and the
+    // trunk advanced past that merge afterwards.
+    let lab = Lab::new();
+    let release = "release/2026-08-04";
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    lab.octopus(release, "feat/alpha", "feat/beta");
+    let (home, _consumer) = release_test_home(&lab);
+    lab.publish_pull("feat/alpha", 7);
+    lab.merge_pull_with_merge_commit(7);
+    let merged_at = commit_at(&lab, "main@upstream");
+    lab.advance_upstream("beyond the merge\n");
+    let tip = commit_at(&lab, "main@upstream");
+    let pulls = format!(
+        "[{},{}]",
+        pull_record(7, "MERGED", "feat/alpha", Some(merged_at.as_str())),
+        pull_record(8, "OPEN", "feat/beta", None)
+    );
+
+    // When: the bare rebase asks the forge instead of taking a target.
+    let output = knives_release_with_forge(&lab, &home, &pulls, &["rebase"]);
+
+    // Then: the release lands on the merge commit, not the later tip.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "rebase failed: {stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains(&format!(
+            "demo: every merged pull request (#7) is in main@upstream by {}; rebasing onto it",
+            &merged_at.as_str()[..12]
+        )),
+        "missing target explanation: {stdout}"
+    );
+    let repo = Repo::open(&lab.work).expect("reopen after the default rebase");
+    let at_release = commit_at(&lab, release);
+    assert!(
+        repo.is_ancestor(&merged_at, &at_release).expect("ancestry"),
+        "the release does not contain the merge commit"
+    );
+    assert!(
+        !repo.is_ancestor(&tip, &at_release).expect("ancestry"),
+        "the release overshot the merged point onto the trunk tip"
+    );
+}
+
+#[test]
+fn a_bare_rebase_covers_the_latest_of_several_merged_pull_requests() {
+    // Given: alpha and gamma merged upstream in that order, so gamma's merge
+    // commit is the first trunk commit containing both.
+    let lab = Lab::new();
+    let release = "release/2026-08-04";
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    lab.branch("feat/gamma", "gamma.txt", "gamma\n");
+    lab.octopus(release, "feat/alpha", "feat/beta");
+    let (home, _consumer) = release_test_home(&lab);
+    lab.publish_pull("feat/alpha", 7);
+    lab.merge_pull_with_merge_commit(7);
+    let first_merge = commit_at(&lab, "main@upstream");
+    lab.publish_pull("feat/gamma", 8);
+    lab.merge_pull_with_merge_commit(8);
+    let second_merge = commit_at(&lab, "main@upstream");
+    lab.advance_upstream("beyond both merges\n");
+    let tip = commit_at(&lab, "main@upstream");
+    let pulls = format!(
+        "[{},{}]",
+        pull_record(7, "MERGED", "feat/alpha", Some(first_merge.as_str())),
+        pull_record(8, "MERGED", "feat/gamma", Some(second_merge.as_str()))
+    );
+
+    // When: the bare rebase chooses among several merged pull requests.
+    let output = knives_release_with_forge(&lab, &home, &pulls, &["rebase"]);
+
+    // Then: the later merge commit wins because it contains the earlier one.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "rebase failed: {stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains(&format!(
+            "demo: every merged pull request (#7, #8) is in main@upstream by {}; \
+             rebasing onto it",
+            &second_merge.as_str()[..12]
+        )),
+        "missing target explanation: {stdout}"
+    );
+    let repo = Repo::open(&lab.work).expect("reopen after the default rebase");
+    let at_release = commit_at(&lab, release);
+    assert!(
+        repo.is_ancestor(&second_merge, &at_release)
+            .expect("ancestry"),
+        "the release does not contain the covering merge commit"
+    );
+    assert!(
+        !repo.is_ancestor(&tip, &at_release).expect("ancestry"),
+        "the release overshot the merged point onto the trunk tip"
+    );
+}
+
+#[test]
+fn a_bare_rebase_refuses_merged_work_missing_from_the_local_trunk() {
+    // Given: the forge says a pull request merged, but its merge commit is not
+    // in the local repository at all.
+    let lab = Lab::new();
+    let release = "release/2026-08-04";
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    lab.octopus(release, "feat/alpha", "feat/beta");
+    let (home, _consumer) = release_test_home(&lab);
+    lab.advance_upstream("upstream advance\n");
+    let before = commit_at(&lab, release);
+    let pulls = format!(
+        "[{}]",
+        pull_record(
+            7,
+            "MERGED",
+            "feat/alpha",
+            Some("feedfacefeedfacefeedfacefeedfacefeedface")
+        )
+    );
+
+    // When: the bare rebase tries to place that merge on the local trunk.
+    let output = knives_release_with_forge(&lab, &home, &pulls, &["rebase"]);
+
+    // Then: it refuses with fetch guidance rather than guessing, and moves nothing.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "stdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains(
+            "demo: the merge commit(s) of #7 are not in the local main@upstream; \
+             run knives sync, or provide a commit to rebase onto"
+        ),
+        "missing fetch guidance: {stdout}"
+    );
+    assert_eq!(before, commit_at(&lab, release), "the release moved anyway");
 }
 
 #[test]
@@ -4584,7 +4821,7 @@ fn a_rebase_preserves_the_previous_releases_conflict_resolution() {
     lab.advance_upstream("upstream advance\n");
 
     // When: the real binary rebases the release onto the advanced upstream.
-    let output = knives_release(&lab, &home, &["rebase"]);
+    let output = knives_release(&lab, &home, &["rebase", "main@upstream"]);
 
     // Then: duplicating the old release carries its resolution without a new conflict.
     assert!(
