@@ -4,7 +4,7 @@
 //! here because each is one jj sequence over a parent set rather than a report
 //! with a renderer. Every other command owns its own logic and returns an
 //! [`Exit`], so the match stays a table.
-// allow: SIZE_OK: 1837 lines - dispatch plus the release-edit verbs; splitting would scatter the exhaustive match.
+// allow: SIZE_OK: 2006 lines - dispatch plus the release-edit verbs; splitting would scatter the exhaustive match.
 
 use std::process::ExitCode;
 
@@ -166,8 +166,8 @@ fn dispatch_release(
             extra_consumers,
             &ReleaseInvocation::Cut { name, allow_drop },
         ),
-        Some(ReleaseAction::Rebase { reference }) => {
-            run_rebase(chosen.as_str(), reference.as_deref())
+        Some(ReleaseAction::Rebase { reference, no_drop }) => {
+            run_rebase(chosen.as_str(), reference.as_deref(), no_drop)
         }
         Some(ReleaseAction::Reap) => run_reap(chosen.as_str()),
         Some(ReleaseAction::Include { branch, why }) => {
@@ -190,8 +190,10 @@ fn dispatch_release(
 /// conflict resolutions replay as ordinary rebase semantics. The upstream base
 /// is never a release parent; this is how the release's members change theirs.
 /// A cut deliberately does not do this: which upstream commit to move onto,
-/// and whether to move at all, is a judgment.
-fn run_rebase(name: &str, reference: Option<&str>) -> anyhow::Result<Exit> {
+/// and whether to move at all, is a judgment. After a bare rebase, members
+/// whose pull requests landed and carry nothing more are dropped — the work
+/// reaches the release through its new base — unless `--no-drop` keeps them.
+fn run_rebase(name: &str, reference: Option<&str>, no_drop: bool) -> anyhow::Result<Exit> {
     let chosen = match selected(Some(name), false)? {
         Ok(list) => list,
         Err(exit) => return Ok(exit),
@@ -208,16 +210,25 @@ fn run_rebase(name: &str, reference: Option<&str>) -> anyhow::Result<Exit> {
             worst = worst.worst(Exit::Incomplete);
             continue;
         }
-        let Some((onto, reference)) = rebase_target(&repo, &entry, &opened, reference)? else {
+        let Some(destination) = rebase_target(&repo, &entry, &opened, reference)? else {
             worst = worst.worst(Exit::Incomplete);
             continue;
         };
+        let onto = destination.onto.clone();
+        let reference = destination.reference.clone();
         let release_commit = opened.resolve_commit(&release_name)?;
-        let parents = opened.parents_of(&release_name)?;
         // Ancestry, not parent identity: a commit already reachable through a
         // parent's history is contained, and adding it again grows the octopus.
         if opened.is_ancestor(&onto, &release_commit)? {
             println!("{repo}: {release_name} already contains {reference}");
+            if !no_drop {
+                worst = worst.worst(drop_landed_members(
+                    &repo,
+                    &entry,
+                    &release_name,
+                    &destination,
+                )?);
+            }
             continue;
         }
         // Follows from who pins it, rather than from an opinion: a consumer that follows
@@ -238,43 +249,22 @@ fn run_rebase(name: &str, reference: Option<&str>) -> anyhow::Result<Exit> {
             worst = worst.worst(Exit::Incomplete);
             continue;
         }
-        let tips = opened.bookmark_tips()?;
-        // A stale parent is the old tip of a branch that has moved on: rebasing
-        // carries pre-rewrite code onto the new base. A held parent — any
-        // bookmark still on it whose branch is neither a release name nor the
-        // trunk — is a member and moves. An unheld parent already reachable
-        // from the target is a legacy trunk parent: the base is never a parent,
-        // so it is shed before the rebase.
-        let mut members: Vec<knives::ids::CommitId> = Vec::new();
-        let mut shed = 0usize;
-        for parent in &parents {
-            let held = parent.bookmarks.iter().any(|reference| {
-                tips.get(reference) == Some(&parent.commit)
-                    && !knives::ids::is_release_name(reference.branch(), &scheme)
-                    && reference.branch().as_str() != entry.trunk()
-            });
-            if held {
-                members.push(parent.commit.clone());
-                continue;
-            }
-            if opened.is_ancestor(&parent.commit, &onto)? {
-                shed += 1;
-                continue;
-            }
-            let no_bookmark = if parent.bookmarks.is_empty() {
-                "; no bookmark points at it"
-            } else {
-                ""
-            };
-            let moved = stale_parent_moved_branches(&entry, &scheme, &parent.commit)?;
-            let moved = moved.map_or_else(String::new, |moved| format!("; moved tip(s): {moved}"));
-            eprintln!(
-                "{repo}: refusing to rebase {release_name}: parent {} is stale{no_bookmark}{moved}. \
-                 Fix the branch or drop it from the release, then re-run; carrying it could ship \
-                 pre-rewrite code.",
-                short12(&parent.commit),
-            );
+        let context = RebaseContext {
+            repo: &repo,
+            entry: &entry,
+            opened: &opened,
+        };
+        let Some((members, shed)) = classify_rebase_parents(&context, &release_name, &onto)? else {
             return Ok(Exit::Incomplete);
+        };
+        if all_landed(&opened, &members, &onto)? {
+            println!(
+                "{repo}: every member of {release_name} has landed in {reference}; rebasing \
+                 would make the trunk the only parent, so nothing moved \u{2014} reap the release \
+                 or include new work"
+            );
+            worst = worst.worst(Exit::Incomplete);
+            continue;
         }
         if members.is_empty() {
             println!("{repo}: {release_name} has no member parents to move; nothing to rebase");
@@ -296,8 +286,84 @@ fn run_rebase(name: &str, reference: Option<&str>) -> anyhow::Result<Exit> {
                 shed,
             },
         )?;
+        if !no_drop {
+            worst = worst.worst(drop_landed_members(
+                &repo,
+                &entry,
+                &release_name,
+                &destination,
+            )?);
+        }
     }
     Ok(worst)
+}
+
+/// One repo mid-rebase: what parent classification needs to read and say.
+struct RebaseContext<'a> {
+    repo: &'a RepoName,
+    entry: &'a knives::config::RepoEntry,
+    opened: &'a knives::jj::Repo,
+}
+
+/// The release's moving members and the count of shed legacy base parents, or
+/// `None` after printing the stale-parent refusal.
+///
+/// A stale parent is the old tip of a branch that has moved on: rebasing
+/// carries pre-rewrite code onto the new base. A held parent — any bookmark
+/// still on it whose branch is neither a release name nor the trunk — is a
+/// member and moves. An unheld parent already reachable from the target is a
+/// legacy trunk parent: the base is never a parent, so it is shed.
+fn classify_rebase_parents(
+    context: &RebaseContext<'_>,
+    release_name: &str,
+    onto: &knives::ids::CommitId,
+) -> anyhow::Result<Option<(Vec<knives::ids::CommitId>, usize)>> {
+    let (repo, entry, opened) = (context.repo, context.entry, context.opened);
+    let scheme = entry.release_scheme();
+    let parents = opened.parents_of(release_name)?;
+    let tips = opened.bookmark_tips()?;
+    let mut members: Vec<knives::ids::CommitId> = Vec::new();
+    let mut shed = 0usize;
+    for parent in &parents {
+        let held = parent.bookmarks.iter().any(|reference| {
+            tips.get(reference) == Some(&parent.commit)
+                && !knives::ids::is_release_name(reference.branch(), &scheme)
+                && reference.branch().as_str() != entry.trunk()
+        });
+        if held {
+            members.push(parent.commit.clone());
+            continue;
+        }
+        if opened.is_ancestor(&parent.commit, onto)? {
+            shed += 1;
+            continue;
+        }
+        let no_bookmark = if parent.bookmarks.is_empty() {
+            "; no bookmark points at it"
+        } else {
+            ""
+        };
+        let moved = stale_parent_moved_branches(entry, &scheme, &parent.commit)?;
+        let moved = moved.map_or_else(String::new, |moved| format!("; moved tip(s): {moved}"));
+        eprintln!(
+            "{repo}: refusing to rebase {release_name}: parent {} is stale{no_bookmark}{moved}. \
+             Fix the branch or drop it from the release, then re-run; carrying it could ship \
+             pre-rewrite code.",
+            short12(&parent.commit),
+        );
+        return Ok(None);
+    }
+    Ok(Some((members, shed)))
+}
+
+/// A resolved rebase destination: the commit, the label the report and
+/// provenance use, and which of our pull requests the forge says landed by it.
+struct RebaseDestination {
+    onto: knives::ids::CommitId,
+    reference: String,
+    /// Empty for an explicit reference: dropping is the bare default's job,
+    /// because only it knows the target covers every landing.
+    landed: Vec<knives::forge::LandedPull>,
 }
 
 /// The commit a rebase moves onto, with the label the report and provenance use.
@@ -310,12 +376,13 @@ fn rebase_target(
     entry: &knives::config::RepoEntry,
     opened: &knives::jj::Repo,
     reference: Option<&str>,
-) -> anyhow::Result<Option<(knives::ids::CommitId, String)>> {
+) -> anyhow::Result<Option<RebaseDestination>> {
     if let Some(explicit) = reference {
-        return Ok(Some((
-            opened.resolve_commit(explicit)?,
-            explicit.to_owned(),
-        )));
+        return Ok(Some(RebaseDestination {
+            onto: opened.resolve_commit(explicit)?,
+            reference: explicit.to_owned(),
+            landed: Vec::new(),
+        }));
     }
     merged_rebase_target(repo, entry, opened)
 }
@@ -330,7 +397,7 @@ fn merged_rebase_target(
     repo: &RepoName,
     entry: &knives::config::RepoEntry,
     opened: &knives::jj::Repo,
-) -> anyhow::Result<Option<(knives::ids::CommitId, String)>> {
+) -> anyhow::Result<Option<RebaseDestination>> {
     let trunk = entry.upstream_trunk();
     let pull_requests = match CliForge.pull_requests(&entry.path) {
         Ok(found) => knives::forge::ours_only(
@@ -359,7 +426,9 @@ fn merged_rebase_target(
     let tip = opened.resolve_commit(&trunk)?;
     let mut placed: Vec<(u64, knives::ids::CommitId)> = Vec::new();
     let mut unplaced: Vec<u64> = Vec::new();
-    for (number, oid) in landed {
+    for pull in &landed {
+        let oid = pull.oid.clone();
+        let number = pull.number;
         // Unrecorded, unresolvable and out-of-trunk merge commits are one fact
         // here: the local trunk does not carry that landing yet.
         match oid.and_then(|oid| opened.resolve_commit(&oid).ok()) {
@@ -375,7 +444,14 @@ fn merged_rebase_target(
         );
         return Ok(None);
     }
-    covering_commit(repo, opened, &placed, &trunk)
+    let Some((onto, reference)) = covering_commit(repo, opened, &placed, &trunk)? else {
+        return Ok(None);
+    };
+    Ok(Some(RebaseDestination {
+        onto,
+        reference,
+        landed,
+    }))
 }
 
 /// The first trunk commit containing every landing in `placed`: their maximum
@@ -421,6 +497,98 @@ fn covering_commit(
 fn numbered(numbers: &[u64]) -> String {
     let numbers: Vec<String> = numbers.iter().map(|number| format!("#{number}")).collect();
     numbers.join(", ")
+}
+
+/// Whether every member has landed at or before `onto`. No members is not that:
+/// it is its own refusal, with its own message.
+fn all_landed(
+    opened: &knives::jj::Repo,
+    members: &[knives::ids::CommitId],
+    onto: &knives::ids::CommitId,
+) -> anyhow::Result<bool> {
+    if members.is_empty() {
+        return Ok(false);
+    }
+    for member in members {
+        if !opened.is_ancestor(member, onto)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Drop the members whose pull requests landed at or before the rebase target.
+///
+/// Only a member carrying nothing past the target is dropped: a branch with
+/// commits beyond its merged pull request still holds undelivered work, and
+/// that is said instead. The drop duplicates the release onto the kept parents,
+/// exactly as `drop` does, so recorded conflict resolutions carry forward.
+fn drop_landed_members(
+    repo: &RepoName,
+    entry: &knives::config::RepoEntry,
+    release_name: &str,
+    destination: &RebaseDestination,
+) -> anyhow::Result<Exit> {
+    if destination.landed.is_empty() {
+        return Ok(Exit::Ok);
+    }
+    let opened = knives::jj::Repo::open(&entry.path)?;
+    let parents: Vec<knives::ids::CommitId> = opened
+        .parents_of(release_name)?
+        .into_iter()
+        .map(|parent| parent.commit)
+        .collect();
+    let mut kept = parents.clone();
+    let mut deltas: Vec<String> = Vec::new();
+    for pull in &destination.landed {
+        let Some(tip) = bookmark_tip(&opened, pull.branch.as_str())? else {
+            continue;
+        };
+        if !parents.contains(&tip) {
+            continue;
+        }
+        if knives::jj::carries_work_past(&entry.path, &destination.onto, &tip)? {
+            println!(
+                "{repo}: kept {}: it carries work past #{}",
+                pull.branch, pull.number
+            );
+            continue;
+        }
+        kept.retain(|parent| parent != &tip);
+        deltas.push(format!(
+            "dropped {}: landed upstream as #{}",
+            pull.branch, pull.number
+        ));
+    }
+    if deltas.is_empty() {
+        return Ok(Exit::Ok);
+    }
+    if kept.is_empty() {
+        println!(
+            "{repo}: every member of {release_name} landed; dropping them all would leave it \
+             without a parent, so nothing was dropped"
+        );
+        return Ok(Exit::Incomplete);
+    }
+    let release = opened.resolve_commit(release_name)?;
+    let provenance = parent_sources(&opened, entry, &entry.release_scheme(), &kept)?;
+    let delta = deltas.join("; ");
+    let message = format!(
+        "{}\n\n{delta}",
+        cut_request(release_name.to_owned(), &provenance).message()
+    );
+    let duplicated = knives::jj::duplicate_onto(&entry.path, &release, &kept)?;
+    let created = knives::jj::describe_commit(&entry.path, &duplicated, &message)?;
+    knives::jj::set_bookmark_anywhere(&entry.path, release_name, created.as_str())?;
+    println!(
+        "{repo}: {release_name} now has {} parent(s): {delta}",
+        kept.len()
+    );
+    match knives::jj::conflicted_files(&entry.path, created.as_str()) {
+        Ok(files) => println!("{}", release::conflict_guidance(&files)),
+        Err(error) => println!("  could not list conflicts: {error}"),
+    }
+    Ok(Exit::Ok)
 }
 
 /// A composition rebase that just happened: what moved, and onto what.

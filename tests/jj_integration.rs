@@ -3060,6 +3060,267 @@ fn a_bare_rebase_refuses_merged_work_missing_from_the_local_trunk() {
 }
 
 #[test]
+fn a_bare_rebase_drops_a_member_whose_pull_request_landed() {
+    // Given: alpha merged upstream by a merge commit and beta still open.
+    let lab = Lab::new();
+    let release = "release/2026-08-04";
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    lab.octopus(release, "feat/alpha", "feat/beta");
+    let (home, _consumer) = release_test_home(&lab);
+    lab.publish_pull("feat/alpha", 7);
+    lab.merge_pull_with_merge_commit(7);
+    let merged_at = commit_at(&lab, "main@upstream");
+    lab.advance_upstream("beyond the merge\n");
+    let pulls = format!(
+        "[{},{}]",
+        pull_record(7, "MERGED", "feat/alpha", Some(merged_at.as_str())),
+        pull_record(8, "OPEN", "feat/beta", None)
+    );
+
+    // When: the bare rebase lands on the merge commit.
+    let output = knives_release_with_forge(&lab, &home, &pulls, &["rebase"]);
+
+    // Then: alpha's parent is dropped, its bookmark untouched, and the drop is
+    // recorded on the release itself.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "rebase failed: {stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("dropped feat/alpha: landed upstream as #7"),
+        "missing drop report: {stdout}"
+    );
+    assert_eq!(
+        release_parent_commits(&lab, release),
+        vec![commit_at(&lab, "feat/beta")],
+        "the landed member must be the only parent removed"
+    );
+    assert!(
+        Repo::open(&lab.work)
+            .expect("reopen")
+            .resolve_commit("feat/alpha")
+            .is_ok(),
+        "dropping the parent must not touch the branch"
+    );
+    assert!(
+        lab.revision(&lab.work, release, "description")
+            .contains("dropped feat/alpha: landed upstream as #7"),
+        "the release description must record the drop"
+    );
+}
+
+#[test]
+fn no_drop_keeps_a_landed_member_as_a_parent() {
+    // Given: the same landed alpha, and the caller asking to keep it.
+    let lab = Lab::new();
+    let release = "release/2026-08-04";
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    lab.octopus(release, "feat/alpha", "feat/beta");
+    let (home, _consumer) = release_test_home(&lab);
+    lab.publish_pull("feat/alpha", 7);
+    lab.merge_pull_with_merge_commit(7);
+    let merged_at = commit_at(&lab, "main@upstream");
+    let alpha = commit_at(&lab, "feat/alpha");
+    let pulls = format!(
+        "[{}]",
+        pull_record(7, "MERGED", "feat/alpha", Some(merged_at.as_str()))
+    );
+
+    // When: the bare rebase runs with --no-drop.
+    let output = knives_release_with_forge(&lab, &home, &pulls, &["rebase", "--no-drop"]);
+
+    // Then: the landed member stays a parent and nothing reports a drop.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "rebase failed: {stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!stdout.contains("dropped feat/alpha"), "{stdout}");
+    assert!(
+        release_parent_commits(&lab, release).contains(&alpha),
+        "--no-drop must keep the landed member"
+    );
+}
+
+#[test]
+fn a_bare_rebase_drops_a_member_landed_by_squash() {
+    // Given: alpha squash-merged, so its commits replay empty onto the target
+    // without the tip ever entering the trunk's history.
+    let lab = Lab::new();
+    let release = "release/2026-08-04";
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    lab.octopus(release, "feat/alpha", "feat/beta");
+    let (home, _consumer) = release_test_home(&lab);
+    lab.publish_pull("feat/alpha", 7);
+    lab.squash_merge_pull(7, None);
+    let merged_at = commit_at(&lab, "main@upstream");
+    let pulls = format!(
+        "[{}]",
+        pull_record(7, "MERGED", "feat/alpha", Some(merged_at.as_str()))
+    );
+
+    // When: the bare rebase lands on the squash commit.
+    let output = knives_release_with_forge(&lab, &home, &pulls, &["rebase"]);
+
+    // Then: alpha is dropped and beta's rewritten tip is the only parent.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "rebase failed: {stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("dropped feat/alpha: landed upstream as #7"),
+        "missing drop report: {stdout}"
+    );
+    assert_eq!(
+        release_parent_commits(&lab, release),
+        vec![commit_at(&lab, "feat/beta")],
+        "the squash-landed member must be dropped"
+    );
+}
+
+#[test]
+fn a_bare_rebase_keeps_a_landed_branch_that_carries_work_past_its_pull() {
+    // Given: alpha's pull request holds only its first commit, the branch has a
+    // second commit past it, and the release carries the extended tip. The pull
+    // then squash-merges, so the branch still holds work the trunk lacks.
+    let lab = Lab::new();
+    let release = "release/2026-08-04";
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.publish_pull("feat/alpha", 7);
+    extend_branch(&lab, "feat/alpha", "alpha-more.txt", "work past the pull\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    lab.octopus(release, "feat/alpha", "feat/beta");
+    let (home, _consumer) = release_test_home(&lab);
+    lab.squash_merge_pull(7, None);
+    let merged_at = commit_at(&lab, "main@upstream");
+    let pulls = format!(
+        "[{}]",
+        pull_record(7, "MERGED", "feat/alpha", Some(merged_at.as_str()))
+    );
+
+    // When: the bare rebase lands on the squash commit.
+    let output = knives_release_with_forge(&lab, &home, &pulls, &["rebase"]);
+
+    // Then: alpha is kept, with the reason stated, and both members remain.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "rebase failed: {stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("kept feat/alpha: it carries work past #7"),
+        "missing keep report: {stdout}"
+    );
+    assert!(!stdout.contains("dropped feat/alpha"), "{stdout}");
+    assert_eq!(
+        release_parent_commits(&lab, release).len(),
+        2,
+        "both members must remain parents"
+    );
+}
+
+#[test]
+fn a_rebase_refuses_a_composition_whose_every_member_landed() {
+    // Given: a single-member release whose only branch merged upstream. jj
+    // would re-parent the release straight onto the destination, leaving the
+    // trunk as its only parent — and the base is never a parent.
+    let lab = Lab::new();
+    let release = "release/2026-08-04";
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let (home, _consumer) = release_test_home(&lab);
+    let cut = knives_release(&lab, &home, &["cut", release]);
+    assert!(cut.status.success(), "{cut:?}");
+    lab.publish_pull("feat/alpha", 7);
+    lab.merge_pull_with_merge_commit(7);
+    let before = commit_at(&lab, release);
+
+    // When: the rebase is pointed past the landing, explicitly.
+    let output = knives_release(&lab, &home, &["rebase", "main@upstream"]);
+
+    // Then: it refuses rather than making the trunk a parent, and moves nothing.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "stdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains(
+            "every member of release/2026-08-04 has landed in main@upstream; rebasing would \
+             make the trunk the only parent, so nothing moved \u{2014} reap the release or \
+             include new work"
+        ),
+        "missing fully-landed refusal: {stdout}"
+    );
+    assert_eq!(before, commit_at(&lab, release), "the release moved anyway");
+}
+
+#[test]
+fn a_release_already_at_its_target_still_drops_landed_members() {
+    // Given: both members squash-merged and the release already rebased onto
+    // their covering commit with --no-drop, so it carries two landed members
+    // as empty replayed chains.
+    let lab = Lab::new();
+    let release = "release/2026-08-04";
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    lab.octopus(release, "feat/alpha", "feat/beta");
+    let (home, _consumer) = release_test_home(&lab);
+    lab.publish_pull("feat/alpha", 7);
+    lab.squash_merge_pull(7, None);
+    let first_merge = commit_at(&lab, "main@upstream");
+    lab.publish_pull("feat/beta", 8);
+    lab.squash_merge_pull(8, None);
+    let second_merge = commit_at(&lab, "main@upstream");
+    let pulls = format!(
+        "[{},{}]",
+        pull_record(7, "MERGED", "feat/alpha", Some(first_merge.as_str())),
+        pull_record(8, "MERGED", "feat/beta", Some(second_merge.as_str()))
+    );
+    let kept = knives_release_with_forge(&lab, &home, &pulls, &["rebase", "--no-drop"]);
+    assert!(kept.status.success(), "{kept:?}");
+
+    // When: the bare rebase finds the release already contains the target.
+    let output = knives_release_with_forge(&lab, &home, &pulls, &["rebase"]);
+
+    // Then: nothing moves, and dropping every landed member is refused because
+    // it would leave the release without a parent.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "stdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("already contains"),
+        "missing already-contains skip: {stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "every member of release/2026-08-04 landed; dropping them all would leave it \
+             without a parent, so nothing was dropped"
+        ),
+        "missing parentless-drop refusal: {stdout}"
+    );
+    assert_eq!(
+        release_parent_commits(&lab, release).len(),
+        2,
+        "a refused drop must leave the parents alone"
+    );
+}
+
+#[test]
 fn a_release_already_containing_the_reference_by_ancestry_is_left_alone() {
     // Given: a release whose alpha parent merged the upstream advance, so the
     // seed trunk is reachable through alpha rather than a direct release parent.

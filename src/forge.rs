@@ -255,6 +255,16 @@ pub fn ours_only(
         .collect()
 }
 
+/// One of our pull requests the forge says merged onto the trunk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LandedPull {
+    pub number: u64,
+    /// The head branch it was merged from: the member a release may still carry.
+    pub branch: BranchName,
+    /// The trunk commit it landed as, when the forge recorded one.
+    pub oid: Option<String>,
+}
+
 /// Where each merged pull request landed on `trunk`, in number order.
 ///
 /// Merged means merged: a closed pull request landed nothing, and a merge onto
@@ -265,18 +275,17 @@ pub fn ours_only(
 pub fn merged_onto(
     pull_requests: &BTreeMap<BranchName, PullRequest>,
     trunk: &str,
-) -> Vec<(u64, Option<String>)> {
-    let mut landed: Vec<(u64, Option<String>)> = pull_requests
-        .values()
-        .filter(|pr| pr.is_merged() && pr.base_ref_name == trunk)
-        .map(|pr| {
-            (
-                pr.number,
-                pr.merge_commit.as_ref().map(|merge| merge.oid.clone()),
-            )
+) -> Vec<LandedPull> {
+    let mut landed: Vec<LandedPull> = pull_requests
+        .iter()
+        .filter(|(_, pr)| pr.is_merged() && pr.base_ref_name == trunk)
+        .map(|(branch, pr)| LandedPull {
+            number: pr.number,
+            branch: branch.clone(),
+            oid: pr.merge_commit.as_ref().map(|merge| merge.oid.clone()),
         })
         .collect();
-    landed.sort_unstable();
+    landed.sort_unstable_by_key(|pull| pull.number);
     landed
 }
 
@@ -732,13 +741,13 @@ mod tests {
         // request without a recorded merge commit stays listed with no landing
         // point: the caller cannot place it, and must refuse rather than rebase
         // to a target that quietly leaves merged work out.
+        let brief: Vec<(u64, &str, Option<&str>)> = landed
+            .iter()
+            .map(|pull| (pull.number, pull.branch.as_str(), pull.oid.as_deref()))
+            .collect();
         assert_eq!(
-            landed,
-            vec![
-                (5, Some("e5".to_owned())),
-                (6, None),
-                (9, Some("a9".to_owned())),
-            ],
+            brief,
+            vec![(5, "e", Some("e5")), (6, "f", None), (9, "a", Some("a9")),],
             "case-insensitive state, trunk base only, sorted by number"
         );
     }
