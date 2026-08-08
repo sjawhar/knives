@@ -325,6 +325,33 @@ impl Repo {
             })
     }
 
+    /// The single newest commit that every one of `commits` and `tip` can all
+    /// reach: their common fork point. `None` when the histories criss-cross to
+    /// several candidates — rare enough that callers keep their own fallback
+    /// rather than have one guessed here.
+    pub fn common_ancestor(
+        &self,
+        commits: &[CommitId],
+        tip: &CommitId,
+    ) -> Result<Option<CommitId>, JjError> {
+        let mut common = vec![self.commit(tip.as_str())?.id().clone()];
+        for commit in commits {
+            let commit = self.commit(commit.as_str())?.id().clone();
+            common = self
+                .repo
+                .index()
+                .common_ancestors(&common, std::slice::from_ref(&commit))
+                .map_err(|error| JjError::Revision {
+                    revision: commit.to_string(),
+                    detail: error.to_string(),
+                })?;
+        }
+        match common.as_slice() {
+            [only] => Ok(Some(commit_id(only))),
+            _ => Ok(None),
+        }
+    }
+
     /// Bookmarks whose history includes `commit`, excluding any pointing exactly at it.
     ///
     /// Answers where work went when it was not merged: a maintainer building their own
