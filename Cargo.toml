@@ -26,6 +26,10 @@ jj-lib = "=0.43.0"
 
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+# Only the `Stream` trait, to drain jj-lib's tree-diff streams with the same
+# hand-rolled poll loop `block_on` uses for its futures. Already in the tree
+# through jj-lib.
+futures-core = "0.3"
 jiff = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -8,6 +8,7 @@ use std::task::{Context, Poll, Waker};
 use jj_lib::backend::CommitId as JjCommitId;
 use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
 use jj_lib::local_working_copy::LocalWorkingCopy;
+use jj_lib::matchers::EverythingMatcher;
 use jj_lib::object_id::ObjectId as _;
 use jj_lib::op_store::{RefTarget, RemoteRef};
 use jj_lib::ref_name::{RefName as JjRefName, RemoteName as JjRemoteName};
@@ -960,52 +961,19 @@ pub struct ReleaseWrite<'a> {
 /// cannot make that mistake, and it reports the created commit directly
 /// instead of through parsed human-facing output.
 pub fn write_release(repo: &Path, write: &ReleaseWrite<'_>) -> Result<CommitId, JjError> {
-    if write.parents.is_empty() {
-        return Err(JjError::Revision {
-            revision: write.source.map_or_else(
-                || "a fresh merge".to_owned(),
-                |source| source.as_str().to_owned(),
-            ),
-            detail: "a release write needs at least one destination parent".to_owned(),
-        });
-    }
-    // The porcelain silently DEDUPED a repeated parent, which is how "a
-    // branch's work was dropped" once looked; a jj-lib write would happily
-    // record the duplicate instead. Both are wrong: the composition is the
-    // parent set, so a repeat is always a caller bug.
-    let mut seen = BTreeSet::new();
-    for parent in write.parents {
-        if !seen.insert(parent.as_str()) {
-            return Err(JjError::Revision {
-                revision: parent.as_str().to_owned(),
-                detail: "a release cannot carry the same parent twice".to_owned(),
-            });
-        }
-    }
+    validate_parents(write.source, write.parents)?;
     let repo = Repo::open(repo)?;
-    let parent_commits: Vec<jj_lib::commit::Commit> = write
-        .parents
-        .iter()
-        .map(|parent| repo.commit(parent.as_str()))
-        .collect::<Result<_, _>>()?;
-    let parent_ids: Vec<JjCommitId> = parent_commits
-        .iter()
-        .map(|commit| commit.id().clone())
-        .collect();
+    let (parent_commits, parent_ids) = resolved_parents(&repo, write.parents)?;
     let mut tx = repo.repo.start_transaction();
     let written = if let Some(source) = write.source {
         let source = repo.commit(source.as_str())?;
         duplicated_release(&mut tx, (&source, write.message), &parent_ids)?
     } else {
-        let tree = block_on(merge_commit_trees(tx.repo(), &parent_commits))
-            .map_err(|error| store_error(&error))?;
-        block_on(
-            tx.repo_mut()
-                .new_commit(parent_ids, tree)
-                .set_description(write.message.unwrap_or_default())
-                .write(),
-        )
-        .map_err(|error| store_error(&error))?
+        merged_release(
+            &mut tx,
+            (&parent_commits, parent_ids),
+            write.message.unwrap_or_default(),
+        )?
     };
     if let Some(name) = write.bookmark {
         tx.repo_mut().set_local_bookmark_target(
@@ -1015,6 +983,64 @@ pub fn write_release(repo: &Path, write: &ReleaseWrite<'_>) -> Result<CommitId, 
     }
     commit_mutation(&repo, tx, write.operation)?;
     Ok(commit_id(written.id()))
+}
+
+/// Refuse an empty or repeated parent set before anything is written.
+///
+/// The porcelain silently DEDUPED a repeated parent, which is how "a branch's
+/// work was dropped" once looked; a jj-lib write would happily record the
+/// duplicate instead. Both are wrong: the composition is the parent set, so a
+/// repeat is always a caller bug.
+fn validate_parents(source: Option<&CommitId>, parents: &[CommitId]) -> Result<(), JjError> {
+    if parents.is_empty() {
+        return Err(JjError::Revision {
+            revision: source.map_or_else(
+                || "a fresh merge".to_owned(),
+                |source| source.as_str().to_owned(),
+            ),
+            detail: "a release write needs at least one destination parent".to_owned(),
+        });
+    }
+    let mut seen = BTreeSet::new();
+    for parent in parents {
+        if !seen.insert(parent.as_str()) {
+            return Err(JjError::Revision {
+                revision: parent.as_str().to_owned(),
+                detail: "a release cannot carry the same parent twice".to_owned(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Every parent as a resolved commit, alongside its backend id.
+fn resolved_parents(
+    repo: &Repo,
+    parents: &[CommitId],
+) -> Result<(Vec<jj_lib::commit::Commit>, Vec<JjCommitId>), JjError> {
+    let commits: Vec<jj_lib::commit::Commit> = parents
+        .iter()
+        .map(|parent| repo.commit(parent.as_str()))
+        .collect::<Result<_, _>>()?;
+    let ids = commits.iter().map(|commit| commit.id().clone()).collect();
+    Ok((commits, ids))
+}
+
+/// A fresh flat merge of the parents, described.
+fn merged_release(
+    tx: &mut Transaction,
+    (parent_commits, parent_ids): (&[jj_lib::commit::Commit], Vec<JjCommitId>),
+    message: &str,
+) -> Result<jj_lib::commit::Commit, JjError> {
+    let tree = block_on(merge_commit_trees(tx.repo(), parent_commits))
+        .map_err(|error| store_error(&error))?;
+    block_on(
+        tx.repo_mut()
+            .new_commit(parent_ids, tree)
+            .set_description(message)
+            .write(),
+    )
+    .map_err(|error| store_error(&error))
 }
 
 /// The duplicate of `source` onto `parent_ids`, message optionally replaced.
@@ -1043,6 +1069,189 @@ fn duplicated_release(
             revision: source.id().to_string(),
             detail: "the duplicate produced no commit".to_owned(),
         })
+}
+
+/// What one cut is made of, owned so a candidate can be rebuilt verbatim.
+#[derive(Debug, Clone)]
+pub struct CutSpec {
+    /// Duplicate this commit onto the parents; `None` builds a fresh flat merge.
+    pub source: Option<CommitId>,
+    pub parents: Vec<CommitId>,
+    pub message: String,
+}
+
+/// A release commit built in a scratch transaction that is never committed.
+///
+/// The cut audit needs to READ the merge it is judging. Committing the merge
+/// first meant a failed audit had to compensate with an abandon, and a crash
+/// between the two operations stranded an anonymous merge. A candidate gives
+/// the audit a real commit to read — conflicts, member replays, tree drift —
+/// inside a transaction that simply evaporates afterwards: a failed audit
+/// writes nothing at all. [`Candidate::publish`] rebuilds the spec in a fresh
+/// transaction and refuses if the rebuilt tree differs from the audited one,
+/// so the verdict provably applies to what ships.
+pub struct Candidate {
+    repo: Repo,
+    tx: Transaction,
+    spec: CutSpec,
+    commit: jj_lib::commit::Commit,
+}
+
+impl std::fmt::Debug for Candidate {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Candidate")
+            .field("spec", &self.spec)
+            .field("commit", self.commit.id())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Build `spec`'s release commit in a scratch transaction, for auditing.
+pub fn candidate_release(repo: &Path, spec: CutSpec) -> Result<Candidate, JjError> {
+    validate_parents(spec.source.as_ref(), &spec.parents)?;
+    let repo = Repo::open(repo)?;
+    let mut tx = repo.repo.start_transaction();
+    let commit = spec_commit(&repo, &mut tx, &spec)?;
+    Ok(Candidate {
+        repo,
+        tx,
+        spec,
+        commit,
+    })
+}
+
+/// The release commit `spec` describes, written into `tx`.
+fn spec_commit(
+    repo: &Repo,
+    tx: &mut Transaction,
+    spec: &CutSpec,
+) -> Result<jj_lib::commit::Commit, JjError> {
+    let (parent_commits, parent_ids) = resolved_parents(repo, &spec.parents)?;
+    if let Some(source) = &spec.source {
+        let source = repo.commit(source.as_str())?;
+        duplicated_release(tx, (&source, Some(&spec.message)), &parent_ids)
+    } else {
+        merged_release(tx, (&parent_commits, parent_ids), &spec.message)
+    }
+}
+
+impl Candidate {
+    pub fn commit_id(&self) -> CommitId {
+        commit_id(self.commit.id())
+    }
+
+    pub fn parent_count(&self) -> usize {
+        self.commit.parent_ids().len()
+    }
+
+    /// Files the candidate's tree leaves conflicted.
+    pub fn conflicted_files(&self) -> Result<Vec<String>, JjError> {
+        let mut files = Vec::new();
+        for (file, value) in self.commit.tree().conflicts() {
+            value.map_err(|error| store_error(&error))?;
+            files.push(file.as_internal_file_string().to_owned());
+        }
+        Ok(files)
+    }
+
+    /// [`probe_net_diff`] with the candidate as the target: the net effect of
+    /// `base..revision`, replayed onto the candidate in its own scratch
+    /// transaction.
+    pub fn replay_outcome(&mut self, base: &str, revision: &str) -> Result<RebaseOutcome, JjError> {
+        let base = self.repo.commit(base)?;
+        let revision = self.repo.commit(revision)?;
+        // `base..revision` is empty exactly when the base already reaches the tip.
+        if self.repo.backend_is_ancestor(revision.id(), base.id())? {
+            return Ok(RebaseOutcome::Empty);
+        }
+        let synthetic = block_on(
+            self.tx
+                .repo_mut()
+                .new_commit(vec![base.id().clone()], revision.tree())
+                .write(),
+        )
+        .map_err(|error| store_error(&error))?;
+        let replayed = block_on(rebase_commit(
+            self.tx.repo_mut(),
+            synthetic,
+            vec![self.commit.id().clone()],
+        ))
+        .map_err(|error| store_error(&error))?;
+        Ok(if replayed.has_conflict() {
+            RebaseOutcome::Conflicted
+        } else if block_on(replayed.is_empty(self.tx.repo()))
+            .map_err(|error| store_error(&error))?
+        {
+            RebaseOutcome::Empty
+        } else {
+            RebaseOutcome::CleanNonEmpty
+        })
+    }
+
+    /// Paths whose content differs between `previous` and the candidate.
+    pub fn changed_files_since(&self, previous: &str) -> Result<Vec<String>, JjError> {
+        let previous = self.repo.commit(previous)?;
+        let previous_tree = previous.tree();
+        let candidate_tree = self.commit.tree();
+        let mut files = Vec::new();
+        for entry in collect_stream(previous_tree.diff_stream(&candidate_tree, &EverythingMatcher))
+        {
+            entry.values.map_err(|error| store_error(&error))?;
+            files.push(entry.path.as_internal_file_string().to_owned());
+        }
+        Ok(files)
+    }
+
+    /// Rebuild the audited spec in a fresh transaction, point `bookmark` at it,
+    /// and publish as ONE operation: creation, audit and naming never exist as
+    /// separate published states. Refuses when the rebuilt tree differs from
+    /// the audited tree, so the audit's verdict provably applies to what ships.
+    pub fn publish(
+        self,
+        (bookmark, motion): (&str, BookmarkMotion),
+        operation: &str,
+    ) -> Result<CommitId, JjError> {
+        let Self {
+            repo,
+            tx,
+            spec,
+            commit: audited,
+        } = self;
+        // The audited scratch — candidate and probe leftovers — evaporates
+        // before anything real is written.
+        drop(tx);
+        let mut tx = repo.repo.start_transaction();
+        let written = spec_commit(&repo, &mut tx, &spec)?;
+        if written.tree_ids() != audited.tree_ids() {
+            return Err(JjError::Revision {
+                revision: commit_id(audited.id()).as_str().to_owned(),
+                detail: "the rebuilt cut's tree differs from the audited candidate".to_owned(),
+            });
+        }
+        guard_bookmark_motion(tx.repo(), (bookmark, written.id()), motion)?;
+        tx.repo_mut().set_local_bookmark_target(
+            JjRefName::new(bookmark),
+            RefTarget::normal(written.id().clone()),
+        );
+        commit_mutation(&repo, tx, operation)?;
+        Ok(commit_id(written.id()))
+    }
+}
+
+/// Drain a jj-lib stream with the same noop-waker loop [`block_on`] uses.
+fn collect_stream<S: futures_core::Stream>(stream: S) -> Vec<S::Item> {
+    let waker = Waker::noop();
+    let mut context = Context::from_waker(waker);
+    let mut stream = std::pin::pin!(stream);
+    let mut items = Vec::new();
+    loop {
+        match stream.as_mut().poll_next(&mut context) {
+            Poll::Ready(Some(item)) => items.push(item),
+            Poll::Ready(None) => return items,
+            Poll::Pending => std::thread::yield_now(),
+        }
+    }
 }
 
 /// A ref jj's stock configuration treats as an immutability pin.
@@ -1358,8 +1567,11 @@ pub fn set_bookmark_anywhere(repo: &Path, name: &str, revision: &str) -> Result<
     move_bookmark(repo, (name, revision), BookmarkMotion::Anywhere)
 }
 
-#[derive(Clone, Copy)]
-enum BookmarkMotion {
+/// How far a bookmark may move: [`BookmarkMotion::ForwardOnly`] refuses
+/// backwards or sideways movement, [`BookmarkMotion::Anywhere`] is the
+/// deliberate override for fixed release names.
+#[derive(Clone, Copy, Debug)]
+pub enum BookmarkMotion {
     ForwardOnly,
     Anywhere,
 }
@@ -1371,19 +1583,7 @@ fn move_bookmark(
 ) -> Result<(), JjError> {
     let repo = Repo::open(repo)?;
     let target = repo.commit(revision)?;
-    if matches!(motion, BookmarkMotion::ForwardOnly)
-        && let Some(current) = repo
-            .repo
-            .view()
-            .get_local_bookmark(JjRefName::new(name))
-            .as_normal()
-        && !repo.backend_is_ancestor(current, target.id())?
-    {
-        return Err(JjError::Revision {
-            revision: name.to_owned(),
-            detail: "refusing to move the bookmark backwards or sideways".to_owned(),
-        });
-    }
+    guard_bookmark_motion(repo.repo.as_ref(), (name, target.id()), motion)?;
     let mut tx = repo.repo.start_transaction();
     tx.repo_mut()
         .set_local_bookmark_target(JjRefName::new(name), RefTarget::normal(target.id().clone()));
@@ -1392,6 +1592,37 @@ fn move_bookmark(
         short_id(&target.id().to_string())
     );
     commit_mutation(&repo, tx, &operation)
+}
+
+/// Refuse a [`BookmarkMotion::ForwardOnly`] move that is backwards or sideways.
+///
+/// Takes the repo abstraction rather than [`Repo`] so a publish can ask the
+/// question inside its own transaction, whose index is the only one that
+/// contains the just-written commit.
+fn guard_bookmark_motion(
+    repo: &dyn jj_lib::repo::Repo,
+    (name, target): (&str, &JjCommitId),
+    motion: BookmarkMotion,
+) -> Result<(), JjError> {
+    if matches!(motion, BookmarkMotion::ForwardOnly)
+        && let Some(current) = repo
+            .view()
+            .get_local_bookmark(JjRefName::new(name))
+            .as_normal()
+        && !repo
+            .index()
+            .is_ancestor(current, target)
+            .map_err(|error| JjError::Revision {
+                revision: target.to_string(),
+                detail: error.to_string(),
+            })?
+    {
+        return Err(JjError::Revision {
+            revision: name.to_owned(),
+            detail: "refusing to move the bookmark backwards or sideways".to_owned(),
+        });
+    }
+    Ok(())
 }
 
 /// Commits matching a revset, resolved through jj porcelain.
