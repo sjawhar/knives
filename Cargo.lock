@@ -1628,6 +1628,7 @@ dependencies = [
  "anyhow",
  "clap",
  "filetime",
+ "futures-core",
  "insta",
  "jiff",
  "jj-lib",

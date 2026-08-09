@@ -4156,6 +4156,84 @@ fn include_adds_one_parent_and_changes_nothing_else() {
 }
 
 #[test]
+fn a_cut_is_one_operation_described_for_the_op_log() {
+    // Given: branches ready for a first cut. A cut used to be two operations
+    // (build the merge, then name it after the audit) with a crash window
+    // between them that stranded an anonymous merge; the audit now reads a
+    // candidate that was never committed, so pass = one operation and
+    // fail = none (#18).
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let (home, _consumer) = release_test_home(&lab);
+    let operations_before = operation_ids(&lab.work);
+
+    // When: the release is cut.
+    let output = knives_release(&lab, &home, &["cut", "release/2026-08-04"]);
+    assert!(
+        output.status.success(),
+        "cut failed: {}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Then: creating AND naming the audited release is ONE operation.
+    let operations_after = operation_ids(&lab.work);
+    assert_eq!(
+        operations_after.len(),
+        operations_before.len() + 1,
+        "a cut must be one operation"
+    );
+    assert_eq!(
+        newest_operation_description(&lab.work),
+        "knives: cut release/2026-08-04"
+    );
+}
+
+#[test]
+fn a_discarded_candidate_leaves_no_trace() {
+    // Given: a candidate cut that a failing audit would discard. The old flow
+    // committed the merge before auditing, so a failure had to compensate with
+    // an abandon — and a crash in between stranded an anonymous merge.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let repo = Repo::open(&lab.work).expect("open");
+    let alpha = repo.resolve_commit("feat/alpha").expect("resolve alpha");
+    let beta = repo.resolve_commit("feat/beta").expect("resolve beta");
+    let trunk = repo.resolve_commit("main@origin").expect("resolve trunk");
+    let operations_before = operation_ids(&lab.work);
+    let visible_before = knives::jj::commits_matching(&lab.work, "all()").expect("list all");
+
+    // When: the candidate is built, audit-shaped reads run against it, and it
+    // is dropped without publishing.
+    let mut candidate = knives::jj::candidate_release(
+        &lab.work,
+        knives::jj::CutSpec {
+            source: None,
+            parents: vec![alpha.clone(), beta],
+            message: "release: doomed candidate".to_owned(),
+        },
+    )
+    .expect("build candidate");
+    let conflicted = candidate.conflicted_files().expect("list conflicts");
+    assert!(conflicted.is_empty(), "{conflicted:?}");
+    let replay = candidate
+        .replay_outcome(trunk.as_str(), alpha.as_str())
+        .expect("replay alpha onto the candidate");
+    assert_eq!(replay, RebaseOutcome::Empty, "alpha must be carried");
+    drop(candidate);
+
+    // Then: no operation was written and no commit became visible.
+    assert_eq!(operation_ids(&lab.work), operations_before);
+    assert_eq!(
+        knives::jj::commits_matching(&lab.work, "all()").expect("list all"),
+        visible_before,
+        "a discarded candidate leaked a commit"
+    );
+}
+
+#[test]
 fn a_release_edit_is_one_operation_described_for_the_op_log() {
     // Given: a cut release and a new branch to include. An include used to be
     // three operations (duplicate, describe, bookmark set), each described as
@@ -5001,7 +5079,7 @@ fn the_audit_catches_a_cut_missing_a_members_content() {
             (beta.clone(), "feat/beta".to_owned()),
         ],
     };
-    let cut = knives::commands::release::build_cut(&lab.work, &request, None).expect("build cut");
+    let cut = committed_cut_fixture(&lab, &request, None).expect("build cut");
     lab.jj_work(["bookmark", "create", "doctored-cut", "-r", cut.as_str()]);
     lab.jj_work(["edit", "doctored-cut"]);
     std::fs::remove_file(lab.work.join("beta.txt")).expect("remove beta from cut tree");
@@ -5019,7 +5097,7 @@ fn the_audit_catches_a_cut_missing_a_members_content() {
             ("feat/alpha".to_owned(), alpha),
             ("feat/beta".to_owned(), beta),
         ],
-        &cut,
+        knives::commands::release::CutSubject::Committed(&cut),
         knives::commands::release::AuditContext {
             previous: None,
             trunk: &trunk,
@@ -5053,14 +5131,14 @@ fn the_audit_passes_a_faithful_cut() {
     };
 
     // When: the cut is audited against its captured members.
-    let cut = knives::commands::release::build_cut(&lab.work, &request, None).expect("build cut");
+    let cut = committed_cut_fixture(&lab, &request, None).expect("build cut");
     let audit = knives::commands::release::audit_cut(
         &lab.work,
         &[
             ("feat/alpha".to_owned(), alpha),
             ("feat/beta".to_owned(), beta),
         ],
-        &cut,
+        knives::commands::release::CutSubject::Committed(&cut),
         knives::commands::release::AuditContext {
             previous: None,
             trunk: &trunk,
@@ -5091,8 +5169,7 @@ fn divergence_the_previous_release_already_carried_is_not_a_loss() {
             (beta.clone(), "feat/beta".to_owned()),
         ],
     };
-    let previous =
-        knives::commands::release::build_cut(&lab.work, &request, None).expect("build previous");
+    let previous = committed_cut_fixture(&lab, &request, None).expect("build previous");
     lab.jj_work([
         "bookmark",
         "create",
@@ -5112,8 +5189,7 @@ fn divergence_the_previous_release_already_carried_is_not_a_loss() {
         name: "release/2026-08-05".to_owned(),
         ..request
     };
-    let cut = knives::commands::release::build_cut(&lab.work, &recut, Some(&previous))
-        .expect("build recut");
+    let cut = committed_cut_fixture(&lab, &recut, Some(&previous)).expect("build recut");
 
     // When: the recut is audited with the previous release in view.
     let audit = knives::commands::release::audit_cut(
@@ -5122,7 +5198,7 @@ fn divergence_the_previous_release_already_carried_is_not_a_loss() {
             ("feat/alpha".to_owned(), alpha),
             ("feat/beta".to_owned(), beta),
         ],
-        &cut,
+        knives::commands::release::CutSubject::Committed(&cut),
         knives::commands::release::AuditContext {
             previous: Some(&previous),
             trunk: &trunk,
@@ -5155,14 +5231,12 @@ fn a_loss_the_previous_release_did_not_have_still_fails_the_audit() {
             (beta.clone(), "feat/beta".to_owned()),
         ],
     };
-    let previous =
-        knives::commands::release::build_cut(&lab.work, &request, None).expect("build previous");
+    let previous = committed_cut_fixture(&lab, &request, None).expect("build previous");
     let recut = knives::commands::release::Cut {
         name: "release/2026-08-05".to_owned(),
         ..request
     };
-    let cut = knives::commands::release::build_cut(&lab.work, &recut, Some(&previous))
-        .expect("build recut");
+    let cut = committed_cut_fixture(&lab, &recut, Some(&previous)).expect("build recut");
     lab.jj_work(["bookmark", "create", "lossy-recut", "-r", cut.as_str()]);
     lab.jj_work(["edit", "lossy-recut"]);
     std::fs::remove_file(lab.work.join("beta.txt")).expect("lose beta from the recut");
@@ -5180,7 +5254,7 @@ fn a_loss_the_previous_release_did_not_have_still_fails_the_audit() {
             ("feat/alpha".to_owned(), alpha),
             ("feat/beta".to_owned(), beta),
         ],
-        &cut,
+        knives::commands::release::CutSubject::Committed(&cut),
         knives::commands::release::AuditContext {
             previous: Some(&previous),
             trunk: &trunk,
@@ -5217,7 +5291,7 @@ fn the_audit_passes_a_faithful_multi_commit_member_without_inconclusive() {
             (beta.clone(), "feat/beta".to_owned()),
         ],
     };
-    let cut = knives::commands::release::build_cut(&lab.work, &request, None).expect("build cut");
+    let cut = committed_cut_fixture(&lab, &request, None).expect("build cut");
 
     // When: the fresh cut is audited using the captured tips.
     let audit = knives::commands::release::audit_cut(
@@ -5226,7 +5300,7 @@ fn the_audit_passes_a_faithful_multi_commit_member_without_inconclusive() {
             ("feat/alpha".to_owned(), alpha),
             ("feat/beta".to_owned(), beta),
         ],
-        &cut,
+        knives::commands::release::CutSubject::Committed(&cut),
         knives::commands::release::AuditContext {
             previous: None,
             trunk: &trunk,
@@ -5262,7 +5336,7 @@ fn the_audit_passes_when_a_member_adds_then_deletes_a_file() {
             (beta.clone(), "feat/beta".to_owned()),
         ],
     };
-    let cut = knives::commands::release::build_cut(&lab.work, &request, None).expect("build cut");
+    let cut = committed_cut_fixture(&lab, &request, None).expect("build cut");
     let deleted_path = Command::new("jj")
         .args([
             "--repository",
@@ -5289,7 +5363,7 @@ fn the_audit_passes_when_a_member_adds_then_deletes_a_file() {
             ("feat/alpha".to_owned(), alpha),
             ("feat/beta".to_owned(), beta),
         ],
-        &cut,
+        knives::commands::release::CutSubject::Committed(&cut),
         knives::commands::release::AuditContext {
             previous: None,
             trunk: &trunk,
@@ -5323,7 +5397,7 @@ fn the_audit_catches_a_member_whose_early_range_content_is_missing() {
             (beta.clone(), "feat/beta".to_owned()),
         ],
     };
-    let cut = knives::commands::release::build_cut(&lab.work, &request, None).expect("build cut");
+    let cut = committed_cut_fixture(&lab, &request, None).expect("build cut");
     lab.jj_work(["bookmark", "create", "doctored-cut", "-r", cut.as_str()]);
     lab.jj_work(["edit", "doctored-cut"]);
     std::fs::remove_file(lab.work.join("early.txt")).expect("remove early content from cut");
@@ -5341,7 +5415,7 @@ fn the_audit_catches_a_member_whose_early_range_content_is_missing() {
             ("feat/alpha".to_owned(), alpha),
             ("feat/beta".to_owned(), beta),
         ],
-        &cut,
+        knives::commands::release::CutSubject::Committed(&cut),
         knives::commands::release::AuditContext {
             previous: None,
             trunk: &trunk,
@@ -5377,7 +5451,7 @@ fn the_audit_passes_when_a_member_renames_a_file() {
             (beta.clone(), "feat/beta".to_owned()),
         ],
     };
-    let cut = knives::commands::release::build_cut(&lab.work, &request, None).expect("build cut");
+    let cut = committed_cut_fixture(&lab, &request, None).expect("build cut");
 
     // When: the cut includes the renamed tree and audits the full member range.
     let audit = knives::commands::release::audit_cut(
@@ -5386,7 +5460,7 @@ fn the_audit_passes_when_a_member_renames_a_file() {
             ("feat/alpha".to_owned(), alpha),
             ("feat/beta".to_owned(), beta),
         ],
-        &cut,
+        knives::commands::release::CutSubject::Committed(&cut),
         knives::commands::release::AuditContext {
             previous: None,
             trunk: &trunk,
@@ -5417,7 +5491,7 @@ fn the_audit_fails_when_a_regenerated_lockfile_loses_member_content() {
             (beta.clone(), "feat/beta".to_owned()),
         ],
     };
-    let cut = knives::commands::release::build_cut(&lab.work, &request, None).expect("build cut");
+    let cut = committed_cut_fixture(&lab, &request, None).expect("build cut");
     lab.jj_work(["bookmark", "create", "doctored-cut", "-r", cut.as_str()]);
     lab.jj_work(["edit", "doctored-cut"]);
     std::fs::write(lab.work.join("uv.lock"), "pkg-a\n").expect("regenerate lockfile");
@@ -5435,7 +5509,7 @@ fn the_audit_fails_when_a_regenerated_lockfile_loses_member_content() {
             ("feat/alpha".to_owned(), alpha),
             ("feat/beta".to_owned(), beta),
         ],
-        &cut,
+        knives::commands::release::CutSubject::Committed(&cut),
         knives::commands::release::AuditContext {
             previous: None,
             trunk: &trunk,
@@ -5466,7 +5540,7 @@ fn the_audit_judges_the_captured_tip_not_the_moved_bookmark() {
             (beta.clone(), "feat/beta".to_owned()),
         ],
     };
-    let cut = knives::commands::release::build_cut(&lab.work, &request, None).expect("build cut");
+    let cut = committed_cut_fixture(&lab, &request, None).expect("build cut");
     lab.jj_work(["new", "-r", "feat/beta", "-m", "beta moved after planning"]);
     std::fs::write(lab.work.join("beta-next.txt"), "new beta work\n").expect("write moved beta");
     lab.jj_work(["bookmark", "set", "feat/beta", "-r", "@"]);
@@ -5479,7 +5553,7 @@ fn the_audit_judges_the_captured_tip_not_the_moved_bookmark() {
             ("feat/alpha".to_owned(), alpha),
             ("feat/beta".to_owned(), beta),
         ],
-        &cut,
+        knives::commands::release::CutSubject::Committed(&cut),
         knives::commands::release::AuditContext {
             previous: None,
             trunk: &trunk,
@@ -5507,15 +5581,39 @@ fn resolved_two_branch_cut(lab: &Lab) -> (CommitId, CommitId, CommitId) {
             (beta.clone(), "feat/beta".to_owned()),
         ],
     };
-    let cut =
-        knives::commands::release::build_cut(&lab.work, &request, None).expect("build first cut");
-    knives::commands::release::name_cut(&lab.work, &request.name, &cut, &ReleaseScheme::Dated)
-        .expect("name first cut");
+    let cut = committed_cut_fixture(lab, &request, None).expect("build first cut");
+    lab.jj_work([
+        "bookmark",
+        "create",
+        "release/2026-08-04",
+        "-r",
+        cut.as_str(),
+    ]);
     lab.jj_work(["edit", "release/2026-08-04"]);
     std::fs::write(lab.work.join("shared.txt"), "resolved\n").expect("resolve conflict");
     lab.jj_work(["bookmark", "set", "release/2026-08-04", "-r", "@"]);
     lab.jj_work(["new"]);
     (alpha, beta, gamma)
+}
+
+/// A committed, unnamed cut for fixtures. The doctored-tree audit tests and
+/// content assertions need a commit that real jj commands can edit and read,
+/// which the live cut path's scratch candidate deliberately is not.
+fn committed_cut_fixture(
+    lab: &Lab,
+    request: &knives::commands::release::Cut,
+    previous: Option<&CommitId>,
+) -> Result<CommitId, knives::jj::JjError> {
+    knives::jj::write_release(
+        &lab.work,
+        &knives::jj::ReleaseWrite {
+            source: previous,
+            parents: &request.parents,
+            message: Some(&request.message()),
+            bookmark: None,
+            operation: &format!("knives: cut {} (fixture)", request.name),
+        },
+    )
 }
 
 fn file_at_revision(lab: &Lab, revision: &str, file: &str) -> String {
@@ -5604,8 +5702,8 @@ fn an_incremental_recut_preserves_the_previous_cuts_conflict_resolutions() {
     };
 
     // When: the next cut duplicates the resolved cut onto the new parent set.
-    let cut = knives::commands::release::build_cut(&lab.work, &request, Some(&previous))
-        .expect("build incremental cut");
+    let cut =
+        committed_cut_fixture(&lab, &request, Some(&previous)).expect("build incremental cut");
 
     // Then: the resolution, new branch content, and new message all survive.
     assert_eq!(
@@ -5667,8 +5765,8 @@ fn dropping_a_resolved_branch_surfaces_a_focused_conflict_not_silence() {
     };
 
     // When: the next cut drops beta while preserving the prior resolution diff.
-    let cut = knives::commands::release::build_cut(&lab.work, &request, Some(&previous))
-        .expect("build incremental cut");
+    let cut =
+        committed_cut_fixture(&lab, &request, Some(&previous)).expect("build incremental cut");
 
     // Then: jj reports the one entangled file as a conflict instead of silently retaining beta.
     assert_eq!(

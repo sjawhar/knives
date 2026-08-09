@@ -4,7 +4,7 @@
 //! here because each is one jj sequence over a parent set rather than a report
 //! with a renderer. Every other command owns its own logic and returns an
 //! [`Exit`], so the match stays a table.
-// allow: SIZE_OK: 2065 lines - dispatch plus the release-edit verbs; splitting would scatter the exhaustive match.
+// allow: SIZE_OK: 2050 lines - dispatch plus the release-edit verbs; splitting would scatter the exhaustive match.
 
 use std::process::ExitCode;
 
@@ -1583,30 +1583,24 @@ fn run_release(
                 (carried, members, base)
             };
             let request = cut_request(name.clone(), &carried);
-            let created = release::build_cut(&entry.path, &request, previous_commit.as_ref())?;
-            let audit = match release::audit_cut(
+            let mut candidate =
+                release::candidate_cut(&entry.path, &request, previous_commit.as_ref())?;
+            // An audit error or failure simply DROPS the candidate: the merge
+            // was never a published operation, so there is nothing to abandon
+            // and no crash window that strands one.
+            let audit = release::audit_cut(
                 &entry.path,
                 &members,
-                &created,
+                release::CutSubject::Candidate(&mut candidate),
                 release::AuditContext {
                     previous: previous_commit.as_ref(),
                     trunk: &audit_base,
                 },
-            ) {
-                Ok(audit) => audit,
-                Err(error) => {
-                    let _ = knives::jj::abandon_commits(
-                        &entry.path,
-                        std::slice::from_ref(&created),
-                        "knives: abandon a cut whose audit errored",
-                    );
-                    return Err(error);
-                }
-            };
-            if let Some(exit) = report_cut_audit(&repo, &entry, &created, &audit)? {
+            )?;
+            if let Some(exit) = report_cut_audit(&repo, &audit) {
                 return Ok(exit);
             }
-            release::name_cut(&entry.path, &request.name, &created, &scheme)?;
+            let created = release::publish_cut(candidate, &request.name, &scheme)?;
             worst = worst.worst(report_completed_cut(
                 &repo,
                 &entry,
@@ -1659,18 +1653,14 @@ fn release_plan_exit(
     Ok(exit)
 }
 
-/// Say what the audit found; abandon and refuse when it failed.
+/// Say what the audit found; refuse when it failed.
 ///
 /// Inconclusive members are reported without failing the cut: a conflicted
 /// replay onto a conflicted cut answers nothing either way. Missing or
-/// unexplained content abandons the cut, because naming it would look exactly
-/// like success while work is gone.
-fn report_cut_audit(
-    repo: &RepoName,
-    entry: &knives::config::RepoEntry,
-    created: &knives::ids::CommitId,
-    audit: &release::CutAudit,
-) -> anyhow::Result<Option<Exit>> {
+/// unexplained content refuses the cut, because naming it would look exactly
+/// like success while work is gone. The refused candidate was never a
+/// published operation, so nothing is abandoned and nothing needs cleanup.
+fn report_cut_audit(repo: &RepoName, audit: &release::CutAudit) -> Option<Exit> {
     for name in &audit.carried {
         println!(
             "  {name}: diverges where the previous release already did \
@@ -1684,7 +1674,7 @@ fn report_cut_audit(
         );
     }
     if audit.passed() {
-        return Ok(None);
+        return None;
     }
     for name in &audit.missing {
         println!("  !! {name}: the cut tree is missing or diverges from the member's content");
@@ -1695,13 +1685,8 @@ fn report_cut_audit(
              with no member or trunk explaining it"
         );
     }
-    knives::jj::abandon_commits(
-        &entry.path,
-        std::slice::from_ref(created),
-        "knives: abandon a cut that failed its audit",
-    )?;
-    println!("{repo}: cut abandoned; nothing was named or pushed. Fix the inputs and re-cut.");
-    Ok(Some(Exit::Incomplete))
+    println!("{repo}: cut discarded; nothing was written at all. Fix the inputs and re-cut.");
+    Some(Exit::Incomplete)
 }
 
 struct CompletedCut<'a> {

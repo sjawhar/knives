@@ -5,7 +5,7 @@
 //! decided. Planning is the default because everything else here writes: a cut
 //! names a composition, and `include`, `drop`, `advance` and `rebase` change
 //! one. Every one of them writes locally only, and none of them pushes.
-// allow: SIZE_OK: 1539 lines - the release lifecycle's plan, cut, edit, audit, reap, and rebase operations are one domain seam.
+// allow: SIZE_OK: 1586 lines - the release lifecycle's plan, cut, edit, audit, reap, and rebase operations are one domain seam.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -1129,8 +1129,9 @@ pub fn workspaces_to_clean(workspaces: &[String], branches: &[String]) -> Vec<St
         .collect()
 }
 
-/// Build the candidate cut and verify it has exactly the parents asked for.
-/// Public seam so the audit can run between creation and naming.
+/// Build the candidate cut — in a scratch transaction the audit can read and
+/// a failed audit simply drops — and verify it has exactly the parents asked
+/// for.
 ///
 /// `Some(previous)` duplicates the previous release onto the new parent set,
 /// preserving its recorded conflict resolutions. Adding a branch or advancing
@@ -1141,75 +1142,122 @@ pub fn workspaces_to_clean(workspaces: &[String], branches: &[String]) -> Vec<St
 /// The parent-count guard catches a silent failure: a cut that dropped a parent
 /// looks exactly like one that did not, until work goes missing downstream.
 ///
-/// This never pushes. Publishing a release is a separate, deliberate act.
-pub fn build_cut(
+/// Nothing is published until [`publish_cut`], and nothing ever pushes.
+pub fn candidate_cut(
     repo: &Path,
     request: &Cut,
     previous: Option<&CommitId>,
-) -> anyhow::Result<CommitId> {
-    let message = request.message();
-    let created = crate::jj::write_release(
+) -> anyhow::Result<jj::Candidate> {
+    let candidate = jj::candidate_release(
         repo,
-        &crate::jj::ReleaseWrite {
-            source: previous,
-            parents: &request.parents,
-            message: Some(&message),
-            bookmark: None,
-            operation: &format!("knives: cut {}", request.name),
+        jj::CutSpec {
+            source: previous.cloned(),
+            parents: request.parents.clone(),
+            message: request.message(),
         },
     )?;
-    let actual = Repo::open(repo)?.parents_of(created.as_str())?;
     anyhow::ensure!(
-        actual.len() == request.parents.len(),
+        candidate.parent_count() == request.parents.len(),
         "cut {} came out with {} parents, expected {}; refusing to name it",
         request.name,
-        actual.len(),
+        candidate.parent_count(),
         request.parents.len()
     );
-    Ok(created)
+    Ok(candidate)
 }
 
-/// Point the release name at an already-checked merge.
+/// Rebuild the audited candidate and point the release name at it, as ONE
+/// published operation.
 ///
 /// Dated cuts retain ordinary bookmark-movement protection because each name
 /// records a new release. Fixed cuts deliberately move their existing release
 /// name, which may already exist on the remote.
-pub fn name_cut(
-    repo: &Path,
+pub fn publish_cut(
+    candidate: jj::Candidate,
     name: &str,
-    commit: &CommitId,
     scheme: &ReleaseScheme,
-) -> anyhow::Result<()> {
-    match scheme {
-        ReleaseScheme::Dated => crate::jj::set_bookmark(repo, name, commit.as_str())?,
-        ReleaseScheme::Fixed(_) => {
-            crate::jj::set_bookmark_anywhere(repo, name, commit.as_str())?;
+) -> anyhow::Result<CommitId> {
+    let motion = match scheme {
+        ReleaseScheme::Dated => jj::BookmarkMotion::ForwardOnly,
+        ReleaseScheme::Fixed(_) => jj::BookmarkMotion::Anywhere,
+    };
+    Ok(candidate.publish((name, motion), &format!("knives: cut {name}"))?)
+}
+
+/// The cut being audited: an unpublished candidate in its scratch transaction,
+/// or a committed commit (how a published cut is re-examined).
+#[derive(Debug)]
+pub enum CutSubject<'a> {
+    Candidate(&'a mut jj::Candidate),
+    Committed(&'a CommitId),
+}
+
+impl CutSubject<'_> {
+    fn conflicted_files(&mut self, repo: &Path) -> anyhow::Result<Vec<String>> {
+        match self {
+            Self::Candidate(candidate) => Ok(candidate.conflicted_files()?),
+            Self::Committed(cut) => Ok(crate::jj::conflicted_files(repo, cut.as_str())?),
         }
     }
-    Ok(())
+
+    fn replay_outcome(
+        &mut self,
+        repo: &Path,
+        base: &str,
+        revision: &str,
+    ) -> anyhow::Result<RebaseOutcome> {
+        match self {
+            Self::Candidate(candidate) => Ok(candidate.replay_outcome(base, revision)?),
+            Self::Committed(cut) => Ok(crate::jj::probe_net_diff(
+                repo,
+                base,
+                revision,
+                cut.as_str(),
+            )?),
+        }
+    }
+
+    fn changed_files_since(
+        &mut self,
+        repo: &Path,
+        previous: &CommitId,
+    ) -> anyhow::Result<Vec<String>> {
+        match self {
+            Self::Candidate(candidate) => Ok(candidate.changed_files_since(previous.as_str())?),
+            Self::Committed(cut) => Ok(crate::jj::changed_files_between(
+                repo,
+                previous.as_str(),
+                cut.as_str(),
+            )?),
+        }
+    }
 }
 
 /// Verify the cut actually contains what it merged (spec 1.3).
 ///
-/// For each member, a scratch child of `trunk` is restored to the member tip's
-/// tree, producing a synthetic commit whose diff is `trunk..member_tip`; that
-/// single net commit is replayed onto the fresh cut.
+/// For each member, a scratch child of `trunk` carrying the member tip's tree
+/// — a synthetic commit whose diff is `trunk..member_tip` — is replayed onto
+/// the cut.
 /// An empty replay means its hunks are present; a clean, non-empty replay means
 /// the cut silently lacks them. A conflicted replay is inconclusive only when
 /// the cut itself has unresolved conflicts; otherwise its tree diverges from the
 /// member and fails the audit.
 /// Changes from the previous release that no member or trunk explains are
 /// merge-invented drift.
+///
+/// Auditing a [`CutSubject::Candidate`] reads a merge that no other observer
+/// can see and that a failure simply drops — nothing to compensate, nothing
+/// stranded by a crash.
 pub fn audit_cut(
     repo: &Path,
     members: &[(String, CommitId)],
-    cut: &CommitId,
+    mut subject: CutSubject<'_>,
     context: AuditContext<'_>,
 ) -> anyhow::Result<CutAudit> {
     let mut audit = CutAudit::default();
-    let cut_is_conflicted = !crate::jj::conflicted_files(repo, cut.as_str())?.is_empty();
+    let cut_is_conflicted = !subject.conflicted_files(repo)?.is_empty();
     for (name, tip) in members {
-        match crate::jj::probe_net_diff(repo, context.trunk.as_str(), tip.as_str(), cut.as_str())? {
+        match subject.replay_outcome(repo, context.trunk.as_str(), tip.as_str())? {
             RebaseOutcome::Empty => {}
             RebaseOutcome::Conflicted if cut_is_conflicted => audit.inconclusive.push(name.clone()),
             RebaseOutcome::CleanNonEmpty | RebaseOutcome::Conflicted => {
@@ -1237,7 +1285,7 @@ pub fn audit_cut(
         }
     }
     if let Some(previous) = context.previous {
-        let drifted = crate::jj::changed_files_between(repo, previous.as_str(), cut.as_str())?;
+        let drifted = subject.changed_files_since(repo, previous)?;
         let mut explained = BTreeSet::new();
         for (_, tip) in members {
             explained.extend(crate::jj::changed_files_between(
@@ -1261,9 +1309,8 @@ pub fn audit_cut(
 
 /// Create and name a fresh cut for direct callers that do not need an audit.
 pub fn cut(repo: &Path, request: &Cut, scheme: &ReleaseScheme) -> anyhow::Result<CommitId> {
-    let created = build_cut(repo, request, None)?;
-    name_cut(repo, &request.name, &created, scheme)?;
-    Ok(created)
+    let candidate = candidate_cut(repo, request, None)?;
+    publish_cut(candidate, &request.name, scheme)
 }
 
 #[cfg(test)]
