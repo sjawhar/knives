@@ -4,7 +4,7 @@
 //! here because each is one jj sequence over a parent set rather than a report
 //! with a renderer. Every other command owns its own logic and returns an
 //! [`Exit`], so the match stays a table.
-// allow: SIZE_OK: 2019 lines - dispatch plus the release-edit verbs; splitting would scatter the exhaustive match.
+// allow: SIZE_OK: 2065 lines - dispatch plus the release-edit verbs; splitting would scatter the exhaustive match.
 
 use std::process::ExitCode;
 
@@ -271,10 +271,7 @@ fn run_rebase(name: &str, reference: Option<&str>, no_drop: bool) -> anyhow::Res
             worst = worst.worst(Exit::Incomplete);
             continue;
         }
-        if shed > 0 {
-            let trimmed = knives::jj::duplicate_onto(&entry.path, &release_commit, &members)?;
-            knives::jj::set_bookmark_anywhere(&entry.path, &release_name, trimmed.as_str())?;
-        }
+        shed_stale_bases(&entry, (&release_name, &release_commit), &members, shed)?;
         knives::jj::rebase_branch_onto(&entry.path, &release_name, &onto)?;
         report_rebased_release(
             &repo,
@@ -296,6 +293,29 @@ fn run_rebase(name: &str, reference: Option<&str>, no_drop: bool) -> anyhow::Res
         }
     }
     Ok(worst)
+}
+
+/// Rewrite the release to its member parents only, shedding stale bases.
+fn shed_stale_bases(
+    entry: &knives::config::RepoEntry,
+    (release_name, release_commit): (&str, &knives::ids::CommitId),
+    members: &[knives::ids::CommitId],
+    shed: usize,
+) -> anyhow::Result<()> {
+    if shed == 0 {
+        return Ok(());
+    }
+    knives::jj::write_release(
+        &entry.path,
+        &knives::jj::ReleaseWrite {
+            source: Some(release_commit),
+            parents: members,
+            message: None,
+            bookmark: Some(release_name),
+            operation: &format!("knives: {release_name}: shed {shed} stale base parent(s)"),
+        },
+    )?;
+    Ok(())
 }
 
 /// One repo mid-rebase: what parent classification needs to read and say.
@@ -577,9 +597,16 @@ fn drop_landed_members(
         "{}\n\n{delta}",
         cut_request(release_name.to_owned(), &provenance).message()
     );
-    let duplicated = knives::jj::duplicate_onto(&entry.path, &release, &kept)?;
-    let created = knives::jj::describe_commit(&entry.path, &duplicated, &message)?;
-    knives::jj::set_bookmark_anywhere(&entry.path, release_name, created.as_str())?;
+    let created = knives::jj::write_release(
+        &entry.path,
+        &knives::jj::ReleaseWrite {
+            source: Some(&release),
+            parents: &kept,
+            message: Some(&message),
+            bookmark: Some(release_name),
+            operation: &format!("knives: {release_name}: {delta}"),
+        },
+    )?;
     println!(
         "{repo}: {release_name} now has {} parent(s): {delta}",
         kept.len()
@@ -619,7 +646,12 @@ fn report_rebased_release(
         cut_request(rebased.name.to_owned(), &provenance).message(),
         rebased.reference
     );
-    let described = knives::jj::describe_commit(&entry.path, &created, &message)?;
+    let described = knives::jj::describe_commit(
+        &entry.path,
+        &created,
+        &message,
+        &format!("knives: {}: record rebased provenance", rebased.name),
+    )?;
     let stale_bases = if rebased.shed > 0 {
         format!(", {} stale base parent(s) shed", rebased.shed)
     } else {
@@ -806,9 +838,16 @@ fn edit_release(
         "{}\n\n{delta}",
         cut_request(release.name.clone(), &provenance).message()
     );
-    let duplicated = knives::jj::duplicate_onto(&entry.path, &release.commit, &new_parents)?;
-    let created = knives::jj::describe_commit(&entry.path, &duplicated, &message)?;
-    knives::jj::set_bookmark_anywhere(&entry.path, &release.name, created.as_str())?;
+    let created = knives::jj::write_release(
+        &entry.path,
+        &knives::jj::ReleaseWrite {
+            source: Some(&release.commit),
+            parents: &new_parents,
+            message: Some(&message),
+            bookmark: Some(&release.name),
+            operation: &format!("knives: {}: {delta}", release.name),
+        },
+    )?;
     println!(
         "{repo}: {} now has {} parent(s): {delta}",
         release.name,
@@ -1556,8 +1595,11 @@ fn run_release(
             ) {
                 Ok(audit) => audit,
                 Err(error) => {
-                    let _ =
-                        knives::jj::abandon_commits(&entry.path, std::slice::from_ref(&created));
+                    let _ = knives::jj::abandon_commits(
+                        &entry.path,
+                        std::slice::from_ref(&created),
+                        "knives: abandon a cut whose audit errored",
+                    );
                     return Err(error);
                 }
             };
@@ -1653,7 +1695,11 @@ fn report_cut_audit(
              with no member or trunk explaining it"
         );
     }
-    knives::jj::abandon_commits(&entry.path, std::slice::from_ref(created))?;
+    knives::jj::abandon_commits(
+        &entry.path,
+        std::slice::from_ref(created),
+        "knives: abandon a cut that failed its audit",
+    )?;
     println!("{repo}: cut abandoned; nothing was named or pushed. Fix the inputs and re-cut.");
     Ok(Some(Exit::Incomplete))
 }
