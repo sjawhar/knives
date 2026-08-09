@@ -139,7 +139,7 @@ pub enum Command {
         /// One line per finding rather than one line per kind.
         #[arg(long)]
         verbose: bool,
-        /// Skip the landed probe, which replays onto the trunk and cleans up.
+        /// Skip the landed probe, which replays every branch onto the trunk.
         #[arg(long)]
         no_landed: bool,
         /// Skip pull request lookups. Branch pull request state reads as unknown.

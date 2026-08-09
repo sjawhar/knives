@@ -1214,6 +1214,55 @@ fn probe_landed_cleans_only_its_temporary_commits() {
     );
 }
 
+/// Operation ids in the shared op log, newest first.
+fn operation_ids(repo: &std::path::Path) -> Vec<String> {
+    let output = Command::new("jj")
+        .args([
+            "--ignore-working-copy",
+            "op",
+            "log",
+            "--no-graph",
+            "-T",
+            "id ++ \"\\n\"",
+        ])
+        .current_dir(repo)
+        .env("JJ_CONFIG", "/dev/null")
+        .env("JJ_USER", "Knives Lab")
+        .env("JJ_EMAIL", "knives-lab@example.test")
+        .output()
+        .expect("read op log");
+    assert!(output.status.success(), "read op log");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+#[test]
+fn probes_write_nothing_to_the_shared_op_log() {
+    // Given: an open branch and upstream drift, so both probes do real replay
+    // work. A probe answers a read-only question; in a repo shared by several
+    // agents every operation it writes is a reconciliation point and op-log
+    // noise (the shape that derailed the 2026-08-08 cut diagnosis).
+    let lab = lab::Lab::new();
+    lab.branch("feature", "feature.txt", "original\n");
+    lab.advance_upstream("advance\n");
+    let trunk = lab.revision(&lab.work, "main@upstream", "commit_id");
+    let tip = lab.revision(&lab.work, "feature", "commit_id");
+    let operations_before = operation_ids(&lab.work);
+
+    // When: the landed and net-diff probes both run.
+    let landed = probe_landed(&lab.work, &BranchName::new("feature"), "main@upstream")
+        .expect("probe landed");
+    let net = knives::jj::probe_net_diff(&lab.work, &trunk, &tip, &trunk).expect("probe net diff");
+
+    // Then: real answers, and the op log gained nothing at all.
+    assert_eq!(landed, RebaseOutcome::CleanNonEmpty);
+    assert_eq!(net, RebaseOutcome::CleanNonEmpty);
+    assert_eq!(operation_ids(&lab.work), operations_before);
+}
+
 #[test]
 fn divergent_changes_reports_both_rewrites_after_fetch() {
     // Given: the same branch rewritten independently in two jj clones.
@@ -1469,87 +1518,6 @@ fn changed_files_between_handles_a_branch_behind_advanced_upstream() {
     assert_eq!(
         lab.revision(&lab.work, "@", "change_id"),
         working_copy_before
-    );
-}
-
-#[test]
-fn a_net_probe_with_an_unparseable_creation_message_leaves_no_scratch_commit() {
-    const RERUN: &str = "KNIVES_TEST_HIDE_PROBE_CREATION";
-    const TEST_NAME: &str =
-        "a_net_probe_with_an_unparseable_creation_message_leaves_no_scratch_commit";
-
-    if std::env::var_os(RERUN).is_some() {
-        assert_no_net_probe_residue_after_unparseable_creation();
-        return;
-    }
-
-    // Given: a jj wrapper that creates probe roots but suppresses their creation message.
-    let wrapper_dir = tempfile::tempdir().expect("create jj wrapper directory");
-    let wrapper = wrapper_dir.path().join("jj");
-    std::fs::write(
-        &wrapper,
-        "#!/bin/sh\n\
-         case \" $* \" in\n\
-           *\" new --no-edit -r \"*) \"$KNIVES_REAL_JJ\" \"$@\" 2>/dev/null ;;\n\
-           *) exec \"$KNIVES_REAL_JJ\" \"$@\" ;;\n\
-         esac\n",
-    )
-    .expect("write jj wrapper");
-    let mut permissions = std::fs::metadata(&wrapper)
-        .expect("read jj wrapper permissions")
-        .permissions();
-    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
-    std::fs::set_permissions(&wrapper, permissions).expect("make jj wrapper executable");
-    let real_jj = Command::new("sh")
-        .args(["-c", "command -v jj"])
-        .output()
-        .expect("locate jj");
-    assert!(real_jj.status.success(), "could not locate jj");
-    let real_jj = String::from_utf8(real_jj.stdout)
-        .expect("jj path is utf-8")
-        .trim()
-        .to_owned();
-    let path = std::env::join_paths(std::iter::once(wrapper_dir.path().to_owned()).chain(
-        std::env::split_paths(&std::env::var_os("PATH").expect("PATH is set")),
-    ))
-    .expect("construct wrapper PATH");
-
-    // When: an isolated copy of this test runs the production probe through that wrapper.
-    let output = Command::new(std::env::current_exe().expect("test executable path"))
-        .args(["--exact", TEST_NAME])
-        .env(RERUN, "1")
-        .env("KNIVES_REAL_JJ", real_jj)
-        .env("PATH", path)
-        .output()
-        .expect("rerun probe regression");
-
-    // Then: the child completed its residue assertion successfully.
-    assert!(
-        output.status.success(),
-        "probe regression failed:\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-fn assert_no_net_probe_residue_after_unparseable_creation() {
-    // Given: a non-empty member range and its visible commits before the probe.
-    let lab = lab::Lab::new();
-    lab.branch("feat/alpha", "alpha.txt", "first\n");
-    let before = lab.revision(&lab.work, "all()", "commit_id ++ \"\\n\"");
-
-    // When: jj creates a probe root but does not report the new commit id.
-    let result = knives::jj::probe_net_diff(&lab.work, "main@origin", "feat/alpha", "main@origin");
-
-    // Then: the probe fails rather than continuing and leaves no untracked scratch commit.
-    assert!(
-        matches!(result, Err(knives::jj::JjError::ProbeRoot)),
-        "{result:?}"
-    );
-    let after = lab.revision(&lab.work, "all()", "commit_id ++ \"\\n\"");
-    assert_eq!(
-        after, before,
-        "an unparseable creation response leaked a synthetic probe commit"
     );
 }
 
