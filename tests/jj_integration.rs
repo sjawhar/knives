@@ -561,6 +561,81 @@ fn an_untracked_remote_pin_makes_abandon_refuse_and_lands_in_forgotten_only() {
 }
 
 #[test]
+fn a_refused_first_name_does_not_stop_reaping_later_names() {
+    // Given: TWO superseded dated cuts, where the alphabetically first is held
+    // immutable by an untracked remote pin and the second is freely reapable.
+    // The fleet cleanup of 2026-08-07 saw a reap stop at its first immutable
+    // commit instead of carrying on — this pins the continuation.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    lab.octopus("release/2026-08-04", "feat/alpha", "feat/beta");
+    lab.octopus("release/2026-08-05", "feat/alpha", "feat/beta");
+    lab.octopus("release/2026-08-06", "feat/alpha", "feat/beta");
+    lab.jj_work([
+        "git",
+        "push",
+        "--remote",
+        "origin",
+        "--bookmark",
+        "release/2026-08-04",
+    ]);
+    let status = Command::new("jj")
+        .args(["git", "fetch", "--remote", "origin"])
+        .current_dir(&lab.second)
+        .env("JJ_CONFIG", "/dev/null")
+        .env("JJ_USER", "Knives Lab")
+        .env("JJ_EMAIL", "knives-lab@example.test")
+        .status()
+        .expect("fetch superseded cut in second clone");
+    assert!(status.success(), "fetch superseded cut in second clone");
+    let status = Command::new("jj")
+        .args([
+            "bookmark",
+            "create",
+            "keep/pin",
+            "-r",
+            "release/2026-08-04@origin",
+        ])
+        .current_dir(&lab.second)
+        .env("JJ_CONFIG", "/dev/null")
+        .env("JJ_USER", "Knives Lab")
+        .env("JJ_EMAIL", "knives-lab@example.test")
+        .status()
+        .expect("create pin in second clone");
+    assert!(status.success(), "create pin in second clone");
+    let status = Command::new("jj")
+        .args([
+            "git",
+            "push",
+            "--remote",
+            "origin",
+            "--bookmark",
+            "keep/pin",
+        ])
+        .current_dir(&lab.second)
+        .env("JJ_CONFIG", "/dev/null")
+        .env("JJ_USER", "Knives Lab")
+        .env("JJ_EMAIL", "knives-lab@example.test")
+        .status()
+        .expect("push pin from second clone");
+    assert!(status.success(), "push pin from second clone");
+    lab.fetch_work();
+
+    // When: the workspace is reaped.
+    let repo = Repo::open(&lab.work).expect("open");
+    let report = knives::commands::release::reap_superseded(&lab.work, &repo).expect("reap");
+
+    // Then: the pinned first name refuses without stopping the second.
+    assert_eq!(report.forgotten_only, vec!["release/2026-08-04".to_owned()]);
+    assert_eq!(report.reaped, vec!["release/2026-08-05".to_owned()]);
+    assert!(
+        report.notes.iter().any(|note| note.contains("immutable")),
+        "{report:?}"
+    );
+}
+
+#[test]
 fn reap_clears_a_ref_the_next_fetch_rematerialized() {
     // Given: a reaped workspace whose next fetch resurrected the superseded ref
     // as untracked (jj keeps no memory of forgotten refs; spec evidence item 2).
@@ -1154,6 +1229,36 @@ fn divergent_changes_reports_both_rewrites_after_fetch() {
 
     // Then: exactly one change has two visible commits.
     assert_eq!(divergent.len(), 2);
+    assert_eq!(divergent[0].0, divergent[1].0);
+    assert_ne!(divergent[0].1, divergent[1].1);
+}
+
+#[test]
+fn divergent_changes_reports_copies_buried_under_descendants() {
+    // Given: one change as two visible commits, EACH buried under a child, so
+    // neither copy is a view head. This is the fleet's dominant shape — a
+    // branch advanced past its rewritten ancestor while a remote-pinned chain
+    // kept the old copy — and enumerating only head copies missed it (the jj
+    // fork carried 74 divergent changes; 35 were reported).
+    let lab = lab::Lab::new();
+    lab.branch("feature", "feature.txt", "original\n");
+    lab.rewrite_in_both_clones("feature");
+    // Bury the local rewrite: make the parked child real so it survives, then
+    // bury the fetched rewrite under a child of its own.
+    std::fs::write(lab.work.join("local-child.txt"), "local\n").expect("write local child");
+    lab.jj_work(["describe", "-m", "child of local rewrite"]);
+    lab.jj_work(["new", "feature@origin", "-m", "child of fetched rewrite"]);
+    std::fs::write(lab.work.join("fetched-child.txt"), "fetched\n").expect("write fetched child");
+    lab.jj_work(["status"]);
+
+    // When: divergence is read through jj-lib.
+    let divergent = Repo::open(&lab.work)
+        .expect("open repository")
+        .divergent_changes(&std::collections::BTreeSet::new())
+        .expect("read divergence");
+
+    // Then: the buried pair is still reported.
+    assert_eq!(divergent.len(), 2, "{divergent:?}");
     assert_eq!(divergent[0].0, divergent[1].0);
     assert_ne!(divergent[0].1, divergent[1].1);
 }

@@ -57,6 +57,7 @@ fn short_id(id: &str) -> String {
 #[derive(Debug)]
 pub struct Repo {
     repo: Arc<ReadonlyRepo>,
+    path: PathBuf,
 }
 
 impl Repo {
@@ -114,7 +115,10 @@ impl Repo {
             path: path.display().to_string(),
             detail: error.to_string(),
         })?;
-        Ok(Self { repo })
+        Ok(Self {
+            repo,
+            path: path.to_owned(),
+        })
     }
 
     pub fn workspaces(&self) -> Result<Vec<(WorkspaceName, ChangeId)>, JjError> {
@@ -229,6 +233,13 @@ impl Repo {
 
     /// One change existing as several visible commits, ignoring nominated refs.
     ///
+    /// Enumeration is jj's own `divergent()` revset, which considers every
+    /// visible commit — a copy buried under descendants counts the same as one
+    /// sitting at a head. An earlier reader resolved the change ids of view
+    /// heads only, which missed exactly the fleet's dominant shape (a branch
+    /// advanced past its rewritten ancestor while a remote-pinned chain kept
+    /// the old copy): the jj fork carried 74 divergent changes, 35 reported.
+    ///
     /// `ignored` names refs whose testimony does not count — in practice the
     /// superseded dated releases, which any `jj git fetch` re-materializes as
     /// untracked refs forever (they exist on the remote and jj keeps no memory of
@@ -246,59 +257,35 @@ impl Repo {
         for (reference, commit) in &tips {
             refs_at.entry(commit).or_default().push(reference);
         }
-        // Kept heads are the vouching authorities; enumeration walks all heads.
-        // An ignored-only head can still identify a change with copies reached by
-        // live heads, so excluding it here would erase that real divergence.
+        // Kept heads are the vouching authorities: a copy counts only while a
+        // head that is not ignored-only can reach it.
         let mut kept_heads = Vec::new();
-        let mut all_heads: Vec<(CommitId, &JjCommitId)> = Vec::new();
         for head in self.repo.view().heads() {
             let commit = commit_id(head);
             let all_ignored = refs_at
                 .get(&commit)
                 .is_some_and(|refs| refs.iter().all(|reference| ignored.contains(reference)));
             if !all_ignored {
-                kept_heads.push(commit.clone());
+                kept_heads.push(commit);
             }
-            all_heads.push((commit, head));
         }
 
         let mut changes = BTreeMap::<ChangeId, BTreeSet<CommitId>>::new();
-        for (_, head) in &all_heads {
-            let commit = self
-                .repo
-                .store()
-                .get_commit(head)
-                .map_err(|error| JjError::Open {
-                    path: "commit store".to_owned(),
-                    detail: error.to_string(),
-                })?;
-            let change = ChangeId::new(commit.change_id().to_string());
-            if let Some(targets) =
-                self.repo
-                    .resolve_change_id(commit.change_id())
-                    .map_err(|error| JjError::Open {
-                        path: "change index".to_owned(),
-                        detail: error.to_string(),
-                    })?
-            {
-                let commits = changes.entry(change).or_default();
-                for (_, id) in targets.visible_with_offsets() {
-                    let candidate = commit_id(id);
-                    // A copy only an ignored ref can reach does not count. Errors
-                    // propagate so an index failure cannot silently suppress a finding.
-                    let mut vouched = kept_heads.contains(&candidate);
-                    if !vouched {
-                        for kept in &kept_heads {
-                            if self.is_ancestor(&candidate, kept)? {
-                                vouched = true;
-                                break;
-                            }
-                        }
-                    }
-                    if vouched {
-                        commits.insert(candidate);
+        for candidate in commits_matching(&self.path, "divergent()")? {
+            let change = ChangeId::new(self.commit(candidate.as_str())?.change_id().to_string());
+            // A copy only an ignored ref can reach does not count. Errors
+            // propagate so an index failure cannot silently suppress a finding.
+            let mut vouched = kept_heads.contains(&candidate);
+            if !vouched {
+                for kept in &kept_heads {
+                    if self.is_ancestor(&candidate, kept)? {
+                        vouched = true;
+                        break;
                     }
                 }
+            }
+            if vouched {
+                changes.entry(change).or_default().insert(candidate);
             }
         }
         Ok(changes
