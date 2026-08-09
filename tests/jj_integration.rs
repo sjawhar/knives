@@ -163,18 +163,26 @@ fn a_forgotten_and_abandoned_release_disappears_and_the_remote_keeps_it() {
         .expect("resolve alpha child");
     let beta = repo.resolve_commit("feat/beta").expect("resolve beta");
 
-    // When: the release is reaped in the load-bearing order.
-    knives::jj::forget_bookmark_include_remotes(&lab.work, "release/2026-08-04").expect("forget");
-    knives::jj::abandon_commits(&lab.work, std::slice::from_ref(&release)).expect("abandon");
-    knives::jj::forget_bookmark_include_remotes(&lab.work, "feat/alpha").expect("forget alpha");
-    knives::jj::forget_bookmark_include_remotes(&lab.work, "feat/alpha-child")
-        .expect("forget alpha child");
-    knives::jj::forget_bookmark_include_remotes(&lab.work, "feat/beta").expect("forget beta");
-    knives::jj::abandon_commits(
+    // When: the release is reaped in the load-bearing order, then the chained
+    // features in one batch.
+    let outcome = knives::jj::forget_and_abandon(
         &lab.work,
-        &[alpha.clone(), alpha_child.clone(), beta.clone()],
+        &[("release/2026-08-04".to_owned(), vec![release.clone()])],
+        "knives: reap release/2026-08-04",
     )
-    .expect("batch abandon");
+    .expect("reap the release");
+    assert!(outcome.refused.is_empty(), "release abandon refused");
+    let outcome = knives::jj::forget_and_abandon(
+        &lab.work,
+        &[
+            ("feat/alpha".to_owned(), vec![alpha.clone()]),
+            ("feat/alpha-child".to_owned(), vec![alpha_child.clone()]),
+            ("feat/beta".to_owned(), vec![beta.clone()]),
+        ],
+        "knives: reap the feature chain",
+    )
+    .expect("reap the feature chain");
+    assert!(outcome.refused.is_empty(), "feature abandon refused");
 
     // Then: no ref of any kind remains and every abandoned commit is invisible.
     let tips = Repo::open(&lab.work)
@@ -632,6 +640,35 @@ fn a_refused_first_name_does_not_stop_reaping_later_names() {
     assert!(
         report.notes.iter().any(|note| note.contains("immutable")),
         "{report:?}"
+    );
+}
+
+#[test]
+fn reaping_is_one_operation_described_for_the_op_log() {
+    // Given: one superseded cut. Reaping used to be two operations per name
+    // (bookmark forget, then abandon), each described as raw `args: jj ...`.
+    let lab = lab::Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    lab.octopus("release/2026-08-04", "feat/alpha", "feat/beta");
+    lab.octopus("release/2026-08-05", "feat/alpha", "feat/beta");
+    let operations_before = operation_ids(&lab.work);
+
+    // When: reaped.
+    let repo = Repo::open(&lab.work).expect("open");
+    let report = knives::commands::release::reap_superseded(&lab.work, &repo).expect("reap");
+    assert_eq!(report.reaped, vec!["release/2026-08-04".to_owned()]);
+
+    // Then: the whole reap is ONE operation, described as knives' own act.
+    let operations_after = operation_ids(&lab.work);
+    assert_eq!(
+        operations_after.len(),
+        operations_before.len() + 1,
+        "a reap must be one operation"
+    );
+    assert_eq!(
+        newest_operation_description(&lab.work),
+        "knives: reap release/2026-08-04"
     );
 }
 
@@ -1237,6 +1274,29 @@ fn operation_ids(repo: &std::path::Path) -> Vec<String> {
         .filter(|line| !line.trim().is_empty())
         .map(ToOwned::to_owned)
         .collect()
+}
+
+/// The newest operation's description.
+fn newest_operation_description(repo: &std::path::Path) -> String {
+    let output = Command::new("jj")
+        .args([
+            "--ignore-working-copy",
+            "op",
+            "log",
+            "--no-graph",
+            "--limit",
+            "1",
+            "-T",
+            "description",
+        ])
+        .current_dir(repo)
+        .env("JJ_CONFIG", "/dev/null")
+        .env("JJ_USER", "Knives Lab")
+        .env("JJ_EMAIL", "knives-lab@example.test")
+        .output()
+        .expect("read newest operation");
+    assert!(output.status.success(), "read newest operation");
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
 }
 
 #[test]
@@ -3861,7 +3921,17 @@ fn cutting_a_release_does_not_move_another_agents_working_copy() {
     let alpha =
         knives::ids::CommitId::new(lab.revision(&lab.work, "feat/alpha", "commit_id").trim());
     let beta = knives::ids::CommitId::new(lab.revision(&lab.work, "feat/beta", "commit_id").trim());
-    let _ = knives::jj::create_merge(&lab.work, &[alpha, beta], "release: test").expect("merge");
+    let _ = knives::jj::write_release(
+        &lab.work,
+        &knives::jj::ReleaseWrite {
+            source: None,
+            parents: &[alpha, beta],
+            message: Some("release: test"),
+            bookmark: None,
+            operation: "knives: cut release: test",
+        },
+    )
+    .expect("merge");
 
     let after = lab.revision(&lab.work, "@", "change_id");
     assert_eq!(
@@ -3916,9 +3986,17 @@ fn a_foreign_pull_request_can_be_fetched_and_carried_as_a_release_parent() {
 
     // And it is usable as a parent, which is the whole point.
     let trunk = knives::ids::CommitId::new(lab.revision(&lab.second, "main", "commit_id").trim());
-    let merge =
-        knives::jj::create_merge(&lab.second, &[trunk, fetched], "release: with a foreign PR")
-            .expect("merge");
+    let merge = knives::jj::write_release(
+        &lab.second,
+        &knives::jj::ReleaseWrite {
+            source: None,
+            parents: &[trunk, fetched],
+            message: Some("release: with a foreign PR"),
+            bookmark: None,
+            operation: "knives: cut with a foreign PR",
+        },
+    )
+    .expect("merge");
     let parents = knives::jj::Repo::open(&lab.second)
         .expect("open")
         .parents_of(merge.as_str())
@@ -4074,6 +4152,67 @@ fn include_adds_one_parent_and_changes_nothing_else() {
             after.len()
         )),
         "the reported parent count and delta must match the release: {stdout}"
+    );
+}
+
+#[test]
+fn a_release_edit_is_one_operation_described_for_the_op_log() {
+    // Given: a cut release and a new branch to include. An include used to be
+    // three operations (duplicate, describe, bookmark set), each described as
+    // raw `args: jj ...` — hard to audit, and three reconciliation points with
+    // concurrent agents (#18).
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let (home, _consumer) = home_after_first_cut(&lab);
+    lab.branch("feat/gamma", "gamma.txt", "gamma\n");
+    let operations_before = operation_ids(&lab.work);
+
+    // When: the branch is included.
+    let output = knives_release(&lab, &home, &["include", "feat/gamma"]);
+    assert!(
+        output.status.success(),
+        "include failed: {}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Then: the edit is ONE operation, described as knives' own act.
+    let operations_after = operation_ids(&lab.work);
+    assert_eq!(
+        operations_after.len(),
+        operations_before.len() + 1,
+        "an edit must be one operation"
+    );
+    let description = newest_operation_description(&lab.work);
+    assert_eq!(
+        description, "knives: release/2026-08-04: included feat/gamma",
+        "the operation must describe the verb, not the plumbing"
+    );
+}
+
+#[test]
+fn an_edited_release_carries_the_repository_identity() {
+    // Given: identity configured only in the repository's own jj config, the
+    // way every lab and managed checkout carries it. A release merge written
+    // with an empty author cannot be pushed by jj later, so the library-side
+    // writer must resolve identity the way the jj CLI does.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let (home, _consumer) = home_after_first_cut(&lab);
+    lab.branch("feat/gamma", "gamma.txt", "gamma\n");
+
+    // When: the release is edited.
+    let output = knives_release(&lab, &home, &["include", "feat/gamma"]);
+    assert!(output.status.success(), "{output:?}");
+
+    // Then: the new release commit is authored, not anonymous.
+    assert_eq!(
+        lab.revision(&lab.work, "release/2026-08-04", "author.email()"),
+        "knives-lab@example.test"
+    );
+    assert_eq!(
+        lab.revision(&lab.work, "release/2026-08-04", "committer.name()"),
+        "Knives Lab"
     );
 }
 
@@ -5672,10 +5811,9 @@ fn an_edit_refuses_a_release_held_only_as_a_remote_ref() {
 }
 
 #[test]
-fn a_duplicate_onto_no_parents_is_refused_rather_than_done_in_place() {
-    // jj duplicates in place when no destination is given, keeping the source's
-    // own parents. A caller that computed an empty parent set would report the
-    // change it meant to make while the composition stayed exactly as it was.
+fn a_release_write_with_no_parents_is_refused_rather_than_done_in_place() {
+    // A caller that computed an empty parent set would report the change it
+    // meant to make while the composition stayed exactly as it was.
     let lab = Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     let source = Repo::open(&lab.work)
@@ -5683,7 +5821,17 @@ fn a_duplicate_onto_no_parents_is_refused_rather_than_done_in_place() {
         .resolve_commit("feat/alpha")
         .expect("resolve alpha");
 
-    let error = knives::jj::duplicate_onto(&lab.work, &source, &[]).expect_err("must refuse");
+    let error = knives::jj::write_release(
+        &lab.work,
+        &knives::jj::ReleaseWrite {
+            source: Some(&source),
+            parents: &[],
+            message: None,
+            bookmark: None,
+            operation: "knives: an empty edit",
+        },
+    )
+    .expect_err("must refuse");
 
     assert!(
         error.to_string().contains("destination parent"),

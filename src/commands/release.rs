@@ -5,7 +5,7 @@
 //! decided. Planning is the default because everything else here writes: a cut
 //! names a composition, and `include`, `drop`, `advance` and `rebase` change
 //! one. Every one of them writes locally only, and none of them pushes.
-// allow: SIZE_OK: 1531 lines - the release lifecycle's plan, cut, edit, audit, reap, and rebase operations are one domain seam.
+// allow: SIZE_OK: 1539 lines - the release lifecycle's plan, cut, edit, audit, reap, and rebase operations are one domain seam.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -567,6 +567,7 @@ pub fn reap_superseded(repo_path: &Path, repo: &Repo) -> anyhow::Result<ReapRepo
         kept: Vec::new(),
         notes: Vec::new(),
     };
+    let mut entries: Vec<(String, Vec<CommitId>)> = Vec::new();
     'names: for (name, targets) in by_name {
         for target in &targets {
             let descendants = crate::jj::commits_matching(
@@ -585,15 +586,18 @@ pub fn reap_superseded(repo_path: &Path, repo: &Repo) -> anyhow::Result<ReapRepo
                 continue 'names;
             }
         }
-        crate::jj::forget_bookmark_include_remotes(repo_path, &name)?;
-        match crate::jj::abandon_commits(repo_path, &targets) {
-            Ok(()) => report.reaped.push(name),
-            Err(error) => {
-                report
-                    .notes
-                    .push(format!("{name}: refs forgotten, abandon refused: {error}"));
-                report.forgotten_only.push(name);
-            }
+        entries.push((name, targets));
+    }
+    if !entries.is_empty() {
+        let names: Vec<&str> = entries.iter().map(|(name, _)| name.as_str()).collect();
+        let operation = format!("knives: reap {}", names.join(", "));
+        let outcome = crate::jj::forget_and_abandon(repo_path, &entries, &operation)?;
+        report.reaped = outcome.abandoned;
+        for (name, error) in outcome.refused {
+            report
+                .notes
+                .push(format!("{name}: refs forgotten, abandon refused: {error}"));
+            report.forgotten_only.push(name);
         }
     }
     Ok(report)
@@ -1143,13 +1147,17 @@ pub fn build_cut(
     request: &Cut,
     previous: Option<&CommitId>,
 ) -> anyhow::Result<CommitId> {
-    let created = match previous {
-        Some(previous) => {
-            let duplicated = crate::jj::duplicate_onto(repo, previous, &request.parents)?;
-            crate::jj::describe_commit(repo, &duplicated, &request.message())?
-        }
-        None => crate::jj::create_merge(repo, &request.parents, &request.message())?,
-    };
+    let message = request.message();
+    let created = crate::jj::write_release(
+        repo,
+        &crate::jj::ReleaseWrite {
+            source: previous,
+            parents: &request.parents,
+            message: Some(&message),
+            bookmark: None,
+            operation: &format!("knives: cut {}", request.name),
+        },
+    )?;
     let actual = Repo::open(repo)?.parents_of(created.as_str())?;
     anyhow::ensure!(
         actual.len() == request.parents.len(),

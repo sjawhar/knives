@@ -6,13 +6,16 @@ use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
 use jj_lib::backend::CommitId as JjCommitId;
-use jj_lib::config::StackedConfig;
+use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
 use jj_lib::local_working_copy::LocalWorkingCopy;
 use jj_lib::object_id::ObjectId as _;
-use jj_lib::repo::{ReadonlyRepo, Repo as _, RepoLoader, StoreFactories};
+use jj_lib::op_store::{RefTarget, RemoteRef};
+use jj_lib::ref_name::{RefName as JjRefName, RemoteName as JjRemoteName};
+use jj_lib::repo::{MutableRepo, ReadonlyRepo, Repo as _, RepoLoader, StoreFactories};
 use jj_lib::revset::SymbolResolver;
-use jj_lib::rewrite::{duplicate_commits, rebase_commit};
+use jj_lib::rewrite::{duplicate_commits, merge_commit_trees, rebase_commit};
 use jj_lib::settings::UserSettings;
+use jj_lib::transaction::Transaction;
 use jj_lib::working_copy::WorkingCopy as _;
 use thiserror::Error;
 
@@ -43,6 +46,8 @@ pub enum JjError {
     ProbeRoot,
     #[error("could not parse command output: {detail}")]
     Parse { detail: String },
+    #[error("commit {commit} is immutable: pinned by {pin}")]
+    Immutable { commit: String, pin: String },
 }
 
 /// Twelve characters is what jj shows, and a full id is correct and unreadable.
@@ -91,13 +96,7 @@ impl Repo {
     }
 
     pub fn open(path: &Path) -> Result<Self, JjError> {
-        let settings =
-            UserSettings::from_config(StackedConfig::with_defaults()).map_err(|error| {
-                JjError::Open {
-                    path: path.display().to_string(),
-                    detail: error.to_string(),
-                }
-            })?;
+        let settings = repo_settings(path)?;
         let loader = RepoLoader::init_from_file_system(
             &settings,
             &path.join(".jj/repo"),
@@ -340,7 +339,7 @@ impl Repo {
                 .repo
                 .store()
                 .get_commit(&id)
-                .map_err(|error| probe_error(&error))?;
+                .map_err(|error| store_error(&error))?;
             stack.push((id, true));
             for parent in commit.parent_ids() {
                 if !visited.contains(parent) {
@@ -574,16 +573,16 @@ pub fn probe_net_diff(
             .new_commit(vec![base.id().clone()], revision.tree())
             .write(),
     )
-    .map_err(|error| probe_error(&error))?;
+    .map_err(|error| store_error(&error))?;
     let replayed = block_on(rebase_commit(
         tx.repo_mut(),
         synthetic,
         vec![onto.id().clone()],
     ))
-    .map_err(|error| probe_error(&error))?;
+    .map_err(|error| store_error(&error))?;
     let outcome = if replayed.has_conflict() {
         RebaseOutcome::Conflicted
-    } else if block_on(replayed.is_empty(tx.repo())).map_err(|error| probe_error(&error))? {
+    } else if block_on(replayed.is_empty(tx.repo())).map_err(|error| store_error(&error))? {
         RebaseOutcome::Empty
     } else {
         RebaseOutcome::CleanNonEmpty
@@ -623,7 +622,7 @@ pub fn probe_revision(
         std::slice::from_ref(onto.id()),
         &[],
     ))
-    .map_err(|error| probe_error(&error))?;
+    .map_err(|error| store_error(&error))?;
     // Every duplicated commit, not just the first. A branch of several commits
     // duplicates as several, and judging the branch by one of them answers a
     // different question.
@@ -632,7 +631,7 @@ pub fn probe_revision(
     for replayed in stats.duplicated_commits.values() {
         conflicted = conflicted || replayed.has_conflict();
         all_empty = all_empty
-            && block_on(replayed.is_empty(tx.repo())).map_err(|error| probe_error(&error))?;
+            && block_on(replayed.is_empty(tx.repo())).map_err(|error| store_error(&error))?;
     }
     drop(tx);
     if stats.duplicated_commits.is_empty() {
@@ -648,7 +647,7 @@ pub fn probe_revision(
 }
 
 /// A backend failure while probing, named for the store that failed.
-fn probe_error(error: &jj_lib::backend::BackendError) -> JjError {
+fn store_error(error: &jj_lib::backend::BackendError) -> JjError {
     JjError::Open {
         path: "commit store".to_owned(),
         detail: error.to_string(),
@@ -874,55 +873,6 @@ fn command_output(program: &str, args: &[&str]) -> Result<(String, String), JjEr
     ))
 }
 
-fn resolve_commit_id(repo_path: &str, revision: &str) -> Result<CommitId, JjError> {
-    let full = command(
-        "jj",
-        [
-            "--repository",
-            repo_path,
-            "--ignore-working-copy",
-            "log",
-            "--no-graph",
-            "-r",
-            revision,
-            "-T",
-            "commit_id ++ \"\\n\"",
-        ],
-    )?;
-    parse_resolved_commit_id(&full)
-}
-
-fn parse_resolved_commit_id(output: &str) -> Result<CommitId, JjError> {
-    let mut commit_ids = output.lines().filter(|line| !line.trim().is_empty());
-    let commit_id = commit_ids.next().ok_or_else(|| JjError::Parse {
-        detail: "expected exactly one commit id, found none".to_owned(),
-    })?;
-    if commit_ids.next().is_some() {
-        return Err(JjError::Parse {
-            detail: "expected exactly one commit id, found multiple".to_owned(),
-        });
-    }
-    Ok(CommitId::new(commit_id.trim()))
-}
-
-/// Commit ids `jj duplicate` reports creating.
-///
-/// Identity, not set difference. A set difference over `children(onto)` also
-/// captures commits this probe did not create: a dirty `@` that is a child of
-/// `onto` gets its commit id rewritten by any snapshotting command, and a
-/// concurrent `jj new` by another agent adds one outright. Abandoning that
-/// difference destroyed three commits and two bookmarks of another agent's work
-/// in a reproduction. Only ids jj says it made are ever abandoned.
-pub fn parse_duplicated(stderr: &str) -> Vec<CommitId> {
-    stderr
-        .lines()
-        .filter_map(|line| line.trim().strip_prefix("Duplicated "))
-        .filter_map(|rest| rest.split(" as ").nth(1))
-        .filter_map(|tail| tail.split_whitespace().nth(1))
-        .map(CommitId::new)
-        .collect()
-}
-
 fn command_args(program: &str, args: &[&str]) -> Result<String, JjError> {
     let output = Command::new(program)
         .args(args)
@@ -972,7 +922,25 @@ fn path(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
-/// Create a flat merge of explicit commits and return the new commit.
+/// One release write — a fresh flat merge or a duplicate of a prior cut —
+/// applied and bookmarked as a single described operation.
+#[derive(Debug)]
+pub struct ReleaseWrite<'a> {
+    /// Duplicate this commit onto the new parents; `None` builds a fresh flat
+    /// merge of exactly `parents`.
+    pub source: Option<&'a CommitId>,
+    pub parents: &'a [CommitId],
+    /// `None` keeps the source's own message (fresh merges must name one).
+    pub message: Option<&'a str>,
+    /// Point this bookmark at the written commit, sideways moves allowed —
+    /// callers that pass one have already established the move is safe (see
+    /// [`set_bookmark_anywhere`]).
+    pub bookmark: Option<&'a str>,
+    /// The operation-log description, `knives: …` by convention.
+    pub operation: &'a str,
+}
+
+/// Write a release commit — and optionally its bookmark — as ONE operation.
 ///
 /// Explicit commit ids, never bookmark names: a name can move between the
 /// moment a release is planned and the moment it is cut, and the whole point of
@@ -981,73 +949,345 @@ fn path(path: &Path) -> String {
 /// Flat by construction. A nested integration node was considered and rejected:
 /// it makes dropping a landed parent harder, forces staleness detection to
 /// recurse, and destroys the empty-merge invariant that makes a cut verifiable.
-pub fn create_merge(repo: &Path, parents: &[CommitId], message: &str) -> Result<CommitId, JjError> {
-    let repo_path = path(repo);
-    let mut args: Vec<String> = vec![
-        "--repository".to_owned(),
-        repo_path.clone(),
-        // Do not snapshot, and do not move the working copy. Without these two
-        // flags this command parks whoever is working in the repo's default
-        // workspace on top of the release merge, with their uncommitted edits
-        // pending against it. That is verbatim the accident `knives start` exists
-        // to prevent, caused by `knives release`. Reproduced in review.
-        "--ignore-working-copy".to_owned(),
-        "new".to_owned(),
-        "--no-edit".to_owned(),
-    ];
-    args.extend(parents.iter().map(|parent| parent.as_str().to_owned()));
-    args.push("-m".to_owned());
-    args.push(message.to_owned());
-    let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
-    let (_, reported) = command_output("jj", &borrowed)?;
-
-    // Read the id jj reports, never `@`. Reading `@` was both wrong (with
-    // --no-edit the working copy does not move) and a race: any concurrent jj
-    // command between the create and the read returns someone else's commit,
-    // which would then be bookmarked as the release.
-    //
-    // jj reports a short id; widen it to the full one so a single id width
-    // circulates through the rest of the program.
-    let short = parse_created(&reported).ok_or(JjError::ProbeRoot)?;
-    resolve_commit_id(&repo_path, short.as_str())
-}
-
-/// Duplicates a prior cut onto an exact new parent set without moving a workspace.
 ///
-/// An empty parent set is refused rather than passed on: with no `-d`, jj
-/// duplicates in place and keeps the source's own parents, so a caller that
-/// computed its way to no parents would report the change it meant to make while
-/// the composition stayed exactly as it was.
-pub fn duplicate_onto(
-    repo: &Path,
-    source: &CommitId,
-    parents: &[CommitId],
-) -> Result<CommitId, JjError> {
-    let repo_path = path(repo);
-    if parents.is_empty() {
+/// An empty parent set is refused rather than passed on: a caller that computed
+/// its way to no parents would report the change it meant to make while the
+/// composition stayed exactly as it was.
+///
+/// Never touches a working copy. The porcelain this replaces (`jj new
+/// --no-edit`, `jj duplicate`) parked whoever was working in the default
+/// workspace on top of the release merge unless flagged off; a jj-lib write
+/// cannot make that mistake, and it reports the created commit directly
+/// instead of through parsed human-facing output.
+pub fn write_release(repo: &Path, write: &ReleaseWrite<'_>) -> Result<CommitId, JjError> {
+    if write.parents.is_empty() {
         return Err(JjError::Revision {
-            revision: source.as_str().to_owned(),
-            detail: "a duplicate needs at least one destination parent".to_owned(),
+            revision: write.source.map_or_else(
+                || "a fresh merge".to_owned(),
+                |source| source.as_str().to_owned(),
+            ),
+            detail: "a release write needs at least one destination parent".to_owned(),
         });
     }
-    let mut args = vec![
-        "--repository".to_owned(),
-        repo_path.clone(),
-        "--ignore-working-copy".to_owned(),
-        "duplicate".to_owned(),
-        "-r".to_owned(),
-        source.as_str().to_owned(),
-    ];
-    for parent in parents {
-        args.extend(["-d".to_owned(), parent.as_str().to_owned()]);
+    // The porcelain silently DEDUPED a repeated parent, which is how "a
+    // branch's work was dropped" once looked; a jj-lib write would happily
+    // record the duplicate instead. Both are wrong: the composition is the
+    // parent set, so a repeat is always a caller bug.
+    let mut seen = BTreeSet::new();
+    for parent in write.parents {
+        if !seen.insert(parent.as_str()) {
+            return Err(JjError::Revision {
+                revision: parent.as_str().to_owned(),
+                detail: "a release cannot carry the same parent twice".to_owned(),
+            });
+        }
     }
-    let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
-    let (output, reported) = command_output("jj", &borrowed)?;
-    let short = parse_duplicated(&format!("{output}\n{reported}"))
-        .into_iter()
+    let repo = Repo::open(repo)?;
+    let parent_commits: Vec<jj_lib::commit::Commit> = write
+        .parents
+        .iter()
+        .map(|parent| repo.commit(parent.as_str()))
+        .collect::<Result<_, _>>()?;
+    let parent_ids: Vec<JjCommitId> = parent_commits
+        .iter()
+        .map(|commit| commit.id().clone())
+        .collect();
+    let mut tx = repo.repo.start_transaction();
+    let written = if let Some(source) = write.source {
+        let source = repo.commit(source.as_str())?;
+        duplicated_release(&mut tx, (&source, write.message), &parent_ids)?
+    } else {
+        let tree = block_on(merge_commit_trees(tx.repo(), &parent_commits))
+            .map_err(|error| store_error(&error))?;
+        block_on(
+            tx.repo_mut()
+                .new_commit(parent_ids, tree)
+                .set_description(write.message.unwrap_or_default())
+                .write(),
+        )
+        .map_err(|error| store_error(&error))?
+    };
+    if let Some(name) = write.bookmark {
+        tx.repo_mut().set_local_bookmark_target(
+            JjRefName::new(name),
+            RefTarget::normal(written.id().clone()),
+        );
+    }
+    commit_mutation(&repo, tx, write.operation)?;
+    Ok(commit_id(written.id()))
+}
+
+/// The duplicate of `source` onto `parent_ids`, message optionally replaced.
+fn duplicated_release(
+    tx: &mut Transaction,
+    (source, message): (&jj_lib::commit::Commit, Option<&str>),
+    parent_ids: &[JjCommitId],
+) -> Result<jj_lib::commit::Commit, JjError> {
+    let mut descriptions = std::collections::HashMap::new();
+    if let Some(message) = message {
+        descriptions.insert(source.id().clone(), message.to_owned());
+    }
+    let stats = block_on(duplicate_commits(
+        tx.repo_mut(),
+        std::slice::from_ref(source.id()),
+        &descriptions,
+        parent_ids,
+        &[],
+    ))
+    .map_err(|error| store_error(&error))?;
+    stats
+        .duplicated_commits
+        .into_values()
         .next()
-        .ok_or(JjError::ProbeRoot)?;
-    resolve_commit_id(&repo_path, short.as_str())
+        .ok_or_else(|| JjError::Revision {
+            revision: source.id().to_string(),
+            detail: "the duplicate produced no commit".to_owned(),
+        })
+}
+
+/// A ref jj's stock configuration treats as an immutability pin.
+struct ImmutablePin {
+    commit: JjCommitId,
+    label: String,
+}
+
+/// The pins `builtin_immutable_heads()` names under jj's defaults:
+/// `present(trunk()) | tags() | untracked_remote_bookmarks()`. Trunk is read
+/// wider than jj's alias — a trunk-named bookmark on ANY remote rather than
+/// one chosen remote's — which can only refuse more, never less, and no
+/// knives verb rewrites trunk ancestry on purpose.
+fn immutable_pins(repo: &dyn jj_lib::repo::Repo) -> Vec<ImmutablePin> {
+    let mut pins = Vec::new();
+    let view = repo.view();
+    for (name, targets) in view.tags() {
+        for id in targets.local_target.added_ids() {
+            pins.push(ImmutablePin {
+                commit: id.clone(),
+                label: format!("tag {}", name.as_str()),
+            });
+        }
+        for (remote, remote_ref) in targets.remote_refs {
+            for id in remote_ref.target.added_ids() {
+                pins.push(ImmutablePin {
+                    commit: id.clone(),
+                    label: format!("tag {}@{}", name.as_str(), remote.as_str()),
+                });
+            }
+        }
+    }
+    for (name, targets) in view.bookmarks() {
+        let trunkish = matches!(name.as_str(), "main" | "master" | "trunk");
+        for (remote, remote_ref) in targets.remote_refs {
+            if trunkish || !remote_ref.is_tracked() {
+                for id in remote_ref.target.added_ids() {
+                    pins.push(ImmutablePin {
+                        commit: id.clone(),
+                        label: format!("{}@{}", name.as_str(), remote.as_str()),
+                    });
+                }
+            }
+        }
+    }
+    pins
+}
+
+/// Refuse to rewrite what jj itself would refuse to rewrite.
+///
+/// The jj CLI enforces `immutable_heads()` on every rewriting command; jj-lib
+/// deliberately does not, so this is the library-side equivalent under stock
+/// configuration. The reap flow DEPENDS on the refusal: a superseded cut
+/// pinned by someone else's untracked remote ref must land in
+/// `forgotten_only`, never be abandoned.
+fn assert_mutable(
+    repo: &dyn jj_lib::repo::Repo,
+    targets: &[jj_lib::commit::Commit],
+) -> Result<(), JjError> {
+    let pins = immutable_pins(repo);
+    for target in targets {
+        for pin in &pins {
+            let pinned = repo
+                .index()
+                .is_ancestor(target.id(), &pin.commit)
+                .map_err(|error| JjError::Revision {
+                    revision: target.id().to_string(),
+                    detail: error.to_string(),
+                })?;
+            if pinned {
+                return Err(JjError::Immutable {
+                    commit: short_id(&target.id().to_string()),
+                    pin: pin.label.clone(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Publish one mutation as ONE described operation.
+///
+/// Descendants are rebased first (bookmarks and parked working copies follow
+/// their rewritten commits, as under the CLI), the git refs are exported so
+/// `git` and `gh` in a colocated checkout see the result immediately rather
+/// than at someone's next jj command, and the transaction commits under
+/// `description`. Failure before the commit writes nothing at all.
+///
+/// Deliberately no git IMPORT here: nothing moves git refs between jj commands
+/// in a knives-managed checkout, every jj porcelain run (knives sync included)
+/// imports anyway, and import options are behavior configuration — behavior
+/// stays at jj's defaults (#18).
+fn commit_mutation(repo: &Repo, tx: Transaction, description: &str) -> Result<(), JjError> {
+    let mut tx = tx;
+    block_on(tx.repo_mut().rebase_descendants()).map_err(|error| store_error(&error))?;
+    let stats = jj_lib::git::export_refs(tx.repo_mut()).map_err(|error| JjError::Open {
+        path: repo.path.display().to_string(),
+        detail: format!("could not export git refs: {error}"),
+    })?;
+    for (symbol, reason) in stats
+        .failed_bookmarks
+        .iter()
+        .chain(stats.failed_tags.iter())
+    {
+        eprintln!("knives: could not export {symbol:?} to git: {reason:?}");
+    }
+    block_on(tx.commit(description)).map_err(|error| JjError::Open {
+        path: repo.path.display().to_string(),
+        detail: format!("could not commit the operation: {error}"),
+    })?;
+    Ok(())
+}
+
+/// jj's stock configuration, plus the writer identity resolved the way the jj
+/// CLI resolves it: `JJ_USER`/`JJ_EMAIL`, then the repository's own
+/// `.jj/repo/config.toml`, then the user file (`$JJ_CONFIG` when set,
+/// otherwise `$XDG_CONFIG_HOME/jj/config.toml`, `~/.config/jj/config.toml`,
+/// `~/.jjconfig.toml`). Only `user.name` and `user.email` are read: every
+/// behavioral setting deliberately stays at jj's defaults (#18), but a commit
+/// written with an empty author could never be pushed.
+fn repo_settings(path: &Path) -> Result<UserSettings, JjError> {
+    let open_error = |detail: String| JjError::Open {
+        path: path.display().to_string(),
+        detail,
+    };
+    let mut config = StackedConfig::with_defaults();
+    let (name, email) = resolved_identity(path)?;
+    let mut lines = Vec::new();
+    if let Some(name) = name {
+        lines.push(format!("user.name = {}", toml_string(&name)));
+    }
+    if let Some(email) = email {
+        lines.push(format!("user.email = {}", toml_string(&email)));
+    }
+    if !lines.is_empty() {
+        let layer = ConfigLayer::parse(ConfigSource::User, &lines.join("\n"))
+            .map_err(|error| open_error(error.to_string()))?;
+        config.add_layer(layer);
+    }
+    UserSettings::from_config(config).map_err(|error| open_error(error.to_string()))
+}
+
+/// A string as a quoted, escaped TOML literal.
+fn toml_string(value: &str) -> String {
+    toml::Value::String(value.to_owned()).to_string()
+}
+
+/// The identity the jj CLI would write with, by its precedence.
+fn resolved_identity(repo_path: &Path) -> Result<(Option<String>, Option<String>), JjError> {
+    let mut name = identity_var("JJ_USER");
+    let mut email = identity_var("JJ_EMAIL");
+    for file in identity_files(repo_path) {
+        if name.is_some() && email.is_some() {
+            break;
+        }
+        let (file_name, file_email) = file_identity(&file)?;
+        name = name.or(file_name);
+        email = email.or(file_email);
+    }
+    Ok((name, email))
+}
+
+fn identity_var(key: &str) -> Option<String> {
+    std::env::var(key).ok().filter(|value| !value.is_empty())
+}
+
+/// Identity sources after the environment, highest precedence first.
+fn identity_files(repo_path: &Path) -> Vec<PathBuf> {
+    let mut files = repo_config_files(repo_path);
+    if let Ok(paths) = std::env::var("JJ_CONFIG") {
+        // Like jj, `JJ_CONFIG` replaces the user files entirely.
+        files.extend(std::env::split_paths(&paths));
+        return files;
+    }
+    if let Some(home) = config_home() {
+        files.push(home.join("jj/config.toml"));
+    }
+    if let Ok(home) = std::env::var("HOME")
+        && !home.is_empty()
+    {
+        files.push(PathBuf::from(home).join(".jjconfig.toml"));
+    }
+    files
+}
+
+/// Where this repository's own jj config may live, newest convention first.
+fn repo_config_files(repo_path: &Path) -> Vec<PathBuf> {
+    let mut repo_dir = repo_path.join(".jj/repo");
+    // A non-default workspace's `.jj/repo` is a file naming the real repo directory.
+    if repo_dir.is_file()
+        && let Ok(pointed) = std::fs::read_to_string(&repo_dir)
+    {
+        repo_dir = PathBuf::from(pointed.trim());
+    }
+    let mut files = Vec::new();
+    // Newer jj keeps per-repo config under the user config directory, keyed by
+    // the repository's `config-id`.
+    if let Ok(id) = std::fs::read_to_string(repo_dir.join("config-id"))
+        && !id.trim().is_empty()
+        && let Some(home) = config_home()
+    {
+        files.push(home.join("jj/repos").join(id.trim()).join("config.toml"));
+    }
+    // Older jj kept it inside the repository.
+    files.push(repo_dir.join("config.toml"));
+    files
+}
+
+/// `$XDG_CONFIG_HOME`, else `~/.config` — the directory jj's user config lives under.
+fn config_home() -> Option<PathBuf> {
+    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME")
+        && !xdg.is_empty()
+    {
+        return Some(PathBuf::from(xdg));
+    }
+    std::env::var("HOME")
+        .ok()
+        .filter(|home| !home.is_empty())
+        .map(|home| PathBuf::from(home).join(".config"))
+}
+
+/// `user.name` and `user.email` from one jj config file. An absent or
+/// unreadable file is not a source; a file that exists but cannot parse is an
+/// error — quietly writing anonymous commits because a config file is broken
+/// would surface much later, as an unpushable release.
+fn file_identity(file: &Path) -> Result<(Option<String>, Option<String>), JjError> {
+    let Ok(text) = std::fs::read_to_string(file) else {
+        return Ok((None, None));
+    };
+    let table: toml::Table = text
+        .parse()
+        .map_err(|error: toml::de::Error| JjError::Parse {
+            detail: format!("{}: {error}", file.display()),
+        })?;
+    let Some(toml::Value::Table(user)) = table.get("user") else {
+        return Ok((None, None));
+    };
+    Ok((table_string(user, "name"), table_string(user, "email")))
+}
+
+fn table_string(table: &toml::Table, key: &str) -> Option<String> {
+    match table.get(key) {
+        Some(toml::Value::String(value)) => Some(value.clone()),
+        _ => None,
+    }
 }
 
 /// Rebase a whole branch onto `dest`: `jj rebase -b rev -d dest`.
@@ -1074,64 +1314,37 @@ pub fn rebase_branch_onto(repo: &Path, rev: &str, dest: &CommitId) -> Result<(),
     Ok(())
 }
 
-/// Rewrites a commit's message and returns its replacement commit id.
-pub fn describe_commit(repo: &Path, commit: &CommitId, message: &str) -> Result<CommitId, JjError> {
-    let repo_path = path(repo);
-    let change_id = command(
-        "jj",
-        [
-            "--repository",
-            &repo_path,
-            "--ignore-working-copy",
-            "log",
-            "--no-graph",
-            "-r",
-            commit.as_str(),
-            "-T",
-            "change_id",
-        ],
-    )?;
-    command_output(
-        "jj",
-        &[
-            "--repository",
-            &repo_path,
-            "--ignore-working-copy",
-            "describe",
-            "-r",
-            commit.as_str(),
-            "-m",
-            message,
-        ],
-    )?;
-    resolve_commit_id(&repo_path, &format!("change_id({})", change_id.trim()))
+/// Rewrites a commit's message as ONE described operation and returns the
+/// replacement commit id. Descendants and bookmarks follow the rewrite, as
+/// they do under `jj describe`; immutable commits refuse.
+pub fn describe_commit(
+    repo: &Path,
+    commit: &CommitId,
+    message: &str,
+    operation: &str,
+) -> Result<CommitId, JjError> {
+    let repo = Repo::open(repo)?;
+    let target = repo.commit(commit.as_str())?;
+    assert_mutable(repo.repo.as_ref(), std::slice::from_ref(&target))?;
+    let mut tx = repo.repo.start_transaction();
+    let rewritten = block_on(
+        tx.repo_mut()
+            .rewrite_commit(&target)
+            .set_description(message)
+            .write(),
+    )
+    .map_err(|error| store_error(&error))?;
+    commit_mutation(&repo, tx, operation)?;
+    Ok(commit_id(rewritten.id()))
 }
 
-/// The commit id `jj new` reports creating.
-pub fn parse_created(stderr: &str) -> Option<CommitId> {
-    stderr
-        .lines()
-        .find_map(|line| line.trim().strip_prefix("Created new commit "))
-        .and_then(|rest| rest.split_whitespace().nth(1))
-        .map(CommitId::new)
-}
-
+/// Point `name` at `revision` as ONE described operation, refusing backwards
+/// or sideways movement.
+///
+/// Dated cuts retain this protection because each name records a new release;
+/// [`set_bookmark_anywhere`] is the deliberate override.
 pub fn set_bookmark(repo: &Path, name: &str, revision: &str) -> Result<(), JjError> {
-    let repo_path = path(repo);
-    command(
-        "jj",
-        [
-            "--repository",
-            &repo_path,
-            "--ignore-working-copy",
-            "bookmark",
-            "set",
-            name,
-            "-r",
-            revision,
-        ],
-    )?;
-    Ok(())
+    move_bookmark(repo, (name, revision), BookmarkMotion::ForwardOnly)
 }
 
 /// Move a release bookmark even when its fresh flat merge is sideways.
@@ -1142,22 +1355,43 @@ pub fn set_bookmark(repo: &Path, name: &str, revision: &str) -> Result<(), JjErr
 /// checks `repair_effect` so a followed consumer will receive the repair. The failed sideways
 /// move that motivated this distinction means these helpers are not interchangeable.
 pub fn set_bookmark_anywhere(repo: &Path, name: &str, revision: &str) -> Result<(), JjError> {
-    let repo_path = path(repo);
-    command(
-        "jj",
-        [
-            "--repository",
-            &repo_path,
-            "--ignore-working-copy",
-            "bookmark",
-            "set",
-            "--allow-backwards",
-            name,
-            "-r",
-            revision,
-        ],
-    )?;
-    Ok(())
+    move_bookmark(repo, (name, revision), BookmarkMotion::Anywhere)
+}
+
+#[derive(Clone, Copy)]
+enum BookmarkMotion {
+    ForwardOnly,
+    Anywhere,
+}
+
+fn move_bookmark(
+    repo: &Path,
+    (name, revision): (&str, &str),
+    motion: BookmarkMotion,
+) -> Result<(), JjError> {
+    let repo = Repo::open(repo)?;
+    let target = repo.commit(revision)?;
+    if matches!(motion, BookmarkMotion::ForwardOnly)
+        && let Some(current) = repo
+            .repo
+            .view()
+            .get_local_bookmark(JjRefName::new(name))
+            .as_normal()
+        && !repo.backend_is_ancestor(current, target.id())?
+    {
+        return Err(JjError::Revision {
+            revision: name.to_owned(),
+            detail: "refusing to move the bookmark backwards or sideways".to_owned(),
+        });
+    }
+    let mut tx = repo.repo.start_transaction();
+    tx.repo_mut()
+        .set_local_bookmark_target(JjRefName::new(name), RefTarget::normal(target.id().clone()));
+    let operation = format!(
+        "knives: point {name} at {}",
+        short_id(&target.id().to_string())
+    );
+    commit_mutation(&repo, tx, &operation)
 }
 
 /// Commits matching a revset, resolved through jj porcelain.
@@ -1192,57 +1426,103 @@ pub fn commits_matching(repo: &Path, revset: &str) -> Result<Vec<CommitId>, JjEr
         .collect())
 }
 
-/// Forget a bookmark AND its remote-tracking refs, releasing the pin they hold.
-///
-/// `bookmark forget` alone leaves the `@remote` ref, which keeps the commit
-/// immutable so a following abandon refuses. `--include-remotes` is the whole
-/// point; verified by experiment (spec, evidence item 1). Erases local
-/// knowledge only: nothing is deleted on any remote.
-pub fn forget_bookmark_include_remotes(repo: &Path, name: &str) -> Result<(), JjError> {
-    let repo_path = path(repo);
-    command(
-        "jj",
-        [
-            "--repository",
-            &repo_path,
-            "--ignore-working-copy",
-            "bookmark",
-            "forget",
-            "--include-remotes",
-            name,
-        ],
-    )?;
-    Ok(())
+/// Names reaped and names whose abandon was refused, from one operation.
+#[derive(Debug)]
+pub struct ReapWrite {
+    pub abandoned: Vec<String>,
+    pub refused: Vec<(String, JjError)>,
 }
 
-/// Abandon commits by explicit id, in ONE invocation.
+/// Forget every ref of each name and abandon its commits, as ONE operation.
 ///
-/// One at a time does not work: abandoning a commit rebases its descendants,
-/// which rewrites the ids of the later ones (same lesson as `ProbeCleanup`).
-/// A commit pinned by a remote-tracking ref refuses abandon, so call
-/// [`forget_bookmark_include_remotes`] first. An empty slice is a no-op.
-pub fn abandon_commits(repo: &Path, commits: &[CommitId]) -> Result<(), JjError> {
+/// Forgetting first releases the pins the names themselves hold: a superseded
+/// cut's own re-materialized `@origin` ref keeps it immutable, and forgetting
+/// (unlike deleting) erases local knowledge only — nothing changes on any
+/// remote. A commit still immutable AFTER its refs are forgotten (an untracked
+/// remote pin someone else pushed, a trunk, a tag) refuses its abandon and is
+/// reported without stopping later names — the porcelain forget/abandon
+/// sequence this replaces behaved the same way, in two operations per name.
+pub fn forget_and_abandon(
+    repo: &Path,
+    entries: &[(String, Vec<CommitId>)],
+    operation: &str,
+) -> Result<ReapWrite, JjError> {
+    let repo = Repo::open(repo)?;
+    let mut tx = repo.repo.start_transaction();
+    let mut outcome = ReapWrite {
+        abandoned: Vec::new(),
+        refused: Vec::new(),
+    };
+    for (name, targets) in entries {
+        forget_refs(tx.repo_mut(), name);
+        let commits: Vec<jj_lib::commit::Commit> = targets
+            .iter()
+            .map(|target| repo.commit(target.as_str()))
+            .collect::<Result<_, _>>()?;
+        // Gate against the transaction's view: the refs just forgotten no
+        // longer pin, exactly as they no longer pinned the porcelain abandon.
+        match assert_mutable(tx.repo(), &commits) {
+            Ok(()) => {
+                for commit in &commits {
+                    tx.repo_mut().record_abandoned_commit(commit);
+                }
+                outcome.abandoned.push(name.clone());
+            }
+            Err(error) => outcome.refused.push((name.clone(), error)),
+        }
+    }
+    commit_mutation(&repo, tx, operation)?;
+    Ok(outcome)
+}
+
+/// Forget a bookmark and its remote-tracking refs in the transaction's view:
+/// the same view edits `jj bookmark forget --include-remotes` makes. Erases
+/// local knowledge only; nothing is deleted on any remote, and a later fetch
+/// re-materializes whatever still exists there.
+fn forget_refs(mut_repo: &mut MutableRepo, name: &str) {
+    let ref_name = JjRefName::new(name);
+    let remotes: Vec<String> = mut_repo
+        .view()
+        .bookmarks()
+        .filter(|(bookmark, _)| *bookmark == ref_name)
+        .flat_map(|(_, targets)| {
+            targets
+                .remote_refs
+                .into_iter()
+                .map(|(remote, _)| remote.as_str().to_owned())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    mut_repo.set_local_bookmark_target(ref_name, RefTarget::absent());
+    for remote in &remotes {
+        mut_repo.set_remote_bookmark(
+            ref_name.to_remote_symbol(JjRemoteName::new(remote)),
+            RemoteRef::absent(),
+        );
+    }
+}
+
+/// Abandon commits by explicit id, as ONE described operation.
+///
+/// Immutable commits refuse, as they do under `jj abandon`. Descendants are
+/// rebased onto the abandoned commits' parents in the same operation, so ids
+/// of later targets never go stale (the old one-at-a-time porcelain lesson).
+/// An empty slice is a no-op.
+pub fn abandon_commits(repo: &Path, commits: &[CommitId], operation: &str) -> Result<(), JjError> {
     if commits.is_empty() {
         return Ok(());
     }
-    let revset = commits
+    let repo = Repo::open(repo)?;
+    let targets: Vec<jj_lib::commit::Commit> = commits
         .iter()
-        .map(|commit| commit.as_str().to_owned())
-        .collect::<Vec<_>>()
-        .join("|");
-    let repo_path = path(repo);
-    command(
-        "jj",
-        [
-            "--repository",
-            &repo_path,
-            "--ignore-working-copy",
-            "abandon",
-            "-r",
-            &revset,
-        ],
-    )?;
-    Ok(())
+        .map(|commit| repo.commit(commit.as_str()))
+        .collect::<Result<_, _>>()?;
+    assert_mutable(repo.repo.as_ref(), &targets)?;
+    let mut tx = repo.repo.start_transaction();
+    for target in &targets {
+        tx.repo_mut().record_abandoned_commit(target);
+    }
+    commit_mutation(&repo, tx, operation)
 }
 
 /// Bookmarks whose tip descends from this commit, and where they now are.
@@ -1432,33 +1712,4 @@ pub fn conflicted_files(repo: &Path, revision: &str) -> Result<Vec<String>, JjEr
         .filter_map(|line| line.split_whitespace().next())
         .map(ToOwned::to_owned)
         .collect())
-}
-
-#[cfg(test)]
-mod resolve_commit_id_tests {
-    use super::*;
-
-    #[test]
-    fn parse_resolved_commit_id_rejects_ambiguous_output() {
-        // Given: a divergent change-id query that renders two commit ids.
-        let output = "aabbcc\nddeeff\n";
-
-        // When: the resolver parses the porcelain output.
-        let result = parse_resolved_commit_id(output);
-
-        // Then: it refuses to concatenate or select an arbitrary commit.
-        assert!(matches!(result, Err(JjError::Parse { .. })));
-    }
-
-    #[test]
-    fn parse_resolved_commit_id_rejects_empty_output() {
-        // Given: a revset that matched no commits and therefore printed no id.
-        let output = "";
-
-        // When: the resolver parses the porcelain output.
-        let result = parse_resolved_commit_id(output);
-
-        // Then: it refuses to construct an empty commit id.
-        assert!(matches!(result, Err(JjError::Parse { .. })));
-    }
 }
