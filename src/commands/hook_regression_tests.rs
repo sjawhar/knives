@@ -43,6 +43,9 @@ fn checkout_declaring(owner: &str) -> anyhow::Result<(tempfile::TempDir, PathBuf
 
 #[test]
 fn a_cached_owner_does_not_outlive_a_registry_owner_revocation() -> anyhow::Result<()> {
+    // The fixture and the probe both spawn `git`; hold the environment lock so
+    // a concurrent test legally mutating PATH cannot break the spawns.
+    let _lock = crate::config::test_support::environment_lock();
     // Given: one session has cached a checkout whose remote owner is currently trusted.
     let home = tempfile::tempdir()?;
     let (_checkout, root) = checkout_declaring("old-owner")?;
@@ -70,6 +73,7 @@ fn a_cached_owner_does_not_outlive_a_registry_owner_revocation() -> anyhow::Resu
 
 #[test]
 fn a_cached_owner_is_rechecked_when_the_registry_adds_the_owner() -> anyhow::Result<()> {
+    let _lock = crate::config::test_support::environment_lock();
     // Given: one session cached a checkout while its remote owner was absent from the registry.
     let home = tempfile::tempdir()?;
     let (_checkout, root) = checkout_declaring("real-owner")?;

@@ -594,6 +594,9 @@ mod comment_activity_tests {
         }
     }
 
+    /// Spawns `jj` (and sync itself spawns more), so every test using this
+    /// fixture holds the environment lock for its whole body: a spawn racing a
+    /// test that legally mutates PATH fails here, looking like a real flake.
     fn local_entry(temp: &TempDir) -> crate::config::RepoEntry {
         let work = temp.path().join("work");
         let origin = temp.path().join("origin");
@@ -640,6 +643,7 @@ mod comment_activity_tests {
 
     #[test]
     fn pull_request_list_failure_is_incomplete_not_informational() {
+        let _lock = crate::config::test_support::environment_lock();
         let temp = TempDir::new().unwrap();
         let entry = local_entry(&temp);
         let mut store = Store::open_for_update(temp.path().join("state.json")).unwrap();
@@ -665,6 +669,7 @@ mod comment_activity_tests {
 
     #[test]
     fn pull_ref_failure_is_incomplete_not_informational() {
+        let _lock = crate::config::test_support::environment_lock();
         let temp = TempDir::new().unwrap();
         let mut entry = local_entry(&temp);
         entry.upstream = temp.path().join("missing-upstream").display().to_string();
@@ -697,6 +702,7 @@ mod comment_activity_tests {
 
     #[test]
     fn no_github_skips_forge_queries_and_reports_the_unknown_state() {
+        let _lock = crate::config::test_support::environment_lock();
         let temp = TempDir::new().unwrap();
         let entry = local_entry(&temp);
         let mut store = Store::open_for_update(temp.path().join("state.json")).unwrap();
@@ -715,6 +721,7 @@ mod comment_activity_tests {
 
     #[test]
     fn comment_activity_reports_once_and_mark_persists() {
+        let _lock = crate::config::test_support::environment_lock();
         let temp = TempDir::new().unwrap();
         let store_path = temp.path().join("state.json");
         let repo_name = RepoName::new("test-repo");
@@ -774,6 +781,7 @@ mod comment_activity_tests {
 
     #[test]
     fn newest_comment_error_goes_to_problems_not_notes() {
+        let _lock = crate::config::test_support::environment_lock();
         let temp = TempDir::new().unwrap();
         let store_path = temp.path().join("state.json");
         let repo_name = RepoName::new("test-repo");
@@ -809,6 +817,7 @@ mod comment_activity_tests {
 
     #[test]
     fn first_sync_records_comment_activity_without_a_note() {
+        let _lock = crate::config::test_support::environment_lock();
         // Given: a previously unseen open pull request with an existing comment
         let temp = TempDir::new().unwrap();
         let store_path = temp.path().join("state.json");
@@ -841,6 +850,7 @@ mod comment_activity_tests {
 
     #[test]
     fn a_closed_pull_request_skips_comment_activity_lookup() {
+        let _lock = crate::config::test_support::environment_lock();
         // Given: a closed tracked pull request with a comment available from the forge
         let temp = TempDir::new().unwrap();
         let store_path = temp.path().join("state.json");

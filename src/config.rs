@@ -22,6 +22,14 @@ pub(crate) mod test_support {
 
     static ENVIRONMENT_LOCK: Mutex<()> = Mutex::new(());
 
+    /// Serializes every test that touches the process environment — in either
+    /// direction. Tests that MUTATE variables (`PATH`, `HOME`, `KNIVES_*`)
+    /// hold it while an [`EnvironmentGuard`] is live, and tests that SPAWN
+    /// subprocesses hold it for their whole body: a spawn resolves its binary
+    /// through `PATH` and inherits the environment at that instant, so an
+    /// unlocked spawn racing a mutator fails in ways that look like the
+    /// production code flaking (measured: `git`/`jj` fixtures in the hook and
+    /// sync tests, 3 failures in 50 parallel suite runs).
     pub(crate) fn environment_lock() -> MutexGuard<'static, ()> {
         ENVIRONMENT_LOCK
             .lock()
