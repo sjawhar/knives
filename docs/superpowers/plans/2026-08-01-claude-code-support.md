@@ -24,7 +24,7 @@
 1. **One announcement budget, two flags.** The OpenCode plugin emits notice+guidance together, once per session+repo. The Rust core stores two flags per repo (`noticed`, `guided`) in a session state file. The OpenCode adapter sets both together (unchanged semantics). The Claude Code adapter sets `noticed` at SessionStart (cwd repo only) and delivers guidance later on first touch.
 2. **Claude Code never gets guidance for the session's own repo.** Claude Code natively loads the cwd repo's own instruction files; injecting them again duplicates ~35KB. Foreign managed repos (reached mid-session) get notice+guidance via PostToolUse. The session repo gets notice only.
 3. **Dedup state lives in files**, one per harness+session, under the knives config home (`hook-sessions/`). This replaces the OpenCode plugin's `globalThis` record when the shim lands (Task 8). Compaction clears the file; SessionEnd deletes it; files older than 7 days are pruned opportunistically on write.
-4. **Owner for Claude Code:** `current_owner()` fallback chain becomes `KNIVES_OWNER` → `CLAUDE_CODE_SESSION_ID` → `USER`. Accepted tradeoff (raised with the owner): a session-id owner means the same human's next session reads as a different agent; that is correct for collision detection.
+4. **Owner for Claude Code:** `current_owner(cwd)` falls back from `KNIVES_OWNER` to `CLAUDE_CODE_SESSION_ID`, then to the managed working directory's knives state, and finally to `USER`. Accepted tradeoff (raised with the owner): a session-id owner means the same human's next session reads as a different agent; that is correct for collision detection.
 5. **The binary is not bundled in the Claude Code plugin.** The plugin installs from the git repo; binaries come from the release tarball as today. Hook commands go through a wrapper that exits 0 silently when `knives` is not on PATH.
 6. **Trusted is not Managed.** `GuidanceRoot` carries `kind: GuidanceRootKind::{Managed, Trusted}` (`[repos.*]` vs `[trusted.*]`). BOTH kinds resolve guidance. ONLY `Managed` gets the notice, claims, and owner resolution — a `[trusted.*]` entry is "read instructions from but do not maintain" (src/config.rs docs), and telling an agent a trusted repo "is a fork managed by knives" is false (this also settles field report #2 item 7 in the hook's favor of the CLI). This is a deliberate behavior change from the current TS plugin, approved at plan review.
 7. **Session-state writes hold an exclusive lock.** Two hook processes can fire concurrently; separate load→mutate→save loses updates. All mutations go through a locked read-modify-write (`SessionState::update`), following the lock pattern already in `src/store.rs`.
@@ -436,10 +436,15 @@ Owner fallback unit test in `src/commands/claim.rs`:
 ```rust
 #[test]
 fn claude_session_id_is_the_owner_when_knives_owner_is_absent() {
-    unsafe { std::env::remove_var("KNIVES_OWNER") };
-    unsafe { std::env::set_var("CLAUDE_CODE_SESSION_ID", "abc-123") };
-    assert_eq!(current_owner(), "abc-123");
-    unsafe { std::env::remove_var("CLAUDE_CODE_SESSION_ID") };
+    let _lock = environment_lock();
+    let environment = EnvironmentGuard::capture(&["KNIVES_OWNER", "CLAUDE_CODE_SESSION_ID", "USER"]);
+    environment.remove("KNIVES_OWNER");
+    environment.set("CLAUDE_CODE_SESSION_ID", "abc-123");
+    environment.set("USER", "terminal-user");
+    assert_eq!(
+        current_owner(Path::new("/tmp/unmanaged")).unwrap(),
+        "abc-123"
+    );
 }
 ```
 

@@ -1,0 +1,12 @@
+{
+  "name": "knives-omp",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "description": "oh-my-pi extension adapting knives OpenCode hooks.",
+  "omp": {
+    "extensions": [
+      "./extensions/knives.ts"
+    ]
+  }
+}

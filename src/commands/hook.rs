@@ -156,11 +156,16 @@ fn opencode_chat_system(event: &OpenCodeEvent, home: &Path) -> anyhow::Result<St
 }
 
 fn opencode_shell_env(event: &OpenCodeEvent) -> anyhow::Result<String> {
-    let owner = event.cwd().map(owner_for).transpose()?.flatten();
+    let owner = event
+        .cwd()
+        .map(Path::new)
+        .map(owner_for)
+        .transpose()?
+        .flatten();
     opencode::environment_response(owner.as_deref()).map_err(Into::into)
 }
 
-fn owner_for(cwd: &str) -> anyhow::Result<Option<String>> {
+pub(crate) fn owner_for(cwd: &Path) -> anyhow::Result<Option<String>> {
     if let Some(owner) = std::env::var("KNIVES_OWNER")
         .ok()
         .filter(|owner| !owner.trim().is_empty())
@@ -168,7 +173,7 @@ fn owner_for(cwd: &str) -> anyhow::Result<Option<String>> {
         return Ok(Some(owner));
     }
     let registry = load(&default_config_path())?;
-    let Some(matched) = managed_repo_for(&[PathBuf::from(cwd)], &registry.guidance_roots()) else {
+    let Some(matched) = managed_repo_for(&[cwd.to_path_buf()], &registry.guidance_roots()) else {
         return Ok(None);
     };
     if matched.repo.kind != GuidanceRootKind::Managed {

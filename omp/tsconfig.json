@@ -1,0 +1,24 @@
+{
+  "compilerOptions": {
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "noFallthroughCasesInSwitch": true,
+    "noPropertyAccessFromIndexSignature": true,
+    "forceConsistentCasingInFileNames": true,
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "verbatimModuleSyntax": true,
+    "isolatedModules": true,
+    "target": "ESNext",
+    "lib": ["ESNext"],
+    "types": ["bun-types"],
+    "moduleDetection": "force",
+    // pi-coding-agent 17.3.4 declarations fail under exact optional properties in
+    // edit/index.d.ts:26 and tools/bash.d.ts:115. Remove when upstream is strict-clean.
+    "skipLibCheck": true,
+    "noEmit": true,
+    "allowImportingTsExtensions": true
+  },
+  "include": ["extensions/**/*.ts", "../plugin/lib/**/*.ts"]
+}

@@ -5,7 +5,10 @@
 //! that advice was insufficient.
 // allow: SIZE_OK: 292 lines - claim coordination keeps owner-resolution behavior beside branch claim outcomes.
 
+use std::path::Path;
+
 use crate::cli::Exit;
+use crate::commands::hook::owner_for;
 use crate::config::{Registry, default_config_path, load};
 use crate::ids::BranchTarget;
 use crate::store::{Store, default_state_path};
@@ -13,22 +16,28 @@ use crate::store::{Store, default_state_path};
 /// Who is claiming.
 ///
 /// `KNIVES_OWNER` is what the `OpenCode` plugin injects. Claude Code instead
-/// provides its session ID. A claim cannot live in a shell environment variable:
-/// each tool call is its own process and subagents are spawned by the harness, so
-/// an `export` reaches nothing. The OS user is the fallback for a human at a terminal.
+/// provides its session ID. When neither harness provides an identity, a managed
+/// working directory can identify its active owner from knives state. The OS user
+/// is the fallback for a human at a terminal.
 /// A blank `KNIVES_OWNER` is a plugin bug, not an identity. Treating it as one
 /// would let two agents share a claim. The same applies to `CLAUDE_CODE_SESSION_ID`.
-pub fn current_owner() -> String {
-    std::env::var("KNIVES_OWNER")
+pub fn current_owner(cwd: &Path) -> anyhow::Result<String> {
+    if let Some(owner) = std::env::var("KNIVES_OWNER")
         .ok()
         .filter(|value| !value.trim().is_empty())
-        .or_else(|| {
-            std::env::var("CLAUDE_CODE_SESSION_ID")
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-        })
-        .or_else(|| std::env::var("USER").ok())
-        .unwrap_or_else(|| "unknown".to_owned())
+    {
+        return Ok(owner);
+    }
+    if let Some(owner) = std::env::var("CLAUDE_CODE_SESSION_ID")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
+        return Ok(owner);
+    }
+    if let Some(owner) = owner_for(cwd)? {
+        return Ok(owner);
+    }
+    Ok(std::env::var("USER").unwrap_or_else(|_| "unknown".to_owned()))
 }
 
 /// What `claim` decided, so the caller can render and exit without re-deriving it.
@@ -112,7 +121,7 @@ pub struct ClaimRequest<'a> {
 pub fn run_claim(request: &ClaimRequest<'_>) -> anyhow::Result<Exit> {
     let registry = load(&default_config_path())?;
     let mut store = Store::open_for_update(default_state_path())?;
-    let owner = current_owner();
+    let owner = current_owner(&std::env::current_dir()?)?;
     let outcome = decide(&registry, &store, &request.target, &owner);
 
     let exit = match &outcome {
@@ -157,7 +166,7 @@ mod tests {
         clippy::indexing_slicing,
         reason = "indexing a result in a test is the assertion; a panic is the failure"
     )]
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use super::*;
     use crate::config::{
@@ -254,7 +263,10 @@ mod tests {
         environment.set("KNIVES_OWNER", "   ");
         environment.remove("CLAUDE_CODE_SESSION_ID");
         environment.set("USER", "terminal-user");
-        assert_eq!(current_owner(), "terminal-user");
+        assert_eq!(
+            current_owner(Path::new("/tmp/unmanaged")).unwrap(),
+            "terminal-user"
+        );
     }
 
     #[test]
@@ -266,7 +278,10 @@ mod tests {
         environment.remove("KNIVES_OWNER");
         environment.set("CLAUDE_CODE_SESSION_ID", "abc-123");
         environment.set("USER", "terminal-user");
-        assert_eq!(current_owner(), "abc-123");
+        assert_eq!(
+            current_owner(Path::new("/tmp/unmanaged")).unwrap(),
+            "abc-123"
+        );
     }
 
     #[test]
@@ -278,7 +293,43 @@ mod tests {
         environment.remove("KNIVES_OWNER");
         environment.set("CLAUDE_CODE_SESSION_ID", "   ");
         environment.set("USER", "terminal-user");
-        assert_eq!(current_owner(), "terminal-user");
+        assert_eq!(
+            current_owner(Path::new("/tmp/unmanaged")).unwrap(),
+            "terminal-user"
+        );
+    }
+
+    #[test]
+    fn current_owner_uses_the_managed_directory_claim_when_harness_ids_are_absent() {
+        let _lock = environment_lock();
+        let environment = EnvironmentGuard::capture(&[
+            "KNIVES_CONFIG_HOME",
+            "KNIVES_OWNER",
+            "CLAUDE_CODE_SESSION_ID",
+            "USER",
+        ]);
+        let home = tempfile::tempdir().unwrap();
+        let repository = home.path().join("repo");
+        std::fs::create_dir(&repository).unwrap();
+        std::fs::write(
+            home.path().join("repos.toml"),
+            format!(
+                "[repos.repo]\npath = \"{}\"\nupstream = \"u\"\norigin = \"o\"\n",
+                repository.display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            home.path().join("state.json"),
+            r#"{"claims":{"repo/feat/owner":{"repo":"repo","branch":"feat/owner","owner":"state-owner","why":"test","started":"2026-01-01T00:00:00Z","files":[]}}}"#,
+        )
+        .unwrap();
+        environment.set("KNIVES_CONFIG_HOME", home.path().to_str().unwrap());
+        environment.remove("KNIVES_OWNER");
+        environment.remove("CLAUDE_CODE_SESSION_ID");
+        environment.set("USER", "terminal-user");
+
+        assert_eq!(current_owner(&repository).unwrap(), "state-owner");
     }
 
     #[test]
