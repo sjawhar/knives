@@ -7,9 +7,8 @@ import {
   bundledSkillDirectory,
   createKnivesHooks,
   readOptions,
+  relevantTools,
 } from "../../plugin/lib/internals.ts";
-
-const relevantTools = new Set(["read", "grep", "glob", "edit", "write", "apply_patch", "bash"]);
 
 export default function knivesExtension(pi: ExtensionAPI): void {
   const options = readOptions(undefined);

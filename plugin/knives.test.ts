@@ -8,6 +8,7 @@ import {
   bundledSkillDirectory,
   createKnivesHooks,
   readOptions,
+  relevantTools,
   resolveBinary,
 } from "./lib/internals.ts";
 
@@ -145,6 +146,12 @@ test.serial("does not spawn for an irrelevant tool", async () => {
     expect(result.output).toBe("tool output");
     await expect(readFile(`${record}.stdin`, "utf8")).rejects.toThrow();
   });
+});
+
+test("the OMP adapter shares the plugin's relevant-tool list", () => {
+  expect([...relevantTools].sort()).toEqual(
+    ["apply_patch", "bash", "edit", "glob", "grep", "read", "write"].sort()
+  );
 });
 
 test.serial("forwards tool input and appends an addition verbatim", async () => {

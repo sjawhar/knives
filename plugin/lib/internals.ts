@@ -3,7 +3,15 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 // allow: SIZE_OK — the adapter's OpenCode hook contracts and binary boundary are one seam.
-const relevantTools = new Set(["read", "grep", "glob", "edit", "write", "apply_patch", "bash"]);
+export const relevantTools: ReadonlySet<string> = new Set([
+  "read",
+  "grep",
+  "glob",
+  "edit",
+  "write",
+  "apply_patch",
+  "bash",
+]);
 const binaryCacheKey = "__knives_opencode_failed_binaries__";
 const warningKey = "__knives_opencode_binary_warning_emitted__";
 
