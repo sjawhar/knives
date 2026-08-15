@@ -73,8 +73,9 @@ pub struct Cli {
 /// Explicit flags win. Otherwise JSON when the output is not going to a terminal, or
 /// when the environment says an agent is running this: agents were grepping human
 /// output to count findings by detector, which is both fragile and unnecessary.
-/// `KNIVES_OWNER` is set by this tool's own `OpenCode` plugin, so its presence is a
-/// direct signal rather than a guess.
+/// `KNIVES_OWNER` is set by this tool's own `OpenCode` plugin, so it is a direct harness
+/// signal rather than a guess. OMP exposes no such variable to its bash shells; that tool's
+/// stdout is not a terminal, so OMP lands on the non-terminal fallback below.
 pub fn machine_readable(json: bool, text: bool) -> bool {
     if json {
         return true;
@@ -82,15 +83,27 @@ pub fn machine_readable(json: bool, text: bool) -> bool {
     if text {
         return false;
     }
-    if std::env::var_os("KNIVES_OWNER").is_some() {
+    if agent_environment() {
         return true;
     }
-    for name in ["CLAUDECODE", "CLAUDE_CODE", "OPENCODE", "AGENT", "CI"] {
+
+    !std::io::IsTerminal::is_terminal(&std::io::stdout())
+}
+
+fn agent_environment() -> bool {
+    for name in [
+        "KNIVES_OWNER",
+        "CLAUDECODE",
+        "CLAUDE_CODE",
+        "OPENCODE",
+        "AGENT",
+        "CI",
+    ] {
         if std::env::var_os(name).is_some() {
             return true;
         }
     }
-    !std::io::IsTerminal::is_terminal(&std::io::stdout())
+    false
 }
 
 #[derive(Debug, Subcommand)]
@@ -353,7 +366,6 @@ mod tests {
         environment.set("KNIVES_OWNER", "someone");
         assert!(machine_readable(false, false), "an agent shell gets JSON");
         assert!(!machine_readable(false, true), "--text still wins there");
-        environment.remove("KNIVES_OWNER");
     }
 
     #[test]

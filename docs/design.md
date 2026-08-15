@@ -221,6 +221,7 @@ does not interrupt an agent session.
 |---|---|---|---|
 | A | Claude Code | A plugin-bundled shell hook calls `knives hook claude-code`. | `SessionStart` emits a notice when the working directory is a managed repository. `PostToolUse` handles relevant tools that name a path, adding an unspent notice and guidance. `PreCompact` and a compact `SessionStart` clear session state. `SessionEnd` deletes it. |
 | B | OpenCode | The in-process TypeScript plugin is a shim that spawns `knives hook opencode`. | `tool.execute.after` uses the notice and guidance parts in one response budget. `chat.system` returns formatted guidance and its raw bodies. `shell.env` uses `KNIVES_OWNER` when set, then resolves an owner from a managed working directory. `compacting` clears session state. |
+| C | oh-my-pi | The `omp/extensions/knives.ts` extension adapts the OpenCode hook core. | `resources_discover` exposes bundled skills. `tool_result` and `before_agent_start` apply the notice and guidance hooks, and `session.compacting` clears state. It leaves Pi's built-in `bash` tool intact, preserving its approval and sandbox behavior. |
 
 Each session records `noticed` and `guided` flags for every repository. The Claude Code adapter
 marks only `noticed` at `SessionStart`, then marks guidance after a relevant foreign-repository
@@ -231,6 +232,12 @@ flags after any nonempty addition, so its notice and guidance consume one budget
 The OpenCode protocol fails soft. For a parsed event, a processing failure returns that event's
 empty response envelope. Malformed input returns an empty object. Both cases keep the hook exit
 successful.
+
+The OMP extension uses Pi's native `bash` implementation rather than replacing it. OMP exposes no
+session environment variable to tool shells; its bash output is not a terminal, so CLI output is
+machine-readable through the non-terminal fallback. Commands that need an owner use
+`KNIVES_OWNER`, then the Claude Code session identifier, then the managed working directory's
+recorded owner, before falling back to the operating-system user.
 
 ### Trust boundary
 

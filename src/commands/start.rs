@@ -29,7 +29,7 @@ pub fn run(repo_name: &RepoName, branch: &BranchName, why: Option<&str>) -> anyh
     let upstream_trunk = entry.upstream_trunk();
 
     let mut store = Store::open_for_update(default_state_path())?;
-    let owner = current_owner();
+    let owner = current_owner(&std::env::current_dir()?)?;
     if let Some(held) = store
         .claims(Some(repo_name))
         .into_iter()

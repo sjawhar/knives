@@ -74,6 +74,8 @@ jobs:
         run: bun run lint
       - name: Typecheck plugin
         run: bun run typecheck
+      - name: Typecheck OMP extension
+        run: bun run typecheck:omp
       # The suite includes an import guard pinning the entry module's export surface:
       # OpenCode calls every exported function as a plugin, so a second export
       # breaks plugin loading. See plugin/knives.ts.
