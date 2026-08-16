@@ -1,18 +1,18 @@
-//! `knives claim` and `knives release-claim`: advisory coordination between agents.
+//! Claim decisions: who owns a branch, whether a claim can be taken, and the
+//! words each outcome prints. Consumed by `start` and `finish`, which are the
+//! commands that actually take and release claims.
 //!
 //! Enforcement layer three. Advisory on purpose: layers one and two are
 //! default-correct paths and detectors, and hard refusal waits for evidence
 //! that advice was insufficient.
-// allow: SIZE_OK: 469 lines - claim coordination keeps owner-resolution behavior beside branch claim outcomes.
+// allow: SIZE_OK: 295 lines - claim coordination keeps owner-resolution behavior beside branch claim outcomes.
 
 use std::path::Path;
 
-use crate::cli::Exit;
 use crate::commands::hook::owner_for;
-use crate::config::{Registry, default_config_path, load};
+use crate::config::Registry;
 use crate::ids::BranchTarget;
-use crate::ledger::{Ledger, Scribe};
-use crate::store::{Store, default_state_path};
+use crate::store::Store;
 
 /// Who is claiming.
 ///
@@ -110,97 +110,6 @@ pub fn render(outcome: &ClaimOutcome) -> String {
             format!("unknown repo {name}; known: {}", known.join(", "))
         }
     }
-}
-
-#[derive(Debug)]
-pub struct ClaimRequest<'a> {
-    pub target: BranchTarget,
-    pub why: &'a str,
-    pub fork_only: bool,
-}
-
-pub fn run_claim(request: &ClaimRequest<'_>) -> anyhow::Result<Exit> {
-    let registry = load(&default_config_path())?;
-    let mut store = Store::open_for_update(default_state_path())?;
-    let owner = current_owner(&std::env::current_dir()?)?;
-    let outcome = decide(&registry, &store, &request.target, &owner);
-
-    let exit = match &outcome {
-        ClaimOutcome::Taken { .. } => {
-            let _ = store.claim(&request.target, &owner, request.why);
-            if request.fork_only {
-                // Without the mark, a branch we deliberately keep with no
-                // upstream pull request reads as an error in every report.
-                store.mark_fork_only(&request.target, request.why);
-            }
-            store.save()?;
-            // After the state write, because the ledger records what happened and
-            // nothing happened until the claim was saved. A failure here fails the
-            // command: the ledger and state file live in one config home, and a
-            // write that can fail one can fail the other.
-            // A repo the registry does not know has no checkout to anchor against,
-            // and an entry with no anchor is still a valid entry.
-            let path = registry
-                .get(&request.target.repo)
-                .map_or_else(std::path::PathBuf::new, |entry| entry.path.clone());
-            Scribe::new(
-                Ledger::for_repo(&request.target.repo),
-                request.target.repo.clone(),
-                path,
-                owner.clone(),
-            )
-            .event(
-                Some(request.target.branch.as_str()),
-                format!("claimed: {}", request.why),
-                store.tracked_pull(&request.target),
-            )?;
-            Exit::Ok
-        }
-        ClaimOutcome::AlreadyYours { .. } => Exit::Ok,
-        ClaimOutcome::HeldByAnother { .. } | ClaimOutcome::UnknownRepo { .. } => Exit::Usage,
-    };
-
-    match exit {
-        Exit::Ok => println!("{}", render(&outcome)),
-        _ => eprintln!("{}", render(&outcome)),
-    }
-    Ok(exit)
-}
-
-pub fn run_release(target: &BranchTarget, superseded_by: Option<&str>) -> anyhow::Result<Exit> {
-    let registry = load(&default_config_path())?;
-    let mut store = Store::open_for_update(default_state_path())?;
-    if !store.release_claim(target) {
-        eprintln!("no claim on {target}");
-        return Ok(Exit::Usage);
-    }
-    if let Some(replacement) = superseded_by {
-        store.supersede(target, replacement);
-    }
-    let pr = store.tracked_pull(target);
-    store.save()?;
-    let owner = current_owner(&std::env::current_dir()?)?;
-    // A repo the registry does not know has no checkout to anchor against, and an
-    // entry with no anchor is still a valid entry.
-    let path = registry
-        .get(&target.repo)
-        .map_or_else(std::path::PathBuf::new, |entry| entry.path.clone());
-    Scribe::new(
-        Ledger::for_repo(&target.repo),
-        target.repo.clone(),
-        path,
-        owner,
-    )
-    .event(
-        Some(target.branch.as_str()),
-        superseded_by.map_or_else(
-            || "claim released".to_owned(),
-            |replacement| format!("claim released; superseded by {replacement}"),
-        ),
-        pr,
-    )?;
-    println!("released {target}");
-    Ok(Exit::Ok)
 }
 
 #[cfg(test)]
@@ -339,89 +248,6 @@ mod tests {
         assert_eq!(
             current_owner(Path::new("/tmp/unmanaged")).unwrap(),
             "terminal-user"
-        );
-    }
-
-    #[test]
-    fn taking_a_claim_records_why_in_the_ledger() {
-        // The one "why" this tool records is a claim's, and `finish` deletes it.
-        // Without an event here the reason a branch exists dies with the claim.
-        let _lock = environment_lock();
-        let home = tempfile::tempdir().unwrap();
-        let environment = EnvironmentGuard::capture(&[
-            "KNIVES_CONFIG_HOME",
-            "KNIVES_OWNER",
-            "CLAUDE_CODE_SESSION_ID",
-        ]);
-        environment.set("KNIVES_CONFIG_HOME", home.path().to_str().unwrap());
-        environment.set("KNIVES_OWNER", "ses_fff688");
-        environment.remove("CLAUDE_CODE_SESSION_ID");
-        std::fs::write(
-            home.path().join("repos.toml"),
-            "[repos.a-repo]\npath = \"/tmp/knives-not-a-repository\"\n\
-             upstream = \"https://forge.invalid/org/work.git\"\n\
-             origin = \"https://forge.invalid/ours/work.git\"\n",
-        )
-        .unwrap();
-
-        let exit = run_claim(&ClaimRequest {
-            target: names(),
-            why: "fixing the parser",
-            fork_only: false,
-        })
-        .unwrap();
-        assert_eq!(exit, Exit::Ok);
-
-        let entries = crate::ledger::Ledger::for_repo(&crate::ids::RepoName::new("a-repo"))
-            .entries()
-            .unwrap();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].kind, crate::ledger::Kind::Event);
-        assert_eq!(entries[0].owner, "ses_fff688");
-        assert_eq!(entries[0].subject.as_deref(), Some("feat/alpha"));
-        assert_eq!(entries[0].text, "claimed: fixing the parser");
-        // The registered path is not a repository, so the subject's tip does not
-        // resolve and the entry records that by omitting the anchor rather than
-        // by failing.
-        assert_eq!(entries[0].anchor, None);
-    }
-
-    #[test]
-    fn releasing_a_claim_records_where_the_work_went_when_it_went_somewhere() {
-        let _lock = environment_lock();
-        let home = tempfile::tempdir().unwrap();
-        let environment = EnvironmentGuard::capture(&[
-            "KNIVES_CONFIG_HOME",
-            "KNIVES_OWNER",
-            "CLAUDE_CODE_SESSION_ID",
-        ]);
-        environment.set("KNIVES_CONFIG_HOME", home.path().to_str().unwrap());
-        environment.set("KNIVES_OWNER", "ses_fff688");
-        environment.remove("CLAUDE_CODE_SESSION_ID");
-        std::fs::write(
-            home.path().join("repos.toml"),
-            "[repos.a-repo]\npath = \"/tmp/knives-not-a-repository\"\n\
-             upstream = \"https://forge.invalid/org/work.git\"\n\
-             origin = \"https://forge.invalid/ours/work.git\"\n",
-        )
-        .unwrap();
-        let _ = run_claim(&ClaimRequest {
-            target: names(),
-            why: "fixing the parser",
-            fork_only: false,
-        })
-        .unwrap();
-
-        let exit = run_release(&names(), Some("feat/replacement")).unwrap();
-        assert_eq!(exit, Exit::Ok);
-
-        let entries = crate::ledger::Ledger::for_repo(&crate::ids::RepoName::new("a-repo"))
-            .entries()
-            .unwrap();
-        assert_eq!(entries.len(), 2);
-        assert_eq!(
-            entries[1].text,
-            "claim released; superseded by feat/replacement"
         );
     }
 
