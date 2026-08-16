@@ -24,13 +24,13 @@ What is managed, where each checkout is, the newest release each has cut, and, w
 Pins are read from each consumer's origin trunk rather than its working copy. Notes report when a consumer checkout is behind its origin trunk (`checkout is N commit(s) behind its <branch>`), when no origin trunk resolves (`no origin trunk resolved; pins read from the working copy`), or when a consumer is not a repository (`not a repository; pins read from the working copy`). Under a fixed scheme, a branch-name pin with no locked commit is current by definition, and a locked commit is behind when it is an ancestor of the branch tip.
 ### `knives status [REPO|--all]`
 
-The main report. Per branch: local tip, push status, pull request and its state, review decision, CI check status, landed verdict against upstream trunk, and flags. Plus claims other agents hold, the releases scanned, findings grouped one line per kind, and anything it could not answer.
+The main report. Per branch: local tip, push status, pull request and its state, review decision, CI check status, landed verdict against upstream trunk, flags, and newest ledger entry. Plus claims other agents hold, the releases scanned, findings grouped one line per kind, and anything it could not answer.
 
 `--verbose` prints one block per finding instead of one line per kind. `--no-landed` skips the trunk probe, which is the slow part. `--no-github` skips pull request lookups.
 
 #### Branch table columns
 
-Branch rows are rendered as an aligned table with 8 columns. Empty cells render as `-` for `review`, `checks`, `landed`, and `flags` columns (`branch`, `tip`, `push`, and `pr` always carry values or state tokens).
+Branch rows are rendered as an aligned table with 9 columns. Empty cells render as `-` for `review`, `checks`, `landed`, `flags`, and `notch` columns (`branch`, `tip`, and `push` always carry values or state tokens, while `pr` reports a number or state token).
 
 1. `branch`: local bookmark name.
 2. `tip`: short commit hash, or `divergent` if the bookmark has multiple tips.
@@ -54,6 +54,7 @@ Branch rows are rendered as an aligned table with 8 columns. Empty cells render 
    - `-` if no open PR exists or checks were not consulted. CI still in flight renders the same as all-green (`ok`) because the vocabulary has no `checks-running`. Checks are consulted only for open pull requests.
 7. `landed`: verdict against upstream's trunk (`in-trunk`, `conflicts-with-trunk`, `not-in-trunk`, `landed?`, or `-`).
 8. `flags`: comma-separated flags (`CONFLICTING`, `behind-base`, `review-stale`, `fork-only`) or `-`.
+9. `notch`: the newest ledger entry for this branch as one truncated token with its age (`"superseded by #1157…" (3d)`), or `-` when there is none. `knives notch <branch>` prints it in full.
 
 Trunk verdicts say what was observed, not what it means:
 
@@ -114,6 +115,106 @@ knives track <branch> --forget       # back to inference
 ### `knives depends <branch> --on <repo>#<number>`
 
 That the branch cannot land before that pull request does. Dependencies cross forks, which is the case that motivated it: dropping a required change from a release without dropping the branch that needs it ships a release that cannot work. `status` reports the ones that are not merged yet.
+
+### `knives notch [SUBJECT]`
+
+The record of what happened in this fork and what was decided. Each repository has an
+append-only ledger directory beside the state file, with one immutable Markdown entry file
+per entry. `knives status` deletes nothing, but `knives finish` does: it removes the claim
+that said why a branch exists. The ledger is where that survives.
+
+Two moods on one command. Bare, it reads:
+
+```
+knives notch                      # the newest 20 entries across this repo
+knives notch <branch>             # that ref's whole chronology, oldest first
+knives notch release/2026-08-15   # a release is a subject like any branch
+knives notch --pr 4545            # only entries stamped with that pull request
+knives notch --repo other         # a repo you are not standing in
+```
+
+With `-m`, it writes:
+
+```
+knives notch <branch> -m "superseded by #1157; upstream wanted the trait approach" \
+  --evidence 06d778b9 --evidence other-repo#1157 --pr 4891
+knives notch -m "this fork needs a cut before the pin moves"   # about the repo itself
+```
+
+`--repo` works in both moods, and it is the flag for the case that keeps happening: you
+are standing in the consumer fork when you learn something about the library fork, and the
+entry belongs in the library's ledger. `--pr` filters reads; with `-m`, it stamps the entry
+explicitly and otherwise the tracked pull request is the fallback. `--evidence` is repeatable
+and requires `-m`.
+
+A `knives start` workspace resolves its registered checkout through `.jj/repo`, so ordinary
+commands infer that repository there. Keep `--repo <name>` for a cross-repository write.
+
+#### What an entry holds
+
+| Field | Written by | Content |
+|---|---|---|
+| `ts` | automatically | when it was written, RFC 3339 UTC |
+| `owner` | automatically | the same identity a claim gets |
+| `subject` | you | the ref it is about; absent for an entry about the repository |
+| `kind` | automatically | `event` when a knives command observed it, `note` when an agent asserted it |
+| `text` | you, or the command | the entry itself |
+| `evidence` | you, optional | commit ids, `file:line`, `<repo>#<number>`, URLs, and they may name other repos |
+| `anchor` | automatically | the subject's tip at write time, absent when it did not resolve |
+| `pr` | `--pr` on write, otherwise automatically | caller-supplied write stamp, or the pull request `knives track` states for the subject |
+
+Two kinds, not three. The question a reader has is whether a machine observed this or an
+agent asserted it. Supersessions and parkings arrive as events, through `finish
+--superseded-by` and `start --why`; everything you assert by hand is a note.
+
+`anchor` is why this record does not rot. A stored disposition goes wrong the moment
+upstream moves: a branch census that inferred "not a release parent, therefore unhomed"
+produced 54 findings of which 5 were false, and a parity audit's finding was true at its
+recorded commit and stale two hours later. A past-tense entry anchored to a commit stays
+true. So the ledger holds events and judgments, never derived state — if a detector can
+compute it, do not write it down.
+
+#### What writes entries without being asked
+
+Every command that already witnesses something records it as part of doing it. A failed
+ledger write fails the command.
+
+| Command | Entry |
+|---|---|
+| `start`, `claim` | `claimed: <why>` on the branch |
+| `finish`, `release-claim` | `claim released`, `claim released; superseded by <branch>`, or bare `superseded by <branch>` for an unheld finish with `--superseded-by` |
+| `track --pr/--fork-only/--forget` | the statement that changed |
+| `depends --on` | `requires <repo>#<number>` |
+| `release cut` | the whole parent set, branch names and commit ids, plus the previous cut's carried-parent delta |
+| `sync` | one entry per tracked pull request that merged, closed or advanced |
+
+Nothing is recorded for a pull request that did not move, and nothing injects any of this
+into a session: reading the ledger is intentional, and that is the point.
+
+#### In `knives status`
+
+Each branch row carries its newest entry. In JSON that is `last_notch: {ts, kind, text}`,
+absent when the branch has none; in text it is one truncated token at the end of the line,
+`"superseded by #1157…" (3d)`. Repo-level entries appear separately as
+`repo_notches: {count, last}` in JSON and as `notches  <N> repo-level, newest: "<text>" (<age>)`
+above the branch table. It is a local ledger read, so it costs nothing.
+
+#### Storage and exit codes
+
+Each repository's ledger is `~/.config/knives/ledger/<repo>/`. Every entry is one Markdown
+file with TOML frontmatter between `+++` fences and prose as its body. Entry files are
+immutable: they are never rewritten or deleted. A write completes a temporary file and
+atomically persists it without replacement to its final name; there is no lockfile. Its
+filename is a compact UTC timestamp followed by a four-hex-character suffix; readers scan
+entry files in lexicographic filename order, which is chronological.
+
+There is no rotation or retention policy — an entry is about 300 bytes. Readers ignore
+unknown frontmatter keys, so a newer binary can add one and an older one still reads the
+entry. There is no version number and there never needs to be.
+
+`0` is fine, `2` is a usage error, and `3` means the ledger exists but cannot be read — its
+directory or an entry file within it. That is deliberately not the same as a repository
+nobody has notched yet, which is `0` with `no notches yet`.
 
 ### `knives release [REPO]`
 

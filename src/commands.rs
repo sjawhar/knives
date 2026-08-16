@@ -9,6 +9,7 @@ pub mod claim;
 pub mod gh;
 pub mod hook;
 pub mod init;
+pub mod notch;
 pub mod preflight;
 pub mod register;
 pub mod release;

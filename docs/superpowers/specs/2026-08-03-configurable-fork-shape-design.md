@@ -117,7 +117,7 @@ same way. An edit to `repos.toml` takes effect on the next tool call. So
 would be theater, since any agent-writable pending store proves nothing and
 the file itself is the trust root.
 
-**The real problem** is churn: workspaces under `~/agent-c/*/*` are created
+**The real problem** is churn: workspaces under `~/session-workspace/*/*` are created
 and destroyed constantly, and none of them get AGENTS.md guidance because
 per-repo registration cannot keep up.
 
@@ -125,7 +125,7 @@ per-repo registration cannot keep up.
 
 ```toml
 [trust]
-roots = ["~/agent-c"]                          # any repo under here is mine
+roots = ["~/session-workspace"]                          # any repo under here is mine
 owners = ["some-user", "some-org"]              # any repo whose upstream/origin
                                                  # is owned by these
 ```

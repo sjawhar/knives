@@ -7,8 +7,9 @@ use std::path::Path;
 use crate::cli::Exit;
 use crate::config::{RepoEntry, Role};
 use crate::forge::{Forge, PullRequest, ours_only};
-use crate::ids::{BranchName, RepoName};
+use crate::ids::{BranchName, BranchTarget};
 use crate::jj::{fetch_all, fetch_pull_ref, pull_heads};
+use crate::ledger::Scribe;
 use crate::store::Store;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -22,15 +23,21 @@ pub enum PullState {
     Closed,
 }
 
-impl fmt::Display for PullState {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
+impl PullState {
+    const fn as_str(self) -> &'static str {
+        match self {
             Self::Unchanged => "unchanged",
             Self::New => "new",
             Self::Advanced => "advanced",
             Self::Merged => "merged",
             Self::Closed => "closed",
-        })
+        }
+    }
+}
+
+impl fmt::Display for PullState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -165,12 +172,84 @@ fn sync_pull_requests(
     }
 }
 
+/// The current head from fetched pull refs, or the forge list when no ref exists.
+fn current_pull_head<'a>(
+    heads: &'a BTreeMap<u64, String>,
+    pull_requests: &'a BTreeMap<BranchName, PullRequest>,
+    number: u64,
+) -> Option<&'a str> {
+    heads.get(&number).map(String::as_str).or_else(|| {
+        pull_requests
+            .values()
+            .find(|pull_request| pull_request.number == number)
+            .map(|pull_request| pull_request.head_ref_oid.as_str())
+    })
+}
+
+/// What to record about a pull request that moved, and nothing for one that did not.
+///
+/// `unchanged` is the absence of an event, and `new` is a first sighting rather
+/// than something that happened: recording either would fill a fork's history
+/// with one line per pull request per run.
+fn transition_text(number: u64, state: PullState, head: &str) -> Option<String> {
+    match state {
+        PullState::Merged => Some(format!("#{number} merged")),
+        PullState::Closed => Some(format!("#{number} closed")),
+        PullState::Advanced => Some(format!(
+            "#{number} advanced to {}",
+            head.chars().take(12).collect::<String>()
+        )),
+        PullState::Unchanged | PullState::New => None,
+    }
+}
+
+/// The classified state and observed head for one tracked pull request.
+#[derive(Clone, Copy)]
+struct PullTransition<'a> {
+    number: u64,
+    state: PullState,
+    head: &'a str,
+}
+
+/// Append an automatic event when the pull request's observed state changes.
+fn record_transition_event(
+    scribe: &Scribe,
+    store: &mut Store,
+    pull_requests: &BTreeMap<BranchName, PullRequest>,
+    transition: PullTransition<'_>,
+) -> Result<(), crate::ledger::LedgerError> {
+    let state = transition.state.as_str();
+    let settled = matches!(transition.state, PullState::Merged | PullState::Closed);
+    let state_changed = store.pull_state(scribe.repo(), transition.number) != Some(state);
+    // Forge state repeats for settled pulls, but every advanced classification
+    // names a new head and is therefore a distinct event.
+    if (!settled || state_changed)
+        && let Some(text) = transition_text(transition.number, transition.state, transition.head)
+    {
+        let subject = pull_requests
+            .iter()
+            .find(|(_, pull_request)| pull_request.number == transition.number)
+            .map(|(branch, _)| branch.to_string());
+        let pr = subject
+            .as_deref()
+            .map(|branch| BranchTarget::new(scribe.repo().to_owned(), BranchName::new(branch)));
+        scribe.event(
+            subject.as_deref(),
+            text,
+            pr.and_then(|target| store.tracked_pull(&target)),
+        )?;
+    }
+    store.record_pull_state(scribe.repo(), transition.number, state);
+    Ok(())
+}
+
 pub fn sync_repo(
-    name: &RepoName,
     entry: &RepoEntry,
     store: &mut Store,
     forge: Option<&dyn Forge>,
+    scribe: &Scribe,
 ) -> anyhow::Result<Report> {
+    let name = scribe.repo();
     let mut report = Report {
         repo: name.to_string(),
         ..Report::default()
@@ -202,16 +281,7 @@ pub fn sync_repo(
     let tracked = tracked_pull_requests(&pull_requests, &foreign, &seen);
 
     for (number, label) in tracked {
-        let current = heads
-            .get(&number)
-            .cloned()
-            .or_else(|| {
-                pull_requests
-                    .values()
-                    .find(|pr| pr.number == number)
-                    .map(|pr| pr.head_ref_oid.clone())
-            })
-            .unwrap_or_default();
+        let current = current_pull_head(&heads, &pull_requests, number).unwrap_or_default();
 
         // A tracked number absent from the pull request list is merged or closed, and
         // the list cannot say which. Resolve only those, so a run where
@@ -239,18 +309,22 @@ pub fn sync_repo(
             None => "OPEN".to_owned(),
         };
 
+        let transition = PullTransition {
+            number,
+            state: classify_pull(
+                seen.get(&number.to_string()).map(String::as_str),
+                current,
+                &state,
+            ),
+            head: current,
+        };
+        record_transition_event(scribe, store, &pull_requests, transition)?;
         report.rows.push(Row {
             number,
             label,
-            state: classify_pull(
-                seen.get(&number.to_string()).map(String::as_str),
-                &current,
-                &state,
-            ),
+            state: transition.state,
         });
-        if !current.is_empty() {
-            store.record_pull_head(name, number, &current);
-        }
+        store.record_pull_head(name, number, current);
 
         if state == "OPEN"
             && let Some(forge) = forge
@@ -372,6 +446,13 @@ mod tests {
     }
 
     #[test]
+    fn unchanged_and_new_pulls_have_no_transition_event() {
+        // A first sighting and no movement are not facts this run observed.
+        assert_eq!(transition_text(12, PullState::Unchanged, "head-12"), None);
+        assert_eq!(transition_text(13, PullState::New, "head-13"), None);
+    }
+
+    #[test]
     fn a_report_with_a_problem_does_not_exit_zero() {
         let blocked = Report {
             problems: vec!["forge unavailable".to_owned()],
@@ -486,6 +567,7 @@ mod tracking_tests {
 mod comment_activity_tests {
     use super::*;
     use crate::forge::{ChecksSummary, Forge, ForgeError};
+    use crate::ids::RepoName;
     use crate::store::Store;
     use std::cell::RefCell;
     use std::path::Path;
@@ -641,6 +723,17 @@ mod comment_activity_tests {
         }
     }
 
+    /// A scribe writing into the fixture's own directory. Every test that calls
+    /// `sync_repo` needs one, and none of them may reach the real config home.
+    fn test_scribe(temp: &TempDir, name: &RepoName) -> crate::ledger::Scribe {
+        crate::ledger::Scribe::new(
+            crate::ledger::Ledger::at(temp.path().join("ledger")),
+            name.clone(),
+            temp.path().to_owned(),
+            "a-test".to_owned(),
+        )
+    }
+
     #[test]
     fn pull_request_list_failure_is_incomplete_not_informational() {
         let _lock = crate::config::test_support::environment_lock();
@@ -649,10 +742,10 @@ mod comment_activity_tests {
         let mut store = Store::open_for_update(temp.path().join("state.json")).unwrap();
 
         let report = sync_repo(
-            &RepoName::new("test-repo"),
             &entry,
             &mut store,
             Some(&PullListUnavailable),
+            &test_scribe(&temp, &RepoName::new("test-repo")),
         )
         .unwrap();
 
@@ -682,10 +775,10 @@ mod comment_activity_tests {
         };
 
         let report = sync_repo(
-            &RepoName::new("test-repo"),
             &entry,
             &mut store,
             Some(&forge),
+            &test_scribe(&temp, &RepoName::new("test-repo")),
         )
         .unwrap();
 
@@ -707,7 +800,13 @@ mod comment_activity_tests {
         let entry = local_entry(&temp);
         let mut store = Store::open_for_update(temp.path().join("state.json")).unwrap();
 
-        let report = sync_repo(&RepoName::new("test-repo"), &entry, &mut store, None).unwrap();
+        let report = sync_repo(
+            &entry,
+            &mut store,
+            None,
+            &test_scribe(&temp, &RepoName::new("test-repo")),
+        )
+        .unwrap();
 
         assert!(
             report
@@ -726,6 +825,7 @@ mod comment_activity_tests {
         let store_path = temp.path().join("state.json");
         let repo_name = RepoName::new("test-repo");
         let entry = local_entry(&temp);
+        let scribe = test_scribe(&temp, &repo_name);
 
         // First sync: PR #42 with comment activity
         let (branch, pull_request) = pr(42, "feat/alpha");
@@ -738,7 +838,7 @@ mod comment_activity_tests {
 
         let mut store = Store::open_for_update(store_path.clone()).unwrap();
         store.record_comment_mark(&repo_name, 42, "2026-07-29T10:00:00Z");
-        let report1 = sync_repo(&repo_name, &entry, &mut store, Some(&forge_first)).unwrap();
+        let report1 = sync_repo(&entry, &mut store, Some(&forge_first), &scribe).unwrap();
         store.save().unwrap();
 
         // Verify: comment activity note appears with exact message
@@ -766,7 +866,7 @@ mod comment_activity_tests {
         };
 
         let mut store = Store::open(store_path).unwrap();
-        let report2 = sync_repo(&repo_name, &entry, &mut store, Some(&forge_second)).unwrap();
+        let report2 = sync_repo(&entry, &mut store, Some(&forge_second), &scribe).unwrap();
 
         // Verify: no comment activity note on second run (mark unchanged)
         assert!(
@@ -797,7 +897,13 @@ mod comment_activity_tests {
         };
 
         let mut store = Store::open_for_update(store_path).unwrap();
-        let report = sync_repo(&repo_name, &entry, &mut store, Some(&forge)).unwrap();
+        let report = sync_repo(
+            &entry,
+            &mut store,
+            Some(&forge),
+            &test_scribe(&temp, &repo_name),
+        )
+        .unwrap();
 
         // Verify: error went to problems, not notes
         assert!(
@@ -833,7 +939,13 @@ mod comment_activity_tests {
         let mut store = Store::open_for_update(store_path).unwrap();
 
         // When: the first sync observes the historical comment
-        let report = sync_repo(&repo_name, &entry, &mut store, Some(&forge)).unwrap();
+        let report = sync_repo(
+            &entry,
+            &mut store,
+            Some(&forge),
+            &test_scribe(&temp, &repo_name),
+        )
+        .unwrap();
 
         // Then: its timestamp is remembered without announcing old activity
         assert_eq!(
@@ -867,7 +979,13 @@ mod comment_activity_tests {
         let mut store = Store::open_for_update(store_path).unwrap();
 
         // When: sync classifies the settled pull request
-        let report = sync_repo(&repo_name, &entry, &mut store, Some(&forge)).unwrap();
+        let report = sync_repo(
+            &entry,
+            &mut store,
+            Some(&forge),
+            &test_scribe(&temp, &repo_name),
+        )
+        .unwrap();
 
         // Then: the settled pull request is reported but never queried for comments
         assert_eq!(

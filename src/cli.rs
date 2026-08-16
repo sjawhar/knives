@@ -227,6 +227,32 @@ pub enum Command {
         #[arg(long)]
         repo: Option<String>,
     },
+    /// Read what agents did and decided here, or add to it.
+    ///
+    /// One command, two moods: bare it reads, `-m` writes. Reading is
+    /// intentional — nothing injects notches into a session — so the bare form
+    /// answers the question an agent actually has, which is what happened here
+    /// lately. A subject is a ref name: a branch, or a release, which is a
+    /// subject like any other.
+    Notch {
+        /// The branch or release ref this is about. Omit it to read the whole
+        /// repository, or to write an entry about the repository itself.
+        subject: Option<String>,
+        /// Record this text as a note. Without it, `notch` reads.
+        #[arg(short = 'm', long = "message")]
+        message: Option<String>,
+        /// A commit id, `file:line`, `<repo>#<number>` or URL backing the note.
+        /// Repeatable, and it may name another repo.
+        #[arg(long, requires = "message")]
+        evidence: Vec<String>,
+        /// Read only entries stamped with this pull request number, or stamp a
+        /// written entry with it.
+        #[arg(long = "pr")]
+        pr: Option<u64>,
+        /// Registry name. Defaults to the repo you are standing in.
+        #[arg(long)]
+        repo: Option<String>,
+    },
     /// Plan, curate and cut releases.
     ///
     /// With no subcommand, plans: what a cut would contain, whether every parent is
@@ -430,6 +456,11 @@ mod tests {
             vec!["knives", "release", "advance", "feat/x"],
             vec!["knives", "depends", "a-branch", "--on", "other#1"],
             vec!["knives", "track", "a-branch", "--pr", "7"],
+            vec!["knives", "notch"],
+            vec!["knives", "notch", "feat/alpha"],
+            vec!["knives", "notch", "feat/alpha", "-m", "superseded"],
+            vec!["knives", "notch", "--pr", "1157"],
+            vec!["knives", "notch", "release/2026-08-15", "--repo", "a-repo"],
             vec!["knives", "gh", "--", "pr", "list"],
         ];
         // When / Then: each parses
@@ -444,6 +475,21 @@ mod tests {
     #[test]
     fn sync_can_skip_forge_lookups() {
         assert!(Cli::try_parse_from(["knives", "sync", "--no-github"]).is_ok());
+    }
+
+    #[test]
+    fn notch_allows_a_write_stamp_and_requires_a_message_for_evidence() {
+        assert!(
+            Cli::try_parse_from(["knives", "notch", "feat/a", "-m", "x", "--pr", "7"]).is_ok(),
+            "a write with an explicit pull-request stamp did not parse"
+        );
+        assert!(
+            Cli::try_parse_from(["knives", "notch", "feat/a", "--evidence", "06d778b9"]).is_err(),
+            "evidence with nothing to attach it to parsed"
+        );
+        // And: a repo-level note needs no subject, so the model's absent subject
+        // is reachable.
+        assert!(Cli::try_parse_from(["knives", "notch", "-m", "the fork needs a cut"]).is_ok());
     }
 
     #[test]

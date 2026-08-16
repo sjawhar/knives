@@ -79,6 +79,10 @@ pub struct State {
     pub tracked_pulls: BTreeMap<String, u64>,
     #[serde(default)]
     pub comment_marks: BTreeMap<String, String>,
+    /// The latest pull-request state sync observed. Keyed by `<repo>#<number>`
+    /// so automatic events remain edges instead of repeating settled conditions.
+    #[serde(default)]
+    pub pull_states: BTreeMap<String, String>,
     /// Keys this version does not know, kept verbatim through a round trip.
     ///
     /// Release membership is the release commit's own parent set, edited by
@@ -131,6 +135,8 @@ pub(crate) struct StoreLock {
 }
 
 impl StoreLock {
+    /// Beside the file it guards, named for that file's stem: `state.json` is
+    /// guarded by `state.lock`.
     pub(crate) fn acquire(target: &Path) -> Result<Self, StoreError> {
         let path = target.with_extension("lock");
         if let Some(parent) = path.parent() {
@@ -401,6 +407,20 @@ impl Store {
             .insert(number.to_string(), sha.to_owned());
     }
 
+    pub fn record_pull_state(&mut self, repo: &RepoName, number: u64, state: &str) {
+        let _ = self
+            .state
+            .pull_states
+            .insert(format!("{repo}#{number}"), state.to_owned());
+    }
+
+    pub fn pull_state(&self, repo: &RepoName, number: u64) -> Option<&str> {
+        self.state
+            .pull_states
+            .get(&format!("{repo}#{number}"))
+            .map(String::as_str)
+    }
+
     pub fn record_comment_mark(&mut self, repo: &RepoName, number: u64, at: &str) {
         let _ = self
             .state
@@ -606,6 +626,20 @@ mod tests {
             Some("2026-07-30T00:00:00Z")
         );
         assert_eq!(store.comment_mark(&RepoName::new("hawk"), 7), None);
+    }
+
+    #[test]
+    fn pull_states_round_trip_and_are_scoped_to_their_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        {
+            let mut subject = Store::open_for_update(path.clone()).unwrap();
+            subject.record_pull_state(&RepoName::new("ai"), 7, "merged");
+            subject.save().unwrap();
+        }
+        let subject = Store::open(path).unwrap();
+        assert_eq!(subject.pull_state(&RepoName::new("ai"), 7), Some("merged"));
+        assert_eq!(subject.pull_state(&RepoName::new("hawk"), 7), None);
     }
 }
 

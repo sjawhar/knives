@@ -1584,7 +1584,7 @@ Add to the `tests` module in `src/store.rs`:
             store.comment_mark(&RepoName::new("ai"), 7),
             Some("2026-07-30T00:00:00Z")
         );
-        assert_eq!(store.comment_mark(&RepoName::new("hawk"), 7), None);
+        assert_eq!(store.comment_mark(&RepoName::new("fork A"), 7), None);
     }
 ```
 

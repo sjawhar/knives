@@ -5,7 +5,7 @@
 //! decided. Planning is the default because everything else here writes: a cut
 //! names a composition, and `include`, `drop`, `advance` and `rebase` change
 //! one. Every one of them writes locally only, and none of them pushes.
-// allow: SIZE_OK: 1586 lines - the release lifecycle's plan, cut, edit, audit, reap, and rebase operations are one domain seam.
+// allow: SIZE_OK: 1622 lines - the release lifecycle's plan, cut, edit, audit, reap, and rebase operations are one domain seam.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -1311,6 +1311,42 @@ pub fn audit_cut(
 pub fn cut(repo: &Path, request: &Cut, scheme: &ReleaseScheme) -> anyhow::Result<CommitId> {
     let candidate = candidate_cut(repo, request, None)?;
     publish_cut(candidate, &request.name, scheme)
+}
+
+/// The two merge-parent sets a cut event compares.
+#[derive(Debug)]
+pub struct ParentDelta<'a> {
+    pub previous: &'a [(String, CommitId)],
+    pub current: &'a [CommitId],
+    pub trunk_source: &'a str,
+    pub trunk_parent: Option<&'a CommitId>,
+}
+
+/// Previous non-trunk parents no new cut parent carries, directly or by ancestry.
+pub fn unaccounted_previous_members(
+    repo: &Repo,
+    delta: &ParentDelta<'_>,
+) -> anyhow::Result<Vec<String>> {
+    let mut dropped = Vec::new();
+    for (source, parent) in delta.previous {
+        if source == delta.trunk_source {
+            continue;
+        }
+        let mut accounted_for = false;
+        for newer in delta.current {
+            if parent == newer || repo.is_ancestor(parent, newer)? {
+                accounted_for = true;
+                break;
+            }
+        }
+        if !accounted_for && let Some(trunk) = delta.trunk_parent {
+            accounted_for = parent == trunk || repo.is_ancestor(parent, trunk)?;
+        }
+        if !accounted_for {
+            dropped.push(format!("{source}@{}", short(parent)));
+        }
+    }
+    Ok(dropped)
 }
 
 #[cfg(test)]

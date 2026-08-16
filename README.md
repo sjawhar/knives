@@ -51,7 +51,7 @@ yours.
 
 ## What it checks
 
-Per branch: local tip, push status, pull request and state, review decision, CI check status, landed verdict against upstream trunk, and flags.
+Per branch: local tip, push status, pull request and state, review decision, CI check status, landed verdict against upstream trunk, flags, and the newest ledger entry.
 
 Across branches: divergent bookmarks, release parents that are no longer their branch tip, two
 workspaces holding the same change, two branches changing the same file, commits carried into
@@ -59,6 +59,34 @@ somebody else's branch, and cross-fork dependencies that have not merged yet.
 
 `knives sync` fetches every remote and classifies each tracked pull request as new, unchanged,
 advanced, merged, or closed, and reports comment activity since the last run.
+
+## What it remembers
+
+Everything above is computed on demand and nothing is cached. One thing cannot be computed:
+why. `knives finish` deletes the claim that said why a branch exists, and after that the
+only honest answer to "what is this branch" is archaeology.
+
+So each repository has a ledger directory at `~/.config/knives/ledger/<repo>/`, beside the
+state file. Each entry is an immutable Markdown file with TOML frontmatter between `+++`
+fences and a prose body. A write is one atomic `create_new`; entries are never rewritten or
+deleted, and there is no lockfile. Every command that witnesses something
+writes to the ledger as part of doing it: claims taken and handed back, pull requests
+stated, dependencies recorded, the full parent set of every release cut, and each tracked
+pull request that merged, closed or advanced. Agents add their own judgments by hand:
+
+```
+knives notch feat/log-queue -m "superseded by #1157; upstream wanted the trait approach" \
+  --evidence 06d778b9
+knives notch feat/log-queue
+```
+
+Every entry records the subject's tip at the time it was written, which is what keeps the
+record from rotting: a conclusion recorded against a commit the branch has since moved
+past is a reason to re-check rather than something to inherit. The ledger holds what
+happened and what was decided. It never holds anything a detector can recompute.
+
+`knives status` carries each branch's newest entry on its row, so the question "what is
+this weird branch" is usually answered before you ask it.
 
 ## Install
 
@@ -142,6 +170,7 @@ are somewhere else.
 | `knives start` / `finish` | take a branch and get your own workspace, then hand it back |
 | `knives track` | state which pull request a branch belongs to, when inference cannot find it |
 | `knives depends` | record that a branch cannot land before another repo's pull request |
+| `knives notch` | what agents did and decided here, and add to it |
 | `knives release` | plan a release, edit its membership, cut one, or reap superseded cuts |
 | `knives init` | register a checkout |
 | `knives hook` | harness plumbing, not for humans |

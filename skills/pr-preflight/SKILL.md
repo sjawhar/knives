@@ -69,7 +69,23 @@ Walk each check sequentially. Each check specifies what facts to verify, what ev
 - **If Failed**:
   - *Incorrect Routing*: Refactor and relocate the changes to the permitted package, directory, or extension location defined by upstream policy.
 
-## Step 3: Execution
+## Step 3: Record What You Promised
+
+A pull request review is a conversation with a person who will not be here next session,
+and a promise made in a review thread is invisible to the next agent. Before opening the
+pull request, and again after every review round that leaves you owing something, record
+it:
+
+```bash
+knives notch <branch> -m "promised the maintainer we would split the config change out" \
+  --evidence <repo>#<number>
+```
+
+Promises belong in notches, not in a session that ends. `knives notch <branch>` before you
+answer a review is how you find out what you already owe. Which review threads are still
+unanswered is a different question, derived from the forge, and not this.
+
+## Step 4: Execution
 
 When all six checks pass with verified evidence, proceed with opening the pull request:
 

@@ -839,10 +839,10 @@ fn trust_rules_parse_expand_and_survive_a_save() {
     let environment = EnvironmentGuard::capture(&["HOME"]);
     environment.set("HOME", "/home/someone");
     let dir = tempfile::tempdir().unwrap();
-    let text = "[trust]\nroots = [\"~/agent-c\"]\nowners = [\"some-owner\", \"some-org\"]\n";
+    let text = "[trust]\nroots = [\"~/session-workspace\"]\nowners = [\"some-owner\", \"some-org\"]\n";
     let path = write(dir.path(), text);
     let registry = load(&path).unwrap();
-    assert_eq!(registry.trust.roots, vec![PathBuf::from("/home/someone/agent-c")]);
+    assert_eq!(registry.trust.roots, vec![PathBuf::from("/home/someone/session-workspace")]);
     assert_eq!(registry.trust.owners, vec!["some-owner".to_owned(), "some-org".to_owned()]);
     // `init` rewrites the whole file; a section serde does not know about
     // would be silently deleted the next time it runs.
@@ -887,11 +887,11 @@ fn match_with_trust(
 fn a_repo_under_a_trust_root_is_a_trusted_guidance_root() {
     // Given: a workspace-shaped checkout under a trusted subtree, never registered
     let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().join("agent-c/platform/default");
+    let root = dir.path().join("session-workspace/platform/default");
     std::fs::create_dir_all(root.join(".jj")).unwrap();
     std::fs::write(root.join("AGENTS.md"), "rules\n").unwrap();
     let trust = crate::config::TrustRules {
-        roots: vec![dir.path().join("agent-c")],
+        roots: vec![dir.path().join("session-workspace")],
         owners: vec![],
     };
     // When: a file inside it is resolved with no owner probe available
@@ -922,13 +922,13 @@ fn a_repo_matching_a_trusted_owner_is_found_through_the_probe() {
 
 #[test]
 fn a_sibling_of_a_trust_root_sharing_its_name_prefix_is_outside() {
-    // agent-c-2 shares the string prefix; component containment must reject it,
+    // session-workspace-2 shares the string prefix; component containment must reject it,
     // the same trap managed_repo_for and the plugin's isInside avoid.
     let dir = tempfile::tempdir().unwrap();
-    let inside = dir.path().join("agent-c-2/repo");
+    let inside = dir.path().join("session-workspace-2/repo");
     std::fs::create_dir_all(inside.join(".jj")).unwrap();
     let trust = crate::config::TrustRules {
-        roots: vec![dir.path().join("agent-c")],
+        roots: vec![dir.path().join("session-workspace")],
         owners: vec![],
     };
     let mut probe = |_: &std::path::Path| None;
@@ -949,10 +949,10 @@ And in `src/hook/state.rs`: a round-trip test that `owner_verdicts` persists and
 
 ```bash
 cargo build
-printf '%s' '{"event":"tool.execute.after","session_id":"manual-test","tool":"read","args":{"filePath":"'"$HOME"'/agent-c/platform/default/AGENTS.md"},"parts":{"notice":true,"guidance":true}}' \
+printf '%s' '{"event":"tool.execute.after","session_id":"manual-test","tool":"read","args":{"filePath":"'"$HOME"'/session-workspace/platform/default/AGENTS.md"},"parts":{"notice":true,"guidance":true}}' \
   | KNIVES_CONFIG_HOME=/tmp/knives-manual ./target/debug/knives hook opencode
 ```
-with `/tmp/knives-manual/repos.toml` containing `[trust]\nroots = ["~/agent-c"]`. Expected: JSON whose `addition` contains the AGENTS.md body wrapped in a `knives-guidance` envelope. Then repeat with an empty `repos.toml` — expected `{"addition":""}`.
+with `/tmp/knives-manual/repos.toml` containing `[trust]\nroots = ["~/session-workspace"]`. Expected: JSON whose `addition` contains the AGENTS.md body wrapped in a `knives-guidance` envelope. Then repeat with an empty `repos.toml` — expected `{"addition":""}`.
 
 ---
 

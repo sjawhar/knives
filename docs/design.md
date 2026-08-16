@@ -73,6 +73,18 @@ Store only what no amount of computing can recover:
 - why we carry a foreign PR as a release parent
 - supersession pointers, when one of our PRs closes in favour of another
 - **fork-only marks**: a branch we deliberately keep with no upstream PR. This should be the minority, but it is real, and it covers CI we want on our fork but not upstream. Without a mark, every such branch reads as an error in `knives status` forever.
+- **what happened, and what was decided**: an append-only ledger per repo, beside the state
+  file. Everything above is current intent, rewritten whole on each change; `knives finish`
+  deletes the one "why" the tool records. The ledger is the past tense: events this tool
+  observed in its own commands, and judgments an agent asserted, each anchored to the
+  subject's tip at write time.
+
+The ledger's rule is past tense only. Stored dispositions rot and recorded judgments do
+not: a census that inferred "not a release parent, therefore unhomed" produced 54 findings
+of which 5 were false, and a parity audit's finding was true at its recorded commit and
+stale two hours later after an in-place repair. An entry says what happened, at which
+commit, according to whom, and never what is currently the case. Anything currently the
+case is a detector's job, and the detectors are cheap.
 
 ## Detection rules
 
@@ -139,11 +151,13 @@ knives sync [REPO|--all]       fetch all remotes and tracked pull/N/head refs; c
                                tracked PR as new | unchanged | advanced | merged | closed
 knives preflight [REPO]        programmatic pre-contribution facts (see below)
 knives status [REPO|--all]     aligned table per branch (branch, tip, push, pr, review, checks,
-                               landed, flags); claims, active workspaces, and detectors
+                               landed, flags, notch); claims, active workspaces, and detectors
 knives start BRANCH            claim, create the workspace, base it on the release's shared base (falling back to fetched trunk)
 knives finish BRANCH           hand back claim and remove workspace
 knives track BRANCH --pr N     state which PR a branch belongs to, overriding inference
 knives depends BRANCH --on R#N  record that a branch cannot land before something else
+knives notch [SUBJECT]         read what happened here (bare: newest 20; a subject: its whole
+                               chronology); -m writes a note, --evidence backs it
 knives release [NAME]          plan, cut, edit or reap a release under the configured scheme
 knives release cut [NAME]      name a new cut of the composition in hand, verbatim (first cut: every branch); refuses to orphan commits ([--allow-drop] overrides); never pushes
 knives release reap            reap superseded dated release bookmarks everywhere locally and abandon their commits; all kept while the live cut carries conflicts
@@ -155,7 +169,13 @@ knives release rebase [REF]    jj rebase -b <release> -d REF (bare: the first tr
 
 `--json` on any command, and it is the default when the environment says an agent is running it. Agents were grepping human output to count findings by detector.
 
-`knives repos` and `knives status` are deliberately separate: one answers "what am I maintaining", the other "what is the current state and what is being worked on right now". Conflating them was an earlier mistake in this design. `knives status` outputs an aligned table for branch rows (`branch`, `tip`, `push`, `pr`, `review`, `checks`, `landed`, `flags`) with empty cells as `-`. On-screen status display tokens use `failing` for failing checks and `none-ran` when no checks run.
+`knives notch` is the one command with two moods, split by `-m`: bare it reads, `-m` writes.
+Reading is intentional and nothing injects notches into a session, so the bare form has to
+answer the question an agent actually has rather than making them name a subject they do
+not know yet. The `status` breadcrumb — each branch's newest entry, one token on its line —
+is the other half of that: the record is no use if reading it requires knowing it exists.
+
+`knives repos` and `knives status` are deliberately separate: one answers "what am I maintaining", the other "what is the current state and what is being worked on right now". Conflating them was an earlier mistake in this design. `knives status` outputs an aligned table for branch rows (`branch`, `tip`, `push`, `pr`, `review`, `checks`, `landed`, `flags`, `notch`) with empty cells as `-`. On-screen status display tokens use `failing` for failing checks and `none-ran` when no checks run.
 
 `knives register [DIR]` prints a paste-ready `[repos.<name>]` TOML snippet to stdout and diagnostic notes to stderr without writing to disk, because registration is a trust grant. An existing entry of the same name must be replaced rather than appended.
 

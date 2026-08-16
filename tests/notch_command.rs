@@ -1,0 +1,389 @@
+#![allow(
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic,
+    reason = "a fixture or assertion that cannot proceed IS the test failure"
+)]
+
+//! The command through the real binary: both output modes, `--repo` from
+//! outside the repository, and the exit codes the house rules fix.
+
+use std::path::Path;
+use std::process::{Command, Output};
+
+/// A config home with one managed repo whose checkout is `path`.
+fn home(path: &Path) -> tempfile::TempDir {
+    let home = tempfile::tempdir().expect("create config home");
+    std::fs::write(
+        home.path().join("repos.toml"),
+        format!(
+            "[repos.a-repo]\npath = \"{}\"\nupstream = \"https://forge.invalid/org/work.git\"\norigin = \"https://forge.invalid/ours/work.git\"\n",
+            path.display()
+        ),
+    )
+    .expect("write registry");
+    home
+}
+
+fn knives(home: &tempfile::TempDir, cwd: &Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_knives"))
+        .args(args)
+        .current_dir(cwd)
+        .env("KNIVES_CONFIG_HOME", home.path())
+        .env("KNIVES_OWNER", "ses_fff688")
+        .output()
+        .expect("run knives")
+}
+
+fn stdout(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+#[test]
+fn a_note_written_from_outside_the_repo_is_read_back_in_both_modes() {
+    // Given: a config home naming one repo, and a cwd that is not it — the case
+    // the --repo flag exists for: you learn something about the library fork
+    // while standing in the consumer fork.
+    let checkout = tempfile::tempdir().expect("checkout");
+    let home = home(checkout.path());
+    let elsewhere = tempfile::tempdir().expect("somewhere else");
+
+    // When: a note is written for that repo by name
+    let wrote = knives(
+        &home,
+        elsewhere.path(),
+        &[
+            "--text",
+            "notch",
+            "feat/log-queue",
+            "-m",
+            "superseded by #1157; upstream wanted the trait approach",
+            "--evidence",
+            "06d778b9",
+            "--repo",
+            "a-repo",
+        ],
+    );
+
+    // Then: it succeeded and said what it recorded
+    assert_eq!(
+        wrote.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&wrote.stderr)
+    );
+    assert_eq!(
+        stdout(&wrote).trim(),
+        "notched feat/log-queue",
+        "was: {}",
+        stdout(&wrote)
+    );
+
+    // And: the prose read shows the entry, its kind and its evidence
+    let text = knives(
+        &home,
+        elsewhere.path(),
+        &["--text", "notch", "--repo", "a-repo"],
+    );
+    let shown = stdout(&text);
+    assert!(shown.contains("note"), "was: {shown}");
+    assert!(shown.contains("superseded by #1157"), "was: {shown}");
+    assert!(shown.contains("06d778b9"), "was: {shown}");
+
+    // And: the JSON read carries the same facts as fields
+    let json = knives(
+        &home,
+        elsewhere.path(),
+        &["--json", "notch", "--repo", "a-repo"],
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&json.stdout).expect("notch --json emits JSON");
+    assert_eq!(parsed["repo"], "a-repo");
+    assert_eq!(parsed["matched"], 1);
+    assert_eq!(parsed["entries"][0]["kind"], "note");
+    assert_eq!(parsed["entries"][0]["owner"], "ses_fff688");
+    assert_eq!(parsed["entries"][0]["subject"], "feat/log-queue");
+    assert_eq!(parsed["entries"][0]["evidence"][0], "06d778b9");
+    // The checkout is a temporary directory, not a repository, so the subject's
+    // tip does not resolve and the entry says so by omission.
+    assert!(parsed["entries"][0].get("anchor").is_none());
+}
+
+#[test]
+fn a_json_write_emits_only_the_entry_it_wrote() {
+    let checkout = tempfile::tempdir().expect("checkout");
+    let home = home(checkout.path());
+    let elsewhere = tempfile::tempdir().expect("somewhere else");
+
+    let wrote = knives(
+        &home,
+        elsewhere.path(),
+        &[
+            "--json",
+            "notch",
+            "feat/alpha",
+            "-m",
+            "recorded a decision",
+            "--repo",
+            "a-repo",
+        ],
+    );
+
+    assert_eq!(wrote.status.code(), Some(0));
+    let parsed: serde_json::Value = serde_json::from_slice(&wrote.stdout).expect("JSON");
+    assert_eq!(
+        parsed.as_object().expect("object").len(),
+        1,
+        "was: {parsed}"
+    );
+    assert_eq!(parsed["wrote"]["text"], "recorded a decision");
+    assert!(parsed.get("repo").is_none(), "was: {parsed}");
+    assert!(parsed.get("entries").is_none(), "was: {parsed}");
+    assert!(parsed.get("matched").is_none(), "was: {parsed}");
+}
+
+#[test]
+fn a_write_pr_stamps_the_entry_and_a_pr_read_finds_it() {
+    let checkout = tempfile::tempdir().expect("checkout");
+    let home = home(checkout.path());
+    let elsewhere = tempfile::tempdir().expect("somewhere else");
+
+    let wrote = knives(
+        &home,
+        elsewhere.path(),
+        &[
+            "--json",
+            "notch",
+            "feat/alpha",
+            "-m",
+            "stated for this pull request",
+            "--pr",
+            "4891",
+            "--repo",
+            "a-repo",
+        ],
+    );
+    assert_eq!(wrote.status.code(), Some(0));
+    let written: serde_json::Value = serde_json::from_slice(&wrote.stdout).expect("JSON");
+    assert_eq!(written["wrote"]["pr"], 4891);
+
+    let read = knives(
+        &home,
+        elsewhere.path(),
+        &["--json", "notch", "--pr", "4891", "--repo", "a-repo"],
+    );
+    assert_eq!(read.status.code(), Some(0));
+    let entries: serde_json::Value = serde_json::from_slice(&read.stdout).expect("JSON");
+    assert_eq!(entries["matched"], 1);
+    assert_eq!(entries["entries"][0]["pr"], 4891);
+}
+
+#[test]
+fn a_write_without_pr_uses_the_tracked_pull_stamp() {
+    let checkout = tempfile::tempdir().expect("checkout");
+    let home = home(checkout.path());
+    std::fs::write(
+        home.path().join("state.json"),
+        r#"{"tracked_pulls":{"a-repo/feat/alpha":1157}}"#,
+    )
+    .expect("seed tracked pull");
+
+    let wrote = knives(
+        &home,
+        checkout.path(),
+        &[
+            "--json",
+            "notch",
+            "feat/alpha",
+            "-m",
+            "uses tracked pull",
+            "--repo",
+            "a-repo",
+        ],
+    );
+    assert_eq!(wrote.status.code(), Some(0));
+    let written: serde_json::Value = serde_json::from_slice(&wrote.stdout).expect("JSON");
+    assert_eq!(written["wrote"]["pr"], 1157);
+}
+
+#[test]
+fn a_subject_read_shows_that_refs_chronology_and_a_bare_read_windows_the_repo() {
+    let checkout = tempfile::tempdir().expect("checkout");
+    let home = home(checkout.path());
+    std::fs::write(
+        home.path().join("state.json"),
+        r#"{"tracked_pulls":{"a-repo/feat/alpha":1157}}"#,
+    )
+    .expect("seed tracked pull");
+
+    for index in 0..42 {
+        let text = format!("entry {index}");
+        let subject = if index % 2 == 0 {
+            "feat/alpha"
+        } else {
+            "feat/beta"
+        };
+        let wrote = knives(
+            &home,
+            checkout.path(),
+            &["--text", "notch", subject, "-m", &text, "--repo", "a-repo"],
+        );
+        assert_eq!(wrote.status.code(), Some(0));
+    }
+
+    // A bare read windows to the newest 20 and says how many it did not show.
+    let bare = knives(
+        &home,
+        checkout.path(),
+        &["--json", "notch", "--repo", "a-repo"],
+    );
+    let parsed: serde_json::Value = serde_json::from_slice(&bare.stdout).expect("JSON");
+    assert_eq!(parsed["matched"], 42);
+    assert_eq!(parsed["entries"].as_array().expect("array").len(), 20);
+    assert_eq!(parsed["entries"][0]["text"], "entry 22");
+
+    // A subject read is not windowed: it is that ref's whole chronology.
+    let subject = knives(
+        &home,
+        checkout.path(),
+        &["--json", "notch", "feat/alpha", "--repo", "a-repo"],
+    );
+    let parsed: serde_json::Value = serde_json::from_slice(&subject.stdout).expect("JSON");
+    assert_eq!(parsed["matched"], 21);
+    assert_eq!(parsed["entries"].as_array().expect("array").len(), 21);
+
+    // A pull-request read is not windowed either: it is that pull request's
+    // whole chronology.
+    let pull_request = knives(
+        &home,
+        checkout.path(),
+        &["--json", "notch", "--pr", "1157", "--repo", "a-repo"],
+    );
+    let parsed: serde_json::Value = serde_json::from_slice(&pull_request.stdout).expect("JSON");
+    assert_eq!(parsed["matched"], 21);
+    assert_eq!(parsed["entries"].as_array().expect("array").len(), 21);
+}
+
+#[test]
+fn an_unreadable_ledger_is_incomplete_and_an_unknown_repo_is_usage() {
+    let checkout = tempfile::tempdir().expect("checkout");
+    let home = home(checkout.path());
+
+    // Given: a ledger directory holding a file that is not an entry
+    let ledger = home.path().join("ledger").join("a-repo");
+    std::fs::create_dir_all(&ledger).expect("ledger directory");
+    std::fs::write(
+        ledger.join("20260815T221403.000000000Z-0000.md"),
+        "not a ledger entry at all\n",
+    )
+    .expect("corrupt entry");
+
+    // When / Then: reading it cannot answer, and says so with exit 3
+    let broken = knives(
+        &home,
+        checkout.path(),
+        &["--text", "notch", "--repo", "a-repo"],
+    );
+    assert_eq!(broken.status.code(), Some(3));
+    assert!(
+        String::from_utf8_lossy(&broken.stderr).contains("0000.md"),
+        "the error must name the entry file; was: {}",
+        String::from_utf8_lossy(&broken.stderr)
+    );
+
+    // And: a repo nobody manages is a usage error, naming the ones we do
+    let unknown = knives(
+        &home,
+        checkout.path(),
+        &["--text", "notch", "--repo", "nope"],
+    );
+    assert_eq!(unknown.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&unknown.stderr).contains("a-repo"),
+        "was: {}",
+        String::from_utf8_lossy(&unknown.stderr)
+    );
+}
+
+#[test]
+fn a_read_of_a_repo_with_no_ledger_yet_is_success_and_says_so() {
+    let checkout = tempfile::tempdir().expect("checkout");
+    let home = home(checkout.path());
+    let empty = knives(
+        &home,
+        checkout.path(),
+        &["--text", "notch", "--repo", "a-repo"],
+    );
+    assert_eq!(empty.status.code(), Some(0));
+    assert!(
+        stdout(&empty).contains("no notches"),
+        "was: {}",
+        stdout(&empty)
+    );
+}
+
+#[test]
+fn an_empty_subject_is_usage_and_does_not_write_a_nameless_entry() {
+    let checkout = tempfile::tempdir().expect("checkout");
+    let home = home(checkout.path());
+
+    let empty_read = knives(
+        &home,
+        checkout.path(),
+        &["--text", "notch", "", "--repo", "a-repo"],
+    );
+    assert_eq!(empty_read.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&empty_read.stderr).contains("subject"),
+        "was: {}",
+        String::from_utf8_lossy(&empty_read.stderr)
+    );
+
+    let empty_write = knives(
+        &home,
+        checkout.path(),
+        &[
+            "--text",
+            "notch",
+            "",
+            "-m",
+            "must name a branch",
+            "--repo",
+            "a-repo",
+        ],
+    );
+    assert_eq!(empty_write.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&empty_write.stderr).contains("subject"),
+        "was: {}",
+        String::from_utf8_lossy(&empty_write.stderr)
+    );
+
+    let whitespace_write = knives(
+        &home,
+        checkout.path(),
+        &[
+            "--text",
+            "notch",
+            " ",
+            "-m",
+            "must name a branch",
+            "--repo",
+            "a-repo",
+        ],
+    );
+    assert_eq!(whitespace_write.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&whitespace_write.stderr).contains("subject"),
+        "was: {}",
+        String::from_utf8_lossy(&whitespace_write.stderr)
+    );
+
+    let ledger = knives(
+        &home,
+        checkout.path(),
+        &["--json", "notch", "--repo", "a-repo"],
+    );
+    let parsed: serde_json::Value = serde_json::from_slice(&ledger.stdout).expect("JSON");
+    assert_eq!(parsed["matched"], 0);
+}

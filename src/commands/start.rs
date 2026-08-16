@@ -8,6 +8,7 @@ use crate::commands::release::{newest_release, shared_base};
 use crate::config::{default_config_path, load};
 use crate::ids::{BranchName, BranchTarget, RepoName};
 use crate::jj::{Repo, add_workspace, fetch_all};
+use crate::ledger::{Ledger, Scribe};
 use crate::store::{Store, default_state_path};
 
 /// Where a new workspace goes: a sibling of the repo, named for the branch.
@@ -76,12 +77,17 @@ pub fn run(repo_name: &RepoName, branch: &BranchName, why: Option<&str>) -> anyh
     )?;
 
     let reason = why.unwrap_or("started work");
-    let _ = store.claim(
-        &BranchTarget::new(repo_name.clone(), branch.clone()),
-        &owner,
-        reason,
-    );
+    let target = BranchTarget::new(repo_name.clone(), branch.clone());
+    let _ = store.claim(&target, &owner, reason);
+    let pr = store.tracked_pull(&target);
     store.save()?;
+    Scribe::new(
+        Ledger::for_repo(repo_name),
+        repo_name.clone(),
+        entry.path.clone(),
+        owner.clone(),
+    )
+    .event(Some(branch.as_str()), format!("claimed: {reason}"), pr)?;
 
     println!(
         "workspace {} based on {base_revision} ({base_label})\nclaimed {repo_name}/{branch} for {owner}",
