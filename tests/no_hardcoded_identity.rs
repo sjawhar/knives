@@ -38,6 +38,10 @@ const FORBIDDEN: &[&str] = &[
     concat!("trajectory", "-labs"),
     concat!("UK", "GovernmentBEIS"),
     concat!("meridian", "labs"),
+    concat!("ha", "wk"),
+    concat!("HA", "WK"),
+    concat!("ME", "TR", "/"),
+    concat!("me", "tr", "/"),
 ];
 
 fn scanned_roots() -> Vec<PathBuf> {

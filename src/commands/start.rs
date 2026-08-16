@@ -107,10 +107,10 @@ mod tests {
     #[test]
     fn a_workspace_is_a_sibling_named_for_the_branch() {
         let path = workspace_path(
-            Path::new("/home/u/forks/hawk/default"),
+            Path::new("/home/u/forks/work/default"),
             &BranchName::new("feat/alpha"),
         );
-        assert_eq!(path, PathBuf::from("/home/u/forks/hawk/feat-alpha"));
+        assert_eq!(path, PathBuf::from("/home/u/forks/work/feat-alpha"));
     }
 
     #[test]

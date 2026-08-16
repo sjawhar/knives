@@ -28,8 +28,8 @@ pub enum InitOutcome {
     ///
     /// Refusing matters beyond tidiness: the registry is the plugin's trust set,
     /// so silently replacing an entry re-points guidance injection at whatever
-    /// tree ran `init` last. An adversarial fixture at `<anywhere>/hawk/default`
-    /// could take over the name `hawk`. This is the "verify one repo per fork"
+    /// tree ran `init` last. An adversarial fixture at `<anywhere>/work/default`
+    /// could take over the name `work`. This is the "verify one repo per fork"
     /// the design asks for.
     NameTaken {
         name: String,
@@ -336,9 +336,9 @@ mod tests {
     #[test]
     fn a_case_variant_of_upstream_is_not_a_miswiring() {
         let found = remotes(&[
-            ("origin", "https://forge.invalid/sjawhar/hawk.git"),
-            ("upstream", "https://forge.invalid/METR/hawk.git"),
-            ("metr", "https://forge.invalid/metr/hawk.git"),
+            ("origin", "https://forge.invalid/ours/work.git"),
+            ("upstream", "https://forge.invalid/ACME/work.git"),
+            ("acme", "https://forge.invalid/acme/work.git"),
         ]);
         let InitOutcome::Adopted { warnings, .. } = decide(Path::new("/tmp/t"), &found) else {
             panic!("expected adoption")
@@ -349,9 +349,9 @@ mod tests {
     #[test]
     fn a_case_variant_of_upstream_slug_warns_for_a_third_owner() {
         let found = remotes(&[
-            ("origin", "https://forge.invalid/sjawhar/hawk.git"),
-            ("upstream", "https://forge.invalid/METR/hawk.git"),
-            ("third", "https://forge.invalid/someone/HAWK.git"),
+            ("origin", "https://forge.invalid/ours/work.git"),
+            ("upstream", "https://forge.invalid/ACME/work.git"),
+            ("third", "https://forge.invalid/someone/WORK.git"),
         ]);
         let InitOutcome::Adopted { warnings, .. } = decide(Path::new("/tmp/t"), &found) else {
             panic!("expected adoption")
@@ -362,9 +362,9 @@ mod tests {
     #[test]
     fn an_owner_matching_origin_is_not_a_miswiring() {
         let found = remotes(&[
-            ("origin", "https://forge.invalid/sjawhar/hawk.git"),
-            ("upstream", "https://forge.invalid/METR/hawk.git"),
-            ("same-as-origin", "https://forge.invalid/sjawhar/hawk.git"),
+            ("origin", "https://forge.invalid/ours/work.git"),
+            ("upstream", "https://forge.invalid/ACME/work.git"),
+            ("same-as-origin", "https://forge.invalid/ours/work.git"),
         ]);
         let InitOutcome::Adopted { warnings, .. } = decide(Path::new("/tmp/t"), &found) else {
             panic!("expected adoption")
@@ -375,9 +375,9 @@ mod tests {
     #[test]
     fn an_owner_matching_upstream_is_not_a_miswiring() {
         let found = remotes(&[
-            ("origin", "https://forge.invalid/sjawhar/hawk.git"),
-            ("upstream", "https://forge.invalid/METR/hawk.git"),
-            ("same-as-upstream", "https://forge.invalid/METR/hawk.git"),
+            ("origin", "https://forge.invalid/ours/work.git"),
+            ("upstream", "https://forge.invalid/ACME/work.git"),
+            ("same-as-upstream", "https://forge.invalid/ACME/work.git"),
         ]);
         let InitOutcome::Adopted { warnings, .. } = decide(Path::new("/tmp/t"), &found) else {
             panic!("expected adoption")
@@ -388,9 +388,9 @@ mod tests {
     #[test]
     fn a_release_named_remote_is_not_a_miswiring() {
         let found = remotes(&[
-            ("origin", "https://forge.invalid/sjawhar/hawk.git"),
-            ("upstream", "https://forge.invalid/METR/hawk.git"),
-            ("release", "https://forge.invalid/someone/hawk.git"),
+            ("origin", "https://forge.invalid/ours/work.git"),
+            ("upstream", "https://forge.invalid/ACME/work.git"),
+            ("release", "https://forge.invalid/someone/work.git"),
         ]);
         let InitOutcome::Adopted { warnings, .. } = decide(Path::new("/tmp/t"), &found) else {
             panic!("expected adoption")
@@ -401,9 +401,9 @@ mod tests {
     #[test]
     fn a_cross_forge_remote_is_not_a_miswiring() {
         let found = remotes(&[
-            ("origin", "https://github.example/sjawhar/hawk.git"),
-            ("upstream", "https://github.example/METR/hawk.git"),
-            ("other-forge", "https://gitlab.example/someone/hawk.git"),
+            ("origin", "https://github.example/ours/work.git"),
+            ("upstream", "https://github.example/ACME/work.git"),
+            ("other-forge", "https://gitlab.example/someone/work.git"),
         ]);
         let InitOutcome::Adopted { warnings, .. } = decide(Path::new("/tmp/t"), &found) else {
             panic!("expected adoption")
@@ -414,9 +414,9 @@ mod tests {
     #[test]
     fn an_unparseable_host_keeps_a_possible_miswiring_warning() {
         let found = remotes(&[
-            ("origin", "https:///sjawhar/hawk.git"),
-            ("upstream", "https:///METR/hawk.git"),
-            ("third", "https://forge.invalid/someone/hawk.git"),
+            ("origin", "https:///ours/work.git"),
+            ("upstream", "https:///ACME/work.git"),
+            ("third", "https://forge.invalid/someone/work.git"),
         ]);
         let InitOutcome::Adopted { warnings, .. } = decide(Path::new("/tmp/t"), &found) else {
             panic!("expected adoption")
@@ -460,10 +460,10 @@ mod tests {
         // The layout these forks use: <name>/default. Naming it "default" would
         // make every repo in the registry collide.
         assert_eq!(
-            guidance_name(Path::new("/home/u/forks/hawk/default")),
-            "hawk"
+            guidance_name(Path::new("/home/u/forks/work/default")),
+            "work"
         );
-        assert_eq!(guidance_name(Path::new("/home/u/forks/hawk")), "hawk");
+        assert_eq!(guidance_name(Path::new("/home/u/forks/work")), "work");
     }
 }
 
@@ -501,17 +501,17 @@ mod registry_tests {
         // re-points guidance injection at whatever tree ran `init` last, which
         // is the one real path to poisoning the allowlist.
         let outcome = decide_with_registry(
-            Path::new("/tmp/attacker/hawk/default"),
+            Path::new("/tmp/attacker/work/default"),
             &remotes(),
-            Some(&held("/home/real/forks/hawk/default")),
+            Some(&held("/home/real/forks/work/default")),
         );
         let InitOutcome::NameTaken { name, .. } = &outcome else {
             panic!("expected refusal, got {outcome:?}")
         };
-        assert_eq!(name, "hawk");
+        assert_eq!(name, "work");
         let text = render(&outcome, Path::new("/tmp/repos.toml"));
         assert!(
-            text.contains("/home/real/forks/hawk/default"),
+            text.contains("/home/real/forks/work/default"),
             "was: {text}"
         );
         assert!(text.contains("refusing"), "was: {text}");
@@ -521,9 +521,9 @@ mod registry_tests {
     fn re_adopting_the_same_tree_is_allowed() {
         // Re-running init on a repo already in the registry is routine.
         let outcome = decide_with_registry(
-            Path::new("/home/real/forks/hawk/default"),
+            Path::new("/home/real/forks/work/default"),
             &remotes(),
-            Some(&held("/home/real/forks/hawk/default")),
+            Some(&held("/home/real/forks/work/default")),
         );
         let InitOutcome::Adopted { warnings, .. } = outcome else {
             panic!("expected adoption")
