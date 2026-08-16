@@ -26,7 +26,7 @@ Pins are read from each consumer's origin trunk rather than its working copy. No
 
 The main report. Per branch: local tip, push status, pull request and its state, review decision, CI check status, landed verdict against upstream trunk, flags, and newest ledger entry. Plus claims other agents hold, the releases scanned, findings grouped one line per kind, and anything it could not answer.
 
-`--verbose` prints one block per finding instead of one line per kind. `--no-landed` skips the trunk probe, which is the slow part. `--no-github` skips pull request lookups.
+`--verbose` prints one block per finding instead of one line per kind. `--no-landed` skips the trunk probe, which is the slow part. `--no-github` skips pull request lookups. Set `KNIVES_TIMING` (any value) to print a phase-timing line (`releases`, `forge`, `probes`, and `total`) to stderr; the report's stdout/JSON contract is unchanged.
 
 #### Branch table columns
 

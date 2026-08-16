@@ -7,7 +7,10 @@
 
 use std::collections::BTreeSet;
 
-use knives::forge::{parse_checks, parse_pull_requests, pull_request_list_args, requested_fields};
+use knives::forge::{
+    ChecksSummary, parse_pull_details, parse_pull_requests, pull_details_query,
+    pull_request_list_args, requested_fields,
+};
 use serde_json::Value;
 
 const RECORDED: &str = include_str!("fixtures/gh_pr_list.json");
@@ -98,18 +101,30 @@ fn the_list_request_keeps_base_but_not_the_check_rollup() {
 }
 
 #[test]
-fn recorded_check_rollups_match_the_per_pull_request_decoder() {
-    // Given: every recorded list payload rollup, including its forge-only fields
+fn recorded_check_rollups_match_the_batch_decoder() {
+    // Given: every recorded list payload rollup, including its forge-only fields,
+    // reshaped as the batch reply carries them
     let recorded: Vec<Value> = serde_json::from_str(RECORDED).expect("recorded JSON is valid");
     let mut saw_empty = false;
 
-    // When: each rollup is shaped like `gh pr view --json statusCheckRollup` and decoded
-    for pull_request in &recorded {
+    // When: each is decoded through the batch parser
+    for (index, pull_request) in recorded.iter().enumerate() {
         let rollup = pull_request
             .get("statusCheckRollup")
             .expect("recorded pull request has a rollup");
-        let payload = serde_json::json!({"statusCheckRollup": rollup}).to_string();
-        let checks = parse_checks(&payload).expect("recorded rollup must deserialise");
+        let payload = serde_json::json!({"data": {"repository": {
+            "p0": {
+                "number": index + 1,
+                "rollup": {"nodes": [{"commit": {"statusCheckRollup": {"contexts": {"nodes": rollup}}}}]}
+            }
+        }}})
+        .to_string();
+        let details = parse_pull_details(&payload).expect("recorded rollup must deserialise");
+        let checks = details
+            .values()
+            .next()
+            .and_then(|detail| detail.checks.clone())
+            .expect("a decoded pull request was consulted");
         saw_empty |= checks.runs.is_empty();
         assert!(
             !checks.failing(),
@@ -120,8 +135,9 @@ fn recorded_check_rollups_match_the_per_pull_request_decoder() {
     // Then: the empty rollup stays a consulted, never-ran result
     assert!(saw_empty, "the recording includes an empty rollup");
 
-    // StatusContext is the variant this recording lacks. Reusing one recorded CheckRun keeps
-    // its real unknown fields while proving an in-flight conclusion remains non-failing.
+    // StatusContext is the variant this recording lacks. Reusing one recorded
+    // CheckRun keeps its real unknown fields while proving an in-flight conclusion
+    // remains non-failing.
     let mut in_flight = recorded
         .first()
         .and_then(|pull_request| pull_request.get("statusCheckRollup"))
@@ -133,10 +149,66 @@ fn recorded_check_rollups_match_the_per_pull_request_decoder() {
         .as_object_mut()
         .and_then(|check| check.get_mut("conclusion"))
         .expect("recorded check run has a conclusion") = Value::String(String::new());
-    let payload = serde_json::json!({"statusCheckRollup": [in_flight]}).to_string();
-    let checks = parse_checks(&payload).expect("in-flight rollup must deserialise");
+    let payload = serde_json::json!({"data": {"repository": {
+        "p0": {
+            "number": 1,
+            "rollup": {"nodes": [{"commit": {"statusCheckRollup": {"contexts": {"nodes": [in_flight]}}}}]}
+        }
+    }}})
+    .to_string();
+    let checks = parse_pull_details(&payload)
+        .expect("in-flight rollup must deserialise")
+        .remove(&1)
+        .and_then(|detail| detail.checks)
+        .expect("consulted");
     assert!(checks.ran());
     assert!(!checks.failing());
+}
+
+#[test]
+fn a_recorded_batch_payload_decodes_every_field_the_query_asks_for() {
+    // The defect this prevents: a query field added and the decoder not, so the
+    // report reads "nothing to compare" forever while the forge answered.
+    const RECORDED_DETAILS: &str = include_str!("fixtures/gh_pull_details.json");
+    let details = parse_pull_details(RECORDED_DETAILS).expect("recorded batch output decodes");
+    assert!(!details.is_empty(), "the fixture must carry pull requests");
+    assert!(
+        details
+            .values()
+            .any(|detail| detail.review_predates_head.is_some()),
+        "no recorded pull request had a review to compare: {details:?}"
+    );
+    assert!(
+        details
+            .values()
+            .any(|detail| detail.checks.as_ref().is_some_and(ChecksSummary::ran)),
+        "no recorded pull request had checks: {details:?}"
+    );
+    // And: the query and the recording describe the same reply.
+    let query = pull_details_query(&[1]);
+    for field in [
+        "submittedAt",
+        "committedDate",
+        "hasNextPage",
+        "statusCheckRollup",
+        "number",
+    ] {
+        assert!(query.contains(field), "the query dropped {field}");
+        assert!(
+            RECORDED_DETAILS.contains(field),
+            "the recording lacks {field}"
+        );
+    }
+}
+
+/// Prints the batch query so a real reply can be recorded into
+/// `tests/fixtures/gh_pull_details.json`. Re-run it whenever the query changes:
+/// the fixture is only a contract while it is the forge's own answer to this
+/// exact query.
+#[test]
+#[ignore = "a recording tool, not a check; see the status-speed plan's verification task"]
+fn print_the_batch_query() {
+    println!("{}", pull_details_query(&[1, 2]));
 }
 
 #[test]
@@ -188,4 +260,25 @@ fn the_recorded_payload_is_scrubbed() {
             }
         }
     }
+}
+
+#[test]
+fn the_recorded_details_payload_is_scrubbed() {
+    const RECORDED_DETAILS: &str = include_str!("fixtures/gh_pull_details.json");
+    let lower = RECORDED_DETAILS.to_ascii_lowercase();
+    for identity in [
+        concat!("ha", "wk"),
+        concat!("middle", "man"),
+        concat!("re", "lay"),
+    ] {
+        assert!(
+            !lower.contains(identity),
+            "details fixture leaks internal identifier `{identity}`"
+        );
+    }
+    assert!(!RECORDED_DETAILS.contains(REAL_FORGE_HOST));
+    // The batch query needs neither account identities nor URLs, so retaining
+    // either in a recording would only make the public fixture less safe.
+    assert!(!RECORDED_DETAILS.contains("\"login\""));
+    assert!(!RECORDED_DETAILS.contains("://"));
 }

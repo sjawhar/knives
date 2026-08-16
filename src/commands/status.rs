@@ -9,7 +9,7 @@ use crate::detect::{
     BookmarkTips, Finding, FindingKind, LandedVerdict, Subject, classify_landed, divergent_changes,
     double_checkout, stale_parents,
 };
-use crate::forge::{ChecksSummary, Forge, PullRequest, ours_only};
+use crate::forge::{ChecksSummary, Forge, PullDetails, PullRequest, ours_only};
 use crate::ids::{
     BookmarkRef, BranchName, BranchTarget, CommitId, ReleaseScheme, RepoName, is_release_name,
     pull_number_from_bookmark,
@@ -166,6 +166,49 @@ pub struct Options<'a> {
     pub registry: Option<&'a Registry>,
     /// This repository's ledger, for the per-branch breadcrumb. `None` reads none.
     pub ledger: Option<&'a Ledger>,
+    /// How many threads the landed probes may use. `1` is serial.
+    ///
+    /// Set below the machine's parallelism when several repositories are gathered
+    /// at once, so `--all` cannot multiply one repository's probe threads by the
+    /// size of the registry.
+    pub workers: usize,
+}
+
+/// Where a status run spent its time.
+///
+/// Not a report field: it measures this run rather than describing the
+/// repository, and every number would change the JSON contract for readers who
+/// did not ask. Printed to stderr when `KNIVES_TIMING` is set — an environment
+/// variable rather than `--verbose`, because that flag already selects how
+/// findings are grouped.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Timings {
+    /// Scanning releases for stale parents.
+    pub releases: std::time::Duration,
+    /// The pull request list, batched details, and stated-pull state lookups for
+    /// maintained branches. Divergent-row stated-pull and dependency lookups are
+    /// not counted.
+    pub forge: std::time::Duration,
+    /// Replaying branches onto the upstream trunk.
+    pub probes: std::time::Duration,
+    pub total: std::time::Duration,
+}
+
+impl Timings {
+    pub fn line(&self, repo: &str) -> String {
+        format!(
+            "timing {repo}: releases {}ms forge {}ms probes {}ms total {}ms",
+            self.releases.as_millis(),
+            self.forge.as_millis(),
+            self.probes.as_millis(),
+            self.total.as_millis()
+        )
+    }
+}
+
+/// Whether phase timings were asked for.
+pub fn timing_enabled() -> bool {
+    std::env::var_os("KNIVES_TIMING").is_some()
 }
 
 impl fmt::Debug for Options<'_> {
@@ -259,6 +302,67 @@ fn landed_verdict(
         branch,
         upstream_trunk,
     )?)))
+}
+/// Landed verdicts for every branch, probed concurrently, in branch order.
+///
+/// Each probe opens its own repository handle and replays inside a transaction it
+/// drops: nothing is shared between threads and nothing is written, so no probe
+/// can observe another's. Verified against jj-lib rather than assumed — see
+/// `jj_lib_answers_the_same_probe_from_many_threads_as_from_one`.
+///
+/// Bounded by chunking the branch list rather than by a work queue, because the
+/// bound is the point and a queue would be a dependency. Results come back in the
+/// order the branches went in, so this is the serial report.
+fn landed_verdicts(
+    path: &std::path::Path,
+    carried: &[CarriedPull],
+    options: &Options<'_>,
+    upstream_trunk: &str,
+) -> Vec<Result<Option<LandedVerdict>, JjError>> {
+    // Nothing to spawn for: `landed_verdict` answers `None` without probing when
+    // the probe is off, and an empty list has no chunks.
+    if !options.probe || carried.is_empty() {
+        return carried.iter().map(|_| Ok(None)).collect();
+    }
+    let workers = options.workers.clamp(1, carried.len());
+    let chunk = carried.len().div_ceil(workers);
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(workers);
+        for slice in carried.chunks(chunk) {
+            handles.push((
+                slice,
+                scope.spawn(move || {
+                    slice
+                        .iter()
+                        .map(|(branch, tip, origin_tip, _)| {
+                            landed_verdict(
+                                path,
+                                branch,
+                                (tip, origin_tip.as_ref()),
+                                options,
+                                upstream_trunk,
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                }),
+            ));
+        }
+        handles
+            .into_iter()
+            .flat_map(|(slice, handle)| {
+                handle.join().unwrap_or_else(|_| {
+                    slice
+                        .iter()
+                        .map(|(branch, ..)| {
+                            Err(JjError::ProbePanic {
+                                branch: branch.to_string(),
+                            })
+                        })
+                        .collect()
+                })
+            })
+            .collect()
+    })
 }
 
 /// The pull request a bookmark refers to, by branch name or by fetched-head number.
@@ -556,50 +660,109 @@ fn add_releases(
     Ok(())
 }
 
-fn review_stale_for(
+/// One maintained branch, its tip, where origin has it, and the pull request it
+/// refers to.
+type CarriedPull = (BranchName, CommitId, Option<CommitId>, Option<PullRequest>);
+
+/// Every branch paired with what the row loop needs before it starts.
+///
+/// Built up front because both phases that dominate a run — the forge round trip
+/// and the landed probes — go over the whole list at once now, and a loop that
+/// discovers its own inputs one at a time is exactly what made them serial.
+fn carried_pulls(
+    branches: Vec<(BranchName, CommitId)>,
+    pull_requests: &BTreeMap<BranchName, PullRequest>,
+    tips: &BookmarkTips,
+) -> Vec<CarriedPull> {
+    branches
+        .into_iter()
+        .map(|(branch, tip)| {
+            let origin_tip = tips
+                .get(&BookmarkRef::Remote {
+                    branch: branch.clone(),
+                    remote: crate::ids::RemoteName::new("origin"),
+                })
+                .cloned();
+            let pull_request = pull_request_for(&branch, pull_requests);
+            (branch, tip, origin_tip, pull_request)
+        })
+        .collect()
+}
+
+/// The pull requests worth asking the forge about.
+///
+/// Exactly the ones the per-branch calls asked about: a review age only when the
+/// forge recorded a review decision, checks only while the pull request is open.
+/// Asking about more would be a behaviour change dressed as an optimisation.
+fn detail_numbers(carried: &[CarriedPull]) -> Vec<u64> {
+    let mut numbers: Vec<u64> = carried
+        .iter()
+        .filter_map(|(_, _, _, pull_request)| pull_request.as_ref())
+        .filter(|pull_request| pull_request.is_open() || !pull_request.review_decision.is_empty())
+        .map(|pull_request| pull_request.number)
+        .collect();
+    // Sorted and duplicate-free to keep the query shape stable without redundant
+    // fields. No two rows can name one number today — `maintained_branches` drops
+    // the `pr-<n>` bookmarks that are the only other way to reach a number — and
+    // this keeps the query's shape independent of that staying true.
+    numbers.sort_unstable();
+    numbers.dedup();
+    numbers
+}
+
+/// Review age and check state for every pull request in this report, in one call.
+fn pull_details_from_forge(
     forge: Option<&dyn Forge>,
     entry: &RepoEntry,
-    pull_request: Option<&PullRequest>,
+    numbers: &[u64],
     report: &mut Report,
-) -> Option<bool> {
-    match (forge, pull_request) {
-        (Some(forge), Some(pull_request)) if !pull_request.review_decision.is_empty() => {
-            match forge.review_predates_head(&entry.path, pull_request.number) {
-                Ok(answer) => answer,
-                Err(error) => {
-                    report.problems.push(format!(
-                        "review age for #{} unavailable: {error}",
-                        pull_request.number
-                    ));
-                    None
-                }
-            }
+) -> BTreeMap<u64, PullDetails> {
+    let Some(forge) = forge else {
+        return BTreeMap::new();
+    };
+    if numbers.is_empty() {
+        return BTreeMap::new();
+    }
+    match forge.pull_details(&entry.path, numbers) {
+        Ok(details) => details,
+        Err(error) => {
+            report
+                .problems
+                .push(format!("review age and checks unavailable: {error}"));
+            BTreeMap::new()
         }
-        _ => None,
     }
 }
 
-fn checks_for(
-    forge: Option<&dyn Forge>,
-    entry: &RepoEntry,
+/// Whether the newest review predates the branch head, when there was a review to
+/// compare.
+///
+/// Gated as the per-pull-request call was: an empty review decision means the
+/// forge recorded no review, and `None` must never render as "current".
+fn review_stale_from(
+    details: Option<&PullDetails>,
     pull_request: Option<&PullRequest>,
-    report: &mut Report,
-) -> Option<ChecksSummary> {
-    match (forge, pull_request) {
-        (Some(forge), Some(pull_request)) if pull_request.is_open() => {
-            match forge.checks(&entry.path, pull_request.number) {
-                Ok(answer) => answer,
-                Err(error) => {
-                    report.problems.push(format!(
-                        "checks for #{} unavailable: {error}",
-                        pull_request.number
-                    ));
-                    None
-                }
-            }
-        }
-        _ => None,
+) -> Option<bool> {
+    let pull_request = pull_request?;
+    if pull_request.review_decision.is_empty() {
+        return None;
     }
+    details?.review_predates_head
+}
+
+/// What the forge's checks say, for an open pull request that was consulted.
+///
+/// Settled pull requests are not asked about and not reported on: a closed one's
+/// recorded rollup is obsolete the moment it closes.
+fn checks_from(
+    details: Option<&PullDetails>,
+    pull_request: Option<&PullRequest>,
+) -> Option<ChecksSummary> {
+    let pull_request = pull_request?;
+    if !pull_request.is_open() {
+        return None;
+    }
+    details?.checks.clone()
 }
 
 struct DivergentInput<'a> {
@@ -806,12 +969,103 @@ fn add_branch_overlap_findings(report: &mut Report, entry: &RepoEntry) {
         .extend(crate::detect::overlap::branch_overlaps(&touching));
 }
 
-pub fn gather(
+/// Everything the branch table needs from one repository.
+struct RowInput<'a> {
+    name: &'a RepoName,
+    entry: &'a RepoEntry,
+    repo: &'a Repo,
+    tips: &'a BookmarkTips,
+    store: &'a Store,
+    options: &'a Options<'a>,
+    branches: Vec<(BranchName, CommitId)>,
+    pull_requests: &'a BTreeMap<BranchName, PullRequest>,
+    notches: &'a [Notch],
+    upstream_trunk: &'a str,
+}
+
+/// The branch rows, and the branches whose landed state could not be judged.
+///
+/// Extracted from `gather` because the two phases that dominate a status run —
+/// the forge round trips and the landed probes — are driven over the whole branch
+/// list, and one function that both drives them and assembles the rest of a
+/// report is past what a reviewer holds at once.
+fn branch_rows(
+    input: RowInput<'_>,
+    report: &mut Report,
+    timings: &mut Timings,
+) -> anyhow::Result<Vec<String>> {
+    let carried = carried_pulls(input.branches, input.pull_requests, input.tips);
+
+    let phase = std::time::Instant::now();
+    let details = pull_details_from_forge(
+        input.options.forge,
+        input.entry,
+        &detail_numbers(&carried),
+        report,
+    );
+    timings.forge += phase.elapsed();
+
+    let phase = std::time::Instant::now();
+    let verdicts = landed_verdicts(
+        &input.entry.path,
+        &carried,
+        input.options,
+        input.upstream_trunk,
+    );
+    timings.probes = phase.elapsed();
+
+    let mut unjudged = Vec::new();
+    for (verdict, (branch, tip, origin_tip, pull_request)) in verdicts.into_iter().zip(carried) {
+        // Propagated in branch order, so a probe failure reports the same branch
+        // and the same message it did when the probes ran one at a time.
+        let landed = verdict?;
+        if landed == Some(LandedVerdict::Unjudged) {
+            unjudged.push(branch.to_string());
+        }
+        let detail = pull_request
+            .as_ref()
+            .and_then(|pull_request| details.get(&pull_request.number));
+        let review_stale = review_stale_from(detail, pull_request.as_ref());
+        let checks = checks_from(detail, pull_request.as_ref());
+        let origin_relation = record_origin_relation(
+            report,
+            &branch,
+            relation_to_origin(input.repo, &tip, origin_tip.as_ref()),
+        );
+        let target = BranchTarget::new(input.name.clone(), branch.clone());
+        let phase = std::time::Instant::now();
+        let stated_pull = stated_pull_for(&target, input.store, input.entry, input.options);
+        timings.forge += phase.elapsed();
+        let last_notch = newest_for(input.notches, branch.as_str()).map(LastNotch::of);
+        report.branches.push(BranchRow {
+            name: branch,
+            tip: Some(tip),
+            origin_tip,
+            origin_relation,
+            pull_request,
+            landed,
+            review_stale,
+            checks,
+            fork_only: input.store.is_fork_only(&target),
+            stated_pull,
+            last_notch,
+        });
+    }
+    Ok(unjudged)
+}
+
+/// The report, and where the run spent its time.
+///
+/// One function rather than two paths, so a measured run and an unmeasured one
+/// cannot drift: `gather` is this with the measurement dropped.
+pub fn gather_timed(
     name: &RepoName,
     entry: &RepoEntry,
     store: &Store,
     options: &Options<'_>,
-) -> anyhow::Result<Report> {
+) -> anyhow::Result<(Report, Timings)> {
+    let started = std::time::Instant::now();
+    let mut timings = Timings::default();
     let repo = Repo::open(&entry.path)?;
     let mut report = Report {
         repo: name.to_string(),
@@ -822,58 +1076,34 @@ pub fn gather(
     let trunk = entry.trunk();
     let scheme = entry.release_scheme();
     let upstream_trunk = entry.upstream_trunk();
+    let phase = std::time::Instant::now();
     add_releases(&mut report, &repo, &tips, entry)?;
+    timings.releases = phase.elapsed();
 
     let (branches, fetched_heads) = maintained_branches(&tips, trunk, &scheme);
     let notches = notches_from_ledger(options.ledger, &mut report);
     report.repo_notches = repo_notches(&notches);
-    let mut unjudged: Vec<String> = Vec::new();
     note_fetched_heads(&mut report, fetched_heads);
+    let phase = std::time::Instant::now();
     let pull_requests = pull_requests_from_forge(options.forge, entry, &mut report);
+    timings.forge += phase.elapsed();
 
-    for (branch, tip) in branches {
-        let pull_request = pull_request_for(&branch, &pull_requests);
-        let review_stale =
-            review_stale_for(options.forge, entry, pull_request.as_ref(), &mut report);
-        let checks = checks_for(options.forge, entry, pull_request.as_ref(), &mut report);
-        let origin_tip = tips
-            .get(&BookmarkRef::Remote {
-                branch: branch.clone(),
-                remote: crate::ids::RemoteName::new("origin"),
-            })
-            .cloned();
-        let origin_relation = record_origin_relation(
-            &mut report,
-            &branch,
-            relation_to_origin(&repo, &tip, origin_tip.as_ref()),
-        );
-        let landed = landed_verdict(
-            &entry.path,
-            &branch,
-            (&tip, origin_tip.as_ref()),
+    let unjudged = branch_rows(
+        RowInput {
+            name,
+            entry,
+            repo: &repo,
+            tips: &tips,
+            store,
             options,
-            &upstream_trunk,
-        )?;
-        if landed == Some(LandedVerdict::Unjudged) {
-            unjudged.push(branch.to_string());
-        }
-        let target = BranchTarget::new(name.clone(), branch.clone());
-        let stated_pull = stated_pull_for(&target, store, entry, options);
-        let last_notch = newest_for(&notches, branch.as_str()).map(LastNotch::of);
-        report.branches.push(BranchRow {
-            name: branch,
-            tip: Some(tip),
-            origin_tip,
-            origin_relation,
-            pull_request,
-            landed,
-            review_stale,
-            checks,
-            fork_only: store.is_fork_only(&target),
-            stated_pull,
-            last_notch,
-        });
-    }
+            branches,
+            pull_requests: &pull_requests,
+            upstream_trunk: &upstream_trunk,
+            notches: &notches,
+        },
+        &mut report,
+        &mut timings,
+    )?;
 
     report.branches.extend(divergent_rows(&DivergentInput {
         repo: &repo,
@@ -902,7 +1132,17 @@ pub fn gather(
         .extend(wrong_base_findings(&report.branches, entry.default_base()));
     report.problems.extend(unjudged_note(&unjudged));
     add_dependency_findings(&mut report, name, store, options);
-    Ok(report)
+    timings.total = started.elapsed();
+    Ok((report, timings))
+}
+
+pub fn gather(
+    name: &RepoName,
+    entry: &RepoEntry,
+    store: &Store,
+    options: &Options<'_>,
+) -> anyhow::Result<Report> {
+    gather_timed(name, entry, store, options).map(|(report, _)| report)
 }
 
 /// Order a dated release name so numeric suffixes compare numerically.
@@ -1496,6 +1736,23 @@ mod tests {
             head_ref_oid: "deadbeef".to_owned(),
             ..PullRequest::default()
         }
+    }
+    #[test]
+    fn a_timing_line_names_every_phase_it_measured() {
+        // The numbers this PR is judged against. A line that reported only a total
+        // could not say which phase a change actually moved.
+        let timings = Timings {
+            releases: std::time::Duration::from_millis(12),
+            forge: std::time::Duration::from_millis(3400),
+            probes: std::time::Duration::from_millis(8100),
+            total: std::time::Duration::from_millis(11_600),
+        };
+        let line = timings.line("a-repo");
+        assert!(line.contains("a-repo"), "was: {line}");
+        assert!(line.contains("releases 12ms"), "was: {line}");
+        assert!(line.contains("forge 3400ms"), "was: {line}");
+        assert!(line.contains("probes 8100ms"), "was: {line}");
+        assert!(line.contains("total 11600ms"), "was: {line}");
     }
 
     #[test]

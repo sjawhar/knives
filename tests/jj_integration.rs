@@ -33,20 +33,12 @@ impl Forge for StateUnavailableForge {
         Ok(BTreeMap::new())
     }
 
-    fn review_predates_head(
+    fn pull_details(
         &self,
         _repo: &std::path::Path,
-        _number: u64,
-    ) -> Result<Option<bool>, ForgeError> {
-        Ok(None)
-    }
-
-    fn checks(
-        &self,
-        _repo: &std::path::Path,
-        _number: u64,
-    ) -> Result<Option<ChecksSummary>, ForgeError> {
-        Ok(None)
+        _numbers: &[u64],
+    ) -> Result<BTreeMap<u64, knives::forge::PullDetails>, ForgeError> {
+        Ok(BTreeMap::new())
     }
 
     fn pull_request_state(
@@ -69,6 +61,387 @@ impl Forge for StateUnavailableForge {
     ) -> Result<Option<String>, ForgeError> {
         Ok(None)
     }
+}
+
+/// A forge whose list works and whose batch does not, for the one behaviour that
+/// batching changes: how a details failure is reported.
+struct DetailsUnavailableForge {
+    pull_requests: BTreeMap<BranchName, PullRequest>,
+}
+
+impl Forge for DetailsUnavailableForge {
+    fn pull_requests(
+        &self,
+        _repo: &std::path::Path,
+    ) -> Result<BTreeMap<BranchName, PullRequest>, ForgeError> {
+        Ok(self.pull_requests.clone())
+    }
+
+    fn pull_details(
+        &self,
+        _repo: &std::path::Path,
+        _numbers: &[u64],
+    ) -> Result<BTreeMap<u64, knives::forge::PullDetails>, ForgeError> {
+        Err(ForgeError::Command {
+            command: "gh api graphql".to_owned(),
+            dir: "/repo".to_owned(),
+            code: 1,
+            stderr: "unavailable".to_owned(),
+        })
+    }
+
+    fn pull_request_state(
+        &self,
+        _repo: &std::path::Path,
+        _number: u64,
+    ) -> Result<Option<String>, ForgeError> {
+        Ok(None)
+    }
+
+    fn newest_comment(
+        &self,
+        _repo: &std::path::Path,
+        _number: u64,
+    ) -> Result<Option<String>, ForgeError> {
+        Ok(None)
+    }
+}
+
+/// A registry entry for the lab's work checkout, which stands in for origin.
+fn lab_entry(lab: &lab::Lab) -> RepoEntry {
+    RepoEntry {
+        path: lab.work.clone(),
+        upstream: lab.upstream.display().to_string(),
+        origin: lab.work.display().to_string(),
+        base: None,
+        release: None,
+        release_branch: None,
+        test_count_command: None,
+        consumers: Vec::new(),
+    }
+}
+
+#[test]
+fn one_batch_answers_review_age_and_checks_for_every_branch_at_once() {
+    // Given: two branches with open pull requests, one stale-reviewed and red, one
+    // clean, and a third whose pull request is closed
+    let lab = lab::Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    lab.branch("feat/gamma", "gamma.txt", "gamma\n");
+    let mut pull_requests = BTreeMap::new();
+    for (number, branch, state, decision) in [
+        (11, "feat/alpha", "OPEN", "CHANGES_REQUESTED"),
+        (12, "feat/beta", "OPEN", "APPROVED"),
+        (13, "feat/gamma", "CLOSED", ""),
+    ] {
+        assert!(
+            pull_requests
+                .insert(
+                    BranchName::new(branch),
+                    PullRequest {
+                        number,
+                        state: state.to_owned(),
+                        review_decision: decision.to_owned(),
+                        head_ref_name: branch.to_owned(),
+                        head_ref_oid: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+                        updated_at: "2026-01-01T00:00:00Z".to_owned(),
+                        is_draft: false,
+                        url: String::new(),
+                        head_repository_owner: None,
+                        mergeable: String::new(),
+                        merge_state_status: String::new(),
+                        base_ref_name: "main".to_owned(),
+                        merge_commit: None,
+                    },
+                )
+                .is_none()
+        );
+    }
+    let forge = knives::forge::FakeForge {
+        pull_requests,
+        stale_reviews: vec![11],
+        checks: BTreeMap::from([
+            (
+                11,
+                ChecksSummary {
+                    runs: vec![knives::forge::CheckRun {
+                        name: "build".to_owned(),
+                        conclusion: "FAILURE".to_owned(),
+                    }],
+                },
+            ),
+            // Supplied and empty: consulted, with nothing having run. The fake
+            // answers with the facts it was given, so supplying the entry is how
+            // "consulted" is expressed and omitting it is how "not consulted" is.
+            (12, ChecksSummary::default()),
+        ]),
+        ..knives::forge::FakeForge::default()
+    };
+    let state = tempfile::tempdir().expect("state directory");
+    let store = Store::open(state.path().join("state.json")).expect("open store");
+
+    // When: status gathers
+    let report = status::gather(
+        &knives::ids::RepoName::new("demo"),
+        &lab_entry(&lab),
+        &store,
+        &knives::commands::status::Options {
+            probe: false,
+            forge: Some(&forge),
+            registry: None,
+            ledger: None,
+            workers: 1,
+        },
+    )
+    .expect("gather");
+
+    // Then: each branch carries the facts the per-pull-request calls used to fetch
+    let row = |name: &str| {
+        report
+            .branches
+            .iter()
+            .find(|row| row.name.as_str() == name)
+            .unwrap_or_else(|| panic!("no row for {name}: {report:?}"))
+            .clone()
+    };
+    assert_eq!(row("feat/alpha").review_stale, Some(true));
+    assert!(
+        row("feat/alpha")
+            .checks
+            .as_ref()
+            .is_some_and(ChecksSummary::failing)
+    );
+    assert_eq!(row("feat/beta").review_stale, Some(false));
+    assert_eq!(
+        row("feat/beta").checks,
+        Some(ChecksSummary::default()),
+        "consulted with nothing running is not the same as unconsulted"
+    );
+    // And: a settled pull request is neither asked about nor reported on
+    assert_eq!(row("feat/gamma").review_stale, None);
+    assert_eq!(row("feat/gamma").checks, None);
+    assert!(report.problems.is_empty(), "was: {report:?}");
+}
+
+#[test]
+fn a_measured_gather_reports_the_same_report_and_a_total_that_covers_its_phases() {
+    // Given: a fork with branches to probe and releases to scan
+    let lab = lab::Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    lab.octopus("release/2026-08-15", "feat/alpha", "feat/beta");
+    let name = knives::ids::RepoName::new("demo");
+    let entry = lab_entry(&lab);
+    let state = tempfile::tempdir().expect("state directory");
+    let store = Store::open(state.path().join("state.json")).expect("open store");
+    let options = || knives::commands::status::Options {
+        probe: true,
+        forge: None,
+        registry: None,
+        ledger: None,
+        workers: 1,
+    };
+
+    // When: the same repository is gathered with and without measurement
+    let plain = status::gather(&name, &entry, &store, &options()).expect("gather");
+    let (measured, timings) =
+        status::gather_timed(&name, &entry, &store, &options()).expect("gather_timed");
+
+    // Then: the report is the same one, and the total covers the phases it timed
+    assert_eq!(
+        status::render(&plain, true),
+        status::render(&measured, true),
+        "measuring changed the report"
+    );
+    assert!(
+        timings.total >= timings.releases + timings.probes,
+        "total {:?} does not cover releases {:?} plus probes {:?}",
+        timings.total,
+        timings.releases,
+        timings.probes
+    );
+    assert!(
+        timings.probes > std::time::Duration::ZERO,
+        "two branches were probed and the probe phase measured nothing"
+    );
+}
+
+/// Records what the batch was asked for, so "once, with exactly these numbers"
+/// is asserted rather than assumed.
+struct CountingForge {
+    pull_requests: BTreeMap<BranchName, PullRequest>,
+    asked: std::sync::Mutex<Vec<Vec<u64>>>,
+}
+
+impl Forge for CountingForge {
+    fn pull_requests(
+        &self,
+        _repo: &std::path::Path,
+    ) -> Result<BTreeMap<BranchName, PullRequest>, ForgeError> {
+        Ok(self.pull_requests.clone())
+    }
+
+    fn pull_details(
+        &self,
+        _repo: &std::path::Path,
+        numbers: &[u64],
+    ) -> Result<BTreeMap<u64, knives::forge::PullDetails>, ForgeError> {
+        if let Ok(mut asked) = self.asked.lock() {
+            asked.push(numbers.to_vec());
+        }
+        Ok(BTreeMap::new())
+    }
+
+    fn pull_request_state(
+        &self,
+        _repo: &std::path::Path,
+        _number: u64,
+    ) -> Result<Option<String>, ForgeError> {
+        Ok(None)
+    }
+
+    fn newest_comment(
+        &self,
+        _repo: &std::path::Path,
+        _number: u64,
+    ) -> Result<Option<String>, ForgeError> {
+        Ok(None)
+    }
+}
+
+#[test]
+fn the_forge_is_asked_once_for_the_whole_report_with_one_entry_per_number() {
+    // The point of the batch, stated as a contract rather than as a hope: one
+    // call for the repository, carrying each number once, and only the numbers
+    // the per-branch calls would have asked about.
+    let lab = lab::Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    lab.branch("feat/gamma", "gamma.txt", "gamma\n");
+    lab.branch("feat/delta", "delta.txt", "delta\n");
+    let mut pull_requests = BTreeMap::new();
+    for (number, branch, state, decision) in [
+        (12, "feat/beta", "OPEN", "APPROVED"),
+        (11, "feat/alpha", "OPEN", ""),
+        // Settled with nobody having reviewed it: neither phase asked about this
+        // one before, so neither does the batch.
+        (13, "feat/gamma", "CLOSED", ""),
+    ] {
+        assert!(
+            pull_requests
+                .insert(
+                    BranchName::new(branch),
+                    PullRequest {
+                        number,
+                        state: state.to_owned(),
+                        review_decision: decision.to_owned(),
+                        head_ref_name: branch.to_owned(),
+                        head_ref_oid: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+                        updated_at: "2026-01-01T00:00:00Z".to_owned(),
+                        is_draft: false,
+                        url: String::new(),
+                        head_repository_owner: None,
+                        mergeable: String::new(),
+                        merge_state_status: String::new(),
+                        base_ref_name: "main".to_owned(),
+                        merge_commit: None,
+                    },
+                )
+                .is_none()
+        );
+    }
+    let forge = CountingForge {
+        pull_requests,
+        asked: std::sync::Mutex::new(Vec::new()),
+    };
+    let state = tempfile::tempdir().expect("state directory");
+    let store = Store::open(state.path().join("state.json")).expect("open store");
+
+    let report = status::gather(
+        &knives::ids::RepoName::new("demo"),
+        &lab_entry(&lab),
+        &store,
+        &knives::commands::status::Options {
+            probe: false,
+            forge: Some(&forge),
+            registry: None,
+            ledger: None,
+            workers: 1,
+        },
+    )
+    .expect("gather");
+    assert_eq!(report.branches.len(), 4, "was: {report:?}");
+
+    let asked = forge.asked.lock().expect("lock");
+    assert_eq!(
+        asked.len(),
+        1,
+        "the forge was asked {} times: {asked:?}",
+        asked.len()
+    );
+    assert_eq!(
+        asked[0],
+        vec![11, 12],
+        "sorted, each number once, and only the ones worth asking about"
+    );
+    drop(asked);
+}
+
+#[test]
+fn a_batch_the_forge_refused_is_one_unanswered_question_not_a_clean_report() {
+    let lab = lab::Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let mut pull_requests = BTreeMap::new();
+    assert!(
+        pull_requests
+            .insert(
+                BranchName::new("feat/alpha"),
+                PullRequest {
+                    number: 11,
+                    state: "OPEN".to_owned(),
+                    review_decision: "APPROVED".to_owned(),
+                    head_ref_name: "feat/alpha".to_owned(),
+                    head_ref_oid: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+                    updated_at: "2026-01-01T00:00:00Z".to_owned(),
+                    is_draft: false,
+                    url: String::new(),
+                    head_repository_owner: None,
+                    mergeable: String::new(),
+                    merge_state_status: String::new(),
+                    base_ref_name: "main".to_owned(),
+                    merge_commit: None,
+                },
+            )
+            .is_none()
+    );
+    let forge = DetailsUnavailableForge { pull_requests };
+    let state = tempfile::tempdir().expect("state directory");
+    let store = Store::open(state.path().join("state.json")).expect("open store");
+
+    let report = status::gather(
+        &knives::ids::RepoName::new("demo"),
+        &lab_entry(&lab),
+        &store,
+        &knives::commands::status::Options {
+            probe: false,
+            forge: Some(&forge),
+            registry: None,
+            ledger: None,
+            workers: 1,
+        },
+    )
+    .expect("gather");
+
+    assert_eq!(report.problems.len(), 1, "was: {report:?}");
+    assert!(
+        report.problems[0].contains("review age and checks unavailable"),
+        "was: {report:?}"
+    );
+    assert_eq!(status::exit_for(&report), knives::cli::Exit::Incomplete);
+    let row = &report.branches[0];
+    assert_eq!(row.review_stale, None, "a refused answer is not 'current'");
+    assert_eq!(row.checks, None, "a refused answer is not 'nothing ran'");
 }
 
 fn relation_to_origin(lab: &lab::Lab) -> Result<Option<OriginRelation>, knives::jj::JjError> {
@@ -1618,6 +1991,74 @@ fn probe_landed_is_clean_nonempty_for_open_branch() {
 }
 
 #[test]
+fn jj_lib_answers_the_same_probe_from_many_threads_as_from_one() {
+    // Every parallel landed probe opens its own repository handle and replays
+    // inside a transaction it drops. jj's own model is concurrent-safe by design,
+    // but the loaded-repo handle is not assumed Sync, so this is measured rather
+    // than believed. The operation log must also remain unchanged after all
+    // concurrent probes complete.
+    let lab = lab::Lab::new();
+    for index in 0..8 {
+        lab.branch(
+            &format!("feat/b{index}"),
+            &format!("b{index}.txt"),
+            "content\n",
+        );
+    }
+    let branches: Vec<BranchName> = (0..8)
+        .map(|index| BranchName::new(format!("feat/b{index}")))
+        .collect();
+
+    // When: the same probes run serially and then all at once
+    let serial: Vec<RebaseOutcome> = branches
+        .iter()
+        .map(|branch| probe_landed(&lab.work, branch, "main@upstream").expect("serial probe"))
+        .collect();
+    let work = lab.work.as_path();
+    let operations_before = operation_ids(&lab.work);
+    let concurrent: Vec<RebaseOutcome> = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(branches.len());
+        for branch in &branches {
+            handles.push(scope.spawn(move || {
+                probe_landed(work, branch, "main@upstream").expect("concurrent probe")
+            }));
+        }
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("a probe thread panicked"))
+            .collect()
+    });
+
+    // Then: every answer is identical and in the same order
+    assert_eq!(
+        concurrent, serial,
+        "a concurrent probe answered differently from a serial one"
+    );
+    assert!(
+        serial
+            .iter()
+            .all(|outcome| *outcome == RebaseOutcome::CleanNonEmpty),
+        "the fixture's unmerged branches should all be unlanded: {serial:?}"
+    );
+    // And: concurrent probes wrote no operation into the shared log.
+    assert_eq!(operation_ids(&lab.work), operations_before);
+
+    // And: the repository is still readable afterwards and retains every branch.
+    let tips = Repo::open(&lab.work)
+        .expect("reopen after concurrent probes")
+        .bookmark_tips()
+        .expect("read tips");
+    assert!(
+        (0..8).all(
+            |index| tips.contains_key(&BookmarkRef::Local(BranchName::new(format!(
+                "feat/b{index}"
+            ))))
+        ),
+        "a feature bookmark disappeared after concurrent probes: {tips:?}"
+    );
+}
+
+#[test]
 fn probe_landed_cleans_only_its_temporary_commits() {
     // Given: an open branch and a stable working copy.
     let lab = lab::Lab::new();
@@ -3132,6 +3573,144 @@ fn plan_for_a_fixed_release_ignores_a_non_publish_remote() {
 }
 
 #[test]
+fn parallel_landed_probes_answer_exactly_what_serial_ones_did() {
+    // The comment on `maintained_branches` already said these were most of the
+    // runtime. Parallelising them may not change one reported fact, so the proof
+    // is the two reports rendering identically.
+    let lab = lab::Lab::new();
+    for index in 0..6 {
+        lab.branch(
+            &format!("feat/b{index}"),
+            &format!("b{index}.txt"),
+            "content\n",
+        );
+    }
+    lab.publish_pull("feat/b0", 1);
+    lab.squash_merge_pull(1, None);
+    lab.fetch_work();
+    let entry = lab_entry(&lab);
+    let state = tempfile::tempdir().expect("state directory");
+    let store = Store::open(state.path().join("state.json")).expect("open store");
+    let options = |workers: usize| knives::commands::status::Options {
+        probe: true,
+        forge: None,
+        registry: None,
+        ledger: None,
+        workers,
+    };
+    let name = knives::ids::RepoName::new("demo");
+
+    // When: the same repository is gathered serially and on several threads
+    let serial = status::gather(&name, &entry, &store, &options(1)).expect("serial gather");
+    let parallel = status::gather(&name, &entry, &store, &options(8)).expect("parallel gather");
+
+    // Then: not one token differs, including the landed column
+    assert_eq!(
+        status::render(&serial, true),
+        status::render(&parallel, true),
+        "parallelism changed the report"
+    );
+    assert_eq!(status::exit_for(&serial), status::exit_for(&parallel));
+    assert_eq!(
+        parallel
+            .branches
+            .iter()
+            .map(|row| row.landed)
+            .collect::<Vec<_>>(),
+        serial
+            .branches
+            .iter()
+            .map(|row| row.landed)
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        parallel
+            .branches
+            .iter()
+            .any(|row| row.landed == Some(knives::detect::LandedVerdict::InTrunk)),
+        "the merged branch must still be judged in-trunk: {parallel:?}"
+    );
+}
+#[test]
+fn status_all_reports_every_repo_in_registry_order() {
+    // Given: two managed forks in one registry, named so registry order and
+    // completion order can differ — the small one finishes first and must still
+    // print second.
+    let first = Lab::new();
+    first.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let second = Lab::new();
+    for index in 0..6 {
+        second.branch(
+            &format!("feat/b{index}"),
+            &format!("b{index}.txt"),
+            "content\n",
+        );
+    }
+    let home = tempfile::tempdir().expect("create config home");
+    std::fs::write(
+        home.path().join("repos.toml"),
+        format!(
+            "[repos.aardvark]\npath = \"{}\"\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/one.git\"\n\
+             [repos.zebra]\npath = \"{}\"\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/two.git\"\n",
+            second.work.display(),
+            second.upstream.display(),
+            first.work.display(),
+            first.upstream.display(),
+        ),
+    )
+    .expect("write registry");
+
+    // When: every repo is reported at once, from outside both of them.
+    let elsewhere = tempfile::tempdir().expect("somewhere else");
+    let output = Command::new(env!("CARGO_BIN_EXE_knives"))
+        .args(["--text", "status", "--all", "--no-github", "--no-landed"])
+        .current_dir(elsewhere.path())
+        .env("KNIVES_CONFIG_HOME", home.path())
+        .env("KNIVES_TIMING", "1")
+        .output()
+        .expect("run status --all");
+
+    // Then: both are present, in registry order, whichever finished first.
+    let text = String::from_utf8_lossy(&output.stdout);
+    let aardvark = text.find("aardvark").expect("first repo reported");
+    let zebra = text.find("zebra").expect("second repo reported");
+    assert!(
+        aardvark < zebra,
+        "repos were rendered out of registry order: {text}"
+    );
+    assert!(text.contains("feat/b5"), "was: {text}");
+    assert!(text.contains("feat/alpha"), "was: {text}");
+    // And: the timing lines go to stderr, so a script's stdout is still a report.
+    let errors = String::from_utf8_lossy(&output.stderr);
+    assert!(errors.contains("timing aardvark:"), "was: {errors}");
+    assert!(errors.contains("timing zebra:"), "was: {errors}");
+    assert!(
+        !text.contains("timing "),
+        "timings leaked into stdout: {text}"
+    );
+
+    // And: `--all` is exactly each repository's own report, in registry order,
+    // joined the way the serial loop joined them. `--no-landed` makes it exact:
+    // with no probes, a single repo's larger probe budget cannot change a token.
+    let alone = |repo: &str| {
+        let output = Command::new(env!("CARGO_BIN_EXE_knives"))
+            .args(["--text", "status", repo, "--no-github", "--no-landed"])
+            .current_dir(elsewhere.path())
+            .env("KNIVES_CONFIG_HOME", home.path())
+            .output()
+            .expect("run status for one repo");
+        String::from_utf8_lossy(&output.stdout)
+            .trim_end()
+            .to_owned()
+    };
+    assert_eq!(
+        text.trim_end(),
+        format!("{}\n\n{}", alone("aardvark"), alone("zebra")),
+        "--all is not each repo's own report in registry order"
+    );
+}
+
+#[test]
 fn status_with_the_landed_probe_reports_a_merged_branch_and_leaves_no_trace() {
     // The probe path through `knives status` end to end. It is exercised here and
     // deliberately never against a live shared repository, because it mutates.
@@ -3165,6 +3744,7 @@ fn status_with_the_landed_probe_reports_a_merged_branch_and_leaves_no_trace() {
             forge: None,
             registry: None,
             ledger: None,
+            workers: 1,
         },
     )
     .expect("gather");
@@ -3221,6 +3801,7 @@ fn status_reports_branch_overlap_after_upstream_advances_without_landed_probe() 
             forge: None,
             registry: None,
             ledger: None,
+            workers: 1,
         },
     )
     .expect("gather");
@@ -3270,6 +3851,7 @@ fn status_reports_a_branch_carried_elsewhere() {
             forge: None,
             registry: None,
             ledger: None,
+            workers: 1,
         },
     )
     .expect("gather");
@@ -3336,6 +3918,7 @@ fn status_reports_a_carrier_for_a_closed_pull_request() {
             forge: Some(&forge),
             registry: None,
             ledger: None,
+            workers: 1,
         },
     )
     .expect("gather");
@@ -3388,6 +3971,7 @@ fn status_does_not_report_trunk_as_a_carrier_without_landed_probe() {
             forge: None,
             registry: None,
             ledger: None,
+            workers: 1,
         },
     )
     .expect("gather");
@@ -3457,6 +4041,7 @@ fn status_carries_each_branchs_newest_notch_in_json_and_in_text() {
             forge: None,
             registry: None,
             ledger: Some(&ledger),
+            workers: 1,
         },
     )
     .expect("gather");
@@ -3538,6 +4123,7 @@ fn status_carries_repo_level_notches_in_json_and_text() {
             forge: None,
             registry: None,
             ledger: Some(&ledger),
+            workers: 1,
         },
     )
     .expect("gather");
