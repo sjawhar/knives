@@ -1717,7 +1717,8 @@ fn run_release(
             {
                 return Ok(exit);
             }
-            let previous = release::previous_release_for_cut(&entry, &opened.bookmark_tips()?);
+            let tips = opened.bookmark_tips()?;
+            let previous = release::previous_release_for_cut(&entry, &tips);
             let previous_commit = previous.as_ref().map(|(_, commit)| commit.clone());
             // A cut is a new name for the composition in hand, never a recomputation:
             // with a previous release its parents are carried verbatim — nothing joins,
@@ -1725,39 +1726,37 @@ fn run_release(
             // first cut has no composition to carry, so it starts from every branch: a
             // release is a flat merge of feature and fix branches, and the upstream
             // base is never a direct parent — it is reachable through every member.
-            let (carried, members, audit_base, previous_members) =
-                if let Some((_, previous)) = &previous {
-                    let parents: Vec<knives::ids::CommitId> = opened
-                        .parents_of(previous.as_str())?
-                        .into_iter()
-                        .map(|parent| parent.commit)
-                        .collect();
-                    let previous_members = parent_sources(&opened, &entry, &scheme, &parents)?;
-                    let carried = previous_members.clone();
-                    let members = carried.clone();
-                    let base = release::shared_base(&opened, previous, &trunk)?
-                        .unwrap_or_else(|| trunk.clone());
-                    (carried, members, base, previous_members)
-                } else {
-                    let carried = release::carried_branches(&opened, entry.trunk(), &scheme)?;
-                    if carried.is_empty() {
-                        println!(
-                            "{repo}: no branches to cut; a release is a flat merge of feature \
-                             and fix branches, and there are none"
-                        );
-                        return Ok(Exit::Incomplete);
-                    }
-                    let members = carried.clone();
-                    // The first cut audits each branch from the fork point too:
-                    // measuring from the trunk tip charges every commit upstream
-                    // landed since the fork to the branches themselves.
-                    let tips: Vec<knives::ids::CommitId> =
-                        carried.iter().map(|(_, tip)| tip.clone()).collect();
-                    let base = opened
-                        .common_ancestor(&tips, &trunk)?
-                        .unwrap_or_else(|| trunk.clone());
-                    (carried, members, base, Vec::new())
-                };
+            let (carried, members, audit_base) = if let Some((_, previous)) = &previous {
+                let parents: Vec<knives::ids::CommitId> = opened
+                    .parents_of(previous.as_str())?
+                    .into_iter()
+                    .map(|parent| parent.commit)
+                    .collect();
+                let carried = parent_sources(&opened, &entry, &scheme, &parents)?;
+                let members = carried.clone();
+                let base = release::shared_base(&opened, previous, &trunk)?
+                    .unwrap_or_else(|| trunk.clone());
+                (carried, members, base)
+            } else {
+                let carried = release::carried_branches(&opened, entry.trunk(), &scheme)?;
+                if carried.is_empty() {
+                    println!(
+                        "{repo}: no branches to cut; a release is a flat merge of feature \
+                         and fix branches, and there are none"
+                    );
+                    return Ok(Exit::Incomplete);
+                }
+                let members = carried.clone();
+                // The first cut audits each branch from the fork point too:
+                // measuring from the trunk tip charges every commit upstream
+                // landed since the fork to the branches themselves.
+                let member_tips: Vec<knives::ids::CommitId> =
+                    carried.iter().map(|(_, tip)| tip.clone()).collect();
+                let base = opened
+                    .common_ancestor(&member_tips, &trunk)?
+                    .unwrap_or_else(|| trunk.clone());
+                (carried, members, base)
+            };
             let request = cut_request(name.clone(), &carried);
             let mut candidate =
                 release::candidate_cut(&entry.path, &request, previous_commit.as_ref())?;
@@ -1776,6 +1775,22 @@ fn run_release(
             if let Some(exit) = report_cut_audit(&repo, &audit) {
                 return Ok(exit);
             }
+            // The orphan gate protects unreachable commits; this protects the
+            // composition itself. The previous cut's ledger event is the only
+            // record of a parent set that survives the bookmark moving, so the
+            // candidate is held against it before anything is published.
+            let gate = CompositionGate {
+                opened: &opened,
+                parents: &request.parents,
+                base: &audit_base,
+                trunk: &trunk,
+                tips: &tips,
+            };
+            let (recorded, check) =
+                match recorded_composition_check(&repo, &mut candidate, &gate, allow_drop)? {
+                    Ok(verdict) => verdict,
+                    Err(exit) => return Ok(exit),
+                };
             let created = release::publish_cut(candidate, &request.name, &scheme)?;
             let completed = CompletedCut {
                 name: &name,
@@ -1784,10 +1799,8 @@ fn run_release(
                 created: &created,
                 audit: &audit,
                 scheme: &scheme,
-                previous: previous.map(|(name, _)| PreviousCut {
-                    name,
-                    members: previous_members,
-                }),
+                recorded: recorded.as_ref(),
+                check: &check,
             };
             record_cut_event(&repo, &entry, &completed)?;
             worst = worst.worst(report_completed_cut(&repo, &entry, &opened, &completed)?);
@@ -1867,9 +1880,96 @@ fn report_cut_audit(repo: &RepoName, audit: &release::CutAudit) -> Option<Exit> 
     Some(Exit::Incomplete)
 }
 
-struct PreviousCut {
-    name: String,
-    members: Vec<(String, knives::ids::CommitId)>,
+/// The composition gate's inputs: everything the recorded-member check reads
+/// beside the candidate itself.
+struct CompositionGate<'a> {
+    opened: &'a knives::jj::Repo,
+    parents: &'a [knives::ids::CommitId],
+    base: &'a knives::ids::CommitId,
+    trunk: &'a knives::ids::CommitId,
+    tips: &'a knives::detect::BookmarkTips,
+}
+
+/// Hold the candidate against the previous cut's recorded composition.
+///
+/// `Err` is the refusal, already reported. `Ok` carries what the ledger
+/// recorded and what the check found, for the cut event to restate.
+fn recorded_composition_check(
+    repo: &RepoName,
+    candidate: &mut knives::jj::Candidate,
+    gate: &CompositionGate<'_>,
+    allow_drop: bool,
+) -> anyhow::Result<Result<(Option<release::RecordedCut>, release::CompositionCheck), Exit>> {
+    let recorded = release::last_recorded_cut(&Ledger::for_repo(repo).entries()?);
+    let check = match &recorded {
+        Some(recorded) => release::uncarried_recorded_members(
+            gate.opened,
+            candidate,
+            &release::CompositionDelta {
+                recorded,
+                parents: gate.parents,
+                base: gate.base,
+                trunk: gate.trunk,
+                tips: gate.tips,
+            },
+        )?,
+        None => release::CompositionCheck::default(),
+    };
+    if let Some(exit) = report_uncarried_cut(repo, recorded.as_ref(), &check, allow_drop) {
+        return Ok(Err(exit));
+    }
+    Ok(Ok((recorded, check)))
+}
+
+/// Say what the recorded-composition check found; refuse when members are gone.
+///
+/// Inconclusive members are reported without refusing, for the same reason the
+/// audit's are: a conflicted replay onto a conflicted candidate answers nothing
+/// either way. A member the candidate does not carry refuses the cut, because
+/// the previous cut's ledger event is the only surviving record of the
+/// composition — every edit moves the bookmark, and the next cut reaps the
+/// superseded commit. The refused candidate was never published, so nothing is
+/// abandoned and nothing needs cleanup.
+fn report_uncarried_cut(
+    repo: &RepoName,
+    recorded: Option<&release::RecordedCut>,
+    check: &release::CompositionCheck,
+    allow_drop: bool,
+) -> Option<Exit> {
+    let recorded = recorded?;
+    for member in &check.inconclusive {
+        println!(
+            "  {}: recorded by the {} cut; carry check inconclusive (replay conflicted; \
+             re-check after resolving the cut's conflicts)",
+            member.name, recorded.name
+        );
+    }
+    if check.dropped.is_empty() {
+        return None;
+    }
+    if allow_drop {
+        println!(
+            "{repo}: --allow-drop: cutting without {} member(s) the previous cut {} recorded: {}",
+            check.dropped.len(),
+            recorded.name,
+            check.dropped.join(", ")
+        );
+        return None;
+    }
+    println!(
+        "{repo}: refusing to cut: the previous cut {} recorded {} member(s) this cut does not \
+         carry:",
+        recorded.name,
+        check.dropped.len()
+    );
+    for member in &check.dropped {
+        println!("    {member}");
+    }
+    println!(
+        "  the candidate was discarded; `knives release include <branch>` restores a member, \
+         or re-run with --allow-drop to state the drop is intended"
+    );
+    Some(Exit::Incomplete)
 }
 
 struct CompletedCut<'a> {
@@ -1879,7 +1979,8 @@ struct CompletedCut<'a> {
     created: &'a knives::ids::CommitId,
     audit: &'a release::CutAudit,
     scheme: &'a ReleaseScheme,
-    previous: Option<PreviousCut>,
+    recorded: Option<&'a release::RecordedCut>,
+    check: &'a release::CompositionCheck,
 }
 
 /// Record which branches and commits became a published release cut.
@@ -1902,38 +2003,42 @@ fn record_cut_event(
         .join(", ");
     let mut evidence = vec![cut.created.as_str().to_owned()];
     evidence.extend(members.iter().map(|(_, commit)| commit.as_str().to_owned()));
-    let delta = if let Some(previous) = &cut.previous {
-        let trunk = entry.upstream_trunk();
-        let trunk_parent = members
-            .iter()
-            .find(|(source, _)| source == &trunk)
-            .map(|(_, commit)| commit);
-        let dropped = release::unaccounted_previous_members(
-            &opened,
-            &release::ParentDelta {
-                previous: &previous.members,
-                current: &parents,
-                trunk_source: &trunk,
-                trunk_parent,
-            },
-        )?;
-        if dropped.is_empty() {
-            format!(
-                "; previous {} carried {} parent(s); carries every previous parent",
-                previous.name,
-                previous.members.len()
-            )
+    // An unverified member stays in evidence so the next gate rechecks it:
+    // dropping it from the baseline here would let one conflicted cut launder
+    // a member out of the composition without anyone ever stating the drop.
+    let unverified: Vec<String> = cut
+        .check
+        .inconclusive
+        .iter()
+        .map(|member| member.commit.as_str().to_owned())
+        .filter(|sha| !evidence.contains(sha))
+        .collect();
+    evidence.extend(unverified);
+    let delta = cut.recorded.map_or_else(String::new, |recorded| {
+        let carried = if cut.check.dropped.is_empty() {
+            "all carried".to_owned()
+        } else {
+            format!("dropped: {}", cut.check.dropped.join(", "))
+        };
+        let unverified = if cut.check.inconclusive.is_empty() {
+            String::new()
         } else {
             format!(
-                "; previous {} carried {} parent(s); dropped: {}",
-                previous.name,
-                previous.members.len(),
-                dropped.join(", ")
+                "; unverified: {}",
+                cut.check
+                    .inconclusive
+                    .iter()
+                    .map(|member| member.name.clone())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             )
-        }
-    } else {
-        String::new()
-    };
+        };
+        format!(
+            "; previous cut {} recorded {} member(s); {carried}{unverified}",
+            recorded.name,
+            recorded.members.len()
+        )
+    });
     scribe_for(repo, entry)?.record(&Draft {
         subject: Some(cut.name),
         kind: Kind::Event,
@@ -1955,11 +2060,12 @@ fn report_completed_cut(
     opened: &knives::jj::Repo,
     cut: &CompletedCut<'_>,
 ) -> anyhow::Result<Exit> {
-    let mut post_cut_exit = if cut.audit.inconclusive.is_empty() {
-        Exit::Ok
-    } else {
-        Exit::Findings
-    };
+    let mut post_cut_exit =
+        if cut.audit.inconclusive.is_empty() && cut.check.inconclusive.is_empty() {
+            Exit::Ok
+        } else {
+            Exit::Findings
+        };
     print_previous_release_position(opened, entry);
     println!(
         "  cut {} as {} with {} parent(s), flat, not pushed",

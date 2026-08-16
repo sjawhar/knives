@@ -296,8 +296,9 @@ pub enum ReleaseAction {
     Cut {
         /// The dated release name. Omit it for a configured fixed release branch.
         name: Option<String>,
-        /// Proceed even when commits reachable only from the previous release
-        /// lineage would be dropped. The refusal lists exactly what.
+        /// Proceed even when the cut would drop something: commits reachable
+        /// only from the previous release lineage, or members the previous
+        /// cut's ledger event recorded. The refusal lists exactly what.
         #[arg(long)]
         allow_drop: bool,
     },
