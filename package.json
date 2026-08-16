@@ -8,6 +8,11 @@
   "exports": {
     ".": "./plugin/knives.ts"
   },
+  "omp": {
+    "extensions": [
+      "./omp/extensions/knives.ts"
+    ]
+  },
   "files": [
     "plugin/knives.ts",
     "plugin/lib/",
