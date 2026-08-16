@@ -159,7 +159,7 @@ knives depends BRANCH --on R#N  record that a branch cannot land before somethin
 knives notch [SUBJECT]         read what happened here (bare: newest 20; a subject: its whole
                                chronology); -m writes a note, --evidence backs it
 knives release [NAME]          plan, cut, edit or reap a release under the configured scheme
-knives release cut [NAME]      name a new cut of the composition in hand, verbatim (first cut: every branch); refuses to orphan commits ([--allow-drop] overrides); never pushes
+knives release cut [NAME]      name a new cut of the composition in hand, verbatim (first cut: every branch); refuses to orphan commits or to silently drop members the previous cut's ledger event recorded ([--allow-drop] overrides); never pushes
 knives release reap            reap superseded dated release bookmarks everywhere locally and abandon their commits; all kept while the live cut carries conflicts
 knives release include BRANCH  add a branch (or revision) to the release as one new parent; nothing else moves
 knives release drop BRANCH     remove a branch's parent from the release; the branch and its bookmark are untouched

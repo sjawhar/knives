@@ -5,7 +5,7 @@
 //! decided. Planning is the default because everything else here writes: a cut
 //! names a composition, and `include`, `drop`, `advance` and `rebase` change
 //! one. Every one of them writes locally only, and none of them pushes.
-// allow: SIZE_OK: 1622 lines - the release lifecycle's plan, cut, edit, audit, reap, and rebase operations are one domain seam.
+// allow: SIZE_OK: 1795 lines - the release lifecycle's plan, cut, edit, audit, reap, and rebase operations are one domain seam.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -20,6 +20,7 @@ use crate::ids::{
     strict_dated_release,
 };
 use crate::jj::{self, OriginTrunk, Repo};
+use crate::ledger::{Entry, Kind};
 use crate::pins::{PIN_FILES, Pin, PinKind, scan};
 
 /// What repairing this release would actually reach.
@@ -1313,40 +1314,156 @@ pub fn cut(repo: &Path, request: &Cut, scheme: &ReleaseScheme) -> anyhow::Result
     publish_cut(candidate, &request.name, scheme)
 }
 
-/// The two merge-parent sets a cut event compares.
-#[derive(Debug)]
-pub struct ParentDelta<'a> {
-    pub previous: &'a [(String, CommitId)],
-    pub current: &'a [CommitId],
-    pub trunk_source: &'a str,
-    pub trunk_parent: Option<&'a CommitId>,
+/// The composition a previous cut's ledger event recorded: the release name
+/// and the member commits the event stored as evidence.
+///
+/// This is the only record of a cut's parent set that survives the release
+/// bookmark moving: `include`, `drop`, `advance`, a rebase, and a hand-rebuilt
+/// merge all relocate the name, and the next cut reaps the superseded commit
+/// itself. Once that has happened the repository cannot answer "what did the
+/// last cut carry" — the ledger can.
+#[derive(Debug, PartialEq, Eq)]
+pub struct RecordedCut {
+    pub name: String,
+    pub members: Vec<CommitId>,
 }
 
-/// Previous non-trunk parents no new cut parent carries, directly or by ancestry.
-pub fn unaccounted_previous_members(
+/// The newest cut event among `entries`.
+///
+/// Identified structurally: an event about a subject whose text this tool
+/// wrote at cut time (`cut <subject> as …`), carrying the created commit plus
+/// at least one member as evidence. A note never matches, and neither does
+/// prose written by anything else.
+pub fn last_recorded_cut(entries: &[Entry]) -> Option<RecordedCut> {
+    entries.iter().rev().find_map(|entry| {
+        let subject = entry.subject.as_deref()?;
+        if entry.kind != Kind::Event || !entry.text.starts_with(&format!("cut {subject} as ")) {
+            return None;
+        }
+        let (_, members) = entry.evidence.split_first()?;
+        if members.is_empty() {
+            return None;
+        }
+        Some(RecordedCut {
+            name: subject.to_owned(),
+            members: members
+                .iter()
+                .map(|sha| CommitId::new(sha.as_str()))
+                .collect(),
+        })
+    })
+}
+
+/// A recorded member whose carry check answered nothing either way.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Unverified {
+    /// Carried into the new cut event's evidence, so the next gate rechecks it.
+    pub commit: CommitId,
+    /// Rendered for a human: the branch still holding the commit when one does.
+    pub name: String,
+}
+
+/// How a candidate cut relates to the previous cut's recorded composition.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct CompositionCheck {
+    /// Recorded members whose content the candidate does not carry, rendered
+    /// for a human: the branch still holding the commit when one does.
+    pub dropped: Vec<String>,
+    /// Members whose replay conflicted while the candidate itself is
+    /// conflicted: unanswerable either way, exactly as the audit reports it.
+    pub inconclusive: Vec<Unverified>,
+}
+
+/// What the composition gate compares: the candidate's parents against the
+/// members the previous cut's ledger event recorded.
+#[derive(Debug)]
+pub struct CompositionDelta<'a> {
+    pub recorded: &'a RecordedCut,
+    /// The candidate's parents, for the identity and ancestry fast paths.
+    pub parents: &'a [CommitId],
+    /// The audit's base: what every current member forks from. A recorded
+    /// member that is an ancestor of it entered the candidate through the
+    /// base — how a merge-landed member reads as carried after a rebase.
+    pub base: &'a CommitId,
+    /// The upstream trunk tip. A member reachable from it but not from the
+    /// base or any parent landed upstream past what the candidate ships:
+    /// the trunk carries it, this cut does not, and that is a drop.
+    pub trunk: &'a CommitId,
+    pub tips: &'a BookmarkTips,
+}
+
+/// Recorded members of the previous cut that the candidate does not carry.
+///
+/// Identity and ancestry account for a member that is still a parent, was
+/// advanced past, or entered through the candidate's base; the content replay
+/// accounts for one that landed upstream as a squash — the same measure
+/// [`audit_cut`] applies to current members, taken from the member's own fork
+/// point so a moved base is never charged to the member. A member the trunk
+/// reaches but the candidate does not is dropped without a replay: its fork
+/// point degenerates to the member itself, and that replay would read empty
+/// without consulting the candidate at all. A recorded commit this repository
+/// cannot resolve counts as dropped: unverifiable must not read as carried.
+pub fn uncarried_recorded_members(
     repo: &Repo,
-    delta: &ParentDelta<'_>,
-) -> anyhow::Result<Vec<String>> {
-    let mut dropped = Vec::new();
-    for (source, parent) in delta.previous {
-        if source == delta.trunk_source {
+    candidate: &mut jj::Candidate,
+    delta: &CompositionDelta<'_>,
+) -> anyhow::Result<CompositionCheck> {
+    let mut check = CompositionCheck::default();
+    let candidate_conflicted = !candidate.conflicted_files()?.is_empty();
+    for member in &delta.recorded.members {
+        if delta.parents.contains(member) {
             continue;
         }
-        let mut accounted_for = false;
-        for newer in delta.current {
-            if parent == newer || repo.is_ancestor(parent, newer)? {
-                accounted_for = true;
+        if repo.resolve_commit(member.as_str()).is_err() {
+            check
+                .dropped
+                .push(format!("{} (not known to this repository)", short(member)));
+            continue;
+        }
+        let mut carried = repo.is_ancestor(member, delta.base)?;
+        for parent in delta.parents {
+            if carried {
                 break;
             }
+            carried = repo.is_ancestor(member, parent)?;
         }
-        if !accounted_for && let Some(trunk) = delta.trunk_parent {
-            accounted_for = parent == trunk || repo.is_ancestor(parent, trunk)?;
+        if carried {
+            continue;
         }
-        if !accounted_for {
-            dropped.push(format!("{source}@{}", short(parent)));
+        if repo.is_ancestor(member, delta.trunk)? {
+            check.dropped.push(recorded_member_name(member, delta.tips));
+            continue;
+        }
+        let base = repo
+            .common_ancestor(std::slice::from_ref(member), delta.trunk)?
+            .unwrap_or_else(|| delta.trunk.clone());
+        match candidate.replay_outcome(base.as_str(), member.as_str())? {
+            RebaseOutcome::Empty => {}
+            RebaseOutcome::Conflicted if candidate_conflicted => {
+                check.inconclusive.push(Unverified {
+                    commit: member.clone(),
+                    name: recorded_member_name(member, delta.tips),
+                });
+            }
+            RebaseOutcome::CleanNonEmpty | RebaseOutcome::Conflicted => {
+                check.dropped.push(recorded_member_name(member, delta.tips));
+            }
         }
     }
-    Ok(dropped)
+    Ok(check)
+}
+
+/// `feat/gamma@a9a6c3e8ad93` when a local bookmark still holds the commit,
+/// otherwise the commit alone.
+fn recorded_member_name(commit: &CommitId, tips: &BookmarkTips) -> String {
+    let named = tips.iter().find_map(|(reference, tip)| match reference {
+        BookmarkRef::Local(branch) if tip == commit => Some(branch.to_string()),
+        BookmarkRef::Local(_) | BookmarkRef::Remote { .. } => None,
+    });
+    named.map_or_else(
+        || short(commit),
+        |branch| format!("{branch}@{}", short(commit)),
+    )
 }
 
 #[cfg(test)]
@@ -1397,6 +1514,62 @@ mod cut_tests {
         // Reaping it would delete the checkout the operator is standing in.
         let workspaces = vec!["default".to_owned()];
         assert!(workspaces_to_clean(&workspaces, &[]).is_empty());
+    }
+
+    fn cut_event(subject: &str, created: &str, members: &[&str]) -> Entry {
+        let mut evidence = vec![created.to_owned()];
+        evidence.extend(members.iter().map(|sha| (*sha).to_owned()));
+        Entry {
+            ts: "2026-08-15T00:00:00Z".to_owned(),
+            owner: "an-agent".to_owned(),
+            subject: Some(subject.to_owned()),
+            kind: Kind::Event,
+            text: format!(
+                "cut {subject} as {created} with {} parent(s)",
+                members.len()
+            ),
+            evidence,
+            anchor: None,
+            pr: None,
+        }
+    }
+
+    #[test]
+    fn the_newest_cut_event_is_the_recorded_composition() {
+        // Given: two cut events; the newer one is the composition in hand.
+        let entries = vec![
+            cut_event("release/2026-08-14", "aaaa", &["1111", "2222", "3333"]),
+            cut_event("release/2026-08-15", "bbbb", &["1111", "2222"]),
+        ];
+        // When/Then: the newest wins, and evidence splits into created + members.
+        let recorded = last_recorded_cut(&entries).expect("a recorded cut");
+        assert_eq!(recorded.name, "release/2026-08-15");
+        assert_eq!(
+            recorded.members,
+            vec![CommitId::new("1111"), CommitId::new("2222")]
+        );
+    }
+
+    #[test]
+    fn a_note_or_foreign_prose_is_never_a_recorded_cut() {
+        // Given: a note whose prose merely resembles a cut event, and an event
+        // about something else entirely.
+        let mut note = cut_event("release/2026-08-15", "aaaa", &["1111"]);
+        note.kind = Kind::Note;
+        let mut other = cut_event("feat/alpha", "bbbb", &["2222"]);
+        other.text = "synced feat/alpha".to_owned();
+        // When/Then: neither reads as a recorded composition.
+        assert_eq!(last_recorded_cut(&[note, other]), None);
+    }
+
+    #[test]
+    fn a_cut_event_without_member_evidence_is_not_a_baseline() {
+        // A cut always records created + members; anything thinner cannot say
+        // what the previous composition was and must not pretend to.
+        let mut thin = cut_event("release/2026-08-15", "aaaa", &[]);
+        assert_eq!(last_recorded_cut(std::slice::from_ref(&thin)), None);
+        thin.evidence.clear();
+        assert_eq!(last_recorded_cut(&[thin]), None);
     }
 }
 

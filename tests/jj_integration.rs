@@ -1486,67 +1486,311 @@ fn a_release_cut_records_its_whole_parent_set_under_the_release_name() {
         .find(|entry| entry.subject.as_deref() == Some("release/2026-08-16"))
         .unwrap_or_else(|| panic!("no second cut entry: {entries:?}"));
     assert!(
-        second_cut.text.contains(
-            "previous release/2026-08-15 carried 2 parent(s); carries every previous parent"
-        ),
+        second_cut
+            .text
+            .contains("previous cut release/2026-08-15 recorded 2 member(s); all carried"),
         "was: {}",
         second_cut.text
     );
 }
 
 #[test]
-fn a_second_cut_parent_delta_names_a_dropped_member() {
+fn a_cut_that_omits_a_recorded_member_is_refused_until_the_drop_is_stated() {
+    // Given: a three-member cut through the binary, then the release rebuilt
+    // by hand without feat/gamma — the bookmark moved, so the repository no
+    // longer remembers the old composition. The ledger's cut event does.
     let lab = lab::Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     lab.branch("feat/beta", "beta.txt", "beta\n");
     lab.branch("feat/gamma", "gamma.txt", "gamma\n");
-    let repo = Repo::open(&lab.work).expect("open");
-    let alpha = repo.resolve_commit("feat/alpha").expect("alpha");
-    let beta = repo.resolve_commit("feat/beta").expect("beta");
-    let gamma = repo.resolve_commit("feat/gamma").expect("gamma");
-    let trunk = repo.resolve_commit("main@origin").expect("trunk");
+    let (home, _consumer) = home_after_first_cut(&lab);
+    lab.jj_work(["new", "feat/alpha", "feat/beta", "-m", "hand-rebuilt merge"]);
+    lab.jj_work([
+        "bookmark",
+        "set",
+        "release/2026-08-04",
+        "-r",
+        "@",
+        "--allow-backwards",
+    ]);
+    lab.jj_work(["new"]);
+
+    // When: the next cut is taken without stating the drop.
+    let output = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
+
+    // Then: it is refused, the missing member is named, and nothing was cut.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(3), "{stdout}");
+    assert!(
+        stdout.contains("refusing to cut") && stdout.contains("feat/gamma@"),
+        "{stdout}"
+    );
+    assert!(
+        Repo::open(&lab.work)
+            .expect("reopen after the refusal")
+            .resolve_commit("release/2026-08-05")
+            .is_err(),
+        "the refused cut was published anyway"
+    );
+
+    // And when: the drop is stated.
+    let allowed = knives_release(&lab, &home, &["cut", "release/2026-08-05", "--allow-drop"]);
+
+    // Then: the cut lands and its ledger event records exactly what was dropped.
+    let stdout = String::from_utf8_lossy(&allowed.stdout);
+    assert!(
+        stdout.contains("cut release/2026-08-05 as"),
+        "the stated drop was still refused: {stdout}\n{}",
+        String::from_utf8_lossy(&allowed.stderr)
+    );
+    let entries = knives::ledger::Ledger::at(home.path().join("ledger").join("demo"))
+        .entries()
+        .expect("read ledger");
+    let event = entries
+        .iter()
+        .find(|entry| entry.subject.as_deref() == Some("release/2026-08-05"))
+        .unwrap_or_else(|| panic!("no cut entry: {entries:?}"));
+    assert!(
+        event
+            .text
+            .contains("previous cut release/2026-08-04 recorded 3 member(s); dropped: feat/gamma@"),
+        "was: {}",
+        event.text
+    );
+}
+
+#[test]
+fn a_drop_between_cuts_is_restated_at_the_next_cut() {
+    // Given: a member dropped through the tool itself. The drop recorded a why
+    // on the release, but the next cut still ships less than the last one did,
+    // and the cut is where that is stated for the record.
+    let lab = lab::Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let (home, _consumer) = home_after_first_cut(&lab);
+    let dropped = knives_release(
+        &lab,
+        &home,
+        &["drop", "feat/beta", "--why", "not this time"],
+    );
+    assert!(dropped.status.success(), "{dropped:?}");
+
+    // When: the next cut is taken without stating the drop.
+    let output = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
+
+    // Then: the cut is refused and names the member the last cut recorded.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(3), "{stdout}");
+    assert!(
+        stdout.contains("refusing to cut") && stdout.contains("feat/beta@"),
+        "{stdout}"
+    );
+
+    // And when: the drop is stated, the cut lands and records it.
+    let allowed = knives_release(&lab, &home, &["cut", "release/2026-08-05", "--allow-drop"]);
+    let stdout = String::from_utf8_lossy(&allowed.stdout);
+    assert!(stdout.contains("cut release/2026-08-05 as"), "{stdout}");
+    let entries = knives::ledger::Ledger::at(home.path().join("ledger").join("demo"))
+        .entries()
+        .expect("read ledger");
+    let event = entries
+        .iter()
+        .find(|entry| entry.subject.as_deref() == Some("release/2026-08-05"))
+        .unwrap_or_else(|| panic!("no cut entry: {entries:?}"));
+    assert!(
+        event.text.contains("dropped: feat/beta@"),
+        "was: {}",
+        event.text
+    );
+}
+
+#[test]
+fn a_recorded_member_that_landed_upstream_is_carried_not_dropped() {
+    // Given: a member squash-merged upstream, the composition rebased onto the
+    // landing, and the landed member dropped — the standard shrink that loses
+    // no content, because the base now carries the member's diff.
+    let lab = lab::Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let (home, _consumer) = home_after_first_cut(&lab);
+    lab.publish_pull("feat/alpha", 7);
+    lab.squash_merge_pull(7, None);
+    lab.fetch_work();
+    let rebased = knives_release(&lab, &home, &["rebase", "main@upstream"]);
+    assert!(rebased.status.success(), "{rebased:?}");
+    let dropped = knives_release(
+        &lab,
+        &home,
+        &["drop", "feat/alpha", "--why", "landed upstream as #7"],
+    );
+    assert!(dropped.status.success(), "{dropped:?}");
+
+    // When: the next cut is taken without --allow-drop.
+    let output = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
+
+    // Then: nothing refuses — the recorded member's content is in the cut
+    // through its base — and the event records a full carry.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("cut release/2026-08-05 as"),
+        "a landed member was treated as dropped: {stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let entries = knives::ledger::Ledger::at(home.path().join("ledger").join("demo"))
+        .entries()
+        .expect("read ledger");
+    let event = entries
+        .iter()
+        .find(|entry| entry.subject.as_deref() == Some("release/2026-08-05"))
+        .unwrap_or_else(|| panic!("no cut entry: {entries:?}"));
+    assert!(
+        event
+            .text
+            .contains("previous cut release/2026-08-04 recorded 2 member(s); all carried"),
+        "was: {}",
+        event.text
+    );
+}
+
+#[test]
+fn a_recorded_member_this_repository_cannot_resolve_is_named_in_the_refusal() {
+    // Given: a ledger whose newest cut event names a commit this checkout has
+    // never seen — a stale ledger, or a re-clone. Unverifiable must not read
+    // as carried, and the gate applies even to a first cut: with every release
+    // bookmark gone, the ledger is the only witness the composition existed.
+    let lab = lab::Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let (home, _consumer) = release_test_home(&lab);
+    let ledger_dir = home.path().join("ledger").join("demo");
+    std::fs::create_dir_all(&ledger_dir).expect("create ledger directory");
+    std::fs::write(
+        ledger_dir.join("20260801T000000.000000000Z-dead.md"),
+        "+++\n\
+         ts = \"2026-08-01T00:00:00Z\"\n\
+         owner = \"an-agent\"\n\
+         subject = \"release/2026-08-01\"\n\
+         kind = \"event\"\n\
+         evidence = [\"feedfeedfeedfeedfeedfeedfeedfeedfeedfeed\", \"deaddeaddeaddeaddeaddeaddeaddeaddeaddead\"]\n\
+         +++\n\
+         cut release/2026-08-01 as feedfeedfeed with 1 parent(s): feat/old@deaddeaddead\n",
+    )
+    .expect("write a cut event by hand");
+
+    // When: a first cut is taken with no release bookmark anywhere.
+    let output = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
+
+    // Then: the refusal names the unresolvable member rather than shrugging.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(3), "{stdout}");
+    assert!(
+        stdout.contains("deaddeaddead (not known to this repository)"),
+        "{stdout}"
+    );
+
+    // And when: the drop is stated, the first cut proceeds.
+    let allowed = knives_release(&lab, &home, &["cut", "release/2026-08-05", "--allow-drop"]);
+    let stdout = String::from_utf8_lossy(&allowed.stdout);
+    assert!(stdout.contains("cut release/2026-08-05 as"), "{stdout}");
+}
+
+#[test]
+fn a_member_merged_upstream_past_the_candidates_base_is_dropped_not_carried() {
+    // Given: alpha merged into upstream by a MERGE COMMIT, so the recorded tip
+    // is an ancestor of the trunk. The composition was never rebased onto the
+    // landing, and a hand rebuild then dropped alpha: the trunk carries the
+    // content, this cut does not. A fork-point replay would degenerate to the
+    // member itself and read empty without consulting the candidate at all.
+    let lab = lab::Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let (home, _consumer) = home_after_first_cut(&lab);
+    lab.publish_pull("feat/alpha", 7);
+    lab.merge_pull_with_merge_commit(7);
+    lab.fetch_work();
+    lab.jj_work(["new", "feat/beta", "-m", "hand-rebuilt without alpha"]);
+    lab.jj_work([
+        "bookmark",
+        "set",
+        "release/2026-08-04",
+        "-r",
+        "@",
+        "--allow-backwards",
+    ]);
+    lab.jj_work(["new"]);
+
+    // When: the next cut is taken without stating the drop.
+    let output = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
+
+    // Then: it is refused and names alpha — content the upstream carries is
+    // not content this cut ships.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(3), "{stdout}");
+    assert!(
+        stdout.contains("refusing to cut") && stdout.contains("feat/alpha@"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn an_unverified_member_stays_in_the_recorded_composition() {
+    // Given: three members entangled in one file, so every cut is conflicted,
+    // then a hand rebuild without alpha. Alpha's replay onto the conflicted
+    // candidate answers nothing either way — and an unanswered question must
+    // not fall out of the baseline, or one conflicted cut launders a member
+    // out of the composition without anyone stating the drop.
+    let lab = lab::Lab::new();
+    lab.branch("feat/alpha", "shared.txt", "alpha\n");
+    lab.branch("feat/beta", "shared.txt", "beta\n");
+    lab.branch("feat/gamma", "shared.txt", "gamma\n");
+    let (home, _consumer) = release_test_home(&lab);
+    let first = knives_release(&lab, &home, &["cut", "release/2026-08-04"]);
+    assert!(
+        String::from_utf8_lossy(&first.stdout).contains("cut release/2026-08-04 as"),
+        "first conflicted cut was refused: {first:?}"
+    );
+    let alpha = commit_at(&lab, "feat/alpha");
     lab.jj_work([
         "new",
-        "-r",
-        "main@origin",
-        "-r",
-        "feat/alpha",
-        "-r",
         "feat/beta",
-        "-r",
         "feat/gamma",
         "-m",
-        "release/2026-08-15",
+        "hand-rebuilt without alpha",
     ]);
-    lab.jj_work(["bookmark", "create", "release/2026-08-15", "-r", "@"]);
+    lab.jj_work([
+        "bookmark",
+        "set",
+        "release/2026-08-04",
+        "-r",
+        "@",
+        "--allow-backwards",
+    ]);
     lab.jj_work(["new"]);
-    lab.octopus("release/2026-08-16", "feat/alpha", "feat/beta");
-    let repo = Repo::open(&lab.work).expect("reopen");
-    let current: Vec<CommitId> = repo
-        .parents_of("release/2026-08-16")
-        .expect("second cut parents")
-        .into_iter()
-        .map(|parent| parent.commit)
-        .collect();
-    let previous = vec![
-        ("main@upstream".to_owned(), trunk),
-        ("feat/alpha".to_owned(), alpha),
-        ("feat/beta".to_owned(), beta),
-        ("feat/gamma".to_owned(), gamma),
-    ];
 
-    let dropped = knives::commands::release::unaccounted_previous_members(
-        &repo,
-        &knives::commands::release::ParentDelta {
-            previous: &previous,
-            current: &current,
-            trunk_source: "main@upstream",
-            trunk_parent: None,
-        },
-    )
-    .expect("compare parent sets");
-    assert_eq!(dropped.len(), 1, "was: {dropped:?}");
-    assert!(dropped[0].starts_with("feat/gamma@"), "was: {dropped:?}");
+    // When: the next cut is taken.
+    let output = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
+
+    // Then: the check is inconclusive rather than a refusal, and the new cut's
+    // event keeps alpha in evidence so the next gate rechecks it.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("cut release/2026-08-05 as"), "{stdout}");
+    assert!(stdout.contains("carry check inconclusive"), "{stdout}");
+    let entries = knives::ledger::Ledger::at(home.path().join("ledger").join("demo"))
+        .entries()
+        .expect("read ledger");
+    let event = entries
+        .iter()
+        .find(|entry| entry.subject.as_deref() == Some("release/2026-08-05"))
+        .unwrap_or_else(|| panic!("no cut entry: {entries:?}"));
+    assert!(
+        event.text.contains("unverified: feat/alpha@"),
+        "was: {}",
+        event.text
+    );
+    assert!(
+        event.evidence.iter().any(|sha| sha == alpha.as_str()),
+        "alpha fell out of the baseline: {:?}",
+        event.evidence
+    );
 }
 
 #[test]
