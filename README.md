@@ -176,8 +176,10 @@ are somewhere else.
 | `knives hook` | harness plumbing, not for humans |
 | `knives gh` | fork-aware `gh` passthrough |
 
-`--json` works on any of them, and is the default when the environment indicates an agent is
-running it. `--text` forces prose.
+When the environment indicates an agent is running a command (or stdout is not a terminal),
+the report is emitted as [TOON](https://github.com/toon-format/toon) — the same structure as
+JSON at fewer tokens. `--json` forces JSON exactly; `--text` forces prose. The two machine
+encodings are lossless renderings of one report.
 
 Exit codes: `0` nothing to report, `1` findings, `2` usage, `3` something could not be
 answered.

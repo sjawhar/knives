@@ -36,6 +36,12 @@ serde_json = "1"
 tempfile = "3"
 thiserror = "2"
 toml = "0.9"
+# The machine-default output encoding. Pinned exactly: the TOON spec is young
+# and this is a machine surface, so a floating minor must not change what agents
+# read under our feet. Default features ship the crate's CLI and TUI — clap,
+# ratatui, a clipboard — plus a rejected license and three unmaintained-crate
+# advisories; the encoder itself needs none of that.
+toon-format = { version = "=0.5.0", default-features = false }
 
 [dev-dependencies]
 filetime = "0.2"

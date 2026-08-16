@@ -110,6 +110,52 @@ fn a_note_written_from_outside_the_repo_is_read_back_in_both_modes() {
 }
 
 #[test]
+fn the_machine_default_is_toon_and_decodes_to_exactly_the_json_report() {
+    // Given: a written note. The machine default changed from JSON to TOON for
+    // token cost; the contract is that nothing else changed — the TOON output
+    // is the same report, losslessly.
+    let checkout = tempfile::tempdir().expect("checkout");
+    let home = home(checkout.path());
+    let wrote = knives(
+        &home,
+        checkout.path(),
+        &[
+            "--text",
+            "notch",
+            "feat/alpha",
+            "-m",
+            "parked until upstream answers",
+            "--evidence",
+            "06d778b9",
+            "--repo",
+            "a-repo",
+        ],
+    );
+    assert_eq!(wrote.status.code(), Some(0), "{wrote:?}");
+
+    // When: the report is read with no format flag (stdout is a pipe, so the
+    // machine default applies) and once more with explicit --json.
+    let bare = knives(&home, checkout.path(), &["notch", "--repo", "a-repo"]);
+    let json = knives(
+        &home,
+        checkout.path(),
+        &["--json", "notch", "--repo", "a-repo"],
+    );
+
+    // Then: the bare output is TOON, not JSON, and decodes to the identical value.
+    let toon_text = stdout(&bare);
+    assert!(
+        !toon_text.trim_start().starts_with('{'),
+        "the machine default still emits JSON: {toon_text}"
+    );
+    let from_toon: serde_json::Value =
+        toon_format::decode_default(&toon_text).expect("machine default decodes as TOON");
+    let from_json: serde_json::Value =
+        serde_json::from_slice(&json.stdout).expect("--json emits JSON");
+    assert_eq!(from_toon, from_json, "TOON and JSON reports diverged");
+}
+
+#[test]
 fn a_json_write_emits_only_the_entry_it_wrote() {
     let checkout = tempfile::tempdir().expect("checkout");
     let home = home(checkout.path());

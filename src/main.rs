@@ -35,7 +35,7 @@ fn main() -> ExitCode {
 )]
 fn dispatch() -> anyhow::Result<Exit> {
     let cli = Cli::parse();
-    let json = knives::cli::machine_readable(cli.json, cli.text);
+    let output = knives::cli::output_format(cli.json, cli.text);
     match cli.command {
         Command::Hook { harness } => Ok(hook::run(harness)),
         Command::Init { repo } => init::run(repo),
@@ -55,14 +55,14 @@ fn dispatch() -> anyhow::Result<Exit> {
                     probe: !no_landed,
                     use_forge: !no_github,
                 },
-                display: Display { verbose, json },
+                display: Display { verbose, output },
             },
         ),
         Command::Sync {
             repo,
             all,
             no_github,
-        } => run_sync(repo.as_deref(), all, json, !no_github),
+        } => run_sync(repo.as_deref(), all, output, !no_github),
         Command::Start { branch, repo, why } => {
             let Some(name) = one_repo(repo.as_deref())? else {
                 return Ok(Exit::Usage);
@@ -132,7 +132,7 @@ fn dispatch() -> anyhow::Result<Exit> {
                     evidence: &evidence,
                     pr,
                 },
-                json,
+                output,
             )
         }
         Command::Preflight { repo } => {
@@ -1570,7 +1570,7 @@ struct Gather {
 #[derive(Debug, Clone, Copy)]
 struct Display {
     verbose: bool,
-    json: bool,
+    output: knives::cli::Output,
 }
 
 /// How many threads to run at once, from the machine's own answer.
@@ -1590,7 +1590,7 @@ fn run_status(requested: Option<&str>, view: StatusView) -> anyhow::Result<Exit>
     let StatusView {
         scope: Scope { all },
         gather: Gather { probe, use_forge },
-        display: Display { verbose, json },
+        display: Display { verbose, output },
     } = view;
     let chosen = match selected(requested, all)? {
         Ok(list) => list,
@@ -1658,8 +1658,8 @@ fn run_status(requested: Option<&str>, view: StatusView) -> anyhow::Result<Exit>
     let mut first = true;
     for gathered in gathered {
         let (name, report, timings) = gathered?;
-        if json {
-            println!("{}", serde_json::to_string_pretty(&report)?);
+        if let Some(payload) = knives::cli::machine_payload(output, &report)? {
+            println!("{payload}");
         } else {
             if !first {
                 println!();
@@ -2280,7 +2280,7 @@ fn run_preflight(name: &str) -> anyhow::Result<Exit> {
 fn run_sync(
     requested: Option<&str>,
     all: bool,
-    json: bool,
+    output: knives::cli::Output,
     use_forge: bool,
 ) -> anyhow::Result<Exit> {
     let registry = load(&default_config_path())?;
@@ -2297,8 +2297,8 @@ fn run_sync(
     for (name, entry) in chosen {
         let scribe = scribe_for(&name, &entry)?;
         let report = sync::sync_repo(&entry, &mut store, forge, &scribe)?;
-        if json {
-            println!("{}", serde_json::to_string_pretty(&report)?);
+        if let Some(payload) = knives::cli::machine_payload(output, &report)? {
+            println!("{payload}");
         } else {
             println!("{}", sync::render(&report));
         }

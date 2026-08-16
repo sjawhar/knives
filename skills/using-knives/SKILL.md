@@ -295,9 +295,9 @@ owners = ["orgname"]               # forge owners whose repos are trusted for gu
 
 Edits to `repos.toml` take effect on the next hook event or tool call (reloaded per event) — no restart required.
 
-## JSON
+## Machine output
 
-`--json` on any command, and it is the default when the environment indicates an agent is running it, so nothing has to grep prose to count findings. `--text` forces prose.
+When the environment indicates an agent is running a command (or stdout is not a terminal), reports are emitted as TOON — the same structure as JSON at fewer tokens, so nothing has to grep prose to count findings. `--json` forces JSON exactly; `--text` forces prose.
 
 ## Exit codes
 

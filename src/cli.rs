@@ -56,38 +56,63 @@ impl Exit {
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
-    /// Emit JSON instead of text.
+    /// Emit JSON instead of the machine default (TOON).
     ///
     /// The default is decided rather than fixed: an agent reading this output should
-    /// not have to parse prose, and a human should not have to read JSON. See
-    /// `machine_readable`.
+    /// not have to parse prose, and a human should not have to read a machine
+    /// format. See `output_format`.
     #[arg(long, global = true)]
     pub json: bool,
-    /// Force text even where JSON would be chosen automatically.
+    /// Force text even where a machine format would be chosen automatically.
     #[arg(long, global = true, conflicts_with = "json")]
     pub text: bool,
 }
 
-/// Whether to emit JSON.
+/// What a report is rendered as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Output {
+    /// The machine default: the same structure as JSON at fewer tokens, for
+    /// the agents that read almost all of this tool's output.
+    Toon,
+    /// On explicit request, for anything that wants JSON exactly.
+    Json,
+    /// Prose for a human at a terminal.
+    Text,
+}
+
+/// Which format to emit.
 ///
-/// Explicit flags win. Otherwise JSON when the output is not going to a terminal, or
-/// when the environment says an agent is running this: agents were grepping human
-/// output to count findings by detector, which is both fragile and unnecessary.
+/// Explicit flags win. Otherwise a machine format when the output is not going to a
+/// terminal, or when the environment says an agent is running this: agents were
+/// grepping human output to count findings by detector, which is both fragile and
+/// unnecessary. The machine default is TOON — measured on real reports it carries
+/// the same structure at fewer tokens — and `--json` stays as the stable opt-in.
 /// `KNIVES_OWNER` is set by this tool's own `OpenCode` plugin, so it is a direct harness
 /// signal rather than a guess. OMP exposes no such variable to its bash shells; that tool's
 /// stdout is not a terminal, so OMP lands on the non-terminal fallback below.
-pub fn machine_readable(json: bool, text: bool) -> bool {
+pub fn output_format(json: bool, text: bool) -> Output {
     if json {
-        return true;
+        return Output::Json;
     }
     if text {
-        return false;
+        return Output::Text;
     }
-    if agent_environment() {
-        return true;
+    if agent_environment() || !std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+        return Output::Toon;
     }
+    Output::Text
+}
 
-    !std::io::IsTerminal::is_terminal(&std::io::stdout())
+/// A report in its machine encoding, or `None` when prose was chosen.
+pub fn machine_payload<T: serde::Serialize>(
+    output: Output,
+    report: &T,
+) -> anyhow::Result<Option<String>> {
+    Ok(match output {
+        Output::Json => Some(serde_json::to_string_pretty(report)?),
+        Output::Toon => Some(toon_format::encode_default(report)?),
+        Output::Text => None,
+    })
 }
 
 fn agent_environment() -> bool {
@@ -380,19 +405,35 @@ mod tests {
     use clap::CommandFactory as _;
 
     #[test]
-    fn json_is_chosen_for_an_agent_and_text_for_a_person() {
+    fn a_machine_format_is_chosen_for_an_agent_and_text_for_a_person() {
         let _lock = environment_lock();
         let environment = EnvironmentGuard::capture(&["KNIVES_OWNER"]);
         // Agents were grepping human output to count findings by detector. Explicit
         // flags win; otherwise the environment decides.
-        assert!(machine_readable(true, false), "--json is explicit");
-        assert!(!machine_readable(false, true), "--text is explicit");
+        assert_eq!(
+            output_format(true, false),
+            Output::Json,
+            "--json is explicit"
+        );
+        assert_eq!(
+            output_format(false, true),
+            Output::Text,
+            "--text is explicit"
+        );
         // Neither flag: the environment decides, and this tool's own plugin exports
         // `KNIVES_OWNER` into every agent shell, so it is a direct signal rather than a
         // guess about terminals.
         environment.set("KNIVES_OWNER", "someone");
-        assert!(machine_readable(false, false), "an agent shell gets JSON");
-        assert!(!machine_readable(false, true), "--text still wins there");
+        assert_eq!(
+            output_format(false, false),
+            Output::Toon,
+            "an agent shell gets the machine default"
+        );
+        assert_eq!(
+            output_format(false, true),
+            Output::Text,
+            "--text still wins there"
+        );
     }
 
     #[test]

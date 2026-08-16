@@ -167,7 +167,7 @@ knives release advance [BR..]  move member parents to their branches' tips; name
 knives release rebase [REF]    jj rebase -b <release> -d REF (bare: the first trunk commit containing every merged pull request, then landed members carrying nothing more are dropped unless --no-drop; REF required when nothing merged): members and release move together, bookmarks following
 ```
 
-`--json` on any command, and it is the default when the environment says an agent is running it. Agents were grepping human output to count findings by detector.
+TOON is the machine default on any command when the environment says an agent is running it (or stdout is not a terminal): agents were grepping human output to count findings by detector, and JSON answered that at more tokens than the same structure needs. `--json` forces JSON exactly; `--text` forces prose.
 
 `knives notch` is the one command with two moods, split by `-m`: bare it reads, `-m` writes.
 Reading is intentional and nothing injects notches into a session, so the bare form has to

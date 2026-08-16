@@ -134,7 +134,7 @@ fn short(id: &str) -> String {
     inline_human_text(id).chars().take(12).collect()
 }
 
-pub fn run(request: &Request<'_>, json: bool) -> anyhow::Result<Exit> {
+pub fn run(request: &Request<'_>, output: crate::cli::Output) -> anyhow::Result<Exit> {
     let registry = load(&default_config_path())?;
     let Some(entry) = registry.get(request.repo) else {
         let known: Vec<String> = registry.names().map(|name| name.to_string()).collect();
@@ -179,8 +179,8 @@ pub fn run(request: &Request<'_>, json: bool) -> anyhow::Result<Exit> {
             },
         )?,
     };
-    if json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
+    if let Some(payload) = crate::cli::machine_payload(output, &report)? {
+        println!("{payload}");
     } else {
         println!("{}", render(&report));
     }
