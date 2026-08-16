@@ -566,12 +566,12 @@ mod tracking_tests {
 #[cfg(test)]
 mod comment_activity_tests {
     use super::*;
-    use crate::forge::{ChecksSummary, Forge, ForgeError};
+    use crate::forge::{Forge, ForgeError};
     use crate::ids::RepoName;
     use crate::store::Store;
-    use std::cell::RefCell;
     use std::path::Path;
     use std::process::Command;
+    use std::sync::Mutex;
     use tempfile::TempDir;
 
     fn pr(number: u64, branch: &str) -> (BranchName, PullRequest) {
@@ -586,12 +586,12 @@ mod comment_activity_tests {
         )
     }
 
-    #[derive(Debug, Clone)]
+    #[derive(Debug)]
     struct ErroringForge {
         pull_requests: BTreeMap<BranchName, PullRequest>,
         newest_comments: BTreeMap<u64, String>,
         error_on_comment: Option<u64>, // PR number that errors, None = no error
-        comment_calls: RefCell<Vec<u64>>,
+        comment_calls: Mutex<Vec<u64>>,
     }
 
     impl Forge for ErroringForge {
@@ -602,16 +602,12 @@ mod comment_activity_tests {
             Ok(self.pull_requests.clone())
         }
 
-        fn review_predates_head(
+        fn pull_details(
             &self,
             _repo: &Path,
-            _number: u64,
-        ) -> Result<Option<bool>, ForgeError> {
-            Ok(None)
-        }
-
-        fn checks(&self, _repo: &Path, _number: u64) -> Result<Option<ChecksSummary>, ForgeError> {
-            Ok(None)
+            _numbers: &[u64],
+        ) -> Result<BTreeMap<u64, crate::forge::PullDetails>, ForgeError> {
+            Ok(BTreeMap::new())
         }
 
         fn pull_request_state(
@@ -623,7 +619,9 @@ mod comment_activity_tests {
         }
 
         fn newest_comment(&self, _repo: &Path, number: u64) -> Result<Option<String>, ForgeError> {
-            self.comment_calls.borrow_mut().push(number);
+            if let Ok(mut calls) = self.comment_calls.lock() {
+                calls.push(number);
+            }
             if self.error_on_comment == Some(number) {
                 return Err(ForgeError::Command {
                     command: "gh pr view".to_owned(),
@@ -651,16 +649,12 @@ mod comment_activity_tests {
             })
         }
 
-        fn review_predates_head(
+        fn pull_details(
             &self,
             _repo: &Path,
-            _number: u64,
-        ) -> Result<Option<bool>, ForgeError> {
-            Ok(None)
-        }
-
-        fn checks(&self, _repo: &Path, _number: u64) -> Result<Option<ChecksSummary>, ForgeError> {
-            Ok(None)
+            _numbers: &[u64],
+        ) -> Result<BTreeMap<u64, crate::forge::PullDetails>, ForgeError> {
+            Ok(BTreeMap::new())
         }
 
         fn pull_request_state(
@@ -771,7 +765,7 @@ mod comment_activity_tests {
             pull_requests: BTreeMap::new(),
             newest_comments: BTreeMap::new(),
             error_on_comment: None,
-            comment_calls: RefCell::new(Vec::new()),
+            comment_calls: Mutex::new(Vec::new()),
         };
 
         let report = sync_repo(
@@ -833,7 +827,7 @@ mod comment_activity_tests {
             pull_requests: BTreeMap::from([(branch, pull_request)]),
             newest_comments: BTreeMap::from([(42, "2026-07-30T10:00:00Z".to_owned())]),
             error_on_comment: None,
-            comment_calls: RefCell::new(Vec::new()),
+            comment_calls: Mutex::new(Vec::new()),
         };
 
         let mut store = Store::open_for_update(store_path.clone()).unwrap();
@@ -862,7 +856,7 @@ mod comment_activity_tests {
             pull_requests: BTreeMap::from([(branch, pull_request)]),
             newest_comments: BTreeMap::from([(42, "2026-07-29T10:00:00Z".to_owned())]),
             error_on_comment: None,
-            comment_calls: RefCell::new(Vec::new()),
+            comment_calls: Mutex::new(Vec::new()),
         };
 
         let mut store = Store::open(store_path).unwrap();
@@ -893,7 +887,7 @@ mod comment_activity_tests {
             pull_requests: BTreeMap::from([(branch, pull_request)]),
             newest_comments: BTreeMap::new(),
             error_on_comment: Some(42),
-            comment_calls: RefCell::new(Vec::new()),
+            comment_calls: Mutex::new(Vec::new()),
         };
 
         let mut store = Store::open_for_update(store_path).unwrap();
@@ -934,7 +928,7 @@ mod comment_activity_tests {
             pull_requests: BTreeMap::from([(branch, pull_request)]),
             newest_comments: BTreeMap::from([(42, "2026-07-30T10:00:00Z".to_owned())]),
             error_on_comment: None,
-            comment_calls: RefCell::new(Vec::new()),
+            comment_calls: Mutex::new(Vec::new()),
         };
         let mut store = Store::open_for_update(store_path).unwrap();
 
@@ -974,7 +968,7 @@ mod comment_activity_tests {
             pull_requests: BTreeMap::from([(branch, pull_request)]),
             newest_comments: BTreeMap::from([(42, "2026-07-30T10:00:00Z".to_owned())]),
             error_on_comment: None,
-            comment_calls: RefCell::new(Vec::new()),
+            comment_calls: Mutex::new(Vec::new()),
         };
         let mut store = Store::open_for_update(store_path).unwrap();
 
@@ -992,6 +986,6 @@ mod comment_activity_tests {
             report.rows.first().map(|row| &row.state),
             Some(&PullState::Closed)
         );
-        assert!(forge.comment_calls.borrow().is_empty());
+        assert!(forge.comment_calls.lock().expect("lock").is_empty());
     }
 }

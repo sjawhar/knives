@@ -4,7 +4,7 @@
 //! here because each is one jj sequence over a parent set rather than a report
 //! with a renderer. Every other command owns its own logic and returns an
 //! [`Exit`], so the match stays a table.
-// allow: SIZE_OK: 2265 lines - dispatch plus the release-edit verbs; splitting would scatter the exhaustive match.
+// allow: SIZE_OK: 2333 lines - dispatch plus the release-edit verbs; splitting would scatter the exhaustive match.
 
 use std::process::ExitCode;
 
@@ -1573,6 +1573,19 @@ struct Display {
     json: bool,
 }
 
+/// How many threads to run at once, from the machine's own answer.
+fn parallelism() -> usize {
+    std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
+}
+/// Headroom under the forge's documented 100-concurrent-request cap.
+const MAX_REPO_WORKERS: usize = 64;
+
+fn worker_budget(repositories: usize, parallelism: usize) -> (usize, usize) {
+    let repo_workers = repositories.clamp(1, parallelism.min(MAX_REPO_WORKERS));
+    let probe_workers = (parallelism / repo_workers).max(1);
+    (repo_workers, probe_workers)
+}
+
 fn run_status(requested: Option<&str>, view: StatusView) -> anyhow::Result<Exit> {
     let StatusView {
         scope: Scope { all },
@@ -1588,21 +1601,63 @@ fn run_status(requested: Option<&str>, view: StatusView) -> anyhow::Result<Exit>
     let cli_forge = CliForge;
     let forge: Option<&dyn Forge> = if use_forge { Some(&cli_forge) } else { None };
 
+    // Bounded on both axes, because they multiply: repositories are chunked
+    // across at most `repo_workers` threads, and each of those divides the
+    // machine's parallelism among its probes. Spawning one thread per repository
+    // instead would put a ten-repo registry's probe threads at ten times the
+    // budget, and this work is index reads and repository handles, not idle
+    // waiting. Chunked rather than queued for the same reason the probes are: the
+    // bound is the point and a queue would be a dependency.
+    let (repo_workers, probe_workers) = worker_budget(chosen.len(), parallelism());
+    let chunk = chosen.len().div_ceil(repo_workers).max(1);
+    let store = &store;
+    let registry = &registry;
+    let gathered: Vec<anyhow::Result<(RepoName, status::Report, status::Timings)>> =
+        std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(repo_workers);
+            for slice in chosen.chunks(chunk) {
+                handles.push((
+                    slice,
+                    scope.spawn(move || {
+                        slice
+                            .iter()
+                            .map(|(name, entry)| {
+                                let ledger = Ledger::for_repo(name);
+                                let (report, timings) = status::gather_timed(
+                                    name,
+                                    entry,
+                                    store,
+                                    &status::Options {
+                                        probe,
+                                        forge,
+                                        registry: Some(registry),
+                                        ledger: Some(&ledger),
+                                        workers: probe_workers,
+                                    },
+                                )?;
+                                Ok((name.clone(), report, timings))
+                            })
+                            .collect::<Vec<_>>()
+                    }),
+                ));
+            }
+            handles
+                .into_iter()
+                .flat_map(|(slice, handle)| {
+                    handle.join().unwrap_or_else(|_| {
+                        slice
+                            .iter()
+                            .map(|(name, _)| Err(anyhow::anyhow!("gathering {name} panicked")))
+                            .collect()
+                    })
+                })
+                .collect()
+        });
+
     let mut worst = Exit::Ok;
     let mut first = true;
-    for (name, entry) in chosen {
-        let ledger = knives::ledger::Ledger::for_repo(&name);
-        let report = status::gather(
-            &name,
-            &entry,
-            &store,
-            &status::Options {
-                probe,
-                forge,
-                registry: Some(&registry),
-                ledger: Some(&ledger),
-            },
-        )?;
+    for gathered in gathered {
+        let (name, report, timings) = gathered?;
         if json {
             println!("{}", serde_json::to_string_pretty(&report)?);
         } else {
@@ -1611,6 +1666,10 @@ fn run_status(requested: Option<&str>, view: StatusView) -> anyhow::Result<Exit>
             }
             first = false;
             println!("{}", status::render(&report, verbose));
+        }
+        // stderr, so a timed run's stdout is still the report a script parses.
+        if status::timing_enabled() {
+            eprintln!("{}", timings.line(name.as_str()));
         }
         worst = worst.worst(status::exit_for(&report));
     }
@@ -2184,6 +2243,15 @@ mod tests {
     use knives::config::{Registry, RepoEntry, TrustRules};
     use std::collections::BTreeMap;
     use std::path::PathBuf;
+
+    #[test]
+    fn worker_budget_caps_large_repository_sets_under_the_forge_limit() {
+        let (repo_workers, probe_workers) = worker_budget(101, 101);
+
+        assert_eq!(repo_workers, MAX_REPO_WORKERS);
+        assert!(repo_workers <= MAX_REPO_WORKERS);
+        assert!(probe_workers >= 1);
+    }
 
     #[test]
     fn sync_targets_bare_in_managed_repo_selects_that_repo() {

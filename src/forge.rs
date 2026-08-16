@@ -203,6 +203,21 @@ impl PullRequest {
             .is_some_and(|account| account.login.eq_ignore_ascii_case(owner))
     }
 }
+/// What one round trip answers about a pull request beyond its list fields.
+///
+/// A number the forge did not answer for is absent from the map rather than
+/// present with defaults: "not consulted" and "nothing to compare" are different
+/// facts, and rendering the first as the second reports a red pull request as
+/// clean.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PullDetails {
+    /// Whether the newest review predates the newest commit. `None` means there
+    /// was nothing to compare, which must never render as "the review is current".
+    pub review_predates_head: Option<bool>,
+    /// What the forge's checks say. `None` means the forge reported no rollup for
+    /// this pull request at all.
+    pub checks: Option<ChecksSummary>,
+}
 
 #[cfg(test)]
 // Fixture-only defaults keep test pull request literals focused on fields under test.
@@ -301,6 +316,15 @@ pub enum ForgeError {
         code: i32,
         stderr: String,
     },
+    /// The forge named a repository that cannot be split into owner and name.
+    #[error("the forge reported the repository as `{named}`, which is not `<owner>/<name>`")]
+    Target { named: String },
+    /// The forge answered with errors instead of data. Raised rather than read as
+    /// "no details": a partial answer that reads as "nothing to compare" would
+    /// render a red pull request as clean.
+    #[error("the forge rejected the query: {detail}")]
+    Query { detail: String },
+
     #[error("the forge CLI is not installed: {source}")]
     Missing {
         #[from]
@@ -313,22 +337,30 @@ pub enum ForgeError {
     },
 }
 
-pub trait Forge {
+/// The pull request half of a hosting service.
+///
+/// `Send + Sync` because `status` gathers repositories concurrently and probes
+/// branches on scoped threads, and both share one forge.
+pub trait Forge: Send + Sync {
     /// Pull requests in every state, indexed by head branch name.
     fn pull_requests(&self, repo: &Path) -> Result<BTreeMap<BranchName, PullRequest>, ForgeError>;
 
-    /// Was the newest review submitted before the newest commit?
+    /// Review age and check state for many pull requests in one round trip.
     ///
-    /// `None` means there was nothing to compare, which is not the same as
-    /// `Some(false)` and must never render as "the review is current".
-    fn review_predates_head(&self, repo: &Path, number: u64) -> Result<Option<bool>, ForgeError>;
-
-    /// What the forge's checks say about one pull request.
+    /// This replaces a per-pull-request pair — a review-timeline query and a check
+    /// rollup query — each of which cost a process spawn plus an HTTPS round trip.
+    /// A repository with nine open pull requests spent eighteen serial calls where
+    /// one query now answers, and that was most of what made `status` slow. The
+    /// rollup is asked for here rather than in the list query because there it
+    /// exceeds the forge's GraphQL budget and fails the whole call.
     ///
-    /// Per pull request rather than in the list query, because `statusCheckRollup` there
-    /// exceeds the forge's GraphQL budget and fails the whole call. Called only for the
-    /// branches we render, which is our own handful rather than the repository's hundreds.
-    fn checks(&self, repo: &Path, number: u64) -> Result<Option<ChecksSummary>, ForgeError>;
+    /// A number the forge does not answer for is absent from the map. Callers
+    /// must keep that distinct from an empty answer.
+    fn pull_details(
+        &self,
+        repo: &Path,
+        numbers: &[u64],
+    ) -> Result<BTreeMap<u64, PullDetails>, ForgeError>;
 
     /// The state of one pull request by number, whatever that state is.
     ///
@@ -375,27 +407,34 @@ impl Forge for CliForge {
         Ok(index_by_branch(&parse_pull_requests(&payload)?))
     }
 
-    fn review_predates_head(&self, repo: &Path, number: u64) -> Result<Option<bool>, ForgeError> {
+    fn pull_details(
+        &self,
+        repo: &Path,
+        numbers: &[u64],
+    ) -> Result<BTreeMap<u64, PullDetails>, ForgeError> {
+        if numbers.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        // Two subprocesses, not one: the GraphQL endpoint has no repository
+        // context of its own, so the owner and name come from the same resolution
+        // `gh pr list` uses — whatever the remotes and the resolved-repository
+        // markers say, rather than a second guess of our own.
+        let named = Self::run(repo, &["repo", "view", "--json", "nameWithOwner"])?;
+        let (owner, name) = parse_repo_target(&named)?;
         let payload = Self::run(
             repo,
             &[
-                "pr",
-                "view",
-                &number.to_string(),
-                "--json",
-                "reviews,commits",
+                "api",
+                "graphql",
+                "-f",
+                &format!("owner={owner}"),
+                "-f",
+                &format!("name={name}"),
+                "-f",
+                &format!("query={}", pull_details_query(numbers)),
             ],
         )?;
-        compare_review_to_head(&payload)
-    }
-
-    fn checks(&self, repo: &Path, number: u64) -> Result<Option<ChecksSummary>, ForgeError> {
-        let number = number.to_string();
-        let payload = Self::run(
-            repo,
-            &["pr", "view", &number, "--json", "statusCheckRollup"],
-        )?;
-        Ok(Some(parse_checks(&payload)?))
+        parse_pull_details(&payload)
     }
 
     fn pull_request_state(&self, repo: &Path, number: u64) -> Result<Option<String>, ForgeError> {
@@ -426,21 +465,56 @@ struct StateOnly {
     state: String,
 }
 
-#[derive(Deserialize)]
-struct CheckRollup {
-    #[serde(default, rename = "statusCheckRollup")]
-    checks: Option<ChecksSummary>,
-}
-
 pub fn parse_state(payload: &str) -> Result<Option<String>, serde_json::Error> {
     let parsed: StateOnly = serde_json::from_str(payload)?;
     Ok(Some(parsed.state))
 }
+/// One aliased field per number, so the reply carries exactly the pull requests
+/// asked about and nothing else.
+///
+/// Alias names are not load-bearing: every entry repeats its own `number` and the
+/// parser keys on that, so a forge that normalises aliases cannot silently
+/// reassign a rollup to the wrong pull request. `commits(last: 1)` is where the
+/// rollup lives — a pull request has no rollup of its own, only its head commit
+/// does — and the connections are bounded because an unbounded one is a rejected
+/// query rather than a slow one.
+// `last` keeps the newest items, so newest review and newest commit are
+// inside every truncation and need no pagination guard.
+pub fn pull_details_query(numbers: &[u64]) -> String {
+    let fields: String = numbers
+        .iter()
+        .map(|number| format!("p{number}: pullRequest(number: {number}) {{ ...details }}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        "query($owner: String!, $name: String!) {{ \
+         repository(owner: $owner, name: $name) {{ {fields} }} }} \
+         fragment details on PullRequest {{ number \
+         reviews(last: 100) {{ nodes {{ submittedAt }} }} \
+         commits(last: 100) {{ nodes {{ commit {{ committedDate }} }} }} \
+         rollup: commits(last: 1) {{ nodes {{ commit {{ statusCheckRollup {{ \
+         contexts(first: 100) {{ pageInfo {{ hasNextPage }} nodes {{ __typename \
+         ... on CheckRun {{ name conclusion }} \
+         ... on StatusContext {{ context state }} }} }} }} }} }} }} }}"
+    )
+}
 
-pub fn parse_checks(payload: &str) -> Result<ChecksSummary, ForgeError> {
-    Ok(serde_json::from_str::<CheckRollup>(payload)?
-        .checks
-        .unwrap_or_default())
+#[derive(Deserialize)]
+struct RepoTarget {
+    #[serde(rename = "nameWithOwner")]
+    name_with_owner: String,
+}
+
+/// The owner and name to query, from the forge's own answer about this checkout.
+pub fn parse_repo_target(payload: &str) -> Result<(String, String), ForgeError> {
+    let target: RepoTarget = serde_json::from_str(payload)?;
+    target
+        .name_with_owner
+        .split_once('/')
+        .map(|(owner, name)| (owner.to_owned(), name.to_owned()))
+        .ok_or(ForgeError::Target {
+            named: target.name_with_owner,
+        })
 }
 
 pub fn parse_pull_requests(payload: &str) -> Result<Vec<PullRequest>, ForgeError> {
@@ -458,14 +532,6 @@ pub fn index_by_branch(prs: &[PullRequest]) -> BTreeMap<BranchName, PullRequest>
 }
 
 #[derive(Deserialize)]
-struct ReviewAges {
-    #[serde(default)]
-    reviews: Vec<Dated>,
-    #[serde(default)]
-    commits: Vec<Committed>,
-}
-
-#[derive(Deserialize)]
 struct Dated {
     #[serde(rename = "submittedAt")]
     submitted_at: Option<String>,
@@ -477,20 +543,161 @@ struct Committed {
     committed_date: String,
 }
 
+#[derive(Deserialize)]
+#[serde(bound(deserialize = "T: Deserialize<'de>"))]
+struct Nodes<T> {
+    #[serde(default, rename = "pageInfo")]
+    page_info: PageInfo,
+    #[serde(default)]
+    nodes: Vec<T>,
+}
+
+#[derive(Deserialize)]
+struct CommitNode {
+    commit: Committed,
+}
+
+#[derive(Deserialize)]
+struct RollupNode {
+    commit: RollupHolder,
+}
+
+#[derive(Deserialize)]
+struct RollupHolder {
+    #[serde(default, rename = "statusCheckRollup")]
+    rollup: Option<Contexts>,
+}
+
+#[derive(Deserialize, Default)]
+struct PageInfo {
+    #[serde(default, rename = "hasNextPage")]
+    has_next_page: bool,
+}
+
+#[derive(Deserialize)]
+struct Contexts {
+    #[serde(default)]
+    contexts: Option<Nodes<CheckRun>>,
+}
+
+#[derive(Deserialize)]
+struct DetailsPayload {
+    number: u64,
+    #[serde(default)]
+    reviews: Option<Nodes<Dated>>,
+    #[serde(default)]
+    commits: Option<Nodes<CommitNode>>,
+    #[serde(default)]
+    rollup: Option<Nodes<RollupNode>>,
+}
+
+#[derive(Deserialize)]
+struct DetailsData {
+    #[serde(default)]
+    repository: Option<BTreeMap<String, Option<DetailsPayload>>>,
+}
+
+#[derive(Deserialize)]
+struct QueryFailure {
+    #[serde(default)]
+    message: String,
+}
+
+#[derive(Deserialize)]
+struct DetailsEnvelope {
+    #[serde(default)]
+    data: Option<DetailsData>,
+    #[serde(default)]
+    errors: Vec<QueryFailure>,
+}
+
+/// Review age and check state per pull request, from one batch reply.
+///
 /// A review four days older than the branch head sent an agent to rewrite
-/// already-fixed code. This comparison is the whole point.
-pub fn compare_review_to_head(payload: &str) -> Result<Option<bool>, ForgeError> {
-    let ages: ReviewAges = serde_json::from_str(payload)?;
-    let newest_review = ages
-        .reviews
-        .iter()
-        .filter_map(|r| r.submitted_at.as_deref())
-        .max();
-    let newest_commit = ages.commits.iter().map(|c| c.committed_date.as_str()).max();
-    match (newest_review, newest_commit) {
-        (Some(review), Some(commit)) => Ok(Some(review < commit)),
-        _ => Ok(None),
+/// already-fixed code; that comparison is why the review timeline is asked for at
+/// all. `CliForge::run` normally catches GraphQL errors first when `gh` exits
+/// nonzero; the parser guard is defence-in-depth for an exit-zero reply that
+/// still carries errors. An empty answer reads as "nothing to compare" and "no
+/// checks", which is how a red pull request reads as clean.
+pub fn parse_pull_details(payload: &str) -> Result<BTreeMap<u64, PullDetails>, ForgeError> {
+    let envelope: DetailsEnvelope = serde_json::from_str(payload)?;
+    // Deliberately discard partial answers: one loud batch problem, never salvage `data.repository` alongside errors.
+    if !envelope.errors.is_empty() {
+        return Err(ForgeError::Query {
+            detail: envelope
+                .errors
+                .iter()
+                .map(|failure| failure.message.clone())
+                .collect::<Vec<_>>()
+                .join("; "),
+        });
     }
+    let mut details = BTreeMap::new();
+    // No errors AND no repository is not an empty answer. This is only ever
+    // called for a non-empty query — `CliForge::pull_details` returns early
+    // otherwise — so a reply carrying neither is a reply about nothing, and
+    // reporting it as "nothing to compare, no checks ran" is exactly how a red
+    // pull request reads as clean.
+    let Some(repository) = envelope.data.and_then(|data| data.repository) else {
+        return Err(ForgeError::Query {
+            detail: "the reply carried neither errors nor a repository".to_owned(),
+        });
+    };
+    for payload in repository.into_values().flatten() {
+        let newest_review = payload
+            .reviews
+            .iter()
+            .flat_map(|list| list.nodes.iter())
+            .filter_map(|review| review.submitted_at.as_deref())
+            .max();
+        let newest_commit = payload
+            .commits
+            .iter()
+            .flat_map(|list| list.nodes.iter())
+            .map(|node| node.commit.committed_date.as_str())
+            .max();
+        let review_predates_head = match (newest_review, newest_commit) {
+            (Some(review), Some(commit)) => Some(review < commit),
+            _ => None,
+        };
+        let has_more_contexts = payload
+            .rollup
+            .iter()
+            .flat_map(|list| list.nodes.iter())
+            .filter_map(|node| node.commit.rollup.as_ref())
+            .filter_map(|rollup| rollup.contexts.as_ref())
+            .any(|contexts| contexts.page_info.has_next_page);
+        if has_more_contexts {
+            return Err(ForgeError::Query {
+                detail: format!(
+                    "pull request #{} has more than 100 check contexts; refusing a truncated rollup",
+                    payload.number
+                ),
+            });
+        }
+
+        // Always `Some` for a pull request the reply carried: it was consulted,
+        // and an absent rollup means nothing ran rather than nobody asked.
+        let checks = Some(ChecksSummary {
+            runs: payload
+                .rollup
+                .iter()
+                .flat_map(|list| list.nodes.iter())
+                .filter_map(|node| node.commit.rollup.as_ref())
+                .filter_map(|rollup| rollup.contexts.as_ref())
+                .flat_map(|contexts| contexts.nodes.iter())
+                .cloned()
+                .collect(),
+        });
+        let _ = details.insert(
+            payload.number,
+            PullDetails {
+                review_predates_head,
+                checks,
+            },
+        );
+    }
+    Ok(details)
 }
 
 #[derive(Deserialize)]
@@ -534,15 +741,30 @@ impl Forge for FakeForge {
         Ok(self.pull_requests.clone())
     }
 
-    fn review_predates_head(&self, _repo: &Path, number: u64) -> Result<Option<bool>, ForgeError> {
-        if self.pull_requests.values().any(|pr| pr.number == number) {
-            return Ok(Some(self.stale_reviews.contains(&number)));
-        }
-        Ok(None)
-    }
-
-    fn checks(&self, _repo: &Path, number: u64) -> Result<Option<ChecksSummary>, ForgeError> {
-        Ok(self.checks.get(&number).cloned())
+    fn pull_details(
+        &self,
+        _repo: &Path,
+        numbers: &[u64],
+    ) -> Result<BTreeMap<u64, PullDetails>, ForgeError> {
+        Ok(numbers
+            .iter()
+            .map(|number| {
+                let known = self
+                    .pull_requests
+                    .values()
+                    .any(|pull_request| pull_request.number == *number);
+                (
+                    *number,
+                    PullDetails {
+                        // A pull request the fake does not know has nothing to
+                        // compare, exactly as the real forge answers for one whose
+                        // timeline it cannot see.
+                        review_predates_head: known.then(|| self.stale_reviews.contains(number)),
+                        checks: self.checks.get(number).cloned(),
+                    },
+                )
+            })
+            .collect())
     }
 
     fn pull_request_state(&self, _repo: &Path, number: u64) -> Result<Option<String>, ForgeError> {
@@ -752,77 +974,185 @@ mod tests {
         );
     }
 
+    /// The batch reply's shape, with one pull request per aliased field.
+    fn details_payload(entries: &str) -> String {
+        format!("{{\"data\":{{\"repository\":{{{entries}}}}}}}")
+    }
+
     #[test]
-    fn a_failing_check_is_told_from_one_that_never_ran() {
-        // Given: one pull request with a failed check and one whose checks have not run
-        let failed_payload = r#"{
-           "statusCheckRollup":[
-             {"__typename":"CheckRun","conclusion":"FAILURE","name":"build"},
-             {"__typename":"CheckRun","conclusion":"SUCCESS","name":"lint"}
-           ]}
-        "#;
-        let empty_payload = r#"{"statusCheckRollup":[]}"#;
+    fn a_failing_check_is_told_from_one_that_never_ran_and_from_one_not_asked_about() {
+        // Three states, and conflating any two of them misreports a pull request:
+        // red CI, green-or-nothing-ran, and never consulted.
+        let payload = details_payload(
+            "\"p11\":{\"number\":11,\"rollup\":{\"nodes\":[{\"commit\":{\"statusCheckRollup\":\
+             {\"contexts\":{\"nodes\":[\
+             {\"__typename\":\"CheckRun\",\"conclusion\":\"FAILURE\",\"name\":\"build\"},\
+             {\"__typename\":\"CheckRun\",\"conclusion\":\"SUCCESS\",\"name\":\"lint\"}]}}}}]}},\
+             \"p12\":{\"number\":12,\"rollup\":{\"nodes\":[{\"commit\":{\"statusCheckRollup\":null}}]}}",
+        );
 
-        // When: each per-pull-request forge response is parsed
-        let failed = parse_checks(failed_payload).expect("parse");
-        let never_ran = parse_checks(empty_payload).expect("parse");
+        let details = parse_pull_details(&payload).expect("parse");
 
-        // Then: a failure and a never-ran rollup remain distinct
-        assert!(failed.failing(), "a FAILURE conclusion is failing");
-        assert_eq!(failed.failed_names(), vec!["build".to_owned()]);
-        assert!(failed.ran());
-        assert!(!never_ran.failing(), "an empty rollup is not a failure");
-        assert!(!never_ran.ran(), "an empty rollup means nothing ran");
-        assert!(!ChecksSummary::default().failing());
+        let failing = details[&11].checks.as_ref().expect("consulted");
+        assert!(failing.failing(), "a FAILURE conclusion is failing");
+        assert_eq!(failing.failed_names(), vec!["build".to_owned()]);
+        assert!(failing.ran());
+        let quiet = details[&12].checks.as_ref().expect("consulted");
+        assert!(!quiet.failing(), "an absent rollup is not a failure");
+        assert!(!quiet.ran(), "an absent rollup means nothing ran");
+        assert!(
+            !details.contains_key(&13),
+            "a number the reply did not carry is not consulted, not empty"
+        );
     }
 
     #[test]
     fn an_error_status_context_is_not_silently_treated_as_still_running() {
-        // Given: external CI reports an aborted build through the StatusContext state field
-        let payload = r#"{"statusCheckRollup":[{"__typename":"StatusContext","context":"legacy-ci","state":"ERROR"}]}"#;
+        // External CI posting commit statuses reports an aborted build this way, and
+        // missing it made a red pull request read as clean green.
+        let payload = details_payload(
+            "\"p11\":{\"number\":11,\"rollup\":{\"nodes\":[{\"commit\":{\"statusCheckRollup\":\
+             {\"contexts\":{\"nodes\":[{\"__typename\":\"StatusContext\",\"context\":\"legacy-ci\",\
+             \"state\":\"ERROR\"}]}}}}]}}",
+        );
 
-        // When: the per-pull-request forge response is parsed
-        let checks = parse_checks(payload).expect("parse");
+        let details = parse_pull_details(&payload).expect("parse");
 
-        // Then: its context and state become a named failed check
+        let checks = details[&11].checks.as_ref().expect("consulted");
         assert!(checks.failing(), "an ERROR state is failing");
         assert_eq!(checks.failed_names(), vec!["legacy-ci".to_owned()]);
     }
 
     #[test]
-    fn an_omitted_rollup_means_checks_were_asked_for_but_nothing_ran() {
-        // Given: a successful per-pull-request response without a rollup key
-        let payload = "{}";
+    fn a_review_is_stale_current_or_incomparable_and_the_three_stay_distinct() {
+        // A review four days older than the branch head sent an agent to rewrite
+        // already-fixed code. "No review exists" is not "the review is current".
+        let payload = details_payload(
+            "\"p1\":{\"number\":1,\"reviews\":{\"nodes\":[{\"submittedAt\":\"2026-07-01T00:00:00Z\"}]},\
+             \"commits\":{\"nodes\":[{\"commit\":{\"committedDate\":\"2026-07-02T00:00:00Z\"}}]}},\
+             \"p2\":{\"number\":2,\"reviews\":{\"nodes\":[{\"submittedAt\":\"2026-07-03T00:00:00Z\"}]},\
+             \"commits\":{\"nodes\":[{\"commit\":{\"committedDate\":\"2026-07-02T00:00:00Z\"}}]}},\
+             \"p3\":{\"number\":3,\"reviews\":{\"nodes\":[]},\
+             \"commits\":{\"nodes\":[{\"commit\":{\"committedDate\":\"2026-07-02T00:00:00Z\"}}]}}",
+        );
 
-        // When: the response is parsed
-        let checks = parse_checks(payload).expect("parse");
+        let details = parse_pull_details(&payload).expect("parse");
 
-        // Then: it remains distinct from an unconsulted pull request
-        assert_eq!(checks, ChecksSummary::default());
+        assert_eq!(details[&1].review_predates_head, Some(true));
+        assert_eq!(details[&2].review_predates_head, Some(false));
+        assert_eq!(details[&3].review_predates_head, None);
     }
 
     #[test]
-    fn a_review_older_than_the_newest_commit_is_stale() {
-        // Given: a review from the 1st and a commit from the 2nd
-        let payload = r#"{"reviews":[{"submittedAt":"2026-07-01T00:00:00Z"}],
-                          "commits":[{"committedDate":"2026-07-02T00:00:00Z"}]}"#;
-        // When / Then: the review predates the head
-        assert_eq!(compare_review_to_head(payload).unwrap(), Some(true));
+    fn the_newest_review_and_the_newest_commit_decide_it_rather_than_the_last_listed() {
+        // The reply's node order is the forge's business, not ours.
+        let payload = details_payload(
+            "\"p1\":{\"number\":1,\"reviews\":{\"nodes\":[\
+             {\"submittedAt\":\"2026-07-05T00:00:00Z\"},{\"submittedAt\":\"2026-07-01T00:00:00Z\"}]},\
+             \"commits\":{\"nodes\":[\
+             {\"commit\":{\"committedDate\":\"2026-07-04T00:00:00Z\"}},\
+             {\"commit\":{\"committedDate\":\"2026-07-02T00:00:00Z\"}}]}}",
+        );
+        assert_eq!(
+            parse_pull_details(&payload).expect("parse")[&1].review_predates_head,
+            Some(false)
+        );
     }
 
     #[test]
-    fn a_review_newer_than_the_newest_commit_is_current() {
-        let payload = r#"{"reviews":[{"submittedAt":"2026-07-03T00:00:00Z"}],
-                          "commits":[{"committedDate":"2026-07-02T00:00:00Z"}]}"#;
-        assert_eq!(compare_review_to_head(payload).unwrap(), Some(false));
+    fn a_query_the_forge_rejected_is_an_error_rather_than_an_empty_answer() {
+        // A partial answer that read as "nothing to compare" would render a red
+        // pull request as clean, which is the whole failure class this raises for.
+        let payload =
+            "{\"data\":null,\"errors\":[{\"message\":\"Could not resolve to a Repository\"}]}";
+        let error = parse_pull_details(payload).expect_err("errors must not be swallowed");
+        assert!(matches!(&error, ForgeError::Query { .. }), "was: {error}");
+        assert!(
+            error.to_string().contains("Could not resolve"),
+            "was: {error}"
+        );
     }
 
     #[test]
-    fn nothing_to_compare_is_none_rather_than_false() {
-        // None and Some(false) must stay distinguishable: "no review exists" is
-        // not "the review is current".
-        let payload = r#"{"reviews":[],"commits":[{"committedDate":"2026-07-02T00:00:00Z"}]}"#;
-        assert_eq!(compare_review_to_head(payload).unwrap(), None);
+    fn a_reply_with_neither_errors_nor_a_repository_answers_nothing_loudly() {
+        // The silent-fallback shape: no errors, no data, so every requested fact
+        // would come back absent and every red pull request would read as clean.
+        let error = parse_pull_details("{\"data\":{}}")
+            .expect_err("a reply about nothing is not an answer");
+        assert!(matches!(&error, ForgeError::Query { .. }), "was: {error}");
+
+        // But a repository that answered `null` for a number it does not have IS
+        // an answer: that number was not consulted, and the boundary between the
+        // two cases is the whole point.
+        let present = parse_pull_details("{\"data\":{\"repository\":{\"p9\":null}}}")
+            .expect("a repository that resolved is an answer");
+        assert!(present.is_empty());
+    }
+
+    #[test]
+    fn the_batch_query_asks_about_every_number_and_nothing_else() {
+        let query = pull_details_query(&[1157, 4545]);
+        assert!(query.contains("pullRequest(number: 1157)"), "was: {query}");
+        assert!(query.contains("pullRequest(number: 4545)"), "was: {query}");
+        assert!(query.contains("statusCheckRollup"), "was: {query}");
+        assert!(query.contains("submittedAt"), "was: {query}");
+        assert!(query.contains("committedDate"), "was: {query}");
+        assert!(query.contains("hasNextPage"), "was: {query}");
+        // Every entry repeats its own number, so alias names are not load-bearing.
+        assert!(query.contains("number"), "was: {query}");
+    }
+
+    #[test]
+    fn a_rollup_with_more_than_one_page_of_contexts_is_unavailable() {
+        let contexts: Vec<serde_json::Value> = (0..100)
+            .map(|number| {
+                serde_json::json!({
+                    "__typename": "CheckRun",
+                    "name": format!("green-{number}"),
+                    "conclusion": "SUCCESS",
+                })
+            })
+            .collect();
+        let payload = serde_json::json!({
+            "data": {
+                "repository": {
+                    "p7": {
+                        "number": 7,
+                        "rollup": {
+                            "nodes": [{
+                                "commit": {
+                                    "statusCheckRollup": {
+                                        "contexts": {
+                                            "pageInfo": { "hasNextPage": true },
+                                            "nodes": contexts,
+                                        }
+                                    }
+                                }
+                            }]
+                        }
+                    }
+                }
+            }
+        })
+        .to_string();
+
+        let error = parse_pull_details(&payload)
+            .expect_err("a paginated check rollup must not render as complete");
+
+        assert!(matches!(&error, ForgeError::Query { .. }), "was: {error}");
+        assert!(error.to_string().contains("#7"), "was: {error}");
+        assert!(error.to_string().contains("more than 100"), "was: {error}");
+    }
+
+    #[test]
+    fn a_repository_the_forge_will_not_split_into_owner_and_name_is_an_error() {
+        assert_eq!(
+            parse_repo_target("{\"nameWithOwner\":\"our-org/some-repo\"}").expect("split"),
+            ("our-org".to_owned(), "some-repo".to_owned())
+        );
+        let error = parse_repo_target("{\"nameWithOwner\":\"bare\"}")
+            .expect_err("a name with no owner cannot be queried");
+        assert!(matches!(&error, ForgeError::Target { .. }), "was: {error}");
     }
 
     #[test]
@@ -862,12 +1192,11 @@ mod tests {
     }
 
     #[test]
-    fn the_fake_reports_none_for_a_pull_request_it_does_not_know() {
+    fn the_fake_answers_a_review_only_for_a_pull_request_it_knows() {
         let fake = FakeForge::default();
-        assert_eq!(
-            fake.review_predates_head(Path::new("/tmp"), 7).unwrap(),
-            None
-        );
+        let details = fake.pull_details(Path::new("/tmp"), &[7]).expect("details");
+        assert_eq!(details[&7].review_predates_head, None);
+        assert_eq!(details[&7].checks, None);
     }
 
     #[test]
@@ -884,12 +1213,32 @@ mod tests {
             ..FakeForge::default()
         };
 
-        // When: checks are requested for known and unknown pull requests
-        let known = fake.checks(Path::new("/tmp"), 7).expect("checks");
-        let unknown = fake.checks(Path::new("/tmp"), 8).expect("checks");
+        // When: both are asked about in one call
+        let details = fake
+            .pull_details(Path::new("/tmp"), &[7, 8])
+            .expect("details");
 
         // Then: unknown means not consulted, not an empty rollup
-        assert_eq!(known, Some(checks));
-        assert_eq!(unknown, None);
+        assert_eq!(details[&7].checks, Some(checks));
+        assert_eq!(details[&8].checks, None);
+    }
+
+    #[test]
+    fn the_fake_reports_a_stale_review_for_a_pull_request_it_knows_is_stale() {
+        let mut pull_requests = BTreeMap::new();
+        let _ = pull_requests.insert(
+            BranchName::new("feat/alpha"),
+            PullRequest {
+                number: 7,
+                ..PullRequest::default()
+            },
+        );
+        let fake = FakeForge {
+            pull_requests,
+            stale_reviews: vec![7],
+            ..FakeForge::default()
+        };
+        let details = fake.pull_details(Path::new("/tmp"), &[7]).expect("details");
+        assert_eq!(details[&7].review_predates_head, Some(true));
     }
 }

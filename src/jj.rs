@@ -45,6 +45,8 @@ pub enum JjError {
     Process { program: String, detail: String },
     #[error("probe did not create exactly one root commit")]
     ProbeRoot,
+    #[error("the landed probe for `{branch}` panicked")]
+    ProbePanic { branch: String },
     #[error("could not parse command output: {detail}")]
     Parse { detail: String },
     #[error("commit {commit} is immutable: pinned by {pin}")]
