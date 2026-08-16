@@ -493,9 +493,9 @@ mod tests {
     }
 
     #[test]
-    fn a_claim_without_a_reason_is_rejected_by_the_parser() {
-        // The description is what makes `knives wip` useful to another agent, so
-        // the parser refuses rather than the command failing later.
+    fn track_fork_only_parses_without_a_pull_request_number() {
+        // Marking a branch as deliberately having no upstream pull request must
+        // not demand one.
         assert!(Cli::try_parse_from(["knives", "track", "a-branch", "--fork-only"]).is_ok());
     }
 

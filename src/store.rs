@@ -121,7 +121,7 @@ pub enum StoreError {
 
 /// Held for the duration of a read-modify-write.
 ///
-/// Without it the store is last-writer-wins: two `knives claim` runs that
+/// Without it the store is last-writer-wins: two `knives start` runs that
 /// interleave read, decide and write both see "unclaimed", both report success,
 /// and the second erases the first. For a tool whose stated purpose is to make
 /// collisions between agents visible before they cost work, the coordination
@@ -649,7 +649,7 @@ mod lock_tests {
 
     #[test]
     fn a_second_writer_cannot_open_while_the_first_holds_the_lock() {
-        // Two `knives claim` runs that interleave read, decide and write both used
+        // Two concurrent claim writers that interleave read, decide and write both used
         // to see "unclaimed", both report success, and the second erase the
         // first. The tool exists to make collisions visible, so its own record
         // must not lose them.

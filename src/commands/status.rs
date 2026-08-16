@@ -1657,7 +1657,11 @@ pub fn render(report: &Report, verbose: bool) -> String {
     if !report.problems.is_empty() {
         lines.push(format!("  unanswered  {}", report.problems.len()));
         for problem in &report.problems {
-            lines.push(format!("    {problem}"));
+            // One physical line per problem: a forge error can carry its own
+            // newlines ("Try authenticating with: gh auth login"), and a spilled
+            // continuation at column zero reads as a second, unlabeled problem.
+            let one_line: Vec<&str> = problem.split_whitespace().collect();
+            lines.push(format!("    {}", one_line.join(" ")));
         }
     }
     lines.extend(claim_lines(&report.claims));
@@ -2132,6 +2136,31 @@ mod tests {
             "was: {out}"
         );
         assert!(out.contains("unanswered"), "was: {out}");
+    }
+
+    #[test]
+    fn a_problem_carrying_newlines_renders_as_one_physical_line() {
+        // Given: a problem embedding a forge error with its own remediation line
+        let report = Report {
+            repo: "demo".to_owned(),
+            problems: vec![
+                "pull request state unavailable: HTTP 401\nTry authenticating with: gh auth login"
+                    .to_owned(),
+            ],
+            ..Report::default()
+        };
+        // When: the report renders as text
+        let out = render(&report, true);
+        // Then: the problem occupies one indented line, not a spilled continuation
+        let problem_lines: Vec<&str> = out
+            .lines()
+            .filter(|line| line.contains("HTTP 401") || line.contains("Try authenticating"))
+            .collect();
+        assert_eq!(problem_lines.len(), 1, "was: {out}");
+        assert!(
+            problem_lines[0].contains("HTTP 401 Try authenticating with: gh auth login"),
+            "was: {out}"
+        );
     }
 
     #[test]

@@ -182,7 +182,7 @@ ledger write fails the command.
 | Command | Entry |
 |---|---|
 | `start`, `claim` | `claimed: <why>` on the branch |
-| `finish`, `release-claim` | `claim released`, `claim released; superseded by <branch>`, or bare `superseded by <branch>` for an unheld finish with `--superseded-by` |
+| `finish` | `claim released`, `claim released; superseded by <branch>`, or bare `superseded by <branch>` for an unheld finish with `--superseded-by` |
 | `track --pr/--fork-only/--forget` | the statement that changed |
 | `depends --on` | `requires <repo>#<number>` |
 | `release cut` | the whole parent set, branch names and commit ids, plus the previous cut's carried-parent delta |
