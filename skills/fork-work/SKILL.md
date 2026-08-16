@@ -37,6 +37,36 @@ Read the claims before you touch anything. If another agent holds the branch you
 about to work on, that is a collision, and the cost of discovering it later is their work
 or yours.
 
+## Then read the notches
+
+```
+knives notch
+```
+
+What agents did and decided here lately: claims taken and handed back, pull requests
+stated, dependencies recorded, releases cut, and whatever anyone thought worth writing
+down. Before you touch a branch you do not understand, ask about that branch:
+
+```
+knives notch <branch>
+```
+
+Every entry carries the branch's tip at the time it was written. That is the part to read
+carefully: an entry saying "superseded by #1157" at a commit the branch has since moved
+past is a reason to re-check, not a conclusion to inherit. A weird branch nobody can
+explain is exactly what this answers, and the reason it exists is usually one line long.
+
+When you make a call worth remembering — this is superseded, the owner parked it, you
+promised a reviewer something, you re-homed a pull request onto another branch — record it
+before you move on:
+
+```
+knives notch <branch> -m "what you decided and why" --evidence <commit-or-ref>
+```
+
+Cite something. Every audit claim that survived review cited a commit or a `file:line`;
+every false one did not.
+
 ## Get your own working copy the managed way
 
 ```

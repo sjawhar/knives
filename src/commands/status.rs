@@ -15,6 +15,7 @@ use crate::ids::{
     pull_number_from_bookmark,
 };
 use crate::jj::{JjError, Repo, branches_past, probe_landed};
+use crate::ledger::{Entry as Notch, Ledger, newest_for};
 use crate::store::Store;
 
 pub use crate::ids::{RELEASE_PREFIX, is_our_release};
@@ -50,6 +51,13 @@ pub struct BranchRow {
     /// state the forge reports. Inference only ever sees open pull requests from our
     /// own copy of the repository; a closed or foreign one has to be stated.
     pub stated_pull: Option<StatedPull>,
+    /// The newest ledger entry about this branch, when it has one.
+    ///
+    /// A local file read the tool already sits beside, and the difference between
+    /// a reader running one more command and a reader concluding a branch was
+    /// never explained.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_notch: Option<LastNotch>,
 }
 
 impl BranchRow {
@@ -65,6 +73,7 @@ impl BranchRow {
             checks: None,
             fork_only: false,
             stated_pull: None,
+            last_notch: None,
         }
     }
 }
@@ -94,6 +103,35 @@ pub struct StatedPull {
     pub state: String,
 }
 
+/// The part of a ledger entry a branch row carries.
+///
+/// Three fields, not the entry: a row is not the place to re-print an owner, an
+/// anchor and a list of evidence that `knives notch <branch>` shows in full.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LastNotch {
+    pub ts: String,
+    pub kind: crate::ledger::Kind,
+    pub text: String,
+}
+
+impl LastNotch {
+    fn of(entry: &Notch) -> Self {
+        Self {
+            ts: entry.ts.clone(),
+            kind: entry.kind,
+            text: entry.text.clone(),
+        }
+    }
+}
+
+/// The repo-scoped portion of its ledger: facts about the repository rather
+/// than a branch, which therefore have no branch-row cell to carry them.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RepoNotches {
+    pub count: usize,
+    pub last: LastNotch,
+}
+
 #[derive(Debug, Default, serde::Serialize)]
 pub struct Report {
     /// Who is working on what here, and since when.
@@ -106,6 +144,9 @@ pub struct Report {
     pub findings: Vec<Finding>,
     pub branches: Vec<BranchRow>,
     pub releases: Vec<String>,
+    /// Repo-scoped ledger entries, absent when the repository has none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repo_notches: Option<RepoNotches>,
     /// Informational: something worth saying that is not a failure.
     pub notes: Vec<String>,
     /// Could not answer. These, and only these, make the command exit non-zero
@@ -123,6 +164,8 @@ pub struct Options<'a> {
     pub forge: Option<&'a dyn Forge>,
     /// Needed because a branch's requirements may name other managed repos.
     pub registry: Option<&'a Registry>,
+    /// This repository's ledger, for the per-branch breadcrumb. `None` reads none.
+    pub ledger: Option<&'a Ledger>,
 }
 
 impl fmt::Debug for Options<'_> {
@@ -450,6 +493,69 @@ fn note_fetched_heads(report: &mut Report, fetched_heads: usize) {
     }
 }
 
+/// Every notch in this repository's ledger, read once for the whole report.
+///
+/// One local file read per repository rather than one per branch. A ledger that
+/// exists and cannot be read is an unanswered question rather than an absence:
+/// a report that quietly showed no breadcrumbs would say this fork's history was
+/// never written.
+fn notches_from_ledger(ledger: Option<&Ledger>, report: &mut Report) -> Vec<Notch> {
+    let Some(ledger) = ledger else {
+        return Vec::new();
+    };
+    match ledger.entries() {
+        Ok(entries) => entries,
+        Err(error) => {
+            report.problems.push(format!("ledger unavailable: {error}"));
+            Vec::new()
+        }
+    }
+}
+
+fn repo_notches(notches: &[Notch]) -> Option<RepoNotches> {
+    let mut count = 0;
+    let mut last = None;
+    for notch in notches {
+        if notch.subject.is_none() {
+            count += 1;
+            last = Some(LastNotch::of(notch));
+        }
+    }
+    last.map(|last| RepoNotches { count, last })
+}
+
+/// Fold the release scan into a report.
+///
+/// Extracted from `gather` for the same reason `scan_releases` was: that function
+/// sits within a few lines of the file's hundred-line limit, and the breadcrumb
+/// adds to it.
+fn add_releases(
+    report: &mut Report,
+    repo: &Repo,
+    tips: &BookmarkTips,
+    entry: &RepoEntry,
+) -> anyhow::Result<()> {
+    // Releases are scanned local AND remote: what a consumer pins is the remote
+    // ref, and scanning only local silently skipped the actually-pinned release.
+    let (names, findings, skipped) = scan_releases(
+        repo,
+        &ReleaseScan {
+            path: &entry.path,
+            tips,
+            scheme: &entry.release_scheme(),
+            publish_remote: entry.publish_remote(),
+        },
+    )?;
+    report.releases = names;
+    report.findings.extend(findings);
+    if skipped > 0 {
+        report
+            .notes
+            .push(format!("{skipped} superseded release(s) not scanned"));
+    }
+    Ok(())
+}
+
 fn review_stale_for(
     forge: Option<&dyn Forge>,
     entry: &RepoEntry,
@@ -504,6 +610,7 @@ struct DivergentInput<'a> {
     store: &'a Store,
     options: &'a Options<'a>,
     pull_requests: &'a BTreeMap<BranchName, PullRequest>,
+    notches: &'a [Notch],
 }
 
 /// Rows for divergent local bookmarks.
@@ -538,6 +645,7 @@ fn divergent_rows(input: &DivergentInput<'_>) -> anyhow::Result<Vec<BranchRow>> 
                     remote: crate::ids::RemoteName::new("origin"),
                 })
                 .cloned(),
+            last_notch: newest_for(input.notches, branch.as_str()).map(LastNotch::of),
             // Nothing to replay: a divergent bookmark has no single commit to probe.
             ..BranchRow::bare(branch, None)
         };
@@ -714,26 +822,11 @@ pub fn gather(
     let trunk = entry.trunk();
     let scheme = entry.release_scheme();
     let upstream_trunk = entry.upstream_trunk();
-    // Releases are scanned local AND remote: what a consumer pins is the remote
-    // ref, and scanning only local silently skipped the actually-pinned release.
-    let (names, release_findings, skipped) = scan_releases(
-        &repo,
-        &ReleaseScan {
-            path: &entry.path,
-            tips: &tips,
-            scheme: &scheme,
-            publish_remote: entry.publish_remote(),
-        },
-    )?;
-    report.releases = names;
-    report.findings.extend(release_findings);
-    if skipped > 0 {
-        report
-            .notes
-            .push(format!("{skipped} superseded release(s) not scanned"));
-    }
+    add_releases(&mut report, &repo, &tips, entry)?;
 
     let (branches, fetched_heads) = maintained_branches(&tips, trunk, &scheme);
+    let notches = notches_from_ledger(options.ledger, &mut report);
+    report.repo_notches = repo_notches(&notches);
     let mut unjudged: Vec<String> = Vec::new();
     note_fetched_heads(&mut report, fetched_heads);
     let pull_requests = pull_requests_from_forge(options.forge, entry, &mut report);
@@ -766,6 +859,7 @@ pub fn gather(
         }
         let target = BranchTarget::new(name.clone(), branch.clone());
         let stated_pull = stated_pull_for(&target, store, entry, options);
+        let last_notch = newest_for(&notches, branch.as_str()).map(LastNotch::of);
         report.branches.push(BranchRow {
             name: branch,
             tip: Some(tip),
@@ -777,6 +871,7 @@ pub fn gather(
             checks,
             fork_only: store.is_fork_only(&target),
             stated_pull,
+            last_notch,
         });
     }
 
@@ -788,6 +883,7 @@ pub fn gather(
         store,
         options,
         pull_requests: &pull_requests,
+        notches: &notches,
     })?);
     report
         .branches
@@ -1156,12 +1252,48 @@ fn flags_cell(row: &BranchRow) -> String {
     }
 }
 
+/// How much of a notch's text a branch line carries.
+const NOTCH_TEXT: usize = 32;
+
+/// Render a ledger entry in the one-line status form.
+fn notch_summary(notch: &LastNotch) -> String {
+    let collapsed = notch.text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let escaped = crate::ledger::inline_human_text(&collapsed);
+    let mut shown: String = escaped.chars().take(NOTCH_TEXT).collect();
+    if escaped.chars().count() > NOTCH_TEXT {
+        shown.push('…');
+    }
+    crate::ledger::age(&notch.ts, jiff::Timestamp::now()).map_or_else(
+        || format!("\"{shown}\""),
+        |age| format!("\"{shown}\" ({age})"),
+    )
+}
+
+/// The newest notch on this branch, as one token.
+///
+/// Truncated and whitespace-collapsed because an entry's text is free prose that
+/// may run to a paragraph and may contain newlines, and this is a table cell: one
+/// stray newline destroys every column below it.
+fn notch_cell(row: &BranchRow) -> String {
+    row.last_notch
+        .as_ref()
+        .map_or_else(|| "-".to_owned(), notch_summary)
+}
+
+fn repo_notch_line(notches: &RepoNotches) -> String {
+    format!(
+        "  notches  {} repo-level, newest: {}",
+        notches.count,
+        notch_summary(&notches.last)
+    )
+}
+
 fn branch_table(rows: &[BranchRow]) -> Vec<String> {
-    const HEADER: [&str; 8] = [
-        "branch", "tip", "push", "pr", "review", "checks", "landed", "flags",
+    const HEADER: [&str; 9] = [
+        "branch", "tip", "push", "pr", "review", "checks", "landed", "flags", "notch",
     ];
 
-    let cells: Vec<[String; 8]> = rows
+    let cells: Vec<[String; 9]> = rows
         .iter()
         .map(|row| {
             [
@@ -1173,6 +1305,7 @@ fn branch_table(rows: &[BranchRow]) -> Vec<String> {
                 checks_cell(row),
                 landed_cell(row),
                 flags_cell(row),
+                notch_cell(row),
             ]
         })
         .collect();
@@ -1182,7 +1315,7 @@ fn branch_table(rows: &[BranchRow]) -> Vec<String> {
             *width = (*width).max(cell.len());
         }
     }
-    let format_row = |cells: [&str; 8]| {
+    let format_row = |cells: [&str; 9]| {
         let [
             branch,
             tip,
@@ -1192,6 +1325,7 @@ fn branch_table(rows: &[BranchRow]) -> Vec<String> {
             checks,
             landed,
             flags,
+            notch,
         ] = cells;
         let [
             branch_width,
@@ -1202,9 +1336,10 @@ fn branch_table(rows: &[BranchRow]) -> Vec<String> {
             checks_width,
             landed_width,
             flags_width,
+            notch_width,
         ] = widths;
         format!(
-            "    {branch:<branch_width$}  {tip:<tip_width$}  {push:<push_width$}  {pull_request:<pull_request_width$}  {review:<review_width$}  {checks:<checks_width$}  {landed:<landed_width$}  {flags:<flags_width$}"
+            "    {branch:<branch_width$}  {tip:<tip_width$}  {push:<push_width$}  {pull_request:<pull_request_width$}  {review:<review_width$}  {checks:<checks_width$}  {landed:<landed_width$}  {flags:<flags_width$}  {notch:<notch_width$}"
         )
         .trim_end()
         .to_owned()
@@ -1220,6 +1355,7 @@ fn branch_table(rows: &[BranchRow]) -> Vec<String> {
             checks,
             landed,
             flags,
+            notch,
         ] = row.each_ref();
         format_row([
             branch.as_str(),
@@ -1230,6 +1366,7 @@ fn branch_table(rows: &[BranchRow]) -> Vec<String> {
             checks.as_str(),
             landed.as_str(),
             flags.as_str(),
+            notch.as_str(),
         ])
     }));
     lines
@@ -1251,6 +1388,11 @@ pub fn render(report: &Report, verbose: bool) -> String {
         lines.push("  branches    none".to_owned());
     } else {
         lines.push(format!("  branches    {}", report.branches.len()));
+    }
+    if let Some(notches) = &report.repo_notches {
+        lines.push(repo_notch_line(notches));
+    }
+    if !report.branches.is_empty() {
         lines.extend(branch_table(&report.branches));
     }
     if report.findings.is_empty() {
@@ -1420,7 +1562,7 @@ mod tests {
 
         let header_columns = columns(&lines[0]);
         let header_offsets: Vec<usize> = header_columns.iter().map(|(offset, _)| *offset).collect();
-        assert_eq!(header_offsets.len(), 8, "was: {}", lines[0]);
+        assert_eq!(header_offsets.len(), 9, "was: {}", lines[0]);
         for line in &lines {
             assert_eq!(
                 line.chars().take_while(|ch| *ch == ' ').count(),
@@ -1441,9 +1583,95 @@ mod tests {
                 "was: {line}"
             );
         }
-        assert_eq!(columns(&lines[2]).len(), 8, "was: {}", lines[2]);
+        assert_eq!(columns(&lines[2]).len(), 9, "was: {}", lines[2]);
         assert!(lines[2].ends_with(" -"), "was: {}", lines[2]);
         assert!(lines[1].contains("CONFLICTING"));
+    }
+
+    #[test]
+    fn a_branchs_newest_notch_is_one_token_at_the_end_of_its_line() {
+        // Status text is already dense: the breadcrumb is one token, and its
+        // legibility overhaul is separate work.
+        let mut row = row("feat/log-queue", None, None);
+        row.last_notch = Some(LastNotch {
+            ts: jiff::Timestamp::now().to_string(),
+            kind: crate::ledger::Kind::Note,
+            text: "superseded by #1157".to_owned(),
+        });
+        let lines = branch_table(&[row]);
+        assert!(lines[0].contains("notch"), "header: {}", lines[0]);
+        assert!(
+            lines[1].ends_with("\"superseded by #1157\" (now)"),
+            "was: {}",
+            lines[1]
+        );
+    }
+
+    #[test]
+    fn a_long_or_multi_line_notch_cannot_break_the_table() {
+        // An entry's text is free prose that may run to a paragraph and may carry
+        // newlines. One stray newline destroys every column below it.
+        let mut row = row("feat/alpha", None, None);
+        row.last_notch = Some(LastNotch {
+            ts: jiff::Timestamp::now().to_string(),
+            kind: crate::ledger::Kind::Note,
+            text: "parked by the owner\nuntil the trait lands upstream, which may be weeks"
+                .to_owned(),
+        });
+        let lines = branch_table(&[row]);
+        assert_eq!(lines.len(), 2, "was: {lines:?}");
+        assert!(!lines[1].contains('\n'));
+        assert!(lines[1].contains('…'), "truncation is marked: {}", lines[1]);
+        assert!(
+            lines[1].contains("parked by the owner until"),
+            "newlines collapse to spaces: {}",
+            lines[1]
+        );
+    }
+
+    #[test]
+    fn a_notch_control_character_cannot_reach_the_status_table() {
+        let mut row = row("feat/alpha", None, None);
+        row.last_notch = Some(LastNotch {
+            ts: jiff::Timestamp::now().to_string(),
+            kind: crate::ledger::Kind::Note,
+            text: "parked\u{1b}now\ragain".to_owned(),
+        });
+
+        let lines = branch_table(&[row]);
+        assert!(!lines[1].contains('\u{1b}'), "was: {:?}", lines[1]);
+        assert!(!lines[1].contains('\r'), "was: {:?}", lines[1]);
+        assert!(lines[1].contains('\u{fffd}'), "was: {:?}", lines[1]);
+    }
+
+    #[test]
+    fn a_branch_with_no_notch_renders_the_empty_placeholder() {
+        let lines = branch_table(&[row("feat/alpha", None, None)]);
+        assert!(lines[1].ends_with(" -"), "was: {}", lines[1]);
+        assert_eq!(columns(&lines[1]).len(), 9, "was: {}", lines[1]);
+    }
+
+    #[test]
+    fn a_ledger_that_cannot_be_read_is_an_unanswered_question_not_an_absence() {
+        // A report that quietly showed no breadcrumbs would say this fork's
+        // history was never written.
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let path = dir.path().join("a-repo");
+        std::fs::create_dir_all(&path).expect("ledger directory");
+        std::fs::write(
+            path.join("20260815T221403.000000000Z-0000.md"),
+            "not a ledger entry at all\n",
+        )
+        .expect("corrupt ledger");
+        let ledger = crate::ledger::Ledger::at(path);
+        let mut report = Report::default();
+
+        let notches = notches_from_ledger(Some(&ledger), &mut report);
+
+        assert!(notches.is_empty());
+        assert_eq!(report.problems.len(), 1, "was: {report:?}");
+        assert!(report.problems[0].contains("ledger"), "was: {report:?}");
+        assert_eq!(exit_for(&report), Exit::Incomplete);
     }
 
     #[test]

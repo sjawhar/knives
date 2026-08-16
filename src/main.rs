@@ -4,16 +4,19 @@
 //! here because each is one jj sequence over a parent set rather than a report
 //! with a renderer. Every other command owns its own logic and returns an
 //! [`Exit`], so the match stays a table.
-// allow: SIZE_OK: 2050 lines - dispatch plus the release-edit verbs; splitting would scatter the exhaustive match.
+// allow: SIZE_OK: 2265 lines - dispatch plus the release-edit verbs; splitting would scatter the exhaustive match.
 
 use std::process::ExitCode;
 
 use clap::Parser as _;
 use knives::cli::{Cli, Command, Exit, ReleaseAction};
-use knives::commands::{hook, init, preflight, register, release, repos, start, status, sync};
+use knives::commands::{
+    hook, init, notch, preflight, register, release, repos, start, status, sync,
+};
 use knives::config::{default_config_path, load};
 use knives::forge::{CliForge, Forge};
 use knives::ids::{BranchName, BranchTarget, ReleaseScheme, RepoName, Requirement};
+use knives::ledger::{Draft, Kind, Ledger, Scribe};
 use knives::store::{Store, default_state_path};
 
 fn main() -> ExitCode {
@@ -26,6 +29,10 @@ fn main() -> ExitCode {
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the exhaustive command dispatch is easier to audit as one table"
+)]
 fn dispatch() -> anyhow::Result<Exit> {
     let cli = Cli::parse();
     let json = knives::cli::machine_readable(cli.json, cli.text);
@@ -99,6 +106,34 @@ fn dispatch() -> anyhow::Result<Exit> {
                 return Ok(Exit::Usage);
             };
             run_depends(&BranchTarget::new(name, BranchName::new(branch)), &on)
+        }
+        Command::Notch {
+            subject,
+            message,
+            evidence,
+            pr,
+            repo,
+        } => {
+            if subject
+                .as_deref()
+                .is_some_and(|name| name.trim().is_empty())
+            {
+                eprintln!("subject cannot be empty");
+                return Ok(Exit::Usage);
+            }
+            let Some(name) = one_repo(repo.as_deref())? else {
+                return Ok(Exit::Usage);
+            };
+            notch::run(
+                &notch::Request {
+                    repo: &name,
+                    subject: subject.as_deref(),
+                    message: message.as_deref(),
+                    evidence: &evidence,
+                    pr,
+                },
+                json,
+            )
         }
         Command::Preflight { repo } => {
             let Some(name) = one_repo(repo.as_deref())? else {
@@ -1268,6 +1303,34 @@ fn short12(commit: &knives::ids::CommitId) -> String {
     commit.as_str().chars().take(12).collect()
 }
 
+/// The ledger writer for a command acting on `entry`.
+///
+/// The owner is resolved exactly as a claim's is, so one agent's events and its
+/// claims carry the same name and a reader can join them.
+fn scribe_for(repo: &RepoName, entry: &knives::config::RepoEntry) -> anyhow::Result<Scribe> {
+    let owner = knives::commands::claim::current_owner(&std::env::current_dir()?)?;
+    Ok(Scribe::new(
+        Ledger::for_repo(repo),
+        repo.clone(),
+        entry.path.clone(),
+        owner,
+    ))
+}
+
+/// What a `finish` did, or nothing when it did nothing.
+///
+/// Releasing a claim and recording a supersession are two acts and either can
+/// happen alone: a `finish` on an unheld branch releases no claim, and one with
+/// `--superseded-by` still records where the work went.
+fn release_event(had: bool, superseded_by: Option<&str>) -> Option<String> {
+    match (had, superseded_by) {
+        (true, Some(replacement)) => Some(format!("claim released; superseded by {replacement}")),
+        (true, None) => Some("claim released".to_owned()),
+        (false, Some(replacement)) => Some(format!("superseded by {replacement}")),
+        (false, None) => None,
+    }
+}
+
 /// Hand a branch back and remove its workspace. The inverse of `start`.
 ///
 /// Removing the directory loses no work: jj snapshots a working copy into a commit, so
@@ -1288,7 +1351,15 @@ fn run_finish(
     if let Some(new) = superseded_by {
         store.supersede(target, new);
     }
+    let pr = store.tracked_pull(target);
     store.save()?;
+    // What happened, and nothing else. This command runs happily on a branch
+    // nobody held — it says "was not held" and forgets the workspace anyway —
+    // and an event asserting a release would be a false fact in the one record
+    // that exists to be believed later.
+    if let Some(text) = release_event(had, superseded_by) {
+        scribe_for(&target.repo, entry)?.event(Some(target.branch.as_str()), text, pr)?;
+    }
 
     let claim = if had { "released" } else { "was not held" };
     let workspace = knives::commands::wip::workspace_for(target.branch.as_str());
@@ -1324,34 +1395,61 @@ fn run_track(
     fork_only: bool,
     forget: bool,
 ) -> anyhow::Result<Exit> {
-    let mut store = Store::open_for_update(default_state_path())?;
-    if fork_only {
-        store.mark_fork_only(target, "stated with `knives track --fork-only`");
-        store.save()?;
-        println!("{target} deliberately has no upstream pull request");
-        return Ok(Exit::Ok);
-    }
-    if forget {
-        let had = store.untrack_pull(target);
-        store.save()?;
-        println!(
-            "{target} {}",
-            if had {
-                "is back to inferring its pull request"
-            } else {
-                "had no stated pull request"
-            }
-        );
-        return Ok(Exit::Ok);
-    }
-    let Some(number) = pr else {
-        eprintln!("give --pr <number>, or --forget");
+    let registry = load(&default_config_path())?;
+    let Some(entry) = registry.get(&target.repo) else {
+        eprintln!("unknown repo {}", target.repo);
         return Ok(Exit::Usage);
     };
-    store.track_pull(target, number);
+    let mut store = Store::open_for_update(default_state_path())?;
+    // Read before the change, so a withdrawal is still filed under the number it
+    // withdrew.
+    let stated = store.tracked_pull(target);
+    // Each branch stamps the number its entry is ABOUT, not whatever happened to
+    // be stated a moment earlier. The event that creates an association is the
+    // one `knives notch --pr <n>` most needs to find, and stamping the prior
+    // value there — usually nothing — would hide it from the only filter the
+    // field exists for.
+    let (text, stamped) = if fork_only {
+        store.mark_fork_only(target, "stated with `knives track --fork-only`");
+        (
+            "stated as having no upstream pull request".to_owned(),
+            stated,
+        )
+    } else if forget {
+        let had = store.untrack_pull(target);
+        (
+            if had {
+                "pull request statement forgotten".to_owned()
+            } else {
+                "no pull request statement to forget".to_owned()
+            },
+            stated,
+        )
+    } else {
+        let Some(number) = pr else {
+            eprintln!("give --pr <number>, or --forget");
+            return Ok(Exit::Usage);
+        };
+        store.track_pull(target, number);
+        (format!("stated as #{number}"), Some(number))
+    };
     store.save()?;
-    println!("{target} is #{number}");
+    scribe_for(&target.repo, entry)?.event(Some(target.branch.as_str()), text.clone(), stamped)?;
+    println!("{target} {}", spoken(&text));
     Ok(Exit::Ok)
+}
+
+/// The prose form of a `track` outcome, which reads about the branch rather than
+/// about the statement.
+fn spoken(text: &str) -> String {
+    match text {
+        "stated as having no upstream pull request" => {
+            "deliberately has no upstream pull request".to_owned()
+        }
+        "pull request statement forgotten" => "is back to inferring its pull request".to_owned(),
+        "no pull request statement to forget" => "had no stated pull request".to_owned(),
+        stated => stated.replacen("stated as ", "is ", 1),
+    }
 }
 
 /// Record what a branch cannot land before.
@@ -1378,10 +1476,26 @@ fn run_depends(target: &BranchTarget, on: &[String]) -> anyhow::Result<Exit> {
         }
         requirements.push(requirement);
     }
+    // Resolved before anything is written. Dispatch already validated this name
+    // through `one_repo`, so an absent entry is an invariant violation rather
+    // than a user error — and the one thing not to do with it is mutate the
+    // store and then quietly skip the ledger, which would leave a dependency
+    // recorded and unexplained.
+    let Some(entry) = registry.get(&target.repo) else {
+        let known: Vec<String> = registry.names().map(|name| name.to_string()).collect();
+        eprintln!("unknown repo {}; known: {}", target.repo, known.join(", "));
+        return Ok(Exit::Usage);
+    };
     let mut store = Store::open_for_update(default_state_path())?;
     store.add_dependencies(target, &requirements);
+    let pr = store.tracked_pull(target);
     store.save()?;
     let listed: Vec<String> = requirements.iter().map(ToString::to_string).collect();
+    scribe_for(&target.repo, entry)?.event(
+        Some(target.branch.as_str()),
+        format!("requires {}", listed.join(", ")),
+        pr,
+    )?;
     println!("{target} now requires {}", listed.join(", "));
     Ok(Exit::Ok)
 }
@@ -1477,6 +1591,7 @@ fn run_status(requested: Option<&str>, view: StatusView) -> anyhow::Result<Exit>
     let mut worst = Exit::Ok;
     let mut first = true;
     for (name, entry) in chosen {
+        let ledger = knives::ledger::Ledger::for_repo(&name);
         let report = status::gather(
             &name,
             &entry,
@@ -1485,6 +1600,7 @@ fn run_status(requested: Option<&str>, view: StatusView) -> anyhow::Result<Exit>
                 probe,
                 forge,
                 registry: Some(&registry),
+                ledger: Some(&ledger),
             },
         )?;
         if json {
@@ -1542,46 +1658,47 @@ fn run_release(
             {
                 return Ok(exit);
             }
-            let previous_commit =
-                release::previous_release_for_cut(&entry, &opened.bookmark_tips()?)
-                    .map(|(_, commit)| commit);
+            let previous = release::previous_release_for_cut(&entry, &opened.bookmark_tips()?);
+            let previous_commit = previous.as_ref().map(|(_, commit)| commit.clone());
             // A cut is a new name for the composition in hand, never a recomputation:
             // with a previous release its parents are carried verbatim — nothing joins,
             // nothing advances, and a branch enters through `release include`. Only the
             // first cut has no composition to carry, so it starts from every branch: a
             // release is a flat merge of feature and fix branches, and the upstream
             // base is never a direct parent — it is reachable through every member.
-            let (carried, members, audit_base) = if let Some(previous) = &previous_commit {
-                let parents: Vec<knives::ids::CommitId> = opened
-                    .parents_of(previous.as_str())?
-                    .into_iter()
-                    .map(|parent| parent.commit)
-                    .collect();
-                let carried = parent_sources(&opened, &entry, &scheme, &parents)?;
-                let members = carried.clone();
-                let base = release::shared_base(&opened, previous, &trunk)?
-                    .unwrap_or_else(|| trunk.clone());
-                (carried, members, base)
-            } else {
-                let carried = release::carried_branches(&opened, entry.trunk(), &scheme)?;
-                if carried.is_empty() {
-                    println!(
-                        "{repo}: no branches to cut; a release is a flat merge of feature \
-                         and fix branches, and there are none"
-                    );
-                    return Ok(Exit::Incomplete);
-                }
-                let members = carried.clone();
-                // The first cut audits each branch from the fork point too:
-                // measuring from the trunk tip charges every commit upstream
-                // landed since the fork to the branches themselves.
-                let tips: Vec<knives::ids::CommitId> =
-                    carried.iter().map(|(_, tip)| tip.clone()).collect();
-                let base = opened
-                    .common_ancestor(&tips, &trunk)?
-                    .unwrap_or_else(|| trunk.clone());
-                (carried, members, base)
-            };
+            let (carried, members, audit_base, previous_members) =
+                if let Some((_, previous)) = &previous {
+                    let parents: Vec<knives::ids::CommitId> = opened
+                        .parents_of(previous.as_str())?
+                        .into_iter()
+                        .map(|parent| parent.commit)
+                        .collect();
+                    let previous_members = parent_sources(&opened, &entry, &scheme, &parents)?;
+                    let carried = previous_members.clone();
+                    let members = carried.clone();
+                    let base = release::shared_base(&opened, previous, &trunk)?
+                        .unwrap_or_else(|| trunk.clone());
+                    (carried, members, base, previous_members)
+                } else {
+                    let carried = release::carried_branches(&opened, entry.trunk(), &scheme)?;
+                    if carried.is_empty() {
+                        println!(
+                            "{repo}: no branches to cut; a release is a flat merge of feature \
+                             and fix branches, and there are none"
+                        );
+                        return Ok(Exit::Incomplete);
+                    }
+                    let members = carried.clone();
+                    // The first cut audits each branch from the fork point too:
+                    // measuring from the trunk tip charges every commit upstream
+                    // landed since the fork to the branches themselves.
+                    let tips: Vec<knives::ids::CommitId> =
+                        carried.iter().map(|(_, tip)| tip.clone()).collect();
+                    let base = opened
+                        .common_ancestor(&tips, &trunk)?
+                        .unwrap_or_else(|| trunk.clone());
+                    (carried, members, base, Vec::new())
+                };
             let request = cut_request(name.clone(), &carried);
             let mut candidate =
                 release::candidate_cut(&entry.path, &request, previous_commit.as_ref())?;
@@ -1601,18 +1718,20 @@ fn run_release(
                 return Ok(exit);
             }
             let created = release::publish_cut(candidate, &request.name, &scheme)?;
-            worst = worst.worst(report_completed_cut(
-                &repo,
-                &entry,
-                &opened,
-                &CompletedCut {
-                    name: &name,
-                    request: &request,
-                    carried: &carried,
-                    created: &created,
-                    audit: &audit,
-                },
-            )?);
+            let completed = CompletedCut {
+                name: &name,
+                request: &request,
+                carried: &carried,
+                created: &created,
+                audit: &audit,
+                scheme: &scheme,
+                previous: previous.map(|(name, _)| PreviousCut {
+                    name,
+                    members: previous_members,
+                }),
+            };
+            record_cut_event(&repo, &entry, &completed)?;
+            worst = worst.worst(report_completed_cut(&repo, &entry, &opened, &completed)?);
         }
     }
     Ok(worst)
@@ -1689,12 +1808,86 @@ fn report_cut_audit(repo: &RepoName, audit: &release::CutAudit) -> Option<Exit> 
     Some(Exit::Incomplete)
 }
 
+struct PreviousCut {
+    name: String,
+    members: Vec<(String, knives::ids::CommitId)>,
+}
+
 struct CompletedCut<'a> {
     name: &'a str,
     request: &'a release::Cut,
     carried: &'a [(String, knives::ids::CommitId)],
     created: &'a knives::ids::CommitId,
     audit: &'a release::CutAudit,
+    scheme: &'a ReleaseScheme,
+    previous: Option<PreviousCut>,
+}
+
+/// Record which branches and commits became a published release cut.
+fn record_cut_event(
+    repo: &RepoName,
+    entry: &knives::config::RepoEntry,
+    cut: &CompletedCut<'_>,
+) -> anyhow::Result<()> {
+    let opened = knives::jj::Repo::open(&entry.path)?;
+    let parents: Vec<knives::ids::CommitId> = opened
+        .parents_of(cut.created.as_str())?
+        .into_iter()
+        .map(|parent| parent.commit)
+        .collect();
+    let members = parent_sources(&opened, entry, cut.scheme, &parents)?;
+    let members_text = members
+        .iter()
+        .map(|(source, commit)| format!("{source}@{}", short12(commit)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut evidence = vec![cut.created.as_str().to_owned()];
+    evidence.extend(members.iter().map(|(_, commit)| commit.as_str().to_owned()));
+    let delta = if let Some(previous) = &cut.previous {
+        let trunk = entry.upstream_trunk();
+        let trunk_parent = members
+            .iter()
+            .find(|(source, _)| source == &trunk)
+            .map(|(_, commit)| commit);
+        let dropped = release::unaccounted_previous_members(
+            &opened,
+            &release::ParentDelta {
+                previous: &previous.members,
+                current: &parents,
+                trunk_source: &trunk,
+                trunk_parent,
+            },
+        )?;
+        if dropped.is_empty() {
+            format!(
+                "; previous {} carried {} parent(s); carries every previous parent",
+                previous.name,
+                previous.members.len()
+            )
+        } else {
+            format!(
+                "; previous {} carried {} parent(s); dropped: {}",
+                previous.name,
+                previous.members.len(),
+                dropped.join(", ")
+            )
+        }
+    } else {
+        String::new()
+    };
+    scribe_for(repo, entry)?.record(&Draft {
+        subject: Some(cut.name),
+        kind: Kind::Event,
+        text: format!(
+            "cut {} as {} with {} parent(s): {members_text}{delta}",
+            cut.name,
+            short12(cut.created),
+            members.len()
+        ),
+        evidence,
+        pr: None,
+    })?;
+    Ok(())
 }
 
 fn report_completed_cut(
@@ -1937,7 +2130,8 @@ fn run_sync(
 
     let mut worst = Exit::Ok;
     for (name, entry) in chosen {
-        let report = sync::sync_repo(&name, &entry, &mut store, forge)?;
+        let scribe = scribe_for(&name, &entry)?;
+        let report = sync::sync_repo(&entry, &mut store, forge, &scribe)?;
         if json {
             println!("{}", serde_json::to_string_pretty(&report)?);
         } else {
@@ -2019,6 +2213,27 @@ mod tests {
         let selected = result.unwrap();
         assert_eq!(selected.len(), 1);
         assert_eq!(selected.first().unwrap().0.as_str(), "scout");
+    }
+
+    #[test]
+    fn track_prose_preserves_the_established_human_output() {
+        for (event, expected) in [
+            ("stated as #4545", "is #4545"),
+            (
+                "stated as having no upstream pull request",
+                "deliberately has no upstream pull request",
+            ),
+            (
+                "pull request statement forgotten",
+                "is back to inferring its pull request",
+            ),
+            (
+                "no pull request statement to forget",
+                "had no stated pull request",
+            ),
+        ] {
+            assert_eq!(spoken(event), expected);
+        }
     }
 
     #[test]

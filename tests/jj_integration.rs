@@ -13,7 +13,7 @@ use knives::commands::{
     status::{self, OriginRelation},
     sync,
 };
-use knives::config::RepoEntry;
+use knives::config::{Registry, RepoEntry};
 use knives::detect::landed::RebaseOutcome;
 use knives::forge::{ChecksSummary, Forge, ForgeError, PullRequest};
 use knives::ids::{BookmarkRef, BranchName, CommitId, ReleaseScheme, RemoteName};
@@ -104,6 +104,37 @@ fn release_test_home(lab: &lab::Lab) -> (tempfile::TempDir, std::path::PathBuf) 
     (home, consumer)
 }
 
+fn sync_entry(lab: &lab::Lab) -> RepoEntry {
+    RepoEntry {
+        path: lab.work.clone(),
+        upstream: lab.upstream.display().to_string(),
+        origin: lab.work.display().to_string(),
+        base: None,
+        release: None,
+        release_branch: None,
+        test_count_command: None,
+        consumers: Vec::new(),
+    }
+}
+
+fn sync_pull_request(number: u64, state: &str, branch: &str, head: &str) -> PullRequest {
+    PullRequest {
+        number,
+        state: state.to_owned(),
+        review_decision: String::new(),
+        head_ref_name: branch.to_owned(),
+        head_ref_oid: head.to_owned(),
+        updated_at: "2026-08-15T00:00:00Z".to_owned(),
+        is_draft: false,
+        url: String::new(),
+        head_repository_owner: None,
+        mergeable: String::new(),
+        merge_state_status: String::new(),
+        base_ref_name: "main".to_owned(),
+        merge_commit: None,
+    }
+}
+
 #[test]
 fn a_fork_whose_trunk_is_dev_probes_and_forks_against_dev() {
     // Given: an upstream whose only branch is dev, and a feature branch on it
@@ -129,6 +160,29 @@ fn a_fork_whose_trunk_is_dev_probes_and_forks_against_dev() {
     )
     .expect("probe runs after squash merge");
     assert_eq!(outcome, RebaseOutcome::Empty);
+}
+
+#[test]
+fn a_jj_workspace_beside_a_registered_repo_resolves_that_repo() {
+    let lab = Lab::new();
+    let workspace = lab
+        .work
+        .parent()
+        .expect("workspace parent")
+        .join("feature-alpha");
+    knives::jj::add_workspace(&lab.work, "feature-alpha", &workspace, "main@upstream")
+        .expect("add workspace");
+    let registry = Registry {
+        repos: BTreeMap::from([("demo".to_owned(), sync_entry(&lab))]),
+        ..Registry::default()
+    };
+
+    assert_eq!(
+        registry.containing(&workspace).map(|(name, _)| name),
+        Some(knives::ids::RepoName::new("demo"))
+    );
+    let unrelated = tempfile::tempdir().expect("unrelated directory");
+    assert!(registry.containing(unrelated.path()).is_none());
 }
 
 #[test]
@@ -1000,6 +1054,129 @@ fn a_release_cut_is_not_a_carrier_locally_or_at_origin() {
 }
 
 #[test]
+fn a_release_cut_records_its_whole_parent_set_under_the_release_name() {
+    // Given: two branches with distinct tips that the cut must preserve as evidence.
+    let lab = lab::Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let (home, _consumer) = release_test_home(&lab);
+    let alpha = Repo::open(&lab.work)
+        .expect("open")
+        .resolve_commit("feat/alpha")
+        .expect("alpha tip");
+
+    // When: a first cut is taken through the binary.
+    let output = knives_release(&lab, &home, &["cut", "release/2026-08-15"]);
+    assert!(
+        output.status.success() || output.status.code() == Some(1),
+        "cut failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Then: the release ref is the subject, every member is named, and their
+    // commit ids remain evidence for a reader to verify later.
+    let entries = knives::ledger::Ledger::at(home.path().join("ledger").join("demo"))
+        .entries()
+        .expect("read ledger");
+    let cut = entries
+        .iter()
+        .find(|entry| entry.subject.as_deref() == Some("release/2026-08-15"))
+        .unwrap_or_else(|| panic!("no cut entry: {entries:?}"));
+    assert_eq!(cut.kind, knives::ledger::Kind::Event);
+    assert!(cut.text.contains("feat/alpha"), "was: {}", cut.text);
+    assert!(cut.text.contains("feat/beta"), "was: {}", cut.text);
+    assert!(cut.text.contains("2 parent(s)"), "was: {}", cut.text);
+    assert!(
+        cut.evidence
+            .iter()
+            .any(|reference| reference == alpha.as_str()),
+        "was: {:?}",
+        cut.evidence
+    );
+    let created = Repo::open(&lab.work)
+        .expect("reopen")
+        .resolve_commit("release/2026-08-15")
+        .expect("release tip");
+    assert_eq!(cut.anchor.as_deref(), Some(created.as_str()));
+
+    let second = knives_release(&lab, &home, &["cut", "release/2026-08-16"]);
+    assert!(
+        second.status.success() || second.status.code() == Some(1),
+        "second cut failed: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let entries = knives::ledger::Ledger::at(home.path().join("ledger").join("demo"))
+        .entries()
+        .expect("read ledger");
+    let second_cut = entries
+        .iter()
+        .find(|entry| entry.subject.as_deref() == Some("release/2026-08-16"))
+        .unwrap_or_else(|| panic!("no second cut entry: {entries:?}"));
+    assert!(
+        second_cut.text.contains(
+            "previous release/2026-08-15 carried 2 parent(s); carries every previous parent"
+        ),
+        "was: {}",
+        second_cut.text
+    );
+}
+
+#[test]
+fn a_second_cut_parent_delta_names_a_dropped_member() {
+    let lab = lab::Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    lab.branch("feat/gamma", "gamma.txt", "gamma\n");
+    let repo = Repo::open(&lab.work).expect("open");
+    let alpha = repo.resolve_commit("feat/alpha").expect("alpha");
+    let beta = repo.resolve_commit("feat/beta").expect("beta");
+    let gamma = repo.resolve_commit("feat/gamma").expect("gamma");
+    let trunk = repo.resolve_commit("main@origin").expect("trunk");
+    lab.jj_work([
+        "new",
+        "-r",
+        "main@origin",
+        "-r",
+        "feat/alpha",
+        "-r",
+        "feat/beta",
+        "-r",
+        "feat/gamma",
+        "-m",
+        "release/2026-08-15",
+    ]);
+    lab.jj_work(["bookmark", "create", "release/2026-08-15", "-r", "@"]);
+    lab.jj_work(["new"]);
+    lab.octopus("release/2026-08-16", "feat/alpha", "feat/beta");
+    let repo = Repo::open(&lab.work).expect("reopen");
+    let current: Vec<CommitId> = repo
+        .parents_of("release/2026-08-16")
+        .expect("second cut parents")
+        .into_iter()
+        .map(|parent| parent.commit)
+        .collect();
+    let previous = vec![
+        ("main@upstream".to_owned(), trunk),
+        ("feat/alpha".to_owned(), alpha),
+        ("feat/beta".to_owned(), beta),
+        ("feat/gamma".to_owned(), gamma),
+    ];
+
+    let dropped = knives::commands::release::unaccounted_previous_members(
+        &repo,
+        &knives::commands::release::ParentDelta {
+            previous: &previous,
+            current: &current,
+            trunk_source: "main@upstream",
+            trunk_parent: None,
+        },
+    )
+    .expect("compare parent sets");
+    assert_eq!(dropped.len(), 1, "was: {dropped:?}");
+    assert!(dropped[0].starts_with("feat/gamma@"), "was: {dropped:?}");
+}
+
+#[test]
 fn git_tracking_refs_are_not_carriers_but_other_branches_are() {
     // Given: a maintainer branch carrying our tip and jj's matching git-tracking ref.
     let lab = lab::Lab::new();
@@ -1075,8 +1252,14 @@ fn unavailable_state_for_a_tracked_pull_request_is_incomplete() {
     };
     let mut store = Store::open_for_update(lab.work.join("state.json")).expect("store");
     store.record_pull_head(&name, 42, "previous");
+    let scribe = knives::ledger::Scribe::new(
+        knives::ledger::Ledger::at(lab.work.join("ledger")),
+        name.clone(),
+        lab.work.clone(),
+        "a-test".to_owned(),
+    );
 
-    let report = sync::sync_repo(&name, &entry, &mut store, Some(&StateUnavailableForge))
+    let report = sync::sync_repo(&entry, &mut store, Some(&StateUnavailableForge), &scribe)
         .expect("sync report");
 
     assert!(
@@ -1088,6 +1271,216 @@ fn unavailable_state_for_a_tracked_pull_request_is_incomplete() {
     );
     assert!(report.notes.is_empty(), "was: {report:?}");
     assert_eq!(sync::exit_for(&report), knives::cli::Exit::Incomplete);
+}
+
+#[test]
+fn sync_records_one_event_for_each_pull_request_that_moved() {
+    // Given: three tracked pull requests that moved and one that did not.
+    let lab = lab::Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let name = knives::ids::RepoName::new("demo");
+    let entry = RepoEntry {
+        path: lab.work.clone(),
+        upstream: lab.upstream.display().to_string(),
+        origin: lab.work.display().to_string(),
+        base: None,
+        release: None,
+        release_branch: None,
+        test_count_command: None,
+        consumers: Vec::new(),
+    };
+    let mut pull_requests = BTreeMap::new();
+    for (number, branch, state) in [
+        (10, "feat/merged", "MERGED"),
+        (11, "feat/closed", "CLOSED"),
+        (12, "feat/moved", "OPEN"),
+        (13, "feat/still", "OPEN"),
+    ] {
+        let _ = pull_requests.insert(
+            BranchName::new(branch),
+            PullRequest {
+                number,
+                state: state.to_owned(),
+                review_decision: String::new(),
+                head_ref_name: branch.to_owned(),
+                head_ref_oid: format!("head-{number}"),
+                updated_at: "2026-08-15T00:00:00Z".to_owned(),
+                is_draft: false,
+                url: String::new(),
+                head_repository_owner: None,
+                mergeable: String::new(),
+                merge_state_status: String::new(),
+                base_ref_name: "main".to_owned(),
+                merge_commit: None,
+            },
+        );
+    }
+    let forge = knives::forge::FakeForge {
+        pull_requests,
+        ..knives::forge::FakeForge::default()
+    };
+    let state = tempfile::tempdir().expect("state directory");
+    let mut store = Store::open_for_update(state.path().join("state.json")).expect("open store");
+    store.record_pull_head(&name, 12, "older");
+    store.record_pull_head(&name, 13, "head-13");
+    let ledger = knives::ledger::Ledger::at(state.path().join("demo"));
+    let scribe = knives::ledger::Scribe::new(
+        ledger.clone(),
+        name.clone(),
+        lab.work,
+        "ses_fff688".to_owned(),
+    );
+
+    // When: sync classifies them.
+    let report = sync::sync_repo(&entry, &mut store, Some(&forge), &scribe).expect("sync report");
+    assert_eq!(report.rows.len(), 4, "was: {report:?}");
+
+    // Then: exactly the moved pulls are events, each under the tracked branch.
+    let entries = ledger.entries().expect("read ledger");
+    let recorded: Vec<(Option<&str>, &str)> = entries
+        .iter()
+        .map(|entry| (entry.subject.as_deref(), entry.text.as_str()))
+        .collect();
+    assert_eq!(
+        recorded,
+        [
+            (Some("feat/merged"), "#10 merged"),
+            (Some("feat/closed"), "#11 closed"),
+            (Some("feat/moved"), "#12 advanced to head-12"),
+        ],
+        "was: {entries:?}"
+    );
+    assert!(entries.iter().all(|entry| entry.owner == "ses_fff688"));
+    assert!(
+        entries
+            .iter()
+            .all(|entry| entry.kind == knives::ledger::Kind::Event),
+        "sync observed these; it did not assert them"
+    );
+}
+
+#[test]
+fn sync_records_a_settled_pull_request_once_across_repeated_runs() {
+    // Given: a merged pull request that remains listed by the forge.
+    let lab = lab::Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let name = knives::ids::RepoName::new("demo");
+    let entry = sync_entry(&lab);
+    let forge = knives::forge::FakeForge {
+        pull_requests: BTreeMap::from([(
+            BranchName::new("feat/alpha"),
+            sync_pull_request(10, "MERGED", "feat/alpha", "head-10"),
+        )]),
+        ..knives::forge::FakeForge::default()
+    };
+    let state = tempfile::tempdir().expect("state directory");
+    let mut store = Store::open_for_update(state.path().join("state.json")).expect("open store");
+    let ledger = knives::ledger::Ledger::at(state.path().join("demo"));
+    let scribe =
+        knives::ledger::Scribe::new(ledger.clone(), name, lab.work, "ses_fff688".to_owned());
+
+    // When: the same settled pull request is seen twice.
+    sync::sync_repo(&entry, &mut store, Some(&forge), &scribe).expect("first sync");
+    sync::sync_repo(&entry, &mut store, Some(&forge), &scribe).expect("second sync");
+
+    // Then: its settled transition remains one fact, not one fact per sync run.
+    let entries = ledger.entries().expect("read ledger");
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|entry| entry.text == "#10 merged")
+            .count(),
+        1,
+        "was: {entries:?}"
+    );
+}
+
+#[test]
+fn sync_records_an_advanced_pull_request_then_its_merge() {
+    // Given: a tracked pull request whose head advanced before the forge reports it merged.
+    let lab = lab::Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let name = knives::ids::RepoName::new("demo");
+    let entry = sync_entry(&lab);
+    let advanced = knives::forge::FakeForge {
+        pull_requests: BTreeMap::from([(
+            BranchName::new("feat/alpha"),
+            sync_pull_request(12, "OPEN", "feat/alpha", "head-12"),
+        )]),
+        ..knives::forge::FakeForge::default()
+    };
+    let merged = knives::forge::FakeForge {
+        pull_requests: BTreeMap::from([(
+            BranchName::new("feat/alpha"),
+            sync_pull_request(12, "MERGED", "feat/alpha", "head-12"),
+        )]),
+        ..knives::forge::FakeForge::default()
+    };
+    let state = tempfile::tempdir().expect("state directory");
+    let mut store = Store::open_for_update(state.path().join("state.json")).expect("open store");
+    store.record_pull_head(&name, 12, "older");
+    let ledger = knives::ledger::Ledger::at(state.path().join("demo"));
+    let scribe =
+        knives::ledger::Scribe::new(ledger.clone(), name, lab.work, "ses_fff688".to_owned());
+
+    // When: the head advances, then the forge marks that same pull request merged.
+    sync::sync_repo(&entry, &mut store, Some(&advanced), &scribe).expect("advanced sync");
+    sync::sync_repo(&entry, &mut store, Some(&merged), &scribe).expect("merged sync");
+
+    // Then: both distinct transitions remain in the ledger in observation order.
+    let entries = ledger.entries().expect("read ledger");
+    assert_eq!(
+        entries
+            .iter()
+            .map(|entry| entry.text.as_str())
+            .collect::<Vec<_>>(),
+        ["#12 advanced to head-12", "#12 merged"],
+        "was: {entries:?}"
+    );
+}
+
+#[test]
+fn sync_records_each_consecutive_advance() {
+    // Given: an open pull request whose head changes twice between sync runs.
+    let lab = lab::Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let name = knives::ids::RepoName::new("demo");
+    let entry = sync_entry(&lab);
+    let first_advance = knives::forge::FakeForge {
+        pull_requests: BTreeMap::from([(
+            BranchName::new("feat/alpha"),
+            sync_pull_request(12, "OPEN", "feat/alpha", "head-b"),
+        )]),
+        ..knives::forge::FakeForge::default()
+    };
+    let second_advance = knives::forge::FakeForge {
+        pull_requests: BTreeMap::from([(
+            BranchName::new("feat/alpha"),
+            sync_pull_request(12, "OPEN", "feat/alpha", "head-c"),
+        )]),
+        ..knives::forge::FakeForge::default()
+    };
+    let state = tempfile::tempdir().expect("state directory");
+    let mut store = Store::open_for_update(state.path().join("state.json")).expect("open store");
+    store.record_pull_head(&name, 12, "head-a");
+    let ledger = knives::ledger::Ledger::at(state.path().join("demo"));
+    let scribe =
+        knives::ledger::Scribe::new(ledger.clone(), name, lab.work, "ses_fff688".to_owned());
+
+    // When: the pull request advances from A to B, then from B to C.
+    sync::sync_repo(&entry, &mut store, Some(&first_advance), &scribe).expect("first advance");
+    sync::sync_repo(&entry, &mut store, Some(&second_advance), &scribe).expect("second advance");
+
+    // Then: both changed heads are recorded as distinct advances.
+    let entries = ledger.entries().expect("read ledger");
+    assert_eq!(
+        entries
+            .iter()
+            .map(|entry| entry.text.as_str())
+            .collect::<Vec<_>>(),
+        ["#12 advanced to head-b", "#12 advanced to head-c"],
+        "was: {entries:?}"
+    );
 }
 
 #[test]
@@ -2041,6 +2434,294 @@ fn start_bases_a_new_branch_on_a_flat_releases_fork_point() {
 }
 
 #[test]
+fn starting_and_finishing_a_branch_leaves_its_reason_in_the_ledger() {
+    // Given: a managed fork and a config home
+    let lab = lab::Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+
+    // When: a branch is started through the binary with a reason
+    let started = Command::new(env!("CARGO_BIN_EXE_knives"))
+        .args([
+            "--text",
+            "start",
+            "feat/alpha",
+            "--repo",
+            "demo",
+            "--why",
+            "carrying the queue fix",
+        ])
+        .current_dir(&lab.work)
+        .env("KNIVES_CONFIG_HOME", home.path())
+        .env("KNIVES_OWNER", "ses_fff688")
+        .output()
+        .expect("run start");
+    assert!(
+        started.status.success(),
+        "start failed: {}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+
+    // Then: the ledger holds the claim event. `start` opens a workspace at the
+    // base revision and does not create a bookmark, so only the Scribe may decide
+    // whether a ref anchor exists; here it correctly records none.
+    let ledger = knives::ledger::Ledger::at(home.path().join("ledger").join("demo"));
+    let entries = ledger.entries().expect("read ledger");
+    assert_eq!(entries.len(), 1, "was: {entries:?}");
+    assert_eq!(entries[0].kind, knives::ledger::Kind::Event);
+    assert_eq!(entries[0].owner, "ses_fff688");
+    assert_eq!(entries[0].subject.as_deref(), Some("feat/alpha"));
+    assert_eq!(entries[0].text, "claimed: carrying the queue fix");
+    assert_eq!(entries[0].anchor, None);
+
+    // When: it is handed back naming its successor
+    let finished = Command::new(env!("CARGO_BIN_EXE_knives"))
+        .args([
+            "--text",
+            "finish",
+            "feat/alpha",
+            "--repo",
+            "demo",
+            "--superseded-by",
+            "feat/replacement",
+        ])
+        .current_dir(&lab.work)
+        .env("KNIVES_CONFIG_HOME", home.path())
+        .env("KNIVES_OWNER", "ses_fff688")
+        .output()
+        .expect("run finish");
+    assert!(
+        finished.status.success(),
+        "finish failed: {}",
+        String::from_utf8_lossy(&finished.stderr)
+    );
+
+    // Then: the supersession is recorded as an event rather than only as state
+    let entries = ledger.entries().expect("read ledger");
+    assert_eq!(entries.len(), 2, "was: {entries:?}");
+    assert_eq!(
+        entries[1].text,
+        "claim released; superseded by feat/replacement"
+    );
+}
+
+/// A claim written straight into the store, so a `finish` test starts from a held
+/// branch without `start` putting its own event in the ledger first.
+fn hold_claim(home: &tempfile::TempDir, branch: &str) {
+    let mut store = Store::open_for_update(home.path().join("state.json")).expect("open store");
+    let _ = store.claim(
+        &knives::ids::BranchTarget::new(
+            knives::ids::RepoName::new("demo"),
+            BranchName::new(branch),
+        ),
+        "ses_fff688",
+        "carrying the queue fix",
+    );
+    store.save().expect("save store");
+}
+
+fn knives_finish(lab: &lab::Lab, home: &tempfile::TempDir, args: &[&str]) -> std::process::Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_knives"));
+    command.args(["--text", "finish"]);
+    command.args(args);
+    command
+        .args(["--repo", "demo"])
+        .current_dir(&lab.work)
+        .env("KNIVES_CONFIG_HOME", home.path())
+        .env("KNIVES_OWNER", "ses_fff688")
+        .output()
+        .expect("run finish")
+}
+
+#[test]
+fn finishing_a_held_branch_without_a_successor_records_only_the_release() {
+    let lab = lab::Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let (home, _consumer) = release_test_home(&lab);
+    hold_claim(&home, "feat/alpha");
+
+    let finished = knives_finish(&lab, &home, &["feat/alpha"]);
+    assert!(finished.status.success());
+
+    let entries = knives::ledger::Ledger::at(home.path().join("ledger").join("demo"))
+        .entries()
+        .expect("read ledger");
+    assert_eq!(entries.len(), 1, "was: {entries:?}");
+    assert_eq!(entries[0].text, "claim released");
+}
+
+#[test]
+fn finishing_a_branch_nobody_held_records_no_release_that_never_happened() {
+    // The ledger is the one record meant to be trusted months later, and an event
+    // is a past-tense fact this tool observed. `finish` on an unheld branch
+    // releases nothing — the command's own prose already says "was not held" —
+    // so an entry claiming a release is a fabrication in the audit trail.
+    let lab = lab::Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let (home, _consumer) = release_test_home(&lab);
+
+    let finished = knives_finish(&lab, &home, &["feat/alpha"]);
+    assert!(finished.status.success());
+    assert!(
+        String::from_utf8_lossy(&finished.stdout).contains("was not held"),
+        "was: {}",
+        String::from_utf8_lossy(&finished.stdout)
+    );
+
+    let entries = knives::ledger::Ledger::at(home.path().join("ledger").join("demo"))
+        .entries()
+        .expect("read ledger");
+    assert!(
+        entries.is_empty(),
+        "a release that never happened: {entries:?}"
+    );
+}
+
+#[test]
+fn finishing_an_unheld_branch_still_records_the_supersession_it_did_record() {
+    // Two acts, and either can happen alone: `--superseded-by` writes a
+    // supersession into the store whether or not a claim was held, so the entry
+    // says that and not the release that did not happen.
+    let lab = lab::Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let (home, _consumer) = release_test_home(&lab);
+
+    let finished = knives_finish(
+        &lab,
+        &home,
+        &["feat/alpha", "--superseded-by", "feat/replacement"],
+    );
+    assert!(finished.status.success());
+
+    let entries = knives::ledger::Ledger::at(home.path().join("ledger").join("demo"))
+        .entries()
+        .expect("read ledger");
+    assert_eq!(entries.len(), 1, "was: {entries:?}");
+    assert_eq!(entries[0].text, "superseded by feat/replacement");
+}
+
+#[test]
+fn stating_a_pull_request_and_a_dependency_leaves_both_statements_in_the_ledger() {
+    // Given: a managed fork with a branch, and a sibling repo to depend on
+    let lab = lab::Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let home = tempfile::tempdir().expect("create config home");
+    let sibling = home.path().join("sibling");
+    std::fs::write(
+        home.path().join("repos.toml"),
+        format!(
+            "[repos.demo]\npath = \"{}\"\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/work.git\"\n\
+             [repos.sibling]\npath = \"{}\"\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/other.git\"\n",
+            lab.work.display(),
+            lab.upstream.display(),
+            sibling.display(),
+            lab.upstream.display(),
+        ),
+    )
+    .expect("write registry");
+    let knives = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_knives"))
+            .args(args)
+            .current_dir(&lab.work)
+            .env("KNIVES_CONFIG_HOME", home.path())
+            .env("KNIVES_OWNER", "ses_fff688")
+            .output()
+            .expect("run knives")
+    };
+
+    // When: the branch's pull request is stated, then a dependency, then the
+    // statement is withdrawn
+    assert!(
+        knives(&["--text", "track", "feat/alpha", "--pr", "4545"])
+            .status
+            .success()
+    );
+    assert!(
+        knives(&["--text", "depends", "feat/alpha", "--on", "sibling#49"])
+            .status
+            .success()
+    );
+    assert!(
+        knives(&["--text", "track", "feat/alpha", "--forget"])
+            .status
+            .success()
+    );
+
+    // Then: all three statements are in order, anchored, and the stated pull
+    // request is stamped on the entries written while it was stated
+    let entries = knives::ledger::Ledger::at(home.path().join("ledger").join("demo"))
+        .entries()
+        .expect("read ledger");
+    let texts: Vec<&str> = entries.iter().map(|entry| entry.text.as_str()).collect();
+    assert_eq!(
+        texts,
+        [
+            "stated as #4545",
+            "requires sibling#49",
+            "pull request statement forgotten"
+        ],
+        "was: {entries:?}"
+    );
+    assert!(
+        entries
+            .iter()
+            .all(|entry| entry.subject.as_deref() == Some("feat/alpha"))
+    );
+    // Each entry is stamped with the number it is about: the one that created the
+    // association, the one recorded while it stood, and the one it withdrew.
+    assert_eq!(
+        entries.iter().map(|entry| entry.pr).collect::<Vec<_>>(),
+        [Some(4545), Some(4545), Some(4545)],
+        "was: {entries:?}"
+    );
+    let tip = Repo::open(&lab.work)
+        .expect("open")
+        .resolve_commit("feat/alpha")
+        .expect("tip");
+    assert!(
+        entries
+            .iter()
+            .all(|entry| entry.anchor.as_deref() == Some(tip.as_str()))
+    );
+
+    // And: the whole chronology of that number is findable BY that number, which
+    // is the only thing the stamped field is for. Stamping the pre-change value
+    // on the statement event would have returned two of the three.
+    let filtered = knives(&["--json", "notch", "--pr", "4545"]);
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&filtered.stdout).expect("notch --json emits JSON");
+    assert_eq!(parsed["matched"], 3, "was: {parsed}");
+}
+
+#[test]
+fn a_fork_only_statement_is_recorded_as_the_decision_it_is() {
+    let lab = lab::Lab::new();
+    lab.branch("feat/ci-only", "ci.yml", "on: push\n");
+    let (home, _consumer) = release_test_home(&lab);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_knives"))
+        .args([
+            "--text",
+            "track",
+            "feat/ci-only",
+            "--fork-only",
+            "--repo",
+            "demo",
+        ])
+        .current_dir(&lab.work)
+        .env("KNIVES_CONFIG_HOME", home.path())
+        .env("KNIVES_OWNER", "ses_fff688")
+        .output()
+        .expect("run track");
+    assert!(output.status.success());
+
+    let entries = knives::ledger::Ledger::at(home.path().join("ledger").join("demo"))
+        .entries()
+        .expect("read ledger");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].text, "stated as having no upstream pull request");
+}
+
+#[test]
 fn release_plan_exits_with_findings_when_the_current_release_lags_the_upstream_trunk() {
     // Given: a clean dated release that was cut before upstream advanced.
     let lab = lab::Lab::new();
@@ -2483,6 +3164,7 @@ fn status_with_the_landed_probe_reports_a_merged_branch_and_leaves_no_trace() {
             probe: true,
             forge: None,
             registry: None,
+            ledger: None,
         },
     )
     .expect("gather");
@@ -2538,6 +3220,7 @@ fn status_reports_branch_overlap_after_upstream_advances_without_landed_probe() 
             probe: false,
             forge: None,
             registry: None,
+            ledger: None,
         },
     )
     .expect("gather");
@@ -2586,6 +3269,7 @@ fn status_reports_a_branch_carried_elsewhere() {
             probe: false,
             forge: None,
             registry: None,
+            ledger: None,
         },
     )
     .expect("gather");
@@ -2651,6 +3335,7 @@ fn status_reports_a_carrier_for_a_closed_pull_request() {
             probe: false,
             forge: Some(&forge),
             registry: None,
+            ledger: None,
         },
     )
     .expect("gather");
@@ -2702,6 +3387,7 @@ fn status_does_not_report_trunk_as_a_carrier_without_landed_probe() {
             probe: false,
             forge: None,
             registry: None,
+            ledger: None,
         },
     )
     .expect("gather");
@@ -2711,6 +3397,163 @@ fn status_does_not_report_trunk_as_a_carrier_without_landed_probe() {
         finding.kind == knives::detect::FindingKind::CarriedElsewhere
             && finding.subject == knives::detect::Subject::Branch(BranchName::new("feat/alpha"))
     }));
+}
+
+#[test]
+fn status_carries_each_branchs_newest_notch_in_json_and_in_text() {
+    // Given: a fork with a branch and two notches on it, the second the newest
+    let lab = lab::Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let name = knives::ids::RepoName::new("demo");
+    let entry = RepoEntry {
+        path: lab.work.clone(),
+        upstream: lab.upstream.display().to_string(),
+        origin: lab.work.display().to_string(),
+        base: None,
+        release: None,
+        release_branch: None,
+        test_count_command: None,
+        consumers: Vec::new(),
+    };
+    let state = tempfile::tempdir().expect("state directory");
+    let store = Store::open(state.path().join("state.json")).expect("open store");
+    let ledger = knives::ledger::Ledger::at(state.path().join("demo"));
+    let scribe = knives::ledger::Scribe::new(
+        ledger.clone(),
+        name.clone(),
+        lab.work,
+        "ses_fff688".to_owned(),
+    );
+    scribe
+        .event(
+            Some("feat/alpha"),
+            "claimed: carrying the fix".to_owned(),
+            None,
+        )
+        .expect("first notch");
+    scribe
+        .event(
+            Some("feat/alpha"),
+            "claim released; superseded by feat/next".to_owned(),
+            None,
+        )
+        .expect("second notch");
+    scribe
+        .event(
+            Some("feat/unrelated"),
+            "claimed: something else".to_owned(),
+            None,
+        )
+        .expect("other branch");
+
+    // When: status gathers with the ledger available
+    let report = status::gather(
+        &name,
+        &entry,
+        &store,
+        &knives::commands::status::Options {
+            probe: false,
+            forge: None,
+            registry: None,
+            ledger: Some(&ledger),
+        },
+    )
+    .expect("gather");
+
+    // Then: the newest entry for that branch is on its row, and nobody else's is
+    let alpha = report
+        .branches
+        .iter()
+        .find(|row| row.name.as_str() == "feat/alpha")
+        .expect("the branch has a row");
+    let last = alpha.last_notch.as_ref().expect("a breadcrumb");
+    assert_eq!(last.text, "claim released; superseded by feat/next");
+    assert_eq!(last.kind, knives::ledger::Kind::Event);
+
+    // And: it survives serialisation under the name the design fixed
+    let json = serde_json::to_value(&report).expect("report serialises");
+    let rows = json["branches"].as_array().expect("branches");
+    let row = rows
+        .iter()
+        .find(|row| row["name"] == "feat/alpha")
+        .expect("row");
+    assert_eq!(row["last_notch"]["kind"], "event");
+    assert_eq!(
+        row["last_notch"]["text"],
+        "claim released; superseded by feat/next"
+    );
+    assert!(row["last_notch"]["ts"].is_string());
+    let beta = rows
+        .iter()
+        .find(|row| row["name"] == "feat/beta")
+        .expect("branch without a notch");
+    assert!(
+        beta.get("last_notch").is_none(),
+        "no notch is absent, not null: {beta}"
+    );
+
+    // And: the branch line carries one token for it
+    let text = status::render(&report, false);
+    assert!(
+        text.contains("\"claim released; superseded by fe…\""),
+        "was: {text}"
+    );
+    assert!(report.repo_notches.is_none(), "was: {report:?}");
+    assert!(
+        json.get("repo_notches").is_none(),
+        "absent when no repo-level entry: {json}"
+    );
+    assert!(
+        !text.contains("repo-level"),
+        "no repo-level summary without a repo-level entry: {text}"
+    );
+}
+
+#[test]
+fn status_carries_repo_level_notches_in_json_and_text() {
+    let lab = lab::Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let name = knives::ids::RepoName::new("demo");
+    let entry = sync_entry(&lab);
+    let state = tempfile::tempdir().expect("state directory");
+    let store = Store::open(state.path().join("state.json")).expect("open store");
+    let ledger = knives::ledger::Ledger::at(state.path().join("demo"));
+    let scribe = knives::ledger::Scribe::new(
+        ledger.clone(),
+        name.clone(),
+        lab.work,
+        "ses_fff688".to_owned(),
+    );
+    scribe
+        .event(None, "release remote needs a refresh".to_owned(), None)
+        .expect("repo-level notch");
+
+    let report = status::gather(
+        &name,
+        &entry,
+        &store,
+        &knives::commands::status::Options {
+            probe: false,
+            forge: None,
+            registry: None,
+            ledger: Some(&ledger),
+        },
+    )
+    .expect("gather");
+
+    let json = serde_json::to_value(&report).expect("report serialises");
+    assert_eq!(json["repo_notches"]["count"], 1);
+    assert_eq!(json["repo_notches"]["last"]["kind"], "event");
+    assert_eq!(
+        json["repo_notches"]["last"]["text"],
+        "release remote needs a refresh"
+    );
+    let text = status::render(&report, false);
+    assert!(
+        text.contains("notches  1 repo-level, newest: \"release remote needs a refresh\""),
+        "was: {text}"
+    );
 }
 
 #[test]

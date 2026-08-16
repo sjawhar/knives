@@ -10,6 +10,9 @@
 //!   with a commit id, or a local bookmark with its remote counterpart, are the
 //!   two mistakes this domain actually invites.
 //! - [`jj`] is the only module that opens a repository.
+//! - [`ledger`] is the only module that knows what a notch is: an append-only
+//!   record per repository of what happened and what was decided, which is the
+//!   half of state that [`store`] deletes when intent changes.
 //! - [`forge`] is the only module that talks to a hosting service.
 //! - [`config`] and [`store`] own the two things that cannot be recomputed:
 //!   which repos are managed, and who is working on what and why.
@@ -23,5 +26,6 @@ pub mod forge;
 pub mod hook;
 pub mod ids;
 pub mod jj;
+pub mod ledger;
 pub mod pins;
 pub mod store;

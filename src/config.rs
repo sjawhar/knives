@@ -333,10 +333,16 @@ impl Registry {
     /// The managed repo that contains `path`, if any.
     ///
     /// Longest root wins, so a repo checked out inside another repo resolves to the
-    /// inner one. Containment is by path components, never by string prefix: a
-    /// sibling directory named `<root>-2` shares the prefix and is a different
-    /// repository, which is the same trap the plugin's `isInside` avoids.
+    /// inner one. When `path` is a jj workspace beside its registered checkout,
+    /// `.jj/repo` points back to that checkout's repository store; following that
+    /// pointer retains the same component-based containment rule.
     pub fn containing(&self, path: &Path) -> Option<(RepoName, &RepoEntry)> {
+        self.containing_direct(path).or_else(|| {
+            workspace_checkout(path).and_then(|checkout| self.containing_direct(&checkout))
+        })
+    }
+
+    fn containing_direct(&self, path: &Path) -> Option<(RepoName, &RepoEntry)> {
         let canonical = path.canonicalize().unwrap_or_else(|_| path.to_owned());
         self.repos
             .iter()
@@ -354,6 +360,28 @@ impl Registry {
     pub fn names(&self) -> impl Iterator<Item = RepoName> + '_ {
         self.repos.keys().map(|name| RepoName::new(name.clone()))
     }
+}
+
+/// The registered checkout behind a jj workspace, when `path` is inside one.
+fn workspace_checkout(path: &Path) -> Option<PathBuf> {
+    for directory in path.ancestors() {
+        let pointer = directory.join(".jj").join("repo");
+        if !pointer.is_file() {
+            continue;
+        }
+        let store = PathBuf::from(std::fs::read_to_string(&pointer).ok()?.trim());
+        let store = if store.is_absolute() {
+            store
+        } else {
+            pointer.parent()?.join(store)
+        };
+        let checkout = store.parent()?.parent()?;
+        return checkout
+            .canonicalize()
+            .ok()
+            .or_else(|| Some(checkout.to_owned()));
+    }
+    None
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -439,6 +467,20 @@ pub fn load(path: &Path) -> Result<Registry, ConfigError> {
         path: path.to_owned(),
         source: Box::new(source),
     })?;
+    for name in registry.repos.keys() {
+        if name.is_empty()
+            || name == "."
+            || name == ".."
+            || Path::new(name).is_absolute()
+            || name.contains('/')
+            || name.contains('\\')
+        {
+            return Err(ConfigError::Invalid {
+                path: path.to_owned(),
+                detail: format!("repository key {name:?} is not a safe path component"),
+            });
+        }
+    }
     // Resolve once, here, so no caller can accidentally use the raw value and
     // end up pointed somewhere other than the plugin's allowlist.
     let home = path.parent().unwrap_or_else(|| Path::new(".")).to_owned();
@@ -541,6 +583,16 @@ release = "https://example.invalid/releases.git"
             registry.repos["example"].path,
             PathBuf::from("/tmp/example")
         );
+    }
+
+    #[test]
+    fn a_repo_name_that_escapes_the_ledger_directory_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let text =
+            "[repos.\"../escape\"]\npath = \"/tmp/escape\"\nupstream = \"u\"\norigin = \"o\"\n";
+
+        let error = load(&write(dir.path(), text)).unwrap_err().to_string();
+        assert!(error.contains("../escape"), "was: {error}");
     }
 
     #[test]
