@@ -158,7 +158,7 @@ mod tests {
 
     #[test]
     fn a_rev_pin_is_frozen() {
-        let text = r#"hawk-infra = { git = "https://x/y", rev = "release/2026-07-28" }"#;
+        let text = r#"work-infra = { git = "https://x/y", rev = "release/2026-07-28" }"#;
         let pins = scan("pyproject.toml", text, &crate::ids::ReleaseScheme::Dated);
         assert_eq!(pins.len(), 1);
         assert_eq!(pins[0].reference, "release/2026-07-28");

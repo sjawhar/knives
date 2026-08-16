@@ -617,15 +617,15 @@ mod tests {
         let path = dir.path().join("state.json");
         {
             let mut store = Store::open_for_update(path.clone()).unwrap();
-            store.record_comment_mark(&RepoName::new("ai"), 7, "2026-07-30T00:00:00Z");
+            store.record_comment_mark(&RepoName::new("a-repo"), 7, "2026-07-30T00:00:00Z");
             store.save().unwrap();
         }
         let store = Store::open(path).unwrap();
         assert_eq!(
-            store.comment_mark(&RepoName::new("ai"), 7),
+            store.comment_mark(&RepoName::new("a-repo"), 7),
             Some("2026-07-30T00:00:00Z")
         );
-        assert_eq!(store.comment_mark(&RepoName::new("hawk"), 7), None);
+        assert_eq!(store.comment_mark(&RepoName::new("other-repo"), 7), None);
     }
 
     #[test]
@@ -634,12 +634,15 @@ mod tests {
         let path = dir.path().join("state.json");
         {
             let mut subject = Store::open_for_update(path.clone()).unwrap();
-            subject.record_pull_state(&RepoName::new("ai"), 7, "merged");
+            subject.record_pull_state(&RepoName::new("a-repo"), 7, "merged");
             subject.save().unwrap();
         }
         let subject = Store::open(path).unwrap();
-        assert_eq!(subject.pull_state(&RepoName::new("ai"), 7), Some("merged"));
-        assert_eq!(subject.pull_state(&RepoName::new("hawk"), 7), None);
+        assert_eq!(
+            subject.pull_state(&RepoName::new("a-repo"), 7),
+            Some("merged")
+        );
+        assert_eq!(subject.pull_state(&RepoName::new("other-repo"), 7), None);
     }
 }
 
