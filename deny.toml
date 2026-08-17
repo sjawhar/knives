@@ -32,7 +32,12 @@ deny = [
 
 [sources]
 unknown-registry = "deny"
-# No git dependencies: jj-lib comes from crates.io so this tool does not
-# depend on anyone's fork. A git dependency appearing here fails CI.
+# No git dependencies except the one deliberate pin below: jj-lib in
+# particular comes from crates.io, never from a fork. Any other git
+# dependency appearing here fails CI.
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# toon-format is pinned by rev to our fork carrying TOON spec v4.1 until
+# upstream merges toon-format/toon-rust#79 and releases it; drop this
+# allowance when the dependency returns to crates.io.
+allow-git = ["https://github.com/sjawhar/toon-rust"]
