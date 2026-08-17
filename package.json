@@ -11,6 +11,9 @@
   "omp": {
     "extensions": [
       "./omp/extensions/knives.ts"
+    ],
+    "skills": [
+      "./skills"
     ]
   },
   "files": [
