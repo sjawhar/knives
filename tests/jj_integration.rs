@@ -6380,6 +6380,201 @@ fn a_bare_advance_with_an_ambiguous_parent_changes_nothing() {
 }
 
 #[test]
+fn a_bare_advance_refuses_a_branch_that_would_replace_several_parents() {
+    // Given: two released members, and a third branch built by merging both of
+    // their released tips directly -- the shape of an integration branch built
+    // across several former members, or of a member rebuilt with `jj
+    // duplicate`, whose new tip has no ancestry back to its own stale parent
+    // but happens to leave some *other* branch still reachable from it. Its
+    // current tip descends from both stale parents, so each parent's ancestry
+    // search finds it as the sole successor; deduping that result would
+    // silently fold two distinct members into one.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let (home, _consumer) = home_after_first_cut(&lab);
+    let old_alpha = commit_at(&lab, "feat/alpha");
+    let old_beta = commit_at(&lab, "feat/beta");
+    let before = release_parent_commits(&lab, "release/2026-08-04");
+    assert!(
+        before.contains(&old_alpha) && before.contains(&old_beta),
+        "{before:?}"
+    );
+    lab.jj_work([
+        "new",
+        "feat/alpha",
+        "feat/beta",
+        "-m",
+        "consolidated across both",
+    ]);
+    std::fs::write(lab.work.join("consolidated.txt"), "consolidated\n")
+        .expect("write consolidated content");
+    lab.jj_work(["bookmark", "create", "feat/consolidated", "-r", "@"]);
+    lab.jj_work(["new"]);
+
+    let output = knives_release(&lab, &home, &["advance"]);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(3), "{stdout}");
+    assert!(stdout.contains("nothing advanced"), "{stdout}");
+    assert!(
+        stdout.contains("feat/consolidated")
+            && stdout.contains("descends from 2 parents")
+            && stdout.contains("drop and include instead"),
+        "the refusal must name the overreaching branch and both parents it claimed: {stdout}"
+    );
+    assert_eq!(
+        release_parent_commits(&lab, "release/2026-08-04"),
+        before,
+        "an overreaching bare advance mutated the release"
+    );
+}
+
+#[test]
+fn advance_from_recovers_a_branch_rebuilt_with_jj_duplicate() {
+    // Given: two released members, then feat/alpha rebuilt the way `jj
+    // duplicate` rebuilds a branch onto a new base -- same content, a fresh
+    // change id sharing no ancestry with the commit the release still carries.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let (home, _consumer) = home_after_first_cut(&lab);
+    let old_alpha = commit_at(&lab, "feat/alpha");
+    let old_beta = commit_at(&lab, "feat/beta");
+    lab.jj_work(["new", "main", "-m", "alpha rebuilt onto a new base"]);
+    std::fs::write(lab.work.join("alpha.txt"), "alpha\n").expect("rebuild alpha content");
+    lab.jj_work([
+        "bookmark",
+        "set",
+        "feat/alpha",
+        "-r",
+        "@",
+        "--allow-backwards",
+    ]);
+    lab.jj_work(["new"]);
+    let rebuilt_alpha = commit_at(&lab, "feat/alpha");
+    assert_ne!(
+        rebuilt_alpha, old_alpha,
+        "the rebuild must be a fresh commit"
+    );
+
+    // When: a plain named advance can't match it -- ancestry back to
+    // `old_alpha` is gone -- so it is refused, not guessed at.
+    let plain = knives_release(&lab, &home, &["advance", "feat/alpha"]);
+    let plain_stdout = String::from_utf8_lossy(&plain.stdout);
+    assert_eq!(plain.status.code(), Some(3), "{plain_stdout}");
+    assert!(
+        plain_stdout.contains("carries no parent of feat/alpha"),
+        "{plain_stdout}"
+    );
+
+    // But naming the exact old parent it replaces succeeds.
+    let output = knives_release(
+        &lab,
+        &home,
+        &["advance", "feat/alpha", "--from", old_alpha.as_str()],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}");
+    assert!(stdout.contains("advanced feat/alpha"), "{stdout}");
+    let parents = release_parent_commits(&lab, "release/2026-08-04");
+    assert!(
+        parents.contains(&rebuilt_alpha),
+        "the rebuilt branch did not land: {parents:?}"
+    );
+    assert!(
+        !parents.contains(&old_alpha),
+        "the old parent stayed: {parents:?}"
+    );
+    assert!(
+        parents.contains(&old_beta),
+        "an unrelated member moved too: {parents:?}"
+    );
+    assert_eq!(parents.len(), 2, "{parents:?}");
+}
+
+#[test]
+fn advance_from_requires_exactly_one_branch() {
+    // Given: --from asserts one specific mapping. More than one named branch
+    // makes that assertion ambiguous, so it is refused before touching
+    // anything, not applied to the first branch and silently ignored for
+    // the rest.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let (home, _consumer) = home_after_first_cut(&lab);
+    let old_alpha = commit_at(&lab, "feat/alpha");
+    let before = release_parent_commits(&lab, "release/2026-08-04");
+
+    let output = knives_release(
+        &lab,
+        &home,
+        &[
+            "advance",
+            "feat/alpha",
+            "feat/beta",
+            "--from",
+            old_alpha.as_str(),
+        ],
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(2), "{stdout}");
+    assert!(stdout.contains("give exactly one branch"), "{stdout}");
+    assert_eq!(
+        release_parent_commits(&lab, "release/2026-08-04"),
+        before,
+        "a rejected --from still mutated the release"
+    );
+}
+
+#[test]
+fn advance_from_refuses_when_the_named_commit_is_not_a_parent() {
+    // Given: feat/alpha rebuilt onto a new base (so it is not already at its
+    // released tip), and --from naming a commit that never was a member --
+    // not even its own true old parent.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let (home, _consumer) = home_after_first_cut(&lab);
+    lab.branch("feat/gamma", "gamma.txt", "gamma\n");
+    let stray = commit_at(&lab, "feat/gamma");
+    lab.jj_work(["new", "main", "-m", "alpha rebuilt onto a new base"]);
+    std::fs::write(lab.work.join("alpha.txt"), "alpha\n").expect("rebuild alpha content");
+    lab.jj_work([
+        "bookmark",
+        "set",
+        "feat/alpha",
+        "-r",
+        "@",
+        "--allow-backwards",
+    ]);
+    lab.jj_work(["new"]);
+    let before = release_parent_commits(&lab, "release/2026-08-04");
+
+    let output = knives_release(
+        &lab,
+        &home,
+        &["advance", "feat/alpha", "--from", stray.as_str()],
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(3), "{stdout}");
+    assert!(
+        stdout.contains("is not a parent of release/2026-08-04"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("knives release include feat/alpha"),
+        "{stdout}"
+    );
+    assert_eq!(
+        release_parent_commits(&lab, "release/2026-08-04"),
+        before,
+        "a refused --from still mutated the release"
+    );
+}
+
+#[test]
 fn a_drop_without_a_why_is_a_usage_error() {
     // Dropping shipped content without a reason is how a release becomes
     // unexplainable later; the parser refuses rather than defaulting one in.

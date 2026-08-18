@@ -163,7 +163,7 @@ knives release cut [NAME]      name a new cut of the composition in hand, verbat
 knives release reap            reap superseded dated release bookmarks everywhere locally and abandon their commits; all kept while the live cut carries conflicts
 knives release include BRANCH  add a branch (or revision) to the release as one new parent; nothing else moves
 knives release drop BRANCH     remove a branch's parent from the release; the branch and its bookmark are untouched
-knives release advance [BR..]  move member parents to their branches' tips; named branches only, or every advanced member when bare
+knives release advance [BR..] [--from SHA]  move member parents to their branches' tips; named branches only, or every advanced member when bare; refuses a candidate that would replace more than one parent; --from names one branch's old parent directly, for a branch (e.g. `jj duplicate`-rebuilt) whose ancestry back to it is gone
 knives release rebase [REF]    jj rebase -b <release> -d REF (bare: the first trunk commit containing every merged pull request, then landed members carrying nothing more are dropped unless --no-drop; REF required when nothing merged): members and release move together, bookmarks following
 ```
 
