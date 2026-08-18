@@ -376,9 +376,19 @@ pub enum ReleaseAction {
     /// Moving a member is a content change, so it happens only when asked for:
     /// named branches move, and a bare `advance` moves every member whose branch
     /// has advanced. The trunk parent is `rebase`'s job.
+    ///
+    /// Matching a branch to its released parent is ancestry-based, which a `jj
+    /// duplicate` rebuild breaks: the rebuilt tip shares no history with the
+    /// commit it replaces. `--from` names that old commit directly, for exactly
+    /// one branch, so the caller asserts the mapping instead of losing the
+    /// release's recorded conflict resolution to a `drop` + `include`.
     Advance {
         /// Branches to advance. Empty means every member that has advanced.
         branches: Vec<String>,
+        /// The old parent commit a `jj duplicate`-rebuilt branch replaces.
+        /// Requires exactly one branch; bypasses the ancestry search.
+        #[arg(long)]
+        from: Option<String>,
     },
     /// Reap superseded dated cuts: forget their bookmarks everywhere, abandon their commits.
     /// The remote is never touched.

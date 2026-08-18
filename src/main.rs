@@ -211,9 +211,9 @@ fn dispatch_release(
         Some(ReleaseAction::Drop { branch, why }) => {
             run_release_edit(chosen.as_str(), &ReleaseEdit::Drop { branch, why })
         }
-        Some(ReleaseAction::Advance { branches }) => {
+        Some(ReleaseAction::Advance { branches, from }) => {
             let branches = branches.into_iter().map(BranchName::new).collect();
-            run_release_edit(chosen.as_str(), &ReleaseEdit::Advance { branches })
+            run_release_edit(chosen.as_str(), &ReleaseEdit::Advance { branches, from })
         }
     }
 }
@@ -724,9 +724,18 @@ fn stale_parent_moved_branches(
 
 /// One deliberate change to the release in hand.
 enum ReleaseEdit {
-    Include { branch: String, why: Option<String> },
-    Drop { branch: String, why: String },
-    Advance { branches: Vec<BranchName> },
+    Include {
+        branch: String,
+        why: Option<String>,
+    },
+    Drop {
+        branch: String,
+        why: String,
+    },
+    Advance {
+        branches: Vec<BranchName>,
+        from: Option<String>,
+    },
 }
 
 /// What an edit decided: a new parent set to write with the delta that describes
@@ -860,7 +869,9 @@ fn edit_release(
     let outcome = match change {
         ReleaseEdit::Include { branch, why } => include_edit(&context, branch, why.as_deref())?,
         ReleaseEdit::Drop { branch, why } => drop_edit(&context, branch, why)?,
-        ReleaseEdit::Advance { branches } => advance_edit(&context, entry, branches)?,
+        ReleaseEdit::Advance { branches, from } => {
+            advance_edit(&context, entry, branches, from.as_deref())?
+        }
     };
     let (new_parents, delta) = match outcome {
         EditOutcome::Settled(exit) => return Ok(exit),
@@ -1077,10 +1088,24 @@ fn advance_edit(
     context: &EditContext<'_>,
     entry: &knives::config::RepoEntry,
     branches: &[BranchName],
+    from: Option<&str>,
 ) -> anyhow::Result<EditOutcome> {
     let tips = context.opened.bookmark_tips()?;
     let carried = release::carried_from_tips(&tips, entry.trunk(), &entry.release_scheme());
-    let outcome = if branches.is_empty() {
+    let outcome = if let Some(from) = from {
+        let [branch] = branches else {
+            println!(
+                "{}: --from names the old commit one branch replaces; give exactly one branch",
+                context.repo
+            );
+            return Ok(EditOutcome::Settled(Exit::Usage));
+        };
+        let Ok(old) = context.opened.resolve_commit(from) else {
+            println!("{}: cannot resolve {from}", context.repo);
+            return Ok(EditOutcome::Settled(Exit::Incomplete));
+        };
+        advance_named_member_from(context, &carried, branch, &old)?
+    } else if branches.is_empty() {
         advance_every_member(context, &carried)?
     } else {
         advance_named_members(context, &carried, branches)?
@@ -1160,6 +1185,38 @@ fn advance_every_member(
             println!("{repo}: {line}");
         }
         println!("{repo}: nothing advanced; advance the ambiguous members by name");
+        return Ok(None);
+    }
+    // The mirror image of the ambiguity above: one branch found as the sole
+    // successor of more than one stale parent is not evidence it replaced all
+    // of them. A branch stacked across several former members' tips (an
+    // integration branch built across them, or a member rebuilt with `jj
+    // duplicate` that left an unrelated branch still reachable from its old
+    // tip) satisfies the ancestry check for each parent individually, and
+    // deduping the result would silently fold distinct members into one,
+    // discarding a match nobody asked for. Refuse instead of guessing.
+    let mut overreaching: Vec<(String, Vec<knives::ids::CommitId>)> = Vec::new();
+    for (index, branch, _tip) in &advances {
+        let Some(stale) = parents.get(*index).cloned() else {
+            continue;
+        };
+        match overreaching.iter_mut().find(|entry| &entry.0 == branch) {
+            Some(entry) => entry.1.push(stale),
+            None => overreaching.push((branch.clone(), vec![stale])),
+        }
+    }
+    overreaching.retain(|(_, stale_parents)| stale_parents.len() > 1);
+    if !overreaching.is_empty() {
+        for (branch, stale_parents) in &overreaching {
+            let listed: Vec<String> = stale_parents.iter().map(short12).collect();
+            println!(
+                "{repo}: {branch} descends from {} parents of {} ({}); drop and include instead",
+                stale_parents.len(),
+                release.name,
+                listed.join(", ")
+            );
+        }
+        println!("{repo}: nothing advanced; one candidate cannot silently replace several members");
         return Ok(None);
     }
     let mut moved: Vec<String> = Vec::new();
@@ -1251,6 +1308,67 @@ fn advance_named_members(
         }
     }
     Ok(Some((parents, moved)))
+}
+
+/// Advance one named branch onto the parent explicitly given by `old`,
+/// bypassing the ancestry search entirely.
+///
+/// Ancestry is the right default: it survives an ordinary `jj rebase`, which
+/// keeps a commit's descendants reachable from it. It cannot survive a `jj
+/// duplicate` rebuild -- routine in these repos precisely because `jj rebase
+/// -s` drags in whatever else is stacked on the branch -- which produces a new
+/// change id sharing no ancestry with the commit it replaces. Without this,
+/// the only way forward is `drop` then `include`, which loses the release's
+/// recorded resolution for that member and rebuilds it from scratch.
+fn advance_named_member_from(
+    context: &EditContext<'_>,
+    carried: &[(String, knives::ids::CommitId)],
+    branch: &BranchName,
+    old: &knives::ids::CommitId,
+) -> anyhow::Result<Option<(Vec<knives::ids::CommitId>, Vec<String>)>> {
+    let (repo, opened, release) = (context.repo, context.opened, context.release);
+    let Some(tip) = carried
+        .iter()
+        .find(|(carried, _)| carried == branch.as_str())
+        .map(|(_, tip)| tip.clone())
+    else {
+        if bookmark_tip(opened, branch.as_str())?.is_some() {
+            println!(
+                "{repo}: {branch} is the trunk or a release name, so it is never a member \
+                 of {}",
+                release.name
+            );
+        } else {
+            println!("{repo}: no local bookmark named {branch}");
+        }
+        return Ok(None);
+    };
+    if opened.is_ancestor(&release.commit, &tip)? {
+        println!(
+            "{repo}: {branch} is stacked on {}, so advancing a member onto it would fold in \
+             work nobody included and put the cut in its own ancestry",
+            release.name
+        );
+        return Ok(None);
+    }
+    let mut parents = release.parents.clone();
+    if parents.contains(&tip) {
+        println!("{repo}: {branch} is already at its tip in {}", release.name);
+        return Ok(Some((parents, Vec::new())));
+    }
+    let Some(index) = parents.iter().position(|parent| parent == old) else {
+        println!(
+            "{repo}: {} is not a parent of {}; `knives release include {branch}` adds \
+             {branch} instead",
+            short12(old),
+            release.name
+        );
+        return Ok(None);
+    };
+    if let Some(slot) = parents.get_mut(index) {
+        *slot = tip;
+    }
+    Ok(Some((parents, vec![branch.to_string()])))
 }
 
 /// A local bookmark's tip, when the name is one.
