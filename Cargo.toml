@@ -1,6 +1,6 @@
 [package]
 name = "knives"
-version = "0.13.1"
+version = "0.13.2"
 description = "Multi-fork, multi-agent maintenance"
 edition = "2024"
 rust-version = "1.90"
