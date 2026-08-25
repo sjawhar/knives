@@ -37,7 +37,52 @@ const OPENCODE_RELEVANT_TOOLS: &[&str] = &[
     "bash",
 ];
 
+/// How long a hook invocation may live before the watchdog ends it.
+///
+/// A response is advisory and worthless once the harness's own handler timeout
+/// (30s in OMP) has passed, so nothing legitimate is lost at this deadline.
+const WATCHDOG_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The longest deadline an override may set: above this the watchdog stops
+/// being a guard, so larger values fall back to the default instead.
+const WATCHDOG_DEADLINE_CEILING_MS: u64 = 600_000;
+
+/// End this process at a wall-clock deadline, whatever it is blocked on.
+///
+/// Harnesses spawn `knives hook` with a piped stdin and can abandon the handler
+/// that would write it, leaving the process parked in its stdin read forever.
+/// On 2026-08-25 a loaded devbox leaked one such immortal process per agent
+/// tool call until ~13k concurrent `knives` processes took the machine down.
+/// Dying loudly bounds every invocation's lifetime no matter which harness
+/// spawned it or how it misbehaves. `KNIVES_HOOK_DEADLINE_MS` overrides the
+/// deadline (tests use it; operators can too); zero and values above the
+/// ceiling would disarm the guard, so they fall back to the default.
+///
+/// Exits with `Exit::Incomplete`, never `Exit::Usage`: a clap usage error (2)
+/// is how an old binary without the `hook` subcommand fails, and the Claude
+/// Code wrapper and the TypeScript shim both key on that distinction.
+fn arm_watchdog() {
+    let deadline = std::env::var("KNIVES_HOOK_DEADLINE_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|milliseconds| (1..=WATCHDOG_DEADLINE_CEILING_MS).contains(milliseconds))
+        .map_or(WATCHDOG_DEADLINE, std::time::Duration::from_millis);
+    std::thread::spawn(move || {
+        std::thread::sleep(deadline);
+        // Best-effort diagnostics: `eprintln!` panics when stderr is gone, and a
+        // harness that abandoned this process may well have closed its pipes —
+        // the exit must happen regardless.
+        let _ = writeln!(
+            std::io::stderr(),
+            "knives hook: gave up after {}ms; exiting so abandoned invocations cannot accumulate",
+            deadline.as_millis()
+        );
+        std::process::exit(i32::from(Exit::Incomplete.code()));
+    });
+}
+
 pub fn run(harness: HookHarness) -> Exit {
+    arm_watchdog();
     let result = match harness {
         HookHarness::ClaudeCode => run_claude_code(),
         HookHarness::Opencode => run_opencode(),

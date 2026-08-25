@@ -6,6 +6,7 @@ import type {
 import {
   bundledSkillDirectory,
   createKnivesHooks,
+  type KnivesHooks,
   readOptions,
   relevantTools,
 } from "../../plugin/lib/internals.ts";
@@ -13,7 +14,7 @@ import {
 export default function knivesExtension(pi: ExtensionAPI): void {
   const options = readOptions(undefined);
   let sessionId: string | undefined;
-  let hooks: ReturnType<typeof createKnivesHooks> | undefined;
+  let hooks: KnivesHooks | undefined;
 
   pi.on("resources_discover", async () => {
     if (!options.skills) return {};

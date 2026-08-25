@@ -95,6 +95,7 @@ function restoreEnvironment(): void {
 function resetBinaryFailureState(): void {
   Reflect.deleteProperty(globalThis, "__knives_opencode_failed_binaries__");
   Reflect.deleteProperty(globalThis, "__knives_opencode_binary_warning_emitted__");
+  Reflect.deleteProperty(globalThis, "__knives_opencode_inflight__");
 }
 
 async function mockRequest(
@@ -763,3 +764,88 @@ test.serial.skipIf(realBinary.length === 0)(
     }
   }
 );
+
+test.serial("a hung binary is killed at the invoke timeout without being condemned", async () => {
+  // The 2026-08-25 devbox collapse: a hook child that never finishes must not
+  // outlive its handler, and a timeout is load, not a broken binary.
+  resetBinaryFailureState();
+  const directory = await mkdtemp(join(tmpdir(), "knives-hung-binary-"));
+  const binary = join(directory, "hung-knives.sh");
+  const pids = join(directory, "pids");
+  const respond = join(directory, "respond");
+  await write(
+    binary,
+    `#!/bin/sh\nif [ -f "${respond}" ]; then\n  cat >/dev/null\n  printf '%s' '{"addition":"REVIVED"}'\n  exit 0\nfi\nprintf '%s\\n' "$$" >> "${pids}"\nexec sleep 30\n`
+  );
+  await chmod(binary, 0o755);
+  process.env["KNIVES_BIN"] = binary;
+  process.env["KNIVES_INVOKE_TIMEOUT_MS"] = "250";
+  const warnings: string[] = [];
+  const originalError = console.error;
+  console.error = (message?: unknown) => warnings.push(String(message));
+  try {
+    const hooks = createKnivesHooks("/repo", readOptions(undefined));
+    const started = Date.now();
+    const result = output();
+    await hooks["tool.execute.after"](
+      { tool: "read", sessionID: "s", callID: "c", args: {} },
+      result
+    );
+    expect(Date.now() - started).toBeLessThan(5_000);
+    expect(result.output).toBe("tool output");
+    expect(warnings).toEqual([]);
+    // The child is dead, not merely raced past: its PID no longer exists.
+    const recorded = (await readFile(pids, "utf8")).trim().split("\n");
+    expect(recorded).toHaveLength(1);
+    const pid = Number.parseInt(recorded[0] ?? "", 10);
+    expect(pid).toBeGreaterThan(0);
+    expect(() => process.kill(pid, 0)).toThrow();
+    // And the candidate was not condemned: the very same path answers the next
+    // invocation once it behaves.
+    await writeFile(respond, "");
+    const revived = output();
+    await hooks["tool.execute.after"](
+      { tool: "read", sessionID: "s", callID: "c2", args: {} },
+      revived
+    );
+    expect(revived.output).toBe("tool outputREVIVED");
+  } finally {
+    console.error = originalError;
+    restoreEnvironment();
+    resetBinaryFailureState();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test.serial("in-flight invocations are capped so slow children cannot pile up", async () => {
+  resetBinaryFailureState();
+  const directory = await mkdtemp(join(tmpdir(), "knives-slow-binary-"));
+  const binary = join(directory, "slow-knives.sh");
+  const record = join(directory, "started");
+  await write(binary, `#!/bin/sh\nprintf 'x\\n' >> "${record}"\nexec sleep 30\n`);
+  await chmod(binary, 0o755);
+  process.env["KNIVES_BIN"] = binary;
+  // Generous kill window so all four admitted children reliably record their
+  // start even on a loaded runner; the cap assertion is what matters here.
+  process.env["KNIVES_INVOKE_TIMEOUT_MS"] = "2000";
+  try {
+    const hooks = createKnivesHooks("/repo", readOptions(undefined));
+    await Promise.all(
+      Array.from({ length: 6 }, () =>
+        hooks["experimental.session.compacting"]({ sessionID: "s" }, { context: [] })
+      )
+    );
+    const started = await readFile(record, "utf8");
+    expect(started.split("\n").filter((line) => line.length > 0)).toHaveLength(4);
+    // The gate is an in-flight limit, not a latch: once the timed-out children
+    // are gone, the next invocation is admitted again.
+    process.env["KNIVES_INVOKE_TIMEOUT_MS"] = "250";
+    await hooks["experimental.session.compacting"]({ sessionID: "s" }, { context: [] });
+    const after = await readFile(record, "utf8");
+    expect(after.split("\n").filter((line) => line.length > 0)).toHaveLength(5);
+  } finally {
+    restoreEnvironment();
+    resetBinaryFailureState();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
