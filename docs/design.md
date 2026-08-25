@@ -253,6 +253,21 @@ The OpenCode protocol fails soft. For a parsed event, a processing failure retur
 empty response envelope. Malformed input returns an empty object. Both cases keep the hook exit
 successful.
 
+Every hook invocation arms a watchdog thread that ends the process after 30 seconds
+(`KNIVES_HOOK_DEADLINE_MS` overrides; zero or absurd values fall back). Harnesses spawn the hook
+with a piped stdin and can abandon the handler that would write it — OMP times handlers out at
+30 seconds and keeps the session moving — which without the watchdog leaves the process parked in
+its stdin read forever. On 2026-08-25 that leaked one immortal process per agent tool call across
+~22 sessions until ~13k concurrent `knives` processes exhausted a devbox. A response is worthless
+after the harness's own timeout anyway, so dying loses nothing. The watchdog exits `Incomplete`
+(3), never clap's usage code (2): both the Claude Code wrapper and the TypeScript shim read 2 as
+"binary too old" and 3 as load, which degrades silently. The TypeScript shim adds the same
+guarantee from its side: it SIGKILLs its child after 10 seconds (`KNIVES_INVOKE_TIMEOUT_MS`
+overrides, bounded to the 32-bit timer range) without condemning the binary, and refuses to hold
+more than four children in flight per process, degrading to an empty response instead. The Claude
+Code shell wrapper bounds its own stdin read with `timeout 35 cat` where timeout(1) exists,
+covering the window before the binary's watchdog can arm.
+
 The OMP extension uses Pi's native `bash` implementation rather than replacing it. OMP exposes no
 session environment variable to tool shells; its bash output is not a terminal, so CLI output is
 machine-readable through the non-terminal fallback. Commands that need an owner use

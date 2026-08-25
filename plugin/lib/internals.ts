@@ -14,6 +14,13 @@ export const relevantTools: ReadonlySet<string> = new Set([
 ]);
 const binaryCacheKey = "__knives_opencode_failed_binaries__";
 const warningKey = "__knives_opencode_binary_warning_emitted__";
+const inflightKey = "__knives_opencode_inflight__";
+// One agent session rarely has more than one hook in flight; a saturated gate
+// means children are not finishing, and adding more is how a loaded devbox
+// became a fork bomb (2026-08-25, ~13k concurrent knives processes). Hooks are
+// advisory, so degrading to no response is always safe.
+const inflightCap = 4;
+const defaultInvokeTimeoutMs = 10_000;
 
 type ToolInput = {
   readonly tool: string;
@@ -74,9 +81,15 @@ export type KnivesOptions = {
   readonly skills: boolean;
 };
 
+// The gate's shape is frozen: two independently built plugin versions in one
+// process share the globalThis slot, so a shape change silently breaks the cap
+// (NaN arithmetic). A key rename is the migration path if it ever must change.
+type InflightGate = { count: number };
+
 type GlobalCarrier = typeof globalThis & {
   [binaryCacheKey]?: Set<string>;
   [warningKey]?: boolean;
+  [inflightKey]?: InflightGate;
 };
 
 function isRecord(value: unknown): value is JsonRecord {
@@ -100,6 +113,24 @@ function failedBinaries(): Set<string> {
   const created = new Set<string>();
   carrier[binaryCacheKey] = created;
   return created;
+}
+
+function inflightGate(): InflightGate {
+  // On globalThis for the same reason as failedBinaries: the module can load
+  // more than once in one process, and the cap must hold per process.
+  const carrier = globalThis as GlobalCarrier;
+  const existing = carrier[inflightKey];
+  if (existing !== undefined) return existing;
+  const created: InflightGate = { count: 0 };
+  carrier[inflightKey] = created;
+  return created;
+}
+
+function invokeTimeoutMs(): number {
+  // Bounded above by the 32-bit timer range: setTimeout clamps larger values
+  // to 1ms, which would silently kill every child immediately.
+  const parsed = Number.parseInt(process.env["KNIVES_INVOKE_TIMEOUT_MS"] ?? "", 10);
+  return parsed > 0 && parsed <= 2_147_483_647 ? parsed : defaultInvokeTimeoutMs;
 }
 
 function warnOnce(client: KnivesClient | undefined, warning: BinaryWarning): void {
@@ -191,50 +222,83 @@ function failBinary(client: KnivesClient | undefined, warning: BinaryWarning): n
   return null;
 }
 
-async function invoke(
+function parsedRecord(text: string): JsonRecord | null {
+  try {
+    const parsed: unknown = JSON.parse(text);
+    return isRecord(parsed) ? parsed : null;
+  } catch {
+    // no-excuse-ok: catch -- a non-JSON response is classified by the caller.
+    return null;
+  }
+}
+
+async function hookResponse(
   client: KnivesClient | undefined,
+  candidate: string,
   request: JsonRecord
 ): Promise<JsonRecord | null> {
-  const candidate = await binary();
-  if (candidate === null) return null;
+  const child = Bun.spawn([candidate, "hook", "opencode"], {
+    stdin: "pipe",
+    stderr: "pipe",
+    env: process.env,
+  });
+  // The timer guarantees the child cannot outlive this handler: a harness that
+  // times the handler out and abandons it would otherwise leave the child
+  // parked in its stdin read forever. SIGKILL, not SIGTERM: the response is
+  // already discarded, and releasing the gate slot must not depend on the
+  // child's cooperation. A timeout is load, not a broken binary, so it
+  // degrades to null without condemning the candidate.
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    child.kill("SIGKILL");
+  }, invokeTimeoutMs());
   try {
-    const child = Bun.spawn([candidate, "hook", "opencode"], {
-      stdin: "pipe",
-      stderr: "pipe",
-      env: process.env,
-    });
+    let wrote = true;
     try {
       await child.stdin.write(JSON.stringify(request));
       await child.stdin.end();
     } catch {
-      const [, stderr, exitCode] = await Promise.all([
-        child.stdout.text(),
-        child.stderr.text(),
-        child.exited,
-      ]);
-      return failBinary(client, {
-        candidate,
-        failure: exitCode === 0 ? "invalid_response" : "outdated",
-        stderr,
-      });
+      // no-excuse-ok: catch -- an old binary closes stdin early; classification happens below.
+      wrote = false;
     }
     const [stdout, stderr, exitCode] = await Promise.all([
       child.stdout.text(),
       child.stderr.text(),
       child.exited,
     ]);
+    if (timedOut) return null;
+    // Exit 3 (Incomplete) is the binary's own watchdog giving up under load —
+    // its hook otherwise always exits 0, and an old binary without the hook
+    // subcommand fails with clap's usage code 2. Load never condemns a binary.
+    if (exitCode === 3) return null;
     if (exitCode !== 0) return failBinary(client, { candidate, failure: "outdated", stderr });
-    try {
-      const parsed: unknown = JSON.parse(stdout);
-      return isRecord(parsed)
-        ? parsed
-        : failBinary(client, { candidate, failure: "invalid_response", stderr });
-    } catch {
-      return failBinary(client, { candidate, failure: "invalid_response", stderr });
-    }
+    return (
+      (wrote ? parsedRecord(stdout) : null) ??
+      failBinary(client, { candidate, failure: "invalid_response", stderr })
+    );
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function invoke(
+  client: KnivesClient | undefined,
+  request: JsonRecord
+): Promise<JsonRecord | null> {
+  const candidate = await binary();
+  if (candidate === null) return null;
+  const gate = inflightGate();
+  if (gate.count >= inflightCap) return null;
+  gate.count += 1;
+  try {
+    // `return await`, not `return`: the catch below must observe a spawn failure.
+    return await hookResponse(client, candidate, request);
   } catch {
     // no-excuse-ok: catch -- the plugin boundary intentionally degrades when the optional binary is unavailable.
     return failBinary(client, { candidate, failure: "missing", stderr: "" });
+  } finally {
+    gate.count -= 1;
   }
 }
 

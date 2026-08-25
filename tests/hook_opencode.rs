@@ -5,7 +5,7 @@
 )]
 
 use std::fs::File;
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -617,4 +617,49 @@ fn compacting_returns_an_empty_envelope_when_its_state_path_is_invalid() {
     assert!(success);
     assert_eq!(output, "{}");
     assert!(!errors.is_empty(), "state failure is reported on stderr");
+}
+
+#[test]
+fn an_abandoned_hook_invocation_exits_at_its_deadline_instead_of_living_forever() {
+    // Given: a harness spawned the hook with a piped stdin and then abandoned
+    // it — nothing will ever write or close that pipe. This is the state that
+    // accumulated ~13k immortal knives processes and took down a devbox on
+    // 2026-08-25: without a watchdog the process parks in its stdin read.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_knives"))
+        .args(["hook", "opencode"])
+        .env("KNIVES_HOOK_DEADLINE_MS", "250")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn hook");
+
+    // When: the deadline passes. Poll rather than block, so a regression fails
+    // the test instead of hanging the suite.
+    let started = std::time::Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll hook") {
+            break status;
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "hook process outlived its watchdog deadline"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    };
+
+    // Then: the watchdog ended the process — Incomplete (3), never clap's
+    // usage code (2), which harnesses read as "binary too old".
+    assert_eq!(status.code(), Some(3), "watchdog exit code");
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .expect("hook stderr")
+        .read_to_string(&mut stderr)
+        .expect("read hook stderr");
+    assert!(
+        stderr.contains("gave up after 250ms"),
+        "stderr names the deadline: {stderr}"
+    );
 }
