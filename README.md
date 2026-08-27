@@ -199,7 +199,7 @@ The routing table stays in gitconfig (`gh-resolved` markers, credential helpers)
 Escape hatches:
 
 * `KNIVES_GH_BYPASS` on the shim bypasses `knives gh` entirely.
-* `KNIVES_REAL_GH` points `knives gh` at a specific real `gh` binary.
+* `KNIVES_REAL_GH` points `knives gh` at a specific real `gh` binary. A value that is itself a marker-bearing shim is ignored in favor of the PATH scan — a poisoned override must never re-enter the shim.
 
 ## Release workflow
 
