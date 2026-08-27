@@ -291,11 +291,19 @@ pub(crate) fn inject_positional(args: &[String], subcommand: &str, bookmark: &st
 }
 
 /// Finds the real `gh`, never returning a marker-bearing shim (shim lines 206-215).
+///
+/// The `KNIVES_REAL_GH` override is trusted only while it is not provably the
+/// shim: a poisoned override pointing back at the shim sustained an unbounded
+/// knives<->shim fork chain (2026-08-27, ~300k processes). An unreadable
+/// override stays trusted — the spawn fails loudly with exit 127 — because the
+/// override never promised to be scannable, only to be the caller's choice.
 pub(crate) fn real_gh() -> anyhow::Result<PathBuf> {
     if let Some(path) = std::env::var_os("KNIVES_REAL_GH").filter(|path| !path.is_empty()) {
-        return Ok(PathBuf::from(path));
+        let candidate = PathBuf::from(path);
+        if shim_marker(&candidate) != Some(true) {
+            return Ok(candidate);
+        }
     }
-    let marker = b"knives-gh-shim";
     let path = std::env::var_os("PATH").unwrap_or_default();
     for directory in std::env::split_paths(&path) {
         let candidate = directory.join("gh");
@@ -305,17 +313,30 @@ pub(crate) fn real_gh() -> anyhow::Result<PathBuf> {
         if !executable {
             continue;
         }
-        let mut bytes = [0_u8; 512];
-        let Ok(read) = std::fs::File::open(&candidate).and_then(|mut file| file.read(&mut bytes))
-        else {
-            continue;
-        };
-        let (prefix, _) = bytes.split_at(read);
-        if !prefix.windows(marker.len()).any(|window| window == marker) {
+        if shim_marker(&candidate) == Some(false) {
             return Ok(candidate);
         }
     }
     Err(anyhow::anyhow!("real gh not found"))
+}
+
+/// Whether the file's first 512 bytes carry the shim marker; None when the
+/// path is not a readable regular file. Sniffing only regular files keeps a
+/// FIFO or device override from blocking resolution on open; such a path
+/// stays trusted and fails loudly at spawn instead. The sniff-to-spawn race
+/// is accepted: exploiting it needs write access to the resolved path.
+fn shim_marker(candidate: &Path) -> Option<bool> {
+    let marker = b"knives-gh-shim";
+    if !std::fs::metadata(candidate).ok()?.is_file() {
+        return None;
+    }
+    // read_to_end, not one read(): a single read may legally return short and
+    // miss a marker that sits later in the prefix.
+    let mut prefix = Vec::with_capacity(512);
+    std::fs::File::open(candidate)
+        .and_then(|file| file.take(512).read_to_end(&mut prefix))
+        .ok()?;
+    Some(prefix.windows(marker.len()).any(|window| window == marker))
 }
 
 /// Normalize a remote URL to https form with a trailing .git (shim lines 44-57).
@@ -1345,5 +1366,60 @@ mod tests {
 
         // Then: the shim does not need to be scanned or executable at the override path.
         assert_eq!(selected, override_path);
+    }
+
+    #[test]
+    fn a_marker_bearing_override_is_rejected_in_favor_of_the_path_scan() {
+        // Given: KNIVES_REAL_GH pointing at a marked shim (a mis-resolved
+        // environment), and a PATH that holds a clean gh.
+        let scratch = tempfile::tempdir().expect("scratch");
+        let shim = scratch.path().join("gh-shim");
+        let real_dir = scratch.path().join("real");
+        std::fs::create_dir(&real_dir).expect("create real directory");
+        let real = real_dir.join("gh");
+        std::fs::write(&shim, "#!/bin/sh\n# knives-gh-shim\n").expect("write shim");
+        std::fs::write(&real, "#!/bin/sh\n").expect("write real gh");
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod real gh");
+        let path = real_dir.display().to_string();
+        let override_value = shim.display().to_string();
+        let _lock = crate::config::test_support::environment_lock();
+        let guard =
+            crate::config::test_support::EnvironmentGuard::capture(&["KNIVES_REAL_GH", "PATH"]);
+        guard.set("KNIVES_REAL_GH", &override_value);
+        guard.set("PATH", &path);
+
+        // When: resolving the actual gh executable.
+        let selected = real_gh().expect("fall back to the scan");
+
+        // Then: the poisoned override cannot re-enter the shim.
+        assert_eq!(selected, real);
+    }
+
+    #[test]
+    fn a_marker_bearing_override_with_no_clean_gh_errors() {
+        // Given: a marked override and a PATH holding only another marked shim.
+        let scratch = tempfile::tempdir().expect("scratch");
+        let override_shim = scratch.path().join("gh-shim");
+        let path_dir = scratch.path().join("shims");
+        std::fs::create_dir(&path_dir).expect("create shim directory");
+        let path_shim = path_dir.join("gh");
+        std::fs::write(&override_shim, "#!/bin/sh\n# knives-gh-shim\n").expect("write override");
+        std::fs::write(&path_shim, "#!/bin/sh\n# knives-gh-shim\n").expect("write path shim");
+        std::fs::set_permissions(&path_shim, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod path shim");
+        let path = path_dir.display().to_string();
+        let override_value = override_shim.display().to_string();
+        let _lock = crate::config::test_support::environment_lock();
+        let guard =
+            crate::config::test_support::EnvironmentGuard::capture(&["KNIVES_REAL_GH", "PATH"]);
+        guard.set("KNIVES_REAL_GH", &override_value);
+        guard.set("PATH", &path);
+
+        // When: resolving the actual gh executable with nothing clean to fall back to.
+        let selected = real_gh();
+
+        // Then: a marker-bearing shim is never returned, even under failure pressure.
+        assert!(selected.is_err(), "must not return a shim: {selected:?}");
     }
 }
