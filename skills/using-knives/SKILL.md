@@ -252,6 +252,20 @@ Reads a checkout's remotes and outputs a registry entry or adopts the repository
 
 Expects remotes named for their roles: `upstream` (what we contribute to) and `origin` (our fork where branches push and PR heads live), plus an optional `release` remote. Warns if an untracked remote looks like another fork of upstream (detected via case-insensitive owner and slug comparison on the same host), reminding that `origin` must point to your own fork.
 
+## Is this content carried?
+
+For any “is branch/fix X in release/trunk Y?” question, agents MUST use the replay probe, not a source-text search. Text search proved wrong on a real repository: it claimed an approved but unmerged fix was carried; replay proved it absent.
+
+- For a release, run `knives release carries <revision> [--in <ref>]`. `--in` accepts any revision expression and defaults to the release in hand.
+- For the upstream trunk, read the `landed` column from `knives status`; it is the trunk replay probe’s answer.
+- Agents MUST NOT grep source text to answer either question.
+
+The release replay has three answers:
+
+- `is carried in`: replaying the revision leaves nothing, so the target contains its content.
+- `is NOT carried in`: replaying it leaves real diffs, so the target lacks its content.
+- `conflicts with`: the replay conflicts, so some content may be there or unrelated work touched the same files; judge it by eye.
+
 ## The three remotes
 
 - `upstream`: what we contribute to. Only ever through a pull request.

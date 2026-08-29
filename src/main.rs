@@ -10,6 +10,7 @@ use std::process::ExitCode;
 
 use clap::Parser as _;
 use knives::cli::{Cli, Command, Exit, ReleaseAction};
+use knives::detect::RebaseOutcome;
 use knives::commands::{
     hook, init, notch, preflight, register, release, repos, start, status, sync,
 };
@@ -204,6 +205,13 @@ fn dispatch_release(
         Some(ReleaseAction::Rebase { reference, no_drop }) => {
             run_rebase(chosen.as_str(), reference.as_deref(), no_drop)
         }
+        Some(ReleaseAction::Carries { revision, target }) => {
+            let registry = load(&default_config_path())?;
+            let Some(entry) = registry.get(chosen) else {
+                return Ok(Exit::Usage);
+            };
+            run_release_carries(chosen, entry, &revision, target.as_deref())
+        }
         Some(ReleaseAction::Reap) => run_reap(chosen.as_str()),
         Some(ReleaseAction::Include { branch, why }) => {
             run_release_edit(chosen.as_str(), &ReleaseEdit::Include { branch, why })
@@ -216,6 +224,47 @@ fn dispatch_release(
             run_release_edit(chosen.as_str(), &ReleaseEdit::Advance { branches, from })
         }
     }
+}
+
+/// Answer "does <target> carry <revision>" with the replay test, not text search.
+fn run_release_carries(
+    repo: &RepoName,
+    entry: &knives::config::RepoEntry,
+    revision: &str,
+    target: Option<&str>,
+) -> anyhow::Result<Exit> {
+    let named = match target {
+        Some(reference) => reference.to_owned(),
+        None => match release::plan(repo, entry, &entry.consumers)?.release {
+            Some(name) => name,
+            None => {
+                println!("{repo}: no release to check against; cut one or pass --in <ref>");
+                return Ok(Exit::Incomplete);
+            }
+        },
+    };
+    let outcome = knives::jj::probe_landed(
+        &entry.path,
+        &knives::ids::BranchName::new(revision),
+        &named,
+    )?;
+    Ok(match outcome {
+        RebaseOutcome::Empty => {
+            println!("{repo}: {revision} is carried in {named}: replaying it leaves nothing");
+            Exit::Ok
+        }
+        RebaseOutcome::CleanNonEmpty => {
+            println!("{repo}: {revision} is NOT carried in {named}: replaying it leaves real diffs");
+            Exit::Findings
+        }
+        RebaseOutcome::Conflicted => {
+            println!(
+                "{repo}: {revision} conflicts with {named}: some of its content is there, \
+                 or unrelated work touched the same files; judge it by eye"
+            );
+            Exit::Findings
+        }
+    })
 }
 
 /// Rebase the whole composition onto an upstream commit: `jj rebase -b <release> -d <target>`.

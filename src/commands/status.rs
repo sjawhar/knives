@@ -236,7 +236,7 @@ impl Timings {
 
 /// Whether phase timings were asked for.
 pub fn timing_enabled() -> bool {
-    std::env::var_os("KNIVES_TIMING").is_some()
+    crate::timing::enabled()
 }
 
 impl fmt::Debug for Options<'_> {

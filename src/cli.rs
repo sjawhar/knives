@@ -390,6 +390,19 @@ pub enum ReleaseAction {
         #[arg(long)]
         from: Option<String>,
     },
+    /// Whether a revision's content is actually carried by a release, by replay.
+    ///
+    /// The rigorous answer to "is this fix in the release": duplicate the
+    /// revision's commits onto the target and look at what remains. Empty means
+    /// carried; a real diff means not carried; grep answers a different question.
+    Carries {
+        /// A branch name, or any revision when no bookmark fits.
+        revision: String,
+        /// The release ref to check against. Defaults to the release in hand;
+        /// any revset works: a remote release, a pin, a commit id.
+        #[arg(long = "in")]
+        target: Option<String>,
+    },
     /// Reap superseded dated cuts: forget their bookmarks everywhere, abandon their commits.
     /// The remote is never touched.
     ///

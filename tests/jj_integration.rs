@@ -7867,3 +7867,59 @@ fn a_rebase_refuses_a_release_held_only_as_a_remote_ref() {
         "the remote-only release was rebased anyway"
     );
 }
+
+#[test]
+fn release_carries_answers_carried_for_a_member() {
+    // Given: a release cut carrying alpha.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let (home, _consumer) = release_test_home(&lab);
+    let cut = knives_release(&lab, &home, &["cut", "release/2026-08-04"]);
+    assert!(cut.status.success(), "{cut:?}");
+
+    // When: carries uses the release in hand as its target.
+    let output = knives_release(&lab, &home, &["carries", "feat/alpha"]);
+
+    // Then: replaying alpha onto the release is empty.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}");
+    assert!(stdout.contains("is carried in"), "{stdout}");
+}
+
+#[test]
+fn release_carries_answers_not_carried_for_outside_work() {
+    // Given: a release cut carrying alpha and an independent beta branch.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let (home, _consumer) = release_test_home(&lab);
+    let cut = knives_release(&lab, &home, &["cut", "release/2026-08-04"]);
+    assert!(cut.status.success(), "{cut:?}");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+
+    // When: beta is replayed onto the release in hand.
+    let output = knives_release(&lab, &home, &["carries", "feat/beta"]);
+
+    // Then: the real diff that remains is reported as not carried.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert!(stdout.contains("is NOT carried in"), "{stdout}");
+}
+
+#[test]
+fn release_carries_refuses_without_a_release_or_target() {
+    // Given: a branch but no release in hand.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let (home, _consumer) = release_test_home(&lab);
+
+    // When: carries has no explicit target to use instead.
+    let output = knives_release(&lab, &home, &["carries", "feat/alpha"]);
+
+    // Then: it refuses rather than guessing a target.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(3), "{stdout}");
+    assert!(
+        stdout.contains("no release to check against; cut one or pass --in <ref>"),
+        "{stdout}"
+    );
+}

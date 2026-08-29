@@ -23,6 +23,25 @@ const PR_LIST_ARGS: [&str; 8] = [
     "pr", "list", "--state", PR_STATE, "--limit", "300", "--json", PR_FIELDS,
 ];
 
+// The wide lists never ask for mergeable/mergeStateStatus: GitHub computes them
+// lazily per pull request, which made the 300-row list cost 16s on one fork and
+// deterministically 502 on another. Merge-state is live-batch-only (I2).
+const PR_SUMMARY_FIELDS: &str = "number,state,reviewDecision,headRefName,headRefOid,updatedAt,\
+     isDraft,url,headRepositoryOwner,baseRefName,mergeCommit";
+const SUMMARY_LIST_ARGS: [&str; 8] = [
+    "pr", "list", "--state", PR_STATE, "--limit", "300", "--json", PR_SUMMARY_FIELDS,
+];
+
+pub const fn summary_list_args() -> &'static [&'static str; 8] {
+    &SUMMARY_LIST_ARGS
+}
+
+/// The fields asked for by the cheap pull-request list.
+pub const fn summary_fields() -> &'static str {
+    PR_SUMMARY_FIELDS
+}
+
+
 /// The arguments used to list pull requests from the forge.
 pub const fn pull_request_list_args() -> &'static [&'static str; 8] {
     &PR_LIST_ARGS
@@ -217,6 +236,106 @@ pub struct PullDetails {
     /// What the forge's checks say. `None` means the forge reported no rollup for
     /// this pull request at all.
     pub checks: Option<ChecksSummary>,
+}
+
+/// The cheap row: wide lists, the cache, and discovery. Carries every list
+/// field EXCEPT `mergeable`/`mergeStateStatus` — their absence from this type
+/// is the field split, enforced structurally: a consumer cannot read
+/// merge-state from a list row because the field does not exist.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PullSummary {
+    pub number: u64,
+    pub state: String,
+    #[serde(default)]
+    pub review_decision: String,
+    pub head_ref_name: String,
+    pub head_ref_oid: String,
+    pub updated_at: String,
+    #[serde(default)]
+    pub is_draft: bool,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub head_repository_owner: Option<Account>,
+    #[serde(default)]
+    pub base_ref_name: String,
+    #[serde(default)]
+    pub merge_commit: Option<MergeCommit>,
+}
+
+impl PullSummary {
+    /// The cheap projection of a live row, for merging fetched facts back into the cache.
+    pub fn of(pull: &PullRequest) -> Self {
+        Self {
+            number: pull.number,
+            state: pull.state.clone(),
+            review_decision: pull.review_decision.clone(),
+            head_ref_name: pull.head_ref_name.clone(),
+            head_ref_oid: pull.head_ref_oid.clone(),
+            updated_at: pull.updated_at.clone(),
+            is_draft: pull.is_draft,
+            url: pull.url.clone(),
+            head_repository_owner: pull.head_repository_owner.clone(),
+            base_ref_name: pull.base_ref_name.clone(),
+            merge_commit: pull.merge_commit.clone(),
+        }
+    }
+
+    pub fn is_open(&self) -> bool {
+        self.state.eq_ignore_ascii_case("OPEN")
+    }
+
+    pub fn is_merged(&self) -> bool {
+        self.state.eq_ignore_ascii_case("MERGED")
+    }
+
+    pub fn is_from(&self, owner: &str) -> bool {
+        self.head_repository_owner
+            .as_ref()
+            .is_some_and(|account| account.login.eq_ignore_ascii_case(owner))
+    }
+}
+
+/// Everything the live batch answers about one pull request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullFacts {
+    /// The full fact row, `mergeable`/`mergeStateStatus` included.
+    pub pull: PullRequest,
+    pub details: PullDetails,
+    /// Newest comment-or-review timestamp, for sync's activity mark.
+    pub newest_comment: Option<String>,
+}
+
+/// The forge's own name for this checkout, resolved once per run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoIdentity {
+    pub name_with_owner: String, // "owner/repo"
+    pub id: String, // GraphQL node id
+}
+
+impl RepoIdentity {
+    /// (owner, repo), or ForgeError::Target when the name has no slash.
+    pub fn split(&self) -> Result<(&str, &str), ForgeError> {
+        self.name_with_owner
+            .split_once('/')
+            .ok_or_else(|| ForgeError::Target {
+                named: self.name_with_owner.clone(),
+            })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SweepEntry {
+    pub number: u64,
+    pub updated_at: String,
+    pub state: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SweepPage {
+    pub entries: Vec<SweepEntry>,
+    pub has_next_page: bool,
 }
 
 #[cfg(test)]
@@ -541,6 +660,42 @@ pub fn pull_details_query(numbers: &[u64]) -> String {
     )
 }
 
+/// One page, newest-updated first. No pagination: cursoring over a changing
+/// UPDATED_AT ordering can skip a concurrently-updated pull request, so a page
+/// that does not span the watermark abandons the delta (snapshot::discover).
+pub fn sweep_query() -> &'static str {
+    "query($owner: String!, $name: String!) { \
+     repository(owner: $owner, name: $name) { \
+     pullRequests(orderBy: {field: UPDATED_AT, direction: DESC}, first: 100) { \
+     pageInfo { hasNextPage } \
+     nodes { number updatedAt state } } } }"
+}
+
+/// The full I2 fact row per aliased number: every summary field plus
+/// merge-state, review timeline, check rollup, and the newest comment (sync).
+/// Alias names are not load-bearing; the parser keys on the repeated `number`.
+pub fn pull_facts_query(numbers: &[u64]) -> String {
+    let fields: String = numbers
+        .iter()
+        .map(|number| format!("p{number}: pullRequest(number: {number}) {{ ...facts }}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        "query($owner: String!, $name: String!) {{ \
+         repository(owner: $owner, name: $name) {{ {fields} }} }} \
+         fragment facts on PullRequest {{ number state reviewDecision headRefName headRefOid \
+         updatedAt isDraft url headRepositoryOwner {{ login }} baseRefName mergeable \
+         mergeStateStatus mergeCommit {{ oid }} \
+         reviews(last: 100) {{ nodes {{ submittedAt }} }} \
+         commits(last: 100) {{ nodes {{ commit {{ committedDate }} }} }} \
+         rollup: commits(last: 1) {{ nodes {{ commit {{ statusCheckRollup {{ \
+         contexts(first: 100) {{ pageInfo {{ hasNextPage }} nodes {{ __typename \
+         ... on CheckRun {{ name conclusion }} \
+         ... on StatusContext {{ context state }} }} }} }} }} }} }} \
+         comments(last: 1) {{ nodes {{ createdAt }} }} }}"
+    )
+}
+
 #[derive(Deserialize)]
 struct RepoTarget {
     #[serde(rename = "nameWithOwner")]
@@ -685,12 +840,93 @@ struct DetailsData {
 struct QueryFailure {
     #[serde(default)]
     message: String,
+    #[serde(default, rename = "type")]
+    kind: String,
+    #[serde(default)]
+    path: Vec<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
 struct DetailsEnvelope {
     #[serde(default)]
     data: Option<DetailsData>,
+    #[serde(default)]
+    errors: Vec<QueryFailure>,
+}
+
+#[derive(Deserialize)]
+struct IdentityPayload {
+    #[serde(rename = "nameWithOwner")]
+    name_with_owner: String,
+    id: String,
+}
+
+#[derive(Deserialize)]
+struct SweepEntryPayload {
+    number: u64,
+    #[serde(rename = "updatedAt")]
+    updated_at: String,
+    state: String,
+}
+
+#[derive(Deserialize)]
+struct SweepPullRequests {
+    #[serde(default, rename = "pageInfo")]
+    page_info: PageInfo,
+    #[serde(default)]
+    nodes: Vec<SweepEntryPayload>,
+}
+
+#[derive(Deserialize)]
+struct SweepRepository {
+    #[serde(rename = "pullRequests")]
+    pull_requests: SweepPullRequests,
+}
+
+#[derive(Deserialize)]
+struct SweepData {
+    #[serde(default)]
+    repository: Option<SweepRepository>,
+}
+
+#[derive(Deserialize)]
+struct SweepEnvelope {
+    #[serde(default)]
+    data: Option<SweepData>,
+    #[serde(default)]
+    errors: Vec<QueryFailure>,
+}
+
+#[derive(Deserialize)]
+struct FactsPayload {
+    #[serde(flatten)]
+    pull: PullRequest,
+    #[serde(default)]
+    reviews: Option<Nodes<Dated>>,
+    #[serde(default)]
+    commits: Option<Nodes<CommitNode>>,
+    #[serde(default)]
+    rollup: Option<Nodes<RollupNode>>,
+    #[serde(default)]
+    comments: Option<Nodes<Created>>,
+}
+
+#[derive(Deserialize)]
+struct Created {
+    #[serde(rename = "createdAt")]
+    created_at: String,
+}
+
+#[derive(Deserialize)]
+struct FactsData {
+    #[serde(default)]
+    repository: Option<BTreeMap<String, Option<FactsPayload>>>,
+}
+
+#[derive(Deserialize)]
+struct FactsEnvelope {
+    #[serde(default)]
+    data: Option<FactsData>,
     #[serde(default)]
     errors: Vec<QueryFailure>,
 }
@@ -782,6 +1018,166 @@ pub fn parse_pull_details(payload: &str) -> Result<BTreeMap<u64, PullDetails>, F
         );
     }
     Ok(details)
+}
+
+pub fn parse_identity(payload: &str) -> Result<RepoIdentity, ForgeError> {
+    let identity: IdentityPayload = serde_json::from_str(payload)?;
+    Ok(RepoIdentity {
+        name_with_owner: identity.name_with_owner,
+        id: identity.id,
+    })
+}
+
+pub fn parse_sweep(payload: &str) -> Result<SweepPage, ForgeError> {
+    let envelope: SweepEnvelope = serde_json::from_str(payload)?;
+    if !envelope.errors.is_empty() {
+        return Err(ForgeError::Query {
+            detail: envelope
+                .errors
+                .iter()
+                .map(|failure| failure.message.clone())
+                .collect::<Vec<_>>()
+                .join("; "),
+        });
+    }
+    let Some(pulls) = envelope
+        .data
+        .and_then(|data| data.repository)
+        .map(|repository| repository.pull_requests)
+    else {
+        return Err(ForgeError::Query {
+            detail: "the reply carried neither errors nor a repository".to_owned(),
+        });
+    };
+    Ok(SweepPage {
+        entries: pulls
+            .nodes
+            .into_iter()
+            .map(|entry| SweepEntry {
+                number: entry.number,
+                updated_at: entry.updated_at,
+                state: entry.state,
+            })
+            .collect(),
+        has_next_page: pulls.page_info.has_next_page,
+    })
+}
+
+pub fn parse_summaries(payload: &str) -> Result<Vec<PullSummary>, ForgeError> {
+    Ok(serde_json::from_str(payload)?)
+}
+
+fn is_tolerable_not_found(failure: &QueryFailure, asked: &[u64]) -> bool {
+    if failure.kind != "NOT_FOUND" {
+        return false;
+    }
+    let [repository, alias] = failure.path.as_slice() else {
+        return false;
+    };
+    let (Some(repository), Some(alias)) = (repository.as_str(), alias.as_str()) else {
+        return false;
+    };
+    repository == "repository" && asked.iter().any(|number| alias == format!("p{number}"))
+}
+
+pub fn parse_pull_facts(
+    payload: &str,
+    asked: &[u64],
+) -> Result<BTreeMap<u64, PullFacts>, ForgeError> {
+    let envelope: FactsEnvelope = serde_json::from_str(payload)?;
+    if envelope
+        .errors
+        .iter()
+        .any(|failure| !is_tolerable_not_found(failure, asked))
+    {
+        return Err(ForgeError::Query {
+            detail: envelope
+                .errors
+                .iter()
+                .filter(|failure| !is_tolerable_not_found(failure, asked))
+                .map(|failure| failure.message.clone())
+                .collect::<Vec<_>>()
+                .join("; "),
+        });
+    }
+    let Some(repository) = envelope.data.and_then(|data| data.repository) else {
+        return Err(ForgeError::Query {
+            detail: "the reply carried neither errors nor a repository".to_owned(),
+        });
+    };
+    let mut facts = BTreeMap::new();
+    for payload in repository.into_values().flatten() {
+        let newest_review = payload
+            .reviews
+            .iter()
+            .flat_map(|list| list.nodes.iter())
+            .filter_map(|review| review.submitted_at.as_deref())
+            .max();
+        let newest_commit = payload
+            .commits
+            .iter()
+            .flat_map(|list| list.nodes.iter())
+            .map(|node| node.commit.committed_date.as_str())
+            .max();
+        let review_predates_head = match (newest_review, newest_commit) {
+            (Some(review), Some(commit)) => Some(review < commit),
+            _ => None,
+        };
+        let has_more_contexts = payload
+            .rollup
+            .iter()
+            .flat_map(|list| list.nodes.iter())
+            .filter_map(|node| node.commit.rollup.as_ref())
+            .filter_map(|rollup| rollup.contexts.as_ref())
+            .any(|contexts| contexts.page_info.has_next_page);
+        if has_more_contexts {
+            return Err(ForgeError::Query {
+                detail: format!(
+                    "pull request #{} has more than 100 check contexts; refusing a truncated rollup",
+                    payload.pull.number
+                ),
+            });
+        }
+
+        let checks = Some(ChecksSummary {
+            runs: payload
+                .rollup
+                .iter()
+                .flat_map(|list| list.nodes.iter())
+                .filter_map(|node| node.commit.rollup.as_ref())
+                .filter_map(|rollup| rollup.contexts.as_ref())
+                .flat_map(|contexts| contexts.nodes.iter())
+                .cloned()
+                .collect(),
+        });
+        let newest_comment = payload
+            .reviews
+            .iter()
+            .flat_map(|list| list.nodes.iter())
+            .filter_map(|review| review.submitted_at.as_deref())
+            .chain(
+                payload
+                    .comments
+                    .iter()
+                    .flat_map(|list| list.nodes.iter())
+                    .map(|comment| comment.created_at.as_str()),
+            )
+            .max()
+            .map(str::to_owned);
+        let number = payload.pull.number;
+        let _ = facts.insert(
+            number,
+            PullFacts {
+                pull: payload.pull,
+                details: PullDetails {
+                    review_predates_head,
+                    checks,
+                },
+                newest_comment,
+            },
+        );
+    }
+    Ok(facts)
 }
 
 #[derive(Deserialize)]
@@ -1355,5 +1751,172 @@ mod tests {
         };
         let details = fake.pull_details(Path::new("/tmp"), &[7]).expect("details");
         assert_eq!(details[&7].review_predates_head, Some(true));
+    }
+    #[test]
+    fn a_summary_row_has_no_merge_state_to_read() {
+        // The field split is structural: this test documents it by parsing a payload
+        // that CARRIES mergeable and asserting the summary type ignores it.
+        let parsed = parse_summaries(
+            r#"[{"number":7,"state":"OPEN","headRefName":"feat/a",
+        "headRefOid":"aa","updatedAt":"2026-08-01T00:00:00Z","mergeable":"CONFLICTING"}]"#,
+        )
+        .expect("summary row parses");
+        assert_eq!(parsed[0].number, 7); // PullSummary has no mergeable field — enforced by the compiler.
+    }
+
+    #[test]
+    fn a_sweep_page_reports_order_and_continuation() {
+        let page = parse_sweep(
+            r#"{"data":{"repository":{"pullRequests":{"pageInfo":{"hasNextPage":true},
+        "nodes":[{"number":9,"updatedAt":"2026-08-02T00:00:00Z","state":"OPEN"},
+                 {"number":7,"updatedAt":"2026-08-01T00:00:00Z","state":"MERGED"}]}}}}"#,
+        )
+        .expect("sweep page parses");
+        assert!(page.has_next_page);
+        assert_eq!(page.entries[0].number, 9, "newest-updated first");
+        assert_eq!(page.entries[1].state, "MERGED");
+    }
+
+    /// The live batch reply's shape, with one fact payload per aliased field.
+    fn facts_payload(entries: &str) -> String {
+        format!("{{\"data\":{{\"repository\":{{{entries}}}}}}}")
+    }
+
+    #[test]
+    fn facts_carry_the_full_row_the_details_and_the_newest_comment() {
+        // One alias carrying every summary field plus mergeable CONFLICTING,
+        // headRepositoryOwner{login}, a review newer than the newest comment.
+        let payload = facts_payload(
+            r#""p7":{"number":7,"state":"OPEN","reviewDecision":"APPROVED","headRefName":"feat/a",
+        "headRefOid":"aa","updatedAt":"2026-08-01T00:00:00Z","isDraft":false,"url":"u",
+        "headRepositoryOwner":{"login":"our-org"},"baseRefName":"main","mergeable":"CONFLICTING",
+        "mergeStateStatus":"DIRTY","mergeCommit":null,
+        "reviews":{"nodes":[{"submittedAt":"2026-08-02T00:00:00Z"}]},
+        "commits":{"nodes":[{"commit":{"committedDate":"2026-08-01T12:00:00Z"}}]},
+        "rollup":{"nodes":[]},"comments":{"nodes":[{"createdAt":"2026-07-30T00:00:00Z"}]}}"#,
+        );
+        let facts = parse_pull_facts(&payload, &[7]).expect("facts parse");
+        let fact = &facts[&7];
+        assert_eq!(fact.pull.mergeable, "CONFLICTING");
+        assert_eq!(
+            fact.pull.head_repository_owner.as_ref().map(|owner| owner.login.as_str()),
+            Some("our-org")
+        );
+        assert_eq!(
+            fact.details.review_predates_head,
+            Some(false),
+            "review is newer than the head"
+        );
+        assert_eq!(
+            fact.newest_comment.as_deref(),
+            Some("2026-08-02T00:00:00Z"),
+            "the review outranks the older comment"
+        );
+    }
+
+    #[test]
+    fn a_not_found_alias_is_absent_and_does_not_fail_the_batch() {
+        let payload = format!(
+            r#"{{"data":{{"repository":{{"p7":{{"number":7,"state":"OPEN","headRefName":"feat/a",
+            "headRefOid":"aa","updatedAt":"2026-08-01T00:00:00Z"}},"p300":null}}}},
+            "errors":[{{"type":"NOT_FOUND","path":["repository","p300"],"message":"not found"}}]}}"#
+        );
+        let facts = parse_pull_facts(&payload, &[7, 300]).expect("a missing asked alias is tolerated");
+        assert!(facts.contains_key(&7));
+        assert!(!facts.contains_key(&300));
+    }
+
+    #[test]
+    fn any_other_error_fails_the_whole_batch() {
+        let payload = r#"{"data":{"repository":{"p7":null}},"errors":[
+            {"type":"RATE_LIMITED","path":["repository","p7"],"message":"rate limited"}]}"#;
+        let error = parse_pull_facts(payload, &[7]).expect_err("only asked NOT_FOUND aliases are tolerated");
+        assert!(matches!(error, ForgeError::Query { .. }), "was: {error}");
+        assert!(error.to_string().contains("rate limited"), "was: {error}");
+    }
+
+    #[test]
+    fn the_newest_comment_is_the_max_of_comments_and_reviews() {
+        let payload = facts_payload(
+            r#""p7":{"number":7,"state":"OPEN","headRefName":"feat/a","headRefOid":"aa",
+            "updatedAt":"2026-08-01T00:00:00Z",
+            "reviews":{"nodes":[{"submittedAt":"2026-08-02T00:00:00Z"}]},
+            "comments":{"nodes":[{"createdAt":"2026-08-03T00:00:00Z"}]}}"#,
+        );
+        let facts = parse_pull_facts(&payload, &[7]).expect("facts parse");
+        assert_eq!(
+            facts[&7].newest_comment.as_deref(),
+            Some("2026-08-03T00:00:00Z")
+        );
+    }
+
+    #[test]
+    fn a_repo_identity_exposes_and_splits_the_forges_own_name() {
+        let identity =
+            parse_identity(r#"{"nameWithOwner":"our-org/some-repo","id":"R_kgDOxyz"}"#)
+                .expect("identity parses");
+        assert_eq!(identity.split().expect("owner/repo"), ("our-org", "some-repo"));
+
+        let error = RepoIdentity {
+            name_with_owner: "bare".to_owned(),
+            id: "R_kgDOxyz".to_owned(),
+        }
+        .split()
+        .expect_err("an unsplittable identity cannot be queried");
+        assert!(matches!(error, ForgeError::Target { .. }), "was: {error}");
+    }
+
+    #[test]
+    fn summaries_copy_only_the_cheap_projection_and_preserve_its_behavior() {
+        let pull = PullRequest {
+            number: 7,
+            state: "MERGED".to_owned(),
+            review_decision: "APPROVED".to_owned(),
+            head_ref_name: "feat/a".to_owned(),
+            head_ref_oid: "aa".to_owned(),
+            updated_at: "2026-08-01T00:00:00Z".to_owned(),
+            is_draft: false,
+            url: "u".to_owned(),
+            head_repository_owner: Some(Account {
+                login: "our-org".to_owned(),
+            }),
+            mergeable: "CONFLICTING".to_owned(),
+            merge_state_status: "DIRTY".to_owned(),
+            base_ref_name: "main".to_owned(),
+            merge_commit: Some(MergeCommit {
+                oid: "bb".to_owned(),
+            }),
+        };
+        let summary = PullSummary::of(&pull);
+        assert!(summary.is_merged());
+        assert!(!summary.is_open());
+        assert!(summary.is_from("OUR-ORG"));
+        assert_eq!(summary.merge_commit, pull.merge_commit);
+    }
+
+    #[test]
+    fn cache_list_contract_omits_live_merge_state_fields() {
+        let args = summary_list_args();
+        assert_eq!(
+            args,
+            &["pr", "list", "--state", "all", "--limit", "300", "--json",
+                "number,state,reviewDecision,headRefName,headRefOid,updatedAt,isDraft,url,\
+     headRepositoryOwner,baseRefName,mergeCommit"]
+        );
+        assert!(!summary_fields().contains("mergeable"));
+        assert!(!summary_fields().contains("mergeStateStatus"));
+    }
+
+    #[test]
+    fn live_queries_request_the_required_fact_and_sweep_shapes() {
+        let sweep = sweep_query();
+        assert!(sweep.contains("orderBy: {field: UPDATED_AT, direction: DESC}"), "was: {sweep}");
+        assert!(sweep.contains("first: 100"), "was: {sweep}");
+        let facts = pull_facts_query(&[7, 300]);
+        assert!(facts.contains("p7: pullRequest(number: 7)"), "was: {facts}");
+        assert!(facts.contains("p300: pullRequest(number: 300)"), "was: {facts}");
+        assert!(facts.contains("mergeable"), "was: {facts}");
+        assert!(facts.contains("mergeStateStatus"), "was: {facts}");
+        assert!(facts.contains("comments(last: 1)"), "was: {facts}");
     }
 }
