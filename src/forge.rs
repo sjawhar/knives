@@ -250,11 +250,23 @@ pub fn remote_owner(remote: &str) -> Option<&str> {
     (!owner.is_empty()).then_some(owner)
 }
 
+/// The account names whose full pull-request history is worth fetching.
+///
+/// Derived from the same remotes `ours_only` filters by. An organization owner
+/// cannot author a pull request, so a name that happens to be an org merely
+/// returns an empty search.
+pub fn search_authors(remotes: &[&str]) -> Vec<String> {
+    let mut authors: Vec<String> = remotes
+        .iter()
+        .filter_map(|remote| remote_owner(remote))
+        .map(str::to_owned)
+        .collect();
+    authors.dedup();
+    authors
+}
+
 /// Keep only the pull requests that come from our own copy of the repository.
-pub fn ours_only(
-    pull_requests: BTreeMap<BranchName, PullRequest>,
-    remotes: &[&str],
-) -> BTreeMap<BranchName, PullRequest> {
+pub fn ours_only(pull_requests: Vec<PullRequest>, remotes: &[&str]) -> Vec<PullRequest> {
     let owners: Vec<&str> = remotes
         .iter()
         .filter_map(|remote| remote_owner(remote))
@@ -266,7 +278,7 @@ pub fn ours_only(
     }
     pull_requests
         .into_iter()
-        .filter(|(_, pr)| owners.iter().any(|owner| pr.is_from(owner)))
+        .filter(|pr| owners.iter().any(|owner| pr.is_from(owner)))
         .collect()
 }
 
@@ -287,16 +299,13 @@ pub struct LandedPull {
 /// commit the forge did not record stays listed with `None` — the caller cannot
 /// place it and must say so, rather than choose a target that quietly leaves
 /// merged work out.
-pub fn merged_onto(
-    pull_requests: &BTreeMap<BranchName, PullRequest>,
-    trunk: &str,
-) -> Vec<LandedPull> {
+pub fn merged_onto(pull_requests: &[PullRequest], trunk: &str) -> Vec<LandedPull> {
     let mut landed: Vec<LandedPull> = pull_requests
         .iter()
-        .filter(|(_, pr)| pr.is_merged() && pr.base_ref_name == trunk)
-        .map(|(branch, pr)| LandedPull {
+        .filter(|pr| pr.is_merged() && pr.base_ref_name == trunk)
+        .map(|pr| LandedPull {
             number: pr.number,
-            branch: branch.clone(),
+            branch: BranchName::new(pr.head_ref_name.clone()),
             oid: pr.merge_commit.as_ref().map(|merge| merge.oid.clone()),
         })
         .collect();
@@ -342,8 +351,26 @@ pub enum ForgeError {
 /// `Send + Sync` because `status` gathers repositories concurrently and probes
 /// branches on scoped threads, and both share one forge.
 pub trait Forge: Send + Sync {
-    /// Pull requests in every state, indexed by head branch name.
-    fn pull_requests(&self, repo: &Path) -> Result<BTreeMap<BranchName, PullRequest>, ForgeError>;
+    /// Pull requests in every state, as the forge lists them (freshest first).
+    ///
+    /// The raw list, not an index: one head branch accumulates several pull
+    /// requests over its life, and which of them a caller cares about differs —
+    /// `status` wants a primary per branch plus the shadowed history
+    /// (`index_pulls`), `sync` resolves tracked numbers and must see every
+    /// state without one shadowing another.
+    ///
+    /// `authors` names whose full history to fetch beyond the newest-300
+    /// window. On a busy upstream that window is other people's traffic: a
+    /// real repository's newest 300 pull requests started at #4720 while our
+    /// own closed submissions sat at #4526–#4674, so every one of them —
+    /// review history included — was invisible to every consumer. One extra
+    /// author-scoped query per name retrieves ours in every state, whatever
+    /// the upstream's volume.
+    fn pull_requests(
+        &self,
+        repo: &Path,
+        authors: &[String],
+    ) -> Result<Vec<PullRequest>, ForgeError>;
 
     /// Review age and check state for many pull requests in one round trip.
     ///
@@ -399,12 +426,27 @@ impl CliForge {
 }
 
 impl Forge for CliForge {
-    fn pull_requests(&self, repo: &Path) -> Result<BTreeMap<BranchName, PullRequest>, ForgeError> {
+    fn pull_requests(
+        &self,
+        repo: &Path,
+        authors: &[String],
+    ) -> Result<Vec<PullRequest>, ForgeError> {
         // Every state, not just open. A pull request the maintainer declined is
         // the most important thing to know about a branch, and querying only open
         // ones reported "no pull request" and then advised opening one.
         let payload = Self::run(repo, &PR_LIST_ARGS)?;
-        Ok(index_by_branch(&parse_pull_requests(&payload)?))
+        let mut pull_requests = parse_pull_requests(&payload)?;
+        for author in authors {
+            let search = format!("author:{author}");
+            let args = [
+                "pr", "list", "--state", PR_STATE, "--limit", "300", "--search", &search, "--json",
+                PR_FIELDS,
+            ];
+            let payload = Self::run(repo, &args)?;
+            pull_requests.extend(parse_pull_requests(&payload)?);
+        }
+        dedupe_by_number(&mut pull_requests);
+        Ok(pull_requests)
     }
 
     fn pull_details(
@@ -521,14 +563,56 @@ pub fn parse_pull_requests(payload: &str) -> Result<Vec<PullRequest>, ForgeError
     Ok(serde_json::from_str(payload)?)
 }
 
-pub fn index_by_branch(prs: &[PullRequest]) -> BTreeMap<BranchName, PullRequest> {
-    let mut indexed = BTreeMap::new();
+/// Drop later duplicates of a number, keeping the forge's freshest-first order.
+///
+/// The windowed list and the author-scoped searches overlap on recent pull
+/// requests; a duplicate would double a branch's history.
+pub fn dedupe_by_number(pull_requests: &mut Vec<PullRequest>) {
+    let mut seen = std::collections::BTreeSet::new();
+    pull_requests.retain(|pull_request| seen.insert(pull_request.number));
+}
+
+/// One branch's pull requests, split into the primary and its shadowed history.
+#[derive(Debug, Default)]
+pub struct PullIndex {
+    /// The pull request a reader should look at first for each head branch.
+    pub by_branch: BTreeMap<BranchName, PullRequest>,
+    /// The rest of each branch's pull requests, in the forge's freshest-first
+    /// order. A head branch accumulates several over its life — an org-fork
+    /// submission closed and re-homed onto a personal fork keeps its review
+    /// history on the closed number — and collapsing to one per branch used to
+    /// discard these silently. An audit walked straight past a maintainer's
+    /// blocking question because the closed predecessor carrying it never
+    /// rendered anywhere.
+    pub prior: BTreeMap<BranchName, Vec<PullRequest>>,
+}
+
+/// Index pull requests by head branch, keeping every shadowed one visible.
+///
+/// Primary selection is deterministic: an open pull request beats any closed or
+/// merged one, and ties keep the forge's own ordering. First-wins list order —
+/// the previous rule — let whichever pull request the forge listed first shadow
+/// the rest, so a freshly closed duplicate could hide a still-open submission
+/// and vice versa.
+pub fn index_pulls(prs: &[PullRequest]) -> PullIndex {
+    let mut index = PullIndex::default();
     for pr in prs {
-        let _ = indexed
-            .entry(BranchName::new(pr.head_ref_name.clone()))
-            .or_insert_with(|| pr.clone());
+        let branch = BranchName::new(pr.head_ref_name.clone());
+        match index.by_branch.entry(branch.clone()) {
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                let _ = slot.insert(pr.clone());
+            }
+            std::collections::btree_map::Entry::Occupied(mut slot) => {
+                if pr.is_open() && !slot.get().is_open() {
+                    let shadowed = slot.insert(pr.clone());
+                    index.prior.entry(branch).or_default().push(shadowed);
+                } else {
+                    index.prior.entry(branch).or_default().push(pr.clone());
+                }
+            }
+        }
     }
-    indexed
+    index
 }
 
 #[derive(Deserialize)]
@@ -737,8 +821,12 @@ pub struct FakeForge {
 }
 
 impl Forge for FakeForge {
-    fn pull_requests(&self, _repo: &Path) -> Result<BTreeMap<BranchName, PullRequest>, ForgeError> {
-        Ok(self.pull_requests.clone())
+    fn pull_requests(
+        &self,
+        _repo: &Path,
+        _authors: &[String],
+    ) -> Result<Vec<PullRequest>, ForgeError> {
+        Ok(self.pull_requests.values().cloned().collect())
     }
 
     fn pull_details(
@@ -802,8 +890,6 @@ mod tests {
         // A real repository had an outside contributor whose head branch was called `main`.
         // Because we carry a local `main`, name matching claimed it as our work.
         use super::{Account, PullRequest, ours_only};
-        use crate::ids::BranchName;
-        use std::collections::BTreeMap;
 
         let origin = format!("https://{HOST}/our-org/some-repo.git");
         let make = |number: u64, owner: Option<&str>| PullRequest {
@@ -814,19 +900,16 @@ mod tests {
             }),
             ..PullRequest::default()
         };
-        let mut pull_requests = BTreeMap::new();
-        let _ = pull_requests.insert(BranchName::new("main"), make(4554, Some("outsider")));
-        let kept = ours_only(pull_requests, &[&origin]);
+        let kept = ours_only(vec![make(4554, Some("outsider"))], &[&origin]);
         assert!(kept.is_empty(), "another owner's branch is not our work");
 
-        let mut mine = BTreeMap::new();
-        let _ = mine.insert(BranchName::new("main"), make(1, Some("our-org")));
-        assert_eq!(ours_only(mine, &[&origin]).len(), 1);
+        assert_eq!(
+            ours_only(vec![make(1, Some("our-org"))], &[&origin]).len(),
+            1
+        );
 
         // A deleted head repository cannot be ours, and must not be assumed to be.
-        let mut gone = BTreeMap::new();
-        let _ = gone.insert(BranchName::new("main"), make(2, None));
-        assert!(ours_only(gone, &[&origin]).is_empty());
+        assert!(ours_only(vec![make(2, None)], &[&origin]).is_empty());
     }
 
     #[test]
@@ -835,21 +918,16 @@ mod tests {
         // personal fork recorded under another role. Matching only origin's owner
         // reported those PRs as nobody's and their branches as unpushed for months.
         use super::{Account, PullRequest, ours_only};
-        use crate::ids::BranchName;
-        use std::collections::BTreeMap;
         let origin = format!("https://{HOST}/org-copy/some-repo.git");
         let release = format!("https://{HOST}/personal/some-repo.git");
-        let mut prs = BTreeMap::new();
-        let _ = prs.insert(
-            BranchName::new("feat/a"),
-            PullRequest {
-                number: 7,
-                head_repository_owner: Some(Account {
-                    login: "personal".to_owned(),
-                }),
-                ..PullRequest::default()
-            },
-        );
+        let prs = vec![PullRequest {
+            number: 7,
+            head_ref_name: "feat/a".to_owned(),
+            head_repository_owner: Some(Account {
+                login: "personal".to_owned(),
+            }),
+            ..PullRequest::default()
+        }];
         assert_eq!(ours_only(prs.clone(), &[&origin, &release]).len(), 1);
         assert!(
             ours_only(prs, &[&origin]).is_empty(),
@@ -896,10 +974,48 @@ mod tests {
     #[test]
     fn pull_requests_parse_and_index_by_head_branch() {
         let parsed = parse_pull_requests(LIST).unwrap();
-        let indexed = index_by_branch(&parsed);
-        assert_eq!(indexed.len(), 2);
-        assert_eq!(indexed[&BranchName::new("feat/alpha")].number, 1128);
-        assert!(indexed[&BranchName::new("feat/beta")].is_draft);
+        let indexed = index_pulls(&parsed);
+        assert_eq!(indexed.by_branch.len(), 2);
+        assert_eq!(
+            indexed.by_branch[&BranchName::new("feat/alpha")].number,
+            1128
+        );
+        assert!(indexed.by_branch[&BranchName::new("feat/beta")].is_draft);
+        assert!(indexed.prior.is_empty());
+    }
+
+    #[test]
+    fn an_open_pull_request_beats_a_closed_one_whatever_the_list_order() {
+        // A head branch accumulates pull requests over its life: an org-fork
+        // submission closed and re-homed onto a personal fork keeps its review
+        // history on the closed number. First-wins list order let whichever the
+        // forge listed first shadow the rest silently.
+        let record = |number: u64, state: &str| PullRequest {
+            number,
+            state: state.to_owned(),
+            head_ref_name: "feat/alpha".to_owned(),
+            ..PullRequest::default()
+        };
+
+        // Closed listed first (a freshly closed duplicate above an older open one).
+        let closed_first = [record(9, "CLOSED"), record(7, "OPEN")];
+        let indexed = index_pulls(&closed_first);
+        assert_eq!(indexed.by_branch[&BranchName::new("feat/alpha")].number, 7);
+        let prior = &indexed.prior[&BranchName::new("feat/alpha")];
+        assert_eq!(prior.len(), 1);
+        assert_eq!(prior[0].number, 9);
+
+        // Open listed first (the usual freshest-first order): same answer.
+        let open_first = [record(7, "OPEN"), record(9, "CLOSED")];
+        let indexed = index_pulls(&open_first);
+        assert_eq!(indexed.by_branch[&BranchName::new("feat/alpha")].number, 7);
+        assert_eq!(indexed.prior[&BranchName::new("feat/alpha")].len(), 1);
+
+        // A branch whose only pull request is closed keeps it as primary: a
+        // declined pull request is the most important thing to know about it.
+        let indexed = index_pulls(&[record(9, "CLOSED")]);
+        assert_eq!(indexed.by_branch[&BranchName::new("feat/alpha")].number, 9);
+        assert!(indexed.prior.is_empty());
     }
 
     #[test]
@@ -916,7 +1032,7 @@ mod tests {
 
         // When: the list payload is parsed
         let parsed = parse_pull_requests(payload).expect("parse");
-        let indexed = index_by_branch(&parsed);
+        let indexed = index_pulls(&parsed).by_branch;
 
         // Then: the merge commit survives, and its absence stays None
         let merged = &indexed[&BranchName::new("feat/alpha")];
@@ -942,19 +1058,18 @@ mod tests {
             }),
             ..PullRequest::default()
         };
-        let mut pull_requests = BTreeMap::new();
-        let _ = pull_requests.insert(
-            BranchName::new("e"),
-            record(5, "merged", "main", Some("e5")),
-        );
-        let _ = pull_requests.insert(
-            BranchName::new("a"),
-            record(9, "MERGED", "main", Some("a9")),
-        );
-        let _ = pull_requests.insert(BranchName::new("b"), record(2, "OPEN", "main", None));
-        let _ = pull_requests.insert(BranchName::new("c"), record(3, "CLOSED", "main", None));
-        let _ = pull_requests.insert(BranchName::new("d"), record(4, "MERGED", "dev", Some("d4")));
-        let _ = pull_requests.insert(BranchName::new("f"), record(6, "MERGED", "main", None));
+        let with_branch = |branch: &str, pull_request: PullRequest| PullRequest {
+            head_ref_name: branch.to_owned(),
+            ..pull_request
+        };
+        let pull_requests = vec![
+            with_branch("e", record(5, "merged", "main", Some("e5"))),
+            with_branch("a", record(9, "MERGED", "main", Some("a9"))),
+            with_branch("b", record(2, "OPEN", "main", None)),
+            with_branch("c", record(3, "CLOSED", "main", None)),
+            with_branch("d", record(4, "MERGED", "dev", Some("d4"))),
+            with_branch("f", record(6, "MERGED", "main", None)),
+        ];
 
         // When: the landing points on the trunk are read
         let landed = merged_onto(&pull_requests, "main");

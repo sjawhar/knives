@@ -454,7 +454,12 @@ fn merged_rebase_target(
     opened: &knives::jj::Repo,
 ) -> anyhow::Result<Option<RebaseDestination>> {
     let trunk = entry.upstream_trunk();
-    let pull_requests = match CliForge.pull_requests(&entry.path) {
+    let remotes = [
+        entry.remote(knives::config::Role::Origin),
+        entry.remote(knives::config::Role::Release),
+    ];
+    let authors = knives::forge::search_authors(&remotes);
+    let pull_requests = match CliForge.pull_requests(&entry.path, &authors) {
         Ok(found) => knives::forge::ours_only(
             found,
             &[

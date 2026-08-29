@@ -5,14 +5,14 @@
 //! cannot evaluate and must not pretend to. That half is the skill's job, and
 //! it consumes this output.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use crate::cli::Exit;
 use crate::config::RepoEntry;
 use crate::detect::{Finding, divergent_changes, stale_parents};
 use crate::forge::{Forge, PullRequest};
-use crate::ids::{BookmarkRef, BranchName, RepoName, is_release_name};
+use crate::ids::{BookmarkRef, RepoName, is_release_name};
 use crate::jj::Repo;
 use crate::store::Store;
 
@@ -109,13 +109,12 @@ pub fn stated_pull_request_cap(policy: &str) -> Option<u32> {
     None
 }
 
-fn owned_open_pull_request_count(
-    pull_requests: &BTreeMap<BranchName, PullRequest>,
-    ours: &BTreeSet<String>,
-) -> usize {
+fn owned_open_pull_request_count(pull_requests: &[PullRequest], ours: &BTreeSet<String>) -> usize {
     pull_requests
         .iter()
-        .filter(|(branch, pull_request)| ours.contains(branch.as_str()) && pull_request.is_open())
+        .filter(|pull_request| {
+            ours.contains(pull_request.head_ref_name.as_str()) && pull_request.is_open()
+        })
         .count()
 }
 
@@ -199,7 +198,13 @@ pub fn gather(name: &RepoName, entry: &RepoEntry, store: &mut Store, forge: &dyn
         }
     }
 
-    match forge.pull_requests(&entry.path) {
+    match forge.pull_requests(
+        &entry.path,
+        &crate::forge::search_authors(&[
+            entry.remote(crate::config::Role::Origin),
+            entry.remote(crate::config::Role::Release),
+        ]),
+    ) {
         // OURS, not every pull request on the upstream. The spec asks for
         // our count against that repo, and the unscoped figure was 83 where ours
         // was 10. An agent checking itself against a cap needs its own number.
@@ -411,29 +416,23 @@ mod tests {
     fn only_open_owned_pull_requests_count_toward_a_cap() {
         // Given: our branches with both an open and a merged pull request, plus an
         // open pull request on a branch we do not carry.
-        let pull_requests = BTreeMap::from([
-            (
-                BranchName::new("feat/open"),
-                PullRequest {
-                    state: "OPEN".to_owned(),
-                    ..PullRequest::default()
-                },
-            ),
-            (
-                BranchName::new("feat/merged"),
-                PullRequest {
-                    state: "MERGED".to_owned(),
-                    ..PullRequest::default()
-                },
-            ),
-            (
-                BranchName::new("outside/open"),
-                PullRequest {
-                    state: "OPEN".to_owned(),
-                    ..PullRequest::default()
-                },
-            ),
-        ]);
+        let pull_requests = vec![
+            PullRequest {
+                state: "OPEN".to_owned(),
+                head_ref_name: "feat/open".to_owned(),
+                ..PullRequest::default()
+            },
+            PullRequest {
+                state: "MERGED".to_owned(),
+                head_ref_name: "feat/merged".to_owned(),
+                ..PullRequest::default()
+            },
+            PullRequest {
+                state: "OPEN".to_owned(),
+                head_ref_name: "outside/open".to_owned(),
+                ..PullRequest::default()
+            },
+        ];
         let ours = BTreeSet::from(["feat/open".to_owned(), "feat/merged".to_owned()]);
 
         // When: the cap count is derived from the all-state forge list.

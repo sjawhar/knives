@@ -9,7 +9,9 @@ use crate::detect::{
     BookmarkTips, Finding, FindingKind, LandedVerdict, Subject, classify_landed, divergent_changes,
     double_checkout, stale_parents,
 };
-use crate::forge::{ChecksSummary, Forge, PullDetails, PullRequest, ours_only};
+use crate::forge::{
+    ChecksSummary, Forge, PullDetails, PullIndex, PullRequest, index_pulls, ours_only,
+};
 use crate::ids::{
     BookmarkRef, BranchName, BranchTarget, CommitId, ReleaseScheme, RepoName, is_release_name,
     pull_number_from_bookmark,
@@ -58,6 +60,31 @@ pub struct BranchRow {
     /// never explained.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_notch: Option<LastNotch>,
+    /// This branch's other pull requests, shadowed by the primary one.
+    ///
+    /// A head branch accumulates pull requests over its life — an org-fork
+    /// submission closed and re-homed onto a personal fork keeps its review
+    /// history on the closed number — and hiding them is how an audit walked
+    /// past a maintainer's blocking question that lived on a closed
+    /// predecessor.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub prior_pulls: Vec<PriorPull>,
+}
+
+/// A shadowed pull request, compact enough for a row.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PriorPull {
+    pub number: u64,
+    pub state: String,
+}
+
+impl PriorPull {
+    fn of(pull_request: &PullRequest) -> Self {
+        Self {
+            number: pull_request.number,
+            state: pull_request.state.clone(),
+        }
+    }
 }
 
 impl BranchRow {
@@ -74,6 +101,7 @@ impl BranchRow {
             fork_only: false,
             stated_pull: None,
             last_notch: None,
+            prior_pulls: Vec::new(),
         }
     }
 }
@@ -369,6 +397,17 @@ fn landed_verdicts(
 ///
 /// A `pr-<n>` bookmark is a fetched pull request head: its name is the number, not
 /// the branch the pull request came from, so matching on name alone never found one.
+/// The shadowed pull requests for one branch, compacted for its row.
+fn prior_pulls_for(
+    branch: &BranchName,
+    prior: &BTreeMap<BranchName, Vec<PullRequest>>,
+) -> Vec<PriorPull> {
+    prior
+        .get(branch)
+        .map(|shadowed| shadowed.iter().map(PriorPull::of).collect())
+        .unwrap_or_default()
+}
+
 fn pull_request_for(
     branch: &BranchName,
     open: &BTreeMap<BranchName, PullRequest>,
@@ -566,25 +605,28 @@ fn pull_requests_from_forge(
     forge: Option<&dyn Forge>,
     entry: &RepoEntry,
     report: &mut Report,
-) -> BTreeMap<BranchName, PullRequest> {
+) -> PullIndex {
     let Some(forge) = forge else {
-        return BTreeMap::new();
+        return PullIndex::default();
     };
-    match forge.pull_requests(&entry.path) {
+    match forge.pull_requests(
+        &entry.path,
+        &crate::forge::search_authors(&[entry.remote(Role::Origin), entry.remote(Role::Release)]),
+    ) {
         Ok(found) => {
             report.forge_consulted = true;
             // Ours means it comes from our copy of the repository, not that its branch
             // happens to share a name with one of ours.
-            ours_only(
+            index_pulls(&ours_only(
                 found,
                 &[entry.remote(Role::Origin), entry.remote(Role::Release)],
-            )
+            ))
         }
         Err(error) => {
             report
                 .problems
                 .push(format!("pull request state unavailable: {error}"));
-            BTreeMap::new()
+            PullIndex::default()
         }
     }
 }
@@ -773,6 +815,7 @@ struct DivergentInput<'a> {
     store: &'a Store,
     options: &'a Options<'a>,
     pull_requests: &'a BTreeMap<BranchName, PullRequest>,
+    prior_pulls: &'a BTreeMap<BranchName, Vec<PullRequest>>,
     notches: &'a [Notch],
 }
 
@@ -801,6 +844,7 @@ fn divergent_rows(input: &DivergentInput<'_>) -> anyhow::Result<Vec<BranchRow>> 
             fork_only: input.store.is_fork_only(&target),
             stated_pull: stated_pull_for(&target, input.store, input.entry, input.options),
             pull_request: pull_request_for(&branch, input.pull_requests),
+            prior_pulls: prior_pulls_for(&branch, input.prior_pulls),
             origin_tip: input
                 .tips
                 .get(&BookmarkRef::Remote {
@@ -979,6 +1023,7 @@ struct RowInput<'a> {
     options: &'a Options<'a>,
     branches: Vec<(BranchName, CommitId)>,
     pull_requests: &'a BTreeMap<BranchName, PullRequest>,
+    prior_pulls: &'a BTreeMap<BranchName, Vec<PullRequest>>,
     notches: &'a [Notch],
     upstream_trunk: &'a str,
 }
@@ -1038,6 +1083,7 @@ fn branch_rows(
         timings.forge += phase.elapsed();
         let last_notch = newest_for(input.notches, branch.as_str()).map(LastNotch::of);
         report.branches.push(BranchRow {
+            prior_pulls: prior_pulls_for(&branch, input.prior_pulls),
             name: branch,
             tip: Some(tip),
             origin_tip,
@@ -1097,7 +1143,8 @@ pub fn gather_timed(
             store,
             options,
             branches,
-            pull_requests: &pull_requests,
+            pull_requests: &pull_requests.by_branch,
+            prior_pulls: &pull_requests.prior,
             upstream_trunk: &upstream_trunk,
             notches: &notches,
         },
@@ -1112,7 +1159,8 @@ pub fn gather_timed(
         entry,
         store,
         options,
-        pull_requests: &pull_requests,
+        pull_requests: &pull_requests.by_branch,
+        prior_pulls: &pull_requests.prior,
         notches: &notches,
     })?);
     report
@@ -1439,6 +1487,13 @@ fn pull_request_cell(row: &BranchRow) -> String {
                 } else {
                     details.push(stated_pull_cell(stated));
                 }
+            }
+            for prior in &row.prior_pulls {
+                details.push(format!(
+                    "prior #{} {}",
+                    prior.number,
+                    prior.state.to_lowercase()
+                ));
             }
             details.join(" ")
         },
@@ -2510,6 +2565,24 @@ mod tests {
 
         // Then: both numbers remain visible because they identify different pull requests.
         assert_eq!(cell, "#106 #107 open (stated)");
+    }
+
+    #[test]
+    fn a_shadowed_pull_request_renders_as_prior_history_beside_the_primary() {
+        // Given: an open pull request whose branch also carries a closed
+        // predecessor (an org-fork submission re-homed onto a personal fork).
+        let mut row = row("feat/alpha", None, Some(pull_request(4894)));
+        row.prior_pulls = vec![PriorPull {
+            number: 4565,
+            state: "CLOSED".to_owned(),
+        }];
+
+        // When: the pull-request cell renders.
+        let cell = pull_request_cell(&row);
+
+        // Then: the closed predecessor stays visible — its review history is
+        // exactly what a reader of the open pull request is missing.
+        assert_eq!(cell, "#4894 prior #4565 closed");
     }
 
     #[test]

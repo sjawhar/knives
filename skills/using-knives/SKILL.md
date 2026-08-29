@@ -46,6 +46,7 @@ Branch rows are rendered as an aligned table with 9 columns. Empty cells render 
    - `#<n> draft` for draft pull requests.
    - `#<n> <state> (stated)` for explicitly tracked pull requests.
    - `no-pr` if no pull request is associated.
+   - `prior #<n> <state>` appended for each of the branch's other pull requests, shadowed by the primary. A head branch accumulates pull requests over its life — an org-fork submission closed and re-homed onto a personal fork keeps its review history on the closed number — so read a `prior` closed pull request before working the branch: maintainer feedback often lives only there. Primary selection is deterministic (an open pull request beats any closed one). In JSON these are `prior_pulls: [{number, state}]`, absent when empty. The forge fetch behind this merges the newest-window list with one author-scoped query per origin/release owner, so our own older pull requests stay visible however busy the upstream is.
 5. `review`: `APPROVED`, `CHANGES_REQUESTED`, `no-review`, or `-` if no PR exists.
 6. `checks`: CI check status for open pull requests:
    - `ok` if checks passed.

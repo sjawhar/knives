@@ -107,13 +107,13 @@ fn fetch_foreign(
 /// open pull request on the upstream is not our business and buries the signal:
 /// on a real repository that was 10 rows against 83.
 pub fn tracked_pull_requests(
-    pull_requests: &BTreeMap<BranchName, PullRequest>,
+    pull_requests: &[PullRequest],
     foreign: &BTreeSet<u64>,
     seen: &BTreeMap<String, String>,
 ) -> BTreeMap<u64, String> {
     let mut tracked: BTreeMap<u64, String> = BTreeMap::new();
-    for (branch, pr) in pull_requests {
-        let _ = tracked.insert(pr.number, branch.to_string());
+    for pr in pull_requests {
+        let _ = tracked.insert(pr.number, pr.head_ref_name.clone());
     }
     for key in seen.keys() {
         if let Ok(number) = key.parse::<u64>() {
@@ -131,13 +131,13 @@ pub fn tracked_pull_requests(
 }
 
 fn resolve_state(
-    pull_requests: &BTreeMap<BranchName, PullRequest>,
+    pull_requests: &[PullRequest],
     number: u64,
     forge: &dyn Forge,
     path: &Path,
 ) -> Result<String, crate::forge::ForgeError> {
     if let Some(pull_request) = pull_requests
-        .values()
+        .iter()
         .find(|pull_request| pull_request.number == number)
     {
         return Ok(pull_request.state.clone());
@@ -151,14 +151,17 @@ fn sync_pull_requests(
     forge: Option<&dyn Forge>,
     entry: &RepoEntry,
     report: &mut Report,
-) -> Result<BTreeMap<BranchName, PullRequest>, ()> {
+) -> Result<Vec<PullRequest>, ()> {
     let Some(forge) = forge else {
         report
             .notes
             .push("pull request state was not checked; branch columns are unknown".to_owned());
-        return Ok(BTreeMap::new());
+        return Ok(Vec::new());
     };
-    match forge.pull_requests(&entry.path) {
+    match forge.pull_requests(
+        &entry.path,
+        &crate::forge::search_authors(&[entry.remote(Role::Origin), entry.remote(Role::Release)]),
+    ) {
         Ok(found) => Ok(ours_only(
             found,
             &[entry.remote(Role::Origin), entry.remote(Role::Release)],
@@ -175,12 +178,12 @@ fn sync_pull_requests(
 /// The current head from fetched pull refs, or the forge list when no ref exists.
 fn current_pull_head<'a>(
     heads: &'a BTreeMap<u64, String>,
-    pull_requests: &'a BTreeMap<BranchName, PullRequest>,
+    pull_requests: &'a [PullRequest],
     number: u64,
 ) -> Option<&'a str> {
     heads.get(&number).map(String::as_str).or_else(|| {
         pull_requests
-            .values()
+            .iter()
             .find(|pull_request| pull_request.number == number)
             .map(|pull_request| pull_request.head_ref_oid.as_str())
     })
@@ -215,7 +218,7 @@ struct PullTransition<'a> {
 fn record_transition_event(
     scribe: &Scribe,
     store: &mut Store,
-    pull_requests: &BTreeMap<BranchName, PullRequest>,
+    pull_requests: &[PullRequest],
     transition: PullTransition<'_>,
 ) -> Result<(), crate::ledger::LedgerError> {
     let state = transition.state.as_str();
@@ -228,8 +231,8 @@ fn record_transition_event(
     {
         let subject = pull_requests
             .iter()
-            .find(|(_, pull_request)| pull_request.number == transition.number)
-            .map(|(branch, _)| branch.to_string());
+            .find(|pull_request| pull_request.number == transition.number)
+            .map(|pull_request| pull_request.head_ref_name.clone());
         let pr = subject
             .as_deref()
             .map(|branch| BranchTarget::new(scribe.repo().to_owned(), BranchName::new(branch)));
@@ -496,9 +499,9 @@ mod tracking_tests {
     fn resolve_state_returns_listed_state_without_fake_fallback() {
         use crate::forge::FakeForge;
 
-        let (branch, mut pull_request) = pr(99, "feat/merged");
+        let (_branch, mut pull_request) = pr(99, "feat/merged");
         pull_request.state = "MERGED".to_owned();
-        let pull_requests = BTreeMap::from([(branch, pull_request)]);
+        let pull_requests = vec![pull_request];
         let forge = FakeForge {
             // The fallback deliberately contradicts listed MERGED: ignoring it returns OPEN.
             vanished_states: BTreeMap::from([(99, "OPEN".to_owned())]),
@@ -521,7 +524,7 @@ mod tracking_tests {
         };
 
         assert_eq!(
-            resolve_state(&BTreeMap::new(), 100, &forge, std::path::Path::new("/repo")).unwrap(),
+            resolve_state(&[], 100, &forge, std::path::Path::new("/repo")).unwrap(),
             "CLOSED"
         );
     }
@@ -533,9 +536,10 @@ mod tracking_tests {
         // any branch we had pushed but did not have checked out in this clone: the
         // The forge reported 13 open pull requests for a real repository and knives reported
         // 12, and the missing one was the single most actionable of them.
-        let pull_requests: BTreeMap<_, _> = [pr(1, "feat/checked-out"), pr(2, "feat/pushed-only")]
-            .into_iter()
-            .collect();
+        let pull_requests: Vec<PullRequest> =
+            [pr(1, "feat/checked-out"), pr(2, "feat/pushed-only")]
+                .map(|(_, pull_request)| pull_request)
+                .into();
         let foreign: BTreeSet<u64> = BTreeSet::new();
 
         let tracked = tracked_pull_requests(&pull_requests, &foreign, &BTreeMap::new());
@@ -551,14 +555,14 @@ mod tracking_tests {
         // what the next step needs to do.
         let seen: BTreeMap<String, String> =
             std::iter::once(("99".to_owned(), "aaaa".to_owned())).collect();
-        let tracked = tracked_pull_requests(&BTreeMap::new(), &BTreeSet::new(), &seen);
+        let tracked = tracked_pull_requests(&[], &BTreeSet::new(), &seen);
         assert!(tracked.contains_key(&99));
     }
 
     #[test]
     fn a_foreign_parent_is_tracked_without_a_listed_pull_request() {
         let foreign: BTreeSet<u64> = std::iter::once(4677).collect();
-        let tracked = tracked_pull_requests(&BTreeMap::new(), &foreign, &BTreeMap::new());
+        let tracked = tracked_pull_requests(&[], &foreign, &BTreeMap::new());
         assert!(tracked[&4677].contains("foreign"));
     }
 }
@@ -588,7 +592,7 @@ mod comment_activity_tests {
 
     #[derive(Debug)]
     struct ErroringForge {
-        pull_requests: BTreeMap<BranchName, PullRequest>,
+        pull_requests: Vec<PullRequest>,
         newest_comments: BTreeMap<u64, String>,
         error_on_comment: Option<u64>, // PR number that errors, None = no error
         comment_calls: Mutex<Vec<u64>>,
@@ -598,7 +602,8 @@ mod comment_activity_tests {
         fn pull_requests(
             &self,
             _repo: &Path,
-        ) -> Result<BTreeMap<BranchName, PullRequest>, ForgeError> {
+            _authors: &[String],
+        ) -> Result<Vec<PullRequest>, ForgeError> {
             Ok(self.pull_requests.clone())
         }
 
@@ -640,7 +645,8 @@ mod comment_activity_tests {
         fn pull_requests(
             &self,
             _repo: &Path,
-        ) -> Result<BTreeMap<BranchName, PullRequest>, ForgeError> {
+            _authors: &[String],
+        ) -> Result<Vec<PullRequest>, ForgeError> {
             Err(ForgeError::Command {
                 command: "gh pr list".to_owned(),
                 dir: "/repo".to_owned(),
@@ -762,7 +768,7 @@ mod comment_activity_tests {
         entry.upstream = temp.path().join("missing-upstream").display().to_string();
         let mut store = Store::open_for_update(temp.path().join("state.json")).unwrap();
         let forge = ErroringForge {
-            pull_requests: BTreeMap::new(),
+            pull_requests: Vec::new(),
             newest_comments: BTreeMap::new(),
             error_on_comment: None,
             comment_calls: Mutex::new(Vec::new()),
@@ -822,9 +828,9 @@ mod comment_activity_tests {
         let scribe = test_scribe(&temp, &repo_name);
 
         // First sync: PR #42 with comment activity
-        let (branch, pull_request) = pr(42, "feat/alpha");
+        let (_branch, pull_request) = pr(42, "feat/alpha");
         let forge_first = ErroringForge {
-            pull_requests: BTreeMap::from([(branch, pull_request)]),
+            pull_requests: vec![pull_request],
             newest_comments: BTreeMap::from([(42, "2026-07-30T10:00:00Z".to_owned())]),
             error_on_comment: None,
             comment_calls: Mutex::new(Vec::new()),
@@ -851,9 +857,9 @@ mod comment_activity_tests {
         );
 
         // Second sync: same comment timestamp, no new activity
-        let (branch, pull_request) = pr(42, "feat/alpha");
+        let (_branch, pull_request) = pr(42, "feat/alpha");
         let forge_second = ErroringForge {
-            pull_requests: BTreeMap::from([(branch, pull_request)]),
+            pull_requests: vec![pull_request],
             newest_comments: BTreeMap::from([(42, "2026-07-29T10:00:00Z".to_owned())]),
             error_on_comment: None,
             comment_calls: Mutex::new(Vec::new()),
@@ -882,9 +888,9 @@ mod comment_activity_tests {
         let entry = local_entry(&temp);
 
         // Forge that fails on newest_comment for PR #42
-        let (branch, pull_request) = pr(42, "feat/alpha");
+        let (_branch, pull_request) = pr(42, "feat/alpha");
         let forge = ErroringForge {
-            pull_requests: BTreeMap::from([(branch, pull_request)]),
+            pull_requests: vec![pull_request],
             newest_comments: BTreeMap::new(),
             error_on_comment: Some(42),
             comment_calls: Mutex::new(Vec::new()),
@@ -923,9 +929,9 @@ mod comment_activity_tests {
         let store_path = temp.path().join("state.json");
         let repo_name = RepoName::new("test-repo");
         let entry = local_entry(&temp);
-        let (branch, pull_request) = pr(42, "feat/alpha");
+        let (_branch, pull_request) = pr(42, "feat/alpha");
         let forge = ErroringForge {
-            pull_requests: BTreeMap::from([(branch, pull_request)]),
+            pull_requests: vec![pull_request],
             newest_comments: BTreeMap::from([(42, "2026-07-30T10:00:00Z".to_owned())]),
             error_on_comment: None,
             comment_calls: Mutex::new(Vec::new()),
@@ -962,10 +968,10 @@ mod comment_activity_tests {
         let store_path = temp.path().join("state.json");
         let repo_name = RepoName::new("test-repo");
         let entry = local_entry(&temp);
-        let (branch, mut pull_request) = pr(42, "feat/alpha");
+        let (_branch, mut pull_request) = pr(42, "feat/alpha");
         pull_request.state = "CLOSED".to_owned();
         let forge = ErroringForge {
-            pull_requests: BTreeMap::from([(branch, pull_request)]),
+            pull_requests: vec![pull_request],
             newest_comments: BTreeMap::from([(42, "2026-07-30T10:00:00Z".to_owned())]),
             error_on_comment: None,
             comment_calls: Mutex::new(Vec::new()),

@@ -29,8 +29,9 @@ impl Forge for StateUnavailableForge {
     fn pull_requests(
         &self,
         _repo: &std::path::Path,
-    ) -> Result<BTreeMap<BranchName, PullRequest>, ForgeError> {
-        Ok(BTreeMap::new())
+        _authors: &[String],
+    ) -> Result<Vec<PullRequest>, ForgeError> {
+        Ok(Vec::new())
     }
 
     fn pull_details(
@@ -73,8 +74,9 @@ impl Forge for DetailsUnavailableForge {
     fn pull_requests(
         &self,
         _repo: &std::path::Path,
-    ) -> Result<BTreeMap<BranchName, PullRequest>, ForgeError> {
-        Ok(self.pull_requests.clone())
+        _authors: &[String],
+    ) -> Result<Vec<PullRequest>, ForgeError> {
+        Ok(self.pull_requests.values().cloned().collect())
     }
 
     fn pull_details(
@@ -278,8 +280,9 @@ impl Forge for CountingForge {
     fn pull_requests(
         &self,
         _repo: &std::path::Path,
-    ) -> Result<BTreeMap<BranchName, PullRequest>, ForgeError> {
-        Ok(self.pull_requests.clone())
+        _authors: &[String],
+    ) -> Result<Vec<PullRequest>, ForgeError> {
+        Ok(self.pull_requests.values().cloned().collect())
     }
 
     fn pull_details(
