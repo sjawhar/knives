@@ -19,7 +19,7 @@ pub enum RebaseOutcome {
     CleanNonEmpty,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum LandedVerdict {
     /// Replaying the branch onto the trunk produced nothing, so the trunk already has

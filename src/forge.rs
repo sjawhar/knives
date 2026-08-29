@@ -516,6 +516,28 @@ pub trait Forge: Send + Sync {
     fn pull_request_state(&self, repo: &Path, number: u64) -> Result<Option<String>, ForgeError>;
 
     fn newest_comment(&self, repo: &Path, number: u64) -> Result<Option<String>, ForgeError>;
+
+    /// The forge's own name and GraphQL id for this checkout, once per run.
+    fn repo_identity(&self, repo: &Path) -> Result<RepoIdentity, ForgeError>;
+
+    /// Cold path: the cheap-field wide lists (base window ∥ author-scoped), deduped.
+    fn list_pull_requests(
+        &self,
+        repo: &Path,
+        authors: &[String],
+    ) -> Result<Vec<PullSummary>, ForgeError>;
+
+    /// Warm path page 1: newest-updated (number, updatedAt, state) plus continuation.
+    fn sweep(&self, repo: &Path, target: &RepoIdentity) -> Result<SweepPage, ForgeError>;
+
+    /// The live batch: full fact rows by number. Numbers the forge answers
+    /// NOT_FOUND for are absent from the map; any other failure is an error.
+    fn pull_facts(
+        &self,
+        repo: &Path,
+        target: &RepoIdentity,
+        numbers: &[u64],
+    ) -> Result<BTreeMap<u64, PullFacts>, ForgeError>;
 }
 
 /// Backed by the hosting service's command line tool.
@@ -524,7 +546,11 @@ pub struct CliForge;
 
 impl CliForge {
     fn run(repo: &Path, args: &[&str]) -> Result<String, ForgeError> {
+        let started = std::time::Instant::now();
         let output = Command::new("gh").args(args).current_dir(repo).output()?;
+        if crate::timing::enabled() {
+            eprintln!("{}", crate::timing::call_line(started.elapsed(), repo, args));
+        }
         if output.status.success() {
             return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
         }
@@ -544,7 +570,115 @@ impl CliForge {
     }
 }
 
+fn joined_forge_call<T>(
+    result: std::thread::Result<Result<T, ForgeError>>,
+) -> Result<T, ForgeError> {
+    result.map_err(|_| ForgeError::Query {
+        detail: "a forge worker panicked".to_owned(),
+    })?
+}
+
 impl Forge for CliForge {
+    fn repo_identity(&self, repo: &Path) -> Result<RepoIdentity, ForgeError> {
+        let payload = Self::run(repo, &["repo", "view", "--json", "nameWithOwner,id"])?;
+        parse_identity(&payload)
+    }
+
+    fn list_pull_requests(
+        &self,
+        repo: &Path,
+        authors: &[String],
+    ) -> Result<Vec<PullSummary>, ForgeError> {
+        std::thread::scope(|scope| {
+            let base = scope.spawn(|| {
+                let payload = Self::run(repo, &SUMMARY_LIST_ARGS)?;
+                parse_summaries(&payload)
+            });
+            let author_lists = authors
+                .iter()
+                .map(|author| {
+                    scope.spawn(move || {
+                        let search = format!("author:{author}");
+                        let args = [
+                            "pr",
+                            "list",
+                            "--state",
+                            PR_STATE,
+                            "--limit",
+                            "300",
+                            "--search",
+                            &search,
+                            "--json",
+                            PR_SUMMARY_FIELDS,
+                        ];
+                        let payload = Self::run(repo, &args)?;
+                        parse_summaries(&payload)
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            let mut pull_requests = joined_forge_call(base.join())?;
+            for author_list in author_lists {
+                pull_requests.extend(joined_forge_call(author_list.join())?);
+            }
+            dedupe_summaries(&mut pull_requests);
+            Ok(pull_requests)
+        })
+    }
+
+    fn sweep(&self, repo: &Path, target: &RepoIdentity) -> Result<SweepPage, ForgeError> {
+        let (owner, name) = target.split()?;
+        let owner = format!("owner={owner}");
+        let name = format!("name={name}");
+        let query = format!("query={}", sweep_query());
+        let payload = Self::run(
+            repo,
+            &[
+                "api", "graphql", "-f", &owner, "-f", &name, "-f", &query,
+            ],
+        )?;
+        parse_sweep(&payload)
+    }
+
+    fn pull_facts(
+        &self,
+        repo: &Path,
+        target: &RepoIdentity,
+        numbers: &[u64],
+    ) -> Result<BTreeMap<u64, PullFacts>, ForgeError> {
+        if numbers.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let (owner, name) = target.split()?;
+        let owner = format!("owner={owner}");
+        let name = format!("name={name}");
+
+        std::thread::scope(|scope| {
+            let chunks = numbers
+                .chunks(40)
+                .map(|chunk| {
+                    let owner = &owner;
+                    let name = &name;
+                    scope.spawn(move || {
+                        let query = format!("query={}", pull_facts_query(chunk));
+                        let payload = Self::run(
+                            repo,
+                            &[
+                                "api", "graphql", "-f", owner, "-f", name, "-f", &query,
+                            ],
+                        )?;
+                        parse_pull_facts(&payload, chunk)
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            let mut facts = BTreeMap::new();
+            for chunk in chunks {
+                facts.extend(joined_forge_call(chunk.join())?);
+            }
+            Ok(facts)
+        })
+    }
     fn pull_requests(
         &self,
         repo: &Path,
@@ -723,6 +857,12 @@ pub fn parse_pull_requests(payload: &str) -> Result<Vec<PullRequest>, ForgeError
 /// The windowed list and the author-scoped searches overlap on recent pull
 /// requests; a duplicate would double a branch's history.
 pub fn dedupe_by_number(pull_requests: &mut Vec<PullRequest>) {
+    let mut seen = std::collections::BTreeSet::new();
+    pull_requests.retain(|pull_request| seen.insert(pull_request.number));
+}
+
+/// Drop later duplicate summary rows, keeping the forge's freshest-first order.
+pub fn dedupe_summaries(pull_requests: &mut Vec<PullSummary>) {
     let mut seen = std::collections::BTreeSet::new();
     pull_requests.retain(|pull_request| seen.insert(pull_request.number));
 }
@@ -1211,12 +1351,128 @@ pub struct FakeForge {
     pub pull_requests: BTreeMap<BranchName, PullRequest>,
     pub stale_reviews: Vec<u64>,
     pub checks: BTreeMap<u64, ChecksSummary>,
-    /// States for numbers no longer in the pull request list.
+    /// States for numbers outside the listed universe (deleted-from-window
+    /// history a batch can still answer about).
     pub vanished_states: BTreeMap<u64, String>,
     pub newest_comments: BTreeMap<u64, String>,
+    pub fail_identity: bool,
+    pub fail_list: bool,
+    pub fail_sweep: bool,
+    pub fail_facts: bool,
+    /// Sweep reports a continuation past page 1 (overflow → cold reseed).
+    pub sweep_overflows: bool,
+}
+
+fn fake_failure(operation: &str) -> ForgeError {
+    ForgeError::Command {
+        command: "fake".to_owned(),
+        dir: "/fake".to_owned(),
+        code: 1,
+        stderr: format!("fake {operation} failed"),
+    }
+}
+
+fn vanished_pull(number: u64, state: String) -> PullRequest {
+    PullRequest {
+        number,
+        state,
+        review_decision: String::new(),
+        head_ref_name: String::new(),
+        head_ref_oid: String::new(),
+        updated_at: String::new(),
+        is_draft: false,
+        url: String::new(),
+        head_repository_owner: None,
+        mergeable: String::new(),
+        merge_state_status: String::new(),
+        base_ref_name: String::new(),
+        merge_commit: None,
+    }
 }
 
 impl Forge for FakeForge {
+    fn repo_identity(&self, _repo: &Path) -> Result<RepoIdentity, ForgeError> {
+        if self.fail_identity {
+            return Err(fake_failure("identity"));
+        }
+        Ok(RepoIdentity {
+            name_with_owner: "fake-owner/fake-repo".to_owned(),
+            id: "FAKEID".to_owned(),
+        })
+    }
+
+    fn list_pull_requests(
+        &self,
+        _repo: &Path,
+        _authors: &[String],
+    ) -> Result<Vec<PullSummary>, ForgeError> {
+        if self.fail_list {
+            return Err(fake_failure("list"));
+        }
+        Ok(self.pull_requests.values().map(PullSummary::of).collect())
+    }
+
+    fn sweep(&self, _repo: &Path, _target: &RepoIdentity) -> Result<SweepPage, ForgeError> {
+        if self.fail_sweep {
+            return Err(fake_failure("sweep"));
+        }
+        let mut entries = self
+            .pull_requests
+            .values()
+            .map(|pull| SweepEntry {
+                number: pull.number,
+                updated_at: pull.updated_at.clone(),
+                state: pull.state.clone(),
+            })
+            .collect::<Vec<_>>();
+        entries.sort_unstable_by(|left, right| {
+            right
+                .updated_at
+                .cmp(&left.updated_at)
+                .then_with(|| left.number.cmp(&right.number))
+        });
+        Ok(SweepPage {
+            entries,
+            has_next_page: self.sweep_overflows,
+        })
+    }
+
+    fn pull_facts(
+        &self,
+        _repo: &Path,
+        _target: &RepoIdentity,
+        numbers: &[u64],
+    ) -> Result<BTreeMap<u64, PullFacts>, ForgeError> {
+        if self.fail_facts {
+            return Err(fake_failure("facts"));
+        }
+        Ok(numbers
+            .iter()
+            .filter_map(|number| {
+                let facts = if let Some(pull) = self
+                    .pull_requests
+                    .values()
+                    .find(|pull| pull.number == *number)
+                {
+                    Some(PullFacts {
+                        pull: pull.clone(),
+                        details: PullDetails {
+                            review_predates_head: Some(self.stale_reviews.contains(number)),
+                            checks: self.checks.get(number).cloned(),
+                        },
+                        newest_comment: self.newest_comments.get(number).cloned(),
+                    })
+                } else {
+                    self.vanished_states.get(number).map(|state| PullFacts {
+                        pull: vanished_pull(*number, state.clone()),
+                        details: PullDetails::default(),
+                        newest_comment: self.newest_comments.get(number).cloned(),
+                    })
+                };
+                facts.map(|facts| (*number, facts))
+            })
+            .collect())
+    }
     fn pull_requests(
         &self,
         _repo: &Path,
@@ -1751,6 +2007,81 @@ mod tests {
         };
         let details = fake.pull_details(Path::new("/tmp"), &[7]).expect("details");
         assert_eq!(details[&7].review_predates_head, Some(true));
+    }
+
+    #[test]
+    fn the_fake_sweep_is_newest_first_and_reports_overflow() {
+        let pull_requests = BTreeMap::from([
+            (
+                BranchName::new("feat/older"),
+                PullRequest {
+                    number: 7,
+                    updated_at: "2026-08-01T00:00:00Z".to_owned(),
+                    ..PullRequest::default()
+                },
+            ),
+            (
+                BranchName::new("feat/newer"),
+                PullRequest {
+                    number: 9,
+                    updated_at: "2026-08-02T00:00:00Z".to_owned(),
+                    ..PullRequest::default()
+                },
+            ),
+        ]);
+        let fake = FakeForge {
+            pull_requests,
+            sweep_overflows: true,
+            ..FakeForge::default()
+        };
+        let target = RepoIdentity {
+            name_with_owner: "fake-owner/fake-repo".to_owned(),
+            id: "FAKEID".to_owned(),
+        };
+
+        let sweep = fake.sweep(Path::new("/tmp"), &target).expect("sweep");
+
+        assert!(sweep.has_next_page);
+        assert_eq!(
+            sweep
+                .entries
+                .iter()
+                .map(|entry| entry.number)
+                .collect::<Vec<_>>(),
+            vec![9, 7]
+        );
+    }
+
+    #[test]
+    fn fake_facts_answer_the_universe_the_vanished_and_nothing_else() {
+        let pull = PullRequest {
+            number: 7,
+            state: "OPEN".to_owned(),
+            head_ref_name: "feat/known".to_owned(),
+            ..PullRequest::default()
+        };
+        let fake = FakeForge {
+            pull_requests: BTreeMap::from([(BranchName::new("feat/known"), pull)]),
+            vanished_states: BTreeMap::from([(8, "CLOSED".to_owned())]),
+            newest_comments: BTreeMap::from([(7, "2026-08-03T00:00:00Z".to_owned())]),
+            ..FakeForge::default()
+        };
+        let target = RepoIdentity {
+            name_with_owner: "fake-owner/fake-repo".to_owned(),
+            id: "FAKEID".to_owned(),
+        };
+
+        let facts = fake
+            .pull_facts(Path::new("/tmp"), &target, &[7, 8, 9])
+            .expect("facts");
+
+        assert_eq!(facts[&7].pull.head_ref_name, "feat/known");
+        assert_eq!(
+            facts[&7].newest_comment.as_deref(),
+            Some("2026-08-03T00:00:00Z")
+        );
+        assert_eq!(facts[&8].pull.state, "CLOSED");
+        assert!(!facts.contains_key(&9));
     }
     #[test]
     fn a_summary_row_has_no_merge_state_to_read() {

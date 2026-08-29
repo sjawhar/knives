@@ -570,7 +570,9 @@ mod tracking_tests {
 #[cfg(test)]
 mod comment_activity_tests {
     use super::*;
-    use crate::forge::{Forge, ForgeError};
+    use crate::forge::{
+        Forge, ForgeError, PullFacts, PullSummary, RepoIdentity, SweepEntry, SweepPage,
+    };
     use crate::ids::RepoName;
     use crate::store::Store;
     use std::path::Path;
@@ -599,6 +601,76 @@ mod comment_activity_tests {
     }
 
     impl Forge for ErroringForge {
+        fn repo_identity(&self, _repo: &Path) -> Result<RepoIdentity, ForgeError> {
+            Ok(RepoIdentity {
+                name_with_owner: "fake-owner/fake-repo".to_owned(),
+                id: "FAKEID".to_owned(),
+            })
+        }
+
+        fn list_pull_requests(
+            &self,
+            _repo: &Path,
+            _authors: &[String],
+        ) -> Result<Vec<PullSummary>, ForgeError> {
+            Ok(self.pull_requests.iter().map(PullSummary::of).collect())
+        }
+
+        fn sweep(&self, _repo: &Path, _target: &RepoIdentity) -> Result<SweepPage, ForgeError> {
+            let mut entries = self
+                .pull_requests
+                .iter()
+                .map(|pull| SweepEntry {
+                    number: pull.number,
+                    updated_at: pull.updated_at.clone(),
+                    state: pull.state.clone(),
+                })
+                .collect::<Vec<_>>();
+            entries.sort_unstable_by(|left, right| {
+                right
+                    .updated_at
+                    .cmp(&left.updated_at)
+                    .then_with(|| left.number.cmp(&right.number))
+            });
+            Ok(SweepPage {
+                entries,
+                has_next_page: false,
+            })
+        }
+
+        fn pull_facts(
+            &self,
+            _repo: &Path,
+            _target: &RepoIdentity,
+            numbers: &[u64],
+        ) -> Result<BTreeMap<u64, PullFacts>, ForgeError> {
+            if self
+                .error_on_comment
+                .is_some_and(|number| numbers.contains(&number))
+            {
+                return Err(ForgeError::Query {
+                    detail: "comment fetch failed".to_owned(),
+                });
+            }
+            Ok(numbers
+                .iter()
+                .filter_map(|number| {
+                    self.pull_requests
+                        .iter()
+                        .find(|pull| pull.number == *number)
+                        .map(|pull| {
+                            (
+                                *number,
+                                PullFacts {
+                                    pull: pull.clone(),
+                                    details: crate::forge::PullDetails::default(),
+                                    newest_comment: self.newest_comments.get(number).cloned(),
+                                },
+                            )
+                        })
+                })
+                .collect())
+        }
         fn pull_requests(
             &self,
             _repo: &Path,
@@ -642,6 +714,43 @@ mod comment_activity_tests {
     struct PullListUnavailable;
 
     impl Forge for PullListUnavailable {
+        fn repo_identity(&self, _repo: &Path) -> Result<RepoIdentity, ForgeError> {
+            Ok(RepoIdentity {
+                name_with_owner: "fake-owner/fake-repo".to_owned(),
+                id: "FAKEID".to_owned(),
+            })
+        }
+
+        fn list_pull_requests(
+            &self,
+            _repo: &Path,
+            _authors: &[String],
+        ) -> Result<Vec<PullSummary>, ForgeError> {
+            Err(ForgeError::Command {
+                command: "gh pr list".to_owned(),
+                dir: "/repo".to_owned(),
+                code: 1,
+                stderr: "unavailable".to_owned(),
+            })
+        }
+
+        fn sweep(&self, _repo: &Path, _target: &RepoIdentity) -> Result<SweepPage, ForgeError> {
+            Err(ForgeError::Command {
+                command: "gh pr list".to_owned(),
+                dir: "/repo".to_owned(),
+                code: 1,
+                stderr: "unavailable".to_owned(),
+            })
+        }
+
+        fn pull_facts(
+            &self,
+            _repo: &Path,
+            _target: &RepoIdentity,
+            _numbers: &[u64],
+        ) -> Result<BTreeMap<u64, PullFacts>, ForgeError> {
+            Ok(BTreeMap::new())
+        }
         fn pull_requests(
             &self,
             _repo: &Path,
