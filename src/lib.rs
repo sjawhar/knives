@@ -18,6 +18,7 @@
 //!   which repos are managed, and who is working on what and why.
 //! - [`hook`] owns harness-facing session state and behavior.
 
+pub mod carriage;
 pub mod cli;
 pub mod commands;
 pub mod config;
