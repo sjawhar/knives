@@ -867,10 +867,10 @@ fn forge_phase<'snapshot>(
             };
         }
     };
-    let index = index_pulls(&discovery.ours());
+    let discovery_index = index_pulls(&discovery.ours());
     let mut surfaced: Vec<u64> = branches
         .iter()
-        .filter_map(|branch| pull_summary_for(branch, &index.by_branch))
+        .filter_map(|branch| pull_summary_for(branch, &discovery_index.by_branch))
         .map(|pull| pull.number)
         .collect();
     surfaced.extend_from_slice(extra_numbers);
@@ -878,6 +878,7 @@ fn forge_phase<'snapshot>(
     surfaced.dedup();
     match discovery.complete(&surfaced) {
         Ok(snapshot) => {
+            let index = index_pulls(&snapshot.ours());
             let problems = branches
                 .iter()
                 .filter_map(|branch| {
@@ -1165,11 +1166,7 @@ struct OriginPhase {
 /// Loaded repository handles are not assumed `Sync`. Each worker opens its own
 /// handle, handles its chunk in order, and the join order restores branch order
 /// before a result reaches the report.
-fn origin_phase(
-    path: &std::path::Path,
-    inputs: &[ProbeInput],
-    workers: usize,
-) -> OriginPhase {
+fn origin_phase(path: &std::path::Path, inputs: &[ProbeInput], workers: usize) -> OriginPhase {
     if inputs.is_empty() {
         return OriginPhase {
             relations: Vec::new(),
@@ -1202,12 +1199,13 @@ fn origin_phase(
         }
         handles
             .into_iter()
-            .flat_map(|(slice, handle)| match handle.join() {
-                Ok(relations) => relations,
-                Err(_) => slice
-                    .iter()
-                    .map(|_| Err("origin relation task panicked".to_owned()))
-                    .collect(),
+            .flat_map(|(slice, handle)| {
+                handle.join().unwrap_or_else(|_| {
+                    slice
+                        .iter()
+                        .map(|_| Err("origin relation task panicked".to_owned()))
+                        .collect()
+                })
             })
             .collect()
     });
@@ -1315,6 +1313,11 @@ fn carried_findings(
     Ok(findings)
 }
 
+/// Changed-file result for one branch, if it has a single tip to compare.
+type BranchFiles = Result<Vec<String>, String>;
+/// The branch name and its optional changed-file result.
+type BranchOverlapOutcome = (String, Option<BranchFiles>);
+
 /// Compare branch paths concurrently, preserving the report's branch order.
 ///
 /// `changed_files_between` invokes jj's porcelain because it normalizes paths.
@@ -1330,7 +1333,7 @@ fn add_branch_overlap_findings(
     let rows = &report.branches;
     let upstream_trunk = entry.upstream_trunk();
     let path = &entry.path;
-    let outcomes: Vec<(String, Option<Result<Vec<String>, String>>)> = if rows.is_empty() {
+    let outcomes: Vec<BranchOverlapOutcome> = if rows.is_empty() {
         Vec::new()
     } else {
         let workers = workers.clamp(1, rows.len());
@@ -1348,12 +1351,8 @@ fn add_branch_overlap_findings(
                                 let files = row.tip.as_ref().map(|_| {
                                     let from =
                                         format!("fork_point({upstream_trunk} | {})", row.name);
-                                    crate::jj::changed_files_between(
-                                        path,
-                                        &from,
-                                        row.name.as_str(),
-                                    )
-                                    .map_err(|error| error.to_string())
+                                    crate::jj::changed_files_between(path, &from, row.name.as_str())
+                                        .map_err(|error| error.to_string())
                                 });
                                 (row.name.to_string(), files)
                             })
@@ -1363,17 +1362,18 @@ fn add_branch_overlap_findings(
             }
             handles
                 .into_iter()
-                .flat_map(|(slice, handle)| match handle.join() {
-                    Ok(outcomes) => outcomes,
-                    Err(_) => slice
-                        .iter()
-                        .map(|row| {
-                            (
-                                row.name.to_string(),
-                                Some(Err("path comparison task panicked".to_owned())),
-                            )
-                        })
-                        .collect(),
+                .flat_map(|(slice, handle)| {
+                    handle.join().unwrap_or_else(|_| {
+                        slice
+                            .iter()
+                            .map(|row| {
+                                (
+                                    row.name.to_string(),
+                                    Some(Err("path comparison task panicked".to_owned())),
+                                )
+                            })
+                            .collect()
+                    })
                 })
                 .collect()
         })
@@ -1389,7 +1389,9 @@ fn add_branch_overlap_findings(
             Some(Err(error)) => {
                 unanswered.push(format!("cannot compare paths for {branch}: {error}"));
             }
-            None => notes.push(format!("cannot compare paths for {branch}: it has no single tip")),
+            None => notes.push(format!(
+                "cannot compare paths for {branch}: it has no single tip"
+            )),
         }
     }
     report.notes.extend(notes);
@@ -1564,7 +1566,11 @@ fn fold_phase_outcome(
     timings.probes = phases.probe.duration;
 
     let phase = std::time::Instant::now();
-    let origin_phase = origin_phase(&input.entry.path, &input.probe_inputs, input.options.workers);
+    let origin_phase = origin_phase(
+        &input.entry.path,
+        &input.probe_inputs,
+        input.options.workers,
+    );
     let unjudged = branch_rows(
         RowInput {
             name: input.name,
@@ -1604,8 +1610,7 @@ fn fold_phase_outcome(
     )?);
     timings.carried_findings = phase.elapsed();
 
-    timings.touching =
-        add_branch_overlap_findings(report, input.entry, input.options.workers);
+    timings.touching = add_branch_overlap_findings(report, input.entry, input.options.workers);
 
     let phase = std::time::Instant::now();
     add_claims(report, input.repo, input.name, input.store);
@@ -1631,9 +1636,7 @@ fn fold_phase_outcome(
             .probe_ran
             .then(|| std::mem::take(&mut phases.probe.landed));
         if let Err(error) = snapshot.persist(landed) {
-            report
-                .problems
-                .push(format!("forge cache not saved: {error}"));
+            report.notes.push(format!("forge cache not saved: {error}"));
         }
     }
     timings.report = phase.elapsed();
@@ -2317,7 +2320,10 @@ mod tests {
         reason = "indexing a result in a test is the assertion; a panic is the failure"
     )]
     use super::*;
+    use crate::forge::FakeForge;
     use crate::ids::{BranchName, RemoteName};
+    use std::collections::BTreeMap;
+    use std::path::Path;
 
     fn local(name: &str) -> BookmarkRef {
         BookmarkRef::Local(BranchName::new(name))
@@ -2354,6 +2360,103 @@ mod tests {
             ..PullRequest::default()
         }
     }
+    #[test]
+    fn status_uses_a_newly_open_primary_from_the_completed_snapshot() {
+        // A warm cache can still attach a branch to a closed primary when a new
+        // open pull request for that branch appeared after the cache watermark.
+        let cache = tempfile::tempdir().expect("cache directory");
+        let branch = BranchName::new("feat/alpha");
+        let closed = PullRequest {
+            number: 7,
+            state: "CLOSED".to_owned(),
+            head_ref_name: branch.to_string(),
+            updated_at: "2026-08-01T00:00:00Z".to_owned(),
+            ..PullRequest::default()
+        };
+        let seeded = FakeForge {
+            pull_requests: BTreeMap::from([(branch.clone(), closed)]),
+            ..FakeForge::default()
+        };
+        let seeded_opened = crate::snapshot::open(crate::snapshot::SnapshotConfig {
+            forge: &seeded,
+            path: Path::new("/fake"),
+            remotes: ["origin", "release"],
+            cache_root: Some(cache.path()),
+        })
+        .expect("open seed cache");
+        seeded_opened
+            .discover()
+            .expect("discover closed pull request")
+            .complete(&[7])
+            .expect("fetch closed pull request")
+            .persist(None)
+            .expect("persist closed pull request");
+
+        let opened = FakeForge {
+            pull_requests: BTreeMap::from([(
+                branch.clone(),
+                PullRequest {
+                    number: 8,
+                    state: "OPEN".to_owned(),
+                    head_ref_name: branch.to_string(),
+                    updated_at: "2026-08-02T00:00:00Z".to_owned(),
+                    ..PullRequest::default()
+                },
+            )]),
+            ..FakeForge::default()
+        };
+        let live_opened = crate::snapshot::open(crate::snapshot::SnapshotConfig {
+            forge: &opened,
+            path: Path::new("/fake"),
+            remotes: ["origin", "release"],
+            cache_root: Some(cache.path()),
+        })
+        .expect("open warm cache");
+
+        let phase = forge_phase(
+            Some(&live_opened),
+            std::slice::from_ref(&branch),
+            &[],
+            std::time::Instant::now(),
+        );
+
+        assert!(phase.snapshot.is_some(), "the live batch completed");
+        assert_eq!(
+            phase.index.by_branch[&branch].number, 8,
+            "the current open pull request is primary"
+        );
+        let store = Store::open(cache.path().join("state.json")).expect("open state");
+        let repo = RepoName::new("test-repo");
+        let mut report = Report::default();
+        branch_rows(
+            RowInput {
+                name: &repo,
+                store: &store,
+                probe_inputs: vec![(
+                    branch,
+                    CommitId::new("test-commit"),
+                    Some(CommitId::new("origin-commit")),
+                )],
+                index: &phase.index,
+                snapshot: phase.snapshot.as_ref(),
+                notches: &[],
+            },
+            vec![Ok::<Option<LandedVerdict>, JjError>(None)],
+            vec![Ok::<Option<OriginRelation>, String>(None)],
+            &mut report,
+        )
+        .expect("assemble status report");
+
+        assert_eq!(
+            report.branches[0]
+                .pull_request
+                .as_ref()
+                .map(|pull| pull.number),
+            Some(8),
+            "the report shows the current open pull request this run"
+        );
+    }
+
     #[test]
     fn a_missing_forge_renders_unknown_not_no_pr() {
         // A missing snapshot means the forge did not answer; `no-pr` would claim

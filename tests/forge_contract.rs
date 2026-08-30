@@ -267,7 +267,7 @@ fn a_recorded_sweep_payload_decodes() {
 /// Prints the facts query so a real reply can be recorded into
 /// `tests/fixtures/gh_pull_facts.json`.
 #[test]
-#[ignore = "a recording tool, not a check; see the forge snapshot cache plan"]
+#[ignore = "recording utility, not a check; see the doc comment"]
 fn print_the_facts_query() {
     println!("{}", pull_facts_query(&[1331, 5116]));
 }
@@ -275,7 +275,7 @@ fn print_the_facts_query() {
 /// Prints the sweep query so a real reply can be recorded into
 /// `tests/fixtures/gh_sweep.json`.
 #[test]
-#[ignore = "a recording tool, not a check; see the forge snapshot cache plan"]
+#[ignore = "recording utility, not a check; see the doc comment"]
 fn print_the_sweep_query() {
     println!("{}", knives::forge::sweep_query());
 }

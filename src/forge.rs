@@ -205,17 +205,6 @@ impl PullRequest {
     pub fn conflicting(&self) -> bool {
         self.mergeable.eq_ignore_ascii_case("CONFLICTING")
     }
-
-    /// Whether this pull request comes from `owner`'s copy of the repository.
-    ///
-    /// `None` for the owner means the head repository is gone, which cannot be
-    /// ours, and an unknown owner must not be assumed to be ours: the whole point
-    /// is to stop treating other people's branches as our work.
-    pub fn is_from(&self, owner: &str) -> bool {
-        self.head_repository_owner
-            .as_ref()
-            .is_some_and(|account| account.login.eq_ignore_ascii_case(owner))
-    }
 }
 /// What one round trip answers about a pull request beyond its list fields.
 ///
@@ -367,9 +356,9 @@ pub fn remote_owner(remote: &str) -> Option<&str> {
 
 /// The account names whose full pull-request history is worth fetching.
 ///
-/// Derived from the same remotes `ours_only` filters by. An organization owner
-/// cannot author a pull request, so a name that happens to be an org merely
-/// returns an empty search.
+/// Derived from the same remotes that snapshot filtering uses. An organization
+/// owner cannot author a pull request, so a name that happens to be an org
+/// merely returns an empty search.
 pub fn search_authors(remotes: &[&str]) -> Vec<String> {
     let mut authors: Vec<String> = remotes
         .iter()
@@ -378,23 +367,6 @@ pub fn search_authors(remotes: &[&str]) -> Vec<String> {
         .collect();
     authors.dedup();
     authors
-}
-
-/// Keep only the pull requests that come from our own copy of the repository.
-pub fn ours_only(pull_requests: Vec<PullRequest>, remotes: &[&str]) -> Vec<PullRequest> {
-    let owners: Vec<&str> = remotes
-        .iter()
-        .filter_map(|remote| remote_owner(remote))
-        .collect();
-    if owners.is_empty() {
-        // A set of remotes we cannot parse is not a licence to claim everyone's work,
-        // and not a reason to claim nobody's either: keep today's fail-open answer.
-        return pull_requests;
-    }
-    pull_requests
-        .into_iter()
-        .filter(|pr| owners.iter().any(|owner| pr.is_from(owner)))
-        .collect()
 }
 
 /// The merged summaries onto `trunk`, in number order.
@@ -478,7 +450,7 @@ pub trait Forge: Send + Sync {
 /// Backed by the hosting service's command line tool.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct CliForge;
-/// Medians from three real ~30-number `inspect_ai` trials on the ai fork
+/// Medians from three real ~30-number trials against a busy upstream fork
 /// (2026-08-30):
 ///
 /// | Chunk size | Median |
@@ -490,7 +462,6 @@ pub struct CliForge;
 ///
 /// Eight was the fastest configuration.
 const FACTS_BATCH_CHUNK_SIZE: usize = 8;
-
 
 impl CliForge {
     fn run(repo: &Path, args: &[&str]) -> Result<String, ForgeError> {
@@ -1173,56 +1144,6 @@ mod tests {
         assert_eq!(remote_owner("https://example.invalid/x/y"), None);
     }
 
-    #[test]
-    fn a_pull_request_from_someone_elses_fork_is_not_ours() {
-        // A real repository had an outside contributor whose head branch was called `main`.
-        // Because we carry a local `main`, name matching claimed it as our work.
-        use super::{Account, PullRequest, ours_only};
-
-        let origin = format!("https://{HOST}/our-org/some-repo.git");
-        let make = |number: u64, owner: Option<&str>| PullRequest {
-            number,
-            head_ref_name: "main".to_owned(),
-            head_repository_owner: owner.map(|login| Account {
-                login: login.to_owned(),
-            }),
-            ..PullRequest::default()
-        };
-        let kept = ours_only(vec![make(4554, Some("outsider"))], &[&origin]);
-        assert!(kept.is_empty(), "another owner's branch is not our work");
-
-        assert_eq!(
-            ours_only(vec![make(1, Some("our-org"))], &[&origin]).len(),
-            1
-        );
-
-        // A deleted head repository cannot be ours, and must not be assumed to be.
-        assert!(ours_only(vec![make(2, None)], &[&origin]).is_empty());
-    }
-
-    #[test]
-    fn a_head_on_the_release_remotes_owner_is_ours_too() {
-        // Six real forks had origin pointed at an org copy while PR heads lived on a
-        // personal fork recorded under another role. Matching only origin's owner
-        // reported those PRs as nobody's and their branches as unpushed for months.
-        use super::{Account, PullRequest, ours_only};
-        let origin = format!("https://{HOST}/org-copy/some-repo.git");
-        let release = format!("https://{HOST}/personal/some-repo.git");
-        let prs = vec![PullRequest {
-            number: 7,
-            head_ref_name: "feat/a".to_owned(),
-            head_repository_owner: Some(Account {
-                login: "personal".to_owned(),
-            }),
-            ..PullRequest::default()
-        }];
-        assert_eq!(ours_only(prs.clone(), &[&origin, &release]).len(), 1);
-        assert!(
-            ours_only(prs, &[&origin]).is_empty(),
-            "origin alone must not match"
-        );
-    }
-
     use super::*;
 
     #[test]
@@ -1739,7 +1660,6 @@ mod tests {
 
         assert_eq!(sizes, [8, 8, 8, 6]);
     }
-
 
     #[test]
     fn live_queries_request_the_required_fact_and_sweep_shapes() {

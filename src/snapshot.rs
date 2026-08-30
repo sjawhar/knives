@@ -16,7 +16,7 @@ pub struct SnapshotConfig<'a> {
     pub forge: &'a dyn Forge,
     pub path: &'a Path,
     /// Origin and release remotes: authors derive from them (`search_authors`),
-    /// and `ours()` filters by them (`ours_only`).
+    /// and `ours()` filters pull requests to their head-repository owners.
     pub remotes: [&'a str; 2],
     /// Resolved cache root (…/knives). None = no persistence: cold fetch, no read, no write.
     pub cache_root: Option<&'a Path>,
@@ -70,10 +70,6 @@ pub fn open(config: SnapshotConfig<'_>) -> Result<Opened<'_>, ForgeError> {
 }
 
 impl Opened<'_> {
-    pub const fn identity(&self) -> &RepoIdentity {
-        &self.identity
-    }
-
     /// Landed verdict cached under this key, from the same single read.
     pub fn landed_cached(&self, key: &str) -> Option<LandedVerdict> {
         self.read
@@ -163,7 +159,7 @@ impl<'o> Discovery<'o> {
         &self.rows
     }
 
-    /// `rows()` filtered to our own copies (`ours_only` over config.remotes).
+    /// `rows()` filtered to copies owned by the configured remotes.
     pub fn ours(&self) -> Vec<PullSummary> {
         ours_only(&self.rows, &self.opened.config.remotes)
     }
@@ -230,6 +226,7 @@ impl ForgeSnapshot<'_> {
         &self.rows
     }
 
+    /// `rows()` filtered to copies owned by the configured remotes.
     pub fn ours(&self) -> Vec<PullSummary> {
         ours_only(&self.rows, &self.opened.config.remotes)
     }
@@ -275,8 +272,7 @@ impl ForgeSnapshot<'_> {
     }
 }
 
-/// `PullSummary` successor to [`crate::forge::ours_only`], the `PullRequest`
-/// helper that Wave 5 deletes after every consumer has moved to snapshots.
+/// Filters pull-request summaries to copies owned by the configured remotes.
 fn ours_only(rows: &[PullSummary], remotes: &[&str]) -> Vec<PullSummary> {
     let owners: Vec<&str> = remotes
         .iter()
@@ -393,7 +389,6 @@ mod tests {
         let forge = fake([pull(7, LATER, "fresh-oid")]);
 
         let opened = open(config(&forge, Some(directory.path()))).expect("open cache");
-        assert_eq!(opened.identity(), &identity());
         assert_eq!(
             opened.landed_cached("tip:trunk"),
             Some(LandedVerdict::InTrunk),

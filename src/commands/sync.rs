@@ -307,9 +307,7 @@ fn persist_snapshot(snapshot: Option<&crate::snapshot::ForgeSnapshot<'_>>, repor
     if let Some(snapshot) = snapshot
         && let Err(error) = snapshot.persist(None)
     {
-        report
-            .problems
-            .push(format!("forge cache not saved: {error}"));
+        report.notes.push(format!("forge cache not saved: {error}"));
     }
 }
 
@@ -363,11 +361,11 @@ pub fn sync_repo(input: SyncInput<'_>) -> anyhow::Result<Report> {
         },
         None => None,
     };
-    let ours = discovery
-        .as_ref()
-        .map_or_else(Vec::new, crate::snapshot::Discovery::ours);
-    let tracked = tracked_pull_requests(&ours, &foreign, &seen);
-    let surfaced: Vec<u64> = tracked.keys().copied().collect();
+    let pre_batch_tracked = discovery.as_ref().map_or_else(
+        || tracked_pull_requests(&[], &foreign, &seen),
+        |discovery| tracked_pull_requests(&discovery.ours(), &foreign, &seen),
+    );
+    let surfaced: Vec<u64> = pre_batch_tracked.keys().copied().collect();
     let snapshot = match discovery {
         Some(discovery) => match discovery.complete(&surfaced) {
             Ok(snapshot) => Some(snapshot),
@@ -380,6 +378,10 @@ pub fn sync_repo(input: SyncInput<'_>) -> anyhow::Result<Report> {
         },
         None => None,
     };
+    let tracked = snapshot.as_ref().map_or_else(
+        || tracked_pull_requests(&[], &foreign, &seen),
+        |snapshot| tracked_pull_requests(&snapshot.ours(), &foreign, &seen),
+    );
     let heads = pull_heads_or_problem(entry, &mut report);
     let summaries: &[PullSummary] = snapshot
         .as_ref()
@@ -454,6 +456,10 @@ mod tests {
         reason = "indexing a result in a test is the assertion; a panic is the failure"
     )]
     use super::*;
+    use crate::forge::{FakeForge, PullRequest};
+    use crate::ids::BranchName;
+    use std::collections::BTreeMap;
+    use std::path::Path;
 
     #[test]
     fn forge_state_wins_over_head_movement() {
@@ -503,6 +509,50 @@ mod tests {
             ..Report::default()
         };
         assert_eq!(exit_for(&blocked), Exit::Incomplete);
+    }
+    #[test]
+    fn cache_write_failure_is_a_note_and_does_not_make_sync_incomplete() {
+        // A cache write happens after the live batch; losing it must not change
+        // the successful run into an incomplete one.
+        let cache = tempfile::tempdir().expect("cache directory");
+        std::fs::write(cache.path().join("forge"), "not a directory")
+            .expect("block the cache parent");
+        let forge = FakeForge {
+            pull_requests: BTreeMap::from([(
+                BranchName::new("feat/alpha"),
+                PullRequest {
+                    number: 7,
+                    head_ref_name: "feat/alpha".to_owned(),
+                    ..PullRequest::default()
+                },
+            )]),
+            ..FakeForge::default()
+        };
+        let opened = crate::snapshot::open(crate::snapshot::SnapshotConfig {
+            forge: &forge,
+            path: Path::new("/fake"),
+            remotes: ["origin", "release"],
+            cache_root: Some(cache.path()),
+        })
+        .expect("open snapshot");
+        let snapshot = opened
+            .discover()
+            .expect("discover pull request")
+            .complete(&[7])
+            .expect("fetch pull request");
+        let mut report = Report::default();
+
+        persist_snapshot(Some(&snapshot), &mut report);
+
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|note| note.starts_with("forge cache not saved:")),
+            "was: {report:?}"
+        );
+        assert!(report.problems.is_empty(), "was: {report:?}");
+        assert_eq!(exit_for(&report), Exit::Ok);
     }
 
     #[test]

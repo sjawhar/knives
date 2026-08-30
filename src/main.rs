@@ -584,15 +584,14 @@ fn merged_rebase_target(
     cache_root: Option<&std::path::Path>,
 ) -> anyhow::Result<Option<RebaseDestination>> {
     let trunk = entry.upstream_trunk();
-    let remotes = [
-        entry.remote(knives::config::Role::Origin),
-        entry.remote(knives::config::Role::Release),
-    ];
     let forge = CliForge;
     let opened_snapshot = match knives::snapshot::open(knives::snapshot::SnapshotConfig {
         forge: &forge,
         path: &entry.path,
-        remotes,
+        remotes: [
+            entry.remote(knives::config::Role::Origin),
+            entry.remote(knives::config::Role::Release),
+        ],
         cache_root,
     }) {
         Ok(opened_snapshot) => opened_snapshot,
@@ -614,8 +613,10 @@ fn merged_rebase_target(
             return Ok(None);
         }
     };
-    let candidates = knives::forge::merged_onto(&discovery.ours(), entry.trunk());
-    let numbers: Vec<u64> = candidates.iter().map(|pull| pull.number).collect();
+    let numbers: Vec<u64> = knives::forge::merged_onto(&discovery.ours(), entry.trunk())
+        .iter()
+        .map(|pull| pull.number)
+        .collect();
     let snapshot = match discovery.complete(&numbers) {
         Ok(snapshot) => snapshot,
         Err(error) => {
@@ -626,7 +627,7 @@ fn merged_rebase_target(
             return Ok(None);
         }
     };
-
+    let candidates = knives::forge::merged_onto(&snapshot.ours(), entry.trunk());
     let result: anyhow::Result<Option<RebaseDestination>> = (|| {
         let mut landed = Vec::new();
         for candidate in &candidates {
@@ -1649,16 +1650,21 @@ fn open_pull_for(
     })?;
     let discovery = opened.discover()?;
     let stated = store.tracked_pull(target);
-    let primary = knives::forge::index_pulls(&discovery.ours())
+    let discovery_primary = knives::forge::index_pulls(&discovery.ours())
         .by_branch
         .get(&target.branch)
         .map(|pull| pull.number);
     let mut surfaced = std::collections::BTreeSet::new();
-    for number in [stated, primary].into_iter().flatten() {
+    for number in [stated, discovery_primary].into_iter().flatten() {
         let _ = surfaced.insert(number);
     }
     let numbers: Vec<u64> = surfaced.into_iter().collect();
     let snapshot = discovery.complete(&numbers)?;
+    let primary = knives::forge::index_pulls(&snapshot.ours())
+        .by_branch
+        .get(&target.branch)
+        .map(|pull| pull.number);
+
     let open = [stated, primary]
         .into_iter()
         .flatten()
