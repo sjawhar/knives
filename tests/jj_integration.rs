@@ -253,6 +253,9 @@ impl Forge for CountingForge {
                                 details: knives::forge::PullDetails {
                                     review_predates_head: Some(false),
                                     checks: None,
+                                    diff: None,
+                                    head_ref_deleted: None,
+                                    tip_commit_empty: None,
                                 },
                                 newest_comment: None,
                             },

@@ -140,6 +140,9 @@ impl Forge for FakeForge {
                                 details: PullDetails {
                                     review_predates_head: Some(self.stale_reviews.contains(number)),
                                     checks: self.checks.get(number).cloned(),
+                                    diff: None,
+                                    head_ref_deleted: None,
+                                    tip_commit_empty: None,
                                 },
                                 newest_comment: self.newest_comments.get(number).cloned(),
                             })

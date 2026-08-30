@@ -142,6 +142,21 @@ impl PullRequest {
         self.mergeable.eq_ignore_ascii_case("CONFLICTING")
     }
 }
+/// A pull request's own diff totals, from the live batch.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct DiffTotals {
+    pub additions: u64,
+    pub deletions: u64,
+    pub changed_files: u64,
+}
+
+impl DiffTotals {
+    /// Nothing changed by this pull request at all.
+    pub const fn empty(&self) -> bool {
+        self.additions == 0 && self.deletions == 0 && self.changed_files == 0
+    }
+}
+
 /// What one round trip answers about a pull request beyond its list fields.
 ///
 /// A number the forge did not answer for is absent from the map rather than
@@ -156,6 +171,16 @@ pub struct PullDetails {
     /// What the forge's checks say. `None` means the forge reported no rollup for
     /// this pull request at all.
     pub checks: Option<ChecksSummary>,
+    /// The pull request's diff totals. `None` means the batch did not answer them,
+    /// which must never render as "empty diff".
+    pub diff: Option<DiffTotals>,
+    /// Whether the head ref no longer exists on the forge. GitHub keeps
+    /// `headRefName` as text after a delete; the `headRef` object goes null —
+    /// that null is the "open pull request with a deleted head" incident signal.
+    pub head_ref_deleted: Option<bool>,
+    /// Whether the newest commit's tree equals its one parent tree: a tip that a
+    /// rebase or duplicate emptied while the branch reads healthy.
+    pub tip_commit_empty: Option<bool>,
 }
 
 /// Cheap row for wide lists, the cache, and discovery.

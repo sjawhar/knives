@@ -211,6 +211,23 @@ fn a_recorded_batch_payload_decodes_every_field_the_query_asks_for() {
         facts.values().any(|fact| fact.newest_comment.is_some()),
         "no recorded pull request had comment activity: {facts:?}"
     );
+    assert!(
+        facts.values().any(|fact| fact.details.diff.is_some()),
+        "no recorded pull request carried diff totals: {facts:?}"
+    );
+    assert!(
+        facts
+            .values()
+            .any(|fact| fact.details.head_ref_deleted.is_some()),
+        "no recorded pull request answered head-ref presence: {facts:?}"
+    );
+    assert!(
+        facts
+            .values()
+            .any(|fact| fact.details.tip_commit_empty.is_some()),
+        "no recorded pull request answered tip emptiness: {facts:?}"
+    );
+
 
     let query = pull_facts_query(&[1]);
     for field in [
@@ -227,6 +244,12 @@ fn a_recorded_batch_payload_decodes_every_field_the_query_asks_for() {
         "mergeable",
         "mergeStateStatus",
         "mergeCommit",
+        "additions",
+        "deletions",
+        "changedFiles",
+        "headRef",
+        "tree",
+        "parents",
         "submittedAt",
         "committedDate",
         "hasNextPage",

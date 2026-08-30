@@ -17,6 +17,12 @@
         "mergeable": "CONFLICTING",
         "mergeStateStatus": "DIRTY",
         "mergeCommit": null,
+        "additions": 10,
+        "deletions": 3,
+        "changedFiles": 1,
+        "headRef": {
+          "name": "max/making_formatting_optional"
+        },
         "reviews": {
           "nodes": []
         },
@@ -38,6 +44,21 @@
           "nodes": [
             {
               "commit": {
+                "tree": {
+                  "oid": "71044a66cdec02c34346619f3d3b24084c0e44ee"
+                },
+                "parents": {
+                  "pageInfo": {
+                    "hasNextPage": false
+                  },
+                  "nodes": [
+                    {
+                      "tree": {
+                        "oid": "60a72d06631709ee581877dd155de8bee2d5ac40"
+                      }
+                    }
+                  ]
+                },
                 "statusCheckRollup": null
               }
             }
@@ -69,6 +90,12 @@
         "mergeCommit": {
           "oid": "3712507590dc4e6e678114194ac9844fd3a6fd6c"
         },
+        "additions": 33,
+        "deletions": 1,
+        "changedFiles": 3,
+        "headRef": {
+          "name": "claude/issue-372-20260828-2145"
+        },
         "reviews": {
           "nodes": [
             {
@@ -99,6 +126,26 @@
           "nodes": [
             {
               "commit": {
+                "tree": {
+                  "oid": "703fa9fd107962f98bdefe01b2b7c24d460a7609"
+                },
+                "parents": {
+                  "pageInfo": {
+                    "hasNextPage": false
+                  },
+                  "nodes": [
+                    {
+                      "tree": {
+                        "oid": "86e43a500309f1df73646a8acae8f88c0c529a92"
+                      }
+                    },
+                    {
+                      "tree": {
+                        "oid": "a25f1f7a2f1b0088fdebbf08cc7c8e4727ca0ad0"
+                      }
+                    }
+                  ]
+                },
                 "statusCheckRollup": {
                   "contexts": {
                     "pageInfo": {

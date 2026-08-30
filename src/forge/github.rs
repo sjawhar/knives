@@ -14,8 +14,8 @@ use std::sync::{Condvar, Mutex};
 use serde::{Deserialize, Deserializer};
 
 use super::{
-    CheckRun, ChecksSummary, Forge, ForgeError, PullDetails, PullFacts, PullRequest, PullSummary,
-    RepoIdentity, SweepEntry, SweepPage,
+    CheckRun, ChecksSummary, DiffTotals, Forge, ForgeError, PullDetails, PullFacts, PullRequest,
+    PullSummary, RepoIdentity, SweepEntry, SweepPage,
 };
 const PR_STATE: &str = "all";
 // headRepositoryOwner is what makes a pull request ours or someone else's. Without
@@ -357,11 +357,12 @@ pub fn pull_facts_query(numbers: &[u64]) -> String {
          repository(owner: $owner, name: $name) {{ {fields} }} }} \
          fragment facts on PullRequest {{ number state reviewDecision headRefName headRefOid \
          updatedAt isDraft url headRepositoryOwner {{ login }} baseRefName mergeable \
-         mergeStateStatus mergeCommit {{ oid }} \
+         mergeStateStatus mergeCommit {{ oid }} additions deletions changedFiles headRef {{ name }} \
          reviews(last: 100) {{ nodes {{ submittedAt }} }} \
          commits(last: 100) {{ nodes {{ commit {{ committedDate }} }} }} \
-         rollup: commits(last: 1) {{ nodes {{ commit {{ statusCheckRollup {{ \
-         contexts(first: 100) {{ pageInfo {{ hasNextPage }} nodes {{ __typename \
+         rollup: commits(last: 1) {{ nodes {{ commit {{ tree {{ oid }} \
+         parents(first: 2) {{ pageInfo {{ hasNextPage }} nodes {{ tree {{ oid }} }} }} \
+         statusCheckRollup {{ contexts(first: 100) {{ pageInfo {{ hasNextPage }} nodes {{ __typename \
          ... on CheckRun {{ name conclusion }} \
          ... on StatusContext {{ context state }} }} }} }} }} }} }} \
          comments(last: 1) {{ nodes {{ createdAt }} }} }}"
@@ -405,7 +406,22 @@ struct RollupNode {
 }
 
 #[derive(Deserialize)]
+struct Tree {
+    oid: String,
+}
+
+#[derive(Deserialize)]
+struct ParentNode {
+    #[serde(default)]
+    tree: Option<Tree>,
+}
+
+#[derive(Deserialize)]
 struct RollupHolder {
+    #[serde(default)]
+    tree: Option<Tree>,
+    #[serde(default)]
+    parents: Option<Nodes<ParentNode>>,
     #[serde(default, rename = "statusCheckRollup")]
     rollup: Option<Contexts>,
 }
@@ -475,10 +491,40 @@ struct SweepEnvelope {
     errors: Vec<QueryFailure>,
 }
 
+#[derive(Debug, Deserialize)]
+struct HeadRefNode {
+    #[serde(default)]
+    #[allow(
+        dead_code,
+        reason = "the object's presence is the fact; the name confirms the shape"
+    )]
+    name: String,
+}
+
+/// Distinguish an absent key from a present-but-null one: absent means the
+/// query never asked (an old recorded payload), null means the forge answered
+/// "gone". Collapsing the two would report every legacy payload as a deletion.
+fn queried<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
+}
+
 #[derive(Deserialize)]
 struct FactsPayload {
     #[serde(flatten)]
     pull: PullRequest,
+    #[serde(default)]
+    additions: Option<u64>,
+    #[serde(default)]
+    deletions: Option<u64>,
+    #[serde(default, rename = "changedFiles")]
+    changed_files: Option<u64>,
+    /// Absent key = not asked (old payloads); present-null = deleted head.
+    #[serde(default, rename = "headRef", deserialize_with = "queried")]
+    head_ref: Option<Option<HeadRefNode>>,
     #[serde(default)]
     reviews: Option<Nodes<Dated>>,
     #[serde(default)]
@@ -569,6 +615,91 @@ fn is_tolerable_not_found(failure: &QueryFailure, asked: &[u64]) -> bool {
     repository == "repository" && asked.iter().any(|number| alias == format!("p{number}"))
 }
 
+/// A tip is empty only when its tree is identical to its sole parent's tree.
+///
+/// The query caps parents at two. A continuation means an octopus merge, which
+/// reads as non-empty rather than being classified from an incomplete parent list.
+fn tip_commit_empty(tip: &RollupHolder) -> Option<bool> {
+    let (Some(tree), Some(parents)) = (tip.tree.as_ref(), tip.parents.as_ref()) else {
+        return None;
+    };
+    if parents.page_info.has_next_page {
+        return Some(false);
+    }
+    let [parent] = parents.nodes.as_slice() else {
+        return Some(false);
+    };
+    parent.tree.as_ref().map(|parent| tree.oid == parent.oid)
+}
+
+fn details_from(payload: &FactsPayload) -> Result<PullDetails, ForgeError> {
+    let newest_review = payload
+        .reviews
+        .iter()
+        .flat_map(|list| list.nodes.iter())
+        .filter_map(|review| review.submitted_at.as_deref())
+        .max();
+    let newest_commit = payload
+        .commits
+        .iter()
+        .flat_map(|list| list.nodes.iter())
+        .map(|node| node.commit.committed_date.as_str())
+        .max();
+    let review_predates_head = match (newest_review, newest_commit) {
+        (Some(review), Some(commit)) => Some(review < commit),
+        _ => None,
+    };
+    let has_more_contexts = payload
+        .rollup
+        .iter()
+        .flat_map(|list| list.nodes.iter())
+        .filter_map(|node| node.commit.rollup.as_ref())
+        .filter_map(|rollup| rollup.contexts.as_ref())
+        .any(|contexts| contexts.page_info.has_next_page);
+    if has_more_contexts {
+        return Err(ForgeError::Query {
+            detail: format!(
+                "pull request #{} has more than 100 check contexts; refusing a truncated rollup",
+                payload.pull.number
+            ),
+        });
+    }
+
+    let checks = Some(ChecksSummary {
+        runs: payload
+            .rollup
+            .iter()
+            .flat_map(|list| list.nodes.iter())
+            .filter_map(|node| node.commit.rollup.as_ref())
+            .filter_map(|rollup| rollup.contexts.as_ref())
+            .flat_map(|contexts| contexts.nodes.iter())
+            .cloned()
+            .collect(),
+    });
+    let diff = match (payload.additions, payload.deletions, payload.changed_files) {
+        (Some(additions), Some(deletions), Some(changed_files)) => Some(DiffTotals {
+            additions,
+            deletions,
+            changed_files,
+        }),
+        _ => None,
+    };
+    let head_ref_deleted = payload.head_ref.as_ref().map(Option::is_none);
+    let tip_commit_empty = payload
+        .rollup
+        .iter()
+        .flat_map(|list| list.nodes.iter())
+        .last()
+        .and_then(|tip| tip_commit_empty(&tip.commit));
+    Ok(PullDetails {
+        review_predates_head,
+        checks,
+        diff,
+        head_ref_deleted,
+        tip_commit_empty,
+    })
+}
+
 pub fn parse_pull_facts(
     payload: &str,
     asked: &[u64],
@@ -596,49 +727,7 @@ pub fn parse_pull_facts(
     };
     let mut facts = BTreeMap::new();
     for payload in repository.into_values().flatten() {
-        let newest_review = payload
-            .reviews
-            .iter()
-            .flat_map(|list| list.nodes.iter())
-            .filter_map(|review| review.submitted_at.as_deref())
-            .max();
-        let newest_commit = payload
-            .commits
-            .iter()
-            .flat_map(|list| list.nodes.iter())
-            .map(|node| node.commit.committed_date.as_str())
-            .max();
-        let review_predates_head = match (newest_review, newest_commit) {
-            (Some(review), Some(commit)) => Some(review < commit),
-            _ => None,
-        };
-        let has_more_contexts = payload
-            .rollup
-            .iter()
-            .flat_map(|list| list.nodes.iter())
-            .filter_map(|node| node.commit.rollup.as_ref())
-            .filter_map(|rollup| rollup.contexts.as_ref())
-            .any(|contexts| contexts.page_info.has_next_page);
-        if has_more_contexts {
-            return Err(ForgeError::Query {
-                detail: format!(
-                    "pull request #{} has more than 100 check contexts; refusing a truncated rollup",
-                    payload.pull.number
-                ),
-            });
-        }
-
-        let checks = Some(ChecksSummary {
-            runs: payload
-                .rollup
-                .iter()
-                .flat_map(|list| list.nodes.iter())
-                .filter_map(|node| node.commit.rollup.as_ref())
-                .filter_map(|rollup| rollup.contexts.as_ref())
-                .flat_map(|contexts| contexts.nodes.iter())
-                .cloned()
-                .collect(),
-        });
+        let details = details_from(&payload)?;
         let newest_comment = payload
             .reviews
             .iter()
@@ -658,10 +747,7 @@ pub fn parse_pull_facts(
             number,
             PullFacts {
                 pull: payload.pull,
-                details: PullDetails {
-                    review_predates_head,
-                    checks,
-                },
+                details,
                 newest_comment,
             },
         );
@@ -926,6 +1012,106 @@ printf '{}'
             Some("2026-08-02T00:00:00Z"),
             "the review outranks the older comment"
         );
+    }
+
+    #[test]
+    fn facts_carry_diff_totals_head_ref_presence_and_tip_emptiness() {
+        let payload = facts_payload(
+            r#""p7":{"number":7,"state":"OPEN","headRefName":"feat/a","headRefOid":"aa",
+        "updatedAt":"2026-08-01T00:00:00Z",
+        "additions":0,"deletions":0,"changedFiles":0,"headRef":null,
+        "rollup":{"nodes":[{"commit":{"additions":0,"deletions":0,"tree":{"oid":"same"},
+        "parents":{"nodes":[{"tree":{"oid":"same"}}]}}}]}}"#,
+        );
+        let facts = parse_pull_facts(&payload, &[7]).expect("facts parse");
+        let details = &facts[&7].details;
+        assert_eq!(
+            details.diff,
+            Some(crate::forge::DiffTotals {
+                additions: 0,
+                deletions: 0,
+                changed_files: 0
+            }),
+            "an answered zero diff is a fact, not an absence"
+        );
+        assert_eq!(
+            details.head_ref_deleted,
+            Some(true),
+            "headRef null means the ref is gone"
+        );
+        assert_eq!(details.tip_commit_empty, Some(true));
+    }
+
+    #[test]
+    fn facts_do_not_mistake_zero_line_rename_for_an_empty_tip() {
+        let payload = facts_payload(
+            r#""p7":{"number":7,"state":"OPEN","headRefName":"feat/a","headRefOid":"aa",
+        "updatedAt":"2026-08-01T00:00:00Z","rollup":{"nodes":[{"commit":{
+        "additions":0,"deletions":0,"tree":{"oid":"renamed"},
+        "parents":{"nodes":[{"tree":{"oid":"original"}}]}}}]}}"#,
+        );
+
+        let facts = parse_pull_facts(&payload, &[7]).expect("facts parse");
+
+        assert_eq!(facts[&7].details.tip_commit_empty, Some(false));
+    }
+
+    #[test]
+    fn facts_do_not_mistake_a_merge_tip_for_an_empty_tip() {
+        let payload = facts_payload(
+            r#""p7":{"number":7,"state":"OPEN","headRefName":"feat/a","headRefOid":"aa",
+        "updatedAt":"2026-08-01T00:00:00Z","rollup":{"nodes":[{"commit":{
+        "additions":0,"deletions":0,"tree":{"oid":"merged"},
+        "parents":{"nodes":[{"tree":{"oid":"left"}},{"tree":{"oid":"right"}}]}}}]}}"#,
+        );
+
+        let facts = parse_pull_facts(&payload, &[7]).expect("facts parse");
+
+        assert_eq!(facts[&7].details.tip_commit_empty, Some(false));
+    }
+
+    #[test]
+    fn facts_do_not_mistake_a_root_tip_for_an_empty_tip() {
+        let payload = facts_payload(
+            r#""p7":{"number":7,"state":"OPEN","headRefName":"feat/a","headRefOid":"aa",
+        "updatedAt":"2026-08-01T00:00:00Z","rollup":{"nodes":[{"commit":{
+        "additions":0,"deletions":0,"tree":{"oid":"root"},"parents":{"nodes":[]}}}]}}"#,
+        );
+
+        let facts = parse_pull_facts(&payload, &[7]).expect("facts parse");
+
+        assert_eq!(facts[&7].details.tip_commit_empty, Some(false));
+    }
+
+    #[test]
+    fn facts_do_not_guess_about_an_octopus_tip() {
+        let payload = facts_payload(
+            r#""p7":{"number":7,"state":"OPEN","headRefName":"feat/a","headRefOid":"aa",
+        "updatedAt":"2026-08-01T00:00:00Z","rollup":{"nodes":[{"commit":{
+        "additions":0,"deletions":0,"tree":{"oid":"octopus"},
+        "parents":{"pageInfo":{"hasNextPage":true},
+        "nodes":[{"tree":{"oid":"one"}},{"tree":{"oid":"two"}}]}}}]}}"#,
+        );
+
+        let facts = parse_pull_facts(&payload, &[7]).expect("facts parse");
+
+        assert_eq!(facts[&7].details.tip_commit_empty, Some(false));
+    }
+
+    #[test]
+    fn facts_missing_the_new_fields_answer_none_not_zero() {
+        // An old recorded payload (or a forge that refused the fields) must read as
+        // "not answered", never as "empty diff" — the not-consulted/nothing-found
+        // distinction the whole forge module is built on.
+        let payload = facts_payload(
+            r#""p7":{"number":7,"state":"OPEN","headRefName":"feat/a","headRefOid":"aa",
+        "updatedAt":"2026-08-01T00:00:00Z"}"#,
+        );
+        let facts = parse_pull_facts(&payload, &[7]).expect("facts parse");
+        let details = &facts[&7].details;
+        assert_eq!(details.diff, None);
+        assert_eq!(details.head_ref_deleted, None);
+        assert_eq!(details.tip_commit_empty, None);
     }
 
     #[test]
