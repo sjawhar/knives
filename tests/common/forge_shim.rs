@@ -124,13 +124,27 @@ pub fn path_with_gh_shim(shim: &Path) -> std::ffi::OsString {
 
 /// One forge pull request record with the fields the binary requires.
 pub fn pull_record(number: u64, state: &str, branch: &str, merge_oid: Option<&str>) -> String {
+    pull_record_with_fields(number, state, branch, merge_oid, "")
+}
+
+/// One forge pull request record with additional raw JSON fields.
+///
+/// `extra_fields` begins with a comma when non-empty, so test scenarios can
+/// add facts to a single row without changing existing callers.
+pub fn pull_record_with_fields(
+    number: u64,
+    state: &str,
+    branch: &str,
+    merge_oid: Option<&str>,
+    extra_fields: &str,
+) -> String {
     let merge = merge_oid.map_or_else(String::new, |oid| {
         format!(",\"mergeCommit\":{{\"oid\":\"{oid}\"}}")
     });
     format!(
         "{{\"number\":{number},\"state\":\"{state}\",\"headRefName\":\"{branch}\",\
          \"headRefOid\":\"0123456789abcdef0123456789abcdef01234567\",\
-         \"updatedAt\":\"2026-08-07T00:00:00Z\",\"baseRefName\":\"main\"{merge}}}"
+         \"updatedAt\":\"2026-08-07T00:00:00Z\",\"baseRefName\":\"main\"{merge}{extra_fields}}}"
     )
 }
 

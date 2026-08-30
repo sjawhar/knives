@@ -850,6 +850,25 @@ fn fold_phase_outcome(
         timings,
     });
     if let Some(snapshot) = snapshot {
+        let states: Vec<crate::detect::pull_state::PullState<'_>> = report
+            .branches
+            .iter()
+            .filter_map(|row| row.pull_request.as_ref())
+            .filter_map(|pull| {
+                snapshot
+                    .fact(pull.number)
+                    .map(|fact| crate::detect::pull_state::PullState {
+                        number: pull.number,
+                        open: fact.pull.is_open(),
+                        details: &fact.details,
+                    })
+            })
+            .collect();
+        report
+            .findings
+            .extend(crate::detect::pull_state::pull_state_findings(&states));
+    }
+    if let Some(snapshot) = snapshot {
         let landed = input
             .probe_ran
             .then(|| std::mem::take(&mut phases.probe.landed));

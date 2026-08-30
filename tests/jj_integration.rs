@@ -12,7 +12,10 @@ mod lab;
 #[path = "common/pulls.rs"]
 mod pulls;
 
-use forge_shim::{install_failing_gh, install_snapshot_gh, path_with_gh_shim, pull_record};
+use forge_shim::{
+    install_failing_gh, install_snapshot_gh, path_with_gh_shim, pull_record,
+    pull_record_with_fields,
+};
 
 use knives::commands::{
     repos,
@@ -4485,6 +4488,47 @@ fn status_with_the_landed_probe_reports_a_merged_branch_and_leaves_no_trace() {
 
     // And the probe left the repository as it found it.
     assert_eq!(before, after, "the probe left commits behind");
+}
+
+#[test]
+fn status_reports_empty_diff_and_deleted_head_from_completed_facts() {
+    // Given: an open branch pull whose completed fact row reports no diff and no head ref
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let (home, _consumer) = release_test_home(&lab);
+    let pulls = format!(
+        "[{}]",
+        pull_record_with_fields(
+            7,
+            "OPEN",
+            "feat/alpha",
+            None,
+            r#","additions":0,"deletions":0,"changedFiles":0,"headRef":null"#,
+        )
+    );
+    let shim = tempfile::tempdir().expect("create forge shim directory");
+    install_snapshot_gh(shim.path(), &pulls, &[], None);
+
+    // When: the real status binary consumes the completed snapshot
+    let output = Command::new(env!("CARGO_BIN_EXE_knives"))
+        .args(["--text", "status", "demo", "--no-landed"])
+        .current_dir(&lab.work)
+        .env("KNIVES_CONFIG_HOME", home.path())
+        .env("XDG_CACHE_HOME", shim.path().join("cache"))
+        .env("PATH", path_with_gh_shim(shim.path()))
+        .output()
+        .expect("run status with a forge shim");
+
+    // Then: both answered incidents are visible and findings determine the exit code
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        output.status.code(),
+        Some(i32::from(knives::cli::Exit::Findings.code())),
+        "stdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(stdout.contains("empty-diff"), "stdout: {stdout}");
+    assert!(stdout.contains("deleted-head-ref"), "stdout: {stdout}");
 }
 
 #[test]

@@ -11,6 +11,7 @@ pub mod hook;
 pub mod init;
 pub mod notch;
 pub mod preflight;
+pub mod pr;
 pub mod register;
 pub mod release;
 pub mod repos;
