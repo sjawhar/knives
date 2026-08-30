@@ -3565,6 +3565,7 @@ struct FinishWithSnapshotForgeInput<'a> {
     lab: &'a Lab,
     home: &'a tempfile::TempDir,
     pulls: &'a str,
+    withheld_facts: &'a [u64],
     args: &'a [&'a str],
     log: &'a std::path::Path,
 }
@@ -3576,11 +3577,12 @@ fn knives_finish_with_snapshot_forge(
         lab,
         home,
         pulls,
+        withheld_facts,
         args,
         log,
     } = input;
     let shim = tempfile::tempdir().expect("create forge shim directory");
-    install_snapshot_gh(shim.path(), pulls, Some(log));
+    install_snapshot_gh(shim.path(), pulls, withheld_facts, Some(log));
     let mut command = Command::new(env!("CARGO_BIN_EXE_knives"));
     command.args(["--text", "finish"]);
     command.args(args);
@@ -3644,6 +3646,7 @@ fn finish_refuses_while_the_pull_request_is_open() {
         lab: &lab,
         home: &home,
         pulls: &pulls,
+        withheld_facts: &[],
         args: &["feat/alpha"],
         log: &log,
     });
@@ -3660,6 +3663,41 @@ fn finish_refuses_while_the_pull_request_is_open() {
         "the refusal did not name the open pull request: {stdout}"
     );
     assert!(log.is_file(), "the guard did not consult the fake forge");
+}
+
+#[test]
+fn finish_refuses_when_the_forge_omits_a_surfaced_pull_fact() {
+    // Given: discovery says alpha owns an open pull request, but the same run's
+    // requested-facts batch omits that number.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let (home, _consumer) = release_test_home(&lab);
+    hold_claim(&home, "feat/alpha");
+    let state = tempfile::tempdir().expect("test state");
+    let log = state.path().join("gh.log");
+    let pulls = format!("[{}]", pull_record(7, "OPEN", "feat/alpha", None));
+
+    let output = knives_finish_with_snapshot_forge(FinishWithSnapshotForgeInput {
+        lab: &lab,
+        home: &home,
+        pulls: &pulls,
+        withheld_facts: &[7],
+        args: &["feat/alpha"],
+        log: &log,
+    });
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "stdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("cannot verify whether feat/alpha has an open pull request")
+            && stdout.contains("#7"),
+        "the refusal did not name the unanswered pull request: {stdout}"
+    );
 }
 
 #[test]
@@ -5348,7 +5386,12 @@ fn a_rebase_moves_the_whole_composition_onto_the_target() {
 
 /// Install a fake `gh` that answers the full snapshot protocol: repository
 /// identity, cold list, warm sweep, and by-number facts.
-fn install_snapshot_gh(shim: &std::path::Path, pulls: &str, log: Option<&std::path::Path>) {
+fn install_snapshot_gh(
+    shim: &std::path::Path,
+    pulls: &str,
+    withheld_facts: &[u64],
+    log: Option<&std::path::Path>,
+) {
     let pulls: Vec<serde_json::Value> =
         serde_json::from_str(pulls).expect("parse fake pull request payload");
     let sweep_entries = pulls
@@ -5364,7 +5407,9 @@ fn install_snapshot_gh(shim: &std::path::Path, pulls: &str, log: Option<&std::pa
     let mut fact_rows = serde_json::Map::new();
     for pull in &pulls {
         let number = pull["number"].as_u64().expect("pull request number");
-        let _ = fact_rows.insert(format!("p{number}"), pull.clone());
+        if !withheld_facts.contains(&number) {
+            let _ = fact_rows.insert(format!("p{number}"), pull.clone());
+        }
     }
     let identity = shim.join("identity.json");
     let list = shim.join("pulls.json");
@@ -5447,8 +5492,36 @@ fn knives_release_with_forge(
     pulls: &str,
     args: &[&str],
 ) -> std::process::Output {
+    knives_release_with_forge_withheld_facts(ReleaseWithSnapshotForgeInput {
+        lab,
+        home,
+        pulls,
+        withheld_facts: &[],
+        args,
+    })
+}
+
+#[derive(Clone, Copy)]
+struct ReleaseWithSnapshotForgeInput<'a> {
+    lab: &'a Lab,
+    home: &'a tempfile::TempDir,
+    pulls: &'a str,
+    withheld_facts: &'a [u64],
+    args: &'a [&'a str],
+}
+
+fn knives_release_with_forge_withheld_facts(
+    input: ReleaseWithSnapshotForgeInput<'_>,
+) -> std::process::Output {
+    let ReleaseWithSnapshotForgeInput {
+        lab,
+        home,
+        pulls,
+        withheld_facts,
+        args,
+    } = input;
     let shim = tempfile::tempdir().expect("create forge shim directory");
-    install_snapshot_gh(shim.path(), pulls, None);
+    install_snapshot_gh(shim.path(), pulls, withheld_facts, None);
     let mut command = Command::new(env!("CARGO_BIN_EXE_knives"));
     command.args(["--text", "release", "--repo", "demo"]);
     command.args(args);
@@ -5611,6 +5684,53 @@ fn a_bare_rebase_covers_the_latest_of_several_merged_pull_requests() {
         !repo.is_ancestor(&tip, &at_release).expect("ancestry"),
         "the release overshot the merged point onto the trunk tip"
     );
+}
+
+#[test]
+fn a_bare_rebase_refuses_when_a_merged_candidate_fact_is_omitted() {
+    // Given: discovery names two merged pull requests that are on local trunk,
+    // but the facts batch answers only the latter one.
+    let lab = Lab::new();
+    let release = "release/2026-08-04";
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    lab.branch("feat/gamma", "gamma.txt", "gamma\n");
+    lab.octopus(release, "feat/alpha", "feat/beta");
+    let (home, _consumer) = release_test_home(&lab);
+    lab.publish_pull("feat/alpha", 7);
+    lab.merge_pull_with_merge_commit(7);
+    let first_merge = commit_at(&lab, "main@upstream");
+    lab.publish_pull("feat/gamma", 8);
+    lab.merge_pull_with_merge_commit(8);
+    let second_merge = commit_at(&lab, "main@upstream");
+    let before = commit_at(&lab, release);
+    let pulls = format!(
+        "[{},{}]",
+        pull_record(7, "MERGED", "feat/alpha", Some(first_merge.as_str())),
+        pull_record(8, "MERGED", "feat/gamma", Some(second_merge.as_str()))
+    );
+
+    let output = knives_release_with_forge_withheld_facts(ReleaseWithSnapshotForgeInput {
+        lab: &lab,
+        home: &home,
+        pulls: &pulls,
+        withheld_facts: &[7],
+        args: &["rebase"],
+    });
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    let text = format!("{stdout}\n{stderr}");
+    assert!(
+        text.contains("#7") && !text.contains("rebasing onto it"),
+        "the refusal did not name the unanswered merged pull request: {text}"
+    );
+    assert_eq!(before, commit_at(&lab, release), "the release moved anyway");
 }
 
 #[test]

@@ -629,21 +629,10 @@ fn merged_rebase_target(
     };
     let candidates = knives::forge::merged_onto(&snapshot.ours(), entry.trunk());
     let result: anyhow::Result<Option<RebaseDestination>> = (|| {
-        let mut landed = Vec::new();
-        for candidate in &candidates {
-            let Some(fact) = snapshot.fact(candidate.number) else {
-                eprintln!(
-                    "{repo}: could not ask the forge which pull request merged: #{} was not found; \
-                     provide a commit to rebase onto",
-                    candidate.number
-                );
-                continue;
-            };
-            let pull = &fact.pull;
-            if pull.is_merged() && pull.base_ref_name == entry.trunk() {
-                landed.push(pull.clone());
-            }
-        }
+        let Some(landed) = verified_merged_candidates(repo, &snapshot, &candidates, entry.trunk())
+        else {
+            return Ok(None);
+        };
         if landed.is_empty() {
             println!(
                 "{repo}: no pull request has merged, so there is no default target; \
@@ -685,6 +674,36 @@ fn merged_rebase_target(
         eprintln!("{repo}: could not update forge cache: {error}");
     }
     result
+}
+
+fn verified_merged_candidates(
+    repo: &RepoName,
+    snapshot: &knives::snapshot::ForgeSnapshot<'_>,
+    candidates: &[knives::forge::PullSummary],
+    trunk: &str,
+) -> Option<Vec<knives::forge::PullRequest>> {
+    let unanswered: Vec<u64> = candidates
+        .iter()
+        .filter(|candidate| snapshot.fact(candidate.number).is_none())
+        .map(|candidate| candidate.number)
+        .collect();
+    if !unanswered.is_empty() {
+        eprintln!(
+            "{repo}: could not ask the forge which pull requests merged: it did not report \
+             facts for {}; provide a commit to rebase onto",
+            numbered(&unanswered)
+        );
+        return None;
+    }
+    let mut landed = Vec::new();
+    for candidate in candidates {
+        let fact = snapshot.fact(candidate.number)?;
+        let pull = &fact.pull;
+        if pull.is_merged() && pull.base_ref_name == trunk {
+            landed.push(pull.clone());
+        }
+    }
+    Some(landed)
 }
 
 /// The first trunk commit containing every landing in `placed`: their maximum
@@ -1630,7 +1649,8 @@ fn release_event(had: bool, superseded_by: Option<&str>) -> Option<String> {
 /// The open pull request a branch still owns, if the forge proves it has one.
 ///
 /// A stated number is authoritative when it is open; otherwise the branch's
-/// currently primary pull request is considered too.
+/// currently primary pull request is considered too. Every number surfaced for
+/// that guard needs a same-run fact; an omitted fact cannot prove it is closed.
 fn open_pull_for(
     target: &BranchTarget,
     entry: &knives::config::RepoEntry,
@@ -1658,21 +1678,47 @@ fn open_pull_for(
     for number in [stated, discovery_primary].into_iter().flatten() {
         let _ = surfaced.insert(number);
     }
-    let numbers: Vec<u64> = surfaced.into_iter().collect();
+    let numbers: Vec<u64> = surfaced.iter().copied().collect();
     let snapshot = discovery.complete(&numbers)?;
     let primary = knives::forge::index_pulls(&snapshot.ours())
         .by_branch
         .get(&target.branch)
         .map(|pull| pull.number);
-
-    let open = [stated, primary]
-        .into_iter()
-        .flatten()
-        .filter_map(|number| snapshot.fact(number).map(|fact| &fact.pull))
-        .find(|pull| pull.is_open())
-        .cloned();
+    if let Some(number) = primary {
+        let _ = surfaced.insert(number);
+    }
+    let unanswered: Vec<u64> = surfaced
+        .iter()
+        .copied()
+        .filter(|number| snapshot.fact(*number).is_none())
+        .collect();
+    let result = (|| {
+        if !unanswered.is_empty() {
+            return Err(knives::forge::ForgeError::Query {
+                detail: format!(
+                    "the forge did not report facts for requested pull request(s) {}",
+                    numbered(&unanswered)
+                ),
+            });
+        }
+        let mut open = None;
+        for number in [stated, primary].into_iter().flatten() {
+            let Some(fact) = snapshot.fact(number) else {
+                return Err(knives::forge::ForgeError::Query {
+                    detail: format!(
+                        "the forge did not report facts for requested pull request #{number}"
+                    ),
+                });
+            };
+            if fact.pull.is_open() {
+                open = Some(fact.pull.clone());
+                break;
+            }
+        }
+        Ok(open)
+    })();
     let _ = snapshot.persist(None);
-    Ok(open)
+    result
 }
 
 /// Hand a branch back and remove its workspace. The inverse of `start`.

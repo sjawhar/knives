@@ -3160,6 +3160,38 @@ mod tests {
     }
 
     #[test]
+    fn a_pending_legacy_status_context_renders_as_pending() {
+        let facts = crate::forge::parse_pull_facts(
+            r#"{"data":{"repository":{"p13":{"number":13,"state":"OPEN","headRefName":"feat/pending",
+            "headRefOid":"aa","updatedAt":"2026-08-01T00:00:00Z","rollup":{"nodes":[{"commit":{
+            "statusCheckRollup":{"contexts":{"nodes":[{"__typename":"StatusContext",
+            "context":"legacy-ci","state":"PENDING"}]}}}}]}}}}}"#,
+            &[13],
+        )
+        .expect("facts parse");
+        let fact = &facts[&13];
+        let mut pending = row("feat/pending", None, Some(fact.pull.clone()));
+        pending.checks = fact.details.checks.clone();
+        let report = Report {
+            repo: "demo".to_owned(),
+            branches: vec![pending],
+            ..Report::default()
+        };
+
+        let rendered = render(&report, false);
+        let pending_line = rendered
+            .lines()
+            .find(|line| line.contains("feat/pending"))
+            .expect("the pending branch line");
+
+        assert_eq!(
+            pending_line.split_whitespace().nth(5),
+            Some("pending"),
+            "was: {pending_line}"
+        );
+    }
+
+    #[test]
     fn not_consulted_checks_do_not_render_as_none_ran() {
         // Given: matching pull requests whose checks were and were not consulted
         let mut no_checks = row("feat/no-checks", None, Some(pull_request(11)));

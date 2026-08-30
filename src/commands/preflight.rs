@@ -163,6 +163,10 @@ pub struct Report {
     /// "not checked" must never render as "not landed".
     pub branch_state: Vec<BranchState>,
     pub findings: Vec<Finding>,
+    /// Answers this run could not establish, so a caller must not use a green
+    /// exit as evidence that every gate ran.
+    pub problems: Vec<String>,
+    /// Informational facts that do not change a successful run's exit status.
     pub notes: Vec<String>,
 }
 
@@ -257,16 +261,16 @@ pub fn gather(input: GatherInput<'_>) -> Report {
                             Some(owned_open_pull_request_count(snapshot.rows(), &ours));
                     }
                     Err(error) => report
-                        .notes
+                        .problems
                         .push(format!("could not read our branches: {error}")),
                 }
             }
             Err(error) => report
-                .notes
+                .problems
                 .push(format!("open pull request count unavailable: {error}")),
         },
         Err(error) => report
-            .notes
+            .problems
             .push(format!("open pull request count unavailable: {error}")),
     }
 
@@ -282,7 +286,7 @@ pub fn gather(input: GatherInput<'_>) -> Report {
             report.findings.extend(findings);
         }
         Err(error) => report
-            .notes
+            .problems
             .push(format!("branch state unavailable: {error}")),
     }
     report
@@ -388,9 +392,10 @@ fn branch_states_with_findings(
 
 pub fn render(report: &Report) -> String {
     let mut lines: Vec<String> = report
-        .notes
+        .problems
         .iter()
-        .map(|note| format!("! {note}"))
+        .chain(&report.notes)
+        .map(|message| format!("! {message}"))
         .collect();
     lines.push(format!("{}: convention files", report.repo));
     lines.extend(report.conventions.iter().map(Convention::render));
@@ -427,17 +432,14 @@ pub fn render(report: &Report) -> String {
 }
 
 pub const fn exit_for(report: &Report) -> Exit {
-    let notes = if report.notes.is_empty() {
-        Exit::Ok
-    } else {
-        Exit::Incomplete
-    };
-    let findings = if report.findings.is_empty() {
+    if !report.problems.is_empty() {
+        return Exit::Incomplete;
+    }
+    if report.findings.is_empty() {
         Exit::Ok
     } else {
         Exit::Findings
-    };
-    notes.worst(findings)
+    }
 }
 
 /// Convenience for callers that only have a path.
@@ -506,6 +508,51 @@ mod tests {
         // Then: neither merged history nor an open pull request on a branch we
         // do not carry consumes a slot.
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn cache_write_failure_is_a_note_and_does_not_make_preflight_incomplete() {
+        let cache = tempfile::tempdir().expect("cache directory");
+        std::fs::write(cache.path().join("forge"), "not a directory")
+            .expect("block the cache parent");
+        let forge = crate::forge::FakeForge {
+            pull_requests: std::collections::BTreeMap::from([(
+                crate::ids::BranchName::new("feat/alpha"),
+                crate::forge::PullRequest {
+                    number: 7,
+                    head_ref_name: "feat/alpha".to_owned(),
+                    ..crate::forge::PullRequest::default()
+                },
+            )]),
+            ..crate::forge::FakeForge::default()
+        };
+        let opened = snapshot::open(SnapshotConfig {
+            forge: &forge,
+            path: Path::new("/fake"),
+            remotes: ["origin", "release"],
+            cache_root: Some(cache.path()),
+        })
+        .expect("open snapshot");
+        let snapshot = opened
+            .discover()
+            .expect("discover pull request")
+            .complete(&[7])
+            .expect("fetch pull request");
+        let mut report = Report::default();
+
+        if let Err(error) = snapshot.persist(None) {
+            report.notes.push(format!("forge cache not saved: {error}"));
+        }
+
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|note| note.starts_with("forge cache not saved:")),
+            "was: {report:?}"
+        );
+        assert!(report.problems.is_empty(), "was: {report:?}");
+        assert_eq!(exit_for(&report), Exit::Ok);
     }
 
     #[test]

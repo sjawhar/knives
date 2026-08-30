@@ -37,16 +37,57 @@ pub fn cache_path(root: &std::path::Path, identity: &RepoIdentity) -> Option<std
     Some(root.join("forge").join(owner).join(format!("{repo}.json")))
 }
 
-/// `None` on: missing file, unreadable, unparseable, `schema_version` mismatch,
-/// `nameWithOwner` mismatch, `repo_id` mismatch. Never an error (spec: cache loss
-/// is not a problem).
+/// `None` when cache loss or a validation failure makes a warm read unsafe.
+///
+/// Validation covers file readability and syntax, schema and identity fields,
+/// plus every discovery timestamp. Cache loss is never an error.
 pub fn load(path: &std::path::Path, identity: &RepoIdentity) -> Option<CacheFile> {
     let bytes = std::fs::read(path).ok()?;
     let file: CacheFile = serde_json::from_slice(&bytes).ok()?;
     (file.schema_version == SCHEMA_VERSION
         && file.name_with_owner == identity.name_with_owner
-        && file.repo_id == identity.id)
-        .then_some(file)
+        && file.repo_id == identity.id
+        && (file.watermark.is_empty() || is_rfc3339_utc(&file.watermark))
+        && file
+            .pulls
+            .values()
+            .all(|pull| is_rfc3339_utc(&pull.updated_at)))
+    .then_some(file)
+}
+
+fn is_rfc3339_utc(value: &str) -> bool {
+    let Some(body) = value.strip_suffix('Z') else {
+        return false;
+    };
+    let Some((date, time)) = body.split_once('T') else {
+        return false;
+    };
+    let date = date.as_bytes();
+    let valid_date = date.len() == 10
+        && date.get(4) == Some(&b'-')
+        && date.get(7) == Some(&b'-')
+        && date
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| matches!(index, 4 | 7) || byte.is_ascii_digit());
+    let (seconds, fraction) = time
+        .split_once('.')
+        .map_or((time, None), |(seconds, fraction)| {
+            (seconds, Some(fraction))
+        });
+    let seconds = seconds.as_bytes();
+    let valid_time = seconds.len() == 8
+        && seconds.get(2) == Some(&b':')
+        && seconds.get(5) == Some(&b':')
+        && seconds
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| matches!(index, 2 | 5) || byte.is_ascii_digit());
+    let valid_fraction = fraction.is_none_or(|fraction| {
+        !fraction.is_empty() && fraction.bytes().all(|byte| byte.is_ascii_digit())
+    });
+
+    valid_date && valid_time && valid_fraction && value.parse::<jiff::Timestamp>().is_ok()
 }
 
 pub fn landed_key(tip: &crate::ids::CommitId, trunk: &crate::ids::CommitId) -> String {
@@ -271,6 +312,72 @@ mod tests {
             std::fs::write(&path, bytes).expect("write foreign cache");
             assert!(load(&path, &repo).is_none(), "{description}");
         }
+    }
+
+    #[test]
+    fn a_cache_with_a_non_timestamp_watermark_loads_as_none() {
+        let directory = tempfile::tempdir().expect("create cache directory");
+        let path = directory.path().join("cache.json");
+        let repo = identity();
+        let file = CacheFile {
+            watermark: "~".to_owned(),
+            ..cache(
+                &repo,
+                BTreeMap::from([(1, summary(1, "2026-01-02T00:00:00Z"))]),
+            )
+        };
+
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&file).expect("serialize cache fixture"),
+        )
+        .expect("write cache fixture");
+
+        assert!(
+            load(&path, &repo).is_none(),
+            "a malformed watermark must force a cold reseed"
+        );
+    }
+
+    #[test]
+    fn a_cache_with_a_non_timestamp_row_loads_as_none() {
+        let directory = tempfile::tempdir().expect("create cache directory");
+        let path = directory.path().join("cache.json");
+        let repo = identity();
+        let file = cache(&repo, BTreeMap::from([(1, summary(1, "~"))]));
+
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&file).expect("serialize cache fixture"),
+        )
+        .expect("write cache fixture");
+
+        assert!(
+            load(&path, &repo).is_none(),
+            "a malformed row timestamp must force a cold reseed"
+        );
+    }
+
+    #[test]
+    fn a_cache_with_rfc3339_utc_timestamps_loads() {
+        let directory = tempfile::tempdir().expect("create cache directory");
+        let path = directory.path().join("cache.json");
+        let repo = identity();
+        let file = CacheFile {
+            watermark: "2026-01-03T00:00:00Z".to_owned(),
+            ..cache(
+                &repo,
+                BTreeMap::from([(1, summary(1, "2026-01-02T00:00:00Z"))]),
+            )
+        };
+
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&file).expect("serialize cache fixture"),
+        )
+        .expect("write cache fixture");
+
+        assert_eq!(load(&path, &repo), Some(file));
     }
 
     #[test]

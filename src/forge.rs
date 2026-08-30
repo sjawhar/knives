@@ -49,8 +49,8 @@ pub const fn summary_fields() -> &'static str {
 pub struct CheckRun {
     #[serde(default)]
     pub name: String,
-    /// `None` while still running; otherwise `SUCCESS`, `FAILURE`, `SKIPPED`, or
-    /// `CANCELLED`.
+    /// `None` while unfinished, including legacy `PENDING` and `EXPECTED` contexts;
+    /// otherwise `SUCCESS`, `FAILURE`, `SKIPPED`, or `CANCELLED`.
     #[serde(default)]
     pub conclusion: Option<String>,
 }
@@ -72,6 +72,32 @@ enum CheckRunPayload {
     },
 }
 
+enum NormalizedCheckState {
+    Unfinished,
+    Finished(String),
+}
+
+impl NormalizedCheckState {
+    fn from_check_run(conclusion: Option<String>) -> Self {
+        conclusion.map_or(Self::Unfinished, Self::Finished)
+    }
+
+    fn from_status_context(state: String) -> Self {
+        if state.eq_ignore_ascii_case("PENDING") || state.eq_ignore_ascii_case("EXPECTED") {
+            Self::Unfinished
+        } else {
+            Self::Finished(state)
+        }
+    }
+
+    fn into_conclusion(self) -> Option<String> {
+        match self {
+            Self::Unfinished => None,
+            Self::Finished(conclusion) => Some(conclusion),
+        }
+    }
+}
+
 impl<'de> Deserialize<'de> for CheckRun {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -80,13 +106,18 @@ impl<'de> Deserialize<'de> for CheckRun {
         // An unknown typename rejects the complete rollup, including any earlier known
         // failures. Reporting unavailable checks is preferable to silently calling a
         // known-red pull request clean when the forge adds an unrecognised variant.
-        match CheckRunPayload::deserialize(deserializer)? {
-            CheckRunPayload::CheckRun { name, conclusion } => Ok(Self { name, conclusion }),
-            CheckRunPayload::StatusContext { context, state } => Ok(Self {
-                name: context,
-                conclusion: Some(state),
-            }),
-        }
+        let (name, state) = match CheckRunPayload::deserialize(deserializer)? {
+            CheckRunPayload::CheckRun { name, conclusion } => {
+                (name, NormalizedCheckState::from_check_run(conclusion))
+            }
+            CheckRunPayload::StatusContext { context, state } => {
+                (context, NormalizedCheckState::from_status_context(state))
+            }
+        };
+        Ok(Self {
+            name,
+            conclusion: state.into_conclusion(),
+        })
     }
 }
 
@@ -1697,6 +1728,31 @@ printf '{}'
         assert!(checks.ran(), "the returned check has started");
         assert!(checks.pending(), "a null conclusion is still running");
         assert!(!checks.failing(), "a running check is not failing");
+    }
+
+    #[test]
+    fn pending_legacy_status_contexts_serialize_as_unfinished_check_runs() {
+        let payload = facts_payload(
+            r#""p4909":{"number":4909,"state":"OPEN","headRefName":"feat/running","headRefOid":"aa",
+            "updatedAt":"2026-08-01T00:00:00Z","rollup":{"nodes":[{"commit":{
+            "statusCheckRollup":{"contexts":{"nodes":[
+            {"__typename":"StatusContext","context":"legacy-pending","state":"PENDING"},
+            {"__typename":"StatusContext","context":"legacy-expected","state":"EXPECTED"}
+            ]}}}}]}}"#,
+        );
+
+        let facts = parse_pull_facts(&payload, &[4909]).expect("facts parse");
+
+        let checks = facts[&4909].details.checks.as_ref().expect("consulted");
+        assert!(checks.pending(), "the status contexts are unfinished");
+        assert!(!checks.failing(), "the status contexts are not failing");
+        assert_eq!(
+            serde_json::to_value(checks).expect("checks serialize"),
+            serde_json::json!([
+                {"name":"legacy-pending","conclusion":null},
+                {"name":"legacy-expected","conclusion":null}
+            ])
+        );
     }
 
     #[test]
