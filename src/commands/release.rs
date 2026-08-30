@@ -5,7 +5,7 @@
 //! decided. Planning is the default because everything else here writes: a cut
 //! names a composition, and `include`, `drop`, `advance` and `rebase` change
 //! one. Every one of them writes locally only, and none of them pushes.
-// allow: SIZE_OK: 1795 lines - the release lifecycle's plan, cut, edit, audit, reap, and rebase operations are one domain seam.
+// allow: SIZE_OK: 2298 lines - the release lifecycle's plan, members, cut, edit, audit, reap, and rebase operations are one domain seam.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -622,6 +622,57 @@ fn live_dated_release(tips: &BookmarkTips) -> Option<(BranchName, CommitId)> {
         .map(|(reference, commit)| (reference.branch().clone(), commit.clone()))
 }
 
+/// Detect release names that refer to different trees in our trusted refs.
+pub fn double_cut_findings(
+    repo_path: &Path,
+    tips: &BookmarkTips,
+    scheme: &ReleaseScheme,
+) -> anyhow::Result<(Vec<Finding>, Vec<String>)> {
+    let disagreements = crate::detect::double_cut::same_name_disagreements(tips, scheme);
+    if disagreements.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+
+    let mut findings = Vec::new();
+    let mut notes = Vec::new();
+    for (name, references) in disagreements {
+        let mut commits: BTreeSet<CommitId> =
+            references.into_iter().map(|(_, commit)| commit).collect();
+        let Some(first) = commits.pop_first() else {
+            anyhow::bail!("double-cut disagreement for {name} named no commits");
+        };
+        let mut changed = BTreeSet::new();
+        let mut different = None;
+        for other in commits {
+            let files = jj::changed_files_between(repo_path, first.as_str(), other.as_str())?;
+            if !files.is_empty() && different.is_none() {
+                different = Some(other);
+            }
+            changed.extend(files);
+        }
+        if changed.is_empty() {
+            notes.push(format!(
+                "{name} names two commits with identical trees (a rebuilt cut)"
+            ));
+        } else if let Some(different) = different {
+            let detail = format!(
+                "{name} names both {} and {}, and their trees differ ({} files)",
+                short(&first),
+                short(&different),
+                changed.len()
+            );
+            findings.push(Finding::new(
+                FindingKind::DoubleCut,
+                Subject::Branch(name),
+                detail,
+            ));
+        } else {
+            anyhow::bail!("double-cut disagreement for {name} had no tree comparison");
+        }
+    }
+    Ok((findings, notes))
+}
+
 pub fn plan(name: &RepoName, entry: &RepoEntry, consumers: &[PathBuf]) -> anyhow::Result<Plan> {
     let mut plan = Plan {
         repo: name.to_string(),
@@ -632,6 +683,9 @@ pub fn plan(name: &RepoName, entry: &RepoEntry, consumers: &[PathBuf]) -> anyhow
 
     // The newest release we cut. Historical ones are frozen and not our concern.
     let scheme = entry.release_scheme();
+    let (findings, notes) = double_cut_findings(&entry.path, &tips, &scheme)?;
+    plan.base_findings.extend(findings);
+    plan.notes.extend(notes);
     let publish_remote = entry.publish_remote();
     let newest = newest_release(&tips, &scheme, publish_remote);
 
@@ -755,6 +809,200 @@ fn any_ancestor_of(repo: &Repo, parents: &[ReleaseParent], tip: &CommitId) -> an
 fn short(commit: &CommitId) -> String {
     commit.as_str().chars().take(12).collect()
 }
+
+/// One direct parent of a release, and what still identifies its commit.
+#[derive(Debug, serde::Serialize)]
+pub struct MemberRow {
+    pub commit: CommitId,
+    /// Every bookmark still on the parent, verbatim — a `keep/…` anchor is a
+    /// bookmark like any other and shows up by name.
+    pub held_by: Vec<String>,
+    /// Branches that moved past the parent (`branches_past`), rendered as
+    /// `feat/x advanced to <tip12>`. Empty + empty `held_by` = a bare commit.
+    pub advanced: Vec<String>,
+    /// A trunk-reachable parent is the base of a legacy cut, not a member.
+    pub base_parent: bool,
+}
+
+/// The structural and semantic membership of one release.
+#[derive(Debug, serde::Serialize)]
+pub struct MembersReport {
+    pub repo: String,
+    pub release: String,
+    pub commit: CommitId,
+    /// The repository's own parent list — `git rev-list --parents` semantics
+    /// via jj-lib, never text (the audit's worst instrument error was counting
+    /// `^parent` lines in commit-message prose).
+    pub parent_count: usize,
+    pub members: Vec<MemberRow>,
+    /// `--verify` only: `audit_cut`'s four buckets, reusing the cut path's phrasing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audit: Option<CutAudit>,
+    pub notes: Vec<String>,
+    pub problems: Vec<String>,
+}
+
+/// Gather one parent's current holders, descendants, and trunk relation.
+fn member_row(
+    opened: &Repo,
+    entry: &RepoEntry,
+    parent: ReleaseParent,
+    trunk: Option<&CommitId>,
+) -> anyhow::Result<MemberRow> {
+    let scheme = entry.release_scheme();
+    let advanced = jj::branches_past(&entry.path, &parent.commit)?
+        .into_iter()
+        .filter(|(branch, _)| !is_release_name(branch, &scheme))
+        .map(|(branch, tip)| format!("{branch} advanced to {}", short(&tip)))
+        .collect();
+    let base_parent = trunk.map_or(Ok(false), |trunk| {
+        opened.is_ancestor(&parent.commit, trunk)
+    })?;
+    Ok(MemberRow {
+        commit: parent.commit,
+        held_by: parent.bookmarks.into_iter().map(|bookmark| bookmark.to_string()).collect(),
+        advanced,
+        base_parent,
+    })
+}
+
+/// The label audit buckets use for a member row.
+fn member_label(member: &MemberRow) -> String {
+    let source = member
+        .held_by
+        .first()
+        .map(String::as_str)
+        .or_else(|| {
+            member
+                .advanced
+                .first()
+                .and_then(|advanced| advanced.split_once(" advanced to "))
+                .map(|(branch, _)| branch)
+        });
+    source.map_or_else(
+        || short(&member.commit),
+        |source| format!("{source}@{}", short(&member.commit)),
+    )
+}
+
+/// Gather the parents, holders, and optional content audit for a named release.
+pub fn gather_members(
+    opened: &Repo,
+    entry: &RepoEntry,
+    name: &str,
+    verify: bool,
+) -> anyhow::Result<MembersReport> {
+    let commit = opened.resolve_commit(name)?;
+    let parents = opened.parents_of(commit.as_str())?;
+    let trunk_name = entry.upstream_trunk();
+    let mut problems = Vec::new();
+    let trunk = match opened.resolve_commit(&trunk_name) {
+        Ok(trunk) => Some(trunk),
+        Err(error) => {
+            problems.push(format!("cannot resolve upstream trunk {trunk_name}: {error}"));
+            None
+        }
+    };
+    let members: Vec<MemberRow> = parents
+        .into_iter()
+        .map(|parent| member_row(opened, entry, parent, trunk.as_ref()))
+        .collect::<anyhow::Result<_>>()?;
+    let audit = if verify {
+        trunk.as_ref().map(|trunk| {
+            let members: Vec<(String, CommitId)> = members
+                .iter()
+                .filter(|member| !member.base_parent)
+                .map(|member| (member_label(member), member.commit.clone()))
+                .collect();
+            audit_cut(
+                &entry.path,
+                &members,
+                CutSubject::Committed(&commit),
+                AuditContext {
+                    previous: None,
+                    trunk,
+                },
+            )
+        })
+        .transpose()?
+    } else {
+        None
+    };
+    Ok(MembersReport {
+        repo: entry.path.display().to_string(),
+        release: name.to_owned(),
+        commit,
+        parent_count: members.len(),
+        members,
+        audit,
+        notes: Vec::new(),
+        problems,
+    })
+}
+
+/// Render the gathered parent state and optional audit in the cut command's words.
+pub fn render_members(report: &MembersReport) -> String {
+    let mut lines = vec![format!(
+        "{} @ {} — {} parents",
+        report.release,
+        short(&report.commit),
+        report.parent_count
+    )];
+    for member in &report.members {
+        let mut description = member.held_by.join(", ");
+        if !member.advanced.is_empty() {
+            if !description.is_empty() {
+                description.push_str(", ");
+            }
+            description.push_str(&member.advanced.join(", "));
+        }
+        if description.is_empty() {
+            description.push_str("bare commit — nothing holds it");
+        }
+        if member.base_parent {
+            description.push_str(" (base parent)");
+        }
+        lines.push(format!("- {} {description}", short(&member.commit)));
+    }
+    if let Some(audit) = &report.audit {
+        for name in &audit.carried {
+            lines.push(format!(
+                "  {name}: diverges where the previous release already did \
+                 (a recorded resolution); carried forward"
+            ));
+        }
+        for name in &audit.inconclusive {
+            lines.push(format!(
+                "  {name}: content check inconclusive (replay conflicted; \
+                 re-check after resolving the cut's conflicts)"
+            ));
+        }
+        for member in report.members.iter().filter(|member| !member.base_parent) {
+            let name = member_label(member);
+            if !audit.carried.contains(&name)
+                && !audit.inconclusive.contains(&name)
+                && !audit.missing.contains(&name)
+            {
+                lines.push(format!("  {name}: carried (replay empty)"));
+            }
+        }
+        for name in &audit.missing {
+            lines.push(format!(
+                "  !! {name}: the cut tree is missing or diverges from the member's content"
+            ));
+        }
+        for file in &audit.unexplained {
+            lines.push(format!(
+                "  !! {file}: changed between the previous release and this cut \
+                 with no member or trunk explaining it"
+            ));
+        }
+    }
+    lines.extend(report.notes.iter().map(|note| format!("! {note}")));
+    lines.extend(report.problems.iter().map(|problem| format!("!! {problem}")));
+    lines.join("\n")
+}
+
 
 pub fn render(plan: &Plan) -> String {
     let mut lines: Vec<String> = plan
@@ -1091,7 +1339,7 @@ impl Cut {
 }
 
 /// The post-construction checks that determine whether a cut is safe to name.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, serde::Serialize)]
 pub struct CutAudit {
     pub missing: Vec<String>,
     pub unexplained: Vec<String>,
@@ -1791,5 +2039,260 @@ mod conflict_tests {
         assert!(text.contains("infra/lib/config.py"));
         assert!(text.contains("union"));
         assert!(text.contains("every loader"));
+    }
+}
+
+#[cfg(test)]
+mod members_tests {
+    #![allow(
+        clippy::indexing_slicing,
+        reason = "indexing a result in a test is the assertion; a panic is the failure"
+    )]
+
+    use super::*;
+
+    fn row(commit: &str, held_by: &[&str], advanced: &[&str], base_parent: bool) -> MemberRow {
+        MemberRow {
+            commit: CommitId::new(commit),
+            held_by: held_by.iter().map(ToString::to_string).collect(),
+            advanced: advanced.iter().map(ToString::to_string).collect(),
+            base_parent,
+        }
+    }
+
+    fn report(audit: Option<CutAudit>) -> MembersReport {
+        MembersReport {
+            repo: "demo".to_owned(),
+            release: "release/2026-08-30".to_owned(),
+            commit: CommitId::new("rrrrrrrrrrrrrrrr"),
+            parent_count: 4,
+            members: vec![
+                row("aaaaaaaaaaaaaaaa", &["feat/alpha"], &[], false),
+                row(
+                    "bbbbbbbbbbbbbbbb",
+                    &[],
+                    &["feat/beta advanced to cccccccccccc"],
+                    false,
+                ),
+                row("dddddddddddddddd", &[], &[], false),
+                row("eeeeeeeeeeeeeeee", &["main@upstream"], &[], true),
+            ],
+            audit,
+            notes: Vec::new(),
+            problems: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn members_render_holders_advances_bare_bases_and_audit_buckets() {
+        let audit = CutAudit {
+            carried: vec!["feat/alpha@aaaaaaaaaaaa".to_owned()],
+            missing: vec!["dddddddddddd".to_owned()],
+            unexplained: vec!["Cargo.lock".to_owned()],
+            inconclusive: Vec::new(),
+        };
+
+        assert_eq!(
+            render_members(&report(Some(audit))),
+            concat!(
+                "release/2026-08-30 @ rrrrrrrrrrrr — 4 parents\n",
+                "- aaaaaaaaaaaa feat/alpha\n",
+                "- bbbbbbbbbbbb feat/beta advanced to cccccccccccc\n",
+                "- dddddddddddd bare commit — nothing holds it\n",
+                "- eeeeeeeeeeee main@upstream (base parent)\n",
+                "  feat/alpha@aaaaaaaaaaaa: diverges where the previous release already did (a recorded resolution); carried forward\n",
+                "  feat/beta@bbbbbbbbbbbb: carried (replay empty)\n",
+                "  !! dddddddddddd: the cut tree is missing or diverges from the member's content\n",
+                "  !! Cargo.lock: changed between the previous release and this cut with no member or trunk explaining it"
+            )
+        );
+    }
+
+    #[test]
+    fn members_report_serializes_the_jj_parent_count() {
+        let serialized = serde_json::to_value(report(None)).expect("report serializes");
+
+        assert_eq!(serialized["parent_count"], serde_json::json!(4));
+        assert!(serialized.get("audit").is_none());
+    }
+
+    #[test]
+    fn audit_labels_keep_two_parents_advanced_by_one_branch_distinct() {
+        let report = MembersReport {
+            repo: "demo".to_owned(),
+            release: "release/2026-08-30".to_owned(),
+            commit: CommitId::new("rrrrrrrrrrrrrrrr"),
+            parent_count: 2,
+            members: vec![
+                row(
+                    "aaaaaaaaaaaaaaaa",
+                    &[],
+                    &["feat/shared advanced to ssssssssssss"],
+                    false,
+                ),
+                row(
+                    "bbbbbbbbbbbbbbbb",
+                    &[],
+                    &["feat/shared advanced to ssssssssssss"],
+                    false,
+                ),
+            ],
+            audit: Some(CutAudit {
+                missing: vec!["feat/shared@aaaaaaaaaaaa".to_owned()],
+                unexplained: Vec::new(),
+                inconclusive: Vec::new(),
+                carried: Vec::new(),
+            }),
+            notes: Vec::new(),
+            problems: Vec::new(),
+        };
+
+        let rendered = render_members(&report);
+        assert!(rendered.contains(
+            "!! feat/shared@aaaaaaaaaaaa: the cut tree is missing or diverges from the member's content"
+        ));
+        assert!(rendered.contains("feat/shared@bbbbbbbbbbbb: carried (replay empty)"));
+    }
+
+    #[test]
+    fn members_render_holders_and_advances_together() {
+        let report = MembersReport {
+            repo: "demo".to_owned(),
+            release: "release/2026-08-30".to_owned(),
+            commit: CommitId::new("rrrrrrrrrrrrrrrr"),
+            parent_count: 1,
+            members: vec![row(
+                "aaaaaaaaaaaaaaaa",
+                &["keep/alpha"],
+                &["feat/alpha advanced to bbbbbbbbbbbb"],
+                false,
+            )],
+            audit: None,
+            notes: Vec::new(),
+            problems: Vec::new(),
+        };
+
+        assert!(
+            render_members(&report).contains(
+                "- aaaaaaaaaaaa keep/alpha, feat/alpha advanced to bbbbbbbbbbbb"
+            )
+        );
+    }
+
+    fn run_jj(path: &Path, args: &[&str]) {
+        let output = std::process::Command::new("jj")
+            .current_dir(path)
+            .args(args)
+            .output()
+            .expect("run jj test fixture command");
+        assert!(
+            output.status.success(),
+            "jj {} failed:\nstdout:\n{}\nstderr:\n{}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    #[test]
+    fn member_parent_count_ignores_parent_shaped_commit_message_prose() {
+        let _environment = crate::config::test_support::environment_lock();
+        let directory = tempfile::tempdir().expect("create test repository");
+        let repository = directory.path().join("repo");
+        let repository_text = repository.display().to_string();
+        run_jj(directory.path(), &["git", "init", &repository_text]);
+        run_jj(
+            &repository,
+            &["config", "set", "--repo", "user.name", "knives tests"],
+        );
+        run_jj(
+            &repository,
+            &["config", "set", "--repo", "user.email", "tests@example.invalid"],
+        );
+
+        run_jj(&repository, &["new", "-r", "root()", "-m", "member alpha"]);
+        run_jj(
+            &repository,
+            &["bookmark", "create", "feat/alpha", "-r", "@"],
+        );
+        run_jj(&repository, &["new", "-r", "root()", "-m", "member beta"]);
+        run_jj(
+            &repository,
+            &["bookmark", "create", "feat/beta", "-r", "@"],
+        );
+        run_jj(
+            &repository,
+            &[
+                "new",
+                "-r",
+                "feat/alpha",
+                "-r",
+                "feat/beta",
+                "-m",
+                "release: release/2026-08-30\n\n^parent prose-one\n^parent prose-two\n^parent prose-three",
+            ],
+        );
+        run_jj(
+            &repository,
+            &["bookmark", "create", "release/2026-08-30", "-r", "@"],
+        );
+
+        let entry = RepoEntry {
+            path: repository,
+            upstream: "upstream".to_owned(),
+            origin: "origin".to_owned(),
+            base: None,
+            release: None,
+            release_branch: None,
+            test_count_command: None,
+            consumers: Vec::new(),
+        };
+        let opened = Repo::open(&entry.path).expect("open test repository");
+        let members = gather_members(&opened, &entry, "release/2026-08-30", false)
+            .expect("gather members");
+
+        assert_eq!(members.parent_count, 2);
+    }
+
+    #[test]
+    fn a_release_bookmark_does_not_make_a_bare_parent_advanced() {
+        let _environment = crate::config::test_support::environment_lock();
+        let directory = tempfile::tempdir().expect("create test repository");
+        let repository = directory.path().join("repo");
+        let repository_text = repository.display().to_string();
+        run_jj(directory.path(), &["git", "init", &repository_text]);
+        run_jj(
+            &repository,
+            &["config", "set", "--repo", "user.name", "knives tests"],
+        );
+        run_jj(
+            &repository,
+            &["config", "set", "--repo", "user.email", "tests@example.invalid"],
+        );
+        run_jj(&repository, &["new", "-r", "root()", "-m", "bare parent"]);
+        run_jj(&repository, &["new", "-r", "@", "-m", "release"]);
+        run_jj(
+            &repository,
+            &["bookmark", "create", "release/2026-08-30", "-r", "@"],
+        );
+
+        let entry = RepoEntry {
+            path: repository,
+            upstream: "upstream".to_owned(),
+            origin: "origin".to_owned(),
+            base: None,
+            release: None,
+            release_branch: None,
+            test_count_command: None,
+            consumers: Vec::new(),
+        };
+        let opened = Repo::open(&entry.path).expect("open test repository");
+        let members = gather_members(&opened, &entry, "release/2026-08-30", false)
+            .expect("gather members");
+
+        assert_eq!(members.members.len(), 1);
+        assert!(members.members[0].held_by.is_empty());
+        assert!(members.members[0].advanced.is_empty());
+        assert!(render_members(&members).contains("bare commit — nothing holds it"));
     }
 }

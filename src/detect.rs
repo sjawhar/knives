@@ -7,6 +7,7 @@
 
 pub mod divergence;
 pub mod double_checkout;
+pub mod double_cut;
 pub mod landed;
 pub mod overlap;
 pub mod pull_state;
@@ -24,6 +25,7 @@ pub use stale_parents::{BookmarkTips, ReleaseParent, stale_parents};
 #[serde(rename_all = "kebab-case")]
 pub enum FindingKind {
     DoubleCheckout,
+    DoubleCut,
     StaleParent,
     Divergence,
     StaleReview,
@@ -58,6 +60,7 @@ impl fmt::Display for FindingKind {
             Self::MixedBase => "mixed-base",
             Self::SupersededBase => "superseded-base",
             Self::EmptyDiff => "empty-diff",
+            Self::DoubleCut => "double-cut",
             Self::DeletedHeadRef => "deleted-head-ref",
             Self::EmptyTipCommit => "empty-tip-commit",
         };
@@ -161,6 +164,7 @@ mod tests {
             FindingKind::MixedBase => "mixed-base",
             FindingKind::SupersededBase => "superseded-base",
             FindingKind::EmptyDiff => "empty-diff",
+            FindingKind::DoubleCut => "double-cut",
             FindingKind::DeletedHeadRef => "deleted-head-ref",
             FindingKind::EmptyTipCommit => "empty-tip-commit",
         }
@@ -185,6 +189,7 @@ mod tests {
             FindingKind::MixedBase,
             FindingKind::SupersededBase,
             FindingKind::EmptyDiff,
+            FindingKind::DoubleCut,
             FindingKind::DeletedHeadRef,
             FindingKind::EmptyTipCommit,
         ];

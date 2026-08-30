@@ -8083,6 +8083,33 @@ fn knives_release(lab: &Lab, home: &tempfile::TempDir, args: &[&str]) -> std::pr
         .expect("run knives release")
 }
 
+/// Publish an origin bookmark from the second clone, then fetch it into `work`.
+fn publish_remote_bookmark(lab: &Lab, source: &str, destination: &str) {
+    let run_in_second = |args: &[&str]| {
+        let command = Command::new("jj")
+            .args(args)
+            .current_dir(&lab.second)
+            .output()
+            .expect("run jj in second clone");
+        assert!(
+            command.status.success(),
+            "jj {args:?} failed: {}",
+            String::from_utf8_lossy(&command.stderr)
+        );
+    };
+    run_in_second(&["git", "fetch", "--remote", "origin"]);
+    run_in_second(&["bookmark", "create", destination, "-r", source]);
+    run_in_second(&[
+        "git",
+        "push",
+        "--remote",
+        "origin",
+        "--bookmark",
+        destination,
+    ]);
+    lab.jj_work(["git", "fetch", "--remote", "origin"]);
+}
+
 /// Add a commit to `branch`, leave its bookmark on the new tip, and step off it.
 fn extend_branch(lab: &Lab, branch: &str, file: &str, content: &str) {
     lab.jj_work(["new", branch, "-m", "follow-up"]);
@@ -8439,13 +8466,58 @@ fn release_carries_answers_carried_for_a_member() {
     let cut = knives_release(&lab, &home, &["cut", "release/2026-08-04"]);
     assert!(cut.status.success(), "{cut:?}");
 
-    // When: carries uses the release in hand as its target.
+    // When: carries checks every release target and the upstream trunk.
     let output = knives_release(&lab, &home, &["carries", "feat/alpha"]);
 
-    // Then: replaying alpha onto the release is empty.
+    // Then: the live release says it carries alpha exactly, so the answer is safe.
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success(), "{stdout}");
-    assert!(stdout.contains("is carried in"), "{stdout}");
+    assert!(
+        stdout.contains("carried-exact      release/2026-08-04"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn release_carries_stops_before_superseded_targets_when_live_release_carries() {
+    // Given: alpha is carried in both the previous cut and its live successor,
+    // with the previous cut restored as a historical remote target afterward.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let (home, _consumer) = release_test_home(&lab);
+    let first = knives_release(&lab, &home, &["cut", "release/2026-08-04"]);
+    assert!(first.status.success(), "{first:?}");
+    let historical = commit_at(&lab, "release/2026-08-04");
+    lab.jj_work([
+        "bookmark",
+        "create",
+        "history/alpha-release",
+        "-r",
+        historical.as_str(),
+    ]);
+    lab.push_branch("history/alpha-release");
+    let second = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
+    assert!(second.status.success(), "{second:?}");
+    publish_remote_bookmark(
+        &lab,
+        "history/alpha-release@origin",
+        "release/2026-08-04",
+    );
+
+    // When: carries finds alpha in the live release or trunk census.
+    let output = knives_release(&lab, &home, &["carries", "feat/alpha"]);
+
+    // Then: that safe answer does not probe or print stale release targets.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}");
+    assert!(
+        stdout.contains("carried-exact      release/2026-08-05"),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("release/2026-08-04"),
+        "safe results must not include superseded probes: {stdout}"
+    );
 }
 
 #[test]
@@ -8458,30 +8530,168 @@ fn release_carries_answers_not_carried_for_outside_work() {
     assert!(cut.status.success(), "{cut:?}");
     lab.branch("feat/beta", "beta.txt", "beta\n");
 
-    // When: beta is replayed onto the release in hand.
+    // When: beta is checked against every release target and the trunk.
     let output = knives_release(&lab, &home, &["carries", "feat/beta"]);
 
-    // Then: the real diff that remains is reported as not carried.
+    // Then: no safe target carries it, so the answer names the real remaining diff.
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_eq!(output.status.code(), Some(1), "{stdout}");
-    assert!(stdout.contains("is NOT carried in"), "{stdout}");
+    assert!(stdout.contains("NOT carried"), "{stdout}");
 }
 
 #[test]
-fn release_carries_refuses_without_a_release_or_target() {
+fn release_carries_in_checks_only_the_requested_target() {
+    // Given: alpha is in the release but absent from the upstream trunk.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let (home, _consumer) = release_test_home(&lab);
+    let cut = knives_release(&lab, &home, &["cut", "release/2026-08-04"]);
+    assert!(cut.status.success(), "{cut:?}");
+
+    // When: the explicit target is the upstream trunk.
+    let output = knives_release(
+        &lab,
+        &home,
+        &["carries", "feat/alpha", "--in", "main@upstream"],
+    );
+
+    // Then: the live release cannot make a single-target trunk query safe.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert!(
+        stdout.contains("NOT carried        main@upstream"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("release/2026-08-04"), "{stdout}");
+}
+
+#[test]
+fn release_carries_answers_against_the_trunk_when_no_release_exists() {
     // Given: a branch but no release in hand.
     let lab = Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     let (home, _consumer) = release_test_home(&lab);
 
-    // When: carries has no explicit target to use instead.
+    // When: carries has no explicit target.
     let output = knives_release(&lab, &home, &["carries", "feat/alpha"]);
 
-    // Then: it refuses rather than guessing a target.
+    // Then: the orphan question is answered against the upstream trunk.
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert_eq!(output.status.code(), Some(3), "{stdout}");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert!(stdout.contains("main@upstream"), "{stdout}");
+    assert!(stdout.contains("NOT carried"), "{stdout}");
+}
+
+#[test]
+fn release_carries_reports_carried_rewritten_for_a_squash_landed_branch() {
+    // Given: alpha is squash-landed, so the trunk has its content but not its tip.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.publish_pull("feat/alpha", 7);
+    lab.squash_merge_pull(7, None);
+    let alpha = commit_at(&lab, "feat/alpha");
+    let trunk = commit_at(&lab, "main@upstream");
     assert!(
-        stdout.contains("no release to check against; cut one or pass --in <ref>"),
+        !Repo::open(&lab.work)
+            .expect("open after squash merge")
+            .is_ancestor(&alpha, &trunk)
+            .expect("ancestry answerable"),
+        "fixture must use a rewritten trunk commit"
+    );
+    let (home, _consumer) = release_test_home(&lab);
+
+    // When: alpha is checked without any release.
+    let output = knives_release(&lab, &home, &["carries", "feat/alpha"]);
+
+    // Then: the trunk's tree-content evidence proves its rewritten carriage.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}");
+    assert!(
+        stdout.contains("carried-rewritten  main@upstream"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(&trunk.as_str().chars().take(12).collect::<String>()),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn carries_superseded_only_carriage_is_findings() {
+    // Given: a published cut carrying alpha survives at origin after the local
+    // release drops it and the next cut becomes live.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let (home, _consumer) = release_test_home(&lab);
+    let first = knives_release(&lab, &home, &["cut", "release/2026-08-04"]);
+    assert!(first.status.success(), "{first:?}");
+    let original = commit_at(&lab, "release/2026-08-04");
+    lab.jj_work([
+        "bookmark",
+        "create",
+        "history/alpha-release",
+        "-r",
+        original.as_str(),
+    ]);
+    lab.push_branch("history/alpha-release");
+    let dropped = knives_release(
+        &lab,
+        &home,
+        &["drop", "feat/alpha", "--why", "superseded release preserves it"],
+    );
+    assert!(dropped.status.success(), "{dropped:?}");
+    let second = knives_release(
+        &lab,
+        &home,
+        &["cut", "release/2026-08-05", "--allow-drop"],
+    );
+    assert!(second.status.success(), "{second:?}");
+
+    // Publish the preserved historical commit under its release name only after
+    // the successor cut has passed the duplicate-release gate.
+    let run_in_second = |args: &[&str]| {
+        let command = Command::new("jj")
+            .args(args)
+            .current_dir(&lab.second)
+            .output()
+            .expect("run jj in second clone");
+        assert!(
+            command.status.success(),
+            "jj {args:?} failed: {}",
+            String::from_utf8_lossy(&command.stderr)
+        );
+    };
+    run_in_second(&["git", "fetch", "--remote", "origin"]);
+    run_in_second(&[
+        "bookmark",
+        "create",
+        "release/2026-08-04",
+        "-r",
+        "history/alpha-release@origin",
+    ]);
+    run_in_second(&[
+        "git",
+        "push",
+        "--remote",
+        "origin",
+        "--bookmark",
+        "release/2026-08-04",
+    ]);
+    lab.jj_work(["git", "fetch", "--remote", "origin"]);
+
+    // When: bare carries finds alpha only in the historical remote cut.
+    let output = knives_release(&lab, &home, &["carries", "feat/alpha"]);
+
+    // Then: the historical row is visible, but it cannot make the result safe.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert!(
+        stdout.contains("carried-exact      release/2026-08-04@origin"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("NOT carried        release/2026-08-05"),
         "{stdout}"
     );
 }

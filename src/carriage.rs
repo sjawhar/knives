@@ -2,19 +2,21 @@
 //!
 //! The audit's worst near-miss class was a branch deleted while its content
 //! was uncarried. The verdicts here are content-based only: sha ancestry for
-//! carried-exact, an empty replay for carried-rewritten (jj divergent
+//! carried-exact, a three-way tree merge for carried-rewritten (jj divergent
 //! change-ids force tree comparison — the same change id can name two
-//! different trees), a real replay diff for not-carried. Every verdict names
-//! an evidence commit a notch can cite and a later reader can re-resolve.
+//! different trees), and merge conflicts for human judgment. A net-zero
+//! revision is vacuously carried: it contributes no content for the target to
+//! lack. Every verdict names an evidence commit a notch can cite and a later
+//! reader can re-resolve.
 
 use std::collections::BTreeMap;
 use std::path::Path;
 
 use crate::detect::{BookmarkTips, RebaseOutcome};
 use crate::ids::{
-    BookmarkRef, BranchName, CommitId, ReleaseScheme, is_our_release, strict_dated_release,
+    BookmarkRef, CommitId, ReleaseScheme, is_our_release, strict_dated_release,
 };
-use crate::jj::{Repo, probe_landed};
+use crate::jj::Repo;
 
 /// What a revision is checked against.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -42,8 +44,8 @@ pub enum TargetRole {
 pub enum CarryVerdict {
     /// The revision's tip is an ancestor of the target: carried as-is.
     CarriedExact,
-    /// Replaying the revision onto the target leaves nothing: same content,
-    /// different commits.
+    /// Its net tree change leaves the target unchanged, whether the same content
+    /// arrived through different commits or the revision itself has no net content.
     CarriedRewritten,
     NotCarried,
     /// The replay conflicted while the target itself is clean: some content
@@ -64,6 +66,71 @@ impl CarryVerdict {
 pub struct CarryCheck {
     pub verdict: CarryVerdict,
     pub evidence: CommitId,
+}
+/// One target's carriage verdict, including how it was classified for exit
+/// semantics and the commit that establishes the verdict.
+#[derive(Debug, serde::Serialize)]
+pub struct TargetCheck {
+    /// Ref names, `/`-joined for display; a requested revision when no ref names it.
+    pub target: String,
+    pub commit: CommitId,
+    pub role: TargetRole,
+    pub verdict: CarryVerdict,
+    pub evidence: CommitId,
+}
+
+/// The complete answer to a `release carries` query.
+#[derive(Debug, serde::Serialize)]
+pub struct CarriesReport {
+    pub repo: String,
+    pub revision: String,
+    pub checks: Vec<TargetCheck>,
+    pub notes: Vec<String>,
+    pub problems: Vec<String>,
+}
+
+/// Render the human-readable form of a multi-target carriage report.
+pub fn render_carries(report: &CarriesReport) -> String {
+    let mut lines = vec![format!("{}: {}", report.repo, report.revision)];
+    for check in &report.checks {
+        let verdict = match check.verdict {
+            CarryVerdict::CarriedExact => "carried-exact",
+            CarryVerdict::CarriedRewritten => "carried-rewritten",
+            CarryVerdict::NotCarried => "NOT carried",
+            CarryVerdict::Conflicted => "conflicted",
+        };
+        let reason = match check.verdict {
+            CarryVerdict::CarriedExact => "tip is an ancestor",
+            CarryVerdict::CarriedRewritten => "no net content remains",
+            CarryVerdict::NotCarried => "replay leaves real diffs",
+            CarryVerdict::Conflicted => "judge by eye",
+        };
+        let target = if check.target.is_empty() {
+            match check.role {
+                TargetRole::UpstreamTrunk => "upstream trunk",
+                TargetRole::LiveRelease | TargetRole::SupersededRelease => "unnamed release",
+            }
+        } else {
+            check.target.as_str()
+        };
+        lines.push(format!(
+            "  {verdict:<19}{target} @ {}  (evidence {}: {reason})",
+            short(&check.commit),
+            short(&check.evidence),
+        ));
+    }
+    lines.extend(report.notes.iter().map(|note| format!("  note: {note}")));
+    lines.extend(
+        report
+            .problems
+            .iter()
+            .map(|problem| format!("  unanswered: {problem}")),
+    );
+    lines.join("\n")
+}
+
+fn short(commit: &CommitId) -> String {
+    commit.as_str().chars().take(12).collect()
 }
 
 /// Every check target for this repository: each distinct commit named by our
@@ -177,11 +244,7 @@ pub fn check(input: &CheckInput<'_>, target: &Target) -> anyhow::Result<CarryChe
         });
     }
 
-    let verdict = match probe_landed(
-        input.repo_path,
-        &BranchName::new(input.revision),
-        target.commit.as_str(),
-    )? {
+    let verdict = match input.repo.tree_replay_outcome(input.tip, &target.commit)? {
         RebaseOutcome::Empty => CarryVerdict::CarriedRewritten,
         RebaseOutcome::CleanNonEmpty => CarryVerdict::NotCarried,
         RebaseOutcome::Conflicted => CarryVerdict::Conflicted,

@@ -10,6 +10,8 @@ use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
 use jj_lib::local_working_copy::LocalWorkingCopy;
 use jj_lib::matchers::EverythingMatcher;
 use jj_lib::object_id::ObjectId as _;
+use jj_lib::merge::Merge;
+use jj_lib::merged_tree::MergedTree;
 use jj_lib::op_store::{RefTarget, RemoteRef};
 use jj_lib::ref_name::{RefName as JjRefName, RemoteName as JjRemoteName};
 use jj_lib::repo::{MutableRepo, ReadonlyRepo, Repo as _, RepoLoader, StoreFactories};
@@ -298,6 +300,39 @@ impl Repo {
         let ancestor = self.commit(ancestor.as_str())?;
         let descendant = self.commit(descendant.as_str())?;
         self.backend_is_ancestor(ancestor.id(), descendant.id())
+    }
+
+    /// Compares a revision's net tree change with a target in one three-way
+    /// merge. Unlike a per-commit rebase, this correctly recognizes a squashed
+    /// series and a branch whose additions are later reverted.
+    pub fn tree_replay_outcome(
+        &self,
+        revision: &CommitId,
+        target: &CommitId,
+    ) -> Result<RebaseOutcome, JjError> {
+        let base = self
+            .common_ancestor(std::slice::from_ref(revision), target)?
+            .ok_or_else(|| JjError::Revision {
+                revision: revision.as_str().to_owned(),
+                detail: format!("no unique common ancestor with {}", target.as_str()),
+            })?;
+        let base = self.commit(base.as_str())?;
+        let target = self.commit(target.as_str())?;
+        let revision = self.commit(revision.as_str())?;
+        let merged = block_on(MergedTree::merge(Merge::from_vec(vec![
+            (target.tree(), "target".to_owned()),
+            (base.tree(), "base".to_owned()),
+            (revision.tree(), "revision".to_owned()),
+        ])))
+        .map_err(|error| store_error(&error))?;
+
+        Ok(if merged.has_conflict() {
+            RebaseOutcome::Conflicted
+        } else if merged.tree_ids() == target.tree_ids() {
+            RebaseOutcome::Empty
+        } else {
+            RebaseOutcome::CleanNonEmpty
+        })
     }
 
     /// [`Self::is_ancestor`] by backend id, saving the hex round-trip.

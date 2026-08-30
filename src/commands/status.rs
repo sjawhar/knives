@@ -597,6 +597,10 @@ fn add_releases(
     )?;
     report.releases = names;
     report.findings.extend(findings);
+    let (double_cut_findings, double_cut_notes) =
+        crate::commands::release::double_cut_findings(&entry.path, tips, &entry.release_scheme())?;
+    report.findings.extend(double_cut_findings);
+    report.notes.extend(double_cut_notes);
     if skipped > 0 {
         report
             .notes
