@@ -86,7 +86,7 @@ fn one_batch_answers_review_age_and_checks_for_every_branch_at_once() {
                 ChecksSummary {
                     runs: vec![knives::forge::CheckRun {
                         name: "build".to_owned(),
-                        conclusion: "FAILURE".to_owned(),
+                        conclusion: Some("FAILURE".to_owned()),
                     }],
                 },
             ),
@@ -370,7 +370,7 @@ fn a_failed_facts_batch_clears_review_and_check_cells() {
             ChecksSummary {
                 runs: vec![knives::forge::CheckRun {
                     name: "build".to_owned(),
-                    conclusion: "FAILURE".to_owned(),
+                    conclusion: Some("FAILURE".to_owned()),
                 }],
             },
         )]),

@@ -48,9 +48,10 @@ pub const fn summary_fields() -> &'static str {
 pub struct CheckRun {
     #[serde(default)]
     pub name: String,
-    /// `SUCCESS`, `FAILURE`, `SKIPPED`, `CANCELLED`, or empty while still running.
+    /// `None` while still running; otherwise `SUCCESS`, `FAILURE`, `SKIPPED`, or
+    /// `CANCELLED`.
     #[serde(default)]
-    pub conclusion: String,
+    pub conclusion: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -60,7 +61,7 @@ enum CheckRunPayload {
         #[serde(default)]
         name: String,
         #[serde(default)]
-        conclusion: String,
+        conclusion: Option<String>,
     },
     StatusContext {
         #[serde(default)]
@@ -82,7 +83,7 @@ impl<'de> Deserialize<'de> for CheckRun {
             CheckRunPayload::CheckRun { name, conclusion } => Ok(Self { name, conclusion }),
             CheckRunPayload::StatusContext { context, state } => Ok(Self {
                 name: context,
-                conclusion: state,
+                conclusion: Some(state),
             }),
         }
     }
@@ -103,12 +104,14 @@ impl ChecksSummary {
         self.runs
             .iter()
             .filter(|run| {
-                run.conclusion.eq_ignore_ascii_case("FAILURE")
-                    || run.conclusion.eq_ignore_ascii_case("TIMED_OUT")
-                    || run.conclusion.eq_ignore_ascii_case("CANCELLED")
-                    || run.conclusion.eq_ignore_ascii_case("STARTUP_FAILURE")
-                    || run.conclusion.eq_ignore_ascii_case("ACTION_REQUIRED")
-                    || run.conclusion.eq_ignore_ascii_case("ERROR")
+                run.conclusion.as_deref().is_some_and(|conclusion| {
+                    conclusion.eq_ignore_ascii_case("FAILURE")
+                        || conclusion.eq_ignore_ascii_case("TIMED_OUT")
+                        || conclusion.eq_ignore_ascii_case("CANCELLED")
+                        || conclusion.eq_ignore_ascii_case("STARTUP_FAILURE")
+                        || conclusion.eq_ignore_ascii_case("ACTION_REQUIRED")
+                        || conclusion.eq_ignore_ascii_case("ERROR")
+                })
             })
             .map(|run| run.name.clone())
             .collect()
@@ -116,6 +119,11 @@ impl ChecksSummary {
 
     pub fn failing(&self) -> bool {
         !self.failed_names().is_empty()
+    }
+
+    /// Whether any returned check has not completed.
+    pub fn pending(&self) -> bool {
+        self.runs.iter().any(|run| run.conclusion.is_none())
     }
 
     /// Whether the forge ran anything at all. Nothing having run is not a failure.
@@ -470,6 +478,19 @@ pub trait Forge: Send + Sync {
 /// Backed by the hosting service's command line tool.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct CliForge;
+/// Medians from three real ~30-number `inspect_ai` trials on the ai fork
+/// (2026-08-30):
+///
+/// | Chunk size | Median |
+/// | ---: | ---: |
+/// | 40 | 4.018s |
+/// | 15 | 2.857s |
+/// | 10 | 2.010s |
+/// | 8 | 1.879s |
+///
+/// Eight was the fastest configuration.
+const FACTS_BATCH_CHUNK_SIZE: usize = 8;
+
 
 impl CliForge {
     fn run(repo: &Path, args: &[&str]) -> Result<String, ForgeError> {
@@ -583,7 +604,7 @@ impl Forge for CliForge {
 
         std::thread::scope(|scope| {
             let chunks = numbers
-                .chunks(40)
+                .chunks(FACTS_BATCH_CHUNK_SIZE)
                 .map(|chunk| {
                     let owner = &owner;
                     let name = &name;
@@ -1489,6 +1510,23 @@ mod tests {
     }
 
     #[test]
+    fn a_null_check_run_conclusion_is_pending_in_facts() {
+        let payload = facts_payload(
+            r#""p4908":{"number":4908,"state":"OPEN","headRefName":"feat/running","headRefOid":"aa",
+            "updatedAt":"2026-08-01T00:00:00Z","rollup":{"nodes":[{"commit":{
+            "statusCheckRollup":{"contexts":{"nodes":[{"__typename":"CheckRun",
+            "name":"live-build","conclusion":null}]}}}}]}}"#,
+        );
+
+        let facts = parse_pull_facts(&payload, &[4908]).expect("facts parse");
+
+        let checks = facts[&4908].details.checks.as_ref().expect("consulted");
+        assert!(checks.ran(), "the returned check has started");
+        assert!(checks.pending(), "a null conclusion is still running");
+        assert!(!checks.failing(), "a running check is not failing");
+    }
+
+    #[test]
     fn an_error_status_context_is_failing_in_facts() {
         let payload = facts_payload(
             r#""p11":{"number":11,"state":"OPEN","headRefName":"feat/a","headRefOid":"aa",
@@ -1691,6 +1729,17 @@ mod tests {
         assert!(!summary_fields().contains("mergeable"));
         assert!(!summary_fields().contains("mergeStateStatus"));
     }
+    #[test]
+    fn facts_batches_30_numbers_into_four_bounded_queries() {
+        let numbers: Vec<u64> = (1..=30).collect();
+        let sizes: Vec<usize> = numbers
+            .chunks(FACTS_BATCH_CHUNK_SIZE)
+            .map(<[u64]>::len)
+            .collect();
+
+        assert_eq!(sizes, [8, 8, 8, 6]);
+    }
+
 
     #[test]
     fn live_queries_request_the_required_fact_and_sweep_shapes() {

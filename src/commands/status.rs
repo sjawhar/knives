@@ -204,23 +204,54 @@ pub struct Options<'a> {
 /// findings are grouped.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Timings {
+    /// Opening the repository and reading its bookmark tips.
+    pub repository: std::time::Duration,
+    /// Opening the independent health handle and gathering stale-copy, workspace,
+    /// divergent-change, and conflicted-bookmark findings.
+    pub health: std::time::Duration,
+    /// Detecting visible changes that exist as multiple commits.
+    pub divergent_changes: std::time::Duration,
     /// Scanning releases for stale parents.
     pub releases: std::time::Duration,
+    /// Preparing maintained branches, references, claims, and forge inputs.
+    pub setup: std::time::Duration,
     /// Forge identity, discovery sweep or reseed, live facts batch, and every stated-pull and
     /// dependency lookup. Forge and probes overlap, so `total` is wall time rather than a sum.
     pub forge: std::time::Duration,
     /// Replaying branches onto the upstream trunk.
     pub probes: std::time::Duration,
+    /// Comparing each local branch tip to its origin counterpart.
+    pub origin_relations: std::time::Duration,
+    /// Constructing rows for conflicted local bookmarks.
+    pub divergent_rows: std::time::Duration,
+    /// Finding branches carried by another branch.
+    pub carried_findings: std::time::Duration,
+    /// Comparing each maintained branch's changed paths for overlap.
+    pub touching: std::time::Duration,
+    /// Loading claims, workspaces, and claim overlap findings.
+    pub claims: std::time::Duration,
+    /// Final local finding folds and forge-cache persistence.
+    pub report: std::time::Duration,
     pub total: std::time::Duration,
 }
 
 impl Timings {
     pub fn line(&self, repo: &str) -> String {
         format!(
-            "timing {repo}: releases {}ms forge {}ms probes {}ms total {}ms",
+            "timing {repo}: repository-open {}ms health {}ms divergent-changes {}ms releases {}ms setup {}ms forge {}ms probes {}ms origin-relations {}ms divergent-rows {}ms carried-findings {}ms touching {}ms claims {}ms report {}ms total {}ms",
+            self.repository.as_millis(),
+            self.health.as_millis(),
+            self.divergent_changes.as_millis(),
             self.releases.as_millis(),
+            self.setup.as_millis(),
             self.forge.as_millis(),
             self.probes.as_millis(),
+            self.origin_relations.as_millis(),
+            self.divergent_rows.as_millis(),
+            self.carried_findings.as_millis(),
+            self.touching.as_millis(),
+            self.claims.as_millis(),
+            self.report.as_millis(),
             self.total.as_millis()
         )
     }
@@ -1125,10 +1156,68 @@ pub fn relation_to_origin(
     }
 }
 
-fn record_origin_relation(
+struct OriginPhase {
+    relations: Vec<Result<Option<OriginRelation>, String>>,
+}
+
+/// Relations to origin, queried concurrently with one jj-lib handle per worker.
+///
+/// Loaded repository handles are not assumed `Sync`. Each worker opens its own
+/// handle, handles its chunk in order, and the join order restores branch order
+/// before a result reaches the report.
+fn origin_phase(
+    path: &std::path::Path,
+    inputs: &[ProbeInput],
+    workers: usize,
+) -> OriginPhase {
+    if inputs.is_empty() {
+        return OriginPhase {
+            relations: Vec::new(),
+        };
+    }
+    let workers = workers.clamp(1, inputs.len());
+    let chunk = inputs.len().div_ceil(workers);
+    let relations = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(workers);
+        for slice in inputs.chunks(chunk) {
+            handles.push((
+                slice,
+                scope.spawn(move || match Repo::open(path) {
+                    Ok(repo) => slice
+                        .iter()
+                        .map(|(_, tip, origin_tip)| {
+                            relation_to_origin(&repo, tip, origin_tip.as_ref())
+                                .map_err(|error| error.to_string())
+                        })
+                        .collect::<Vec<Result<Option<OriginRelation>, String>>>(),
+                    Err(error) => {
+                        let error = error.to_string();
+                        slice
+                            .iter()
+                            .map(|_| Err(error.clone()))
+                            .collect::<Vec<Result<Option<OriginRelation>, String>>>()
+                    }
+                }),
+            ));
+        }
+        handles
+            .into_iter()
+            .flat_map(|(slice, handle)| match handle.join() {
+                Ok(relations) => relations,
+                Err(_) => slice
+                    .iter()
+                    .map(|_| Err("origin relation task panicked".to_owned()))
+                    .collect(),
+            })
+            .collect()
+    });
+    OriginPhase { relations }
+}
+
+fn record_origin_relation<E: fmt::Display>(
     report: &mut Report,
     branch: &BranchName,
-    relation: Result<Option<OriginRelation>, JjError>,
+    relation: Result<Option<OriginRelation>, E>,
 ) -> Option<OriginRelation> {
     match relation {
         Ok(relation) => relation,
@@ -1146,7 +1235,7 @@ fn record_repository_health(
     repo: &Repo,
     path: &std::path::Path,
     tips: &BookmarkTips,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<std::time::Duration> {
     // Recorded before conclusions from this repository: detectors replay commits, so a stale
     // working copy can invalidate their answers.
     if let Some(stale) = repo.stale_working_copy(path) {
@@ -1158,11 +1247,41 @@ fn record_repository_health(
             .into_iter()
             .map(|(reference, _)| reference)
             .collect();
-    report
-        .findings
-        .extend(divergent_changes(&repo.divergent_changes(&ignored)?));
+    let phase = std::time::Instant::now();
+    let changes = repo.divergent_changes(&ignored)?;
+    let duration = phase.elapsed();
+    report.findings.extend(divergent_changes(&changes));
     report.findings.extend(conflicted_bookmark_findings(repo)?);
-    Ok(())
+    Ok(duration)
+}
+
+/// Repository-wide health facts prepared on an independent jj-lib handle.
+///
+/// The status rows use their own handle below. Keeping this result separate
+/// lets its expensive divergent-change scan overlap forge discovery while the
+/// report still prefixes its findings and problems exactly as before.
+struct RepositoryHealth {
+    findings: Vec<Finding>,
+    problems: Vec<String>,
+    health: std::time::Duration,
+    divergent_changes: std::time::Duration,
+}
+
+fn repository_health(
+    path: &std::path::Path,
+    tips: &BookmarkTips,
+) -> anyhow::Result<RepositoryHealth> {
+    let phase = std::time::Instant::now();
+    let repo = Repo::open(path)?;
+    let mut report = Report::default();
+    let divergent_changes = record_repository_health(&mut report, &repo, path, tips)?;
+    let health = phase.elapsed();
+    Ok(RepositoryHealth {
+        findings: report.findings,
+        problems: report.problems,
+        health,
+        divergent_changes,
+    })
 }
 
 /// Reports branches carried by another branch, excluding the configured trunk.
@@ -1196,26 +1315,81 @@ fn carried_findings(
     Ok(findings)
 }
 
-fn add_branch_overlap_findings(report: &mut Report, entry: &RepoEntry) {
+/// Compare branch paths concurrently, preserving the report's branch order.
+///
+/// `changed_files_between` invokes jj's porcelain because it normalizes paths.
+/// It does not mutate the checkout, so each worker can independently query its
+/// contiguous branch chunk and report the serial implementation's findings in
+/// exactly the same order.
+fn add_branch_overlap_findings(
+    report: &mut Report,
+    entry: &RepoEntry,
+    workers: usize,
+) -> std::time::Duration {
+    let started = std::time::Instant::now();
+    let rows = &report.branches;
+    let upstream_trunk = entry.upstream_trunk();
+    let path = &entry.path;
+    let outcomes: Vec<(String, Option<Result<Vec<String>, String>>)> = if rows.is_empty() {
+        Vec::new()
+    } else {
+        let workers = workers.clamp(1, rows.len());
+        let chunk = rows.len().div_ceil(workers);
+        let upstream_trunk = upstream_trunk.as_str();
+        std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(workers);
+            for slice in rows.chunks(chunk) {
+                handles.push((
+                    slice,
+                    scope.spawn(move || {
+                        slice
+                            .iter()
+                            .map(|row| {
+                                let files = row.tip.as_ref().map(|_| {
+                                    let from =
+                                        format!("fork_point({upstream_trunk} | {})", row.name);
+                                    crate::jj::changed_files_between(
+                                        path,
+                                        &from,
+                                        row.name.as_str(),
+                                    )
+                                    .map_err(|error| error.to_string())
+                                });
+                                (row.name.to_string(), files)
+                            })
+                            .collect::<Vec<_>>()
+                    }),
+                ));
+            }
+            handles
+                .into_iter()
+                .flat_map(|(slice, handle)| match handle.join() {
+                    Ok(outcomes) => outcomes,
+                    Err(_) => slice
+                        .iter()
+                        .map(|row| {
+                            (
+                                row.name.to_string(),
+                                Some(Err("path comparison task panicked".to_owned())),
+                            )
+                        })
+                        .collect(),
+                })
+                .collect()
+        })
+    };
     let mut touching: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut notes = Vec::new();
     let mut unanswered = Vec::new();
-    for row in &report.branches {
-        if row.tip.is_none() {
-            notes.push(format!(
-                "cannot compare paths for {}: it has no single tip",
-                row.name
-            ));
-            continue;
-        }
-        let from = format!("fork_point({} | {})", entry.upstream_trunk(), row.name);
-        match crate::jj::changed_files_between(&entry.path, &from, row.name.as_str()) {
-            Ok(files) => {
-                let _ = touching.insert(row.name.to_string(), files);
+    for (branch, files) in outcomes {
+        match files {
+            Some(Ok(files)) => {
+                let _ = touching.insert(branch, files);
             }
-            Err(error) => {
-                unanswered.push(format!("cannot compare paths for {}: {error}", row.name));
+            Some(Err(error)) => {
+                unanswered.push(format!("cannot compare paths for {branch}: {error}"));
             }
+            None => notes.push(format!("cannot compare paths for {branch}: it has no single tip")),
         }
     }
     report.notes.extend(notes);
@@ -1223,12 +1397,12 @@ fn add_branch_overlap_findings(report: &mut Report, entry: &RepoEntry) {
     report
         .findings
         .extend(crate::detect::overlap::branch_overlaps(&touching));
+    started.elapsed()
 }
 
 /// Everything the maintained-branch row loop needs after the two concurrent phases end.
 struct RowInput<'a, 'snapshot> {
     name: &'a RepoName,
-    repo: &'a Repo,
     store: &'a Store,
     probe_inputs: Vec<ProbeInput>,
     index: &'a PullIndex,
@@ -1240,10 +1414,15 @@ struct RowInput<'a, 'snapshot> {
 fn branch_rows(
     input: RowInput<'_, '_>,
     verdicts: Vec<Result<Option<LandedVerdict>, JjError>>,
+    origin_relations: Vec<Result<Option<OriginRelation>, String>>,
     report: &mut Report,
 ) -> anyhow::Result<Vec<String>> {
     let mut unjudged = Vec::new();
-    for (verdict, (branch, tip, origin_tip)) in verdicts.into_iter().zip(input.probe_inputs) {
+    for ((verdict, (branch, tip, origin_tip)), relation) in verdicts
+        .into_iter()
+        .zip(input.probe_inputs)
+        .zip(origin_relations)
+    {
         // Propagated in branch order, so a probe failure reports the same branch
         // and the same message it did when probes ran one at a time.
         let landed = verdict?;
@@ -1265,11 +1444,7 @@ fn branch_rows(
                 )
             },
         );
-        let origin_relation = record_origin_relation(
-            report,
-            &branch,
-            relation_to_origin(input.repo, &tip, origin_tip.as_ref()),
-        );
+        let origin_relation = record_origin_relation(report, &branch, relation);
         let target = BranchTarget::new(input.name.clone(), branch.clone());
         let last_notch = newest_for(input.notches, branch.as_str()).map(LastNotch::of);
         report.branches.push(BranchRow {
@@ -1388,10 +1563,11 @@ fn fold_phase_outcome(
     timings.forge = phases.forge.duration;
     timings.probes = phases.probe.duration;
 
+    let phase = std::time::Instant::now();
+    let origin_phase = origin_phase(&input.entry.path, &input.probe_inputs, input.options.workers);
     let unjudged = branch_rows(
         RowInput {
             name: input.name,
-            repo: input.repo,
             store: input.store,
             probe_inputs: input.probe_inputs,
             index: &phases.forge.index,
@@ -1399,8 +1575,12 @@ fn fold_phase_outcome(
             notches: input.notches,
         },
         std::mem::take(&mut phases.probe.verdicts),
+        origin_phase.relations,
         report,
     )?;
+    timings.origin_relations = phase.elapsed();
+
+    let phase = std::time::Instant::now();
     report.branches.extend(divergent_rows(&DivergentInput {
         branches: input.divergent_branches,
         tips: input.tips,
@@ -1413,15 +1593,25 @@ fn fold_phase_outcome(
     report
         .branches
         .sort_by(|left, right| left.name.cmp(&right.name));
+    timings.divergent_rows = phase.elapsed();
+
+    let phase = std::time::Instant::now();
     report.findings.extend(carried_findings(
         report,
         input.repo,
         input.entry.trunk(),
         &input.entry.release_scheme(),
     )?);
-    add_branch_overlap_findings(report, input.entry);
-    add_claims(report, input.repo, input.name, input.store);
+    timings.carried_findings = phase.elapsed();
 
+    timings.touching =
+        add_branch_overlap_findings(report, input.entry, input.options.workers);
+
+    let phase = std::time::Instant::now();
+    add_claims(report, input.repo, input.name, input.store);
+    timings.claims = phase.elapsed();
+
+    let phase = std::time::Instant::now();
     report.findings.extend(branch_findings(&report.branches));
     report.findings.extend(wrong_base_findings(
         &report.branches,
@@ -1446,6 +1636,7 @@ fn fold_phase_outcome(
                 .push(format!("forge cache not saved: {error}"));
         }
     }
+    timings.report = phase.elapsed();
     Ok(())
 }
 
@@ -1461,17 +1652,19 @@ pub fn gather_timed(
 ) -> anyhow::Result<(Report, Timings)> {
     let started = std::time::Instant::now();
     let mut timings = Timings::default();
+    let phase = std::time::Instant::now();
     let repo = Repo::open(&entry.path)?;
     let mut report = Report {
         repo: name.to_string(),
         ..Report::default()
     };
     let tips = repo.bookmark_tips()?;
-    record_repository_health(&mut report, &repo, &entry.path, &tips)?;
+    timings.repository = phase.elapsed();
     let phase = std::time::Instant::now();
     add_releases(&mut report, &repo, &tips, entry)?;
     timings.releases = phase.elapsed();
 
+    let phase = std::time::Instant::now();
     let (branches, fetched_heads) =
         maintained_branches(&tips, entry.trunk(), &entry.release_scheme());
     let divergent_branches = divergent_branch_names(&repo, entry)?;
@@ -1485,6 +1678,7 @@ pub fn gather_timed(
     let notches = notches_from_ledger(options.ledger, &mut report);
     report.repo_notches = repo_notches(&notches);
     note_fetched_heads(&mut report, fetched_heads);
+    timings.setup = phase.elapsed();
 
     let forge_started = std::time::Instant::now();
     let opened = match open_forge_snapshot(options.forge, entry, options.cache) {
@@ -1499,16 +1693,27 @@ pub fn gather_timed(
     let opened_ref = opened.as_ref();
     let trunk_commit = repo.resolve_commit(&entry.upstream_trunk()).ok();
     let probe_ran = options.probe && trunk_commit.is_some();
-    let mut phases = run_status_phases(StatusPhaseInput {
-        entry,
-        options,
-        probe_inputs: &probe_inputs,
-        opened: opened_ref,
-        trunk_commit: trunk_commit.as_ref(),
-        branches: &all_branches,
-        declared: &declared,
-        forge_started,
-    });
+    let (mut phases, health) = std::thread::scope(|scope| {
+        let health = scope.spawn(|| repository_health(&entry.path, &tips));
+        let phases = run_status_phases(StatusPhaseInput {
+            entry,
+            options,
+            probe_inputs: &probe_inputs,
+            opened: opened_ref,
+            trunk_commit: trunk_commit.as_ref(),
+            branches: &all_branches,
+            declared: &declared,
+            forge_started,
+        });
+        let health = health
+            .join()
+            .map_err(|_| anyhow::anyhow!("repository health phase panicked"))??;
+        Ok::<_, anyhow::Error>((phases, health))
+    })?;
+    timings.divergent_changes = health.divergent_changes;
+    timings.health = health.health;
+    report.findings.splice(0..0, health.findings);
+    report.problems.splice(0..0, health.problems);
     fold_phase_outcome(
         &mut report,
         &mut timings,
@@ -1865,6 +2070,7 @@ fn checks_cell(row: &BranchRow) -> String {
         Some(pr) if pr.is_open() => match row.checks.as_ref() {
             Some(checks) if checks.failing() => "failing".to_owned(),
             Some(checks) if !checks.ran() => "none-ran".to_owned(),
+            Some(checks) if checks.pending() => "pending".to_owned(),
             Some(_) => "ok".to_owned(),
             None => "-".to_owned(),
         },
@@ -2166,16 +2372,36 @@ mod tests {
         // The numbers this PR is judged against. A line that reported only a total
         // could not say which phase a change actually moved.
         let timings = Timings {
+            repository: std::time::Duration::from_millis(4),
+            health: std::time::Duration::from_millis(10),
+            divergent_changes: std::time::Duration::from_millis(11),
             releases: std::time::Duration::from_millis(12),
+            setup: std::time::Duration::from_millis(5),
             forge: std::time::Duration::from_millis(3400),
             probes: std::time::Duration::from_millis(8100),
+            origin_relations: std::time::Duration::from_millis(16),
+            divergent_rows: std::time::Duration::from_millis(17),
+            carried_findings: std::time::Duration::from_millis(18),
+            touching: std::time::Duration::from_millis(19),
+            claims: std::time::Duration::from_millis(20),
+            report: std::time::Duration::from_millis(6),
             total: std::time::Duration::from_millis(11_600),
         };
         let line = timings.line("a-repo");
         assert!(line.contains("a-repo"), "was: {line}");
+        assert!(line.contains("repository-open 4ms"), "was: {line}");
+        assert!(line.contains("health 10ms"), "was: {line}");
+        assert!(line.contains("divergent-changes 11ms"), "was: {line}");
         assert!(line.contains("releases 12ms"), "was: {line}");
+        assert!(line.contains("setup 5ms"), "was: {line}");
         assert!(line.contains("forge 3400ms"), "was: {line}");
         assert!(line.contains("probes 8100ms"), "was: {line}");
+        assert!(line.contains("origin-relations 16ms"), "was: {line}");
+        assert!(line.contains("divergent-rows 17ms"), "was: {line}");
+        assert!(line.contains("carried-findings 18ms"), "was: {line}");
+        assert!(line.contains("touching 19ms"), "was: {line}");
+        assert!(line.contains("claims 20ms"), "was: {line}");
+        assert!(line.contains("report 6ms"), "was: {line}");
         assert!(line.contains("total 11600ms"), "was: {line}");
     }
 
@@ -2602,7 +2828,7 @@ mod tests {
         };
 
         // When: overlap paths are gathered alongside the landed probe
-        add_branch_overlap_findings(&mut report, &entry);
+        let _ = add_branch_overlap_findings(&mut report, &entry, 1);
 
         // Then: the known divergence is announced without claiming the report is incomplete.
         assert!(report.notes.iter().any(|note| {
@@ -2636,7 +2862,7 @@ mod tests {
         };
 
         // When: jj cannot calculate that branch's changed paths
-        add_branch_overlap_findings(&mut report, &entry);
+        let _ = add_branch_overlap_findings(&mut report, &entry, 1);
 
         // Then: the report says path coverage was incomplete instead of silently omitting it
         assert!(
@@ -2748,7 +2974,7 @@ mod tests {
         red.checks = Some(crate::forge::ChecksSummary {
             runs: vec![crate::forge::CheckRun {
                 name: "build".to_owned(),
-                conclusion: "FAILURE".to_owned(),
+                conclusion: Some("FAILURE".to_owned()),
             }],
         });
 
@@ -2783,7 +3009,7 @@ mod tests {
         failing.checks = Some(crate::forge::ChecksSummary {
             runs: vec![crate::forge::CheckRun {
                 name: "build".to_owned(),
-                conclusion: "FAILURE".to_owned(),
+                conclusion: Some("FAILURE".to_owned()),
             }],
         });
         let mut never_ran = pull_request(12);
@@ -2816,6 +3042,18 @@ mod tests {
             never_ran_line.contains("draft") && never_ran_line.contains("none-ran"),
             "was: {never_ran_line}"
         );
+    }
+    #[test]
+    fn pending_checks_are_not_rendered_as_ok() {
+        let mut pending = row("feat/pending", None, Some(pull_request(13)));
+        pending.checks = Some(crate::forge::ChecksSummary {
+            runs: vec![crate::forge::CheckRun {
+                name: "build".to_owned(),
+                conclusion: None,
+            }],
+        });
+
+        assert_eq!(checks_cell(&pending), "pending");
     }
 
     #[test]
@@ -2862,7 +3100,7 @@ mod tests {
         closed.checks = Some(crate::forge::ChecksSummary {
             runs: vec![crate::forge::CheckRun {
                 name: "build".to_owned(),
-                conclusion: "FAILURE".to_owned(),
+                conclusion: Some("FAILURE".to_owned()),
             }],
         });
 
