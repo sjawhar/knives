@@ -211,6 +211,12 @@ pub enum Command {
         /// Forget the workspace but leave its directory on disk.
         #[arg(long)]
         no_cleanup: bool,
+        /// Proceed even when the branch's pull request is open, or when its state
+        /// could not be checked. The default refuses both: handing back a branch
+        /// whose pull request is still open is how an open submission's head got
+        /// deleted on the forge.
+        #[arg(long)]
+        allow_open: bool,
         /// Record that this branch was superseded by another.
         #[arg(long)]
         superseded_by: Option<String>,
