@@ -14,8 +14,9 @@ use std::sync::{Condvar, Mutex};
 use serde::{Deserialize, Deserializer};
 
 use super::{
-    CheckRun, ChecksSummary, DiffTotals, Forge, ForgeError, PullDetails, PullFacts, PullRequest,
-    PullSummary, RepoIdentity, SweepEntry, SweepPage,
+    CheckRun, ChecksSummary, CommitOids, DiffTotals, Forge, ForgeError, PullDetails, PullFacts,
+    PullRequest, PullSummary, RepoIdentity, SweepEntry, SweepPage, TimelineEvent,
+    TimelineEventKind,
 };
 const PR_STATE: &str = "all";
 // headRepositoryOwner is what makes a pull request ours or someone else's. Without
@@ -326,7 +327,63 @@ impl Forge for CliForge {
             Ok(facts)
         })
     }
+
+    fn pull_timeline(
+        &self,
+        repo: &Path,
+        target: &RepoIdentity,
+        number: u64,
+    ) -> Result<Vec<TimelineEvent>, ForgeError> {
+        let (owner, name) = target.split()?;
+        let owner = format!("owner={owner}");
+        let name = format!("name={name}");
+        let query = format!("query={}", pull_timeline_query(number));
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                let payload = Self::run(
+                    repo,
+                    &["api", "graphql", "-f", &owner, "-f", &name, "-f", &query],
+                )?;
+                parse_pull_timeline(&payload, number)
+            });
+            joined_forge_call(worker.join())
+        })
+    }
 }
+
+/// One pull request's head-ref history. `last: 100` of only the named item
+/// types is bounded by construction and does not add any fields to the wide
+/// pull-request sweep.
+///
+/// Probed on 2026-08-30 with the final shape:
+///
+/// | Workload | Samples (seconds) | Median |
+/// | --- | --- | ---: |
+/// | force-push, delete, and restore history | 1.166, 1.160, 1.125 | 1.160s |
+/// | quiet pull request | 1.071 | 1.071s |
+/// | busy long-lived pull request | 1.246 | 1.246s |
+///
+/// Every query completed without rejection, so `last: 100` stays below the
+/// two-second limit without dropping state events.
+pub fn pull_timeline_query(number: u64) -> String {
+    format!(
+        "query($owner: String!, $name: String!) {{ \
+         repository(owner: $owner, name: $name) {{ \
+         pullRequest(number: {number}) {{ \
+         timelineItems(last: 100, itemTypes: [HEAD_REF_FORCE_PUSHED_EVENT, \
+         HEAD_REF_DELETED_EVENT, HEAD_REF_RESTORED_EVENT, CLOSED_EVENT, \
+         REOPENED_EVENT, MERGED_EVENT]) {{ \
+         pageInfo {{ hasPreviousPage }} nodes {{ __typename \
+         ... on HeadRefForcePushedEvent {{ createdAt \
+             beforeCommit {{ oid tree {{ oid }} }} afterCommit {{ oid tree {{ oid }} }} }} \
+         ... on HeadRefDeletedEvent {{ createdAt }} \
+         ... on HeadRefRestoredEvent {{ createdAt }} \
+         ... on ClosedEvent {{ createdAt }} \
+         ... on ReopenedEvent {{ createdAt }} \
+         ... on MergedEvent {{ createdAt commit {{ oid }} }} }} }} }} }} }}"
+    )
+}
+
 
 /// One page, newest-updated first.
 ///
@@ -555,6 +612,85 @@ struct FactsEnvelope {
     errors: Vec<QueryFailure>,
 }
 
+#[derive(Deserialize)]
+struct TimelineEnvelope {
+    #[serde(default)]
+    data: Option<TimelineData>,
+    #[serde(default)]
+    errors: Vec<QueryFailure>,
+}
+
+#[derive(Deserialize)]
+struct TimelineData {
+    #[serde(default)]
+    repository: Option<TimelineRepository>,
+}
+
+#[derive(Deserialize)]
+struct TimelineRepository {
+    #[serde(default, rename = "pullRequest")]
+    pull_request: Option<TimelinePullRequest>,
+}
+
+#[derive(Deserialize)]
+struct TimelinePullRequest {
+    #[serde(rename = "timelineItems")]
+    timeline_items: TimelineItems,
+}
+
+#[derive(Deserialize)]
+struct TimelineItems {
+    #[serde(default)]
+    nodes: Vec<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct TimelineCommit {
+    oid: String,
+    #[serde(default)]
+    tree: Option<Tree>,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "__typename")]
+enum TimelineEventPayload {
+    #[serde(rename = "HeadRefForcePushedEvent")]
+    ForcePush {
+        #[serde(rename = "createdAt")]
+        at: String,
+        #[serde(rename = "beforeCommit")]
+        before: Option<TimelineCommit>,
+        #[serde(rename = "afterCommit")]
+        after: Option<TimelineCommit>,
+    },
+    #[serde(rename = "HeadRefDeletedEvent")]
+    HeadDeleted {
+        #[serde(rename = "createdAt")]
+        at: String,
+    },
+    #[serde(rename = "HeadRefRestoredEvent")]
+    HeadRestored {
+        #[serde(rename = "createdAt")]
+        at: String,
+    },
+    #[serde(rename = "ClosedEvent")]
+    Closed {
+        #[serde(rename = "createdAt")]
+        at: String,
+    },
+    #[serde(rename = "ReopenedEvent")]
+    Reopened {
+        #[serde(rename = "createdAt")]
+        at: String,
+    },
+    #[serde(rename = "MergedEvent")]
+    Merged {
+        #[serde(rename = "createdAt")]
+        at: String,
+        commit: Option<TimelineCommit>,
+    },
+}
+
 pub fn parse_identity(payload: &str) -> Result<RepoIdentity, ForgeError> {
     let identity: IdentityPayload = serde_json::from_str(payload)?;
     Ok(RepoIdentity {
@@ -753,6 +889,106 @@ pub fn parse_pull_facts(
         );
     }
     Ok(facts)
+}
+
+/// Decode the bounded timeline payload for its requested pull request number.
+pub fn parse_pull_timeline(
+    payload: &str,
+    number: u64,
+) -> Result<Vec<TimelineEvent>, ForgeError> {
+    let envelope: TimelineEnvelope = serde_json::from_str(payload)?;
+    if !envelope.errors.is_empty() {
+        return Err(ForgeError::Query {
+            detail: envelope
+                .errors
+                .iter()
+                .map(|failure| failure.message.clone())
+                .collect::<Vec<_>>()
+                .join("; "),
+        });
+    }
+    let pull = envelope
+        .data
+        .and_then(|data| data.repository)
+        .and_then(|repository| repository.pull_request);
+    let Some(pull) = pull else {
+        return Err(ForgeError::Query {
+            detail: format!("the reply carried neither errors nor pull request #{number}"),
+        });
+    };
+    pull.timeline_items
+        .nodes
+        .into_iter()
+        .map(timeline_event)
+        .collect()
+}
+
+fn timeline_event(event: serde_json::Value) -> Result<TimelineEvent, ForgeError> {
+    let Some(typename) = event.get("__typename").and_then(serde_json::Value::as_str) else {
+        return Err(ForgeError::Query {
+            detail: "a pull timeline event had no __typename".to_owned(),
+        });
+    };
+    match typename {
+        "HeadRefForcePushedEvent"
+        | "HeadRefDeletedEvent"
+        | "HeadRefRestoredEvent"
+        | "ClosedEvent"
+        | "ReopenedEvent"
+        | "MergedEvent" => {}
+        unknown => {
+            return Err(ForgeError::Query {
+                detail: format!("the forge returned unknown pull timeline event type `{unknown}`"),
+            });
+        }
+    }
+    let event: TimelineEventPayload = serde_json::from_value(event)?;
+    Ok(match event {
+        TimelineEventPayload::ForcePush { at, before, after } => TimelineEvent {
+            at,
+            kind: TimelineEventKind::ForcePush {
+                before: commit_oids(before),
+                after: commit_oids(after),
+            },
+        },
+        TimelineEventPayload::HeadDeleted { at } => TimelineEvent {
+            at,
+            kind: TimelineEventKind::HeadDeleted,
+        },
+        TimelineEventPayload::HeadRestored { at } => TimelineEvent {
+            at,
+            kind: TimelineEventKind::HeadRestored,
+        },
+        TimelineEventPayload::Closed { at } => TimelineEvent {
+            at,
+            kind: TimelineEventKind::Closed,
+        },
+        TimelineEventPayload::Reopened { at } => TimelineEvent {
+            at,
+            kind: TimelineEventKind::Reopened,
+        },
+        TimelineEventPayload::Merged { at, commit } => TimelineEvent {
+            at,
+            kind: TimelineEventKind::Merged {
+                commit: commit.map(|commit| commit.oid),
+            },
+        },
+    })
+}
+
+fn commit_oids(commit: Option<TimelineCommit>) -> CommitOids {
+    let Some(commit) = commit else {
+        return CommitOids {
+            commit: "unknown".to_owned(),
+            tree: "unknown".to_owned(),
+        };
+    };
+    CommitOids {
+        commit: commit.oid,
+        tree: commit
+            .tree
+            .map_or_else(|| "unknown".to_owned(), |tree| tree.oid),
+    }
 }
 
 #[cfg(test)]
@@ -1376,5 +1612,122 @@ printf '{}'
         assert!(facts.contains("mergeable"), "was: {facts}");
         assert!(facts.contains("mergeStateStatus"), "was: {facts}");
         assert!(facts.contains("comments(last: 1)"), "was: {facts}");
+    }
+
+    fn timeline_payload(nodes: &str) -> String {
+        format!(
+            "{{\"data\":{{\"repository\":{{\"pullRequest\":{{\"timelineItems\":\
+             {{\"pageInfo\":{{\"hasPreviousPage\":false}},\"nodes\":[{nodes}]}}}}}}}}}}"
+        )
+    }
+
+    #[test]
+    fn a_force_push_carries_before_and_after_commit_and_tree_oids() {
+        let payload = timeline_payload(
+            r#"{"__typename":"HeadRefForcePushedEvent","createdAt":"2026-08-30T22:41:02Z",
+            "beforeCommit":{"oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "tree":{"oid":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}},
+            "afterCommit":{"oid":"cccccccccccccccccccccccccccccccccccccccc",
+            "tree":{"oid":"dddddddddddddddddddddddddddddddddddddddd"}}}"#,
+        );
+
+        let events = parse_pull_timeline(&payload, 7).expect("timeline parses");
+
+        assert_eq!(
+            events,
+            vec![TimelineEvent {
+                at: "2026-08-30T22:41:02Z".to_owned(),
+                kind: TimelineEventKind::ForcePush {
+                    before: CommitOids {
+                        commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+                        tree: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
+                    },
+                    after: CommitOids {
+                        commit: "cccccccccccccccccccccccccccccccccccccccc".to_owned(),
+                        tree: "dddddddddddddddddddddddddddddddddddddddd".to_owned(),
+                    },
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn delete_and_restore_events_keep_the_forges_chronological_order() {
+        let payload = timeline_payload(
+            r#"{"__typename":"HeadRefDeletedEvent","createdAt":"2026-08-30T22:43:13Z"},
+            {"__typename":"HeadRefRestoredEvent","createdAt":"2026-08-30T22:44:11Z"}"#,
+        );
+
+        let events = parse_pull_timeline(&payload, 7).expect("timeline parses");
+
+        assert_eq!(
+            events,
+            vec![
+                TimelineEvent {
+                    at: "2026-08-30T22:43:13Z".to_owned(),
+                    kind: TimelineEventKind::HeadDeleted,
+                },
+                TimelineEvent {
+                    at: "2026-08-30T22:44:11Z".to_owned(),
+                    kind: TimelineEventKind::HeadRestored,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unknown_timeline_event_type_rejects_the_whole_history() {
+        let payload = timeline_payload(
+            r#"{"__typename":"NewForgeTimelineEvent","createdAt":"2026-08-30T22:43:13Z"}"#,
+        );
+
+        let error =
+            parse_pull_timeline(&payload, 7).expect_err("unknown event must not disappear");
+
+        assert!(matches!(error, ForgeError::Query { .. }), "was: {error}");
+        assert!(
+            error.to_string().contains("NewForgeTimelineEvent"),
+            "was: {error}"
+        );
+    }
+
+    #[test]
+    fn a_force_push_with_a_garbage_collected_before_commit_keeps_the_event() {
+        let payload = timeline_payload(
+            r#"{"__typename":"HeadRefForcePushedEvent","createdAt":"2026-08-30T22:41:02Z",
+            "beforeCommit":null,"afterCommit":{"oid":"cccccccccccccccccccccccccccccccccccccccc",
+            "tree":{"oid":"dddddddddddddddddddddddddddddddddddddddd"}}}"#,
+        );
+
+        let events = parse_pull_timeline(&payload, 7).expect("missing before commit is historical");
+
+        assert_eq!(
+            events,
+            vec![TimelineEvent {
+                at: "2026-08-30T22:41:02Z".to_owned(),
+                kind: TimelineEventKind::ForcePush {
+                    before: CommitOids {
+                        commit: "unknown".to_owned(),
+                        tree: "unknown".to_owned(),
+                    },
+                    after: CommitOids {
+                        commit: "cccccccccccccccccccccccccccccccccccccccc".to_owned(),
+                        tree: "dddddddddddddddddddddddddddddddddddddddd".to_owned(),
+                    },
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn an_absent_pull_timeline_names_the_requested_number() {
+        let error = parse_pull_timeline(
+            r#"{"data":{"repository":{"pullRequest":null}}}"#,
+            88,
+        )
+        .expect_err("a null pull request is unavailable");
+
+        assert!(matches!(error, ForgeError::Query { .. }), "was: {error}");
+        assert!(error.to_string().contains("#88"), "was: {error}");
     }
 }

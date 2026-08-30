@@ -13,8 +13,8 @@ mod lab;
 mod pulls;
 
 use forge_shim::{
-    install_failing_gh, install_snapshot_gh, path_with_gh_shim, pull_record,
-    pull_record_with_fields,
+    install_failing_gh, install_snapshot_gh, install_snapshot_gh_with_timeline, path_with_gh_shim,
+    pull_record, pull_record_with_fields,
 };
 
 use knives::commands::{
@@ -26,7 +26,7 @@ use knives::config::{Registry, RepoEntry};
 use knives::detect::landed::RebaseOutcome;
 use knives::forge::{
     ChecksSummary, Forge, ForgeError, PullFacts, PullRequest, PullSummary, RepoIdentity,
-    SweepEntry, SweepPage,
+    SweepEntry, SweepPage, TimelineEvent,
 };
 use knives::ids::{BookmarkRef, BranchName, CommitId, ReleaseScheme, RemoteName};
 use knives::jj::{Repo, changed_files, changed_files_between, probe_landed, pull_heads};
@@ -266,6 +266,15 @@ impl Forge for CountingForge {
                     })
             })
             .collect())
+    }
+
+    fn pull_timeline(
+        &self,
+        _repo: &std::path::Path,
+        _target: &RepoIdentity,
+        _number: u64,
+    ) -> Result<Vec<TimelineEvent>, ForgeError> {
+        Ok(Vec::new())
     }
 }
 
@@ -8476,4 +8485,84 @@ fn release_carries_refuses_without_a_release_or_target() {
         stdout.contains("no release to check against; cut one or pass --in <ref>"),
         "{stdout}"
     );
+}
+
+fn knives_pr_with_shim(
+    number: u64,
+    timeline: bool,
+    pulls: &str,
+    timeline_nodes: Option<&str>,
+) -> std::process::Output {
+    let lab = Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let shim = tempfile::tempdir().expect("create forge shim directory");
+    install_snapshot_gh_with_timeline(shim.path(), pulls, timeline_nodes);
+    let mut command = Command::new(env!("CARGO_BIN_EXE_knives"));
+    command
+        .args(["--text", "pr"])
+        .arg(number.to_string())
+        .args(["--repo", "demo"])
+        .current_dir(&lab.work)
+        .env("KNIVES_CONFIG_HOME", home.path())
+        .env("XDG_CACHE_HOME", shim.path().join("cache"))
+        .env("PATH", path_with_gh_shim(shim.path()));
+    if timeline {
+        command.arg("--timeline");
+    }
+    command.output().expect("run knives pr with a forge shim")
+}
+
+#[test]
+fn pr_reports_a_closed_pull_and_its_branch_through_the_real_binary() {
+    let pulls = format!("[{}]", pull_record(7, "CLOSED", "feat/closed", None));
+
+    let output = knives_pr_with_shim(7, false, &pulls, None);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        output.status.code(),
+        Some(i32::from(knives::cli::Exit::Ok.code())),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(stdout.contains("#7"), "stdout: {stdout}");
+    assert!(stdout.contains("CLOSED"), "stdout: {stdout}");
+    assert!(stdout.contains("feat/closed"), "stdout: {stdout}");
+}
+
+#[test]
+fn pr_reports_an_unanswered_number_as_incomplete_through_the_real_binary() {
+    let pulls = format!("[{}]", pull_record(7, "CLOSED", "feat/closed", None));
+
+    let output = knives_pr_with_shim(999, false, &pulls, None);
+
+    assert_eq!(
+        output.status.code(),
+        Some(i32::from(knives::cli::Exit::Incomplete.code())),
+        "stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("999"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn pr_timeline_renders_force_pushes_with_both_tree_oids_through_the_real_binary() {
+    let pulls = format!("[{}]", pull_record(7, "CLOSED", "feat/closed", None));
+    let timeline = r#"[{"__typename":"HeadRefForcePushedEvent","createdAt":"2026-08-30T22:41:02Z",
+        "beforeCommit":{"oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "tree":{"oid":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}},
+        "afterCommit":{"oid":"cccccccccccccccccccccccccccccccccccccccc",
+        "tree":{"oid":"dddddddddddddddddddddddddddddddddddddddd"}}}]"#;
+
+    let output = knives_pr_with_shim(7, true, &pulls, Some(timeline));
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(stdout.contains("force-push"), "stdout: {stdout}");
+    assert!(stdout.contains("tree bbbbbbbbbbbb"), "stdout: {stdout}");
+    assert!(stdout.contains("tree dddddddddddd"), "stdout: {stdout}");
 }

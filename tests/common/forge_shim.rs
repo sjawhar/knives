@@ -16,6 +16,42 @@ use std::path::Path;
 /// Install a fake `gh` that answers the full snapshot protocol: repository
 /// identity, cold list, warm sweep, and by-number facts.
 pub fn install_snapshot_gh(shim: &Path, pulls: &str, withheld_facts: &[u64], log: Option<&Path>) {
+    install_snapshot_gh_configured(
+        shim,
+        pulls,
+        SnapshotGhOptions {
+            withheld_facts,
+            log,
+            timeline_nodes: None,
+        },
+    );
+}
+
+/// Install the snapshot shim with an optional canned pull-request timeline.
+pub fn install_snapshot_gh_with_timeline(shim: &Path, pulls: &str, timeline_nodes: Option<&str>) {
+    install_snapshot_gh_configured(
+        shim,
+        pulls,
+        SnapshotGhOptions {
+            withheld_facts: &[],
+            log: None,
+            timeline_nodes,
+        },
+    );
+}
+
+struct SnapshotGhOptions<'a> {
+    withheld_facts: &'a [u64],
+    log: Option<&'a Path>,
+    timeline_nodes: Option<&'a str>,
+}
+
+fn install_snapshot_gh_configured(shim: &Path, pulls: &str, options: SnapshotGhOptions<'_>) {
+    let SnapshotGhOptions {
+        withheld_facts,
+        log,
+        timeline_nodes,
+    } = options;
     let pulls: Vec<serde_json::Value> =
         serde_json::from_str(pulls).expect("parse fake pull request payload");
     let sweep_entries = pulls
@@ -39,6 +75,7 @@ pub fn install_snapshot_gh(shim: &Path, pulls: &str, withheld_facts: &[u64], log
     let list = shim.join("pulls.json");
     let sweep = shim.join("sweep.json");
     let facts_payload = shim.join("facts.json");
+    let timeline_payload = shim.join("timeline.json");
     std::fs::write(
         &identity,
         serde_json::to_vec(&serde_json::json!({
@@ -76,6 +113,27 @@ pub fn install_snapshot_gh(shim: &Path, pulls: &str, withheld_facts: &[u64], log
         .expect("serialize facts payload"),
     )
     .expect("write facts payload");
+    let timeline_nodes: Vec<serde_json::Value> = timeline_nodes.map_or_else(
+        Vec::new,
+        |nodes| serde_json::from_str(nodes).expect("parse fake timeline payload"),
+    );
+    std::fs::write(
+        &timeline_payload,
+        serde_json::to_vec(&serde_json::json!({
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "timelineItems": {
+                            "pageInfo": {"hasPreviousPage": false},
+                            "nodes": timeline_nodes,
+                        }
+                    }
+                }
+            }
+        }))
+        .expect("serialize timeline payload"),
+    )
+    .expect("write timeline payload");
     let log_line = log.map_or_else(String::new, |log| {
         format!("printf '%s\\n' \"$*\" >> \"{}\"\n", log.display())
     });
@@ -88,6 +146,7 @@ pub fn install_snapshot_gh(shim: &Path, pulls: &str, withheld_facts: &[u64], log
              *\" pr list \"*) cat \"{}\" ;;\n\
              *\" api graphql \"*)\n\
                case \"$*\" in\n\
+                 *\"timelineItems\"*) cat \"{}\" ;;\n\
                  *\"pullRequest(number:\"*) cat \"{}\" ;;\n\
                  *\"orderBy: {{field: UPDATED_AT\"*) cat \"{}\" ;;\n\
                  *) echo \"unexpected GraphQL invocation: $*\" >&2; exit 1 ;;\n\
@@ -96,6 +155,7 @@ pub fn install_snapshot_gh(shim: &Path, pulls: &str, withheld_facts: &[u64], log
              esac\n",
             identity.display(),
             list.display(),
+            timeline_payload.display(),
             facts_payload.display(),
             sweep.display(),
         ),

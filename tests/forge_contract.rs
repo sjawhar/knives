@@ -8,15 +8,16 @@
 use std::collections::BTreeSet;
 
 use knives::forge::github::{
-    parse_pull_facts, parse_summaries, parse_sweep, pull_facts_query, summary_fields,
-    summary_list_args,
+    parse_pull_facts, parse_pull_timeline, parse_summaries, parse_sweep, pull_facts_query,
+    pull_timeline_query, summary_fields, summary_list_args,
 };
-use knives::forge::{ChecksSummary, PullRequest, PullSummary};
+use knives::forge::{ChecksSummary, PullRequest, PullSummary, TimelineEventKind};
 use serde_json::Value;
 
 const RECORDED_SUMMARIES: &str = include_str!("fixtures/gh_pr_list.json");
 const RECORDED_FACTS: &str = include_str!("fixtures/gh_pull_facts.json");
 const RECORDED_SWEEP: &str = include_str!("fixtures/gh_sweep.json");
+const RECORDED_TIMELINE: &str = include_str!("fixtures/gh_pull_timeline.json");
 const SCRUBBED_REPOSITORY: &str = "https://forge.invalid/our-org/recorded-repo";
 const REAL_FORGE_HOST: &str = concat!("github", ".com");
 
@@ -304,6 +305,51 @@ fn print_the_sweep_query() {
     println!("{}", knives::forge::github::sweep_query());
 }
 
+/// Prints the timeline query so a real reply can be recorded into
+/// `tests/fixtures/gh_pull_timeline.json`.
+#[test]
+#[ignore = "recording utility, not a check; see the doc comment"]
+fn print_the_timeline_query() {
+    println!("{}", pull_timeline_query(1413));
+}
+
+#[test]
+fn a_recorded_timeline_payload_decodes() {
+    let events =
+        parse_pull_timeline(RECORDED_TIMELINE, 1413).expect("recorded timeline payload decodes");
+
+    assert!(
+        events.iter().any(|event| {
+            matches!(
+                &event.kind,
+                TimelineEventKind::ForcePush { before, after }
+                    if [before.commit.as_str(), before.tree.as_str(), after.commit.as_str(), after.tree.as_str()]
+                        .into_iter()
+                        .all(|oid| oid.len() == 40 && oid.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            )
+        }),
+        "the recording must carry full force-push commit and tree ids: {events:?}"
+    );
+    assert!(
+        events.windows(2).any(|events| {
+            matches!(
+                events,
+                [
+                    knives::forge::TimelineEvent {
+                        kind: TimelineEventKind::HeadDeleted,
+                        ..
+                    },
+                    knives::forge::TimelineEvent {
+                        kind: TimelineEventKind::HeadRestored,
+                        ..
+                    }
+                ]
+            )
+        }),
+        "the recording must preserve the delete/restore pair: {events:?}"
+    );
+}
+
 #[test]
 fn the_pull_request_list_argument_array_requests_every_state() {
     let arguments = summary_list_args();
@@ -379,4 +425,32 @@ fn the_recorded_sweep_payload_is_scrubbed() {
             "sweep fixture leaks internal identifier `{identity}`"
         );
     }
+}
+
+#[test]
+fn the_recorded_timeline_payload_is_scrubbed() {
+    let lower = RECORDED_TIMELINE.to_ascii_lowercase();
+    for identity in [
+        concat!("me", "tr"),
+        concat!("ha", "wk"),
+        concat!("sjaw", "har"),
+        REAL_FORGE_HOST,
+    ] {
+        assert!(
+            !lower.contains(identity),
+            "timeline fixture leaks internal identifier `{identity}`"
+        );
+    }
+
+    let recorded: Value = serde_json::from_str(RECORDED_TIMELINE).expect("recorded JSON is valid");
+    let nodes = recorded
+        .pointer("/data/repository/pullRequest/timelineItems/nodes")
+        .and_then(Value::as_array)
+        .expect("recorded timeline has event nodes");
+    assert!(
+        nodes
+            .iter()
+            .all(|node| node.get("actor").is_none() && node.get("url").is_none()),
+        "the bounded event payload must not retain account or URL fields"
+    );
 }

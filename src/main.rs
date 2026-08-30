@@ -60,11 +60,15 @@ fn dispatch() -> anyhow::Result<Exit> {
                 display: Display { verbose, output },
             },
         ),
-        Command::Pr { number, repo } => {
+        Command::Pr {
+            number,
+            repo,
+            timeline,
+        } => {
             let Some(name) = one_repo(repo.as_deref())? else {
                 return Ok(Exit::Usage);
             };
-            run_pr(&name, number, output)
+            run_pr(&name, number, timeline, output)
         }
         Command::Sync {
             repo,
@@ -2022,6 +2026,7 @@ fn worker_budget(repositories: usize, parallelism: usize) -> (usize, usize) {
 fn run_pr(
     repo: &RepoName,
     number: u64,
+    timeline: bool,
     output: knives::cli::Output,
 ) -> anyhow::Result<Exit> {
     let registry = load(&default_config_path())?;
@@ -2038,6 +2043,7 @@ fn run_pr(
         number,
         forge: &forge,
         cache_root: cache_root.as_deref(),
+        timeline,
     })?;
     let Some(report) = report else {
         eprintln!("{repo}: the forge did not report #{number}");

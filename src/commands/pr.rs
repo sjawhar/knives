@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use crate::config::RepoEntry;
-use crate::forge::{DiffTotals, Forge};
+use crate::forge::{DiffTotals, Forge, TimelineEvent, TimelineEventKind};
 use crate::ids::RepoName;
 
 #[derive(Debug, serde::Serialize)]
@@ -26,6 +26,8 @@ pub struct Report {
     pub head_ref_deleted: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tip_commit_empty: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeline: Option<Vec<TimelineEvent>>,
 }
 
 
@@ -33,6 +35,7 @@ pub struct Request<'a> {
     pub repo: &'a RepoName,
     pub entry: &'a RepoEntry,
     pub number: u64,
+    pub timeline: bool,
     pub forge: &'a dyn Forge,
     pub cache_root: Option<&'a Path>,
 }
@@ -45,6 +48,7 @@ impl std::fmt::Debug for Request<'_> {
             .field("entry", self.entry)
             .field("number", &self.number)
             .field("forge", &true)
+            .field("timeline", &self.timeline)
             .field("cache_root", &self.cache_root)
             .finish()
     }
@@ -64,6 +68,16 @@ pub fn gather(request: &Request<'_>) -> anyhow::Result<Option<Report>> {
     })?;
     let number = request.number;
     let snapshot = opened.complete_with(&number, |_, number| vec![*number])?;
+    let timeline = if request.timeline && snapshot.fact(number).is_some() {
+        let target = request.forge.repo_identity(&request.entry.path)?;
+        Some(
+            request
+                .forge
+                .pull_timeline(&request.entry.path, &target, number)?,
+        )
+    } else {
+        None
+    };
     let report = snapshot.fact(number).map(|fact| {
         let pull = &fact.pull;
         Report {
@@ -81,6 +95,7 @@ pub fn gather(request: &Request<'_>) -> anyhow::Result<Option<Report>> {
             diff: fact.details.diff,
             head_ref_deleted: fact.details.head_ref_deleted,
             tip_commit_empty: fact.details.tip_commit_empty,
+            timeline,
         }
     });
     // The live batch is useful to subsequent reads even for a one-number request.
@@ -122,7 +137,43 @@ pub fn render(report: &Report) -> String {
         line.push_str("  ");
         line.push_str(&report.url);
     }
+    if let Some(events) = &report.timeline {
+        for event in events {
+            line.push('\n');
+            line.push_str(&render_timeline_event(event));
+        }
+    }
     line
+}
+
+fn render_timeline_event(event: &TimelineEvent) -> String {
+    match &event.kind {
+        TimelineEventKind::ForcePush { before, after } => format!(
+            "  {}  force-push  {} (tree {}) -> {} (tree {}){}",
+            event.at,
+            short(&before.commit),
+            short(&before.tree),
+            short(&after.commit),
+            short(&after.tree),
+            if before.tree != "unknown" && before.tree == after.tree {
+                "  [same tree]"
+            } else {
+                ""
+            }
+        ),
+        TimelineEventKind::HeadDeleted => format!("  {}  head-deleted", event.at),
+        TimelineEventKind::HeadRestored => format!("  {}  head-restored", event.at),
+        TimelineEventKind::Closed => format!("  {}  closed", event.at),
+        TimelineEventKind::Reopened => format!("  {}  reopened", event.at),
+        TimelineEventKind::Merged { commit } => commit.as_deref().map_or_else(
+            || format!("  {}  merged", event.at),
+            |commit| format!("  {}  merged  @{}", event.at, short(commit)),
+        ),
+    }
+}
+
+fn short(oid: &str) -> String {
+    oid.chars().take(12).collect()
 }
 
 #[cfg(test)]
@@ -172,6 +223,7 @@ mod tests {
             number: 4545,
             forge: &forge,
             cache_root: None,
+            timeline: false,
         };
         let report = gather(&request)
             .expect("gather")
@@ -193,6 +245,7 @@ mod tests {
             number: 9,
             forge: &FakeForge::default(),
             cache_root: None,
+            timeline: false,
         };
         assert!(
             gather(&request).expect("gather").is_none(),
@@ -217,6 +270,7 @@ mod tests {
             diff: Some(DiffTotals::default()),
             head_ref_deleted: Some(true),
             tip_commit_empty: Some(true),
+            timeline: None,
         };
 
         assert_eq!(
@@ -224,6 +278,87 @@ mod tests {
             "demo#4545  CLOSED (draft)  feat/egress-guard -> main  @ab12cd34ef56  \
              review APPROVED  updated 2026-08-30T00:00:00Z  [empty-diff]  \
              [deleted-head-ref]  [empty-tip-commit]  https://example.test/demo/pull/4545"
+        );
+    }
+
+    #[test]
+    fn render_shows_force_push_trees_and_marks_content_identical_rewrites() {
+        let report = Report {
+            repo: "demo".to_owned(),
+            number: 7,
+            state: "OPEN".to_owned(),
+            branch: "feat/a".to_owned(),
+            base: "main".to_owned(),
+            head: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            review: String::new(),
+            updated: "2026-08-30T22:41:02Z".to_owned(),
+            url: String::new(),
+            is_draft: false,
+            mergeable: "MERGEABLE".to_owned(),
+            diff: None,
+            head_ref_deleted: None,
+            tip_commit_empty: None,
+            timeline: Some(vec![crate::forge::TimelineEvent {
+                at: "2026-08-30T22:41:02Z".to_owned(),
+                kind: crate::forge::TimelineEventKind::ForcePush {
+                    before: crate::forge::CommitOids {
+                        commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+                        tree: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
+                    },
+                    after: crate::forge::CommitOids {
+                        commit: "cccccccccccccccccccccccccccccccccccccccc".to_owned(),
+                        tree: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
+                    },
+                },
+            }]),
+        };
+
+        assert_eq!(
+            render(&report),
+            concat!(
+                "demo#7  OPEN  feat/a -> main  @aaaaaaaaaaaa  review -  updated \
+                 2026-08-30T22:41:02Z\n",
+                "  2026-08-30T22:41:02Z  force-push  aaaaaaaaaaaa (tree bbbbbbbbbbbb) -> \
+                 cccccccccccc (tree bbbbbbbbbbbb)  [same tree]"
+            )
+        );
+    }
+
+    #[test]
+    fn render_does_not_call_unavailable_trees_the_same_tree() {
+        let report = Report {
+            repo: "demo".to_owned(),
+            number: 7,
+            state: "OPEN".to_owned(),
+            branch: "feat/a".to_owned(),
+            base: "main".to_owned(),
+            head: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            review: String::new(),
+            updated: "2026-08-30T22:41:02Z".to_owned(),
+            url: String::new(),
+            is_draft: false,
+            mergeable: "MERGEABLE".to_owned(),
+            diff: None,
+            head_ref_deleted: None,
+            tip_commit_empty: None,
+            timeline: Some(vec![crate::forge::TimelineEvent {
+                at: "2026-08-30T22:41:02Z".to_owned(),
+                kind: crate::forge::TimelineEventKind::ForcePush {
+                    before: crate::forge::CommitOids {
+                        commit: "unknown".to_owned(),
+                        tree: "unknown".to_owned(),
+                    },
+                    after: crate::forge::CommitOids {
+                        commit: "unknown".to_owned(),
+                        tree: "unknown".to_owned(),
+                    },
+                },
+            }]),
+        };
+
+        assert!(
+            !render(&report).contains("[same tree]"),
+            "unavailable tree ids cannot prove a content-identical rewrite"
         );
     }
 }

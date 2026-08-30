@@ -195,6 +195,10 @@ pub enum Command {
         /// Registry name. Defaults to the repo you are standing in.
         #[arg(long)]
         repo: Option<String>,
+        /// Also read the head-ref event log: force pushes with before/after
+        /// commit and tree ids, deletes, restores, closes, reopens, and merges.
+        #[arg(long)]
+        timeline: bool,
     },
     /// Take a branch and open a workspace on the fetched upstream trunk.
     ///

@@ -157,6 +157,42 @@ impl DiffTotals {
     }
 }
 
+/// A commit as a force-push event names it: the commit and its tree, so
+/// content-identical rewrites are distinguishable from content changes.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct CommitOids {
+    pub commit: String,
+    pub tree: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case", tag = "kind")]
+pub enum TimelineEventKind {
+    ForcePush {
+        before: CommitOids,
+        after: CommitOids,
+    },
+    HeadDeleted,
+    HeadRestored,
+    Closed,
+    Reopened,
+    Merged {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        commit: Option<String>,
+    },
+}
+
+/// One head-ref or state event from the forge's own log.
+///
+/// knives stores no push or commit history: the forge's event log is the one
+/// durable record of what happened to a ref, and this type is the lens.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct TimelineEvent {
+    pub at: String,
+    #[serde(flatten)]
+    pub kind: TimelineEventKind,
+}
+
 /// What one round trip answers about a pull request beyond its list fields.
 ///
 /// A number the forge did not answer for is absent from the map rather than
@@ -426,6 +462,16 @@ pub trait Forge: Send + Sync {
         target: &RepoIdentity,
         numbers: &[u64],
     ) -> Result<BTreeMap<u64, PullFacts>, ForgeError>;
+
+    /// The bounded, by-number head-ref history: force pushes (before/after
+    /// commit and tree oids), deletes, restores, closes, reopens, and merges.
+    /// On demand only — never part of any batch.
+    fn pull_timeline(
+        &self,
+        repo: &Path,
+        target: &RepoIdentity,
+        number: u64,
+    ) -> Result<Vec<TimelineEvent>, ForgeError>;
 }
 
 /// One branch's pull request summaries, split into the primary and its shadowed history.

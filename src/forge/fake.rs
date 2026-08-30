@@ -9,7 +9,7 @@ use std::path::Path;
 
 use super::{
     ChecksSummary, Forge, ForgeError, PullDetails, PullFacts, PullRequest, PullSummary,
-    RepoIdentity, SweepEntry, SweepPage,
+    RepoIdentity, SweepEntry, SweepPage, TimelineEvent,
 };
 use crate::ids::BranchName;
 /// Facts supplied directly, for tests.
@@ -28,10 +28,12 @@ pub struct FakeForge {
     /// history a batch can still answer about).
     pub vanished_states: BTreeMap<u64, String>,
     pub newest_comments: BTreeMap<u64, String>,
+    pub timeline: BTreeMap<u64, Vec<TimelineEvent>>,
     pub fail_identity: bool,
     pub fail_list: bool,
     pub fail_sweep: bool,
     pub fail_facts: bool,
+    pub fail_timeline: bool,
     /// Sweep reports a continuation past page 1 (overflow → cold reseed).
     pub sweep_overflows: bool,
 }
@@ -152,6 +154,18 @@ impl Forge for FakeForge {
             })
             .collect())
     }
+
+    fn pull_timeline(
+        &self,
+        _repo: &Path,
+        _target: &RepoIdentity,
+        number: u64,
+    ) -> Result<Vec<TimelineEvent>, ForgeError> {
+        if self.fail_timeline {
+            return Err(fake_failure("timeline"));
+        }
+        Ok(self.timeline.get(&number).cloned().unwrap_or_default())
+    }
 }
 
 #[cfg(test)]
@@ -236,5 +250,32 @@ mod tests {
         );
         assert_eq!(facts[&8].pull.state, "CLOSED");
         assert!(!facts.contains_key(&9));
+    }
+
+    #[test]
+    fn fake_timeline_answers_configured_events_and_leaves_other_numbers_empty() {
+        let event = crate::forge::TimelineEvent {
+            at: "2026-08-30T22:43:13Z".to_owned(),
+            kind: crate::forge::TimelineEventKind::HeadDeleted,
+        };
+        let fake = FakeForge {
+            timeline: BTreeMap::from([(7, vec![event.clone()])]),
+            ..FakeForge::default()
+        };
+        let target = RepoIdentity {
+            name_with_owner: "fake-owner/fake-repo".to_owned(),
+            id: "FAKEID".to_owned(),
+        };
+
+        assert_eq!(
+            fake.pull_timeline(Path::new("/tmp"), &target, 7)
+                .expect("configured timeline"),
+            vec![event]
+        );
+        assert!(
+            fake.pull_timeline(Path::new("/tmp"), &target, 8)
+                .expect("unconfigured timeline")
+                .is_empty()
+        );
     }
 }
