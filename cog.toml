@@ -1,0 +1,13 @@
+# Release tags are SemVer versions prefixed with `v`, e.g. v0.14.0.
+from_latest_tag = true
+tag_prefix = "v"
+# GitHub generates the release notes from the tag; do not add a second changelog.
+disable_changelog = true
+
+# Keep the release behavior of existing refactor and perf commits.
+[commit_types]
+refactor = { bump_patch = true }
+perf = { bump_patch = true }
+
+# The history contains the plural form as a non-bumping test type.
+tests = { omit_from_changelog = true }
