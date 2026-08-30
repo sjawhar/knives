@@ -19,70 +19,44 @@ jobs:
     name: Determine Version
     runs-on: ubuntu-latest
     outputs:
-      version: ${{ steps.bump.outputs.version }}
-      should_release: ${{ steps.bump.outputs.should_release }}
+      version: ${{ steps.release.outputs.version }}
+      should_release: ${{ steps.release.outputs.should_release }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
+      - name: Install Cocogitto
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cocogitto@7.0.0
+
       - name: Determine version bump
-        id: bump
+        id: release
         run: |
-          LATEST_TAG=$(git tag -l 'v*' --sort=-v:refname | head -1)
-
-          if [ -z "$LATEST_TAG" ]; then
-            # No tags yet — the first release uses the version already in Cargo.toml.
-            VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-            echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-            echo "should_release=true" >> "$GITHUB_OUTPUT"
-            echo "First release: v$VERSION"
-            exit 0
-          fi
-
-          COMMITS=$(git log "${LATEST_TAG}..HEAD" --format='%s')
-
-          if [ -z "$COMMITS" ]; then
+          set -euo pipefail
+          version="$(cog bump --dry-run --auto)"
+          if [[ "$version" == *"No conventional commits for your repository that required a bump."* ]]; then
             echo "should_release=false" >> "$GITHUB_OUTPUT"
-            echo "No commits since $LATEST_TAG"
             exit 0
           fi
 
-          MAJOR=false
-          MINOR=false
-          PATCH=false
-
-          while IFS= read -r msg; do
-            if echo "$msg" | grep -qE '^[a-z]+(\(.+\))?!:' || echo "$msg" | grep -q 'BREAKING CHANGE'; then
-              MAJOR=true
-            elif echo "$msg" | grep -qE '^feat(\(.+\))?:'; then
-              MINOR=true
-            elif echo "$msg" | grep -qE '^(fix|refactor|perf)(\(.+\))?:'; then
-              PATCH=true
-            fi
-          done <<< "$COMMITS"
-
-          if ! $MAJOR && ! $MINOR && ! $PATCH; then
-            echo "should_release=false" >> "$GITHUB_OUTPUT"
-            echo "No version-bumping commits since $LATEST_TAG"
-            exit 0
+          if ! [[ "$version" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            printf 'Cocogitto did not return a SemVer version: %s\n' "$version" >&2
+            exit 1
           fi
 
-          CURRENT="${LATEST_TAG#v}"
-          IFS='.' read -r major minor patch <<< "$CURRENT"
-
-          if $MAJOR; then
-            major=$((major + 1)); minor=0; patch=0
-          elif $MINOR; then
-            minor=$((minor + 1)); patch=0
-          else
-            patch=$((patch + 1))
+          # Cocogitto keeps breaking changes below 1.0 on the minor line; knives
+          # treats them as a major release even before its 1.0.0 release.
+          latest_tag="$(git describe --tags --abbrev=0)"
+          if [[ "$version" =~ ^v0\. ]] &&
+            git log "$latest_tag..HEAD" --format=%B |
+              grep -qE '^[[:lower:]]+(\(.+\))?!:|BREAKING CHANGE'; then
+            version="$(cog bump --dry-run --major)"
           fi
 
-          VERSION="${major}.${minor}.${patch}"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "version=${version#v}" >> "$GITHUB_OUTPUT"
           echo "should_release=true" >> "$GITHUB_OUTPUT"
-          echo "Bumping $CURRENT → $VERSION"
 
   build:
     name: Build
