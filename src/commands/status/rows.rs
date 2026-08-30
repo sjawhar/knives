@@ -1,4 +1,9 @@
-use super::*;
+use super::{
+    BTreeMap, BookmarkRef, BookmarkTips, BranchName, BranchRow, BranchTarget, ChecksSummary,
+    CommitId, JjError, LandedVerdict, LastNotch, Notch, OriginRelation, PriorPull, PullDetails,
+    PullIndex, PullRequest, PullSummary, ReleaseScheme, Repo, RepoEntry, RepoName, Report,
+    StatedPull, Store, fmt, is_release_name, newest_for, pull_number_from_bookmark,
+};
 
 use super::phases::ProbeInput;
 /// The pull request a bookmark refers to, by branch name or by fetched-head number.
@@ -276,8 +281,8 @@ mod tests {
         clippy::indexing_slicing,
         reason = "indexing a result in a test is the assertion; a panic is the failure"
     )]
-    use super::*;
     use super::super::test_fixtures::{local, tips};
+    use super::*;
     #[test]
     fn the_trunk_exclusion_follows_the_repo_entry_not_the_name_main() {
         // Given: a repo whose upstream trunk is dev, carrying a branch named main

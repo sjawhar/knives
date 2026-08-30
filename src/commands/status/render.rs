@@ -1,4 +1,7 @@
-use super::*;
+use super::{
+    BTreeMap, BranchRow, Finding, FindingKind, LastNotch, OriginRelation, RepoNotches, Report,
+    StatedPull, short,
+};
 /// One line per kind of finding, naming every subject.
 ///
 /// A finding per branch times a detector per finding made the report unreadable: one
@@ -380,8 +383,11 @@ mod tests {
         clippy::indexing_slicing,
         reason = "indexing a result in a test is the assertion; a panic is the failure"
     )]
-    use super::*;
     use super::super::test_fixtures::{pull_request, row};
+    use super::super::{PriorPull, branch_findings};
+    use super::*;
+    use crate::detect::LandedVerdict;
+    use crate::ids::CommitId;
     #[test]
     fn a_missing_forge_renders_unknown_not_no_pr() {
         // A missing snapshot means the forge did not answer; `no-pr` would claim

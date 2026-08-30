@@ -15,8 +15,8 @@ use knives::commands::{
 };
 use knives::config::{default_config_path, load};
 use knives::detect::RebaseOutcome;
-use knives::forge::{Forge, PullRequest};
 use knives::forge::github::CliForge;
+use knives::forge::{Forge, PullRequest};
 use knives::ids::{BranchName, BranchTarget, ReleaseScheme, RepoName, Requirement};
 use knives::ledger::{Draft, Kind, Ledger, Scribe};
 use knives::store::{Store, default_state_path};
@@ -621,7 +621,7 @@ fn merged_rebase_target(
             return Ok(None);
         }
     };
-    let candidates = knives::forge::merged_onto(&snapshot.ours(), entry.trunk());
+    let candidates = knives::forge::merged_onto(snapshot.ours(), entry.trunk());
     let result: anyhow::Result<Option<RebaseDestination>> = (|| {
         let Some(landed) = verified_merged_candidates(repo, &snapshot, &candidates, entry.trunk())
         else {

@@ -327,9 +327,6 @@ fn scan_releases(
     Ok((names, findings, skipped))
 }
 
-
-
-
 /// Declared dependencies that are not satisfied yet.
 ///
 /// A branch can require a pull request in a sibling fork. Dropping the required one
@@ -516,7 +513,6 @@ fn add_dependency_findings(input: DependencyInput<'_, '_, '_>) {
     report.problems.extend(unanswered);
 }
 
-
 /// One sentence naming every branch that could not be judged.
 ///
 /// One problem per branch meant ten copies of the same explanation differing only by a
@@ -537,8 +533,6 @@ fn unjudged_note(branches: &[String]) -> Option<String> {
         branches.join(", ")
     ))
 }
-
-
 
 fn note_fetched_heads(report: &mut Report, fetched_heads: usize) {
     if fetched_heads > 0 {
@@ -611,7 +605,6 @@ fn add_releases(
     Ok(())
 }
 
-
 /// Who holds what here, and where they are working.
 ///
 /// Absorbed from the old `wip` command. Who holds a branch is part of a repository's
@@ -636,9 +629,6 @@ fn touching(claims: &[crate::store::Claim]) -> BTreeMap<String, Vec<String>> {
         .map(|claim| (claim.key(), claim.files.clone()))
         .collect()
 }
-
-
-
 
 /// Reports branches carried by another branch, excluding the configured trunk.
 fn carried_findings(
@@ -759,8 +749,6 @@ fn add_branch_overlap_findings(
         .extend(crate::detect::overlap::branch_overlaps(&touching));
     started.elapsed()
 }
-
-
 
 /// Inputs that turn completed phases into the report's visible rows and findings.
 struct PostPhaseInput<'a> {
@@ -1153,7 +1141,6 @@ fn wrong_base_findings(rows: &[BranchRow], expected: &str) -> Vec<Finding> {
         .collect()
 }
 
-
 /// Findings mean act; notes mean we could not answer. A command that reports a
 /// problem in its text and still exits zero lets a CI gate go green on a broken
 /// forge login or an unopenable repository.
@@ -1167,7 +1154,6 @@ pub const fn exit_for(report: &Report) -> Exit {
         Exit::Findings
     }
 }
-
 
 /// Row and bookmark literals shared by the split test modules; scenario tests
 /// state only the fields under test.
@@ -1223,8 +1209,8 @@ mod tests {
         clippy::indexing_slicing,
         reason = "indexing a result in a test is the assertion; a panic is the failure"
     )]
-    use super::*;
     use super::test_fixtures::{local, pull_request, remote, row, tips};
+    use super::*;
     use crate::ids::BranchName;
 
     #[test]
@@ -1265,11 +1251,6 @@ mod tests {
         assert!(line.contains("total 11600ms"), "was: {line}");
     }
 
-
-
-
-
-
     #[test]
     fn a_ledger_that_cannot_be_read_is_an_unanswered_question_not_an_absence() {
         // A report that quietly showed no breadcrumbs would say this fork's
@@ -1292,7 +1273,6 @@ mod tests {
         assert!(report.problems[0].contains("ledger"), "was: {report:?}");
         assert_eq!(exit_for(&report), Exit::Incomplete);
     }
-
 
     #[test]
     fn only_the_newest_release_on_each_side_is_scanned() {
@@ -1459,8 +1439,6 @@ mod tests {
         assert_eq!(skipped, 1);
     }
 
-
-
     #[test]
     fn a_branch_without_a_single_tip_is_noted_but_does_not_make_status_incomplete() {
         // Given: a divergent bookmark row, which cannot name one commit to compare
@@ -1525,7 +1503,6 @@ mod tests {
         );
         assert_eq!(exit_for(&report), Exit::Incomplete);
     }
-
 
     #[test]
     fn a_pull_request_in_conflict_with_its_base_is_reported() {
@@ -1637,14 +1614,6 @@ mod tests {
         );
     }
 
-
-
-
-
-
-
-
-
     #[test]
     fn a_stale_review_names_the_pull_request_and_says_to_re_read() {
         let mut stale = row("feat/alpha", None, Some(pull_request(42)));
@@ -1656,13 +1625,6 @@ mod tests {
             .expect("finding");
         assert_eq!(review.subject.to_string(), "#42");
     }
-
-
-
-
-
-
-
 
     #[test]
     fn a_problem_means_incomplete_even_when_there_are_no_findings() {

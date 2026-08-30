@@ -682,7 +682,6 @@ mod tests {
     use std::io::{Read as _, Write as _};
     use std::os::unix::fs::PermissionsExt as _;
 
-
     struct FakeGhGate {
         directory: tempfile::TempDir,
         entered: std::path::PathBuf,

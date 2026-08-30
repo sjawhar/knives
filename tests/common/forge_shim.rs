@@ -5,7 +5,8 @@
     reason = "a fixture that cannot proceed IS the test failure"
 )]
 #![allow(
-    unreachable_pub, dead_code,
+    unreachable_pub,
+    dead_code,
     reason = "a test fixture included by path; not every test target uses every helper"
 )]
 

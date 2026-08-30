@@ -7,11 +7,11 @@
 
 use std::collections::BTreeSet;
 
-use knives::forge::{ChecksSummary, PullRequest, PullSummary};
 use knives::forge::github::{
     parse_pull_facts, parse_summaries, parse_sweep, pull_facts_query, summary_fields,
     summary_list_args,
 };
+use knives::forge::{ChecksSummary, PullRequest, PullSummary};
 use serde_json::Value;
 
 const RECORDED_SUMMARIES: &str = include_str!("fixtures/gh_pr_list.json");

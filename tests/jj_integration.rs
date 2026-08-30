@@ -5,10 +5,10 @@
     reason = "a fixture or assertion that cannot proceed IS the test failure"
 )]
 
-#[path = "common/lab.rs"]
-mod lab;
 #[path = "common/forge_shim.rs"]
 mod forge_shim;
+#[path = "common/lab.rs"]
+mod lab;
 #[path = "common/pulls.rs"]
 mod pulls;
 
@@ -3515,7 +3515,6 @@ fn knives_finish(lab: &lab::Lab, home: &tempfile::TempDir, args: &[&str]) -> std
         .expect("run finish")
 }
 
-
 #[derive(Clone, Copy)]
 struct FinishWithSnapshotForgeInput<'a> {
     lab: &'a Lab,
@@ -5313,7 +5312,6 @@ fn a_rebase_moves_the_whole_composition_onto_the_target() {
     );
 }
 
-
 /// Run the knives binary's release command against the complete snapshot forge
 /// protocol, with an isolated cache root.
 fn knives_release_with_forge(
@@ -5363,7 +5361,6 @@ fn knives_release_with_forge_withheld_facts(
         .output()
         .expect("run knives release with a forge shim")
 }
-
 
 #[test]
 fn a_bare_rebase_with_no_merged_pull_request_requires_a_commit() {

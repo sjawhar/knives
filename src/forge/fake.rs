@@ -1,6 +1,8 @@
 //! Facts supplied directly, for tests: the [`Forge`](crate::forge::Forge)
-//! implementation scenario tests configure with rows and failure switches
-//! instead of a network. One failure switch per failure-table row.
+//! implementation scenario tests configure with rows and failure switches instead
+//! of a network.
+//!
+//! One failure switch per failure-table row.
 
 use std::collections::BTreeMap;
 use std::path::Path;

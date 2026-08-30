@@ -185,10 +185,7 @@ impl<'o> Discovery<'o> {
     /// The one live batch: refresh set ∪ requested numbers (deduped). Any
     /// failure → Err and no snapshot exists (I3). Success merges fetched rows
     /// over the discovery rows so `rows()` reflects what the batch just proved.
-    fn into_completed(
-        self,
-        mut requested: Vec<u64>,
-    ) -> Result<CompletedSnapshot<'o>, ForgeError> {
+    fn into_completed(self, mut requested: Vec<u64>) -> Result<CompletedSnapshot<'o>, ForgeError> {
         requested.sort_unstable();
         requested.dedup();
         let mut numbers = self.refresh;
@@ -277,7 +274,7 @@ impl CompletedSnapshot<'_> {
     }
 
     /// The primary and shadowed pull requests indexed from `ours()`.
-    pub fn index(&self) -> &PullIndex {
+    pub const fn index(&self) -> &PullIndex {
         &self.index
     }
 
@@ -359,8 +356,8 @@ mod tests {
 
     use super::{Discovery, SnapshotConfig, open};
     use crate::detect::LandedVerdict;
-    use crate::forge::{Account, PullRequest, PullSummary, RepoIdentity};
     use crate::forge::fake::FakeForge;
+    use crate::forge::{Account, PullRequest, PullSummary, RepoIdentity};
     use crate::forge_cache::{CacheFile, SCHEMA_VERSION, cache_path, load, write};
     use crate::ids::BranchName;
 
@@ -408,7 +405,7 @@ mod tests {
         }
     }
 
-    fn select_none(_: &Discovery<'_>, _: &()) -> Vec<u64> {
+    const fn select_none<T>(_: &Discovery<'_>, _: &T) -> Vec<u64> {
         Vec::new()
     }
 
@@ -421,10 +418,7 @@ mod tests {
         surfaced: &'a [u64],
     }
 
-    fn select_expected(
-        discovery: &Discovery<'_>,
-        expected: &ExpectedSelection<'_>,
-    ) -> Vec<u64> {
+    fn select_expected(discovery: &Discovery<'_>, expected: &ExpectedSelection<'_>) -> Vec<u64> {
         assert_eq!(
             discovery
                 .rows()

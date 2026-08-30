@@ -186,7 +186,7 @@ impl fmt::Debug for GatherInput<'_> {
             .finish()
     }
 }
-fn select_none(_: &snapshot::Discovery<'_>, _: &()) -> Vec<u64> {
+const fn select_none<T>(_: &snapshot::Discovery<'_>, _: &T) -> Vec<u64> {
     Vec::new()
 }
 

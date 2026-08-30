@@ -7,15 +7,12 @@
 pub mod fake;
 pub mod github;
 
-
 use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde::Deserialize;
 
 use crate::ids::BranchName;
-
-
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -27,7 +24,6 @@ pub struct CheckRun {
     #[serde(default)]
     pub conclusion: Option<String>,
 }
-
 
 /// What the forge's checks say about a pull request.
 ///
@@ -407,7 +403,6 @@ pub trait Forge: Send + Sync {
     ) -> Result<BTreeMap<u64, PullFacts>, ForgeError>;
 }
 
-
 /// One branch's pull request summaries, split into the primary and its shadowed history.
 #[derive(Debug, Default)]
 pub struct PullIndex {
@@ -450,8 +445,6 @@ pub fn index_pulls(prs: &[PullSummary]) -> PullIndex {
     }
     index
 }
-
-
 
 #[cfg(test)]
 mod tests {
@@ -593,7 +586,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn summaries_copy_only_the_cheap_projection_and_preserve_its_behavior() {
         let pull = PullRequest {
@@ -621,5 +613,4 @@ mod tests {
         assert!(summary.is_from("OUR-ORG"));
         assert_eq!(summary.merge_commit, pull.merge_commit);
     }
-
 }

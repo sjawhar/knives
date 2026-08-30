@@ -1,4 +1,9 @@
-use super::*;
+use super::{
+    BTreeMap, BTreeSet, BookmarkRef, BookmarkTips, BranchName, BranchTarget, CommitId, Finding,
+    FindingKind, Forge, JjError, LandedVerdict, Options, OriginRelation, Repo, RepoEntry, RepoName,
+    Report, Role, Store, Subject, classify_landed, divergent_changes, double_checkout, index_pulls,
+    probe_landed, short,
+};
 
 use super::rows::pull_summary_for;
 /// Inputs for a landed probe.
@@ -17,9 +22,7 @@ pub(super) struct LandedInput<'a, 'forge> {
 /// bookmark, so when local and origin disagree it answers about content nobody has
 /// pushed, and stale content replays clean and reads as landed. Refusing to judge is
 /// cheap; the `landed` advice is to delete the branch and its release parent.
-pub(super) fn landed_verdict(
-    input: LandedInput<'_, '_>,
-) -> Result<Option<LandedVerdict>, JjError> {
+pub(super) fn landed_verdict(input: LandedInput<'_, '_>) -> Result<Option<LandedVerdict>, JjError> {
     let LandedInput {
         path,
         branch,
@@ -87,10 +90,7 @@ pub(super) struct ProbeContext<'a, 'forge, 'opened_ref, 'opened> {
     trunk_commit: Option<&'a CommitId>,
 }
 
-pub(super) fn probe_one(
-    input: &ProbeInput,
-    context: &ProbeContext<'_, '_, '_, '_>,
-) -> ProbeResult {
+pub(super) fn probe_one(input: &ProbeInput, context: &ProbeContext<'_, '_, '_, '_>) -> ProbeResult {
     let ProbeContext {
         path,
         options,
@@ -543,9 +543,10 @@ mod tests {
         clippy::indexing_slicing,
         reason = "indexing a result in a test is the assertion; a panic is the failure"
     )]
-    use super::*;
     use super::super::rows::{RowInput, branch_rows};
     use super::super::unjudged_note;
+    use super::*;
+    use crate::forge::PullRequest;
     use crate::forge::fake::FakeForge;
     use std::collections::BTreeMap;
     use std::path::Path;
@@ -613,7 +614,8 @@ mod tests {
 
         let snapshot = phase.snapshot.as_ref().expect("the live batch completed");
         assert_eq!(
-            snapshot.index().by_branch[&branch].number, 8,
+            snapshot.index().by_branch[&branch].number,
+            8,
             "the current open pull request is primary"
         );
         let store = Store::open(cache.path().join("state.json")).expect("open state");

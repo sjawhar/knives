@@ -364,10 +364,7 @@ pub fn sync_repo(input: SyncInput<'_>) -> anyhow::Result<Report> {
         None
     };
     let snapshot = match opened.as_ref() {
-        Some(opened) => match opened.complete_with(
-            &(&foreign, &seen),
-            select_tracked_numbers,
-        ) {
+        Some(opened) => match opened.complete_with(&(&foreign, &seen), select_tracked_numbers) {
             Ok(snapshot) => Some(snapshot),
             Err(error) => {
                 report
@@ -380,7 +377,7 @@ pub fn sync_repo(input: SyncInput<'_>) -> anyhow::Result<Report> {
     };
     let tracked = snapshot.as_ref().map_or_else(
         || tracked_pull_requests(&[], &foreign, &seen),
-        |snapshot| tracked_pull_requests(&snapshot.ours(), &foreign, &seen),
+        |snapshot| tracked_pull_requests(snapshot.ours(), &foreign, &seen),
     );
     let heads = pull_heads_or_problem(entry, &mut report);
     let summaries: &[PullSummary] = snapshot
@@ -591,7 +588,6 @@ mod tracking_tests {
     use super::{test_pull, *};
     use crate::forge::PullSummary;
 
-
     #[test]
     fn every_listed_pull_request_is_tracked_even_with_no_local_bookmark() {
         // Scoping now happens upstream, by head repository, so everything reaching
@@ -599,10 +595,12 @@ mod tracking_tests {
         // any branch we had pushed but did not have checked out in this clone: the
         // The forge reported 13 open pull requests for a real repository and knives reported
         // 12, and the missing one was the single most actionable of them.
-        let pull_requests: Vec<PullSummary> =
-            [test_pull(1, "feat/checked-out"), test_pull(2, "feat/pushed-only")]
-                .map(|(_, pull_request)| PullSummary::of(&pull_request))
-                .into();
+        let pull_requests: Vec<PullSummary> = [
+            test_pull(1, "feat/checked-out"),
+            test_pull(2, "feat/pushed-only"),
+        ]
+        .map(|(_, pull_request)| PullSummary::of(&pull_request))
+        .into();
         let foreign: BTreeSet<u64> = BTreeSet::new();
 
         let tracked = tracked_pull_requests(&pull_requests, &foreign, &BTreeMap::new());
@@ -641,7 +639,6 @@ mod comment_activity_tests {
     use std::path::Path;
     use std::process::Command;
     use tempfile::TempDir;
-
 
     #[derive(Debug)]
     struct ErroringForge {
