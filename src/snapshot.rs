@@ -9,7 +9,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use crate::detect::LandedVerdict;
-use crate::forge::{Forge, ForgeError, PullFacts, PullSummary, RepoIdentity};
+use crate::forge::{Forge, ForgeError, PullFacts, PullIndex, PullSummary, RepoIdentity};
 use crate::forge_cache::{self, CacheFile};
 
 pub struct SnapshotConfig<'a> {
@@ -79,7 +79,7 @@ impl Opened<'_> {
 
     /// Warm: sweep; valid delta → cached rows. Overflow/invalid/failed sweep or
     /// no cache → cold reseed (wide cheap lists). Err = neither path succeeded.
-    pub fn discover(&self) -> Result<Discovery<'_>, ForgeError> {
+    fn discover(&self) -> Result<Discovery<'_>, ForgeError> {
         if let Some(read) = &self.read
             && let Ok(page) = self.config.forge.sweep(self.config.path, &self.identity)
         {
@@ -130,6 +130,24 @@ impl Opened<'_> {
             cold: true,
         })
     }
+
+    /// Completes the one discovery-and-live-batch choreography. `select` can
+    /// inspect the ephemeral discovery view to select any extra pull requests
+    /// whose current facts the completed snapshot must contain.
+    ///
+    /// `select` is a function pointer, not a capturing closure, so discovery
+    /// rows and indexes cannot accidentally escape into post-batch code. Callers
+    /// pass only immutable selection inputs through `context`; the deduped
+    /// selection output is available afterward through `CompletedSnapshot::requested`.
+    pub fn complete_with<C: ?Sized>(
+        &self,
+        context: &C,
+        select: fn(&Discovery<'_>, &C) -> Vec<u64>,
+    ) -> Result<CompletedSnapshot<'_>, ForgeError> {
+        let discovery = self.discover()?;
+        let surfaced = select(&discovery, context);
+        discovery.into_completed(surfaced)
+    }
 }
 
 pub struct Discovery<'o> {
@@ -164,12 +182,17 @@ impl<'o> Discovery<'o> {
         ours_only(&self.rows, &self.opened.config.remotes)
     }
 
-    /// The one live batch: refresh set ∪ surfaced (deduped). Any failure → Err
-    /// and no snapshot exists (I3). Success merges fetched rows over the
-    /// discovery rows so `rows()` reflects what the batch just proved.
-    pub fn complete(self, surfaced: &[u64]) -> Result<ForgeSnapshot<'o>, ForgeError> {
+    /// The one live batch: refresh set ∪ requested numbers (deduped). Any
+    /// failure → Err and no snapshot exists (I3). Success merges fetched rows
+    /// over the discovery rows so `rows()` reflects what the batch just proved.
+    fn into_completed(
+        self,
+        mut requested: Vec<u64>,
+    ) -> Result<CompletedSnapshot<'o>, ForgeError> {
+        requested.sort_unstable();
+        requested.dedup();
         let mut numbers = self.refresh;
-        numbers.extend_from_slice(surfaced);
+        numbers.extend_from_slice(&requested);
         numbers.sort_unstable();
         numbers.dedup();
         let facts = if numbers.is_empty() {
@@ -191,9 +214,14 @@ impl<'o> Discovery<'o> {
             }
         }
         rows.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
-        Ok(ForgeSnapshot {
+        let ours = ours_only(&rows, &self.opened.config.remotes);
+        let index = crate::forge::index_pulls(&ours);
+        Ok(CompletedSnapshot {
             opened: self.opened,
             rows,
+            ours,
+            index,
+            requested,
             facts,
             sweep_max: self.sweep_max,
             cold: self.cold,
@@ -201,19 +229,26 @@ impl<'o> Discovery<'o> {
     }
 }
 
-pub struct ForgeSnapshot<'o> {
+/// A completed forge discovery and its single live fact batch.
+pub struct CompletedSnapshot<'o> {
     opened: &'o Opened<'o>,
     rows: Vec<PullSummary>,
+    ours: Vec<PullSummary>,
+    index: PullIndex,
+    requested: Vec<u64>,
     facts: BTreeMap<u64, PullFacts>,
     sweep_max: String,
     cold: bool,
 }
 
-impl fmt::Debug for ForgeSnapshot<'_> {
+impl fmt::Debug for CompletedSnapshot<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ForgeSnapshot")
+        f.debug_struct("CompletedSnapshot")
             .field("opened", &self.opened)
             .field("rows", &self.rows)
+            .field("ours", &self.ours)
+            .field("index", &self.index)
+            .field("requested", &self.requested)
             .field("facts", &self.facts)
             .field("sweep_max", &self.sweep_max)
             .field("cold", &self.cold)
@@ -221,18 +256,40 @@ impl fmt::Debug for ForgeSnapshot<'_> {
     }
 }
 
-impl ForgeSnapshot<'_> {
+/// A cache-write failure that happened after live forge data was completed.
+#[derive(Debug)]
+pub struct PersistNote(std::io::Error);
+
+impl fmt::Display for PersistNote {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "forge cache not saved: {}", self.0)
+    }
+}
+
+impl CompletedSnapshot<'_> {
     pub fn rows(&self) -> &[PullSummary] {
         &self.rows
     }
 
     /// `rows()` filtered to copies owned by the configured remotes.
-    pub fn ours(&self) -> Vec<PullSummary> {
-        ours_only(&self.rows, &self.opened.config.remotes)
+    pub fn ours(&self) -> &[PullSummary] {
+        &self.ours
+    }
+
+    /// The primary and shadowed pull requests indexed from `ours()`.
+    pub fn index(&self) -> &PullIndex {
+        &self.index
+    }
+
+    /// Numbers selected by the caller, deduped before warm refresh numbers join
+    /// the batch. The finish guard uses this to fail closed when a selected fact
+    /// is absent.
+    pub fn requested(&self) -> &[u64] {
+        &self.requested
     }
 
     /// The live fact row. Present for every number the batch answered; a
-    /// surfaced number that is absent was `NOT_FOUND` — render it as unanswered,
+    /// selected number that is absent was `NOT_FOUND` — render it as unanswered,
     /// never from cache.
     pub fn fact(&self, number: u64) -> Option<&PullFacts> {
         self.facts.get(&number)
@@ -243,7 +300,10 @@ impl ForgeSnapshot<'_> {
     /// Err = cache write failed AFTER live success: consulted stays true,
     /// caller adds a problem note (failure-table row 7). No-op Ok when no
     /// cache path exists.
-    pub fn persist(&self, landed: Option<BTreeMap<String, LandedVerdict>>) -> std::io::Result<()> {
+    pub fn persist(
+        &self,
+        landed: Option<BTreeMap<String, LandedVerdict>>,
+    ) -> Result<(), PersistNote> {
         let Some(path) = &self.opened.file else {
             return Ok(());
         };
@@ -263,12 +323,12 @@ impl ForgeSnapshot<'_> {
                 merged
             }
             (false, None) => {
-                return Err(std::io::Error::other(
+                return Err(PersistNote(std::io::Error::other(
                     "a warm snapshot must retain the cache read from open",
-                ));
+                )));
             }
         };
-        forge_cache::write(path, &file)
+        forge_cache::write(path, &file).map_err(PersistNote)
     }
 }
 
@@ -297,7 +357,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::path::Path;
 
-    use super::{SnapshotConfig, open};
+    use super::{Discovery, SnapshotConfig, open};
     use crate::detect::LandedVerdict;
     use crate::forge::{Account, PullRequest, PullSummary, RepoIdentity};
     use crate::forge::fake::FakeForge;
@@ -348,6 +408,34 @@ mod tests {
         }
     }
 
+    fn select_none(_: &Discovery<'_>, _: &()) -> Vec<u64> {
+        Vec::new()
+    }
+
+    fn select_numbers(_: &Discovery<'_>, numbers: &[u64]) -> Vec<u64> {
+        numbers.to_vec()
+    }
+
+    struct ExpectedSelection<'a> {
+        rows: &'a [u64],
+        surfaced: &'a [u64],
+    }
+
+    fn select_expected(
+        discovery: &Discovery<'_>,
+        expected: &ExpectedSelection<'_>,
+    ) -> Vec<u64> {
+        assert_eq!(
+            discovery
+                .rows()
+                .iter()
+                .map(|row| row.number)
+                .collect::<Vec<_>>(),
+            expected.rows
+        );
+        expected.surfaced.to_vec()
+    }
+
     fn cache(watermark: &str, pulls: impl IntoIterator<Item = PullRequest>) -> CacheFile {
         CacheFile {
             schema_version: SCHEMA_VERSION,
@@ -372,9 +460,7 @@ mod tests {
         let forge = fake([initial]);
         let opened = open(config(&forge, Some(root))).expect("resolve fake identity");
         let snapshot = opened
-            .discover()
-            .expect("cold reseed")
-            .complete(&[])
+            .complete_with(&(), select_none)
             .expect("empty live batch succeeds");
         snapshot.persist(None).expect("persist seed cache");
     }
@@ -396,9 +482,7 @@ mod tests {
             "the landed section comes from the single read at open"
         );
         let snapshot = opened
-            .discover()
-            .expect("sweep spans the watermark")
-            .complete(&[])
+            .complete_with(&(), select_none)
             .expect("live batch succeeds");
 
         assert_eq!(
@@ -420,9 +504,7 @@ mod tests {
         };
         let quiet_opened = open(config(&quiet_forge, None)).expect("open quiet repository");
         let quiet_snapshot = quiet_opened
-            .discover()
-            .expect("empty cold list succeeds")
-            .complete(&[])
+            .complete_with(&(), select_none)
             .expect("empty batch does not call pull_facts");
         assert!(
             quiet_snapshot.fact(7).is_none(),
@@ -442,7 +524,7 @@ mod tests {
         };
 
         let opened = open(config(&forge, Some(directory.path()))).expect("open seeded cache");
-        let result = opened.discover().expect("sweep succeeds").complete(&[]);
+        let result = opened.complete_with(&(), select_none);
 
         assert!(
             result.is_err(),
@@ -468,17 +550,15 @@ mod tests {
         };
 
         let opened = open(config(&forge, Some(directory.path()))).expect("open cache");
-        let discovery = opened.discover().expect("failed sweep falls back to list");
-        assert_eq!(
-            discovery
-                .rows()
-                .iter()
-                .map(|row| row.number)
-                .collect::<Vec<_>>(),
-            vec![7, 100],
-            "cold discovery normalizes the fake's branch-ordered list to newest-updated first"
-        );
-        let snapshot = discovery.complete(&[7]).expect("live batch after reseed");
+        let snapshot = opened
+            .complete_with(
+                &ExpectedSelection {
+                    rows: &[7, 100],
+                    surfaced: &[7],
+                },
+                select_expected,
+            )
+            .expect("live batch after reseed");
 
         assert_eq!(
             snapshot
@@ -510,7 +590,7 @@ mod tests {
         assert!(
             open(config(&forge, Some(directory.path())))
                 .expect("open cache")
-                .discover()
+                .complete_with(&(), select_none)
                 .is_err(),
             "no cached discovery survives when both live paths fail"
         );
@@ -533,9 +613,7 @@ mod tests {
 
         let opened = open(config(&forge, Some(directory.path()))).expect("open cache");
         let snapshot = opened
-            .discover()
-            .expect("overflow falls back to cold list")
-            .complete(&[7])
+            .complete_with(&[7_u64][..], select_numbers)
             .expect("live batch succeeds");
         snapshot.persist(None).expect("persist cold replacement");
 
@@ -562,9 +640,7 @@ mod tests {
 
         let opened = open(config(&forge, Some(directory.path()))).expect("open cache");
         let snapshot = opened
-            .discover()
-            .expect("a complete first page is a valid delta")
-            .complete(&[])
+            .complete_with(&(), select_none)
             .expect("the refreshed row is fetched live");
 
         assert_eq!(
@@ -584,9 +660,7 @@ mod tests {
 
         let opened = open(config(&forge, Some(directory.path()))).expect("open cache");
         let snapshot = opened
-            .discover()
-            .expect("sweep spans its equal watermark")
-            .complete(&[])
+            .complete_with(&(), select_none)
             .expect("same-second entry is in the live batch");
 
         assert_eq!(
@@ -606,18 +680,19 @@ mod tests {
         let opened = open(config(&forge, Some(&root_file)))
             .expect("identity resolution does not depend on the cache");
         let snapshot = opened
-            .discover()
-            .expect("cold list succeeds")
-            .complete(&[7])
+            .complete_with(&[7_u64][..], select_numbers)
             .expect("live data succeeds before the write");
 
         assert!(
             snapshot.fact(7).is_some(),
             "live fact is usable before persistence"
         );
+        let note = snapshot
+            .persist(None)
+            .expect_err("an unwritable cache is reported to the caller");
         assert!(
-            snapshot.persist(None).is_err(),
-            "an unwritable cache is reported to the caller"
+            note.to_string().starts_with("forge cache not saved: "),
+            "the note text is canonical: {note}"
         );
         assert!(
             snapshot.fact(7).is_some(),
@@ -639,15 +714,18 @@ mod tests {
 
         let opened = open(config(&forge, Some(directory.path()))).expect("open cache");
         let snapshot = opened
-            .discover()
-            .expect("valid warm delta")
-            .complete(&[7, 9, 9])
+            .complete_with(&[7_u64, 9, 9][..], select_numbers)
             .expect("one batch answers refresh and surfaced numbers");
 
         assert!(snapshot.fact(7).is_some(), "the refresh number is answered");
         assert!(
             snapshot.fact(9).is_some(),
             "a surfaced number joins the batch once"
+        );
+        assert_eq!(
+            snapshot.requested(),
+            &[7, 9],
+            "the caller's selection is deduped before it joins warm refresh numbers"
         );
     }
 
@@ -661,16 +739,14 @@ mod tests {
 
         let opened = open(config(&forge, Some(directory.path())))
             .expect("open ignores a foreign cache file");
-        let discovery = opened.discover().expect("identity mismatch cold-reseeds");
-
-        assert_eq!(
-            discovery
-                .rows()
-                .iter()
-                .map(|row| row.number)
-                .collect::<Vec<_>>(),
-            vec![7],
-            "the foreign file contributes no discovery rows"
-        );
+        opened
+            .complete_with(
+                &ExpectedSelection {
+                    rows: &[7],
+                    surfaced: &[],
+                },
+                select_expected,
+            )
+            .expect("identity mismatch cold-reseeds");
     }
 }

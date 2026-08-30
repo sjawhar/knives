@@ -67,7 +67,7 @@ pub(super) fn maintained_branches(
 pub(super) fn stated_pull_for(
     target: &BranchTarget,
     store: &Store,
-    snapshot: Option<&crate::snapshot::ForgeSnapshot<'_>>,
+    snapshot: Option<&crate::snapshot::CompletedSnapshot<'_>>,
 ) -> Option<StatedPull> {
     store.tracked_pull(target).map(|number| StatedPull {
         state: snapshot
@@ -133,7 +133,7 @@ pub(super) struct DivergentInput<'a, 'snapshot> {
     pub(super) tips: &'a BookmarkTips,
     pub(super) name: &'a RepoName,
     pub(super) store: &'a Store,
-    pub(super) snapshot: Option<&'a crate::snapshot::ForgeSnapshot<'snapshot>>,
+    pub(super) snapshot: Option<&'a crate::snapshot::CompletedSnapshot<'snapshot>>,
     pub(super) index: &'a PullIndex,
     pub(super) notches: &'a [Notch],
 }
@@ -208,7 +208,7 @@ pub(super) struct RowInput<'a, 'snapshot> {
     pub(super) store: &'a Store,
     pub(super) probe_inputs: Vec<ProbeInput>,
     pub(super) index: &'a PullIndex,
-    pub(super) snapshot: Option<&'a crate::snapshot::ForgeSnapshot<'snapshot>>,
+    pub(super) snapshot: Option<&'a crate::snapshot::CompletedSnapshot<'snapshot>>,
     pub(super) notches: &'a [Notch],
 }
 

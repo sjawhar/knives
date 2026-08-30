@@ -341,7 +341,7 @@ struct DependencyContext<'a, 'snapshot> {
     store: &'a Store,
     registry: &'a Registry,
     forge: Option<&'a dyn Forge>,
-    snapshot: Option<&'a crate::snapshot::ForgeSnapshot<'snapshot>>,
+    snapshot: Option<&'a crate::snapshot::CompletedSnapshot<'snapshot>>,
 }
 
 struct DependencyResults<'a> {
@@ -484,7 +484,7 @@ struct DependencyInput<'a, 'forge, 'snapshot> {
     name: &'a RepoName,
     store: &'a Store,
     options: &'a Options<'forge>,
-    snapshot: Option<&'a crate::snapshot::ForgeSnapshot<'snapshot>>,
+    snapshot: Option<&'a crate::snapshot::CompletedSnapshot<'snapshot>>,
     timings: &'a mut Timings,
 }
 
@@ -783,7 +783,10 @@ fn fold_phase_outcome(
     input: PostPhaseInput<'_>,
     phases: &mut phases::StatusPhases<'_>,
 ) -> anyhow::Result<()> {
-    report.forge_consulted = phases.forge.snapshot.is_some();
+    let snapshot = phases.forge.snapshot.as_ref();
+    let empty_index = PullIndex::default();
+    let index = snapshot.map_or(&empty_index, crate::snapshot::CompletedSnapshot::index);
+    report.forge_consulted = snapshot.is_some();
     report
         .problems
         .extend(std::mem::take(&mut phases.forge.problems));
@@ -801,8 +804,8 @@ fn fold_phase_outcome(
             name: input.name,
             store: input.store,
             probe_inputs: input.probe_inputs,
-            index: &phases.forge.index,
-            snapshot: phases.forge.snapshot.as_ref(),
+            index,
+            snapshot,
             notches: input.notches,
         },
         std::mem::take(&mut phases.probe.verdicts),
@@ -819,8 +822,8 @@ fn fold_phase_outcome(
             tips: input.tips,
             name: input.name,
             store: input.store,
-            snapshot: phases.forge.snapshot.as_ref(),
-            index: &phases.forge.index,
+            snapshot,
+            index,
             notches: input.notches,
         }));
     report
@@ -855,15 +858,15 @@ fn fold_phase_outcome(
         name: input.name,
         store: input.store,
         options: input.options,
-        snapshot: phases.forge.snapshot.as_ref(),
+        snapshot,
         timings,
     });
-    if let Some(snapshot) = phases.forge.snapshot.as_ref() {
+    if let Some(snapshot) = snapshot {
         let landed = input
             .probe_ran
             .then(|| std::mem::take(&mut phases.probe.landed));
-        if let Err(error) = snapshot.persist(landed) {
-            report.notes.push(format!("forge cache not saved: {error}"));
+        if let Err(note) = snapshot.persist(landed) {
+            report.notes.push(note.to_string());
         }
     }
     timings.report = phase.elapsed();

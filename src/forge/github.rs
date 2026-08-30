@@ -332,7 +332,7 @@ impl Forge for CliForge {
 ///
 /// No pagination: cursoring over a changing `UPDATED_AT` ordering can skip a
 /// concurrently-updated pull request, so a page that does not span the
-/// watermark abandons the delta (`snapshot::discover`).
+/// watermark abandons the delta (`snapshot::Opened::complete_with`).
 pub const fn sweep_query() -> &'static str {
     "query($owner: String!, $name: String!) { \
      repository(owner: $owner, name: $name) { \

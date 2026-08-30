@@ -244,10 +244,24 @@ pub(super) fn declared_numbers(
 }
 
 pub(super) struct ForgePhase<'snapshot> {
-    pub(super) snapshot: Option<crate::snapshot::ForgeSnapshot<'snapshot>>,
-    pub(super) index: PullIndex,
+    pub(super) snapshot: Option<crate::snapshot::CompletedSnapshot<'snapshot>>,
     pub(super) duration: std::time::Duration,
     pub(super) problems: Vec<String>,
+}
+
+fn select_status_numbers(
+    discovery: &crate::snapshot::Discovery<'_>,
+    context: &(&[BranchName], &[u64]),
+) -> Vec<u64> {
+    let (branches, extra_numbers) = *context;
+    let discovery_index = index_pulls(&discovery.ours());
+    let mut surfaced: Vec<u64> = branches
+        .iter()
+        .filter_map(|branch| pull_summary_for(branch, &discovery_index.by_branch))
+        .map(|pull| pull.number)
+        .collect();
+    surfaced.extend_from_slice(extra_numbers);
+    surfaced
 }
 
 pub(super) fn forge_phase<'snapshot>(
@@ -259,38 +273,16 @@ pub(super) fn forge_phase<'snapshot>(
     let Some(opened) = opened else {
         return ForgePhase {
             snapshot: None,
-            index: PullIndex::default(),
             duration: started.elapsed(),
             problems: Vec::new(),
         };
     };
-    let discovery = match opened.discover() {
-        Ok(discovery) => discovery,
-        Err(error) => {
-            return ForgePhase {
-                snapshot: None,
-                index: PullIndex::default(),
-                duration: started.elapsed(),
-                problems: vec![format!("pull request state unavailable: {error}")],
-            };
-        }
-    };
-    let discovery_index = index_pulls(&discovery.ours());
-    let mut surfaced: Vec<u64> = branches
-        .iter()
-        .filter_map(|branch| pull_summary_for(branch, &discovery_index.by_branch))
-        .map(|pull| pull.number)
-        .collect();
-    surfaced.extend_from_slice(extra_numbers);
-    surfaced.sort_unstable();
-    surfaced.dedup();
-    match discovery.complete(&surfaced) {
+    match opened.complete_with(&(branches, extra_numbers), select_status_numbers) {
         Ok(snapshot) => {
-            let index = index_pulls(&snapshot.ours());
             let problems = branches
                 .iter()
                 .filter_map(|branch| {
-                    let summary = pull_summary_for(branch, &index.by_branch)?;
+                    let summary = pull_summary_for(branch, &snapshot.index().by_branch)?;
                     snapshot.fact(summary.number).is_none().then(|| {
                         format!(
                             "pull request #{} for {branch} unavailable: the forge did not report it",
@@ -301,14 +293,12 @@ pub(super) fn forge_phase<'snapshot>(
                 .collect();
             ForgePhase {
                 snapshot: Some(snapshot),
-                index,
                 duration: started.elapsed(),
                 problems,
             }
         }
         Err(error) => ForgePhase {
             snapshot: None,
-            index: PullIndex::default(),
             duration: started.elapsed(),
             problems: vec![format!("pull request state unavailable: {error}")],
         },
@@ -559,6 +549,10 @@ mod tests {
     use crate::forge::fake::FakeForge;
     use std::collections::BTreeMap;
     use std::path::Path;
+    fn select_numbers(_: &crate::snapshot::Discovery<'_>, numbers: &[u64]) -> Vec<u64> {
+        numbers.to_vec()
+    }
+
     #[test]
     fn status_uses_a_newly_open_primary_from_the_completed_snapshot() {
         // A warm cache can still attach a branch to a closed primary when a new
@@ -584,9 +578,7 @@ mod tests {
         })
         .expect("open seed cache");
         seeded_opened
-            .discover()
-            .expect("discover closed pull request")
-            .complete(&[7])
+            .complete_with(&[7_u64][..], select_numbers)
             .expect("fetch closed pull request")
             .persist(None)
             .expect("persist closed pull request");
@@ -619,9 +611,9 @@ mod tests {
             std::time::Instant::now(),
         );
 
-        assert!(phase.snapshot.is_some(), "the live batch completed");
+        let snapshot = phase.snapshot.as_ref().expect("the live batch completed");
         assert_eq!(
-            phase.index.by_branch[&branch].number, 8,
+            snapshot.index().by_branch[&branch].number, 8,
             "the current open pull request is primary"
         );
         let store = Store::open(cache.path().join("state.json")).expect("open state");
@@ -636,7 +628,7 @@ mod tests {
                     tip: CommitId::new("test-commit"),
                     origin_tip: Some(CommitId::new("origin-commit")),
                 }],
-                index: &phase.index,
+                index: snapshot.index(),
                 snapshot: phase.snapshot.as_ref(),
                 notches: &[],
             },

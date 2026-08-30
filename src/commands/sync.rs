@@ -220,7 +220,7 @@ struct TrackingInput<'a, 'snapshot> {
     seen: &'a BTreeMap<String, String>,
     heads: &'a BTreeMap<u64, String>,
     summaries: &'a [PullSummary],
-    snapshot: Option<&'a crate::snapshot::ForgeSnapshot<'snapshot>>,
+    snapshot: Option<&'a crate::snapshot::CompletedSnapshot<'snapshot>>,
     scribe: &'a Scribe,
     store: &'a mut Store,
 }
@@ -303,12 +303,26 @@ fn pull_heads_or_problem(entry: &RepoEntry, report: &mut Report) -> BTreeMap<u64
     }
 }
 
-fn persist_snapshot(snapshot: Option<&crate::snapshot::ForgeSnapshot<'_>>, report: &mut Report) {
+fn persist_snapshot(
+    snapshot: Option<&crate::snapshot::CompletedSnapshot<'_>>,
+    report: &mut Report,
+) {
     if let Some(snapshot) = snapshot
-        && let Err(error) = snapshot.persist(None)
+        && let Err(note) = snapshot.persist(None)
     {
-        report.notes.push(format!("forge cache not saved: {error}"));
+        report.notes.push(note.to_string());
     }
+}
+
+fn select_tracked_numbers(
+    discovery: &crate::snapshot::Discovery<'_>,
+    context: &(&BTreeSet<u64>, &BTreeMap<String, String>),
+) -> Vec<u64> {
+    let (foreign, seen) = *context;
+    tracked_pull_requests(&discovery.ours(), foreign, seen)
+        .keys()
+        .copied()
+        .collect()
 }
 
 pub fn sync_repo(input: SyncInput<'_>) -> anyhow::Result<Report> {
@@ -349,25 +363,11 @@ pub fn sync_repo(input: SyncInput<'_>) -> anyhow::Result<Report> {
             .push("pull request state was not checked; branch columns are unknown".to_owned());
         None
     };
-    let discovery = match opened.as_ref() {
-        Some(opened) => match opened.discover() {
-            Ok(discovery) => Some(discovery),
-            Err(error) => {
-                report
-                    .problems
-                    .push(format!("pull request state unavailable: {error}"));
-                return Ok(report);
-            }
-        },
-        None => None,
-    };
-    let pre_batch_tracked = discovery.as_ref().map_or_else(
-        || tracked_pull_requests(&[], &foreign, &seen),
-        |discovery| tracked_pull_requests(&discovery.ours(), &foreign, &seen),
-    );
-    let surfaced: Vec<u64> = pre_batch_tracked.keys().copied().collect();
-    let snapshot = match discovery {
-        Some(discovery) => match discovery.complete(&surfaced) {
+    let snapshot = match opened.as_ref() {
+        Some(opened) => match opened.complete_with(
+            &(&foreign, &seen),
+            select_tracked_numbers,
+        ) {
             Ok(snapshot) => Some(snapshot),
             Err(error) => {
                 report
@@ -385,7 +385,7 @@ pub fn sync_repo(input: SyncInput<'_>) -> anyhow::Result<Report> {
     let heads = pull_heads_or_problem(entry, &mut report);
     let summaries: &[PullSummary] = snapshot
         .as_ref()
-        .map_or(&[], crate::snapshot::ForgeSnapshot::rows);
+        .map_or(&[], crate::snapshot::CompletedSnapshot::rows);
     record_tracked_pulls(
         TrackingInput {
             tracked,
@@ -462,6 +462,10 @@ mod tests {
     use std::collections::BTreeMap;
     use std::path::Path;
 
+    fn select_numbers(_: &crate::snapshot::Discovery<'_>, numbers: &[u64]) -> Vec<u64> {
+        numbers.to_vec()
+    }
+
     #[test]
     fn forge_state_wins_over_head_movement() {
         // Given: a pull request whose head moved AND which merged
@@ -537,9 +541,7 @@ mod tests {
         })
         .expect("open snapshot");
         let snapshot = opened
-            .discover()
-            .expect("discover pull request")
-            .complete(&[7])
+            .complete_with(&[7_u64][..], select_numbers)
             .expect("fetch pull request");
         let mut report = Report::default();
 
