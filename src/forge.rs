@@ -432,6 +432,25 @@ pub fn merged_onto(pull_requests: &[PullRequest], trunk: &str) -> Vec<LandedPull
     landed
 }
 
+/// The summary-typed successor to [`merged_onto`].
+///
+/// Wave 5 deletes the original and renames this function to [`merged_onto`].
+/// Merged means merged: a closed pull request landed nothing, and a merge onto
+/// some other base is not on the trunk. A merged pull request whose landing
+/// commit the forge did not record stays listed — the caller cannot place it
+/// and must say so, rather than choose a target that quietly leaves merged work
+/// out.
+pub fn merged_onto_summaries(pulls: &[PullSummary], trunk: &str) -> Vec<PullSummary> {
+    let mut merged: Vec<PullSummary> = pulls
+        .iter()
+        .filter(|pull| pull.is_merged() && pull.base_ref_name == trunk)
+        .cloned()
+        .collect();
+    merged.sort_unstable_by_key(|pull| pull.number);
+    merged
+}
+
+
 #[derive(Debug, thiserror::Error)]
 pub enum ForgeError {
     /// Raised, never swallowed. A status report that quietly omits pull request
@@ -891,6 +910,55 @@ pub struct PullIndex {
 /// and vice versa.
 pub fn index_pulls(prs: &[PullRequest]) -> PullIndex {
     let mut index = PullIndex::default();
+    for pr in prs {
+        let branch = BranchName::new(pr.head_ref_name.clone());
+        match index.by_branch.entry(branch.clone()) {
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                let _ = slot.insert(pr.clone());
+            }
+            std::collections::btree_map::Entry::Occupied(mut slot) => {
+                if pr.is_open() && !slot.get().is_open() {
+                    let shadowed = slot.insert(pr.clone());
+                    index.prior.entry(branch).or_default().push(shadowed);
+                } else {
+                    index.prior.entry(branch).or_default().push(pr.clone());
+                }
+            }
+        }
+    }
+    index
+}
+
+/// The summary-typed successor to [`PullIndex`] and [`index_pulls`].
+///
+/// Wave 5 deletes the originals and renames this type and [`index_summaries`]
+/// to their original names.
+///
+/// One branch's pull request summaries, split into the primary and its shadowed
+/// history.
+#[derive(Debug, Default)]
+pub struct SummaryIndex {
+    /// The pull request summary a reader should look at first for each head branch.
+    pub by_branch: BTreeMap<BranchName, PullSummary>,
+    /// The rest of each branch's pull request summaries, in the forge's
+    /// freshest-first order. A head branch accumulates several over its life — an
+    /// org-fork submission closed and re-homed onto a personal fork keeps its
+    /// review history on the closed number — and collapsing to one per branch used
+    /// to discard these silently. An audit walked straight past a maintainer's
+    /// blocking question because the closed predecessor carrying it never rendered
+    /// anywhere.
+    pub prior: BTreeMap<BranchName, Vec<PullSummary>>,
+}
+
+/// Index pull request summaries by head branch, keeping every shadowed one visible.
+///
+/// Primary selection is deterministic: an open pull request beats any closed or
+/// merged one, and ties keep the forge's own ordering. First-wins list order —
+/// the previous rule — let whichever pull request the forge listed first shadow
+/// the rest, so a freshly closed duplicate could hide a still-open submission
+/// and vice versa.
+pub fn index_summaries(prs: &[PullSummary]) -> SummaryIndex {
+    let mut index = SummaryIndex::default();
     for pr in prs {
         let branch = BranchName::new(pr.head_ref_name.clone());
         match index.by_branch.entry(branch.clone()) {
@@ -1671,6 +1739,59 @@ mod tests {
     }
 
     #[test]
+    fn an_open_summary_beats_closed_summaries_and_preserves_shadow_history_order() {
+        let summary =
+            |number: u64, state: &str, branch: &str, base: &str, oid: Option<&str>| PullSummary {
+                number,
+                state: state.to_owned(),
+                review_decision: String::new(),
+                head_ref_name: branch.to_owned(),
+                head_ref_oid: format!("oid-{number}"),
+                updated_at: "2026-08-01T00:00:00Z".to_owned(),
+                is_draft: false,
+                url: String::new(),
+                head_repository_owner: None,
+                base_ref_name: base.to_owned(),
+                merge_commit: oid.map(|oid| MergeCommit {
+                    oid: oid.to_owned(),
+                }),
+            };
+        let branch = BranchName::new("feat/alpha");
+
+        // A closed duplicate listed first cannot hide the first open submission;
+        // every shadow stays in the order the forge supplied it.
+        let closed_first = [
+            summary(9, "CLOSED", "feat/alpha", "main", None),
+            summary(7, "OPEN", "feat/alpha", "main", None),
+            summary(6, "OPEN", "feat/alpha", "main", None),
+            summary(8, "CLOSED", "feat/alpha", "main", None),
+        ];
+        let indexed = index_summaries(&closed_first);
+        assert_eq!(indexed.by_branch[&branch].number, 7);
+        assert_eq!(
+            indexed.prior[&branch]
+                .iter()
+                .map(|summary| summary.number)
+                .collect::<Vec<_>>(),
+            vec![9, 6, 8]
+        );
+
+        // The usual freshest-first order produces the same primary.
+        let open_first = [
+            summary(7, "OPEN", "feat/alpha", "main", None),
+            summary(9, "CLOSED", "feat/alpha", "main", None),
+        ];
+        let indexed = index_summaries(&open_first);
+        assert_eq!(indexed.by_branch[&branch].number, 7);
+        assert_eq!(indexed.prior[&branch][0].number, 9);
+
+        // With no open summary, the first closed summary remains the primary.
+        let indexed = index_summaries(&[summary(9, "CLOSED", "feat/alpha", "main", None)]);
+        assert_eq!(indexed.by_branch[&branch].number, 9);
+        assert!(indexed.prior.is_empty());
+    }
+
+    #[test]
     fn a_merge_commit_parses_when_present_and_defaults_when_absent() {
         // Given: one merged pull request naming its merge commit, one open without
         let payload = r#"[
@@ -1734,6 +1855,52 @@ mod tests {
             .iter()
             .map(|pull| (pull.number, pull.branch.as_str(), pull.oid.as_deref()))
             .collect();
+        assert_eq!(
+            brief,
+            vec![(5, "e", Some("e5")), (6, "f", None), (9, "a", Some("a9")),],
+            "case-insensitive state, trunk base only, sorted by number"
+        );
+    }
+
+    #[test]
+    fn only_merged_summaries_onto_the_trunk_are_returned_in_number_order() {
+        let summary =
+            |number: u64, state: &str, branch: &str, base: &str, oid: Option<&str>| PullSummary {
+                number,
+                state: state.to_owned(),
+                review_decision: String::new(),
+                head_ref_name: branch.to_owned(),
+                head_ref_oid: format!("oid-{number}"),
+                updated_at: "2026-08-01T00:00:00Z".to_owned(),
+                is_draft: false,
+                url: String::new(),
+                head_repository_owner: None,
+                base_ref_name: base.to_owned(),
+                merge_commit: oid.map(|oid| MergeCommit {
+                    oid: oid.to_owned(),
+                }),
+            };
+        let pulls = [
+            summary(5, "merged", "e", "main", Some("e5")),
+            summary(9, "MERGED", "a", "main", Some("a9")),
+            summary(2, "OPEN", "b", "main", None),
+            summary(3, "CLOSED", "c", "main", None),
+            summary(4, "MERGED", "d", "dev", Some("d4")),
+            summary(6, "MERGED", "f", "main", None),
+        ];
+
+        let merged = merged_onto_summaries(&pulls, "main");
+        let brief: Vec<(u64, &str, Option<&str>)> = merged
+            .iter()
+            .map(|summary| {
+                (
+                    summary.number,
+                    summary.head_ref_name.as_str(),
+                    summary.merge_commit.as_ref().map(|commit| commit.oid.as_str()),
+                )
+            })
+            .collect();
+
         assert_eq!(
             brief,
             vec![(5, "e", Some("e5")), (6, "f", None), (9, "a", Some("a9")),],
