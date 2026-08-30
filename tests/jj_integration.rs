@@ -77,7 +77,7 @@ fn one_batch_answers_review_age_and_checks_for_every_branch_at_once() {
                 .is_none()
         );
     }
-    let forge = knives::forge::FakeForge {
+    let forge = knives::forge::fake::FakeForge {
         pull_requests,
         stale_reviews: vec![11],
         checks: BTreeMap::from([
@@ -95,7 +95,7 @@ fn one_batch_answers_review_age_and_checks_for_every_branch_at_once() {
             // "consulted" is expressed and omitting it is how "not consulted" is.
             (12, ChecksSummary::default()),
         ]),
-        ..knives::forge::FakeForge::default()
+        ..knives::forge::fake::FakeForge::default()
     };
     let state = tempfile::tempdir().expect("state directory");
     let store = Store::open(state.path().join("state.json")).expect("open store");
@@ -362,7 +362,7 @@ fn a_failed_facts_batch_clears_review_and_check_cells() {
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     let mut pull = sync_pull_request(11, "OPEN", "feat/alpha", "head-11");
     pull.review_decision = "APPROVED".to_owned();
-    let forge = knives::forge::FakeForge {
+    let forge = knives::forge::fake::FakeForge {
         pull_requests: BTreeMap::from([(BranchName::new("feat/alpha"), pull)]),
         stale_reviews: vec![11],
         checks: BTreeMap::from([(
@@ -375,7 +375,7 @@ fn a_failed_facts_batch_clears_review_and_check_cells() {
             },
         )]),
         fail_facts: true,
-        ..knives::forge::FakeForge::default()
+        ..knives::forge::fake::FakeForge::default()
     };
     let state = tempfile::tempdir().expect("state directory");
     let store = Store::open(state.path().join("state.json")).expect("open store");
@@ -416,13 +416,13 @@ fn a_consulted_false_report_carries_zero_pull_facts() {
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     let name = knives::ids::RepoName::new("demo");
     let target = knives::ids::BranchTarget::new(name.clone(), BranchName::new("feat/alpha"));
-    let forge = knives::forge::FakeForge {
+    let forge = knives::forge::fake::FakeForge {
         pull_requests: BTreeMap::from([(
             BranchName::new("feat/alpha"),
             sync_pull_request(11, "OPEN", "feat/alpha", "head-11"),
         )]),
         fail_facts: true,
-        ..knives::forge::FakeForge::default()
+        ..knives::forge::fake::FakeForge::default()
     };
     let state = tempfile::tempdir().expect("state directory");
     let mut store = Store::open_for_update(state.path().join("state.json")).expect("open store");
@@ -465,13 +465,13 @@ fn stated_pulls_and_dependencies_are_answered_from_the_one_batch() {
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     let name = knives::ids::RepoName::new("demo");
     let target = knives::ids::BranchTarget::new(name.clone(), BranchName::new("feat/alpha"));
-    let forge = knives::forge::FakeForge {
+    let forge = knives::forge::fake::FakeForge {
         pull_requests: BTreeMap::from([(
             BranchName::new("feat/alpha"),
             sync_pull_request(11, "OPEN", "feat/alpha", "head-11"),
         )]),
         vanished_states: BTreeMap::from([(42, "CLOSED".to_owned()), (43, "MERGED".to_owned())]),
-        ..knives::forge::FakeForge::default()
+        ..knives::forge::fake::FakeForge::default()
     };
     let state = tempfile::tempdir().expect("state directory");
     let mut store = Store::open_for_update(state.path().join("state.json")).expect("open store");
@@ -528,7 +528,7 @@ fn landed_verdicts_come_from_the_cache_when_the_key_matches() {
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     let name = knives::ids::RepoName::new("demo");
     let entry = lab_entry(&lab);
-    let forge = knives::forge::FakeForge::default();
+    let forge = knives::forge::fake::FakeForge::default();
     let state = tempfile::tempdir().expect("state directory");
     let cache = tempfile::tempdir().expect("cache directory");
     let store = Store::open(state.path().join("state.json")).expect("open store");
@@ -584,7 +584,7 @@ fn a_probe_free_run_preserves_the_landed_section() {
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     let name = knives::ids::RepoName::new("demo");
     let entry = lab_entry(&lab);
-    let forge = knives::forge::FakeForge::default();
+    let forge = knives::forge::fake::FakeForge::default();
     let state = tempfile::tempdir().expect("state directory");
     let cache = tempfile::tempdir().expect("cache directory");
     let store = Store::open(state.path().join("state.json")).expect("open store");
@@ -632,7 +632,7 @@ fn an_unresolvable_trunk_fails_loudly_and_touches_no_landed_cache() {
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     let name = knives::ids::RepoName::new("demo");
     let entry = lab_entry(&lab);
-    let forge = knives::forge::FakeForge::default();
+    let forge = knives::forge::fake::FakeForge::default();
     let state = tempfile::tempdir().expect("state directory");
     let cache = tempfile::tempdir().expect("cache directory");
     let store = Store::open(state.path().join("state.json")).expect("open store");
@@ -2081,13 +2081,13 @@ fn sync_fails_closed_when_the_facts_batch_fails() {
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     let name = knives::ids::RepoName::new("demo");
     let entry = sync_entry(&lab);
-    let forge = knives::forge::FakeForge {
+    let forge = knives::forge::fake::FakeForge {
         pull_requests: BTreeMap::from([(
             BranchName::new("feat/alpha"),
             sync_pull_request(42, "OPEN", "feat/alpha", "head-42"),
         )]),
         fail_facts: true,
-        ..knives::forge::FakeForge::default()
+        ..knives::forge::fake::FakeForge::default()
     };
     let state = tempfile::tempdir().expect("state directory");
     let mut store = Store::open_for_update(state.path().join("state.json")).expect("store");
@@ -2126,13 +2126,13 @@ fn a_listed_state_wins_and_a_vanished_number_is_answered_by_the_batch() {
     lab.publish_pull("feat/alpha", 43);
     let name = knives::ids::RepoName::new("demo");
     let entry = sync_entry(&lab);
-    let forge = knives::forge::FakeForge {
+    let forge = knives::forge::fake::FakeForge {
         pull_requests: BTreeMap::from([(
             BranchName::new("feat/alpha"),
             sync_pull_request(42, "OPEN", "feat/alpha", "head-42"),
         )]),
         vanished_states: BTreeMap::from([(42, "MERGED".to_owned()), (43, "MERGED".to_owned())]),
-        ..knives::forge::FakeForge::default()
+        ..knives::forge::fake::FakeForge::default()
     };
     let state = tempfile::tempdir().expect("state directory");
     let mut store = Store::open_for_update(state.path().join("state.json")).expect("store");
@@ -2216,9 +2216,9 @@ fn sync_records_one_event_for_each_pull_request_that_moved() {
             },
         );
     }
-    let forge = knives::forge::FakeForge {
+    let forge = knives::forge::fake::FakeForge {
         pull_requests,
-        ..knives::forge::FakeForge::default()
+        ..knives::forge::fake::FakeForge::default()
     };
     let state = tempfile::tempdir().expect("state directory");
     let mut store = Store::open_for_update(state.path().join("state.json")).expect("open store");
@@ -2274,12 +2274,12 @@ fn sync_records_a_settled_pull_request_once_across_repeated_runs() {
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     let name = knives::ids::RepoName::new("demo");
     let entry = sync_entry(&lab);
-    let forge = knives::forge::FakeForge {
+    let forge = knives::forge::fake::FakeForge {
         pull_requests: BTreeMap::from([(
             BranchName::new("feat/alpha"),
             sync_pull_request(10, "MERGED", "feat/alpha", "head-10"),
         )]),
-        ..knives::forge::FakeForge::default()
+        ..knives::forge::fake::FakeForge::default()
     };
     let state = tempfile::tempdir().expect("state directory");
     let mut store = Store::open_for_update(state.path().join("state.json")).expect("open store");
@@ -2324,19 +2324,19 @@ fn sync_records_an_advanced_pull_request_then_its_merge() {
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     let name = knives::ids::RepoName::new("demo");
     let entry = sync_entry(&lab);
-    let advanced = knives::forge::FakeForge {
+    let advanced = knives::forge::fake::FakeForge {
         pull_requests: BTreeMap::from([(
             BranchName::new("feat/alpha"),
             sync_pull_request(12, "OPEN", "feat/alpha", "head-12"),
         )]),
-        ..knives::forge::FakeForge::default()
+        ..knives::forge::fake::FakeForge::default()
     };
-    let merged = knives::forge::FakeForge {
+    let merged = knives::forge::fake::FakeForge {
         pull_requests: BTreeMap::from([(
             BranchName::new("feat/alpha"),
             sync_pull_request(12, "MERGED", "feat/alpha", "head-12"),
         )]),
-        ..knives::forge::FakeForge::default()
+        ..knives::forge::fake::FakeForge::default()
     };
     let state = tempfile::tempdir().expect("state directory");
     let mut store = Store::open_for_update(state.path().join("state.json")).expect("open store");
@@ -2382,19 +2382,19 @@ fn sync_records_each_consecutive_advance() {
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     let name = knives::ids::RepoName::new("demo");
     let entry = sync_entry(&lab);
-    let first_advance = knives::forge::FakeForge {
+    let first_advance = knives::forge::fake::FakeForge {
         pull_requests: BTreeMap::from([(
             BranchName::new("feat/alpha"),
             sync_pull_request(12, "OPEN", "feat/alpha", "head-b"),
         )]),
-        ..knives::forge::FakeForge::default()
+        ..knives::forge::fake::FakeForge::default()
     };
-    let second_advance = knives::forge::FakeForge {
+    let second_advance = knives::forge::fake::FakeForge {
         pull_requests: BTreeMap::from([(
             BranchName::new("feat/alpha"),
             sync_pull_request(12, "OPEN", "feat/alpha", "head-c"),
         )]),
-        ..knives::forge::FakeForge::default()
+        ..knives::forge::fake::FakeForge::default()
     };
     let state = tempfile::tempdir().expect("state directory");
     let mut store = Store::open_for_update(state.path().join("state.json")).expect("open store");
@@ -4046,9 +4046,9 @@ fn preflight_renders_a_mixed_base_finding_and_exits_with_findings() {
     };
     let state = tempfile::tempdir().expect("create state directory");
     let mut store = Store::open_for_update(state.path().join("state.json")).expect("open store");
-    let forge = knives::forge::FakeForge {
+    let forge = knives::forge::fake::FakeForge {
         fail_facts: true,
-        ..knives::forge::FakeForge::default()
+        ..knives::forge::fake::FakeForge::default()
     };
 
     // When: preflight gathers and renders the repository state.
@@ -4663,7 +4663,7 @@ fn status_reports_a_carrier_for_a_closed_pull_request() {
     let name = knives::ids::RepoName::new("a-repo");
     let temp = std::env::temp_dir().join(format!("knives-status-{}", std::process::id()));
     let store = knives::store::Store::open(temp.join("state.json")).expect("store");
-    let forge = knives::forge::FakeForge {
+    let forge = knives::forge::fake::FakeForge {
         pull_requests: std::iter::once((
             BranchName::new("feat/alpha"),
             knives::forge::PullRequest {
@@ -4683,7 +4683,7 @@ fn status_reports_a_carrier_for_a_closed_pull_request() {
             },
         ))
         .collect(),
-        ..knives::forge::FakeForge::default()
+        ..knives::forge::fake::FakeForge::default()
     };
 
     // When: status gathers the branch report with the closed pull request

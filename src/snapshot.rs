@@ -299,7 +299,8 @@ mod tests {
 
     use super::{SnapshotConfig, open};
     use crate::detect::LandedVerdict;
-    use crate::forge::{Account, FakeForge, PullRequest, PullSummary, RepoIdentity};
+    use crate::forge::{Account, PullRequest, PullSummary, RepoIdentity};
+    use crate::forge::fake::FakeForge;
     use crate::forge_cache::{CacheFile, SCHEMA_VERSION, cache_path, load, write};
     use crate::ids::BranchName;
 

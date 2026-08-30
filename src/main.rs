@@ -15,7 +15,8 @@ use knives::commands::{
 };
 use knives::config::{default_config_path, load};
 use knives::detect::RebaseOutcome;
-use knives::forge::{CliForge, Forge, PullRequest};
+use knives::forge::{Forge, PullRequest};
+use knives::forge::github::CliForge;
 use knives::ids::{BranchName, BranchTarget, ReleaseScheme, RepoName, Requirement};
 use knives::ledger::{Draft, Kind, Ledger, Scribe};
 use knives::store::{Store, default_state_path};

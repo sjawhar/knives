@@ -2320,7 +2320,7 @@ mod tests {
         reason = "indexing a result in a test is the assertion; a panic is the failure"
     )]
     use super::*;
-    use crate::forge::FakeForge;
+    use crate::forge::fake::FakeForge;
     use crate::ids::{BranchName, RemoteName};
     use std::collections::BTreeMap;
     use std::path::Path;
@@ -3161,7 +3161,7 @@ mod tests {
 
     #[test]
     fn a_pending_legacy_status_context_renders_as_pending() {
-        let facts = crate::forge::parse_pull_facts(
+        let facts = crate::forge::github::parse_pull_facts(
             r#"{"data":{"repository":{"p13":{"number":13,"state":"OPEN","headRefName":"feat/pending",
             "headRefOid":"aa","updatedAt":"2026-08-01T00:00:00Z","rollup":{"nodes":[{"commit":{
             "statusCheckRollup":{"contexts":{"nodes":[{"__typename":"StatusContext",

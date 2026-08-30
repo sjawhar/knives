@@ -456,7 +456,8 @@ mod tests {
         reason = "indexing a result in a test is the assertion; a panic is the failure"
     )]
     use super::*;
-    use crate::forge::{FakeForge, PullRequest};
+    use crate::forge::PullRequest;
+    use crate::forge::fake::FakeForge;
     use crate::ids::BranchName;
     use std::collections::BTreeMap;
     use std::path::Path;

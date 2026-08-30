@@ -515,7 +515,7 @@ mod tests {
         let cache = tempfile::tempdir().expect("cache directory");
         std::fs::write(cache.path().join("forge"), "not a directory")
             .expect("block the cache parent");
-        let forge = crate::forge::FakeForge {
+        let forge = crate::forge::fake::FakeForge {
             pull_requests: std::collections::BTreeMap::from([(
                 crate::ids::BranchName::new("feat/alpha"),
                 crate::forge::PullRequest {
@@ -524,7 +524,7 @@ mod tests {
                     ..crate::forge::PullRequest::default()
                 },
             )]),
-            ..crate::forge::FakeForge::default()
+            ..crate::forge::fake::FakeForge::default()
         };
         let opened = snapshot::open(SnapshotConfig {
             forge: &forge,
