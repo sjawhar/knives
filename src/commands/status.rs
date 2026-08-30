@@ -10,7 +10,7 @@ use crate::detect::{
     double_checkout, stale_parents,
 };
 use crate::forge::{
-    ChecksSummary, Forge, PullDetails, PullRequest, PullSummary, SummaryIndex, index_summaries,
+    ChecksSummary, Forge, PullDetails, PullIndex, PullRequest, PullSummary, index_pulls,
 };
 use crate::ids::{
     BookmarkRef, BranchName, BranchTarget, CommitId, ReleaseScheme, RepoName, is_release_name,
@@ -785,7 +785,7 @@ fn declared_numbers(repo: &RepoName, branches: &[BranchName], store: &Store) -> 
 
 struct ForgePhase<'snapshot> {
     snapshot: Option<crate::snapshot::ForgeSnapshot<'snapshot>>,
-    index: SummaryIndex,
+    index: PullIndex,
     duration: std::time::Duration,
     problems: Vec<String>,
 }
@@ -799,7 +799,7 @@ fn forge_phase<'snapshot>(
     let Some(opened) = opened else {
         return ForgePhase {
             snapshot: None,
-            index: SummaryIndex::default(),
+            index: PullIndex::default(),
             duration: started.elapsed(),
             problems: Vec::new(),
         };
@@ -809,13 +809,13 @@ fn forge_phase<'snapshot>(
         Err(error) => {
             return ForgePhase {
                 snapshot: None,
-                index: SummaryIndex::default(),
+                index: PullIndex::default(),
                 duration: started.elapsed(),
                 problems: vec![format!("pull request state unavailable: {error}")],
             };
         }
     };
-    let index = index_summaries(&discovery.ours());
+    let index = index_pulls(&discovery.ours());
     let mut surfaced: Vec<u64> = branches
         .iter()
         .filter_map(|branch| pull_summary_for(branch, &index.by_branch))
@@ -847,7 +847,7 @@ fn forge_phase<'snapshot>(
         }
         Err(error) => ForgePhase {
             snapshot: None,
-            index: SummaryIndex::default(),
+            index: PullIndex::default(),
             duration: started.elapsed(),
             problems: vec![format!("pull request state unavailable: {error}")],
         },
@@ -1005,7 +1005,7 @@ struct DivergentInput<'a, 'snapshot> {
     name: &'a RepoName,
     store: &'a Store,
     snapshot: Option<&'a crate::snapshot::ForgeSnapshot<'snapshot>>,
-    index: &'a SummaryIndex,
+    index: &'a PullIndex,
     notches: &'a [Notch],
 }
 
@@ -1216,7 +1216,7 @@ struct RowInput<'a, 'snapshot> {
     repo: &'a Repo,
     store: &'a Store,
     probe_inputs: Vec<ProbeInput>,
-    index: &'a SummaryIndex,
+    index: &'a PullIndex,
     snapshot: Option<&'a crate::snapshot::ForgeSnapshot<'snapshot>>,
     notches: &'a [Notch],
 }

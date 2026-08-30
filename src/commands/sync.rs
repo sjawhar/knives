@@ -628,33 +628,6 @@ mod comment_activity_tests {
                 })
                 .collect())
         }
-        fn pull_requests(
-            &self,
-            _repo: &Path,
-            _authors: &[String],
-        ) -> Result<Vec<PullRequest>, ForgeError> {
-            Ok(self.pull_requests.clone())
-        }
-
-        fn pull_details(
-            &self,
-            _repo: &Path,
-            _numbers: &[u64],
-        ) -> Result<BTreeMap<u64, crate::forge::PullDetails>, ForgeError> {
-            Ok(BTreeMap::new())
-        }
-
-        fn pull_request_state(
-            &self,
-            _repo: &Path,
-            _number: u64,
-        ) -> Result<Option<String>, ForgeError> {
-            Ok(None)
-        }
-
-        fn newest_comment(&self, _repo: &Path, number: u64) -> Result<Option<String>, ForgeError> {
-            Ok(self.newest_comments.get(&number).cloned())
-        }
     }
 
     struct PullListUnavailable;
@@ -696,38 +669,6 @@ mod comment_activity_tests {
             _numbers: &[u64],
         ) -> Result<BTreeMap<u64, PullFacts>, ForgeError> {
             Ok(BTreeMap::new())
-        }
-        fn pull_requests(
-            &self,
-            _repo: &Path,
-            _authors: &[String],
-        ) -> Result<Vec<PullRequest>, ForgeError> {
-            Err(ForgeError::Command {
-                command: "gh pr list".to_owned(),
-                dir: "/repo".to_owned(),
-                code: 1,
-                stderr: "unavailable".to_owned(),
-            })
-        }
-
-        fn pull_details(
-            &self,
-            _repo: &Path,
-            _numbers: &[u64],
-        ) -> Result<BTreeMap<u64, crate::forge::PullDetails>, ForgeError> {
-            Ok(BTreeMap::new())
-        }
-
-        fn pull_request_state(
-            &self,
-            _repo: &Path,
-            _number: u64,
-        ) -> Result<Option<String>, ForgeError> {
-            Ok(None)
-        }
-
-        fn newest_comment(&self, _repo: &Path, _number: u64) -> Result<Option<String>, ForgeError> {
-            Ok(None)
         }
     }
 

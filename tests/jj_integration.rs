@@ -197,45 +197,6 @@ struct CountingForge {
 }
 
 impl Forge for CountingForge {
-    fn pull_requests(
-        &self,
-        _repo: &std::path::Path,
-        _authors: &[String],
-    ) -> Result<Vec<PullRequest>, ForgeError> {
-        Ok(self.pull_requests.values().cloned().collect())
-    }
-
-    fn pull_details(
-        &self,
-        _repo: &std::path::Path,
-        numbers: &[u64],
-    ) -> Result<BTreeMap<u64, knives::forge::PullDetails>, ForgeError> {
-        Ok(numbers
-            .iter()
-            .filter(|number| {
-                self.pull_requests
-                    .values()
-                    .any(|pull| pull.number == **number)
-            })
-            .map(|number| (*number, knives::forge::PullDetails::default()))
-            .collect())
-    }
-
-    fn pull_request_state(
-        &self,
-        _repo: &std::path::Path,
-        _number: u64,
-    ) -> Result<Option<String>, ForgeError> {
-        Ok(None)
-    }
-
-    fn newest_comment(
-        &self,
-        _repo: &std::path::Path,
-        _number: u64,
-    ) -> Result<Option<String>, ForgeError> {
-        Ok(None)
-    }
 
     fn repo_identity(&self, _repo: &std::path::Path) -> Result<RepoIdentity, ForgeError> {
         Ok(RepoIdentity {
@@ -5321,7 +5282,7 @@ fn a_rebase_moves_the_whole_composition_onto_the_target() {
 fn install_snapshot_gh(shim: &std::path::Path, pulls: &str, log: Option<&std::path::Path>) {
     let pulls: Vec<serde_json::Value> =
         serde_json::from_str(pulls).expect("parse fake pull request payload");
-    let sweep = pulls
+    let sweep_entries = pulls
         .iter()
         .map(|pull| {
             serde_json::json!({
@@ -5358,7 +5319,7 @@ fn install_snapshot_gh(shim: &std::path::Path, pulls: &str, log: Option<&std::pa
                 "repository": {
                     "pullRequests": {
                         "pageInfo": {"hasNextPage": false},
-                        "nodes": sweep,
+                        "nodes": sweep_entries,
                     }
                 }
             }

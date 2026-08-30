@@ -15,7 +15,7 @@ use knives::commands::{
     hook, init, notch, preflight, register, release, repos, start, status, sync,
 };
 use knives::config::{default_config_path, load};
-use knives::forge::{CliForge, Forge};
+use knives::forge::{CliForge, Forge, PullRequest};
 use knives::ids::{BranchName, BranchTarget, ReleaseScheme, RepoName, Requirement};
 use knives::ledger::{Draft, Kind, Ledger, Scribe};
 use knives::store::{Store, default_state_path};
@@ -481,7 +481,7 @@ struct RebaseDestination {
     reference: String,
     /// Empty for an explicit reference: dropping is the bare default's job,
     /// because only it knows the target covers every landing.
-    landed: Vec<knives::forge::LandedPull>,
+    landed: Vec<PullRequest>,
 }
 
 /// The commit a rebase moves onto, with the label the report and provenance use.
@@ -549,7 +549,7 @@ fn merged_rebase_target(
             return Ok(None);
         }
     };
-    let candidates = knives::forge::merged_onto_summaries(&discovery.ours(), entry.trunk());
+    let candidates = knives::forge::merged_onto(&discovery.ours(), entry.trunk());
     let numbers: Vec<u64> = candidates.iter().map(|pull| pull.number).collect();
     let snapshot = match discovery.complete(&numbers) {
         Ok(snapshot) => snapshot,
@@ -575,11 +575,7 @@ fn merged_rebase_target(
             };
             let pull = &fact.pull;
             if pull.is_merged() && pull.base_ref_name == entry.trunk() {
-                landed.push(knives::forge::LandedPull {
-                    number: pull.number,
-                    branch: BranchName::new(pull.head_ref_name.clone()),
-                    oid: pull.merge_commit.as_ref().map(|merge| merge.oid.clone()),
-                });
+                landed.push(pull.clone());
             }
         }
         if landed.is_empty() {
@@ -593,7 +589,7 @@ fn merged_rebase_target(
         let mut placed: Vec<(u64, knives::ids::CommitId)> = Vec::new();
         let mut unplaced: Vec<u64> = Vec::new();
         for pull in &landed {
-            let oid = pull.oid.clone();
+            let oid = pull.merge_commit.as_ref().map(|merge| merge.oid.clone());
             let number = pull.number;
             // Unrecorded, unresolvable and out-of-trunk merge commits are one fact
             // here: the local trunk does not carry that landing yet.
@@ -712,7 +708,7 @@ fn drop_landed_members(
     let mut kept = parents.clone();
     let mut deltas: Vec<String> = Vec::new();
     for pull in &destination.landed {
-        let Some(tip) = bookmark_tip(&opened, pull.branch.as_str())? else {
+        let Some(tip) = bookmark_tip(&opened, &pull.head_ref_name)? else {
             continue;
         };
         if !parents.contains(&tip) {
@@ -721,14 +717,14 @@ fn drop_landed_members(
         if knives::jj::carries_work_past(&entry.path, &destination.onto, &tip)? {
             println!(
                 "{repo}: kept {}: it carries work past #{}",
-                pull.branch, pull.number
+                pull.head_ref_name, pull.number
             );
             continue;
         }
         kept.retain(|parent| parent != &tip);
         deltas.push(format!(
             "dropped {}: landed upstream as #{}",
-            pull.branch, pull.number
+            pull.head_ref_name, pull.number
         ));
     }
     if deltas.is_empty() {
@@ -1588,7 +1584,7 @@ fn open_pull_for(
     })?;
     let discovery = opened.discover()?;
     let stated = store.tracked_pull(target);
-    let primary = knives::forge::index_summaries(&discovery.ours())
+    let primary = knives::forge::index_pulls(&discovery.ours())
         .by_branch
         .get(&target.branch)
         .map(|pull| pull.number);
