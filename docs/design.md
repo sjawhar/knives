@@ -65,9 +65,7 @@ falls back to `origin` when absent, because not every fork is consumed by anythi
 
 ## State
 
-Compute anything cheap. The detectors below are all sub-second and local, so they run on demand and nothing caches them.
-
-Store only what no amount of computing can recover:
+Local state is computed on demand. Store only what no amount of computing can recover:
 
 - who is working on what, and why (the repo cannot know this; and it cannot be inferred from session working directories either, since an agent launched elsewhere may need to change a fork)
 - why we carry a foreign PR as a release parent
@@ -83,8 +81,60 @@ The ledger's rule is past tense only. Stored dispositions rot and recorded judgm
 not: a census that inferred "not a release parent, therefore unhomed" produced 54 findings
 of which 5 were false, and a parity audit's finding was true at its recorded commit and
 stale two hours later after an in-place repair. An entry says what happened, at which
-commit, according to whom, and never what is currently the case. Anything currently the
-case is a detector's job, and the detectors are cheap.
+commit, according to whom, and never what is currently the case. Anything currently true
+about the repository graph or workspace is a detector's job.
+
+## Forge snapshot and cache
+
+Forge discovery is not a local detector: listing a repository's pull requests finds the small
+set of numbers that matter, but the list is too expensive to use as a report's fact source. The
+snapshot separates those jobs. **The cache discovers; a live batch decides.** The discovery cache
+is `$XDG_CACHE_HOME/knives/forge/<owner>/<repo>.json` (default
+`~/.cache/knives/forge/<owner>/<repo>.json`); it stores cheap pull-request rows and a watermark,
+along with the repository identity and cache schema. A missing, invalid, or deleted cache simply
+uses the cold discovery path.
+
+### Invariants
+
+**I1 — no trust without a same-run sweep.** A warm run performs a live delta sweep and retains a
+cached entry only when the sweep shows that nothing at or after the watermark touched it. A cold
+run uses a live reseed. When both the sweep and reseed fail, the forge is not consulted and no
+cached pull-request data is used.
+
+**I2 — report-surfaced facts are live.** Every pull-request number that appears in branch rows,
+sync classification, stated pulls, or dependencies gets its complete fact row in one live,
+by-number batch in that run: state, head and base refs, draft and owner state, review and
+mergeability state, checks, review recency, and, for `sync`, newest-comment activity. Cache rows
+only discover numbers and preserve shadowed prior history.
+
+**I3 — a failed live batch fails closed.** When discovery succeeds but any live-batch chunk fails,
+no snapshot exists. The report treats the forge as unavailable, reads no cached facts, and neither
+advances the watermark nor writes the cache.
+
+**I4 — a lost cache write only loses freshness.** A writer reads once, merges each row by
+`updatedAt` (with this run's freshly fetched row winning ties), then writes a temporary file and
+renames it. Its watermark comes from that same read. Concurrent writers can lose a newer row and
+make the next run refresh it, but a surviving file cannot claim another writer's watermark without
+that writer's rows.
+
+### Failure semantics
+
+| Condition | Behavior |
+|---|---|
+| Sweep and live batch succeed | Build a snapshot and mark the forge consulted. |
+| Sweep overflows before reaching an entry older than the watermark | Cold-reseed the cache, replacing its pull-request map; a successful live batch builds a snapshot. |
+| Sweep fails | Attempt a cold reseed; a successful live batch builds a snapshot. |
+| Any live-batch chunk fails | Mark the forge unconsulted; use no cache, do not advance the watermark, and do not write the cache. |
+| Sweep and reseed both fail | Mark the forge unconsulted and use no cached pull-request data. |
+| Cache is unreadable, corrupt, or has a schema or repository-identity mismatch | Ignore it and use the cold path. |
+| Cache write or rename fails after live success | Keep the live snapshot, mark the forge consulted, and report the cache problem. |
+
+### Landed-verdict cache
+
+The same cache file stores landed verdicts. Each entry is keyed by the resolved branch-tip commit
+ID, resolved upstream-trunk commit ID, knives version, and landed-probe schema version. If either
+ref does not resolve in the current checkout, the verdict cache is not read. An installed knives
+upgrade, or a probe-schema change, produces a new key and therefore a fresh landed probe.
 
 ## Detection rules
 
@@ -92,7 +142,7 @@ Eight detection rules, all resting on mechanical fields and graph queries rather
 
 **1. Stale release parent (`stale-parent`).** Rests on `Repo::bookmark_tips` compared against release parent commits. When a PR branch is rebased upstream, jj moves the local bookmark to the new commit but the octopus keeps the old one, leaving a parent whose bookmark has moved to a descendant. The release then ships pre-rebase code with nothing in the bookmark list saying so.
 
-**2. Landed upstream (`landed`).** Rests on `classify_landed`, which replays the branch onto the upstream trunk (defaulting to `main`) inside a dropped jj-lib transaction — a pure read that writes no operation and is invisible to concurrent agents — and inspects the tree diff:
+**2. Landed upstream (`landed`).** Rests on `classify_landed`, which replays the branch onto the upstream trunk (defaulting to `main`) inside a dropped jj-lib transaction — a pure read that writes no operation and is invisible to concurrent agents — and inspects the tree diff. A matching landed-verdict cache key reuses that result; a changed branch tip, trunk tip, knives version, or probe schema runs the replay again:
 
 | Result | Meaning |
 |---|---|
@@ -153,7 +203,9 @@ knives preflight [REPO]        programmatic pre-contribution facts (see below)
 knives status [REPO|--all]     aligned table per branch (branch, tip, push, pr, review, checks,
                                landed, flags, notch); claims, active workspaces, and detectors
 knives start BRANCH            claim, create the workspace, base it on the release's shared base (falling back to fetched trunk)
-knives finish BRANCH           hand back claim and remove workspace
+knives finish BRANCH [--allow-open]
+                               hand back claim and remove workspace; without --allow-open, refuse
+                               when the branch's pull request is open or cannot be checked
 knives track BRANCH --pr N     state which PR a branch belongs to, overriding inference
 knives depends BRANCH --on R#N  record that a branch cannot land before something else
 knives notch [SUBJECT]         read what happened here (bare: newest 20; a subject: its whole
@@ -164,7 +216,9 @@ knives release reap            reap superseded dated release bookmarks everywher
 knives release include BRANCH  add a branch (or revision) to the release as one new parent; nothing else moves
 knives release drop BRANCH     remove a branch's parent from the release; the branch and its bookmark are untouched
 knives release advance [BR..] [--from SHA]  move member parents to their branches' tips; named branches only, or every advanced member when bare; refuses a candidate that would replace more than one parent; --from names one branch's old parent directly, for a branch (e.g. `jj duplicate`-rebuilt) whose ancestry back to it is gone
-knives release rebase [REF]    jj rebase -b <release> -d REF (bare: the first trunk commit containing every merged pull request, then landed members carrying nothing more are dropped unless --no-drop; REF required when nothing merged): members and release move together, bookmarks following
+knives release carries REVISION [--in TARGET]
+                               replay a revision onto the release in hand, or TARGET, and report
+                               whether its content is carried
 ```
 
 TOON is the machine default on any command when the environment says an agent is running it (or stdout is not a terminal): agents were grepping human output to count findings by detector, and JSON answered that at more tokens than the same structure needs. `--json` forces JSON exactly; `--text` forces prose.

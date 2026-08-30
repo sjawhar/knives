@@ -74,6 +74,23 @@ pub struct Report {
     pub problems: Vec<String>,
 }
 
+pub struct SyncInput<'a> {
+    pub entry: &'a RepoEntry,
+    pub store: &'a mut Store,
+    pub forge: Option<&'a dyn Forge>,
+    pub scribe: &'a Scribe,
+    pub cache: Option<&'a std::path::Path>,
+}
+
+impl fmt::Debug for SyncInput<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SyncInput")
+            .field("has_forge", &self.forge.is_some())
+            .field("has_cache", &self.cache.is_some())
+            .finish()
+    }
+}
+
 /// Fetch the objects for foreign pull requests we carry as release parents.
 ///
 /// Ours need nothing: we already have the branch. Theirs cannot be a release
@@ -128,7 +145,6 @@ pub fn tracked_pull_requests(
     }
     tracked
 }
-
 
 /// The current head from fetched pull refs, or the live forge fact when no ref exists.
 fn current_pull_head<'a>(
@@ -199,13 +215,112 @@ fn record_transition_event(
     Ok(())
 }
 
-pub fn sync_repo(
-    entry: &RepoEntry,
-    store: &mut Store,
-    forge: Option<&dyn Forge>,
-    scribe: &Scribe,
-    cache: Option<&std::path::Path>,
-) -> anyhow::Result<Report> {
+struct TrackingInput<'a, 'snapshot> {
+    tracked: BTreeMap<u64, String>,
+    seen: &'a BTreeMap<String, String>,
+    heads: &'a BTreeMap<u64, String>,
+    summaries: &'a [PullSummary],
+    snapshot: Option<&'a crate::snapshot::ForgeSnapshot<'snapshot>>,
+    scribe: &'a Scribe,
+    store: &'a mut Store,
+}
+
+fn record_tracked_pulls(
+    input: TrackingInput<'_, '_>,
+    report: &mut Report,
+) -> Result<(), crate::ledger::LedgerError> {
+    for (number, label) in input.tracked {
+        let fact = input.snapshot.and_then(|snapshot| snapshot.fact(number));
+        if input.snapshot.is_some() && fact.is_none() {
+            report.problems.push(format!(
+                "state of #{number} unavailable: the forge did not report it"
+            ));
+            continue;
+        }
+        let current = current_pull_head(input.heads, fact, number).unwrap_or_default();
+
+        if current.is_empty() {
+            // Neither the pull refs nor the live forge fact knew this head. Reporting
+            // it as moved would be a fabrication, and because the empty head is
+            // never recorded, the false "advanced" would repeat on every run.
+            report
+                .problems
+                .push(format!("could not determine the head of #{number}"));
+            continue;
+        }
+
+        let state = fact.map_or_else(|| "OPEN".to_owned(), |fact| fact.pull.state.clone());
+        let transition = PullTransition {
+            number,
+            state: classify_pull(
+                input.seen.get(&number.to_string()).map(String::as_str),
+                current,
+                &state,
+            ),
+            head: current,
+        };
+        record_transition_event(input.scribe, input.store, input.summaries, transition)?;
+        report.rows.push(Row {
+            number,
+            label,
+            state: transition.state,
+        });
+        input
+            .store
+            .record_pull_head(input.scribe.repo(), number, current);
+
+        if state == "OPEN"
+            && let Some(newest) = fact.and_then(|fact| fact.newest_comment.as_ref())
+        {
+            // `gh` emits fixed-width RFC-3339 UTC timestamps, so lexical ordering is chronological.
+            let previous = input.store.comment_mark(input.scribe.repo(), number);
+            let is_first_observation = previous.is_none();
+            let has_advanced = previous.is_some_and(|mark| newest.as_str() > mark);
+            if has_advanced {
+                report.notes.push(format!(
+                    "#{number} has comment activity newer than the last sync"
+                ));
+            }
+            if is_first_observation || has_advanced {
+                input
+                    .store
+                    .record_comment_mark(input.scribe.repo(), number, newest);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn pull_heads_or_problem(entry: &RepoEntry, report: &mut Report) -> BTreeMap<u64, String> {
+    match pull_heads(&entry.path, entry.remote(Role::Upstream)) {
+        Ok(found) => found,
+        Err(error) => {
+            report
+                .problems
+                .push(format!("could not read pull refs: {error}"));
+            BTreeMap::new()
+        }
+    }
+}
+
+fn persist_snapshot(snapshot: Option<&crate::snapshot::ForgeSnapshot<'_>>, report: &mut Report) {
+    if let Some(snapshot) = snapshot
+        && let Err(error) = snapshot.persist(None)
+    {
+        report
+            .problems
+            .push(format!("forge cache not saved: {error}"));
+    }
+}
+
+pub fn sync_repo(input: SyncInput<'_>) -> anyhow::Result<Report> {
+    let SyncInput {
+        entry,
+        store,
+        forge,
+        scribe,
+        cache,
+    } = input;
     let name = scribe.repo();
     let mut report = Report {
         repo: name.to_string(),
@@ -250,7 +365,7 @@ pub fn sync_repo(
     };
     let ours = discovery
         .as_ref()
-        .map_or_else(Vec::new, |discovery| discovery.ours());
+        .map_or_else(Vec::new, crate::snapshot::Discovery::ours);
     let tracked = tracked_pull_requests(&ours, &foreign, &seen);
     let surfaced: Vec<u64> = tracked.keys().copied().collect();
     let snapshot = match discovery {
@@ -265,89 +380,24 @@ pub fn sync_repo(
         },
         None => None,
     };
-
-    let heads = match pull_heads(&entry.path, entry.remote(Role::Upstream)) {
-        Ok(found) => found,
-        Err(error) => {
-            report
-                .problems
-                .push(format!("could not read pull refs: {error}"));
-            BTreeMap::new()
-        }
-    };
-    let summaries = snapshot
+    let heads = pull_heads_or_problem(entry, &mut report);
+    let summaries: &[PullSummary] = snapshot
         .as_ref()
-        .map(|snapshot| snapshot.rows())
-        .unwrap_or(&[]);
+        .map_or(&[], crate::snapshot::ForgeSnapshot::rows);
+    record_tracked_pulls(
+        TrackingInput {
+            tracked,
+            seen: &seen,
+            heads: &heads,
+            summaries,
+            snapshot: snapshot.as_ref(),
+            scribe,
+            store,
+        },
+        &mut report,
+    )?;
 
-    for (number, label) in tracked {
-        let fact = match snapshot.as_ref() {
-            Some(snapshot) => match snapshot.fact(number) {
-                Some(fact) => Some(fact),
-                None => {
-                    report.problems.push(format!(
-                        "state of #{number} unavailable: the forge did not report it"
-                    ));
-                    continue;
-                }
-            },
-            None => None,
-        };
-        let current = current_pull_head(&heads, fact, number).unwrap_or_default();
-
-        if current.is_empty() {
-            // Neither the pull refs nor the live forge fact knew this head. Reporting
-            // it as moved would be a fabrication, and because the empty head is
-            // never recorded, the false "advanced" would repeat on every run.
-            report
-                .problems
-                .push(format!("could not determine the head of #{number}"));
-            continue;
-        }
-
-        let state = fact.map_or_else(|| "OPEN".to_owned(), |fact| fact.pull.state.clone());
-        let transition = PullTransition {
-            number,
-            state: classify_pull(
-                seen.get(&number.to_string()).map(String::as_str),
-                current,
-                &state,
-            ),
-            head: current,
-        };
-        record_transition_event(scribe, store, summaries, transition)?;
-        report.rows.push(Row {
-            number,
-            label,
-            state: transition.state,
-        });
-        store.record_pull_head(name, number, current);
-
-        if state == "OPEN"
-            && let Some(newest) = fact.and_then(|fact| fact.newest_comment.as_ref())
-        {
-            // `gh` emits fixed-width RFC-3339 UTC timestamps, so lexical ordering is chronological.
-            let previous = store.comment_mark(name, number);
-            let is_first_observation = previous.is_none();
-            let has_advanced = previous.is_some_and(|mark| newest.as_str() > mark);
-            if has_advanced {
-                report.notes.push(format!(
-                    "#{number} has comment activity newer than the last sync"
-                ));
-            }
-            if is_first_observation || has_advanced {
-                store.record_comment_mark(name, number, newest);
-            }
-        }
-    }
-
-    if let Some(snapshot) = snapshot.as_ref()
-        && let Err(error) = snapshot.persist(None)
-    {
-        report
-            .problems
-            .push(format!("forge cache not saved: {error}"));
-    }
+    persist_snapshot(snapshot.as_ref(), &mut report);
 
     fetch_foreign(
         &entry.path,
@@ -487,7 +537,6 @@ mod tracking_tests {
         )
     }
 
-
     #[test]
     fn every_listed_pull_request_is_tracked_even_with_no_local_bookmark() {
         // Scoping now happens upstream, by head repository, so everything reaching
@@ -495,9 +544,10 @@ mod tracking_tests {
         // any branch we had pushed but did not have checked out in this clone: the
         // The forge reported 13 open pull requests for a real repository and knives reported
         // 12, and the missing one was the single most actionable of them.
-        let pull_requests: Vec<PullSummary> = [pr(1, "feat/checked-out"), pr(2, "feat/pushed-only")]
-            .map(|(_, pull_request)| PullSummary::of(&pull_request))
-            .into();
+        let pull_requests: Vec<PullSummary> =
+            [pr(1, "feat/checked-out"), pr(2, "feat/pushed-only")]
+                .map(|(_, pull_request)| PullSummary::of(&pull_request))
+                .into();
         let foreign: BTreeSet<u64> = BTreeSet::new();
 
         let tracked = tracked_pull_requests(&pull_requests, &foreign, &BTreeMap::new());
@@ -529,8 +579,7 @@ mod tracking_tests {
 mod comment_activity_tests {
     use super::*;
     use crate::forge::{
-        Forge, ForgeError, PullFacts, PullRequest, PullSummary, RepoIdentity, SweepEntry,
-        SweepPage,
+        Forge, ForgeError, PullFacts, PullRequest, PullSummary, RepoIdentity, SweepEntry, SweepPage,
     };
     use crate::ids::RepoName;
     use crate::store::Store;
@@ -737,13 +786,13 @@ mod comment_activity_tests {
         let entry = local_entry(&temp);
         let mut store = Store::open_for_update(temp.path().join("state.json")).unwrap();
 
-        let report = sync_repo(
-            &entry,
-            &mut store,
-            Some(&PullListUnavailable),
-            &test_scribe(&temp, &RepoName::new("test-repo")),
-            None,
-        )
+        let report = sync_repo(SyncInput {
+            entry: &entry,
+            store: &mut store,
+            forge: Some(&PullListUnavailable),
+            scribe: &test_scribe(&temp, &RepoName::new("test-repo")),
+            cache: None,
+        })
         .unwrap();
 
         assert!(
@@ -770,13 +819,13 @@ mod comment_activity_tests {
             error_on_comment: None,
         };
 
-        let report = sync_repo(
-            &entry,
-            &mut store,
-            Some(&forge),
-            &test_scribe(&temp, &RepoName::new("test-repo")),
-            None,
-        )
+        let report = sync_repo(SyncInput {
+            entry: &entry,
+            store: &mut store,
+            forge: Some(&forge),
+            scribe: &test_scribe(&temp, &RepoName::new("test-repo")),
+            cache: None,
+        })
         .unwrap();
 
         assert!(
@@ -797,13 +846,13 @@ mod comment_activity_tests {
         let entry = local_entry(&temp);
         let mut store = Store::open_for_update(temp.path().join("state.json")).unwrap();
 
-        let report = sync_repo(
-            &entry,
-            &mut store,
-            None,
-            &test_scribe(&temp, &RepoName::new("test-repo")),
-            None,
-        )
+        let report = sync_repo(SyncInput {
+            entry: &entry,
+            store: &mut store,
+            forge: None,
+            scribe: &test_scribe(&temp, &RepoName::new("test-repo")),
+            cache: None,
+        })
         .unwrap();
 
         assert!(
@@ -835,13 +884,13 @@ mod comment_activity_tests {
 
         let mut store = Store::open_for_update(store_path.clone()).unwrap();
         store.record_comment_mark(&repo_name, 42, "2026-07-29T10:00:00Z");
-        let report1 = sync_repo(
-            &entry,
-            &mut store,
-            Some(&forge_first),
-            &scribe,
-            None,
-        )
+        let report1 = sync_repo(SyncInput {
+            entry: &entry,
+            store: &mut store,
+            forge: Some(&forge_first),
+            scribe: &scribe,
+            cache: None,
+        })
         .unwrap();
         store.save().unwrap();
 
@@ -869,13 +918,13 @@ mod comment_activity_tests {
         };
 
         let mut store = Store::open(store_path).unwrap();
-        let report2 = sync_repo(
-            &entry,
-            &mut store,
-            Some(&forge_second),
-            &scribe,
-            None,
-        )
+        let report2 = sync_repo(SyncInput {
+            entry: &entry,
+            store: &mut store,
+            forge: Some(&forge_second),
+            scribe: &scribe,
+            cache: None,
+        })
         .unwrap();
 
         // Verify: no comment activity note on second run (mark unchanged)
@@ -902,13 +951,13 @@ mod comment_activity_tests {
             error_on_comment: Some(42),
         };
         let mut store = Store::open_for_update(temp.path().join("state.json")).unwrap();
-        let report = sync_repo(
-            &entry,
-            &mut store,
-            Some(&forge),
-            &test_scribe(&temp, &repo_name),
-            None,
-        )
+        let report = sync_repo(SyncInput {
+            entry: &entry,
+            store: &mut store,
+            forge: Some(&forge),
+            scribe: &test_scribe(&temp, &repo_name),
+            cache: None,
+        })
         .unwrap();
 
         assert!(
@@ -918,7 +967,10 @@ mod comment_activity_tests {
                 .any(|problem| problem.contains("pull request state unavailable")),
             "batch failure was not reported: {report:?}"
         );
-        assert!(report.rows.is_empty(), "batch failure classified rows: {report:?}");
+        assert!(
+            report.rows.is_empty(),
+            "batch failure classified rows: {report:?}"
+        );
         assert_eq!(exit_for(&report), Exit::Incomplete);
     }
 
@@ -939,13 +991,13 @@ mod comment_activity_tests {
         let mut store = Store::open_for_update(store_path).unwrap();
 
         // When: the first sync observes the historical comment
-        let report = sync_repo(
-            &entry,
-            &mut store,
-            Some(&forge),
-            &test_scribe(&temp, &repo_name),
-            None,
-        )
+        let report = sync_repo(SyncInput {
+            entry: &entry,
+            store: &mut store,
+            forge: Some(&forge),
+            scribe: &test_scribe(&temp, &repo_name),
+            cache: None,
+        })
         .unwrap();
 
         // Then: its timestamp is remembered without announcing old activity
@@ -977,13 +1029,13 @@ mod comment_activity_tests {
         };
         let mut store = Store::open_for_update(store_path).unwrap();
 
-        let report = sync_repo(
-            &entry,
-            &mut store,
-            Some(&forge),
-            &test_scribe(&temp, &repo_name),
-            None,
-        )
+        let report = sync_repo(SyncInput {
+            entry: &entry,
+            store: &mut store,
+            forge: Some(&forge),
+            scribe: &test_scribe(&temp, &repo_name),
+            cache: None,
+        })
         .unwrap();
 
         assert_eq!(

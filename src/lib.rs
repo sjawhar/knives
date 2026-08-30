@@ -29,6 +29,6 @@ pub mod ids;
 pub mod jj;
 pub mod ledger;
 pub mod pins;
-pub mod store;
 pub mod snapshot;
+pub mod store;
 pub mod timing;

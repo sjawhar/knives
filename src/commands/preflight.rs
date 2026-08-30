@@ -6,6 +6,7 @@
 //! it consumes this output.
 
 use std::collections::BTreeSet;
+use std::fmt;
 use std::path::Path;
 
 use crate::cli::Exit;
@@ -165,13 +166,30 @@ pub struct Report {
     pub notes: Vec<String>,
 }
 
-pub fn gather(
-    name: &RepoName,
-    entry: &RepoEntry,
-    store: &mut Store,
-    forge: &dyn Forge,
-    cache: Option<&std::path::Path>,
-) -> Report {
+pub struct GatherInput<'a> {
+    pub name: &'a RepoName,
+    pub entry: &'a RepoEntry,
+    pub store: &'a mut Store,
+    pub forge: &'a dyn Forge,
+    pub cache: Option<&'a Path>,
+}
+
+impl fmt::Debug for GatherInput<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GatherInput")
+            .field("has_forge", &true)
+            .field("has_cache", &self.cache.is_some())
+            .finish()
+    }
+}
+pub fn gather(input: GatherInput<'_>) -> Report {
+    let GatherInput {
+        name,
+        entry,
+        store,
+        forge,
+        cache,
+    } = input;
     let mut report = Report {
         repo: name.to_string(),
         ..Report::default()

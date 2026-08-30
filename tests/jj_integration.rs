@@ -26,7 +26,6 @@ use lab::Lab;
 use std::collections::BTreeMap;
 use std::process::Command;
 
-
 /// A registry entry for the lab's work checkout, which stands in for origin.
 fn lab_entry(lab: &lab::Lab) -> RepoEntry {
     RepoEntry {
@@ -197,7 +196,6 @@ struct CountingForge {
 }
 
 impl Forge for CountingForge {
-
     fn repo_identity(&self, _repo: &std::path::Path) -> Result<RepoIdentity, ForgeError> {
         Ok(RepoIdentity {
             name_with_owner: "fake-owner/fake-repo".to_owned(),
@@ -210,11 +208,7 @@ impl Forge for CountingForge {
         _repo: &std::path::Path,
         _authors: &[String],
     ) -> Result<Vec<PullSummary>, ForgeError> {
-        Ok(self
-            .pull_requests
-            .values()
-            .map(PullSummary::of)
-            .collect())
+        Ok(self.pull_requests.values().map(PullSummary::of).collect())
     }
 
     fn sweep(
@@ -342,7 +336,10 @@ fn the_forge_is_asked_once_for_the_whole_report_with_one_entry_per_number() {
         .iter()
         .find(|row| row.name.as_str() == "feat/gamma")
         .expect("closed pull request row");
-    assert_eq!(gamma.checks, None, "settled pulls do not render a checks cell");
+    assert_eq!(
+        gamma.checks, None,
+        "settled pulls do not render a checks cell"
+    );
 
     let asked = forge.asked.lock().expect("lock");
     assert_eq!(
@@ -448,10 +445,7 @@ fn a_consulted_false_report_carries_zero_pull_facts() {
 
     assert!(!report.forge_consulted, "was: {report:?}");
     assert!(
-        report
-            .branches
-            .iter()
-            .all(|row| row.pull_request.is_none()),
+        report.branches.iter().all(|row| row.pull_request.is_none()),
         "a failed facts batch leaked a pull fact: {report:?}"
     );
     assert_eq!(
@@ -517,7 +511,10 @@ fn stated_pulls_and_dependencies_are_answered_from_the_one_batch() {
         Some((42, "CLOSED")),
         "the stated number did not come from the snapshot: {report:?}"
     );
-    assert!(report.findings.is_empty(), "a merged dependency became unmet: {report:?}");
+    assert!(
+        report.findings.is_empty(),
+        "a merged dependency became unmet: {report:?}"
+    );
     assert!(report.problems.is_empty(), "was: {report:?}");
     assert!(
         status::render(&report, true).contains("#42 closed (stated)"),
@@ -554,8 +551,7 @@ fn landed_verdicts_come_from_the_cache_when_the_key_matches() {
         name_with_owner: "fake-owner/fake-repo".to_owned(),
         id: "FAKEID".to_owned(),
     };
-    let cache_file =
-        knives::forge_cache::cache_path(cache.path(), &identity).expect("cache path");
+    let cache_file = knives::forge_cache::cache_path(cache.path(), &identity).expect("cache path");
     let repo = Repo::open(&lab.work).expect("open repository");
     let tip = repo.resolve_commit("feat/alpha").expect("feature tip");
     let trunk = repo.resolve_commit("main@upstream").expect("trunk tip");
@@ -614,8 +610,7 @@ fn a_probe_free_run_preserves_the_landed_section() {
         name_with_owner: "fake-owner/fake-repo".to_owned(),
         id: "FAKEID".to_owned(),
     };
-    let cache_file =
-        knives::forge_cache::cache_path(cache.path(), &identity).expect("cache path");
+    let cache_file = knives::forge_cache::cache_path(cache.path(), &identity).expect("cache path");
     let before = knives::forge_cache::load(&cache_file, &identity)
         .expect("cache after probe")
         .landed;
@@ -625,7 +620,10 @@ fn a_probe_free_run_preserves_the_landed_section() {
     let after = knives::forge_cache::load(&cache_file, &identity)
         .expect("cache after probe-free run")
         .landed;
-    assert_eq!(after, before, "a probe-free run erased landed cache entries");
+    assert_eq!(
+        after, before,
+        "a probe-free run erased landed cache entries"
+    );
 }
 
 #[test]
@@ -652,10 +650,9 @@ fn an_unresolvable_trunk_fails_loudly_and_touches_no_landed_cache() {
         name_with_owner: "fake-owner/fake-repo".to_owned(),
         id: "FAKEID".to_owned(),
     };
-    let cache_file =
-        knives::forge_cache::cache_path(cache.path(), &identity).expect("cache path");
+    let cache_file = knives::forge_cache::cache_path(cache.path(), &identity).expect("cache path");
     let before = std::fs::read(&cache_file).expect("cache after initial probe");
-    let mut unresolvable = entry.clone();
+    let mut unresolvable = entry;
     unresolvable.base = Some("missing-trunk".to_owned());
 
     let error = status::gather(&name, &unresolvable, &store, &options())
@@ -665,7 +662,10 @@ fn an_unresolvable_trunk_fails_loudly_and_touches_no_landed_cache() {
         "missing unresolved revision in error: {error:#}"
     );
     let after = std::fs::read(&cache_file).expect("cache after unresolvable-trunk run");
-    assert_eq!(after, before, "an unresolvable-trunk run rewrote landed cache");
+    assert_eq!(
+        after, before,
+        "an unresolvable-trunk run rewrote landed cache"
+    );
 }
 
 fn relation_to_origin(lab: &lab::Lab) -> Result<Option<OriginRelation>, knives::jj::JjError> {
@@ -2094,12 +2094,18 @@ fn sync_fails_closed_when_the_facts_batch_fails() {
     let scribe = knives::ledger::Scribe::new(
         knives::ledger::Ledger::at(state.path().join("ledger")),
         name,
-        lab.work.clone(),
+        lab.work,
         "a-test".to_owned(),
     );
 
-    let report = sync::sync_repo(&entry, &mut store, Some(&forge), &scribe, None)
-        .expect("sync report");
+    let report = sync::sync_repo(sync::SyncInput {
+        entry: &entry,
+        store: &mut store,
+        forge: Some(&forge),
+        scribe: &scribe,
+        cache: None,
+    })
+    .expect("sync report");
 
     assert!(report.rows.is_empty(), "was: {report:?}");
     assert!(
@@ -2125,10 +2131,7 @@ fn a_listed_state_wins_and_a_vanished_number_is_answered_by_the_batch() {
             BranchName::new("feat/alpha"),
             sync_pull_request(42, "OPEN", "feat/alpha", "head-42"),
         )]),
-        vanished_states: BTreeMap::from([
-            (42, "MERGED".to_owned()),
-            (43, "MERGED".to_owned()),
-        ]),
+        vanished_states: BTreeMap::from([(42, "MERGED".to_owned()), (43, "MERGED".to_owned())]),
         ..knives::forge::FakeForge::default()
     };
     let state = tempfile::tempdir().expect("state directory");
@@ -2137,12 +2140,18 @@ fn a_listed_state_wins_and_a_vanished_number_is_answered_by_the_batch() {
     let scribe = knives::ledger::Scribe::new(
         knives::ledger::Ledger::at(state.path().join("ledger")),
         name,
-        lab.work.clone(),
+        lab.work,
         "a-test".to_owned(),
     );
 
-    let report = sync::sync_repo(&entry, &mut store, Some(&forge), &scribe, None)
-        .expect("sync report");
+    let report = sync::sync_repo(sync::SyncInput {
+        entry: &entry,
+        store: &mut store,
+        forge: Some(&forge),
+        scribe: &scribe,
+        cache: None,
+    })
+    .expect("sync report");
 
     assert_eq!(
         report
@@ -2224,8 +2233,14 @@ fn sync_records_one_event_for_each_pull_request_that_moved() {
     );
 
     // When: sync classifies them.
-    let report =
-        sync::sync_repo(&entry, &mut store, Some(&forge), &scribe, None).expect("sync report");
+    let report = sync::sync_repo(sync::SyncInput {
+        entry: &entry,
+        store: &mut store,
+        forge: Some(&forge),
+        scribe: &scribe,
+        cache: None,
+    })
+    .expect("sync report");
     assert_eq!(report.rows.len(), 4, "was: {report:?}");
 
     // Then: exactly the moved pulls are events, each under the tracked branch.
@@ -2273,8 +2288,22 @@ fn sync_records_a_settled_pull_request_once_across_repeated_runs() {
         knives::ledger::Scribe::new(ledger.clone(), name, lab.work, "ses_fff688".to_owned());
 
     // When: the same settled pull request is seen twice.
-    sync::sync_repo(&entry, &mut store, Some(&forge), &scribe, None).expect("first sync");
-    sync::sync_repo(&entry, &mut store, Some(&forge), &scribe, None).expect("second sync");
+    sync::sync_repo(sync::SyncInput {
+        entry: &entry,
+        store: &mut store,
+        forge: Some(&forge),
+        scribe: &scribe,
+        cache: None,
+    })
+    .expect("first sync");
+    sync::sync_repo(sync::SyncInput {
+        entry: &entry,
+        store: &mut store,
+        forge: Some(&forge),
+        scribe: &scribe,
+        cache: None,
+    })
+    .expect("second sync");
 
     // Then: its settled transition remains one fact, not one fact per sync run.
     let entries = ledger.entries().expect("read ledger");
@@ -2317,9 +2346,22 @@ fn sync_records_an_advanced_pull_request_then_its_merge() {
         knives::ledger::Scribe::new(ledger.clone(), name, lab.work, "ses_fff688".to_owned());
 
     // When: the head advances, then the forge marks that same pull request merged.
-    sync::sync_repo(&entry, &mut store, Some(&advanced), &scribe, None)
-        .expect("advanced sync");
-    sync::sync_repo(&entry, &mut store, Some(&merged), &scribe, None).expect("merged sync");
+    sync::sync_repo(sync::SyncInput {
+        entry: &entry,
+        store: &mut store,
+        forge: Some(&advanced),
+        scribe: &scribe,
+        cache: None,
+    })
+    .expect("advanced sync");
+    sync::sync_repo(sync::SyncInput {
+        entry: &entry,
+        store: &mut store,
+        forge: Some(&merged),
+        scribe: &scribe,
+        cache: None,
+    })
+    .expect("merged sync");
 
     // Then: both distinct transitions remain in the ledger in observation order.
     let entries = ledger.entries().expect("read ledger");
@@ -2362,10 +2404,22 @@ fn sync_records_each_consecutive_advance() {
         knives::ledger::Scribe::new(ledger.clone(), name, lab.work, "ses_fff688".to_owned());
 
     // When: the pull request advances from A to B, then from B to C.
-    sync::sync_repo(&entry, &mut store, Some(&first_advance), &scribe, None)
-        .expect("first advance");
-    sync::sync_repo(&entry, &mut store, Some(&second_advance), &scribe, None)
-        .expect("second advance");
+    sync::sync_repo(sync::SyncInput {
+        entry: &entry,
+        store: &mut store,
+        forge: Some(&first_advance),
+        scribe: &scribe,
+        cache: None,
+    })
+    .expect("first advance");
+    sync::sync_repo(sync::SyncInput {
+        entry: &entry,
+        store: &mut store,
+        forge: Some(&second_advance),
+        scribe: &scribe,
+        cache: None,
+    })
+    .expect("second advance");
 
     // Then: both changed heads are recorded as distinct advances.
     let entries = ledger.entries().expect("read ledger");
@@ -3498,19 +3552,33 @@ fn knives_finish(lab: &lab::Lab, home: &tempfile::TempDir, args: &[&str]) -> std
 }
 
 fn path_with_gh_shim(shim: &std::path::Path) -> std::ffi::OsString {
-    std::env::join_paths(std::iter::once(shim.to_owned()).chain(
-        std::env::split_paths(&std::env::var_os("PATH").expect("PATH is set")),
-    ))
+    std::env::join_paths(
+        std::iter::once(shim.to_owned()).chain(std::env::split_paths(
+            &std::env::var_os("PATH").expect("PATH is set"),
+        )),
+    )
     .expect("construct shim PATH")
 }
 
+#[derive(Clone, Copy)]
+struct FinishWithSnapshotForgeInput<'a> {
+    lab: &'a Lab,
+    home: &'a tempfile::TempDir,
+    pulls: &'a str,
+    args: &'a [&'a str],
+    log: &'a std::path::Path,
+}
+
 fn knives_finish_with_snapshot_forge(
-    lab: &Lab,
-    home: &tempfile::TempDir,
-    pulls: &str,
-    args: &[&str],
-    log: &std::path::Path,
+    input: FinishWithSnapshotForgeInput<'_>,
 ) -> std::process::Output {
+    let FinishWithSnapshotForgeInput {
+        lab,
+        home,
+        pulls,
+        args,
+        log,
+    } = input;
     let shim = tempfile::tempdir().expect("create forge shim directory");
     install_snapshot_gh(shim.path(), pulls, Some(log));
     let mut command = Command::new(env!("CARGO_BIN_EXE_knives"));
@@ -3572,8 +3640,13 @@ fn finish_refuses_while_the_pull_request_is_open() {
     let log = state.path().join("gh.log");
     let pulls = format!("[{}]", pull_record(7, "OPEN", "feat/alpha", None));
 
-    let output =
-        knives_finish_with_snapshot_forge(&lab, &home, &pulls, &["feat/alpha"], &log);
+    let output = knives_finish_with_snapshot_forge(FinishWithSnapshotForgeInput {
+        lab: &lab,
+        home: &home,
+        pulls: &pulls,
+        args: &["feat/alpha"],
+        log: &log,
+    });
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_eq!(
@@ -3614,12 +3687,8 @@ fn finish_refuses_when_it_cannot_verify_and_allow_open_proceeds() {
     assert!(refusal_log.is_file(), "the failed guard never reached gh");
 
     let bypass_log = state.path().join("bypass-gh.log");
-    let bypass = knives_finish_with_failing_forge(
-        &lab,
-        &home,
-        &["feat/alpha", "--allow-open"],
-        &bypass_log,
-    );
+    let bypass =
+        knives_finish_with_failing_forge(&lab, &home, &["feat/alpha", "--allow-open"], &bypass_log);
 
     let stdout = String::from_utf8_lossy(&bypass.stdout);
     assert!(
@@ -3945,13 +4014,13 @@ fn preflight_renders_a_mixed_base_finding_and_exits_with_findings() {
     };
 
     // When: preflight gathers and renders the repository state.
-    let report = knives::commands::preflight::gather(
-        &knives::ids::RepoName::new("demo"),
-        &entry,
-        &mut store,
-        &forge,
-        None,
-    );
+    let report = knives::commands::preflight::gather(knives::commands::preflight::GatherInput {
+        name: &knives::ids::RepoName::new("demo"),
+        entry: &entry,
+        store: &mut store,
+        forge: &forge,
+        cache: None,
+    });
     let text = knives::commands::preflight::render(&report);
 
     // Then: the finding is visible and makes the command actionable to scripts.
@@ -5310,8 +5379,11 @@ fn install_snapshot_gh(shim: &std::path::Path, pulls: &str, log: Option<&std::pa
         .expect("serialize identity payload"),
     )
     .expect("write identity payload");
-    std::fs::write(&list, serde_json::to_vec(&pulls).expect("serialize list payload"))
-        .expect("write pull request payload");
+    std::fs::write(
+        &list,
+        serde_json::to_vec(&pulls).expect("serialize list payload"),
+    )
+    .expect("write pull request payload");
     std::fs::write(
         &sweep,
         serde_json::to_vec(&serde_json::json!({

@@ -19,19 +19,28 @@ const RECORDED_SWEEP: &str = include_str!("fixtures/gh_sweep.json");
 const SCRUBBED_REPOSITORY: &str = "https://forge.invalid/our-org/recorded-repo";
 const REAL_FORGE_HOST: &str = concat!("github", ".com");
 
-fn recorded_fact_numbers() -> Vec<u64> {
-    let recorded: Value = serde_json::from_str(RECORDED_FACTS).expect("recorded JSON is valid");
-    recorded["data"]["repository"]
-        .as_object()
-        .expect("recorded facts has a repository")
-        .values()
-        .filter_map(|pull| pull.get("number").and_then(Value::as_u64))
-        .collect()
+fn recorded_repository(recorded: &Value) -> Result<&serde_json::Map<String, Value>, &'static str> {
+    recorded
+        .get("data")
+        .and_then(Value::as_object)
+        .and_then(|data| data.get("repository"))
+        .and_then(Value::as_object)
+        .ok_or("recorded facts has a repository")
 }
 
-fn decoded_facts() -> std::collections::BTreeMap<u64, knives::forge::PullFacts> {
-    let numbers = recorded_fact_numbers();
-    parse_pull_facts(RECORDED_FACTS, &numbers).expect("recorded fact output decodes")
+fn recorded_fact_numbers() -> Result<Vec<u64>, String> {
+    let recorded: Value =
+        serde_json::from_str(RECORDED_FACTS).map_err(|error| format!("recorded JSON: {error}"))?;
+    Ok(recorded_repository(&recorded)?
+        .values()
+        .filter_map(|pull| pull.get("number").and_then(Value::as_u64))
+        .collect())
+}
+
+fn decoded_facts() -> Result<std::collections::BTreeMap<u64, knives::forge::PullFacts>, String> {
+    let numbers = recorded_fact_numbers()?;
+    parse_pull_facts(RECORDED_FACTS, &numbers)
+        .map_err(|error| format!("recorded fact output: {error}"))
 }
 
 #[test]
@@ -158,7 +167,7 @@ fn the_list_request_keeps_base_but_not_the_check_rollup() {
 
 #[test]
 fn recorded_check_rollups_match_the_batch_decoder() {
-    let facts = decoded_facts();
+    let facts = decoded_facts().expect("recorded fact output decodes");
     let checks: Vec<&ChecksSummary> = facts
         .values()
         .filter_map(|fact| fact.details.checks.as_ref())
@@ -183,7 +192,7 @@ fn recorded_check_rollups_match_the_batch_decoder() {
 fn a_recorded_batch_payload_decodes_every_field_the_query_asks_for() {
     // The defect this prevents: a query field added and the decoder not, so the
     // report reads "nothing to compare" forever while the forge answered.
-    let facts = decoded_facts();
+    let facts = decoded_facts().expect("recorded fact output decodes");
     assert!(!facts.is_empty(), "the fixture must carry pull requests");
     assert!(
         facts
@@ -234,13 +243,19 @@ fn a_recorded_batch_payload_decodes_every_field_the_query_asks_for() {
 #[test]
 fn a_recorded_sweep_payload_decodes() {
     let sweep = parse_sweep(RECORDED_SWEEP).expect("recorded sweep output decodes");
-    assert!(!sweep.entries.is_empty(), "the fixture must carry pull requests");
+    assert!(
+        !sweep.entries.is_empty(),
+        "the fixture must carry pull requests"
+    );
     assert!(
         sweep.entries.iter().all(|entry| entry.number > 0),
         "every sweep entry must have a pull request number"
     );
     assert!(
-        sweep.entries.iter().all(|entry| !entry.updated_at.is_empty()),
+        sweep
+            .entries
+            .iter()
+            .all(|entry| !entry.updated_at.is_empty()),
         "every sweep entry must have an update time"
     );
     assert!(
@@ -307,9 +322,7 @@ fn the_recorded_facts_payload_is_scrubbed() {
     assert!(!RECORDED_FACTS.contains(REAL_FORGE_HOST));
 
     let recorded: Value = serde_json::from_str(RECORDED_FACTS).expect("recorded JSON is valid");
-    let pulls = recorded["data"]["repository"]
-        .as_object()
-        .expect("recorded facts has a repository");
+    let pulls = recorded_repository(&recorded).expect("recorded facts has a repository");
     for pull_request in pulls.values() {
         let pull_request = pull_request
             .as_object()

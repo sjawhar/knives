@@ -78,7 +78,6 @@ pub struct PriorPull {
     pub state: String,
 }
 
-
 impl BranchRow {
     const fn bare(name: BranchName, tip: Option<CommitId>) -> Self {
         Self {
@@ -293,19 +292,30 @@ fn scan_releases(
     Ok((names, findings, skipped))
 }
 
+/// Inputs for a landed probe.
+#[derive(Clone, Copy)]
+struct LandedInput<'a, 'forge> {
+    path: &'a std::path::Path,
+    branch: &'a BranchName,
+    tips: (&'a CommitId, Option<&'a CommitId>),
+    options: &'a Options<'forge>,
+    upstream_trunk: &'a str,
+}
+
 /// Whether the branch has landed upstream, or that the question cannot be answered.
 ///
 /// Judge only what the pull request actually contains. The probe replays the local
 /// bookmark, so when local and origin disagree it answers about content nobody has
 /// pushed, and stale content replays clean and reads as landed. Refusing to judge is
 /// cheap; the `landed` advice is to delete the branch and its release parent.
-fn landed_verdict(
-    path: &std::path::Path,
-    branch: &BranchName,
-    tips: (&CommitId, Option<&CommitId>),
-    options: &Options<'_>,
-    upstream_trunk: &str,
-) -> Result<Option<LandedVerdict>, JjError> {
+fn landed_verdict(input: LandedInput<'_, '_>) -> Result<Option<LandedVerdict>, JjError> {
+    let LandedInput {
+        path,
+        branch,
+        tips,
+        options,
+        upstream_trunk,
+    } = input;
     let (tip, origin_tip) = tips;
     if !options.probe {
         return Ok(None);
@@ -352,19 +362,28 @@ impl ProbePhase {
     }
 }
 
-fn probe_one(
-    path: &std::path::Path,
-    input: &ProbeInput,
-    options: &Options<'_>,
-    upstream_trunk: &str,
-    opened: Option<&crate::snapshot::Opened<'_>>,
-    trunk_commit: Option<&CommitId>,
-) -> ProbeResult {
+#[derive(Clone, Copy)]
+struct ProbeContext<'a, 'forge, 'opened_ref, 'opened> {
+    path: &'a std::path::Path,
+    options: &'a Options<'forge>,
+    upstream_trunk: &'a str,
+    opened: Option<&'opened_ref crate::snapshot::Opened<'opened>>,
+    trunk_commit: Option<&'a CommitId>,
+}
+
+fn probe_one(input: &ProbeInput, context: &ProbeContext<'_, '_, '_, '_>) -> ProbeResult {
+    let ProbeContext {
+        path,
+        options,
+        upstream_trunk,
+        opened,
+        trunk_commit,
+    } = *context;
     let (branch, tip, origin_tip) = input;
     let can_cache = options.probe
         && origin_tip
             .as_ref()
-            .map_or(true, |origin_tip| origin_tip == tip);
+            .is_none_or(|origin_tip| origin_tip == tip);
     let key = can_cache
         .then(|| trunk_commit.map(|trunk| crate::forge_cache::landed_key(tip, trunk)))
         .flatten();
@@ -379,13 +398,13 @@ fn probe_one(
         };
     }
 
-    let verdict = landed_verdict(
+    let verdict = landed_verdict(LandedInput {
         path,
         branch,
-        (tip, origin_tip.as_ref()),
+        tips: (tip, origin_tip.as_ref()),
         options,
         upstream_trunk,
-    );
+    });
     let landed = match (&key, &verdict) {
         (Some(key), Ok(Some(verdict))) if *verdict != LandedVerdict::Unjudged => {
             Some((key.clone(), *verdict))
@@ -397,14 +416,8 @@ fn probe_one(
 
 /// Landed verdicts for every branch, probed concurrently in branch order, with
 /// successful replay answers merged into the cache section.
-fn probe_phase(
-    path: &std::path::Path,
-    inputs: &[ProbeInput],
-    options: &Options<'_>,
-    upstream_trunk: &str,
-    opened: Option<&crate::snapshot::Opened<'_>>,
-    trunk_commit: Option<&CommitId>,
-) -> ProbePhase {
+fn probe_phase(context: ProbeContext<'_, '_, '_, '_>, inputs: &[ProbeInput]) -> ProbePhase {
+    let ProbeContext { options, .. } = context;
     let started = std::time::Instant::now();
     if !options.probe || inputs.is_empty() {
         return ProbePhase {
@@ -424,33 +437,25 @@ fn probe_phase(
                 scope.spawn(move || {
                     slice
                         .iter()
-                        .map(|input| {
-                            probe_one(
-                                path,
-                                input,
-                                options,
-                                upstream_trunk,
-                                opened,
-                                trunk_commit,
-                            )
-                        })
+                        .map(|input| probe_one(input, &context))
                         .collect::<Vec<_>>()
                 }),
             ));
         }
         handles
             .into_iter()
-            .flat_map(|(slice, handle)| match handle.join() {
-                Ok(results) => results,
-                Err(_) => slice
-                    .iter()
-                    .map(|(branch, ..)| ProbeResult {
-                        verdict: Err(JjError::ProbePanic {
-                            branch: branch.to_string(),
-                        }),
-                        landed: None,
-                    })
-                    .collect(),
+            .flat_map(|(slice, handle)| {
+                handle.join().unwrap_or_else(|_| {
+                    slice
+                        .iter()
+                        .map(|(branch, ..)| ProbeResult {
+                            verdict: Err(JjError::ProbePanic {
+                                branch: branch.to_string(),
+                            }),
+                            landed: None,
+                        })
+                        .collect()
+                })
             })
             .collect::<Vec<_>>()
     });
@@ -541,26 +546,32 @@ struct DependencyContext<'a, 'snapshot> {
     snapshot: Option<&'a crate::snapshot::ForgeSnapshot<'snapshot>>,
 }
 
-fn record_dependency_state(
-    branch: &BranchName,
-    requirement: &crate::ids::Requirement,
-    state: Option<&str>,
-    findings: &mut Vec<Finding>,
-    problems: &mut Vec<String>,
-) {
-    match state {
-        Some(state) if state.eq_ignore_ascii_case("MERGED") => {}
-        Some(state) => findings.push(Finding::new(
-            FindingKind::UnmetDependency,
-            Subject::Branch(branch.clone()),
-            format!(
-                "{branch} requires {requirement}, which is {}",
-                state.to_lowercase()
-            ),
-        )),
-        None => problems.push(format!(
-            "{branch} requires {requirement}, which the forge did not report on"
-        )),
+struct DependencyResults<'a> {
+    findings: &'a mut Vec<Finding>,
+    problems: &'a mut Vec<String>,
+}
+
+impl DependencyResults<'_> {
+    fn record(
+        &mut self,
+        branch: &BranchName,
+        requirement: &crate::ids::Requirement,
+        state: Option<&str>,
+    ) {
+        match state {
+            Some(state) if state.eq_ignore_ascii_case("MERGED") => {}
+            Some(state) => self.findings.push(Finding::new(
+                FindingKind::UnmetDependency,
+                Subject::Branch(branch.clone()),
+                format!(
+                    "{branch} requires {requirement}, which is {}",
+                    state.to_lowercase()
+                ),
+            )),
+            None => self.problems.push(format!(
+                "{branch} requires {requirement}, which the forge did not report on"
+            )),
+        }
     }
 }
 
@@ -575,10 +586,8 @@ fn unmet_dependencies(
         forge,
         snapshot,
     } = *context;
-    let mut grouped: BTreeMap<
-        RepoName,
-        Vec<(BranchName, crate::ids::Requirement)>,
-    > = BTreeMap::new();
+    let mut grouped: BTreeMap<RepoName, Vec<(BranchName, crate::ids::Requirement)>> =
+        BTreeMap::new();
     for row in branches {
         let target = BranchTarget::new(repo.clone(), row.name.clone());
         for requirement in store.dependencies(&target) {
@@ -591,75 +600,77 @@ fn unmet_dependencies(
 
     let mut findings = Vec::new();
     let mut problems = Vec::new();
-    for (required_repo, requirements) in grouped {
-        let Some(entry) = registry.get(&required_repo) else {
-            for (branch, requirement) in requirements {
-                problems.push(format!(
-                    "{branch} requires {requirement}, whose repo is not in the registry"
-                ));
-            }
-            continue;
+    {
+        let mut outcomes = DependencyResults {
+            findings: &mut findings,
+            problems: &mut problems,
         };
-
-        if required_repo == *repo {
-            let Some(snapshot) = snapshot else {
+        for (required_repo, requirements) in grouped {
+            let Some(entry) = registry.get(&required_repo) else {
                 for (branch, requirement) in requirements {
-                    problems.push(format!(
-                        "cannot check whether {branch} still needs {requirement}: no forge consulted"
+                    outcomes.problems.push(format!(
+                        "{branch} requires {requirement}, whose repo is not in the registry"
                     ));
                 }
                 continue;
             };
-            for (branch, requirement) in requirements {
-                record_dependency_state(
-                    &branch,
-                    &requirement,
-                    snapshot
-                        .fact(requirement.number)
-                        .map(|fact| fact.pull.state.as_str()),
-                    &mut findings,
-                    &mut problems,
-                );
-            }
-            continue;
-        }
 
-        let Some(forge) = forge else {
-            for (branch, requirement) in requirements {
-                problems.push(format!(
-                    "cannot check whether {branch} still needs {requirement}: no forge consulted"
-                ));
-            }
-            continue;
-        };
-        let numbers: Vec<u64> = requirements
-            .iter()
-            .map(|(_, requirement)| requirement.number)
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect();
-        match forge
-            .repo_identity(&entry.path)
-            .and_then(|identity| forge.pull_facts(&entry.path, &identity, &numbers))
-        {
-            Ok(facts) => {
+            if required_repo == *repo {
+                let Some(snapshot) = snapshot else {
+                    for (branch, requirement) in requirements {
+                        outcomes.problems.push(format!(
+                        "cannot check whether {branch} still needs {requirement}: no forge consulted"
+                    ));
+                    }
+                    continue;
+                };
                 for (branch, requirement) in requirements {
-                    record_dependency_state(
+                    outcomes.record(
                         &branch,
                         &requirement,
-                        facts
-                            .get(&requirement.number)
+                        snapshot
+                            .fact(requirement.number)
                             .map(|fact| fact.pull.state.as_str()),
-                        &mut findings,
-                        &mut problems,
                     );
                 }
+                continue;
             }
-            Err(error) => {
+
+            let Some(forge) = forge else {
                 for (branch, requirement) in requirements {
-                    problems.push(format!(
-                        "cannot check whether {branch} still needs {requirement}: {error}"
-                    ));
+                    outcomes.problems.push(format!(
+                    "cannot check whether {branch} still needs {requirement}: no forge consulted"
+                ));
+                }
+                continue;
+            };
+            let numbers: Vec<u64> = requirements
+                .iter()
+                .map(|(_, requirement)| requirement.number)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            match forge
+                .repo_identity(&entry.path)
+                .and_then(|identity| forge.pull_facts(&entry.path, &identity, &numbers))
+            {
+                Ok(facts) => {
+                    for (branch, requirement) in requirements {
+                        outcomes.record(
+                            &branch,
+                            &requirement,
+                            facts
+                                .get(&requirement.number)
+                                .map(|fact| fact.pull.state.as_str()),
+                        );
+                    }
+                }
+                Err(error) => {
+                    for (branch, requirement) in requirements {
+                        outcomes.problems.push(format!(
+                            "cannot check whether {branch} still needs {requirement}: {error}"
+                        ));
+                    }
                 }
             }
         }
@@ -670,14 +681,24 @@ fn unmet_dependencies(
 /// Fold declared dependencies into a report.
 ///
 /// Separate from `gather` only to keep that function readable.
-fn add_dependency_findings(
-    report: &mut Report,
-    name: &RepoName,
-    store: &Store,
-    options: &Options<'_>,
-    snapshot: Option<&crate::snapshot::ForgeSnapshot<'_>>,
-    timings: &mut Timings,
-) {
+struct DependencyInput<'a, 'forge, 'snapshot> {
+    report: &'a mut Report,
+    name: &'a RepoName,
+    store: &'a Store,
+    options: &'a Options<'forge>,
+    snapshot: Option<&'a crate::snapshot::ForgeSnapshot<'snapshot>>,
+    timings: &'a mut Timings,
+}
+
+fn add_dependency_findings(input: DependencyInput<'_, '_, '_>) {
+    let DependencyInput {
+        report,
+        name,
+        store,
+        options,
+        snapshot,
+        timings,
+    } = input;
     let Some(registry) = options.registry else {
         return;
     };
@@ -929,10 +950,7 @@ fn add_releases(
 ///
 /// Pull request discovery is deliberately absent: a probe never reads it, and
 /// separating these inputs lets the probe phase overlap forge discovery.
-fn probe_inputs(
-    branches: Vec<(BranchName, CommitId)>,
-    tips: &BookmarkTips,
-) -> Vec<ProbeInput> {
+fn probe_inputs(branches: Vec<(BranchName, CommitId)>, tips: &BookmarkTips) -> Vec<ProbeInput> {
     branches
         .into_iter()
         .map(|(branch, tip)| {
@@ -979,10 +997,7 @@ fn checks_from(
 }
 
 /// The locally divergent branches that need rows but have no tip to probe.
-fn divergent_branch_names(
-    repo: &Repo,
-    entry: &RepoEntry,
-) -> anyhow::Result<Vec<BranchName>> {
+fn divergent_branch_names(repo: &Repo, entry: &RepoEntry) -> anyhow::Result<Vec<BranchName>> {
     let scheme = entry.release_scheme();
     Ok(repo
         .conflicted_bookmarks()?
@@ -1235,8 +1250,11 @@ fn branch_rows(
         if landed == Some(LandedVerdict::Unjudged) {
             unjudged.push(branch.to_string());
         }
-        let fact = pull_summary_for(&branch, &input.index.by_branch)
-            .and_then(|summary| input.snapshot.and_then(|snapshot| snapshot.fact(summary.number)));
+        let fact = pull_summary_for(&branch, &input.index.by_branch).and_then(|summary| {
+            input
+                .snapshot
+                .and_then(|snapshot| snapshot.fact(summary.number))
+        });
         let (pull_request, review_stale, checks) = fact.map_or_else(
             || (None, None, None),
             |fact| {
@@ -1296,38 +1314,47 @@ struct StatusPhases<'snapshot> {
     probe: ProbePhase,
 }
 
-/// Run independent forge discovery and landed probes without sharing report mutation.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the phase boundary keeps the concurrent inputs explicit and gather_timed compact"
-)]
-fn run_status_phases<'snapshot>(
-    entry: &RepoEntry,
-    options: &Options<'_>,
-    probe_inputs: &[ProbeInput],
+/// Inputs to the concurrent forge-discovery and landed-probe phases.
+#[derive(Clone, Copy)]
+struct StatusPhaseInput<'a, 'forge, 'snapshot> {
+    entry: &'a RepoEntry,
+    options: &'a Options<'forge>,
+    probe_inputs: &'a [ProbeInput],
     opened: Option<&'snapshot crate::snapshot::Opened<'snapshot>>,
-    trunk_commit: Option<&CommitId>,
-    branches: &[BranchName],
-    declared: &[u64],
+    trunk_commit: Option<&'a CommitId>,
+    branches: &'a [BranchName],
+    declared: &'a [u64],
     forge_started: std::time::Instant,
+}
+
+/// Run independent forge discovery and landed probes without sharing report mutation.
+fn run_status_phases<'snapshot>(
+    input: StatusPhaseInput<'_, '_, 'snapshot>,
 ) -> StatusPhases<'snapshot> {
+    let StatusPhaseInput {
+        entry,
+        options,
+        probe_inputs,
+        opened,
+        trunk_commit,
+        branches,
+        declared,
+        forge_started,
+    } = input;
     let upstream_trunk = entry.upstream_trunk();
+    let context = ProbeContext {
+        path: &entry.path,
+        options,
+        upstream_trunk: &upstream_trunk,
+        opened,
+        trunk_commit,
+    };
     let (forge, probe) = std::thread::scope(|scope| {
-        let probes = scope.spawn(|| {
-            probe_phase(
-                &entry.path,
-                probe_inputs,
-                options,
-                &upstream_trunk,
-                opened,
-                trunk_commit,
-            )
-        });
+        let probes = scope.spawn(|| probe_phase(context, probe_inputs));
         let forge = forge_phase(opened, branches, declared, forge_started);
-        let probes = match probes.join() {
-            Ok(probes) => probes,
-            Err(_) => ProbePhase::panicked(probe_inputs),
-        };
+        let probes = probes
+            .join()
+            .unwrap_or_else(|_| ProbePhase::panicked(probe_inputs));
         (forge, probes)
     });
     StatusPhases { forge, probe }
@@ -1355,7 +1382,9 @@ fn fold_phase_outcome(
     phases: &mut StatusPhases<'_>,
 ) -> anyhow::Result<()> {
     report.forge_consulted = phases.forge.snapshot.is_some();
-    report.problems.extend(std::mem::take(&mut phases.forge.problems));
+    report
+        .problems
+        .extend(std::mem::take(&mut phases.forge.problems));
     timings.forge = phases.forge.duration;
     timings.probes = phases.probe.duration;
 
@@ -1399,20 +1428,22 @@ fn fold_phase_outcome(
         input.entry.default_base(),
     ));
     report.problems.extend(unjudged_note(&unjudged));
-    add_dependency_findings(
+    add_dependency_findings(DependencyInput {
         report,
-        input.name,
-        input.store,
-        input.options,
-        phases.forge.snapshot.as_ref(),
+        name: input.name,
+        store: input.store,
+        options: input.options,
+        snapshot: phases.forge.snapshot.as_ref(),
         timings,
-    );
+    });
     if let Some(snapshot) = phases.forge.snapshot.as_ref() {
         let landed = input
             .probe_ran
             .then(|| std::mem::take(&mut phases.probe.landed));
         if let Err(error) = snapshot.persist(landed) {
-            report.problems.push(format!("forge cache not saved: {error}"));
+            report
+                .problems
+                .push(format!("forge cache not saved: {error}"));
         }
     }
     Ok(())
@@ -1468,16 +1499,16 @@ pub fn gather_timed(
     let opened_ref = opened.as_ref();
     let trunk_commit = repo.resolve_commit(&entry.upstream_trunk()).ok();
     let probe_ran = options.probe && trunk_commit.is_some();
-    let mut phases = run_status_phases(
+    let mut phases = run_status_phases(StatusPhaseInput {
         entry,
         options,
-        &probe_inputs,
-        opened_ref,
-        trunk_commit.as_ref(),
-        &all_branches,
-        &declared,
+        probe_inputs: &probe_inputs,
+        opened: opened_ref,
+        trunk_commit: trunk_commit.as_ref(),
+        branches: &all_branches,
+        declared: &declared,
         forge_started,
-    );
+    });
     fold_phase_outcome(
         &mut report,
         &mut timings,

@@ -15,8 +15,8 @@ use crate::forge_cache::{self, CacheFile};
 pub struct SnapshotConfig<'a> {
     pub forge: &'a dyn Forge,
     pub path: &'a Path,
-    /// Origin and release remotes: authors derive from them (search_authors),
-    /// and ours() filters by them (ours_only).
+    /// Origin and release remotes: authors derive from them (`search_authors`),
+    /// and `ours()` filters by them (`ours_only`).
     pub remotes: [&'a str; 2],
     /// Resolved cache root (…/knives). None = no persistence: cold fetch, no read, no write.
     pub cache_root: Option<&'a Path>,
@@ -53,7 +53,7 @@ impl fmt::Debug for Opened<'_> {
     }
 }
 
-pub fn open<'a>(config: SnapshotConfig<'a>) -> Result<Opened<'a>, ForgeError> {
+pub fn open(config: SnapshotConfig<'_>) -> Result<Opened<'_>, ForgeError> {
     let identity = config.forge.repo_identity(config.path)?;
     let file = config
         .cache_root
@@ -69,8 +69,8 @@ pub fn open<'a>(config: SnapshotConfig<'a>) -> Result<Opened<'a>, ForgeError> {
     })
 }
 
-impl<'a> Opened<'a> {
-    pub fn identity(&self) -> &RepoIdentity {
+impl Opened<'_> {
+    pub const fn identity(&self) -> &RepoIdentity {
         &self.identity
     }
 
@@ -84,39 +84,34 @@ impl<'a> Opened<'a> {
     /// Warm: sweep; valid delta → cached rows. Overflow/invalid/failed sweep or
     /// no cache → cold reseed (wide cheap lists). Err = neither path succeeded.
     pub fn discover(&self) -> Result<Discovery<'_>, ForgeError> {
-        if let Some(read) = &self.read {
-            match self.config.forge.sweep(self.config.path, &self.identity) {
-                Ok(page) => {
-                    let spans = page
-                        .entries
-                        .last()
-                        .is_some_and(|oldest| oldest.updated_at.as_str() < read.watermark.as_str())
-                        || !page.has_next_page;
-                    if spans {
-                        let refresh = page
-                            .entries
-                            .iter()
-                            .filter(|entry| {
-                                entry.updated_at.as_str() >= read.watermark.as_str()
-                            })
-                            .map(|entry| entry.number)
-                            .collect();
-                        let sweep_max = page
-                            .entries
-                            .first()
-                            .map_or_else(String::new, |newest| newest.updated_at.clone());
-                        let mut rows: Vec<PullSummary> = read.pulls.values().cloned().collect();
-                        rows.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
-                        return Ok(Discovery {
-                            opened: self,
-                            rows,
-                            refresh,
-                            sweep_max,
-                            cold: false,
-                        });
-                    }
-                }
-                Err(_) => {}
+        if let Some(read) = &self.read
+            && let Ok(page) = self.config.forge.sweep(self.config.path, &self.identity)
+        {
+            let spans = page
+                .entries
+                .last()
+                .is_some_and(|oldest| oldest.updated_at.as_str() < read.watermark.as_str())
+                || !page.has_next_page;
+            if spans {
+                let refresh = page
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.updated_at.as_str() >= read.watermark.as_str())
+                    .map(|entry| entry.number)
+                    .collect();
+                let sweep_max = page
+                    .entries
+                    .first()
+                    .map_or_else(String::new, |newest| newest.updated_at.clone());
+                let mut rows: Vec<PullSummary> = read.pulls.values().cloned().collect();
+                rows.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+                return Ok(Discovery {
+                    opened: self,
+                    rows,
+                    refresh,
+                    sweep_max,
+                    cold: false,
+                });
             }
         }
 
@@ -140,7 +135,6 @@ impl<'a> Opened<'a> {
         })
     }
 }
-
 
 pub struct Discovery<'o> {
     opened: &'o Opened<'o>,
@@ -169,14 +163,14 @@ impl<'o> Discovery<'o> {
         &self.rows
     }
 
-    /// rows() filtered to our own copies (ours_only over config.remotes).
+    /// `rows()` filtered to our own copies (`ours_only` over config.remotes).
     pub fn ours(&self) -> Vec<PullSummary> {
         ours_only(&self.rows, &self.opened.config.remotes)
     }
 
     /// The one live batch: refresh set ∪ surfaced (deduped). Any failure → Err
     /// and no snapshot exists (I3). Success merges fetched rows over the
-    /// discovery rows so rows() reflects what the batch just proved.
+    /// discovery rows so `rows()` reflects what the batch just proved.
     pub fn complete(self, surfaced: &[u64]) -> Result<ForgeSnapshot<'o>, ForgeError> {
         let mut numbers = self.refresh;
         numbers.extend_from_slice(surfaced);
@@ -185,10 +179,11 @@ impl<'o> Discovery<'o> {
         let facts = if numbers.is_empty() {
             BTreeMap::new()
         } else {
-            self.opened
-                .config
-                .forge
-                .pull_facts(self.opened.config.path, &self.opened.identity, &numbers)?
+            self.opened.config.forge.pull_facts(
+                self.opened.config.path,
+                &self.opened.identity,
+                &numbers,
+            )?
         };
         let mut rows = self.rows;
         for fact in facts.values() {
@@ -240,7 +235,7 @@ impl ForgeSnapshot<'_> {
     }
 
     /// The live fact row. Present for every number the batch answered; a
-    /// surfaced number that is absent was NOT_FOUND — render it as unanswered,
+    /// surfaced number that is absent was `NOT_FOUND` — render it as unanswered,
     /// never from cache.
     pub fn fact(&self, number: u64) -> Option<&PullFacts> {
         self.facts.get(&number)
@@ -251,10 +246,7 @@ impl ForgeSnapshot<'_> {
     /// Err = cache write failed AFTER live success: consulted stays true,
     /// caller adds a problem note (failure-table row 7). No-op Ok when no
     /// cache path exists.
-    pub fn persist(
-        &self,
-        landed: Option<BTreeMap<String, LandedVerdict>>,
-    ) -> std::io::Result<()> {
+    pub fn persist(&self, landed: Option<BTreeMap<String, LandedVerdict>>) -> std::io::Result<()> {
         let Some(path) = &self.opened.file else {
             return Ok(());
         };
@@ -283,8 +275,8 @@ impl ForgeSnapshot<'_> {
     }
 }
 
-/// PullSummary successor to [`crate::forge::ours_only`], the PullRequest helper
-/// that Wave 5 deletes after every consumer has moved to snapshots.
+/// `PullSummary` successor to [`crate::forge::ours_only`], the `PullRequest`
+/// helper that Wave 5 deletes after every consumer has moved to snapshots.
 fn ours_only(rows: &[PullSummary], remotes: &[&str]) -> Vec<PullSummary> {
     let owners: Vec<&str> = remotes
         .iter()
@@ -317,15 +309,14 @@ mod tests {
 
     const EARLIER: &str = "2026-08-01T00:00:00Z";
     const LATER: &str = "2026-08-02T00:00:00Z";
+    const ORIGIN_REMOTE: &str = concat!("https://github", ".com/fake-owner/fake-repo.git");
+    const RELEASE_REMOTE: &str = concat!("git@github", ".com:fake-owner/fake-repo.git");
 
     fn config<'a>(fake: &'a FakeForge, root: Option<&'a Path>) -> SnapshotConfig<'a> {
         SnapshotConfig {
             forge: fake,
             path: Path::new("/fake"),
-            remotes: [
-                "https://github.com/fake-owner/fake-repo.git",
-                "git@github.com:fake-owner/fake-repo.git",
-            ],
+            remotes: [ORIGIN_REMOTE, RELEASE_REMOTE],
             cache_root: root,
         }
     }
@@ -395,7 +386,9 @@ mod tests {
     fn a_snapshot_only_exists_after_sweep_and_batch_both_succeed() {
         let directory = tempfile::tempdir().expect("create cache directory");
         let mut read = cache(EARLIER, [pull(7, EARLIER, "old-oid")]);
-        let _ = read.landed.insert("tip:trunk".to_owned(), LandedVerdict::InTrunk);
+        let _ = read
+            .landed
+            .insert("tip:trunk".to_owned(), LandedVerdict::InTrunk);
         let path = write_cache(directory.path(), &read);
         let forge = fake([pull(7, LATER, "fresh-oid")]);
 
@@ -412,13 +405,15 @@ mod tests {
             .complete(&[])
             .expect("live batch succeeds");
 
-        assert_eq!(snapshot.fact(7).map(|fact| fact.pull.head_ref_oid.as_str()), Some("fresh-oid"));
+        assert_eq!(
+            snapshot.fact(7).map(|fact| fact.pull.head_ref_oid.as_str()),
+            Some("fresh-oid")
+        );
         assert_eq!(snapshot.rows()[0].head_ref_oid, "fresh-oid");
         assert_eq!(snapshot.ours().len(), 1, "ours uses the configured remotes");
         snapshot.persist(None).expect("persist warm snapshot");
         assert_eq!(
-            load(&path, &identity())
-                .and_then(|file| file.landed.get("tip:trunk").copied()),
+            load(&path, &identity()).and_then(|file| file.landed.get("tip:trunk").copied()),
             Some(LandedVerdict::InTrunk),
             "a non-probe caller keeps the landed cache section"
         );
@@ -451,12 +446,12 @@ mod tests {
         };
 
         let opened = open(config(&forge, Some(directory.path()))).expect("open seeded cache");
-        let result = opened
-            .discover()
-            .expect("sweep succeeds")
-            .complete(&[]);
+        let result = opened.discover().expect("sweep succeeds").complete(&[]);
 
-        assert!(result.is_err(), "a failed live batch constructs no snapshot");
+        assert!(
+            result.is_err(),
+            "a failed live batch constructs no snapshot"
+        );
         assert_eq!(
             std::fs::read(&path).expect("read cache after failed batch"),
             before,
@@ -467,36 +462,49 @@ mod tests {
     #[test]
     fn sweep_failure_falls_back_to_reseed_and_still_consults() {
         let directory = tempfile::tempdir().expect("create cache directory");
-        write_cache(directory.path(), &cache(EARLIER, [pull(99, EARLIER, "stale-oid")]));
+        write_cache(
+            directory.path(),
+            &cache(EARLIER, [pull(99, EARLIER, "stale-oid")]),
+        );
         let forge = FakeForge {
             fail_sweep: true,
             ..fake([pull(7, LATER, "live-oid"), pull(100, EARLIER, "older-oid")])
         };
 
         let opened = open(config(&forge, Some(directory.path()))).expect("open cache");
-        let discovery = opened
-            .discover()
-            .expect("failed sweep falls back to list");
+        let discovery = opened.discover().expect("failed sweep falls back to list");
         assert_eq!(
-            discovery.rows().iter().map(|row| row.number).collect::<Vec<_>>(),
+            discovery
+                .rows()
+                .iter()
+                .map(|row| row.number)
+                .collect::<Vec<_>>(),
             vec![7, 100],
             "cold discovery normalizes the fake's branch-ordered list to newest-updated first"
         );
-        let snapshot = discovery
-            .complete(&[7])
-            .expect("live batch after reseed");
+        let snapshot = discovery.complete(&[7]).expect("live batch after reseed");
 
         assert_eq!(
-            snapshot.rows().iter().map(|row| row.number).collect::<Vec<_>>(),
+            snapshot
+                .rows()
+                .iter()
+                .map(|row| row.number)
+                .collect::<Vec<_>>(),
             vec![7, 100]
         );
-        assert!(snapshot.fact(7).is_some(), "the fallback snapshot has live facts");
+        assert!(
+            snapshot.fact(7).is_some(),
+            "the fallback snapshot has live facts"
+        );
     }
 
     #[test]
     fn sweep_and_reseed_both_failing_is_todays_forge_down() {
         let directory = tempfile::tempdir().expect("create cache directory");
-        write_cache(directory.path(), &cache(EARLIER, [pull(7, EARLIER, "cached-oid")]));
+        write_cache(
+            directory.path(),
+            &cache(EARLIER, [pull(7, EARLIER, "cached-oid")]),
+        );
         let forge = FakeForge {
             fail_sweep: true,
             fail_list: true,
@@ -517,7 +525,10 @@ mod tests {
         let directory = tempfile::tempdir().expect("create cache directory");
         let path = write_cache(
             directory.path(),
-            &cache(EARLIER, [pull(7, EARLIER, "old-oid"), pull(99, EARLIER, "stale-oid")]),
+            &cache(
+                EARLIER,
+                [pull(7, EARLIER, "old-oid"), pull(99, EARLIER, "stale-oid")],
+            ),
         );
         let forge = FakeForge {
             sweep_overflows: true,
@@ -544,7 +555,10 @@ mod tests {
     #[test]
     fn a_short_all_fresh_page_is_not_an_overflow() {
         let directory = tempfile::tempdir().expect("create cache directory");
-        write_cache(directory.path(), &cache(EARLIER, [pull(7, EARLIER, "old-oid")]));
+        write_cache(
+            directory.path(),
+            &cache(EARLIER, [pull(7, EARLIER, "old-oid")]),
+        );
         let forge = FakeForge {
             fail_list: true,
             ..fake([pull(7, LATER, "fresh-oid")])
@@ -557,13 +571,19 @@ mod tests {
             .complete(&[])
             .expect("the refreshed row is fetched live");
 
-        assert_eq!(snapshot.fact(7).map(|fact| fact.pull.head_ref_oid.as_str()), Some("fresh-oid"));
+        assert_eq!(
+            snapshot.fact(7).map(|fact| fact.pull.head_ref_oid.as_str()),
+            Some("fresh-oid")
+        );
     }
 
     #[test]
     fn a_same_second_mutation_is_refreshed_anyway() {
         let directory = tempfile::tempdir().expect("create cache directory");
-        write_cache(directory.path(), &cache(EARLIER, [pull(7, EARLIER, "old-oid")]));
+        write_cache(
+            directory.path(),
+            &cache(EARLIER, [pull(7, EARLIER, "old-oid")]),
+        );
         let forge = fake([pull(7, EARLIER, "fresh-oid")]);
 
         let opened = open(config(&forge, Some(directory.path()))).expect("open cache");
@@ -573,7 +593,10 @@ mod tests {
             .complete(&[])
             .expect("same-second entry is in the live batch");
 
-        assert_eq!(snapshot.fact(7).map(|fact| fact.pull.head_ref_oid.as_str()), Some("fresh-oid"));
+        assert_eq!(
+            snapshot.fact(7).map(|fact| fact.pull.head_ref_oid.as_str()),
+            Some("fresh-oid")
+        );
         assert_eq!(snapshot.rows()[0].head_ref_oid, "fresh-oid");
     }
 
@@ -584,24 +607,39 @@ mod tests {
         std::fs::write(&root_file, b"not a directory").expect("make invalid cache root");
         let forge = fake([pull(7, LATER, "live-oid")]);
 
-        let opened =
-            open(config(&forge, Some(&root_file))).expect("identity resolution does not depend on the cache");
+        let opened = open(config(&forge, Some(&root_file)))
+            .expect("identity resolution does not depend on the cache");
         let snapshot = opened
             .discover()
             .expect("cold list succeeds")
             .complete(&[7])
             .expect("live data succeeds before the write");
 
-        assert!(snapshot.fact(7).is_some(), "live fact is usable before persistence");
-        assert!(snapshot.persist(None).is_err(), "an unwritable cache is reported to the caller");
-        assert!(snapshot.fact(7).is_some(), "a write failure cannot invalidate live facts");
+        assert!(
+            snapshot.fact(7).is_some(),
+            "live fact is usable before persistence"
+        );
+        assert!(
+            snapshot.persist(None).is_err(),
+            "an unwritable cache is reported to the caller"
+        );
+        assert!(
+            snapshot.fact(7).is_some(),
+            "a write failure cannot invalidate live facts"
+        );
     }
 
     #[test]
     fn surfaced_numbers_join_the_batch_deduped_with_the_refresh_set() {
         let directory = tempfile::tempdir().expect("create cache directory");
-        write_cache(directory.path(), &cache(EARLIER, [pull(7, EARLIER, "old-oid")]));
-        let forge = fake([pull(7, LATER, "fresh-oid"), pull(9, EARLIER, "surfaced-oid")]);
+        write_cache(
+            directory.path(),
+            &cache(EARLIER, [pull(7, EARLIER, "old-oid")]),
+        );
+        let forge = fake([
+            pull(7, LATER, "fresh-oid"),
+            pull(9, EARLIER, "surfaced-oid"),
+        ]);
 
         let opened = open(config(&forge, Some(directory.path()))).expect("open cache");
         let snapshot = opened
@@ -611,7 +649,10 @@ mod tests {
             .expect("one batch answers refresh and surfaced numbers");
 
         assert!(snapshot.fact(7).is_some(), "the refresh number is answered");
-        assert!(snapshot.fact(9).is_some(), "a surfaced number joins the batch once");
+        assert!(
+            snapshot.fact(9).is_some(),
+            "a surfaced number joins the batch once"
+        );
     }
 
     #[test]
@@ -622,14 +663,16 @@ mod tests {
         write_cache(directory.path(), &foreign);
         let forge = fake([pull(7, LATER, "live-oid")]);
 
-        let opened =
-            open(config(&forge, Some(directory.path()))).expect("open ignores a foreign cache file");
-        let discovery = opened
-            .discover()
-            .expect("identity mismatch cold-reseeds");
+        let opened = open(config(&forge, Some(directory.path())))
+            .expect("open ignores a foreign cache file");
+        let discovery = opened.discover().expect("identity mismatch cold-reseeds");
 
         assert_eq!(
-            discovery.rows().iter().map(|row| row.number).collect::<Vec<_>>(),
+            discovery
+                .rows()
+                .iter()
+                .map(|row| row.number)
+                .collect::<Vec<_>>(),
             vec![7],
             "the foreign file contributes no discovery rows"
         );

@@ -10,11 +10,11 @@ use std::process::ExitCode;
 
 use clap::Parser as _;
 use knives::cli::{Cli, Command, Exit, ReleaseAction};
-use knives::detect::RebaseOutcome;
 use knives::commands::{
     hook, init, notch, preflight, register, release, repos, start, status, sync,
 };
 use knives::config::{default_config_path, load};
+use knives::detect::RebaseOutcome;
 use knives::forge::{CliForge, Forge, PullRequest};
 use knives::ids::{BranchName, BranchTarget, ReleaseScheme, RepoName, Requirement};
 use knives::ledger::{Draft, Kind, Ledger, Scribe};
@@ -243,26 +243,26 @@ fn run_release_carries(
 ) -> anyhow::Result<Exit> {
     let named = match target {
         Some(reference) => reference.to_owned(),
-        None => match release::plan(repo, entry, &entry.consumers)?.release {
-            Some(name) => name,
-            None => {
+        None => {
+            if let Some(name) = release::plan(repo, entry, &entry.consumers)?.release {
+                name
+            } else {
                 println!("{repo}: no release to check against; cut one or pass --in <ref>");
                 return Ok(Exit::Incomplete);
             }
-        },
+        }
     };
-    let outcome = knives::jj::probe_landed(
-        &entry.path,
-        &knives::ids::BranchName::new(revision),
-        &named,
-    )?;
+    let outcome =
+        knives::jj::probe_landed(&entry.path, &knives::ids::BranchName::new(revision), &named)?;
     Ok(match outcome {
         RebaseOutcome::Empty => {
             println!("{repo}: {revision} is carried in {named}: replaying it leaves nothing");
             Exit::Ok
         }
         RebaseOutcome::CleanNonEmpty => {
-            println!("{repo}: {revision} is NOT carried in {named}: replaying it leaves real diffs");
+            println!(
+                "{repo}: {revision} is NOT carried in {named}: replaying it leaves real diffs"
+            );
             Exit::Findings
         }
         RebaseOutcome::Conflicted => {
@@ -307,7 +307,13 @@ fn run_rebase(
             worst = worst.worst(Exit::Incomplete);
             continue;
         }
-        let Some(destination) = rebase_target(&repo, &entry, &opened, reference, cache_root)?
+        let Some(destination) = rebase_target(RebaseTargetInput {
+            repo: &repo,
+            entry: &entry,
+            opened: &opened,
+            reference,
+            cache_root,
+        })?
         else {
             worst = worst.worst(Exit::Incomplete);
             continue;
@@ -315,36 +321,26 @@ fn run_rebase(
         let onto = destination.onto.clone();
         let reference = destination.reference.clone();
         let release_commit = opened.resolve_commit(&release_name)?;
-        // Ancestry, not parent identity: a commit already reachable through a
-        // parent's history is contained, and adding it again grows the octopus.
-        if opened.is_ancestor(&onto, &release_commit)? {
-            println!("{repo}: {release_name} already contains {reference}");
-            if !no_drop {
-                worst = worst.worst(drop_landed_members(
-                    &repo,
-                    &entry,
-                    &release_name,
-                    &destination,
-                )?);
-            }
+        if let Some(exit) = existing_rebase_exit(ExistingRebaseInput {
+            opened: &opened,
+            repo: &repo,
+            entry: &entry,
+            release_name: &release_name,
+            release_commit: &release_commit,
+            destination: &destination,
+            no_drop,
+        })? {
+            worst = worst.worst(exit);
             continue;
         }
-        // Follows from who pins it, rather than from an opinion: a consumer that follows
-        // the branch sees a repair in place, one frozen on the revision does not.
         let scheme = entry.release_scheme();
-        if release::repair_effect(&plan.pins) == release::RepairEffect::NewDatedName {
-            match &scheme {
-                ReleaseScheme::Dated => println!(
-                    "{repo}: every pin of {release_name} is frozen, so moving it would reach \
-                     nobody; cut a new dated release instead"
-                ),
-                ReleaseScheme::Fixed(_) => println!(
-                    "{repo}: every pin of {release_name} is frozen, so moving the fixed branch \
-                     would reach nobody; update the frozen consumer pins, or change the release \
-                     scheme before advancing it (fixed branches cannot reach revision pins)"
-                ),
-            }
-            worst = worst.worst(Exit::Incomplete);
+        if let Some(exit) = frozen_rebase_exit(
+            &repo,
+            &release_name,
+            &scheme,
+            release::repair_effect(&plan.pins),
+        ) {
+            worst = worst.worst(exit);
             continue;
         }
         let context = RebaseContext {
@@ -391,6 +387,29 @@ fn run_rebase(
         }
     }
     Ok(worst)
+}
+
+fn frozen_rebase_exit(
+    repo: &RepoName,
+    release_name: &str,
+    scheme: &ReleaseScheme,
+    effect: release::RepairEffect,
+) -> Option<Exit> {
+    if effect != release::RepairEffect::NewDatedName {
+        return None;
+    }
+    match scheme {
+        ReleaseScheme::Dated => println!(
+            "{repo}: every pin of {release_name} is frozen, so moving it would reach \
+             nobody; cut a new dated release instead"
+        ),
+        ReleaseScheme::Fixed(_) => println!(
+            "{repo}: every pin of {release_name} is frozen, so moving the fixed branch \
+             would reach nobody; update the frozen consumer pins, or change the release \
+             scheme before advancing it (fixed branches cannot reach revision pins)"
+        ),
+    }
+    Some(Exit::Incomplete)
 }
 
 /// Rewrite the release to its member parents only, shedding stale bases.
@@ -484,18 +503,64 @@ struct RebaseDestination {
     landed: Vec<PullRequest>,
 }
 
+#[derive(Clone, Copy)]
+struct RebaseTargetInput<'a> {
+    repo: &'a RepoName,
+    entry: &'a knives::config::RepoEntry,
+    opened: &'a knives::jj::Repo,
+    reference: Option<&'a str>,
+    cache_root: Option<&'a std::path::Path>,
+}
+
+#[derive(Clone, Copy)]
+struct ExistingRebaseInput<'a> {
+    opened: &'a knives::jj::Repo,
+    repo: &'a RepoName,
+    entry: &'a knives::config::RepoEntry,
+    release_name: &'a str,
+    release_commit: &'a knives::ids::CommitId,
+    destination: &'a RebaseDestination,
+    no_drop: bool,
+}
+
+fn existing_rebase_exit(input: ExistingRebaseInput<'_>) -> anyhow::Result<Option<Exit>> {
+    let ExistingRebaseInput {
+        opened,
+        repo,
+        entry,
+        release_name,
+        release_commit,
+        destination,
+        no_drop,
+    } = input;
+    if !opened.is_ancestor(&destination.onto, release_commit)? {
+        return Ok(None);
+    }
+    println!(
+        "{repo}: {release_name} already contains {}",
+        destination.reference
+    );
+    let exit = if no_drop {
+        Exit::Ok
+    } else {
+        drop_landed_members(repo, entry, release_name, destination)?
+    };
+    Ok(Some(exit))
+}
+
 /// The commit a rebase moves onto, with the label the report and provenance use.
 ///
 /// An explicit reference is taken at its word. Without one, the default is the
 /// first upstream trunk commit that contains every merged pull request — merged,
 /// not closed, because closed landed nothing.
-fn rebase_target(
-    repo: &RepoName,
-    entry: &knives::config::RepoEntry,
-    opened: &knives::jj::Repo,
-    reference: Option<&str>,
-    cache_root: Option<&std::path::Path>,
-) -> anyhow::Result<Option<RebaseDestination>> {
+fn rebase_target(input: RebaseTargetInput<'_>) -> anyhow::Result<Option<RebaseDestination>> {
+    let RebaseTargetInput {
+        repo,
+        entry,
+        opened,
+        reference,
+        cache_root,
+    } = input;
     if let Some(explicit) = reference {
         return Ok(Some(RebaseDestination {
             onto: opened.resolve_commit(explicit)?,
@@ -2569,8 +2634,13 @@ fn run_preflight(name: &str) -> anyhow::Result<Exit> {
     let mut worst = Exit::Ok;
     let cache_root = knives::forge_cache::cache_root();
     for (repo, entry) in chosen {
-        let report =
-            preflight::gather(&repo, &entry, &mut store, &forge, cache_root.as_deref());
+        let report = preflight::gather(preflight::GatherInput {
+            name: &repo,
+            entry: &entry,
+            store: &mut store,
+            forge: &forge,
+            cache: cache_root.as_deref(),
+        });
         println!("{}", preflight::render(&report));
         worst = worst.worst(preflight::exit_for(&report));
     }
@@ -2598,13 +2668,13 @@ fn run_sync(
     let mut worst = Exit::Ok;
     for (name, entry) in chosen {
         let scribe = scribe_for(&name, &entry)?;
-        let report = sync::sync_repo(
-            &entry,
-            &mut store,
+        let report = sync::sync_repo(sync::SyncInput {
+            entry: &entry,
+            store: &mut store,
             forge,
-            &scribe,
-            cache_root.as_deref(),
-        )?;
+            scribe: &scribe,
+            cache: cache_root.as_deref(),
+        })?;
         if let Some(payload) = knives::cli::machine_payload(output, &report)? {
             println!("{payload}");
         } else {

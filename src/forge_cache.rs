@@ -21,28 +21,24 @@ pub struct CacheFile {
     pub landed: std::collections::BTreeMap<String, LandedVerdict>,
 }
 
-/// XDG_CACHE_HOME, else $HOME/.cache, then /knives. None only when HOME is unset.
+/// `XDG_CACHE_HOME`, else `$HOME/.cache`, then `/knives`. `None` only when `HOME` is unset.
 pub fn cache_root() -> Option<std::path::PathBuf> {
     std::env::var_os("XDG_CACHE_HOME")
         .map(std::path::PathBuf::from)
         .or_else(|| {
-            std::env::var_os("HOME")
-                .map(|home| std::path::PathBuf::from(home).join(".cache"))
+            std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".cache"))
         })
         .map(|base| base.join("knives"))
 }
 
 /// <root>/forge/<owner>/<repo>.json — owner and repo are separate path segments.
-pub fn cache_path(
-    root: &std::path::Path,
-    identity: &RepoIdentity,
-) -> Option<std::path::PathBuf> {
+pub fn cache_path(root: &std::path::Path, identity: &RepoIdentity) -> Option<std::path::PathBuf> {
     let (owner, repo) = identity.split().ok()?;
     Some(root.join("forge").join(owner).join(format!("{repo}.json")))
 }
 
-/// None on: missing file, unreadable, unparseable, schema_version mismatch,
-/// nameWithOwner mismatch, repo_id mismatch. Never an error (spec: cache loss
+/// `None` on: missing file, unreadable, unparseable, `schema_version` mismatch,
+/// `nameWithOwner` mismatch, `repo_id` mismatch. Never an error (spec: cache loss
 /// is not a problem).
 pub fn load(path: &std::path::Path, identity: &RepoIdentity) -> Option<CacheFile> {
     let bytes = std::fs::read(path).ok()?;
@@ -65,7 +61,7 @@ pub fn landed_key(tip: &crate::ids::CommitId, trunk: &crate::ids::CommitId) -> S
 
 /// Warm merge against the state read at open (never a re-read): per number the
 /// newer updatedAt wins, equal updatedAt keeps this run's fetched row; the
-/// watermark is max(read.watermark, sweep_max).
+/// watermark is max(read.watermark, `sweep_max`).
 pub fn merge_warm(
     read: CacheFile,
     fetched: &std::collections::BTreeMap<u64, PullFacts>,
@@ -117,11 +113,7 @@ pub fn replace_cold(
         .map(|row| row.updated_at.as_str())
         .max()
         .map_or_else(String::new, str::to_owned);
-    let pulls = rows
-        .iter()
-        .cloned()
-        .map(|row| (row.number, row))
-        .collect();
+    let pulls = rows.iter().cloned().map(|row| (row.number, row)).collect();
 
     CacheFile {
         schema_version: SCHEMA_VERSION,
@@ -133,7 +125,7 @@ pub fn replace_cold(
     }
 }
 
-/// create_dir_all + tempfile in the same directory + persist (rename).
+/// `create_dir_all` + tempfile in the same directory + persist (rename).
 pub fn write(path: &std::path::Path, file: &CacheFile) -> std::io::Result<()> {
     let parent = match path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent,
@@ -355,9 +347,15 @@ mod tests {
         );
 
         assert_eq!(replacement.pulls.len(), 2);
-        assert!(!replacement.pulls.contains_key(&4000), "old rows cannot survive a reseed");
+        assert!(
+            !replacement.pulls.contains_key(&4000),
+            "old rows cannot survive a reseed"
+        );
         assert_eq!(replacement.watermark, "2026-01-04T00:00:00Z");
-        assert_eq!(replacement.landed, landed, "the landed section is preserved");
+        assert_eq!(
+            replacement.landed, landed,
+            "the landed section is preserved"
+        );
     }
 
     #[test]
@@ -371,16 +369,18 @@ mod tests {
         let path = directory.path().join("nested").join("cache.json");
 
         write(&path, &input).expect("write cache atomically");
-        let round_trip: CacheFile = serde_json::from_slice(
-            &std::fs::read(&path).expect("read atomically written cache"),
-        )
-        .expect("parse atomically written cache");
+        let round_trip: CacheFile =
+            serde_json::from_slice(&std::fs::read(&path).expect("read atomically written cache"))
+                .expect("parse atomically written cache");
         assert_eq!(round_trip, input);
 
         let blocking_parent = directory.path().join("cannot-be-a-directory");
         std::fs::write(&blocking_parent, b"original bytes").expect("prewrite parent file");
         let blocked = blocking_parent.join("cache.json");
-        assert!(write(&blocked, &input).is_err(), "a file cannot become a directory");
+        assert!(
+            write(&blocked, &input).is_err(),
+            "a file cannot become a directory"
+        );
         assert_eq!(
             std::fs::read(&blocking_parent).expect("read prewritten parent file"),
             b"original bytes",

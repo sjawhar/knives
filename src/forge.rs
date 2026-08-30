@@ -24,7 +24,14 @@ const PR_STATE: &str = "all";
 const PR_SUMMARY_FIELDS: &str = "number,state,reviewDecision,headRefName,headRefOid,updatedAt,\
      isDraft,url,headRepositoryOwner,baseRefName,mergeCommit";
 const SUMMARY_LIST_ARGS: [&str; 8] = [
-    "pr", "list", "--state", PR_STATE, "--limit", "300", "--json", PR_SUMMARY_FIELDS,
+    "pr",
+    "list",
+    "--state",
+    PR_STATE,
+    "--limit",
+    "300",
+    "--json",
+    PR_SUMMARY_FIELDS,
 ];
 
 pub const fn summary_list_args() -> &'static [&'static str; 8] {
@@ -35,8 +42,6 @@ pub const fn summary_list_args() -> &'static [&'static str; 8] {
 pub const fn summary_fields() -> &'static str {
     PR_SUMMARY_FIELDS
 }
-
-
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -220,10 +225,11 @@ pub struct PullDetails {
     pub checks: Option<ChecksSummary>,
 }
 
-/// The cheap row: wide lists, the cache, and discovery. Carries every list
-/// field EXCEPT `mergeable`/`mergeStateStatus` — their absence from this type
-/// is the field split, enforced structurally: a consumer cannot read
-/// merge-state from a list row because the field does not exist.
+/// Cheap row for wide lists, the cache, and discovery.
+///
+/// Carries every list field except `mergeable`/`mergeStateStatus`. Its type
+/// structurally enforces the field split: consumers cannot read merge state
+/// from a list row because the field does not exist.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PullSummary {
@@ -293,11 +299,11 @@ pub struct PullFacts {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepoIdentity {
     pub name_with_owner: String, // "owner/repo"
-    pub id: String, // GraphQL node id
+    pub id: String,              // GraphQL node id
 }
 
 impl RepoIdentity {
-    /// (owner, repo), or ForgeError::Target when the name has no slash.
+    /// (owner, repo), or `ForgeError::Target` when the name has no slash.
     pub fn split(&self) -> Result<(&str, &str), ForgeError> {
         self.name_with_owner
             .split_once('/')
@@ -400,7 +406,6 @@ pub fn merged_onto(pulls: &[PullSummary], trunk: &str) -> Vec<PullSummary> {
     merged
 }
 
-
 #[derive(Debug, thiserror::Error)]
 pub enum ForgeError {
     /// Raised, never swallowed. A status report that quietly omits pull request
@@ -439,7 +444,6 @@ pub enum ForgeError {
 /// `Send + Sync` because `status` gathers repositories concurrently and probes
 /// branches on scoped threads, and both share one forge.
 pub trait Forge: Send + Sync {
-
     /// The forge's own name and GraphQL id for this checkout, once per run.
     fn repo_identity(&self, repo: &Path) -> Result<RepoIdentity, ForgeError>;
 
@@ -454,7 +458,7 @@ pub trait Forge: Send + Sync {
     fn sweep(&self, repo: &Path, target: &RepoIdentity) -> Result<SweepPage, ForgeError>;
 
     /// The live batch: full fact rows by number. Numbers the forge answers
-    /// NOT_FOUND for are absent from the map; any other failure is an error.
+    /// `NOT_FOUND` for are absent from the map; any other failure is an error.
     fn pull_facts(
         &self,
         repo: &Path,
@@ -472,7 +476,10 @@ impl CliForge {
         let started = std::time::Instant::now();
         let output = Command::new("gh").args(args).current_dir(repo).output()?;
         if crate::timing::enabled() {
-            eprintln!("{}", crate::timing::call_line(started.elapsed(), repo, args));
+            eprintln!(
+                "{}",
+                crate::timing::call_line(started.elapsed(), repo, args)
+            );
         }
         if output.status.success() {
             return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
@@ -556,9 +563,7 @@ impl Forge for CliForge {
         let query = format!("query={}", sweep_query());
         let payload = Self::run(
             repo,
-            &[
-                "api", "graphql", "-f", &owner, "-f", &name, "-f", &query,
-            ],
+            &["api", "graphql", "-f", &owner, "-f", &name, "-f", &query],
         )?;
         parse_sweep(&payload)
     }
@@ -586,9 +591,7 @@ impl Forge for CliForge {
                         let query = format!("query={}", pull_facts_query(chunk));
                         let payload = Self::run(
                             repo,
-                            &[
-                                "api", "graphql", "-f", owner, "-f", name, "-f", &query,
-                            ],
+                            &["api", "graphql", "-f", owner, "-f", name, "-f", &query],
                         )?;
                         parse_pull_facts(&payload, chunk)
                     })
@@ -604,11 +607,12 @@ impl Forge for CliForge {
     }
 }
 
-
-/// One page, newest-updated first. No pagination: cursoring over a changing
-/// UPDATED_AT ordering can skip a concurrently-updated pull request, so a page
-/// that does not span the watermark abandons the delta (snapshot::discover).
-pub fn sweep_query() -> &'static str {
+/// One page, newest-updated first.
+///
+/// No pagination: cursoring over a changing `UPDATED_AT` ordering can skip a
+/// concurrently-updated pull request, so a page that does not span the
+/// watermark abandons the delta (`snapshot::discover`).
+pub const fn sweep_query() -> &'static str {
     "query($owner: String!, $name: String!) { \
      repository(owner: $owner, name: $name) { \
      pullRequests(orderBy: {field: UPDATED_AT, direction: DESC}, first: 100) { \
@@ -616,9 +620,11 @@ pub fn sweep_query() -> &'static str {
      nodes { number updatedAt state } } } }"
 }
 
-/// The full I2 fact row per aliased number: every summary field plus
-/// merge-state, review timeline, check rollup, and the newest comment (sync).
-/// Alias names are not load-bearing; the parser keys on the repeated `number`.
+/// Full I2 fact row per aliased number.
+///
+/// It has every summary field plus merge state, review timeline, check rollup,
+/// and the newest comment (`sync`). Alias names are not load-bearing; the
+/// parser keys on the repeated `number`.
 pub fn pull_facts_query(numbers: &[u64]) -> String {
     let fields: String = numbers
         .iter()
@@ -640,8 +646,6 @@ pub fn pull_facts_query(numbers: &[u64]) -> String {
          comments(last: 1) {{ nodes {{ createdAt }} }} }}"
     )
 }
-
-
 
 /// Drop later duplicate summary rows, keeping the forge's freshest-first order.
 pub fn dedupe_by_number(pull_requests: &mut Vec<PullSummary>) {
@@ -751,7 +755,6 @@ struct QueryFailure {
     path: Vec<serde_json::Value>,
 }
 
-
 #[derive(Deserialize)]
 struct IdentityPayload {
     #[serde(rename = "nameWithOwner")]
@@ -828,7 +831,6 @@ struct FactsEnvelope {
     #[serde(default)]
     errors: Vec<QueryFailure>,
 }
-
 
 pub fn parse_identity(payload: &str) -> Result<RepoIdentity, ForgeError> {
     let identity: IdentityPayload = serde_json::from_str(payload)?;
@@ -990,8 +992,13 @@ pub fn parse_pull_facts(
     Ok(facts)
 }
 
-
 /// Facts supplied directly, for tests.
+///
+// Test-fake failure injection has one switch per failure-table row.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "test-fake failure injection needs one switch per failure-table row"
+)]
 #[derive(Debug, Default, Clone)]
 pub struct FakeForge {
     pub pull_requests: BTreeMap<BranchName, PullRequest>,
@@ -1018,7 +1025,7 @@ fn fake_failure(operation: &str) -> ForgeError {
     }
 }
 
-fn vanished_pull(number: u64, state: String) -> PullRequest {
+const fn vanished_pull(number: u64, state: String) -> PullRequest {
     PullRequest {
         number,
         state,
@@ -1095,26 +1102,29 @@ impl Forge for FakeForge {
         Ok(numbers
             .iter()
             .filter_map(|number| {
-                let facts = if let Some(pull) = self
+                let facts = self
                     .pull_requests
                     .values()
                     .find(|pull| pull.number == *number)
-                {
-                    Some(PullFacts {
-                        pull: pull.clone(),
-                        details: PullDetails {
-                            review_predates_head: Some(self.stale_reviews.contains(number)),
-                            checks: self.checks.get(number).cloned(),
+                    .map_or_else(
+                        || {
+                            self.vanished_states.get(number).map(|state| PullFacts {
+                                pull: vanished_pull(*number, state.clone()),
+                                details: PullDetails::default(),
+                                newest_comment: self.newest_comments.get(number).cloned(),
+                            })
                         },
-                        newest_comment: self.newest_comments.get(number).cloned(),
-                    })
-                } else {
-                    self.vanished_states.get(number).map(|state| PullFacts {
-                        pull: vanished_pull(*number, state.clone()),
-                        details: PullDetails::default(),
-                        newest_comment: self.newest_comments.get(number).cloned(),
-                    })
-                };
+                        |pull| {
+                            Some(PullFacts {
+                                pull: pull.clone(),
+                                details: PullDetails {
+                                    review_predates_head: Some(self.stale_reviews.contains(number)),
+                                    checks: self.checks.get(number).cloned(),
+                                },
+                                newest_comment: self.newest_comments.get(number).cloned(),
+                            })
+                        },
+                    );
                 facts.map(|facts| (*number, facts))
             })
             .collect())
@@ -1219,7 +1229,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn an_open_pull_summary_beats_a_closed_one_whatever_the_list_order() {
         let summary =
@@ -1273,7 +1282,6 @@ mod tests {
         assert!(indexed.prior.is_empty());
     }
 
-
     #[test]
     fn only_merged_pull_request_summaries_onto_the_trunk_are_returned_in_number_order() {
         let summary =
@@ -1308,7 +1316,10 @@ mod tests {
                 (
                     summary.number,
                     summary.head_ref_name.as_str(),
-                    summary.merge_commit.as_ref().map(|commit| commit.oid.as_str()),
+                    summary
+                        .merge_commit
+                        .as_ref()
+                        .map(|commit| commit.oid.as_str()),
                 )
             })
             .collect();
@@ -1319,7 +1330,6 @@ mod tests {
             "case-insensitive state, trunk base only, sorted by number"
         );
     }
-
 
     #[test]
     fn the_fake_sweep_is_newest_first_and_reports_overflow() {
@@ -1442,7 +1452,10 @@ mod tests {
         let fact = &facts[&7];
         assert_eq!(fact.pull.mergeable, "CONFLICTING");
         assert_eq!(
-            fact.pull.head_repository_owner.as_ref().map(|owner| owner.login.as_str()),
+            fact.pull
+                .head_repository_owner
+                .as_ref()
+                .map(|owner| owner.login.as_str()),
             Some("our-org")
         );
         assert_eq!(
@@ -1512,12 +1525,14 @@ mod tests {
 
     #[test]
     fn a_facts_reply_with_neither_errors_nor_a_repository_answers_nothing_loudly() {
-        let error =
-            parse_pull_facts(r#"{"data":{}}"#, &[7]).expect_err("a reply about nothing is not an answer");
+        let error = parse_pull_facts(r#"{"data":{}}"#, &[7])
+            .expect_err("a reply about nothing is not an answer");
 
         assert!(matches!(&error, ForgeError::Query { .. }), "was: {error}");
         assert!(
-            error.to_string().contains("neither errors nor a repository"),
+            error
+                .to_string()
+                .contains("neither errors nor a repository"),
             "was: {error}"
         );
     }
@@ -1531,8 +1546,8 @@ mod tests {
             {"__typename":"CheckRun","name":"green","conclusion":"SUCCESS"}]}}}}]}}"#,
         );
 
-        let error =
-            parse_pull_facts(&payload, &[7]).expect_err("a paginated check rollup must not render as complete");
+        let error = parse_pull_facts(&payload, &[7])
+            .expect_err("a paginated check rollup must not render as complete");
 
         assert!(matches!(&error, ForgeError::Query { .. }), "was: {error}");
         assert!(error.to_string().contains("#7"), "was: {error}");
@@ -1574,12 +1589,13 @@ mod tests {
 
     #[test]
     fn a_not_found_alias_is_absent_and_does_not_fail_the_batch() {
-        let payload = format!(
-            r#"{{"data":{{"repository":{{"p7":{{"number":7,"state":"OPEN","headRefName":"feat/a",
-            "headRefOid":"aa","updatedAt":"2026-08-01T00:00:00Z"}},"p300":null}}}},
-            "errors":[{{"type":"NOT_FOUND","path":["repository","p300"],"message":"not found"}}]}}"#
-        );
-        let facts = parse_pull_facts(&payload, &[7, 300]).expect("a missing asked alias is tolerated");
+        let payload =
+            r#"{"data":{"repository":{"p7":{"number":7,"state":"OPEN","headRefName":"feat/a",
+            "headRefOid":"aa","updatedAt":"2026-08-01T00:00:00Z"},"p300":null}},
+            "errors":[{"type":"NOT_FOUND","path":["repository","p300"],"message":"not found"}]}"#
+                .to_owned();
+        let facts =
+            parse_pull_facts(&payload, &[7, 300]).expect("a missing asked alias is tolerated");
         assert!(facts.contains_key(&7));
         assert!(!facts.contains_key(&300));
     }
@@ -1588,7 +1604,8 @@ mod tests {
     fn any_other_error_fails_the_whole_batch() {
         let payload = r#"{"data":{"repository":{"p7":null}},"errors":[
             {"type":"RATE_LIMITED","path":["repository","p7"],"message":"rate limited"}]}"#;
-        let error = parse_pull_facts(payload, &[7]).expect_err("only asked NOT_FOUND aliases are tolerated");
+        let error = parse_pull_facts(payload, &[7])
+            .expect_err("only asked NOT_FOUND aliases are tolerated");
         assert!(matches!(error, ForgeError::Query { .. }), "was: {error}");
         assert!(error.to_string().contains("rate limited"), "was: {error}");
     }
@@ -1610,10 +1627,12 @@ mod tests {
 
     #[test]
     fn a_repo_identity_exposes_and_splits_the_forges_own_name() {
-        let identity =
-            parse_identity(r#"{"nameWithOwner":"our-org/some-repo","id":"R_kgDOxyz"}"#)
-                .expect("identity parses");
-        assert_eq!(identity.split().expect("owner/repo"), ("our-org", "some-repo"));
+        let identity = parse_identity(r#"{"nameWithOwner":"our-org/some-repo","id":"R_kgDOxyz"}"#)
+            .expect("identity parses");
+        assert_eq!(
+            identity.split().expect("owner/repo"),
+            ("our-org", "some-repo")
+        );
 
         let error = RepoIdentity {
             name_with_owner: "bare".to_owned(),
@@ -1657,9 +1676,17 @@ mod tests {
         let args = summary_list_args();
         assert_eq!(
             args,
-            &["pr", "list", "--state", "all", "--limit", "300", "--json",
+            &[
+                "pr",
+                "list",
+                "--state",
+                "all",
+                "--limit",
+                "300",
+                "--json",
                 "number,state,reviewDecision,headRefName,headRefOid,updatedAt,isDraft,url,\
-     headRepositoryOwner,baseRefName,mergeCommit"]
+     headRepositoryOwner,baseRefName,mergeCommit"
+            ]
         );
         assert!(!summary_fields().contains("mergeable"));
         assert!(!summary_fields().contains("mergeStateStatus"));
@@ -1668,11 +1695,17 @@ mod tests {
     #[test]
     fn live_queries_request_the_required_fact_and_sweep_shapes() {
         let sweep = sweep_query();
-        assert!(sweep.contains("orderBy: {field: UPDATED_AT, direction: DESC}"), "was: {sweep}");
+        assert!(
+            sweep.contains("orderBy: {field: UPDATED_AT, direction: DESC}"),
+            "was: {sweep}"
+        );
         assert!(sweep.contains("first: 100"), "was: {sweep}");
         let facts = pull_facts_query(&[7, 300]);
         assert!(facts.contains("p7: pullRequest(number: 7)"), "was: {facts}");
-        assert!(facts.contains("p300: pullRequest(number: 300)"), "was: {facts}");
+        assert!(
+            facts.contains("p300: pullRequest(number: 300)"),
+            "was: {facts}"
+        );
         assert!(facts.contains("mergeable"), "was: {facts}");
         assert!(facts.contains("mergeStateStatus"), "was: {facts}");
         assert!(facts.contains("comments(last: 1)"), "was: {facts}");

@@ -57,14 +57,21 @@ Across branches: divergent bookmarks, release parents that are no longer their b
 workspaces holding the same change, two branches changing the same file, commits carried into
 somebody else's branch, and cross-fork dependencies that have not merged yet.
 
-`knives sync` fetches every remote and classifies each tracked pull request as new, unchanged,
-advanced, merged, or closed, and reports comment activity since the last run.
+`knives sync` fetches every remote, discovers tracked pull requests from the forge snapshot,
+then classifies each as new, unchanged, advanced, merged, or closed and reports comment activity
+since the last run.
 
 ## What it remembers
 
-Everything above is computed on demand and nothing is cached. One thing cannot be computed:
-why. `knives finish` deletes the claim that said why a branch exists, and after that the
-only honest answer to "what is this branch" is archaeology.
+Local state is computed on demand. Forge discovery uses
+`$XDG_CACHE_HOME/knives/forge/<owner>/<repo>.json` (default
+`~/.cache/knives/forge/<owner>/<repo>.json`). **The cache discovers; a live batch decides.**
+It selects pull request numbers from cache, then fetches a complete live row for every pull
+request that reaches a report. Deleting the cache file is always safe: the next status run uses
+cold forge discovery and re-runs its landed probes.
+
+One thing cannot be computed: why. `knives finish` deletes the claim that said why a branch
+exists, and after that the only honest answer to "what is this branch" is archaeology.
 
 So each repository has a ledger directory at `~/.config/knives/ledger/<repo>/`, beside the
 state file. Each entry is an immutable Markdown file with TOML frontmatter between `+++`
@@ -167,11 +174,13 @@ are somewhere else.
 | `knives status` | the main report |
 | `knives sync` | fetch, then classify what happened to each tracked pull request |
 | `knives preflight` | the facts to check before contributing upstream |
-| `knives start` / `finish` | take a branch and get your own workspace, then hand it back |
+| `knives start` | take a branch and get your own workspace |
+| `knives finish [--allow-open]` | hand a branch back; by default, refuse when its pull request is open or cannot be checked, and use `--allow-open` to proceed |
 | `knives track` | state which pull request a branch belongs to, when inference cannot find it |
 | `knives depends` | record that a branch cannot land before another repo's pull request |
 | `knives notch` | what agents did and decided here, and add to it |
 | `knives release` | plan a release, edit its membership, cut one, or reap superseded cuts |
+| `knives release carries REVISION [--in TARGET]` | replay a revision onto a release and report whether its content is carried |
 | `knives init` | register a checkout |
 | `knives hook` | harness plumbing, not for humans |
 | `knives gh` | fork-aware `gh` passthrough |
@@ -183,6 +192,11 @@ encodings are lossless renderings of one report.
 
 Exit codes: `0` nothing to report, `1` findings, `2` usage, `3` something could not be
 answered.
+
+### Timing
+
+Set `KNIVES_TIMING=1` to write one `timing gh <repo> <duration>ms: <argv summary>` line to
+standard error for every forge call. Timing is diagnostic output and does not change the report.
 
 ## GitHub CLI passthrough
 
@@ -204,6 +218,9 @@ Escape hatches:
 ## Release workflow
 
 A release is a flat octopus merge of feature and fix branches, and its parent set is its membership: a branch is in the release exactly when the release has its parent. The upstream base is never a direct parent — every member forks from it, so it is reachable through each of them, and there is no role to classify. Membership changes only through stated edits. `knives release include` adds one parent, `knives release drop` removes one (saying so when no remaining member carries the dropped content), and `knives release advance` moves member parents to their branches' current tips — refusing outright, rather than silently deduping, if the same branch would replace more than one parent, and accepting `--from <old-sha>` to name one branch's old parent directly when a `jj duplicate` rebuild has left it with no ancestry back to the commit it replaces. `knives release rebase` moves the whole composition onto a newer upstream commit — the equivalent of `jj rebase -b <release> -d <target>` — members and their bookmarks moving together; bare, it targets the first upstream trunk commit that contains every merged pull request, then drops the members whose landed branches carry nothing more (`--no-drop` keeps them); with nothing merged it asks for a commit. Each edit duplicates the release onto the changed parent set, so recorded conflict resolutions carry forward and only the change itself can surface new conflicts. `knives release cut` names a new cut of the composition in hand, verbatim: nothing joins, nothing advances, and a branch created since the last release enters through `include`, never by existing. Only the first cut, with no composition to carry, starts from every branch.
+
+`knives release carries REVISION` replays the revision onto the release in hand and reports
+whether its content is carried. `--in TARGET` selects another release ref or revset.
 
 Before cutting, the orphan gate verifies that no commits exist reachable only from the previous release lineage or its descendants; if commits would be stranded without a remaining bookmark or upstream trunk reaching them, the cut refuses and lists the exact commit IDs. Passing `--allow-drop` overrides this refusal when dropping those commits is intentional.
 
