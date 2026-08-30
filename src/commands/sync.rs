@@ -450,6 +450,19 @@ pub const fn exit_for(report: &Report) -> Exit {
 }
 
 #[cfg(test)]
+fn test_pull(number: u64, branch: &str) -> (BranchName, crate::forge::PullRequest) {
+    (
+        BranchName::new(branch),
+        crate::forge::PullRequest {
+            number,
+            head_ref_name: branch.to_owned(),
+            head_ref_oid: "aaaa".to_owned(),
+            ..crate::forge::PullRequest::default()
+        },
+    )
+}
+
+#[cfg(test)]
 mod tests {
     #![allow(
         clippy::indexing_slicing,
@@ -575,20 +588,9 @@ mod tracking_tests {
         clippy::indexing_slicing,
         reason = "indexing a result in a test is the assertion; a panic is the failure"
     )]
-    use super::*;
-    use crate::forge::{PullRequest, PullSummary};
+    use super::{test_pull, *};
+    use crate::forge::PullSummary;
 
-    fn pr(number: u64, branch: &str) -> (BranchName, PullRequest) {
-        (
-            BranchName::new(branch),
-            PullRequest {
-                number,
-                head_ref_name: branch.to_owned(),
-                head_ref_oid: "aaaa".to_owned(),
-                ..PullRequest::default()
-            },
-        )
-    }
 
     #[test]
     fn every_listed_pull_request_is_tracked_even_with_no_local_bookmark() {
@@ -598,7 +600,7 @@ mod tracking_tests {
         // The forge reported 13 open pull requests for a real repository and knives reported
         // 12, and the missing one was the single most actionable of them.
         let pull_requests: Vec<PullSummary> =
-            [pr(1, "feat/checked-out"), pr(2, "feat/pushed-only")]
+            [test_pull(1, "feat/checked-out"), test_pull(2, "feat/pushed-only")]
                 .map(|(_, pull_request)| PullSummary::of(&pull_request))
                 .into();
         let foreign: BTreeSet<u64> = BTreeSet::new();
@@ -630,7 +632,7 @@ mod tracking_tests {
 
 #[cfg(test)]
 mod comment_activity_tests {
-    use super::*;
+    use super::{test_pull, *};
     use crate::forge::{
         Forge, ForgeError, PullFacts, PullRequest, PullSummary, RepoIdentity, SweepEntry, SweepPage,
     };
@@ -640,17 +642,6 @@ mod comment_activity_tests {
     use std::process::Command;
     use tempfile::TempDir;
 
-    fn pr(number: u64, branch: &str) -> (BranchName, PullRequest) {
-        (
-            BranchName::new(branch),
-            PullRequest {
-                number,
-                head_ref_name: branch.to_owned(),
-                head_ref_oid: "aaaa".to_owned(),
-                ..PullRequest::default()
-            },
-        )
-    }
 
     #[derive(Debug)]
     struct ErroringForge {
@@ -928,7 +919,7 @@ mod comment_activity_tests {
         let scribe = test_scribe(&temp, &repo_name);
 
         // First sync: PR #42 with comment activity
-        let (_branch, pull_request) = pr(42, "feat/alpha");
+        let (_branch, pull_request) = test_pull(42, "feat/alpha");
         let forge_first = ErroringForge {
             pull_requests: vec![pull_request],
             newest_comments: BTreeMap::from([(42, "2026-07-30T10:00:00Z".to_owned())]),
@@ -963,7 +954,7 @@ mod comment_activity_tests {
         );
 
         // Second sync: same comment timestamp, no new activity
-        let (_branch, pull_request) = pr(42, "feat/alpha");
+        let (_branch, pull_request) = test_pull(42, "feat/alpha");
         let forge_second = ErroringForge {
             pull_requests: vec![pull_request],
             newest_comments: BTreeMap::from([(42, "2026-07-29T10:00:00Z".to_owned())]),
@@ -997,7 +988,7 @@ mod comment_activity_tests {
         let temp = TempDir::new().unwrap();
         let repo_name = RepoName::new("test-repo");
         let entry = local_entry(&temp);
-        let (_branch, pull_request) = pr(42, "feat/alpha");
+        let (_branch, pull_request) = test_pull(42, "feat/alpha");
         let forge = ErroringForge {
             pull_requests: vec![pull_request],
             newest_comments: BTreeMap::new(),
@@ -1035,7 +1026,7 @@ mod comment_activity_tests {
         let store_path = temp.path().join("state.json");
         let repo_name = RepoName::new("test-repo");
         let entry = local_entry(&temp);
-        let (_branch, pull_request) = pr(42, "feat/alpha");
+        let (_branch, pull_request) = test_pull(42, "feat/alpha");
         let forge = ErroringForge {
             pull_requests: vec![pull_request],
             newest_comments: BTreeMap::from([(42, "2026-07-30T10:00:00Z".to_owned())]),
@@ -1073,7 +1064,7 @@ mod comment_activity_tests {
         let store_path = temp.path().join("state.json");
         let repo_name = RepoName::new("test-repo");
         let entry = local_entry(&temp);
-        let (_branch, mut pull_request) = pr(42, "feat/alpha");
+        let (_branch, mut pull_request) = test_pull(42, "feat/alpha");
         pull_request.state = "CLOSED".to_owned();
         let forge = ErroringForge {
             pull_requests: vec![pull_request],

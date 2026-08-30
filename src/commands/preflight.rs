@@ -468,41 +468,20 @@ mod tests {
             crate::forge::PullSummary {
                 number: 1,
                 state: "OPEN".to_owned(),
-                review_decision: String::new(),
                 head_ref_name: "feat/open".to_owned(),
-                head_ref_oid: "aa".to_owned(),
-                updated_at: "2026-08-01T00:00:00Z".to_owned(),
-                is_draft: false,
-                url: String::new(),
-                head_repository_owner: None,
-                base_ref_name: "main".to_owned(),
-                merge_commit: None,
+                ..crate::forge::PullSummary::default()
             },
             crate::forge::PullSummary {
                 number: 2,
                 state: "MERGED".to_owned(),
-                review_decision: String::new(),
                 head_ref_name: "feat/merged".to_owned(),
-                head_ref_oid: "bb".to_owned(),
-                updated_at: "2026-08-01T00:00:00Z".to_owned(),
-                is_draft: false,
-                url: String::new(),
-                head_repository_owner: None,
-                base_ref_name: "main".to_owned(),
-                merge_commit: None,
+                ..crate::forge::PullSummary::default()
             },
             crate::forge::PullSummary {
                 number: 3,
                 state: "OPEN".to_owned(),
-                review_decision: String::new(),
                 head_ref_name: "outside/open".to_owned(),
-                head_ref_oid: "cc".to_owned(),
-                updated_at: "2026-08-01T00:00:00Z".to_owned(),
-                is_draft: false,
-                url: String::new(),
-                head_repository_owner: None,
-                base_ref_name: "main".to_owned(),
-                merge_commit: None,
+                ..crate::forge::PullSummary::default()
             },
         ];
         let ours = BTreeSet::from(["feat/open".to_owned(), "feat/merged".to_owned()]);
@@ -565,17 +544,11 @@ mod tests {
         let pull = crate::forge::PullSummary {
             number: 7,
             state: "OPEN".to_owned(),
-            review_decision: String::new(),
             head_ref_name: "feat/ours".to_owned(),
-            head_ref_oid: "aa".to_owned(),
-            updated_at: "2026-08-01T00:00:00Z".to_owned(),
-            is_draft: false,
-            url: String::new(),
             head_repository_owner: Some(crate::forge::Account {
                 login: "someone-else".to_owned(),
             }),
-            base_ref_name: "main".to_owned(),
-            merge_commit: None,
+            ..crate::forge::PullSummary::default()
         };
         let ours = BTreeSet::from(["feat/ours".to_owned()]);
 

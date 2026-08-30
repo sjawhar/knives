@@ -285,6 +285,26 @@ impl Default for PullRequest {
     }
 }
 
+#[cfg(test)]
+// Fixture-only defaults keep test pull request literals focused on fields under test.
+impl Default for PullSummary {
+    fn default() -> Self {
+        Self {
+            number: 0,
+            state: String::new(),
+            review_decision: String::new(),
+            head_ref_name: String::new(),
+            head_ref_oid: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+            updated_at: "2026-01-01T00:00:00Z".to_owned(),
+            is_draft: false,
+            url: String::new(),
+            head_repository_owner: None,
+            base_ref_name: String::new(),
+            merge_commit: None,
+        }
+    }
+}
+
 /// The owner segment of a forge remote, for `https://` and `git@` forms alike.
 pub fn remote_owner(remote: &str) -> Option<&str> {
     let rest = remote
@@ -487,17 +507,12 @@ mod tests {
             |number: u64, state: &str, branch: &str, base: &str, oid: Option<&str>| PullSummary {
                 number,
                 state: state.to_owned(),
-                review_decision: String::new(),
                 head_ref_name: branch.to_owned(),
-                head_ref_oid: format!("oid-{number}"),
-                updated_at: "2026-08-01T00:00:00Z".to_owned(),
-                is_draft: false,
-                url: String::new(),
-                head_repository_owner: None,
                 base_ref_name: base.to_owned(),
                 merge_commit: oid.map(|oid| MergeCommit {
                     oid: oid.to_owned(),
                 }),
+                ..PullSummary::default()
             };
         let branch = BranchName::new("feat/alpha");
 
@@ -540,17 +555,12 @@ mod tests {
             |number: u64, state: &str, branch: &str, base: &str, oid: Option<&str>| PullSummary {
                 number,
                 state: state.to_owned(),
-                review_decision: String::new(),
                 head_ref_name: branch.to_owned(),
-                head_ref_oid: format!("oid-{number}"),
-                updated_at: "2026-08-01T00:00:00Z".to_owned(),
-                is_draft: false,
-                url: String::new(),
-                head_repository_owner: None,
                 base_ref_name: base.to_owned(),
                 merge_commit: oid.map(|oid| MergeCommit {
                     oid: oid.to_owned(),
                 }),
+                ..PullSummary::default()
             };
         let pulls = [
             summary(5, "merged", "e", "main", Some("e5")),
