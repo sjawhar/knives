@@ -229,7 +229,6 @@ fn a_recorded_batch_payload_decodes_every_field_the_query_asks_for() {
         "no recorded pull request answered tip emptiness: {facts:?}"
     );
 
-
     let query = pull_facts_query(&[1]);
     for field in [
         "number",

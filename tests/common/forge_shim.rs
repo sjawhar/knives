@@ -40,6 +40,7 @@ pub fn install_snapshot_gh_with_timeline(shim: &Path, pulls: &str, timeline_node
     );
 }
 
+#[derive(Clone, Copy)]
 struct SnapshotGhOptions<'a> {
     withheld_facts: &'a [u64],
     log: Option<&'a Path>,
@@ -113,27 +114,7 @@ fn install_snapshot_gh_configured(shim: &Path, pulls: &str, options: SnapshotGhO
         .expect("serialize facts payload"),
     )
     .expect("write facts payload");
-    let timeline_nodes: Vec<serde_json::Value> = timeline_nodes.map_or_else(
-        Vec::new,
-        |nodes| serde_json::from_str(nodes).expect("parse fake timeline payload"),
-    );
-    std::fs::write(
-        &timeline_payload,
-        serde_json::to_vec(&serde_json::json!({
-            "data": {
-                "repository": {
-                    "pullRequest": {
-                        "timelineItems": {
-                            "pageInfo": {"hasPreviousPage": false},
-                            "nodes": timeline_nodes,
-                        }
-                    }
-                }
-            }
-        }))
-        .expect("serialize timeline payload"),
-    )
-    .expect("write timeline payload");
+    write_timeline_payload(&timeline_payload, timeline_nodes);
     let log_line = log.map_or_else(String::new, |log| {
         format!("printf '%s\\n' \"$*\" >> \"{}\"\n", log.display())
     });
@@ -161,6 +142,28 @@ fn install_snapshot_gh_configured(shim: &Path, pulls: &str, options: SnapshotGhO
         ),
     );
 }
+fn write_timeline_payload(path: &Path, timeline_nodes: Option<&str>) {
+    let timeline_nodes: Vec<serde_json::Value> = timeline_nodes.map_or_else(Vec::new, |nodes| {
+        serde_json::from_str(nodes).expect("parse fake timeline payload")
+    });
+    std::fs::write(
+        path,
+        serde_json::to_vec(&serde_json::json!({
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "timelineItems": {
+                            "pageInfo": {"hasPreviousPage": false},
+                            "nodes": timeline_nodes,
+                        }
+                    }
+                }
+            }
+        }))
+        .expect("serialize timeline payload"),
+    )
+    .expect("write timeline payload");
+}
 
 pub fn install_failing_gh(shim: &Path, log: &Path) {
     let gh = shim.join("gh");
@@ -184,7 +187,10 @@ pub fn path_with_gh_shim(shim: &Path) -> std::ffi::OsString {
 
 /// One forge pull request record with the fields the binary requires.
 pub fn pull_record(number: u64, state: &str, branch: &str, merge_oid: Option<&str>) -> String {
-    pull_record_with_fields(number, state, branch, merge_oid, "")
+    let merge = merge_oid.map_or_else(String::new, |oid| {
+        format!(",\"mergeCommit\":{{\"oid\":\"{oid}\"}}")
+    });
+    pull_record_with_fields(number, state, branch, &merge)
 }
 
 /// One forge pull request record with additional raw JSON fields.
@@ -195,16 +201,12 @@ pub fn pull_record_with_fields(
     number: u64,
     state: &str,
     branch: &str,
-    merge_oid: Option<&str>,
     extra_fields: &str,
 ) -> String {
-    let merge = merge_oid.map_or_else(String::new, |oid| {
-        format!(",\"mergeCommit\":{{\"oid\":\"{oid}\"}}")
-    });
     format!(
         "{{\"number\":{number},\"state\":\"{state}\",\"headRefName\":\"{branch}\",\
          \"headRefOid\":\"0123456789abcdef0123456789abcdef01234567\",\
-         \"updatedAt\":\"2026-08-07T00:00:00Z\",\"baseRefName\":\"main\"{merge}{extra_fields}}}"
+         \"updatedAt\":\"2026-08-07T00:00:00Z\",\"baseRefName\":\"main\"{extra_fields}}}"
     )
 }
 

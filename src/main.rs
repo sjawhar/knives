@@ -11,7 +11,7 @@ use std::process::ExitCode;
 use clap::Parser as _;
 use knives::cli::{Cli, Command, Exit, ReleaseAction};
 use knives::commands::{
-    hook, init, notch, preflight, pr, register, release, repos, start, status, sync,
+    hook, init, notch, pr, preflight, register, release, repos, start, status, sync,
 };
 use knives::config::{default_config_path, load};
 use knives::detect::RebaseOutcome;

@@ -632,8 +632,8 @@ mod tracking_tests {
 mod comment_activity_tests {
     use super::{test_pull, *};
     use crate::forge::{
-        Forge, ForgeError, PullFacts, PullRequest, PullSummary, RepoIdentity, SweepEntry, SweepPage,
-        TimelineEvent,
+        Forge, ForgeError, PullFacts, PullRequest, PullSummary, RepoIdentity, SweepEntry,
+        SweepPage, TimelineEvent,
     };
     use crate::ids::RepoName;
     use crate::store::Store;

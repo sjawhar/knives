@@ -126,6 +126,16 @@ pub struct CliForge;
 /// | 8 | 1.879s |
 ///
 /// Eight was the fastest configuration.
+///
+/// Facts-fragment cost probe: three cold-cache runs per fork (2026-08-30).
+///
+/// | Fork | Installed median | Candidate median | Change |
+/// | --- | ---: | ---: | ---: |
+/// | Busy fork one | 8.579s | 8.945s | +4.3% |
+/// | Busy fork two | 14.830s | 16.353s | +10.3% |
+///
+/// Outcome A: both candidate medians stayed within the 20% envelope, so the
+/// status facts fragment retains the diff-stat fields.
 const FACTS_BATCH_CHUNK_SIZE: usize = 8;
 /// `status --all` may gather 64 repositories concurrently, and each gather
 /// can start several fact-batch workers. The forge sees `gh` child processes,
@@ -384,7 +394,6 @@ pub fn pull_timeline_query(number: u64) -> String {
     )
 }
 
-
 /// One page, newest-updated first.
 ///
 /// No pagination: cursoring over a changing `UPDATED_AT` ordering can skip a
@@ -558,15 +567,25 @@ struct HeadRefNode {
     name: String,
 }
 
-/// Distinguish an absent key from a present-but-null one: absent means the
-/// query never asked (an old recorded payload), null means the forge answered
-/// "gone". Collapsing the two would report every legacy payload as a deletion.
-fn queried<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
-where
-    D: Deserializer<'de>,
-    T: Deserialize<'de>,
-{
-    Option::<T>::deserialize(deserializer).map(Some)
+/// Distinguishes an omitted legacy field from an answered null head ref.
+#[derive(Debug, Default, Clone, Copy)]
+enum HeadRef {
+    #[default]
+    Missing,
+    Present,
+    Deleted,
+}
+
+impl<'de> Deserialize<'de> for HeadRef {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Option::<HeadRefNode>::deserialize(deserializer).map(|head_ref| match head_ref {
+            Some(_) => Self::Present,
+            None => Self::Deleted,
+        })
+    }
 }
 
 #[derive(Deserialize)]
@@ -579,9 +598,9 @@ struct FactsPayload {
     deletions: Option<u64>,
     #[serde(default, rename = "changedFiles")]
     changed_files: Option<u64>,
-    /// Absent key = not asked (old payloads); present-null = deleted head.
-    #[serde(default, rename = "headRef", deserialize_with = "queried")]
-    head_ref: Option<Option<HeadRefNode>>,
+    /// Missing means an old payload; null means a deleted remote head ref.
+    #[serde(default, rename = "headRef")]
+    head_ref: HeadRef,
     #[serde(default)]
     reviews: Option<Nodes<Dated>>,
     #[serde(default)]
@@ -820,7 +839,11 @@ fn details_from(payload: &FactsPayload) -> Result<PullDetails, ForgeError> {
         }),
         _ => None,
     };
-    let head_ref_deleted = payload.head_ref.as_ref().map(Option::is_none);
+    let head_ref_deleted = match payload.head_ref {
+        HeadRef::Missing => None,
+        HeadRef::Present => Some(false),
+        HeadRef::Deleted => Some(true),
+    };
     let tip_commit_empty = payload
         .rollup
         .iter()
@@ -892,10 +915,7 @@ pub fn parse_pull_facts(
 }
 
 /// Decode the bounded timeline payload for its requested pull request number.
-pub fn parse_pull_timeline(
-    payload: &str,
-    number: u64,
-) -> Result<Vec<TimelineEvent>, ForgeError> {
+pub fn parse_pull_timeline(payload: &str, number: u64) -> Result<Vec<TimelineEvent>, ForgeError> {
     let envelope: TimelineEnvelope = serde_json::from_str(payload)?;
     if !envelope.errors.is_empty() {
         return Err(ForgeError::Query {
@@ -1681,8 +1701,7 @@ printf '{}'
             r#"{"__typename":"NewForgeTimelineEvent","createdAt":"2026-08-30T22:43:13Z"}"#,
         );
 
-        let error =
-            parse_pull_timeline(&payload, 7).expect_err("unknown event must not disappear");
+        let error = parse_pull_timeline(&payload, 7).expect_err("unknown event must not disappear");
 
         assert!(matches!(error, ForgeError::Query { .. }), "was: {error}");
         assert!(
@@ -1721,11 +1740,8 @@ printf '{}'
 
     #[test]
     fn an_absent_pull_timeline_names_the_requested_number() {
-        let error = parse_pull_timeline(
-            r#"{"data":{"repository":{"pullRequest":null}}}"#,
-            88,
-        )
-        .expect_err("a null pull request is unavailable");
+        let error = parse_pull_timeline(r#"{"data":{"repository":{"pullRequest":null}}}"#, 88)
+            .expect_err("a null pull request is unavailable");
 
         assert!(matches!(error, ForgeError::Query { .. }), "was: {error}");
         assert!(error.to_string().contains("#88"), "was: {error}");

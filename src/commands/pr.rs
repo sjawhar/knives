@@ -30,7 +30,6 @@ pub struct Report {
     pub timeline: Option<Vec<TimelineEvent>>,
 }
 
-
 pub struct Request<'a> {
     pub repo: &'a RepoName,
     pub entry: &'a RepoEntry,
@@ -184,8 +183,8 @@ mod tests {
     )]
 
     use super::*;
-    use crate::forge::{DiffTotals, PullRequest};
     use crate::forge::fake::FakeForge;
+    use crate::forge::{DiffTotals, PullRequest};
     use crate::ids::{BranchName, RepoName};
 
     fn entry() -> crate::config::RepoEntry {

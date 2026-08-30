@@ -103,9 +103,22 @@ cached pull-request data is used.
 
 **I2 — report-surfaced facts are live.** Every pull-request number that appears in branch rows,
 sync classification, stated pulls, or dependencies gets its complete fact row in one live,
-by-number batch in that run: state, head and base refs, draft and owner state, review and
-mergeability state, checks, review recency, and, for `sync`, newest-comment activity. Cache rows
-only discover numbers and preserve shadowed prior history.
+by-number batch in that run. Cache rows only discover numbers and preserve shadowed prior
+history:
+
+| Source | Fields |
+|---|---|
+| Cache and wide-list discovery | number, state, review decision, head-ref name and object ID, update time, draft and owner state, URL, base ref, merge commit |
+| Live batch only | mergeability state, diff totals (additions, deletions, changed-file count), nullable head-ref object, review and commit timestamps, newest-tip tree and parent tree IDs, check rollup, newest comment |
+For an open pull request, the same answered live fields drive three present-state findings in
+`knives status` and bracketed `knives pr` flags. `empty-diff` requires answered zero additions,
+deletions, and changed-file count; `deleted-head-ref` requires an answered null head-ref object;
+and `empty-tip-commit` requires the newest tip tree to equal its sole parent tree. Unanswered
+fields are silent: absence is not evidence of an incident.
+
+`knives pr NUMBER --timeline` issues one on-demand, bounded `last: 100` query for that pull
+request's head-ref and state events. It reports force pushes, deletion and restoration, closure,
+reopening, and merging from the forge's event log; knives stores no push or commit history.
 
 **I3 — a failed live batch fails closed.** When discovery succeeds but any live-batch chunk fails,
 no snapshot exists. The report treats the forge as unavailable, reads no cached facts, and neither
@@ -202,6 +215,8 @@ knives sync [REPO|--all]       fetch all remotes and tracked pull/N/head refs; c
 knives preflight [REPO]        programmatic pre-contribution facts (see below)
 knives status [REPO|--all]     aligned table per branch (branch, tip, push, pr, review, checks,
                                landed, flags, notch); claims, active workspaces, and detectors
+knives pr NUMBER [--repo REPO] [--timeline]
+                               one pull request's live state; --timeline reads its bounded forge event log
 knives start BRANCH            claim, create the workspace, base it on the release's shared base (falling back to fetched trunk)
 knives finish BRANCH [--allow-open]
                                hand back claim and remove workspace; without --allow-open, refuse

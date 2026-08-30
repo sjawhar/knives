@@ -764,6 +764,26 @@ struct PostPhaseInput<'a> {
     probe_ran: bool,
 }
 
+fn add_pull_state_findings(report: &mut Report, snapshot: &crate::snapshot::CompletedSnapshot<'_>) {
+    let states: Vec<crate::detect::pull_state::PullState<'_>> = report
+        .branches
+        .iter()
+        .filter_map(|row| row.pull_request.as_ref())
+        .filter_map(|pull| {
+            snapshot
+                .fact(pull.number)
+                .map(|fact| crate::detect::pull_state::PullState {
+                    number: pull.number,
+                    open: fact.pull.is_open(),
+                    details: &fact.details,
+                })
+        })
+        .collect();
+    report
+        .findings
+        .extend(crate::detect::pull_state::pull_state_findings(&states));
+}
+
 /// Fold completed phases into rows, findings, timings, and cache persistence.
 fn fold_phase_outcome(
     report: &mut Report,
@@ -850,23 +870,7 @@ fn fold_phase_outcome(
         timings,
     });
     if let Some(snapshot) = snapshot {
-        let states: Vec<crate::detect::pull_state::PullState<'_>> = report
-            .branches
-            .iter()
-            .filter_map(|row| row.pull_request.as_ref())
-            .filter_map(|pull| {
-                snapshot
-                    .fact(pull.number)
-                    .map(|fact| crate::detect::pull_state::PullState {
-                        number: pull.number,
-                        open: fact.pull.is_open(),
-                        details: &fact.details,
-                    })
-            })
-            .collect();
-        report
-            .findings
-            .extend(crate::detect::pull_state::pull_state_findings(&states));
+        add_pull_state_findings(report, snapshot);
     }
     if let Some(snapshot) = snapshot {
         let landed = input

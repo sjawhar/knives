@@ -4511,7 +4511,6 @@ fn status_reports_empty_diff_and_deleted_head_from_completed_facts() {
             7,
             "OPEN",
             "feat/alpha",
-            None,
             r#","additions":0,"deletions":0,"changedFiles":0,"headRef":null"#,
         )
     );
@@ -8561,7 +8560,11 @@ fn pr_timeline_renders_force_pushes_with_both_tree_oids_through_the_real_binary(
     let output = knives_pr_with_shim(7, true, &pulls, Some(timeline));
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(stdout.contains("force-push"), "stdout: {stdout}");
     assert!(stdout.contains("tree bbbbbbbbbbbb"), "stdout: {stdout}");
     assert!(stdout.contains("tree dddddddddddd"), "stdout: {stdout}");

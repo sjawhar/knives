@@ -170,7 +170,10 @@ mod tests {
         ]);
 
         // Then: each pull's facts are grouped in report order and have one stable incident order
-        let subjects: Vec<_> = findings.iter().map(|finding| finding.subject.clone()).collect();
+        let subjects: Vec<_> = findings
+            .iter()
+            .map(|finding| finding.subject.clone())
+            .collect();
         let kinds: Vec<_> = findings.iter().map(|finding| finding.kind).collect();
         assert_eq!(
             subjects,
