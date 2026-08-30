@@ -14,7 +14,8 @@ use knives::commands::{
     hook, init, notch, preflight, register, release, repos, start, status, sync,
 };
 use knives::config::{default_config_path, load};
-use knives::forge::{CliForge, Forge};
+use knives::detect::RebaseOutcome;
+use knives::forge::{CliForge, Forge, PullRequest};
 use knives::ids::{BranchName, BranchTarget, ReleaseScheme, RepoName, Requirement};
 use knives::ledger::{Draft, Kind, Ledger, Scribe};
 use knives::store::{Store, default_state_path};
@@ -74,6 +75,7 @@ fn dispatch() -> anyhow::Result<Exit> {
             repo,
             no_cleanup,
             superseded_by,
+            allow_open,
         } => {
             let Some(name) = one_repo(repo.as_deref())? else {
                 return Ok(Exit::Usage);
@@ -82,6 +84,7 @@ fn dispatch() -> anyhow::Result<Exit> {
                 &BranchTarget::new(name, BranchName::new(branch)),
                 superseded_by.as_deref(),
                 !no_cleanup,
+                allow_open,
             )
         }
         Command::Track {
@@ -202,7 +205,20 @@ fn dispatch_release(
             &ReleaseInvocation::Cut { name, allow_drop },
         ),
         Some(ReleaseAction::Rebase { reference, no_drop }) => {
-            run_rebase(chosen.as_str(), reference.as_deref(), no_drop)
+            let cache_root = knives::forge_cache::cache_root();
+            run_rebase(
+                chosen.as_str(),
+                reference.as_deref(),
+                no_drop,
+                cache_root.as_deref(),
+            )
+        }
+        Some(ReleaseAction::Carries { revision, target }) => {
+            let registry = load(&default_config_path())?;
+            let Some(entry) = registry.get(chosen) else {
+                return Ok(Exit::Usage);
+            };
+            run_release_carries(chosen, entry, &revision, target.as_deref())
         }
         Some(ReleaseAction::Reap) => run_reap(chosen.as_str()),
         Some(ReleaseAction::Include { branch, why }) => {
@@ -218,6 +234,47 @@ fn dispatch_release(
     }
 }
 
+/// Answer "does <target> carry <revision>" with the replay test, not text search.
+fn run_release_carries(
+    repo: &RepoName,
+    entry: &knives::config::RepoEntry,
+    revision: &str,
+    target: Option<&str>,
+) -> anyhow::Result<Exit> {
+    let named = match target {
+        Some(reference) => reference.to_owned(),
+        None => {
+            if let Some(name) = release::plan(repo, entry, &entry.consumers)?.release {
+                name
+            } else {
+                println!("{repo}: no release to check against; cut one or pass --in <ref>");
+                return Ok(Exit::Incomplete);
+            }
+        }
+    };
+    let outcome =
+        knives::jj::probe_landed(&entry.path, &knives::ids::BranchName::new(revision), &named)?;
+    Ok(match outcome {
+        RebaseOutcome::Empty => {
+            println!("{repo}: {revision} is carried in {named}: replaying it leaves nothing");
+            Exit::Ok
+        }
+        RebaseOutcome::CleanNonEmpty => {
+            println!(
+                "{repo}: {revision} is NOT carried in {named}: replaying it leaves real diffs"
+            );
+            Exit::Findings
+        }
+        RebaseOutcome::Conflicted => {
+            println!(
+                "{repo}: {revision} conflicts with {named}: some of its content is there, \
+                 or unrelated work touched the same files; judge it by eye"
+            );
+            Exit::Findings
+        }
+    })
+}
+
 /// Rebase the whole composition onto an upstream commit: `jj rebase -b <release> -d <target>`.
 ///
 /// Every member branch's commits move onto the target and the release merge
@@ -228,7 +285,12 @@ fn dispatch_release(
 /// and whether to move at all, is a judgment. After a bare rebase, members
 /// whose pull requests landed and carry nothing more are dropped — the work
 /// reaches the release through its new base — unless `--no-drop` keeps them.
-fn run_rebase(name: &str, reference: Option<&str>, no_drop: bool) -> anyhow::Result<Exit> {
+fn run_rebase(
+    name: &str,
+    reference: Option<&str>,
+    no_drop: bool,
+    cache_root: Option<&std::path::Path>,
+) -> anyhow::Result<Exit> {
     let chosen = match selected(Some(name), false)? {
         Ok(list) => list,
         Err(exit) => return Ok(exit),
@@ -245,43 +307,40 @@ fn run_rebase(name: &str, reference: Option<&str>, no_drop: bool) -> anyhow::Res
             worst = worst.worst(Exit::Incomplete);
             continue;
         }
-        let Some(destination) = rebase_target(&repo, &entry, &opened, reference)? else {
+        let Some(destination) = rebase_target(RebaseTargetInput {
+            repo: &repo,
+            entry: &entry,
+            opened: &opened,
+            reference,
+            cache_root,
+        })?
+        else {
             worst = worst.worst(Exit::Incomplete);
             continue;
         };
         let onto = destination.onto.clone();
         let reference = destination.reference.clone();
         let release_commit = opened.resolve_commit(&release_name)?;
-        // Ancestry, not parent identity: a commit already reachable through a
-        // parent's history is contained, and adding it again grows the octopus.
-        if opened.is_ancestor(&onto, &release_commit)? {
-            println!("{repo}: {release_name} already contains {reference}");
-            if !no_drop {
-                worst = worst.worst(drop_landed_members(
-                    &repo,
-                    &entry,
-                    &release_name,
-                    &destination,
-                )?);
-            }
+        if let Some(exit) = existing_rebase_exit(ExistingRebaseInput {
+            opened: &opened,
+            repo: &repo,
+            entry: &entry,
+            release_name: &release_name,
+            release_commit: &release_commit,
+            destination: &destination,
+            no_drop,
+        })? {
+            worst = worst.worst(exit);
             continue;
         }
-        // Follows from who pins it, rather than from an opinion: a consumer that follows
-        // the branch sees a repair in place, one frozen on the revision does not.
         let scheme = entry.release_scheme();
-        if release::repair_effect(&plan.pins) == release::RepairEffect::NewDatedName {
-            match &scheme {
-                ReleaseScheme::Dated => println!(
-                    "{repo}: every pin of {release_name} is frozen, so moving it would reach \
-                     nobody; cut a new dated release instead"
-                ),
-                ReleaseScheme::Fixed(_) => println!(
-                    "{repo}: every pin of {release_name} is frozen, so moving the fixed branch \
-                     would reach nobody; update the frozen consumer pins, or change the release \
-                     scheme before advancing it (fixed branches cannot reach revision pins)"
-                ),
-            }
-            worst = worst.worst(Exit::Incomplete);
+        if let Some(exit) = frozen_rebase_exit(
+            &repo,
+            &release_name,
+            &scheme,
+            release::repair_effect(&plan.pins),
+        ) {
+            worst = worst.worst(exit);
             continue;
         }
         let context = RebaseContext {
@@ -328,6 +387,29 @@ fn run_rebase(name: &str, reference: Option<&str>, no_drop: bool) -> anyhow::Res
         }
     }
     Ok(worst)
+}
+
+fn frozen_rebase_exit(
+    repo: &RepoName,
+    release_name: &str,
+    scheme: &ReleaseScheme,
+    effect: release::RepairEffect,
+) -> Option<Exit> {
+    if effect != release::RepairEffect::NewDatedName {
+        return None;
+    }
+    match scheme {
+        ReleaseScheme::Dated => println!(
+            "{repo}: every pin of {release_name} is frozen, so moving it would reach \
+             nobody; cut a new dated release instead"
+        ),
+        ReleaseScheme::Fixed(_) => println!(
+            "{repo}: every pin of {release_name} is frozen, so moving the fixed branch \
+             would reach nobody; update the frozen consumer pins, or change the release \
+             scheme before advancing it (fixed branches cannot reach revision pins)"
+        ),
+    }
+    Some(Exit::Incomplete)
 }
 
 /// Rewrite the release to its member parents only, shedding stale bases.
@@ -418,7 +500,52 @@ struct RebaseDestination {
     reference: String,
     /// Empty for an explicit reference: dropping is the bare default's job,
     /// because only it knows the target covers every landing.
-    landed: Vec<knives::forge::LandedPull>,
+    landed: Vec<PullRequest>,
+}
+
+#[derive(Clone, Copy)]
+struct RebaseTargetInput<'a> {
+    repo: &'a RepoName,
+    entry: &'a knives::config::RepoEntry,
+    opened: &'a knives::jj::Repo,
+    reference: Option<&'a str>,
+    cache_root: Option<&'a std::path::Path>,
+}
+
+#[derive(Clone, Copy)]
+struct ExistingRebaseInput<'a> {
+    opened: &'a knives::jj::Repo,
+    repo: &'a RepoName,
+    entry: &'a knives::config::RepoEntry,
+    release_name: &'a str,
+    release_commit: &'a knives::ids::CommitId,
+    destination: &'a RebaseDestination,
+    no_drop: bool,
+}
+
+fn existing_rebase_exit(input: ExistingRebaseInput<'_>) -> anyhow::Result<Option<Exit>> {
+    let ExistingRebaseInput {
+        opened,
+        repo,
+        entry,
+        release_name,
+        release_commit,
+        destination,
+        no_drop,
+    } = input;
+    if !opened.is_ancestor(&destination.onto, release_commit)? {
+        return Ok(None);
+    }
+    println!(
+        "{repo}: {release_name} already contains {}",
+        destination.reference
+    );
+    let exit = if no_drop {
+        Exit::Ok
+    } else {
+        drop_landed_members(repo, entry, release_name, destination)?
+    };
+    Ok(Some(exit))
 }
 
 /// The commit a rebase moves onto, with the label the report and provenance use.
@@ -426,12 +553,14 @@ struct RebaseDestination {
 /// An explicit reference is taken at its word. Without one, the default is the
 /// first upstream trunk commit that contains every merged pull request — merged,
 /// not closed, because closed landed nothing.
-fn rebase_target(
-    repo: &RepoName,
-    entry: &knives::config::RepoEntry,
-    opened: &knives::jj::Repo,
-    reference: Option<&str>,
-) -> anyhow::Result<Option<RebaseDestination>> {
+fn rebase_target(input: RebaseTargetInput<'_>) -> anyhow::Result<Option<RebaseDestination>> {
+    let RebaseTargetInput {
+        repo,
+        entry,
+        opened,
+        reference,
+        cache_root,
+    } = input;
     if let Some(explicit) = reference {
         return Ok(Some(RebaseDestination {
             onto: opened.resolve_commit(explicit)?,
@@ -439,7 +568,7 @@ fn rebase_target(
             landed: Vec::new(),
         }));
     }
-    merged_rebase_target(repo, entry, opened)
+    merged_rebase_target(repo, entry, opened, cache_root)
 }
 
 /// The bare-rebase default target, or `None` with its reason already printed.
@@ -452,16 +581,20 @@ fn merged_rebase_target(
     repo: &RepoName,
     entry: &knives::config::RepoEntry,
     opened: &knives::jj::Repo,
+    cache_root: Option<&std::path::Path>,
 ) -> anyhow::Result<Option<RebaseDestination>> {
     let trunk = entry.upstream_trunk();
-    let pull_requests = match CliForge.pull_requests(&entry.path) {
-        Ok(found) => knives::forge::ours_only(
-            found,
-            &[
-                entry.remote(knives::config::Role::Origin),
-                entry.remote(knives::config::Role::Release),
-            ],
-        ),
+    let forge = CliForge;
+    let opened_snapshot = match knives::snapshot::open(knives::snapshot::SnapshotConfig {
+        forge: &forge,
+        path: &entry.path,
+        remotes: [
+            entry.remote(knives::config::Role::Origin),
+            entry.remote(knives::config::Role::Release),
+        ],
+        cache_root,
+    }) {
+        Ok(opened_snapshot) => opened_snapshot,
         Err(error) => {
             eprintln!(
                 "{repo}: could not ask the forge which pull requests merged: {error}; \
@@ -470,43 +603,107 @@ fn merged_rebase_target(
             return Ok(None);
         }
     };
-    let landed = knives::forge::merged_onto(&pull_requests, entry.trunk());
-    if landed.is_empty() {
-        println!(
-            "{repo}: no pull request has merged, so there is no default target; \
-             provide a commit to rebase onto"
-        );
-        return Ok(None);
+    let discovery = match opened_snapshot.discover() {
+        Ok(discovery) => discovery,
+        Err(error) => {
+            eprintln!(
+                "{repo}: could not ask the forge which pull requests merged: {error}; \
+                 provide a commit to rebase onto"
+            );
+            return Ok(None);
+        }
+    };
+    let numbers: Vec<u64> = knives::forge::merged_onto(&discovery.ours(), entry.trunk())
+        .iter()
+        .map(|pull| pull.number)
+        .collect();
+    let snapshot = match discovery.complete(&numbers) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            eprintln!(
+                "{repo}: could not ask the forge which pull requests merged: {error}; \
+                 provide a commit to rebase onto"
+            );
+            return Ok(None);
+        }
+    };
+    let candidates = knives::forge::merged_onto(&snapshot.ours(), entry.trunk());
+    let result: anyhow::Result<Option<RebaseDestination>> = (|| {
+        let Some(landed) = verified_merged_candidates(repo, &snapshot, &candidates, entry.trunk())
+        else {
+            return Ok(None);
+        };
+        if landed.is_empty() {
+            println!(
+                "{repo}: no pull request has merged, so there is no default target; \
+                 provide a commit to rebase onto"
+            );
+            return Ok(None);
+        }
+        let tip = opened.resolve_commit(&trunk)?;
+        let mut placed: Vec<(u64, knives::ids::CommitId)> = Vec::new();
+        let mut unplaced: Vec<u64> = Vec::new();
+        for pull in &landed {
+            let oid = pull.merge_commit.as_ref().map(|merge| merge.oid.clone());
+            let number = pull.number;
+            // Unrecorded, unresolvable and out-of-trunk merge commits are one fact
+            // here: the local trunk does not carry that landing yet.
+            match oid.and_then(|oid| opened.resolve_commit(&oid).ok()) {
+                Some(commit) if opened.is_ancestor(&commit, &tip)? => placed.push((number, commit)),
+                _ => unplaced.push(number),
+            }
+        }
+        if !unplaced.is_empty() {
+            println!(
+                "{repo}: the merge commit(s) of {} are not in the local {trunk}; \
+                 run knives sync, or provide a commit to rebase onto",
+                numbered(&unplaced)
+            );
+            return Ok(None);
+        }
+        let Some((onto, reference)) = covering_commit(repo, opened, &placed, &trunk)? else {
+            return Ok(None);
+        };
+        Ok(Some(RebaseDestination {
+            onto,
+            reference,
+            landed,
+        }))
+    })();
+    if let Err(error) = snapshot.persist(None) {
+        eprintln!("{repo}: could not update forge cache: {error}");
     }
-    let tip = opened.resolve_commit(&trunk)?;
-    let mut placed: Vec<(u64, knives::ids::CommitId)> = Vec::new();
-    let mut unplaced: Vec<u64> = Vec::new();
-    for pull in &landed {
-        let oid = pull.oid.clone();
-        let number = pull.number;
-        // Unrecorded, unresolvable and out-of-trunk merge commits are one fact
-        // here: the local trunk does not carry that landing yet.
-        match oid.and_then(|oid| opened.resolve_commit(&oid).ok()) {
-            Some(commit) if opened.is_ancestor(&commit, &tip)? => placed.push((number, commit)),
-            _ => unplaced.push(number),
+    result
+}
+
+fn verified_merged_candidates(
+    repo: &RepoName,
+    snapshot: &knives::snapshot::ForgeSnapshot<'_>,
+    candidates: &[knives::forge::PullSummary],
+    trunk: &str,
+) -> Option<Vec<knives::forge::PullRequest>> {
+    let unanswered: Vec<u64> = candidates
+        .iter()
+        .filter(|candidate| snapshot.fact(candidate.number).is_none())
+        .map(|candidate| candidate.number)
+        .collect();
+    if !unanswered.is_empty() {
+        eprintln!(
+            "{repo}: could not ask the forge which pull requests merged: it did not report \
+             facts for {}; provide a commit to rebase onto",
+            numbered(&unanswered)
+        );
+        return None;
+    }
+    let mut landed = Vec::new();
+    for candidate in candidates {
+        let fact = snapshot.fact(candidate.number)?;
+        let pull = &fact.pull;
+        if pull.is_merged() && pull.base_ref_name == trunk {
+            landed.push(pull.clone());
         }
     }
-    if !unplaced.is_empty() {
-        println!(
-            "{repo}: the merge commit(s) of {} are not in the local {trunk}; \
-             run knives sync, or provide a commit to rebase onto",
-            numbered(&unplaced)
-        );
-        return Ok(None);
-    }
-    let Some((onto, reference)) = covering_commit(repo, opened, &placed, &trunk)? else {
-        return Ok(None);
-    };
-    Ok(Some(RebaseDestination {
-        onto,
-        reference,
-        landed,
-    }))
+    Some(landed)
 }
 
 /// The first trunk commit containing every landing in `placed`: their maximum
@@ -596,7 +793,7 @@ fn drop_landed_members(
     let mut kept = parents.clone();
     let mut deltas: Vec<String> = Vec::new();
     for pull in &destination.landed {
-        let Some(tip) = bookmark_tip(&opened, pull.branch.as_str())? else {
+        let Some(tip) = bookmark_tip(&opened, &pull.head_ref_name)? else {
             continue;
         };
         if !parents.contains(&tip) {
@@ -605,14 +802,14 @@ fn drop_landed_members(
         if knives::jj::carries_work_past(&entry.path, &destination.onto, &tip)? {
             println!(
                 "{repo}: kept {}: it carries work past #{}",
-                pull.branch, pull.number
+                pull.head_ref_name, pull.number
             );
             continue;
         }
         kept.retain(|parent| parent != &tip);
         deltas.push(format!(
             "dropped {}: landed upstream as #{}",
-            pull.branch, pull.number
+            pull.head_ref_name, pull.number
         ));
     }
     if deltas.is_empty() {
@@ -1449,6 +1646,81 @@ fn release_event(had: bool, superseded_by: Option<&str>) -> Option<String> {
     }
 }
 
+/// The open pull request a branch still owns, if the forge proves it has one.
+///
+/// A stated number is authoritative when it is open; otherwise the branch's
+/// currently primary pull request is considered too. Every number surfaced for
+/// that guard needs a same-run fact; an omitted fact cannot prove it is closed.
+fn open_pull_for(
+    target: &BranchTarget,
+    entry: &knives::config::RepoEntry,
+    store: &Store,
+    cache_root: Option<&std::path::Path>,
+) -> Result<Option<knives::forge::PullRequest>, knives::forge::ForgeError> {
+    let remotes = [
+        entry.remote(knives::config::Role::Origin),
+        entry.remote(knives::config::Role::Release),
+    ];
+    let forge = CliForge;
+    let opened = knives::snapshot::open(knives::snapshot::SnapshotConfig {
+        forge: &forge,
+        path: &entry.path,
+        remotes,
+        cache_root,
+    })?;
+    let discovery = opened.discover()?;
+    let stated = store.tracked_pull(target);
+    let discovery_primary = knives::forge::index_pulls(&discovery.ours())
+        .by_branch
+        .get(&target.branch)
+        .map(|pull| pull.number);
+    let mut surfaced = std::collections::BTreeSet::new();
+    for number in [stated, discovery_primary].into_iter().flatten() {
+        let _ = surfaced.insert(number);
+    }
+    let numbers: Vec<u64> = surfaced.iter().copied().collect();
+    let snapshot = discovery.complete(&numbers)?;
+    let primary = knives::forge::index_pulls(&snapshot.ours())
+        .by_branch
+        .get(&target.branch)
+        .map(|pull| pull.number);
+    if let Some(number) = primary {
+        let _ = surfaced.insert(number);
+    }
+    let unanswered: Vec<u64> = surfaced
+        .iter()
+        .copied()
+        .filter(|number| snapshot.fact(*number).is_none())
+        .collect();
+    let result = (|| {
+        if !unanswered.is_empty() {
+            return Err(knives::forge::ForgeError::Query {
+                detail: format!(
+                    "the forge did not report facts for requested pull request(s) {}",
+                    numbered(&unanswered)
+                ),
+            });
+        }
+        let mut open = None;
+        for number in [stated, primary].into_iter().flatten() {
+            let Some(fact) = snapshot.fact(number) else {
+                return Err(knives::forge::ForgeError::Query {
+                    detail: format!(
+                        "the forge did not report facts for requested pull request #{number}"
+                    ),
+                });
+            };
+            if fact.pull.is_open() {
+                open = Some(fact.pull.clone());
+                break;
+            }
+        }
+        Ok(open)
+    })();
+    let _ = snapshot.persist(None);
+    result
+}
+
 /// Hand a branch back and remove its workspace. The inverse of `start`.
 ///
 /// Removing the directory loses no work: jj snapshots a working copy into a commit, so
@@ -1458,6 +1730,7 @@ fn run_finish(
     target: &BranchTarget,
     superseded_by: Option<&str>,
     cleanup: bool,
+    allow_open: bool,
 ) -> anyhow::Result<Exit> {
     let registry = load(&default_config_path())?;
     let Some(entry) = registry.get(&target.repo) else {
@@ -1465,6 +1738,28 @@ fn run_finish(
         return Ok(Exit::Usage);
     };
     let mut store = Store::open_for_update(default_state_path())?;
+    let cache_root = knives::forge_cache::cache_root();
+    if !allow_open {
+        match open_pull_for(target, entry, &store, cache_root.as_deref()) {
+            Ok(Some(pull)) => {
+                println!(
+                    "{}: {} is the head of open pull request #{} ({}); merge or close it first, \
+                     or pass --allow-open",
+                    target.repo, target.branch, pull.number, pull.url
+                );
+                return Ok(Exit::Findings);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                println!(
+                    "{}: cannot verify whether {} has an open pull request ({error}); \
+                     fix the forge login or pass --allow-open",
+                    target.repo, target.branch
+                );
+                return Ok(Exit::Incomplete);
+            }
+        }
+    }
     let had = store.release_claim(target);
     if let Some(new) = superseded_by {
         store.supersede(target, new);
@@ -1718,6 +2013,8 @@ fn run_status(requested: Option<&str>, view: StatusView) -> anyhow::Result<Exit>
     let registry = load(&default_config_path())?;
     let cli_forge = CliForge;
     let forge: Option<&dyn Forge> = if use_forge { Some(&cli_forge) } else { None };
+    let cache_root = knives::forge_cache::cache_root();
+    let cache = cache_root.as_deref();
 
     // Bounded on both axes, because they multiply: repositories are chunked
     // across at most `repo_workers` threads, and each of those divides the
@@ -1748,6 +2045,7 @@ fn run_status(requested: Option<&str>, view: StatusView) -> anyhow::Result<Exit>
                                     &status::Options {
                                         probe,
                                         forge,
+                                        cache,
                                         registry: Some(registry),
                                         ledger: Some(&ledger),
                                         workers: probe_workers,
@@ -1786,7 +2084,7 @@ fn run_status(requested: Option<&str>, view: StatusView) -> anyhow::Result<Exit>
             println!("{}", status::render(&report, verbose));
         }
         // stderr, so a timed run's stdout is still the report a script parses.
-        if status::timing_enabled() {
+        if knives::timing::enabled() {
             eprintln!("{}", timings.line(name.as_str()));
         }
         worst = worst.worst(status::exit_for(&report));
@@ -2386,8 +2684,15 @@ fn run_preflight(name: &str) -> anyhow::Result<Exit> {
     let mut store = Store::open_for_update(default_state_path())?;
     let forge = CliForge;
     let mut worst = Exit::Ok;
+    let cache_root = knives::forge_cache::cache_root();
     for (repo, entry) in chosen {
-        let report = preflight::gather(&repo, &entry, &mut store, &forge);
+        let report = preflight::gather(preflight::GatherInput {
+            name: &repo,
+            entry: &entry,
+            store: &mut store,
+            forge: &forge,
+            cache: cache_root.as_deref(),
+        });
         println!("{}", preflight::render(&report));
         worst = worst.worst(preflight::exit_for(&report));
     }
@@ -2410,11 +2715,18 @@ fn run_sync(
     let mut store = Store::open_for_update(default_state_path())?;
     let cli_forge = CliForge;
     let forge = use_forge.then_some(&cli_forge as &dyn Forge);
+    let cache_root = knives::forge_cache::cache_root();
 
     let mut worst = Exit::Ok;
     for (name, entry) in chosen {
         let scribe = scribe_for(&name, &entry)?;
-        let report = sync::sync_repo(&entry, &mut store, forge, &scribe)?;
+        let report = sync::sync_repo(sync::SyncInput {
+            entry: &entry,
+            store: &mut store,
+            forge,
+            scribe: &scribe,
+            cache: cache_root.as_deref(),
+        })?;
         if let Some(payload) = knives::cli::machine_payload(output, &report)? {
             println!("{payload}");
         } else {

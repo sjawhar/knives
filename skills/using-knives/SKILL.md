@@ -26,7 +26,7 @@ Pins are read from each consumer's origin trunk rather than its working copy. No
 
 The main report. Per branch: local tip, push status, pull request and its state, review decision, CI check status, landed verdict against upstream trunk, flags, and newest ledger entry. Plus claims other agents hold, the releases scanned, findings grouped one line per kind, and anything it could not answer.
 
-`--verbose` prints one block per finding instead of one line per kind. `--no-landed` skips the trunk probe, which is the slow part. `--no-github` skips pull request lookups. Set `KNIVES_TIMING` (any value) to print a phase-timing line (`releases`, `forge`, `probes`, and `total`) to stderr; the report's stdout/JSON contract is unchanged.
+`--verbose` prints one block per finding instead of one line per kind. `--no-landed` skips the trunk probe, which is the slow part. `--no-github` skips pull request lookups. Set `KNIVES_TIMING` (any value) to print a phase-timing line with `repository-open`, `health`, `divergent-changes`, `releases`, `setup`, `forge`, `probes`, `origin-relations`, `divergent-rows`, `carried-findings`, `touching`, `claims`, `report`, and `total` to stderr; `total` is wall time because phases overlap, and the report's stdout/JSON contract is unchanged.
 
 #### Branch table columns
 
@@ -45,13 +45,17 @@ Branch rows are rendered as an aligned table with 9 columns. Empty cells render 
    - `#<n>` or `#<n> <state>` for closed/merged pull requests.
    - `#<n> draft` for draft pull requests.
    - `#<n> <state> (stated)` for explicitly tracked pull requests.
+   - `unknown (forge unavailable)` if the forge was not consulted and no pull request is stated.
+   - `#<n> unknown (stated)` if an explicitly tracked pull request has no current forge answer.
    - `no-pr` if no pull request is associated.
+   - `prior #<n> <state>` appended for each of the branch's other pull requests, shadowed by the primary. A head branch accumulates pull requests over its life — an org-fork submission closed and re-homed onto a personal fork keeps its review history on the closed number — so read a `prior` closed pull request before working the branch: maintainer feedback often lives only there. Primary selection is deterministic (an open pull request beats any closed one). In JSON these are `prior_pulls: [{number, state}]`, absent when empty. The forge fetch behind this merges the newest-window list with one author-scoped query per origin/release owner, so our own older pull requests stay visible however busy the upstream is.
 5. `review`: `APPROVED`, `CHANGES_REQUESTED`, `no-review`, or `-` if no PR exists.
 6. `checks`: CI check status for open pull requests:
    - `ok` if checks passed.
    - `failing` if CI checks failed.
    - `none-ran` if no checks ran.
-   - `-` if no open PR exists or checks were not consulted. CI still in flight renders the same as all-green (`ok`) because the vocabulary has no `checks-running`. Checks are consulted only for open pull requests.
+   - `pending` if no check has failed and at least one is still in flight; an in-flight check never renders `ok`.
+   - `-` if no open pull request exists or the forge returned no check rollup. Checks are consulted only for open pull requests.
 7. `landed`: verdict against upstream's trunk (`in-trunk`, `conflicts-with-trunk`, `not-in-trunk`, `landed?`, or `-`).
 8. `flags`: comma-separated flags (`CONFLICTING`, `behind-base`, `review-stale`, `fork-only`) or `-`.
 9. `notch`: the newest ledger entry for this branch as one truncated token with its age (`"superseded by #1157…" (3d)`), or `-` when there is none. `knives notch <branch>` prints it in full.
@@ -250,6 +254,20 @@ Writes nothing to `repos.toml` directly. The human or caller pastes the stdout s
 Reads a checkout's remotes and outputs a registry entry or adopts the repository into the registry.
 
 Expects remotes named for their roles: `upstream` (what we contribute to) and `origin` (our fork where branches push and PR heads live), plus an optional `release` remote. Warns if an untracked remote looks like another fork of upstream (detected via case-insensitive owner and slug comparison on the same host), reminding that `origin` must point to your own fork.
+
+## Is this content carried?
+
+For any “is branch/fix X in release/trunk Y?” question, agents MUST use the replay probe, not a source-text search. Text search proved wrong on a real repository: it claimed an approved but unmerged fix was carried; replay proved it absent.
+
+- For a release, run `knives release carries <revision> [--in <ref>]`. `--in` accepts any revision expression and defaults to the release in hand.
+- For the upstream trunk, read the `landed` column from `knives status`; it is the trunk replay probe’s answer.
+- Agents MUST NOT grep source text to answer either question.
+
+The release replay has three answers:
+
+- `is carried in`: replaying the revision leaves nothing, so the target contains its content.
+- `is NOT carried in`: replaying it leaves real diffs, so the target lacks its content.
+- `conflicts with`: the replay conflicts, so some content may be there or unrelated work touched the same files; judge it by eye.
 
 ## The three remotes
 

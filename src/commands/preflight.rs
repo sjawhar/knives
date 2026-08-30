@@ -5,15 +5,17 @@
 //! cannot evaluate and must not pretend to. That half is the skill's job, and
 //! it consumes this output.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
+use std::fmt;
 use std::path::Path;
 
 use crate::cli::Exit;
 use crate::config::RepoEntry;
 use crate::detect::{Finding, divergent_changes, stale_parents};
-use crate::forge::{Forge, PullRequest};
-use crate::ids::{BookmarkRef, BranchName, RepoName, is_release_name};
+use crate::forge::{Forge, PullSummary};
+use crate::ids::{BookmarkRef, RepoName, is_release_name};
 use crate::jj::Repo;
+use crate::snapshot::{self, SnapshotConfig};
 use crate::store::Store;
 
 /// Files a project uses to state how to contribute.
@@ -109,13 +111,12 @@ pub fn stated_pull_request_cap(policy: &str) -> Option<u32> {
     None
 }
 
-fn owned_open_pull_request_count(
-    pull_requests: &BTreeMap<BranchName, PullRequest>,
-    ours: &BTreeSet<String>,
-) -> usize {
+fn owned_open_pull_request_count(pull_requests: &[PullSummary], ours: &BTreeSet<String>) -> usize {
     pull_requests
         .iter()
-        .filter(|(branch, pull_request)| ours.contains(branch.as_str()) && pull_request.is_open())
+        .filter(|pull_request| {
+            ours.contains(pull_request.head_ref_name.as_str()) && pull_request.is_open()
+        })
         .count()
 }
 
@@ -162,10 +163,37 @@ pub struct Report {
     /// "not checked" must never render as "not landed".
     pub branch_state: Vec<BranchState>,
     pub findings: Vec<Finding>,
+    /// Answers this run could not establish, so a caller must not use a green
+    /// exit as evidence that every gate ran.
+    pub problems: Vec<String>,
+    /// Informational facts that do not change a successful run's exit status.
     pub notes: Vec<String>,
 }
 
-pub fn gather(name: &RepoName, entry: &RepoEntry, store: &mut Store, forge: &dyn Forge) -> Report {
+pub struct GatherInput<'a> {
+    pub name: &'a RepoName,
+    pub entry: &'a RepoEntry,
+    pub store: &'a mut Store,
+    pub forge: &'a dyn Forge,
+    pub cache: Option<&'a Path>,
+}
+
+impl fmt::Debug for GatherInput<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GatherInput")
+            .field("has_forge", &true)
+            .field("has_cache", &self.cache.is_some())
+            .finish()
+    }
+}
+pub fn gather(input: GatherInput<'_>) -> Report {
+    let GatherInput {
+        name,
+        entry,
+        store,
+        forge,
+        cache,
+    } = input;
     let mut report = Report {
         repo: name.to_string(),
         ..Report::default()
@@ -199,28 +227,50 @@ pub fn gather(name: &RepoName, entry: &RepoEntry, store: &mut Store, forge: &dyn
         }
     }
 
-    match forge.pull_requests(&entry.path) {
-        // OURS, not every pull request on the upstream. The spec asks for
-        // our count against that repo, and the unscoped figure was 83 where ours
-        // was 10. An agent checking itself against a cap needs its own number.
-        Ok(pull_requests) => match Repo::open(&entry.path).and_then(|repo| repo.bookmark_tips()) {
-            Ok(tips) => {
-                let ours: BTreeSet<String> = tips
-                    .keys()
-                    .filter_map(|reference| match reference {
-                        BookmarkRef::Local(branch) => Some(branch.to_string()),
-                        BookmarkRef::Remote { .. } => None,
-                    })
-                    .collect();
-                report.open_pull_requests =
-                    Some(owned_open_pull_request_count(&pull_requests, &ours));
+    match snapshot::open(SnapshotConfig {
+        forge,
+        path: &entry.path,
+        remotes: [
+            entry.remote(crate::config::Role::Origin),
+            entry.remote(crate::config::Role::Release),
+        ],
+        cache_root: cache,
+    }) {
+        Ok(opened) => match opened
+            .discover()
+            .and_then(|discovery| discovery.complete(&[]))
+        {
+            // The cap counts every open pull request on a local branch. Unlike
+            // the snapshot's ours() helper, this deliberately does not filter
+            // by head repository owner: that would silently shrink today's
+            // count.
+            Ok(snapshot) => {
+                if let Err(error) = snapshot.persist(None) {
+                    report.notes.push(format!("forge cache not saved: {error}"));
+                }
+                match Repo::open(&entry.path).and_then(|repo| repo.bookmark_tips()) {
+                    Ok(tips) => {
+                        let ours: BTreeSet<String> = tips
+                            .keys()
+                            .filter_map(|reference| match reference {
+                                BookmarkRef::Local(branch) => Some(branch.to_string()),
+                                BookmarkRef::Remote { .. } => None,
+                            })
+                            .collect();
+                        report.open_pull_requests =
+                            Some(owned_open_pull_request_count(snapshot.rows(), &ours));
+                    }
+                    Err(error) => report
+                        .problems
+                        .push(format!("could not read our branches: {error}")),
+                }
             }
             Err(error) => report
-                .notes
-                .push(format!("could not read our branches: {error}")),
+                .problems
+                .push(format!("open pull request count unavailable: {error}")),
         },
         Err(error) => report
-            .notes
+            .problems
             .push(format!("open pull request count unavailable: {error}")),
     }
 
@@ -236,7 +286,7 @@ pub fn gather(name: &RepoName, entry: &RepoEntry, store: &mut Store, forge: &dyn
             report.findings.extend(findings);
         }
         Err(error) => report
-            .notes
+            .problems
             .push(format!("branch state unavailable: {error}")),
     }
     report
@@ -342,9 +392,10 @@ fn branch_states_with_findings(
 
 pub fn render(report: &Report) -> String {
     let mut lines: Vec<String> = report
-        .notes
+        .problems
         .iter()
-        .map(|note| format!("! {note}"))
+        .chain(&report.notes)
+        .map(|message| format!("! {message}"))
         .collect();
     lines.push(format!("{}: convention files", report.repo));
     lines.extend(report.conventions.iter().map(Convention::render));
@@ -381,17 +432,14 @@ pub fn render(report: &Report) -> String {
 }
 
 pub const fn exit_for(report: &Report) -> Exit {
-    let notes = if report.notes.is_empty() {
-        Exit::Ok
-    } else {
-        Exit::Incomplete
-    };
-    let findings = if report.findings.is_empty() {
+    if !report.problems.is_empty() {
+        return Exit::Incomplete;
+    }
+    if report.findings.is_empty() {
         Exit::Ok
     } else {
         Exit::Findings
-    };
-    notes.worst(findings)
+    }
 }
 
 /// Convenience for callers that only have a path.
@@ -408,39 +456,127 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_open_owned_pull_requests_count_toward_a_cap() {
+    fn only_open_pulls_on_our_branches_count_toward_a_cap() {
         // Given: our branches with both an open and a merged pull request, plus an
         // open pull request on a branch we do not carry.
-        let pull_requests = BTreeMap::from([
-            (
-                BranchName::new("feat/open"),
-                PullRequest {
-                    state: "OPEN".to_owned(),
-                    ..PullRequest::default()
-                },
-            ),
-            (
-                BranchName::new("feat/merged"),
-                PullRequest {
-                    state: "MERGED".to_owned(),
-                    ..PullRequest::default()
-                },
-            ),
-            (
-                BranchName::new("outside/open"),
-                PullRequest {
-                    state: "OPEN".to_owned(),
-                    ..PullRequest::default()
-                },
-            ),
-        ]);
+        let pull_requests = vec![
+            crate::forge::PullSummary {
+                number: 1,
+                state: "OPEN".to_owned(),
+                review_decision: String::new(),
+                head_ref_name: "feat/open".to_owned(),
+                head_ref_oid: "aa".to_owned(),
+                updated_at: "2026-08-01T00:00:00Z".to_owned(),
+                is_draft: false,
+                url: String::new(),
+                head_repository_owner: None,
+                base_ref_name: "main".to_owned(),
+                merge_commit: None,
+            },
+            crate::forge::PullSummary {
+                number: 2,
+                state: "MERGED".to_owned(),
+                review_decision: String::new(),
+                head_ref_name: "feat/merged".to_owned(),
+                head_ref_oid: "bb".to_owned(),
+                updated_at: "2026-08-01T00:00:00Z".to_owned(),
+                is_draft: false,
+                url: String::new(),
+                head_repository_owner: None,
+                base_ref_name: "main".to_owned(),
+                merge_commit: None,
+            },
+            crate::forge::PullSummary {
+                number: 3,
+                state: "OPEN".to_owned(),
+                review_decision: String::new(),
+                head_ref_name: "outside/open".to_owned(),
+                head_ref_oid: "cc".to_owned(),
+                updated_at: "2026-08-01T00:00:00Z".to_owned(),
+                is_draft: false,
+                url: String::new(),
+                head_repository_owner: None,
+                base_ref_name: "main".to_owned(),
+                merge_commit: None,
+            },
+        ];
         let ours = BTreeSet::from(["feat/open".to_owned(), "feat/merged".to_owned()]);
 
-        // When: the cap count is derived from the all-state forge list.
+        // When: the cap count is derived from all snapshot rows.
         let count = owned_open_pull_request_count(&pull_requests, &ours);
 
-        // Then: neither merged history nor another owner's OPEN pull request consumes a slot.
+        // Then: neither merged history nor an open pull request on a branch we
+        // do not carry consumes a slot.
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn cache_write_failure_is_a_note_and_does_not_make_preflight_incomplete() {
+        let cache = tempfile::tempdir().expect("cache directory");
+        std::fs::write(cache.path().join("forge"), "not a directory")
+            .expect("block the cache parent");
+        let forge = crate::forge::FakeForge {
+            pull_requests: std::collections::BTreeMap::from([(
+                crate::ids::BranchName::new("feat/alpha"),
+                crate::forge::PullRequest {
+                    number: 7,
+                    head_ref_name: "feat/alpha".to_owned(),
+                    ..crate::forge::PullRequest::default()
+                },
+            )]),
+            ..crate::forge::FakeForge::default()
+        };
+        let opened = snapshot::open(SnapshotConfig {
+            forge: &forge,
+            path: Path::new("/fake"),
+            remotes: ["origin", "release"],
+            cache_root: Some(cache.path()),
+        })
+        .expect("open snapshot");
+        let snapshot = opened
+            .discover()
+            .expect("discover pull request")
+            .complete(&[7])
+            .expect("fetch pull request");
+        let mut report = Report::default();
+
+        if let Err(error) = snapshot.persist(None) {
+            report.notes.push(format!("forge cache not saved: {error}"));
+        }
+
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|note| note.starts_with("forge cache not saved:")),
+            "was: {report:?}"
+        );
+        assert!(report.problems.is_empty(), "was: {report:?}");
+        assert_eq!(exit_for(&report), Exit::Ok);
+    }
+
+    #[test]
+    fn an_open_pull_from_another_owner_still_counts_when_its_branch_is_ours() {
+        // The cap counts submissions by branch name, exactly as today's unfiltered
+        // list did: an owner filter here would silently shrink the count.
+        let pull = crate::forge::PullSummary {
+            number: 7,
+            state: "OPEN".to_owned(),
+            review_decision: String::new(),
+            head_ref_name: "feat/ours".to_owned(),
+            head_ref_oid: "aa".to_owned(),
+            updated_at: "2026-08-01T00:00:00Z".to_owned(),
+            is_draft: false,
+            url: String::new(),
+            head_repository_owner: Some(crate::forge::Account {
+                login: "someone-else".to_owned(),
+            }),
+            base_ref_name: "main".to_owned(),
+            merge_commit: None,
+        };
+        let ours = BTreeSet::from(["feat/ours".to_owned()]);
+
+        assert_eq!(owned_open_pull_request_count(&[pull], &ours), 1);
     }
 
     #[test]

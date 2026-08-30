@@ -13,7 +13,7 @@ use jj_lib::object_id::ObjectId as _;
 use jj_lib::op_store::{RefTarget, RemoteRef};
 use jj_lib::ref_name::{RefName as JjRefName, RemoteName as JjRemoteName};
 use jj_lib::repo::{MutableRepo, ReadonlyRepo, Repo as _, RepoLoader, StoreFactories};
-use jj_lib::revset::SymbolResolver;
+use jj_lib::revset::{SymbolResolver, walk_revs};
 use jj_lib::rewrite::{duplicate_commits, merge_commit_trees, rebase_commit};
 use jj_lib::settings::UserSettings;
 use jj_lib::transaction::Transaction;
@@ -231,12 +231,10 @@ impl Repo {
 
     /// One change existing as several visible commits, ignoring nominated refs.
     ///
-    /// Enumeration is jj's own `divergent()` revset, which considers every
-    /// visible commit — a copy buried under descendants counts the same as one
-    /// sitting at a head. An earlier reader resolved the change ids of view
-    /// heads only, which missed exactly the fleet's dominant shape (a branch
-    /// advanced past its rewritten ancestor while a remote-pinned chain kept
-    /// the old copy): the jj fork carried 74 divergent changes, 35 reported.
+    /// Every candidate comes from the existing jj-lib index, walking ancestors
+    /// of the heads whose references still vouch for them. That preserves a
+    /// copy buried under descendants while avoiding a porcelain `divergent()`
+    /// scan across unrelated visible history.
     ///
     /// `ignored` names refs whose testimony does not count — in practice the
     /// superseded dated releases, which any `jj git fetch` re-materializes as
@@ -264,27 +262,25 @@ impl Repo {
                 .get(&commit)
                 .is_some_and(|refs| refs.iter().all(|reference| ignored.contains(reference)));
             if !all_ignored {
-                kept_heads.push(commit);
+                kept_heads.push(head.clone());
             }
         }
 
+        let candidates =
+            walk_revs(self.repo.as_ref(), &kept_heads, &[]).map_err(|error| JjError::Revision {
+                revision: "divergent changes".to_owned(),
+                detail: error.to_string(),
+            })?;
         let mut changes = BTreeMap::<ChangeId, BTreeSet<CommitId>>::new();
-        for candidate in commits_matching(&self.path, "divergent()")? {
-            let change = ChangeId::new(self.commit(candidate.as_str())?.change_id().to_string());
-            // A copy only an ignored ref can reach does not count. Errors
-            // propagate so an index failure cannot silently suppress a finding.
-            let mut vouched = kept_heads.contains(&candidate);
-            if !vouched {
-                for kept in &kept_heads {
-                    if self.is_ancestor(&candidate, kept)? {
-                        vouched = true;
-                        break;
-                    }
-                }
-            }
-            if vouched {
-                changes.entry(change).or_default().insert(candidate);
-            }
+        for candidate in collect_stream(candidates.commit_change_ids()) {
+            let (commit, change) = candidate.map_err(|error| JjError::Revision {
+                revision: "divergent changes".to_owned(),
+                detail: error.to_string(),
+            })?;
+            changes
+                .entry(ChangeId::new(change.to_string()))
+                .or_default()
+                .insert(commit_id(&commit));
         }
         Ok(changes
             .into_iter()

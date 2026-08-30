@@ -1,6 +1,6 @@
 //! `knives status`: per-branch state and all four detectors against a live repo.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use crate::cli::Exit;
@@ -9,7 +9,9 @@ use crate::detect::{
     BookmarkTips, Finding, FindingKind, LandedVerdict, Subject, classify_landed, divergent_changes,
     double_checkout, stale_parents,
 };
-use crate::forge::{ChecksSummary, Forge, PullDetails, PullRequest, ours_only};
+use crate::forge::{
+    ChecksSummary, Forge, PullDetails, PullIndex, PullRequest, PullSummary, index_pulls,
+};
 use crate::ids::{
     BookmarkRef, BranchName, BranchTarget, CommitId, ReleaseScheme, RepoName, is_release_name,
     pull_number_from_bookmark,
@@ -58,6 +60,22 @@ pub struct BranchRow {
     /// never explained.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_notch: Option<LastNotch>,
+    /// This branch's other pull requests, shadowed by the primary one.
+    ///
+    /// A head branch accumulates pull requests over its life — an org-fork
+    /// submission closed and re-homed onto a personal fork keeps its review
+    /// history on the closed number — and hiding them is how an audit walked
+    /// past a maintainer's blocking question that lived on a closed
+    /// predecessor.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub prior_pulls: Vec<PriorPull>,
+}
+
+/// A shadowed pull request, compact enough for a row.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PriorPull {
+    pub number: u64,
+    pub state: String,
 }
 
 impl BranchRow {
@@ -74,6 +92,7 @@ impl BranchRow {
             fork_only: false,
             stated_pull: None,
             last_notch: None,
+            prior_pulls: Vec::new(),
         }
     }
 }
@@ -162,6 +181,8 @@ pub struct Report {
 pub struct Options<'a> {
     pub probe: bool,
     pub forge: Option<&'a dyn Forge>,
+    /// Resolved cache root. `None` disables cache reads and persistence, for library callers.
+    pub cache: Option<&'a std::path::Path>,
     /// Needed because a branch's requirements may name other managed repos.
     pub registry: Option<&'a Registry>,
     /// This repository's ledger, for the per-branch breadcrumb. `None` reads none.
@@ -183,24 +204,54 @@ pub struct Options<'a> {
 /// findings are grouped.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Timings {
+    /// Opening the repository and reading its bookmark tips.
+    pub repository: std::time::Duration,
+    /// Opening the independent health handle and gathering stale-copy, workspace,
+    /// divergent-change, and conflicted-bookmark findings.
+    pub health: std::time::Duration,
+    /// Detecting visible changes that exist as multiple commits.
+    pub divergent_changes: std::time::Duration,
     /// Scanning releases for stale parents.
     pub releases: std::time::Duration,
-    /// The pull request list, batched details, and stated-pull state lookups for
-    /// maintained branches. Divergent-row stated-pull and dependency lookups are
-    /// not counted.
+    /// Preparing maintained branches, references, claims, and forge inputs.
+    pub setup: std::time::Duration,
+    /// Forge identity, discovery sweep or reseed, live facts batch, and every stated-pull and
+    /// dependency lookup. Forge and probes overlap, so `total` is wall time rather than a sum.
     pub forge: std::time::Duration,
     /// Replaying branches onto the upstream trunk.
     pub probes: std::time::Duration,
+    /// Comparing each local branch tip to its origin counterpart.
+    pub origin_relations: std::time::Duration,
+    /// Constructing rows for conflicted local bookmarks.
+    pub divergent_rows: std::time::Duration,
+    /// Finding branches carried by another branch.
+    pub carried_findings: std::time::Duration,
+    /// Comparing each maintained branch's changed paths for overlap.
+    pub touching: std::time::Duration,
+    /// Loading claims, workspaces, and claim overlap findings.
+    pub claims: std::time::Duration,
+    /// Final local finding folds and forge-cache persistence.
+    pub report: std::time::Duration,
     pub total: std::time::Duration,
 }
 
 impl Timings {
     pub fn line(&self, repo: &str) -> String {
         format!(
-            "timing {repo}: releases {}ms forge {}ms probes {}ms total {}ms",
+            "timing {repo}: repository-open {}ms health {}ms divergent-changes {}ms releases {}ms setup {}ms forge {}ms probes {}ms origin-relations {}ms divergent-rows {}ms carried-findings {}ms touching {}ms claims {}ms report {}ms total {}ms",
+            self.repository.as_millis(),
+            self.health.as_millis(),
+            self.divergent_changes.as_millis(),
             self.releases.as_millis(),
+            self.setup.as_millis(),
             self.forge.as_millis(),
             self.probes.as_millis(),
+            self.origin_relations.as_millis(),
+            self.divergent_rows.as_millis(),
+            self.carried_findings.as_millis(),
+            self.touching.as_millis(),
+            self.claims.as_millis(),
+            self.report.as_millis(),
             self.total.as_millis()
         )
     }
@@ -208,7 +259,7 @@ impl Timings {
 
 /// Whether phase timings were asked for.
 pub fn timing_enabled() -> bool {
-    std::env::var_os("KNIVES_TIMING").is_some()
+    crate::timing::enabled()
 }
 
 impl fmt::Debug for Options<'_> {
@@ -272,24 +323,30 @@ fn scan_releases(
     Ok((names, findings, skipped))
 }
 
+/// Inputs for a landed probe.
+#[derive(Clone, Copy)]
+struct LandedInput<'a, 'forge> {
+    path: &'a std::path::Path,
+    branch: &'a BranchName,
+    tips: (&'a CommitId, Option<&'a CommitId>),
+    options: &'a Options<'forge>,
+    upstream_trunk: &'a str,
+}
+
 /// Whether the branch has landed upstream, or that the question cannot be answered.
 ///
 /// Judge only what the pull request actually contains. The probe replays the local
 /// bookmark, so when local and origin disagree it answers about content nobody has
 /// pushed, and stale content replays clean and reads as landed. Refusing to judge is
 /// cheap; the `landed` advice is to delete the branch and its release parent.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the approved interface separately names the probe inputs and configured upstream trunk"
-)]
-fn landed_verdict(
-    path: &std::path::Path,
-    branch: &BranchName,
-    // Local tip, and the origin tip when the branch has been pushed.
-    tips: (&CommitId, Option<&CommitId>),
-    options: &Options<'_>,
-    upstream_trunk: &str,
-) -> Result<Option<LandedVerdict>, JjError> {
+fn landed_verdict(input: LandedInput<'_, '_>) -> Result<Option<LandedVerdict>, JjError> {
+    let LandedInput {
+        path,
+        branch,
+        tips,
+        options,
+        upstream_trunk,
+    } = input;
     let (tip, origin_tip) = tips;
     if !options.probe {
         return Ok(None);
@@ -303,46 +360,115 @@ fn landed_verdict(
         upstream_trunk,
     )?)))
 }
-/// Landed verdicts for every branch, probed concurrently, in branch order.
-///
-/// Each probe opens its own repository handle and replays inside a transaction it
-/// drops: nothing is shared between threads and nothing is written, so no probe
-/// can observe another's. Verified against jj-lib rather than assumed — see
-/// `jj_lib_answers_the_same_probe_from_many_threads_as_from_one`.
-///
-/// Bounded by chunking the branch list rather than by a work queue, because the
-/// bound is the point and a queue would be a dependency. Results come back in the
-/// order the branches went in, so this is the serial report.
-fn landed_verdicts(
-    path: &std::path::Path,
-    carried: &[CarriedPull],
-    options: &Options<'_>,
-    upstream_trunk: &str,
-) -> Vec<Result<Option<LandedVerdict>, JjError>> {
-    // Nothing to spawn for: `landed_verdict` answers `None` without probing when
-    // the probe is off, and an empty list has no chunks.
-    if !options.probe || carried.is_empty() {
-        return carried.iter().map(|_| Ok(None)).collect();
+
+/// The branch data needed by landed probes. Pull request discovery deliberately
+/// stays out so the probes can overlap the forge phase.
+type ProbeInput = (BranchName, CommitId, Option<CommitId>);
+
+struct ProbeResult {
+    verdict: Result<Option<LandedVerdict>, JjError>,
+    landed: Option<(String, LandedVerdict)>,
+}
+
+struct ProbePhase {
+    verdicts: Vec<Result<Option<LandedVerdict>, JjError>>,
+    landed: BTreeMap<String, LandedVerdict>,
+    duration: std::time::Duration,
+}
+
+impl ProbePhase {
+    fn panicked(inputs: &[ProbeInput]) -> Self {
+        Self {
+            verdicts: inputs
+                .iter()
+                .map(|(branch, ..)| {
+                    Err(JjError::ProbePanic {
+                        branch: branch.to_string(),
+                    })
+                })
+                .collect(),
+            landed: BTreeMap::new(),
+            duration: std::time::Duration::default(),
+        }
     }
-    let workers = options.workers.clamp(1, carried.len());
-    let chunk = carried.len().div_ceil(workers);
-    std::thread::scope(|scope| {
+}
+
+#[derive(Clone, Copy)]
+struct ProbeContext<'a, 'forge, 'opened_ref, 'opened> {
+    path: &'a std::path::Path,
+    options: &'a Options<'forge>,
+    upstream_trunk: &'a str,
+    opened: Option<&'opened_ref crate::snapshot::Opened<'opened>>,
+    trunk_commit: Option<&'a CommitId>,
+}
+
+fn probe_one(input: &ProbeInput, context: &ProbeContext<'_, '_, '_, '_>) -> ProbeResult {
+    let ProbeContext {
+        path,
+        options,
+        upstream_trunk,
+        opened,
+        trunk_commit,
+    } = *context;
+    let (branch, tip, origin_tip) = input;
+    let can_cache = options.probe
+        && origin_tip
+            .as_ref()
+            .is_none_or(|origin_tip| origin_tip == tip);
+    let key = can_cache
+        .then(|| trunk_commit.map(|trunk| crate::forge_cache::landed_key(tip, trunk)))
+        .flatten();
+    if let Some((key, verdict)) = key.as_ref().and_then(|key| {
+        opened
+            .and_then(|opened| opened.landed_cached(key))
+            .map(|verdict| (key.clone(), verdict))
+    }) {
+        return ProbeResult {
+            verdict: Ok(Some(verdict)),
+            landed: Some((key, verdict)),
+        };
+    }
+
+    let verdict = landed_verdict(LandedInput {
+        path,
+        branch,
+        tips: (tip, origin_tip.as_ref()),
+        options,
+        upstream_trunk,
+    });
+    let landed = match (&key, &verdict) {
+        (Some(key), Ok(Some(verdict))) if *verdict != LandedVerdict::Unjudged => {
+            Some((key.clone(), *verdict))
+        }
+        _ => None,
+    };
+    ProbeResult { verdict, landed }
+}
+
+/// Landed verdicts for every branch, probed concurrently in branch order, with
+/// successful replay answers merged into the cache section.
+fn probe_phase(context: ProbeContext<'_, '_, '_, '_>, inputs: &[ProbeInput]) -> ProbePhase {
+    let ProbeContext { options, .. } = context;
+    let started = std::time::Instant::now();
+    if !options.probe || inputs.is_empty() {
+        return ProbePhase {
+            verdicts: inputs.iter().map(|_| Ok(None)).collect(),
+            landed: BTreeMap::new(),
+            duration: started.elapsed(),
+        };
+    }
+
+    let workers = options.workers.clamp(1, inputs.len());
+    let chunk = inputs.len().div_ceil(workers);
+    let results = std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(workers);
-        for slice in carried.chunks(chunk) {
+        for slice in inputs.chunks(chunk) {
             handles.push((
                 slice,
                 scope.spawn(move || {
                     slice
                         .iter()
-                        .map(|(branch, tip, origin_tip, _)| {
-                            landed_verdict(
-                                path,
-                                branch,
-                                (tip, origin_tip.as_ref()),
-                                options,
-                                upstream_trunk,
-                            )
-                        })
+                        .map(|input| probe_one(input, &context))
                         .collect::<Vec<_>>()
                 }),
             ));
@@ -353,30 +479,66 @@ fn landed_verdicts(
                 handle.join().unwrap_or_else(|_| {
                     slice
                         .iter()
-                        .map(|(branch, ..)| {
-                            Err(JjError::ProbePanic {
+                        .map(|(branch, ..)| ProbeResult {
+                            verdict: Err(JjError::ProbePanic {
                                 branch: branch.to_string(),
-                            })
+                            }),
+                            landed: None,
                         })
                         .collect()
                 })
             })
-            .collect()
-    })
+            .collect::<Vec<_>>()
+    });
+
+    let mut landed = BTreeMap::new();
+    let verdicts = results
+        .into_iter()
+        .map(|result| {
+            if let Some((key, verdict)) = result.landed {
+                let _ = landed.insert(key, verdict);
+            }
+            result.verdict
+        })
+        .collect();
+    ProbePhase {
+        verdicts,
+        landed,
+        duration: started.elapsed(),
+    }
 }
 
 /// The pull request a bookmark refers to, by branch name or by fetched-head number.
 ///
 /// A `pr-<n>` bookmark is a fetched pull request head: its name is the number, not
 /// the branch the pull request came from, so matching on name alone never found one.
-fn pull_request_for(
+fn pull_summary_for<'a>(
     branch: &BranchName,
-    open: &BTreeMap<BranchName, PullRequest>,
-) -> Option<PullRequest> {
-    open.get(branch).cloned().or_else(|| {
+    index: &'a BTreeMap<BranchName, PullSummary>,
+) -> Option<&'a PullSummary> {
+    index.get(branch).or_else(|| {
         let number = pull_number_from_bookmark(branch.as_str())?;
-        open.values().find(|pr| pr.number == number).cloned()
+        index.values().find(|pull| pull.number == number)
     })
+}
+
+/// The shadowed pull requests for one branch, compacted for its row.
+fn prior_pulls_for(
+    branch: &BranchName,
+    prior: &BTreeMap<BranchName, Vec<PullSummary>>,
+) -> Vec<PriorPull> {
+    prior
+        .get(branch)
+        .map(|shadowed| {
+            shadowed
+                .iter()
+                .map(|pull| PriorPull {
+                    number: pull.number,
+                    state: pull.state.clone(),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Divergent bookmarks, named individually.
@@ -408,78 +570,170 @@ fn conflicted_bookmark_findings(repo: &Repo) -> anyhow::Result<Vec<Finding>> {
 /// cannot work, which is exactly what happened when one repo's #4545 was dropped
 /// while a sibling's #49 still needed it. Satisfied means merged: an open pull
 /// request may still change or be rejected.
-struct DependencyContext<'a> {
+struct DependencyContext<'a, 'snapshot> {
     store: &'a Store,
     registry: &'a Registry,
     forge: Option<&'a dyn Forge>,
+    snapshot: Option<&'a crate::snapshot::ForgeSnapshot<'snapshot>>,
+}
+
+struct DependencyResults<'a> {
+    findings: &'a mut Vec<Finding>,
+    problems: &'a mut Vec<String>,
+}
+
+impl DependencyResults<'_> {
+    fn record(
+        &mut self,
+        branch: &BranchName,
+        requirement: &crate::ids::Requirement,
+        state: Option<&str>,
+    ) {
+        match state {
+            Some(state) if state.eq_ignore_ascii_case("MERGED") => {}
+            Some(state) => self.findings.push(Finding::new(
+                FindingKind::UnmetDependency,
+                Subject::Branch(branch.clone()),
+                format!(
+                    "{branch} requires {requirement}, which is {}",
+                    state.to_lowercase()
+                ),
+            )),
+            None => self.problems.push(format!(
+                "{branch} requires {requirement}, which the forge did not report on"
+            )),
+        }
+    }
 }
 
 fn unmet_dependencies(
     repo: &RepoName,
     branches: &[BranchRow],
-    context: &DependencyContext<'_>,
+    context: &DependencyContext<'_, '_>,
 ) -> (Vec<Finding>, Vec<String>) {
     let DependencyContext {
         store,
         registry,
         forge,
+        snapshot,
     } = *context;
-    let mut findings = Vec::new();
-    let mut problems = Vec::new();
+    let mut grouped: BTreeMap<RepoName, Vec<(BranchName, crate::ids::Requirement)>> =
+        BTreeMap::new();
     for row in branches {
         let target = BranchTarget::new(repo.clone(), row.name.clone());
         for requirement in store.dependencies(&target) {
-            let Some(entry) = registry.get(&requirement.repo) else {
-                problems.push(format!(
-                    "{} requires {requirement}, whose repo is not in the registry",
-                    row.name
-                ));
+            grouped
+                .entry(requirement.repo.clone())
+                .or_default()
+                .push((row.name.clone(), requirement));
+        }
+    }
+
+    let mut findings = Vec::new();
+    let mut problems = Vec::new();
+    {
+        let mut outcomes = DependencyResults {
+            findings: &mut findings,
+            problems: &mut problems,
+        };
+        for (required_repo, requirements) in grouped {
+            let Some(entry) = registry.get(&required_repo) else {
+                for (branch, requirement) in requirements {
+                    outcomes.problems.push(format!(
+                        "{branch} requires {requirement}, whose repo is not in the registry"
+                    ));
+                }
                 continue;
             };
+
+            if required_repo == *repo {
+                let Some(snapshot) = snapshot else {
+                    for (branch, requirement) in requirements {
+                        outcomes.problems.push(format!(
+                        "cannot check whether {branch} still needs {requirement}: no forge consulted"
+                    ));
+                    }
+                    continue;
+                };
+                for (branch, requirement) in requirements {
+                    outcomes.record(
+                        &branch,
+                        &requirement,
+                        snapshot
+                            .fact(requirement.number)
+                            .map(|fact| fact.pull.state.as_str()),
+                    );
+                }
+                continue;
+            }
+
             let Some(forge) = forge else {
-                problems.push(format!(
-                    "cannot check whether {} still needs {requirement}: no forge consulted",
-                    row.name
+                for (branch, requirement) in requirements {
+                    outcomes.problems.push(format!(
+                    "cannot check whether {branch} still needs {requirement}: no forge consulted"
                 ));
+                }
                 continue;
             };
-            match forge.pull_request_state(&entry.path, requirement.number) {
-                Ok(Some(state)) if state.eq_ignore_ascii_case("MERGED") => {}
-                Ok(Some(state)) => findings.push(Finding::new(
-                    FindingKind::UnmetDependency,
-                    Subject::Branch(row.name.clone()),
-                    format!(
-                        "{} requires {requirement}, which is {}",
-                        row.name,
-                        state.to_lowercase()
-                    ),
-                )),
-                Ok(None) => problems.push(format!(
-                    "{} requires {requirement}, which the forge did not report on",
-                    row.name
-                )),
-                Err(error) => problems.push(format!(
-                    "cannot check whether {} still needs {requirement}: {error}",
-                    row.name
-                )),
+            let numbers: Vec<u64> = requirements
+                .iter()
+                .map(|(_, requirement)| requirement.number)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            match forge
+                .repo_identity(&entry.path)
+                .and_then(|identity| forge.pull_facts(&entry.path, &identity, &numbers))
+            {
+                Ok(facts) => {
+                    for (branch, requirement) in requirements {
+                        outcomes.record(
+                            &branch,
+                            &requirement,
+                            facts
+                                .get(&requirement.number)
+                                .map(|fact| fact.pull.state.as_str()),
+                        );
+                    }
+                }
+                Err(error) => {
+                    for (branch, requirement) in requirements {
+                        outcomes.problems.push(format!(
+                            "cannot check whether {branch} still needs {requirement}: {error}"
+                        ));
+                    }
+                }
             }
         }
     }
     (findings, problems)
 }
 
-/// Fold declared cross-repo requirements into a report.
+/// Fold declared dependencies into a report.
 ///
 /// Separate from `gather` only to keep that function readable.
-fn add_dependency_findings(
-    report: &mut Report,
-    name: &RepoName,
-    store: &Store,
-    options: &Options<'_>,
-) {
+struct DependencyInput<'a, 'forge, 'snapshot> {
+    report: &'a mut Report,
+    name: &'a RepoName,
+    store: &'a Store,
+    options: &'a Options<'forge>,
+    snapshot: Option<&'a crate::snapshot::ForgeSnapshot<'snapshot>>,
+    timings: &'a mut Timings,
+}
+
+fn add_dependency_findings(input: DependencyInput<'_, '_, '_>) {
+    let DependencyInput {
+        report,
+        name,
+        store,
+        options,
+        snapshot,
+        timings,
+    } = input;
     let Some(registry) = options.registry else {
         return;
     };
+    let started = std::time::Instant::now();
     let (found, unanswered) = unmet_dependencies(
         name,
         &report.branches,
@@ -487,8 +741,10 @@ fn add_dependency_findings(
             store,
             registry,
             forge: options.forge,
+            snapshot,
         },
     );
+    timings.forge += started.elapsed();
     report.findings.extend(found);
     report.problems.extend(unanswered);
 }
@@ -545,47 +801,109 @@ fn unjudged_note(branches: &[String]) -> Option<String> {
     ))
 }
 
-/// The pull request stated for a branch, with whatever state the forge reports.
+/// The pull request stated for a branch, with the current snapshot's answer.
 fn stated_pull_for(
     target: &BranchTarget,
     store: &Store,
-    entry: &RepoEntry,
-    options: &Options<'_>,
+    snapshot: Option<&crate::snapshot::ForgeSnapshot<'_>>,
 ) -> Option<StatedPull> {
     store.tracked_pull(target).map(|number| StatedPull {
-        state: options
-            .forge
-            .and_then(|forge| forge.pull_request_state(&entry.path, number).ok())
-            .flatten()
-            .unwrap_or_else(|| "unknown".to_owned()),
+        state: snapshot
+            .and_then(|snapshot| snapshot.fact(number))
+            .map_or_else(|| "unknown".to_owned(), |fact| fact.pull.state.clone()),
         number,
     })
 }
 
-fn pull_requests_from_forge(
-    forge: Option<&dyn Forge>,
-    entry: &RepoEntry,
-    report: &mut Report,
-) -> BTreeMap<BranchName, PullRequest> {
-    let Some(forge) = forge else {
-        return BTreeMap::new();
+/// Every number declared before discovery: stated pull requests and same-repository
+/// dependencies for both maintained and divergent branches.
+fn declared_numbers(repo: &RepoName, branches: &[BranchName], store: &Store) -> Vec<u64> {
+    let mut numbers = BTreeSet::new();
+    for branch in branches {
+        let target = BranchTarget::new(repo.clone(), branch.clone());
+        if let Some(number) = store.tracked_pull(&target) {
+            let _ = numbers.insert(number);
+        }
+        numbers.extend(
+            store
+                .dependencies(&target)
+                .into_iter()
+                .filter(|requirement| requirement.repo == *repo)
+                .map(|requirement| requirement.number),
+        );
+    }
+    numbers.into_iter().collect()
+}
+
+struct ForgePhase<'snapshot> {
+    snapshot: Option<crate::snapshot::ForgeSnapshot<'snapshot>>,
+    index: PullIndex,
+    duration: std::time::Duration,
+    problems: Vec<String>,
+}
+
+fn forge_phase<'snapshot>(
+    opened: Option<&'snapshot crate::snapshot::Opened<'snapshot>>,
+    branches: &[BranchName],
+    extra_numbers: &[u64],
+    started: std::time::Instant,
+) -> ForgePhase<'snapshot> {
+    let Some(opened) = opened else {
+        return ForgePhase {
+            snapshot: None,
+            index: PullIndex::default(),
+            duration: started.elapsed(),
+            problems: Vec::new(),
+        };
     };
-    match forge.pull_requests(&entry.path) {
-        Ok(found) => {
-            report.forge_consulted = true;
-            // Ours means it comes from our copy of the repository, not that its branch
-            // happens to share a name with one of ours.
-            ours_only(
-                found,
-                &[entry.remote(Role::Origin), entry.remote(Role::Release)],
-            )
-        }
+    let discovery = match opened.discover() {
+        Ok(discovery) => discovery,
         Err(error) => {
-            report
-                .problems
-                .push(format!("pull request state unavailable: {error}"));
-            BTreeMap::new()
+            return ForgePhase {
+                snapshot: None,
+                index: PullIndex::default(),
+                duration: started.elapsed(),
+                problems: vec![format!("pull request state unavailable: {error}")],
+            };
         }
+    };
+    let discovery_index = index_pulls(&discovery.ours());
+    let mut surfaced: Vec<u64> = branches
+        .iter()
+        .filter_map(|branch| pull_summary_for(branch, &discovery_index.by_branch))
+        .map(|pull| pull.number)
+        .collect();
+    surfaced.extend_from_slice(extra_numbers);
+    surfaced.sort_unstable();
+    surfaced.dedup();
+    match discovery.complete(&surfaced) {
+        Ok(snapshot) => {
+            let index = index_pulls(&snapshot.ours());
+            let problems = branches
+                .iter()
+                .filter_map(|branch| {
+                    let summary = pull_summary_for(branch, &index.by_branch)?;
+                    snapshot.fact(summary.number).is_none().then(|| {
+                        format!(
+                            "pull request #{} for {branch} unavailable: the forge did not report it",
+                            summary.number
+                        )
+                    })
+                })
+                .collect();
+            ForgePhase {
+                snapshot: Some(snapshot),
+                index,
+                duration: started.elapsed(),
+                problems,
+            }
+        }
+        Err(error) => ForgePhase {
+            snapshot: None,
+            index: PullIndex::default(),
+            duration: started.elapsed(),
+            problems: vec![format!("pull request state unavailable: {error}")],
+        },
     }
 }
 
@@ -660,20 +978,11 @@ fn add_releases(
     Ok(())
 }
 
-/// One maintained branch, its tip, where origin has it, and the pull request it
-/// refers to.
-type CarriedPull = (BranchName, CommitId, Option<CommitId>, Option<PullRequest>);
-
-/// Every branch paired with what the row loop needs before it starts.
+/// Every maintained branch paired with the data the landed probes need.
 ///
-/// Built up front because both phases that dominate a run — the forge round trip
-/// and the landed probes — go over the whole list at once now, and a loop that
-/// discovers its own inputs one at a time is exactly what made them serial.
-fn carried_pulls(
-    branches: Vec<(BranchName, CommitId)>,
-    pull_requests: &BTreeMap<BranchName, PullRequest>,
-    tips: &BookmarkTips,
-) -> Vec<CarriedPull> {
+/// Pull request discovery is deliberately absent: a probe never reads it, and
+/// separating these inputs lets the probe phase overlap forge discovery.
+fn probe_inputs(branches: Vec<(BranchName, CommitId)>, tips: &BookmarkTips) -> Vec<ProbeInput> {
     branches
         .into_iter()
         .map(|(branch, tip)| {
@@ -683,55 +992,9 @@ fn carried_pulls(
                     remote: crate::ids::RemoteName::new("origin"),
                 })
                 .cloned();
-            let pull_request = pull_request_for(&branch, pull_requests);
-            (branch, tip, origin_tip, pull_request)
+            (branch, tip, origin_tip)
         })
         .collect()
-}
-
-/// The pull requests worth asking the forge about.
-///
-/// Exactly the ones the per-branch calls asked about: a review age only when the
-/// forge recorded a review decision, checks only while the pull request is open.
-/// Asking about more would be a behaviour change dressed as an optimisation.
-fn detail_numbers(carried: &[CarriedPull]) -> Vec<u64> {
-    let mut numbers: Vec<u64> = carried
-        .iter()
-        .filter_map(|(_, _, _, pull_request)| pull_request.as_ref())
-        .filter(|pull_request| pull_request.is_open() || !pull_request.review_decision.is_empty())
-        .map(|pull_request| pull_request.number)
-        .collect();
-    // Sorted and duplicate-free to keep the query shape stable without redundant
-    // fields. No two rows can name one number today — `maintained_branches` drops
-    // the `pr-<n>` bookmarks that are the only other way to reach a number — and
-    // this keeps the query's shape independent of that staying true.
-    numbers.sort_unstable();
-    numbers.dedup();
-    numbers
-}
-
-/// Review age and check state for every pull request in this report, in one call.
-fn pull_details_from_forge(
-    forge: Option<&dyn Forge>,
-    entry: &RepoEntry,
-    numbers: &[u64],
-    report: &mut Report,
-) -> BTreeMap<u64, PullDetails> {
-    let Some(forge) = forge else {
-        return BTreeMap::new();
-    };
-    if numbers.is_empty() {
-        return BTreeMap::new();
-    }
-    match forge.pull_details(&entry.path, numbers) {
-        Ok(details) => details,
-        Err(error) => {
-            report
-                .problems
-                .push(format!("review age and checks unavailable: {error}"));
-            BTreeMap::new()
-        }
-    }
 }
 
 /// Whether the newest review predates the branch head, when there was a review to
@@ -765,14 +1028,31 @@ fn checks_from(
     details?.checks.clone()
 }
 
-struct DivergentInput<'a> {
-    repo: &'a Repo,
+/// The locally divergent branches that need rows but have no tip to probe.
+fn divergent_branch_names(repo: &Repo, entry: &RepoEntry) -> anyhow::Result<Vec<BranchName>> {
+    let scheme = entry.release_scheme();
+    Ok(repo
+        .conflicted_bookmarks()?
+        .into_iter()
+        .filter_map(|(reference, _)| {
+            let BookmarkRef::Local(branch) = reference else {
+                return None;
+            };
+            (!is_release_name(&branch, &scheme)
+                && branch.as_str() != entry.trunk()
+                && pull_number_from_bookmark(branch.as_str()).is_none())
+            .then_some(branch)
+        })
+        .collect())
+}
+
+struct DivergentInput<'a, 'snapshot> {
+    branches: &'a [BranchName],
     tips: &'a BookmarkTips,
     name: &'a RepoName,
-    entry: &'a RepoEntry,
     store: &'a Store,
-    options: &'a Options<'a>,
-    pull_requests: &'a BTreeMap<BranchName, PullRequest>,
+    snapshot: Option<&'a crate::snapshot::ForgeSnapshot<'snapshot>>,
+    index: &'a PullIndex,
     notches: &'a [Notch],
 }
 
@@ -783,40 +1063,48 @@ struct DivergentInput<'a> {
 /// listing entirely, and a branch with no row got no pull request association either, so
 /// its pull request read as nonexistent until somebody happened to resolve the
 /// divergence. Proven by before-and-after on #228.
-fn divergent_rows(input: &DivergentInput<'_>) -> anyhow::Result<Vec<BranchRow>> {
-    let mut rows = Vec::new();
-    let scheme = input.entry.release_scheme();
-    for (reference, _) in input.repo.conflicted_bookmarks()? {
-        let BookmarkRef::Local(branch) = reference else {
-            continue;
-        };
-        if is_release_name(&branch, &scheme)
-            || branch.as_str() == input.entry.trunk()
-            || pull_number_from_bookmark(branch.as_str()).is_some()
-        {
-            continue;
-        }
-        let target = BranchTarget::new(input.name.clone(), branch.clone());
-        let row = BranchRow {
-            fork_only: input.store.is_fork_only(&target),
-            stated_pull: stated_pull_for(&target, input.store, input.entry, input.options),
-            pull_request: pull_request_for(&branch, input.pull_requests),
-            origin_tip: input
-                .tips
-                .get(&BookmarkRef::Remote {
-                    branch: branch.clone(),
-                    remote: crate::ids::RemoteName::new("origin"),
-                })
-                .cloned(),
-            last_notch: newest_for(input.notches, branch.as_str()).map(LastNotch::of),
-            // Nothing to replay: a divergent bookmark has no single commit to probe.
-            ..BranchRow::bare(branch, None)
-        };
-        rows.push(row);
-    }
-    Ok(rows)
+fn divergent_rows(input: &DivergentInput<'_, '_>) -> Vec<BranchRow> {
+    input
+        .branches
+        .iter()
+        .map(|branch| {
+            let target = BranchTarget::new(input.name.clone(), branch.clone());
+            let fact = pull_summary_for(branch, &input.index.by_branch).and_then(|summary| {
+                input
+                    .snapshot
+                    .and_then(|snapshot| snapshot.fact(summary.number))
+            });
+            let (pull_request, review_stale, checks) = fact.map_or_else(
+                || (None, None, None),
+                |fact| {
+                    (
+                        Some(fact.pull.clone()),
+                        review_stale_from(Some(&fact.details), Some(&fact.pull)),
+                        checks_from(Some(&fact.details), Some(&fact.pull)),
+                    )
+                },
+            );
+            BranchRow {
+                fork_only: input.store.is_fork_only(&target),
+                stated_pull: stated_pull_for(&target, input.store, input.snapshot),
+                pull_request,
+                review_stale,
+                checks,
+                prior_pulls: prior_pulls_for(branch, &input.index.prior),
+                origin_tip: input
+                    .tips
+                    .get(&BookmarkRef::Remote {
+                        branch: branch.clone(),
+                        remote: crate::ids::RemoteName::new("origin"),
+                    })
+                    .cloned(),
+                last_notch: newest_for(input.notches, branch.as_str()).map(LastNotch::of),
+                // Nothing to replay: a divergent bookmark has no single commit to probe.
+                ..BranchRow::bare(branch.clone(), None)
+            }
+        })
+        .collect()
 }
-
 /// Who holds what here, and where they are working.
 ///
 /// Absorbed from the old `wip` command. Who holds a branch is part of a repository's
@@ -869,10 +1157,65 @@ pub fn relation_to_origin(
     }
 }
 
-fn record_origin_relation(
+struct OriginPhase {
+    relations: Vec<Result<Option<OriginRelation>, String>>,
+}
+
+/// Relations to origin, queried concurrently with one jj-lib handle per worker.
+///
+/// Loaded repository handles are not assumed `Sync`. Each worker opens its own
+/// handle, handles its chunk in order, and the join order restores branch order
+/// before a result reaches the report.
+fn origin_phase(path: &std::path::Path, inputs: &[ProbeInput], workers: usize) -> OriginPhase {
+    if inputs.is_empty() {
+        return OriginPhase {
+            relations: Vec::new(),
+        };
+    }
+    let workers = workers.clamp(1, inputs.len());
+    let chunk = inputs.len().div_ceil(workers);
+    let relations = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(workers);
+        for slice in inputs.chunks(chunk) {
+            handles.push((
+                slice,
+                scope.spawn(move || match Repo::open(path) {
+                    Ok(repo) => slice
+                        .iter()
+                        .map(|(_, tip, origin_tip)| {
+                            relation_to_origin(&repo, tip, origin_tip.as_ref())
+                                .map_err(|error| error.to_string())
+                        })
+                        .collect::<Vec<Result<Option<OriginRelation>, String>>>(),
+                    Err(error) => {
+                        let error = error.to_string();
+                        slice
+                            .iter()
+                            .map(|_| Err(error.clone()))
+                            .collect::<Vec<Result<Option<OriginRelation>, String>>>()
+                    }
+                }),
+            ));
+        }
+        handles
+            .into_iter()
+            .flat_map(|(slice, handle)| {
+                handle.join().unwrap_or_else(|_| {
+                    slice
+                        .iter()
+                        .map(|_| Err("origin relation task panicked".to_owned()))
+                        .collect()
+                })
+            })
+            .collect()
+    });
+    OriginPhase { relations }
+}
+
+fn record_origin_relation<E: fmt::Display>(
     report: &mut Report,
     branch: &BranchName,
-    relation: Result<Option<OriginRelation>, JjError>,
+    relation: Result<Option<OriginRelation>, E>,
 ) -> Option<OriginRelation> {
     match relation {
         Ok(relation) => relation,
@@ -890,7 +1233,7 @@ fn record_repository_health(
     repo: &Repo,
     path: &std::path::Path,
     tips: &BookmarkTips,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<std::time::Duration> {
     // Recorded before conclusions from this repository: detectors replay commits, so a stale
     // working copy can invalidate their answers.
     if let Some(stale) = repo.stale_working_copy(path) {
@@ -902,11 +1245,41 @@ fn record_repository_health(
             .into_iter()
             .map(|(reference, _)| reference)
             .collect();
-    report
-        .findings
-        .extend(divergent_changes(&repo.divergent_changes(&ignored)?));
+    let phase = std::time::Instant::now();
+    let changes = repo.divergent_changes(&ignored)?;
+    let duration = phase.elapsed();
+    report.findings.extend(divergent_changes(&changes));
     report.findings.extend(conflicted_bookmark_findings(repo)?);
-    Ok(())
+    Ok(duration)
+}
+
+/// Repository-wide health facts prepared on an independent jj-lib handle.
+///
+/// The status rows use their own handle below. Keeping this result separate
+/// lets its expensive divergent-change scan overlap forge discovery while the
+/// report still prefixes its findings and problems exactly as before.
+struct RepositoryHealth {
+    findings: Vec<Finding>,
+    problems: Vec<String>,
+    health: std::time::Duration,
+    divergent_changes: std::time::Duration,
+}
+
+fn repository_health(
+    path: &std::path::Path,
+    tips: &BookmarkTips,
+) -> anyhow::Result<RepositoryHealth> {
+    let phase = std::time::Instant::now();
+    let repo = Repo::open(path)?;
+    let mut report = Report::default();
+    let divergent_changes = record_repository_health(&mut report, &repo, path, tips)?;
+    let health = phase.elapsed();
+    Ok(RepositoryHealth {
+        findings: report.findings,
+        problems: report.problems,
+        health,
+        divergent_changes,
+    })
 }
 
 /// Reports branches carried by another branch, excluding the configured trunk.
@@ -940,26 +1313,85 @@ fn carried_findings(
     Ok(findings)
 }
 
-fn add_branch_overlap_findings(report: &mut Report, entry: &RepoEntry) {
+/// Changed-file result for one branch, if it has a single tip to compare.
+type BranchFiles = Result<Vec<String>, String>;
+/// The branch name and its optional changed-file result.
+type BranchOverlapOutcome = (String, Option<BranchFiles>);
+
+/// Compare branch paths concurrently, preserving the report's branch order.
+///
+/// `changed_files_between` invokes jj's porcelain because it normalizes paths.
+/// It does not mutate the checkout, so each worker can independently query its
+/// contiguous branch chunk and report the serial implementation's findings in
+/// exactly the same order.
+fn add_branch_overlap_findings(
+    report: &mut Report,
+    entry: &RepoEntry,
+    workers: usize,
+) -> std::time::Duration {
+    let started = std::time::Instant::now();
+    let rows = &report.branches;
+    let upstream_trunk = entry.upstream_trunk();
+    let path = &entry.path;
+    let outcomes: Vec<BranchOverlapOutcome> = if rows.is_empty() {
+        Vec::new()
+    } else {
+        let workers = workers.clamp(1, rows.len());
+        let chunk = rows.len().div_ceil(workers);
+        let upstream_trunk = upstream_trunk.as_str();
+        std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(workers);
+            for slice in rows.chunks(chunk) {
+                handles.push((
+                    slice,
+                    scope.spawn(move || {
+                        slice
+                            .iter()
+                            .map(|row| {
+                                let files = row.tip.as_ref().map(|_| {
+                                    let from =
+                                        format!("fork_point({upstream_trunk} | {})", row.name);
+                                    crate::jj::changed_files_between(path, &from, row.name.as_str())
+                                        .map_err(|error| error.to_string())
+                                });
+                                (row.name.to_string(), files)
+                            })
+                            .collect::<Vec<_>>()
+                    }),
+                ));
+            }
+            handles
+                .into_iter()
+                .flat_map(|(slice, handle)| {
+                    handle.join().unwrap_or_else(|_| {
+                        slice
+                            .iter()
+                            .map(|row| {
+                                (
+                                    row.name.to_string(),
+                                    Some(Err("path comparison task panicked".to_owned())),
+                                )
+                            })
+                            .collect()
+                    })
+                })
+                .collect()
+        })
+    };
     let mut touching: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut notes = Vec::new();
     let mut unanswered = Vec::new();
-    for row in &report.branches {
-        if row.tip.is_none() {
-            notes.push(format!(
-                "cannot compare paths for {}: it has no single tip",
-                row.name
-            ));
-            continue;
-        }
-        let from = format!("fork_point({} | {})", entry.upstream_trunk(), row.name);
-        match crate::jj::changed_files_between(&entry.path, &from, row.name.as_str()) {
-            Ok(files) => {
-                let _ = touching.insert(row.name.to_string(), files);
+    for (branch, files) in outcomes {
+        match files {
+            Some(Ok(files)) => {
+                let _ = touching.insert(branch, files);
             }
-            Err(error) => {
-                unanswered.push(format!("cannot compare paths for {}: {error}", row.name));
+            Some(Err(error)) => {
+                unanswered.push(format!("cannot compare paths for {branch}: {error}"));
             }
+            None => notes.push(format!(
+                "cannot compare paths for {branch}: it has no single tip"
+            )),
         }
     }
     report.notes.extend(notes);
@@ -967,77 +1399,58 @@ fn add_branch_overlap_findings(report: &mut Report, entry: &RepoEntry) {
     report
         .findings
         .extend(crate::detect::overlap::branch_overlaps(&touching));
+    started.elapsed()
 }
 
-/// Everything the branch table needs from one repository.
-struct RowInput<'a> {
+/// Everything the maintained-branch row loop needs after the two concurrent phases end.
+struct RowInput<'a, 'snapshot> {
     name: &'a RepoName,
-    entry: &'a RepoEntry,
-    repo: &'a Repo,
-    tips: &'a BookmarkTips,
     store: &'a Store,
-    options: &'a Options<'a>,
-    branches: Vec<(BranchName, CommitId)>,
-    pull_requests: &'a BTreeMap<BranchName, PullRequest>,
+    probe_inputs: Vec<ProbeInput>,
+    index: &'a PullIndex,
+    snapshot: Option<&'a crate::snapshot::ForgeSnapshot<'snapshot>>,
     notches: &'a [Notch],
-    upstream_trunk: &'a str,
 }
 
 /// The branch rows, and the branches whose landed state could not be judged.
-///
-/// Extracted from `gather` because the two phases that dominate a status run —
-/// the forge round trips and the landed probes — are driven over the whole branch
-/// list, and one function that both drives them and assembles the rest of a
-/// report is past what a reviewer holds at once.
 fn branch_rows(
-    input: RowInput<'_>,
+    input: RowInput<'_, '_>,
+    verdicts: Vec<Result<Option<LandedVerdict>, JjError>>,
+    origin_relations: Vec<Result<Option<OriginRelation>, String>>,
     report: &mut Report,
-    timings: &mut Timings,
 ) -> anyhow::Result<Vec<String>> {
-    let carried = carried_pulls(input.branches, input.pull_requests, input.tips);
-
-    let phase = std::time::Instant::now();
-    let details = pull_details_from_forge(
-        input.options.forge,
-        input.entry,
-        &detail_numbers(&carried),
-        report,
-    );
-    timings.forge += phase.elapsed();
-
-    let phase = std::time::Instant::now();
-    let verdicts = landed_verdicts(
-        &input.entry.path,
-        &carried,
-        input.options,
-        input.upstream_trunk,
-    );
-    timings.probes = phase.elapsed();
-
     let mut unjudged = Vec::new();
-    for (verdict, (branch, tip, origin_tip, pull_request)) in verdicts.into_iter().zip(carried) {
+    for ((verdict, (branch, tip, origin_tip)), relation) in verdicts
+        .into_iter()
+        .zip(input.probe_inputs)
+        .zip(origin_relations)
+    {
         // Propagated in branch order, so a probe failure reports the same branch
-        // and the same message it did when the probes ran one at a time.
+        // and the same message it did when probes ran one at a time.
         let landed = verdict?;
         if landed == Some(LandedVerdict::Unjudged) {
             unjudged.push(branch.to_string());
         }
-        let detail = pull_request
-            .as_ref()
-            .and_then(|pull_request| details.get(&pull_request.number));
-        let review_stale = review_stale_from(detail, pull_request.as_ref());
-        let checks = checks_from(detail, pull_request.as_ref());
-        let origin_relation = record_origin_relation(
-            report,
-            &branch,
-            relation_to_origin(input.repo, &tip, origin_tip.as_ref()),
+        let fact = pull_summary_for(&branch, &input.index.by_branch).and_then(|summary| {
+            input
+                .snapshot
+                .and_then(|snapshot| snapshot.fact(summary.number))
+        });
+        let (pull_request, review_stale, checks) = fact.map_or_else(
+            || (None, None, None),
+            |fact| {
+                (
+                    Some(fact.pull.clone()),
+                    review_stale_from(Some(&fact.details), Some(&fact.pull)),
+                    checks_from(Some(&fact.details), Some(&fact.pull)),
+                )
+            },
         );
+        let origin_relation = record_origin_relation(report, &branch, relation);
         let target = BranchTarget::new(input.name.clone(), branch.clone());
-        let phase = std::time::Instant::now();
-        let stated_pull = stated_pull_for(&target, input.store, input.entry, input.options);
-        timings.forge += phase.elapsed();
         let last_notch = newest_for(input.notches, branch.as_str()).map(LastNotch::of);
         report.branches.push(BranchRow {
+            prior_pulls: prior_pulls_for(&branch, &input.index.prior),
             name: branch,
             tip: Some(tip),
             origin_tip,
@@ -1047,11 +1460,187 @@ fn branch_rows(
             review_stale,
             checks,
             fork_only: input.store.is_fork_only(&target),
-            stated_pull,
+            stated_pull: stated_pull_for(&target, input.store, input.snapshot),
             last_notch,
         });
     }
     Ok(unjudged)
+}
+
+/// Resolve the single forge identity and cache read both concurrent phases share.
+fn open_forge_snapshot<'a>(
+    forge: Option<&'a dyn Forge>,
+    entry: &'a RepoEntry,
+    cache_root: Option<&'a std::path::Path>,
+) -> Result<Option<crate::snapshot::Opened<'a>>, crate::forge::ForgeError> {
+    let Some(forge) = forge else {
+        return Ok(None);
+    };
+    crate::snapshot::open(crate::snapshot::SnapshotConfig {
+        forge,
+        path: &entry.path,
+        remotes: [entry.remote(Role::Origin), entry.remote(Role::Release)],
+        cache_root,
+    })
+    .map(Some)
+}
+
+/// The completed concurrent phases, retained until report folding persists the cache.
+struct StatusPhases<'snapshot> {
+    forge: ForgePhase<'snapshot>,
+    probe: ProbePhase,
+}
+
+/// Inputs to the concurrent forge-discovery and landed-probe phases.
+#[derive(Clone, Copy)]
+struct StatusPhaseInput<'a, 'forge, 'snapshot> {
+    entry: &'a RepoEntry,
+    options: &'a Options<'forge>,
+    probe_inputs: &'a [ProbeInput],
+    opened: Option<&'snapshot crate::snapshot::Opened<'snapshot>>,
+    trunk_commit: Option<&'a CommitId>,
+    branches: &'a [BranchName],
+    declared: &'a [u64],
+    forge_started: std::time::Instant,
+}
+
+/// Run independent forge discovery and landed probes without sharing report mutation.
+fn run_status_phases<'snapshot>(
+    input: StatusPhaseInput<'_, '_, 'snapshot>,
+) -> StatusPhases<'snapshot> {
+    let StatusPhaseInput {
+        entry,
+        options,
+        probe_inputs,
+        opened,
+        trunk_commit,
+        branches,
+        declared,
+        forge_started,
+    } = input;
+    let upstream_trunk = entry.upstream_trunk();
+    let context = ProbeContext {
+        path: &entry.path,
+        options,
+        upstream_trunk: &upstream_trunk,
+        opened,
+        trunk_commit,
+    };
+    let (forge, probe) = std::thread::scope(|scope| {
+        let probes = scope.spawn(|| probe_phase(context, probe_inputs));
+        let forge = forge_phase(opened, branches, declared, forge_started);
+        let probes = probes
+            .join()
+            .unwrap_or_else(|_| ProbePhase::panicked(probe_inputs));
+        (forge, probes)
+    });
+    StatusPhases { forge, probe }
+}
+
+/// Inputs that turn completed phases into the report's visible rows and findings.
+struct PostPhaseInput<'a> {
+    name: &'a RepoName,
+    entry: &'a RepoEntry,
+    repo: &'a Repo,
+    store: &'a Store,
+    options: &'a Options<'a>,
+    tips: &'a BookmarkTips,
+    notches: &'a [Notch],
+    divergent_branches: &'a [BranchName],
+    probe_inputs: Vec<ProbeInput>,
+    probe_ran: bool,
+}
+
+/// Fold completed phases into rows, findings, timings, and cache persistence.
+fn fold_phase_outcome(
+    report: &mut Report,
+    timings: &mut Timings,
+    input: PostPhaseInput<'_>,
+    phases: &mut StatusPhases<'_>,
+) -> anyhow::Result<()> {
+    report.forge_consulted = phases.forge.snapshot.is_some();
+    report
+        .problems
+        .extend(std::mem::take(&mut phases.forge.problems));
+    timings.forge = phases.forge.duration;
+    timings.probes = phases.probe.duration;
+
+    let phase = std::time::Instant::now();
+    let origin_phase = origin_phase(
+        &input.entry.path,
+        &input.probe_inputs,
+        input.options.workers,
+    );
+    let unjudged = branch_rows(
+        RowInput {
+            name: input.name,
+            store: input.store,
+            probe_inputs: input.probe_inputs,
+            index: &phases.forge.index,
+            snapshot: phases.forge.snapshot.as_ref(),
+            notches: input.notches,
+        },
+        std::mem::take(&mut phases.probe.verdicts),
+        origin_phase.relations,
+        report,
+    )?;
+    timings.origin_relations = phase.elapsed();
+
+    let phase = std::time::Instant::now();
+    report.branches.extend(divergent_rows(&DivergentInput {
+        branches: input.divergent_branches,
+        tips: input.tips,
+        name: input.name,
+        store: input.store,
+        snapshot: phases.forge.snapshot.as_ref(),
+        index: &phases.forge.index,
+        notches: input.notches,
+    }));
+    report
+        .branches
+        .sort_by(|left, right| left.name.cmp(&right.name));
+    timings.divergent_rows = phase.elapsed();
+
+    let phase = std::time::Instant::now();
+    report.findings.extend(carried_findings(
+        report,
+        input.repo,
+        input.entry.trunk(),
+        &input.entry.release_scheme(),
+    )?);
+    timings.carried_findings = phase.elapsed();
+
+    timings.touching = add_branch_overlap_findings(report, input.entry, input.options.workers);
+
+    let phase = std::time::Instant::now();
+    add_claims(report, input.repo, input.name, input.store);
+    timings.claims = phase.elapsed();
+
+    let phase = std::time::Instant::now();
+    report.findings.extend(branch_findings(&report.branches));
+    report.findings.extend(wrong_base_findings(
+        &report.branches,
+        input.entry.default_base(),
+    ));
+    report.problems.extend(unjudged_note(&unjudged));
+    add_dependency_findings(DependencyInput {
+        report,
+        name: input.name,
+        store: input.store,
+        options: input.options,
+        snapshot: phases.forge.snapshot.as_ref(),
+        timings,
+    });
+    if let Some(snapshot) = phases.forge.snapshot.as_ref() {
+        let landed = input
+            .probe_ran
+            .then(|| std::mem::take(&mut phases.probe.landed));
+        if let Err(error) = snapshot.persist(landed) {
+            report.notes.push(format!("forge cache not saved: {error}"));
+        }
+    }
+    timings.report = phase.elapsed();
+    Ok(())
 }
 
 /// The report, and where the run spent its time.
@@ -1066,72 +1655,85 @@ pub fn gather_timed(
 ) -> anyhow::Result<(Report, Timings)> {
     let started = std::time::Instant::now();
     let mut timings = Timings::default();
+    let phase = std::time::Instant::now();
     let repo = Repo::open(&entry.path)?;
     let mut report = Report {
         repo: name.to_string(),
         ..Report::default()
     };
     let tips = repo.bookmark_tips()?;
-    record_repository_health(&mut report, &repo, &entry.path, &tips)?;
-    let trunk = entry.trunk();
-    let scheme = entry.release_scheme();
-    let upstream_trunk = entry.upstream_trunk();
+    timings.repository = phase.elapsed();
     let phase = std::time::Instant::now();
     add_releases(&mut report, &repo, &tips, entry)?;
     timings.releases = phase.elapsed();
 
-    let (branches, fetched_heads) = maintained_branches(&tips, trunk, &scheme);
+    let phase = std::time::Instant::now();
+    let (branches, fetched_heads) =
+        maintained_branches(&tips, entry.trunk(), &entry.release_scheme());
+    let divergent_branches = divergent_branch_names(&repo, entry)?;
+    let probe_inputs = probe_inputs(branches, &tips);
+    let mut all_branches: Vec<BranchName> = probe_inputs
+        .iter()
+        .map(|(branch, ..)| branch.clone())
+        .collect();
+    all_branches.extend(divergent_branches.iter().cloned());
+    let declared = declared_numbers(name, &all_branches, store);
     let notches = notches_from_ledger(options.ledger, &mut report);
     report.repo_notches = repo_notches(&notches);
     note_fetched_heads(&mut report, fetched_heads);
-    let phase = std::time::Instant::now();
-    let pull_requests = pull_requests_from_forge(options.forge, entry, &mut report);
-    timings.forge += phase.elapsed();
+    timings.setup = phase.elapsed();
 
-    let unjudged = branch_rows(
-        RowInput {
+    let forge_started = std::time::Instant::now();
+    let opened = match open_forge_snapshot(options.forge, entry, options.cache) {
+        Ok(opened) => opened,
+        Err(error) => {
+            report
+                .problems
+                .push(format!("pull request state unavailable: {error}"));
+            None
+        }
+    };
+    let opened_ref = opened.as_ref();
+    let trunk_commit = repo.resolve_commit(&entry.upstream_trunk()).ok();
+    let probe_ran = options.probe && trunk_commit.is_some();
+    let (mut phases, health) = std::thread::scope(|scope| {
+        let health = scope.spawn(|| repository_health(&entry.path, &tips));
+        let phases = run_status_phases(StatusPhaseInput {
+            entry,
+            options,
+            probe_inputs: &probe_inputs,
+            opened: opened_ref,
+            trunk_commit: trunk_commit.as_ref(),
+            branches: &all_branches,
+            declared: &declared,
+            forge_started,
+        });
+        let health = health
+            .join()
+            .map_err(|_| anyhow::anyhow!("repository health phase panicked"))??;
+        Ok::<_, anyhow::Error>((phases, health))
+    })?;
+    timings.divergent_changes = health.divergent_changes;
+    timings.health = health.health;
+    report.findings.splice(0..0, health.findings);
+    report.problems.splice(0..0, health.problems);
+    fold_phase_outcome(
+        &mut report,
+        &mut timings,
+        PostPhaseInput {
             name,
             entry,
             repo: &repo,
-            tips: &tips,
             store,
             options,
-            branches,
-            pull_requests: &pull_requests,
-            upstream_trunk: &upstream_trunk,
+            tips: &tips,
             notches: &notches,
+            divergent_branches: &divergent_branches,
+            probe_inputs,
+            probe_ran,
         },
-        &mut report,
-        &mut timings,
+        &mut phases,
     )?;
-
-    report.branches.extend(divergent_rows(&DivergentInput {
-        repo: &repo,
-        tips: &tips,
-        name,
-        entry,
-        store,
-        options,
-        pull_requests: &pull_requests,
-        notches: &notches,
-    })?);
-    report
-        .branches
-        .sort_by(|left, right| left.name.cmp(&right.name));
-    report
-        .findings
-        .extend(carried_findings(&report, &repo, trunk, &scheme)?);
-    add_branch_overlap_findings(&mut report, entry);
-
-    add_claims(&mut report, &repo, name, store);
-
-    let derived = branch_findings(&report.branches);
-    report.findings.extend(derived);
-    report
-        .findings
-        .extend(wrong_base_findings(&report.branches, entry.default_base()));
-    report.problems.extend(unjudged_note(&unjudged));
-    add_dependency_findings(&mut report, name, store, options);
     timings.total = started.elapsed();
     Ok((report, timings))
 }
@@ -1418,9 +2020,15 @@ fn stated_pull_details(stated: &StatedPull) -> String {
     format!("{} (stated)", stated.state.to_lowercase())
 }
 
-fn pull_request_cell(row: &BranchRow) -> String {
+fn pull_request_cell(row: &BranchRow, forge_consulted: bool) -> String {
     row.pull_request.as_ref().map_or_else(
         || {
+            if !forge_consulted {
+                return row.stated_pull.as_ref().map_or_else(
+                    || "unknown (forge unavailable)".to_owned(),
+                    stated_pull_cell,
+                );
+            }
             row.stated_pull
                 .as_ref()
                 .map_or_else(|| "no-pr".to_owned(), stated_pull_cell)
@@ -1440,6 +2048,13 @@ fn pull_request_cell(row: &BranchRow) -> String {
                     details.push(stated_pull_cell(stated));
                 }
             }
+            for prior in &row.prior_pulls {
+                details.push(format!(
+                    "prior #{} {}",
+                    prior.number,
+                    prior.state.to_lowercase()
+                ));
+            }
             details.join(" ")
         },
     )
@@ -1458,6 +2073,7 @@ fn checks_cell(row: &BranchRow) -> String {
         Some(pr) if pr.is_open() => match row.checks.as_ref() {
             Some(checks) if checks.failing() => "failing".to_owned(),
             Some(checks) if !checks.ran() => "none-ran".to_owned(),
+            Some(checks) if checks.pending() => "pending".to_owned(),
             Some(_) => "ok".to_owned(),
             None => "-".to_owned(),
         },
@@ -1528,7 +2144,7 @@ fn repo_notch_line(notches: &RepoNotches) -> String {
     )
 }
 
-fn branch_table(rows: &[BranchRow]) -> Vec<String> {
+fn branch_table(rows: &[BranchRow], forge_consulted: bool) -> Vec<String> {
     const HEADER: [&str; 9] = [
         "branch", "tip", "push", "pr", "review", "checks", "landed", "flags", "notch",
     ];
@@ -1540,7 +2156,7 @@ fn branch_table(rows: &[BranchRow]) -> Vec<String> {
                 branch_cell(row),
                 tip_cell(row),
                 push_cell(row),
-                pull_request_cell(row),
+                pull_request_cell(row, forge_consulted),
                 review_cell(row),
                 checks_cell(row),
                 landed_cell(row),
@@ -1633,7 +2249,7 @@ pub fn render(report: &Report, verbose: bool) -> String {
         lines.push(repo_notch_line(notches));
     }
     if !report.branches.is_empty() {
-        lines.extend(branch_table(&report.branches));
+        lines.extend(branch_table(&report.branches, report.forge_consulted));
     }
     if report.findings.is_empty() {
         lines.push("  findings    none".to_owned());
@@ -1704,7 +2320,10 @@ mod tests {
         reason = "indexing a result in a test is the assertion; a panic is the failure"
     )]
     use super::*;
+    use crate::forge::FakeForge;
     use crate::ids::{BranchName, RemoteName};
+    use std::collections::BTreeMap;
+    use std::path::Path;
 
     fn local(name: &str) -> BookmarkRef {
         BookmarkRef::Local(BranchName::new(name))
@@ -1742,20 +2361,150 @@ mod tests {
         }
     }
     #[test]
+    fn status_uses_a_newly_open_primary_from_the_completed_snapshot() {
+        // A warm cache can still attach a branch to a closed primary when a new
+        // open pull request for that branch appeared after the cache watermark.
+        let cache = tempfile::tempdir().expect("cache directory");
+        let branch = BranchName::new("feat/alpha");
+        let closed = PullRequest {
+            number: 7,
+            state: "CLOSED".to_owned(),
+            head_ref_name: branch.to_string(),
+            updated_at: "2026-08-01T00:00:00Z".to_owned(),
+            ..PullRequest::default()
+        };
+        let seeded = FakeForge {
+            pull_requests: BTreeMap::from([(branch.clone(), closed)]),
+            ..FakeForge::default()
+        };
+        let seeded_opened = crate::snapshot::open(crate::snapshot::SnapshotConfig {
+            forge: &seeded,
+            path: Path::new("/fake"),
+            remotes: ["origin", "release"],
+            cache_root: Some(cache.path()),
+        })
+        .expect("open seed cache");
+        seeded_opened
+            .discover()
+            .expect("discover closed pull request")
+            .complete(&[7])
+            .expect("fetch closed pull request")
+            .persist(None)
+            .expect("persist closed pull request");
+
+        let opened = FakeForge {
+            pull_requests: BTreeMap::from([(
+                branch.clone(),
+                PullRequest {
+                    number: 8,
+                    state: "OPEN".to_owned(),
+                    head_ref_name: branch.to_string(),
+                    updated_at: "2026-08-02T00:00:00Z".to_owned(),
+                    ..PullRequest::default()
+                },
+            )]),
+            ..FakeForge::default()
+        };
+        let live_opened = crate::snapshot::open(crate::snapshot::SnapshotConfig {
+            forge: &opened,
+            path: Path::new("/fake"),
+            remotes: ["origin", "release"],
+            cache_root: Some(cache.path()),
+        })
+        .expect("open warm cache");
+
+        let phase = forge_phase(
+            Some(&live_opened),
+            std::slice::from_ref(&branch),
+            &[],
+            std::time::Instant::now(),
+        );
+
+        assert!(phase.snapshot.is_some(), "the live batch completed");
+        assert_eq!(
+            phase.index.by_branch[&branch].number, 8,
+            "the current open pull request is primary"
+        );
+        let store = Store::open(cache.path().join("state.json")).expect("open state");
+        let repo = RepoName::new("test-repo");
+        let mut report = Report::default();
+        branch_rows(
+            RowInput {
+                name: &repo,
+                store: &store,
+                probe_inputs: vec![(
+                    branch,
+                    CommitId::new("test-commit"),
+                    Some(CommitId::new("origin-commit")),
+                )],
+                index: &phase.index,
+                snapshot: phase.snapshot.as_ref(),
+                notches: &[],
+            },
+            vec![Ok::<Option<LandedVerdict>, JjError>(None)],
+            vec![Ok::<Option<OriginRelation>, String>(None)],
+            &mut report,
+        )
+        .expect("assemble status report");
+
+        assert_eq!(
+            report.branches[0]
+                .pull_request
+                .as_ref()
+                .map(|pull| pull.number),
+            Some(8),
+            "the report shows the current open pull request this run"
+        );
+    }
+
+    #[test]
+    fn a_missing_forge_renders_unknown_not_no_pr() {
+        // A missing snapshot means the forge did not answer; `no-pr` would claim
+        // it did answer and found nothing.
+        let row = row("feat/alpha", None, None);
+
+        assert_eq!(
+            pull_request_cell(&row, false),
+            "unknown (forge unavailable)"
+        );
+        assert_eq!(pull_request_cell(&row, true), "no-pr");
+    }
+
+    #[test]
     fn a_timing_line_names_every_phase_it_measured() {
         // The numbers this PR is judged against. A line that reported only a total
         // could not say which phase a change actually moved.
         let timings = Timings {
+            repository: std::time::Duration::from_millis(4),
+            health: std::time::Duration::from_millis(10),
+            divergent_changes: std::time::Duration::from_millis(11),
             releases: std::time::Duration::from_millis(12),
+            setup: std::time::Duration::from_millis(5),
             forge: std::time::Duration::from_millis(3400),
             probes: std::time::Duration::from_millis(8100),
+            origin_relations: std::time::Duration::from_millis(16),
+            divergent_rows: std::time::Duration::from_millis(17),
+            carried_findings: std::time::Duration::from_millis(18),
+            touching: std::time::Duration::from_millis(19),
+            claims: std::time::Duration::from_millis(20),
+            report: std::time::Duration::from_millis(6),
             total: std::time::Duration::from_millis(11_600),
         };
         let line = timings.line("a-repo");
         assert!(line.contains("a-repo"), "was: {line}");
+        assert!(line.contains("repository-open 4ms"), "was: {line}");
+        assert!(line.contains("health 10ms"), "was: {line}");
+        assert!(line.contains("divergent-changes 11ms"), "was: {line}");
         assert!(line.contains("releases 12ms"), "was: {line}");
+        assert!(line.contains("setup 5ms"), "was: {line}");
         assert!(line.contains("forge 3400ms"), "was: {line}");
         assert!(line.contains("probes 8100ms"), "was: {line}");
+        assert!(line.contains("origin-relations 16ms"), "was: {line}");
+        assert!(line.contains("divergent-rows 17ms"), "was: {line}");
+        assert!(line.contains("carried-findings 18ms"), "was: {line}");
+        assert!(line.contains("touching 19ms"), "was: {line}");
+        assert!(line.contains("claims 20ms"), "was: {line}");
+        assert!(line.contains("report 6ms"), "was: {line}");
         assert!(line.contains("total 11600ms"), "was: {line}");
     }
 
@@ -1770,7 +2519,7 @@ mod tests {
         );
         let bare = row("fix/a-much-longer-branch-name", None, None);
 
-        let lines = branch_table(&[with_pr, bare]);
+        let lines = branch_table(&[with_pr, bare], true);
 
         assert_eq!(lines.len(), 3, "header plus one row per branch: {lines:?}");
         let header = &lines[0];
@@ -1819,7 +2568,7 @@ mod tests {
         };
         let plain = row("feat/plain", None, None);
 
-        let lines = branch_table(&[with_flags, plain]);
+        let lines = branch_table(&[with_flags, plain], true);
 
         let header_columns = columns(&lines[0]);
         let header_offsets: Vec<usize> = header_columns.iter().map(|(offset, _)| *offset).collect();
@@ -1859,7 +2608,7 @@ mod tests {
             kind: crate::ledger::Kind::Note,
             text: "superseded by #1157".to_owned(),
         });
-        let lines = branch_table(&[row]);
+        let lines = branch_table(&[row], true);
         assert!(lines[0].contains("notch"), "header: {}", lines[0]);
         assert!(
             lines[1].ends_with("\"superseded by #1157\" (now)"),
@@ -1879,7 +2628,7 @@ mod tests {
             text: "parked by the owner\nuntil the trait lands upstream, which may be weeks"
                 .to_owned(),
         });
-        let lines = branch_table(&[row]);
+        let lines = branch_table(&[row], true);
         assert_eq!(lines.len(), 2, "was: {lines:?}");
         assert!(!lines[1].contains('\n'));
         assert!(lines[1].contains('…'), "truncation is marked: {}", lines[1]);
@@ -1899,7 +2648,7 @@ mod tests {
             text: "parked\u{1b}now\ragain".to_owned(),
         });
 
-        let lines = branch_table(&[row]);
+        let lines = branch_table(&[row], true);
         assert!(!lines[1].contains('\u{1b}'), "was: {:?}", lines[1]);
         assert!(!lines[1].contains('\r'), "was: {:?}", lines[1]);
         assert!(lines[1].contains('\u{fffd}'), "was: {:?}", lines[1]);
@@ -1907,7 +2656,7 @@ mod tests {
 
     #[test]
     fn a_branch_with_no_notch_renders_the_empty_placeholder() {
-        let lines = branch_table(&[row("feat/alpha", None, None)]);
+        let lines = branch_table(&[row("feat/alpha", None, None)], true);
         assert!(lines[1].ends_with(" -"), "was: {}", lines[1]);
         assert_eq!(columns(&lines[1]).len(), 9, "was: {}", lines[1]);
     }
@@ -2182,7 +2931,7 @@ mod tests {
         };
 
         // When: overlap paths are gathered alongside the landed probe
-        add_branch_overlap_findings(&mut report, &entry);
+        let _ = add_branch_overlap_findings(&mut report, &entry, 1);
 
         // Then: the known divergence is announced without claiming the report is incomplete.
         assert!(report.notes.iter().any(|note| {
@@ -2216,7 +2965,7 @@ mod tests {
         };
 
         // When: jj cannot calculate that branch's changed paths
-        add_branch_overlap_findings(&mut report, &entry);
+        let _ = add_branch_overlap_findings(&mut report, &entry, 1);
 
         // Then: the report says path coverage was incomplete instead of silently omitting it
         assert!(
@@ -2328,7 +3077,7 @@ mod tests {
         red.checks = Some(crate::forge::ChecksSummary {
             runs: vec![crate::forge::CheckRun {
                 name: "build".to_owned(),
-                conclusion: "FAILURE".to_owned(),
+                conclusion: Some("FAILURE".to_owned()),
             }],
         });
 
@@ -2363,7 +3112,7 @@ mod tests {
         failing.checks = Some(crate::forge::ChecksSummary {
             runs: vec![crate::forge::CheckRun {
                 name: "build".to_owned(),
-                conclusion: "FAILURE".to_owned(),
+                conclusion: Some("FAILURE".to_owned()),
             }],
         });
         let mut never_ran = pull_request(12);
@@ -2395,6 +3144,50 @@ mod tests {
         assert!(
             never_ran_line.contains("draft") && never_ran_line.contains("none-ran"),
             "was: {never_ran_line}"
+        );
+    }
+    #[test]
+    fn pending_checks_are_not_rendered_as_ok() {
+        let mut pending = row("feat/pending", None, Some(pull_request(13)));
+        pending.checks = Some(crate::forge::ChecksSummary {
+            runs: vec![crate::forge::CheckRun {
+                name: "build".to_owned(),
+                conclusion: None,
+            }],
+        });
+
+        assert_eq!(checks_cell(&pending), "pending");
+    }
+
+    #[test]
+    fn a_pending_legacy_status_context_renders_as_pending() {
+        let facts = crate::forge::parse_pull_facts(
+            r#"{"data":{"repository":{"p13":{"number":13,"state":"OPEN","headRefName":"feat/pending",
+            "headRefOid":"aa","updatedAt":"2026-08-01T00:00:00Z","rollup":{"nodes":[{"commit":{
+            "statusCheckRollup":{"contexts":{"nodes":[{"__typename":"StatusContext",
+            "context":"legacy-ci","state":"PENDING"}]}}}}]}}}}}"#,
+            &[13],
+        )
+        .expect("facts parse");
+        let fact = &facts[&13];
+        let mut pending = row("feat/pending", None, Some(fact.pull.clone()));
+        pending.checks = fact.details.checks.clone();
+        let report = Report {
+            repo: "demo".to_owned(),
+            branches: vec![pending],
+            ..Report::default()
+        };
+
+        let rendered = render(&report, false);
+        let pending_line = rendered
+            .lines()
+            .find(|line| line.contains("feat/pending"))
+            .expect("the pending branch line");
+
+        assert_eq!(
+            pending_line.split_whitespace().nth(5),
+            Some("pending"),
+            "was: {pending_line}"
         );
     }
 
@@ -2442,12 +3235,12 @@ mod tests {
         closed.checks = Some(crate::forge::ChecksSummary {
             runs: vec![crate::forge::CheckRun {
                 name: "build".to_owned(),
-                conclusion: "FAILURE".to_owned(),
+                conclusion: Some("FAILURE".to_owned()),
             }],
         });
 
         // When: the settled branch is rendered and analysed
-        let rendered = branch_table(std::slice::from_ref(&closed)).join("\n");
+        let rendered = branch_table(std::slice::from_ref(&closed), true).join("\n");
         let findings = branch_findings(&[closed]);
 
         // Then: no action-oriented CI token or finding is emitted
@@ -2490,7 +3283,7 @@ mod tests {
         });
 
         // When: the pull-request cell combines inference with the stated record.
-        let cell = pull_request_cell(&row);
+        let cell = pull_request_cell(&row, true);
 
         // Then: the number is shown once while the stated state and provenance remain visible.
         assert_eq!(cell, "#106 open (stated)");
@@ -2506,10 +3299,28 @@ mod tests {
         });
 
         // When: the pull-request cell combines inference with the stated record.
-        let cell = pull_request_cell(&row);
+        let cell = pull_request_cell(&row, true);
 
         // Then: both numbers remain visible because they identify different pull requests.
         assert_eq!(cell, "#106 #107 open (stated)");
+    }
+
+    #[test]
+    fn a_shadowed_pull_request_renders_as_prior_history_beside_the_primary() {
+        // Given: an open pull request whose branch also carries a closed
+        // predecessor (an org-fork submission re-homed onto a personal fork).
+        let mut row = row("feat/alpha", None, Some(pull_request(4894)));
+        row.prior_pulls = vec![PriorPull {
+            number: 4565,
+            state: "CLOSED".to_owned(),
+        }];
+
+        // When: the pull-request cell renders.
+        let cell = pull_request_cell(&row, true);
+
+        // Then: the closed predecessor stays visible — its review history is
+        // exactly what a reader of the open pull request is missing.
+        assert_eq!(cell, "#4894 prior #4565 closed");
     }
 
     #[test]

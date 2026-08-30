@@ -1,0 +1,226 @@
+{
+  "data": {
+    "repository": {
+      "p1331": {
+        "number": 1331,
+        "state": "CLOSED",
+        "reviewDecision": "REVIEW_REQUIRED",
+        "headRefName": "max/making_formatting_optional",
+        "headRefOid": "2d4b8e27a4d2e0fbf849b1d29558d3012f6ab215",
+        "updatedAt": "2025-02-17T14:07:12Z",
+        "isDraft": false,
+        "url": "https://forge.invalid/our-org/recorded-repo/pull/1331",
+        "headRepositoryOwner": {
+          "login": "our-org"
+        },
+        "baseRefName": "main",
+        "mergeable": "CONFLICTING",
+        "mergeStateStatus": "DIRTY",
+        "mergeCommit": null,
+        "reviews": {
+          "nodes": []
+        },
+        "commits": {
+          "nodes": [
+            {
+              "commit": {
+                "committedDate": "2025-02-16T21:48:39Z"
+              }
+            },
+            {
+              "commit": {
+                "committedDate": "2025-02-16T21:53:55Z"
+              }
+            }
+          ]
+        },
+        "rollup": {
+          "nodes": [
+            {
+              "commit": {
+                "statusCheckRollup": null
+              }
+            }
+          ]
+        },
+        "comments": {
+          "nodes": [
+            {
+              "createdAt": "2025-02-17T14:07:12Z"
+            }
+          ]
+        }
+      },
+      "p5116": {
+        "number": 5116,
+        "state": "MERGED",
+        "reviewDecision": "APPROVED",
+        "headRefName": "claude/issue-372-20260828-2145",
+        "headRefOid": "fa8b2793fae63b263f2e70e5df5ef7d06b15b3c8",
+        "updatedAt": "2026-08-28T23:07:17Z",
+        "isDraft": false,
+        "url": "https://forge.invalid/our-org/recorded-repo/pull/5116",
+        "headRepositoryOwner": {
+          "login": "our-org"
+        },
+        "baseRefName": "main",
+        "mergeable": "UNKNOWN",
+        "mergeStateStatus": "UNKNOWN",
+        "mergeCommit": {
+          "oid": "3712507590dc4e6e678114194ac9844fd3a6fd6c"
+        },
+        "reviews": {
+          "nodes": [
+            {
+              "submittedAt": "2026-08-28T23:07:06Z"
+            }
+          ]
+        },
+        "commits": {
+          "nodes": [
+            {
+              "commit": {
+                "committedDate": "2026-08-28T21:49:23Z"
+              }
+            },
+            {
+              "commit": {
+                "committedDate": "2026-08-28T22:02:59Z"
+              }
+            },
+            {
+              "commit": {
+                "committedDate": "2026-08-28T22:56:35Z"
+              }
+            }
+          ]
+        },
+        "rollup": {
+          "nodes": [
+            {
+              "commit": {
+                "statusCheckRollup": {
+                  "contexts": {
+                    "pageInfo": {
+                      "hasNextPage": false
+                    },
+                    "nodes": [
+                      {
+                        "__typename": "CheckRun",
+                        "name": "ruff",
+                        "conclusion": "SUCCESS"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "name": "entries-under-unreleased",
+                        "conclusion": "SUCCESS"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "name": "gate",
+                        "conclusion": "SUCCESS"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "name": "check-schema-and-types",
+                        "conclusion": "SUCCESS"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "name": "mypy (3.10)",
+                        "conclusion": "SUCCESS"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "name": "submodule-on-main",
+                        "conclusion": "SUCCESS"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "name": "mypy (3.11)",
+                        "conclusion": "SUCCESS"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "name": "pre-commit",
+                        "conclusion": "SUCCESS"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "name": "viewer-tests",
+                        "conclusion": "SUCCESS"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "name": "changes",
+                        "conclusion": "SUCCESS"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "name": "dist-validation",
+                        "conclusion": "SUCCESS"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "name": "test (3.10)",
+                        "conclusion": "SUCCESS"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "name": "test (3.11)",
+                        "conclusion": "SUCCESS"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "name": "detect-slow",
+                        "conclusion": "SUCCESS"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "name": "Build & inspect the package.",
+                        "conclusion": "SUCCESS"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "name": "docs",
+                        "conclusion": "SKIPPED"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "name": "sandbox-tools-unit",
+                        "conclusion": "SKIPPED"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "name": "check-version-bump",
+                        "conclusion": "SKIPPED"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "name": "slow-tests",
+                        "conclusion": "SKIPPED"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "name": "slow-tool-tests-dev",
+                        "conclusion": "SKIPPED"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "name": "slow-tool-tests-release",
+                        "conclusion": "SKIPPED"
+                      }
+                    ]
+                  }
+                }
+              }
+            }
+          ]
+        },
+        "comments": {
+          "nodes": []
+        }
+      }
+    }
+  }
+}

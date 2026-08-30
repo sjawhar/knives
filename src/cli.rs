@@ -211,6 +211,12 @@ pub enum Command {
         /// Forget the workspace but leave its directory on disk.
         #[arg(long)]
         no_cleanup: bool,
+        /// Proceed even when the branch's pull request is open, or when its state
+        /// could not be checked. The default refuses both: handing back a branch
+        /// whose pull request is still open is how an open submission's head got
+        /// deleted on the forge.
+        #[arg(long)]
+        allow_open: bool,
         /// Record that this branch was superseded by another.
         #[arg(long)]
         superseded_by: Option<String>,
@@ -389,6 +395,19 @@ pub enum ReleaseAction {
         /// Requires exactly one branch; bypasses the ancestry search.
         #[arg(long)]
         from: Option<String>,
+    },
+    /// Whether a revision's content is actually carried by a release, by replay.
+    ///
+    /// The rigorous answer to "is this fix in the release": duplicate the
+    /// revision's commits onto the target and look at what remains. Empty means
+    /// carried; a real diff means not carried; grep answers a different question.
+    Carries {
+        /// A branch name, or any revision when no bookmark fits.
+        revision: String,
+        /// The release ref to check against. Defaults to the release in hand;
+        /// any revset works: a remote release, a pin, a commit id.
+        #[arg(long = "in")]
+        target: Option<String>,
     },
     /// Reap superseded dated cuts: forget their bookmarks everywhere, abandon their commits.
     /// The remote is never touched.
