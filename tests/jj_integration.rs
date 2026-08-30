@@ -171,8 +171,8 @@ fn a_measured_gather_reports_the_same_report_and_a_total_that_covers_its_phases(
 
     // Then: the report is the same one, and the total covers the phases it timed
     assert_eq!(
-        status::render(&plain, true),
-        status::render(&measured, true),
+        status::render::render(&plain, true),
+        status::render::render(&measured, true),
         "measuring changed the report"
     );
     assert!(
@@ -517,7 +517,7 @@ fn stated_pulls_and_dependencies_are_answered_from_the_one_batch() {
     );
     assert!(report.problems.is_empty(), "was: {report:?}");
     assert!(
-        status::render(&report, true).contains("#42 closed (stated)"),
+        status::render::render(&report, true).contains("#42 closed (stated)"),
         "the stated batch answer did not render: {report:?}"
     );
 }
@@ -676,7 +676,7 @@ fn relation_to_origin(lab: &lab::Lab) -> Result<Option<OriginRelation>, knives::
         .resolve_commit("feat/alpha@origin")
         .expect("origin tip");
 
-    status::relation_to_origin(&repo, &tip, Some(&origin_tip))
+    status::phases::relation_to_origin(&repo, &tip, Some(&origin_tip))
 }
 
 /// Registry home + consumer for release-cut tests: one repo named `demo`,
@@ -1437,7 +1437,7 @@ fn an_unresolvable_origin_tip_returns_an_error() {
     let unresolved = CommitId::new("1111111111111111111111111111111111111111");
 
     // When: the resolver compares local history to that absent origin tip.
-    let error = status::relation_to_origin(&repo, &tip, Some(&unresolved))
+    let error = status::phases::relation_to_origin(&repo, &tip, Some(&unresolved))
         .expect_err("an unresolved origin tip must not become a relation");
 
     // Then: the caller receives an error to report rather than a history verdict.
@@ -4381,8 +4381,8 @@ fn parallel_landed_probes_answer_exactly_what_serial_ones_did() {
 
     // Then: not one token differs, including the landed column
     assert_eq!(
-        status::render(&serial, true),
-        status::render(&parallel, true),
+        status::render::render(&serial, true),
+        status::render::render(&parallel, true),
         "parallelism changed the report"
     );
     assert_eq!(status::exit_for(&serial), status::exit_for(&parallel));
@@ -4860,7 +4860,7 @@ fn status_carries_each_branchs_newest_notch_in_json_and_in_text() {
     );
 
     // And: the branch line carries one token for it
-    let text = status::render(&report, false);
+    let text = status::render::render(&report, false);
     assert!(
         text.contains("\"claim released; superseded by fe…\""),
         "was: {text}"
@@ -4917,7 +4917,7 @@ fn status_carries_repo_level_notches_in_json_and_text() {
         json["repo_notches"]["last"]["text"],
         "release remote needs a refresh"
     );
-    let text = status::render(&report, false);
+    let text = status::render::render(&report, false);
     assert!(
         text.contains("notches  1 repo-level, newest: \"release remote needs a refresh\""),
         "was: {text}"

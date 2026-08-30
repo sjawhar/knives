@@ -2082,7 +2082,7 @@ fn run_status(requested: Option<&str>, view: StatusView) -> anyhow::Result<Exit>
                 println!();
             }
             first = false;
-            println!("{}", status::render(&report, verbose));
+            println!("{}", status::render::render(&report, verbose));
         }
         // stderr, so a timed run's stdout is still the report a script parses.
         if knives::timing::enabled() {
