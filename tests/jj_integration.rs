@@ -5,8 +5,14 @@
     reason = "a fixture or assertion that cannot proceed IS the test failure"
 )]
 
+#[path = "common/forge_shim.rs"]
+mod forge_shim;
 #[path = "common/lab.rs"]
 mod lab;
+#[path = "common/pulls.rs"]
+mod pulls;
+
+use forge_shim::{install_failing_gh, install_snapshot_gh, path_with_gh_shim, pull_record};
 
 use knives::commands::{
     repos,
@@ -59,25 +65,14 @@ fn one_batch_answers_review_age_and_checks_for_every_branch_at_once() {
                 .insert(
                     BranchName::new(branch),
                     PullRequest {
-                        number,
-                        state: state.to_owned(),
                         review_decision: decision.to_owned(),
-                        head_ref_name: branch.to_owned(),
-                        head_ref_oid: "0123456789abcdef0123456789abcdef01234567".to_owned(),
-                        updated_at: "2026-01-01T00:00:00Z".to_owned(),
-                        is_draft: false,
-                        url: String::new(),
-                        head_repository_owner: None,
-                        mergeable: String::new(),
-                        merge_state_status: String::new(),
-                        base_ref_name: "main".to_owned(),
-                        merge_commit: None,
+                        ..pulls::pull_request(number, state, branch)
                     },
                 )
                 .is_none()
         );
     }
-    let forge = knives::forge::FakeForge {
+    let forge = knives::forge::fake::FakeForge {
         pull_requests,
         stale_reviews: vec![11],
         checks: BTreeMap::from([
@@ -95,7 +90,7 @@ fn one_batch_answers_review_age_and_checks_for_every_branch_at_once() {
             // "consulted" is expressed and omitting it is how "not consulted" is.
             (12, ChecksSummary::default()),
         ]),
-        ..knives::forge::FakeForge::default()
+        ..knives::forge::fake::FakeForge::default()
     };
     let state = tempfile::tempdir().expect("state directory");
     let store = Store::open(state.path().join("state.json")).expect("open store");
@@ -171,8 +166,8 @@ fn a_measured_gather_reports_the_same_report_and_a_total_that_covers_its_phases(
 
     // Then: the report is the same one, and the total covers the phases it timed
     assert_eq!(
-        status::render(&plain, true),
-        status::render(&measured, true),
+        status::render::render(&plain, true),
+        status::render::render(&measured, true),
         "measuring changed the report"
     );
     assert!(
@@ -291,19 +286,8 @@ fn the_forge_is_asked_once_for_the_whole_report_with_one_entry_per_number() {
                 .insert(
                     BranchName::new(branch),
                     PullRequest {
-                        number,
-                        state: state.to_owned(),
                         review_decision: decision.to_owned(),
-                        head_ref_name: branch.to_owned(),
-                        head_ref_oid: "0123456789abcdef0123456789abcdef01234567".to_owned(),
-                        updated_at: "2026-01-01T00:00:00Z".to_owned(),
-                        is_draft: false,
-                        url: String::new(),
-                        head_repository_owner: None,
-                        mergeable: String::new(),
-                        merge_state_status: String::new(),
-                        base_ref_name: "main".to_owned(),
-                        merge_commit: None,
+                        ..pulls::pull_request(number, state, branch)
                     },
                 )
                 .is_none()
@@ -362,7 +346,7 @@ fn a_failed_facts_batch_clears_review_and_check_cells() {
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     let mut pull = sync_pull_request(11, "OPEN", "feat/alpha", "head-11");
     pull.review_decision = "APPROVED".to_owned();
-    let forge = knives::forge::FakeForge {
+    let forge = knives::forge::fake::FakeForge {
         pull_requests: BTreeMap::from([(BranchName::new("feat/alpha"), pull)]),
         stale_reviews: vec![11],
         checks: BTreeMap::from([(
@@ -375,7 +359,7 @@ fn a_failed_facts_batch_clears_review_and_check_cells() {
             },
         )]),
         fail_facts: true,
-        ..knives::forge::FakeForge::default()
+        ..knives::forge::fake::FakeForge::default()
     };
     let state = tempfile::tempdir().expect("state directory");
     let store = Store::open(state.path().join("state.json")).expect("open store");
@@ -416,13 +400,13 @@ fn a_consulted_false_report_carries_zero_pull_facts() {
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     let name = knives::ids::RepoName::new("demo");
     let target = knives::ids::BranchTarget::new(name.clone(), BranchName::new("feat/alpha"));
-    let forge = knives::forge::FakeForge {
+    let forge = knives::forge::fake::FakeForge {
         pull_requests: BTreeMap::from([(
             BranchName::new("feat/alpha"),
             sync_pull_request(11, "OPEN", "feat/alpha", "head-11"),
         )]),
         fail_facts: true,
-        ..knives::forge::FakeForge::default()
+        ..knives::forge::fake::FakeForge::default()
     };
     let state = tempfile::tempdir().expect("state directory");
     let mut store = Store::open_for_update(state.path().join("state.json")).expect("open store");
@@ -465,13 +449,13 @@ fn stated_pulls_and_dependencies_are_answered_from_the_one_batch() {
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     let name = knives::ids::RepoName::new("demo");
     let target = knives::ids::BranchTarget::new(name.clone(), BranchName::new("feat/alpha"));
-    let forge = knives::forge::FakeForge {
+    let forge = knives::forge::fake::FakeForge {
         pull_requests: BTreeMap::from([(
             BranchName::new("feat/alpha"),
             sync_pull_request(11, "OPEN", "feat/alpha", "head-11"),
         )]),
         vanished_states: BTreeMap::from([(42, "CLOSED".to_owned()), (43, "MERGED".to_owned())]),
-        ..knives::forge::FakeForge::default()
+        ..knives::forge::fake::FakeForge::default()
     };
     let state = tempfile::tempdir().expect("state directory");
     let mut store = Store::open_for_update(state.path().join("state.json")).expect("open store");
@@ -517,7 +501,7 @@ fn stated_pulls_and_dependencies_are_answered_from_the_one_batch() {
     );
     assert!(report.problems.is_empty(), "was: {report:?}");
     assert!(
-        status::render(&report, true).contains("#42 closed (stated)"),
+        status::render::render(&report, true).contains("#42 closed (stated)"),
         "the stated batch answer did not render: {report:?}"
     );
 }
@@ -528,7 +512,7 @@ fn landed_verdicts_come_from_the_cache_when_the_key_matches() {
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     let name = knives::ids::RepoName::new("demo");
     let entry = lab_entry(&lab);
-    let forge = knives::forge::FakeForge::default();
+    let forge = knives::forge::fake::FakeForge::default();
     let state = tempfile::tempdir().expect("state directory");
     let cache = tempfile::tempdir().expect("cache directory");
     let store = Store::open(state.path().join("state.json")).expect("open store");
@@ -584,7 +568,7 @@ fn a_probe_free_run_preserves_the_landed_section() {
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     let name = knives::ids::RepoName::new("demo");
     let entry = lab_entry(&lab);
-    let forge = knives::forge::FakeForge::default();
+    let forge = knives::forge::fake::FakeForge::default();
     let state = tempfile::tempdir().expect("state directory");
     let cache = tempfile::tempdir().expect("cache directory");
     let store = Store::open(state.path().join("state.json")).expect("open store");
@@ -632,7 +616,7 @@ fn an_unresolvable_trunk_fails_loudly_and_touches_no_landed_cache() {
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     let name = knives::ids::RepoName::new("demo");
     let entry = lab_entry(&lab);
-    let forge = knives::forge::FakeForge::default();
+    let forge = knives::forge::fake::FakeForge::default();
     let state = tempfile::tempdir().expect("state directory");
     let cache = tempfile::tempdir().expect("cache directory");
     let store = Store::open(state.path().join("state.json")).expect("open store");
@@ -676,7 +660,7 @@ fn relation_to_origin(lab: &lab::Lab) -> Result<Option<OriginRelation>, knives::
         .resolve_commit("feat/alpha@origin")
         .expect("origin tip");
 
-    status::relation_to_origin(&repo, &tip, Some(&origin_tip))
+    status::phases::relation_to_origin(&repo, &tip, Some(&origin_tip))
 }
 
 /// Registry home + consumer for release-cut tests: one repo named `demo`,
@@ -716,19 +700,9 @@ fn sync_entry(lab: &lab::Lab) -> RepoEntry {
 
 fn sync_pull_request(number: u64, state: &str, branch: &str, head: &str) -> PullRequest {
     PullRequest {
-        number,
-        state: state.to_owned(),
-        review_decision: String::new(),
-        head_ref_name: branch.to_owned(),
         head_ref_oid: head.to_owned(),
         updated_at: "2026-08-15T00:00:00Z".to_owned(),
-        is_draft: false,
-        url: String::new(),
-        head_repository_owner: None,
-        mergeable: String::new(),
-        merge_state_status: String::new(),
-        base_ref_name: "main".to_owned(),
-        merge_commit: None,
+        ..pulls::pull_request(number, state, branch)
     }
 }
 
@@ -1437,7 +1411,7 @@ fn an_unresolvable_origin_tip_returns_an_error() {
     let unresolved = CommitId::new("1111111111111111111111111111111111111111");
 
     // When: the resolver compares local history to that absent origin tip.
-    let error = status::relation_to_origin(&repo, &tip, Some(&unresolved))
+    let error = status::phases::relation_to_origin(&repo, &tip, Some(&unresolved))
         .expect_err("an unresolved origin tip must not become a relation");
 
     // Then: the caller receives an error to report rather than a history verdict.
@@ -2081,13 +2055,13 @@ fn sync_fails_closed_when_the_facts_batch_fails() {
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     let name = knives::ids::RepoName::new("demo");
     let entry = sync_entry(&lab);
-    let forge = knives::forge::FakeForge {
+    let forge = knives::forge::fake::FakeForge {
         pull_requests: BTreeMap::from([(
             BranchName::new("feat/alpha"),
             sync_pull_request(42, "OPEN", "feat/alpha", "head-42"),
         )]),
         fail_facts: true,
-        ..knives::forge::FakeForge::default()
+        ..knives::forge::fake::FakeForge::default()
     };
     let state = tempfile::tempdir().expect("state directory");
     let mut store = Store::open_for_update(state.path().join("state.json")).expect("store");
@@ -2126,13 +2100,13 @@ fn a_listed_state_wins_and_a_vanished_number_is_answered_by_the_batch() {
     lab.publish_pull("feat/alpha", 43);
     let name = knives::ids::RepoName::new("demo");
     let entry = sync_entry(&lab);
-    let forge = knives::forge::FakeForge {
+    let forge = knives::forge::fake::FakeForge {
         pull_requests: BTreeMap::from([(
             BranchName::new("feat/alpha"),
             sync_pull_request(42, "OPEN", "feat/alpha", "head-42"),
         )]),
         vanished_states: BTreeMap::from([(42, "MERGED".to_owned()), (43, "MERGED".to_owned())]),
-        ..knives::forge::FakeForge::default()
+        ..knives::forge::fake::FakeForge::default()
     };
     let state = tempfile::tempdir().expect("state directory");
     let mut store = Store::open_for_update(state.path().join("state.json")).expect("store");
@@ -2200,25 +2174,15 @@ fn sync_records_one_event_for_each_pull_request_that_moved() {
         let _ = pull_requests.insert(
             BranchName::new(branch),
             PullRequest {
-                number,
-                state: state.to_owned(),
-                review_decision: String::new(),
-                head_ref_name: branch.to_owned(),
                 head_ref_oid: format!("head-{number}"),
                 updated_at: "2026-08-15T00:00:00Z".to_owned(),
-                is_draft: false,
-                url: String::new(),
-                head_repository_owner: None,
-                mergeable: String::new(),
-                merge_state_status: String::new(),
-                base_ref_name: "main".to_owned(),
-                merge_commit: None,
+                ..pulls::pull_request(number, state, branch)
             },
         );
     }
-    let forge = knives::forge::FakeForge {
+    let forge = knives::forge::fake::FakeForge {
         pull_requests,
-        ..knives::forge::FakeForge::default()
+        ..knives::forge::fake::FakeForge::default()
     };
     let state = tempfile::tempdir().expect("state directory");
     let mut store = Store::open_for_update(state.path().join("state.json")).expect("open store");
@@ -2274,12 +2238,12 @@ fn sync_records_a_settled_pull_request_once_across_repeated_runs() {
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     let name = knives::ids::RepoName::new("demo");
     let entry = sync_entry(&lab);
-    let forge = knives::forge::FakeForge {
+    let forge = knives::forge::fake::FakeForge {
         pull_requests: BTreeMap::from([(
             BranchName::new("feat/alpha"),
             sync_pull_request(10, "MERGED", "feat/alpha", "head-10"),
         )]),
-        ..knives::forge::FakeForge::default()
+        ..knives::forge::fake::FakeForge::default()
     };
     let state = tempfile::tempdir().expect("state directory");
     let mut store = Store::open_for_update(state.path().join("state.json")).expect("open store");
@@ -2324,19 +2288,19 @@ fn sync_records_an_advanced_pull_request_then_its_merge() {
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     let name = knives::ids::RepoName::new("demo");
     let entry = sync_entry(&lab);
-    let advanced = knives::forge::FakeForge {
+    let advanced = knives::forge::fake::FakeForge {
         pull_requests: BTreeMap::from([(
             BranchName::new("feat/alpha"),
             sync_pull_request(12, "OPEN", "feat/alpha", "head-12"),
         )]),
-        ..knives::forge::FakeForge::default()
+        ..knives::forge::fake::FakeForge::default()
     };
-    let merged = knives::forge::FakeForge {
+    let merged = knives::forge::fake::FakeForge {
         pull_requests: BTreeMap::from([(
             BranchName::new("feat/alpha"),
             sync_pull_request(12, "MERGED", "feat/alpha", "head-12"),
         )]),
-        ..knives::forge::FakeForge::default()
+        ..knives::forge::fake::FakeForge::default()
     };
     let state = tempfile::tempdir().expect("state directory");
     let mut store = Store::open_for_update(state.path().join("state.json")).expect("open store");
@@ -2382,19 +2346,19 @@ fn sync_records_each_consecutive_advance() {
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     let name = knives::ids::RepoName::new("demo");
     let entry = sync_entry(&lab);
-    let first_advance = knives::forge::FakeForge {
+    let first_advance = knives::forge::fake::FakeForge {
         pull_requests: BTreeMap::from([(
             BranchName::new("feat/alpha"),
             sync_pull_request(12, "OPEN", "feat/alpha", "head-b"),
         )]),
-        ..knives::forge::FakeForge::default()
+        ..knives::forge::fake::FakeForge::default()
     };
-    let second_advance = knives::forge::FakeForge {
+    let second_advance = knives::forge::fake::FakeForge {
         pull_requests: BTreeMap::from([(
             BranchName::new("feat/alpha"),
             sync_pull_request(12, "OPEN", "feat/alpha", "head-c"),
         )]),
-        ..knives::forge::FakeForge::default()
+        ..knives::forge::fake::FakeForge::default()
     };
     let state = tempfile::tempdir().expect("state directory");
     let mut store = Store::open_for_update(state.path().join("state.json")).expect("open store");
@@ -3551,15 +3515,6 @@ fn knives_finish(lab: &lab::Lab, home: &tempfile::TempDir, args: &[&str]) -> std
         .expect("run finish")
 }
 
-fn path_with_gh_shim(shim: &std::path::Path) -> std::ffi::OsString {
-    std::env::join_paths(
-        std::iter::once(shim.to_owned()).chain(std::env::split_paths(
-            &std::env::var_os("PATH").expect("PATH is set"),
-        )),
-    )
-    .expect("construct shim PATH")
-}
-
 #[derive(Clone, Copy)]
 struct FinishWithSnapshotForgeInput<'a> {
     lab: &'a Lab,
@@ -3604,20 +3559,7 @@ fn knives_finish_with_failing_forge(
     log: &std::path::Path,
 ) -> std::process::Output {
     let shim = tempfile::tempdir().expect("create failing forge shim directory");
-    let gh = shim.path().join("gh");
-    std::fs::write(
-        &gh,
-        format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\nexit 1\n",
-            log.display()
-        ),
-    )
-    .expect("write failing gh shim");
-    let mut permissions = std::fs::metadata(&gh)
-        .expect("read gh shim permissions")
-        .permissions();
-    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
-    std::fs::set_permissions(&gh, permissions).expect("make gh shim executable");
+    install_failing_gh(shim.path(), log);
     let mut command = Command::new(env!("CARGO_BIN_EXE_knives"));
     command.args(["--text", "finish"]);
     command.args(args);
@@ -4046,9 +3988,9 @@ fn preflight_renders_a_mixed_base_finding_and_exits_with_findings() {
     };
     let state = tempfile::tempdir().expect("create state directory");
     let mut store = Store::open_for_update(state.path().join("state.json")).expect("open store");
-    let forge = knives::forge::FakeForge {
+    let forge = knives::forge::fake::FakeForge {
         fail_facts: true,
-        ..knives::forge::FakeForge::default()
+        ..knives::forge::fake::FakeForge::default()
     };
 
     // When: preflight gathers and renders the repository state.
@@ -4381,8 +4323,8 @@ fn parallel_landed_probes_answer_exactly_what_serial_ones_did() {
 
     // Then: not one token differs, including the landed column
     assert_eq!(
-        status::render(&serial, true),
-        status::render(&parallel, true),
+        status::render::render(&serial, true),
+        status::render::render(&parallel, true),
         "parallelism changed the report"
     );
     assert_eq!(status::exit_for(&serial), status::exit_for(&parallel));
@@ -4663,27 +4605,13 @@ fn status_reports_a_carrier_for_a_closed_pull_request() {
     let name = knives::ids::RepoName::new("a-repo");
     let temp = std::env::temp_dir().join(format!("knives-status-{}", std::process::id()));
     let store = knives::store::Store::open(temp.join("state.json")).expect("store");
-    let forge = knives::forge::FakeForge {
+    let forge = knives::forge::fake::FakeForge {
         pull_requests: std::iter::once((
             BranchName::new("feat/alpha"),
-            knives::forge::PullRequest {
-                number: 7,
-                state: "CLOSED".to_owned(),
-                review_decision: String::new(),
-                head_ref_name: "feat/alpha".to_owned(),
-                head_ref_oid: "0123456789abcdef0123456789abcdef01234567".to_owned(),
-                updated_at: "2026-01-01T00:00:00Z".to_owned(),
-                is_draft: false,
-                url: String::new(),
-                head_repository_owner: None,
-                mergeable: String::new(),
-                merge_state_status: String::new(),
-                base_ref_name: "main".to_owned(),
-                merge_commit: None,
-            },
+            pulls::pull_request(7, "CLOSED", "feat/alpha"),
         ))
         .collect(),
-        ..knives::forge::FakeForge::default()
+        ..knives::forge::fake::FakeForge::default()
     };
 
     // When: status gathers the branch report with the closed pull request
@@ -4860,7 +4788,7 @@ fn status_carries_each_branchs_newest_notch_in_json_and_in_text() {
     );
 
     // And: the branch line carries one token for it
-    let text = status::render(&report, false);
+    let text = status::render::render(&report, false);
     assert!(
         text.contains("\"claim released; superseded by fe…\""),
         "was: {text}"
@@ -4917,7 +4845,7 @@ fn status_carries_repo_level_notches_in_json_and_text() {
         json["repo_notches"]["last"]["text"],
         "release remote needs a refresh"
     );
-    let text = status::render(&report, false);
+    let text = status::render::render(&report, false);
     assert!(
         text.contains("notches  1 repo-level, newest: \"release remote needs a refresh\""),
         "was: {text}"
@@ -5384,106 +5312,6 @@ fn a_rebase_moves_the_whole_composition_onto_the_target() {
     );
 }
 
-/// Install a fake `gh` that answers the full snapshot protocol: repository
-/// identity, cold list, warm sweep, and by-number facts.
-fn install_snapshot_gh(
-    shim: &std::path::Path,
-    pulls: &str,
-    withheld_facts: &[u64],
-    log: Option<&std::path::Path>,
-) {
-    let pulls: Vec<serde_json::Value> =
-        serde_json::from_str(pulls).expect("parse fake pull request payload");
-    let sweep_entries = pulls
-        .iter()
-        .map(|pull| {
-            serde_json::json!({
-                "number": pull.get("number"),
-                "updatedAt": pull.get("updatedAt"),
-                "state": pull.get("state"),
-            })
-        })
-        .collect::<Vec<_>>();
-    let mut fact_rows = serde_json::Map::new();
-    for pull in &pulls {
-        let number = pull["number"].as_u64().expect("pull request number");
-        if !withheld_facts.contains(&number) {
-            let _ = fact_rows.insert(format!("p{number}"), pull.clone());
-        }
-    }
-    let identity = shim.join("identity.json");
-    let list = shim.join("pulls.json");
-    let sweep = shim.join("sweep.json");
-    let facts_payload = shim.join("facts.json");
-    std::fs::write(
-        &identity,
-        serde_json::to_vec(&serde_json::json!({
-            "nameWithOwner": "fake-owner/fake-repo",
-            "id": "FAKEID",
-        }))
-        .expect("serialize identity payload"),
-    )
-    .expect("write identity payload");
-    std::fs::write(
-        &list,
-        serde_json::to_vec(&pulls).expect("serialize list payload"),
-    )
-    .expect("write pull request payload");
-    std::fs::write(
-        &sweep,
-        serde_json::to_vec(&serde_json::json!({
-            "data": {
-                "repository": {
-                    "pullRequests": {
-                        "pageInfo": {"hasNextPage": false},
-                        "nodes": sweep_entries,
-                    }
-                }
-            }
-        }))
-        .expect("serialize sweep payload"),
-    )
-    .expect("write sweep payload");
-    std::fs::write(
-        &facts_payload,
-        serde_json::to_vec(&serde_json::json!({
-            "data": {"repository": fact_rows},
-        }))
-        .expect("serialize facts payload"),
-    )
-    .expect("write facts payload");
-    let log_line = log.map_or_else(String::new, |log| {
-        format!("printf '%s\\n' \"$*\" >> \"{}\"\n", log.display())
-    });
-    let gh = shim.join("gh");
-    std::fs::write(
-        &gh,
-        format!(
-            "#!/bin/sh\n{log_line}case \" $* \" in\n\
-             *\" repo view \"*) cat \"{}\" ;;\n\
-             *\" pr list \"*) cat \"{}\" ;;\n\
-             *\" api graphql \"*)\n\
-               case \"$*\" in\n\
-                 *\"pullRequest(number:\"*) cat \"{}\" ;;\n\
-                 *\"orderBy: {{field: UPDATED_AT\"*) cat \"{}\" ;;\n\
-                 *) echo \"unexpected GraphQL invocation: $*\" >&2; exit 1 ;;\n\
-               esac ;;\n\
-             *) echo \"unexpected gh invocation: $*\" >&2; exit 1 ;;\n\
-             esac\n",
-            identity.display(),
-            list.display(),
-            facts_payload.display(),
-            sweep.display(),
-        ),
-    )
-    .expect("write gh shim");
-    let mut permissions = std::fs::metadata(&gh)
-        .expect("read gh shim permissions")
-        .permissions();
-    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
-    std::fs::set_permissions(&gh, permissions).expect("make gh shim executable");
-}
-
 /// Run the knives binary's release command against the complete snapshot forge
 /// protocol, with an isolated cache root.
 fn knives_release_with_forge(
@@ -5532,18 +5360,6 @@ fn knives_release_with_forge_withheld_facts(
         .env("PATH", path_with_gh_shim(shim.path()))
         .output()
         .expect("run knives release with a forge shim")
-}
-
-/// One forge pull request record with the fields the binary requires.
-fn pull_record(number: u64, state: &str, branch: &str, merge_oid: Option<&str>) -> String {
-    let merge = merge_oid.map_or_else(String::new, |oid| {
-        format!(",\"mergeCommit\":{{\"oid\":\"{oid}\"}}")
-    });
-    format!(
-        "{{\"number\":{number},\"state\":\"{state}\",\"headRefName\":\"{branch}\",\
-         \"headRefOid\":\"0123456789abcdef0123456789abcdef01234567\",\
-         \"updatedAt\":\"2026-08-07T00:00:00Z\",\"baseRefName\":\"main\"{merge}}}"
-    )
 }
 
 #[test]

@@ -15,7 +15,8 @@ use knives::commands::{
 };
 use knives::config::{default_config_path, load};
 use knives::detect::RebaseOutcome;
-use knives::forge::{CliForge, Forge, PullRequest};
+use knives::forge::github::CliForge;
+use knives::forge::{Forge, PullRequest};
 use knives::ids::{BranchName, BranchTarget, ReleaseScheme, RepoName, Requirement};
 use knives::ledger::{Draft, Kind, Ledger, Scribe};
 use knives::store::{Store, default_state_path};
@@ -571,6 +572,13 @@ fn rebase_target(input: RebaseTargetInput<'_>) -> anyhow::Result<Option<RebaseDe
     merged_rebase_target(repo, entry, opened, cache_root)
 }
 
+fn select_merged_numbers(discovery: &knives::snapshot::Discovery<'_>, trunk: &str) -> Vec<u64> {
+    knives::forge::merged_onto(&discovery.ours(), trunk)
+        .iter()
+        .map(|pull| pull.number)
+        .collect()
+}
+
 /// The bare-rebase default target, or `None` with its reason already printed.
 ///
 /// Rebasing to this point makes every merged branch's work part of the members'
@@ -603,21 +611,7 @@ fn merged_rebase_target(
             return Ok(None);
         }
     };
-    let discovery = match opened_snapshot.discover() {
-        Ok(discovery) => discovery,
-        Err(error) => {
-            eprintln!(
-                "{repo}: could not ask the forge which pull requests merged: {error}; \
-                 provide a commit to rebase onto"
-            );
-            return Ok(None);
-        }
-    };
-    let numbers: Vec<u64> = knives::forge::merged_onto(&discovery.ours(), entry.trunk())
-        .iter()
-        .map(|pull| pull.number)
-        .collect();
-    let snapshot = match discovery.complete(&numbers) {
+    let snapshot = match opened_snapshot.complete_with(entry.trunk(), select_merged_numbers) {
         Ok(snapshot) => snapshot,
         Err(error) => {
             eprintln!(
@@ -627,7 +621,7 @@ fn merged_rebase_target(
             return Ok(None);
         }
     };
-    let candidates = knives::forge::merged_onto(&snapshot.ours(), entry.trunk());
+    let candidates = knives::forge::merged_onto(snapshot.ours(), entry.trunk());
     let result: anyhow::Result<Option<RebaseDestination>> = (|| {
         let Some(landed) = verified_merged_candidates(repo, &snapshot, &candidates, entry.trunk())
         else {
@@ -670,15 +664,15 @@ fn merged_rebase_target(
             landed,
         }))
     })();
-    if let Err(error) = snapshot.persist(None) {
-        eprintln!("{repo}: could not update forge cache: {error}");
+    if let Err(note) = snapshot.persist(None) {
+        eprintln!("{repo}: {note}");
     }
     result
 }
 
 fn verified_merged_candidates(
     repo: &RepoName,
-    snapshot: &knives::snapshot::ForgeSnapshot<'_>,
+    snapshot: &knives::snapshot::CompletedSnapshot<'_>,
     candidates: &[knives::forge::PullSummary],
     trunk: &str,
 ) -> Option<Vec<knives::forge::PullRequest>> {
@@ -1646,6 +1640,29 @@ fn release_event(had: bool, superseded_by: Option<&str>) -> Option<String> {
     }
 }
 
+/// The finish guard's explicit selection context.
+///
+/// It holds only input available before discovery; `CompletedSnapshot::requested`
+/// carries the deduped selected numbers into the post-batch missing-fact check.
+struct FinishSelection<'a> {
+    stated: Option<u64>,
+    branch: &'a BranchName,
+}
+
+fn select_finish_numbers(
+    discovery: &knives::snapshot::Discovery<'_>,
+    selection: &FinishSelection<'_>,
+) -> Vec<u64> {
+    let discovery_primary = knives::forge::index_pulls(&discovery.ours())
+        .by_branch
+        .get(selection.branch)
+        .map(|pull| pull.number);
+    [selection.stated, discovery_primary]
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
 /// The open pull request a branch still owns, if the forge proves it has one.
 ///
 /// A stated number is authoritative when it is open; otherwise the branch's
@@ -1668,26 +1685,23 @@ fn open_pull_for(
         remotes,
         cache_root,
     })?;
-    let discovery = opened.discover()?;
     let stated = store.tracked_pull(target);
-    let discovery_primary = knives::forge::index_pulls(&discovery.ours())
-        .by_branch
-        .get(&target.branch)
-        .map(|pull| pull.number);
-    let mut surfaced = std::collections::BTreeSet::new();
-    for number in [stated, discovery_primary].into_iter().flatten() {
-        let _ = surfaced.insert(number);
-    }
-    let numbers: Vec<u64> = surfaced.iter().copied().collect();
-    let snapshot = discovery.complete(&numbers)?;
-    let primary = knives::forge::index_pulls(&snapshot.ours())
+    let selection = FinishSelection {
+        stated,
+        branch: &target.branch,
+    };
+    let snapshot = opened.complete_with(&selection, select_finish_numbers)?;
+    let mut requested: std::collections::BTreeSet<u64> =
+        snapshot.requested().iter().copied().collect();
+    let primary = snapshot
+        .index()
         .by_branch
         .get(&target.branch)
         .map(|pull| pull.number);
     if let Some(number) = primary {
-        let _ = surfaced.insert(number);
+        let _ = requested.insert(number);
     }
-    let unanswered: Vec<u64> = surfaced
+    let unanswered: Vec<u64> = requested
         .iter()
         .copied()
         .filter(|number| snapshot.fact(*number).is_none())
@@ -2081,7 +2095,7 @@ fn run_status(requested: Option<&str>, view: StatusView) -> anyhow::Result<Exit>
                 println!();
             }
             first = false;
-            println!("{}", status::render(&report, verbose));
+            println!("{}", status::render::render(&report, verbose));
         }
         // stderr, so a timed run's stdout is still the report a script parses.
         if knives::timing::enabled() {

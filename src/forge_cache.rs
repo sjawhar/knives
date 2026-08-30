@@ -210,16 +210,9 @@ mod tests {
     fn summary(number: u64, updated_at: &str) -> PullSummary {
         PullSummary {
             number,
-            state: "OPEN".to_owned(),
-            review_decision: String::new(),
             head_ref_name: format!("branch-at-{updated_at}"),
-            head_ref_oid: format!("oid-at-{updated_at}"),
             updated_at: updated_at.to_owned(),
-            is_draft: false,
-            url: String::new(),
-            head_repository_owner: None,
-            base_ref_name: "main".to_owned(),
-            merge_commit: None,
+            ..PullSummary::default()
         }
     }
 

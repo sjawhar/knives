@@ -186,6 +186,10 @@ impl fmt::Debug for GatherInput<'_> {
             .finish()
     }
 }
+const fn select_none<T>(_: &snapshot::Discovery<'_>, _: &T) -> Vec<u64> {
+    Vec::new()
+}
+
 pub fn gather(input: GatherInput<'_>) -> Report {
     let GatherInput {
         name,
@@ -236,17 +240,14 @@ pub fn gather(input: GatherInput<'_>) -> Report {
         ],
         cache_root: cache,
     }) {
-        Ok(opened) => match opened
-            .discover()
-            .and_then(|discovery| discovery.complete(&[]))
-        {
+        Ok(opened) => match opened.complete_with(&(), select_none) {
             // The cap counts every open pull request on a local branch. Unlike
             // the snapshot's ours() helper, this deliberately does not filter
             // by head repository owner: that would silently shrink today's
             // count.
             Ok(snapshot) => {
-                if let Err(error) = snapshot.persist(None) {
-                    report.notes.push(format!("forge cache not saved: {error}"));
+                if let Err(note) = snapshot.persist(None) {
+                    report.notes.push(note.to_string());
                 }
                 match Repo::open(&entry.path).and_then(|repo| repo.bookmark_tips()) {
                     Ok(tips) => {
@@ -455,6 +456,10 @@ mod tests {
     )]
     use super::*;
 
+    fn select_numbers(_: &snapshot::Discovery<'_>, numbers: &[u64]) -> Vec<u64> {
+        numbers.to_vec()
+    }
+
     #[test]
     fn only_open_pulls_on_our_branches_count_toward_a_cap() {
         // Given: our branches with both an open and a merged pull request, plus an
@@ -463,41 +468,20 @@ mod tests {
             crate::forge::PullSummary {
                 number: 1,
                 state: "OPEN".to_owned(),
-                review_decision: String::new(),
                 head_ref_name: "feat/open".to_owned(),
-                head_ref_oid: "aa".to_owned(),
-                updated_at: "2026-08-01T00:00:00Z".to_owned(),
-                is_draft: false,
-                url: String::new(),
-                head_repository_owner: None,
-                base_ref_name: "main".to_owned(),
-                merge_commit: None,
+                ..crate::forge::PullSummary::default()
             },
             crate::forge::PullSummary {
                 number: 2,
                 state: "MERGED".to_owned(),
-                review_decision: String::new(),
                 head_ref_name: "feat/merged".to_owned(),
-                head_ref_oid: "bb".to_owned(),
-                updated_at: "2026-08-01T00:00:00Z".to_owned(),
-                is_draft: false,
-                url: String::new(),
-                head_repository_owner: None,
-                base_ref_name: "main".to_owned(),
-                merge_commit: None,
+                ..crate::forge::PullSummary::default()
             },
             crate::forge::PullSummary {
                 number: 3,
                 state: "OPEN".to_owned(),
-                review_decision: String::new(),
                 head_ref_name: "outside/open".to_owned(),
-                head_ref_oid: "cc".to_owned(),
-                updated_at: "2026-08-01T00:00:00Z".to_owned(),
-                is_draft: false,
-                url: String::new(),
-                head_repository_owner: None,
-                base_ref_name: "main".to_owned(),
-                merge_commit: None,
+                ..crate::forge::PullSummary::default()
             },
         ];
         let ours = BTreeSet::from(["feat/open".to_owned(), "feat/merged".to_owned()]);
@@ -515,7 +499,7 @@ mod tests {
         let cache = tempfile::tempdir().expect("cache directory");
         std::fs::write(cache.path().join("forge"), "not a directory")
             .expect("block the cache parent");
-        let forge = crate::forge::FakeForge {
+        let forge = crate::forge::fake::FakeForge {
             pull_requests: std::collections::BTreeMap::from([(
                 crate::ids::BranchName::new("feat/alpha"),
                 crate::forge::PullRequest {
@@ -524,7 +508,7 @@ mod tests {
                     ..crate::forge::PullRequest::default()
                 },
             )]),
-            ..crate::forge::FakeForge::default()
+            ..crate::forge::fake::FakeForge::default()
         };
         let opened = snapshot::open(SnapshotConfig {
             forge: &forge,
@@ -534,14 +518,12 @@ mod tests {
         })
         .expect("open snapshot");
         let snapshot = opened
-            .discover()
-            .expect("discover pull request")
-            .complete(&[7])
+            .complete_with(&[7_u64][..], select_numbers)
             .expect("fetch pull request");
         let mut report = Report::default();
 
-        if let Err(error) = snapshot.persist(None) {
-            report.notes.push(format!("forge cache not saved: {error}"));
+        if let Err(note) = snapshot.persist(None) {
+            report.notes.push(note.to_string());
         }
 
         assert!(
@@ -562,17 +544,11 @@ mod tests {
         let pull = crate::forge::PullSummary {
             number: 7,
             state: "OPEN".to_owned(),
-            review_decision: String::new(),
             head_ref_name: "feat/ours".to_owned(),
-            head_ref_oid: "aa".to_owned(),
-            updated_at: "2026-08-01T00:00:00Z".to_owned(),
-            is_draft: false,
-            url: String::new(),
             head_repository_owner: Some(crate::forge::Account {
                 login: "someone-else".to_owned(),
             }),
-            base_ref_name: "main".to_owned(),
-            merge_commit: None,
+            ..crate::forge::PullSummary::default()
         };
         let ours = BTreeSet::from(["feat/ours".to_owned()]);
 

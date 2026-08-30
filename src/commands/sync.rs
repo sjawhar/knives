@@ -220,7 +220,7 @@ struct TrackingInput<'a, 'snapshot> {
     seen: &'a BTreeMap<String, String>,
     heads: &'a BTreeMap<u64, String>,
     summaries: &'a [PullSummary],
-    snapshot: Option<&'a crate::snapshot::ForgeSnapshot<'snapshot>>,
+    snapshot: Option<&'a crate::snapshot::CompletedSnapshot<'snapshot>>,
     scribe: &'a Scribe,
     store: &'a mut Store,
 }
@@ -303,12 +303,26 @@ fn pull_heads_or_problem(entry: &RepoEntry, report: &mut Report) -> BTreeMap<u64
     }
 }
 
-fn persist_snapshot(snapshot: Option<&crate::snapshot::ForgeSnapshot<'_>>, report: &mut Report) {
+fn persist_snapshot(
+    snapshot: Option<&crate::snapshot::CompletedSnapshot<'_>>,
+    report: &mut Report,
+) {
     if let Some(snapshot) = snapshot
-        && let Err(error) = snapshot.persist(None)
+        && let Err(note) = snapshot.persist(None)
     {
-        report.notes.push(format!("forge cache not saved: {error}"));
+        report.notes.push(note.to_string());
     }
+}
+
+fn select_tracked_numbers(
+    discovery: &crate::snapshot::Discovery<'_>,
+    context: &(&BTreeSet<u64>, &BTreeMap<String, String>),
+) -> Vec<u64> {
+    let (foreign, seen) = *context;
+    tracked_pull_requests(&discovery.ours(), foreign, seen)
+        .keys()
+        .copied()
+        .collect()
 }
 
 pub fn sync_repo(input: SyncInput<'_>) -> anyhow::Result<Report> {
@@ -349,25 +363,8 @@ pub fn sync_repo(input: SyncInput<'_>) -> anyhow::Result<Report> {
             .push("pull request state was not checked; branch columns are unknown".to_owned());
         None
     };
-    let discovery = match opened.as_ref() {
-        Some(opened) => match opened.discover() {
-            Ok(discovery) => Some(discovery),
-            Err(error) => {
-                report
-                    .problems
-                    .push(format!("pull request state unavailable: {error}"));
-                return Ok(report);
-            }
-        },
-        None => None,
-    };
-    let pre_batch_tracked = discovery.as_ref().map_or_else(
-        || tracked_pull_requests(&[], &foreign, &seen),
-        |discovery| tracked_pull_requests(&discovery.ours(), &foreign, &seen),
-    );
-    let surfaced: Vec<u64> = pre_batch_tracked.keys().copied().collect();
-    let snapshot = match discovery {
-        Some(discovery) => match discovery.complete(&surfaced) {
+    let snapshot = match opened.as_ref() {
+        Some(opened) => match opened.complete_with(&(&foreign, &seen), select_tracked_numbers) {
             Ok(snapshot) => Some(snapshot),
             Err(error) => {
                 report
@@ -380,12 +377,12 @@ pub fn sync_repo(input: SyncInput<'_>) -> anyhow::Result<Report> {
     };
     let tracked = snapshot.as_ref().map_or_else(
         || tracked_pull_requests(&[], &foreign, &seen),
-        |snapshot| tracked_pull_requests(&snapshot.ours(), &foreign, &seen),
+        |snapshot| tracked_pull_requests(snapshot.ours(), &foreign, &seen),
     );
     let heads = pull_heads_or_problem(entry, &mut report);
     let summaries: &[PullSummary] = snapshot
         .as_ref()
-        .map_or(&[], crate::snapshot::ForgeSnapshot::rows);
+        .map_or(&[], crate::snapshot::CompletedSnapshot::rows);
     record_tracked_pulls(
         TrackingInput {
             tracked,
@@ -450,16 +447,34 @@ pub const fn exit_for(report: &Report) -> Exit {
 }
 
 #[cfg(test)]
+fn test_pull(number: u64, branch: &str) -> (BranchName, crate::forge::PullRequest) {
+    (
+        BranchName::new(branch),
+        crate::forge::PullRequest {
+            number,
+            head_ref_name: branch.to_owned(),
+            head_ref_oid: "aaaa".to_owned(),
+            ..crate::forge::PullRequest::default()
+        },
+    )
+}
+
+#[cfg(test)]
 mod tests {
     #![allow(
         clippy::indexing_slicing,
         reason = "indexing a result in a test is the assertion; a panic is the failure"
     )]
     use super::*;
-    use crate::forge::{FakeForge, PullRequest};
+    use crate::forge::PullRequest;
+    use crate::forge::fake::FakeForge;
     use crate::ids::BranchName;
     use std::collections::BTreeMap;
     use std::path::Path;
+
+    fn select_numbers(_: &crate::snapshot::Discovery<'_>, numbers: &[u64]) -> Vec<u64> {
+        numbers.to_vec()
+    }
 
     #[test]
     fn forge_state_wins_over_head_movement() {
@@ -536,9 +551,7 @@ mod tests {
         })
         .expect("open snapshot");
         let snapshot = opened
-            .discover()
-            .expect("discover pull request")
-            .complete(&[7])
+            .complete_with(&[7_u64][..], select_numbers)
             .expect("fetch pull request");
         let mut report = Report::default();
 
@@ -572,20 +585,8 @@ mod tracking_tests {
         clippy::indexing_slicing,
         reason = "indexing a result in a test is the assertion; a panic is the failure"
     )]
-    use super::*;
-    use crate::forge::{PullRequest, PullSummary};
-
-    fn pr(number: u64, branch: &str) -> (BranchName, PullRequest) {
-        (
-            BranchName::new(branch),
-            PullRequest {
-                number,
-                head_ref_name: branch.to_owned(),
-                head_ref_oid: "aaaa".to_owned(),
-                ..PullRequest::default()
-            },
-        )
-    }
+    use super::{test_pull, *};
+    use crate::forge::PullSummary;
 
     #[test]
     fn every_listed_pull_request_is_tracked_even_with_no_local_bookmark() {
@@ -594,10 +595,12 @@ mod tracking_tests {
         // any branch we had pushed but did not have checked out in this clone: the
         // The forge reported 13 open pull requests for a real repository and knives reported
         // 12, and the missing one was the single most actionable of them.
-        let pull_requests: Vec<PullSummary> =
-            [pr(1, "feat/checked-out"), pr(2, "feat/pushed-only")]
-                .map(|(_, pull_request)| PullSummary::of(&pull_request))
-                .into();
+        let pull_requests: Vec<PullSummary> = [
+            test_pull(1, "feat/checked-out"),
+            test_pull(2, "feat/pushed-only"),
+        ]
+        .map(|(_, pull_request)| PullSummary::of(&pull_request))
+        .into();
         let foreign: BTreeSet<u64> = BTreeSet::new();
 
         let tracked = tracked_pull_requests(&pull_requests, &foreign, &BTreeMap::new());
@@ -627,7 +630,7 @@ mod tracking_tests {
 
 #[cfg(test)]
 mod comment_activity_tests {
-    use super::*;
+    use super::{test_pull, *};
     use crate::forge::{
         Forge, ForgeError, PullFacts, PullRequest, PullSummary, RepoIdentity, SweepEntry, SweepPage,
     };
@@ -636,18 +639,6 @@ mod comment_activity_tests {
     use std::path::Path;
     use std::process::Command;
     use tempfile::TempDir;
-
-    fn pr(number: u64, branch: &str) -> (BranchName, PullRequest) {
-        (
-            BranchName::new(branch),
-            PullRequest {
-                number,
-                head_ref_name: branch.to_owned(),
-                head_ref_oid: "aaaa".to_owned(),
-                ..PullRequest::default()
-            },
-        )
-    }
 
     #[derive(Debug)]
     struct ErroringForge {
@@ -925,7 +916,7 @@ mod comment_activity_tests {
         let scribe = test_scribe(&temp, &repo_name);
 
         // First sync: PR #42 with comment activity
-        let (_branch, pull_request) = pr(42, "feat/alpha");
+        let (_branch, pull_request) = test_pull(42, "feat/alpha");
         let forge_first = ErroringForge {
             pull_requests: vec![pull_request],
             newest_comments: BTreeMap::from([(42, "2026-07-30T10:00:00Z".to_owned())]),
@@ -960,7 +951,7 @@ mod comment_activity_tests {
         );
 
         // Second sync: same comment timestamp, no new activity
-        let (_branch, pull_request) = pr(42, "feat/alpha");
+        let (_branch, pull_request) = test_pull(42, "feat/alpha");
         let forge_second = ErroringForge {
             pull_requests: vec![pull_request],
             newest_comments: BTreeMap::from([(42, "2026-07-29T10:00:00Z".to_owned())]),
@@ -994,7 +985,7 @@ mod comment_activity_tests {
         let temp = TempDir::new().unwrap();
         let repo_name = RepoName::new("test-repo");
         let entry = local_entry(&temp);
-        let (_branch, pull_request) = pr(42, "feat/alpha");
+        let (_branch, pull_request) = test_pull(42, "feat/alpha");
         let forge = ErroringForge {
             pull_requests: vec![pull_request],
             newest_comments: BTreeMap::new(),
@@ -1032,7 +1023,7 @@ mod comment_activity_tests {
         let store_path = temp.path().join("state.json");
         let repo_name = RepoName::new("test-repo");
         let entry = local_entry(&temp);
-        let (_branch, pull_request) = pr(42, "feat/alpha");
+        let (_branch, pull_request) = test_pull(42, "feat/alpha");
         let forge = ErroringForge {
             pull_requests: vec![pull_request],
             newest_comments: BTreeMap::from([(42, "2026-07-30T10:00:00Z".to_owned())]),
@@ -1070,7 +1061,7 @@ mod comment_activity_tests {
         let store_path = temp.path().join("state.json");
         let repo_name = RepoName::new("test-repo");
         let entry = local_entry(&temp);
-        let (_branch, mut pull_request) = pr(42, "feat/alpha");
+        let (_branch, mut pull_request) = test_pull(42, "feat/alpha");
         pull_request.state = "CLOSED".to_owned();
         let forge = ErroringForge {
             pull_requests: vec![pull_request],

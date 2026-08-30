@@ -7,10 +7,11 @@
 
 use std::collections::BTreeSet;
 
-use knives::forge::{
-    ChecksSummary, PullRequest, PullSummary, parse_pull_facts, parse_summaries, parse_sweep,
-    pull_facts_query, summary_fields, summary_list_args,
+use knives::forge::github::{
+    parse_pull_facts, parse_summaries, parse_sweep, pull_facts_query, summary_fields,
+    summary_list_args,
 };
+use knives::forge::{ChecksSummary, PullRequest, PullSummary};
 use serde_json::Value;
 
 const RECORDED_SUMMARIES: &str = include_str!("fixtures/gh_pr_list.json");
@@ -277,7 +278,7 @@ fn print_the_facts_query() {
 #[test]
 #[ignore = "recording utility, not a check; see the doc comment"]
 fn print_the_sweep_query() {
-    println!("{}", knives::forge::sweep_query());
+    println!("{}", knives::forge::github::sweep_query());
 }
 
 #[test]

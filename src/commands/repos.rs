@@ -8,9 +8,9 @@ use std::fmt::Write as _;
 use std::path::Path;
 
 use crate::cli::Exit;
-use crate::commands::status::{is_our_release, release_order};
+use crate::commands::status::release_order;
 use crate::config::{Registry, RepoEntry, Role, default_config_path, load};
-use crate::ids::{BookmarkRef, ReleaseScheme, RemoteName};
+use crate::ids::{BookmarkRef, ReleaseScheme, RemoteName, is_our_release};
 use crate::jj::Repo;
 
 struct ReleaseState {

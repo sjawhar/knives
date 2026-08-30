@@ -29,7 +29,7 @@ Pinned to the exact revision the installed `jj` binary was built from, so the li
 
 - No user name, organisation name, or upstream repository name appears in release surfaces. A guard test enforces it, keyed on `concat!("github", ".com")` because that catches any hard-coded remote URL without the test itself naming anyone.
 - Remotes are addressed by **role**. `Role` is an enum, so an unknown role cannot be requested and no runtime lookup error is needed.
-- `detect/` is pure: functions from parsed values to findings, no I/O. `jj.rs` is the only module that opens a repository; `forge.rs` is the only module that talks to a hosting service.
+- `detect/` is pure: functions from parsed values to findings, no I/O. `jj.rs` is the only module that opens a repository; `forge/github.rs` is the only module that talks to a hosting service.
 - **Never mutate a repo we do not own.** Read-only jj access passes `--ignore-working-copy`, so a busy workspace is not snapshotted.
 - **Never `jj op restore` in a shared repo.** Restoring to a recorded operation discards any operation another agent performed since. The landed probe cleans up by abandoning exactly the commits it created, inside a guard that runs on every exit path.
 - **One commit** for the whole plan.
@@ -59,7 +59,7 @@ Confirmed against the live machine and real repositories, not recalled.
 | `detect/` | Four pure detectors: two workspaces on one change, stale release parent, landed, divergence. |
 | `jj.rs` | The only module that opens a repository. Reads via jj-lib; the landed probe and workspace creation shell out, and say why. |
 | `pins.rs` | Where a consumer pins a dated release. Five sites, four syntaxes, and a lockfile that percent-encodes the slash so the obvious grep finds nothing. |
-| `forge.rs` | `Forge` trait, a CLI-backed implementation, and a fake. The CLI speaks to one hosting service, so a local server of a different kind would not exercise this path; a fake does. |
+| `forge.rs`, `forge/github.rs`, `forge/fake.rs` | The `Forge` trait and shared wire types, the CLI-backed implementation, and the fake. The CLI speaks to one hosting service, so a local server of a different kind would not exercise this path; a fake does. |
 | `config.rs` | The registry. `KNIVES_CONFIG_HOME` wins over `XDG_CONFIG_HOME`, because redirecting the latter to isolate this tool also hides the forge CLI's credentials. |
 | `store.rs` | Only what cannot be recomputed: claims, fork-only marks, foreign-parent rationale, supersession, last-seen pull heads. Unknown keys are written back untouched. |
 | `cli.rs` | The command surface and the exit-code type. Argument shapes are enforced by the parser, not checked at runtime. |
