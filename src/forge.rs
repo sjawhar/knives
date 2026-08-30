@@ -8,6 +8,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Command;
+use std::sync::{Condvar, Mutex};
 
 use serde::{Deserialize, Deserializer};
 
@@ -462,11 +463,76 @@ pub struct CliForge;
 ///
 /// Eight was the fastest configuration.
 const FACTS_BATCH_CHUNK_SIZE: usize = 8;
+/// `status --all` may gather 64 repositories concurrently, and each gather
+/// can start several fact-batch workers. The forge sees `gh` child processes,
+/// not those gather threads: capping those children at 16 keeps concurrent
+/// forge requests well below the documented 100-request budget.
+const MAX_CONCURRENT_GH_PROCESSES: usize = 16;
+
+#[derive(Debug)]
+struct GhProcessSemaphore {
+    available: Mutex<usize>,
+    released: Condvar,
+}
+
+impl GhProcessSemaphore {
+    const fn new(permits: usize) -> Self {
+        Self {
+            available: Mutex::new(permits),
+            released: Condvar::new(),
+        }
+    }
+
+    fn acquire(&'static self) -> GhProcessPermit {
+        let mut available = self
+            .available
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while *available == 0 {
+            available = self
+                .released
+                .wait(available)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        *available -= 1;
+        drop(available);
+        GhProcessPermit { semaphore: self }
+    }
+
+    fn release(&self) {
+        let mut available = self
+            .available
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *available += 1;
+        self.released.notify_one();
+        drop(available);
+    }
+}
+
+#[derive(Debug)]
+struct GhProcessPermit {
+    semaphore: &'static GhProcessSemaphore,
+}
+
+impl Drop for GhProcessPermit {
+    fn drop(&mut self) {
+        self.semaphore.release();
+    }
+}
+
+static GH_PROCESS_SEMAPHORE: GhProcessSemaphore =
+    GhProcessSemaphore::new(MAX_CONCURRENT_GH_PROCESSES);
 
 impl CliForge {
     fn run(repo: &Path, args: &[&str]) -> Result<String, ForgeError> {
         let started = std::time::Instant::now();
+        // This permit must span `output()`: it is a cap on live `gh` children,
+        // so releasing it after spawning would allow running processes to exceed
+        // the global limit. Callers acquire it before their scoped threads join.
+        let permit = GH_PROCESS_SEMAPHORE.acquire();
         let output = Command::new("gh").args(args).current_dir(repo).output()?;
+        drop(permit);
         if crate::timing::enabled() {
             eprintln!(
                 "{}",
@@ -1145,6 +1211,192 @@ mod tests {
     }
 
     use super::*;
+    use crate::config::test_support::{EnvironmentGuard, environment_lock};
+    use std::fs;
+    use std::io::{Read as _, Write as _};
+    use std::os::unix::fs::PermissionsExt as _;
+
+    struct FakeGhGate {
+        directory: tempfile::TempDir,
+        entered: std::path::PathBuf,
+        gate: std::path::PathBuf,
+        max: std::path::PathBuf,
+    }
+
+    impl FakeGhGate {
+        fn new(environment: &EnvironmentGuard) -> Self {
+            let directory = tempfile::tempdir().expect("temporary fake gh directory");
+            let gh = directory.path().join("gh");
+            let lock = directory.path().join("lock");
+            let current = directory.path().join("current");
+            let max = directory.path().join("max");
+            let entered = directory.path().join("entered");
+            let gate = directory.path().join("gate");
+            fs::write(&current, "0\n").expect("initialize fake gh counter");
+            fs::write(&max, "0\n").expect("initialize fake gh maximum");
+            for fifo in [&entered, &gate] {
+                let status = Command::new("mkfifo")
+                    .arg(fifo)
+                    .status()
+                    .expect("create fake gh synchronization fifo");
+                assert!(status.success(), "create fake gh synchronization fifo");
+            }
+            fs::write(
+                &gh,
+                r#"#!/bin/sh
+set -eu
+lock_counter() {
+    while ! mkdir "$FAKE_GH_LOCK" 2>/dev/null; do
+        :
+    done
+}
+unlock_counter() {
+    rmdir "$FAKE_GH_LOCK"
+}
+lock_counter
+active=$(cat "$FAKE_GH_CURRENT")
+active=$((active + 1))
+printf '%s\n' "$active" > "$FAKE_GH_CURRENT"
+seen=$(cat "$FAKE_GH_MAX")
+if [ "$active" -gt "$seen" ]; then
+    printf '%s\n' "$active" > "$FAKE_GH_MAX"
+fi
+unlock_counter
+exec 3>"$FAKE_GH_ENTERED"
+printf . >&3
+IFS= read -r _ < "$FAKE_GH_GATE"
+exec 3>&-
+lock_counter
+active=$(cat "$FAKE_GH_CURRENT")
+printf '%s\n' "$((active - 1))" > "$FAKE_GH_CURRENT"
+unlock_counter
+printf '{}'
+"#,
+            )
+            .expect("write fake gh");
+            fs::set_permissions(&gh, fs::Permissions::from_mode(0o755))
+                .expect("make fake gh executable");
+            environment.set(
+                "PATH",
+                &format!(
+                    "{}:{}",
+                    directory.path().display(),
+                    std::env::var("PATH").expect("read PATH")
+                ),
+            );
+            environment.set("FAKE_GH_LOCK", lock.to_str().expect("utf-8 lock path"));
+            environment.set(
+                "FAKE_GH_CURRENT",
+                current.to_str().expect("utf-8 current path"),
+            );
+            environment.set("FAKE_GH_MAX", max.to_str().expect("utf-8 maximum path"));
+            environment.set(
+                "FAKE_GH_ENTERED",
+                entered.to_str().expect("utf-8 entered fifo path"),
+            );
+            environment.set("FAKE_GH_GATE", gate.to_str().expect("utf-8 gate fifo path"));
+            Self {
+                directory,
+                entered,
+                gate,
+                max,
+            }
+        }
+
+        fn repository(&self) -> &Path {
+            self.directory.path()
+        }
+
+        fn wait_for_permit_holders(&self) -> fs::File {
+            let mut entered = fs::File::open(&self.entered).expect("open fake gh entry fifo");
+            let mut cohort = [0; MAX_CONCURRENT_GH_PROCESSES];
+            entered
+                .read_exact(&mut cohort)
+                .expect("wait for every permit holder to enter fake gh");
+            entered
+        }
+
+        fn release(&self, calls: usize) -> fs::File {
+            // A read-write endpoint keeps queued release tokens in the FIFO until
+            // the second cohort opens its read end; a write-only endpoint can see
+            // EPIPE after the first cohort exits.
+            let mut release = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&self.gate)
+                .expect("open fake gh release fifo");
+            for _ in 0..calls {
+                writeln!(release, "release").expect("release fake gh child");
+            }
+            release
+        }
+
+        fn maximum(&self) -> usize {
+            fs::read_to_string(&self.max)
+                .expect("read maximum fake gh concurrency")
+                .trim()
+                .parse()
+                .expect("parse maximum fake gh concurrency")
+        }
+    }
+
+    #[test]
+    fn cli_forge_limits_concurrent_gh_processes_globally() {
+        use std::sync::{
+            Arc, Barrier,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        const CALLS: usize = MAX_CONCURRENT_GH_PROCESSES * 2;
+
+        let _environment = environment_lock();
+        let environment = EnvironmentGuard::capture(&[
+            "PATH",
+            "FAKE_GH_LOCK",
+            "FAKE_GH_CURRENT",
+            "FAKE_GH_MAX",
+            "FAKE_GH_ENTERED",
+            "FAKE_GH_GATE",
+        ]);
+        let fake = FakeGhGate::new(&environment);
+        let start = Arc::new(Barrier::new(CALLS + 1));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        std::thread::scope(|scope| {
+            let workers = (0..CALLS)
+                .map(|_| {
+                    let start = Arc::clone(&start);
+                    let attempts = Arc::clone(&attempts);
+                    let repo = fake.repository();
+                    scope.spawn(move || {
+                        start.wait();
+                        attempts.fetch_add(1, Ordering::SeqCst);
+                        CliForge::run(repo, &["api", "graphql"]).expect("fake gh succeeds");
+                    })
+                })
+                .collect::<Vec<_>>();
+            start.wait();
+            while attempts.load(Ordering::SeqCst) != CALLS {
+                std::thread::yield_now();
+            }
+
+            let _entered = fake.wait_for_permit_holders();
+            assert_eq!(
+                fake.maximum(),
+                MAX_CONCURRENT_GH_PROCESSES,
+                "all calls have started, but only the permitted cohort may enter fake gh"
+            );
+            let _release = fake.release(CALLS);
+            for worker in workers {
+                worker.join().expect("gh worker does not panic");
+            }
+        });
+
+        let observed = fake.maximum();
+        assert!(
+            observed <= MAX_CONCURRENT_GH_PROCESSES,
+            "observed {observed} concurrent gh processes; cap is {MAX_CONCURRENT_GH_PROCESSES}"
+        );
+    }
 
     #[test]
     fn fixture_default_has_a_parseable_timestamp_and_hex_oid() {

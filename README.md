@@ -67,8 +67,9 @@ Local state is computed on demand. Forge discovery uses
 `$XDG_CACHE_HOME/knives/forge/<owner>/<repo>.json` (default
 `~/.cache/knives/forge/<owner>/<repo>.json`). **The cache discovers; a live batch decides.**
 It selects pull request numbers from cache, then fetches a complete live row for every pull
-request that reaches a report. Deleting the cache file is always safe: the next status run uses
-cold forge discovery and re-runs its landed probes.
+request that reaches a report. A cache write failure after a successful live fetch emits a
+`forge cache not saved: …` note and preserves the command's exit. Deleting the cache file is
+always safe: the next status run uses cold forge discovery and re-runs its landed probes.
 
 One thing cannot be computed: why. `knives finish` deletes the claim that said why a branch
 exists, and after that the only honest answer to "what is this branch" is archaeology.

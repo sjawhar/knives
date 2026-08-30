@@ -127,7 +127,7 @@ that writer's rows.
 | Any live-batch chunk fails | Mark the forge unconsulted; use no cache, do not advance the watermark, and do not write the cache. |
 | Sweep and reseed both fail | Mark the forge unconsulted and use no cached pull-request data. |
 | Cache is unreadable, corrupt, or has a schema or repository-identity mismatch | Ignore it and use the cold path. |
-| Cache write or rename fails after live success | Keep the live snapshot, mark the forge consulted, and report the cache problem. |
+| Cache write or rename fails after live success | Keep the live snapshot, mark the forge consulted, and report the cache problem as a note without changing the command's exit. |
 
 ### Landed-verdict cache
 
