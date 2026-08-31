@@ -40,10 +40,13 @@ pub enum RepairEffect {
 }
 
 pub fn repair_effect(pins: &[Pin]) -> RepairEffect {
-    if pins.is_empty() {
+    // Off-scheme pins consume the fork at a tag or branch of their own choosing;
+    // they neither receive an in-place repair nor demand a new dated name.
+    let mut releases = pins.iter().filter(|pin| pin.on_scheme).peekable();
+    if releases.peek().is_none() {
         return RepairEffect::Unpinned;
     }
-    if pins.iter().any(|pin| pin.kind == PinKind::Follows) {
+    if releases.any(|pin| pin.kind == PinKind::Follows) {
         return RepairEffect::RepairInPlace;
     }
     RepairEffect::NewDatedName
@@ -1047,6 +1050,7 @@ mod tests {
             reference: "release/2026-07-28".to_owned(),
             kind,
             locked: None,
+            on_scheme: true,
             source: String::new(),
         }
     }
@@ -1069,6 +1073,16 @@ mod tests {
     #[test]
     fn nothing_pinning_it_leaves_the_choice_open() {
         assert_eq!(repair_effect(&[]), RepairEffect::Unpinned);
+    }
+
+    #[test]
+    fn an_off_scheme_pin_alone_leaves_the_repair_choice_open() {
+        // A consumer pinned at its own tag is not consuming releases: repairing in
+        // place cannot reach it and a new dated name would not either.
+        let mut off_scheme = pin(PinKind::Frozen);
+        off_scheme.on_scheme = false;
+        off_scheme.reference = "acme-pin-0.4.47.dev7".to_owned();
+        assert_eq!(repair_effect(&[off_scheme]), RepairEffect::Unpinned);
     }
 
     #[test]

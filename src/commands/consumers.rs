@@ -277,6 +277,9 @@ fn pin_row(pin: &Pin, live: &BTreeMap<String, CommitId>, newest: Option<&Release
 
 /// Compare one pin with the known live release refs and their newest member.
 pub fn verdict(pin: &Pin, live: &BTreeMap<String, CommitId>, newest: &str) -> PinVerdict {
+    if !pin.on_scheme {
+        return PinVerdict::OffScheme;
+    }
     let reference = format!("refs/heads/{}", pin.reference);
     let Some(commit) = live.get(&reference) else {
         return PinVerdict::UnknownName;
@@ -298,6 +301,9 @@ fn add_skew_note(consumers: &[ConsumerRow], notes: &mut Vec<String>) {
     let mut pins = BTreeMap::new();
     for consumer in consumers {
         for pin in &consumer.pins {
+            if matches!(pin.verdict, Some(PinVerdict::OffScheme)) {
+                continue;
+            }
             pins.entry(pin.reference.clone())
                 .or_insert_with(|| consumer_label(Path::new(&consumer.path)));
         }
@@ -409,6 +415,7 @@ fn render_verdict(verdict: &PinVerdict) -> String {
         PinVerdict::StaleLock { expected } => format!("stale lock: expected @{}", short(expected)),
         PinVerdict::BehindName { newest } => format!("behind: newest is {newest}"),
         PinVerdict::UnknownName => "unknown release".to_owned(),
+        PinVerdict::OffScheme => "off-scheme reference".to_owned(),
     }
 }
 
@@ -431,6 +438,7 @@ mod tests {
             reference: reference.to_owned(),
             kind: PinKind::Frozen,
             locked: locked.map(str::to_owned),
+            on_scheme: true,
             source: String::new(),
         }
     }
@@ -548,6 +556,49 @@ mod tests {
                 expected: "11223344556677889900aabbccddeeff".to_owned()
             }
         );
+    }
+
+    #[test]
+    fn verdict_reports_an_off_scheme_pin_as_a_fact_not_a_missing_release() {
+        let mut off_scheme = pin("agent-c-pin-0.4.47.dev7", Some("79ceb0832a61"));
+        off_scheme.on_scheme = false;
+
+        let found = verdict(&off_scheme, &live(), "release/2026-08-05");
+
+        assert_eq!(found, PinVerdict::OffScheme);
+    }
+
+    #[test]
+    fn an_off_scheme_lock_pin_is_reported_instead_of_reading_as_unpinned() {
+        let consumer = tempfile::tempdir().expect("create consumer");
+        std::fs::write(
+            consumer.path().join("uv.lock"),
+            "source = { git = \"https://forge.invalid/acme/tool.git?rev=acme-pin-0.4.47.dev7#79ceb0832a61a095c5c9819da2327675f5268753\" }\n",
+        )
+        .expect("write off-scheme pin");
+        let newest = release("release/2026-08-05", "11223344556677889900aabbccddeeff");
+        let scheme = ReleaseScheme::Dated;
+        let live = live();
+        let context = ConsumerContext {
+            fork: "demo",
+            slug: Some("tool"),
+            scheme: &scheme,
+            live: &live,
+            newest: Some(&newest),
+        };
+
+        let row = consumer_row(consumer.path(), &context);
+
+        assert!(!row.notes.iter().any(|note| note == "does not pin demo"));
+        assert_eq!(row.pins.len(), 1);
+        let reported = row.pins.first().expect("one off-scheme pin row");
+        assert_eq!(reported.reference, "acme-pin-0.4.47.dev7");
+        assert_eq!(reported.kind, "frozen");
+        assert_eq!(
+            reported.locked.as_deref(),
+            Some("79ceb0832a61a095c5c9819da2327675f5268753")
+        );
+        assert_eq!(reported.verdict, Some(PinVerdict::OffScheme));
     }
     #[test]
     fn an_advanced_live_ref_with_the_same_name_records_view_disagreement() {

@@ -29,6 +29,8 @@ Checks every registered consumer checkout for a fork, plus any repeatable `--con
 against the newest release on the live publish remote. A missing path is an unanswered problem;
 a reachable consumer that does not pin the fork is a note. It finds stale frozen locks, pins to
 older or unknown release names, and disagreement between consumers without editing a consumer.
+A pin at a reference outside the release scheme (a consumer's own tag or branch) is reported
+as a fact with an `off-scheme` verdict — never as "does not pin", and never as a finding.
 The local checkout's release view is compared with the live remote and reported when they differ.
 
 ### `knives pushed [BRANCH]... [--repo REPO]`

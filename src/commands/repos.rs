@@ -112,12 +112,15 @@ fn dated_pin_lag(entry: &RepoEntry, newest: Option<&String>, scheme: &ReleaseSch
     let mut behind = Vec::new();
     let mut notes = Vec::new();
     for consumer in &entry.consumers {
-        let scan = scan_consumer_for(consumer, slug.as_deref(), scheme);
-        notes.extend(scan.notes);
+        let mut scan = scan_consumer_for(consumer, slug.as_deref(), scheme);
+        notes.extend(std::mem::take(&mut scan.notes));
         if !scan.problems.is_empty() {
             notes.extend(scan.problems);
             continue;
         }
+        // The listing answers "how far behind our releases"; a pin at a consumer's own
+        // tag is off that axis and reads here exactly as pinning no release.
+        scan.pins.retain(|pin| pin.on_scheme);
         let label = consumer_label(consumer);
         if scan.pins.is_empty() {
             behind.push(format!("{label} pins no release of this repo"));
@@ -153,12 +156,13 @@ fn fixed_pin_lag(
     let mut behind = Vec::new();
     let mut notes = Vec::new();
     for consumer in &entry.consumers {
-        let scan = scan_consumer_for(consumer, slug.as_deref(), scheme);
-        notes.extend(scan.notes);
+        let mut scan = scan_consumer_for(consumer, slug.as_deref(), scheme);
+        notes.extend(std::mem::take(&mut scan.notes));
         if !scan.problems.is_empty() {
             notes.extend(scan.problems);
             continue;
         }
+        scan.pins.retain(|pin| pin.on_scheme);
         let label = consumer_label(consumer);
         if scan.pins.is_empty() {
             behind.push(format!("{label} pins no release of this repo"));

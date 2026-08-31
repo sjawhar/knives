@@ -36,6 +36,14 @@ pub struct Pin {
     pub reference: String,
     pub kind: PinKind,
     pub locked: Option<String>,
+    /// Whether the reference belongs to the repository's release scheme.
+    ///
+    /// A consumer can pin a fork at an arbitrary tag or branch (`?rev=some-pin-tag`).
+    /// That pin is a fact about the consumer — dropping it made the scan answer
+    /// "does not pin" for a file that plainly pins, a confident absence on the exact
+    /// question the consumers command exists to answer. Release-repair reasoning and
+    /// skew comparison stay scoped to `on_scheme` pins; reporting shows everything.
+    pub on_scheme: bool,
     /// The line the pin was read from.
     ///
     /// Kept because a release name alone cannot say which repository it belongs to:
@@ -57,6 +65,9 @@ pub enum PinVerdict {
     BehindName { newest: String },
     /// Names a release this fork's remote does not have.
     UnknownName,
+    /// Pins the fork at a reference outside its release scheme (a tag or branch).
+    /// A deliberate consumption choice, reported as a fact rather than a finding.
+    OffScheme,
 }
 
 /// A malformed lock fragment that prevents a pin from being classified.
@@ -120,6 +131,7 @@ pub fn scan(file: &str, text: &str, scheme: &ReleaseScheme) -> PinScan {
             }
         };
         let Some(start) = start else {
+            extend_off_scheme_pin(&mut pins, file, index, &decoded);
             continue;
         };
         let reference: String = decoded[start..]
@@ -131,6 +143,7 @@ pub fn scan(file: &str, text: &str, scheme: &ReleaseScheme) -> PinScan {
             ReleaseScheme::Fixed(name) => reference == name.as_str(),
         };
         if !is_valid {
+            extend_off_scheme_pin(&mut pins, file, index, &decoded);
             continue;
         }
         let source = decoded.trim().to_owned();
@@ -171,10 +184,65 @@ pub fn scan(file: &str, text: &str, scheme: &ReleaseScheme) -> PinScan {
             reference,
             kind,
             locked,
+            on_scheme: true,
             source,
         });
     }
     PinScan { pins, problems }
+}
+
+/// Capture a git pin whose reference sits outside the release scheme.
+///
+/// Recognizes the same selector syntaxes the scheme path handles — a TOML
+/// `rev = "..."` / `branch = "..."` and a lockfile's `?rev=...` — so a consumer
+/// pinned at an arbitrary tag is still reported instead of reading as unpinned.
+fn extend_off_scheme_pin(pins: &mut Vec<Pin>, file: &str, index: usize, decoded: &str) {
+    let selectors: &[(&str, PinKind)] = &[
+        ("?rev=", PinKind::Frozen),
+        ("rev = \"", PinKind::Frozen),
+        ("rev=\"", PinKind::Frozen),
+        ("rev = '", PinKind::Frozen),
+        ("branch = \"", PinKind::Follows),
+        ("branch=\"", PinKind::Follows),
+        ("branch = '", PinKind::Follows),
+    ];
+    let Some((start, kind)) = selectors.iter().find_map(|(marker, kind)| {
+        decoded
+            .find(marker)
+            .map(|position| (position + marker.len(), *kind))
+    }) else {
+        return;
+    };
+    let reference: String = decoded[start..]
+        .chars()
+        .take_while(|c| !c.is_whitespace() && !matches!(c, '"' | '\'' | ',' | '#' | ')'))
+        .collect();
+    if reference.is_empty() {
+        return;
+    }
+    let end = start + reference.len();
+    let locked = decoded[end..].strip_prefix('#').and_then(|suffix| {
+        let fragment: String = suffix
+            .chars()
+            .take_while(|character| {
+                !character.is_whitespace() && !matches!(character, '"' | '\'' | ',' | ')')
+            })
+            .collect();
+        (fragment.len() >= 6
+            && fragment
+                .chars()
+                .all(|character| character.is_ascii_hexdigit()))
+        .then_some(fragment)
+    });
+    pins.push(Pin {
+        file: file.to_owned(),
+        line: index + 1,
+        reference,
+        kind,
+        locked,
+        on_scheme: false,
+        source: decoded.trim().to_owned(),
+    });
 }
 
 fn follows_branch_selector(prefix: &str) -> bool {
