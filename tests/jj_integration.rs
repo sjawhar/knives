@@ -3344,6 +3344,135 @@ fn a_recut_carries_a_recorded_resolution_that_dropped_content() {
 }
 
 #[test]
+fn members_counts_parents_and_names_their_holders() {
+    // Given: a flat two-member cut, then feat/alpha advances without moving
+    // the release parent it originally held.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let (home, _consumer) = home_after_first_cut(&lab);
+    let release = commit_at(&lab, "release/2026-08-04");
+    let released_alpha = commit_at(&lab, "feat/alpha");
+    let released_beta = commit_at(&lab, "feat/beta");
+    extend_branch(&lab, "feat/alpha", "alpha.txt", "alpha\nmore\n");
+    let advanced_alpha = commit_at(&lab, "feat/alpha");
+
+    // When: the release's members are inspected through the real CLI.
+    let output = knives_release(&lab, &home, &["members"]);
+
+    // Then: its own two direct parents are counted, and each is represented
+    // once by its current holder or its branch's advanced successor.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "members failed: {stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains(&format!(
+            "release/2026-08-04 @ {} — 2 parents",
+            release.as_str().chars().take(12).collect::<String>()
+        )),
+        "the count must come from the release's parent list: {stdout}"
+    );
+    assert!(
+        stdout.contains(&format!(
+            "- {} feat/beta",
+            released_beta.as_str().chars().take(12).collect::<String>()
+        )),
+        "the held parent is missing its holder: {stdout}"
+    );
+    assert!(
+        stdout.contains(&format!(
+            "- {} feat/alpha advanced to {}",
+            released_alpha.as_str().chars().take(12).collect::<String>(),
+            advanced_alpha.as_str().chars().take(12).collect::<String>()
+        )),
+        "the advanced member must name the current tip: {stdout}"
+    );
+    assert_eq!(
+        stdout.lines().filter(|line| line.starts_with("- ")).count(),
+        2,
+        "each release parent must render exactly one row: {stdout}"
+    );
+}
+
+#[test]
+fn members_verify_reports_a_dropped_members_content() {
+    // Given: the same hand-resolved conflicting cut as the recut scenario,
+    // where the release tree contains neither member's original content.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "shared.txt", "alpha\n");
+    lab.branch("feat/beta", "shared.txt", "beta\n");
+    let (home, _consumer) = release_test_home(&lab);
+    let first = knives_release(&lab, &home, &["cut", "release/2026-08-04"]);
+    assert!(
+        String::from_utf8_lossy(&first.stdout).contains("cut release/2026-08-04 as"),
+        "first cut was refused: {first:?}"
+    );
+    let dropped_beta = commit_at(&lab, "feat/beta");
+    lab.jj_work(["edit", "release/2026-08-04"]);
+    std::fs::write(lab.work.join("shared.txt"), "merged\n").expect("resolve by hand");
+    lab.jj_work(["new"]);
+
+    // When: each member's content is replayed against the resolved release.
+    let output = knives_release(&lab, &home, &["members", "--verify"]);
+
+    // Then: the lost member is a finding, rather than a successful inspection.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        output.status.code(),
+        Some(i32::from(knives::cli::Exit::Findings.code())),
+        "members verify must fail closed: {stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains(&format!(
+            "!! feat/beta@{}: the cut tree is missing or diverges from the member's content",
+            dropped_beta.as_str().chars().take(12).collect::<String>()
+        )),
+        "the dropped member must be named under missing: {stdout}"
+    );
+}
+
+#[test]
+fn prose_parent_lines_do_not_inflate_the_count() {
+    // Given: a flat two-member release whose description contains a line that
+    // looks like an old text parser's parent record.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let (home, _consumer) = home_after_first_cut(&lab);
+    lab.jj_work([
+        "describe",
+        "-r",
+        "release/2026-08-04",
+        "-m",
+        "release notes\nparent deadbeef from feat/x",
+    ]);
+
+    // When: the release is inspected by name.
+    let output = knives_release(&lab, &home, &["members", "release/2026-08-04"]);
+
+    // Then: prose never changes the structural parent count.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "members failed: {stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("release/2026-08-04 @") && stdout.contains("— 2 parents"),
+        "the prose line inflated the count: {stdout}"
+    );
+    assert_eq!(
+        stdout.lines().filter(|line| line.starts_with("- ")).count(),
+        2,
+        "the report must have exactly one row per actual parent: {stdout}"
+    );
+}
+
+#[test]
 fn a_first_cut_audits_members_from_their_fork_point_not_the_trunk_tip() {
     // Given: three branches forked from the seed, one of them squash-merged
     // upstream with maintainer edits that rewrite alpha's file. The first cut
@@ -4439,6 +4568,131 @@ fn status_all_reports_every_repo_in_registry_order() {
         text.trim_end(),
         format!("{}\n\n{}", alone("aardvark"), alone("zebra")),
         "--all is not each repo's own report in registry order"
+    );
+}
+
+#[test]
+fn status_and_plan_report_a_double_cut() {
+    // Given: a published cut, then a local release name moved sideways to a
+    // sibling with different content. Both the local and origin names are in
+    // the release trust boundary.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let (home, _consumer) = home_after_first_cut(&lab);
+    lab.push_branch("release/2026-08-04");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    knives::jj::set_bookmark_anywhere(&lab.work, "release/2026-08-04", "feat/beta")
+        .expect("move local release sideways");
+    lab.jj_work(["workspace", "update-stale"]);
+
+    // When: status and the bare release command observe the two named cuts.
+    let status = Command::new(env!("CARGO_BIN_EXE_knives"))
+        .args([
+            "--text",
+            "status",
+            "demo",
+            "--no-github",
+            "--no-landed",
+        ])
+        .current_dir(&lab.work)
+        .env("KNIVES_CONFIG_HOME", home.path())
+        .output()
+        .expect("run status");
+    let plan = knives_release(&lab, &home, &[]);
+
+    // Then: both read the changed trees as the same release name cut twice.
+    let status_text = String::from_utf8_lossy(&status.stdout);
+    assert_eq!(
+        status.status.code(),
+        Some(i32::from(knives::cli::Exit::Findings.code())),
+        "status missed the double cut: {status_text}\n{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    assert!(
+        status_text.contains("double-cut") && status_text.contains("release/2026-08-04"),
+        "status did not name the double cut: {status_text}"
+    );
+    let plan_text = String::from_utf8_lossy(&plan.stdout);
+    assert_eq!(
+        plan.status.code(),
+        Some(i32::from(knives::cli::Exit::Findings.code())),
+        "plan missed the double cut: {plan_text}\n{}",
+        String::from_utf8_lossy(&plan.stderr)
+    );
+    assert!(
+        plan_text.contains("release/2026-08-04 names both")
+            && plan_text.contains("their trees differ"),
+        "plan did not carry the double-cut finding: {plan_text}"
+    );
+
+    // Given: another published cut whose local name is rebuilt with `jj
+    // duplicate`, retaining the release tree while getting a different commit.
+    let rebuilt = Lab::new();
+    rebuilt.branch("feat/alpha", "alpha.txt", "alpha\n");
+    rebuilt.branch("feat/beta", "beta.txt", "beta\n");
+    let (rebuilt_home, _consumer) = home_after_first_cut(&rebuilt);
+    rebuilt.push_branch("release/2026-08-04");
+    let published = commit_at(&rebuilt, "release/2026-08-04");
+    rebuilt.jj_work(["duplicate", "release/2026-08-04"]);
+    let duplicated = knives::jj::commits_matching(&rebuilt.work, "all()")
+        .expect("list duplicated release candidates")
+        .into_iter()
+        .find(|candidate| {
+            candidate != &published
+                && knives::jj::changed_files_between(
+                    &rebuilt.work,
+                    published.as_str(),
+                    candidate.as_str(),
+                )
+                .expect("compare duplicate tree")
+                .is_empty()
+        })
+        .expect("find the duplicated release");
+    knives::jj::set_bookmark_anywhere(
+        &rebuilt.work,
+        "release/2026-08-04",
+        duplicated.as_str(),
+    )
+    .expect("point local release at duplicated cut");
+    rebuilt.jj_work(["workspace", "update-stale"]);
+
+    // When: the same two commands compare the rebuilt cut to its published copy.
+    let rebuilt_status = Command::new(env!("CARGO_BIN_EXE_knives"))
+        .args([
+            "--text",
+            "status",
+            "demo",
+            "--no-github",
+            "--no-landed",
+        ])
+        .current_dir(&rebuilt.work)
+        .env("KNIVES_CONFIG_HOME", rebuilt_home.path())
+        .output()
+        .expect("run rebuilt status");
+    let rebuilt_plan = knives_release(&rebuilt, &rebuilt_home, &[]);
+
+    // Then: identical trees are a note, not the changed-content finding.
+    let rebuilt_status_text = String::from_utf8_lossy(&rebuilt_status.stdout);
+    assert!(
+        rebuilt_status.status.success(),
+        "status treated an identical rebuild as a finding: {rebuilt_status_text}\n{}",
+        String::from_utf8_lossy(&rebuilt_status.stderr)
+    );
+    assert!(
+        rebuilt_status_text
+            .contains("release/2026-08-04 names two commits with identical trees (a rebuilt cut)"),
+        "status omitted the rebuilt-cut note: {rebuilt_status_text}"
+    );
+    let rebuilt_plan_text = String::from_utf8_lossy(&rebuilt_plan.stdout);
+    assert!(
+        rebuilt_plan.status.success(),
+        "plan treated an identical rebuild as a finding: {rebuilt_plan_text}\n{}",
+        String::from_utf8_lossy(&rebuilt_plan.stderr)
+    );
+    assert!(
+        rebuilt_plan_text
+            .contains("release/2026-08-04 names two commits with identical trees (a rebuilt cut)"),
+        "plan omitted the rebuilt-cut note: {rebuilt_plan_text}"
     );
 }
 

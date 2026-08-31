@@ -435,6 +435,19 @@ pub enum ReleaseAction {
         #[arg(long, requires = "all")]
         no_github: bool,
     },
+    /// The release's parents: count, commits, and who still holds each.
+    ///
+    /// The count uses the repository's own parent list — the audit's worst
+    /// instrument error was counting `^parent` lines in prose. `--verify`
+    /// replays every member against the release and reports what it lacks.
+    Members {
+        /// The release ref to inspect. Defaults to the release in hand.
+        reference: Option<String>,
+        /// Replay each member's content against the release (heavier: one
+        /// replay per member) and report drop-guard anchors.
+        #[arg(long)]
+        verify: bool,
+    },
     /// Reap superseded dated cuts: forget their bookmarks everywhere, abandon their commits.
     /// The remote is never touched.
     ///

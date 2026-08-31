@@ -250,6 +250,21 @@ fn dispatch_release(
                 },
             )
         }
+        Some(ReleaseAction::Members { reference, verify }) => {
+            let registry = load(&default_config_path())?;
+            let Some(entry) = registry.get(chosen) else {
+                return Ok(Exit::Usage);
+            };
+            run_release_members(
+                chosen,
+                entry,
+                MembersInvocation {
+                    reference: reference.as_deref(),
+                    verify,
+                    output,
+                },
+            )
+        }
         Some(ReleaseAction::Reap) => run_reap(chosen.as_str()),
         Some(ReleaseAction::Include { branch, why }) => {
             run_release_edit(chosen.as_str(), &ReleaseEdit::Include { branch, why })
@@ -271,6 +286,60 @@ struct CarriesInvocation<'a> {
     all: bool,
     no_github: bool,
     output: Output,
+}
+
+#[derive(Clone, Copy)]
+struct MembersInvocation<'a> {
+    reference: Option<&'a str>,
+    verify: bool,
+    output: Output,
+}
+
+/// Inspect a release's direct parents and, on request, replay their content.
+fn run_release_members(
+    repo: &RepoName,
+    entry: &knives::config::RepoEntry,
+    request: MembersInvocation<'_>,
+) -> anyhow::Result<Exit> {
+    let opened = Repo::open(&entry.path)?;
+    let reference = match request.reference {
+        Some(reference) => std::borrow::Cow::Borrowed(reference),
+        None => {
+            let plan = release::plan(repo, entry, &entry.consumers)?;
+            let Some(reference) = plan.release else {
+                println!("{repo}: no release to inspect; cut one first");
+                return Ok(Exit::Incomplete);
+            };
+            std::borrow::Cow::Owned(reference)
+        }
+    };
+    let report = release::gather_members(&opened, entry, &reference, request.verify)?;
+    let exit = members_exit(&report, request.verify);
+    print_members(&report, request.output)?;
+    Ok(exit)
+}
+
+fn members_exit(report: &release::MembersReport, verify: bool) -> Exit {
+    if !report.problems.is_empty() {
+        Exit::Incomplete
+    } else if verify
+        && report.audit.as_ref().is_some_and(|audit| {
+            !audit.missing.is_empty() || !audit.unexplained.is_empty()
+        })
+    {
+        Exit::Findings
+    } else {
+        Exit::Ok
+    }
+}
+
+fn print_members(report: &release::MembersReport, output: Output) -> anyhow::Result<()> {
+    if let Some(payload) = knives::cli::machine_payload(output, report)? {
+        println!("{payload}");
+    } else {
+        println!("{}", release::render_members(report));
+    }
+    Ok(())
 }
 
 /// Answer one revision's carriage, or census every branch and anonymous head.
