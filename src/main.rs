@@ -9,16 +9,23 @@
 use std::process::ExitCode;
 
 use clap::Parser as _;
-use knives::cli::{Cli, Command, Exit, ReleaseAction};
+use knives::carriage::{
+    self, CarriesReport, CensusOptions, CensusReport, CheckInput, Target, TargetCheck, TargetRole,
+};
+use knives::cli::{Cli, Command, Exit, Output, ReleaseAction};
 use knives::commands::{
-    hook, init, notch, pr, preflight, register, release, repos, start, status, sync,
+    audit, consumers, hook, init, notch, pr, preflight, pushed, register, release, repos, start,
+    status, sync,
 };
 use knives::config::{default_config_path, load};
-use knives::detect::RebaseOutcome;
 use knives::forge::github::CliForge;
 use knives::forge::{Forge, PullRequest};
 use knives::ids::{BranchName, BranchTarget, ReleaseScheme, RepoName, Requirement};
+use knives::jj::Repo;
 use knives::ledger::{Draft, Kind, Ledger, Scribe};
+use knives::release_model::{
+    RecordedCut, carried_branches, carried_from_tips, last_recorded_cut, previous_release_for_cut,
+};
 use knives::store::{Store, default_state_path};
 
 fn main() -> ExitCode {
@@ -43,6 +50,23 @@ fn dispatch() -> anyhow::Result<Exit> {
         Command::Init { repo } => init::run(repo),
         Command::Register { repo } => register::run(repo),
         Command::Repos => repos::run(),
+        Command::Consumers { fork, consumer } => {
+            let Some(name) = one_repo(fork.as_deref())? else {
+                return Ok(Exit::Usage);
+            };
+            run_consumers(&name, &consumer, output)
+        }
+        Command::Pushed { branches, repo } => {
+            let Some(name) = one_repo(repo.as_deref())? else {
+                return Ok(Exit::Usage);
+            };
+            run_pushed(&name, &branches, output)
+        }
+        Command::Audit {
+            repo,
+            all,
+            no_github,
+        } => run_audit(repo.as_deref(), all, output, !no_github),
         Command::Status {
             repo,
             all,
@@ -125,6 +149,10 @@ fn dispatch() -> anyhow::Result<Exit> {
             subject,
             message,
             evidence,
+            disposition,
+            dispositions,
+            events,
+            verify,
             pr,
             repo,
         } => {
@@ -145,6 +173,10 @@ fn dispatch() -> anyhow::Result<Exit> {
                     message: message.as_deref(),
                     evidence: &evidence,
                     pr,
+                    disposition: disposition.as_deref(),
+                    dispositions,
+                    events,
+                    verify,
                 },
                 output,
             )
@@ -165,7 +197,7 @@ fn dispatch() -> anyhow::Result<Exit> {
             };
             let extra: Vec<&std::path::Path> =
                 consumer.iter().map(std::path::PathBuf::as_path).collect();
-            dispatch_release(&chosen, action, &extra)
+            dispatch_release(&chosen, action, &extra, output)
         }
         Command::Gh { args } => match knives::commands::gh::run(&args)? {},
     }
@@ -202,11 +234,93 @@ fn one_repo(requested: Option<&str>) -> anyhow::Result<Option<RepoName>> {
     }
 }
 
+/// Census the checkouts that consume one fork's releases.
+fn run_consumers(
+    fork: &RepoName,
+    extras: &[std::path::PathBuf],
+    output: Output,
+) -> anyhow::Result<Exit> {
+    let registry = load(&default_config_path())?;
+    let Some(entry) = registry.get(fork) else {
+        let known: Vec<String> = registry.names().map(|name| name.to_string()).collect();
+        eprintln!("unknown repo {fork}; known: {}", known.join(", "));
+        return Ok(Exit::Usage);
+    };
+    let mut paths = entry.consumers.clone();
+    paths.extend(extras.iter().cloned());
+    paths.sort();
+    paths.dedup();
+    let report = consumers::gather(&consumers::Request {
+        fork,
+        entry,
+        consumers: &paths,
+    });
+    if let Some(payload) = knives::cli::machine_payload(output, &report)? {
+        println!("{payload}");
+    } else {
+        println!("{}", consumers::render(&report));
+    }
+    Ok(consumers::exit_for(&report))
+}
+
+/// Reconcile one fork's local bookmarks with the live refs on their owning remotes.
+fn run_pushed(repo: &RepoName, branches: &[String], output: Output) -> anyhow::Result<Exit> {
+    let registry = load(&default_config_path())?;
+    let Some(entry) = registry.get(repo) else {
+        let known: Vec<String> = registry.names().map(|name| name.to_string()).collect();
+        eprintln!("unknown repo {repo}; known: {}", known.join(", "));
+        return Ok(Exit::Usage);
+    };
+    let store = Store::open(default_state_path())?;
+    let report = pushed::gather(repo, entry, &store, branches);
+    if let Some(payload) = knives::cli::machine_payload(output, &report)? {
+        println!("{payload}");
+    } else {
+        println!("{}", pushed::render(&report));
+    }
+    Ok(pushed::exit_for(&report))
+}
+
+/// Reconcile every requested fork's remote refs, release records, and anonymous heads.
+fn run_audit(
+    requested: Option<&str>,
+    all: bool,
+    output: Output,
+    use_forge: bool,
+) -> anyhow::Result<Exit> {
+    let chosen = match selected(requested, all)? {
+        Ok(chosen) => chosen,
+        Err(exit) => return Ok(exit),
+    };
+    let store = Store::open(default_state_path())?;
+    let cli_forge = CliForge;
+    let forge = use_forge.then_some(&cli_forge as &dyn Forge);
+    let cache_root = knives::forge_cache::cache_root();
+    let mut worst = Exit::Ok;
+    for (repo, entry) in chosen {
+        let report = audit::gather(&audit::AuditInput {
+            repo: &repo,
+            entry: &entry,
+            store: &store,
+            forge,
+            cache_root: cache_root.as_deref(),
+        });
+        if let Some(payload) = knives::cli::machine_payload(output, &report)? {
+            println!("{payload}");
+        } else {
+            println!("{}", audit::render(&report));
+        }
+        worst = worst.worst(audit::exit_for(&report));
+    }
+    Ok(worst)
+}
+
 /// Plan, curate or cut a release.
 fn dispatch_release(
     chosen: &RepoName,
     action: Option<ReleaseAction>,
     extra_consumers: &[&std::path::Path],
+    output: Output,
 ) -> anyhow::Result<Exit> {
     match action {
         None => run_release(chosen.as_str(), extra_consumers, &ReleaseInvocation::Plan),
@@ -224,12 +338,42 @@ fn dispatch_release(
                 cache_root.as_deref(),
             )
         }
-        Some(ReleaseAction::Carries { revision, target }) => {
+        Some(ReleaseAction::Carries {
+            revision,
+            target,
+            all,
+            no_github,
+        }) => {
             let registry = load(&default_config_path())?;
             let Some(entry) = registry.get(chosen) else {
                 return Ok(Exit::Usage);
             };
-            run_release_carries(chosen, entry, &revision, target.as_deref())
+            run_release_carries(
+                chosen,
+                entry,
+                CarriesInvocation {
+                    revision: revision.as_deref(),
+                    target: target.as_deref(),
+                    all,
+                    no_github,
+                    output,
+                },
+            )
+        }
+        Some(ReleaseAction::Members { reference, verify }) => {
+            let registry = load(&default_config_path())?;
+            let Some(entry) = registry.get(chosen) else {
+                return Ok(Exit::Usage);
+            };
+            run_release_members(
+                chosen,
+                entry,
+                MembersInvocation {
+                    reference: reference.as_deref(),
+                    verify,
+                    output,
+                },
+            )
         }
         Some(ReleaseAction::Reap) => run_reap(chosen.as_str()),
         Some(ReleaseAction::Include { branch, why }) => {
@@ -245,45 +389,314 @@ fn dispatch_release(
     }
 }
 
-/// Answer "does <target> carry <revision>" with the replay test, not text search.
+#[derive(Clone, Copy)]
+struct CarriesInvocation<'a> {
+    revision: Option<&'a str>,
+    target: Option<&'a str>,
+    all: bool,
+    no_github: bool,
+    output: Output,
+}
+
+#[derive(Clone, Copy)]
+struct MembersInvocation<'a> {
+    reference: Option<&'a str>,
+    verify: bool,
+    output: Output,
+}
+
+/// Inspect a release's direct parents and, on request, replay their content.
+fn run_release_members(
+    repo: &RepoName,
+    entry: &knives::config::RepoEntry,
+    request: MembersInvocation<'_>,
+) -> anyhow::Result<Exit> {
+    let opened = Repo::open(&entry.path)?;
+    let reference = if let Some(reference) = request.reference {
+        std::borrow::Cow::Borrowed(reference)
+    } else {
+        let plan = release::plan(repo, entry, &entry.consumers)?;
+        let Some(reference) = plan.release else {
+            println!("{repo}: no release to inspect; cut one first");
+            return Ok(Exit::Incomplete);
+        };
+        std::borrow::Cow::Owned(reference)
+    };
+    let report = release::gather_members(&opened, entry, &reference, request.verify)?;
+    let exit = members_exit(&report, request.verify);
+    print_members(&report, request.output)?;
+    Ok(exit)
+}
+
+fn members_exit(report: &release::MembersReport, verify: bool) -> Exit {
+    if !report.problems.is_empty() {
+        Exit::Incomplete
+    } else if verify
+        && report
+            .audit
+            .as_ref()
+            .is_some_and(|audit| !audit.missing.is_empty() || !audit.unexplained.is_empty())
+    {
+        Exit::Findings
+    } else {
+        Exit::Ok
+    }
+}
+
+fn print_members(report: &release::MembersReport, output: Output) -> anyhow::Result<()> {
+    if let Some(payload) = knives::cli::machine_payload(output, report)? {
+        println!("{payload}");
+    } else {
+        println!("{}", release::render_members(report));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CarriesMode {
+    Bare,
+    ExplicitTarget,
+}
+
+/// Answer one revision's carriage, or census every maintained branch.
 fn run_release_carries(
     repo: &RepoName,
     entry: &knives::config::RepoEntry,
-    revision: &str,
-    target: Option<&str>,
+    request: CarriesInvocation<'_>,
 ) -> anyhow::Result<Exit> {
-    let named = match target {
-        Some(reference) => reference.to_owned(),
-        None => {
-            if let Some(name) = release::plan(repo, entry, &entry.consumers)?.release {
-                name
-            } else {
-                println!("{repo}: no release to check against; cut one or pass --in <ref>");
-                return Ok(Exit::Incomplete);
-            }
+    if request.all {
+        let forge = CliForge;
+        let forge: Option<&dyn Forge> = (!request.no_github).then_some(&forge);
+        let cache_root = knives::forge_cache::cache_root();
+        let report = carriage::census(
+            repo,
+            entry,
+            forge,
+            CensusOptions {
+                cache_root: cache_root.as_deref(),
+                workers: parallelism(),
+            },
+        )?;
+        let exit = census_exit(&report);
+        print_census(&report, request.output)?;
+        return Ok(exit);
+    }
+    let Some(revision) = request.revision else {
+        return Ok(Exit::Usage);
+    };
+    run_revision_carries(repo, entry, request, revision)
+}
+
+fn run_revision_carries(
+    repo: &RepoName,
+    entry: &knives::config::RepoEntry,
+    request: CarriesInvocation<'_>,
+    revision: &str,
+) -> anyhow::Result<Exit> {
+    let opened = Repo::open(&entry.path)?;
+    let tip = match opened.resolve_commit(revision) {
+        Ok(tip) => tip,
+        Err(error) => {
+            let report = carries_problem(
+                repo,
+                revision.to_owned(),
+                format!("cannot resolve revision {revision}: {error}"),
+            );
+            print_carries(&report, request.output)?;
+            return Ok(Exit::Incomplete);
         }
     };
-    let outcome =
-        knives::jj::probe_landed(&entry.path, &knives::ids::BranchName::new(revision), &named)?;
-    Ok(match outcome {
-        RebaseOutcome::Empty => {
-            println!("{repo}: {revision} is carried in {named}: replaying it leaves nothing");
-            Exit::Ok
-        }
-        RebaseOutcome::CleanNonEmpty => {
-            println!(
-                "{repo}: {revision} is NOT carried in {named}: replaying it leaves real diffs"
+    let trunk_name = entry.upstream_trunk();
+    let trunk = match opened.resolve_commit(&trunk_name) {
+        Ok(trunk) => trunk,
+        Err(error) => {
+            let report = carries_problem(
+                repo,
+                carries_revision(revision, &tip),
+                format!("cannot resolve upstream trunk {trunk_name}: {error}"),
             );
-            Exit::Findings
+            print_carries(&report, request.output)?;
+            return Ok(Exit::Incomplete);
         }
-        RebaseOutcome::Conflicted => {
-            println!(
-                "{repo}: {revision} conflicts with {named}: some of its content is there, \
-                 or unrelated work touched the same files; judge it by eye"
-            );
-            Exit::Findings
+    };
+    let tips = opened.bookmark_tips()?;
+    let all_targets = carriage::targets(
+        &tips,
+        &entry.release_scheme(),
+        (trunk_name.as_str(), trunk),
+        entry.publish_remote(),
+    );
+    let mode = request
+        .target
+        .map_or(CarriesMode::Bare, |_| CarriesMode::ExplicitTarget);
+    let (mut selected, superseded) = match request.target {
+        Some(target) => match selected_carries_targets(&opened, &all_targets, target) {
+            Ok(targets) => (targets, Vec::new()),
+            Err(error) => {
+                let report = carries_problem(
+                    repo,
+                    carries_revision(revision, &tip),
+                    format!("cannot resolve target {target}: {error}"),
+                );
+                print_carries(&report, request.output)?;
+                return Ok(Exit::Incomplete);
+            }
+        },
+        None => all_targets
+            .into_iter()
+            .partition(|target| target.role != TargetRole::SupersededRelease),
+    };
+    if let (Some(requested), Some(selected_target)) = (request.target, selected.first_mut())
+        && requested == trunk_name
+    {
+        selected_target.role = TargetRole::UpstreamTrunk;
+    }
+    let checks = CarriesChecks {
+        input: CheckInput {
+            repo: &opened,
+            revision,
+            tip: &tip,
+        },
+        fallback: request.target.unwrap_or(trunk_name.as_str()),
+    };
+    let mut report = CarriesReport {
+        repo: repo.to_string(),
+        revision: carries_revision(revision, &tip),
+        checks: Vec::with_capacity(selected.len() + superseded.len()),
+        notes: Vec::new(),
+        problems: Vec::new(),
+    };
+    checks.append(&mut report, selected);
+    let exit = carries_exit(&mut report, &checks, superseded, mode);
+    print_carries(&report, request.output)?;
+    Ok(exit)
+}
+
+fn carries_exit(
+    report: &mut CarriesReport,
+    checks: &CarriesChecks<'_>,
+    superseded: Vec<Target>,
+    mode: CarriesMode,
+) -> Exit {
+    if !report.problems.is_empty() {
+        return Exit::Incomplete;
+    }
+    match mode {
+        CarriesMode::Bare => {
+            if !carries_safe(report) {
+                checks.append(report, superseded);
+            }
+            if carries_safe(report) {
+                Exit::Ok
+            } else {
+                Exit::Findings
+            }
         }
+        CarriesMode::ExplicitTarget => {
+            if report.checks.iter().all(|check| check.verdict.carried()) {
+                Exit::Ok
+            } else {
+                Exit::Findings
+            }
+        }
+    }
+}
+
+struct CarriesChecks<'a> {
+    input: CheckInput<'a>,
+    fallback: &'a str,
+}
+
+impl CarriesChecks<'_> {
+    fn append(&self, report: &mut CarriesReport, targets: Vec<Target>) {
+        for target in targets {
+            let target_name = carriage::target_name(&target, self.fallback);
+            match carriage::check(&self.input, &target) {
+                Ok(check) => report.checks.push(TargetCheck {
+                    target: target_name,
+                    commit: target.commit,
+                    role: target.role,
+                    verdict: check.verdict,
+                    evidence: check.evidence,
+                }),
+                Err(error) => report
+                    .problems
+                    .push(format!("cannot check {target_name}: {error}")),
+            }
+        }
+    }
+}
+
+fn carries_safe(report: &CarriesReport) -> bool {
+    report.checks.iter().any(|check| {
+        check.verdict.carried()
+            && matches!(
+                check.role,
+                TargetRole::LiveRelease | TargetRole::UpstreamTrunk
+            )
     })
+}
+
+fn carries_problem(repo: &RepoName, revision: String, problem: String) -> CarriesReport {
+    CarriesReport {
+        repo: repo.to_string(),
+        revision,
+        checks: Vec::new(),
+        notes: Vec::new(),
+        problems: vec![problem],
+    }
+}
+
+fn selected_carries_targets(
+    opened: &Repo,
+    known_targets: &[Target],
+    target: &str,
+) -> anyhow::Result<Vec<Target>> {
+    let commit = opened.resolve_commit(target)?;
+    let role = known_targets
+        .iter()
+        .find(|known| known.commit == commit)
+        .map_or(TargetRole::SupersededRelease, |known| known.role);
+    Ok(vec![Target {
+        refs: Vec::new(),
+        commit,
+        role,
+    }])
+}
+
+fn carries_revision(revision: &str, tip: &knives::ids::CommitId) -> String {
+    format!(
+        "{revision} @ {}",
+        tip.as_str().chars().take(12).collect::<String>()
+    )
+}
+
+fn print_carries(report: &CarriesReport, output: Output) -> anyhow::Result<()> {
+    if let Some(payload) = knives::cli::machine_payload(output, report)? {
+        println!("{payload}");
+    } else {
+        println!("{}", carriage::render_carries(report));
+    }
+    Ok(())
+}
+
+fn census_exit(report: &CensusReport) -> Exit {
+    if !report.problems.is_empty() || report.rows.iter().any(|row| row.in_open_pull.is_none()) {
+        Exit::Incomplete
+    } else if report.orphans.is_empty() {
+        Exit::Ok
+    } else {
+        Exit::Findings
+    }
+}
+
+fn print_census(report: &CensusReport, output: Output) -> anyhow::Result<()> {
+    if let Some(payload) = knives::cli::machine_payload(output, report)? {
+        println!("{payload}");
+    } else {
+        println!("{}", carriage::render_census(report));
+    }
+    Ok(())
 }
 
 /// Rebase the whole composition onto an upstream commit: `jj rebase -b <release> -d <target>`.
@@ -1292,7 +1705,7 @@ fn advance_edit(
     from: Option<&str>,
 ) -> anyhow::Result<EditOutcome> {
     let tips = context.opened.bookmark_tips()?;
-    let carried = release::carried_from_tips(&tips, entry.trunk(), &entry.release_scheme());
+    let carried = carried_from_tips(&tips, entry.trunk(), &entry.release_scheme());
     let outcome = if let Some(from) = from {
         let [branch] = branches else {
             println!(
@@ -1594,7 +2007,7 @@ fn parent_sources(
     parents: &[knives::ids::CommitId],
 ) -> anyhow::Result<Vec<(String, knives::ids::CommitId)>> {
     let tips = opened.bookmark_tips()?;
-    let carried = release::carried_from_tips(&tips, entry.trunk(), scheme);
+    let carried = carried_from_tips(&tips, entry.trunk(), scheme);
     let trunk_tip = opened.resolve_commit(&entry.upstream_trunk()).ok();
     let mut sources = Vec::new();
     for commit in parents {
@@ -2054,7 +2467,7 @@ fn run_pr(
     } else {
         println!("{}", pr::render(&report));
     }
-    Ok(Exit::Ok)
+    Ok(pr::exit_for(&report))
 }
 
 fn run_status(requested: Option<&str>, view: StatusView) -> anyhow::Result<Exit> {
@@ -2192,7 +2605,7 @@ fn run_release(
                 return Ok(exit);
             }
             let tips = opened.bookmark_tips()?;
-            let previous = release::previous_release_for_cut(&entry, &tips);
+            let previous = previous_release_for_cut(&entry, &tips);
             let previous_commit = previous.as_ref().map(|(_, commit)| commit.clone());
             // A cut is a new name for the composition in hand, never a recomputation:
             // with a previous release its parents are carried verbatim — nothing joins,
@@ -2212,7 +2625,7 @@ fn run_release(
                     .unwrap_or_else(|| trunk.clone());
                 (carried, members, base)
             } else {
-                let carried = release::carried_branches(&opened, entry.trunk(), &scheme)?;
+                let carried = carried_branches(&opened, entry.trunk(), &scheme)?;
                 if carried.is_empty() {
                     println!(
                         "{repo}: no branches to cut; a release is a flat merge of feature \
@@ -2373,8 +2786,8 @@ fn recorded_composition_check(
     candidate: &mut knives::jj::Candidate,
     gate: &CompositionGate<'_>,
     allow_drop: bool,
-) -> anyhow::Result<Result<(Option<release::RecordedCut>, release::CompositionCheck), Exit>> {
-    let recorded = release::last_recorded_cut(&Ledger::for_repo(repo).entries()?);
+) -> anyhow::Result<Result<(Option<RecordedCut>, release::CompositionCheck), Exit>> {
+    let recorded = last_recorded_cut(&Ledger::for_repo(repo).entries()?, None);
     let check = match &recorded {
         Some(recorded) => release::uncarried_recorded_members(
             gate.opened,
@@ -2406,7 +2819,7 @@ fn recorded_composition_check(
 /// abandoned and nothing needs cleanup.
 fn report_uncarried_cut(
     repo: &RepoName,
-    recorded: Option<&release::RecordedCut>,
+    recorded: Option<&RecordedCut>,
     check: &release::CompositionCheck,
     allow_drop: bool,
 ) -> Option<Exit> {
@@ -2453,7 +2866,7 @@ struct CompletedCut<'a> {
     created: &'a knives::ids::CommitId,
     audit: &'a release::CutAudit,
     scheme: &'a ReleaseScheme,
-    recorded: Option<&'a release::RecordedCut>,
+    recorded: Option<&'a RecordedCut>,
     check: &'a release::CompositionCheck,
 }
 
@@ -2516,6 +2929,7 @@ fn record_cut_event(
     scribe_for(repo, entry)?.record(&Draft {
         subject: Some(cut.name),
         kind: Kind::Event,
+        disposition: None,
         text: format!(
             "cut {} as {} with {} parent(s): {members_text}{delta}",
             cut.name,
@@ -2571,7 +2985,7 @@ fn report_completed_cut(
         .map(|(branch, _)| branch.clone())
         .collect();
     carried_names.extend(
-        release::carried_branches(opened, entry.trunk(), &entry.release_scheme())?
+        carried_branches(opened, entry.trunk(), &entry.release_scheme())?
             .into_iter()
             .map(|(branch, _)| branch),
     );
@@ -2626,7 +3040,7 @@ fn check_orphan_commits_before_cut(
 ) -> anyhow::Result<Option<OrphanedLineage>> {
     let scheme = entry.release_scheme();
     let tips = opened.bookmark_tips()?;
-    let Some(previous) = release::previous_release_for_cut(entry, &tips) else {
+    let Some(previous) = previous_release_for_cut(entry, &tips) else {
         return Ok(None);
     };
     let mut keep: Vec<knives::ids::CommitId> = tips
@@ -2641,7 +3055,13 @@ fn check_orphan_commits_before_cut(
         })
         .collect();
     keep.push(trunk);
-    let orphans = release::orphaned_commits(&entry.path, &previous.1, &keep, &tips)?;
+    let orphans = release::orphaned_commits(release::OrphanedCommitInput {
+        repo_path: &entry.path,
+        previous: &previous.1,
+        keep: &keep,
+        tips: &tips,
+        publish_remote: entry.publish_remote(),
+    })?;
     if orphans.is_empty() {
         return Ok(None);
     }
@@ -2670,7 +3090,7 @@ fn cut_request(name: String, carried: &[(String, knives::ids::CommitId)]) -> rel
 /// is still the newest dated name and nothing is reaped at all.
 fn reap_after_cut(repo: &RepoName, entry: &knives::config::RepoEntry) -> anyhow::Result<Exit> {
     let reopened = knives::jj::Repo::open(&entry.path)?;
-    let report = release::reap_superseded(&entry.path, &reopened)?;
+    let report = release::reap_superseded(&entry.path, &reopened, entry.publish_remote())?;
     print_reap(&repo.to_string(), &report);
     Ok(reap_exit(&report))
 }
@@ -2684,7 +3104,7 @@ fn run_reap(name: &str) -> anyhow::Result<Exit> {
     let mut worst = Exit::Ok;
     for (repo, entry) in chosen {
         let opened = knives::jj::Repo::open(&entry.path)?;
-        let report = release::reap_superseded(&entry.path, &opened)?;
+        let report = release::reap_superseded(&entry.path, &opened, entry.publish_remote())?;
         print_reap(&repo.to_string(), &report);
         worst = worst.worst(reap_exit(&report));
     }

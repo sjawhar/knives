@@ -2,7 +2,7 @@ use super::{
     BTreeMap, BookmarkRef, BookmarkTips, BranchName, BranchRow, BranchTarget, ChecksSummary,
     CommitId, JjError, LandedVerdict, LastNotch, Notch, OriginRelation, PriorPull, PullDetails,
     PullIndex, PullRequest, PullSummary, ReleaseScheme, Repo, RepoEntry, RepoName, Report,
-    StatedPull, Store, fmt, is_release_name, newest_for, pull_number_from_bookmark,
+    StatedPull, Store, fmt, is_release_name, pull_number_from_bookmark,
 };
 
 use super::phases::ProbeInput;
@@ -185,7 +185,12 @@ pub(super) fn divergent_rows(input: &DivergentInput<'_, '_>) -> Vec<BranchRow> {
                         remote: crate::ids::RemoteName::new("origin"),
                     })
                     .cloned(),
-                last_notch: newest_for(input.notches, branch.as_str()).map(LastNotch::of),
+                last_notch: LastNotch::of(
+                    input
+                        .notches
+                        .iter()
+                        .filter(|notch| notch.subject.as_deref() == Some(branch.as_str())),
+                ),
                 // Nothing to replay: a divergent bookmark has no single commit to probe.
                 ..BranchRow::bare(branch.clone(), None)
             }
@@ -256,7 +261,12 @@ pub(super) fn branch_rows(
         );
         let origin_relation = record_origin_relation(report, &branch, relation);
         let target = BranchTarget::new(row_input.name.clone(), branch.clone());
-        let last_notch = newest_for(row_input.notches, branch.as_str()).map(LastNotch::of);
+        let last_notch = LastNotch::of(
+            row_input
+                .notches
+                .iter()
+                .filter(|notch| notch.subject.as_deref() == Some(branch.as_str())),
+        );
         report.branches.push(BranchRow {
             prior_pulls: prior_pulls_for(&branch, &row_input.index.prior),
             name: branch,

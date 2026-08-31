@@ -17,10 +17,11 @@ use crate::ids::{
     pull_number_from_bookmark,
 };
 use crate::jj::{JjError, Repo, branches_past, probe_landed};
-use crate::ledger::{Entry as Notch, Ledger, newest_for};
+use crate::ledger::{Entry as Notch, Ledger};
+use crate::release_model::{double_cut_findings, release_order};
 use crate::store::Store;
 
-use crate::ids::{RELEASE_PREFIX, is_our_release};
+use crate::ids::is_our_release;
 
 pub mod phases;
 pub mod render;
@@ -126,24 +127,40 @@ pub struct StatedPull {
     pub state: String,
 }
 
-/// The part of a ledger entry a branch row carries.
+/// The most relevant ledger entry for one status row and the entries it masks.
 ///
-/// Three fields, not the entry: a row is not the place to re-print an owner, an
-/// anchor and a list of evidence that `knives notch <branch>` shows in full.
+/// A row does not re-print an owner, anchor, or evidence list: `knives notch`
+/// shows that complete chronology.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct LastNotch {
     pub ts: String,
     pub kind: crate::ledger::Kind,
     pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disposition: Option<String>,
+    pub count: usize,
 }
 
 impl LastNotch {
-    fn of(entry: &Notch) -> Self {
-        Self {
+    fn of<'a>(entries: impl Iterator<Item = &'a Notch>) -> Option<Self> {
+        let mut count = 0;
+        let mut newest = None;
+        let mut newest_note = None;
+        for entry in entries {
+            count += 1;
+            newest = Some(entry);
+            if entry.kind == crate::ledger::Kind::Note {
+                newest_note = Some(entry);
+            }
+        }
+        let entry = newest_note.or(newest)?;
+        Some(Self {
             ts: entry.ts.clone(),
             kind: entry.kind,
             text: entry.text.clone(),
-        }
+            disposition: entry.disposition.clone(),
+            count,
+        })
     }
 }
 
@@ -562,15 +579,11 @@ fn notches_from_ledger(ledger: Option<&Ledger>, report: &mut Report) -> Vec<Notc
 }
 
 fn repo_notches(notches: &[Notch]) -> Option<RepoNotches> {
-    let mut count = 0;
-    let mut last = None;
-    for notch in notches {
-        if notch.subject.is_none() {
-            count += 1;
-            last = Some(LastNotch::of(notch));
-        }
-    }
-    last.map(|last| RepoNotches { count, last })
+    let last = LastNotch::of(notches.iter().filter(|notch| notch.subject.is_none()))?;
+    Some(RepoNotches {
+        count: last.count,
+        last,
+    })
 }
 
 /// Fold the release scan into a report.
@@ -597,6 +610,14 @@ fn add_releases(
     )?;
     report.releases = names;
     report.findings.extend(findings);
+    let (double_cut_findings, double_cut_notes) = double_cut_findings(
+        &entry.path,
+        tips,
+        &entry.release_scheme(),
+        entry.publish_remote(),
+    )?;
+    report.findings.extend(double_cut_findings);
+    report.notes.extend(double_cut_notes);
     if skipped > 0 {
         report
             .notes
@@ -630,13 +651,24 @@ fn touching(claims: &[crate::store::Claim]) -> BTreeMap<String, Vec<String>> {
         .collect()
 }
 
+#[derive(Clone, Copy)]
+struct CarriedFindingInput<'a> {
+    report: &'a Report,
+    repo: &'a Repo,
+    trunk: &'a str,
+    scheme: &'a ReleaseScheme,
+    publish_remote: &'a str,
+}
+
 /// Reports branches carried by another branch, excluding the configured trunk.
-fn carried_findings(
-    report: &Report,
-    repo: &Repo,
-    trunk: &str,
-    scheme: &ReleaseScheme,
-) -> anyhow::Result<Vec<Finding>> {
+fn carried_findings(input: CarriedFindingInput<'_>) -> anyhow::Result<Vec<Finding>> {
+    let CarriedFindingInput {
+        report,
+        repo,
+        trunk,
+        scheme,
+        publish_remote,
+    } = input;
     let mut findings = Vec::new();
     for row in &report.branches {
         let Some(tip) = row.tip.as_ref() else {
@@ -646,7 +678,7 @@ fn carried_findings(
             continue;
         }
         let carriers = repo
-            .branches_containing(tip, scheme)?
+            .branches_containing(tip, scheme, publish_remote)?
             .into_iter()
             // A same-named upstream ref can contain commits ahead of ours, but this
             // deliberately treats every same-named ref as the branch itself.
@@ -840,12 +872,15 @@ fn fold_phase_outcome(
     timings.divergent_rows = phase.elapsed();
 
     let phase = std::time::Instant::now();
-    report.findings.extend(carried_findings(
+    let scheme = input.entry.release_scheme();
+    let carried = carried_findings(CarriedFindingInput {
         report,
-        input.repo,
-        input.entry.trunk(),
-        &input.entry.release_scheme(),
-    )?);
+        repo: input.repo,
+        trunk: input.entry.trunk(),
+        scheme: &scheme,
+        publish_remote: input.entry.publish_remote(),
+    })?;
+    report.findings.extend(carried);
     timings.carried_findings = phase.elapsed();
 
     timings.touching = add_branch_overlap_findings(report, input.entry, input.options.workers);
@@ -938,7 +973,8 @@ pub fn gather_timed(
     let trunk_commit = repo.resolve_commit(&entry.upstream_trunk()).ok();
     let probe_ran = options.probe && trunk_commit.is_some();
     let (mut phases, health) = std::thread::scope(|scope| {
-        let health = scope.spawn(|| phases::repository_health(&entry.path, &tips));
+        let health =
+            scope.spawn(|| phases::repository_health(&entry.path, &tips, entry.publish_remote()));
         let phases = phases::run_status_phases(phases::StatusPhaseInput {
             entry,
             options,
@@ -988,20 +1024,6 @@ pub fn gather(
     gather_timed(name, entry, store, options).map(|(report, _)| report)
 }
 
-/// Order a dated release name so numeric suffixes compare numerically.
-///
-/// String order is wrong here: `release/2026-07-28.10` sorts BELOW
-/// `release/2026-07-28.2` because "1" < "2". The tenth repair of one day then
-/// silently audits the wrong release. Returns the date part and the suffix as
-/// separate comparable pieces.
-pub fn release_order(name: &str) -> (String, u32) {
-    let bare = name.strip_prefix(RELEASE_PREFIX).unwrap_or(name);
-    match bare.split_once('.') {
-        Some((date, suffix)) => (date.to_owned(), suffix.parse().unwrap_or(0)),
-        None => (bare.to_owned(), 0),
-    }
-}
-
 /// Which releases are worth checking for stale parents.
 ///
 /// Not all of them. A fork accumulates every dated release it ever cut, and
@@ -1024,7 +1046,7 @@ fn releases_to_scan(
         ReleaseScheme::Dated => {
             let all: Vec<(&BookmarkRef, &CommitId)> = tips
                 .iter()
-                .filter(|(reference, _)| is_our_release(reference, scheme))
+                .filter(|(reference, _)| is_our_release(reference, scheme, publish_remote))
                 .collect();
 
             let newest = |local: bool| {
@@ -1298,6 +1320,37 @@ mod tests {
     }
 
     #[test]
+    fn the_notch_cell_prefers_the_newest_note_over_a_newer_event() {
+        // Removing the preference would let a mechanical transition mask the
+        // human ruling that tells a reader how to interpret this branch.
+        let note = Notch {
+            ts: "2026-08-15T22:14:01Z".to_owned(),
+            owner: "ses_fff688".to_owned(),
+            subject: Some("feat/alpha".to_owned()),
+            kind: crate::ledger::Kind::Note,
+            disposition: Some("ruled-out".to_owned()),
+            text: "split to a plugin".to_owned(),
+            evidence: Vec::new(),
+            anchor: None,
+            pr: None,
+        };
+        let event = Notch {
+            ts: "2026-08-15T22:14:02Z".to_owned(),
+            kind: crate::ledger::Kind::Event,
+            disposition: None,
+            text: "sync advanced".to_owned(),
+            ..note.clone()
+        };
+
+        let last = LastNotch::of([&note, &event].into_iter()).expect("a notch");
+
+        assert_eq!(last.kind, crate::ledger::Kind::Note);
+        assert_eq!(last.text, "split to a plugin");
+        assert_eq!(last.disposition.as_deref(), Some("ruled-out"));
+        assert_eq!(last.count, 2);
+    }
+
+    #[test]
     fn only_the_newest_release_on_each_side_is_scanned() {
         // A fork accumulates every release it ever cut, and every one of their parents
         // has moved on, so scanning them all filled the report with stale-parent
@@ -1349,25 +1402,39 @@ mod tests {
         // promptly picked an upstream release as ours. One predicate now.
         assert!(is_our_release(
             &local("release/2026-07-29"),
-            &ReleaseScheme::Dated
+            &ReleaseScheme::Dated,
+            "release"
         ));
         assert!(is_our_release(
             &remote("release/2026-07-29", "origin"),
-            &ReleaseScheme::Dated
+            &ReleaseScheme::Dated,
+            "origin"
         ));
         assert!(is_our_release(
             &remote("release/2026-07-29", "release"),
-            &ReleaseScheme::Dated
+            &ReleaseScheme::Dated,
+            "release"
+        ));
+        assert!(!is_our_release(
+            &remote("release/2026-07-29", "origin"),
+            &ReleaseScheme::Dated,
+            "release"
         ));
         assert!(!is_our_release(
             &remote("release/2026-07-29", "upstream"),
-            &ReleaseScheme::Dated
+            &ReleaseScheme::Dated,
+            "origin"
         ));
         assert!(!is_our_release(
             &remote("release/2026-07-29", "git"),
-            &ReleaseScheme::Dated
+            &ReleaseScheme::Dated,
+            "origin"
         ));
-        assert!(!is_our_release(&local("feat/alpha"), &ReleaseScheme::Dated));
+        assert!(!is_our_release(
+            &local("feat/alpha"),
+            &ReleaseScheme::Dated,
+            "origin"
+        ));
     }
 
     #[test]

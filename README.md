@@ -83,18 +83,22 @@ stated, dependencies recorded, the full parent set of every release cut, and eac
 pull request that merged, closed or advanced. Agents add their own judgments by hand:
 
 ```
-knives notch feat/log-queue -m "superseded by #1157; upstream wanted the trait approach" \
-  --evidence 06d778b9
-knives notch feat/log-queue
+knives notch '#1413' -m "split to a plugin; the original branch will not land" \
+  --disposition ruled-out --evidence https://forge.example/org/libcore/pull/1413
+knives notch --dispositions
+knives notch --verify '#1413'
 ```
 
-Every entry records the subject's tip at the time it was written, which is what keeps the
-record from rotting: a conclusion recorded against a commit the branch has since moved
-past is a reason to re-check rather than something to inherit. The ledger holds what
-happened and what was decided. It never holds anything a detector can recompute.
+A disposition is a terminal, past-tense ruling (`merged-elsewhere`, `withdrawn`, or
+`ruled-out`) backed by evidence; it remains a human note, not a detector result. A `#<n>`
+subject also stamps that pull request, so `knives notch --pr <n>` finds it without tracking a
+fictional branch. Bare `knives notch` shows the newest human notes and folds machine events into
+one count; `--events` reads their full chronology. `--verify` re-checks selected
+commit-shaped evidence and anchors against the repository as it is now.
 
-`knives status` carries each branch's newest entry on its row, so the question "what is
-this weird branch" is usually answered before you ask it.
+`knives status` carries the newest human note for each branch, preferring it over a newer machine
+event. Its compact notch cell prefixes a disposition, if any, and appends the count of entries it
+masks, so the question "what is this weird branch" is usually answered before you ask it.
 
 ## Install
 
@@ -172,6 +176,9 @@ are somewhere else.
 | | |
 |---|---|
 | `knives repos` | what is managed, the newest release each has cut, and whether consumer origin trunks are pinned behind it |
+| `knives consumers [FORK] [--consumer PATH]...` | compare registered and extra consumer pins with the newest release on the live publish remote; reports only |
+| `knives pushed [BRANCH]... [--repo REPO]` | compare local branches with the live remote refs that own them; reports only |
+| `knives audit [REPO] [--all] [--no-github]` | reconcile remote refs, open pull heads, recorded cuts, and anonymous heads; reports only and never repairs |
 | `knives status` | the main report |
 | `knives pr NUMBER [--repo REPO] [--timeline]` | one pull request's live state; `--timeline` adds its bounded forge event log |
 | `knives sync` | fetch, then classify what happened to each tracked pull request |
@@ -180,9 +187,10 @@ are somewhere else.
 | `knives finish [--allow-open]` | hand a branch back; by default, refuse when its pull request is open or cannot be checked, and use `--allow-open` to proceed |
 | `knives track` | state which pull request a branch belongs to, when inference cannot find it |
 | `knives depends` | record that a branch cannot land before another repo's pull request |
-| `knives notch` | what agents did and decided here, and add to it |
+| `knives notch [SUBJECT] [-m TEXT] [--disposition TOKEN]` | read the ledger or write a human note; dispositions require evidence, `--dispositions` reads terminal rulings, and `--verify` re-checks selected entries |
 | `knives release` | plan a release, edit its membership, cut one, or reap superseded cuts |
-| `knives release carries REVISION [--in TARGET]` | replay a revision onto a release and report whether its content is carried |
+| `knives release carries [REVISION] [--in TARGET] [--all]` | compare a revision's content with live releases and upstream trunk; `--all` censuses maintained branches, conditionally checks superseded releases, and reports qualified orphans |
+| `knives release members [REF] [--verify]` | list a release's direct member parents, their holders and advances; `--verify` audits every member's content in the release |
 | `knives init` | register a checkout |
 | `knives hook` | harness plumbing, not for humans |
 | `knives gh` | fork-aware `gh` passthrough |
@@ -221,8 +229,8 @@ Escape hatches:
 
 A release is a flat octopus merge of feature and fix branches, and its parent set is its membership: a branch is in the release exactly when the release has its parent. The upstream base is never a direct parent — every member forks from it, so it is reachable through each of them, and there is no role to classify. Membership changes only through stated edits. `knives release include` adds one parent, `knives release drop` removes one (saying so when no remaining member carries the dropped content), and `knives release advance` moves member parents to their branches' current tips — refusing outright, rather than silently deduping, if the same branch would replace more than one parent, and accepting `--from <old-sha>` to name one branch's old parent directly when a `jj duplicate` rebuild has left it with no ancestry back to the commit it replaces. `knives release rebase` moves the whole composition onto a newer upstream commit — the equivalent of `jj rebase -b <release> -d <target>` — members and their bookmarks moving together; bare, it targets the first upstream trunk commit that contains every merged pull request, then drops the members whose landed branches carry nothing more (`--no-drop` keeps them); with nothing merged it asks for a commit. Each edit duplicates the release onto the changed parent set, so recorded conflict resolutions carry forward and only the change itself can surface new conflicts. `knives release cut` names a new cut of the composition in hand, verbatim: nothing joins, nothing advances, and a branch created since the last release enters through `include`, never by existing. Only the first cut, with no composition to carry, starts from every branch.
 
-`knives release carries REVISION` replays the revision onto the release in hand and reports
-whether its content is carried. `--in TARGET` selects another release ref or revset.
+`knives release carries REVISION` compares the revision with every live release and the upstream
+trunk. `--in TARGET` selects exactly one target; `--all` censuses every maintained branch.
 
 Before cutting, the orphan gate verifies that no commits exist reachable only from the previous release lineage or its descendants; if commits would be stranded without a remaining bookmark or upstream trunk reaching them, the cut refuses and lists the exact commit IDs. Passing `--allow-drop` overrides this refusal when dropping those commits is intentional.
 

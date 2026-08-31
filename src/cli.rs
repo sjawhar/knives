@@ -9,6 +9,19 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
+fn disposition_token(value: &str) -> Result<String, String> {
+    match value {
+        "merged-elsewhere" | "withdrawn" | "ruled-out" => Ok(value.to_owned()),
+        _ => Err("a disposition must be one of: merged-elsewhere, withdrawn, ruled-out".to_owned()),
+    }
+}
+
+fn evidence_token(value: &str) -> Result<String, String> {
+    (!value.trim().is_empty())
+        .then(|| value.to_owned())
+        .ok_or_else(|| "evidence must not be blank".to_owned())
+}
+
 /// Process exit codes, as a type so a command cannot invent one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Exit {
@@ -151,6 +164,34 @@ pub enum Command {
     },
     /// List the repos knives manages, with their release state.
     Repos,
+    /// Which consumer checkouts and locks resolve this fork at which commit,
+    /// against the newest published release. Reports; never edits a consumer.
+    Consumers {
+        /// Registry name. Defaults to the repo you are standing in.
+        fork: Option<String>,
+        /// Extra consumer checkouts beyond the registry's list.
+        #[arg(long)]
+        consumer: Vec<PathBuf>,
+    },
+    /// Reconcile local branches against the live remote refs that own them.
+    Pushed {
+        /// Branches to verify. Defaults to every local bookmark.
+        branches: Vec<String>,
+        /// Registry name. Defaults to the repo you are standing in.
+        #[arg(long)]
+        repo: Option<String>,
+    },
+    /// Reconcile remote refs, open pull heads, recorded cuts, and anonymous heads.
+    Audit {
+        /// Registry name. Defaults to the repo you are standing in.
+        repo: Option<String>,
+        /// Every managed repository.
+        #[arg(long)]
+        all: bool,
+        /// Skip the bounded live pull-request-head check.
+        #[arg(long)]
+        no_github: bool,
+    },
     /// Fetch every remote and tracked pull ref, and classify each pull request.
     Sync {
         /// Registry name. Defaults to the repo you are standing in.
@@ -290,8 +331,23 @@ pub enum Command {
         message: Option<String>,
         /// A commit id, `file:line`, `<repo>#<number>` or URL backing the note.
         /// Repeatable, and it may name another repo.
-        #[arg(long, requires = "message")]
+        #[arg(long, requires = "message", value_parser = evidence_token)]
         evidence: Vec<String>,
+        /// Record a terminal ruling with this entry: merged-elsewhere,
+        /// withdrawn, ruled-out — one lowercase token. Requires -m and at
+        /// least one --evidence, because a ruling without provenance is an
+        /// unsupported claim.
+        #[arg(long, requires = "message", requires = "evidence", value_parser = disposition_token)]
+        disposition: Option<String>,
+        /// Read only entries that carry a disposition.
+        #[arg(long, conflicts_with_all = ["message", "disposition"])]
+        dispositions: bool,
+        #[arg(long, conflicts_with_all = ["message", "disposition", "dispositions"])]
+        events: bool,
+        /// Re-check selected commit evidence and anchors against the repository
+        /// as it stands. A vanished SHA is a finding.
+        #[arg(long, conflicts_with = "message")]
+        verify: bool,
         /// Read only entries stamped with this pull request number, or stamp a
         /// written entry with it.
         #[arg(long = "pr")]
@@ -412,18 +468,41 @@ pub enum ReleaseAction {
         #[arg(long)]
         from: Option<String>,
     },
-    /// Whether a revision's content is actually carried by a release, by replay.
+    /// Whether a revision's content is actually carried by releases or the upstream trunk.
     ///
-    /// The rigorous answer to "is this fix in the release": duplicate the
-    /// revision's commits onto the target and look at what remains. Empty means
-    /// carried; a real diff means not carried; grep answers a different question.
+    /// The rigorous answer to "is this fix safe to delete": compare the
+    /// revision's net content with each target. Matching content is carried; a
+    /// remaining diff is not carried; grep answers a different question. Bare
+    /// form checks live releases and the upstream trunk before consulting
+    /// superseded releases. `--in` checks one arbitrary revset instead.
     Carries {
         /// A branch name, or any revision when no bookmark fits.
-        revision: String,
-        /// The release ref to check against. Defaults to the release in hand;
-        /// any revset works: a remote release, a pin, a commit id.
+        #[arg(required_unless_present = "all")]
+        revision: Option<String>,
+        /// The one release ref or revision to check instead of every target.
         #[arg(long = "in")]
         target: Option<String>,
+        /// Every maintained branch against the live releases and upstream trunk;
+        /// superseded releases are checked only after a complete, everywhere-not-carried
+        /// primary matrix. The census that answers "what would deleting this lose".
+        #[arg(long, conflicts_with_all = ["revision", "target"])]
+        all: bool,
+        /// Skip pull request lookups; the orphan test then reports unknown.
+        #[arg(long, requires = "all")]
+        no_github: bool,
+    },
+    /// The release's parents: count, commits, and who still holds each.
+    ///
+    /// The count uses the repository's own parent list — the audit's worst
+    /// instrument error was counting `^parent` lines in prose. `--verify`
+    /// replays every member against the release and reports what it lacks.
+    Members {
+        /// The release ref to inspect. Defaults to the release in hand.
+        reference: Option<String>,
+        /// Replay each member's content against the release (heavier: one
+        /// replay per member) and report drop-guard anchors.
+        #[arg(long)]
+        verify: bool,
     },
     /// Reap superseded dated cuts: forget their bookmarks everywhere, abandon their commits.
     /// The remote is never touched.
@@ -530,6 +609,11 @@ mod tests {
             vec!["knives", "sync", "--all"],
             vec!["knives", "preflight"],
             vec!["knives", "status"],
+            vec!["knives", "pushed"],
+            vec!["knives", "pushed", "feat/alpha", "--repo", "demo"],
+            vec!["knives", "audit"],
+            vec!["knives", "audit", "demo", "--no-github"],
+            vec!["knives", "audit", "--all"],
             vec!["knives", "start", "a-branch"],
             vec!["knives", "finish", "a-branch"],
             vec!["knives", "release"],
@@ -565,7 +649,7 @@ mod tests {
     }
 
     #[test]
-    fn notch_allows_a_write_stamp_and_requires_a_message_for_evidence() {
+    fn notch_rejects_evidence_without_a_message_or_nonblank_content() {
         assert!(
             Cli::try_parse_from(["knives", "notch", "feat/a", "-m", "x", "--pr", "7"]).is_ok(),
             "a write with an explicit pull-request stamp did not parse"
@@ -574,9 +658,68 @@ mod tests {
             Cli::try_parse_from(["knives", "notch", "feat/a", "--evidence", "06d778b9"]).is_err(),
             "evidence with nothing to attach it to parsed"
         );
+        assert!(
+            Cli::try_parse_from([
+                "knives",
+                "notch",
+                "feat/a",
+                "-m",
+                "x",
+                "--disposition",
+                "ruled-out",
+                "--evidence",
+                "   ",
+            ])
+            .is_err(),
+            "blank disposition evidence parsed"
+        );
         // And: a repo-level note needs no subject, so the model's absent subject
         // is reachable.
         assert!(Cli::try_parse_from(["knives", "notch", "-m", "the fork needs a cut"]).is_ok());
+    }
+
+    #[test]
+    fn notch_accepts_only_the_terminal_disposition_vocabulary() {
+        for disposition in ["merged-elsewhere", "withdrawn", "ruled-out"] {
+            assert!(
+                Cli::try_parse_from([
+                    "knives",
+                    "notch",
+                    "feat/a",
+                    "-m",
+                    "x",
+                    "--evidence",
+                    "aabbccddeeff",
+                    "--disposition",
+                    disposition,
+                ])
+                .is_ok(),
+                "{disposition} did not parse"
+            );
+        }
+        assert!(
+            Cli::try_parse_from([
+                "knives",
+                "notch",
+                "feat/a",
+                "-m",
+                "x",
+                "--evidence",
+                "aabbccddeeff",
+                "--disposition",
+                "needs-review",
+            ])
+            .is_err(),
+            "an unrecognized disposition parsed"
+        );
+    }
+
+    #[test]
+    fn notch_events_and_dispositions_are_mutually_exclusive_read_modes() {
+        assert!(
+            Cli::try_parse_from(["knives", "notch", "--events", "--dispositions"]).is_err(),
+            "the parser accepted incompatible chronology selectors"
+        );
     }
 
     #[test]

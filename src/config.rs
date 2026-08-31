@@ -199,13 +199,19 @@ impl RepoEntry {
         self.trunk()
     }
 
-    /// Whether releases live somewhere other than our branches.
-    pub const fn has_split_release(&self) -> bool {
-        self.release.is_some()
+    /// Whether release publishing has a remote distinct from the origin fork.
+    ///
+    /// A configured `release` URL equal to `origin` is an explicit spelling of
+    /// the default topology, not a second role. Roles name ref ownership, so
+    /// every downstream release decision must continue to use origin there.
+    pub fn has_split_release(&self) -> bool {
+        self.release
+            .as_deref()
+            .is_some_and(|release| release != self.origin.as_str())
     }
 
     /// The remote role that publishes releases for this repository.
-    pub const fn publish_remote(&self) -> &str {
+    pub fn publish_remote(&self) -> &str {
         if self.has_split_release() {
             "release"
         } else {
@@ -486,6 +492,20 @@ pub fn load(path: &Path) -> Result<Registry, ConfigError> {
     let home = path.parent().unwrap_or_else(|| Path::new(".")).to_owned();
     for entry in registry.repos.values_mut() {
         entry.path = entry.resolved_path(&home);
+        for (role, remote) in [
+            ("upstream", entry.upstream.as_str()),
+            ("origin", entry.origin.as_str()),
+        ]
+        .into_iter()
+        .chain(entry.release.as_deref().map(|remote| ("release", remote)))
+        {
+            if remote.starts_with('-') {
+                return Err(ConfigError::Invalid {
+                    path: path.to_owned(),
+                    detail: format!("{role} remote {remote:?} must not start with `-`"),
+                });
+            }
+        }
         if let Some(name) = entry.release_branch.as_deref() {
             if name.is_empty() {
                 return Err(ConfigError::Invalid {
@@ -706,6 +726,23 @@ release = "https://example.invalid/releases.git"
     }
 
     #[test]
+    fn an_equal_release_url_is_not_a_split_publish_role() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = "\
+            [repos.demo]\n\
+            path = \"/tmp/d\"\n\
+            upstream = \"https://forge.invalid/up/demo.git\"\n\
+            origin = \"https://forge.invalid/ours/demo.git\"\n\
+            release = \"https://forge.invalid/ours/demo.git\"\n";
+
+        let registry = load(&write(dir.path(), text)).expect("equal release URL parses");
+        let entry = &registry.repos["demo"];
+
+        assert_eq!(entry.publish_remote(), "origin");
+        assert!(!entry.has_split_release());
+    }
+
+    #[test]
     fn a_registry_missing_a_required_role_fails_to_parse() {
         // Given: an entry with no upstream
         let dir = tempfile::tempdir().unwrap();
@@ -715,6 +752,17 @@ release = "https://example.invalid/releases.git"
         // Then: it fails at parse time, naming the field, not later at query time
         let message = result.unwrap_err().to_string();
         assert!(message.contains("upstream"), "message was: {message}");
+    }
+
+    #[test]
+    fn a_remote_url_that_looks_like_an_option_is_rejected_at_config_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let text =
+            "[repos.demo]\npath = \"/tmp/d\"\nupstream = \"u\"\norigin = \"--upload-pack=x\"\n";
+
+        let error = load(&write(dir.path(), text)).unwrap_err().to_string();
+        assert!(error.contains("origin remote"), "was: {error}");
+        assert!(error.contains("must not start with `-`"), "was: {error}");
     }
 
     #[test]

@@ -190,18 +190,29 @@ fn flags_cell(row: &BranchRow) -> String {
 /// How much of a notch's text a branch line carries.
 const NOTCH_TEXT: usize = 32;
 
-/// Render a ledger entry in the one-line status form.
+/// Render the selected ledger entry and the number of sibling entries it masks.
 fn notch_summary(notch: &LastNotch) -> String {
-    let collapsed = notch.text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut collapsed = notch.text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if let Some(disposition) = &notch.disposition {
+        collapsed = format!(
+            "{}:{collapsed}",
+            crate::ledger::inline_human_text(disposition)
+        );
+    }
     let escaped = crate::ledger::inline_human_text(&collapsed);
     let mut shown: String = escaped.chars().take(NOTCH_TEXT).collect();
     if escaped.chars().count() > NOTCH_TEXT {
         shown.push('…');
     }
-    crate::ledger::age(&notch.ts, jiff::Timestamp::now()).map_or_else(
+    let summary = crate::ledger::age(&notch.ts, jiff::Timestamp::now()).map_or_else(
         || format!("\"{shown}\""),
         |age| format!("\"{shown}\" ({age})"),
-    )
+    );
+    if notch.count > 1 {
+        format!("{summary}+{}", notch.count - 1)
+    } else {
+        summary
+    }
 }
 
 /// The newest notch on this branch, as one token.
@@ -498,6 +509,8 @@ mod tests {
             ts: jiff::Timestamp::now().to_string(),
             kind: crate::ledger::Kind::Note,
             text: "superseded by #1157".to_owned(),
+            disposition: None,
+            count: 1,
         });
         let lines = branch_table(&[row], true);
         assert!(lines[0].contains("notch"), "header: {}", lines[0]);
@@ -508,6 +521,45 @@ mod tests {
         );
     }
     #[test]
+    fn a_masked_note_cell_counts_its_siblings() {
+        // Appending before truncation would hide the count behind an ellipsis;
+        // adding whitespace would split the table cell into multiple columns.
+        let mut row = row("feat/alpha", None, None);
+        row.last_notch = Some(LastNotch {
+            ts: jiff::Timestamp::now().to_string(),
+            kind: crate::ledger::Kind::Note,
+            disposition: None,
+            text: "human ruling".to_owned(),
+            count: 2,
+        });
+
+        let lines = branch_table(&[row], true);
+        let start = columns(&lines[1]).last().expect("notch cell").0;
+        let cell = &lines[1][start..];
+        assert!(cell.ends_with("+1"), "was: {cell}");
+        assert_eq!(columns(&lines[1]).len(), 9, "was: {}", lines[1]);
+    }
+
+    #[test]
+    fn a_disposition_notch_prefixes_its_ruling_before_truncation() {
+        let mut row = row("feat/alpha", None, None);
+        row.last_notch = Some(LastNotch {
+            ts: jiff::Timestamp::now().to_string(),
+            kind: crate::ledger::Kind::Note,
+            disposition: Some("ruled-out".to_owned()),
+            text: "split to a plugin".to_owned(),
+            count: 1,
+        });
+
+        let lines = branch_table(&[row], true);
+        assert!(
+            lines[1].contains("\"ruled-out:split to a plugin\""),
+            "was: {}",
+            lines[1]
+        );
+    }
+
+    #[test]
     fn a_long_or_multi_line_notch_cannot_break_the_table() {
         // An entry's text is free prose that may run to a paragraph and may carry
         // newlines. One stray newline destroys every column below it.
@@ -517,6 +569,8 @@ mod tests {
             kind: crate::ledger::Kind::Note,
             text: "parked by the owner\nuntil the trait lands upstream, which may be weeks"
                 .to_owned(),
+            disposition: None,
+            count: 1,
         });
         let lines = branch_table(&[row], true);
         assert_eq!(lines.len(), 2, "was: {lines:?}");
@@ -535,6 +589,8 @@ mod tests {
             ts: jiff::Timestamp::now().to_string(),
             kind: crate::ledger::Kind::Note,
             text: "parked\u{1b}now\ragain".to_owned(),
+            disposition: None,
+            count: 1,
         });
 
         let lines = branch_table(&[row], true);

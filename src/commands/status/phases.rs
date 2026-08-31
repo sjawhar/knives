@@ -414,30 +414,6 @@ pub(super) fn origin_phase(
     });
     OriginPhase { relations }
 }
-pub(super) fn record_repository_health(
-    report: &mut Report,
-    repo: &Repo,
-    path: &std::path::Path,
-    tips: &BookmarkTips,
-) -> anyhow::Result<std::time::Duration> {
-    // Recorded before conclusions from this repository: detectors replay commits, so a stale
-    // working copy can invalidate their answers.
-    if let Some(stale) = repo.stale_working_copy(path) {
-        report.problems.push(stale);
-    }
-    report.findings.extend(double_checkout(&repo.workspaces()?));
-    let ignored: std::collections::BTreeSet<crate::ids::BookmarkRef> =
-        crate::commands::release::superseded_dated_releases(tips)
-            .into_iter()
-            .map(|(reference, _)| reference)
-            .collect();
-    let phase = std::time::Instant::now();
-    let changes = repo.divergent_changes(&ignored)?;
-    let duration = phase.elapsed();
-    report.findings.extend(divergent_changes(&changes));
-    report.findings.extend(conflicted_bookmark_findings(repo)?);
-    Ok(duration)
-}
 
 /// Repository-wide health facts prepared on an independent jj-lib handle.
 ///
@@ -454,17 +430,31 @@ pub(super) struct RepositoryHealth {
 pub(super) fn repository_health(
     path: &std::path::Path,
     tips: &BookmarkTips,
+    publish_remote: &str,
 ) -> anyhow::Result<RepositoryHealth> {
-    let phase = std::time::Instant::now();
+    let health_phase = std::time::Instant::now();
     let repo = Repo::open(path)?;
     let mut report = Report::default();
-    let divergent_changes = record_repository_health(&mut report, &repo, path, tips)?;
-    let health = phase.elapsed();
+    if let Some(stale) = repo.stale_working_copy(path) {
+        report.problems.push(stale);
+    }
+    report.findings.extend(double_checkout(&repo.workspaces()?));
+    let ignored: std::collections::BTreeSet<crate::ids::BookmarkRef> =
+        crate::commands::release::superseded_dated_releases(tips, publish_remote)
+            .into_iter()
+            .map(|(reference, _)| reference)
+            .collect();
+    let phase = std::time::Instant::now();
+    let changes = repo.divergent_changes(&ignored)?;
+    let divergent_duration = phase.elapsed();
+    report.findings.extend(divergent_changes(&changes));
+    report.findings.extend(conflicted_bookmark_findings(&repo)?);
+    let health = health_phase.elapsed();
     Ok(RepositoryHealth {
         findings: report.findings,
         problems: report.problems,
         health,
-        divergent_changes,
+        divergent_changes: divergent_duration,
     })
 }
 /// Resolve the single forge identity and cache read both concurrent phases share.

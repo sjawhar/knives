@@ -9,6 +9,8 @@ use jj_lib::backend::CommitId as JjCommitId;
 use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
 use jj_lib::local_working_copy::LocalWorkingCopy;
 use jj_lib::matchers::EverythingMatcher;
+use jj_lib::merge::Merge;
+use jj_lib::merged_tree::MergedTree;
 use jj_lib::object_id::ObjectId as _;
 use jj_lib::op_store::{RefTarget, RemoteRef};
 use jj_lib::ref_name::{RefName as JjRefName, RemoteName as JjRemoteName};
@@ -300,6 +302,39 @@ impl Repo {
         self.backend_is_ancestor(ancestor.id(), descendant.id())
     }
 
+    /// Compares a revision's net tree change with a target in one three-way
+    /// merge. Unlike a per-commit rebase, this correctly recognizes a squashed
+    /// series and a branch whose additions are later reverted.
+    pub fn tree_replay_outcome(
+        &self,
+        revision: &CommitId,
+        target: &CommitId,
+    ) -> Result<RebaseOutcome, JjError> {
+        let base = self
+            .common_ancestor(std::slice::from_ref(revision), target)?
+            .ok_or_else(|| JjError::Revision {
+                revision: revision.as_str().to_owned(),
+                detail: format!("no unique common ancestor with {}", target.as_str()),
+            })?;
+        let base = self.commit(base.as_str())?;
+        let target = self.commit(target.as_str())?;
+        let revision = self.commit(revision.as_str())?;
+        let merged = block_on(MergedTree::merge(Merge::from_vec(vec![
+            (target.tree(), "target".to_owned()),
+            (base.tree(), "base".to_owned()),
+            (revision.tree(), "revision".to_owned()),
+        ])))
+        .map_err(|error| store_error(&error))?;
+
+        Ok(if merged.has_conflict() {
+            RebaseOutcome::Conflicted
+        } else if merged.tree_ids() == target.tree_ids() {
+            RebaseOutcome::Empty
+        } else {
+            RebaseOutcome::CleanNonEmpty
+        })
+    }
+
     /// [`Self::is_ancestor`] by backend id, saving the hex round-trip.
     fn backend_is_ancestor(
         &self,
@@ -386,6 +421,7 @@ impl Repo {
         &self,
         commit: &CommitId,
         scheme: &ReleaseScheme,
+        publish_remote: &str,
     ) -> Result<Vec<BookmarkRef>, JjError> {
         let mut found = Vec::new();
         for (reference, tip) in self.bookmark_tips()? {
@@ -402,7 +438,7 @@ impl Repo {
             // `@git` is jj's internal git-tracking view rather than a remote, and is
             // excluded everywhere else in this codebase for the same reason.
             // A fetched head is our own pull request, not someone else carrying the work.
-            if is_our_release(&reference, scheme)
+            if is_our_release(&reference, scheme, publish_remote)
                 || matches!(&reference, BookmarkRef::Remote { remote, .. } if remote.as_str() == "git")
                 || pull_number_from_bookmark(reference.branch().as_str()).is_some()
             {
@@ -486,7 +522,8 @@ pub fn fetch_all(repo: &Path) -> Result<(), JjError> {
 
 /// Reads pull refs directly from the git transport because jj-lib intentionally has no forge-ref API.
 pub fn pull_heads(_repo: &Path, remote_url: &str) -> Result<BTreeMap<u64, String>, JjError> {
-    let output = command("git", ["ls-remote", remote_url, "refs/pull/*/head"])?;
+    let args = ls_remote_args(remote_url, &["refs/pull/*/head"]);
+    let output = command_args("git", &args)?;
     output.lines().try_fold(BTreeMap::new(), |mut heads, line| {
         let (sha, reference) = line.split_once('\t').ok_or_else(|| JjError::Parse {
             detail: line.to_owned(),
@@ -504,6 +541,30 @@ pub fn pull_heads(_repo: &Path, remote_url: &str) -> Result<BTreeMap<u64, String
         heads.insert(number, sha.to_owned());
         Ok(heads)
     })
+}
+
+/// Live remote refs by pattern: one ls-remote round trip. The remote's truth,
+/// not the last fetch's — reconciliation must compare against what is there NOW.
+pub fn remote_refs(
+    remote_url: &str,
+    patterns: &[&str],
+) -> Result<BTreeMap<String, CommitId>, JjError> {
+    let args = ls_remote_args(remote_url, patterns);
+    let output = command_args("git", &args)?;
+    output.lines().try_fold(BTreeMap::new(), |mut refs, line| {
+        let (sha, reference) = line.split_once('\t').ok_or_else(|| JjError::Parse {
+            detail: line.to_owned(),
+        })?;
+        refs.insert(reference.to_owned(), CommitId::new(sha));
+        Ok(refs)
+    })
+}
+
+fn ls_remote_args<'a>(remote_url: &'a str, patterns: &[&'a str]) -> Vec<&'a str> {
+    let mut args = Vec::with_capacity(patterns.len() + 3);
+    args.extend(["ls-remote", "--", remote_url]);
+    args.extend(patterns.iter().copied());
+    args
 }
 
 /// Replays a branch onto `onto` as a dropped-transaction read: nothing is written.
@@ -1941,4 +2002,22 @@ pub fn conflicted_files(repo: &Path, revision: &str) -> Result<Vec<String>, JjEr
         .filter_map(|line| line.split_whitespace().next())
         .map(ToOwned::to_owned)
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ls_remote_args;
+
+    #[test]
+    fn ls_remote_always_terminates_option_parsing_before_the_remote_url() {
+        assert_eq!(
+            ls_remote_args("-looks-like-an-option", &["refs/heads/release/*"]),
+            vec![
+                "ls-remote",
+                "--",
+                "-looks-like-an-option",
+                "refs/heads/release/*"
+            ]
+        );
+    }
 }
