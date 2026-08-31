@@ -303,15 +303,17 @@ Expects remotes named for their roles: `upstream` (what we contribute to) and `o
 
 For any “is branch/fix X in release/trunk Y?” question, agents MUST use the replay probe, not a source-text search. Text search proved wrong on a real repository: it claimed an approved but unmerged fix was carried; replay proved it absent.
 
-- For a specific revision, run `knives release carries <revision>`. Bare `carries` compares it with every live release and the upstream trunk; `--in <ref>` selects exactly one explicit target. Run `knives release carries --all` to census maintained branches.
-- For the upstream trunk, read the `landed` column from `knives status`; it is the trunk replay probe’s answer.
+- `knives release carries <revision>` without `--in` evaluates the deletion-safety question across live releases and upstream trunk. `knives release carries --all` censuses maintained branches.
+- `knives release carries <revision> --in <target>` asks only whether that exact target carries the revision. Its exit status is direct: `0` for either carried verdict, `1` for `NOT carried` or `conflicted`, and `3` if the target could not be resolved or checked. A target's live/superseded role is irrelevant to this explicit query.
+- For the upstream trunk, the `landed` column from `knives status` is the trunk replay probe’s answer.
 - Agents MUST NOT grep source text to answer either question.
 
-The release replay has three answers:
+The carriage vocabulary is exact:
 
-- `is carried in`: replaying the revision leaves nothing, so the target contains its content.
-- `is NOT carried in`: replaying it leaves real diffs, so the target lacks its content.
-- `conflicts with`: the replay conflicts, so some content may be there or unrelated work touched the same files; judge it by eye.
+- `carried-exact`: the revision tip is an ancestor of the target; the target contains that exact commit.
+- `carried-rewritten`: replaying the revision's net tree change leaves the target unchanged; equivalent content arrived through different commits, or the revision has no net change.
+- `NOT carried`: replaying leaves a clean, non-empty diff; the target lacks that content.
+- `conflicted`: replaying conflicts; some content may be present or unrelated work touched the same files, so the result requires judgment.
 
 ## The three remotes
 

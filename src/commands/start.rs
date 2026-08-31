@@ -4,11 +4,12 @@ use std::path::{Path, PathBuf};
 
 use crate::cli::Exit;
 use crate::commands::claim::current_owner;
-use crate::commands::release::{newest_release, shared_base};
+use crate::commands::release::shared_base;
 use crate::config::{default_config_path, load};
 use crate::ids::{BranchName, BranchTarget, RepoName};
 use crate::jj::{Repo, add_workspace, fetch_all};
 use crate::ledger::{Ledger, Scribe};
+use crate::release_model::newest_release;
 use crate::store::{Store, default_state_path};
 
 /// Where a new workspace goes: a sibling of the repo, named for the branch.

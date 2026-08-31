@@ -91,21 +91,26 @@ pub enum BookmarkRef {
 
 pub const RELEASE_PREFIX: &str = "release/";
 
-/// Whether a release reference is one of ours.
+/// Whether a release reference is one of ours for the configured publishing role.
 ///
-/// `repos` and `status` each grew their own version of this, and `repos`
-/// promptly picked an upstream release as ours. Only local releases and the
-/// `origin` or `release` remotes are ours: `upstream` is somebody else's cut,
-/// while `git` is jj's internal tracking view rather than a remote.
+/// Local releases are always ours. Remote releases are ours only when their
+/// remote is the configured publish remote: an `origin` release-shaped ref is
+/// a misplaced branch, rather than a release, in a split-release repository.
+/// `upstream` remains somebody else's cut, while `git` is jj's internal tracking
+/// view rather than a remote.
 /// Naming is scheme-dependent: dated releases share a prefix, while fixed releases
 /// are the one configured branch.
-pub fn is_our_release(reference: &BookmarkRef, scheme: &ReleaseScheme) -> bool {
+pub fn is_our_release(
+    reference: &BookmarkRef,
+    scheme: &ReleaseScheme,
+    publish_remote: &str,
+) -> bool {
     if !is_release_name(reference.branch(), scheme) {
         return false;
     }
     match reference {
         BookmarkRef::Local(_) => true,
-        BookmarkRef::Remote { remote, .. } => matches!(remote.as_str(), "origin" | "release"),
+        BookmarkRef::Remote { remote, .. } => remote.as_str() == publish_remote,
     }
 }
 
@@ -314,22 +319,50 @@ mod tests {
             branch: BranchName::new(name),
             remote: RemoteName::new(r),
         };
-        // The fixed branch is a cut wherever we publish it, never on upstream.
-        assert!(is_our_release(&local("integration"), &fixed));
-        assert!(is_our_release(&remote("integration", "origin"), &fixed));
-        assert!(is_our_release(&remote("integration", "release"), &fixed));
-        assert!(!is_our_release(&remote("integration", "upstream"), &fixed));
-        assert!(!is_our_release(&remote("integration", "git"), &fixed));
+        // Local releases are ours; tracked refs are ours only on the role that
+        // publishes them.
+        assert!(is_our_release(&local("integration"), &fixed, "release"));
+        assert!(is_our_release(
+            &remote("integration", "origin"),
+            &fixed,
+            "origin"
+        ));
+        assert!(is_our_release(
+            &remote("integration", "release"),
+            &fixed,
+            "release"
+        ));
+        assert!(!is_our_release(
+            &remote("integration", "origin"),
+            &fixed,
+            "release"
+        ));
+        assert!(!is_our_release(
+            &remote("integration", "upstream"),
+            &fixed,
+            "origin"
+        ));
+        assert!(!is_our_release(
+            &remote("integration", "git"),
+            &fixed,
+            "origin"
+        ));
         // Under Fixed, a dated name is not one of this repo's releases.
-        assert!(!is_our_release(&local("release/2026-07-29"), &fixed));
+        assert!(!is_our_release(
+            &local("release/2026-07-29"),
+            &fixed,
+            "origin"
+        ));
         // Dated behavior is unchanged.
         assert!(is_our_release(
             &local("release/2026-07-29"),
-            &ReleaseScheme::Dated
+            &ReleaseScheme::Dated,
+            "origin"
         ));
         assert!(!is_our_release(
             &local("integration"),
-            &ReleaseScheme::Dated
+            &ReleaseScheme::Dated,
+            "origin"
         ));
     }
 }

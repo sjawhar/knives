@@ -5,11 +5,11 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use crate::cli::Exit;
-use crate::commands::release::{newest_release, repo_slug, scan_consumer_for};
 use crate::config::{RepoEntry, Role};
 use crate::ids::{CommitId, ReleaseScheme, RepoName, strict_dated_release};
 use crate::jj::{self, Repo};
 use crate::pins::{Pin, PinVerdict};
+use crate::release_model::{newest_release, repo_slug, scan_consumer_for};
 
 /// Inputs for one fork's consumer-pin census.
 #[derive(Debug)]

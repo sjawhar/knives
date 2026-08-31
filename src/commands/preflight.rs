@@ -310,7 +310,7 @@ fn branch_states_with_findings(
     let tips = repo.bookmark_tips()?;
     let scheme = entry.release_scheme();
     let ignored: BTreeSet<crate::ids::BookmarkRef> =
-        crate::commands::release::superseded_dated_releases(&tips)
+        crate::commands::release::superseded_dated_releases(&tips, entry.publish_remote())
             .into_iter()
             .map(|(reference, _)| reference)
             .collect();
@@ -376,11 +376,11 @@ fn branch_states_with_findings(
     }));
     let mut findings = Vec::new();
     if let (Some((_, release)), Ok(trunk_tip)) = (
-        crate::commands::release::newest_release(&tips, &scheme, entry.publish_remote()),
+        crate::release_model::newest_release(&tips, &scheme, entry.publish_remote()),
         repo.resolve_commit(&entry.upstream_trunk()),
     ) && let Some(base) = crate::commands::release::shared_base(&repo, &release, &trunk_tip)?
     {
-        let members = crate::commands::release::carried_from_tips(&tips, entry.trunk(), &scheme);
+        let members = crate::release_model::carried_from_tips(&tips, entry.trunk(), &scheme);
         findings.extend(crate::commands::release::mixed_base_findings(
             &entry.path,
             &members,

@@ -11,15 +11,16 @@ use std::collections::BTreeMap;
 use crate::detect::BookmarkTips;
 use crate::ids::{BookmarkRef, BranchName, CommitId, ReleaseScheme, is_our_release};
 
-/// Names whose refs (within the local/origin/release trust boundary) name
-/// more than one distinct commit, with every ref of each commit.
+/// Names whose refs on the configured publish remote (or locally) name more
+/// than one distinct commit, with every ref of each commit.
 pub fn same_name_disagreements(
     tips: &BookmarkTips,
     scheme: &ReleaseScheme,
+    publish_remote: &str,
 ) -> Vec<(BranchName, Vec<(BookmarkRef, CommitId)>)> {
     let mut grouped: BTreeMap<BranchName, BTreeMap<CommitId, Vec<BookmarkRef>>> = BTreeMap::new();
     for (reference, commit) in tips {
-        if is_our_release(reference, scheme) {
+        if is_our_release(reference, scheme, publish_remote) {
             grouped
                 .entry(reference.branch().clone())
                 .or_default()
@@ -86,6 +87,7 @@ mod tests {
                 (origin_ref.clone(), "bbbbbbbb"),
             ]),
             &ReleaseScheme::Dated,
+            "origin",
         );
 
         assert_eq!(
@@ -109,6 +111,7 @@ mod tests {
                     (remote("release/2026-08-30", "origin"), "aaaaaaaa"),
                 ]),
                 &ReleaseScheme::Dated,
+                "origin",
             )
             .is_empty()
         );
@@ -124,6 +127,7 @@ mod tests {
                     (remote("release/2026-08-30", "upstream"), "bbbbbbbb"),
                 ]),
                 &ReleaseScheme::Dated,
+                "origin",
             )
             .is_empty()
         );
@@ -142,6 +146,7 @@ mod tests {
                 (remote("release/2026-08-30", "origin"), "dddddddd"),
             ]),
             &ReleaseScheme::Fixed(BranchName::new(fixed)),
+            "release",
         );
 
         assert_eq!(

@@ -105,7 +105,22 @@ pub fn gather(input: &AuditInput<'_>) -> Report {
         live: &live,
         scheme: &scheme,
     }));
-    add_release_drifts(&mut report, &local, &scheme, &Ledger::for_repo(input.repo));
+    add_release_drifts(
+        &mut report,
+        &ReleaseDriftScan {
+            local: &local,
+            published: live.release(),
+            scheme: &scheme,
+            publish_remote: input.entry.publish_remote(),
+            ledger: &Ledger::for_repo(input.repo),
+        },
+    );
+    add_misplaced_origin_release_refs(
+        &mut report,
+        live.origin(),
+        &scheme,
+        input.entry.publish_remote(),
+    );
     add_orphan_commits(&mut report, &opened, &input.entry.path);
     add_open_pull_head_checks(&mut report, input, &local, live.origin());
     report
@@ -226,12 +241,29 @@ fn release_zombies(
         .collect()
 }
 
-fn add_release_drifts(
-    report: &mut Report,
-    local: &BTreeMap<BranchName, CommitId>,
-    scheme: &crate::ids::ReleaseScheme,
-    ledger: &Ledger,
-) {
+struct ReleaseDriftScan<'a> {
+    local: &'a BTreeMap<BranchName, CommitId>,
+    published: &'a BTreeMap<String, CommitId>,
+    scheme: &'a crate::ids::ReleaseScheme,
+    publish_remote: &'a str,
+    ledger: &'a Ledger,
+}
+
+struct ReleaseDrift<'a> {
+    entries: &'a [Entry],
+    reference: BookmarkRef,
+    current: &'a CommitId,
+    source: &'a str,
+}
+
+fn add_release_drifts(report: &mut Report, scan: &ReleaseDriftScan<'_>) {
+    let ReleaseDriftScan {
+        local,
+        published,
+        scheme,
+        publish_remote,
+        ledger,
+    } = *scan;
     let entries = match ledger.entries() {
         Ok(entries) => entries,
         Err(error) => {
@@ -245,44 +277,101 @@ fn add_release_drifts(
         .iter()
         .filter(|(branch, _)| is_release_name(branch, scheme))
     {
-        match recorded_commit(&entries, branch.as_str()) {
-            Some((entry, recorded)) if !same_commit(recorded, current.as_str()) => {
-                report.findings.push(Finding::new(
-                    FindingKind::ReleaseDrift,
-                    Subject::Bookmark(BookmarkRef::Local(branch.clone())),
-                    format!(
-                        "{branch} is at {} but its newest recorded event names {} ({})",
-                        short(current.as_str()),
-                        short(recorded),
-                        entry.ts
-                    ),
-                ));
-            }
-            Some(_) => {}
-            None => report.notes.push(format!(
-                "{branch} has no recorded event with a commit identifier"
-            )),
+        add_release_drift(
+            report,
+            ReleaseDrift {
+                entries: &entries,
+                reference: BookmarkRef::Local(branch.clone()),
+                current,
+                source: "local",
+            },
+        );
+    }
+    for (reference, current) in published {
+        let Some(name) = reference.strip_prefix("refs/heads/") else {
+            continue;
+        };
+        let branch = BranchName::new(name);
+        if !is_release_name(&branch, scheme) {
+            continue;
         }
+        add_release_drift(
+            report,
+            ReleaseDrift {
+                entries: &entries,
+                reference: BookmarkRef::Remote {
+                    branch,
+                    remote: crate::ids::RemoteName::new(publish_remote),
+                },
+                current,
+                source: "publish remote",
+            },
+        );
     }
 }
 
-fn recorded_commit<'a>(entries: &'a [Entry], subject: &str) -> Option<(&'a Entry, &'a str)> {
-    entries.iter().rev().find_map(|entry| {
-        (entry.subject.as_deref() == Some(subject)).then(|| {
-            entry
-                .evidence
-                .iter()
-                .find(|evidence| commit_token(evidence))
-                .map(|evidence| (entry, evidence.as_str()))
-        })?
-    })
+fn add_release_drift(report: &mut Report, drift: ReleaseDrift<'_>) {
+    let ReleaseDrift {
+        entries,
+        reference,
+        current,
+        source,
+    } = drift;
+    let branch = reference.branch();
+    match recorded_commit(entries, branch.as_str()) {
+        Some(recorded) if !same_commit(recorded.as_str(), current.as_str()) => {
+            let detail = format!(
+                "{source} {branch} is at {} but its newest recorded cut names {}",
+                short(current.as_str()),
+                short(recorded.as_str()),
+            );
+            report.findings.push(Finding::new(
+                FindingKind::ReleaseDrift,
+                Subject::Bookmark(reference),
+                detail,
+            ));
+        }
+        Some(_) => {}
+        None => report
+            .notes
+            .push(format!("{source} {branch} has no recorded cut event")),
+    }
 }
 
-fn commit_token(value: &str) -> bool {
-    (12..=40).contains(&value.len())
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+fn add_misplaced_origin_release_refs(
+    report: &mut Report,
+    origin: &BTreeMap<String, CommitId>,
+    scheme: &crate::ids::ReleaseScheme,
+    publish_remote: &str,
+) {
+    if publish_remote == "origin" {
+        return;
+    }
+    for (reference, commit) in origin {
+        let Some(name) = reference.strip_prefix("refs/heads/") else {
+            continue;
+        };
+        let branch = BranchName::new(name);
+        if !is_release_name(&branch, scheme) {
+            continue;
+        }
+        report.findings.push(Finding::new(
+            FindingKind::RemoteDrift,
+            Subject::Bookmark(BookmarkRef::Remote {
+                branch,
+                remote: crate::ids::RemoteName::new("origin"),
+            }),
+            format!(
+                "origin has release ref {name} at {} but releases publish to {publish_remote}; \
+                 this ref is misplaced",
+                short(commit.as_str())
+            ),
+        ));
+    }
+}
+
+fn recorded_commit(entries: &[Entry], subject: &str) -> Option<CommitId> {
+    crate::release_model::last_recorded_cut(entries, Some(subject)).map(|cut| cut.commit)
 }
 
 fn same_commit(recorded: &str, current: &str) -> bool {
@@ -477,22 +566,23 @@ fn short(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-    use std::path::{Path, PathBuf};
-
     use super::{
-        AuditInput, PullHeadInput, Report, add_open_pull_head_checks, commit_token, exit_for,
-        pull_head_findings, pull_position_findings, same_commit,
+        AuditInput, PullHeadInput, ReleaseDriftScan, Report, add_misplaced_origin_release_refs,
+        add_open_pull_head_checks, add_release_drifts, exit_for, pull_head_findings,
+        pull_position_findings, recorded_commit, same_commit,
     };
     use crate::cli::Exit;
     use crate::config::RepoEntry;
-    use crate::detect::Subject;
+    use crate::detect::{FindingKind, Subject};
     use crate::forge::{
         Account, Forge, ForgeError, PullDetails, PullFacts, PullRequest, PullSummary, RepoIdentity,
         SweepPage, TimelineEvent, fake::FakeForge,
     };
-    use crate::ids::{BranchName, CommitId, RepoName};
+    use crate::ids::{BookmarkRef, BranchName, CommitId, RepoName};
+    use crate::ledger::{Entry, Kind, Ledger};
     use crate::store::Store;
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
 
     #[derive(Debug)]
     struct ChangingFactsForge {
@@ -584,15 +674,6 @@ mod tests {
     }
 
     #[test]
-    fn commit_evidence_accepts_only_lowercase_git_identifier_shapes() {
-        assert!(commit_token("aabbccddeeff"));
-        assert!(commit_token("aabbccddeeff00112233445566778899aabbccdd"));
-        assert!(!commit_token("aabbccddeef"));
-        assert!(!commit_token("AABBCCDDEEFF"));
-        assert!(!commit_token("aabbccddeeff-note"));
-    }
-
-    #[test]
     fn abbreviated_recorded_commit_matches_its_current_full_identifier() {
         assert!(same_commit(
             "aabbccddeeff",
@@ -602,6 +683,159 @@ mod tests {
             "aabbccddeeff",
             "ccddeeffaabb00112233445566778899aabbccdd"
         ));
+    }
+
+    #[test]
+    fn a_later_note_with_commit_evidence_cannot_replace_a_cut_baseline() {
+        let entries = vec![
+            Entry {
+                ts: "2026-08-15T00:00:00Z".to_owned(),
+                owner: "test".to_owned(),
+                subject: Some("release/2026-08-15".to_owned()),
+                kind: Kind::Event,
+                disposition: None,
+                text: "cut release/2026-08-15 as aaaaaaaaaaaa with 1 parent(s)".to_owned(),
+                evidence: vec!["aaaaaaaaaaaa".to_owned(), "member0000000".to_owned()],
+                anchor: None,
+                pr: None,
+            },
+            Entry {
+                ts: "2026-08-16T00:00:00Z".to_owned(),
+                owner: "test".to_owned(),
+                subject: Some("release/2026-08-15".to_owned()),
+                kind: Kind::Note,
+                disposition: Some("ruled-out".to_owned()),
+                text: "later disposition".to_owned(),
+                evidence: vec!["bbbbbbbbbbbb".to_owned()],
+                anchor: None,
+                pr: None,
+            },
+        ];
+
+        assert_eq!(
+            recorded_commit(&entries, "release/2026-08-15"),
+            Some(CommitId::new("aaaaaaaaaaaa"))
+        );
+    }
+
+    #[test]
+    fn a_publish_only_release_drift_is_compared_to_its_recorded_cut() {
+        let directory = tempfile::tempdir().expect("ledger directory");
+        let ledger = Ledger::at(directory.path().to_owned());
+        ledger
+            .append(&Entry {
+                ts: "2026-08-15T00:00:00Z".to_owned(),
+                owner: "test".to_owned(),
+                subject: Some("release/2026-08-15".to_owned()),
+                kind: Kind::Event,
+                disposition: None,
+                text: "cut release/2026-08-15 as aaaaaaaaaaaa with 1 parent(s)".to_owned(),
+                evidence: vec!["aaaaaaaaaaaa".to_owned(), "bbbbbbbbbbbb".to_owned()],
+                anchor: None,
+                pr: None,
+            })
+            .expect("record cut");
+        let mut report = Report {
+            repo: "demo".to_owned(),
+            findings: Vec::new(),
+            notes: Vec::new(),
+            problems: Vec::new(),
+        };
+        let published = BTreeMap::from([(
+            "refs/heads/release/2026-08-15".to_owned(),
+            CommitId::new("cccccccccccccccccccccccccccccccccccccccc"),
+        )]);
+
+        add_release_drifts(
+            &mut report,
+            &ReleaseDriftScan {
+                local: &BTreeMap::new(),
+                published: &published,
+                scheme: &crate::ids::ReleaseScheme::Dated,
+                publish_remote: "release",
+                ledger: &ledger,
+            },
+        );
+
+        assert_eq!(report.findings.len(), 1, "{report:?}");
+        let finding = report.findings.first().expect("one release-drift finding");
+        assert_eq!(finding.kind, FindingKind::ReleaseDrift);
+        assert_eq!(
+            finding.subject,
+            Subject::Bookmark(BookmarkRef::Remote {
+                branch: BranchName::new("release/2026-08-15"),
+                remote: crate::ids::RemoteName::new("release"),
+            })
+        );
+        assert!(
+            finding.detail.contains("publish remote"),
+            "was: {finding:?}"
+        );
+    }
+
+    #[test]
+    fn an_origin_release_ref_is_misplaced_when_another_remote_publishes_releases() {
+        let mut report = Report {
+            repo: "demo".to_owned(),
+            findings: Vec::new(),
+            notes: Vec::new(),
+            problems: Vec::new(),
+        };
+        add_misplaced_origin_release_refs(
+            &mut report,
+            &BTreeMap::from([(
+                "refs/heads/release/2026-08-15".to_owned(),
+                CommitId::new("aaaaaaaaaaaa"),
+            )]),
+            &crate::ids::ReleaseScheme::Dated,
+            "release",
+        );
+
+        assert_eq!(report.findings.len(), 1, "{report:?}");
+        let finding = report
+            .findings
+            .first()
+            .expect("one misplaced-origin-release finding");
+        assert_eq!(finding.kind, FindingKind::RemoteDrift);
+        assert_eq!(
+            finding.subject,
+            Subject::Bookmark(BookmarkRef::Remote {
+                branch: BranchName::new("release/2026-08-15"),
+                remote: crate::ids::RemoteName::new("origin"),
+            })
+        );
+    }
+
+    #[test]
+    fn an_equal_release_url_does_not_misplace_origin_release_refs() {
+        let entry = RepoEntry {
+            path: PathBuf::from("/tmp/demo"),
+            upstream: "https://forge.invalid/up/demo.git".to_owned(),
+            origin: "https://forge.invalid/ours/demo.git".to_owned(),
+            base: None,
+            release: Some("https://forge.invalid/ours/demo.git".to_owned()),
+            release_branch: None,
+            test_count_command: None,
+            consumers: Vec::new(),
+        };
+        let mut report = Report {
+            repo: "demo".to_owned(),
+            findings: Vec::new(),
+            notes: Vec::new(),
+            problems: Vec::new(),
+        };
+
+        add_misplaced_origin_release_refs(
+            &mut report,
+            &BTreeMap::from([(
+                "refs/heads/release/2026-08-15".to_owned(),
+                CommitId::new("aaaaaaaaaaaa"),
+            )]),
+            &crate::ids::ReleaseScheme::Dated,
+            entry.publish_remote(),
+        );
+
+        assert!(report.findings.is_empty(), "findings: {report:?}");
     }
 
     #[test]

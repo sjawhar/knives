@@ -12,7 +12,6 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use crate::commands::release;
 use crate::config::{RepoEntry, Role};
 use crate::detect::{BookmarkTips, RebaseOutcome};
 use crate::forge::{Forge, index_pulls};
@@ -21,6 +20,7 @@ use crate::ids::{
     strict_dated_release,
 };
 use crate::jj::Repo;
+use crate::release_model;
 use crate::snapshot::{self, SnapshotConfig};
 
 /// What a revision is checked against.
@@ -149,11 +149,16 @@ pub fn census(
     let tips = repo.bookmark_tips()?;
     let trunk_branch = entry.trunk();
     let branches: Vec<(BranchName, CommitId)> =
-        release::carried_from_tips(&tips, trunk_branch, &entry.release_scheme())
+        release_model::carried_from_tips(&tips, trunk_branch, &entry.release_scheme())
             .into_iter()
             .map(|(branch, tip)| (BranchName::new(branch), tip))
             .collect();
-    let all_targets = targets(&tips, &entry.release_scheme(), (trunk_name.as_str(), trunk));
+    let all_targets = targets(
+        &tips,
+        &entry.release_scheme(),
+        (trunk_name.as_str(), trunk),
+        entry.publish_remote(),
+    );
     let (primary, superseded): (Vec<Target>, Vec<Target>) = all_targets
         .into_iter()
         .partition(|target| target.role != TargetRole::SupersededRelease);
@@ -632,11 +637,12 @@ pub fn targets(
     tips: &BookmarkTips,
     scheme: &ReleaseScheme,
     trunk: (&str, CommitId),
+    publish_remote: &str,
 ) -> Vec<Target> {
     let newest_release = match scheme {
         ReleaseScheme::Dated => tips
             .keys()
-            .filter(|reference| is_our_release(reference, scheme))
+            .filter(|reference| is_our_release(reference, scheme, publish_remote))
             .filter_map(|reference| strict_dated_release(reference.branch().as_str()))
             .max(),
         ReleaseScheme::Fixed(_) => None,
@@ -646,7 +652,7 @@ pub fn targets(
 
     for (reference, commit) in tips
         .iter()
-        .filter(|(reference, _)| is_our_release(reference, scheme))
+        .filter(|(reference, _)| is_our_release(reference, scheme, publish_remote))
     {
         let dated_name = strict_dated_release(reference.branch().as_str());
         let role = match scheme {
@@ -753,8 +759,10 @@ mod tests {
         reason = "indexing a result in a test is the assertion; a panic is the failure"
     )]
 
+    use crate::config::RepoEntry;
     use crate::detect::BookmarkTips;
     use crate::ids::{BookmarkRef, BranchName, CommitId, ReleaseScheme, RemoteName};
+    use std::path::PathBuf;
 
     use super::{
         CarryCheck, CarryVerdict, CensusInput, CensusTargets, Target, TargetRole, census_member,
@@ -816,6 +824,7 @@ mod tests {
             &tips(vec![(local_ref.clone(), "a"), (origin_ref.clone(), "b")]),
             &ReleaseScheme::Dated,
             ("trunk", CommitId::new("trunk")),
+            "origin",
         );
 
         assert_eq!(targets.len(), 3);
@@ -826,6 +835,53 @@ mod tests {
         assert_eq!(targets[1].commit, CommitId::new("b"));
         assert_eq!(targets[1].refs, vec![origin_ref]);
         assert_eq!(targets[2].role, TargetRole::UpstreamTrunk);
+    }
+
+    #[test]
+    fn split_release_targets_exclude_a_stale_origin_release_ref() {
+        let name = "release/2026-08-30";
+        let release_ref = remote(name, "release");
+        let targets = targets(
+            &tips(vec![
+                (remote(name, "origin"), "stale-origin"),
+                (release_ref.clone(), "published"),
+            ]),
+            &ReleaseScheme::Dated,
+            ("main", CommitId::new("trunk")),
+            "release",
+        );
+
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].role, TargetRole::LiveRelease);
+        assert_eq!(targets[0].commit, CommitId::new("published"));
+        assert_eq!(targets[0].refs, vec![release_ref]);
+        assert_eq!(targets[1].role, TargetRole::UpstreamTrunk);
+    }
+
+    #[test]
+    fn an_equal_release_url_keeps_origin_release_as_a_live_target() {
+        let entry = RepoEntry {
+            path: PathBuf::from("/tmp/demo"),
+            upstream: "https://forge.invalid/up/demo.git".to_owned(),
+            origin: "https://forge.invalid/ours/demo.git".to_owned(),
+            base: None,
+            release: Some("https://forge.invalid/ours/demo.git".to_owned()),
+            release_branch: None,
+            test_count_command: None,
+            consumers: Vec::new(),
+        };
+        let origin_ref = remote("release/2026-08-30", "origin");
+
+        let targets = targets(
+            &tips(vec![(origin_ref.clone(), "published")]),
+            &entry.release_scheme(),
+            ("main", CommitId::new("trunk")),
+            entry.publish_remote(),
+        );
+
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].role, TargetRole::LiveRelease);
+        assert_eq!(targets[0].refs, vec![origin_ref]);
     }
 
     #[test]
@@ -842,6 +898,7 @@ mod tests {
             ]),
             &ReleaseScheme::Dated,
             ("main@upstream", CommitId::new("trunk")),
+            "origin",
         );
 
         assert_eq!(
@@ -865,6 +922,7 @@ mod tests {
             &tips(vec![(remote("release/2026-08-30", "upstream"), "upstream")]),
             &ReleaseScheme::Dated,
             ("main", CommitId::new("trunk")),
+            "origin",
         );
 
         assert_eq!(targets.len(), 1);
@@ -882,6 +940,7 @@ mod tests {
             ]),
             &ReleaseScheme::Fixed(BranchName::new("integration")),
             ("main", CommitId::new("trunk")),
+            "release",
         );
 
         assert_eq!(targets.len(), 3);
@@ -899,6 +958,7 @@ mod tests {
             ]),
             &ReleaseScheme::Dated,
             ("main", CommitId::new("trunk")),
+            "origin",
         );
 
         assert_eq!(targets.len(), 2);
@@ -913,6 +973,7 @@ mod tests {
             &tips(vec![(local("release/not-a-date"), "invalid")]),
             &ReleaseScheme::Dated,
             ("main", CommitId::new("trunk")),
+            "origin",
         );
 
         assert_eq!(targets.len(), 2);

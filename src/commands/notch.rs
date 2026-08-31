@@ -233,14 +233,24 @@ fn read_filtered(
         });
     }
 
+    let entry_class = if request.events {
+        Some(EntryClass::Event)
+    } else if request.dispositions {
+        Some(EntryClass::Disposition)
+    } else {
+        None
+    };
     let (selected, matched) = select(
         &entries,
         &Filter {
             subject: request.subject,
             pr: request.pr,
-            only: request.dispositions.then_some(EntryClass::Disposition),
-            limit: (!request.dispositions && request.subject.is_none() && request.pr.is_none())
-                .then_some(RECENT),
+            only: entry_class,
+            limit: (!request.events
+                && !request.dispositions
+                && request.subject.is_none()
+                && request.pr.is_none())
+            .then_some(RECENT),
         },
     );
     Ok(Report::Read {
@@ -456,6 +466,62 @@ mod tests {
         assert_eq!(render(&report), "a-repo  no notches yet");
     }
 
+    #[test]
+    fn an_events_read_returns_every_matching_event_without_a_recent_cap() {
+        let directory = tempfile::tempdir().expect("ledger directory");
+        let ledger = Ledger::at(directory.path().to_owned());
+        for second in 0..21 {
+            ledger
+                .append(&Entry {
+                    ts: format!("2026-08-15T22:14:{second:02}Z"),
+                    owner: "test".to_owned(),
+                    subject: Some("feat/alpha".to_owned()),
+                    kind: Kind::Event,
+                    disposition: None,
+                    text: format!("event {second}"),
+                    evidence: Vec::new(),
+                    anchor: None,
+                    pr: Some(7),
+                })
+                .expect("record event");
+        }
+        ledger
+            .append(&Entry {
+                ts: "2026-08-15T22:15:00Z".to_owned(),
+                owner: "test".to_owned(),
+                subject: Some("feat/alpha".to_owned()),
+                kind: Kind::Note,
+                disposition: None,
+                text: "human note".to_owned(),
+                evidence: Vec::new(),
+                anchor: None,
+                pr: Some(7),
+            })
+            .expect("record note");
+        let repo = RepoName::new("demo");
+        let request = Request {
+            repo: &repo,
+            subject: Some("feat/alpha"),
+            message: None,
+            evidence: &[],
+            pr: Some(7),
+            disposition: None,
+            dispositions: false,
+            events: true,
+            verify: false,
+        };
+
+        let report = read_filtered(&ledger, &repo, &request).expect("read events");
+        let Report::Read {
+            entries, matched, ..
+        } = report
+        else {
+            panic!("expected a read report");
+        };
+        assert_eq!(matched, 21);
+        assert_eq!(entries.len(), 21);
+        assert!(entries.iter().all(|entry| entry.kind == Kind::Event));
+    }
     #[test]
     fn a_repo_level_entry_is_headed_by_the_repo_rather_than_an_empty_subject() {
         let report = Report::Written {

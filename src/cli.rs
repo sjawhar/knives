@@ -10,12 +10,10 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand, ValueEnum};
 
 fn disposition_token(value: &str) -> Result<String, String> {
-    (!value.is_empty()
-        && value.chars().all(|character| {
-            character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-'
-        }))
-    .then(|| value.to_owned())
-    .ok_or_else(|| "a disposition must contain lowercase letters, digits, or hyphens".to_owned())
+    match value {
+        "merged-elsewhere" | "withdrawn" | "ruled-out" => Ok(value.to_owned()),
+        _ => Err("a disposition must be one of: merged-elsewhere, withdrawn, ruled-out".to_owned()),
+    }
 }
 
 fn evidence_token(value: &str) -> Result<String, String> {
@@ -344,8 +342,7 @@ pub enum Command {
         /// Read only entries that carry a disposition.
         #[arg(long, conflicts_with_all = ["message", "disposition"])]
         dispositions: bool,
-        /// Read the full chronology, machine events included.
-        #[arg(long, conflicts_with = "message")]
+        #[arg(long, conflicts_with_all = ["message", "disposition", "dispositions"])]
         events: bool,
         /// Re-check selected commit evidence and anchors against the repository
         /// as it stands. A vanished SHA is a finding.
@@ -679,6 +676,50 @@ mod tests {
         // And: a repo-level note needs no subject, so the model's absent subject
         // is reachable.
         assert!(Cli::try_parse_from(["knives", "notch", "-m", "the fork needs a cut"]).is_ok());
+    }
+
+    #[test]
+    fn notch_accepts_only_the_terminal_disposition_vocabulary() {
+        for disposition in ["merged-elsewhere", "withdrawn", "ruled-out"] {
+            assert!(
+                Cli::try_parse_from([
+                    "knives",
+                    "notch",
+                    "feat/a",
+                    "-m",
+                    "x",
+                    "--evidence",
+                    "aabbccddeeff",
+                    "--disposition",
+                    disposition,
+                ])
+                .is_ok(),
+                "{disposition} did not parse"
+            );
+        }
+        assert!(
+            Cli::try_parse_from([
+                "knives",
+                "notch",
+                "feat/a",
+                "-m",
+                "x",
+                "--evidence",
+                "aabbccddeeff",
+                "--disposition",
+                "needs-review",
+            ])
+            .is_err(),
+            "an unrecognized disposition parsed"
+        );
+    }
+
+    #[test]
+    fn notch_events_and_dispositions_are_mutually_exclusive_read_modes() {
+        assert!(
+            Cli::try_parse_from(["knives", "notch", "--events", "--dispositions"]).is_err(),
+            "the parser accepted incompatible chronology selectors"
+        );
     }
 
     #[test]

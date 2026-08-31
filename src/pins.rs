@@ -160,8 +160,7 @@ pub fn scan(file: &str, text: &str, scheme: &ReleaseScheme) -> PinScan {
             }
             None => None,
         };
-        let lowered = decoded.to_lowercase();
-        let kind = if lowered.contains("branch") {
+        let kind = if follows_branch_selector(&decoded[..start]) {
             PinKind::Follows
         } else {
             PinKind::Frozen
@@ -176,6 +175,24 @@ pub fn scan(file: &str, text: &str, scheme: &ReleaseScheme) -> PinScan {
         });
     }
     PinScan { pins, problems }
+}
+
+fn follows_branch_selector(prefix: &str) -> bool {
+    let prefix = prefix
+        .trim_end()
+        .trim_end_matches(&['"', '\''][..])
+        .trim_end();
+    let Some((before_value, _)) = prefix.rsplit_once('=') else {
+        return false;
+    };
+    let key = before_value.trim_end();
+    let Some(before_key) = key.strip_suffix("branch") else {
+        return false;
+    };
+    before_key
+        .chars()
+        .next_back()
+        .is_none_or(|character| !character.is_ascii_alphanumeric() && character != '_')
 }
 
 /// Files worth scanning in a consumer.
@@ -245,6 +262,16 @@ mod tests {
         let scanned = scan("uv.lock", text, &crate::ids::ReleaseScheme::Dated);
         assert_eq!(scanned.pins.len(), 1, "percent-encoded pin was missed");
         assert_eq!(scanned.pins[0].reference, "release/2026-07-28.2");
+        assert_eq!(scanned.pins[0].kind, PinKind::Frozen);
+    }
+
+    #[test]
+    fn a_rev_selector_with_an_unrelated_branch_word_stays_frozen() {
+        let text =
+            r#"url = "https://x/y.git?rev=release%2F2026-07-28.2#548aaafb" # branch mentioned"#;
+        let scanned = scan("uv.lock", text, &crate::ids::ReleaseScheme::Dated);
+
+        assert_eq!(scanned.pins.len(), 1, "was: {scanned:?}");
         assert_eq!(scanned.pins[0].kind, PinKind::Frozen);
     }
 

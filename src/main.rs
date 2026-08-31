@@ -23,6 +23,9 @@ use knives::forge::{Forge, PullRequest};
 use knives::ids::{BranchName, BranchTarget, ReleaseScheme, RepoName, Requirement};
 use knives::jj::Repo;
 use knives::ledger::{Draft, Kind, Ledger, Scribe};
+use knives::release_model::{
+    RecordedCut, carried_branches, carried_from_tips, last_recorded_cut, previous_release_for_cut,
+};
 use knives::store::{Store, default_state_path};
 
 fn main() -> ExitCode {
@@ -449,6 +452,12 @@ fn print_members(report: &release::MembersReport, output: Output) -> anyhow::Res
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CarriesMode {
+    Bare,
+    ExplicitTarget,
+}
+
 /// Answer one revision's carriage, or census every maintained branch.
 fn run_release_carries(
     repo: &RepoName,
@@ -475,6 +484,15 @@ fn run_release_carries(
     let Some(revision) = request.revision else {
         return Ok(Exit::Usage);
     };
+    run_revision_carries(repo, entry, request, revision)
+}
+
+fn run_revision_carries(
+    repo: &RepoName,
+    entry: &knives::config::RepoEntry,
+    request: CarriesInvocation<'_>,
+    revision: &str,
+) -> anyhow::Result<Exit> {
     let opened = Repo::open(&entry.path)?;
     let tip = match opened.resolve_commit(revision) {
         Ok(tip) => tip,
@@ -502,8 +520,15 @@ fn run_release_carries(
         }
     };
     let tips = opened.bookmark_tips()?;
-    let all_targets =
-        carriage::targets(&tips, &entry.release_scheme(), (trunk_name.as_str(), trunk));
+    let all_targets = carriage::targets(
+        &tips,
+        &entry.release_scheme(),
+        (trunk_name.as_str(), trunk),
+        entry.publish_remote(),
+    );
+    let mode = request
+        .target
+        .map_or(CarriesMode::Bare, |_| CarriesMode::ExplicitTarget);
     let (mut selected, superseded) = match request.target {
         Some(target) => match selected_carries_targets(&opened, &all_targets, target) {
             Ok(targets) => (targets, Vec::new()),
@@ -542,18 +567,39 @@ fn run_release_carries(
         problems: Vec::new(),
     };
     checks.append(&mut report, selected);
-    let mut safe = carries_safe(&report);
-    if !safe && report.problems.is_empty() {
-        checks.append(&mut report, superseded);
-        safe = carries_safe(&report);
-    }
-    let exit = if report.problems.is_empty() {
-        if safe { Exit::Ok } else { Exit::Findings }
-    } else {
-        Exit::Incomplete
-    };
+    let exit = carries_exit(&mut report, &checks, superseded, mode);
     print_carries(&report, request.output)?;
     Ok(exit)
+}
+
+fn carries_exit(
+    report: &mut CarriesReport,
+    checks: &CarriesChecks<'_>,
+    superseded: Vec<Target>,
+    mode: CarriesMode,
+) -> Exit {
+    if !report.problems.is_empty() {
+        return Exit::Incomplete;
+    }
+    match mode {
+        CarriesMode::Bare => {
+            if !carries_safe(report) {
+                checks.append(report, superseded);
+            }
+            if carries_safe(report) {
+                Exit::Ok
+            } else {
+                Exit::Findings
+            }
+        }
+        CarriesMode::ExplicitTarget => {
+            if report.checks.iter().all(|check| check.verdict.carried()) {
+                Exit::Ok
+            } else {
+                Exit::Findings
+            }
+        }
+    }
 }
 
 struct CarriesChecks<'a> {
@@ -1659,7 +1705,7 @@ fn advance_edit(
     from: Option<&str>,
 ) -> anyhow::Result<EditOutcome> {
     let tips = context.opened.bookmark_tips()?;
-    let carried = release::carried_from_tips(&tips, entry.trunk(), &entry.release_scheme());
+    let carried = carried_from_tips(&tips, entry.trunk(), &entry.release_scheme());
     let outcome = if let Some(from) = from {
         let [branch] = branches else {
             println!(
@@ -1961,7 +2007,7 @@ fn parent_sources(
     parents: &[knives::ids::CommitId],
 ) -> anyhow::Result<Vec<(String, knives::ids::CommitId)>> {
     let tips = opened.bookmark_tips()?;
-    let carried = release::carried_from_tips(&tips, entry.trunk(), scheme);
+    let carried = carried_from_tips(&tips, entry.trunk(), scheme);
     let trunk_tip = opened.resolve_commit(&entry.upstream_trunk()).ok();
     let mut sources = Vec::new();
     for commit in parents {
@@ -2421,7 +2467,7 @@ fn run_pr(
     } else {
         println!("{}", pr::render(&report));
     }
-    Ok(Exit::Ok)
+    Ok(pr::exit_for(&report))
 }
 
 fn run_status(requested: Option<&str>, view: StatusView) -> anyhow::Result<Exit> {
@@ -2559,7 +2605,7 @@ fn run_release(
                 return Ok(exit);
             }
             let tips = opened.bookmark_tips()?;
-            let previous = release::previous_release_for_cut(&entry, &tips);
+            let previous = previous_release_for_cut(&entry, &tips);
             let previous_commit = previous.as_ref().map(|(_, commit)| commit.clone());
             // A cut is a new name for the composition in hand, never a recomputation:
             // with a previous release its parents are carried verbatim — nothing joins,
@@ -2579,7 +2625,7 @@ fn run_release(
                     .unwrap_or_else(|| trunk.clone());
                 (carried, members, base)
             } else {
-                let carried = release::carried_branches(&opened, entry.trunk(), &scheme)?;
+                let carried = carried_branches(&opened, entry.trunk(), &scheme)?;
                 if carried.is_empty() {
                     println!(
                         "{repo}: no branches to cut; a release is a flat merge of feature \
@@ -2740,8 +2786,8 @@ fn recorded_composition_check(
     candidate: &mut knives::jj::Candidate,
     gate: &CompositionGate<'_>,
     allow_drop: bool,
-) -> anyhow::Result<Result<(Option<release::RecordedCut>, release::CompositionCheck), Exit>> {
-    let recorded = release::last_recorded_cut(&Ledger::for_repo(repo).entries()?);
+) -> anyhow::Result<Result<(Option<RecordedCut>, release::CompositionCheck), Exit>> {
+    let recorded = last_recorded_cut(&Ledger::for_repo(repo).entries()?, None);
     let check = match &recorded {
         Some(recorded) => release::uncarried_recorded_members(
             gate.opened,
@@ -2773,7 +2819,7 @@ fn recorded_composition_check(
 /// abandoned and nothing needs cleanup.
 fn report_uncarried_cut(
     repo: &RepoName,
-    recorded: Option<&release::RecordedCut>,
+    recorded: Option<&RecordedCut>,
     check: &release::CompositionCheck,
     allow_drop: bool,
 ) -> Option<Exit> {
@@ -2820,7 +2866,7 @@ struct CompletedCut<'a> {
     created: &'a knives::ids::CommitId,
     audit: &'a release::CutAudit,
     scheme: &'a ReleaseScheme,
-    recorded: Option<&'a release::RecordedCut>,
+    recorded: Option<&'a RecordedCut>,
     check: &'a release::CompositionCheck,
 }
 
@@ -2939,7 +2985,7 @@ fn report_completed_cut(
         .map(|(branch, _)| branch.clone())
         .collect();
     carried_names.extend(
-        release::carried_branches(opened, entry.trunk(), &entry.release_scheme())?
+        carried_branches(opened, entry.trunk(), &entry.release_scheme())?
             .into_iter()
             .map(|(branch, _)| branch),
     );
@@ -2994,7 +3040,7 @@ fn check_orphan_commits_before_cut(
 ) -> anyhow::Result<Option<OrphanedLineage>> {
     let scheme = entry.release_scheme();
     let tips = opened.bookmark_tips()?;
-    let Some(previous) = release::previous_release_for_cut(entry, &tips) else {
+    let Some(previous) = previous_release_for_cut(entry, &tips) else {
         return Ok(None);
     };
     let mut keep: Vec<knives::ids::CommitId> = tips
@@ -3009,7 +3055,13 @@ fn check_orphan_commits_before_cut(
         })
         .collect();
     keep.push(trunk);
-    let orphans = release::orphaned_commits(&entry.path, &previous.1, &keep, &tips)?;
+    let orphans = release::orphaned_commits(release::OrphanedCommitInput {
+        repo_path: &entry.path,
+        previous: &previous.1,
+        keep: &keep,
+        tips: &tips,
+        publish_remote: entry.publish_remote(),
+    })?;
     if orphans.is_empty() {
         return Ok(None);
     }
@@ -3038,7 +3090,7 @@ fn cut_request(name: String, carried: &[(String, knives::ids::CommitId)]) -> rel
 /// is still the newest dated name and nothing is reaped at all.
 fn reap_after_cut(repo: &RepoName, entry: &knives::config::RepoEntry) -> anyhow::Result<Exit> {
     let reopened = knives::jj::Repo::open(&entry.path)?;
-    let report = release::reap_superseded(&entry.path, &reopened)?;
+    let report = release::reap_superseded(&entry.path, &reopened, entry.publish_remote())?;
     print_reap(&repo.to_string(), &report);
     Ok(reap_exit(&report))
 }
@@ -3052,7 +3104,7 @@ fn run_reap(name: &str) -> anyhow::Result<Exit> {
     let mut worst = Exit::Ok;
     for (repo, entry) in chosen {
         let opened = knives::jj::Repo::open(&entry.path)?;
-        let report = release::reap_superseded(&entry.path, &opened)?;
+        let report = release::reap_superseded(&entry.path, &opened, entry.publish_remote())?;
         print_reap(&repo.to_string(), &report);
         worst = worst.worst(reap_exit(&report));
     }

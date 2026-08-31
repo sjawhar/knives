@@ -893,7 +893,8 @@ fn reap_removes_superseded_cuts_and_keeps_the_newest() {
 
     // When: the workspace is reaped.
     let repo = Repo::open(&lab.work).expect("open");
-    let report = knives::commands::release::reap_superseded(&lab.work, &repo).expect("reap");
+    let report =
+        knives::commands::release::reap_superseded(&lab.work, &repo, "origin").expect("reap");
 
     // Then: the older cut is gone in every form, the newest survives.
     assert_eq!(report.reaped, vec!["release/2026-08-04".to_owned()]);
@@ -925,7 +926,8 @@ fn reap_refuses_a_cut_that_has_local_descendants() {
     lab.octopus("release/2026-08-05", "feat/alpha", "feat/beta");
 
     let repo = Repo::open(&lab.work).expect("open");
-    let report = knives::commands::release::reap_superseded(&lab.work, &repo).expect("reap");
+    let report =
+        knives::commands::release::reap_superseded(&lab.work, &repo, "origin").expect("reap");
 
     // Then: nothing reaped; the reason names the descendant.
     assert!(report.reaped.is_empty(), "reaped: {:?}", report.reaped);
@@ -1065,7 +1067,8 @@ fn a_second_workspaces_parked_working_copy_does_not_block_reaping() {
 
     // When: reaped.
     let repo = Repo::open(&lab.work).expect("open");
-    let report = knives::commands::release::reap_superseded(&lab.work, &repo).expect("reap");
+    let report =
+        knives::commands::release::reap_superseded(&lab.work, &repo, "origin").expect("reap");
 
     // Then: the parked working copy does not block — the clause this pins.
     assert_eq!(
@@ -1112,7 +1115,8 @@ fn reap_reaps_when_another_remote_bookmark_pins_the_cut() {
 
     // When: reaped.
     let repo = Repo::open(&lab.work).expect("open");
-    let report = knives::commands::release::reap_superseded(&lab.work, &repo).expect("reap");
+    let report =
+        knives::commands::release::reap_superseded(&lab.work, &repo, "origin").expect("reap");
 
     // Then: the tracked remote pin is mutable, so the dated cut is reaped.
     assert_eq!(
@@ -1199,7 +1203,8 @@ fn an_untracked_remote_pin_makes_abandon_refuse_and_lands_in_forgotten_only() {
 
     // When: the workspace is reaped.
     let repo = Repo::open(&lab.work).expect("open");
-    let report = knives::commands::release::reap_superseded(&lab.work, &repo).expect("reap");
+    let report =
+        knives::commands::release::reap_superseded(&lab.work, &repo, "origin").expect("reap");
 
     // Then: refs are forgotten, abandon refuses, and reaped does not overstate.
     assert!(report.reaped.is_empty(), "{report:?}");
@@ -1274,7 +1279,8 @@ fn a_refused_first_name_does_not_stop_reaping_later_names() {
 
     // When: the workspace is reaped.
     let repo = Repo::open(&lab.work).expect("open");
-    let report = knives::commands::release::reap_superseded(&lab.work, &repo).expect("reap");
+    let report =
+        knives::commands::release::reap_superseded(&lab.work, &repo, "origin").expect("reap");
 
     // Then: the pinned first name refuses without stopping the second.
     assert_eq!(report.forgotten_only, vec!["release/2026-08-04".to_owned()]);
@@ -1298,7 +1304,8 @@ fn reaping_is_one_operation_described_for_the_op_log() {
 
     // When: reaped.
     let repo = Repo::open(&lab.work).expect("open");
-    let report = knives::commands::release::reap_superseded(&lab.work, &repo).expect("reap");
+    let report =
+        knives::commands::release::reap_superseded(&lab.work, &repo, "origin").expect("reap");
     assert_eq!(report.reaped, vec!["release/2026-08-04".to_owned()]);
 
     // Then: the whole reap is ONE operation, described as knives' own act.
@@ -1327,7 +1334,7 @@ fn reap_clears_a_ref_the_next_fetch_rematerialized() {
         lab.jj_work(["git", "push", "--remote", "origin", "--bookmark", name]);
     }
     let repo = Repo::open(&lab.work).expect("open");
-    knives::commands::release::reap_superseded(&lab.work, &repo).expect("first reap");
+    knives::commands::release::reap_superseded(&lab.work, &repo, "origin").expect("first reap");
     lab.fetch_work();
     let tips = Repo::open(&lab.work)
         .expect("reopen")
@@ -1341,7 +1348,8 @@ fn reap_clears_a_ref_the_next_fetch_rematerialized() {
 
     // When: reaped again (idempotence is the contract).
     let repo = Repo::open(&lab.work).expect("reopen for second reap");
-    let report = knives::commands::release::reap_superseded(&lab.work, &repo).expect("second reap");
+    let report = knives::commands::release::reap_superseded(&lab.work, &repo, "origin")
+        .expect("second reap");
 
     // Then: gone again.
     assert_eq!(report.reaped, vec!["release/2026-08-04".to_owned()]);
@@ -1510,7 +1518,7 @@ fn a_consumer_checkout_parked_behind_its_origin_does_not_produce_a_false_behind(
     );
 
     // When: the consumer is scanned.
-    let scan = knives::commands::release::scan_consumer_for(
+    let scan = knives::release_model::scan_consumer_for(
         &consumer,
         Some("tool"),
         &knives::ids::ReleaseScheme::Dated,
@@ -1536,7 +1544,7 @@ fn a_dev_trunk_consumer_checkout_uses_its_origin_head_pin() {
         "url = \"https://forge.invalid/o/tool.git?rev=release%2F2026-07-28\"\n",
     );
 
-    let scan = knives::commands::release::scan_consumer_for(
+    let scan = knives::release_model::scan_consumer_for(
         &consumer,
         Some("tool"),
         &knives::ids::ReleaseScheme::Dated,
@@ -1599,7 +1607,7 @@ fn a_tip_carried_into_another_branch_is_found() {
     // When: bookmarks carrying the original tip are listed
     let repo = Repo::open(&lab.work).expect("reopen");
     let carriers = repo
-        .branches_containing(&tip, &ReleaseScheme::Dated)
+        .branches_containing(&tip, &ReleaseScheme::Dated, "origin")
         .expect("carriers");
     let named: Vec<String> = carriers.iter().map(ToString::to_string).collect();
 
@@ -1628,7 +1636,7 @@ fn a_release_cut_is_not_a_carrier_locally_or_at_origin() {
     // When: carriers of the feature tip are listed.
     let carriers = Repo::open(&lab.work)
         .expect("reopen")
-        .branches_containing(&tip, &ReleaseScheme::Dated)
+        .branches_containing(&tip, &ReleaseScheme::Dated, "origin")
         .expect("carriers");
 
     // Then: the release is not reported through either representation we own.
@@ -2026,7 +2034,7 @@ fn git_tracking_refs_are_not_carriers_but_other_branches_are() {
     // When: carriers of our tip are listed.
     let carriers = Repo::open(&lab.work)
         .expect("reopen")
-        .branches_containing(&tip, &ReleaseScheme::Dated)
+        .branches_containing(&tip, &ReleaseScheme::Dated, "origin")
         .expect("carriers");
 
     // Then: the real branch remains useful evidence, but jj's duplicate does not.
@@ -2060,7 +2068,7 @@ fn fetched_pull_request_heads_are_not_carriers() {
     // When: carriers of the feature tip are listed.
     let carriers = Repo::open(&lab.work)
         .expect("reopen")
-        .branches_containing(&tip, &ReleaseScheme::Dated)
+        .branches_containing(&tip, &ReleaseScheme::Dated, "origin")
         .expect("carriers");
 
     // Then: our fetched pull request is not mistaken for someone else's carrier.
@@ -4470,7 +4478,7 @@ fn a_fixed_release_branch_is_cut_in_place_and_its_previous_position_is_the_old_c
 
     // When: the first fixed cut is made and pushed.
     let opened = Repo::open(lab.work_path()).expect("open");
-    let carried = knives::commands::release::carried_branches(&opened, entry.trunk(), &scheme)
+    let carried = knives::release_model::carried_branches(&opened, entry.trunk(), &scheme)
         .expect("carried branches");
     let trunk = opened
         .resolve_commit(&entry.upstream_trunk())
@@ -4505,7 +4513,7 @@ fn a_fixed_release_branch_is_cut_in_place_and_its_previous_position_is_the_old_c
 
     lab.branch("feat/beta", "beta.txt", "two\n");
     let opened = Repo::open(lab.work_path()).expect("reopen for second cut");
-    let carried = knives::commands::release::carried_branches(&opened, entry.trunk(), &scheme)
+    let carried = knives::release_model::carried_branches(&opened, entry.trunk(), &scheme)
         .expect("carried branches for second cut");
     let trunk = opened
         .resolve_commit(&entry.upstream_trunk())
@@ -4578,7 +4586,7 @@ fn plan_for_a_fixed_release_ignores_a_non_publish_remote() {
     let entry = lab.repo_entry_with_release_branch("integration");
     let scheme = entry.release_scheme();
     let opened = Repo::open(lab.work_path()).expect("open");
-    let carried = knives::commands::release::carried_branches(&opened, entry.trunk(), &scheme)
+    let carried = knives::release_model::carried_branches(&opened, entry.trunk(), &scheme)
         .expect("carried branches");
     let trunk = opened
         .resolve_commit(&entry.upstream_trunk())
@@ -5343,7 +5351,7 @@ fn a_fresh_cut_carries_every_branch_and_nothing_else() {
     lab.octopus("release/2026-07-29", "feat/alpha", "feat/beta");
 
     let repo = knives::jj::Repo::open(&lab.work).expect("open");
-    let carried = knives::commands::release::carried_branches(&repo, "main", &ReleaseScheme::Dated)
+    let carried = knives::release_model::carried_branches(&repo, "main", &ReleaseScheme::Dated)
         .expect("carried");
     let names: Vec<&str> = carried.iter().map(|(branch, _)| branch.as_str()).collect();
 
@@ -5822,6 +5830,13 @@ struct ReleaseWithSnapshotForgeInput<'a> {
 fn knives_release_with_forge_withheld_facts(
     input: ReleaseWithSnapshotForgeInput<'_>,
 ) -> std::process::Output {
+    release_with_snapshot_forge(input, ReleaseOutput::Text)
+}
+
+fn release_with_snapshot_forge(
+    input: ReleaseWithSnapshotForgeInput<'_>,
+    output: ReleaseOutput,
+) -> std::process::Output {
     let ReleaseWithSnapshotForgeInput {
         lab,
         home,
@@ -5831,12 +5846,7 @@ fn knives_release_with_forge_withheld_facts(
     } = input;
     let shim = tempfile::tempdir().expect("create forge shim directory");
     install_snapshot_gh(shim.path(), pulls, withheld_facts, None);
-    let mut command = Command::new(env!("CARGO_BIN_EXE_knives"));
-    command.args(["--text", "release", "--repo", "demo"]);
-    command.args(args);
-    command
-        .current_dir(&lab.work)
-        .env("KNIVES_CONFIG_HOME", home.path())
+    release_command(lab, home, output, args)
         .env("XDG_CACHE_HOME", shim.path().join("cache"))
         .env("PATH", path_with_gh_shim(shim.path()))
         .output()
@@ -8497,14 +8507,39 @@ fn file_at_revision(lab: &Lab, revision: &str, file: &str) -> String {
     String::from_utf8(output.stdout).expect("utf-8 file content")
 }
 
-/// Run the knives binary's release command for the `demo` repo in `lab`.
-fn knives_release(lab: &Lab, home: &tempfile::TempDir, args: &[&str]) -> std::process::Output {
+#[derive(Clone, Copy)]
+enum ReleaseOutput {
+    Text,
+    Json,
+}
+
+impl ReleaseOutput {
+    const fn flag(self) -> &'static str {
+        match self {
+            Self::Text => "--text",
+            Self::Json => "--json",
+        }
+    }
+}
+
+fn release_command(
+    lab: &Lab,
+    home: &tempfile::TempDir,
+    output: ReleaseOutput,
+    args: &[&str],
+) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_knives"));
-    command.args(["--text", "release", "--repo", "demo"]);
+    command.args([output.flag(), "release", "--repo", "demo"]);
     command.args(args);
     command
         .current_dir(&lab.work)
-        .env("KNIVES_CONFIG_HOME", home.path())
+        .env("KNIVES_CONFIG_HOME", home.path());
+    command
+}
+
+/// Run the knives binary's release command for the `demo` repo in `lab`.
+fn knives_release(lab: &Lab, home: &tempfile::TempDir, args: &[&str]) -> std::process::Output {
+    release_command(lab, home, ReleaseOutput::Text, args)
         .output()
         .expect("run knives release")
 }
@@ -8988,6 +9023,43 @@ fn release_carries_in_checks_only_the_requested_target() {
 }
 
 #[test]
+fn release_carries_in_exits_successfully_when_the_selected_historical_release_carries() {
+    // Given: alpha was carried by a release that later became superseded.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let (home, _consumer) = release_test_home(&lab);
+    let first = knives_release(&lab, &home, &["cut", "release/2026-08-04"]);
+    assert!(first.status.success(), "{first:?}");
+    let historical = commit_at(&lab, "release/2026-08-04");
+    lab.jj_work([
+        "bookmark",
+        "create",
+        "history/alpha-release",
+        "-r",
+        historical.as_str(),
+    ]);
+    lab.push_branch("history/alpha-release");
+    let second = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
+    assert!(second.status.success(), "{second:?}");
+    publish_remote_bookmark(&lab, "history/alpha-release@origin", "release/2026-08-04");
+
+    // When: the explicit target is the known, historical release.
+    let output = knives_release(
+        &lab,
+        &home,
+        &["carries", "feat/alpha", "--in", "release/2026-08-04@origin"],
+    );
+
+    // Then: --in reports the direct target verdict, not its safe-delete role.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}");
+    assert!(
+        stdout.contains("carried-exact      release/2026-08-04@origin"),
+        "{stdout}"
+    );
+}
+
+#[test]
 fn release_carries_answers_against_the_trunk_when_no_release_exists() {
     // Given: a branch but no release in hand.
     let lab = Lab::new();
@@ -9347,12 +9419,7 @@ fn census_excludes_anonymous_heads() {
 /// Run census without a forge so its locally discovered anonymous id can be
 /// supplied as a pull request's exact head oid on a subsequent run.
 fn knives_release_json(lab: &Lab, home: &tempfile::TempDir, args: &[&str]) -> std::process::Output {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_knives"));
-    command.args(["--json", "release", "--repo", "demo"]);
-    command.args(args);
-    command
-        .current_dir(&lab.work)
-        .env("KNIVES_CONFIG_HOME", home.path())
+    release_command(lab, home, ReleaseOutput::Json, args)
         .output()
         .expect("run knives release census")
 }
@@ -9377,25 +9444,7 @@ fn knives_release_json_with_forge(
 fn knives_release_json_with_forge_withheld_facts(
     input: ReleaseWithSnapshotForgeInput<'_>,
 ) -> std::process::Output {
-    let ReleaseWithSnapshotForgeInput {
-        lab,
-        home,
-        pulls,
-        withheld_facts,
-        args,
-    } = input;
-    let shim = tempfile::tempdir().expect("create forge shim directory");
-    install_snapshot_gh(shim.path(), pulls, withheld_facts, None);
-    let mut command = Command::new(env!("CARGO_BIN_EXE_knives"));
-    command.args(["--json", "release", "--repo", "demo"]);
-    command.args(args);
-    command
-        .current_dir(&lab.work)
-        .env("KNIVES_CONFIG_HOME", home.path())
-        .env("XDG_CACHE_HOME", shim.path().join("cache"))
-        .env("PATH", path_with_gh_shim(shim.path()))
-        .output()
-        .expect("run knives release census with a forge shim")
+    release_with_snapshot_forge(input, ReleaseOutput::Json)
 }
 
 /// Run census with a forge that fails before returning any data.
@@ -9406,12 +9455,7 @@ fn knives_release_with_failing_forge(
 ) -> std::process::Output {
     let shim = tempfile::tempdir().expect("create forge shim directory");
     install_failing_gh(shim.path(), &shim.path().join("calls.log"));
-    let mut command = Command::new(env!("CARGO_BIN_EXE_knives"));
-    command.args(["--text", "release", "--repo", "demo"]);
-    command.args(args);
-    command
-        .current_dir(&lab.work)
-        .env("KNIVES_CONFIG_HOME", home.path())
+    release_command(lab, home, ReleaseOutput::Text, args)
         .env("XDG_CACHE_HOME", shim.path().join("cache"))
         .env("PATH", path_with_gh_shim(shim.path()))
         .output()

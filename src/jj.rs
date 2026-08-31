@@ -421,6 +421,7 @@ impl Repo {
         &self,
         commit: &CommitId,
         scheme: &ReleaseScheme,
+        publish_remote: &str,
     ) -> Result<Vec<BookmarkRef>, JjError> {
         let mut found = Vec::new();
         for (reference, tip) in self.bookmark_tips()? {
@@ -437,7 +438,7 @@ impl Repo {
             // `@git` is jj's internal git-tracking view rather than a remote, and is
             // excluded everywhere else in this codebase for the same reason.
             // A fetched head is our own pull request, not someone else carrying the work.
-            if is_our_release(&reference, scheme)
+            if is_our_release(&reference, scheme, publish_remote)
                 || matches!(&reference, BookmarkRef::Remote { remote, .. } if remote.as_str() == "git")
                 || pull_number_from_bookmark(reference.branch().as_str()).is_some()
             {
@@ -521,7 +522,8 @@ pub fn fetch_all(repo: &Path) -> Result<(), JjError> {
 
 /// Reads pull refs directly from the git transport because jj-lib intentionally has no forge-ref API.
 pub fn pull_heads(_repo: &Path, remote_url: &str) -> Result<BTreeMap<u64, String>, JjError> {
-    let output = command("git", ["ls-remote", remote_url, "refs/pull/*/head"])?;
+    let args = ls_remote_args(remote_url, &["refs/pull/*/head"]);
+    let output = command_args("git", &args)?;
     output.lines().try_fold(BTreeMap::new(), |mut heads, line| {
         let (sha, reference) = line.split_once('\t').ok_or_else(|| JjError::Parse {
             detail: line.to_owned(),
@@ -547,8 +549,7 @@ pub fn remote_refs(
     remote_url: &str,
     patterns: &[&str],
 ) -> Result<BTreeMap<String, CommitId>, JjError> {
-    let mut args = vec!["ls-remote", remote_url];
-    args.extend(patterns);
+    let args = ls_remote_args(remote_url, patterns);
     let output = command_args("git", &args)?;
     output.lines().try_fold(BTreeMap::new(), |mut refs, line| {
         let (sha, reference) = line.split_once('\t').ok_or_else(|| JjError::Parse {
@@ -557,6 +558,13 @@ pub fn remote_refs(
         refs.insert(reference.to_owned(), CommitId::new(sha));
         Ok(refs)
     })
+}
+
+fn ls_remote_args<'a>(remote_url: &'a str, patterns: &[&'a str]) -> Vec<&'a str> {
+    let mut args = Vec::with_capacity(patterns.len() + 3);
+    args.extend(["ls-remote", "--", remote_url]);
+    args.extend(patterns.iter().copied());
+    args
 }
 
 /// Replays a branch onto `onto` as a dropped-transaction read: nothing is written.
@@ -1994,4 +2002,22 @@ pub fn conflicted_files(repo: &Path, revision: &str) -> Result<Vec<String>, JjEr
         .filter_map(|line| line.split_whitespace().next())
         .map(ToOwned::to_owned)
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ls_remote_args;
+
+    #[test]
+    fn ls_remote_always_terminates_option_parsing_before_the_remote_url() {
+        assert_eq!(
+            ls_remote_args("-looks-like-an-option", &["refs/heads/release/*"]),
+            vec![
+                "ls-remote",
+                "--",
+                "-looks-like-an-option",
+                "refs/heads/release/*"
+            ]
+        );
+    }
 }

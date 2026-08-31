@@ -2,8 +2,10 @@
 
 use std::path::Path;
 
+use crate::cli::Exit;
 use crate::config::RepoEntry;
-use crate::forge::{DiffTotals, Forge, TimelineEvent, TimelineEventKind};
+use crate::detect::pull_state::{PullState, pull_state_findings};
+use crate::forge::{DiffTotals, Forge, PullDetails, TimelineEvent, TimelineEventKind};
 use crate::ids::RepoName;
 
 #[derive(Debug, serde::Serialize)]
@@ -28,6 +30,8 @@ pub struct Report {
     pub tip_commit_empty: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeline: Option<Vec<TimelineEvent>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
 }
 
 pub struct Request<'a> {
@@ -77,6 +81,11 @@ pub fn gather(request: &Request<'_>) -> anyhow::Result<Option<Report>> {
     } else {
         None
     };
+    // The live batch is useful to subsequent reads even for a one-number request.
+    let persist_note = snapshot
+        .persist(None)
+        .err()
+        .map(|error| format!("could not persist forge snapshot: {error}"));
     let report = snapshot.fact(number).map(|fact| {
         let pull = &fact.pull;
         Report {
@@ -95,11 +104,32 @@ pub fn gather(request: &Request<'_>) -> anyhow::Result<Option<Report>> {
             head_ref_deleted: fact.details.head_ref_deleted,
             tip_commit_empty: fact.details.tip_commit_empty,
             timeline,
+            notes: persist_note.into_iter().collect(),
         }
     });
-    // The live batch is useful to subsequent reads even for a one-number request.
-    let _ = snapshot.persist(None);
     Ok(report)
+}
+
+/// The `pr` command has complete data when the live snapshot succeeds. Its
+/// optional cache write must remain visible, but cannot change the answer.
+pub fn exit_for(report: &Report) -> Exit {
+    let details = PullDetails {
+        diff: report.diff,
+        head_ref_deleted: report.head_ref_deleted,
+        tip_commit_empty: report.tip_commit_empty,
+        ..PullDetails::default()
+    };
+    if pull_state_findings(&[PullState {
+        number: report.number,
+        open: report.state.eq_ignore_ascii_case("OPEN"),
+        details: &details,
+    }])
+    .is_empty()
+    {
+        Exit::Ok
+    } else {
+        Exit::Findings
+    }
 }
 
 /// `ai#4545  CLOSED  feat/egress-guard -> main  @ab12cd34ef56  review APPROVED  updated …  <url>`
@@ -142,6 +172,11 @@ pub fn render(report: &Report) -> String {
             line.push_str(&render_timeline_event(event));
         }
     }
+    for note in &report.notes {
+        line.push('\n');
+        line.push_str("  note: ");
+        line.push_str(note);
+    }
     line
 }
 
@@ -183,6 +218,7 @@ mod tests {
     )]
 
     use super::*;
+    use crate::cli::Exit;
     use crate::forge::fake::FakeForge;
     use crate::forge::{DiffTotals, PullRequest};
     use crate::ids::{BranchName, RepoName};
@@ -253,6 +289,39 @@ mod tests {
     }
 
     #[test]
+    fn an_open_pull_with_an_answered_incident_exits_findings_even_with_a_persist_note() {
+        let report = Report {
+            repo: "demo".to_owned(),
+            number: 7,
+            state: "OPEN".to_owned(),
+            branch: "feat/a".to_owned(),
+            base: "main".to_owned(),
+            head: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            review: String::new(),
+            updated: "2026-08-30T00:00:00Z".to_owned(),
+            url: String::new(),
+            is_draft: false,
+            mergeable: "MERGEABLE".to_owned(),
+            diff: Some(DiffTotals::default()),
+            head_ref_deleted: Some(false),
+            tip_commit_empty: Some(false),
+            timeline: None,
+            notes: vec!["could not persist forge snapshot: disk full".to_owned()],
+        };
+
+        assert_eq!(exit_for(&report), Exit::Findings);
+        assert!(render(&report).contains("note: could not persist forge snapshot: disk full"));
+        assert_eq!(
+            serde_json::to_value(&report)
+                .expect("serialize")
+                .get("notes")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len),
+            Some(1)
+        );
+    }
+
+    #[test]
     fn render_keeps_the_pull_requests_present_state_context_together() {
         let report = Report {
             repo: "demo".to_owned(),
@@ -270,6 +339,7 @@ mod tests {
             head_ref_deleted: Some(true),
             tip_commit_empty: Some(true),
             timeline: None,
+            notes: Vec::new(),
         };
 
         assert_eq!(
@@ -310,6 +380,7 @@ mod tests {
                     },
                 },
             }]),
+            notes: Vec::new(),
         };
 
         assert_eq!(
@@ -353,6 +424,7 @@ mod tests {
                     },
                 },
             }]),
+            notes: Vec::new(),
         };
 
         assert!(

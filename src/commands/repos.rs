@@ -8,10 +8,10 @@ use std::fmt::Write as _;
 use std::path::Path;
 
 use crate::cli::Exit;
-use crate::commands::status::release_order;
 use crate::config::{Registry, RepoEntry, Role, default_config_path, load};
 use crate::ids::{BookmarkRef, BranchName, ReleaseScheme, RemoteName, is_our_release};
 use crate::jj::Repo;
+use crate::release_model::{release_order, repo_slug, scan_consumer_for};
 
 struct ReleaseState {
     newest: Option<String>,
@@ -27,7 +27,7 @@ fn newest_release(tips: &crate::detect::BookmarkTips, entry: &RepoEntry) -> Opti
     match &scheme {
         ReleaseScheme::Dated => tips
             .keys()
-            .filter(|reference| is_our_release(reference, &scheme))
+            .filter(|reference| is_our_release(reference, &scheme, entry.publish_remote()))
             .max_by_key(|reference| release_order(reference.branch().as_str()))
             .map(ToString::to_string),
         ReleaseScheme::Fixed(branch) => {
@@ -105,14 +105,14 @@ fn dated_pin_lag(entry: &RepoEntry, newest: Option<&String>, scheme: &ReleaseSch
     // names only the branch. Comparing those forms directly called every repo behind,
     // including ones pinned exactly at the newest cut.
     let newest_branch = newest.split('@').next().unwrap_or(newest);
-    let slug = crate::commands::release::repo_slug(entry);
+    let slug = repo_slug(entry);
     // Reported per consumer, because they can sit on different releases: one consumer
     // being current says nothing about another, and collapsing them into a single verdict
     // hid exactly that.
     let mut behind = Vec::new();
     let mut notes = Vec::new();
     for consumer in &entry.consumers {
-        let scan = crate::commands::release::scan_consumer_for(consumer, slug.as_deref(), scheme);
+        let scan = scan_consumer_for(consumer, slug.as_deref(), scheme);
         notes.extend(scan.notes);
         if !scan.problems.is_empty() {
             notes.extend(scan.problems);
@@ -144,7 +144,7 @@ fn fixed_pin_lag(
     fixed: &BranchName,
     scheme: &ReleaseScheme,
 ) -> PinLag {
-    let slug = crate::commands::release::repo_slug(entry);
+    let slug = repo_slug(entry);
     let local_tip = repo.and_then(|repo| {
         repo.bookmark_tips()
             .ok()
@@ -153,7 +153,7 @@ fn fixed_pin_lag(
     let mut behind = Vec::new();
     let mut notes = Vec::new();
     for consumer in &entry.consumers {
-        let scan = crate::commands::release::scan_consumer_for(consumer, slug.as_deref(), scheme);
+        let scan = scan_consumer_for(consumer, slug.as_deref(), scheme);
         notes.extend(scan.notes);
         if !scan.problems.is_empty() {
             notes.extend(scan.problems);
