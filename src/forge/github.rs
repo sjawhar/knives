@@ -14,8 +14,9 @@ use std::sync::{Condvar, Mutex};
 use serde::{Deserialize, Deserializer};
 
 use super::{
-    CheckRun, ChecksSummary, Forge, ForgeError, PullDetails, PullFacts, PullRequest, PullSummary,
-    RepoIdentity, SweepEntry, SweepPage,
+    CheckRun, ChecksSummary, CommitOids, DiffTotals, Forge, ForgeError, PullDetails, PullFacts,
+    PullRequest, PullSummary, RepoIdentity, SweepEntry, SweepPage, TimelineEvent,
+    TimelineEventKind,
 };
 const PR_STATE: &str = "all";
 // headRepositoryOwner is what makes a pull request ours or someone else's. Without
@@ -125,6 +126,16 @@ pub struct CliForge;
 /// | 8 | 1.879s |
 ///
 /// Eight was the fastest configuration.
+///
+/// Facts-fragment cost probe: three cold-cache runs per fork (2026-08-30).
+///
+/// | Fork | Installed median | Candidate median | Change |
+/// | --- | ---: | ---: | ---: |
+/// | Busy fork one | 8.579s | 8.945s | +4.3% |
+/// | Busy fork two | 14.830s | 16.353s | +10.3% |
+///
+/// Outcome A: both candidate medians stayed within the 20% envelope, so the
+/// status facts fragment retains the diff-stat fields.
 const FACTS_BATCH_CHUNK_SIZE: usize = 8;
 /// `status --all` may gather 64 repositories concurrently, and each gather
 /// can start several fact-batch workers. The forge sees `gh` child processes,
@@ -326,6 +337,61 @@ impl Forge for CliForge {
             Ok(facts)
         })
     }
+
+    fn pull_timeline(
+        &self,
+        repo: &Path,
+        target: &RepoIdentity,
+        number: u64,
+    ) -> Result<Vec<TimelineEvent>, ForgeError> {
+        let (owner, name) = target.split()?;
+        let owner = format!("owner={owner}");
+        let name = format!("name={name}");
+        let query = format!("query={}", pull_timeline_query(number));
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                let payload = Self::run(
+                    repo,
+                    &["api", "graphql", "-f", &owner, "-f", &name, "-f", &query],
+                )?;
+                parse_pull_timeline(&payload, number)
+            });
+            joined_forge_call(worker.join())
+        })
+    }
+}
+
+/// One pull request's head-ref history. `last: 100` of only the named item
+/// types is bounded by construction and does not add any fields to the wide
+/// pull-request sweep.
+///
+/// Probed on 2026-08-30 with the final shape:
+///
+/// | Workload | Samples (seconds) | Median |
+/// | --- | --- | ---: |
+/// | force-push, delete, and restore history | 1.166, 1.160, 1.125 | 1.160s |
+/// | quiet pull request | 1.071 | 1.071s |
+/// | busy long-lived pull request | 1.246 | 1.246s |
+///
+/// Every query completed without rejection, so `last: 100` stays below the
+/// two-second limit without dropping state events.
+pub fn pull_timeline_query(number: u64) -> String {
+    format!(
+        "query($owner: String!, $name: String!) {{ \
+         repository(owner: $owner, name: $name) {{ \
+         pullRequest(number: {number}) {{ \
+         timelineItems(last: 100, itemTypes: [HEAD_REF_FORCE_PUSHED_EVENT, \
+         HEAD_REF_DELETED_EVENT, HEAD_REF_RESTORED_EVENT, CLOSED_EVENT, \
+         REOPENED_EVENT, MERGED_EVENT]) {{ \
+         pageInfo {{ hasPreviousPage }} nodes {{ __typename \
+         ... on HeadRefForcePushedEvent {{ createdAt \
+             beforeCommit {{ oid tree {{ oid }} }} afterCommit {{ oid tree {{ oid }} }} }} \
+         ... on HeadRefDeletedEvent {{ createdAt }} \
+         ... on HeadRefRestoredEvent {{ createdAt }} \
+         ... on ClosedEvent {{ createdAt }} \
+         ... on ReopenedEvent {{ createdAt }} \
+         ... on MergedEvent {{ createdAt commit {{ oid }} }} }} }} }} }} }}"
+    )
 }
 
 /// One page, newest-updated first.
@@ -357,11 +423,12 @@ pub fn pull_facts_query(numbers: &[u64]) -> String {
          repository(owner: $owner, name: $name) {{ {fields} }} }} \
          fragment facts on PullRequest {{ number state reviewDecision headRefName headRefOid \
          updatedAt isDraft url headRepositoryOwner {{ login }} baseRefName mergeable \
-         mergeStateStatus mergeCommit {{ oid }} \
+         mergeStateStatus mergeCommit {{ oid }} additions deletions changedFiles headRef {{ name }} \
          reviews(last: 100) {{ nodes {{ submittedAt }} }} \
          commits(last: 100) {{ nodes {{ commit {{ committedDate }} }} }} \
-         rollup: commits(last: 1) {{ nodes {{ commit {{ statusCheckRollup {{ \
-         contexts(first: 100) {{ pageInfo {{ hasNextPage }} nodes {{ __typename \
+         rollup: commits(last: 1) {{ nodes {{ commit {{ tree {{ oid }} \
+         parents(first: 2) {{ pageInfo {{ hasNextPage }} nodes {{ tree {{ oid }} }} }} \
+         statusCheckRollup {{ contexts(first: 100) {{ pageInfo {{ hasNextPage }} nodes {{ __typename \
          ... on CheckRun {{ name conclusion }} \
          ... on StatusContext {{ context state }} }} }} }} }} }} }} \
          comments(last: 1) {{ nodes {{ createdAt }} }} }}"
@@ -405,7 +472,22 @@ struct RollupNode {
 }
 
 #[derive(Deserialize)]
+struct Tree {
+    oid: String,
+}
+
+#[derive(Deserialize)]
+struct ParentNode {
+    #[serde(default)]
+    tree: Option<Tree>,
+}
+
+#[derive(Deserialize)]
 struct RollupHolder {
+    #[serde(default)]
+    tree: Option<Tree>,
+    #[serde(default)]
+    parents: Option<Nodes<ParentNode>>,
     #[serde(default, rename = "statusCheckRollup")]
     rollup: Option<Contexts>,
 }
@@ -475,10 +557,50 @@ struct SweepEnvelope {
     errors: Vec<QueryFailure>,
 }
 
+#[derive(Debug, Deserialize)]
+struct HeadRefNode {
+    #[serde(default)]
+    #[allow(
+        dead_code,
+        reason = "the object's presence is the fact; the name confirms the shape"
+    )]
+    name: String,
+}
+
+/// Distinguishes an omitted legacy field from an answered null head ref.
+#[derive(Debug, Default, Clone, Copy)]
+enum HeadRef {
+    #[default]
+    Missing,
+    Present,
+    Deleted,
+}
+
+impl<'de> Deserialize<'de> for HeadRef {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Option::<HeadRefNode>::deserialize(deserializer).map(|head_ref| match head_ref {
+            Some(_) => Self::Present,
+            None => Self::Deleted,
+        })
+    }
+}
+
 #[derive(Deserialize)]
 struct FactsPayload {
     #[serde(flatten)]
     pull: PullRequest,
+    #[serde(default)]
+    additions: Option<u64>,
+    #[serde(default)]
+    deletions: Option<u64>,
+    #[serde(default, rename = "changedFiles")]
+    changed_files: Option<u64>,
+    /// Missing means an old payload; null means a deleted remote head ref.
+    #[serde(default, rename = "headRef")]
+    head_ref: HeadRef,
     #[serde(default)]
     reviews: Option<Nodes<Dated>>,
     #[serde(default)]
@@ -507,6 +629,85 @@ struct FactsEnvelope {
     data: Option<FactsData>,
     #[serde(default)]
     errors: Vec<QueryFailure>,
+}
+
+#[derive(Deserialize)]
+struct TimelineEnvelope {
+    #[serde(default)]
+    data: Option<TimelineData>,
+    #[serde(default)]
+    errors: Vec<QueryFailure>,
+}
+
+#[derive(Deserialize)]
+struct TimelineData {
+    #[serde(default)]
+    repository: Option<TimelineRepository>,
+}
+
+#[derive(Deserialize)]
+struct TimelineRepository {
+    #[serde(default, rename = "pullRequest")]
+    pull_request: Option<TimelinePullRequest>,
+}
+
+#[derive(Deserialize)]
+struct TimelinePullRequest {
+    #[serde(rename = "timelineItems")]
+    timeline_items: TimelineItems,
+}
+
+#[derive(Deserialize)]
+struct TimelineItems {
+    #[serde(default)]
+    nodes: Vec<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct TimelineCommit {
+    oid: String,
+    #[serde(default)]
+    tree: Option<Tree>,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "__typename")]
+enum TimelineEventPayload {
+    #[serde(rename = "HeadRefForcePushedEvent")]
+    ForcePush {
+        #[serde(rename = "createdAt")]
+        at: String,
+        #[serde(rename = "beforeCommit")]
+        before: Option<TimelineCommit>,
+        #[serde(rename = "afterCommit")]
+        after: Option<TimelineCommit>,
+    },
+    #[serde(rename = "HeadRefDeletedEvent")]
+    HeadDeleted {
+        #[serde(rename = "createdAt")]
+        at: String,
+    },
+    #[serde(rename = "HeadRefRestoredEvent")]
+    HeadRestored {
+        #[serde(rename = "createdAt")]
+        at: String,
+    },
+    #[serde(rename = "ClosedEvent")]
+    Closed {
+        #[serde(rename = "createdAt")]
+        at: String,
+    },
+    #[serde(rename = "ReopenedEvent")]
+    Reopened {
+        #[serde(rename = "createdAt")]
+        at: String,
+    },
+    #[serde(rename = "MergedEvent")]
+    Merged {
+        #[serde(rename = "createdAt")]
+        at: String,
+        commit: Option<TimelineCommit>,
+    },
 }
 
 pub fn parse_identity(payload: &str) -> Result<RepoIdentity, ForgeError> {
@@ -569,6 +770,95 @@ fn is_tolerable_not_found(failure: &QueryFailure, asked: &[u64]) -> bool {
     repository == "repository" && asked.iter().any(|number| alias == format!("p{number}"))
 }
 
+/// A tip is empty only when its tree is identical to its sole parent's tree.
+///
+/// The query caps parents at two. A continuation means an octopus merge, which
+/// reads as non-empty rather than being classified from an incomplete parent list.
+fn tip_commit_empty(tip: &RollupHolder) -> Option<bool> {
+    let (Some(tree), Some(parents)) = (tip.tree.as_ref(), tip.parents.as_ref()) else {
+        return None;
+    };
+    if parents.page_info.has_next_page {
+        return Some(false);
+    }
+    let [parent] = parents.nodes.as_slice() else {
+        return Some(false);
+    };
+    parent.tree.as_ref().map(|parent| tree.oid == parent.oid)
+}
+
+fn details_from(payload: &FactsPayload) -> Result<PullDetails, ForgeError> {
+    let newest_review = payload
+        .reviews
+        .iter()
+        .flat_map(|list| list.nodes.iter())
+        .filter_map(|review| review.submitted_at.as_deref())
+        .max();
+    let newest_commit = payload
+        .commits
+        .iter()
+        .flat_map(|list| list.nodes.iter())
+        .map(|node| node.commit.committed_date.as_str())
+        .max();
+    let review_predates_head = match (newest_review, newest_commit) {
+        (Some(review), Some(commit)) => Some(review < commit),
+        _ => None,
+    };
+    let has_more_contexts = payload
+        .rollup
+        .iter()
+        .flat_map(|list| list.nodes.iter())
+        .filter_map(|node| node.commit.rollup.as_ref())
+        .filter_map(|rollup| rollup.contexts.as_ref())
+        .any(|contexts| contexts.page_info.has_next_page);
+    if has_more_contexts {
+        return Err(ForgeError::Query {
+            detail: format!(
+                "pull request #{} has more than 100 check contexts; refusing a truncated rollup",
+                payload.pull.number
+            ),
+        });
+    }
+
+    let checks = Some(ChecksSummary {
+        runs: payload
+            .rollup
+            .iter()
+            .flat_map(|list| list.nodes.iter())
+            .filter_map(|node| node.commit.rollup.as_ref())
+            .filter_map(|rollup| rollup.contexts.as_ref())
+            .flat_map(|contexts| contexts.nodes.iter())
+            .cloned()
+            .collect(),
+    });
+    let diff = match (payload.additions, payload.deletions, payload.changed_files) {
+        (Some(additions), Some(deletions), Some(changed_files)) => Some(DiffTotals {
+            additions,
+            deletions,
+            changed_files,
+        }),
+        _ => None,
+    };
+    let head_ref_deleted = match payload.head_ref {
+        HeadRef::Missing => None,
+        HeadRef::Present => Some(false),
+        HeadRef::Deleted => Some(true),
+    };
+    let tip_commit_empty = payload
+        .rollup
+        .iter()
+        .flat_map(|list| list.nodes.iter())
+        .last()
+        .and_then(|tip| tip_commit_empty(&tip.commit));
+    Ok(PullDetails {
+        review_predates_head,
+        checks,
+        diff,
+        head_ref_deleted,
+        tip_commit_empty,
+    })
+}
+
 pub fn parse_pull_facts(
     payload: &str,
     asked: &[u64],
@@ -596,49 +886,7 @@ pub fn parse_pull_facts(
     };
     let mut facts = BTreeMap::new();
     for payload in repository.into_values().flatten() {
-        let newest_review = payload
-            .reviews
-            .iter()
-            .flat_map(|list| list.nodes.iter())
-            .filter_map(|review| review.submitted_at.as_deref())
-            .max();
-        let newest_commit = payload
-            .commits
-            .iter()
-            .flat_map(|list| list.nodes.iter())
-            .map(|node| node.commit.committed_date.as_str())
-            .max();
-        let review_predates_head = match (newest_review, newest_commit) {
-            (Some(review), Some(commit)) => Some(review < commit),
-            _ => None,
-        };
-        let has_more_contexts = payload
-            .rollup
-            .iter()
-            .flat_map(|list| list.nodes.iter())
-            .filter_map(|node| node.commit.rollup.as_ref())
-            .filter_map(|rollup| rollup.contexts.as_ref())
-            .any(|contexts| contexts.page_info.has_next_page);
-        if has_more_contexts {
-            return Err(ForgeError::Query {
-                detail: format!(
-                    "pull request #{} has more than 100 check contexts; refusing a truncated rollup",
-                    payload.pull.number
-                ),
-            });
-        }
-
-        let checks = Some(ChecksSummary {
-            runs: payload
-                .rollup
-                .iter()
-                .flat_map(|list| list.nodes.iter())
-                .filter_map(|node| node.commit.rollup.as_ref())
-                .filter_map(|rollup| rollup.contexts.as_ref())
-                .flat_map(|contexts| contexts.nodes.iter())
-                .cloned()
-                .collect(),
-        });
+        let details = details_from(&payload)?;
         let newest_comment = payload
             .reviews
             .iter()
@@ -658,15 +906,109 @@ pub fn parse_pull_facts(
             number,
             PullFacts {
                 pull: payload.pull,
-                details: PullDetails {
-                    review_predates_head,
-                    checks,
-                },
+                details,
                 newest_comment,
             },
         );
     }
     Ok(facts)
+}
+
+/// Decode the bounded timeline payload for its requested pull request number.
+pub fn parse_pull_timeline(payload: &str, number: u64) -> Result<Vec<TimelineEvent>, ForgeError> {
+    let envelope: TimelineEnvelope = serde_json::from_str(payload)?;
+    if !envelope.errors.is_empty() {
+        return Err(ForgeError::Query {
+            detail: envelope
+                .errors
+                .iter()
+                .map(|failure| failure.message.clone())
+                .collect::<Vec<_>>()
+                .join("; "),
+        });
+    }
+    let pull = envelope
+        .data
+        .and_then(|data| data.repository)
+        .and_then(|repository| repository.pull_request);
+    let Some(pull) = pull else {
+        return Err(ForgeError::Query {
+            detail: format!("the reply carried neither errors nor pull request #{number}"),
+        });
+    };
+    pull.timeline_items
+        .nodes
+        .into_iter()
+        .map(timeline_event)
+        .collect()
+}
+
+fn timeline_event(event: serde_json::Value) -> Result<TimelineEvent, ForgeError> {
+    let Some(typename) = event.get("__typename").and_then(serde_json::Value::as_str) else {
+        return Err(ForgeError::Query {
+            detail: "a pull timeline event had no __typename".to_owned(),
+        });
+    };
+    match typename {
+        "HeadRefForcePushedEvent"
+        | "HeadRefDeletedEvent"
+        | "HeadRefRestoredEvent"
+        | "ClosedEvent"
+        | "ReopenedEvent"
+        | "MergedEvent" => {}
+        unknown => {
+            return Err(ForgeError::Query {
+                detail: format!("the forge returned unknown pull timeline event type `{unknown}`"),
+            });
+        }
+    }
+    let event: TimelineEventPayload = serde_json::from_value(event)?;
+    Ok(match event {
+        TimelineEventPayload::ForcePush { at, before, after } => TimelineEvent {
+            at,
+            kind: TimelineEventKind::ForcePush {
+                before: commit_oids(before),
+                after: commit_oids(after),
+            },
+        },
+        TimelineEventPayload::HeadDeleted { at } => TimelineEvent {
+            at,
+            kind: TimelineEventKind::HeadDeleted,
+        },
+        TimelineEventPayload::HeadRestored { at } => TimelineEvent {
+            at,
+            kind: TimelineEventKind::HeadRestored,
+        },
+        TimelineEventPayload::Closed { at } => TimelineEvent {
+            at,
+            kind: TimelineEventKind::Closed,
+        },
+        TimelineEventPayload::Reopened { at } => TimelineEvent {
+            at,
+            kind: TimelineEventKind::Reopened,
+        },
+        TimelineEventPayload::Merged { at, commit } => TimelineEvent {
+            at,
+            kind: TimelineEventKind::Merged {
+                commit: commit.map(|commit| commit.oid),
+            },
+        },
+    })
+}
+
+fn commit_oids(commit: Option<TimelineCommit>) -> CommitOids {
+    let Some(commit) = commit else {
+        return CommitOids {
+            commit: "unknown".to_owned(),
+            tree: "unknown".to_owned(),
+        };
+    };
+    CommitOids {
+        commit: commit.oid,
+        tree: commit
+            .tree
+            .map_or_else(|| "unknown".to_owned(), |tree| tree.oid),
+    }
 }
 
 #[cfg(test)]
@@ -926,6 +1268,106 @@ printf '{}'
             Some("2026-08-02T00:00:00Z"),
             "the review outranks the older comment"
         );
+    }
+
+    #[test]
+    fn facts_carry_diff_totals_head_ref_presence_and_tip_emptiness() {
+        let payload = facts_payload(
+            r#""p7":{"number":7,"state":"OPEN","headRefName":"feat/a","headRefOid":"aa",
+        "updatedAt":"2026-08-01T00:00:00Z",
+        "additions":0,"deletions":0,"changedFiles":0,"headRef":null,
+        "rollup":{"nodes":[{"commit":{"additions":0,"deletions":0,"tree":{"oid":"same"},
+        "parents":{"nodes":[{"tree":{"oid":"same"}}]}}}]}}"#,
+        );
+        let facts = parse_pull_facts(&payload, &[7]).expect("facts parse");
+        let details = &facts[&7].details;
+        assert_eq!(
+            details.diff,
+            Some(crate::forge::DiffTotals {
+                additions: 0,
+                deletions: 0,
+                changed_files: 0
+            }),
+            "an answered zero diff is a fact, not an absence"
+        );
+        assert_eq!(
+            details.head_ref_deleted,
+            Some(true),
+            "headRef null means the ref is gone"
+        );
+        assert_eq!(details.tip_commit_empty, Some(true));
+    }
+
+    #[test]
+    fn facts_do_not_mistake_zero_line_rename_for_an_empty_tip() {
+        let payload = facts_payload(
+            r#""p7":{"number":7,"state":"OPEN","headRefName":"feat/a","headRefOid":"aa",
+        "updatedAt":"2026-08-01T00:00:00Z","rollup":{"nodes":[{"commit":{
+        "additions":0,"deletions":0,"tree":{"oid":"renamed"},
+        "parents":{"nodes":[{"tree":{"oid":"original"}}]}}}]}}"#,
+        );
+
+        let facts = parse_pull_facts(&payload, &[7]).expect("facts parse");
+
+        assert_eq!(facts[&7].details.tip_commit_empty, Some(false));
+    }
+
+    #[test]
+    fn facts_do_not_mistake_a_merge_tip_for_an_empty_tip() {
+        let payload = facts_payload(
+            r#""p7":{"number":7,"state":"OPEN","headRefName":"feat/a","headRefOid":"aa",
+        "updatedAt":"2026-08-01T00:00:00Z","rollup":{"nodes":[{"commit":{
+        "additions":0,"deletions":0,"tree":{"oid":"merged"},
+        "parents":{"nodes":[{"tree":{"oid":"left"}},{"tree":{"oid":"right"}}]}}}]}}"#,
+        );
+
+        let facts = parse_pull_facts(&payload, &[7]).expect("facts parse");
+
+        assert_eq!(facts[&7].details.tip_commit_empty, Some(false));
+    }
+
+    #[test]
+    fn facts_do_not_mistake_a_root_tip_for_an_empty_tip() {
+        let payload = facts_payload(
+            r#""p7":{"number":7,"state":"OPEN","headRefName":"feat/a","headRefOid":"aa",
+        "updatedAt":"2026-08-01T00:00:00Z","rollup":{"nodes":[{"commit":{
+        "additions":0,"deletions":0,"tree":{"oid":"root"},"parents":{"nodes":[]}}}]}}"#,
+        );
+
+        let facts = parse_pull_facts(&payload, &[7]).expect("facts parse");
+
+        assert_eq!(facts[&7].details.tip_commit_empty, Some(false));
+    }
+
+    #[test]
+    fn facts_do_not_guess_about_an_octopus_tip() {
+        let payload = facts_payload(
+            r#""p7":{"number":7,"state":"OPEN","headRefName":"feat/a","headRefOid":"aa",
+        "updatedAt":"2026-08-01T00:00:00Z","rollup":{"nodes":[{"commit":{
+        "additions":0,"deletions":0,"tree":{"oid":"octopus"},
+        "parents":{"pageInfo":{"hasNextPage":true},
+        "nodes":[{"tree":{"oid":"one"}},{"tree":{"oid":"two"}}]}}}]}}"#,
+        );
+
+        let facts = parse_pull_facts(&payload, &[7]).expect("facts parse");
+
+        assert_eq!(facts[&7].details.tip_commit_empty, Some(false));
+    }
+
+    #[test]
+    fn facts_missing_the_new_fields_answer_none_not_zero() {
+        // An old recorded payload (or a forge that refused the fields) must read as
+        // "not answered", never as "empty diff" — the not-consulted/nothing-found
+        // distinction the whole forge module is built on.
+        let payload = facts_payload(
+            r#""p7":{"number":7,"state":"OPEN","headRefName":"feat/a","headRefOid":"aa",
+        "updatedAt":"2026-08-01T00:00:00Z"}"#,
+        );
+        let facts = parse_pull_facts(&payload, &[7]).expect("facts parse");
+        let details = &facts[&7].details;
+        assert_eq!(details.diff, None);
+        assert_eq!(details.head_ref_deleted, None);
+        assert_eq!(details.tip_commit_empty, None);
     }
 
     #[test]
@@ -1190,5 +1632,118 @@ printf '{}'
         assert!(facts.contains("mergeable"), "was: {facts}");
         assert!(facts.contains("mergeStateStatus"), "was: {facts}");
         assert!(facts.contains("comments(last: 1)"), "was: {facts}");
+    }
+
+    fn timeline_payload(nodes: &str) -> String {
+        format!(
+            "{{\"data\":{{\"repository\":{{\"pullRequest\":{{\"timelineItems\":\
+             {{\"pageInfo\":{{\"hasPreviousPage\":false}},\"nodes\":[{nodes}]}}}}}}}}}}"
+        )
+    }
+
+    #[test]
+    fn a_force_push_carries_before_and_after_commit_and_tree_oids() {
+        let payload = timeline_payload(
+            r#"{"__typename":"HeadRefForcePushedEvent","createdAt":"2026-08-30T22:41:02Z",
+            "beforeCommit":{"oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "tree":{"oid":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}},
+            "afterCommit":{"oid":"cccccccccccccccccccccccccccccccccccccccc",
+            "tree":{"oid":"dddddddddddddddddddddddddddddddddddddddd"}}}"#,
+        );
+
+        let events = parse_pull_timeline(&payload, 7).expect("timeline parses");
+
+        assert_eq!(
+            events,
+            vec![TimelineEvent {
+                at: "2026-08-30T22:41:02Z".to_owned(),
+                kind: TimelineEventKind::ForcePush {
+                    before: CommitOids {
+                        commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+                        tree: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
+                    },
+                    after: CommitOids {
+                        commit: "cccccccccccccccccccccccccccccccccccccccc".to_owned(),
+                        tree: "dddddddddddddddddddddddddddddddddddddddd".to_owned(),
+                    },
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn delete_and_restore_events_keep_the_forges_chronological_order() {
+        let payload = timeline_payload(
+            r#"{"__typename":"HeadRefDeletedEvent","createdAt":"2026-08-30T22:43:13Z"},
+            {"__typename":"HeadRefRestoredEvent","createdAt":"2026-08-30T22:44:11Z"}"#,
+        );
+
+        let events = parse_pull_timeline(&payload, 7).expect("timeline parses");
+
+        assert_eq!(
+            events,
+            vec![
+                TimelineEvent {
+                    at: "2026-08-30T22:43:13Z".to_owned(),
+                    kind: TimelineEventKind::HeadDeleted,
+                },
+                TimelineEvent {
+                    at: "2026-08-30T22:44:11Z".to_owned(),
+                    kind: TimelineEventKind::HeadRestored,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unknown_timeline_event_type_rejects_the_whole_history() {
+        let payload = timeline_payload(
+            r#"{"__typename":"NewForgeTimelineEvent","createdAt":"2026-08-30T22:43:13Z"}"#,
+        );
+
+        let error = parse_pull_timeline(&payload, 7).expect_err("unknown event must not disappear");
+
+        assert!(matches!(error, ForgeError::Query { .. }), "was: {error}");
+        assert!(
+            error.to_string().contains("NewForgeTimelineEvent"),
+            "was: {error}"
+        );
+    }
+
+    #[test]
+    fn a_force_push_with_a_garbage_collected_before_commit_keeps_the_event() {
+        let payload = timeline_payload(
+            r#"{"__typename":"HeadRefForcePushedEvent","createdAt":"2026-08-30T22:41:02Z",
+            "beforeCommit":null,"afterCommit":{"oid":"cccccccccccccccccccccccccccccccccccccccc",
+            "tree":{"oid":"dddddddddddddddddddddddddddddddddddddddd"}}}"#,
+        );
+
+        let events = parse_pull_timeline(&payload, 7).expect("missing before commit is historical");
+
+        assert_eq!(
+            events,
+            vec![TimelineEvent {
+                at: "2026-08-30T22:41:02Z".to_owned(),
+                kind: TimelineEventKind::ForcePush {
+                    before: CommitOids {
+                        commit: "unknown".to_owned(),
+                        tree: "unknown".to_owned(),
+                    },
+                    after: CommitOids {
+                        commit: "cccccccccccccccccccccccccccccccccccccccc".to_owned(),
+                        tree: "dddddddddddddddddddddddddddddddddddddddd".to_owned(),
+                    },
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn an_absent_pull_timeline_names_the_requested_number() {
+        let error = parse_pull_timeline(r#"{"data":{"repository":{"pullRequest":null}}}"#, 88)
+            .expect_err("a null pull request is unavailable");
+
+        assert!(matches!(error, ForgeError::Query { .. }), "was: {error}");
+        assert!(error.to_string().contains("#88"), "was: {error}");
     }
 }

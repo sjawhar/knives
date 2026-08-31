@@ -632,7 +632,8 @@ mod tracking_tests {
 mod comment_activity_tests {
     use super::{test_pull, *};
     use crate::forge::{
-        Forge, ForgeError, PullFacts, PullRequest, PullSummary, RepoIdentity, SweepEntry, SweepPage,
+        Forge, ForgeError, PullFacts, PullRequest, PullSummary, RepoIdentity, SweepEntry,
+        SweepPage, TimelineEvent,
     };
     use crate::ids::RepoName;
     use crate::store::Store;
@@ -718,6 +719,17 @@ mod comment_activity_tests {
                 })
                 .collect())
         }
+
+        fn pull_timeline(
+            &self,
+            _repo: &Path,
+            _target: &RepoIdentity,
+            _number: u64,
+        ) -> Result<Vec<TimelineEvent>, ForgeError> {
+            Err(ForgeError::Query {
+                detail: "comment fetch failed".to_owned(),
+            })
+        }
     }
 
     struct PullListUnavailable;
@@ -759,6 +771,15 @@ mod comment_activity_tests {
             _numbers: &[u64],
         ) -> Result<BTreeMap<u64, PullFacts>, ForgeError> {
             Ok(BTreeMap::new())
+        }
+
+        fn pull_timeline(
+            &self,
+            _repo: &Path,
+            _target: &RepoIdentity,
+            _number: u64,
+        ) -> Result<Vec<TimelineEvent>, ForgeError> {
+            Ok(Vec::new())
         }
     }
 

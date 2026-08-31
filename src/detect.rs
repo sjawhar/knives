@@ -9,6 +9,7 @@ pub mod divergence;
 pub mod double_checkout;
 pub mod landed;
 pub mod overlap;
+pub mod pull_state;
 pub mod stale_parents;
 pub mod superseded;
 
@@ -35,6 +36,9 @@ pub enum FindingKind {
     CarriedElsewhere,
     MixedBase,
     SupersededBase,
+    EmptyDiff,
+    DeletedHeadRef,
+    EmptyTipCommit,
 }
 
 impl fmt::Display for FindingKind {
@@ -53,6 +57,9 @@ impl fmt::Display for FindingKind {
             Self::CarriedElsewhere => "carried-elsewhere",
             Self::MixedBase => "mixed-base",
             Self::SupersededBase => "superseded-base",
+            Self::EmptyDiff => "empty-diff",
+            Self::DeletedHeadRef => "deleted-head-ref",
+            Self::EmptyTipCommit => "empty-tip-commit",
         };
         f.write_str(text)
     }
@@ -153,6 +160,9 @@ mod tests {
             FindingKind::CarriedElsewhere => "carried-elsewhere",
             FindingKind::MixedBase => "mixed-base",
             FindingKind::SupersededBase => "superseded-base",
+            FindingKind::EmptyDiff => "empty-diff",
+            FindingKind::DeletedHeadRef => "deleted-head-ref",
+            FindingKind::EmptyTipCommit => "empty-tip-commit",
         }
     }
 
@@ -174,6 +184,9 @@ mod tests {
             FindingKind::CarriedElsewhere,
             FindingKind::MixedBase,
             FindingKind::SupersededBase,
+            FindingKind::EmptyDiff,
+            FindingKind::DeletedHeadRef,
+            FindingKind::EmptyTipCommit,
         ];
         // When: each is rendered
         let labels: Vec<String> = kinds

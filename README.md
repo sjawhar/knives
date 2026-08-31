@@ -173,6 +173,7 @@ are somewhere else.
 |---|---|
 | `knives repos` | what is managed, the newest release each has cut, and whether consumer origin trunks are pinned behind it |
 | `knives status` | the main report |
+| `knives pr NUMBER [--repo REPO] [--timeline]` | one pull request's live state; `--timeline` adds its bounded forge event log |
 | `knives sync` | fetch, then classify what happened to each tracked pull request |
 | `knives preflight` | the facts to check before contributing upstream |
 | `knives start` | take a branch and get your own workspace |

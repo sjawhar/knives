@@ -11,7 +11,7 @@ use std::process::ExitCode;
 use clap::Parser as _;
 use knives::cli::{Cli, Command, Exit, ReleaseAction};
 use knives::commands::{
-    hook, init, notch, preflight, register, release, repos, start, status, sync,
+    hook, init, notch, pr, preflight, register, release, repos, start, status, sync,
 };
 use knives::config::{default_config_path, load};
 use knives::detect::RebaseOutcome;
@@ -60,6 +60,16 @@ fn dispatch() -> anyhow::Result<Exit> {
                 display: Display { verbose, output },
             },
         ),
+        Command::Pr {
+            number,
+            repo,
+            timeline,
+        } => {
+            let Some(name) = one_repo(repo.as_deref())? else {
+                return Ok(Exit::Usage);
+            };
+            run_pr(&name, number, timeline, output)
+        }
         Command::Sync {
             repo,
             all,
@@ -2011,6 +2021,40 @@ fn worker_budget(repositories: usize, parallelism: usize) -> (usize, usize) {
     let repo_workers = repositories.clamp(1, parallelism.min(MAX_REPO_WORKERS));
     let probe_workers = (parallelism / repo_workers).max(1);
     (repo_workers, probe_workers)
+}
+
+fn run_pr(
+    repo: &RepoName,
+    number: u64,
+    timeline: bool,
+    output: knives::cli::Output,
+) -> anyhow::Result<Exit> {
+    let registry = load(&default_config_path())?;
+    let Some(entry) = registry.get(repo) else {
+        let known: Vec<String> = registry.names().map(|name| name.to_string()).collect();
+        eprintln!("unknown repo {repo}; known: {}", known.join(", "));
+        return Ok(Exit::Usage);
+    };
+    let forge = CliForge;
+    let cache_root = knives::forge_cache::cache_root();
+    let report = pr::gather(&pr::Request {
+        repo,
+        entry,
+        number,
+        forge: &forge,
+        cache_root: cache_root.as_deref(),
+        timeline,
+    })?;
+    let Some(report) = report else {
+        eprintln!("{repo}: the forge did not report #{number}");
+        return Ok(Exit::Incomplete);
+    };
+    if let Some(payload) = knives::cli::machine_payload(output, &report)? {
+        println!("{payload}");
+    } else {
+        println!("{}", pr::render(&report));
+    }
+    Ok(Exit::Ok)
 }
 
 fn run_status(requested: Option<&str>, view: StatusView) -> anyhow::Result<Exit> {

@@ -184,6 +184,22 @@ pub enum Command {
         #[arg(long)]
         no_github: bool,
     },
+    /// One pull request's present state, any number in any state.
+    ///
+    /// Exists because half of the audit's wrong premises were stale dispatch
+    /// context: a closed pull request cited as open, a bare number nobody could
+    /// map to a branch. One line answers both, from a live read.
+    Pr {
+        /// The pull request number.
+        number: u64,
+        /// Registry name. Defaults to the repo you are standing in.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Also read the head-ref event log: force pushes with before/after
+        /// commit and tree ids, deletes, restores, closes, reopens, and merges.
+        #[arg(long)]
+        timeline: bool,
+    },
     /// Take a branch and open a workspace on the fetched upstream trunk.
     ///
     /// Claiming a branch and opening a workspace for it were two commands for no
