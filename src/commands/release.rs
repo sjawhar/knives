@@ -46,6 +46,19 @@ pub fn repair_effect(pins: &[Pin]) -> RepairEffect {
     RepairEffect::NewDatedName
 }
 
+/// Scan evidence for one consumer checkout.
+#[derive(Debug, Default)]
+pub struct ConsumerScan {
+    pub pins: Vec<Pin>,
+    pub notes: Vec<String>,
+    pub problems: Vec<String>,
+}
+
+struct ConsumerPinScope<'a> {
+    slug: Option<&'a str>,
+    scheme: &'a ReleaseScheme,
+}
+
 /// Scan a consumer checkout for pins of one repo's releases.
 ///
 /// Scoped by `slug`, the repository's name as it appears in a dependency line. These
@@ -57,76 +70,95 @@ pub fn scan_consumer_for(
     consumer: &Path,
     slug: Option<&str>,
     scheme: &ReleaseScheme,
-) -> (Vec<Pin>, Vec<String>) {
-    let mut pins = Vec::new();
-    let mut notes = Vec::new();
+) -> ConsumerScan {
+    let mut result = ConsumerScan::default();
+    let scope = ConsumerPinScope { slug, scheme };
     match jj::origin_trunk(consumer) {
         Ok(OriginTrunk::Reference(branch)) => {
             let mut checkout_lag = None;
             for name in PIN_FILES {
                 match jj::file_at_ref(consumer, &branch, name) {
                     Ok(Some((text, behind))) => {
-                        pins.extend(scanned_pins(name, &text, slug, scheme));
+                        extend_scanned_pins(&mut result, name, &text, &scope);
                         checkout_lag = checkout_lag.or_else(|| (behind > 0).then_some(behind));
                     }
                     Ok(None) => {}
-                    Err(error) => notes.push(format!(
-                        "{}: could not read {name} at {branch}: {error}",
-                        consumer.display()
-                    )),
+                    Err(error) => result
+                        .problems
+                        .push(format!("could not read {name} at {branch}: {error}")),
                 }
             }
             if let Some(behind) = checkout_lag {
-                notes.push(format!(
+                result.notes.push(format!(
                     "{} checkout is {behind} commit(s) behind its {branch}",
                     consumer.display()
                 ));
             }
         }
         Ok(OriginTrunk::Missing) => {
-            extend_working_copy_pins(&mut pins, consumer, slug, scheme);
-            notes.push(format!(
+            extend_working_copy_pins(&mut result, consumer, &scope);
+            result.notes.push(format!(
                 "{}: no origin trunk resolved; pins read from the working copy",
                 consumer.display()
             ));
         }
         Ok(OriginTrunk::NotRepository) => {
-            extend_working_copy_pins(&mut pins, consumer, slug, scheme);
-            notes.push(format!(
+            extend_working_copy_pins(&mut result, consumer, &scope);
+            result.notes.push(format!(
                 "{}: not a repository; pins read from the working copy",
                 consumer.display()
             ));
         }
         Err(error) => {
-            extend_working_copy_pins(&mut pins, consumer, slug, scheme);
-            notes.push(format!(
+            extend_working_copy_pins(&mut result, consumer, &scope);
+            result.notes.push(format!(
                 "{}: could not resolve its origin trunk ({error}); pins read from the working copy",
                 consumer.display()
             ));
+            result
+                .problems
+                .push(format!("could not resolve origin trunk: {error}"));
         }
     }
-    (pins, notes)
+    result
 }
 
 fn extend_working_copy_pins(
-    pins: &mut Vec<Pin>,
+    result: &mut ConsumerScan,
     consumer: &Path,
-    slug: Option<&str>,
-    scheme: &ReleaseScheme,
+    scope: &ConsumerPinScope<'_>,
 ) {
     for name in PIN_FILES {
-        let path = consumer.join(name);
-        if let Ok(text) = std::fs::read_to_string(&path) {
-            pins.extend(scanned_pins(name, &text, slug, scheme));
+        match std::fs::read_to_string(consumer.join(name)) {
+            Ok(text) => extend_scanned_pins(result, name, &text, scope),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => result
+                .problems
+                .push(format!("could not read {name}: {error}")),
         }
     }
 }
 
-fn scanned_pins(file: &str, text: &str, slug: Option<&str>, scheme: &ReleaseScheme) -> Vec<Pin> {
-    scan(file, text, scheme)
-        .into_iter()
-        .filter(|pin| slug.is_none_or(|slug| pin.source.contains(slug)))
-        .collect()
+fn extend_scanned_pins(
+    result: &mut ConsumerScan,
+    file: &str,
+    text: &str,
+    scope: &ConsumerPinScope<'_>,
+) {
+    let parsed = scan(file, text, scope.scheme);
+    result.pins.extend(
+        parsed
+            .pins
+            .into_iter()
+            .filter(|pin| scope.slug.is_none_or(|slug| pin.source.contains(slug))),
+    );
+    result.problems.extend(
+        parsed
+            .problems
+            .into_iter()
+            .filter(|problem| scope.slug.is_none_or(|slug| problem.source.contains(slug)))
+            .map(|problem| problem.to_string()),
+    );
 }
 
 /// The repository's name as it appears in a dependency line, e.g. `sandbox-runner`.
@@ -773,6 +805,16 @@ pub fn plan(name: &RepoName, entry: &RepoEntry, consumers: &[PathBuf]) -> anyhow
         })
         .collect();
 
+    add_consumer_pins(&mut plan, entry, consumers, &scheme);
+    Ok(plan)
+}
+
+fn add_consumer_pins(
+    plan: &mut Plan,
+    entry: &RepoEntry,
+    consumers: &[PathBuf],
+    scheme: &ReleaseScheme,
+) {
     if consumers.is_empty() {
         // The command's central question. Unanswered is not success.
         plan.problems.push(
@@ -785,11 +827,11 @@ pub fn plan(name: &RepoName, entry: &RepoEntry, consumers: &[PathBuf]) -> anyhow
     // the first would call a release unpinned while something else was frozen on it.
     let slug = repo_slug(entry);
     for consumer in consumers {
-        let (pins, notes) = scan_consumer_for(consumer, slug.as_deref(), &scheme);
-        plan.pins.extend(pins);
-        plan.notes.extend(notes);
+        let scan = scan_consumer_for(consumer, slug.as_deref(), scheme);
+        plan.pins.extend(scan.pins);
+        plan.notes.extend(scan.notes);
+        plan.problems.extend(scan.problems);
     }
-    Ok(plan)
 }
 
 /// Whether any of `parents` is an ancestor of `tip`.
@@ -855,12 +897,14 @@ fn member_row(
         .filter(|(branch, _)| !is_release_name(branch, &scheme))
         .map(|(branch, tip)| format!("{branch} advanced to {}", short(&tip)))
         .collect();
-    let base_parent = trunk.map_or(Ok(false), |trunk| {
-        opened.is_ancestor(&parent.commit, trunk)
-    })?;
+    let base_parent = trunk.map_or(Ok(false), |trunk| opened.is_ancestor(&parent.commit, trunk))?;
     Ok(MemberRow {
         commit: parent.commit,
-        held_by: parent.bookmarks.into_iter().map(|bookmark| bookmark.to_string()).collect(),
+        held_by: parent
+            .bookmarks
+            .into_iter()
+            .map(|bookmark| bookmark.to_string())
+            .collect(),
         advanced,
         base_parent,
     })
@@ -868,17 +912,13 @@ fn member_row(
 
 /// The label audit buckets use for a member row.
 fn member_label(member: &MemberRow) -> String {
-    let source = member
-        .held_by
-        .first()
-        .map(String::as_str)
-        .or_else(|| {
-            member
-                .advanced
-                .first()
-                .and_then(|advanced| advanced.split_once(" advanced to "))
-                .map(|(branch, _)| branch)
-        });
+    let source = member.held_by.first().map(String::as_str).or_else(|| {
+        member
+            .advanced
+            .first()
+            .and_then(|advanced| advanced.split_once(" advanced to "))
+            .map(|(branch, _)| branch)
+    });
     source.map_or_else(
         || short(&member.commit),
         |source| format!("{source}@{}", short(&member.commit)),
@@ -899,7 +939,9 @@ pub fn gather_members(
     let trunk = match opened.resolve_commit(&trunk_name) {
         Ok(trunk) => Some(trunk),
         Err(error) => {
-            problems.push(format!("cannot resolve upstream trunk {trunk_name}: {error}"));
+            problems.push(format!(
+                "cannot resolve upstream trunk {trunk_name}: {error}"
+            ));
             None
         }
     };
@@ -908,23 +950,25 @@ pub fn gather_members(
         .map(|parent| member_row(opened, entry, parent, trunk.as_ref()))
         .collect::<anyhow::Result<_>>()?;
     let audit = if verify {
-        trunk.as_ref().map(|trunk| {
-            let members: Vec<(String, CommitId)> = members
-                .iter()
-                .filter(|member| !member.base_parent)
-                .map(|member| (member_label(member), member.commit.clone()))
-                .collect();
-            audit_cut(
-                &entry.path,
-                &members,
-                CutSubject::Committed(&commit),
-                AuditContext {
-                    previous: None,
-                    trunk,
-                },
-            )
-        })
-        .transpose()?
+        trunk
+            .as_ref()
+            .map(|trunk| {
+                let members: Vec<(String, CommitId)> = members
+                    .iter()
+                    .filter(|member| !member.base_parent)
+                    .map(|member| (member_label(member), member.commit.clone()))
+                    .collect();
+                audit_cut(
+                    &entry.path,
+                    &members,
+                    CutSubject::Committed(&commit),
+                    AuditContext {
+                        previous: None,
+                        trunk,
+                    },
+                )
+            })
+            .transpose()?
     } else {
         None
     };
@@ -999,10 +1043,14 @@ pub fn render_members(report: &MembersReport) -> String {
         }
     }
     lines.extend(report.notes.iter().map(|note| format!("! {note}")));
-    lines.extend(report.problems.iter().map(|problem| format!("!! {problem}")));
+    lines.extend(
+        report
+            .problems
+            .iter()
+            .map(|problem| format!("!! {problem}")),
+    );
     lines.join("\n")
 }
-
 
 pub fn render(plan: &Plan) -> String {
     let mut lines: Vec<String> = plan
@@ -1772,6 +1820,7 @@ mod cut_tests {
             owner: "an-agent".to_owned(),
             subject: Some(subject.to_owned()),
             kind: Kind::Event,
+            disposition: None,
             text: format!(
                 "cut {subject} as {created} with {} parent(s)",
                 members.len()
@@ -1990,20 +2039,20 @@ mod consumer_scope_tests {
         )
         .unwrap();
 
-        let (ours, notes) =
-            scan_consumer_for(dir.path(), Some("sandbox-runner"), &ReleaseScheme::Dated);
-        assert_eq!(ours.len(), 1, "only our own pin: {ours:?}");
-        assert_eq!(ours[0].reference, "release/2026-07-20");
+        let ours = scan_consumer_for(dir.path(), Some("sandbox-runner"), &ReleaseScheme::Dated);
+        assert_eq!(ours.pins.len(), 1, "only our own pin: {:?}", ours.pins);
+        assert_eq!(ours.pins[0].reference, "release/2026-07-20");
         assert_eq!(
-            notes,
+            ours.notes,
             vec![format!(
                 "{}: not a repository; pins read from the working copy",
                 dir.path().display()
             )]
         );
+        assert!(ours.problems.is_empty());
 
-        let (unscoped, _) = scan_consumer_for(dir.path(), None, &ReleaseScheme::Dated);
-        assert_eq!(unscoped.len(), 2, "without a slug, every pin is kept");
+        let unscoped = scan_consumer_for(dir.path(), None, &ReleaseScheme::Dated);
+        assert_eq!(unscoped.pins.len(), 2, "without a slug, every pin is kept");
     }
 
     #[test]
@@ -2173,9 +2222,8 @@ mod members_tests {
         };
 
         assert!(
-            render_members(&report).contains(
-                "- aaaaaaaaaaaa keep/alpha, feat/alpha advanced to bbbbbbbbbbbb"
-            )
+            render_members(&report)
+                .contains("- aaaaaaaaaaaa keep/alpha, feat/alpha advanced to bbbbbbbbbbbb")
         );
     }
 
@@ -2207,7 +2255,13 @@ mod members_tests {
         );
         run_jj(
             &repository,
-            &["config", "set", "--repo", "user.email", "tests@example.invalid"],
+            &[
+                "config",
+                "set",
+                "--repo",
+                "user.email",
+                "tests@example.invalid",
+            ],
         );
 
         run_jj(&repository, &["new", "-r", "root()", "-m", "member alpha"]);
@@ -2216,10 +2270,7 @@ mod members_tests {
             &["bookmark", "create", "feat/alpha", "-r", "@"],
         );
         run_jj(&repository, &["new", "-r", "root()", "-m", "member beta"]);
-        run_jj(
-            &repository,
-            &["bookmark", "create", "feat/beta", "-r", "@"],
-        );
+        run_jj(&repository, &["bookmark", "create", "feat/beta", "-r", "@"]);
         run_jj(
             &repository,
             &[
@@ -2248,8 +2299,8 @@ mod members_tests {
             consumers: Vec::new(),
         };
         let opened = Repo::open(&entry.path).expect("open test repository");
-        let members = gather_members(&opened, &entry, "release/2026-08-30", false)
-            .expect("gather members");
+        let members =
+            gather_members(&opened, &entry, "release/2026-08-30", false).expect("gather members");
 
         assert_eq!(members.parent_count, 2);
     }
@@ -2267,7 +2318,13 @@ mod members_tests {
         );
         run_jj(
             &repository,
-            &["config", "set", "--repo", "user.email", "tests@example.invalid"],
+            &[
+                "config",
+                "set",
+                "--repo",
+                "user.email",
+                "tests@example.invalid",
+            ],
         );
         run_jj(&repository, &["new", "-r", "root()", "-m", "bare parent"]);
         run_jj(&repository, &["new", "-r", "@", "-m", "release"]);
@@ -2287,8 +2344,8 @@ mod members_tests {
             consumers: Vec::new(),
         };
         let opened = Repo::open(&entry.path).expect("open test repository");
-        let members = gather_members(&opened, &entry, "release/2026-08-30", false)
-            .expect("gather members");
+        let members =
+            gather_members(&opened, &entry, "release/2026-08-30", false).expect("gather members");
 
         assert_eq!(members.members.len(), 1);
         assert!(members.members[0].held_by.is_empty());

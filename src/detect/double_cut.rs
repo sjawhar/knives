@@ -90,41 +90,43 @@ mod tests {
 
         assert_eq!(
             found,
-            vec![
-                (
-                    BranchName::new(name),
-                    vec![
-                        (local_ref, CommitId::new("aaaaaaaa")),
-                        (origin_ref, CommitId::new("bbbbbbbb")),
-                    ],
-                ),
-            ]
+            vec![(
+                BranchName::new(name),
+                vec![
+                    (local_ref, CommitId::new("aaaaaaaa")),
+                    (origin_ref, CommitId::new("bbbbbbbb")),
+                ],
+            ),]
         );
     }
 
     #[test]
     fn agreeing_release_refs_are_not_a_disagreement() {
-        assert!(same_name_disagreements(
-            &tips(vec![
-                (local("release/2026-08-30"), "aaaaaaaa"),
-                (remote("release/2026-08-30", "origin"), "aaaaaaaa"),
-            ]),
-            &ReleaseScheme::Dated,
-        )
-        .is_empty());
+        assert!(
+            same_name_disagreements(
+                &tips(vec![
+                    (local("release/2026-08-30"), "aaaaaaaa"),
+                    (remote("release/2026-08-30", "origin"), "aaaaaaaa"),
+                ]),
+                &ReleaseScheme::Dated,
+            )
+            .is_empty()
+        );
     }
 
     #[test]
     fn a_release_ref_on_an_untrusted_remote_never_counts() {
-        assert!(same_name_disagreements(
-            &tips(vec![
-                (local("release/2026-08-30"), "aaaaaaaa"),
-                (remote("release/2026-08-30", "origin"), "aaaaaaaa"),
-                (remote("release/2026-08-30", "upstream"), "bbbbbbbb"),
-            ]),
-            &ReleaseScheme::Dated,
-        )
-        .is_empty());
+        assert!(
+            same_name_disagreements(
+                &tips(vec![
+                    (local("release/2026-08-30"), "aaaaaaaa"),
+                    (remote("release/2026-08-30", "origin"), "aaaaaaaa"),
+                    (remote("release/2026-08-30", "upstream"), "bbbbbbbb"),
+                ]),
+                &ReleaseScheme::Dated,
+            )
+            .is_empty()
+        );
     }
 
     #[test]
@@ -144,15 +146,13 @@ mod tests {
 
         assert_eq!(
             found,
-            vec![
-                (
-                    BranchName::new(fixed),
-                    vec![
-                        (local_ref, CommitId::new("aaaaaaaa")),
-                        (release_ref, CommitId::new("bbbbbbbb")),
-                    ],
-                ),
-            ]
+            vec![(
+                BranchName::new(fixed),
+                vec![
+                    (local_ref, CommitId::new("aaaaaaaa")),
+                    (release_ref, CommitId::new("bbbbbbbb")),
+                ],
+            ),]
         );
     }
 }

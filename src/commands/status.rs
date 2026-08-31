@@ -17,7 +17,7 @@ use crate::ids::{
     pull_number_from_bookmark,
 };
 use crate::jj::{JjError, Repo, branches_past, probe_landed};
-use crate::ledger::{Entry as Notch, Ledger, newest_for};
+use crate::ledger::{Entry as Notch, Ledger};
 use crate::store::Store;
 
 use crate::ids::{RELEASE_PREFIX, is_our_release};
@@ -126,24 +126,40 @@ pub struct StatedPull {
     pub state: String,
 }
 
-/// The part of a ledger entry a branch row carries.
+/// The most relevant ledger entry for one status row and the entries it masks.
 ///
-/// Three fields, not the entry: a row is not the place to re-print an owner, an
-/// anchor and a list of evidence that `knives notch <branch>` shows in full.
+/// A row does not re-print an owner, anchor, or evidence list: `knives notch`
+/// shows that complete chronology.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct LastNotch {
     pub ts: String,
     pub kind: crate::ledger::Kind,
     pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disposition: Option<String>,
+    pub count: usize,
 }
 
 impl LastNotch {
-    fn of(entry: &Notch) -> Self {
-        Self {
+    fn of<'a>(entries: impl Iterator<Item = &'a Notch>) -> Option<Self> {
+        let mut count = 0;
+        let mut newest = None;
+        let mut newest_note = None;
+        for entry in entries {
+            count += 1;
+            newest = Some(entry);
+            if entry.kind == crate::ledger::Kind::Note {
+                newest_note = Some(entry);
+            }
+        }
+        let entry = newest_note.or(newest)?;
+        Some(Self {
             ts: entry.ts.clone(),
             kind: entry.kind,
             text: entry.text.clone(),
-        }
+            disposition: entry.disposition.clone(),
+            count,
+        })
     }
 }
 
@@ -562,15 +578,11 @@ fn notches_from_ledger(ledger: Option<&Ledger>, report: &mut Report) -> Vec<Notc
 }
 
 fn repo_notches(notches: &[Notch]) -> Option<RepoNotches> {
-    let mut count = 0;
-    let mut last = None;
-    for notch in notches {
-        if notch.subject.is_none() {
-            count += 1;
-            last = Some(LastNotch::of(notch));
-        }
-    }
-    last.map(|last| RepoNotches { count, last })
+    let last = LastNotch::of(notches.iter().filter(|notch| notch.subject.is_none()))?;
+    Some(RepoNotches {
+        count: last.count,
+        last,
+    })
 }
 
 /// Fold the release scan into a report.
@@ -1299,6 +1311,37 @@ mod tests {
         assert_eq!(report.problems.len(), 1, "was: {report:?}");
         assert!(report.problems[0].contains("ledger"), "was: {report:?}");
         assert_eq!(exit_for(&report), Exit::Incomplete);
+    }
+
+    #[test]
+    fn the_notch_cell_prefers_the_newest_note_over_a_newer_event() {
+        // Removing the preference would let a mechanical transition mask the
+        // human ruling that tells a reader how to interpret this branch.
+        let note = Notch {
+            ts: "2026-08-15T22:14:01Z".to_owned(),
+            owner: "ses_fff688".to_owned(),
+            subject: Some("feat/alpha".to_owned()),
+            kind: crate::ledger::Kind::Note,
+            disposition: Some("ruled-out".to_owned()),
+            text: "split to a plugin".to_owned(),
+            evidence: Vec::new(),
+            anchor: None,
+            pr: None,
+        };
+        let event = Notch {
+            ts: "2026-08-15T22:14:02Z".to_owned(),
+            kind: crate::ledger::Kind::Event,
+            disposition: None,
+            text: "sync advanced".to_owned(),
+            ..note.clone()
+        };
+
+        let last = LastNotch::of([&note, &event].into_iter()).expect("a notch");
+
+        assert_eq!(last.kind, crate::ledger::Kind::Note);
+        assert_eq!(last.text, "split to a plugin");
+        assert_eq!(last.disposition.as_deref(), Some("ruled-out"));
+        assert_eq!(last.count, 2);
     }
 
     #[test]

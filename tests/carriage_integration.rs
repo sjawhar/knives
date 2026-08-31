@@ -21,12 +21,11 @@ const fn upstream_trunk_target(commit: CommitId) -> Target {
     }
 }
 
-fn check_against(repo: &Repo, lab: &Lab, revision: &str, target: &str) -> CarryVerdict {
+fn check_against(repo: &Repo, revision: &str, target: &str) -> CarryVerdict {
     let tip = repo.resolve_commit(revision).expect("resolve revision");
     let target = upstream_trunk_target(repo.resolve_commit(target).expect("resolve target"));
     check(
         &CheckInput {
-            repo_path: lab.work_path(),
             repo,
             revision,
             tip: &tip,
@@ -47,7 +46,7 @@ fn a_net_zero_branch_is_carried_rewritten_against_its_base() {
     lab.jj_work(["new"]);
     let repo = Repo::open(lab.work_path()).expect("open repository");
 
-    let verdict = check_against(&repo, &lab, "feat/net-zero", "main@upstream");
+    let verdict = check_against(&repo, "feat/net-zero", "main@upstream");
 
     assert_eq!(verdict, CarryVerdict::CarriedRewritten);
 }
@@ -65,7 +64,7 @@ fn a_squashed_multicommit_branch_is_carried_despite_an_intermediate_conflict() {
     lab.jj_work(["new"]);
     let repo = Repo::open(lab.work_path()).expect("open repository");
 
-    let verdict = check_against(&repo, &lab, "feat/multi", "target");
+    let verdict = check_against(&repo, "feat/multi", "target");
 
     assert_eq!(verdict, CarryVerdict::CarriedRewritten);
 }

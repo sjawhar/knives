@@ -10,7 +10,7 @@ use std::path::Path;
 use crate::cli::Exit;
 use crate::commands::status::release_order;
 use crate::config::{Registry, RepoEntry, Role, default_config_path, load};
-use crate::ids::{BookmarkRef, ReleaseScheme, RemoteName, is_our_release};
+use crate::ids::{BookmarkRef, BranchName, ReleaseScheme, RemoteName, is_our_release};
 use crate::jj::Repo;
 
 struct ReleaseState {
@@ -89,100 +89,115 @@ fn consumer_label(consumer: &Path) -> String {
 pub fn pin_lag(entry: &RepoEntry, newest: Option<&String>, repo: Option<&Repo>) -> PinLag {
     let scheme = entry.release_scheme();
     match &scheme {
-        ReleaseScheme::Dated => {
-            if entry.consumers.is_empty() {
-                return PinLag::default();
-            }
-            let Some(newest) = newest else {
-                return PinLag::default();
+        ReleaseScheme::Dated => dated_pin_lag(entry, newest, &scheme),
+        ReleaseScheme::Fixed(fixed) => fixed_pin_lag(entry, repo, fixed, &scheme),
+    }
+}
+
+fn dated_pin_lag(entry: &RepoEntry, newest: Option<&String>, scheme: &ReleaseScheme) -> PinLag {
+    if entry.consumers.is_empty() {
+        return PinLag::default();
+    }
+    let Some(newest) = newest else {
+        return PinLag::default();
+    };
+    // The newest release arrives qualified with the remote it was seen on, while a pin
+    // names only the branch. Comparing those forms directly called every repo behind,
+    // including ones pinned exactly at the newest cut.
+    let newest_branch = newest.split('@').next().unwrap_or(newest);
+    let slug = crate::commands::release::repo_slug(entry);
+    // Reported per consumer, because they can sit on different releases: one consumer
+    // being current says nothing about another, and collapsing them into a single verdict
+    // hid exactly that.
+    let mut behind = Vec::new();
+    let mut notes = Vec::new();
+    for consumer in &entry.consumers {
+        let scan = crate::commands::release::scan_consumer_for(consumer, slug.as_deref(), scheme);
+        notes.extend(scan.notes);
+        if !scan.problems.is_empty() {
+            notes.extend(scan.problems);
+            continue;
+        }
+        let label = consumer_label(consumer);
+        if scan.pins.is_empty() {
+            behind.push(format!("{label} pins no release of this repo"));
+            continue;
+        }
+        if scan.pins.iter().any(|pin| pin.reference == newest_branch) {
+            continue;
+        }
+        let mut names: Vec<&str> = scan.pins.iter().map(|pin| pin.reference.as_str()).collect();
+        names.sort_unstable();
+        names.dedup();
+        behind.push(format!("{label} pins {}", names.join(", ")));
+    }
+    PinLag {
+        lag: (!behind.is_empty())
+            .then(|| format!("newest is {newest_branch}; {}", behind.join("; "))),
+        notes,
+    }
+}
+
+fn fixed_pin_lag(
+    entry: &RepoEntry,
+    repo: Option<&Repo>,
+    fixed: &BranchName,
+    scheme: &ReleaseScheme,
+) -> PinLag {
+    let slug = crate::commands::release::repo_slug(entry);
+    let local_tip = repo.and_then(|repo| {
+        repo.bookmark_tips()
+            .ok()
+            .and_then(|tips| tips.get(&BookmarkRef::Local(fixed.clone())).cloned())
+    });
+    let mut behind = Vec::new();
+    let mut notes = Vec::new();
+    for consumer in &entry.consumers {
+        let scan = crate::commands::release::scan_consumer_for(consumer, slug.as_deref(), scheme);
+        notes.extend(scan.notes);
+        if !scan.problems.is_empty() {
+            notes.extend(scan.problems);
+            continue;
+        }
+        let label = consumer_label(consumer);
+        if scan.pins.is_empty() {
+            behind.push(format!("{label} pins no release of this repo"));
+            continue;
+        }
+        for pin in scan.pins {
+            let Some(locked) = pin.locked else {
+                continue;
             };
-            // The newest release arrives qualified with the remote it was seen on, while a pin
-            // names only the branch. Comparing those forms directly called every repo behind,
-            // including ones pinned exactly at the newest cut.
-            let newest_branch = newest.split('@').next().unwrap_or(newest);
-            let slug = crate::commands::release::repo_slug(entry);
-            // Reported per consumer, because they can sit on different releases: one consumer
-            // being current says nothing about another, and collapsing them into a single verdict
-            // hid exactly that.
-            let mut behind = Vec::new();
-            let mut notes = Vec::new();
-            for consumer in &entry.consumers {
-                let (pins, consumer_notes) =
-                    crate::commands::release::scan_consumer_for(consumer, slug.as_deref(), &scheme);
-                notes.extend(consumer_notes);
-                let label = consumer_label(consumer);
-                if pins.is_empty() {
-                    behind.push(format!("{label} pins no release of this repo"));
-                    continue;
+            let Some(repo) = repo else {
+                notes.push(format!(
+                    "could not compare {locked} with {fixed}: repository unavailable"
+                ));
+                continue;
+            };
+            let Some(tip) = local_tip.as_ref() else {
+                notes.push(format!(
+                    "could not compare {locked} with {fixed}: local branch unavailable"
+                ));
+                continue;
+            };
+            let Ok(locked_commit) = repo.resolve_commit(&locked) else {
+                notes.push(format!(
+                    "could not compare {locked} with {fixed}: commit unavailable"
+                ));
+                continue;
+            };
+            match repo.is_ancestor(&locked_commit, tip) {
+                Ok(true) if locked_commit != *tip => {
+                    behind.push(format!("{label} pins {fixed} at {locked}"));
                 }
-                if pins.iter().any(|pin| pin.reference == newest_branch) {
-                    continue;
-                }
-                let mut names: Vec<&str> = pins.iter().map(|pin| pin.reference.as_str()).collect();
-                names.sort_unstable();
-                names.dedup();
-                behind.push(format!("{label} pins {}", names.join(", ")));
-            }
-            PinLag {
-                lag: (!behind.is_empty())
-                    .then(|| format!("newest is {newest_branch}; {}", behind.join("; "))),
-                notes,
+                Ok(_) => {}
+                Err(_) => notes.push(format!("could not compare {locked} with {fixed}")),
             }
         }
-        ReleaseScheme::Fixed(fixed) => {
-            let slug = crate::commands::release::repo_slug(entry);
-            let local_tip = repo.and_then(|repo| {
-                repo.bookmark_tips()
-                    .ok()
-                    .and_then(|tips| tips.get(&BookmarkRef::Local(fixed.clone())).cloned())
-            });
-            let mut behind = Vec::new();
-            let mut notes = Vec::new();
-            for consumer in &entry.consumers {
-                let (pins, consumer_notes) =
-                    crate::commands::release::scan_consumer_for(consumer, slug.as_deref(), &scheme);
-                notes.extend(consumer_notes);
-                let label = consumer_label(consumer);
-                if pins.is_empty() {
-                    behind.push(format!("{label} pins no release of this repo"));
-                    continue;
-                }
-                for pin in pins {
-                    let Some(locked) = pin.locked else {
-                        continue;
-                    };
-                    let Some(repo) = repo else {
-                        notes.push(format!(
-                            "could not compare {locked} with {fixed}: repository unavailable"
-                        ));
-                        continue;
-                    };
-                    let Some(tip) = local_tip.as_ref() else {
-                        notes.push(format!(
-                            "could not compare {locked} with {fixed}: local branch unavailable"
-                        ));
-                        continue;
-                    };
-                    let Ok(locked_commit) = repo.resolve_commit(&locked) else {
-                        notes.push(format!(
-                            "could not compare {locked} with {fixed}: commit unavailable"
-                        ));
-                        continue;
-                    };
-                    match repo.is_ancestor(&locked_commit, tip) {
-                        Ok(true) if locked_commit != *tip => {
-                            behind.push(format!("{label} pins {fixed} at {locked}"));
-                        }
-                        Ok(_) => {}
-                        Err(_) => notes.push(format!("could not compare {locked} with {fixed}")),
-                    }
-                }
-            }
-            PinLag {
-                lag: (!behind.is_empty()).then(|| behind.join("; ")),
-                notes,
-            }
-        }
+    }
+    PinLag {
+        lag: (!behind.is_empty()).then(|| behind.join("; ")),
+        notes,
     }
 }
 

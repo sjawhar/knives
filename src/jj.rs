@@ -9,9 +9,9 @@ use jj_lib::backend::CommitId as JjCommitId;
 use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
 use jj_lib::local_working_copy::LocalWorkingCopy;
 use jj_lib::matchers::EverythingMatcher;
-use jj_lib::object_id::ObjectId as _;
 use jj_lib::merge::Merge;
 use jj_lib::merged_tree::MergedTree;
+use jj_lib::object_id::ObjectId as _;
 use jj_lib::op_store::{RefTarget, RemoteRef};
 use jj_lib::ref_name::{RefName as JjRefName, RemoteName as JjRemoteName};
 use jj_lib::repo::{MutableRepo, ReadonlyRepo, Repo as _, RepoLoader, StoreFactories};
@@ -538,6 +538,24 @@ pub fn pull_heads(_repo: &Path, remote_url: &str) -> Result<BTreeMap<u64, String
             })?;
         heads.insert(number, sha.to_owned());
         Ok(heads)
+    })
+}
+
+/// Live remote refs by pattern: one ls-remote round trip. The remote's truth,
+/// not the last fetch's — reconciliation must compare against what is there NOW.
+pub fn remote_refs(
+    remote_url: &str,
+    patterns: &[&str],
+) -> Result<BTreeMap<String, CommitId>, JjError> {
+    let mut args = vec!["ls-remote", remote_url];
+    args.extend(patterns);
+    let output = command_args("git", &args)?;
+    output.lines().try_fold(BTreeMap::new(), |mut refs, line| {
+        let (sha, reference) = line.split_once('\t').ok_or_else(|| JjError::Parse {
+            detail: line.to_owned(),
+        })?;
+        refs.insert(reference.to_owned(), CommitId::new(sha));
+        Ok(refs)
     })
 }
 

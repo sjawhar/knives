@@ -41,6 +41,10 @@ pub enum FindingKind {
     EmptyDiff,
     DeletedHeadRef,
     EmptyTipCommit,
+    RemoteDrift,
+    ZombieBranch,
+    ReleaseDrift,
+    OrphanCommit,
 }
 
 impl fmt::Display for FindingKind {
@@ -63,6 +67,10 @@ impl fmt::Display for FindingKind {
             Self::DoubleCut => "double-cut",
             Self::DeletedHeadRef => "deleted-head-ref",
             Self::EmptyTipCommit => "empty-tip-commit",
+            Self::RemoteDrift => "remote-drift",
+            Self::ZombieBranch => "zombie-branch",
+            Self::ReleaseDrift => "release-drift",
+            Self::OrphanCommit => "orphan-commit",
         };
         f.write_str(text)
     }
@@ -167,6 +175,10 @@ mod tests {
             FindingKind::DoubleCut => "double-cut",
             FindingKind::DeletedHeadRef => "deleted-head-ref",
             FindingKind::EmptyTipCommit => "empty-tip-commit",
+            FindingKind::RemoteDrift => "remote-drift",
+            FindingKind::ZombieBranch => "zombie-branch",
+            FindingKind::ReleaseDrift => "release-drift",
+            FindingKind::OrphanCommit => "orphan-commit",
         }
     }
 
@@ -192,6 +204,10 @@ mod tests {
             FindingKind::DoubleCut,
             FindingKind::DeletedHeadRef,
             FindingKind::EmptyTipCommit,
+            FindingKind::RemoteDrift,
+            FindingKind::ZombieBranch,
+            FindingKind::ReleaseDrift,
+            FindingKind::OrphanCommit,
         ];
         // When: each is rendered
         let labels: Vec<String> = kinds

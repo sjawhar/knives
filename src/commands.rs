@@ -5,13 +5,16 @@
 //! earlier implementation shipped a `render` with no caller, so the command
 //! printed nothing and exited zero.
 
+pub mod audit;
 pub mod claim;
+pub mod consumers;
 pub mod gh;
 pub mod hook;
 pub mod init;
 pub mod notch;
 pub mod pr;
 pub mod preflight;
+pub mod pushed;
 pub mod register;
 pub mod release;
 pub mod repos;

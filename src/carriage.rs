@@ -20,7 +20,7 @@ use crate::ids::{
     BookmarkRef, BranchName, CommitId, ReleaseScheme, RepoName, is_our_release,
     strict_dated_release,
 };
-use crate::jj::{Repo, commits_matching};
+use crate::jj::Repo;
 use crate::snapshot::{self, SnapshotConfig};
 
 /// What a revision is checked against.
@@ -94,15 +94,13 @@ pub struct CarriesReport {
     pub problems: Vec<String>,
 }
 
-/// One maintained branch or anonymous head in the census.
+/// One maintained branch in the census.
 #[derive(Debug, serde::Serialize)]
 pub struct BranchCarriage {
-    /// A branch name, or — in [`CensusReport::anonymous`] — a full commit id.
     pub branch: String,
     pub tip: CommitId,
     pub checks: Vec<TargetCheck>,
-    /// `Some(true)` means an open pull request carries this content. Branches
-    /// match a head branch; anonymous heads match a head object id.
+    /// `Some(true)` means an open pull request carries this branch's content.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub in_open_pull: Option<bool>,
     /// `Some(true)` is a proven content orphan; `Some(false)` is not an
@@ -111,27 +109,31 @@ pub struct BranchCarriage {
     pub orphan: Option<bool>,
 }
 
-/// The carriage census over maintained branches and anonymous heads.
+/// The carriage census over maintained branches.
 #[derive(Debug, serde::Serialize)]
 pub struct CensusReport {
     pub repo: String,
     pub rows: Vec<BranchCarriage>,
-    /// Heads no bookmark, tag, or working copy accounts for. `knives audit`
-    /// lists these ungraded; this census grades the same content.
-    pub anonymous: Vec<BranchCarriage>,
     pub orphans: Vec<String>,
     pub notes: Vec<String>,
     pub problems: Vec<String>,
 }
 
-/// The anonymous-head population shared with `knives audit`: hidden heads are
-/// intentionally out of scope, while visible commits that no named reference,
-/// tag, or workspace explains must be graded before deletion.
-const ANONYMOUS_HEADS_REVSET: &str =
-    r#"heads(all()) ~ ::(bookmarks() | remote_bookmarks() | tags()) ~ working_copies() ~ (empty() & description(exact:""))"#;
+/// Optional resources and limits for a carriage census.
+#[derive(Debug, Clone, Copy)]
+pub struct CensusOptions<'a> {
+    pub cache_root: Option<&'a Path>,
+    pub workers: usize,
+}
 
-/// Census every maintained branch and anonymous head against live releases and
-/// the upstream trunk, escalating uncarried content to superseded releases.
+/// Census maintained branches against live releases and the upstream trunk.
+///
+/// It escalates only a complete, everywhere-not-carried primary matrix to
+/// superseded releases. Member checks run in bounded, input-ordered worker
+/// chunks, each with its own repository handle.
+///
+/// The live `ai` census fell from 46m42.510s over 217 members to 11.785s over
+/// 26 maintained branches after anonymous-head removal and bounded parallelism.
 ///
 /// `forge: None` leaves pull-request state explicitly unknown; carriage itself
 /// remains a local repository question and still completes.
@@ -139,7 +141,7 @@ pub fn census(
     repo_name: &RepoName,
     entry: &RepoEntry,
     forge: Option<&dyn Forge>,
-    cache_root: Option<&Path>,
+    options: CensusOptions<'_>,
 ) -> anyhow::Result<CensusReport> {
     let repo = Repo::open(&entry.path)?;
     let trunk_name = entry.upstream_trunk();
@@ -151,12 +153,7 @@ pub fn census(
             .into_iter()
             .map(|(branch, tip)| (BranchName::new(branch), tip))
             .collect();
-    let anonymous_heads = commits_matching(&entry.path, ANONYMOUS_HEADS_REVSET)?;
-    let all_targets = targets(
-        &tips,
-        &entry.release_scheme(),
-        (trunk_name.as_str(), trunk),
-    );
+    let all_targets = targets(&tips, &entry.release_scheme(), (trunk_name.as_str(), trunk));
     let (primary, superseded): (Vec<Target>, Vec<Target>) = all_targets
         .into_iter()
         .partition(|target| target.role != TargetRole::SupersededRelease);
@@ -170,55 +167,35 @@ pub fn census(
     )];
     let CensusPulls {
         branch_pulls,
-        open_pull_oids,
         checked: pull_requests_checked,
         notes: pull_notes,
-    } = census_pulls(forge, entry, branches.as_slice(), cache_root);
+    } = census_pulls(forge, entry, branches.as_slice(), options.cache_root);
     notes.extend(pull_notes);
 
-    let mut problems = Vec::new();
-    let (rows, anonymous, orphans) = {
-        let mut checks = CensusChecks {
-            repo: &repo,
-            repo_path: &entry.path,
-            primary: &primary,
-            superseded: &superseded,
-            fallback: trunk_name.as_str(),
-            problems: &mut problems,
-        };
-        let rows: Vec<CensusMember> = branches
-            .into_iter()
-            .map(|(branch, tip)| {
-                let in_open_pull = pull_requests_checked
-                    .then(|| branch_pulls.get(&branch).copied().unwrap_or(false));
-                checks.row(branch.to_string(), tip, in_open_pull)
-            })
-            .collect();
-        let anonymous: Vec<CensusMember> = anonymous_heads
-            .into_iter()
-            .map(|tip| {
-                let in_open_pull = pull_requests_checked
-                    .then(|| open_pull_oids.iter().any(|oid| oid == tip.as_str()));
-                checks.row(tip.to_string(), tip, in_open_pull)
-            })
-            .collect();
-        let orphans = rows
-            .iter()
-            .chain(&anonymous)
-            .filter(|member| member.list_as_orphan)
-            .map(|member| member.carriage.branch.clone())
-            .collect();
-        let rows = rows.into_iter().map(|member| member.carriage).collect();
-        let anonymous = anonymous
-            .into_iter()
-            .map(|member| member.carriage)
-            .collect();
-        (rows, anonymous, orphans)
+    let members: Vec<CensusInput> = branches
+        .into_iter()
+        .map(|(branch, tip)| CensusInput {
+            in_open_pull: pull_requests_checked
+                .then(|| branch_pulls.get(&branch).copied().unwrap_or(false)),
+            branch: branch.to_string(),
+            tip,
+        })
+        .collect();
+    let targets = CensusTargets {
+        primary: &primary,
+        superseded: &superseded,
+        fallback: trunk_name.as_str(),
     };
+    let (members, problems) = census_rows(&entry.path, &members, targets, options.workers);
+    let orphans = members
+        .iter()
+        .filter(|member| member.list_as_orphan)
+        .map(|member| member.carriage.branch.clone())
+        .collect();
+    let rows = members.into_iter().map(|member| member.carriage).collect();
     Ok(CensusReport {
         repo: repo_name.to_string(),
         rows,
-        anonymous,
         orphans,
         notes,
         problems,
@@ -238,7 +215,6 @@ fn select_census_numbers(
 
 struct CensusPulls {
     branch_pulls: BTreeMap<BranchName, bool>,
-    open_pull_oids: Vec<String>,
     checked: bool,
     notes: Vec<String>,
 }
@@ -252,14 +228,12 @@ fn census_pulls(
     let Some(forge) = forge else {
         return CensusPulls {
             branch_pulls: BTreeMap::new(),
-            open_pull_oids: Vec::new(),
             checked: false,
             notes: vec!["pull request state was not checked".to_owned()],
         };
     };
     let mut pulls = CensusPulls {
         branch_pulls: BTreeMap::new(),
-        open_pull_oids: Vec::new(),
         checked: false,
         notes: Vec::new(),
     };
@@ -279,22 +253,19 @@ fn census_pulls(
     };
     match opened.complete_with(branches, select_census_numbers) {
         Ok(snapshot) => {
-            pulls.checked = true;
+            pulls.checked = snapshot
+                .requested()
+                .iter()
+                .all(|number| snapshot.fact(*number).is_some());
             pulls.branch_pulls = branches
                 .iter()
                 .filter_map(|(branch, _)| {
-                    snapshot
-                        .index()
-                        .by_branch
-                        .get(branch)
-                        .map(|pull| (branch.clone(), pull.is_open()))
+                    snapshot.index().by_branch.get(branch).and_then(|pull| {
+                        snapshot
+                            .fact(pull.number)
+                            .map(|fact| (branch.clone(), fact.pull.is_open()))
+                    })
                 })
-                .collect();
-            pulls.open_pull_oids = snapshot
-                .ours()
-                .iter()
-                .filter(|pull| pull.is_open())
-                .map(|pull| pull.head_ref_oid.clone())
                 .collect();
             if let Err(error) = snapshot.persist(None) {
                 pulls.notes.push(error.to_string());
@@ -307,13 +278,10 @@ fn census_pulls(
     pulls
 }
 
-struct CensusChecks<'a> {
-    repo: &'a Repo,
-    repo_path: &'a Path,
-    primary: &'a [Target],
-    superseded: &'a [Target],
-    fallback: &'a str,
-    problems: &'a mut Vec<String>,
+struct CensusInput {
+    branch: String,
+    tip: CommitId,
+    in_open_pull: Option<bool>,
 }
 
 struct CensusMember {
@@ -321,66 +289,169 @@ struct CensusMember {
     list_as_orphan: bool,
 }
 
-struct TargetChecks {
-    checks: Vec<TargetCheck>,
-    complete: bool,
+#[derive(Clone, Copy)]
+struct CensusTargets<'a> {
+    primary: &'a [Target],
+    superseded: &'a [Target],
+    fallback: &'a str,
 }
 
-impl CensusChecks<'_> {
-    fn row(
-        &mut self,
-        branch: String,
-        tip: CommitId,
-        in_open_pull: Option<bool>,
-    ) -> CensusMember {
-        let primary = self.primary;
-        let superseded = self.superseded;
-        let primary_result = self.for_targets(&branch, &tip, primary);
-        let primary_complete = primary_result.complete;
-        let mut checks = primary_result.checks;
-        let mut escalation_complete = true;
-        if !checks.iter().any(|check| check.verdict.carried()) {
-            let escalation = self.for_targets(&branch, &tip, superseded);
-            escalation_complete = escalation.complete;
-            checks.extend(escalation.checks);
+struct CensusChunk {
+    members: Vec<CensusMember>,
+    problems: Vec<String>,
+}
+
+impl CensusChunk {
+    fn panicked(inputs: &[CensusInput]) -> Self {
+        Self {
+            members: inputs.iter().map(unanswered_census_member).collect(),
+            problems: inputs
+                .iter()
+                .map(|input| format!("census check task panicked for {}", input.branch))
+                .collect(),
         }
-        let orphan = orphan_status(
-            primary_complete,
-            escalation_complete,
-            checks.iter().map(|check| check.verdict),
-            in_open_pull,
-        );
-        CensusMember {
-            carriage: BranchCarriage {
-                branch,
-                tip,
-                checks,
-                in_open_pull,
-                orphan: orphan.status,
-            },
-            list_as_orphan: orphan.list_as_orphan,
+    }
+}
+
+/// Every maintained member is checked in branch order, with no more than
+/// `workers` repository handles open at once.
+fn census_rows(
+    repo_path: &Path,
+    inputs: &[CensusInput],
+    targets: CensusTargets<'_>,
+    workers: usize,
+) -> (Vec<CensusMember>, Vec<String>) {
+    if inputs.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let workers = workers.clamp(1, inputs.len());
+    let chunk = inputs.len().div_ceil(workers);
+    let chunks = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(workers);
+        for slice in inputs.chunks(chunk) {
+            handles.push((
+                slice,
+                scope.spawn(move || match Repo::open(repo_path) {
+                    Ok(repo) => {
+                        let mut problems = Vec::new();
+                        let members = slice
+                            .iter()
+                            .map(|input| {
+                                census_member(input, targets, &mut problems, |target| {
+                                    let check_input = CheckInput {
+                                        repo: &repo,
+                                        revision: &input.branch,
+                                        tip: &input.tip,
+                                    };
+                                    check(&check_input, target)
+                                })
+                            })
+                            .collect();
+                        CensusChunk { members, problems }
+                    }
+                    Err(error) => {
+                        let error = error.to_string();
+                        CensusChunk {
+                            members: slice.iter().map(unanswered_census_member).collect(),
+                            problems: slice
+                                .iter()
+                                .map(|input| {
+                                    format!(
+                                        "cannot open repository for census check {}: {error}",
+                                        input.branch
+                                    )
+                                })
+                                .collect(),
+                        }
+                    }
+                }),
+            ));
+        }
+        handles
+            .into_iter()
+            .map(|(slice, handle)| {
+                handle
+                    .join()
+                    .unwrap_or_else(|_| CensusChunk::panicked(slice))
+            })
+            .collect::<Vec<_>>()
+    });
+    let mut members = Vec::with_capacity(inputs.len());
+    let mut problems = Vec::new();
+    for mut chunk in chunks {
+        members.append(&mut chunk.members);
+        problems.append(&mut chunk.problems);
+    }
+    (members, problems)
+}
+
+fn census_member<F>(
+    input: &CensusInput,
+    targets: CensusTargets<'_>,
+    problems: &mut Vec<String>,
+    mut check_target: F,
+) -> CensusMember
+where
+    F: FnMut(&Target) -> anyhow::Result<CarryCheck>,
+{
+    let mut checks = CensusChecks::new(
+        &input.branch,
+        problems,
+        targets.primary.len() + targets.superseded.len(),
+    );
+    let primary_complete = checks.append(targets.primary, targets.fallback, &mut check_target);
+    let escalation_complete = if primary_complete
+        && checks
+            .entries
+            .iter()
+            .all(|check| check.verdict == CarryVerdict::NotCarried)
+    {
+        checks.append(targets.superseded, targets.fallback, &mut check_target)
+    } else {
+        true
+    };
+    let orphan = orphan_status(
+        primary_complete,
+        escalation_complete,
+        checks.entries.iter().map(|check| check.verdict),
+        input.in_open_pull,
+    );
+    CensusMember {
+        carriage: BranchCarriage {
+            branch: input.branch.clone(),
+            tip: input.tip.clone(),
+            checks: checks.entries,
+            in_open_pull: input.in_open_pull,
+            orphan: orphan.status,
+        },
+        list_as_orphan: orphan.list_as_orphan,
+    }
+}
+
+struct CensusChecks<'a> {
+    branch: &'a str,
+    entries: Vec<TargetCheck>,
+    problems: &'a mut Vec<String>,
+}
+
+impl<'a> CensusChecks<'a> {
+    fn new(branch: &'a str, problems: &'a mut Vec<String>, capacity: usize) -> Self {
+        Self {
+            branch,
+            entries: Vec::with_capacity(capacity),
+            problems,
         }
     }
 
-
-    fn for_targets(
-        &mut self,
-        branch: &str,
-        tip: &CommitId,
-        targets: &[Target],
-    ) -> TargetChecks {
-        let input = CheckInput {
-            repo_path: self.repo_path,
-            repo: self.repo,
-            revision: branch,
-            tip,
-        };
-        let mut checks = Vec::with_capacity(targets.len());
+    fn append<F>(&mut self, targets: &[Target], fallback: &str, check_target: &mut F) -> bool
+    where
+        F: FnMut(&Target) -> anyhow::Result<CarryCheck>,
+    {
         let mut complete = true;
         for target in targets {
-            let name = target_name(target, self.fallback);
-            match check(&input, target) {
-                Ok(check) => checks.push(TargetCheck {
+            let name = target_name(target, fallback);
+            match check_target(target) {
+                Ok(check) => self.entries.push(TargetCheck {
                     target: name,
                     commit: target.commit.clone(),
                     role: target.role,
@@ -389,12 +460,27 @@ impl CensusChecks<'_> {
                 }),
                 Err(error) => {
                     complete = false;
-                    self.problems
-                        .push(format!("cannot check {branch} against {name}: {error}"));
+                    self.problems.push(format!(
+                        "cannot check {} against {name}: {error}",
+                        self.branch
+                    ));
                 }
             }
         }
-        TargetChecks { checks, complete }
+        complete
+    }
+}
+
+fn unanswered_census_member(input: &CensusInput) -> CensusMember {
+    CensusMember {
+        carriage: BranchCarriage {
+            branch: input.branch.clone(),
+            tip: input.tip.clone(),
+            checks: Vec::new(),
+            in_open_pull: input.in_open_pull,
+            orphan: None,
+        },
+        list_as_orphan: false,
     }
 }
 
@@ -453,16 +539,6 @@ pub fn render_census(report: &CensusReport) -> String {
     for row in &report.rows {
         lines.push(String::new());
         render_census_row(&mut lines, row);
-    }
-    lines.push(String::new());
-    lines.push("anonymous heads:".to_owned());
-    if report.anonymous.is_empty() {
-        lines.push("  none".to_owned());
-    } else {
-        for row in &report.anonymous {
-            lines.push(String::new());
-            render_census_row(&mut lines, row);
-        }
     }
     lines.push(String::new());
     let pull_state_unknown = report.notes.iter().any(|note| {
@@ -565,7 +641,8 @@ pub fn targets(
             .max(),
         ReleaseScheme::Fixed(_) => None,
     };
-    let mut grouped = BTreeMap::<CommitId, (Vec<BookmarkRef>, TargetRole, Option<(String, u32)>)>::new();
+    let mut grouped =
+        BTreeMap::<CommitId, (Vec<BookmarkRef>, TargetRole, Option<(String, u32)>)>::new();
 
     for (reference, commit) in tips
         .iter()
@@ -621,11 +698,13 @@ pub fn targets(
         .filter_map(|(reference, commit)| {
             let names_trunk = match reference {
                 BookmarkRef::Local(branch) => branch.as_str() == trunk.0,
-                BookmarkRef::Remote { branch, remote } => trunk
-                    .0
-                    .strip_suffix(remote.as_str())
-                    .and_then(|prefix| prefix.strip_suffix('@'))
-                    == Some(branch.as_str()),
+                BookmarkRef::Remote { branch, remote } => {
+                    trunk
+                        .0
+                        .strip_suffix(remote.as_str())
+                        .and_then(|prefix| prefix.strip_suffix('@'))
+                        == Some(branch.as_str())
+                }
             };
             (names_trunk && commit == &trunk.1).then(|| reference.clone())
         })
@@ -642,7 +721,6 @@ pub fn targets(
 
 #[derive(Debug)]
 pub struct CheckInput<'a> {
-    pub repo_path: &'a Path,
     pub repo: &'a Repo,
     pub revision: &'a str,
     pub tip: &'a CommitId,
@@ -678,7 +756,10 @@ mod tests {
     use crate::detect::BookmarkTips;
     use crate::ids::{BookmarkRef, BranchName, CommitId, ReleaseScheme, RemoteName};
 
-    use super::{CarryVerdict, TargetRole, orphan_status, targets};
+    use super::{
+        CarryCheck, CarryVerdict, CensusInput, CensusTargets, Target, TargetRole, census_member,
+        orphan_status, targets,
+    };
 
     fn local(name: &str) -> BookmarkRef {
         BookmarkRef::Local(BranchName::new(name))
@@ -837,5 +918,56 @@ mod tests {
         assert_eq!(targets.len(), 2);
         assert_eq!(targets[0].role, TargetRole::UpstreamTrunk);
         assert_eq!(targets[1].role, TargetRole::SupersededRelease);
+    }
+
+    #[test]
+    fn incomplete_primary_matrix_never_checks_superseded_targets() {
+        // A regression would call the superseded target after a no-common-ancestor
+        // primary error. The call log is the observable check budget.
+        let target = |role, commit| Target {
+            refs: Vec::new(),
+            commit: CommitId::new(commit),
+            role,
+        };
+        let primary = [
+            target(TargetRole::LiveRelease, "live"),
+            target(TargetRole::UpstreamTrunk, "trunk"),
+        ];
+        let superseded = [target(TargetRole::SupersededRelease, "historical")];
+        let mut problems = Vec::new();
+        let mut calls = Vec::new();
+
+        let input = CensusInput {
+            branch: "feat/unanswered".to_owned(),
+            tip: CommitId::new("tip"),
+            in_open_pull: None,
+        };
+        let targets = CensusTargets {
+            primary: &primary,
+            superseded: &superseded,
+            fallback: "main",
+        };
+        let member = census_member(&input, targets, &mut problems, |target| {
+            calls.push(target.role);
+            match target.role {
+                TargetRole::LiveRelease => Ok(CarryCheck {
+                    verdict: CarryVerdict::NotCarried,
+                    evidence: target.commit.clone(),
+                }),
+                TargetRole::UpstreamTrunk => {
+                    Err(anyhow::anyhow!("no unique common ancestor with trunk"))
+                }
+                TargetRole::SupersededRelease => Err(anyhow::anyhow!("must not escalate")),
+            }
+        });
+
+        assert_eq!(
+            calls,
+            [TargetRole::LiveRelease, TargetRole::UpstreamTrunk],
+            "an unanswered primary matrix must not spend a superseded check"
+        );
+        assert_eq!(member.carriage.checks.len(), 1);
+        assert_eq!(member.carriage.orphan, None);
+        assert_eq!(problems.len(), 1);
     }
 }

@@ -58,6 +58,16 @@ falls back to `origin` when absent, because not every fork is consumed by anythi
 
 `consumers` is optional too: the checkouts that pin this repo's releases. Consumer pins are read directly from the consumer repository's origin trunk reference rather than its working copy, avoiding false reports caused by an unpushed or unpulled working copy. Notes report if a consumer checkout is behind its branch, if no origin trunk resolves, or if it is not a repository. Recorded so that `knives repos` can say which consumer is pinned behind the newest cut without being asked, since nobody runs a command to answer a question they have not thought of.
 
+### Consumer-pin census
+
+`knives consumers [FORK] [--consumer PATH]...` checks every recorded consumer plus explicitly
+named checkouts against the newest release on the live publish remote. A pin names a release
+reference and may freeze its resolved commit. The census reports a missing consumer directory as
+an unanswered problem, a consumer that does not pin the fork as a note, and a pin whose reference
+or frozen commit differs from the newest live release as a finding. It also reports local release
+view disagreement with the live publish remote rather than treating the checkout as authority.
+The command never edits consumer checkouts.
+
 `[trust]` configures automated guidance rules for repositories outside `[repos.*]` and `[trusted.*]`:
 - `roots`: Directory subtrees where all contained repositories are trusted for instruction guidance.
 - `owners`: Remote URL owners trusted for instruction guidance, matched case-insensitively against git remote URLs.
@@ -77,12 +87,16 @@ Local state is computed on demand. Store only what no amount of computing can re
   observed in its own commands, and judgments an agent asserted, each anchored to the
   subject's tip at write time.
 
-The ledger's rule is past tense only. Stored dispositions rot and recorded judgments do
-not: a census that inferred "not a release parent, therefore unhomed" produced 54 findings
-of which 5 were false, and a parity audit's finding was true at its recorded commit and
-stale two hours later after an in-place repair. An entry says what happened, at which
-commit, according to whom, and never what is currently the case. Anything currently true
-about the repository graph or workspace is a detector's job.
+A disposition is a terminal, past-tense human ruling: `merged-elsewhere`, `withdrawn`, or
+`ruled-out`. It is an optional ledger field on a note, not a third kind and not derived state. A
+write requires the ruling's text and at least one evidence item; a `#<n>` subject stamps that pull
+request without trying to track a branch named `#<n>`. Readers can select notes, events, or
+dispositions; the last class means notes that carry the optional field.
+
+`knives notch --verify` re-checks selected entries against all commits visible to the repository
+and its local bookmark tips. It flags a missing commit-shaped evidence token, a vanished anchor,
+or a subject whose anchor no longer matches its local tip. That makes an old entry's context
+inspectable without rewriting its past-tense record.
 
 ## Forge snapshot and cache
 
@@ -210,6 +224,13 @@ knives init [DIR]              configure remote roles for a repo; warn when untr
 knives register [DIR]          print a paste-ready [repos.<name>] snippet on stdout without writing to disk
 knives repos                   the repos knives manages, their release state, and whether a
                                recorded consumer is pinned behind the newest cut
+knives consumers [FORK] [--consumer PATH]...
+                               compare consumer pins with the newest live published release
+knives pushed [BRANCH]... [--repo REPO]
+                               compare local tips with the live remote refs that own them
+knives audit [REPO] [--all] [--no-github]
+                               reconcile remote refs, open pull heads, recorded cuts, and
+                               anonymous heads; reports only, never repairs
 knives sync [REPO|--all]       fetch all remotes and tracked pull/N/head refs; classify each
                                tracked PR as new | unchanged | advanced | merged | closed
 knives preflight [REPO]        programmatic pre-contribution facts (see below)
@@ -223,30 +244,44 @@ knives finish BRANCH [--allow-open]
                                when the branch's pull request is open or cannot be checked
 knives track BRANCH --pr N     state which PR a branch belongs to, overriding inference
 knives depends BRANCH --on R#N  record that a branch cannot land before something else
-knives notch [SUBJECT]         read what happened here (bare: newest 20; a subject: its whole
-                               chronology); -m writes a note, --evidence backs it
+knives notch [SUBJECT]         read what happened here (bare: newest 20 human notes plus a
+                               folded machine-event count; a subject: its whole chronology);
+                               -m writes a note, --disposition requires --evidence
 knives release [NAME]          plan, cut, edit or reap a release under the configured scheme
 knives release cut [NAME]      name a new cut of the composition in hand, verbatim (first cut: every branch); refuses to orphan commits or to silently drop members the previous cut's ledger event recorded ([--allow-drop] overrides); never pushes
 knives release reap            reap superseded dated release bookmarks everywhere locally and abandon their commits; all kept while the live cut carries conflicts
 knives release include BRANCH  add a branch (or revision) to the release as one new parent; nothing else moves
 knives release drop BRANCH     remove a branch's parent from the release; the branch and its bookmark are untouched
 knives release advance [BR..] [--from SHA]  move member parents to their branches' tips; named branches only, or every advanced member when bare; refuses a candidate that would replace more than one parent; --from names one branch's old parent directly, for a branch (e.g. `jj duplicate`-rebuilt) whose ancestry back to it is gone
-knives release carries REVISION [--in TARGET]
-                               replay a revision onto the release in hand, or TARGET, and report
-                               whether its content is carried
+knives release carries [REVISION] [--in TARGET] [--all]
+                               bare replay is multi-target; --in selects one explicit target;
+                               --all censuses maintained branches
 ```
 
 TOON is the machine default on any command when the environment says an agent is running it (or stdout is not a terminal): agents were grepping human output to count findings by detector, and JSON answered that at more tokens than the same structure needs. `--json` forces JSON exactly; `--text` forces prose.
 
-`knives notch` is the one command with two moods, split by `-m`: bare it reads, `-m` writes.
-Reading is intentional and nothing injects notches into a session, so the bare form has to
-answer the question an agent actually has rather than making them name a subject they do
-not know yet. The `status` breadcrumb — each branch's newest entry, one token on its line —
-is the other half of that: the record is no use if reading it requires knowing it exists.
+### Mutation verification
+
+`knives pushed` queries live remote refs and judges each name only against the remote that owns
+it: release names against the publish remote, ordinary branches and pull heads against origin.
+It reports equal, missing, differing, and remote-only branch states, including a branch that was
+deleted locally while its remote ref remained. It changes neither remote nor local state.
+
+`knives audit` applies that same reconciliation across a repository (or every registry entry with
+`--all`), then checks open pull heads unless `--no-github`, zombie remote branches, recorded
+release-cut evidence, and anonymous heads. Its findings identify the observed drift; it never
+repairs, deletes, pushes, or opens a pull request. Per-pull history remains the separate,
+on-demand `knives pr <n> --timeline` read.
+
+`knives notch` has two moods, split by `-m`: bare it reads, `-m` writes.
+Reading is intentional and nothing injects notches into a session, so the bare form returns the
+newest human notes and folds machine events into one count rather than letting routine events
+hide decisions. `--events` reads the full chronology; `--dispositions` reads every terminal
+ruling. `--verify` re-checks selected entries without writing. The `status` breadcrumb is the
+other half: each branch shows its newest note when one exists, otherwise its newest event, with
+the number of sibling entries it masks. A disposition token prefixes that compact text.
 
 `knives repos` and `knives status` are deliberately separate: one answers "what am I maintaining", the other "what is the current state and what is being worked on right now". Conflating them was an earlier mistake in this design. `knives status` outputs an aligned table for branch rows (`branch`, `tip`, `push`, `pr`, `review`, `checks`, `landed`, `flags`, `notch`) with empty cells as `-`. On-screen status display tokens use `failing` for failing checks and `none-ran` when no checks run.
-
-`knives register [DIR]` prints a paste-ready `[repos.<name>]` TOML snippet to stdout and diagnostic notes to stderr without writing to disk, because registration is a trust grant. An existing entry of the same name must be replaced rather than appended.
 
 ### Which PR belongs to a branch
 
@@ -285,6 +320,32 @@ Workspaces are effectively free: 0.15 to 0.55s to create, because tracked conten
 Cuts, edits or repairs a release under the repository's configured scheme. Everything here is a check, never a prompt: a CLI in a non-interactive agent session has nobody to ask.
 
 A release's parent set is its membership: a flat merge of feature and fix branches, never the upstream base — members fork from it, so it is reachable through every one of them, and no base/member role exists to classify. `include`, `drop` and `advance` are the membership edits, each duplicating the release onto the changed parent set so recorded conflict resolutions carry forward; a cut names the composition in hand verbatim. Nothing recomputes membership from the branch list after the first cut.
+
+`knives release carries REVISION` is the content answer rather than an ancestry guess. Bare
+form compares the revision with every live release and the upstream trunk, reporting an exact,
+rewritten, conflicted, or not-carried verdict with the commit the replay judged. This deliberately
+changes the earlier release-in-hand contract: bare `carries` is multi-target, while `--in TARGET`
+retains the explicit single-target query. It also answers when no release exists, against the
+upstream trunk alone, rather than refusing; that is the only target needed to decide whether
+unreleased work would be orphaned. A revision is safe only when a live release or the trunk
+carries its content; a superseded release is consulted only after those targets miss and does not
+make the result safe.
+
+`knives release carries --all` turns that same check into a census. Its primary matrix contains
+every maintained branch against the live releases and upstream trunk. Superseded releases are
+checked only when that matrix is complete and every answered verdict is not-carried; an unanswered
+row stays unanswered. Anonymous heads belong to `knives audit`'s orphan-commit detector.
+
+The `orphans` list may contain qualified unknown entries: a branch's content is not carried
+anywhere, but its unanswered pull state makes it a deletion-unsafe candidate. The row's `orphan`
+field is three-state: `true` is a deletion-safe proven orphan, `false` is not an orphan, and
+`null` means carriage or pull state is unanswered. Consumers must handle `null` as incomplete.
+
+`knives release members [REF]` reads the release's direct parent list, which is the membership
+source of truth, and names every bookmark still holding a parent plus branch tips that advanced
+beyond one. `--verify` replays every member's content into the release, reports missing and
+unexplained audit buckets, and makes either bucket a finding. Parent counts come from the
+repository's parent list, not text that happens to look like a parent declaration.
 
 Every mutating verb applies as **one jj operation**, written through jj-lib in a single transaction and described in the operation log as knives' own act (`knives: release/X: included feat/y`, `knives: cut release/X`, `knives: reap …`) rather than as a trail of raw `jj` invocations. Failure before the commit writes nothing, so a half-applied edit is unconstructible. A cut audits a **candidate** built in a scratch transaction that is never committed: a failed audit evaporates without a trace, and a passing one rebuilds the spec, verifies the published tree is identical to the audited one, and creates-and-names the release in one operation. Git refs are exported in the same step, so `git` and `gh` in a colocated checkout see the result immediately. Rewrites honor jj's stock `immutable_heads()` (trunk, tags, untracked remote bookmarks) — the reap flow depends on that refusal. Identity for written commits resolves the way the jj CLI resolves it (`JJ_USER`/`JJ_EMAIL`, repo config, user config); every behavioral setting stays at jj's defaults. Only `jj git fetch` and the composition rebase (`release rebase`, defined as `jj rebase -b <release> -d <target>`) remain subprocess calls, deliberately (#18).
 

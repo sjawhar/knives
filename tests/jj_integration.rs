@@ -29,7 +29,9 @@ use knives::forge::{
     SweepEntry, SweepPage, TimelineEvent,
 };
 use knives::ids::{BookmarkRef, BranchName, CommitId, ReleaseScheme, RemoteName};
-use knives::jj::{Repo, changed_files, changed_files_between, probe_landed, pull_heads};
+use knives::jj::{
+    Repo, changed_files, changed_files_between, probe_landed, pull_heads, remote_refs,
+};
 use knives::store::Store;
 use lab::Lab;
 use std::collections::BTreeMap;
@@ -1508,19 +1510,21 @@ fn a_consumer_checkout_parked_behind_its_origin_does_not_produce_a_false_behind(
     );
 
     // When: the consumer is scanned.
-    let (pins, notes) = knives::commands::release::scan_consumer_for(
+    let scan = knives::commands::release::scan_consumer_for(
         &consumer,
         Some("tool"),
         &knives::ids::ReleaseScheme::Dated,
     );
 
     // Then: the pin is the origin trunk's, and the checkout's lag is a note.
-    assert_eq!(pins.len(), 1, "was: {pins:?}");
-    assert_eq!(pins[0].reference, "release/2026-07-28");
+    assert_eq!(scan.pins.len(), 1, "was: {:?}", scan.pins);
+    assert_eq!(scan.pins[0].reference, "release/2026-07-28");
     assert!(
-        notes.iter().any(|note| note.contains("behind")),
-        "the stale checkout is annotated, not silently trusted: {notes:?}"
+        scan.notes.iter().any(|note| note.contains("behind")),
+        "the stale checkout is annotated, not silently trusted: {:?}",
+        scan.notes
     );
+    assert!(scan.problems.is_empty());
 }
 
 #[test]
@@ -1532,18 +1536,20 @@ fn a_dev_trunk_consumer_checkout_uses_its_origin_head_pin() {
         "url = \"https://forge.invalid/o/tool.git?rev=release%2F2026-07-28\"\n",
     );
 
-    let (pins, notes) = knives::commands::release::scan_consumer_for(
+    let scan = knives::commands::release::scan_consumer_for(
         &consumer,
         Some("tool"),
         &knives::ids::ReleaseScheme::Dated,
     );
 
-    assert_eq!(pins.len(), 1, "was: {pins:?}");
-    assert_eq!(pins[0].reference, "release/2026-07-28");
+    assert_eq!(scan.pins.len(), 1, "was: {:?}", scan.pins);
+    assert_eq!(scan.pins[0].reference, "release/2026-07-28");
     assert!(
-        notes.iter().any(|note| note.contains("origin/dev")),
-        "the origin default branch is preserved: {notes:?}"
+        scan.notes.iter().any(|note| note.contains("origin/dev")),
+        "the origin default branch is preserved: {:?}",
+        scan.notes
     );
+    assert!(scan.problems.is_empty());
 }
 
 #[test]
@@ -2920,6 +2926,188 @@ fn pull_heads_reads_local_upstream_pull_refs() {
 
     // Then: the pull number maps to its published object id.
     assert!(heads.contains_key(&42));
+}
+
+#[test]
+fn remote_refs_reads_live_heads_by_pattern() {
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.push_branch("feat/alpha");
+    let url = lab.temp_origin().display().to_string();
+
+    let refs = remote_refs(&url, &["refs/heads/*"]).expect("ls-remote");
+
+    assert!(refs.contains_key("refs/heads/feat/alpha"));
+    let none = remote_refs(&url, &["refs/pull/*/head"]).expect("ls-remote");
+    assert!(none.is_empty(), "a path remote has no pull refs");
+}
+
+#[test]
+fn consumers_reports_stale_and_behind_locks() {
+    let lab = Lab::new();
+    lab.branch("release/2026-08-04", "release.txt", "first\n");
+    lab.push_branch("release/2026-08-04");
+    let consumer = tempfile::tempdir().expect("create consumer");
+    std::fs::write(
+        consumer.path().join("uv.lock"),
+        "tool = { git = \"https://forge.invalid/acme/tool.git?rev=release%2F2026-08-04#deadbeef\" }\n",
+    )
+    .expect("write frozen pin");
+    let home = tempfile::tempdir().expect("create config home");
+    std::fs::write(
+        home.path().join("repos.toml"),
+        format!(
+            "[repos.demo]\npath = \"{}\"\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/tool.git\"\nrelease = \"{}\"\nconsumers = [\"{}\"]\n",
+            lab.work.display(),
+            lab.upstream.display(),
+            lab.temp_origin().display(),
+            consumer.path().display(),
+        ),
+    )
+    .expect("write registry");
+    let knives = || {
+        Command::new(env!("CARGO_BIN_EXE_knives"))
+            .args(["--text", "consumers", "demo"])
+            .current_dir(&lab.work)
+            .env("KNIVES_CONFIG_HOME", home.path())
+            .output()
+            .expect("run consumers")
+    };
+
+    let stale = knives();
+
+    assert_eq!(stale.status.code(), Some(1), "stderr: {:?}", stale.stderr);
+    assert!(
+        String::from_utf8_lossy(&stale.stdout).contains("stale lock: expected @"),
+        "stdout: {}",
+        String::from_utf8_lossy(&stale.stdout)
+    );
+
+    lab.branch("release/2026-08-05", "release.txt", "second\n");
+    lab.push_branch("release/2026-08-05");
+
+    let behind = knives();
+
+    assert_eq!(behind.status.code(), Some(1), "stderr: {:?}", behind.stderr);
+    assert!(
+        String::from_utf8_lossy(&behind.stdout).contains("behind: newest is release/2026-08-05"),
+        "stdout: {}",
+        String::from_utf8_lossy(&behind.stdout)
+    );
+}
+
+#[test]
+fn consumers_reports_a_missing_registry_path_as_incomplete() {
+    let lab = Lab::new();
+    lab.branch("release/2026-08-04", "release.txt", "first\n");
+    lab.push_branch("release/2026-08-04");
+    let home = tempfile::tempdir().expect("create config home");
+    let missing = home.path().join("gone");
+    std::fs::write(
+        home.path().join("repos.toml"),
+        format!(
+            "[repos.demo]\npath = \"{}\"\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/tool.git\"\nrelease = \"{}\"\nconsumers = [\"{}\"]\n",
+            lab.work.display(),
+            lab.upstream.display(),
+            lab.temp_origin().display(),
+            missing.display(),
+        ),
+    )
+    .expect("write registry");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_knives"))
+        .args(["--text", "consumers", "demo"])
+        .current_dir(&lab.work)
+        .env("KNIVES_CONFIG_HOME", home.path())
+        .output()
+        .expect("run consumers");
+
+    assert_eq!(output.status.code(), Some(3), "stderr: {:?}", output.stderr);
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("PROBLEM: not found"),
+        "stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
+fn consumers_leaves_pins_unclassified_when_live_release_refs_fail() {
+    let lab = Lab::new();
+    lab.branch("release/2026-08-05", "release.txt", "published\n");
+    lab.push_branch("release/2026-08-05");
+    let consumer = tempfile::tempdir().expect("create consumer");
+    std::fs::write(
+        consumer.path().join("uv.lock"),
+        "tool = { git = \"https://forge.invalid/acme/tool.git?rev=release%2F2026-08-05#deadbeef\" }\n",
+    )
+    .expect("write frozen pin");
+    let home = tempfile::tempdir().expect("create config home");
+    let unavailable = home.path().join("unavailable-release-remote");
+    std::fs::write(
+        home.path().join("repos.toml"),
+        format!(
+            "[repos.demo]\npath = \"{}\"\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/tool.git\"\nrelease = \"{}\"\nconsumers = [\"{}\"]\n",
+            lab.work.display(),
+            lab.upstream.display(),
+            unavailable.display(),
+            consumer.path().display(),
+        ),
+    )
+    .expect("write registry");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_knives"))
+        .args(["--text", "consumers", "demo"])
+        .current_dir(&lab.work)
+        .env("KNIVES_CONFIG_HOME", home.path())
+        .output()
+        .expect("run consumers");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert_eq!(output.status.code(), Some(3), "stderr: {:?}", output.stderr);
+    assert!(stdout.contains("unclassified"), "stdout: {stdout}");
+    assert!(
+        !stdout.contains("stale lock:") && !stdout.contains("behind:"),
+        "live remote failure must not derive a local verdict: {stdout}"
+    );
+}
+
+#[test]
+fn consumers_reports_an_unreadable_pin_file_as_incomplete() {
+    let lab = Lab::new();
+    lab.branch("release/2026-08-05", "release.txt", "published\n");
+    lab.push_branch("release/2026-08-05");
+    let consumer = tempfile::tempdir().expect("create consumer");
+    std::fs::create_dir(consumer.path().join("uv.lock")).expect("create unreadable pin file");
+    let home = tempfile::tempdir().expect("create config home");
+    std::fs::write(
+        home.path().join("repos.toml"),
+        format!(
+            "[repos.demo]\npath = \"{}\"\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/tool.git\"\nrelease = \"{}\"\nconsumers = [\"{}\"]\n",
+            lab.work.display(),
+            lab.upstream.display(),
+            lab.temp_origin().display(),
+            consumer.path().display(),
+        ),
+    )
+    .expect("write registry");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_knives"))
+        .args(["--text", "consumers", "demo"])
+        .current_dir(&lab.work)
+        .env("KNIVES_CONFIG_HOME", home.path())
+        .output()
+        .expect("run consumers");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert_eq!(output.status.code(), Some(3), "stderr: {:?}", output.stderr);
+    assert!(
+        stdout.contains("PROBLEM: could not read uv.lock"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        !stdout.contains("does not pin demo"),
+        "a failed file scan must not make a no-pin claim: {stdout}"
+    );
 }
 
 #[test]
@@ -4587,13 +4775,7 @@ fn status_and_plan_report_a_double_cut() {
 
     // When: status and the bare release command observe the two named cuts.
     let status = Command::new(env!("CARGO_BIN_EXE_knives"))
-        .args([
-            "--text",
-            "status",
-            "demo",
-            "--no-github",
-            "--no-landed",
-        ])
+        .args(["--text", "status", "demo", "--no-github", "--no-landed"])
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
         .output()
@@ -4648,23 +4830,13 @@ fn status_and_plan_report_a_double_cut() {
                 .is_empty()
         })
         .expect("find the duplicated release");
-    knives::jj::set_bookmark_anywhere(
-        &rebuilt.work,
-        "release/2026-08-04",
-        duplicated.as_str(),
-    )
-    .expect("point local release at duplicated cut");
+    knives::jj::set_bookmark_anywhere(&rebuilt.work, "release/2026-08-04", duplicated.as_str())
+        .expect("point local release at duplicated cut");
     rebuilt.jj_work(["workspace", "update-stale"]);
 
     // When: the same two commands compare the rebuilt cut to its published copy.
     let rebuilt_status = Command::new(env!("CARGO_BIN_EXE_knives"))
-        .args([
-            "--text",
-            "status",
-            "demo",
-            "--no-github",
-            "--no-landed",
-        ])
+        .args(["--text", "status", "demo", "--no-github", "--no-landed"])
         .current_dir(&rebuilt.work)
         .env("KNIVES_CONFIG_HOME", rebuilt_home.path())
         .output()
@@ -5002,7 +5174,7 @@ fn status_does_not_report_trunk_as_a_carrier_without_landed_probe() {
 
 #[test]
 fn status_carries_each_branchs_newest_notch_in_json_and_in_text() {
-    // Given: a fork with a branch and two notches on it, the second the newest
+    // Given: a fork with a note followed by a newer machine event on one branch.
     let lab = lab::Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     lab.branch("feat/beta", "beta.txt", "beta\n");
@@ -5027,19 +5199,22 @@ fn status_carries_each_branchs_newest_notch_in_json_and_in_text() {
         "ses_fff688".to_owned(),
     );
     scribe
-        .event(
-            Some("feat/alpha"),
-            "claimed: carrying the fix".to_owned(),
-            None,
-        )
-        .expect("first notch");
+        .record(&knives::ledger::Draft {
+            subject: Some("feat/alpha"),
+            kind: knives::ledger::Kind::Note,
+            disposition: None,
+            text: "human conclusion".to_owned(),
+            evidence: Vec::new(),
+            pr: None,
+        })
+        .expect("human note");
     scribe
         .event(
             Some("feat/alpha"),
             "claim released; superseded by feat/next".to_owned(),
             None,
         )
-        .expect("second notch");
+        .expect("machine event");
     scribe
         .event(
             Some("feat/unrelated"),
@@ -5064,15 +5239,17 @@ fn status_carries_each_branchs_newest_notch_in_json_and_in_text() {
     )
     .expect("gather");
 
-    // Then: the newest entry for that branch is on its row, and nobody else's is
+    // Then: the human note wins over the newer event, while the row still says
+    // how many ledger entries it condensed.
     let alpha = report
         .branches
         .iter()
         .find(|row| row.name.as_str() == "feat/alpha")
         .expect("the branch has a row");
     let last = alpha.last_notch.as_ref().expect("a breadcrumb");
-    assert_eq!(last.text, "claim released; superseded by feat/next");
-    assert_eq!(last.kind, knives::ledger::Kind::Event);
+    assert_eq!(last.text, "human conclusion");
+    assert_eq!(last.kind, knives::ledger::Kind::Note);
+    assert_eq!(last.count, 2);
 
     // And: it survives serialisation under the name the design fixed
     let json = serde_json::to_value(&report).expect("report serialises");
@@ -5081,11 +5258,9 @@ fn status_carries_each_branchs_newest_notch_in_json_and_in_text() {
         .iter()
         .find(|row| row["name"] == "feat/alpha")
         .expect("row");
-    assert_eq!(row["last_notch"]["kind"], "event");
-    assert_eq!(
-        row["last_notch"]["text"],
-        "claim released; superseded by feat/next"
-    );
+    assert_eq!(row["last_notch"]["kind"], "note");
+    assert_eq!(row["last_notch"]["text"], "human conclusion");
+    assert_eq!(row["last_notch"]["count"], 2);
     assert!(row["last_notch"]["ts"].is_string());
     let beta = rows
         .iter()
@@ -5096,12 +5271,9 @@ fn status_carries_each_branchs_newest_notch_in_json_and_in_text() {
         "no notch is absent, not null: {beta}"
     );
 
-    // And: the branch line carries one token for it
+    // And: the branch line carries one token for it and its masked sibling
     let text = status::render::render(&report, false);
-    assert!(
-        text.contains("\"claim released; superseded by fe…\""),
-        "was: {text}"
-    );
+    assert!(text.contains("\"human conclusion\" (now)+1"), "was: {text}");
     assert!(report.repo_notches.is_none(), "was: {report:?}");
     assert!(
         json.get("repo_notches").is_none(),
@@ -8752,11 +8924,7 @@ fn release_carries_stops_before_superseded_targets_when_live_release_carries() {
     lab.push_branch("history/alpha-release");
     let second = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
     assert!(second.status.success(), "{second:?}");
-    publish_remote_bookmark(
-        &lab,
-        "history/alpha-release@origin",
-        "release/2026-08-04",
-    );
+    publish_remote_bookmark(&lab, "history/alpha-release@origin", "release/2026-08-04");
 
     // When: carries finds alpha in the live release or trunk census.
     let output = knives_release(&lab, &home, &["carries", "feat/alpha"]);
@@ -8892,14 +9060,15 @@ fn carries_superseded_only_carriage_is_findings() {
     let dropped = knives_release(
         &lab,
         &home,
-        &["drop", "feat/alpha", "--why", "superseded release preserves it"],
+        &[
+            "drop",
+            "feat/alpha",
+            "--why",
+            "superseded release preserves it",
+        ],
     );
     assert!(dropped.status.success(), "{dropped:?}");
-    let second = knives_release(
-        &lab,
-        &home,
-        &["cut", "release/2026-08-05", "--allow-drop"],
-    );
+    let second = knives_release(&lab, &home, &["cut", "release/2026-08-05", "--allow-drop"]);
     assert!(second.status.success(), "{second:?}");
 
     // Publish the preserved historical commit under its release name only after
@@ -8970,11 +9139,7 @@ fn census_lab() -> (Lab, tempfile::TempDir) {
     lab.push_branch("history/alpha-release");
     let second = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
     assert!(second.status.success(), "{second:?}");
-    publish_remote_bookmark(
-        &lab,
-        "history/alpha-release@origin",
-        "release/2026-08-04",
-    );
+    publish_remote_bookmark(&lab, "history/alpha-release@origin", "release/2026-08-04");
     lab.jj_work(["bookmark", "forget", "history/alpha-release"]);
     lab.branch("feat/beta", "beta.txt", "beta\n");
     (lab, home)
@@ -9001,7 +9166,7 @@ fn census_finds_the_orphan_branch() {
     // superseded probe, while a non-carried member proves the negative against
     // every target, including the historical release.
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(output.status.code(), Some(3), "{stdout}");
     assert!(
         !stdout
             .split("\n\n")
@@ -9029,9 +9194,7 @@ fn census_finds_the_orphan_branch() {
         );
     }
     assert!(
-        stdout.contains(
-            "orphans: not carried anywhere (pull request state unknown)\n  feat/beta"
-        ),
+        stdout.contains("orphans: not carried anywhere (pull request state unknown)\n  feat/beta"),
         "{stdout}"
     );
 }
@@ -9063,7 +9226,7 @@ fn census_marks_unknown_pull_orphans_as_unanswered_in_json() {
             .any(|orphan| orphan == "feat/beta"),
         "{report}"
     );
-    assert_eq!(output.status.code(), Some(1), "{report}");
+    assert_eq!(output.status.code(), Some(3), "{report}");
 }
 
 #[test]
@@ -9074,12 +9237,7 @@ fn census_respects_an_open_pull() {
     let pulls = format!("[{}]", pull_record(17, "OPEN", "feat/beta", None));
 
     // When: the real CLI completes one forge snapshot for the census.
-    let output = knives_release_json_with_forge(
-        &lab,
-        &home,
-        &pulls,
-        &["carries", "--all"],
-    );
+    let output = knives_release_json_with_forge(&lab, &home, &pulls, &["carries", "--all"]);
 
     // Then: the branch association is retained in the report and forbids an
     // orphan result despite every target being non-carried.
@@ -9107,6 +9265,35 @@ fn census_respects_an_open_pull() {
 }
 
 #[test]
+fn census_withholds_a_selected_pull_fact_as_unanswered() {
+    // Given: beta is locally uncarried and discovery names its open pull request.
+    let (lab, home) = census_lab();
+    let pulls = format!("[{}]", pull_record(17, "OPEN", "feat/beta", None));
+
+    // When: the live batch withholds that selected pull request's fact.
+    let output = knives_release_json_with_forge_withheld_facts(ReleaseWithSnapshotForgeInput {
+        lab: &lab,
+        home: &home,
+        pulls: &pulls,
+        withheld_facts: &[17],
+        args: &["carries", "--all"],
+    });
+
+    // Then: discovery cannot make the pull state a deletion-safe answer.
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("parse census JSON");
+    let beta = report["rows"]
+        .as_array()
+        .expect("branch rows")
+        .iter()
+        .find(|row| row["branch"] == "feat/beta")
+        .expect("beta row");
+    assert!(beta["in_open_pull"].is_null(), "{report}");
+    assert!(beta["orphan"].is_null(), "{report}");
+    assert_eq!(output.status.code(), Some(3), "{report}");
+}
+
+#[test]
 fn census_keeps_local_orphans_when_the_forge_is_unavailable() {
     // Given: beta is locally uncarried and the forge refuses every request.
     let (lab, home) = census_lab();
@@ -9115,95 +9302,51 @@ fn census_keeps_local_orphans_when_the_forge_is_unavailable() {
     let output = knives_release_with_failing_forge(&lab, &home, &["carries", "--all"]);
 
     // Then: failure changes pull-request knowledge to unknown without hiding
-    // the local orphan finding or converting it into an incomplete result.
+    // the local orphan finding, and the unanswered deletion-safety check wins.
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(output.status.code(), Some(3), "{stdout}");
     assert!(
         stdout.contains("pull request state unavailable:"),
         "{stdout}"
     );
     assert!(
-        stdout.contains(
-            "orphans: not carried anywhere (pull request state unknown)\n  feat/beta"
-        ),
+        stdout.contains("orphans: not carried anywhere (pull request state unknown)\n  feat/beta"),
         "{stdout}"
     );
 }
 
 #[test]
-fn census_grades_anonymous_heads() {
+fn census_excludes_anonymous_heads() {
     // Given: an unbookmarked commit with unique content, disconnected from the
-    // working copy before the census reads anonymous heads.
+    // working copy before the census runs.
     let (lab, home) = census_lab();
     lab.jj_work(["new", "main@upstream", "-m", "stranded"]);
     std::fs::write(lab.work.join("stranded.txt"), "stranded\n").expect("write stranded content");
     lab.jj_work(["new", "main@upstream"]);
-    let initial = knives_release_json(&lab, &home, &["carries", "--all", "--no-github"]);
-    assert_eq!(initial.status.code(), Some(1), "{initial:?}");
-    let initial_report: serde_json::Value =
-        serde_json::from_slice(&initial.stdout).expect("parse initial census JSON");
-    let initial_anonymous = initial_report["anonymous"].as_array().expect("anonymous rows");
-    assert_eq!(initial_anonymous.len(), 1, "{initial_report}");
-    assert!(initial_anonymous[0]["orphan"].is_null(), "{initial_report}");
-    let stranded = initial_anonymous[0]["branch"]
-        .as_str()
-        .expect("anonymous commit id")
-        .to_owned();
-    assert!(
-        initial_report["orphans"]
-            .as_array()
-            .expect("qualified orphan listing")
-            .iter()
-            .any(|orphan| orphan == &stranded),
-        "{initial_report}"
-    );
-    let pulls = format!(
-        "[{}]",
-        pull_record_with_fields(
-            23,
-            "OPEN",
-            "an-unrelated-head-name",
-            &format!(",\"headRefOid\":\"{stranded}\""),
-        )
-    );
 
-    // When: the forge's open pull names the anonymous commit by oid, not by its
-    // unrelated head branch name.
-    let output = knives_release_json_with_forge(
-        &lab,
-        &home,
-        &pulls,
-        &["carries", "--all"],
-    );
+    // When: the maintained-branch census runs without a pull-request lookup.
+    let output = knives_release_json(&lab, &home, &["carries", "--all", "--no-github"]);
 
-    // Then: the anonymous population receives the primary matrix and its
-    // superseded escalation, and oid association keeps it from being orphaned.
+    // Then: the unnamed head is audit population, not a census row or schema field.
+    assert_eq!(output.status.code(), Some(3), "{output:?}");
     let report: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("parse census JSON");
-    let anonymous = report["anonymous"]
+    let branches = report["rows"]
         .as_array()
-        .expect("anonymous rows")
+        .expect("branch rows")
         .iter()
-        .find(|row| row["branch"] == stranded.as_str())
-        .unwrap_or_else(|| panic!("stranded anonymous head {stranded} missing from {report}"));
-    assert_eq!(anonymous["in_open_pull"], true, "{report}");
-    assert_eq!(anonymous["orphan"], false, "{report}");
-    let checks = anonymous["checks"].as_array().expect("anonymous checks");
-    for role in ["live-release", "upstream-trunk", "superseded-release"] {
-        assert!(
-            checks.iter().any(|check| check["role"] == role),
-            "anonymous head lacks {role}: {checks:?}"
-        );
-    }
+        .map(|row| row["branch"].as_str().expect("branch name"))
+        .collect::<Vec<_>>();
+    assert_eq!(branches, ["feat/alpha", "feat/beta"], "{report}");
+    assert!(
+        report.get("anonymous").is_none(),
+        "anonymous heads belong exclusively to audit: {report}"
+    );
 }
 
 /// Run census without a forge so its locally discovered anonymous id can be
 /// supplied as a pull request's exact head oid on a subsequent run.
-fn knives_release_json(
-    lab: &Lab,
-    home: &tempfile::TempDir,
-    args: &[&str],
-) -> std::process::Output {
+fn knives_release_json(lab: &Lab, home: &tempfile::TempDir, args: &[&str]) -> std::process::Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_knives"));
     command.args(["--json", "release", "--repo", "demo"]);
     command.args(args);
@@ -9222,8 +9365,27 @@ fn knives_release_json_with_forge(
     pulls: &str,
     args: &[&str],
 ) -> std::process::Output {
+    knives_release_json_with_forge_withheld_facts(ReleaseWithSnapshotForgeInput {
+        lab,
+        home,
+        pulls,
+        withheld_facts: &[],
+        args,
+    })
+}
+
+fn knives_release_json_with_forge_withheld_facts(
+    input: ReleaseWithSnapshotForgeInput<'_>,
+) -> std::process::Output {
+    let ReleaseWithSnapshotForgeInput {
+        lab,
+        home,
+        pulls,
+        withheld_facts,
+        args,
+    } = input;
     let shim = tempfile::tempdir().expect("create forge shim directory");
-    install_snapshot_gh(shim.path(), pulls, &[], None);
+    install_snapshot_gh(shim.path(), pulls, withheld_facts, None);
     let mut command = Command::new(env!("CARGO_BIN_EXE_knives"));
     command.args(["--json", "release", "--repo", "demo"]);
     command.args(args);
@@ -9338,4 +9500,427 @@ fn pr_timeline_renders_force_pushes_with_both_tree_oids_through_the_real_binary(
     assert!(stdout.contains("force-push"), "stdout: {stdout}");
     assert!(stdout.contains("tree bbbbbbbbbbbb"), "stdout: {stdout}");
     assert!(stdout.contains("tree dddddddddddd"), "stdout: {stdout}");
+}
+
+/// Registry home for commands that reconcile the lab's live bare remotes.
+fn mutation_test_home(lab: &Lab, release: Option<&std::path::Path>) -> tempfile::TempDir {
+    let home = tempfile::tempdir().expect("create config home");
+    let release = release.map_or_else(String::new, |path| {
+        format!("release = \"{}\"\n", path.display())
+    });
+    std::fs::write(
+        home.path().join("repos.toml"),
+        format!(
+            "[repos.demo]\npath = \"{}\"\nupstream = \"{}\"\norigin = \"{}\"\n{release}",
+            lab.work.display(),
+            lab.upstream.display(),
+            lab.temp_origin().display(),
+        ),
+    )
+    .expect("write registry");
+    home
+}
+
+/// Run the reconciliation command against the lab's registry entry.
+fn knives_pushed(lab: &Lab, home: &tempfile::TempDir, args: &[&str]) -> std::process::Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_knives"));
+    command.args(["--json", "pushed"]);
+    command.args(args);
+    command
+        .current_dir(&lab.work)
+        .env("KNIVES_CONFIG_HOME", home.path())
+        .env("KNIVES_OWNER", "test-owner")
+        .output()
+        .expect("run knives pushed")
+}
+
+#[test]
+fn pushed_confirms_a_pushed_branch_and_flags_an_unpushed_one() {
+    // Given: alpha reached the live origin and beta exists only in the checkout.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    lab.push_branch("feat/alpha");
+    let home = mutation_test_home(&lab, None);
+
+    // When: every local bookmark is reconciled against its owning remote.
+    let output = knives_pushed(&lab, &home, &["--repo", "demo"]);
+
+    // Then: the missing beta ref is a finding while alpha is confirmed live.
+    assert_eq!(
+        output.status.code(),
+        Some(i32::from(knives::cli::Exit::Findings.code())),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("pushed emits JSON");
+    let rows = report["rows"].as_array().expect("rows");
+    let alpha = rows
+        .iter()
+        .find(|row| row["branch"] == "feat/alpha")
+        .expect("alpha row");
+    let beta = rows
+        .iter()
+        .find(|row| row["branch"] == "feat/beta")
+        .expect("beta row");
+    assert_eq!(alpha["verdicts"][0]["verdict"], "in-sync");
+    assert_eq!(beta["verdicts"][0]["verdict"], "not-on-remote");
+    assert_eq!(beta["verdicts"][0]["remote"], "origin");
+}
+
+#[test]
+fn pushed_catches_the_no_op_delete() {
+    // Given: alpha was pushed before its local bookmark was removed.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.push_branch("feat/alpha");
+    lab.jj_work(["bookmark", "delete", "feat/alpha"]);
+    let home = mutation_test_home(&lab, None);
+
+    // When: the named, now-local-absent branch is reconciled.
+    let output = knives_pushed(&lab, &home, &["feat/alpha", "--repo", "demo"]);
+
+    // Then: the live ref is reported rather than silently accepting the delete.
+    assert_eq!(
+        output.status.code(),
+        Some(i32::from(knives::cli::Exit::Findings.code())),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("pushed emits JSON");
+    let row = report["rows"][0].as_object().expect("one row");
+    assert!(row.get("local").is_none(), "was: {row:?}");
+    assert_eq!(row["verdicts"][0]["verdict"], "remote-only");
+    assert_eq!(row["verdicts"][0]["remote"], "origin");
+}
+
+#[test]
+fn pushed_compares_a_tracked_pull_head() {
+    // Given: alpha's tracked pull ref still names the older trunk commit.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.push_branch("feat/alpha");
+    let trunk = Repo::open(&lab.work)
+        .expect("open lab")
+        .resolve_commit("main@origin")
+        .expect("resolve trunk");
+    let status = Command::new("git")
+        .args(["update-ref", "refs/pull/7/head", trunk.as_str()])
+        .current_dir(lab.temp_origin())
+        .status()
+        .expect("write pull fixture");
+    assert!(status.success(), "write pull fixture");
+    let home = mutation_test_home(&lab, None);
+    let tracked = Command::new(env!("CARGO_BIN_EXE_knives"))
+        .args([
+            "--text",
+            "track",
+            "feat/alpha",
+            "--pr",
+            "7",
+            "--repo",
+            "demo",
+        ])
+        .current_dir(&lab.work)
+        .env("KNIVES_CONFIG_HOME", home.path())
+        .env("KNIVES_OWNER", "test-owner")
+        .output()
+        .expect("track pull");
+    assert!(
+        tracked.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&tracked.stderr)
+    );
+
+    // When: pushed compares the stated pull head from origin.
+    let output = knives_pushed(&lab, &home, &["feat/alpha", "--repo", "demo"]);
+
+    // Then: the independent pull-head mismatch is surfaced.
+    assert_eq!(
+        output.status.code(),
+        Some(i32::from(knives::cli::Exit::Findings.code())),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("pushed emits JSON");
+    let verdicts = report["rows"][0]["verdicts"].as_array().expect("verdicts");
+    assert!(
+        verdicts
+            .iter()
+            .any(|verdict| verdict["verdict"] == "pull-head-differs" && verdict["number"] == 7),
+        "was: {verdicts:?}"
+    );
+}
+
+#[test]
+fn pushed_partitions_release_names_to_the_release_remote() {
+    // Given: the release and origin roles point at separate bare remotes.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("release/2026-08-04", "release.txt", "release\n");
+    lab.push_branch("feat/alpha");
+    let home = tempfile::tempdir().expect("create release remote home");
+    let release = home.path().join("release.git");
+    let status = Command::new("git")
+        .args(["init", "--bare", release.to_str().expect("utf-8 path")])
+        .status()
+        .expect("create release remote");
+    assert!(status.success(), "create release remote");
+    lab.jj_work([
+        "git",
+        "remote",
+        "add",
+        "release",
+        release.to_str().expect("utf-8 path"),
+    ]);
+    lab.jj_work([
+        "git",
+        "push",
+        "--remote",
+        "release",
+        "--bookmark",
+        "release/2026-08-04",
+    ]);
+    let config = mutation_test_home(&lab, Some(&release));
+
+    // When: both roles contain only the ref class they own.
+    let synced = knives_pushed(&lab, &config, &["--repo", "demo"]);
+
+    // Then: cross-remote absence is topology, so both refs are in sync.
+    assert!(
+        synced.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&synced.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&synced.stdout).expect("pushed emits JSON");
+    for branch in ["feat/alpha", "release/2026-08-04"] {
+        let row = report["rows"]
+            .as_array()
+            .expect("rows")
+            .iter()
+            .find(|row| row["branch"] == branch)
+            .expect("row");
+        assert_eq!(row["verdicts"][0]["verdict"], "in-sync", "row: {row}");
+    }
+
+    // When: the release remote moves its release ref to a different live commit.
+    let trunk = Repo::open(&lab.work)
+        .expect("open lab")
+        .resolve_commit("main@origin")
+        .expect("resolve trunk");
+    let status = Command::new("git")
+        .args([
+            "update-ref",
+            "refs/heads/release/2026-08-04",
+            trunk.as_str(),
+        ])
+        .current_dir(&release)
+        .status()
+        .expect("move release ref");
+    assert!(status.success(), "move release ref");
+    let drifted = knives_pushed(&lab, &config, &["release/2026-08-04", "--repo", "demo"]);
+
+    // Then: only its owner role names the mismatch.
+    assert_eq!(
+        drifted.status.code(),
+        Some(i32::from(knives::cli::Exit::Findings.code())),
+        "stderr: {}",
+        String::from_utf8_lossy(&drifted.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&drifted.stdout).expect("pushed emits JSON");
+    assert_eq!(report["rows"][0]["verdicts"][0]["verdict"], "differs");
+    assert_eq!(report["rows"][0]["verdicts"][0]["remote"], "release");
+}
+
+/// Run estate reconciliation against the lab's registry entry.
+fn knives_audit(lab: &Lab, home: &tempfile::TempDir, args: &[&str]) -> std::process::Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_knives"));
+    command.args(["--json", "audit"]);
+    command.args(args);
+    command
+        .current_dir(&lab.work)
+        .env("KNIVES_CONFIG_HOME", home.path())
+        .env("KNIVES_OWNER", "test-owner")
+        .output()
+        .expect("run knives audit")
+}
+
+#[test]
+fn audit_reports_zombie_drift_and_anonymous_heads() {
+    // Given: one locally rewritten pushed branch, one remote-only branch, and
+    // a described anonymous head no workspace currently holds.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/zombie", "zombie.txt", "zombie\n");
+    lab.push_branch("feat/alpha");
+    lab.push_branch("feat/zombie");
+    lab.rewrite_local_branch("feat/alpha", "locally moved\n");
+    lab.jj_work(["bookmark", "delete", "feat/zombie"]);
+    lab.jj_work(["new", "main@origin", "-m", "stranded"]);
+    lab.jj_work(["new", "main@origin"]);
+    let home = mutation_test_home(&lab, None);
+
+    // When: audit runs without a forge session.
+    let output = knives_audit(&lab, &home, &["demo", "--no-github"]);
+
+    // Then: each independently recoverable estate fact remains a separate
+    // finding, while the skipped pull-head reconciliation makes the result incomplete.
+    assert_eq!(
+        output.status.code(),
+        Some(i32::from(knives::cli::Exit::Incomplete.code())),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("audit emits JSON");
+    let kinds = report["findings"]
+        .as_array()
+        .expect("findings")
+        .iter()
+        .map(|finding| finding["kind"].as_str().expect("finding kind"))
+        .collect::<Vec<_>>();
+    for expected in ["remote-drift", "zombie-branch", "orphan-commit"] {
+        assert!(kinds.contains(&expected), "missing {expected}: {report}");
+    }
+}
+
+#[test]
+fn audit_does_not_treat_a_shared_release_url_as_a_separate_zombie_remote() {
+    // Given: release is configured to the same remote as origin, where alpha
+    // remains after its local bookmark is deleted.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.push_branch("feat/alpha");
+    lab.jj_work(["bookmark", "delete", "feat/alpha"]);
+    let release = lab.temp_origin();
+    let home = mutation_test_home(&lab, Some(&release));
+
+    // When: audit classifies the one shared remote.
+    let output = knives_audit(&lab, &home, &["demo", "--no-github"]);
+
+    // Then: origin's missing bookmark is a zombie once, never a second release
+    // zombie; skipped pull-head reconciliation makes the result incomplete.
+    assert_eq!(
+        output.status.code(),
+        Some(i32::from(knives::cli::Exit::Incomplete.code())),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("audit emits JSON");
+    let zombies = report["findings"]
+        .as_array()
+        .expect("findings")
+        .iter()
+        .filter(|finding| finding["kind"] == "zombie-branch")
+        .collect::<Vec<_>>();
+    assert_eq!(zombies.len(), 1, "was: {report}");
+    assert!(
+        zombies[0]["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.starts_with("origin has feat/alpha")),
+        "was: {zombies:?}"
+    );
+}
+
+#[test]
+fn audit_reports_release_drift_from_the_recorded_cut() {
+    // Given: a cut records its created commit, then its bookmark moves sideways.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let home = mutation_test_home(&lab, None);
+    let cut = Command::new(env!("CARGO_BIN_EXE_knives"))
+        .args([
+            "--text",
+            "release",
+            "--repo",
+            "demo",
+            "cut",
+            "release/2026-08-04",
+        ])
+        .current_dir(&lab.work)
+        .env("KNIVES_CONFIG_HOME", home.path())
+        .env("KNIVES_OWNER", "test-owner")
+        .output()
+        .expect("cut release");
+    assert!(
+        cut.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&cut.stdout),
+        String::from_utf8_lossy(&cut.stderr)
+    );
+    knives::jj::set_bookmark_anywhere(&lab.work, "release/2026-08-04", "feat/alpha")
+        .expect("move local release sideways");
+    lab.jj_work(["workspace", "update-stale"]);
+
+    // When: audit compares the release's current tip to its newest record.
+    let output = knives_audit(&lab, &home, &["demo", "--no-github"]);
+
+    // Then: the recorded cut disagreement remains a content finding, but the
+    // skipped pull-head reconciliation prevents a completed result.
+    assert_eq!(
+        output.status.code(),
+        Some(i32::from(knives::cli::Exit::Incomplete.code())),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("audit emits JSON");
+    assert!(
+        report["findings"]
+            .as_array()
+            .expect("findings")
+            .iter()
+            .any(|finding| finding["kind"] == "release-drift"),
+        "was: {report}"
+    );
+}
+
+#[test]
+fn audit_with_no_github_still_reconciles() {
+    // Given: a local-only branch and no forge transport.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let home = mutation_test_home(&lab, None);
+
+    // When: the optional forge check is disabled.
+    let output = knives_audit(&lab, &home, &["demo", "--no-github"]);
+
+    // Then: local reconciliation still reports its remote fact, while the
+    // skipped open-pull reconciliation is an unanswered question.
+    assert_eq!(
+        output.status.code(),
+        Some(i32::from(knives::cli::Exit::Incomplete.code())),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("audit emits JSON");
+    assert!(
+        report["findings"]
+            .as_array()
+            .expect("findings")
+            .iter()
+            .any(|finding| finding["kind"] == "remote-drift"),
+        "was: {report}"
+    );
+    assert!(
+        report["problems"]
+            .as_array()
+            .expect("problems")
+            .iter()
+            .any(|problem| problem
+                .as_str()
+                .is_some_and(|problem| problem.contains("pull-head reconciliation was skipped"))),
+        "was: {report}"
+    );
 }

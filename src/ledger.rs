@@ -1,4 +1,4 @@
-// allow: SIZE_OK: 1201 lines - entry type, storage, filters, and writer are one domain.
+// allow: SIZE_OK: 1429 lines - entry type, storage, filters, and writer are one domain.
 //! What agents did and decided here, in order, forever.
 //!
 //! [`crate::store`] holds current intent and is rewritten whole on every change:
@@ -17,6 +17,7 @@
 //! moment upstream moves.
 
 use std::collections::hash_map::RandomState;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::io::Write as _;
@@ -62,6 +63,14 @@ impl std::fmt::Display for Kind {
     }
 }
 
+/// Which entry class a read wants; a disposition remains a note.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryClass {
+    Note,
+    Event,
+    Disposition,
+}
+
 /// One entry of the ledger.
 ///
 /// Unknown frontmatter keys are ignored rather than rejected: entries are never
@@ -83,6 +92,11 @@ pub struct Entry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subject: Option<String>,
     pub kind: Kind,
+    /// A terminal ruling about the subject — `merged-elsewhere`, `withdrawn`,
+    /// `ruled-out` — with provenance in [`Entry::evidence`]. It stays a note:
+    /// unknown frontmatter keys are the ledger's compatible extension point.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disposition: Option<String>,
     pub text: String,
     /// Free strings backing the entry: commit ids, `file:line`, `<repo>#<number>`,
     /// URLs, and they may name other repositories. Every audit claim that
@@ -114,6 +128,8 @@ struct Frontmatter {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     subject: Option<String>,
     kind: Kind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    disposition: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     evidence: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -129,6 +145,7 @@ impl Frontmatter {
             owner: entry.owner.clone(),
             subject: entry.subject.clone(),
             kind: entry.kind,
+            disposition: entry.disposition.clone(),
             evidence: entry.evidence.clone(),
             anchor: entry.anchor.clone(),
             pr: entry.pr,
@@ -141,6 +158,7 @@ impl Frontmatter {
             owner: self.owner,
             subject: self.subject,
             kind: self.kind,
+            disposition: self.disposition,
             text,
             evidence: self.evidence,
             anchor: self.anchor,
@@ -281,6 +299,8 @@ pub struct Filter<'a> {
     pub subject: Option<&'a str>,
     /// Only entries stamped with this pull request.
     pub pr: Option<u64>,
+    /// Limit reads to one entry class. A disposition is also a note.
+    pub only: Option<EntryClass>,
     /// Keep at most this many, the newest of them. `None` keeps everything.
     pub limit: Option<usize>,
 }
@@ -291,6 +311,7 @@ pub struct Filter<'a> {
 /// that silently drops the older half of a branch's history is how a reader
 /// concludes the history is short.
 pub fn select<'a>(entries: &'a [Entry], filter: &Filter<'_>) -> (Vec<&'a Entry>, usize) {
+    let pr_subject = filter.pr.map(|number| format!("#{number}"));
     let matched: Vec<&Entry> = entries
         .iter()
         .filter(|entry| {
@@ -298,7 +319,18 @@ pub fn select<'a>(entries: &'a [Entry], filter: &Filter<'_>) -> (Vec<&'a Entry>,
                 .subject
                 .is_none_or(|wanted| entry.subject.as_deref() == Some(wanted))
         })
-        .filter(|entry| filter.pr.is_none_or(|wanted| entry.pr == Some(wanted)))
+        .filter(|entry| {
+            filter.pr.is_none_or(|wanted| {
+                entry.pr == Some(wanted) || entry.subject.as_deref() == pr_subject.as_deref()
+            })
+        })
+        .filter(|entry| {
+            filter.only.is_none_or(|class| match class {
+                EntryClass::Event => entry.kind == Kind::Event,
+                EntryClass::Note => entry.kind == Kind::Note,
+                EntryClass::Disposition => entry.disposition.is_some(),
+            })
+        })
         .collect();
     let matched_count = matched.len();
     let skipped = filter
@@ -320,10 +352,70 @@ pub fn newest_for<'a>(entries: &'a [Entry], subject: &str) -> Option<&'a Entry> 
         .find(|entry| entry.subject.as_deref() == Some(subject))
 }
 
-/// How long ago, in the shortest form that is still true: `now`, `12m`, `4h`, `3d`.
-///
-/// `None` when the timestamp does not parse. [`Ledger::entries`] rejects those at
-/// the boundary, so this answers `None` only for an entry assembled by hand.
+/// One re-verification failure: content the entry cites that the repository no
+/// longer shows, or an anchor whose subject moved.
+#[derive(Debug, PartialEq, Eq, Serialize)]
+pub struct VerifyFlag {
+    pub ts: String,
+    pub subject: Option<String>,
+    pub what: String,
+}
+
+/// Re-check commit-shaped evidence and anchors against a visibility-scoped
+/// commit listing. A short evidence SHA matches a visible full id by prefix.
+pub fn verify_entries(
+    entries: &[Entry],
+    visible: &BTreeSet<String>,
+    tips: &BTreeMap<String, String>,
+) -> Vec<VerifyFlag> {
+    let mut flags = Vec::new();
+    for entry in entries {
+        for evidence in &entry.evidence {
+            if is_commit_token(evidence) && !visible_contains(visible, evidence) {
+                flags.push(VerifyFlag {
+                    ts: entry.ts.clone(),
+                    subject: entry.subject.clone(),
+                    what: format!("evidence {evidence} not found in this repository"),
+                });
+            }
+        }
+        if let Some(anchor) = &entry.anchor {
+            if !visible_contains(visible, anchor) {
+                flags.push(VerifyFlag {
+                    ts: entry.ts.clone(),
+                    subject: entry.subject.clone(),
+                    what: format!("anchor {anchor} vanished"),
+                });
+            } else if let Some(tip) = entry
+                .subject
+                .as_deref()
+                .and_then(|subject| tips.get(subject))
+                && !tip.starts_with(anchor)
+            {
+                flags.push(VerifyFlag {
+                    ts: entry.ts.clone(),
+                    subject: entry.subject.clone(),
+                    what: format!("anchor moved: {anchor} -> {tip}"),
+                });
+            }
+        }
+    }
+    flags
+}
+
+fn is_commit_token(token: &str) -> bool {
+    (12..=40).contains(&token.len())
+        && token
+            .chars()
+            .all(|character| character.is_ascii_hexdigit() && !character.is_ascii_uppercase())
+}
+
+fn visible_contains(visible: &BTreeSet<String>, token: &str) -> bool {
+    visible
+        .range(token.to_owned()..)
+        .next()
+        .is_some_and(|id| id.starts_with(token))
+}
 pub fn age(ts: &str, now: jiff::Timestamp) -> Option<String> {
     let then = ts.parse::<jiff::Timestamp>().ok()?;
     let seconds = now.as_second().saturating_sub(then.as_second()).max(0);
@@ -372,6 +464,8 @@ pub struct Draft<'a> {
     /// The ref this is about, or nothing for an entry about the repository.
     pub subject: Option<&'a str>,
     pub kind: Kind,
+    /// A terminal ruling token when this note is a disposition.
+    pub disposition: Option<String>,
     pub text: String,
     pub evidence: Vec<String>,
     /// The pull request stated for the subject, read from the store by the
@@ -414,6 +508,7 @@ impl Scribe {
             owner: self.owner.clone(),
             subject: draft.subject.map(str::to_owned),
             kind: draft.kind,
+            disposition: draft.disposition.clone(),
             text: draft.text.clone(),
             evidence: draft.evidence.clone(),
             anchor: self.anchor(draft.subject),
@@ -433,6 +528,7 @@ impl Scribe {
         self.record(&Draft {
             subject,
             kind: Kind::Event,
+            disposition: None,
             text,
             evidence: Vec::new(),
             pr,
@@ -586,6 +682,7 @@ mod tests {
         reason = "indexing a result in a test is the assertion; a panic is the failure"
     )]
     use super::*;
+    use std::collections::{BTreeMap, BTreeSet};
 
     fn entry(subject: Option<&str>, text: &str) -> Entry {
         Entry {
@@ -597,6 +694,7 @@ mod tests {
             evidence: Vec::new(),
             anchor: Some("6c42fe71".to_owned()),
             pr: None,
+            disposition: None,
         }
     }
     fn entry_at(ts: &str, subject: Option<&str>, text: &str) -> Entry {
@@ -1166,6 +1264,7 @@ mod tests {
             .record(&Draft {
                 subject: None,
                 kind: Kind::Note,
+                disposition: None,
                 text: "the release remote is out of date".to_owned(),
                 evidence: vec!["06d778b9".to_owned(), "a-repo#1157".to_owned()],
                 pr: None,
@@ -1196,6 +1295,135 @@ mod tests {
         assert!(
             matches!(blocked, Err(LedgerError::Write { .. })),
             "was: {blocked:?}"
+        );
+    }
+
+    #[test]
+    fn a_disposition_round_trips_and_an_entry_without_one_stays_clean() {
+        // Removing the frontmatter mirror would lose a ruling on disk; emitting
+        // None would turn ordinary notes into an invented disposition field.
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = Ledger::at(dir.path().join("a-repo"));
+        let disposition = Entry {
+            disposition: Some("ruled-out".to_owned()),
+            ..entry(Some("feat/alpha"), "split into a plugin")
+        };
+        ledger.append(&disposition).unwrap();
+        assert_eq!(ledger.entries().unwrap(), vec![disposition]);
+
+        let plain_dir = tempfile::tempdir().unwrap();
+        let plain = Ledger::at(plain_dir.path().join("a-repo"));
+        plain
+            .append(&entry(Some("feat/beta"), "still investigating"))
+            .unwrap();
+        let text = std::fs::read_to_string(only_file(plain.path())).unwrap();
+        assert!(!text.contains("disposition"), "was: {text}");
+    }
+
+    #[test]
+    fn filters_select_by_class() {
+        // Class filtering must retain dispositions as notes while still letting a
+        // discovery read isolate terminal rulings.
+        let entries = vec![
+            Entry {
+                kind: Kind::Event,
+                ..entry(Some("feat/alpha"), "synced")
+            },
+            entry(Some("feat/alpha"), "still investigating"),
+            Entry {
+                disposition: Some("ruled-out".to_owned()),
+                ..entry(Some("feat/alpha"), "split into a plugin")
+            },
+        ];
+
+        for (class, expected) in [
+            (Some(EntryClass::Disposition), 1),
+            (Some(EntryClass::Note), 2),
+            (Some(EntryClass::Event), 1),
+            (None, 3),
+        ] {
+            let (selected, _) = select(
+                &entries,
+                &Filter {
+                    only: class,
+                    ..Filter::default()
+                },
+            );
+            assert_eq!(selected.len(), expected, "class: {class:?}");
+        }
+    }
+
+    #[test]
+    fn a_pr_subject_matches_the_pr_filter() {
+        // Removing the #number subject fallback would strand cross-repository
+        // rulings from the PR history that gives them their meaning.
+        let entry = Entry {
+            subject: Some("#4545".to_owned()),
+            pr: None,
+            ..entry(None, "split into a plugin")
+        };
+        let by_pr = select(
+            std::slice::from_ref(&entry),
+            &Filter {
+                pr: Some(4545),
+                ..Filter::default()
+            },
+        );
+        let by_subject = select(
+            std::slice::from_ref(&entry),
+            &Filter {
+                subject: Some("#4545"),
+                ..Filter::default()
+            },
+        );
+
+        assert_eq!(by_pr.1, 1);
+        assert_eq!(by_subject.1, 1);
+    }
+
+    #[test]
+    fn verify_flags_vanished_evidence_and_moved_anchors() {
+        // Removing the membership check lets a vanished cited SHA look valid;
+        // ignoring a changed subject tip lets an inherited conclusion look current.
+        let entries = vec![
+            Entry {
+                evidence: vec!["aaaaaaaaaaaa".to_owned()],
+                anchor: None,
+                ..entry(Some("feat/present"), "still present")
+            },
+            Entry {
+                ts: "2026-08-15T22:14:04Z".to_owned(),
+                evidence: vec!["deadbeefdead".to_owned()],
+                anchor: None,
+                ..entry(Some("feat/missing"), "the cited change vanished")
+            },
+            Entry {
+                ts: "2026-08-15T22:14:05Z".to_owned(),
+                anchor: Some("bbbbbbbbbbbb".to_owned()),
+                ..entry(Some("feat/moved"), "the branch changed")
+            },
+        ];
+        let visible = BTreeSet::from([
+            "aaaaaaaaaaaa9999".to_owned(),
+            "bbbbbbbbbbbb9999".to_owned(),
+            "cccccccccccc9999".to_owned(),
+        ]);
+        let tips = BTreeMap::from([("feat/moved".to_owned(), "cccccccccccc9999".to_owned())]);
+
+        assert_eq!(
+            verify_entries(&entries, &visible, &tips),
+            vec![
+                VerifyFlag {
+                    ts: "2026-08-15T22:14:04Z".to_owned(),
+                    subject: Some("feat/missing".to_owned()),
+                    what: "evidence deadbeefdead not found in this repository".to_owned(),
+                },
+                VerifyFlag {
+                    ts: "2026-08-15T22:14:05Z".to_owned(),
+                    subject: Some("feat/moved".to_owned()),
+                    what: "anchor moved: bbbbbbbbbbbb -> cccccccccccc9999".to_owned(),
+                },
+            ]
         );
     }
 }

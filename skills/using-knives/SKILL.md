@@ -22,9 +22,40 @@ Every command takes its repo from the directory you are standing in. Name one on
 What is managed, where each checkout is, the newest release each has cut, and, where consumers are recorded, whether those consumers are pinned behind the newest cut. Trusted entries, which are repositories whose instructions we read but do not maintain, are listed separately.
 
 Pins are read from each consumer's origin trunk rather than its working copy. Notes report when a consumer checkout is behind its origin trunk (`checkout is N commit(s) behind its <branch>`), when no origin trunk resolves (`no origin trunk resolved; pins read from the working copy`), or when a consumer is not a repository (`not a repository; pins read from the working copy`). Under a fixed scheme, a branch-name pin with no locked commit is current by definition, and a locked commit is behind when it is an ancestor of the branch tip.
+
+### `knives consumers [FORK] [--consumer PATH]...`
+
+Checks every registered consumer checkout for a fork, plus any repeatable `--consumer` paths,
+against the newest release on the live publish remote. A missing path is an unanswered problem;
+a reachable consumer that does not pin the fork is a note. It finds stale frozen locks, pins to
+older or unknown release names, and disagreement between consumers without editing a consumer.
+The local checkout's release view is compared with the live remote and reported when they differ.
+
+### `knives pushed [BRANCH]... [--repo REPO]`
+
+Reconciles local bookmark tips with the live refs that own them. Release names are checked only
+against the publish remote; ordinary branches and pull-request heads are checked only against
+origin. A named ref without a local bookmark is still checked, exposing a remote-only branch
+after a silent local delete. It is read-only: findings name equal, missing, different, or
+remote-only refs and never repair them.
+
+### `knives audit [REPO] [--all] [--no-github]`
+
+Runs the estate-wide, read-only reconciliation. It checks remote drift, open pull heads (unless
+`--no-github`), zombie remote branches, recorded release-cut evidence, and anonymous heads.
+`--all` applies those checks to every managed repository. Findings are facts for investigation:
+the command never deletes refs, changes local bookmarks, pushes, repairs, or opens a pull request.
+
+### `knives pr NUMBER [--repo REPO] [--timeline]`
+
+Reads one pull request's present state. `--timeline` makes the separate on-demand bounded forge
+event-log read, reporting force pushes with before/after commit and tree ids, deletion and
+restoration, closure, reopening, and merge events. It is history for the named pull request, not
+an audit repair path.
+
 ### `knives status [REPO|--all]`
 
-The main report. Per branch: local tip, push status, pull request and its state, review decision, CI check status, landed verdict against upstream trunk, flags, and newest ledger entry. Plus claims other agents hold, the releases scanned, findings grouped one line per kind, and anything it could not answer.
+The main report. Per branch: local tip, push status, pull request and its state, review decision, CI check status, landed verdict against upstream trunk, flags, and the most relevant ledger entry. Plus claims other agents hold, the releases scanned, findings grouped one line per kind, and anything it could not answer.
 
 `--verbose` prints one block per finding instead of one line per kind. `--no-landed` skips the trunk probe, which is the slow part. `--no-github` skips pull request lookups. Set `KNIVES_TIMING` (any value) to print a phase-timing line with `repository-open`, `health`, `divergent-changes`, `releases`, `setup`, `forge`, `probes`, `origin-relations`, `divergent-rows`, `carried-findings`, `touching`, `claims`, `report`, and `total` to stderr; `total` is wall time because phases overlap, and the report's stdout/JSON contract is unchanged.
 
@@ -58,7 +89,7 @@ Branch rows are rendered as an aligned table with 9 columns. Empty cells render 
    - `-` if no open pull request exists or the forge returned no check rollup. Checks are consulted only for open pull requests.
 7. `landed`: verdict against upstream's trunk (`in-trunk`, `conflicts-with-trunk`, `not-in-trunk`, `landed?`, or `-`).
 8. `flags`: comma-separated flags (`CONFLICTING`, `behind-base`, `review-stale`, `fork-only`) or `-`.
-9. `notch`: the newest ledger entry for this branch as one truncated token with its age (`"superseded by #1157…" (3d)`), or `-` when there is none. `knives notch <branch>` prints it in full.
+9. `notch`: the newest human note for this branch, if one exists, otherwise its newest ledger event, as one truncated token with its age. A disposition prefixes the text; `+N` reports N sibling entries that the cell masks. `knives notch <branch>` prints the full record. `-` means there is no entry.
 
 Trunk verdicts say what was observed, not what it means:
 
@@ -82,6 +113,9 @@ Findings appear grouped one line per kind at the end of the status report:
 - `unmergeable`: the pull request conflicts with its base branch according to the forge.
 - `checks-failing`: the forge reported a red CI conclusion (`FAILURE`, `TIMED_OUT`, `CANCELLED`, `STARTUP_FAILURE`, `ACTION_REQUIRED`, or `ERROR`).
 - `wrong-base`: the pull request targets a branch whose name differs from the repo's configured base branch. Only open pull requests are checked; an empty base is unknown, not wrong.
+- `empty-diff`: an open pull request's answered live diff has zero additions, deletions, and changed files.
+- `deleted-head-ref`: an open pull request's answered live head ref is gone from the forge.
+- `empty-tip-commit`: an open pull request's newest tip commit has the same tree as its sole parent.
 - `carried-elsewhere`: the branch tip is reachable from another reference. Trunk, `@git` refs, and our own release cuts are excluded.
 - `branch-overlap`: two or more of our branches change the same file, which conflicts when a release merges them. One finding per file, naming every branch.
 ### `knives sync [REPO|--all]`
@@ -127,13 +161,17 @@ append-only ledger directory beside the state file, with one immutable Markdown 
 per entry. `knives status` deletes nothing, but `knives finish` does: it removes the claim
 that said why a branch exists. The ledger is where that survives.
 
-Two moods on one command. Bare, it reads:
+Two moods on one command. Bare, it reads the newest 20 human notes and folds all machine events
+into one newest-event count:
 
 ```
-knives notch                      # the newest 20 entries across this repo
+knives notch                      # newest human notes, plus a machine-event fold
 knives notch <branch>             # that ref's whole chronology, oldest first
 knives notch release/2026-08-15   # a release is a subject like any branch
-knives notch --pr 4545            # only entries stamped with that pull request
+knives notch --pr 4545            # entries stamped with, or written for, that pull request
+knives notch --dispositions       # every terminal ruling
+knives notch --events             # the full machine-event chronology
+knives notch --verify '#4545'     # re-check one selected record
 knives notch --repo other         # a repo you are not standing in
 ```
 
@@ -142,14 +180,17 @@ With `-m`, it writes:
 ```
 knives notch <branch> -m "superseded by #1157; upstream wanted the trait approach" \
   --evidence 06d778b9 --evidence other-repo#1157 --pr 4891
+knives notch '#4545' -m "split to a plugin" --disposition ruled-out \
+  --evidence https://forge.example/org/libcore/pull/4545
 knives notch -m "this fork needs a cut before the pin moves"   # about the repo itself
 ```
 
 `--repo` works in both moods, and it is the flag for the case that keeps happening: you
 are standing in the consumer fork when you learn something about the library fork, and the
 entry belongs in the library's ledger. `--pr` filters reads; with `-m`, it stamps the entry
-explicitly and otherwise the tracked pull request is the fallback. `--evidence` is repeatable
-and requires `-m`.
+explicitly and otherwise the tracked pull request is the fallback. A `#<n>` subject also stamps
+that number without treating it as a branch. `--evidence` is repeatable and requires `-m`.
+`--disposition` is a lowercase terminal token and requires both `-m` and evidence.
 
 A `knives start` workspace resolves its registered checkout through `.jj/repo`, so ordinary
 commands infer that repository there. Keep `--repo <name>` for a cross-repository write.
@@ -162,21 +203,23 @@ commands infer that repository there. Keep `--repo <name>` for a cross-repositor
 | `owner` | automatically | the same identity a claim gets |
 | `subject` | you | the ref it is about; absent for an entry about the repository |
 | `kind` | automatically | `event` when a knives command observed it, `note` when an agent asserted it |
+| `disposition` | you, optional | a terminal ruling (`merged-elsewhere`, `withdrawn`, or `ruled-out`) backed by evidence; it remains a note |
 | `text` | you, or the command | the entry itself |
 | `evidence` | you, optional | commit ids, `file:line`, `<repo>#<number>`, URLs, and they may name other repos |
 | `anchor` | automatically | the subject's tip at write time, absent when it did not resolve |
 | `pr` | `--pr` on write, otherwise automatically | caller-supplied write stamp, or the pull request `knives track` states for the subject |
 
 Two kinds, not three. The question a reader has is whether a machine observed this or an
-agent asserted it. Supersessions and parkings arrive as events, through `finish
---superseded-by` and `start --why`; everything you assert by hand is a note.
+agent asserted it. A disposition is a selectable class of note, not a new kind. Supersessions
+and parkings arrive as events, through `finish --superseded-by` and `start --why`; everything
+you assert by hand is a note.
 
-`anchor` is why this record does not rot. A stored disposition goes wrong the moment
-upstream moves: a branch census that inferred "not a release parent, therefore unhomed"
-produced 54 findings of which 5 were false, and a parity audit's finding was true at its
-recorded commit and stale two hours later. A past-tense entry anchored to a commit stays
-true. So the ledger holds events and judgments, never derived state — if a detector can
-compute it, do not write it down.
+`anchor` preserves the record's context: a past-tense ruling remains a record of what was
+decided, while its current commit context can be checked again. `knives notch --verify` tests
+selected commit-shaped evidence and anchors against all visible commits and local bookmark tips.
+It flags missing evidence, vanished anchors, and subject anchors that no longer match the current
+local tip; it never rewrites the entry. So the ledger holds events and judgments, never derived
+state — if a detector can compute it, do not write it down.
 
 #### What writes entries without being asked
 
@@ -197,9 +240,10 @@ into a session: reading the ledger is intentional, and that is the point.
 
 #### In `knives status`
 
-Each branch row carries its newest entry. In JSON that is `last_notch: {ts, kind, text}`,
-absent when the branch has none; in text it is one truncated token at the end of the line,
-`"superseded by #1157…" (3d)`. Repo-level entries appear separately as
+Each branch row carries the newest human note if any, otherwise its newest event. In JSON that is
+`last_notch: {ts, kind, text, disposition?, count}`, absent when the branch has none; in text it
+is one truncated token at the end of the line. A disposition prefixes its text and `+N` records N
+masked sibling entries. Repo-level entries appear separately as
 `repo_notches: {count, last}` in JSON and as `notches  <N> repo-level, newest: "<text>" (<age>)`
 above the branch table. It is a local ledger read, so it costs nothing.
 
@@ -259,7 +303,7 @@ Expects remotes named for their roles: `upstream` (what we contribute to) and `o
 
 For any “is branch/fix X in release/trunk Y?” question, agents MUST use the replay probe, not a source-text search. Text search proved wrong on a real repository: it claimed an approved but unmerged fix was carried; replay proved it absent.
 
-- For a release, run `knives release carries <revision> [--in <ref>]`. `--in` accepts any revision expression and defaults to the release in hand.
+- For a specific revision, run `knives release carries <revision>`. Bare `carries` compares it with every live release and the upstream trunk; `--in <ref>` selects exactly one explicit target. Run `knives release carries --all` to census maintained branches.
 - For the upstream trunk, read the `landed` column from `knives status`; it is the trunk replay probe’s answer.
 - Agents MUST NOT grep source text to answer either question.
 

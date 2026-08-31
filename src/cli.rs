@@ -9,6 +9,21 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
+fn disposition_token(value: &str) -> Result<String, String> {
+    (!value.is_empty()
+        && value.chars().all(|character| {
+            character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-'
+        }))
+    .then(|| value.to_owned())
+    .ok_or_else(|| "a disposition must contain lowercase letters, digits, or hyphens".to_owned())
+}
+
+fn evidence_token(value: &str) -> Result<String, String> {
+    (!value.trim().is_empty())
+        .then(|| value.to_owned())
+        .ok_or_else(|| "evidence must not be blank".to_owned())
+}
+
 /// Process exit codes, as a type so a command cannot invent one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Exit {
@@ -151,6 +166,34 @@ pub enum Command {
     },
     /// List the repos knives manages, with their release state.
     Repos,
+    /// Which consumer checkouts and locks resolve this fork at which commit,
+    /// against the newest published release. Reports; never edits a consumer.
+    Consumers {
+        /// Registry name. Defaults to the repo you are standing in.
+        fork: Option<String>,
+        /// Extra consumer checkouts beyond the registry's list.
+        #[arg(long)]
+        consumer: Vec<PathBuf>,
+    },
+    /// Reconcile local branches against the live remote refs that own them.
+    Pushed {
+        /// Branches to verify. Defaults to every local bookmark.
+        branches: Vec<String>,
+        /// Registry name. Defaults to the repo you are standing in.
+        #[arg(long)]
+        repo: Option<String>,
+    },
+    /// Reconcile remote refs, open pull heads, recorded cuts, and anonymous heads.
+    Audit {
+        /// Registry name. Defaults to the repo you are standing in.
+        repo: Option<String>,
+        /// Every managed repository.
+        #[arg(long)]
+        all: bool,
+        /// Skip the bounded live pull-request-head check.
+        #[arg(long)]
+        no_github: bool,
+    },
     /// Fetch every remote and tracked pull ref, and classify each pull request.
     Sync {
         /// Registry name. Defaults to the repo you are standing in.
@@ -290,8 +333,24 @@ pub enum Command {
         message: Option<String>,
         /// A commit id, `file:line`, `<repo>#<number>` or URL backing the note.
         /// Repeatable, and it may name another repo.
-        #[arg(long, requires = "message")]
+        #[arg(long, requires = "message", value_parser = evidence_token)]
         evidence: Vec<String>,
+        /// Record a terminal ruling with this entry: merged-elsewhere,
+        /// withdrawn, ruled-out — one lowercase token. Requires -m and at
+        /// least one --evidence, because a ruling without provenance is an
+        /// unsupported claim.
+        #[arg(long, requires = "message", requires = "evidence", value_parser = disposition_token)]
+        disposition: Option<String>,
+        /// Read only entries that carry a disposition.
+        #[arg(long, conflicts_with_all = ["message", "disposition"])]
+        dispositions: bool,
+        /// Read the full chronology, machine events included.
+        #[arg(long, conflicts_with = "message")]
+        events: bool,
+        /// Re-check selected commit evidence and anchors against the repository
+        /// as it stands. A vanished SHA is a finding.
+        #[arg(long, conflicts_with = "message")]
+        verify: bool,
         /// Read only entries stamped with this pull request number, or stamp a
         /// written entry with it.
         #[arg(long = "pr")]
@@ -426,9 +485,9 @@ pub enum ReleaseAction {
         /// The one release ref or revision to check instead of every target.
         #[arg(long = "in")]
         target: Option<String>,
-        /// Every maintained branch and anonymous head against the live releases
-        /// and the upstream trunk; superseded releases are checked for anything
-        /// those miss. The census that answers "what would deleting this lose".
+        /// Every maintained branch against the live releases and upstream trunk;
+        /// superseded releases are checked only after a complete, everywhere-not-carried
+        /// primary matrix. The census that answers "what would deleting this lose".
         #[arg(long, conflicts_with_all = ["revision", "target"])]
         all: bool,
         /// Skip pull request lookups; the orphan test then reports unknown.
@@ -553,6 +612,11 @@ mod tests {
             vec!["knives", "sync", "--all"],
             vec!["knives", "preflight"],
             vec!["knives", "status"],
+            vec!["knives", "pushed"],
+            vec!["knives", "pushed", "feat/alpha", "--repo", "demo"],
+            vec!["knives", "audit"],
+            vec!["knives", "audit", "demo", "--no-github"],
+            vec!["knives", "audit", "--all"],
             vec!["knives", "start", "a-branch"],
             vec!["knives", "finish", "a-branch"],
             vec!["knives", "release"],
@@ -588,7 +652,7 @@ mod tests {
     }
 
     #[test]
-    fn notch_allows_a_write_stamp_and_requires_a_message_for_evidence() {
+    fn notch_rejects_evidence_without_a_message_or_nonblank_content() {
         assert!(
             Cli::try_parse_from(["knives", "notch", "feat/a", "-m", "x", "--pr", "7"]).is_ok(),
             "a write with an explicit pull-request stamp did not parse"
@@ -596,6 +660,21 @@ mod tests {
         assert!(
             Cli::try_parse_from(["knives", "notch", "feat/a", "--evidence", "06d778b9"]).is_err(),
             "evidence with nothing to attach it to parsed"
+        );
+        assert!(
+            Cli::try_parse_from([
+                "knives",
+                "notch",
+                "feat/a",
+                "-m",
+                "x",
+                "--disposition",
+                "ruled-out",
+                "--evidence",
+                "   ",
+            ])
+            .is_err(),
+            "blank disposition evidence parsed"
         );
         // And: a repo-level note needs no subject, so the model's absent subject
         // is reachable.

@@ -10,11 +10,12 @@ use std::process::ExitCode;
 
 use clap::Parser as _;
 use knives::carriage::{
-    self, CarriesReport, CensusReport, CheckInput, Target, TargetCheck, TargetRole,
+    self, CarriesReport, CensusOptions, CensusReport, CheckInput, Target, TargetCheck, TargetRole,
 };
 use knives::cli::{Cli, Command, Exit, Output, ReleaseAction};
 use knives::commands::{
-    hook, init, notch, pr, preflight, register, release, repos, start, status, sync,
+    audit, consumers, hook, init, notch, pr, preflight, pushed, register, release, repos, start,
+    status, sync,
 };
 use knives::config::{default_config_path, load};
 use knives::forge::github::CliForge;
@@ -46,6 +47,23 @@ fn dispatch() -> anyhow::Result<Exit> {
         Command::Init { repo } => init::run(repo),
         Command::Register { repo } => register::run(repo),
         Command::Repos => repos::run(),
+        Command::Consumers { fork, consumer } => {
+            let Some(name) = one_repo(fork.as_deref())? else {
+                return Ok(Exit::Usage);
+            };
+            run_consumers(&name, &consumer, output)
+        }
+        Command::Pushed { branches, repo } => {
+            let Some(name) = one_repo(repo.as_deref())? else {
+                return Ok(Exit::Usage);
+            };
+            run_pushed(&name, &branches, output)
+        }
+        Command::Audit {
+            repo,
+            all,
+            no_github,
+        } => run_audit(repo.as_deref(), all, output, !no_github),
         Command::Status {
             repo,
             all,
@@ -128,6 +146,10 @@ fn dispatch() -> anyhow::Result<Exit> {
             subject,
             message,
             evidence,
+            disposition,
+            dispositions,
+            events,
+            verify,
             pr,
             repo,
         } => {
@@ -148,6 +170,10 @@ fn dispatch() -> anyhow::Result<Exit> {
                     message: message.as_deref(),
                     evidence: &evidence,
                     pr,
+                    disposition: disposition.as_deref(),
+                    dispositions,
+                    events,
+                    verify,
                 },
                 output,
             )
@@ -203,6 +229,87 @@ fn one_repo(requested: Option<&str>) -> anyhow::Result<Option<RepoName>> {
         );
         Ok(None)
     }
+}
+
+/// Census the checkouts that consume one fork's releases.
+fn run_consumers(
+    fork: &RepoName,
+    extras: &[std::path::PathBuf],
+    output: Output,
+) -> anyhow::Result<Exit> {
+    let registry = load(&default_config_path())?;
+    let Some(entry) = registry.get(fork) else {
+        let known: Vec<String> = registry.names().map(|name| name.to_string()).collect();
+        eprintln!("unknown repo {fork}; known: {}", known.join(", "));
+        return Ok(Exit::Usage);
+    };
+    let mut paths = entry.consumers.clone();
+    paths.extend(extras.iter().cloned());
+    paths.sort();
+    paths.dedup();
+    let report = consumers::gather(&consumers::Request {
+        fork,
+        entry,
+        consumers: &paths,
+    });
+    if let Some(payload) = knives::cli::machine_payload(output, &report)? {
+        println!("{payload}");
+    } else {
+        println!("{}", consumers::render(&report));
+    }
+    Ok(consumers::exit_for(&report))
+}
+
+/// Reconcile one fork's local bookmarks with the live refs on their owning remotes.
+fn run_pushed(repo: &RepoName, branches: &[String], output: Output) -> anyhow::Result<Exit> {
+    let registry = load(&default_config_path())?;
+    let Some(entry) = registry.get(repo) else {
+        let known: Vec<String> = registry.names().map(|name| name.to_string()).collect();
+        eprintln!("unknown repo {repo}; known: {}", known.join(", "));
+        return Ok(Exit::Usage);
+    };
+    let store = Store::open(default_state_path())?;
+    let report = pushed::gather(repo, entry, &store, branches);
+    if let Some(payload) = knives::cli::machine_payload(output, &report)? {
+        println!("{payload}");
+    } else {
+        println!("{}", pushed::render(&report));
+    }
+    Ok(pushed::exit_for(&report))
+}
+
+/// Reconcile every requested fork's remote refs, release records, and anonymous heads.
+fn run_audit(
+    requested: Option<&str>,
+    all: bool,
+    output: Output,
+    use_forge: bool,
+) -> anyhow::Result<Exit> {
+    let chosen = match selected(requested, all)? {
+        Ok(chosen) => chosen,
+        Err(exit) => return Ok(exit),
+    };
+    let store = Store::open(default_state_path())?;
+    let cli_forge = CliForge;
+    let forge = use_forge.then_some(&cli_forge as &dyn Forge);
+    let cache_root = knives::forge_cache::cache_root();
+    let mut worst = Exit::Ok;
+    for (repo, entry) in chosen {
+        let report = audit::gather(&audit::AuditInput {
+            repo: &repo,
+            entry: &entry,
+            store: &store,
+            forge,
+            cache_root: cache_root.as_deref(),
+        });
+        if let Some(payload) = knives::cli::machine_payload(output, &report)? {
+            println!("{payload}");
+        } else {
+            println!("{}", audit::render(&report));
+        }
+        worst = worst.worst(audit::exit_for(&report));
+    }
+    Ok(worst)
 }
 
 /// Plan, curate or cut a release.
@@ -302,16 +409,15 @@ fn run_release_members(
     request: MembersInvocation<'_>,
 ) -> anyhow::Result<Exit> {
     let opened = Repo::open(&entry.path)?;
-    let reference = match request.reference {
-        Some(reference) => std::borrow::Cow::Borrowed(reference),
-        None => {
-            let plan = release::plan(repo, entry, &entry.consumers)?;
-            let Some(reference) = plan.release else {
-                println!("{repo}: no release to inspect; cut one first");
-                return Ok(Exit::Incomplete);
-            };
-            std::borrow::Cow::Owned(reference)
-        }
+    let reference = if let Some(reference) = request.reference {
+        std::borrow::Cow::Borrowed(reference)
+    } else {
+        let plan = release::plan(repo, entry, &entry.consumers)?;
+        let Some(reference) = plan.release else {
+            println!("{repo}: no release to inspect; cut one first");
+            return Ok(Exit::Incomplete);
+        };
+        std::borrow::Cow::Owned(reference)
     };
     let report = release::gather_members(&opened, entry, &reference, request.verify)?;
     let exit = members_exit(&report, request.verify);
@@ -323,9 +429,10 @@ fn members_exit(report: &release::MembersReport, verify: bool) -> Exit {
     if !report.problems.is_empty() {
         Exit::Incomplete
     } else if verify
-        && report.audit.as_ref().is_some_and(|audit| {
-            !audit.missing.is_empty() || !audit.unexplained.is_empty()
-        })
+        && report
+            .audit
+            .as_ref()
+            .is_some_and(|audit| !audit.missing.is_empty() || !audit.unexplained.is_empty())
     {
         Exit::Findings
     } else {
@@ -342,7 +449,7 @@ fn print_members(report: &release::MembersReport, output: Output) -> anyhow::Res
     Ok(())
 }
 
-/// Answer one revision's carriage, or census every branch and anonymous head.
+/// Answer one revision's carriage, or census every maintained branch.
 fn run_release_carries(
     repo: &RepoName,
     entry: &knives::config::RepoEntry,
@@ -352,7 +459,15 @@ fn run_release_carries(
         let forge = CliForge;
         let forge: Option<&dyn Forge> = (!request.no_github).then_some(&forge);
         let cache_root = knives::forge_cache::cache_root();
-        let report = carriage::census(repo, entry, forge, cache_root.as_deref())?;
+        let report = carriage::census(
+            repo,
+            entry,
+            forge,
+            CensusOptions {
+                cache_root: cache_root.as_deref(),
+                workers: parallelism(),
+            },
+        )?;
         let exit = census_exit(&report);
         print_census(&report, request.output)?;
         return Ok(exit);
@@ -406,15 +521,13 @@ fn run_release_carries(
             .into_iter()
             .partition(|target| target.role != TargetRole::SupersededRelease),
     };
-    if let (Some(requested), Some(selected_target)) =
-        (request.target, selected.first_mut())
+    if let (Some(requested), Some(selected_target)) = (request.target, selected.first_mut())
         && requested == trunk_name
     {
         selected_target.role = TargetRole::UpstreamTrunk;
     }
     let checks = CarriesChecks {
         input: CheckInput {
-            repo_path: &entry.path,
             repo: &opened,
             revision,
             tip: &tip,
@@ -522,7 +635,7 @@ fn print_carries(report: &CarriesReport, output: Output) -> anyhow::Result<()> {
 }
 
 fn census_exit(report: &CensusReport) -> Exit {
-    if !report.problems.is_empty() {
+    if !report.problems.is_empty() || report.rows.iter().any(|row| row.in_open_pull.is_none()) {
         Exit::Incomplete
     } else if report.orphans.is_empty() {
         Exit::Ok
@@ -2770,6 +2883,7 @@ fn record_cut_event(
     scribe_for(repo, entry)?.record(&Draft {
         subject: Some(cut.name),
         kind: Kind::Event,
+        disposition: None,
         text: format!(
             "cut {} as {} with {} parent(s): {members_text}{delta}",
             cut.name,
