@@ -417,14 +417,23 @@ pub enum ReleaseAction {
     /// The rigorous answer to "is this fix safe to delete": compare the
     /// revision's net content with each target. Matching content is carried; a
     /// remaining diff is not carried; grep answers a different question. Bare
-    /// form checks every release ref and the upstream trunk. `--in` checks one
-    /// arbitrary revset instead.
+    /// form checks live releases and the upstream trunk before consulting
+    /// superseded releases. `--in` checks one arbitrary revset instead.
     Carries {
         /// A branch name, or any revision when no bookmark fits.
-        revision: String,
+        #[arg(required_unless_present = "all")]
+        revision: Option<String>,
         /// The one release ref or revision to check instead of every target.
         #[arg(long = "in")]
         target: Option<String>,
+        /// Every maintained branch and anonymous head against the live releases
+        /// and the upstream trunk; superseded releases are checked for anything
+        /// those miss. The census that answers "what would deleting this lose".
+        #[arg(long, conflicts_with_all = ["revision", "target"])]
+        all: bool,
+        /// Skip pull request lookups; the orphan test then reports unknown.
+        #[arg(long, requires = "all")]
+        no_github: bool,
     },
     /// Reap superseded dated cuts: forget their bookmarks everywhere, abandon their commits.
     /// The remote is never touched.

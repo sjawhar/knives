@@ -8696,6 +8696,312 @@ fn carries_superseded_only_carriage_is_findings() {
     );
 }
 
+/// A release history with one live and one superseded cut, plus one branch
+/// deliberately absent from both. The historical cut remains only as an origin
+/// ref, so it is a census target without becoming a maintained branch itself.
+fn census_lab() -> (Lab, tempfile::TempDir) {
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let (home, _consumer) = release_test_home(&lab);
+    let first = knives_release(&lab, &home, &["cut", "release/2026-08-04"]);
+    assert!(first.status.success(), "{first:?}");
+    let historical = commit_at(&lab, "release/2026-08-04");
+    lab.jj_work([
+        "bookmark",
+        "create",
+        "history/alpha-release",
+        "-r",
+        historical.as_str(),
+    ]);
+    lab.push_branch("history/alpha-release");
+    let second = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
+    assert!(second.status.success(), "{second:?}");
+    publish_remote_bookmark(
+        &lab,
+        "history/alpha-release@origin",
+        "release/2026-08-04",
+    );
+    lab.jj_work(["bookmark", "forget", "history/alpha-release"]);
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    (lab, home)
+}
+
+fn census_block<'a>(stdout: &'a str, branch: &str) -> &'a str {
+    let wanted = format!("  {branch} @");
+    stdout
+        .split("\n\n")
+        .find(|block| block.starts_with(&wanted))
+        .unwrap_or_else(|| panic!("no census block for {branch}: {stdout}"))
+}
+
+#[test]
+fn census_finds_the_orphan_branch() {
+    // Given: alpha is in the live cut and beta is independent; the preceding
+    // dated cut survives only as a superseded origin target.
+    let (lab, home) = census_lab();
+
+    // When: census asks only local carriage questions, so PR state is explicitly unknown.
+    let output = knives_release(&lab, &home, &["carries", "--all", "--no-github"]);
+
+    // Then: a carried member names its live carrier but does not spend a
+    // superseded probe, while a non-carried member proves the negative against
+    // every target, including the historical release.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert!(
+        !stdout
+            .split("\n\n")
+            .any(|block| block.starts_with("  main @")),
+        "the upstream trunk is a target, never a maintained-branch row: {stdout}"
+    );
+    let alpha = census_block(&stdout, "feat/alpha");
+    assert!(
+        alpha.contains("carried-exact      release/2026-08-05"),
+        "{alpha}"
+    );
+    assert!(
+        !alpha.contains("release/2026-08-04"),
+        "a live-carried row must not probe superseded targets: {alpha}"
+    );
+    let beta = census_block(&stdout, "feat/beta");
+    for target in [
+        "release/2026-08-05",
+        "main@upstream",
+        "release/2026-08-04@origin",
+    ] {
+        assert!(
+            beta.contains(&format!("NOT carried        {target}")),
+            "beta must be checked against {target}: {beta}"
+        );
+    }
+    assert!(
+        stdout.contains(
+            "orphans: not carried anywhere (pull request state unknown)\n  feat/beta"
+        ),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn census_marks_unknown_pull_orphans_as_unanswered_in_json() {
+    // Given: beta is locally uncarried and pull-request lookup is deliberately skipped.
+    let (lab, home) = census_lab();
+
+    // When: the census is emitted as its machine report.
+    let output = knives_release_json(&lab, &home, &["carries", "--all", "--no-github"]);
+
+    // Then: the qualified text listing remains actionable, but JSON cannot
+    // represent beta as a pull-safe, proven orphan.
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("parse census JSON");
+    let beta = report["rows"]
+        .as_array()
+        .expect("branch rows")
+        .iter()
+        .find(|row| row["branch"] == "feat/beta")
+        .expect("beta row");
+    assert!(beta["orphan"].is_null(), "{report}");
+    assert!(
+        report["orphans"]
+            .as_array()
+            .expect("qualified orphan listing")
+            .iter()
+            .any(|orphan| orphan == "feat/beta"),
+        "{report}"
+    );
+    assert_eq!(output.status.code(), Some(1), "{report}");
+}
+
+#[test]
+fn census_respects_an_open_pull() {
+    // Given: beta's content remains outside every release but the forge says its
+    // branch has an open pull request.
+    let (lab, home) = census_lab();
+    let pulls = format!("[{}]", pull_record(17, "OPEN", "feat/beta", None));
+
+    // When: the real CLI completes one forge snapshot for the census.
+    let output = knives_release_json_with_forge(
+        &lab,
+        &home,
+        &pulls,
+        &["carries", "--all"],
+    );
+
+    // Then: the branch association is retained in the report and forbids an
+    // orphan result despite every target being non-carried.
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("parse census JSON");
+    let beta = report["rows"]
+        .as_array()
+        .expect("branch rows")
+        .iter()
+        .find(|row| row["branch"] == "feat/beta")
+        .expect("beta row");
+    assert_eq!(beta["in_open_pull"], true, "{report}");
+    assert_eq!(beta["orphan"], false, "{report}");
+    let alpha = report["rows"]
+        .as_array()
+        .expect("branch rows")
+        .iter()
+        .find(|row| row["branch"] == "feat/alpha")
+        .expect("alpha row");
+    assert_eq!(
+        alpha["in_open_pull"], false,
+        "a completed snapshot answers that an absent branch has no open pull: {report}"
+    );
+    assert_eq!(output.status.code(), Some(0), "{report}");
+}
+
+#[test]
+fn census_keeps_local_orphans_when_the_forge_is_unavailable() {
+    // Given: beta is locally uncarried and the forge refuses every request.
+    let (lab, home) = census_lab();
+
+    // When: census attempts the normal forge snapshot.
+    let output = knives_release_with_failing_forge(&lab, &home, &["carries", "--all"]);
+
+    // Then: failure changes pull-request knowledge to unknown without hiding
+    // the local orphan finding or converting it into an incomplete result.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert!(
+        stdout.contains("pull request state unavailable:"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "orphans: not carried anywhere (pull request state unknown)\n  feat/beta"
+        ),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn census_grades_anonymous_heads() {
+    // Given: an unbookmarked commit with unique content, disconnected from the
+    // working copy before the census reads anonymous heads.
+    let (lab, home) = census_lab();
+    lab.jj_work(["new", "main@upstream", "-m", "stranded"]);
+    std::fs::write(lab.work.join("stranded.txt"), "stranded\n").expect("write stranded content");
+    lab.jj_work(["new", "main@upstream"]);
+    let initial = knives_release_json(&lab, &home, &["carries", "--all", "--no-github"]);
+    assert_eq!(initial.status.code(), Some(1), "{initial:?}");
+    let initial_report: serde_json::Value =
+        serde_json::from_slice(&initial.stdout).expect("parse initial census JSON");
+    let initial_anonymous = initial_report["anonymous"].as_array().expect("anonymous rows");
+    assert_eq!(initial_anonymous.len(), 1, "{initial_report}");
+    assert!(initial_anonymous[0]["orphan"].is_null(), "{initial_report}");
+    let stranded = initial_anonymous[0]["branch"]
+        .as_str()
+        .expect("anonymous commit id")
+        .to_owned();
+    assert!(
+        initial_report["orphans"]
+            .as_array()
+            .expect("qualified orphan listing")
+            .iter()
+            .any(|orphan| orphan == &stranded),
+        "{initial_report}"
+    );
+    let pulls = format!(
+        "[{}]",
+        pull_record_with_fields(
+            23,
+            "OPEN",
+            "an-unrelated-head-name",
+            &format!(",\"headRefOid\":\"{stranded}\""),
+        )
+    );
+
+    // When: the forge's open pull names the anonymous commit by oid, not by its
+    // unrelated head branch name.
+    let output = knives_release_json_with_forge(
+        &lab,
+        &home,
+        &pulls,
+        &["carries", "--all"],
+    );
+
+    // Then: the anonymous population receives the primary matrix and its
+    // superseded escalation, and oid association keeps it from being orphaned.
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("parse census JSON");
+    let anonymous = report["anonymous"]
+        .as_array()
+        .expect("anonymous rows")
+        .iter()
+        .find(|row| row["branch"] == stranded.as_str())
+        .unwrap_or_else(|| panic!("stranded anonymous head {stranded} missing from {report}"));
+    assert_eq!(anonymous["in_open_pull"], true, "{report}");
+    assert_eq!(anonymous["orphan"], false, "{report}");
+    let checks = anonymous["checks"].as_array().expect("anonymous checks");
+    for role in ["live-release", "upstream-trunk", "superseded-release"] {
+        assert!(
+            checks.iter().any(|check| check["role"] == role),
+            "anonymous head lacks {role}: {checks:?}"
+        );
+    }
+}
+
+/// Run census without a forge so its locally discovered anonymous id can be
+/// supplied as a pull request's exact head oid on a subsequent run.
+fn knives_release_json(
+    lab: &Lab,
+    home: &tempfile::TempDir,
+    args: &[&str],
+) -> std::process::Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_knives"));
+    command.args(["--json", "release", "--repo", "demo"]);
+    command.args(args);
+    command
+        .current_dir(&lab.work)
+        .env("KNIVES_CONFIG_HOME", home.path())
+        .output()
+        .expect("run knives release census")
+}
+
+/// Run census with the full snapshot forge protocol and ask the CLI for JSON so
+/// tests assert the report's machine contract rather than parsing prose.
+fn knives_release_json_with_forge(
+    lab: &Lab,
+    home: &tempfile::TempDir,
+    pulls: &str,
+    args: &[&str],
+) -> std::process::Output {
+    let shim = tempfile::tempdir().expect("create forge shim directory");
+    install_snapshot_gh(shim.path(), pulls, &[], None);
+    let mut command = Command::new(env!("CARGO_BIN_EXE_knives"));
+    command.args(["--json", "release", "--repo", "demo"]);
+    command.args(args);
+    command
+        .current_dir(&lab.work)
+        .env("KNIVES_CONFIG_HOME", home.path())
+        .env("XDG_CACHE_HOME", shim.path().join("cache"))
+        .env("PATH", path_with_gh_shim(shim.path()))
+        .output()
+        .expect("run knives release census with a forge shim")
+}
+
+/// Run census with a forge that fails before returning any data.
+fn knives_release_with_failing_forge(
+    lab: &Lab,
+    home: &tempfile::TempDir,
+    args: &[&str],
+) -> std::process::Output {
+    let shim = tempfile::tempdir().expect("create forge shim directory");
+    install_failing_gh(shim.path(), &shim.path().join("calls.log"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_knives"));
+    command.args(["--text", "release", "--repo", "demo"]);
+    command.args(args);
+    command
+        .current_dir(&lab.work)
+        .env("KNIVES_CONFIG_HOME", home.path())
+        .env("XDG_CACHE_HOME", shim.path().join("cache"))
+        .env("PATH", path_with_gh_shim(shim.path()))
+        .output()
+        .expect("run knives release census with a failing forge")
+}
+
 fn knives_pr_with_shim(
     number: u64,
     timeline: bool,

@@ -9,7 +9,9 @@
 use std::process::ExitCode;
 
 use clap::Parser as _;
-use knives::carriage::{self, CarriesReport, CheckInput, Target, TargetCheck, TargetRole};
+use knives::carriage::{
+    self, CarriesReport, CensusReport, CheckInput, Target, TargetCheck, TargetRole,
+};
 use knives::cli::{Cli, Command, Exit, Output, ReleaseAction};
 use knives::commands::{
     hook, init, notch, pr, preflight, register, release, repos, start, status, sync,
@@ -226,7 +228,12 @@ fn dispatch_release(
                 cache_root.as_deref(),
             )
         }
-        Some(ReleaseAction::Carries { revision, target }) => {
+        Some(ReleaseAction::Carries {
+            revision,
+            target,
+            all,
+            no_github,
+        }) => {
             let registry = load(&default_config_path())?;
             let Some(entry) = registry.get(chosen) else {
                 return Ok(Exit::Usage);
@@ -235,8 +242,10 @@ fn dispatch_release(
                 chosen,
                 entry,
                 CarriesInvocation {
-                    revision: &revision,
+                    revision: revision.as_deref(),
                     target: target.as_deref(),
+                    all,
+                    no_github,
                     output,
                 },
             )
@@ -257,25 +266,39 @@ fn dispatch_release(
 
 #[derive(Clone, Copy)]
 struct CarriesInvocation<'a> {
-    revision: &'a str,
+    revision: Option<&'a str>,
     target: Option<&'a str>,
+    all: bool,
+    no_github: bool,
     output: Output,
 }
 
-/// Answer whether a revision is carried by a live release or the upstream trunk.
+/// Answer one revision's carriage, or census every branch and anonymous head.
 fn run_release_carries(
     repo: &RepoName,
     entry: &knives::config::RepoEntry,
     request: CarriesInvocation<'_>,
 ) -> anyhow::Result<Exit> {
+    if request.all {
+        let forge = CliForge;
+        let forge: Option<&dyn Forge> = (!request.no_github).then_some(&forge);
+        let cache_root = knives::forge_cache::cache_root();
+        let report = carriage::census(repo, entry, forge, cache_root.as_deref())?;
+        let exit = census_exit(&report);
+        print_census(&report, request.output)?;
+        return Ok(exit);
+    }
+    let Some(revision) = request.revision else {
+        return Ok(Exit::Usage);
+    };
     let opened = Repo::open(&entry.path)?;
-    let tip = match opened.resolve_commit(request.revision) {
+    let tip = match opened.resolve_commit(revision) {
         Ok(tip) => tip,
         Err(error) => {
             let report = carries_problem(
                 repo,
-                request.revision.to_owned(),
-                format!("cannot resolve revision {}: {error}", request.revision),
+                revision.to_owned(),
+                format!("cannot resolve revision {revision}: {error}"),
             );
             print_carries(&report, request.output)?;
             return Ok(Exit::Incomplete);
@@ -287,7 +310,7 @@ fn run_release_carries(
         Err(error) => {
             let report = carries_problem(
                 repo,
-                carries_revision(request.revision, &tip),
+                carries_revision(revision, &tip),
                 format!("cannot resolve upstream trunk {trunk_name}: {error}"),
             );
             print_carries(&report, request.output)?;
@@ -303,7 +326,7 @@ fn run_release_carries(
             Err(error) => {
                 let report = carries_problem(
                     repo,
-                    carries_revision(request.revision, &tip),
+                    carries_revision(revision, &tip),
                     format!("cannot resolve target {target}: {error}"),
                 );
                 print_carries(&report, request.output)?;
@@ -324,14 +347,14 @@ fn run_release_carries(
         input: CheckInput {
             repo_path: &entry.path,
             repo: &opened,
-            revision: request.revision,
+            revision,
             tip: &tip,
         },
         fallback: request.target.unwrap_or(trunk_name.as_str()),
     };
     let mut report = CarriesReport {
         repo: repo.to_string(),
-        revision: carries_revision(request.revision, &tip),
+        revision: carries_revision(revision, &tip),
         checks: Vec::with_capacity(selected.len() + superseded.len()),
         notes: Vec::new(),
         problems: Vec::new(),
@@ -359,7 +382,7 @@ struct CarriesChecks<'a> {
 impl CarriesChecks<'_> {
     fn append(&self, report: &mut CarriesReport, targets: Vec<Target>) {
         for target in targets {
-            let target_name = carries_target_name(&target, self.fallback);
+            let target_name = carriage::target_name(&target, self.fallback);
             match carriage::check(&self.input, &target) {
                 Ok(check) => report.checks.push(TargetCheck {
                     target: target_name,
@@ -413,20 +436,6 @@ fn selected_carries_targets(
     }])
 }
 
-fn carries_target_name(target: &Target, fallback: &str) -> String {
-    let name = target
-        .refs
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join("/");
-    if name.is_empty() {
-        fallback.to_owned()
-    } else {
-        name
-    }
-}
-
 fn carries_revision(revision: &str, tip: &knives::ids::CommitId) -> String {
     format!(
         "{revision} @ {}",
@@ -439,6 +448,25 @@ fn print_carries(report: &CarriesReport, output: Output) -> anyhow::Result<()> {
         println!("{payload}");
     } else {
         println!("{}", carriage::render_carries(report));
+    }
+    Ok(())
+}
+
+fn census_exit(report: &CensusReport) -> Exit {
+    if !report.problems.is_empty() {
+        Exit::Incomplete
+    } else if report.orphans.is_empty() {
+        Exit::Ok
+    } else {
+        Exit::Findings
+    }
+}
+
+fn print_census(report: &CensusReport, output: Output) -> anyhow::Result<()> {
+    if let Some(payload) = knives::cli::machine_payload(output, report)? {
+        println!("{payload}");
+    } else {
+        println!("{}", carriage::render_census(report));
     }
     Ok(())
 }
