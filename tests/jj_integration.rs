@@ -52,6 +52,24 @@ fn lab_entry(lab: &lab::Lab) -> RepoEntry {
     }
 }
 
+/// Repeated status runs carry their measured forge duration in the headline.
+/// Compare the reported facts while retaining the distinct `forge` state token.
+fn without_forge_elapsed(text: &str) -> String {
+    text.lines()
+        .map(|line| {
+            if line.contains("  forge ") {
+                let (headline, _) = line
+                    .rsplit_once(" (")
+                    .expect("a status headline ends with elapsed milliseconds");
+                format!("{headline} (elapsed)")
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[test]
 fn one_batch_answers_review_age_and_checks_for_every_branch_at_once() {
     // Given: two branches with open pull requests, one stale-reviewed and red, one
@@ -126,22 +144,33 @@ fn one_batch_answers_review_age_and_checks_for_every_branch_at_once() {
             .unwrap_or_else(|| panic!("no row for {name}: {report:?}"))
             .clone()
     };
-    assert_eq!(row("feat/alpha").review_stale, Some(true));
+    let alpha = row("feat/alpha");
+    assert_eq!(alpha.state, status::BranchState::ChecksFailing);
+    assert_eq!(alpha.review.as_deref(), Some("changes-requested"));
+    assert_eq!(alpha.checks.as_deref(), Some("failing"));
     assert!(
-        row("feat/alpha")
-            .checks
-            .as_ref()
-            .is_some_and(ChecksSummary::failing)
+        alpha.flags.iter().any(|flag| flag == "review-stale"),
+        "was: {alpha:?}"
     );
-    assert_eq!(row("feat/beta").review_stale, Some(false));
+
+    let beta = row("feat/beta");
+    assert_eq!(beta.state, status::BranchState::Approved);
+    assert_eq!(beta.review.as_deref(), Some("approved"));
     assert_eq!(
-        row("feat/beta").checks,
-        Some(ChecksSummary::default()),
+        beta.checks.as_deref(),
+        Some("none-ran"),
         "consulted with nothing running is not the same as unconsulted"
     );
+    assert!(
+        !beta.flags.iter().any(|flag| flag == "review-stale"),
+        "was: {beta:?}"
+    );
+
     // And: a settled pull request is neither asked about nor reported on
-    assert_eq!(row("feat/gamma").review_stale, None);
-    assert_eq!(row("feat/gamma").checks, None);
+    let gamma = row("feat/gamma");
+    assert_eq!(gamma.state, status::BranchState::Closed);
+    assert_eq!(gamma.review, None);
+    assert_eq!(gamma.checks, None);
     assert!(report.problems.is_empty(), "was: {report:?}");
 }
 
@@ -170,10 +199,11 @@ fn a_measured_gather_reports_the_same_report_and_a_total_that_covers_its_phases(
     let (measured, timings) =
         status::gather_timed(&name, &entry, &store, &options()).expect("gather_timed");
 
-    // Then: the report is the same one, and the total covers the phases it timed
+    // Then: the report's facts are unchanged; its measured forge duration is
+    // specific to each run, and the total covers the phases it timed.
     assert_eq!(
-        status::render::render(&plain, true),
-        status::render::render(&measured, true),
+        without_forge_elapsed(&status::render::render(&plain, true)),
+        without_forge_elapsed(&status::render::render(&measured, true)),
         "measuring changed the report"
     );
     assert!(
@@ -397,7 +427,7 @@ fn a_failed_facts_batch_clears_review_and_check_cells() {
     )
     .expect("gather");
 
-    assert!(!report.forge_consulted, "was: {report:?}");
+    assert!(!report.forge.consulted, "was: {report:?}");
     assert!(
         report
             .problems
@@ -407,13 +437,18 @@ fn a_failed_facts_batch_clears_review_and_check_cells() {
     );
     assert_eq!(status::exit_for(&report), knives::cli::Exit::Incomplete);
     let row = &report.branches[0];
-    assert_eq!(row.pull_request, None, "no live-looking pull request cell");
-    assert_eq!(row.review_stale, None, "a refused answer is not current");
+    assert_eq!(row.state, status::BranchState::Unknown);
+    assert!(row.pr.is_none(), "no live-looking pull request cell");
+    assert_eq!(row.review, None, "a refused answer is not current");
     assert_eq!(row.checks, None, "a refused answer is not no checks");
+    assert!(
+        !row.flags.iter().any(|flag| flag == "review-stale"),
+        "a refused answer is not a stale review: {row:?}"
+    );
 }
 
 #[test]
-fn a_consulted_false_report_carries_zero_pull_facts() {
+fn a_consulted_false_report_carries_an_unanswered_stated_pull() {
     let lab = lab::Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     let name = knives::ids::RepoName::new("demo");
@@ -445,19 +480,18 @@ fn a_consulted_false_report_carries_zero_pull_facts() {
     )
     .expect("gather");
 
-    assert!(!report.forge_consulted, "was: {report:?}");
-    assert!(
-        report.branches.iter().all(|row| row.pull_request.is_none()),
-        "a failed facts batch leaked a pull fact: {report:?}"
-    );
+    assert!(!report.forge.consulted, "was: {report:?}");
+    let row = &report.branches[0];
+    assert_eq!(row.state, status::BranchState::Unknown);
     assert_eq!(
-        report.branches[0]
-            .stated_pull
+        row.pr
             .as_ref()
-            .map(|pull| (pull.number, pull.state.as_str())),
-        Some((42, "unknown")),
-        "the stated pull escaped the failed batch: {report:?}"
+            .map(|pull| (pull.number, pull.state.as_str(), pull.stated)),
+        Some((42, "unknown", Some(true))),
+        "the failed facts batch must not turn the stated pull into a live fact: {report:?}"
     );
+    assert_eq!(row.review, None, "a failed facts batch has no review fact");
+    assert_eq!(row.checks, None, "a failed facts batch has no check fact");
     assert!(!report.problems.is_empty(), "was: {report:?}");
 }
 
@@ -505,12 +539,21 @@ fn stated_pulls_and_dependencies_are_answered_from_the_one_batch() {
     )
     .expect("gather");
 
+    let pull = report.branches[0]
+        .pr
+        .as_ref()
+        .expect("an inferred pull request");
     assert_eq!(
-        report.branches[0]
-            .stated_pull
-            .as_ref()
-            .map(|pull| (pull.number, pull.state.as_str())),
-        Some((42, "CLOSED")),
+        (pull.number, pull.state.as_str(), pull.stated),
+        (11, "open", None),
+        "the inferred pull is the primary cell: {report:?}"
+    );
+    assert_eq!(
+        pull.prior
+            .iter()
+            .map(|prior| (prior.number, prior.state.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(42, "closed")],
         "the stated number did not come from the snapshot: {report:?}"
     );
     assert!(
@@ -519,7 +562,7 @@ fn stated_pulls_and_dependencies_are_answered_from_the_one_batch() {
     );
     assert!(report.problems.is_empty(), "was: {report:?}");
     assert!(
-        status::render::render(&report, true).contains("#42 closed (stated)"),
+        status::render::render(&report, true).contains("#11 prior #42 closed"),
         "the stated batch answer did not render: {report:?}"
     );
 }
@@ -5624,10 +5667,11 @@ fn parallel_landed_probes_answer_exactly_what_serial_ones_did() {
     let serial = status::gather(&name, &entry, &store, &options(1)).expect("serial gather");
     let parallel = status::gather(&name, &entry, &store, &options(8)).expect("parallel gather");
 
-    // Then: not one token differs, including the landed column
+    // Then: apart from each run's elapsed forge duration, not one report token
+    // differs, including the landed column.
     assert_eq!(
-        status::render::render(&serial, true),
-        status::render::render(&parallel, true),
+        without_forge_elapsed(&status::render::render(&serial, true)),
+        without_forge_elapsed(&status::render::render(&parallel, true)),
         "parallelism changed the report"
     );
     assert_eq!(status::exit_for(&serial), status::exit_for(&parallel));
@@ -5724,8 +5768,8 @@ fn status_all_reports_every_repo_in_registry_order() {
             .to_owned()
     };
     assert_eq!(
-        text.trim_end(),
-        format!("{}\n\n{}", alone("aardvark"), alone("zebra")),
+        without_forge_elapsed(text.trim_end()),
+        without_forge_elapsed(&format!("{}\n\n{}", alone("aardvark"), alone("zebra"))),
         "--all is not each repo's own report in registry order"
     );
 }
@@ -5977,17 +6021,14 @@ fn status_reports_branch_overlap_after_upstream_advances_without_landed_probe() 
     )
     .expect("gather");
 
-    // Then: the independent path comparison still reports the shared file
+    // Then: the independent path comparison still reports the shared file.
     let overlap = report
         .findings
         .iter()
-        .find(|finding| {
-            finding.kind == knives::detect::FindingKind::BranchOverlap
-                && finding.subject == knives::detect::Subject::File("shared.txt".to_owned())
-        })
+        .find(|finding| finding.kind == knives::detect::FindingKind::BranchOverlap)
         .expect("the shared file is reported even without the landed probe");
-    assert!(overlap.detail.contains("feat/alpha"), "was: {overlap:?}");
-    assert!(overlap.detail.contains("feat/beta"), "was: {overlap:?}");
+    assert_eq!(overlap.count, 1, "was: {overlap:?}");
+    assert_eq!(overlap.subjects, vec!["shared.txt".to_owned()]);
 }
 
 #[test]
@@ -6028,11 +6069,11 @@ fn status_reports_a_branch_carried_elsewhere() {
     )
     .expect("gather");
 
-    // Then: the branch fact names the reference that reaches its tip
+    // Then: the grouped finding preserves the branch carrying the local ancestry fact.
     assert!(report.findings.iter().any(|finding| {
         finding.kind == knives::detect::FindingKind::CarriedElsewhere
-            && finding.subject == knives::detect::Subject::Branch(BranchName::new("feat/alpha"))
-            && finding.detail.contains("theirs/rework")
+            && finding.count >= 1
+            && finding.subjects.iter().any(|subject| subject == "feat/alpha")
     }));
 }
 
@@ -6082,11 +6123,11 @@ fn status_reports_a_carrier_for_a_closed_pull_request() {
     )
     .expect("gather");
 
-    // Then: forge state does not suppress the local ancestry fact
+    // Then: forge state does not suppress the local ancestry finding group.
     assert!(report.findings.iter().any(|finding| {
         finding.kind == knives::detect::FindingKind::CarriedElsewhere
-            && finding.subject == knives::detect::Subject::Branch(BranchName::new("feat/alpha"))
-            && finding.detail.contains("theirs/rework")
+            && finding.count >= 1
+            && finding.subjects.iter().any(|subject| subject == "feat/alpha")
     }));
 }
 
@@ -6136,10 +6177,10 @@ fn status_does_not_report_trunk_as_a_carrier_without_landed_probe() {
     )
     .expect("gather");
 
-    // Then: trunk is never a carrier finding, even without an InTrunk verdict
+    // Then: trunk is never a carrier finding, even without an InTrunk verdict.
     assert!(!report.findings.iter().any(|finding| {
         finding.kind == knives::detect::FindingKind::CarriedElsewhere
-            && finding.subject == knives::detect::Subject::Branch(BranchName::new("feat/alpha"))
+            && finding.subjects.iter().any(|subject| subject == "feat/alpha")
     }));
 }
 
@@ -6217,7 +6258,7 @@ fn status_carries_each_branchs_newest_notch_in_json_and_in_text() {
         .iter()
         .find(|row| row.name.as_str() == "feat/alpha")
         .expect("the branch has a row");
-    let last = alpha.last_notch.as_ref().expect("a breadcrumb");
+    let last = alpha.notch.as_ref().expect("a breadcrumb");
     assert_eq!(last.text, "human conclusion");
     assert_eq!(last.kind, knives::ledger::Kind::Note);
     assert_eq!(last.count, 2);
@@ -6229,16 +6270,16 @@ fn status_carries_each_branchs_newest_notch_in_json_and_in_text() {
         .iter()
         .find(|row| row["name"] == "feat/alpha")
         .expect("row");
-    assert_eq!(row["last_notch"]["kind"], "note");
-    assert_eq!(row["last_notch"]["text"], "human conclusion");
-    assert_eq!(row["last_notch"]["count"], 2);
-    assert!(row["last_notch"]["ts"].is_string());
+    assert_eq!(row["notch"]["kind"], "note");
+    assert_eq!(row["notch"]["text"], "human conclusion");
+    assert_eq!(row["notch"]["count"], 2);
+    assert!(row["notch"]["ts"].is_string());
     let beta = rows
         .iter()
         .find(|row| row["name"] == "feat/beta")
         .expect("branch without a notch");
     assert!(
-        beta.get("last_notch").is_none(),
+        beta.get("notch").is_none(),
         "no notch is absent, not null: {beta}"
     );
 
