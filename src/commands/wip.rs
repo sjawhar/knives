@@ -6,10 +6,12 @@
 use std::collections::BTreeMap;
 
 use crate::cli::Exit;
+use crate::commands::claim::render_claim_line;
 use crate::config::Registry;
 use crate::detect::{Finding, FindingKind, Subject, double_checkout};
 use crate::ids::{ChangeId, RepoName, WorkspaceName};
-use crate::jj::{Repo, changed_files};
+use crate::jj::{Repo, WorkspaceActivity, changed_files};
+use crate::seen;
 use crate::store::{Claim, Store};
 
 /// Two active claims touching one file.
@@ -102,18 +104,22 @@ pub fn render(report: &Report) -> String {
         .map(|problem| format!("!! {problem}"))
         .chain(report.notes.iter().map(|note| format!("! {note}")))
         .collect();
+    let observations = seen::load();
+    let now = jiff::Timestamp::now();
+    let activity = WorkspaceActivity {
+        moves: BTreeMap::new(),
+        horizon: Some(now),
+    };
     if report.claims.is_empty() {
         lines.push("no active claims".to_owned());
     } else {
         lines.push(format!("{} active claim(s)", report.claims.len()));
         for claim in &report.claims {
+            let last_seen = seen::last_seen(claim, &activity, &observations);
             lines.push(format!(
-                "  {}  {}  since {}",
-                claim.key(),
-                claim.owner,
-                claim.started
+                "  {}",
+                render_claim_line(&claim.key(), claim, last_seen, now)
             ));
-            lines.push(format!("    {}", claim.why));
         }
     }
     for (repo, rows) in &report.workspaces {
@@ -156,6 +162,8 @@ mod tests {
         reason = "indexing a result in a test is the assertion; a panic is the failure"
     )]
     use super::*;
+    use crate::store::OwnerKind;
+
 
     fn touching(pairs: &[(&str, &[&str])]) -> BTreeMap<String, Vec<String>> {
         pairs
@@ -188,5 +196,59 @@ mod tests {
         // `knives start` flattens slashes, so the mapping needs no storage.
         assert_eq!(workspace_for("feat/alpha"), "feat-alpha");
         assert_eq!(workspace_for("feat/a/b"), "feat-a-b");
+    }
+
+    #[test]
+    fn rendered_claims_carry_owner_kind_age_and_last_seen() {
+        // A wip row must carry the same ownership provenance as a hook notice,
+        // rather than making a reader infer it from a bare timestamp.
+        let report = Report {
+            claims: vec![Claim {
+                repo: "test-wip".to_owned(),
+                branch: "feat/x".to_owned(),
+                owner: "wip-render-test-owner".to_owned(),
+                kind: OwnerKind::HarnessSession,
+                why: "porting".to_owned(),
+                started: "2020-01-01T00:00:00Z".to_owned(),
+                files: Vec::new(),
+            }],
+            ..Report::default()
+        };
+
+        let text = render(&report);
+
+        assert!(text.contains("harness-session"), "text: {text}");
+        assert!(text.contains("claimed"), "text: {text}");
+        assert!(
+            text.contains("not seen within the observation window"),
+            "text: {text}"
+        );
+    }
+
+    #[test]
+    fn rendered_claims_keep_same_named_branches_distinguishable_by_repo() {
+        // Branch names are only unique inside a repository, so a cross-repo wip
+        // report must preserve their keys rather than collapsing both rows.
+        let claims = ["repo-one", "repo-two"]
+            .into_iter()
+            .map(|repo| Claim {
+                repo: repo.to_owned(),
+                branch: "feat/x".to_owned(),
+                owner: format!("{repo}-owner"),
+                kind: OwnerKind::HarnessSession,
+                why: "porting".to_owned(),
+                started: "2020-01-01T00:00:00Z".to_owned(),
+                files: Vec::new(),
+            })
+            .collect();
+        let report = Report {
+            claims,
+            ..Report::default()
+        };
+
+        let text = render(&report);
+
+        assert!(text.contains("repo-one/feat/x ("), "text: {text}");
+        assert!(text.contains("repo-two/feat/x ("), "text: {text}");
     }
 }

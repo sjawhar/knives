@@ -496,7 +496,13 @@ fn config_home() -> PathBuf {
 
 fn notice_for(repo: &GuidanceRoot) -> anyhow::Result<String> {
     let store = Store::open(default_state_path())?;
-    let visible_claims = claim_lines(&all_claims(&store), &repo.name);
+    let observations = crate::seen::load();
+    let visible_claims = claim_lines(
+        &all_claims(&store),
+        &repo.name,
+        &observations,
+        jiff::Timestamp::now(),
+    );
     Ok(format_notice(&repo.name, &repo.root, &visible_claims))
 }
 

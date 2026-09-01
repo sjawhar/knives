@@ -11,6 +11,7 @@ use knives::{
     hook::guidance::{
         Guidance, InstructionFile, claim_lines, format_guidance, format_notice, guidance_for,
     },
+    seen::Seen,
     store::{Claim, OwnerKind},
 };
 use tempfile::TempDir;
@@ -139,7 +140,7 @@ fn claude_md_wins_over_context_md_in_one_directory() {
 }
 
 #[test]
-fn claim_lines_filter_the_repo_and_format_both_why_variants() {
+fn claim_lines_filter_the_repo_and_render_claim_provenance() {
     // Given: matching claims with and without a reason, plus another repo's claim.
     let claim = |repo: &str, branch: &str, owner: &str, why: &str| Claim {
         repo: repo.to_owned(),
@@ -155,16 +156,19 @@ fn claim_lines_filter_the_repo_and_format_both_why_variants() {
         claim("repo", "feature/reason", "blair", "review fixes"),
         claim("other", "feature/hidden", "casey", "different repository"),
     ];
+    let now = "2026-08-03T00:00:00Z"
+        .parse()
+        .expect("valid timestamp");
 
     // When: lines are rendered for `repo`.
-    let lines = claim_lines(&claims, "repo");
+    let lines = claim_lines(&claims, "repo", &Seen::default(), now);
 
-    // Then: only matching claims remain and punctuation reflects the reason.
+    // Then: only matching claims remain with explicit ownership provenance.
     assert_eq!(
         lines,
         [
-            "feature/no-reason (alex)",
-            "feature/reason (blair): review fixes"
+            "feature/no-reason (alex, os-user, claimed 1d ago, not seen within the observation window): ",
+            "feature/reason (blair, os-user, claimed 1d ago, not seen within the observation window): review fixes"
         ]
     );
 }

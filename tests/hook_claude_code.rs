@@ -159,7 +159,11 @@ fn session_start_inside_a_managed_repo_emits_the_notice_with_claims() {
     );
     assert!(context.contains("fork managed by knives"), "was: {context}");
     assert!(
-        context.contains("feat/claimed (agent-one): porting"),
+        context.contains("feat/claimed (agent-one, os-user, claimed "),
+        "was: {context}"
+    );
+    assert!(
+        context.contains("not seen within the observation window): porting"),
         "was: {context}"
     );
     assert!(!context.contains("beta instructions"), "was: {context}");

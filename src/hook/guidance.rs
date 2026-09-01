@@ -1,11 +1,14 @@
 use std::{
-    collections::hash_map::RandomState,
+    collections::{BTreeMap, hash_map::RandomState},
     hash::{BuildHasher, Hash, Hasher},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
 
+use crate::commands::claim::render_claim_line;
 use crate::config::GuidanceRoot;
+use crate::jj::WorkspaceActivity;
+use crate::seen::{self, Seen};
 use crate::store::Claim;
 
 #[derive(Debug)]
@@ -120,16 +123,29 @@ pub fn format_notice(repo_name: &str, root: &Path, claims: &[String]) -> String 
 }
 
 /// Returns active claim summaries for a repository.
-pub fn claim_lines(claims: &[Claim], repo_name: &str) -> Vec<String> {
+///
+/// Hooks deliberately do not open a jj repo or walk operations, so an empty
+/// operation stream is marked window-exhausted rather than claiming no activity.
+pub fn claim_lines(
+    claims: &[Claim],
+    repo_name: &str,
+    observations: &Seen,
+    now: jiff::Timestamp,
+) -> Vec<String> {
+    let activity = WorkspaceActivity {
+        moves: BTreeMap::new(),
+        horizon: Some(now),
+    };
     claims
         .iter()
         .filter(|claim| claim.repo == repo_name)
         .map(|claim| {
-            if claim.why.is_empty() {
-                format!("{} ({})", claim.branch, claim.owner)
-            } else {
-                format!("{} ({}): {}", claim.branch, claim.owner, claim.why)
-            }
+            render_claim_line(
+                &claim.branch,
+                claim,
+                seen::last_seen(claim, &activity, observations),
+                now,
+            )
         })
         .collect()
 }
@@ -191,12 +207,19 @@ mod tests {
 
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
-    use std::path::{Path, PathBuf};
+    use std::{
+        collections::BTreeMap,
+        path::{Path, PathBuf},
+    };
 
     use tempfile::TempDir;
 
-    use super::{Guidance, InstructionFile, format_guidance, format_notice, guidance_for};
+    use super::{
+        Guidance, InstructionFile, claim_lines, format_guidance, format_notice, guidance_for,
+    };
     use crate::config::{GuidanceRoot, GuidanceRootKind};
+    use crate::seen::Seen;
+    use crate::store::{Claim, OwnerKind};
 
     fn root(files: &[(&str, &str)]) -> (TempDir, GuidanceRoot) {
         let dir = tempfile::tempdir().unwrap();
@@ -312,6 +335,52 @@ mod tests {
         let text = format_notice("r", Path::new("/r"), &["feat/x (agent-a): porting".into()]);
 
         assert!(text.contains("Branches claimed here: feat/x (agent-a): porting."));
+    }
+
+    #[test]
+    fn claim_lines_include_owner_kind_claimed_age_and_last_seen() {
+        // Removing any claim provenance cell would make a live notice unable to
+        // distinguish both who took work and what evidence supports it.
+        let claims = [
+            Claim {
+                repo: "r".to_owned(),
+                branch: "feat/x".to_owned(),
+                owner: "agent-a".to_owned(),
+                kind: OwnerKind::HarnessSession,
+                why: "porting".to_owned(),
+                started: "2026-01-01T00:00:00Z".to_owned(),
+                files: Vec::new(),
+            },
+            Claim {
+                repo: "r".to_owned(),
+                branch: "feat/y".to_owned(),
+                owner: "agent-b".to_owned(),
+                kind: OwnerKind::HarnessSession,
+                why: "waiting".to_owned(),
+                started: "2026-01-01T00:00:00Z".to_owned(),
+                files: Vec::new(),
+            },
+        ];
+        let seen = Seen {
+            owners: BTreeMap::from([(
+                OwnerKind::HarnessSession,
+                BTreeMap::from([("agent-a".to_owned(), "2026-01-02T00:00:00Z".to_owned())]),
+            )]),
+            workspaces: BTreeMap::new(),
+        };
+        let now = "2026-01-03T00:00:00Z"
+            .parse()
+            .expect("valid timestamp");
+
+        let rows = claim_lines(&claims, "r", &seen, now);
+
+        assert_eq!(
+            rows,
+            [
+                "feat/x (agent-a, harness-session, claimed 2d ago, last seen 1d ago): porting",
+                "feat/y (agent-b, harness-session, claimed 2d ago, not seen within the observation window): waiting",
+            ]
+        );
     }
 
     #[test]

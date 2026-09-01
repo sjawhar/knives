@@ -76,6 +76,24 @@ pub fn render_claim_context(
     )
 }
 
+/// Renders a compact claim row for an advisory surface.
+pub fn render_claim_line(
+    subject: &str,
+    claim: &Claim,
+    last_seen: crate::seen::LastSeen,
+    now: jiff::Timestamp,
+) -> String {
+    let claimed_age =
+        crate::ledger::age(&claim.started, now).unwrap_or_else(|| "unknown".to_owned());
+    format!(
+        "{subject} ({}, {}, claimed {claimed_age} ago, {}): {}",
+        claim.owner,
+        owner_kind_label(claim.kind),
+        render_last_seen(last_seen, now),
+        claim.why,
+    )
+}
+
 /// Renders the observation state without implying a liveness guarantee.
 pub fn render_last_seen(last_seen: crate::seen::LastSeen, now: jiff::Timestamp) -> String {
     match last_seen {
