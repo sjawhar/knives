@@ -140,6 +140,34 @@ fn tool_after_emits_notice_and_guidance_once_with_one_shared_budget() {
 }
 
 #[test]
+fn tool_after_in_a_managed_workspace_records_event_identity_and_cwd() {
+    let repos = Repositories::new();
+    std::fs::create_dir_all(repos.beta.join(".jj")).expect("create workspace marker");
+    let mut event = tool(&repos.beta.join("file.txt"), None);
+    event["cwd"] = json!(repos.beta);
+
+    let _ = run_hook(repos.home.path(), &event);
+
+    let seen: Value = serde_json::from_str(
+        &std::fs::read_to_string(repos.home.path().join("seen.json"))
+            .expect("OpenCode hook records seen.json"),
+    )
+    .expect("seen JSON");
+    assert!(
+        seen["owners"]["harness-session"][SESSION_ID]
+            .as_str()
+            .is_some_and(|timestamp| timestamp.parse::<jiff::Timestamp>().is_ok()),
+        "was: {seen}"
+    );
+    assert!(
+        seen["workspaces"]["beta/beta"]
+            .as_str()
+            .is_some_and(|timestamp| timestamp.parse::<jiff::Timestamp>().is_ok()),
+        "was: {seen}"
+    );
+}
+
+#[test]
 fn tool_after_honors_disabled_notice_and_trusted_roots() {
     // Given: managed and trusted repositories with instructions.
     let repos = Repositories::new();

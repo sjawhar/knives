@@ -485,6 +485,11 @@ impl Lab {
         jj(&self.work, args);
     }
 
+    /// Run a jj command in an explicitly selected workspace.
+    pub(crate) fn jj_at<const N: usize>(&self, directory: &Path, args: [&str; N]) {
+        jj(directory, args);
+    }
+
     pub(crate) fn fetch_work(&self) {
         jj(&self.work, ["git", "fetch", "--all-remotes"]);
     }

@@ -13,6 +13,7 @@ use knives::carriage::{
     self, CarriesReport, CensusOptions, CensusReport, CheckInput, Target, TargetCheck, TargetRole,
 };
 use knives::cli::{Cli, Command, Exit, Output, ReleaseAction};
+use knives::commands::claim::current_identity;
 use knives::commands::{
     audit, consumers, hook, init, notch, pr, preflight, pushed, register, release, repos, start,
     status, sync,
@@ -44,6 +45,12 @@ fn main() -> ExitCode {
 )]
 fn dispatch() -> anyhow::Result<Exit> {
     let cli = Cli::parse();
+    let _ = (|| -> anyhow::Result<()> {
+        let cwd = std::env::current_dir()?;
+        let identity = current_identity(&cwd)?;
+        knives::seen::record_observation(&cwd, &identity);
+        Ok(())
+    })();
     let output = knives::cli::output_format(cli.json, cli.text);
     match cli.command {
         Command::Hook { harness } => Ok(hook::run(harness)),

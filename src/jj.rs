@@ -5,6 +5,7 @@ use std::process::Command;
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
+use futures_core::Stream as _;
 use jj_lib::backend::CommitId as JjCommitId;
 use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
 use jj_lib::local_working_copy::LocalWorkingCopy;
@@ -55,6 +56,9 @@ pub enum JjError {
     Immutable { commit: String, pin: String },
 }
 
+/// Bound the passive operation walk so status stays proportional to current work.
+pub const MAX_ACTIVITY_OPS: usize = 200;
+
 /// Twelve characters is what jj shows, and a full id is correct and unreadable.
 fn short_id(id: &str) -> String {
     id.chars().take(12).collect()
@@ -64,6 +68,20 @@ fn short_id(id: &str) -> String {
 pub struct Repo {
     repo: Arc<ReadonlyRepo>,
     path: PathBuf,
+}
+
+/// Working-copy moves for the requested workspaces and the walk's coverage.
+///
+/// Read-only commands on a clean tree write no operation, and mutations that do
+/// not move a working copy cannot be attributed to a workspace. This remains a
+/// descriptive observation, never a liveness guarantee.
+#[derive(Debug, Default)]
+pub struct WorkspaceActivity {
+    pub moves: BTreeMap<WorkspaceName, jiff::Timestamp>,
+    /// The end time of the oldest visited operation, unless the whole op log was
+    /// consumed. A bounded walk must carry this witness so callers never call
+    /// an unsearched past "never".
+    pub horizon: Option<jiff::Timestamp>,
 }
 
 impl Repo {
@@ -141,6 +159,87 @@ impl Repo {
                 ))
             })
             .collect()
+    }
+
+    /// Walks operations backward from this repository's loaded head, attributing
+    /// working-copy changes to requested workspace names.
+    pub fn workspace_activity(
+        &self,
+        wanted: &BTreeSet<WorkspaceName>,
+        max_ops: usize,
+    ) -> Result<WorkspaceActivity, JjError> {
+        let head = self.repo.operation();
+        let mut stream = std::pin::pin!(jj_lib::op_walk::walk_ancestors(
+            std::slice::from_ref(head)
+        ));
+        let waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
+        let mut activity = WorkspaceActivity::default();
+        let mut visited = 0;
+        let mut exhausted = false;
+
+        loop {
+            if visited == max_ops
+                || (!wanted.is_empty()
+                    && wanted
+                        .iter()
+                        .all(|workspace| activity.moves.contains_key(workspace)))
+            {
+                break;
+            }
+            match stream.as_mut().poll_next(&mut context) {
+                Poll::Ready(Some(Ok(operation))) => {
+                    visited += 1;
+                    let timestamp = jiff::Timestamp::from_millisecond(
+                        operation.metadata().time.end.timestamp.0,
+                    )
+                    .map_err(|error| JjError::Parse {
+                        detail: error.to_string(),
+                    })?;
+                    activity.horizon = Some(timestamp);
+                    if operation.parent_ids().len() != 1 {
+                        continue;
+                    }
+
+                    let parents = block_on(operation.parents()).map_err(|error| JjError::Parse {
+                        detail: error.to_string(),
+                    })?;
+                    let parent = parents
+                        .into_iter()
+                        .next()
+                        .expect("one parent id yields one parent operation");
+                    let view = block_on(operation.view()).map_err(|error| JjError::Parse {
+                        detail: error.to_string(),
+                    })?;
+                    let parent_view = block_on(parent.view()).map_err(|error| JjError::Parse {
+                        detail: error.to_string(),
+                    })?;
+                    for (name, commit) in view.wc_commit_ids() {
+                        let workspace = WorkspaceName::new(name.as_symbol().to_string());
+                        if wanted.contains(&workspace)
+                            && !activity.moves.contains_key(&workspace)
+                            && parent_view.wc_commit_ids().get(name) != Some(commit)
+                        {
+                            activity.moves.insert(workspace, timestamp);
+                        }
+                    }
+                }
+                Poll::Ready(Some(Err(error))) => {
+                    return Err(JjError::Parse {
+                        detail: error.to_string(),
+                    });
+                }
+                Poll::Ready(None) => {
+                    exhausted = true;
+                    break;
+                }
+                Poll::Pending => std::thread::yield_now(),
+            }
+        }
+        if exhausted {
+            activity.horizon = None;
+        }
+        Ok(activity)
     }
 
     pub fn bookmark_tips(&self) -> Result<BookmarkTips, JjError> {

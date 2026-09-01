@@ -5,6 +5,7 @@ use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 
 use crate::cli::{Exit, HookHarness};
+use crate::commands::claim::Identity;
 use crate::config::{GuidanceRoot, GuidanceRootKind, Registry, default_config_path, load};
 use crate::hook::claude_code::{
     Event, EventKind, POST_TOOL_USE_WIRE_NAME, SESSION_START_WIRE_NAME, response,
@@ -153,6 +154,17 @@ fn opencode_tool_after(event: &OpenCodeEvent, home: &Path) -> anyhow::Result<Str
     else {
         return opencode::tool_response("").map_err(Into::into);
     };
+    if matched.repo.kind == GuidanceRootKind::Managed
+        && let Some(cwd) = event.cwd()
+    {
+        let _ = crate::seen::record_observation(
+            Path::new(cwd),
+            &Identity {
+                owner: session_id.to_owned(),
+                kind: crate::store::OwnerKind::HarnessSession,
+            },
+        );
+    }
     let flags = SessionState::load(home, OPENCODE, session_id).repo(&matched.repo.root);
     let requested = event.parts();
     let include_notice =
@@ -288,6 +300,13 @@ fn session_start(event: &Event, home: &Path) -> anyhow::Result<Option<String>> {
     if matched.repo.kind != GuidanceRootKind::Managed {
         return Ok(None);
     }
+    let _ = crate::seen::record_observation(
+        Path::new(cwd),
+        &Identity {
+            owner: session_id.to_owned(),
+            kind: crate::store::OwnerKind::HarnessSession,
+        },
+    );
     let state = SessionState::load(home, CLAUDE_CODE, session_id);
     if state.repo(&matched.repo.root).noticed {
         return Ok(None);
@@ -314,6 +333,17 @@ fn post_tool_use(event: &Event, home: &Path) -> anyhow::Result<Option<String>> {
     else {
         return Ok(None);
     };
+    if matched.repo.kind == GuidanceRootKind::Managed
+        && let Some(cwd) = event.cwd()
+    {
+        let _ = crate::seen::record_observation(
+            Path::new(cwd),
+            &Identity {
+                owner: session_id.to_owned(),
+                kind: crate::store::OwnerKind::HarnessSession,
+            },
+        );
+    }
     let state = SessionState::load(home, CLAUDE_CODE, session_id);
     let flags = state.repo(&matched.repo.root);
     let include_notice = matched.repo.kind == GuidanceRootKind::Managed && !flags.noticed;

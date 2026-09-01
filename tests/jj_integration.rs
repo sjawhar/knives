@@ -28,13 +28,14 @@ use knives::forge::{
     ChecksSummary, Forge, ForgeError, PullFacts, PullRequest, PullSummary, RepoIdentity,
     SweepEntry, SweepPage, TimelineEvent,
 };
-use knives::ids::{BookmarkRef, BranchName, CommitId, ReleaseScheme, RemoteName};
+use knives::ids::{BookmarkRef, BranchName, CommitId, ReleaseScheme, RemoteName, WorkspaceName};
 use knives::jj::{
     Repo, changed_files, changed_files_between, probe_landed, pull_heads, remote_refs,
 };
 use knives::store::{OwnerKind, Store};
+use serde_json::Value;
 use lab::Lab;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::process::Command;
 
 /// A registry entry for the lab's work checkout, which stands in for origin.
@@ -771,6 +772,81 @@ fn a_jj_workspace_beside_a_registered_repo_resolves_that_repo() {
     );
     let unrelated = tempfile::tempdir().expect("unrelated directory");
     assert!(registry.containing(unrelated.path()).is_none());
+}
+
+#[test]
+fn workspace_activity_attributes_working_copy_moves_to_their_workspace() {
+    let lab = Lab::new();
+    lab.jj_work(["workspace", "add", "--name", "feat-x", "../feat-x-ws"]);
+    let workspace_dir = lab.work.parent().expect("workspace parent").join("feat-x-ws");
+    std::fs::write(workspace_dir.join("w.txt"), "work\n").expect("write workspace content");
+    lab.jj_at(&workspace_dir, ["new", "-m", "wip"]);
+
+    let repo = Repo::open(&lab.work).expect("open");
+    let wanted = BTreeSet::from([WorkspaceName::new("feat-x")]);
+    let activity = repo.workspace_activity(&wanted, 200).expect("walk");
+
+    assert!(
+        activity.moves.contains_key(&WorkspaceName::new("feat-x")),
+        "was: {activity:?}"
+    );
+}
+
+#[test]
+fn workspace_activity_reports_nothing_for_a_workspace_that_never_moved() {
+    let lab = Lab::new();
+    let repo = Repo::open(&lab.work).expect("open");
+    let wanted = BTreeSet::from([WorkspaceName::new("never-created")]);
+    let activity = repo.workspace_activity(&wanted, 200).expect("walk");
+
+    assert!(activity.moves.is_empty(), "was: {activity:?}");
+    assert!(activity.horizon.is_none(), "was: {activity:?}");
+}
+
+#[test]
+fn cli_dispatch_records_an_observation_before_running_the_command() {
+    let lab = Lab::new();
+    let home = tempfile::tempdir().expect("config home");
+    std::fs::write(
+        home.path().join("repos.toml"),
+        format!(
+            "[repos.demo]\npath = \"{}\"\nupstream = \"{}\"\norigin = \"o\"\n",
+            lab.work.display(),
+            lab.upstream.display()
+        ),
+    )
+    .expect("write registry");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_knives"))
+        .args(["--text", "repos"])
+        .current_dir(&lab.work)
+        .env("KNIVES_CONFIG_HOME", home.path())
+        .env("KNIVES_OWNER", "agent-one")
+        .output()
+        .expect("run knives");
+
+    assert!(
+        output.status.success(),
+        "knives failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let seen: Value = serde_json::from_str(
+        &std::fs::read_to_string(home.path().join("seen.json"))
+            .expect("CLI dispatch records seen.json"),
+    )
+    .expect("seen JSON");
+    assert!(
+        seen["owners"]["harness-session"]["agent-one"]
+            .as_str()
+            .is_some_and(|timestamp| timestamp.parse::<jiff::Timestamp>().is_ok()),
+        "was: {seen}"
+    );
+    assert!(
+        seen["workspaces"]["demo/work"]
+            .as_str()
+            .is_some_and(|timestamp| timestamp.parse::<jiff::Timestamp>().is_ok()),
+        "was: {seen}"
+    );
 }
 
 #[test]
