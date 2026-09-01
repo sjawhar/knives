@@ -15,26 +15,18 @@ fn tip_cell(row: &BranchRow) -> String {
     })
 }
 
-#[allow(
-    clippy::expect_used,
-    reason = "a non-clean push relation is constructed only with its origin tip"
-)]
-fn origin_relation_cell(row: &BranchRow, relation: &str) -> String {
-    let origin = row
-        .origin_tip
-        .as_deref()
-        .expect("non-clean push has an origin tip");
+fn origin_relation_cell(origin: &str, relation: &str) -> String {
     format!("origin={origin} ({relation})")
 }
 
 fn push_cell(row: &BranchRow) -> String {
-    match row.push {
+    match row.push.as_ref() {
         None => "pushed".to_owned(),
         Some(PushRelation::Unpushed) => "unpushed".to_owned(),
         Some(PushRelation::UnpushedCommits) => "unpushed-commits".to_owned(),
-        Some(PushRelation::Behind) => origin_relation_cell(row, "behind"),
-        Some(PushRelation::Diverged) => origin_relation_cell(row, "diverged"),
-        Some(PushRelation::Unresolved) => origin_relation_cell(row, "unresolved"),
+        Some(PushRelation::Behind(origin)) => origin_relation_cell(origin, "behind"),
+        Some(PushRelation::Diverged(origin)) => origin_relation_cell(origin, "diverged"),
+        Some(PushRelation::Unresolved(origin)) => origin_relation_cell(origin, "unresolved"),
     }
 }
 
@@ -285,7 +277,6 @@ mod tests {
             state: BranchState::Unknown,
             tip: None,
             push: None,
-            origin_tip: None,
             pr: None,
             review: None,
             checks: None,
@@ -377,8 +368,7 @@ mod tests {
     #[test]
     fn a_behind_row_renders_origin_and_relation() {
         let mut row = new_row("feat/alpha");
-        row.push = Some(PushRelation::Behind);
-        row.origin_tip = Some("0123456789ab".to_owned());
+        row.push = Some(PushRelation::Behind("0123456789ab".to_owned()));
 
         let rendered = render(&report_with(row), false);
 
@@ -386,6 +376,18 @@ mod tests {
             rendered.contains("origin=0123456789ab (behind)"),
             "was: {rendered}"
         );
+    }
+
+    #[test]
+    fn an_origin_relation_serializes_as_a_relation_and_tip() {
+        let mut row = new_row("feat/alpha");
+        row.push = Some(PushRelation::Behind("0123456789ab".to_owned()));
+
+        let rendered = serde_json::to_value(report_with(row))
+            .unwrap_or_else(|error| panic!("status report should serialize: {error}"));
+
+        assert_eq!(rendered["branches"][0]["push"], "behind");
+        assert_eq!(rendered["branches"][0]["origin_tip"], "0123456789ab");
     }
 
     #[test]

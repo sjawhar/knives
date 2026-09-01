@@ -280,18 +280,33 @@ fn flags_for(pull: Option<&PullRequest>, review_predates_head: Option<bool>) -> 
     flags
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingPushRelation {
+    UnpushedCommits,
+    Behind,
+    Diverged,
+    Unresolved,
+}
+
 fn push_for(
     origin_tip: Option<&CommitId>,
-    relation: Option<PushRelation>,
-) -> (Option<PushRelation>, Option<String>) {
+    relation: Option<PendingPushRelation>,
+) -> Option<PushRelation> {
     match (origin_tip, relation) {
-        (None, _) => (Some(PushRelation::Unpushed), None),
-        (
-            Some(origin),
-            Some(PushRelation::Behind | PushRelation::Diverged | PushRelation::Unresolved),
-        ) => (relation, Some(short(origin.as_str()))),
-        (Some(_), Some(PushRelation::Unpushed | PushRelation::UnpushedCommits)) => (relation, None),
-        (Some(_), None) => (None, None),
+        (None, _) => Some(PushRelation::Unpushed),
+        (Some(_), Some(PendingPushRelation::UnpushedCommits)) => {
+            Some(PushRelation::UnpushedCommits)
+        }
+        (Some(origin), Some(PendingPushRelation::Behind)) => {
+            Some(PushRelation::Behind(short(origin.as_str())))
+        }
+        (Some(origin), Some(PendingPushRelation::Diverged)) => {
+            Some(PushRelation::Diverged(short(origin.as_str())))
+        }
+        (Some(origin), Some(PendingPushRelation::Unresolved)) => {
+            Some(PushRelation::Unresolved(short(origin.as_str())))
+        }
+        (Some(_), None) => None,
     }
 }
 
@@ -416,10 +431,9 @@ pub(super) fn divergent_rows(
                 branch: branch.clone(),
                 remote: crate::ids::RemoteName::new("origin"),
             });
-            let (push, origin_tip) = raw_origin
-                .map_or((Some(PushRelation::Unpushed), None), |origin| {
-                    (Some(PushRelation::Unresolved), Some(short(origin.as_str())))
-                });
+            let push = raw_origin.map_or(Some(PushRelation::Unpushed), |origin| {
+                Some(PushRelation::Unresolved(short(origin.as_str())))
+            });
             let fork_only = input.store.is_fork_only(&target);
             let pr = pull_cell(
                 pull,
@@ -439,7 +453,6 @@ pub(super) fn divergent_rows(
                 }),
                 tip: None,
                 push,
-                origin_tip,
                 pr,
                 review: review_cell(pull),
                 checks: checks_cell(pull, checks.as_ref()),
@@ -460,22 +473,22 @@ pub(super) fn divergent_rows(
         .collect()
 }
 
-pub(super) fn record_origin_relation<E: fmt::Display>(
+fn record_origin_relation<E: fmt::Display>(
     report: &mut Report,
     branch: &BranchName,
     relation: Result<Option<OriginRelation>, E>,
-) -> Option<PushRelation> {
+) -> Option<PendingPushRelation> {
     match relation {
         Ok(relation) => relation.map(|relation| match relation {
-            OriginRelation::Ahead => PushRelation::UnpushedCommits,
-            OriginRelation::Behind => PushRelation::Behind,
-            OriginRelation::Diverged => PushRelation::Diverged,
+            OriginRelation::Ahead => PendingPushRelation::UnpushedCommits,
+            OriginRelation::Behind => PendingPushRelation::Behind,
+            OriginRelation::Diverged => PendingPushRelation::Diverged,
         }),
         Err(error) => {
             report.problems.push(format!(
                 "cannot tell how {branch} relates to origin: {error}"
             ));
-            Some(PushRelation::Unresolved)
+            Some(PendingPushRelation::Unresolved)
         }
     }
 }
@@ -533,7 +546,7 @@ pub(super) fn branch_rows(
             },
         );
         let relation = record_origin_relation(report, &branch, relation);
-        let (push, origin_tip) = push_for(raw_origin.as_ref(), relation);
+        let push = push_for(raw_origin.as_ref(), relation);
         let target = BranchTarget::new(row_input.name.clone(), branch.clone());
         let fork_only = row_input.store.is_fork_only(&target);
         let pr = pull_cell(
@@ -554,7 +567,6 @@ pub(super) fn branch_rows(
             }),
             tip: Some(short(tip.as_str())),
             push,
-            origin_tip,
             pr,
             review: review_cell(pull),
             checks: checks_cell(pull, checks.as_ref()),
@@ -731,7 +743,7 @@ mod tests {
             }),
         );
 
-        assert_eq!(relation, Some(PushRelation::Unresolved));
+        assert_eq!(relation, Some(PendingPushRelation::Unresolved));
         assert!(
             report.problems.iter().any(|problem| {
                 problem.contains("cannot tell how feat/alpha relates to origin")

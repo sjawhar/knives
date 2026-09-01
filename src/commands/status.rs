@@ -27,39 +27,84 @@ pub mod phases;
 pub mod render;
 mod rows;
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone)]
 pub struct BranchRow {
     pub name: BranchName,
     pub state: BranchState,
     /// Short (12-char) commit id; absent when the bookmark is divergent.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub tip: Option<String>,
     /// Present only when the local branch does not cleanly match origin.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub push: Option<PushRelation>,
-    /// Origin's differing short tip. Its relation lives in `push`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub origin_tip: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub pr: Option<PullCell>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub review: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub checks: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub landed: Option<LandedVerdict>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub flags: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub claim: Option<ClaimCell>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub last_seen: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub seen: Option<SeenWindow>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub workspace: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub notch: Option<LastNotch>,
+}
+
+impl serde::Serialize for BranchRow {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        #[derive(serde::Serialize)]
+        struct SerializedBranchRow<'a> {
+            name: &'a BranchName,
+            state: &'a BranchState,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            tip: Option<&'a String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            push: Option<&'a PushRelation>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            origin_tip: Option<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            pr: Option<&'a PullCell>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            review: Option<&'a String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            checks: Option<&'a String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            landed: Option<&'a LandedVerdict>,
+            #[serde(skip_serializing_if = "Vec::is_empty")]
+            flags: &'a Vec<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            claim: Option<&'a ClaimCell>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            last_seen: Option<&'a String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            seen: Option<&'a SeenWindow>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            workspace: Option<&'a String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            notch: Option<&'a LastNotch>,
+        }
+
+        serde::Serialize::serialize(
+            &SerializedBranchRow {
+                name: &self.name,
+                state: &self.state,
+                tip: self.tip.as_ref(),
+                push: self.push.as_ref(),
+                origin_tip: self.push.as_ref().and_then(PushRelation::origin_tip),
+                pr: self.pr.as_ref(),
+                review: self.review.as_ref(),
+                checks: self.checks.as_ref(),
+                landed: self.landed.as_ref(),
+                flags: &self.flags,
+                claim: self.claim.as_ref(),
+                last_seen: self.last_seen.as_ref(),
+                seen: self.seen.as_ref(),
+                workspace: self.workspace.as_ref(),
+                notch: self.notch.as_ref(),
+            },
+            serializer,
+        )
+    }
 }
 
 impl BranchRow {
@@ -69,7 +114,6 @@ impl BranchRow {
             state: BranchState::Unknown,
             tip: None,
             push: None,
-            origin_tip: None,
             pr: None,
             review: None,
             checks: None,
@@ -157,14 +201,43 @@ pub enum OriginRelation {
     Diverged,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "kebab-case")]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PushRelation {
     Unpushed,
     UnpushedCommits,
-    Behind,
-    Diverged,
-    Unresolved,
+    Behind(String),
+    Diverged(String),
+    Unresolved(String),
+}
+
+impl PushRelation {
+    const fn label(&self) -> &'static str {
+        match self {
+            Self::Unpushed => "unpushed",
+            Self::UnpushedCommits => "unpushed-commits",
+            Self::Behind(_) => "behind",
+            Self::Diverged(_) => "diverged",
+            Self::Unresolved(_) => "unresolved",
+        }
+    }
+
+    fn origin_tip(&self) -> Option<&str> {
+        match self {
+            Self::Behind(origin) | Self::Diverged(origin) | Self::Unresolved(origin) => {
+                Some(origin)
+            }
+            Self::Unpushed | Self::UnpushedCommits => None,
+        }
+    }
+}
+
+impl serde::Serialize for PushRelation {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.label())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -1716,8 +1789,7 @@ mod tests {
                     row.flags.push("review-stale".to_owned());
                 }
                 if index == 1 {
-                    row.push = Some(PushRelation::Behind);
-                    row.origin_tip = Some("f0e1d2c3b4a5".to_owned());
+                    row.push = Some(PushRelation::Behind("f0e1d2c3b4a5".to_owned()));
                 }
                 if index == 2 {
                     row.seen = Some(SeenWindow::NoneWithinWindow);
@@ -1830,7 +1902,12 @@ mod tests {
         assert!(report.branches.iter().any(|row| row.checks.is_some()));
         assert!(report.branches.iter().any(|row| !row.flags.is_empty()));
         assert!(report.branches.iter().any(|row| row.push.is_some()));
-        assert!(report.branches.iter().any(|row| row.origin_tip.is_some()));
+        assert!(report.branches.iter().any(|row| {
+            row.push
+                .as_ref()
+                .and_then(PushRelation::origin_tip)
+                .is_some()
+        }));
         assert!(report.branches.iter().any(|row| row.seen.is_some()));
         assert!(report.branches.iter().any(|row| row.workspace.is_some()));
         assert!(report.branches.iter().any(|row| row.notch.is_some()));
