@@ -119,6 +119,7 @@ Findings appear grouped one line per kind at the end of the status report:
 - `deleted-head-ref`: an open pull request's answered live head ref is gone from the forge.
 - `empty-tip-commit`: an open pull request's newest tip commit has the same tree as its sole parent.
 - `carried-elsewhere`: the branch tip is reachable from another reference. Trunk, `@git` refs, and our own release cuts are excluded.
+- `unconfigured-remote`: a remote-tracking ref whose remote is not configured; its commits stay pinned immutable and a fetch will never update it.
 - `branch-overlap`: two or more of our branches change the same file, which conflicts when a release merges them. One finding per file, naming every branch.
 ### `knives sync [REPO|--all]`
 

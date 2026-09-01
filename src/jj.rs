@@ -747,12 +747,34 @@ pub fn git_toplevel(repo: &Path) -> Result<PathBuf, JjError> {
     Ok(PathBuf::from(output.trim()))
 }
 
+/// Reads git's remote configuration because jj-lib does not expose remote URLs as a typed repository view.
+///
+/// `git config --get-regexp` uses exit 1 with no output for no matches, which is an empty map.
 pub fn git_remotes(repo: &Path) -> Result<BTreeMap<String, String>, JjError> {
     let repo = path(repo);
-    let output = command(
-        "git",
-        ["-C", &repo, "config", "--get-regexp", "^remote\\..*\\.url$"],
-    )?;
+    let output = Command::new("git")
+        .args(["-C", &repo, "config", "--get-regexp", "^remote\\..*\\.url$"])
+        .output()
+        .map_err(|error| JjError::Process {
+            program: "git".to_owned(),
+            detail: error.to_string(),
+        })?;
+    let output = if output.status.success() {
+        String::from_utf8(output.stdout).map_err(|error| JjError::Parse {
+            detail: error.to_string(),
+        })?
+    } else if output.status.code() == Some(1)
+        && output.stdout.is_empty()
+        && output.stderr.is_empty()
+    {
+        String::new()
+    } else {
+        return Err(JjError::Command {
+            program: "git".to_owned(),
+            status: output.status.to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        });
+    };
     output
         .lines()
         .try_fold(BTreeMap::new(), |mut remotes, line| {

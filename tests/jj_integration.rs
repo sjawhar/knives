@@ -18,7 +18,7 @@ use forge_shim::{
 };
 
 use knives::commands::{
-    repos,
+    audit, repos,
     status::{self, OriginRelation},
     sync,
 };
@@ -28,7 +28,7 @@ use knives::forge::{
     ChecksSummary, Forge, ForgeError, PullFacts, PullRequest, PullSummary, RepoIdentity,
     SweepEntry, SweepPage, TimelineEvent,
 };
-use knives::ids::{BookmarkRef, BranchName, CommitId, ReleaseScheme, RemoteName};
+use knives::ids::{BookmarkRef, BranchName, CommitId, ReleaseScheme, RemoteName, RepoName};
 use knives::jj::{
     Repo, changed_files, changed_files_between, probe_landed, pull_heads, remote_refs,
 };
@@ -9792,6 +9792,388 @@ fn knives_audit(lab: &Lab, home: &tempfile::TempDir, args: &[&str]) -> std::proc
         .env("KNIVES_OWNER", "test-owner")
         .output()
         .expect("run knives audit")
+}
+
+fn gather_audit(lab: &Lab) -> audit::Report {
+    let state = tempfile::tempdir().expect("state directory");
+    let store = Store::open(state.path().join("state.json")).expect("open store");
+    let repo = RepoName::new("demo");
+    let entry = lab_entry(lab);
+
+    audit::gather(&audit::AuditInput {
+        repo: &repo,
+        entry: &entry,
+        store: &store,
+        forge: None,
+        cache_root: None,
+    })
+}
+
+fn assert_only_unconfigured_remote(report: &audit::Report, branch: &str) {
+    let mut findings = report
+        .findings
+        .iter()
+        .filter(|finding| finding.kind.to_string() == "unconfigured-remote");
+    let finding = findings.next().expect("one unconfigured remote finding");
+    assert_eq!(finding.subject.to_string(), format!("{branch}@extra"));
+    assert!(findings.next().is_none(), "unexpected findings: {report:?}");
+    assert!(
+        !report.findings.iter().any(|finding| {
+            finding.kind.to_string() == "unconfigured-remote"
+                && finding.subject.to_string().ends_with("@git")
+        }),
+        "jj's internal git remote must not be reported: {report:?}"
+    );
+}
+
+/// Mutate the colocated Git config directly so jj's remote bookmark remains in its view.
+fn git_remote_in_colocated_config(lab: &Lab, args: &[&str]) {
+    let store = &lab.work;
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(store)
+        .arg("remote")
+        .args(args)
+        .output()
+        .expect("run git remote in jj store");
+    assert!(
+        output.status.success(),
+        "git remote {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn current_operation(lab: &Lab) -> String {
+    let output = Command::new("jj")
+        .args(["op", "log", "--no-graph", "-T", "id ++ \"\\n\""])
+        .current_dir(&lab.work)
+        .env("JJ_CONFIG", "/dev/null")
+        .env("JJ_USER", "Knives Lab")
+        .env("JJ_EMAIL", "knives-lab@example.test")
+        .output()
+        .expect("read current operation");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("utf-8 operation id")
+        .lines()
+        .next()
+        .expect("current operation")
+        .to_owned()
+}
+
+fn fetch_remote_without_integrating(lab: &Lab, operation: &str, remote: &str) -> String {
+    let output = Command::new("jj")
+        .args([
+            "--at-op",
+            operation,
+            "--no-integrate-operation",
+            "git",
+            "fetch",
+            "--remote",
+            remote,
+        ])
+        .current_dir(&lab.work)
+        .env("JJ_CONFIG", "/dev/null")
+        .env("JJ_USER", "Knives Lab")
+        .env("JJ_EMAIL", "knives-lab@example.test")
+        .output()
+        .expect("fetch remote at operation");
+    assert!(
+        output.status.success(),
+        "fetch {remote} at {operation} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("utf-8 fetch stdout");
+    let stderr = String::from_utf8(output.stderr).expect("utf-8 fetch stderr");
+    let operation = if stdout.trim().is_empty() {
+        stderr.as_str()
+    } else {
+        stdout.as_str()
+    };
+    operation
+        .split_whitespace()
+        .last()
+        .unwrap_or_else(|| {
+            panic!("unintegrated operation id: stdout={stdout:?}, stderr={stderr:?}")
+        })
+        .to_owned()
+}
+
+fn integrate_operation(lab: &Lab, operation: &str) {
+    let output = Command::new("jj")
+        .args(["op", "integrate", operation])
+        .current_dir(&lab.work)
+        .env("JJ_CONFIG", "/dev/null")
+        .env("JJ_USER", "Knives Lab")
+        .env("JJ_EMAIL", "knives-lab@example.test")
+        .output()
+        .expect("integrate operation");
+    assert!(
+        output.status.success(),
+        "integrate {operation} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn a_remote_tracking_ref_whose_remote_is_gone_is_reported() {
+    // Given: extra contributes a normal tracking ref while still configured.
+    let lab = Lab::new();
+    let extra = lab.temp_origin();
+    lab.jj_work([
+        "git",
+        "remote",
+        "add",
+        "extra",
+        extra.to_str().expect("utf-8 remote path"),
+    ]);
+    lab.jj_work(["git", "fetch", "--remote", "extra"]);
+    let tips = Repo::open(&lab.work)
+        .expect("open lab")
+        .bookmark_tips()
+        .expect("read bookmark tips");
+    assert!(
+        tips.contains_key(&BookmarkRef::Remote {
+            branch: BranchName::new("main"),
+            remote: RemoteName::new("git"),
+        }),
+        "fixture must include jj's internal git remote: {tips:?}"
+    );
+    let configured = gather_audit(&lab);
+    assert!(
+        configured
+            .findings
+            .iter()
+            .all(|finding| finding.kind.to_string() != "unconfigured-remote"),
+        "configured remotes must not be reported: {configured:?}"
+    );
+
+    // When: configuration is removed without deleting extra's remote-tracking ref.
+    git_remote_in_colocated_config(&lab, &["remove", "extra"]);
+    let home = mutation_test_home(&lab, None);
+    let output = knives_audit(&lab, &home, &["demo", "--no-github"]);
+    let cli_report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("audit emits JSON");
+    assert!(
+        cli_report["findings"]
+            .as_array()
+            .expect("findings")
+            .iter()
+            .any(|finding| finding["kind"] == "unconfigured-remote"),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report = gather_audit(&lab);
+
+    // Then: the orphan remains visible as its remote bookmark, never jj's internal remote.
+    assert_only_unconfigured_remote(&report, "main");
+}
+
+#[test]
+fn a_remote_tracking_ref_is_reported_after_the_last_configured_remote_is_removed() {
+    // Given: extra contributes a tracking ref alongside the lab's standard remotes.
+    let lab = Lab::new();
+    let extra = lab.temp_origin();
+    lab.jj_work([
+        "git",
+        "remote",
+        "add",
+        "extra",
+        extra.to_str().expect("utf-8 remote path"),
+    ]);
+    lab.jj_work(["git", "fetch", "--remote", "extra"]);
+
+    // When: config surgery removes every remote while retaining their tracking refs.
+    for remote in ["origin", "upstream", "extra"] {
+        git_remote_in_colocated_config(&lab, &["remove", remote]);
+    }
+    let configured = Command::new("git")
+        .args([
+            "-C",
+            lab.work.to_str().expect("utf-8 work path"),
+            "config",
+            "--get-regexp",
+            "^remote\\..*\\.url$",
+        ])
+        .output()
+        .expect("read configured Git remotes");
+    assert_eq!(
+        configured.status.code(),
+        Some(1),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&configured.stdout),
+        String::from_utf8_lossy(&configured.stderr)
+    );
+    assert!(
+        configured.stdout.is_empty(),
+        "no-match output: {}",
+        String::from_utf8_lossy(&configured.stdout)
+    );
+
+    // Then: the audit CLI treats that valid empty map as no configured remotes.
+    let home = mutation_test_home(&lab, None);
+    let output = knives_audit(&lab, &home, &["demo", "--no-github"]);
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("audit emits JSON");
+    assert!(
+        report["findings"]
+            .as_array()
+            .expect("findings")
+            .iter()
+            .any(|finding| {
+                finding["kind"] == "unconfigured-remote"
+                    && finding["subject"]["bookmark"]["Remote"]["branch"] == "main"
+                    && finding["subject"]["bookmark"]["Remote"]["remote"] == "extra"
+            }),
+        "missing extra tracking-ref finding: stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !report["problems"].as_array().is_some_and(|problems| {
+            problems.iter().any(|problem| {
+                problem.as_str().is_some_and(|problem| {
+                    problem.contains("could not read configured Git remotes")
+                })
+            })
+        }),
+        "the empty configured-remote set is valid: {report}"
+    );
+}
+
+#[test]
+fn an_unreadable_remote_config_surfaces_a_problem_without_fabricating_orphans() {
+    // Given: extra contributes a tracking ref while its remote is configured.
+    let lab = Lab::new();
+    let extra = lab.temp_origin();
+    lab.jj_work([
+        "git",
+        "remote",
+        "add",
+        "extra",
+        extra.to_str().expect("utf-8 remote path"),
+    ]);
+    lab.jj_work(["git", "fetch", "--remote", "extra"]);
+
+    // When: Git reports the remote config unreadable only for the detector's query.
+    let home = mutation_test_home(&lab, None);
+    let shim = tempfile::tempdir().expect("create Git shim directory");
+    let fake_git = shim.path().join("git");
+    std::fs::write(
+        &fake_git,
+        "#!/bin/sh\ncase \" $* \" in\n  *\" config --get-regexp \"*) echo 'fatal: unable to read config' >&2; exit 128 ;;\n  *) PATH=\"${PATH#*:}\" exec git \"$@\" ;;\nesac\n",
+    )
+    .expect("write Git shim");
+    let mut permissions = std::fs::metadata(&fake_git)
+        .expect("read Git shim permissions")
+        .permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+    std::fs::set_permissions(&fake_git, permissions).expect("make Git shim executable");
+    let shimmed_path = std::env::join_paths(std::iter::once(shim.path().to_path_buf()).chain(
+        std::env::split_paths(&std::env::var_os("PATH").expect("PATH is set")),
+    ))
+    .expect("construct shimmed PATH");
+    let configured = Command::new("git")
+        .args([
+            "-C",
+            lab.work.to_str().expect("utf-8 work path"),
+            "config",
+            "--get-regexp",
+            "^remote\\..*\\.url$",
+        ])
+        .env("PATH", &shimmed_path)
+        .output()
+        .expect("read configured Git remotes");
+    assert!(
+        !configured.status.success(),
+        "unreadable config unexpectedly read: {}",
+        String::from_utf8_lossy(&configured.stdout)
+    );
+
+    // Then: the audit CLI reports the read error instead of inventing orphan findings.
+    let output = Command::new(env!("CARGO_BIN_EXE_knives"))
+        .args(["--json", "audit", "demo", "--no-github"])
+        .current_dir(&lab.work)
+        .env("KNIVES_CONFIG_HOME", home.path())
+        .env("KNIVES_OWNER", "test-owner")
+        .env("PATH", &shimmed_path)
+        .output()
+        .expect("run knives audit");
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("audit emits JSON");
+    assert!(
+        report["problems"].as_array().is_some_and(|problems| {
+            problems.iter().any(|problem| {
+                problem.as_str().is_some_and(|problem| {
+                    problem.contains("could not read configured Git remotes")
+                })
+            })
+        }),
+        "missing configured-remote read problem: {report}"
+    );
+    assert!(
+        report["findings"]
+            .as_array()
+            .expect("findings")
+            .iter()
+            .all(|finding| finding["kind"] != "unconfigured-remote"),
+        "unreadable config must not fabricate orphan findings: {report}"
+    );
+}
+
+#[test]
+fn a_conflicted_ref_on_an_unconfigured_remote_is_still_reported() {
+    // Given: two concurrent fetches see non-ancestral extra/main moves.
+    let lab = Lab::new();
+    lab.advance_origin_branch("main", "origin main advance\n");
+    lab.advance_upstream("upstream main advance\n");
+    let extra = lab.temp_origin();
+    lab.jj_work([
+        "git",
+        "remote",
+        "add",
+        "extra",
+        extra.to_str().expect("utf-8 remote path"),
+    ]);
+    let before_fetch = current_operation(&lab);
+    let origin_fetch = fetch_remote_without_integrating(&lab, &before_fetch, "extra");
+    git_remote_in_colocated_config(
+        &lab,
+        &[
+            "set-url",
+            "extra",
+            lab.upstream.to_str().expect("utf-8 remote path"),
+        ],
+    );
+    let upstream_fetch = fetch_remote_without_integrating(&lab, &before_fetch, "extra");
+    integrate_operation(&lab, &origin_fetch);
+    integrate_operation(&lab, &upstream_fetch);
+    let conflicted = Repo::open(&lab.work)
+        .expect("open lab")
+        .conflicted_bookmarks()
+        .expect("read conflicted bookmarks");
+    assert!(
+        conflicted.iter().any(|(reference, _)| {
+            *reference
+                == BookmarkRef::Remote {
+                    branch: BranchName::new("main"),
+                    remote: RemoteName::new("extra"),
+                }
+        }),
+        "fixture must make main@extra conflicted: {conflicted:?}"
+    );
+
+    // When: the remote config disappears but its conflicted tracking ref stays pinned.
+    git_remote_in_colocated_config(&lab, &["remove", "extra"]);
+    let report = gather_audit(&lab);
+
+    // Then: a target absent from bookmark_tips still produces the remote finding.
+    assert_only_unconfigured_remote(&report, "main");
 }
 
 #[test]
