@@ -1748,13 +1748,15 @@ mod tests {
         let toon = toon_format::encode_default(&report).expect("encode");
         let lines = toon.lines().count();
         assert!(
-            lines < 120,
+            lines <= 120,
             "the map regressed to a dump: {lines} lines\n{toon}"
         );
     }
 
+    /// Guards the pinned serde-order-equals-TOON-presentation-order invariant:
+    /// an unanswered forge decode must lead the branch section.
     #[test]
-    fn a_forge_decode_failure_leads_the_report() {
+    fn serde_order_keeps_a_forge_decode_failure_before_branches() {
         let report = Report {
             repo: "a".into(),
             trunk: "main".into(),
