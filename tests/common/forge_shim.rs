@@ -15,13 +15,12 @@ use std::path::Path;
 
 /// Install a fake `gh` that answers the full snapshot protocol: repository
 /// identity, cold list, warm sweep, and by-number facts.
-pub fn install_snapshot_gh(shim: &Path, pulls: &str, withheld_facts: &[u64], log: Option<&Path>) {
+pub fn install_snapshot_gh(shim: &Path, pulls: &str, withheld_facts: &[u64]) {
     install_snapshot_gh_configured(
         shim,
         pulls,
         SnapshotGhOptions {
             withheld_facts,
-            log,
             timeline_nodes: None,
         },
     );
@@ -34,7 +33,6 @@ pub fn install_snapshot_gh_with_timeline(shim: &Path, pulls: &str, timeline_node
         pulls,
         SnapshotGhOptions {
             withheld_facts: &[],
-            log: None,
             timeline_nodes,
         },
     );
@@ -43,14 +41,12 @@ pub fn install_snapshot_gh_with_timeline(shim: &Path, pulls: &str, timeline_node
 #[derive(Clone, Copy)]
 struct SnapshotGhOptions<'a> {
     withheld_facts: &'a [u64],
-    log: Option<&'a Path>,
     timeline_nodes: Option<&'a str>,
 }
 
 fn install_snapshot_gh_configured(shim: &Path, pulls: &str, options: SnapshotGhOptions<'_>) {
     let SnapshotGhOptions {
         withheld_facts,
-        log,
         timeline_nodes,
     } = options;
     let pulls: Vec<serde_json::Value> =
@@ -115,14 +111,11 @@ fn install_snapshot_gh_configured(shim: &Path, pulls: &str, options: SnapshotGhO
     )
     .expect("write facts payload");
     write_timeline_payload(&timeline_payload, timeline_nodes);
-    let log_line = log.map_or_else(String::new, |log| {
-        format!("printf '%s\\n' \"$*\" >> \"{}\"\n", log.display())
-    });
     let gh = shim.join("gh");
     install_executable(
         &gh,
         &format!(
-            "#!/bin/sh\n{log_line}case \" $* \" in\n\
+            "#!/bin/sh\ncase \" $* \" in\n\
              *\" repo view \"*) cat \"{}\" ;;\n\
              *\" pr list \"*) cat \"{}\" ;;\n\
              *\" api graphql \"*)\n\

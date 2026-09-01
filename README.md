@@ -187,7 +187,7 @@ are somewhere else.
 | `knives sync` | fetch, then classify what happened to each tracked pull request |
 | `knives preflight` | the facts to check before contributing upstream |
 | `knives start` | take a branch and get your own workspace |
-| `knives finish [--allow-open]` | hand a branch back; by default, refuse when its pull request is open or cannot be checked, and use `--allow-open` to proceed |
+| `knives finish` | hand a branch back so another agent can pick it up; its bookmark and any open pull request survive |
 | `knives track` | state which pull request a branch belongs to, when inference cannot find it |
 | `knives depends` | record that a branch cannot land before another repo's pull request |
 | `knives notch [SUBJECT] [-m TEXT] [--disposition TOKEN]` | read the ledger or write a human note; dispositions require evidence, `--dispositions` reads terminal rulings, and `--verify` re-checks selected entries |

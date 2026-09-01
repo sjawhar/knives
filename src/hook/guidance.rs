@@ -168,7 +168,8 @@ pub fn format_notice(repo_name: &str, root: &Path, claims: &[String], digest: &s
             .to_owned(),
         "every branch, `knives start <branch>` to take a branch and get your own workspace,"
             .to_owned(),
-        "`knives finish <branch>` when you are done with it.".to_owned(),
+        "`knives finish <branch>` as soon as your active work there stops — the branch,".to_owned(),
+        "its bookmark, and any open pull request all survive the release.".to_owned(),
         format!("</knives-notice-{nonce}>"),
     ]
     .join("\n")

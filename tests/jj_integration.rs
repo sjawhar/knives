@@ -3565,7 +3565,6 @@ fn starting_and_finishing_a_branch_leaves_its_reason_in_the_ledger() {
             "--text",
             "finish",
             "feat/alpha",
-            "--allow-open",
             "--repo",
             "demo",
             "--superseded-by",
@@ -3645,49 +3644,12 @@ fn knives_finish(lab: &lab::Lab, home: &tempfile::TempDir, args: &[&str]) -> std
     command.args(["--text", "finish"]);
     command.args(args);
     command
-        .args(["--allow-open", "--repo", "demo"])
+        .args(["--repo", "demo"])
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
         .env("KNIVES_OWNER", "ses_fff688")
         .output()
         .expect("run finish")
-}
-
-#[derive(Clone, Copy)]
-struct FinishWithSnapshotForgeInput<'a> {
-    lab: &'a Lab,
-    home: &'a tempfile::TempDir,
-    pulls: &'a str,
-    withheld_facts: &'a [u64],
-    args: &'a [&'a str],
-    log: &'a std::path::Path,
-}
-
-fn knives_finish_with_snapshot_forge(
-    input: FinishWithSnapshotForgeInput<'_>,
-) -> std::process::Output {
-    let FinishWithSnapshotForgeInput {
-        lab,
-        home,
-        pulls,
-        withheld_facts,
-        args,
-        log,
-    } = input;
-    let shim = tempfile::tempdir().expect("create forge shim directory");
-    install_snapshot_gh(shim.path(), pulls, withheld_facts, Some(log));
-    let mut command = Command::new(env!("CARGO_BIN_EXE_knives"));
-    command.args(["--text", "finish"]);
-    command.args(args);
-    command
-        .args(["--repo", "demo"])
-        .current_dir(&lab.work)
-        .env("KNIVES_CONFIG_HOME", home.path())
-        .env("KNIVES_OWNER", "ses_fff688")
-        .env("XDG_CACHE_HOME", shim.path().join("cache"))
-        .env("PATH", path_with_gh_shim(shim.path()))
-        .output()
-        .expect("run finish with a forge shim")
 }
 
 fn knives_finish_with_failing_forge(
@@ -3713,112 +3675,86 @@ fn knives_finish_with_failing_forge(
 }
 
 #[test]
-fn finish_refuses_while_the_pull_request_is_open() {
+fn finish_releases_without_consulting_the_forge() {
+    // Releasing a claim is a local act: the branch, its bookmark, and any open
+    // pull request survive it, so finish has no question to ask the forge.
     let lab = Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     let (home, _consumer) = release_test_home(&lab);
     hold_claim(&home, "feat/alpha");
+    {
+        let target = knives::ids::BranchTarget::new(
+            knives::ids::RepoName::new("demo"),
+            BranchName::new("feat/alpha"),
+        );
+        let mut store = Store::open_for_update(home.path().join("state.json")).expect("open store");
+        store.track_pull(&target, 7);
+        store.save().expect("save stated pull");
+    }
+    let tip_before = lab.revision(&lab.work, "feat/alpha", "commit_id");
     let state = tempfile::tempdir().expect("test state");
     let log = state.path().join("gh.log");
-    let pulls = format!("[{}]", pull_record(7, "OPEN", "feat/alpha", None));
 
-    let output = knives_finish_with_snapshot_forge(FinishWithSnapshotForgeInput {
-        lab: &lab,
-        home: &home,
-        pulls: &pulls,
-        withheld_facts: &[],
-        args: &["feat/alpha"],
-        log: &log,
-    });
+    let finished = knives_finish_with_failing_forge(&lab, &home, &["feat/alpha"], &log);
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert_eq!(
-        output.status.code(),
-        Some(1),
-        "stdout: {stdout}\nstderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    let stdout = String::from_utf8_lossy(&finished.stdout);
     assert!(
-        stdout.contains("open pull request #7"),
-        "the refusal did not name the open pull request: {stdout}"
-    );
-    assert!(log.is_file(), "the guard did not consult the fake forge");
-}
-
-#[test]
-fn finish_refuses_when_the_forge_omits_a_surfaced_pull_fact() {
-    // Given: discovery says alpha owns an open pull request, but the same run's
-    // requested-facts batch omits that number.
-    let lab = Lab::new();
-    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
-    let (home, _consumer) = release_test_home(&lab);
-    hold_claim(&home, "feat/alpha");
-    let state = tempfile::tempdir().expect("test state");
-    let log = state.path().join("gh.log");
-    let pulls = format!("[{}]", pull_record(7, "OPEN", "feat/alpha", None));
-
-    let output = knives_finish_with_snapshot_forge(FinishWithSnapshotForgeInput {
-        lab: &lab,
-        home: &home,
-        pulls: &pulls,
-        withheld_facts: &[7],
-        args: &["feat/alpha"],
-        log: &log,
-    });
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert_eq!(
-        output.status.code(),
-        Some(3),
-        "stdout: {stdout}\nstderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        stdout.contains("cannot verify whether feat/alpha has an open pull request")
-            && stdout.contains("#7"),
-        "the refusal did not name the unanswered pull request: {stdout}"
-    );
-}
-
-#[test]
-fn finish_refuses_when_it_cannot_verify_and_allow_open_proceeds() {
-    let lab = Lab::new();
-    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
-    let (home, _consumer) = release_test_home(&lab);
-    hold_claim(&home, "feat/alpha");
-    let state = tempfile::tempdir().expect("test state");
-    let refusal_log = state.path().join("refusal-gh.log");
-
-    let refused = knives_finish_with_failing_forge(&lab, &home, &["feat/alpha"], &refusal_log);
-
-    let refusal = String::from_utf8_lossy(&refused.stdout);
-    assert_eq!(
-        refused.status.code(),
-        Some(3),
-        "stdout: {refusal}\nstderr: {}",
-        String::from_utf8_lossy(&refused.stderr)
-    );
-    assert!(
-        refusal.contains("cannot verify whether feat/alpha has an open pull request"),
-        "missing verification refusal: {refusal}"
-    );
-    assert!(refusal_log.is_file(), "the failed guard never reached gh");
-
-    let bypass_log = state.path().join("bypass-gh.log");
-    let bypass =
-        knives_finish_with_failing_forge(&lab, &home, &["feat/alpha", "--allow-open"], &bypass_log);
-
-    let stdout = String::from_utf8_lossy(&bypass.stdout);
-    assert!(
-        bypass.status.success(),
-        "allow-open did not release the claim: {stdout}\n{}",
-        String::from_utf8_lossy(&bypass.stderr)
+        finished.status.success(),
+        "finish did not release the claim: {stdout}\n{}",
+        String::from_utf8_lossy(&finished.stderr)
     );
     assert!(stdout.contains("claim released"), "was: {stdout}");
     assert!(
-        !bypass_log.exists(),
-        "--allow-open spawned the fake gh: {}",
-        std::fs::read_to_string(&bypass_log).unwrap_or_default()
+        !log.exists(),
+        "finish consulted the forge: {}",
+        std::fs::read_to_string(&log).unwrap_or_default()
+    );
+    let state: Value = serde_json::from_str(
+        &std::fs::read_to_string(home.path().join("state.json")).expect("read state"),
+    )
+    .expect("parse state");
+    assert!(
+        state["claims"].get("demo/feat/alpha").is_none(),
+        "claim remained: {}",
+        state["claims"]
+    );
+    assert_eq!(
+        state["tracked_pulls"]["demo/feat/alpha"],
+        Value::from(7),
+        "the stated pull request did not survive the release"
+    );
+    assert_eq!(
+        lab.revision(&lab.work, "feat/alpha", "commit_id"),
+        tip_before,
+        "the branch did not survive the release untouched"
+    );
+}
+
+#[test]
+fn finish_refuses_a_branch_that_maps_to_the_primary_workspace() {
+    // `start` can never have created a workspace named "default" — jj owns that
+    // name — so a branch whose flattened name lands on it is a collision with
+    // the checkout itself, not a workspace to forget and remove.
+    let lab = Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+
+    let refused = knives_finish(&lab, &home, &["default"]);
+
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert_eq!(
+        refused.status.code(),
+        Some(2),
+        "stdout: {}\nstderr: {stderr}",
+        String::from_utf8_lossy(&refused.stdout)
+    );
+    assert!(
+        stderr.contains("registered checkout itself"),
+        "stderr: {stderr}"
+    );
+    assert!(lab.work.is_dir(), "the checkout was removed");
+    assert!(
+        !lab.revision(&lab.work, "@", "commit_id").is_empty(),
+        "the primary workspace was forgotten"
     );
 }
 
@@ -3831,14 +3767,7 @@ fn finish_refuses_to_release_anothers_claim_without_force() {
     let workspace = start_claim_for_finish(&lab, &home, "agent-one", "feat/gamma");
 
     let refused = Command::new(env!("CARGO_BIN_EXE_knives"))
-        .args([
-            "--text",
-            "finish",
-            "feat/gamma",
-            "--allow-open",
-            "--repo",
-            "demo",
-        ])
+        .args(["--text", "finish", "feat/gamma", "--repo", "demo"])
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
         .env("KNIVES_OWNER", "agent-two")
@@ -3885,7 +3814,6 @@ fn finish_force_releases_and_records_provenance() {
             "--force",
             "--why",
             "owner session died",
-            "--allow-open",
             "--repo",
             "demo",
         ])
@@ -3953,7 +3881,6 @@ fn finish_force_requires_why() {
             "finish",
             "feat/gamma",
             "--force",
-            "--allow-open",
             "--repo",
             "demo",
         ])
@@ -3979,14 +3906,7 @@ fn finish_by_possession_still_releases() {
     let workspace = start_claim_for_finish(&lab, &home, "agent-one", "feat/gamma");
 
     let finished = Command::new(env!("CARGO_BIN_EXE_knives"))
-        .args([
-            "--text",
-            "finish",
-            "feat/gamma",
-            "--allow-open",
-            "--repo",
-            "demo",
-        ])
+        .args(["--text", "finish", "feat/gamma", "--repo", "demo"])
         .current_dir(&workspace)
         .env("KNIVES_CONFIG_HOME", home.path())
         .env_remove("KNIVES_OWNER")
@@ -4977,7 +4897,7 @@ fn status_reports_empty_diff_and_deleted_head_from_completed_facts() {
         )
     );
     let shim = tempfile::tempdir().expect("create forge shim directory");
-    install_snapshot_gh(shim.path(), &pulls, &[], None);
+    install_snapshot_gh(shim.path(), &pulls, &[]);
 
     // When: the real status binary consumes the completed snapshot
     let output = Command::new(env!("CARGO_BIN_EXE_knives"))
@@ -5907,7 +5827,7 @@ fn release_with_snapshot_forge(
         args,
     } = input;
     let shim = tempfile::tempdir().expect("create forge shim directory");
-    install_snapshot_gh(shim.path(), pulls, withheld_facts, None);
+    install_snapshot_gh(shim.path(), pulls, withheld_facts);
     release_command(lab, home, output, args)
         .env("XDG_CACHE_HOME", shim.path().join("cache"))
         .env("PATH", path_with_gh_shim(shim.path()))
