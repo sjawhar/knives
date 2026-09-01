@@ -715,6 +715,68 @@ fn force_finish_does_not_save_state_when_its_provenance_cannot_be_appended() {
 }
 
 #[test]
+fn forced_finish_with_supersession_writes_one_atomic_provenance_event() {
+    // Given: another owner holds the claim that this terminal must force-release.
+    let lab = lab::Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let start = Command::new(env!("CARGO_BIN_EXE_knives"))
+        .args([
+            "--text",
+            "start",
+            "feat/gamma",
+            "--repo",
+            "demo",
+            "--why",
+            "port it",
+        ])
+        .current_dir(&lab.work)
+        .env("KNIVES_CONFIG_HOME", home.path())
+        .env("KNIVES_OWNER", "agent-one")
+        .output()
+        .expect("start claim");
+    assert!(start.status.success(), "{start:?}");
+
+    // When: the claim is force-finished while recording where its work continued.
+    let finished = Command::new(env!("CARGO_BIN_EXE_knives"))
+        .args([
+            "--text",
+            "finish",
+            "feat/gamma",
+            "--repo",
+            "demo",
+            "--allow-open",
+            "--no-cleanup",
+            "--force",
+            "--why",
+            "release stalled work",
+            "--superseded-by",
+            "feat/replacement",
+        ])
+        .current_dir(&lab.work)
+        .env("KNIVES_CONFIG_HOME", home.path())
+        .env("KNIVES_OWNER", "agent-two")
+        .output()
+        .expect("force finish");
+
+    // Then: one durable event proves both facts, so no second append can strand a false release.
+    assert!(finished.status.success(), "{finished:?}");
+    let entries = knives::ledger::Ledger::at(home.path().join("ledger").join("demo"))
+        .entries()
+        .expect("read ledger");
+    assert_eq!(entries.len(), 2, "was: {entries:?}");
+    let event = &entries[1].text;
+    assert!(
+        event.contains("released agent-one's claim by force"),
+        "event: {event}"
+    );
+    assert!(event.contains("release stalled work"), "event: {event}");
+    assert!(
+        event.contains("superseded by feat/replacement"),
+        "event: {event}"
+    );
+}
+
+#[test]
 fn start_refuses_a_forgotten_same_repo_workspace_with_a_different_name_before_reattaching() {
     // Given: a forgotten workspace from this repository occupies another branch's destination.
     let lab = lab::Lab::new();

@@ -2349,17 +2349,13 @@ fn run_finish(target: &BranchTarget, options: &FinishOptions<'_>) -> anyhow::Res
     // Persist the immutable explanation before the mutable claim state. A failed
     // append then leaves the old claim in place instead of silently releasing or
     // seizing work without the provenance that explains why.
-    if let Some(text) = forced_release {
-        let scribe = scribe_for(&target.repo, entry)?;
-        scribe.event(Some(target.branch.as_str()), text, pr)?;
-        if let Some(replacement) = options.superseded_by {
-            scribe.event(
-                Some(target.branch.as_str()),
-                format!("superseded by {replacement}"),
-                pr,
-            )?;
-        }
-    } else if let Some(text) = release_event(had, options.superseded_by) {
+    let provenance = forced_release
+        .map(|text| match options.superseded_by {
+            Some(replacement) => format!("{text}; superseded by {replacement}"),
+            None => text,
+        })
+        .or_else(|| release_event(had, options.superseded_by));
+    if let Some(text) = provenance {
         scribe_for(&target.repo, entry)?.event(Some(target.branch.as_str()), text, pr)?;
     }
     store.save()?;
