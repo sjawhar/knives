@@ -221,10 +221,10 @@ const fn branch_state(input: BranchStateInput) -> BranchState {
         BranchState::ChecksFailing
     } else if changes_requested {
         BranchState::ChangesRequested
-    } else if approved {
-        BranchState::Approved
     } else if draft {
         BranchState::Draft
+    } else if approved {
+        BranchState::Approved
     } else if awaiting_review {
         BranchState::AwaitingReview
     } else if merged {
@@ -249,6 +249,9 @@ fn state_for(input: StateInput<'_>) -> BranchState {
         pr,
     } = input;
     let is_open = pull.is_some_and(PullRequest::is_open);
+    if is_open && pull.is_some_and(|pull| pull.missing_merge_fields().next().is_some()) {
+        return BranchState::Unknown;
+    }
     let review = pull
         .filter(|pull| pull.is_open())
         .map(|pull| pull.review_decision.as_str());
@@ -271,7 +274,11 @@ fn state_for(input: StateInput<'_>) -> BranchState {
 
 fn flags_for(pull: Option<&PullRequest>, review_predates_head: Option<bool>) -> Vec<String> {
     let mut flags = Vec::new();
-    if pull.is_some_and(|pull| pull.merge_state_status.eq_ignore_ascii_case("BEHIND")) {
+    if pull.is_some_and(|pull| {
+        pull.merge_state_status
+            .as_deref()
+            .is_some_and(|state| state.eq_ignore_ascii_case("BEHIND"))
+    }) {
         flags.push("behind-base".to_owned());
     }
     if review_predates_head == Some(true) {
@@ -319,7 +326,11 @@ struct PullFindingInput<'a> {
     expected_base: &'a str,
 }
 
-fn add_pull_findings(findings: &mut Vec<Finding>, input: PullFindingInput<'_>) {
+fn add_pull_findings(
+    problems: &mut Vec<String>,
+    findings: &mut Vec<Finding>,
+    input: PullFindingInput<'_>,
+) {
     let PullFindingInput {
         branch,
         pull,
@@ -330,6 +341,9 @@ fn add_pull_findings(findings: &mut Vec<Finding>, input: PullFindingInput<'_>) {
     let Some(pull) = pull else {
         return;
     };
+    for field in pull.missing_merge_fields() {
+        problems.push(format!("#{}: forge did not report {field}", pull.number));
+    }
     if pull.conflicting() {
         findings.push(Finding::new(
             FindingKind::Unmergeable,
@@ -354,14 +368,14 @@ fn add_pull_findings(findings: &mut Vec<Finding>, input: PullFindingInput<'_>) {
             ),
         ));
     }
-    if pull.is_open() && !pull.base_ref_name.is_empty() && pull.base_ref_name != expected_base {
+    if pull.is_open()
+        && let Some(base) = pull.base_ref_name.as_deref()
+        && base != expected_base
+    {
         findings.push(Finding::new(
             FindingKind::WrongBase,
             Subject::PullRequest(pull.number),
-            format!(
-                "#{} targets {}, not {expected_base}",
-                pull.number, pull.base_ref_name
-            ),
+            format!("#{} targets {base}, not {expected_base}", pull.number),
         ));
     }
 }
@@ -398,77 +412,139 @@ pub(super) struct DivergentInput<'a, 'snapshot> {
     pub(super) expected_base: &'a str,
 }
 
+struct RowContext<'a, 'snapshot> {
+    name: &'a RepoName,
+    store: &'a Store,
+    index: &'a PullIndex,
+    snapshot: Option<&'a crate::snapshot::CompletedSnapshot<'snapshot>>,
+    notches: &'a [Notch],
+    expected_base: &'a str,
+}
+
+struct RowOutput<'a> {
+    report: &'a mut Report,
+    findings: &'a mut Vec<Finding>,
+}
+
+struct RowFacts<'a> {
+    divergent: bool,
+    tip: Option<String>,
+    landed: Option<LandedVerdict>,
+    push: Option<PushRelation>,
+    origin_tip: Option<&'a CommitId>,
+    origin_relation: Option<Result<Option<OriginRelation>, String>>,
+}
+
+fn build_branch_row(
+    context: &RowContext<'_, '_>,
+    output: &mut RowOutput<'_>,
+    branch: &BranchName,
+    facts: RowFacts<'_>,
+) -> BranchRow {
+    let fact = pull_summary_for(branch, &context.index.by_branch).and_then(|summary| {
+        context
+            .snapshot
+            .and_then(|snapshot| snapshot.fact(summary.number))
+    });
+    let pull = fact.map(|fact| &fact.pull);
+    let details = fact.map(|fact| &fact.details);
+    let checks = checks_from(details, pull);
+    let review_predates_head = review_predates_head_from(details, pull);
+    add_pull_findings(
+        &mut output.report.problems,
+        output.findings,
+        PullFindingInput {
+            branch,
+            pull,
+            checks: checks.as_ref(),
+            review_predates_head,
+            expected_base: context.expected_base,
+        },
+    );
+    let push = if let Some(relation) = facts.origin_relation {
+        push_for(
+            facts.origin_tip,
+            record_origin_relation(output.report, branch, relation),
+        )
+    } else {
+        facts.push
+    };
+    let target = BranchTarget::new(context.name.clone(), branch.clone());
+    let fork_only = context.store.is_fork_only(&target);
+    let pr = pull_cell(
+        pull,
+        stated_pull_for(&target, context.store, context.snapshot),
+        prior_pulls_for(branch, &context.index.prior),
+    );
+    BranchRow {
+        name: branch.clone(),
+        state: state_for(StateInput {
+            fork_only,
+            divergent: facts.divergent,
+            landed: facts.landed,
+            pull,
+            checks: checks.as_ref(),
+            forge_answered: context.snapshot.is_some(),
+            pr: pr.as_ref(),
+        }),
+        tip: facts.tip,
+        push,
+        pr,
+        review: review_cell(pull),
+        checks: checks_cell(pull, checks.as_ref()),
+        landed: facts.landed,
+        flags: flags_for(pull, review_predates_head),
+        claim: None,
+        last_seen: None,
+        seen: None,
+        workspace: None,
+        notch: LastNotch::of(
+            context
+                .notches
+                .iter()
+                .filter(|notch| notch.subject.as_deref() == Some(branch.as_str())),
+        ),
+    }
+}
+
 /// Rows for divergent local bookmarks.
 pub(super) fn divergent_rows(
     input: &DivergentInput<'_, '_>,
+    report: &mut Report,
     findings: &mut Vec<Finding>,
 ) -> Vec<BranchRow> {
+    let context = RowContext {
+        name: input.name,
+        store: input.store,
+        index: input.index,
+        snapshot: input.snapshot,
+        notches: input.notches,
+        expected_base: input.expected_base,
+    };
+    let mut output = RowOutput { report, findings };
     input
         .branches
         .iter()
         .map(|branch| {
-            let target = BranchTarget::new(input.name.clone(), branch.clone());
-            let fact = pull_summary_for(branch, &input.index.by_branch).and_then(|summary| {
-                input
-                    .snapshot
-                    .and_then(|snapshot| snapshot.fact(summary.number))
-            });
-            let pull = fact.map(|fact| &fact.pull);
-            let details = fact.map(|fact| &fact.details);
-            let checks = checks_from(details, pull);
-            let review_predates_head = review_predates_head_from(details, pull);
-            add_pull_findings(
-                findings,
-                PullFindingInput {
-                    branch,
-                    pull,
-                    checks: checks.as_ref(),
-                    review_predates_head,
-                    expected_base: input.expected_base,
-                },
-            );
             let raw_origin = input.tips.get(&BookmarkRef::Remote {
                 branch: branch.clone(),
                 remote: crate::ids::RemoteName::new("origin"),
             });
-            let push = raw_origin.map_or(Some(PushRelation::Unpushed), |origin| {
-                Some(PushRelation::Unresolved(short(origin.as_str())))
-            });
-            let fork_only = input.store.is_fork_only(&target);
-            let pr = pull_cell(
-                pull,
-                stated_pull_for(&target, input.store, input.snapshot),
-                prior_pulls_for(branch, &input.index.prior),
-            );
-            BranchRow {
-                name: branch.clone(),
-                state: state_for(StateInput {
-                    fork_only,
+            build_branch_row(
+                &context,
+                &mut output,
+                branch,
+                RowFacts {
                     divergent: true,
+                    tip: None,
                     landed: None,
-                    pull,
-                    checks: checks.as_ref(),
-                    forge_answered: input.snapshot.is_some(),
-                    pr: pr.as_ref(),
-                }),
-                tip: None,
-                push,
-                pr,
-                review: review_cell(pull),
-                checks: checks_cell(pull, checks.as_ref()),
-                landed: None,
-                flags: flags_for(pull, review_predates_head),
-                claim: None,
-                last_seen: None,
-                seen: None,
-                workspace: None,
-                notch: LastNotch::of(
-                    input
-                        .notches
-                        .iter()
-                        .filter(|notch| notch.subject.as_deref() == Some(branch.as_str())),
-                ),
-            }
+                    push: raw_origin.map_or(Some(PushRelation::Unpushed), |origin| {
+                        Some(PushRelation::Unresolved(short(origin.as_str())))
+                    }),
+                    origin_tip: None,
+                    origin_relation: None,
+                },
+            )
         })
         .collect()
 }
@@ -513,6 +589,15 @@ pub(super) fn branch_rows(
     findings: &mut Vec<Finding>,
 ) -> anyhow::Result<Vec<String>> {
     let mut unjudged = Vec::new();
+    let context = RowContext {
+        name: row_input.name,
+        store: row_input.store,
+        index: row_input.index,
+        snapshot: row_input.snapshot,
+        notches: row_input.notches,
+        expected_base: row_input.expected_base,
+    };
+    let mut output = RowOutput { report, findings };
     for ((verdict, probe_input), relation) in row_input
         .verdicts
         .into_iter()
@@ -526,63 +611,20 @@ pub(super) fn branch_rows(
         if landed == Some(LandedVerdict::Unjudged) {
             unjudged.push(branch.to_string());
         }
-        let fact = pull_summary_for(&branch, &row_input.index.by_branch).and_then(|summary| {
-            row_input
-                .snapshot
-                .and_then(|snapshot| snapshot.fact(summary.number))
-        });
-        let pull = fact.map(|fact| &fact.pull);
-        let details = fact.map(|fact| &fact.details);
-        let checks = checks_from(details, pull);
-        let review_predates_head = review_predates_head_from(details, pull);
-        add_pull_findings(
-            findings,
-            PullFindingInput {
-                branch: &branch,
-                pull,
-                checks: checks.as_ref(),
-                review_predates_head,
-                expected_base: row_input.expected_base,
+        let row = build_branch_row(
+            &context,
+            &mut output,
+            &branch,
+            RowFacts {
+                divergent: false,
+                tip: Some(short(tip.as_str())),
+                landed,
+                push: None,
+                origin_tip: raw_origin.as_ref(),
+                origin_relation: Some(relation),
             },
         );
-        let relation = record_origin_relation(report, &branch, relation);
-        let push = push_for(raw_origin.as_ref(), relation);
-        let target = BranchTarget::new(row_input.name.clone(), branch.clone());
-        let fork_only = row_input.store.is_fork_only(&target);
-        let pr = pull_cell(
-            pull,
-            stated_pull_for(&target, row_input.store, row_input.snapshot),
-            prior_pulls_for(&branch, &row_input.index.prior),
-        );
-        report.branches.push(BranchRow {
-            name: branch.clone(),
-            state: state_for(StateInput {
-                fork_only,
-                divergent: false,
-                landed,
-                pull,
-                checks: checks.as_ref(),
-                forge_answered: row_input.snapshot.is_some(),
-                pr: pr.as_ref(),
-            }),
-            tip: Some(short(tip.as_str())),
-            push,
-            pr,
-            review: review_cell(pull),
-            checks: checks_cell(pull, checks.as_ref()),
-            landed,
-            flags: flags_for(pull, review_predates_head),
-            claim: None,
-            last_seen: None,
-            seen: None,
-            workspace: None,
-            notch: LastNotch::of(
-                row_input
-                    .notches
-                    .iter()
-                    .filter(|notch| notch.subject.as_deref() == Some(branch.as_str())),
-            ),
-        });
+        output.report.branches.push(row);
     }
     Ok(unjudged)
 }
@@ -646,7 +688,7 @@ mod tests {
         let mut case = input();
         case.approved = true;
         case.draft = true;
-        assert_eq!(branch_state(case), BranchState::Approved);
+        assert_eq!(branch_state(case), BranchState::Draft);
 
         let mut case = input();
         case.draft = true;
@@ -660,6 +702,7 @@ mod tests {
 
         let mut case = input();
         case.merged = true;
+
         case.closed = true;
         assert_eq!(branch_state(case), BranchState::Merged);
 
@@ -673,6 +716,38 @@ mod tests {
         assert_eq!(branch_state(case), BranchState::NoPr);
 
         assert_eq!(branch_state(input()), BranchState::Unknown);
+    }
+    #[test]
+    fn missing_merge_facts_make_an_open_pull_unknown_and_report_problems() {
+        let pull = PullRequest {
+            number: 7,
+            ..PullRequest::default()
+        };
+        let mut problems = Vec::new();
+        let mut findings = Vec::new();
+        add_pull_findings(
+            &mut problems,
+            &mut findings,
+            PullFindingInput {
+                branch: &BranchName::new("feat/alpha"),
+                pull: Some(&pull),
+                checks: None,
+                review_predates_head: None,
+                expected_base: "main",
+            },
+        );
+
+        assert_eq!(
+            state_for(state_input(Some(&pull), None)),
+            BranchState::Unknown
+        );
+        assert_eq!(problems.len(), 3, "problems: {problems:?}");
+        assert!(
+            findings
+                .iter()
+                .all(|finding| finding.kind != FindingKind::WrongBase),
+            "unknown base must not be silently treated as the expected base: {findings:?}"
+        );
     }
 
     #[test]

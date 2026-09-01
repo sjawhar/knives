@@ -56,17 +56,24 @@ separate remote that releases are cut on, for the case where releases are consum
 internally and should not sit in a personal fork; the release remote is optional, and it
 falls back to `origin` when absent, because not every fork is consumed by anything.
 
-`consumers` is optional too: the checkouts that pin this repo's releases. Consumer pins are read directly from the consumer repository's origin trunk reference rather than its working copy, avoiding false reports caused by an unpushed or unpulled working copy. Notes report if a consumer checkout is behind its branch, if no origin trunk resolves, or if it is not a repository. Recorded so that `knives repos` can say which consumer is pinned behind the newest cut without being asked, since nobody runs a command to answer a question they have not thought of.
+`consumers` is optional too: forge slugs for repositories that pin this repo's releases. Knives
+reads supported pin files from each consumer repository's trunk through the forge, not from a
+recorded checkout. Each scan is cached by the consumer's trunk commit. When the forge is down,
+cached pins are explicitly labeled as cache-backed and the result remains incomplete; no cache is
+never treated as an answer. A local path is intentionally not persisted: `--consumer PATH` is an
+ad-hoc local scan. Recording slugs lets `knives repos` say which consumer is pinned behind the
+newest cut without requiring local checkout inventories.
 
 ### Consumer-pin census
 
-`knives consumers [FORK] [--consumer PATH]...` checks every recorded consumer plus explicitly
-named checkouts against the newest release on the live publish remote. A pin names a release
-reference and may freeze its resolved commit. The census reports a missing consumer directory as
-an unanswered problem, a consumer that does not pin the fork as a note, and a pin whose reference
-or frozen commit differs from the newest live release as a finding. It also reports local release
-view disagreement with the live publish remote rather than treating the checkout as authority.
-The command never edits consumer checkouts.
+`knives consumers [FORK] [--consumer PATH]...` checks every recorded forge consumer plus
+explicit ad-hoc local scans against the newest release on the live publish remote. A pin names a
+release reference and may freeze its resolved commit. The census reports an unavailable forge as
+incomplete even when it can show cache-backed pins, a local path that is missing as an unanswered
+problem, a consumer that does not pin the fork as a note, and a pin whose reference or frozen
+commit differs from the newest live release as a finding. It also reports local release view
+disagreement with the live publish remote rather than treating the checkout as authority. The
+command never edits consumer checkouts.
 
 `[trust]` configures automated guidance rules for repositories outside `[repos.*]` and `[trusted.*]`:
 - `roots`: Directory subtrees where all contained repositories are trusted for instruction guidance.

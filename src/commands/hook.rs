@@ -16,8 +16,8 @@ use crate::hook::guidance::{
 use crate::hook::opencode::{self, Event as OpenCodeEvent, EventKind as OpenCodeEventKind};
 use crate::hook::resolve::{Match, argument_paths, managed_repo_for, trust_rule_match, url_owner};
 use crate::hook::state::SessionState;
-use crate::store::{Store, default_state_path};
 
+use crate::store::{Store, default_state_path};
 const CLAUDE_CODE: &str = "claude-code";
 const OPENCODE: &str = "opencode";
 const RELEVANT_TOOLS: &[&str] = &[
@@ -187,6 +187,7 @@ fn opencode_tool_after(event: &OpenCodeEvent, home: &Path) -> anyhow::Result<Str
     if let Some(text) = notice_text {
         additions.push(text);
     }
+    let guidance_rendered = guidance.is_some();
     if let Some(guidance) = guidance {
         additions.push(format_guidance(&matched.repo.name, &guidance));
     }
@@ -196,7 +197,9 @@ fn opencode_tool_after(event: &OpenCodeEvent, home: &Path) -> anyhow::Result<Str
             if let Some(update) = notice_update {
                 update.apply(state, &matched.repo.root);
             }
-            state.mark_guided(&matched.repo.root);
+            if guidance_rendered {
+                state.mark_guided(&matched.repo.root);
+            }
         })?;
     }
     opencode::tool_response(&addition).map_err(Into::into)
@@ -226,13 +229,7 @@ fn opencode_chat_system(event: &OpenCodeEvent, home: &Path) -> anyhow::Result<St
 }
 
 fn opencode_shell_env(event: &OpenCodeEvent) -> anyhow::Result<String> {
-    let owner = event
-        .cwd()
-        .map(Path::new)
-        .map(owner_for)
-        .transpose()?
-        .flatten();
-    opencode::environment_response(owner.as_deref()).map_err(Into::into)
+    opencode::environment_response(event.session_id()).map_err(Into::into)
 }
 
 pub(crate) fn owner_for(cwd: &Path) -> anyhow::Result<Option<String>> {

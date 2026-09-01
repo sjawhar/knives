@@ -9,11 +9,10 @@ use std::path::Path;
 
 use crate::cli::Exit;
 use crate::config::{Registry, RepoEntry, Role, default_config_path, load};
+use crate::consumer_pins::{ConsumerHeadMemo, ConsumerPinSource, scan_consumer_slug_with_heads};
 use crate::ids::{BookmarkRef, BranchName, ReleaseScheme, RemoteName, is_our_release};
 use crate::jj::Repo;
-use crate::release_model::{
-    ConsumerHeadMemo, release_order, repo_slug, scan_consumer_slug_with_heads,
-};
+use crate::release_model::{release_order, repo_slug};
 
 struct ReleaseState {
     newest: Option<String>,
@@ -87,7 +86,7 @@ pub fn pin_lag(
     entry: &RepoEntry,
     newest: Option<&String>,
     repo: Option<&Repo>,
-    forge: &dyn crate::forge::Forge,
+    forge: &dyn ConsumerPinSource,
     cache_root: Option<&Path>,
     heads: &ConsumerHeadMemo,
 ) -> PinLag {
@@ -108,7 +107,7 @@ fn dated_pin_lag(
     entry: &RepoEntry,
     newest: Option<&String>,
     scheme: &ReleaseScheme,
-    forge: &dyn crate::forge::Forge,
+    forge: &dyn ConsumerPinSource,
     cache_root: Option<&Path>,
     heads: &ConsumerHeadMemo,
 ) -> PinLag {
@@ -177,7 +176,7 @@ fn fixed_pin_lag(
     repo: Option<&Repo>,
     fixed: &BranchName,
     scheme: &ReleaseScheme,
-    forge: &dyn crate::forge::Forge,
+    forge: &dyn ConsumerPinSource,
     cache_root: Option<&Path>,
     heads: &ConsumerHeadMemo,
 ) -> PinLag {
@@ -257,7 +256,7 @@ fn render_with_releases(
     registry: &Registry,
     releases: &BTreeMap<String, ReleaseState>,
     config_path: &Path,
-    forge: &dyn crate::forge::Forge,
+    forge: &dyn ConsumerPinSource,
     cache_root: Option<&Path>,
     heads: &ConsumerHeadMemo,
 ) -> (String, bool) {
@@ -400,9 +399,9 @@ mod tests {
 
     use super::*;
     use crate::config::RepoEntry;
+    use crate::consumer_pins::ConsumerHeadMemo;
     use crate::forge::{ConsumerHead, fake::FakeForge};
     use crate::ids::{BookmarkRef, BranchName, CommitId, RemoteName};
-    use crate::release_model::ConsumerHeadMemo;
     fn entry(release: Option<&str>) -> RepoEntry {
         RepoEntry {
             path: PathBuf::from("/tmp/a-repo"),

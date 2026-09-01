@@ -18,6 +18,7 @@ use super::{
     PullFacts, PullRequest, PullSummary, RepoIdentity, SweepEntry, SweepPage, TimelineEvent,
     TimelineEventKind,
 };
+use crate::consumer_pins::ConsumerPinSource;
 const PR_STATE: &str = "all";
 // headRepositoryOwner is what makes a pull request ours or someone else's. Without
 // it, ownership was inferred from the head branch name, so an outside contributor
@@ -359,7 +360,9 @@ impl Forge for CliForge {
             joined_forge_call(worker.join())
         })
     }
+}
 
+impl ConsumerPinSource for CliForge {
     fn consumer_head(&self, repo: &Path, slug: &str) -> Result<ConsumerHead, ForgeError> {
         let Some((owner, name)) = slug.split_once('/') else {
             return Err(ForgeError::Target {
@@ -1351,6 +1354,25 @@ printf '{}'
     }
 
     #[test]
+    fn null_merge_facts_remain_explicitly_unknown() {
+        // A null merge fact is an incomplete forge answer, not an empty string that
+        // downstream status logic could mistake for non-conflicting or on-base.
+        let payload = facts_payload(
+            r#""p134":{"number":134,"state":"OPEN","headRefName":"feat/x",
+        "headRefOid":"0123456789abcdef0123456789abcdef01234567",
+        "updatedAt":"2026-08-30T00:00:00Z","baseRefName":null,
+        "mergeable":null,"mergeStateStatus":null}"#,
+        );
+
+        let facts = parse_pull_facts(&payload, &[134]).expect("null merge facts decode");
+        let encoded = serde_json::to_value(&facts[&134].pull).expect("pull serialises");
+
+        assert!(encoded["mergeable"].is_null(), "was: {encoded}");
+        assert!(encoded["mergeStateStatus"].is_null(), "was: {encoded}");
+        assert!(encoded["baseRefName"].is_null(), "was: {encoded}");
+    }
+
+    #[test]
     fn a_null_required_string_in_the_facts_batch_fails_to_decode() {
         let payload = facts_payload(
             r#""p134":{"number":134,"state":null,"headRefName":"feat/x",
@@ -1385,7 +1407,7 @@ printf '{}'
         );
         let facts = parse_pull_facts(&payload, &[7]).expect("facts parse");
         let fact = &facts[&7];
-        assert_eq!(fact.pull.mergeable, "CONFLICTING");
+        assert_eq!(fact.pull.mergeable.as_deref(), Some("CONFLICTING"));
         assert_eq!(
             fact.pull
                 .head_repository_owner

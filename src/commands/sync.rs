@@ -632,8 +632,8 @@ mod tracking_tests {
 mod comment_activity_tests {
     use super::{test_pull, *};
     use crate::forge::{
-        ConsumerHead, Forge, ForgeError, PullFacts, PullRequest, PullSummary, RepoIdentity,
-        SweepEntry, SweepPage, TimelineEvent,
+        Forge, ForgeError, PullFacts, PullRequest, PullSummary, RepoIdentity, SweepEntry,
+        SweepPage, TimelineEvent,
     };
     use crate::ids::RepoName;
     use crate::store::Store;
@@ -730,24 +730,6 @@ mod comment_activity_tests {
                 detail: "comment fetch failed".to_owned(),
             })
         }
-
-        fn consumer_head(&self, _repo: &Path, _slug: &str) -> Result<ConsumerHead, ForgeError> {
-            Err(ForgeError::Query {
-                detail: "consumer lookups are not part of this test".to_owned(),
-            })
-        }
-
-        fn file_at(
-            &self,
-            _repo: &Path,
-            _slug: &str,
-            _commit: &str,
-            _path: &str,
-        ) -> Result<Option<String>, ForgeError> {
-            Err(ForgeError::Query {
-                detail: "consumer lookups are not part of this test".to_owned(),
-            })
-        }
     }
 
     struct PullListUnavailable;
@@ -798,24 +780,6 @@ mod comment_activity_tests {
             _number: u64,
         ) -> Result<Vec<TimelineEvent>, ForgeError> {
             Ok(Vec::new())
-        }
-
-        fn consumer_head(&self, _repo: &Path, _slug: &str) -> Result<ConsumerHead, ForgeError> {
-            Err(ForgeError::Query {
-                detail: "consumer lookups are not part of this test".to_owned(),
-            })
-        }
-
-        fn file_at(
-            &self,
-            _repo: &Path,
-            _slug: &str,
-            _commit: &str,
-            _path: &str,
-        ) -> Result<Option<String>, ForgeError> {
-            Err(ForgeError::Query {
-                detail: "consumer lookups are not part of this test".to_owned(),
-            })
         }
     }
 

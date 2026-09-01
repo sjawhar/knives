@@ -13,6 +13,7 @@ use super::{
     ChecksSummary, ConsumerHead, Forge, ForgeError, PullDetails, PullFacts, PullRequest,
     PullSummary, RepoIdentity, SweepEntry, SweepPage, TimelineEvent,
 };
+use crate::consumer_pins::ConsumerPinSource;
 use crate::ids::BranchName;
 /// Facts supplied directly, for tests.
 ///
@@ -66,9 +67,9 @@ const fn vanished_pull(number: u64, state: String) -> PullRequest {
         is_draft: false,
         url: String::new(),
         head_repository_owner: None,
-        mergeable: String::new(),
-        merge_state_status: String::new(),
-        base_ref_name: String::new(),
+        mergeable: Some(String::new()),
+        merge_state_status: Some(String::new()),
+        base_ref_name: Some(String::new()),
         merge_commit: None,
     }
 }
@@ -174,7 +175,9 @@ impl Forge for FakeForge {
         }
         Ok(self.timeline.get(&number).cloned().unwrap_or_default())
     }
+}
 
+impl ConsumerPinSource for FakeForge {
     fn consumer_head(&self, _repo: &Path, slug: &str) -> Result<ConsumerHead, ForgeError> {
         self.consumer_head_calls.fetch_add(1, Ordering::SeqCst);
         if self.fail_consumer_head {

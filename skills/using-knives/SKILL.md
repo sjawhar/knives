@@ -19,19 +19,28 @@ Every command takes its repo from the directory you are standing in. Name one on
 
 ### `knives repos`
 
-What is managed, where each checkout is, the newest release each has cut, and, where consumers are recorded, whether those consumers are pinned behind the newest cut. Trusted entries, which are repositories whose instructions we read but do not maintain, are listed separately.
+What is managed, where each checkout is, the newest release each has cut, and, where consumer
+slugs are recorded, whether their repository trunks are pinned behind the newest cut. Trusted
+entries, which are repositories whose instructions we read but do not maintain, are listed
+separately.
 
-Pins are read from each consumer's origin trunk rather than its working copy. Notes report when a consumer checkout is behind its origin trunk (`checkout is N commit(s) behind its <branch>`), when no origin trunk resolves (`no origin trunk resolved; pins read from the working copy`), or when a consumer is not a repository (`not a repository; pins read from the working copy`). Under a fixed scheme, a branch-name pin with no locked commit is current by definition, and a locked commit is behind when it is an ancestor of the branch tip.
+Registered consumers are fetched by forge slug: Knives reads supported pin files at the consumer
+repository's trunk and caches the result by its commit. When the forge is down, cache-backed pins
+are labeled as such and the result is incomplete. `--consumer PATH` is separate: it performs an
+ad-hoc local scan and never persists the path. Under a fixed scheme, a branch-name pin with no
+locked commit is current by definition, and a locked commit is behind when it is an ancestor of
+the branch tip.
 
 ### `knives consumers [FORK] [--consumer PATH]...`
 
-Checks every registered consumer checkout for a fork, plus any repeatable `--consumer` paths,
-against the newest release on the live publish remote. A missing path is an unanswered problem;
+Checks every registered forge consumer for a fork, plus any repeatable ad-hoc `--consumer` local
+scans, against the newest release on the live publish remote. An unavailable forge is incomplete,
+including when cache-backed pins can be reported; a missing local path is an unanswered problem;
 a reachable consumer that does not pin the fork is a note. It finds stale frozen locks, pins to
 older or unknown release names, and disagreement between consumers without editing a consumer.
-A pin at a reference outside the release scheme (a consumer's own tag or branch) is reported
-as a fact with an `off-scheme` verdict — never as "does not pin", and never as a finding.
-The local checkout's release view is compared with the live remote and reported when they differ.
+A pin at a reference outside the release scheme (a consumer's own tag or branch) is reported as a
+fact with an `off-scheme` verdict — never as "does not pin", and never as a finding. The local
+checkout's release view is compared with the live remote and reported when they differ.
 
 ### `knives pushed [BRANCH]... [--repo REPO]`
 
@@ -312,7 +321,10 @@ A release is a flat octopus merge of feature and fix branches, and its parent se
 - `knives release drop <branch> --why "..."`: remove a branch's parent from the release in hand. The branch and its bookmark are untouched. A branch that advanced past its released parent still resolves by ancestry; a commit id works when no bookmark does. The reason is recorded on the release commit itself, and is required: dropping shipped content without one is how a release becomes unexplainable later, so omitting it is a usage error.
 - `knives release advance [<branch>...] [--from <old-sha>]`: move member parents to their branches' current tips. Named branches move exactly; a bare `advance` moves every member whose branch has advanced. The trunk parent is `rebase`'s domain. Matching a branch to its released parent is ancestry-based, so it refuses rather than guess whenever that is unsafe: a bare advance refuses outright if the *same* branch would replace more than one parent (a stacked integration branch satisfying the ancestry check for several stale parents at once is not evidence it replaced all of them). `--from <old-sha>` names the exact old parent one named branch replaces, bypassing the ancestry search — the tool for a branch rebuilt with `jj duplicate`, whose new tip shares no history with the commit it replaces; requires exactly one named branch.
 - All three edits share a rebase's two refusals, both `Incomplete`: when every pin of the release is frozen on a revision, editing it in place would reach nobody, so cut a new dated release instead; and when the upstream trunk cannot be resolved, nothing can separate the release's base parents from its members, so fetch upstream first.
-- `knives release --consumer <DIR>`: scans an extra consumer checkout directory alongside any consumers recorded in `repos.toml`. Repeatable (`--consumer <DIR1> --consumer <DIR2>`), because a fork can be consumed by several checkouts sitting on different releases. It widens planning and cutting; `include`, `drop`, `advance` and `rebase` read the recorded consumers only, so record a consumer that should count towards their pin gate.
+- `knives release --consumer <DIR>`: runs an ad-hoc local scan alongside the registered forge
+  slugs in `repos.toml`. Repeatable (`--consumer <DIR1> --consumer <DIR2>`), it widens planning
+  and cutting; `include`, `drop`, `advance` and `rebase` read only the recorded forge consumers,
+  so add a slug for a repository that should count towards their pin gate.
 
 ### `knives register [DIR]`
 
@@ -359,7 +371,7 @@ upstream = "https://forge.invalid/org/scout"
 origin = "https://forge.invalid/ours/scout"
 base = "main"                         # optional: upstream's trunk (defaults to main; set e.g. "dev" for opencode-style forks)
 release_branch = "release"            # optional: fixed release branch scheme (omit for dated release/YYYY-MM-DD)
-consumers = ["~/workbench/default"] # optional: consumer checkouts pinning this repo's releases
+consumers = ["acme/workbench"]       # optional: forge slugs whose trunks pin this repo's releases
 
 [trusted.workbench]
 path = "~/workbench/default"       # instructions read, not maintained
@@ -374,7 +386,9 @@ owners = ["orgname"]               # forge owners whose repos are trusted for gu
 - `[repos.*]`: managed forks. `upstream` and `origin` are required.
   - `base`: upstream's trunk — the branch we fork from, measure landed state against, and target pull requests at. Defaults to `main`. Configurable because upstreams use different trunk names (for example, opencode-style forks set `base = "dev"`).
   - `release_branch`: configures a fixed release branch scheme (e.g., `"release"` or `"integration"`). Must not be empty, equal to `base`, or sit under the `release/` prefix.
-  - `consumers`: checkouts that pin this repository's releases.
+  - `consumers`: forge slugs for repositories that pin this repository's releases. Knives scans
+    each slug's trunk through the forge and caches it by commit; use `--consumer PATH` for an
+    ad-hoc local scan.
 
 - `[trusted.*]`: unmaintained repositories whose agent instructions are trusted for reading.
 

@@ -6,13 +6,13 @@ use std::path::{Path, PathBuf};
 
 use crate::cli::Exit;
 use crate::config::{RepoEntry, Role};
+use crate::consumer_pins::{
+    ConsumerHeadMemo, ConsumerPinSource, scan_consumer_for, scan_consumer_slug_with_heads,
+};
 use crate::ids::{CommitId, ReleaseScheme, RepoName, strict_dated_release};
 use crate::jj::{self, Repo};
 use crate::pins::{Pin, PinVerdict};
-use crate::release_model::{
-    ConsumerHeadMemo, ConsumerScan, newest_release, repo_slug, scan_consumer_for,
-    scan_consumer_slug_with_heads,
-};
+use crate::release_model::{ConsumerScan, newest_release, repo_slug};
 
 /// Inputs for one fork's consumer-pin census.
 pub struct Request<'a> {
@@ -20,7 +20,7 @@ pub struct Request<'a> {
     pub entry: &'a RepoEntry,
     pub slugs: &'a [String],
     pub locals: &'a [PathBuf],
-    pub forge: &'a dyn crate::forge::Forge,
+    pub forge: &'a dyn ConsumerPinSource,
     pub cache_root: Option<&'a Path>,
     pub heads: &'a ConsumerHeadMemo,
 }
@@ -48,7 +48,7 @@ pub struct Release {
     pub source: String,
 }
 
-/// One pin observed in a consumer checkout.
+/// One pin observed in a consumer.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct PinRow {
     pub file: String,
@@ -99,7 +99,7 @@ struct ConsumerContext<'a> {
     repo_path: &'a Path,
     live: &'a BTreeMap<String, CommitId>,
     newest: Option<&'a Release>,
-    forge: &'a dyn crate::forge::Forge,
+    forge: &'a dyn ConsumerPinSource,
     cache_root: Option<&'a Path>,
     heads: &'a ConsumerHeadMemo,
 }
@@ -485,10 +485,10 @@ mod tests {
         local_remote_skew_note, render, verdict,
     };
     use crate::cli::Exit;
+    use crate::consumer_pins::ConsumerHeadMemo;
     use crate::forge::{ConsumerHead, fake::FakeForge};
     use crate::ids::{CommitId, ReleaseScheme};
     use crate::pins::{Pin, PinKind, PinVerdict};
-    use crate::release_model::ConsumerHeadMemo;
 
     fn pin(reference: &str, locked: Option<&str>) -> Pin {
         Pin {

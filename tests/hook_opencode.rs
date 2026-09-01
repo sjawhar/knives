@@ -172,6 +172,38 @@ fn tool_after_emits_notice_and_guidance_once_with_one_shared_budget() {
 }
 
 #[test]
+fn a_notice_only_event_does_not_spend_the_guidance_budget() {
+    // Given: a managed repository that has both an outstanding notice and guidance.
+    let repos = Repositories::new();
+
+    // When: the first relevant event requests only notice, then guidance is requested.
+    let notice_only = run_hook(
+        repos.home.path(),
+        &tool(
+            &repos.beta.join("file.txt"),
+            Some(json!({"notice": true, "guidance": false})),
+        ),
+    );
+    let guidance = run_hook(
+        repos.home.path(),
+        &tool(
+            &repos.beta.join("file.txt"),
+            Some(json!({"notice": false, "guidance": true})),
+        ),
+    );
+
+    // Then: the notice did not mark guidance as rendered.
+    assert!(
+        addition(&notice_only).contains("<knives-notice-"),
+        "was: {notice_only}"
+    );
+    assert!(
+        addition(&guidance).contains("<knives-guidance-"),
+        "was: {guidance}"
+    );
+}
+
+#[test]
 fn the_same_roster_is_noticed_once_per_session() {
     // Removing content-aware notice tracking would re-inject on the second
     // identical event, creating repetitive hook output.
@@ -464,30 +496,20 @@ fn chat_system_returns_guidance_for_a_trusted_directory() {
 }
 
 #[test]
-fn shell_env_returns_the_managed_claim_owner_only() {
-    // Given: a managed root with one claim, a trusted root, and an outside directory.
+fn shell_env_exports_its_event_session_never_a_claim_owner() {
+    // Given: a fresh shell event under a managed repository with an existing foreign claim.
     let repos = Repositories::new();
-    let outside = repos.home.path().join("outside");
-    std::fs::create_dir_all(&outside).expect("create outside directory");
+    let event = json!({
+        "event": "shell.env",
+        "session_id": "fresh-opencode-session",
+        "cwd": repos.beta
+    });
 
-    // When: the shim requests an owner for each directory.
-    let managed = run_hook(
-        repos.home.path(),
-        &json!({"event": "shell.env", "cwd": repos.beta}),
-    );
-    let trusted = run_hook(
-        repos.home.path(),
-        &json!({"event": "shell.env", "cwd": repos.trusted}),
-    );
-    let outside = run_hook(
-        repos.home.path(),
-        &json!({"event": "shell.env", "cwd": outside}),
-    );
+    // When: OpenCode requests its shell environment.
+    let output = run_hook(repos.home.path(), &event);
 
-    // Then: only the managed repository has an owner.
-    assert_eq!(managed, json!({"owner": "agent-one"}));
-    assert_eq!(trusted, json!({"owner": null}));
-    assert_eq!(outside, json!({"owner": null}));
+    // Then: start receives the fresh harness identity, not the stored claim holder.
+    assert_eq!(output, json!({"owner": "fresh-opencode-session"}));
 }
 
 #[test]
@@ -510,51 +532,14 @@ fn shell_env_never_exports_a_claim_owner_for_a_trusted_repo() {
 }
 
 #[test]
-fn shell_env_returns_an_environment_owner_outside_any_root() {
-    // Given: an outside directory and an explicit owner override.
+fn shell_env_without_an_event_session_exports_no_owner() {
+    // An inherited shell variable or stored claim cannot create a harness identity.
     let repos = Repositories::new();
-    let outside = repos.home.path().join("outside");
-    std::fs::create_dir_all(&outside).expect("create outside directory");
-    let event = json!({"event": "shell.env", "cwd": outside});
-
-    // When: OpenCode requests its shell environment.
-    let output = run_hook_with_owner(repos.home.path(), &event, Some("env-owner"));
-
-    // Then: the explicit owner does not require a managed repository match.
-    assert_eq!(output, json!({"owner": "env-owner"}));
-}
-
-#[test]
-fn shell_env_returns_an_environment_owner_for_a_trusted_root() {
-    // Given: a trusted root and an explicit owner override.
-    let repos = Repositories::new();
-    let event = json!({"event": "shell.env", "cwd": repos.trusted});
-
-    // When: OpenCode requests its shell environment.
-    let output = run_hook_with_owner(repos.home.path(), &event, Some("env-owner"));
-
-    // Then: the explicit owner wins before managed-root filtering.
-    assert_eq!(output, json!({"owner": "env-owner"}));
-}
-
-#[test]
-fn shell_env_prefers_current_agent_over_claim_owners() {
-    // Given: a managed root with both a current agent and a distinct claim owner.
-    let repos = Repositories::new();
-    repos.write_state(&json!({
-        "currentAgent": "current-agent",
-        "claims": {"beta/feat/claimed": {
-            "repo": "beta", "branch": "feat/claimed", "owner": "claim-agent",
-            "why": "porting", "started": "2026-01-01T00:00:00Z", "files": []
-        }}
-    }));
     let event = json!({"event": "shell.env", "cwd": repos.beta});
 
-    // When: OpenCode requests the owner.
-    let output = run_hook(repos.home.path(), &event);
+    let output = run_hook_with_owner(repos.home.path(), &event, Some("inherited-owner"));
 
-    // Then: the state-level current agent wins.
-    assert_eq!(output, json!({"owner": "current-agent"}));
+    assert_eq!(output, json!({"owner": null}));
 }
 
 #[test]
@@ -692,7 +677,7 @@ fn chat_system_returns_an_empty_envelope_when_the_registry_is_malformed() {
 }
 
 #[test]
-fn shell_env_returns_an_empty_envelope_when_the_registry_is_malformed() {
+fn shell_env_ignores_a_malformed_registry() {
     // Given: a shell-environment event and a malformed registry.
     let home = tempfile::tempdir().expect("config home");
     std::fs::write(home.path().join("repos.toml"), "[[[garbage").expect("write malformed registry");
@@ -701,14 +686,14 @@ fn shell_env_returns_an_empty_envelope_when_the_registry_is_malformed() {
     // When: the event reaches the hook binary.
     let (success, output, errors) = run_hook_input(home.path(), &event.to_string());
 
-    // Then: the environment envelope remains parseable and the error is on stderr.
+    // Then: shell owner comes only from the event session, never registry state.
     assert!(success);
     assert_eq!(output, r#"{"owner":null}"#);
-    assert!(!errors.is_empty(), "registry failure is reported on stderr");
+    assert!(errors.is_empty(), "stderr: {errors}");
 }
 
 #[test]
-fn shell_env_returns_an_empty_envelope_when_the_state_is_malformed() {
+fn shell_env_ignores_malformed_state() {
     // Given: a managed shell-environment event and malformed state.
     let repos = Repositories::new();
     std::fs::write(repos.home.path().join("state.json"), "[[[garbage")
@@ -718,10 +703,10 @@ fn shell_env_returns_an_empty_envelope_when_the_state_is_malformed() {
     // When: the event reaches the hook binary.
     let (success, output, errors) = run_hook_input(repos.home.path(), &event.to_string());
 
-    // Then: the environment envelope remains parseable and the error is on stderr.
+    // Then: shell owner comes only from the event session, never persisted state.
     assert!(success);
     assert_eq!(output, r#"{"owner":null}"#);
-    assert!(!errors.is_empty(), "state failure is reported on stderr");
+    assert!(errors.is_empty(), "stderr: {errors}");
 }
 
 #[test]

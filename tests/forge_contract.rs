@@ -71,7 +71,10 @@ fn every_field_we_request_survives_a_real_payload() {
     );
     assert!(parsed.iter().any(|pr| !pr.url.is_empty()), "url");
     assert!(
-        parsed.iter().any(|pr| !pr.base_ref_name.is_empty()),
+        parsed.iter().any(|pr| pr
+            .base_ref_name
+            .as_deref()
+            .is_some_and(|base| !base.is_empty())),
         "baseRefName"
     );
     assert!(parsed.iter().any(|pr| pr.is_draft), "isDraft");
@@ -102,7 +105,7 @@ fn every_summary_field_is_requested() {
         is_draft: false,
         url: String::new(),
         head_repository_owner: None,
-        base_ref_name: String::new(),
+        base_ref_name: Some(String::new()),
         merge_commit: None,
     })
     .expect("PullSummary serialises");
@@ -135,9 +138,9 @@ fn every_fact_field_is_in_the_batch_fragment() {
         is_draft: false,
         url: String::new(),
         head_repository_owner: None,
-        mergeable: String::new(),
-        merge_state_status: String::new(),
-        base_ref_name: String::new(),
+        mergeable: Some(String::new()),
+        merge_state_status: Some(String::new()),
+        base_ref_name: Some(String::new()),
         merge_commit: None,
     })
     .expect("PullRequest serialises");

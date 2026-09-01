@@ -275,7 +275,7 @@ fn run_consumers(
     locals.dedup();
     let forge = CliForge;
     let cache_root = knives::forge_cache::cache_root();
-    let heads = knives::release_model::ConsumerHeadMemo::default();
+    let heads = knives::consumer_pins::ConsumerHeadMemo::default();
     let report = consumers::gather(&consumers::Request {
         fork,
         entry,
@@ -453,7 +453,7 @@ fn run_release_members(
     let opened = Repo::open(&entry.path)?;
     let forge = CliForge;
     let cache_root = knives::forge_cache::cache_root();
-    let heads = knives::release_model::ConsumerHeadMemo::default();
+    let heads = knives::consumer_pins::ConsumerHeadMemo::default();
     let reference = if let Some(reference) = request.reference {
         std::borrow::Cow::Borrowed(reference)
     } else {
@@ -782,7 +782,7 @@ fn run_rebase(
     locals.dedup();
     let mut worst = Exit::Ok;
     let forge = CliForge;
-    let heads = knives::release_model::ConsumerHeadMemo::default();
+    let heads = knives::consumer_pins::ConsumerHeadMemo::default();
     for (repo, entry) in chosen {
         let opened = knives::jj::Repo::open(&entry.path)?;
         let consumers = release::ConsumerInputs {
@@ -793,6 +793,11 @@ fn run_rebase(
             heads: &heads,
         };
         let plan = release::plan(&repo, &entry, &consumers)?;
+        if !plan.problems.is_empty() {
+            println!("{}", release::render(&plan));
+            worst = worst.worst(Exit::Incomplete);
+            continue;
+        }
         let Some(release_name) = plan.release.clone() else {
             println!("{repo}: no release to move");
             continue;
@@ -1186,7 +1191,7 @@ fn verified_merged_candidates(
     for candidate in candidates {
         let fact = snapshot.fact(candidate.number)?;
         let pull = &fact.pull;
-        if pull.is_merged() && pull.base_ref_name == trunk {
+        if pull.is_merged() && pull.base_ref_name.as_deref() == Some(trunk) {
             landed.push(pull.clone());
         }
     }
@@ -1501,7 +1506,7 @@ fn run_release_edit(
     let mut worst = Exit::Ok;
     let forge = CliForge;
     let cache_root = knives::forge_cache::cache_root();
-    let heads = knives::release_model::ConsumerHeadMemo::default();
+    let heads = knives::consumer_pins::ConsumerHeadMemo::default();
     for (repo, entry) in chosen {
         worst = worst.worst(edit_release(
             &repo,
@@ -1531,9 +1536,9 @@ fn edit_release(
     entry: &knives::config::RepoEntry,
     locals: &[std::path::PathBuf],
     change: &ReleaseEdit,
-    forge: &dyn Forge,
+    forge: &dyn knives::consumer_pins::ConsumerPinSource,
     cache_root: Option<&std::path::Path>,
-    heads: &knives::release_model::ConsumerHeadMemo,
+    heads: &knives::consumer_pins::ConsumerHeadMemo,
 ) -> anyhow::Result<Exit> {
     let opened = knives::jj::Repo::open(&entry.path)?;
     let consumers = release::ConsumerInputs {
@@ -1544,6 +1549,10 @@ fn edit_release(
         heads,
     };
     let plan = release::plan(repo, entry, &consumers)?;
+    if !plan.problems.is_empty() {
+        println!("{}", release::render(&plan));
+        return Ok(Exit::Incomplete);
+    }
     let Some(release_name) = plan.release.clone() else {
         println!("{repo}: no release to edit; cut one first");
         return Ok(Exit::Incomplete);
@@ -2337,11 +2346,9 @@ fn run_finish(target: &BranchTarget, options: &FinishOptions<'_>) -> anyhow::Res
         store.supersede(target, new);
     }
     let pr = store.tracked_pull(target);
-    store.save()?;
-    // What happened, and nothing else. This command runs happily on a branch
-    // nobody held — it says "was not held" and forgets the workspace anyway —
-    // and an event asserting a release would be a false fact in the one record
-    // that exists to be believed later.
+    // Persist the immutable explanation before the mutable claim state. A failed
+    // append then leaves the old claim in place instead of silently releasing or
+    // seizing work without the provenance that explains why.
     if let Some(text) = forced_release {
         let scribe = scribe_for(&target.repo, entry)?;
         scribe.event(Some(target.branch.as_str()), text, pr)?;
@@ -2355,6 +2362,7 @@ fn run_finish(target: &BranchTarget, options: &FinishOptions<'_>) -> anyhow::Res
     } else if let Some(text) = release_event(had, options.superseded_by) {
         scribe_for(&target.repo, entry)?.event(Some(target.branch.as_str()), text, pr)?;
     }
+    store.save()?;
 
     let claim = if had { "released" } else { "was not held" };
     if let Err(error) = knives::jj::forget_workspace(&entry.path, &workspace) {
@@ -2790,7 +2798,7 @@ fn run_release(
     locals.dedup();
     let forge = CliForge;
     let cache_root = knives::forge_cache::cache_root();
-    let heads = knives::release_model::ConsumerHeadMemo::default();
+    let heads = knives::consumer_pins::ConsumerHeadMemo::default();
     for (repo, entry) in chosen {
         let opened = knives::jj::Repo::open(&entry.path)?;
         let scheme = entry.release_scheme();
@@ -2798,7 +2806,7 @@ fn run_release(
             Ok(request) => request,
             Err(exit) => return Ok(exit),
         };
-        worst = worst.worst(release_plan_exit(
+        let plan_exit = release_plan_exit(
             &repo,
             &entry,
             &locals,
@@ -2806,7 +2814,11 @@ fn run_release(
             &forge,
             cache_root.as_deref(),
             &heads,
-        )?);
+        )?;
+        worst = worst.worst(plan_exit);
+        if plan_exit == Exit::Incomplete {
+            continue;
+        }
 
         if let Some(name) = cut_name {
             let trunk_name = entry.upstream_trunk();
@@ -2935,9 +2947,9 @@ fn release_plan_exit(
     entry: &knives::config::RepoEntry,
     locals: &[std::path::PathBuf],
     opened: &knives::jj::Repo,
-    forge: &dyn Forge,
+    forge: &dyn knives::consumer_pins::ConsumerPinSource,
     cache_root: Option<&std::path::Path>,
-    heads: &knives::release_model::ConsumerHeadMemo,
+    heads: &knives::consumer_pins::ConsumerHeadMemo,
 ) -> anyhow::Result<Exit> {
     let consumers = release::ConsumerInputs {
         slugs: &entry.consumers,

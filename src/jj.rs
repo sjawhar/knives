@@ -43,6 +43,15 @@ pub enum JjError {
         expected: PathBuf,
         actual: PathBuf,
     },
+    #[error(
+        "workspace {workspace} is named {actual}, but the requested branch requires {expected}"
+    )]
+    WorkspaceNameMismatch {
+        workspace: PathBuf,
+        expected: WorkspaceName,
+        actual: String,
+    },
+
     #[error("could not resolve revision `{revision}`: {detail}")]
     Revision { revision: String, detail: String },
     #[error("reference `{name}` is absent or conflicted")]
@@ -175,7 +184,11 @@ impl Repo {
     /// The forgotten workspace's state points at the operation that last owned
     /// its working-copy commit. Reinstating that mapping and advancing only the
     /// state operation preserves the files and change exactly as they were.
-    pub fn reattach_workspace(&self, destination: &Path) -> Result<(), JjError> {
+    pub fn reattach_workspace(
+        &self,
+        destination: &Path,
+        expected_name: &WorkspaceName,
+    ) -> Result<(), JjError> {
         let expected = Self::repository_store_path(&self.path)?;
         let actual = Self::repository_store_path(destination)?;
         if actual != expected {
@@ -213,6 +226,13 @@ impl Repo {
             });
         }
         let name = workspace.workspace_name().to_owned();
+        if name.as_str() != expected_name.as_str() {
+            return Err(JjError::WorkspaceNameMismatch {
+                workspace: destination.to_owned(),
+                expected: expected_name.clone(),
+                actual: name.as_symbol().to_string(),
+            });
+        }
         let recorded = workspace.working_copy().operation_id().clone();
         let repo_loader = workspace.repo_loader();
         let operation =

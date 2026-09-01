@@ -164,12 +164,12 @@ pub enum Command {
     },
     /// List the repos knives manages, with their release state.
     Repos,
-    /// Which consumer checkouts and locks resolve this fork at which commit,
-    /// against the newest published release. Reports; never edits a consumer.
+    /// Which registered forge consumers and ad-hoc local scans resolve this fork
+    /// at which commit against the newest published release. Reports; never edits a consumer.
     Consumers {
         /// Registry name. Defaults to the repo you are standing in.
         fork: Option<String>,
-        /// Extra consumer checkouts beyond the registry's list.
+        /// Extra ad-hoc local consumer scans, beyond the registry's forge slugs.
         #[arg(long)]
         consumer: Vec<PathBuf>,
     },

@@ -152,7 +152,7 @@ upstream = "https://forge.example/org/libcore"
 origin = "https://forge.example/ours/libcore"
 base = "main"                         # optional: upstream's trunk (defaults to main)
 release_branch = "release"            # optional: fixed release branch scheme (omit for dated release/YYYY-MM-DD)
-consumers = ["~/workbench/default"] # optional: who pins this repo's releases
+consumers = ["acme/workbench"]       # optional: forge slugs whose trunks pin this repo's releases
 
 [trusted.workbench]
 path = "~/workbench/default"       # instructions read, not maintained
@@ -166,6 +166,11 @@ malformed entry fails there rather than at the first query. `release` is a fourt
 remote for when releases are consumed somewhere other than your own fork; it falls back to
 `origin`.
 
+`consumers` records forge slugs, not checkout paths. Knives reads supported pin files from each
+consumer repository's trunk and caches that scan by the trunk commit. If the forge is unavailable,
+cached results are labeled as such and the command is incomplete; pass `--consumer PATH` for an
+ad-hoc local scan without recording the path.
+
 Every command takes its repo from the directory you are standing in. Name one only when you
 are somewhere else.
 
@@ -173,8 +178,8 @@ are somewhere else.
 
 | | |
 |---|---|
-| `knives repos` | what is managed, the newest release each has cut, and whether consumer origin trunks are pinned behind it |
-| `knives consumers [FORK] [--consumer PATH]...` | compare registered and extra consumer pins with the newest release on the live publish remote; reports only |
+| `knives repos` | what is managed, the newest release each has cut, and whether registered forge consumers pin it |
+| `knives consumers [FORK] [--consumer PATH]...` | compare registered forge consumers and ad-hoc local scans with the newest release on the live publish remote; reports only |
 | `knives pushed [BRANCH]... [--repo REPO]` | compare local branches with the live remote refs that own them; reports only |
 | `knives audit [REPO] [--all] [--no-github]` | reconcile remote refs, open pull heads, recorded cuts, and anonymous heads; reports only and never repairs |
 | `knives status` | the main report |

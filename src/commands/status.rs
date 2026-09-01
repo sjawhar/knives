@@ -7,7 +7,7 @@ use crate::cli::Exit;
 use crate::config::{Registry, RepoEntry, Role};
 use crate::detect::{
     BookmarkTips, Finding, FindingKind, LandedVerdict, Subject, classify_landed, divergent_changes,
-    double_checkout, stale_parents,
+    double_checkout,
 };
 use crate::forge::{
     ChecksSummary, Forge, PullDetails, PullIndex, PullRequest, PullSummary, index_pulls,
@@ -16,17 +16,22 @@ use crate::ids::{
     BookmarkRef, BranchName, BranchTarget, CommitId, ReleaseScheme, RepoName, is_release_name,
     pull_number_from_bookmark,
 };
-use crate::jj::{JjError, Repo, branches_past, probe_landed};
+use crate::jj::{JjError, Repo, probe_landed};
 use crate::ledger::{Entry as Notch, Ledger};
-use crate::release_model::{double_cut_findings, release_order};
 use crate::store::Store;
 
-use crate::ids::is_our_release;
-
+mod claims;
+mod dependencies;
+mod overlap;
 pub mod phases;
+mod releases;
 pub mod render;
 mod rows;
 
+use claims::{ClaimFoldInput, fold_claims, notches_from_ledger, repo_notches};
+use dependencies::{DependencyInput, add_dependency_findings};
+use overlap::{CarriedFindingInput, add_branch_overlap_findings, carried_findings};
+use releases::{ReleaseInput, add_releases};
 #[derive(Debug, Clone)]
 pub struct BranchRow {
     pub name: BranchName,
@@ -430,244 +435,6 @@ impl fmt::Debug for Options<'_> {
     }
 }
 
-struct ReleaseScan<'a> {
-    path: &'a std::path::Path,
-    tips: &'a BookmarkTips,
-    scheme: &'a ReleaseScheme,
-    publish_remote: &'a str,
-}
-
-/// Which releases were scanned, what was found, and how many were skipped.
-///
-/// Extracted from `gather` because that function had grown past what one
-/// reviewer can hold at once, not to be reused.
-fn scan_releases(
-    repo: &Repo,
-    input: &ReleaseScan<'_>,
-) -> anyhow::Result<(Vec<String>, Vec<Finding>, usize)> {
-    let (releases, skipped) = releases_to_scan(input.tips, input.scheme, input.publish_remote);
-    let mut names = Vec::new();
-    let mut findings = Vec::new();
-    for (release, commit) in &releases {
-        names.push(release.to_string());
-        // Resolve by commit id, never by the bookmark's display form. A remote
-        // bookmark rendered `name@remote` is not reliably resolvable as a
-        // revset, and the tip map already carries the commit.
-        let mut stale = stale_parents(&repo.parents_of(commit.as_str())?, input.tips);
-        // Say where the branch went, not just that nothing points at the parent.
-        // `parents_of` only reports bookmarks pointing AT a parent, so the pure
-        // detector can never produce the "feat/x is now <id>" payload.
-        for finding in &mut stale {
-            let Subject::Commit(parent) = finding.subject.clone() else {
-                continue;
-            };
-            if let Ok(moved) = branches_past(input.path, &parent)
-                && !moved.is_empty()
-            {
-                let where_now = moved
-                    .iter()
-                    .map(|(branch, tip)| format!("{branch} is now {}", short(tip.as_str())))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                finding.detail = format!(
-                    "parent {} is no longer the tip of its branch ({where_now})",
-                    short(parent.as_str())
-                );
-            }
-        }
-        findings.extend(stale);
-    }
-    Ok((names, findings, skipped))
-}
-
-/// Declared dependencies that are not satisfied yet.
-///
-/// A branch can require a pull request in a sibling fork. Dropping the required one
-/// from a release without dropping the branch that needs it ships a release that
-/// cannot work, which is exactly what happened when one repo's #4545 was dropped
-/// while a sibling's #49 still needed it. Satisfied means merged: an open pull
-/// request may still change or be rejected.
-struct DependencyContext<'a, 'snapshot> {
-    store: &'a Store,
-    registry: &'a Registry,
-    forge: Option<&'a dyn Forge>,
-    snapshot: Option<&'a crate::snapshot::CompletedSnapshot<'snapshot>>,
-}
-
-struct DependencyResults<'a> {
-    findings: &'a mut Vec<Finding>,
-    problems: &'a mut Vec<String>,
-}
-
-impl DependencyResults<'_> {
-    fn record(
-        &mut self,
-        branch: &BranchName,
-        requirement: &crate::ids::Requirement,
-        state: Option<&str>,
-    ) {
-        match state {
-            Some(state) if state.eq_ignore_ascii_case("MERGED") => {}
-            Some(state) => self.findings.push(Finding::new(
-                FindingKind::UnmetDependency,
-                Subject::Branch(branch.clone()),
-                format!(
-                    "{branch} requires {requirement}, which is {}",
-                    state.to_lowercase()
-                ),
-            )),
-            None => self.problems.push(format!(
-                "{branch} requires {requirement}, which the forge did not report on"
-            )),
-        }
-    }
-}
-
-fn unmet_dependencies(
-    repo: &RepoName,
-    branches: &[BranchRow],
-    context: &DependencyContext<'_, '_>,
-) -> (Vec<Finding>, Vec<String>) {
-    let DependencyContext {
-        store,
-        registry,
-        forge,
-        snapshot,
-    } = *context;
-    let mut grouped: BTreeMap<RepoName, Vec<(BranchName, crate::ids::Requirement)>> =
-        BTreeMap::new();
-    for row in branches {
-        let target = BranchTarget::new(repo.clone(), row.name.clone());
-        for requirement in store.dependencies(&target) {
-            grouped
-                .entry(requirement.repo.clone())
-                .or_default()
-                .push((row.name.clone(), requirement));
-        }
-    }
-
-    let mut findings = Vec::new();
-    let mut problems = Vec::new();
-    {
-        let mut outcomes = DependencyResults {
-            findings: &mut findings,
-            problems: &mut problems,
-        };
-        for (required_repo, requirements) in grouped {
-            let Some(entry) = registry.get(&required_repo) else {
-                for (branch, requirement) in requirements {
-                    outcomes.problems.push(format!(
-                        "{branch} requires {requirement}, whose repo is not in the registry"
-                    ));
-                }
-                continue;
-            };
-
-            if required_repo == *repo {
-                let Some(snapshot) = snapshot else {
-                    for (branch, requirement) in requirements {
-                        outcomes.problems.push(format!(
-                        "cannot check whether {branch} still needs {requirement}: no forge consulted"
-                    ));
-                    }
-                    continue;
-                };
-                for (branch, requirement) in requirements {
-                    outcomes.record(
-                        &branch,
-                        &requirement,
-                        snapshot
-                            .fact(requirement.number)
-                            .map(|fact| fact.pull.state.as_str()),
-                    );
-                }
-                continue;
-            }
-
-            let Some(forge) = forge else {
-                for (branch, requirement) in requirements {
-                    outcomes.problems.push(format!(
-                    "cannot check whether {branch} still needs {requirement}: no forge consulted"
-                ));
-                }
-                continue;
-            };
-            let numbers: Vec<u64> = requirements
-                .iter()
-                .map(|(_, requirement)| requirement.number)
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect();
-            match forge
-                .repo_identity(&entry.path)
-                .and_then(|identity| forge.pull_facts(&entry.path, &identity, &numbers))
-            {
-                Ok(facts) => {
-                    for (branch, requirement) in requirements {
-                        outcomes.record(
-                            &branch,
-                            &requirement,
-                            facts
-                                .get(&requirement.number)
-                                .map(|fact| fact.pull.state.as_str()),
-                        );
-                    }
-                }
-                Err(error) => {
-                    for (branch, requirement) in requirements {
-                        outcomes.problems.push(format!(
-                            "cannot check whether {branch} still needs {requirement}: {error}"
-                        ));
-                    }
-                }
-            }
-        }
-    }
-    (findings, problems)
-}
-
-/// Fold declared dependencies into a report.
-///
-/// Separate from `gather` only to keep that function readable.
-struct DependencyInput<'a, 'forge, 'snapshot> {
-    report: &'a mut Report,
-    findings: &'a mut Vec<Finding>,
-    name: &'a RepoName,
-    store: &'a Store,
-    options: &'a Options<'forge>,
-    snapshot: Option<&'a crate::snapshot::CompletedSnapshot<'snapshot>>,
-    timings: &'a mut Timings,
-}
-
-fn add_dependency_findings(input: DependencyInput<'_, '_, '_>) {
-    let DependencyInput {
-        report,
-        findings,
-        name,
-        store,
-        options,
-        snapshot,
-        timings,
-    } = input;
-    let Some(registry) = options.registry else {
-        return;
-    };
-    let started = std::time::Instant::now();
-    let (found, unanswered) = unmet_dependencies(
-        name,
-        &report.branches,
-        &DependencyContext {
-            store,
-            registry,
-            forge: options.forge,
-            snapshot,
-        },
-    );
-    timings.forge += started.elapsed();
-    findings.extend(found);
-    report.problems.extend(unanswered);
-}
-
 /// One sentence naming every branch that could not be judged.
 ///
 /// One problem per branch meant ten copies of the same explanation differing only by a
@@ -697,339 +464,16 @@ fn note_fetched_heads(report: &mut Report, fetched_heads: usize) {
     }
 }
 
-/// Every notch in this repository's ledger, read once for the whole report.
-///
-/// One local file read per repository rather than one per branch. A ledger that
-/// exists and cannot be read is an unanswered question rather than an absence:
-/// a report that quietly showed no breadcrumbs would say this fork's history was
-/// never written.
-fn notches_from_ledger(ledger: Option<&Ledger>, report: &mut Report) -> Vec<Notch> {
-    let Some(ledger) = ledger else {
-        return Vec::new();
-    };
-    match ledger.entries() {
-        Ok(entries) => entries,
-        Err(error) => {
-            report.problems.push(format!("ledger unavailable: {error}"));
-            Vec::new()
-        }
-    }
-}
-
-fn repo_notches(notches: &[Notch]) -> Option<RepoNotches> {
-    let last = LastNotch::of(notches.iter().filter(|notch| notch.subject.is_none()))?;
-    Some(RepoNotches {
-        count: last.count,
-        last,
-    })
-}
-
-#[derive(Clone, Copy)]
-struct ReleaseInput<'a> {
-    repo: &'a Repo,
-    tips: &'a BookmarkTips,
-    entry: &'a RepoEntry,
-}
-
-/// Fold the release scan into a report.
-///
-/// Extracted from `gather` for the same reason `scan_releases` was: that function
-/// sits within a few lines of the file's hundred-line limit, and the breadcrumb
-/// adds to it.
-fn add_releases(
-    report: &mut Report,
-    findings: &mut Vec<Finding>,
-    input: ReleaseInput<'_>,
-) -> anyhow::Result<()> {
-    let ReleaseInput { repo, tips, entry } = input;
-    let scheme = entry.release_scheme();
-    report.newest_release =
-        crate::release_model::newest_release(tips, &scheme, entry.publish_remote())
-            .map(|(reference, _)| reference.to_string());
-    let (names, release_findings, skipped) = scan_releases(
-        repo,
-        &ReleaseScan {
-            path: &entry.path,
-            tips,
-            scheme: &scheme,
-            publish_remote: entry.publish_remote(),
-        },
-    )?;
-    report.releases = names;
-    findings.extend(release_findings);
-    let (double_cut_findings, double_cut_notes) =
-        double_cut_findings(&entry.path, tips, &scheme, entry.publish_remote())?;
-    findings.extend(double_cut_findings);
-    report.notes.extend(double_cut_notes);
-    if skipped > 0 {
-        report
-            .notes
-            .push(format!("{skipped} superseded release(s) not scanned"));
-    }
-    Ok(())
-}
-
-/// Uses all observation sources when the operation walk succeeded. If it failed,
-/// sidecar records remain trustworthy but the unobserved window is necessarily incomplete.
-fn claim_last_seen(
-    claim: &crate::store::Claim,
-    activity: Option<&crate::jj::WorkspaceActivity>,
-    seen: &crate::seen::Seen,
-) -> crate::seen::LastSeen {
-    let Some(activity) = activity else {
-        let workspace = crate::commands::wip::workspace_for(&claim.branch);
-        let workspace_key = format!("{}/{}", claim.repo, workspace);
-        let timestamps = [
-            seen.owners
-                .get(&claim.kind)
-                .and_then(|owners| owners.get(&claim.owner))
-                .and_then(|timestamp| timestamp.parse().ok()),
-            seen.workspaces
-                .get(&workspace_key)
-                .and_then(|timestamp| timestamp.parse().ok()),
-        ];
-        return timestamps.into_iter().flatten().max().map_or(
-            crate::seen::LastSeen::NoneWithinWindow,
-            crate::seen::LastSeen::At,
-        );
-    };
-    crate::seen::last_seen(claim, activity, seen)
-}
-
-#[derive(Clone, Copy)]
-struct ClaimFoldInput<'a> {
-    repo: &'a Repo,
-    name: &'a RepoName,
-    store: &'a Store,
-    seen: &'a crate::seen::Seen,
-}
-
-/// Folds claims, workspace facts, and sidecar observations into branch rows.
-fn fold_claims(
-    report: &mut Report,
-    findings: &mut Vec<Finding>,
-    input: ClaimFoldInput<'_>,
-) -> anyhow::Result<()> {
-    let ClaimFoldInput {
-        repo,
-        name,
-        store,
-        seen,
-    } = input;
-    let claims: Vec<crate::store::Claim> = store.claims(Some(name)).into_iter().cloned().collect();
-    let wanted: BTreeSet<crate::ids::WorkspaceName> = claims
-        .iter()
-        .map(|claim| {
-            crate::ids::WorkspaceName::new(crate::commands::wip::workspace_for(&claim.branch))
-        })
-        .collect();
-    let activity = match repo.workspace_activity(&wanted, crate::jj::MAX_ACTIVITY_OPS) {
-        Ok(activity) => Some(activity),
-        Err(error) => {
-            report
-                .problems
-                .push(format!("workspace activity unavailable: {error}"));
-            None
-        }
-    };
-    let mut workspaces: BTreeSet<crate::ids::WorkspaceName> = match repo.workspaces() {
-        Ok(rows) => rows.into_iter().map(|(workspace, _)| workspace).collect(),
-        Err(error) => {
-            report
-                .problems
-                .push(format!("workspaces unavailable: {error}"));
-            BTreeSet::new()
-        }
-    };
-    findings.extend(crate::commands::wip::overlaps(&touching(&claims)));
-
-    for claim in &claims {
-        if !report
-            .branches
-            .iter()
-            .any(|row| row.name.as_str() == claim.branch)
-        {
-            report
-                .branches
-                .push(BranchRow::bare(BranchName::new(&claim.branch)));
-        }
-        let row = report
-            .branches
-            .iter_mut()
-            .find(|row| row.name.as_str() == claim.branch)
-            .ok_or_else(|| anyhow::anyhow!("claim row could not be materialized"))?;
-        row.claim = Some(ClaimCell {
-            id: claim.owner.clone(),
-            kind: claim.kind,
-            since: claim.started.clone(),
-            why: claim.why.clone(),
-        });
-        match claim_last_seen(claim, activity.as_ref(), seen) {
-            crate::seen::LastSeen::At(timestamp) => row.last_seen = Some(timestamp.to_string()),
-            crate::seen::LastSeen::NoneSinceClaim => {
-                row.seen = Some(SeenWindow::NoneSinceClaim);
-            }
-            crate::seen::LastSeen::NoneWithinWindow => {
-                row.seen = Some(SeenWindow::NoneWithinWindow);
-            }
-        }
-    }
-    for row in &mut report.branches {
-        let expected =
-            crate::ids::WorkspaceName::new(crate::commands::wip::workspace_for(row.name.as_str()));
-        if workspaces.remove(&expected) {
-            row.workspace = Some(expected.to_string());
-        }
-    }
-    report.other_workspaces = workspaces
-        .into_iter()
-        .map(|workspace| workspace.to_string())
-        .collect();
-    Ok(())
-}
-
-/// Files each claim says it is touching, keyed by claim.
-fn touching(claims: &[crate::store::Claim]) -> BTreeMap<String, Vec<String>> {
-    claims
-        .iter()
-        .map(|claim| (claim.key(), claim.files.clone()))
-        .collect()
-}
-
-#[derive(Clone, Copy)]
-struct CarriedFindingInput<'a> {
-    report: &'a Report,
-    repo: &'a Repo,
-    tips: &'a BookmarkTips,
-    trunk: &'a str,
-    scheme: &'a ReleaseScheme,
-    publish_remote: &'a str,
-}
-
-/// Reports branches carried by another branch, excluding the configured trunk.
-fn carried_findings(input: CarriedFindingInput<'_>) -> anyhow::Result<Vec<Finding>> {
-    let CarriedFindingInput {
-        report,
-        repo,
-        tips,
-        trunk,
-        scheme,
-        publish_remote,
-    } = input;
-    let mut findings = Vec::new();
-    for row in &report.branches {
-        let Some(tip) = tips.get(&BookmarkRef::Local(row.name.clone())) else {
-            continue;
-        };
-        if row.landed == Some(LandedVerdict::InTrunk) {
-            continue;
-        }
-        let carriers = repo
-            .branches_containing(tip, scheme, publish_remote)?
-            .into_iter()
-            .filter(|reference| {
-                reference.branch() != &row.name && reference.branch().as_str() != trunk
-            })
-            .collect::<Vec<_>>();
-        if let Some(finding) = crate::detect::superseded::carried_elsewhere(&row.name, &carriers) {
-            findings.push(finding);
-        }
-    }
-    Ok(findings)
-}
-
-/// Changed-file result for one branch, if it has a single tip to compare.
-type BranchFiles = Result<Vec<String>, String>;
-/// The branch name and its optional changed-file result.
-type BranchOverlapOutcome = (String, Option<BranchFiles>);
-
-/// Compare branch paths concurrently, preserving the report's branch order.
-///
-/// `changed_files_between` invokes jj's porcelain because it normalizes paths.
-/// It does not mutate the checkout, so each worker can independently query its
-/// contiguous branch chunk and report the serial implementation's findings in
-/// exactly the same order.
-fn add_branch_overlap_findings(
-    report: &mut Report,
-    findings: &mut Vec<Finding>,
-    entry: &RepoEntry,
-    workers: usize,
-) -> std::time::Duration {
-    let started = std::time::Instant::now();
-    let rows = &report.branches;
-    let upstream_trunk = entry.upstream_trunk();
-    let path = &entry.path;
-    let outcomes: Vec<BranchOverlapOutcome> = if rows.is_empty() {
-        Vec::new()
-    } else {
-        let workers = workers.clamp(1, rows.len());
-        let chunk = rows.len().div_ceil(workers);
-        let upstream_trunk = upstream_trunk.as_str();
-        std::thread::scope(|scope| {
-            let mut handles = Vec::with_capacity(workers);
-            for slice in rows.chunks(chunk) {
-                handles.push((
-                    slice,
-                    scope.spawn(move || {
-                        slice
-                            .iter()
-                            .map(|row| {
-                                let files = row.tip.as_ref().map(|_| {
-                                    let from =
-                                        format!("fork_point({upstream_trunk} | {})", row.name);
-                                    crate::jj::changed_files_between(path, &from, row.name.as_str())
-                                        .map_err(|error| error.to_string())
-                                });
-                                (row.name.to_string(), files)
-                            })
-                            .collect::<Vec<_>>()
-                    }),
-                ));
-            }
-            handles
-                .into_iter()
-                .flat_map(|(slice, handle)| {
-                    handle.join().unwrap_or_else(|_| {
-                        slice
-                            .iter()
-                            .map(|row| {
-                                (
-                                    row.name.to_string(),
-                                    Some(Err("path comparison task panicked".to_owned())),
-                                )
-                            })
-                            .collect()
-                    })
-                })
-                .collect()
-        })
-    };
-    let mut touching: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    let mut notes = Vec::new();
-    let mut unanswered = Vec::new();
-    for (branch, files) in outcomes {
-        match files {
-            Some(Ok(files)) => {
-                let _ = touching.insert(branch, files);
-            }
-            Some(Err(error)) => {
-                unanswered.push(format!("cannot compare paths for {branch}: {error}"));
-            }
-            None => notes.push(format!(
-                "cannot compare paths for {branch}: it has no single tip"
-            )),
-        }
-    }
-    report.notes.extend(notes);
-    report.problems.extend(unanswered);
-    findings.extend(crate::detect::overlap::branch_overlaps(&touching));
-    started.elapsed()
-}
-
 struct FoldOutput<'a> {
     report: &'a mut Report,
     findings: &'a mut Vec<Finding>,
     timings: &'a mut Timings,
+}
+
+struct FinalStatusInput<'a, 'snapshot> {
+    unjudged: &'a [String],
+    snapshot: Option<&'a crate::snapshot::CompletedSnapshot<'snapshot>>,
+    landed: Option<BTreeMap<String, LandedVerdict>>,
 }
 
 /// Inputs that turn completed phases into the report's visible rows and findings.
@@ -1093,6 +537,32 @@ fn set_forge_status(
     Ok(())
 }
 
+fn finalize_status(
+    report: &mut Report,
+    findings: &mut Vec<Finding>,
+    input: FinalStatusInput<'_, '_>,
+) {
+    report.problems.extend(unjudged_note(input.unjudged));
+    if let Some(snapshot) = input.snapshot {
+        add_pull_state_findings(report, findings, snapshot);
+    }
+    persist_landed(report, input.snapshot, input.landed);
+}
+
+fn append_divergent_rows(
+    input: &rows::DivergentInput<'_, '_>,
+    report: &mut Report,
+    findings: &mut Vec<Finding>,
+) -> std::time::Duration {
+    let phase = std::time::Instant::now();
+    let divergent = rows::divergent_rows(input, report, findings);
+    report.branches.extend(divergent);
+    report
+        .branches
+        .sort_by(|left, right| left.name.cmp(&right.name));
+    phase.elapsed()
+}
+
 /// Fold completed phases into rows, findings, timings, and cache persistence.
 fn fold_phase_outcome(
     output: FoldOutput<'_>,
@@ -1136,8 +606,7 @@ fn fold_phase_outcome(
     )?;
     timings.origin_relations = phase.elapsed();
 
-    let phase = std::time::Instant::now();
-    report.branches.extend(rows::divergent_rows(
+    timings.divergent_rows = append_divergent_rows(
         &rows::DivergentInput {
             branches: input.divergent_branches,
             tips: input.tips,
@@ -1148,12 +617,9 @@ fn fold_phase_outcome(
             notches: input.notches,
             expected_base: input.entry.default_base(),
         },
+        report,
         findings,
-    ));
-    report
-        .branches
-        .sort_by(|left, right| left.name.cmp(&right.name));
-    timings.divergent_rows = phase.elapsed();
+    );
 
     let phase = std::time::Instant::now();
     let scheme = input.entry.release_scheme();
@@ -1185,7 +651,9 @@ fn fold_phase_outcome(
     timings.claims = phase.elapsed();
 
     let phase = std::time::Instant::now();
-    report.problems.extend(unjudged_note(&unjudged));
+    let landed = input
+        .probe_ran
+        .then(|| std::mem::take(&mut phases.probe.landed));
     add_dependency_findings(DependencyInput {
         report,
         findings,
@@ -1195,13 +663,15 @@ fn fold_phase_outcome(
         snapshot,
         timings,
     });
-    if let Some(snapshot) = snapshot {
-        add_pull_state_findings(report, findings, snapshot);
-    }
-    let landed = input
-        .probe_ran
-        .then(|| std::mem::take(&mut phases.probe.landed));
-    persist_landed(report, snapshot, landed);
+    finalize_status(
+        report,
+        findings,
+        FinalStatusInput {
+            unjudged: &unjudged,
+            snapshot,
+            landed,
+        },
+    );
     set_forge_status(report, snapshot, timings)?;
     timings.report = phase.elapsed();
     Ok(())
@@ -1326,80 +796,6 @@ pub fn gather(
     gather_timed(name, entry, store, options).map(|(report, _)| report)
 }
 
-/// Which releases are worth checking for stale parents.
-///
-/// Not all of them. A fork accumulates every dated release it ever cut, and
-/// those are frozen history: reporting stale parents on a release from ten days
-/// ago is noise that buries the one finding that matters. Scanning a real
-/// repository unfiltered produced twenty releases and forty-nine findings.
-///
-/// The rule: every local release bookmark, because those are the ones we can
-/// re-cut, plus the newest remote one, because that is what a consumer is
-/// plausibly pinning. Dated names sort correctly as strings. `@git` refs are
-/// excluded outright: they are jj's internal git-tracking view, not a remote.
-/// The count of what was skipped is reported rather than silently dropped.
-/// Under `Fixed` this is instead exactly the local branch and its publish-remote counterpart: there is no accumulated history to skip, so nothing is superseded.
-fn releases_to_scan(
-    tips: &BookmarkTips,
-    scheme: &ReleaseScheme,
-    publish_remote: &str,
-) -> (Vec<(BookmarkRef, CommitId)>, usize) {
-    match scheme {
-        ReleaseScheme::Dated => {
-            let all: Vec<(&BookmarkRef, &CommitId)> = tips
-                .iter()
-                .filter(|(reference, _)| is_our_release(reference, scheme, publish_remote))
-                .collect();
-
-            let newest = |local: bool| {
-                all.iter()
-                    .filter(|(reference, _)| reference.is_local() == local)
-                    .max_by_key(|(reference, _)| release_order(reference.branch().as_str()))
-                    .map(|(reference, _)| (*reference).clone())
-            };
-            // Only the newest cut on each side. Every local release a fork ever cut used to
-            // be scanned, and their parents have all moved on by definition, so the report
-            // filled with stale-parent findings for releases nothing pins: 47 of 89 in a real
-            // repository, nearly all against cuts a fortnight old. The remedy attached to a stale
-            // parent is to re-cut the release onto current tips, which is right for the release in
-            // use and wrong for frozen history, where the answer is to forget it.
-            let newest_local = newest(true);
-            let newest_remote = newest(false);
-
-            let chosen: Vec<(BookmarkRef, CommitId)> = all
-                .iter()
-                .filter(|(reference, _)| {
-                    newest_local.as_ref() == Some(*reference)
-                        || newest_remote.as_ref() == Some(*reference)
-                })
-                .map(|(reference, commit)| ((*reference).clone(), (*commit).clone()))
-                .collect();
-
-            let skipped = all.len() - chosen.len();
-            (chosen, skipped)
-        }
-        ReleaseScheme::Fixed(branch) => {
-            // Fixed releases advance in place, so only their local and published positions matter.
-            let references = [
-                BookmarkRef::Local(branch.clone()),
-                BookmarkRef::Remote {
-                    branch: branch.clone(),
-                    remote: crate::ids::RemoteName::new(publish_remote),
-                },
-            ];
-            let chosen = references
-                .into_iter()
-                .filter_map(|reference| {
-                    tips.get(&reference)
-                        .cloned()
-                        .map(|commit| (reference, commit))
-                })
-                .collect();
-            (chosen, 0)
-        }
-    }
-}
-
 /// Short form for display. Full ids are correct and unreadable.
 fn short(id: &str) -> String {
     id.chars().take(12).collect()
@@ -1493,6 +889,7 @@ mod tests {
 
     use super::test_fixtures::{local, remote, tips};
     use super::*;
+    use super::{claims::claim_last_seen, releases::releases_to_scan};
 
     #[test]
     fn the_report_serializes_problems_before_branches_and_skips_absent_values() {

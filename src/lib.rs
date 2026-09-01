@@ -22,6 +22,7 @@ pub mod carriage;
 pub mod cli;
 pub mod commands;
 pub mod config;
+pub mod consumer_pins;
 pub mod detect;
 pub mod forge;
 pub mod forge_cache;

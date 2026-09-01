@@ -12,6 +12,9 @@ use std::path::{Path, PathBuf};
 
 use crate::cli::Exit;
 use crate::config::RepoEntry;
+use crate::consumer_pins::{
+    ConsumerHeadMemo, ConsumerPinSource, scan_consumer_for, scan_consumer_slug_with_heads,
+};
 use crate::detect::{
     BookmarkTips, Finding, FindingKind, RebaseOutcome, ReleaseParent, Subject, stale_parents,
 };
@@ -22,15 +25,14 @@ use crate::ids::{
 use crate::jj::{self, Repo};
 use crate::pins::{Pin, PinKind};
 use crate::release_model::{
-    ConsumerHeadMemo, RecordedCut, carried_from_tips, double_cut_findings, newest_release,
-    repo_slug, scan_consumer_for, scan_consumer_slug_with_heads,
+    RecordedCut, carried_from_tips, double_cut_findings, newest_release, repo_slug,
 };
 
 /// Registered forge consumers and explicitly requested local checkout scans.
 pub struct ConsumerInputs<'a> {
     pub slugs: &'a [String],
     pub locals: &'a [PathBuf],
-    pub forge: &'a dyn crate::forge::Forge,
+    pub forge: &'a dyn ConsumerPinSource,
     pub cache_root: Option<&'a Path>,
     pub heads: &'a ConsumerHeadMemo,
 }

@@ -100,15 +100,15 @@ pub struct PullRequest {
     /// finished from every other angle — tests green, review approved, nothing left to
     /// write — and cannot be merged. An agent called one code complete and ready to ship
     /// while it was in conflict with main.
-    #[serde(default, deserialize_with = "null_default")]
-    pub mergeable: String,
+    #[serde(default)]
+    pub mergeable: Option<String>,
     /// The forge's fuller account of why: `DIRTY` for a conflict, `BEHIND` for a base that
     /// has moved on, `BLOCKED`, `CLEAN`, `UNSTABLE`.
-    #[serde(default, deserialize_with = "null_default")]
-    pub merge_state_status: String,
+    #[serde(default)]
+    pub merge_state_status: Option<String>,
     /// The branch this pull request targets.
-    #[serde(default, deserialize_with = "null_default")]
-    pub base_ref_name: String,
+    #[serde(default)]
+    pub base_ref_name: Option<String>,
     /// The commit that landed this pull request on its base branch, present only
     /// once merged. For every merge method — merge commit, squash, rebase — this
     /// is the base-branch commit that carries the work, which is exactly the
@@ -146,7 +146,21 @@ impl PullRequest {
     /// `UNKNOWN` is not a conflict: the forge computes mergeability asynchronously, and
     /// treating "not worked out yet" as "broken" would cry wolf on every fresh push.
     pub fn conflicting(&self) -> bool {
-        self.mergeable.eq_ignore_ascii_case("CONFLICTING")
+        self.mergeable
+            .as_deref()
+            .is_some_and(|mergeable| mergeable.eq_ignore_ascii_case("CONFLICTING"))
+    }
+
+    /// Required merge facts that the forge did not answer. Callers must report
+    /// these rather than interpreting unknown data as a healthy pull request.
+    pub fn missing_merge_fields(&self) -> impl Iterator<Item = &'static str> {
+        [
+            (self.mergeable.is_none(), "mergeable"),
+            (self.merge_state_status.is_none(), "mergeStateStatus"),
+            (self.base_ref_name.is_none(), "baseRefName"),
+        ]
+        .into_iter()
+        .filter_map(|(missing, field)| missing.then_some(field))
     }
 }
 /// A pull request's own diff totals, from the live batch.
@@ -248,7 +262,7 @@ pub struct PullSummary {
     #[serde(default)]
     pub head_repository_owner: Option<Account>,
     #[serde(default)]
-    pub base_ref_name: String,
+    pub base_ref_name: Option<String>,
     #[serde(default)]
     pub merge_commit: Option<MergeCommit>,
 }
@@ -348,9 +362,9 @@ impl Default for PullRequest {
             is_draft: false,
             url: String::new(),
             head_repository_owner: None,
-            mergeable: String::new(),
-            merge_state_status: String::new(),
-            base_ref_name: "main".to_owned(),
+            mergeable: None,
+            merge_state_status: None,
+            base_ref_name: None,
             merge_commit: None,
         }
     }
@@ -370,7 +384,7 @@ impl Default for PullSummary {
             is_draft: false,
             url: String::new(),
             head_repository_owner: None,
-            base_ref_name: String::new(),
+            base_ref_name: None,
             merge_commit: None,
         }
     }
@@ -410,7 +424,13 @@ pub fn search_authors(remotes: &[&str]) -> Vec<String> {
 pub fn merged_onto(pulls: &[PullSummary], trunk: &str) -> Vec<PullSummary> {
     let mut merged: Vec<PullSummary> = pulls
         .iter()
-        .filter(|pull| pull.is_merged() && pull.base_ref_name == trunk)
+        .filter(|pull| {
+            pull.is_merged()
+                && pull
+                    .base_ref_name
+                    .as_deref()
+                    .is_some_and(|base| base == trunk)
+        })
         .cloned()
         .collect();
     merged.sort_unstable_by_key(|pull| pull.number);
@@ -486,22 +506,6 @@ pub trait Forge: Send + Sync {
         target: &RepoIdentity,
         number: u64,
     ) -> Result<Vec<TimelineEvent>, ForgeError>;
-
-    /// The consumer's default branch and its head commit in one forge call.
-    fn consumer_head(&self, repo: &Path, slug: &str) -> Result<ConsumerHead, ForgeError>;
-
-    /// One file's raw text at a commit. A missing file is not an error.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the checkout, consumer slug, commit, and file path are distinct forge-address components"
-    )]
-    fn file_at(
-        &self,
-        repo: &Path,
-        slug: &str,
-        commit: &str,
-        path: &str,
-    ) -> Result<Option<String>, ForgeError>;
 }
 
 /// One branch's pull request summaries, split into the primary and its shadowed history.
@@ -602,7 +606,7 @@ mod tests {
                 number,
                 state: state.to_owned(),
                 head_ref_name: branch.to_owned(),
-                base_ref_name: base.to_owned(),
+                base_ref_name: Some(base.to_owned()),
                 merge_commit: oid.map(|oid| MergeCommit {
                     oid: oid.to_owned(),
                 }),
@@ -650,7 +654,7 @@ mod tests {
                 number,
                 state: state.to_owned(),
                 head_ref_name: branch.to_owned(),
-                base_ref_name: base.to_owned(),
+                base_ref_name: Some(base.to_owned()),
                 merge_commit: oid.map(|oid| MergeCommit {
                     oid: oid.to_owned(),
                 }),
@@ -701,9 +705,9 @@ mod tests {
             head_repository_owner: Some(Account {
                 login: "our-org".to_owned(),
             }),
-            mergeable: "CONFLICTING".to_owned(),
-            merge_state_status: "DIRTY".to_owned(),
-            base_ref_name: "main".to_owned(),
+            mergeable: Some("CONFLICTING".to_owned()),
+            merge_state_status: Some("DIRTY".to_owned()),
+            base_ref_name: Some("main".to_owned()),
             merge_commit: Some(MergeCommit {
                 oid: "bb".to_owned(),
             }),

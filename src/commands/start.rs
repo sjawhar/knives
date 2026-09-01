@@ -165,7 +165,7 @@ fn resume_claim(
     possession: bool,
 ) -> anyhow::Result<Exit> {
     let (claim, last_seen) = claim_context(held, claim_seen)?;
-    let workspace_notice = workspace_notice(context, false)?;
+    let workspace_notice = resume_workspace_notice(context);
     let event = if possession {
         "resumed via workspace possession"
     } else {
@@ -196,9 +196,15 @@ fn take_claim(context: &mut StartContext<'_>, reason: &str) -> anyhow::Result<Ex
     if context.destination.exists() {
         let change = match workspace_change(&context.opened, &context.workspace) {
             Ok(change) => change,
-            Err(_) => match context.opened.reattach_workspace(&context.destination) {
+            Err(_) => match context
+                .opened
+                .reattach_workspace(&context.destination, &context.workspace)
+            {
                 Ok(()) => workspace_change(&Repo::open(&context.entry.path)?, &context.workspace)?,
-                Err(error @ JjError::WorkspaceRepositoryMismatch { .. }) => {
+                Err(
+                    error @ (JjError::WorkspaceRepositoryMismatch { .. }
+                    | JjError::WorkspaceNameMismatch { .. }),
+                ) => {
                     eprintln!(
                         "cannot adopt {}: {error}; move the foreign workspace or choose a different branch",
                         context.destination.display()
@@ -245,7 +251,6 @@ fn record_claim(context: &mut StartContext<'_>, reason: &str, event: String) -> 
     let target = BranchTarget::new(context.repo_name.clone(), context.branch.clone());
     let pull = context.store.tracked_pull(&target);
     let _ = context.store.claim(&target, &context.identity, reason);
-    context.store.save()?;
     Scribe::new(
         Ledger::for_repo(context.repo_name),
         context.repo_name.clone(),
@@ -253,7 +258,28 @@ fn record_claim(context: &mut StartContext<'_>, reason: &str, event: String) -> 
         context.identity.owner.clone(),
     )
     .event(Some(context.branch.as_str()), event, pull)?;
+    context.store.save()?;
     Ok(())
+}
+
+fn resume_workspace_notice(context: &StartContext<'_>) -> String {
+    if !context.destination.exists() {
+        return format!(
+            "workspace missing at {}; `knives start {} --force --why \"…\"` rebuilds it",
+            context.destination.display(),
+            context.branch
+        );
+    }
+    match workspace_change(&context.opened, &context.workspace) {
+        Ok(change) => format!("workspace {} at {change}", context.destination.display()),
+        Err(error) => format!(
+            "workspace {} is present but not registered as {} ({error}); \
+             `knives start {} --force --why \"…\"` rebuilds it",
+            context.destination.display(),
+            context.workspace,
+            context.branch
+        ),
+    }
 }
 
 fn workspace_notice(context: &StartContext<'_>, left_as_is: bool) -> anyhow::Result<String> {
