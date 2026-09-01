@@ -21,6 +21,7 @@ use jj_lib::rewrite::{duplicate_commits, merge_commit_trees, rebase_commit};
 use jj_lib::settings::UserSettings;
 use jj_lib::transaction::Transaction;
 use jj_lib::working_copy::WorkingCopy as _;
+use jj_lib::workspace::{Workspace, default_working_copy_factories};
 use thiserror::Error;
 
 use crate::detect::landed::RebaseOutcome;
@@ -159,6 +160,75 @@ impl Repo {
                 ))
             })
             .collect()
+    }
+
+    /// Re-registers a workspace that `jj workspace forget` left on disk.
+    ///
+    /// The forgotten workspace's state points at the operation that last owned
+    /// its working-copy commit. Reinstating that mapping and advancing only the
+    /// state operation preserves the files and change exactly as they were.
+    pub fn reattach_workspace(&self, destination: &Path) -> Result<(), JjError> {
+        let settings = repo_settings(destination)?;
+        let mut workspace = Workspace::load(
+            &settings,
+            destination,
+            &StoreFactories::default(),
+            &default_working_copy_factories(),
+        )
+        .map_err(|error| JjError::Open {
+            path: destination.display().to_string(),
+            detail: error.to_string(),
+        })?;
+        let name = workspace.workspace_name().to_owned();
+        let recorded = workspace.working_copy().operation_id().clone();
+        let loader = workspace.repo_loader();
+        let operation = block_on(loader.load_operation(&recorded)).map_err(|error| JjError::Open {
+            path: destination.display().to_string(),
+            detail: error.to_string(),
+        })?;
+        let historical = block_on(loader.load_at(&operation)).map_err(|error| JjError::Open {
+            path: destination.display().to_string(),
+            detail: error.to_string(),
+        })?;
+        let commit = historical
+            .view()
+            .get_wc_commit_id(&name)
+            .cloned()
+            .ok_or_else(|| JjError::Open {
+                path: destination.display().to_string(),
+                detail: format!(
+                    "workspace {} has no working-copy commit at its recorded operation",
+                    name.as_symbol()
+                ),
+            })?;
+
+        let mut transaction = self.repo.start_transaction();
+        transaction.set_workspace_name(&name);
+        transaction
+            .repo_mut()
+            .set_wc_commit(name, commit)
+            .map_err(|error| JjError::Open {
+                path: destination.display().to_string(),
+                detail: error.to_string(),
+            })?;
+        let updated = block_on(transaction.commit("re-registered forgotten workspace")).map_err(
+            |error| JjError::Open {
+                path: destination.display().to_string(),
+                detail: error.to_string(),
+            },
+        )?;
+        let mutation = block_on(workspace.start_working_copy_mutation()).map_err(|error| {
+            JjError::Open {
+                path: destination.display().to_string(),
+                detail: error.to_string(),
+            }
+        })?;
+        block_on(mutation.finish(updated.operation().id().clone())).map_err(|error| {
+            JjError::Open {
+                path: destination.display().to_string(),
+                detail: error.to_string(),
+            }
+        })
     }
 
     /// Walks operations backward from this repository's loaded head, attributing

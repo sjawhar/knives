@@ -3822,6 +3822,93 @@ fn start_adopts_an_existing_workspace_for_an_unclaimed_branch() {
 }
 
 #[test]
+fn start_adopts_a_no_cleanup_forgotten_workspace_without_resetting_it() {
+    // `finish --no-cleanup` intentionally keeps the directory, but forgets its
+    // registration. Starting it again must reattach that exact working copy.
+    let lab = lab::Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let run_start = |why: &str| {
+        Command::new(env!("CARGO_BIN_EXE_knives"))
+            .args([
+                "--text",
+                "start",
+                "feat/gamma",
+                "--repo",
+                "demo",
+                "--why",
+                why,
+            ])
+            .current_dir(&lab.work)
+            .env("KNIVES_CONFIG_HOME", home.path())
+            .env("KNIVES_OWNER", "agent-one")
+            .output()
+            .expect("run start")
+    };
+    let started = run_start("port it");
+    assert!(
+        started.status.success(),
+        "start failed: {}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let workspace = lab.work.parent().expect("parent").join("feat-gamma");
+    let work_file = workspace.join("in-progress.txt");
+    std::fs::write(&work_file, "preserve this work\n").expect("write in-progress work");
+    let change_before = lab.revision(&workspace, "@", "change_id");
+
+    let finished = Command::new(env!("CARGO_BIN_EXE_knives"))
+        .args([
+            "--text",
+            "finish",
+            "feat/gamma",
+            "--allow-open",
+            "--no-cleanup",
+            "--repo",
+            "demo",
+        ])
+        .current_dir(&lab.work)
+        .env("KNIVES_CONFIG_HOME", home.path())
+        .env("KNIVES_OWNER", "agent-one")
+        .output()
+        .expect("finish without cleanup");
+    assert!(
+        finished.status.success(),
+        "finish failed: {}",
+        String::from_utf8_lossy(&finished.stderr)
+    );
+    assert!(workspace.is_dir(), "workspace directory was removed");
+
+    let restarted = run_start("resume preserved work");
+
+    assert!(
+        restarted.status.success(),
+        "restart failed: {}",
+        String::from_utf8_lossy(&restarted.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&restarted.stdout).contains("adopted"),
+        "stdout: {}",
+        String::from_utf8_lossy(&restarted.stdout)
+    );
+    let state: Value = serde_json::from_str(
+        &std::fs::read_to_string(home.path().join("state.json")).expect("state"),
+    )
+    .expect("parse state");
+    assert_eq!(
+        state["claims"]["demo/feat/gamma"]["owner"],
+        Value::String("agent-one".to_owned())
+    );
+    assert_eq!(
+        lab.revision(&workspace, "@", "change_id"),
+        change_before,
+        "adoption reset the working-copy change"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&work_file).expect("read preserved work"),
+        "preserve this work\n"
+    );
+}
+
+#[test]
 fn start_force_without_why_is_a_usage_error() {
     // Clap owns this validation so a force never reaches claim handling without
     // a durable human explanation.

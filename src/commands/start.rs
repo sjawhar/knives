@@ -174,7 +174,13 @@ pub fn run(
         ClaimDecision::Take => {
             let reason = why.unwrap_or("started work");
             if destination.exists() {
-                let change = workspace_change(&opened, &workspace)?;
+                let change = match workspace_change(&opened, &workspace) {
+                    Ok(change) => change,
+                    Err(_) => {
+                        opened.reattach_workspace(&destination)?;
+                        workspace_change(&Repo::open(&entry.path)?, &workspace)?
+                    }
+                };
                 let _ = store.claim(&target, &identity, reason);
                 store.save()?;
                 Scribe::new(
