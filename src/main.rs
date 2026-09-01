@@ -13,7 +13,10 @@ use knives::carriage::{
     self, CarriesReport, CensusOptions, CensusReport, CheckInput, Target, TargetCheck, TargetRole,
 };
 use knives::cli::{Cli, Command, Exit, Output, ReleaseAction};
-use knives::commands::claim::current_identity;
+use knives::commands::claim::{
+    ClaimContext, ClaimDecision, current_identity, decide, last_seen_provenance,
+    render_claim_context,
+};
 use knives::commands::{
     audit, consumers, hook, init, notch, pr, preflight, pushed, register, release, repos, start,
     status, sync,
@@ -123,6 +126,8 @@ fn dispatch() -> anyhow::Result<Exit> {
             no_cleanup,
             superseded_by,
             allow_open,
+            force,
+            why,
         } => {
             let Some(name) = one_repo(repo.as_deref())? else {
                 return Ok(Exit::Usage);
@@ -132,6 +137,8 @@ fn dispatch() -> anyhow::Result<Exit> {
                 superseded_by.as_deref(),
                 !no_cleanup,
                 allow_open,
+                force,
+                why.as_deref(),
             )
         }
         Command::Track {
@@ -2075,6 +2082,21 @@ fn release_event(had: bool, superseded_by: Option<&str>) -> Option<String> {
     }
 }
 
+/// The durable provenance required when a claim is released by force.
+fn forced_release_event(
+    claim: &knives::store::Claim,
+    last_seen: knives::seen::LastSeen,
+    why: &str,
+) -> String {
+    format!(
+        "released {}'s claim by force ({}, claimed {}, last seen {}): {why}",
+        claim.owner,
+        knives::commands::claim::owner_kind_label(claim.kind),
+        claim.started,
+        last_seen_provenance(last_seen),
+    )
+}
+
 /// The finish guard's explicit selection context.
 ///
 /// It holds only input available before discovery; `CompletedSnapshot::requested`
@@ -2180,6 +2202,8 @@ fn run_finish(
     superseded_by: Option<&str>,
     cleanup: bool,
     allow_open: bool,
+    force: bool,
+    why: Option<&str>,
 ) -> anyhow::Result<Exit> {
     let registry = load(&default_config_path())?;
     let Some(entry) = registry.get(&target.repo) else {
@@ -2187,6 +2211,69 @@ fn run_finish(
         return Ok(Exit::Usage);
     };
     let mut store = Store::open_for_update(default_state_path())?;
+    let workspace = knives::commands::wip::workspace_for(target.branch.as_str());
+    let directory = entry.path.parent().map(|parent| parent.join(&workspace));
+    let forced_release = if let Some(claim) = store
+        .claims(Some(&target.repo))
+        .into_iter()
+        .find(|claim| claim.branch == target.branch.as_str())
+        .cloned()
+    {
+        let cwd = std::env::current_dir()?;
+        let identity = current_identity(&cwd)?;
+        let in_claimed_workspace = directory
+            .as_ref()
+            .is_some_and(|path| cwd.starts_with(path));
+        let decision = decide(&ClaimContext {
+            held: Some(&claim),
+            identity: &identity,
+            in_claimed_workspace,
+        });
+        match decision {
+            ClaimDecision::RefuseAnonymous | ClaimDecision::RefuseHeld => {
+                let activity = Repo::open(&entry.path)?.workspace_activity(
+                    &std::collections::BTreeSet::from([knives::ids::WorkspaceName::new(
+                        workspace.clone(),
+                    )]),
+                    knives::jj::MAX_ACTIVITY_OPS,
+                )?;
+                let last_seen =
+                    knives::seen::last_seen(&claim, &activity, &knives::seen::load());
+                let now = jiff::Timestamp::now();
+                match (decision, force) {
+                    (ClaimDecision::RefuseAnonymous, false) => {
+                        eprintln!(
+                            "both sides anonymous; {}\nuse `knives finish {} --force --why \"…\"` to release the claim",
+                            render_claim_context(&claim, last_seen, now),
+                            target.branch,
+                        );
+                        return Ok(Exit::Usage);
+                    }
+                    (ClaimDecision::RefuseHeld, false) => {
+                        eprintln!(
+                            "{}\nuse `knives finish {} --force --why \"…\"` to release the claim",
+                            render_claim_context(&claim, last_seen, now),
+                            target.branch,
+                        );
+                        return Ok(Exit::Usage);
+                    }
+                    (ClaimDecision::RefuseAnonymous | ClaimDecision::RefuseHeld, true) => {
+                        Some(forced_release_event(
+                            &claim,
+                            last_seen,
+                            why.expect("clap requires --why with --force"),
+                        ))
+                    }
+                    (ClaimDecision::Take | ClaimDecision::Resume { .. }, _) => {
+                        unreachable!("only refusals reach this branch")
+                    }
+                }
+            }
+            ClaimDecision::Resume { .. } | ClaimDecision::Take => None,
+        }
+    } else {
+        None
+    };
     let cache_root = knives::forge_cache::cache_root();
     if !allow_open {
         match open_pull_for(target, entry, &store, cache_root.as_deref()) {
@@ -2219,17 +2306,25 @@ fn run_finish(
     // nobody held — it says "was not held" and forgets the workspace anyway —
     // and an event asserting a release would be a false fact in the one record
     // that exists to be believed later.
-    if let Some(text) = release_event(had, superseded_by) {
+    if let Some(text) = forced_release {
+        let scribe = scribe_for(&target.repo, entry)?;
+        scribe.event(Some(target.branch.as_str()), text, pr)?;
+        if let Some(replacement) = superseded_by {
+            scribe.event(
+                Some(target.branch.as_str()),
+                format!("superseded by {replacement}"),
+                pr,
+            )?;
+        }
+    } else if let Some(text) = release_event(had, superseded_by) {
         scribe_for(&target.repo, entry)?.event(Some(target.branch.as_str()), text, pr)?;
     }
 
     let claim = if had { "released" } else { "was not held" };
-    let workspace = knives::commands::wip::workspace_for(target.branch.as_str());
     if let Err(error) = knives::jj::forget_workspace(&entry.path, &workspace) {
         println!("{target}: claim {claim}; no workspace forgotten ({error})");
         return Ok(Exit::Ok);
     }
-    let directory = entry.path.parent().map(|parent| parent.join(&workspace));
     match (cleanup, directory) {
         (true, Some(directory)) if directory.is_dir() => {
             // Safe because jj already snapshotted the working copy into a commit: the

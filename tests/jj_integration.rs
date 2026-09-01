@@ -4532,6 +4532,38 @@ fn hold_claim(home: &tempfile::TempDir, branch: &str) {
     );
     store.save().expect("save store");
 }
+fn start_claim_for_finish(
+    lab: &lab::Lab,
+    home: &tempfile::TempDir,
+    owner: &str,
+    branch: &str,
+) -> std::path::PathBuf {
+    let started = Command::new(env!("CARGO_BIN_EXE_knives"))
+        .args([
+            "--text",
+            "start",
+            branch,
+            "--repo",
+            "demo",
+            "--why",
+            "carry the queue fix",
+        ])
+        .current_dir(&lab.work)
+        .env("KNIVES_CONFIG_HOME", home.path())
+        .env("KNIVES_OWNER", owner)
+        .output()
+        .expect("start held branch");
+    assert!(
+        started.status.success(),
+        "start failed: {}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    lab.work
+        .parent()
+        .expect("workspace parent")
+        .join(knives::commands::wip::workspace_for(branch))
+}
+
 
 fn knives_finish(lab: &lab::Lab, home: &tempfile::TempDir, args: &[&str]) -> std::process::Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_knives"));
@@ -4712,6 +4744,225 @@ fn finish_refuses_when_it_cannot_verify_and_allow_open_proceeds() {
         !bypass_log.exists(),
         "--allow-open spawned the fake gh: {}",
         std::fs::read_to_string(&bypass_log).unwrap_or_default()
+    );
+}
+
+#[test]
+fn finish_refuses_to_release_anothers_claim_without_force() {
+    // A different harness session does not own the held workspace, so finishing
+    // must leave both the claim and its workspace intact until force is explicit.
+    let lab = lab::Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let workspace = start_claim_for_finish(&lab, &home, "agent-one", "feat/gamma");
+
+    let refused = Command::new(env!("CARGO_BIN_EXE_knives"))
+        .args([
+            "--text",
+            "finish",
+            "feat/gamma",
+            "--allow-open",
+            "--repo",
+            "demo",
+        ])
+        .current_dir(&lab.work)
+        .env("KNIVES_CONFIG_HOME", home.path())
+        .env("KNIVES_OWNER", "agent-two")
+        .output()
+        .expect("finish another agent's claim");
+
+    assert_eq!(
+        refused.status.code(),
+        Some(2),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&refused.stdout),
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(stderr.contains("agent-one"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("knives finish feat/gamma --force --why"),
+        "stderr: {stderr}"
+    );
+    let state: Value = serde_json::from_str(
+        &std::fs::read_to_string(home.path().join("state.json")).expect("read state"),
+    )
+    .expect("parse state");
+    assert_eq!(
+        state["claims"]["demo/feat/gamma"]["owner"],
+        Value::String("agent-one".to_owned())
+    );
+    assert!(workspace.is_dir(), "foreign workspace was removed");
+}
+
+#[test]
+fn finish_force_releases_and_records_provenance() {
+    // A forced release needs an enduring, independently inspectable record of
+    // whose claim it released, how it was identified, and why it was forced.
+    let lab = lab::Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let _workspace = start_claim_for_finish(&lab, &home, "agent-one", "feat/gamma");
+
+    let finished = Command::new(env!("CARGO_BIN_EXE_knives"))
+        .args([
+            "--text",
+            "finish",
+            "feat/gamma",
+            "--force",
+            "--why",
+            "owner session died",
+            "--allow-open",
+            "--repo",
+            "demo",
+        ])
+        .current_dir(&lab.work)
+        .env("KNIVES_CONFIG_HOME", home.path())
+        .env("KNIVES_OWNER", "agent-two")
+        .output()
+        .expect("force finish another agent's claim");
+
+    assert!(
+        finished.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&finished.stdout),
+        String::from_utf8_lossy(&finished.stderr)
+    );
+    let state: Value = serde_json::from_str(
+        &std::fs::read_to_string(home.path().join("state.json")).expect("read state"),
+    )
+    .expect("parse state");
+    assert!(
+        state["claims"].get("demo/feat/gamma").is_none(),
+        "claim remained: {}",
+        state["claims"]
+    );
+    let events = Command::new(env!("CARGO_BIN_EXE_knives"))
+        .args([
+            "--text",
+            "notch",
+            "feat/gamma",
+            "--events",
+            "--repo",
+            "demo",
+        ])
+        .current_dir(&lab.work)
+        .env("KNIVES_CONFIG_HOME", home.path())
+        .env("KNIVES_OWNER", "agent-two")
+        .output()
+        .expect("read forced-release events");
+    assert!(
+        events.status.success(),
+        "read events failed: {}",
+        String::from_utf8_lossy(&events.stderr)
+    );
+    let events = String::from_utf8_lossy(&events.stdout);
+    assert!(
+        events.contains("released agent-one's claim by force"),
+        "events: {events}"
+    );
+    assert!(
+        events.contains("(harness-session, claimed ") && events.contains(", last seen "),
+        "events: {events}"
+    );
+    assert!(events.contains("owner session died"), "events: {events}");
+}
+
+#[test]
+fn finish_force_requires_why() {
+    // Clap must reject an unexplained forced release before it can mutate a claim.
+    let lab = lab::Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_knives"))
+        .args([
+            "--text",
+            "finish",
+            "feat/gamma",
+            "--force",
+            "--allow-open",
+            "--repo",
+            "demo",
+        ])
+        .current_dir(&lab.work)
+        .env("KNIVES_CONFIG_HOME", home.path())
+        .output()
+        .expect("parse forced finish");
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("--why"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn finish_by_possession_still_releases() {
+    // Physical presence in the claim's workspace is an intentional possession
+    // proof even when no harness identity survives into the finishing process.
+    let lab = lab::Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let workspace = start_claim_for_finish(&lab, &home, "agent-one", "feat/gamma");
+
+    let finished = Command::new(env!("CARGO_BIN_EXE_knives"))
+        .args([
+            "--text",
+            "finish",
+            "feat/gamma",
+            "--allow-open",
+            "--repo",
+            "demo",
+        ])
+        .current_dir(&workspace)
+        .env("KNIVES_CONFIG_HOME", home.path())
+        .env_remove("KNIVES_OWNER")
+        .env_remove("CLAUDE_CODE_SESSION_ID")
+        .env("USER", "terminal-user")
+        .output()
+        .expect("finish held workspace by possession");
+
+    assert!(
+        finished.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&finished.stdout),
+        String::from_utf8_lossy(&finished.stderr)
+    );
+}
+
+#[test]
+fn finish_by_owner_releases_when_checkout_activity_is_unavailable() {
+    // The ownership decision is complete without an operation walk. An
+    // unavailable checkout may prevent forgetting a workspace, but cannot turn
+    // a same-owner release into a claim that remains held.
+    let lab = lab::Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    hold_claim(&home, "feat/alpha");
+    let unavailable = home.path().join("unavailable");
+    std::fs::write(
+        home.path().join("repos.toml"),
+        format!(
+            "[repos.demo]\npath = \"{}\"\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/work.git\"\n",
+            unavailable.display(),
+            lab.upstream.display(),
+        ),
+    )
+    .expect("make configured checkout unavailable");
+
+    let finished = knives_finish(&lab, &home, &["feat/alpha"]);
+
+    assert!(
+        finished.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&finished.stdout),
+        String::from_utf8_lossy(&finished.stderr)
+    );
+    let state: Value = serde_json::from_str(
+        &std::fs::read_to_string(home.path().join("state.json")).expect("read state"),
+    )
+    .expect("parse state");
+    assert!(
+        state["claims"].get("demo/feat/alpha").is_none(),
+        "claim remained: {}",
+        state["claims"]
     );
 }
 
