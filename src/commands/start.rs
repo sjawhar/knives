@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::cli::Exit;
-use crate::commands::claim::current_owner;
+use crate::commands::claim::current_identity;
 use crate::commands::release::shared_base;
 use crate::config::{default_config_path, load};
 use crate::ids::{BranchName, BranchTarget, RepoName};
@@ -31,12 +31,12 @@ pub fn run(repo_name: &RepoName, branch: &BranchName, why: Option<&str>) -> anyh
     let upstream_trunk = entry.upstream_trunk();
 
     let mut store = Store::open_for_update(default_state_path())?;
-    let owner = current_owner(&std::env::current_dir()?)?;
+    let identity = current_identity(&std::env::current_dir()?)?;
     if let Some(held) = store
         .claims(Some(repo_name))
         .into_iter()
         .find(|c| c.branch == branch.as_str())
-        && held.owner != owner
+        && held.owner != identity.owner
     {
         eprintln!(
             "{repo_name}/{branch} is already claimed by {}: {}",
@@ -79,20 +79,21 @@ pub fn run(repo_name: &RepoName, branch: &BranchName, why: Option<&str>) -> anyh
 
     let reason = why.unwrap_or("started work");
     let target = BranchTarget::new(repo_name.clone(), branch.clone());
-    let _ = store.claim(&target, &owner, reason);
+    let _ = store.claim(&target, &identity, reason);
     let pr = store.tracked_pull(&target);
     store.save()?;
     Scribe::new(
         Ledger::for_repo(repo_name),
         repo_name.clone(),
         entry.path.clone(),
-        owner.clone(),
+        identity.owner.clone(),
     )
     .event(Some(branch.as_str()), format!("claimed: {reason}"), pr)?;
 
     println!(
-        "workspace {} based on {base_revision} ({base_label})\nclaimed {repo_name}/{branch} for {owner}",
-        destination.display()
+        "workspace {} based on {base_revision} ({base_label})\nclaimed {repo_name}/{branch} for {}",
+        destination.display(),
+        identity.owner,
     );
     Ok(Exit::Ok)
 }

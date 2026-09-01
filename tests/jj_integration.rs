@@ -32,7 +32,7 @@ use knives::ids::{BookmarkRef, BranchName, CommitId, ReleaseScheme, RemoteName};
 use knives::jj::{
     Repo, changed_files, changed_files_between, probe_landed, pull_heads, remote_refs,
 };
-use knives::store::Store;
+use knives::store::{OwnerKind, Store};
 use lab::Lab;
 use std::collections::BTreeMap;
 use std::process::Command;
@@ -3836,7 +3836,10 @@ fn hold_claim(home: &tempfile::TempDir, branch: &str) {
             knives::ids::RepoName::new("demo"),
             BranchName::new(branch),
         ),
-        "ses_fff688",
+        &knives::commands::claim::Identity {
+            owner: "ses_fff688".to_owned(),
+            kind: OwnerKind::HarnessSession,
+        },
         "carrying the queue fix",
     );
     store.save().expect("save store");

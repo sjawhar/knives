@@ -11,7 +11,7 @@ use knives::{
     hook::guidance::{
         Guidance, InstructionFile, claim_lines, format_guidance, format_notice, guidance_for,
     },
-    store::Claim,
+    store::{Claim, OwnerKind},
 };
 use tempfile::TempDir;
 
@@ -145,6 +145,7 @@ fn claim_lines_filter_the_repo_and_format_both_why_variants() {
         repo: repo.to_owned(),
         branch: branch.to_owned(),
         owner: owner.to_owned(),
+        kind: OwnerKind::OsUser,
         why: why.to_owned(),
         started: "2026-08-02T00:00:00Z".to_owned(),
         files: vec![],

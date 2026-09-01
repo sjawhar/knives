@@ -2040,12 +2040,12 @@ fn short12(commit: &knives::ids::CommitId) -> String {
 /// The owner is resolved exactly as a claim's is, so one agent's events and its
 /// claims carry the same name and a reader can join them.
 fn scribe_for(repo: &RepoName, entry: &knives::config::RepoEntry) -> anyhow::Result<Scribe> {
-    let owner = knives::commands::claim::current_owner(&std::env::current_dir()?)?;
+    let identity = knives::commands::claim::current_identity(&std::env::current_dir()?)?;
     Ok(Scribe::new(
         Ledger::for_repo(repo),
         repo.clone(),
         entry.path.clone(),
-        owner,
+        identity.owner,
     ))
 }
 
