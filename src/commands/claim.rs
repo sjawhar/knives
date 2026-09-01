@@ -57,6 +57,58 @@ pub fn decide(context: &ClaimContext<'_>) -> ClaimDecision {
     }
 }
 
+/// Renders the complete claim context shared by refusals and other claim
+/// lifecycle notices.
+pub fn render_claim_context(
+    claim: &Claim,
+    last_seen: crate::seen::LastSeen,
+    now: jiff::Timestamp,
+) -> String {
+    let claimed_age =
+        crate::ledger::age(&claim.started, now).unwrap_or_else(|| "unknown".to_owned());
+    format!(
+        "{} is claimed by {} ({}), claimed {claimed_age} ago, {}: {}",
+        claim.key(),
+        claim.owner,
+        owner_kind_label(claim.kind),
+        render_last_seen(last_seen, now),
+        claim.why,
+    )
+}
+
+/// Renders the observation state without implying a liveness guarantee.
+pub fn render_last_seen(last_seen: crate::seen::LastSeen, now: jiff::Timestamp) -> String {
+    match last_seen {
+        crate::seen::LastSeen::At(timestamp) => crate::ledger::age(&timestamp.to_string(), now)
+            .map_or_else(
+                || "not seen within the observation window".to_owned(),
+                |age| format!("last seen {age} ago"),
+            ),
+        crate::seen::LastSeen::NoneSinceClaim => "no activity observed since claimed".to_owned(),
+        crate::seen::LastSeen::NoneWithinWindow => {
+            "not seen within the observation window".to_owned()
+        }
+    }
+}
+
+/// The durable token for a claim observation.
+pub fn last_seen_provenance(last_seen: crate::seen::LastSeen) -> String {
+    match last_seen {
+        crate::seen::LastSeen::At(timestamp) => timestamp.to_string(),
+        crate::seen::LastSeen::NoneSinceClaim => "none-since-claim".to_owned(),
+        crate::seen::LastSeen::NoneWithinWindow => "none-within-window".to_owned(),
+    }
+}
+
+/// The stable, human-readable identity-source label.
+pub const fn owner_kind_label(kind: OwnerKind) -> &'static str {
+    match kind {
+        OwnerKind::HarnessSession => "harness-session",
+        OwnerKind::WorkspaceDerived => "workspace-derived",
+        OwnerKind::OsUser => "os-user",
+    }
+}
+
 /// Resolves the identity that should own a claim.
 ///
 /// `KNIVES_OWNER` is what the `OpenCode` plugin injects. Claude Code instead

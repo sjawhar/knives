@@ -3452,6 +3452,405 @@ fn start_without_a_release_uses_the_fetched_upstream_trunk() {
 }
 
 #[test]
+fn start_resumes_the_same_harness_sessions_claim_without_mutating_it() {
+    // A second invocation from the same harness session must acknowledge the
+    // existing claim rather than overwrite its timestamp or reason.
+    let lab = lab::Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_knives"))
+            .args(args)
+            .current_dir(&lab.work)
+            .env("KNIVES_CONFIG_HOME", home.path())
+            .env("KNIVES_OWNER", "agent-one")
+            .output()
+            .expect("run start")
+    };
+
+    let first = run(&[
+        "--text",
+        "start",
+        "feat/gamma",
+        "--repo",
+        "demo",
+        "--why",
+        "port it",
+    ]);
+    assert!(
+        first.status.success(),
+        "first start failed: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let state_before = std::fs::read_to_string(home.path().join("state.json")).expect("state");
+
+    let second = run(&["--text", "start", "feat/gamma", "--repo", "demo"]);
+
+    assert!(
+        second.status.success(),
+        "resume must exit 0: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&second.stdout);
+    assert!(stdout.contains("resumed"), "stdout: {stdout}");
+    assert!(stdout.contains("feat-gamma"), "stdout: {stdout}");
+    assert_eq!(
+        std::fs::read_to_string(home.path().join("state.json")).expect("state"),
+        state_before,
+        "resume must not rewrite the claim"
+    );
+
+    let events = run(&[
+        "--text",
+        "notch",
+        "feat/gamma",
+        "--events",
+        "--repo",
+        "demo",
+    ]);
+    assert!(
+        events.status.success(),
+        "read events failed: {}",
+        String::from_utf8_lossy(&events.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&events.stdout).contains("resumed"),
+        "events: {}",
+        String::from_utf8_lossy(&events.stdout)
+    );
+}
+
+#[test]
+fn start_refuses_two_anonymous_owners_with_the_same_name() {
+    // Equal OS-user strings are not a trustworthy identity proof, so the second
+    // anonymous terminal must receive the claim context and an explicit override.
+    let lab = lab::Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let outside = tempfile::tempdir().expect("create unmanaged terminal");
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_knives"))
+            .args(args)
+            .current_dir(outside.path())
+            .env("KNIVES_CONFIG_HOME", home.path())
+            .env_remove("KNIVES_OWNER")
+            .env_remove("CLAUDE_CODE_SESSION_ID")
+            .env("USER", "terminal-user")
+            .output()
+            .expect("run start")
+    };
+
+    let first = run(&[
+        "--text",
+        "start",
+        "feat/gamma",
+        "--repo",
+        "demo",
+        "--why",
+        "port it",
+    ]);
+    assert!(
+        first.status.success(),
+        "first start failed: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+
+    let second = run(&["--text", "start", "feat/gamma", "--repo", "demo"]);
+
+    assert_eq!(second.status.code(), Some(2), "stderr: {}", String::from_utf8_lossy(&second.stderr));
+    let stderr = String::from_utf8_lossy(&second.stderr);
+    assert!(stderr.contains("anonymous"), "stderr: {stderr}");
+    assert!(stderr.contains("port it"), "stderr: {stderr}");
+    assert!(stderr.contains("--force"), "stderr: {stderr}");
+}
+
+#[test]
+fn start_refuses_another_harness_session_and_names_the_holder() {
+    // A different harness identity must not inherit the first agent's workspace
+    // silently; the refusal names enough context to make the override auditable.
+    let lab = lab::Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let run = |owner: &str, args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_knives"))
+            .args(args)
+            .current_dir(&lab.work)
+            .env("KNIVES_CONFIG_HOME", home.path())
+            .env("KNIVES_OWNER", owner)
+            .output()
+            .expect("run start")
+    };
+
+    let first = run(
+        "agent-one",
+        &[
+            "--text",
+            "start",
+            "feat/gamma",
+            "--repo",
+            "demo",
+            "--why",
+            "port it",
+        ],
+    );
+    assert!(
+        first.status.success(),
+        "first start failed: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+
+    let second = run(
+        "agent-two",
+        &["--text", "start", "feat/gamma", "--repo", "demo"],
+    );
+
+    assert_eq!(second.status.code(), Some(2), "stderr: {}", String::from_utf8_lossy(&second.stderr));
+    let stderr = String::from_utf8_lossy(&second.stderr);
+    assert!(stderr.contains("agent-one"), "stderr: {stderr}");
+    assert!(stderr.contains("harness-session"), "stderr: {stderr}");
+    assert!(stderr.contains("claimed"), "stderr: {stderr}");
+    assert!(stderr.contains("last seen"), "stderr: {stderr}");
+    assert!(stderr.contains("--force"), "stderr: {stderr}");
+}
+
+#[test]
+fn start_from_inside_the_claimed_workspace_resumes_by_possession() {
+    // Possession is intentionally weaker than a harness identity and must leave
+    // its own ledger trail instead of mutating the held claim.
+    let lab = lab::Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let first = Command::new(env!("CARGO_BIN_EXE_knives"))
+        .args([
+            "--text",
+            "start",
+            "feat/gamma",
+            "--repo",
+            "demo",
+            "--why",
+            "port it",
+        ])
+        .current_dir(&lab.work)
+        .env("KNIVES_CONFIG_HOME", home.path())
+        .env("KNIVES_OWNER", "agent-one")
+        .output()
+        .expect("first start");
+    assert!(
+        first.status.success(),
+        "first start failed: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let workspace = lab.work.parent().expect("parent").join("feat-gamma");
+
+    let second = Command::new(env!("CARGO_BIN_EXE_knives"))
+        .args(["--text", "start", "feat/gamma", "--repo", "demo"])
+        .current_dir(&workspace)
+        .env("KNIVES_CONFIG_HOME", home.path())
+        .env_remove("KNIVES_OWNER")
+        .env_remove("CLAUDE_CODE_SESSION_ID")
+        .env("USER", "terminal-user")
+        .output()
+        .expect("resume from workspace");
+
+    assert!(
+        second.status.success(),
+        "possession resume failed: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&second.stdout).contains("possession"),
+        "stdout: {}",
+        String::from_utf8_lossy(&second.stdout)
+    );
+    let events = Command::new(env!("CARGO_BIN_EXE_knives"))
+        .args([
+            "--text",
+            "notch",
+            "feat/gamma",
+            "--events",
+            "--repo",
+            "demo",
+        ])
+        .current_dir(&workspace)
+        .env("KNIVES_CONFIG_HOME", home.path())
+        .env("KNIVES_OWNER", "agent-one")
+        .output()
+        .expect("read events");
+    assert!(
+        events.status.success(),
+        "read events failed: {}",
+        String::from_utf8_lossy(&events.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&events.stdout).contains("resumed via workspace possession"),
+        "events: {}",
+        String::from_utf8_lossy(&events.stdout)
+    );
+}
+
+#[test]
+fn start_force_seizes_and_records_the_previous_owner() {
+    // A force seizure preserves the workspace and records both the displaced
+    // identity and the new reason in the durable event stream.
+    let lab = lab::Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let run = |owner: &str, args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_knives"))
+            .args(args)
+            .current_dir(&lab.work)
+            .env("KNIVES_CONFIG_HOME", home.path())
+            .env("KNIVES_OWNER", owner)
+            .output()
+            .expect("run start")
+    };
+    let first = run(
+        "agent-one",
+        &[
+            "--text",
+            "start",
+            "feat/gamma",
+            "--repo",
+            "demo",
+            "--why",
+            "port it",
+        ],
+    );
+    assert!(
+        first.status.success(),
+        "first start failed: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let workspace = lab.work.parent().expect("parent").join("feat-gamma");
+    let change = lab.revision(&workspace, "@", "change_id.short(12)");
+
+    let second = run(
+        "agent-two",
+        &[
+            "--text",
+            "start",
+            "feat/gamma",
+            "--repo",
+            "demo",
+            "--force",
+            "--why",
+            "rescue stalled work",
+        ],
+    );
+
+    assert!(
+        second.status.success(),
+        "force start failed: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let state: Value = serde_json::from_str(
+        &std::fs::read_to_string(home.path().join("state.json")).expect("state"),
+    )
+    .expect("parse state");
+    assert_eq!(
+        state["claims"]["demo/feat/gamma"]["owner"],
+        Value::String("agent-two".to_owned())
+    );
+    assert!(
+        String::from_utf8_lossy(&second.stdout).contains(change.trim()),
+        "stdout: {}",
+        String::from_utf8_lossy(&second.stdout)
+    );
+    let events = run(
+        "agent-two",
+        &[
+            "--text",
+            "notch",
+            "feat/gamma",
+            "--events",
+            "--repo",
+            "demo",
+        ],
+    );
+    assert!(
+        events.status.success(),
+        "read events failed: {}",
+        String::from_utf8_lossy(&events.stderr)
+    );
+    let events = String::from_utf8_lossy(&events.stdout);
+    assert!(
+        events.contains("seized from agent-one (harness-session"),
+        "events: {events}"
+    );
+    assert!(events.contains("rescue stalled work"), "events: {events}");
+}
+
+#[test]
+fn start_adopts_an_existing_workspace_for_an_unclaimed_branch() {
+    // A workspace made outside knives is still valid work to claim. The command
+    // must reuse it rather than dying on the destination's existence.
+    let lab = lab::Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let workspace = lab.work.parent().expect("parent").join("feat-gamma");
+    knives::jj::add_workspace(&lab.work, "feat-gamma", &workspace, "main@upstream")
+        .expect("create existing workspace");
+    let change = lab.revision(&workspace, "@", "change_id.short(12)");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_knives"))
+        .args([
+            "--text",
+            "start",
+            "feat/gamma",
+            "--repo",
+            "demo",
+            "--why",
+            "adopt it",
+        ])
+        .current_dir(&lab.work)
+        .env("KNIVES_CONFIG_HOME", home.path())
+        .env("KNIVES_OWNER", "agent-one")
+        .output()
+        .expect("adopt workspace");
+
+    assert!(
+        output.status.success(),
+        "adopt failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("adopted"), "stdout: {stdout}");
+    assert!(stdout.contains("left as-is"), "stdout: {stdout}");
+    assert!(stdout.contains(change.trim()), "stdout: {stdout}");
+    let state: Value = serde_json::from_str(
+        &std::fs::read_to_string(home.path().join("state.json")).expect("state"),
+    )
+    .expect("parse state");
+    assert_eq!(
+        state["claims"]["demo/feat/gamma"]["owner"],
+        Value::String("agent-one".to_owned())
+    );
+}
+
+#[test]
+fn start_force_without_why_is_a_usage_error() {
+    // Clap owns this validation so a force never reaches claim handling without
+    // a durable human explanation.
+    let lab = lab::Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_knives"))
+        .args([
+            "--text",
+            "start",
+            "feat/gamma",
+            "--repo",
+            "demo",
+            "--force",
+        ])
+        .current_dir(&lab.work)
+        .env("KNIVES_CONFIG_HOME", home.path())
+        .output()
+        .expect("parse start");
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("--why"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn shared_base_selects_the_newest_of_multiple_trunk_reachable_release_parents() {
     // Given: a release carrying an old origin trunk parent, a newer upstream trunk
     // parent, and a feature parent. This is the accumulated-bases shape #11 leaves

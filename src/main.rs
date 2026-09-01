@@ -106,11 +106,16 @@ fn dispatch() -> anyhow::Result<Exit> {
             all,
             no_github,
         } => run_sync(repo.as_deref(), all, output, !no_github),
-        Command::Start { branch, repo, why } => {
+        Command::Start {
+            branch,
+            repo,
+            why,
+            force,
+        } => {
             let Some(name) = one_repo(repo.as_deref())? else {
                 return Ok(Exit::Usage);
             };
-            start::run(&name, &BranchName::new(branch), why.as_deref())
+            start::run(&name, &BranchName::new(branch), why.as_deref(), force)
         }
         Command::Finish {
             branch,
