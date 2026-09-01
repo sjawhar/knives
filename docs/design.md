@@ -247,9 +247,8 @@ knives status [REPO|--all]     problem-first status map; aligned branch rows (br
 knives pr NUMBER [--repo REPO] [--timeline]
                                one pull request's live state; --timeline reads its bounded forge event log
 knives start BRANCH            claim, create the workspace, base it on the release's shared base (falling back to fetched trunk)
-knives finish BRANCH [--allow-open]
-                               hand back claim and remove workspace; without --allow-open, refuse
-                               when the branch's pull request is open or cannot be checked
+knives finish BRANCH           hand back claim and remove workspace; the branch, its bookmark,
+                               and any open pull request survive the release
 knives track BRANCH --pr N     state which PR a branch belongs to, overriding inference
 knives depends BRANCH --on R#N  record that a branch cannot land before something else
 knives notch [SUBJECT]         read what happened here (bare: newest 20 human notes plus a
@@ -533,6 +532,6 @@ Measured or reproduced, not reasoned: workspace creation cost and tracked-versus
 
 - Closed-not-merged while the branch lives on, which staleness bots produce. Distinguish from supersession and from a deliberate fork-only branch.
 - A foreign `pull/N/head` advancing under a release, and whether re-cutting should be automatic or offered.
-- Whether hard refusal earns its cost.
+- Whether the claim gate's hard refusal earns its cost. The finish guard's did not: holding a claim through review blocked other agents for nothing, since a released branch, its bookmark, and its pull request all survive.
 - Workspace lifecycle beyond what `knives finish` cleans up. They are cheap to create, which is why they accumulate.
 - Codegraph integration. A stale index answers queries with silence rather than a warning, and `sync` costs 415ms, so any integration must sync before querying. Deferred; not important to resolve now.

@@ -279,8 +279,8 @@ impl CompletedSnapshot<'_> {
     }
 
     /// Numbers selected by the caller, deduped before warm refresh numbers join
-    /// the batch. The finish guard uses this to fail closed when a selected fact
-    /// is absent.
+    /// the batch. Callers that select facts read this back to spot a selected
+    /// number the batch left unanswered, from same-run evidence.
     pub fn requested(&self) -> &[u64] {
         &self.requested
     }

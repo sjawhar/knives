@@ -259,6 +259,9 @@ pub enum Command {
     },
     /// Hand a branch back and remove its workspace. The inverse of `start`.
     ///
+    /// Only the claim is released: the branch, its bookmark, and any open pull request
+    /// all survive, so hand a branch back as soon as your active work on it stops.
+    ///
     /// Removing the directory loses no work: jj snapshots a working copy into a commit,
     /// so every change made in that workspace is already in the repository and reachable
     /// by change id. What does not survive is anything jj never tracked — build output,
@@ -271,12 +274,6 @@ pub enum Command {
         /// Forget the workspace but leave its directory on disk.
         #[arg(long)]
         no_cleanup: bool,
-        /// Proceed even when the branch's pull request is open, or when its state
-        /// could not be checked. The default refuses both: handing back a branch
-        /// whose pull request is still open is how an open submission's head got
-        /// deleted on the forge.
-        #[arg(long)]
-        allow_open: bool,
         /// Release a claim held by another identity. Requires a durable reason.
         #[arg(long, requires = "why")]
         force: bool,

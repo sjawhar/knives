@@ -74,14 +74,17 @@ knives start <branch> --why "what you are doing"
 ```
 
 This claims the branch and creates a jj workspace for it, based on the fetched upstream
-trunk. When you are done:
+trunk. As soon as your active work there stops — including when it now waits on something
+external, such as a pull request in review:
 
 ```
 knives finish <branch>
 ```
 
-Which hands the claim back and removes the workspace. Nothing is lost — jj snapshots a
-working copy into a commit, so the work is in the repository and reachable by change id.
+Which hands the claim back and removes the workspace so another agent can pick the branch
+up. Nothing is lost — jj snapshots a working copy into a commit, so the work is in the
+repository and reachable by change id, and the branch, its bookmark, and any open pull
+request all survive the release.
 
 ## What not to do instead
 

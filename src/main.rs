@@ -125,7 +125,6 @@ fn dispatch() -> anyhow::Result<Exit> {
             repo,
             no_cleanup,
             superseded_by,
-            allow_open,
             force,
             why,
         } => {
@@ -137,7 +136,6 @@ fn dispatch() -> anyhow::Result<Exit> {
                 &FinishOptions {
                     superseded_by: superseded_by.as_deref(),
                     cleanup: !no_cleanup,
-                    allow_open,
                     force,
                     why: why.as_deref(),
                 },
@@ -2193,105 +2191,9 @@ fn forced_release_event(
     )
 }
 
-/// The finish guard's explicit selection context.
-///
-/// It holds only input available before discovery; `CompletedSnapshot::requested`
-/// carries the deduped selected numbers into the post-batch missing-fact check.
-struct FinishSelection<'a> {
-    stated: Option<u64>,
-    branch: &'a BranchName,
-}
-
-fn select_finish_numbers(
-    discovery: &knives::snapshot::Discovery<'_>,
-    selection: &FinishSelection<'_>,
-) -> Vec<u64> {
-    let discovery_primary = knives::forge::index_pulls(&discovery.ours())
-        .by_branch
-        .get(selection.branch)
-        .map(|pull| pull.number);
-    [selection.stated, discovery_primary]
-        .into_iter()
-        .flatten()
-        .collect()
-}
-
-/// The open pull request a branch still owns, if the forge proves it has one.
-///
-/// A stated number is authoritative when it is open; otherwise the branch's
-/// currently primary pull request is considered too. Every number surfaced for
-/// that guard needs a same-run fact; an omitted fact cannot prove it is closed.
-fn open_pull_for(
-    target: &BranchTarget,
-    entry: &knives::config::RepoEntry,
-    store: &Store,
-    cache_root: Option<&std::path::Path>,
-) -> Result<Option<knives::forge::PullRequest>, knives::forge::ForgeError> {
-    let remotes = [
-        entry.remote(knives::config::Role::Origin),
-        entry.remote(knives::config::Role::Release),
-    ];
-    let forge = CliForge;
-    let opened = knives::snapshot::open(knives::snapshot::SnapshotConfig {
-        forge: &forge,
-        path: &entry.path,
-        remotes,
-        cache_root,
-    })?;
-    let stated = store.tracked_pull(target);
-    let selection = FinishSelection {
-        stated,
-        branch: &target.branch,
-    };
-    let snapshot = opened.complete_with(&selection, select_finish_numbers)?;
-    let mut requested: std::collections::BTreeSet<u64> =
-        snapshot.requested().iter().copied().collect();
-    let primary = snapshot
-        .index()
-        .by_branch
-        .get(&target.branch)
-        .map(|pull| pull.number);
-    if let Some(number) = primary {
-        let _ = requested.insert(number);
-    }
-    let unanswered: Vec<u64> = requested
-        .iter()
-        .copied()
-        .filter(|number| snapshot.fact(*number).is_none())
-        .collect();
-    let result = (|| {
-        if !unanswered.is_empty() {
-            return Err(knives::forge::ForgeError::Query {
-                detail: format!(
-                    "the forge did not report facts for requested pull request(s) {}",
-                    numbered(&unanswered)
-                ),
-            });
-        }
-        let mut open = None;
-        for number in [stated, primary].into_iter().flatten() {
-            let Some(fact) = snapshot.fact(number) else {
-                return Err(knives::forge::ForgeError::Query {
-                    detail: format!(
-                        "the forge did not report facts for requested pull request #{number}"
-                    ),
-                });
-            };
-            if fact.pull.is_open() {
-                open = Some(fact.pull.clone());
-                break;
-            }
-        }
-        Ok(open)
-    })();
-    let _ = snapshot.persist(None);
-    result
-}
-
 struct FinishOptions<'a> {
     superseded_by: Option<&'a str>,
     cleanup: bool,
-    allow_open: bool,
     force: bool,
     why: Option<&'a str>,
 }
@@ -2315,32 +2217,25 @@ fn run_finish(target: &BranchTarget, options: &FinishOptions<'_>) -> anyhow::Res
     let mut store = Store::open_for_update(default_state_path())?;
     let workspace = knives::commands::wip::workspace_for(target.branch.as_str());
     let directory = entry.path.parent().map(|parent| parent.join(&workspace));
+    // The primary workspace is named "default" and the registered checkout is its
+    // directory; `start` can never have created either for a branch, so a branch
+    // whose flattened name lands on them is a collision, not a workspace to clean
+    // up. Without this, `finish` would forget the primary workspace and delete
+    // the checkout itself.
+    if workspace == "default" || directory.as_deref() == Some(entry.path.as_path()) {
+        eprintln!(
+            "{}: branch {} maps to workspace {workspace}, which is the registered \
+             checkout itself; refusing to touch {}",
+            target.repo,
+            target.branch,
+            entry.path.display()
+        );
+        return Ok(Exit::Usage);
+    }
     let forced_release = match finish_claim_gate(target, entry, &store, options)? {
         FinishClaimGate::Continue(event) => event,
         FinishClaimGate::Refuse => return Ok(Exit::Usage),
     };
-    let cache_root = knives::forge_cache::cache_root();
-    if !options.allow_open {
-        match open_pull_for(target, entry, &store, cache_root.as_deref()) {
-            Ok(Some(pull)) => {
-                println!(
-                    "{}: {} is the head of open pull request #{} ({}); merge or close it first, \
-                     or pass --allow-open",
-                    target.repo, target.branch, pull.number, pull.url
-                );
-                return Ok(Exit::Findings);
-            }
-            Ok(None) => {}
-            Err(error) => {
-                println!(
-                    "{}: cannot verify whether {} has an open pull request ({error}); \
-                     fix the forge login or pass --allow-open",
-                    target.repo, target.branch
-                );
-                return Ok(Exit::Incomplete);
-            }
-        }
-    }
     let had = store.release_claim(target);
     if let Some(new) = options.superseded_by {
         store.supersede(target, new);

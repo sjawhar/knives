@@ -89,10 +89,10 @@ fn notice_format_matches_the_plugin_prose_exactly() {
         ),
     ];
 
-    // Then: every non-nonce byte equals the TypeScript formatter's text.
+    // Then: every non-nonce byte matches the notice prose exactly.
     assert_eq!(actual, [
-        "\n\n<knives-notice-NONCE repo=\"example-repo\" digest=\"0123456789abcdef\">\n/example/repo is a fork managed by knives, and another agent may be working in it.\nBranches claimed here: a (x); b (y).\nUse knives rather than jj or git directly here: `knives status` for the state of\nevery branch, `knives start <branch>` to take a branch and get your own workspace,\n`knives finish <branch>` when you are done with it.\n</knives-notice-NONCE>".to_owned(),
-        "\n\n<knives-notice-NONCE repo=\"example-repo\" digest=\"fedcba9876543210\">\n/example/repo is a fork managed by knives, and another agent may be working in it.\nNo branch is claimed here right now.\nUse knives rather than jj or git directly here: `knives status` for the state of\nevery branch, `knives start <branch>` to take a branch and get your own workspace,\n`knives finish <branch>` when you are done with it.\n</knives-notice-NONCE>".to_owned(),
+        "\n\n<knives-notice-NONCE repo=\"example-repo\" digest=\"0123456789abcdef\">\n/example/repo is a fork managed by knives, and another agent may be working in it.\nBranches claimed here: a (x); b (y).\nUse knives rather than jj or git directly here: `knives status` for the state of\nevery branch, `knives start <branch>` to take a branch and get your own workspace,\n`knives finish <branch>` as soon as your active work there stops — the branch,\nits bookmark, and any open pull request all survive the release.\n</knives-notice-NONCE>".to_owned(),
+        "\n\n<knives-notice-NONCE repo=\"example-repo\" digest=\"fedcba9876543210\">\n/example/repo is a fork managed by knives, and another agent may be working in it.\nNo branch is claimed here right now.\nUse knives rather than jj or git directly here: `knives status` for the state of\nevery branch, `knives start <branch>` to take a branch and get your own workspace,\n`knives finish <branch>` as soon as your active work there stops — the branch,\nits bookmark, and any open pull request all survive the release.\n</knives-notice-NONCE>".to_owned(),
     ]);
 }
 
