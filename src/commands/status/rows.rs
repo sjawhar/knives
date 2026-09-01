@@ -221,21 +221,26 @@ fn state_for(
     pull: Option<&PullRequest>,
     checks: Option<&ChecksSummary>,
     forge_consulted: bool,
+    has_associated_pull: bool,
 ) -> BranchState {
-    let review = pull.map(|pull| pull.review_decision.as_str());
+    let is_open = pull.is_some_and(PullRequest::is_open);
+    let review = pull
+        .filter(|pull| pull.is_open())
+        .map(|pull| pull.review_decision.as_str());
     branch_state(BranchStateInput {
         fork_only,
         divergent,
         landed: landed == Some(LandedVerdict::InTrunk),
-        conflicted: pull.is_some_and(PullRequest::conflicting),
-        checks_failing: checks.is_some_and(ChecksSummary::failing),
-        changes_requested: review.is_some_and(|review| review.eq_ignore_ascii_case("CHANGES_REQUESTED")),
+        conflicted: is_open && pull.is_some_and(PullRequest::conflicting),
+        checks_failing: is_open && checks.is_some_and(ChecksSummary::failing),
+        changes_requested: review
+            .is_some_and(|review| review.eq_ignore_ascii_case("CHANGES_REQUESTED")),
         approved: review.is_some_and(|review| review.eq_ignore_ascii_case("APPROVED")),
-        draft: pull.is_some_and(|pull| pull.is_draft),
-        awaiting_review: pull.is_some_and(PullRequest::is_open),
+        draft: is_open && pull.is_some_and(|pull| pull.is_draft),
+        awaiting_review: is_open,
         merged: pull.is_some_and(|pull| pull.state.eq_ignore_ascii_case("MERGED")),
         closed: pull.is_some_and(|pull| pull.state.eq_ignore_ascii_case("CLOSED")),
-        no_pr: forge_consulted && pull.is_none(),
+        no_pr: forge_consulted && !has_associated_pull,
     })
 }
 
@@ -364,6 +369,11 @@ pub(super) fn divergent_rows(
                 None => (Some(PushRelation::Unpushed), None),
             };
             let fork_only = input.store.is_fork_only(&target);
+            let pr = pull_cell(
+                pull,
+                stated_pull_for(&target, input.store, input.snapshot),
+                prior_pulls_for(branch, &input.index.prior),
+            );
             BranchRow {
                 name: branch.clone(),
                 state: state_for(
@@ -373,15 +383,12 @@ pub(super) fn divergent_rows(
                     pull,
                     checks.as_ref(),
                     input.snapshot.is_some(),
+                    pr.is_some(),
                 ),
                 tip: None,
                 push,
                 origin_tip,
-                pr: pull_cell(
-                    pull,
-                    stated_pull_for(&target, input.store, input.snapshot),
-                    prior_pulls_for(branch, &input.index.prior),
-                ),
+                pr,
                 review: review_cell(pull),
                 checks: checks_cell(pull, checks.as_ref()),
                 landed: None,
@@ -471,6 +478,11 @@ pub(super) fn branch_rows(
         let (push, origin_tip) = push_for(raw_origin.as_ref(), relation);
         let target = BranchTarget::new(row_input.name.clone(), branch.clone());
         let fork_only = row_input.store.is_fork_only(&target);
+        let pr = pull_cell(
+            pull,
+            stated_pull_for(&target, row_input.store, row_input.snapshot),
+            prior_pulls_for(&branch, &row_input.index.prior),
+        );
         report.branches.push(BranchRow {
             name: branch.clone(),
             state: state_for(
@@ -480,15 +492,12 @@ pub(super) fn branch_rows(
                 pull,
                 checks.as_ref(),
                 row_input.snapshot.is_some(),
+                pr.is_some(),
             ),
             tip: Some(short(tip.as_str())),
             push,
             origin_tip,
-            pr: pull_cell(
-                pull,
-                stated_pull_for(&target, row_input.store, row_input.snapshot),
-                prior_pulls_for(&branch, &row_input.index.prior),
-            ),
+            pr,
             review: review_cell(pull),
             checks: checks_cell(pull, checks.as_ref()),
             landed,
@@ -583,6 +592,52 @@ mod tests {
         assert_eq!(branch_state(case), BranchState::NoPr);
 
         assert_eq!(branch_state(input()), BranchState::Unknown);
+    }
+
+    #[test]
+    fn terminal_pull_states_outrank_review_decisions_and_draft() {
+        let approved_closed = PullRequest {
+            state: "CLOSED".to_owned(),
+            review_decision: "APPROVED".to_owned(),
+            ..PullRequest::default()
+        };
+        assert_eq!(
+            state_for(false, false, None, Some(&approved_closed), None, true, true),
+            BranchState::Closed
+        );
+
+        let closed_draft = PullRequest {
+            state: "CLOSED".to_owned(),
+            is_draft: true,
+            ..PullRequest::default()
+        };
+        assert_eq!(
+            state_for(false, false, None, Some(&closed_draft), None, true, true),
+            BranchState::Closed
+        );
+    }
+
+    #[test]
+    fn a_tracked_unavailable_pull_is_not_no_pr() {
+        let tracked_unavailable = Some(PullCell {
+            number: 42,
+            state: "unknown".to_owned(),
+            draft: false,
+            stated: Some(true),
+            prior: Vec::new(),
+        });
+        assert_eq!(
+            state_for(
+                false,
+                false,
+                None,
+                None,
+                None,
+                true,
+                tracked_unavailable.is_some(),
+            ),
+            BranchState::Unknown
+        );
     }
 
     #[test]

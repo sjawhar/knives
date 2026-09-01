@@ -693,6 +693,34 @@ fn add_releases(
     Ok(())
 }
 
+/// Uses all observation sources when the operation walk succeeded. If it failed,
+/// sidecar records remain trustworthy but the unobserved window is necessarily incomplete.
+fn claim_last_seen(
+    claim: &crate::store::Claim,
+    activity: Option<&crate::jj::WorkspaceActivity>,
+    seen: &crate::seen::Seen,
+) -> crate::seen::LastSeen {
+    let Some(activity) = activity else {
+        let workspace = crate::commands::wip::workspace_for(&claim.branch);
+        let workspace_key = format!("{}/{}", claim.repo, workspace);
+        let timestamps = [
+            seen.owners
+                .get(&claim.kind)
+                .and_then(|owners| owners.get(&claim.owner))
+                .and_then(|timestamp| timestamp.parse().ok()),
+            seen.workspaces
+                .get(&workspace_key)
+                .and_then(|timestamp| timestamp.parse().ok()),
+        ];
+        return timestamps
+            .into_iter()
+            .flatten()
+            .max()
+            .map_or(crate::seen::LastSeen::NoneWithinWindow, crate::seen::LastSeen::At);
+    };
+    crate::seen::last_seen(claim, activity, seen)
+}
+
 /// Folds claims, workspace facts, and sidecar observations into branch rows.
 fn fold_claims(
     report: &mut Report,
@@ -708,12 +736,12 @@ fn fold_claims(
         .map(|claim| crate::ids::WorkspaceName::new(crate::commands::wip::workspace_for(&claim.branch)))
         .collect();
     let activity = match repo.workspace_activity(&wanted, crate::jj::MAX_ACTIVITY_OPS) {
-        Ok(activity) => activity,
+        Ok(activity) => Some(activity),
         Err(error) => {
             report
                 .problems
                 .push(format!("workspace activity unavailable: {error}"));
-            crate::jj::WorkspaceActivity::default()
+            None
         }
     };
     let mut workspaces: BTreeSet<crate::ids::WorkspaceName> = match repo.workspaces() {
@@ -744,7 +772,7 @@ fn fold_claims(
             since: claim.started.clone(),
             why: claim.why.clone(),
         });
-        match crate::seen::last_seen(claim, &activity, seen) {
+        match claim_last_seen(claim, activity.as_ref(), seen) {
             crate::seen::LastSeen::At(timestamp) => row.last_seen = Some(timestamp.to_string()),
             crate::seen::LastSeen::NoneSinceClaim => {
                 row.seen = Some(SeenWindow::NoneSinceClaim);
@@ -1407,6 +1435,39 @@ mod tests {
 
         assert!(notches_from_ledger(Some(&ledger), &mut report).is_empty());
         assert_eq!(exit_for(&report), Exit::Incomplete);
+    }
+
+    #[test]
+    fn activity_errors_keep_sidecar_observations_and_mark_unsighted_claims_within_window() {
+        let claim = crate::store::Claim {
+            repo: "demo".to_owned(),
+            branch: "feat/alpha".to_owned(),
+            owner: "session".to_owned(),
+            kind: crate::store::OwnerKind::HarnessSession,
+            why: "status model".to_owned(),
+            started: "2026-08-01T00:00:00Z".to_owned(),
+            files: Vec::new(),
+        };
+
+        assert_eq!(
+            claim_last_seen(&claim, None, &crate::seen::Seen::default()),
+            crate::seen::LastSeen::NoneWithinWindow
+        );
+
+        let seen = crate::seen::Seen {
+            owners: std::collections::BTreeMap::from([(
+                crate::store::OwnerKind::HarnessSession,
+                std::collections::BTreeMap::from([(
+                    "session".to_owned(),
+                    jiff::Timestamp::now().to_string(),
+                )]),
+            )]),
+            ..crate::seen::Seen::default()
+        };
+        assert!(matches!(
+            claim_last_seen(&claim, None, &seen),
+            crate::seen::LastSeen::At(_)
+        ));
     }
 
     #[test]
