@@ -1,15 +1,14 @@
 use super::{
-    BTreeMap, BookmarkRef, BookmarkTips, BranchName, BranchRow, BranchTarget, ChecksSummary,
-    CommitId, JjError, LandedVerdict, LastNotch, Notch, OriginRelation, PriorPull, PullDetails,
-    PullIndex, PullRequest, PullSummary, ReleaseScheme, Repo, RepoEntry, RepoName, Report,
-    StatedPull, Store, fmt, is_release_name, pull_number_from_bookmark,
+    BTreeMap, BookmarkRef, BookmarkTips, BranchName, BranchRow, BranchState, BranchTarget,
+    ChecksSummary, CommitId, Finding, FindingKind, JjError, LandedVerdict, LastNotch, Notch,
+    OriginRelation, PriorPull, PullCell, PullDetails, PullIndex, PullRequest, PullSummary,
+    PushRelation, ReleaseScheme, Repo, RepoEntry, RepoName, Report, Store, Subject, fmt,
+    is_release_name, pull_number_from_bookmark, short,
 };
 
 use super::phases::ProbeInput;
+
 /// The pull request a bookmark refers to, by branch name or by fetched-head number.
-///
-/// A `pr-<n>` bookmark is a fetched pull request head: its name is the number, not
-/// the branch the pull request came from, so matching on name alone never found one.
 pub(super) fn pull_summary_for<'a>(
     branch: &BranchName,
     index: &'a BTreeMap<BranchName, PullSummary>,
@@ -32,19 +31,14 @@ pub(super) fn prior_pulls_for(
                 .iter()
                 .map(|pull| PriorPull {
                     number: pull.number,
-                    state: pull.state.clone(),
+                    state: pull.state.to_lowercase(),
                 })
                 .collect()
         })
         .unwrap_or_default()
 }
+
 /// Branches we maintain apart from the configured trunk, and fetched pull request heads skipped.
-///
-/// A `pr-<n>` bookmark is not a branch of ours: it is a pull request head this tool
-/// fetched so a release could carry it. Treating fetch artifacts as our work is most of
-/// why this report was unreadable — on one repository they were 16 of 28 rows and 10 of
-/// 24 findings, every one of the latter advising us to drop a branch that was never
-/// ours. They also each cost a landed probe, which is most of the runtime.
 pub(super) fn maintained_branches(
     tips: &BookmarkTips,
     trunk: &str,
@@ -68,28 +62,58 @@ pub(super) fn maintained_branches(
         .collect();
     (branches, fetched_heads)
 }
-/// The pull request stated for a branch, with the current snapshot's answer.
-pub(super) fn stated_pull_for(
+
+fn stated_pull_for(
     target: &BranchTarget,
     store: &Store,
     snapshot: Option<&crate::snapshot::CompletedSnapshot<'_>>,
-) -> Option<StatedPull> {
-    store.tracked_pull(target).map(|number| StatedPull {
-        state: snapshot
-            .and_then(|snapshot| snapshot.fact(number))
-            .map_or_else(|| "unknown".to_owned(), |fact| fact.pull.state.clone()),
-        number,
+) -> Option<PullCell> {
+    store.tracked_pull(target).map(|number| {
+        let pull = snapshot.and_then(|snapshot| snapshot.fact(number));
+        PullCell {
+            number,
+            state: pull.map_or_else(|| "unknown".to_owned(), |fact| fact.pull.state.to_lowercase()),
+            draft: pull.is_some_and(|fact| fact.pull.is_draft),
+            stated: Some(true),
+            prior: Vec::new(),
+        }
     })
 }
-/// Whether the newest review predates the branch head, when there was a review to
-/// compare.
-///
-/// Gated as the per-pull-request call was: an empty review decision means the
-/// forge recorded no review, and `None` must never render as "current".
-pub(super) fn review_stale_from(
-    details: Option<&PullDetails>,
-    pull_request: Option<&PullRequest>,
-) -> Option<bool> {
+
+fn pull_cell(
+    inferred: Option<&PullRequest>,
+    stated: Option<PullCell>,
+    mut prior: Vec<PriorPull>,
+) -> Option<PullCell> {
+    let mut cell = inferred.map(|pull| PullCell {
+        number: pull.number,
+        state: pull.state.to_lowercase(),
+        draft: pull.is_draft,
+        stated: None,
+        prior: Vec::new(),
+    });
+    if let Some(stated) = stated {
+        if let Some(primary) = &mut cell {
+            if primary.number == stated.number {
+                primary.stated = Some(true);
+            } else {
+                prior.push(PriorPull {
+                    number: stated.number,
+                    state: stated.state,
+                });
+            }
+        } else {
+            cell = Some(stated);
+        }
+    }
+    cell.map(|mut cell| {
+        cell.prior = prior;
+        cell
+    })
+}
+
+/// Whether the newest review predates the branch head, when there was a review to compare.
+fn review_stale_from(details: Option<&PullDetails>, pull_request: Option<&PullRequest>) -> Option<bool> {
     let pull_request = pull_request?;
     if pull_request.review_decision.is_empty() {
         return None;
@@ -98,13 +122,7 @@ pub(super) fn review_stale_from(
 }
 
 /// What the forge's checks say, for an open pull request that was consulted.
-///
-/// Settled pull requests are not asked about and not reported on: a closed one's
-/// recorded rollup is obsolete the moment it closes.
-pub(super) fn checks_from(
-    details: Option<&PullDetails>,
-    pull_request: Option<&PullRequest>,
-) -> Option<ChecksSummary> {
+fn checks_from(details: Option<&PullDetails>, pull_request: Option<&PullRequest>) -> Option<ChecksSummary> {
     let pull_request = pull_request?;
     if !pull_request.is_open() {
         return None;
@@ -112,11 +130,180 @@ pub(super) fn checks_from(
     details?.checks.clone()
 }
 
+fn review_cell(pull: Option<&PullRequest>) -> Option<String> {
+    let pull = pull.filter(|pull| pull.is_open())?;
+    Some(if pull.review_decision.is_empty() {
+        "no-review".to_owned()
+    } else {
+        pull.review_decision.to_lowercase().replace('_', "-")
+    })
+}
+
+fn checks_cell(pull: Option<&PullRequest>, checks: Option<&ChecksSummary>) -> Option<String> {
+    pull.filter(|pull| pull.is_open())?;
+    let checks = checks?;
+    Some(if checks.failing() {
+        "failing".to_owned()
+    } else if !checks.ran() {
+        "none-ran".to_owned()
+    } else if checks.pending() {
+        "pending".to_owned()
+    } else {
+        "ok".to_owned()
+    })
+}
+
+#[derive(Default)]
+struct BranchStateInput {
+    fork_only: bool,
+    divergent: bool,
+    landed: bool,
+    conflicted: bool,
+    checks_failing: bool,
+    changes_requested: bool,
+    approved: bool,
+    draft: bool,
+    awaiting_review: bool,
+    merged: bool,
+    closed: bool,
+    no_pr: bool,
+}
+
+/// Applies the reported branch-state taxonomy in its declaration order.
+fn branch_state(input: BranchStateInput) -> BranchState {
+    let BranchStateInput {
+        fork_only,
+        divergent,
+        landed,
+        conflicted,
+        checks_failing,
+        changes_requested,
+        approved,
+        draft,
+        awaiting_review,
+        merged,
+        closed,
+        no_pr,
+    } = input;
+    if fork_only {
+        BranchState::ForkOnly
+    } else if divergent {
+        BranchState::Divergent
+    } else if landed {
+        BranchState::Landed
+    } else if conflicted {
+        BranchState::Conflicted
+    } else if checks_failing {
+        BranchState::ChecksFailing
+    } else if changes_requested {
+        BranchState::ChangesRequested
+    } else if approved {
+        BranchState::Approved
+    } else if draft {
+        BranchState::Draft
+    } else if awaiting_review {
+        BranchState::AwaitingReview
+    } else if merged {
+        BranchState::Merged
+    } else if closed {
+        BranchState::Closed
+    } else if no_pr {
+        BranchState::NoPr
+    } else {
+        BranchState::Unknown
+    }
+}
+
+fn state_for(
+    fork_only: bool,
+    divergent: bool,
+    landed: Option<LandedVerdict>,
+    pull: Option<&PullRequest>,
+    checks: Option<&ChecksSummary>,
+    forge_consulted: bool,
+) -> BranchState {
+    let review = pull.map(|pull| pull.review_decision.as_str());
+    branch_state(BranchStateInput {
+        fork_only,
+        divergent,
+        landed: landed == Some(LandedVerdict::InTrunk),
+        conflicted: pull.is_some_and(PullRequest::conflicting),
+        checks_failing: checks.is_some_and(ChecksSummary::failing),
+        changes_requested: review.is_some_and(|review| review.eq_ignore_ascii_case("CHANGES_REQUESTED")),
+        approved: review.is_some_and(|review| review.eq_ignore_ascii_case("APPROVED")),
+        draft: pull.is_some_and(|pull| pull.is_draft),
+        awaiting_review: pull.is_some_and(PullRequest::is_open),
+        merged: pull.is_some_and(|pull| pull.state.eq_ignore_ascii_case("MERGED")),
+        closed: pull.is_some_and(|pull| pull.state.eq_ignore_ascii_case("CLOSED")),
+        no_pr: forge_consulted && pull.is_none(),
+    })
+}
+
+fn flags_for(pull: Option<&PullRequest>, review_stale: Option<bool>) -> Vec<String> {
+    let mut flags = Vec::new();
+    if pull.is_some_and(|pull| pull.merge_state_status.eq_ignore_ascii_case("BEHIND")) {
+        flags.push("behind-base".to_owned());
+    }
+    if review_stale == Some(true) {
+        flags.push("review-stale".to_owned());
+    }
+    flags
+}
+
+fn push_for(origin_tip: Option<&CommitId>, relation: Option<PushRelation>) -> (Option<PushRelation>, Option<String>) {
+    match (origin_tip, relation) {
+        (None, _) => (Some(PushRelation::Unpushed), None),
+        (Some(origin), Some(PushRelation::Behind | PushRelation::Diverged | PushRelation::Unresolved)) => {
+            (relation, Some(short(origin.as_str())))
+        }
+        (Some(_), Some(PushRelation::Unpushed | PushRelation::UnpushedCommits)) => (relation, None),
+        (Some(_), None) => (None, None),
+    }
+}
+
+fn add_pull_findings(
+    findings: &mut Vec<Finding>,
+    branch: &BranchName,
+    pull: Option<&PullRequest>,
+    checks: Option<&ChecksSummary>,
+    review_stale: Option<bool>,
+    expected_base: &str,
+) {
+    let Some(pull) = pull else {
+        return;
+    };
+    if pull.conflicting() {
+        findings.push(Finding::new(
+            FindingKind::Unmergeable,
+            Subject::PullRequest(pull.number),
+            format!("#{} cannot be merged as it stands", pull.number),
+        ));
+    }
+    if pull.is_open() && checks.is_some_and(ChecksSummary::failing) {
+        findings.push(Finding::new(
+            FindingKind::ChecksFailing,
+            Subject::PullRequest(pull.number),
+            format!("#{} has failing checks", pull.number),
+        ));
+    }
+    if review_stale == Some(true) {
+        findings.push(Finding::new(
+            FindingKind::StaleReview,
+            Subject::PullRequest(pull.number),
+            format!("the newest review on #{} predates the newest commit on {branch}", pull.number),
+        ));
+    }
+    if pull.is_open() && !pull.base_ref_name.is_empty() && pull.base_ref_name != expected_base {
+        findings.push(Finding::new(
+            FindingKind::WrongBase,
+            Subject::PullRequest(pull.number),
+            format!("#{} targets {}, not {expected_base}", pull.number, pull.base_ref_name),
+        ));
+    }
+}
+
 /// The locally divergent branches that need rows but have no tip to probe.
-pub(super) fn divergent_branch_names(
-    repo: &Repo,
-    entry: &RepoEntry,
-) -> anyhow::Result<Vec<BranchName>> {
+pub(super) fn divergent_branch_names(repo: &Repo, entry: &RepoEntry) -> anyhow::Result<Vec<BranchName>> {
     let scheme = entry.release_scheme();
     Ok(repo
         .conflicted_bookmarks()?
@@ -141,77 +328,99 @@ pub(super) struct DivergentInput<'a, 'snapshot> {
     pub(super) snapshot: Option<&'a crate::snapshot::CompletedSnapshot<'snapshot>>,
     pub(super) index: &'a PullIndex,
     pub(super) notches: &'a [Notch],
+    pub(super) expected_base: &'a str,
 }
 
 /// Rows for divergent local bookmarks.
-///
-/// `bookmark_tips` cannot report these: a conflicted target has no single commit, so
-/// jj-lib yields nothing for it. Without them these branches were absent from the
-/// listing entirely, and a branch with no row got no pull request association either, so
-/// its pull request read as nonexistent until somebody happened to resolve the
-/// divergence. Proven by before-and-after on #228.
-pub(super) fn divergent_rows(input: &DivergentInput<'_, '_>) -> Vec<BranchRow> {
+pub(super) fn divergent_rows(
+    input: &DivergentInput<'_, '_>,
+    findings: &mut Vec<Finding>,
+) -> Vec<BranchRow> {
     input
         .branches
         .iter()
         .map(|branch| {
             let target = BranchTarget::new(input.name.clone(), branch.clone());
-            let fact = pull_summary_for(branch, &input.index.by_branch).and_then(|summary| {
-                input
-                    .snapshot
-                    .and_then(|snapshot| snapshot.fact(summary.number))
-            });
-            let (pull_request, review_stale, checks) = fact.map_or_else(
-                || (None, None, None),
-                |fact| {
-                    (
-                        Some(fact.pull.clone()),
-                        review_stale_from(Some(&fact.details), Some(&fact.pull)),
-                        checks_from(Some(&fact.details), Some(&fact.pull)),
-                    )
-                },
-            );
-            BranchRow {
-                fork_only: input.store.is_fork_only(&target),
-                stated_pull: stated_pull_for(&target, input.store, input.snapshot),
-                pull_request,
+            let fact = pull_summary_for(branch, &input.index.by_branch)
+                .and_then(|summary| input.snapshot.and_then(|snapshot| snapshot.fact(summary.number)));
+            let pull = fact.map(|fact| &fact.pull);
+            let details = fact.map(|fact| &fact.details);
+            let checks = checks_from(details, pull);
+            let review_stale = review_stale_from(details, pull);
+            add_pull_findings(
+                findings,
+                branch,
+                pull,
+                checks.as_ref(),
                 review_stale,
-                checks,
-                prior_pulls: prior_pulls_for(branch, &input.index.prior),
-                origin_tip: input
-                    .tips
-                    .get(&BookmarkRef::Remote {
-                        branch: branch.clone(),
-                        remote: crate::ids::RemoteName::new("origin"),
-                    })
-                    .cloned(),
-                last_notch: LastNotch::of(
+                input.expected_base,
+            );
+            let raw_origin = input.tips.get(&BookmarkRef::Remote {
+                branch: branch.clone(),
+                remote: crate::ids::RemoteName::new("origin"),
+            });
+            let (push, origin_tip) = match raw_origin {
+                Some(origin) => (Some(PushRelation::Unresolved), Some(short(origin.as_str()))),
+                None => (Some(PushRelation::Unpushed), None),
+            };
+            let fork_only = input.store.is_fork_only(&target);
+            BranchRow {
+                name: branch.clone(),
+                state: state_for(
+                    fork_only,
+                    true,
+                    None,
+                    pull,
+                    checks.as_ref(),
+                    input.snapshot.is_some(),
+                ),
+                tip: None,
+                push,
+                origin_tip,
+                pr: pull_cell(
+                    pull,
+                    stated_pull_for(&target, input.store, input.snapshot),
+                    prior_pulls_for(branch, &input.index.prior),
+                ),
+                review: review_cell(pull),
+                checks: checks_cell(pull, checks.as_ref()),
+                landed: None,
+                flags: flags_for(pull, review_stale),
+                claim: None,
+                last_seen: None,
+                seen: None,
+                workspace: None,
+                notch: LastNotch::of(
                     input
                         .notches
                         .iter()
                         .filter(|notch| notch.subject.as_deref() == Some(branch.as_str())),
                 ),
-                // Nothing to replay: a divergent bookmark has no single commit to probe.
-                ..BranchRow::bare(branch.clone(), None)
             }
         })
         .collect()
 }
+
 pub(super) fn record_origin_relation<E: fmt::Display>(
     report: &mut Report,
     branch: &BranchName,
     relation: Result<Option<OriginRelation>, E>,
-) -> Option<OriginRelation> {
+) -> Option<PushRelation> {
     match relation {
-        Ok(relation) => relation,
+        Ok(relation) => relation.map(|relation| match relation {
+            OriginRelation::Ahead => PushRelation::UnpushedCommits,
+            OriginRelation::Behind => PushRelation::Behind,
+            OriginRelation::Diverged => PushRelation::Diverged,
+        }),
         Err(error) => {
-            report.problems.push(format!(
-                "cannot tell how {branch} relates to origin: {error}"
-            ));
-            None
+            report
+                .problems
+                .push(format!("cannot tell how {branch} relates to origin: {error}"));
+            Some(PushRelation::Unresolved)
         }
     }
 }
+
 /// Everything the maintained-branch row loop needs after the two concurrent phases end.
 pub(super) struct RowInput<'a, 'snapshot> {
     pub(super) name: &'a RepoName,
@@ -220,6 +429,7 @@ pub(super) struct RowInput<'a, 'snapshot> {
     pub(super) index: &'a PullIndex,
     pub(super) snapshot: Option<&'a crate::snapshot::CompletedSnapshot<'snapshot>>,
     pub(super) notches: &'a [Notch],
+    pub(super) expected_base: &'a str,
 }
 
 /// The branch rows, and the branches whose landed state could not be judged.
@@ -228,6 +438,7 @@ pub(super) fn branch_rows(
     verdicts: Vec<Result<Option<LandedVerdict>, JjError>>,
     origin_relations: Vec<Result<Option<OriginRelation>, String>>,
     report: &mut Report,
+    findings: &mut Vec<Finding>,
 ) -> anyhow::Result<Vec<String>> {
     let mut unjudged = Vec::new();
     for ((verdict, probe_input), relation) in verdicts
@@ -237,49 +448,61 @@ pub(super) fn branch_rows(
     {
         let branch = probe_input.branch;
         let tip = probe_input.tip;
-        let origin_tip = probe_input.origin_tip;
-        // Propagated in branch order, so a probe failure reports the same branch
-        // and the same message it did when probes ran one at a time.
+        let raw_origin = probe_input.origin_tip;
         let landed = verdict?;
         if landed == Some(LandedVerdict::Unjudged) {
             unjudged.push(branch.to_string());
         }
-        let fact = pull_summary_for(&branch, &row_input.index.by_branch).and_then(|summary| {
-            row_input
-                .snapshot
-                .and_then(|snapshot| snapshot.fact(summary.number))
-        });
-        let (pull_request, review_stale, checks) = fact.map_or_else(
-            || (None, None, None),
-            |fact| {
-                (
-                    Some(fact.pull.clone()),
-                    review_stale_from(Some(&fact.details), Some(&fact.pull)),
-                    checks_from(Some(&fact.details), Some(&fact.pull)),
-                )
-            },
-        );
-        let origin_relation = record_origin_relation(report, &branch, relation);
-        let target = BranchTarget::new(row_input.name.clone(), branch.clone());
-        let last_notch = LastNotch::of(
-            row_input
-                .notches
-                .iter()
-                .filter(|notch| notch.subject.as_deref() == Some(branch.as_str())),
-        );
-        report.branches.push(BranchRow {
-            prior_pulls: prior_pulls_for(&branch, &row_input.index.prior),
-            name: branch,
-            tip: Some(tip),
-            origin_tip,
-            origin_relation,
-            pull_request,
-            landed,
+        let fact = pull_summary_for(&branch, &row_input.index.by_branch)
+            .and_then(|summary| row_input.snapshot.and_then(|snapshot| snapshot.fact(summary.number)));
+        let pull = fact.map(|fact| &fact.pull);
+        let details = fact.map(|fact| &fact.details);
+        let checks = checks_from(details, pull);
+        let review_stale = review_stale_from(details, pull);
+        add_pull_findings(
+            findings,
+            &branch,
+            pull,
+            checks.as_ref(),
             review_stale,
-            checks,
-            fork_only: row_input.store.is_fork_only(&target),
-            stated_pull: stated_pull_for(&target, row_input.store, row_input.snapshot),
-            last_notch,
+            row_input.expected_base,
+        );
+        let relation = record_origin_relation(report, &branch, relation);
+        let (push, origin_tip) = push_for(raw_origin.as_ref(), relation);
+        let target = BranchTarget::new(row_input.name.clone(), branch.clone());
+        let fork_only = row_input.store.is_fork_only(&target);
+        report.branches.push(BranchRow {
+            name: branch.clone(),
+            state: state_for(
+                fork_only,
+                false,
+                landed,
+                pull,
+                checks.as_ref(),
+                row_input.snapshot.is_some(),
+            ),
+            tip: Some(short(tip.as_str())),
+            push,
+            origin_tip,
+            pr: pull_cell(
+                pull,
+                stated_pull_for(&target, row_input.store, row_input.snapshot),
+                prior_pulls_for(&branch, &row_input.index.prior),
+            ),
+            review: review_cell(pull),
+            checks: checks_cell(pull, checks.as_ref()),
+            landed,
+            flags: flags_for(pull, review_stale),
+            claim: None,
+            last_seen: None,
+            seen: None,
+            workspace: None,
+            notch: LastNotch::of(
+                row_input
+                    .notches
+                    .iter()
+                    .filter(|notch| notch.subject.as_deref() == Some(branch.as_str())),
+            ),
         });
     }
     Ok(unjudged)
@@ -293,26 +516,92 @@ mod tests {
     )]
     use super::super::test_fixtures::{local, tips};
     use super::*;
+
+    fn input() -> BranchStateInput {
+        BranchStateInput::default()
+    }
+
+    #[test]
+    fn branch_state_precedence_is_first_match_wins() {
+        let mut case = input();
+        case.fork_only = true;
+        case.divergent = true;
+        assert_eq!(branch_state(case), BranchState::ForkOnly);
+
+        let mut case = input();
+        case.divergent = true;
+        case.landed = true;
+        assert_eq!(branch_state(case), BranchState::Divergent);
+
+        let mut case = input();
+        case.landed = true;
+        case.conflicted = true;
+        assert_eq!(branch_state(case), BranchState::Landed);
+
+        let mut case = input();
+        case.conflicted = true;
+        case.checks_failing = true;
+        assert_eq!(branch_state(case), BranchState::Conflicted);
+
+        let mut case = input();
+        case.checks_failing = true;
+        case.changes_requested = true;
+        assert_eq!(branch_state(case), BranchState::ChecksFailing);
+
+        let mut case = input();
+        case.changes_requested = true;
+        case.approved = true;
+        assert_eq!(branch_state(case), BranchState::ChangesRequested);
+
+        let mut case = input();
+        case.approved = true;
+        case.draft = true;
+        assert_eq!(branch_state(case), BranchState::Approved);
+
+        let mut case = input();
+        case.draft = true;
+        case.awaiting_review = true;
+        assert_eq!(branch_state(case), BranchState::Draft);
+
+        let mut case = input();
+        case.awaiting_review = true;
+        case.merged = true;
+        assert_eq!(branch_state(case), BranchState::AwaitingReview);
+
+        let mut case = input();
+        case.merged = true;
+        case.closed = true;
+        assert_eq!(branch_state(case), BranchState::Merged);
+
+        let mut case = input();
+        case.closed = true;
+        case.no_pr = true;
+        assert_eq!(branch_state(case), BranchState::Closed);
+
+        let mut case = input();
+        case.no_pr = true;
+        assert_eq!(branch_state(case), BranchState::NoPr);
+
+        assert_eq!(branch_state(input()), BranchState::Unknown);
+    }
+
     #[test]
     fn the_trunk_exclusion_follows_the_repo_entry_not_the_name_main() {
-        // Given: a repo whose upstream trunk is dev, carrying a branch named main
         let map = tips(&[
             (local("dev"), "aaa"),
             (local("main"), "bbb"),
             (local("feat/alpha"), "ccc"),
         ]);
-        // When: maintained branches are collected with dev as the trunk
         let (branches, _) = maintained_branches(&map, "dev", &ReleaseScheme::Dated);
         let names: Vec<String> = branches
             .iter()
             .map(|(branch, _)| branch.to_string())
             .collect();
-        // Then: dev is excluded as the trunk, and a branch that merely shares the
-        // name main is ours to report
         assert!(!names.contains(&"dev".to_owned()), "was: {names:?}");
         assert!(names.contains(&"main".to_owned()), "was: {names:?}");
         assert!(names.contains(&"feat/alpha".to_owned()));
     }
+
     #[test]
     fn an_unresolved_origin_relation_records_its_branch() {
         let mut report = Report::default();
@@ -326,7 +615,7 @@ mod tests {
             }),
         );
 
-        assert_eq!(relation, None);
+        assert_eq!(relation, Some(PushRelation::Unresolved));
         assert!(
             report.problems.iter().any(|problem| {
                 problem.contains("cannot tell how feat/alpha relates to origin")
