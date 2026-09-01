@@ -11,13 +11,50 @@
 use std::path::Path;
 
 use crate::commands::hook::owner_for;
-use crate::store::OwnerKind;
+use crate::store::{Claim, OwnerKind};
 
 /// A claimant and the source that established its name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Identity {
     pub owner: String,
     pub kind: OwnerKind,
+}
+
+/// The inputs relevant to taking or resuming a claim.
+pub struct ClaimContext<'a> {
+    pub held: Option<&'a Claim>,
+    pub identity: &'a Identity,
+    pub in_claimed_workspace: bool,
+}
+
+/// The mutually exclusive outcomes for a claim attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimDecision {
+    Take,
+    Resume { possession: bool },
+    RefuseAnonymous,
+    RefuseHeld,
+}
+
+/// Chooses the claim outcome from identity, possession, and the current claim.
+pub fn decide(context: &ClaimContext<'_>) -> ClaimDecision {
+    match context.held {
+        None => ClaimDecision::Take,
+        Some(_) if context.in_claimed_workspace => ClaimDecision::Resume { possession: true },
+        Some(claim)
+            if claim.kind == context.identity.kind
+                && claim.kind != OwnerKind::OsUser
+                && claim.owner == context.identity.owner =>
+        {
+            ClaimDecision::Resume { possession: false }
+        }
+        Some(claim)
+            if claim.kind == OwnerKind::OsUser && context.identity.kind == OwnerKind::OsUser =>
+        {
+            ClaimDecision::RefuseAnonymous
+        }
+        Some(_) => ClaimDecision::RefuseHeld,
+    }
 }
 
 /// Resolves the identity that should own a claim.
@@ -69,6 +106,27 @@ mod tests {
 
     use super::*;
     use crate::config::test_support::{EnvironmentGuard, environment_lock};
+    use crate::store::{Claim, OwnerKind};
+
+    fn held(owner: &str, kind: OwnerKind) -> Claim {
+        Claim {
+            repo: "a-repo".into(),
+            branch: "feat/alpha".into(),
+            owner: owner.into(),
+            kind,
+            why: "w".into(),
+            started: "2026-01-01T00:00:00Z".into(),
+            files: Vec::new(),
+        }
+    }
+
+    fn identity(owner: &str, kind: OwnerKind) -> Identity {
+        Identity {
+            owner: owner.into(),
+            kind,
+        }
+    }
+
 
 
     #[test]
@@ -186,4 +244,116 @@ mod tests {
 
         environment.set("CLAUDE_CODE_SESSION_ID", "abc-123");
     }
+    #[test]
+    fn an_unclaimed_branch_is_taken() {
+        let identity = identity("agent-one", OwnerKind::HarnessSession);
+        let context = ClaimContext {
+            held: None,
+            identity: &identity,
+            in_claimed_workspace: false,
+        };
+
+        assert_eq!(decide(&context), ClaimDecision::Take);
+    }
+
+    #[test]
+    fn the_same_harness_session_resumes() {
+        let claim = held("agent-one", OwnerKind::HarnessSession);
+        let identity = identity("agent-one", OwnerKind::HarnessSession);
+        let context = ClaimContext {
+            held: Some(&claim),
+            identity: &identity,
+            in_claimed_workspace: false,
+        };
+
+        assert_eq!(
+            decide(&context),
+            ClaimDecision::Resume { possession: false }
+        );
+    }
+
+    #[test]
+    fn a_different_harness_session_is_refused() {
+        let claim = held("agent-one", OwnerKind::HarnessSession);
+        let identity = identity("agent-two", OwnerKind::HarnessSession);
+        let context = ClaimContext {
+            held: Some(&claim),
+            identity: &identity,
+            in_claimed_workspace: false,
+        };
+
+        assert_eq!(decide(&context), ClaimDecision::RefuseHeld);
+    }
+
+    #[test]
+    fn two_anonymous_owners_never_match_even_with_equal_strings() {
+        let claim = held("terminal-user", OwnerKind::OsUser);
+        let identity = identity("terminal-user", OwnerKind::OsUser);
+        let context = ClaimContext {
+            held: Some(&claim),
+            identity: &identity,
+            in_claimed_workspace: false,
+        };
+
+        assert_eq!(decide(&context), ClaimDecision::RefuseAnonymous);
+    }
+
+    #[test]
+    fn possession_of_the_claimed_workspace_resumes_whatever_the_identity() {
+        let claim = held("someone-else", OwnerKind::HarnessSession);
+        let identity = identity("terminal-user", OwnerKind::OsUser);
+        let context = ClaimContext {
+            held: Some(&claim),
+            identity: &identity,
+            in_claimed_workspace: true,
+        };
+
+        assert_eq!(
+            decide(&context),
+            ClaimDecision::Resume { possession: true }
+        );
+    }
+
+    #[test]
+    fn mixed_kinds_with_equal_strings_are_strangers() {
+        let claim = held("abc", OwnerKind::HarnessSession);
+        let identity = identity("abc", OwnerKind::WorkspaceDerived);
+        let context = ClaimContext {
+            held: Some(&claim),
+            identity: &identity,
+            in_claimed_workspace: false,
+        };
+
+        assert_eq!(decide(&context), ClaimDecision::RefuseHeld);
+    }
+
+    #[test]
+    fn matching_workspace_derived_identities_resume() {
+        let claim = held("abc", OwnerKind::WorkspaceDerived);
+        let identity = identity("abc", OwnerKind::WorkspaceDerived);
+        let context = ClaimContext {
+            held: Some(&claim),
+            identity: &identity,
+            in_claimed_workspace: false,
+        };
+
+        assert_eq!(
+            decide(&context),
+            ClaimDecision::Resume { possession: false }
+        );
+    }
+
+    #[test]
+    fn an_anonymous_challenger_to_a_harness_claim_is_refused_not_anonymous() {
+        let claim = held("abc", OwnerKind::HarnessSession);
+        let identity = identity("ubuntu", OwnerKind::OsUser);
+        let context = ClaimContext {
+            held: Some(&claim),
+            identity: &identity,
+            in_claimed_workspace: false,
+        };
+
+        assert_eq!(decide(&context), ClaimDecision::RefuseHeld);
+    }
+
 }
