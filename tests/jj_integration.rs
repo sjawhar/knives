@@ -797,7 +797,9 @@ fn workspace_activity_reports_nothing_for_a_workspace_that_never_moved() {
     let lab = Lab::new();
     let repo = Repo::open(&lab.work).expect("open");
     let wanted = BTreeSet::from([WorkspaceName::new("never-created")]);
-    let activity = repo.workspace_activity(&wanted, 200).expect("walk");
+    let activity = repo
+        .workspace_activity(&wanted, operation_ids(&lab.work).len())
+        .expect("walk");
 
     assert!(activity.moves.is_empty(), "was: {activity:?}");
     assert!(activity.horizon.is_none(), "was: {activity:?}");

@@ -179,11 +179,21 @@ impl Repo {
         let mut exhausted = false;
 
         loop {
-            if visited == max_ops
-                || (!wanted.is_empty()
-                    && wanted
-                        .iter()
-                        .all(|workspace| activity.moves.contains_key(workspace)))
+            if visited == max_ops {
+                match stream.as_mut().poll_next(&mut context) {
+                    Poll::Ready(None) => exhausted = true,
+                    Poll::Ready(Some(_)) => {}
+                    Poll::Pending => {
+                        std::thread::yield_now();
+                        continue;
+                    }
+                }
+                break;
+            }
+            if !wanted.is_empty()
+                && wanted
+                    .iter()
+                    .all(|workspace| activity.moves.contains_key(workspace))
             {
                 break;
             }

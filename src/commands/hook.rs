@@ -281,9 +281,9 @@ fn session_start(event: &Event, home: &Path) -> anyhow::Result<Option<String>> {
     let Some(session_id) = event.session_id() else {
         return Ok(None);
     };
-    if event.source() == Some("compact") {
+    let compact = event.source() == Some("compact");
+    if compact {
         let _ = SessionState::update(home, CLAUDE_CODE, session_id, SessionState::clear)?;
-        return Ok(None);
     }
     let Some(cwd) = event.cwd() else {
         return Ok(None);
@@ -307,6 +307,9 @@ fn session_start(event: &Event, home: &Path) -> anyhow::Result<Option<String>> {
             kind: crate::store::OwnerKind::HarnessSession,
         },
     );
+    if compact {
+        return Ok(None);
+    }
     let state = SessionState::load(home, CLAUDE_CODE, session_id);
     if state.repo(&matched.repo.root).noticed {
         return Ok(None);

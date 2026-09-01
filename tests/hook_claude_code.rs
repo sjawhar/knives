@@ -194,6 +194,35 @@ fn session_start_in_a_managed_workspace_records_passive_observations() {
 }
 
 #[test]
+fn compact_session_start_in_a_managed_workspace_records_passive_observations() {
+    let repos = Repositories::new();
+    repos.configure(false);
+    std::fs::create_dir_all(repos.beta.join(".jj")).expect("create workspace marker");
+    let mut compact = event("session-start", &repos.beta, None);
+    compact["source"] = json!("compact");
+
+    assert!(run_hook(repos.home.path(), &compact).is_empty());
+
+    let seen: Value = serde_json::from_str(
+        &std::fs::read_to_string(repos.home.path().join("seen.json"))
+            .expect("compact SessionStart records seen.json"),
+    )
+    .expect("seen JSON");
+    assert!(
+        seen["owners"]["harness-session"][SESSION_ID]
+            .as_str()
+            .is_some_and(|timestamp| timestamp.parse::<jiff::Timestamp>().is_ok()),
+        "was: {seen}"
+    );
+    assert!(
+        seen["workspaces"]["beta/beta"]
+            .as_str()
+            .is_some_and(|timestamp| timestamp.parse::<jiff::Timestamp>().is_ok()),
+        "was: {seen}"
+    );
+}
+
+#[test]
 fn compact_session_start_resets_the_notice_budget() {
     // Given: a managed session has already received its notice.
     let repos = Repositories::new();
