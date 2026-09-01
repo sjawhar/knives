@@ -157,7 +157,7 @@ fn opencode_tool_after(event: &OpenCodeEvent, home: &Path) -> anyhow::Result<Str
     if matched.repo.kind == GuidanceRootKind::Managed
         && let Some(cwd) = event.cwd()
     {
-        let _ = crate::seen::record_observation(
+        crate::seen::record_observation(
             Path::new(cwd),
             &Identity {
                 owner: session_id.to_owned(),
@@ -300,7 +300,7 @@ fn session_start(event: &Event, home: &Path) -> anyhow::Result<Option<String>> {
     if matched.repo.kind != GuidanceRootKind::Managed {
         return Ok(None);
     }
-    let _ = crate::seen::record_observation(
+    crate::seen::record_observation(
         Path::new(cwd),
         &Identity {
             owner: session_id.to_owned(),
@@ -339,7 +339,7 @@ fn post_tool_use(event: &Event, home: &Path) -> anyhow::Result<Option<String>> {
     if matched.repo.kind == GuidanceRootKind::Managed
         && let Some(cwd) = event.cwd()
     {
-        let _ = crate::seen::record_observation(
+        crate::seen::record_observation(
             Path::new(cwd),
             &Identity {
                 owner: session_id.to_owned(),

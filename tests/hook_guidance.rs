@@ -156,9 +156,7 @@ fn claim_lines_filter_the_repo_and_render_claim_provenance() {
         claim("repo", "feature/reason", "blair", "review fixes"),
         claim("other", "feature/hidden", "casey", "different repository"),
     ];
-    let now = "2026-08-03T00:00:00Z"
-        .parse()
-        .expect("valid timestamp");
+    let now = "2026-08-03T00:00:00Z".parse().expect("valid timestamp");
 
     // When: lines are rendered for `repo`.
     let lines = claim_lines(&claims, "repo", &Seen::default(), now);

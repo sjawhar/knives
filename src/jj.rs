@@ -197,28 +197,34 @@ impl Repo {
             path: destination.display().to_string(),
             detail: error.to_string(),
         })?;
-        let loaded = workspace.repo_path().canonicalize().map_err(|error| JjError::Open {
-            path: workspace.repo_path().display().to_string(),
-            detail: error.to_string(),
-        })?;
-        if loaded != expected {
+        let workspace_repo_path =
+            workspace
+                .repo_path()
+                .canonicalize()
+                .map_err(|error| JjError::Open {
+                    path: workspace.repo_path().display().to_string(),
+                    detail: error.to_string(),
+                })?;
+        if workspace_repo_path != expected {
             return Err(JjError::WorkspaceRepositoryMismatch {
                 workspace: destination.to_owned(),
                 expected,
-                actual: loaded,
+                actual: workspace_repo_path,
             });
         }
         let name = workspace.workspace_name().to_owned();
         let recorded = workspace.working_copy().operation_id().clone();
-        let loader = workspace.repo_loader();
-        let operation = block_on(loader.load_operation(&recorded)).map_err(|error| JjError::Open {
-            path: destination.display().to_string(),
-            detail: error.to_string(),
-        })?;
-        let historical = block_on(loader.load_at(&operation)).map_err(|error| JjError::Open {
-            path: destination.display().to_string(),
-            detail: error.to_string(),
-        })?;
+        let repo_loader = workspace.repo_loader();
+        let operation =
+            block_on(repo_loader.load_operation(&recorded)).map_err(|error| JjError::Open {
+                path: destination.display().to_string(),
+                detail: error.to_string(),
+            })?;
+        let historical =
+            block_on(repo_loader.load_at(&operation)).map_err(|error| JjError::Open {
+                path: destination.display().to_string(),
+                detail: error.to_string(),
+            })?;
         let commit = historical
             .view()
             .get_wc_commit_id(&name)
@@ -240,44 +246,46 @@ impl Repo {
                 path: destination.display().to_string(),
                 detail: error.to_string(),
             })?;
-        let updated = block_on(transaction.commit("re-registered forgotten workspace")).map_err(
-            |error| JjError::Open {
+        let updated =
+            block_on(transaction.commit("re-registered forgotten workspace")).map_err(|error| {
+                JjError::Open {
+                    path: destination.display().to_string(),
+                    detail: error.to_string(),
+                }
+            })?;
+        let mutation =
+            block_on(workspace.start_working_copy_mutation()).map_err(|error| JjError::Open {
                 path: destination.display().to_string(),
                 detail: error.to_string(),
-            },
-        )?;
-        let mutation = block_on(workspace.start_working_copy_mutation()).map_err(|error| {
-            JjError::Open {
-                path: destination.display().to_string(),
-                detail: error.to_string(),
-            }
-        })?;
-        block_on(mutation.finish(updated.operation().id().clone())).map_err(|error| {
-            JjError::Open {
-                path: destination.display().to_string(),
-                detail: error.to_string(),
-            }
+            })?;
+        block_on(mutation.finish(updated.operation().id().clone())).map_err(|error| JjError::Open {
+            path: destination.display().to_string(),
+            detail: error.to_string(),
         })
     }
 
     fn repository_store_path(workspace: &Path) -> Result<PathBuf, JjError> {
-        let pointer = workspace.join(".jj/repo");
-        let repository = if pointer.is_file() {
-            let pointed = std::fs::read_to_string(&pointer).map_err(|error| JjError::Open {
-                path: pointer.display().to_string(),
-                detail: error.to_string(),
-            })?;
-            let pointed = PathBuf::from(pointed.trim());
-            if pointed.is_absolute() {
-                pointed
+        let repo_pointer = workspace.join(".jj/repo");
+        let repository = if repo_pointer.is_file() {
+            let path_contents =
+                std::fs::read_to_string(&repo_pointer).map_err(|error| JjError::Open {
+                    path: repo_pointer.display().to_string(),
+                    detail: error.to_string(),
+                })?;
+            let relative_path = PathBuf::from(path_contents.trim());
+            if relative_path.is_absolute() {
+                relative_path
             } else {
-                pointer
+                repo_pointer
                     .parent()
-                    .expect(".jj/repo has a parent")
-                    .join(pointed)
+                    .ok_or_else(|| JjError::Open {
+                        path: repo_pointer.display().to_string(),
+                        detail: ".jj/repo has no parent directory".to_owned(),
+                    })?
+                    .join(relative_path)
             }
         } else {
-            pointer
+            repo_pointer
         };
         repository.canonicalize().map_err(|error| JjError::Open {
             path: repository.display().to_string(),
@@ -293,9 +301,8 @@ impl Repo {
         max_ops: usize,
     ) -> Result<WorkspaceActivity, JjError> {
         let head = self.repo.operation();
-        let mut stream = std::pin::pin!(jj_lib::op_walk::walk_ancestors(
-            std::slice::from_ref(head)
-        ));
+        let mut stream =
+            std::pin::pin!(jj_lib::op_walk::walk_ancestors(std::slice::from_ref(head)));
         let waker = Waker::noop();
         let mut context = Context::from_waker(waker);
         let mut activity = WorkspaceActivity::default();
@@ -335,13 +342,13 @@ impl Repo {
                         continue;
                     }
 
-                    let parents = block_on(operation.parents()).map_err(|error| JjError::Parse {
-                        detail: error.to_string(),
+                    let parents =
+                        block_on(operation.parents()).map_err(|error| JjError::Parse {
+                            detail: error.to_string(),
+                        })?;
+                    let parent = parents.into_iter().next().ok_or_else(|| JjError::Parse {
+                        detail: "single-parent operation loaded without a parent".to_owned(),
                     })?;
-                    let parent = parents
-                        .into_iter()
-                        .next()
-                        .expect("one parent id yields one parent operation");
                     let view = block_on(operation.view()).map_err(|error| JjError::Parse {
                         detail: error.to_string(),
                     })?;

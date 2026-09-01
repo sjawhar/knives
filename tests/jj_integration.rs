@@ -33,8 +33,8 @@ use knives::jj::{
     Repo, changed_files, changed_files_between, probe_landed, pull_heads, remote_refs,
 };
 use knives::store::{OwnerKind, Store};
-use serde_json::Value;
 use lab::Lab;
+use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::process::Command;
 
@@ -778,7 +778,11 @@ fn a_jj_workspace_beside_a_registered_repo_resolves_that_repo() {
 fn workspace_activity_attributes_working_copy_moves_to_their_workspace() {
     let lab = Lab::new();
     lab.jj_work(["workspace", "add", "--name", "feat-x", "../feat-x-ws"]);
-    let workspace_dir = lab.work.parent().expect("workspace parent").join("feat-x-ws");
+    let workspace_dir = lab
+        .work
+        .parent()
+        .expect("workspace parent")
+        .join("feat-x-ws");
     std::fs::write(workspace_dir.join("w.txt"), "work\n").expect("write workspace content");
     lab.jj_at(&workspace_dir, ["new", "-m", "wip"]);
 
@@ -3555,9 +3559,18 @@ fn start_refuses_two_anonymous_owners_with_the_same_name() {
 
     let second = run(&["--text", "start", "feat/gamma", "--repo", "demo"]);
 
-    assert_eq!(second.status.code(), Some(2), "stderr: {}", String::from_utf8_lossy(&second.stderr));
+    assert_eq!(
+        second.status.code(),
+        Some(2),
+        "stderr: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
     let stderr = String::from_utf8_lossy(&second.stderr);
-    assert!(stderr.contains("anonymous"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("both sides are anonymous identities"),
+        "stderr: {stderr}"
+    );
+    assert!(stderr.contains("can never match"), "stderr: {stderr}");
     assert!(stderr.contains("port it"), "stderr: {stderr}");
     assert!(stderr.contains("--force"), "stderr: {stderr}");
 }
@@ -3601,7 +3614,12 @@ fn start_refuses_another_harness_session_and_names_the_holder() {
         &["--text", "start", "feat/gamma", "--repo", "demo"],
     );
 
-    assert_eq!(second.status.code(), Some(2), "stderr: {}", String::from_utf8_lossy(&second.stderr));
+    assert_eq!(
+        second.status.code(),
+        Some(2),
+        "stderr: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
     let stderr = String::from_utf8_lossy(&second.stderr);
     assert!(stderr.contains("agent-one"), "stderr: {stderr}");
     assert!(stderr.contains("harness-session"), "stderr: {stderr}");
@@ -3918,7 +3936,10 @@ fn start_refuses_a_same_named_workspace_from_another_repository() {
     let workspace = lab.work.parent().expect("parent").join("feat-gamma");
     knives::jj::add_workspace(&foreign.work, "feat-gamma", &workspace, "main@upstream")
         .expect("create foreign workspace at target path");
-    let main_workspaces_before = Repo::open(&lab.work).expect("open managed repo").workspaces().expect("list managed workspaces");
+    let main_workspaces_before = Repo::open(&lab.work)
+        .expect("open managed repo")
+        .workspaces()
+        .expect("list managed workspaces");
     let foreign_change_before = foreign.revision(&workspace, "@", "change_id");
     let main_operations_before = operation_ids(&lab.work);
     let foreign_operations_before = operation_ids(&foreign.work);
@@ -3946,7 +3967,10 @@ fn start_refuses_a_same_named_workspace_from_another_repository() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains(&lab.work.display().to_string()), "stderr: {stderr}");
+    assert!(
+        stderr.contains(&lab.work.display().to_string()),
+        "stderr: {stderr}"
+    );
     assert!(
         stderr.contains(&foreign.work.display().to_string()),
         "stderr: {stderr}"
@@ -3956,7 +3980,10 @@ fn start_refuses_a_same_named_workspace_from_another_repository() {
         "foreign workspace wrote a claim"
     );
     assert_eq!(
-        Repo::open(&lab.work).expect("reopen managed repo").workspaces().expect("list managed workspaces"),
+        Repo::open(&lab.work)
+            .expect("reopen managed repo")
+            .workspaces()
+            .expect("list managed workspaces"),
         main_workspaces_before,
         "foreign workspace changed the managed repository"
     );
@@ -4018,7 +4045,10 @@ fn start_refuses_a_malformed_foreign_workspace_before_loading_it() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains(&lab.work.display().to_string()), "stderr: {stderr}");
+    assert!(
+        stderr.contains(&lab.work.display().to_string()),
+        "stderr: {stderr}"
+    );
     assert!(
         stderr.contains(&foreign.work.display().to_string()),
         "stderr: {stderr}"
@@ -4029,7 +4059,6 @@ fn start_refuses_a_malformed_foreign_workspace_before_loading_it() {
     );
     assert_eq!(operation_ids(&lab.work), main_operations_before);
     assert_eq!(operation_ids(&foreign.work), foreign_operations_before);
-
 }
 
 #[test]
@@ -4040,14 +4069,7 @@ fn start_force_without_why_is_a_usage_error() {
     let (home, _consumer) = release_test_home(&lab);
 
     let output = Command::new(env!("CARGO_BIN_EXE_knives"))
-        .args([
-            "--text",
-            "start",
-            "feat/gamma",
-            "--repo",
-            "demo",
-            "--force",
-        ])
+        .args(["--text", "start", "feat/gamma", "--repo", "demo", "--force"])
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
         .output()
@@ -4563,7 +4585,6 @@ fn start_claim_for_finish(
         .expect("workspace parent")
         .join(knives::commands::wip::workspace_for(branch))
 }
-
 
 fn knives_finish(lab: &lab::Lab, home: &tempfile::TempDir, args: &[&str]) -> std::process::Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_knives"));

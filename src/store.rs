@@ -23,18 +23,13 @@ pub fn default_state_path() -> PathBuf {
     default_config_path().with_file_name("state.json")
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum OwnerKind {
     HarnessSession,
     WorkspaceDerived,
+    #[default]
     OsUser,
-}
-
-impl Default for OwnerKind {
-    fn default() -> Self {
-        Self::OsUser
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

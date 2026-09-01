@@ -21,6 +21,7 @@ pub struct Identity {
 }
 
 /// The inputs relevant to taking or resuming a claim.
+#[derive(Debug)]
 pub struct ClaimContext<'a> {
     pub held: Option<&'a Claim>,
     pub identity: &'a Identity,
@@ -196,8 +197,6 @@ mod tests {
             kind,
         }
     }
-
-
 
     #[test]
     fn a_blank_knives_owner_falls_back_to_the_os_user() {
@@ -378,10 +377,7 @@ mod tests {
             in_claimed_workspace: true,
         };
 
-        assert_eq!(
-            decide(&context),
-            ClaimDecision::Resume { possession: true }
-        );
+        assert_eq!(decide(&context), ClaimDecision::Resume { possession: true });
     }
 
     #[test]
@@ -425,5 +421,4 @@ mod tests {
 
         assert_eq!(decide(&context), ClaimDecision::RefuseHeld);
     }
-
 }

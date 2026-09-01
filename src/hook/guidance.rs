@@ -368,9 +368,7 @@ mod tests {
             )]),
             workspaces: BTreeMap::new(),
         };
-        let now = "2026-01-03T00:00:00Z"
-            .parse()
-            .expect("valid timestamp");
+        let now = "2026-01-03T00:00:00Z".parse().expect("valid timestamp");
 
         let rows = claim_lines(&claims, "r", &seen, now);
 

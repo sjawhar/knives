@@ -31,7 +31,7 @@ pub mod jj;
 pub mod ledger;
 pub mod pins;
 pub mod release_model;
-pub mod snapshot;
 pub mod seen;
+pub mod snapshot;
 pub mod store;
 pub mod timing;

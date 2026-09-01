@@ -47,9 +47,8 @@ pub enum LastSeen {
 /// A resolved jj workspace also contributes its registered repository and
 /// workspace-directory name.
 pub fn record_observation(cwd: &Path, identity: &Identity) {
-    let owner = (identity.kind != OwnerKind::OsUser).then(|| {
-        (identity.kind, identity.owner.clone())
-    });
+    let owner =
+        (identity.kind != OwnerKind::OsUser).then(|| (identity.kind, identity.owner.clone()));
     let workspace = workspace_key(cwd);
     if owner.is_none() && workspace.is_none() {
         return;
@@ -63,20 +62,18 @@ pub fn record_observation(cwd: &Path, identity: &Identity) {
         return;
     };
     let now = jiff::Timestamp::now();
-    let prune_before = now
-        .checked_sub(PRUNE_AGE)
-        .expect("90 days is within Jiff's timestamp range");
-    let fresh_after = now
-        .checked_sub(THROTTLE_AGE)
-        .expect("60 seconds is within Jiff's timestamp range");
+    let Ok(prune_before) = now.checked_sub(PRUNE_AGE) else {
+        return;
+    };
+    let Ok(fresh_after) = now.checked_sub(THROTTLE_AGE) else {
+        return;
+    };
     let mut changed = prune(&mut seen, prune_before);
     let timestamp = now.to_string();
 
     if let Some((kind, owner)) = owner
         && !is_fresh(
-            seen.owners
-                .get(&kind)
-                .and_then(|owners| owners.get(&owner)),
+            seen.owners.get(&kind).and_then(|owners| owners.get(&owner)),
             fresh_after,
         )
     {
@@ -124,13 +121,10 @@ pub fn last_seen(claim: &Claim, activity: &WorkspaceActivity, seen: &Seen) -> La
     let Ok(started) = claim.started.parse::<jiff::Timestamp>() else {
         return LastSeen::NoneWithinWindow;
     };
-    let seen_horizon = jiff::Timestamp::now()
-        .checked_sub(PRUNE_AGE)
-        .expect("90 days is within Jiff's timestamp range");
-    let operation_covers_claim = match activity.horizon {
-        None => true,
-        Some(horizon) => horizon <= started,
+    let Ok(seen_horizon) = jiff::Timestamp::now().checked_sub(PRUNE_AGE) else {
+        return LastSeen::NoneWithinWindow;
     };
+    let operation_covers_claim = activity.horizon.is_none_or(|horizon| horizon <= started);
     if operation_covers_claim && started >= seen_horizon {
         LastSeen::NoneSinceClaim
     } else {
@@ -259,7 +253,10 @@ mod tests {
                 OwnerKind::HarnessSession,
                 BTreeMap::from([("agent-one".to_owned(), "2026-01-03T00:00:00Z".to_owned())]),
             )]),
-            workspaces: BTreeMap::from([("a/feat-x".to_owned(), "2026-01-02T00:00:00Z".to_owned())]),
+            workspaces: BTreeMap::from([(
+                "a/feat-x".to_owned(),
+                "2026-01-02T00:00:00Z".to_owned(),
+            )]),
         };
 
         assert_eq!(
@@ -343,7 +340,10 @@ mod tests {
         let _lock = environment_lock();
         let environment = EnvironmentGuard::capture(&["KNIVES_CONFIG_HOME"]);
         let home = tempfile::tempdir().expect("create config home");
-        environment.set("KNIVES_CONFIG_HOME", home.path().to_str().expect("utf-8 path"));
+        environment.set(
+            "KNIVES_CONFIG_HOME",
+            home.path().to_str().expect("utf-8 path"),
+        );
         let cwd = configured_workspace(&home);
 
         record_observation(
@@ -362,7 +362,10 @@ mod tests {
         let _lock = environment_lock();
         let environment = EnvironmentGuard::capture(&["KNIVES_CONFIG_HOME"]);
         let home = tempfile::tempdir().expect("create config home");
-        environment.set("KNIVES_CONFIG_HOME", home.path().to_str().expect("utf-8 path"));
+        environment.set(
+            "KNIVES_CONFIG_HOME",
+            home.path().to_str().expect("utf-8 path"),
+        );
         let cwd = configured_workspace(&home);
         let identity = Identity {
             owner: "agent-one".to_owned(),
@@ -383,7 +386,10 @@ mod tests {
         let _lock = environment_lock();
         let environment = EnvironmentGuard::capture(&["KNIVES_CONFIG_HOME"]);
         let home = tempfile::tempdir().expect("create config home");
-        environment.set("KNIVES_CONFIG_HOME", home.path().to_str().expect("utf-8 path"));
+        environment.set(
+            "KNIVES_CONFIG_HOME",
+            home.path().to_str().expect("utf-8 path"),
+        );
         let cwd = configured_workspace(&home);
         let stale = jiff::Timestamp::now()
             .checked_sub(jiff::SignedDuration::from_hours(91 * 24))

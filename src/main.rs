@@ -134,11 +134,13 @@ fn dispatch() -> anyhow::Result<Exit> {
             };
             run_finish(
                 &BranchTarget::new(name, BranchName::new(branch)),
-                superseded_by.as_deref(),
-                !no_cleanup,
-                allow_open,
-                force,
-                why.as_deref(),
+                &FinishOptions {
+                    superseded_by: superseded_by.as_deref(),
+                    cleanup: !no_cleanup,
+                    allow_open,
+                    force,
+                    why: why.as_deref(),
+                },
             )
         }
         Command::Track {
@@ -2192,19 +2194,25 @@ fn open_pull_for(
     result
 }
 
+struct FinishOptions<'a> {
+    superseded_by: Option<&'a str>,
+    cleanup: bool,
+    allow_open: bool,
+    force: bool,
+    why: Option<&'a str>,
+}
+
+enum FinishClaimGate {
+    Continue(Option<String>),
+    Refuse,
+}
+
 /// Hand a branch back and remove its workspace. The inverse of `start`.
 ///
 /// Removing the directory loses no work: jj snapshots a working copy into a commit, so
 /// every change made there is already in the repository and reachable by change id. What
 /// does not survive is anything jj never tracked, which is what `--no-cleanup` is for.
-fn run_finish(
-    target: &BranchTarget,
-    superseded_by: Option<&str>,
-    cleanup: bool,
-    allow_open: bool,
-    force: bool,
-    why: Option<&str>,
-) -> anyhow::Result<Exit> {
+fn run_finish(target: &BranchTarget, options: &FinishOptions<'_>) -> anyhow::Result<Exit> {
     let registry = load(&default_config_path())?;
     let Some(entry) = registry.get(&target.repo) else {
         eprintln!("unknown repo {}", target.repo);
@@ -2213,69 +2221,12 @@ fn run_finish(
     let mut store = Store::open_for_update(default_state_path())?;
     let workspace = knives::commands::wip::workspace_for(target.branch.as_str());
     let directory = entry.path.parent().map(|parent| parent.join(&workspace));
-    let forced_release = if let Some(claim) = store
-        .claims(Some(&target.repo))
-        .into_iter()
-        .find(|claim| claim.branch == target.branch.as_str())
-        .cloned()
-    {
-        let cwd = std::env::current_dir()?;
-        let identity = current_identity(&cwd)?;
-        let in_claimed_workspace = directory
-            .as_ref()
-            .is_some_and(|path| cwd.starts_with(path));
-        let decision = decide(&ClaimContext {
-            held: Some(&claim),
-            identity: &identity,
-            in_claimed_workspace,
-        });
-        match decision {
-            ClaimDecision::RefuseAnonymous | ClaimDecision::RefuseHeld => {
-                let activity = Repo::open(&entry.path)?.workspace_activity(
-                    &std::collections::BTreeSet::from([knives::ids::WorkspaceName::new(
-                        workspace.clone(),
-                    )]),
-                    knives::jj::MAX_ACTIVITY_OPS,
-                )?;
-                let last_seen =
-                    knives::seen::last_seen(&claim, &activity, &knives::seen::load());
-                let now = jiff::Timestamp::now();
-                match (decision, force) {
-                    (ClaimDecision::RefuseAnonymous, false) => {
-                        eprintln!(
-                            "both sides anonymous; {}\nuse `knives finish {} --force --why \"…\"` to release the claim",
-                            render_claim_context(&claim, last_seen, now),
-                            target.branch,
-                        );
-                        return Ok(Exit::Usage);
-                    }
-                    (ClaimDecision::RefuseHeld, false) => {
-                        eprintln!(
-                            "{}\nuse `knives finish {} --force --why \"…\"` to release the claim",
-                            render_claim_context(&claim, last_seen, now),
-                            target.branch,
-                        );
-                        return Ok(Exit::Usage);
-                    }
-                    (ClaimDecision::RefuseAnonymous | ClaimDecision::RefuseHeld, true) => {
-                        Some(forced_release_event(
-                            &claim,
-                            last_seen,
-                            why.expect("clap requires --why with --force"),
-                        ))
-                    }
-                    (ClaimDecision::Take | ClaimDecision::Resume { .. }, _) => {
-                        unreachable!("only refusals reach this branch")
-                    }
-                }
-            }
-            ClaimDecision::Resume { .. } | ClaimDecision::Take => None,
-        }
-    } else {
-        None
+    let forced_release = match finish_claim_gate(target, entry, &store, options)? {
+        FinishClaimGate::Continue(event) => event,
+        FinishClaimGate::Refuse => return Ok(Exit::Usage),
     };
     let cache_root = knives::forge_cache::cache_root();
-    if !allow_open {
+    if !options.allow_open {
         match open_pull_for(target, entry, &store, cache_root.as_deref()) {
             Ok(Some(pull)) => {
                 println!(
@@ -2297,7 +2248,7 @@ fn run_finish(
         }
     }
     let had = store.release_claim(target);
-    if let Some(new) = superseded_by {
+    if let Some(new) = options.superseded_by {
         store.supersede(target, new);
     }
     let pr = store.tracked_pull(target);
@@ -2309,14 +2260,14 @@ fn run_finish(
     if let Some(text) = forced_release {
         let scribe = scribe_for(&target.repo, entry)?;
         scribe.event(Some(target.branch.as_str()), text, pr)?;
-        if let Some(replacement) = superseded_by {
+        if let Some(replacement) = options.superseded_by {
             scribe.event(
                 Some(target.branch.as_str()),
                 format!("superseded by {replacement}"),
                 pr,
             )?;
         }
-    } else if let Some(text) = release_event(had, superseded_by) {
+    } else if let Some(text) = release_event(had, options.superseded_by) {
         scribe_for(&target.repo, entry)?.event(Some(target.branch.as_str()), text, pr)?;
     }
 
@@ -2325,7 +2276,7 @@ fn run_finish(
         println!("{target}: claim {claim}; no workspace forgotten ({error})");
         return Ok(Exit::Ok);
     }
-    match (cleanup, directory) {
+    match (options.cleanup, directory) {
         (true, Some(directory)) if directory.is_dir() => {
             // Safe because jj already snapshotted the working copy into a commit: the
             // work is in the repository and reachable by change id. Untracked files are
@@ -2343,6 +2294,60 @@ fn run_finish(
         ),
     }
     Ok(Exit::Ok)
+}
+
+fn finish_claim_gate(
+    target: &BranchTarget,
+    entry: &knives::config::RepoEntry,
+    store: &Store,
+    options: &FinishOptions<'_>,
+) -> anyhow::Result<FinishClaimGate> {
+    let Some(claim) = store
+        .claims(Some(&target.repo))
+        .into_iter()
+        .find(|claim| claim.branch == target.branch.as_str())
+        .cloned()
+    else {
+        return Ok(FinishClaimGate::Continue(None));
+    };
+    let workspace = knives::commands::wip::workspace_for(target.branch.as_str());
+    let directory = entry.path.parent().map(|parent| parent.join(&workspace));
+    let cwd = std::env::current_dir()?;
+    let identity = current_identity(&cwd)?;
+    let decision = decide(&ClaimContext {
+        held: Some(&claim),
+        identity: &identity,
+        in_claimed_workspace: directory.as_ref().is_some_and(|path| cwd.starts_with(path)),
+    });
+    match decision {
+        ClaimDecision::Resume { .. } | ClaimDecision::Take => Ok(FinishClaimGate::Continue(None)),
+        ClaimDecision::RefuseAnonymous | ClaimDecision::RefuseHeld => {
+            let activity = Repo::open(&entry.path)?.workspace_activity(
+                &std::collections::BTreeSet::from([knives::ids::WorkspaceName::new(workspace)]),
+                knives::jj::MAX_ACTIVITY_OPS,
+            )?;
+            let last_seen = knives::seen::last_seen(&claim, &activity, &knives::seen::load());
+            if !options.force {
+                let anonymous_note = if decision == ClaimDecision::RefuseAnonymous {
+                    "both sides are anonymous identities, so they can never match; "
+                } else {
+                    ""
+                };
+                eprintln!(
+                    "{anonymous_note}{}\nuse `knives finish {} --force --why \"…\"` to release the claim",
+                    render_claim_context(&claim, last_seen, jiff::Timestamp::now()),
+                    target.branch,
+                );
+                return Ok(FinishClaimGate::Refuse);
+            }
+            let why = options
+                .why
+                .ok_or_else(|| anyhow::anyhow!("--force requires --why"))?;
+            Ok(FinishClaimGate::Continue(Some(forced_release_event(
+                &claim, last_seen, why,
+            ))))
+        }
+    }
 }
 
 /// State or forget which pull request a branch belongs to.

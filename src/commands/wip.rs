@@ -164,7 +164,6 @@ mod tests {
     use super::*;
     use crate::store::OwnerKind;
 
-
     fn touching(pairs: &[(&str, &[&str])]) -> BTreeMap<String, Vec<String>> {
         pairs
             .iter()
