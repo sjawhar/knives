@@ -3909,6 +3909,63 @@ fn start_adopts_a_no_cleanup_forgotten_workspace_without_resetting_it() {
 }
 
 #[test]
+fn start_refuses_a_same_named_workspace_from_another_repository() {
+    // A sibling directory can belong to any jj repository. Reattachment is only
+    // safe when its retained working-copy state belongs to the managed checkout.
+    let lab = lab::Lab::new();
+    let foreign = lab::Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let workspace = lab.work.parent().expect("parent").join("feat-gamma");
+    knives::jj::add_workspace(&foreign.work, "feat-gamma", &workspace, "main@upstream")
+        .expect("create foreign workspace at target path");
+    let main_workspaces_before = Repo::open(&lab.work).expect("open managed repo").workspaces().expect("list managed workspaces");
+    let foreign_change_before = foreign.revision(&workspace, "@", "change_id");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_knives"))
+        .args([
+            "--text",
+            "start",
+            "feat/gamma",
+            "--repo",
+            "demo",
+            "--why",
+            "do not seize foreign work",
+        ])
+        .current_dir(&lab.work)
+        .env("KNIVES_CONFIG_HOME", home.path())
+        .env("KNIVES_OWNER", "agent-one")
+        .output()
+        .expect("start against foreign workspace");
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(&lab.work.display().to_string()), "stderr: {stderr}");
+    assert!(
+        stderr.contains(&foreign.work.display().to_string()),
+        "stderr: {stderr}"
+    );
+    assert!(
+        !home.path().join("state.json").exists(),
+        "foreign workspace wrote a claim"
+    );
+    assert_eq!(
+        Repo::open(&lab.work).expect("reopen managed repo").workspaces().expect("list managed workspaces"),
+        main_workspaces_before,
+        "foreign workspace changed the managed repository"
+    );
+    assert_eq!(
+        foreign.revision(&workspace, "@", "change_id"),
+        foreign_change_before,
+        "foreign workspace state changed"
+    );
+}
+
+#[test]
 fn start_force_without_why_is_a_usage_error() {
     // Clap owns this validation so a force never reaches claim handling without
     // a durable human explanation.

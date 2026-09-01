@@ -35,6 +35,14 @@ use crate::ids::{
 pub enum JjError {
     #[error("could not open jj repository at {path}: {detail}")]
     Open { path: String, detail: String },
+    #[error(
+        "workspace {workspace} belongs to repository {actual}, not configured repository {expected}"
+    )]
+    WorkspaceRepositoryMismatch {
+        workspace: PathBuf,
+        expected: PathBuf,
+        actual: PathBuf,
+    },
     #[error("could not resolve revision `{revision}`: {detail}")]
     Revision { revision: String, detail: String },
     #[error("reference `{name}` is absent or conflicted")]
@@ -179,6 +187,15 @@ impl Repo {
             path: destination.display().to_string(),
             detail: error.to_string(),
         })?;
+        let expected = Self::repository_store_path(&self.path)?;
+        let actual = workspace.repo_path().to_owned();
+        if actual != expected {
+            return Err(JjError::WorkspaceRepositoryMismatch {
+                workspace: destination.to_owned(),
+                expected,
+                actual,
+            });
+        }
         let name = workspace.workspace_name().to_owned();
         let recorded = workspace.working_copy().operation_id().clone();
         let loader = workspace.repo_loader();
@@ -228,6 +245,31 @@ impl Repo {
                 path: destination.display().to_string(),
                 detail: error.to_string(),
             }
+        })
+    }
+
+    fn repository_store_path(workspace: &Path) -> Result<PathBuf, JjError> {
+        let pointer = workspace.join(".jj/repo");
+        let repository = if pointer.is_file() {
+            let pointed = std::fs::read_to_string(&pointer).map_err(|error| JjError::Open {
+                path: pointer.display().to_string(),
+                detail: error.to_string(),
+            })?;
+            let pointed = PathBuf::from(pointed.trim());
+            if pointed.is_absolute() {
+                pointed
+            } else {
+                pointer
+                    .parent()
+                    .expect(".jj/repo has a parent")
+                    .join(pointed)
+            }
+        } else {
+            pointer
+        };
+        repository.canonicalize().map_err(|error| JjError::Open {
+            path: repository.display().to_string(),
+            detail: error.to_string(),
         })
     }
 

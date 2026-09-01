@@ -12,7 +12,7 @@ use crate::commands::release::shared_base;
 use crate::commands::wip::workspace_for;
 use crate::config::{RepoEntry, default_config_path, load};
 use crate::ids::{BranchName, BranchTarget, RepoName, WorkspaceName};
-use crate::jj::{Repo, add_workspace, fetch_all};
+use crate::jj::{JjError, Repo, add_workspace, fetch_all};
 use crate::ledger::{Ledger, Scribe};
 use crate::release_model::newest_release;
 use crate::seen;
@@ -176,10 +176,17 @@ pub fn run(
             if destination.exists() {
                 let change = match workspace_change(&opened, &workspace) {
                     Ok(change) => change,
-                    Err(_) => {
-                        opened.reattach_workspace(&destination)?;
-                        workspace_change(&Repo::open(&entry.path)?, &workspace)?
-                    }
+                    Err(_) => match opened.reattach_workspace(&destination) {
+                        Ok(()) => workspace_change(&Repo::open(&entry.path)?, &workspace)?,
+                        Err(error @ JjError::WorkspaceRepositoryMismatch { .. }) => {
+                            eprintln!(
+                                "cannot adopt {}: {error}; move the foreign workspace or choose a different branch",
+                                destination.display()
+                            );
+                            return Ok(Exit::Usage);
+                        }
+                        Err(error) => return Err(error.into()),
+                    },
                 };
                 let _ = store.claim(&target, &identity, reason);
                 store.save()?;
