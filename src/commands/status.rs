@@ -1589,4 +1589,129 @@ mod tests {
         };
         assert_eq!(exit_for(&dirty), Exit::Findings);
     }
+
+    fn swe_scale_fixture() -> Report {
+        let branches = (0..14)
+            .map(|index| {
+                let mut row = BranchRow::bare(BranchName::new(format!("feat/scale-{index:02}")));
+                row.state = match index % 4 {
+                    0 => BranchState::ChecksFailing,
+                    1 => BranchState::Approved,
+                    2 => BranchState::AwaitingReview,
+                    _ => BranchState::NoPr,
+                };
+                if index < 6 {
+                    row.claim = Some(ClaimCell {
+                        id: format!("session-{index:012x}"),
+                        kind: crate::store::OwnerKind::HarnessSession,
+                        since: "2026-08-29T12:00:00Z".to_owned(),
+                        why: format!(
+                            "Migrate the status integration assertions and verify the release report for branch {index}."
+                        ),
+                    });
+                }
+                row
+            })
+            .collect();
+        let finding = |kind, count, prefix: &str| FindingGroup {
+            kind,
+            count,
+            subjects: (0..count)
+                .map(|index| format!("{prefix}-{index:02}"))
+                .collect(),
+        };
+
+        Report {
+            repo: "swe-scale".to_owned(),
+            trunk: "main".to_owned(),
+            newest_release: Some("release/2026-08-29".to_owned()),
+            forge: ForgeStatus {
+                consulted: true,
+                elapsed_ms: 347,
+            },
+            problems: vec![
+                "pull request state unavailable: the forge rejected one facts batch".to_owned(),
+                "workspace activity unavailable: the local sidecar could not be read".to_owned(),
+            ],
+            branches,
+            findings: vec![
+                finding(FindingKind::ChecksFailing, 6, "checks"),
+                finding(FindingKind::StaleReview, 6, "review"),
+                finding(FindingKind::WrongBase, 6, "base"),
+                finding(FindingKind::BranchOverlap, 6, "path"),
+                finding(FindingKind::ClaimOverlap, 5, "claim"),
+                finding(FindingKind::CarriedElsewhere, 5, "carrier"),
+            ],
+            releases: vec![
+                "release/2026-08-22".to_owned(),
+                "release/2026-08-29".to_owned(),
+            ],
+            repo_notches: Some(RepoNotches {
+                count: 4,
+                last: LastNotch {
+                    ts: "2026-08-30T09:15:00Z".to_owned(),
+                    kind: crate::ledger::Kind::Note,
+                    text: "Release triage recorded after the final merge queue drain.".to_owned(),
+                    disposition: Some("decided".to_owned()),
+                    count: 4,
+                },
+            }),
+            other_workspaces: vec![
+                "legacy-release".to_owned(),
+                "manual-repro".to_owned(),
+                "untracked-experiment".to_owned(),
+            ],
+            notes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_swe_scale_report_encodes_within_the_map_budget() {
+        // 14 branches (6 claimed with real-length whys), 34 findings across 6 kinds,
+        // 2 problems, 2 releases, repo notches, and 3 other workspaces: the report
+        // shape that rendered 393 TOON lines before the status map.
+        let report = swe_scale_fixture();
+        assert_eq!(report.branches.len(), 14);
+        assert_eq!(
+            report
+                .branches
+                .iter()
+                .filter(|row| row.claim.is_some())
+                .count(),
+            6
+        );
+        assert_eq!(report.findings.len(), 6);
+        assert_eq!(
+            report.findings.iter().map(|finding| finding.count).sum::<usize>(),
+            34
+        );
+        assert_eq!(report.problems.len(), 2);
+        assert_eq!(report.releases.len(), 2);
+        assert!(report.repo_notches.is_some());
+        assert_eq!(report.other_workspaces.len(), 3);
+
+        let toon = toon_format::encode_default(&report).expect("encode");
+        let lines = toon.lines().count();
+        assert!(
+            lines < 100,
+            "the map regressed to a dump: {lines} lines\n{toon}"
+        );
+    }
+
+    #[test]
+    fn a_forge_decode_failure_leads_the_report() {
+        let report = Report {
+            repo: "a".into(),
+            trunk: "main".into(),
+            problems: vec![
+                "pull request state unavailable: could not read the forge's reply: …".into(),
+            ],
+            ..Report::default()
+        };
+
+        let toon = toon_format::encode_default(&report).expect("encode");
+        let head: String = toon.lines().take(6).collect::<Vec<_>>().join("\n");
+        assert!(head.contains("pull request state unavailable"), "was:\n{toon}");
+        assert_eq!(exit_for(&report), Exit::Incomplete);
+    }
 }
