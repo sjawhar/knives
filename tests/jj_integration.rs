@@ -6021,14 +6021,17 @@ fn status_reports_branch_overlap_after_upstream_advances_without_landed_probe() 
     )
     .expect("gather");
 
-    // Then: the independent path comparison still reports the shared file.
+    // Then: the grouped finding retains the shared path and both participants.
     let overlap = report
         .findings
         .iter()
         .find(|finding| finding.kind == knives::detect::FindingKind::BranchOverlap)
         .expect("the shared file is reported even without the landed probe");
     assert_eq!(overlap.count, 1, "was: {overlap:?}");
-    assert_eq!(overlap.subjects, vec!["shared.txt".to_owned()]);
+    assert_eq!(
+        overlap.subjects,
+        vec!["shared.txt: feat/alpha, feat/beta".to_owned()]
+    );
 }
 
 #[test]
@@ -6069,12 +6072,14 @@ fn status_reports_a_branch_carried_elsewhere() {
     )
     .expect("gather");
 
-    // Then: the grouped finding preserves the branch carrying the local ancestry fact.
-    assert!(report.findings.iter().any(|finding| {
-        finding.kind == knives::detect::FindingKind::CarriedElsewhere
-            && finding.count >= 1
-            && finding.subjects.iter().any(|subject| subject == "feat/alpha")
-    }));
+    // Then: the grouped finding retains the branch and its carrier.
+    let carrier = report
+        .findings
+        .iter()
+        .find(|finding| finding.kind == knives::detect::FindingKind::CarriedElsewhere)
+        .expect("the branch carrier is reported");
+    assert_eq!(carrier.count, 1, "was: {carrier:?}");
+    assert_eq!(carrier.subjects, vec!["feat/alpha: theirs/rework".to_owned()]);
 }
 
 #[test]
@@ -6123,12 +6128,14 @@ fn status_reports_a_carrier_for_a_closed_pull_request() {
     )
     .expect("gather");
 
-    // Then: forge state does not suppress the local ancestry finding group.
-    assert!(report.findings.iter().any(|finding| {
-        finding.kind == knives::detect::FindingKind::CarriedElsewhere
-            && finding.count >= 1
-            && finding.subjects.iter().any(|subject| subject == "feat/alpha")
-    }));
+    // Then: forge state does not suppress the branch or its carrier.
+    let carrier = report
+        .findings
+        .iter()
+        .find(|finding| finding.kind == knives::detect::FindingKind::CarriedElsewhere)
+        .expect("the branch carrier is reported");
+    assert_eq!(carrier.count, 1, "was: {carrier:?}");
+    assert_eq!(carrier.subjects, vec!["feat/alpha: theirs/rework".to_owned()]);
 }
 
 #[test]

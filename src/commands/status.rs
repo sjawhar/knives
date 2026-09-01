@@ -1266,20 +1266,37 @@ fn short(id: &str) -> String {
     id.chars().take(12).collect()
 }
 
+/// One grouped subject per raw finding. Relationship findings include the
+/// counterpart because the lone branch or path does not identify the action.
+fn grouped_subject(finding: &Finding) -> String {
+    let subject = finding.subject.short();
+    let counterpart = match finding.kind {
+        FindingKind::BranchOverlap => finding
+            .detail
+            .strip_prefix(&format!("{subject} is touched by ")),
+        FindingKind::CarriedElsewhere => finding
+            .detail
+            .strip_prefix(&format!("{subject}'s tip is also reachable from ")),
+        _ => None,
+    };
+    counterpart.map_or(subject.clone(), |counterpart| format!("{subject}: {counterpart}"))
+}
+
 /// Folds raw findings once, after every detector has reported, preserving detector order.
 fn group_findings(findings: Vec<Finding>) -> Vec<FindingGroup> {
     let mut groups: Vec<FindingGroup> = Vec::new();
     for finding in findings {
+        let subject = grouped_subject(&finding);
         if let Some(group) = groups.iter_mut().find(|group| group.kind == finding.kind) {
             group.count += 1;
             if group.subjects.len() < 8 {
-                group.subjects.push(finding.subject.short());
+                group.subjects.push(subject);
             }
         } else {
             groups.push(FindingGroup {
                 kind: finding.kind,
                 count: 1,
-                subjects: vec![finding.subject.short()],
+                subjects: vec![subject],
             });
         }
     }
@@ -1600,6 +1617,35 @@ mod tests {
                     2 => BranchState::AwaitingReview,
                     _ => BranchState::NoPr,
                 };
+                if index == 0 {
+                    row.pr = Some(PullCell {
+                        number: 4891,
+                        state: "open".to_owned(),
+                        draft: false,
+                        stated: None,
+                        prior: Vec::new(),
+                    });
+                    row.review = Some("changes-requested".to_owned());
+                    row.checks = Some("failing".to_owned());
+                    row.flags.push("review-stale".to_owned());
+                }
+                if index == 1 {
+                    row.push = Some(PushRelation::Behind);
+                    row.origin_tip = Some("f0e1d2c3b4a5".to_owned());
+                }
+                if index == 2 {
+                    row.seen = Some(SeenWindow::NoneWithinWindow);
+                    row.workspace = Some("scale-02".to_owned());
+                }
+                if index == 3 {
+                    row.notch = Some(LastNotch {
+                        ts: "2026-08-30T09:15:00Z".to_owned(),
+                        kind: crate::ledger::Kind::Note,
+                        text: "Release triage recorded after the final merge queue drain.".to_owned(),
+                        disposition: Some("decided".to_owned()),
+                        count: 4,
+                    });
+                }
                 if index < 6 {
                     row.claim = Some(ClaimCell {
                         id: format!("session-{index:012x}"),
@@ -1689,11 +1735,20 @@ mod tests {
         assert_eq!(report.releases.len(), 2);
         assert!(report.repo_notches.is_some());
         assert_eq!(report.other_workspaces.len(), 3);
+        assert!(report.branches.iter().any(|row| row.pr.is_some()));
+        assert!(report.branches.iter().any(|row| row.review.is_some()));
+        assert!(report.branches.iter().any(|row| row.checks.is_some()));
+        assert!(report.branches.iter().any(|row| !row.flags.is_empty()));
+        assert!(report.branches.iter().any(|row| row.push.is_some()));
+        assert!(report.branches.iter().any(|row| row.origin_tip.is_some()));
+        assert!(report.branches.iter().any(|row| row.seen.is_some()));
+        assert!(report.branches.iter().any(|row| row.workspace.is_some()));
+        assert!(report.branches.iter().any(|row| row.notch.is_some()));
 
         let toon = toon_format::encode_default(&report).expect("encode");
         let lines = toon.lines().count();
         assert!(
-            lines < 100,
+            lines < 120,
             "the map regressed to a dump: {lines} lines\n{toon}"
         );
     }
@@ -1706,12 +1761,18 @@ mod tests {
             problems: vec![
                 "pull request state unavailable: could not read the forge's reply: …".into(),
             ],
+            branches: vec![BranchRow::bare(BranchName::new("feat/alpha"))],
             ..Report::default()
         };
 
         let toon = toon_format::encode_default(&report).expect("encode");
         let head: String = toon.lines().take(6).collect::<Vec<_>>().join("\n");
+        let problem_at = toon
+            .find("pull request state unavailable")
+            .expect("forge decode failure is rendered");
+        let branches_at = toon.find("branches[1]").expect("branch section is rendered");
         assert!(head.contains("pull request state unavailable"), "was:\n{toon}");
+        assert!(problem_at < branches_at, "problems must lead: {toon}");
         assert_eq!(exit_for(&report), Exit::Incomplete);
     }
 }
