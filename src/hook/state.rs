@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -13,8 +13,6 @@ const PRUNE_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepoFlags {
     #[serde(default)]
-    pub noticed: bool,
-    #[serde(default)]
     pub guided: bool,
 }
 
@@ -23,12 +21,15 @@ struct DiskState {
     #[serde(default)]
     repos: HashMap<PathBuf, RepoFlags>,
     #[serde(default)]
+    seen_notices: HashMap<PathBuf, BTreeSet<String>>,
+    #[serde(default)]
     owner_remotes: HashMap<PathBuf, Vec<String>>,
 }
 
 #[derive(Debug, Default)]
 pub struct SessionState {
     repos: HashMap<PathBuf, RepoFlags>,
+    seen_notices: HashMap<PathBuf, BTreeSet<String>>,
     owner_remotes: HashMap<PathBuf, Vec<String>>,
 }
 
@@ -66,10 +67,21 @@ impl SessionState {
         Ok(state)
     }
 
-    pub fn mark(&mut self, root: &Path, noticed: bool, guided: bool) {
-        let flags = self.repos.entry(root.to_owned()).or_default();
-        flags.noticed |= noticed;
-        flags.guided |= guided;
+    pub fn mark_guided(&mut self, root: &Path) {
+        self.repos.entry(root.to_owned()).or_default().guided = true;
+    }
+
+    pub fn record_notice(&mut self, root: &Path, digest: String) {
+        self.seen_notices
+            .entry(root.to_owned())
+            .or_default()
+            .insert(digest);
+    }
+
+    pub fn notice_seen(&self, root: &Path, digest: &str) -> bool {
+        self.seen_notices
+            .get(root)
+            .is_some_and(|notices| notices.contains(digest))
     }
 
     /// Caches resolved remote owners so registry changes can be re-evaluated without Git.
@@ -82,6 +94,7 @@ impl SessionState {
 
     pub fn clear(&mut self) {
         self.repos.clear();
+        self.seen_notices.clear();
         self.owner_remotes.clear();
     }
 
@@ -96,6 +109,7 @@ impl SessionState {
             .and_then(|text| serde_json::from_str::<DiskState>(&text).ok())
             .map_or_else(Self::default, |disk| Self {
                 repos: disk.repos,
+                seen_notices: disk.seen_notices,
                 owner_remotes: disk.owner_remotes,
             })
     }
@@ -107,6 +121,7 @@ impl SessionState {
             &mut temporary,
             &DiskState {
                 repos: self.repos.clone(),
+                seen_notices: self.seen_notices.clone(),
                 owner_remotes: self.owner_remotes.clone(),
             },
         )?;
@@ -162,86 +177,90 @@ mod tests {
     use super::SessionState;
 
     #[test]
-    fn a_fresh_session_has_no_flags() {
+    fn a_fresh_session_has_no_guidance_or_notices() {
         let home = tempfile::tempdir().unwrap();
+        let root = Path::new("/some/repo");
         let state = SessionState::load(home.path(), "claude-code", "s1");
-        let flags = state.repo(Path::new("/some/repo"));
-        assert!(!flags.noticed);
-        assert!(!flags.guided);
+        assert!(!state.repo(root).guided);
+        assert!(!state.notice_seen(root, "digest"));
     }
 
     #[test]
-    fn marks_survive_update_and_reload() {
+    fn notices_and_guidance_survive_update_and_reload() {
         let home = tempfile::tempdir().unwrap();
-        SessionState::update(home.path(), "claude-code", "s1", |s| {
-            s.mark(Path::new("/some/repo"), true, false);
+        let root = Path::new("/some/repo");
+        SessionState::update(home.path(), "claude-code", "s1", |state| {
+            state.record_notice(root, "digest".to_owned());
+            state.mark_guided(root);
         })
         .unwrap();
         let reloaded = SessionState::load(home.path(), "claude-code", "s1");
-        assert!(reloaded.repo(Path::new("/some/repo")).noticed);
-        assert!(!reloaded.repo(Path::new("/some/repo")).guided);
+        assert!(reloaded.notice_seen(root, "digest"));
+        assert!(reloaded.repo(root).guided);
     }
 
     #[test]
-    fn mark_merges_rather_than_overwrites() {
+    fn notice_digests_accumulate_for_one_root() {
         let home = tempfile::tempdir().unwrap();
-        SessionState::update(home.path(), "claude-code", "s1", |s| {
-            s.mark(Path::new("/r"), true, false);
+        let root = Path::new("/r");
+        SessionState::update(home.path(), "claude-code", "s1", |state| {
+            state.record_notice(root, "first".to_owned());
         })
         .unwrap();
-        let state = SessionState::update(home.path(), "claude-code", "s1", |s| {
-            s.mark(Path::new("/r"), false, true);
+        let state = SessionState::update(home.path(), "claude-code", "s1", |state| {
+            state.record_notice(root, "second".to_owned());
         })
         .unwrap();
-        let flags = state.repo(Path::new("/r"));
-        assert!(flags.noticed && flags.guided);
+        assert!(state.notice_seen(root, "first"));
+        assert!(state.notice_seen(root, "second"));
     }
 
     #[test]
     fn update_rereads_the_latest_disk_state_under_the_lock() {
-        // A stale in-memory copy must not clobber flags another process wrote.
+        // A stale in-memory copy must not clobber notices another process wrote.
         // The closure API makes this structural: each update re-reads before applying.
         let home = tempfile::tempdir().unwrap();
-        SessionState::update(home.path(), "claude-code", "s1", |s| {
-            s.mark(Path::new("/a"), true, true);
+        SessionState::update(home.path(), "claude-code", "s1", |state| {
+            state.record_notice(Path::new("/a"), "first".to_owned());
         })
         .unwrap();
-        SessionState::update(home.path(), "claude-code", "s1", |s| {
-            s.mark(Path::new("/b"), true, true);
+        SessionState::update(home.path(), "claude-code", "s1", |state| {
+            state.record_notice(Path::new("/b"), "second".to_owned());
         })
         .unwrap();
         let state = SessionState::load(home.path(), "claude-code", "s1");
         assert!(
-            state.repo(Path::new("/a")).noticed,
+            state.notice_seen(Path::new("/a"), "first"),
             "first write survives the second"
         );
-        assert!(state.repo(Path::new("/b")).noticed);
+        assert!(state.notice_seen(Path::new("/b"), "second"));
     }
 
     #[test]
-    fn sessions_do_not_share_state() {
+    fn sessions_do_not_share_notices() {
         let home = tempfile::tempdir().unwrap();
-        SessionState::update(home.path(), "claude-code", "s1", |s| {
-            s.mark(Path::new("/r"), true, true);
+        let root = Path::new("/r");
+        SessionState::update(home.path(), "claude-code", "s1", |state| {
+            state.record_notice(root, "digest".to_owned());
         })
         .unwrap();
         let other = SessionState::load(home.path(), "claude-code", "s2");
-        assert!(!other.repo(Path::new("/r")).noticed);
+        assert!(!other.notice_seen(root, "digest"));
     }
 
     #[test]
     fn clear_forgets_everything() {
         let home = tempfile::tempdir().unwrap();
-        SessionState::update(home.path(), "claude-code", "s1", |s| {
-            s.mark(Path::new("/r"), true, true);
+        let root = Path::new("/r");
+        SessionState::update(home.path(), "claude-code", "s1", |state| {
+            state.record_notice(root, "digest".to_owned());
+            state.mark_guided(root);
         })
         .unwrap();
         SessionState::update(home.path(), "claude-code", "s1", SessionState::clear).unwrap();
-        assert!(
-            !SessionState::load(home.path(), "claude-code", "s1")
-                .repo(Path::new("/r"))
-                .noticed
-        );
+        let cleared = SessionState::load(home.path(), "claude-code", "s1");
+        assert!(!cleared.notice_seen(root, "digest"));
+        assert!(!cleared.repo(root).guided);
     }
 
     #[test]
@@ -274,14 +293,14 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("claude-code-s1.json"), b"{not json").unwrap();
         let state = SessionState::load(home.path(), "claude-code", "s1");
-        assert!(!state.repo(Path::new("/r")).noticed);
+        assert!(!state.notice_seen(Path::new("/r"), "digest"));
     }
 
     #[test]
     fn session_ids_cannot_escape_the_state_directory() {
         let home = tempfile::tempdir().unwrap();
-        SessionState::update(home.path(), "claude-code", "../../evil", |s| {
-            s.mark(Path::new("/r"), true, true);
+        SessionState::update(home.path(), "claude-code", "../../evil", |state| {
+            state.mark_guided(Path::new("/r"));
         })
         .unwrap();
         // Whatever the name became, it is inside hook-sessions/ (lock files may sit beside it).
@@ -303,8 +322,8 @@ mod tests {
         std::fs::write(&stale, b"{}").unwrap();
         let old = std::time::SystemTime::now() - std::time::Duration::from_secs(8 * 24 * 3600);
         filetime::set_file_mtime(&stale, filetime::FileTime::from_system_time(old)).unwrap();
-        SessionState::update(home.path(), "claude-code", "s1", |s| {
-            s.mark(Path::new("/r"), true, true);
+        SessionState::update(home.path(), "claude-code", "s1", |state| {
+            state.mark_guided(Path::new("/r"));
         })
         .unwrap();
         assert!(!stale.exists());

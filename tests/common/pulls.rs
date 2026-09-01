@@ -24,9 +24,9 @@ pub fn pull_request(number: u64, state: &str, branch: &str) -> PullRequest {
         is_draft: false,
         url: String::new(),
         head_repository_owner: None,
-        mergeable: String::new(),
-        merge_state_status: String::new(),
-        base_ref_name: "main".to_owned(),
+        mergeable: Some(String::new()),
+        merge_state_status: Some(String::new()),
+        base_ref_name: Some("main".to_owned()),
         merge_commit: None,
     }
 }

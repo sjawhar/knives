@@ -10,9 +10,16 @@ pub mod github;
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
 use crate::ids::BranchName;
+
+fn null_default<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(Option::unwrap_or_default)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -73,14 +80,14 @@ impl ChecksSummary {
 pub struct PullRequest {
     pub number: u64,
     pub state: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub review_decision: String,
     pub head_ref_name: String,
     pub head_ref_oid: String,
     pub updated_at: String,
     #[serde(default)]
     pub is_draft: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub url: String,
     /// The owner of the repository the branch lives in, absent when the head
     /// repository has been deleted.
@@ -94,14 +101,14 @@ pub struct PullRequest {
     /// write — and cannot be merged. An agent called one code complete and ready to ship
     /// while it was in conflict with main.
     #[serde(default)]
-    pub mergeable: String,
+    pub mergeable: Option<String>,
     /// The forge's fuller account of why: `DIRTY` for a conflict, `BEHIND` for a base that
     /// has moved on, `BLOCKED`, `CLEAN`, `UNSTABLE`.
     #[serde(default)]
-    pub merge_state_status: String,
+    pub merge_state_status: Option<String>,
     /// The branch this pull request targets.
     #[serde(default)]
-    pub base_ref_name: String,
+    pub base_ref_name: Option<String>,
     /// The commit that landed this pull request on its base branch, present only
     /// once merged. For every merge method — merge commit, squash, rebase — this
     /// is the base-branch commit that carries the work, which is exactly the
@@ -139,7 +146,21 @@ impl PullRequest {
     /// `UNKNOWN` is not a conflict: the forge computes mergeability asynchronously, and
     /// treating "not worked out yet" as "broken" would cry wolf on every fresh push.
     pub fn conflicting(&self) -> bool {
-        self.mergeable.eq_ignore_ascii_case("CONFLICTING")
+        self.mergeable
+            .as_deref()
+            .is_some_and(|mergeable| mergeable.eq_ignore_ascii_case("CONFLICTING"))
+    }
+
+    /// Required merge facts that the forge did not answer. Callers must report
+    /// these rather than interpreting unknown data as a healthy pull request.
+    pub fn missing_merge_fields(&self) -> impl Iterator<Item = &'static str> {
+        [
+            (self.mergeable.is_none(), "mergeable"),
+            (self.merge_state_status.is_none(), "mergeStateStatus"),
+            (self.base_ref_name.is_none(), "baseRefName"),
+        ]
+        .into_iter()
+        .filter_map(|(missing, field)| missing.then_some(field))
     }
 }
 /// A pull request's own diff totals, from the live batch.
@@ -241,7 +262,7 @@ pub struct PullSummary {
     #[serde(default)]
     pub head_repository_owner: Option<Account>,
     #[serde(default)]
-    pub base_ref_name: String,
+    pub base_ref_name: Option<String>,
     #[serde(default)]
     pub merge_commit: Option<MergeCommit>,
 }
@@ -307,6 +328,13 @@ impl RepoIdentity {
     }
 }
 
+/// The default branch and current head commit of a consumer repository.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsumerHead {
+    pub branch: String,
+    pub commit: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SweepEntry {
     pub number: u64,
@@ -334,9 +362,9 @@ impl Default for PullRequest {
             is_draft: false,
             url: String::new(),
             head_repository_owner: None,
-            mergeable: String::new(),
-            merge_state_status: String::new(),
-            base_ref_name: "main".to_owned(),
+            mergeable: None,
+            merge_state_status: None,
+            base_ref_name: None,
             merge_commit: None,
         }
     }
@@ -356,7 +384,7 @@ impl Default for PullSummary {
             is_draft: false,
             url: String::new(),
             head_repository_owner: None,
-            base_ref_name: String::new(),
+            base_ref_name: None,
             merge_commit: None,
         }
     }
@@ -396,7 +424,13 @@ pub fn search_authors(remotes: &[&str]) -> Vec<String> {
 pub fn merged_onto(pulls: &[PullSummary], trunk: &str) -> Vec<PullSummary> {
     let mut merged: Vec<PullSummary> = pulls
         .iter()
-        .filter(|pull| pull.is_merged() && pull.base_ref_name == trunk)
+        .filter(|pull| {
+            pull.is_merged()
+                && pull
+                    .base_ref_name
+                    .as_deref()
+                    .is_some_and(|base| base == trunk)
+        })
         .cloned()
         .collect();
     merged.sort_unstable_by_key(|pull| pull.number);
@@ -572,7 +606,7 @@ mod tests {
                 number,
                 state: state.to_owned(),
                 head_ref_name: branch.to_owned(),
-                base_ref_name: base.to_owned(),
+                base_ref_name: Some(base.to_owned()),
                 merge_commit: oid.map(|oid| MergeCommit {
                     oid: oid.to_owned(),
                 }),
@@ -620,7 +654,7 @@ mod tests {
                 number,
                 state: state.to_owned(),
                 head_ref_name: branch.to_owned(),
-                base_ref_name: base.to_owned(),
+                base_ref_name: Some(base.to_owned()),
                 merge_commit: oid.map(|oid| MergeCommit {
                     oid: oid.to_owned(),
                 }),
@@ -671,9 +705,9 @@ mod tests {
             head_repository_owner: Some(Account {
                 login: "our-org".to_owned(),
             }),
-            mergeable: "CONFLICTING".to_owned(),
-            merge_state_status: "DIRTY".to_owned(),
-            base_ref_name: "main".to_owned(),
+            mergeable: Some("CONFLICTING".to_owned()),
+            merge_state_status: Some("DIRTY".to_owned()),
+            base_ref_name: Some("main".to_owned()),
             merge_commit: Some(MergeCommit {
                 oid: "bb".to_owned(),
             }),

@@ -11,11 +11,10 @@ use crate::detect::{BookmarkTips, Finding, FindingKind, Subject};
 use crate::ids::{
     BookmarkRef, CommitId, RELEASE_PREFIX, ReleaseScheme, is_our_release, is_release_name,
 };
-use crate::jj::{self, OriginTrunk, Repo};
+use crate::jj::{self, Repo};
 use crate::ledger::{Entry, Kind};
-use crate::pins::{PIN_FILES, Pin, scan};
-
-/// Scan evidence for one consumer checkout.
+use crate::pins::{Pin, scan};
+/// Scan evidence for one consumer's fetched pin texts.
 #[derive(Debug, Default)]
 pub struct ConsumerScan {
     pub pins: Vec<Pin>,
@@ -23,111 +22,55 @@ pub struct ConsumerScan {
     pub problems: Vec<String>,
 }
 
-struct ConsumerPinScope<'a> {
-    slug: Option<&'a str>,
-    scheme: &'a ReleaseScheme,
+impl ConsumerScan {
+    pub fn extend(&mut self, other: Self) {
+        self.pins.extend(other.pins);
+        self.notes.extend(other.notes);
+        self.problems.extend(other.problems);
+    }
 }
 
-/// Scan a consumer checkout for pins of one repo's releases.
+/// Classify already-fetched consumer pin texts for one repository's release scheme.
 ///
-/// Scoped by `slug`, the repository's name as it appears in a dependency line. These
-/// forks cut releases on one dated scheme, so `release/2026-07-28` exists in several of
-/// them at once; an unscoped scan attributed a sibling's pin to this repo, which reads
-/// as "pinned at the newest cut" when it is not pinned here at all. `None` keeps every
-/// pin, for a caller that genuinely wants the whole file.
-pub fn scan_consumer_for(
-    consumer: &Path,
+/// The caller owns where texts came from (a forge, cache, checkout ref, or working
+/// copy); this release-domain function only parses and scopes their pin evidence.
+pub fn scan_consumer_texts<'a>(
+    files: impl IntoIterator<Item = (&'a str, &'a str)>,
     slug: Option<&str>,
     scheme: &ReleaseScheme,
 ) -> ConsumerScan {
     let mut result = ConsumerScan::default();
     let scope = ConsumerPinScope { slug, scheme };
-    match jj::origin_trunk(consumer) {
-        Ok(OriginTrunk::Reference(branch)) => {
-            let mut checkout_lag = None;
-            for name in PIN_FILES {
-                match jj::file_at_ref(consumer, &branch, name) {
-                    Ok(Some((text, behind))) => {
-                        extend_scanned_pins(&mut result, name, &text, &scope);
-                        checkout_lag = checkout_lag.or_else(|| (behind > 0).then_some(behind));
-                    }
-                    Ok(None) => {}
-                    Err(error) => result
-                        .problems
-                        .push(format!("could not read {name} at {branch}: {error}")),
-                }
-            }
-            if let Some(behind) = checkout_lag {
-                result.notes.push(format!(
-                    "{} checkout is {behind} commit(s) behind its {branch}",
-                    consumer.display()
-                ));
-            }
-        }
-        Ok(OriginTrunk::Missing) => {
-            extend_working_copy_pins(&mut result, consumer, &scope);
-            result.notes.push(format!(
-                "{}: no origin trunk resolved; pins read from the working copy",
-                consumer.display()
-            ));
-        }
-        Ok(OriginTrunk::NotRepository) => {
-            extend_working_copy_pins(&mut result, consumer, &scope);
-            result.notes.push(format!(
-                "{}: not a repository; pins read from the working copy",
-                consumer.display()
-            ));
-        }
-        Err(error) => {
-            extend_working_copy_pins(&mut result, consumer, &scope);
-            result.notes.push(format!(
-                "{}: could not resolve its origin trunk ({error}); pins read from the working copy",
-                consumer.display()
-            ));
-            result
-                .problems
-                .push(format!("could not resolve origin trunk: {error}"));
-        }
-    }
+    extend_scanned_texts(&mut result, files, &scope);
     result
 }
 
-fn extend_working_copy_pins(
-    result: &mut ConsumerScan,
-    consumer: &Path,
-    scope: &ConsumerPinScope<'_>,
-) {
-    for name in PIN_FILES {
-        match std::fs::read_to_string(consumer.join(name)) {
-            Ok(text) => extend_scanned_pins(result, name, &text, scope),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => result
-                .problems
-                .push(format!("could not read {name}: {error}")),
-        }
-    }
+struct ConsumerPinScope<'a> {
+    slug: Option<&'a str>,
+    scheme: &'a ReleaseScheme,
 }
 
-fn extend_scanned_pins(
+fn extend_scanned_texts<'a>(
     result: &mut ConsumerScan,
-    file: &str,
-    text: &str,
+    files: impl IntoIterator<Item = (&'a str, &'a str)>,
     scope: &ConsumerPinScope<'_>,
 ) {
-    let parsed = scan(file, text, scope.scheme);
-    result.pins.extend(
-        parsed
-            .pins
-            .into_iter()
-            .filter(|pin| scope.slug.is_none_or(|slug| pin.source.contains(slug))),
-    );
-    result.problems.extend(
-        parsed
-            .problems
-            .into_iter()
-            .filter(|problem| scope.slug.is_none_or(|slug| problem.source.contains(slug)))
-            .map(|problem| problem.to_string()),
-    );
+    for (file, text) in files {
+        let parsed = scan(file, text, scope.scheme);
+        result.pins.extend(
+            parsed
+                .pins
+                .into_iter()
+                .filter(|pin| scope.slug.is_none_or(|slug| pin.source.contains(slug))),
+        );
+        result.problems.extend(
+            parsed
+                .problems
+                .into_iter()
+                .filter(|problem| scope.slug.is_none_or(|slug| problem.source.contains(slug)))
+                .map(|problem| problem.to_string()),
+        );
+    }
 }
 
 /// The repository's name as it appears in a dependency line, e.g. `sandbox-runner`.

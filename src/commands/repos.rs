@@ -9,9 +9,10 @@ use std::path::Path;
 
 use crate::cli::Exit;
 use crate::config::{Registry, RepoEntry, Role, default_config_path, load};
+use crate::consumer_pins::{ConsumerHeadMemo, ConsumerPinSource, scan_consumer_slug_with_heads};
 use crate::ids::{BookmarkRef, BranchName, ReleaseScheme, RemoteName, is_our_release};
 use crate::jj::Repo;
-use crate::release_model::{release_order, repo_slug, scan_consumer_for};
+use crate::release_model::{release_order, repo_slug};
 
 struct ReleaseState {
     newest: Option<String>,
@@ -70,31 +71,46 @@ fn release_state(registry: &Registry) -> BTreeMap<String, ReleaseState> {
 pub struct PinLag {
     pub lag: Option<String>,
     pub notes: Vec<String>,
+    pub problems: Vec<String>,
 }
 
-fn consumer_label(consumer: &Path) -> String {
-    let label = consumer.file_name().map_or_else(
-        || consumer.display().to_string(),
-        |name| name.to_string_lossy().into_owned(),
-    );
-    consumer
-        .parent()
-        .and_then(|parent| parent.file_name())
-        .map_or_else(
-            || label.clone(),
-            |parent| format!("{}/{}", parent.to_string_lossy(), label),
-        )
+fn consumer_label(consumer: &str) -> String {
+    consumer.to_owned()
 }
 
-pub fn pin_lag(entry: &RepoEntry, newest: Option<&String>, repo: Option<&Repo>) -> PinLag {
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the current release state and shared consumer-scan collaborators have independent owners and lifetimes"
+)]
+pub fn pin_lag(
+    entry: &RepoEntry,
+    newest: Option<&String>,
+    repo: Option<&Repo>,
+    forge: &dyn ConsumerPinSource,
+    cache_root: Option<&Path>,
+    heads: &ConsumerHeadMemo,
+) -> PinLag {
     let scheme = entry.release_scheme();
     match &scheme {
-        ReleaseScheme::Dated => dated_pin_lag(entry, newest, &scheme),
-        ReleaseScheme::Fixed(fixed) => fixed_pin_lag(entry, repo, fixed, &scheme),
+        ReleaseScheme::Dated => dated_pin_lag(entry, newest, &scheme, forge, cache_root, heads),
+        ReleaseScheme::Fixed(fixed) => {
+            fixed_pin_lag(entry, repo, fixed, &scheme, forge, cache_root, heads)
+        }
     }
 }
 
-fn dated_pin_lag(entry: &RepoEntry, newest: Option<&String>, scheme: &ReleaseScheme) -> PinLag {
+#[allow(
+    clippy::too_many_arguments,
+    reason = "dated pin lag needs a release comparison target and each shared scan collaborator independently"
+)]
+fn dated_pin_lag(
+    entry: &RepoEntry,
+    newest: Option<&String>,
+    scheme: &ReleaseScheme,
+    forge: &dyn ConsumerPinSource,
+    cache_root: Option<&Path>,
+    heads: &ConsumerHeadMemo,
+) -> PinLag {
     if entry.consumers.is_empty() {
         return PinLag::default();
     }
@@ -111,11 +127,20 @@ fn dated_pin_lag(entry: &RepoEntry, newest: Option<&String>, scheme: &ReleaseSch
     // hid exactly that.
     let mut behind = Vec::new();
     let mut notes = Vec::new();
+    let mut problems = Vec::new();
     for consumer in &entry.consumers {
-        let mut scan = scan_consumer_for(consumer, slug.as_deref(), scheme);
+        let mut scan = scan_consumer_slug_with_heads(
+            forge,
+            cache_root,
+            &entry.path,
+            consumer,
+            slug.as_deref(),
+            scheme,
+            heads,
+        );
         notes.extend(std::mem::take(&mut scan.notes));
         if !scan.problems.is_empty() {
-            notes.extend(scan.problems);
+            problems.extend(scan.problems);
             continue;
         }
         // The listing answers "how far behind our releases"; a pin at a consumer's own
@@ -138,14 +163,22 @@ fn dated_pin_lag(entry: &RepoEntry, newest: Option<&String>, scheme: &ReleaseSch
         lag: (!behind.is_empty())
             .then(|| format!("newest is {newest_branch}; {}", behind.join("; "))),
         notes,
+        problems,
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "fixed pin lag needs both fixed-release comparison inputs and each shared scan collaborator independently"
+)]
 fn fixed_pin_lag(
     entry: &RepoEntry,
     repo: Option<&Repo>,
     fixed: &BranchName,
     scheme: &ReleaseScheme,
+    forge: &dyn ConsumerPinSource,
+    cache_root: Option<&Path>,
+    heads: &ConsumerHeadMemo,
 ) -> PinLag {
     let slug = repo_slug(entry);
     let local_tip = repo.and_then(|repo| {
@@ -155,11 +188,20 @@ fn fixed_pin_lag(
     });
     let mut behind = Vec::new();
     let mut notes = Vec::new();
+    let mut problems = Vec::new();
     for consumer in &entry.consumers {
-        let mut scan = scan_consumer_for(consumer, slug.as_deref(), scheme);
+        let mut scan = scan_consumer_slug_with_heads(
+            forge,
+            cache_root,
+            &entry.path,
+            consumer,
+            slug.as_deref(),
+            scheme,
+            heads,
+        );
         notes.extend(std::mem::take(&mut scan.notes));
         if !scan.problems.is_empty() {
-            notes.extend(scan.problems);
+            problems.extend(scan.problems);
             continue;
         }
         scan.pins.retain(|pin| pin.on_scheme);
@@ -202,50 +244,68 @@ fn fixed_pin_lag(
     PinLag {
         lag: (!behind.is_empty()).then(|| behind.join("; ")),
         notes,
+        problems,
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "rendering consumes command-level state rather than a duplicated request object with the same fields"
+)]
 fn render_with_releases(
     registry: &Registry,
     releases: &BTreeMap<String, ReleaseState>,
     config_path: &Path,
-) -> String {
+    forge: &dyn ConsumerPinSource,
+    cache_root: Option<&Path>,
+    heads: &ConsumerHeadMemo,
+) -> (String, bool) {
     if registry.is_empty() {
-        return render(registry, config_path);
+        return (render(registry, config_path), false);
     }
     let width = registry.repos.keys().map(String::len).max().unwrap_or(0);
-    let mut lines: Vec<String> = registry
-        .repos
-        .iter()
-        .map(|(name, entry)| {
-            let mut line = format!("{name:<width$}  {}", entry.path.display());
-            if entry.has_split_release() {
-                let _ = write!(line, "  release-remote={}", entry.remote(Role::Release));
+    let mut lines = Vec::new();
+    let mut incomplete = false;
+    for (name, entry) in &registry.repos {
+        let mut line = format!("{name:<width$}  {}", entry.path.display());
+        if entry.has_split_release() {
+            let _ = write!(line, "  release-remote={}", entry.remote(Role::Release));
+        }
+        let state = releases.get(name);
+        let newest = state.and_then(|state| state.newest.as_ref());
+        match newest {
+            Some(newest) => {
+                let _ = write!(line, "  newest={newest}");
             }
-            let state = releases.get(name);
-            let newest = state.and_then(|state| state.newest.as_ref());
-            match newest {
-                Some(newest) => {
-                    let _ = write!(line, "  newest={newest}");
-                }
-                None => line.push_str("  newest=none"),
-            }
-            let pin_lag = pin_lag(entry, newest, state.and_then(|state| state.repo.as_ref()));
-            if let Some(lag) = pin_lag.lag {
-                let _ = write!(line, "  BEHIND: {lag}");
-            }
-            std::iter::once(line)
-                .chain(pin_lag.notes.into_iter().map(|note| format!("  ! {note}")))
-                .collect::<Vec<_>>()
-                .join("\n")
-        })
-        .collect();
+            None => line.push_str("  newest=none"),
+        }
+        let pin_lag = pin_lag(
+            entry,
+            newest,
+            state.and_then(|state| state.repo.as_ref()),
+            forge,
+            cache_root,
+            heads,
+        );
+        if let Some(lag) = pin_lag.lag {
+            let _ = write!(line, "  BEHIND: {lag}");
+        }
+        lines.push(line);
+        lines.extend(pin_lag.notes.into_iter().map(|note| format!("  ! {note}")));
+        incomplete |= !pin_lag.problems.is_empty();
+        lines.extend(
+            pin_lag
+                .problems
+                .into_iter()
+                .map(|problem| format!("  ? {problem}")),
+        );
+    }
     lines.extend(trusted_lines(registry));
     lines.push(
         "pin state lives in consumers: record them as `consumers = [...]` in the registry"
             .to_owned(),
     );
-    lines.join("\n")
+    (lines.join("\n"), incomplete)
 }
 
 /// Trusted-but-unmaintained entries, listed apart from the forks.
@@ -302,12 +362,31 @@ pub fn render(registry: &Registry, config_path: &Path) -> String {
         .join("\n")
 }
 
+const fn report_exit(incomplete: bool) -> Exit {
+    if incomplete {
+        Exit::Incomplete
+    } else {
+        Exit::Ok
+    }
+}
+
 pub fn run() -> anyhow::Result<Exit> {
     let path = default_config_path();
     let registry = load(&path)?;
     let releases = release_state(&registry);
-    println!("{}", render_with_releases(&registry, &releases, &path));
-    Ok(Exit::Ok)
+    let forge = crate::forge::github::CliForge;
+    let cache_root = crate::forge_cache::cache_root();
+    let heads = ConsumerHeadMemo::default();
+    let (rendered, incomplete) = render_with_releases(
+        &registry,
+        &releases,
+        &path,
+        &forge,
+        cache_root.as_deref(),
+        &heads,
+    );
+    println!("{rendered}");
+    Ok(report_exit(incomplete))
 }
 
 #[cfg(test)]
@@ -320,8 +399,9 @@ mod tests {
 
     use super::*;
     use crate::config::RepoEntry;
+    use crate::consumer_pins::ConsumerHeadMemo;
+    use crate::forge::{ConsumerHead, fake::FakeForge};
     use crate::ids::{BookmarkRef, BranchName, CommitId, RemoteName};
-
     fn entry(release: Option<&str>) -> RepoEntry {
         RepoEntry {
             path: PathBuf::from("/tmp/a-repo"),
@@ -439,20 +519,41 @@ mod tests {
         // Consumers can sit on different releases, so one being current says nothing about
         // another. Collapsing them into a single verdict hid exactly that.
         let dir = tempfile::tempdir().unwrap();
-        let current = dir.path().join("current/default");
-        let behind = dir.path().join("behind/default");
-        std::fs::create_dir_all(&current).unwrap();
-        std::fs::create_dir_all(&behind).unwrap();
-        std::fs::write(
-            current.join("uv.lock"),
-            "git = \"https://forge.invalid/o/sandbox-runner.git?rev=release/2026-07-28\"\n",
-        )
-        .unwrap();
-        std::fs::write(
-            behind.join("uv.lock"),
-            "git = \"https://forge.invalid/o/sandbox-runner.git?rev=release/2026-07-20\"\n",
-        )
-        .unwrap();
+        let current = "acme/current";
+        let behind = "acme/behind";
+        let commit = "aaaaaaaaaaaaaaaa";
+        let forge = FakeForge {
+            heads: BTreeMap::from([
+                (
+                    current.to_owned(),
+                    ConsumerHead {
+                        branch: "main".to_owned(),
+                        commit: commit.to_owned(),
+                    },
+                ),
+                (
+                    behind.to_owned(),
+                    ConsumerHead {
+                        branch: "main".to_owned(),
+                        commit: commit.to_owned(),
+                    },
+                ),
+            ]),
+            files: BTreeMap::from([
+                (
+                    (current.to_owned(), commit.to_owned(), "uv.lock".to_owned()),
+                    "git = \"https://forge.invalid/o/sandbox-runner.git?rev=release/2026-07-28\"\n"
+                        .to_owned(),
+                ),
+                (
+                    (behind.to_owned(), commit.to_owned(), "uv.lock".to_owned()),
+                    "git = \"https://forge.invalid/o/sandbox-runner.git?rev=release/2026-07-20\"\n"
+                        .to_owned(),
+                ),
+            ]),
+            ..FakeForge::default()
+        };
+        let heads = ConsumerHeadMemo::default();
         let entry = RepoEntry {
             path: dir.path().join("repo"),
             upstream: "https://forge.invalid/up/sandbox-runner".to_owned(),
@@ -461,19 +562,26 @@ mod tests {
             release: None,
             release_branch: None,
             test_count_command: None,
-            consumers: vec![current, behind],
+            consumers: vec![current.to_owned(), behind.to_owned()],
         };
 
-        let lag = pin_lag(&entry, Some(&"release/2026-07-28@origin".to_owned()), None)
-            .lag
-            .expect("one consumer is behind");
+        let lag = pin_lag(
+            &entry,
+            Some(&"release/2026-07-28@origin".to_owned()),
+            None,
+            &forge,
+            None,
+            &heads,
+        )
+        .lag
+        .expect("one consumer is behind");
 
         assert!(
-            lag.contains("behind/default pins release/2026-07-20"),
+            lag.contains("acme/behind pins release/2026-07-20"),
             "was: {lag}"
         );
         assert!(
-            !lag.contains("current/default"),
+            !lag.contains("acme/current"),
             "the current consumer must not be reported as behind: {lag}"
         );
     }
@@ -481,11 +589,24 @@ mod tests {
     #[test]
     fn a_fixed_branch_pin_without_a_lock_is_current() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("uv.lock"),
-            "git = \"https://forge.invalid/o/sandbox-runner.git?branch=integration\"\n",
-        )
-        .unwrap();
+        let consumer = "acme/consumer";
+        let commit = "aaaaaaaaaaaaaaaa";
+        let forge = FakeForge {
+            heads: BTreeMap::from([(
+                consumer.to_owned(),
+                ConsumerHead {
+                    branch: "main".to_owned(),
+                    commit: commit.to_owned(),
+                },
+            )]),
+            files: BTreeMap::from([(
+                (consumer.to_owned(), commit.to_owned(), "uv.lock".to_owned()),
+                "git = \"https://forge.invalid/o/sandbox-runner.git?branch=integration\"\n"
+                    .to_owned(),
+            )]),
+            ..FakeForge::default()
+        };
+        let heads = ConsumerHeadMemo::default();
         let entry = RepoEntry {
             path: dir.path().join("repo"),
             upstream: "https://forge.invalid/up/sandbox-runner".to_owned(),
@@ -494,30 +615,40 @@ mod tests {
             release: None,
             release_branch: Some("integration".to_owned()),
             test_count_command: None,
-            consumers: vec![dir.path().to_owned()],
+            consumers: vec![consumer.to_owned()],
         };
 
-        let pin_lag = pin_lag(&entry, None, None);
+        let pin_lag = pin_lag(&entry, None, None, &forge, None, &heads);
 
         assert_eq!(pin_lag.lag, None);
         assert!(
-            pin_lag
-                .notes
-                .iter()
-                .any(|note| note.contains("pins read from the working copy")),
-            "notes: {:?}",
-            pin_lag.notes
+            pin_lag.problems.is_empty(),
+            "problems: {:?}",
+            pin_lag.problems
         );
     }
 
     #[test]
     fn a_fixed_locked_pin_without_a_repo_reports_a_comparison_note() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("uv.lock"),
-            "git = \"https://forge.invalid/o/sandbox-runner.git?branch=integration#548aaafb\"\n",
-        )
-        .unwrap();
+        let consumer = "acme/consumer";
+        let commit = "aaaaaaaaaaaaaaaa";
+        let forge = FakeForge {
+            heads: BTreeMap::from([(
+                consumer.to_owned(),
+                ConsumerHead {
+                    branch: "main".to_owned(),
+                    commit: commit.to_owned(),
+                },
+            )]),
+            files: BTreeMap::from([(
+                (consumer.to_owned(), commit.to_owned(), "uv.lock".to_owned()),
+                "git = \"https://forge.invalid/o/sandbox-runner.git?branch=integration#548aaafb\"\n"
+                    .to_owned(),
+            )]),
+            ..FakeForge::default()
+        };
+        let heads = ConsumerHeadMemo::default();
         let entry = RepoEntry {
             path: dir.path().join("repo"),
             upstream: "https://forge.invalid/up/sandbox-runner".to_owned(),
@@ -526,10 +657,10 @@ mod tests {
             release: None,
             release_branch: Some("integration".to_owned()),
             test_count_command: None,
-            consumers: vec![dir.path().to_owned()],
+            consumers: vec![consumer.to_owned()],
         };
 
-        let pin_lag = pin_lag(&entry, None, None);
+        let pin_lag = pin_lag(&entry, None, None, &forge, None, &heads);
 
         assert_eq!(pin_lag.lag, None);
         assert!(
@@ -543,11 +674,24 @@ mod tests {
     #[test]
     fn fixed_pin_comparison_notes_are_rendered_below_the_repository() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("uv.lock"),
-            "git = \"https://forge.invalid/o/sandbox-runner.git?branch=integration#548aaafb\"\n",
-        )
-        .unwrap();
+        let consumer = "acme/consumer";
+        let commit = "aaaaaaaaaaaaaaaa";
+        let forge = FakeForge {
+            heads: BTreeMap::from([(
+                consumer.to_owned(),
+                ConsumerHead {
+                    branch: "main".to_owned(),
+                    commit: commit.to_owned(),
+                },
+            )]),
+            files: BTreeMap::from([(
+                (consumer.to_owned(), commit.to_owned(), "uv.lock".to_owned()),
+                "git = \"https://forge.invalid/o/sandbox-runner.git?branch=integration#548aaafb\"\n"
+                    .to_owned(),
+            )]),
+            ..FakeForge::default()
+        };
+        let heads = ConsumerHeadMemo::default();
         let entry = RepoEntry {
             path: dir.path().join("repo"),
             upstream: "https://forge.invalid/up/sandbox-runner".to_owned(),
@@ -556,7 +700,7 @@ mod tests {
             release: None,
             release_branch: Some("integration".to_owned()),
             test_count_command: None,
-            consumers: vec![dir.path().to_owned()],
+            consumers: vec![consumer.to_owned()],
         };
         let registry = Registry {
             repos: BTreeMap::from([("sandbox-runner".to_owned(), entry)]),
@@ -570,12 +714,87 @@ mod tests {
             },
         )]);
 
-        let rendered = render_with_releases(&registry, &releases, Path::new("/tmp/repos.toml"));
+        let (rendered, incomplete) = render_with_releases(
+            &registry,
+            &releases,
+            Path::new("/tmp/repos.toml"),
+            &forge,
+            None,
+            &heads,
+        );
 
+        assert!(!incomplete);
         assert!(
             rendered.contains("\n  ! could not compare"),
             "was: {rendered}"
         );
+    }
+
+    #[test]
+    fn a_cached_forge_failure_marks_the_repository_listing_incomplete() {
+        let cache = tempfile::tempdir().expect("create consumer cache");
+        let consumer = "acme/consumer";
+        let commit = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let mut entry = entry(None);
+        entry.origin = "https://forge.invalid/o/tool.git".to_owned();
+        entry.consumers = vec![consumer.to_owned()];
+        let registry = Registry {
+            repos: BTreeMap::from([("tool".to_owned(), entry)]),
+            ..Registry::default()
+        };
+        let releases = BTreeMap::from([(
+            "tool".to_owned(),
+            ReleaseState {
+                newest: Some("release/2026-08-05@origin".to_owned()),
+                repo: None,
+            },
+        )]);
+        let priming_forge = FakeForge {
+            heads: BTreeMap::from([(
+                consumer.to_owned(),
+                ConsumerHead {
+                    branch: "main".to_owned(),
+                    commit: commit.to_owned(),
+                },
+            )]),
+            files: BTreeMap::from([(
+                (consumer.to_owned(), commit.to_owned(), "uv.lock".to_owned()),
+                "tool = { git = \"https://forge.invalid/o/tool.git?rev=release%2F2026-08-05#112233445566\" }\n"
+                    .to_owned(),
+            )]),
+            ..FakeForge::default()
+        };
+        let priming_heads = ConsumerHeadMemo::default();
+        let (_, priming_incomplete) = render_with_releases(
+            &registry,
+            &releases,
+            Path::new("/tmp/repos.toml"),
+            &priming_forge,
+            Some(cache.path()),
+            &priming_heads,
+        );
+        assert!(!priming_incomplete);
+
+        let unavailable_forge = FakeForge {
+            fail_consumer_head: true,
+            ..FakeForge::default()
+        };
+        let unavailable_heads = ConsumerHeadMemo::default();
+        let (rendered, incomplete) = render_with_releases(
+            &registry,
+            &releases,
+            Path::new("/tmp/repos.toml"),
+            &unavailable_forge,
+            Some(cache.path()),
+            &unavailable_heads,
+        );
+
+        assert!(rendered.contains("? acme/consumer: forge unreachable:"));
+        assert!(rendered.contains("fake consumer head failed"));
+        assert!(rendered.contains(
+            "! acme/consumer: forge unreachable; pins answered from cache at aaaaaaaaaaaa"
+        ));
+        assert_eq!(report_exit(incomplete), Exit::Incomplete);
     }
 
     #[test]

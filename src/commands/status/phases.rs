@@ -1,7 +1,7 @@
 use super::{
     BTreeMap, BTreeSet, BookmarkRef, BookmarkTips, BranchName, BranchTarget, CommitId, Finding,
     FindingKind, Forge, JjError, LandedVerdict, Options, OriginRelation, Repo, RepoEntry, RepoName,
-    Report, Role, Store, Subject, classify_landed, divergent_changes, double_checkout, index_pulls,
+    Role, Store, Subject, classify_landed, divergent_changes, double_checkout, index_pulls,
     probe_landed, short,
 };
 
@@ -434,11 +434,12 @@ pub(super) fn repository_health(
 ) -> anyhow::Result<RepositoryHealth> {
     let health_phase = std::time::Instant::now();
     let repo = Repo::open(path)?;
-    let mut report = Report::default();
+    let mut findings = Vec::new();
+    let mut problems = Vec::new();
     if let Some(stale) = repo.stale_working_copy(path) {
-        report.problems.push(stale);
+        problems.push(stale);
     }
-    report.findings.extend(double_checkout(&repo.workspaces()?));
+    findings.extend(double_checkout(&repo.workspaces()?));
     let ignored: std::collections::BTreeSet<crate::ids::BookmarkRef> =
         crate::commands::release::superseded_dated_releases(tips, publish_remote)
             .into_iter()
@@ -447,12 +448,12 @@ pub(super) fn repository_health(
     let phase = std::time::Instant::now();
     let changes = repo.divergent_changes(&ignored)?;
     let divergent_duration = phase.elapsed();
-    report.findings.extend(divergent_changes(&changes));
-    report.findings.extend(conflicted_bookmark_findings(&repo)?);
+    findings.extend(divergent_changes(&changes));
+    findings.extend(conflicted_bookmark_findings(&repo)?);
     let health = health_phase.elapsed();
     Ok(RepositoryHealth {
-        findings: report.findings,
-        problems: report.problems,
+        findings,
+        problems,
         health,
         divergent_changes: divergent_duration,
     })
@@ -533,6 +534,7 @@ mod tests {
         clippy::indexing_slicing,
         reason = "indexing a result in a test is the assertion; a panic is the failure"
     )]
+    use super::super::Report;
     use super::super::rows::{RowInput, branch_rows};
     use super::super::unjudged_note;
     use super::*;
@@ -620,21 +622,20 @@ mod tests {
                     tip: CommitId::new("test-commit"),
                     origin_tip: Some(CommitId::new("origin-commit")),
                 }],
+                verdicts: vec![Ok::<Option<LandedVerdict>, JjError>(None)],
+                origin_relations: vec![Ok::<Option<OriginRelation>, String>(None)],
                 index: snapshot.index(),
                 snapshot: phase.snapshot.as_ref(),
                 notches: &[],
+                expected_base: "main",
             },
-            vec![Ok::<Option<LandedVerdict>, JjError>(None)],
-            vec![Ok::<Option<OriginRelation>, String>(None)],
             &mut report,
+            &mut Vec::new(),
         )
         .expect("assemble status report");
 
         assert_eq!(
-            report.branches[0]
-                .pull_request
-                .as_ref()
-                .map(|pull| pull.number),
+            report.branches[0].pr.as_ref().map(|pull| pull.number),
             Some(8),
             "the report shows the current open pull request this run"
         );

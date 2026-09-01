@@ -123,6 +123,11 @@ impl Repositories {
         std::fs::write(self.home.path().join("state.json"), state.to_string())
             .expect("write state");
     }
+
+    fn write_state(&self, state: &Value) {
+        std::fs::write(self.home.path().join("state.json"), state.to_string())
+            .expect("write state");
+    }
 }
 
 fn additional_context(output: &str) -> String {
@@ -159,10 +164,107 @@ fn session_start_inside_a_managed_repo_emits_the_notice_with_claims() {
     );
     assert!(context.contains("fork managed by knives"), "was: {context}");
     assert!(
-        context.contains("feat/claimed (agent-one): porting"),
+        context.contains("feat/claimed (agent-one, os-user, claimed "),
+        "was: {context}"
+    );
+    assert!(
+        context.contains("not seen within the observation window): porting"),
         "was: {context}"
     );
     assert!(!context.contains("beta instructions"), "was: {context}");
+}
+
+#[test]
+fn session_start_reemits_a_notice_when_the_roster_changes() {
+    // A one-time boolean must not hide a new claim when a session starts again
+    // in a repository whose roster has changed.
+    let repos = Repositories::new();
+    repos.configure(false);
+    let start = event("session-start", &repos.beta, None);
+
+    let _ = run_hook(repos.home.path(), &start);
+    repos.write_state(&json!({"claims": {
+        "beta/feat/claimed": {
+            "repo": "beta",
+            "branch": "feat/claimed",
+            "owner": "agent-one",
+            "why": "porting",
+            "started": "2026-01-01T00:00:00Z",
+            "files": []
+        },
+        "beta/feat/new": {
+            "repo": "beta",
+            "branch": "feat/new",
+            "owner": "agent-two",
+            "why": "reviewing",
+            "started": "2026-01-02T00:00:00Z",
+            "files": []
+        }
+    }}));
+    let second = run_hook(repos.home.path(), &start);
+
+    assert!(!second.is_empty(), "a changed roster must be noticed");
+    assert!(
+        additional_context(&second).contains("feat/new"),
+        "was: {second}"
+    );
+}
+
+#[test]
+fn session_start_in_a_managed_workspace_records_passive_observations() {
+    let repos = Repositories::new();
+    repos.configure(false);
+    std::fs::create_dir_all(repos.beta.join(".jj")).expect("create workspace marker");
+    let start = event("session-start", &repos.beta, None);
+
+    let _ = run_hook(repos.home.path(), &start);
+
+    let seen: Value = serde_json::from_str(
+        &std::fs::read_to_string(repos.home.path().join("seen.json"))
+            .expect("SessionStart records seen.json"),
+    )
+    .expect("seen JSON");
+    assert!(
+        seen["owners"]["harness-session"][SESSION_ID]
+            .as_str()
+            .is_some_and(|timestamp| timestamp.parse::<jiff::Timestamp>().is_ok()),
+        "was: {seen}"
+    );
+    assert!(
+        seen["workspaces"]["beta/beta"]
+            .as_str()
+            .is_some_and(|timestamp| timestamp.parse::<jiff::Timestamp>().is_ok()),
+        "was: {seen}"
+    );
+}
+
+#[test]
+fn compact_session_start_in_a_managed_workspace_records_passive_observations() {
+    let repos = Repositories::new();
+    repos.configure(false);
+    std::fs::create_dir_all(repos.beta.join(".jj")).expect("create workspace marker");
+    let mut compact = event("session-start", &repos.beta, None);
+    compact["source"] = json!("compact");
+
+    assert!(run_hook(repos.home.path(), &compact).is_empty());
+
+    let seen: Value = serde_json::from_str(
+        &std::fs::read_to_string(repos.home.path().join("seen.json"))
+            .expect("compact SessionStart records seen.json"),
+    )
+    .expect("seen JSON");
+    assert!(
+        seen["owners"]["harness-session"][SESSION_ID]
+            .as_str()
+            .is_some_and(|timestamp| timestamp.parse::<jiff::Timestamp>().is_ok()),
+        "was: {seen}"
+    );
+    assert!(
+        seen["workspaces"]["beta/beta"]
+            .as_str()
+            .is_some_and(|timestamp| timestamp.parse::<jiff::Timestamp>().is_ok()),
+        "was: {seen}"
+    );
 }
 
 #[test]
@@ -238,6 +340,77 @@ fn post_tool_use_on_a_foreign_repo_emits_notice_and_guidance_once() {
     assert!(context.contains("fork managed by knives"), "was: {context}");
     assert!(context.contains("beta instructions"), "was: {context}");
     assert!(second.is_empty(), "was: {second}");
+}
+
+#[test]
+fn post_tool_use_reemits_a_notice_when_the_roster_changes() {
+    // A changed roster must be reported on the foreign-repository path too,
+    // rather than only at SessionStart.
+    let repos = Repositories::new();
+    repos.configure(false);
+    let read = event(
+        "post-tool-read",
+        &repos.alpha,
+        Some(&repos.beta.join("file.txt")),
+    );
+
+    let _ = run_hook(repos.home.path(), &read);
+    repos.write_state(&json!({"claims": {
+        "beta/feat/claimed": {
+            "repo": "beta",
+            "branch": "feat/claimed",
+            "owner": "agent-one",
+            "why": "porting",
+            "started": "2026-01-01T00:00:00Z",
+            "files": []
+        },
+        "beta/feat/new": {
+            "repo": "beta",
+            "branch": "feat/new",
+            "owner": "agent-two",
+            "why": "reviewing",
+            "started": "2026-01-02T00:00:00Z",
+            "files": []
+        }
+    }}));
+    let second = run_hook(repos.home.path(), &read);
+
+    assert!(
+        additional_context(&second).contains("feat/new"),
+        "was: {second}"
+    );
+}
+
+#[test]
+fn post_tool_use_in_a_managed_workspace_records_event_identity_and_cwd() {
+    let repos = Repositories::new();
+    repos.configure(false);
+    std::fs::create_dir_all(repos.alpha.join(".jj")).expect("create alpha workspace marker");
+    let read = event(
+        "post-tool-read",
+        &repos.alpha,
+        Some(&repos.beta.join("file.txt")),
+    );
+
+    let _ = run_hook(repos.home.path(), &read);
+
+    let seen: Value = serde_json::from_str(
+        &std::fs::read_to_string(repos.home.path().join("seen.json"))
+            .expect("PostToolUse records seen.json"),
+    )
+    .expect("seen JSON");
+    assert!(
+        seen["owners"]["harness-session"][SESSION_ID]
+            .as_str()
+            .is_some_and(|timestamp| timestamp.parse::<jiff::Timestamp>().is_ok()),
+        "was: {seen}"
+    );
+    assert!(
+        seen["workspaces"]["alpha/alpha"]
+            .as_str()
+            .is_some_and(|timestamp| timestamp.parse::<jiff::Timestamp>().is_ok()),
+        "was: {seen}"
+    );
 }
 
 #[test]

@@ -18,7 +18,6 @@ use forge_shim::{
 };
 
 use knives::commands::{
-    repos,
     status::{self, OriginRelation},
     sync,
 };
@@ -28,27 +27,35 @@ use knives::forge::{
     ChecksSummary, Forge, ForgeError, PullFacts, PullRequest, PullSummary, RepoIdentity,
     SweepEntry, SweepPage, TimelineEvent,
 };
-use knives::ids::{BookmarkRef, BranchName, CommitId, ReleaseScheme, RemoteName};
+use knives::ids::{BookmarkRef, BranchName, CommitId, ReleaseScheme, RemoteName, WorkspaceName};
 use knives::jj::{
     Repo, changed_files, changed_files_between, probe_landed, pull_heads, remote_refs,
 };
-use knives::store::Store;
-use lab::Lab;
-use std::collections::BTreeMap;
+use knives::store::{OwnerKind, Store};
+use lab::{
+    Lab, ReleaseOutput, knives_release, lab_entry, operation_ids, release_command,
+    release_test_home,
+};
+use serde_json::Value;
+use std::collections::{BTreeMap, BTreeSet};
 use std::process::Command;
 
-/// A registry entry for the lab's work checkout, which stands in for origin.
-fn lab_entry(lab: &lab::Lab) -> RepoEntry {
-    RepoEntry {
-        path: lab.work.clone(),
-        upstream: lab.upstream.display().to_string(),
-        origin: lab.work.display().to_string(),
-        base: None,
-        release: None,
-        release_branch: None,
-        test_count_command: None,
-        consumers: Vec::new(),
-    }
+/// Repeated status runs carry their measured forge duration in the headline.
+/// Compare the reported facts while retaining the distinct `forge` state token.
+fn without_forge_elapsed(text: &str) -> String {
+    text.lines()
+        .map(|line| {
+            if line.contains("  forge ") {
+                let (headline, _) = line
+                    .rsplit_once(" (")
+                    .expect("a status headline ends with elapsed milliseconds");
+                format!("{headline} (elapsed)")
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[test]
@@ -125,22 +132,33 @@ fn one_batch_answers_review_age_and_checks_for_every_branch_at_once() {
             .unwrap_or_else(|| panic!("no row for {name}: {report:?}"))
             .clone()
     };
-    assert_eq!(row("feat/alpha").review_stale, Some(true));
+    let alpha = row("feat/alpha");
+    assert_eq!(alpha.state, status::BranchState::ChecksFailing);
+    assert_eq!(alpha.review.as_deref(), Some("changes-requested"));
+    assert_eq!(alpha.checks.as_deref(), Some("failing"));
     assert!(
-        row("feat/alpha")
-            .checks
-            .as_ref()
-            .is_some_and(ChecksSummary::failing)
+        alpha.flags.iter().any(|flag| flag == "review-stale"),
+        "was: {alpha:?}"
     );
-    assert_eq!(row("feat/beta").review_stale, Some(false));
+
+    let beta = row("feat/beta");
+    assert_eq!(beta.state, status::BranchState::Approved);
+    assert_eq!(beta.review.as_deref(), Some("approved"));
     assert_eq!(
-        row("feat/beta").checks,
-        Some(ChecksSummary::default()),
+        beta.checks.as_deref(),
+        Some("none-ran"),
         "consulted with nothing running is not the same as unconsulted"
     );
+    assert!(
+        !beta.flags.iter().any(|flag| flag == "review-stale"),
+        "was: {beta:?}"
+    );
+
     // And: a settled pull request is neither asked about nor reported on
-    assert_eq!(row("feat/gamma").review_stale, None);
-    assert_eq!(row("feat/gamma").checks, None);
+    let gamma = row("feat/gamma");
+    assert_eq!(gamma.state, status::BranchState::Closed);
+    assert_eq!(gamma.review, None);
+    assert_eq!(gamma.checks, None);
     assert!(report.problems.is_empty(), "was: {report:?}");
 }
 
@@ -169,10 +187,11 @@ fn a_measured_gather_reports_the_same_report_and_a_total_that_covers_its_phases(
     let (measured, timings) =
         status::gather_timed(&name, &entry, &store, &options()).expect("gather_timed");
 
-    // Then: the report is the same one, and the total covers the phases it timed
+    // Then: the report's facts are unchanged; its measured forge duration is
+    // specific to each run, and the total covers the phases it timed.
     assert_eq!(
-        status::render::render(&plain, true),
-        status::render::render(&measured, true),
+        without_forge_elapsed(&status::render::render(&plain, true)),
+        without_forge_elapsed(&status::render::render(&measured, true)),
         "measuring changed the report"
     );
     assert!(
@@ -396,7 +415,7 @@ fn a_failed_facts_batch_clears_review_and_check_cells() {
     )
     .expect("gather");
 
-    assert!(!report.forge_consulted, "was: {report:?}");
+    assert!(!report.forge.consulted, "was: {report:?}");
     assert!(
         report
             .problems
@@ -406,13 +425,18 @@ fn a_failed_facts_batch_clears_review_and_check_cells() {
     );
     assert_eq!(status::exit_for(&report), knives::cli::Exit::Incomplete);
     let row = &report.branches[0];
-    assert_eq!(row.pull_request, None, "no live-looking pull request cell");
-    assert_eq!(row.review_stale, None, "a refused answer is not current");
+    assert_eq!(row.state, status::BranchState::Unknown);
+    assert!(row.pr.is_none(), "no live-looking pull request cell");
+    assert_eq!(row.review, None, "a refused answer is not current");
     assert_eq!(row.checks, None, "a refused answer is not no checks");
+    assert!(
+        !row.flags.iter().any(|flag| flag == "review-stale"),
+        "a refused answer is not a stale review: {row:?}"
+    );
 }
 
 #[test]
-fn a_consulted_false_report_carries_zero_pull_facts() {
+fn a_consulted_false_report_carries_an_unanswered_stated_pull() {
     let lab = lab::Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     let name = knives::ids::RepoName::new("demo");
@@ -444,19 +468,18 @@ fn a_consulted_false_report_carries_zero_pull_facts() {
     )
     .expect("gather");
 
-    assert!(!report.forge_consulted, "was: {report:?}");
-    assert!(
-        report.branches.iter().all(|row| row.pull_request.is_none()),
-        "a failed facts batch leaked a pull fact: {report:?}"
-    );
+    assert!(!report.forge.consulted, "was: {report:?}");
+    let row = &report.branches[0];
+    assert_eq!(row.state, status::BranchState::Unknown);
     assert_eq!(
-        report.branches[0]
-            .stated_pull
+        row.pr
             .as_ref()
-            .map(|pull| (pull.number, pull.state.as_str())),
-        Some((42, "unknown")),
-        "the stated pull escaped the failed batch: {report:?}"
+            .map(|pull| (pull.number, pull.state.as_str(), pull.stated)),
+        Some((42, "unknown", Some(true))),
+        "the failed facts batch must not turn the stated pull into a live fact: {report:?}"
     );
+    assert_eq!(row.review, None, "a failed facts batch has no review fact");
+    assert_eq!(row.checks, None, "a failed facts batch has no check fact");
     assert!(!report.problems.is_empty(), "was: {report:?}");
 }
 
@@ -504,12 +527,21 @@ fn stated_pulls_and_dependencies_are_answered_from_the_one_batch() {
     )
     .expect("gather");
 
+    let pull = report.branches[0]
+        .pr
+        .as_ref()
+        .expect("an inferred pull request");
     assert_eq!(
-        report.branches[0]
-            .stated_pull
-            .as_ref()
-            .map(|pull| (pull.number, pull.state.as_str())),
-        Some((42, "CLOSED")),
+        (pull.number, pull.state.as_str(), pull.stated),
+        (11, "open", None),
+        "the inferred pull is the primary cell: {report:?}"
+    );
+    assert_eq!(
+        pull.prior
+            .iter()
+            .map(|prior| (prior.number, prior.state.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(42, "closed")],
         "the stated number did not come from the snapshot: {report:?}"
     );
     assert!(
@@ -518,7 +550,7 @@ fn stated_pulls_and_dependencies_are_answered_from_the_one_batch() {
     );
     assert!(report.problems.is_empty(), "was: {report:?}");
     assert!(
-        status::render::render(&report, true).contains("#42 closed (stated)"),
+        status::render::render(&report, true).contains("#11 prior #42 closed"),
         "the stated batch answer did not render: {report:?}"
     );
 }
@@ -680,28 +712,6 @@ fn relation_to_origin(lab: &lab::Lab) -> Result<Option<OriginRelation>, knives::
     status::phases::relation_to_origin(&repo, &tip, Some(&origin_tip))
 }
 
-/// Registry home + consumer for release-cut tests: one repo named `demo`,
-/// one consumer following the current release by branch.
-fn release_test_home(lab: &lab::Lab) -> (tempfile::TempDir, std::path::PathBuf) {
-    let consumer = lab.consumer_with_pin_history(
-        "pyproject.toml",
-        "work = { git = \"https://forge.invalid/acme/work.git\", branch = \"release/2026-08-03\" }\n",
-        "work = { git = \"https://forge.invalid/acme/work.git\", branch = \"release/2026-08-04\" }\n",
-    );
-    let home = tempfile::tempdir().expect("create config home");
-    std::fs::write(
-        home.path().join("repos.toml"),
-        format!(
-            "[repos.demo]\npath = \"{}\"\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/work.git\"\nconsumers = [\"{}\"]\n",
-            lab.work.display(),
-            lab.upstream.display(),
-            consumer.display(),
-        ),
-    )
-    .expect("write registry");
-    (home, consumer)
-}
-
 fn sync_entry(lab: &lab::Lab) -> RepoEntry {
     RepoEntry {
         path: lab.work.clone(),
@@ -771,6 +781,87 @@ fn a_jj_workspace_beside_a_registered_repo_resolves_that_repo() {
     );
     let unrelated = tempfile::tempdir().expect("unrelated directory");
     assert!(registry.containing(unrelated.path()).is_none());
+}
+
+#[test]
+fn workspace_activity_attributes_working_copy_moves_to_their_workspace() {
+    let lab = Lab::new();
+    lab.jj_work(["workspace", "add", "--name", "feat-x", "../feat-x-ws"]);
+    let workspace_dir = lab
+        .work
+        .parent()
+        .expect("workspace parent")
+        .join("feat-x-ws");
+    std::fs::write(workspace_dir.join("w.txt"), "work\n").expect("write workspace content");
+    lab.jj_at(&workspace_dir, ["new", "-m", "wip"]);
+
+    let repo = Repo::open(&lab.work).expect("open");
+    let wanted = BTreeSet::from([WorkspaceName::new("feat-x")]);
+    let activity = repo.workspace_activity(&wanted, 200).expect("walk");
+
+    assert!(
+        activity.moves.contains_key(&WorkspaceName::new("feat-x")),
+        "was: {activity:?}"
+    );
+}
+
+#[test]
+fn workspace_activity_reports_nothing_for_a_workspace_that_never_moved() {
+    let lab = Lab::new();
+    let repo = Repo::open(&lab.work).expect("open");
+    let wanted = BTreeSet::from([WorkspaceName::new("never-created")]);
+    let activity = repo
+        .workspace_activity(&wanted, operation_ids(&lab.work).len())
+        .expect("walk");
+
+    assert!(activity.moves.is_empty(), "was: {activity:?}");
+    assert!(activity.horizon.is_none(), "was: {activity:?}");
+}
+
+#[test]
+fn cli_dispatch_records_an_observation_before_running_the_command() {
+    let lab = Lab::new();
+    let home = tempfile::tempdir().expect("config home");
+    std::fs::write(
+        home.path().join("repos.toml"),
+        format!(
+            "[repos.demo]\npath = \"{}\"\nupstream = \"{}\"\norigin = \"o\"\n",
+            lab.work.display(),
+            lab.upstream.display()
+        ),
+    )
+    .expect("write registry");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_knives"))
+        .args(["--text", "repos"])
+        .current_dir(&lab.work)
+        .env("KNIVES_CONFIG_HOME", home.path())
+        .env("KNIVES_OWNER", "agent-one")
+        .output()
+        .expect("run knives");
+
+    assert!(
+        output.status.success(),
+        "knives failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let seen: Value = serde_json::from_str(
+        &std::fs::read_to_string(home.path().join("seen.json"))
+            .expect("CLI dispatch records seen.json"),
+    )
+    .expect("seen JSON");
+    assert!(
+        seen["owners"]["harness-session"]["agent-one"]
+            .as_str()
+            .is_some_and(|timestamp| timestamp.parse::<jiff::Timestamp>().is_ok()),
+        "was: {seen}"
+    );
+    assert!(
+        seen["workspaces"]["demo/work"]
+            .as_str()
+            .is_some_and(|timestamp| timestamp.parse::<jiff::Timestamp>().is_ok()),
+        "was: {seen}"
+    );
 }
 
 #[test]
@@ -1456,140 +1547,6 @@ fn ancestry_is_answered_in_both_directions() {
         !repo
             .is_ancestor(&tip, &base)
             .expect("tip is not behind base")
-    );
-}
-
-#[test]
-fn a_fixed_pin_locked_to_an_ancestor_is_behind() {
-    let lab = Lab::new();
-    lab.branch("integration", "base.txt", "base\n");
-    let repo = Repo::open(&lab.work).expect("open ancestor");
-    let ancestor = repo.resolve_commit("integration").expect("ancestor");
-    lab.jj_work(["new", "-r", "integration", "-m", "advance integration"]);
-    std::fs::write(lab.work.join("advance.txt"), "advance\n").expect("advance integration");
-    lab.jj_work(["bookmark", "set", "integration", "-r", "@"]);
-    lab.jj_work(["new"]);
-
-    let consumer = tempfile::tempdir().expect("consumer directory");
-    let locked: String = ancestor.as_str().chars().take(12).collect();
-    std::fs::write(
-        consumer.path().join("uv.lock"),
-        format!("url = \"https://forge.invalid/o/repo.git?branch=integration#{locked}\"\n"),
-    )
-    .expect("consumer pin");
-    let entry = RepoEntry {
-        path: lab.work.clone(),
-        upstream: "https://forge.invalid/up/repo.git".to_owned(),
-        origin: "https://forge.invalid/o/repo.git".to_owned(),
-        base: None,
-        release: None,
-        release_branch: Some("integration".to_owned()),
-        test_count_command: None,
-        consumers: vec![consumer.path().to_owned()],
-    };
-    let repo = Repo::open(&lab.work).expect("open advanced branch");
-
-    let lag = repos::pin_lag(&entry, None, Some(&repo));
-
-    assert!(
-        lag.notes
-            .iter()
-            .any(|note| note.contains("pins read from the working copy")),
-        "notes: {:?}",
-        lag.notes
-    );
-    assert!(
-        lag.lag.as_ref().is_some_and(|lag| lag.contains(&locked)),
-        "lag: {:?}",
-        lag.lag
-    );
-}
-
-#[test]
-fn a_consumer_checkout_parked_behind_its_origin_does_not_produce_a_false_behind() {
-    // Given: a consumer repo whose origin trunk pins the newest release while
-    // the checkout's working copy still shows an older pin — the exact state
-    // that produced false BEHIND findings twice.
-    let lab = Lab::new();
-    let consumer = lab.consumer_with_pin_history(
-        "uv.lock",
-        "url = \"https://forge.invalid/o/tool.git?rev=release%2F2026-07-20\"\n",
-        "url = \"https://forge.invalid/o/tool.git?rev=release%2F2026-07-28\"\n",
-    );
-
-    // When: the consumer is scanned.
-    let scan = knives::release_model::scan_consumer_for(
-        &consumer,
-        Some("tool"),
-        &knives::ids::ReleaseScheme::Dated,
-    );
-
-    // Then: the pin is the origin trunk's, and the checkout's lag is a note.
-    assert_eq!(scan.pins.len(), 1, "was: {:?}", scan.pins);
-    assert_eq!(scan.pins[0].reference, "release/2026-07-28");
-    assert!(
-        scan.notes.iter().any(|note| note.contains("behind")),
-        "the stale checkout is annotated, not silently trusted: {:?}",
-        scan.notes
-    );
-    assert!(scan.problems.is_empty());
-}
-
-#[test]
-fn a_dev_trunk_consumer_checkout_uses_its_origin_head_pin() {
-    let lab = Lab::with_trunk("dev");
-    let consumer = lab.consumer_with_pin_history(
-        "uv.lock",
-        "url = \"https://forge.invalid/o/tool.git?rev=release%2F2026-07-20\"\n",
-        "url = \"https://forge.invalid/o/tool.git?rev=release%2F2026-07-28\"\n",
-    );
-
-    let scan = knives::release_model::scan_consumer_for(
-        &consumer,
-        Some("tool"),
-        &knives::ids::ReleaseScheme::Dated,
-    );
-
-    assert_eq!(scan.pins.len(), 1, "was: {:?}", scan.pins);
-    assert_eq!(scan.pins[0].reference, "release/2026-07-28");
-    assert!(
-        scan.notes.iter().any(|note| note.contains("origin/dev")),
-        "the origin default branch is preserved: {:?}",
-        scan.notes
-    );
-    assert!(scan.problems.is_empty());
-}
-
-#[test]
-fn a_consumer_without_an_origin_remote_uses_its_current_working_copy_pin() {
-    let lab = Lab::new();
-    let consumer = lab.consumer_with_pin_history(
-        "uv.lock",
-        "url = \"https://forge.invalid/o/tool.git?rev=release%2F2026-07-20\"\n",
-        "url = \"https://forge.invalid/o/tool.git?rev=release%2F2026-07-28\"\n",
-    );
-    lab.reset_consumer_to_origin(&consumer);
-    lab.rename_consumer_remote(&consumer, "origin", "upstream");
-    let entry = RepoEntry {
-        path: lab.work,
-        upstream: "https://forge.invalid/up/tool.git".to_owned(),
-        origin: "https://forge.invalid/o/tool.git".to_owned(),
-        base: None,
-        release: None,
-        release_branch: None,
-        test_count_command: None,
-        consumers: vec![consumer.clone()],
-    };
-
-    let pin_lag = repos::pin_lag(&entry, Some(&"release/2026-07-28@origin".to_owned()), None);
-
-    assert_eq!(pin_lag.lag, None, "was: {pin_lag:?}");
-    assert_eq!(
-        pin_lag.notes,
-        vec![format!(
-            "{}: no origin trunk resolved; pins read from the working copy",
-            consumer.display()
-        )]
     );
 }
 
@@ -2655,31 +2612,6 @@ fn probe_landed_cleans_only_its_temporary_commits() {
     );
 }
 
-/// Operation ids in the shared op log, newest first.
-fn operation_ids(repo: &std::path::Path) -> Vec<String> {
-    let output = Command::new("jj")
-        .args([
-            "--ignore-working-copy",
-            "op",
-            "log",
-            "--no-graph",
-            "-T",
-            "id ++ \"\\n\"",
-        ])
-        .current_dir(repo)
-        .env("JJ_CONFIG", "/dev/null")
-        .env("JJ_USER", "Knives Lab")
-        .env("JJ_EMAIL", "knives-lab@example.test")
-        .output()
-        .expect("read op log");
-    assert!(output.status.success(), "read op log");
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(ToOwned::to_owned)
-        .collect()
-}
-
 /// The newest operation's description.
 fn newest_operation_description(repo: &std::path::Path) -> String {
     let output = Command::new("jj")
@@ -2948,174 +2880,6 @@ fn remote_refs_reads_live_heads_by_pattern() {
     assert!(refs.contains_key("refs/heads/feat/alpha"));
     let none = remote_refs(&url, &["refs/pull/*/head"]).expect("ls-remote");
     assert!(none.is_empty(), "a path remote has no pull refs");
-}
-
-#[test]
-fn consumers_reports_stale_and_behind_locks() {
-    let lab = Lab::new();
-    lab.branch("release/2026-08-04", "release.txt", "first\n");
-    lab.push_branch("release/2026-08-04");
-    let consumer = tempfile::tempdir().expect("create consumer");
-    std::fs::write(
-        consumer.path().join("uv.lock"),
-        "tool = { git = \"https://forge.invalid/acme/tool.git?rev=release%2F2026-08-04#deadbeef\" }\n",
-    )
-    .expect("write frozen pin");
-    let home = tempfile::tempdir().expect("create config home");
-    std::fs::write(
-        home.path().join("repos.toml"),
-        format!(
-            "[repos.demo]\npath = \"{}\"\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/tool.git\"\nrelease = \"{}\"\nconsumers = [\"{}\"]\n",
-            lab.work.display(),
-            lab.upstream.display(),
-            lab.temp_origin().display(),
-            consumer.path().display(),
-        ),
-    )
-    .expect("write registry");
-    let knives = || {
-        Command::new(env!("CARGO_BIN_EXE_knives"))
-            .args(["--text", "consumers", "demo"])
-            .current_dir(&lab.work)
-            .env("KNIVES_CONFIG_HOME", home.path())
-            .output()
-            .expect("run consumers")
-    };
-
-    let stale = knives();
-
-    assert_eq!(stale.status.code(), Some(1), "stderr: {:?}", stale.stderr);
-    assert!(
-        String::from_utf8_lossy(&stale.stdout).contains("stale lock: expected @"),
-        "stdout: {}",
-        String::from_utf8_lossy(&stale.stdout)
-    );
-
-    lab.branch("release/2026-08-05", "release.txt", "second\n");
-    lab.push_branch("release/2026-08-05");
-
-    let behind = knives();
-
-    assert_eq!(behind.status.code(), Some(1), "stderr: {:?}", behind.stderr);
-    assert!(
-        String::from_utf8_lossy(&behind.stdout).contains("behind: newest is release/2026-08-05"),
-        "stdout: {}",
-        String::from_utf8_lossy(&behind.stdout)
-    );
-}
-
-#[test]
-fn consumers_reports_a_missing_registry_path_as_incomplete() {
-    let lab = Lab::new();
-    lab.branch("release/2026-08-04", "release.txt", "first\n");
-    lab.push_branch("release/2026-08-04");
-    let home = tempfile::tempdir().expect("create config home");
-    let missing = home.path().join("gone");
-    std::fs::write(
-        home.path().join("repos.toml"),
-        format!(
-            "[repos.demo]\npath = \"{}\"\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/tool.git\"\nrelease = \"{}\"\nconsumers = [\"{}\"]\n",
-            lab.work.display(),
-            lab.upstream.display(),
-            lab.temp_origin().display(),
-            missing.display(),
-        ),
-    )
-    .expect("write registry");
-
-    let output = Command::new(env!("CARGO_BIN_EXE_knives"))
-        .args(["--text", "consumers", "demo"])
-        .current_dir(&lab.work)
-        .env("KNIVES_CONFIG_HOME", home.path())
-        .output()
-        .expect("run consumers");
-
-    assert_eq!(output.status.code(), Some(3), "stderr: {:?}", output.stderr);
-    assert!(
-        String::from_utf8_lossy(&output.stdout).contains("PROBLEM: not found"),
-        "stdout: {}",
-        String::from_utf8_lossy(&output.stdout)
-    );
-}
-
-#[test]
-fn consumers_leaves_pins_unclassified_when_live_release_refs_fail() {
-    let lab = Lab::new();
-    lab.branch("release/2026-08-05", "release.txt", "published\n");
-    lab.push_branch("release/2026-08-05");
-    let consumer = tempfile::tempdir().expect("create consumer");
-    std::fs::write(
-        consumer.path().join("uv.lock"),
-        "tool = { git = \"https://forge.invalid/acme/tool.git?rev=release%2F2026-08-05#deadbeef\" }\n",
-    )
-    .expect("write frozen pin");
-    let home = tempfile::tempdir().expect("create config home");
-    let unavailable = home.path().join("unavailable-release-remote");
-    std::fs::write(
-        home.path().join("repos.toml"),
-        format!(
-            "[repos.demo]\npath = \"{}\"\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/tool.git\"\nrelease = \"{}\"\nconsumers = [\"{}\"]\n",
-            lab.work.display(),
-            lab.upstream.display(),
-            unavailable.display(),
-            consumer.path().display(),
-        ),
-    )
-    .expect("write registry");
-
-    let output = Command::new(env!("CARGO_BIN_EXE_knives"))
-        .args(["--text", "consumers", "demo"])
-        .current_dir(&lab.work)
-        .env("KNIVES_CONFIG_HOME", home.path())
-        .output()
-        .expect("run consumers");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    assert_eq!(output.status.code(), Some(3), "stderr: {:?}", output.stderr);
-    assert!(stdout.contains("unclassified"), "stdout: {stdout}");
-    assert!(
-        !stdout.contains("stale lock:") && !stdout.contains("behind:"),
-        "live remote failure must not derive a local verdict: {stdout}"
-    );
-}
-
-#[test]
-fn consumers_reports_an_unreadable_pin_file_as_incomplete() {
-    let lab = Lab::new();
-    lab.branch("release/2026-08-05", "release.txt", "published\n");
-    lab.push_branch("release/2026-08-05");
-    let consumer = tempfile::tempdir().expect("create consumer");
-    std::fs::create_dir(consumer.path().join("uv.lock")).expect("create unreadable pin file");
-    let home = tempfile::tempdir().expect("create config home");
-    std::fs::write(
-        home.path().join("repos.toml"),
-        format!(
-            "[repos.demo]\npath = \"{}\"\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/tool.git\"\nrelease = \"{}\"\nconsumers = [\"{}\"]\n",
-            lab.work.display(),
-            lab.upstream.display(),
-            lab.temp_origin().display(),
-            consumer.path().display(),
-        ),
-    )
-    .expect("write registry");
-
-    let output = Command::new(env!("CARGO_BIN_EXE_knives"))
-        .args(["--text", "consumers", "demo"])
-        .current_dir(&lab.work)
-        .env("KNIVES_CONFIG_HOME", home.path())
-        .output()
-        .expect("run consumers");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    assert_eq!(output.status.code(), Some(3), "stderr: {:?}", output.stderr);
-    assert!(
-        stdout.contains("PROBLEM: could not read uv.lock"),
-        "stdout: {stdout}"
-    );
-    assert!(
-        !stdout.contains("does not pin demo"),
-        "a failed file scan must not make a no-pin claim: {stdout}"
-    );
 }
 
 #[test]
@@ -3836,10 +3600,44 @@ fn hold_claim(home: &tempfile::TempDir, branch: &str) {
             knives::ids::RepoName::new("demo"),
             BranchName::new(branch),
         ),
-        "ses_fff688",
+        &knives::commands::claim::Identity {
+            owner: "ses_fff688".to_owned(),
+            kind: OwnerKind::HarnessSession,
+        },
         "carrying the queue fix",
     );
     store.save().expect("save store");
+}
+fn start_claim_for_finish(
+    lab: &lab::Lab,
+    home: &tempfile::TempDir,
+    owner: &str,
+    branch: &str,
+) -> std::path::PathBuf {
+    let started = Command::new(env!("CARGO_BIN_EXE_knives"))
+        .args([
+            "--text",
+            "start",
+            branch,
+            "--repo",
+            "demo",
+            "--why",
+            "carry the queue fix",
+        ])
+        .current_dir(&lab.work)
+        .env("KNIVES_CONFIG_HOME", home.path())
+        .env("KNIVES_OWNER", owner)
+        .output()
+        .expect("start held branch");
+    assert!(
+        started.status.success(),
+        "start failed: {}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    lab.work
+        .parent()
+        .expect("workspace parent")
+        .join(knives::commands::wip::workspace_for(branch))
 }
 
 fn knives_finish(lab: &lab::Lab, home: &tempfile::TempDir, args: &[&str]) -> std::process::Output {
@@ -4021,6 +3819,225 @@ fn finish_refuses_when_it_cannot_verify_and_allow_open_proceeds() {
         !bypass_log.exists(),
         "--allow-open spawned the fake gh: {}",
         std::fs::read_to_string(&bypass_log).unwrap_or_default()
+    );
+}
+
+#[test]
+fn finish_refuses_to_release_anothers_claim_without_force() {
+    // A different harness session does not own the held workspace, so finishing
+    // must leave both the claim and its workspace intact until force is explicit.
+    let lab = lab::Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let workspace = start_claim_for_finish(&lab, &home, "agent-one", "feat/gamma");
+
+    let refused = Command::new(env!("CARGO_BIN_EXE_knives"))
+        .args([
+            "--text",
+            "finish",
+            "feat/gamma",
+            "--allow-open",
+            "--repo",
+            "demo",
+        ])
+        .current_dir(&lab.work)
+        .env("KNIVES_CONFIG_HOME", home.path())
+        .env("KNIVES_OWNER", "agent-two")
+        .output()
+        .expect("finish another agent's claim");
+
+    assert_eq!(
+        refused.status.code(),
+        Some(2),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&refused.stdout),
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(stderr.contains("agent-one"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("knives finish feat/gamma --force --why"),
+        "stderr: {stderr}"
+    );
+    let state: Value = serde_json::from_str(
+        &std::fs::read_to_string(home.path().join("state.json")).expect("read state"),
+    )
+    .expect("parse state");
+    assert_eq!(
+        state["claims"]["demo/feat/gamma"]["owner"],
+        Value::String("agent-one".to_owned())
+    );
+    assert!(workspace.is_dir(), "foreign workspace was removed");
+}
+
+#[test]
+fn finish_force_releases_and_records_provenance() {
+    // A forced release needs an enduring, independently inspectable record of
+    // whose claim it released, how it was identified, and why it was forced.
+    let lab = lab::Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let _workspace = start_claim_for_finish(&lab, &home, "agent-one", "feat/gamma");
+
+    let finished = Command::new(env!("CARGO_BIN_EXE_knives"))
+        .args([
+            "--text",
+            "finish",
+            "feat/gamma",
+            "--force",
+            "--why",
+            "owner session died",
+            "--allow-open",
+            "--repo",
+            "demo",
+        ])
+        .current_dir(&lab.work)
+        .env("KNIVES_CONFIG_HOME", home.path())
+        .env("KNIVES_OWNER", "agent-two")
+        .output()
+        .expect("force finish another agent's claim");
+
+    assert!(
+        finished.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&finished.stdout),
+        String::from_utf8_lossy(&finished.stderr)
+    );
+    let state: Value = serde_json::from_str(
+        &std::fs::read_to_string(home.path().join("state.json")).expect("read state"),
+    )
+    .expect("parse state");
+    assert!(
+        state["claims"].get("demo/feat/gamma").is_none(),
+        "claim remained: {}",
+        state["claims"]
+    );
+    let events = Command::new(env!("CARGO_BIN_EXE_knives"))
+        .args([
+            "--text",
+            "notch",
+            "feat/gamma",
+            "--events",
+            "--repo",
+            "demo",
+        ])
+        .current_dir(&lab.work)
+        .env("KNIVES_CONFIG_HOME", home.path())
+        .env("KNIVES_OWNER", "agent-two")
+        .output()
+        .expect("read forced-release events");
+    assert!(
+        events.status.success(),
+        "read events failed: {}",
+        String::from_utf8_lossy(&events.stderr)
+    );
+    let events = String::from_utf8_lossy(&events.stdout);
+    assert!(
+        events.contains("released agent-one's claim by force"),
+        "events: {events}"
+    );
+    assert!(
+        events.contains("(harness-session, claimed ") && events.contains(", last seen "),
+        "events: {events}"
+    );
+    assert!(events.contains("owner session died"), "events: {events}");
+}
+
+#[test]
+fn finish_force_requires_why() {
+    // Clap must reject an unexplained forced release before it can mutate a claim.
+    let lab = lab::Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_knives"))
+        .args([
+            "--text",
+            "finish",
+            "feat/gamma",
+            "--force",
+            "--allow-open",
+            "--repo",
+            "demo",
+        ])
+        .current_dir(&lab.work)
+        .env("KNIVES_CONFIG_HOME", home.path())
+        .output()
+        .expect("parse forced finish");
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("--why"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn finish_by_possession_still_releases() {
+    // Physical presence in the claim's workspace is an intentional possession
+    // proof even when no harness identity survives into the finishing process.
+    let lab = lab::Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let workspace = start_claim_for_finish(&lab, &home, "agent-one", "feat/gamma");
+
+    let finished = Command::new(env!("CARGO_BIN_EXE_knives"))
+        .args([
+            "--text",
+            "finish",
+            "feat/gamma",
+            "--allow-open",
+            "--repo",
+            "demo",
+        ])
+        .current_dir(&workspace)
+        .env("KNIVES_CONFIG_HOME", home.path())
+        .env_remove("KNIVES_OWNER")
+        .env_remove("CLAUDE_CODE_SESSION_ID")
+        .env("USER", "terminal-user")
+        .output()
+        .expect("finish held workspace by possession");
+
+    assert!(
+        finished.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&finished.stdout),
+        String::from_utf8_lossy(&finished.stderr)
+    );
+}
+
+#[test]
+fn finish_by_owner_releases_when_checkout_activity_is_unavailable() {
+    // The ownership decision is complete without an operation walk. An
+    // unavailable checkout may prevent forgetting a workspace, but cannot turn
+    // a same-owner release into a claim that remains held.
+    let lab = lab::Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    hold_claim(&home, "feat/alpha");
+    let unavailable = home.path().join("unavailable");
+    std::fs::write(
+        home.path().join("repos.toml"),
+        format!(
+            "[repos.demo]\npath = \"{}\"\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/work.git\"\n",
+            unavailable.display(),
+            lab.upstream.display(),
+        ),
+    )
+    .expect("make configured checkout unavailable");
+
+    let finished = knives_finish(&lab, &home, &["feat/alpha"]);
+
+    assert!(
+        finished.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&finished.stdout),
+        String::from_utf8_lossy(&finished.stderr)
+    );
+    let state: Value = serde_json::from_str(
+        &std::fs::read_to_string(home.path().join("state.json")).expect("read state"),
+    )
+    .expect("parse state");
+    assert!(
+        state["claims"].get("demo/feat/alpha").is_none(),
+        "claim remained: {}",
+        state["claims"]
     );
 }
 
@@ -4621,8 +4638,18 @@ fn plan_for_a_fixed_release_ignores_a_non_publish_remote() {
     lab.jj_work(["bookmark", "delete", "integration"]);
 
     // When: planning selects the newest fixed release without a local bookmark.
-    let plan = knives::commands::release::plan(&knives::ids::RepoName::new("a-repo"), &entry, &[])
-        .expect("plan");
+    let forge = knives::forge::fake::FakeForge::default();
+    let heads = knives::consumer_pins::ConsumerHeadMemo::default();
+    let consumers = knives::commands::release::ConsumerInputs {
+        slugs: &[],
+        locals: &[],
+        forge: &forge,
+        cache_root: None,
+        heads: &heads,
+    };
+    let plan =
+        knives::commands::release::plan(&knives::ids::RepoName::new("a-repo"), &entry, &consumers)
+            .expect("plan");
 
     // Then: upstream cannot be mistaken for the publish remote's release.
     assert_eq!(plan.release.as_deref(), Some("integration@origin"));
@@ -4661,10 +4688,11 @@ fn parallel_landed_probes_answer_exactly_what_serial_ones_did() {
     let serial = status::gather(&name, &entry, &store, &options(1)).expect("serial gather");
     let parallel = status::gather(&name, &entry, &store, &options(8)).expect("parallel gather");
 
-    // Then: not one token differs, including the landed column
+    // Then: apart from each run's elapsed forge duration, not one report token
+    // differs, including the landed column.
     assert_eq!(
-        status::render::render(&serial, true),
-        status::render::render(&parallel, true),
+        without_forge_elapsed(&status::render::render(&serial, true)),
+        without_forge_elapsed(&status::render::render(&parallel, true)),
         "parallelism changed the report"
     );
     assert_eq!(status::exit_for(&serial), status::exit_for(&parallel));
@@ -4761,8 +4789,8 @@ fn status_all_reports_every_repo_in_registry_order() {
             .to_owned()
     };
     assert_eq!(
-        text.trim_end(),
-        format!("{}\n\n{}", alone("aardvark"), alone("zebra")),
+        without_forge_elapsed(text.trim_end()),
+        without_forge_elapsed(&format!("{}\n\n{}", alone("aardvark"), alone("zebra"))),
         "--all is not each repo's own report in registry order"
     );
 }
@@ -4961,16 +4989,21 @@ fn status_reports_empty_diff_and_deleted_head_from_completed_facts() {
         .output()
         .expect("run status with a forge shim");
 
-    // Then: both answered incidents are visible and findings determine the exit code
+    // Then: both answered incidents remain visible, but absent merge facts make
+    // the status incomplete rather than green or merely findings-only.
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_eq!(
         output.status.code(),
-        Some(i32::from(knives::cli::Exit::Findings.code())),
+        Some(i32::from(knives::cli::Exit::Incomplete.code())),
         "stdout: {stdout}\nstderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(stdout.contains("empty-diff"), "stdout: {stdout}");
     assert!(stdout.contains("deleted-head-ref"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("forge did not report mergeable"),
+        "stdout: {stdout}"
+    );
 }
 
 #[test]
@@ -5014,17 +5047,17 @@ fn status_reports_branch_overlap_after_upstream_advances_without_landed_probe() 
     )
     .expect("gather");
 
-    // Then: the independent path comparison still reports the shared file
+    // Then: the grouped finding retains the shared path and both participants.
     let overlap = report
         .findings
         .iter()
-        .find(|finding| {
-            finding.kind == knives::detect::FindingKind::BranchOverlap
-                && finding.subject == knives::detect::Subject::File("shared.txt".to_owned())
-        })
+        .find(|finding| finding.kind == knives::detect::FindingKind::BranchOverlap)
         .expect("the shared file is reported even without the landed probe");
-    assert!(overlap.detail.contains("feat/alpha"), "was: {overlap:?}");
-    assert!(overlap.detail.contains("feat/beta"), "was: {overlap:?}");
+    assert_eq!(overlap.count, 1, "was: {overlap:?}");
+    assert_eq!(
+        overlap.subjects,
+        vec!["shared.txt: feat/alpha, feat/beta".to_owned()]
+    );
 }
 
 #[test]
@@ -5065,12 +5098,17 @@ fn status_reports_a_branch_carried_elsewhere() {
     )
     .expect("gather");
 
-    // Then: the branch fact names the reference that reaches its tip
-    assert!(report.findings.iter().any(|finding| {
-        finding.kind == knives::detect::FindingKind::CarriedElsewhere
-            && finding.subject == knives::detect::Subject::Branch(BranchName::new("feat/alpha"))
-            && finding.detail.contains("theirs/rework")
-    }));
+    // Then: the grouped finding retains the branch and its carrier.
+    let carrier = report
+        .findings
+        .iter()
+        .find(|finding| finding.kind == knives::detect::FindingKind::CarriedElsewhere)
+        .expect("the branch carrier is reported");
+    assert_eq!(carrier.count, 1, "was: {carrier:?}");
+    assert_eq!(
+        carrier.subjects,
+        vec!["feat/alpha: theirs/rework".to_owned()]
+    );
 }
 
 #[test]
@@ -5119,12 +5157,17 @@ fn status_reports_a_carrier_for_a_closed_pull_request() {
     )
     .expect("gather");
 
-    // Then: forge state does not suppress the local ancestry fact
-    assert!(report.findings.iter().any(|finding| {
-        finding.kind == knives::detect::FindingKind::CarriedElsewhere
-            && finding.subject == knives::detect::Subject::Branch(BranchName::new("feat/alpha"))
-            && finding.detail.contains("theirs/rework")
-    }));
+    // Then: forge state does not suppress the branch or its carrier.
+    let carrier = report
+        .findings
+        .iter()
+        .find(|finding| finding.kind == knives::detect::FindingKind::CarriedElsewhere)
+        .expect("the branch carrier is reported");
+    assert_eq!(carrier.count, 1, "was: {carrier:?}");
+    assert_eq!(
+        carrier.subjects,
+        vec!["feat/alpha: theirs/rework".to_owned()]
+    );
 }
 
 #[test]
@@ -5173,10 +5216,13 @@ fn status_does_not_report_trunk_as_a_carrier_without_landed_probe() {
     )
     .expect("gather");
 
-    // Then: trunk is never a carrier finding, even without an InTrunk verdict
+    // Then: trunk is never a carrier finding, even without an InTrunk verdict.
     assert!(!report.findings.iter().any(|finding| {
         finding.kind == knives::detect::FindingKind::CarriedElsewhere
-            && finding.subject == knives::detect::Subject::Branch(BranchName::new("feat/alpha"))
+            && finding
+                .subjects
+                .iter()
+                .any(|subject| subject == "feat/alpha")
     }));
 }
 
@@ -5254,7 +5300,7 @@ fn status_carries_each_branchs_newest_notch_in_json_and_in_text() {
         .iter()
         .find(|row| row.name.as_str() == "feat/alpha")
         .expect("the branch has a row");
-    let last = alpha.last_notch.as_ref().expect("a breadcrumb");
+    let last = alpha.notch.as_ref().expect("a breadcrumb");
     assert_eq!(last.text, "human conclusion");
     assert_eq!(last.kind, knives::ledger::Kind::Note);
     assert_eq!(last.count, 2);
@@ -5266,16 +5312,16 @@ fn status_carries_each_branchs_newest_notch_in_json_and_in_text() {
         .iter()
         .find(|row| row["name"] == "feat/alpha")
         .expect("row");
-    assert_eq!(row["last_notch"]["kind"], "note");
-    assert_eq!(row["last_notch"]["text"], "human conclusion");
-    assert_eq!(row["last_notch"]["count"], 2);
-    assert!(row["last_notch"]["ts"].is_string());
+    assert_eq!(row["notch"]["kind"], "note");
+    assert_eq!(row["notch"]["text"], "human conclusion");
+    assert_eq!(row["notch"]["count"], 2);
+    assert!(row["notch"]["ts"].is_string());
     let beta = rows
         .iter()
         .find(|row| row["name"] == "feat/beta")
         .expect("branch without a notch");
     assert!(
-        beta.get("last_notch").is_none(),
+        beta.get("notch").is_none(),
         "no notch is absent, not null: {beta}"
     );
 
@@ -5484,10 +5530,9 @@ fn release_rebase_refuses_when_every_pin_is_frozen() {
     std::fs::write(
         home.path().join("repos.toml"),
         format!(
-            "[repos.demo]\npath = \"{}\"\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/work.git\"\nconsumers = [\"{}\"]\n",
+            "[repos.demo]\npath = \"{}\"\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/work.git\"\n",
             lab.work.display(),
             lab.upstream.display(),
-            consumer.display(),
         ),
     )
     .expect("write registry");
@@ -5498,7 +5543,16 @@ fn release_rebase_refuses_when_every_pin_is_frozen() {
         .expect("resolve release before refusal");
 
     // When: the real binary is asked to rebase the release onto upstream.
-    let output = knives_release(&lab, &home, &["rebase", "main@upstream"]);
+    let output = knives_release(
+        &lab,
+        &home,
+        &[
+            "--consumer",
+            consumer.to_str().expect("utf-8 consumer path"),
+            "rebase",
+            "main@upstream",
+        ],
+    );
 
     // Then: it directs the caller to a dated cut, exits incomplete, and does not move it.
     assert_eq!(
@@ -5537,17 +5591,25 @@ fn release_rebase_refusal_for_fixed_release_explains_that_revision_pins_cannot_f
     std::fs::write(
         home.path().join("repos.toml"),
         format!(
-            "[repos.demo]\npath = \"{}\"\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/work.git\"\nrelease_branch = \"integration\"\nconsumers = [\"{}\"]\n",
+            "[repos.demo]\npath = \"{}\"\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/work.git\"\nrelease_branch = \"integration\"\n",
             lab.work.display(),
             lab.upstream.display(),
-            consumer.display(),
         ),
     )
     .expect("write fixed-release registry");
     lab.advance_upstream("upstream advance\n");
 
     // When: the fixed release is asked to move in place.
-    let output = knives_release(&lab, &home, &["rebase", "main@upstream"]);
+    let output = knives_release(
+        &lab,
+        &home,
+        &[
+            "--consumer",
+            consumer.to_str().expect("utf-8 consumer path"),
+            "rebase",
+            "main@upstream",
+        ],
+    );
 
     // Then: it is incomplete and names the only viable remediation.
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -7255,6 +7317,12 @@ fn a_fixed_scheme_cut_carries_the_local_release_in_hand() {
         ),
     )
     .expect("write fixed-scheme registry");
+    let consumer = tempfile::tempdir().expect("create local consumer");
+    std::fs::write(
+        home.path().join("local-consumer"),
+        consumer.path().display().to_string(),
+    )
+    .expect("write local consumer fixture path");
     let first = knives_release(&lab, &home, &["cut"]);
     assert!(
         Repo::open(&lab.work)
@@ -7282,13 +7350,12 @@ fn a_fixed_scheme_cut_carries_the_local_release_in_hand() {
     let output = knives_release(&lab, &home, &["cut"]);
 
     // Then: the cut ran, and the composition in hand survived it: a fresh
-    // commit whose parents are still both members. This registry lists no
-    // consumers, so pinned-ness is unknown and the run is incomplete — which is
-    // not the cut refusing, so the assertions below hold it to having cut.
+    // commit whose parents are still both members. Its live predecessor differs
+    // under the same fixed name, so reconciliation makes the completed cut a finding.
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_eq!(
         output.status.code(),
-        Some(3),
+        Some(i32::from(knives::cli::Exit::Findings.code())),
         "stdout: {stdout}\nstderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
@@ -7325,6 +7392,12 @@ fn an_edit_refuses_when_the_upstream_trunk_cannot_resolve() {
         ),
     )
     .expect("write broken-trunk registry");
+    let consumer = tempfile::tempdir().expect("create local consumer");
+    std::fs::write(
+        home.path().join("local-consumer"),
+        consumer.path().display().to_string(),
+    )
+    .expect("write local consumer fixture path");
     let before = release_parent_commits(&lab, "release/2026-08-04");
 
     let output = knives_release(&lab, &home, &["include", "feat/alpha"]);
@@ -7746,6 +7819,12 @@ fn a_bare_advance_under_the_fixed_scheme_ignores_the_release_bookmark() {
         ),
     )
     .expect("write fixed-scheme registry");
+    let consumer = tempfile::tempdir().expect("create local consumer");
+    std::fs::write(
+        home.path().join("local-consumer"),
+        consumer.path().display().to_string(),
+    )
+    .expect("write local consumer fixture path");
     let first = knives_release(&lab, &home, &["cut"]);
     let released = Repo::open(&lab.work)
         .expect("open first fixed cut")
@@ -7906,16 +7985,24 @@ fn an_edit_refuses_when_every_pin_of_the_release_is_frozen() {
     std::fs::write(
         home.path().join("repos.toml"),
         format!(
-            "[repos.demo]\npath = \"{}\"\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/work.git\"\nconsumers = [\"{}\"]\n",
+            "[repos.demo]\npath = \"{}\"\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/work.git\"\n",
             lab.work.display(),
             lab.upstream.display(),
-            consumer.display(),
         ),
     )
     .expect("write frozen-pin registry");
     let before = release_parent_commits(&lab, release);
 
-    let output = knives_release(&lab, &home, &["include", "feat/gamma"]);
+    let output = knives_release(
+        &lab,
+        &home,
+        &[
+            "--consumer",
+            consumer.to_str().expect("utf-8 consumer path"),
+            "include",
+            "feat/gamma",
+        ],
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_eq!(output.status.code(), Some(3), "{stdout}");
@@ -8505,43 +8592,6 @@ fn file_at_revision(lab: &Lab, revision: &str, file: &str) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8(output.stdout).expect("utf-8 file content")
-}
-
-#[derive(Clone, Copy)]
-enum ReleaseOutput {
-    Text,
-    Json,
-}
-
-impl ReleaseOutput {
-    const fn flag(self) -> &'static str {
-        match self {
-            Self::Text => "--text",
-            Self::Json => "--json",
-        }
-    }
-}
-
-fn release_command(
-    lab: &Lab,
-    home: &tempfile::TempDir,
-    output: ReleaseOutput,
-    args: &[&str],
-) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_knives"));
-    command.args([output.flag(), "release", "--repo", "demo"]);
-    command.args(args);
-    command
-        .current_dir(&lab.work)
-        .env("KNIVES_CONFIG_HOME", home.path());
-    command
-}
-
-/// Run the knives binary's release command for the `demo` repo in `lab`.
-fn knives_release(lab: &Lab, home: &tempfile::TempDir, args: &[&str]) -> std::process::Output {
-    release_command(lab, home, ReleaseOutput::Text, args)
-        .output()
-        .expect("run knives release")
 }
 
 /// Publish an origin bookmark from the second clone, then fetch it into `work`.
@@ -9544,427 +9594,4 @@ fn pr_timeline_renders_force_pushes_with_both_tree_oids_through_the_real_binary(
     assert!(stdout.contains("force-push"), "stdout: {stdout}");
     assert!(stdout.contains("tree bbbbbbbbbbbb"), "stdout: {stdout}");
     assert!(stdout.contains("tree dddddddddddd"), "stdout: {stdout}");
-}
-
-/// Registry home for commands that reconcile the lab's live bare remotes.
-fn mutation_test_home(lab: &Lab, release: Option<&std::path::Path>) -> tempfile::TempDir {
-    let home = tempfile::tempdir().expect("create config home");
-    let release = release.map_or_else(String::new, |path| {
-        format!("release = \"{}\"\n", path.display())
-    });
-    std::fs::write(
-        home.path().join("repos.toml"),
-        format!(
-            "[repos.demo]\npath = \"{}\"\nupstream = \"{}\"\norigin = \"{}\"\n{release}",
-            lab.work.display(),
-            lab.upstream.display(),
-            lab.temp_origin().display(),
-        ),
-    )
-    .expect("write registry");
-    home
-}
-
-/// Run the reconciliation command against the lab's registry entry.
-fn knives_pushed(lab: &Lab, home: &tempfile::TempDir, args: &[&str]) -> std::process::Output {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_knives"));
-    command.args(["--json", "pushed"]);
-    command.args(args);
-    command
-        .current_dir(&lab.work)
-        .env("KNIVES_CONFIG_HOME", home.path())
-        .env("KNIVES_OWNER", "test-owner")
-        .output()
-        .expect("run knives pushed")
-}
-
-#[test]
-fn pushed_confirms_a_pushed_branch_and_flags_an_unpushed_one() {
-    // Given: alpha reached the live origin and beta exists only in the checkout.
-    let lab = Lab::new();
-    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
-    lab.branch("feat/beta", "beta.txt", "beta\n");
-    lab.push_branch("feat/alpha");
-    let home = mutation_test_home(&lab, None);
-
-    // When: every local bookmark is reconciled against its owning remote.
-    let output = knives_pushed(&lab, &home, &["--repo", "demo"]);
-
-    // Then: the missing beta ref is a finding while alpha is confirmed live.
-    assert_eq!(
-        output.status.code(),
-        Some(i32::from(knives::cli::Exit::Findings.code())),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let report: serde_json::Value =
-        serde_json::from_slice(&output.stdout).expect("pushed emits JSON");
-    let rows = report["rows"].as_array().expect("rows");
-    let alpha = rows
-        .iter()
-        .find(|row| row["branch"] == "feat/alpha")
-        .expect("alpha row");
-    let beta = rows
-        .iter()
-        .find(|row| row["branch"] == "feat/beta")
-        .expect("beta row");
-    assert_eq!(alpha["verdicts"][0]["verdict"], "in-sync");
-    assert_eq!(beta["verdicts"][0]["verdict"], "not-on-remote");
-    assert_eq!(beta["verdicts"][0]["remote"], "origin");
-}
-
-#[test]
-fn pushed_catches_the_no_op_delete() {
-    // Given: alpha was pushed before its local bookmark was removed.
-    let lab = Lab::new();
-    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
-    lab.push_branch("feat/alpha");
-    lab.jj_work(["bookmark", "delete", "feat/alpha"]);
-    let home = mutation_test_home(&lab, None);
-
-    // When: the named, now-local-absent branch is reconciled.
-    let output = knives_pushed(&lab, &home, &["feat/alpha", "--repo", "demo"]);
-
-    // Then: the live ref is reported rather than silently accepting the delete.
-    assert_eq!(
-        output.status.code(),
-        Some(i32::from(knives::cli::Exit::Findings.code())),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let report: serde_json::Value =
-        serde_json::from_slice(&output.stdout).expect("pushed emits JSON");
-    let row = report["rows"][0].as_object().expect("one row");
-    assert!(row.get("local").is_none(), "was: {row:?}");
-    assert_eq!(row["verdicts"][0]["verdict"], "remote-only");
-    assert_eq!(row["verdicts"][0]["remote"], "origin");
-}
-
-#[test]
-fn pushed_compares_a_tracked_pull_head() {
-    // Given: alpha's tracked pull ref still names the older trunk commit.
-    let lab = Lab::new();
-    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
-    lab.push_branch("feat/alpha");
-    let trunk = Repo::open(&lab.work)
-        .expect("open lab")
-        .resolve_commit("main@origin")
-        .expect("resolve trunk");
-    let status = Command::new("git")
-        .args(["update-ref", "refs/pull/7/head", trunk.as_str()])
-        .current_dir(lab.temp_origin())
-        .status()
-        .expect("write pull fixture");
-    assert!(status.success(), "write pull fixture");
-    let home = mutation_test_home(&lab, None);
-    let tracked = Command::new(env!("CARGO_BIN_EXE_knives"))
-        .args([
-            "--text",
-            "track",
-            "feat/alpha",
-            "--pr",
-            "7",
-            "--repo",
-            "demo",
-        ])
-        .current_dir(&lab.work)
-        .env("KNIVES_CONFIG_HOME", home.path())
-        .env("KNIVES_OWNER", "test-owner")
-        .output()
-        .expect("track pull");
-    assert!(
-        tracked.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&tracked.stderr)
-    );
-
-    // When: pushed compares the stated pull head from origin.
-    let output = knives_pushed(&lab, &home, &["feat/alpha", "--repo", "demo"]);
-
-    // Then: the independent pull-head mismatch is surfaced.
-    assert_eq!(
-        output.status.code(),
-        Some(i32::from(knives::cli::Exit::Findings.code())),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let report: serde_json::Value =
-        serde_json::from_slice(&output.stdout).expect("pushed emits JSON");
-    let verdicts = report["rows"][0]["verdicts"].as_array().expect("verdicts");
-    assert!(
-        verdicts
-            .iter()
-            .any(|verdict| verdict["verdict"] == "pull-head-differs" && verdict["number"] == 7),
-        "was: {verdicts:?}"
-    );
-}
-
-#[test]
-fn pushed_partitions_release_names_to_the_release_remote() {
-    // Given: the release and origin roles point at separate bare remotes.
-    let lab = Lab::new();
-    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
-    lab.branch("release/2026-08-04", "release.txt", "release\n");
-    lab.push_branch("feat/alpha");
-    let home = tempfile::tempdir().expect("create release remote home");
-    let release = home.path().join("release.git");
-    let status = Command::new("git")
-        .args(["init", "--bare", release.to_str().expect("utf-8 path")])
-        .status()
-        .expect("create release remote");
-    assert!(status.success(), "create release remote");
-    lab.jj_work([
-        "git",
-        "remote",
-        "add",
-        "release",
-        release.to_str().expect("utf-8 path"),
-    ]);
-    lab.jj_work([
-        "git",
-        "push",
-        "--remote",
-        "release",
-        "--bookmark",
-        "release/2026-08-04",
-    ]);
-    let config = mutation_test_home(&lab, Some(&release));
-
-    // When: both roles contain only the ref class they own.
-    let synced = knives_pushed(&lab, &config, &["--repo", "demo"]);
-
-    // Then: cross-remote absence is topology, so both refs are in sync.
-    assert!(
-        synced.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&synced.stderr)
-    );
-    let report: serde_json::Value =
-        serde_json::from_slice(&synced.stdout).expect("pushed emits JSON");
-    for branch in ["feat/alpha", "release/2026-08-04"] {
-        let row = report["rows"]
-            .as_array()
-            .expect("rows")
-            .iter()
-            .find(|row| row["branch"] == branch)
-            .expect("row");
-        assert_eq!(row["verdicts"][0]["verdict"], "in-sync", "row: {row}");
-    }
-
-    // When: the release remote moves its release ref to a different live commit.
-    let trunk = Repo::open(&lab.work)
-        .expect("open lab")
-        .resolve_commit("main@origin")
-        .expect("resolve trunk");
-    let status = Command::new("git")
-        .args([
-            "update-ref",
-            "refs/heads/release/2026-08-04",
-            trunk.as_str(),
-        ])
-        .current_dir(&release)
-        .status()
-        .expect("move release ref");
-    assert!(status.success(), "move release ref");
-    let drifted = knives_pushed(&lab, &config, &["release/2026-08-04", "--repo", "demo"]);
-
-    // Then: only its owner role names the mismatch.
-    assert_eq!(
-        drifted.status.code(),
-        Some(i32::from(knives::cli::Exit::Findings.code())),
-        "stderr: {}",
-        String::from_utf8_lossy(&drifted.stderr)
-    );
-    let report: serde_json::Value =
-        serde_json::from_slice(&drifted.stdout).expect("pushed emits JSON");
-    assert_eq!(report["rows"][0]["verdicts"][0]["verdict"], "differs");
-    assert_eq!(report["rows"][0]["verdicts"][0]["remote"], "release");
-}
-
-/// Run estate reconciliation against the lab's registry entry.
-fn knives_audit(lab: &Lab, home: &tempfile::TempDir, args: &[&str]) -> std::process::Output {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_knives"));
-    command.args(["--json", "audit"]);
-    command.args(args);
-    command
-        .current_dir(&lab.work)
-        .env("KNIVES_CONFIG_HOME", home.path())
-        .env("KNIVES_OWNER", "test-owner")
-        .output()
-        .expect("run knives audit")
-}
-
-#[test]
-fn audit_reports_zombie_drift_and_anonymous_heads() {
-    // Given: one locally rewritten pushed branch, one remote-only branch, and
-    // a described anonymous head no workspace currently holds.
-    let lab = Lab::new();
-    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
-    lab.branch("feat/zombie", "zombie.txt", "zombie\n");
-    lab.push_branch("feat/alpha");
-    lab.push_branch("feat/zombie");
-    lab.rewrite_local_branch("feat/alpha", "locally moved\n");
-    lab.jj_work(["bookmark", "delete", "feat/zombie"]);
-    lab.jj_work(["new", "main@origin", "-m", "stranded"]);
-    lab.jj_work(["new", "main@origin"]);
-    let home = mutation_test_home(&lab, None);
-
-    // When: audit runs without a forge session.
-    let output = knives_audit(&lab, &home, &["demo", "--no-github"]);
-
-    // Then: each independently recoverable estate fact remains a separate
-    // finding, while the skipped pull-head reconciliation makes the result incomplete.
-    assert_eq!(
-        output.status.code(),
-        Some(i32::from(knives::cli::Exit::Incomplete.code())),
-        "stdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let report: serde_json::Value =
-        serde_json::from_slice(&output.stdout).expect("audit emits JSON");
-    let kinds = report["findings"]
-        .as_array()
-        .expect("findings")
-        .iter()
-        .map(|finding| finding["kind"].as_str().expect("finding kind"))
-        .collect::<Vec<_>>();
-    for expected in ["remote-drift", "zombie-branch", "orphan-commit"] {
-        assert!(kinds.contains(&expected), "missing {expected}: {report}");
-    }
-}
-
-#[test]
-fn audit_does_not_treat_a_shared_release_url_as_a_separate_zombie_remote() {
-    // Given: release is configured to the same remote as origin, where alpha
-    // remains after its local bookmark is deleted.
-    let lab = Lab::new();
-    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
-    lab.push_branch("feat/alpha");
-    lab.jj_work(["bookmark", "delete", "feat/alpha"]);
-    let release = lab.temp_origin();
-    let home = mutation_test_home(&lab, Some(&release));
-
-    // When: audit classifies the one shared remote.
-    let output = knives_audit(&lab, &home, &["demo", "--no-github"]);
-
-    // Then: origin's missing bookmark is a zombie once, never a second release
-    // zombie; skipped pull-head reconciliation makes the result incomplete.
-    assert_eq!(
-        output.status.code(),
-        Some(i32::from(knives::cli::Exit::Incomplete.code())),
-        "stdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let report: serde_json::Value =
-        serde_json::from_slice(&output.stdout).expect("audit emits JSON");
-    let zombies = report["findings"]
-        .as_array()
-        .expect("findings")
-        .iter()
-        .filter(|finding| finding["kind"] == "zombie-branch")
-        .collect::<Vec<_>>();
-    assert_eq!(zombies.len(), 1, "was: {report}");
-    assert!(
-        zombies[0]["detail"]
-            .as_str()
-            .is_some_and(|detail| detail.starts_with("origin has feat/alpha")),
-        "was: {zombies:?}"
-    );
-}
-
-#[test]
-fn audit_reports_release_drift_from_the_recorded_cut() {
-    // Given: a cut records its created commit, then its bookmark moves sideways.
-    let lab = Lab::new();
-    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
-    let home = mutation_test_home(&lab, None);
-    let cut = Command::new(env!("CARGO_BIN_EXE_knives"))
-        .args([
-            "--text",
-            "release",
-            "--repo",
-            "demo",
-            "cut",
-            "release/2026-08-04",
-        ])
-        .current_dir(&lab.work)
-        .env("KNIVES_CONFIG_HOME", home.path())
-        .env("KNIVES_OWNER", "test-owner")
-        .output()
-        .expect("cut release");
-    assert!(
-        cut.status.success(),
-        "stdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&cut.stdout),
-        String::from_utf8_lossy(&cut.stderr)
-    );
-    knives::jj::set_bookmark_anywhere(&lab.work, "release/2026-08-04", "feat/alpha")
-        .expect("move local release sideways");
-    lab.jj_work(["workspace", "update-stale"]);
-
-    // When: audit compares the release's current tip to its newest record.
-    let output = knives_audit(&lab, &home, &["demo", "--no-github"]);
-
-    // Then: the recorded cut disagreement remains a content finding, but the
-    // skipped pull-head reconciliation prevents a completed result.
-    assert_eq!(
-        output.status.code(),
-        Some(i32::from(knives::cli::Exit::Incomplete.code())),
-        "stdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let report: serde_json::Value =
-        serde_json::from_slice(&output.stdout).expect("audit emits JSON");
-    assert!(
-        report["findings"]
-            .as_array()
-            .expect("findings")
-            .iter()
-            .any(|finding| finding["kind"] == "release-drift"),
-        "was: {report}"
-    );
-}
-
-#[test]
-fn audit_with_no_github_still_reconciles() {
-    // Given: a local-only branch and no forge transport.
-    let lab = Lab::new();
-    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
-    let home = mutation_test_home(&lab, None);
-
-    // When: the optional forge check is disabled.
-    let output = knives_audit(&lab, &home, &["demo", "--no-github"]);
-
-    // Then: local reconciliation still reports its remote fact, while the
-    // skipped open-pull reconciliation is an unanswered question.
-    assert_eq!(
-        output.status.code(),
-        Some(i32::from(knives::cli::Exit::Incomplete.code())),
-        "stdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let report: serde_json::Value =
-        serde_json::from_slice(&output.stdout).expect("audit emits JSON");
-    assert!(
-        report["findings"]
-            .as_array()
-            .expect("findings")
-            .iter()
-            .any(|finding| finding["kind"] == "remote-drift"),
-        "was: {report}"
-    );
-    assert!(
-        report["problems"]
-            .as_array()
-            .expect("problems")
-            .iter()
-            .any(|problem| problem
-                .as_str()
-                .is_some_and(|problem| problem.contains("pull-head reconciliation was skipped"))),
-        "was: {report}"
-    );
 }

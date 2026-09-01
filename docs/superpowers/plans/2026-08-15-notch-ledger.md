@@ -34,7 +34,7 @@ _Revised 2026-08-16 (spec §1.2 "Storage (revised 2026-08-16)", Task 11): the st
 - **`--repo <name>` on both moods**, "matching the existing convention ('takes its repo from where you stand, name one when you are somewhere else')".
 - **Output:** "JSON by default for agents, prose for humans, exactly as every other command (`--json` / `--text`)."
 - **Exit codes:** "0 fine, 2 usage, 3 when the ledger file exists but cannot be read."
-- **Status breadcrumb:** "JSON: `last_notch: {ts, kind, text}` (absent when the subject has none). Text: one truncated token at the end of the branch line, e.g. `"superseded by #1157…" (3d)`. One token, nothing else."
+- **Status breadcrumb:** "JSON: `notch: {ts, kind, text}` (absent when the subject has none). Text: one truncated token at the end of the branch line, e.g. `"superseded by #1157…" (3d)`. One token, nothing else."
 - **No hook injection.** "Reading the ledger is intentional. The OpenCode plugin does not change." Nothing under `plugin/`, `omp/` or `hooks/` is touched by this PR.
 - **Out of scope, and absent from every task below:** unowned-release-content detection at cut time; pin-vs-tip equality per fork; release ref integrity; status text legibility; ledger backup/sync; hook injection of ledger content; per-PR promise-thread tracking against the forge.
 
@@ -68,7 +68,7 @@ _(empty at the start; the coordinator records hardening findings here as they ar
 | `src/commands/claim.rs` (modify) | Auto-events in `run_claim` and `run_release`. |
 | `src/commands/start.rs` (modify) | Auto-event in `run`. |
 | `src/commands/sync.rs` (modify) | `sync_repo` takes a `&Scribe` and records each transition. |
-| `src/commands/status.rs` (modify) | `LastNotch`, `BranchRow::last_notch`, `Options::ledger`, `notches_from_ledger`, `notch_cell`, `add_releases`, `gather`, `DivergentInput`/`divergent_rows`, `branch_table`. |
+| `src/commands/status.rs` (modify) | `LastNotch`, `BranchRow::notch`, `Options::ledger`, `notches_from_ledger`, `notch_cell`, `add_releases`, `gather`, `DivergentInput`/`divergent_rows`, `branch_table`. |
 | `tests/notch_command.rs` (new) | The command through the real binary: both output modes, `--repo` from outside, exit codes. |
 | `tests/jj_integration.rs` (modify) | Auto-events fire with the right subject, owner and anchor; the status breadcrumb end to end. |
 | `skills/fork-work/SKILL.md`, `skills/using-knives/SKILL.md`, `skills/pr-preflight/SKILL.md`, `README.md`, `docs/design.md` (modify) | Agents are told to read and write notches, and the past-tense-only doctrine is written down. |
@@ -77,7 +77,7 @@ _(empty at the start; the coordinator records hardening findings here as they ar
 
 PR 2 (`docs/superpowers/plans/2026-08-15-status-speed.md`) also changes this file. **This PR merges first.** The complete list of what this PR touches there, so PR 2's rebase is mechanical:
 
-- `struct BranchRow` — one field added (`last_notch`).
+- `struct BranchRow` — one field added (`notch`).
 - `BranchRow::bare` — one field initialised.
 - `struct Options` — one field added (`ledger`).
 - `struct LastNotch` — new.
@@ -89,7 +89,7 @@ PR 2 (`docs/superpowers/plans/2026-08-15-status-speed.md`) also changes this fil
 - `fn branch_table` — eight columns become nine.
 - `mod tests` — `branch_rows_render_as_an_aligned_table_with_a_header` and `an_empty_cell_never_shifts_its_neighbours` learn the ninth column; new breadcrumb tests.
 
-The overlap with PR 2 is `fn gather` and `struct Options`. PR 2 adds a different field to `Options` and moves work out of `gather`'s loop while keeping the `last_notch` line this PR puts in the `BranchRow` literal.
+The overlap with PR 2 is `fn gather` and `struct Options`. PR 2 adds a different field to `Options` and moves work out of `gather`'s loop while keeping the `notch` line this PR puts in the `BranchRow` literal.
 
 ### Task dependencies
 
@@ -2689,7 +2689,7 @@ Expected: PASS.
 
 ### Task 9: The status breadcrumb
 
-_**Storage note (2026-08-16).** Task 11 swapped the ledger to one markdown file per entry before this task runs. The snippets below still execute — `Ledger::at` takes any path, which is now a directory — but adjust the fixtures while implementing: drop the `.jsonl` suffix from every ledger path (`demo.jsonl` → `demo`, `a-repo.jsonl` → `a-repo`), and build the corrupt-ledger fixture as a garbage entry file inside the ledger directory — `std::fs::create_dir_all(&path)` then `std::fs::write(path.join("20260815T221403.000000000Z-0000.md"), "not a ledger entry at all\n")` — the exact shape Task 11 Step 6 gives `tests/notch_command.rs`. The `last_notch` surface this task builds is unchanged._
+_**Storage note (2026-08-16).** Task 11 swapped the ledger to one markdown file per entry before this task runs. The snippets below still execute — `Ledger::at` takes any path, which is now a directory — but adjust the fixtures while implementing: drop the `.jsonl` suffix from every ledger path (`demo.jsonl` → `demo`, `a-repo.jsonl` → `a-repo`), and build the corrupt-ledger fixture as a garbage entry file inside the ledger directory — `std::fs::create_dir_all(&path)` then `std::fs::write(path.join("20260815T221403.000000000Z-0000.md"), "not a ledger entry at all\n")` — the exact shape Task 11 Step 6 gives `tests/notch_command.rs`. The `notch` surface this task builds is unchanged._
 
 **Files:**
 - Modify: `src/commands/status.rs`
@@ -2700,7 +2700,7 @@ _**Storage note (2026-08-16).** Task 11 swapped the ledger to one markdown file 
 - Consumes: `Ledger`, `Entry`, `Kind`, `newest_for`, `age` (Tasks 1–2).
 - Produces:
   - `pub struct LastNotch { pub ts: String, pub kind: crate::ledger::Kind, pub text: String }` with `fn of(entry: &Entry) -> Self`
-  - `BranchRow::last_notch: Option<LastNotch>`
+  - `BranchRow::notch: Option<LastNotch>`
   - `Options::ledger: Option<&'a Ledger>`
   - `fn notches_from_ledger(ledger: Option<&Ledger>, report: &mut Report) -> Vec<Entry>`
   - `fn notch_cell(row: &BranchRow) -> String`, `const NOTCH_TEXT: usize = 32`
@@ -2715,7 +2715,7 @@ _**Storage note (2026-08-16).** Task 11 swapped the ledger to one markdown file 
         // Status text is already dense: the breadcrumb is one token, and its
         // legibility overhaul is separate work.
         let mut row = row("feat/log-queue", None, None);
-        row.last_notch = Some(LastNotch {
+        row.notch = Some(LastNotch {
             ts: jiff::Timestamp::now().to_string(),
             kind: crate::ledger::Kind::Note,
             text: "superseded by #1157".to_owned(),
@@ -2734,7 +2734,7 @@ _**Storage note (2026-08-16).** Task 11 swapped the ledger to one markdown file 
         // An entry's text is free prose that may run to a paragraph and may carry
         // newlines. One stray newline destroys every column below it.
         let mut row = row("feat/alpha", None, None);
-        row.last_notch = Some(LastNotch {
+        row.notch = Some(LastNotch {
             ts: jiff::Timestamp::now().to_string(),
             kind: crate::ledger::Kind::Note,
             text: "parked by the owner\nuntil the trait lands upstream, which may be weeks"
@@ -2837,7 +2837,7 @@ fn status_carries_each_branchs_newest_notch_in_json_and_in_text() {
         .iter()
         .find(|row| row.name.as_str() == "feat/alpha")
         .expect("the branch has a row");
-    let last = alpha.last_notch.as_ref().expect("a breadcrumb");
+    let last = alpha.notch.as_ref().expect("a breadcrumb");
     assert_eq!(last.text, "claim released; superseded by feat/next");
     assert_eq!(last.kind, knives::ledger::Kind::Event);
 
@@ -2848,9 +2848,9 @@ fn status_carries_each_branchs_newest_notch_in_json_and_in_text() {
         .iter()
         .find(|row| row["name"] == "feat/alpha")
         .expect("row");
-    assert_eq!(row["last_notch"]["kind"], "event");
-    assert_eq!(row["last_notch"]["text"], "claim released; superseded by feat/next");
-    assert!(row["last_notch"]["ts"].is_string());
+    assert_eq!(row["notch"]["kind"], "event");
+    assert_eq!(row["notch"]["text"], "claim released; superseded by feat/next");
+    assert!(row["notch"]["ts"].is_string());
 
     // And: the branch line carries one token for it
     let text = status::render(&report, false);
@@ -2864,7 +2864,7 @@ fn status_carries_each_branchs_newest_notch_in_json_and_in_text() {
 - [ ] **Step 2: Run to verify failure**
 
 Run: `cargo test --lib status:: && cargo test --test jj_integration status_carries_each_branchs`
-Expected: FAIL to compile — `BranchRow` has no field `last_notch`, `Options` has no field `ledger`, `LastNotch` and `notches_from_ledger` do not exist.
+Expected: FAIL to compile — `BranchRow` has no field `notch`, `Options` has no field `ledger`, `LastNotch` and `notches_from_ledger` do not exist.
 
 - [ ] **Step 3: Add the types and the row field** in `src/commands/status.rs`. Add `use crate::ledger::{Entry as Notch, Ledger, newest_for};` to the imports. Add to `struct BranchRow`, after `stated_pull`:
 
@@ -2875,10 +2875,10 @@ Expected: FAIL to compile — `BranchRow` has no field `last_notch`, `Options` h
     /// a reader running one more command and a reader concluding a branch was
     /// never explained.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_notch: Option<LastNotch>,
+    pub notch: Option<LastNotch>,
 ```
 
-Add `last_notch: None,` to `BranchRow::bare`'s literal, and after the `StatedPull` struct:
+Add `notch: None,` to `BranchRow::bare`'s literal, and after the `StatedPull` struct:
 
 ```rust
 /// The part of a ledger entry a branch row carries.
@@ -2982,10 +2982,10 @@ Compute the breadcrumb before the row literal, because that literal's first fiel
 immediately above `report.branches.push(BranchRow {`:
 
 ```rust
-        let last_notch = newest_for(&notches, branch.as_str()).map(LastNotch::of);
+        let notch = newest_for(&notches, branch.as_str()).map(LastNotch::of);
 ```
 
-and add the field `last_notch,` to that literal, after `stated_pull,`. Then add
+and add the field `notch,` to that literal, after `stated_pull,`. Then add
 `notches: &notches,` to the `DivergentInput { ... }` literal.
 
 - [ ] **Step 6: Give divergent rows their breadcrumb too.** Add to `struct DivergentInput`:
@@ -2997,7 +2997,7 @@ and add the field `last_notch,` to that literal, after `stated_pull,`. Then add
 and in `divergent_rows`'s `BranchRow { ... }` literal, before the `..BranchRow::bare(branch, None)` line:
 
 ```rust
-            last_notch: newest_for(input.notches, branch.as_str()).map(LastNotch::of),
+            notch: newest_for(input.notches, branch.as_str()).map(LastNotch::of),
 ```
 
 - [ ] **Step 7: Add the cell and the ninth column.** After `fn flags_cell`, add:
@@ -3012,7 +3012,7 @@ const NOTCH_TEXT: usize = 32;
 /// may run to a paragraph and may contain newlines, and this is a table cell: one
 /// stray newline destroys every column below it.
 fn notch_cell(row: &BranchRow) -> String {
-    let Some(notch) = &row.last_notch else {
+    let Some(notch) = &row.notch else {
         return "-".to_owned();
     };
     let collapsed = notch.text.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -3274,7 +3274,7 @@ into a session: reading the ledger is intentional, and that is the point.
 
 #### In `knives status`
 
-Each branch row carries its newest entry. In JSON that is `last_notch: {ts, kind, text}`,
+Each branch row carries its newest entry. In JSON that is `notch: {ts, kind, text}`,
 absent when the branch has none; in text it is one truncated token at the end of the line,
 `"superseded by #1157…" (3d)`. It is a local file read, so it costs nothing.
 
@@ -4369,12 +4369,12 @@ Run against the spec after every task is complete.
 | 1.2 storage (revised 2026-08-16): one markdown file per entry, TOML frontmatter between `+++` fences, atomic `create_new` with loud collision, no lockfile, lexicographic filename chronology, unparseable entry file loud, unknown keys ignored, ~300 bytes and no rotation | T11 |
 | 1.3 auto-events: start/claim, finish/release-claim with `--superseded-by`, track's three moods, depends, release cut's parent set, sync's transitions; append failure fails loudly | T5, T6, T7, T8 |
 | 1.4 the command: write form, read form, bare last-20, subject chronology, `--pr`, `--repo` both moods, JSON/text, exit 0/2/3 | T4 |
-| 1.5 breadcrumb: `last_notch` in JSON, one token in text, no added runtime | T9 |
+| 1.5 breadcrumb: `notch` in JSON, one token in text, no added runtime | T9 |
 | 1.6 skills and docs: fork-work, using-knives, pr-preflight, README, design's past-tense doctrine | T10 |
 | 1.7 tests: ledger unit tests (round trip, filters, lock contention — both a held lock and two concurrent appenders proving no lost or interleaved line, unknown fields, missing anchor) | T1, T2 *(lock-contention rows superseded 2026-08-16 → the create_new concurrency test in T11)* |
 | 1.7 tests: integration per auto-event with subject, owner and anchor; release cut's parent set; sync via a fake forge | T5, T6, T7, T8 |
 | 1.7 tests: CLI both modes, `--repo` from outside, exit codes | T4 |
-| 1.7 tests: status `last_notch` in JSON, one-token text, absent cleanly | T9 |
+| 1.7 tests: status `notch` in JSON, one-token text, absent cleanly | T9 |
 
 **Out of scope, and absent:** no task detects unowned release content, compares pins to tips, checks release ref integrity, restyles status text, syncs or backs up the ledger, injects ledger content through a hook, or tracks promise threads against the forge.
 
@@ -4382,7 +4382,7 @@ Run against the spec after every task is complete.
 
 **Placeholders:** none. Every code step carries the code, every run step carries the command and the expected result, and the two spec ambiguities are resolved in Task 4's preamble rather than deferred.
 
-**Type consistency:** `Ledger::at`/`for_repo`/`append`/`entries`/`path`, `Entry`'s eight fields, `Kind::{Event, Note}`, `LedgerError`'s six variants, `Filter`'s three fields, `select`'s `(Vec<&Entry>, usize)`, `newest_for`, `age(&str, Timestamp) -> Option<String>`, `Scribe::{new, repo, record, event}`, `Draft`'s five fields, `notch::{Request, Report, read, render, run}`, `LastNotch::{ts, kind, text}` and `LastNotch::of`, `Options::ledger`, `BranchRow::last_notch`, `notches_from_ledger`, `notch_cell`, `NOTCH_TEXT`, `add_releases`, `scribe_for`, `transition_text`, `spoken`, and `sync_repo`'s five parameters are spelled identically everywhere they appear above.
+**Type consistency:** `Ledger::at`/`for_repo`/`append`/`entries`/`path`, `Entry`'s eight fields, `Kind::{Event, Note}`, `LedgerError`'s six variants, `Filter`'s three fields, `select`'s `(Vec<&Entry>, usize)`, `newest_for`, `age(&str, Timestamp) -> Option<String>`, `Scribe::{new, repo, record, event}`, `Draft`'s five fields, `notch::{Request, Report, read, render, run}`, `LastNotch::{ts, kind, text}` and `LastNotch::of`, `Options::ledger`, `BranchRow::notch`, `notches_from_ledger`, `notch_cell`, `NOTCH_TEXT`, `add_releases`, `scribe_for`, `transition_text`, `spoken`, and `sync_repo`'s five parameters are spelled identically everywhere they appear above.
 
 ## Live-dogfood addendum (2026-08-16)
 

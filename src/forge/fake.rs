@@ -6,11 +6,14 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::{
-    ChecksSummary, Forge, ForgeError, PullDetails, PullFacts, PullRequest, PullSummary,
-    RepoIdentity, SweepEntry, SweepPage, TimelineEvent,
+    ChecksSummary, ConsumerHead, Forge, ForgeError, PullDetails, PullFacts, PullRequest,
+    PullSummary, RepoIdentity, SweepEntry, SweepPage, TimelineEvent,
 };
+use crate::consumer_pins::ConsumerPinSource;
 use crate::ids::BranchName;
 /// Facts supplied directly, for tests.
 ///
@@ -36,6 +39,12 @@ pub struct FakeForge {
     pub fail_timeline: bool,
     /// Sweep reports a continuation past page 1 (overflow → cold reseed).
     pub sweep_overflows: bool,
+    pub heads: BTreeMap<String, ConsumerHead>,
+    pub files: BTreeMap<(String, String, String), String>,
+    pub fail_consumer_head: bool,
+    pub fail_file_at: bool,
+    pub consumer_head_calls: Arc<AtomicUsize>,
+    pub file_calls: Arc<AtomicUsize>,
 }
 
 fn fake_failure(operation: &str) -> ForgeError {
@@ -58,9 +67,9 @@ const fn vanished_pull(number: u64, state: String) -> PullRequest {
         is_draft: false,
         url: String::new(),
         head_repository_owner: None,
-        mergeable: String::new(),
-        merge_state_status: String::new(),
-        base_ref_name: String::new(),
+        mergeable: Some(String::new()),
+        merge_state_status: Some(String::new()),
+        base_ref_name: Some(String::new()),
         merge_commit: None,
     }
 }
@@ -165,6 +174,38 @@ impl Forge for FakeForge {
             return Err(fake_failure("timeline"));
         }
         Ok(self.timeline.get(&number).cloned().unwrap_or_default())
+    }
+}
+
+impl ConsumerPinSource for FakeForge {
+    fn consumer_head(&self, _repo: &Path, slug: &str) -> Result<ConsumerHead, ForgeError> {
+        self.consumer_head_calls.fetch_add(1, Ordering::SeqCst);
+        if self.fail_consumer_head {
+            return Err(fake_failure("consumer head"));
+        }
+        self.heads
+            .get(slug)
+            .cloned()
+            .ok_or_else(|| ForgeError::Query {
+                detail: format!("fake consumer head not configured for {slug}"),
+            })
+    }
+
+    fn file_at(
+        &self,
+        _repo: &Path,
+        slug: &str,
+        commit: &str,
+        path: &str,
+    ) -> Result<Option<String>, ForgeError> {
+        self.file_calls.fetch_add(1, Ordering::SeqCst);
+        if self.fail_file_at {
+            return Err(fake_failure("consumer file"));
+        }
+        Ok(self
+            .files
+            .get(&(slug.to_owned(), commit.to_owned(), path.to_owned()))
+            .cloned())
     }
 }
 

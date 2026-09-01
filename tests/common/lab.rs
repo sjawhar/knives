@@ -305,19 +305,6 @@ impl Lab {
         consumer
     }
 
-    pub(crate) fn reset_consumer_to_origin(&self, consumer: &Path) {
-        let origin_trunk = format!("origin/{}", self.trunk);
-        git(
-            consumer,
-            &self.trunk,
-            ["reset", "--hard", origin_trunk.as_str()],
-        );
-    }
-
-    pub(crate) fn rename_consumer_remote(&self, consumer: &Path, from: &str, to: &str) {
-        git(consumer, &self.trunk, ["remote", "rename", from, to]);
-    }
-
     pub(crate) fn octopus(&self, name: &str, first: &str, second: &str) {
         let origin_trunk = format!("{}@origin", self.trunk);
         jj(
@@ -404,6 +391,111 @@ impl Lab {
         }
     }
 }
+/// A registry entry for the lab's work checkout, which stands in for origin.
+pub fn lab_entry(lab: &Lab) -> knives::config::RepoEntry {
+    knives::config::RepoEntry {
+        path: lab.work.clone(),
+        upstream: lab.upstream.display().to_string(),
+        origin: lab.work.display().to_string(),
+        base: None,
+        release: None,
+        release_branch: None,
+        test_count_command: None,
+        consumers: Vec::new(),
+    }
+}
+/// Registry home plus a local consumer for release tests. The registry deliberately
+/// keeps no local consumer path: command helpers supply this checkout via
+/// `--consumer`, as production callers must.
+pub fn release_test_home(lab: &Lab) -> (tempfile::TempDir, std::path::PathBuf) {
+    let consumer = lab.consumer_with_pin_history(
+        "pyproject.toml",
+        "work = { git = \"https://forge.invalid/acme/work.git\", branch = \"release/2026-08-03\" }\n",
+        "work = { git = \"https://forge.invalid/acme/work.git\", branch = \"release/2026-08-04\" }\n",
+    );
+    let home = tempfile::tempdir().expect("create config home");
+    std::fs::write(
+        home.path().join("repos.toml"),
+        format!(
+            "[repos.demo]\npath = \"{}\"\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/work.git\"\n",
+            lab.work.display(),
+            lab.upstream.display(),
+        ),
+    )
+    .expect("write registry");
+    std::fs::write(
+        home.path().join("local-consumer"),
+        consumer.display().to_string(),
+    )
+    .expect("write local consumer fixture path");
+    (home, consumer)
+}
+/// Operation ids in the shared op log, newest first.
+pub fn operation_ids(repo: &std::path::Path) -> Vec<String> {
+    let output = Command::new("jj")
+        .args([
+            "--ignore-working-copy",
+            "op",
+            "log",
+            "--no-graph",
+            "-T",
+            "id ++ \"\\n\"",
+        ])
+        .current_dir(repo)
+        .env("JJ_CONFIG", "/dev/null")
+        .env("JJ_USER", "Knives Lab")
+        .env("JJ_EMAIL", "knives-lab@example.test")
+        .output()
+        .expect("read op log");
+    assert!(output.status.success(), "read op log");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+#[derive(Clone, Copy)]
+pub enum ReleaseOutput {
+    Text,
+    Json,
+}
+
+impl ReleaseOutput {
+    const fn flag(self) -> &'static str {
+        match self {
+            Self::Text => "--text",
+            Self::Json => "--json",
+        }
+    }
+}
+
+pub fn release_command(
+    lab: &Lab,
+    home: &tempfile::TempDir,
+    output: ReleaseOutput,
+    args: &[&str],
+) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_knives"));
+    command.args([output.flag(), "release", "--repo", "demo"]);
+    let local_consumer = home.path().join("local-consumer");
+    if local_consumer.exists() {
+        let consumer =
+            std::fs::read_to_string(&local_consumer).expect("read local consumer fixture path");
+        command.args(["--consumer", consumer.trim()]);
+    }
+    command.args(args);
+    command
+        .current_dir(&lab.work)
+        .env("KNIVES_CONFIG_HOME", home.path());
+    command
+}
+
+/// Run the knives binary's release command for the `demo` repo in `lab`.
+pub fn knives_release(lab: &Lab, home: &tempfile::TempDir, args: &[&str]) -> std::process::Output {
+    release_command(lab, home, ReleaseOutput::Text, args)
+        .output()
+        .expect("run knives release")
+}
 
 fn git<const N: usize>(directory: &Path, trunk: &str, args: [&str; N]) {
     let status = Command::new("git")
@@ -483,6 +575,11 @@ impl Lab {
     /// specific working-copy state.
     pub(crate) fn jj_work<const N: usize>(&self, args: [&str; N]) {
         jj(&self.work, args);
+    }
+
+    /// Run a jj command in an explicitly selected workspace.
+    pub(crate) fn jj_at<const N: usize>(&self, directory: &Path, args: [&str; N]) {
+        jj(directory, args);
     }
 
     pub(crate) fn fetch_work(&self) {

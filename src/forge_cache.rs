@@ -181,6 +181,62 @@ pub fn write(path: &std::path::Path, file: &CacheFile) -> std::io::Result<()> {
     Ok(())
 }
 
+pub const CONSUMER_SCHEMA_VERSION: u32 = 1;
+
+/// Cached pin-file contents for one consumer at one exact default-branch head.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ConsumerCache {
+    pub schema: u32,
+    pub slug: String,
+    pub branch: String,
+    pub commit: String,
+    pub fetched_at: String,
+    pub files: std::collections::BTreeMap<String, String>,
+}
+
+/// `<root>/consumers/<owner>/<repo>.json`.
+pub fn consumer_cache_path(root: &std::path::Path, slug: &str) -> Option<std::path::PathBuf> {
+    let (owner, repository) = slug.split_once('/')?;
+    let path_syntax = |segment: &str| {
+        segment.is_empty() || segment.starts_with(['/', '~', '.']) || segment.contains('\\')
+    };
+    (!path_syntax(owner) && !path_syntax(repository) && !repository.contains('/')).then(|| {
+        root.join("consumers")
+            .join(owner)
+            .join(format!("{repository}.json"))
+    })
+}
+
+/// `None` when cache loss or validation failure makes a cached consumer scan unsafe.
+pub fn load_consumer_cache(path: &std::path::Path, slug: &str) -> Option<ConsumerCache> {
+    let bytes = std::fs::read(path).ok()?;
+    let cache: ConsumerCache = serde_json::from_slice(&bytes).ok()?;
+    (cache.schema == CONSUMER_SCHEMA_VERSION
+        && cache.slug == slug
+        && !cache.branch.is_empty()
+        && !cache.commit.is_empty()
+        && is_rfc3339_utc(&cache.fetched_at)
+        && cache
+            .files
+            .keys()
+            .all(|path| crate::pins::PIN_FILES.contains(&path.as_str())))
+    .then_some(cache)
+}
+
+/// `create_dir_all` + tempfile in the same directory + persist (rename).
+pub fn write_consumer_cache(path: &std::path::Path, cache: &ConsumerCache) -> std::io::Result<()> {
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => std::path::Path::new("."),
+    };
+    std::fs::create_dir_all(parent)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    serde_json::to_writer(&mut temporary, cache).map_err(std::io::Error::other)?;
+    temporary
+        .persist(path)
+        .map_err(|error| std::io::Error::other(error.error))?;
+    Ok(())
+}
 #[cfg(test)]
 #[allow(
     clippy::expect_used,
@@ -191,8 +247,9 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        CacheFile, PROBE_SCHEMA, SCHEMA_VERSION, cache_path, landed_key, load, merge_warm,
-        replace_cold, write,
+        CONSUMER_SCHEMA_VERSION, CacheFile, ConsumerCache, PROBE_SCHEMA, SCHEMA_VERSION,
+        cache_path, consumer_cache_path, landed_key, load, load_consumer_cache, merge_warm,
+        replace_cold, write, write_consumer_cache,
     };
     use crate::{
         detect::LandedVerdict,
@@ -229,8 +286,8 @@ mod tests {
                 is_draft: summary.is_draft,
                 url: summary.url,
                 head_repository_owner: summary.head_repository_owner,
-                mergeable: "MERGEABLE".to_owned(),
-                merge_state_status: "CLEAN".to_owned(),
+                mergeable: Some("MERGEABLE".to_owned()),
+                merge_state_status: Some("CLEAN".to_owned()),
                 base_ref_name: summary.base_ref_name,
                 merge_commit: summary.merge_commit,
             },
@@ -248,6 +305,55 @@ mod tests {
             pulls,
             landed: BTreeMap::new(),
         }
+    }
+
+    fn consumer_cache(slug: &str) -> ConsumerCache {
+        ConsumerCache {
+            schema: CONSUMER_SCHEMA_VERSION,
+            slug: slug.to_owned(),
+            branch: "main".to_owned(),
+            commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            fetched_at: "2026-08-31T12:34:56Z".to_owned(),
+            files: BTreeMap::from([("uv.lock".to_owned(), "pin = \"release\"".to_owned())]),
+        }
+    }
+
+    #[test]
+    fn a_consumer_cache_round_trips_only_for_the_matching_slug_and_schema() {
+        let directory = tempfile::tempdir().expect("create cache directory");
+        let slug = "owner/repo";
+        let path = consumer_cache_path(directory.path(), slug).expect("valid slug");
+        assert_eq!(
+            path,
+            directory
+                .path()
+                .join("consumers")
+                .join("owner")
+                .join("repo.json")
+        );
+        assert!(
+            consumer_cache_path(directory.path(), "../repo").is_none()
+                && consumer_cache_path(directory.path(), "owner/.repo").is_none()
+                && consumer_cache_path(directory.path(), "owner/repo/extra").is_none()
+        );
+        let cache = consumer_cache(slug);
+
+        write_consumer_cache(&path, &cache).expect("write consumer cache");
+
+        assert_eq!(load_consumer_cache(&path, slug), Some(cache.clone()));
+        assert!(
+            load_consumer_cache(&path, "other/repo").is_none(),
+            "a cache cannot answer for another consumer"
+        );
+        let stale_schema = ConsumerCache {
+            schema: CONSUMER_SCHEMA_VERSION + 1,
+            ..cache
+        };
+        write_consumer_cache(&path, &stale_schema).expect("write stale schema");
+        assert!(
+            load_consumer_cache(&path, slug).is_none(),
+            "a changed schema requires a refetch"
+        );
     }
 
     #[test]

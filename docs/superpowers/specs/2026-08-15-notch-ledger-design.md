@@ -190,7 +190,7 @@ knives notch [<subject>] [--pr <n>] [--repo <name>]
 
 `knives status` includes the newest ledger entry per branch:
 
-- JSON: `last_notch: {ts, kind, text}` (absent when the subject has none).
+- JSON: `notch: {ts, kind, text}` (absent when the subject has none).
 - Text: one truncated token at the end of the branch line, e.g.
   `"superseded by #1157…" (3d)`.
 
@@ -224,7 +224,7 @@ adds no observable runtime.
   claim/finish (with and without `--superseded-by`), track, depends, a
   release cut recording its parent set, sync transitions via `FakeForge`.
 - CLI tests: both output modes; `--repo` from outside the repo; exit codes.
-- Status tests: `last_notch` present in JSON, one-token text rendering,
+- Status tests: `notch` present in JSON, one-token text rendering,
   absent cleanly when no entries exist.
 
 ## PR 2: status speed

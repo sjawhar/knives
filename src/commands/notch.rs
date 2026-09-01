@@ -326,8 +326,13 @@ pub fn run(request: &Request<'_>, output: crate::cli::Output) -> anyhow::Result<
                             ))
                         })
                 });
-            let owner = crate::commands::claim::current_owner(&std::env::current_dir()?)?;
-            let scribe = Scribe::new(ledger, request.repo.clone(), entry.path.clone(), owner);
+            let identity = crate::commands::claim::current_identity(&std::env::current_dir()?)?;
+            let scribe = Scribe::new(
+                ledger,
+                request.repo.clone(),
+                entry.path.clone(),
+                identity.owner,
+            );
             let written = scribe.record(&Draft {
                 subject: request.subject,
                 kind: Kind::Note,

@@ -164,12 +164,12 @@ pub enum Command {
     },
     /// List the repos knives manages, with their release state.
     Repos,
-    /// Which consumer checkouts and locks resolve this fork at which commit,
-    /// against the newest published release. Reports; never edits a consumer.
+    /// Which registered forge consumers and ad-hoc local scans resolve this fork
+    /// at which commit against the newest published release. Reports; never edits a consumer.
     Consumers {
         /// Registry name. Defaults to the repo you are standing in.
         fork: Option<String>,
-        /// Extra consumer checkouts beyond the registry's list.
+        /// Extra ad-hoc local consumer scans, beyond the registry's forge slugs.
         #[arg(long)]
         consumer: Vec<PathBuf>,
     },
@@ -253,6 +253,9 @@ pub enum Command {
         /// What you are doing and why. A claim nobody can read is noise.
         #[arg(long)]
         why: Option<String>,
+        /// Replace an existing claim. Requires a new reason for the ledger.
+        #[arg(long, requires = "why")]
+        force: bool,
     },
     /// Hand a branch back and remove its workspace. The inverse of `start`.
     ///
@@ -274,6 +277,12 @@ pub enum Command {
         /// deleted on the forge.
         #[arg(long)]
         allow_open: bool,
+        /// Release a claim held by another identity. Requires a durable reason.
+        #[arg(long, requires = "why")]
+        force: bool,
+        /// Why this forced release is safe.
+        #[arg(long)]
+        why: Option<String>,
         /// Record that this branch was superseded by another.
         #[arg(long)]
         superseded_by: Option<String>,
