@@ -1234,6 +1234,46 @@ printf '{}'
     fn facts_payload(entries: &str) -> String {
         format!("{{\"data\":{{\"repository\":{{{entries}}}}}}}")
     }
+    #[test]
+    fn a_null_review_decision_in_the_facts_batch_decodes_as_no_review() {
+        // The forge returns explicit null for a pull request nobody reviewed; serde's
+        // #[serde(default)] does not cover explicit null, and this exact reply shape
+        // downgraded a whole status run to pull-state-unavailable.
+        let payload = r#"{"data":{"repository":{"p134":{
+        "number":134,"state":"OPEN","reviewDecision":null,
+        "headRefName":"feat/x","headRefOid":"0123456789abcdef0123456789abcdef01234567",
+        "updatedAt":"2026-08-30T00:00:00Z","isDraft":false,
+        "url":"https://forge.example/r/pull/134",
+        "headRepositoryOwner":{"login":"someone"},"baseRefName":"main",
+        "mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","mergeCommit":null,
+        "additions":1,"deletions":0,"changedFiles":1,"headRef":{"name":"feat/x"},
+        "reviews":{"nodes":[]},
+        "commits":{"nodes":[{"commit":{"committedDate":"2026-08-29T00:00:00Z"}}]}
+    }}}}"#;
+        let facts = parse_pull_facts(payload, &[134]).expect("null reviewDecision must decode");
+        assert_eq!(facts[&134].pull.review_decision, "");
+    }
+
+    #[test]
+    fn a_null_required_string_in_the_facts_batch_fails_to_decode() {
+        let payload = facts_payload(
+            r#""p134":{"number":134,"state":null,"headRefName":"feat/x",
+        "headRefOid":"0123456789abcdef0123456789abcdef01234567",
+        "updatedAt":"2026-08-30T00:00:00Z"}"#,
+        );
+
+        let error = parse_pull_facts(&payload, &[134])
+            .expect_err("a null required field must make the batch unavailable");
+
+        assert!(matches!(error, ForgeError::Parse { .. }), "was: {error}");
+        assert!(
+            error
+                .to_string()
+                .contains("invalid type: null, expected a string"),
+            "was: {error}"
+        );
+    }
+
 
     #[test]
     fn facts_carry_the_full_row_the_details_and_the_newest_comment() {
