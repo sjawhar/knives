@@ -176,6 +176,16 @@ impl Repo {
     /// its working-copy commit. Reinstating that mapping and advancing only the
     /// state operation preserves the files and change exactly as they were.
     pub fn reattach_workspace(&self, destination: &Path) -> Result<(), JjError> {
+        let expected = Self::repository_store_path(&self.path)?;
+        let actual = Self::repository_store_path(destination)?;
+        if actual != expected {
+            return Err(JjError::WorkspaceRepositoryMismatch {
+                workspace: destination.to_owned(),
+                expected,
+                actual,
+            });
+        }
+
         let settings = repo_settings(destination)?;
         let mut workspace = Workspace::load(
             &settings,
@@ -187,13 +197,15 @@ impl Repo {
             path: destination.display().to_string(),
             detail: error.to_string(),
         })?;
-        let expected = Self::repository_store_path(&self.path)?;
-        let actual = workspace.repo_path().to_owned();
-        if actual != expected {
+        let loaded = workspace.repo_path().canonicalize().map_err(|error| JjError::Open {
+            path: workspace.repo_path().display().to_string(),
+            detail: error.to_string(),
+        })?;
+        if loaded != expected {
             return Err(JjError::WorkspaceRepositoryMismatch {
                 workspace: destination.to_owned(),
                 expected,
-                actual,
+                actual: loaded,
             });
         }
         let name = workspace.workspace_name().to_owned();

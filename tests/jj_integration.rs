@@ -3920,6 +3920,8 @@ fn start_refuses_a_same_named_workspace_from_another_repository() {
         .expect("create foreign workspace at target path");
     let main_workspaces_before = Repo::open(&lab.work).expect("open managed repo").workspaces().expect("list managed workspaces");
     let foreign_change_before = foreign.revision(&workspace, "@", "change_id");
+    let main_operations_before = operation_ids(&lab.work);
+    let foreign_operations_before = operation_ids(&foreign.work);
 
     let output = Command::new(env!("CARGO_BIN_EXE_knives"))
         .args([
@@ -3963,6 +3965,71 @@ fn start_refuses_a_same_named_workspace_from_another_repository() {
         foreign_change_before,
         "foreign workspace state changed"
     );
+    assert_eq!(
+        operation_ids(&lab.work),
+        main_operations_before,
+        "foreign workspace wrote a managed-repository operation"
+    );
+    assert_eq!(
+        operation_ids(&foreign.work),
+        foreign_operations_before,
+        "foreign workspace wrote a foreign-repository operation"
+    );
+}
+
+#[test]
+fn start_refuses_a_malformed_foreign_workspace_before_loading_it() {
+    // Identity comes from `.jj/repo`; a broken foreign working-copy state must
+    // not turn that clear mismatch into an incomplete-command error.
+    let lab = lab::Lab::new();
+    let foreign = lab::Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let workspace = lab.work.parent().expect("parent").join("feat-gamma");
+    knives::jj::add_workspace(&foreign.work, "feat-gamma", &workspace, "main@upstream")
+        .expect("create foreign workspace at target path");
+    std::fs::write(
+        workspace.join(".jj/working_copy/checkout"),
+        "not a working-copy state",
+    )
+    .expect("corrupt foreign working-copy state");
+    let main_operations_before = operation_ids(&lab.work);
+    let foreign_operations_before = operation_ids(&foreign.work);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_knives"))
+        .args([
+            "--text",
+            "start",
+            "feat/gamma",
+            "--repo",
+            "demo",
+            "--why",
+            "do not load foreign work",
+        ])
+        .current_dir(&lab.work)
+        .env("KNIVES_CONFIG_HOME", home.path())
+        .env("KNIVES_OWNER", "agent-one")
+        .output()
+        .expect("start against malformed foreign workspace");
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(&lab.work.display().to_string()), "stderr: {stderr}");
+    assert!(
+        stderr.contains(&foreign.work.display().to_string()),
+        "stderr: {stderr}"
+    );
+    assert!(
+        !home.path().join("state.json").exists(),
+        "malformed foreign workspace wrote a claim"
+    );
+    assert_eq!(operation_ids(&lab.work), main_operations_before);
+    assert_eq!(operation_ids(&foreign.work), foreign_operations_before);
+
 }
 
 #[test]
