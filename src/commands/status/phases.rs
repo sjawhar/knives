@@ -534,9 +534,9 @@ mod tests {
         clippy::indexing_slicing,
         reason = "indexing a result in a test is the assertion; a panic is the failure"
     )]
+    use super::super::Report;
     use super::super::rows::{RowInput, branch_rows};
     use super::super::unjudged_note;
-    use super::super::Report;
     use super::*;
     use crate::forge::PullRequest;
     use crate::forge::fake::FakeForge;
@@ -622,13 +622,13 @@ mod tests {
                     tip: CommitId::new("test-commit"),
                     origin_tip: Some(CommitId::new("origin-commit")),
                 }],
+                verdicts: vec![Ok::<Option<LandedVerdict>, JjError>(None)],
+                origin_relations: vec![Ok::<Option<OriginRelation>, String>(None)],
                 index: snapshot.index(),
                 snapshot: phase.snapshot.as_ref(),
                 notches: &[],
                 expected_base: "main",
             },
-            vec![Ok::<Option<LandedVerdict>, JjError>(None)],
-            vec![Ok::<Option<OriginRelation>, String>(None)],
             &mut report,
             &mut Vec::new(),
         )

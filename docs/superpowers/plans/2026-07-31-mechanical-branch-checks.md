@@ -70,7 +70,7 @@ pub struct BranchRow {
     pub origin_tip: Option<CommitId>,
     pub pull_request: Option<PullRequest>,
     pub landed: Option<LandedVerdict>,
-    pub review_stale: Option<bool>,
+    pub review_predates_head: Option<bool>,
     pub fork_only: bool,
     pub stated_pull: Option<StatedPull>,
 }
@@ -752,7 +752,7 @@ without the field succeeds 3 of 3, and `gh pr view <n> --json statusCheckRollup`
 of 3.
 
 This is not a new pattern. Expensive per-pull-request facts already live on `BranchRow`, not
-on `PullRequest` — `review_stale: Option<bool>` is exactly this shape, fetched by
+on `PullRequest` — `review_predates_head: Option<bool>` is exactly this shape, fetched by
 `Forge::review_predates_head` for the branches being rendered. Checks are the same kind of
 fact and get the same treatment:
 
@@ -765,7 +765,7 @@ fact and get the same treatment:
     /// branches we render, which is our own handful rather than the repository's hundreds.
     fn checks(&self, repo: &Path, number: u64) -> Result<Option<ChecksSummary>, ForgeError>;
 
-// on BranchRow, beside review_stale
+// on BranchRow, beside review_predates_head
     /// What the forge's checks say, when they were asked for. `None` means not consulted —
     /// which is not the same as nothing having run, and must not render as a failure.
     pub checks: Option<ChecksSummary>,
@@ -1692,7 +1692,7 @@ pub fn parse_newest_comment(payload: &str) -> Result<Option<String>, ForgeError>
 ```
 
 **Consult checks only for pull requests where they can still matter.** The sibling this
-mirrors, `review_stale_for`, guards on `!review_decision.is_empty()`; this needs the
+mirrors, `review_predates_head_for`, guards on `!review_decision.is_empty()`; this needs the
 equivalent. The list is `--state all`, so without a guard `no-checks` lands on a closed,
 abandoned pull request whose branch is still local — announcing "CI has not run yet" about
 something that will never run again, which is the same cry-wolf failure as treating UNKNOWN

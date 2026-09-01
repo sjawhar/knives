@@ -1,3 +1,5 @@
+use std::fmt::Write as _;
+
 use super::{
     BranchRow, BranchState, FindingGroup, LastNotch, PushRelation, RepoNotches, Report, SeenWindow,
     short,
@@ -13,6 +15,10 @@ fn tip_cell(row: &BranchRow) -> String {
     })
 }
 
+#[allow(
+    clippy::expect_used,
+    reason = "a non-clean push relation is constructed only with its origin tip"
+)]
 fn origin_relation_cell(row: &BranchRow, relation: &str) -> String {
     let origin = row
         .origin_tip
@@ -159,16 +165,20 @@ fn branch_table(rows: &[BranchRow]) -> Vec<String> {
     }
     let format_row = |cells: [&str; 11]| {
         let mut line = String::from("    ");
-        for (index, cell) in cells.into_iter().enumerate() {
+        for (index, (cell, width)) in cells.into_iter().zip(widths).enumerate() {
             if index > 0 {
                 line.push_str("  ");
             }
-            line.push_str(&format!("{cell:<width$}", width = widths[index]));
+            let _ = write!(line, "{cell:<width$}");
         }
         line.trim_end().to_owned()
     };
     let mut lines = vec![format_row(HEADER)];
-    lines.extend(cells.iter().map(|row| format_row(row.each_ref().map(String::as_str))));
+    lines.extend(
+        cells
+            .iter()
+            .map(|row| format_row(row.each_ref().map(String::as_str))),
+    );
     lines
 }
 
@@ -237,7 +247,10 @@ pub fn render(report: &Report, verbose: bool) -> String {
         lines.push(repo_notch_line(notches));
     }
     if !report.other_workspaces.is_empty() {
-        lines.push(format!("  workspaces  {}", report.other_workspaces.join(", ")));
+        lines.push(format!(
+            "  workspaces  {}",
+            report.other_workspaces.join(", ")
+        ));
     }
     if !report.notes.is_empty() {
         lines.push(format!("  notes       {}", report.notes.len()));
@@ -326,7 +339,10 @@ mod tests {
 
         let rendered = render(&report_with(row), false);
 
-        assert!(rendered.contains("abcdefghijkl/harness-session"), "was: {rendered}");
+        assert!(
+            rendered.contains("abcdefghijkl/harness-session"),
+            "was: {rendered}"
+        );
         assert!(rendered.contains("now"), "was: {rendered}");
     }
 
@@ -350,8 +366,12 @@ mod tests {
             .filter(|line| line.contains("checks-failing"))
             .collect();
         assert_eq!(lines.len(), 1, "was: {rendered}");
-        assert!(lines[0].contains("3"), "was: {}", lines[0]);
-        assert!(lines[0].contains("#11, #12, and 1 more"), "was: {}", lines[0]);
+        assert!(lines[0].contains('3'), "was: {}", lines[0]);
+        assert!(
+            lines[0].contains("#11, #12, and 1 more"),
+            "was: {}",
+            lines[0]
+        );
     }
 
     #[test]
@@ -384,7 +404,11 @@ mod tests {
             .lines()
             .find(|line| line.contains("feat/alpha"))
             .expect("branch line");
-        assert_eq!(line.split_whitespace().nth(9), Some("none-since-claim"), "was: {line}");
+        assert_eq!(
+            line.split_whitespace().nth(9),
+            Some("none-since-claim"),
+            "was: {line}"
+        );
     }
 
     #[test]
@@ -446,7 +470,10 @@ mod tests {
 
         let rendered = render(&report_with(row), false);
 
-        assert!(rendered.contains("\"superseded by #1157\" (now)+1"), "was: {rendered}");
+        assert!(
+            rendered.contains("\"superseded by #1157\" (now)+1"),
+            "was: {rendered}"
+        );
     }
 
     #[test]

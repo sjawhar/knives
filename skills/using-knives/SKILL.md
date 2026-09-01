@@ -57,69 +57,91 @@ an audit repair path.
 
 ### `knives status [REPO|--all]`
 
-The main report. Per branch: local tip, push status, pull request and its state, review decision, CI check status, landed verdict against upstream trunk, flags, and the most relevant ledger entry. Plus claims other agents hold, the releases scanned, findings grouped one line per kind, and anything it could not answer.
+The main status map. Its header names the repository, trunk, newest release, and whether the
+forge was consulted. If anything could not be answered, `UNANSWERED` is the first content
+section; branch rows, grouped findings, repo notches, unmatched workspaces, and notes follow.
+Claims live in their branch rows, so a claim for a deleted branch still has a synthesized row
+instead of disappearing into a separate section.
 
-`--verbose` prints one block per finding instead of one line per kind. `--no-landed` skips the trunk probe, which is the slow part. `--no-github` skips pull request lookups. Set `KNIVES_TIMING` (any value) to print a phase-timing line with `repository-open`, `health`, `divergent-changes`, `releases`, `setup`, `forge`, `probes`, `origin-relations`, `divergent-rows`, `carried-findings`, `touching`, `claims`, `report`, and `total` to stderr; `total` is wall time because phases overlap, and the report's stdout/JSON contract is unchanged.
+TOON and `--json` serialize the same report, in this order:
+`repo`, `trunk`, `newest_release?`, `forge: {consulted, elapsed_ms}`, `problems?`, `branches`,
+`findings?`, `releases?`, `repo_notches?`, `other_workspaces?`, and `notes?`. A branch is
+`{name, state, tip?, push?, origin_tip?, pr?, review?, checks?, landed?, flags?, claim?,
+last_seen?, seen?, workspace?, notch?}`. A `pr` cell is
+`{number, state, draft?, stated?, prior?}`; `claim` is `{id, kind, since, why}`; and `notch`
+is `{ts, kind, text, disposition?, count}`. Question-marked fields are omitted when absent.
+
+`--verbose` expands each finding group's subjects rather than printing its detail prose.
+`--no-landed` skips the trunk probe, which is the slow part. `--no-github` skips pull request
+lookups. Set `KNIVES_TIMING` (any value) to print a phase-timing line with
+`repository-open`, `health`, `divergent-changes`, `releases`, `setup`, `forge`, `probes`,
+`origin-relations`, `divergent-rows`, `carried-findings`, `touching`, `claims`, `report`, and
+`total` to stderr; `total` is wall time because phases overlap, and the report's stdout/JSON
+contract is unchanged.
+
+#### Branch state
+
+`state` is one reported label per row, chosen in the following precedence order. It describes
+the strongest observed condition; it does not recommend an action.
+
+1. `fork-only`: the branch is stated to have no upstream pull request.
+2. `divergent`: the bookmark has no single tip.
+3. `landed`: the trunk probe observed its content in trunk.
+4. `conflicted`: an open pull request is conflicting according to the forge.
+5. `checks-failing`: an open pull request has a failing check rollup.
+6. `changes-requested`: an open pull request's review decision is `CHANGES_REQUESTED`.
+7. `approved`: an open pull request's review decision is `APPROVED`.
+8. `draft`: an open pull request is marked draft.
+9. `awaiting-review`: an open pull request has none of the preceding observed states.
+10. `merged`: the associated pull request is merged but the trunk probe did not report
+    `in-trunk`.
+11. `closed`: the associated pull request is closed.
+12. `no-pr`: the forge answered and no pull request is associated with the branch.
+13. `unknown`: the forge was not consulted and no pull request was stated.
 
 #### Branch table columns
 
-Branch rows are rendered as an aligned table with 9 columns. Empty cells render as `-` for `review`, `checks`, `landed`, `flags`, and `notch` columns (`branch`, `tip`, and `push` always carry values or state tokens, while `pr` reports a number or state token).
+Text rows are rendered as an aligned table with 11 columns. Missing display values are `-`;
+`push` defaults to `pushed`, and a row whose divergent bookmark has no `tip` displays
+`divergent`.
 
 1. `branch`: local bookmark name.
-2. `tip`: short commit hash, or `divergent` if the bookmark has multiple tips.
-3. `push`: relation between local and origin tips:
-   - `pushed` if local matches origin tip.
-   - `unpushed` if origin has no remote-tracking ref for this branch.
-   - `unpushed-commits` if local is ahead of origin.
-   - `origin=<id> (behind)` if origin is ahead of local.
-   - `origin=<id> (diverged)` if local and origin have diverged.
-   - `origin=<id> (unresolved)` if ancestry could not be determined.
-4. `pr`: pull request details:
-   - `#<n>` or `#<n> <state>` for closed/merged pull requests.
-   - `#<n> draft` for draft pull requests.
-   - `#<n> <state> (stated)` for explicitly tracked pull requests.
-   - `unknown (forge unavailable)` if the forge was not consulted and no pull request is stated.
-   - `#<n> unknown (stated)` if an explicitly tracked pull request has no current forge answer.
-   - `no-pr` if no pull request is associated.
-   - `prior #<n> <state>` appended for each of the branch's other pull requests, shadowed by the primary. A head branch accumulates pull requests over its life — an org-fork submission closed and re-homed onto a personal fork keeps its review history on the closed number — so read a `prior` closed pull request before working the branch: maintainer feedback often lives only there. Primary selection is deterministic (an open pull request beats any closed one). In JSON these are `prior_pulls: [{number, state}]`, absent when empty. The forge fetch behind this merges the newest-window list with one author-scoped query per origin/release owner, so our own older pull requests stay visible however busy the upstream is.
-5. `review`: `APPROVED`, `CHANGES_REQUESTED`, `no-review`, or `-` if no PR exists.
-6. `checks`: CI check status for open pull requests:
-   - `ok` if checks passed.
-   - `failing` if CI checks failed.
-   - `none-ran` if no checks ran.
-   - `pending` if no check has failed and at least one is still in flight; an in-flight check never renders `ok`.
-   - `-` if no open pull request exists or the forge returned no check rollup. Checks are consulted only for open pull requests.
-7. `landed`: verdict against upstream's trunk (`in-trunk`, `conflicts-with-trunk`, `not-in-trunk`, `landed?`, or `-`).
-8. `flags`: comma-separated flags (`CONFLICTING`, `behind-base`, `review-stale`, `fork-only`) or `-`.
-9. `notch`: the newest human note for this branch, if one exists, otherwise its newest ledger event, as one truncated token with its age. A disposition prefixes the text; `+N` reports N sibling entries that the cell masks. `knives notch <branch>` prints the full record. `-` means there is no entry.
+2. `state`: the reported state label above.
+3. `tip`: short commit hash, `divergent`, or `-`.
+4. `push`: `pushed`, `unpushed`, `unpushed-commits`, or
+   `origin=<id> (behind|diverged|unresolved)`.
+5. `pr`: `#<n>` with its non-open state, `draft`, `(stated)`, and any `prior #<n> <state>`
+   cells appended as applicable.
+6. `review`: the reported review rollup for an open pull request.
+7. `checks`: the reported check rollup for an open pull request (`ok`, `failing`, `pending`, or
+   `none-ran`).
+8. `landed`: the trunk verdict (`in-trunk`, `conflicts-with-trunk`, `not-in-trunk`, or
+   `landed?`).
+9. `claim`: the claimed owner's shortened id and kind, such as `ubuntu/os-user`.
+10. `seen`: an age for the latest observation, `none-since-claim`,
+    `none-within-window`, or `-`.
+11. `notch`: the newest human note, otherwise newest event, collapsed to a short token with its
+    age and a `+N` count for masked sibling entries.
 
-Trunk verdicts say what was observed, not what it means:
+#### Claim observations
 
-- `in-trunk`: replaying the branch onto the trunk produced nothing, so the trunk has it.
-- `conflicts-with-trunk`: replaying it conflicts. This does not mean the maintainer took it and modified it: a branch declined upstream, whose files were later touched by unrelated work, conflicts identically. The tool cannot tell those apart and does not try.
-- `not-in-trunk`: it applies cleanly and is not empty, so the trunk lacks it.
-- `landed?`: local differs from origin, so replaying would judge content the pull request does not contain. Refusing to answer beats guessing.
+For a claimed row, `last_seen` is the RFC 3339 timestamp of the newest observation, while
+`seen` carries either unsighted result (`none-since-claim` or `none-within-window`). The
+observation takes the newest of three streams: a working-copy move for the branch's workspace
+from the jj operation walk, the owner-and-kind record in `seen.json`, and the repository
+workspace record in `seen.json`.
 
-An `unanswered` section means the run is incomplete and some of the report is missing. Read it before trusting the rest.
+These are descriptive observations, never a liveness guarantee. Read-only commands on a clean
+tree write no operation; mutations that move no working copy are not workspace-attributable;
+and the operation walk and pruned observation file have bounded coverage. An exhausted window
+therefore reports `none-within-window`, not “never”.
 
 #### Findings
 
-Findings appear grouped one line per kind at the end of the status report:
-
-- `double-checkout`: two or more workspaces hold `@` on the same change.
-- `stale-parent`: a release parent's bookmark has moved to a descendant.
-- `divergence`: a change ID exists on two or more commits.
-- `stale-review`: the newest review predates the newest commit on the branch.
-- `claim-overlap`: active claims touch the same file.
-- `unmet-dependency`: a required pull request dependency is not merged yet.
-- `unmergeable`: the pull request conflicts with its base branch according to the forge.
-- `checks-failing`: the forge reported a red CI conclusion (`FAILURE`, `TIMED_OUT`, `CANCELLED`, `STARTUP_FAILURE`, `ACTION_REQUIRED`, or `ERROR`).
-- `wrong-base`: the pull request targets a branch whose name differs from the repo's configured base branch. Only open pull requests are checked; an empty base is unknown, not wrong.
-- `empty-diff`: an open pull request's answered live diff has zero additions, deletions, and changed files.
-- `deleted-head-ref`: an open pull request's answered live head ref is gone from the forge.
-- `empty-tip-commit`: an open pull request's newest tip commit has the same tree as its sole parent.
-- `carried-elsewhere`: the branch tip is reachable from another reference. Trunk, `@git` refs, and our own release cuts are excluded.
-- `branch-overlap`: two or more of our branches change the same file, which conflicts when a release merges them. One finding per file, naming every branch.
+`findings` is a sequence of `{kind, count, subjects}` groups. `count` is exact; `subjects`
+holds the first eight detector-order subjects, so the text report prints one `kind  count
+subjects` line per group and adds `and N more` when needed. The status report deliberately
+does not carry per-finding detail prose; the detector kind and subjects are the observation.
 ### `knives sync [REPO|--all]`
 
 Fetches every remote and every tracked pull request head, then classifies each tracked pull request as `new`, `unchanged`, `advanced`, `merged` or `closed`. Forge state wins over head movement: a merged pull request whose head also moved is merged.
@@ -242,12 +264,13 @@ into a session: reading the ledger is intentional, and that is the point.
 
 #### In `knives status`
 
-Each branch row carries the newest human note if any, otherwise its newest event. In JSON that is
-`last_notch: {ts, kind, text, disposition?, count}`, absent when the branch has none; in text it
-is one truncated token at the end of the line. A disposition prefixes its text and `+N` records N
-masked sibling entries. Repo-level entries appear separately as
-`repo_notches: {count, last}` in JSON and as `notches  <N> repo-level, newest: "<text>" (<age>)`
-above the branch table. It is a local ledger read, so it costs nothing.
+Each branch row carries the newest human note if any, otherwise its newest event. In JSON and
+TOON that is `notch: {ts, kind, text, disposition?, count}`, absent when the branch has none;
+in text it is one truncated token at the end of the line. A disposition prefixes its text and
+`+N` records N masked sibling entries. Repo-level entries appear separately as
+`repo_notches: {count, last}` in machine output and as
+`notches  <N> repo-level, newest: "<text>" (<age>)` after the findings. It is a local ledger
+read, so it costs nothing.
 
 #### Storage and exit codes
 

@@ -1274,7 +1274,6 @@ printf '{}'
         );
     }
 
-
     #[test]
     fn facts_carry_the_full_row_the_details_and_the_newest_comment() {
         // One alias carrying every summary field plus mergeable CONFLICTING,

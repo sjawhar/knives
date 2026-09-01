@@ -63,7 +63,7 @@ pub struct BranchRow {
 }
 
 impl BranchRow {
-    fn bare(name: BranchName) -> Self {
+    const fn bare(name: BranchName) -> Self {
         Self {
             name,
             state: BranchState::Unknown,
@@ -651,6 +651,13 @@ fn repo_notches(notches: &[Notch]) -> Option<RepoNotches> {
     })
 }
 
+#[derive(Clone, Copy)]
+struct ReleaseInput<'a> {
+    repo: &'a Repo,
+    tips: &'a BookmarkTips,
+    entry: &'a RepoEntry,
+}
+
 /// Fold the release scan into a report.
 ///
 /// Extracted from `gather` for the same reason `scan_releases` was: that function
@@ -659,17 +666,13 @@ fn repo_notches(notches: &[Notch]) -> Option<RepoNotches> {
 fn add_releases(
     report: &mut Report,
     findings: &mut Vec<Finding>,
-    repo: &Repo,
-    tips: &BookmarkTips,
-    entry: &RepoEntry,
+    input: ReleaseInput<'_>,
 ) -> anyhow::Result<()> {
+    let ReleaseInput { repo, tips, entry } = input;
     let scheme = entry.release_scheme();
-    report.newest_release = crate::release_model::newest_release(
-        tips,
-        &scheme,
-        entry.publish_remote(),
-    )
-    .map(|(reference, _)| reference.to_string());
+    report.newest_release =
+        crate::release_model::newest_release(tips, &scheme, entry.publish_remote())
+            .map(|(reference, _)| reference.to_string());
     let (names, release_findings, skipped) = scan_releases(
         repo,
         &ReleaseScan {
@@ -712,28 +715,40 @@ fn claim_last_seen(
                 .get(&workspace_key)
                 .and_then(|timestamp| timestamp.parse().ok()),
         ];
-        return timestamps
-            .into_iter()
-            .flatten()
-            .max()
-            .map_or(crate::seen::LastSeen::NoneWithinWindow, crate::seen::LastSeen::At);
+        return timestamps.into_iter().flatten().max().map_or(
+            crate::seen::LastSeen::NoneWithinWindow,
+            crate::seen::LastSeen::At,
+        );
     };
     crate::seen::last_seen(claim, activity, seen)
+}
+
+#[derive(Clone, Copy)]
+struct ClaimFoldInput<'a> {
+    repo: &'a Repo,
+    name: &'a RepoName,
+    store: &'a Store,
+    seen: &'a crate::seen::Seen,
 }
 
 /// Folds claims, workspace facts, and sidecar observations into branch rows.
 fn fold_claims(
     report: &mut Report,
     findings: &mut Vec<Finding>,
-    repo: &Repo,
-    name: &RepoName,
-    store: &Store,
-    seen: &crate::seen::Seen,
-) {
+    input: ClaimFoldInput<'_>,
+) -> anyhow::Result<()> {
+    let ClaimFoldInput {
+        repo,
+        name,
+        store,
+        seen,
+    } = input;
     let claims: Vec<crate::store::Claim> = store.claims(Some(name)).into_iter().cloned().collect();
     let wanted: BTreeSet<crate::ids::WorkspaceName> = claims
         .iter()
-        .map(|claim| crate::ids::WorkspaceName::new(crate::commands::wip::workspace_for(&claim.branch)))
+        .map(|claim| {
+            crate::ids::WorkspaceName::new(crate::commands::wip::workspace_for(&claim.branch))
+        })
         .collect();
     let activity = match repo.workspace_activity(&wanted, crate::jj::MAX_ACTIVITY_OPS) {
         Ok(activity) => Some(activity),
@@ -756,16 +771,20 @@ fn fold_claims(
     findings.extend(crate::commands::wip::overlaps(&touching(&claims)));
 
     for claim in &claims {
-        let row = if let Some(index) = report
+        if !report
             .branches
             .iter()
-            .position(|row| row.name.as_str() == claim.branch)
+            .any(|row| row.name.as_str() == claim.branch)
         {
-            &mut report.branches[index]
-        } else {
-            report.branches.push(BranchRow::bare(BranchName::new(&claim.branch)));
-            report.branches.last_mut().expect("row inserted")
-        };
+            report
+                .branches
+                .push(BranchRow::bare(BranchName::new(&claim.branch)));
+        }
+        let row = report
+            .branches
+            .iter_mut()
+            .find(|row| row.name.as_str() == claim.branch)
+            .ok_or_else(|| anyhow::anyhow!("claim row could not be materialized"))?;
         row.claim = Some(ClaimCell {
             id: claim.owner.clone(),
             kind: claim.kind,
@@ -783,14 +802,17 @@ fn fold_claims(
         }
     }
     for row in &mut report.branches {
-        let expected = crate::ids::WorkspaceName::new(crate::commands::wip::workspace_for(
-            row.name.as_str(),
-        ));
+        let expected =
+            crate::ids::WorkspaceName::new(crate::commands::wip::workspace_for(row.name.as_str()));
         if workspaces.remove(&expected) {
             row.workspace = Some(expected.to_string());
         }
     }
-    report.other_workspaces = workspaces.into_iter().map(|workspace| workspace.to_string()).collect();
+    report.other_workspaces = workspaces
+        .into_iter()
+        .map(|workspace| workspace.to_string())
+        .collect();
+    Ok(())
 }
 
 /// Files each claim says it is touching, keyed by claim.
@@ -931,6 +953,12 @@ fn add_branch_overlap_findings(
     started.elapsed()
 }
 
+struct FoldOutput<'a> {
+    report: &'a mut Report,
+    findings: &'a mut Vec<Finding>,
+    timings: &'a mut Timings,
+}
+
 /// Inputs that turn completed phases into the report's visible rows and findings.
 struct PostPhaseInput<'a> {
     name: &'a RepoName,
@@ -966,15 +994,43 @@ fn add_pull_state_findings(
         .collect();
     findings.extend(crate::detect::pull_state::pull_state_findings(&states));
 }
+fn persist_landed(
+    report: &mut Report,
+    snapshot: Option<&crate::snapshot::CompletedSnapshot<'_>>,
+    landed: Option<BTreeMap<String, LandedVerdict>>,
+) {
+    let Some(snapshot) = snapshot else {
+        return;
+    };
+    if let Err(note) = snapshot.persist(landed) {
+        report.notes.push(note.to_string());
+    }
+}
+
+fn set_forge_status(
+    report: &mut Report,
+    snapshot: Option<&crate::snapshot::CompletedSnapshot<'_>>,
+    timings: &Timings,
+) -> anyhow::Result<()> {
+    report.forge = ForgeStatus {
+        consulted: snapshot.is_some(),
+        elapsed_ms: u64::try_from(timings.forge.as_millis())
+            .map_err(|_| anyhow::anyhow!("forge phase elapsed time cannot fit in milliseconds"))?,
+    };
+    Ok(())
+}
 
 /// Fold completed phases into rows, findings, timings, and cache persistence.
 fn fold_phase_outcome(
-    report: &mut Report,
-    findings: &mut Vec<Finding>,
-    timings: &mut Timings,
+    output: FoldOutput<'_>,
     input: PostPhaseInput<'_>,
     phases: &mut phases::StatusPhases<'_>,
 ) -> anyhow::Result<()> {
+    let FoldOutput {
+        report,
+        findings,
+        timings,
+    } = output;
     let snapshot = phases.forge.snapshot.as_ref();
     let empty_index = PullIndex::default();
     let index = snapshot.map_or(&empty_index, crate::snapshot::CompletedSnapshot::index);
@@ -995,34 +1051,32 @@ fn fold_phase_outcome(
             name: input.name,
             store: input.store,
             probe_inputs: input.probe_inputs,
+            verdicts: std::mem::take(&mut phases.probe.verdicts),
+            origin_relations: origin_phase.relations,
             index,
             snapshot,
             notches: input.notches,
             expected_base: input.entry.default_base(),
         },
-        std::mem::take(&mut phases.probe.verdicts),
-        origin_phase.relations,
         report,
         findings,
     )?;
     timings.origin_relations = phase.elapsed();
 
     let phase = std::time::Instant::now();
-    report
-        .branches
-        .extend(rows::divergent_rows(
-            &rows::DivergentInput {
-                branches: input.divergent_branches,
-                tips: input.tips,
-                name: input.name,
-                store: input.store,
-                snapshot,
-                index,
-                notches: input.notches,
-                expected_base: input.entry.default_base(),
-            },
-            findings,
-        ));
+    report.branches.extend(rows::divergent_rows(
+        &rows::DivergentInput {
+            branches: input.divergent_branches,
+            tips: input.tips,
+            name: input.name,
+            store: input.store,
+            snapshot,
+            index,
+            notches: input.notches,
+            expected_base: input.entry.default_base(),
+        },
+        findings,
+    ));
     report
         .branches
         .sort_by(|left, right| left.name.cmp(&right.name));
@@ -1045,7 +1099,16 @@ fn fold_phase_outcome(
 
     let phase = std::time::Instant::now();
     let seen = crate::seen::load();
-    fold_claims(report, findings, input.repo, input.name, input.store, &seen);
+    fold_claims(
+        report,
+        findings,
+        ClaimFoldInput {
+            repo: input.repo,
+            name: input.name,
+            store: input.store,
+            seen: &seen,
+        },
+    )?;
     timings.claims = phase.elapsed();
 
     let phase = std::time::Instant::now();
@@ -1062,18 +1125,11 @@ fn fold_phase_outcome(
     if let Some(snapshot) = snapshot {
         add_pull_state_findings(report, findings, snapshot);
     }
-    if let Some(snapshot) = snapshot {
-        let landed = input
-            .probe_ran
-            .then(|| std::mem::take(&mut phases.probe.landed));
-        if let Err(note) = snapshot.persist(landed) {
-            report.notes.push(note.to_string());
-        }
-    }
-    report.forge = ForgeStatus {
-        consulted: snapshot.is_some(),
-        elapsed_ms: timings.forge.as_millis() as u64,
-    };
+    let landed = input
+        .probe_ran
+        .then(|| std::mem::take(&mut phases.probe.landed));
+    persist_landed(report, snapshot, landed);
+    set_forge_status(report, snapshot, timings)?;
     timings.report = phase.elapsed();
     Ok(())
 }
@@ -1101,7 +1157,15 @@ pub fn gather_timed(
     let tips = repo.bookmark_tips()?;
     timings.repository = phase.elapsed();
     let phase = std::time::Instant::now();
-    add_releases(&mut report, &mut findings, &repo, &tips, entry)?;
+    add_releases(
+        &mut report,
+        &mut findings,
+        ReleaseInput {
+            repo: &repo,
+            tips: &tips,
+            entry,
+        },
+    )?;
     timings.releases = phase.elapsed();
 
     let phase = std::time::Instant::now();
@@ -1156,9 +1220,11 @@ pub fn gather_timed(
     findings.splice(0..0, health.findings);
     report.problems.splice(0..0, health.problems);
     fold_phase_outcome(
-        &mut report,
-        &mut findings,
-        &mut timings,
+        FoldOutput {
+            report: &mut report,
+            findings: &mut findings,
+            timings: &mut timings,
+        },
         PostPhaseInput {
             name,
             entry,
@@ -1279,7 +1345,10 @@ fn grouped_subject(finding: &Finding) -> String {
             .strip_prefix(&format!("{subject}'s tip is also reachable from ")),
         _ => None,
     };
-    counterpart.map_or(subject.clone(), |counterpart| format!("{subject}: {counterpart}"))
+    counterpart.map_or_else(
+        || subject.clone(),
+        |counterpart| format!("{subject}: {counterpart}"),
+    )
 }
 
 /// Folds raw findings once, after every detector has reported, preserving detector order.
@@ -1365,7 +1434,10 @@ mod tests {
         let problems_at = json.find("\"problems\"").expect("problems present");
         let branches_at = json.find("\"branches\"").expect("branches present");
         assert!(problems_at < branches_at, "problems must lead: {json}");
-        assert!(!json.contains("null"), "absent values are skipped, never null: {json}");
+        assert!(
+            !json.contains("null"),
+            "absent values are skipped, never null: {json}"
+        );
         assert!(
             !json.contains("\"claims\""),
             "the standalone claims section is dead: {json}"
@@ -1518,9 +1590,15 @@ mod tests {
         ]);
 
         let (chosen, skipped) = releases_to_scan(&map, &ReleaseScheme::Dated, "origin");
-        let names: Vec<String> = chosen.iter().map(|(reference, _)| reference.to_string()).collect();
+        let names: Vec<String> = chosen
+            .iter()
+            .map(|(reference, _)| reference.to_string())
+            .collect();
 
-        assert_eq!(names, vec!["release/2026-07-28", "release/2026-07-29@origin"]);
+        assert_eq!(
+            names,
+            vec!["release/2026-07-28", "release/2026-07-29@origin"]
+        );
         assert_eq!(skipped, 2);
     }
 
@@ -1534,7 +1612,10 @@ mod tests {
         ]);
 
         let (chosen, skipped) = releases_to_scan(&map, &fixed, "origin");
-        let names: Vec<String> = chosen.iter().map(|(reference, _)| reference.to_string()).collect();
+        let names: Vec<String> = chosen
+            .iter()
+            .map(|(reference, _)| reference.to_string())
+            .collect();
 
         assert_eq!(names, vec!["integration", "integration@origin"]);
         assert_eq!(skipped, 0);
@@ -1559,7 +1640,12 @@ mod tests {
 
         let _ = add_branch_overlap_findings(&mut report, &mut Vec::new(), &entry, 1);
 
-        assert!(report.notes.iter().any(|note| note.contains("no single tip")));
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|note| note.contains("no single tip"))
+        );
         assert_ne!(exit_for(&report), Exit::Incomplete);
     }
 
@@ -1728,7 +1814,11 @@ mod tests {
         );
         assert_eq!(report.findings.len(), 6);
         assert_eq!(
-            report.findings.iter().map(|finding| finding.count).sum::<usize>(),
+            report
+                .findings
+                .iter()
+                .map(|finding| finding.count)
+                .sum::<usize>(),
             34
         );
         assert_eq!(report.problems.len(), 2);
@@ -1772,8 +1862,13 @@ mod tests {
         let problem_at = toon
             .find("pull request state unavailable")
             .expect("forge decode failure is rendered");
-        let branches_at = toon.find("branches[1]").expect("branch section is rendered");
-        assert!(head.contains("pull request state unavailable"), "was:\n{toon}");
+        let branches_at = toon
+            .find("branches[1]")
+            .expect("branch section is rendered");
+        assert!(
+            head.contains("pull request state unavailable"),
+            "was:\n{toon}"
+        );
         assert!(problem_at < branches_at, "problems must lead: {toon}");
         assert_eq!(exit_for(&report), Exit::Incomplete);
     }

@@ -12,21 +12,19 @@ collide without noticing.
 
 ```
 $ knives status
-libcore
-  releases    2 checked: release/2026-07-30, release/2026-07-28.2@origin
-  branches    12
-    branch                 tip        push                         pr           review             checks   landed  flags
-    feat/client-headers    d9ae60977  pushed                       #4565 draft  REVIEW_REQUIRED    failing  -       CONFLICTING
-    feat/response-filter   5da4e7a7a  origin=4c94fb019 (diverged)  #4561        REVIEW_REQUIRED    ok       -       behind-base
-    fix/session-isolation  4e8975585  pushed                       #4559        CHANGES_REQUESTED  ok       -       review-stale
+libcore  trunk main  release release/2026-07-30  forge consulted (72ms)
+  UNANSWERED  1
+    cannot tell whether feat/response-filter landed, because local differs from origin
+  branches    3
+    branch                 state           tip           push                         pr           review             checks   landed  claim                seen  notch
+    feat/client-headers    conflicted      d9ae60977abc  pushed                       #4565 draft  approved           failing  -       ada/harness-session  17m   -
+    feat/response-filter   checks-failing  5da4e7a7a123  origin=4c94fb019abc (behind)  #4561        no-review          failing  landed?  -                    -     -
+    fix/session-isolation  approved        4e8975585def  pushed                       #4559        approved           ok       -       -                    -     -
   findings    6
-    divergence          2  qnslzxkkrmnl, qwpowwlkzuym
-    checks-failing      2  #4526, #4565
-    unmergeable         1  #4565
-    stale-review        1  #4559
-  claims      1
-    feat/client-headers  ada  since 2026-07-31T21:27:31Z
-      conflicts, lint, and the version gate
+    divergence        2  qnslzxkkrmnl, qwpowwlkzuym
+    checks-failing    2  #4526, #4565
+    unmergeable       1  #4565
+    stale-review      1  #4559
 ```
 
 The first branch there reads as finished from every angle a person checks: approved, pushed,

@@ -6079,7 +6079,10 @@ fn status_reports_a_branch_carried_elsewhere() {
         .find(|finding| finding.kind == knives::detect::FindingKind::CarriedElsewhere)
         .expect("the branch carrier is reported");
     assert_eq!(carrier.count, 1, "was: {carrier:?}");
-    assert_eq!(carrier.subjects, vec!["feat/alpha: theirs/rework".to_owned()]);
+    assert_eq!(
+        carrier.subjects,
+        vec!["feat/alpha: theirs/rework".to_owned()]
+    );
 }
 
 #[test]
@@ -6135,7 +6138,10 @@ fn status_reports_a_carrier_for_a_closed_pull_request() {
         .find(|finding| finding.kind == knives::detect::FindingKind::CarriedElsewhere)
         .expect("the branch carrier is reported");
     assert_eq!(carrier.count, 1, "was: {carrier:?}");
-    assert_eq!(carrier.subjects, vec!["feat/alpha: theirs/rework".to_owned()]);
+    assert_eq!(
+        carrier.subjects,
+        vec!["feat/alpha: theirs/rework".to_owned()]
+    );
 }
 
 #[test]
@@ -6187,7 +6193,10 @@ fn status_does_not_report_trunk_as_a_carrier_without_landed_probe() {
     // Then: trunk is never a carrier finding, even without an InTrunk verdict.
     assert!(!report.findings.iter().any(|finding| {
         finding.kind == knives::detect::FindingKind::CarriedElsewhere
-            && finding.subjects.iter().any(|subject| subject == "feat/alpha")
+            && finding
+                .subjects
+                .iter()
+                .any(|subject| subject == "feat/alpha")
     }));
 }
 
