@@ -22,9 +22,31 @@ use crate::ids::{
 use crate::jj::{self, Repo};
 use crate::pins::{Pin, PinKind};
 use crate::release_model::{
-    RecordedCut, carried_from_tips, double_cut_findings, newest_release, repo_slug,
-    scan_consumer_for,
+    ConsumerHeadMemo, RecordedCut, carried_from_tips, double_cut_findings, newest_release,
+    repo_slug, scan_consumer_for, scan_consumer_slug_with_heads,
 };
+
+/// Registered forge consumers and explicitly requested local checkout scans.
+pub struct ConsumerInputs<'a> {
+    pub slugs: &'a [String],
+    pub locals: &'a [PathBuf],
+    pub forge: &'a dyn crate::forge::Forge,
+    pub cache_root: Option<&'a Path>,
+    pub heads: &'a ConsumerHeadMemo,
+}
+
+impl std::fmt::Debug for ConsumerInputs<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ConsumerInputs")
+            .field("slugs", &self.slugs)
+            .field("locals", &self.locals)
+            .field("forge", &"<Forge>")
+            .field("cache_root", &self.cache_root)
+            .field("heads", self.heads)
+            .finish()
+    }
+}
 
 /// What repairing this release would actually reach.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -471,7 +493,11 @@ fn live_dated_release(tips: &BookmarkTips, publish_remote: &str) -> Option<(Bran
         .map(|(reference, commit)| (reference.branch().clone(), commit.clone()))
 }
 
-pub fn plan(name: &RepoName, entry: &RepoEntry, consumers: &[PathBuf]) -> anyhow::Result<Plan> {
+pub fn plan(
+    name: &RepoName,
+    entry: &RepoEntry,
+    consumers: &ConsumerInputs<'_>,
+) -> anyhow::Result<Plan> {
     let mut plan = Plan {
         repo: name.to_string(),
         ..Plan::default()
@@ -579,10 +605,10 @@ pub fn plan(name: &RepoName, entry: &RepoEntry, consumers: &[PathBuf]) -> anyhow
 fn add_consumer_pins(
     plan: &mut Plan,
     entry: &RepoEntry,
-    consumers: &[PathBuf],
+    consumers: &ConsumerInputs<'_>,
     scheme: &ReleaseScheme,
 ) {
-    if consumers.is_empty() {
+    if consumers.slugs.is_empty() && consumers.locals.is_empty() {
         // The command's central question. Unanswered is not success.
         plan.problems.push(
             "no consumers recorded, so pinned-ness is unknown; add `consumers = [...]` to \
@@ -593,7 +619,21 @@ fn add_consumer_pins(
     // Every consumer, not one: they can sit on different releases, so a plan that saw only
     // the first would call a release unpinned while something else was frozen on it.
     let slug = repo_slug(entry);
-    for consumer in consumers {
+    for consumer in consumers.slugs {
+        let scan = scan_consumer_slug_with_heads(
+            consumers.forge,
+            consumers.cache_root,
+            &entry.path,
+            consumer,
+            slug.as_deref(),
+            scheme,
+            consumers.heads,
+        );
+        plan.pins.extend(scan.pins);
+        plan.notes.extend(scan.notes);
+        plan.problems.extend(scan.problems);
+    }
+    for consumer in consumers.locals {
         let scan = scan_consumer_for(consumer, slug.as_deref(), scheme);
         plan.pins.extend(scan.pins);
         plan.notes.extend(scan.notes);

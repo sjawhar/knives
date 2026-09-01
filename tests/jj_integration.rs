@@ -25,8 +25,8 @@ use knives::commands::{
 use knives::config::{Registry, RepoEntry};
 use knives::detect::landed::RebaseOutcome;
 use knives::forge::{
-    ChecksSummary, Forge, ForgeError, PullFacts, PullRequest, PullSummary, RepoIdentity,
-    SweepEntry, SweepPage, TimelineEvent,
+    ChecksSummary, ConsumerHead, Forge, ForgeError, PullFacts, PullRequest, PullSummary,
+    RepoIdentity, SweepEntry, SweepPage, TimelineEvent,
 };
 use knives::ids::{BookmarkRef, BranchName, CommitId, ReleaseScheme, RemoteName};
 use knives::jj::{
@@ -277,6 +277,28 @@ impl Forge for CountingForge {
         _number: u64,
     ) -> Result<Vec<TimelineEvent>, ForgeError> {
         Ok(Vec::new())
+    }
+
+    fn consumer_head(
+        &self,
+        _repo: &std::path::Path,
+        _slug: &str,
+    ) -> Result<ConsumerHead, ForgeError> {
+        Err(ForgeError::Query {
+            detail: "consumer lookups are not part of this test".to_owned(),
+        })
+    }
+
+    fn file_at(
+        &self,
+        _repo: &std::path::Path,
+        _slug: &str,
+        _commit: &str,
+        _path: &str,
+    ) -> Result<Option<String>, ForgeError> {
+        Err(ForgeError::Query {
+            detail: "consumer lookups are not part of this test".to_owned(),
+        })
     }
 }
 
@@ -680,8 +702,9 @@ fn relation_to_origin(lab: &lab::Lab) -> Result<Option<OriginRelation>, knives::
     status::phases::relation_to_origin(&repo, &tip, Some(&origin_tip))
 }
 
-/// Registry home + consumer for release-cut tests: one repo named `demo`,
-/// one consumer following the current release by branch.
+/// Registry home plus a local consumer for release tests. The registry deliberately
+/// keeps no local consumer path: command helpers supply this checkout via
+/// `--consumer`, as production callers must.
 fn release_test_home(lab: &lab::Lab) -> (tempfile::TempDir, std::path::PathBuf) {
     let consumer = lab.consumer_with_pin_history(
         "pyproject.toml",
@@ -692,13 +715,17 @@ fn release_test_home(lab: &lab::Lab) -> (tempfile::TempDir, std::path::PathBuf) 
     std::fs::write(
         home.path().join("repos.toml"),
         format!(
-            "[repos.demo]\npath = \"{}\"\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/work.git\"\nconsumers = [\"{}\"]\n",
+            "[repos.demo]\npath = \"{}\"\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/work.git\"\n",
             lab.work.display(),
             lab.upstream.display(),
-            consumer.display(),
         ),
     )
     .expect("write registry");
+    std::fs::write(
+        home.path().join("local-consumer"),
+        consumer.display().to_string(),
+    )
+    .expect("write local consumer fixture path");
     (home, consumer)
 }
 
@@ -1470,13 +1497,24 @@ fn a_fixed_pin_locked_to_an_ancestor_is_behind() {
     lab.jj_work(["bookmark", "set", "integration", "-r", "@"]);
     lab.jj_work(["new"]);
 
-    let consumer = tempfile::tempdir().expect("consumer directory");
+    let consumer = "acme/consumer";
+    let commit = "aaaaaaaaaaaaaaaa";
     let locked: String = ancestor.as_str().chars().take(12).collect();
-    std::fs::write(
-        consumer.path().join("uv.lock"),
-        format!("url = \"https://forge.invalid/o/repo.git?branch=integration#{locked}\"\n"),
-    )
-    .expect("consumer pin");
+    let forge = knives::forge::fake::FakeForge {
+        heads: BTreeMap::from([(
+            consumer.to_owned(),
+            ConsumerHead {
+                branch: "main".to_owned(),
+                commit: commit.to_owned(),
+            },
+        )]),
+        files: BTreeMap::from([(
+            (consumer.to_owned(), commit.to_owned(), "uv.lock".to_owned()),
+            format!("url = \"https://forge.invalid/o/repo.git?branch=integration#{locked}\"\n"),
+        )]),
+        ..knives::forge::fake::FakeForge::default()
+    };
+    let heads = knives::release_model::ConsumerHeadMemo::default();
     let entry = RepoEntry {
         path: lab.work.clone(),
         upstream: "https://forge.invalid/up/repo.git".to_owned(),
@@ -1485,19 +1523,12 @@ fn a_fixed_pin_locked_to_an_ancestor_is_behind() {
         release: None,
         release_branch: Some("integration".to_owned()),
         test_count_command: None,
-        consumers: vec![consumer.path().to_owned()],
+        consumers: vec![consumer.to_owned()],
     };
     let repo = Repo::open(&lab.work).expect("open advanced branch");
 
-    let lag = repos::pin_lag(&entry, None, Some(&repo));
+    let lag = repos::pin_lag(&entry, None, Some(&repo), &forge, None, &heads);
 
-    assert!(
-        lag.notes
-            .iter()
-            .any(|note| note.contains("pins read from the working copy")),
-        "notes: {:?}",
-        lag.notes
-    );
     assert!(
         lag.lag.as_ref().is_some_and(|lag| lag.contains(&locked)),
         "lag: {:?}",
@@ -1570,27 +1601,23 @@ fn a_consumer_without_an_origin_remote_uses_its_current_working_copy_pin() {
     );
     lab.reset_consumer_to_origin(&consumer);
     lab.rename_consumer_remote(&consumer, "origin", "upstream");
-    let entry = RepoEntry {
-        path: lab.work,
-        upstream: "https://forge.invalid/up/tool.git".to_owned(),
-        origin: "https://forge.invalid/o/tool.git".to_owned(),
-        base: None,
-        release: None,
-        release_branch: None,
-        test_count_command: None,
-        consumers: vec![consumer.clone()],
-    };
 
-    let pin_lag = repos::pin_lag(&entry, Some(&"release/2026-07-28@origin".to_owned()), None);
+    let scan = knives::release_model::scan_consumer_for(
+        &consumer,
+        Some("tool"),
+        &knives::ids::ReleaseScheme::Dated,
+    );
 
-    assert_eq!(pin_lag.lag, None, "was: {pin_lag:?}");
+    assert_eq!(scan.pins.len(), 1, "was: {:?}", scan.pins);
+    assert_eq!(scan.pins[0].reference, "release/2026-07-28");
     assert_eq!(
-        pin_lag.notes,
+        scan.notes,
         vec![format!(
             "{}: no origin trunk resolved; pins read from the working copy",
             consumer.display()
         )]
     );
+    assert!(scan.problems.is_empty());
 }
 
 #[test]
@@ -2965,17 +2992,22 @@ fn consumers_reports_stale_and_behind_locks() {
     std::fs::write(
         home.path().join("repos.toml"),
         format!(
-            "[repos.demo]\npath = \"{}\"\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/tool.git\"\nrelease = \"{}\"\nconsumers = [\"{}\"]\n",
+            "[repos.demo]\npath = \"{}\"\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/tool.git\"\nrelease = \"{}\"\n",
             lab.work.display(),
             lab.upstream.display(),
             lab.temp_origin().display(),
-            consumer.path().display(),
         ),
     )
     .expect("write registry");
     let knives = || {
         Command::new(env!("CARGO_BIN_EXE_knives"))
-            .args(["--text", "consumers", "demo"])
+            .args([
+                "--text",
+                "consumers",
+                "demo",
+                "--consumer",
+                consumer.path().to_str().expect("utf-8 consumer path"),
+            ])
             .current_dir(&lab.work)
             .env("KNIVES_CONFIG_HOME", home.path())
             .output()
@@ -3005,7 +3037,7 @@ fn consumers_reports_stale_and_behind_locks() {
 }
 
 #[test]
-fn consumers_reports_a_missing_registry_path_as_incomplete() {
+fn consumers_reports_a_missing_local_path_as_incomplete() {
     let lab = Lab::new();
     lab.branch("release/2026-08-04", "release.txt", "first\n");
     lab.push_branch("release/2026-08-04");
@@ -3014,17 +3046,22 @@ fn consumers_reports_a_missing_registry_path_as_incomplete() {
     std::fs::write(
         home.path().join("repos.toml"),
         format!(
-            "[repos.demo]\npath = \"{}\"\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/tool.git\"\nrelease = \"{}\"\nconsumers = [\"{}\"]\n",
+            "[repos.demo]\npath = \"{}\"\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/tool.git\"\nrelease = \"{}\"\n",
             lab.work.display(),
             lab.upstream.display(),
             lab.temp_origin().display(),
-            missing.display(),
         ),
     )
     .expect("write registry");
 
     let output = Command::new(env!("CARGO_BIN_EXE_knives"))
-        .args(["--text", "consumers", "demo"])
+        .args([
+            "--text",
+            "consumers",
+            "demo",
+            "--consumer",
+            missing.to_str().expect("utf-8 missing consumer path"),
+        ])
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
         .output()
@@ -3054,17 +3091,22 @@ fn consumers_leaves_pins_unclassified_when_live_release_refs_fail() {
     std::fs::write(
         home.path().join("repos.toml"),
         format!(
-            "[repos.demo]\npath = \"{}\"\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/tool.git\"\nrelease = \"{}\"\nconsumers = [\"{}\"]\n",
+            "[repos.demo]\npath = \"{}\"\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/tool.git\"\nrelease = \"{}\"\n",
             lab.work.display(),
             lab.upstream.display(),
             unavailable.display(),
-            consumer.path().display(),
         ),
     )
     .expect("write registry");
 
     let output = Command::new(env!("CARGO_BIN_EXE_knives"))
-        .args(["--text", "consumers", "demo"])
+        .args([
+            "--text",
+            "consumers",
+            "demo",
+            "--consumer",
+            consumer.path().to_str().expect("utf-8 consumer path"),
+        ])
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
         .output()
@@ -3090,17 +3132,22 @@ fn consumers_reports_an_unreadable_pin_file_as_incomplete() {
     std::fs::write(
         home.path().join("repos.toml"),
         format!(
-            "[repos.demo]\npath = \"{}\"\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/tool.git\"\nrelease = \"{}\"\nconsumers = [\"{}\"]\n",
+            "[repos.demo]\npath = \"{}\"\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/tool.git\"\nrelease = \"{}\"\n",
             lab.work.display(),
             lab.upstream.display(),
             lab.temp_origin().display(),
-            consumer.path().display(),
         ),
     )
     .expect("write registry");
 
     let output = Command::new(env!("CARGO_BIN_EXE_knives"))
-        .args(["--text", "consumers", "demo"])
+        .args([
+            "--text",
+            "consumers",
+            "demo",
+            "--consumer",
+            consumer.path().to_str().expect("utf-8 consumer path"),
+        ])
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
         .output()
@@ -4621,8 +4668,18 @@ fn plan_for_a_fixed_release_ignores_a_non_publish_remote() {
     lab.jj_work(["bookmark", "delete", "integration"]);
 
     // When: planning selects the newest fixed release without a local bookmark.
-    let plan = knives::commands::release::plan(&knives::ids::RepoName::new("a-repo"), &entry, &[])
-        .expect("plan");
+    let forge = knives::forge::fake::FakeForge::default();
+    let heads = knives::release_model::ConsumerHeadMemo::default();
+    let consumers = knives::commands::release::ConsumerInputs {
+        slugs: &[],
+        locals: &[],
+        forge: &forge,
+        cache_root: None,
+        heads: &heads,
+    };
+    let plan =
+        knives::commands::release::plan(&knives::ids::RepoName::new("a-repo"), &entry, &consumers)
+            .expect("plan");
 
     // Then: upstream cannot be mistaken for the publish remote's release.
     assert_eq!(plan.release.as_deref(), Some("integration@origin"));
@@ -5484,10 +5541,9 @@ fn release_rebase_refuses_when_every_pin_is_frozen() {
     std::fs::write(
         home.path().join("repos.toml"),
         format!(
-            "[repos.demo]\npath = \"{}\"\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/work.git\"\nconsumers = [\"{}\"]\n",
+            "[repos.demo]\npath = \"{}\"\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/work.git\"\n",
             lab.work.display(),
             lab.upstream.display(),
-            consumer.display(),
         ),
     )
     .expect("write registry");
@@ -5498,7 +5554,16 @@ fn release_rebase_refuses_when_every_pin_is_frozen() {
         .expect("resolve release before refusal");
 
     // When: the real binary is asked to rebase the release onto upstream.
-    let output = knives_release(&lab, &home, &["rebase", "main@upstream"]);
+    let output = knives_release(
+        &lab,
+        &home,
+        &[
+            "--consumer",
+            consumer.to_str().expect("utf-8 consumer path"),
+            "rebase",
+            "main@upstream",
+        ],
+    );
 
     // Then: it directs the caller to a dated cut, exits incomplete, and does not move it.
     assert_eq!(
@@ -5537,17 +5602,25 @@ fn release_rebase_refusal_for_fixed_release_explains_that_revision_pins_cannot_f
     std::fs::write(
         home.path().join("repos.toml"),
         format!(
-            "[repos.demo]\npath = \"{}\"\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/work.git\"\nrelease_branch = \"integration\"\nconsumers = [\"{}\"]\n",
+            "[repos.demo]\npath = \"{}\"\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/work.git\"\nrelease_branch = \"integration\"\n",
             lab.work.display(),
             lab.upstream.display(),
-            consumer.display(),
         ),
     )
     .expect("write fixed-release registry");
     lab.advance_upstream("upstream advance\n");
 
     // When: the fixed release is asked to move in place.
-    let output = knives_release(&lab, &home, &["rebase", "main@upstream"]);
+    let output = knives_release(
+        &lab,
+        &home,
+        &[
+            "--consumer",
+            consumer.to_str().expect("utf-8 consumer path"),
+            "rebase",
+            "main@upstream",
+        ],
+    );
 
     // Then: it is incomplete and names the only viable remediation.
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -7906,16 +7979,24 @@ fn an_edit_refuses_when_every_pin_of_the_release_is_frozen() {
     std::fs::write(
         home.path().join("repos.toml"),
         format!(
-            "[repos.demo]\npath = \"{}\"\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/work.git\"\nconsumers = [\"{}\"]\n",
+            "[repos.demo]\npath = \"{}\"\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/work.git\"\n",
             lab.work.display(),
             lab.upstream.display(),
-            consumer.display(),
         ),
     )
     .expect("write frozen-pin registry");
     let before = release_parent_commits(&lab, release);
 
-    let output = knives_release(&lab, &home, &["include", "feat/gamma"]);
+    let output = knives_release(
+        &lab,
+        &home,
+        &[
+            "--consumer",
+            consumer.to_str().expect("utf-8 consumer path"),
+            "include",
+            "feat/gamma",
+        ],
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_eq!(output.status.code(), Some(3), "{stdout}");
@@ -8530,6 +8611,12 @@ fn release_command(
 ) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_knives"));
     command.args([output.flag(), "release", "--repo", "demo"]);
+    let local_consumer = home.path().join("local-consumer");
+    if local_consumer.exists() {
+        let consumer =
+            std::fs::read_to_string(&local_consumer).expect("read local consumer fixture path");
+        command.args(["--consumer", consumer.trim()]);
+    }
     command.args(args);
     command
         .current_dir(&lab.work)

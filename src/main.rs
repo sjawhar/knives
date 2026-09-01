@@ -246,14 +246,23 @@ fn run_consumers(
         eprintln!("unknown repo {fork}; known: {}", known.join(", "));
         return Ok(Exit::Usage);
     };
-    let mut paths = entry.consumers.clone();
-    paths.extend(extras.iter().cloned());
-    paths.sort();
-    paths.dedup();
+    let mut slugs = entry.consumers.clone();
+    slugs.sort();
+    slugs.dedup();
+    let mut locals = extras.to_vec();
+    locals.sort();
+    locals.dedup();
+    let forge = CliForge;
+    let cache_root = knives::forge_cache::cache_root();
+    let heads = knives::release_model::ConsumerHeadMemo::default();
     let report = consumers::gather(&consumers::Request {
         fork,
         entry,
-        consumers: &paths,
+        slugs: &slugs,
+        locals: &locals,
+        forge: &forge,
+        cache_root: cache_root.as_deref(),
+        heads: &heads,
     });
     if let Some(payload) = knives::cli::machine_payload(output, &report)? {
         println!("{payload}");
@@ -335,6 +344,7 @@ fn dispatch_release(
                 chosen.as_str(),
                 reference.as_deref(),
                 no_drop,
+                extra_consumers,
                 cache_root.as_deref(),
             )
         }
@@ -376,15 +386,23 @@ fn dispatch_release(
             )
         }
         Some(ReleaseAction::Reap) => run_reap(chosen.as_str()),
-        Some(ReleaseAction::Include { branch, why }) => {
-            run_release_edit(chosen.as_str(), &ReleaseEdit::Include { branch, why })
-        }
-        Some(ReleaseAction::Drop { branch, why }) => {
-            run_release_edit(chosen.as_str(), &ReleaseEdit::Drop { branch, why })
-        }
+        Some(ReleaseAction::Include { branch, why }) => run_release_edit(
+            chosen.as_str(),
+            extra_consumers,
+            &ReleaseEdit::Include { branch, why },
+        ),
+        Some(ReleaseAction::Drop { branch, why }) => run_release_edit(
+            chosen.as_str(),
+            extra_consumers,
+            &ReleaseEdit::Drop { branch, why },
+        ),
         Some(ReleaseAction::Advance { branches, from }) => {
             let branches = branches.into_iter().map(BranchName::new).collect();
-            run_release_edit(chosen.as_str(), &ReleaseEdit::Advance { branches, from })
+            run_release_edit(
+                chosen.as_str(),
+                extra_consumers,
+                &ReleaseEdit::Advance { branches, from },
+            )
         }
     }
 }
@@ -412,10 +430,20 @@ fn run_release_members(
     request: MembersInvocation<'_>,
 ) -> anyhow::Result<Exit> {
     let opened = Repo::open(&entry.path)?;
+    let forge = CliForge;
+    let cache_root = knives::forge_cache::cache_root();
+    let heads = knives::release_model::ConsumerHeadMemo::default();
     let reference = if let Some(reference) = request.reference {
         std::borrow::Cow::Borrowed(reference)
     } else {
-        let plan = release::plan(repo, entry, &entry.consumers)?;
+        let consumers = release::ConsumerInputs {
+            slugs: &entry.consumers,
+            locals: &[],
+            forge: &forge,
+            cache_root: cache_root.as_deref(),
+            heads: &heads,
+        };
+        let plan = release::plan(repo, entry, &consumers)?;
         let Some(reference) = plan.release else {
             println!("{repo}: no release to inspect; cut one first");
             return Ok(Exit::Incomplete);
@@ -709,20 +737,41 @@ fn print_census(report: &CensusReport, output: Output) -> anyhow::Result<()> {
 /// and whether to move at all, is a judgment. After a bare rebase, members
 /// whose pull requests landed and carry nothing more are dropped — the work
 /// reaches the release through its new base — unless `--no-drop` keeps them.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "rebasing is one ordered stateful gate sequence; its inputs remain explicit and its stages must not be separated"
+)]
 fn run_rebase(
     name: &str,
     reference: Option<&str>,
     no_drop: bool,
+    extra_consumers: &[&std::path::Path],
     cache_root: Option<&std::path::Path>,
 ) -> anyhow::Result<Exit> {
     let chosen = match selected(Some(name), false)? {
         Ok(list) => list,
         Err(exit) => return Ok(exit),
     };
+    let mut locals = extra_consumers
+        .iter()
+        .map(|path| path.to_path_buf())
+        .collect::<Vec<_>>();
+    locals.sort();
+    locals.dedup();
     let mut worst = Exit::Ok;
+    let forge = CliForge;
+    let heads = knives::release_model::ConsumerHeadMemo::default();
     for (repo, entry) in chosen {
         let opened = knives::jj::Repo::open(&entry.path)?;
-        let plan = release::plan(&repo, &entry, &entry.consumers)?;
+        let consumers = release::ConsumerInputs {
+            slugs: &entry.consumers,
+            locals: &locals,
+            forge: &forge,
+            cache_root,
+            heads: &heads,
+        };
+        let plan = release::plan(&repo, &entry, &consumers)?;
         let Some(release_name) = plan.release.clone() else {
             println!("{repo}: no release to move");
             continue;
@@ -1413,14 +1462,35 @@ struct EditContext<'a> {
 }
 
 /// Apply one stated change to each chosen repo's release in hand.
-fn run_release_edit(name: &str, change: &ReleaseEdit) -> anyhow::Result<Exit> {
+fn run_release_edit(
+    name: &str,
+    extra_consumers: &[&std::path::Path],
+    change: &ReleaseEdit,
+) -> anyhow::Result<Exit> {
     let chosen = match selected(Some(name), false)? {
         Ok(list) => list,
         Err(exit) => return Ok(exit),
     };
+    let mut locals = extra_consumers
+        .iter()
+        .map(|path| path.to_path_buf())
+        .collect::<Vec<_>>();
+    locals.sort();
+    locals.dedup();
     let mut worst = Exit::Ok;
+    let forge = CliForge;
+    let cache_root = knives::forge_cache::cache_root();
+    let heads = knives::release_model::ConsumerHeadMemo::default();
     for (repo, entry) in chosen {
-        worst = worst.worst(edit_release(&repo, &entry, change)?);
+        worst = worst.worst(edit_release(
+            &repo,
+            &entry,
+            &locals,
+            change,
+            &forge,
+            cache_root.as_deref(),
+            &heads,
+        )?);
     }
     Ok(worst)
 }
@@ -1431,13 +1501,28 @@ fn run_release_edit(name: &str, change: &ReleaseEdit) -> anyhow::Result<Exit> {
 /// onto the changed parent set, describe it, move its name — with the same pin
 /// gate a rebase has. The duplicate preserves recorded conflict resolutions;
 /// only the change itself can surface new conflicts, and they are reported.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "release-edit state and the shared consumer-scan collaborators are independently owned command inputs"
+)]
 fn edit_release(
     repo: &RepoName,
     entry: &knives::config::RepoEntry,
+    locals: &[std::path::PathBuf],
     change: &ReleaseEdit,
+    forge: &dyn Forge,
+    cache_root: Option<&std::path::Path>,
+    heads: &knives::release_model::ConsumerHeadMemo,
 ) -> anyhow::Result<Exit> {
     let opened = knives::jj::Repo::open(&entry.path)?;
-    let plan = release::plan(repo, entry, &entry.consumers)?;
+    let consumers = release::ConsumerInputs {
+        slugs: &entry.consumers,
+        locals,
+        forge,
+        cache_root,
+        heads,
+    };
+    let plan = release::plan(repo, entry, &consumers)?;
     let Some(release_name) = plan.release.clone() else {
         println!("{repo}: no release to edit; cut one first");
         return Ok(Exit::Incomplete);
@@ -2571,6 +2656,10 @@ enum ReleaseInvocation {
     },
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "cutting is one ordered transaction whose candidate, audits, composition gate, publication, and ledger event must stay together"
+)]
 fn run_release(
     name: &str,
     extra_consumers: &[&std::path::Path],
@@ -2581,20 +2670,31 @@ fn run_release(
         Err(exit) => return Ok(exit),
     };
     let mut worst = Exit::Ok;
+    let mut locals = extra_consumers
+        .iter()
+        .map(|path| path.to_path_buf())
+        .collect::<Vec<_>>();
+    locals.sort();
+    locals.dedup();
+    let forge = CliForge;
+    let cache_root = knives::forge_cache::cache_root();
+    let heads = knives::release_model::ConsumerHeadMemo::default();
     for (repo, entry) in chosen {
-        // Consumers recorded in the registry are the answer to `--consumer`; asking for
-        // them again every time is how the flag stayed unexplained and unused. A flag,
-        // when given, adds to them rather than replacing: a fork has however many
-        // consumers it has, and asking about one more does not unrecord the others.
-        let mut consumers = entry.consumers.clone();
-        consumers.extend(extra_consumers.iter().map(|path| path.to_path_buf()));
         let opened = knives::jj::Repo::open(&entry.path)?;
         let scheme = entry.release_scheme();
         let (cut_name, allow_drop) = match requested_cut(invocation, &scheme) {
             Ok(request) => request,
             Err(exit) => return Ok(exit),
         };
-        worst = worst.worst(release_plan_exit(&repo, &entry, &consumers, &opened)?);
+        worst = worst.worst(release_plan_exit(
+            &repo,
+            &entry,
+            &locals,
+            &opened,
+            &forge,
+            cache_root.as_deref(),
+            &heads,
+        )?);
 
         if let Some(name) = cut_name {
             let trunk_name = entry.upstream_trunk();
@@ -2714,13 +2814,27 @@ fn requested_cut(
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the release plan needs explicit repository state and each independently owned consumer-scan collaborator"
+)]
 fn release_plan_exit(
     repo: &RepoName,
     entry: &knives::config::RepoEntry,
-    consumers: &[std::path::PathBuf],
+    locals: &[std::path::PathBuf],
     opened: &knives::jj::Repo,
+    forge: &dyn Forge,
+    cache_root: Option<&std::path::Path>,
+    heads: &knives::release_model::ConsumerHeadMemo,
 ) -> anyhow::Result<Exit> {
-    let plan = release::plan(repo, entry, consumers)?;
+    let consumers = release::ConsumerInputs {
+        slugs: &entry.consumers,
+        locals,
+        forge,
+        cache_root,
+        heads,
+    };
+    let plan = release::plan(repo, entry, &consumers)?;
     println!("{}", release::render(&plan));
     let mut exit = release::exit_for(&plan);
     if let Some(lag) = release::trunk_lag(opened, plan.release.as_deref(), &entry.upstream_trunk())

@@ -307,6 +307,13 @@ impl RepoIdentity {
     }
 }
 
+/// The default branch and current head commit of a consumer repository.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsumerHead {
+    pub branch: String,
+    pub commit: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SweepEntry {
     pub number: u64,
@@ -472,6 +479,22 @@ pub trait Forge: Send + Sync {
         target: &RepoIdentity,
         number: u64,
     ) -> Result<Vec<TimelineEvent>, ForgeError>;
+
+    /// The consumer's default branch and its head commit in one forge call.
+    fn consumer_head(&self, repo: &Path, slug: &str) -> Result<ConsumerHead, ForgeError>;
+
+    /// One file's raw text at a commit. A missing file is not an error.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the checkout, consumer slug, commit, and file path are distinct forge-address components"
+    )]
+    fn file_at(
+        &self,
+        repo: &Path,
+        slug: &str,
+        commit: &str,
+        path: &str,
+    ) -> Result<Option<String>, ForgeError>;
 }
 
 /// One branch's pull request summaries, split into the primary and its shadowed history.

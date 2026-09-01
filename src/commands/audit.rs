@@ -575,8 +575,8 @@ mod tests {
     use crate::config::RepoEntry;
     use crate::detect::{FindingKind, Subject};
     use crate::forge::{
-        Account, Forge, ForgeError, PullDetails, PullFacts, PullRequest, PullSummary, RepoIdentity,
-        SweepPage, TimelineEvent, fake::FakeForge,
+        Account, ConsumerHead, Forge, ForgeError, PullDetails, PullFacts, PullRequest, PullSummary,
+        RepoIdentity, SweepPage, TimelineEvent, fake::FakeForge,
     };
     use crate::ids::{BookmarkRef, BranchName, CommitId, RepoName};
     use crate::ledger::{Entry, Kind, Ledger};
@@ -644,6 +644,24 @@ mod tests {
             _number: u64,
         ) -> Result<Vec<TimelineEvent>, ForgeError> {
             Ok(Vec::new())
+        }
+
+        fn consumer_head(&self, _repo: &Path, _slug: &str) -> Result<ConsumerHead, ForgeError> {
+            Err(ForgeError::Query {
+                detail: "consumer lookups are not part of this test".to_owned(),
+            })
+        }
+
+        fn file_at(
+            &self,
+            _repo: &Path,
+            _slug: &str,
+            _commit: &str,
+            _path: &str,
+        ) -> Result<Option<String>, ForgeError> {
+            Err(ForgeError::Query {
+                detail: "consumer lookups are not part of this test".to_owned(),
+            })
         }
     }
 

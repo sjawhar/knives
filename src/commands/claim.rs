@@ -210,8 +210,14 @@ mod tests {
     #[test]
     fn current_owner_filters_a_blank_knives_owner() {
         let _lock = environment_lock();
-        let environment =
-            EnvironmentGuard::capture(&["KNIVES_OWNER", "CLAUDE_CODE_SESSION_ID", "USER"]);
+        let environment = EnvironmentGuard::capture(&[
+            "KNIVES_CONFIG_HOME",
+            "KNIVES_OWNER",
+            "CLAUDE_CODE_SESSION_ID",
+            "USER",
+        ]);
+        let config = tempfile::tempdir().unwrap();
+        environment.set("KNIVES_CONFIG_HOME", config.path().to_str().unwrap());
         environment.set("KNIVES_OWNER", "   ");
         environment.remove("CLAUDE_CODE_SESSION_ID");
         environment.set("USER", "terminal-user");
@@ -239,8 +245,14 @@ mod tests {
     #[test]
     fn current_owner_falls_back_to_user_when_the_session_id_is_blank() {
         let _lock = environment_lock();
-        let environment =
-            EnvironmentGuard::capture(&["KNIVES_OWNER", "CLAUDE_CODE_SESSION_ID", "USER"]);
+        let environment = EnvironmentGuard::capture(&[
+            "KNIVES_CONFIG_HOME",
+            "KNIVES_OWNER",
+            "CLAUDE_CODE_SESSION_ID",
+            "USER",
+        ]);
+        let config = tempfile::tempdir().unwrap();
+        environment.set("KNIVES_CONFIG_HOME", config.path().to_str().unwrap());
 
         environment.remove("KNIVES_OWNER");
         environment.set("CLAUDE_CODE_SESSION_ID", "   ");
