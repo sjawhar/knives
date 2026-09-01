@@ -132,17 +132,14 @@ pub struct RepoEntry {
     /// check is reported as not configured, never as passed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub test_count_command: Option<String>,
-    /// Checkouts that pin this repo's releases, so pinned-versus-newest can be answered
-    /// without being asked.
+    /// Forge slugs for repositories that pin this repo's releases, so
+    /// pinned-versus-newest can be answered without local checkouts.
     ///
     /// A list, because a fork can be consumed by several things at once and they can sit
-    /// on different releases — which is the case the pin logic already reasoned about
-    /// while the registry could only record one of them. Recorded here rather than passed
-    /// as a flag every time, because the fact worth knowing is that a consumer is behind,
-    /// and nobody runs a command to discover a question they have not thought of. Empty
-    /// is normal: not every fork is consumed by something we also check out.
+    /// on different releases. Local checkouts are deliberately not persisted here: pass
+    /// them with `--consumer` for a one-off scan.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub consumers: Vec<PathBuf>,
+    pub consumers: Vec<String>,
 }
 
 impl RepoEntry {
@@ -490,7 +487,7 @@ pub fn load(path: &Path) -> Result<Registry, ConfigError> {
     // Resolve once, here, so no caller can accidentally use the raw value and
     // end up pointed somewhere other than the plugin's allowlist.
     let home = path.parent().unwrap_or_else(|| Path::new(".")).to_owned();
-    for entry in registry.repos.values_mut() {
+    for (name, entry) in &mut registry.repos {
         entry.path = entry.resolved_path(&home);
         for (role, remote) in [
             ("upstream", entry.upstream.as_str()),
@@ -534,14 +531,18 @@ pub fn load(path: &Path) -> Result<Registry, ConfigError> {
                 });
             }
         }
-        // Consumer paths get the same treatment as the repo path. Leaving `~` unexpanded
-        // made a recorded consumer read as pinning nothing, which is the same wrong answer
-        // as having no consumer at all.
-        entry.consumers = entry
-            .consumers
-            .iter()
-            .map(|consumer| expand_registry_path(consumer, &home))
-            .collect();
+        for consumer in &entry.consumers {
+            if !is_forge_slug(consumer) {
+                return Err(ConfigError::Invalid {
+                    path: path.to_owned(),
+                    detail: format!(
+                        "repos.toml: [repos.{name}] consumers now takes forge slugs \
+                         (\"<owner>/<repo>\"); found \"{consumer}\". Scan a local checkout \
+                         with --consumer <path> instead."
+                    ),
+                });
+            }
+        }
     }
     for entry in registry.trusted.values_mut() {
         entry.path = entry.resolved_path(&home);
@@ -550,6 +551,19 @@ pub fn load(path: &Path) -> Result<Registry, ConfigError> {
         *root = expand_registry_path(root, &home);
     }
     Ok(registry)
+}
+
+fn is_forge_slug(value: &str) -> bool {
+    let Some((owner, repository)) = value.split_once('/') else {
+        return false;
+    };
+    let has_path_syntax =
+        |segment: &str| segment.starts_with(['/', '~', '.']) || segment.contains('\\');
+    !owner.is_empty()
+        && !repository.is_empty()
+        && !repository.contains('/')
+        && !has_path_syntax(owner)
+        && !has_path_syntax(repository)
 }
 
 pub fn save(registry: &Registry, path: &Path) -> Result<(), ConfigError> {
@@ -797,24 +811,25 @@ release = "https://example.invalid/releases.git"
     }
 
     #[test]
-    fn consumer_paths_are_expanded_like_the_repo_path() {
-        // An unexpanded `~` made a recorded consumer look like one pinning nothing,
-        // which reads identically to having no consumer at all.
-        let _lock = environment_lock();
-        let environment = EnvironmentGuard::capture(&["HOME"]);
-        environment.set("HOME", "/home/someone");
+    fn consumer_slugs_load_verbatim() {
         let dir = tempfile::tempdir().unwrap();
         let text = "[repos.demo]\npath = \"/tmp/demo\"\nupstream = \"u\"\norigin = \"o\"\n\
-                    consumers = [\"~/one/default\", \"~/two/default\"]\n";
+                    consumers = [\"an-org/a-consumer\"]\n";
         let registry = load(&write(dir.path(), text)).unwrap();
         assert_eq!(
             registry.repos["demo"].consumers,
-            vec![
-                PathBuf::from("/home/someone/one/default"),
-                PathBuf::from("/home/someone/two/default")
-            ],
-            "a fork can be consumed by several things at once"
+            vec!["an-org/a-consumer".to_owned()]
         );
+    }
+
+    #[test]
+    fn a_path_in_consumers_is_a_loud_config_error_naming_the_new_form() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = "[repos.demo]\npath = \"/tmp/demo\"\nupstream = \"u\"\norigin = \"o\"\n\
+                    consumers = [\"~/one/default\"]\n";
+        let error = load(&write(dir.path(), text)).unwrap_err().to_string();
+        assert!(error.contains("forge slugs"), "was: {error}");
+        assert!(error.contains("--consumer"), "was: {error}");
     }
 
     #[test]

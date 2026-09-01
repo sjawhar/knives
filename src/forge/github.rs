@@ -14,8 +14,8 @@ use std::sync::{Condvar, Mutex};
 use serde::{Deserialize, Deserializer};
 
 use super::{
-    CheckRun, ChecksSummary, CommitOids, DiffTotals, Forge, ForgeError, PullDetails, PullFacts,
-    PullRequest, PullSummary, RepoIdentity, SweepEntry, SweepPage, TimelineEvent,
+    CheckRun, ChecksSummary, CommitOids, ConsumerHead, DiffTotals, Forge, ForgeError, PullDetails,
+    PullFacts, PullRequest, PullSummary, RepoIdentity, SweepEntry, SweepPage, TimelineEvent,
     TimelineEventKind,
 };
 const PR_STATE: &str = "all";
@@ -359,6 +359,40 @@ impl Forge for CliForge {
             joined_forge_call(worker.join())
         })
     }
+
+    fn consumer_head(&self, repo: &Path, slug: &str) -> Result<ConsumerHead, ForgeError> {
+        let Some((owner, name)) = slug.split_once('/') else {
+            return Err(ForgeError::Target {
+                named: slug.to_owned(),
+            });
+        };
+        let owner = format!("owner={owner}");
+        let name = format!("name={name}");
+        let query = format!("query={}", consumer_head_query());
+        let payload = Self::run(
+            repo,
+            &["api", "graphql", "-f", &owner, "-f", &name, "-f", &query],
+        )?;
+        parse_consumer_head(&payload)
+    }
+
+    fn file_at(
+        &self,
+        repo: &Path,
+        slug: &str,
+        commit: &str,
+        path: &str,
+    ) -> Result<Option<String>, ForgeError> {
+        let endpoint = format!("repos/{slug}/contents/{path}?ref={commit}");
+        match Self::run(
+            repo,
+            &["api", &endpoint, "-H", "Accept: application/vnd.github.raw"],
+        ) {
+            Ok(text) => Ok(Some(text)),
+            Err(ForgeError::Command { stderr, .. }) if stderr.contains("HTTP 404") => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
 }
 
 /// One pull request's head-ref history. `last: 100` of only the named item
@@ -519,6 +553,36 @@ struct IdentityPayload {
     #[serde(rename = "nameWithOwner")]
     name_with_owner: String,
     id: String,
+}
+
+#[derive(Deserialize)]
+struct ConsumerHeadTarget {
+    oid: String,
+}
+
+#[derive(Deserialize)]
+struct ConsumerHeadReference {
+    name: String,
+    target: ConsumerHeadTarget,
+}
+
+#[derive(Deserialize)]
+struct ConsumerHeadRepository {
+    #[serde(rename = "defaultBranchRef")]
+    default_branch_ref: Option<ConsumerHeadReference>,
+}
+
+#[derive(Deserialize)]
+struct ConsumerHeadData {
+    repository: Option<ConsumerHeadRepository>,
+}
+
+#[derive(Deserialize)]
+struct ConsumerHeadEnvelope {
+    #[serde(default)]
+    data: Option<ConsumerHeadData>,
+    #[serde(default)]
+    errors: Vec<QueryFailure>,
 }
 
 #[derive(Deserialize)]
@@ -715,6 +779,38 @@ pub fn parse_identity(payload: &str) -> Result<RepoIdentity, ForgeError> {
     Ok(RepoIdentity {
         name_with_owner: identity.name_with_owner,
         id: identity.id,
+    })
+}
+
+pub const fn consumer_head_query() -> &'static str {
+    "query($owner: String!, $name: String!) { repository(owner: $owner, name: $name) { \
+     defaultBranchRef { name target { oid } } } }"
+}
+
+pub fn parse_consumer_head(payload: &str) -> Result<ConsumerHead, ForgeError> {
+    let envelope: ConsumerHeadEnvelope = serde_json::from_str(payload)?;
+    if !envelope.errors.is_empty() {
+        return Err(ForgeError::Query {
+            detail: envelope
+                .errors
+                .iter()
+                .map(|failure| failure.message.clone())
+                .collect::<Vec<_>>()
+                .join("; "),
+        });
+    }
+    let Some(reference) = envelope
+        .data
+        .and_then(|data| data.repository)
+        .and_then(|repository| repository.default_branch_ref)
+    else {
+        return Err(ForgeError::Query {
+            detail: "the consumer reply carried neither errors nor a default branch".to_owned(),
+        });
+    };
+    Ok(ConsumerHead {
+        branch: reference.name,
+        commit: reference.target.oid,
     })
 }
 
@@ -1234,6 +1330,45 @@ printf '{}'
     fn facts_payload(entries: &str) -> String {
         format!("{{\"data\":{{\"repository\":{{{entries}}}}}}}")
     }
+    #[test]
+    fn a_null_review_decision_in_the_facts_batch_decodes_as_no_review() {
+        // The forge returns explicit null for a pull request nobody reviewed; serde's
+        // #[serde(default)] does not cover explicit null, and this exact reply shape
+        // downgraded a whole status run to pull-state-unavailable.
+        let payload = r#"{"data":{"repository":{"p134":{
+        "number":134,"state":"OPEN","reviewDecision":null,
+        "headRefName":"feat/x","headRefOid":"0123456789abcdef0123456789abcdef01234567",
+        "updatedAt":"2026-08-30T00:00:00Z","isDraft":false,
+        "url":"https://forge.example/r/pull/134",
+        "headRepositoryOwner":{"login":"someone"},"baseRefName":"main",
+        "mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","mergeCommit":null,
+        "additions":1,"deletions":0,"changedFiles":1,"headRef":{"name":"feat/x"},
+        "reviews":{"nodes":[]},
+        "commits":{"nodes":[{"commit":{"committedDate":"2026-08-29T00:00:00Z"}}]}
+    }}}}"#;
+        let facts = parse_pull_facts(payload, &[134]).expect("null reviewDecision must decode");
+        assert_eq!(facts[&134].pull.review_decision, "");
+    }
+
+    #[test]
+    fn a_null_required_string_in_the_facts_batch_fails_to_decode() {
+        let payload = facts_payload(
+            r#""p134":{"number":134,"state":null,"headRefName":"feat/x",
+        "headRefOid":"0123456789abcdef0123456789abcdef01234567",
+        "updatedAt":"2026-08-30T00:00:00Z"}"#,
+        );
+
+        let error = parse_pull_facts(&payload, &[134])
+            .expect_err("a null required field must make the batch unavailable");
+
+        assert!(matches!(error, ForgeError::Parse { .. }), "was: {error}");
+        assert!(
+            error
+                .to_string()
+                .contains("invalid type: null, expected a string"),
+            "was: {error}"
+        );
+    }
 
     #[test]
     fn facts_carry_the_full_row_the_details_and_the_newest_comment() {
@@ -1565,6 +1700,20 @@ printf '{}'
             facts[&7].newest_comment.as_deref(),
             Some("2026-08-03T00:00:00Z")
         );
+    }
+
+    #[test]
+    fn consumer_head_query_parses_the_default_branch_and_commit() {
+        let head = parse_consumer_head(
+            r#"{"data":{"repository":{"defaultBranchRef":{"name":"main","target":{"oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}}}}"#,
+        )
+        .expect("consumer head parses");
+
+        assert_eq!(head.branch, "main");
+        assert_eq!(head.commit, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let query = consumer_head_query();
+        assert!(query.contains("defaultBranchRef"), "was: {query}");
+        assert!(query.contains("target { oid }"), "was: {query}");
     }
 
     #[test]

@@ -62,6 +62,38 @@ fn addition(output: &Value) -> &str {
     output["addition"].as_str().expect("tool addition")
 }
 
+fn notice_attribute<'a>(addition: &'a str, name: &str) -> &'a str {
+    let tag = addition
+        .lines()
+        .find(|line| line.starts_with("<knives-notice-"))
+        .expect("notice opening tag");
+    let prefix = format!("{name}=\"");
+    tag.split_once(&prefix)
+        .and_then(|(_, value)| value.split_once('"').map(|(value, _)| value))
+        .expect("notice attribute")
+}
+
+fn notice_nonce(addition: &str) -> &str {
+    let tag = addition
+        .lines()
+        .find(|line| line.starts_with("<knives-notice-"))
+        .expect("notice opening tag");
+    tag.strip_prefix("<knives-notice-")
+        .and_then(|rest| rest.split_once(' ').map(|(nonce, _)| nonce))
+        .expect("notice nonce")
+}
+
+fn claim(branch: &str) -> Value {
+    json!({
+        "repo": "beta",
+        "branch": branch,
+        "owner": "agent-one",
+        "why": "porting",
+        "started": "2026-01-01T00:00:00Z",
+        "files": []
+    })
+}
+
 struct Repositories {
     home: tempfile::TempDir,
     beta: PathBuf,
@@ -137,6 +169,96 @@ fn tool_after_emits_notice_and_guidance_once_with_one_shared_budget() {
         "was: {first}"
     );
     assert_eq!(addition(&second), "");
+}
+
+#[test]
+fn the_same_roster_is_noticed_once_per_session() {
+    // Removing content-aware notice tracking would re-inject on the second
+    // identical event, creating repetitive hook output.
+    let repos = Repositories::new();
+    let event = tool(&repos.beta.join("file.txt"), None);
+
+    let first = run_hook(repos.home.path(), &event);
+    let second = run_hook(repos.home.path(), &event);
+
+    assert_eq!(notice_attribute(addition(&first), "digest").len(), 16);
+    assert_eq!(addition(&second), "");
+}
+
+#[test]
+fn a_roster_change_re_emits_the_notice() {
+    // A boolean "noticed" flag would suppress the second notice even though
+    // the roster changed and the user needs the new branch in the response.
+    let repos = Repositories::new();
+    let event = tool(&repos.beta.join("file.txt"), None);
+
+    let first = run_hook(repos.home.path(), &event);
+    repos.write_state(&json!({"claims": {
+        "beta/feat/claimed": claim("feat/claimed"),
+        "beta/feat/new": claim("feat/new")
+    }}));
+    let second = run_hook(repos.home.path(), &event);
+
+    assert!(
+        addition(&second).contains("<knives-notice-"),
+        "was: {second}"
+    );
+    assert!(addition(&second).contains("feat/new"), "was: {second}");
+    assert_ne!(
+        notice_attribute(addition(&first), "digest"),
+        notice_attribute(addition(&second), "digest")
+    );
+}
+
+#[test]
+fn the_notice_tag_carries_a_stable_digest_and_a_fresh_nonce() {
+    // Digesting the nonce would make equal rosters look different, while
+    // reusing it would weaken the notice envelope's anti-injection boundary.
+    let repos = Repositories::new();
+    let mut first_event = tool(&repos.beta.join("file.txt"), None);
+    first_event["session_id"] = json!("first-session");
+    let mut second_event = tool(&repos.beta.join("file.txt"), None);
+    second_event["session_id"] = json!("second-session");
+
+    let first = run_hook(repos.home.path(), &first_event);
+    let second = run_hook(repos.home.path(), &second_event);
+
+    assert_eq!(
+        notice_attribute(addition(&first), "digest"),
+        notice_attribute(addition(&second), "digest")
+    );
+    assert_ne!(
+        notice_nonce(addition(&first)),
+        notice_nonce(addition(&second))
+    );
+}
+
+#[test]
+fn tool_after_in_a_managed_workspace_records_event_identity_and_cwd() {
+    let repos = Repositories::new();
+    std::fs::create_dir_all(repos.beta.join(".jj")).expect("create workspace marker");
+    let mut event = tool(&repos.beta.join("file.txt"), None);
+    event["cwd"] = json!(repos.beta);
+
+    let _ = run_hook(repos.home.path(), &event);
+
+    let seen: Value = serde_json::from_str(
+        &std::fs::read_to_string(repos.home.path().join("seen.json"))
+            .expect("OpenCode hook records seen.json"),
+    )
+    .expect("seen JSON");
+    assert!(
+        seen["owners"]["harness-session"][SESSION_ID]
+            .as_str()
+            .is_some_and(|timestamp| timestamp.parse::<jiff::Timestamp>().is_ok()),
+        "was: {seen}"
+    );
+    assert!(
+        seen["workspaces"]["beta/beta"]
+            .as_str()
+            .is_some_and(|timestamp| timestamp.parse::<jiff::Timestamp>().is_ok()),
+        "was: {seen}"
+    );
 }
 
 #[test]

@@ -5,6 +5,7 @@ use std::process::Command;
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
+use futures_core::Stream as _;
 use jj_lib::backend::CommitId as JjCommitId;
 use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
 use jj_lib::local_working_copy::LocalWorkingCopy;
@@ -20,6 +21,7 @@ use jj_lib::rewrite::{duplicate_commits, merge_commit_trees, rebase_commit};
 use jj_lib::settings::UserSettings;
 use jj_lib::transaction::Transaction;
 use jj_lib::working_copy::WorkingCopy as _;
+use jj_lib::workspace::{Workspace, default_working_copy_factories};
 use thiserror::Error;
 
 use crate::detect::landed::RebaseOutcome;
@@ -33,6 +35,14 @@ use crate::ids::{
 pub enum JjError {
     #[error("could not open jj repository at {path}: {detail}")]
     Open { path: String, detail: String },
+    #[error(
+        "workspace {workspace} belongs to repository {actual}, not configured repository {expected}"
+    )]
+    WorkspaceRepositoryMismatch {
+        workspace: PathBuf,
+        expected: PathBuf,
+        actual: PathBuf,
+    },
     #[error("could not resolve revision `{revision}`: {detail}")]
     Revision { revision: String, detail: String },
     #[error("reference `{name}` is absent or conflicted")]
@@ -55,6 +65,9 @@ pub enum JjError {
     Immutable { commit: String, pin: String },
 }
 
+/// Bound the passive operation walk so status stays proportional to current work.
+pub const MAX_ACTIVITY_OPS: usize = 200;
+
 /// Twelve characters is what jj shows, and a full id is correct and unreadable.
 fn short_id(id: &str) -> String {
     id.chars().take(12).collect()
@@ -64,6 +77,20 @@ fn short_id(id: &str) -> String {
 pub struct Repo {
     repo: Arc<ReadonlyRepo>,
     path: PathBuf,
+}
+
+/// Working-copy moves for the requested workspaces and the walk's coverage.
+///
+/// Read-only commands on a clean tree write no operation, and mutations that do
+/// not move a working copy cannot be attributed to a workspace. This remains a
+/// descriptive observation, never a liveness guarantee.
+#[derive(Debug, Default)]
+pub struct WorkspaceActivity {
+    pub moves: BTreeMap<WorkspaceName, jiff::Timestamp>,
+    /// The end time of the oldest visited operation, unless the whole op log was
+    /// consumed. A bounded walk must carry this witness so callers never call
+    /// an unsearched past "never".
+    pub horizon: Option<jiff::Timestamp>,
 }
 
 impl Repo {
@@ -141,6 +168,219 @@ impl Repo {
                 ))
             })
             .collect()
+    }
+
+    /// Re-registers a workspace that `jj workspace forget` left on disk.
+    ///
+    /// The forgotten workspace's state points at the operation that last owned
+    /// its working-copy commit. Reinstating that mapping and advancing only the
+    /// state operation preserves the files and change exactly as they were.
+    pub fn reattach_workspace(&self, destination: &Path) -> Result<(), JjError> {
+        let expected = Self::repository_store_path(&self.path)?;
+        let actual = Self::repository_store_path(destination)?;
+        if actual != expected {
+            return Err(JjError::WorkspaceRepositoryMismatch {
+                workspace: destination.to_owned(),
+                expected,
+                actual,
+            });
+        }
+
+        let settings = repo_settings(destination)?;
+        let mut workspace = Workspace::load(
+            &settings,
+            destination,
+            &StoreFactories::default(),
+            &default_working_copy_factories(),
+        )
+        .map_err(|error| JjError::Open {
+            path: destination.display().to_string(),
+            detail: error.to_string(),
+        })?;
+        let workspace_repo_path =
+            workspace
+                .repo_path()
+                .canonicalize()
+                .map_err(|error| JjError::Open {
+                    path: workspace.repo_path().display().to_string(),
+                    detail: error.to_string(),
+                })?;
+        if workspace_repo_path != expected {
+            return Err(JjError::WorkspaceRepositoryMismatch {
+                workspace: destination.to_owned(),
+                expected,
+                actual: workspace_repo_path,
+            });
+        }
+        let name = workspace.workspace_name().to_owned();
+        let recorded = workspace.working_copy().operation_id().clone();
+        let repo_loader = workspace.repo_loader();
+        let operation =
+            block_on(repo_loader.load_operation(&recorded)).map_err(|error| JjError::Open {
+                path: destination.display().to_string(),
+                detail: error.to_string(),
+            })?;
+        let historical =
+            block_on(repo_loader.load_at(&operation)).map_err(|error| JjError::Open {
+                path: destination.display().to_string(),
+                detail: error.to_string(),
+            })?;
+        let commit = historical
+            .view()
+            .get_wc_commit_id(&name)
+            .cloned()
+            .ok_or_else(|| JjError::Open {
+                path: destination.display().to_string(),
+                detail: format!(
+                    "workspace {} has no working-copy commit at its recorded operation",
+                    name.as_symbol()
+                ),
+            })?;
+
+        let mut transaction = self.repo.start_transaction();
+        transaction.set_workspace_name(&name);
+        transaction
+            .repo_mut()
+            .set_wc_commit(name, commit)
+            .map_err(|error| JjError::Open {
+                path: destination.display().to_string(),
+                detail: error.to_string(),
+            })?;
+        let updated =
+            block_on(transaction.commit("re-registered forgotten workspace")).map_err(|error| {
+                JjError::Open {
+                    path: destination.display().to_string(),
+                    detail: error.to_string(),
+                }
+            })?;
+        let mutation =
+            block_on(workspace.start_working_copy_mutation()).map_err(|error| JjError::Open {
+                path: destination.display().to_string(),
+                detail: error.to_string(),
+            })?;
+        block_on(mutation.finish(updated.operation().id().clone())).map_err(|error| JjError::Open {
+            path: destination.display().to_string(),
+            detail: error.to_string(),
+        })
+    }
+
+    fn repository_store_path(workspace: &Path) -> Result<PathBuf, JjError> {
+        let repo_pointer = workspace.join(".jj/repo");
+        let repository = if repo_pointer.is_file() {
+            let path_contents =
+                std::fs::read_to_string(&repo_pointer).map_err(|error| JjError::Open {
+                    path: repo_pointer.display().to_string(),
+                    detail: error.to_string(),
+                })?;
+            let relative_path = PathBuf::from(path_contents.trim());
+            if relative_path.is_absolute() {
+                relative_path
+            } else {
+                repo_pointer
+                    .parent()
+                    .ok_or_else(|| JjError::Open {
+                        path: repo_pointer.display().to_string(),
+                        detail: ".jj/repo has no parent directory".to_owned(),
+                    })?
+                    .join(relative_path)
+            }
+        } else {
+            repo_pointer
+        };
+        repository.canonicalize().map_err(|error| JjError::Open {
+            path: repository.display().to_string(),
+            detail: error.to_string(),
+        })
+    }
+
+    /// Walks operations backward from this repository's loaded head, attributing
+    /// working-copy changes to requested workspace names.
+    pub fn workspace_activity(
+        &self,
+        wanted: &BTreeSet<WorkspaceName>,
+        max_ops: usize,
+    ) -> Result<WorkspaceActivity, JjError> {
+        let head = self.repo.operation();
+        let mut stream =
+            std::pin::pin!(jj_lib::op_walk::walk_ancestors(std::slice::from_ref(head)));
+        let waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
+        let mut activity = WorkspaceActivity::default();
+        let mut visited = 0;
+        let mut exhausted = false;
+
+        loop {
+            if visited == max_ops {
+                match stream.as_mut().poll_next(&mut context) {
+                    Poll::Ready(None) => exhausted = true,
+                    Poll::Ready(Some(_)) => {}
+                    Poll::Pending => {
+                        std::thread::yield_now();
+                        continue;
+                    }
+                }
+                break;
+            }
+            if !wanted.is_empty()
+                && wanted
+                    .iter()
+                    .all(|workspace| activity.moves.contains_key(workspace))
+            {
+                break;
+            }
+            match stream.as_mut().poll_next(&mut context) {
+                Poll::Ready(Some(Ok(operation))) => {
+                    visited += 1;
+                    let timestamp = jiff::Timestamp::from_millisecond(
+                        operation.metadata().time.end.timestamp.0,
+                    )
+                    .map_err(|error| JjError::Parse {
+                        detail: error.to_string(),
+                    })?;
+                    activity.horizon = Some(timestamp);
+                    if operation.parent_ids().len() != 1 {
+                        continue;
+                    }
+
+                    let parents =
+                        block_on(operation.parents()).map_err(|error| JjError::Parse {
+                            detail: error.to_string(),
+                        })?;
+                    let parent = parents.into_iter().next().ok_or_else(|| JjError::Parse {
+                        detail: "single-parent operation loaded without a parent".to_owned(),
+                    })?;
+                    let view = block_on(operation.view()).map_err(|error| JjError::Parse {
+                        detail: error.to_string(),
+                    })?;
+                    let parent_view = block_on(parent.view()).map_err(|error| JjError::Parse {
+                        detail: error.to_string(),
+                    })?;
+                    for (name, commit) in view.wc_commit_ids() {
+                        let workspace = WorkspaceName::new(name.as_symbol().to_string());
+                        if wanted.contains(&workspace)
+                            && !activity.moves.contains_key(&workspace)
+                            && parent_view.wc_commit_ids().get(name) != Some(commit)
+                        {
+                            activity.moves.insert(workspace, timestamp);
+                        }
+                    }
+                }
+                Poll::Ready(Some(Err(error))) => {
+                    return Err(JjError::Parse {
+                        detail: error.to_string(),
+                    });
+                }
+                Poll::Ready(None) => {
+                    exhausted = true;
+                    break;
+                }
+                Poll::Pending => std::thread::yield_now(),
+            }
+        }
+        if exhausted {
+            activity.horizon = None;
+        }
+        Ok(activity)
     }
 
     pub fn bookmark_tips(&self) -> Result<BookmarkTips, JjError> {
@@ -747,12 +987,34 @@ pub fn git_toplevel(repo: &Path) -> Result<PathBuf, JjError> {
     Ok(PathBuf::from(output.trim()))
 }
 
+/// Reads git's remote configuration because jj-lib does not expose remote URLs as a typed repository view.
+///
+/// `git config --get-regexp` uses exit 1 with no output for no matches, which is an empty map.
 pub fn git_remotes(repo: &Path) -> Result<BTreeMap<String, String>, JjError> {
     let repo = path(repo);
-    let output = command(
-        "git",
-        ["-C", &repo, "config", "--get-regexp", "^remote\\..*\\.url$"],
-    )?;
+    let output = Command::new("git")
+        .args(["-C", &repo, "config", "--get-regexp", "^remote\\..*\\.url$"])
+        .output()
+        .map_err(|error| JjError::Process {
+            program: "git".to_owned(),
+            detail: error.to_string(),
+        })?;
+    let output = if output.status.success() {
+        String::from_utf8(output.stdout).map_err(|error| JjError::Parse {
+            detail: error.to_string(),
+        })?
+    } else if output.status.code() == Some(1)
+        && output.stdout.is_empty()
+        && output.stderr.is_empty()
+    {
+        String::new()
+    } else {
+        return Err(JjError::Command {
+            program: "git".to_owned(),
+            status: output.status.to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        });
+    };
     output
         .lines()
         .try_fold(BTreeMap::new(), |mut remotes, line| {

@@ -1,15 +1,21 @@
 //! `knives start`: claim a branch and open a workspace on the shared base.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use crate::cli::Exit;
-use crate::commands::claim::current_owner;
+use crate::commands::claim::{
+    ClaimContext, ClaimDecision, current_identity, decide, last_seen_provenance,
+    render_claim_context,
+};
 use crate::commands::release::shared_base;
-use crate::config::{default_config_path, load};
-use crate::ids::{BranchName, BranchTarget, RepoName};
-use crate::jj::{Repo, add_workspace, fetch_all};
+use crate::commands::wip::workspace_for;
+use crate::config::{RepoEntry, default_config_path, load};
+use crate::ids::{BranchName, BranchTarget, RepoName, WorkspaceName};
+use crate::jj::{JjError, Repo, add_workspace, fetch_all};
 use crate::ledger::{Ledger, Scribe};
 use crate::release_model::newest_release;
+use crate::seen;
 use crate::store::{Store, default_state_path};
 
 /// Where a new workspace goes: a sibling of the repo, named for the branch.
@@ -22,35 +28,263 @@ pub fn workspace_path(repo: &Path, branch: &BranchName) -> PathBuf {
     repo.parent().unwrap_or(repo).join(safe)
 }
 
-pub fn run(repo_name: &RepoName, branch: &BranchName, why: Option<&str>) -> anyhow::Result<Exit> {
+struct StartContext<'a> {
+    store: &'a mut Store,
+    entry: &'a RepoEntry,
+    repo_name: &'a RepoName,
+    branch: &'a BranchName,
+    identity: crate::commands::claim::Identity,
+    upstream_trunk: String,
+    destination: PathBuf,
+    workspace: WorkspaceName,
+    opened: Repo,
+}
+
+pub fn run(
+    repo_name: &RepoName,
+    branch: &BranchName,
+    why: Option<&str>,
+    force: bool,
+) -> anyhow::Result<Exit> {
     let registry = load(&default_config_path())?;
     let Some(entry) = registry.get(repo_name) else {
         eprintln!("unknown repo {repo_name}");
         return Ok(Exit::Usage);
     };
-    let upstream_trunk = entry.upstream_trunk();
-
     let mut store = Store::open_for_update(default_state_path())?;
-    let owner = current_owner(&std::env::current_dir()?)?;
-    if let Some(held) = store
+    let cwd = std::env::current_dir()?;
+    let destination = workspace_path(&entry.path, branch);
+    let in_claimed_workspace = cwd.starts_with(&destination);
+    let mut context = StartContext {
+        store: &mut store,
+        entry,
+        repo_name,
+        branch,
+        identity: current_identity(&cwd)?,
+        upstream_trunk: entry.upstream_trunk(),
+        workspace: WorkspaceName::new(workspace_for(branch.as_str())),
+        opened: Repo::open(&entry.path)?,
+        destination,
+    };
+    let held = context
+        .store
         .claims(Some(repo_name))
         .into_iter()
-        .find(|c| c.branch == branch.as_str())
-        && held.owner != owner
-    {
-        eprintln!(
-            "{repo_name}/{branch} is already claimed by {}: {}",
-            held.owner, held.why
+        .find(|claim| claim.branch == branch.as_str())
+        .cloned();
+    let activity = context
+        .opened
+        .workspace_activity(&BTreeSet::from([context.workspace.clone()]), 200)?;
+    let observations = seen::load();
+    let claim_seen = held
+        .as_ref()
+        .map(|claim| seen::last_seen(claim, &activity, &observations));
+    let decision = decide(&ClaimContext {
+        held: held.as_ref(),
+        identity: &context.identity,
+        in_claimed_workspace,
+    });
+
+    if force && held.is_some() {
+        let (previous, last_seen) = claim_context(held.as_ref(), claim_seen)?;
+        let reason = why.ok_or_else(|| anyhow::anyhow!("--force requires --why"))?;
+        return force_claim(&mut context, previous, last_seen, reason);
+    }
+
+    match decision {
+        ClaimDecision::RefuseAnonymous => {
+            let (claim, last_seen) = claim_context(held.as_ref(), claim_seen)?;
+            Ok(refuse_claim(branch, claim, last_seen, true))
+        }
+        ClaimDecision::RefuseHeld => {
+            let (claim, last_seen) = claim_context(held.as_ref(), claim_seen)?;
+            Ok(refuse_claim(branch, claim, last_seen, false))
+        }
+        ClaimDecision::Resume { possession } => {
+            resume_claim(&context, held.as_ref(), claim_seen, possession)
+        }
+        ClaimDecision::Take => take_claim(&mut context, why.unwrap_or("started work")),
+    }
+}
+
+fn claim_context(
+    held: Option<&crate::store::Claim>,
+    claim_seen: Option<crate::seen::LastSeen>,
+) -> anyhow::Result<(&crate::store::Claim, crate::seen::LastSeen)> {
+    held.zip(claim_seen)
+        .ok_or_else(|| anyhow::anyhow!("claim decision lacked held claim context"))
+}
+
+fn refuse_claim(
+    branch: &BranchName,
+    claim: &crate::store::Claim,
+    last_seen: crate::seen::LastSeen,
+    anonymous: bool,
+) -> Exit {
+    let anonymous_note = if anonymous {
+        "both sides are anonymous identities, so they can never match; "
+    } else {
+        ""
+    };
+    eprintln!(
+        "{anonymous_note}{}\nuse `knives start {branch} --force --why \"…\"` to seize the claim",
+        render_claim_context(claim, last_seen, jiff::Timestamp::now()),
+    );
+    Exit::Usage
+}
+
+fn force_claim(
+    context: &mut StartContext<'_>,
+    previous: &crate::store::Claim,
+    last_seen: crate::seen::LastSeen,
+    reason: &str,
+) -> anyhow::Result<Exit> {
+    let workspace_notice = workspace_notice(context, true)?;
+    record_claim(
+        context,
+        reason,
+        format!(
+            "seized from {} ({}, claimed {}, last seen {}): {reason}",
+            previous.owner,
+            crate::commands::claim::owner_kind_label(previous.kind),
+            previous.started,
+            last_seen_provenance(last_seen),
+        ),
+    )?;
+    println!(
+        "seized {}\n{workspace_notice}",
+        render_claim_context(previous, last_seen, jiff::Timestamp::now()),
+    );
+    Ok(Exit::Ok)
+}
+
+fn resume_claim(
+    context: &StartContext<'_>,
+    held: Option<&crate::store::Claim>,
+    claim_seen: Option<crate::seen::LastSeen>,
+    possession: bool,
+) -> anyhow::Result<Exit> {
+    let (claim, last_seen) = claim_context(held, claim_seen)?;
+    let workspace_notice = workspace_notice(context, false)?;
+    let event = if possession {
+        "resumed via workspace possession"
+    } else {
+        "resumed"
+    };
+    Scribe::new(
+        Ledger::for_repo(context.repo_name),
+        context.repo_name.clone(),
+        context.entry.path.clone(),
+        context.identity.owner.clone(),
+    )
+    .event(
+        Some(context.branch.as_str()),
+        event.to_owned(),
+        context.store.tracked_pull(&BranchTarget::new(
+            context.repo_name.clone(),
+            context.branch.clone(),
+        )),
+    )?;
+    println!(
+        "{event}\n{}\n{workspace_notice}",
+        render_claim_context(claim, last_seen, jiff::Timestamp::now()),
+    );
+    Ok(Exit::Ok)
+}
+
+fn take_claim(context: &mut StartContext<'_>, reason: &str) -> anyhow::Result<Exit> {
+    if context.destination.exists() {
+        let change = match workspace_change(&context.opened, &context.workspace) {
+            Ok(change) => change,
+            Err(_) => match context.opened.reattach_workspace(&context.destination) {
+                Ok(()) => workspace_change(&Repo::open(&context.entry.path)?, &context.workspace)?,
+                Err(error @ JjError::WorkspaceRepositoryMismatch { .. }) => {
+                    eprintln!(
+                        "cannot adopt {}: {error}; move the foreign workspace or choose a different branch",
+                        context.destination.display()
+                    );
+                    return Ok(Exit::Usage);
+                }
+                Err(error) => return Err(error.into()),
+            },
+        };
+        record_claim(
+            context,
+            reason,
+            format!("claimed: {reason} (adopted existing workspace)"),
+        )?;
+        println!(
+            "adopted existing workspace {} at {change}; left as-is\nclaimed {}/{} for {}",
+            context.destination.display(),
+            context.repo_name,
+            context.branch,
+            context.identity.owner,
         );
-        return Ok(Exit::Usage);
+        return Ok(Exit::Ok);
     }
 
-    let destination = workspace_path(&entry.path, branch);
-    if destination.exists() {
-        eprintln!("{} already exists", destination.display());
-        return Ok(Exit::Usage);
+    let (base_revision, base_label) = create_workspace(
+        context.entry,
+        &context.upstream_trunk,
+        &context.workspace,
+        &context.destination,
+    )?;
+    let change = workspace_change(&Repo::open(&context.entry.path)?, &context.workspace)?;
+    record_claim(context, reason, format!("claimed: {reason}"))?;
+    println!(
+        "workspace {} at {change} based on {base_revision} ({base_label})\nclaimed {}/{} for {}",
+        context.destination.display(),
+        context.repo_name,
+        context.branch,
+        context.identity.owner,
+    );
+    Ok(Exit::Ok)
+}
+
+fn record_claim(context: &mut StartContext<'_>, reason: &str, event: String) -> anyhow::Result<()> {
+    let target = BranchTarget::new(context.repo_name.clone(), context.branch.clone());
+    let pull = context.store.tracked_pull(&target);
+    let _ = context.store.claim(&target, &context.identity, reason);
+    context.store.save()?;
+    Scribe::new(
+        Ledger::for_repo(context.repo_name),
+        context.repo_name.clone(),
+        context.entry.path.clone(),
+        context.identity.owner.clone(),
+    )
+    .event(Some(context.branch.as_str()), event, pull)?;
+    Ok(())
+}
+
+fn workspace_notice(context: &StartContext<'_>, left_as_is: bool) -> anyhow::Result<String> {
+    if context.destination.exists() {
+        let retained = if left_as_is { "; left as-is" } else { "" };
+        return Ok(format!(
+            "workspace {} at {}{retained}",
+            context.destination.display(),
+            workspace_change(&context.opened, &context.workspace)?,
+        ));
     }
 
+    let (base_revision, base_label) = create_workspace(
+        context.entry,
+        &context.upstream_trunk,
+        &context.workspace,
+        &context.destination,
+    )?;
+    Ok(format!(
+        "created missing workspace {} at {} based on {base_revision} ({base_label})",
+        context.destination.display(),
+        workspace_change(&Repo::open(&context.entry.path)?, &context.workspace)?,
+    ))
+}
+
+fn create_workspace(
+    entry: &RepoEntry,
+    upstream_trunk: &str,
+    workspace: &WorkspaceName,
+    destination: &Path,
+) -> anyhow::Result<(String, String)> {
     fetch_all(&entry.path)?;
     // A release names the shared base every member branch forks from; without
     // one, the fetched upstream trunk starts the first branch. Never use the
@@ -61,40 +295,34 @@ pub fn run(repo_name: &RepoName, branch: &BranchName, why: Option<&str>) -> anyh
     let scheme = entry.release_scheme();
     let base = match newest_release(&tips, &scheme, entry.publish_remote()) {
         Some((_, release)) => {
-            let trunk_tip = opened.resolve_commit(&upstream_trunk)?;
+            let trunk_tip = opened.resolve_commit(upstream_trunk)?;
             shared_base(&opened, &release, &trunk_tip)?
         }
         None => None,
     };
     let (base_revision, base_label) = base.map_or_else(
-        || (upstream_trunk, "the fetched upstream trunk"),
-        |commit| (commit.as_str().to_owned(), "the release's shared base"),
+        || {
+            (
+                upstream_trunk.to_owned(),
+                "the fetched upstream trunk".to_owned(),
+            )
+        },
+        |commit| {
+            (
+                commit.as_str().to_owned(),
+                "the release's shared base".to_owned(),
+            )
+        },
     );
-    add_workspace(
-        &entry.path,
-        &branch.as_str().replace('/', "-"),
-        &destination,
-        &base_revision,
-    )?;
+    add_workspace(&entry.path, workspace.as_str(), destination, &base_revision)?;
+    Ok((base_revision, base_label))
+}
 
-    let reason = why.unwrap_or("started work");
-    let target = BranchTarget::new(repo_name.clone(), branch.clone());
-    let _ = store.claim(&target, &owner, reason);
-    let pr = store.tracked_pull(&target);
-    store.save()?;
-    Scribe::new(
-        Ledger::for_repo(repo_name),
-        repo_name.clone(),
-        entry.path.clone(),
-        owner.clone(),
-    )
-    .event(Some(branch.as_str()), format!("claimed: {reason}"), pr)?;
-
-    println!(
-        "workspace {} based on {base_revision} ({base_label})\nclaimed {repo_name}/{branch} for {owner}",
-        destination.display()
-    );
-    Ok(Exit::Ok)
+fn workspace_change(repo: &Repo, workspace: &WorkspaceName) -> anyhow::Result<String> {
+    repo.workspaces()?
+        .into_iter()
+        .find_map(|(name, change)| (name == *workspace).then(|| change.as_str().to_owned()))
+        .ok_or_else(|| anyhow::anyhow!("workspace {} has no working copy", workspace.as_str()))
 }
 
 #[cfg(test)]

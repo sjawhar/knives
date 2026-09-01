@@ -1,11 +1,14 @@
 use std::{
-    collections::hash_map::RandomState,
+    collections::{BTreeMap, hash_map::RandomState},
     hash::{BuildHasher, Hash, Hasher},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
 
+use crate::commands::claim::{owner_kind_label, render_claim_line};
 use crate::config::GuidanceRoot;
+use crate::jj::WorkspaceActivity;
+use crate::seen::{self, Seen};
 use crate::store::Claim;
 
 #[derive(Debug)]
@@ -18,6 +21,18 @@ pub struct Guidance {
 pub struct InstructionFile {
     pub path: PathBuf,
     pub body: String,
+}
+
+const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+const fn fnv1a(mut hash: u64, mut bytes: &[u8]) -> u64 {
+    while let [byte, rest @ ..] = bytes {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(FNV_PRIME);
+        bytes = rest;
+    }
+    hash
 }
 
 /// Returns instructions that govern a candidate path, ordered from nearest to root.
@@ -88,8 +103,48 @@ pub fn format_guidance(repo_name: &str, guidance: &Guidance) -> String {
     format!("\n\n{header}\n{body}\n{footer}")
 }
 
+/// Returns the time-invariant digest of a repository's active claim roster.
+pub fn notice_digest(repo_name: &str, root: &Path, claims: &[Claim]) -> String {
+    let mut claims = claims
+        .iter()
+        .filter(|claim| claim.repo == repo_name)
+        .collect::<Vec<_>>();
+    claims.sort_unstable_by(|left, right| {
+        left.repo
+            .cmp(&right.repo)
+            .then_with(|| left.branch.cmp(&right.branch))
+    });
+
+    let mut hash = FNV_OFFSET_BASIS;
+    hash = fnv1a(hash, repo_name.as_bytes());
+    hash = fnv1a(hash, b"\x1e");
+    hash = fnv1a(hash, root.as_os_str().as_encoded_bytes());
+    hash = fnv1a(hash, b"\x1e");
+    for (claim_index, claim) in claims.iter().enumerate() {
+        if claim_index != 0 {
+            hash = fnv1a(hash, b"\x1e");
+        }
+        for (field_index, field) in [
+            claim.branch.as_str(),
+            claim.owner.as_str(),
+            owner_kind_label(claim.kind),
+            claim.started.as_str(),
+            claim.why.as_str(),
+        ]
+        .iter()
+        .enumerate()
+        {
+            if field_index != 0 {
+                hash = fnv1a(hash, b"\x1f");
+            }
+            hash = fnv1a(hash, field.as_bytes());
+        }
+    }
+    format!("{hash:016x}")
+}
+
 /// Formats a direct notice that a managed fork may be actively edited elsewhere.
-pub fn format_notice(repo_name: &str, root: &Path, claims: &[String]) -> String {
+pub fn format_notice(repo_name: &str, root: &Path, claims: &[String], digest: &str) -> String {
     let nonce = envelope_nonce();
     let held = if claims.is_empty() {
         "No branch is claimed here right now.".to_owned()
@@ -101,7 +156,7 @@ pub fn format_notice(repo_name: &str, root: &Path, claims: &[String]) -> String 
         String::new(),
         String::new(),
         format!(
-            "<knives-notice-{nonce} repo=\"{}\">",
+            "<knives-notice-{nonce} repo=\"{}\" digest=\"{digest}\">",
             safe_attribute(repo_name)
         ),
         format!(
@@ -120,16 +175,29 @@ pub fn format_notice(repo_name: &str, root: &Path, claims: &[String]) -> String 
 }
 
 /// Returns active claim summaries for a repository.
-pub fn claim_lines(claims: &[Claim], repo_name: &str) -> Vec<String> {
+///
+/// Hooks deliberately do not open a jj repo or walk operations, so an empty
+/// operation stream is marked window-exhausted rather than claiming no activity.
+pub fn claim_lines(
+    claims: &[Claim],
+    repo_name: &str,
+    observations: &Seen,
+    now: jiff::Timestamp,
+) -> Vec<String> {
+    let activity = WorkspaceActivity {
+        moves: BTreeMap::new(),
+        horizon: Some(now),
+    };
     claims
         .iter()
         .filter(|claim| claim.repo == repo_name)
         .map(|claim| {
-            if claim.why.is_empty() {
-                format!("{} ({})", claim.branch, claim.owner)
-            } else {
-                format!("{} ({}): {}", claim.branch, claim.owner, claim.why)
-            }
+            render_claim_line(
+                &claim.branch,
+                claim,
+                seen::last_seen(claim, &activity, observations),
+                now,
+            )
         })
         .collect()
 }
@@ -191,12 +259,20 @@ mod tests {
 
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
-    use std::path::{Path, PathBuf};
+    use std::{
+        collections::BTreeMap,
+        path::{Path, PathBuf},
+    };
 
     use tempfile::TempDir;
 
-    use super::{Guidance, InstructionFile, format_guidance, format_notice, guidance_for};
+    use super::{
+        Guidance, InstructionFile, claim_lines, format_guidance, format_notice, guidance_for,
+        notice_digest,
+    };
     use crate::config::{GuidanceRoot, GuidanceRootKind};
+    use crate::seen::Seen;
+    use crate::store::{Claim, OwnerKind};
 
     fn root(files: &[(&str, &str)]) -> (TempDir, GuidanceRoot) {
         let dir = tempfile::tempdir().unwrap();
@@ -309,14 +385,114 @@ mod tests {
 
     #[test]
     fn notice_names_the_claims() {
-        let text = format_notice("r", Path::new("/r"), &["feat/x (agent-a): porting".into()]);
+        let text = format_notice(
+            "r",
+            Path::new("/r"),
+            &["feat/x (agent-a): porting".into()],
+            "0123456789abcdef",
+        );
 
+        assert!(text.contains("digest=\"0123456789abcdef\""));
         assert!(text.contains("Branches claimed here: feat/x (agent-a): porting."));
     }
 
     #[test]
+    fn claim_lines_include_owner_kind_claimed_age_and_last_seen() {
+        // Removing any claim provenance cell would make a live notice unable to
+        // distinguish both who took work and what evidence supports it.
+        let claims = [
+            Claim {
+                repo: "r".to_owned(),
+                branch: "feat/x".to_owned(),
+                owner: "agent-a".to_owned(),
+                kind: OwnerKind::HarnessSession,
+                why: "porting".to_owned(),
+                started: "2026-01-01T00:00:00Z".to_owned(),
+                files: Vec::new(),
+            },
+            Claim {
+                repo: "r".to_owned(),
+                branch: "feat/y".to_owned(),
+                owner: "agent-b".to_owned(),
+                kind: OwnerKind::HarnessSession,
+                why: "waiting".to_owned(),
+                started: "2026-01-01T00:00:00Z".to_owned(),
+                files: Vec::new(),
+            },
+        ];
+        let seen = Seen {
+            owners: BTreeMap::from([(
+                OwnerKind::HarnessSession,
+                BTreeMap::from([("agent-a".to_owned(), "2026-01-02T00:00:00Z".to_owned())]),
+            )]),
+            workspaces: BTreeMap::new(),
+        };
+        let now = "2026-01-03T00:00:00Z".parse().expect("valid timestamp");
+
+        let rows = claim_lines(&claims, "r", &seen, now);
+
+        assert_eq!(
+            rows,
+            [
+                "feat/x (agent-a, harness-session, claimed 2d ago, last seen 1d ago): porting",
+                "feat/y (agent-b, harness-session, claimed 2d ago, not seen within the observation window): waiting",
+            ]
+        );
+    }
+
+    #[test]
+    fn the_digest_ignores_rolling_ages() {
+        // Rendering must continue to roll elapsed-time language while the
+        // content identity remains strictly a function of persisted claims.
+        let root = Path::new("/repos/beta");
+        let claims = vec![Claim {
+            repo: "beta".to_owned(),
+            branch: "feat/first".to_owned(),
+            owner: "agent-one".to_owned(),
+            kind: OwnerKind::HarnessSession,
+            why: "porting".to_owned(),
+            started: "2026-01-01T00:00:00Z".to_owned(),
+            files: Vec::new(),
+        }];
+        let seen = Seen::default();
+        let early = claim_lines(
+            &claims,
+            "beta",
+            &seen,
+            "2026-01-01T01:00:00Z".parse().expect("valid timestamp"),
+        );
+        let late = claim_lines(
+            &claims,
+            "beta",
+            &seen,
+            "2026-01-01T03:00:00Z".parse().expect("valid timestamp"),
+        );
+
+        assert_ne!(early, late, "ages must roll for this test to bite");
+        let digest = notice_digest("beta", root, &claims);
+        assert_eq!(digest, notice_digest("beta", root, &claims));
+
+        let mut grown = claims;
+        grown.push(Claim {
+            repo: "beta".to_owned(),
+            branch: "feat/second".to_owned(),
+            owner: "agent-two".to_owned(),
+            kind: OwnerKind::WorkspaceDerived,
+            why: "reviewing".to_owned(),
+            started: "2026-01-02T00:00:00Z".to_owned(),
+            files: Vec::new(),
+        });
+        let expected = "03b4a0b08163a78c";
+        assert_eq!(notice_digest("beta", root, &grown), expected);
+        let mut reordered = grown.clone();
+        reordered.reverse();
+        assert_eq!(notice_digest("beta", root, &reordered), expected);
+        assert_ne!(digest, notice_digest("beta", root, &grown));
+    }
+
+    #[test]
     fn notice_without_claims_says_so() {
-        let text = format_notice("r", Path::new("/r"), &[]);
+        let text = format_notice("r", Path::new("/r"), &[], "0123456789abcdef");
 
         assert!(text.contains("No branch is claimed here right now."));
     }

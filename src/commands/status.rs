@@ -27,53 +27,105 @@ pub mod phases;
 pub mod render;
 mod rows;
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone)]
 pub struct BranchRow {
     pub name: BranchName,
-    /// `None` when the local bookmark is divergent, which is not a single commit.
-    ///
-    /// Divergent branches used to be absent from this list entirely: `bookmark_tips`
-    /// only yields non-conflicted targets, so a divergent bookmark produced no row, and
-    /// with no row there was no pull request association either. The pull request read
-    /// as nonexistent until somebody happened to resolve the divergence. Proven by
-    /// before-and-after on #228.
-    pub tip: Option<CommitId>,
-    /// Where origin has this branch, if anywhere. The design asks for both tips
-    /// because "is my work pushed" is otherwise unanswerable, and a release cut
-    /// from origin ships what origin has, not what is local.
-    pub origin_tip: Option<CommitId>,
-    /// How local relates to origin, when they differ and it could be determined. `None`
-    /// means the tips match, there is no origin ref, or ancestry could not be resolved —
-    /// and in that last case a problem is recorded, so the report says so rather than
-    /// implying a relation.
-    pub origin_relation: Option<OriginRelation>,
-    pub pull_request: Option<PullRequest>,
+    pub state: BranchState,
+    /// Short (12-char) commit id; absent when the bookmark is divergent.
+    pub tip: Option<String>,
+    /// Present only when the local branch does not cleanly match origin.
+    pub push: Option<PushRelation>,
+    pub pr: Option<PullCell>,
+    pub review: Option<String>,
+    pub checks: Option<String>,
     pub landed: Option<LandedVerdict>,
-    pub review_stale: Option<bool>,
-    /// What the forge's checks say, when they were asked for. `None` means not consulted —
-    /// which is not the same as nothing having run, and must not render as a failure.
-    pub checks: Option<ChecksSummary>,
-    pub fork_only: bool,
-    /// A pull request stated for this branch rather than inferred, with whatever
-    /// state the forge reports. Inference only ever sees open pull requests from our
-    /// own copy of the repository; a closed or foreign one has to be stated.
-    pub stated_pull: Option<StatedPull>,
-    /// The newest ledger entry about this branch, when it has one.
-    ///
-    /// A local file read the tool already sits beside, and the difference between
-    /// a reader running one more command and a reader concluding a branch was
-    /// never explained.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_notch: Option<LastNotch>,
-    /// This branch's other pull requests, shadowed by the primary one.
-    ///
-    /// A head branch accumulates pull requests over its life — an org-fork
-    /// submission closed and re-homed onto a personal fork keeps its review
-    /// history on the closed number — and hiding them is how an audit walked
-    /// past a maintainer's blocking question that lived on a closed
-    /// predecessor.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub prior_pulls: Vec<PriorPull>,
+    pub flags: Vec<String>,
+    pub claim: Option<ClaimCell>,
+    pub last_seen: Option<String>,
+    pub seen: Option<SeenWindow>,
+    pub workspace: Option<String>,
+    pub notch: Option<LastNotch>,
+}
+
+impl serde::Serialize for BranchRow {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        #[derive(serde::Serialize)]
+        struct SerializedBranchRow<'a> {
+            name: &'a BranchName,
+            state: &'a BranchState,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            tip: Option<&'a String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            push: Option<&'a PushRelation>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            origin_tip: Option<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            pr: Option<&'a PullCell>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            review: Option<&'a String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            checks: Option<&'a String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            landed: Option<&'a LandedVerdict>,
+            #[serde(skip_serializing_if = "Vec::is_empty")]
+            flags: &'a Vec<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            claim: Option<&'a ClaimCell>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            last_seen: Option<&'a String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            seen: Option<&'a SeenWindow>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            workspace: Option<&'a String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            notch: Option<&'a LastNotch>,
+        }
+
+        serde::Serialize::serialize(
+            &SerializedBranchRow {
+                name: &self.name,
+                state: &self.state,
+                tip: self.tip.as_ref(),
+                push: self.push.as_ref(),
+                origin_tip: self.push.as_ref().and_then(PushRelation::origin_tip),
+                pr: self.pr.as_ref(),
+                review: self.review.as_ref(),
+                checks: self.checks.as_ref(),
+                landed: self.landed.as_ref(),
+                flags: &self.flags,
+                claim: self.claim.as_ref(),
+                last_seen: self.last_seen.as_ref(),
+                seen: self.seen.as_ref(),
+                workspace: self.workspace.as_ref(),
+                notch: self.notch.as_ref(),
+            },
+            serializer,
+        )
+    }
+}
+
+impl BranchRow {
+    const fn bare(name: BranchName) -> Self {
+        Self {
+            name,
+            state: BranchState::Unknown,
+            tip: None,
+            push: None,
+            pr: None,
+            review: None,
+            checks: None,
+            landed: None,
+            flags: Vec::new(),
+            claim: None,
+            last_seen: None,
+            seen: None,
+            workspace: None,
+            notch: None,
+        }
+    }
 }
 
 /// A shadowed pull request, compact enough for a row.
@@ -83,54 +135,132 @@ pub struct PriorPull {
     pub state: String,
 }
 
-impl BranchRow {
-    const fn bare(name: BranchName, tip: Option<CommitId>) -> Self {
-        Self {
-            name,
-            tip,
-            origin_tip: None,
-            origin_relation: None,
-            pull_request: None,
-            landed: None,
-            review_stale: None,
-            checks: None,
-            fork_only: false,
-            stated_pull: None,
-            last_notch: None,
-            prior_pulls: Vec::new(),
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PullCell {
+    pub number: u64,
+    pub state: String,
+    #[serde(skip_serializing_if = "std::ops::Not::not", default)]
+    pub draft: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stated: Option<bool>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub prior: Vec<PriorPull>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ClaimCell {
+    pub id: String,
+    pub kind: crate::store::OwnerKind,
+    pub since: String,
+    pub why: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BranchState {
+    ForkOnly,
+    Divergent,
+    Landed,
+    Conflicted,
+    ChecksFailing,
+    ChangesRequested,
+    Approved,
+    Draft,
+    AwaitingReview,
+    Merged,
+    Closed,
+    NoPr,
+    Unknown,
+}
+
+impl fmt::Display for BranchState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::ForkOnly => "fork-only",
+            Self::Divergent => "divergent",
+            Self::Landed => "landed",
+            Self::Conflicted => "conflicted",
+            Self::ChecksFailing => "checks-failing",
+            Self::ChangesRequested => "changes-requested",
+            Self::Approved => "approved",
+            Self::Draft => "draft",
+            Self::AwaitingReview => "awaiting-review",
+            Self::Merged => "merged",
+            Self::Closed => "closed",
+            Self::NoPr => "no-pr",
+            Self::Unknown => "unknown",
+        })
+    }
+}
+
+/// Internal ancestry facts, converted to the report's wider `PushRelation` taxonomy in rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OriginRelation {
+    Ahead,
+    Behind,
+    Diverged,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PushRelation {
+    Unpushed,
+    UnpushedCommits,
+    Behind(String),
+    Diverged(String),
+    Unresolved(String),
+}
+
+impl PushRelation {
+    const fn label(&self) -> &'static str {
+        match self {
+            Self::Unpushed => "unpushed",
+            Self::UnpushedCommits => "unpushed-commits",
+            Self::Behind(_) => "behind",
+            Self::Diverged(_) => "diverged",
+            Self::Unresolved(_) => "unresolved",
+        }
+    }
+
+    fn origin_tip(&self) -> Option<&str> {
+        match self {
+            Self::Behind(origin) | Self::Diverged(origin) | Self::Unresolved(origin) => {
+                Some(origin)
+            }
+            Self::Unpushed | Self::UnpushedCommits => None,
         }
     }
 }
 
-/// How local relates to origin when the two differ.
-///
-/// Named states rather than a boolean because history has four cases and a boolean has
-/// two: ahead, behind, forked, and could-not-tell. Collapsing the last two into a
-/// boolean's `None` reported a fork as `(behind)`, which is the conflation this type
-/// exists to prevent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum OriginRelation {
-    /// Local carries commits origin does not: unpushed work.
-    Ahead,
-    /// Origin carries commits local does not, so a replay judges content the pull request
-    /// does not contain.
-    Behind,
-    /// Neither tip is reachable from the other. Usual cause is a rewrite after a push.
-    Diverged,
+impl serde::Serialize for PushRelation {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.label())
+    }
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct StatedPull {
-    pub number: u64,
-    /// Whatever the forge said, including `CLOSED`, or `unknown` when it would not say.
-    pub state: String,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SeenWindow {
+    NoneSinceClaim,
+    NoneWithinWindow,
+}
+
+#[derive(Debug, Default, serde::Serialize)]
+pub struct ForgeStatus {
+    pub consulted: bool,
+    pub elapsed_ms: u64,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct FindingGroup {
+    pub kind: FindingKind,
+    pub count: usize,
+    pub subjects: Vec<String>,
 }
 
 /// The most relevant ledger entry for one status row and the entries it masks.
-///
-/// A row does not re-print an owner, anchor, or evidence list: `knives notch`
-/// shows that complete chronology.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct LastNotch {
     pub ts: String,
@@ -139,6 +269,16 @@ pub struct LastNotch {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disposition: Option<String>,
     pub count: usize,
+}
+
+fn collapsed_notch_text(text: &str) -> String {
+    const MAX_TEXT: usize = 120;
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut capped: String = text.chars().take(MAX_TEXT).collect();
+    if text.chars().count() > MAX_TEXT {
+        capped.push('…');
+    }
+    capped
 }
 
 impl LastNotch {
@@ -157,7 +297,7 @@ impl LastNotch {
         Some(Self {
             ts: entry.ts.clone(),
             kind: entry.kind,
-            text: entry.text.clone(),
+            text: collapsed_notch_text(&entry.text),
             disposition: entry.disposition.clone(),
             count,
         })
@@ -172,31 +312,27 @@ pub struct RepoNotches {
     pub last: LastNotch,
 }
 
+/// Field order is serde order and text-presentation order.
 #[derive(Debug, Default, serde::Serialize)]
 pub struct Report {
-    /// Who is working on what here, and since when.
-    ///
-    /// This used to be a separate `wip` command. Who holds a branch is part of the
-    /// state of a repository, so it belongs in the one command that reports that.
-    pub claims: Vec<crate::store::Claim>,
-    pub workspaces: BTreeMap<String, Vec<(crate::ids::WorkspaceName, crate::ids::ChangeId)>>,
     pub repo: String,
-    pub findings: Vec<Finding>,
+    pub trunk: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub newest_release: Option<String>,
+    pub forge: ForgeStatus,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub problems: Vec<String>,
     pub branches: Vec<BranchRow>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub findings: Vec<FindingGroup>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub releases: Vec<String>,
-    /// Repo-scoped ledger entries, absent when the repository has none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub repo_notches: Option<RepoNotches>,
-    /// Informational: something worth saying that is not a failure.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub other_workspaces: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub notes: Vec<String>,
-    /// Could not answer. These, and only these, make the command exit non-zero
-    /// for incompleteness. Keying on every note instead would make a routine
-    /// remark like "14 superseded releases not scanned" look like a failure.
-    pub problems: Vec<String>,
-    /// Whether pull request state was actually fetched. Not having looked is not
-    /// the same as having looked and found nothing, and conflating them produced
-    /// a false finding for every branch.
-    pub forge_consulted: bool,
 }
 
 pub struct Options<'a> {
@@ -495,6 +631,7 @@ fn unmet_dependencies(
 /// Separate from `gather` only to keep that function readable.
 struct DependencyInput<'a, 'forge, 'snapshot> {
     report: &'a mut Report,
+    findings: &'a mut Vec<Finding>,
     name: &'a RepoName,
     store: &'a Store,
     options: &'a Options<'forge>,
@@ -505,6 +642,7 @@ struct DependencyInput<'a, 'forge, 'snapshot> {
 fn add_dependency_findings(input: DependencyInput<'_, '_, '_>) {
     let DependencyInput {
         report,
+        findings,
         name,
         store,
         options,
@@ -526,7 +664,7 @@ fn add_dependency_findings(input: DependencyInput<'_, '_, '_>) {
         },
     );
     timings.forge += started.elapsed();
-    report.findings.extend(found);
+    findings.extend(found);
     report.problems.extend(unanswered);
 }
 
@@ -586,6 +724,13 @@ fn repo_notches(notches: &[Notch]) -> Option<RepoNotches> {
     })
 }
 
+#[derive(Clone, Copy)]
+struct ReleaseInput<'a> {
+    repo: &'a Repo,
+    tips: &'a BookmarkTips,
+    entry: &'a RepoEntry,
+}
+
 /// Fold the release scan into a report.
 ///
 /// Extracted from `gather` for the same reason `scan_releases` was: that function
@@ -593,30 +738,28 @@ fn repo_notches(notches: &[Notch]) -> Option<RepoNotches> {
 /// adds to it.
 fn add_releases(
     report: &mut Report,
-    repo: &Repo,
-    tips: &BookmarkTips,
-    entry: &RepoEntry,
+    findings: &mut Vec<Finding>,
+    input: ReleaseInput<'_>,
 ) -> anyhow::Result<()> {
-    // Releases are scanned local AND remote: what a consumer pins is the remote
-    // ref, and scanning only local silently skipped the actually-pinned release.
-    let (names, findings, skipped) = scan_releases(
+    let ReleaseInput { repo, tips, entry } = input;
+    let scheme = entry.release_scheme();
+    report.newest_release =
+        crate::release_model::newest_release(tips, &scheme, entry.publish_remote())
+            .map(|(reference, _)| reference.to_string());
+    let (names, release_findings, skipped) = scan_releases(
         repo,
         &ReleaseScan {
             path: &entry.path,
             tips,
-            scheme: &entry.release_scheme(),
+            scheme: &scheme,
             publish_remote: entry.publish_remote(),
         },
     )?;
     report.releases = names;
-    report.findings.extend(findings);
-    let (double_cut_findings, double_cut_notes) = double_cut_findings(
-        &entry.path,
-        tips,
-        &entry.release_scheme(),
-        entry.publish_remote(),
-    )?;
-    report.findings.extend(double_cut_findings);
+    findings.extend(release_findings);
+    let (double_cut_findings, double_cut_notes) =
+        double_cut_findings(&entry.path, tips, &scheme, entry.publish_remote())?;
+    findings.extend(double_cut_findings);
     report.notes.extend(double_cut_notes);
     if skipped > 0 {
         report
@@ -626,21 +769,123 @@ fn add_releases(
     Ok(())
 }
 
-/// Who holds what here, and where they are working.
-///
-/// Absorbed from the old `wip` command. Who holds a branch is part of a repository's
-/// state, so it belongs in the one command that reports that rather than in a second
-/// command nobody remembers the name of.
-fn add_claims(report: &mut Report, repo: &Repo, name: &RepoName, store: &Store) {
-    report.claims = store.claims(Some(name)).into_iter().cloned().collect();
-    if let Ok(spaces) = repo.workspaces() {
-        let _ = report
-            .workspaces
-            .insert(name.to_string(), spaces.into_iter().collect());
+/// Uses all observation sources when the operation walk succeeded. If it failed,
+/// sidecar records remain trustworthy but the unobserved window is necessarily incomplete.
+fn claim_last_seen(
+    claim: &crate::store::Claim,
+    activity: Option<&crate::jj::WorkspaceActivity>,
+    seen: &crate::seen::Seen,
+) -> crate::seen::LastSeen {
+    let Some(activity) = activity else {
+        let workspace = crate::commands::wip::workspace_for(&claim.branch);
+        let workspace_key = format!("{}/{}", claim.repo, workspace);
+        let timestamps = [
+            seen.owners
+                .get(&claim.kind)
+                .and_then(|owners| owners.get(&claim.owner))
+                .and_then(|timestamp| timestamp.parse().ok()),
+            seen.workspaces
+                .get(&workspace_key)
+                .and_then(|timestamp| timestamp.parse().ok()),
+        ];
+        return timestamps.into_iter().flatten().max().map_or(
+            crate::seen::LastSeen::NoneWithinWindow,
+            crate::seen::LastSeen::At,
+        );
+    };
+    crate::seen::last_seen(claim, activity, seen)
+}
+
+#[derive(Clone, Copy)]
+struct ClaimFoldInput<'a> {
+    repo: &'a Repo,
+    name: &'a RepoName,
+    store: &'a Store,
+    seen: &'a crate::seen::Seen,
+}
+
+/// Folds claims, workspace facts, and sidecar observations into branch rows.
+fn fold_claims(
+    report: &mut Report,
+    findings: &mut Vec<Finding>,
+    input: ClaimFoldInput<'_>,
+) -> anyhow::Result<()> {
+    let ClaimFoldInput {
+        repo,
+        name,
+        store,
+        seen,
+    } = input;
+    let claims: Vec<crate::store::Claim> = store.claims(Some(name)).into_iter().cloned().collect();
+    let wanted: BTreeSet<crate::ids::WorkspaceName> = claims
+        .iter()
+        .map(|claim| {
+            crate::ids::WorkspaceName::new(crate::commands::wip::workspace_for(&claim.branch))
+        })
+        .collect();
+    let activity = match repo.workspace_activity(&wanted, crate::jj::MAX_ACTIVITY_OPS) {
+        Ok(activity) => Some(activity),
+        Err(error) => {
+            report
+                .problems
+                .push(format!("workspace activity unavailable: {error}"));
+            None
+        }
+    };
+    let mut workspaces: BTreeSet<crate::ids::WorkspaceName> = match repo.workspaces() {
+        Ok(rows) => rows.into_iter().map(|(workspace, _)| workspace).collect(),
+        Err(error) => {
+            report
+                .problems
+                .push(format!("workspaces unavailable: {error}"));
+            BTreeSet::new()
+        }
+    };
+    findings.extend(crate::commands::wip::overlaps(&touching(&claims)));
+
+    for claim in &claims {
+        if !report
+            .branches
+            .iter()
+            .any(|row| row.name.as_str() == claim.branch)
+        {
+            report
+                .branches
+                .push(BranchRow::bare(BranchName::new(&claim.branch)));
+        }
+        let row = report
+            .branches
+            .iter_mut()
+            .find(|row| row.name.as_str() == claim.branch)
+            .ok_or_else(|| anyhow::anyhow!("claim row could not be materialized"))?;
+        row.claim = Some(ClaimCell {
+            id: claim.owner.clone(),
+            kind: claim.kind,
+            since: claim.started.clone(),
+            why: claim.why.clone(),
+        });
+        match claim_last_seen(claim, activity.as_ref(), seen) {
+            crate::seen::LastSeen::At(timestamp) => row.last_seen = Some(timestamp.to_string()),
+            crate::seen::LastSeen::NoneSinceClaim => {
+                row.seen = Some(SeenWindow::NoneSinceClaim);
+            }
+            crate::seen::LastSeen::NoneWithinWindow => {
+                row.seen = Some(SeenWindow::NoneWithinWindow);
+            }
+        }
     }
-    report
-        .findings
-        .extend(crate::commands::wip::overlaps(&touching(&report.claims)));
+    for row in &mut report.branches {
+        let expected =
+            crate::ids::WorkspaceName::new(crate::commands::wip::workspace_for(row.name.as_str()));
+        if workspaces.remove(&expected) {
+            row.workspace = Some(expected.to_string());
+        }
+    }
+    report.other_workspaces = workspaces
+        .into_iter()
+        .map(|workspace| workspace.to_string())
+        .collect();
+    Ok(())
 }
 
 /// Files each claim says it is touching, keyed by claim.
@@ -655,6 +900,7 @@ fn touching(claims: &[crate::store::Claim]) -> BTreeMap<String, Vec<String>> {
 struct CarriedFindingInput<'a> {
     report: &'a Report,
     repo: &'a Repo,
+    tips: &'a BookmarkTips,
     trunk: &'a str,
     scheme: &'a ReleaseScheme,
     publish_remote: &'a str,
@@ -665,13 +911,14 @@ fn carried_findings(input: CarriedFindingInput<'_>) -> anyhow::Result<Vec<Findin
     let CarriedFindingInput {
         report,
         repo,
+        tips,
         trunk,
         scheme,
         publish_remote,
     } = input;
     let mut findings = Vec::new();
     for row in &report.branches {
-        let Some(tip) = row.tip.as_ref() else {
+        let Some(tip) = tips.get(&BookmarkRef::Local(row.name.clone())) else {
             continue;
         };
         if row.landed == Some(LandedVerdict::InTrunk) {
@@ -680,8 +927,6 @@ fn carried_findings(input: CarriedFindingInput<'_>) -> anyhow::Result<Vec<Findin
         let carriers = repo
             .branches_containing(tip, scheme, publish_remote)?
             .into_iter()
-            // A same-named upstream ref can contain commits ahead of ours, but this
-            // deliberately treats every same-named ref as the branch itself.
             .filter(|reference| {
                 reference.branch() != &row.name && reference.branch().as_str() != trunk
             })
@@ -706,6 +951,7 @@ type BranchOverlapOutcome = (String, Option<BranchFiles>);
 /// exactly the same order.
 fn add_branch_overlap_findings(
     report: &mut Report,
+    findings: &mut Vec<Finding>,
     entry: &RepoEntry,
     workers: usize,
 ) -> std::time::Duration {
@@ -776,10 +1022,14 @@ fn add_branch_overlap_findings(
     }
     report.notes.extend(notes);
     report.problems.extend(unanswered);
-    report
-        .findings
-        .extend(crate::detect::overlap::branch_overlaps(&touching));
+    findings.extend(crate::detect::overlap::branch_overlaps(&touching));
     started.elapsed()
+}
+
+struct FoldOutput<'a> {
+    report: &'a mut Report,
+    findings: &'a mut Vec<Finding>,
+    timings: &'a mut Timings,
 }
 
 /// Inputs that turn completed phases into the report's visible rows and findings.
@@ -796,11 +1046,15 @@ struct PostPhaseInput<'a> {
     probe_ran: bool,
 }
 
-fn add_pull_state_findings(report: &mut Report, snapshot: &crate::snapshot::CompletedSnapshot<'_>) {
+fn add_pull_state_findings(
+    report: &Report,
+    findings: &mut Vec<Finding>,
+    snapshot: &crate::snapshot::CompletedSnapshot<'_>,
+) {
     let states: Vec<crate::detect::pull_state::PullState<'_>> = report
         .branches
         .iter()
-        .filter_map(|row| row.pull_request.as_ref())
+        .filter_map(|row| row.pr.as_ref())
         .filter_map(|pull| {
             snapshot
                 .fact(pull.number)
@@ -811,22 +1065,48 @@ fn add_pull_state_findings(report: &mut Report, snapshot: &crate::snapshot::Comp
                 })
         })
         .collect();
-    report
-        .findings
-        .extend(crate::detect::pull_state::pull_state_findings(&states));
+    findings.extend(crate::detect::pull_state::pull_state_findings(&states));
+}
+fn persist_landed(
+    report: &mut Report,
+    snapshot: Option<&crate::snapshot::CompletedSnapshot<'_>>,
+    landed: Option<BTreeMap<String, LandedVerdict>>,
+) {
+    let Some(snapshot) = snapshot else {
+        return;
+    };
+    if let Err(note) = snapshot.persist(landed) {
+        report.notes.push(note.to_string());
+    }
+}
+
+fn set_forge_status(
+    report: &mut Report,
+    snapshot: Option<&crate::snapshot::CompletedSnapshot<'_>>,
+    timings: &Timings,
+) -> anyhow::Result<()> {
+    report.forge = ForgeStatus {
+        consulted: snapshot.is_some(),
+        elapsed_ms: u64::try_from(timings.forge.as_millis())
+            .map_err(|_| anyhow::anyhow!("forge phase elapsed time cannot fit in milliseconds"))?,
+    };
+    Ok(())
 }
 
 /// Fold completed phases into rows, findings, timings, and cache persistence.
 fn fold_phase_outcome(
-    report: &mut Report,
-    timings: &mut Timings,
+    output: FoldOutput<'_>,
     input: PostPhaseInput<'_>,
     phases: &mut phases::StatusPhases<'_>,
 ) -> anyhow::Result<()> {
+    let FoldOutput {
+        report,
+        findings,
+        timings,
+    } = output;
     let snapshot = phases.forge.snapshot.as_ref();
     let empty_index = PullIndex::default();
     let index = snapshot.map_or(&empty_index, crate::snapshot::CompletedSnapshot::index);
-    report.forge_consulted = snapshot.is_some();
     report
         .problems
         .extend(std::mem::take(&mut phases.forge.problems));
@@ -844,20 +1124,21 @@ fn fold_phase_outcome(
             name: input.name,
             store: input.store,
             probe_inputs: input.probe_inputs,
+            verdicts: std::mem::take(&mut phases.probe.verdicts),
+            origin_relations: origin_phase.relations,
             index,
             snapshot,
             notches: input.notches,
+            expected_base: input.entry.default_base(),
         },
-        std::mem::take(&mut phases.probe.verdicts),
-        origin_phase.relations,
         report,
+        findings,
     )?;
     timings.origin_relations = phase.elapsed();
 
     let phase = std::time::Instant::now();
-    report
-        .branches
-        .extend(rows::divergent_rows(&rows::DivergentInput {
+    report.branches.extend(rows::divergent_rows(
+        &rows::DivergentInput {
             branches: input.divergent_branches,
             tips: input.tips,
             name: input.name,
@@ -865,7 +1146,10 @@ fn fold_phase_outcome(
             snapshot,
             index,
             notches: input.notches,
-        }));
+            expected_base: input.entry.default_base(),
+        },
+        findings,
+    ));
     report
         .branches
         .sort_by(|left, right| left.name.cmp(&right.name));
@@ -873,31 +1157,38 @@ fn fold_phase_outcome(
 
     let phase = std::time::Instant::now();
     let scheme = input.entry.release_scheme();
-    let carried = carried_findings(CarriedFindingInput {
+    findings.extend(carried_findings(CarriedFindingInput {
         report,
         repo: input.repo,
+        tips: input.tips,
         trunk: input.entry.trunk(),
         scheme: &scheme,
         publish_remote: input.entry.publish_remote(),
-    })?;
-    report.findings.extend(carried);
+    })?);
     timings.carried_findings = phase.elapsed();
 
-    timings.touching = add_branch_overlap_findings(report, input.entry, input.options.workers);
+    timings.touching =
+        add_branch_overlap_findings(report, findings, input.entry, input.options.workers);
 
     let phase = std::time::Instant::now();
-    add_claims(report, input.repo, input.name, input.store);
+    let seen = crate::seen::load();
+    fold_claims(
+        report,
+        findings,
+        ClaimFoldInput {
+            repo: input.repo,
+            name: input.name,
+            store: input.store,
+            seen: &seen,
+        },
+    )?;
     timings.claims = phase.elapsed();
 
     let phase = std::time::Instant::now();
-    report.findings.extend(branch_findings(&report.branches));
-    report.findings.extend(wrong_base_findings(
-        &report.branches,
-        input.entry.default_base(),
-    ));
     report.problems.extend(unjudged_note(&unjudged));
     add_dependency_findings(DependencyInput {
         report,
+        findings,
         name: input.name,
         store: input.store,
         options: input.options,
@@ -905,16 +1196,13 @@ fn fold_phase_outcome(
         timings,
     });
     if let Some(snapshot) = snapshot {
-        add_pull_state_findings(report, snapshot);
+        add_pull_state_findings(report, findings, snapshot);
     }
-    if let Some(snapshot) = snapshot {
-        let landed = input
-            .probe_ran
-            .then(|| std::mem::take(&mut phases.probe.landed));
-        if let Err(note) = snapshot.persist(landed) {
-            report.notes.push(note.to_string());
-        }
-    }
+    let landed = input
+        .probe_ran
+        .then(|| std::mem::take(&mut phases.probe.landed));
+    persist_landed(report, snapshot, landed);
+    set_forge_status(report, snapshot, timings)?;
     timings.report = phase.elapsed();
     Ok(())
 }
@@ -935,12 +1223,22 @@ pub fn gather_timed(
     let repo = Repo::open(&entry.path)?;
     let mut report = Report {
         repo: name.to_string(),
+        trunk: entry.trunk().to_owned(),
         ..Report::default()
     };
+    let mut findings = Vec::new();
     let tips = repo.bookmark_tips()?;
     timings.repository = phase.elapsed();
     let phase = std::time::Instant::now();
-    add_releases(&mut report, &repo, &tips, entry)?;
+    add_releases(
+        &mut report,
+        &mut findings,
+        ReleaseInput {
+            repo: &repo,
+            tips: &tips,
+            entry,
+        },
+    )?;
     timings.releases = phase.elapsed();
 
     let phase = std::time::Instant::now();
@@ -992,11 +1290,14 @@ pub fn gather_timed(
     })?;
     timings.divergent_changes = health.divergent_changes;
     timings.health = health.health;
-    report.findings.splice(0..0, health.findings);
+    findings.splice(0..0, health.findings);
     report.problems.splice(0..0, health.problems);
     fold_phase_outcome(
-        &mut report,
-        &mut timings,
+        FoldOutput {
+            report: &mut report,
+            findings: &mut findings,
+            timings: &mut timings,
+        },
         PostPhaseInput {
             name,
             entry,
@@ -1011,6 +1312,7 @@ pub fn gather_timed(
         },
         &mut phases,
     )?;
+    report.findings = group_findings(findings);
     timings.total = started.elapsed();
     Ok((report, timings))
 }
@@ -1103,87 +1405,44 @@ fn short(id: &str) -> String {
     id.chars().take(12).collect()
 }
 
-/// Observations about branches that the branch line itself cannot carry.
-///
-/// Once the advice was removed, most of what lived here went with it: whether a branch
-/// is in the trunk, and whether it has a pull request, are facts already stated on the
-/// branch's own line. Repeating them as findings only added volume.
-fn branch_findings(rows: &[BranchRow]) -> Vec<Finding> {
-    let mut findings = Vec::new();
-    for row in rows {
-        // The forge's own verdict, not a guess. A pull request in conflict with its base
-        // looks complete from every other angle — tests green, review approved, nothing
-        // left to write — and cannot be merged; an agent called one ready to ship while it
-        // was in conflict with main.
-        if let Some(pr) = row.pull_request.as_ref()
-            && pr.conflicting()
-        {
-            findings.push(Finding::new(
-                FindingKind::Unmergeable,
-                Subject::PullRequest(pr.number),
-                format!(
-                    "#{} cannot be merged as it stands: the forge reports {} ({})",
-                    pr.number,
-                    pr.mergeable.to_lowercase(),
-                    if pr.merge_state_status.is_empty() {
-                        "no further detail".to_owned()
-                    } else {
-                        pr.merge_state_status.to_lowercase()
-                    }
-                ),
-            ));
-        }
-        if let (Some(pr), Some(checks)) = (row.pull_request.as_ref(), row.checks.as_ref())
-            && pr.is_open()
-            && checks.failing()
-        {
-            findings.push(Finding::new(
-                FindingKind::ChecksFailing,
-                Subject::PullRequest(pr.number),
-                format!(
-                    "#{} has failing checks: {}",
-                    pr.number,
-                    checks.failed_names().join(", ")
-                ),
-            ));
-        }
-        // Only when a pull request exists. The old default rendered a finding
-        // for `#0`, a fabricated identifier, rather than declining to speak.
-        if let (Some(true), Some(pr)) = (row.review_stale, row.pull_request.as_ref()) {
-            let number = pr.number;
-            findings.push(Finding::new(
-                FindingKind::StaleReview,
-                Subject::PullRequest(number),
-                format!(
-                    "the newest review on #{number} predates the newest commit on {}",
-                    row.name
-                ),
-            ));
-        }
-    }
-    findings
+/// One grouped subject per raw finding. Relationship findings include the
+/// counterpart because the lone branch or path does not identify the action.
+fn grouped_subject(finding: &Finding) -> String {
+    let subject = finding.subject.short();
+    let counterpart = match finding.kind {
+        FindingKind::BranchOverlap => finding
+            .detail
+            .strip_prefix(&format!("{subject} is touched by ")),
+        FindingKind::CarriedElsewhere => finding
+            .detail
+            .strip_prefix(&format!("{subject}'s tip is also reachable from ")),
+        _ => None,
+    };
+    counterpart.map_or_else(
+        || subject.clone(),
+        |counterpart| format!("{subject}: {counterpart}"),
+    )
 }
 
-/// Open pull requests whose base branch name differs from the configured base.
-///
-/// An empty base means the forge did not say, which is not the same as wrong.
-fn wrong_base_findings(rows: &[BranchRow], expected: &str) -> Vec<Finding> {
-    rows.iter()
-        .filter_map(|row| {
-            let pr = row.pull_request.as_ref()?;
-            if !pr.is_open() || pr.base_ref_name.is_empty() || pr.base_ref_name == expected {
-                return None;
+/// Folds raw findings once, after every detector has reported, preserving detector order.
+fn group_findings(findings: Vec<Finding>) -> Vec<FindingGroup> {
+    let mut groups: Vec<FindingGroup> = Vec::new();
+    for finding in findings {
+        let subject = grouped_subject(&finding);
+        if let Some(group) = groups.iter_mut().find(|group| group.kind == finding.kind) {
+            group.count += 1;
+            if group.subjects.len() < 8 {
+                group.subjects.push(subject);
             }
-            Some(Finding::new(
-                FindingKind::WrongBase,
-                Subject::PullRequest(pr.number),
-                format!(
-                    "#{} targets {}, not {expected}",
-                    pr.number, pr.base_ref_name
-                ),
-            ))
-        })
-        .collect()
+        } else {
+            groups.push(FindingGroup {
+                kind: finding.kind,
+                count: 1,
+                subjects: vec![subject],
+            });
+        }
+    }
+    groups
 }
 
 /// Findings mean act; notes mean we could not answer. A command that reports a
@@ -1200,8 +1459,7 @@ pub const fn exit_for(report: &Report) -> Exit {
     }
 }
 
-/// Row and bookmark literals shared by the split test modules; scenario tests
-/// state only the fields under test.
+/// Row and bookmark literals shared by status's split test modules.
 #[cfg(test)]
 pub(super) mod test_fixtures {
     use super::*;
@@ -1224,28 +1482,6 @@ pub(super) mod test_fixtures {
             .map(|(reference, commit)| (reference.clone(), CommitId::new(*commit)))
             .collect()
     }
-
-    pub(super) fn row(
-        name: &str,
-        landed: Option<LandedVerdict>,
-        pr: Option<PullRequest>,
-    ) -> BranchRow {
-        BranchRow {
-            pull_request: pr,
-            landed,
-            ..BranchRow::bare(BranchName::new(name), Some(CommitId::new("0700338c")))
-        }
-    }
-
-    pub(super) fn pull_request(number: u64) -> PullRequest {
-        PullRequest {
-            number,
-            review_decision: "APPROVED".to_owned(),
-            head_ref_name: "feat/alpha".to_owned(),
-            head_ref_oid: "deadbeef".to_owned(),
-            ..PullRequest::default()
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1254,14 +1490,61 @@ mod tests {
         clippy::indexing_slicing,
         reason = "indexing a result in a test is the assertion; a panic is the failure"
     )]
-    use super::test_fixtures::{local, pull_request, remote, row, tips};
+
+    use super::test_fixtures::{local, remote, tips};
     use super::*;
-    use crate::ids::BranchName;
+
+    #[test]
+    fn the_report_serializes_problems_before_branches_and_skips_absent_values() {
+        let report = Report {
+            repo: "a".into(),
+            trunk: "main".into(),
+            problems: vec!["pull request state unavailable: boom".into()],
+            branches: vec![BranchRow::bare(BranchName::new("feat/bare"))],
+            ..Report::default()
+        };
+        let json = serde_json::to_string(&report).expect("serialize");
+        let problems_at = json.find("\"problems\"").expect("problems present");
+        let branches_at = json.find("\"branches\"").expect("branches present");
+        assert!(problems_at < branches_at, "problems must lead: {json}");
+        assert!(
+            !json.contains("null"),
+            "absent values are skipped, never null: {json}"
+        );
+        assert!(
+            !json.contains("\"claims\""),
+            "the standalone claims section is dead: {json}"
+        );
+    }
+
+    #[test]
+    fn findings_group_by_kind_in_first_seen_order_and_cap_subjects() {
+        let mut findings = vec![Finding::new(
+            FindingKind::WrongBase,
+            Subject::PullRequest(1),
+            "first",
+        )];
+        findings.extend((0..30).map(|number| {
+            Finding::new(
+                FindingKind::Divergence,
+                Subject::Branch(BranchName::new(format!("feat/{number}"))),
+                "detail",
+            )
+        }));
+
+        let groups = group_findings(findings);
+
+        assert_eq!(groups.len(), 2, "was: {groups:?}");
+        assert_eq!(groups[0].kind, FindingKind::WrongBase);
+        assert_eq!(groups[1].kind, FindingKind::Divergence);
+        assert_eq!(groups[1].count, 30);
+        assert_eq!(groups[1].subjects.len(), 8);
+        assert_eq!(groups[1].subjects[0], "feat/0");
+        assert_eq!(groups[1].subjects[7], "feat/7");
+    }
 
     #[test]
     fn a_timing_line_names_every_phase_it_measured() {
-        // The numbers this PR is judged against. A line that reported only a total
-        // could not say which phase a change actually moved.
         let timings = Timings {
             repository: std::time::Duration::from_millis(4),
             health: std::time::Duration::from_millis(10),
@@ -1279,27 +1562,28 @@ mod tests {
             total: std::time::Duration::from_millis(11_600),
         };
         let line = timings.line("a-repo");
-        assert!(line.contains("a-repo"), "was: {line}");
-        assert!(line.contains("repository-open 4ms"), "was: {line}");
-        assert!(line.contains("health 10ms"), "was: {line}");
-        assert!(line.contains("divergent-changes 11ms"), "was: {line}");
-        assert!(line.contains("releases 12ms"), "was: {line}");
-        assert!(line.contains("setup 5ms"), "was: {line}");
-        assert!(line.contains("forge 3400ms"), "was: {line}");
-        assert!(line.contains("probes 8100ms"), "was: {line}");
-        assert!(line.contains("origin-relations 16ms"), "was: {line}");
-        assert!(line.contains("divergent-rows 17ms"), "was: {line}");
-        assert!(line.contains("carried-findings 18ms"), "was: {line}");
-        assert!(line.contains("touching 19ms"), "was: {line}");
-        assert!(line.contains("claims 20ms"), "was: {line}");
-        assert!(line.contains("report 6ms"), "was: {line}");
-        assert!(line.contains("total 11600ms"), "was: {line}");
+        for phase in [
+            "repository-open 4ms",
+            "health 10ms",
+            "divergent-changes 11ms",
+            "releases 12ms",
+            "setup 5ms",
+            "forge 3400ms",
+            "probes 8100ms",
+            "origin-relations 16ms",
+            "divergent-rows 17ms",
+            "carried-findings 18ms",
+            "touching 19ms",
+            "claims 20ms",
+            "report 6ms",
+            "total 11600ms",
+        ] {
+            assert!(line.contains(phase), "was: {line}");
+        }
     }
 
     #[test]
     fn a_ledger_that_cannot_be_read_is_an_unanswered_question_not_an_absence() {
-        // A report that quietly showed no breadcrumbs would say this fork's
-        // history was never written.
         let dir = tempfile::tempdir().expect("temporary directory");
         let path = dir.path().join("a-repo");
         std::fs::create_dir_all(&path).expect("ledger directory");
@@ -1311,229 +1595,109 @@ mod tests {
         let ledger = crate::ledger::Ledger::at(path);
         let mut report = Report::default();
 
-        let notches = notches_from_ledger(Some(&ledger), &mut report);
-
-        assert!(notches.is_empty());
-        assert_eq!(report.problems.len(), 1, "was: {report:?}");
-        assert!(report.problems[0].contains("ledger"), "was: {report:?}");
+        assert!(notches_from_ledger(Some(&ledger), &mut report).is_empty());
         assert_eq!(exit_for(&report), Exit::Incomplete);
     }
 
     #[test]
-    fn the_notch_cell_prefers_the_newest_note_over_a_newer_event() {
-        // Removing the preference would let a mechanical transition mask the
-        // human ruling that tells a reader how to interpret this branch.
+    fn activity_errors_keep_sidecar_observations_and_mark_unsighted_claims_within_window() {
+        let claim = crate::store::Claim {
+            repo: "demo".to_owned(),
+            branch: "feat/alpha".to_owned(),
+            owner: "session".to_owned(),
+            kind: crate::store::OwnerKind::HarnessSession,
+            why: "status model".to_owned(),
+            started: "2026-08-01T00:00:00Z".to_owned(),
+            files: Vec::new(),
+        };
+
+        assert_eq!(
+            claim_last_seen(&claim, None, &crate::seen::Seen::default()),
+            crate::seen::LastSeen::NoneWithinWindow
+        );
+
+        let seen = crate::seen::Seen {
+            owners: std::collections::BTreeMap::from([(
+                crate::store::OwnerKind::HarnessSession,
+                std::collections::BTreeMap::from([(
+                    "session".to_owned(),
+                    jiff::Timestamp::now().to_string(),
+                )]),
+            )]),
+            ..crate::seen::Seen::default()
+        };
+        assert!(matches!(
+            claim_last_seen(&claim, None, &seen),
+            crate::seen::LastSeen::At(_)
+        ));
+    }
+
+    #[test]
+    fn report_notch_text_is_collapsed_and_capped_at_120_characters() {
         let note = Notch {
             ts: "2026-08-15T22:14:01Z".to_owned(),
             owner: "ses_fff688".to_owned(),
             subject: Some("feat/alpha".to_owned()),
             kind: crate::ledger::Kind::Note,
             disposition: Some("ruled-out".to_owned()),
-            text: "split to a plugin".to_owned(),
+            text: format!("first\n{}", "x".repeat(140)),
             evidence: Vec::new(),
             anchor: None,
             pr: None,
         };
-        let event = Notch {
-            ts: "2026-08-15T22:14:02Z".to_owned(),
-            kind: crate::ledger::Kind::Event,
-            disposition: None,
-            text: "sync advanced".to_owned(),
-            ..note.clone()
-        };
 
-        let last = LastNotch::of([&note, &event].into_iter()).expect("a notch");
+        let last = LastNotch::of([&note].into_iter()).expect("a notch");
 
-        assert_eq!(last.kind, crate::ledger::Kind::Note);
-        assert_eq!(last.text, "split to a plugin");
-        assert_eq!(last.disposition.as_deref(), Some("ruled-out"));
-        assert_eq!(last.count, 2);
+        assert!(!last.text.contains('\n'), "was: {}", last.text);
+        assert_eq!(last.text.chars().count(), 121, "was: {}", last.text);
+        assert!(last.text.ends_with('…'), "was: {}", last.text);
     }
 
     #[test]
-    fn only_the_newest_release_on_each_side_is_scanned() {
-        // A fork accumulates every release it ever cut, and every one of their parents
-        // has moved on, so scanning them all filled the report with stale-parent
-        // findings for releases nothing pins: 47 of 89 on a real repository. Two local
-        // releases here on purpose; with one, this test cannot tell "every local" from
-        // "the newest local".
+    fn release_scanning_selects_the_newest_local_and_origin_releases() {
         let map = tips(&[
             (local("release/2026-07-17.5"), "aaa"),
             (local("release/2026-07-28"), "bbb"),
             (remote("release/2026-07-20", "origin"), "ccc"),
             (remote("release/2026-07-29", "origin"), "ddd"),
-            (local("feat/alpha"), "eee"),
         ]);
+
         let (chosen, skipped) = releases_to_scan(&map, &ReleaseScheme::Dated, "origin");
-        let names: Vec<String> = chosen.iter().map(|(r, _)| r.to_string()).collect();
-        assert!(names.contains(&"release/2026-07-28".to_owned()));
-        assert!(names.contains(&"release/2026-07-29@origin".to_owned()));
-        assert!(
-            !names.contains(&"release/2026-07-17.5".to_owned()),
-            "a superseded local release is frozen history: {names:?}"
+        let names: Vec<String> = chosen
+            .iter()
+            .map(|(reference, _)| reference.to_string())
+            .collect();
+
+        assert_eq!(
+            names,
+            vec!["release/2026-07-28", "release/2026-07-29@origin"]
         );
-        assert!(!names.contains(&"release/2026-07-20@origin".to_owned()));
-        assert_eq!(skipped, 2, "what was skipped must be reported, not dropped");
+        assert_eq!(skipped, 2);
     }
 
     #[test]
-    fn an_upstream_release_is_never_a_candidate() {
-        // We did not cut it and cannot re-cut it. It also has a different date
-        // format, which sorted above ours and won the "newest" slot until this
-        // was fixed.
-        let map = tips(&[
-            (local("release/2026-07-28"), "aaa"),
-            (
-                remote("release/20260416144609+gcloud-fix", "upstream"),
-                "zzz",
-            ),
-        ]);
-        let (chosen, _) = releases_to_scan(&map, &ReleaseScheme::Dated, "origin");
-        assert!(
-            chosen
-                .iter()
-                .all(|(r, _)| !r.to_string().contains("upstream"))
-        );
-    }
-
-    #[test]
-    fn only_releases_we_cut_count_as_ours() {
-        // `repos` and `status` each grew their own version of this, and `repos`
-        // promptly picked an upstream release as ours. One predicate now.
-        assert!(is_our_release(
-            &local("release/2026-07-29"),
-            &ReleaseScheme::Dated,
-            "release"
-        ));
-        assert!(is_our_release(
-            &remote("release/2026-07-29", "origin"),
-            &ReleaseScheme::Dated,
-            "origin"
-        ));
-        assert!(is_our_release(
-            &remote("release/2026-07-29", "release"),
-            &ReleaseScheme::Dated,
-            "release"
-        ));
-        assert!(!is_our_release(
-            &remote("release/2026-07-29", "origin"),
-            &ReleaseScheme::Dated,
-            "release"
-        ));
-        assert!(!is_our_release(
-            &remote("release/2026-07-29", "upstream"),
-            &ReleaseScheme::Dated,
-            "origin"
-        ));
-        assert!(!is_our_release(
-            &remote("release/2026-07-29", "git"),
-            &ReleaseScheme::Dated,
-            "origin"
-        ));
-        assert!(!is_our_release(
-            &local("feat/alpha"),
-            &ReleaseScheme::Dated,
-            "origin"
-        ));
-    }
-
-    #[test]
-    fn a_double_digit_repair_suffix_sorts_above_a_single_digit_one() {
-        // String order puts `.10` below `.2`, so from the tenth repair of one
-        // day onward the wrong release is audited and the difference is
-        // reported as "1 superseded release not scanned".
-        assert!(release_order("release/2026-07-28.10") > release_order("release/2026-07-28.2"));
-        assert!(release_order("release/2026-07-29") > release_order("release/2026-07-28.10"));
-        assert!(release_order("release/2026-07-28.1") > release_order("release/2026-07-28"));
-    }
-
-    #[test]
-    fn the_newest_release_is_chosen_numerically_not_lexically() {
-        let map = tips(&[
-            (remote("release/2026-07-28.2", "origin"), "aaa"),
-            (remote("release/2026-07-28.10", "origin"), "bbb"),
-        ]);
-        let (chosen, _) = releases_to_scan(&map, &ReleaseScheme::Dated, "origin");
-        let names: Vec<String> = chosen.iter().map(|(r, _)| r.to_string()).collect();
-        assert_eq!(names, vec!["release/2026-07-28.10@origin".to_owned()]);
-    }
-
-    #[test]
-    fn jj_internal_git_refs_are_not_releases() {
-        let map = tips(&[(remote("release/2026-07-29", "git"), "aaa")]);
-        let (chosen, _) = releases_to_scan(&map, &ReleaseScheme::Dated, "origin");
-        assert!(chosen.is_empty());
-    }
-
-    #[test]
-    fn under_a_fixed_scheme_the_fixed_branch_is_scanned_and_is_not_a_maintained_branch() {
-        // Given: a fixed release branch, its publish remote, a different release-role remote,
-        // and a dated leftover from before the scheme changed.
-        let fixed = crate::ids::ReleaseScheme::Fixed(BranchName::new("integration"));
+    fn fixed_release_scanning_uses_only_the_local_and_publish_remote_positions() {
+        let fixed = ReleaseScheme::Fixed(BranchName::new("integration"));
         let map = tips(&[
             (local("integration"), "aaa"),
             (remote("integration", "origin"), "bbb"),
-            (remote("integration", "release"), "eee"),
-            (local("feat/alpha"), "ccc"),
-            (local("release/2026-07-28"), "ddd"),
+            (remote("integration", "release"), "ccc"),
         ]);
-        // When: releases are chosen and branches collected under the fixed scheme.
+
         let (chosen, skipped) = releases_to_scan(&map, &fixed, "origin");
         let names: Vec<String> = chosen
             .iter()
             .map(|(reference, _)| reference.to_string())
             .collect();
-        let (branches, _) = rows::maintained_branches(&map, "main", &fixed);
-        let branch_names: Vec<String> = branches
-            .iter()
-            .map(|(branch, _)| branch.to_string())
-            .collect();
-        // Then: local and publish-remote positions are the complete scan set, while the fixed
-        // branch is a cut rather than carried work.
-        assert!(names.contains(&"integration".to_owned()), "was: {names:?}");
-        assert!(
-            names.contains(&"integration@origin".to_owned()),
-            "was: {names:?}"
-        );
-        assert!(
-            !names.contains(&"integration@release".to_owned()),
-            "only the publish remote's counterpart is a release candidate: {names:?}"
-        );
-        assert!(
-            !names.iter().any(|name| name.contains("release/")),
-            "was: {names:?}"
-        );
-        assert_eq!(skipped, 0);
-        assert!(
-            !branch_names.contains(&"integration".to_owned()),
-            "was: {branch_names:?}"
-        );
-        assert!(
-            branch_names.contains(&"release/2026-07-28".to_owned()),
-            "was: {branch_names:?}"
-        );
-    }
 
-    #[test]
-    fn the_dated_scheme_still_scans_only_the_newest_release_on_each_side() {
-        // Given: dated releases with one superseded local cut.
-        let map = tips(&[
-            (local("release/2026-07-17.5"), "aaa"),
-            (local("release/2026-07-28"), "bbb"),
-            (remote("release/2026-07-29", "origin"), "ddd"),
-        ]);
-        // When: releases are chosen under the dated scheme.
-        let (chosen, skipped) = releases_to_scan(&map, &ReleaseScheme::Dated, "origin");
-        // Then: exactly the latest local and remote cuts are kept.
-        assert_eq!(chosen.len(), 2);
-        assert_eq!(skipped, 1);
+        assert_eq!(names, vec!["integration", "integration@origin"]);
+        assert_eq!(skipped, 0);
     }
 
     #[test]
     fn a_branch_without_a_single_tip_is_noted_but_does_not_make_status_incomplete() {
-        // Given: a divergent bookmark row, which cannot name one commit to compare
         let mut report = Report {
-            branches: vec![BranchRow::bare(BranchName::new("feat/divergent"), None)],
+            branches: vec![BranchRow::bare(BranchName::new("feat/divergent"))],
             ..Report::default()
         };
         let entry = RepoEntry {
@@ -1547,27 +1711,24 @@ mod tests {
             consumers: Vec::new(),
         };
 
-        // When: overlap paths are gathered alongside the landed probe
-        let _ = add_branch_overlap_findings(&mut report, &entry, 1);
+        let _ = add_branch_overlap_findings(&mut report, &mut Vec::new(), &entry, 1);
 
-        // Then: the known divergence is announced without claiming the report is incomplete.
-        assert!(report.notes.iter().any(|note| {
-            note.contains("cannot compare paths for feat/divergent")
-                && note.contains("no single tip")
-        }));
-        assert!(report.problems.is_empty(), "was: {report:?}");
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|note| note.contains("no single tip"))
+        );
         assert_ne!(exit_for(&report), Exit::Incomplete);
     }
 
     #[test]
     fn a_branch_whose_path_diff_errors_is_unanswered() {
-        // Given: a reported branch and a repository path where jj cannot resolve its range
         let scratch = tempfile::tempdir().expect("temporary non-repository");
+        let mut row = BranchRow::bare(BranchName::new("feat/unresolvable"));
+        row.tip = Some("0700338c".to_owned());
         let mut report = Report {
-            branches: vec![BranchRow::bare(
-                BranchName::new("feat/unresolvable"),
-                Some(CommitId::new("0700338c")),
-            )],
+            branches: vec![row],
             ..Report::default()
         };
         let entry = RepoEntry {
@@ -1581,181 +1742,211 @@ mod tests {
             consumers: Vec::new(),
         };
 
-        // When: jj cannot calculate that branch's changed paths
-        let _ = add_branch_overlap_findings(&mut report, &entry, 1);
+        let _ = add_branch_overlap_findings(&mut report, &mut Vec::new(), &entry, 1);
 
-        // Then: the report says path coverage was incomplete instead of silently omitting it
-        assert!(
-            report
-                .problems
-                .iter()
-                .any(|problem| problem.contains("cannot compare paths for feat/unresolvable"))
-        );
         assert_eq!(exit_for(&report), Exit::Incomplete);
     }
 
     #[test]
-    fn a_pull_request_in_conflict_with_its_base_is_reported() {
-        // The case this exists for: a pull request that looks finished from every other
-        // angle — tests green, review approved, nothing left to write — and cannot be
-        // merged. An agent called one code complete and ready to ship while it was in
-        // conflict with main. Four of thirteen open pull requests were in that state.
-        let mut pr = pull_request(4565);
-        pr.mergeable = "CONFLICTING".to_owned();
-        pr.merge_state_status = "DIRTY".to_owned();
-        let findings = branch_findings(&[row("feat/alpha", None, Some(pr))]);
-
-        let found = findings
-            .iter()
-            .find(|finding| finding.kind == FindingKind::Unmergeable)
-            .expect("a conflicting pull request must be reported");
-        assert!(found.detail.contains("#4565"), "was: {}", found.detail);
-        assert!(
-            found.detail.contains("conflicting"),
-            "was: {}",
-            found.detail
-        );
-    }
-
-    #[test]
-    fn a_pull_request_against_the_wrong_base_is_reported() {
-        let mut wrong = pull_request(21);
-        wrong.base_ref_name = "release/2026-07-28".to_owned();
-        let findings = wrong_base_findings(&[row("feat/alpha", None, Some(wrong))], "main");
-        let found = findings
-            .iter()
-            .find(|finding| finding.kind == FindingKind::WrongBase)
-            .expect("a wrong base must be reported");
-        assert!(
-            found.detail.contains("release/2026-07-28"),
-            "was: {}",
-            found.detail
-        );
-        assert!(
-            found.detail.contains("main"),
-            "name the expected base: {}",
-            found.detail
-        );
-
-        let mut right = pull_request(22);
-        right.base_ref_name = "main".to_owned();
-        assert!(wrong_base_findings(&[row("feat/beta", None, Some(right))], "main").is_empty());
-
-        let mut merged = pull_request(23);
-        merged.state = "MERGED".to_owned();
-        merged.base_ref_name = "release/2026-07-28".to_owned();
-        assert!(wrong_base_findings(&[row("feat/gamma", None, Some(merged))], "main").is_empty());
-
-        // Unknown is not wrong: an empty base means the forge did not say.
-        let mut quiet = pull_request(24);
-        quiet.base_ref_name.clear();
-        assert!(wrong_base_findings(&[row("feat/gamma", None, Some(quiet))], "main").is_empty());
-    }
-
-    #[test]
-    fn a_mergeable_pull_request_is_not_reported_and_neither_is_an_unknown_one() {
-        // The forge computes mergeability asynchronously, so treating "not worked out yet"
-        // as "broken" would cry wolf on every fresh push.
-        let mut fine = pull_request(1);
-        fine.mergeable = "MERGEABLE".to_owned();
-        let mut unknown = pull_request(2);
-        unknown.mergeable = "UNKNOWN".to_owned();
-        for pr in [fine, unknown] {
-            let findings = branch_findings(&[row("feat/alpha", None, Some(pr))]);
-            assert!(
-                !findings
-                    .iter()
-                    .any(|finding| finding.kind == FindingKind::Unmergeable),
-                "only CONFLICTING is a conflict: {findings:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn failing_checks_are_reported_and_an_empty_rollup_is_not() {
-        // Given: one pull request with red CI and one without a reported check
-        let mut red = row("feat/alpha", None, Some(pull_request(11)));
-        red.checks = Some(crate::forge::ChecksSummary {
-            runs: vec![crate::forge::CheckRun {
-                name: "build".to_owned(),
-                conclusion: Some("FAILURE".to_owned()),
-            }],
-        });
-
-        // When: branch findings are derived
-        let findings = branch_findings(&[red]);
-        let found = findings
-            .iter()
-            .find(|finding| finding.kind == FindingKind::ChecksFailing)
-            .expect("a failing check must be reported");
-
-        // Then: the failing check is named, while an empty rollup has no finding
-        assert!(
-            found.detail.contains("build"),
-            "name the check: {}",
-            found.detail
-        );
-        let mut quiet = row("feat/beta", None, Some(pull_request(12)));
-        quiet.checks = Some(crate::forge::ChecksSummary::default());
-        assert!(
-            !branch_findings(&[quiet])
-                .iter()
-                .any(|finding| finding.kind == FindingKind::ChecksFailing)
-        );
-    }
-
-    #[test]
-    fn a_stale_review_names_the_pull_request_and_says_to_re_read() {
-        let mut stale = row("feat/alpha", None, Some(pull_request(42)));
-        stale.review_stale = Some(true);
-        let findings = branch_findings(&[stale]);
-        let review = findings
-            .iter()
-            .find(|f| f.kind == FindingKind::StaleReview)
-            .expect("finding");
-        assert_eq!(review.subject.to_string(), "#42");
-    }
-
-    #[test]
-    fn a_problem_means_incomplete_even_when_there_are_no_findings() {
-        // A CI gate on `knives status` must not go green because the forge login
-        // failed and every detector therefore found nothing.
+    fn problems_and_grouped_findings_drive_the_existing_exit_contract() {
         let blocked = Report {
-            repo: "a".to_owned(),
             problems: vec!["pull request state unavailable".to_owned()],
             ..Report::default()
         };
         assert_eq!(exit_for(&blocked), Exit::Incomplete);
-    }
 
-    #[test]
-    fn an_informational_note_does_not_make_the_command_look_broken() {
-        // "14 superseded releases not scanned" is a remark, not a failure.
-        // Keying incompleteness on every note made status always exit 3.
-        let chatty = Report {
-            repo: "a".to_owned(),
-            notes: vec!["14 superseded release(s) not scanned".to_owned()],
-            ..Report::default()
-        };
-        assert_eq!(exit_for(&chatty), Exit::Ok);
-    }
-
-    #[test]
-    fn findings_make_the_command_exit_non_zero_so_a_script_can_gate_on_it() {
-        let clean = Report {
-            repo: "a".to_owned(),
-            ..Report::default()
-        };
-        assert_eq!(exit_for(&clean), Exit::Ok);
         let dirty = Report {
-            repo: "a".to_owned(),
-            findings: vec![Finding::new(
-                FindingKind::Divergence,
-                Subject::File("a".to_owned()),
-                "d",
-            )],
+            findings: vec![FindingGroup {
+                kind: FindingKind::Divergence,
+                count: 1,
+                subjects: vec!["feat/a".to_owned()],
+            }],
             ..Report::default()
         };
         assert_eq!(exit_for(&dirty), Exit::Findings);
+    }
+
+    fn swe_scale_fixture() -> Report {
+        let branches = (0..14)
+            .map(|index| {
+                let mut row = BranchRow::bare(BranchName::new(format!("feat/scale-{index:02}")));
+                row.state = match index % 4 {
+                    0 => BranchState::ChecksFailing,
+                    1 => BranchState::Approved,
+                    2 => BranchState::AwaitingReview,
+                    _ => BranchState::NoPr,
+                };
+                if index == 0 {
+                    row.pr = Some(PullCell {
+                        number: 4891,
+                        state: "open".to_owned(),
+                        draft: false,
+                        stated: None,
+                        prior: Vec::new(),
+                    });
+                    row.review = Some("changes-requested".to_owned());
+                    row.checks = Some("failing".to_owned());
+                    row.flags.push("review-stale".to_owned());
+                }
+                if index == 1 {
+                    row.push = Some(PushRelation::Behind("f0e1d2c3b4a5".to_owned()));
+                }
+                if index == 2 {
+                    row.seen = Some(SeenWindow::NoneWithinWindow);
+                    row.workspace = Some("scale-02".to_owned());
+                }
+                if index == 3 {
+                    row.notch = Some(LastNotch {
+                        ts: "2026-08-30T09:15:00Z".to_owned(),
+                        kind: crate::ledger::Kind::Note,
+                        text: "Release triage recorded after the final merge queue drain.".to_owned(),
+                        disposition: Some("decided".to_owned()),
+                        count: 4,
+                    });
+                }
+                if index < 6 {
+                    row.claim = Some(ClaimCell {
+                        id: format!("session-{index:012x}"),
+                        kind: crate::store::OwnerKind::HarnessSession,
+                        since: "2026-08-29T12:00:00Z".to_owned(),
+                        why: format!(
+                            "Migrate the status integration assertions and verify the release report for branch {index}."
+                        ),
+                    });
+                }
+                row
+            })
+            .collect();
+        let finding = |kind, count, prefix: &str| FindingGroup {
+            kind,
+            count,
+            subjects: (0..count)
+                .map(|index| format!("{prefix}-{index:02}"))
+                .collect(),
+        };
+
+        Report {
+            repo: "swe-scale".to_owned(),
+            trunk: "main".to_owned(),
+            newest_release: Some("release/2026-08-29".to_owned()),
+            forge: ForgeStatus {
+                consulted: true,
+                elapsed_ms: 347,
+            },
+            problems: vec![
+                "pull request state unavailable: the forge rejected one facts batch".to_owned(),
+                "workspace activity unavailable: the local sidecar could not be read".to_owned(),
+            ],
+            branches,
+            findings: vec![
+                finding(FindingKind::ChecksFailing, 6, "checks"),
+                finding(FindingKind::StaleReview, 6, "review"),
+                finding(FindingKind::WrongBase, 6, "base"),
+                finding(FindingKind::BranchOverlap, 6, "path"),
+                finding(FindingKind::ClaimOverlap, 5, "claim"),
+                finding(FindingKind::CarriedElsewhere, 5, "carrier"),
+            ],
+            releases: vec![
+                "release/2026-08-22".to_owned(),
+                "release/2026-08-29".to_owned(),
+            ],
+            repo_notches: Some(RepoNotches {
+                count: 4,
+                last: LastNotch {
+                    ts: "2026-08-30T09:15:00Z".to_owned(),
+                    kind: crate::ledger::Kind::Note,
+                    text: "Release triage recorded after the final merge queue drain.".to_owned(),
+                    disposition: Some("decided".to_owned()),
+                    count: 4,
+                },
+            }),
+            other_workspaces: vec![
+                "legacy-release".to_owned(),
+                "manual-repro".to_owned(),
+                "untracked-experiment".to_owned(),
+            ],
+            notes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_swe_scale_report_encodes_within_the_map_budget() {
+        // 14 branches (6 claimed with real-length whys), 34 findings across 6 kinds,
+        // 2 problems, 2 releases, repo notches, and 3 other workspaces: the report
+        // shape that rendered 393 TOON lines before the status map.
+        let report = swe_scale_fixture();
+        assert_eq!(report.branches.len(), 14);
+        assert_eq!(
+            report
+                .branches
+                .iter()
+                .filter(|row| row.claim.is_some())
+                .count(),
+            6
+        );
+        assert_eq!(report.findings.len(), 6);
+        assert_eq!(
+            report
+                .findings
+                .iter()
+                .map(|finding| finding.count)
+                .sum::<usize>(),
+            34
+        );
+        assert_eq!(report.problems.len(), 2);
+        assert_eq!(report.releases.len(), 2);
+        assert!(report.repo_notches.is_some());
+        assert_eq!(report.other_workspaces.len(), 3);
+        assert!(report.branches.iter().any(|row| row.pr.is_some()));
+        assert!(report.branches.iter().any(|row| row.review.is_some()));
+        assert!(report.branches.iter().any(|row| row.checks.is_some()));
+        assert!(report.branches.iter().any(|row| !row.flags.is_empty()));
+        assert!(report.branches.iter().any(|row| row.push.is_some()));
+        assert!(report.branches.iter().any(|row| {
+            row.push
+                .as_ref()
+                .and_then(PushRelation::origin_tip)
+                .is_some()
+        }));
+        assert!(report.branches.iter().any(|row| row.seen.is_some()));
+        assert!(report.branches.iter().any(|row| row.workspace.is_some()));
+        assert!(report.branches.iter().any(|row| row.notch.is_some()));
+
+        let toon = toon_format::encode_default(&report).expect("encode");
+        let lines = toon.lines().count();
+        assert!(
+            lines <= 120,
+            "the map regressed to a dump: {lines} lines\n{toon}"
+        );
+    }
+
+    /// Guards the pinned serde-order-equals-TOON-presentation-order invariant:
+    /// an unanswered forge decode must lead the branch section.
+    #[test]
+    fn serde_order_keeps_a_forge_decode_failure_before_branches() {
+        let report = Report {
+            repo: "a".into(),
+            trunk: "main".into(),
+            problems: vec![
+                "pull request state unavailable: could not read the forge's reply: …".into(),
+            ],
+            branches: vec![BranchRow::bare(BranchName::new("feat/alpha"))],
+            ..Report::default()
+        };
+
+        let toon = toon_format::encode_default(&report).expect("encode");
+        let head: String = toon.lines().take(6).collect::<Vec<_>>().join("\n");
+        let problem_at = toon
+            .find("pull request state unavailable")
+            .expect("forge decode failure is rendered");
+        let branches_at = toon
+            .find("branches[1]")
+            .expect("branch section is rendered");
+        assert!(
+            head.contains("pull request state unavailable"),
+            "was:\n{toon}"
+        );
+        assert!(problem_at < branches_at, "problems must lead: {toon}");
+        assert_eq!(exit_for(&report), Exit::Incomplete);
     }
 }

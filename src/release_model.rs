@@ -3,24 +3,151 @@
 //! This module owns facts about release names, recorded cuts, and consumer pins.
 //! Commands gather their I/O and render their answers around these rules.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use std::sync::Mutex;
 
 use crate::config::{RepoEntry, Role};
 use crate::detect::{BookmarkTips, Finding, FindingKind, Subject};
+use crate::forge::{ConsumerHead, Forge};
+use crate::forge_cache::{
+    CONSUMER_SCHEMA_VERSION, ConsumerCache, consumer_cache_path, load_consumer_cache,
+    write_consumer_cache,
+};
 use crate::ids::{
     BookmarkRef, CommitId, RELEASE_PREFIX, ReleaseScheme, is_our_release, is_release_name,
 };
 use crate::jj::{self, OriginTrunk, Repo};
 use crate::ledger::{Entry, Kind};
 use crate::pins::{PIN_FILES, Pin, scan};
-
 /// Scan evidence for one consumer checkout.
 #[derive(Debug, Default)]
 pub struct ConsumerScan {
     pub pins: Vec<Pin>,
     pub notes: Vec<String>,
     pub problems: Vec<String>,
+}
+
+/// One process's memo of consumer default-branch heads.
+#[derive(Debug, Default)]
+pub struct ConsumerHeadMemo {
+    heads: Mutex<BTreeMap<String, ConsumerHead>>,
+}
+
+/// Scan a forge-addressed consumer with a process-wide default-branch-head memo.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the forge, cache, checkout, consumer identity, filter, release scheme, and shared memo are independent scan inputs"
+)]
+pub fn scan_consumer_slug_with_heads(
+    forge: &dyn Forge,
+    cache_root: Option<&Path>,
+    repo_path: &Path,
+    slug: &str,
+    repo_slug_filter: Option<&str>,
+    scheme: &ReleaseScheme,
+    heads: &ConsumerHeadMemo,
+) -> ConsumerScan {
+    let mut result = ConsumerScan::default();
+    let scope = ConsumerPinScope {
+        slug: repo_slug_filter,
+        scheme,
+    };
+    let cache_path = cache_root.and_then(|root| consumer_cache_path(root, slug));
+    let cache = cache_path
+        .as_deref()
+        .and_then(|path| load_consumer_cache(path, slug));
+    match (consumer_head(forge, repo_path, slug, heads), cache.as_ref()) {
+        (Ok(head), Some(cache)) if cache.commit == head.commit => {
+            extend_cached_pins(&mut result, cache, &scope);
+        }
+        (Ok(head), _) => {
+            let mut files = BTreeMap::new();
+            for file in PIN_FILES {
+                match forge.file_at(repo_path, slug, &head.commit, file) {
+                    Ok(Some(text)) => {
+                        files.insert((*file).to_owned(), text);
+                    }
+                    Ok(None) => {}
+                    Err(error) => result.problems.push(format!(
+                        "could not read {file} at {slug}@{}: {error}",
+                        head.commit
+                    )),
+                }
+            }
+            if result.problems.is_empty() {
+                let cache = ConsumerCache {
+                    schema: CONSUMER_SCHEMA_VERSION,
+                    slug: slug.to_owned(),
+                    branch: head.branch,
+                    commit: head.commit,
+                    fetched_at: jiff::Timestamp::now().to_string(),
+                    files: files.clone(),
+                };
+                if let Some(path) = cache_path.as_deref()
+                    && let Err(error) = write_consumer_cache(path, &cache)
+                {
+                    result
+                        .notes
+                        .push(format!("{slug}: could not write consumer cache: {error}"));
+                }
+            }
+            extend_scanned_texts(
+                &mut result,
+                files
+                    .iter()
+                    .map(|(file, text)| (file.as_str(), text.as_str())),
+                &scope,
+            );
+        }
+        (Err(error), cache) => {
+            if let Some(cache) = cache {
+                extend_cached_pins(&mut result, cache, &scope);
+                result.notes.push(format!(
+                    "{slug}: forge unreachable; pins answered from cache at {}",
+                    short_text(&cache.commit)
+                ));
+            }
+            result
+                .problems
+                .push(format!("{slug}: forge unreachable: {error}"));
+        }
+    }
+    result
+}
+
+fn consumer_head(
+    forge: &dyn Forge,
+    repo_path: &Path,
+    slug: &str,
+    heads: &ConsumerHeadMemo,
+) -> Result<ConsumerHead, crate::forge::ForgeError> {
+    let mut cached = heads
+        .heads
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(head) = cached.get(slug) {
+        return Ok(head.clone());
+    }
+    let head = forge.consumer_head(repo_path, slug)?;
+    cached.insert(slug.to_owned(), head.clone());
+    drop(cached);
+    Ok(head)
+}
+
+fn extend_cached_pins(
+    result: &mut ConsumerScan,
+    cache: &ConsumerCache,
+    scope: &ConsumerPinScope<'_>,
+) {
+    extend_scanned_texts(
+        result,
+        cache
+            .files
+            .iter()
+            .map(|(file, text)| (file.as_str(), text.as_str())),
+        scope,
+    );
 }
 
 struct ConsumerPinScope<'a> {
@@ -114,20 +241,30 @@ fn extend_scanned_pins(
     text: &str,
     scope: &ConsumerPinScope<'_>,
 ) {
-    let parsed = scan(file, text, scope.scheme);
-    result.pins.extend(
-        parsed
-            .pins
-            .into_iter()
-            .filter(|pin| scope.slug.is_none_or(|slug| pin.source.contains(slug))),
-    );
-    result.problems.extend(
-        parsed
-            .problems
-            .into_iter()
-            .filter(|problem| scope.slug.is_none_or(|slug| problem.source.contains(slug)))
-            .map(|problem| problem.to_string()),
-    );
+    extend_scanned_texts(result, std::iter::once((file, text)), scope);
+}
+
+fn extend_scanned_texts<'a>(
+    result: &mut ConsumerScan,
+    files: impl IntoIterator<Item = (&'a str, &'a str)>,
+    scope: &ConsumerPinScope<'_>,
+) {
+    for (file, text) in files {
+        let parsed = scan(file, text, scope.scheme);
+        result.pins.extend(
+            parsed
+                .pins
+                .into_iter()
+                .filter(|pin| scope.slug.is_none_or(|slug| pin.source.contains(slug))),
+        );
+        result.problems.extend(
+            parsed
+                .problems
+                .into_iter()
+                .filter(|problem| scope.slug.is_none_or(|slug| problem.source.contains(slug)))
+                .map(|problem| problem.to_string()),
+        );
+    }
 }
 
 /// The repository's name as it appears in a dependency line, e.g. `sandbox-runner`.
@@ -302,4 +439,156 @@ pub fn last_recorded_cut(entries: &[Entry], subject: Option<&str>) -> Option<Rec
 
 fn short(value: &CommitId) -> String {
     value.as_str().chars().take(12).collect()
+}
+
+fn short_text(value: &str) -> String {
+    value.chars().take(12).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::path::Path;
+    use std::sync::atomic::Ordering;
+
+    use super::{ConsumerHeadMemo, scan_consumer_slug_with_heads};
+    use crate::forge::{ConsumerHead, fake::FakeForge};
+    use crate::ids::ReleaseScheme;
+    use crate::pins::PIN_FILES;
+
+    const CONSUMER: &str = "acme/consumer";
+    const REPOSITORY: &str = "tool";
+    const HOST: &str = concat!("github", ".com");
+
+    fn lockfile(reference: &str) -> String {
+        format!(
+            "tool = {{ git = \"https://{HOST}/acme/{REPOSITORY}.git?rev={}#0123456789abcdef\" }}\n",
+            reference.replace('/', "%2F")
+        )
+    }
+
+    fn forge(commit: &str, lock: &str) -> FakeForge {
+        FakeForge {
+            heads: BTreeMap::from([(
+                CONSUMER.to_owned(),
+                ConsumerHead {
+                    branch: "main".to_owned(),
+                    commit: commit.to_owned(),
+                },
+            )]),
+            files: BTreeMap::from([(
+                (CONSUMER.to_owned(), commit.to_owned(), "uv.lock".to_owned()),
+                lock.to_owned(),
+            )]),
+            ..FakeForge::default()
+        }
+    }
+
+    #[test]
+    fn a_same_commit_consumer_scan_serves_lock_files_from_the_cache_with_zero_content_calls() {
+        let root = tempfile::tempdir().expect("create cache root");
+        let initial = forge("aaaaaaaaaaaaaaaa", &lockfile("release/2026-08-01"));
+        let heads = ConsumerHeadMemo::default();
+
+        let first = scan_consumer_slug_with_heads(
+            &initial,
+            Some(root.path()),
+            Path::new("/fork"),
+            CONSUMER,
+            Some(REPOSITORY),
+            &ReleaseScheme::Dated,
+            &heads,
+        );
+        assert_eq!(first.pins.len(), 1);
+        assert_eq!(initial.file_calls.load(Ordering::SeqCst), PIN_FILES.len());
+
+        let cached = forge("aaaaaaaaaaaaaaaa", &lockfile("release/2026-08-02"));
+        let second = scan_consumer_slug_with_heads(
+            &cached,
+            Some(root.path()),
+            Path::new("/fork"),
+            CONSUMER,
+            Some(REPOSITORY),
+            &ReleaseScheme::Dated,
+            &ConsumerHeadMemo::default(),
+        );
+
+        assert_eq!(cached.file_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            second.pins.first().map(|pin| pin.reference.as_str()),
+            Some("release/2026-08-01")
+        );
+    }
+
+    #[test]
+    fn a_new_commit_refetches_pin_files_and_rewrites_the_cache() {
+        let root = tempfile::tempdir().expect("create cache root");
+        let initial = forge("aaaaaaaaaaaaaaaa", &lockfile("release/2026-08-01"));
+        let heads = ConsumerHeadMemo::default();
+        let _ = scan_consumer_slug_with_heads(
+            &initial,
+            Some(root.path()),
+            Path::new("/fork"),
+            CONSUMER,
+            Some(REPOSITORY),
+            &ReleaseScheme::Dated,
+            &heads,
+        );
+
+        let advanced = forge("bbbbbbbbbbbbbbbb", &lockfile("release/2026-08-02"));
+        let scan = scan_consumer_slug_with_heads(
+            &advanced,
+            Some(root.path()),
+            Path::new("/fork"),
+            CONSUMER,
+            Some(REPOSITORY),
+            &ReleaseScheme::Dated,
+            &ConsumerHeadMemo::default(),
+        );
+
+        assert_eq!(advanced.file_calls.load(Ordering::SeqCst), PIN_FILES.len());
+        assert_eq!(
+            scan.pins.first().map(|pin| pin.reference.as_str()),
+            Some("release/2026-08-02")
+        );
+
+        let cached = forge("bbbbbbbbbbbbbbbb", &lockfile("release/2026-08-03"));
+        let scan = scan_consumer_slug_with_heads(
+            &cached,
+            Some(root.path()),
+            Path::new("/fork"),
+            CONSUMER,
+            Some(REPOSITORY),
+            &ReleaseScheme::Dated,
+            &ConsumerHeadMemo::default(),
+        );
+        assert_eq!(cached.file_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            scan.pins.first().map(|pin| pin.reference.as_str()),
+            Some("release/2026-08-02")
+        );
+    }
+
+    #[test]
+    fn a_forge_failure_with_no_cache_is_a_problem_not_an_empty_success() {
+        let root = tempfile::tempdir().expect("create cache root");
+        let forge = FakeForge {
+            fail_consumer_head: true,
+            ..FakeForge::default()
+        };
+
+        let scan = scan_consumer_slug_with_heads(
+            &forge,
+            Some(root.path()),
+            Path::new("/fork"),
+            CONSUMER,
+            Some(REPOSITORY),
+            &ReleaseScheme::Dated,
+            &ConsumerHeadMemo::default(),
+        );
+
+        assert!(scan.pins.is_empty());
+        assert_eq!(scan.notes, Vec::<String>::new());
+        assert_eq!(scan.problems.len(), 1);
+    }
 }

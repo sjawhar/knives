@@ -5,11 +5,14 @@ use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 
 use crate::cli::{Exit, HookHarness};
+use crate::commands::claim::Identity;
 use crate::config::{GuidanceRoot, GuidanceRootKind, Registry, default_config_path, load};
 use crate::hook::claude_code::{
     Event, EventKind, POST_TOOL_USE_WIRE_NAME, SESSION_START_WIRE_NAME, response,
 };
-use crate::hook::guidance::{claim_lines, format_guidance, format_notice, guidance_for};
+use crate::hook::guidance::{
+    claim_lines, format_guidance, format_notice, guidance_for, notice_digest,
+};
 use crate::hook::opencode::{self, Event as OpenCodeEvent, EventKind as OpenCodeEventKind};
 use crate::hook::resolve::{Match, argument_paths, managed_repo_for, trust_rule_match, url_owner};
 use crate::hook::state::SessionState;
@@ -153,25 +156,47 @@ fn opencode_tool_after(event: &OpenCodeEvent, home: &Path) -> anyhow::Result<Str
     else {
         return opencode::tool_response("").map_err(Into::into);
     };
-    let flags = SessionState::load(home, OPENCODE, session_id).repo(&matched.repo.root);
+    if matched.repo.kind == GuidanceRootKind::Managed
+        && let Some(cwd) = event.cwd()
+    {
+        crate::seen::record_observation(
+            Path::new(cwd),
+            &Identity {
+                owner: session_id.to_owned(),
+                kind: crate::store::OwnerKind::HarnessSession,
+            },
+        );
+    }
+    let state = SessionState::load(home, OPENCODE, session_id);
+    let flags = state.repo(&matched.repo.root);
     let requested = event.parts();
-    let include_notice =
-        requested.notice && matched.repo.kind == GuidanceRootKind::Managed && !flags.noticed;
+    let notice = notice_if_requested(
+        &matched.repo,
+        &state,
+        requested.notice && matched.repo.kind == GuidanceRootKind::Managed,
+    )?;
     let guidance = (requested.guidance && !flags.guided)
         .then(|| guidance_for(&matched.repo, &matched.candidate))
         .flatten();
 
+    let (notice_text, notice_update) = notice.map_or((None, None), |notice| {
+        let (text, update) = notice.into_parts();
+        (Some(text), Some(update))
+    });
     let mut additions = Vec::new();
-    if include_notice {
-        additions.push(notice_for(&matched.repo)?);
+    if let Some(text) = notice_text {
+        additions.push(text);
     }
     if let Some(guidance) = guidance {
         additions.push(format_guidance(&matched.repo.name, &guidance));
     }
     let addition = additions.join("\n");
     if !addition.is_empty() {
-        let _ = SessionState::update(home, OPENCODE, session_id, |state| {
-            state.mark(&matched.repo.root, true, true);
+        let _ = SessionState::update(home, OPENCODE, session_id, move |state| {
+            if let Some(update) = notice_update {
+                update.apply(state, &matched.repo.root);
+            }
+            state.mark_guided(&matched.repo.root);
         })?;
     }
     opencode::tool_response(&addition).map_err(Into::into)
@@ -269,9 +294,9 @@ fn session_start(event: &Event, home: &Path) -> anyhow::Result<Option<String>> {
     let Some(session_id) = event.session_id() else {
         return Ok(None);
     };
-    if event.source() == Some("compact") {
+    let compact = event.source() == Some("compact");
+    if compact {
         let _ = SessionState::update(home, CLAUDE_CODE, session_id, SessionState::clear)?;
-        return Ok(None);
     }
     let Some(cwd) = event.cwd() else {
         return Ok(None);
@@ -288,13 +313,23 @@ fn session_start(event: &Event, home: &Path) -> anyhow::Result<Option<String>> {
     if matched.repo.kind != GuidanceRootKind::Managed {
         return Ok(None);
     }
-    let state = SessionState::load(home, CLAUDE_CODE, session_id);
-    if state.repo(&matched.repo.root).noticed {
+    crate::seen::record_observation(
+        Path::new(cwd),
+        &Identity {
+            owner: session_id.to_owned(),
+            kind: crate::store::OwnerKind::HarnessSession,
+        },
+    );
+    if compact {
         return Ok(None);
     }
-    let notice = notice_for(&matched.repo)?;
-    let _ = SessionState::update(home, CLAUDE_CODE, session_id, |state| {
-        state.mark(&matched.repo.root, true, false);
+    let state = SessionState::load(home, CLAUDE_CODE, session_id);
+    let Some(notice) = notice_if_requested(&matched.repo, &state, true)? else {
+        return Ok(None);
+    };
+    let (notice, update) = notice.into_parts();
+    let _ = SessionState::update(home, CLAUDE_CODE, session_id, move |state| {
+        update.apply(state, &matched.repo.root);
     })?;
     response(SESSION_START_WIRE_NAME, &notice)
         .map(Some)
@@ -314,9 +349,25 @@ fn post_tool_use(event: &Event, home: &Path) -> anyhow::Result<Option<String>> {
     else {
         return Ok(None);
     };
+    if matched.repo.kind == GuidanceRootKind::Managed
+        && let Some(cwd) = event.cwd()
+    {
+        crate::seen::record_observation(
+            Path::new(cwd),
+            &Identity {
+                owner: session_id.to_owned(),
+                kind: crate::store::OwnerKind::HarnessSession,
+            },
+        );
+    }
     let state = SessionState::load(home, CLAUDE_CODE, session_id);
     let flags = state.repo(&matched.repo.root);
-    let include_notice = matched.repo.kind == GuidanceRootKind::Managed && !flags.noticed;
+    let notice = notice_if_requested(
+        &matched.repo,
+        &state,
+        matched.repo.kind == GuidanceRootKind::Managed,
+    )?;
+    let include_notice = notice.is_some();
     let include_guidance = !flags.guided
         && event
             .cwd()
@@ -325,9 +376,13 @@ fn post_tool_use(event: &Event, home: &Path) -> anyhow::Result<Option<String>> {
         return Ok(None);
     }
 
+    let (notice_text, notice_update) = notice.map_or((None, None), |notice| {
+        let (text, update) = notice.into_parts();
+        (Some(text), Some(update))
+    });
     let mut parts = Vec::new();
-    if include_notice {
-        parts.push(notice_for(&matched.repo)?);
+    if let Some(text) = notice_text {
+        parts.push(text);
     }
     let guidance = include_guidance
         .then(|| guidance_for(&matched.repo, &matched.candidate))
@@ -338,8 +393,13 @@ fn post_tool_use(event: &Event, home: &Path) -> anyhow::Result<Option<String>> {
     if parts.is_empty() {
         return Ok(None);
     }
-    let _ = SessionState::update(home, CLAUDE_CODE, session_id, |state| {
-        state.mark(&matched.repo.root, include_notice, guidance.is_some());
+    let _ = SessionState::update(home, CLAUDE_CODE, session_id, move |state| {
+        if let Some(update) = notice_update {
+            update.apply(state, &matched.repo.root);
+        }
+        if guidance.is_some() {
+            state.mark_guided(&matched.repo.root);
+        }
     })?;
     response(POST_TOOL_USE_WIRE_NAME, &parts.join("\n"))
         .map(Some)
@@ -461,10 +521,51 @@ fn config_home() -> PathBuf {
         .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
 }
 
-fn notice_for(repo: &GuidanceRoot) -> anyhow::Result<String> {
+struct PreparedNotice {
+    text: String,
+    update: NoticeStateUpdate,
+}
+
+impl PreparedNotice {
+    fn into_parts(self) -> (String, NoticeStateUpdate) {
+        (self.text, self.update)
+    }
+}
+
+struct NoticeStateUpdate {
+    digest: String,
+}
+
+impl NoticeStateUpdate {
+    fn apply(self, state: &mut SessionState, root: &Path) {
+        state.record_notice(root, self.digest);
+    }
+}
+
+fn notice_if_requested(
+    repo: &GuidanceRoot,
+    state: &SessionState,
+    requested: bool,
+) -> anyhow::Result<Option<PreparedNotice>> {
+    if !requested {
+        return Ok(None);
+    }
     let store = Store::open(default_state_path())?;
-    let visible_claims = claim_lines(&all_claims(&store), &repo.name);
-    Ok(format_notice(&repo.name, &repo.root, &visible_claims))
+    let claims = all_claims(&store);
+    let digest = notice_digest(&repo.name, &repo.root, &claims);
+    if state.notice_seen(&repo.root, &digest) {
+        return Ok(None);
+    }
+    Ok(Some(PreparedNotice {
+        text: format_notice_for(repo, &digest, &claims),
+        update: NoticeStateUpdate { digest },
+    }))
+}
+
+fn format_notice_for(repo: &GuidanceRoot, digest: &str, claims: &[crate::store::Claim]) -> String {
+    let observations = crate::seen::load();
+    let visible_claims = claim_lines(claims, &repo.name, &observations, jiff::Timestamp::now());
+    format_notice(&repo.name, &repo.root, &visible_claims, digest)
 }
 
 fn all_claims(store: &Store) -> Vec<crate::store::Claim> {

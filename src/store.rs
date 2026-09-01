@@ -18,8 +18,18 @@ use serde::{Deserialize, Serialize};
 use crate::config::default_config_path;
 use crate::ids::{BranchTarget, RepoName, Requirement};
 
+use crate::commands::claim::Identity;
 pub fn default_state_path() -> PathBuf {
     default_config_path().with_file_name("state.json")
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OwnerKind {
+    HarnessSession,
+    WorkspaceDerived,
+    #[default]
+    OsUser,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -27,6 +37,8 @@ pub struct Claim {
     pub repo: String,
     pub branch: String,
     pub owner: String,
+    #[serde(default)]
+    pub kind: OwnerKind,
     pub why: String,
     pub started: String,
     #[serde(default)]
@@ -239,11 +251,12 @@ impl Store {
         Ok(())
     }
 
-    pub fn claim(&mut self, target: &BranchTarget, owner: &str, why: &str) -> Claim {
+    pub fn claim(&mut self, target: &BranchTarget, identity: &Identity, why: &str) -> Claim {
         let record = Claim {
             repo: target.repo.to_string(),
             branch: target.branch.to_string(),
-            owner: owner.to_owned(),
+            owner: identity.owner.clone(),
+            kind: identity.kind,
             why: why.to_owned(),
             started: jiff::Timestamp::now().to_string(),
             files: Vec::new(),
@@ -459,25 +472,61 @@ mod tests {
         )
     }
 
+    fn os_user(owner: &str) -> Identity {
+        Identity {
+            owner: owner.to_owned(),
+            kind: OwnerKind::OsUser,
+        }
+    }
+
     #[test]
-    fn a_claim_round_trips_through_disk() {
+    fn a_harness_claim_writes_and_round_trips_its_kind() {
         let dir = tempfile::tempdir().unwrap();
-        let mut first = store(dir.path());
-        let _ = first.claim(&target(), "someone", "fixing the parser");
+        let path = dir.path().join("state.json");
+        let identity = crate::commands::claim::Identity {
+            owner: "someone".to_owned(),
+            kind: OwnerKind::HarnessSession,
+        };
+        let mut first = Store::open(path.clone()).unwrap();
+        let _ = first.claim(&target(), &identity, "fixing the parser");
         first.save().unwrap();
 
-        let reloaded = store(dir.path());
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains(r#""kind": "harness-session""#),
+            "state was: {text}"
+        );
+
+        let reloaded = Store::open(path).unwrap();
         let claims = reloaded.claims(None);
         assert_eq!(claims.len(), 1);
         assert_eq!(claims[0].why, "fixing the parser");
+        assert_eq!(claims[0].kind, OwnerKind::HarnessSession);
         assert!(!claims[0].started.is_empty());
+    }
+
+    #[test]
+    fn a_legacy_claim_without_kind_defaults_to_an_os_user() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        std::fs::write(
+            &path,
+            r#"{"claims":{"a-repo/feat/alpha":{"repo":"a-repo","branch":"feat/alpha","owner":"someone","why":"legacy claim","started":"2026-01-01T00:00:00Z","files":[]}}}"#,
+        )
+        .unwrap();
+
+        let store = Store::open(path).unwrap();
+        let claims = store.claims(None);
+
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].kind, OwnerKind::OsUser);
     }
 
     #[test]
     fn releasing_a_claim_reports_whether_there_was_one() {
         let dir = tempfile::tempdir().unwrap();
         let mut subject = store(dir.path());
-        let _ = subject.claim(&target(), "someone", "w");
+        let _ = subject.claim(&target(), &os_user("someone"), "w");
         assert!(subject.release_claim(&target()));
         assert!(!subject.release_claim(&target()));
         assert!(subject.claims(None).is_empty());
@@ -492,7 +541,7 @@ mod tests {
                 RepoName::new("one"),
                 crate::ids::BranchName::new("feat/alpha"),
             ),
-            "x",
+            &os_user("x"),
             "w",
         );
         let _ = subject.claim(
@@ -500,7 +549,7 @@ mod tests {
                 RepoName::new("two"),
                 crate::ids::BranchName::new("feat/alpha"),
             ),
-            "y",
+            &os_user("y"),
             "w",
         );
         let only = subject.claims(Some(&RepoName::new("one")));
@@ -551,7 +600,7 @@ mod tests {
         std::fs::write(&path, r#"{"claims":{},"from_the_future":{"k":"v"}}"#).unwrap();
         // When: an older binary loads, changes, and saves it
         let mut subject = Store::open(path.clone()).unwrap();
-        let _ = subject.claim(&target(), "x", "w");
+        let _ = subject.claim(&target(), &os_user("x"), "w");
         subject.save().unwrap();
         // Then: the unknown key is still there
         let text = std::fs::read_to_string(&path).unwrap();
@@ -562,7 +611,7 @@ mod tests {
     fn the_write_leaves_no_temporary_file_behind() {
         let dir = tempfile::tempdir().unwrap();
         let mut subject = store(dir.path());
-        let _ = subject.claim(&target(), "x", "w");
+        let _ = subject.claim(&target(), &os_user("x"), "w");
         subject.save().unwrap();
         let names: Vec<String> = std::fs::read_dir(dir.path())
             .unwrap()

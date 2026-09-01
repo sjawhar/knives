@@ -1,20 +1,134 @@
-//! Claim decisions: who owns a branch, whether a claim can be taken, and the
-//! words each outcome prints. Consumed by `start` and `finish`, which are the
-//! commands that actually take and release claims.
+//! Claim identity resolution.
+//!
+//! [`current_identity`] records both the claimant's name and how it was resolved.
+//! The claim-lifecycle matrix introduced in Task 2 consumes that resolution kind.
 //!
 //! Enforcement layer three. Advisory on purpose: layers one and two are
 //! default-correct paths and detectors, and hard refusal waits for evidence
 //! that advice was insufficient.
-// allow: SIZE_OK: 295 lines - claim coordination keeps owner-resolution behavior beside branch claim outcomes.
+// allow: SIZE_OK: claim coordination keeps identity-resolution behavior beside its tests.
 
 use std::path::Path;
 
 use crate::commands::hook::owner_for;
-use crate::config::Registry;
-use crate::ids::BranchTarget;
-use crate::store::Store;
+use crate::store::{Claim, OwnerKind};
 
-/// Who is claiming.
+/// A claimant and the source that established its name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Identity {
+    pub owner: String,
+    pub kind: OwnerKind,
+}
+
+/// The inputs relevant to taking or resuming a claim.
+#[derive(Debug)]
+pub struct ClaimContext<'a> {
+    pub held: Option<&'a Claim>,
+    pub identity: &'a Identity,
+    pub in_claimed_workspace: bool,
+}
+
+/// The mutually exclusive outcomes for a claim attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimDecision {
+    Take,
+    Resume { possession: bool },
+    RefuseAnonymous,
+    RefuseHeld,
+}
+
+/// Chooses the claim outcome from identity, possession, and the current claim.
+pub fn decide(context: &ClaimContext<'_>) -> ClaimDecision {
+    match context.held {
+        None => ClaimDecision::Take,
+        Some(_) if context.in_claimed_workspace => ClaimDecision::Resume { possession: true },
+        Some(claim)
+            if claim.kind == context.identity.kind
+                && claim.kind != OwnerKind::OsUser
+                && claim.owner == context.identity.owner =>
+        {
+            ClaimDecision::Resume { possession: false }
+        }
+        Some(claim)
+            if claim.kind == OwnerKind::OsUser && context.identity.kind == OwnerKind::OsUser =>
+        {
+            ClaimDecision::RefuseAnonymous
+        }
+        Some(_) => ClaimDecision::RefuseHeld,
+    }
+}
+
+/// Renders the complete claim context shared by refusals and other claim
+/// lifecycle notices.
+pub fn render_claim_context(
+    claim: &Claim,
+    last_seen: crate::seen::LastSeen,
+    now: jiff::Timestamp,
+) -> String {
+    let claimed_age =
+        crate::ledger::age(&claim.started, now).unwrap_or_else(|| "unknown".to_owned());
+    format!(
+        "{} is claimed by {} ({}), claimed {claimed_age} ago, {}: {}",
+        claim.key(),
+        claim.owner,
+        owner_kind_label(claim.kind),
+        render_last_seen(last_seen, now),
+        claim.why,
+    )
+}
+
+/// Renders a compact claim row for an advisory surface.
+pub fn render_claim_line(
+    subject: &str,
+    claim: &Claim,
+    last_seen: crate::seen::LastSeen,
+    now: jiff::Timestamp,
+) -> String {
+    let claimed_age =
+        crate::ledger::age(&claim.started, now).unwrap_or_else(|| "unknown".to_owned());
+    format!(
+        "{subject} ({}, {}, claimed {claimed_age} ago, {}): {}",
+        claim.owner,
+        owner_kind_label(claim.kind),
+        render_last_seen(last_seen, now),
+        claim.why,
+    )
+}
+
+/// Renders the observation state without implying a liveness guarantee.
+pub fn render_last_seen(last_seen: crate::seen::LastSeen, now: jiff::Timestamp) -> String {
+    match last_seen {
+        crate::seen::LastSeen::At(timestamp) => crate::ledger::age(&timestamp.to_string(), now)
+            .map_or_else(
+                || "not seen within the observation window".to_owned(),
+                |age| format!("last seen {age} ago"),
+            ),
+        crate::seen::LastSeen::NoneSinceClaim => "no activity observed since claimed".to_owned(),
+        crate::seen::LastSeen::NoneWithinWindow => {
+            "not seen within the observation window".to_owned()
+        }
+    }
+}
+
+/// The durable token for a claim observation.
+pub fn last_seen_provenance(last_seen: crate::seen::LastSeen) -> String {
+    match last_seen {
+        crate::seen::LastSeen::At(timestamp) => timestamp.to_string(),
+        crate::seen::LastSeen::NoneSinceClaim => "none-since-claim".to_owned(),
+        crate::seen::LastSeen::NoneWithinWindow => "none-within-window".to_owned(),
+    }
+}
+
+/// The stable, human-readable identity-source label.
+pub const fn owner_kind_label(kind: OwnerKind) -> &'static str {
+    match kind {
+        OwnerKind::HarnessSession => "harness-session",
+        OwnerKind::WorkspaceDerived => "workspace-derived",
+        OwnerKind::OsUser => "os-user",
+    }
+}
+
+/// Resolves the identity that should own a claim.
 ///
 /// `KNIVES_OWNER` is what the `OpenCode` plugin injects. Claude Code instead
 /// provides its session ID. When neither harness provides an identity, a managed
@@ -22,94 +136,35 @@ use crate::store::Store;
 /// is the fallback for a human at a terminal.
 /// A blank `KNIVES_OWNER` is a plugin bug, not an identity. Treating it as one
 /// would let two agents share a claim. The same applies to `CLAUDE_CODE_SESSION_ID`.
-pub fn current_owner(cwd: &Path) -> anyhow::Result<String> {
+pub fn current_identity(cwd: &Path) -> anyhow::Result<Identity> {
     if let Some(owner) = std::env::var("KNIVES_OWNER")
         .ok()
         .filter(|value| !value.trim().is_empty())
     {
-        return Ok(owner);
+        return Ok(Identity {
+            owner,
+            kind: OwnerKind::HarnessSession,
+        });
     }
     if let Some(owner) = std::env::var("CLAUDE_CODE_SESSION_ID")
         .ok()
         .filter(|value| !value.trim().is_empty())
     {
-        return Ok(owner);
+        return Ok(Identity {
+            owner,
+            kind: OwnerKind::HarnessSession,
+        });
     }
     if let Some(owner) = owner_for(cwd)? {
-        return Ok(owner);
+        return Ok(Identity {
+            owner,
+            kind: OwnerKind::WorkspaceDerived,
+        });
     }
-    Ok(std::env::var("USER").unwrap_or_else(|_| "unknown".to_owned()))
-}
-
-/// What `claim` decided, so the caller can render and exit without re-deriving it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ClaimOutcome {
-    Taken {
-        key: String,
-        owner: String,
-    },
-    AlreadyYours {
-        key: String,
-        why: String,
-    },
-    HeldByAnother {
-        key: String,
-        owner: String,
-        why: String,
-    },
-    UnknownRepo {
-        name: String,
-        known: Vec<String>,
-    },
-}
-
-pub fn decide(
-    registry: &Registry,
-    store: &Store,
-    target: &BranchTarget,
-    owner: &str,
-) -> ClaimOutcome {
-    if registry.get(&target.repo).is_none() {
-        return ClaimOutcome::UnknownRepo {
-            name: target.repo.to_string(),
-            known: registry.names().map(|name| name.to_string()).collect(),
-        };
-    }
-    let key = target.to_string();
-    match store
-        .claims(Some(&target.repo))
-        .into_iter()
-        .find(|c| c.branch == target.branch.as_str())
-    {
-        Some(held) if held.owner == owner => ClaimOutcome::AlreadyYours {
-            key,
-            why: held.why.clone(),
-        },
-        Some(held) => ClaimOutcome::HeldByAnother {
-            key,
-            owner: held.owner.clone(),
-            why: held.why.clone(),
-        },
-        None => ClaimOutcome::Taken {
-            key,
-            owner: owner.to_owned(),
-        },
-    }
-}
-
-pub fn render(outcome: &ClaimOutcome) -> String {
-    match outcome {
-        ClaimOutcome::Taken { key, owner } => format!("claimed {key} for {owner}"),
-        ClaimOutcome::AlreadyYours { key, why } => format!("{key} is already yours: {why}"),
-        // Naming the holder and their reason is the point: the next agent needs
-        // to know whether it is the same work before deciding anything.
-        ClaimOutcome::HeldByAnother { key, owner, why } => {
-            format!("{key} is already claimed by {owner}: {why}")
-        }
-        ClaimOutcome::UnknownRepo { name, known } => {
-            format!("unknown repo {name}; known: {}", known.join(", "))
-        }
-    }
+    Ok(Identity {
+        owner: std::env::var("USER").unwrap_or_else(|_| "unknown".to_owned()),
+        kind: OwnerKind::OsUser,
+    })
 }
 
 #[cfg(test)]
@@ -118,141 +173,116 @@ mod tests {
         clippy::indexing_slicing,
         reason = "indexing a result in a test is the assertion; a panic is the failure"
     )]
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
 
     use super::*;
-    use crate::config::{
-        RepoEntry,
-        test_support::{EnvironmentGuard, environment_lock},
-    };
+    use crate::config::test_support::{EnvironmentGuard, environment_lock};
+    use crate::store::{Claim, OwnerKind};
 
-    fn registry() -> Registry {
-        Registry {
-            repos: [(
-                "a-repo".to_owned(),
-                RepoEntry {
-                    path: PathBuf::from("/tmp/a-repo"),
-                    upstream: "u".to_owned(),
-                    origin: "o".to_owned(),
-                    base: None,
-                    release: None,
-                    release_branch: None,
-                    test_count_command: None,
-                    consumers: Vec::new(),
-                },
-            )]
-            .into(),
-            ..Registry::default()
+    fn held(owner: &str, kind: OwnerKind) -> Claim {
+        Claim {
+            repo: "a-repo".into(),
+            branch: "feat/alpha".into(),
+            owner: owner.into(),
+            kind,
+            why: "w".into(),
+            started: "2026-01-01T00:00:00Z".into(),
+            files: Vec::new(),
         }
     }
 
-    fn store(dir: &std::path::Path) -> Store {
-        Store::open(dir.join("state.json")).unwrap()
-    }
-
-    fn names() -> BranchTarget {
-        BranchTarget::new(
-            crate::ids::RepoName::new("a-repo"),
-            crate::ids::BranchName::new("feat/alpha"),
-        )
+    fn identity(owner: &str, kind: OwnerKind) -> Identity {
+        Identity {
+            owner: owner.into(),
+            kind,
+        }
     }
 
     #[test]
-    fn an_unclaimed_branch_in_a_known_repo_can_be_taken() {
-        let dir = tempfile::tempdir().unwrap();
-        let target = names();
-        let outcome = decide(&registry(), &store(dir.path()), &target, "agent-one");
-        assert!(matches!(outcome, ClaimOutcome::Taken { .. }));
-    }
-
-    #[test]
-    fn a_branch_held_by_another_agent_names_the_holder_and_the_reason() {
-        // Given: agent-one holds the branch
-        let dir = tempfile::tempdir().unwrap();
-        let target = names();
-        let mut subject = store(dir.path());
-        let _ = subject.claim(&target, "agent-one", "fixing the parser");
-        // When: agent-two asks
-        let outcome = decide(&registry(), &subject, &target, "agent-two");
-        // Then: it says who, and why, so the second agent can judge overlap
-        let text = render(&outcome);
-        assert!(text.contains("agent-one"), "was: {text}");
-        assert!(text.contains("fixing the parser"), "was: {text}");
-    }
-
-    #[test]
-    fn re_claiming_your_own_branch_is_not_an_error() {
-        let dir = tempfile::tempdir().unwrap();
-        let target = names();
-        let mut subject = store(dir.path());
-        let _ = subject.claim(&target, "agent-one", "w");
-        let outcome = decide(&registry(), &subject, &target, "agent-one");
-        assert!(matches!(outcome, ClaimOutcome::AlreadyYours { .. }));
-    }
-
-    #[test]
-    fn an_unknown_repo_is_reported_with_the_known_ones() {
-        let dir = tempfile::tempdir().unwrap();
-        let outcome = decide(
-            &registry(),
-            &store(dir.path()),
-            &BranchTarget::new(
-                crate::ids::RepoName::new("nope"),
-                crate::ids::BranchName::new("b"),
-            ),
-            "agent-one",
-        );
-        let text = render(&outcome);
-        assert!(text.contains("nope"));
-        assert!(text.contains("a-repo"));
-    }
-
-    #[test]
-    fn current_owner_filters_a_blank_knives_owner() {
+    fn a_blank_knives_owner_falls_back_to_the_os_user() {
         let _lock = environment_lock();
-        let environment =
-            EnvironmentGuard::capture(&["KNIVES_OWNER", "CLAUDE_CODE_SESSION_ID", "USER"]);
+        let environment = EnvironmentGuard::capture(&[
+            "KNIVES_CONFIG_HOME",
+            "KNIVES_OWNER",
+            "CLAUDE_CODE_SESSION_ID",
+            "USER",
+        ]);
+        let config = tempfile::tempdir().unwrap();
+        environment.set("KNIVES_CONFIG_HOME", config.path().to_str().unwrap());
         environment.set("KNIVES_OWNER", "   ");
         environment.remove("CLAUDE_CODE_SESSION_ID");
         environment.set("USER", "terminal-user");
-        assert_eq!(
-            current_owner(Path::new("/tmp/unmanaged")).unwrap(),
-            "terminal-user"
-        );
+
+        let identity = current_identity(Path::new("/tmp/unmanaged")).unwrap();
+
+        assert_eq!(identity.owner, "terminal-user");
+        assert_eq!(identity.kind, crate::store::OwnerKind::OsUser);
     }
 
     #[test]
-    fn current_owner_uses_the_session_id_when_knives_owner_is_absent() {
+    fn a_harness_owner_resolves_as_a_harness_session() {
         let _lock = environment_lock();
         let environment =
             EnvironmentGuard::capture(&["KNIVES_OWNER", "CLAUDE_CODE_SESSION_ID", "USER"]);
+        environment.set("KNIVES_OWNER", "agent-one");
+        let identity = current_identity(Path::new("/tmp/unmanaged")).unwrap();
 
+        assert_eq!(identity.owner, "agent-one");
+        assert_eq!(identity.kind, crate::store::OwnerKind::HarnessSession);
+    }
+
+    #[test]
+    fn a_claude_code_session_resolves_as_a_harness_session() {
+        let _lock = environment_lock();
+        let environment =
+            EnvironmentGuard::capture(&["KNIVES_OWNER", "CLAUDE_CODE_SESSION_ID", "USER"]);
         environment.remove("KNIVES_OWNER");
         environment.set("CLAUDE_CODE_SESSION_ID", "abc-123");
         environment.set("USER", "terminal-user");
-        assert_eq!(
-            current_owner(Path::new("/tmp/unmanaged")).unwrap(),
-            "abc-123"
-        );
+
+        let identity = current_identity(Path::new("/tmp/unmanaged")).unwrap();
+
+        assert_eq!(identity.owner, "abc-123");
+        assert_eq!(identity.kind, crate::store::OwnerKind::HarnessSession);
     }
 
     #[test]
-    fn current_owner_falls_back_to_user_when_the_session_id_is_blank() {
+    fn a_blank_claude_code_session_falls_back_to_the_os_user() {
         let _lock = environment_lock();
-        let environment =
-            EnvironmentGuard::capture(&["KNIVES_OWNER", "CLAUDE_CODE_SESSION_ID", "USER"]);
-
+        let environment = EnvironmentGuard::capture(&[
+            "KNIVES_CONFIG_HOME",
+            "KNIVES_OWNER",
+            "CLAUDE_CODE_SESSION_ID",
+            "USER",
+        ]);
+        let config = tempfile::tempdir().unwrap();
+        environment.set("KNIVES_CONFIG_HOME", config.path().to_str().unwrap());
         environment.remove("KNIVES_OWNER");
         environment.set("CLAUDE_CODE_SESSION_ID", "   ");
         environment.set("USER", "terminal-user");
-        assert_eq!(
-            current_owner(Path::new("/tmp/unmanaged")).unwrap(),
-            "terminal-user"
-        );
+
+        let identity = current_identity(Path::new("/tmp/unmanaged")).unwrap();
+
+        assert_eq!(identity.owner, "terminal-user");
+        assert_eq!(identity.kind, crate::store::OwnerKind::OsUser);
     }
 
     #[test]
-    fn current_owner_uses_the_managed_directory_claim_when_harness_ids_are_absent() {
+    fn the_user_fallback_is_anonymous() {
+        let _lock = environment_lock();
+        let environment =
+            EnvironmentGuard::capture(&["KNIVES_OWNER", "CLAUDE_CODE_SESSION_ID", "USER"]);
+        environment.remove("KNIVES_OWNER");
+        environment.remove("CLAUDE_CODE_SESSION_ID");
+        environment.set("USER", "terminal-user");
+        let identity = current_identity(Path::new("/tmp/unmanaged")).unwrap();
+
+        assert_eq!(identity.owner, "terminal-user");
+        assert_eq!(identity.kind, crate::store::OwnerKind::OsUser);
+    }
+
+    #[test]
+    fn a_managed_directory_claim_resolves_as_workspace_derived() {
         let _lock = environment_lock();
         let environment = EnvironmentGuard::capture(&[
             "KNIVES_CONFIG_HOME",
@@ -281,7 +311,10 @@ mod tests {
         environment.remove("CLAUDE_CODE_SESSION_ID");
         environment.set("USER", "terminal-user");
 
-        assert_eq!(current_owner(&repository).unwrap(), "state-owner");
+        let identity = current_identity(&repository).unwrap();
+
+        assert_eq!(identity.owner, "state-owner");
+        assert_eq!(identity.kind, crate::store::OwnerKind::WorkspaceDerived);
     }
 
     #[test]
@@ -291,5 +324,113 @@ mod tests {
         let environment = EnvironmentGuard::capture(&["KNIVES_OWNER"]);
 
         environment.set("CLAUDE_CODE_SESSION_ID", "abc-123");
+    }
+    #[test]
+    fn an_unclaimed_branch_is_taken() {
+        let identity = identity("agent-one", OwnerKind::HarnessSession);
+        let context = ClaimContext {
+            held: None,
+            identity: &identity,
+            in_claimed_workspace: false,
+        };
+
+        assert_eq!(decide(&context), ClaimDecision::Take);
+    }
+
+    #[test]
+    fn the_same_harness_session_resumes() {
+        let claim = held("agent-one", OwnerKind::HarnessSession);
+        let identity = identity("agent-one", OwnerKind::HarnessSession);
+        let context = ClaimContext {
+            held: Some(&claim),
+            identity: &identity,
+            in_claimed_workspace: false,
+        };
+
+        assert_eq!(
+            decide(&context),
+            ClaimDecision::Resume { possession: false }
+        );
+    }
+
+    #[test]
+    fn a_different_harness_session_is_refused() {
+        let claim = held("agent-one", OwnerKind::HarnessSession);
+        let identity = identity("agent-two", OwnerKind::HarnessSession);
+        let context = ClaimContext {
+            held: Some(&claim),
+            identity: &identity,
+            in_claimed_workspace: false,
+        };
+
+        assert_eq!(decide(&context), ClaimDecision::RefuseHeld);
+    }
+
+    #[test]
+    fn two_anonymous_owners_never_match_even_with_equal_strings() {
+        let claim = held("terminal-user", OwnerKind::OsUser);
+        let identity = identity("terminal-user", OwnerKind::OsUser);
+        let context = ClaimContext {
+            held: Some(&claim),
+            identity: &identity,
+            in_claimed_workspace: false,
+        };
+
+        assert_eq!(decide(&context), ClaimDecision::RefuseAnonymous);
+    }
+
+    #[test]
+    fn possession_of_the_claimed_workspace_resumes_whatever_the_identity() {
+        let claim = held("someone-else", OwnerKind::HarnessSession);
+        let identity = identity("terminal-user", OwnerKind::OsUser);
+        let context = ClaimContext {
+            held: Some(&claim),
+            identity: &identity,
+            in_claimed_workspace: true,
+        };
+
+        assert_eq!(decide(&context), ClaimDecision::Resume { possession: true });
+    }
+
+    #[test]
+    fn mixed_kinds_with_equal_strings_are_strangers() {
+        let claim = held("abc", OwnerKind::HarnessSession);
+        let identity = identity("abc", OwnerKind::WorkspaceDerived);
+        let context = ClaimContext {
+            held: Some(&claim),
+            identity: &identity,
+            in_claimed_workspace: false,
+        };
+
+        assert_eq!(decide(&context), ClaimDecision::RefuseHeld);
+    }
+
+    #[test]
+    fn matching_workspace_derived_identities_resume() {
+        let claim = held("abc", OwnerKind::WorkspaceDerived);
+        let identity = identity("abc", OwnerKind::WorkspaceDerived);
+        let context = ClaimContext {
+            held: Some(&claim),
+            identity: &identity,
+            in_claimed_workspace: false,
+        };
+
+        assert_eq!(
+            decide(&context),
+            ClaimDecision::Resume { possession: false }
+        );
+    }
+
+    #[test]
+    fn an_anonymous_challenger_to_a_harness_claim_is_refused_not_anonymous() {
+        let claim = held("abc", OwnerKind::HarnessSession);
+        let identity = identity("ubuntu", OwnerKind::OsUser);
+        let context = ClaimContext {
+            held: Some(&claim),
+            identity: &identity,
+            in_claimed_workspace: false,
+        };
+
+        assert_eq!(decide(&context), ClaimDecision::RefuseHeld);
     }
 }

@@ -9,14 +9,35 @@ use crate::config::{RepoEntry, Role};
 use crate::ids::{CommitId, ReleaseScheme, RepoName, strict_dated_release};
 use crate::jj::{self, Repo};
 use crate::pins::{Pin, PinVerdict};
-use crate::release_model::{newest_release, repo_slug, scan_consumer_for};
+use crate::release_model::{
+    ConsumerHeadMemo, ConsumerScan, newest_release, repo_slug, scan_consumer_for,
+    scan_consumer_slug_with_heads,
+};
 
 /// Inputs for one fork's consumer-pin census.
-#[derive(Debug)]
 pub struct Request<'a> {
     pub fork: &'a RepoName,
     pub entry: &'a RepoEntry,
-    pub consumers: &'a [PathBuf],
+    pub slugs: &'a [String],
+    pub locals: &'a [PathBuf],
+    pub forge: &'a dyn crate::forge::Forge,
+    pub cache_root: Option<&'a Path>,
+    pub heads: &'a ConsumerHeadMemo,
+}
+
+impl std::fmt::Debug for Request<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Request")
+            .field("fork", self.fork)
+            .field("entry", self.entry)
+            .field("slugs", &self.slugs)
+            .field("locals", &self.locals)
+            .field("forge", &"<Forge>")
+            .field("cache_root", &self.cache_root)
+            .field("heads", self.heads)
+            .finish()
+    }
 }
 
 /// The release against which the census classified pins.
@@ -43,7 +64,7 @@ pub struct PinRow {
 /// One checkout that may consume the fork's releases.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ConsumerRow {
-    pub path: String,
+    pub consumer: String,
     pub pins: Vec<PinRow>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub notes: Vec<String>,
@@ -75,8 +96,12 @@ struct ConsumerContext<'a> {
     fork: &'a str,
     slug: Option<&'a str>,
     scheme: &'a ReleaseScheme,
+    repo_path: &'a Path,
     live: &'a BTreeMap<String, CommitId>,
     newest: Option<&'a Release>,
+    forge: &'a dyn crate::forge::Forge,
+    cache_root: Option<&'a Path>,
+    heads: &'a ConsumerHeadMemo,
 }
 
 /// Classify every registered and explicitly named consumer against live release refs.
@@ -90,13 +115,23 @@ pub fn gather(request: &Request<'_>) -> Report {
         scheme: &scheme,
         live: &positions.refs,
         newest: positions.newest.as_ref(),
+        forge: request.forge,
+        cache_root: request.cache_root,
+        heads: request.heads,
+        repo_path: &request.entry.path,
     };
     let mut consumers = request
-        .consumers
+        .slugs
         .iter()
-        .map(|consumer| consumer_row(consumer, &context))
+        .map(|consumer| consumer_slug_row(consumer, &context))
+        .chain(
+            request
+                .locals
+                .iter()
+                .map(|consumer| consumer_row(consumer, &context)),
+        )
         .collect::<Vec<_>>();
-    consumers.sort_by(|left, right| left.path.cmp(&right.path));
+    consumers.sort_by(|left, right| left.consumer.cmp(&right.consumer));
     let mut notes = positions.notes;
     add_skew_note(&consumers, &mut notes);
     Report {
@@ -227,10 +262,10 @@ fn newest_live(
 }
 
 fn consumer_row(consumer: &Path, context: &ConsumerContext<'_>) -> ConsumerRow {
-    let path = consumer.display().to_string();
+    let consumer_name = consumer.display().to_string();
     if !consumer.exists() {
         return ConsumerRow {
-            path,
+            consumer: consumer_name,
             pins: Vec::new(),
             notes: Vec::new(),
             problem: Some("not found".to_owned()),
@@ -238,13 +273,40 @@ fn consumer_row(consumer: &Path, context: &ConsumerContext<'_>) -> ConsumerRow {
     }
     if !consumer.is_dir() {
         return ConsumerRow {
-            path,
+            consumer: consumer_name,
             pins: Vec::new(),
             notes: Vec::new(),
             problem: Some("not a directory".to_owned()),
         };
     }
-    let scan = scan_consumer_for(consumer, context.slug, context.scheme);
+    consumer_row_from_scan(
+        consumer_name,
+        scan_consumer_for(consumer, context.slug, context.scheme),
+        context,
+    )
+}
+
+fn consumer_slug_row(consumer: &str, context: &ConsumerContext<'_>) -> ConsumerRow {
+    consumer_row_from_scan(
+        consumer.to_owned(),
+        scan_consumer_slug_with_heads(
+            context.forge,
+            context.cache_root,
+            context.repo_path,
+            consumer,
+            context.slug,
+            context.scheme,
+            context.heads,
+        ),
+        context,
+    )
+}
+
+fn consumer_row_from_scan(
+    consumer: String,
+    scan: ConsumerScan,
+    context: &ConsumerContext<'_>,
+) -> ConsumerRow {
     let mut notes = scan.notes;
     let problem = (!scan.problems.is_empty()).then(|| scan.problems.join("; "));
     if problem.is_none() && scan.pins.is_empty() {
@@ -253,7 +315,7 @@ fn consumer_row(consumer: &Path, context: &ConsumerContext<'_>) -> ConsumerRow {
         notes.push("cannot classify pins: no newest release is available".to_owned());
     }
     ConsumerRow {
-        path,
+        consumer,
         pins: scan
             .pins
             .iter()
@@ -305,7 +367,7 @@ fn add_skew_note(consumers: &[ConsumerRow], notes: &mut Vec<String>) {
                 continue;
             }
             pins.entry(pin.reference.clone())
-                .or_insert_with(|| consumer_label(Path::new(&consumer.path)));
+                .or_insert_with(|| consumer.consumer.clone());
         }
     }
     if pins.len() > 1 {
@@ -316,16 +378,6 @@ fn add_skew_note(consumers: &[ConsumerRow], notes: &mut Vec<String>) {
             .join(", ");
         notes.push(format!("consumers disagree: {detail}"));
     }
-}
-
-fn consumer_label(path: &Path) -> String {
-    path.parent()
-        .and_then(Path::file_name)
-        .or_else(|| path.file_name())
-        .map_or_else(
-            || path.display().to_string(),
-            |name| name.to_string_lossy().into_owned(),
-        )
 }
 
 /// The command outcome, with unanswered checks outranking actionable pin findings.
@@ -377,27 +429,27 @@ pub fn render(report: &Report) -> String {
         let _ = write!(lines, "\n  PROBLEM: {problem}");
     }
     for consumer in &report.consumers {
-        let _ = write!(lines, "\n  {}", consumer.path);
+        let _ = write!(lines, "\n  {}", consumer.consumer);
         if let Some(problem) = &consumer.problem {
             let _ = write!(lines, ": PROBLEM: {problem}");
-            continue;
-        }
-        lines.push(':');
-        for pin in &consumer.pins {
-            let _ = write!(
-                lines,
-                "\n    {}:{}  {}  {}{}  {}",
-                pin.file,
-                pin.line,
-                pin.reference,
-                pin.kind,
-                pin.locked
-                    .as_deref()
-                    .map_or_else(String::new, |locked| format!("  @{}", short(locked))),
-                pin.verdict
-                    .as_ref()
-                    .map_or_else(|| "unclassified".to_owned(), render_verdict)
-            );
+        } else {
+            lines.push(':');
+            for pin in &consumer.pins {
+                let _ = write!(
+                    lines,
+                    "\n    {}:{}  {}  {}{}  {}",
+                    pin.file,
+                    pin.line,
+                    pin.reference,
+                    pin.kind,
+                    pin.locked
+                        .as_deref()
+                        .map_or_else(String::new, |locked| format!("  @{}", short(locked))),
+                    pin.verdict
+                        .as_ref()
+                        .map_or_else(|| "unclassified".to_owned(), render_verdict)
+                );
+            }
         }
         for note in &consumer.notes {
             let _ = write!(lines, "\n    {note}");
@@ -426,10 +478,17 @@ fn short(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::path::Path;
 
-    use super::{ConsumerContext, Release, consumer_row, local_remote_skew_note, verdict};
+    use super::{
+        ConsumerContext, Release, Report, consumer_row, consumer_slug_row, exit_for,
+        local_remote_skew_note, render, verdict,
+    };
+    use crate::cli::Exit;
+    use crate::forge::{ConsumerHead, fake::FakeForge};
     use crate::ids::{CommitId, ReleaseScheme};
     use crate::pins::{Pin, PinKind, PinVerdict};
+    use crate::release_model::ConsumerHeadMemo;
 
     fn pin(reference: &str, locked: Option<&str>) -> Pin {
         Pin {
@@ -475,12 +534,18 @@ mod tests {
         let newest = release("release/2026-08-05", "11223344556677889900aabbccddeeff");
         let scheme = ReleaseScheme::Dated;
         let live = live();
+        let forge = FakeForge::default();
+        let heads = ConsumerHeadMemo::default();
         let context = ConsumerContext {
             fork: "demo",
             slug: Some("tool"),
             scheme: &scheme,
+            repo_path: Path::new("/fork"),
             live: &live,
             newest: Some(&newest),
+            forge: &forge,
+            cache_root: None,
+            heads: &heads,
         };
 
         let row = consumer_row(consumer.path(), &context);
@@ -579,12 +644,18 @@ mod tests {
         let newest = release("release/2026-08-05", "11223344556677889900aabbccddeeff");
         let scheme = ReleaseScheme::Dated;
         let live = live();
+        let forge = FakeForge::default();
+        let heads = ConsumerHeadMemo::default();
         let context = ConsumerContext {
             fork: "demo",
             slug: Some("tool"),
             scheme: &scheme,
+            repo_path: Path::new("/fork"),
             live: &live,
             newest: Some(&newest),
+            forge: &forge,
+            cache_root: None,
+            heads: &heads,
         };
 
         let row = consumer_row(consumer.path(), &context);
@@ -600,6 +671,94 @@ mod tests {
         );
         assert_eq!(reported.verdict, Some(PinVerdict::OffScheme));
     }
+    #[test]
+    fn a_forge_failure_answers_from_cache_labeled_with_its_commit_and_exits_incomplete() {
+        let cache = tempfile::tempdir().expect("create consumer cache");
+        let consumer = "acme/consumer";
+        let commit = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let scheme = ReleaseScheme::Dated;
+        let live = live();
+        let newest = release("release/2026-08-05", "11223344556677889900aabbccddeeff");
+        let priming_forge = FakeForge {
+            heads: BTreeMap::from([(
+                consumer.to_owned(),
+                ConsumerHead {
+                    branch: "main".to_owned(),
+                    commit: commit.to_owned(),
+                },
+            )]),
+            files: BTreeMap::from([(
+                (consumer.to_owned(), commit.to_owned(), "uv.lock".to_owned()),
+                "tool = { git = \"https://forge.invalid/acme/tool.git?rev=release%2F2026-08-05#112233445566\" }\n"
+                    .to_owned(),
+            )]),
+            ..FakeForge::default()
+        };
+        let priming_heads = ConsumerHeadMemo::default();
+        let priming_context = ConsumerContext {
+            fork: "demo",
+            slug: Some("tool"),
+            scheme: &scheme,
+            repo_path: Path::new("/fork"),
+            live: &live,
+            newest: Some(&newest),
+            forge: &priming_forge,
+            cache_root: Some(cache.path()),
+            heads: &priming_heads,
+        };
+        let primed = consumer_slug_row(consumer, &priming_context);
+        assert!(primed.problem.is_none(), "priming report: {primed:?}");
+
+        let unavailable_forge = FakeForge {
+            fail_consumer_head: true,
+            ..FakeForge::default()
+        };
+        let unavailable_heads = ConsumerHeadMemo::default();
+        let unavailable_context = ConsumerContext {
+            fork: "demo",
+            slug: Some("tool"),
+            scheme: &scheme,
+            repo_path: Path::new("/fork"),
+            live: &live,
+            newest: Some(&newest),
+            forge: &unavailable_forge,
+            cache_root: Some(cache.path()),
+            heads: &unavailable_heads,
+        };
+
+        let row = consumer_slug_row(consumer, &unavailable_context);
+        let report = Report {
+            fork: "demo".to_owned(),
+            newest: Some(newest),
+            consumers: vec![row.clone()],
+            notes: Vec::new(),
+            problems: Vec::new(),
+        };
+
+        assert_eq!(row.pins.len(), 1, "cached pin: {row:?}");
+        assert!(
+            row.notes.iter().any(|note| note
+                == "acme/consumer: forge unreachable; pins answered from cache at aaaaaaaaaaaa"),
+            "notes: {:?}",
+            row.notes
+        );
+        assert!(
+            row.problem
+                .as_deref()
+                .is_some_and(|problem| problem.contains("acme/consumer: forge unreachable")),
+            "problem: {:?}",
+            row.problem
+        );
+        let rendered = render(&report);
+        assert!(
+            rendered.contains(
+                "acme/consumer: forge unreachable; pins answered from cache at aaaaaaaaaaaa"
+            ),
+            "rendered: {rendered}"
+        );
+        assert_eq!(exit_for(&report), Exit::Incomplete);
+    }
+
     #[test]
     fn an_advanced_live_ref_with_the_same_name_records_view_disagreement() {
         let local = release("release/2026-08-05", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");

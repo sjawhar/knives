@@ -11,7 +11,8 @@ use knives::{
     hook::guidance::{
         Guidance, InstructionFile, claim_lines, format_guidance, format_notice, guidance_for,
     },
-    store::Claim,
+    seen::Seen,
+    store::{Claim, OwnerKind},
 };
 use tempfile::TempDir;
 
@@ -69,19 +70,29 @@ fn notice_format_matches_the_plugin_prose_exactly() {
     // When: the formatter produces both notice forms.
     let actual = [
         normalize_nonce(
-            &format_notice("example-repo", Path::new("/example/repo"), &claims),
+            &format_notice(
+                "example-repo",
+                Path::new("/example/repo"),
+                &claims,
+                "0123456789abcdef",
+            ),
             "notice",
         ),
         normalize_nonce(
-            &format_notice("example-repo", Path::new("/example/repo"), &[]),
+            &format_notice(
+                "example-repo",
+                Path::new("/example/repo"),
+                &[],
+                "fedcba9876543210",
+            ),
             "notice",
         ),
     ];
 
     // Then: every non-nonce byte equals the TypeScript formatter's text.
     assert_eq!(actual, [
-        "\n\n<knives-notice-NONCE repo=\"example-repo\">\n/example/repo is a fork managed by knives, and another agent may be working in it.\nBranches claimed here: a (x); b (y).\nUse knives rather than jj or git directly here: `knives status` for the state of\nevery branch, `knives start <branch>` to take a branch and get your own workspace,\n`knives finish <branch>` when you are done with it.\n</knives-notice-NONCE>".to_owned(),
-        "\n\n<knives-notice-NONCE repo=\"example-repo\">\n/example/repo is a fork managed by knives, and another agent may be working in it.\nNo branch is claimed here right now.\nUse knives rather than jj or git directly here: `knives status` for the state of\nevery branch, `knives start <branch>` to take a branch and get your own workspace,\n`knives finish <branch>` when you are done with it.\n</knives-notice-NONCE>".to_owned(),
+        "\n\n<knives-notice-NONCE repo=\"example-repo\" digest=\"0123456789abcdef\">\n/example/repo is a fork managed by knives, and another agent may be working in it.\nBranches claimed here: a (x); b (y).\nUse knives rather than jj or git directly here: `knives status` for the state of\nevery branch, `knives start <branch>` to take a branch and get your own workspace,\n`knives finish <branch>` when you are done with it.\n</knives-notice-NONCE>".to_owned(),
+        "\n\n<knives-notice-NONCE repo=\"example-repo\" digest=\"fedcba9876543210\">\n/example/repo is a fork managed by knives, and another agent may be working in it.\nNo branch is claimed here right now.\nUse knives rather than jj or git directly here: `knives status` for the state of\nevery branch, `knives start <branch>` to take a branch and get your own workspace,\n`knives finish <branch>` when you are done with it.\n</knives-notice-NONCE>".to_owned(),
     ]);
 }
 
@@ -139,12 +150,13 @@ fn claude_md_wins_over_context_md_in_one_directory() {
 }
 
 #[test]
-fn claim_lines_filter_the_repo_and_format_both_why_variants() {
+fn claim_lines_filter_the_repo_and_render_claim_provenance() {
     // Given: matching claims with and without a reason, plus another repo's claim.
     let claim = |repo: &str, branch: &str, owner: &str, why: &str| Claim {
         repo: repo.to_owned(),
         branch: branch.to_owned(),
         owner: owner.to_owned(),
+        kind: OwnerKind::OsUser,
         why: why.to_owned(),
         started: "2026-08-02T00:00:00Z".to_owned(),
         files: vec![],
@@ -154,16 +166,17 @@ fn claim_lines_filter_the_repo_and_format_both_why_variants() {
         claim("repo", "feature/reason", "blair", "review fixes"),
         claim("other", "feature/hidden", "casey", "different repository"),
     ];
+    let now = "2026-08-03T00:00:00Z".parse().expect("valid timestamp");
 
     // When: lines are rendered for `repo`.
-    let lines = claim_lines(&claims, "repo");
+    let lines = claim_lines(&claims, "repo", &Seen::default(), now);
 
-    // Then: only matching claims remain and punctuation reflects the reason.
+    // Then: only matching claims remain with explicit ownership provenance.
     assert_eq!(
         lines,
         [
-            "feature/no-reason (alex)",
-            "feature/reason (blair): review fixes"
+            "feature/no-reason (alex, os-user, claimed 1d ago, not seen within the observation window): ",
+            "feature/reason (blair, os-user, claimed 1d ago, not seen within the observation window): review fixes"
         ]
     );
 }

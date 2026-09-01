@@ -234,8 +234,9 @@ knives audit [REPO] [--all] [--no-github]
 knives sync [REPO|--all]       fetch all remotes and tracked pull/N/head refs; classify each
                                tracked PR as new | unchanged | advanced | merged | closed
 knives preflight [REPO]        programmatic pre-contribution facts (see below)
-knives status [REPO|--all]     aligned table per branch (branch, tip, push, pr, review, checks,
-                               landed, flags, notch); claims, active workspaces, and detectors
+knives status [REPO|--all]     problem-first status map; aligned branch rows (branch, state,
+                               tip, push, pr, review, checks, landed, claim, seen, notch),
+                               grouped findings, and unmatched workspaces
 knives pr NUMBER [--repo REPO] [--timeline]
                                one pull request's live state; --timeline reads its bounded forge event log
 knives start BRANCH            claim, create the workspace, base it on the release's shared base (falling back to fetched trunk)
@@ -281,7 +282,7 @@ ruling. `--verify` re-checks selected entries without writing. The `status` brea
 other half: each branch shows its newest note when one exists, otherwise its newest event, with
 the number of sibling entries it masks. A disposition token prefixes that compact text.
 
-`knives repos` and `knives status` are deliberately separate: one answers "what am I maintaining", the other "what is the current state and what is being worked on right now". Conflating them was an earlier mistake in this design. `knives status` outputs an aligned table for branch rows (`branch`, `tip`, `push`, `pr`, `review`, `checks`, `landed`, `flags`, `notch`) with empty cells as `-`. On-screen status display tokens use `failing` for failing checks and `none-ran` when no checks run.
+`knives repos` and `knives status` are deliberately separate: one answers "what am I maintaining", the other "what is the current state and what is being worked on right now". Conflating them was an earlier mistake in this design. `knives status` emits a problem-first map: `UNANSWERED` precedes the aligned branch table (`branch`, `state`, `tip`, `push`, `pr`, `review`, `checks`, `landed`, `claim`, `seen`, `notch`), followed by grouped findings. Absent display values are `-`; `push` displays `pushed` when its machine field is absent, and a divergent bookmark displays `divergent` in `tip`. `claim` and `seen` carry claim ownership and observation instead of a separate claims section. On-screen status display tokens use `failing` for failing checks and `none-ran` when no checks run.
 
 ### Which PR belongs to a branch
 

@@ -90,7 +90,7 @@ mod tests {
             release: Some("https://forge.invalid/someone/tool-releases.git".to_owned()),
             release_branch: Some("release".to_owned()),
             test_count_command: Some("cargo test -- --list | wc -l".to_owned()),
-            consumers: vec![std::path::PathBuf::from("/home/someone/consumers/tool")],
+            consumers: vec!["acme/consumer".to_owned()],
         };
         let text = snippet("tool", &entry).expect("snippet serializes");
         assert!(text.starts_with("[repos.tool]"), "was: {text}");

@@ -14,7 +14,7 @@ fn an_unreadable_sibling_does_not_fail_update() -> anyhow::Result<()> {
 
     // When: a session state is persisted
     let result = SessionState::update(home.path(), "claude-code", "s1", |state| {
-        state.mark(Path::new("/r"), true, true);
+        state.mark_guided(Path::new("/r"));
     });
 
     // Then: housekeeping cannot turn the successful persistence into an error
@@ -23,8 +23,8 @@ fn an_unreadable_sibling_does_not_fail_update() -> anyhow::Result<()> {
 }
 
 #[test]
-fn missing_flag_fields_default_independently() -> anyhow::Result<()> {
-    // Given: state written by a version before `guided` existed
+fn a_legacy_noticed_flag_does_not_suppress_notices() -> anyhow::Result<()> {
+    // Given: state written by the previous one-boolean notice implementation.
     let home = tempfile::tempdir()?;
     let directory = home.path().join("hook-sessions");
     std::fs::create_dir_all(&directory)?;
@@ -33,18 +33,18 @@ fn missing_flag_fields_default_independently() -> anyhow::Result<()> {
         r#"{"repos":{"/r":{"noticed":true}}}"#,
     )?;
 
-    // When: the record is read
-    let flags = SessionState::load(home.path(), "claude-code", "s1").repo(Path::new("/r"));
+    // When: the record is read after digest-aware notices were introduced.
+    let state = SessionState::load(home.path(), "claude-code", "s1");
 
-    // Then: the existing flag survives and the absent one defaults to false
-    assert!(flags.noticed);
-    assert!(!flags.guided);
+    // Then: absent digest state is empty, allowing one harmless re-emission.
+    assert!(!state.notice_seen(Path::new("/r"), "digest"));
+    assert!(!state.repo(Path::new("/r")).guided);
     Ok(())
 }
 
 #[test]
-fn a_document_predating_owner_remotes_survives_update_and_reload() -> anyhow::Result<()> {
-    // Given: state written before `owner_remotes` existed.
+fn a_document_predating_notice_digests_survives_update_and_reload() -> anyhow::Result<()> {
+    // Given: state written before `seen_notices` existed.
     let home = tempfile::tempdir()?;
     let directory = home.path().join("hook-sessions");
     std::fs::create_dir_all(&directory)?;
@@ -55,13 +55,14 @@ fn a_document_predating_owner_remotes_survives_update_and_reload() -> anyhow::Re
 
     // When: the legacy record is updated, then loaded through the public API.
     SessionState::update(home.path(), "claude-code", "s1", |state| {
-        state.mark(Path::new("/other"), true, false);
+        state.record_notice(Path::new("/other"), "digest".to_owned());
     })?;
     let state = SessionState::load(home.path(), "claude-code", "s1");
 
-    // Then: existing flags survive and the missing owner map remains absent.
-    assert!(state.repo(Path::new("/r")).noticed);
+    // Then: guidance survives, missing digest state defaults empty, and the
+    // independent remote cache remains absent.
     assert!(state.repo(Path::new("/r")).guided);
+    assert!(!state.notice_seen(Path::new("/r"), "digest"));
     assert!(state.owner_remotes(Path::new("/r")).is_none());
     Ok(())
 }
@@ -95,13 +96,13 @@ fn concurrent_updates_for_one_session_preserve_both_repos() -> anyhow::Result<()
         let first = scope.spawn(|| {
             start.wait();
             SessionState::update(home.path(), "claude-code", "s1", |state| {
-                state.mark(Path::new("/a"), true, true);
+                state.record_notice(Path::new("/a"), "first".to_owned());
             })
         });
         let second = scope.spawn(|| {
             start.wait();
             SessionState::update(home.path(), "claude-code", "s1", |state| {
-                state.mark(Path::new("/b"), true, true);
+                state.record_notice(Path::new("/b"), "second".to_owned());
             })
         });
         (first.join(), second.join())
@@ -111,8 +112,8 @@ fn concurrent_updates_for_one_session_preserve_both_repos() -> anyhow::Result<()
 
     // Then: neither writer loses the other writer's state
     let state = SessionState::load(home.path(), "claude-code", "s1");
-    assert!(state.repo(Path::new("/a")).noticed);
-    assert!(state.repo(Path::new("/b")).noticed);
+    assert!(state.notice_seen(Path::new("/a"), "first"));
+    assert!(state.notice_seen(Path::new("/b"), "second"));
     Ok(())
 }
 
@@ -121,7 +122,7 @@ fn delete_removes_state_and_tolerates_missing_files() -> anyhow::Result<()> {
     // Given: a persisted session record
     let home = tempfile::tempdir()?;
     SessionState::update(home.path(), "claude-code", "s1", |state| {
-        state.mark(Path::new("/r"), true, true);
+        state.mark_guided(Path::new("/r"));
     })?;
 
     // When: SessionEnd deletes it twice

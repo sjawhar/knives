@@ -7,7 +7,7 @@ use std::path::Path;
 use crate::cli::Exit;
 use crate::commands::pushed::{self, ReconcileInput, Row};
 use crate::config::{RepoEntry, Role};
-use crate::detect::{Finding, FindingKind, Subject};
+use crate::detect::{BookmarkTips, Finding, FindingKind, Subject};
 use crate::forge::{Forge, PullRequest};
 use crate::ids::{BookmarkRef, BranchName, BranchTarget, CommitId, RepoName, is_release_name};
 use crate::jj::{self, Repo};
@@ -67,8 +67,8 @@ pub fn gather(input: &AuditInput<'_>) -> Report {
             return report;
         }
     };
-    let local = match opened.bookmark_tips() {
-        Ok(tips) => pushed::local_tips(tips),
+    let tips = match opened.bookmark_tips() {
+        Ok(tips) => tips,
         Err(error) => {
             report
                 .problems
@@ -76,6 +76,8 @@ pub fn gather(input: &AuditInput<'_>) -> Report {
             return report;
         }
     };
+    add_unconfigured_remote_refs(&mut report, &opened, &input.entry.path, &tips);
+    let local = pushed::local_tips(tips);
     let live = match pushed::live_refs(input.entry) {
         Ok(live) => live,
         Err(error) => {
@@ -124,6 +126,59 @@ pub fn gather(input: &AuditInput<'_>) -> Report {
     add_orphan_commits(&mut report, &opened, &input.entry.path);
     add_open_pull_head_checks(&mut report, input, &local, live.origin());
     report
+}
+
+fn add_unconfigured_remote_refs(
+    report: &mut Report,
+    opened: &Repo,
+    path: &Path,
+    tips: &BookmarkTips,
+) {
+    let conflicted = match opened.conflicted_bookmarks() {
+        Ok(conflicted) => conflicted,
+        Err(error) => {
+            report
+                .problems
+                .push(format!("could not read conflicted bookmarks: {error}"));
+            return;
+        }
+    };
+    let configured = match jj::git_remotes(path) {
+        Ok(remotes) => remotes,
+        Err(error) => {
+            report
+                .problems
+                .push(format!("could not read configured Git remotes: {error}"));
+            return;
+        }
+    };
+    let unconfigured: BTreeSet<&str> = tips
+        .keys()
+        .chain(conflicted.iter().map(|(reference, _)| reference))
+        .filter_map(|reference| match reference {
+            BookmarkRef::Local(_) => None,
+            BookmarkRef::Remote { remote, .. } => Some(remote.as_str()),
+        })
+        .filter(|remote| *remote != "git" && !configured.contains_key(*remote))
+        .collect();
+    report.findings.extend(
+        tips.keys()
+            .chain(conflicted.iter().map(|(reference, _)| reference))
+            .filter_map(|reference| match reference {
+                BookmarkRef::Local(_) => None,
+                BookmarkRef::Remote { remote, .. } => unconfigured
+                    .contains(remote.as_str())
+                    .then(|| {
+                        Finding::new(
+                            FindingKind::UnconfiguredRemote,
+                            Subject::Bookmark(reference.clone()),
+                            format!(
+                                "remote {remote} is not configured; this remote-tracking ref stays pinned immutable and a fetch will never update it"
+                            ),
+                        )
+                    }),
+            }),
+    );
 }
 
 fn tracked(store: &Store, repo: &RepoName, branches: &[BranchName]) -> BTreeMap<BranchName, u64> {
@@ -575,8 +630,8 @@ mod tests {
     use crate::config::RepoEntry;
     use crate::detect::{FindingKind, Subject};
     use crate::forge::{
-        Account, Forge, ForgeError, PullDetails, PullFacts, PullRequest, PullSummary, RepoIdentity,
-        SweepPage, TimelineEvent, fake::FakeForge,
+        Account, ConsumerHead, Forge, ForgeError, PullDetails, PullFacts, PullRequest, PullSummary,
+        RepoIdentity, SweepPage, TimelineEvent, fake::FakeForge,
     };
     use crate::ids::{BookmarkRef, BranchName, CommitId, RepoName};
     use crate::ledger::{Entry, Kind, Ledger};
@@ -644,6 +699,24 @@ mod tests {
             _number: u64,
         ) -> Result<Vec<TimelineEvent>, ForgeError> {
             Ok(Vec::new())
+        }
+
+        fn consumer_head(&self, _repo: &Path, _slug: &str) -> Result<ConsumerHead, ForgeError> {
+            Err(ForgeError::Query {
+                detail: "consumer lookups are not part of this test".to_owned(),
+            })
+        }
+
+        fn file_at(
+            &self,
+            _repo: &Path,
+            _slug: &str,
+            _commit: &str,
+            _path: &str,
+        ) -> Result<Option<String>, ForgeError> {
+            Err(ForgeError::Query {
+                detail: "consumer lookups are not part of this test".to_owned(),
+            })
         }
     }
 

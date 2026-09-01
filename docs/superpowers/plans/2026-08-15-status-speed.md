@@ -44,7 +44,7 @@ _(empty at the start; the coordinator records hardening findings here as they ar
 
 **PR 1 (`docs/superpowers/plans/2026-08-15-notch-ledger.md`) merges first.** This plan is written against `src/commands/status.rs` **as PR 1 leaves it**, which means:
 
-- `struct BranchRow` has a `last_notch: Option<LastNotch>` field. Every row literal below sets it. Do not remove it.
+- `struct BranchRow` has a `notch: Option<LastNotch>` field. Every row literal below sets it. Do not remove it.
 - `struct Options` has a `ledger: Option<&'a Ledger>` field. Every `Options` literal below sets it, and this plan adds a second field, `workers: usize`.
 - `fn add_releases(report, repo, tips, entry)` exists, extracted from `gather` by PR 1. This plan depends on that extraction for its line budget: `gather` was 103 non-comment lines against a hundred-line clippy threshold, PR 1's extraction takes it to about 88, and Task 1 here extracts the branch loop as well.
 - `fn branch_table` renders nine columns. **This plan does not touch it**, or any other rendering function: status text legibility is out of scope.
@@ -55,11 +55,11 @@ _(empty at the start; the coordinator records hardening findings here as they ar
 - `struct Options` — one field added (`workers`). PR 1 added `ledger` to the same struct; the rebase adds two lines to one struct.
 - `fn gather` — **touched once, in Task 1**: it becomes a three-line delegation to a new `gather_timed`, which holds what `gather` holds today plus the phase clocks, minus the branch loop.
 - `fn branch_rows` and `struct RowInput` — new in Task 1, holding the branch loop that `gather` holds today. Tasks 3 and 5 change only this function, not `gather`.
-- `fn review_stale_for`, `fn checks_for` — removed in Task 3, replaced by `review_stale_from` and `checks_from`, which read the batch map instead of calling the forge.
+- `fn review_predates_head_for`, `fn checks_for` — removed in Task 3, replaced by `review_predates_head_from` and `checks_from`, which read the batch map instead of calling the forge.
 - `fn landed_verdict` — **unchanged**, including its signature: it still takes `&Options`, which is why Task 2's `Forge: Send + Sync` matters.
-- New: `struct Timings`, `fn timing_enabled`, `fn gather_timed`, `type CarriedPull`, `fn carried_pulls`, `fn detail_numbers`, `fn pull_details_from_forge`, `fn review_stale_from`, `fn checks_from`, `fn landed_verdicts`.
+- New: `struct Timings`, `fn timing_enabled`, `fn gather_timed`, `type CarriedPull`, `fn carried_pulls`, `fn detail_numbers`, `fn pull_details_from_forge`, `fn review_predates_head_from`, `fn checks_from`, `fn landed_verdicts`.
 
-The whole overlap with PR 1 is therefore `struct Options` and `fn gather`, and in `gather` it is one extraction that carries PR 1's two added lines (`notches_from_ledger` and `notches: &notches`) through unchanged while moving PR 1's `last_notch` line into `branch_rows` with the rest of the loop.
+The whole overlap with PR 1 is therefore `struct Options` and `fn gather`, and in `gather` it is one extraction that carries PR 1's two added lines (`notches_from_ledger` and `notches: &notches`) through unchanged while moving the `notch` line into `branch_rows` with the rest of the loop.
 
 ### Task dependencies
 
@@ -249,8 +249,8 @@ fn branch_rows(
     for (branch, tip) in input.branches {
         let pull_request = pull_request_for(&branch, input.pull_requests);
         let phase = std::time::Instant::now();
-        let review_stale =
-            review_stale_for(input.options.forge, input.entry, pull_request.as_ref(), report);
+        let review_predates_head =
+            review_predates_head_for(input.options.forge, input.entry, pull_request.as_ref(), report);
         let checks = checks_for(input.options.forge, input.entry, pull_request.as_ref(), report);
         timings.forge += phase.elapsed();
         let origin_tip = input
@@ -279,7 +279,7 @@ fn branch_rows(
         }
         let target = BranchTarget::new(input.name.clone(), branch.clone());
         let stated_pull = stated_pull_for(&target, input.store, input.entry, input.options);
-        let last_notch = newest_for(input.notches, branch.as_str()).map(LastNotch::of);
+        let notch = newest_for(input.notches, branch.as_str()).map(LastNotch::of);
         report.branches.push(BranchRow {
             name: branch,
             tip: Some(tip),
@@ -287,11 +287,11 @@ fn branch_rows(
             origin_relation,
             pull_request,
             landed,
-            review_stale,
+            review_predates_head,
             checks,
             fork_only: input.store.is_fork_only(&target),
             stated_pull,
-            last_notch,
+            notch,
         });
     }
     Ok(unjudged)
@@ -1208,10 +1208,10 @@ In `tests/jj_integration.rs`, replace `StateUnavailableForge`'s `review_predates
     }
 ```
 
-- [ ] **Step 8: Point `status` at the new method, minimally.** `review_stale_for` and `checks_for` are replaced wholesale in Task 3; here they only need to compile and keep answering what they answer today. Replace both:
+- [ ] **Step 8: Point `status` at the new method, minimally.** `review_predates_head_for` and `checks_for` are replaced wholesale in Task 3; here they only need to compile and keep answering what they answer today. Replace both:
 
 ```rust
-fn review_stale_for(
+fn review_predates_head_for(
     forge: Option<&dyn Forge>,
     entry: &RepoEntry,
     pull_request: Option<&PullRequest>,
@@ -1287,9 +1287,9 @@ Expected: PASS with no clippy output. A `dead_code` warning here means a decoder
   - `fn carried_pulls(branches: Vec<(BranchName, CommitId)>, pull_requests: &BTreeMap<BranchName, PullRequest>, tips: &BookmarkTips) -> Vec<CarriedPull>`
   - `fn detail_numbers(carried: &[CarriedPull]) -> Vec<u64>`
   - `fn pull_details_from_forge(forge: Option<&dyn Forge>, entry: &RepoEntry, numbers: &[u64], report: &mut Report) -> BTreeMap<u64, PullDetails>`
-  - `fn review_stale_from(details: Option<&PullDetails>, pull_request: Option<&PullRequest>) -> Option<bool>`
+  - `fn review_predates_head_from(details: Option<&PullDetails>, pull_request: Option<&PullRequest>) -> Option<bool>`
   - `fn checks_from(details: Option<&PullDetails>, pull_request: Option<&PullRequest>) -> Option<ChecksSummary>`
-- Removed: `fn review_stale_for`, `fn checks_for`.
+- Removed: `fn review_predates_head_for`, `fn checks_for`.
 
 One behaviour does change, and it is the only one: a forge failure used to record two problems per pull request (`review age for #N unavailable`, `checks for #N unavailable`) and now records one for the batch (`review age and checks unavailable`). Both make the report `Exit::Incomplete`, no test asserts on the old strings, and on a working forge the two reports are identical.
 
@@ -1425,21 +1425,21 @@ fn one_batch_answers_review_age_and_checks_for_every_branch_at_once() {
             .unwrap_or_else(|| panic!("no row for {name}: {report:?}"))
             .clone()
     };
-    assert_eq!(row("feat/alpha").review_stale, Some(true));
+    assert_eq!(row("feat/alpha").review_predates_head, Some(true));
     assert!(
         row("feat/alpha")
             .checks
             .as_ref()
             .is_some_and(ChecksSummary::failing)
     );
-    assert_eq!(row("feat/beta").review_stale, Some(false));
+    assert_eq!(row("feat/beta").review_predates_head, Some(false));
     assert_eq!(
         row("feat/beta").checks,
         Some(ChecksSummary::default()),
         "consulted with nothing running is not the same as unconsulted"
     );
     // And: a settled pull request is neither asked about nor reported on
-    assert_eq!(row("feat/gamma").review_stale, None);
+    assert_eq!(row("feat/gamma").review_predates_head, None);
     assert_eq!(row("feat/gamma").checks, None);
     assert!(report.problems.is_empty(), "was: {report:?}");
 }
@@ -1585,7 +1585,7 @@ fn a_batch_the_forge_refused_is_one_unanswered_question_not_a_clean_report() {
     );
     assert_eq!(status::exit_for(&report), knives::cli::Exit::Incomplete);
     let row = &report.branches[0];
-    assert_eq!(row.review_stale, None, "a refused answer is not 'current'");
+    assert_eq!(row.review_predates_head, None, "a refused answer is not 'current'");
     assert_eq!(row.checks, None, "a refused answer is not 'nothing ran'");
 }
 ```
@@ -1680,7 +1680,7 @@ fn pull_details_from_forge(
 ///
 /// Gated as the per-pull-request call was: an empty review decision means the
 /// forge recorded no review, and `None` must never render as "current".
-fn review_stale_from(
+fn review_predates_head_from(
     details: Option<&PullDetails>,
     pull_request: Option<&PullRequest>,
 ) -> Option<bool> {
@@ -1707,7 +1707,7 @@ fn checks_from(
 }
 ```
 
-- [ ] **Step 4: Delete `review_stale_for` and `checks_for`** from `src/commands/status.rs`.
+- [ ] **Step 4: Delete `review_predates_head_for` and `checks_for`** from `src/commands/status.rs`.
 
 - [ ] **Step 5: Rewrite `branch_rows`** to drive the batch:
 
@@ -1733,7 +1733,7 @@ fn branch_rows(
         let detail = pull_request
             .as_ref()
             .and_then(|pull_request| details.get(&pull_request.number));
-        let review_stale = review_stale_from(detail, pull_request.as_ref());
+        let review_predates_head = review_predates_head_from(detail, pull_request.as_ref());
         let checks = checks_from(detail, pull_request.as_ref());
         let origin_relation = record_origin_relation(
             report,
@@ -1754,7 +1754,7 @@ fn branch_rows(
         }
         let target = BranchTarget::new(input.name.clone(), branch.clone());
         let stated_pull = stated_pull_for(&target, input.store, input.entry, input.options);
-        let last_notch = newest_for(input.notches, branch.as_str()).map(LastNotch::of);
+        let notch = newest_for(input.notches, branch.as_str()).map(LastNotch::of);
         report.branches.push(BranchRow {
             name: branch,
             tip: Some(tip),
@@ -1762,11 +1762,11 @@ fn branch_rows(
             origin_relation,
             pull_request,
             landed,
-            review_stale,
+            review_predates_head,
             checks,
             fork_only: input.store.is_fork_only(&target),
             stated_pull,
-            last_notch,
+            notch,
         });
     }
     Ok(unjudged)
@@ -2085,7 +2085,7 @@ fn branch_rows(
         let detail = pull_request
             .as_ref()
             .and_then(|pull_request| details.get(&pull_request.number));
-        let review_stale = review_stale_from(detail, pull_request.as_ref());
+        let review_predates_head = review_predates_head_from(detail, pull_request.as_ref());
         let checks = checks_from(detail, pull_request.as_ref());
         let origin_relation = record_origin_relation(
             report,
@@ -2094,7 +2094,7 @@ fn branch_rows(
         );
         let target = BranchTarget::new(input.name.clone(), branch.clone());
         let stated_pull = stated_pull_for(&target, input.store, input.entry, input.options);
-        let last_notch = newest_for(input.notches, branch.as_str()).map(LastNotch::of);
+        let notch = newest_for(input.notches, branch.as_str()).map(LastNotch::of);
         report.branches.push(BranchRow {
             name: branch,
             tip: Some(tip),
@@ -2102,11 +2102,11 @@ fn branch_rows(
             origin_relation,
             pull_request,
             landed,
-            review_stale,
+            review_predates_head,
             checks,
             fork_only: input.store.is_fork_only(&target),
             stated_pull,
-            last_notch,
+            notch,
         });
     }
     Ok(unjudged)
@@ -2428,4 +2428,4 @@ State, for the coordinator to put in the PR body: the measured before-and-after 
 
 **Placeholders:** none. Every code step carries the code; every run step carries the command and what it should print, including the two steps whose expected result is PASS-before-the-change and which say why. The recording of the real GraphQL fixture is a numbered step with exact commands, and the hand-shaped fixture keeps its test a real gate until then. The one thing this plan cannot supply is forge authentication; Task 1 Step 9 and Task 7 Step 3 each say exactly what to report if it is missing rather than working around it.
 
-**Type consistency:** `Timings`'s four `Duration` fields and `line(&str)`, `timing_enabled()`, `gather_timed(...) -> (Report, Timings)`, `gather(...) -> Report`, `RowInput`'s ten fields, `branch_rows(RowInput, &mut Report, &mut Timings) -> anyhow::Result<Vec<String>>`, `PullDetails::{review_predates_head, checks}`, `Forge::pull_details(&self, &Path, &[u64]) -> Result<BTreeMap<u64, PullDetails>, ForgeError>`, `pull_details_query(&[u64]) -> String`, `parse_pull_details(&str)`, `parse_repo_target(&str) -> Result<(String, String), ForgeError>`, `ForgeError::{Target, Query}`, `CarriedPull`, `carried_pulls`, `detail_numbers`, `pull_details_from_forge`, `review_stale_from`, `checks_from`, `landed_verdicts`, `Options::workers`, `JjError::ProbePanic { branch }` and `parallelism()` are spelled identically everywhere they appear above. `landed_verdict` keeps the signature it has today.
+**Type consistency:** `Timings`'s four `Duration` fields and `line(&str)`, `timing_enabled()`, `gather_timed(...) -> (Report, Timings)`, `gather(...) -> Report`, `RowInput`'s ten fields, `branch_rows(RowInput, &mut Report, &mut Timings) -> anyhow::Result<Vec<String>>`, `PullDetails::{review_predates_head, checks}`, `Forge::pull_details(&self, &Path, &[u64]) -> Result<BTreeMap<u64, PullDetails>, ForgeError>`, `pull_details_query(&[u64]) -> String`, `parse_pull_details(&str)`, `parse_repo_target(&str) -> Result<(String, String), ForgeError>`, `ForgeError::{Target, Query}`, `CarriedPull`, `carried_pulls`, `detail_numbers`, `pull_details_from_forge`, `review_predates_head_from`, `checks_from`, `landed_verdicts`, `Options::workers`, `JjError::ProbePanic { branch }` and `…
