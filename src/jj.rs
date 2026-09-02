@@ -740,7 +740,7 @@ impl Repo {
             // excluded everywhere else in this codebase for the same reason.
             // A fetched head is our own pull request, not someone else carrying the work.
             if is_our_release(&reference, scheme, publish_remote)
-                || matches!(&reference, BookmarkRef::Remote { remote, .. } if remote.as_str() == "git")
+                || reference.is_git_view()
                 || pull_number_from_bookmark(reference.branch().as_str()).is_some()
             {
                 continue;

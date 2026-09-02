@@ -186,7 +186,7 @@ are somewhere else.
 | `knives pr NUMBER [--repo REPO] [--timeline]` | one pull request's live state; `--timeline` adds its bounded forge event log |
 | `knives sync` | fetch, then classify what happened to each tracked pull request |
 | `knives preflight` | the facts to check before contributing upstream |
-| `knives start` | take a branch and get your own workspace on the release's shared base |
+| `knives start` | take a branch and get your own workspace: on its tip, or on the release's shared base for a new one |
 | `knives finish` | hand a branch back so another agent can pick it up; its bookmark and any open pull request survive |
 | `knives track` | state which pull request a branch belongs to, when inference cannot find it |
 | `knives depends` | record that a branch cannot land before another repo's pull request |
@@ -233,9 +233,10 @@ Escape hatches:
 A release is a flat octopus merge of feature and fix branches, and its parent set is its membership: a branch is in the release exactly when the release has its parent. The upstream base is never a direct parent — every member forks from it, so it is reachable through each of them, and there is no role to classify. Membership changes only through stated edits. `knives release include` adds one parent, `knives release drop` removes one (saying so when no remaining member carries the dropped content), and `knives release advance` moves member parents to their branches' current tips — refusing outright, rather than silently deduping, if the same branch would replace more than one parent, and accepting `--from <old-sha>` to name one branch's old parent directly when a `jj duplicate` rebuild has left it with no ancestry back to the commit it replaces. `knives release rebase` moves the whole composition onto a newer upstream commit — the equivalent of `jj rebase -b <release> -d <target>` — members and their bookmarks moving together; bare, it targets the first upstream trunk commit that contains every merged pull request, then drops the members whose landed branches carry nothing more (`--no-drop` keeps them); with nothing merged it asks for a commit. Each edit duplicates the release onto the changed parent set, so recorded conflict resolutions carry forward and only the change itself can surface new conflicts. `knives release cut` names a new cut of the composition in hand, verbatim: nothing joins, nothing advances, and a branch created since the last release enters through `include`, never by existing. Only the first cut, with no composition to carry, starts from every branch.
 
 One branch is both the release member and the upstream pull request head; there is never a
-second copy. Branches fork from the release's shared base (`knives start` puts them there, or
-on the fetched upstream trunk when no release exists) and are linear past it, so a new branch
-composes into the release without forcing a rebase; moving the composition to a newer trunk is
+second copy. New branches fork from the release's shared base (`knives start` puts them there,
+or on the fetched upstream trunk when no release exists) and are linear past it, so a new branch
+composes into the release without forcing a rebase; an existing branch is continued from its tip,
+and a name that exists only on upstream is still a new branch here. Moving the composition to a newer trunk is
 `knives release rebase`, a decision of its own. When a branch is rebased onto a newer trunk,
 `advance` still recognises it as the same member by change id, which `jj rebase` keeps. A
 branch that does not compose into the release means the release is behind: move the release,
@@ -254,7 +255,7 @@ A second pre-publish gate holds the candidate against the previous cut's ledger 
 
 `knives release reap` cleans up superseded dated release bookmarks by forgetting their refs locally and across tracking remotes before abandoning their merge commits. Reaping also runs automatically after every successful dated cut. While the live cut still carries unresolved conflicts, every superseded cut is kept: the previous release is the only record of how those conflicts were last resolved, and an abandon-and-recut needs it. Reaping never modifies remote repositories; subsequent fetches may re-materialize forgotten remote refs as untracked bookmarks, which is harmless and cleared by the next reap.
 
-An edit follows consumer pin state exactly as a rebase does: when every pin of the release is frozen on a revision, editing it in place would reach nobody, so the edit refuses and says to cut a new dated release. An edit also refuses when the upstream trunk cannot be resolved, because it is the trunk that separates the release's base parents from its members.
+An edit follows consumer pin state exactly as a rebase does: when every pin of that release is frozen on a revision, editing it in place would reach nobody, so the edit refuses and says to cut a new dated release; a consumer frozen on an older release is not reached either way and does not block the edit. An edit also refuses when the upstream trunk cannot be resolved, because it is the trunk that separates the release's base parents from its members.
 
 ## For agents
 

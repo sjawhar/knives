@@ -81,9 +81,8 @@ fn branch_named_anywhere(
     tips: &crate::detect::BookmarkTips,
     workspaces: &BTreeSet<WorkspaceName>,
 ) -> bool {
-    let git_view = |reference: &crate::ids::BookmarkRef| matches!(reference, crate::ids::BookmarkRef::Remote { remote, .. } if remote.as_str() == "git");
     tips.keys()
-        .any(|reference| reference.branch().as_str() == branch && !git_view(reference))
+        .any(|reference| reference.branch().as_str() == branch && !reference.is_git_view())
         || workspaces.contains(&WorkspaceName::new(crate::commands::wip::workspace_for(
             branch,
         )))

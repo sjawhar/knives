@@ -39,6 +39,15 @@ string_id!(
     "A jj change. Stable across rewrites, and identical across disconnected clones, which is why the same change rewritten in two places collides."
 );
 string_id!(CommitId, "One concrete commit. A change may have several.");
+
+impl CommitId {
+    /// The prefix this program shows: enough to be unique in a fork, short
+    /// enough to read in a line of prose. Commit ids are ASCII hex, so the
+    /// slice is a slice.
+    pub fn short(&self) -> &str {
+        self.0.get(..12).unwrap_or(&self.0)
+    }
+}
 string_id!(RepoName, "A managed repo's name in the registry.");
 string_id!(
     RemoteName,
@@ -164,6 +173,19 @@ pub fn strict_dated_release(name: &str) -> Option<(String, u32)> {
 }
 
 impl BookmarkRef {
+    /// The inverse of `Display`: `branch@remote` is a remote ref, anything else
+    /// a local one. One parser for the grammar, so a display form crossing a
+    /// module boundary as a string comes back as the same value.
+    pub fn parse(text: &str) -> Self {
+        match text.rsplit_once('@') {
+            Some((branch, remote)) if !branch.is_empty() && !remote.is_empty() => Self::Remote {
+                branch: BranchName::new(branch),
+                remote: RemoteName::new(remote),
+            },
+            _ => Self::Local(BranchName::new(text)),
+        }
+    }
+
     pub const fn branch(&self) -> &BranchName {
         match self {
             Self::Local(branch) | Self::Remote { branch, .. } => branch,
@@ -172,6 +194,20 @@ impl BookmarkRef {
 
     pub const fn is_local(&self) -> bool {
         matches!(self, Self::Local(_))
+    }
+
+    /// Whether this is jj's own `@git` tracking view of a bookmark rather than
+    /// a ref on a remote. It mirrors the local bookmark and names nothing of its
+    /// own, so it is not a remote a branch can be fetched from or exist only on.
+    pub fn is_git_view(&self) -> bool {
+        matches!(self, Self::Remote { remote, .. } if remote.is_git_view())
+    }
+}
+
+impl RemoteName {
+    /// Whether this names jj's `git` tracking view rather than a remote.
+    pub fn is_git_view(&self) -> bool {
+        self.as_str() == "git"
     }
 }
 

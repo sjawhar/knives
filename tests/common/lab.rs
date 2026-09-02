@@ -257,6 +257,26 @@ impl Lab {
         jj(&self.work, ["git", "fetch", "--remote", "upstream"]);
     }
 
+    /// A branch of upstream's own, forked from its trunk tip and pushed there:
+    /// somebody else's work, visible here as `<name>@upstream` after the fetch.
+    pub(crate) fn upstream_branch(&self, name: &str, file: &str, content: &str) {
+        git(
+            &self.maintainer,
+            &self.trunk,
+            ["checkout", "-b", name, self.trunk.as_str()],
+        );
+        std::fs::write(self.maintainer.join(file), content).expect("write upstream branch");
+        git(&self.maintainer, &self.trunk, ["add", file]);
+        git(&self.maintainer, &self.trunk, ["commit", "-m", name]);
+        git(&self.maintainer, &self.trunk, ["push", "origin", name]);
+        git(
+            &self.maintainer,
+            &self.trunk,
+            ["checkout", self.trunk.as_str()],
+        );
+        jj(&self.work, ["git", "fetch", "--remote", "upstream"]);
+    }
+
     /// [`Self::advance_upstream`] without the work checkout fetching upstream
     /// afterwards: its `main@upstream` view stays behind.
     pub(crate) fn advance_upstream_unfetched(&self, content: &str) {
@@ -362,25 +382,33 @@ impl Lab {
         jj(&self.work, ["new"]);
     }
 
-    pub(crate) fn rewrite_in_both_clones(&self, branch: &str) {
+    /// Push `branch` from the work checkout and track it in the second clone,
+    /// so both clones can rewrite it.
+    pub(crate) fn track_in_second_clone(&self, branch: &str) {
         self.push_branch(branch);
         jj(&self.second, ["git", "fetch", "--remote", "origin"]);
         let remote_branch = format!("{branch}@origin");
         jj(&self.second, ["bookmark", "track", &remote_branch]);
-        jj(&self.work, ["edit", "--ignore-immutable", branch]);
-        std::fs::write(self.work.join("feature.txt"), "work rewrite\n")
-            .expect("rewrite first clone");
-        jj(&self.work, ["bookmark", "set", branch, "-r", "@"]);
-        jj(&self.work, ["new"]);
+    }
+
+    /// Rewrite `branch` in the second clone and push it: the shape another
+    /// agent's force-push leaves, which the next fetch in the work checkout
+    /// turns into a divergent bookmark when the work checkout rewrote it too.
+    pub(crate) fn rewrite_in_second_clone(&self, branch: &str, content: &str) {
         jj(&self.second, ["edit", "--ignore-immutable", branch]);
-        std::fs::write(self.second.join("feature.txt"), "second rewrite\n")
-            .expect("rewrite second clone");
+        std::fs::write(self.second.join("feature.txt"), content).expect("rewrite second clone");
         jj(&self.second, ["bookmark", "set", branch, "-r", "@"]);
         jj(&self.second, ["new"]);
         jj(
             &self.second,
             ["git", "push", "--remote", "origin", "--bookmark", branch],
         );
+    }
+
+    pub(crate) fn rewrite_in_both_clones(&self, branch: &str) {
+        self.track_in_second_clone(branch);
+        self.rewrite_local_branch(branch, "work rewrite\n");
+        self.rewrite_in_second_clone(branch, "second rewrite\n");
         jj(&self.work, ["git", "fetch", "--remote", "origin"]);
     }
 
@@ -438,10 +466,24 @@ pub fn lab_entry(lab: &Lab) -> knives::config::RepoEntry {
 /// keeps no local consumer path: command helpers supply this checkout via
 /// `--consumer`, as production callers must.
 pub fn release_test_home(lab: &Lab) -> (tempfile::TempDir, std::path::PathBuf) {
+    release_test_home_pinned(
+        lab,
+        "branch = \"release/2026-08-03\"",
+        "branch = \"release/2026-08-04\"",
+    )
+}
+
+/// [`release_test_home`] with the consumer's checkout and origin pins spelled by
+/// the caller: `branch = "…"` follows a release, `rev = "…"` freezes on one.
+pub fn release_test_home_pinned(
+    lab: &Lab,
+    checkout_pin: &str,
+    origin_pin: &str,
+) -> (tempfile::TempDir, std::path::PathBuf) {
     let consumer = lab.consumer_with_pin_history(
         "pyproject.toml",
-        "work = { git = \"https://forge.invalid/acme/work.git\", branch = \"release/2026-08-03\" }\n",
-        "work = { git = \"https://forge.invalid/acme/work.git\", branch = \"release/2026-08-04\" }\n",
+        &format!("work = {{ git = \"https://forge.invalid/acme/work.git\", {checkout_pin} }}\n"),
+        &format!("work = {{ git = \"https://forge.invalid/acme/work.git\", {origin_pin} }}\n"),
     );
     let home = tempfile::tempdir().expect("create config home");
     std::fs::write(
@@ -537,6 +579,16 @@ pub fn release_command(
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path());
     command
+}
+
+/// Run `knives start <branch> --repo demo --why test` from the work checkout.
+pub fn knives_start(lab: &Lab, home: &tempfile::TempDir, branch: &str) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_knives"))
+        .args(["--text", "start", branch, "--repo", "demo", "--why", "test"])
+        .current_dir(&lab.work)
+        .env("KNIVES_CONFIG_HOME", home.path())
+        .output()
+        .expect("run knives start")
 }
 
 /// Run the knives binary's release command for the `demo` repo in `lab`.
