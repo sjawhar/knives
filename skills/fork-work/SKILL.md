@@ -73,10 +73,11 @@ every false one did not.
 knives start <branch> --why "what you are doing"
 ```
 
-This claims the branch and creates a jj workspace for it, based on the release's shared
-base (the fetched upstream trunk when no release exists), so the branch composes into the
-release without forcing a rebase. As soon as your active work there stops — including when it now waits on something
-external, such as a pull request in review:
+This claims the branch and creates a jj workspace for it: on the branch's own tip when the
+branch already exists (your `@` is an empty child of it), or on the release's shared base
+(the fetched upstream trunk when no release exists) for a new branch, so it composes into
+the release without forcing a rebase. As soon as your active work there stops — including
+when it now waits on something external, such as a pull request in review:
 
 ```
 knives finish <branch>
@@ -97,10 +98,10 @@ has a knives command that does the same job safely:
 - **Do not create a scratch or temporary checkout** to "just try something". Use
   `knives start` and get a real workspace that other agents can see you are using.
 - **Do not start a branch in the default workspace of a managed fork.** Another agent may
-  be working there. `knives start` gives you your own workspace on the release's shared
-  base (or the fetched upstream trunk if no release exists), which also avoids silently
-  inheriting a release merge as a parent. This is about these shared forks specifically;
-  branching normally in your own projects is fine.
+  be working there. `knives start` gives you your own workspace on the branch's tip, or
+  for a new branch on the release's shared base (the fetched upstream trunk if no release
+  exists), which also avoids silently inheriting a release merge as a parent. This is
+  about these shared forks specifically; branching normally in your own projects is fine.
 - **Do not keep two copies of a branch** — a "release-lineage" or "sibling" branch carrying
   a pull request's content on an older base so the release can carry it while the pull
   request branch is rebased for the maintainer. One branch is both the release member and the

@@ -1,4 +1,5 @@
-//! `knives start`: claim a branch and open a workspace on the shared base.
+//! `knives start`: claim a branch and open a workspace on its tip, or on the
+//! release's shared base for a new one.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -10,8 +11,11 @@ use crate::commands::claim::{
 };
 use crate::commands::release::shared_base;
 use crate::commands::wip::workspace_for;
-use crate::config::{RepoEntry, default_config_path, load};
-use crate::ids::{BranchName, BranchTarget, RepoName, WorkspaceName};
+use crate::config::{RepoEntry, Role, default_config_path, load};
+use crate::detect::BookmarkTips;
+use crate::ids::{
+    BookmarkRef, BranchName, BranchTarget, CommitId, RemoteName, RepoName, WorkspaceName,
+};
 use crate::jj::{JjError, Repo, add_workspace, fetch_all};
 use crate::ledger::{Ledger, Scribe};
 use crate::release_model::newest_release;
@@ -139,7 +143,16 @@ fn force_claim(
     last_seen: crate::seen::LastSeen,
     reason: &str,
 ) -> anyhow::Result<Exit> {
-    let workspace_notice = workspace_notice(context, true)?;
+    let workspace_notice = match workspace_notice(context, true)? {
+        Ok(notice) => notice,
+        Err(tips) => {
+            // Refused before seizing, as `take_claim` refuses before claiming:
+            // a seized claim with no workspace would leave the branch held and
+            // the agent one `--force` further from the work.
+            eprintln!("{}", divergent_refusal_line(context.branch, &tips));
+            return Ok(Exit::Usage);
+        }
+    };
     record_claim(
         context,
         reason,
@@ -229,12 +242,14 @@ fn take_claim(context: &mut StartContext<'_>, reason: &str) -> anyhow::Result<Ex
         return Ok(Exit::Ok);
     }
 
-    let (base_revision, base_label) = create_workspace(
-        context.entry,
-        &context.upstream_trunk,
-        &context.workspace,
-        &context.destination,
-    )?;
+    let (base_revision, base_label) = match create_workspace(context)? {
+        WorkspaceBase::Created { revision, label } => (revision, label),
+        WorkspaceBase::Divergent(tips) => {
+            // Nothing was claimed: the agent picks a tip and starts again.
+            eprintln!("{}", divergent_refusal_line(context.branch, &tips));
+            return Ok(Exit::Usage);
+        }
+    };
     let change = workspace_change(&Repo::open(&context.entry.path)?, &context.workspace)?;
     record_claim(context, reason, format!("claimed: {reason}"))?;
     println!(
@@ -282,66 +297,157 @@ fn resume_workspace_notice(context: &StartContext<'_>) -> String {
     }
 }
 
-fn workspace_notice(context: &StartContext<'_>, left_as_is: bool) -> anyhow::Result<String> {
+/// The workspace line for a claim being seized: the existing workspace, or the
+/// one just created. `Err` carries the tips of a divergent branch no workspace
+/// can be made for.
+fn workspace_notice(
+    context: &StartContext<'_>,
+    left_as_is: bool,
+) -> anyhow::Result<Result<String, Vec<CommitId>>> {
     if context.destination.exists() {
         let retained = if left_as_is { "; left as-is" } else { "" };
-        return Ok(format!(
+        return Ok(Ok(format!(
             "workspace {} at {}{retained}",
             context.destination.display(),
             workspace_change(&context.opened, &context.workspace)?,
-        ));
+        )));
     }
-
-    let (base_revision, base_label) = create_workspace(
-        context.entry,
-        &context.upstream_trunk,
-        &context.workspace,
-        &context.destination,
-    )?;
-    Ok(format!(
-        "created missing workspace {} at {} based on {base_revision} ({base_label})",
-        context.destination.display(),
-        workspace_change(&Repo::open(&context.entry.path)?, &context.workspace)?,
-    ))
+    Ok(match create_workspace(context)? {
+        WorkspaceBase::Created { revision, label } => Ok(format!(
+            "created missing workspace {} at {} based on {revision} ({label})",
+            context.destination.display(),
+            workspace_change(&Repo::open(&context.entry.path)?, &context.workspace)?,
+        )),
+        WorkspaceBase::Divergent(tips) => Err(tips),
+    })
 }
 
-fn create_workspace(
-    entry: &RepoEntry,
-    upstream_trunk: &str,
-    workspace: &WorkspaceName,
-    destination: &Path,
-) -> anyhow::Result<(String, String)> {
-    fetch_all(&entry.path)?;
-    // A release names the shared base every member branch forks from; without
-    // one, the fetched upstream trunk starts the first branch. Never use the
-    // current `@`: an agent in a release workspace could otherwise run `jj new`
-    // and silently inherit the release merge as a parent.
-    let opened = Repo::open(&entry.path)?;
+/// Where a new workspace's working copy was put, or why it was not.
+enum WorkspaceBase {
+    Created {
+        revision: String,
+        label: String,
+    },
+    /// The branch's local bookmark names several commits, so there is no one tip
+    /// to continue from.
+    Divergent(Vec<CommitId>),
+}
+
+/// The refusal for a divergent branch: which tips, and how to pick one. Nothing
+/// was claimed, so a plain `start` afterwards is the way back.
+fn divergent_refusal_line(branch: &BranchName, tips: &[CommitId]) -> String {
+    let listed: Vec<&str> = tips.iter().map(CommitId::short).collect();
+    format!(
+        "{branch} is divergent ({} tips: {}); `jj bookmark set {branch} -r <commit> \
+         --allow-backwards` on the one to continue, then start again",
+        tips.len(),
+        listed.join(", ")
+    )
+}
+
+/// Create the branch's workspace with its working copy on the right commit.
+///
+/// A branch that already exists — locally, or on one of our remotes, which the
+/// fetch just brought in — is continued from its tip: the working copy is an
+/// empty child of it, so the agent's next commit is the branch's next commit.
+/// Basing an existing branch on the shared base put the agent one `jj new
+/// <branch>` away from the work they claimed, with nothing saying so.
+///
+/// A new branch starts from the release's shared base, the point every member
+/// forks from; without a release, the fetched upstream trunk. Never the current
+/// `@`: an agent in a release workspace could otherwise run `jj new` and
+/// silently inherit the release merge as a parent.
+fn create_workspace(context: &StartContext<'_>) -> anyhow::Result<WorkspaceBase> {
+    fetch_all(&context.entry.path)?;
+    let opened = Repo::open(&context.entry.path)?;
     let tips = opened.bookmark_tips()?;
-    let scheme = entry.release_scheme();
-    let base = match newest_release(&tips, &scheme, entry.publish_remote()) {
-        Some((_, release)) => {
-            let trunk_tip = opened.resolve_commit(upstream_trunk)?;
-            shared_base(&opened, &release, &trunk_tip)?
+    let ours = [
+        RemoteName::new(Role::Origin.to_string()),
+        RemoteName::new(context.entry.publish_remote()),
+    ];
+    let (revision, label) = match branch_tip(&opened, &tips, context.branch, &ours)? {
+        BranchTip::Local(tip) => (tip.as_str().to_owned(), format!("{}'s tip", context.branch)),
+        BranchTip::Remote(remote, tip) => (
+            tip.as_str().to_owned(),
+            format!("{}'s tip at {remote}", context.branch),
+        ),
+        BranchTip::Divergent(targets) => return Ok(WorkspaceBase::Divergent(targets)),
+        BranchTip::Unknown => {
+            let upstream_trunk = context.upstream_trunk.as_str();
+            let scheme = context.entry.release_scheme();
+            let base = match newest_release(&tips, &scheme, context.entry.publish_remote()) {
+                Some((_, release)) => {
+                    let trunk_tip = opened.resolve_commit(upstream_trunk)?;
+                    shared_base(&opened, &release, &trunk_tip)?
+                }
+                None => None,
+            };
+            base.map_or_else(
+                || {
+                    (
+                        upstream_trunk.to_owned(),
+                        "the fetched upstream trunk".to_owned(),
+                    )
+                },
+                |commit| {
+                    (
+                        commit.as_str().to_owned(),
+                        "the release's shared base".to_owned(),
+                    )
+                },
+            )
         }
-        None => None,
     };
-    let (base_revision, base_label) = base.map_or_else(
-        || {
-            (
-                upstream_trunk.to_owned(),
-                "the fetched upstream trunk".to_owned(),
-            )
-        },
-        |commit| {
-            (
-                commit.as_str().to_owned(),
-                "the release's shared base".to_owned(),
-            )
-        },
-    );
-    add_workspace(&entry.path, workspace.as_str(), destination, &base_revision)?;
-    Ok((base_revision, base_label))
+    add_workspace(
+        &context.entry.path,
+        context.workspace.as_str(),
+        &context.destination,
+        &revision,
+    )?;
+    Ok(WorkspaceBase::Created { revision, label })
+}
+
+/// Where a branch that may already exist has its tip.
+enum BranchTip {
+    Local(CommitId),
+    /// Not tracked locally; pushed by someone else to one of our remotes.
+    Remote(RemoteName, CommitId),
+    /// The local bookmark names several commits.
+    Divergent(Vec<CommitId>),
+    /// Nothing of ours names it: a new branch.
+    Unknown,
+}
+
+/// `ours` are the remotes a branch can already exist on and be continued from,
+/// in preference order. Upstream is somebody else's repository: a name that
+/// exists only there is one of their branches, and a fork branch that happens
+/// to share the name is new here — started on the shared base, never on
+/// upstream's tip, which sits on a newer trunk than the release's.
+fn branch_tip(
+    opened: &Repo,
+    tips: &BookmarkTips,
+    branch: &BranchName,
+    ours: &[RemoteName],
+) -> anyhow::Result<BranchTip> {
+    if let Some(tip) = tips.get(&BookmarkRef::Local(branch.clone())) {
+        return Ok(BranchTip::Local(tip.clone()));
+    }
+    if let Some((_, targets)) = opened
+        .conflicted_bookmarks()?
+        .into_iter()
+        .find(|(reference, _)| matches!(reference, BookmarkRef::Local(named) if named == branch))
+    {
+        return Ok(BranchTip::Divergent(targets));
+    }
+    for remote in ours {
+        if let Some(tip) = tips.get(&BookmarkRef::Remote {
+            branch: branch.clone(),
+            remote: remote.clone(),
+        }) {
+            return Ok(BranchTip::Remote(remote.clone(), tip.clone()));
+        }
+    }
+    Ok(BranchTip::Unknown)
 }
 
 fn workspace_change(repo: &Repo, workspace: &WorkspaceName) -> anyhow::Result<String> {

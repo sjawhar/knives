@@ -19,7 +19,7 @@ use crate::detect::{
     BookmarkTips, Finding, FindingKind, RebaseOutcome, ReleaseParent, Subject, stale_parents,
 };
 use crate::ids::{
-    BookmarkRef, BranchName, CommitId, ReleaseScheme, RepoName, is_our_release,
+    BookmarkRef, BranchName, CommitId, ReleaseScheme, RepoName, is_our_release, is_release_name,
     strict_dated_release,
 };
 use crate::jj::{self, Repo};
@@ -66,14 +66,25 @@ pub enum RepairEffect {
     Unpinned,
 }
 
-pub fn repair_effect(pins: &[Pin]) -> RepairEffect {
+/// What moving or editing `release` would reach, judged by the pins of that
+/// release alone.
+///
+/// A consumer frozen on an older release is not reached by an edit to this
+/// one either way, and must not block it: judged over every pin, a fork whose
+/// consumer sat frozen on one old cut refused to edit any release at all,
+/// including a brand-new unpinned cut. A pin names the branch, so the release's
+/// local and publish-remote views are the same release to it.
+pub fn repair_effect(pins: &[Pin], release: &BranchName) -> RepairEffect {
     // Off-scheme pins consume the fork at a tag or branch of their own choosing;
     // they neither receive an in-place repair nor demand a new dated name.
-    let mut releases = pins.iter().filter(|pin| pin.on_scheme).peekable();
-    if releases.peek().is_none() {
+    let mut of_release = pins
+        .iter()
+        .filter(|pin| pin.on_scheme && pin.reference == release.as_str())
+        .peekable();
+    if of_release.peek().is_none() {
         return RepairEffect::Unpinned;
     }
-    if releases.any(|pin| pin.kind == PinKind::Follows) {
+    if of_release.any(|pin| pin.kind == PinKind::Follows) {
         return RepairEffect::RepairInPlace;
     }
     RepairEffect::NewDatedName
@@ -217,14 +228,53 @@ pub fn shared_base(
     Ok(repo.common_ancestor(&members, trunk_tip)?)
 }
 
+/// What a recut keeps reachable: the commits the orphan gate treats as work.
+///
+/// Every non-release local bookmark tip; every commit a divergent non-release
+/// local bookmark names (it has no single tip, but each target is still
+/// bookmarked work — a member whose bookmark also pointed at its merged pull
+/// request head read as dropped by the cut that carried it); the previous
+/// release's own parents (the cut carries them verbatim by commit id, so they
+/// are kept by construction whatever their bookmarks are doing); and the
+/// upstream trunk, `trunk`.
+pub fn cut_keepers(
+    repo: &Repo,
+    entry: &RepoEntry,
+    tips: &BookmarkTips,
+    previous: &CommitId,
+) -> anyhow::Result<Vec<CommitId>> {
+    let scheme = &entry.release_scheme();
+    let mut keep: Vec<CommitId> = tips
+        .iter()
+        .filter_map(|(reference, commit)| match reference {
+            BookmarkRef::Local(branch) if !is_release_name(branch, scheme) => Some(commit.clone()),
+            BookmarkRef::Local(_) | BookmarkRef::Remote { .. } => None,
+        })
+        .collect();
+    for (reference, commits) in repo.conflicted_bookmarks()? {
+        if let BookmarkRef::Local(branch) = reference
+            && !is_release_name(&branch, scheme)
+        {
+            keep.extend(commits);
+        }
+    }
+    keep.extend(
+        repo.parents_of(previous.as_str())?
+            .into_iter()
+            .map(|parent| parent.commit),
+    );
+    keep.push(repo.resolve_commit(&entry.upstream_trunk())?);
+    Ok(keep)
+}
+
 /// Commits the recut would strand: reachable from the previous release or its
 /// local descendants, and from no keeper.
 ///
-/// Keepers are every non-release local bookmark tip plus the upstream trunk.
-/// The previous cut itself, parked working copies, and commits identified by
-/// our strict dated release bookmarks are excluded as release machinery, not
-/// work. A legacy commit that only *describes* itself like release machinery
-/// is deliberately reported: refusing it is safer than dropping real work.
+/// Keepers are [`cut_keepers`]. The previous cut itself, parked working copies,
+/// and commits identified by our strict dated release bookmarks are excluded as
+/// release machinery, not work. A legacy commit that only *describes* itself
+/// like release machinery is deliberately reported: refusing it is safer than
+/// dropping real work.
 #[derive(Debug, Clone, Copy)]
 pub struct OrphanedCommitInput<'a> {
     pub repo_path: &'a Path,
@@ -336,12 +386,16 @@ pub struct ReapReport {
     /// whose abandon refused lands in `forgotten_only`, never here (oracle
     /// amendment: reaped must not overstate).
     pub reaped: Vec<String>,
-    /// Refs forgotten but the commit abandon refused (still pinned by a ref
-    /// outside the enumeration, e.g. a tag); details in `notes`.
-    pub forgotten_only: Vec<String>,
+    /// Refs forgotten but the commit kept, with why: still pinned by a ref
+    /// outside the enumeration — a tag, an untracked remote bookmark — so jj
+    /// would not abandon it. The expected outcome for a tagged release, not a
+    /// failure: the name is gone and the commit stays reachable by its pin.
+    /// Nothing else lands here; an abandon that failed for another reason is a
+    /// note.
+    pub forgotten_only: Vec<(String, String)>,
     /// (name, reason) pairs that were deliberately left alone.
     pub kept: Vec<(String, String)>,
-    /// Non-fatal notes from abandon refusals.
+    /// Non-fatal notes: an abandon that failed for a reason other than a pin.
     pub notes: Vec<String>,
 }
 
@@ -433,10 +487,14 @@ pub fn reap_superseded(
         let outcome = crate::jj::forget_and_abandon(repo_path, &entries, &operation)?;
         report.reaped = outcome.abandoned;
         for (name, error) in outcome.refused {
-            report
-                .notes
-                .push(format!("{name}: refs forgotten, abandon refused: {error}"));
-            report.forgotten_only.push(name);
+            match error {
+                crate::jj::JjError::Immutable { commit, pin } => report
+                    .forgotten_only
+                    .push((name, format!("{commit} still pinned by {pin}"))),
+                other => report.notes.push(format!(
+                    "{name}: refs forgotten, commit not abandoned: {other}"
+                )),
+            }
         }
     }
     Ok(report)
@@ -965,16 +1023,20 @@ pub fn render(plan: &Plan) -> String {
 
     lines.push("  pinned by:".to_owned());
     lines.push(crate::pins::render(&plan.pins));
-    lines.push(match repair_effect(&plan.pins) {
-        RepairEffect::RepairInPlace => {
-            "  at least one consumer follows the branch: repair in place, no new dated name"
-                .to_owned()
-        }
-        RepairEffect::NewDatedName => {
-            "  every pin is frozen: the next cut needs a new dated suffix".to_owned()
-        }
-        RepairEffect::Unpinned => "  nothing pins this release: either is safe".to_owned(),
-    });
+    lines.push(
+        match repair_effect(&plan.pins, BookmarkRef::parse(release).branch()) {
+            RepairEffect::RepairInPlace => {
+                "  at least one consumer follows the branch: repair in place, no new dated name"
+                    .to_owned()
+            }
+            RepairEffect::NewDatedName => {
+                "  every pin of this release is frozen: editing it reaches nobody; the next cut \
+             needs a new dated suffix"
+                    .to_owned()
+            }
+            RepairEffect::Unpinned => "  nothing pins this release: either is safe".to_owned(),
+        },
+    );
     lines.push(
         "  planning by default. `knives release cut [name]` names a new cut of this \
            composition verbatim; `include`, `drop` and `advance` edit it. Nothing here \
@@ -1169,20 +1231,49 @@ mod tests {
     fn one_following_consumer_means_repair_in_place() {
         // A needless dated name burns the name and forces a re-pin nobody wanted.
         let pins = vec![pin(PinKind::Frozen), pin(PinKind::Follows)];
-        assert_eq!(repair_effect(&pins), RepairEffect::RepairInPlace);
+        assert_eq!(
+            repair_effect(&pins, &BranchName::new("release/2026-07-28")),
+            RepairEffect::RepairInPlace
+        );
     }
 
     #[test]
     fn all_frozen_means_a_new_dated_name() {
         assert_eq!(
-            repair_effect(&[pin(PinKind::Frozen)]),
+            repair_effect(
+                &[pin(PinKind::Frozen)],
+                &BranchName::new("release/2026-07-28")
+            ),
             RepairEffect::NewDatedName
         );
     }
 
     #[test]
     fn nothing_pinning_it_leaves_the_choice_open() {
-        assert_eq!(repair_effect(&[]), RepairEffect::Unpinned);
+        assert_eq!(
+            repair_effect(&[], &BranchName::new("release/2026-07-28")),
+            RepairEffect::Unpinned
+        );
+    }
+
+    #[test]
+    fn a_pin_frozen_on_another_release_does_not_freeze_this_one() {
+        // The consumer sits frozen on an older cut; editing the release in hand
+        // reaches it neither way, so it must not block the edit. Judged over every
+        // pin, a fork with one such consumer could edit no release at all.
+        let pins = [pin(PinKind::Frozen)];
+        assert_eq!(
+            repair_effect(&pins, &BranchName::new("release/2026-08-31")),
+            RepairEffect::Unpinned
+        );
+        assert_eq!(
+            repair_effect(
+                &pins,
+                BookmarkRef::parse("release/2026-07-28@release").branch()
+            ),
+            RepairEffect::NewDatedName,
+            "the publish remote's view of the same release is the same release"
+        );
     }
 
     #[test]
@@ -1192,7 +1283,10 @@ mod tests {
         let mut off_scheme = pin(PinKind::Frozen);
         off_scheme.on_scheme = false;
         off_scheme.reference = "acme-pin-0.4.47.dev7".to_owned();
-        assert_eq!(repair_effect(&[off_scheme]), RepairEffect::Unpinned);
+        assert_eq!(
+            repair_effect(&[off_scheme], &BranchName::new("acme-pin-0.4.47.dev7")),
+            RepairEffect::Unpinned
+        );
     }
 
     #[test]

@@ -850,7 +850,10 @@ fn run_rebase(
             &repo,
             &release_name,
             &scheme,
-            release::repair_effect(&plan.pins),
+            release::repair_effect(
+                &plan.pins,
+                knives::ids::BookmarkRef::parse(&release_name).branch(),
+            ),
         ) {
             worst = worst.worst(exit);
             continue;
@@ -2107,7 +2110,7 @@ fn run_release(
         if let Some(name) = cut_name {
             let trunk_name = entry.upstream_trunk();
             let trunk = opened.resolve_commit(&trunk_name)?;
-            if let Some(orphaned) = check_orphan_commits_before_cut(&opened, &entry, trunk.clone())?
+            if let Some(orphaned) = check_orphan_commits_before_cut(&opened, &entry)?
                 && let Some(exit) = report_orphaned_cut(&repo, &orphaned, allow_drop)
             {
                 return Ok(exit);
@@ -2571,25 +2574,12 @@ fn report_orphaned_cut(
 fn check_orphan_commits_before_cut(
     opened: &knives::jj::Repo,
     entry: &knives::config::RepoEntry,
-    trunk: knives::ids::CommitId,
 ) -> anyhow::Result<Option<OrphanedLineage>> {
-    let scheme = entry.release_scheme();
     let tips = opened.bookmark_tips()?;
     let Some(previous) = previous_release_for_cut(entry, &tips) else {
         return Ok(None);
     };
-    let mut keep: Vec<knives::ids::CommitId> = tips
-        .iter()
-        .filter_map(|(reference, commit)| match reference {
-            knives::ids::BookmarkRef::Local(branch)
-                if !knives::ids::is_release_name(branch, &scheme) =>
-            {
-                Some(commit.clone())
-            }
-            _ => None,
-        })
-        .collect();
-    keep.push(trunk);
+    let keep = release::cut_keepers(opened, entry, &tips, &previous.1)?;
     let orphans = release::orphaned_commits(release::OrphanedCommitInput {
         repo_path: &entry.path,
         previous: &previous.1,
@@ -2686,10 +2676,12 @@ fn run_reap(name: &str) -> anyhow::Result<Exit> {
     Ok(worst)
 }
 
-/// Return a finding when reaping leaves work or reports an incomplete cleanup.
-///
-/// `reap_superseded` records every `forgotten_only` entry with a corresponding
-/// note, so `notes` covers that state without a redundant condition here.
+/// Return a finding when reaping leaves work behind — a cut with descendants
+/// is someone's stacked work — or could not finish. A commit kept because a
+/// tag or someone else's bookmark still pins it is neither: every ref knives
+/// owns is gone and the commit stays on purpose, so there is nothing to act on,
+/// and a cut whose reap met one must not exit non-zero for as long as the tag
+/// exists.
 const fn reap_exit(report: &knives::commands::release::ReapReport) -> Exit {
     if report.kept.is_empty() && report.notes.is_empty() {
         Exit::Ok
@@ -2707,8 +2699,8 @@ fn print_reap(repo: &str, report: &knives::commands::release::ReapReport) {
             "{repo}: reaped {name} (refs forgotten everywhere, commit abandoned; remote untouched)"
         );
     }
-    for name in &report.forgotten_only {
-        println!("{repo}: {name}: refs forgotten; commit abandon refused (see note)");
+    for (name, why) in &report.forgotten_only {
+        println!("{repo}: reaped {name} (refs forgotten everywhere; commit kept, {why})");
     }
     for (name, reason) in &report.kept {
         println!("{repo}: kept {name}: {reason}");

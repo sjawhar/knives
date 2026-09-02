@@ -33,8 +33,8 @@ use knives::jj::{
 };
 use knives::store::{OwnerKind, Store};
 use lab::{
-    Lab, ReleaseOutput, commit_at, knives_release, lab_entry, operation_ids, release_command,
-    release_parents, release_test_home,
+    Lab, ReleaseOutput, commit_at, knives_release, knives_start, lab_entry, operation_ids,
+    release_command, release_parents, release_test_home, release_test_home_pinned,
 };
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -1061,7 +1061,7 @@ fn release_reap_returns_findings_when_a_superseded_cut_is_kept() {
 }
 
 #[test]
-fn release_reap_returns_findings_when_an_untracked_remote_pin_refuses_abandon() {
+fn release_reap_keeps_a_commit_an_untracked_remote_pin_holds_and_exits_clean() {
     // Given: an untracked remote pin still holds a superseded dated cut immutable.
     let lab = Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
@@ -1117,15 +1117,22 @@ fn release_reap_returns_findings_when_an_untracked_remote_pin_refuses_abandon() 
     // When: standalone reap attempts to remove the superseded cut.
     let output = knives_release(&lab, &home, &["reap"]);
 
-    // Then: the abandon refusal is printed and exits with Findings (1).
+    // Then: the kept commit is reported as what happened - refs gone, commit
+    // still pinned - on one line that does not read as an error, and the run
+    // exits clean: nothing is left to act on, and a cut's exit is its reap's.
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("demo: ! release/2026-08-04: refs forgotten, abandon refused:"),
+        stdout
+            .contains("demo: reaped release/2026-08-04 (refs forgotten everywhere; commit kept, ")
+            && stdout.contains("still pinned by"),
         "{stdout}"
     );
-    assert_eq!(
-        output.status.code(),
-        Some(1),
+    assert!(
+        !stdout.contains("refused") && !stdout.contains("immutable"),
+        "a pinned commit is not an error: {stdout}"
+    );
+    assert!(
+        output.status.success(),
         "stdout: {stdout}\nstderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
@@ -1297,13 +1304,14 @@ fn an_untracked_remote_pin_makes_abandon_refuse_and_lands_in_forgotten_only() {
     let report =
         knives::commands::release::reap_superseded(&lab.work, &repo, "origin").expect("reap");
 
-    // Then: refs are forgotten, abandon refuses, and reaped does not overstate.
+    // Then: refs are forgotten, the commit is kept with its pin named, reaped
+    // does not overstate, and a pinned commit is not a note-worthy failure.
     assert!(report.reaped.is_empty(), "{report:?}");
-    assert_eq!(report.forgotten_only, vec!["release/2026-08-04".to_owned()]);
-    assert!(
-        report.notes.iter().any(|note| note.contains("immutable")),
-        "{report:?}"
-    );
+    assert_eq!(report.forgotten_only.len(), 1, "{report:?}");
+    let (name, why) = &report.forgotten_only[0];
+    assert_eq!(name, "release/2026-08-04");
+    assert!(why.contains("still pinned by"), "{report:?}");
+    assert!(report.notes.is_empty(), "{report:?}");
 }
 
 #[test]
@@ -1373,13 +1381,14 @@ fn a_refused_first_name_does_not_stop_reaping_later_names() {
     let report =
         knives::commands::release::reap_superseded(&lab.work, &repo, "origin").expect("reap");
 
-    // Then: the pinned first name refuses without stopping the second.
-    assert_eq!(report.forgotten_only, vec!["release/2026-08-04".to_owned()]);
-    assert_eq!(report.reaped, vec!["release/2026-08-05".to_owned()]);
+    // Then: the pinned first name is kept without stopping the second.
+    assert_eq!(report.forgotten_only.len(), 1, "{report:?}");
+    assert_eq!(report.forgotten_only[0].0, "release/2026-08-04");
     assert!(
-        report.notes.iter().any(|note| note.contains("immutable")),
+        report.forgotten_only[0].1.contains("still pinned by"),
         "{report:?}"
     );
+    assert_eq!(report.reaped, vec!["release/2026-08-05".to_owned()]);
 }
 
 #[test]
@@ -3070,20 +3079,7 @@ fn start_bases_a_new_branch_on_the_shared_base_not_the_advanced_upstream() {
     let (home, _consumer) = release_test_home(&lab);
 
     // When: a branch is started through the binary.
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_knives"))
-        .args([
-            "--text",
-            "start",
-            "feat/gamma",
-            "--repo",
-            "demo",
-            "--why",
-            "test",
-        ])
-        .current_dir(&lab.work)
-        .env("KNIVES_CONFIG_HOME", home.path())
-        .output()
-        .expect("run start");
+    let output = knives_start(&lab, &home, "feat/gamma");
     assert!(
         output.status.success(),
         "start failed: {}",
@@ -3112,20 +3108,7 @@ fn start_without_a_release_uses_the_fetched_upstream_trunk() {
     let (home, _consumer) = release_test_home(&lab);
 
     // When: the binary starts a branch without a release base to select.
-    let output = Command::new(env!("CARGO_BIN_EXE_knives"))
-        .args([
-            "--text",
-            "start",
-            "feat/no-release",
-            "--repo",
-            "demo",
-            "--why",
-            "test",
-        ])
-        .current_dir(&lab.work)
-        .env("KNIVES_CONFIG_HOME", home.path())
-        .output()
-        .expect("run start");
+    let output = knives_start(&lab, &home, "feat/no-release");
     assert!(
         output.status.success(),
         "start failed: {}",
@@ -3495,20 +3478,7 @@ fn start_bases_a_new_branch_on_a_flat_releases_fork_point() {
     let (home, _consumer) = release_test_home(&lab);
 
     // When: a branch is started through the binary.
-    let output = Command::new(env!("CARGO_BIN_EXE_knives"))
-        .args([
-            "--text",
-            "start",
-            "feat/gamma",
-            "--repo",
-            "demo",
-            "--why",
-            "test",
-        ])
-        .current_dir(&lab.work)
-        .env("KNIVES_CONFIG_HOME", home.path())
-        .output()
-        .expect("run start");
+    let output = knives_start(&lab, &home, "feat/gamma");
     assert!(
         output.status.success(),
         "start failed: {}",
@@ -5411,21 +5381,11 @@ fn release_rebase_refuses_when_every_pin_is_frozen() {
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     lab.branch("feat/beta", "beta.txt", "beta\n");
     lab.octopus(release, "feat/alpha", "feat/beta");
-    let consumer = lab.consumer_with_pin_history(
-        "pyproject.toml",
-        "work = { git = \"https://forge.invalid/acme/work.git\", rev = \"release/2026-08-03\" }\n",
-        "work = { git = \"https://forge.invalid/acme/work.git\", rev = \"release/2026-08-04\" }\n",
+    let (home, _consumer) = release_test_home_pinned(
+        &lab,
+        "rev = \"release/2026-08-03\"",
+        "rev = \"release/2026-08-04\"",
     );
-    let home = tempfile::tempdir().expect("create config home");
-    std::fs::write(
-        home.path().join("repos.toml"),
-        format!(
-            "[repos.demo]\npath = \"{}\"\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/work.git\"\n",
-            lab.work.display(),
-            lab.upstream.display(),
-        ),
-    )
-    .expect("write registry");
     lab.advance_upstream("upstream advance\n");
     let before = Repo::open(&lab.work)
         .expect("open")
@@ -5433,16 +5393,7 @@ fn release_rebase_refuses_when_every_pin_is_frozen() {
         .expect("resolve release before refusal");
 
     // When: the real binary is asked to rebase the release onto upstream.
-    let output = knives_release(
-        &lab,
-        &home,
-        &[
-            "--consumer",
-            consumer.to_str().expect("utf-8 consumer path"),
-            "rebase",
-            "main@upstream",
-        ],
-    );
+    let output = knives_release(&lab, &home, &["rebase", "main@upstream"]);
 
     // Then: it directs the caller to a dated cut, exits incomplete, and does not move it.
     assert_eq!(
@@ -7883,33 +7834,14 @@ fn an_edit_refuses_when_every_pin_of_the_release_is_frozen() {
     lab.branch("feat/beta", "beta.txt", "beta\n");
     lab.octopus(release, "feat/alpha", "feat/beta");
     lab.branch("feat/gamma", "gamma.txt", "gamma\n");
-    let consumer = lab.consumer_with_pin_history(
-        "pyproject.toml",
-        "work = { git = \"https://forge.invalid/acme/work.git\", rev = \"release/2026-08-03\" }\n",
-        "work = { git = \"https://forge.invalid/acme/work.git\", rev = \"release/2026-08-04\" }\n",
+    let (home, _consumer) = release_test_home_pinned(
+        &lab,
+        "rev = \"release/2026-08-03\"",
+        "rev = \"release/2026-08-04\"",
     );
-    let home = tempfile::tempdir().expect("create config home");
-    std::fs::write(
-        home.path().join("repos.toml"),
-        format!(
-            "[repos.demo]\npath = \"{}\"\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/work.git\"\n",
-            lab.work.display(),
-            lab.upstream.display(),
-        ),
-    )
-    .expect("write frozen-pin registry");
     let before = release_parents(&lab, release);
 
-    let output = knives_release(
-        &lab,
-        &home,
-        &[
-            "--consumer",
-            consumer.to_str().expect("utf-8 consumer path"),
-            "include",
-            "feat/gamma",
-        ],
-    );
+    let output = knives_release(&lab, &home, &["include", "feat/gamma"]);
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_eq!(output.status.code(), Some(3), "{stdout}");
@@ -7921,6 +7853,268 @@ fn an_edit_refuses_when_every_pin_of_the_release_is_frozen() {
         release_parents(&lab, release),
         before,
         "a release no pin follows was edited in place"
+    );
+}
+
+#[test]
+fn a_pin_frozen_on_an_older_release_does_not_refuse_editing_the_release_in_hand() {
+    // Given: the consumer sits frozen on release/2026-08-03 - the pin is the
+    // older cut's, not the release in hand's. Editing release/2026-08-04 reaches
+    // that consumer neither way, so it must not block the edit: judged over every
+    // pin, one frozen consumer made every include, drop and advance refuse - on
+    // the pushed release and on a brand-new unpinned cut alike.
+    let lab = Lab::new();
+    let release = "release/2026-08-04";
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    lab.octopus(release, "feat/alpha", "feat/beta");
+    lab.branch("feat/gamma", "gamma.txt", "gamma\n");
+    let (home, _consumer) = release_test_home_pinned(
+        &lab,
+        "rev = \"release/2026-08-02\"",
+        "rev = \"release/2026-08-03\"",
+    );
+    let before = release_parents(&lab, release).len();
+
+    let output = knives_release(&lab, &home, &["include", "feat/gamma"]);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "an edit was refused for a pin of another release: {stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(stdout.contains("included feat/gamma"), "{stdout}");
+    assert_eq!(release_parents(&lab, release).len(), before + 1);
+}
+
+#[test]
+fn a_verbatim_cut_carries_a_member_whose_bookmark_is_divergent() {
+    // Given: alpha pushed, rewritten locally and released at that rewrite, then
+    // rewritten differently in another clone and pushed from there. The fetch
+    // leaves alpha's bookmark divergent: one target the released copy, one the
+    // pushed head - the state a member is left in when its pull request head
+    // and its release copy both claim the name. The cut carries the previous
+    // release's parents verbatim, so the released copy is kept by construction;
+    // resolving members through their bookmarks read it as dropped.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "feature.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    lab.push_branch("feat/alpha");
+    lab.jj_at(&lab.second, ["git", "fetch", "--remote", "origin"]);
+    lab.jj_at(&lab.second, ["bookmark", "track", "feat/alpha@origin"]);
+    lab.rewrite_local_branch("feat/alpha", "released rewrite\n");
+    let (home, _consumer) = home_after_first_cut(&lab);
+    let released_alpha = commit_at(&lab, "feat/alpha");
+    lab.jj_at(&lab.second, ["edit", "--ignore-immutable", "feat/alpha"]);
+    std::fs::write(lab.second.join("feature.txt"), "pull request rewrite\n")
+        .expect("rewrite in the second clone");
+    lab.jj_at(&lab.second, ["bookmark", "set", "feat/alpha", "-r", "@"]);
+    lab.jj_at(&lab.second, ["new"]);
+    lab.jj_at(
+        &lab.second,
+        [
+            "git",
+            "push",
+            "--remote",
+            "origin",
+            "--bookmark",
+            "feat/alpha",
+        ],
+    );
+    lab.fetch_work();
+    let repo = Repo::open(&lab.work).expect("open");
+    assert!(
+        repo.conflicted_bookmarks()
+            .expect("conflicted bookmarks")
+            .iter()
+            .any(
+                |(reference, targets)| reference.branch().as_str() == "feat/alpha"
+                    && targets.contains(&released_alpha)
+            ),
+        "feat/alpha must be divergent with the released copy as one target, or this test \
+         proves nothing"
+    );
+
+    let output = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("cut release/2026-08-05 as"),
+        "a verbatim cut refused over a divergent member bookmark: {stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        release_parents(&lab, "release/2026-08-05").contains(&released_alpha),
+        "the released copy was not carried"
+    );
+}
+
+#[test]
+fn start_on_an_existing_branch_continues_from_its_tip() {
+    // Given: a release, an upstream advance, and a branch with work on it. An
+    // agent claiming that branch wants its workspace on the work, not one
+    // `jj new <branch>` away from it on the shared base.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    lab.octopus("release/2026-08-04", "feat/alpha", "feat/beta");
+    lab.advance_upstream("upstream advance\n");
+    let (home, _consumer) = release_test_home(&lab);
+    let tip = commit_at(&lab, "feat/alpha");
+
+    let output = knives_start(&lab, &home, "feat/alpha");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "start failed: {stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let workspace = lab.work.parent().expect("parent").join("feat-alpha");
+    let parent = lab.revision(&workspace, "@-", "commit_id");
+    assert_eq!(
+        parent,
+        tip.as_str(),
+        "the workspace must sit on the branch tip"
+    );
+    assert!(stdout.contains("(feat/alpha's tip)"), "{stdout}");
+}
+
+#[test]
+fn start_on_a_name_that_exists_only_upstream_starts_a_new_branch_on_the_shared_base() {
+    // Given: a release whose members fork from today's trunk; upstream advances
+    // and grows a branch of its own. An agent starting a fork branch of the same
+    // name is starting a new branch here: upstream is somebody else's repository,
+    // and basing on its tip would drag the newer trunk into the next cut through
+    // one member - the thing `start` exists not to do.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    lab.octopus("release/2026-08-04", "feat/alpha", "feat/beta");
+    let shared_base = commit_at(&lab, "main@origin");
+    lab.advance_upstream("upstream advance\n");
+    lab.upstream_branch(
+        "feature/dataframe",
+        "theirs.txt",
+        "somebody's upstream branch\n",
+    );
+    let (home, _consumer) = release_test_home(&lab);
+    let theirs = commit_at(&lab, "feature/dataframe@upstream");
+
+    let output = knives_start(&lab, &home, "feature/dataframe");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "start failed: {stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let workspace = lab.work.parent().expect("parent").join("feature-dataframe");
+    let parent = lab.revision(&workspace, "@-", "commit_id");
+    assert_eq!(
+        parent,
+        shared_base.as_str(),
+        "a name upstream happens to use must start on the shared base, not upstream's tip {}",
+        theirs.short()
+    );
+    assert!(stdout.contains("(the release's shared base)"), "{stdout}");
+}
+
+#[test]
+fn a_forced_start_on_a_divergent_branch_refuses_before_seizing_the_claim() {
+    // Given: another owner's claim on a branch whose bookmark is divergent.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "feature.txt", "alpha\n");
+    let (home, _consumer) = release_test_home(&lab);
+    {
+        let mut store = Store::open_for_update(home.path().join("state.json")).expect("open store");
+        let held = knives::commands::claim::Identity {
+            owner: "other-agent".to_owned(),
+            kind: OwnerKind::OsUser,
+        };
+        let _ = store.claim(
+            &knives::ids::BranchTarget::new(
+                knives::ids::RepoName::new("demo"),
+                BranchName::new("feat/alpha"),
+            ),
+            &held,
+            "theirs",
+        );
+        store.save().expect("save claim");
+    }
+    lab.rewrite_in_both_clones("feat/alpha");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_knives"))
+        .args([
+            "--text",
+            "start",
+            "feat/alpha",
+            "--repo",
+            "demo",
+            "--force",
+            "--why",
+            "seize",
+        ])
+        .current_dir(&lab.work)
+        .env("KNIVES_CONFIG_HOME", home.path())
+        .output()
+        .expect("run forced start");
+
+    // Then: refused with the tips named, nothing seized, no workspace made -
+    // a seized claim with no workspace would leave the branch held and the
+    // agent one more `--force` from the work.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("feat/alpha is divergent (2 tips:"),
+        "{stderr}"
+    );
+    let store = Store::open(home.path().join("state.json")).expect("reopen store");
+    let claim = store
+        .claims(Some(&knives::ids::RepoName::new("demo")))
+        .into_iter()
+        .find(|claim| claim.branch == "feat/alpha")
+        .expect("the claim is still held");
+    assert_eq!(
+        claim.owner, "other-agent",
+        "the claim was seized: {claim:?}"
+    );
+    assert!(
+        !lab.work
+            .parent()
+            .expect("parent")
+            .join("feat-alpha")
+            .exists(),
+        "no workspace may be created for a branch with no one tip"
+    );
+}
+
+#[test]
+fn start_on_a_divergent_branch_refuses_and_names_the_tips() {
+    // A bookmark with two tips has no one commit to continue from; the agent
+    // picks, then starts again.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "feature.txt", "alpha\n");
+    let (home, _consumer) = release_test_home(&lab);
+    lab.rewrite_in_both_clones("feat/alpha");
+
+    let output = knives_start(&lab, &home, "feat/alpha");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("feat/alpha is divergent (2 tips:")
+            && stderr.contains("jj bookmark set feat/alpha"),
+        "{stderr}"
+    );
+    assert!(
+        !lab.work
+            .parent()
+            .expect("parent")
+            .join("feat-alpha")
+            .exists(),
+        "no workspace may be created for a branch with no one tip"
     );
 }
 

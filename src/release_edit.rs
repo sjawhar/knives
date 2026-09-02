@@ -225,7 +225,11 @@ fn edit_release(
     // Follows from who pins it, exactly as for a rebase: a consumer that follows
     // the branch sees the edit, one frozen on a revision does not. The way out
     // differs by scheme, because a fixed branch cannot take a dated name.
-    if release::repair_effect(&plan.pins) == release::RepairEffect::NewDatedName {
+    if release::repair_effect(
+        &plan.pins,
+        knives::ids::BookmarkRef::parse(&release_name).branch(),
+    ) == release::RepairEffect::NewDatedName
+    {
         match entry.release_scheme() {
             ReleaseScheme::Dated => println!(
                 "{repo}: every pin of {release_name} is frozen, so editing it would reach \
@@ -408,12 +412,12 @@ pub(crate) fn release_is_locally_movable(
     if bookmark_tip(opened, name)?.is_some() {
         return Ok(true);
     }
-    match name.split_once('@') {
-        Some((branch, remote)) => println!(
+    match knives::ids::BookmarkRef::parse(name) {
+        knives::ids::BookmarkRef::Remote { branch, remote } => println!(
             "{repo}: {name} is here only as a remote ref, so there is no local bookmark to \
              move; `jj bookmark track {branch}@{remote}` first"
         ),
-        None => println!(
+        knives::ids::BookmarkRef::Local(_) => println!(
             "{repo}: {name} has no single local position, so there is nothing to move; \
              resolve its divergence first"
         ),
