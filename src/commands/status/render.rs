@@ -30,6 +30,10 @@ fn push_cell(row: &BranchRow) -> String {
     }
 }
 
+/// `#61 (activity 3h)`: the number, anything unusual about it, and how long ago
+/// it last moved. A comment-only review or a maintainer's question leaves the
+/// review decision empty, so without the age a row can read unchanged for days
+/// while the conversation on it moved on.
 fn pull_cell(row: &BranchRow) -> String {
     let Some(pull) = &row.pr else {
         return "-".to_owned();
@@ -43,6 +47,14 @@ fn pull_cell(row: &BranchRow) -> String {
     }
     if pull.stated == Some(true) {
         details.push("(stated)".to_owned());
+    }
+    if pull.state == "open"
+        && let Some(age) = pull
+            .activity_at
+            .as_deref()
+            .and_then(|at| crate::ledger::age(at, jiff::Timestamp::now()))
+    {
+        details.push(format!("(activity {age})"));
     }
     details.extend(
         pull.prior
@@ -91,6 +103,9 @@ fn seen_cell(row: &BranchRow) -> String {
 /// How much of a notch's text a branch line carries.
 const NOTCH_TEXT: usize = 32;
 
+/// `"text…" (3d @1a2b3c4d5e6f)`: the entry, its age, and the tip it was written
+/// against. The anchor is what lets a reader tell a note that still describes
+/// this branch from one that described an earlier tip.
 fn notch_summary(notch: &LastNotch) -> String {
     let mut text = notch.text.clone();
     if let Some(disposition) = &notch.disposition {
@@ -101,9 +116,13 @@ fn notch_summary(notch: &LastNotch) -> String {
     if escaped.chars().count() > NOTCH_TEXT {
         shown.push('…');
     }
+    let anchor = notch
+        .anchor
+        .as_deref()
+        .map_or_else(String::new, |anchor| format!(" @{anchor}"));
     let summary = crate::ledger::age(&notch.ts, jiff::Timestamp::now()).map_or_else(
-        || format!("\"{shown}\""),
-        |age| format!("\"{shown}\" ({age})"),
+        || format!("\"{shown}\"{anchor}"),
+        |age| format!("\"{shown}\" ({age}{anchor})"),
     );
     if notch.count > 1 {
         format!("{summary}+{}", notch.count - 1)
@@ -174,6 +193,9 @@ fn branch_table(rows: &[BranchRow]) -> Vec<String> {
     lines
 }
 
+/// How many subjects the one-line-per-kind view names before `and N more`.
+const SUBJECTS_PER_LINE: usize = 8;
+
 fn finding_lines(groups: &[FindingGroup], verbose: bool) -> Vec<String> {
     if verbose {
         return groups
@@ -182,7 +204,20 @@ fn finding_lines(groups: &[FindingGroup], verbose: bool) -> Vec<String> {
                 group
                     .subjects
                     .iter()
-                    .map(|subject| format!("    {}  {subject}", group.kind))
+                    .zip(
+                        group
+                            .details
+                            .iter()
+                            .map(String::as_str)
+                            .chain(std::iter::repeat("")),
+                    )
+                    .map(|(subject, detail)| {
+                        if detail.is_empty() {
+                            format!("    {}  {subject}", group.kind)
+                        } else {
+                            format!("    {}  {subject}: {detail}", group.kind)
+                        }
+                    })
             })
             .collect();
     }
@@ -194,8 +229,14 @@ fn finding_lines(groups: &[FindingGroup], verbose: bool) -> Vec<String> {
     groups
         .iter()
         .map(|group| {
-            let mut subjects = group.subjects.join(", ");
-            let hidden = group.count.saturating_sub(group.subjects.len());
+            let shown: Vec<&str> = group
+                .subjects
+                .iter()
+                .take(SUBJECTS_PER_LINE)
+                .map(String::as_str)
+                .collect();
+            let mut subjects = shown.join(", ");
+            let hidden = group.count.saturating_sub(shown.len());
             if hidden > 0 {
                 subjects = format!("{subjects}, and {hidden} more");
             }
@@ -238,9 +279,13 @@ pub fn render(report: &Report, verbose: bool) -> String {
     if let Some(notches) = &report.repo_notches {
         lines.push(repo_notch_line(notches));
     }
+    // Workspaces named for a branch row sit in that row's `workspace` cell;
+    // this line is only what is left, which is why it never matches the length
+    // of `jj workspace list`.
     if !report.other_workspaces.is_empty() {
         lines.push(format!(
-            "  workspaces  {}",
+            "  workspaces  {} not named for a branch above: {}",
+            report.other_workspaces.len(),
             report.other_workspaces.join(", ")
         ));
     }
@@ -346,6 +391,10 @@ mod tests {
                 kind: FindingKind::ChecksFailing,
                 count: 3,
                 subjects: vec!["#11".to_owned(), "#12".to_owned()],
+                details: vec![
+                    "#11 has failing checks: build".to_owned(),
+                    "#12 has failing checks: lint".to_owned(),
+                ],
             }],
             ..Report::default()
         };
@@ -446,6 +495,7 @@ mod tests {
             state: "open".to_owned(),
             draft: false,
             stated: None,
+            activity_at: None,
             prior: Vec::new(),
         });
         full.review = Some("approved".to_owned());
@@ -467,13 +517,14 @@ mod tests {
             kind: crate::ledger::Kind::Note,
             text: "superseded by #1157".to_owned(),
             disposition: None,
+            anchor: Some("1a2b3c4d5e6f".to_owned()),
             count: 2,
         });
 
         let rendered = render(&report_with(row), false);
 
         assert!(
-            rendered.contains("\"superseded by #1157\" (now)+1"),
+            rendered.contains("\"superseded by #1157\" (now @1a2b3c4d5e6f)+1"),
             "was: {rendered}"
         );
     }
@@ -487,6 +538,10 @@ mod tests {
                 kind: FindingKind::ChecksFailing,
                 count: 2,
                 subjects: vec!["#1".to_owned(), "#2".to_owned()],
+                details: vec![
+                    "#1 has failing checks".to_owned(),
+                    "#2 has failing checks".to_owned(),
+                ],
             }],
             ..Report::default()
         };

@@ -374,19 +374,26 @@ fn branch_states_with_findings(
             BookmarkRef::Local(_) | BookmarkRef::Remote { .. } => None,
         }
     }));
+    // The finding a pull request gate needs: a branch whose history past the
+    // trunk carries a merge — a release cut, usually — submits everything that
+    // merge carried, and the maintainer will ask why. Which trunk point a branch
+    // forks from is not a finding: branches follow the upstream trunk, and the
+    // release follows them.
     let mut findings = Vec::new();
-    if let (Some((_, release)), Ok(trunk_tip)) = (
-        crate::release_model::newest_release(&tips, &scheme, entry.publish_remote()),
-        repo.resolve_commit(&entry.upstream_trunk()),
-    ) && let Some(base) = crate::commands::release::shared_base(&repo, &release, &trunk_tip)?
-    {
-        let members = crate::release_model::carried_from_tips(&tips, entry.trunk(), &scheme);
-        findings.extend(crate::commands::release::mixed_base_findings(
-            &entry.path,
-            &members,
-            &base,
-            &trunk_tip,
-        )?);
+    if let Ok(trunk_tip) = repo.resolve_commit(&entry.upstream_trunk()) {
+        let releases =
+            crate::release_model::release_refs_by_commit(&tips, &scheme, entry.publish_remote());
+        let context = crate::release_model::StackedHistoryContext {
+            repo: &repo,
+            trunk: &trunk_tip,
+            releases: &releases,
+        };
+        for (branch, tip) in crate::release_model::carried_from_tips(&tips, entry.trunk(), &scheme)
+        {
+            findings.extend(crate::release_model::stacked_history(
+                context, &branch, &tip,
+            )?);
+        }
     }
     Ok((states, findings))
 }

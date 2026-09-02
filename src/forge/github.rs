@@ -447,8 +447,14 @@ pub const fn sweep_query() -> &'static str {
 /// Full I2 fact row per aliased number.
 ///
 /// It has every summary field plus merge state, review timeline, check rollup,
-/// and the newest comment (`sync`). Alias names are not load-bearing; the
-/// parser keys on the repeated `number`.
+/// check suites, and the newest comment (`sync`). Alias names are not
+/// load-bearing; the parser keys on the repeated `number`.
+///
+/// Check suites are asked for beside the rollup because the rollup omits a
+/// workflow the forge never started: a fork pull request awaiting a
+/// maintainer's approval has one suite per gated workflow with conclusion
+/// `ACTION_REQUIRED` and zero check runs, and nothing in `statusCheckRollup`
+/// says so: such a pull request rolls up as its one unconditional check, green.
 pub fn pull_facts_query(numbers: &[u64]) -> String {
     let fields: String = numbers
         .iter()
@@ -467,7 +473,10 @@ pub fn pull_facts_query(numbers: &[u64]) -> String {
          parents(first: 2) {{ pageInfo {{ hasNextPage }} nodes {{ tree {{ oid }} }} }} \
          statusCheckRollup {{ contexts(first: 100) {{ pageInfo {{ hasNextPage }} nodes {{ __typename \
          ... on CheckRun {{ name conclusion }} \
-         ... on StatusContext {{ context state }} }} }} }} }} }} }} \
+         ... on StatusContext {{ context state }} }} }} }} \
+         checkSuites(first: 100) {{ pageInfo {{ hasNextPage }} nodes {{ conclusion \
+         checkRuns(first: 1) {{ totalCount }} app {{ name }} \
+         workflowRun {{ workflow {{ name }} }} }} }} }} }} }} \
          comments(last: 1) {{ nodes {{ createdAt }} }} }}"
     )
 }
@@ -527,6 +536,70 @@ struct RollupHolder {
     parents: Option<Nodes<ParentNode>>,
     #[serde(default, rename = "statusCheckRollup")]
     rollup: Option<Contexts>,
+    #[serde(default, rename = "checkSuites")]
+    check_suites: Option<Nodes<CheckSuiteNode>>,
+}
+
+/// One check suite on the tip commit: a workflow the forge started, or refused to.
+#[derive(Deserialize)]
+struct CheckSuiteNode {
+    #[serde(default)]
+    conclusion: Option<String>,
+    #[serde(default, rename = "checkRuns")]
+    check_runs: Option<TotalCount>,
+    #[serde(default)]
+    app: Option<Named>,
+    #[serde(default, rename = "workflowRun")]
+    workflow_run: Option<WorkflowRun>,
+}
+
+#[derive(Deserialize)]
+struct TotalCount {
+    #[serde(default, rename = "totalCount")]
+    total_count: u64,
+}
+
+#[derive(Deserialize)]
+struct Named {
+    #[serde(default)]
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct WorkflowRun {
+    #[serde(default)]
+    workflow: Option<Named>,
+}
+
+impl CheckSuiteNode {
+    /// A workflow the forge is holding for approval: concluded `ACTION_REQUIRED`
+    /// with nothing run. A suite that ran and then asked for action has check
+    /// runs of its own in the rollup and is not repeated here.
+    fn gated_workflow(&self) -> Option<CheckRun> {
+        let action_required = self
+            .conclusion
+            .as_deref()
+            .is_some_and(|conclusion| conclusion.eq_ignore_ascii_case("ACTION_REQUIRED"));
+        // A missing count is unknown, not zero: a suite the forge hid the runs
+        // of must not read as one that never ran.
+        let ran_nothing = self
+            .check_runs
+            .as_ref()
+            .is_some_and(|runs| runs.total_count == 0);
+        if !action_required || !ran_nothing {
+            return None;
+        }
+        let name = self
+            .workflow_run
+            .as_ref()
+            .and_then(|run| run.workflow.as_ref())
+            .or(self.app.as_ref())
+            .map_or_else(|| "workflow".to_owned(), |named| named.name.clone());
+        Some(CheckRun {
+            name,
+            conclusion: Some("ACTION_REQUIRED".to_owned()),
+        })
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -903,11 +976,15 @@ fn details_from(payload: &FactsPayload) -> Result<PullDetails, ForgeError> {
         (Some(review), Some(commit)) => Some(review < commit),
         _ => None,
     };
-    let has_more_contexts = payload
-        .rollup
-        .iter()
-        .flat_map(|list| list.nodes.iter())
-        .filter_map(|node| node.commit.rollup.as_ref())
+    let tip_commits = || {
+        payload
+            .rollup
+            .iter()
+            .flat_map(|list| list.nodes.iter())
+            .map(|node| &node.commit)
+    };
+    let has_more_contexts = tip_commits()
+        .filter_map(|tip| tip.rollup.as_ref())
         .filter_map(|rollup| rollup.contexts.as_ref())
         .any(|contexts| contexts.page_info.has_next_page);
     if has_more_contexts {
@@ -918,18 +995,34 @@ fn details_from(payload: &FactsPayload) -> Result<PullDetails, ForgeError> {
             ),
         });
     }
+    let has_more_suites = tip_commits()
+        .filter_map(|tip| tip.check_suites.as_ref())
+        .any(|suites| suites.page_info.has_next_page);
+    if has_more_suites {
+        return Err(ForgeError::Query {
+            detail: format!(
+                "pull request #{} has more than 100 check suites; refusing a truncated list",
+                payload.pull.number
+            ),
+        });
+    }
 
-    let checks = Some(ChecksSummary {
-        runs: payload
-            .rollup
-            .iter()
-            .flat_map(|list| list.nodes.iter())
-            .filter_map(|node| node.commit.rollup.as_ref())
-            .filter_map(|rollup| rollup.contexts.as_ref())
-            .flat_map(|contexts| contexts.nodes.iter())
-            .cloned()
-            .collect(),
-    });
+    // Whatever ran, then whatever the forge refused to start. A gated workflow
+    // has no check run to appear in the rollup, so without the suites an
+    // approval-gated pull request reads as green on its one unconditional check.
+    let mut runs: Vec<CheckRun> = tip_commits()
+        .filter_map(|tip| tip.rollup.as_ref())
+        .filter_map(|rollup| rollup.contexts.as_ref())
+        .flat_map(|contexts| contexts.nodes.iter())
+        .cloned()
+        .collect();
+    runs.extend(
+        tip_commits()
+            .filter_map(|tip| tip.check_suites.as_ref())
+            .flat_map(|suites| suites.nodes.iter())
+            .filter_map(CheckSuiteNode::gated_workflow),
+    );
+    let checks = Some(ChecksSummary { runs });
     let diff = match (payload.additions, payload.deletions, payload.changed_files) {
         (Some(additions), Some(deletions), Some(changed_files)) => Some(DiffTotals {
             additions,

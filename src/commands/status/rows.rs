@@ -78,6 +78,7 @@ fn stated_pull_for(
             ),
             draft: pull.is_some_and(|fact| fact.pull.is_draft),
             stated: Some(true),
+            activity_at: pull.and_then(|fact| fact.newest_comment.clone()),
             prior: Vec::new(),
         }
     })
@@ -85,6 +86,7 @@ fn stated_pull_for(
 
 fn pull_cell(
     inferred: Option<&PullRequest>,
+    activity_at: Option<&str>,
     stated: Option<PullCell>,
     mut prior: Vec<PriorPull>,
 ) -> Option<PullCell> {
@@ -93,6 +95,7 @@ fn pull_cell(
         state: pull.state.to_lowercase(),
         draft: pull.is_draft,
         stated: None,
+        activity_at: activity_at.map(str::to_owned),
         prior: Vec::new(),
     });
     if let Some(stated) = stated {
@@ -148,11 +151,16 @@ fn review_cell(pull: Option<&PullRequest>) -> Option<String> {
     })
 }
 
+/// The checks column. `action-required` is a workflow the forge is holding for
+/// approval rather than one that failed; the row is red either way, but a
+/// reader deciding whether to fix code or ask a maintainer needs the difference.
 fn checks_cell(pull: Option<&PullRequest>, checks: Option<&ChecksSummary>) -> Option<String> {
     pull.filter(|pull| pull.is_open())?;
     let checks = checks?;
-    Some(if checks.failing() {
+    Some(if checks.has_hard_failure() {
         "failing".to_owned()
+    } else if checks.has_action_required() {
+        "action-required".to_owned()
     } else if !checks.ran() {
         "none-ran".to_owned()
     } else if checks.pending() {
@@ -351,12 +359,37 @@ fn add_pull_findings(
             format!("#{} cannot be merged as it stands", pull.number),
         ));
     }
-    if pull.is_open() && checks.is_some_and(ChecksSummary::failing) {
-        findings.push(Finding::new(
-            FindingKind::ChecksFailing,
-            Subject::PullRequest(pull.number),
-            format!("#{} has failing checks", pull.number),
-        ));
+    if pull.is_open()
+        && let Some(checks) = checks
+    {
+        let failed = checks.hard_failure_names();
+        let gated = checks.action_required_names();
+        // A check that ran and failed is a code problem; a workflow the forge is
+        // holding for approval is a maintainer's call. Both are red; the reader
+        // deciding what to do needs the names either way.
+        let detail = if !failed.is_empty() {
+            Some(format!(
+                "#{} has failing checks: {}",
+                pull.number,
+                failed.join(", ")
+            ))
+        } else if !gated.is_empty() {
+            Some(format!(
+                "#{} has {} workflow(s) awaiting approval that never ran: {}",
+                pull.number,
+                gated.len(),
+                gated.join(", ")
+            ))
+        } else {
+            None
+        };
+        if let Some(detail) = detail {
+            findings.push(Finding::new(
+                FindingKind::ChecksFailing,
+                Subject::PullRequest(pull.number),
+                detail,
+            ));
+        }
     }
     if review_predates_head == Some(true) {
         findings.push(Finding::new(
@@ -473,6 +506,7 @@ fn build_branch_row(
     let fork_only = context.store.is_fork_only(&target);
     let pr = pull_cell(
         pull,
+        fact.and_then(|fact| fact.newest_comment.as_deref()),
         stated_pull_for(&target, context.store, context.snapshot),
         prior_pulls_for(branch, &context.index.prior),
     );
@@ -780,6 +814,7 @@ mod tests {
             state: "unknown".to_owned(),
             draft: false,
             stated: Some(true),
+            activity_at: None,
             prior: Vec::new(),
         });
         assert_eq!(

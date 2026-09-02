@@ -2172,6 +2172,10 @@ fn sync_records_one_event_for_each_pull_request_that_moved() {
     };
     let state = tempfile::tempdir().expect("state directory");
     let mut store = Store::open_for_update(state.path().join("state.json")).expect("open store");
+    // Every one of them was seen before: a first sighting is recorded silently,
+    // whatever the forge already did to it, so only prior sightings can move.
+    store.record_pull_head(&name, 10, "head-10");
+    store.record_pull_head(&name, 11, "head-11");
     store.record_pull_head(&name, 12, "older");
     store.record_pull_head(&name, 13, "head-13");
     let ledger = knives::ledger::Ledger::at(state.path().join("demo"));
@@ -2233,6 +2237,8 @@ fn sync_records_a_settled_pull_request_once_across_repeated_runs() {
     };
     let state = tempfile::tempdir().expect("state directory");
     let mut store = Store::open_for_update(state.path().join("state.json")).expect("open store");
+    // Seen while open, so the merge is a transition rather than a first sighting.
+    store.record_pull_head(&name, 10, "head-10");
     let ledger = knives::ledger::Ledger::at(state.path().join("demo"));
     let scribe =
         knives::ledger::Scribe::new(ledger.clone(), name, lab.work, "ses_fff688".to_owned());
@@ -4173,9 +4179,11 @@ fn release_plan_exits_with_findings_when_the_current_release_lags_the_upstream_t
 }
 
 #[test]
-fn the_base_parent_is_not_stale_and_a_drifted_member_is_a_mixed_base_finding() {
+fn the_base_parent_is_not_stale_when_a_member_rebases_onto_the_advanced_trunk() {
     // Given: a release whose first parent is the bookmarkless shared base, and
-    // one member re-based past it onto the advanced upstream.
+    // one member rebased past it onto the advanced upstream — legitimate
+    // upkeep, not a defect: a PR branch is expected to track the trunk it
+    // will land on.
     let lab = lab::Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     lab.branch("feat/beta", "beta.txt", "beta\n");
@@ -4195,17 +4203,14 @@ fn the_base_parent_is_not_stale_and_a_drifted_member_is_a_mixed_base_finding() {
         !text.contains("carries no bookmark"),
         "base parent misread as stale: {text}"
     );
-    // And: the drifted member is named as a mixed base.
+    // And: rebasing a member onto the advanced trunk is not itself a finding:
+    // no per-branch `!! branch …` line names either member.
     assert!(
-        text.contains("feat/beta") && text.contains("beyond the shared base"),
-        "mixed base not reported: {text}"
+        !text
+            .lines()
+            .any(|line| line.trim_start().starts_with("!! branch ")),
+        "a rebased member was reported as a per-branch finding: {text}"
     );
-    // And: the member still on the base is not reported.
-    assert!(
-        !text.contains("feat/alpha carries"),
-        "well-based member misreported: {text}"
-    );
-    assert_eq!(output.status.code(), Some(1), "stdout: {text}");
 }
 
 #[test]
@@ -4239,55 +4244,6 @@ fn older_upstream_release_parent_is_reported_as_a_superseded_base() {
     assert!(
         text.contains("older upstream base superseded by"),
         "superseded base not reported: {text}"
-    );
-}
-
-#[test]
-fn preflight_renders_a_mixed_base_finding_and_exits_with_findings() {
-    // Given: a release with a bookmarkless base and a member rebased past it.
-    let lab = lab::Lab::new();
-    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
-    lab.branch("feat/beta", "beta.txt", "beta\n");
-    lab.octopus("release/2026-08-04", "feat/alpha", "feat/beta");
-    lab.advance_origin_branch("main", "origin advance\n");
-    lab.jj_work(["git", "fetch", "--remote", "origin"]);
-    lab.advance_upstream("upstream advance\n");
-    lab.rebase_and_force_push("feat/beta");
-    let entry = RepoEntry {
-        path: lab.work.clone(),
-        upstream: lab.upstream.display().to_string(),
-        origin: lab.work.display().to_string(),
-        base: None,
-        release: None,
-        release_branch: None,
-        test_count_command: None,
-        consumers: Vec::new(),
-    };
-    let state = tempfile::tempdir().expect("create state directory");
-    let mut store = Store::open_for_update(state.path().join("state.json")).expect("open store");
-    let forge = knives::forge::fake::FakeForge {
-        fail_facts: true,
-        ..knives::forge::fake::FakeForge::default()
-    };
-
-    // When: preflight gathers and renders the repository state.
-    let report = knives::commands::preflight::gather(knives::commands::preflight::GatherInput {
-        name: &knives::ids::RepoName::new("demo"),
-        entry: &entry,
-        store: &mut store,
-        forge: &forge,
-        cache: None,
-    });
-    let text = knives::commands::preflight::render(&report);
-
-    // Then: the finding is visible and makes the command actionable to scripts.
-    assert!(
-        text.contains("!!") && text.contains("beyond the shared base"),
-        "mixed base not rendered: {text}"
-    );
-    assert_eq!(
-        knives::commands::preflight::exit_for(&report),
-        knives::cli::Exit::Findings
     );
 }
 
@@ -5147,6 +5103,10 @@ fn status_does_not_report_trunk_as_a_carrier_without_landed_probe() {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one scenario asserting the notch in the row, the JSON, and the text together"
+)]
 fn status_carries_each_branchs_newest_notch_in_json_and_in_text() {
     // Given: a fork with a note followed by a newer machine event on one branch.
     let lab = lab::Lab::new();
@@ -5245,9 +5205,17 @@ fn status_carries_each_branchs_newest_notch_in_json_and_in_text() {
         "no notch is absent, not null: {beta}"
     );
 
-    // And: the branch line carries one token for it and its masked sibling
+    // And: the branch line carries one token for it and its masked sibling,
+    // anchored to the tip the note was written against
+    let anchor = row["notch"]["anchor"]
+        .as_str()
+        .expect("a note on a resolvable branch records its anchor");
+    assert_eq!(anchor.len(), 12, "anchor is the short id: {anchor}");
     let text = status::render::render(&report, false);
-    assert!(text.contains("\"human conclusion\" (now)+1"), "was: {text}");
+    assert!(
+        text.contains(&format!("\"human conclusion\" (now @{anchor})+1")),
+        "was: {text}"
+    );
     assert!(report.repo_notches.is_none(), "was: {report:?}");
     assert!(
         json.get("repo_notches").is_none(),
@@ -6615,10 +6583,23 @@ fn a_stranded_release_parent_reports_where_the_branch_went() {
     let moved_to = lab.revision(&lab.work, "feat/alpha", "commit_id");
     assert_ne!(stranded.trim(), moved_to.trim());
 
-    let past = knives::jj::branches_past(&lab.work, &knives::ids::CommitId::new(stranded.trim()))
-        .expect("branches past");
+    let repo = Repo::open(&lab.work).expect("open");
+    let trunk = repo.resolve_commit("main@upstream").expect("trunk");
+    let branches = knives::release_model::carried_from_tips(
+        &repo.bookmark_tips().expect("tips"),
+        "main",
+        &ReleaseScheme::Dated,
+    );
+    let past = knives::release_model::branches_succeeding(
+        &repo,
+        std::slice::from_ref(&trunk),
+        &knives::ids::CommitId::new(stranded.trim()),
+        &branches,
+    )
+    .expect("branches succeeding");
     assert!(
-        past.iter().any(|(branch, tip)| branch.as_str() == "feat/alpha" && tip.as_str() == moved_to.trim()),
+        past.iter()
+            .any(|(branch, tip)| branch == "feat/alpha" && tip.as_str() == moved_to.trim()),
         "expected feat/alpha reported at its new tip, got {past:?}"
     );
 }
@@ -6990,7 +6971,7 @@ fn include_refuses_to_advance_an_advanced_branch() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_eq!(output.status.code(), Some(3), "{stdout}");
     assert!(
-        stdout.contains("the branch has advanced")
+        stdout.contains("the branch has moved on")
             && stdout.contains("knives release advance feat/alpha"),
         "the refusal must name the verb that does move a member: {stdout}"
     );
@@ -7374,7 +7355,7 @@ fn a_bare_advance_with_an_ambiguous_parent_changes_nothing() {
 }
 
 #[test]
-fn a_bare_advance_refuses_a_branch_that_would_replace_several_parents() {
+fn a_bare_advance_skips_a_branch_that_merges_several_members() {
     // Given: two released members, and a third branch built by merging both of
     // their released tips directly -- the shape of an integration branch built
     // across several former members, or of a member rebuilt with `jj
@@ -7408,14 +7389,15 @@ fn a_bare_advance_refuses_a_branch_that_would_replace_several_parents() {
 
     let output = knives_release(&lab, &home, &["advance"]);
 
+    // Then: a branch whose history carries a merge of two members is not a
+    // candidate at all — it is stacked history, named as such — and nothing
+    // moves. The release is left exactly as it was.
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert_eq!(output.status.code(), Some(3), "{stdout}");
-    assert!(stdout.contains("nothing advanced"), "{stdout}");
+    assert!(output.status.success(), "{stdout}");
     assert!(
-        stdout.contains("feat/consolidated")
-            && stdout.contains("descends from 2 parents")
-            && stdout.contains("drop and include instead"),
-        "the refusal must name the overreaching branch and both parents it claimed: {stdout}"
+        stdout.contains("feat/consolidated's history past the upstream trunk carries 1 merge")
+            && stdout.contains("not advanced onto"),
+        "the stacked branch must be named and skipped: {stdout}"
     );
     assert_eq!(
         release_parent_commits(&lab, "release/2026-08-04"),
@@ -7452,8 +7434,10 @@ fn advance_from_recovers_a_branch_rebuilt_with_jj_duplicate() {
         "the rebuild must be a fresh commit"
     );
 
-    // When: a plain named advance can't match it -- ancestry back to
-    // `old_alpha` is gone -- so it is refused, not guessed at.
+    // When: nothing can pair the rebuilt branch with its parent — no ancestry, no
+    // shared change id, and (the cut's own record removed) no name on file — a
+    // plain named advance is refused, not guessed at.
+    std::fs::remove_dir_all(home.path().join("ledger")).expect("forget the cut record");
     let plain = knives_release(&lab, &home, &["advance", "feat/alpha"]);
     let plain_stdout = String::from_utf8_lossy(&plain.stdout);
     assert_eq!(plain.status.code(), Some(3), "{plain_stdout}");

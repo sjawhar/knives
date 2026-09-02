@@ -186,7 +186,7 @@ are somewhere else.
 | `knives pr NUMBER [--repo REPO] [--timeline]` | one pull request's live state; `--timeline` adds its bounded forge event log |
 | `knives sync` | fetch, then classify what happened to each tracked pull request |
 | `knives preflight` | the facts to check before contributing upstream |
-| `knives start` | take a branch and get your own workspace |
+| `knives start` | take a branch and get your own workspace on the release's shared base |
 | `knives finish` | hand a branch back so another agent can pick it up; its bookmark and any open pull request survive |
 | `knives track` | state which pull request a branch belongs to, when inference cannot find it |
 | `knives depends` | record that a branch cannot land before another repo's pull request |
@@ -231,6 +231,17 @@ Escape hatches:
 ## Release workflow
 
 A release is a flat octopus merge of feature and fix branches, and its parent set is its membership: a branch is in the release exactly when the release has its parent. The upstream base is never a direct parent — every member forks from it, so it is reachable through each of them, and there is no role to classify. Membership changes only through stated edits. `knives release include` adds one parent, `knives release drop` removes one (saying so when no remaining member carries the dropped content), and `knives release advance` moves member parents to their branches' current tips — refusing outright, rather than silently deduping, if the same branch would replace more than one parent, and accepting `--from <old-sha>` to name one branch's old parent directly when a `jj duplicate` rebuild has left it with no ancestry back to the commit it replaces. `knives release rebase` moves the whole composition onto a newer upstream commit — the equivalent of `jj rebase -b <release> -d <target>` — members and their bookmarks moving together; bare, it targets the first upstream trunk commit that contains every merged pull request, then drops the members whose landed branches carry nothing more (`--no-drop` keeps them); with nothing merged it asks for a commit. Each edit duplicates the release onto the changed parent set, so recorded conflict resolutions carry forward and only the change itself can surface new conflicts. `knives release cut` names a new cut of the composition in hand, verbatim: nothing joins, nothing advances, and a branch created since the last release enters through `include`, never by existing. Only the first cut, with no composition to carry, starts from every branch.
+
+One branch is both the release member and the upstream pull request head; there is never a
+second copy. Branches fork from the release's shared base (`knives start` puts them there, or
+on the fetched upstream trunk when no release exists) and are linear past it, so a new branch
+composes into the release without forcing a rebase; moving the composition to a newer trunk is
+`knives release rebase`, a decision of its own. When a branch is rebased onto a newer trunk,
+`advance` still recognises it as the same member by change id, which `jj rebase` keeps. A
+branch that does not compose into the release means the release is behind: move the release,
+never mint a "release-lineage" sibling of the branch on an older base. A member whose own
+history carries a release merge is reported as `stacked-history`, and the plan stops calling
+the cut `flat`.
 
 `knives release carries REVISION` compares the revision with every live release and the upstream
 trunk. `--in TARGET` selects exactly one target; `--all` censuses every maintained branch.

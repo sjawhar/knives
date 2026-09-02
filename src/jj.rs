@@ -103,13 +103,21 @@ pub struct WorkspaceActivity {
 }
 
 impl Repo {
-    /// Whether this workspace's working copy is behind the repository.
+    /// Whether this workspace's working copy is stale in the sense `jj` itself
+    /// refuses to run: its checked-out tree no longer matches what the repository
+    /// says its working-copy commit is.
     ///
-    /// jj refuses to run in a stale workspace, but this tool reads through jj-lib, so
-    /// it answered happily while `jj` itself errored. The detectors replay commits
-    /// onto the trunk, so a working copy that does not match the repository can
-    /// invalidate their conclusions with nothing said. Observed on a managed checkout,
-    /// which reported normally while every `jj` command in it failed.
+    /// This tool reads through jj-lib, so it answered happily while `jj`
+    /// errored; the detectors replay commits onto the trunk, and a working copy
+    /// that does not match the repository can invalidate their conclusions with
+    /// nothing said. Observed on a managed checkout, which reported normally
+    /// while every `jj` command in it failed.
+    ///
+    /// The rule is jj's, not a stricter one: a working copy is stale when the
+    /// operation moved on AND the working-copy commit's tree differs from the
+    /// tree the working copy last checked out. Comparing operation ids alone
+    /// flags every workspace after any operation made from elsewhere, including
+    /// `knives sync`'s own `--ignore-working-copy` fetch, which touches neither.
     ///
     /// Reads the recorded checkout state only. It does not snapshot, which matters:
     /// these repositories are worked concurrently, and snapshotting another agent's
@@ -125,15 +133,38 @@ impl Repo {
         .ok()?;
         let recorded = working_copy.operation_id();
         let current = self.repo.operation().id();
-        (recorded != current).then(|| {
-            format!(
-                "working copy is stale (recorded at operation {}, repository is at {}); \
-                 run `jj workspace update-stale` in {}",
-                short_id(&recorded.hex()),
-                short_id(&current.hex()),
+        if recorded == current {
+            return None;
+        }
+        let Some(wc_commit) = self
+            .repo
+            .view()
+            .get_wc_commit_id(working_copy.workspace_name())
+        else {
+            return Some(format!(
+                "workspace {} has no working-copy commit in the repository view (forgotten \
+                 while its directory remained?); `jj workspace forget` or re-add it in {}",
+                working_copy.workspace_name().as_symbol(),
                 path.display()
-            )
-        })
+            ));
+        };
+        let checked_out = working_copy.tree().ok()?.tree_ids().clone();
+        let expected = self
+            .repo
+            .store()
+            .get_commit(wc_commit)
+            .ok()
+            .map(|commit| commit.tree_ids().clone());
+        if expected.as_ref() == Some(&checked_out) {
+            return None;
+        }
+        Some(format!(
+            "working copy is stale (recorded at operation {}, repository is at {}); \
+             run `jj workspace update-stale` in {}",
+            short_id(&recorded.hex()),
+            short_id(&current.hex()),
+            path.display()
+        ))
     }
 
     pub fn open(path: &Path) -> Result<Self, JjError> {
@@ -713,6 +744,76 @@ impl Repo {
 
     pub fn resolve_commit(&self, revision: &str) -> Result<CommitId, JjError> {
         Ok(commit_id(&self.commit(revision)?.id().clone()))
+    }
+
+    /// The stable change id of a commit: what still names a release after a
+    /// conflict resolution rewrites the merge and moves its commit id.
+    pub fn change_id_of(&self, revision: &str) -> Result<ChangeId, JjError> {
+        Ok(ChangeId::new(
+            self.commit(revision)?.change_id().to_string(),
+        ))
+    }
+
+    /// Merge commits reachable from `tip` but not from `base` that join two or
+    /// more lines the base does not have, newest first.
+    ///
+    /// A feature branch forked from the trunk has none: every commit past the
+    /// trunk is linear work. A merge whose parents are its own previous commit
+    /// and a trunk commit — the branch pulled the trunk into itself — carries
+    /// nothing beyond the trunk and its own work, and does not count. A merge
+    /// with two or more parents outside the trunk — a release cut, another
+    /// branch — means the branch carries everything that merge carried.
+    pub fn merges_between(
+        &self,
+        base: &CommitId,
+        tip: &CommitId,
+    ) -> Result<Vec<CommitId>, JjError> {
+        let base = self.commit(base.as_str())?.id().clone();
+        let tip = self.commit(tip.as_str())?.id().clone();
+        let mut merges = Vec::new();
+        for id in self.range_newest_first(&base, &tip)? {
+            let commit = self
+                .repo
+                .store()
+                .get_commit(&id)
+                .map_err(|error| store_error(&error))?;
+            let mut beyond_base = 0usize;
+            for parent in commit.parent_ids() {
+                if !self.backend_is_ancestor(parent, &base)? {
+                    beyond_base += 1;
+                }
+            }
+            if beyond_base > 1 {
+                merges.push(commit_id(&id));
+            }
+        }
+        Ok(merges)
+    }
+
+    /// Change ids of every commit reachable from `tip` but not from `base`.
+    ///
+    /// A `jj rebase` rewrites commits — new commit ids, hidden predecessors —
+    /// and keeps their change ids. A member's released parent therefore stops
+    /// being an ancestor of the branch the moment the branch is rebased onto a
+    /// newer trunk, while its change id is still on the branch. Matching by
+    /// change id is how a rebased branch is recognised as the same member.
+    pub fn change_ids_between(
+        &self,
+        base: &CommitId,
+        tip: &CommitId,
+    ) -> Result<BTreeSet<ChangeId>, JjError> {
+        let base = self.commit(base.as_str())?.id().clone();
+        let tip = self.commit(tip.as_str())?.id().clone();
+        let mut changes = BTreeSet::new();
+        for id in self.range_newest_first(&base, &tip)? {
+            let commit = self
+                .repo
+                .store()
+                .get_commit(&id)
+                .map_err(|error| store_error(&error))?;
+            changes.insert(ChangeId::new(commit.change_id().to_string()));
+        }
+        Ok(changes)
     }
 
     fn commit(&self, revision: &str) -> Result<jj_lib::commit::Commit, JjError> {
@@ -2095,58 +2196,6 @@ pub fn abandon_commits(repo: &Path, commits: &[CommitId], operation: &str) -> Re
         tx.repo_mut().record_abandoned_commit(target);
     }
     commit_mutation(&repo, tx, operation)
-}
-
-/// Bookmarks whose tip descends from this commit, and where they now are.
-///
-/// A release parent that nothing points at is stale, but "carries no bookmark"
-/// is a poor report. The useful answer is which branch that commit belonged to
-/// and where it has moved, which is what design asks for. A branch descends from
-/// the parent exactly when the branch moved forward past it, so this recovers
-/// the information without needing provenance.
-pub fn branches_past(
-    repo: &Path,
-    commit: &CommitId,
-) -> Result<Vec<(BranchName, CommitId)>, JjError> {
-    let repo_path = path(repo);
-    let revset = format!(
-        "bookmarks() & descendants({}) & ~{}",
-        commit.as_str(),
-        commit.as_str()
-    );
-    let listed = command(
-        "jj",
-        [
-            "--repository",
-            &repo_path,
-            "--ignore-working-copy",
-            "log",
-            "--no-graph",
-            "-r",
-            &revset,
-            "-T",
-            "commit_id ++ \"\\t\" ++ bookmarks ++ \"\\n\"",
-        ],
-    )?;
-    let mut found = Vec::new();
-    for line in listed.lines().filter(|line| !line.trim().is_empty()) {
-        let Some((tip, names)) = line.split_once('\t') else {
-            continue;
-        };
-        for raw in names.split_whitespace() {
-            // Local names only: a remote-tracking ref moving says origin moved,
-            // which is a different fact.
-            if !raw.contains('@') {
-                let name = raw.trim_end_matches(['*', '?']);
-                if !name.is_empty() {
-                    found.push((BranchName::new(name), CommitId::new(tip.trim())));
-                }
-            }
-        }
-    }
-    found.sort();
-    found.dedup();
-    Ok(found)
 }
 
 /// The git repository jj keeps its objects in.

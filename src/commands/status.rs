@@ -22,6 +22,7 @@ use crate::store::Store;
 
 mod claims;
 mod dependencies;
+mod merged;
 mod overlap;
 pub mod phases;
 mod releases;
@@ -148,6 +149,12 @@ pub struct PullCell {
     pub draft: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stated: Option<bool>,
+    /// When the newest review or comment landed, from the live fact. The
+    /// review column carries the forge's decision, and a comment-only review
+    /// or a maintainer's question leaves that decision empty; this is how a
+    /// reader sees that the pull request moved since they last looked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub activity_at: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub prior: Vec<PriorPull>,
 }
@@ -261,8 +268,12 @@ pub struct ForgeStatus {
 #[derive(Debug, serde::Serialize)]
 pub struct FindingGroup {
     pub kind: FindingKind,
+    /// Equal to `subjects.len()`; kept so a reader of the one-line text view,
+    /// which shows only the first few subjects, still has the total.
     pub count: usize,
     pub subjects: Vec<String>,
+    /// One detail per subject, in the same order.
+    pub details: Vec<String>,
 }
 
 /// The most relevant ledger entry for one status row and the entries it masks.
@@ -273,6 +284,12 @@ pub struct LastNotch {
     pub text: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disposition: Option<String>,
+    /// The subject's tip when the entry was written. A past-tense entry stays
+    /// true at its anchor and may be stale at today's tip: a "NO carried commit"
+    /// note measured against one release read as current four days later, when
+    /// the branch had since been carried. Short (12 characters), for the row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<String>,
     pub count: usize,
 }
 
@@ -304,6 +321,7 @@ impl LastNotch {
             kind: entry.kind,
             text: collapsed_notch_text(&entry.text),
             disposition: entry.disposition.clone(),
+            anchor: entry.anchor.as_deref().map(short),
             count,
         })
     }
@@ -486,8 +504,104 @@ struct PostPhaseInput<'a> {
     tips: &'a BookmarkTips,
     notches: &'a [Notch],
     divergent_branches: &'a [BranchName],
-    probe_inputs: Vec<phases::ProbeInput>,
     probe_ran: bool,
+    trunk_commit: Option<&'a CommitId>,
+}
+
+/// Every commit each divergent local bookmark names, for the rows that have no
+/// single tip.
+fn divergent_tips(
+    repo: &Repo,
+    divergent_branches: &[BranchName],
+) -> anyhow::Result<BTreeMap<BranchName, Vec<CommitId>>> {
+    let mut by_branch = BTreeMap::new();
+    if divergent_branches.is_empty() {
+        return Ok(by_branch);
+    }
+    for (reference, commits) in repo.conflicted_bookmarks()? {
+        if let BookmarkRef::Local(branch) = reference
+            && divergent_branches.contains(&branch)
+        {
+            by_branch.insert(branch, commits);
+        }
+    }
+    Ok(by_branch)
+}
+
+/// A `stacked-history` finding for every branch with an open pull request whose
+/// history past the trunk carries merges: that pull request asks its reviewer
+/// to take everything those merges carried. Branches without a pull request are
+/// the release plan's concern, where the same detector runs on the members.
+fn stacked_pull_findings(
+    report: &Report,
+    context: crate::release_model::StackedHistoryContext<'_>,
+    tips: &BookmarkTips,
+) -> anyhow::Result<Vec<Finding>> {
+    let mut findings = Vec::new();
+    for row in &report.branches {
+        let Some(pull) = row.pr.as_ref() else {
+            continue;
+        };
+        if !pull.state.eq_ignore_ascii_case("OPEN") {
+            continue;
+        }
+        let Some(tip) = tips.get(&BookmarkRef::Local(row.name.clone())) else {
+            continue;
+        };
+        findings.extend(crate::release_model::stacked_history(
+            context,
+            row.name.as_str(),
+            tip,
+        )?);
+    }
+    Ok(findings)
+}
+
+/// What the rows say once the forge and the graph are both in hand: landed
+/// verdicts the forge can settle, branches another reference carries, and pull
+/// requests whose history carries a release merge.
+fn settle_rows_after_phases(
+    report: &mut Report,
+    findings: &mut Vec<Finding>,
+    input: &PostPhaseInput<'_>,
+    index: &PullIndex,
+) -> anyhow::Result<()> {
+    merged::settle_merged_landed(
+        report,
+        merged::MergedLandedInput {
+            repo: input.repo,
+            index,
+            tips: input.tips,
+            divergent_tips: &divergent_tips(input.repo, input.divergent_branches)?,
+            trunk_tip: input.trunk_commit,
+        },
+    );
+    let scheme = input.entry.release_scheme();
+    findings.extend(carried_findings(CarriedFindingInput {
+        report,
+        repo: input.repo,
+        tips: input.tips,
+        trunk: input.entry.trunk(),
+        scheme: &scheme,
+        publish_remote: input.entry.publish_remote(),
+    })?);
+    if let Some(trunk) = input.trunk_commit {
+        let releases = crate::release_model::release_refs_by_commit(
+            input.tips,
+            &scheme,
+            input.entry.publish_remote(),
+        );
+        findings.extend(stacked_pull_findings(
+            report,
+            crate::release_model::StackedHistoryContext {
+                repo: input.repo,
+                trunk,
+                releases: &releases,
+            },
+            input.tips,
+        )?);
+    }
+    Ok(())
 }
 
 fn add_pull_state_findings(
@@ -566,7 +680,8 @@ fn append_divergent_rows(
 /// Fold completed phases into rows, findings, timings, and cache persistence.
 fn fold_phase_outcome(
     output: FoldOutput<'_>,
-    input: PostPhaseInput<'_>,
+    input: &PostPhaseInput<'_>,
+    probe_inputs: Vec<phases::ProbeInput>,
     phases: &mut phases::StatusPhases<'_>,
 ) -> anyhow::Result<()> {
     let FoldOutput {
@@ -584,16 +699,13 @@ fn fold_phase_outcome(
     timings.probes = phases.probe.duration;
 
     let phase = std::time::Instant::now();
-    let origin_phase = phases::origin_phase(
-        &input.entry.path,
-        &input.probe_inputs,
-        input.options.workers,
-    );
+    let origin_phase =
+        phases::origin_phase(&input.entry.path, &probe_inputs, input.options.workers);
     let unjudged = rows::branch_rows(
         rows::RowInput {
             name: input.name,
             store: input.store,
-            probe_inputs: input.probe_inputs,
+            probe_inputs,
             verdicts: std::mem::take(&mut phases.probe.verdicts),
             origin_relations: origin_phase.relations,
             index,
@@ -620,17 +732,8 @@ fn fold_phase_outcome(
         report,
         findings,
     );
-
     let phase = std::time::Instant::now();
-    let scheme = input.entry.release_scheme();
-    findings.extend(carried_findings(CarriedFindingInput {
-        report,
-        repo: input.repo,
-        tips: input.tips,
-        trunk: input.entry.trunk(),
-        scheme: &scheme,
-        publish_remote: input.entry.publish_remote(),
-    })?);
+    settle_rows_after_phases(report, findings, input, index)?;
     timings.carried_findings = phase.elapsed();
 
     timings.touching =
@@ -646,6 +749,7 @@ fn fold_phase_outcome(
             name: input.name,
             store: input.store,
             seen: &seen,
+            tips: input.tips,
         },
     )?;
     timings.claims = phase.elapsed();
@@ -768,7 +872,7 @@ pub fn gather_timed(
             findings: &mut findings,
             timings: &mut timings,
         },
-        PostPhaseInput {
+        &PostPhaseInput {
             name,
             entry,
             repo: &repo,
@@ -777,9 +881,10 @@ pub fn gather_timed(
             tips: &tips,
             notches: &notches,
             divergent_branches: &divergent_branches,
-            probe_inputs,
             probe_ran,
+            trunk_commit: trunk_commit.as_ref(),
         },
+        probe_inputs,
         &mut phases,
     )?;
     report.findings = group_findings(findings);
@@ -821,20 +926,27 @@ fn grouped_subject(finding: &Finding) -> String {
 }
 
 /// Folds raw findings once, after every detector has reported, preserving detector order.
+///
+/// Every finding keeps its subject and its detail. The one-line-per-kind text
+/// view shows the first few subjects; `--verbose` and the machine output carry
+/// all of them with their detail, because a subject alone (`#11`) does not say
+/// which workflow never ran or which release a stacked branch carries, and a
+/// reader who asked for detail on the ninth finding was not asking for the
+/// first eight.
 fn group_findings(findings: Vec<Finding>) -> Vec<FindingGroup> {
     let mut groups: Vec<FindingGroup> = Vec::new();
     for finding in findings {
         let subject = grouped_subject(&finding);
         if let Some(group) = groups.iter_mut().find(|group| group.kind == finding.kind) {
             group.count += 1;
-            if group.subjects.len() < 8 {
-                group.subjects.push(subject);
-            }
+            group.subjects.push(subject);
+            group.details.push(finding.detail);
         } else {
             groups.push(FindingGroup {
                 kind: finding.kind,
                 count: 1,
                 subjects: vec![subject],
+                details: vec![finding.detail],
             });
         }
     }
@@ -915,7 +1027,7 @@ mod tests {
     }
 
     #[test]
-    fn findings_group_by_kind_in_first_seen_order_and_cap_subjects() {
+    fn findings_group_by_kind_in_first_seen_order_and_keep_every_subject() {
         let mut findings = vec![Finding::new(
             FindingKind::WrongBase,
             Subject::PullRequest(1),
@@ -925,19 +1037,33 @@ mod tests {
             Finding::new(
                 FindingKind::Divergence,
                 Subject::Branch(BranchName::new(format!("feat/{number}"))),
-                "detail",
+                format!("feat/{number} is on two commits"),
             )
         }));
 
         let groups = group_findings(findings);
 
+        // Every subject and its detail survive grouping: the one-line text view
+        // truncates, the machine output and --verbose do not.
         assert_eq!(groups.len(), 2, "was: {groups:?}");
         assert_eq!(groups[0].kind, FindingKind::WrongBase);
         assert_eq!(groups[1].kind, FindingKind::Divergence);
         assert_eq!(groups[1].count, 30);
-        assert_eq!(groups[1].subjects.len(), 8);
+        assert_eq!(groups[1].subjects.len(), 30);
+        assert_eq!(groups[1].details.len(), 30);
         assert_eq!(groups[1].subjects[0], "feat/0");
-        assert_eq!(groups[1].subjects[7], "feat/7");
+        assert_eq!(groups[1].details[29], "feat/29 is on two commits");
+        let text = render::render(
+            &Report {
+                findings: groups,
+                ..Report::default()
+            },
+            false,
+        );
+        assert!(
+            text.contains("feat/7, and 22 more") && !text.contains("feat/8"),
+            "the one-line view caps at eight subjects: {text}"
+        );
     }
 
     #[test]
@@ -1157,12 +1283,17 @@ mod tests {
                 kind: FindingKind::Divergence,
                 count: 1,
                 subjects: vec!["feat/a".to_owned()],
+                details: vec!["feat/a is on two commits".to_owned()],
             }],
             ..Report::default()
         };
         assert_eq!(exit_for(&dirty), Exit::Findings);
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one fixture exercising every row cell at once is the point of the scale snapshot"
+    )]
     fn swe_scale_fixture() -> Report {
         let branches = (0..14)
             .map(|index| {
@@ -1179,6 +1310,7 @@ mod tests {
                         state: "open".to_owned(),
                         draft: false,
                         stated: None,
+                        activity_at: Some("2026-08-30T09:15:00Z".to_owned()),
                         prior: Vec::new(),
                     });
                     row.review = Some("changes-requested".to_owned());
@@ -1198,6 +1330,7 @@ mod tests {
                         kind: crate::ledger::Kind::Note,
                         text: "Release triage recorded after the final merge queue drain.".to_owned(),
                         disposition: Some("decided".to_owned()),
+                        anchor: Some("0f1e2d3c4b5a".to_owned()),
                         count: 4,
                     });
                 }
@@ -1219,6 +1352,9 @@ mod tests {
             count,
             subjects: (0..count)
                 .map(|index| format!("{prefix}-{index:02}"))
+                .collect(),
+            details: (0..count)
+                .map(|index| format!("{prefix}-{index:02} needs attention"))
                 .collect(),
         };
 
@@ -1254,6 +1390,7 @@ mod tests {
                     kind: crate::ledger::Kind::Note,
                     text: "Release triage recorded after the final merge queue drain.".to_owned(),
                     disposition: Some("decided".to_owned()),
+                    anchor: None,
                     count: 4,
                 },
             }),

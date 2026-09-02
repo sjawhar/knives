@@ -27,7 +27,12 @@ pub struct CheckRun {
     #[serde(default)]
     pub name: String,
     /// `None` while unfinished, including legacy `PENDING` and `EXPECTED` contexts;
-    /// otherwise `SUCCESS`, `FAILURE`, `SKIPPED`, or `CANCELLED`.
+    /// otherwise `SUCCESS`, `FAILURE`, `SKIPPED`, `CANCELLED`, or `ACTION_REQUIRED`.
+    ///
+    /// `ACTION_REQUIRED` also stands for a whole workflow the forge refused to
+    /// start: a fork pull request whose runs await a maintainer's approval has a
+    /// check suite with that conclusion and no check runs at all, so the rollup
+    /// alone shows only whatever ran unconditionally and reads green.
     #[serde(default)]
     pub conclusion: Option<String>,
 }
@@ -42,26 +47,49 @@ pub struct ChecksSummary {
 }
 
 impl ChecksSummary {
-    /// Checks the forge reported a failing conclusion for.
+    /// Checks the forge reported a red conclusion for: real failures and
+    /// workflows that never ran because they await approval, together. Both keep
+    /// a pull request from merging on its own, which is what a red row means.
     pub fn failed_names(&self) -> Vec<String> {
         self.runs
             .iter()
-            .filter(|run| {
-                run.conclusion.as_deref().is_some_and(|conclusion| {
-                    conclusion.eq_ignore_ascii_case("FAILURE")
-                        || conclusion.eq_ignore_ascii_case("TIMED_OUT")
-                        || conclusion.eq_ignore_ascii_case("CANCELLED")
-                        || conclusion.eq_ignore_ascii_case("STARTUP_FAILURE")
-                        || conclusion.eq_ignore_ascii_case("ACTION_REQUIRED")
-                        || conclusion.eq_ignore_ascii_case("ERROR")
-                })
-            })
+            .filter(|run| run.hard_failure() || run.action_required())
+            .map(|run| run.name.clone())
+            .collect()
+    }
+
+    /// Checks that ran and failed, as opposed to ones that never ran.
+    pub fn hard_failure_names(&self) -> Vec<String> {
+        self.runs
+            .iter()
+            .filter(|run| run.hard_failure())
+            .map(|run| run.name.clone())
+            .collect()
+    }
+
+    /// Workflows the forge is holding for a maintainer's approval, so nothing
+    /// of theirs ran. Over these an `ok` cell is a lie: one unconditional lint
+    /// check green, the whole suite never started.
+    pub fn action_required_names(&self) -> Vec<String> {
+        self.runs
+            .iter()
+            .filter(|run| run.action_required())
             .map(|run| run.name.clone())
             .collect()
     }
 
     pub fn failing(&self) -> bool {
-        !self.failed_names().is_empty()
+        self.runs
+            .iter()
+            .any(|run| run.hard_failure() || run.action_required())
+    }
+
+    pub fn has_hard_failure(&self) -> bool {
+        self.runs.iter().any(CheckRun::hard_failure)
+    }
+
+    pub fn has_action_required(&self) -> bool {
+        self.runs.iter().any(CheckRun::action_required)
     }
 
     /// Whether any returned check has not completed.
@@ -72,6 +100,24 @@ impl ChecksSummary {
     /// Whether the forge ran anything at all. Nothing having run is not a failure.
     pub const fn ran(&self) -> bool {
         !self.runs.is_empty()
+    }
+}
+
+impl CheckRun {
+    fn hard_failure(&self) -> bool {
+        self.conclusion.as_deref().is_some_and(|conclusion| {
+            conclusion.eq_ignore_ascii_case("FAILURE")
+                || conclusion.eq_ignore_ascii_case("TIMED_OUT")
+                || conclusion.eq_ignore_ascii_case("CANCELLED")
+                || conclusion.eq_ignore_ascii_case("STARTUP_FAILURE")
+                || conclusion.eq_ignore_ascii_case("ERROR")
+        })
+    }
+
+    fn action_required(&self) -> bool {
+        self.conclusion
+            .as_deref()
+            .is_some_and(|conclusion| conclusion.eq_ignore_ascii_case("ACTION_REQUIRED"))
     }
 }
 
