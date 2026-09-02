@@ -78,6 +78,7 @@ fn stated_pull_for(
             ),
             draft: pull.is_some_and(|fact| fact.pull.is_draft),
             stated: Some(true),
+            activity_at: pull.and_then(|fact| fact.newest_comment.clone()),
             prior: Vec::new(),
         }
     })
@@ -85,6 +86,7 @@ fn stated_pull_for(
 
 fn pull_cell(
     inferred: Option<&PullRequest>,
+    activity_at: Option<&str>,
     stated: Option<PullCell>,
     mut prior: Vec<PriorPull>,
 ) -> Option<PullCell> {
@@ -93,6 +95,7 @@ fn pull_cell(
         state: pull.state.to_lowercase(),
         draft: pull.is_draft,
         stated: None,
+        activity_at: activity_at.map(str::to_owned),
         prior: Vec::new(),
     });
     if let Some(stated) = stated {
@@ -148,11 +151,16 @@ fn review_cell(pull: Option<&PullRequest>) -> Option<String> {
     })
 }
 
+/// The checks column. `action-required` is a workflow the forge is holding for
+/// approval rather than one that failed; the row is red either way, but a
+/// reader deciding whether to fix code or ask a maintainer needs the difference.
 fn checks_cell(pull: Option<&PullRequest>, checks: Option<&ChecksSummary>) -> Option<String> {
     pull.filter(|pull| pull.is_open())?;
     let checks = checks?;
-    Some(if checks.failing() {
+    Some(if checks.has_hard_failure() {
         "failing".to_owned()
+    } else if checks.has_action_required() {
+        "action-required".to_owned()
     } else if !checks.ran() {
         "none-ran".to_owned()
     } else if checks.pending() {
@@ -351,12 +359,38 @@ fn add_pull_findings(
             format!("#{} cannot be merged as it stands", pull.number),
         ));
     }
-    if pull.is_open() && checks.is_some_and(ChecksSummary::failing) {
-        findings.push(Finding::new(
-            FindingKind::ChecksFailing,
-            Subject::PullRequest(pull.number),
-            format!("#{} has failing checks", pull.number),
-        ));
+    if pull.is_open()
+        && let Some(checks) = checks
+    {
+        let failed = checks.hard_failure_names();
+        let held = checks.action_required_names();
+        // A check that ran and failed is a code problem; a check the forge is
+        // holding for action — a workflow awaiting a maintainer's approval, which
+        // runs nothing until then — is somebody's call. Both are red; the reader
+        // deciding what to do needs the names either way.
+        let detail = if !failed.is_empty() {
+            Some(format!(
+                "#{} has failing checks: {}",
+                pull.number,
+                failed.join(", ")
+            ))
+        } else if !held.is_empty() {
+            Some(format!(
+                "#{} has {} check(s) held for action (an unapproved workflow runs nothing): {}",
+                pull.number,
+                held.len(),
+                held.join(", ")
+            ))
+        } else {
+            None
+        };
+        if let Some(detail) = detail {
+            findings.push(Finding::new(
+                FindingKind::ChecksFailing,
+                Subject::PullRequest(pull.number),
+                detail,
+            ));
+        }
     }
     if review_predates_head == Some(true) {
         findings.push(Finding::new(
@@ -380,23 +414,24 @@ fn add_pull_findings(
     }
 }
 
-/// The locally divergent branches that need rows but have no tip to probe.
-pub(super) fn divergent_branch_names(
+/// The locally divergent branches that need rows but have no tip to probe,
+/// each with every commit its bookmark names.
+pub(super) fn divergent_branches(
     repo: &Repo,
     entry: &RepoEntry,
-) -> anyhow::Result<Vec<BranchName>> {
+) -> anyhow::Result<BTreeMap<BranchName, Vec<CommitId>>> {
     let scheme = entry.release_scheme();
     Ok(repo
         .conflicted_bookmarks()?
         .into_iter()
-        .filter_map(|(reference, _)| {
+        .filter_map(|(reference, commits)| {
             let BookmarkRef::Local(branch) = reference else {
                 return None;
             };
             (!is_release_name(&branch, &scheme)
                 && branch.as_str() != entry.trunk()
                 && pull_number_from_bookmark(branch.as_str()).is_none())
-            .then_some(branch)
+            .then_some((branch, commits))
         })
         .collect())
 }
@@ -473,6 +508,7 @@ fn build_branch_row(
     let fork_only = context.store.is_fork_only(&target);
     let pr = pull_cell(
         pull,
+        fact.and_then(|fact| fact.newest_comment.as_deref()),
         stated_pull_for(&target, context.store, context.snapshot),
         prior_pulls_for(branch, &context.index.prior),
     );
@@ -780,6 +816,7 @@ mod tests {
             state: "unknown".to_owned(),
             draft: false,
             stated: Some(true),
+            activity_at: None,
             prior: Vec::new(),
         });
         assert_eq!(

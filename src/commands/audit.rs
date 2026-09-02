@@ -753,6 +753,7 @@ mod tests {
                 evidence: vec!["aaaaaaaaaaaa".to_owned(), "member0000000".to_owned()],
                 anchor: None,
                 pr: None,
+                parents: Vec::new(),
             },
             Entry {
                 ts: "2026-08-16T00:00:00Z".to_owned(),
@@ -764,6 +765,7 @@ mod tests {
                 evidence: vec!["bbbbbbbbbbbb".to_owned()],
                 anchor: None,
                 pr: None,
+                parents: Vec::new(),
             },
         ];
 
@@ -788,6 +790,7 @@ mod tests {
                 evidence: vec!["aaaaaaaaaaaa".to_owned(), "bbbbbbbbbbbb".to_owned()],
                 anchor: None,
                 pr: None,
+                parents: Vec::new(),
             })
             .expect("record cut");
         let mut report = Report {

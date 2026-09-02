@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::commands::status::{BranchRow, ClaimCell, LastNotch, RepoNotches, Report, SeenWindow};
-use crate::detect::Finding;
+use crate::detect::{Finding, FindingKind, Subject};
 use crate::ids::{BranchName, RepoName, WorkspaceName};
 use crate::jj::{MAX_ACTIVITY_OPS, Repo, WorkspaceActivity};
 use crate::ledger::{Entry as Notch, Ledger};
@@ -69,9 +69,33 @@ pub(super) struct ClaimFoldInput<'a> {
     pub(super) name: &'a RepoName,
     pub(super) store: &'a Store,
     pub(super) seen: &'a Seen,
+    pub(super) tips: &'a crate::detect::BookmarkTips,
+}
+
+/// Whether anything in the repository still names this branch: a bookmark
+/// locally or on a remote, or the workspace `knives start` would have opened
+/// for it. `@git` is jj's tracking view of its own last export, not a remote,
+/// and is excluded as it is everywhere else in this crate.
+fn branch_named_anywhere(
+    branch: &str,
+    tips: &crate::detect::BookmarkTips,
+    workspaces: &BTreeSet<WorkspaceName>,
+) -> bool {
+    let git_view = |reference: &crate::ids::BookmarkRef| matches!(reference, crate::ids::BookmarkRef::Remote { remote, .. } if remote.as_str() == "git");
+    tips.keys()
+        .any(|reference| reference.branch().as_str() == branch && !git_view(reference))
+        || workspaces.contains(&WorkspaceName::new(crate::commands::wip::workspace_for(
+            branch,
+        )))
 }
 
 /// Folds claims, workspace facts, and sidecar observations into branch rows.
+///
+/// A claim whose branch nothing names any more — no bookmark locally or on any
+/// remote, no workspace — is an `orphaned-claim` finding beside its bare row:
+/// the row still carries who held it and why, which `finish` needs, and the
+/// finding says why the row has no tip. `finish` is what releases a claim; a
+/// bookmark deleted around it leaves the claim behind.
 pub(super) fn fold_claims(
     report: &mut Report,
     findings: &mut Vec<Finding>,
@@ -82,6 +106,7 @@ pub(super) fn fold_claims(
         name,
         store,
         seen,
+        tips,
     } = input;
     let claims: Vec<Claim> = store.claims(Some(name)).into_iter().cloned().collect();
     let wanted: BTreeSet<WorkspaceName> = claims
@@ -97,23 +122,46 @@ pub(super) fn fold_claims(
             None
         }
     };
-    let mut workspaces: BTreeSet<WorkspaceName> = match repo.workspaces() {
-        Ok(rows) => rows.into_iter().map(|(workspace, _)| workspace).collect(),
+    // `None` when the list could not be read: an orphan question that cannot
+    // be answered is not a finding.
+    let workspaces: Option<BTreeSet<WorkspaceName>> = match repo.workspaces() {
+        Ok(rows) => Some(rows.into_iter().map(|(workspace, _)| workspace).collect()),
         Err(error) => {
             report
                 .problems
                 .push(format!("workspaces unavailable: {error}"));
-            BTreeSet::new()
+            None
         }
     };
     findings.extend(crate::commands::wip::overlaps(&touching(&claims)));
 
     for claim in &claims {
-        if !report
+        // A row already present — a maintained or divergent bookmark — names the
+        // branch; so does a workspace. With the workspace list unavailable the
+        // question cannot be answered, and an unanswered question is not a
+        // finding.
+        let has_row = report
             .branches
             .iter()
-            .any(|row| row.name.as_str() == claim.branch)
+            .any(|row| row.name.as_str() == claim.branch);
+        if let Some(workspaces) = &workspaces
+            && !has_row
+            && !branch_named_anywhere(&claim.branch, tips, workspaces)
         {
+            findings.push(Finding::new(
+                FindingKind::OrphanedClaim,
+                Subject::Branch(BranchName::new(&claim.branch)),
+                format!(
+                    "claim on {} held by {} ({}) since {}: no bookmark on any remote and no \
+                     workspace names it",
+                    claim.branch,
+                    claim.owner,
+                    crate::commands::claim::owner_kind_label(claim.kind),
+                    claim.started
+                ),
+            ));
+        }
+        if !has_row {
             report
                 .branches
                 .push(BranchRow::bare(BranchName::new(&claim.branch)));
@@ -139,13 +187,14 @@ pub(super) fn fold_claims(
             }
         }
     }
+    let mut unclaimed = workspaces.unwrap_or_default();
     for row in &mut report.branches {
         let expected = WorkspaceName::new(crate::commands::wip::workspace_for(row.name.as_str()));
-        if workspaces.remove(&expected) {
+        if unclaimed.remove(&expected) {
             row.workspace = Some(expected.to_string());
         }
     }
-    report.other_workspaces = workspaces
+    report.other_workspaces = unclaimed
         .into_iter()
         .map(|workspace| workspace.to_string())
         .collect();

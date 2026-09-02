@@ -340,6 +340,7 @@ pub fn run(request: &Request<'_>, output: crate::cli::Output) -> anyhow::Result<
                 text: text.to_owned(),
                 evidence: request.evidence.to_vec(),
                 pr,
+                parents: Vec::new(),
             })?;
             Report::Written {
                 repo: request.repo.to_string(),
@@ -380,6 +381,7 @@ mod tests {
             evidence: Vec::new(),
             anchor: Some("6c42fe71aaaaaaaa".to_owned()),
             pr: Some(1157),
+            parents: Vec::new(),
         }
     }
 
@@ -487,6 +489,7 @@ mod tests {
                     evidence: Vec::new(),
                     anchor: None,
                     pr: Some(7),
+                    parents: Vec::new(),
                 })
                 .expect("record event");
         }
@@ -501,6 +504,7 @@ mod tests {
                 evidence: Vec::new(),
                 anchor: None,
                 pr: Some(7),
+                parents: Vec::new(),
             })
             .expect("record note");
         let repo = RepoName::new("demo");

@@ -2,8 +2,7 @@
     clippy::expect_used,
     clippy::indexing_slicing,
     clippy::panic,
-    dead_code,
-    reason = "the shared lab fixture exposes helpers each isolated test target does not use"
+    reason = "a fixture or assertion that cannot proceed IS the test failure"
 )]
 
 #[path = "common/lab.rs"]

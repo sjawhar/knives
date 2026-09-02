@@ -16,10 +16,14 @@ use crate::store::Store;
 pub enum PullState {
     Unchanged,
     Advanced,
-    /// Seen for the first time; nothing to compare it against yet.
+    /// Seen for the first time. A first sighting is recorded silently, like
+    /// comment marks: the forge already holds the history, so a pull request
+    /// that merged months before tracking started is `New`, not `Merged`.
     New,
     Merged,
     Closed,
+    /// Recorded settled last time, open now.
+    Reopened,
 }
 
 impl PullState {
@@ -30,6 +34,7 @@ impl PullState {
             Self::Advanced => "advanced",
             Self::Merged => "merged",
             Self::Closed => "closed",
+            Self::Reopened => "reopened",
         }
     }
 }
@@ -40,22 +45,107 @@ impl fmt::Display for PullState {
     }
 }
 
+/// Where the forge says a pull request stands. Parsed case-insensitively from
+/// the forge's `OPEN`/`MERGED`/`CLOSED` and from the state file, which records
+/// what the forge said.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ForgeState {
+    Open,
+    Merged,
+    Closed,
+}
+
+impl ForgeState {
+    const fn is_settled(self) -> bool {
+        matches!(self, Self::Merged | Self::Closed)
+    }
+
+    /// The token the state file records: the forge's own spelling.
+    const fn as_recorded(self) -> &'static str {
+        match self {
+            Self::Open => "OPEN",
+            Self::Merged => "MERGED",
+            Self::Closed => "CLOSED",
+        }
+    }
+}
+
+impl std::str::FromStr for ForgeState {
+    type Err = String;
+
+    fn from_str(state: &str) -> Result<Self, Self::Err> {
+        if state.eq_ignore_ascii_case("open") {
+            Ok(Self::Open)
+        } else if state.eq_ignore_ascii_case("merged") {
+            Ok(Self::Merged)
+        } else if state.eq_ignore_ascii_case("closed") {
+            Ok(Self::Closed)
+        } else {
+            Err(format!("`{state}` is not a pull request state"))
+        }
+    }
+}
+
+impl fmt::Display for ForgeState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Open => "open",
+            Self::Merged => "merged",
+            Self::Closed => "closed",
+        })
+    }
+}
+
+/// This run's sighting of a pull request: its head, and where the forge said
+/// it stood if a forge was asked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Sighting<'a> {
+    pub head: &'a str,
+    pub state: Option<ForgeState>,
+}
+
+/// What the last sync recorded about a pull request.
+///
+/// The head it saw, and the forge state when that run asked the forge. Either
+/// may be absent — older state files carry heads alone — and both absent is a
+/// first sighting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Recorded<'a> {
+    pub head: Option<&'a str>,
+    pub state: Option<ForgeState>,
+}
+
 /// What happened to a tracked pull request since the last run.
 ///
-/// Forge state wins over movement: a merged pull request whose head also moved
-/// is merged, and calling it merely advanced keeps us carrying work that is
-/// already upstream.
-pub fn classify_pull(previous: Option<&str>, current: &str, state: &str) -> PullState {
-    match state.to_ascii_uppercase().as_str() {
-        "MERGED" => PullState::Merged,
-        "CLOSED" => PullState::Closed,
-        // A first sighting is not "nothing moved". Reporting them the same way made
-        // the first run against a fresh state file look like a quiet no-op.
-        _ => match previous {
-            None => PullState::New,
-            Some(seen) if seen != current => PullState::Advanced,
-            Some(_) => PullState::Unchanged,
-        },
+/// Nothing recorded means a first sighting, which is always `New`, whatever
+/// the current forge state: the forge already holds the history, and replaying
+/// a pull request's entire past as one event the moment tracking starts would
+/// misdate it: a first run once wrote `merged` events for pull requests settled
+/// months before. A head recorded without a state is a prior sighting while
+/// open, so its settling or moving is a transition. After that, forge state
+/// wins over head movement — a merged pull request whose head also moved is
+/// merged, not merely advanced — but a settled pull request (merged or closed)
+/// that was already recorded settled is `Unchanged`: the forge repeats a
+/// terminal state on every run, and that repetition is not a new event. A run
+/// without the forge classifies by head movement alone.
+pub fn classify_pull(previous: Recorded<'_>, current: Sighting<'_>) -> PullState {
+    if previous.head.is_none() && previous.state.is_none() {
+        return PullState::New;
+    }
+    let previous_state = previous.state.unwrap_or(ForgeState::Open);
+    match current.state {
+        Some(ForgeState::Merged) if previous_state != ForgeState::Merged => PullState::Merged,
+        Some(ForgeState::Closed) if previous_state != ForgeState::Closed => PullState::Closed,
+        Some(ForgeState::Merged | ForgeState::Closed) => PullState::Unchanged,
+        Some(ForgeState::Open) if previous_state.is_settled() => PullState::Reopened,
+        Some(ForgeState::Open) | None => {
+            if previous.head.is_some_and(|seen| seen != current.head) {
+                PullState::Advanced
+            } else {
+                PullState::Unchanged
+            }
+        }
     }
 }
 
@@ -64,6 +154,11 @@ pub struct Row {
     pub number: u64,
     pub label: String,
     pub state: PullState,
+    /// The forge's own state, absent when no forge was consulted. `state` names
+    /// the transition since the last sync; this names where the pull request
+    /// stands now, for a machine reader that only wants the latter.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub forge_state: Option<ForgeState>,
 }
 
 #[derive(Debug, Default, serde::Serialize)]
@@ -171,16 +266,23 @@ fn transition_text(number: u64, state: PullState, head: &str) -> Option<String> 
             "#{number} advanced to {}",
             head.chars().take(12).collect::<String>()
         )),
+        PullState::Reopened => Some(format!("#{number} reopened")),
         PullState::Unchanged | PullState::New => None,
     }
 }
 
-/// The classified state and observed head for one tracked pull request.
+/// The classified state, the observed head, and the raw forge state for one
+/// tracked pull request.
 #[derive(Clone, Copy)]
 struct PullTransition<'a> {
     number: u64,
     state: PullState,
     head: &'a str,
+    /// The forge's own state (`OPEN`/`MERGED`/`CLOSED`), persisted so the next
+    /// sync's `classify_pull` can tell a fresh transition into settled from a
+    /// settled pull that was already recorded settled. `None` when no forge was
+    /// consulted: a state nobody observed is not recorded over one somebody did.
+    forge_state: Option<ForgeState>,
 }
 
 /// Append an automatic event when the pull request's observed state changes.
@@ -190,14 +292,7 @@ fn record_transition_event(
     summaries: &[PullSummary],
     transition: PullTransition<'_>,
 ) -> Result<(), crate::ledger::LedgerError> {
-    let state = transition.state.as_str();
-    let settled = matches!(transition.state, PullState::Merged | PullState::Closed);
-    let state_changed = store.pull_state(scribe.repo(), transition.number) != Some(state);
-    // Forge state repeats for settled pulls, but every advanced classification
-    // names a new head and is therefore a distinct event.
-    if (!settled || state_changed)
-        && let Some(text) = transition_text(transition.number, transition.state, transition.head)
-    {
+    if let Some(text) = transition_text(transition.number, transition.state, transition.head) {
         let subject = summaries
             .iter()
             .find(|summary| summary.number == transition.number)
@@ -211,7 +306,9 @@ fn record_transition_event(
             pr.and_then(|target| store.tracked_pull(&target)),
         )?;
     }
-    store.record_pull_state(scribe.repo(), transition.number, state);
+    if let Some(forge_state) = transition.forge_state {
+        store.record_pull_state(scribe.repo(), transition.number, forge_state.as_recorded());
+    }
     Ok(())
 }
 
@@ -249,27 +346,60 @@ fn record_tracked_pulls(
             continue;
         }
 
-        let state = fact.map_or_else(|| "OPEN".to_owned(), |fact| fact.pull.state.clone());
+        // Without a forge answer the state is unknown, not open: classification
+        // falls back to head movement, and nothing is recorded over a state a
+        // forge-backed run observed.
+        let forge_state = match fact.map(|fact| fact.pull.state.parse::<ForgeState>()) {
+            Some(Ok(state)) => Some(state),
+            Some(Err(error)) => {
+                report
+                    .problems
+                    .push(format!("state of #{number} unreadable: {error}"));
+                continue;
+            }
+            None => None,
+        };
+        let previous_state = match input
+            .store
+            .pull_state(input.scribe.repo(), number)
+            .map(str::parse::<ForgeState>)
+        {
+            Some(Ok(state)) => Some(state),
+            Some(Err(error)) => {
+                report
+                    .problems
+                    .push(format!("recorded state of #{number} unreadable: {error}"));
+                continue;
+            }
+            None => None,
+        };
         let transition = PullTransition {
             number,
             state: classify_pull(
-                input.seen.get(&number.to_string()).map(String::as_str),
-                current,
-                &state,
+                Recorded {
+                    head: input.seen.get(&number.to_string()).map(String::as_str),
+                    state: previous_state,
+                },
+                Sighting {
+                    head: current,
+                    state: forge_state,
+                },
             ),
             head: current,
+            forge_state,
         };
         record_transition_event(input.scribe, input.store, input.summaries, transition)?;
         report.rows.push(Row {
             number,
             label,
             state: transition.state,
+            forge_state,
         });
         input
             .store
             .record_pull_head(input.scribe.repo(), number, current);
 
-        if state == "OPEN"
+        if forge_state == Some(ForgeState::Open)
             && let Some(newest) = fact.and_then(|fact| fact.newest_comment.as_ref())
         {
             // `gh` emits fixed-width RFC-3339 UTC timestamps, so lexical ordering is chronological.
@@ -427,9 +557,11 @@ pub fn render(report: &Report) -> String {
     ));
     for row in &report.rows {
         lines.push(format!(
-            "  #{:<6} {:<10} {}",
+            "  #{:<6} {:<10} {:<8} {}",
             row.number,
-            row.state.to_string(),
+            row.state,
+            row.forge_state
+                .map_or_else(|| "unknown".to_owned(), |state| state.to_string()),
             row.label
         ));
     }
@@ -476,38 +608,133 @@ mod tests {
         numbers.to_vec()
     }
 
+    /// What the last sync recorded, spelled as the state file spells it.
+    fn recorded<'a>(head: Option<&'a str>, state: Option<&str>) -> Recorded<'a> {
+        Recorded {
+            head,
+            state: state.map(|state| state.parse().expect("a pull request state")),
+        }
+    }
+
+    /// This run's sighting, spelled as the forge spells it.
+    fn sighting<'a>(head: &'a str, state: Option<&str>) -> Sighting<'a> {
+        Sighting {
+            head,
+            state: state.map(|state| state.parse().expect("a pull request state")),
+        }
+    }
+
     #[test]
     fn forge_state_wins_over_head_movement() {
         // Given: a pull request whose head moved AND which merged
         // Then: merged, because calling it advanced keeps us carrying landed work
-        assert_eq!(classify_pull(Some("a"), "b", "MERGED"), PullState::Merged);
-        assert_eq!(classify_pull(Some("a"), "b", "CLOSED"), PullState::Closed);
+        assert_eq!(
+            classify_pull(
+                recorded(Some("a"), Some("OPEN")),
+                sighting("b", Some("MERGED"))
+            ),
+            PullState::Merged
+        );
+        assert_eq!(
+            classify_pull(
+                recorded(Some("a"), Some("OPEN")),
+                sighting("b", Some("CLOSED"))
+            ),
+            PullState::Closed
+        );
     }
 
     #[test]
     fn a_moved_head_on_an_open_pull_request_is_advanced() {
-        assert_eq!(classify_pull(Some("a"), "b", "OPEN"), PullState::Advanced);
+        assert_eq!(
+            classify_pull(
+                recorded(Some("a"), Some("OPEN")),
+                sighting("b", Some("OPEN"))
+            ),
+            PullState::Advanced
+        );
     }
 
     #[test]
     fn an_unmoved_head_is_unchanged() {
-        assert_eq!(classify_pull(Some("a"), "a", "OPEN"), PullState::Unchanged);
+        assert_eq!(
+            classify_pull(
+                recorded(Some("a"), Some("OPEN")),
+                sighting("a", Some("OPEN"))
+            ),
+            PullState::Unchanged
+        );
     }
 
     #[test]
     fn a_first_sighting_is_new_rather_than_unchanged() {
         // Calling it unchanged made a first run against an empty state file read as
         // "nothing moved since last time", which is indistinguishable from a no-op.
-        assert_eq!(classify_pull(None, "a", "OPEN"), PullState::New);
-        assert_eq!(classify_pull(Some("a"), "a", "OPEN"), PullState::Unchanged);
-        assert_eq!(classify_pull(Some("a"), "b", "OPEN"), PullState::Advanced);
-        // Forge state still wins over first sighting.
-        assert_eq!(classify_pull(None, "a", "MERGED"), PullState::Merged);
+        assert_eq!(
+            classify_pull(Recorded::default(), sighting("a", Some("OPEN"))),
+            PullState::New
+        );
+        assert_eq!(
+            classify_pull(
+                recorded(Some("a"), Some("OPEN")),
+                sighting("a", Some("OPEN"))
+            ),
+            PullState::Unchanged
+        );
+        assert_eq!(
+            classify_pull(
+                recorded(Some("a"), Some("OPEN")),
+                sighting("b", Some("OPEN"))
+            ),
+            PullState::Advanced
+        );
+    }
+
+    #[test]
+    fn a_first_sighting_is_new_even_when_the_forge_already_settled_it() {
+        // A pull request that merged months before tracking started must not
+        // replay as a "merged" event the moment sync first sees it: the forge
+        // already holds that history, and the ledger should not.
+        assert_eq!(
+            classify_pull(Recorded::default(), sighting("a", Some("MERGED"))),
+            PullState::New
+        );
+        assert_eq!(
+            classify_pull(Recorded::default(), sighting("a", Some("CLOSED"))),
+            PullState::New
+        );
+    }
+
+    #[test]
+    fn a_settled_pull_recorded_settled_before_is_unchanged() {
+        // The forge repeats a terminal state on every run; that repetition is
+        // not a new event, and parsing case-insensitively tolerates whatever
+        // casing a previously recorded state happens to carry.
+        assert_eq!(
+            classify_pull(
+                recorded(Some("a"), Some("MERGED")),
+                sighting("a", Some("merged"))
+            ),
+            PullState::Unchanged
+        );
+        assert_eq!(
+            classify_pull(
+                recorded(Some("a"), Some("closed")),
+                sighting("a", Some("CLOSED"))
+            ),
+            PullState::Unchanged
+        );
     }
 
     #[test]
     fn state_matching_is_case_insensitive() {
-        assert_eq!(classify_pull(None, "a", "merged"), PullState::Merged);
+        assert_eq!(
+            classify_pull(
+                recorded(Some("a"), Some("OPEN")),
+                sighting("a", Some("merged"))
+            ),
+            PullState::Merged
+        );
     }
 
     #[test]
@@ -515,6 +742,22 @@ mod tests {
         // A first sighting and no movement are not facts this run observed.
         assert_eq!(transition_text(12, PullState::Unchanged, "head-12"), None);
         assert_eq!(transition_text(13, PullState::New, "head-13"), None);
+    }
+
+    #[test]
+    fn a_row_serializes_both_the_transition_and_the_forge_state() {
+        // `state` names what changed since the last sync; `forge_state` names
+        // where the pull request stands now. A machine reader that only wants
+        // the terminal state must not have to re-derive it from the transition.
+        let row = Row {
+            number: 1234,
+            label: "feat/foo".to_owned(),
+            state: PullState::Unchanged,
+            forge_state: Some(ForgeState::Merged),
+        };
+        let value = serde_json::to_value(&row).unwrap();
+        assert_eq!(value["state"], "unchanged");
+        assert_eq!(value["forge_state"], "merged");
     }
 
     #[test]
@@ -1090,6 +1333,10 @@ mod comment_activity_tests {
             error_on_comment: None,
         };
         let mut store = Store::open_for_update(store_path).unwrap();
+        // A first sighting of a closed pull is `New`, not `Closed` (that
+        // history belongs to the forge). Seed a prior open state so this
+        // sync observes the open-to-closed transition under test.
+        store.record_pull_state(&repo_name, 42, "OPEN");
 
         let report = sync_repo(SyncInput {
             entry: &entry,
@@ -1110,6 +1357,213 @@ mod comment_activity_tests {
                 .notes
                 .iter()
                 .any(|note| note.contains("comment activity"))
+        );
+    }
+
+    #[test]
+    fn a_first_sighting_of_an_already_merged_pull_is_new_with_no_ledger_event() {
+        let _lock = crate::config::test_support::environment_lock();
+        let temp = TempDir::new().unwrap();
+        let store_path = temp.path().join("state.json");
+        let repo_name = RepoName::new("test-repo");
+        let entry = local_entry(&temp);
+        let (_branch, mut pull_request) = test_pull(42, "feat/alpha");
+        pull_request.state = "MERGED".to_owned();
+        let forge = ErroringForge {
+            pull_requests: vec![pull_request],
+            newest_comments: BTreeMap::new(),
+            error_on_comment: None,
+        };
+        let mut store = Store::open_for_update(store_path).unwrap();
+        let ledger = crate::ledger::Ledger::at(temp.path().join("ledger"));
+
+        let report = sync_repo(SyncInput {
+            entry: &entry,
+            store: &mut store,
+            forge: Some(&forge),
+            scribe: &test_scribe(&temp, &repo_name),
+            cache: None,
+        })
+        .unwrap();
+
+        // The forge already holds this pull request's whole history; a first
+        // sighting must not replay months of it into the ledger as one event.
+        assert_eq!(
+            report.rows.first().map(|row| &row.state),
+            Some(&PullState::New),
+            "was: {report:?}"
+        );
+        assert!(
+            ledger.entries().unwrap().is_empty(),
+            "a first sighting must not write a ledger event"
+        );
+        assert_eq!(store.pull_state(&repo_name, 42), Some("MERGED"));
+    }
+
+    #[test]
+    fn a_second_sync_of_an_already_merged_pull_is_unchanged_with_no_ledger_event() {
+        let _lock = crate::config::test_support::environment_lock();
+        let temp = TempDir::new().unwrap();
+        let store_path = temp.path().join("state.json");
+        let repo_name = RepoName::new("test-repo");
+        let entry = local_entry(&temp);
+        let (_branch, mut pull_request) = test_pull(42, "feat/alpha");
+        pull_request.state = "MERGED".to_owned();
+        let scribe = test_scribe(&temp, &repo_name);
+        let ledger = crate::ledger::Ledger::at(temp.path().join("ledger"));
+
+        // First sync: the first sighting, already merged.
+        let forge_first = ErroringForge {
+            pull_requests: vec![pull_request.clone()],
+            newest_comments: BTreeMap::new(),
+            error_on_comment: None,
+        };
+        let mut store = Store::open_for_update(store_path.clone()).unwrap();
+        sync_repo(SyncInput {
+            entry: &entry,
+            store: &mut store,
+            forge: Some(&forge_first),
+            scribe: &scribe,
+            cache: None,
+        })
+        .unwrap();
+        store.save().unwrap();
+
+        // Second sync: the forge still reports the same merged pull request.
+        let forge_second = ErroringForge {
+            pull_requests: vec![pull_request],
+            newest_comments: BTreeMap::new(),
+            error_on_comment: None,
+        };
+        let mut store = Store::open(store_path).unwrap();
+        let report = sync_repo(SyncInput {
+            entry: &entry,
+            store: &mut store,
+            forge: Some(&forge_second),
+            scribe: &scribe,
+            cache: None,
+        })
+        .unwrap();
+
+        assert_eq!(
+            report.rows.first().map(|row| &row.state),
+            Some(&PullState::Unchanged),
+            "was: {report:?}"
+        );
+        assert!(
+            ledger.entries().unwrap().is_empty(),
+            "a settled pull that repeats settled must not write a second event"
+        );
+    }
+
+    #[test]
+    fn a_pull_request_that_merges_between_syncs_writes_one_merged_event() {
+        let _lock = crate::config::test_support::environment_lock();
+        let temp = TempDir::new().unwrap();
+        let store_path = temp.path().join("state.json");
+        let repo_name = RepoName::new("test-repo");
+        let entry = local_entry(&temp);
+        let scribe = test_scribe(&temp, &repo_name);
+        let ledger = crate::ledger::Ledger::at(temp.path().join("ledger"));
+
+        // First sync: open.
+        let (_branch, pull_request) = test_pull(42, "feat/alpha");
+        let forge_first = ErroringForge {
+            pull_requests: vec![pull_request],
+            newest_comments: BTreeMap::new(),
+            error_on_comment: None,
+        };
+        let mut store = Store::open_for_update(store_path.clone()).unwrap();
+        sync_repo(SyncInput {
+            entry: &entry,
+            store: &mut store,
+            forge: Some(&forge_first),
+            scribe: &scribe,
+            cache: None,
+        })
+        .unwrap();
+        store.save().unwrap();
+
+        // Second sync: merged.
+        let (_branch, mut merged_pull_request) = test_pull(42, "feat/alpha");
+        merged_pull_request.state = "MERGED".to_owned();
+        let forge_second = ErroringForge {
+            pull_requests: vec![merged_pull_request],
+            newest_comments: BTreeMap::new(),
+            error_on_comment: None,
+        };
+        let mut store = Store::open(store_path).unwrap();
+        let report = sync_repo(SyncInput {
+            entry: &entry,
+            store: &mut store,
+            forge: Some(&forge_second),
+            scribe: &scribe,
+            cache: None,
+        })
+        .unwrap();
+
+        assert_eq!(
+            report.rows.first().map(|row| &row.state),
+            Some(&PullState::Merged),
+            "was: {report:?}"
+        );
+        let events = ledger.entries().unwrap();
+        assert_eq!(events.len(), 1, "was: {events:?}");
+        assert_eq!(
+            events.first().map(|event| event.text.as_str()),
+            Some("#42 merged")
+        );
+    }
+
+    #[test]
+    fn an_open_pull_requests_moved_head_is_advanced() {
+        let _lock = crate::config::test_support::environment_lock();
+        let temp = TempDir::new().unwrap();
+        let store_path = temp.path().join("state.json");
+        let repo_name = RepoName::new("test-repo");
+        let entry = local_entry(&temp);
+        let scribe = test_scribe(&temp, &repo_name);
+
+        // First sync: open at head "aaaa".
+        let (_branch, pull_request) = test_pull(42, "feat/alpha");
+        let forge_first = ErroringForge {
+            pull_requests: vec![pull_request],
+            newest_comments: BTreeMap::new(),
+            error_on_comment: None,
+        };
+        let mut store = Store::open_for_update(store_path.clone()).unwrap();
+        sync_repo(SyncInput {
+            entry: &entry,
+            store: &mut store,
+            forge: Some(&forge_first),
+            scribe: &scribe,
+            cache: None,
+        })
+        .unwrap();
+        store.save().unwrap();
+
+        // Second sync: still open, head moved.
+        let (_branch, mut moved_pull_request) = test_pull(42, "feat/alpha");
+        moved_pull_request.head_ref_oid = "bbbb".to_owned();
+        let forge_second = ErroringForge {
+            pull_requests: vec![moved_pull_request],
+            newest_comments: BTreeMap::new(),
+            error_on_comment: None,
+        };
+        let mut store = Store::open(store_path).unwrap();
+        let report = sync_repo(SyncInput {
+            entry: &entry,
+            store: &mut store,
+            forge: Some(&forge_second),
+            scribe: &scribe,
+            cache: None,
+        })
+        .unwrap();
+
+        assert_eq!(
+            report.rows.first().map(|row| &row.state),
+            Some(&PullState::Advanced),
+            "was: {report:?}"
         );
     }
 }

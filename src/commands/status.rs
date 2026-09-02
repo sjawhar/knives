@@ -22,6 +22,7 @@ use crate::store::Store;
 
 mod claims;
 mod dependencies;
+mod merged;
 mod overlap;
 pub mod phases;
 mod releases;
@@ -148,6 +149,12 @@ pub struct PullCell {
     pub draft: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stated: Option<bool>,
+    /// When the newest review or comment landed, from the live fact. The
+    /// review column carries the forge's decision, and a comment-only review
+    /// or a maintainer's question leaves that decision empty; this is how a
+    /// reader sees that the pull request moved since they last looked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub activity_at: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub prior: Vec<PriorPull>,
 }
@@ -258,11 +265,24 @@ pub struct ForgeStatus {
     pub elapsed_ms: u64,
 }
 
+/// Every finding of one kind, in detector order.
 #[derive(Debug, serde::Serialize)]
 pub struct FindingGroup {
     pub kind: FindingKind,
-    pub count: usize,
-    pub subjects: Vec<String>,
+    pub items: Vec<GroupedFinding>,
+}
+
+/// One subject and the one-line fact about it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct GroupedFinding {
+    pub subject: String,
+    pub detail: String,
+}
+
+impl FindingGroup {
+    pub fn subjects(&self) -> impl Iterator<Item = &str> {
+        self.items.iter().map(|item| item.subject.as_str())
+    }
 }
 
 /// The most relevant ledger entry for one status row and the entries it masks.
@@ -273,6 +293,12 @@ pub struct LastNotch {
     pub text: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disposition: Option<String>,
+    /// The subject's tip when the entry was written. A past-tense entry stays
+    /// true at its anchor and may be stale at today's tip: a "NO carried commit"
+    /// note measured against one release read as current four days later, when
+    /// the branch had since been carried. Short (12 characters), for the row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<String>,
     pub count: usize,
 }
 
@@ -304,6 +330,7 @@ impl LastNotch {
             kind: entry.kind,
             text: collapsed_notch_text(&entry.text),
             disposition: entry.disposition.clone(),
+            anchor: entry.anchor.as_deref().map(short),
             count,
         })
     }
@@ -485,9 +512,88 @@ struct PostPhaseInput<'a> {
     options: &'a Options<'a>,
     tips: &'a BookmarkTips,
     notches: &'a [Notch],
-    divergent_branches: &'a [BranchName],
-    probe_inputs: Vec<phases::ProbeInput>,
+    /// Every divergent local bookmark with every commit it names: rows that
+    /// have no single tip.
+    divergent_branches: &'a BTreeMap<BranchName, Vec<CommitId>>,
     probe_ran: bool,
+    trunk_commit: Option<&'a CommitId>,
+}
+
+/// A `stacked-history` finding for every branch with an open pull request whose
+/// history past the trunk carries merges: that pull request asks its reviewer
+/// to take everything those merges carried. Branches without a pull request are
+/// the release plan's concern, where the same detector runs on the members.
+fn stacked_pull_findings(
+    report: &Report,
+    context: crate::release_model::StackedHistoryContext<'_>,
+    tips: &BookmarkTips,
+) -> anyhow::Result<Vec<Finding>> {
+    let mut findings = Vec::new();
+    for row in &report.branches {
+        let Some(pull) = row.pr.as_ref() else {
+            continue;
+        };
+        if !pull.state.eq_ignore_ascii_case("OPEN") {
+            continue;
+        }
+        let Some(tip) = tips.get(&BookmarkRef::Local(row.name.clone())) else {
+            continue;
+        };
+        findings.extend(crate::release_model::stacked_history(
+            context,
+            row.name.as_str(),
+            tip,
+        )?);
+    }
+    Ok(findings)
+}
+
+/// What the rows say once the forge and the graph are both in hand: landed
+/// verdicts the forge can settle, branches another reference carries, and pull
+/// requests whose history carries a release merge.
+fn settle_rows_after_phases(
+    report: &mut Report,
+    findings: &mut Vec<Finding>,
+    input: &PostPhaseInput<'_>,
+    index: &PullIndex,
+) -> anyhow::Result<()> {
+    merged::settle_merged_landed(
+        report,
+        merged::MergedLandedInput {
+            repo: input.repo,
+            index,
+            tips: input.tips,
+            divergent_tips: input.divergent_branches,
+            trunk_tip: input.trunk_commit,
+        },
+    )?;
+    let scheme = input.entry.release_scheme();
+    findings.extend(carried_findings(CarriedFindingInput {
+        report,
+        repo: input.repo,
+        tips: input.tips,
+        trunk: input.entry.trunk(),
+        scheme: &scheme,
+        publish_remote: input.entry.publish_remote(),
+    })?);
+    let trunks = crate::release_model::trunk_positions(input.repo, input.entry)?;
+    if !trunks.is_empty() {
+        let releases = crate::release_model::release_refs_by_commit(
+            input.tips,
+            &scheme,
+            input.entry.publish_remote(),
+        );
+        findings.extend(stacked_pull_findings(
+            report,
+            crate::release_model::StackedHistoryContext {
+                repo: input.repo,
+                trunks: &trunks,
+                releases: &releases,
+            },
+            input.tips,
+        )?);
+    }
+    Ok(())
 }
 
 fn add_pull_state_findings(
@@ -542,7 +648,21 @@ fn finalize_status(
     findings: &mut Vec<Finding>,
     input: FinalStatusInput<'_, '_>,
 ) {
-    report.problems.extend(unjudged_note(input.unjudged));
+    // The forge may have settled a replay the probe could not judge (a merged
+    // pull request whose head the trunk now has); a row that reads `in-trunk`
+    // is not a branch nobody could judge.
+    let still_unjudged: Vec<String> = input
+        .unjudged
+        .iter()
+        .filter(|name| {
+            report.branches.iter().any(|row| {
+                row.name.as_str() == name.as_str()
+                    && matches!(row.landed, Some(LandedVerdict::Unjudged))
+            })
+        })
+        .cloned()
+        .collect();
+    report.problems.extend(unjudged_note(&still_unjudged));
     if let Some(snapshot) = input.snapshot {
         add_pull_state_findings(report, findings, snapshot);
     }
@@ -566,7 +686,8 @@ fn append_divergent_rows(
 /// Fold completed phases into rows, findings, timings, and cache persistence.
 fn fold_phase_outcome(
     output: FoldOutput<'_>,
-    input: PostPhaseInput<'_>,
+    input: &PostPhaseInput<'_>,
+    probe_inputs: Vec<phases::ProbeInput>,
     phases: &mut phases::StatusPhases<'_>,
 ) -> anyhow::Result<()> {
     let FoldOutput {
@@ -584,16 +705,13 @@ fn fold_phase_outcome(
     timings.probes = phases.probe.duration;
 
     let phase = std::time::Instant::now();
-    let origin_phase = phases::origin_phase(
-        &input.entry.path,
-        &input.probe_inputs,
-        input.options.workers,
-    );
+    let origin_phase =
+        phases::origin_phase(&input.entry.path, &probe_inputs, input.options.workers);
     let unjudged = rows::branch_rows(
         rows::RowInput {
             name: input.name,
             store: input.store,
-            probe_inputs: input.probe_inputs,
+            probe_inputs,
             verdicts: std::mem::take(&mut phases.probe.verdicts),
             origin_relations: origin_phase.relations,
             index,
@@ -606,9 +724,10 @@ fn fold_phase_outcome(
     )?;
     timings.origin_relations = phase.elapsed();
 
+    let divergent_names: Vec<BranchName> = input.divergent_branches.keys().cloned().collect();
     timings.divergent_rows = append_divergent_rows(
         &rows::DivergentInput {
-            branches: input.divergent_branches,
+            branches: &divergent_names,
             tips: input.tips,
             name: input.name,
             store: input.store,
@@ -620,17 +739,8 @@ fn fold_phase_outcome(
         report,
         findings,
     );
-
     let phase = std::time::Instant::now();
-    let scheme = input.entry.release_scheme();
-    findings.extend(carried_findings(CarriedFindingInput {
-        report,
-        repo: input.repo,
-        tips: input.tips,
-        trunk: input.entry.trunk(),
-        scheme: &scheme,
-        publish_remote: input.entry.publish_remote(),
-    })?);
+    settle_rows_after_phases(report, findings, input, index)?;
     timings.carried_findings = phase.elapsed();
 
     timings.touching =
@@ -646,6 +756,7 @@ fn fold_phase_outcome(
             name: input.name,
             store: input.store,
             seen: &seen,
+            tips: input.tips,
         },
     )?;
     timings.claims = phase.elapsed();
@@ -714,13 +825,13 @@ pub fn gather_timed(
     let phase = std::time::Instant::now();
     let (branches, fetched_heads) =
         rows::maintained_branches(&tips, entry.trunk(), &entry.release_scheme());
-    let divergent_branches = rows::divergent_branch_names(&repo, entry)?;
+    let divergent_branches = rows::divergent_branches(&repo, entry)?;
     let probe_inputs = phases::probe_inputs(branches, &tips);
     let mut all_branches: Vec<BranchName> = probe_inputs
         .iter()
         .map(|input| input.branch.clone())
         .collect();
-    all_branches.extend(divergent_branches.iter().cloned());
+    all_branches.extend(divergent_branches.keys().cloned());
     let declared = phases::declared_numbers(name, &all_branches, store);
     let notches = notches_from_ledger(options.ledger, &mut report);
     report.repo_notches = repo_notches(&notches);
@@ -768,7 +879,7 @@ pub fn gather_timed(
             findings: &mut findings,
             timings: &mut timings,
         },
-        PostPhaseInput {
+        &PostPhaseInput {
             name,
             entry,
             repo: &repo,
@@ -777,9 +888,10 @@ pub fn gather_timed(
             tips: &tips,
             notches: &notches,
             divergent_branches: &divergent_branches,
-            probe_inputs,
             probe_ran,
+            trunk_commit: trunk_commit.as_ref(),
         },
+        probe_inputs,
         &mut phases,
     )?;
     report.findings = group_findings(findings);
@@ -821,20 +933,27 @@ fn grouped_subject(finding: &Finding) -> String {
 }
 
 /// Folds raw findings once, after every detector has reported, preserving detector order.
+///
+/// Every finding keeps its subject and its detail. The one-line-per-kind text
+/// view shows the first few subjects; `--verbose` and the machine output carry
+/// all of them with their detail, because a subject alone (`#11`) does not say
+/// which workflow never ran or which release a stacked branch carries, and a
+/// reader who asked for detail on the ninth finding was not asking for the
+/// first eight.
 fn group_findings(findings: Vec<Finding>) -> Vec<FindingGroup> {
     let mut groups: Vec<FindingGroup> = Vec::new();
     for finding in findings {
         let subject = grouped_subject(&finding);
+        let item = GroupedFinding {
+            subject,
+            detail: finding.detail,
+        };
         if let Some(group) = groups.iter_mut().find(|group| group.kind == finding.kind) {
-            group.count += 1;
-            if group.subjects.len() < 8 {
-                group.subjects.push(subject);
-            }
+            group.items.push(item);
         } else {
             groups.push(FindingGroup {
                 kind: finding.kind,
-                count: 1,
-                subjects: vec![subject],
+                items: vec![item],
             });
         }
     }
@@ -915,7 +1034,7 @@ mod tests {
     }
 
     #[test]
-    fn findings_group_by_kind_in_first_seen_order_and_cap_subjects() {
+    fn findings_group_by_kind_in_first_seen_order_and_keep_every_subject() {
         let mut findings = vec![Finding::new(
             FindingKind::WrongBase,
             Subject::PullRequest(1),
@@ -925,19 +1044,31 @@ mod tests {
             Finding::new(
                 FindingKind::Divergence,
                 Subject::Branch(BranchName::new(format!("feat/{number}"))),
-                "detail",
+                format!("feat/{number} is on two commits"),
             )
         }));
 
         let groups = group_findings(findings);
 
+        // Every subject and its detail survive grouping: the one-line text view
+        // truncates, the machine output and --verbose do not.
         assert_eq!(groups.len(), 2, "was: {groups:?}");
         assert_eq!(groups[0].kind, FindingKind::WrongBase);
         assert_eq!(groups[1].kind, FindingKind::Divergence);
-        assert_eq!(groups[1].count, 30);
-        assert_eq!(groups[1].subjects.len(), 8);
-        assert_eq!(groups[1].subjects[0], "feat/0");
-        assert_eq!(groups[1].subjects[7], "feat/7");
+        assert_eq!(groups[1].items.len(), 30);
+        assert_eq!(groups[1].items[0].subject, "feat/0");
+        assert_eq!(groups[1].items[29].detail, "feat/29 is on two commits");
+        let text = render::render(
+            &Report {
+                findings: groups,
+                ..Report::default()
+            },
+            false,
+        );
+        assert!(
+            text.contains("feat/7, and 22 more") && !text.contains("feat/8"),
+            "the one-line view caps at eight subjects: {text}"
+        );
     }
 
     #[test]
@@ -1041,6 +1172,7 @@ mod tests {
             evidence: Vec::new(),
             anchor: None,
             pr: None,
+            parents: Vec::new(),
         };
 
         let last = LastNotch::of([&note].into_iter()).expect("a notch");
@@ -1155,14 +1287,20 @@ mod tests {
         let dirty = Report {
             findings: vec![FindingGroup {
                 kind: FindingKind::Divergence,
-                count: 1,
-                subjects: vec!["feat/a".to_owned()],
+                items: vec![GroupedFinding {
+                    subject: "feat/a".to_owned(),
+                    detail: "feat/a is on two commits".to_owned(),
+                }],
             }],
             ..Report::default()
         };
         assert_eq!(exit_for(&dirty), Exit::Findings);
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one fixture exercising every row cell at once is the point of the scale snapshot"
+    )]
     fn swe_scale_fixture() -> Report {
         let branches = (0..14)
             .map(|index| {
@@ -1179,6 +1317,7 @@ mod tests {
                         state: "open".to_owned(),
                         draft: false,
                         stated: None,
+                        activity_at: Some("2026-08-30T09:15:00Z".to_owned()),
                         prior: Vec::new(),
                     });
                     row.review = Some("changes-requested".to_owned());
@@ -1198,6 +1337,7 @@ mod tests {
                         kind: crate::ledger::Kind::Note,
                         text: "Release triage recorded after the final merge queue drain.".to_owned(),
                         disposition: Some("decided".to_owned()),
+                        anchor: Some("0f1e2d3c4b5a".to_owned()),
                         count: 4,
                     });
                 }
@@ -1216,9 +1356,11 @@ mod tests {
             .collect();
         let finding = |kind, count, prefix: &str| FindingGroup {
             kind,
-            count,
-            subjects: (0..count)
-                .map(|index| format!("{prefix}-{index:02}"))
+            items: (0..count)
+                .map(|index| GroupedFinding {
+                    subject: format!("{prefix}-{index:02}"),
+                    detail: format!("{prefix}-{index:02} needs attention"),
+                })
                 .collect(),
         };
 
@@ -1254,6 +1396,7 @@ mod tests {
                     kind: crate::ledger::Kind::Note,
                     text: "Release triage recorded after the final merge queue drain.".to_owned(),
                     disposition: Some("decided".to_owned()),
+                    anchor: None,
                     count: 4,
                 },
             }),
@@ -1286,7 +1429,7 @@ mod tests {
             report
                 .findings
                 .iter()
-                .map(|finding| finding.count)
+                .map(|finding| finding.items.len())
                 .sum::<usize>(),
             34
         );
@@ -1309,11 +1452,20 @@ mod tests {
         assert!(report.branches.iter().any(|row| row.workspace.is_some()));
         assert!(report.branches.iter().any(|row| row.notch.is_some()));
 
+        // Findings are one tabular row each, so their share of the encoding is
+        // exactly the findings and nothing more; everything else stays a map.
         let toon = toon_format::encode_default(&report).expect("encode");
         let lines = toon.lines().count();
+        let groups = report.findings.len();
+        let findings: usize = report.findings.iter().map(|group| group.items.len()).sum();
+        let findings_lines = groups * 2 + findings;
         assert!(
-            lines <= 120,
-            "the map regressed to a dump: {lines} lines\n{toon}"
+            lines - findings_lines <= 100,
+            "the map regressed to a dump: {lines} lines, {findings_lines} of them findings\n{toon}"
+        );
+        assert!(
+            toon.contains("items[6]{subject,detail}:"),
+            "findings must encode as one row per subject: {toon}"
         );
     }
 

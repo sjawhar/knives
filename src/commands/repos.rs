@@ -14,9 +14,12 @@ use crate::ids::{BookmarkRef, BranchName, ReleaseScheme, RemoteName, is_our_rele
 use crate::jj::Repo;
 use crate::release_model::{release_order, repo_slug};
 
-struct ReleaseState {
-    newest: Option<String>,
-    repo: Option<Repo>,
+/// Cached release lookup for one repo, computed once and shared across every
+/// consumer's pin-lag comparison for that repo.
+#[derive(Debug)]
+pub struct ReleaseState {
+    pub newest: Option<String>,
+    pub repo: Option<Repo>,
 }
 
 /// Selects the release reference that represents a repository's newest publishable state.
@@ -248,64 +251,134 @@ fn fixed_pin_lag(
     }
 }
 
-#[allow(
-    clippy::too_many_arguments,
-    reason = "rendering consumes command-level state rather than a duplicated request object with the same fields"
-)]
-fn render_with_releases(
-    registry: &Registry,
-    releases: &BTreeMap<String, ReleaseState>,
-    config_path: &Path,
-    forge: &dyn ConsumerPinSource,
-    cache_root: Option<&Path>,
-    heads: &ConsumerHeadMemo,
-) -> (String, bool) {
-    if registry.is_empty() {
-        return (render(registry, config_path), false);
+/// What `knives repos` reports: per-repo release/consumer state, trusted mounts,
+/// and any registry-level notes (where to add entries, or that pin state lives
+/// in consumers).
+#[derive(Debug, serde::Serialize)]
+pub struct Report {
+    pub repos: Vec<RepoRow>,
+    pub trusted: Vec<TrustedRow>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
+    pub config_path: String,
+}
+
+/// One maintained repository: its release position and how far its consumers lag it.
+#[derive(Debug, serde::Serialize)]
+pub struct RepoRow {
+    pub name: String,
+    pub path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub release_remote: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub newest_release: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub behind: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub problems: Vec<String>,
+}
+
+/// A trusted-but-unmaintained mount: instructions are read, nothing here is
+/// pinned or released.
+#[derive(Debug, serde::Serialize)]
+pub struct TrustedRow {
+    pub name: String,
+    pub path: String,
+}
+
+/// What one listing reads: the registry, each repository's release state, and
+/// the consumer-scan collaborators every row shares.
+pub struct GatherInput<'a> {
+    pub registry: &'a Registry,
+    pub releases: &'a BTreeMap<String, ReleaseState>,
+    pub config_path: &'a Path,
+    pub forge: &'a dyn ConsumerPinSource,
+    pub cache_root: Option<&'a Path>,
+    pub heads: &'a ConsumerHeadMemo,
+}
+
+impl std::fmt::Debug for GatherInput<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GatherInput")
+            .field("config_path", &self.config_path)
+            .field("repos", &self.registry.repos.len())
+            .finish_non_exhaustive()
     }
-    let width = registry.repos.keys().map(String::len).max().unwrap_or(0);
-    let mut lines = Vec::new();
-    let mut incomplete = false;
-    for (name, entry) in &registry.repos {
-        let mut line = format!("{name:<width$}  {}", entry.path.display());
-        if entry.has_split_release() {
-            let _ = write!(line, "  release-remote={}", entry.remote(Role::Release));
-        }
-        let state = releases.get(name);
-        let newest = state.and_then(|state| state.newest.as_ref());
-        match newest {
-            Some(newest) => {
-                let _ = write!(line, "  newest={newest}");
+}
+
+/// Collects release state and consumer pin lag for every maintained and
+/// trusted registry entry.
+pub fn gather(input: &GatherInput<'_>) -> Report {
+    let GatherInput {
+        registry,
+        releases,
+        config_path,
+        forge,
+        cache_root,
+        heads,
+    } = *input;
+    let repos = registry
+        .repos
+        .iter()
+        .map(|(name, entry)| {
+            let state = releases.get(name);
+            let newest = state.and_then(|state| state.newest.as_ref());
+            let pin_lag = pin_lag(
+                entry,
+                newest,
+                state.and_then(|state| state.repo.as_ref()),
+                forge,
+                cache_root,
+                heads,
+            );
+            RepoRow {
+                name: name.clone(),
+                path: entry.path.display().to_string(),
+                release_remote: entry
+                    .has_split_release()
+                    .then(|| entry.remote(Role::Release).to_owned()),
+                newest_release: newest.cloned(),
+                behind: pin_lag.lag,
+                notes: pin_lag.notes,
+                problems: pin_lag.problems,
             }
-            None => line.push_str("  newest=none"),
+        })
+        .collect::<Vec<_>>();
+    let trusted = registry
+        .trusted
+        .iter()
+        .map(|(name, entry)| TrustedRow {
+            name: name.clone(),
+            path: entry.path.display().to_string(),
+        })
+        .collect::<Vec<_>>();
+
+    // Saying where to add entries beats printing nothing and exiting zero; a
+    // trusted-only registry is a real configuration, not an empty one, so that
+    // note only fires when both sections are empty.
+    let mut notes = Vec::new();
+    if repos.is_empty() {
+        if trusted.is_empty() {
+            notes.push(format!(
+                "no repos configured; add entries to {}",
+                config_path.display()
+            ));
         }
-        let pin_lag = pin_lag(
-            entry,
-            newest,
-            state.and_then(|state| state.repo.as_ref()),
-            forge,
-            cache_root,
-            heads,
-        );
-        if let Some(lag) = pin_lag.lag {
-            let _ = write!(line, "  BEHIND: {lag}");
-        }
-        lines.push(line);
-        lines.extend(pin_lag.notes.into_iter().map(|note| format!("  ! {note}")));
-        incomplete |= !pin_lag.problems.is_empty();
-        lines.extend(
-            pin_lag
-                .problems
-                .into_iter()
-                .map(|problem| format!("  ? {problem}")),
+    } else {
+        notes.push(
+            "pin state lives in consumers: record them as `consumers = [...]` in the registry"
+                .to_owned(),
         );
     }
-    lines.extend(trusted_lines(registry));
-    lines.push(
-        "pin state lives in consumers: record them as `consumers = [...]` in the registry"
-            .to_owned(),
-    );
-    (lines.join("\n"), incomplete)
+
+    Report {
+        repos,
+        trusted,
+        notes,
+        config_path: config_path.display().to_string(),
+    }
 }
 
 /// Trusted-but-unmaintained entries, listed apart from the forks.
@@ -314,79 +387,93 @@ fn render_with_releases(
 /// these change what guidance an agent receives, so they have to be visible. Kept
 /// under their own heading because they are not answers to "what am I
 /// maintaining" — no fork command touches them.
-fn trusted_lines(registry: &Registry) -> Vec<String> {
-    if registry.trusted.is_empty() {
+fn trusted_lines(trusted: &[TrustedRow]) -> Vec<String> {
+    if trusted.is_empty() {
         return Vec::new();
     }
-    let width = registry.trusted.keys().map(String::len).max().unwrap_or(0);
+    let width = trusted
+        .iter()
+        .map(|entry| entry.name.len())
+        .max()
+        .unwrap_or(0);
     let mut lines = vec!["trusted (instructions read, not maintained):".to_owned()];
     lines.extend(
-        registry
-            .trusted
+        trusted
             .iter()
-            .map(|(name, entry)| format!("  {name:<width$}  {}", entry.path.display())),
+            .map(|entry| format!("  {:<width$}  {}", entry.name, entry.path)),
     );
     lines
 }
 
-pub fn render(registry: &Registry, config_path: &Path) -> String {
-    if registry.is_empty() {
-        // A trusted-only registry is a real configuration, not an empty one, so it
-        // must not be reported as "nothing configured".
-        let trusted = trusted_lines(registry);
-        if !trusted.is_empty() {
-            return trusted.join("\n");
+pub fn render(report: &Report) -> String {
+    if report.repos.is_empty() {
+        if report.trusted.is_empty() {
+            return report.notes.first().cloned().unwrap_or_default();
         }
-        // Saying where to put them beats printing nothing and exiting zero.
-        return format!(
-            "no repos configured; add entries to {}",
-            config_path.display()
-        );
+        return trusted_lines(&report.trusted).join("\n");
     }
 
-    let width = registry.repos.keys().map(String::len).max().unwrap_or(0);
-    registry
+    let width = report
         .repos
         .iter()
-        .map(|(name, entry)| {
-            let mut line = format!("{name:<width$}  {}", entry.path.display());
-            if entry.has_split_release() {
-                // Only shown when releases genuinely live elsewhere, so the
-                // common case stays quiet.
-                let _ = write!(line, "  release={}", entry.remote(Role::Release));
+        .map(|repo| repo.name.len())
+        .max()
+        .unwrap_or(0);
+    let mut lines = Vec::new();
+    for repo in &report.repos {
+        let mut line = format!("{:<width$}  {}", repo.name, repo.path);
+        if let Some(release_remote) = &repo.release_remote {
+            let _ = write!(line, "  release-remote={release_remote}");
+        }
+        match &repo.newest_release {
+            Some(newest) => {
+                let _ = write!(line, "  newest={newest}");
             }
-            line
-        })
-        .chain(trusted_lines(registry))
-        .collect::<Vec<_>>()
-        .join("\n")
+            None => line.push_str("  newest=none"),
+        }
+        if let Some(behind) = &repo.behind {
+            let _ = write!(line, "  BEHIND: {behind}");
+        }
+        lines.push(line);
+        lines.extend(repo.notes.iter().map(|note| format!("  ! {note}")));
+        lines.extend(repo.problems.iter().map(|problem| format!("  ? {problem}")));
+    }
+    lines.extend(trusted_lines(&report.trusted));
+    lines.extend(report.notes.iter().cloned());
+    lines.join("\n")
 }
 
-const fn report_exit(incomplete: bool) -> Exit {
-    if incomplete {
+/// A repository whose pin state could not be compared leaves the listing
+/// incomplete: the command's central question went unanswered there.
+pub fn exit_for(report: &Report) -> Exit {
+    if report.repos.iter().any(|repo| !repo.problems.is_empty()) {
         Exit::Incomplete
     } else {
         Exit::Ok
     }
 }
 
-pub fn run() -> anyhow::Result<Exit> {
+pub fn run(output: crate::cli::Output) -> anyhow::Result<Exit> {
     let path = default_config_path();
     let registry = load(&path)?;
     let releases = release_state(&registry);
     let forge = crate::forge::github::CliForge;
     let cache_root = crate::forge_cache::cache_root();
     let heads = ConsumerHeadMemo::default();
-    let (rendered, incomplete) = render_with_releases(
-        &registry,
-        &releases,
-        &path,
-        &forge,
-        cache_root.as_deref(),
-        &heads,
-    );
-    println!("{rendered}");
-    Ok(report_exit(incomplete))
+    let report = gather(&GatherInput {
+        registry: &registry,
+        releases: &releases,
+        config_path: &path,
+        forge: &forge,
+        cache_root: cache_root.as_deref(),
+        heads: &heads,
+    });
+    if let Some(payload) = crate::cli::machine_payload(output, &report)? {
+        println!("{payload}");
+    } else {
+        println!("{}", render(&report));
+    }
+    Ok(exit_for(&report))
 }
 
 #[cfg(test)]
@@ -398,7 +485,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::config::RepoEntry;
+    use crate::config::{RepoEntry, TrustedEntry};
     use crate::consumer_pins::ConsumerHeadMemo;
     use crate::forge::{ConsumerHead, fake::FakeForge};
     use crate::ids::{BookmarkRef, BranchName, CommitId, RemoteName};
@@ -505,11 +592,20 @@ mod tests {
     fn repos_are_listed_one_per_line_sorted_by_name() {
         // Given: two repos out of order
         let registry = registry(&[("beta", None), ("alpha", None)]);
-        // When: rendered
-        let out = render(&registry, Path::new("/tmp/repos.toml"));
-        // Then: alphabetical, one per line
+        let releases = release_state(&registry);
+        // When: gathered and rendered
+        let report = gather(&GatherInput {
+            registry: &registry,
+            releases: &releases,
+            config_path: Path::new("/tmp/repos.toml"),
+            forge: &FakeForge::default(),
+            cache_root: None,
+            heads: &ConsumerHeadMemo::default(),
+        });
+        let out = render(&report);
+        // Then: alphabetical, one per line, plus the trailing consumer note
         let lines: Vec<&str> = out.lines().collect();
-        assert_eq!(lines.len(), 2);
+        assert_eq!(lines.len(), 3);
         assert!(lines[0].starts_with("alpha"));
         assert!(lines[1].starts_with("beta"));
     }
@@ -714,16 +810,17 @@ mod tests {
             },
         )]);
 
-        let (rendered, incomplete) = render_with_releases(
-            &registry,
-            &releases,
-            Path::new("/tmp/repos.toml"),
-            &forge,
-            None,
-            &heads,
-        );
+        let report = gather(&GatherInput {
+            registry: &registry,
+            releases: &releases,
+            config_path: Path::new("/tmp/repos.toml"),
+            forge: &forge,
+            cache_root: None,
+            heads: &heads,
+        });
+        let rendered = render(&report);
 
-        assert!(!incomplete);
+        assert_eq!(exit_for(&report), Exit::Ok);
         assert!(
             rendered.contains("\n  ! could not compare"),
             "was: {rendered}"
@@ -765,55 +862,170 @@ mod tests {
             ..FakeForge::default()
         };
         let priming_heads = ConsumerHeadMemo::default();
-        let (_, priming_incomplete) = render_with_releases(
-            &registry,
-            &releases,
-            Path::new("/tmp/repos.toml"),
-            &priming_forge,
-            Some(cache.path()),
-            &priming_heads,
-        );
-        assert!(!priming_incomplete);
+        let priming_report = gather(&GatherInput {
+            registry: &registry,
+            releases: &releases,
+            config_path: Path::new("/tmp/repos.toml"),
+            forge: &priming_forge,
+            cache_root: Some(cache.path()),
+            heads: &priming_heads,
+        });
+        assert_eq!(exit_for(&priming_report), Exit::Ok);
 
         let unavailable_forge = FakeForge {
             fail_consumer_head: true,
             ..FakeForge::default()
         };
         let unavailable_heads = ConsumerHeadMemo::default();
-        let (rendered, incomplete) = render_with_releases(
-            &registry,
-            &releases,
-            Path::new("/tmp/repos.toml"),
-            &unavailable_forge,
-            Some(cache.path()),
-            &unavailable_heads,
-        );
+        let report = gather(&GatherInput {
+            registry: &registry,
+            releases: &releases,
+            config_path: Path::new("/tmp/repos.toml"),
+            forge: &unavailable_forge,
+            cache_root: Some(cache.path()),
+            heads: &unavailable_heads,
+        });
+        let rendered = render(&report);
 
         assert!(rendered.contains("? acme/consumer: forge unreachable:"));
         assert!(rendered.contains("fake consumer head failed"));
         assert!(rendered.contains(
             "! acme/consumer: forge unreachable; pins answered from cache at aaaaaaaaaaaa"
         ));
-        assert_eq!(report_exit(incomplete), Exit::Incomplete);
+        assert_eq!(exit_for(&report), Exit::Incomplete);
     }
 
     #[test]
     fn a_split_release_remote_is_shown() {
         let registry = registry(&[("split", Some("r"))]);
-        assert!(render(&registry, Path::new("/tmp/repos.toml")).contains("release=r"));
+        let releases = release_state(&registry);
+        let report = gather(&GatherInput {
+            registry: &registry,
+            releases: &releases,
+            config_path: Path::new("/tmp/repos.toml"),
+            forge: &FakeForge::default(),
+            cache_root: None,
+            heads: &ConsumerHeadMemo::default(),
+        });
+        assert!(render(&report).contains("release-remote=r"));
     }
 
     #[test]
     fn the_release_column_is_omitted_when_it_defaults_to_origin() {
         let registry = registry(&[("simple", None)]);
-        assert!(!render(&registry, Path::new("/tmp/repos.toml")).contains("release="));
+        let releases = release_state(&registry);
+        let report = gather(&GatherInput {
+            registry: &registry,
+            releases: &releases,
+            config_path: Path::new("/tmp/repos.toml"),
+            forge: &FakeForge::default(),
+            cache_root: None,
+            heads: &ConsumerHeadMemo::default(),
+        });
+        assert!(!render(&report).contains("release-remote="));
     }
 
     #[test]
     fn an_empty_registry_reports_where_to_add_entries() {
         // Printing nothing would be indistinguishable from a broken command.
-        let out = render(&Registry::default(), Path::new("/tmp/somewhere/repos.toml"));
+        let report = gather(&GatherInput {
+            registry: &Registry::default(),
+            releases: &BTreeMap::new(),
+            config_path: Path::new("/tmp/somewhere/repos.toml"),
+            forge: &FakeForge::default(),
+            cache_root: None,
+            heads: &ConsumerHeadMemo::default(),
+        });
+        let out = render(&report);
         assert!(out.contains("no repos configured"));
         assert!(out.contains("/tmp/somewhere/repos.toml"));
+    }
+
+    #[test]
+    fn an_empty_registry_gathers_a_note_pointing_at_the_config_path() {
+        // The Report model carries the same note independent of rendering, so
+        // TOON/JSON consumers see it too.
+        let report = gather(&GatherInput {
+            registry: &Registry::default(),
+            releases: &BTreeMap::new(),
+            config_path: Path::new("/tmp/somewhere/repos.toml"),
+            forge: &FakeForge::default(),
+            cache_root: None,
+            heads: &ConsumerHeadMemo::default(),
+        });
+        assert!(report.repos.is_empty());
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|note| note.contains("no repos configured")
+                    && note.contains("/tmp/somewhere/repos.toml"))
+        );
+    }
+
+    #[test]
+    fn a_gathered_report_serializes_release_state_and_trusted_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let consumer = "acme/behind";
+        let commit = "aaaaaaaaaaaaaaaa";
+        let forge = FakeForge {
+            heads: BTreeMap::from([(
+                consumer.to_owned(),
+                ConsumerHead {
+                    branch: "main".to_owned(),
+                    commit: commit.to_owned(),
+                },
+            )]),
+            files: BTreeMap::from([(
+                (consumer.to_owned(), commit.to_owned(), "uv.lock".to_owned()),
+                "git = \"https://forge.invalid/o/sandbox-runner.git?rev=release/2026-07-20\"\n"
+                    .to_owned(),
+            )]),
+            ..FakeForge::default()
+        };
+        let heads = ConsumerHeadMemo::default();
+        let mut sandbox = entry(None);
+        sandbox.path = dir.path().join("repo");
+        sandbox.origin = "https://forge.invalid/o/sandbox-runner".to_owned();
+        sandbox.consumers = vec![consumer.to_owned()];
+        let registry = Registry {
+            repos: BTreeMap::from([("sandbox-runner".to_owned(), sandbox)]),
+            trusted: BTreeMap::from([(
+                "legacy".to_owned(),
+                TrustedEntry {
+                    path: PathBuf::from("/tmp/legacy"),
+                },
+            )]),
+            ..Registry::default()
+        };
+        let releases = BTreeMap::from([(
+            "sandbox-runner".to_owned(),
+            ReleaseState {
+                newest: Some("release/2026-07-28@origin".to_owned()),
+                repo: None,
+            },
+        )]);
+
+        let report = gather(&GatherInput {
+            registry: &registry,
+            releases: &releases,
+            config_path: Path::new("/tmp/repos.toml"),
+            forge: &forge,
+            cache_root: None,
+            heads: &heads,
+        });
+        let json = serde_json::to_value(&report).expect("serialize report");
+
+        assert_eq!(
+            json["repos"][0]["newest_release"],
+            "release/2026-07-28@origin"
+        );
+        assert!(
+            json["repos"][0]["behind"]
+                .as_str()
+                .is_some_and(|behind| behind.contains("acme/behind pins release/2026-07-20")),
+            "was: {json:#?}"
+        );
+        assert_eq!(json["trusted"][0]["name"], "legacy");
     }
 }

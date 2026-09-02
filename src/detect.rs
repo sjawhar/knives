@@ -36,7 +36,6 @@ pub enum FindingKind {
     WrongBase,
     ChecksFailing,
     CarriedElsewhere,
-    MixedBase,
     SupersededBase,
     EmptyDiff,
     DeletedHeadRef,
@@ -46,6 +45,11 @@ pub enum FindingKind {
     ZombieBranch,
     ReleaseDrift,
     OrphanCommit,
+    /// A branch whose history beyond the upstream trunk carries merge commits —
+    /// typically a release cut — so it carries every member of that cut too.
+    StackedHistory,
+    /// A claim on a branch that no bookmark or workspace still names.
+    OrphanedClaim,
 }
 
 impl fmt::Display for FindingKind {
@@ -62,7 +66,6 @@ impl fmt::Display for FindingKind {
             Self::ClaimOverlap => "claim-overlap",
             Self::BranchOverlap => "branch-overlap",
             Self::CarriedElsewhere => "carried-elsewhere",
-            Self::MixedBase => "mixed-base",
             Self::SupersededBase => "superseded-base",
             Self::EmptyDiff => "empty-diff",
             Self::DoubleCut => "double-cut",
@@ -73,6 +76,8 @@ impl fmt::Display for FindingKind {
             Self::ZombieBranch => "zombie-branch",
             Self::ReleaseDrift => "release-drift",
             Self::OrphanCommit => "orphan-commit",
+            Self::StackedHistory => "stacked-history",
+            Self::OrphanedClaim => "orphaned-claim",
         };
         f.write_str(text)
     }
@@ -171,7 +176,6 @@ mod tests {
             FindingKind::WrongBase => "wrong-base",
             FindingKind::ChecksFailing => "checks-failing",
             FindingKind::CarriedElsewhere => "carried-elsewhere",
-            FindingKind::MixedBase => "mixed-base",
             FindingKind::SupersededBase => "superseded-base",
             FindingKind::EmptyDiff => "empty-diff",
             FindingKind::DoubleCut => "double-cut",
@@ -182,6 +186,8 @@ mod tests {
             FindingKind::ZombieBranch => "zombie-branch",
             FindingKind::ReleaseDrift => "release-drift",
             FindingKind::OrphanCommit => "orphan-commit",
+            FindingKind::StackedHistory => "stacked-history",
+            FindingKind::OrphanedClaim => "orphaned-claim",
         }
     }
 
@@ -201,7 +207,6 @@ mod tests {
             FindingKind::WrongBase,
             FindingKind::ChecksFailing,
             FindingKind::CarriedElsewhere,
-            FindingKind::MixedBase,
             FindingKind::SupersededBase,
             FindingKind::EmptyDiff,
             FindingKind::DoubleCut,
@@ -212,6 +217,8 @@ mod tests {
             FindingKind::ZombieBranch,
             FindingKind::ReleaseDrift,
             FindingKind::OrphanCommit,
+            FindingKind::StackedHistory,
+            FindingKind::OrphanedClaim,
         ];
         // When: each is rendered
         let labels: Vec<String> = kinds

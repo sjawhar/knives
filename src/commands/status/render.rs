@@ -30,6 +30,10 @@ fn push_cell(row: &BranchRow) -> String {
     }
 }
 
+/// `#61 (activity 3h)`: the number, anything unusual about it, and how long ago
+/// it last moved. A comment-only review or a maintainer's question leaves the
+/// review decision empty, so without the age a row can read unchanged for days
+/// while the conversation on it moved on.
 fn pull_cell(row: &BranchRow) -> String {
     let Some(pull) = &row.pr else {
         return "-".to_owned();
@@ -43,6 +47,14 @@ fn pull_cell(row: &BranchRow) -> String {
     }
     if pull.stated == Some(true) {
         details.push("(stated)".to_owned());
+    }
+    if pull.state == "open"
+        && let Some(age) = pull
+            .activity_at
+            .as_deref()
+            .and_then(|at| crate::ledger::age(at, jiff::Timestamp::now()))
+    {
+        details.push(format!("(activity {age})"));
     }
     details.extend(
         pull.prior
@@ -91,6 +103,9 @@ fn seen_cell(row: &BranchRow) -> String {
 /// How much of a notch's text a branch line carries.
 const NOTCH_TEXT: usize = 32;
 
+/// `"text…" (3d @1a2b3c4d5e6f)`: the entry, its age, and the tip it was written
+/// against. The anchor is what lets a reader tell a note that still describes
+/// this branch from one that described an earlier tip.
 fn notch_summary(notch: &LastNotch) -> String {
     let mut text = notch.text.clone();
     if let Some(disposition) = &notch.disposition {
@@ -101,9 +116,13 @@ fn notch_summary(notch: &LastNotch) -> String {
     if escaped.chars().count() > NOTCH_TEXT {
         shown.push('…');
     }
+    let anchor = notch
+        .anchor
+        .as_deref()
+        .map_or_else(String::new, |anchor| format!(" @{anchor}"));
     let summary = crate::ledger::age(&notch.ts, jiff::Timestamp::now()).map_or_else(
-        || format!("\"{shown}\""),
-        |age| format!("\"{shown}\" ({age})"),
+        || format!("\"{shown}\"{anchor}"),
+        |age| format!("\"{shown}\" ({age}{anchor})"),
     );
     if notch.count > 1 {
         format!("{summary}+{}", notch.count - 1)
@@ -174,15 +193,21 @@ fn branch_table(rows: &[BranchRow]) -> Vec<String> {
     lines
 }
 
+/// How many subjects the one-line-per-kind view names before `and N more`.
+const SUBJECTS_PER_LINE: usize = 8;
+
 fn finding_lines(groups: &[FindingGroup], verbose: bool) -> Vec<String> {
     if verbose {
         return groups
             .iter()
             .flat_map(|group| {
-                group
-                    .subjects
-                    .iter()
-                    .map(|subject| format!("    {}  {subject}", group.kind))
+                group.items.iter().map(|item| {
+                    if item.detail.is_empty() {
+                        format!("    {}  {}", group.kind, item.subject)
+                    } else {
+                        format!("    {}  {}: {}", group.kind, item.subject, item.detail)
+                    }
+                })
             })
             .collect();
     }
@@ -194,15 +219,16 @@ fn finding_lines(groups: &[FindingGroup], verbose: bool) -> Vec<String> {
     groups
         .iter()
         .map(|group| {
-            let mut subjects = group.subjects.join(", ");
-            let hidden = group.count.saturating_sub(group.subjects.len());
+            let shown: Vec<&str> = group.subjects().take(SUBJECTS_PER_LINE).collect();
+            let mut subjects = shown.join(", ");
+            let hidden = group.items.len().saturating_sub(shown.len());
             if hidden > 0 {
                 subjects = format!("{subjects}, and {hidden} more");
             }
             format!(
                 "    {:<width$}  {:>3}  {subjects}",
                 group.kind,
-                group.count,
+                group.items.len(),
                 width = width
             )
         })
@@ -238,9 +264,13 @@ pub fn render(report: &Report, verbose: bool) -> String {
     if let Some(notches) = &report.repo_notches {
         lines.push(repo_notch_line(notches));
     }
+    // Workspaces named for a branch row sit in that row's `workspace` cell;
+    // this line is only what is left, which is why it never matches the length
+    // of `jj workspace list`.
     if !report.other_workspaces.is_empty() {
         lines.push(format!(
-            "  workspaces  {}",
+            "  workspaces  {} not named for a branch above: {}",
+            report.other_workspaces.len(),
             report.other_workspaces.join(", ")
         ));
     }
@@ -265,7 +295,7 @@ mod tests {
 
     use super::*;
     use crate::commands::status::{
-        BranchState, ClaimCell, FindingGroup, LastNotch, PullCell, SeenWindow,
+        BranchState, ClaimCell, FindingGroup, GroupedFinding, LastNotch, PullCell, SeenWindow,
     };
     use crate::detect::{FindingKind, LandedVerdict};
     use crate::ids::BranchName;
@@ -339,13 +369,19 @@ mod tests {
 
     #[test]
     fn findings_render_one_line_per_kind_with_count() {
+        // Nine findings of one kind: the line carries the exact count, names
+        // the first eight subjects, and folds the rest into `and N more`.
         let report = Report {
             repo: "demo".to_owned(),
             trunk: "main".to_owned(),
             findings: vec![FindingGroup {
                 kind: FindingKind::ChecksFailing,
-                count: 3,
-                subjects: vec!["#11".to_owned(), "#12".to_owned()],
+                items: (11..20)
+                    .map(|number| GroupedFinding {
+                        subject: format!("#{number}"),
+                        detail: format!("#{number} has failing checks: build"),
+                    })
+                    .collect(),
             }],
             ..Report::default()
         };
@@ -357,9 +393,10 @@ mod tests {
             .filter(|line| line.contains("checks-failing"))
             .collect();
         assert_eq!(lines.len(), 1, "was: {rendered}");
-        assert!(lines[0].contains('3'), "was: {}", lines[0]);
+        assert!(lines[0].contains("  9  "), "was: {}", lines[0]);
         assert!(
-            lines[0].contains("#11, #12, and 1 more"),
+            lines[0].contains("#11, #12, #13, #14, #15, #16, #17, #18, and 1 more")
+                && !lines[0].contains("#19"),
             "was: {}",
             lines[0]
         );
@@ -446,6 +483,7 @@ mod tests {
             state: "open".to_owned(),
             draft: false,
             stated: None,
+            activity_at: None,
             prior: Vec::new(),
         });
         full.review = Some("approved".to_owned());
@@ -467,13 +505,14 @@ mod tests {
             kind: crate::ledger::Kind::Note,
             text: "superseded by #1157".to_owned(),
             disposition: None,
+            anchor: Some("1a2b3c4d5e6f".to_owned()),
             count: 2,
         });
 
         let rendered = render(&report_with(row), false);
 
         assert!(
-            rendered.contains("\"superseded by #1157\" (now)+1"),
+            rendered.contains("\"superseded by #1157\" (now @1a2b3c4d5e6f)+1"),
             "was: {rendered}"
         );
     }
@@ -485,8 +524,16 @@ mod tests {
             trunk: "main".to_owned(),
             findings: vec![FindingGroup {
                 kind: FindingKind::ChecksFailing,
-                count: 2,
-                subjects: vec!["#1".to_owned(), "#2".to_owned()],
+                items: vec![
+                    GroupedFinding {
+                        subject: "#1".to_owned(),
+                        detail: "#1 has failing checks".to_owned(),
+                    },
+                    GroupedFinding {
+                        subject: "#2".to_owned(),
+                        detail: "#2 has failing checks".to_owned(),
+                    },
+                ],
             }],
             ..Report::default()
         };

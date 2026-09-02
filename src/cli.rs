@@ -128,6 +128,37 @@ pub fn machine_payload<T: serde::Serialize>(
     })
 }
 
+/// Print one or several reports as one document.
+///
+/// An array under `--all`, the lone object otherwise, or the prose `render`
+/// makes of them all. One document per invocation is what lets a JSON reader
+/// read the whole output.
+pub fn emit_reports<T: serde::Serialize>(
+    output: Output,
+    all: bool,
+    reports: &[T],
+    render: impl Fn(&[T]) -> String,
+) -> anyhow::Result<()> {
+    let payload = match (all, reports) {
+        (false, [only]) => machine_payload(output, only)?,
+        _ => machine_payload(output, &reports)?,
+    };
+    match payload {
+        Some(payload) => println!("{payload}"),
+        None => println!("{}", render(reports)),
+    }
+    Ok(())
+}
+
+/// Each report's prose, one after another.
+pub fn joined<T>(reports: &[T], separator: &str, render: impl Fn(&T) -> String) -> String {
+    reports
+        .iter()
+        .map(render)
+        .collect::<Vec<_>>()
+        .join(separator)
+}
+
 fn agent_environment() -> bool {
     for name in [
         "KNIVES_OWNER",

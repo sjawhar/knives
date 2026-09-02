@@ -73,8 +73,9 @@ every false one did not.
 knives start <branch> --why "what you are doing"
 ```
 
-This claims the branch and creates a jj workspace for it, based on the fetched upstream
-trunk. As soon as your active work there stops — including when it now waits on something
+This claims the branch and creates a jj workspace for it, based on the release's shared
+base (the fetched upstream trunk when no release exists), so the branch composes into the
+release without forcing a rebase. As soon as your active work there stops — including when it now waits on something
 external, such as a pull request in review:
 
 ```
@@ -96,11 +97,22 @@ has a knives command that does the same job safely:
 - **Do not create a scratch or temporary checkout** to "just try something". Use
   `knives start` and get a real workspace that other agents can see you are using.
 - **Do not start a branch in the default workspace of a managed fork.** Another agent may
-  be working there. `knives start` gives you your own workspace and bases it on the
-  release's shared base (or fetched upstream trunk if no release exists), which also avoids
-  silently inheriting a release merge as a parent. This is about these shared forks specifically,
+  be working there. `knives start` gives you your own workspace on the release's shared
+  base (or the fetched upstream trunk if no release exists), which also avoids silently
+  inheriting a release merge as a parent. This is about these shared forks specifically;
   branching normally in your own projects is fine.
-  projects is fine.
+- **Do not keep two copies of a branch** — a "release-lineage" or "sibling" branch carrying
+  a pull request's content on an older base so the release can carry it while the pull
+  request branch is rebased for the maintainer. One branch is both the release member and the
+  pull request head. When a branch does get rebased onto a newer trunk, `knives release
+  advance <branch>` follows it (it matches by change id, which `jj rebase` keeps), and
+  `knives release rebase` moves the whole release to a newer trunk when that is decided. If a
+  branch does not compose into the release, the release is behind: move the release, do not
+  fork the branch.
+- **Do not build a branch on top of a release merge.** A branch whose history carries a
+  release cut carries every member of that cut, and a pull request from it asks the
+  maintainer to review the whole fork. `knives status` and `knives preflight` report it as
+  `stacked-history`; `jj rebase -b <branch> -d <trunk>` fixes it and keeps the change ids.
 - **Do not `jj op restore`.** It discards other agents' operations along with your own
   mistake.
 - **Do not push to `upstream`.** Contributions go through a pull request.

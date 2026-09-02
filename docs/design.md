@@ -172,7 +172,7 @@ upgrade, or a probe-schema change, produces a new key and therefore a fresh land
 
 ## Detection rules
 
-Eight detection rules, all resting on mechanical fields and graph queries rather than reasoning:
+Ten detection rules, all resting on mechanical fields and graph queries rather than reasoning:
 
 **1. Stale release parent (`stale-parent`).** Rests on `Repo::bookmark_tips` compared against release parent commits. When a PR branch is rebased upstream, jj moves the local bookmark to the new commit but the octopus keeps the old one, leaving a parent whose bookmark has moved to a descendant. The release then ships pre-rebase code with nothing in the bookmark list saying so.
 
@@ -181,22 +181,26 @@ Eight detection rules, all resting on mechanical fields and graph queries rather
 | Result | Meaning |
 |---|---|
 | empty | landed verbatim, drop it |
-| conflicted | landed but modified by the maintainer, drop after a human reads the delta |
+| conflicted | the trunk has content in the way — a maintainer's edit, an unrelated later change, or the branch's own squash |
 | clean and non-empty | not landed, keep carrying |
 
-Authorship- and PR-number-agnostic, which matters because our work sometimes lands under someone else's PR number.
+Authorship- and PR-number-agnostic, which matters because our work sometimes lands under someone else's PR number. The replay cannot recognise a squash merge, though: a branch replayed onto a trunk that already carries its squash conflicts with itself. So the forge's evidence settles what the replay cannot: a merged pull request whose `mergeCommit` the local upstream trunk contains, with the local branch holding nothing past the merged head, reads `in-trunk` whatever the replay said — including a divergent bookmark the probe never ran on. A branch carrying commits past the merged head keeps its replay verdict, with a note.
 
 **3. Divergence (`divergence`).** Rests on `Repo::divergent_changes`, querying whether a single change ID maps to multiple commit IDs across disconnected clones or local rewrites. The general rule: a change rewritten while any other reference still points at its old commit diverges. Divergence is routine, but the observed failure is agents reading `/0`, `/1` suffixes and `??` bookmarks as corruption and stopping.
 
 **4. Double checkout (`double-checkout`).** Rests on `Repo::workspaces`, checking if two workspaces hold `@` on the same change ID, visible in `jj workspace list`.
 
-**5. Failing CI checks (`checks-failing`).** Rests on `ChecksSummary::failing()`, checking for red conclusion states (`FAILURE`, `TIMED_OUT`, `CANCELLED`, `STARTUP_FAILURE`, `ACTION_REQUIRED`, or `ERROR`) on open pull requests. The `ERROR` conclusion is what external CI posting commit statuses emits for an aborted or infrastructure-failed build, and missing it made a red pull request read as clean green.
+**5. Failing CI checks (`checks-failing`).** Rests on `ChecksSummary::failing()` — a hard failure or a check held for action — over red conclusion states (`FAILURE`, `TIMED_OUT`, `CANCELLED`, `STARTUP_FAILURE`, `ACTION_REQUIRED`, or `ERROR`) on open pull requests. The `ERROR` conclusion is what external CI posting commit statuses emits for an aborted or infrastructure-failed build, and missing it made a red pull request read as clean green. `ACTION_REQUIRED` also arrives from the tip commit's check suites, not only its rollup: a fork pull request whose workflows await a maintainer's approval has one suite per gated workflow with that conclusion and zero check runs, which the rollup omits entirely — so the rollup alone showed one green lint check and read `ok` on 11 of 20 open pull requests of one upstream. The checks cell tells the two apart (`failing` versus `action-required`); the finding detail names the held workflows.
 
 **6. Wrong target base (`wrong-base`).** Rests on `PullRequest::base_ref_name` against `RepoEntry::default_base()`, flagging open pull requests targeting a branch name other than the expected base. It cannot tell a pull request aimed at our fork's trunk from one aimed at upstream's trunk because both are usually named `main`, the forge exposes no base-repository field, and `gh` resolves to upstream anyway. An empty base is unknown, not wrong. Only open pull requests are checked.
 
 **7. Commits carried elsewhere (`carried-elsewhere`).** Rests on `Repo::branches_containing(tip)`, querying whether the branch tip is reachable from another reference. It reports where found and says nothing about what it means: whether a maintainer took the work, rebased it, or coincidentally landed the same content is the reader's judgment. Our own release cuts, `@git` refs, and trunk are excluded because releases contain these tips by construction, and reporting that buried the real signal.
 
 **8. Branch file overlap (`branch-overlap`).** Rests on `jj::changed_files_between` path sets computed from `fork_point(trunk | branch)`, grouping files modified by two or more active branches. One finding per file, naming every branch. It is a path comparison and nothing more.
+
+**9. Stacked history (`stacked-history`).** Rests on `Repo::merges_between(trunks, tip)`: merge commits reachable from a branch tip but not from any known trunk position (`release_model::trunk_positions`: the upstream view, the fork's, the local bookmark) that join two or more lines none of them reaches. A member of a flat release is linear past the trunk; a merge in that range — a release cut, usually — means the branch carries every parent of that merge. Measuring past one trunk view alone charged a branch with upstream's own merges whenever that view was behind the branch's base; when no release ref names a merge the detail says so and points at `knives sync`. `knives release` runs it on every member parent and stops calling a cut `flat` when one is stacked, and on every local branch the plan would otherwise point `include` at; `include`, `advance` and the first `cut` refuse a stacked branch with the same detail; `knives status` runs it on branches with open pull requests, because such a pull request submits the whole fork; `knives preflight`, the pre-contribution gate, runs it on every local branch. Observed on a real fork: a three-parent cut read `flat` while one parent contained the previous 26-parent cut, and the same branch became an upstream pull request of 61 commits and 140 files the maintainer questioned.
+
+**10. Orphaned claim (`orphaned-claim`).** Rests on the claim store against `Repo::bookmark_tips` and `Repo::workspaces`: a claim on a branch that no bookmark on any remote and no workspace names. `finish` releases a claim; a bookmark deleted around it leaves the claim behind as a row with no tip and nothing to say why.
 
 ### Reproduced in the lab
 
@@ -320,7 +324,9 @@ Everything of the form "have you read the contributing guide, and does this PR c
 
 Workspaces are effectively free: 0.15 to 0.55s to create, because tracked content is small even in large repos (one 3.2G checkout was 19M across 1278 tracked files, the rest being virtualenvs and the shared `.jj` store). The real cost of a new workspace is rebuilding language environments, not checkout.
 
-`knives start` bases new work on the release's **shared base** when a release exists, falling back to the fetched trunk when none does, never on the current `@`. That preserves the shared-base invariant while preventing an agent in a release workspace from running `jj new` and inheriting the release merge as a parent.
+`knives start` bases new work on the release's **shared base** when a release exists, falling back to the fetched trunk when none does, never on the current `@`. The shared base is the trunk point every member forks from, so a branch started there composes into the release without dragging newer upstream into the cut. Moving the composition to a newer trunk is `knives release rebase`: an intentional, separate decision, never a side effect of starting a branch. Never `@`, because an agent in a release workspace who runs `jj new` would inherit the release merge as a parent.
+
+A branch that does get rebased onto a newer trunk (a maintainer asks for it) is still its own member: `advance`, `include` and `drop` match a member to its branch by change id as well as ancestry (`MemberSuccession`), and fall back to the parent set the release's last cut or edit event recorded — a `parents` field naming every bookmark at each parent (`release_model::member_parents`), which is what answers for a branch rebased outside jj or landed upstream, where the repository itself no longer can. Reading a rebased branch as a stranger to its release is what led agents to keep a second "release-lineage" copy of each pull request branch. One branch, on the shared base, rebased only when someone decides to; the release follows.
 
 ### `knives release`
 

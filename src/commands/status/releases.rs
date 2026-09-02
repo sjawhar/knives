@@ -2,8 +2,10 @@ use crate::commands::status::Report;
 use crate::config::RepoEntry;
 use crate::detect::{BookmarkTips, Finding, Subject};
 use crate::ids::{BookmarkRef, CommitId, ReleaseScheme, is_our_release};
-use crate::jj::{Repo, branches_past};
-use crate::release_model::{double_cut_findings, release_order};
+use crate::jj::Repo;
+use crate::release_model::{
+    BranchSuccessions, carried_from_tips, double_cut_findings, release_order, trunk_positions,
+};
 
 /// Which releases are worth checking for stale parents.
 ///
@@ -80,10 +82,13 @@ pub(super) fn releases_to_scan(
 }
 
 struct ReleaseScan<'a> {
-    path: &'a std::path::Path,
     tips: &'a BookmarkTips,
     scheme: &'a ReleaseScheme,
     publish_remote: &'a str,
+    trunk: &'a str,
+    /// Every known trunk position: what a branch's own changes are measured
+    /// past when a stale parent is matched to its branch.
+    trunks: &'a [CommitId],
 }
 
 /// Which releases were scanned, what was found, and how many were skipped.
@@ -97,6 +102,13 @@ fn scan_releases(
     let (releases, skipped) = releases_to_scan(input.tips, input.scheme, input.publish_remote);
     let mut names = Vec::new();
     let mut findings = Vec::new();
+    // Say where the branch went, not just that nothing points at the parent.
+    // `parents_of` only reports bookmarks pointing AT a parent, so the pure
+    // detector can never produce the "feat/x is now <id>" payload. Matched by
+    // succession — ancestry or change id — so a member rebased onto the newer
+    // trunk is named as itself, with the verb that moves the member.
+    let branches = carried_from_tips(input.tips, input.trunk, input.scheme);
+    let successions = BranchSuccessions::of(repo, input.trunks, &branches)?;
     for (release, commit) in &releases {
         names.push(release.to_string());
         // Resolve by commit id, never by the bookmark's display form. A remote
@@ -104,26 +116,28 @@ fn scan_releases(
         // revset, and the tip map already carries the commit.
         let mut stale =
             crate::detect::stale_parents(&repo.parents_of(commit.as_str())?, input.tips);
-        // Say where the branch went, not just that nothing points at the parent.
-        // `parents_of` only reports bookmarks pointing AT a parent, so the pure
-        // detector can never produce the "feat/x is now <id>" payload.
         for finding in &mut stale {
             let Subject::Commit(parent) = finding.subject.clone() else {
                 continue;
             };
-            if let Ok(moved) = branches_past(input.path, &parent)
-                && !moved.is_empty()
-            {
-                let where_now = moved
-                    .iter()
-                    .map(|(branch, tip)| format!("{branch} is now {}", super::short(tip.as_str())))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                finding.detail = format!(
-                    "parent {} is no longer the tip of its branch ({where_now})",
-                    super::short(parent.as_str())
-                );
+            let moved = successions.successors_of(&parent)?;
+            if moved.is_empty() {
+                continue;
             }
+            let where_now = moved
+                .iter()
+                .map(|(branch, tip)| {
+                    format!(
+                        "{branch} is now {}; `knives release advance {branch}` moves the member",
+                        super::short(tip.as_str())
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            finding.detail = format!(
+                "parent {} is no longer the tip of its branch ({where_now})",
+                super::short(parent.as_str())
+            );
         }
         findings.extend(stale);
     }
@@ -152,13 +166,15 @@ pub(super) fn add_releases(
     report.newest_release =
         crate::release_model::newest_release(tips, &scheme, entry.publish_remote())
             .map(|(reference, _)| reference.to_string());
+    let trunks = trunk_positions(repo, entry)?;
     let (names, release_findings, skipped) = scan_releases(
         repo,
         &ReleaseScan {
-            path: &entry.path,
             tips,
             scheme: &scheme,
             publish_remote: entry.publish_remote(),
+            trunk: entry.trunk(),
+            trunks: &trunks,
         },
     )?;
     report.releases = names;

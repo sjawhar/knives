@@ -33,8 +33,8 @@ use knives::jj::{
 };
 use knives::store::{OwnerKind, Store};
 use lab::{
-    Lab, ReleaseOutput, knives_release, lab_entry, operation_ids, release_command,
-    release_test_home,
+    Lab, ReleaseOutput, commit_at, knives_release, lab_entry, operation_ids, release_command,
+    release_parents, release_test_home,
 };
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -2172,6 +2172,10 @@ fn sync_records_one_event_for_each_pull_request_that_moved() {
     };
     let state = tempfile::tempdir().expect("state directory");
     let mut store = Store::open_for_update(state.path().join("state.json")).expect("open store");
+    // Every one of them was seen before: a first sighting is recorded silently,
+    // whatever the forge already did to it, so only prior sightings can move.
+    store.record_pull_head(&name, 10, "head-10");
+    store.record_pull_head(&name, 11, "head-11");
     store.record_pull_head(&name, 12, "older");
     store.record_pull_head(&name, 13, "head-13");
     let ledger = knives::ledger::Ledger::at(state.path().join("demo"));
@@ -2233,6 +2237,8 @@ fn sync_records_a_settled_pull_request_once_across_repeated_runs() {
     };
     let state = tempfile::tempdir().expect("state directory");
     let mut store = Store::open_for_update(state.path().join("state.json")).expect("open store");
+    // Seen while open, so the merge is a transition rather than a first sighting.
+    store.record_pull_head(&name, 10, "head-10");
     let ledger = knives::ledger::Ledger::at(state.path().join("demo"));
     let scribe =
         knives::ledger::Scribe::new(ledger.clone(), name, lab.work, "ses_fff688".to_owned());
@@ -3247,7 +3253,7 @@ fn a_flat_release_recuts_after_upstream_drift_collides_with_a_member() {
         "audit false positive: {stdout}"
     );
     assert_eq!(
-        release_parent_commits(&lab, "release/2026-08-05"),
+        release_parents(&lab, "release/2026-08-05"),
         vec![commit_at(&lab, "feat/alpha"), commit_at(&lab, "feat/beta")],
         "the re-cut must carry the composition verbatim"
     );
@@ -3455,7 +3461,7 @@ fn a_first_cut_audits_members_from_their_fork_point_not_the_trunk_tip() {
         "first cut failed: {stdout}\n{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let parents = release_parent_commits(&lab, "release/2026-08-04");
+    let parents = release_parents(&lab, "release/2026-08-04");
     assert_eq!(parents.len(), 3, "parents: {parents:?}");
     assert!(
         !parents.contains(&commit_at(&lab, "main@upstream")),
@@ -4173,9 +4179,11 @@ fn release_plan_exits_with_findings_when_the_current_release_lags_the_upstream_t
 }
 
 #[test]
-fn the_base_parent_is_not_stale_and_a_drifted_member_is_a_mixed_base_finding() {
+fn the_base_parent_is_not_stale_when_a_member_rebases_onto_the_advanced_trunk() {
     // Given: a release whose first parent is the bookmarkless shared base, and
-    // one member re-based past it onto the advanced upstream.
+    // one member rebased past it onto the advanced upstream — legitimate
+    // upkeep, not a defect: a PR branch is expected to track the trunk it
+    // will land on.
     let lab = lab::Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     lab.branch("feat/beta", "beta.txt", "beta\n");
@@ -4195,17 +4203,14 @@ fn the_base_parent_is_not_stale_and_a_drifted_member_is_a_mixed_base_finding() {
         !text.contains("carries no bookmark"),
         "base parent misread as stale: {text}"
     );
-    // And: the drifted member is named as a mixed base.
+    // And: rebasing a member onto the advanced trunk is not itself a finding:
+    // no per-branch `!! branch …` line names either member.
     assert!(
-        text.contains("feat/beta") && text.contains("beyond the shared base"),
-        "mixed base not reported: {text}"
+        !text
+            .lines()
+            .any(|line| line.trim_start().starts_with("!! branch ")),
+        "a rebased member was reported as a per-branch finding: {text}"
     );
-    // And: the member still on the base is not reported.
-    assert!(
-        !text.contains("feat/alpha carries"),
-        "well-based member misreported: {text}"
-    );
-    assert_eq!(output.status.code(), Some(1), "stdout: {text}");
 }
 
 #[test]
@@ -4239,55 +4244,6 @@ fn older_upstream_release_parent_is_reported_as_a_superseded_base() {
     assert!(
         text.contains("older upstream base superseded by"),
         "superseded base not reported: {text}"
-    );
-}
-
-#[test]
-fn preflight_renders_a_mixed_base_finding_and_exits_with_findings() {
-    // Given: a release with a bookmarkless base and a member rebased past it.
-    let lab = lab::Lab::new();
-    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
-    lab.branch("feat/beta", "beta.txt", "beta\n");
-    lab.octopus("release/2026-08-04", "feat/alpha", "feat/beta");
-    lab.advance_origin_branch("main", "origin advance\n");
-    lab.jj_work(["git", "fetch", "--remote", "origin"]);
-    lab.advance_upstream("upstream advance\n");
-    lab.rebase_and_force_push("feat/beta");
-    let entry = RepoEntry {
-        path: lab.work.clone(),
-        upstream: lab.upstream.display().to_string(),
-        origin: lab.work.display().to_string(),
-        base: None,
-        release: None,
-        release_branch: None,
-        test_count_command: None,
-        consumers: Vec::new(),
-    };
-    let state = tempfile::tempdir().expect("create state directory");
-    let mut store = Store::open_for_update(state.path().join("state.json")).expect("open store");
-    let forge = knives::forge::fake::FakeForge {
-        fail_facts: true,
-        ..knives::forge::fake::FakeForge::default()
-    };
-
-    // When: preflight gathers and renders the repository state.
-    let report = knives::commands::preflight::gather(knives::commands::preflight::GatherInput {
-        name: &knives::ids::RepoName::new("demo"),
-        entry: &entry,
-        store: &mut store,
-        forge: &forge,
-        cache: None,
-    });
-    let text = knives::commands::preflight::render(&report);
-
-    // Then: the finding is visible and makes the command actionable to scripts.
-    assert!(
-        text.contains("!!") && text.contains("beyond the shared base"),
-        "mixed base not rendered: {text}"
-    );
-    assert_eq!(
-        knives::commands::preflight::exit_for(&report),
-        knives::cli::Exit::Findings
     );
 }
 
@@ -4567,9 +4523,13 @@ fn plan_for_a_fixed_release_ignores_a_non_publish_remote() {
         cache_root: None,
         heads: &heads,
     };
-    let plan =
-        knives::commands::release::plan(&knives::ids::RepoName::new("a-repo"), &entry, &consumers)
-            .expect("plan");
+    let plan = knives::commands::release::plan(
+        &knives::ids::RepoName::new("a-repo"),
+        &entry,
+        &consumers,
+        &[],
+    )
+    .expect("plan");
 
     // Then: upstream cannot be mistaken for the publish remote's release.
     assert_eq!(plan.release.as_deref(), Some("integration@origin"));
@@ -4973,10 +4933,10 @@ fn status_reports_branch_overlap_after_upstream_advances_without_landed_probe() 
         .iter()
         .find(|finding| finding.kind == knives::detect::FindingKind::BranchOverlap)
         .expect("the shared file is reported even without the landed probe");
-    assert_eq!(overlap.count, 1, "was: {overlap:?}");
+    assert_eq!(overlap.items.len(), 1, "was: {overlap:?}");
     assert_eq!(
-        overlap.subjects,
-        vec!["shared.txt: feat/alpha, feat/beta".to_owned()]
+        overlap.subjects().collect::<Vec<_>>(),
+        ["shared.txt: feat/alpha, feat/beta"]
     );
 }
 
@@ -5024,10 +4984,10 @@ fn status_reports_a_branch_carried_elsewhere() {
         .iter()
         .find(|finding| finding.kind == knives::detect::FindingKind::CarriedElsewhere)
         .expect("the branch carrier is reported");
-    assert_eq!(carrier.count, 1, "was: {carrier:?}");
+    assert_eq!(carrier.items.len(), 1, "was: {carrier:?}");
     assert_eq!(
-        carrier.subjects,
-        vec!["feat/alpha: theirs/rework".to_owned()]
+        carrier.subjects().collect::<Vec<_>>(),
+        ["feat/alpha: theirs/rework"]
     );
 }
 
@@ -5083,10 +5043,10 @@ fn status_reports_a_carrier_for_a_closed_pull_request() {
         .iter()
         .find(|finding| finding.kind == knives::detect::FindingKind::CarriedElsewhere)
         .expect("the branch carrier is reported");
-    assert_eq!(carrier.count, 1, "was: {carrier:?}");
+    assert_eq!(carrier.items.len(), 1, "was: {carrier:?}");
     assert_eq!(
-        carrier.subjects,
-        vec!["feat/alpha: theirs/rework".to_owned()]
+        carrier.subjects().collect::<Vec<_>>(),
+        ["feat/alpha: theirs/rework"]
     );
 }
 
@@ -5139,14 +5099,15 @@ fn status_does_not_report_trunk_as_a_carrier_without_landed_probe() {
     // Then: trunk is never a carrier finding, even without an InTrunk verdict.
     assert!(!report.findings.iter().any(|finding| {
         finding.kind == knives::detect::FindingKind::CarriedElsewhere
-            && finding
-                .subjects
-                .iter()
-                .any(|subject| subject == "feat/alpha")
+            && finding.subjects().any(|subject| subject == "feat/alpha")
     }));
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one scenario asserting the notch in the row, the JSON, and the text together"
+)]
 fn status_carries_each_branchs_newest_notch_in_json_and_in_text() {
     // Given: a fork with a note followed by a newer machine event on one branch.
     let lab = lab::Lab::new();
@@ -5180,6 +5141,7 @@ fn status_carries_each_branchs_newest_notch_in_json_and_in_text() {
             text: "human conclusion".to_owned(),
             evidence: Vec::new(),
             pr: None,
+            parents: Vec::new(),
         })
         .expect("human note");
     scribe
@@ -5245,9 +5207,17 @@ fn status_carries_each_branchs_newest_notch_in_json_and_in_text() {
         "no notch is absent, not null: {beta}"
     );
 
-    // And: the branch line carries one token for it and its masked sibling
+    // And: the branch line carries one token for it and its masked sibling,
+    // anchored to the tip the note was written against
+    let anchor = row["notch"]["anchor"]
+        .as_str()
+        .expect("a note on a resolvable branch records its anchor");
+    assert_eq!(anchor.len(), 12, "anchor is the short id: {anchor}");
     let text = status::render::render(&report, false);
-    assert!(text.contains("\"human conclusion\" (now)+1"), "was: {text}");
+    assert!(
+        text.contains(&format!("\"human conclusion\" (now @{anchor})+1")),
+        "was: {text}"
+    );
     assert!(report.repo_notches.is_none(), "was: {report:?}");
     assert!(
         json.get("repo_notches").is_none(),
@@ -5576,7 +5546,7 @@ fn release_rebase_repairs_a_followed_dated_release_with_a_sideways_merge() {
         String::from_utf8_lossy(&output.stderr)
     );
     let repo = Repo::open(&lab.work).expect("reopen repaired release repository");
-    let parents = release_parent_commits(&lab, release);
+    let parents = release_parents(&lab, release);
     let old_base = &previous_parents[0]; // lab.octopus puts main@origin first
     assert!(
         !parents.contains(&old_base.commit),
@@ -5764,7 +5734,7 @@ fn a_rebase_moves_the_whole_composition_onto_the_target() {
         repo.is_ancestor(&trunk, &new_alpha).expect("ancestry"),
         "alpha does not sit on the new trunk"
     );
-    let parents = release_parent_commits(&lab, "release/2026-08-04");
+    let parents = release_parents(&lab, "release/2026-08-04");
     assert!(parents.contains(&new_alpha), "{parents:?}");
     assert!(
         !parents.contains(&trunk),
@@ -6100,7 +6070,7 @@ fn a_bare_rebase_drops_a_member_whose_pull_request_landed() {
         "missing drop report: {stdout}"
     );
     assert_eq!(
-        release_parent_commits(&lab, release),
+        release_parents(&lab, release),
         vec![commit_at(&lab, "feat/beta")],
         "the landed member must be the only parent removed"
     );
@@ -6148,7 +6118,7 @@ fn no_drop_keeps_a_landed_member_as_a_parent() {
     );
     assert!(!stdout.contains("dropped feat/alpha"), "{stdout}");
     assert!(
-        release_parent_commits(&lab, release).contains(&alpha),
+        release_parents(&lab, release).contains(&alpha),
         "--no-drop must keep the landed member"
     );
 }
@@ -6186,7 +6156,7 @@ fn a_bare_rebase_drops_a_member_landed_by_squash() {
         "missing drop report: {stdout}"
     );
     assert_eq!(
-        release_parent_commits(&lab, release),
+        release_parents(&lab, release),
         vec![commit_at(&lab, "feat/beta")],
         "the squash-landed member must be dropped"
     );
@@ -6228,7 +6198,7 @@ fn a_bare_rebase_keeps_a_landed_branch_that_carries_work_past_its_pull() {
     );
     assert!(!stdout.contains("dropped feat/alpha"), "{stdout}");
     assert_eq!(
-        release_parent_commits(&lab, release).len(),
+        release_parents(&lab, release).len(),
         2,
         "both members must remain parents"
     );
@@ -6320,7 +6290,7 @@ fn a_release_already_at_its_target_still_drops_landed_members() {
         "missing parentless-drop refusal: {stdout}"
     );
     assert_eq!(
-        release_parent_commits(&lab, release).len(),
+        release_parents(&lab, release).len(),
         2,
         "a refused drop must leave the parents alone"
     );
@@ -6615,10 +6585,24 @@ fn a_stranded_release_parent_reports_where_the_branch_went() {
     let moved_to = lab.revision(&lab.work, "feat/alpha", "commit_id");
     assert_ne!(stranded.trim(), moved_to.trim());
 
-    let past = knives::jj::branches_past(&lab.work, &knives::ids::CommitId::new(stranded.trim()))
-        .expect("branches past");
+    let repo = Repo::open(&lab.work).expect("open");
+    let trunk = repo.resolve_commit("main@upstream").expect("trunk");
+    let branches = knives::release_model::carried_from_tips(
+        &repo.bookmark_tips().expect("tips"),
+        "main",
+        &ReleaseScheme::Dated,
+    );
+    let past = knives::release_model::BranchSuccessions::of(
+        &repo,
+        std::slice::from_ref(&trunk),
+        &branches,
+    )
+    .expect("branch successions")
+    .successors_of(&knives::ids::CommitId::new(stranded.trim()))
+    .expect("branches succeeding");
     assert!(
-        past.iter().any(|(branch, tip)| branch.as_str() == "feat/alpha" && tip.as_str() == moved_to.trim()),
+        past.iter()
+            .any(|(branch, tip)| branch == "feat/alpha" && tip.as_str() == moved_to.trim()),
         "expected feat/alpha reported at its new tip, got {past:?}"
     );
 }
@@ -6761,7 +6745,7 @@ fn a_dropped_branch_does_not_trip_the_orphan_gate() {
     // quiet over an unchanged release proves nothing about dropped content.
     let beta = commit_at(&lab, "feat/beta");
     assert!(
-        !release_parent_commits(&lab, "release/2026-08-05").contains(&beta),
+        !release_parents(&lab, "release/2026-08-05").contains(&beta),
         "the dropped branch is still a parent of the successor cut"
     );
 }
@@ -6775,7 +6759,7 @@ fn include_adds_one_parent_and_changes_nothing_else() {
     lab.branch("feat/beta", "beta.txt", "beta\n");
     let (home, _consumer) = home_after_first_cut(&lab);
     lab.branch("feat/gamma", "gamma.txt", "gamma\n");
-    let before = release_parent_commits(&lab, "release/2026-08-04");
+    let before = release_parents(&lab, "release/2026-08-04");
 
     // When: the branch is included.
     let output = knives_release(&lab, &home, &["include", "feat/gamma"]);
@@ -6787,7 +6771,7 @@ fn include_adds_one_parent_and_changes_nothing_else() {
     );
 
     // Then: exactly one parent was added and none moved.
-    let after = release_parent_commits(&lab, "release/2026-08-04");
+    let after = release_parents(&lab, "release/2026-08-04");
     assert_eq!(after.len(), before.len() + 1, "{before:?} -> {after:?}");
     for parent in &before {
         assert!(
@@ -6958,7 +6942,7 @@ fn including_a_carried_branch_is_a_reported_noop() {
     let lab = Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     let (home, _consumer) = home_after_first_cut(&lab);
-    let before = release_parent_commits(&lab, "release/2026-08-04");
+    let before = release_parents(&lab, "release/2026-08-04");
     let before_commit = commit_at(&lab, "release/2026-08-04");
 
     let output = knives_release(&lab, &home, &["include", "feat/alpha"]);
@@ -6966,7 +6950,7 @@ fn including_a_carried_branch_is_a_reported_noop() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success(), "{stdout}");
     assert!(stdout.contains("already carries feat/alpha"), "{stdout}");
-    assert_eq!(release_parent_commits(&lab, "release/2026-08-04"), before);
+    assert_eq!(release_parents(&lab, "release/2026-08-04"), before);
     assert_eq!(
         commit_at(&lab, "release/2026-08-04"),
         before_commit,
@@ -6983,19 +6967,19 @@ fn include_refuses_to_advance_an_advanced_branch() {
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     let (home, _consumer) = home_after_first_cut(&lab);
     extend_branch(&lab, "feat/alpha", "alpha.txt", "alpha\nmore\n");
-    let before = release_parent_commits(&lab, "release/2026-08-04");
+    let before = release_parents(&lab, "release/2026-08-04");
 
     let output = knives_release(&lab, &home, &["include", "feat/alpha"]);
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_eq!(output.status.code(), Some(3), "{stdout}");
     assert!(
-        stdout.contains("the branch has advanced")
+        stdout.contains("the branch has moved on")
             && stdout.contains("knives release advance feat/alpha"),
         "the refusal must name the verb that does move a member: {stdout}"
     );
     assert_eq!(
-        release_parent_commits(&lab, "release/2026-08-04"),
+        release_parents(&lab, "release/2026-08-04"),
         before,
         "include must not move a member"
     );
@@ -7010,7 +6994,7 @@ fn drop_removes_one_parent_and_records_why() {
     let repo = Repo::open(&lab.work).expect("open");
     let alpha = repo.resolve_commit("feat/alpha").expect("alpha tip");
     let beta = repo.resolve_commit("feat/beta").expect("beta tip");
-    let before = release_parent_commits(&lab, "release/2026-08-04");
+    let before = release_parents(&lab, "release/2026-08-04");
 
     let output = knives_release(
         &lab,
@@ -7031,7 +7015,7 @@ fn drop_removes_one_parent_and_records_why() {
 
     // Then: only beta's parent left; the reason is on the release itself; the
     // branch bookmark still holds the dropped work.
-    let after = release_parent_commits(&lab, "release/2026-08-04");
+    let after = release_parents(&lab, "release/2026-08-04");
     assert_eq!(after.len(), before.len() - 1, "{before:?} -> {after:?}");
     assert!(!after.contains(&beta), "beta parent survived: {after:?}");
     assert!(after.contains(&alpha), "alpha parent vanished: {after:?}");
@@ -7064,13 +7048,13 @@ fn drop_resolves_an_advanced_branchs_parent_by_ancestry() {
     extend_branch(&lab, "feat/beta", "beta.txt", "beta\nmore\n");
     let repo = Repo::open(&lab.work).expect("reopen after beta advanced");
     let alpha = repo.resolve_commit("feat/alpha").expect("alpha tip");
-    let before = release_parent_commits(&lab, "release/2026-08-04");
+    let before = release_parents(&lab, "release/2026-08-04");
 
     let output = knives_release(&lab, &home, &["drop", "feat/beta", "--why", "superseded"]);
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success(), "{stdout}");
-    let after = release_parent_commits(&lab, "release/2026-08-04");
+    let after = release_parents(&lab, "release/2026-08-04");
     assert!(
         !after.contains(&released_beta),
         "the ancestor parent survived: {after:?}"
@@ -7106,7 +7090,7 @@ fn advance_moves_only_the_named_parents_then_all() {
     assert!(output.status.success(), "{stdout}");
 
     // Then: alpha moved, beta did not.
-    let parents = release_parent_commits(&lab, "release/2026-08-04");
+    let parents = release_parents(&lab, "release/2026-08-04");
     assert!(
         parents.contains(&new_alpha),
         "the named member did not reach its tip: {parents:?}"
@@ -7132,7 +7116,7 @@ fn advance_moves_only_the_named_parents_then_all() {
     // And: a bare advance moves every member that has advanced.
     let output = knives_release(&lab, &home, &["advance"]);
     assert!(output.status.success(), "{output:?}");
-    let parents = release_parent_commits(&lab, "release/2026-08-04");
+    let parents = release_parents(&lab, "release/2026-08-04");
     assert!(
         parents.contains(&new_beta),
         "the bare advance left the advanced member behind: {parents:?}"
@@ -7166,7 +7150,7 @@ fn a_named_advance_claims_nothing_about_the_members_it_never_read() {
     lab.branch("feat/beta", "beta.txt", "beta\n");
     let (home, _consumer) = home_after_first_cut(&lab);
     extend_branch(&lab, "feat/beta", "beta.txt", "beta\nmore\n");
-    let before = release_parent_commits(&lab, "release/2026-08-04");
+    let before = release_parents(&lab, "release/2026-08-04");
 
     // When: only the member that has not moved is named.
     let output = knives_release(&lab, &home, &["advance", "feat/alpha"]);
@@ -7182,7 +7166,7 @@ fn a_named_advance_claims_nothing_about_the_members_it_never_read() {
         !stdout.contains("every member of"),
         "a named advance claimed the sweep only a bare advance performs: {stdout}"
     );
-    assert_eq!(release_parent_commits(&lab, "release/2026-08-04"), before);
+    assert_eq!(release_parents(&lab, "release/2026-08-04"), before);
 }
 
 #[test]
@@ -7195,13 +7179,13 @@ fn cut_with_a_previous_release_duplicates_it_verbatim() {
     lab.branch("feat/beta", "beta.txt", "beta\n");
     let (home, _consumer) = home_after_first_cut(&lab);
     lab.branch("feat/gamma", "gamma.txt", "gamma\n");
-    let previous = release_parent_commits(&lab, "release/2026-08-04");
+    let previous = release_parents(&lab, "release/2026-08-04");
 
     let output = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success(), "{stdout}");
-    let parents = release_parent_commits(&lab, "release/2026-08-05");
+    let parents = release_parents(&lab, "release/2026-08-05");
     assert_eq!(parents, previous, "a cut must not recompute membership");
     let gamma = commit_at(&lab, "feat/gamma");
     assert!(
@@ -7282,7 +7266,7 @@ fn a_fixed_scheme_cut_carries_the_local_release_in_hand() {
     assert!(stdout.contains("cut integration as"), "{stdout}");
     let recut = commit_at(&lab, "integration");
     assert_ne!(recut, edited, "the fixed cut named nothing new: {stdout}");
-    let parents = release_parent_commits(&lab, "integration");
+    let parents = release_parents(&lab, "integration");
     assert!(
         parents.contains(&beta),
         "the cut reverted an unpushed include: {parents:?}\n{stdout}"
@@ -7318,7 +7302,7 @@ fn an_edit_refuses_when_the_upstream_trunk_cannot_resolve() {
         consumer.path().display().to_string(),
     )
     .expect("write local consumer fixture path");
-    let before = release_parent_commits(&lab, "release/2026-08-04");
+    let before = release_parents(&lab, "release/2026-08-04");
 
     let output = knives_release(&lab, &home, &["include", "feat/alpha"]);
 
@@ -7330,7 +7314,7 @@ fn an_edit_refuses_when_the_upstream_trunk_cannot_resolve() {
         "the refusal must name the missing trunk as its reason: {stdout}"
     );
     assert_eq!(
-        release_parent_commits(&lab, "release/2026-08-04"),
+        release_parents(&lab, "release/2026-08-04"),
         before,
         "an edit ran without a resolvable trunk"
     );
@@ -7353,7 +7337,7 @@ fn a_bare_advance_with_an_ambiguous_parent_changes_nothing() {
     std::fs::write(lab.work.join("rival.txt"), "rival\n").expect("write rival");
     lab.jj_work(["bookmark", "create", "feat/rival", "-r", "@"]);
     lab.jj_work(["new"]);
-    let before = release_parent_commits(&lab, "release/2026-08-04");
+    let before = release_parents(&lab, "release/2026-08-04");
 
     let output = knives_release(&lab, &home, &["advance"]);
 
@@ -7367,14 +7351,14 @@ fn a_bare_advance_with_an_ambiguous_parent_changes_nothing() {
         "the refusal must name the branches it could not choose between: {stdout}"
     );
     assert_eq!(
-        release_parent_commits(&lab, "release/2026-08-04"),
+        release_parents(&lab, "release/2026-08-04"),
         before,
         "an ambiguous bare advance mutated the release"
     );
 }
 
 #[test]
-fn a_bare_advance_refuses_a_branch_that_would_replace_several_parents() {
+fn a_bare_advance_skips_a_branch_that_merges_several_members() {
     // Given: two released members, and a third branch built by merging both of
     // their released tips directly -- the shape of an integration branch built
     // across several former members, or of a member rebuilt with `jj
@@ -7389,7 +7373,7 @@ fn a_bare_advance_refuses_a_branch_that_would_replace_several_parents() {
     let (home, _consumer) = home_after_first_cut(&lab);
     let old_alpha = commit_at(&lab, "feat/alpha");
     let old_beta = commit_at(&lab, "feat/beta");
-    let before = release_parent_commits(&lab, "release/2026-08-04");
+    let before = release_parents(&lab, "release/2026-08-04");
     assert!(
         before.contains(&old_alpha) && before.contains(&old_beta),
         "{before:?}"
@@ -7408,17 +7392,18 @@ fn a_bare_advance_refuses_a_branch_that_would_replace_several_parents() {
 
     let output = knives_release(&lab, &home, &["advance"]);
 
+    // Then: a branch whose history carries a merge of two members is not a
+    // candidate at all — it is stacked history, named as such — and nothing
+    // moves. The release is left exactly as it was.
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert_eq!(output.status.code(), Some(3), "{stdout}");
-    assert!(stdout.contains("nothing advanced"), "{stdout}");
+    assert!(output.status.success(), "{stdout}");
     assert!(
-        stdout.contains("feat/consolidated")
-            && stdout.contains("descends from 2 parents")
-            && stdout.contains("drop and include instead"),
-        "the refusal must name the overreaching branch and both parents it claimed: {stdout}"
+        stdout.contains("feat/consolidated's history past the trunk carries 1 merge")
+            && stdout.contains("rebase it off the trunk before advancing onto it"),
+        "the stacked branch must be named and skipped: {stdout}"
     );
     assert_eq!(
-        release_parent_commits(&lab, "release/2026-08-04"),
+        release_parents(&lab, "release/2026-08-04"),
         before,
         "an overreaching bare advance mutated the release"
     );
@@ -7452,8 +7437,10 @@ fn advance_from_recovers_a_branch_rebuilt_with_jj_duplicate() {
         "the rebuild must be a fresh commit"
     );
 
-    // When: a plain named advance can't match it -- ancestry back to
-    // `old_alpha` is gone -- so it is refused, not guessed at.
+    // When: nothing can pair the rebuilt branch with its parent — no ancestry, no
+    // shared change id, and (the cut's own record removed) no name on file — a
+    // plain named advance is refused, not guessed at.
+    std::fs::remove_dir_all(home.path().join("ledger")).expect("forget the cut record");
     let plain = knives_release(&lab, &home, &["advance", "feat/alpha"]);
     let plain_stdout = String::from_utf8_lossy(&plain.stdout);
     assert_eq!(plain.status.code(), Some(3), "{plain_stdout}");
@@ -7471,7 +7458,7 @@ fn advance_from_recovers_a_branch_rebuilt_with_jj_duplicate() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success(), "{stdout}");
     assert!(stdout.contains("advanced feat/alpha"), "{stdout}");
-    let parents = release_parent_commits(&lab, "release/2026-08-04");
+    let parents = release_parents(&lab, "release/2026-08-04");
     assert!(
         parents.contains(&rebuilt_alpha),
         "the rebuilt branch did not land: {parents:?}"
@@ -7498,7 +7485,7 @@ fn advance_from_requires_exactly_one_branch() {
     lab.branch("feat/beta", "beta.txt", "beta\n");
     let (home, _consumer) = home_after_first_cut(&lab);
     let old_alpha = commit_at(&lab, "feat/alpha");
-    let before = release_parent_commits(&lab, "release/2026-08-04");
+    let before = release_parents(&lab, "release/2026-08-04");
 
     let output = knives_release(
         &lab,
@@ -7516,7 +7503,7 @@ fn advance_from_requires_exactly_one_branch() {
     assert_eq!(output.status.code(), Some(2), "{stdout}");
     assert!(stdout.contains("give exactly one branch"), "{stdout}");
     assert_eq!(
-        release_parent_commits(&lab, "release/2026-08-04"),
+        release_parents(&lab, "release/2026-08-04"),
         before,
         "a rejected --from still mutated the release"
     );
@@ -7543,7 +7530,7 @@ fn advance_from_refuses_when_the_named_commit_is_not_a_parent() {
         "--allow-backwards",
     ]);
     lab.jj_work(["new"]);
-    let before = release_parent_commits(&lab, "release/2026-08-04");
+    let before = release_parents(&lab, "release/2026-08-04");
 
     let output = knives_release(
         &lab,
@@ -7562,7 +7549,7 @@ fn advance_from_refuses_when_the_named_commit_is_not_a_parent() {
         "{stdout}"
     );
     assert_eq!(
-        release_parent_commits(&lab, "release/2026-08-04"),
+        release_parents(&lab, "release/2026-08-04"),
         before,
         "a refused --from still mutated the release"
     );
@@ -7594,13 +7581,13 @@ fn include_by_commit_id_adds_that_exact_parent() {
     lab.branch("feat/loose", "loose.txt", "loose\n");
     let loose = commit_at(&lab, "feat/loose");
     lab.jj_work(["bookmark", "forget", "feat/loose"]);
-    let before = release_parent_commits(&lab, "release/2026-08-04");
+    let before = release_parents(&lab, "release/2026-08-04");
 
     let output = knives_release(&lab, &home, &["include", loose.as_str()]);
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success(), "{stdout}");
-    let after = release_parent_commits(&lab, "release/2026-08-04");
+    let after = release_parents(&lab, "release/2026-08-04");
     assert!(
         after.contains(&loose),
         "the raw commit id was not added as a parent: {after:?}"
@@ -7630,7 +7617,7 @@ fn include_of_content_reachable_through_another_parent_reports_the_carrier() {
         &["drop", "feat/alpha", "--why", "beta carries it"],
     );
     assert!(dropped.status.success(), "{dropped:?}");
-    let before = release_parent_commits(&lab, "release/2026-08-04");
+    let before = release_parents(&lab, "release/2026-08-04");
     let before_commit = commit_at(&lab, "release/2026-08-04");
 
     let output = knives_release(&lab, &home, &["include", "feat/alpha"]);
@@ -7642,7 +7629,7 @@ fn include_of_content_reachable_through_another_parent_reports_the_carrier() {
         "{stdout}"
     );
     assert_eq!(
-        release_parent_commits(&lab, "release/2026-08-04"),
+        release_parents(&lab, "release/2026-08-04"),
         before,
         "include mutated the release for content it does not carry"
     );
@@ -7760,7 +7747,7 @@ fn a_bare_advance_under_the_fixed_scheme_ignores_the_release_bookmark() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success(), "{stdout}");
     assert!(stdout.contains("advanced feat/alpha"), "{stdout}");
-    let parents = release_parent_commits(&lab, "integration");
+    let parents = release_parents(&lab, "integration");
     assert!(parents.contains(&advanced_alpha), "{parents:?}");
     assert!(
         !parents.contains(&released),
@@ -7816,7 +7803,7 @@ fn a_member_landed_upstream_by_merge_commit_can_still_be_dropped() {
         stdout.contains("no remaining member carries feat/alpha's content"),
         "{stdout}"
     );
-    let parents = release_parent_commits(&lab, "release/2026-08-04");
+    let parents = release_parents(&lab, "release/2026-08-04");
     assert!(
         !parents.contains(&alpha),
         "landed alpha survived: {parents:?}"
@@ -7851,7 +7838,7 @@ fn a_drop_whose_content_survives_through_another_member_stays_quiet() {
         !stdout.contains("loses it"),
         "content survives through beta; no loss to report: {stdout}"
     );
-    let parents = release_parent_commits(&lab, "release/2026-08-04");
+    let parents = release_parents(&lab, "release/2026-08-04");
     assert_eq!(parents, vec![commit_at(&lab, "feat/beta")], "{parents:?}");
 }
 
@@ -7911,7 +7898,7 @@ fn an_edit_refuses_when_every_pin_of_the_release_is_frozen() {
         ),
     )
     .expect("write frozen-pin registry");
-    let before = release_parent_commits(&lab, release);
+    let before = release_parents(&lab, release);
 
     let output = knives_release(
         &lab,
@@ -7931,7 +7918,7 @@ fn an_edit_refuses_when_every_pin_of_the_release_is_frozen() {
         "frozen-pin guidance missing: {stdout}"
     );
     assert_eq!(
-        release_parent_commits(&lab, release),
+        release_parents(&lab, release),
         before,
         "a release no pin follows was edited in place"
     );
@@ -8549,14 +8536,6 @@ fn extend_branch(lab: &Lab, branch: &str, file: &str, content: &str) {
     lab.jj_work(["new"]);
 }
 
-/// The commit `revision` resolves to right now.
-fn commit_at(lab: &Lab, revision: &str) -> CommitId {
-    Repo::open(&lab.work)
-        .expect("open to resolve a revision")
-        .resolve_commit(revision)
-        .expect("resolve revision")
-}
-
 /// [`release_test_home`], with `release/2026-08-04` already cut from whatever
 /// branches `lab` carries: the starting point of every release-edit test.
 fn home_after_first_cut(lab: &Lab) -> (tempfile::TempDir, std::path::PathBuf) {
@@ -8567,16 +8546,6 @@ fn home_after_first_cut(lab: &Lab) -> (tempfile::TempDir, std::path::PathBuf) {
 }
 
 /// The commit each parent of a named release sits at right now.
-fn release_parent_commits(lab: &Lab, name: &str) -> Vec<CommitId> {
-    Repo::open(&lab.work)
-        .expect("open for release parents")
-        .parents_of(name)
-        .expect("read release parents")
-        .into_iter()
-        .map(|parent| parent.commit)
-        .collect()
-}
-
 #[test]
 fn an_incremental_recut_preserves_the_previous_cuts_conflict_resolutions() {
     // Given: a resolved two-branch cut plus a third branch to include.
@@ -8679,7 +8648,7 @@ fn a_bare_advance_ignores_a_branch_stacked_on_the_release() {
     let (home, _consumer) = release_test_home(&lab);
     let first = knives_release(&lab, &home, &["cut", "release/2026-08-04"]);
     assert!(first.status.success(), "{first:?}");
-    let before = release_parent_commits(&lab, "release/2026-08-04");
+    let before = release_parents(&lab, "release/2026-08-04");
     lab.jj_work(["new", "release/2026-08-04", "-m", "stacked on the cut"]);
     std::fs::write(lab.work.join("stacked.txt"), "stacked\n").expect("write stacked content");
     lab.jj_work(["bookmark", "create", "feat/stacked", "-r", "@"]);
@@ -8694,7 +8663,7 @@ fn a_bare_advance_ignores_a_branch_stacked_on_the_release() {
         "a branch stacked on the release is not an advanced member: {stdout}"
     );
     assert_eq!(
-        release_parent_commits(&lab, "release/2026-08-04"),
+        release_parents(&lab, "release/2026-08-04"),
         before,
         "the bare advance folded a stacked branch into the release"
     );
@@ -8718,7 +8687,7 @@ fn advancing_a_named_stacked_branch_is_refused() {
     let (home, _consumer) = release_test_home(&lab);
     let first = knives_release(&lab, &home, &["cut", "release/2026-08-04"]);
     assert!(first.status.success(), "{first:?}");
-    let before = release_parent_commits(&lab, "release/2026-08-04");
+    let before = release_parents(&lab, "release/2026-08-04");
     lab.jj_work(["new", "release/2026-08-04", "-m", "stacked on the cut"]);
     std::fs::write(lab.work.join("stacked.txt"), "stacked\n").expect("write stacked content");
     lab.jj_work(["bookmark", "create", "feat/stacked", "-r", "@"]);
@@ -8733,7 +8702,7 @@ fn advancing_a_named_stacked_branch_is_refused() {
         "the refusal must say what is wrong with the branch: {stdout}"
     );
     assert_eq!(
-        release_parent_commits(&lab, "release/2026-08-04"),
+        release_parents(&lab, "release/2026-08-04"),
         before,
         "the refusal still moved a parent"
     );
@@ -8750,7 +8719,7 @@ fn include_refuses_the_trunk_because_it_is_never_a_member() {
     let first = knives_release(&lab, &home, &["cut", "release/2026-08-04"]);
     assert!(first.status.success(), "{first:?}");
     lab.advance_upstream("upstream advance\n");
-    let before = release_parent_commits(&lab, "release/2026-08-04");
+    let before = release_parents(&lab, "release/2026-08-04");
 
     let output = knives_release(&lab, &home, &["include", "main@upstream"]);
 
@@ -8761,7 +8730,7 @@ fn include_refuses_the_trunk_because_it_is_never_a_member() {
         "the refusal must state the model: {stdout}"
     );
     assert_eq!(
-        release_parent_commits(&lab, "release/2026-08-04"),
+        release_parents(&lab, "release/2026-08-04"),
         before,
         "including the trunk made it a parent"
     );
@@ -8782,7 +8751,7 @@ fn an_edit_refuses_a_release_held_only_as_a_remote_ref() {
     lab.push_branch("release/2026-08-04");
     lab.jj_work(["bookmark", "forget", "release/2026-08-04"]);
     lab.branch("feat/beta", "beta.txt", "beta\n");
-    let before = release_parent_commits(&lab, "release/2026-08-04@origin");
+    let before = release_parents(&lab, "release/2026-08-04@origin");
 
     let output = knives_release(&lab, &home, &["include", "feat/beta"]);
 
@@ -8793,7 +8762,7 @@ fn an_edit_refuses_a_release_held_only_as_a_remote_ref() {
         "the refusal must say how to get a local bookmark to edit: {stdout}"
     );
     assert_eq!(
-        release_parent_commits(&lab, "release/2026-08-04@origin"),
+        release_parents(&lab, "release/2026-08-04@origin"),
         before,
         "the remote-only release was edited anyway"
     );
@@ -8839,7 +8808,7 @@ fn advance_refuses_the_trunk_and_the_release_by_name() {
     let (home, _consumer) = release_test_home(&lab);
     let first = knives_release(&lab, &home, &["cut", "release/2026-08-04"]);
     assert!(first.status.success(), "{first:?}");
-    let before = release_parent_commits(&lab, "release/2026-08-04");
+    let before = release_parents(&lab, "release/2026-08-04");
 
     for named in ["main", "release/2026-08-04"] {
         let output = knives_release(&lab, &home, &["advance", named]);
@@ -8850,7 +8819,7 @@ fn advance_refuses_the_trunk_and_the_release_by_name() {
             "{named} must be refused as unadvanceable: {stdout}"
         );
         assert_eq!(
-            release_parent_commits(&lab, "release/2026-08-04"),
+            release_parents(&lab, "release/2026-08-04"),
             before,
             "advancing {named} moved a parent"
         );
@@ -8871,7 +8840,7 @@ fn a_rebase_refuses_a_release_held_only_as_a_remote_ref() {
     lab.push_branch("release/2026-08-04");
     lab.jj_work(["bookmark", "forget", "release/2026-08-04"]);
     lab.advance_upstream("upstream advance\n");
-    let before = release_parent_commits(&lab, "release/2026-08-04@origin");
+    let before = release_parents(&lab, "release/2026-08-04@origin");
 
     let output = knives_release(&lab, &home, &["rebase"]);
 
@@ -8882,7 +8851,7 @@ fn a_rebase_refuses_a_release_held_only_as_a_remote_ref() {
         "the refusal must say how to get a local bookmark to move: {stdout}"
     );
     assert_eq!(
-        release_parent_commits(&lab, "release/2026-08-04@origin"),
+        release_parents(&lab, "release/2026-08-04@origin"),
         before,
         "the remote-only release was rebased anyway"
     );

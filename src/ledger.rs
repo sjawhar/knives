@@ -113,6 +113,23 @@ pub struct Entry {
     /// a forge call: this is a write path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pr: Option<u64>,
+    /// The parent set a release cut or edit left behind, one item per parent
+    /// with every local bookmark holding it at the time. Written by `cut`,
+    /// `include`, `drop`, `advance` and `rebase`; the record a later edit uses
+    /// to tell which parent is which branch once a rebase done outside jj has
+    /// left no ancestry or change id to say so.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parents: Vec<RecordedParent>,
+}
+
+/// One release parent as an event recorded it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordedParent {
+    pub commit: String,
+    /// Every local bookmark at the commit when the event was written; empty for
+    /// a parent nothing named.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub branches: Vec<String>,
 }
 
 /// The machine surface of an entry file: every 1.1 field except the text,
@@ -136,6 +153,8 @@ struct Frontmatter {
     anchor: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pr: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    parents: Vec<RecordedParent>,
 }
 
 impl Frontmatter {
@@ -149,6 +168,7 @@ impl Frontmatter {
             evidence: entry.evidence.clone(),
             anchor: entry.anchor.clone(),
             pr: entry.pr,
+            parents: entry.parents.clone(),
         }
     }
 
@@ -163,6 +183,7 @@ impl Frontmatter {
             evidence: self.evidence,
             anchor: self.anchor,
             pr: self.pr,
+            parents: self.parents,
         }
     }
 }
@@ -472,6 +493,9 @@ pub struct Draft<'a> {
     /// caller. Never a forge call: a round trip here would make every claim,
     /// track and sync pay for a network hop to record what it just did.
     pub pr: Option<u64>,
+    /// The parent set a release cut or edit leaves behind; empty for every
+    /// other entry.
+    pub parents: Vec<RecordedParent>,
 }
 
 /// Where automatic events go, and who is writing them.
@@ -513,6 +537,7 @@ impl Scribe {
             evidence: draft.evidence.clone(),
             anchor: self.anchor(draft.subject),
             pr: draft.pr,
+            parents: draft.parents.clone(),
         };
         self.ledger.append(&entry)?;
         Ok(entry)
@@ -532,6 +557,7 @@ impl Scribe {
             text,
             evidence: Vec::new(),
             pr,
+            parents: Vec::new(),
         })
     }
 
@@ -694,6 +720,7 @@ mod tests {
             evidence: Vec::new(),
             anchor: Some("6c42fe71".to_owned()),
             pr: None,
+            parents: Vec::new(),
             disposition: None,
         }
     }
@@ -1268,6 +1295,7 @@ mod tests {
                 text: "the release remote is out of date".to_owned(),
                 evidence: vec!["06d778b9".to_owned(), "a-repo#1157".to_owned()],
                 pr: None,
+                parents: Vec::new(),
             })
             .unwrap();
 
@@ -1318,6 +1346,39 @@ mod tests {
             .unwrap();
         let text = std::fs::read_to_string(only_file(plain.path())).unwrap();
         assert!(!text.contains("disposition"), "was: {text}");
+    }
+
+    #[test]
+    fn a_recorded_parent_set_round_trips_with_every_branch_name() {
+        // The parent set is the one record of which branch a released parent
+        // was that survives the bookmark moving; a file that kept the commit
+        // but lost a name would let `include` carry that branch twice.
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = Ledger::at(dir.path().join("a-repo"));
+        let cut = Entry {
+            kind: Kind::Event,
+            parents: vec![
+                RecordedParent {
+                    commit: "a".repeat(40),
+                    branches: vec!["anchor/alpha".to_owned(), "feat/alpha".to_owned()],
+                },
+                RecordedParent {
+                    commit: "b".repeat(40),
+                    branches: Vec::new(),
+                },
+            ],
+            ..entry(Some("release/2026-08-04"), "cut release/2026-08-04")
+        };
+        ledger.append(&cut).unwrap();
+        assert_eq!(ledger.entries().unwrap(), vec![cut]);
+
+        let plain_dir = tempfile::tempdir().unwrap();
+        let plain = Ledger::at(plain_dir.path().join("a-repo"));
+        plain
+            .append(&entry(Some("feat/beta"), "still investigating"))
+            .unwrap();
+        let text = std::fs::read_to_string(only_file(plain.path())).unwrap();
+        assert!(!text.contains("parents"), "was: {text}");
     }
 
     #[test]

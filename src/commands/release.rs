@@ -19,13 +19,16 @@ use crate::detect::{
     BookmarkTips, Finding, FindingKind, RebaseOutcome, ReleaseParent, Subject, stale_parents,
 };
 use crate::ids::{
-    BookmarkRef, BranchName, CommitId, ReleaseScheme, RepoName, is_our_release, is_release_name,
+    BookmarkRef, BranchName, CommitId, ReleaseScheme, RepoName, is_our_release,
     strict_dated_release,
 };
 use crate::jj::{self, Repo};
+use crate::ledger::{Entry, RecordedParent};
 use crate::pins::{Pin, PinKind};
 use crate::release_model::{
-    RecordedCut, carried_from_tips, double_cut_findings, newest_release, repo_slug,
+    BranchSuccessions, MemberEvidence, MemberSuccession, RecordedCut, StackedHistoryContext,
+    carried_from_tips, double_cut_findings, last_recorded_parents, member_parents, newest_release,
+    release_refs_by_commit, repo_slug, stacked_history, trunk_positions,
 };
 
 /// Registered forge consumers and explicitly requested local checkout scans.
@@ -180,9 +183,10 @@ pub fn trunk_lag(repo: &Repo, release: Option<&str>, upstream_trunk: &str) -> Op
 ///
 /// A doctrine-flat release names no base among its parents — the base is never
 /// a parent — so its fork point is the newest commit every member and the
-/// trunk share. Falling back to the trunk tip here once charged all upstream
-/// drift since the fork to the members: a published composition failed its own
-/// re-cut, and `start` based new branches on the drifted tip.
+/// trunk share. `start` bases new branches on it, the plan names superseded
+/// bases against it, and the cut audit and `release rebase` measure drift from
+/// it; falling back to the trunk tip would charge all upstream drift since the
+/// fork to the members and start new branches on the drifted tip.
 pub fn shared_base(
     repo: &Repo,
     release: &CommitId,
@@ -211,45 +215,6 @@ pub fn shared_base(
     }
     let members: Vec<CommitId> = parents.into_iter().map(|parent| parent.commit).collect();
     Ok(repo.common_ancestor(&members, trunk_tip)?)
-}
-
-/// Branches whose trunk ancestry exceeds the shared base (#10).
-///
-/// A branch based past the base drags newer upstream into the next cut through
-/// itself alone, which surfaces as a conflict storm blamed on everything else.
-/// The finding names the branch so the fix (rebase it onto the base, or move
-/// the base deliberately) happens before the cut.
-pub fn mixed_base_findings(
-    repo_path: &Path,
-    branches: &[(String, CommitId)],
-    base: &CommitId,
-    trunk_tip: &CommitId,
-) -> Result<Vec<Finding>, crate::jj::JjError> {
-    let mut findings = Vec::new();
-    for (name, tip) in branches {
-        let beyond = crate::jj::commits_matching(
-            repo_path,
-            &format!(
-                "(::{tip} & ::{trunk}) ~ ::{base}",
-                tip = tip.as_str(),
-                trunk = trunk_tip.as_str(),
-                base = base.as_str()
-            ),
-        )?;
-        if !beyond.is_empty() {
-            findings.push(Finding::new(
-                FindingKind::MixedBase,
-                Subject::Branch(crate::ids::BranchName::new(name)),
-                format!(
-                    "branch {name} carries {} trunk commit(s) beyond the shared base {}; \
-                     it is based on a different upstream than that shared base",
-                    beyond.len(),
-                    short(base)
-                ),
-            ));
-        }
-    }
-    Ok(findings)
 }
 
 /// Commits the recut would strand: reachable from the previous release or its
@@ -495,10 +460,16 @@ fn live_dated_release(tips: &BookmarkTips, publish_remote: &str) -> Option<(Bran
         .map(|(reference, commit)| (reference.branch().clone(), commit.clone()))
 }
 
+/// The release in hand and what it does not carry.
+///
+/// `ledger` is this repository's ledger, read by the caller: the last recorded
+/// parent set is what names a member whose branch was rebased outside jj or
+/// landed upstream, where the repository no longer can.
 pub fn plan(
     name: &RepoName,
     entry: &RepoEntry,
     consumers: &ConsumerInputs<'_>,
+    ledger: &[Entry],
 ) -> anyhow::Result<Plan> {
     let mut plan = Plan {
         repo: name.to_string(),
@@ -531,6 +502,7 @@ pub fn plan(
 
     let parents = repo.parents_of(commit.as_str())?;
     let trunk_tip = repo.resolve_commit(&entry.upstream_trunk()).ok();
+    let trunks = trunk_positions(&repo, entry)?;
     let base = match &trunk_tip {
         Some(trunk) => shared_base(&repo, &commit, trunk)?,
         None => None,
@@ -559,39 +531,31 @@ pub fn plan(
             ));
         }
     }
-    plan.stale = stale_parents(&member_parents, &tips);
-    // Branches a cut will not carry: membership is the release's parent set,
-    // and a branch joins or moves only through a stated `include` or `advance`.
-    // Saying so here is what keeps "it exists locally" from silently meaning
-    // "it ships", without anyone having to remember to ask.
-    let local_branches = carried_from_tips(&tips, entry.trunk(), &scheme);
-    for (branch, tip) in &local_branches {
-        if repo.is_ancestor(tip, &commit)? {
-            continue;
+    let releases = release_refs_by_commit(&tips, &scheme, publish_remote);
+    let stacked_context = (!trunks.is_empty()).then_some(StackedHistoryContext {
+        repo: &repo,
+        trunks: &trunks,
+        releases: &releases,
+    });
+    if let Some(context) = stacked_context {
+        for parent in &member_parents {
+            if let Some(finding) = stacked_history(context, &parent_label(parent), &parent.commit)?
+            {
+                plan.base_findings.push(finding);
+            }
         }
-        // A branch built on top of the release descends from every member, which
-        // ancestry alone reads as "advanced". It is neither advanced nor
-        // includable as it stands: both verbs refuse it, because carrying it would
-        // put the cut in its own successor's ancestry.
-        let note = if repo.is_ancestor(&commit, tip)? {
-            format!(
-                "{branch} is stacked on {reference} rather than the trunk; rebase it off the \
-                 trunk before including it"
-            )
-        } else if any_ancestor_of(&repo, &member_parents, tip)? {
-            format!(
-                "{branch} has advanced past its parent in {reference}; \
-                 `knives release advance {branch}` moves it"
-            )
-        } else {
-            format!("{branch} is not in {reference}; `knives release include {branch}` adds it")
-        };
-        plan.notes.push(note);
     }
-    if let (Some(base), Some(trunk)) = (&base, &trunk_tip) {
-        let findings = mixed_base_findings(&entry.path, &local_branches, base, trunk)?;
-        plan.base_findings.extend(findings);
-    }
+    plan.stale = stale_parents(&member_parents, &tips);
+    plan.notes.extend(local_branch_notes(&LocalBranchNotes {
+        repo: &repo,
+        reference: &reference.to_string(),
+        release: &commit,
+        parents: &parents,
+        trunks: &trunks,
+        stacked: stacked_context,
+        branches: &carried_from_tips(&tips, entry.trunk(), &scheme),
+        recorded: last_recorded_parents(ledger, &reference.to_string()),
+    })?);
     plan.parents = parents
         .into_iter()
         .map(|parent| {
@@ -643,18 +607,104 @@ fn add_consumer_pins(
     }
 }
 
-/// Whether any of `parents` is an ancestor of `tip`.
-///
-/// A loop rather than `any`, because an ancestry jj cannot answer has to
-/// surface as an error: read as "no" it would label an advanced branch as
-/// never included, and send someone to `include` where `advance` is the answer.
-fn any_ancestor_of(repo: &Repo, parents: &[ReleaseParent], tip: &CommitId) -> anyhow::Result<bool> {
-    for parent in parents {
-        if repo.is_ancestor(&parent.commit, tip)? {
-            return Ok(true);
+/// What the plan says about local branches the release does not carry.
+struct LocalBranchNotes<'a> {
+    repo: &'a Repo,
+    reference: &'a str,
+    release: &'a CommitId,
+    /// Every parent, a landed member's included: the record may still name a
+    /// branch at a parent the trunk has since reached.
+    parents: &'a [ReleaseParent],
+    trunks: &'a [CommitId],
+    stacked: Option<StackedHistoryContext<'a>>,
+    branches: &'a [(String, CommitId)],
+    /// The release's last recorded parent set, for a branch the repository can
+    /// no longer tie to its parent.
+    recorded: &'a [RecordedParent],
+}
+
+/// One note per local branch a cut will not carry: membership is the release's
+/// parent set, and a branch joins or moves only through a stated `include` or
+/// `advance`. Saying so is what keeps "it exists locally" from silently
+/// meaning "it ships", without anyone having to remember to ask. Each note
+/// names the verb that would actually take the branch, so it never points at
+/// an `include` that verb would refuse.
+fn local_branch_notes(input: &LocalBranchNotes<'_>) -> anyhow::Result<Vec<String>> {
+    let LocalBranchNotes {
+        repo,
+        reference,
+        release,
+        parents,
+        trunks,
+        stacked,
+        branches,
+        recorded,
+    } = *input;
+    let parents: Vec<CommitId> = parents.iter().map(|parent| parent.commit.clone()).collect();
+    let mut notes = Vec::new();
+    for (branch, tip) in branches {
+        if repo.is_ancestor(tip, release)? {
+            continue;
         }
+        // A branch built on top of the release descends from every member, which
+        // ancestry alone reads as "advanced". It is neither advanced nor
+        // includable as it stands: both verbs refuse it, because carrying it would
+        // put the cut in its own successor's ancestry. The same goes for a branch
+        // whose history carries any release merge.
+        if repo.is_ancestor(release, tip)? {
+            notes.push(format!(
+                "{branch} is stacked on {reference} rather than the trunk; rebase it off the \
+                 trunk before including it"
+            ));
+            continue;
+        }
+        if let Some(context) = stacked
+            && let Some(stacked) = stacked_history(context, branch, tip)?
+        {
+            notes.push(format!(
+                "{}; rebase it off the trunk before including it",
+                stacked.detail
+            ));
+            continue;
+        }
+        let succession = MemberSuccession::of(repo, trunks, tip)?;
+        let lookup = member_parents(&succession, &parents, recorded, branch)?;
+        notes.push(match (lookup.parents.first(), lookup.evidence) {
+            (None, _) => {
+                format!("{branch} is not in {reference}; `knives release include {branch}` adds it")
+            }
+            (Some(_), MemberEvidence::Succession) => format!(
+                "{branch} has advanced past its parent in {reference}; \
+                 `knives release advance {branch}` moves it"
+            ),
+            (Some(parent), MemberEvidence::Record) => format!(
+                "{branch} was released as {} in {reference} and has since been rebased outside \
+                 jj; `knives release advance {branch}` moves it through that record",
+                short(parent)
+            ),
+            (Some(parent), MemberEvidence::LandedRecord) => format!(
+                "{branch}'s released parent {} in {reference} has landed upstream and the \
+                 branch kept going; `knives release advance {branch}` moves it, \
+                 `knives release rebase` retires the landed parent",
+                short(parent)
+            ),
+        });
     }
-    Ok(false)
+    Ok(notes)
+}
+
+/// The name a stacked-history finding uses for one release parent: its
+/// local bookmark when one still holds it, otherwise the bare commit — a
+/// parent that has been renamed or lost its bookmark is still a real member.
+fn parent_label(parent: &ReleaseParent) -> String {
+    parent
+        .bookmarks
+        .iter()
+        .find_map(|reference| match reference {
+            BookmarkRef::Local(branch) => Some(branch.to_string()),
+            BookmarkRef::Remote { .. } => None,
+        })
+        .unwrap_or_else(|| short(&parent.commit))
 }
 
 fn short(commit: &CommitId) -> String {
@@ -668,7 +718,7 @@ pub struct MemberRow {
     /// Every bookmark still on the parent, verbatim — a `keep/…` anchor is a
     /// bookmark like any other and shows up by name.
     pub held_by: Vec<String>,
-    /// Branches that moved past the parent (`branches_past`), rendered as
+    /// Branches that continue the parent ([`BranchSuccessions`]), rendered as
     /// `feat/x advanced to <tip12>`. Empty + empty `held_by` = a bare commit.
     pub advanced: Vec<String>,
     /// A trunk-reachable parent is the base of a legacy cut, not a member.
@@ -696,14 +746,13 @@ pub struct MembersReport {
 /// Gather one parent's current holders, descendants, and trunk relation.
 fn member_row(
     opened: &Repo,
-    entry: &RepoEntry,
     parent: ReleaseParent,
     trunk: Option<&CommitId>,
+    successions: &BranchSuccessions<'_>,
 ) -> anyhow::Result<MemberRow> {
-    let scheme = entry.release_scheme();
-    let advanced = jj::branches_past(&entry.path, &parent.commit)?
+    let advanced = successions
+        .successors_of(&parent.commit)?
         .into_iter()
-        .filter(|(branch, _)| !is_release_name(branch, &scheme))
         .map(|(branch, tip)| format!("{branch} advanced to {}", short(&tip)))
         .collect();
     let base_parent = trunk.map_or(Ok(false), |trunk| opened.is_ancestor(&parent.commit, trunk))?;
@@ -754,9 +803,16 @@ pub fn gather_members(
             None
         }
     };
+    let trunks = trunk_positions(opened, entry)?;
+    let branches = carried_from_tips(
+        &opened.bookmark_tips()?,
+        entry.trunk(),
+        &entry.release_scheme(),
+    );
+    let successions = BranchSuccessions::of(opened, &trunks, &branches)?;
     let members: Vec<MemberRow> = parents
         .into_iter()
-        .map(|parent| member_row(opened, entry, parent, trunk.as_ref()))
+        .map(|parent| member_row(opened, parent, trunk.as_ref(), &successions))
         .collect::<anyhow::Result<_>>()?;
     let audit = if verify {
         trunk
@@ -873,7 +929,19 @@ pub fn render(plan: &Plan) -> String {
     };
 
     lines.push(format!("{}: {release}", plan.repo));
-    lines.push(format!("  {} parent(s), flat", plan.parents.len()));
+    let stacked = plan
+        .base_findings
+        .iter()
+        .filter(|finding| finding.kind == FindingKind::StackedHistory)
+        .count();
+    lines.push(if stacked == 0 {
+        format!("  {} parent(s), flat", plan.parents.len())
+    } else {
+        format!(
+            "  {} parent(s), {stacked} stacked on a prior merge",
+            plan.parents.len()
+        )
+    });
     for (commit, names) in &plan.parents {
         let held = if names.is_empty() {
             "no bookmark".to_owned()
@@ -883,7 +951,7 @@ pub fn render(plan: &Plan) -> String {
         lines.push(format!("    {}  {held}", short(commit)));
     }
 
-    if plan.stale.is_empty() && plan.base_findings.is_empty() {
+    if plan.stale.is_empty() {
         lines.push("  every parent is still its branch tip".to_owned());
     } else {
         lines.push(format!("  {} stale parent(s):", plan.stale.len()));
@@ -1610,6 +1678,7 @@ mod cut_tests {
             evidence,
             anchor: None,
             pr: None,
+            parents: Vec::new(),
         }
     }
 
