@@ -626,6 +626,16 @@ impl Repo {
         })
     }
 
+    /// Whether any of `bases` reaches `id`.
+    fn reaches_any(&self, id: &JjCommitId, bases: &[JjCommitId]) -> Result<bool, JjError> {
+        for base in bases {
+            if self.backend_is_ancestor(id, base)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// [`Self::is_ancestor`] by backend id, saving the hex round-trip.
     fn backend_is_ancestor(
         &self,
@@ -641,11 +651,11 @@ impl Repo {
             })
     }
 
-    /// Commits of `base..tip` — reachable from `tip` but not from `base` —
+    /// Commits reachable from `tip` but not from any of `bases` — `bases..tip` —
     /// children before parents: the order [`duplicate_commits`] requires.
     fn range_newest_first(
         &self,
-        base: &JjCommitId,
+        bases: &[JjCommitId],
         tip: &JjCommitId,
     ) -> Result<Vec<JjCommitId>, JjError> {
         let mut oldest_first = Vec::new();
@@ -656,7 +666,7 @@ impl Repo {
                 oldest_first.push(id);
                 continue;
             }
-            if visited.contains(&id) || self.backend_is_ancestor(&id, base)? {
+            if visited.contains(&id) || self.reaches_any(&id, bases)? {
                 continue;
             }
             visited.insert(id.clone());
@@ -754,40 +764,57 @@ impl Repo {
         ))
     }
 
-    /// Merge commits reachable from `tip` but not from `base` that join two or
-    /// more lines the base does not have, newest first.
+    /// Merge commits reachable from `tip` but not from any of `bases` that join
+    /// two or more lines none of the bases has, newest first.
     ///
     /// A feature branch forked from the trunk has none: every commit past the
     /// trunk is linear work. A merge whose parents are its own previous commit
     /// and a trunk commit — the branch pulled the trunk into itself — carries
     /// nothing beyond the trunk and its own work, and does not count. A merge
     /// with two or more parents outside the trunk — a release cut, another
-    /// branch — means the branch carries everything that merge carried.
+    /// branch — means the branch carries everything that merge carried. Every
+    /// known trunk position is a base, so a trunk view that is behind another
+    /// does not turn upstream's own merges into the branch's.
     pub fn merges_between(
         &self,
-        base: &CommitId,
+        bases: &[CommitId],
         tip: &CommitId,
     ) -> Result<Vec<CommitId>, JjError> {
-        let base = self.commit(base.as_str())?.id().clone();
-        let tip = self.commit(tip.as_str())?.id().clone();
+        let bases = bases
+            .iter()
+            .map(|base| Ok(self.commit(base.as_str())?.id().clone()))
+            .collect::<Result<Vec<_>, JjError>>()?;
         let mut merges = Vec::new();
-        for id in self.range_newest_first(&base, &tip)? {
-            let commit = self
-                .repo
-                .store()
-                .get_commit(&id)
-                .map_err(|error| store_error(&error))?;
+        for commit in self.commits_between(&bases, tip)? {
             let mut beyond_base = 0usize;
             for parent in commit.parent_ids() {
-                if !self.backend_is_ancestor(parent, &base)? {
+                if !self.reaches_any(parent, &bases)? {
                     beyond_base += 1;
                 }
             }
             if beyond_base > 1 {
-                merges.push(commit_id(&id));
+                merges.push(commit_id(commit.id()));
             }
         }
         Ok(merges)
+    }
+
+    /// The commits of `bases..tip`, newest first.
+    fn commits_between(
+        &self,
+        bases: &[JjCommitId],
+        tip: &CommitId,
+    ) -> Result<Vec<jj_lib::commit::Commit>, JjError> {
+        let tip = self.commit(tip.as_str())?.id().clone();
+        self.range_newest_first(bases, &tip)?
+            .iter()
+            .map(|id| {
+                self.repo
+                    .store()
+                    .get_commit(id)
+                    .map_err(|error| store_error(&error))
+            })
+            .collect()
     }
 
     /// Change ids of every commit reachable from `tip` but not from `base`.
@@ -803,17 +830,11 @@ impl Repo {
         tip: &CommitId,
     ) -> Result<BTreeSet<ChangeId>, JjError> {
         let base = self.commit(base.as_str())?.id().clone();
-        let tip = self.commit(tip.as_str())?.id().clone();
-        let mut changes = BTreeSet::new();
-        for id in self.range_newest_first(&base, &tip)? {
-            let commit = self
-                .repo
-                .store()
-                .get_commit(&id)
-                .map_err(|error| store_error(&error))?;
-            changes.insert(ChangeId::new(commit.change_id().to_string()));
-        }
-        Ok(changes)
+        Ok(self
+            .commits_between(std::slice::from_ref(&base), tip)?
+            .iter()
+            .map(|commit| ChangeId::new(commit.change_id().to_string()))
+            .collect())
     }
 
     fn commit(&self, revision: &str) -> Result<jj_lib::commit::Commit, JjError> {
@@ -1029,7 +1050,7 @@ pub fn probe_revision(
     let base = repo.commit(base)?;
     let revision = repo.commit(revision)?;
     let onto = repo.commit(onto)?;
-    let targets = repo.range_newest_first(base.id(), revision.id())?;
+    let targets = repo.range_newest_first(std::slice::from_ref(base.id()), revision.id())?;
     if targets.is_empty() {
         // Nothing to replay: the range holds no commit that `onto` lacks, so
         // its content is already there. A merge without squashing lands here.

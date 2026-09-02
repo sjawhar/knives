@@ -1,5 +1,4 @@
 #![allow(
-    dead_code,
     clippy::expect_used,
     clippy::indexing_slicing,
     clippy::panic,

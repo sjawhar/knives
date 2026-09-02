@@ -380,12 +380,13 @@ fn branch_states_with_findings(
     // forks from is not a finding: branches follow the upstream trunk, and the
     // release follows them.
     let mut findings = Vec::new();
-    if let Ok(trunk_tip) = repo.resolve_commit(&entry.upstream_trunk()) {
+    let trunks = crate::release_model::trunk_positions(&repo, entry)?;
+    if !trunks.is_empty() {
         let releases =
             crate::release_model::release_refs_by_commit(&tips, &scheme, entry.publish_remote());
         let context = crate::release_model::StackedHistoryContext {
             repo: &repo,
-            trunk: &trunk_tip,
+            trunks: &trunks,
             releases: &releases,
         };
         for (branch, tip) in crate::release_model::carried_from_tips(&tips, entry.trunk(), &scheme)

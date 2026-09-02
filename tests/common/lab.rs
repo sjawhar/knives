@@ -7,7 +7,8 @@
 #![allow(
     clippy::unused_self,
     unreachable_pub,
-    reason = "a test fixture: method form keeps call sites readable, and this module is included by path"
+    dead_code,
+    reason = "a test fixture included by path: method form keeps call sites readable, and not every test target uses every helper"
 )]
 
 use std::path::{Path, PathBuf};
@@ -197,6 +198,13 @@ impl Lab {
     /// the way a merge-commit forge button does: the branch tip itself becomes
     /// an ancestor of the trunk.
     pub(crate) fn merge_pull_with_merge_commit(&self, number: u64) {
+        self.merge_pull_with_merge_commit_unfetched(number);
+        jj(&self.work, ["git", "fetch", "--remote", "upstream"]);
+    }
+
+    /// [`Self::merge_pull_with_merge_commit`] without the work checkout
+    /// fetching upstream afterwards: its `main@upstream` view stays behind.
+    pub(crate) fn merge_pull_with_merge_commit_unfetched(&self, number: u64) {
         let pull = format!("refs/pull/{number}/head:refs/remotes/origin/pull/{number}/head");
         git(&self.maintainer, &self.trunk, ["fetch", "origin", &pull]);
         git(
@@ -215,7 +223,23 @@ impl Lab {
             &self.trunk,
             ["push", "origin", self.trunk.as_str()],
         );
-        jj(&self.work, ["git", "fetch", "--remote", "upstream"]);
+    }
+
+    /// Bring the fork's trunk up to upstream's and fetch it into the work
+    /// checkout, so `main@origin` is ahead of a `main@upstream` view nobody
+    /// refreshed.
+    pub(crate) fn mirror_upstream_trunk_to_origin(&self) {
+        let refspec = format!("{0}:{0}", self.trunk);
+        git(
+            &self.maintainer,
+            &self.trunk,
+            [
+                "push",
+                self.temp_origin().to_str().expect("utf-8 path"),
+                &refspec,
+            ],
+        );
+        jj(&self.work, ["git", "fetch", "--remote", "origin"]);
     }
 
     pub(crate) fn rebase_and_force_push(&self, branch: &str) {
@@ -229,6 +253,13 @@ impl Lab {
     }
 
     pub(crate) fn advance_upstream(&self, content: &str) {
+        self.advance_upstream_unfetched(content);
+        jj(&self.work, ["git", "fetch", "--remote", "upstream"]);
+    }
+
+    /// [`Self::advance_upstream`] without the work checkout fetching upstream
+    /// afterwards: its `main@upstream` view stays behind.
+    pub(crate) fn advance_upstream_unfetched(&self, content: &str) {
         std::fs::write(self.maintainer.join("UPSTREAM.md"), content)
             .expect("write upstream advance");
         git(&self.maintainer, &self.trunk, ["add", "UPSTREAM.md"]);
@@ -242,7 +273,6 @@ impl Lab {
             &self.trunk,
             ["push", "origin", self.trunk.as_str()],
         );
-        jj(&self.work, ["git", "fetch", "--remote", "upstream"]);
     }
 
     pub(crate) fn consumer_with_pin_history(
@@ -430,6 +460,25 @@ pub fn release_test_home(lab: &Lab) -> (tempfile::TempDir, std::path::PathBuf) {
     .expect("write local consumer fixture path");
     (home, consumer)
 }
+/// The commit `revision` resolves to in the work checkout right now.
+pub fn commit_at(lab: &Lab, revision: &str) -> knives::ids::CommitId {
+    knives::jj::Repo::open(&lab.work)
+        .expect("open to resolve a revision")
+        .resolve_commit(revision)
+        .expect("resolve revision")
+}
+
+/// The commits a release named `name` has as parents right now.
+pub fn release_parents(lab: &Lab, name: &str) -> Vec<knives::ids::CommitId> {
+    knives::jj::Repo::open(&lab.work)
+        .expect("open for release parents")
+        .parents_of(name)
+        .expect("read release parents")
+        .into_iter()
+        .map(|parent| parent.commit)
+        .collect()
+}
+
 /// Operation ids in the shared op log, newest first.
 pub fn operation_ids(repo: &std::path::Path) -> Vec<String> {
     let output = Command::new("jj")

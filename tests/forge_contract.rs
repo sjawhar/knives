@@ -188,8 +188,16 @@ fn recorded_check_rollups_match_the_batch_decoder() {
         "the recording includes a consulted, never-ran rollup"
     );
     assert!(
-        checks.iter().all(|checks| !checks.failing()),
+        checks.iter().all(|checks| !checks.has_hard_failure()),
         "recorded rollups must not be falsely classified as failing: {checks:?}"
+    );
+    assert_eq!(
+        checks
+            .iter()
+            .filter(|checks| checks.has_action_required())
+            .count(),
+        1,
+        "exactly the recorded approval-gated pull request is held for action: {checks:?}"
     );
 }
 
@@ -210,6 +218,15 @@ fn a_recorded_batch_payload_decodes_every_field_the_query_asks_for() {
             .values()
             .any(|fact| fact.details.checks.as_ref().is_some_and(ChecksSummary::ran)),
         "no recorded pull request had checks: {facts:?}"
+    );
+    assert!(
+        facts.values().any(|fact| {
+            fact.details
+                .checks
+                .as_ref()
+                .is_some_and(|checks| checks.has_action_required() && !checks.has_hard_failure())
+        }),
+        "no recorded pull request sat behind an approval gate: {facts:?}"
     );
     assert!(
         facts.values().any(|fact| fact.newest_comment.is_some()),
@@ -257,6 +274,9 @@ fn a_recorded_batch_payload_decodes_every_field_the_query_asks_for() {
         "committedDate",
         "hasNextPage",
         "statusCheckRollup",
+        "checkSuites",
+        "totalCount",
+        "workflowRun",
         "createdAt",
     ] {
         assert!(query.contains(field), "the query dropped {field}");
@@ -391,7 +411,19 @@ fn the_recorded_summary_payload_is_scrubbed() {
 
 #[test]
 fn the_recorded_facts_payload_is_scrubbed() {
-    assert!(!RECORDED_FACTS.contains(REAL_FORGE_HOST));
+    let lower = RECORDED_FACTS.to_ascii_lowercase();
+    for identity in [
+        concat!("me", "tr"),
+        concat!("ha", "wk"),
+        concat!("middle", "man"),
+        concat!("sjaw", "har"),
+        REAL_FORGE_HOST,
+    ] {
+        assert!(
+            !lower.contains(identity),
+            "facts fixture leaks internal identifier `{identity}`"
+        );
+    }
 
     let recorded: Value = serde_json::from_str(RECORDED_FACTS).expect("recorded JSON is valid");
     let pulls = recorded_repository(&recorded).expect("recorded facts has a repository");

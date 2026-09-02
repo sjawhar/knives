@@ -1634,7 +1634,7 @@ printf '{}'
 
         let checks = facts[&11].details.checks.as_ref().expect("consulted");
         assert!(checks.failing(), "a FAILURE conclusion is failing");
-        assert_eq!(checks.failed_names(), vec!["build".to_owned()]);
+        assert_eq!(checks.hard_failure_names(), vec!["build".to_owned()]);
         assert!(checks.ran());
     }
 
@@ -1693,7 +1693,7 @@ printf '{}'
 
         let checks = facts[&11].details.checks.as_ref().expect("consulted");
         assert!(checks.failing(), "an ERROR state is failing");
-        assert_eq!(checks.failed_names(), vec!["legacy-ci".to_owned()]);
+        assert_eq!(checks.hard_failure_names(), vec!["legacy-ci".to_owned()]);
     }
 
     #[test]
@@ -1744,6 +1744,53 @@ printf '{}'
         assert!(matches!(&error, ForgeError::Query { .. }), "was: {error}");
         assert!(error.to_string().contains("#7"), "was: {error}");
         assert!(error.to_string().contains("more than 100"), "was: {error}");
+    }
+
+    #[test]
+    fn gated_check_suites_become_action_required_runs_and_ran_suites_are_not_repeated() {
+        // The rollup shows only what ran. A suite the forge refused to start —
+        // ACTION_REQUIRED with no check runs — is the approval gate a fork pull
+        // request sits behind, and without it the one unconditional check reads
+        // as a green pull request. A suite that ran has its runs in the rollup
+        // already; a suite still undecided is not a gate.
+        let payload = facts_payload(
+            r#""p9":{"number":9,"state":"OPEN","headRefName":"feat/a","headRefOid":"aa",
+            "updatedAt":"2026-08-01T00:00:00Z","rollup":{"nodes":[{"commit":{
+            "statusCheckRollup":{"contexts":{"pageInfo":{"hasNextPage":false},"nodes":[
+            {"__typename":"CheckRun","name":"lint","conclusion":"SUCCESS"},
+            {"__typename":"CheckRun","name":"manual-gate","conclusion":"ACTION_REQUIRED"}]}},
+            "checkSuites":{"pageInfo":{"hasNextPage":false},"nodes":[
+            {"conclusion":"ACTION_REQUIRED","checkRuns":{"totalCount":0},
+             "app":{"name":"GitHub Actions"},"workflowRun":{"workflow":{"name":"CI"}}},
+            {"conclusion":"ACTION_REQUIRED","checkRuns":{"totalCount":0},
+             "app":{"name":"Dependabot"},"workflowRun":null},
+            {"conclusion":null,"checkRuns":{"totalCount":0},
+             "app":{"name":"GitHub Actions"},"workflowRun":{"workflow":{"name":"Docs"}}},
+            {"conclusion":"ACTION_REQUIRED","checkRuns":{"totalCount":1},
+             "app":{"name":"GitHub Actions"},"workflowRun":{"workflow":{"name":"Gate"}}},
+            {"conclusion":"SUCCESS","checkRuns":{"totalCount":3},
+             "app":{"name":"GitHub Actions"},"workflowRun":{"workflow":{"name":"Lint"}}}]}}}]}}"#,
+        );
+
+        let facts = parse_pull_facts(&payload, &[9]).expect("facts parse");
+
+        let checks = facts[&9].details.checks.as_ref().expect("consulted");
+        let names: Vec<&str> = checks.runs.iter().map(|run| run.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["lint", "manual-gate", "CI", "Dependabot"],
+            "the rollup's runs, then one run per gated suite named by workflow or app"
+        );
+        assert_eq!(
+            checks.action_required_names(),
+            vec![
+                "manual-gate".to_owned(),
+                "CI".to_owned(),
+                "Dependabot".to_owned()
+            ]
+        );
+        assert!(checks.hard_failure_names().is_empty());
+        assert!(checks.failing() && !checks.has_hard_failure());
     }
 
     #[test]

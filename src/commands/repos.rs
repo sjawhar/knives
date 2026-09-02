@@ -288,20 +288,37 @@ pub struct TrustedRow {
     pub path: String,
 }
 
+/// What one listing reads: the registry, each repository's release state, and
+/// the consumer-scan collaborators every row shares.
+pub struct GatherInput<'a> {
+    pub registry: &'a Registry,
+    pub releases: &'a BTreeMap<String, ReleaseState>,
+    pub config_path: &'a Path,
+    pub forge: &'a dyn ConsumerPinSource,
+    pub cache_root: Option<&'a Path>,
+    pub heads: &'a ConsumerHeadMemo,
+}
+
+impl std::fmt::Debug for GatherInput<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GatherInput")
+            .field("config_path", &self.config_path)
+            .field("repos", &self.registry.repos.len())
+            .finish_non_exhaustive()
+    }
+}
+
 /// Collects release state and consumer pin lag for every maintained and
 /// trusted registry entry.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "gathering consumes command-level state rather than a duplicated request object with the same fields"
-)]
-pub fn gather(
-    registry: &Registry,
-    releases: &BTreeMap<String, ReleaseState>,
-    config_path: &Path,
-    forge: &dyn ConsumerPinSource,
-    cache_root: Option<&Path>,
-    heads: &ConsumerHeadMemo,
-) -> Report {
+pub fn gather(input: &GatherInput<'_>) -> Report {
+    let GatherInput {
+        registry,
+        releases,
+        config_path,
+        forge,
+        cache_root,
+        heads,
+    } = *input;
     let repos = registry
         .repos
         .iter()
@@ -426,8 +443,10 @@ pub fn render(report: &Report) -> String {
     lines.join("\n")
 }
 
-const fn report_exit(incomplete: bool) -> Exit {
-    if incomplete {
+/// A repository whose pin state could not be compared leaves the listing
+/// incomplete: the command's central question went unanswered there.
+pub fn exit_for(report: &Report) -> Exit {
+    if report.repos.iter().any(|repo| !repo.problems.is_empty()) {
         Exit::Incomplete
     } else {
         Exit::Ok
@@ -441,21 +460,20 @@ pub fn run(output: crate::cli::Output) -> anyhow::Result<Exit> {
     let forge = crate::forge::github::CliForge;
     let cache_root = crate::forge_cache::cache_root();
     let heads = ConsumerHeadMemo::default();
-    let report = gather(
-        &registry,
-        &releases,
-        &path,
-        &forge,
-        cache_root.as_deref(),
-        &heads,
-    );
-    let incomplete = report.repos.iter().any(|repo| !repo.problems.is_empty());
+    let report = gather(&GatherInput {
+        registry: &registry,
+        releases: &releases,
+        config_path: &path,
+        forge: &forge,
+        cache_root: cache_root.as_deref(),
+        heads: &heads,
+    });
     if let Some(payload) = crate::cli::machine_payload(output, &report)? {
         println!("{payload}");
     } else {
         println!("{}", render(&report));
     }
-    Ok(report_exit(incomplete))
+    Ok(exit_for(&report))
 }
 
 #[cfg(test)]
@@ -576,14 +594,14 @@ mod tests {
         let registry = registry(&[("beta", None), ("alpha", None)]);
         let releases = release_state(&registry);
         // When: gathered and rendered
-        let report = gather(
-            &registry,
-            &releases,
-            Path::new("/tmp/repos.toml"),
-            &FakeForge::default(),
-            None,
-            &ConsumerHeadMemo::default(),
-        );
+        let report = gather(&GatherInput {
+            registry: &registry,
+            releases: &releases,
+            config_path: Path::new("/tmp/repos.toml"),
+            forge: &FakeForge::default(),
+            cache_root: None,
+            heads: &ConsumerHeadMemo::default(),
+        });
         let out = render(&report);
         // Then: alphabetical, one per line, plus the trailing consumer note
         let lines: Vec<&str> = out.lines().collect();
@@ -792,18 +810,17 @@ mod tests {
             },
         )]);
 
-        let report = gather(
-            &registry,
-            &releases,
-            Path::new("/tmp/repos.toml"),
-            &forge,
-            None,
-            &heads,
-        );
-        let incomplete = report.repos.iter().any(|repo| !repo.problems.is_empty());
+        let report = gather(&GatherInput {
+            registry: &registry,
+            releases: &releases,
+            config_path: Path::new("/tmp/repos.toml"),
+            forge: &forge,
+            cache_root: None,
+            heads: &heads,
+        });
         let rendered = render(&report);
 
-        assert!(!incomplete);
+        assert_eq!(exit_for(&report), Exit::Ok);
         assert!(
             rendered.contains("\n  ! could not compare"),
             "was: {rendered}"
@@ -845,34 +862,29 @@ mod tests {
             ..FakeForge::default()
         };
         let priming_heads = ConsumerHeadMemo::default();
-        let priming_report = gather(
-            &registry,
-            &releases,
-            Path::new("/tmp/repos.toml"),
-            &priming_forge,
-            Some(cache.path()),
-            &priming_heads,
-        );
-        let priming_incomplete = priming_report
-            .repos
-            .iter()
-            .any(|repo| !repo.problems.is_empty());
-        assert!(!priming_incomplete);
+        let priming_report = gather(&GatherInput {
+            registry: &registry,
+            releases: &releases,
+            config_path: Path::new("/tmp/repos.toml"),
+            forge: &priming_forge,
+            cache_root: Some(cache.path()),
+            heads: &priming_heads,
+        });
+        assert_eq!(exit_for(&priming_report), Exit::Ok);
 
         let unavailable_forge = FakeForge {
             fail_consumer_head: true,
             ..FakeForge::default()
         };
         let unavailable_heads = ConsumerHeadMemo::default();
-        let report = gather(
-            &registry,
-            &releases,
-            Path::new("/tmp/repos.toml"),
-            &unavailable_forge,
-            Some(cache.path()),
-            &unavailable_heads,
-        );
-        let incomplete = report.repos.iter().any(|repo| !repo.problems.is_empty());
+        let report = gather(&GatherInput {
+            registry: &registry,
+            releases: &releases,
+            config_path: Path::new("/tmp/repos.toml"),
+            forge: &unavailable_forge,
+            cache_root: Some(cache.path()),
+            heads: &unavailable_heads,
+        });
         let rendered = render(&report);
 
         assert!(rendered.contains("? acme/consumer: forge unreachable:"));
@@ -880,21 +892,21 @@ mod tests {
         assert!(rendered.contains(
             "! acme/consumer: forge unreachable; pins answered from cache at aaaaaaaaaaaa"
         ));
-        assert_eq!(report_exit(incomplete), Exit::Incomplete);
+        assert_eq!(exit_for(&report), Exit::Incomplete);
     }
 
     #[test]
     fn a_split_release_remote_is_shown() {
         let registry = registry(&[("split", Some("r"))]);
         let releases = release_state(&registry);
-        let report = gather(
-            &registry,
-            &releases,
-            Path::new("/tmp/repos.toml"),
-            &FakeForge::default(),
-            None,
-            &ConsumerHeadMemo::default(),
-        );
+        let report = gather(&GatherInput {
+            registry: &registry,
+            releases: &releases,
+            config_path: Path::new("/tmp/repos.toml"),
+            forge: &FakeForge::default(),
+            cache_root: None,
+            heads: &ConsumerHeadMemo::default(),
+        });
         assert!(render(&report).contains("release-remote=r"));
     }
 
@@ -902,28 +914,28 @@ mod tests {
     fn the_release_column_is_omitted_when_it_defaults_to_origin() {
         let registry = registry(&[("simple", None)]);
         let releases = release_state(&registry);
-        let report = gather(
-            &registry,
-            &releases,
-            Path::new("/tmp/repos.toml"),
-            &FakeForge::default(),
-            None,
-            &ConsumerHeadMemo::default(),
-        );
+        let report = gather(&GatherInput {
+            registry: &registry,
+            releases: &releases,
+            config_path: Path::new("/tmp/repos.toml"),
+            forge: &FakeForge::default(),
+            cache_root: None,
+            heads: &ConsumerHeadMemo::default(),
+        });
         assert!(!render(&report).contains("release-remote="));
     }
 
     #[test]
     fn an_empty_registry_reports_where_to_add_entries() {
         // Printing nothing would be indistinguishable from a broken command.
-        let report = gather(
-            &Registry::default(),
-            &BTreeMap::new(),
-            Path::new("/tmp/somewhere/repos.toml"),
-            &FakeForge::default(),
-            None,
-            &ConsumerHeadMemo::default(),
-        );
+        let report = gather(&GatherInput {
+            registry: &Registry::default(),
+            releases: &BTreeMap::new(),
+            config_path: Path::new("/tmp/somewhere/repos.toml"),
+            forge: &FakeForge::default(),
+            cache_root: None,
+            heads: &ConsumerHeadMemo::default(),
+        });
         let out = render(&report);
         assert!(out.contains("no repos configured"));
         assert!(out.contains("/tmp/somewhere/repos.toml"));
@@ -933,14 +945,14 @@ mod tests {
     fn an_empty_registry_gathers_a_note_pointing_at_the_config_path() {
         // The Report model carries the same note independent of rendering, so
         // TOON/JSON consumers see it too.
-        let report = gather(
-            &Registry::default(),
-            &BTreeMap::new(),
-            Path::new("/tmp/somewhere/repos.toml"),
-            &FakeForge::default(),
-            None,
-            &ConsumerHeadMemo::default(),
-        );
+        let report = gather(&GatherInput {
+            registry: &Registry::default(),
+            releases: &BTreeMap::new(),
+            config_path: Path::new("/tmp/somewhere/repos.toml"),
+            forge: &FakeForge::default(),
+            cache_root: None,
+            heads: &ConsumerHeadMemo::default(),
+        });
         assert!(report.repos.is_empty());
         assert!(
             report
@@ -994,14 +1006,14 @@ mod tests {
             },
         )]);
 
-        let report = gather(
-            &registry,
-            &releases,
-            Path::new("/tmp/repos.toml"),
-            &forge,
-            None,
-            &heads,
-        );
+        let report = gather(&GatherInput {
+            registry: &registry,
+            releases: &releases,
+            config_path: Path::new("/tmp/repos.toml"),
+            forge: &forge,
+            cache_root: None,
+            heads: &heads,
+        });
         let json = serde_json::to_value(&report).expect("serialize report");
 
         assert_eq!(

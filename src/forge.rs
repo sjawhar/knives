@@ -47,17 +47,6 @@ pub struct ChecksSummary {
 }
 
 impl ChecksSummary {
-    /// Checks the forge reported a red conclusion for: real failures and
-    /// workflows that never ran because they await approval, together. Both keep
-    /// a pull request from merging on its own, which is what a red row means.
-    pub fn failed_names(&self) -> Vec<String> {
-        self.runs
-            .iter()
-            .filter(|run| run.hard_failure() || run.action_required())
-            .map(|run| run.name.clone())
-            .collect()
-    }
-
     /// Checks that ran and failed, as opposed to ones that never ran.
     pub fn hard_failure_names(&self) -> Vec<String> {
         self.runs
@@ -67,9 +56,10 @@ impl ChecksSummary {
             .collect()
     }
 
-    /// Workflows the forge is holding for a maintainer's approval, so nothing
-    /// of theirs ran. Over these an `ok` cell is a lie: one unconditional lint
-    /// check green, the whole suite never started.
+    /// Checks the forge is holding for someone's action: a whole workflow
+    /// awaiting a maintainer's approval, so nothing of it ran, or a check that
+    /// stopped and asked. Over these an `ok` cell is a lie: one unconditional
+    /// lint check green, the suite never started.
     pub fn action_required_names(&self) -> Vec<String> {
         self.runs
             .iter()
@@ -78,6 +68,9 @@ impl ChecksSummary {
             .collect()
     }
 
+    /// Whether the rollup is red: a check failed, or one is held for action.
+    /// Both keep a pull request from merging on its own, which is what a red
+    /// row means.
     pub fn failing(&self) -> bool {
         self.runs
             .iter()

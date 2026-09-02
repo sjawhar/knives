@@ -267,6 +267,218 @@
         "comments": {
           "nodes": []
         }
+      },
+      "p1425": {
+        "number": 1425,
+        "state": "OPEN",
+        "reviewDecision": "REVIEW_REQUIRED",
+        "headRefName": "fix/gated-fork-branch",
+        "headRefOid": "2c3ea330407ba7cb09318bebb7171d4b04ca930f",
+        "updatedAt": "2026-08-23T14:19:43Z",
+        "isDraft": false,
+        "url": "https://forge.invalid/our-org/recorded-repo/pull/1425",
+        "headRepositoryOwner": {
+          "login": "our-org"
+        },
+        "baseRefName": "main",
+        "mergeable": "UNKNOWN",
+        "mergeStateStatus": "UNKNOWN",
+        "mergeCommit": null,
+        "additions": 66,
+        "deletions": 25,
+        "changedFiles": 2,
+        "headRef": {
+          "name": "fix/gated-fork-branch"
+        },
+        "reviews": {
+          "nodes": [
+            {
+              "submittedAt": "2026-08-23T14:19:43Z"
+            }
+          ]
+        },
+        "commits": {
+          "nodes": [
+            {
+              "commit": {
+                "committedDate": "2026-08-23T14:17:36Z"
+              }
+            }
+          ]
+        },
+        "rollup": {
+          "nodes": [
+            {
+              "commit": {
+                "tree": {
+                  "oid": "02193f6427d8ee4007b8a24b68c6312807d3c837"
+                },
+                "parents": {
+                  "pageInfo": {
+                    "hasNextPage": false
+                  },
+                  "nodes": [
+                    {
+                      "tree": {
+                        "oid": "ff69f705d1ac90b1ef5532ccb5203d227d9f54a5"
+                      }
+                    }
+                  ]
+                },
+                "statusCheckRollup": {
+                  "contexts": {
+                    "pageInfo": {
+                      "hasNextPage": false
+                    },
+                    "nodes": [
+                      {
+                        "__typename": "CheckRun",
+                        "name": "lint-pr-title",
+                        "conclusion": "SUCCESS"
+                      }
+                    ]
+                  }
+                },
+                "checkSuites": {
+                  "pageInfo": {
+                    "hasNextPage": false
+                  },
+                  "nodes": [
+                    {
+                      "conclusion": "SUCCESS",
+                      "checkRuns": {
+                        "totalCount": 1
+                      },
+                      "app": {
+                        "name": "GitHub Actions"
+                      },
+                      "workflowRun": {
+                        "workflow": {
+                          "name": "PR Title"
+                        }
+                      }
+                    },
+                    {
+                      "conclusion": "ACTION_REQUIRED",
+                      "checkRuns": {
+                        "totalCount": 0
+                      },
+                      "app": {
+                        "name": "GitHub Actions"
+                      },
+                      "workflowRun": {
+                        "workflow": {
+                          "name": "Pulumi Production"
+                        }
+                      }
+                    },
+                    {
+                      "conclusion": "ACTION_REQUIRED",
+                      "checkRuns": {
+                        "totalCount": 0
+                      },
+                      "app": {
+                        "name": "GitHub Actions"
+                      },
+                      "workflowRun": {
+                        "workflow": {
+                          "name": "Docs Lint"
+                        }
+                      }
+                    },
+                    {
+                      "conclusion": "ACTION_REQUIRED",
+                      "checkRuns": {
+                        "totalCount": 0
+                      },
+                      "app": {
+                        "name": "GitHub Actions"
+                      },
+                      "workflowRun": {
+                        "workflow": {
+                          "name": "Gateway CI"
+                        }
+                      }
+                    },
+                    {
+                      "conclusion": "ACTION_REQUIRED",
+                      "checkRuns": {
+                        "totalCount": 0
+                      },
+                      "app": {
+                        "name": "GitHub Actions"
+                      },
+                      "workflowRun": {
+                        "workflow": {
+                          "name": "Infrastructure Lint"
+                        }
+                      }
+                    },
+                    {
+                      "conclusion": "ACTION_REQUIRED",
+                      "checkRuns": {
+                        "totalCount": 0
+                      },
+                      "app": {
+                        "name": "GitHub Actions"
+                      },
+                      "workflowRun": {
+                        "workflow": {
+                          "name": "Relay CI"
+                        }
+                      }
+                    },
+                    {
+                      "conclusion": "ACTION_REQUIRED",
+                      "checkRuns": {
+                        "totalCount": 0
+                      },
+                      "app": {
+                        "name": "GitHub Actions"
+                      },
+                      "workflowRun": {
+                        "workflow": {
+                          "name": "Recorded CI"
+                        }
+                      }
+                    },
+                    {
+                      "conclusion": "ACTION_REQUIRED",
+                      "checkRuns": {
+                        "totalCount": 0
+                      },
+                      "app": {
+                        "name": "GitHub Actions"
+                      },
+                      "workflowRun": {
+                        "workflow": {
+                          "name": "API Compatibility"
+                        }
+                      }
+                    },
+                    {
+                      "conclusion": "ACTION_REQUIRED",
+                      "checkRuns": {
+                        "totalCount": 0
+                      },
+                      "app": {
+                        "name": "GitHub Actions"
+                      },
+                      "workflowRun": {
+                        "workflow": {
+                          "name": "Lint"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          ]
+        },
+        "comments": {
+          "nodes": []
+        }
       }
     }
   }

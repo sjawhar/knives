@@ -42,29 +42,23 @@ enum LocalContent {
     /// Some local tip is not within the merged head: commits past it, or a
     /// rewrite of the same work the head does not reach.
     PastMerged,
-    /// No local tip resolves against the merged head, so nothing can be said.
-    Unknown,
 }
 
-fn local_content(repo: &Repo, local_tips: &[CommitId], merged_head: &CommitId) -> LocalContent {
-    let mut within = false;
+/// `None` when the row's bookmark names no commit at all.
+fn local_content(
+    repo: &Repo,
+    local_tips: &[CommitId],
+    merged_head: &CommitId,
+) -> Result<Option<LocalContent>, crate::jj::JjError> {
+    if local_tips.is_empty() {
+        return Ok(None);
+    }
     for tip in local_tips {
-        if tip == merged_head {
-            within = true;
-            continue;
-        }
-        match repo.is_ancestor(tip, merged_head) {
-            Ok(true) => within = true,
-            Ok(false) => return LocalContent::PastMerged,
-            // A tip or head the local view cannot place says nothing either way.
-            Err(_) => {}
+        if tip != merged_head && !repo.is_ancestor(tip, merged_head)? {
+            return Ok(Some(LocalContent::PastMerged));
         }
     }
-    if within {
-        LocalContent::WithinMerged
-    } else {
-        LocalContent::Unknown
-    }
+    Ok(Some(LocalContent::WithinMerged))
 }
 
 /// The commits a row's bookmark names: one for a normal branch, several for a
@@ -83,11 +77,15 @@ fn local_tips(
 /// Settle `landed` for rows whose merged pull request the trunk contains.
 ///
 /// Rows already judged `in-trunk` are left alone. A merged pull request whose
-/// landing commit the local upstream view lacks is noted — `knives sync`
-/// fetches it — rather than guessed at. A branch holding a tip the merged head
-/// does not reach keeps its replay verdict, with a note saying why: the pull
-/// request landed, the branch is somewhere else.
-pub(super) fn settle_merged_landed(report: &mut Report, input: MergedLandedInput<'_>) {
+/// landing commit or merged head the local repository lacks is noted — `knives
+/// sync` fetches them — rather than guessed at. A branch holding a tip the
+/// merged head does not reach keeps its replay verdict, with a note saying why:
+/// the pull request landed, the branch is somewhere else. An ancestry question
+/// jj cannot answer is an error, not a verdict.
+pub(super) fn settle_merged_landed(
+    report: &mut Report,
+    input: MergedLandedInput<'_>,
+) -> anyhow::Result<()> {
     let MergedLandedInput {
         repo,
         index,
@@ -96,7 +94,7 @@ pub(super) fn settle_merged_landed(report: &mut Report, input: MergedLandedInput
         trunk_tip,
     } = input;
     let Some(trunk_tip) = trunk_tip else {
-        return;
+        return Ok(());
     };
     let mut notes = Vec::new();
     for row in &mut report.branches {
@@ -119,21 +117,28 @@ pub(super) fn settle_merged_landed(report: &mut Report, input: MergedLandedInput
             ));
             continue;
         };
-        if !repo
-            .is_ancestor(&landing_commit, trunk_tip)
-            .unwrap_or(false)
-        {
+        if !repo.is_ancestor(&landing_commit, trunk_tip)? {
             continue;
         }
-        let merged_head = CommitId::new(summary.head_ref_oid.as_str());
-        match local_content(repo, &local_tips(row, tips, divergent_tips), &merged_head) {
-            LocalContent::WithinMerged => {
+        let Ok(merged_head) = repo.resolve_commit(&summary.head_ref_oid) else {
+            notes.push(format!(
+                "{}: #{} merged its head {}, which the local repository does not have, so \
+                 whether the branch holds more than it merged cannot be said; `knives sync` \
+                 fetches it",
+                row.name,
+                summary.number,
+                short(&summary.head_ref_oid)
+            ));
+            continue;
+        };
+        match local_content(repo, &local_tips(row, tips, divergent_tips), &merged_head)? {
+            Some(LocalContent::WithinMerged) => {
                 row.landed = Some(LandedVerdict::InTrunk);
                 if !matches!(row.state, BranchState::ForkOnly | BranchState::Divergent) {
                     row.state = BranchState::Landed;
                 }
             }
-            LocalContent::PastMerged => {
+            Some(LocalContent::PastMerged) => {
                 let verdict = if row.landed.is_some() {
                     "landed is judged by replay"
                 } else if row.state == BranchState::Divergent {
@@ -150,10 +155,11 @@ pub(super) fn settle_merged_landed(report: &mut Report, input: MergedLandedInput
                     short(&summary.head_ref_oid)
                 ));
             }
-            LocalContent::Unknown => {}
+            None => {}
         }
     }
     report.notes.extend(notes);
+    Ok(())
 }
 
 /// The landing commit of a merged pull request, when the forge recorded one.

@@ -201,23 +201,13 @@ fn finding_lines(groups: &[FindingGroup], verbose: bool) -> Vec<String> {
         return groups
             .iter()
             .flat_map(|group| {
-                group
-                    .subjects
-                    .iter()
-                    .zip(
-                        group
-                            .details
-                            .iter()
-                            .map(String::as_str)
-                            .chain(std::iter::repeat("")),
-                    )
-                    .map(|(subject, detail)| {
-                        if detail.is_empty() {
-                            format!("    {}  {subject}", group.kind)
-                        } else {
-                            format!("    {}  {subject}: {detail}", group.kind)
-                        }
-                    })
+                group.items.iter().map(|item| {
+                    if item.detail.is_empty() {
+                        format!("    {}  {}", group.kind, item.subject)
+                    } else {
+                        format!("    {}  {}: {}", group.kind, item.subject, item.detail)
+                    }
+                })
             })
             .collect();
     }
@@ -229,21 +219,16 @@ fn finding_lines(groups: &[FindingGroup], verbose: bool) -> Vec<String> {
     groups
         .iter()
         .map(|group| {
-            let shown: Vec<&str> = group
-                .subjects
-                .iter()
-                .take(SUBJECTS_PER_LINE)
-                .map(String::as_str)
-                .collect();
+            let shown: Vec<&str> = group.subjects().take(SUBJECTS_PER_LINE).collect();
             let mut subjects = shown.join(", ");
-            let hidden = group.count.saturating_sub(shown.len());
+            let hidden = group.items.len().saturating_sub(shown.len());
             if hidden > 0 {
                 subjects = format!("{subjects}, and {hidden} more");
             }
             format!(
                 "    {:<width$}  {:>3}  {subjects}",
                 group.kind,
-                group.count,
+                group.items.len(),
                 width = width
             )
         })
@@ -310,7 +295,7 @@ mod tests {
 
     use super::*;
     use crate::commands::status::{
-        BranchState, ClaimCell, FindingGroup, LastNotch, PullCell, SeenWindow,
+        BranchState, ClaimCell, FindingGroup, GroupedFinding, LastNotch, PullCell, SeenWindow,
     };
     use crate::detect::{FindingKind, LandedVerdict};
     use crate::ids::BranchName;
@@ -384,17 +369,19 @@ mod tests {
 
     #[test]
     fn findings_render_one_line_per_kind_with_count() {
+        // Nine findings of one kind: the line carries the exact count, names
+        // the first eight subjects, and folds the rest into `and N more`.
         let report = Report {
             repo: "demo".to_owned(),
             trunk: "main".to_owned(),
             findings: vec![FindingGroup {
                 kind: FindingKind::ChecksFailing,
-                count: 3,
-                subjects: vec!["#11".to_owned(), "#12".to_owned()],
-                details: vec![
-                    "#11 has failing checks: build".to_owned(),
-                    "#12 has failing checks: lint".to_owned(),
-                ],
+                items: (11..20)
+                    .map(|number| GroupedFinding {
+                        subject: format!("#{number}"),
+                        detail: format!("#{number} has failing checks: build"),
+                    })
+                    .collect(),
             }],
             ..Report::default()
         };
@@ -406,9 +393,10 @@ mod tests {
             .filter(|line| line.contains("checks-failing"))
             .collect();
         assert_eq!(lines.len(), 1, "was: {rendered}");
-        assert!(lines[0].contains('3'), "was: {}", lines[0]);
+        assert!(lines[0].contains("  9  "), "was: {}", lines[0]);
         assert!(
-            lines[0].contains("#11, #12, and 1 more"),
+            lines[0].contains("#11, #12, #13, #14, #15, #16, #17, #18, and 1 more")
+                && !lines[0].contains("#19"),
             "was: {}",
             lines[0]
         );
@@ -536,11 +524,15 @@ mod tests {
             trunk: "main".to_owned(),
             findings: vec![FindingGroup {
                 kind: FindingKind::ChecksFailing,
-                count: 2,
-                subjects: vec!["#1".to_owned(), "#2".to_owned()],
-                details: vec![
-                    "#1 has failing checks".to_owned(),
-                    "#2 has failing checks".to_owned(),
+                items: vec![
+                    GroupedFinding {
+                        subject: "#1".to_owned(),
+                        detail: "#1 has failing checks".to_owned(),
+                    },
+                    GroupedFinding {
+                        subject: "#2".to_owned(),
+                        detail: "#2 has failing checks".to_owned(),
+                    },
                 ],
             }],
             ..Report::default()

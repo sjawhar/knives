@@ -10,10 +10,6 @@
 )]
 
 #[path = "common/lab.rs"]
-#[allow(
-    dead_code,
-    reason = "a shared fixture; not every test file uses every helper"
-)]
 mod lab;
 #[path = "common/pulls.rs"]
 mod pulls;
@@ -26,13 +22,7 @@ use knives::forge::{CheckRun, ChecksSummary, MergeCommit, PullRequest};
 use knives::ids::{BranchName, RepoName};
 use knives::jj::Repo;
 use knives::store::Store;
-use lab::{Lab, lab_entry};
-
-fn commit_at(lab: &Lab, revision: &str) -> String {
-    lab.revision(lab.work_path(), revision, "commit_id")
-        .trim()
-        .to_owned()
-}
+use lab::{Lab, commit_at, lab_entry};
 
 fn gather(
     lab: &Lab,
@@ -74,8 +64,8 @@ fn a_squash_merged_pull_the_trunk_contains_reads_in_trunk_despite_a_conflicting_
     lab.push_branch("feature");
     lab.publish_pull("feature", 7);
     lab.squash_merge_pull(7, Some("maintainer edit\n"));
-    let landing = commit_at(&lab, "main@upstream");
-    let head = commit_at(&lab, "feature");
+    let landing = commit_at(&lab, "main@upstream").as_str().to_owned();
+    let head = commit_at(&lab, "feature").as_str().to_owned();
     let forge = knives::forge::fake::FakeForge {
         pull_requests: BTreeMap::from([(
             BranchName::new("feature"),
@@ -106,9 +96,9 @@ fn a_branch_carrying_work_past_its_merged_pull_keeps_the_replay_verdict_and_says
     lab.branch("feature", "feature.txt", "original\n");
     lab.push_branch("feature");
     lab.publish_pull("feature", 7);
-    let merged_head = commit_at(&lab, "feature");
+    let merged_head = commit_at(&lab, "feature").as_str().to_owned();
     lab.squash_merge_pull(7, Some("maintainer edit\n"));
-    let landing = commit_at(&lab, "main@upstream");
+    let landing = commit_at(&lab, "main@upstream").as_str().to_owned();
     lab.jj_work(["new", "feature", "-m", "after the merge"]);
     std::fs::write(lab.work_path().join("later.txt"), "later\n").expect("write later");
     lab.jj_work(["bookmark", "set", "feature", "-r", "@"]);
@@ -184,10 +174,12 @@ fn a_workflow_awaiting_approval_is_action_required_not_ok() {
         .iter()
         .find(|group| group.kind == FindingKind::ChecksFailing)
         .expect("a checks-failing finding");
-    assert_eq!(group.subjects, vec!["#11".to_owned()]);
+    assert_eq!(group.subjects().collect::<Vec<_>>(), ["#11"]);
     let rendered = status::render::render(&report, true);
     assert!(
-        rendered.contains("1 workflow(s) awaiting approval that never ran: integration"),
+        rendered.contains(
+            "1 check(s) held for action (an unapproved workflow runs nothing): integration"
+        ),
         "{rendered}"
     );
 }
@@ -221,7 +213,10 @@ fn a_claim_on_a_branch_nothing_names_is_an_orphaned_claim_finding() {
         .iter()
         .find(|group| group.kind == FindingKind::OrphanedClaim)
         .expect("an orphaned-claim finding");
-    assert_eq!(orphaned.subjects, vec!["fix/deleted-long-ago".to_owned()]);
+    assert_eq!(
+        orphaned.subjects().collect::<Vec<_>>(),
+        ["fix/deleted-long-ago"]
+    );
     assert!(row(&report, "feat/alpha").claim.is_some());
 }
 

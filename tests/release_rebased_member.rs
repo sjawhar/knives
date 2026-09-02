@@ -14,32 +14,11 @@
 )]
 
 #[path = "common/lab.rs"]
-#[allow(
-    dead_code,
-    reason = "a shared fixture; not every test file uses every helper"
-)]
 mod lab;
 
 use knives::ids::CommitId;
 use knives::jj::Repo;
-use lab::{Lab, knives_release, release_test_home};
-
-fn commit_at(lab: &Lab, revision: &str) -> CommitId {
-    Repo::open(lab.work_path())
-        .expect("open to resolve a revision")
-        .resolve_commit(revision)
-        .expect("resolve revision")
-}
-
-fn release_parents(lab: &Lab, name: &str) -> Vec<CommitId> {
-    Repo::open(lab.work_path())
-        .expect("open for release parents")
-        .parents_of(name)
-        .expect("release parents")
-        .into_iter()
-        .map(|parent| parent.commit)
-        .collect()
-}
+use lab::{Lab, commit_at, knives_release, release_parents, release_test_home};
 
 /// A release cut from two members forked from the old trunk, then alpha rebased
 /// onto the advanced upstream — the shape a maintainer's "please rebase"
@@ -282,6 +261,88 @@ fn include_refuses_a_second_copy_of_a_member_the_cut_record_names() {
     assert_eq!(release_parents(&lab, "release/2026-08-04").len(), before);
 }
 
+/// As [`alpha_rebuilt_outside_jj`], with `anchor/alpha` also at alpha's tip when
+/// the cut recorded it - the shape another agent's keep or anchor bookmark
+/// leaves. A record that kept only the first name at that commit would name
+/// `anchor/alpha`, and `feat/alpha` would read as a stranger to its own release.
+fn alpha_rebuilt_outside_jj_with_an_anchor_bookmark() -> (Lab, tempfile::TempDir, CommitId, CommitId)
+{
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.jj_work(["bookmark", "create", "anchor/alpha", "-r", "feat/alpha"]);
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let (home, _consumer) = release_test_home(&lab);
+    let cut = knives_release(&lab, &home, &["cut", "release/2026-08-04"]);
+    assert!(
+        cut.status.success(),
+        "cut failed: {}\n{}",
+        String::from_utf8_lossy(&cut.stdout),
+        String::from_utf8_lossy(&cut.stderr)
+    );
+    let old_alpha = commit_at(&lab, "feat/alpha");
+    assert_eq!(
+        commit_at(&lab, "anchor/alpha"),
+        old_alpha,
+        "the anchor must share alpha's tip at cut time, or this test proves nothing"
+    );
+    lab.advance_upstream("upstream advance\n");
+    lab.jj_work(["duplicate", "feat/alpha", "-d", "main@upstream"]);
+    let new_alpha = CommitId::new(
+        lab.revision(lab.work_path(), "children(main@upstream)", "commit_id")
+            .trim(),
+    );
+    lab.jj_work([
+        "bookmark",
+        "set",
+        "feat/alpha",
+        "--allow-backwards",
+        "-r",
+        new_alpha.as_str(),
+    ]);
+    assert_ne!(old_alpha, new_alpha);
+    (lab, home, old_alpha, new_alpha)
+}
+
+#[test]
+fn include_refuses_a_second_copy_when_an_anchor_bookmark_shared_the_members_tip() {
+    let (lab, home, old_alpha, _new_alpha) = alpha_rebuilt_outside_jj_with_an_anchor_bookmark();
+    let before = release_parents(&lab, "release/2026-08-04").len();
+
+    let output = knives_release(&lab, &home, &["include", "feat/alpha"]);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("would carry it twice")
+            && stdout.contains(&format!(
+                "as {} per its last cut",
+                &old_alpha.as_str()[..12]
+            )),
+        "include must recognise the member through every name the cut recorded: {stdout}"
+    );
+    assert_eq!(release_parents(&lab, "release/2026-08-04").len(), before);
+}
+
+#[test]
+fn advance_moves_a_member_when_an_anchor_bookmark_shared_its_recorded_tip() {
+    let (lab, home, old_alpha, new_alpha) = alpha_rebuilt_outside_jj_with_an_anchor_bookmark();
+    let before = release_parents(&lab, "release/2026-08-04").len();
+
+    let output = knives_release(&lab, &home, &["advance", "feat/alpha"]);
+
+    assert!(
+        output.status.success(),
+        "advance refused a member the cut record names under a second bookmark: {}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let parents = release_parents(&lab, "release/2026-08-04");
+    assert!(
+        parents.contains(&new_alpha) && !parents.contains(&old_alpha),
+        "{parents:?}"
+    );
+    assert_eq!(parents.len(), before);
+}
+
 #[test]
 fn a_member_that_joined_by_include_is_found_through_the_edit_record() {
     // Given: a cut, then a third branch included, then that branch rebuilt
@@ -405,8 +466,70 @@ fn rebase_names_the_rebased_branch_and_advance_when_a_parent_is_stale() {
             && stderr.contains("`knives release advance` moves the member"),
         "the refusal must name the branch and the verb that moves it: {stderr}"
     );
+}
+
+#[test]
+fn a_landed_member_that_kept_growing_gets_one_answer_from_plan_include_and_advance() {
+    // Given: alpha landed upstream by merge commit, then its branch grew. The
+    // trunk now reaches the released parent, so ancestry alone cannot say
+    // which branch was the member - every fresh trunk branch descends from it -
+    // and only the cut record still names alpha at that parent.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let (home, _consumer) = release_test_home(&lab);
+    let cut = knives_release(&lab, &home, &["cut", "release/2026-08-04"]);
     assert!(
-        !stderr.contains("Fix the branch"),
-        "\"fix the branch\" reads as an instruction to rebuild it on the old base: {stderr}"
+        cut.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cut.stdout)
     );
+    let old_alpha = commit_at(&lab, "feat/alpha");
+    lab.push_branch("feat/alpha");
+    lab.publish_pull("feat/alpha", 7);
+    lab.merge_pull_with_merge_commit(7);
+    lab.jj_work(["new", "feat/alpha", "-m", "alpha keeps going"]);
+    std::fs::write(lab.work_path().join("alpha.txt"), "alpha\nmore\n").expect("grow alpha");
+    lab.jj_work(["bookmark", "set", "feat/alpha", "-r", "@"]);
+    lab.jj_work(["new"]);
+    let new_alpha = commit_at(&lab, "feat/alpha");
+    let before = release_parents(&lab, "release/2026-08-04").len();
+
+    // When: the plan is read, then include, then advance.
+    let plan = String::from_utf8_lossy(&knives_release(&lab, &home, &[]).stdout).to_string();
+    let include = knives_release(&lab, &home, &["include", "feat/alpha"]);
+    let include_text = String::from_utf8_lossy(&include.stdout).to_string();
+    let advance = knives_release(&lab, &home, &["advance", "feat/alpha"]);
+    let advance_text = String::from_utf8_lossy(&advance.stdout).to_string();
+
+    // Then: all three say the parent landed and the branch is still the member;
+    // none claims the branch shares nothing with it, and none points at include.
+    let short = &old_alpha.as_str()[..12];
+    assert!(
+        plan.contains(&format!(
+            "feat/alpha's released parent {short} in release/2026-08-04 has landed upstream"
+        )) && plan.contains("`knives release advance feat/alpha` moves it")
+            && !plan.contains("include feat/alpha"),
+        "the plan must name the landed member and the verb that moves it: {plan}"
+    );
+    assert!(
+        include_text.contains(&format!("{short} has landed upstream"))
+            && include_text.contains("would carry it twice")
+            && !include_text.contains("rebased outside jj"),
+        "include must refuse the second copy for the right reason: {include_text}"
+    );
+    assert_eq!(release_parents(&lab, "release/2026-08-04").len(), before);
+    assert!(
+        advance.status.success()
+            && advance_text.contains("that parent has landed upstream")
+            && !advance_text.contains("nothing in the repository ties them"),
+        "advance must move the member and say why the record decided: {advance_text}\n{}",
+        String::from_utf8_lossy(&advance.stderr)
+    );
+    let parents = release_parents(&lab, "release/2026-08-04");
+    assert!(
+        parents.contains(&new_alpha) && !parents.contains(&old_alpha),
+        "{parents:?}"
+    );
+    assert_eq!(parents.len(), before);
 }

@@ -122,14 +122,15 @@ pub(super) fn fold_claims(
             None
         }
     };
-    let workspaces_known = repo.workspaces().is_ok();
-    let mut workspaces: BTreeSet<WorkspaceName> = match repo.workspaces() {
-        Ok(rows) => rows.into_iter().map(|(workspace, _)| workspace).collect(),
+    // `None` when the list could not be read: an orphan question that cannot
+    // be answered is not a finding.
+    let workspaces: Option<BTreeSet<WorkspaceName>> = match repo.workspaces() {
+        Ok(rows) => Some(rows.into_iter().map(|(workspace, _)| workspace).collect()),
         Err(error) => {
             report
                 .problems
                 .push(format!("workspaces unavailable: {error}"));
-            BTreeSet::new()
+            None
         }
     };
     findings.extend(crate::commands::wip::overlaps(&touching(&claims)));
@@ -143,7 +144,9 @@ pub(super) fn fold_claims(
             .branches
             .iter()
             .any(|row| row.name.as_str() == claim.branch);
-        if workspaces_known && !has_row && !branch_named_anywhere(&claim.branch, tips, &workspaces)
+        if let Some(workspaces) = &workspaces
+            && !has_row
+            && !branch_named_anywhere(&claim.branch, tips, workspaces)
         {
             findings.push(Finding::new(
                 FindingKind::OrphanedClaim,
@@ -158,11 +161,7 @@ pub(super) fn fold_claims(
                 ),
             ));
         }
-        if !report
-            .branches
-            .iter()
-            .any(|row| row.name.as_str() == claim.branch)
-        {
+        if !has_row {
             report
                 .branches
                 .push(BranchRow::bare(BranchName::new(&claim.branch)));
@@ -188,13 +187,14 @@ pub(super) fn fold_claims(
             }
         }
     }
+    let mut unclaimed = workspaces.unwrap_or_default();
     for row in &mut report.branches {
         let expected = WorkspaceName::new(crate::commands::wip::workspace_for(row.name.as_str()));
-        if workspaces.remove(&expected) {
+        if unclaimed.remove(&expected) {
             row.workspace = Some(expected.to_string());
         }
     }
-    report.other_workspaces = workspaces
+    report.other_workspaces = unclaimed
         .into_iter()
         .map(|workspace| workspace.to_string())
         .collect();
