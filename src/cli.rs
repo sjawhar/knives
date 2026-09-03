@@ -276,6 +276,12 @@ pub enum Command {
     ///
     /// Claiming a branch and opening a workspace for it were two commands for no
     /// reason: starting work on a branch is one act. `finish` is its inverse.
+    ///
+    /// Also states the fork's `immutable_heads()` — jj's trunk, tags, and the trunk
+    /// by name on every knives remote — in the repository's jj config when that
+    /// config states none, and says so on stdout. jj's default pins every commit beneath an untracked
+    /// remote ref, which in a fork is a superseded release cut or another fork's
+    /// pull request head walling `jj rebase`; a stated rule is left alone.
     Start {
         branch: String,
         /// Registry name. Defaults to the repo you are standing in.
@@ -545,10 +551,10 @@ pub enum ReleaseAction {
     /// The remote is never touched.
     ///
     /// Runs automatically after every cut; exists standalone for pre-knives repos carrying
-    /// years of historical refs, and as the unlock when a rebase needs old-lineage commits
-    /// mutable (superseded release refs are immutable heads, and they freeze every member
-    /// commit in their ancestry). A later fetch re-materializes forgotten refs as untracked;
-    /// re-run to clear them.
+    /// years of historical refs. A later fetch re-materializes forgotten refs as untracked;
+    /// re-run to clear them. Under the fork's `immutable_heads()` (trunk and tags, with the
+    /// trunk named on every knives remote, which `knives start` writes) those refs pin nothing
+    /// for `jj rebase`, so reaping is tidiness, never an unlock.
     ///
     /// Keeps every superseded cut while the live one still carries conflicts: the previous
     /// cut is the only record of how they were last resolved.

@@ -716,3 +716,87 @@ fn status_carries_repo_level_notches_in_json_and_text() {
         "was: {text}"
     );
 }
+
+#[test]
+fn status_reports_a_repo_level_immutable_heads_rule_that_differs_from_the_forks() {
+    // Given: somebody stated their own rule in the repository's jj config
+    let lab = Lab::new();
+    lab.jj_work([
+        "config",
+        "set",
+        "--repo",
+        "revset-aliases.\"immutable_heads()\"",
+        "trunk() | tags() | bookmarks(exact:\"keep\")",
+    ]);
+    let state = tempfile::tempdir().expect("state directory");
+    let store = Store::open(state.path().join("state.json")).expect("open store");
+
+    // When: status gathers without a forge
+    let report = status::gather(
+        &knives::ids::RepoName::new("demo"),
+        &lab_entry(&lab),
+        &store,
+        &knives::commands::status::Options {
+            probe: false,
+            forge: None,
+            cache: None,
+            registry: None,
+            ledger: None,
+            workers: 1,
+        },
+    )
+    .expect("gather");
+
+    // Then: the disagreement is one finding naming both rules
+    let rule = report
+        .findings
+        .iter()
+        .find(|finding| finding.kind == knives::detect::FindingKind::ImmutableHeadsRule)
+        .expect("a differing repo-level rule is reported");
+    assert_eq!(rule.items.len(), 1, "was: {rule:?}");
+    let detail = &rule.items[0].detail;
+    assert!(
+        detail.contains("= `trunk() | tags() | bookmarks(exact:\"keep\")`;")
+            && detail.contains(
+                "under `trunk() | tags() | remote_bookmarks(exact:\"main\", exact:\"upstream\") | remote_bookmarks(exact:\"main\", exact:\"origin\")`"
+            ),
+        "both rules must be named: {detail}"
+    );
+}
+
+#[test]
+fn status_is_silent_about_the_forks_own_immutable_heads_rule() {
+    // Given: the rule `knives start` writes
+    let lab = Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let started = lab::knives_start(&lab, &home, "feat/beta");
+    assert!(started.status.success(), "{started:?}");
+    let state = tempfile::tempdir().expect("state directory");
+    let store = Store::open(state.path().join("state.json")).expect("open store");
+
+    // When: status gathers without a forge
+    let report = status::gather(
+        &knives::ids::RepoName::new("demo"),
+        &lab_entry(&lab),
+        &store,
+        &knives::commands::status::Options {
+            probe: false,
+            forge: None,
+            cache: None,
+            registry: None,
+            ledger: None,
+            workers: 1,
+        },
+    )
+    .expect("gather");
+
+    // Then: the fork's own rule is not a finding
+    assert!(
+        !report
+            .findings
+            .iter()
+            .any(|finding| finding.kind == knives::detect::FindingKind::ImmutableHeadsRule),
+        "was: {:?}",
+        report.findings
+    );
+}

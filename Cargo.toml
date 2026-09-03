@@ -46,6 +46,10 @@ toml = "0.9"
 toon-format = { version = "=0.5.0", git = "https://github.com/sjawhar/toon-rust", rev = "9f0a88fab65727a0384db1794b6a26e6fa5b2002", default-features = false }
 
 [dev-dependencies]
+# Runs the lab fixture's `XDG_CONFIG_HOME` isolation before `main` (see
+# tests/common/lab.rs). Cargo's `[env]` cannot replace it: that would also
+# redirect `cargo run`, and knives resolves its own registry through that variable.
+ctor = "1"
 filetime = "0.2"
 insta = "1"
 

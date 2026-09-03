@@ -17,7 +17,8 @@ use crate::ids::{
     BookmarkRef, BranchName, BranchTarget, CommitId, RemoteName, RepoName, WorkspaceName,
 };
 use crate::jj::{
-    Repo, WorkspaceIdentity, add_workspace, fetch_all, is_workspace_named, workspace_identity,
+    Repo, WorkspaceIdentity, add_workspace, fetch_all, is_workspace_named, repo_immutable_heads,
+    set_repo_immutable_heads, user_immutable_heads, workspace_identity,
 };
 use crate::ledger::{Ledger, Scribe};
 use crate::release_model::newest_release;
@@ -123,6 +124,32 @@ pub fn run(
         opened: Repo::open(&entry.path)?,
         destination,
     };
+    // A rule a human stated is their decision: `status` reports one that
+    // differs, and nothing overwrites it. knives' own earlier write (marked by
+    // its `doc`) is refreshed when the entry's rule has moved on. A user-level
+    // rule is shadowed by the write — jj resolves the repo layer above it — and
+    // the line says so. Done on every `start`, refused or not: the rule belongs
+    // to the repository, and the agent about to run jj here is the one jj's
+    // default would have walled.
+    let rule = entry.immutable_heads();
+    let stated = repo_immutable_heads(&entry.path)?;
+    let verb = match &stated {
+        None => Some("written to"),
+        Some(stated) if stated.written_by_knives && stated.rule != rule => Some("refreshed in"),
+        Some(_) => None,
+    };
+    if let Some(verb) = verb {
+        let shadowed = if stated.is_none() {
+            user_immutable_heads(&entry.path)?
+        } else {
+            None
+        };
+        set_repo_immutable_heads(&entry.path, &rule)?;
+        let shadow = shadowed.map_or_else(String::new, |user_rule| {
+            format!(" (shadows the user-level rule {user_rule} here)")
+        });
+        println!("jj immutable_heads() {verb} {repo_name}'s repository config: {rule}{shadow}");
+    }
     let held = context
         .store
         .claims(Some(repo_name))

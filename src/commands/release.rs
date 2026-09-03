@@ -2263,10 +2263,16 @@ mod members_tests {
         );
     }
 
+    /// Identity comes from the environment, not `config set --repo`: a repo-level
+    /// write mints a `config-id` and a directory under `$XDG_CONFIG_HOME/jj/repos/`
+    /// that outlives the temporary repository.
     fn run_jj(path: &Path, args: &[&str]) {
         let output = std::process::Command::new("jj")
             .current_dir(path)
             .args(args)
+            .env("JJ_CONFIG", "/dev/null")
+            .env("JJ_USER", "knives tests")
+            .env("JJ_EMAIL", "tests@example.invalid")
             .output()
             .expect("run jj test fixture command");
         assert!(
@@ -2285,20 +2291,6 @@ mod members_tests {
         let repository = directory.path().join("repo");
         let repository_text = repository.display().to_string();
         run_jj(directory.path(), &["git", "init", &repository_text]);
-        run_jj(
-            &repository,
-            &["config", "set", "--repo", "user.name", "knives tests"],
-        );
-        run_jj(
-            &repository,
-            &[
-                "config",
-                "set",
-                "--repo",
-                "user.email",
-                "tests@example.invalid",
-            ],
-        );
 
         run_jj(&repository, &["new", "-r", "root()", "-m", "member alpha"]);
         run_jj(
@@ -2349,20 +2341,6 @@ mod members_tests {
         let repository = directory.path().join("repo");
         let repository_text = repository.display().to_string();
         run_jj(directory.path(), &["git", "init", &repository_text]);
-        run_jj(
-            &repository,
-            &["config", "set", "--repo", "user.name", "knives tests"],
-        );
-        run_jj(
-            &repository,
-            &[
-                "config",
-                "set",
-                "--repo",
-                "user.email",
-                "tests@example.invalid",
-            ],
-        );
         run_jj(&repository, &["new", "-r", "root()", "-m", "bare parent"]);
         run_jj(&repository, &["new", "-r", "@", "-m", "release"]);
         run_jj(

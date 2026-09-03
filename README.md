@@ -198,7 +198,7 @@ are somewhere else.
 | `knives pr NUMBER [--repo REPO] [--timeline]` | one pull request's live state; `--timeline` adds its bounded forge event log |
 | `knives sync` | fetch, then classify what happened to each tracked pull request |
 | `knives preflight` | the facts to check before contributing upstream |
-| `knives start` | take a branch and get your own workspace: on its tip, or on the release's shared base for a new one |
+| `knives start` | take a branch and get your own workspace: on its tip, or on the release's shared base for a new one; states the fork's `immutable_heads()` (trunk and tags, with the trunk named on every knives remote) in the repo's jj config where none is stated |
 | `knives finish` | hand a branch back so another agent can pick it up; its bookmark and any open pull request survive |
 | `knives track` | state which pull request a branch belongs to, when inference cannot find it |
 | `knives depends` | record that a branch cannot land before another repo's pull request |

@@ -16,6 +16,24 @@ use std::process::Command;
 
 use tempfile::TempDir;
 
+/// Point every jj in this test process at a config home under cargo's target
+/// directory, before `main` runs.
+///
+/// jj resolves a repository's config to `$XDG_CONFIG_HOME/jj/repos/<config-id>/`
+/// and creates that directory on first contact; left unset, every lab repository
+/// leaves one in the developer's real `~/.config`. Per-spawn `.env()` is not
+/// enough: tests also call knives in-process, and the jj it spawns inherits the
+/// test process's own environment. One variable for the whole process keeps the
+/// lab's jj, the knives binary, and in-process knives agreeing on where a
+/// repository's config (identity, `immutable_heads()`) lives.
+#[ctor::ctor(unsafe)]
+fn isolate_jj_config_home() {
+    let xdg = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("xdg");
+    // SAFETY: a constructor runs before `main`, hence before libtest spawns its
+    // first thread; nothing can read the environment concurrently.
+    unsafe { std::env::set_var("XDG_CONFIG_HOME", xdg) }
+}
+
 pub struct Lab {
     temp: TempDir,
     trunk: String,
@@ -154,6 +172,24 @@ impl Lab {
         std::fs::write(self.second.join("origin-advance.txt"), content)
             .expect("write origin advance");
         jj(&self.second, ["bookmark", "set", name, "-r", "@"]);
+        jj(&self.second, ["new"]);
+        jj(
+            &self.second,
+            ["git", "push", "--remote", "origin", "--bookmark", name],
+        );
+    }
+
+    /// A branch some other clone pushed to origin, forked from `base` — a revset
+    /// in the second clone, such as `main@origin` or `feat/ours@origin` — and
+    /// touching `<name>.txt`. After the work checkout fetches, it is
+    /// `<name>@origin` there: an untracked remote bookmark, which jj's default
+    /// `immutable_heads()` pins along with every commit beneath it.
+    pub(crate) fn foreign_origin_branch(&self, base: &str, name: &str, content: &str) {
+        jj(&self.second, ["git", "fetch", "--remote", "origin"]);
+        jj(&self.second, ["new", "-r", base, "-m", name]);
+        std::fs::write(self.second.join(format!("{name}.txt")), content)
+            .expect("write foreign branch");
+        jj(&self.second, ["bookmark", "create", name, "-r", "@"]);
         jj(&self.second, ["new"]);
         jj(
             &self.second,
@@ -583,12 +619,20 @@ pub fn release_command(
     command
 }
 
-/// Run `knives start <branch> --repo demo --why test` from the work checkout.
-pub fn knives_start(lab: &Lab, home: &tempfile::TempDir, branch: &str) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_knives"))
+/// `knives start <branch> --repo demo --why test` from the work checkout, for
+/// callers that add an environment variable before running it.
+pub fn start_command(lab: &Lab, home: &tempfile::TempDir, branch: &str) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_knives"));
+    command
         .args(["--text", "start", branch, "--repo", "demo", "--why", "test"])
         .current_dir(&lab.work)
-        .env("KNIVES_CONFIG_HOME", home.path())
+        .env("KNIVES_CONFIG_HOME", home.path());
+    command
+}
+
+/// Run `knives start <branch> --repo demo --why test` from the work checkout.
+pub fn knives_start(lab: &Lab, home: &tempfile::TempDir, branch: &str) -> std::process::Output {
+    start_command(lab, home, branch)
         .output()
         .expect("run knives start")
 }
@@ -680,6 +724,11 @@ impl Lab {
         jj(&self.work, args);
     }
 
+    /// [`Self::jj_work`], returning trimmed stdout.
+    pub(crate) fn jj_work_output<const N: usize>(&self, args: [&str; N]) -> String {
+        jj_output(&self.work, args)
+    }
+
     /// Run a jj command in an explicitly selected workspace.
     pub(crate) fn jj_at<const N: usize>(&self, directory: &Path, args: [&str; N]) {
         jj(directory, args);
@@ -751,6 +800,7 @@ pub fn file_at_revision(lab: &Lab, revision: &str, file: &str) -> String {
             revision,
             &format!("root:{file}"),
         ])
+        .env("JJ_CONFIG", "/dev/null")
         .output()
         .expect("show revision file");
     assert!(

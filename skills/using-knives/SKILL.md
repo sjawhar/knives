@@ -170,15 +170,19 @@ therefore reports `none-within-window`, not “never”.
 finding of that kind in detector order with its one-line fact. The text report prints one
 `kind  count  subjects` line per group, naming the first eight subjects and adding `and N more`
 when needed; `--verbose` prints each subject with its detail.
-`unconfigured-remote` reports a remote-tracking ref whose remote is not configured; its
-commits stay pinned immutable and a fetch will never update it. `stacked-history` reports a
+`unconfigured-remote` reports a remote-tracking ref whose remote is not configured, so a fetch
+will never update it. `stacked-history` reports a
 branch with an open pull request whose history past the trunk carries merge commits joining
 lines no known trunk position (`main@upstream`, `main@origin`, local `main`) reaches — a
 release cut, usually — so the pull request asks its reviewer to take everything those merges
 carried; the detail names the releases, or says the merges may be upstream's own when every
 local trunk view is behind the branch's base (`knives sync` fetches). `orphaned-claim` reports a claim on a branch that no
 bookmark on any remote and no workspace still names: `finish` is what releases a claim, and a
-bookmark deleted around it leaves the claim behind.
+bookmark deleted around it leaves the claim behind. `immutable-heads-rule` reports a repository
+whose own jj config states an `immutable_heads()` other than the one its registry entry runs under
+(trunk and tags, with the trunk named on every knives remote — what `start` writes); the subject
+is the config file, the detail names both rules and says whether the stated one is knives' own
+earlier write (the next `start` refreshes it) or a human's (nothing overwrites it).
 
 ### `knives sync [REPO|--all]`
 
@@ -197,6 +201,8 @@ The facts you need before contributing upstream: convention files present and wh
 ### `knives start <branch>` and `knives finish <branch>`
 
 `start` claims the branch and opens a jj workspace for it. A branch that already exists — locally, or on one of our remotes (`origin`, the publish remote) after the fetch — is continued from its tip; a name that exists only on `upstream` is somebody else's branch, and a fork branch of that name is new here: the workspace's `@` is an empty child of the branch tip, so your next commit is the branch's next commit (`jj bookmark set <branch> -r @` when you want the bookmark to follow, or `jj squash` into it). A divergent bookmark has no one tip to continue from; `start` refuses and names the tips so you can `jj bookmark set` one first. A new branch starts on the release's shared base (or the fetched upstream trunk when no release exists) rather than wherever `@` happens to be. The shared base is where every member forks from, so a branch started there composes into the release without dragging newer upstream into the cut; moving the whole release to a newer trunk is `knives release rebase`, an intentional decision of its own, never a side effect of starting a branch. An agent sitting in a release workspace who runs `jj new` silently inherits the release merge as a parent, which is why `@` is never used.
+
+`start` also states the fork's `immutable_heads()` — trunk and tags, with the trunk named on every knives remote — in the repository's own jj config when that config states none, and prints `jj immutable_heads() written to <repo>'s repository config: <rule>` when it does, adding `(shadows the user-level rule <rule> here)` when jj's user layer stated one. jj's default adds `untracked_remote_bookmarks()`; in a fork those are superseded release cuts a fetch re-materialized and other forks' pull request heads, and each one freezes every member tip beneath it against `jj rebase` while protecting nothing — a local rewrite never reaches a remote. The write is jj's table form with a `doc` naming knives, so a later `start` refreshes knives' own rule when the entry changes (`refreshed in` instead of `written to`) and leaves a rule a human stated alone; `status` reports either when it differs.
 
 `finish` hands the claim back and removes the workspace. Run it as soon as your active work on the branch stops — including when the work now waits on something external, such as an open pull request in review. A claim means "an agent is working here right now", not "this branch matters": holding one after you stop blocks every other agent from picking the branch up, and releasing one loses nothing. The branch, its bookmark, and any open pull request all survive the release, and the work itself is safe because jj snapshots a working copy into a commit, reachable by change id. `--no-cleanup` keeps the directory, which matters only for files jj never tracked, such as build output or an untracked `.env`. `--superseded-by <branch>` records where the work went.
 

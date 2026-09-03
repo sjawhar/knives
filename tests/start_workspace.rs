@@ -19,7 +19,7 @@ mod lab;
 use knives::ids::BranchName;
 use knives::jj::Repo;
 use knives::store::{OwnerKind, Store};
-use lab::{Lab, commit_at, knives_start, release_test_home};
+use lab::{Lab, commit_at, knives_start, release_test_home, start_command};
 use std::process::Command;
 
 #[test]
@@ -326,5 +326,176 @@ fn start_on_a_divergent_branch_refuses_and_names_the_tips() {
             .join("feat-alpha")
             .exists(),
         "no workspace may be created for a branch with no one tip"
+    );
+}
+
+#[test]
+fn start_makes_a_branch_pinned_only_by_an_untracked_remote_ref_rebasable() {
+    // Given: our branch is pushed, and another clone built on top of it and
+    // pushed too — the shape a superseded release cut or another fork's pull
+    // request head takes. After the fetch that work is an untracked remote
+    // bookmark here, and jj's default `immutable_heads()` freezes our own tip
+    // beneath it, so the rebase a maintainer asked for is refused.
+    let lab = Lab::new();
+    lab.branch("feat/ours", "ours.txt", "ours\n");
+    lab.push_branch("feat/ours");
+    lab.foreign_origin_branch("feat/ours@origin", "theirs", "theirs\n");
+    lab.advance_upstream("upstream moved on\n");
+    lab.fetch_work();
+    assert_eq!(
+        lab.revision(&lab.work, "feat/ours", "immutable"),
+        "true",
+        "the fixture must reproduce jj's default pin or the test proves nothing"
+    );
+    let (home, _consumer) = release_test_home(&lab);
+
+    // When: any branch is started in the managed fork
+    let output = knives_start(&lab, &home, "feat/gamma");
+
+    // Then: the write is disclosed, our tip is mutable again, upstream's trunk
+    // is not (jj's `trunk()` here is `main@origin`, pinned by the clone), and the
+    // rebase runs
+    assert!(
+        output.status.success(),
+        "start failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(
+            "jj immutable_heads() written to demo's repository config: trunk() | tags() | remote_bookmarks(exact:\"main\", exact:\"upstream\") | remote_bookmarks(exact:\"main\", exact:\"origin\")"
+        ),
+        "the rule write must be disclosed: {stdout}"
+    );
+    assert_eq!(
+        lab.revision(&lab.work, "feat/ours", "immutable"),
+        "false",
+        "an untracked remote ref must not freeze commits in a managed fork"
+    );
+    assert_eq!(
+        lab.revision(&lab.work, "main@upstream", "immutable"),
+        "true",
+        "upstream's trunk stays immutable whatever `trunk()` resolves to"
+    );
+    lab.jj_work(["rebase", "-b", "feat/ours", "-d", "main@upstream"]);
+    let parent = lab.revision(&lab.work, "feat/ours-", "commit_id");
+    assert_eq!(parent, commit_at(&lab, "main@upstream").as_str());
+    // And: a second start writes nothing, because the rule is now stated
+    let again = knives_start(&lab, &home, "feat/delta");
+    assert!(again.status.success(), "{again:?}");
+    assert!(
+        !String::from_utf8_lossy(&again.stdout).contains("immutable_heads()"),
+        "a stated rule is written once: {}",
+        String::from_utf8_lossy(&again.stdout)
+    );
+}
+
+#[test]
+fn start_leaves_a_repo_level_immutable_heads_rule_a_human_set() {
+    // Given: a rule already stated in the repository's own jj config — somebody's
+    // decision, which `status` reports when it differs and nothing overwrites.
+    // jj's documented table form, so a rule is recognised by its key, not its shape.
+    let lab = Lab::new();
+    lab.jj_work([
+        "config",
+        "set",
+        "--repo",
+        "revset-aliases.\"immutable_heads()\"",
+        "{ definition = \"trunk() | tags() | bookmarks(exact:\\\"keep\\\")\", doc = \"keep is pinned\" }",
+    ]);
+    let (home, _consumer) = release_test_home(&lab);
+
+    // When: a branch is started
+    let output = knives_start(&lab, &home, "feat/gamma");
+
+    // Then: the stated rule still governs jj here, and nothing claims to have been written
+    assert!(
+        output.status.success(),
+        "start failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("immutable_heads()"),
+        "nothing was written, so nothing is disclosed: {stdout}"
+    );
+    lab.branch("keep", "keep.txt", "keep\n");
+    assert_eq!(
+        lab.revision(&lab.work, "keep", "immutable"),
+        "true",
+        "the human's rule, not the fork's, decides what is immutable"
+    );
+}
+
+#[test]
+fn start_refreshes_the_rule_it_wrote_when_the_entry_moves_on() {
+    // Given: knives' own earlier write — recognisable by its `doc` — stating a
+    // rule this entry no longer produces, as after a registry change
+    let lab = Lab::new();
+    lab.jj_work([
+        "config",
+        "set",
+        "--repo",
+        "revset-aliases.\"immutable_heads()\"",
+        &format!(
+            "{{ definition = \"trunk() | tags()\", doc = \"{}\" }}",
+            knives::jj::KNIVES_IMMUTABLE_HEADS_DOC
+        ),
+    ]);
+    let (home, _consumer) = release_test_home(&lab);
+
+    // When: a branch is started
+    let output = knives_start(&lab, &home, "feat/gamma");
+
+    // Then: the stale rule is replaced by the entry's, and the line says refreshed
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(
+            "jj immutable_heads() refreshed in demo's repository config: trunk() | tags() | remote_bookmarks(exact:\"main\", exact:\"upstream\") | remote_bookmarks(exact:\"main\", exact:\"origin\")"
+        ),
+        "was: {stdout}"
+    );
+    let stated = lab.jj_work_output([
+        "config",
+        "list",
+        "--repo",
+        "revset-aliases.\"immutable_heads()\"",
+    ]);
+    assert!(
+        stated.contains("exact:\\\"origin\\\"") || stated.contains("exact:\"origin\""),
+        "the entry's rule must now be stated: {stated}"
+    );
+}
+
+#[test]
+fn start_says_when_the_forks_rule_shadows_a_user_level_one() {
+    // Given: a human's rule in jj's user layer and none stated for the repository.
+    // The repo layer resolves above it, so writing the fork's rule shadows it here.
+    let lab = Lab::new();
+    let user_config = lab.work.parent().expect("parent").join("user-jj.toml");
+    std::fs::write(
+        &user_config,
+        "[revset-aliases]\n\"immutable_heads()\" = \"none()\"\n",
+    )
+    .expect("write user config");
+    let (home, _consumer) = release_test_home(&lab);
+
+    // When: a branch is started with that user config in force
+    let output = start_command(&lab, &home, "feat/gamma")
+        .env("JJ_CONFIG", &user_config)
+        .output()
+        .expect("run knives start");
+
+    // Then: the write happens and names the rule it shadows
+    assert!(
+        output.status.success(),
+        "start failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("(shadows the user-level rule none() here)"),
+        "the shadowed rule must be named: {stdout}"
     );
 }
