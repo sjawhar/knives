@@ -5,7 +5,7 @@
 //! decided. Planning is the default because everything else here writes: a cut
 //! names a composition, and `include`, `drop`, `advance` and `rebase` change
 //! one. Every one of them writes locally only, and none of them pushes.
-// allow: SIZE_OK: 2298 lines - the release lifecycle's plan, members, cut, edit, audit, reap, and rebase operations are one domain seam.
+// allow: SIZE_OK: 2290 lines - the release lifecycle's plan, members, cut, edit, audit, reap, and rebase operations are one domain seam.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};

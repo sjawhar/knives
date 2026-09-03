@@ -2,6 +2,7 @@
 //!
 //! Deliberately separate from `knives wip`, which answers what is being worked on
 //! right now. Conflating the two was an earlier mistake in this design.
+// allow: SIZE_OK: 1032 lines - release state, pin lag, gather and render for one report, with the pin-lag scenarios beside the private functions they exercise.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
