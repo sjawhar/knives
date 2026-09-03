@@ -310,6 +310,8 @@ impl Repo {
         })
     }
 
+    /// The repository store a directory belongs to: through its `.jj/repo` pointer
+    /// when it is a secondary workspace, or its own store when it is the checkout.
     fn repository_store_path(workspace: &Path) -> Result<PathBuf, JjError> {
         let repo_pointer = workspace.join(".jj/repo");
         let repository = if repo_pointer.is_file() {
@@ -1113,13 +1115,103 @@ fn store_error(error: &jj_lib::backend::BackendError) -> JjError {
     }
 }
 
+/// What a directory is to a checkout, read from its `.jj/repo` pointer and the
+/// name its working-copy state records.
+///
+/// This is the proof `finish` needs before removing a directory and `start`
+/// needs before adopting one. With `workspaces` free to point anywhere, the
+/// path knives derives for a branch can hold anything — another repository's
+/// workspace, a workspace of this checkout registered under another name, or a
+/// directory that was never one — and `jj workspace forget` exits 0 for a name
+/// it does not know, so it proves nothing. Store identity alone is one field
+/// short: a live workspace of this checkout named `other` sitting at the path
+/// would read as ours and be removed. The checkout itself has a store there,
+/// not a pointer, so it is never its own workspace. A symbolic link at the path
+/// is reported as one rather than followed: `remove_dir_all` unlinks a link
+/// instead of descending, so acting on what it points at would say "removed"
+/// about a directory that is still there.
+#[derive(Debug, PartialEq, Eq)]
+pub enum WorkspaceIdentity {
+    /// A workspace of the checkout, with the name its working copy records.
+    Ours(WorkspaceName),
+    /// A workspace of the checkout whose working-copy state could not be read, so
+    /// its name is unknown; the detail says why.
+    Unreadable(String),
+    /// A workspace of another repository: the store its pointer names.
+    Foreign(PathBuf),
+    /// A repository in its own right — `.jj/repo` is a store, not a pointer — which
+    /// is what the checkout itself, or another checkout, looks like from here.
+    Repository,
+    /// A symbolic link, with its target.
+    SymbolicLink(PathBuf),
+    /// Not a jj workspace at all.
+    NotAWorkspace,
+}
+
+pub fn workspace_identity(directory: &Path, checkout: &Path) -> WorkspaceIdentity {
+    if let Ok(target) = std::fs::read_link(directory) {
+        return WorkspaceIdentity::SymbolicLink(target);
+    }
+    let pointer = directory.join(".jj").join("repo");
+    if pointer.is_dir() {
+        return WorkspaceIdentity::Repository;
+    }
+    if !pointer.is_file() {
+        return WorkspaceIdentity::NotAWorkspace;
+    }
+    let (Ok(store), Ok(expected)) = (
+        Repo::repository_store_path(directory),
+        Repo::repository_store_path(checkout),
+    ) else {
+        return WorkspaceIdentity::NotAWorkspace;
+    };
+    if store != expected {
+        return WorkspaceIdentity::Foreign(store);
+    }
+    match workspace_name_at(directory) {
+        Ok(name) => WorkspaceIdentity::Ours(name),
+        Err(error) => WorkspaceIdentity::Unreadable(error.to_string()),
+    }
+}
+
+/// Whether `directory` is `checkout`'s workspace named `name`.
+pub fn is_workspace_named(directory: &Path, checkout: &Path, name: &WorkspaceName) -> bool {
+    workspace_identity(directory, checkout) == WorkspaceIdentity::Ours(name.clone())
+}
+
+/// The workspace name a directory's working-copy state records.
+fn workspace_name_at(directory: &Path) -> Result<WorkspaceName, JjError> {
+    let settings = repo_settings(directory)?;
+    let workspace = Workspace::load(
+        &settings,
+        directory,
+        &StoreFactories::default(),
+        &default_working_copy_factories(),
+    )
+    .map_err(|error| JjError::Open {
+        path: directory.display().to_string(),
+        detail: error.to_string(),
+    })?;
+    Ok(WorkspaceName::new(workspace.workspace_name().as_str()))
+}
+
 /// Uses jj porcelain because workspace creation updates jj's workspace metadata and filesystem layout.
+///
+/// The destination's parent is created first: a configured `workspaces`
+/// directory need not exist yet, and the released `jj` refuses a destination
+/// whose parent is missing (`Cannot access …: No such file or directory`).
 pub fn add_workspace(
     repo: &Path,
     name: &str,
     destination: &Path,
     revision: &str,
 ) -> Result<(), JjError> {
+    if let Some(parent) = destination.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| JjError::Process {
+            program: format!("create {}", parent.display()),
+            detail: error.to_string(),
+        })?;
+    }
     let repo = path(repo);
     let destination = path(destination);
     command(
@@ -2318,14 +2410,17 @@ pub fn forget_workspace(repo: &Path, name: &str) -> Result<(), JjError> {
 /// A temporary workspace rather than moving `@`: these repositories are worked
 /// concurrently, and checking something out under another agent is the accident
 /// this tool exists to prevent. Workspaces are cheap, well under a second,
-/// because tracked content is small even in a large checkout.
+/// because tracked content is small even in a large checkout. It opens under
+/// `workspace_root`, where the repository's branch workspaces live, so a
+/// checkout at `~/<name>` does not scatter measurement directories across `~`.
 pub fn output_at_revision(
     repo: &Path,
+    workspace_root: &Path,
     revision: &str,
     shell_command: &str,
 ) -> Result<String, JjError> {
     let name = format!("knives-measure-{}", std::process::id());
-    let destination = repo.parent().unwrap_or(repo).join(format!(".{name}"));
+    let destination = workspace_root.join(format!(".{name}"));
     add_workspace(repo, &name, &destination, revision)?;
 
     let result = Command::new("sh")

@@ -125,10 +125,11 @@ fn dispatch() -> anyhow::Result<Exit> {
             why,
             force,
         } => {
-            let Some(name) = one_repo(repo.as_deref())? else {
+            let (Some(name), Some(branch)) = (one_repo(repo.as_deref())?, branch_name(&branch))
+            else {
                 return Ok(Exit::Usage);
             };
-            start::run(&name, &BranchName::new(branch), why.as_deref(), force)
+            start::run(&name, &branch, why.as_deref(), force)
         }
         Command::Finish {
             branch,
@@ -138,11 +139,12 @@ fn dispatch() -> anyhow::Result<Exit> {
             force,
             why,
         } => {
-            let Some(name) = one_repo(repo.as_deref())? else {
+            let (Some(name), Some(branch)) = (one_repo(repo.as_deref())?, branch_name(&branch))
+            else {
                 return Ok(Exit::Usage);
             };
             run_finish(
-                &BranchTarget::new(name, BranchName::new(branch)),
+                &BranchTarget::new(name, branch),
                 &FinishOptions {
                     superseded_by: superseded_by.as_deref(),
                     cleanup: !no_cleanup,
@@ -158,21 +160,18 @@ fn dispatch() -> anyhow::Result<Exit> {
             forget,
             repo,
         } => {
-            let Some(name) = one_repo(repo.as_deref())? else {
+            let (Some(name), Some(branch)) = (one_repo(repo.as_deref())?, branch_name(&branch))
+            else {
                 return Ok(Exit::Usage);
             };
-            run_track(
-                &BranchTarget::new(name, BranchName::new(branch)),
-                pr,
-                fork_only,
-                forget,
-            )
+            run_track(&BranchTarget::new(name, branch), pr, fork_only, forget)
         }
         Command::Depends { branch, on, repo } => {
-            let Some(name) = one_repo(repo.as_deref())? else {
+            let (Some(name), Some(branch)) = (one_repo(repo.as_deref())?, branch_name(&branch))
+            else {
                 return Ok(Exit::Usage);
             };
-            run_depends(&BranchTarget::new(name, BranchName::new(branch)), &on)
+            run_depends(&BranchTarget::new(name, branch), &on)
         }
         Command::Notch {
             subject,
@@ -260,6 +259,17 @@ fn one_repo(requested: Option<&str>) -> anyhow::Result<Option<RepoName>> {
                 .join(", ")
         );
         Ok(None)
+    }
+}
+
+/// The branch a verb acts on, or `None` after saying why the name is not one.
+fn branch_name(typed: &str) -> Option<BranchName> {
+    match BranchName::parse(typed) {
+        Ok(branch) => Some(branch),
+        Err(reason) => {
+            eprintln!("{reason}");
+            None
+        }
     }
 }
 
@@ -821,6 +831,7 @@ mod tests {
                 release_branch: None,
                 test_count_command: None,
                 consumers: vec![],
+                workspaces: None,
             },
         );
         let registry = Registry {
@@ -851,6 +862,7 @@ mod tests {
                 release_branch: None,
                 test_count_command: None,
                 consumers: vec![],
+                workspaces: None,
             },
         );
         let registry = Registry {

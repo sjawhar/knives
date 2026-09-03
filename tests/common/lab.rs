@@ -446,6 +446,7 @@ impl Lab {
             release_branch: Some(name.to_owned()),
             test_count_command: None,
             consumers: Vec::new(),
+            workspaces: None,
         }
     }
 }
@@ -460,6 +461,7 @@ pub fn lab_entry(lab: &Lab) -> knives::config::RepoEntry {
         release_branch: None,
         test_count_command: None,
         consumers: Vec::new(),
+        workspaces: None,
     }
 }
 /// Registry home plus a local consumer for release tests. The registry deliberately

@@ -2009,19 +2009,15 @@ mod test_count_tests {
 /// Runs the repo's configured test command at the cut and at one parent, in
 /// throwaway workspaces. Absent configuration reports "not checked", never
 /// "passed": counting tests has no portable form, so the command is per repo.
-pub fn check_test_count(
-    repo: &Path,
-    entry: &RepoEntry,
-    cut: &CommitId,
-    parent: &CommitId,
-) -> TestCountCheck {
+pub fn check_test_count(entry: &RepoEntry, cut: &CommitId, parent: &CommitId) -> TestCountCheck {
     let Some(command) = entry.test_count_command.as_deref() else {
         return TestCountCheck::NotConfigured;
     };
-    let merged = crate::jj::output_at_revision(repo, cut.as_str(), command)
+    let root = entry.workspace_root();
+    let merged = crate::jj::output_at_revision(&entry.path, root, cut.as_str(), command)
         .ok()
         .and_then(|out| parse_test_count(&out));
-    let single = crate::jj::output_at_revision(repo, parent.as_str(), command)
+    let single = crate::jj::output_at_revision(&entry.path, root, parent.as_str(), command)
         .ok()
         .and_then(|out| parse_test_count(&out));
     match (merged, single) {
@@ -2337,6 +2333,7 @@ mod members_tests {
             release_branch: None,
             test_count_command: None,
             consumers: Vec::new(),
+            workspaces: None,
         };
         let opened = Repo::open(&entry.path).expect("open test repository");
         let members =
@@ -2382,6 +2379,7 @@ mod members_tests {
             release_branch: None,
             test_count_command: None,
             consumers: Vec::new(),
+            workspaces: None,
         };
         let opened = Repo::open(&entry.path).expect("open test repository");
         let members =

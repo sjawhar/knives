@@ -420,6 +420,12 @@ base = "main"                         # optional: upstream's trunk (defaults to 
 release_branch = "release"            # optional: fixed release branch scheme (omit for dated release/YYYY-MM-DD)
 consumers = ["acme/workbench"]       # optional: forge slugs whose trunks pin this repo's releases
 
+[repos.tool]
+path = "~/tool"
+upstream = "https://forge.invalid/org/tool"
+origin = "https://forge.invalid/ours/tool"
+workspaces = "~/.worktrees/tool"      # optional: where `knives start` opens branch workspaces
+
 [trusted.workbench]
 path = "~/workbench/default"       # instructions read, not maintained
 
@@ -436,6 +442,12 @@ owners = ["orgname"]               # forge owners whose repos are trusted for gu
   - `consumers`: forge slugs for repositories that pin this repository's releases. Knives scans
     each slug's trunk through the forge and caches it by commit; use `--consumer PATH` for an
     ad-hoc local scan.
+  - `workspaces`: the directory `knives start` opens this repository's branch workspaces under,
+    and `finish` removes them from. Absent, they sit beside the checkout — the `<name>/default`
+    layout, where each workspace is a sibling of `default`. Set it for a checkout at `~/<name>`,
+    which has no room for siblings: without it every branch would land in `~`. Resolved like
+    `path` (`~` expands; a relative value is taken from the config directory), so write it as
+    `~/…`. A value inside the checkout is refused at load.
 
 - `[trusted.*]`: unmaintained repositories whose agent instructions are trusted for reading.
 

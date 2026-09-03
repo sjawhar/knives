@@ -710,6 +710,7 @@ mod tests {
             release_branch: None,
             test_count_command: None,
             consumers: Vec::new(),
+            workspaces: None,
         }
     }
 
@@ -873,6 +874,7 @@ mod tests {
             release_branch: None,
             test_count_command: None,
             consumers: Vec::new(),
+            workspaces: None,
         };
         let mut report = Report {
             repo: "demo".to_owned(),
@@ -943,6 +945,7 @@ mod tests {
             release_branch: None,
             test_count_command: None,
             consumers: Vec::new(),
+            workspaces: None,
         };
         let forge = FakeForge {
             pull_requests: BTreeMap::from([(

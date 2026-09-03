@@ -16,20 +16,69 @@ use crate::detect::BookmarkTips;
 use crate::ids::{
     BookmarkRef, BranchName, BranchTarget, CommitId, RemoteName, RepoName, WorkspaceName,
 };
-use crate::jj::{JjError, Repo, add_workspace, fetch_all};
+use crate::jj::{
+    Repo, WorkspaceIdentity, add_workspace, fetch_all, is_workspace_named, workspace_identity,
+};
 use crate::ledger::{Ledger, Scribe};
 use crate::release_model::newest_release;
 use crate::seen;
 use crate::store::{Store, default_state_path};
 
-/// Where a new workspace goes: a sibling of the repo, named for the branch.
+/// Where a branch's workspace goes: under the entry's workspace root, named for
+/// the branch with slashes flattened.
 ///
 /// Workspaces are cheap to create, well under a second, because tracked content
 /// is small even in a large checkout. The real cost is rebuilding language
 /// environments, not the checkout.
-pub fn workspace_path(repo: &Path, branch: &BranchName) -> PathBuf {
-    let safe = branch.as_str().replace('/', "-");
-    repo.parent().unwrap_or(repo).join(safe)
+pub fn workspace_path(entry: &RepoEntry, branch: &BranchName) -> PathBuf {
+    entry.workspace_root().join(workspace_for(branch.as_str()))
+}
+
+/// Whether the current directory is inside this branch's workspace.
+///
+/// Possession is the one claim check that needs no identity: standing in the
+/// workspace is being the one working there. `cwd` is a physical path, so the
+/// configured directory is canonicalised before the comparison — a `workspaces`
+/// spelled through a symlink (a directory on another disk) never matched
+/// otherwise. And the directory must be this checkout's workspace of this name:
+/// with `workspaces` free to point anywhere, standing in a directory at the path
+/// is not standing in the workspace.
+pub fn possesses(cwd: &Path, entry: &RepoEntry, branch: &BranchName) -> bool {
+    let directory = workspace_path(entry, branch);
+    directory
+        .canonicalize()
+        .is_ok_and(|canonical| cwd.starts_with(canonical))
+        && is_workspace_named(
+            &directory,
+            &entry.path,
+            &WorkspaceName::new(workspace_for(branch.as_str())),
+        )
+}
+
+/// Whether a branch's workspace would be the primary workspace or the registered
+/// checkout — `start` must not create it and `finish` must not remove it.
+///
+/// The primary workspace is named "default" and the registered checkout is its
+/// directory; `start` can never have created either for a branch, so a branch
+/// whose flattened name lands on them is a collision, not a workspace to open or
+/// clean up. With `workspaces` free to point anywhere, the directory can also be
+/// an ancestor of the checkout — `workspaces = ~/forks` above
+/// `~/forks/tool/default`, branch `tool` — and removing an ancestor removes the
+/// checkout, so containment is the test, not equality. One rule for both verbs:
+/// when it lived in `finish` alone, `start default` under a configured directory
+/// reached `jj workspace add --name default` and died on jj's raw "already
+/// exists".
+pub fn collides_with_checkout(entry: &RepoEntry, branch: &BranchName) -> Option<String> {
+    let workspace = workspace_for(branch.as_str());
+    let directory = workspace_path(entry, branch);
+    (workspace == "default" || entry.path.starts_with(&directory)).then(|| {
+        format!(
+            "branch {branch} maps to workspace {workspace} at {}, which is the registered \
+             checkout itself or contains it; refusing to touch {}",
+            directory.display(),
+            entry.path.display()
+        )
+    })
 }
 
 struct StartContext<'a> {
@@ -55,10 +104,14 @@ pub fn run(
         eprintln!("unknown repo {repo_name}");
         return Ok(Exit::Usage);
     };
+    if let Some(line) = collides_with_checkout(entry, branch) {
+        eprintln!("{repo_name}: {line}");
+        return Ok(Exit::Usage);
+    }
     let mut store = Store::open_for_update(default_state_path())?;
     let cwd = std::env::current_dir()?;
-    let destination = workspace_path(&entry.path, branch);
-    let in_claimed_workspace = cwd.starts_with(&destination);
+    let destination = workspace_path(entry, branch);
+    let in_claimed_workspace = possesses(&cwd, entry, branch);
     let mut context = StartContext {
         store: &mut store,
         entry,
@@ -145,11 +198,11 @@ fn force_claim(
 ) -> anyhow::Result<Exit> {
     let workspace_notice = match workspace_notice(context, true)? {
         Ok(notice) => notice,
-        Err(tips) => {
-            // Refused before seizing, as `take_claim` refuses before claiming:
-            // a seized claim with no workspace would leave the branch held and
-            // the agent one `--force` further from the work.
-            eprintln!("{}", divergent_refusal_line(context.branch, &tips));
+        // Refused before seizing, as `take_claim` refuses before claiming: a
+        // seized claim with no workspace would leave the branch held and the
+        // agent one `--force` further from the work.
+        Err(refusal) => {
+            eprintln!("{refusal}");
             return Ok(Exit::Usage);
         }
     };
@@ -207,25 +260,24 @@ fn resume_claim(
 
 fn take_claim(context: &mut StartContext<'_>, reason: &str) -> anyhow::Result<Exit> {
     if context.destination.exists() {
-        let change = match workspace_change(&context.opened, &context.workspace) {
-            Ok(change) => change,
-            Err(_) => match context
+        if let Some(line) = adoption_refusal(
+            &context.destination,
+            &context.entry.path,
+            &context.workspace,
+        ) {
+            eprintln!("{line}");
+            return Ok(Exit::Usage);
+        }
+        // The identity gate above already established this is our workspace of
+        // this name; `reattach_workspace` re-checks on its own behalf as the
+        // mutation's guard, and a mismatch it finds is a race, not a user error.
+        let change = if let Ok(change) = workspace_change(&context.opened, &context.workspace) {
+            change
+        } else {
+            context
                 .opened
-                .reattach_workspace(&context.destination, &context.workspace)
-            {
-                Ok(()) => workspace_change(&Repo::open(&context.entry.path)?, &context.workspace)?,
-                Err(
-                    error @ (JjError::WorkspaceRepositoryMismatch { .. }
-                    | JjError::WorkspaceNameMismatch { .. }),
-                ) => {
-                    eprintln!(
-                        "cannot adopt {}: {error}; move the foreign workspace or choose a different branch",
-                        context.destination.display()
-                    );
-                    return Ok(Exit::Usage);
-                }
-                Err(error) => return Err(error.into()),
-            },
+                .reattach_workspace(&context.destination, &context.workspace)?;
+            workspace_change(&Repo::open(&context.entry.path)?, &context.workspace)?
         };
         record_claim(
             context,
@@ -297,14 +349,67 @@ fn resume_workspace_notice(context: &StartContext<'_>) -> String {
     }
 }
 
+/// Why the directory at `destination` cannot be adopted as `checkout`'s workspace
+/// named `name`, or `None` when that is what it is.
+///
+/// A registered name with another repository's directory at the path was adopted
+/// as ours, and the next `finish` removed it. With `workspaces` free to point
+/// anywhere, what sits at the path is not knives' to assume, registered name or
+/// not. The checkout itself and its ancestors never get this far:
+/// [`collides_with_checkout`] refuses them before any claim work.
+fn adoption_refusal(destination: &Path, checkout: &Path, name: &WorkspaceName) -> Option<String> {
+    let shown = destination.display();
+    let line = match workspace_identity(destination, checkout) {
+        WorkspaceIdentity::Ours(actual) if actual == *name => return None,
+        WorkspaceIdentity::Ours(actual) => format!(
+            "cannot adopt {shown}: it is workspace {actual} of {}, not {name}; forget or finish \
+             workspace {actual}, or choose a different branch",
+            checkout.display()
+        ),
+        WorkspaceIdentity::Foreign(store) => format!(
+            "cannot adopt {shown}: it belongs to repository {}, not {}; move the foreign \
+             workspace or choose a different branch",
+            store.display(),
+            checkout.display()
+        ),
+        WorkspaceIdentity::Unreadable(detail) => format!(
+            "cannot adopt {shown}: it is a workspace of {} whose working-copy state could not \
+             be read ({detail})",
+            checkout.display()
+        ),
+        WorkspaceIdentity::Repository => format!(
+            "cannot adopt {shown}: it is a repository in its own right, not a workspace of {}; \
+             choose a different branch",
+            checkout.display()
+        ),
+        WorkspaceIdentity::SymbolicLink(target) => format!(
+            "cannot adopt {shown}: it is a symbolic link to {}; start from the real directory \
+             or choose a different branch",
+            target.display()
+        ),
+        WorkspaceIdentity::NotAWorkspace => format!(
+            "cannot adopt {shown}: not a workspace of {}; move it or choose a different branch",
+            checkout.display()
+        ),
+    };
+    Some(line)
+}
+
 /// The workspace line for a claim being seized: the existing workspace, or the
-/// one just created. `Err` carries the tips of a divergent branch no workspace
-/// can be made for.
+/// one just created. `Err` is the refusal line; nothing is claimed in that case,
+/// so a plain `start` afterwards is the way back.
 fn workspace_notice(
     context: &StartContext<'_>,
     left_as_is: bool,
-) -> anyhow::Result<Result<String, Vec<CommitId>>> {
+) -> anyhow::Result<Result<String, String>> {
     if context.destination.exists() {
+        if let Some(line) = adoption_refusal(
+            &context.destination,
+            &context.entry.path,
+            &context.workspace,
+        ) {
+            return Ok(Err(line));
+        }
         let retained = if left_as_is { "; left as-is" } else { "" };
         return Ok(Ok(format!(
             "workspace {} at {}{retained}",
@@ -318,7 +423,7 @@ fn workspace_notice(
             context.destination.display(),
             workspace_change(&Repo::open(&context.entry.path)?, &context.workspace)?,
         )),
-        WorkspaceBase::Divergent(tips) => Err(tips),
+        WorkspaceBase::Divergent(tips) => Err(divergent_refusal_line(context.branch, &tips)),
     })
 }
 
@@ -465,20 +570,81 @@ mod tests {
     )]
     use super::*;
 
+    fn entry(path: &str, workspaces: Option<&str>) -> RepoEntry {
+        RepoEntry {
+            path: PathBuf::from(path),
+            upstream: "u".to_owned(),
+            origin: "o".to_owned(),
+            base: None,
+            release: None,
+            release_branch: None,
+            test_count_command: None,
+            consumers: vec![],
+            workspaces: workspaces.map(PathBuf::from),
+        }
+    }
+
+    #[test]
+    fn a_branch_whose_workspace_is_the_checkout_or_above_it_collides() {
+        // With `workspaces` free to point anywhere, a branch whose flattened name is
+        // an intermediate component of the checkout path maps to an ancestor of the
+        // checkout, and `default` maps to a directory that is not the checkout at
+        // all — but is still the primary workspace's name.
+        let sibling = entry("/home/u/forks/tool/default", None);
+        let configured = entry(
+            "/home/u/forks/tool/default",
+            Some("/home/u/.worktrees/tool"),
+        );
+        let above = entry("/home/u/forks/tool/default", Some("/home/u/forks"));
+        for (entry, branch) in [
+            (&sibling, "default"),
+            (&configured, "default"),
+            (&above, "tool"),
+        ] {
+            let line =
+                collides_with_checkout(entry, &BranchName::new(branch)).expect("a collision");
+            assert!(line.contains("registered checkout"), "was: {line}");
+        }
+        for (entry, branch) in [
+            (&sibling, "tool-fix"),
+            (&configured, "feat/alpha"),
+            (&above, "tool-fix"),
+        ] {
+            assert!(
+                collides_with_checkout(entry, &BranchName::new(branch)).is_none(),
+                "{branch} was refused"
+            );
+        }
+    }
+
     #[test]
     fn a_workspace_is_a_sibling_named_for_the_branch() {
         let path = workspace_path(
-            Path::new("/home/u/forks/work/default"),
+            &entry("/home/u/forks/work/default", None),
             &BranchName::new("feat/alpha"),
         );
         assert_eq!(path, PathBuf::from("/home/u/forks/work/feat-alpha"));
     }
 
     #[test]
+    fn a_configured_workspaces_directory_holds_the_workspace_instead() {
+        // A checkout at `~/<name>` has no `default` leaf to sit beside; without
+        // this, every branch of every such repository would land in `~`.
+        let path = workspace_path(
+            &entry("/home/u/work", Some("/home/u/.worktrees/work")),
+            &BranchName::new("feat/alpha"),
+        );
+        assert_eq!(path, PathBuf::from("/home/u/.worktrees/work/feat-alpha"));
+    }
+
+    #[test]
     fn slashes_in_a_branch_name_do_not_create_nested_directories() {
         // `feat/a/b` must not become three directories deep, or the workspace
         // lands somewhere nobody looks.
-        let path = workspace_path(Path::new("/repos/x/default"), &BranchName::new("feat/a/b"));
+        let path = workspace_path(
+            &entry("/repos/x/default", None),
+            &BranchName::new("feat/a/b"),
+        );
         assert_eq!(path.file_name().and_then(|n| n.to_str()), Some("feat-a-b"));
     }
 }

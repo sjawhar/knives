@@ -460,7 +460,7 @@ fn report_completed_cut(
         Err(error) => println!("  could not list conflicts: {error}"),
     }
     if let Some(first) = cut.request.parents.first() {
-        let test_count = release::check_test_count(&entry.path, entry, cut.created, first);
+        let test_count = release::check_test_count(entry, cut.created, first);
         println!("{}", test_count.render());
         if matches!(test_count, release::TestCountCheck::Dropped { .. }) {
             post_cut_exit = post_cut_exit.worst(Exit::Findings);

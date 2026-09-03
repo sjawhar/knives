@@ -22,21 +22,18 @@ pub fn snippet(name: &str, entry: &RepoEntry) -> Result<String, toml::ser::Error
 
 /// Prints a registry snippet without changing the registry.
 ///
+/// The snippet is what a human pastes over any existing entry, so it consults
+/// the registry the same way `init` does: a registered checkout's hand-written
+/// fields ride along, and a different tree that would take a registered name is
+/// refused rather than handed a snippet that overwrites it.
+///
 /// # Errors
 ///
-/// Returns errors from discovering the repository's remotes or serializing its
-/// entry.
+/// Returns errors from discovering the repository's remotes, reading the
+/// registry, or serializing the entry.
 pub fn run(target: Option<PathBuf>) -> anyhow::Result<Exit> {
-    let path = match target {
-        Some(given) => given,
-        None => std::env::current_dir()?,
-    };
     let config_path = default_config_path();
-    let outcome = if path.join(".jj").exists() {
-        init::decide(&path, &crate::jj::git_remotes(&path)?)
-    } else {
-        InitOutcome::NotARepository { path }
-    };
+    let outcome = init::outcome_for(init::target_path(target)?, &config_path)?;
 
     match &outcome {
         InitOutcome::Adopted {
@@ -57,13 +54,12 @@ pub fn run(target: Option<PathBuf>) -> anyhow::Result<Exit> {
             );
             Ok(Exit::Ok)
         }
-        InitOutcome::NotARepository { .. } | InitOutcome::MissingRoles { .. } => {
+        InitOutcome::NotARepository { .. }
+        | InitOutcome::MissingRoles { .. }
+        | InitOutcome::NameTaken { .. } => {
             eprintln!("{}", init::render(&outcome, &config_path));
             Ok(Exit::Usage)
         }
-        InitOutcome::NameTaken { .. } => Err(anyhow::anyhow!(
-            "init::decide returned a registry-collision outcome without reading a registry"
-        )),
     }
 }
 
@@ -91,6 +87,7 @@ mod tests {
             release_branch: Some("release".to_owned()),
             test_count_command: Some("cargo test -- --list | wc -l".to_owned()),
             consumers: vec!["acme/consumer".to_owned()],
+            workspaces: None,
         };
         let text = snippet("tool", &entry).expect("snippet serializes");
         assert!(text.starts_with("[repos.tool]"), "was: {text}");
@@ -110,6 +107,7 @@ mod tests {
             release_branch: None,
             test_count_command: None,
             consumers: Vec::new(),
+            workspaces: None,
         };
 
         assert!(snippet("tool", &entry).is_err());

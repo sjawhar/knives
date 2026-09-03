@@ -30,6 +30,7 @@ fn preflight_reports_main_when_a_repo_configures_dev_as_its_trunk() {
         release_branch: None,
         test_count_command: None,
         consumers: Vec::new(),
+        workspaces: None,
     };
 
     // When: preflight collects locally maintained branches.
@@ -61,6 +62,7 @@ fn preflight_treats_a_fixed_release_branch_as_a_release_not_a_branch() {
         release_branch: Some("integration".to_owned()),
         test_count_command: None,
         consumers: Vec::new(),
+        workspaces: None,
     };
 
     // When: preflight collects locally maintained branches.
@@ -92,6 +94,7 @@ fn preflight_hides_a_divergent_configured_trunk_bookmark() {
         release_branch: None,
         test_count_command: None,
         consumers: Vec::new(),
+        workspaces: None,
     };
 
     // When: preflight reads divergent bookmarks before regular branch tips.
@@ -125,6 +128,7 @@ fn preflight_flags_a_branch_whose_tip_is_divergent() {
         release_branch: None,
         test_count_command: None,
         consumers: Vec::new(),
+        workspaces: None,
     };
     let states = knives::commands::preflight::branch_states(&entry, &[]).expect("branch states");
     assert!(
