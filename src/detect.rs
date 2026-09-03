@@ -107,8 +107,8 @@ impl Subject {
     /// branch name or file path is wrong, not merely terse.
     pub fn short(&self) -> String {
         match self {
-            Self::Change(id) => id.as_str().chars().take(12).collect(),
-            Self::Commit(id) => id.as_str().chars().take(12).collect(),
+            Self::Change(id) => id.short().to_owned(),
+            Self::Commit(id) => id.short().to_owned(),
             Self::Branch(name) => name.to_string(),
             Self::Bookmark(reference) => reference.to_string(),
             Self::PullRequest(number) => format!("#{number}"),

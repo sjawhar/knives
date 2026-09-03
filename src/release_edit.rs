@@ -8,14 +8,14 @@
 use knives::cli::Exit;
 use knives::commands::release;
 use knives::forge::github::CliForge;
-use knives::ids::{BranchName, ReleaseScheme, RepoName};
+use knives::ids::{BranchName, CommitId, ReleaseScheme, RepoName};
 use knives::ledger::{Draft, Kind, Ledger};
 use knives::release_model::{
     MemberEvidence, MemberLookup, MemberSuccession, StackedHistoryContext, carried_from_tips,
     last_recorded_parents, member_parents, members_event_text, trunk_positions,
 };
 
-use super::{bookmark_tip, cut_request, parent_sources, scribe_for, selected, short12};
+use super::{bookmark_tip, cut_request, parent_sources, scribe_for, selected};
 
 /// One deliberate change to the release in hand.
 pub(crate) enum ReleaseEdit {
@@ -72,11 +72,7 @@ impl ReleaseInHand {
         name: String,
     ) -> anyhow::Result<Self> {
         let commit = opened.resolve_commit(&name)?;
-        let parents: Vec<knives::ids::CommitId> = opened
-            .parents_of(&name)?
-            .into_iter()
-            .map(|parent| parent.commit)
-            .collect();
+        let parents = opened.parent_commits(&name)?;
         Ok(Self {
             name,
             commit,
@@ -482,7 +478,7 @@ fn include_edit(
     if let Some(parent) = lookup.parents.first() {
         // Moving a member is its own decision, and including it again would
         // carry it twice; say which situation the record describes.
-        let parent = short12(parent);
+        let parent = parent.short();
         match lookup.evidence {
             MemberEvidence::Succession => println!(
                 "{repo}: {} carries {parent} of {target}, and the branch has moved on (grown or \
@@ -570,7 +566,7 @@ fn drop_edit(context: &EditContext<'_>, target: &str, why: &str) -> anyhow::Resu
             Ok(EditOutcome::Done(parents, delta))
         }
         many => {
-            let listed: Vec<String> = many.iter().map(short12).collect();
+            let listed: Vec<&str> = many.iter().map(CommitId::short).collect();
             println!(
                 "{repo}: {target} matches {} parents of {} ({}); name one by commit id",
                 many.len(),
@@ -688,7 +684,7 @@ fn advance_every_member(
                 let names: Vec<String> = many.iter().map(|(branch, _)| branch.clone()).collect();
                 ambiguous.push(format!(
                     "parent {} has several advanced branches ({})",
-                    short12(parent),
+                    parent.short(),
                     names.join(", ")
                 ));
             }
@@ -722,7 +718,7 @@ fn advance_every_member(
     overreaching.retain(|(_, stale_parents)| stale_parents.len() > 1);
     if !overreaching.is_empty() {
         for (branch, stale_parents) in &overreaching {
-            let listed: Vec<String> = stale_parents.iter().map(short12).collect();
+            let listed: Vec<&str> = stale_parents.iter().map(CommitId::short).collect();
             println!(
                 "{repo}: {branch} descends from {} parents of {} ({}); drop and include instead",
                 stale_parents.len(),
@@ -800,12 +796,12 @@ fn advance_named_members(
             (Some(recorded), MemberEvidence::Record) => println!(
                 "{repo}: {branch} matched {} by the last cut or edit record only; nothing in \
                  the repository ties them (no ancestry, no shared change id)",
-                short12(recorded)
+                recorded.short()
             ),
             (Some(recorded), MemberEvidence::LandedRecord) => println!(
                 "{repo}: {branch} matched {} by the last cut or edit record; that parent has \
                  landed upstream, so the branch's tip continues it only by name",
-                short12(recorded)
+                recorded.short()
             ),
             (_, MemberEvidence::Succession) | (None, _) => {}
         }
@@ -825,7 +821,7 @@ fn advance_named_members(
                 moved.push(branch.to_string());
             }
             many => {
-                let listed: Vec<String> = many.iter().map(short12).collect();
+                let listed: Vec<&str> = many.iter().map(CommitId::short).collect();
                 println!(
                     "{repo}: {branch} descends from {} parents of {} ({}); drop and \
                      include instead",
@@ -893,7 +889,7 @@ fn advance_named_member_from(
         println!(
             "{repo}: {} is not a parent of {}; `knives release include {branch}` adds \
              {branch} instead",
-            short12(old),
+            old.short(),
             release.name
         );
         return Ok(None);

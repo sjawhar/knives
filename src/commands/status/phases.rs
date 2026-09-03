@@ -2,7 +2,7 @@ use super::{
     BTreeMap, BTreeSet, BookmarkRef, BookmarkTips, BranchName, BranchTarget, CommitId, Finding,
     FindingKind, Forge, JjError, LandedVerdict, Options, OriginRelation, Repo, RepoEntry, RepoName,
     Role, Store, Subject, classify_landed, divergent_changes, double_checkout, index_pulls,
-    probe_landed, short,
+    probe_landed,
 };
 
 use super::rows::pull_summary_for;
@@ -206,7 +206,7 @@ pub(super) fn probe_phase(
 pub(super) fn conflicted_bookmark_findings(repo: &Repo) -> anyhow::Result<Vec<Finding>> {
     let mut findings = Vec::new();
     for (reference, commits) in repo.conflicted_bookmarks()? {
-        let shown: Vec<String> = commits.iter().map(|c| short(c.as_str())).collect();
+        let shown: Vec<&str> = commits.iter().map(CommitId::short).collect();
         findings.push(Finding::new(
             FindingKind::Divergence,
             Subject::Bookmark(reference.clone()),

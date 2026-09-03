@@ -28,7 +28,7 @@ use crate::detect::landed::RebaseOutcome;
 use crate::detect::stale_parents::{BookmarkTips, ReleaseParent};
 use crate::ids::{
     BookmarkRef, BranchName, ChangeId, CommitId, ReleaseScheme, RemoteName, WorkspaceName,
-    is_our_release, pull_number_from_bookmark,
+    is_our_release, pull_number_from_bookmark, short_id,
 };
 
 #[derive(Debug, Error)]
@@ -76,11 +76,6 @@ pub enum JjError {
 
 /// Bound the passive operation walk so status stays proportional to current work.
 pub const MAX_ACTIVITY_OPS: usize = 200;
-
-/// Twelve characters is what jj shows, and a full id is correct and unreadable.
-fn short_id(id: &str) -> String {
-    id.chars().take(12).collect()
-}
 
 #[derive(Debug)]
 pub struct Repo {
@@ -492,25 +487,39 @@ impl Repo {
         Ok(found)
     }
 
+    /// The parents of `revision`, each with the bookmarks that sit on it.
+    ///
+    /// The bookmark view is read once; a release merge has one parent per
+    /// member, and re-reading the view per parent scaled the cost with the
+    /// release's width for nothing.
     pub fn parents_of(&self, revision: &str) -> Result<Vec<ReleaseParent>, JjError> {
-        let commit = self.commit(revision)?;
-        commit
+        let tips = self.bookmark_tips()?;
+        Ok(self
+            .parent_commits(revision)?
+            .into_iter()
+            .map(|commit| {
+                let bookmarks = tips
+                    .iter()
+                    .filter(|(_, tip)| **tip == commit)
+                    .map(|(bookmark, _)| bookmark.clone())
+                    .collect();
+                ReleaseParent { commit, bookmarks }
+            })
+            .collect())
+    }
+
+    /// The parent commits of `revision`, in jj's parent order.
+    ///
+    /// Most callers want only the commits — the members a release carries, the
+    /// keepers a recut must keep — and `parents_of` would read the bookmark
+    /// view to name bookmarks they discard.
+    pub fn parent_commits(&self, revision: &str) -> Result<Vec<CommitId>, JjError> {
+        Ok(self
+            .commit(revision)?
             .parent_ids()
             .iter()
-            .map(|parent| {
-                let bookmarks = self
-                    .bookmark_tips()?
-                    .into_iter()
-                    .filter_map(|(bookmark, tip)| {
-                        (tip.as_str() == parent.to_string()).then_some(bookmark)
-                    })
-                    .collect();
-                Ok(ReleaseParent {
-                    commit: commit_id(parent),
-                    bookmarks,
-                })
-            })
-            .collect()
+            .map(commit_id)
+            .collect())
     }
 
     /// The full description of `revision`.
@@ -1786,7 +1795,7 @@ fn assert_mutable(
                 })?;
             if pinned {
                 return Err(JjError::Immutable {
-                    commit: short_id(&target.id().to_string()),
+                    commit: short_id(&target.id().to_string()).to_owned(),
                     pin: pin.label.clone(),
                 });
             }

@@ -3,7 +3,7 @@ use super::{
     ChecksSummary, CommitId, Finding, FindingKind, JjError, LandedVerdict, LastNotch, Notch,
     OriginRelation, PriorPull, PullCell, PullDetails, PullIndex, PullRequest, PullSummary,
     PushRelation, ReleaseScheme, Repo, RepoEntry, RepoName, Report, Store, Subject, fmt,
-    is_release_name, pull_number_from_bookmark, short,
+    is_release_name, pull_number_from_bookmark,
 };
 
 use super::phases::ProbeInput;
@@ -313,13 +313,13 @@ fn push_for(
             Some(PushRelation::UnpushedCommits)
         }
         (Some(origin), Some(PendingPushRelation::Behind)) => {
-            Some(PushRelation::Behind(short(origin.as_str())))
+            Some(PushRelation::Behind(origin.short().to_owned()))
         }
         (Some(origin), Some(PendingPushRelation::Diverged)) => {
-            Some(PushRelation::Diverged(short(origin.as_str())))
+            Some(PushRelation::Diverged(origin.short().to_owned()))
         }
         (Some(origin), Some(PendingPushRelation::Unresolved)) => {
-            Some(PushRelation::Unresolved(short(origin.as_str())))
+            Some(PushRelation::Unresolved(origin.short().to_owned()))
         }
         (Some(_), None) => None,
     }
@@ -575,7 +575,7 @@ pub(super) fn divergent_rows(
                     tip: None,
                     landed: None,
                     push: raw_origin.map_or(Some(PushRelation::Unpushed), |origin| {
-                        Some(PushRelation::Unresolved(short(origin.as_str())))
+                        Some(PushRelation::Unresolved(origin.short().to_owned()))
                     }),
                     origin_tip: None,
                     origin_relation: None,
@@ -653,7 +653,7 @@ pub(super) fn branch_rows(
             &branch,
             RowFacts {
                 divergent: false,
-                tip: Some(short(tip.as_str())),
+                tip: Some(tip.short().to_owned()),
                 landed,
                 push: None,
                 origin_tip: raw_origin.as_ref(),

@@ -14,7 +14,7 @@ use crate::forge::{
 };
 use crate::ids::{
     BookmarkRef, BranchName, BranchTarget, CommitId, ReleaseScheme, RepoName, is_release_name,
-    pull_number_from_bookmark,
+    pull_number_from_bookmark, short_id,
 };
 use crate::jj::{JjError, Repo, probe_landed};
 use crate::ledger::{Entry as Notch, Ledger};
@@ -330,7 +330,10 @@ impl LastNotch {
             kind: entry.kind,
             text: collapsed_notch_text(&entry.text),
             disposition: entry.disposition.clone(),
-            anchor: entry.anchor.as_deref().map(short),
+            anchor: entry
+                .anchor
+                .as_deref()
+                .map(|anchor| short_id(anchor).to_owned()),
             count,
         })
     }
@@ -906,11 +909,6 @@ pub fn gather(
     options: &Options<'_>,
 ) -> anyhow::Result<Report> {
     gather_timed(name, entry, store, options).map(|(report, _)| report)
-}
-
-/// Short form for display. Full ids are correct and unreadable.
-fn short(id: &str) -> String {
-    id.chars().take(12).collect()
 }
 
 /// One grouped subject per raw finding. Relationship findings include the

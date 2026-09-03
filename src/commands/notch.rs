@@ -8,7 +8,7 @@
 
 use crate::cli::Exit;
 use crate::config::{default_config_path, load};
-use crate::ids::{BranchName, BranchTarget, RepoName};
+use crate::ids::{BranchName, BranchTarget, RepoName, short_id};
 use crate::ledger::{
     Draft, Entry, EntryClass, Filter, Kind, Ledger, LedgerError, Scribe, VerifyFlag,
     body_human_text, inline_human_text, select, verify_entries,
@@ -159,7 +159,7 @@ fn heading(entry: &Entry) -> String {
         .map_or_else(|| "(this repo)".to_owned(), inline_human_text);
     let mut parts = vec![subject];
     if let Some(anchor) = &entry.anchor {
-        parts.push(format!("@{}", short(anchor)));
+        parts.push(format!("@{}", short_id(&inline_human_text(anchor))));
     }
     if let Some(number) = entry.pr {
         parts.push(format!("#{number}"));
@@ -177,13 +177,13 @@ fn wrote_line(repo: &str, entry: &Entry) -> String {
         .map_or_else(|| format!("{repo} itself"), inline_human_text);
     entry.anchor.as_deref().map_or_else(
         || format!("notched {subject}"),
-        |anchor| format!("notched {subject} at {}", short(anchor)),
+        |anchor| {
+            format!(
+                "notched {subject} at {}",
+                short_id(&inline_human_text(anchor))
+            )
+        },
     )
-}
-
-/// Short form for display. Full ids are correct and unreadable.
-fn short(id: &str) -> String {
-    inline_human_text(id).chars().take(12).collect()
 }
 
 fn pr_subject(subject: Option<&str>) -> Option<u64> {

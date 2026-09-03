@@ -1,8 +1,9 @@
 use std::fmt::Write as _;
 
+use crate::ids::short_id;
+
 use super::{
     BranchRow, BranchState, FindingGroup, LastNotch, PushRelation, RepoNotches, Report, SeenWindow,
-    short,
 };
 
 fn tip_cell(row: &BranchRow) -> String {
@@ -76,7 +77,7 @@ fn landed_cell(row: &BranchRow) -> String {
 fn claim_cell(row: &BranchRow) -> String {
     row.claim.as_ref().map_or_else(
         || "-".to_owned(),
-        |claim| format!("{}/{}", short(&claim.id), owner_kind_name(claim.kind)),
+        |claim| format!("{}/{}", short_id(&claim.id), owner_kind_name(claim.kind)),
     )
 }
 

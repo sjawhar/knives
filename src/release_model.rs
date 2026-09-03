@@ -261,7 +261,7 @@ pub fn stacked_history(
         .filter_map(|merge| {
             context.releases.get(merge).map(|refs| {
                 let names: Vec<String> = refs.iter().map(ToString::to_string).collect();
-                format!("{} ({})", names.join(", "), short(merge))
+                format!("{} ({})", names.join(", "), merge.short())
             })
         })
         .collect();
@@ -550,8 +550,8 @@ pub fn double_cut_findings(
                 Subject::Branch(name.clone()),
                 format!(
                     "{name} names both {} and {}, and their trees differ ({} files)",
-                    short(&first),
-                    short(&different),
+                    first.short(),
+                    different.short(),
                     changed.len()
                 ),
             ));
@@ -604,7 +604,7 @@ pub fn parents_with_branches(
 pub fn members_event_text(members: &[(String, CommitId)]) -> String {
     members
         .iter()
-        .map(|(source, commit)| format!("{source}@{}", short(commit)))
+        .map(|(source, commit)| format!("{source}@{}", commit.short()))
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -644,8 +644,4 @@ pub fn last_recorded_cut(entries: &[Entry], subject: Option<&str>) -> Option<Rec
                 .collect(),
         })
     })
-}
-
-fn short(value: &CommitId) -> String {
-    value.as_str().chars().take(12).collect()
 }

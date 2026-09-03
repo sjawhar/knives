@@ -6,7 +6,7 @@ use crate::cli::Exit;
 use crate::config::RepoEntry;
 use crate::detect::pull_state::{PullState, pull_state_findings};
 use crate::forge::{DiffTotals, Forge, PullDetails, TimelineEvent, TimelineEventKind};
-use crate::ids::RepoName;
+use crate::ids::{RepoName, short_id};
 
 #[derive(Debug, serde::Serialize)]
 pub struct Report {
@@ -185,10 +185,10 @@ fn render_timeline_event(event: &TimelineEvent) -> String {
         TimelineEventKind::ForcePush { before, after } => format!(
             "  {}  force-push  {} (tree {}) -> {} (tree {}){}",
             event.at,
-            short(&before.commit),
-            short(&before.tree),
-            short(&after.commit),
-            short(&after.tree),
+            short_id(&before.commit),
+            short_id(&before.tree),
+            short_id(&after.commit),
+            short_id(&after.tree),
             if before.tree != "unknown" && before.tree == after.tree {
                 "  [same tree]"
             } else {
@@ -201,13 +201,9 @@ fn render_timeline_event(event: &TimelineEvent) -> String {
         TimelineEventKind::Reopened => format!("  {}  reopened", event.at),
         TimelineEventKind::Merged { commit } => commit.as_deref().map_or_else(
             || format!("  {}  merged", event.at),
-            |commit| format!("  {}  merged  @{}", event.at, short(commit)),
+            |commit| format!("  {}  merged  @{}", event.at, short_id(commit)),
         ),
     }
-}
-
-fn short(oid: &str) -> String {
-    oid.chars().take(12).collect()
 }
 
 #[cfg(test)]

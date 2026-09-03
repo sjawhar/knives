@@ -1,0 +1,330 @@
+//! The branch verbs after `start`: `finish`, `track` and `depends`.
+//!
+//! `finish` hands a claimed branch back and removes its workspace; `track`
+//! states which pull request a branch belongs to, overriding inference;
+//! `depends` records that a branch cannot land before something else does.
+//! Each is one state write with its ledger event.
+
+use knives::cli::Exit;
+use knives::commands::claim::{
+    ClaimContext, ClaimDecision, current_identity, decide, last_seen_provenance,
+    render_claim_context,
+};
+use knives::config::{default_config_path, load};
+use knives::ids::{BranchTarget, Requirement};
+use knives::jj::Repo;
+use knives::store::{Store, default_state_path};
+
+use super::scribe_for;
+
+/// What a `finish` did, or nothing when it did nothing.
+///
+/// Releasing a claim and recording a supersession are two acts and either can
+/// happen alone: a `finish` on an unheld branch releases no claim, and one with
+/// `--superseded-by` still records where the work went.
+fn release_event(had: bool, superseded_by: Option<&str>) -> Option<String> {
+    match (had, superseded_by) {
+        (true, Some(replacement)) => Some(format!("claim released; superseded by {replacement}")),
+        (true, None) => Some("claim released".to_owned()),
+        (false, Some(replacement)) => Some(format!("superseded by {replacement}")),
+        (false, None) => None,
+    }
+}
+
+/// The durable provenance required when a claim is released by force.
+fn forced_release_event(
+    claim: &knives::store::Claim,
+    last_seen: knives::seen::LastSeen,
+    why: &str,
+) -> String {
+    format!(
+        "released {}'s claim by force ({}, claimed {}, last seen {}): {why}",
+        claim.owner,
+        knives::commands::claim::owner_kind_label(claim.kind),
+        claim.started,
+        last_seen_provenance(last_seen),
+    )
+}
+
+pub(crate) struct FinishOptions<'a> {
+    pub(crate) superseded_by: Option<&'a str>,
+    pub(crate) cleanup: bool,
+    pub(crate) force: bool,
+    pub(crate) why: Option<&'a str>,
+}
+
+enum FinishClaimGate {
+    Continue(Option<String>),
+    Refuse,
+}
+
+/// Hand a branch back and remove its workspace. The inverse of `start`.
+///
+/// Removing the directory loses no work: jj snapshots a working copy into a commit, so
+/// every change made there is already in the repository and reachable by change id. What
+/// does not survive is anything jj never tracked, which is what `--no-cleanup` is for.
+pub(crate) fn run_finish(
+    target: &BranchTarget,
+    options: &FinishOptions<'_>,
+) -> anyhow::Result<Exit> {
+    let registry = load(&default_config_path())?;
+    let Some(entry) = registry.get(&target.repo) else {
+        eprintln!("unknown repo {}", target.repo);
+        return Ok(Exit::Usage);
+    };
+    let mut store = Store::open_for_update(default_state_path())?;
+    let workspace = knives::commands::wip::workspace_for(target.branch.as_str());
+    let directory = entry.path.parent().map(|parent| parent.join(&workspace));
+    // The primary workspace is named "default" and the registered checkout is its
+    // directory; `start` can never have created either for a branch, so a branch
+    // whose flattened name lands on them is a collision, not a workspace to clean
+    // up. Without this, `finish` would forget the primary workspace and delete
+    // the checkout itself.
+    if workspace == "default" || directory.as_deref() == Some(entry.path.as_path()) {
+        eprintln!(
+            "{}: branch {} maps to workspace {workspace}, which is the registered \
+             checkout itself; refusing to touch {}",
+            target.repo,
+            target.branch,
+            entry.path.display()
+        );
+        return Ok(Exit::Usage);
+    }
+    let forced_release = match finish_claim_gate(target, entry, &store, options)? {
+        FinishClaimGate::Continue(event) => event,
+        FinishClaimGate::Refuse => return Ok(Exit::Usage),
+    };
+    let had = store.release_claim(target);
+    if let Some(new) = options.superseded_by {
+        store.supersede(target, new);
+    }
+    let pr = store.tracked_pull(target);
+    // Persist the immutable explanation before the mutable claim state. A failed
+    // append then leaves the old claim in place instead of silently releasing or
+    // seizing work without the provenance that explains why.
+    let provenance = forced_release
+        .map(|text| match options.superseded_by {
+            Some(replacement) => format!("{text}; superseded by {replacement}"),
+            None => text,
+        })
+        .or_else(|| release_event(had, options.superseded_by));
+    if let Some(text) = provenance {
+        scribe_for(&target.repo, entry)?.event(Some(target.branch.as_str()), text, pr)?;
+    }
+    store.save()?;
+
+    let claim = if had { "released" } else { "was not held" };
+    if let Err(error) = knives::jj::forget_workspace(&entry.path, &workspace) {
+        println!("{target}: claim {claim}; no workspace forgotten ({error})");
+        return Ok(Exit::Ok);
+    }
+    match (options.cleanup, directory) {
+        (true, Some(directory)) if directory.is_dir() => {
+            // Safe because jj already snapshotted the working copy into a commit: the
+            // work is in the repository and reachable by change id. Untracked files are
+            // the exception, which is what --no-cleanup is for.
+            std::fs::remove_dir_all(&directory)?;
+            println!(
+                "{target}: claim {claim}, workspace {workspace} removed ({}); its commits \
+                 remain in the repository",
+                directory.display()
+            );
+        }
+        (_, directory) => println!(
+            "{target}: claim {claim}, workspace {workspace} forgotten; {} left on disk",
+            directory.map_or_else(|| "its directory".to_owned(), |d| d.display().to_string())
+        ),
+    }
+    Ok(Exit::Ok)
+}
+
+fn finish_claim_gate(
+    target: &BranchTarget,
+    entry: &knives::config::RepoEntry,
+    store: &Store,
+    options: &FinishOptions<'_>,
+) -> anyhow::Result<FinishClaimGate> {
+    let Some(claim) = store
+        .claims(Some(&target.repo))
+        .into_iter()
+        .find(|claim| claim.branch == target.branch.as_str())
+        .cloned()
+    else {
+        return Ok(FinishClaimGate::Continue(None));
+    };
+    let workspace = knives::commands::wip::workspace_for(target.branch.as_str());
+    let directory = entry.path.parent().map(|parent| parent.join(&workspace));
+    let cwd = std::env::current_dir()?;
+    let identity = current_identity(&cwd)?;
+    let decision = decide(&ClaimContext {
+        held: Some(&claim),
+        identity: &identity,
+        in_claimed_workspace: directory.as_ref().is_some_and(|path| cwd.starts_with(path)),
+    });
+    match decision {
+        ClaimDecision::Resume { .. } | ClaimDecision::Take => Ok(FinishClaimGate::Continue(None)),
+        ClaimDecision::RefuseAnonymous | ClaimDecision::RefuseHeld => {
+            let activity = Repo::open(&entry.path)?.workspace_activity(
+                &std::collections::BTreeSet::from([knives::ids::WorkspaceName::new(workspace)]),
+                knives::jj::MAX_ACTIVITY_OPS,
+            )?;
+            let last_seen = knives::seen::last_seen(&claim, &activity, &knives::seen::load());
+            if !options.force {
+                let anonymous_note = if decision == ClaimDecision::RefuseAnonymous {
+                    "both sides are anonymous identities, so they can never match; "
+                } else {
+                    ""
+                };
+                eprintln!(
+                    "{anonymous_note}{}\nuse `knives finish {} --force --why \"…\"` to release the claim",
+                    render_claim_context(&claim, last_seen, jiff::Timestamp::now()),
+                    target.branch,
+                );
+                return Ok(FinishClaimGate::Refuse);
+            }
+            let why = options
+                .why
+                .ok_or_else(|| anyhow::anyhow!("--force requires --why"))?;
+            Ok(FinishClaimGate::Continue(Some(forced_release_event(
+                &claim, last_seen, why,
+            ))))
+        }
+    }
+}
+
+/// State or forget which pull request a branch belongs to.
+pub(crate) fn run_track(
+    target: &BranchTarget,
+    pr: Option<u64>,
+    fork_only: bool,
+    forget: bool,
+) -> anyhow::Result<Exit> {
+    let registry = load(&default_config_path())?;
+    let Some(entry) = registry.get(&target.repo) else {
+        eprintln!("unknown repo {}", target.repo);
+        return Ok(Exit::Usage);
+    };
+    let mut store = Store::open_for_update(default_state_path())?;
+    // Read before the change, so a withdrawal is still filed under the number it
+    // withdrew.
+    let stated = store.tracked_pull(target);
+    // Each branch stamps the number its entry is ABOUT, not whatever happened to
+    // be stated a moment earlier. The event that creates an association is the
+    // one `knives notch --pr <n>` most needs to find, and stamping the prior
+    // value there — usually nothing — would hide it from the only filter the
+    // field exists for.
+    let (text, stamped) = if fork_only {
+        store.mark_fork_only(target, "stated with `knives track --fork-only`");
+        (
+            "stated as having no upstream pull request".to_owned(),
+            stated,
+        )
+    } else if forget {
+        let had = store.untrack_pull(target);
+        (
+            if had {
+                "pull request statement forgotten".to_owned()
+            } else {
+                "no pull request statement to forget".to_owned()
+            },
+            stated,
+        )
+    } else {
+        let Some(number) = pr else {
+            eprintln!("give --pr <number>, or --forget");
+            return Ok(Exit::Usage);
+        };
+        store.track_pull(target, number);
+        (format!("stated as #{number}"), Some(number))
+    };
+    store.save()?;
+    scribe_for(&target.repo, entry)?.event(Some(target.branch.as_str()), text.clone(), stamped)?;
+    println!("{target} {}", spoken(&text));
+    Ok(Exit::Ok)
+}
+
+/// The prose form of a `track` outcome, which reads about the branch rather than
+/// about the statement.
+fn spoken(text: &str) -> String {
+    match text {
+        "stated as having no upstream pull request" => {
+            "deliberately has no upstream pull request".to_owned()
+        }
+        "pull request statement forgotten" => "is back to inferring its pull request".to_owned(),
+        "no pull request statement to forget" => "had no stated pull request".to_owned(),
+        stated => stated.replacen("stated as ", "is ", 1),
+    }
+}
+
+/// Record what a branch cannot land before.
+///
+/// Requirements are validated against the registry, because a dependency on a repo
+/// knives does not manage is a typo, and a typo that records silently is worse than
+/// no dependency at all: it reads as satisfied forever.
+pub(crate) fn run_depends(target: &BranchTarget, on: &[String]) -> anyhow::Result<Exit> {
+    let registry = load(&default_config_path())?;
+    let mut requirements = Vec::new();
+    for text in on {
+        let Some(requirement) = Requirement::parse(text) else {
+            eprintln!("cannot read {text} as a requirement; write it as `<repo>#<number>`");
+            return Ok(Exit::Usage);
+        };
+        if registry.get(&requirement.repo).is_none() {
+            let known: Vec<String> = registry.names().map(|n| n.to_string()).collect();
+            eprintln!(
+                "unknown repo {} in {text}; known: {}",
+                requirement.repo,
+                known.join(", ")
+            );
+            return Ok(Exit::Usage);
+        }
+        requirements.push(requirement);
+    }
+    // Resolved before anything is written. Dispatch already validated this name
+    // through `one_repo`, so an absent entry is an invariant violation rather
+    // than a user error — and the one thing not to do with it is mutate the
+    // store and then quietly skip the ledger, which would leave a dependency
+    // recorded and unexplained.
+    let Some(entry) = registry.get(&target.repo) else {
+        let known: Vec<String> = registry.names().map(|name| name.to_string()).collect();
+        eprintln!("unknown repo {}; known: {}", target.repo, known.join(", "));
+        return Ok(Exit::Usage);
+    };
+    let mut store = Store::open_for_update(default_state_path())?;
+    store.add_dependencies(target, &requirements);
+    let pr = store.tracked_pull(target);
+    store.save()?;
+    let listed: Vec<String> = requirements.iter().map(ToString::to_string).collect();
+    scribe_for(&target.repo, entry)?.event(
+        Some(target.branch.as_str()),
+        format!("requires {}", listed.join(", ")),
+        pr,
+    )?;
+    println!("{target} now requires {}", listed.join(", "));
+    Ok(Exit::Ok)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::spoken;
+    #[test]
+    fn track_prose_preserves_the_established_human_output() {
+        for (event, expected) in [
+            ("stated as #4545", "is #4545"),
+            (
+                "stated as having no upstream pull request",
+                "deliberately has no upstream pull request",
+            ),
+            (
+                "pull request statement forgotten",
+                "is back to inferring its pull request",
+            ),
+            (
+                "no pull request statement to forget",
+                "had no stated pull request",
+            ),
+        ] {
+            assert_eq!(spoken(event), expected);
+        }
+    }
+}

@@ -571,7 +571,7 @@ pub fn render_census(report: &CensusReport) -> String {
 }
 
 fn render_census_row(lines: &mut Vec<String>, row: &BranchCarriage) {
-    lines.push(format!("  {} @ {}", row.branch, short(&row.tip)));
+    lines.push(format!("  {} @ {}", row.branch, row.tip.short()));
     lines.extend(row.checks.iter().map(|check| render_check(check, "    ")));
     let pull = match row.in_open_pull {
         Some(true) => "yes",
@@ -618,13 +618,9 @@ fn render_check(check: &TargetCheck, indent: &str) -> String {
     };
     format!(
         "{indent}{verdict:<19}{target} @ {}  (evidence {}: {reason})",
-        short(&check.commit),
-        short(&check.evidence),
+        check.commit.short(),
+        check.evidence.short(),
     )
-}
-
-fn short(commit: &CommitId) -> String {
-    commit.as_str().chars().take(12).collect()
 }
 
 /// Every check target for this repository: each distinct commit named by our
