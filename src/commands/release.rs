@@ -203,11 +203,11 @@ pub fn shared_base(
     release: &CommitId,
     trunk_tip: &CommitId,
 ) -> anyhow::Result<Option<CommitId>> {
-    let parents = repo.parents_of(release.as_str())?;
+    let parents = repo.parent_commits(release.as_str())?;
     let mut bases = Vec::new();
     for parent in &parents {
-        if repo.is_ancestor(&parent.commit, trunk_tip)? {
-            bases.push(parent.commit.clone());
+        if repo.is_ancestor(parent, trunk_tip)? {
+            bases.push(parent.clone());
         }
     }
 
@@ -224,8 +224,7 @@ pub fn shared_base(
         // criss-cross, and guessing a base here would misattribute content.
         return Ok(None);
     }
-    let members: Vec<CommitId> = parents.into_iter().map(|parent| parent.commit).collect();
-    Ok(repo.common_ancestor(&members, trunk_tip)?)
+    Ok(repo.common_ancestor(&parents, trunk_tip)?)
 }
 
 /// What a recut keeps reachable: the commits the orphan gate treats as work.
@@ -258,11 +257,7 @@ pub fn cut_keepers(
             keep.extend(commits);
         }
     }
-    keep.extend(
-        repo.parents_of(previous.as_str())?
-            .into_iter()
-            .map(|parent| parent.commit),
-    );
+    keep.extend(repo.parent_commits(previous.as_str())?);
     keep.push(repo.resolve_commit(&entry.upstream_trunk())?);
     Ok(keep)
 }

@@ -72,11 +72,7 @@ impl ReleaseInHand {
         name: String,
     ) -> anyhow::Result<Self> {
         let commit = opened.resolve_commit(&name)?;
-        let parents: Vec<knives::ids::CommitId> = opened
-            .parents_of(&name)?
-            .into_iter()
-            .map(|parent| parent.commit)
-            .collect();
+        let parents = opened.parent_commits(&name)?;
         Ok(Self {
             name,
             commit,

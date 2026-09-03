@@ -1306,11 +1306,7 @@ fn drop_landed_members(
         return Ok(Exit::Ok);
     }
     let opened = knives::jj::Repo::open(&entry.path)?;
-    let parents: Vec<knives::ids::CommitId> = opened
-        .parents_of(release_name)?
-        .into_iter()
-        .map(|parent| parent.commit)
-        .collect();
+    let parents = opened.parent_commits(release_name)?;
     let mut kept = parents.clone();
     let mut deltas: Vec<String> = Vec::new();
     for pull in &destination.landed {
@@ -1399,11 +1395,7 @@ fn report_rebased_release(
 ) -> anyhow::Result<()> {
     let reopened = knives::jj::Repo::open(&entry.path)?;
     let created = reopened.resolve_commit(rebased.name)?;
-    let new_parents: Vec<knives::ids::CommitId> = reopened
-        .parents_of(rebased.name)?
-        .into_iter()
-        .map(|parent| parent.commit)
-        .collect();
+    let new_parents = reopened.parent_commits(rebased.name)?;
     let provenance = parent_sources(&reopened, entry, &entry.release_scheme(), &new_parents)?;
     let message = format!(
         "{}\n\nrebased onto {}",
@@ -2125,11 +2117,7 @@ fn run_release(
             // release is a flat merge of feature and fix branches, and the upstream
             // base is never a direct parent — it is reachable through every member.
             let (carried, members, audit_base) = if let Some((_, previous)) = &previous {
-                let parents: Vec<knives::ids::CommitId> = opened
-                    .parents_of(previous.as_str())?
-                    .into_iter()
-                    .map(|parent| parent.commit)
-                    .collect();
+                let parents = opened.parent_commits(previous.as_str())?;
                 let carried = parent_sources(&opened, &entry, &scheme, &parents)?;
                 let members = carried.clone();
                 let base = release::shared_base(&opened, previous, &trunk)?
@@ -2416,11 +2404,7 @@ fn record_cut_event(
     cut: &CompletedCut<'_>,
 ) -> anyhow::Result<()> {
     let opened = knives::jj::Repo::open(&entry.path)?;
-    let parents: Vec<knives::ids::CommitId> = opened
-        .parents_of(cut.created.as_str())?
-        .into_iter()
-        .map(|parent| parent.commit)
-        .collect();
+    let parents = opened.parent_commits(cut.created.as_str())?;
     let change = opened.change_id_of(cut.created.as_str())?;
     let members = parent_sources(&opened, entry, cut.scheme, &parents)?;
     let members_text = members_event_text(&members);
