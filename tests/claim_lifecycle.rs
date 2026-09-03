@@ -1,3 +1,12 @@
+//! The claim on a branch, from `start` to `finish`.
+//!
+//! One harness session resumes its own claim; another is refused and told who
+//! holds it; `--force` seizes and records the previous owner; possession of the
+//! workspace resumes by itself. Workspaces are adopted, refused or reported
+//! missing rather than rebuilt. Provenance is written atomically or not at all,
+//! and every run leaves its owner and workspace in the last-seen record before
+//! the command does anything else.
+
 #![allow(
     clippy::expect_used,
     clippy::indexing_slicing,

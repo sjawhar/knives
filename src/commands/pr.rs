@@ -143,7 +143,7 @@ pub fn render(report: &Report) -> String {
         if report.is_draft { " (draft)" } else { "" },
         report.branch,
         report.base.as_deref().unwrap_or("unknown"),
-        report.head.chars().take(12).collect::<String>(),
+        short_id(&report.head),
         if report.review.is_empty() {
             "-"
         } else {

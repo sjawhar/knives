@@ -16,7 +16,6 @@ mod forge_shim;
 mod lab;
 
 use forge_shim::{install_snapshot_gh_with_timeline, path_with_gh_shim, pull_record};
-
 use lab::{Lab, release_test_home};
 use std::process::Command;
 

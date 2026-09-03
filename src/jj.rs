@@ -429,6 +429,17 @@ impl Repo {
         Ok(activity)
     }
 
+    /// A local bookmark's tip, when `name` is one: `None` for a name that is
+    /// not a local bookmark and for a divergent one, which has no single tip.
+    /// One view lookup, for the callers that ask about one name.
+    pub fn local_bookmark_tip(&self, name: &str) -> Option<CommitId> {
+        self.repo
+            .view()
+            .get_local_bookmark(JjRefName::new(name))
+            .as_normal()
+            .map(commit_id)
+    }
+
     pub fn bookmark_tips(&self) -> Result<BookmarkTips, JjError> {
         let mut tips = BTreeMap::new();
         for (branch, targets) in self.repo.view().bookmarks() {
@@ -487,11 +498,8 @@ impl Repo {
         Ok(found)
     }
 
-    /// The parents of `revision`, each with the bookmarks that sit on it.
-    ///
-    /// The bookmark view is read once; a release merge has one parent per
-    /// member, and re-reading the view per parent scaled the cost with the
-    /// release's width for nothing.
+    /// The parents of `revision`, each with the bookmarks that sit on it. The
+    /// bookmark view is read once for every parent.
     pub fn parents_of(&self, revision: &str) -> Result<Vec<ReleaseParent>, JjError> {
         let tips = self.bookmark_tips()?;
         Ok(self

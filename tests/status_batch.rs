@@ -3,8 +3,10 @@
 //! One facts batch answers review age, checks, stated pulls and dependencies
 //! for every branch; a failed batch clears what it would have answered rather
 //! than inventing it. Landed verdicts come from the cache when the key matches,
-//! an unresolvable trunk fails loudly and touches no cache, and the probes
-//! answer the same in parallel as in series.
+//! a probe-free run keeps the landed section, an unresolvable trunk fails loudly
+//! and touches no cache, a measured gather reports the same facts with a total
+//! that covers its phases, and the probes answer the same in parallel as in
+//! series.
 
 #![allow(
     clippy::expect_used,
@@ -18,7 +20,7 @@ mod lab;
 #[path = "common/pulls.rs"]
 mod pulls;
 
-use knives::commands::status::{self};
+use knives::commands::status;
 use knives::config::Registry;
 use knives::forge::{
     ChecksSummary, Forge, ForgeError, PullFacts, PullRequest, PullSummary, RepoIdentity,

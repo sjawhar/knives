@@ -7,7 +7,6 @@ use crate::config::{RepoEntry, Role};
 use crate::detect::BookmarkTips;
 use crate::ids::{
     BookmarkRef, BranchName, BranchTarget, CommitId, ReleaseScheme, RepoName, is_release_name,
-    short_id,
 };
 use crate::jj::{self, Repo};
 use crate::store::Store;
@@ -28,7 +27,7 @@ pub struct Report {
 pub struct Row {
     pub branch: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub local: Option<String>,
+    pub local: Option<CommitId>,
     pub verdicts: Vec<Verdict>,
 }
 
@@ -42,16 +41,16 @@ pub enum Verdict {
     },
     Differs {
         remote: String,
-        remote_commit: String,
+        remote_commit: CommitId,
     },
     RemoteOnly {
         remote: String,
-        remote_commit: String,
+        remote_commit: CommitId,
     },
     GoneEverywhere,
     PullHeadDiffers {
         number: u64,
-        remote_commit: String,
+        remote_commit: CommitId,
     },
 }
 
@@ -112,12 +111,12 @@ fn reconcile_branch(input: &ReconcileInput<'_>, branch: &BranchName) -> Row {
         (Some(local), Some(remote_head)) if local == remote_head => vec![Verdict::InSync],
         (Some(_), Some(remote_head)) => vec![Verdict::Differs {
             remote,
-            remote_commit: remote_head.to_string(),
+            remote_commit: remote_head.clone(),
         }],
         (Some(_), None) => vec![Verdict::NotOnRemote { remote }],
         (None, Some(remote_head)) => vec![Verdict::RemoteOnly {
             remote,
-            remote_commit: remote_head.to_string(),
+            remote_commit: remote_head.clone(),
         }],
         (None, None) => vec![Verdict::GoneEverywhere],
     };
@@ -127,12 +126,12 @@ fn reconcile_branch(input: &ReconcileInput<'_>, branch: &BranchName) -> Row {
     {
         verdicts.push(Verdict::PullHeadDiffers {
             number: *number,
-            remote_commit: pull_head.to_string(),
+            remote_commit: pull_head.clone(),
         });
     }
     Row {
         branch: branch.to_string(),
-        local: local.map(ToString::to_string),
+        local: local.cloned(),
         verdicts,
     }
 }
@@ -252,7 +251,10 @@ pub fn render(report: &Report) -> String {
 
 /// The compact human line for one reconciliation row, reusable by estate reports.
 pub(crate) fn render_row(row: &Row) -> String {
-    let local = row.local.as_deref().map_or("no local bookmark", short_id);
+    let local = row
+        .local
+        .as_ref()
+        .map_or("no local bookmark", CommitId::short);
     let verdicts = row
         .verdicts
         .iter()
@@ -278,8 +280,8 @@ fn render_verdict(row: &Row, verdict: &Verdict) -> String {
             remote_commit,
         } => format!(
             "differs on {remote} (local {}, remote {})",
-            row.local.as_deref().map_or("", short_id),
-            short_id(remote_commit)
+            row.local.as_ref().map_or("", CommitId::short),
+            remote_commit.short()
         ),
         Verdict::RemoteOnly {
             remote,
@@ -287,7 +289,7 @@ fn render_verdict(row: &Row, verdict: &Verdict) -> String {
         } => format!(
             "{remote} still has {} at {} (no local bookmark)",
             row.branch,
-            short_id(remote_commit)
+            remote_commit.short()
         ),
         Verdict::GoneEverywhere => "gone everywhere".to_owned(),
         Verdict::PullHeadDiffers {
@@ -295,8 +297,8 @@ fn render_verdict(row: &Row, verdict: &Verdict) -> String {
             remote_commit,
         } => format!(
             "pull #{number} head is {} (local {})",
-            short_id(remote_commit),
-            row.local.as_deref().map_or("", short_id)
+            remote_commit.short(),
+            row.local.as_ref().map_or("", CommitId::short)
         ),
     }
 }

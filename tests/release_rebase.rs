@@ -1,7 +1,8 @@
 //! `knives release rebase`: the whole composition moves onto a newer trunk.
 //!
 //! Refused when every pin is frozen, when a stale parent cannot be mapped, when
-//! every member landed, or when the release is held only as a remote ref. A bare
+//! every member landed, or when the release is held only as a remote ref; a
+//! followed dated release that moved sideways is repaired with a merge. A bare
 //! rebase finds its target through the merged pull requests read from the
 //! snapshot and drops members whose work landed — by merge or by squash — unless
 //! `--no-drop` or work past the pull keeps them; a second rebase does not grow
@@ -22,13 +23,14 @@ mod lab;
 mod release_forge;
 
 use forge_shim::pull_record;
-
 use knives::jj::Repo;
 use lab::{
     Lab, ReleaseOutput, commit_at, extend_branch, file_at_revision, knives_release,
     release_parents, release_test_home, release_test_home_pinned,
 };
-use release_forge::{ReleaseWithSnapshotForgeInput, release_with_snapshot_forge};
+use release_forge::{
+    ReleaseWithSnapshotForgeInput, knives_release_with_forge, release_with_snapshot_forge,
+};
 
 #[test]
 fn release_rebase_refuses_when_every_pin_is_frozen() {
@@ -362,29 +364,6 @@ fn a_rebase_moves_the_whole_composition_onto_the_target() {
     );
 }
 
-/// Run the knives binary's release command against the complete snapshot forge
-/// protocol, with an isolated cache root.
-fn knives_release_with_forge(
-    lab: &Lab,
-    home: &tempfile::TempDir,
-    pulls: &str,
-    args: &[&str],
-) -> std::process::Output {
-    knives_release_with_forge_withheld_facts(ReleaseWithSnapshotForgeInput {
-        lab,
-        home,
-        pulls,
-        withheld_facts: &[],
-        args,
-    })
-}
-
-fn knives_release_with_forge_withheld_facts(
-    input: ReleaseWithSnapshotForgeInput<'_>,
-) -> std::process::Output {
-    release_with_snapshot_forge(input, ReleaseOutput::Text)
-}
-
 #[test]
 fn a_bare_rebase_with_no_merged_pull_request_requires_a_commit() {
     // Given: a release in hand, and a forge whose only pull request is still open.
@@ -549,12 +528,13 @@ fn a_bare_rebase_refuses_when_a_merged_candidate_fact_is_omitted() {
         pull_record(8, "MERGED", "feat/gamma", Some(second_merge.as_str()))
     );
 
-    let output = knives_release_with_forge_withheld_facts(ReleaseWithSnapshotForgeInput {
+    let output = release_with_snapshot_forge(ReleaseWithSnapshotForgeInput {
         lab: &lab,
         home: &home,
         pulls: &pulls,
         withheld_facts: &[7],
         args: &["rebase"],
+        output: ReleaseOutput::Text,
     });
 
     let stdout = String::from_utf8_lossy(&output.stdout);

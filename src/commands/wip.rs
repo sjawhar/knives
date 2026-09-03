@@ -125,10 +125,7 @@ pub fn render(report: &Report) -> String {
     for (repo, rows) in &report.workspaces {
         lines.push(format!("{repo}: {} workspace(s)", rows.len()));
         for (name, change) in rows {
-            lines.push(format!(
-                "  {name}  {}",
-                change.as_str().chars().take(12).collect::<String>()
-            ));
+            lines.push(format!("  {name}  {}", change.short()));
         }
     }
     if !report.findings.is_empty() {

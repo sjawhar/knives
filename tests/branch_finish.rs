@@ -19,7 +19,6 @@ mod forge_shim;
 mod lab;
 
 use forge_shim::{install_failing_gh, path_with_gh_shim};
-
 use knives::ids::BranchName;
 use knives::jj::Repo;
 use knives::store::{OwnerKind, Store};

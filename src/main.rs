@@ -1,34 +1,22 @@
 //! The `knives` binary.
 //!
-//! Dispatch, plus the verbs that are one jj sequence over a release rather than
-//! a report with a renderer: `cut`, `rebase`, `carries` and `members` decide
-//! here, and the release edits in [`release_edit`]. Every other command owns
-//! its own logic and returns an [`Exit`], so the match stays a table.
+//! Dispatch, the repository selection every command shares, and the report
+//! verbs whose work is gather, exit code, render: `status`, `sync`, `audit`,
+//! `consumers`, `pushed`, `pr`, `preflight`. The verbs that write — a cut, a
+//! rebase, a membership edit, a branch handed back — each own a module here:
+//! [`release_cut`], [`release_rebase`], [`release_edit`], [`branch_verbs`];
+//! the release's content reports are [`release_carries`]. Every command
+//! returns an [`Exit`], so the match stays a table.
 
-#[allow(
+#![allow(
     clippy::redundant_pub_crate,
-    reason = "a private module of the binary; crate visibility is what its callers in the root have"
+    reason = "the verb modules are private to the binary; crate visibility is what their callers in the root have"
 )]
+
 mod branch_verbs;
-#[allow(
-    clippy::redundant_pub_crate,
-    reason = "a private module of the binary; crate visibility is what its callers in the root have"
-)]
 mod release_carries;
-#[allow(
-    clippy::redundant_pub_crate,
-    reason = "a private module of the binary; crate visibility is what its callers in the root have"
-)]
 mod release_cut;
-#[allow(
-    clippy::redundant_pub_crate,
-    reason = "a private module of the binary; crate visibility is what its callers in the root have"
-)]
 mod release_edit;
-#[allow(
-    clippy::redundant_pub_crate,
-    reason = "a private module of the binary; crate visibility is what its callers in the root have"
-)]
 mod release_rebase;
 
 use std::process::ExitCode;
@@ -38,15 +26,14 @@ use clap::Parser as _;
 use knives::cli::{Cli, Command, Exit, Output, ReleaseAction};
 use knives::commands::claim::current_identity;
 use knives::commands::{
-    audit, consumers, hook, init, notch, pr, preflight, pushed, register, release, repos, start,
-    status, sync,
+    audit, consumers, hook, init, notch, pr, preflight, pushed, register, repos, start, status,
+    sync,
 };
 use knives::config::{default_config_path, load};
 use knives::forge::Forge;
 use knives::forge::github::CliForge;
-use knives::ids::{BranchName, BranchTarget, ReleaseScheme, RepoName};
+use knives::ids::{BranchName, BranchTarget, RepoName};
 use knives::ledger::{Ledger, Scribe};
-use knives::release_model::carried_from_tips;
 use knives::store::{Store, default_state_path};
 use release_carries::{
     CarriesInvocation, MembersInvocation, run_release_carries, run_release_members,
@@ -449,50 +436,6 @@ fn dispatch_release(
     }
 }
 
-/// A local bookmark's tip, when the name is one.
-fn bookmark_tip(
-    opened: &knives::jj::Repo,
-    name: &str,
-) -> anyhow::Result<Option<knives::ids::CommitId>> {
-    Ok(opened
-        .bookmark_tips()?
-        .get(&knives::ids::BookmarkRef::Local(
-            knives::ids::BranchName::new(name),
-        ))
-        .cloned())
-}
-
-/// Name each parent for the release description: the branch holding it, the
-/// trunk it descends from, or its own id when nothing else does.
-fn parent_sources(
-    opened: &knives::jj::Repo,
-    entry: &knives::config::RepoEntry,
-    scheme: &ReleaseScheme,
-    parents: &[knives::ids::CommitId],
-) -> anyhow::Result<Vec<(String, knives::ids::CommitId)>> {
-    let tips = opened.bookmark_tips()?;
-    let carried = carried_from_tips(&tips, entry.trunk(), scheme);
-    let trunk_tip = opened.resolve_commit(&entry.upstream_trunk()).ok();
-    let mut sources = Vec::new();
-    for commit in parents {
-        let named = carried
-            .iter()
-            .find(|(_, tip)| tip == commit)
-            .map(|(branch, _)| branch.clone());
-        let source = if let Some(named) = named {
-            named
-        } else if let Some(trunk) = &trunk_tip
-            && opened.is_ancestor(commit, trunk)?
-        {
-            entry.upstream_trunk()
-        } else {
-            commit.short().to_owned()
-        };
-        sources.push((source, commit.clone()));
-    }
-    Ok(sources)
-}
-
 /// The ledger writer for a command acting on `entry`.
 ///
 /// The owner is resolved exactly as a claim's is, so one agent's events and its
@@ -740,25 +683,6 @@ fn run_status(requested: Option<&str>, view: StatusView) -> anyhow::Result<Exit>
         })
     })?;
     Ok(worst)
-}
-
-/// The cut for `carried`. A commit two bookmarks hold — a branch and an anchor
-/// another agent left at its tip — is one parent, named twice in provenance.
-fn cut_request(name: String, carried: &[(String, knives::ids::CommitId)]) -> release::Cut {
-    let mut parents: Vec<knives::ids::CommitId> = Vec::with_capacity(carried.len());
-    for (_, commit) in carried {
-        if !parents.contains(commit) {
-            parents.push(commit.clone());
-        }
-    }
-    release::Cut {
-        name,
-        parents,
-        provenance: carried
-            .iter()
-            .map(|(branch, commit)| (commit.clone(), branch.clone()))
-            .collect(),
-    }
 }
 
 fn run_preflight(name: &str) -> anyhow::Result<Exit> {

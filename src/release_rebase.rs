@@ -14,7 +14,7 @@ use knives::ledger::Ledger;
 use knives::release_model::{BranchSuccessions, carried_from_tips, trunk_positions};
 
 use super::release_edit::{EditRecord, record_edit_event, release_is_locally_movable};
-use super::{bookmark_tip, cut_request, parent_sources, selected};
+use super::selected;
 
 /// Rebase the whole composition onto an upstream commit: `jj rebase -b <release> -d <target>`.
 ///
@@ -75,7 +75,7 @@ pub(crate) fn run_rebase(
             println!("{repo}: no release to move");
             continue;
         };
-        if !release_is_locally_movable(&opened, &repo, &release_name)? {
+        if !release_is_locally_movable(&opened, &repo, &release_name) {
             worst = worst.worst(Exit::Incomplete);
             continue;
         }
@@ -233,13 +233,11 @@ fn classify_rebase_parents(
     let (repo, entry, opened) = (context.repo, context.entry, context.opened);
     let scheme = entry.release_scheme();
     let parents = opened.parents_of(release_name)?;
-    let tips = opened.bookmark_tips()?;
     let mut members: Vec<knives::ids::CommitId> = Vec::new();
     let mut shed = 0usize;
     for parent in &parents {
         let held = parent.bookmarks.iter().any(|reference| {
-            tips.get(reference) == Some(&parent.commit)
-                && !knives::ids::is_release_name(reference.branch(), &scheme)
+            !knives::ids::is_release_name(reference.branch(), &scheme)
                 && reference.branch().as_str() != entry.trunk()
         });
         if held {
@@ -570,7 +568,7 @@ fn drop_landed_members(
     let mut kept = parents.clone();
     let mut deltas: Vec<String> = Vec::new();
     for pull in &destination.landed {
-        let Some(tip) = bookmark_tip(&opened, &pull.head_ref_name)? else {
+        let Some(tip) = opened.local_bookmark_tip(&pull.head_ref_name) else {
             continue;
         };
         if !parents.contains(&tip) {
@@ -600,12 +598,9 @@ fn drop_landed_members(
         return Ok(Exit::Incomplete);
     }
     let release = opened.resolve_commit(release_name)?;
-    let provenance = parent_sources(&opened, entry, &entry.release_scheme(), &kept)?;
+    let provenance = release::parent_sources(&opened, entry, &entry.release_scheme(), &kept)?;
     let delta = deltas.join("; ");
-    let message = format!(
-        "{}\n\n{delta}",
-        cut_request(release_name.to_owned(), &provenance).message()
-    );
+    let message = release::composition_message(release_name, &provenance, &delta);
     let created = knives::jj::write_release(
         &entry.path,
         &knives::jj::ReleaseWrite {
@@ -656,12 +651,10 @@ fn report_rebased_release(
     let reopened = knives::jj::Repo::open(&entry.path)?;
     let created = reopened.resolve_commit(rebased.name)?;
     let new_parents = reopened.parent_commits(rebased.name)?;
-    let provenance = parent_sources(&reopened, entry, &entry.release_scheme(), &new_parents)?;
-    let message = format!(
-        "{}\n\nrebased onto {}",
-        cut_request(rebased.name.to_owned(), &provenance).message(),
-        rebased.reference
-    );
+    let provenance =
+        release::parent_sources(&reopened, entry, &entry.release_scheme(), &new_parents)?;
+    let delta = format!("rebased onto {}", rebased.reference);
+    let message = release::composition_message(rebased.name, &provenance, &delta);
     let described = knives::jj::describe_commit(
         &entry.path,
         &created,
@@ -672,7 +665,6 @@ fn report_rebased_release(
     // last (branch, commit) pairing for the release would name commits no
     // longer among its parents, and the next edit could not tell a rebuilt
     // branch from a stranger.
-    let delta = format!("rebased onto {}", rebased.reference);
     record_edit_event(
         repo,
         entry,

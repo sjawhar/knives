@@ -17,7 +17,7 @@ use knives::release_model::{
 };
 
 use super::release_edit::recorded_parents;
-use super::{cut_request, parent_sources, scribe_for, selected};
+use super::{scribe_for, selected};
 
 pub(crate) enum ReleaseInvocation {
     Plan,
@@ -90,7 +90,7 @@ pub(crate) fn run_release(
             // base is never a direct parent — it is reachable through every member.
             let (carried, members, audit_base) = if let Some((_, previous)) = &previous {
                 let parents = opened.parent_commits(previous.as_str())?;
-                let carried = parent_sources(&opened, &entry, &scheme, &parents)?;
+                let carried = release::parent_sources(&opened, &entry, &scheme, &parents)?;
                 let members = carried.clone();
                 let base = release::shared_base(&opened, previous, &trunk)?
                     .unwrap_or_else(|| trunk.clone());
@@ -122,7 +122,7 @@ pub(crate) fn run_release(
                     .unwrap_or_else(|| trunk.clone());
                 (carried, members, base)
             };
-            let request = cut_request(name.clone(), &carried);
+            let request = release::Cut::from_carried(name.clone(), &carried);
             let mut candidate =
                 release::candidate_cut(&entry.path, &request, previous_commit.as_ref())?;
             // An audit error or failure simply DROPS the candidate: the merge
@@ -378,7 +378,7 @@ fn record_cut_event(
     let opened = knives::jj::Repo::open(&entry.path)?;
     let parents = opened.parent_commits(cut.created.as_str())?;
     let change = opened.change_id_of(cut.created.as_str())?;
-    let members = parent_sources(&opened, entry, cut.scheme, &parents)?;
+    let members = release::parent_sources(&opened, entry, cut.scheme, &parents)?;
     let members_text = members_event_text(&members);
     let mut evidence = vec![cut.created.as_str().to_owned()];
     evidence.extend(members.iter().map(|(_, commit)| commit.as_str().to_owned()));
@@ -426,7 +426,7 @@ fn record_cut_event(
             "cut {} as {} (change {}) with {} parent(s): {members_text}{delta}",
             cut.name,
             cut.created.short(),
-            change.as_str().chars().take(12).collect::<String>(),
+            change.short(),
             members.len()
         ),
         evidence,

@@ -5,9 +5,10 @@
 //! member that landed upstream is carried, one merged past the candidate's base
 //! is dropped; a stranded parent names where its branch went; a foreign pull
 //! request can be fetched and carried; the previous release's parents are
-//! carried verbatim by commit, whatever their bookmarks are doing. The shared
-//! base is the members' fork point, and a recut after upstream drift carries the
-//! recorded resolution.
+//! carried verbatim by commit, whatever their bookmarks are doing. The orphan
+//! gate refuses a recut that would strand release-lineage work, and a stated
+//! drop does not trip it. The shared base is the members' fork point, and a
+//! recut after upstream drift carries the recorded resolution.
 
 #![allow(
     clippy::expect_used,

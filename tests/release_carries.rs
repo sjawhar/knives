@@ -22,7 +22,6 @@ mod lab;
 mod release_forge;
 
 use forge_shim::{install_failing_gh, path_with_gh_shim, pull_record};
-
 use knives::jj::Repo;
 use lab::{
     Lab, ReleaseOutput, commit_at, extend_branch, home_after_first_cut, knives_release,
@@ -578,7 +577,14 @@ fn census_respects_an_open_pull() {
     let pulls = format!("[{}]", pull_record(17, "OPEN", "feat/beta", None));
 
     // When: the real CLI completes one forge snapshot for the census.
-    let output = knives_release_json_with_forge(&lab, &home, &pulls, &["carries", "--all"]);
+    let output = release_with_snapshot_forge(ReleaseWithSnapshotForgeInput {
+        lab: &lab,
+        home: &home,
+        pulls: &pulls,
+        withheld_facts: &[],
+        args: &["carries", "--all"],
+        output: ReleaseOutput::Json,
+    });
 
     // Then: the branch association is retained in the report and forbids an
     // orphan result despite every target being non-carried.
@@ -612,12 +618,13 @@ fn census_withholds_a_selected_pull_fact_as_unanswered() {
     let pulls = format!("[{}]", pull_record(17, "OPEN", "feat/beta", None));
 
     // When: the live batch withholds that selected pull request's fact.
-    let output = knives_release_json_with_forge_withheld_facts(ReleaseWithSnapshotForgeInput {
+    let output = release_with_snapshot_forge(ReleaseWithSnapshotForgeInput {
         lab: &lab,
         home: &home,
         pulls: &pulls,
         withheld_facts: &[17],
         args: &["carries", "--all"],
+        output: ReleaseOutput::Json,
     });
 
     // Then: discovery cannot make the pull state a deletion-safe answer.
@@ -691,29 +698,6 @@ fn knives_release_json(lab: &Lab, home: &tempfile::TempDir, args: &[&str]) -> st
     release_command(lab, home, ReleaseOutput::Json, args)
         .output()
         .expect("run knives release census")
-}
-
-/// Run census with the full snapshot forge protocol and ask the CLI for JSON so
-/// tests assert the report's machine contract rather than parsing prose.
-fn knives_release_json_with_forge(
-    lab: &Lab,
-    home: &tempfile::TempDir,
-    pulls: &str,
-    args: &[&str],
-) -> std::process::Output {
-    knives_release_json_with_forge_withheld_facts(ReleaseWithSnapshotForgeInput {
-        lab,
-        home,
-        pulls,
-        withheld_facts: &[],
-        args,
-    })
-}
-
-fn knives_release_json_with_forge_withheld_facts(
-    input: ReleaseWithSnapshotForgeInput<'_>,
-) -> std::process::Output {
-    release_with_snapshot_forge(input, ReleaseOutput::Json)
 }
 
 /// Run census with a forge that fails before returning any data.

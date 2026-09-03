@@ -4,7 +4,7 @@
     clippy::unreachable,
     reason = "fixture setup failures and JSON shape mismatches are test failures"
 )]
-// allow: SIZE_OK: 437 lines - real-binary adapter scenarios share one fixture and process harness.
+// allow: SIZE_OK: 610 lines - real-binary adapter scenarios share one fixture and process harness.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};

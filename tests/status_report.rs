@@ -20,8 +20,7 @@ mod lab;
 mod pulls;
 
 use forge_shim::{install_snapshot_gh, path_with_gh_shim, pull_record_with_fields};
-
-use knives::commands::status::{self};
+use knives::commands::status;
 use knives::config::RepoEntry;
 use knives::ids::BranchName;
 use knives::store::Store;
