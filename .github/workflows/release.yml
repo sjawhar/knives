@@ -4,6 +4,16 @@ on:
   push:
     branches: [main]
 
+# One release at a time. GitHub delivered one merge's push event twice, three
+# seconds apart; both runs computed the same version from the same tags and the
+# second died at `git tag` with "already exists". Two merges inside one build
+# window race the same way. Serialised, the later run sees the earlier one's tag
+# and steps aside; a third run supersedes the queued one, which is right, since
+# its head carries everything the queued one would have released.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 permissions:
   contents: write
   # Attestation lets a consumer verify the archive's provenance against GitHub's
@@ -53,6 +63,13 @@ jobs:
             git log "$latest_tag..HEAD" --format=%B |
               grep -qE '^[[:lower:]]+(\(.+\))?!:|BREAKING CHANGE'; then
             version="$(cog bump --dry-run --major)"
+          fi
+
+          # A run queued behind one that already cut this version: nothing to build.
+          if git ls-remote --exit-code --tags origin "refs/tags/${version}" >/dev/null 2>&1; then
+            echo "${version} is already tagged on origin; nothing to release"
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
 
           echo "version=${version#v}" >> "$GITHUB_OUTPUT"
@@ -152,11 +169,27 @@ jobs:
           cargo update --workspace
 
       - name: Commit and tag
+        id: tag
         run: |
           set -euo pipefail
           VERSION="${{ needs.version.outputs.version }}"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # The tags and trunk as they are now, not as they were at checkout: the
+          # build took minutes, and another run may have released meanwhile.
+          git fetch --quiet origin main "+refs/tags/*:refs/tags/*"
+          if git rev-parse --quiet --verify "refs/tags/v${VERSION}^{commit}" >/dev/null; then
+            echo "v${VERSION} is already tagged at $(git rev-parse --short "v${VERSION}"); another run released it"
+            echo "released=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [[ "$(git rev-parse origin/main)" != "$(git rev-parse HEAD)" ]]; then
+            # The archive was built from HEAD; releasing it as the tip of a trunk
+            # that has moved on would ship a tag whose content is not the tag's.
+            echo "main moved past ${GITHUB_SHA} to $(git rev-parse --short origin/main); its own run will release"
+            echo "released=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           git add Cargo.toml Cargo.lock package.json .claude-plugin/plugin.json
           # The first release takes its version from Cargo.toml, so the files can
           # already be at VERSION and there is nothing to commit. Tag either way.
@@ -166,20 +199,27 @@ jobs:
             git commit -m "chore: release v${VERSION} [skip ci]"
           fi
           git tag "v${VERSION}"
-          git push origin main --tags
+          # Atomic: the trunk and the tag land together or not at all. Separately, a
+          # rejected trunk push leaves a tag on a bump commit main never had.
+          git push --atomic origin main "refs/tags/v${VERSION}"
+          echo "released=true" >> "$GITHUB_OUTPUT"
 
       - uses: actions/download-artifact@v4
+        if: steps.tag.outputs.released == 'true'
 
       - name: Generate checksums
+        if: steps.tag.outputs.released == 'true'
         run: |
           set -euo pipefail
           (cd knives-linux-x86_64 && sha256sum ./*.tar.gz > ../SHA256SUMS)
 
       - uses: actions/attest-build-provenance@v2
+        if: steps.tag.outputs.released == 'true'
         with:
           subject-path: knives-linux-x86_64/knives-*-linux-x86_64.tar.gz
 
       - name: Create GitHub Release
+        if: steps.tag.outputs.released == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
