@@ -50,6 +50,9 @@ pub enum FindingKind {
     StackedHistory,
     /// A claim on a branch that no bookmark or workspace still names.
     OrphanedClaim,
+    /// The repository's own jj config states an `immutable_heads()` other than
+    /// the one its registry entry runs under (`RepoEntry::immutable_heads`).
+    ImmutableHeadsRule,
 }
 
 impl fmt::Display for FindingKind {
@@ -78,6 +81,7 @@ impl fmt::Display for FindingKind {
             Self::OrphanCommit => "orphan-commit",
             Self::StackedHistory => "stacked-history",
             Self::OrphanedClaim => "orphaned-claim",
+            Self::ImmutableHeadsRule => "immutable-heads-rule",
         };
         f.write_str(text)
     }
@@ -188,6 +192,7 @@ mod tests {
             FindingKind::OrphanCommit => "orphan-commit",
             FindingKind::StackedHistory => "stacked-history",
             FindingKind::OrphanedClaim => "orphaned-claim",
+            FindingKind::ImmutableHeadsRule => "immutable-heads-rule",
         }
     }
 
@@ -219,6 +224,7 @@ mod tests {
             FindingKind::OrphanCommit,
             FindingKind::StackedHistory,
             FindingKind::OrphanedClaim,
+            FindingKind::ImmutableHeadsRule,
         ];
         // When: each is rendered
         let labels: Vec<String> = kinds

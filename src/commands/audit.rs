@@ -175,7 +175,7 @@ fn add_unconfigured_remote_refs(
                             FindingKind::UnconfiguredRemote,
                             Subject::Bookmark(reference.clone()),
                             format!(
-                                "remote {remote} is not configured; this remote-tracking ref stays pinned immutable and a fetch will never update it"
+                                "remote {remote} is not configured; a fetch will never update this remote-tracking ref"
                             ),
                         )
                     }),

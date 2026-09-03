@@ -1425,8 +1425,13 @@ fn command<const N: usize>(program: &str, args: [&str; N]) -> Result<String, JjE
 }
 
 /// Runs a dynamically shaped command and returns both output streams on success.
+/// jj's colour is off here as in [`command_args`].
 fn command_output(program: &str, args: &[&str]) -> Result<(String, String), JjError> {
-    let output = Command::new(program)
+    let mut command = Command::new(program);
+    if program == "jj" {
+        command.arg("--color=never");
+    }
+    let output = command
         .args(args)
         .output()
         .map_err(|error| JjError::Process {
@@ -1446,8 +1451,14 @@ fn command_output(program: &str, args: &[&str]) -> Result<(String, String), JjEr
     ))
 }
 
+/// Every jj spawn here is parsed, so jj's colour is off whatever `ui.color`
+/// says: `always` would otherwise thread escape codes into ids and TOML.
 fn command_args(program: &str, args: &[&str]) -> Result<String, JjError> {
-    let output = Command::new(program)
+    let mut command = Command::new(program);
+    if program == "jj" {
+        command.arg("--color=never");
+    }
+    let output = command
         .args(args)
         .output()
         .map_err(|error| JjError::Process {
@@ -1872,13 +1883,16 @@ fn immutable_pins(repo: &dyn jj_lib::repo::Repo) -> Vec<ImmutablePin> {
     pins
 }
 
-/// Refuse to rewrite what jj itself would refuse to rewrite.
+/// Refuse to rewrite what jj's default configuration would refuse to rewrite.
 ///
 /// The jj CLI enforces `immutable_heads()` on every rewriting command; jj-lib
-/// deliberately does not, so this is the library-side equivalent under stock
-/// configuration. The reap flow DEPENDS on the refusal: a superseded cut
-/// pinned by someone else's untracked remote ref must land in
-/// `forgotten_only`, never be abandoned.
+/// deliberately does not, so this is the library-side equivalent — and it keeps
+/// jj's default pin set on purpose, stricter than the rule a managed fork runs
+/// under ([`crate::config::RepoEntry::immutable_heads`]): a rebase may move a member
+/// out from under a stale remote ref, but knives' own describe, abandon and reap
+/// never rewrite anything a remote still names. The reap flow DEPENDS on the
+/// refusal: a superseded cut pinned by someone else's untracked remote ref must
+/// land in `forgotten_only`, never be abandoned.
 fn assert_mutable(
     repo: &dyn jj_lib::repo::Repo,
     targets: &[jj_lib::commit::Commit],
@@ -1942,8 +1956,12 @@ fn commit_mutation(repo: &Repo, tx: Transaction, description: &str) -> Result<()
 /// `.jj/repo/config.toml`, then the user file (`$JJ_CONFIG` when set,
 /// otherwise `$XDG_CONFIG_HOME/jj/config.toml`, `~/.config/jj/config.toml`,
 /// `~/.jjconfig.toml`). Only `user.name` and `user.email` are read: every
-/// behavioral setting deliberately stays at jj's defaults (#18), but a commit
-/// written with an empty author could never be pushed.
+/// behavioral setting of knives' own in-process jj deliberately stays at jj's
+/// defaults (#18), but a commit written with an empty author could never be
+/// pushed. The one setting knives states for the *checkout* — the fork's
+/// `immutable_heads()`, written by `start` into the repository's own config for
+/// the jj CLI ([`crate::config::RepoEntry::immutable_heads`]) — is not read here: in-process rewrites
+/// keep jj's default pins ([`assert_mutable`]).
 fn repo_settings(path: &Path) -> Result<UserSettings, JjError> {
     let open_error = |detail: String| JjError::Open {
         path: path.display().to_string(),
@@ -1975,7 +1993,7 @@ fn toml_string(value: &str) -> String {
 fn resolved_identity(repo_path: &Path) -> Result<(Option<String>, Option<String>), JjError> {
     let mut name = identity_var("JJ_USER");
     let mut email = identity_var("JJ_EMAIL");
-    for file in identity_files(repo_path) {
+    for file in identity_files(repo_path)? {
         if name.is_some() && email.is_some() {
             break;
         }
@@ -1991,12 +2009,12 @@ fn identity_var(key: &str) -> Option<String> {
 }
 
 /// Identity sources after the environment, highest precedence first.
-fn identity_files(repo_path: &Path) -> Vec<PathBuf> {
-    let mut files = repo_config_files(repo_path);
+fn identity_files(repo_path: &Path) -> Result<Vec<PathBuf>, JjError> {
+    let mut files = repo_config_files(repo_path)?;
     if let Ok(paths) = std::env::var("JJ_CONFIG") {
         // Like jj, `JJ_CONFIG` replaces the user files entirely.
         files.extend(std::env::split_paths(&paths));
-        return files;
+        return Ok(files);
     }
     if let Some(home) = config_home() {
         files.push(home.join("jj/config.toml"));
@@ -2006,18 +2024,15 @@ fn identity_files(repo_path: &Path) -> Vec<PathBuf> {
     {
         files.push(PathBuf::from(home).join(".jjconfig.toml"));
     }
-    files
+    Ok(files)
 }
 
 /// Where this repository's own jj config may live, newest convention first.
-fn repo_config_files(repo_path: &Path) -> Vec<PathBuf> {
-    let mut repo_dir = repo_path.join(".jj/repo");
-    // A non-default workspace's `.jj/repo` is a file naming the real repo directory.
-    if repo_dir.is_file()
-        && let Ok(pointed) = std::fs::read_to_string(&repo_dir)
-    {
-        repo_dir = PathBuf::from(pointed.trim());
-    }
+///
+/// A non-default workspace's `.jj/repo` is a pointer to the real repository
+/// directory; `Repo::repository_store_path` resolves it the way jj does.
+fn repo_config_files(repo_path: &Path) -> Result<Vec<PathBuf>, JjError> {
+    let repo_dir = Repo::repository_store_path(repo_path)?;
     let mut files = Vec::new();
     // Newer jj keeps per-repo config under the user config directory, keyed by
     // the repository's `config-id`.
@@ -2029,7 +2044,138 @@ fn repo_config_files(repo_path: &Path) -> Vec<PathBuf> {
     }
     // Older jj kept it inside the repository.
     files.push(repo_dir.join("config.toml"));
-    files
+    Ok(files)
+}
+
+const IMMUTABLE_HEADS_KEY: &str = "revset-aliases.\"immutable_heads()\"";
+
+/// The `doc` knives leaves on the alias it writes, so a later `start` can tell
+/// its own rule from a human's and refresh it when the registry entry changes.
+pub const KNIVES_IMMUTABLE_HEADS_DOC: &str =
+    "written by `knives start` for this fork; delete this doc to state your own rule";
+
+/// An `immutable_heads()` the repository's own jj config states.
+#[derive(Debug)]
+pub struct RepoImmutableHeads {
+    pub rule: String,
+    /// The alias carries [`KNIVES_IMMUTABLE_HEADS_DOC`]: knives wrote it, and may rewrite it.
+    pub written_by_knives: bool,
+}
+
+/// The `immutable_heads()` the repository's own jj config states, if any.
+///
+/// The repo layer alone: jj resolves it above user config, so it is what jj
+/// enforces in this checkout. jj is asked rather than its config files
+/// re-discovered: it knows which file it reads for this repository (config-id
+/// or legacy) and prints the layer as TOML. `config list` mints no config id
+/// for a fresh repository; a legacy `.jj/repo/config.toml` is migrated by jj on
+/// first contact, a `status` read included. No `--config` is passed: jj omits
+/// repo keys a higher layer shadows, and the repo layer is what this answers about.
+pub fn repo_immutable_heads(repo: &Path) -> Result<Option<RepoImmutableHeads>, JjError> {
+    let Some(stated) = listed_immutable_heads(repo, "--repo")? else {
+        return Ok(None);
+    };
+    let written_by_knives = stated
+        .get("doc")
+        .and_then(toml::Value::as_str)
+        .is_some_and(|doc| doc == KNIVES_IMMUTABLE_HEADS_DOC);
+    Ok(Some(RepoImmutableHeads {
+        rule: alias_definition(&stated),
+        written_by_knives,
+    }))
+}
+
+/// The `immutable_heads()` jj's user layer states, if any — the rule a
+/// repo-level write shadows in this checkout.
+pub fn user_immutable_heads(repo: &Path) -> Result<Option<String>, JjError> {
+    Ok(listed_immutable_heads(repo, "--user")?
+        .as_ref()
+        .map(alias_definition))
+}
+
+/// The file jj reads this repository's own config from.
+pub fn repo_config_path(repo: &Path) -> Result<PathBuf, JjError> {
+    let repo = path(repo);
+    let file = command(
+        "jj",
+        [
+            "--repository",
+            &repo,
+            "--ignore-working-copy",
+            "config",
+            "path",
+            "--repo",
+        ],
+    )?;
+    Ok(PathBuf::from(file.trim()))
+}
+
+/// `jj config list <layer> revset-aliases."immutable_heads()"`, read as TOML:
+/// the alias value when the layer states one — a string, or jj's
+/// `{ definition, doc }` table.
+fn listed_immutable_heads(repo: &Path, layer: &str) -> Result<Option<toml::Value>, JjError> {
+    let repo = path(repo);
+    let listed = command(
+        "jj",
+        [
+            "--repository",
+            &repo,
+            "--ignore-working-copy",
+            "config",
+            "list",
+            layer,
+            IMMUTABLE_HEADS_KEY,
+        ],
+    )?;
+    let mut table: toml::Table =
+        listed
+            .parse()
+            .map_err(|error: toml::de::Error| JjError::Parse {
+                detail: format!("jj config list {layer}: {error}"),
+            })?;
+    let Some(toml::Value::Table(mut aliases)) = table.remove("revset-aliases") else {
+        return Ok(None);
+    };
+    Ok(aliases.remove("immutable_heads()"))
+}
+
+/// The revset an alias value defines: the string itself, or a table's
+/// `definition`; anything else is shown as jj printed it.
+fn alias_definition(alias: &toml::Value) -> String {
+    alias
+        .as_str()
+        .or_else(|| alias.get("definition").and_then(toml::Value::as_str))
+        .map_or_else(|| alias.to_string(), str::to_owned)
+}
+
+/// State `rule` as this fork's `immutable_heads()` in the repository's own jj
+/// config, in jj's table form with [`KNIVES_IMMUTABLE_HEADS_DOC`] as its `doc`.
+///
+/// Porcelain, because where jj keeps repo config — `$XDG_CONFIG_HOME/jj/repos/
+/// <config-id>/config.toml`, minting the id on first write — is the CLI's
+/// knowledge rather than the library's. Configuration, not the graph, so no
+/// operation is recorded and the working copy is left alone.
+pub fn set_repo_immutable_heads(repo: &Path, rule: &str) -> Result<(), JjError> {
+    let repo = path(repo);
+    let alias = format!(
+        "{{ definition = {}, doc = {} }}",
+        toml_string(rule),
+        toml_string(KNIVES_IMMUTABLE_HEADS_DOC)
+    );
+    command(
+        "jj",
+        [
+            "--repository",
+            &repo,
+            "--ignore-working-copy",
+            "config",
+            "set",
+            "--repo",
+            IMMUTABLE_HEADS_KEY,
+            &alias,
+        ],
+    )?;
+    Ok(())
 }
 
 /// `$XDG_CONFIG_HOME`, else `~/.config` — the directory jj's user config lives under.

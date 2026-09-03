@@ -16,7 +16,7 @@ use crate::ids::{
     BookmarkRef, BranchName, BranchTarget, CommitId, ReleaseScheme, RepoName, is_release_name,
     pull_number_from_bookmark, short_id,
 };
-use crate::jj::{JjError, Repo, probe_landed};
+use crate::jj::{JjError, Repo, probe_landed, repo_config_path, repo_immutable_heads};
 use crate::ledger::{Entry as Notch, Ledger};
 use crate::store::Store;
 
@@ -494,6 +494,53 @@ fn note_fetched_heads(report: &mut Report, fetched_heads: usize) {
     }
 }
 
+/// The repository's own jj config stating an `immutable_heads()` other than this
+/// entry's. Absence is not reported: `knives start` writes the entry's rule, and a
+/// rule nobody stated is nobody's decision to disagree with. A rule knives itself
+/// wrote earlier, now stale because the entry changed, is reported too — `start`
+/// is what refreshes it, and the detail says so.
+fn immutable_heads_finding(entry: &RepoEntry) -> Result<Option<Finding>, JjError> {
+    let rule = entry.immutable_heads();
+    let Some(stated) = repo_immutable_heads(&entry.path)? else {
+        return Ok(None);
+    };
+    if stated.rule == rule {
+        return Ok(None);
+    }
+    let detail = if stated.written_by_knives {
+        format!(
+            "repo config states immutable_heads() = `{}`, written by an earlier `knives start`; \
+             this entry's rule is `{rule}`, which the next `knives start` writes",
+            stated.rule
+        )
+    } else {
+        format!(
+            "repo config states immutable_heads() = `{}`; a managed fork runs under `{rule}`, \
+             which `knives start` writes where none is stated",
+            stated.rule
+        )
+    };
+    Ok(Some(Finding::new(
+        FindingKind::ImmutableHeadsRule,
+        Subject::File(repo_config_path(&entry.path)?.display().to_string()),
+        detail,
+    )))
+}
+
+/// A jj that cannot answer costs one problem line, not the repository's report.
+fn add_immutable_heads_finding(
+    report: &mut Report,
+    findings: &mut Vec<Finding>,
+    entry: &RepoEntry,
+) {
+    match immutable_heads_finding(entry) {
+        Ok(finding) => findings.extend(finding),
+        Err(error) => report
+            .problems
+            .push(format!("immutable_heads() rule not read: {error}")),
+    }
+}
+
 struct FoldOutput<'a> {
     report: &'a mut Report,
     findings: &'a mut Vec<Finding>,
@@ -839,6 +886,7 @@ pub fn gather_timed(
     let notches = notches_from_ledger(options.ledger, &mut report);
     report.repo_notches = repo_notches(&notches);
     note_fetched_heads(&mut report, fetched_heads);
+    add_immutable_heads_finding(&mut report, &mut findings, entry);
     timings.setup = phase.elapsed();
 
     let forge_started = std::time::Instant::now();

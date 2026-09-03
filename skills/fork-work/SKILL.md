@@ -105,11 +105,28 @@ has a knives command that does the same job safely:
 - **Do not keep two copies of a branch** — a "release-lineage" or "sibling" branch carrying
   a pull request's content on an older base so the release can carry it while the pull
   request branch is rebased for the maintainer. One branch is both the release member and the
-  pull request head. When a branch does get rebased onto a newer trunk, `knives release
-  advance <branch>` follows it (it matches by change id, which `jj rebase` keeps), and
-  `knives release rebase` moves the whole release to a newer trunk when that is decided. If a
-  branch does not compose into the release, the release is behind: move the release, do not
-  fork the branch.
+  pull request head. When members need a newer base, `knives release rebase` moves every
+  member and the release together; one branch alone is `jj rebase -b <branch> -d <trunk>`,
+  which keeps its change ids so `knives release advance <branch>` follows it. Either rebase
+  also moves whatever was built on the branch, other forks' untracked refs included — a
+  superseded release cut, somebody's pull request head — leaving the moved copies as
+  bookmark-less heads while the remote refs stay on the old commits. Those copies carry
+  nothing of yours; `jj abandon` them. If a branch does not compose into the release, the
+  release is behind: move the release, do not fork the branch.
+- **Do not `jj duplicate` a branch, and do not `--ignore-immutable` a rebase.** A managed
+  fork runs under `immutable_heads()` = trunk and tags, with the trunk named on every knives
+  remote (the `using-knives` skill and detector 11 in the design doc spell it out), which
+  `knives start` writes into the repository's jj config where none is stated; under it,
+  `Commit X is immutable` on a rebase means a trunk or a tag, and that refusal is the
+  protection — stop. Under jj's default rule the pin is instead a stale remote ref — a
+  superseded release cut a fetch re-materialized, another fork's pull request head — and
+  protects nothing, because a local rewrite never reaches a remote: run `knives start`, then
+  rebase again. If `knives status` shows `immutable-heads-rule`, the repository states a
+  different rule — read the finding before rebasing: knives refreshes its own stale write on
+  the next `start` and never overwrites a human's. Either way
+  `jj log -r 'immutable_heads() & descendants(<rev>)'` names the pin. A duplicate mints new
+  commit ids the release cannot match to the branch (`knives release advance --from` is the
+  repair), and `--ignore-immutable` rewrites the pinning commits themselves.
 - **Do not build a branch on top of a release merge.** A branch whose history carries a
   release cut carries every member of that cut, and a pull request from it asks the
   maintainer to review the whole fork. `knives status` and `knives preflight` report it as
