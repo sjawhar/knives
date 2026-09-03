@@ -9,7 +9,7 @@
 mod lab;
 
 use knives::jj::Repo;
-use lab::{operation_ids, release_test_home};
+use lab::{Lab, operation_ids, release_test_home};
 use serde_json::Value;
 use std::process::Command;
 #[test]
@@ -888,5 +888,51 @@ fn start_force_without_why_is_a_usage_error() {
         String::from_utf8_lossy(&output.stderr).contains("--why"),
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn cli_dispatch_records_an_observation_before_running_the_command() {
+    let lab = Lab::new();
+    let home = tempfile::tempdir().expect("config home");
+    std::fs::write(
+        home.path().join("repos.toml"),
+        format!(
+            "[repos.demo]\npath = \"{}\"\nupstream = \"{}\"\norigin = \"o\"\n",
+            lab.work.display(),
+            lab.upstream.display()
+        ),
+    )
+    .expect("write registry");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_knives"))
+        .args(["--text", "repos"])
+        .current_dir(&lab.work)
+        .env("KNIVES_CONFIG_HOME", home.path())
+        .env("KNIVES_OWNER", "agent-one")
+        .output()
+        .expect("run knives");
+
+    assert!(
+        output.status.success(),
+        "knives failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let seen: Value = serde_json::from_str(
+        &std::fs::read_to_string(home.path().join("seen.json"))
+            .expect("CLI dispatch records seen.json"),
+    )
+    .expect("seen JSON");
+    assert!(
+        seen["owners"]["harness-session"]["agent-one"]
+            .as_str()
+            .is_some_and(|timestamp| timestamp.parse::<jiff::Timestamp>().is_ok()),
+        "was: {seen}"
+    );
+    assert!(
+        seen["workspaces"]["demo/work"]
+            .as_str()
+            .is_some_and(|timestamp| timestamp.parse::<jiff::Timestamp>().is_ok()),
+        "was: {seen}"
     );
 }
