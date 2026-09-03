@@ -5,7 +5,7 @@
 //! decided. Planning is the default because everything else here writes: a cut
 //! names a composition, and `include`, `drop`, `advance` and `rebase` change
 //! one. Every one of them writes locally only, and none of them pushes.
-// allow: SIZE_OK: 2290 lines - the release lifecycle's plan, members, cut, edit, audit, reap, and rebase operations are one domain seam.
+// allow: SIZE_OK: 2395 lines - the release lifecycle's plan, members, cut, edit, audit, reap, and rebase operations are one domain seam.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -628,10 +628,14 @@ fn add_consumer_pins(
     scheme: &ReleaseScheme,
 ) {
     if consumers.slugs.is_empty() && consumers.locals.is_empty() {
-        // The command's central question. Unanswered is not success.
-        plan.problems.push(
-            "no consumers recorded, so pinned-ness is unknown; add `consumers = [...]` to \
-             the registry entry, or pass --consumer"
+        // An answer, not a gap: `consumers` is optional, and a fork consumed by an
+        // install rather than a lockfile has no consumer to record and no path to
+        // pass. Read as a problem, it refused every edit and rebase of such a fork
+        // while the same plan said nothing pinned it. The render's verdict line
+        // draws the conclusion; this note only says what was not consulted.
+        plan.notes.push(
+            "no consumers recorded; if a lockfile pins this fork, add `consumers = [...]` to \
+             the registry entry or pass --consumer"
                 .to_owned(),
         );
     }
@@ -656,7 +660,13 @@ fn add_consumer_pins(
         let scan = scan_consumer_for(consumer, slug.as_deref(), scheme);
         plan.pins.extend(scan.pins);
         plan.notes.extend(scan.notes);
-        plan.problems.extend(scan.problems);
+        // The scan speaks of one checkout; the plan may hold several, so the
+        // problem names which.
+        plan.problems.extend(
+            scan.problems
+                .into_iter()
+                .map(|problem| format!("{}: {problem}", consumer.display())),
+        );
     }
 }
 
@@ -681,7 +691,11 @@ struct LocalBranchNotes<'a> {
 /// `advance`. Saying so is what keeps "it exists locally" from silently
 /// meaning "it ships", without anyone having to remember to ask. Each note
 /// names the verb that would actually take the branch, so it never points at
-/// an `include` that verb would refuse.
+/// an `include` that verb would refuse. A branch the trunk already has, tip
+/// included, is said so whether or not the release carries a parent of it:
+/// `include` and `advance` both refuse a tip the trunk reaches
+/// ([`trunk_reaches`]), and the note that read one as merely absent sent the
+/// reader to `include` for a fix the trunk had, when a rebase was the way in.
 fn local_branch_notes(input: &LocalBranchNotes<'_>) -> anyhow::Result<Vec<String>> {
     let LocalBranchNotes {
         repo,
@@ -722,6 +736,26 @@ fn local_branch_notes(input: &LocalBranchNotes<'_>) -> anyhow::Result<Vec<String
         }
         let succession = MemberSuccession::of(repo, trunks, tip)?;
         let lookup = member_parents(&succession, &parents, recorded, branch)?;
+        if succession.tip_landed()? {
+            notes.push(lookup.parents.first().map_or_else(
+                || {
+                    format!(
+                        "{branch} is not in {reference}: the trunk already has it, merged after \
+                         the release's base; `knives release rebase` onto a trunk that has it \
+                         brings it in"
+                    )
+                },
+                |parent| {
+                    format!(
+                        "{branch} was released as {} in {reference} and the trunk now has the \
+                         whole branch, tip included; `knives release rebase` retires the landed \
+                         parent and brings the rest in",
+                        parent.short()
+                    )
+                },
+            ));
+            continue;
+        }
         notes.push(match (lookup.parents.first(), lookup.evidence) {
             (None, _) => {
                 format!("{branch} is not in {reference}; `knives release include {branch}` adds it")
@@ -1012,9 +1046,15 @@ pub fn render(plan: &Plan) -> String {
         lines.push(format!("  !! {}", finding.detail));
     }
 
-    lines.push("  pinned by:".to_owned());
-    lines.push(crate::pins::render(&plan.pins));
-    lines.push(
+    // The verdict line below says "nothing pins this release" on its own; a
+    // heading over an empty list added a line about a consumer that may not exist.
+    if !plan.pins.is_empty() {
+        lines.push("  pinned by:".to_owned());
+        lines.push(crate::pins::render(&plan.pins));
+    }
+    // A consumer that could not be consulted may hold the pin the verdict would
+    // deny; the census refuses the same no-pin claim after a failed scan.
+    lines.push(if plan.problems.is_empty() {
         match repair_effect(&plan.pins, BookmarkRef::parse(release).branch()) {
             RepairEffect::RepairInPlace => {
                 "  at least one consumer follows the branch: repair in place, no new dated name"
@@ -1026,8 +1066,10 @@ pub fn render(plan: &Plan) -> String {
                     .to_owned()
             }
             RepairEffect::Unpinned => "  nothing pins this release: either is safe".to_owned(),
-        },
-    );
+        }
+    } else {
+        "  pinned-ness unknown: a consumer could not be consulted (see above)".to_owned()
+    });
     lines.push(
         "  planning by default. `knives release cut [name]` names a new cut of this \
            composition verbatim; `include`, `drop` and `advance` edit it. Nothing here \

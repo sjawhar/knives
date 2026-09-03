@@ -262,25 +262,8 @@ fn newest_live(
 }
 
 fn consumer_row(consumer: &Path, context: &ConsumerContext<'_>) -> ConsumerRow {
-    let consumer_name = consumer.display().to_string();
-    if !consumer.exists() {
-        return ConsumerRow {
-            consumer: consumer_name,
-            pins: Vec::new(),
-            notes: Vec::new(),
-            problem: Some("not found".to_owned()),
-        };
-    }
-    if !consumer.is_dir() {
-        return ConsumerRow {
-            consumer: consumer_name,
-            pins: Vec::new(),
-            notes: Vec::new(),
-            problem: Some("not a directory".to_owned()),
-        };
-    }
     consumer_row_from_scan(
-        consumer_name,
+        consumer.display().to_string(),
         scan_consumer_for(consumer, context.slug, context.scheme),
         context,
     )

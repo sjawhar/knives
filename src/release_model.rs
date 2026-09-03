@@ -299,6 +299,27 @@ pub enum Relation {
     Unrelated,
 }
 
+/// Whether any trunk position already reaches `commit`.
+///
+/// One answer for every verb: a commit the trunk reaches is a base, never a
+/// member. Taken as a parent — by `include`, or by `advance` moving a member
+/// onto a tip the trunk has — it makes the shape a legacy cut has, and
+/// [`shared_base`](crate::commands::release::shared_base) then measures every
+/// other member from it; the next rebase retires it as redundant. A rebase onto
+/// a trunk that has it is the way in.
+pub fn trunk_reaches(
+    repo: &Repo,
+    trunks: &[CommitId],
+    commit: &CommitId,
+) -> Result<bool, jj::JjError> {
+    for trunk in trunks {
+        if repo.is_ancestor(commit, trunk)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// A branch tip's own changes, computed once so every released parent can be
 /// tested against it without walking the branch again.
 ///
@@ -351,10 +372,8 @@ impl<'a> MemberSuccession<'a> {
         if parent == self.tip {
             return Ok(Relation::AtTip);
         }
-        for trunk in self.trunks {
-            if self.repo.is_ancestor(parent, trunk)? {
-                return Ok(Relation::Landed);
-            }
+        if trunk_reaches(self.repo, self.trunks, parent)? {
+            return Ok(Relation::Landed);
         }
         if self.repo.is_ancestor(parent, self.tip)? {
             return Ok(Relation::Succeeds);
@@ -374,6 +393,13 @@ impl<'a> MemberSuccession<'a> {
                 Relation::Unrelated
             },
         )
+    }
+
+    /// Whether the trunk already has the tip itself: the whole branch, merged by
+    /// merge commit. A release cut on an older base does not have it, and no
+    /// verb should take it as a member — see [`trunk_reaches`].
+    pub fn tip_landed(&self) -> Result<bool, jj::JjError> {
+        trunk_reaches(self.repo, self.trunks, self.tip)
     }
 
     /// Whether the tip is a later state of the member whose released parent is
