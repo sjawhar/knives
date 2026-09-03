@@ -28,7 +28,7 @@ use crate::detect::landed::RebaseOutcome;
 use crate::detect::stale_parents::{BookmarkTips, ReleaseParent};
 use crate::ids::{
     BookmarkRef, BranchName, ChangeId, CommitId, ReleaseScheme, RemoteName, WorkspaceName,
-    is_our_release, pull_number_from_bookmark,
+    is_our_release, pull_number_from_bookmark, short_id,
 };
 
 #[derive(Debug, Error)]
@@ -76,11 +76,6 @@ pub enum JjError {
 
 /// Bound the passive operation walk so status stays proportional to current work.
 pub const MAX_ACTIVITY_OPS: usize = 200;
-
-/// Twelve characters is what jj shows, and a full id is correct and unreadable.
-fn short_id(id: &str) -> String {
-    id.chars().take(12).collect()
-}
 
 #[derive(Debug)]
 pub struct Repo {
@@ -1800,7 +1795,7 @@ fn assert_mutable(
                 })?;
             if pinned {
                 return Err(JjError::Immutable {
-                    commit: short_id(&target.id().to_string()),
+                    commit: short_id(&target.id().to_string()).to_owned(),
                     pin: pin.label.clone(),
                 });
             }

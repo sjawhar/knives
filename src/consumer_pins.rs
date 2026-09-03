@@ -12,7 +12,7 @@ use crate::forge_cache::{
     CONSUMER_SCHEMA_VERSION, ConsumerCache, consumer_cache_path, load_consumer_cache,
     write_consumer_cache,
 };
-use crate::ids::ReleaseScheme;
+use crate::ids::{ReleaseScheme, short_id};
 use crate::jj::{self, OriginTrunk};
 use crate::pins::PIN_FILES;
 use crate::release_model::{ConsumerScan, scan_consumer_texts};
@@ -123,7 +123,7 @@ pub fn scan_consumer_slug_with_heads(
                 ));
                 result.notes.push(format!(
                     "{slug}: forge unreachable; pins answered from cache at {}",
-                    short_text(&cache.commit)
+                    short_id(&cache.commit)
                 ));
             }
             result
@@ -233,10 +233,6 @@ fn extend_working_copy_pins(
                 .push(format!("could not read {name}: {error}")),
         }
     }
-}
-
-fn short_text(value: &str) -> String {
-    value.chars().take(12).collect()
 }
 
 #[cfg(test)]

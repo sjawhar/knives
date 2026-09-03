@@ -1005,15 +1005,15 @@ fn classify_rebase_parents(
                 "{repo}: refusing to rebase {release_name}: parent {} is stale{no_bookmark}; it \
                  was {moved}. `knives release advance` moves the member to its branch, then \
                  re-run; carrying the old commit could ship pre-rewrite code.",
-                short12(&parent.commit),
+                parent.commit.short(),
             ),
             None => eprintln!(
                 "{repo}: refusing to rebase {release_name}: parent {} is stale{no_bookmark}, and \
                  no local branch continues it. Drop it from the release (`knives release drop \
                  {}`) or restore its branch, then re-run; carrying it could ship pre-rewrite \
                  code.",
-                short12(&parent.commit),
-                short12(&parent.commit),
+                parent.commit.short(),
+                parent.commit.short(),
             ),
         }
         return Ok(None);
@@ -1260,9 +1260,9 @@ fn covering_commit(
     println!(
         "{repo}: every merged pull request ({}) is in {trunk} by {}; rebasing onto it",
         numbered(&numbers),
-        short12(&covering)
+        covering.short()
     );
-    let label = short12(&covering);
+    let label = covering.short().to_owned();
     Ok(Some((covering, label)))
 }
 
@@ -1433,7 +1433,7 @@ fn report_rebased_release(
         "{repo}: {} rebased onto {} ({}), {} member(s) moved with it{stale_bases}",
         rebased.name,
         rebased.reference,
-        short12(rebased.onto),
+        rebased.onto.short(),
         new_parents.len()
     );
     match knives::jj::conflicted_files(&entry.path, described.as_str()) {
@@ -1459,7 +1459,7 @@ fn stale_parent_moved_branches(
     let moved: Vec<String> = BranchSuccessions::of(opened, &trunks, &branches)?
         .successors_of(parent)?
         .into_iter()
-        .map(|(branch, tip)| format!("{branch} (now {})", short12(&tip)))
+        .map(|(branch, tip)| format!("{branch} (now {})", tip.short()))
         .collect();
     Ok((!moved.is_empty()).then(|| moved.join(", ")))
 }
@@ -1501,17 +1501,11 @@ fn parent_sources(
         {
             entry.upstream_trunk()
         } else {
-            short12(commit)
+            commit.short().to_owned()
         };
         sources.push((source, commit.clone()));
     }
     Ok(sources)
-}
-
-/// A commit id at the length this program shows them: enough to be unique in a
-/// fork, short enough to read in a line of prose.
-fn short12(commit: &knives::ids::CommitId) -> String {
-    commit.as_str().chars().take(12).collect()
 }
 
 /// The ledger writer for a command acting on `entry`.
@@ -2453,7 +2447,7 @@ fn record_cut_event(
         text: format!(
             "cut {} as {} (change {}) with {} parent(s): {members_text}{delta}",
             cut.name,
-            short12(cut.created),
+            cut.created.short(),
             change.as_str().chars().take(12).collect::<String>(),
             members.len()
         ),
@@ -2480,7 +2474,7 @@ fn report_completed_cut(
     println!(
         "  cut {} as {} with {} parent(s), not pushed",
         cut.name,
-        short12(cut.created),
+        cut.created.short(),
         cut.request.parents.len()
     );
     match knives::jj::conflicted_files(&entry.path, cut.created.as_str()) {
@@ -2549,7 +2543,7 @@ fn report_orphaned_cut(
         orphaned.previous
     );
     for commit in &orphaned.commits {
-        println!("    {}", short12(commit));
+        println!("    {}", commit.short());
     }
     println!("  re-run with --allow-drop to state this is intended");
     Some(Exit::Incomplete)
@@ -2698,7 +2692,7 @@ fn print_previous_release_position(opened: &knives::jj::Repo, entry: &knives::co
     if let Some((reference, commit)) = release::previous_position(opened, entry) {
         println!(
             "  previous release position: {reference} at {}",
-            short12(&commit)
+            commit.short()
         );
     } else if matches!(entry.release_scheme(), ReleaseScheme::Fixed(_)) {
         println!("  no previous release position: this is the first cut of the fixed branch");

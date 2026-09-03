@@ -7,6 +7,7 @@ use crate::config::{RepoEntry, Role};
 use crate::detect::BookmarkTips;
 use crate::ids::{
     BookmarkRef, BranchName, BranchTarget, CommitId, ReleaseScheme, RepoName, is_release_name,
+    short_id,
 };
 use crate::jj::{self, Repo};
 use crate::store::Store;
@@ -251,10 +252,7 @@ pub fn render(report: &Report) -> String {
 
 /// The compact human line for one reconciliation row, reusable by estate reports.
 pub(crate) fn render_row(row: &Row) -> String {
-    let local = row
-        .local
-        .as_deref()
-        .map_or_else(|| "no local bookmark".to_owned(), short);
+    let local = row.local.as_deref().map_or("no local bookmark", short_id);
     let verdicts = row
         .verdicts
         .iter()
@@ -280,8 +278,8 @@ fn render_verdict(row: &Row, verdict: &Verdict) -> String {
             remote_commit,
         } => format!(
             "differs on {remote} (local {}, remote {})",
-            row.local.as_deref().map_or_else(String::new, short),
-            short(remote_commit)
+            row.local.as_deref().map_or("", short_id),
+            short_id(remote_commit)
         ),
         Verdict::RemoteOnly {
             remote,
@@ -289,7 +287,7 @@ fn render_verdict(row: &Row, verdict: &Verdict) -> String {
         } => format!(
             "{remote} still has {} at {} (no local bookmark)",
             row.branch,
-            short(remote_commit)
+            short_id(remote_commit)
         ),
         Verdict::GoneEverywhere => "gone everywhere".to_owned(),
         Verdict::PullHeadDiffers {
@@ -297,12 +295,8 @@ fn render_verdict(row: &Row, verdict: &Verdict) -> String {
             remote_commit,
         } => format!(
             "pull #{number} head is {} (local {})",
-            short(remote_commit),
-            row.local.as_deref().map_or_else(String::new, short)
+            short_id(remote_commit),
+            row.local.as_deref().map_or("", short_id)
         ),
     }
-}
-
-fn short(value: &str) -> String {
-    value.chars().take(12).collect()
 }

@@ -180,7 +180,7 @@ pub fn trunk_lag(repo: &Repo, release: Option<&str>, upstream_trunk: &str) -> Op
     }
     Some(format!(
         "{release} does not contain the upstream trunk ({})",
-        short(&trunk)
+        trunk.short()
     ))
 }
 
@@ -466,7 +466,7 @@ pub fn reap_superseded(
                 ),
             )?;
             if !descendants.is_empty() {
-                let sample: Vec<String> = descendants.iter().take(3).map(short).collect();
+                let sample: Vec<&str> = descendants.iter().take(3).map(CommitId::short).collect();
                 report.kept.push((
                     name.clone(),
                     format!("has local descendant(s): {}", sample.join(", ")),
@@ -578,8 +578,8 @@ pub fn plan(
                 format!(
                     "parent {} is an older upstream base superseded by {}; \
                      `knives release rebase` self-heals this",
-                    short(&parent.commit),
-                    base.as_ref().map_or_else(String::new, short),
+                    parent.commit.short(),
+                    base.as_ref().map_or("", CommitId::short),
                 ),
             ));
         }
@@ -733,13 +733,13 @@ fn local_branch_notes(input: &LocalBranchNotes<'_>) -> anyhow::Result<Vec<String
             (Some(parent), MemberEvidence::Record) => format!(
                 "{branch} was released as {} in {reference} and has since been rebased outside \
                  jj; `knives release advance {branch}` moves it through that record",
-                short(parent)
+                parent.short()
             ),
             (Some(parent), MemberEvidence::LandedRecord) => format!(
                 "{branch}'s released parent {} in {reference} has landed upstream and the \
                  branch kept going; `knives release advance {branch}` moves it, \
                  `knives release rebase` retires the landed parent",
-                short(parent)
+                parent.short()
             ),
         });
     }
@@ -757,11 +757,7 @@ fn parent_label(parent: &ReleaseParent) -> String {
             BookmarkRef::Local(branch) => Some(branch.to_string()),
             BookmarkRef::Remote { .. } => None,
         })
-        .unwrap_or_else(|| short(&parent.commit))
-}
-
-fn short(commit: &CommitId) -> String {
-    commit.as_str().chars().take(12).collect()
+        .unwrap_or_else(|| parent.commit.short().to_owned())
 }
 
 /// One direct parent of a release, and what still identifies its commit.
@@ -806,7 +802,7 @@ fn member_row(
     let advanced = successions
         .successors_of(&parent.commit)?
         .into_iter()
-        .map(|(branch, tip)| format!("{branch} advanced to {}", short(&tip)))
+        .map(|(branch, tip)| format!("{branch} advanced to {}", tip.short()))
         .collect();
     let base_parent = trunk.map_or(Ok(false), |trunk| opened.is_ancestor(&parent.commit, trunk))?;
     Ok(MemberRow {
@@ -831,8 +827,8 @@ fn member_label(member: &MemberRow) -> String {
             .map(|(branch, _)| branch)
     });
     source.map_or_else(
-        || short(&member.commit),
-        |source| format!("{source}@{}", short(&member.commit)),
+        || member.commit.short().to_owned(),
+        |source| format!("{source}@{}", member.commit.short()),
     )
 }
 
@@ -907,7 +903,7 @@ pub fn render_members(report: &MembersReport) -> String {
     let mut lines = vec![format!(
         "{} @ {} — {} parents",
         report.release,
-        short(&report.commit),
+        report.commit.short(),
         report.parent_count
     )];
     for member in &report.members {
@@ -924,7 +920,7 @@ pub fn render_members(report: &MembersReport) -> String {
         if member.base_parent {
             description.push_str(" (base parent)");
         }
-        lines.push(format!("- {} {description}", short(&member.commit)));
+        lines.push(format!("- {} {description}", member.commit.short()));
     }
     if let Some(audit) = &report.audit {
         for name in &audit.carried {
@@ -1001,7 +997,7 @@ pub fn render(plan: &Plan) -> String {
         } else {
             names.join(", ")
         };
-        lines.push(format!("    {}  {held}", short(commit)));
+        lines.push(format!("    {}  {held}", commit.short()));
     }
 
     if plan.stale.is_empty() {
@@ -1650,7 +1646,7 @@ pub fn uncarried_recorded_members(
         if repo.resolve_commit(member.as_str()).is_err() {
             check
                 .dropped
-                .push(format!("{} (not known to this repository)", short(member)));
+                .push(format!("{} (not known to this repository)", member.short()));
             continue;
         }
         let mut carried = repo.is_ancestor(member, delta.base)?;
@@ -1694,8 +1690,8 @@ fn recorded_member_name(commit: &CommitId, tips: &BookmarkTips) -> String {
         BookmarkRef::Local(_) | BookmarkRef::Remote { .. } => None,
     });
     named.map_or_else(
-        || short(commit),
-        |branch| format!("{branch}@{}", short(commit)),
+        || commit.short().to_owned(),
+        |branch| format!("{branch}@{}", commit.short()),
     )
 }
 

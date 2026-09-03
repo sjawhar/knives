@@ -129,14 +129,14 @@ fn scan_releases(
                 .map(|(branch, tip)| {
                     format!(
                         "{branch} is now {}; `knives release advance {branch}` moves the member",
-                        super::short(tip.as_str())
+                        tip.short()
                     )
                 })
                 .collect::<Vec<_>>()
                 .join(", ");
             finding.detail = format!(
                 "parent {} is no longer the tip of its branch ({where_now})",
-                super::short(parent.as_str())
+                parent.short()
             );
         }
         findings.extend(stale);

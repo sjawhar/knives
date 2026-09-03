@@ -21,7 +21,7 @@ use crate::ids::{BookmarkRef, BranchName, CommitId};
 use crate::jj::Repo;
 
 use super::rows::pull_summary_for;
-use super::short;
+use crate::ids::short_id;
 
 #[derive(Clone, Copy)]
 pub(super) struct MergedLandedInput<'a> {
@@ -113,7 +113,7 @@ pub(super) fn settle_merged_landed(
                  `knives sync` fetches it",
                 row.name,
                 summary.number,
-                short(landing)
+                short_id(landing)
             ));
             continue;
         };
@@ -127,7 +127,7 @@ pub(super) fn settle_merged_landed(
                  fetches it",
                 row.name,
                 summary.number,
-                short(&summary.head_ref_oid)
+                short_id(&summary.head_ref_oid)
             ));
             continue;
         };
@@ -151,8 +151,8 @@ pub(super) fn settle_merged_landed(
                      tip the merged head {} does not reach; {verdict}",
                     row.name,
                     summary.number,
-                    short(landing),
-                    short(&summary.head_ref_oid)
+                    short_id(landing),
+                    short_id(&summary.head_ref_oid)
                 ));
             }
             None => {}

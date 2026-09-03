@@ -9,7 +9,7 @@ use crate::config::{RepoEntry, Role};
 use crate::consumer_pins::{
     ConsumerHeadMemo, ConsumerPinSource, scan_consumer_for, scan_consumer_slug_with_heads,
 };
-use crate::ids::{CommitId, ReleaseScheme, RepoName, strict_dated_release};
+use crate::ids::{CommitId, ReleaseScheme, RepoName, short_id, strict_dated_release};
 use crate::jj::{self, Repo};
 use crate::pins::{Pin, PinVerdict};
 use crate::release_model::{ConsumerScan, newest_release, repo_slug};
@@ -420,7 +420,7 @@ pub fn render(report: &Report) -> String {
                 "{}: newest {} @ {} (release remote, {})",
                 report.fork,
                 newest.reference,
-                short(&newest.commit),
+                short_id(&newest.commit),
                 newest.source
             )
         },
@@ -444,7 +444,7 @@ pub fn render(report: &Report) -> String {
                     pin.kind,
                     pin.locked
                         .as_deref()
-                        .map_or_else(String::new, |locked| format!("  @{}", short(locked))),
+                        .map_or_else(String::new, |locked| format!("  @{}", short_id(locked))),
                     pin.verdict
                         .as_ref()
                         .map_or_else(|| "unclassified".to_owned(), render_verdict)
@@ -464,15 +464,13 @@ pub fn render(report: &Report) -> String {
 fn render_verdict(verdict: &PinVerdict) -> String {
     match verdict {
         PinVerdict::Current => "current".to_owned(),
-        PinVerdict::StaleLock { expected } => format!("stale lock: expected @{}", short(expected)),
+        PinVerdict::StaleLock { expected } => {
+            format!("stale lock: expected @{}", short_id(expected))
+        }
         PinVerdict::BehindName { newest } => format!("behind: newest is {newest}"),
         PinVerdict::UnknownName => "unknown release".to_owned(),
         PinVerdict::OffScheme => "off-scheme reference".to_owned(),
     }
-}
-
-fn short(value: &str) -> String {
-    value.chars().take(12).collect()
 }
 
 #[cfg(test)]

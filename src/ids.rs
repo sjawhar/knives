@@ -40,13 +40,30 @@ string_id!(
 );
 string_id!(CommitId, "One concrete commit. A change may have several.");
 
-impl CommitId {
-    /// The prefix this program shows: enough to be unique in a fork, short
-    /// enough to read in a line of prose. Commit ids are ASCII hex, so the
-    /// slice is a slice.
+impl ChangeId {
+    /// The prefix this program shows; see [`short_id`].
     pub fn short(&self) -> &str {
-        self.0.get(..12).unwrap_or(&self.0)
+        short_id(&self.0)
     }
+}
+
+impl CommitId {
+    /// The prefix this program shows; see [`short_id`].
+    pub fn short(&self) -> &str {
+        short_id(&self.0)
+    }
+}
+
+/// The first twelve characters of an identifier: what jj shows, enough to be
+/// unique in a fork, short enough to read in a line of prose. A shorter id is
+/// returned whole.
+///
+/// For an id the program holds as text — a forge oid, a lockfile lock, a
+/// recorded anchor. [`CommitId::short`] and [`ChangeId::short`] are this for
+/// the ids it has typed. Only identifiers are shortened this way: a truncated
+/// branch name or file path names something that does not exist.
+pub fn short_id(id: &str) -> &str {
+    id.char_indices().nth(12).map_or(id, |(end, _)| &id[..end])
 }
 string_id!(RepoName, "A managed repo's name in the registry.");
 string_id!(
@@ -293,6 +310,23 @@ mod tests {
         // A real branch that merely starts with the same letters is not a head.
         assert_eq!(pull_number_from_bookmark("pr-fix/thing"), None);
         assert_eq!(pull_number_from_bookmark("feat/alpha"), None);
+    }
+
+    #[test]
+    fn short_id_keeps_twelve_characters_and_shorter_or_wide_text_whole() {
+        use super::{CommitId, short_id};
+        // Given: a full commit id, an already-short one, and text a notch
+        // anchor could carry after sanitising: a multibyte character at the cut.
+        assert_eq!(short_id("0123456789abcdef0123"), "0123456789ab");
+        assert_eq!(short_id("0123456789ab"), "0123456789ab");
+        assert_eq!(short_id("abc"), "abc");
+        assert_eq!(short_id(""), "");
+        assert_eq!(short_id("0123456789a\u{fffd}bc"), "0123456789a\u{fffd}");
+        // Then: a typed id shortens the same way, without allocating.
+        assert_eq!(
+            CommitId::new("0123456789abcdef0123").short(),
+            "0123456789ab"
+        );
     }
 
     #[test]

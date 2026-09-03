@@ -9,7 +9,9 @@ use crate::commands::pushed::{self, ReconcileInput, Row};
 use crate::config::{RepoEntry, Role};
 use crate::detect::{BookmarkTips, Finding, FindingKind, Subject};
 use crate::forge::{Forge, PullRequest};
-use crate::ids::{BookmarkRef, BranchName, BranchTarget, CommitId, RepoName, is_release_name};
+use crate::ids::{
+    BookmarkRef, BranchName, BranchTarget, CommitId, RepoName, is_release_name, short_id,
+};
 use crate::jj::{self, Repo};
 use crate::ledger::{Entry, Ledger};
 use crate::snapshot::{self, SnapshotConfig};
@@ -266,7 +268,7 @@ fn origin_zombies(input: &OriginZombieInput<'_>) -> Vec<Finding> {
                         Subject::Branch(branch.clone()),
                         format!(
                             "origin has {branch} at {} — no local bookmark or claim",
-                            short(commit.as_str())
+                            commit.short()
                         ),
                     )
                 })
@@ -288,7 +290,7 @@ fn release_zombies(
                     Subject::Branch(branch.clone()),
                     format!(
                         "release has {branch} at {} — not a release ref",
-                        short(commit.as_str())
+                        commit.short()
                     ),
                 )
             })
@@ -377,8 +379,8 @@ fn add_release_drift(report: &mut Report, drift: ReleaseDrift<'_>) {
         Some(recorded) if !same_commit(recorded.as_str(), current.as_str()) => {
             let detail = format!(
                 "{source} {branch} is at {} but its newest recorded cut names {}",
-                short(current.as_str()),
-                short(recorded.as_str()),
+                current.short(),
+                recorded.short(),
             );
             report.findings.push(Finding::new(
                 FindingKind::ReleaseDrift,
@@ -419,7 +421,7 @@ fn add_misplaced_origin_release_refs(
             format!(
                 "origin has release ref {name} at {} but releases publish to {publish_remote}; \
                  this ref is misplaced",
-                short(commit.as_str())
+                commit.short()
             ),
         ));
     }
@@ -571,8 +573,8 @@ fn pull_position_finding(pull: &PullRequest, position: &str, actual: &str) -> Fi
         format!(
             "pr #{} head {} but {position} is {}",
             pull.number,
-            short(&pull.head_ref_oid),
-            short(actual)
+            short_id(&pull.head_ref_oid),
+            short_id(actual)
         ),
     )
 }
@@ -613,10 +615,6 @@ pub fn render(report: &Report) -> String {
     }
     lines.push_str("\n  timeline archaeology: knives pr <n> --timeline");
     lines
-}
-
-fn short(value: &str) -> String {
-    value.chars().take(12).collect()
 }
 
 #[cfg(test)]
