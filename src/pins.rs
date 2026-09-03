@@ -272,10 +272,8 @@ pub const PIN_FILES: &[&str] = &[
     "package.json",
 ];
 
+/// One line per pin; the caller decides what an empty list means.
 pub fn render(pins: &[Pin]) -> String {
-    if pins.is_empty() {
-        return "  no dated release pinned by this consumer".to_owned();
-    }
     pins.iter()
         .map(|pin| {
             format!(

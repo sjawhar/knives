@@ -154,12 +154,24 @@ fn consumer_head(
 }
 
 /// Scan a local checkout for pins of one repo's releases.
+///
+/// A path that is not there, or not a directory, is a problem, not an empty
+/// scan: read as "no pins", a mistyped `--consumer` let a release edit proceed
+/// as unpinned, while the census called the same path not found.
 pub fn scan_consumer_for(
     consumer: &Path,
     slug: Option<&str>,
     scheme: &ReleaseScheme,
 ) -> ConsumerScan {
     let mut result = ConsumerScan::default();
+    if !consumer.exists() {
+        result.problems.push("not found".to_owned());
+        return result;
+    }
+    if !consumer.is_dir() {
+        result.problems.push("not a directory".to_owned());
+        return result;
+    }
     match jj::origin_trunk(consumer) {
         Ok(OriginTrunk::Reference(branch)) => {
             let mut checkout_lag = None;

@@ -13,7 +13,7 @@ use knives::config::RepoEntry;
 use knives::consumer_pins::{ConsumerHeadMemo, scan_consumer_for};
 use knives::forge::ConsumerHead;
 use knives::jj::Repo;
-use lab::{Lab, knives_release, operation_ids, release_test_home};
+use lab::{Lab, commit_at, knives_release, operation_ids, release_parents, release_test_home};
 use std::collections::BTreeMap;
 use std::process::Command;
 
@@ -344,16 +344,23 @@ fn consumers_reports_an_unreadable_pin_file_as_incomplete() {
 }
 #[test]
 fn mutating_release_commands_refuse_plan_problems_before_writing() {
-    // Given: a release that would otherwise be mutable, then no configured consumer answer.
+    // Given: a release that would otherwise be mutable, and a --consumer path that
+    // is not there — a mistyped path is a question the plan cannot answer, not an
+    // empty scan.
     let lab = Lab::new();
     let release = "release/2026-08-04";
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     lab.branch("feat/beta", "beta.txt", "beta\n");
     lab.branch("feat/gamma", "gamma.txt", "gamma\n");
     lab.octopus(release, "feat/alpha", "feat/beta");
-    let (home, _consumer) = release_test_home(&lab);
+    let (home, consumer) = release_test_home(&lab);
     lab.advance_upstream("upstream advance\n");
-    std::fs::remove_file(home.path().join("local-consumer")).expect("remove local consumer");
+    let missing = consumer.with_file_name("consumer-that-was-never-cloned");
+    std::fs::write(
+        home.path().join("local-consumer"),
+        missing.display().to_string(),
+    )
+    .expect("point the release helpers at the missing consumer");
     let operations_before = operation_ids(&lab.work);
 
     // When: every mutating release verb sees an incomplete consumer plan.
@@ -366,9 +373,14 @@ fn mutating_release_commands_refuse_plan_problems_before_writing() {
 
         // Then: each exits incomplete after reporting the plan, before a jj write.
         assert_eq!(output.status.code(), Some(3), "output: {output:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
-            String::from_utf8_lossy(&output.stdout).contains("no consumers recorded"),
+            stdout.contains("consumer-that-was-never-cloned: not found"),
             "output: {output:?}"
+        );
+        assert!(
+            !stdout.contains("nothing pins this release"),
+            "a consumer that could not be consulted must not make a no-pin claim: {stdout}"
         );
         assert_eq!(
             operation_ids(&lab.work),
@@ -376,4 +388,45 @@ fn mutating_release_commands_refuse_plan_problems_before_writing() {
             "{args:?} wrote despite plan problems"
         );
     }
+}
+
+#[test]
+fn no_recorded_consumers_is_an_answer_not_a_refusal() {
+    // Given: a fork whose registry entry records no consumer and whose caller
+    // passes none — a tool fork consumed by an install, not by a lockfile, has
+    // no consumer path to hand over.
+    let lab = Lab::new();
+    let release = "release/2026-08-04";
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    lab.branch("feat/gamma", "gamma.txt", "gamma\n");
+    lab.octopus(release, "feat/alpha", "feat/beta");
+    let (home, _consumer) = release_test_home(&lab);
+    std::fs::remove_file(home.path().join("local-consumer")).expect("remove local consumer");
+
+    // When: the plan is asked, then an edit is applied.
+    let plan = knives_release(&lab, &home, &[]);
+    let planned = String::from_utf8_lossy(&plan.stdout);
+    let include = knives_release(&lab, &home, &["include", "feat/gamma"]);
+
+    // Then: nothing recorded pins the release, which is an answer: the plan says
+    // so as a note and exits clean, and the edit applies.
+    assert_eq!(plan.status.code(), Some(0), "plan: {plan:?}");
+    assert!(
+        planned.contains("! no consumers recorded"),
+        "the plan must still say no consumer is recorded: {planned}"
+    );
+    assert!(
+        !planned.contains("!! no consumers recorded"),
+        "an unrecorded consumer is not a problem the plan could not answer: {planned}"
+    );
+    assert!(
+        planned.contains("nothing pins this release: either is safe"),
+        "{planned}"
+    );
+    assert_eq!(include.status.code(), Some(0), "include: {include:?}");
+    assert!(
+        release_parents(&lab, release).contains(&commit_at(&lab, "feat/gamma")),
+        "the include was refused on an answered question"
+    );
 }

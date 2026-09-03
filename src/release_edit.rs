@@ -141,6 +141,41 @@ impl EditContext<'_> {
             branch,
         )?)
     }
+
+    /// Refuse, saying why, a tip the trunk already reaches.
+    ///
+    /// A commit the trunk has is a base, never a member: taken as a parent it
+    /// gives the release a legacy cut's shape and moves its shared base under
+    /// every other member, and the next rebase retires it as redundant.
+    /// `carried` is the parent of the branch the release holds, when the record
+    /// names one — then it is the landed parent a rebase retires.
+    fn refuse_if_trunk_has(
+        &self,
+        branch: &str,
+        tip: &knives::ids::CommitId,
+        carried: Option<&knives::ids::CommitId>,
+    ) -> anyhow::Result<bool> {
+        if !knives::release_model::trunk_reaches(self.opened, &self.release.trunk_tips, tip)? {
+            return Ok(false);
+        }
+        match carried {
+            None => println!(
+                "{}: the trunk already has {branch}, tip included, so it is not a member of \
+                 {}: a parent the trunk reaches is a base, and taking it as one would move the \
+                 shared base; `knives release rebase` onto a trunk that has it brings it in",
+                self.repo, self.release.name
+            ),
+            Some(parent) => println!(
+                "{}: the trunk already has the whole of {branch}, past the {} that {} carries \
+                 for it; moving the member onto a tip the trunk reaches would make it a base \
+                 parent; `knives release rebase` retires the landed parent and brings the rest in",
+                self.repo,
+                parent.short(),
+                self.release.name
+            ),
+        }
+        Ok(true)
+    }
 }
 
 /// Apply one stated change to each chosen repo's release in hand.
@@ -472,6 +507,9 @@ fn include_edit(
         return Ok(EditOutcome::Settled(Exit::Incomplete));
     }
     let lookup = context.member_parents(target, &tip)?;
+    if context.refuse_if_trunk_has(target, &tip, lookup.parents.first())? {
+        return Ok(EditOutcome::Settled(Exit::Incomplete));
+    }
     if let Some(parent) = lookup.parents.first() {
         // Moving a member is its own decision, and including it again would
         // carry it twice; say which situation the record describes.
@@ -789,6 +827,9 @@ fn advance_named_members(
         // in both cases, since a bookmark name reused for unrelated work would
         // be moved onto that member.
         let lookup = context.member_parents(branch.as_str(), &tip)?;
+        if context.refuse_if_trunk_has(branch.as_str(), &tip, lookup.parents.first())? {
+            return Ok(None);
+        }
         match (lookup.parents.first(), lookup.evidence) {
             (Some(recorded), MemberEvidence::Record) => println!(
                 "{repo}: {branch} matched {} by the last cut or edit record only; nothing in \
@@ -875,6 +916,9 @@ fn advance_named_member_from(
         return Ok(None);
     }
     if context.refuse_if_stacked(branch.as_str(), &tip, "advancing onto it")? {
+        return Ok(None);
+    }
+    if context.refuse_if_trunk_has(branch.as_str(), &tip, Some(old))? {
         return Ok(None);
     }
     let mut parents = release.parents.clone();

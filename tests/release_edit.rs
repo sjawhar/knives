@@ -26,6 +26,111 @@ use lab::{
 };
 
 #[test]
+fn a_branch_the_trunk_already_has_is_said_so_and_left_to_rebase() {
+    // Given: a release cut from alpha and beta, then gamma — forked from the same
+    // trunk after the cut — merged upstream by merge commit. Nothing in the
+    // release reaches gamma, yet the trunk does.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let (home, _consumer) = home_after_first_cut(&lab);
+    lab.branch("feat/gamma", "gamma.txt", "gamma\n");
+    lab.publish_pull("feat/gamma", 7);
+    lab.merge_pull_with_merge_commit(7);
+
+    // When: the plan describes the branches the release does not carry.
+    let plan = knives_release(&lab, &home, &[]);
+    let planned = String::from_utf8_lossy(&plan.stdout);
+
+    // Then: the note says where gamma went and names the one verb that brings it
+    // in; a moved trunk is a finding of its own, so the plan exits with findings.
+    assert_eq!(plan.status.code(), Some(1), "{planned}");
+    assert!(
+        planned.contains(
+            "feat/gamma is not in release/2026-08-04: the trunk already has it, merged after \
+             the release's base; `knives release rebase` onto a trunk that has it brings it in"
+        ),
+        "a branch the trunk has was described as merely absent: {planned}"
+    );
+}
+
+#[test]
+fn a_member_whose_grown_branch_landed_whole_is_left_to_rebase_not_advance() {
+    // Given: alpha released, then grown, then the grown branch merged upstream by
+    // merge commit: the trunk has both the released parent and the tip.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let (home, _consumer) = home_after_first_cut(&lab);
+    let released = commit_at(&lab, "feat/alpha");
+    extend_branch(&lab, "feat/alpha", "alpha-more.txt", "more\n");
+    lab.publish_pull("feat/alpha", 8);
+    lab.merge_pull_with_merge_commit(8);
+    let before = release_parents(&lab, "release/2026-08-04");
+
+    // When: the plan describes alpha, and alpha is named for an advance.
+    let plan = knives_release(&lab, &home, &[]);
+    let planned = String::from_utf8_lossy(&plan.stdout);
+    let advance = knives_release(&lab, &home, &["advance", "feat/alpha"]);
+    let advanced = String::from_utf8_lossy(&advance.stdout);
+
+    // Then: neither sends the member onto a tip the trunk reaches — that would
+    // make it a base parent — and both name the rebase that retires it.
+    assert!(
+        planned.contains(&format!(
+            "feat/alpha was released as {} in release/2026-08-04 and the trunk now has the \
+             whole branch, tip included; `knives release rebase` retires the landed parent \
+             and brings the rest in",
+            released.short()
+        )),
+        "the plan sent a landed member to advance: {planned}"
+    );
+    assert_eq!(advance.status.code(), Some(3), "{advanced}");
+    assert!(
+        advanced.contains("the trunk already has the whole of feat/alpha")
+            && advanced.contains("`knives release rebase` retires the landed parent"),
+        "{advanced}"
+    );
+    assert_eq!(
+        release_parents(&lab, "release/2026-08-04"),
+        before,
+        "advance moved a member onto a tip the trunk reaches"
+    );
+}
+
+#[test]
+fn include_refuses_a_tip_the_trunk_already_reaches() {
+    // Given: gamma merged upstream by merge commit after the cut, so its tip is
+    // on the trunk and not in the release.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let (home, _consumer) = home_after_first_cut(&lab);
+    lab.branch("feat/gamma", "gamma.txt", "gamma\n");
+    lab.publish_pull("feat/gamma", 7);
+    lab.merge_pull_with_merge_commit(7);
+    let before = release_parents(&lab, "release/2026-08-04");
+
+    // When: gamma is included.
+    let output = knives_release(&lab, &home, &["include", "feat/gamma"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Then: refused, because a parent the trunk reaches is a base, not a member,
+    // and would move the release's shared base; the rebase is named instead.
+    assert_eq!(output.status.code(), Some(3), "{stdout}");
+    assert!(
+        stdout.contains("the trunk already has feat/gamma, tip included")
+            && stdout.contains("`knives release rebase` onto a trunk that has it brings it in"),
+        "{stdout}"
+    );
+    assert_eq!(
+        release_parents(&lab, "release/2026-08-04"),
+        before,
+        "include added a parent the trunk already reaches"
+    );
+}
+
+#[test]
 fn include_adds_one_parent_and_changes_nothing_else() {
     // Given: a cut made before feat/gamma existed. Including gamma is one new
     // parent; every other parent stays at the commit the release already has.
