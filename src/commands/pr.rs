@@ -229,6 +229,7 @@ mod tests {
             release_branch: None,
             test_count_command: None,
             consumers: Vec::new(),
+            workspaces: None,
         }
     }
 

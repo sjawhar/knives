@@ -72,6 +72,7 @@ fn a_fixed_pin_locked_to_an_ancestor_is_behind() {
         release_branch: Some("integration".to_owned()),
         test_count_command: None,
         consumers: vec![consumer.to_owned()],
+        workspaces: None,
     };
     let repo = Repo::open(&lab.work).expect("open advanced branch");
 

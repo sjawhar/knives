@@ -154,6 +154,12 @@ base = "main"                         # optional: upstream's trunk (defaults to 
 release_branch = "release"            # optional: fixed release branch scheme (omit for dated release/YYYY-MM-DD)
 consumers = ["acme/workbench"]       # optional: forge slugs whose trunks pin this repo's releases
 
+[repos.tool]
+path = "~/tool"
+upstream = "https://forge.example/org/tool"
+origin = "https://forge.example/ours/tool"
+workspaces = "~/.worktrees/tool"      # optional: where `knives start` opens branch workspaces
+
 [trusted.workbench]
 path = "~/workbench/default"       # instructions read, not maintained
 
@@ -165,6 +171,12 @@ A fork entry must carry `upstream` and `origin`. That is enforced when the file 
 malformed entry fails there rather than at the first query. `release` is a fourth optional
 remote for when releases are consumed somewhere other than your own fork; it falls back to
 `origin`.
+
+`knives start` opens a branch's workspace beside the checkout, named for the branch: the
+`<name>/default` layout, where the workspaces are `default`'s siblings. A checkout at `~/<name>`
+has no room for siblings, so its entry sets `workspaces` to the directory they go in instead;
+`finish` removes them from the same place. Like `path`, `~` expands and a relative value is taken
+from the config directory, so write it as `~/…`. A `workspaces` inside the checkout is refused.
 
 `consumers` records forge slugs, not checkout paths. Knives reads supported pin files from each
 consumer repository's trunk and caches that scan by the trunk commit. If the forge is unavailable,

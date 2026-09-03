@@ -248,6 +248,7 @@ fn fixed_previous_position_keeps_the_published_remote_after_a_local_cut() {
         release_branch: Some("integration".to_owned()),
         test_count_command: None,
         consumers: Vec::new(),
+        workspaces: None,
     };
     let repo = Repo::open(&lab.work).expect("open after local cut");
     let local = repo

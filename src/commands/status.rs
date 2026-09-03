@@ -1236,6 +1236,7 @@ mod tests {
             release_branch: None,
             test_count_command: None,
             consumers: Vec::new(),
+            workspaces: None,
         };
 
         let _ = add_branch_overlap_findings(&mut report, &mut Vec::new(), &entry, 1);
@@ -1267,6 +1268,7 @@ mod tests {
             release_branch: None,
             test_count_command: None,
             consumers: Vec::new(),
+            workspaces: None,
         };
 
         let _ = add_branch_overlap_findings(&mut report, &mut Vec::new(), &entry, 1);

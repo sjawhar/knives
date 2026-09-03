@@ -237,6 +237,7 @@ fn status_with_the_landed_probe_reports_a_merged_branch_and_leaves_no_trace() {
         release_branch: None,
         test_count_command: None,
         consumers: Vec::new(),
+        workspaces: None,
     };
     let name = knives::ids::RepoName::new("a-repo");
     let temp = std::env::temp_dir().join(format!("knives-status-{}", std::process::id()));
@@ -336,6 +337,7 @@ fn status_reports_branch_overlap_after_upstream_advances_without_landed_probe() 
         release_branch: None,
         test_count_command: None,
         consumers: Vec::new(),
+        workspaces: None,
     };
     let store_path = lab
         .work
@@ -391,6 +393,7 @@ fn status_reports_a_branch_carried_elsewhere() {
         release_branch: None,
         test_count_command: None,
         consumers: Vec::new(),
+        workspaces: None,
     };
     let name = knives::ids::RepoName::new("a-repo");
     let temp = std::env::temp_dir().join(format!("knives-status-{}", std::process::id()));
@@ -442,6 +445,7 @@ fn status_reports_a_carrier_for_a_closed_pull_request() {
         release_branch: None,
         test_count_command: None,
         consumers: Vec::new(),
+        workspaces: None,
     };
     let name = knives::ids::RepoName::new("a-repo");
     let temp = std::env::temp_dir().join(format!("knives-status-{}", std::process::id()));
@@ -509,6 +513,7 @@ fn status_does_not_report_trunk_as_a_carrier_without_landed_probe() {
         release_branch: None,
         test_count_command: None,
         consumers: Vec::new(),
+        workspaces: None,
     };
     let name = knives::ids::RepoName::new("a-repo");
     let temp = std::env::temp_dir().join(format!("knives-status-{}", std::process::id()));
@@ -557,6 +562,7 @@ fn status_carries_each_branchs_newest_notch_in_json_and_in_text() {
         release_branch: None,
         test_count_command: None,
         consumers: Vec::new(),
+        workspaces: None,
     };
     let state = tempfile::tempdir().expect("state directory");
     let store = Store::open(state.path().join("state.json")).expect("open store");

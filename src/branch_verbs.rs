@@ -5,14 +5,17 @@
 //! `depends` records that a branch cannot land before something else does.
 //! Each is one state write with its ledger event.
 
+use std::path::Path;
+
 use knives::cli::Exit;
 use knives::commands::claim::{
     ClaimContext, ClaimDecision, current_identity, decide, last_seen_provenance,
     render_claim_context,
 };
+use knives::commands::start::{collides_with_checkout, possesses, workspace_path};
 use knives::config::{default_config_path, load};
 use knives::ids::{BranchTarget, Requirement};
-use knives::jj::Repo;
+use knives::jj::{Repo, WorkspaceIdentity};
 use knives::store::{Store, default_state_path};
 
 use super::scribe_for;
@@ -72,24 +75,15 @@ pub(crate) fn run_finish(
         eprintln!("unknown repo {}", target.repo);
         return Ok(Exit::Usage);
     };
-    let mut store = Store::open_for_update(default_state_path())?;
-    let workspace = knives::commands::wip::workspace_for(target.branch.as_str());
-    let directory = entry.path.parent().map(|parent| parent.join(&workspace));
-    // The primary workspace is named "default" and the registered checkout is its
-    // directory; `start` can never have created either for a branch, so a branch
-    // whose flattened name lands on them is a collision, not a workspace to clean
-    // up. Without this, `finish` would forget the primary workspace and delete
-    // the checkout itself.
-    if workspace == "default" || directory.as_deref() == Some(entry.path.as_path()) {
-        eprintln!(
-            "{}: branch {} maps to workspace {workspace}, which is the registered \
-             checkout itself; refusing to touch {}",
-            target.repo,
-            target.branch,
-            entry.path.display()
-        );
+    // Without this, `finish` would forget the primary workspace and delete the
+    // checkout itself.
+    if let Some(line) = collides_with_checkout(entry, &target.branch) {
+        eprintln!("{}: {line}", target.repo);
         return Ok(Exit::Usage);
     }
+    let mut store = Store::open_for_update(default_state_path())?;
+    let workspace = knives::commands::wip::workspace_for(target.branch.as_str());
+    let directory = workspace_path(entry, &target.branch);
     let forced_release = match finish_claim_gate(target, entry, &store, options)? {
         FinishClaimGate::Continue(event) => event,
         FinishClaimGate::Refuse => return Ok(Exit::Usage),
@@ -114,28 +108,94 @@ pub(crate) fn run_finish(
     store.save()?;
 
     let claim = if had { "released" } else { "was not held" };
-    if let Err(error) = knives::jj::forget_workspace(&entry.path, &workspace) {
-        println!("{target}: claim {claim}; no workspace forgotten ({error})");
-        return Ok(Exit::Ok);
-    }
-    match (options.cleanup, directory) {
-        (true, Some(directory)) if directory.is_dir() => {
-            // Safe because jj already snapshotted the working copy into a commit: the
-            // work is in the repository and reachable by change id. Untracked files are
-            // the exception, which is what --no-cleanup is for.
-            std::fs::remove_dir_all(&directory)?;
-            println!(
-                "{target}: claim {claim}, workspace {workspace} removed ({}); its commits \
-                 remain in the repository",
-                directory.display()
-            );
+    // Read what is at the path before writing anything to the repository: a jj
+    // that refused to load a forgotten workspace's state would otherwise leave
+    // the directory forgotten and unremovable.
+    let identity = directory
+        .exists()
+        .then(|| knives::jj::workspace_identity(&directory, &entry.path));
+    let registration = release_registration(&entry.path, &workspace);
+    let shown = directory.display();
+    let checkout = entry.path.display();
+    let removal = match identity {
+        None => format!("no directory at {shown}"),
+        Some(WorkspaceIdentity::Ours(name)) if name.as_str() == workspace => {
+            // A registration that could not be forgotten keeps its directory: with
+            // the directory gone, every later `start` dies on jj's "already exists",
+            // `--force` included, where a retried `finish` would have cleaned up.
+            let removable = options.cleanup && !matches!(registration, Registration::Failed(_));
+            if removable {
+                // Safe because jj already snapshotted the working copy into a commit:
+                // the work is in the repository and reachable by change id. Untracked
+                // files are the exception, which is what --no-cleanup is for.
+                std::fs::remove_dir_all(&directory)?;
+                format!("{shown} removed; its commits remain in the repository")
+            } else {
+                format!("{shown} left on disk")
+            }
         }
-        (_, directory) => println!(
-            "{target}: claim {claim}, workspace {workspace} forgotten; {} left on disk",
-            directory.map_or_else(|| "its directory".to_owned(), |d| d.display().to_string())
+        // What sits at the path is not this branch's workspace, and the forget above
+        // proved nothing about it: `jj workspace forget` exits 0 for a name it does
+        // not know.
+        Some(WorkspaceIdentity::Ours(name)) => {
+            format!("{shown} is workspace {name} of {checkout}, not {workspace}, left alone")
+        }
+        Some(WorkspaceIdentity::Unreadable(detail)) => format!(
+            "{shown} is a workspace of {checkout} whose working-copy state could not be read \
+             ({detail}), left alone"
         ),
-    }
+        Some(WorkspaceIdentity::Foreign(store)) => format!(
+            "{shown} belongs to repository {}, not {checkout}, left alone",
+            store.display()
+        ),
+        Some(WorkspaceIdentity::Repository) => {
+            format!("{shown} is a repository in its own right, not a workspace, left alone")
+        }
+        Some(WorkspaceIdentity::SymbolicLink(target_path)) => format!(
+            "{shown} is a symbolic link to {}, left alone",
+            target_path.display()
+        ),
+        Some(WorkspaceIdentity::NotAWorkspace) => {
+            format!("{shown} is not a workspace of {checkout}, left alone")
+        }
+    };
+    println!("{target}: claim {claim}; workspace {workspace} {registration}; {removal}");
     Ok(Exit::Ok)
+}
+
+/// What became of the branch's workspace registration.
+enum Registration {
+    Forgotten,
+    /// jj never knew the name; `jj workspace forget` would have exited 0 anyway,
+    /// and saying "forgotten" would let a reader believe a registration was cleared.
+    NotRegistered,
+    /// The forget failed, or the checkout could not be opened to ask. Reported,
+    /// not an error: the claim is already released by the time this runs, and the
+    /// ownership decision never needed the checkout.
+    Failed(String),
+}
+
+impl std::fmt::Display for Registration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Forgotten => f.write_str("forgotten"),
+            Self::NotRegistered => f.write_str("was not registered"),
+            Self::Failed(detail) => write!(f, "not forgotten ({detail})"),
+        }
+    }
+}
+
+fn release_registration(checkout: &Path, workspace: &str) -> Registration {
+    match Repo::open(checkout).and_then(|repo| repo.workspaces()) {
+        Err(error) => Registration::Failed(error.to_string()),
+        Ok(names) if !names.iter().any(|(name, _)| name.as_str() == workspace) => {
+            Registration::NotRegistered
+        }
+        Ok(_) => match knives::jj::forget_workspace(checkout, workspace) {
+            Ok(()) => Registration::Forgotten,
+            Err(error) => Registration::Failed(error.to_string()),
+        },
+    }
 }
 
 fn finish_claim_gate(
@@ -153,13 +213,12 @@ fn finish_claim_gate(
         return Ok(FinishClaimGate::Continue(None));
     };
     let workspace = knives::commands::wip::workspace_for(target.branch.as_str());
-    let directory = entry.path.parent().map(|parent| parent.join(&workspace));
     let cwd = std::env::current_dir()?;
     let identity = current_identity(&cwd)?;
     let decision = decide(&ClaimContext {
         held: Some(&claim),
         identity: &identity,
-        in_claimed_workspace: directory.as_ref().is_some_and(|path| cwd.starts_with(path)),
+        in_claimed_workspace: possesses(&cwd, entry, &target.branch),
     });
     match decision {
         ClaimDecision::Resume { .. } | ClaimDecision::Take => Ok(FinishClaimGate::Continue(None)),
@@ -307,6 +366,7 @@ pub(crate) fn run_depends(target: &BranchTarget, on: &[String]) -> anyhow::Resul
 #[cfg(test)]
 mod tests {
     use super::spoken;
+
     #[test]
     fn track_prose_preserves_the_established_human_output() {
         for (event, expected) in [

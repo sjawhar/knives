@@ -139,6 +139,7 @@ fn sync_records_one_event_for_each_pull_request_that_moved() {
         release_branch: None,
         test_count_command: None,
         consumers: Vec::new(),
+        workspaces: None,
     };
     let mut pull_requests = BTreeMap::new();
     for (number, branch, state) in [

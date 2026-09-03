@@ -1055,6 +1055,7 @@ mod tests {
             release_branch: None,
             test_count_command: None,
             consumers: vec![],
+            workspaces: None,
         };
         let remotes = BTreeMap::from([
             (
@@ -1093,6 +1094,7 @@ mod tests {
             release_branch: None,
             test_count_command: None,
             consumers: vec![],
+            workspaces: None,
         };
         let remotes = BTreeMap::from([(
             "origin".to_owned(),

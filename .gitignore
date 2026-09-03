@@ -10,3 +10,6 @@ node_modules/
 
 # omo runtime state the agent harness writes into the working copy
 /.omo
+
+# codegraph index the agent harness writes into the working copy
+/.codegraph

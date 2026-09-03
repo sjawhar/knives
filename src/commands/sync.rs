@@ -1067,6 +1067,7 @@ mod comment_activity_tests {
             release_branch: None,
             test_count_command: None,
             consumers: Vec::new(),
+            workspaces: None,
         }
     }
 

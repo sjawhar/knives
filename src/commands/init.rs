@@ -43,27 +43,73 @@ pub enum InitOutcome {
 /// Only remotes already named for a role are adopted. Guessing which arbitrary
 /// remote is the upstream is a coin flip, and a wrong upstream makes every
 /// landed check answer about the wrong repository.
+///
+/// Re-adopting a registered checkout keeps what the registry was told by hand:
+/// everything but the remotes, including the registry's own spelling of `path`.
+/// Nothing on disk can recover those fields, and rebuilding the entry from
+/// remotes alone silently moved every new workspace back beside the checkout.
 pub fn decide_with_registry(
     path: &Path,
     remotes: &BTreeMap<String, String>,
     existing: Option<&RepoEntry>,
 ) -> InitOutcome {
-    let outcome = decide(path, remotes);
-    if let InitOutcome::Adopted {
-        name,
-        entry,
-        warnings: _,
-    } = &outcome
-        && let Some(held) = existing
-        && held.path != entry.path
-    {
-        return InitOutcome::NameTaken {
-            name: name.clone(),
-            existing: held.path.clone(),
-            requested: entry.path.clone(),
-        };
+    match (decide(path, remotes), existing) {
+        (InitOutcome::Adopted { name, entry, .. }, Some(held))
+            if !same_directory(&held.path, &entry.path) =>
+        {
+            InitOutcome::NameTaken {
+                name,
+                existing: held.path.clone(),
+                requested: entry.path,
+            }
+        }
+        (
+            InitOutcome::Adopted {
+                name,
+                entry,
+                warnings,
+            },
+            Some(held),
+        ) => InitOutcome::Adopted {
+            name,
+            entry: Box::new(RepoEntry {
+                upstream: entry.upstream,
+                origin: entry.origin,
+                release: entry.release,
+                ..held.clone()
+            }),
+            warnings,
+        },
+        (outcome, _) => outcome,
     }
-    outcome
+}
+
+/// What `init` and `register` decide about the tree at `path`, with the registry
+/// consulted so a registered checkout keeps its hand-written fields and a name
+/// is not taken twice.
+pub fn outcome_for(path: PathBuf, config_path: &Path) -> anyhow::Result<InitOutcome> {
+    // `.jj` only: every other command needs `.jj/repo`, so adopting a git-only
+    // tree produces a registry entry on which everything then fails.
+    if !path.join(".jj").exists() {
+        return Ok(InitOutcome::NotARepository { path });
+    }
+    let remotes = crate::jj::git_remotes(&path)?;
+    let registry = load(config_path)?;
+    let existing = match decide(&path, &remotes) {
+        InitOutcome::Adopted { name, .. } => registry.repos.get(&name),
+        _ => None,
+    };
+    Ok(decide_with_registry(&path, &remotes, existing))
+}
+
+/// Whether two spellings name one directory: canonical when both resolve, so a
+/// symlink or relative path to a registered checkout is that checkout and not a
+/// second tree taking its name; literal otherwise.
+fn same_directory(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
 }
 
 pub fn decide(path: &Path, remotes: &BTreeMap<String, String>) -> InitOutcome {
@@ -94,6 +140,7 @@ pub fn decide(path: &Path, remotes: &BTreeMap<String, String>) -> InitOutcome {
             release_branch: None,
             test_count_command: None,
             consumers: Vec::new(),
+            workspaces: None,
         }),
         warnings: miswiring_warnings(remotes),
     }
@@ -196,29 +243,22 @@ pub fn render(outcome: &InitOutcome, config_path: &Path) -> String {
     }
 }
 
-pub fn run(target: Option<PathBuf>) -> anyhow::Result<Exit> {
+/// The checkout `init` or `register` was pointed at, spelled as the registry holds it.
+///
+/// Absolute, so `knives init ./work` neither collides with its own entry nor writes
+/// a path that `load` later resolves against the config directory. Symlinks are
+/// kept; the spelling is the user's.
+pub fn target_path(target: Option<PathBuf>) -> anyhow::Result<PathBuf> {
     let path = match target {
         Some(given) => given,
         None => std::env::current_dir()?,
     };
+    Ok(std::path::absolute(path)?)
+}
+
+pub fn run(target: Option<PathBuf>) -> anyhow::Result<Exit> {
     let config_path = default_config_path();
-    // `.jj` only: every other command needs `.jj/repo`, so adopting a git-only
-    // tree produces a registry entry on which everything then fails.
-    let outcome = if path.join(".jj").exists() {
-        let remotes = crate::jj::git_remotes(&path)?;
-        let registry = load(&config_path)?;
-        let name = match decide(&path, &remotes) {
-            InitOutcome::Adopted {
-                name,
-                entry: _,
-                warnings: _,
-            } => Some(name),
-            _ => None,
-        };
-        decide_with_registry(&path, &remotes, name.and_then(|n| registry.repos.get(&n)))
-    } else {
-        InitOutcome::NotARepository { path }
-    };
+    let outcome = outcome_for(target_path(target)?, &config_path)?;
     match &outcome {
         InitOutcome::Adopted {
             name,
@@ -492,6 +532,7 @@ mod registry_tests {
             release_branch: None,
             test_count_command: None,
             consumers: Vec::new(),
+            workspaces: None,
         }
     }
 
@@ -529,6 +570,53 @@ mod registry_tests {
             panic!("expected adoption")
         };
         assert!(warnings.is_empty(), "was: {warnings:?}");
+    }
+
+    #[test]
+    fn re_adopting_the_same_tree_keeps_what_the_registry_was_told_by_hand() {
+        // `init` reads remotes; `base`, `release_branch`, `test_count_command`,
+        // `consumers` and `workspaces` are written by hand and nothing on disk can
+        // recover them. Rebuilding the entry from remotes alone silently moved
+        // every new workspace back beside the checkout.
+        let mut existing = held("/home/real/forks/work/default");
+        existing.base = Some("dev".to_owned());
+        existing.release_branch = Some("sami".to_owned());
+        existing.test_count_command = Some("count".to_owned());
+        existing.consumers = vec!["acme/workbench".to_owned()];
+        existing.workspaces = Some(PathBuf::from("/home/real/.worktrees/work"));
+
+        let outcome = decide_with_registry(
+            Path::new("/home/real/forks/work/default"),
+            &remotes(),
+            Some(&existing),
+        );
+
+        let InitOutcome::Adopted { entry, .. } = outcome else {
+            panic!("expected adoption")
+        };
+        assert_eq!(*entry, existing);
+    }
+
+    #[test]
+    fn re_adopting_the_same_tree_under_another_spelling_is_not_a_collision() {
+        // The registry holds one spelling; the command line offers another — a
+        // symlink, or a relative path. The same directory is the same checkout.
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir_all(real.join("work")).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let held = held(real.join("work").to_str().unwrap());
+
+        let outcome = decide_with_registry(&link.join("work"), &remotes(), Some(&held));
+
+        let InitOutcome::Adopted { entry, .. } = outcome else {
+            panic!("expected adoption, got {outcome:?}")
+        };
+        assert_eq!(
+            entry.path, held.path,
+            "the registry's spelling was replaced"
+        );
     }
 
     #[test]

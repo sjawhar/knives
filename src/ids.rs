@@ -64,6 +64,35 @@ impl CommitId {
     }
 }
 
+impl BranchName {
+    /// A branch name as typed on the command line, checked to name a bookmark.
+    ///
+    /// `start`, `finish`, `track` and `depends` derive a workspace directory from
+    /// the name, so a name that is not a bookmark is a path: before the workspace
+    /// identity check, `finish ..` flattened to the checkout's grandparent and
+    /// `finish ''` to its parent, and removed them. Rejected here so the degenerate
+    /// spellings never reach a path at all and the message is knives', not jj's.
+    pub fn parse(value: &str) -> Result<Self, String> {
+        if value.is_empty() {
+            return Err("a branch name is required".to_owned());
+        }
+        if value.starts_with('-') {
+            return Err(format!(
+                "{value:?} is not a branch name; it reads as an option"
+            ));
+        }
+        if value.split('/').any(|segment| {
+            segment.is_empty() || segment == "." || segment == ".." || segment.starts_with('.')
+        }) {
+            return Err(format!(
+                "{value:?} is not a branch name: every `/`-separated segment must be non-empty \
+                 and must not start with `.`"
+            ));
+        }
+        Ok(Self::new(value))
+    }
+}
+
 /// The first twelve characters of an identifier: what jj shows, enough to be
 /// unique in a fork, short enough to read in a line of prose. A shorter id is
 /// returned whole.
@@ -301,6 +330,25 @@ mod tests {
         assert!(Requirement::parse("swe#abc").is_none());
     }
 
+    #[test]
+    fn a_branch_name_from_the_command_line_must_name_a_bookmark() {
+        use super::BranchName;
+        // Given: names a shell can hand over that are not bookmarks. Before the
+        // workspace identity check, `finish ..` flattened to the checkout's
+        // grandparent and `finish ''` to its parent — and removed them.
+        for nonsense in ["", ".", "..", "-r", "feat/../x", "a//b", "feat/.hidden/x"] {
+            assert!(
+                BranchName::parse(nonsense).is_err(),
+                "{nonsense:?} was accepted"
+            );
+        }
+        for name in ["main", "feat/alpha", "release/2026-08-15.1", "fix-1", "a.b"] {
+            assert_eq!(
+                BranchName::parse(name).map(|branch| branch.as_str().to_owned()),
+                Ok(name.to_owned())
+            );
+        }
+    }
     #[test]
     fn a_fetched_pull_request_head_names_its_number() {
         use super::pull_number_from_bookmark;

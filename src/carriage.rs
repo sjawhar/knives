@@ -865,6 +865,7 @@ mod tests {
             release_branch: None,
             test_count_command: None,
             consumers: Vec::new(),
+            workspaces: None,
         };
         let origin_ref = remote("release/2026-08-30", "origin");
 

@@ -500,6 +500,7 @@ mod tests {
             release_branch: None,
             test_count_command: None,
             consumers: Vec::new(),
+            workspaces: None,
         }
     }
 
@@ -660,6 +661,7 @@ mod tests {
             release_branch: None,
             test_count_command: None,
             consumers: vec![current.to_owned(), behind.to_owned()],
+            workspaces: None,
         };
 
         let lag = pin_lag(
@@ -713,6 +715,7 @@ mod tests {
             release_branch: Some("integration".to_owned()),
             test_count_command: None,
             consumers: vec![consumer.to_owned()],
+            workspaces: None,
         };
 
         let pin_lag = pin_lag(&entry, None, None, &forge, None, &heads);
@@ -755,6 +758,7 @@ mod tests {
             release_branch: Some("integration".to_owned()),
             test_count_command: None,
             consumers: vec![consumer.to_owned()],
+            workspaces: None,
         };
 
         let pin_lag = pin_lag(&entry, None, None, &forge, None, &heads);
@@ -798,6 +802,7 @@ mod tests {
             release_branch: Some("integration".to_owned()),
             test_count_command: None,
             consumers: vec![consumer.to_owned()],
+            workspaces: None,
         };
         let registry = Registry {
             repos: BTreeMap::from([("sandbox-runner".to_owned(), entry)]),

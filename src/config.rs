@@ -140,6 +140,16 @@ pub struct RepoEntry {
     /// them with `--consumer` for a one-off scan.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub consumers: Vec<String>,
+    /// Where this repository's branch workspaces live. Absent, they sit beside
+    /// the checkout: the `<name>/default` layout, where each workspace is a
+    /// sibling of `default`.
+    ///
+    /// Set it for a checkout at `~/<name>`: with no `default` leaf there is no
+    /// room for siblings, and each branch would land in `~` itself. Resolved
+    /// like `path`: `~` expands, and a relative value is taken from the config
+    /// directory, not the checkout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspaces: Option<PathBuf>,
 }
 
 impl RepoEntry {
@@ -153,6 +163,14 @@ impl RepoEntry {
     /// directories. One rule now, and it is the plugin's.
     pub fn resolved_path(&self, config_home: &Path) -> PathBuf {
         expand_registry_path(&self.path, config_home)
+    }
+
+    /// The directory `knives start` opens this repository's workspaces under,
+    /// and `finish` removes them from.
+    pub fn workspace_root(&self) -> &Path {
+        self.workspaces
+            .as_deref()
+            .unwrap_or_else(|| self.path.parent().unwrap_or(&self.path))
     }
 
     /// The remote for a role. Total: every role resolves.
@@ -489,6 +507,7 @@ pub fn load(path: &Path) -> Result<Registry, ConfigError> {
     let home = path.parent().unwrap_or_else(|| Path::new(".")).to_owned();
     for (name, entry) in &mut registry.repos {
         entry.path = entry.resolved_path(&home);
+        entry.workspaces = checked_workspaces(name, entry, &home, path)?;
         for (role, remote) in [
             ("upstream", entry.upstream.as_str()),
             ("origin", entry.origin.as_str()),
@@ -551,6 +570,42 @@ pub fn load(path: &Path) -> Result<Registry, ConfigError> {
         *root = expand_registry_path(root, &home);
     }
     Ok(registry)
+}
+
+/// An entry's `workspaces`, resolved like `path` and checked. `entry.path` must
+/// already be resolved.
+///
+/// Empty would resolve to the config home itself, putting every branch workspace
+/// beside the state file and the ledger; a directory inside the checkout puts
+/// them in the working copy they belong to. Neither is what anyone meant.
+fn checked_workspaces(
+    name: &str,
+    entry: &RepoEntry,
+    home: &Path,
+    path: &Path,
+) -> Result<Option<PathBuf>, ConfigError> {
+    let Some(raw) = entry.workspaces.as_deref() else {
+        return Ok(None);
+    };
+    if raw.as_os_str().is_empty() {
+        return Err(ConfigError::Invalid {
+            path: path.to_owned(),
+            detail: format!("[repos.{name}] workspaces is empty; name a directory or omit it"),
+        });
+    }
+    let workspaces = expand_registry_path(raw, home);
+    if workspaces.starts_with(&entry.path) {
+        return Err(ConfigError::Invalid {
+            path: path.to_owned(),
+            detail: format!(
+                "[repos.{name}] workspaces {} is inside the checkout {}; branch workspaces cannot \
+                 live in the working copy they belong to",
+                workspaces.display(),
+                entry.path.display()
+            ),
+        });
+    }
+    Ok(Some(workspaces))
 }
 
 fn is_forge_slug(value: &str) -> bool {
@@ -925,6 +980,108 @@ release = "https://example.invalid/releases.git"
         assert_eq!(
             registry.trusted["workbench"].path,
             PathBuf::from("/home/someone/workbench/default")
+        );
+    }
+
+    #[test]
+    fn workspaces_sit_beside_the_checkout_unless_the_entry_says_where() {
+        // The `<name>/default` layout: each branch's workspace is a sibling of
+        // `default`. Absent configuration keeps it, so no registered repository's
+        // existing workspaces move.
+        let dir = tempfile::tempdir().unwrap();
+        let text = "[repos.tool]\npath = \"/home/someone/forks/tool/default\"\nupstream = \"u\"\n\
+                    origin = \"o\"\n";
+        let registry = load(&write(dir.path(), text)).unwrap();
+        assert_eq!(
+            registry.repos["tool"].workspace_root(),
+            PathBuf::from("/home/someone/forks/tool")
+        );
+    }
+
+    #[test]
+    fn a_configured_workspaces_directory_is_where_workspaces_go() {
+        // A checkout at `~/<name>` has no room for siblings: they would land in `~`
+        // itself, one directory per branch across every repository.
+        let _lock = environment_lock();
+        let environment = EnvironmentGuard::capture(&["HOME"]);
+        environment.set("HOME", "/home/someone");
+        let dir = tempfile::tempdir().unwrap();
+        let text = "[repos.tool]\npath = \"~/tool\"\nupstream = \"u\"\norigin = \"o\"\n\
+                    workspaces = \"~/.worktrees/tool\"\n";
+        let registry = load(&write(dir.path(), text)).unwrap();
+        assert_eq!(
+            registry.repos["tool"].workspace_root(),
+            PathBuf::from("/home/someone/.worktrees/tool")
+        );
+    }
+
+    #[test]
+    fn saving_preserves_a_configured_workspaces_directory() {
+        // `init` rewrites the whole file; a field serde does not know about would
+        // silently move every workspace back beside the checkout.
+        let dir = tempfile::tempdir().unwrap();
+        let text = "[repos.tool]\npath = \"/tmp/tool\"\nupstream = \"u\"\norigin = \"o\"\n\
+                    workspaces = \"/tmp/worktrees/tool\"\n";
+        let path = write(dir.path(), text);
+        let registry = load(&path).unwrap();
+
+        save(&registry, &path).unwrap();
+
+        let reloaded = load(&path).unwrap();
+        assert_eq!(
+            reloaded.repos["tool"].workspace_root(),
+            PathBuf::from("/tmp/worktrees/tool")
+        );
+    }
+
+    #[test]
+    fn a_relative_workspaces_directory_is_resolved_against_the_config_home() {
+        // The same rule as `path`: one resolution for every registry path, so a
+        // value that works for one field cannot silently mean something else for
+        // the other.
+        let dir = tempfile::tempdir().unwrap();
+        let text = "[repos.tool]\npath = \"/tmp/tool\"\nupstream = \"u\"\norigin = \"o\"\n\
+                    workspaces = \"worktrees/tool\"\n";
+        let registry = load(&write(dir.path(), text)).unwrap();
+        assert_eq!(
+            registry.repos["tool"].workspace_root(),
+            dir.path().join("worktrees").join("tool")
+        );
+    }
+
+    #[test]
+    fn an_empty_workspaces_directory_is_a_config_error() {
+        // Empty resolves to the config home itself, which would put every branch
+        // workspace beside the state file and the ledger.
+        let dir = tempfile::tempdir().unwrap();
+        let text = "[repos.tool]\npath = \"/tmp/tool\"\nupstream = \"u\"\norigin = \"o\"\n\
+                    workspaces = \"\"\n";
+        let error = load(&write(dir.path(), text)).unwrap_err().to_string();
+        assert!(error.contains("workspaces"), "was: {error}");
+        assert!(error.contains("empty"), "was: {error}");
+    }
+
+    #[test]
+    fn a_workspaces_directory_inside_the_checkout_is_a_config_error() {
+        // A workspace inside the checkout's working copy is never what anyone
+        // meant; the checkout path itself is the most likely slip.
+        let dir = tempfile::tempdir().unwrap();
+        for inside in ["/tmp/tool", "/tmp/tool/.worktrees"] {
+            let text = format!(
+                "[repos.tool]\npath = \"/tmp/tool\"\nupstream = \"u\"\norigin = \"o\"\n\
+                 workspaces = \"{inside}\"\n"
+            );
+            let error = load(&write(dir.path(), &text)).unwrap_err().to_string();
+            assert!(error.contains("workspaces"), "was: {error}");
+            assert!(error.contains("inside the checkout"), "was: {error}");
+        }
+        // Containment is by component: a sibling sharing the checkout's name as a
+        // string prefix is outside it.
+        let beside = "[repos.tool]\npath = \"/tmp/tool\"\nupstream = \"u\"\norigin = \"o\"\n\
+                      workspaces = \"/tmp/tool-worktrees\"\n";
+        assert_eq!(
+            load(&write(dir.path(), beside)).unwrap().repos["tool"].workspace_root(),
+            Path::new("/tmp/tool-worktrees")
         );
     }
 
