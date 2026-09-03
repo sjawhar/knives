@@ -687,3 +687,83 @@ impl Lab {
         jj(&self.work, ["git", "fetch", "--all-remotes"]);
     }
 }
+
+/// Repeated status runs carry their measured forge duration in the headline.
+/// Compare the reported facts while retaining the distinct `forge` state token.
+pub fn without_forge_elapsed(text: &str) -> String {
+    text.lines()
+        .map(|line| {
+            if line.contains("  forge ") {
+                let (headline, _) = line
+                    .rsplit_once(" (")
+                    .expect("a status headline ends with elapsed milliseconds");
+                format!("{headline} (elapsed)")
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The newest operation's description.
+pub fn newest_operation_description(repo: &Path) -> String {
+    let output = Command::new("jj")
+        .args([
+            "--ignore-working-copy",
+            "op",
+            "log",
+            "--no-graph",
+            "--limit",
+            "1",
+            "-T",
+            "description",
+        ])
+        .current_dir(repo)
+        .env("JJ_CONFIG", "/dev/null")
+        .env("JJ_USER", "Knives Lab")
+        .env("JJ_EMAIL", "knives-lab@example.test")
+        .output()
+        .expect("read newest operation");
+    assert!(output.status.success(), "read newest operation");
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
+/// Add a commit to `branch`, leave its bookmark on the new tip, and step off it.
+pub fn extend_branch(lab: &Lab, branch: &str, file: &str, content: &str) {
+    lab.jj_work(["new", branch, "-m", "follow-up"]);
+    std::fs::write(lab.work.join(file), content).expect("extend a branch");
+    lab.jj_work(["bookmark", "set", branch, "-r", "@"]);
+    lab.jj_work(["new"]);
+}
+
+pub fn file_at_revision(lab: &Lab, revision: &str, file: &str) -> String {
+    let output = Command::new("jj")
+        .args([
+            "--repository",
+            lab.work.to_str().expect("utf-8 repository path"),
+            "--ignore-working-copy",
+            "file",
+            "show",
+            "-r",
+            revision,
+            &format!("root:{file}"),
+        ])
+        .output()
+        .expect("show revision file");
+    assert!(
+        output.status.success(),
+        "file show failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).expect("utf-8 file content")
+}
+
+/// [`release_test_home`], with `release/2026-08-04` already cut from whatever
+/// branches `lab` carries: the starting point of every release-edit test.
+pub fn home_after_first_cut(lab: &Lab) -> (tempfile::TempDir, PathBuf) {
+    let (home, consumer) = release_test_home(lab);
+    let cut = knives_release(lab, &home, &["cut", "release/2026-08-04"]);
+    assert!(cut.status.success(), "{cut:?}");
+    (home, consumer)
+}

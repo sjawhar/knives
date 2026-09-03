@@ -30,3 +30,12 @@ pub fn pull_request(number: u64, state: &str, branch: &str) -> PullRequest {
         merge_commit: None,
     }
 }
+
+/// A pull request at a stated head, updated at one fixed instant.
+pub fn pull_request_with_head(number: u64, state: &str, branch: &str, head: &str) -> PullRequest {
+    PullRequest {
+        head_ref_oid: head.to_owned(),
+        updated_at: "2026-08-15T00:00:00Z".to_owned(),
+        ..pull_request(number, state, branch)
+    }
+}
