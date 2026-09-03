@@ -5,7 +5,8 @@
 //! exclude release cuts, git-tracking refs and fetched pull heads; bookmark tips
 //! keep local and remote distinct; divergence is reported once per rewrite and
 //! only where a live head vouches for it; refs and changed files read without
-//! snapshotting; a release write with no parents is refused.
+//! snapshotting; a release write moves no other agent's working copy and is
+//! refused with no parents.
 
 #![allow(
     clippy::expect_used,

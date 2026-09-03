@@ -1349,6 +1349,26 @@ pub struct Cut {
 }
 
 impl Cut {
+    /// The cut for `carried`. A commit two bookmarks hold — a branch and an
+    /// anchor another agent left at its tip — is one parent, named twice in
+    /// provenance.
+    pub fn from_carried(name: String, carried: &[(String, CommitId)]) -> Self {
+        let mut parents: Vec<CommitId> = Vec::with_capacity(carried.len());
+        for (_, commit) in carried {
+            if !parents.contains(commit) {
+                parents.push(commit.clone());
+            }
+        }
+        Self {
+            name,
+            parents,
+            provenance: carried
+                .iter()
+                .map(|(branch, commit)| (commit.clone(), branch.clone()))
+                .collect(),
+        }
+    }
+
     /// The message a cut carries, provenance included.
     pub fn message(&self) -> String {
         let mut lines = vec![format!("release: {}", self.name), String::new()];
@@ -1357,6 +1377,49 @@ impl Cut {
         }
         lines.join("\n")
     }
+}
+
+/// Name each parent for the release description: the branch holding it, the
+/// trunk it descends from, or its own id when nothing else does.
+pub fn parent_sources(
+    repo: &Repo,
+    entry: &RepoEntry,
+    scheme: &ReleaseScheme,
+    parents: &[CommitId],
+) -> anyhow::Result<Vec<(String, CommitId)>> {
+    let tips = repo.bookmark_tips()?;
+    let carried = carried_from_tips(&tips, entry.trunk(), scheme);
+    let trunk_tip = repo.resolve_commit(&entry.upstream_trunk()).ok();
+    let mut sources = Vec::new();
+    for commit in parents {
+        let named = carried
+            .iter()
+            .find(|(_, tip)| tip == commit)
+            .map(|(branch, _)| branch.clone());
+        let source = if let Some(named) = named {
+            named
+        } else if let Some(trunk) = &trunk_tip
+            && repo.is_ancestor(commit, trunk)?
+        {
+            entry.upstream_trunk()
+        } else {
+            commit.short().to_owned()
+        };
+        sources.push((source, commit.clone()));
+    }
+    Ok(sources)
+}
+
+/// The description of a release after a write.
+///
+/// A cut's message from the parents' `provenance`, so an edited or rebased
+/// release reads exactly like a fresh cut, then `delta` — what the write
+/// changed — as its own paragraph.
+pub fn composition_message(name: &str, provenance: &[(String, CommitId)], delta: &str) -> String {
+    format!(
+        "{}\n\n{delta}",
+        Cut::from_carried(name.to_owned(), provenance).message()
+    )
 }
 
 /// The post-construction checks that determine whether a cut is safe to name.

@@ -6,7 +6,7 @@ use std::fmt;
 use crate::cli::Exit;
 use crate::config::{RepoEntry, Role};
 use crate::forge::{Forge, PullFacts, PullSummary};
-use crate::ids::{BranchName, BranchTarget};
+use crate::ids::{BranchName, BranchTarget, short_id};
 use crate::jj::{fetch_all, fetch_pull_ref, pull_heads};
 use crate::ledger::Scribe;
 use crate::store::Store;
@@ -202,7 +202,7 @@ fn fetch_foreign(
         match fetch_pull_ref(repo, upstream, *number) {
             Ok(commit) => report.notes.push(format!(
                 "fetched foreign #{number} as pull/{number} ({})",
-                commit.as_str().chars().take(12).collect::<String>()
+                commit.short()
             )),
             Err(error) => report
                 .problems
@@ -262,10 +262,7 @@ fn transition_text(number: u64, state: PullState, head: &str) -> Option<String> 
     match state {
         PullState::Merged => Some(format!("#{number} merged")),
         PullState::Closed => Some(format!("#{number} closed")),
-        PullState::Advanced => Some(format!(
-            "#{number} advanced to {}",
-            head.chars().take(12).collect::<String>()
-        )),
+        PullState::Advanced => Some(format!("#{number} advanced to {}", short_id(head))),
         PullState::Reopened => Some(format!("#{number} reopened")),
         PullState::Unchanged | PullState::New => None,
     }

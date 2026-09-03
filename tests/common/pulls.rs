@@ -31,7 +31,8 @@ pub fn pull_request(number: u64, state: &str, branch: &str) -> PullRequest {
     }
 }
 
-/// A pull request at a stated head, updated at one fixed instant.
+/// [`pull_request`] at a stated head, updated later than the base fixture
+/// (2026-08-15 against 2026-01-01), so it wins a newest-wins comparison.
 pub fn pull_request_with_head(number: u64, state: &str, branch: &str, head: &str) -> PullRequest {
     PullRequest {
         head_ref_oid: head.to_owned(),

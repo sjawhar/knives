@@ -305,10 +305,7 @@ fn selected_carries_targets(
 }
 
 fn carries_revision(revision: &str, tip: &knives::ids::CommitId) -> String {
-    format!(
-        "{revision} @ {}",
-        tip.as_str().chars().take(12).collect::<String>()
-    )
+    format!("{revision} @ {}", tip.short())
 }
 
 fn print_carries(report: &CarriesReport, output: Output) -> anyhow::Result<()> {

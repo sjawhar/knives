@@ -16,12 +16,11 @@
 #[path = "common/lab.rs"]
 mod lab;
 
-use std::process::Command;
-
 use knives::ids::BranchName;
 use knives::jj::Repo;
 use knives::store::{OwnerKind, Store};
 use lab::{Lab, commit_at, knives_start, release_test_home};
+use std::process::Command;
 
 #[test]
 fn a_new_workspace_is_based_on_the_upstream_trunk_not_the_current_change() {

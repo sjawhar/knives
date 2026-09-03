@@ -39,6 +39,16 @@ string_id!(
     "A jj change. Stable across rewrites, and identical across disconnected clones, which is why the same change rewritten in two places collides."
 );
 string_id!(CommitId, "One concrete commit. A change may have several.");
+string_id!(RepoName, "A managed repo's name in the registry.");
+string_id!(
+    RemoteName,
+    "A remote's name, which this tool only ever derives from a role."
+);
+string_id!(
+    BranchName,
+    "A bookmark name with no remote qualifier and no decoration."
+);
+string_id!(WorkspaceName, "A jj workspace.");
 
 impl ChangeId {
     /// The prefix this program shows; see [`short_id`].
@@ -65,16 +75,6 @@ impl CommitId {
 pub fn short_id(id: &str) -> &str {
     id.char_indices().nth(12).map_or(id, |(end, _)| &id[..end])
 }
-string_id!(RepoName, "A managed repo's name in the registry.");
-string_id!(
-    RemoteName,
-    "A remote's name, which this tool only ever derives from a role."
-);
-string_id!(
-    BranchName,
-    "A bookmark name with no remote qualifier and no decoration."
-);
-string_id!(WorkspaceName, "A jj workspace.");
 
 /// A branch in a particular repo.
 ///
@@ -313,10 +313,11 @@ mod tests {
     }
 
     #[test]
-    fn short_id_keeps_twelve_characters_and_shorter_or_wide_text_whole() {
+    fn short_id_takes_twelve_characters_and_never_splits_one() {
         use super::{CommitId, short_id};
         // Given: a full commit id, an already-short one, and text a notch
-        // anchor could carry after sanitising: a multibyte character at the cut.
+        // anchor could carry after sanitising: a multibyte character at the cut,
+        // which a byte slice would split.
         assert_eq!(short_id("0123456789abcdef0123"), "0123456789ab");
         assert_eq!(short_id("0123456789ab"), "0123456789ab");
         assert_eq!(short_id("abc"), "abc");

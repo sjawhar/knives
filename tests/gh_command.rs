@@ -7,7 +7,7 @@
 
 #[path = "common/lab.rs"]
 mod lab;
-// allow: SIZE_OK: 709 lines - real-binary gh passthrough scenarios share one fixture and process harness.
+// allow: SIZE_OK: 714 lines - real-binary gh passthrough scenarios share one fixture and process harness.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;

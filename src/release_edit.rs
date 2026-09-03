@@ -15,7 +15,7 @@ use knives::release_model::{
     last_recorded_parents, member_parents, members_event_text, trunk_positions,
 };
 
-use super::{bookmark_tip, cut_request, parent_sources, scribe_for, selected};
+use super::{scribe_for, selected};
 
 /// One deliberate change to the release in hand.
 pub(crate) enum ReleaseEdit {
@@ -251,7 +251,7 @@ fn edit_release(
         );
         return Ok(Exit::Incomplete);
     }
-    if !release_is_locally_movable(&opened, repo, &release_name)? {
+    if !release_is_locally_movable(&opened, repo, &release_name) {
         return Ok(Exit::Incomplete);
     }
     let release = ReleaseInHand::read(&opened, entry, release_name)?;
@@ -295,13 +295,8 @@ fn apply_edit(
     delta: &str,
 ) -> anyhow::Result<Exit> {
     let (repo, opened, release) = (context.repo, context.opened, context.release);
-    // Built through `cut_request` so an edited release's description reads exactly
-    // like a fresh cut's, from the same (source, commit) pairs.
-    let provenance = parent_sources(opened, entry, &entry.release_scheme(), new_parents)?;
-    let message = format!(
-        "{}\n\n{delta}",
-        cut_request(release.name.clone(), &provenance).message()
-    );
+    let provenance = release::parent_sources(opened, entry, &entry.release_scheme(), new_parents)?;
+    let message = release::composition_message(&release.name, &provenance, delta);
     let created = knives::jj::write_release(
         &entry.path,
         &knives::jj::ReleaseWrite {
@@ -404,9 +399,9 @@ pub(crate) fn release_is_locally_movable(
     opened: &knives::jj::Repo,
     repo: &RepoName,
     name: &str,
-) -> anyhow::Result<bool> {
-    if bookmark_tip(opened, name)?.is_some() {
-        return Ok(true);
+) -> bool {
+    if opened.local_bookmark_tip(name).is_some() {
+        return true;
     }
     match knives::ids::BookmarkRef::parse(name) {
         knives::ids::BookmarkRef::Remote { branch, remote } => println!(
@@ -418,7 +413,7 @@ pub(crate) fn release_is_locally_movable(
              resolve its divergence first"
         ),
     }
-    Ok(false)
+    false
 }
 
 fn include_edit(
@@ -427,7 +422,9 @@ fn include_edit(
     why: Option<&str>,
 ) -> anyhow::Result<EditOutcome> {
     let (repo, opened, release) = (context.repo, context.opened, context.release);
-    let tip = bookmark_tip(opened, target)?.or_else(|| opened.resolve_commit(target).ok());
+    let tip = opened
+        .local_bookmark_tip(target)
+        .or_else(|| opened.resolve_commit(target).ok());
     let Some(tip) = tip else {
         println!("{repo}: {target} is neither a local bookmark nor a resolvable revision");
         return Ok(EditOutcome::Settled(Exit::Incomplete));
@@ -514,7 +511,7 @@ fn include_edit(
 fn drop_edit(context: &EditContext<'_>, target: &str, why: &str) -> anyhow::Result<EditOutcome> {
     let (repo, opened, release) = (context.repo, context.opened, context.release);
     let mut candidates = Vec::new();
-    if let Some(tip) = bookmark_tip(opened, target)? {
+    if let Some(tip) = opened.local_bookmark_tip(target) {
         if release.parents.contains(&tip) {
             // The bookmark sits exactly on a parent: that parent is the branch.
             candidates.push(tip);
@@ -755,7 +752,7 @@ fn advance_named_members(
             .find(|(carried, _)| carried == branch.as_str())
             .map(|(_, tip)| tip.clone());
         let Some(tip) = named else {
-            if bookmark_tip(opened, branch.as_str())?.is_some() {
+            if opened.local_bookmark_tip(branch.as_str()).is_some() {
                 // The trunk and our release names are the two bookmarks a release
                 // can never carry, and naming one here reached the same mover the
                 // bare advance deliberately keeps them away from.
@@ -858,7 +855,7 @@ fn advance_named_member_from(
         .find(|(carried, _)| carried == branch.as_str())
         .map(|(_, tip)| tip.clone())
     else {
-        if bookmark_tip(opened, branch.as_str())?.is_some() {
+        if opened.local_bookmark_tip(branch.as_str()).is_some() {
             println!(
                 "{repo}: {branch} is the trunk or a release name, so it is never a member \
                  of {}",

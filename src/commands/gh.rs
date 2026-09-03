@@ -2,7 +2,7 @@
 //!
 //! This command executes `gh` directly, so the usual render/run split does not apply:
 //! there is no knives result to render.
-// allow: SIZE_OK: 1349 lines - single passthrough pipeline; splitting would separate resolution steps that read as one procedure.
+// allow: SIZE_OK: 1425 lines - single passthrough pipeline; splitting would separate resolution steps that read as one procedure.
 use std::collections::BTreeMap;
 use std::io::Read as _;
 use std::os::unix::{fs::PermissionsExt as _, process::ExitStatusExt as _};
