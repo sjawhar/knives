@@ -31,35 +31,34 @@ pub enum Outcome {
         entry: RepoEntry,
         warnings: Vec<String>,
     },
-    /// Not a repository, a git clone with no jj store (the hook binds those;
-    /// fork verbs do not), or a checkout missing a role: the refusal line.
+    /// Not a repository, a `.jj` with no `.git` (not colocated), a git clone
+    /// with no jj store (the hook binds those; fork verbs do not), or a checkout
+    /// missing a role: the refusal line.
     Refused(String),
 }
 
 /// Decide for the checkout `path` is inside.
 ///
-/// `path` may be any directory inside the checkout: [`bind::checkout_root`]
-/// finds the root, following a workspace's pointer to its checkout. Only
-/// remotes already named for a role are adopted. Guessing which arbitrary
-/// remote is the upstream is a coin flip, and a wrong upstream makes every
-/// landed check answer about the wrong repository.
+/// `path` may be any directory inside the checkout: [`bind::verb_checkout`]
+/// finds the colocated checkout, a workspace's through git. Only remotes
+/// already named for a role are adopted. Guessing which arbitrary remote is
+/// the upstream is a coin flip, and a wrong upstream makes every landed check
+/// answer about the wrong repository.
 ///
 /// # Errors
 ///
-/// Returns an error when the checkout's remotes cannot be read — including a
-/// workspace whose checkout is gone, which jj reports in its own words.
+/// Returns an error when the checkout's remotes cannot be read, in git's words.
 pub fn outcome_for(path: &Path, registry: &Registry) -> anyhow::Result<Outcome> {
-    let Some(root) = bind::checkout_root(path) else {
-        return Ok(Outcome::Refused(format!(
-            "{} is not a repository",
-            path.display()
-        )));
+    let root = match bind::verb_checkout(path) {
+        Ok(root) => root,
+        Err(Unbound::NotInsideARepository) => {
+            return Ok(Outcome::Refused(format!(
+                "{} is not a repository",
+                path.display()
+            )));
+        }
+        Err(unbound) => return Ok(Outcome::Refused(unbound.message(registry))),
     };
-    if !root.join(".jj").is_dir() {
-        return Ok(Outcome::Refused(
-            Unbound::GitOnly { root }.message(registry),
-        ));
-    }
     Ok(decide(&root, &bind::remotes(&root)?, registry))
 }
 

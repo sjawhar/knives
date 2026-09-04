@@ -353,7 +353,7 @@ fn tool_after_trust_roots_injects_guidance_without_managed_notice() {
     // Given: an unregistered checkout with AGENTS.md and a [trust].roots config entry.
     let home = tempfile::tempdir().expect("config home");
     let trust_root = home.path().join("unregistered-trust-root");
-    std::fs::create_dir_all(trust_root.join(".jj")).expect("create checkout");
+    std::fs::create_dir_all(trust_root.join(".git")).expect("create checkout");
     std::fs::write(trust_root.join("AGENTS.md"), "trust root instructions")
         .expect("write trust instructions");
     std::fs::write(trust_root.join("file.txt"), "content").expect("write file");
@@ -384,9 +384,12 @@ fn tool_after_trust_roots_injects_guidance_without_managed_notice() {
 }
 
 #[test]
-fn trusted_owner_guidance_requires_the_checkout_to_be_the_git_root() {
-    // Given: an attacker-controlled nested `.jj` directory under a Git checkout
-    // whose remote self-declares a trusted owner.
+fn a_nested_jj_under_a_trusted_git_checkout_is_the_checkouts_content() {
+    // Given: a `.jj` directory nested under a Git checkout whose remote
+    // self-declares a trusted owner. A `.jj` is content a checkout can carry;
+    // the nearest `.git` decides, so the nested tree gets the checkout's
+    // verdict — its guidance, attributed to the checkout — and never its own
+    // identity.
     let home = tempfile::tempdir().expect("config home");
     let git_root = home.path().join("parent-git");
     let nested = git_root.join("node_modules/evil");
@@ -408,15 +411,15 @@ fn trusted_owner_guidance_requires_the_checkout_to_be_the_git_root() {
         .expect("add trusted remote");
     assert!(remote_added.success());
     std::fs::create_dir_all(nested.join(".jj")).expect("create nested pseudo-checkout");
-    std::fs::write(nested.join("AGENTS.md"), "attacker instructions").expect("write guidance");
     std::fs::write(nested.join("file.txt"), "content").expect("write file");
+    std::fs::write(git_root.join("AGENTS.md"), "parent instructions").expect("write guidance");
     std::fs::write(
         home.path().join("repos.toml"),
         "[trust]\nowners = [\"trusted-owner\"]\n",
     )
     .expect("write trust config");
 
-    // When: the hook reads the nested attacker's file.
+    // When: the hook reads the nested file.
     let output = run_hook(
         home.path(),
         &tool(
@@ -425,8 +428,11 @@ fn trusted_owner_guidance_requires_the_checkout_to_be_the_git_root() {
         ),
     );
 
-    // Then: the parent checkout's remote identity cannot trust nested guidance.
-    assert_eq!(addition(&output), "");
+    // Then: the checkout's guidance, as the checkout; no managed notice.
+    let added = addition(&output);
+    assert!(added.contains("repo=\"parent-git\""), "{added}");
+    assert!(added.contains("parent instructions"), "{added}");
+    assert!(!added.contains("<knives-notice-"), "{added}");
 }
 
 #[test]

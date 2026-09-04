@@ -100,7 +100,11 @@ masks, so the question "what is this weird branch" is usually answered before yo
 
 ## Install
 
-Download the release archive for your platform, then put `bin/` on your `PATH`:
+knives reads a checkout's identity through git, so a jj workspace must carry a `.git` file beside
+its `.jj`. That needs a jj whose `jj workspace add` registers a git worktree for the workspace
+(`git.auto-register-worktrees`); upstream jj does not yet, so install a build that does — the one
+your fleet's tool configuration names. Then download the knives release archive for your platform
+and put `bin/` on your `PATH`:
 
 ```
 tar xzf knives-v0.1.2-linux-x86_64.tar.gz
@@ -302,7 +306,8 @@ The boundary that made the gap is a security control, so both adapters re-establ
 one rather than removing it. The `[trust]` rules are the allowlist: only a repository they name —
 by identity, owner, or directory — contributes guidance, and a fork entry alone contributes the
 managed notice and nothing more. Containment is checked by path components rather than string
-prefix, symlinks are resolved first, and nested guidance inside a repository is mentioned rather
+prefix, symlinks are resolved first, and the `AGENTS.md` files from the touched file's directory
+up to the repository root are injected nearest first, while `CONTRIBUTING.md` is mentioned rather
 than injected. Guidance arrives wrapped in a per-injection nonce and framed as data, so a
 repository whose files you are reading cannot forge an instruction to you.
 

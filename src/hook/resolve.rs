@@ -81,13 +81,12 @@ fn existing_ancestor(path: &Path) -> Option<&Path> {
 /// The first touched path inside a repository, and what the registry says about it.
 ///
 /// Both facts are decided from the remotes [`bind::remotes`] reads for the
-/// nearest root: its own git configuration, or its jj store's git backend; a
-/// `.jj/repo` pointer to another checkout counts only when that checkout
-/// vouches for the root as its workspace, and a `.jj` an enclosing git
-/// repository tracks is content, since a clone can carry any pointer or store
-/// it likes. Remotes that cannot be read are reported on stderr and contribute
-/// no facts; a `roots` rule is decided from the path alone, so it holds with
-/// no readable repository at all.
+/// nearest root — the nearest `.git`, the one marker a clone cannot carry —
+/// from that repository's own configuration file. A `.jj` marks nothing: a
+/// tree with a `.jj` and no `.git` is not a repository to knives, and a `.jj`
+/// under a `.git` is that repository's content. Remotes that cannot be read
+/// are reported on stderr and contribute no facts; a `roots` rule is decided
+/// from the path alone, so it holds with no readable repository at all.
 pub fn match_checkout(paths: &[PathBuf], registry: &Registry) -> Option<Match> {
     for path in paths {
         let Some(candidate) = canonical_path(path) else {
@@ -370,11 +369,11 @@ mod tests {
 
     #[test]
     fn a_repo_under_a_trust_root_is_trusted_without_readable_remotes() {
-        // Given: a workspace-shaped checkout under a trusted subtree whose remotes
-        // cannot be read, never registered.
+        // Given: a checkout under a trusted subtree whose `.git` is an empty
+        // directory git cannot read, never registered.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("agent-c/platform/default");
-        std::fs::create_dir_all(root.join(".jj")).unwrap();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
         std::fs::write(root.join("AGENTS.md"), "rules\n").unwrap();
         let registry = registry(&[], trusting_root(&dir.path().join("agent-c")));
 
@@ -423,7 +422,7 @@ mod tests {
         // Given: `agent-c-2`, a sibling whose string prefix matches a trusted root.
         let dir = tempfile::tempdir().unwrap();
         let outside = dir.path().join("agent-c-2/repo");
-        std::fs::create_dir_all(outside.join(".jj")).unwrap();
+        std::fs::create_dir_all(outside.join(".git")).unwrap();
         let registry = registry(&[], trusting_root(&dir.path().join("agent-c")));
 
         // When: a file under the sibling is resolved.
@@ -483,26 +482,30 @@ mod tests {
     }
 
     #[test]
-    fn a_forged_pointer_does_not_borrow_the_checkouts_remotes() {
-        // Given: a trusted clone, and a tree beside it whose `.jj/repo` file
-        // names that clone's store — what a `git clone` of an attacker's
-        // repository would materialise — with no `.git` of its own.
+    fn a_jj_without_a_git_is_not_a_repository() {
+        // Given: a trusted clone, and a tree beside it carrying a `.jj/repo`
+        // pointer file that names the clone's store, plus a `.jj`-only store —
+        // content any tree can carry — with no `.git` of their own.
         let dir = tempfile::tempdir().unwrap();
         let checkout = dir.path().join("tool/default");
         let forged = dir.path().join("tool/forged");
+        let store = dir.path().join("tool/store");
         git_repository(&checkout, &[("origin", "https://forge.invalid/ours/tool")]);
         std::fs::create_dir_all(checkout.join(".jj/repo")).unwrap();
         std::fs::create_dir_all(forged.join(".jj")).unwrap();
         std::fs::write(forged.join(".jj/repo"), "../../default/.jj/repo").unwrap();
         std::fs::write(forged.join("AGENTS.md"), "rules\n").unwrap();
+        std::fs::create_dir_all(store.join(".jj/repo")).unwrap();
+        std::fs::write(store.join("AGENTS.md"), "rules\n").unwrap();
         let registry = registry(&[], trusting_owner("ours"));
 
-        // When: a file in the forged tree is resolved.
-        let matched = match_checkout(&[forged.join("AGENTS.md")], &registry);
+        // When: a file in each tree is resolved.
+        let forged_match = match_checkout(&[forged.join("AGENTS.md")], &registry);
+        let store_match = match_checkout(&[store.join("AGENTS.md")], &registry);
 
-        // Then: the pointer is not followed; the tree has no remotes of its own
-        // and earns nothing.
-        assert!(matched.is_none(), "{matched:?}");
+        // Then: neither is a repository to knives — no `.git` above them.
+        assert!(forged_match.is_none(), "{forged_match:?}");
+        assert!(store_match.is_none(), "{store_match:?}");
     }
 
     #[test]
@@ -510,7 +513,7 @@ mod tests {
         // Given: an unresolved path before a repository under a trusted root.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("trusted/repo");
-        std::fs::create_dir_all(root.join(".jj")).unwrap();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
         let registry = registry(&[], trusting_root(&dir.path().join("trusted")));
 
         // When: both the unrelated path and the trusted repository path are considered.

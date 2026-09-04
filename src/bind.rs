@@ -11,14 +11,13 @@ use std::path::{Path, PathBuf};
 
 use crate::config::{Registry, RepoEntry, Role};
 use crate::ids::RepoName;
-use crate::jj::{Unvouched, vouched_workspace};
 use crate::remote_url::same_remote;
 
 /// A repository root on this machine and the remotes it declares.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Checkout {
-    /// The checkout root: the directory whose `.jj/repo` is a directory (or the
-    /// `.git`-only root). A workspace resolves to its checkout, never to itself.
+    /// The checkout root: the directory holding the `.git` directory. A
+    /// workspace resolves to its checkout, never to itself.
     pub path: PathBuf,
     pub remotes: BTreeMap<String, String>,
 }
@@ -81,8 +80,6 @@ impl<'a> Fork<'a> {
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum BindError {
-    #[error("{} is neither a jj nor a git repository", root.display())]
-    NotARepository { root: PathBuf },
     #[error("reading remotes of {}: {detail}", root.display())]
     RemotesUnreadable { root: PathBuf, detail: String },
 }
@@ -90,10 +87,13 @@ pub enum BindError {
 /// Why `here` did not bind.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Unbound {
-    /// No `.jj` or `.git` at or above the directory.
+    /// No `.git` at or above the directory.
     NotInsideARepository,
     /// A git clone with no `.jj`: the hook binds those, fork verbs need jj.
     GitOnly { root: PathBuf },
+    /// A `.jj` with no `.git` beside it: a non-colocated checkout, which knives
+    /// cannot read through git, or a `.jj` some tree carries as content.
+    NotColocated { root: PathBuf },
     /// A repository, but it declares no `upstream` remote.
     NoUpstream { root: PathBuf },
     /// A fork of something the registry does not list.
@@ -114,6 +114,13 @@ impl Unbound {
             Self::GitOnly { root } => {
                 return format!(
                     "{} is a git clone, not a jj checkout; fork commands need jj",
+                    root.display()
+                );
+            }
+            Self::NotColocated { root } => {
+                return format!(
+                    "{} has a .jj but no .git; knives reads a checkout through git, so it must \
+                     be colocated",
                     root.display()
                 );
             }
@@ -202,17 +209,28 @@ fn known(registry: &Registry) -> String {
         .join(", ")
 }
 
-/// The first ancestor of `path` (canonicalised) holding `.jj` or `.git`.
+/// The first ancestor of `path` (canonicalised) holding `.git`, as a directory
+/// or a worktree's pointer file.
 ///
-/// Nearest marker of either kind wins, so a clone nested inside a checkout is
-/// its own root and never inherits the enclosing identity. A jj workspace is
-/// its own root here.
+/// `.git` is the one marker a clone cannot deliver: git refuses to check out a
+/// path component of that name whatever its type, so it is always the
+/// repository's own. A `.jj` marks nothing here — a store, a pointer, a symlink
+/// named `.jj` are all content a tree can carry. Nearest wins, so a clone
+/// nested inside a checkout is its own root and never inherits the enclosing
+/// identity; a jj workspace of a colocated checkout carries a `.git` file and
+/// is its own root too.
 pub fn nearest_root(path: &Path) -> Option<PathBuf> {
     let start = path.canonicalize().ok()?;
     start
         .ancestors()
-        .find(|directory| directory.join(".jj").is_dir() || directory.join(".git").exists())
+        .find(|directory| directory.join(".git").exists())
         .map(Path::to_path_buf)
+}
+
+/// Whether `root` holds a real `.jj` directory: what makes a git repository a
+/// jj checkout knives manages. A symlink named `.jj` is content, not a marker.
+pub fn has_jj_directory(root: &Path) -> bool {
+    std::fs::symlink_metadata(root.join(".jj")).is_ok_and(|metadata| metadata.file_type().is_dir())
 }
 
 /// The checkout `path` belongs to: [`nearest_root`], then [`checkout_of_root`].
@@ -222,126 +240,37 @@ pub fn checkout_root(path: &Path) -> Option<PathBuf> {
 
 /// The checkout a repository root belongs to.
 ///
-/// The root itself, or — when its `.jj/repo` is a file, no enclosing git
-/// repository tracks it, and the checkout it names vouches for the root as its
-/// workspace ([`jj_store`]) — that checkout.
-///
-/// This decides where a fork verb operates ([`here`] reads that checkout's
-/// remotes) and folds a workspace into its checkout. A pointer the checkout
-/// does not vouch for, one an enclosing git repository tracks as content, one
-/// that cannot be read, or one that names a store that is no longer a directory
-/// (the checkout was deleted under the workspace) leaves the root as its own,
-/// so [`remotes`] refuses it in the pointer's terms rather than reporting a
-/// directory that is not a repository.
+/// The root itself when `.git` is its own directory; else — `.git` a file, a
+/// linked worktree such as a jj workspace of a colocated checkout — the
+/// directory holding the common git directory `git rev-parse --git-common-dir`
+/// reports. This is where a fork verb operates and beside what workspaces are
+/// placed; git resolves the worktree pointer itself, and nothing under `.jj`
+/// is read. A worktree git cannot answer for stays its own root, so
+/// [`remotes`] reports git's error.
 pub fn checkout_of_root(root: &Path) -> PathBuf {
-    if !root.join(".jj").join("repo").is_file() || tracking_git_ancestor(root).is_some() {
+    if root.join(".git").is_dir() {
         return root.to_owned();
     }
-    jj_store(root).map_or_else(|_| root.to_owned(), |(checkout, _)| checkout)
-}
-
-/// The jj store that owns `root`, as `(checkout, checkout/.jj/repo)`: `root`'s
-/// own when `.jj/repo` is a directory; when it is a pointer file, the checkout
-/// it names, provided that checkout vouches for `root` as its workspace — the
-/// operation `root/.jj/working_copy` recorded is in the checkout's operation
-/// store ([`vouched_workspace`]). A pointer file is ordinary content any tree
-/// can carry, and only the checkout's records say whose workspace the tree is.
-/// `Err` is the refusal's detail.
-fn jj_store(root: &Path) -> Result<(PathBuf, PathBuf), String> {
-    let jj_dir = root.join(".jj");
-    let pointer = jj_dir.join("repo");
-    if pointer.is_dir() {
-        return Ok((root.to_owned(), pointer));
-    }
-    if !pointer.is_file() {
-        return Err(".jj/repo is neither a store nor a pointer to one".to_owned());
-    }
-    // A workspace's pointer holds the checkout's `.jj/repo` store, relative to
-    // the workspace's `.jj` when it can be; the checkout is two levels above it.
-    let text = std::fs::read_to_string(&pointer).map_err(|_| ".jj/repo cannot be read")?;
-    let store = jj_dir.join(text.trim());
-    let store = store
-        .canonicalize()
-        .map_err(|_| format!(".jj/repo names {}, which does not exist", store.display()))?;
-    let checkout = store
-        .parent()
-        .and_then(Path::parent)
-        .ok_or_else(|| format!(".jj/repo names {}, which is not a store", store.display()))?
-        .to_owned();
-    match vouched_workspace(&checkout, root) {
-        Ok(()) => Ok((checkout, store)),
-        Err(Unvouched::NotARepository { detail }) => Err(format!(
-            ".jj/repo names {}, which is not a repository: {detail}",
-            checkout.display()
-        )),
-        Err(Unvouched::StateUnreadable) => Err(".jj/working_copy cannot be read".to_owned()),
-        Err(Unvouched::Unknown {
-            workspace,
-            operation,
-        }) => Err(format!(
-            ".jj/repo names {}, which has no workspace {workspace} at operation {operation}",
-            checkout.display()
-        )),
-    }
-}
-
-/// The git repository a jj store keeps its objects and remotes in:
-/// `store/git` when the store owns one, else the directory `store/git_target`
-/// names (a colocated checkout's `.git`).
-fn store_git_dir(store: &Path) -> Result<PathBuf, String> {
-    let store = store.join("store");
-    let own = store.join("git");
-    if own.is_dir() {
-        return Ok(own);
-    }
-    let target = std::fs::read_to_string(store.join("git_target"))
-        .map_err(|_| format!("{} has no git backend", store.display()))?;
-    let git_dir = store.join(target.trim());
-    git_dir.canonicalize().map_err(|_| {
-        format!(
-            "{} names {}, which does not exist",
-            store.join("git_target").display(),
-            git_dir.display()
-        )
-    })
-}
-
-/// The nearest git repository strictly above `root` that tracks `root/.jj/repo`
-/// as content, when one does.
-///
-/// git refuses to check out a `.git` path component but not a `.jj` one, so a
-/// plain `git clone` delivers whatever `.jj` store or pointer a repository
-/// committed — a tree that would otherwise be the nearest root and speak for
-/// itself. Decided by `git ls-files --error-unmatch` at the nearest ancestor
-/// holding `.git`: exit 0 is tracked; anything else (untracked, ignored, or a
-/// `.git` git cannot open) leaves the root as its own repository. Only the
-/// nearest ancestor is asked, as git itself would.
-fn tracking_git_ancestor(root: &Path) -> Option<PathBuf> {
-    let ancestor = root
-        .ancestors()
-        .skip(1)
-        .find(|directory| directory.join(".git").exists())?;
-    let relative = root.strip_prefix(ancestor).ok()?.join(".jj").join("repo");
-    let tracked = git(ancestor)
-        .args(["--literal-pathspecs", "ls-files", "--error-unmatch", "--"])
-        .arg(relative)
+    git(root)
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
         .output()
-        .is_ok_and(|output| output.status.success());
-    tracked.then(|| ancestor.to_owned())
-}
-
-fn tracked_detail(ancestor: &Path) -> String {
-    format!(
-        ".jj is tracked by {}; a committed store is content, not a checkout",
-        ancestor.display()
-    )
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| PathBuf::from(String::from_utf8_lossy(&output.stdout).trim()))
+        // A linked worktree's common dir is the checkout's `.git`; a submodule's
+        // is `<super>/.git/modules/<name>`, and the submodule is its own root.
+        .filter(|common| common.file_name().is_some_and(|name| name == ".git"))
+        .and_then(|common| common.parent().map(Path::to_path_buf))
+        .and_then(|checkout| checkout.canonicalize().ok())
+        .unwrap_or_else(|| root.to_owned())
 }
 
 /// A `git` invocation that reads only the repository it is pointed at.
 ///
 /// git hooks, `rebase -x`, `bisect run`, and some editors export `GIT_DIR` and
-/// its companions; inherited, they would make every root report the exporting
-/// repository's configuration.
+/// its companions, and `git -c` exports `GIT_CONFIG_PARAMETERS` to every
+/// subprocess; inherited, they would make a root report another repository's
+/// configuration, or configuration that lives in no repository at all.
 fn git_command() -> std::process::Command {
     let mut command = std::process::Command::new("git");
     for variable in [
@@ -352,61 +281,47 @@ fn git_command() -> std::process::Command {
     ] {
         command.env_remove(variable);
     }
+    for (name, _) in std::env::vars_os() {
+        if name.as_encoded_bytes().starts_with(b"GIT_CONFIG_") {
+            command.env_remove(name);
+        }
+    }
     command
 }
 
-/// [`git_command`] run in `directory` (`git -C`).
+/// [`git_command`] run in `directory` (`git -C`), forbidden from discovering a
+/// repository above it: a `.git` git cannot open (empty, half-initialised) would
+/// otherwise let discovery continue to a parent repository and answer for it.
 pub(crate) fn git(directory: &Path) -> std::process::Command {
     let mut command = git_command();
+    if let Some(parent) = directory.parent() {
+        command.env("GIT_CEILING_DIRECTORIES", parent);
+    }
     command.arg("-C").arg(directory);
     command
 }
 
-/// Remotes of the repository rooted at `root`, from the git configuration of
-/// the repository that owns the root — never by running jj.
+/// Remotes of the repository rooted at `root`, from its own git configuration.
 ///
-/// `.git` present (a directory, or a worktree's pointer file, which git
-/// validates itself) → `git -C root config --get-regexp '^remote\..*\.url$'`,
-/// whether or not `.jj` is beside it: a colocated checkout keeps its remotes
-/// there anyway. Otherwise `.jj` a directory → the same query against the jj
-/// store's git backend ([`store_git_dir`]), provided no enclosing git
-/// repository tracks the `.jj` as content ([`tracking_git_ancestor`]) and,
-/// when `.jj/repo` is a pointer file, the checkout it names vouches for `root`
-/// as its workspace ([`jj_store`]). Git wins because a `.jj` is ordinary
-/// content a clone can carry, while the `.git` that arrives with it holds the
-/// remotes it was actually cloned from; jj is never run because any jj command
-/// resolves divergent operation heads by writing, and a read must not write to
-/// someone's checkout.
+/// `git -C root config --local --get-regexp '^remote\..*\.url$'`: the
+/// repository's own configuration file and nothing else — not the user's, not
+/// the system's, not the environment's. For a linked worktree that is the
+/// common repository's file, so a jj workspace of a colocated checkout reports
+/// the checkout's remotes. A root with no `.git` is not a repository knives
+/// reads.
 pub fn remotes(root: &Path) -> Result<BTreeMap<String, String>, BindError> {
     let failure = |detail: String| BindError::RemotesUnreadable {
         root: root.to_owned(),
         detail,
     };
-    let mut query = if root.join(".git").exists() {
-        git(root)
-    } else if root.join(".jj").is_dir() {
-        if let Some(ancestor) = tracking_git_ancestor(root) {
-            return Err(failure(tracked_detail(&ancestor)));
-        }
-        let (checkout, store) = jj_store(root).map_err(failure)?;
-        // A workspace of a committed store is judged as the store is: the
-        // checkout a pointer names is content when git tracks it.
-        if checkout != root
-            && let Some(ancestor) = tracking_git_ancestor(&checkout)
-        {
-            return Err(failure(tracked_detail(&ancestor)));
-        }
-        let git_dir = store_git_dir(&store).map_err(failure)?;
-        let mut command = git_command();
-        command.arg("--git-dir").arg(git_dir);
-        command
-    } else {
-        return Err(BindError::NotARepository {
-            root: root.to_owned(),
-        });
-    };
-    let output = query
-        .args(["config", "--get-regexp", "^remote\\..*\\.url$"])
+    let output = git(root)
+        .args([
+            "config",
+            "--local",
+            "-z",
+            "--get-regexp",
+            "^remote\\..*\\.url$",
+        ])
         .output()
         .map_err(|error| failure(error.to_string()))?;
     // git exits 1 with empty output when nothing matches: no remotes, not an error.
@@ -416,16 +331,17 @@ pub fn remotes(root: &Path) -> Result<BTreeMap<String, String>, BindError> {
         return Err(failure(error_line(&output.stderr)));
     }
     String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| {
-            // git prints `remote.<name>.url <url>`.
-            line.split_once(' ')
+        .split('\0')
+        .filter(|record| !record.is_empty())
+        .map(|record| {
+            // With `-z`, git prints `remote.<name>.url\n<url>` per NUL-terminated record.
+            record
+                .split_once('\n')
                 .and_then(|(key, url)| {
                     let name = key.strip_prefix("remote.")?.strip_suffix(".url")?;
                     Some((name.to_owned(), url.trim().to_owned()))
                 })
-                .ok_or_else(|| failure(format!("unparseable remote line {line:?}")))
+                .ok_or_else(|| failure(format!("unparseable remote record {record:?}")))
         })
         .collect()
 }
@@ -456,18 +372,41 @@ pub fn entry_for<'a>(registry: &'a Registry, upstream: &str) -> Option<(RepoName
         .map(|(name, entry)| (RepoName::new(name.as_str()), entry))
 }
 
-/// The fork the current directory is inside.
+/// The colocated jj checkout a fork verb run in `cwd` operates on.
 ///
-/// The checkout its nearest root belongs to, bound by the remotes read there.
-/// A verb ran in that directory, so its checkout's remotes are what the verb
-/// is about — no trust decision rests on them.
-pub fn here<'a>(registry: &'a Registry, cwd: &Path) -> Result<Fork<'a>, Unbound> {
-    let Some(root) = checkout_root(cwd) else {
-        return Err(Unbound::NotInsideARepository);
-    };
-    if !root.join(".jj").is_dir() {
+/// Or why there is none: a `.jj` nearer than any `.git` (a non-colocated
+/// checkout, or a `.jj` some tree carries), no `.git` above at all, or a
+/// `.git` with no `.jj` beside it (a plain git clone).
+pub fn verb_checkout(cwd: &Path) -> Result<PathBuf, Unbound> {
+    if let Some(root) = jj_only_ancestor(cwd) {
+        return Err(Unbound::NotColocated { root });
+    }
+    let root = checkout_root(cwd).ok_or(Unbound::NotInsideARepository)?;
+    if !has_jj_directory(&root) {
         return Err(Unbound::GitOnly { root });
     }
+    Ok(root)
+}
+
+/// The nearest ancestor of `path` (canonicalised) holding a real `.jj`
+/// directory but no `.git`, stopping at the nearest `.git`: a non-colocated
+/// checkout the directory is inside, or a `.jj` some tree carries as content.
+fn jj_only_ancestor(path: &Path) -> Option<PathBuf> {
+    let start = path.canonicalize().ok()?;
+    start
+        .ancestors()
+        .take_while(|directory| !directory.join(".git").exists())
+        .find(|directory| has_jj_directory(directory))
+        .map(Path::to_path_buf)
+}
+
+/// The fork the current directory is inside.
+///
+/// The checkout its nearest root belongs to ([`verb_checkout`]), bound by the
+/// remotes read there. A verb ran in that directory, so its checkout's remotes
+/// are what the verb is about — no trust decision rests on them.
+pub fn here<'a>(registry: &'a Registry, cwd: &Path) -> Result<Fork<'a>, Unbound> {
+    let root = verb_checkout(cwd)?;
     let remotes = remotes(&root).map_err(Unbound::Unreadable)?;
     let Some(upstream) = remotes.get("upstream") else {
         return Err(Unbound::NoUpstream { root });
@@ -524,7 +463,8 @@ impl Scan<'_> {
 /// `home` is depth 0; `~/a/b/c` is read and its children are not queued.
 const SCAN_DEPTH: usize = 3;
 
-/// Scan `home` for jj checkouts ([`checkouts_under`]) and bind each to its entry.
+/// Scan `home` for colocated jj checkouts ([`checkouts_under`]) and bind each
+/// to its entry.
 ///
 /// Every checkout's remotes are read at once, one thread each: each read is a
 /// process spawn, and a home holds tens of checkouts, not thousands.
@@ -606,22 +546,24 @@ pub fn scan<'a>(registry: &'a Registry, home: &Path) -> Scan<'a> {
     scan
 }
 
-/// The jj checkouts (`.jj/repo` a directory) under `home`, to depth three.
+/// The colocated jj checkouts under `home`, to depth three: directories holding
+/// a `.git` directory and a real `.jj` directory ([`has_jj_directory`]).
 ///
 /// Directories named with a leading `.` are skipped, symlinks are not followed,
-/// and nothing below a `.jj` is visited — except `home` itself, whose children
-/// are always visited: a home that is a repository (a dotfiles checkout, say)
-/// still holds the forks under it. A `.jj/repo` file is a workspace, found
-/// through its checkout; a git-only clone is not a fork checkout, and a
-/// git-tracked parent (`~/work/.git`) does not hide the forks beneath it. A
-/// directory that could not be listed is pushed to `problems`.
+/// and nothing below a real `.jj` is visited — except `home` itself, whose
+/// children are always visited: a home that is a repository (a dotfiles
+/// checkout, say) still holds the forks under it. A jj workspace carries a
+/// `.git` *file* and is found through its checkout, not as a candidate. A
+/// `.jj` with no `.git` is passed over in silence: content some tree carries,
+/// or a checkout knives does not read. A git-only clone is not a fork checkout,
+/// and a git-tracked parent (`~/work/.git`) does not hide the forks beneath
+/// it. A directory that could not be listed is pushed to `problems`.
 fn checkouts_under(home: &Path, problems: &mut Vec<String>) -> Vec<PathBuf> {
     let mut checkouts = Vec::new();
     let mut pending = vec![(home.to_owned(), 0usize)];
     while let Some((directory, depth)) = pending.pop() {
-        let jj = directory.join(".jj");
-        let is_jj = jj.is_dir();
-        if is_jj && jj.join("repo").is_dir() {
+        let is_jj = has_jj_directory(&directory);
+        if is_jj && directory.join(".git").is_dir() {
             checkouts.push(directory.clone());
         }
         if (is_jj && depth > 0) || depth == SCAN_DEPTH {
@@ -689,7 +631,53 @@ mod tests {
     use crate::config::{Registry, RepoEntry};
     use crate::ids::RepoName;
 
-    use super::{BindError, Checkout, Fork, Unbound, Unresolved, error_line};
+    use super::{
+        BindError, Checkout, Fork, Unbound, Unresolved, error_line, has_jj_directory,
+        jj_only_ancestor, nearest_root,
+    };
+
+    #[test]
+    fn the_nearest_root_is_the_nearest_git_and_a_jj_alone_marks_nothing() {
+        // `outer/.git` encloses `outer/store/.jj` (a `.jj`-only directory) and
+        // `outer/store/deep`; the root of both is `outer`.
+        let dir = tempfile::tempdir().unwrap();
+        let outer = dir.path().join("outer");
+        let store = outer.join("store");
+        let deep = store.join("deep");
+        std::fs::create_dir_all(outer.join(".git")).unwrap();
+        std::fs::create_dir_all(store.join(".jj")).unwrap();
+        std::fs::create_dir_all(&deep).unwrap();
+        let canonical_outer = outer.canonicalize().unwrap();
+        assert_eq!(nearest_root(&deep), Some(canonical_outer.clone()));
+        assert_eq!(nearest_root(&store), Some(canonical_outer));
+        // The `.jj`-only directory is what a fork verb run inside it is refused as.
+        assert_eq!(jj_only_ancestor(&deep), Some(store.canonicalize().unwrap()));
+        assert_eq!(jj_only_ancestor(&outer), None);
+        // No `.git` anywhere: no root at all.
+        let alone = dir.path().join("alone");
+        std::fs::create_dir_all(alone.join(".jj")).unwrap();
+        assert_eq!(nearest_root(&alone), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_named_jj_is_not_a_checkout_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real-store");
+        std::fs::create_dir_all(real.join("repo")).unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::os::unix::fs::symlink(&real, root.join(".jj")).unwrap();
+        assert!(
+            root.join(".jj").is_dir(),
+            "the symlink resolves to a directory"
+        );
+        assert!(!has_jj_directory(&root));
+        assert_eq!(jj_only_ancestor(&root), None);
+        let genuine = dir.path().join("genuine");
+        std::fs::create_dir_all(genuine.join(".jj")).unwrap();
+        assert!(has_jj_directory(&genuine));
+    }
 
     fn entry(upstream: &str, origin: &str, release: Option<&str>) -> RepoEntry {
         RepoEntry {
@@ -852,6 +840,14 @@ mod tests {
             }
             .message(&registry),
             "/r is a git clone, not a jj checkout; fork commands need jj"
+        );
+        assert_eq!(
+            Unbound::NotColocated {
+                root: PathBuf::from("/r")
+            }
+            .message(&registry),
+            "/r has a .jj but no .git; knives reads a checkout through git, so it must be \
+             colocated"
         );
         assert_eq!(
             Unbound::Unreadable(BindError::RemotesUnreadable {

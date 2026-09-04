@@ -266,8 +266,8 @@ explicitly and otherwise the tracked pull request is the fallback. A `#<n>` subj
 that number without treating it as a branch. `--evidence` is repeatable and requires `-m`.
 `--disposition` is a lowercase terminal token and requires both `-m` and evidence.
 
-A `knives start` workspace resolves its registered checkout through `.jj/repo`, so ordinary
-commands infer that repository there. Keep `--repo <name>` for a cross-repository write.
+A `knives start` workspace carries a `.git` file git resolves to the registered checkout, so
+ordinary commands infer that repository there. Keep `--repo <name>` for a cross-repository write.
 
 #### What an entry holds
 
@@ -395,7 +395,7 @@ cannot be two entries.
 
 Writes nothing to `repos.toml`. The human or caller pastes the stdout snippet into `repos.toml`. Replace any existing `[repos.<name>]` section rather than appending a duplicate entry. Registry edits take effect on the next hook event or tool call without needing a daemon or service restart.
 
-Expects remotes named for their roles: `upstream` (what we contribute to) and `origin` (our fork where branches push and PR heads live), plus an optional `release` remote; a checkout missing one is refused with the remotes it does have named. A git clone with no jj store is refused too: the hook binds those, fork commands do not. Warns if an untracked remote looks like another fork of upstream (detected via case-insensitive owner and slug comparison on the same host), reminding that `origin` must point to your own fork.
+Expects remotes named for their roles: `upstream` (what we contribute to) and `origin` (our fork where branches push and PR heads live), plus an optional `release` remote; a checkout missing one is refused with the remotes it does have named. A git clone with no jj store is refused too: the hook binds those, fork commands do not. So is a jj checkout that is not colocated (`.jj` with no `.git`): knives reads a checkout through git. Warns if an untracked remote looks like another fork of upstream (detected via case-insensitive owner and slug comparison on the same host), reminding that `origin` must point to your own fork.
 
 ## Is this content carried?
 
@@ -455,10 +455,18 @@ two is refused with both paths named. A checkout whose `origin` or `release`
 remote differs from the registry still binds, and `status` and `repos` carry a
 note saying so: `origin remote is <X>; registry says <Y>`.
 
-The scan reads jj checkouts only (`.jj/repo` a directory; a workspace is found through its
-checkout), skips directories whose name starts with `.`, does not follow symlinks, and does not
-look below a jj checkout — a plain git repository is not a checkout and does not hide the forks
-beneath it. A checkout deeper than three directories under `~`, or outside `~`, is not found by
+Knives manages colocated jj checkouts (what `jj git init`/`clone` make by default) and reads
+identity through git; a workspace
+must carry a `.git` file too, which `jj workspace add` writes only when it registers a git
+worktree for it (`git.auto-register-worktrees`, not yet in upstream jj), so knives requires such
+a jj build. The scan
+reads directories holding a `.git` directory beside a real `.jj` directory (a workspace carries a
+`.git` file, is not a candidate, and binds when you stand inside it), skips directories whose name starts with `.`, does not follow symlinks, and does not
+look below a `.jj` — a plain git repository is not a checkout and does not hide the forks beneath
+it, and a `.jj` with no `.git` (a non-colocated checkout, or a `.jj` some tree carries as content)
+is passed over in silence; a fork verb run inside one is refused: `<root> has a .jj but no .git;
+knives reads a checkout through git, so it must be colocated`.
+A checkout deeper than three directories under `~`, or outside `~`, is not found by
 the scan but binds as soon as you stand inside it — for every command except `knives repos`,
 which only scans, so it lists such a checkout as `not on this machine` even when run from inside
 it. A checkout whose remotes the scan could not read is named while some entry is still
@@ -492,7 +500,7 @@ scan refuses (`HOME is not set; knives scans $HOME for checkouts`, exit `2`) rat
   - `owners`: array of forge organization or user names; a checkout any of whose remotes belongs to one is trusted.
   - `roots`: array of directory paths; any repository inside these subtrees is trusted.
 
-> **SECURITY:** `repos` and `owners` match self-declared remote URLs read from the candidate checkout's own git configuration — not forge-authenticated; any repository that declares itself a checkout of a trusted repository or owner by remote URL is accepted. Remotes are read from the git configuration of the repository that owns the nearest root — its `.git` when present, else its jj store's git backend — never by running jj, so a read never writes into anyone's checkout. A `.jj` that an enclosing git repository tracks is content, not a checkout (git refuses `.git` path components but not `.jj`, so a plain clone delivers whatever store a repository committed). A `.jj/repo` pointer file is followed to another checkout only when that checkout vouches for the tree as its workspace (the operation the tree's `.jj/working_copy` recorded is in the checkout's operation store), since a pointer file and a copied `.jj/working_copy` are ordinary content a tree can carry. So a directory nested inside a checkout cannot inherit the enclosing checkout's identity, a tree that arrives by clone cannot borrow another checkout's identity (the `.git` it arrives with names the remotes it was cloned from, and anything under it is content), and a tree that arrives by other means cannot borrow one by naming a checkout that does not know it. `GIT_DIR` and its companions in the environment are ignored. A checkout that declares no remotes matches only via `roots`; grants guidance-as-data injection only, never fork-command access; prefer `roots` when in doubt.
+> **SECURITY:** `repos` and `owners` match self-declared remote URLs read from the candidate checkout's own git configuration file (`git config --local`; the user's, the system's and the environment's configuration — `GIT_DIR`, `GIT_WORK_TREE`, every `GIT_CONFIG_*` — are never consulted) — not forge-authenticated; any repository that declares itself a checkout of a trusted repository or owner by remote URL is accepted. The root is the nearest `.git`, the one marker a clone cannot carry: git refuses `.git` path components whatever their type, while a `.jj` — a store, a pointer file, a symlink, a working-copy record — is content any tree can commit and a clone delivers. So a `.jj` without `.git` is not a repository to knives, a `.jj` under a `.git` is that repository's content and gets that repository's verdict, a directory nested inside a checkout cannot inherit the enclosing checkout's identity, and a tree that arrives by clone cannot borrow another checkout's identity (the `.git` it arrives with names the remotes it was cloned from). jj is never run to decide identity, so a read never writes into anyone's checkout. A checkout that declares no remotes matches only via `roots`; grants guidance-as-data injection only, never fork-command access; prefer `roots` when in doubt.
 
 No command writes `repos.toml`: `knives register` prints an entry and a human pastes it. Edits take effect on the next hook event or tool call (reloaded per event) — no restart required.
 

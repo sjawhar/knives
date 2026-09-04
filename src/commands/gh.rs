@@ -604,7 +604,10 @@ fn resolve_from_inputs(inputs: TargetInputs<'_>) -> Option<String> {
 
 /// The first `gh repo set-default` marker, if git reports one (shim lines 151-164).
 fn gh_resolved_remote(cwd: &Path) -> Option<OwnedResolvedRemote> {
-    let output = crate::bind::git(cwd)
+    // `bind::git` forbids discovery above the directory it is given, so it
+    // must be handed the repository root, not a subdirectory of it.
+    let root = crate::bind::checkout_root(cwd)?;
+    let output = crate::bind::git(&root)
         .args(["config", "--get-regexp", "^remote\\..*\\.gh-resolved$"])
         .output()
         .ok()?;
@@ -706,6 +709,31 @@ mod tests {
         // `guard` restores every captured variable when it drops.
     }
 
+    /// [`with_env`] with `PATH` prefixed by `directory`. The prefix is applied
+    /// under the lock: another test may hold `PATH` at a scratch value while
+    /// this one prepares, and a `PATH` read outside the lock would carry that
+    /// value in — and lose `git`.
+    fn with_path_prefix<T>(
+        directory: &Path,
+        vars: &[(&'static str, &str)],
+        run: impl FnOnce() -> T,
+    ) -> T {
+        let _lock = crate::config::test_support::environment_lock();
+        let mut names: Vec<&'static str> = vars.iter().map(|(name, _)| *name).collect();
+        names.push("PATH");
+        let guard = crate::config::test_support::EnvironmentGuard::capture(&names);
+        let path = format!(
+            "{}:{}",
+            directory.display(),
+            std::env::var("PATH").expect("PATH")
+        );
+        guard.set("PATH", &path);
+        for (name, value) in vars {
+            guard.set(name, value);
+        }
+        run()
+    }
+
     #[test]
     fn remote_urls_normalize_to_https_with_a_git_suffix() {
         // The shim's stable matching form: https, trailing .git (lines 44-57).
@@ -800,15 +828,10 @@ mod tests {
 
         // When: minting for a target under that host, with PATH and git config
         // pointed at the scratch versions.
-        let path = format!(
-            "{}:{}",
-            dir.path().display(),
-            std::env::var("PATH").expect("PATH")
-        );
         let gitconfig_path = gitconfig.display().to_string();
-        let token = with_env(
+        let token = with_path_prefix(
+            dir.path(),
             &[
-                ("PATH", &path),
                 ("GIT_CONFIG_GLOBAL", &gitconfig_path),
                 ("GIT_CONFIG_SYSTEM", "/dev/null"),
                 ("GIT_CONFIG_NOSYSTEM", "1"),
@@ -841,15 +864,10 @@ mod tests {
         .expect("write gitconfig");
 
         // When: the helper provides no token value.
-        let path = format!(
-            "{}:{}",
-            dir.path().display(),
-            std::env::var("PATH").expect("PATH")
-        );
         let gitconfig_path = gitconfig.display().to_string();
-        let token = with_env(
+        let token = with_path_prefix(
+            dir.path(),
             &[
-                ("PATH", &path),
                 ("GIT_CONFIG_GLOBAL", &gitconfig_path),
                 ("GIT_CONFIG_SYSTEM", "/dev/null"),
                 ("GIT_CONFIG_NOSYSTEM", "1"),

@@ -391,7 +391,7 @@ impl<'a> Ground<'a> {
             match self.here {
                 Ok(fork) => return Ok(Ok(vec![Selected::Bound(fork)])),
                 Err(Unbound::Unreadable(error)) => return Err(error.into()),
-                Err(unbound @ Unbound::GitOnly { .. }) => {
+                Err(unbound @ (Unbound::GitOnly { .. } | Unbound::NotColocated { .. })) => {
                     eprintln!("{}", unbound.message(registry));
                     return Ok(Err(Exit::Usage));
                 }
@@ -419,7 +419,7 @@ impl<'a> Ground<'a> {
         match self.here {
             Ok(fork) => Ok(Ok(vec![Selected::Bound(fork)])),
             Err(Unbound::Unreadable(error)) => Err(error.into()),
-            Err(unbound @ Unbound::GitOnly { .. }) => {
+            Err(unbound @ (Unbound::GitOnly { .. } | Unbound::NotColocated { .. })) => {
                 eprintln!("{}", unbound.message(self.registry));
                 Ok(Err(Exit::Usage))
             }

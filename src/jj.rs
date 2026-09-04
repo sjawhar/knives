@@ -77,72 +77,6 @@ pub enum JjError {
 /// Bound the passive operation walk so status stays proportional to current work.
 pub const MAX_ACTIVITY_OPS: usize = 200;
 
-/// Why a checkout did not vouch for a directory as one of its workspaces.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Unvouched {
-    /// The checkout's store could not be opened as a jj repository; jj's own reason.
-    NotARepository { detail: String },
-    /// The directory's own `.jj/working_copy` state could not be read.
-    StateUnreadable,
-    /// The checkout has no such workspace: the operation the directory recorded
-    /// is not in its operation store.
-    Unknown {
-        workspace: String,
-        /// The recorded operation, shortened.
-        operation: String,
-    },
-}
-
-/// Whether `checkout` vouches for `workspace` as one of its workspaces: the
-/// operation `workspace/.jj/working_copy` recorded exists in the checkout's
-/// operation store.
-///
-/// A `.jj/repo` pointer file is ordinary content any tree can carry, and a
-/// `.jj/working_copy` copied from an unrelated repository lets `jj -R` open the
-/// tree as if it were the checkout's workspace; only the checkout's own records
-/// say whether it is, and nobody outside the checkout knows one of its
-/// operation ids. A workspace the checkout has since forgotten still vouches:
-/// it was, and by remotes still is, that repository's.
-///
-/// Opens the checkout's stores read-only and reads the workspace's recorded
-/// state; it never loads the repository at head (which would write a merge of
-/// divergent operation heads) and never snapshots.
-pub fn vouched_workspace(checkout: &Path, workspace: &Path) -> Result<(), Unvouched> {
-    let settings = UserSettings::from_config(StackedConfig::with_defaults())
-        .map_err(|_| Unvouched::StateUnreadable)?;
-    let loader = RepoLoader::init_from_file_system(
-        &settings,
-        &checkout.join(".jj/repo"),
-        &StoreFactories::default(),
-    )
-    .map_err(|error| Unvouched::NotARepository {
-        detail: error.to_string(),
-    })?;
-    let working_copy = recorded_working_copy(loader.store(), workspace, &settings)
-        .map_err(|_| Unvouched::StateUnreadable)?;
-    let recorded = working_copy.operation_id();
-    block_on(loader.load_operation(recorded)).map_err(|_| Unvouched::Unknown {
-        workspace: working_copy.workspace_name().as_symbol().to_string(),
-        operation: short_id(&recorded.hex()).to_owned(),
-    })?;
-    Ok(())
-}
-
-/// The working copy at `path` as its `.jj/working_copy` last recorded it:
-/// workspace name, operation, tree. Nothing is snapshotted.
-fn recorded_working_copy(
-    store: &Arc<jj_lib::store::Store>,
-    path: &Path,
-    settings: &UserSettings,
-) -> Result<LocalWorkingCopy, jj_lib::working_copy::WorkingCopyStateError> {
-    LocalWorkingCopy::load(
-        store.clone(),
-        path.to_owned(),
-        path.join(".jj/working_copy"),
-        settings,
-    )
-}
-
 #[derive(Debug)]
 pub struct Repo {
     repo: Arc<ReadonlyRepo>,
@@ -185,7 +119,13 @@ impl Repo {
     /// working copy would be a mutation.
     pub fn stale_working_copy(&self, path: &Path) -> Option<String> {
         let settings = UserSettings::from_config(StackedConfig::with_defaults()).ok()?;
-        let working_copy = recorded_working_copy(self.repo.store(), path, &settings).ok()?;
+        let working_copy = LocalWorkingCopy::load(
+            self.repo.store().clone(),
+            path.to_owned(),
+            path.join(".jj/working_copy"),
+            &settings,
+        )
+        .ok()?;
         let recorded = working_copy.operation_id();
         let current = self.repo.operation().id();
         if recorded == current {

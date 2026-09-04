@@ -90,14 +90,22 @@ Remote spellings are normalised before comparison: a value that parses as a URL 
 case-insensitively; a value that does not (a filesystem path) compares as its trimmed text, so two
 directories that differ by `.git` stay two directories.
 
-Standing inside a checkout, or inside a `knives start` workspace of one, binds it: the nearest
-`.jj` or `.git` above the current directory is the root, a workspace's `.jj/repo` pointer is
-followed to its checkout when that checkout vouches for the workspace (its operation store holds
-the operation the workspace recorded) and no enclosing git repository tracks the pointer, and a
-clone nested inside a checkout is its own root and never inherits the enclosing identity.
+Knives manages **colocated** jj checkouts — what `jj git init` and `jj git clone` make by default —
+and reads every checkout through
+git. A workspace must be colocated too: knives requires a jj whose `jj workspace add` registers
+a git worktree for the new workspace (`git.auto-register-worktrees`), writing the `.git` file
+beside its `.jj`; upstream jj does not do this yet, so the jj build knives is installed with must
+(the fleet's mise configuration and CI name it). Standing inside a checkout, or inside a `knives start` workspace of one, binds it: the
+nearest `.git` above the current directory is the root (a directory, or the pointer file a
+linked worktree carries, which git resolves to its checkout), a fork checkout is a root that also
+holds a real `.jj` directory, and a clone nested inside a checkout is its own root and never
+inherits the enclosing identity. A `.jj` with no `.git` beside it is not a repository to knives:
+a fork verb run inside one is refused (`has a .jj but no .git; knives reads a checkout through
+git, so it must be colocated`), the hook says nothing about it, and the scan passes it over.
 Outside one, `knives repos`, `status --all`, and naming a repository scan
-`$HOME` to depth three for jj checkouts (`.jj/repo` a directory), skipping dot-directories, not
-following symlinks, and not descending below a jj checkout (a `.git`-only directory is not a
+`$HOME` to depth three for colocated checkouts (`.git` beside a real `.jj` directory; a workspace
+carries a `.git` file, is not a candidate, and binds when you stand inside it), skipping dot-directories, not following symlinks, and not
+descending below a `.jj` (a `.git`-only directory is not a
 checkout and does not hide what is beneath it). An entry with no checkout found is
 `not on this machine`: a row on the `repos` listing, one stderr line and no row during a sweep,
 never a failing exit, since the registry is shared across machines that hold different subsets.
@@ -112,7 +120,7 @@ entry grants fork commands and the managed notice, never guidance.
 - `repos`: forge slugs (`owner/repo`) trusted by identity, matched against any remote of a checkout, case-insensitively, `.git` stripped from both sides. The file is refused on load when a value is not a slug.
 - `owners`: forge owners trusted for instruction guidance, matched case-insensitively against the owner segment of every remote URL of a checkout.
 - `roots`: directory subtrees where all contained repositories are trusted for instruction guidance; `~` expands and a relative value is taken from the config directory.
-- **Security posture:** identity and owner matching read self-declared remote URLs from the candidate checkout's own git configuration. They are not forge-authenticated and grant guidance-as-data only, never fork-command access. Remotes are read from the git configuration of the repository that owns the nearest root — its `.git` when present, else its jj store's git backend — never by running jj, which would resolve divergent operation heads by writing into someone's checkout. A `.jj` that an enclosing git repository tracks is content, not a checkout: git refuses `.git` path components but not `.jj`, so a plain clone delivers whatever store a repository committed. A `.jj/repo` pointer file is followed to another checkout only when that checkout vouches for the tree as its workspace — the operation the tree's `.jj/working_copy` recorded is in the checkout's operation store — since a pointer file, and a `.jj/working_copy` copied from any repository, are ordinary content a tree can carry. So a directory nested inside a checkout cannot inherit the enclosing checkout's identity, a tree that arrives by clone cannot borrow another checkout's identity (the `.git` it arrives with names the remotes it was cloned from, and anything under it is content), and a tree that arrives by other means cannot borrow one by naming a checkout that does not know it. `GIT_DIR` and its companions in the environment are ignored, so a hook run from inside another repository's git hook still judges the touched tree by its own remotes. Trust names repositories, so it follows a clone wherever it lands; a checkout with no remotes matches only via `roots`. No command writes the file: `knives register` prints an entry, and a human pastes it. Verdicts are recomputed from `repos.toml` on every hook event, so human edits to the file act as the approval mechanism.
+- **Security posture:** identity and owner matching read self-declared remote URLs from the candidate checkout's own git configuration file — `git config --local`, never the user's, the system's, or the environment's (`GIT_DIR`, `GIT_WORK_TREE`, and every `GIT_CONFIG_*` variable are removed before git runs). They are not forge-authenticated and grant guidance-as-data only, never fork-command access. The root is the nearest `.git`, the one marker a clone cannot carry: git refuses to check out a path component of that name whatever its type, so `.git` is always the repository's own, while a `.jj` — a store, a pointer file, a symlink, a working-copy record — is content any tree can commit and any clone delivers. So a `.jj` without `.git` is not a repository to knives, a `.jj` under a `.git` is that repository's content and gets that repository's verdict, a directory nested inside a checkout cannot inherit the enclosing checkout's identity, and a tree that arrives by clone cannot borrow another checkout's identity: the `.git` it arrives with names the remotes it was cloned from. jj is never run to decide identity, so a read never writes into anyone's checkout. Trust names repositories, so it follows a clone wherever it lands; a checkout with no remotes matches only via `roots`. No command writes the file: `knives register` prints an entry, and a human pastes it. Verdicts are recomputed from `repos.toml` on every hook event, so human edits to the file act as the approval mechanism.
 
 ## State
 
@@ -475,7 +483,7 @@ So the adapters re-establish an equivalent boundary rather than removing it:
 - **The allowlist is `[trust]`, which provides three ways to name guidance roots.** `repos` names repositories by identity (`owner/repo`, matched against any remote of a checkout), `owners` names forge owners (matched case-insensitively against remote URLs), and `roots` names directory subtrees. Any one rule true is enough; any tree none of them names receives no guidance.
   `[repos.*]` names maintained forks and provides fork commands and the managed notice only; a fork entry grants no guidance, and trust for a fork's own instructions is a `[trust]` rule like any other.
   - Distinct sections preserve parse-time invariants. A fork entry requires `upstream` and `origin` so malformed entries fail on load, and a `[trust] repos` value that is not a forge slug fails there too. No command writes the file, so nothing can drop a table on rewrite.
-- **Inject only root-level guidance from a trusted repo**, plus our own overlay, which lives outside the repo. A nested `AGENTS.md` inside a trusted repo is *mentioned, not injected*.
+- **Inject a trusted repo's own `AGENTS.md` files**, from the touched file's directory up to the repository root, nearest first, plus our own overlay, which lives outside the repo. Trusting a repository means trusting its instruction files wherever they sit in it.
 - **Mention `CONTRIBUTING.md` rather than injecting it.** Flagging that it exists is what the agent needs; its contents are long, and every injected byte is instruction-channel surface.
 - **Containment by `relative()`, never string prefix**, so a sibling path like `<dir>-2` cannot pass as `<dir>`.
 - **Canonicalise symlinks before the containment test**, or a symlink inside a managed repo can smuggle an untrusted tree's guidance in.

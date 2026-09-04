@@ -60,11 +60,8 @@ fn a_checkout_root_is_found_from_a_subdirectory_and_from_a_workspace() {
 }
 
 /// A checkout that is not colocated, cloned from the lab's origin with the
-/// lab's upstream added, and a real workspace of it: neither carries a `.git`,
-/// so the workspace's remotes come through its `.jj/repo` pointer.
-fn checkout_without_git_and_its_workspace(
-    lab: &lab::Lab,
-) -> (std::path::PathBuf, std::path::PathBuf) {
+/// lab's upstream added: a `.jj` with no `.git`, which knives does not read.
+fn checkout_without_git(lab: &lab::Lab) -> std::path::PathBuf {
     let checkout = lab.temp_path().join("nocolo").join("default");
     std::fs::create_dir_all(checkout.parent().expect("parent")).expect("parent");
     lab::jj(
@@ -87,121 +84,27 @@ fn checkout_without_git_and_its_workspace(
             lab.upstream.to_str().expect("utf-8"),
         ],
     );
-    lab::jj(&checkout, ["git", "fetch", "--remote", "upstream"]);
-    let workspace = lab.temp_path().join("nocolo").join("feature");
-    lab::jj_workspace_add(&checkout, "feature", &workspace);
     assert!(!checkout.join(".git").exists(), "not colocated");
-    assert!(
-        !workspace.join(".git").exists(),
-        "a workspace of a non-colocated checkout has no .git"
-    );
-    assert!(workspace.join(".jj").join("repo").is_file());
-    (checkout, workspace)
+    assert!(checkout.join(".jj").join("repo").is_dir());
+    checkout
 }
 
-/// A tree whose `.jj/repo` names `checkout`'s store and whose
-/// `.jj/working_copy/{type,checkout}` were copied from an unrelated repository:
-/// what `jj -R` would open as `checkout`'s workspace.
-fn forged_workspace_of(lab: &lab::Lab, checkout: &Path) -> std::path::PathBuf {
-    let unrelated = lab.temp_path().join("unrelated");
-    std::fs::create_dir_all(&unrelated).expect("unrelated");
-    lab::jj(&unrelated, ["git", "init"]);
-    let forged = lab.temp_path().join("forged");
-    std::fs::create_dir_all(forged.join(".jj").join("working_copy")).expect("forged .jj");
-    std::fs::write(
-        forged.join(".jj").join("repo"),
-        checkout.join(".jj").join("repo").to_str().expect("utf-8"),
-    )
-    .expect("forged pointer");
-    for file in ["type", "checkout"] {
-        std::fs::copy(
-            unrelated.join(".jj").join("working_copy").join(file),
-            forged.join(".jj").join("working_copy").join(file),
-        )
-        .expect("copy working-copy state");
-    }
-    forged
+/// A colocated checkout git cannot read: `.git` and `.jj` both empty
+/// directories. A scan candidate whose remotes fail.
+fn broken_colocated_checkout(root: &Path) {
+    std::fs::create_dir_all(root.join(".git")).expect("empty .git");
+    std::fs::create_dir_all(root.join(".jj")).expect("empty .jj");
 }
 
 #[test]
-fn a_pointer_is_followed_only_when_the_checkout_vouches_for_the_workspace() {
+fn a_checkout_that_is_not_colocated_is_refused_and_not_on_this_machine() {
+    // A fork verb run inside it says why; the scan passes it over without a
+    // word, so its entry is `not on this machine` — not a problem, not a
+    // duplicate — however it spells the entry's upstream.
     let lab = lab::Lab::new();
-    let (checkout, workspace) = checkout_without_git_and_its_workspace(&lab);
-    let canonical_checkout = checkout.canonicalize().expect("canonical");
-
-    // The real workspace: the checkout's records know it, so the pointer is
-    // followed and its remotes are the checkout's.
-    assert_eq!(bind::checkout_of_root(&workspace), canonical_checkout);
-    let remotes = bind::remotes(&workspace).expect("vouched remotes");
-    assert_eq!(
-        remotes.get("upstream").map(String::as_str),
-        Some(lab.upstream.to_str().expect("utf-8"))
-    );
-
-    // The forged tree: `jj -R` alone would print the checkout's remotes; the
-    // checkout has no such workspace, so the pointer stays unfollowed.
-    let forged = forged_workspace_of(&lab, &canonical_checkout);
-    assert_eq!(bind::checkout_of_root(&forged), forged);
-    let error = bind::remotes(&forged).expect_err("unvouched");
-    let BindError::RemotesUnreadable { root, detail } = &error else {
-        panic!("{error:?}");
-    };
-    assert_eq!(root, &forged);
-    assert!(
-        detail.starts_with(&format!(
-            ".jj/repo names {}, which has no workspace ",
-            canonical_checkout.display()
-        )),
-        "{detail}"
-    );
-    assert!(detail.contains(" at operation "), "{detail}");
-
-    // A pointer into a directory that is no repository at all.
-    let not_a_repo = lab.temp_path().join("plain").join(".jj").join("repo");
-    std::fs::create_dir_all(&not_a_repo).expect("bare store directory");
-    std::fs::write(
-        forged.join(".jj").join("repo"),
-        not_a_repo.to_str().expect("utf-8"),
-    )
-    .expect("repoint");
-    let error = bind::remotes(&forged).expect_err("not a repository");
-    assert!(
-        error.to_string().contains(&format!(
-            ".jj/repo names {}, which is not a repository: ",
-            lab.temp_path()
-                .join("plain")
-                .canonicalize()
-                .expect("canonical")
-                .display()
-        )),
-        "{error}"
-    );
-
-    // A pointer to a real checkout from a tree with no working-copy state.
-    std::fs::write(
-        forged.join(".jj").join("repo"),
-        canonical_checkout
-            .join(".jj")
-            .join("repo")
-            .to_str()
-            .expect("utf-8"),
-    )
-    .expect("repoint");
-    std::fs::remove_dir_all(forged.join(".jj").join("working_copy")).expect("drop state");
-    let error = bind::remotes(&forged).expect_err("unreadable state");
-    assert!(
-        error
-            .to_string()
-            .ends_with(".jj/working_copy cannot be read"),
-        "{error}"
-    );
-}
-
-#[test]
-fn a_workspace_without_a_git_directory_binds_and_status_reports_the_fork() {
-    let lab = lab::Lab::new();
-    let (home, _consumer) = lab::release_test_home(&lab);
-    let (checkout, workspace) = checkout_without_git_and_its_workspace(&lab);
+    let checkout = checkout_without_git(&lab);
+    let inside = checkout.join("src");
+    std::fs::create_dir_all(&inside).expect("inside");
     let registry = registry(&[(
         "demo",
         RepoEntry::new(
@@ -209,13 +112,112 @@ fn a_workspace_without_a_git_directory_binds_and_status_reports_the_fork() {
             "https://forge.invalid/acme/work.git",
         ),
     )]);
+    let canonical = checkout.canonicalize().expect("canonical");
 
-    let bound = bind::here(&registry, &workspace).expect("bound through the pointer");
-    assert_eq!(bound.name, RepoName::new("demo"));
+    assert_eq!(bind::nearest_root(&inside), None);
+    let unbound = bind::here(&registry, &inside).expect_err("not colocated");
     assert_eq!(
-        bound.checkout.path,
-        checkout.canonicalize().expect("canonical")
+        unbound,
+        Unbound::NotColocated {
+            root: canonical.clone()
+        }
     );
+    assert_eq!(
+        unbound.message(&registry),
+        format!(
+            "{} has a .jj but no .git; knives reads a checkout through git, so it must be \
+             colocated",
+            canonical.display()
+        )
+    );
+
+    // Through the binary, from inside: the refusal, exit 2, no sweep.
+    let home = tempfile::tempdir().expect("config home");
+    std::fs::write(
+        home.path().join("repos.toml"),
+        format!(
+            "[repos.demo]\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/work.git\"\n",
+            lab.upstream.display()
+        ),
+    )
+    .expect("registry");
+    let output = lab::knives_command(
+        &inside,
+        home.path(),
+        lab.temp_path().join("nocolo").as_path(),
+        &["--text", "status", "--no-landed", "--no-github"],
+    )
+    .output()
+    .expect("run knives");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("has a .jj but no .git"), "{stderr}");
+
+    // `knives repos` scanning a home that holds only the non-colocated checkout.
+    let output = lab::knives_command(
+        lab.temp_path(),
+        home.path(),
+        lab.temp_path().join("nocolo").as_path(),
+        &["--json", "repos"],
+    )
+    .output()
+    .expect("run knives");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stdout}\n{stderr}");
+    let report: serde_json::Value = serde_json::from_str(&stdout).expect("json document");
+    let rows = report["repos"].as_array().expect("rows");
+    assert_eq!(rows.len(), 1, "{report}");
+    assert!(rows[0]["path"].is_null(), "{report}");
+    assert!(
+        rows[0]["ambiguous"].as_u64().is_none_or(|count| count == 0),
+        "{report}"
+    );
+    assert!(
+        rows[0]["problems"].as_array().is_none_or(Vec::is_empty),
+        "{report}"
+    );
+    assert!(
+        report["problems"].as_array().is_none_or(Vec::is_empty),
+        "{report}"
+    );
+}
+
+#[test]
+fn a_workspace_of_a_colocated_checkout_binds_to_the_checkout_through_git() {
+    // `jj workspace add` from a colocated checkout writes a `.git` file naming
+    // the checkout's worktree; git resolves it, and the workspace's remotes are
+    // the checkout's. Nothing under `.jj` is read.
+    let lab = lab::Lab::new();
+    let (home, _consumer) = lab::release_test_home(&lab);
+    let workspace = lab.temp_path().join("ws");
+    lab::jj_workspace_add(&lab.work, "ws", &workspace);
+    assert!(
+        workspace.join(".git").is_file(),
+        "a colocated workspace carries a .git file"
+    );
+    let registry = registry(&[(
+        "demo",
+        RepoEntry::new(
+            lab.upstream.to_str().expect("utf-8"),
+            "https://forge.invalid/acme/work.git",
+        ),
+    )]);
+    let checkout = lab.work.canonicalize().expect("canonical");
+
+    assert_eq!(
+        bind::nearest_root(&workspace),
+        Some(workspace.canonicalize().expect("canonical"))
+    );
+    assert_eq!(bind::checkout_root(&workspace), Some(checkout.clone()));
+    let remotes = bind::remotes(&workspace).expect("the checkout's remotes through git");
+    assert_eq!(
+        remotes.get("upstream").map(String::as_str),
+        Some(lab.upstream.to_str().expect("utf-8"))
+    );
+    let bound = bind::here(&registry, &workspace).expect("bound");
+    assert_eq!(bound.name, RepoName::new("demo"));
+    assert_eq!(bound.checkout.path, checkout);
 
     let output = lab::knives_command(
         &workspace,
@@ -284,94 +286,6 @@ fn the_scan_does_not_bind_a_jj_store_committed_inside_a_git_clone() {
 }
 
 #[test]
-fn reading_remotes_of_a_workspace_never_writes_to_its_checkouts_operation_store() {
-    // Two operation heads in the checkout: what any jj command resolves by
-    // writing a merge operation. A read — the hook vouching for the workspace
-    // pointer and reading remotes — leaves both heads exactly as they were.
-    let lab = lab::Lab::new();
-    let (checkout, workspace) = checkout_without_git_and_its_workspace(&lab);
-    let heads = checkout
-        .join(".jj")
-        .join("repo")
-        .join("op_heads")
-        .join("heads");
-    let ops = std::process::Command::new("jj")
-        .args(["-R"])
-        .arg(&checkout)
-        .args([
-            "--ignore-working-copy",
-            "op",
-            "log",
-            "--no-graph",
-            "-n",
-            "3",
-            "-T",
-            "id ++ \"\\n\"",
-        ])
-        .env("JJ_CONFIG", "/dev/null")
-        .output()
-        .expect("op log");
-    let older = String::from_utf8_lossy(&ops.stdout)
-        .lines()
-        .last()
-        .expect("an older operation")
-        .to_owned();
-    std::fs::write(heads.join(&older), b"").expect("plant a second head");
-    let before = || {
-        let mut names: Vec<String> = std::fs::read_dir(&heads)
-            .expect("heads")
-            .map(|entry| {
-                entry
-                    .expect("entry")
-                    .file_name()
-                    .to_string_lossy()
-                    .into_owned()
-            })
-            .collect();
-        names.sort();
-        names
-    };
-    let planted = before();
-    assert_eq!(planted.len(), 2, "{planted:?}");
-
-    let remotes = bind::remotes(&workspace).expect("remotes through the pointer");
-    assert_eq!(
-        remotes.get("upstream").map(String::as_str),
-        Some(lab.upstream.to_str().expect("utf-8"))
-    );
-    let home = tempfile::tempdir().expect("config home");
-    std::fs::write(
-        home.path().join("repos.toml"),
-        "[trust]\nowners = [\"acme\"]\n",
-    )
-    .expect("registry");
-    let mut event: serde_json::Value =
-        serde_json::from_str(include_str!("fixtures/claude_hook_post_tool_use_read.json"))
-            .expect("fixture");
-    event["session_id"] = serde_json::json!("never-writes");
-    event["cwd"] = serde_json::json!(home.path());
-    event["tool_input"]["file_path"] = serde_json::json!(workspace.join("README.md"));
-    let mut hook = std::process::Command::new(env!("CARGO_BIN_EXE_knives"));
-    hook.args(["hook", "claude-code"])
-        .env("KNIVES_CONFIG_HOME", home.path())
-        .env("HOME", lab.temp_path())
-        .env("JJ_CONFIG", "/dev/null")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    let mut child = hook.spawn().expect("spawn hook");
-    std::io::Write::write_all(
-        child.stdin.as_mut().expect("stdin"),
-        event.to_string().as_bytes(),
-    )
-    .expect("write event");
-    let output = child.wait_with_output().expect("hook");
-    assert!(output.status.success());
-
-    assert_eq!(before(), planted, "a read merged the operation heads");
-}
-
-#[test]
 fn remotes_are_read_from_jj_checkouts_and_from_git_only_clones() {
     let lab = lab::Lab::new();
     let jj_remotes = bind::remotes(&lab.work).expect("jj remotes");
@@ -398,6 +312,51 @@ fn remotes_are_read_from_jj_checkouts_and_from_git_only_clones() {
     let plain = lab.temp_path().join("not-a-repo");
     std::fs::create_dir_all(&plain).expect("plain dir");
     assert!(bind::remotes(&plain).is_err());
+}
+
+#[test]
+fn a_remote_whose_name_holds_a_space_is_read() {
+    // `git remote add` refuses such a name, but the configuration file can hold
+    // one, and a checkout with one is still a checkout.
+    let lab = lab::Lab::new();
+    let clone = lab.temp_path().join("spaced");
+    git_repository(&clone, &[("origin", "https://forge.invalid/ours/tool.git")]);
+    let set = std::process::Command::new("git")
+        .args(["-C"])
+        .arg(&clone)
+        .args([
+            "config",
+            "remote.my mirror.url",
+            "https://forge.invalid/mirror/tool.git",
+        ])
+        .status()
+        .expect("git config");
+    assert!(set.success());
+    let remotes = bind::remotes(&clone).expect("remotes with a spaced name");
+    assert_eq!(
+        remotes.get("my mirror").map(String::as_str),
+        Some("https://forge.invalid/mirror/tool.git")
+    );
+    assert!(remotes.contains_key("origin"));
+}
+
+#[test]
+fn a_broken_checkout_inside_a_repository_does_not_answer_for_it() {
+    // git would otherwise discover upward past an empty `.git` and read the
+    // enclosing repository's configuration; the root must speak for itself or
+    // not at all.
+    let lab = lab::Lab::new();
+    let outer = lab.temp_path().join("outer");
+    git_repository(
+        &outer,
+        &[("upstream", "https://forge.invalid/org/tool.git")],
+    );
+    let broken = outer.join("broken");
+    broken_colocated_checkout(&broken);
+    let error = bind::remotes(&broken).expect_err("a broken checkout is unreadable");
+    let text = error.to_string();
+    assert!(text.contains("inside a git repository"), "{text}");
+    assert!(!text.contains("org/tool"), "{text}");
 }
 
 #[test]
@@ -677,13 +636,13 @@ fn scan_descends_from_a_home_that_is_itself_a_repository() {
 
 #[test]
 fn scan_names_a_checkout_whose_remotes_it_could_not_read_while_an_entry_is_unplaced() {
-    // A `.jj/repo` directory with nothing in it looks like a checkout; jj
-    // cannot read it. While an entry is still missing, the scan says so rather
-    // than silently skipping what may be the entry it was looking for.
+    // A `.git` beside a `.jj`, both empty: a colocated checkout git cannot
+    // read. While an entry is still missing, the scan says so rather than
+    // silently skipping what may be the entry it was looking for.
     let lab = lab::Lab::new();
     let home = lab.temp_path().join("home");
     let broken = home.join("broken");
-    std::fs::create_dir_all(broken.join(".jj").join("repo")).expect("empty store");
+    broken_colocated_checkout(&broken);
     jj_checkout(
         &home.join("tool"),
         &[("upstream", "https://forge.invalid/org/tool")],
@@ -733,7 +692,7 @@ fn scan_drops_an_unreadable_stranger_once_every_entry_is_placed() {
     let lab = lab::Lab::new();
     let home = lab.temp_path().join("home");
     let broken = home.join("broken");
-    std::fs::create_dir_all(broken.join(".jj").join("repo")).expect("empty store");
+    broken_colocated_checkout(&broken);
     jj_checkout(
         &home.join("tool"),
         &[("upstream", "https://forge.invalid/org/tool")],
@@ -850,24 +809,15 @@ fn a_repository_whose_remotes_cannot_be_read_is_an_error_naming_the_directory() 
         ),
     )]);
 
-    // A `.jj` with no repository inside: a root jj cannot read.
+    // A colocated checkout whose `.git` is an empty directory: a root git
+    // cannot read, so the error names the directory the user stands in.
     let broken = lab.temp_path().join("broken");
+    std::fs::create_dir_all(broken.join(".git")).expect("broken .git");
     std::fs::create_dir_all(broken.join(".jj")).expect("broken .jj");
     let canonical = broken.canonicalize().expect("canonical");
+    assert_eq!(bind::checkout_root(&broken), Some(canonical.clone()));
     assert!(matches!(
         bind::here(&registry, &broken),
-        Err(Unbound::Unreadable(BindError::RemotesUnreadable { root, .. })) if root == canonical
-    ));
-
-    // A workspace whose `.jj/repo` pointer cannot be read stays its own root,
-    // so the error names the directory the user stands in.
-    let stray = lab.temp_path().join("stray");
-    std::fs::create_dir_all(stray.join(".jj")).expect("stray .jj");
-    std::fs::write(stray.join(".jj").join("repo"), [0xff, 0xfe]).expect("unreadable pointer");
-    let canonical = stray.canonicalize().expect("canonical");
-    assert_eq!(bind::checkout_root(&stray), Some(canonical.clone()));
-    assert!(matches!(
-        bind::here(&registry, &stray),
         Err(Unbound::Unreadable(BindError::RemotesUnreadable { root, .. })) if root == canonical
     ));
 }
@@ -1116,7 +1066,7 @@ fn a_sweep_keeps_an_absent_entry_as_a_row_when_the_scan_could_not_read_a_checkou
     let lab = lab::Lab::new();
     let (home, _consumer) = home_with_a_ghost(&lab);
     let broken = lab.temp_path().join("broken");
-    std::fs::create_dir_all(broken.join(".jj").join("repo")).expect("empty store");
+    broken_colocated_checkout(&broken);
     let output = knives_outside(
         &lab,
         &home,
@@ -1138,12 +1088,12 @@ fn a_sweep_keeps_an_absent_entry_as_a_row_when_the_scan_could_not_read_a_checkou
 
 #[test]
 fn a_named_verb_from_a_broken_cwd_answers_about_the_named_repo() {
-    // Standing in a `.jj` with no store: the verb was asked about `demo`, and
-    // the cwd's unreadable remotes are not its answer.
+    // Standing in a colocated checkout git cannot read: the verb was asked
+    // about `demo`, and the cwd's unreadable remotes are not its answer.
     let lab = lab::Lab::new();
     let (home, _consumer) = lab::release_test_home(&lab);
     let broken = lab.temp_path().join("broken-cwd");
-    std::fs::create_dir_all(broken.join(".jj")).expect("bare .jj");
+    broken_colocated_checkout(&broken);
     let output = lab::knives_command(
         &broken,
         home.path(),
@@ -1168,7 +1118,7 @@ fn a_sweep_says_nothing_about_an_unreadable_stranger_when_every_entry_is_found()
     let lab = lab::Lab::new();
     let (home, _consumer) = lab::release_test_home(&lab);
     let broken = lab.temp_path().join("broken");
-    std::fs::create_dir_all(broken.join(".jj").join("repo")).expect("empty store");
+    broken_colocated_checkout(&broken);
     let output = knives_outside(
         &lab,
         &home,

@@ -754,6 +754,11 @@ pub fn git_clone(source: &Path, destination: &Path) {
     );
 }
 
+/// `git remote set-url name url` in `root`.
+pub fn git_set_remote_url(root: &Path, name: &str, url: &str) {
+    git(root, "main", ["remote", "set-url", name, url]);
+}
+
 /// `jj workspace add --name name path` from `checkout`.
 pub fn jj_workspace_add(checkout: &Path, name: &str, path: &Path) {
     jj(
