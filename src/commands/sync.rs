@@ -541,6 +541,8 @@ pub fn render(report: &Report) -> String {
         .iter()
         .map(|note| format!("! {note}"))
         .collect();
+    // What could not be answered, so an exit of 3 never arrives unexplained.
+    lines.extend(report.problems.iter().map(|problem| format!("? {problem}")));
     if report.rows.is_empty() {
         lines.push(format!("{}: no tracked pull requests", report.repo));
         return lines.join("\n");

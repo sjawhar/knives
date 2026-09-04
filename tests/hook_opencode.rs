@@ -4,11 +4,15 @@
     reason = "fixture setup failures and JSON shape mismatches are test failures"
 )]
 
+#[path = "common/lab.rs"]
+mod lab;
+
 use std::fs::File;
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use lab::git_repository;
 use serde_json::{Value, json};
 
 const SESSION_ID: &str = "opencode-hook-test-session";
@@ -96,34 +100,6 @@ fn claim(branch: &str) -> Value {
     })
 }
 
-/// A git-only repository with the given remotes.
-fn git_repository(root: &Path, remotes: &[(&str, &str)]) {
-    std::fs::create_dir_all(root).expect("create repository");
-    assert!(
-        Command::new("git")
-            .args(["-C", root.to_str().expect("utf-8"), "init", "--quiet"])
-            .status()
-            .expect("git init")
-            .success()
-    );
-    for (name, url) in remotes {
-        assert!(
-            Command::new("git")
-                .args([
-                    "-C",
-                    root.to_str().expect("utf-8"),
-                    "remote",
-                    "add",
-                    name,
-                    url
-                ])
-                .status()
-                .expect("git remote add")
-                .success()
-        );
-    }
-}
-
 struct Repositories {
     home: tempfile::TempDir,
     /// Managed AND trusted: `origin` sits under a trusted owner.
@@ -174,15 +150,7 @@ impl Repositories {
     /// Turn a git-only fixture into a colocated jj checkout, so `seen` can key
     /// on its `.jj` and jj can still read its remotes.
     fn colocate(root: &Path) {
-        let status = Command::new("jj")
-            .args(["git", "init", "--colocate"])
-            .current_dir(root)
-            .env("JJ_CONFIG", "/dev/null")
-            .env("JJ_USER", "Knives Lab")
-            .env("JJ_EMAIL", "knives-lab@example.test")
-            .status()
-            .expect("run jj");
-        assert!(status.success(), "jj git init --colocate failed");
+        lab::jj(root, ["git", "init", "--colocate"]);
     }
 
     fn write_state(&self, state: &Value) {

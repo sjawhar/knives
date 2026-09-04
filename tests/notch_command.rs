@@ -8,8 +8,11 @@
 //! The command through the real binary: both output modes, `--repo` from
 //! outside the repository, and the exit codes the house rules fix.
 
+#[path = "common/lab.rs"]
+mod lab;
+
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::Output;
 
 const UPSTREAM: &str = "https://forge.invalid/org/work.git";
 
@@ -30,32 +33,7 @@ fn home() -> tempfile::TempDir {
 /// `upstream` remote is `a-repo`'s, so `--repo a-repo` finds it from anywhere.
 fn checkout() -> tempfile::TempDir {
     let scan_root = tempfile::tempdir().expect("checkout");
-    let repo = scan_root.path().join("a-repo");
-    let jj = |args: &[&str]| {
-        let status = Command::new("jj")
-            .args(args)
-            .env("JJ_CONFIG", "/dev/null")
-            .env("JJ_USER", "Knives Lab")
-            .env("JJ_EMAIL", "knives-lab@example.test")
-            .status()
-            .expect("run jj");
-        assert!(status.success(), "jj {args:?}");
-    };
-    jj(&[
-        "git",
-        "init",
-        "--colocate",
-        repo.to_str().expect("utf-8 path"),
-    ]);
-    jj(&[
-        "-R",
-        repo.to_str().expect("utf-8 path"),
-        "git",
-        "remote",
-        "add",
-        "upstream",
-        UPSTREAM,
-    ]);
+    lab::jj_checkout(&scan_root.path().join("a-repo"), &[("upstream", UPSTREAM)]);
     scan_root
 }
 
@@ -65,12 +43,7 @@ fn knives(
     cwd: &Path,
     args: &[&str],
 ) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_knives"))
-        .args(args)
-        .current_dir(cwd)
-        .env("KNIVES_CONFIG_HOME", home.path())
-        .env("HOME", scan_root.path())
-        .env("JJ_CONFIG", "/dev/null")
+    lab::knives_command(cwd, home.path(), scan_root.path(), args)
         .env("KNIVES_OWNER", "ses_fff688")
         .output()
         .expect("run knives")
@@ -439,16 +412,16 @@ fn a_read_never_asks_who_is_reading_and_a_write_is_stopped_by_an_unreadable_stat
     let home = home();
     std::fs::write(home.path().join("state.json"), "{not json").expect("corrupt state");
     let anonymous = |args: &[&str]| {
-        Command::new(env!("CARGO_BIN_EXE_knives"))
-            .args(args)
-            .current_dir(checkout.path().join("a-repo"))
-            .env("KNIVES_CONFIG_HOME", home.path())
-            .env("HOME", checkout.path())
-            .env("JJ_CONFIG", "/dev/null")
-            .env_remove("KNIVES_OWNER")
-            .env_remove("CLAUDE_CODE_SESSION_ID")
-            .output()
-            .expect("run knives")
+        lab::knives_command(
+            &checkout.path().join("a-repo"),
+            home.path(),
+            checkout.path(),
+            args,
+        )
+        .env_remove("KNIVES_OWNER")
+        .env_remove("CLAUDE_CODE_SESSION_ID")
+        .output()
+        .expect("run knives")
     };
 
     for read in [

@@ -80,10 +80,11 @@ fn existing_ancestor(path: &Path) -> Option<&Path> {
 
 /// The first touched path inside a repository, and what the registry says about it.
 ///
-/// Both facts are decided from the remotes of the checkout `bind::checkout_root`
-/// resolves to. `remotes_of` is the (cached) reader, keyed by that checkout path;
-/// it returns `None` when remotes cannot be read — the caller has already
-/// reported why. A `roots` rule still applies then.
+/// Both facts are decided from the remotes of the checkout the nearest root
+/// belongs to ([`bind::checkout_of_root`]). `remotes_of` is the (cached)
+/// reader, keyed by that checkout path; it returns `None` when remotes cannot
+/// be read — the caller has already reported why. A `roots` rule is decided
+/// from the path first, so it holds with no jj and no writable cache.
 pub fn match_checkout(
     paths: &[PathBuf],
     registry: &Registry,
@@ -99,15 +100,14 @@ pub fn match_checkout(
         let Some(root) = bind::nearest_root(existing) else {
             continue;
         };
-        let Some(checkout) = bind::checkout_root(existing) else {
-            continue;
-        };
+        let under_root = registry.trust.contains_root(&root);
+        let checkout = bind::checkout_of_root(&root);
         let remotes = remotes_of(&checkout).unwrap_or_default();
         let managed = remotes
             .get("upstream")
             .and_then(|upstream| bind::entry_for(registry, upstream))
             .map(|(name, _)| name);
-        let trusted = registry.trust.grants(&root, &remotes);
+        let trusted = under_root || registry.trust.grants_by_remotes(&remotes);
         if managed.is_some() || trusted {
             return Some(Match {
                 root,

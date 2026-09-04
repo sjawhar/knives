@@ -95,9 +95,11 @@ Standing inside a checkout, or inside a `knives start` workspace of one, binds i
 followed to its checkout, and a clone nested inside a checkout is its own root and never inherits
 the enclosing identity. Outside one, `knives repos`, `status --all`, and naming a repository scan
 `$HOME` to depth three for jj checkouts (`.jj/repo` a directory), skipping dot-directories, not
-following symlinks, and not descending below a repository. An entry with no checkout found is
+following symlinks, and not descending below a jj checkout (a `.git`-only directory is not a
+checkout and does not hide what is beneath it). An entry with no checkout found is
 `not on this machine`; an entry with two is refused with both paths named, because choosing
-would answer about the wrong copy.
+would answer about the wrong copy. What the scan could not read is always named beside the
+entries it may have been: on the refusal, on the `repos` listing, once on stderr during a sweep.
 
 `[trust]` decides whose instructions the hook injects. It is separate from `[repos.*]`: a fork
 entry grants fork commands and the managed notice, never guidance.

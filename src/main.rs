@@ -23,13 +23,15 @@ use std::process::ExitCode;
 
 use branch_verbs::{FinishOptions, run_depends, run_finish, run_track};
 use clap::Parser as _;
-use knives::bind::{BindError, Fork, Unbound, Unresolved};
+use knives::bind::{BindError, Fork, Unbound};
 use knives::cli::{Cli, Command, Exit, Output, ReleaseAction};
 use knives::commands::claim::{Identity, Resolved, current_identity, required};
 use knives::commands::{
     audit, consumers, hook, notch, pr, preflight, pushed, register, repos, start, status, sync,
 };
-use knives::config::{ConfigError, Registry, RepoEntry, default_config_path, home_dir, load};
+use knives::config::{
+    ConfigError, NO_HOME, Registry, RepoEntry, default_config_path, home_dir, load,
+};
 use knives::forge::Forge;
 use knives::forge::github::CliForge;
 use knives::ids::{BranchName, RepoName};
@@ -287,13 +289,26 @@ fn dispatch() -> anyhow::Result<Exit> {
     }
 }
 
-/// The registry's names, for a refusal that has to say what it does know.
-fn known(registry: &Registry) -> String {
-    registry
-        .names()
-        .map(|name| name.to_string())
-        .collect::<Vec<_>>()
-        .join(", ")
+/// `fork` when it is a jj checkout; `None` after saying why a git clone is not
+/// one. Fork verbs need jj; only the hook binds git-only clones.
+fn jj_only(fork: Fork<'_>) -> Option<Fork<'_>> {
+    if fork.checkout.is_jj() {
+        return Some(fork);
+    }
+    eprintln!(
+        "{} is a git clone, not a jj checkout; fork commands need jj",
+        fork.checkout.path.display()
+    );
+    None
+}
+
+/// The scan root, or `None` after saying that there is none (exit `Usage`).
+fn scan_home() -> Option<std::path::PathBuf> {
+    let home = home_dir();
+    if home.is_none() {
+        eprintln!("{NO_HOME}");
+    }
+    home
 }
 
 /// The fork verbs' shared step, taken once per invocation by a verb that acts
@@ -346,49 +361,45 @@ impl<'a> Ground<'a> {
             .map(|fork| &fork.name)
     }
 
+    /// The fork `name` is: the current directory's when it is that entry, else
+    /// the scan's; `None` after printing why not (exit `Usage`).
+    ///
+    /// A `BindError` from the current directory's own repository propagates: a
+    /// checkout whose remotes cannot be read is an error to show, not a reason
+    /// to scan elsewhere.
+    fn named(self, name: &str) -> anyhow::Result<Option<Fork<'a>>> {
+        let registry = self.registry;
+        let name = RepoName::new(name);
+        let here = self.here?.ok();
+        let Some(home) = scan_home() else {
+            return Ok(None);
+        };
+        match knives::bind::resolve(registry, &name, here, &home) {
+            Ok(fork) => Ok(jj_only(fork)),
+            Err(why) => {
+                eprintln!("{}", why.message(&name, registry));
+                Ok(None)
+            }
+        }
+    }
+
     /// The single fork a verb acts on: named, or the one the current directory
     /// is inside; `None` after printing why not (exit `Usage`).
     ///
     /// Requiring the name on every command is absurd when you are inside the
     /// repository, and it was the loudest complaint about using this thing.
-    /// Every refusal about the current directory (not inside a repository, no
-    /// `upstream`, not registered) and an unknown name append the registry's
-    /// names, since the fix is to type one of them; a name that is known but has
-    /// no checkout, or two, does not, since listing entries would not help find
-    /// a directory.
     fn one_fork(self, requested: Option<&str>) -> anyhow::Result<Option<Fork<'a>>> {
-        let registry = self.registry;
-        let fork = if let Some(name) = requested {
-            let name = RepoName::new(name);
-            let cwd = std::env::current_dir()?;
-            match knives::bind::resolve(registry, &name, &cwd, &home_dir())? {
-                Ok(fork) => fork,
-                Err(why @ Unresolved::Unknown) => {
-                    eprintln!("{}; known: {}", why.message(&name), known(registry));
-                    return Ok(None);
-                }
-                Err(why) => {
-                    eprintln!("{}", why.message(&name));
-                    return Ok(None);
-                }
-            }
-        } else {
-            match self.here? {
-                Ok(fork) => fork,
-                Err(unbound) => {
-                    eprintln!("{}; known: {}", unbound.message(), known(registry));
-                    return Ok(None);
-                }
-            }
-        };
-        if !fork.checkout.is_jj() {
-            eprintln!(
-                "{} is a git clone, not a jj checkout; fork commands need jj",
-                fork.checkout.path.display()
-            );
-            return Ok(None);
+        if let Some(name) = requested {
+            return self.named(name);
         }
-        Ok(Some(fork))
+        let registry = self.registry;
+        match self.here? {
+            Ok(fork) => Ok(jj_only(fork)),
+            Err(unbound) => {
+                eprintln!("{}", unbound.message(registry));
+                Ok(None)
+            }
+        }
     }
 
     /// Every entry a many-repo verb covers, bound where the scan could.
@@ -398,8 +409,9 @@ impl<'a> Ground<'a> {
     /// is how `status` became unreadable. `--all` asks for all of them
     /// explicitly, and standing outside every managed repo also means all of
     /// them, since there is nothing else it could mean. An entry the scan did
-    /// not find, or found twice, is still a row — rendered as a problem, exactly
-    /// as an unopenable path was before — and nothing is opened for it.
+    /// not find, or found twice, is still a row — rendered as a problem — and
+    /// nothing is opened for it. What the scan could not read is said once, on
+    /// stderr, whichever output format the document takes.
     fn selected(self, scope: Scope<'_>) -> anyhow::Result<Result<Vec<Selected<'a>>, Exit>> {
         let registry = self.registry;
         if registry.is_empty() {
@@ -409,28 +421,26 @@ impl<'a> Ground<'a> {
             );
             return Ok(Err(Exit::Usage));
         }
-        let home = home_dir();
         if let Some(name) = scope.requested {
-            let name = RepoName::new(name);
-            let cwd = std::env::current_dir()?;
-            return Ok(match knives::bind::resolve(registry, &name, &cwd, &home)? {
-                Ok(fork) => Ok(vec![Selected::Bound(fork)]),
-                Err(why @ Unresolved::Unknown) => {
-                    eprintln!("{}; known: {}", why.message(&name), known(registry));
-                    Err(Exit::Usage)
-                }
-                Err(why) => {
-                    eprintln!("{}", why.message(&name));
-                    Err(Exit::Usage)
-                }
-            });
+            return Ok(self
+                .named(name)?
+                .map_or(Err(Exit::Usage), |fork| Ok(vec![Selected::Bound(fork)])));
         }
         if !scope.all
             && let Ok(fork) = self.here?
         {
-            return Ok(Ok(vec![Selected::Bound(fork)]));
+            return Ok(
+                jj_only(fork).map_or(Err(Exit::Usage), |fork| Ok(vec![Selected::Bound(fork)]))
+            );
         }
-        Ok(Ok(sweep(registry, &home)))
+        let Some(home) = scan_home() else {
+            return Ok(Err(Exit::Usage));
+        };
+        let (selected, problems) = sweep(registry, &home);
+        for problem in &problems {
+            eprintln!("could not read: {problem}");
+        }
+        Ok(Ok(selected))
     }
 
     /// `sync` fetches and writes, so it never sweeps by accident: a name,
@@ -441,7 +451,9 @@ impl<'a> Ground<'a> {
             return self.selected(scope);
         }
         if let Ok(fork) = self.here? {
-            return Ok(Ok(vec![Selected::Bound(fork)]));
+            return Ok(
+                jj_only(fork).map_or(Err(Exit::Usage), |fork| Ok(vec![Selected::Bound(fork)]))
+            );
         }
         eprintln!("give a repo name, or --all");
         Ok(Err(Exit::Usage))
@@ -527,11 +539,11 @@ fn run_audit(
                 forge,
                 cache_root: cache_root.as_deref(),
             }),
-            Selected::Unplaced { name, problems, .. } => audit::Report {
+            Selected::Unplaced { name, problem, .. } => audit::Report {
                 repo: name.to_string(),
                 findings: Vec::new(),
                 notes: Vec::new(),
-                problems: problems.clone(),
+                problems: vec![problem.clone()],
             },
         };
         worst = worst.worst(audit::exit_for(&report));
@@ -642,20 +654,23 @@ fn scribe_for(fork: &Fork<'_>, identity: &Identity) -> Scribe {
 /// One registry entry as a many-repo verb sees it after the scan.
 enum Selected<'a> {
     Bound(Fork<'a>),
-    /// Not found, or found twice: still a row, never opened. `problems` is the
-    /// refusal followed by the scan's own complaints, so an unreadable checkout
-    /// is named beside the entry it may have been.
+    /// Not found, or found twice: still a row, never opened. `problem` is the
+    /// refusal; the scan's own complaints are reported once, not on every row.
     Unplaced {
         name: RepoName,
         entry: &'a RepoEntry,
-        problems: Vec<String>,
+        problem: String,
     },
 }
 
-/// Every entry, bound through one scan of `home`.
-fn sweep<'a>(registry: &'a Registry, home: &std::path::Path) -> Vec<Selected<'a>> {
+/// Every entry, bound through one scan of `home`, and what the scan could not
+/// read — drained from the scan first, so each unplaced row carries only its
+/// own refusal and the caller reports the problems once, whether or not every
+/// entry was found.
+fn sweep<'a>(registry: &'a Registry, home: &std::path::Path) -> (Vec<Selected<'a>>, Vec<String>) {
     let mut scan = knives::bind::scan(registry, home);
-    registry
+    let problems = std::mem::take(&mut scan.problems);
+    let selected = registry
         .repos
         .iter()
         .map(|(name, entry)| {
@@ -663,25 +678,18 @@ fn sweep<'a>(registry: &'a Registry, home: &std::path::Path) -> Vec<Selected<'a>
             if let Some(fork) = scan.found.remove(&name) {
                 return Selected::Bound(fork);
             }
-            let why = scan.duplicates.remove(&name).map_or_else(
-                || Unresolved::Missing {
-                    home: home.to_owned(),
-                },
-                |paths| Unresolved::Duplicate {
-                    home: home.to_owned(),
-                    paths,
-                },
+            let problem = format!(
+                "could not gather: {}",
+                scan.unplaced(&name).message(&name, registry)
             );
-            let problems = std::iter::once(format!("could not gather: {}", why.message(&name)))
-                .chain(scan.problems.iter().cloned())
-                .collect();
             Selected::Unplaced {
                 name,
                 entry,
-                problems,
+                problem,
             }
         })
-        .collect()
+        .collect();
+    (selected, problems)
 }
 
 /// Which repos a report covers: a named one, all of them, or (neither) the one
@@ -781,12 +789,12 @@ fn status_row(
         Selected::Unplaced {
             name,
             entry,
-            problems,
+            problem,
         } => (
             status::Report {
                 repo: name.to_string(),
                 trunk: entry.trunk().to_owned(),
-                problems: problems.clone(),
+                problems: vec![problem.clone()],
                 ..status::Report::default()
             },
             None,
@@ -942,9 +950,9 @@ fn run_sync(
                 problems: vec![format!("could not sync: {error:#}")],
                 ..sync::Report::default()
             }),
-            Selected::Unplaced { name, problems, .. } => sync::Report {
+            Selected::Unplaced { name, problem, .. } => sync::Report {
                 repo: name.to_string(),
-                problems: problems.clone(),
+                problems: vec![problem.clone()],
                 ..sync::Report::default()
             },
         };

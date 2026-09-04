@@ -22,8 +22,9 @@ Every command takes its repo from the directory you are standing in. Name one on
 What is managed, where each checkout was found on this machine, the newest release each has
 cut, and, where consumer slugs are recorded, whether their repository trunks are pinned behind
 the newest cut. Every entry is a row whether or not a checkout was found: one the scan did not
-place reads `not on this machine` and has no release state; one found twice carries the refusal
-naming both paths as a problem, and the command exits `3`.
+place reads `not on this machine` and has no release state; one found twice reads `ambiguous: 2
+checkouts` with a problem naming both paths. A checkout the scan could not read is a `?` line on
+the listing itself. Either leaves the command incomplete: exit `3`.
 
 Registered consumers are fetched by forge slug: Knives reads supported pin files at the consumer
 repository's trunk and caches the result by its commit. When the forge is down, cache-backed pins
@@ -454,10 +455,15 @@ note saying so: `origin remote is <X>; registry says <Y>`.
 
 The scan reads jj checkouts only (`.jj/repo` a directory; a workspace is found through its
 checkout), skips directories whose name starts with `.`, does not follow symlinks, and does not
-look below a repository. A checkout deeper than three directories under `~`, or outside `~`, is
-not found by the scan but binds as soon as you stand inside it — for every command except
-`knives repos`, which only scans, so it lists such a checkout as `not on this machine` even when
-run from inside it.
+look below a jj checkout — a plain git repository is not a checkout and does not hide the forks
+beneath it. A checkout deeper than three directories under `~`, or outside `~`, is not found by
+the scan but binds as soon as you stand inside it — for every command except `knives repos`,
+which only scans, so it lists such a checkout as `not on this machine` even when run from inside
+it. A checkout the scan could not read (a `.jj/repo` jj cannot open, a directory it cannot list)
+is never dropped: a named repository's refusal ends `; could not read: <what>`, `knives repos`
+lists it as a `?` problem, and a sweep (`status --all`, `sync --all`, `audit --all`) says
+`could not read: <what>` once on stderr, whatever the output format. `HOME` must be set: the
+scan refuses (`HOME is not set; knives scans $HOME for checkouts`, exit `2`) rather than scan `/`.
 
 ### Registry fields
 

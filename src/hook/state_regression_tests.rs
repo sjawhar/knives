@@ -63,7 +63,7 @@ fn a_document_predating_notice_digests_survives_update_and_reload() -> anyhow::R
     // independent remote cache remains absent.
     assert!(state.repo(Path::new("/r")).guided);
     assert!(!state.notice_seen(Path::new("/r"), "digest"));
-    assert!(state.remotes(Path::new("/r")).is_none());
+    assert!(state.remotes(Path::new("/r"), None).is_none());
     Ok(())
 }
 
@@ -82,6 +82,26 @@ fn a_legacy_owner_verdict_document_loads_without_reusing_its_verdict() -> anyhow
 
     // Then: legacy verdicts are ignored rather than carried into the new cache shape.
     assert!(!rewritten.contains("owner_verdicts"));
+    Ok(())
+}
+
+#[test]
+fn a_legacy_owner_remotes_document_loads_and_is_rewritten_without_it() -> anyhow::Result<()> {
+    // Given: a session record written when owner lists, not remotes, were cached.
+    let home = tempfile::tempdir()?;
+    let directory = home.path().join("hook-sessions");
+    std::fs::create_dir_all(&directory)?;
+    let state_path = directory.join("claude-code-s1.json");
+    std::fs::write(&state_path, r#"{"owner_remotes":{"/r":["ours"]}}"#)?;
+
+    // When: the record is loaded, then re-persisted by a no-op update.
+    let loaded = SessionState::load(home.path(), "claude-code", "s1");
+    SessionState::update(home.path(), "claude-code", "s1", |_| {})?;
+    let rewritten = std::fs::read_to_string(state_path)?;
+
+    // Then: nothing is known about `/r`, and the legacy key is gone.
+    assert_eq!(loaded.remotes(Path::new("/r"), None), None);
+    assert!(!rewritten.contains("owner_remotes"), "{rewritten}");
     Ok(())
 }
 

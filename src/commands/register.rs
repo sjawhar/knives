@@ -3,12 +3,14 @@
 //! Registration is a trust grant, so nothing here writes the registry: a human
 //! pastes the entry. A checkout whose `upstream` the registry already lists is
 //! named rather than re-described, because the entry is the identity and one
-//! upstream cannot be two entries.
+//! upstream cannot be two entries; a checkout whose directory name is already
+//! an entry of another repository is refused, because two entries cannot share
+//! a name either.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::bind::{self, remote_authority_and_path, url_owner};
+use crate::bind::{self, Checkout, remote_host, url_owner};
 use crate::cli::Exit;
 use crate::config::{Registry, RepoEntry, default_config_path, load};
 use crate::hook::resolve::guidance_name;
@@ -34,6 +36,13 @@ pub enum Outcome {
     AlreadyRegistered {
         name: RepoName,
     },
+    /// The name the checkout would take is already an entry naming another
+    /// repository. Identity is the upstream, so the entry cannot be replaced;
+    /// the human picks another name.
+    NameTaken {
+        name: String,
+        upstream: String,
+    },
     Snippet {
         name: String,
         entry: RepoEntry,
@@ -51,18 +60,25 @@ pub enum Outcome {
 ///
 /// # Errors
 ///
-/// Returns an error when the checkout's remotes cannot be read.
+/// Returns an error when the checkout's remotes cannot be read — including a
+/// workspace whose checkout is gone, which jj reports in its own words.
 pub fn outcome_for(path: &Path, registry: &Registry) -> anyhow::Result<Outcome> {
     let Some(root) = bind::checkout_root(path) else {
         return Ok(Outcome::NotARepository {
             path: path.to_owned(),
         });
     };
-    if !root.join(".jj").join("repo").is_dir() {
-        return Ok(Outcome::NotAJjCheckout { path: root });
-    }
     let remotes = bind::remotes(&root)?;
-    Ok(decide(&root, &remotes, registry))
+    let checkout = Checkout {
+        path: root,
+        remotes,
+    };
+    if !checkout.is_jj() {
+        return Ok(Outcome::NotAJjCheckout {
+            path: checkout.path,
+        });
+    }
+    Ok(decide(&checkout.path, &checkout.remotes, registry))
 }
 
 fn decide(root: &Path, remotes: &BTreeMap<String, String>, registry: &Registry) -> Outcome {
@@ -83,8 +99,17 @@ fn decide(root: &Path, remotes: &BTreeMap<String, String>, registry: &Registry) 
     if let Some((name, _)) = bind::entry_for(registry, upstream) {
         return Outcome::AlreadyRegistered { name };
     }
+    let name = guidance_name(root);
+    // No entry has this upstream, so an entry with this name is another
+    // repository's.
+    if let Some(taken) = registry.repos.get(&name) {
+        return Outcome::NameTaken {
+            name,
+            upstream: taken.upstream.clone(),
+        };
+    }
     Outcome::Snippet {
-        name: guidance_name(root),
+        name,
         entry: RepoEntry {
             upstream: upstream.clone(),
             origin: origin.clone(),
@@ -99,18 +124,12 @@ fn decide(root: &Path, remotes: &BTreeMap<String, String>, registry: &Registry) 
     }
 }
 
-fn url_host(url: &str) -> Option<&str> {
-    let (authority, _) = remote_authority_and_path(url)?;
-    let host = authority
-        .rsplit_once('@')
-        .map_or(authority, |(_, host)| host);
-    (!host.is_empty()).then_some(host)
-}
-
-fn repo_slug(url: &str) -> Option<&str> {
+/// The last path segment of a remote URL without `.git`: the repository's own
+/// name, whichever owner or forge holds it.
+fn repository_name(url: &str) -> Option<&str> {
     let (_, repository) = url.trim_end_matches('/').rsplit_once('/')?;
-    let slug = repository.strip_suffix(".git").or(Some(repository))?;
-    (!slug.is_empty()).then_some(slug)
+    let name = repository.strip_suffix(".git").or(Some(repository))?;
+    (!name.is_empty()).then_some(name)
 }
 
 /// An untracked remote that looks like another fork of upstream: the wiring
@@ -121,12 +140,14 @@ fn miswiring_warnings(remotes: &BTreeMap<String, String>) -> Vec<String> {
     let (Some(upstream), Some(origin)) = (remotes.get("upstream"), remotes.get("origin")) else {
         return Vec::new();
     };
-    let (Some(upstream_slug), Some(upstream_owner), Some(origin_owner)) =
-        (repo_slug(upstream), url_owner(upstream), url_owner(origin))
-    else {
+    let (Some(upstream_name), Some(upstream_owner), Some(origin_owner)) = (
+        repository_name(upstream),
+        url_owner(upstream),
+        url_owner(origin),
+    ) else {
         return Vec::new();
     };
-    let upstream_host = url_host(upstream);
+    let upstream_host = remote_host(upstream);
 
     remotes
         .iter()
@@ -134,17 +155,18 @@ fn miswiring_warnings(remotes: &BTreeMap<String, String>) -> Vec<String> {
             if matches!(name.as_str(), "upstream" | "origin" | "release") {
                 return None;
             }
-            let (Some(slug), Some(owner)) = (repo_slug(url), url_owner(url)) else {
+            let (Some(name_of_remote), Some(owner)) = (repository_name(url), url_owner(url))
+            else {
                 return None;
             };
-            if !slug.eq_ignore_ascii_case(upstream_slug)
+            if !name_of_remote.eq_ignore_ascii_case(upstream_name)
                 || owner.eq_ignore_ascii_case(upstream_owner)
                 || owner.eq_ignore_ascii_case(origin_owner)
             {
                 return None;
             }
-            if let (Some(remote_host), Some(upstream_host)) = (url_host(url), upstream_host)
-                && !remote_host.eq_ignore_ascii_case(upstream_host)
+            if let (Some(host), Some(upstream_host)) = (remote_host(url), upstream_host)
+                && !host.eq_ignore_ascii_case(upstream_host)
             {
                 return None;
             }
@@ -187,6 +209,10 @@ fn refusal(outcome: &Outcome) -> Option<String> {
             found.join(", "),
             absent.join(" or ")
         )),
+        Outcome::NameTaken { name, upstream } => Some(format!(
+            "[repos.{name}] already names {upstream}; pick another name, or update that entry's \
+             upstream if this is the same repository renamed"
+        )),
         Outcome::AlreadyRegistered { .. } | Outcome::Snippet { .. } => None,
     }
 }
@@ -220,14 +246,15 @@ pub fn run(target: Option<PathBuf>) -> anyhow::Result<Exit> {
             }
             print!("{}", snippet(&name, &entry)?);
             eprintln!(
-                "paste this into {} to register; replace any existing [repos.{name}] entry rather than appending a duplicate; hooks reload the registry on every event, so it takes effect on the next tool call\n  convention: origin = your fork (push target, PR heads); upstream = the maintainer's repo (fetch only)",
+                "paste this into {} to register; hooks reload the registry on every event, so it takes effect on the next tool call\n  convention: origin = your fork (push target, PR heads); upstream = the maintainer's repo (fetch only)",
                 config_path.display()
             );
             Ok(Exit::Ok)
         }
         refused @ (Outcome::NotARepository { .. }
         | Outcome::NotAJjCheckout { .. }
-        | Outcome::MissingRoles { .. }) => {
+        | Outcome::MissingRoles { .. }
+        | Outcome::NameTaken { .. }) => {
             if let Some(line) = refusal(&refused) {
                 eprintln!("{line}");
             }
@@ -246,7 +273,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::path::Path;
 
-    use super::{Outcome, decide, refusal, repo_slug, snippet};
+    use super::{Outcome, decide, refusal, repository_name, snippet};
     use crate::config::{Registry, RepoEntry};
     use crate::ids::RepoName;
     #[cfg(unix)]
@@ -343,16 +370,25 @@ mod tests {
 
     #[test]
     fn a_registered_name_does_not_claim_a_checkout_of_another_upstream() {
-        // Identity is the upstream: a second fork named like an entry is a new
-        // entry to paste, and the name is the human's to choose.
+        // Identity is the upstream: a second fork named like an entry is
+        // another repository, and its entry cannot replace the one that is
+        // there. The human picks the name.
         let registry = registry_with("tool", "https://forge.invalid/maintainer/tool");
         let found = remotes(&[
             ("origin", "https://forge.invalid/someone/tool.git"),
             ("upstream", "https://forge.invalid/other/tool.git"),
         ]);
-        assert!(matches!(
+        assert_eq!(
             decide(Path::new("/tmp/forks/tool/default"), &found, &registry),
-            Outcome::Snippet { name, .. } if name == "tool"
+            Outcome::NameTaken {
+                name: "tool".to_owned(),
+                upstream: "https://forge.invalid/maintainer/tool".to_owned(),
+            }
+        );
+        // Another directory name is a new entry to paste.
+        assert!(matches!(
+            decide(Path::new("/tmp/forks/tool-2/default"), &found, &registry),
+            Outcome::Snippet { name, .. } if name == "tool-2"
         ));
     }
 
@@ -449,8 +485,8 @@ mod tests {
     }
 
     #[test]
-    fn repo_slug_rejects_an_empty_repository_name() {
-        assert_eq!(repo_slug("https://forge.invalid/someone/.git"), None);
+    fn repository_name_rejects_an_empty_repository_name() {
+        assert_eq!(repository_name("https://forge.invalid/someone/.git"), None);
     }
 
     #[test]
@@ -480,6 +516,17 @@ mod tests {
             })
             .as_deref(),
             Some("/tmp/nowhere is not a repository")
+        );
+        assert_eq!(
+            refusal(&Outcome::NameTaken {
+                name: "tool".to_owned(),
+                upstream: "https://forge.invalid/maintainer/tool".to_owned(),
+            })
+            .as_deref(),
+            Some(
+                "[repos.tool] already names https://forge.invalid/maintainer/tool; pick another \
+                 name, or update that entry's upstream if this is the same repository renamed"
+            )
         );
         assert_eq!(
             refusal(&Outcome::AlreadyRegistered {

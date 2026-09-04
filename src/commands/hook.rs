@@ -16,7 +16,7 @@ use crate::hook::guidance::{
 };
 use crate::hook::opencode::{self, Event as OpenCodeEvent, EventKind as OpenCodeEventKind};
 use crate::hook::resolve::{Match, argument_paths, match_checkout};
-use crate::hook::state::SessionState;
+use crate::hook::state::{SessionState, remotes_stamp};
 use crate::ids::RepoName;
 use crate::store::{Store, default_state_path};
 
@@ -165,7 +165,7 @@ fn opencode_tool_after(event: &OpenCodeEvent, home: &Path) -> anyhow::Result<Str
         && let Some(cwd) = event.cwd()
     {
         crate::seen::record_observation(
-            standing_in(cwd, &registry, cache)?.as_ref(),
+            standing_in(cwd, &registry, cache).as_ref(),
             Path::new(cwd),
             &Identity {
                 owner: session_id.to_owned(),
@@ -196,14 +196,14 @@ fn opencode_tool_after(event: &OpenCodeEvent, home: &Path) -> anyhow::Result<Str
     }
     let addition = additions.join("\n");
     if !addition.is_empty() {
-        let _ = SessionState::update(home, OPENCODE, session_id, move |state| {
+        remember(home, OPENCODE, session_id, move |state| {
             if let Some(update) = notice_update {
                 update.apply(state, &repo.root);
             }
             if guidance_rendered {
                 state.mark_guided(&repo.root);
             }
-        })?;
+        });
     }
     opencode::tool_response(&addition).map_err(Into::into)
 }
@@ -216,7 +216,7 @@ fn opencode_chat_system(event: &OpenCodeEvent, home: &Path) -> anyhow::Result<St
     let cache = event
         .session_id()
         .map(|session_id| (home, OPENCODE, session_id));
-    let Some(matched) = match_with_trust(&[PathBuf::from(directory)], &registry, cache)? else {
+    let Some(matched) = match_with_trust(&[PathBuf::from(directory)], &registry, cache) else {
         return opencode::system_response("", &[]).map_err(Into::into);
     };
     if !matched.trusted {
@@ -312,8 +312,7 @@ fn session_start(event: &Event, home: &Path) -> anyhow::Result<Option<String>> {
         &[PathBuf::from(cwd)],
         &registry,
         Some((home, CLAUDE_CODE, session_id)),
-    )?
-    else {
+    ) else {
         return Ok(None);
     };
     let Some(managed) = &matched.managed else {
@@ -336,9 +335,9 @@ fn session_start(event: &Event, home: &Path) -> anyhow::Result<Option<String>> {
         return Ok(None);
     };
     let (notice, update) = notice.into_parts();
-    let _ = SessionState::update(home, CLAUDE_CODE, session_id, move |state| {
+    remember(home, CLAUDE_CODE, session_id, move |state| {
         update.apply(state, &repo.root);
-    })?;
+    });
     response(SESSION_START_WIRE_NAME, &notice)
         .map(Some)
         .map_err(Into::into)
@@ -364,7 +363,7 @@ fn post_tool_use(event: &Event, home: &Path) -> anyhow::Result<Option<String>> {
         && let Some(cwd) = event.cwd()
     {
         crate::seen::record_observation(
-            standing_in(cwd, &registry, cache)?.as_ref(),
+            standing_in(cwd, &registry, cache).as_ref(),
             Path::new(cwd),
             &Identity {
                 owner: session_id.to_owned(),
@@ -403,17 +402,27 @@ fn post_tool_use(event: &Event, home: &Path) -> anyhow::Result<Option<String>> {
     if parts.is_empty() {
         return Ok(None);
     }
-    let _ = SessionState::update(home, CLAUDE_CODE, session_id, move |state| {
+    remember(home, CLAUDE_CODE, session_id, move |state| {
         if let Some(update) = notice_update {
             update.apply(state, &repo.root);
         }
         if guidance.is_some() {
             state.mark_guided(&repo.root);
         }
-    })?;
+    });
     response(POST_TOOL_USE_WIRE_NAME, &parts.join("\n"))
         .map(Some)
         .map_err(Into::into)
+}
+
+/// Persist a session-state change, reporting a failure without failing the
+/// response. The state file is a saving — one notice, one guidance per session
+/// — and losing the saving beats losing the answer: a read-only config home
+/// gets its guidance on every event rather than never.
+fn remember(home: &Path, harness: &str, session_id: &str, apply: impl FnOnce(&mut SessionState)) {
+    if let Err(error) = SessionState::update(home, harness, session_id, apply) {
+        eprintln!("knives hook: {error:#}");
+    }
 }
 
 /// The tool an event says was called, and which tools the harness treats as
@@ -445,7 +454,7 @@ fn relevant_tool_match(
         return Ok(None);
     }
     let registry = load(&default_config_path())?;
-    let matched = match_with_trust(&paths, &registry, cache)?;
+    let matched = match_with_trust(&paths, &registry, cache);
     Ok(matched.map(|matched| (registry, matched)))
 }
 
@@ -456,49 +465,53 @@ fn standing_in(
     cwd: &str,
     registry: &Registry,
     cache: Option<(&Path, &str, &str)>,
-) -> anyhow::Result<Option<RepoName>> {
-    Ok(match_with_trust(&[PathBuf::from(cwd)], registry, cache)?
-        .and_then(|matched| matched.managed))
+) -> Option<RepoName> {
+    match_with_trust(&[PathBuf::from(cwd)], registry, cache).and_then(|matched| matched.managed)
 }
 
-/// Resolve the touched paths, reading each checkout's remotes once per session.
+/// Resolve the touched paths, reading each checkout's remotes once per session
+/// — once per rewrite of the file they live in ([`remotes_stamp`]), so a
+/// `git remote add` after the first touch is seen on the next.
 ///
-/// A read failure is reported on stderr and yields no remote facts for that
-/// checkout; a `[trust] roots` rule still applies. A cache write failure is the
-/// command's error, surfaced after resolution so the match itself is not lost.
+/// A read failure is reported on stderr once and cached as no remote facts for
+/// that checkout; a `[trust] roots` rule still applies. A cache write failure
+/// is reported on stderr too, and the match stands: the cache is a saving, not
+/// a condition.
 fn match_with_trust(
     paths: &[PathBuf],
     registry: &Registry,
     cache: Option<(&Path, &str, &str)>,
-) -> anyhow::Result<Option<Match>> {
+) -> Option<Match> {
     let mut cache_error = None;
     let mut remotes_of = |checkout: &Path| -> Option<BTreeMap<String, String>> {
+        let stamp = remotes_stamp(checkout);
         if let Some((home, harness, session_id)) = cache
-            && let Some(cached) = SessionState::load(home, harness, session_id).remotes(checkout)
+            && let Some(cached) =
+                SessionState::load(home, harness, session_id).remotes(checkout, stamp)
         {
             return Some(cached.clone());
         }
         let remotes = match bind::remotes(checkout) {
-            Ok(remotes) => remotes,
+            Ok(remotes) => Some(remotes),
             Err(error) => {
                 eprintln!("knives hook: {error}");
-                return None;
+                None
             }
         };
         if let Some((home, harness, session_id)) = cache
             && let Err(error) = SessionState::update(home, harness, session_id, |state| {
-                state.record_remotes(checkout, remotes.clone());
+                state.record_remotes(checkout, stamp, remotes.clone().unwrap_or_default());
             })
         {
             cache_error = Some(error);
         }
-        Some(remotes)
+        remotes
     };
     let matched = match_checkout(paths, registry, &mut remotes_of);
     if let Some(error) = cache_error {
-        return Err(error);
+        eprintln!("knives hook: {error:#}");
     }
-    Ok(matched)
+    matched
 }
 
 /// What guidance and session state key on: the match's nearest root and name.

@@ -276,23 +276,28 @@ impl TrustRules {
         self.repos.is_empty() && self.roots.is_empty() && self.owners.is_empty()
     }
 
-    /// Whether these rules trust a checkout at `root` declaring `remotes`.
-    ///
-    /// `roots` contains the root (canonicalised, component-wise); `owners`
-    /// matches any remote's owner segment; `repos` matches any remote's
-    /// `owner/repo` slug. Any rule true is enough.
+    /// Whether these rules trust a checkout at `root` declaring `remotes`:
+    /// [`Self::contains_root`] or [`Self::grants_by_remotes`].
     pub fn grants(&self, root: &Path, remotes: &BTreeMap<String, String>) -> bool {
+        self.contains_root(root) || self.grants_by_remotes(remotes)
+    }
+
+    /// Whether `roots` contains `root` (canonicalised, component-wise). Decided
+    /// from the path alone: it needs neither jj nor the remotes cache.
+    pub fn contains_root(&self, root: &Path) -> bool {
         // Trust roots are tilde-expanded at load but can be symlinked; compare
         // canonical paths when possible so a real checkout under one is not missed.
-        let under_root = self.roots.iter().any(|configured| {
+        self.roots.iter().any(|configured| {
             let trusted = configured
                 .canonicalize()
                 .unwrap_or_else(|_| configured.clone());
             root.strip_prefix(&trusted).is_ok()
-        });
-        if under_root {
-            return true;
-        }
+        })
+    }
+
+    /// Whether `owners` matches any remote's owner segment, or `repos` any
+    /// remote's `owner/repo` slug.
+    pub fn grants_by_remotes(&self, remotes: &BTreeMap<String, String>) -> bool {
         remotes.values().any(|url| {
             let owned = crate::bind::url_owner(url).is_some_and(|owner| {
                 self.owners
@@ -360,20 +365,17 @@ pub enum ConfigError {
     Invalid { path: PathBuf, detail: String },
 }
 
-/// Where the registry lives.
-///
-/// `KNIVES_CONFIG_HOME` wins over `XDG_CONFIG_HOME` so this tool can be pointed
-/// elsewhere without moving every other tool's config too. Redirecting
-/// `XDG_CONFIG_HOME` to isolate this tool also hides the forge CLI's
-/// credentials, which turns a working setup into an authentication failure.
 /// Expand `~` and resolve a relative registry path against the config home.
+///
+/// With no home directory `~` stays as written; the caller that needs it
+/// reports the missing home.
 pub fn expand_registry_path(path: &Path, config_home: &Path) -> PathBuf {
     let text = path.to_string_lossy();
     if text == "~" {
-        return home_dir();
+        return home_dir().unwrap_or_else(|| path.to_owned());
     }
     if let Some(rest) = text.strip_prefix("~/") {
-        return home_dir().join(rest);
+        return home_dir().map_or_else(|| path.to_owned(), |home| home.join(rest));
     }
     if path.is_absolute() {
         return path.to_owned();
@@ -381,11 +383,26 @@ pub fn expand_registry_path(path: &Path, config_home: &Path) -> PathBuf {
     config_home.join(path)
 }
 
-/// `$HOME`, the scan root for finding checkouts; `/` when unset.
-pub fn home_dir() -> PathBuf {
-    std::env::var("HOME").map_or_else(|_| PathBuf::from("/"), PathBuf::from)
+/// `$HOME`: the scan root for finding checkouts, and what `~` expands to.
+///
+/// `None` when unset or empty — the scan callers refuse rather than scanning
+/// `/`. No password-database fallback: the refusal says `HOME is not set`, and
+/// a fallback would make it unreachable on any machine with a passwd entry.
+pub fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
 }
 
+/// What the scan callers print when [`home_dir`] is `None`.
+pub const NO_HOME: &str = "HOME is not set; knives scans $HOME for checkouts";
+
+/// Where the registry lives.
+///
+/// `KNIVES_CONFIG_HOME` wins over `XDG_CONFIG_HOME` so this tool can be pointed
+/// elsewhere without moving every other tool's config too. Redirecting
+/// `XDG_CONFIG_HOME` to isolate this tool also hides the forge CLI's
+/// credentials, which turns a working setup into an authentication failure.
 pub fn default_config_path() -> PathBuf {
     if let Ok(home) = std::env::var("KNIVES_CONFIG_HOME") {
         return PathBuf::from(home).join("repos.toml");
@@ -395,8 +412,8 @@ pub fn default_config_path() -> PathBuf {
             // Never the current directory: that silently relocates the trust
             // set, and the registry decides which repositories the plugin will
             // inject guidance from.
-            std::env::var("HOME")
-                .map_or_else(|_| PathBuf::from("/nonexistent"), PathBuf::from)
+            home_dir()
+                .unwrap_or_else(|| PathBuf::from("/nonexistent"))
                 .join(".config")
         },
         PathBuf::from,
@@ -414,13 +431,28 @@ pub fn load(path: &Path) -> Result<Registry, ConfigError> {
         path: path.to_owned(),
         source,
     })?;
-    let raw = raw_table(&text, path)?;
-    reject_deleted_trusted_table(&raw, path)?;
-    reject_deleted_path_field(&raw, path)?;
-    let mut registry: Registry = toml::from_str(&text).map_err(|source| ConfigError::Parse {
-        path: path.to_owned(),
-        source: Box::new(source),
-    })?;
+    let mut registry: Registry = match toml::from_str(&text) {
+        Ok(registry) => registry,
+        // A deleted field or table gets a message naming its replacement,
+        // rather than serde's "unknown field"; both are named when both remain.
+        Err(source) => {
+            let raw = raw_table(&text, path)?;
+            let rejections: Vec<String> = deleted_trusted_table(&raw)
+                .into_iter()
+                .chain(deleted_path_field(&raw))
+                .collect();
+            if rejections.is_empty() {
+                return Err(ConfigError::Parse {
+                    path: path.to_owned(),
+                    source: Box::new(source),
+                });
+            }
+            return Err(ConfigError::Invalid {
+                path: path.to_owned(),
+                detail: rejections.join("; "),
+            });
+        }
+    };
     for name in registry.repos.keys() {
         if name.is_empty()
             || name == "."
@@ -436,9 +468,11 @@ pub fn load(path: &Path) -> Result<Registry, ConfigError> {
         }
     }
     reject_shared_upstreams(&registry, path)?;
-    let home = path.parent().unwrap_or_else(|| Path::new(".")).to_owned();
+    reject_tilde_paths_without_a_home(&registry, path)?;
+    let config_home = path.parent().unwrap_or_else(|| Path::new(".")).to_owned();
     for (name, entry) in &mut registry.repos {
-        entry.workspaces = checked_workspaces(name, entry.workspaces.as_deref(), &home, path)?;
+        entry.workspaces =
+            checked_workspaces(name, entry.workspaces.as_deref(), &config_home, path)?;
         for (role, remote) in [
             ("upstream", entry.upstream.as_str()),
             ("origin", entry.origin.as_str()),
@@ -478,9 +512,51 @@ pub fn load(path: &Path) -> Result<Registry, ConfigError> {
         }
     }
     for root in &mut registry.trust.roots {
-        *root = expand_registry_path(root, &home);
+        *root = expand_registry_path(root, &config_home);
     }
     Ok(registry)
+}
+
+/// A `~` in `workspaces` or `[trust] roots` expands through [`home_dir`]. With
+/// no home it would stay as written — a *relative* path `~/…` — and `knives
+/// start` would open workspaces under `<cwd>/~/…`. Refused by name instead.
+fn reject_tilde_paths_without_a_home(registry: &Registry, path: &Path) -> Result<(), ConfigError> {
+    if home_dir().is_some() {
+        return Ok(());
+    }
+    let is_tilde = |value: &Path| {
+        let text = value.to_string_lossy();
+        text == "~" || text.starts_with("~/")
+    };
+    let offending = registry
+        .repos
+        .iter()
+        .filter_map(|(name, entry)| {
+            let workspaces = entry
+                .workspaces
+                .as_deref()
+                .filter(|value| is_tilde(value))?;
+            Some(format!(
+                "[repos.{name}] workspaces = \"{}\" needs HOME",
+                workspaces.display()
+            ))
+        })
+        .chain(
+            registry
+                .trust
+                .roots
+                .iter()
+                .filter(|root| is_tilde(root))
+                .map(|root| format!("[trust] roots = \"{}\" needs HOME", root.display())),
+        )
+        .collect::<Vec<_>>();
+    if offending.is_empty() {
+        return Ok(());
+    }
+    Err(ConfigError::Invalid {
+        path: path.to_owned(),
+        detail: format!("{NO_HOME}: {}", offending.join("; ")),
+    })
 }
 
 /// A release branch named for the trunk would make every trunk exclusion also
@@ -520,7 +596,7 @@ fn checked_release_branch(entry: &RepoEntry, path: &Path) -> Result<(), ConfigEr
 }
 
 /// The registry as a plain TOML table, for the checks that name a deleted field
-/// or table before serde's "unknown field" gets to complain about it.
+/// or table where serde only says "unknown field".
 fn raw_table(text: &str, path: &Path) -> Result<toml::Table, ConfigError> {
     toml::from_str(text).map_err(|source| ConfigError::Parse {
         path: path.to_owned(),
@@ -530,27 +606,22 @@ fn raw_table(text: &str, path: &Path) -> Result<toml::Table, ConfigError> {
 
 /// `[trusted.*]` was deleted with the registry's paths. A message that names the
 /// replacement beats serde's "unknown field" for the one section people had.
-fn reject_deleted_trusted_table(raw: &toml::Table, path: &Path) -> Result<(), ConfigError> {
+fn deleted_trusted_table(raw: &toml::Table) -> Option<String> {
     raw.get("trusted")
         .and_then(toml::Value::as_table)
         .and_then(|trusted| trusted.keys().next())
-        .map_or(Ok(()), |name| {
-            Err(ConfigError::Invalid {
-                path: path.to_owned(),
-                detail: format!(
-                    "[trusted.{name}] is no longer a registry table; move it to [trust] repos = \
-                     [\"<owner>/<repo>\"]"
-                ),
-            })
+        .map(|name| {
+            format!(
+                "[trusted.{name}] is no longer a registry table; move it to [trust] repos = \
+                 [\"<owner>/<repo>\"]"
+            )
         })
 }
 
 /// `path` left the registry: checkouts are found by their remotes. The first
 /// offending entry by name is reported, with what replaced the field.
-fn reject_deleted_path_field(raw: &toml::Table, path: &Path) -> Result<(), ConfigError> {
-    let Some(repos) = raw.get("repos").and_then(toml::Value::as_table) else {
-        return Ok(());
-    };
+fn deleted_path_field(raw: &toml::Table) -> Option<String> {
+    let repos = raw.get("repos").and_then(toml::Value::as_table)?;
     let mut names: Vec<&String> = repos
         .iter()
         .filter(|(_, entry)| {
@@ -561,14 +632,11 @@ fn reject_deleted_path_field(raw: &toml::Table, path: &Path) -> Result<(), Confi
         .map(|(name, _)| name)
         .collect();
     names.sort();
-    names.first().map_or(Ok(()), |name| {
-        Err(ConfigError::Invalid {
-            path: path.to_owned(),
-            detail: format!(
-                "[repos.{name}] path is no longer a registry field; delete it — knives finds \
-                 checkouts by their remotes"
-            ),
-        })
+    names.first().map(|name| {
+        format!(
+            "[repos.{name}] path is no longer a registry field; delete it — knives finds \
+             checkouts by their remotes"
+        )
     })
 }
 
@@ -600,7 +668,7 @@ fn reject_shared_upstreams(registry: &Registry, path: &Path) -> Result<(), Confi
 fn checked_workspaces(
     name: &str,
     raw: Option<&Path>,
-    home: &Path,
+    config_home: &Path,
     path: &Path,
 ) -> Result<Option<PathBuf>, ConfigError> {
     let Some(raw) = raw else {
@@ -612,7 +680,7 @@ fn checked_workspaces(
             detail: format!("[repos.{name}] workspaces is empty; name a directory or omit it"),
         });
     }
-    Ok(Some(expand_registry_path(raw, home)))
+    Ok(Some(expand_registry_path(raw, config_home)))
 }
 
 fn is_forge_slug(value: &str) -> bool {
@@ -928,6 +996,54 @@ release = "https://example.invalid/releases.git"
     }
 
     #[test]
+    fn a_registry_with_both_a_path_field_and_a_trusted_table_names_both_at_once() {
+        // The registry that predates this shape has both; naming one per load
+        // would take two rounds to migrate it.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("repos.toml");
+        std::fs::write(
+            &path,
+            "[repos.tool]\npath = \"~/tool\"\nupstream = \"u\"\norigin = \"o\"\n\n[trusted.work]\n",
+        )
+        .unwrap();
+        let error = load(&path).unwrap_err().to_string();
+        assert!(
+            error.contains("[trusted.work] is no longer a registry table"),
+            "{error}"
+        );
+        assert!(
+            error.contains("[repos.tool] path is no longer a registry field"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_field_or_table_is_refused_by_name() {
+        // `deny_unknown_fields` on every table: a misspelt key would otherwise
+        // silently mean its default.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("repos.toml");
+        std::fs::write(
+            &path,
+            "[repos.x]\nupstream = \"u\"\norigin = \"o\"\nreleas = \"r\"\n",
+        )
+        .unwrap();
+        let error = load(&path).unwrap_err().to_string();
+        assert!(error.contains("unknown field"), "{error}");
+        assert!(error.contains("releas"), "{error}");
+
+        std::fs::write(&path, "[trust]\nrepo = [\"a/b\"]\n").unwrap();
+        let error = load(&path).unwrap_err().to_string();
+        assert!(error.contains("unknown field"), "{error}");
+        assert!(error.contains("repo"), "{error}");
+
+        std::fs::write(&path, "[bogus]\nkey = 1\n").unwrap();
+        let error = load(&path).unwrap_err().to_string();
+        assert!(error.contains("unknown field"), "{error}");
+        assert!(error.contains("bogus"), "{error}");
+    }
+
+    #[test]
     fn two_entries_sharing_an_upstream_are_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("repos.toml");
@@ -1011,6 +1127,40 @@ release = "https://example.invalid/releases.git"
         assert_eq!(
             registry.trust.owners,
             vec!["some-owner".to_owned(), "some-org".to_owned()]
+        );
+    }
+
+    #[test]
+    fn a_tilde_path_is_refused_by_name_when_there_is_no_home_to_expand_it() {
+        // Left unexpanded, `~/ws` is a relative path and `knives start` would
+        // open workspaces under `<cwd>/~/ws`. Every offending key is named.
+        let _lock = environment_lock();
+        let environment = EnvironmentGuard::capture(&["HOME"]);
+        environment.remove("HOME");
+        let dir = tempfile::tempdir().unwrap();
+        let text = "[repos.demo]\nupstream = \"u\"\norigin = \"o\"\nworkspaces = \"~/ws/demo\"\n\n\
+                    [repos.plain]\nupstream = \"u2\"\norigin = \"o\"\nworkspaces = \"/abs/plain\"\n\n\
+                    [trust]\nroots = [\"~\", \"/abs/root\"]\n";
+        let error = load(&write(dir.path(), text)).unwrap_err().to_string();
+        assert!(error.contains(NO_HOME), "{error}");
+        assert!(
+            error.contains("[repos.demo] workspaces = \"~/ws/demo\" needs HOME"),
+            "{error}"
+        );
+        assert!(
+            error.contains("[trust] roots = \"~\" needs HOME"),
+            "{error}"
+        );
+        assert!(!error.contains("plain"), "{error}");
+        assert!(!error.contains("/abs/root"), "{error}");
+
+        // Without a tilde anywhere, a missing home is not the registry's problem.
+        let absolute = "[repos.plain]\nupstream = \"u\"\norigin = \"o\"\nworkspaces = \"/abs/plain\"\n\
+                        [trust]\nroots = [\"/abs/root\"]\n";
+        let registry = load(&write(dir.path(), absolute)).unwrap();
+        assert_eq!(
+            registry.repos["plain"].workspaces,
+            Some(PathBuf::from("/abs/plain"))
         );
     }
 

@@ -6,6 +6,7 @@
 //! bind. Verbs that run outside a checkout find one by scanning `$HOME`.
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use crate::config::{Registry, RepoEntry, Role};
@@ -104,8 +105,11 @@ pub enum Unbound {
 }
 
 impl Unbound {
-    pub fn message(&self) -> String {
-        match self {
+    /// The refusal, followed by `; known: a, b`: every refusal about the
+    /// current directory ends by listing the registry's names, since the fix
+    /// is to type one of them.
+    pub fn message(&self, registry: &Registry) -> String {
+        let text = match self {
             Self::NotInsideARepository => {
                 "not inside a repository; name a repo, or run this from inside one".to_owned()
             }
@@ -117,42 +121,80 @@ impl Unbound {
                 "{} forks {upstream}, which is not in the registry; `knives register` prints the entry",
                 root.display()
             ),
-        }
+        };
+        format!("{text}; known: {}", known(registry))
     }
 }
 
 /// Why `resolve` did not produce a fork.
+///
+/// `Missing` and `Duplicate` carry the scan's own complaints, so a checkout
+/// whose remotes could not be read is named beside the entry it may have been.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Unresolved {
     Unknown,
-    Missing { home: PathBuf },
-    Duplicate { home: PathBuf, paths: Vec<PathBuf> },
+    Missing {
+        home: PathBuf,
+        problems: Vec<String>,
+    },
+    Duplicate {
+        home: PathBuf,
+        paths: Vec<PathBuf>,
+        problems: Vec<String>,
+    },
 }
 
 impl Unresolved {
-    /// `Unknown` renders `unknown repo <name>`, `Missing` renders
+    /// `Unknown` renders `unknown repo <name>; known: a, b`, `Missing` renders
     /// `no checkout of <name> under <home>`, and `Duplicate` renders
     /// `<name> has <n> checkouts under <home>: <paths>; knives will not choose`.
-    /// The caller appends `; known: a, b` to `Unknown` — the registry's names are
-    /// its to list.
-    pub fn message(&self, name: &RepoName) -> String {
+    /// Each scan problem follows as `; could not read: <problem>`. A name that
+    /// is known but has no checkout, or two, does not list the registry, since
+    /// listing entries would not help find a directory.
+    pub fn message(&self, name: &RepoName, registry: &Registry) -> String {
         match self {
-            Self::Unknown => format!("unknown repo {name}"),
-            Self::Missing { home } => format!("no checkout of {name} under {}", home.display()),
-            Self::Duplicate { home, paths } => {
+            Self::Unknown => format!("unknown repo {name}; known: {}", known(registry)),
+            Self::Missing { home, problems } => with_problems(
+                format!("no checkout of {name} under {}", home.display()),
+                problems,
+            ),
+            Self::Duplicate {
+                home,
+                paths,
+                problems,
+            } => {
                 let listed = paths
                     .iter()
                     .map(|path| path.display().to_string())
                     .collect::<Vec<_>>()
                     .join(", ");
-                format!(
-                    "{name} has {} checkouts under {}: {listed}; knives will not choose",
-                    paths.len(),
-                    home.display()
+                with_problems(
+                    format!(
+                        "{name} has {} checkouts under {}: {listed}; knives will not choose",
+                        paths.len(),
+                        home.display()
+                    ),
+                    problems,
                 )
             }
         }
     }
+}
+
+fn with_problems(mut text: String, problems: &[String]) -> String {
+    for problem in problems {
+        let _ = write!(text, "; could not read: {problem}");
+    }
+    text
+}
+
+/// The registry's names, for a refusal that has to say what it does know.
+fn known(registry: &Registry) -> String {
+    registry
+        .names()
+        .map(|name| name.to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Whether two remote spellings name one repository.
@@ -171,13 +213,10 @@ fn remote_key(remote: &str) -> String {
     match remote_authority_and_path(trimmed) {
         Some((authority, path)) if !authority.is_empty() => {
             let host = authority.rsplit('@').next().unwrap_or(authority);
-            let path = path.trim_matches('/');
-            let path = path.strip_suffix(".git").unwrap_or(path);
-            format!(
-                "{}/{}",
-                host.to_ascii_lowercase(),
-                path.to_ascii_lowercase()
-            )
+            // Lowercase first, so `.GIT` is stripped like `.git`.
+            let path = path.trim_matches('/').to_ascii_lowercase();
+            let path = path.strip_suffix(".git").unwrap_or(&path);
+            format!("{}/{path}", host.to_ascii_lowercase())
         }
         _ => trimmed.to_owned(),
     }
@@ -192,6 +231,14 @@ pub fn remote_authority_and_path(url: &str) -> Option<(&str, &str)> {
     }
     let (authority, path) = url.split_once(':')?;
     authority.contains('@').then_some((authority, path))
+}
+/// The host of a remote URL, without its user; `None` for a non-URL.
+pub fn remote_host(url: &str) -> Option<&str> {
+    let (authority, _) = remote_authority_and_path(url)?;
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    (!host.is_empty()).then_some(host)
 }
 
 /// The owner segment of an authority-delimited `<owner>/<repository>` remote path.
@@ -224,33 +271,41 @@ pub fn nearest_root(path: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
-/// The checkout `path` belongs to.
-///
-/// [`nearest_root`], then — when that root's `.jj/repo` is a file — the checkout
-/// the pointer names. An unreadable pointer returns the workspace root itself so
-/// the remote reader surfaces jj's own error.
+/// The checkout `path` belongs to: [`nearest_root`], then [`checkout_of_root`].
 pub fn checkout_root(path: &Path) -> Option<PathBuf> {
-    let root = nearest_root(path)?;
+    nearest_root(path).map(|root| checkout_of_root(&root))
+}
+
+/// The checkout a repository root belongs to: the root itself, or — when its
+/// `.jj/repo` is a file — the checkout the pointer names.
+///
+/// A pointer that cannot be read, or that names a store that is no longer a
+/// directory (the checkout was deleted under the workspace), returns the
+/// workspace root itself, so the remote reader surfaces jj's own error about
+/// it rather than reporting a directory that is not a repository.
+pub fn checkout_of_root(root: &Path) -> PathBuf {
     let jj_dir = root.join(".jj");
     let pointer = jj_dir.join("repo");
     if !pointer.is_file() {
-        return Some(root);
+        return root.to_owned();
     }
     // A workspace's pointer holds the checkout's `.jj/repo` store, relative to
     // the workspace's `.jj` when it can be; the checkout is two levels above it.
     let Ok(text) = std::fs::read_to_string(&pointer) else {
-        return Some(root);
+        return root.to_owned();
     };
     let store = jj_dir.join(text.trim());
-    let checkout = store
-        .parent()
-        .and_then(Path::parent)
-        .map_or(root, |checkout| {
+    if !store.is_dir() {
+        return root.to_owned();
+    }
+    store.parent().and_then(Path::parent).map_or_else(
+        || root.to_owned(),
+        |checkout| {
             checkout
                 .canonicalize()
                 .unwrap_or_else(|_| checkout.to_owned())
-        });
-    Some(checkout)
+        },
+    )
 }
 
 /// Remotes of the repository rooted at `root`, read from jj when `.jj` is
@@ -283,9 +338,14 @@ pub fn remotes(root: &Path) -> Result<BTreeMap<String, String>, BindError> {
     let no_matches =
         output.status.code() == Some(1) && output.stdout.is_empty() && output.stderr.is_empty();
     if !output.status.success() && !no_matches {
-        return Err(failure(
-            String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-        ));
+        // The first line is the error; jj follows it with hints.
+        let detail = String::from_utf8_lossy(&output.stderr)
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .unwrap_or_default()
+            .to_owned();
+        return Err(failure(detail));
     }
     String::from_utf8_lossy(&output.stdout)
         .lines()
@@ -344,11 +404,33 @@ pub fn here<'a>(
 /// Every entry's checkout under `home`, and what could not be decided.
 #[derive(Debug, Default)]
 pub struct Scan<'a> {
+    /// The scan root, named in every refusal about an entry it did not place.
+    pub home: PathBuf,
     pub found: BTreeMap<RepoName, Fork<'a>>,
     /// Entries with more than one checkout: every path, sorted.
     pub duplicates: BTreeMap<RepoName, Vec<PathBuf>>,
-    /// Directories that looked like checkouts but whose remotes could not be read.
+    /// What could not be read: a checkout whose remotes failed, a directory
+    /// whose listing failed. Never dropped; every report of the scan names them.
     pub problems: Vec<String>,
+}
+
+impl Scan<'_> {
+    /// Why `name` is not in `found`: two checkouts, or none — with the scan's
+    /// problems attached, since one of them may be the checkout it wanted.
+    pub fn unplaced(&self, name: &RepoName) -> Unresolved {
+        let problems = self.problems.clone();
+        match self.duplicates.get(name) {
+            Some(paths) => Unresolved::Duplicate {
+                home: self.home.clone(),
+                paths: paths.clone(),
+                problems,
+            },
+            None => Unresolved::Missing {
+                home: self.home.clone(),
+                problems,
+            },
+        }
+    }
 }
 
 /// `home` is depth 0; `~/a/b/c` is read and its children are not queued.
@@ -357,13 +439,17 @@ const SCAN_DEPTH: usize = 3;
 /// Scan `home` to depth three for jj checkouts and bind each to its entry.
 ///
 /// Directories named with a leading `.` are skipped, symlinks are not followed,
-/// and nothing below a `.jj` or `.git` is visited — except `home` itself, whose
-/// children are always visited: a home that is a repository (a dotfiles
-/// checkout, say) still holds the forks under it. A `.jj/repo` directory is a
-/// checkout; a `.jj/repo` file is a workspace, found through its checkout; a
-/// git-only clone is not a fork checkout.
+/// and nothing below a `.jj` is visited — except `home` itself, whose children
+/// are always visited: a home that is a repository (a dotfiles checkout, say)
+/// still holds the forks under it. A `.jj/repo` directory is a checkout; a
+/// `.jj/repo` file is a workspace, found through its checkout; a git-only
+/// clone is not a fork checkout, and a git-tracked parent (`~/work/.git`) does
+/// not hide the forks beneath it.
 pub fn scan<'a>(registry: &'a Registry, home: &Path) -> Scan<'a> {
-    let mut scan = Scan::default();
+    let mut scan = Scan {
+        home: home.to_owned(),
+        ..Scan::default()
+    };
     // Keyed by name and carrying the entry, so the split below needs no lookup.
     let mut candidates: BTreeMap<RepoName, (&'a RepoEntry, Vec<Checkout>)> = BTreeMap::new();
     let mut pending = vec![(home.to_owned(), 0usize)];
@@ -389,14 +475,26 @@ pub fn scan<'a>(registry: &'a Registry, home: &Path) -> Scan<'a> {
                 Err(error) => scan.problems.push(error.to_string()),
             }
         }
-        let is_repository = is_jj || directory.join(".git").exists();
-        if (is_repository && depth > 0) || depth == SCAN_DEPTH {
+        if (is_jj && depth > 0) || depth == SCAN_DEPTH {
             continue;
         }
-        let Ok(children) = std::fs::read_dir(&directory) else {
-            continue;
+        let children = match std::fs::read_dir(&directory) {
+            Ok(children) => children,
+            Err(error) => {
+                scan.problems
+                    .push(format!("cannot read {}: {error}", directory.display()));
+                continue;
+            }
         };
-        for child in children.flatten() {
+        for child in children {
+            let child = match child {
+                Ok(child) => child,
+                Err(error) => {
+                    scan.problems
+                        .push(format!("cannot read {}: {error}", directory.display()));
+                    continue;
+                }
+            };
             // `file_type` does not follow symlinks, so a linked directory is not one.
             let is_directory = child.file_type().is_ok_and(|kind| kind.is_dir());
             let hidden = child.file_name().as_encoded_bytes().starts_with(b".");
@@ -429,37 +527,30 @@ pub fn scan<'a>(registry: &'a Registry, home: &Path) -> Scan<'a> {
     scan
 }
 
-/// One named entry's fork: the cwd's when it binds to `name`, else the scan's.
+/// One named entry's fork: `here` when it is that entry, else the scan's.
 ///
-/// A `BindError` from the cwd's own repository propagates: a checkout whose
-/// remotes cannot be read is an error to show, not a reason to scan elsewhere.
+/// `here` is the fork the current directory is inside, bound once by the
+/// caller; a directory that did not bind is `None`, and how it failed is the
+/// caller's to report.
 pub fn resolve<'a>(
     registry: &'a Registry,
     name: &RepoName,
-    cwd: &Path,
+    here: Option<Fork<'a>>,
     home: &Path,
-) -> Result<Result<Fork<'a>, Unresolved>, BindError> {
+) -> Result<Fork<'a>, Unresolved> {
     if registry.get(name).is_none() {
-        return Ok(Err(Unresolved::Unknown));
+        return Err(Unresolved::Unknown);
     }
-    if let Ok(fork) = here(registry, cwd)?
+    if let Some(fork) = here
         && fork.name == *name
     {
-        return Ok(Ok(fork));
+        return Ok(fork);
     }
     let mut scan = scan(registry, home);
     if let Some(fork) = scan.found.remove(name) {
-        return Ok(Ok(fork));
+        return Ok(fork);
     }
-    if let Some(paths) = scan.duplicates.remove(name) {
-        return Ok(Err(Unresolved::Duplicate {
-            home: home.to_owned(),
-            paths,
-        }));
-    }
-    Ok(Err(Unresolved::Missing {
-        home: home.to_owned(),
-    }))
+    Err(scan.unplaced(name))
 }
 
 #[cfg(test)]
@@ -467,10 +558,12 @@ mod tests {
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
 
-    use crate::config::RepoEntry;
+    use crate::config::{Registry, RepoEntry};
     use crate::ids::RepoName;
 
-    use super::{Checkout, Fork, Unbound, Unresolved, remote_slug, same_remote, url_owner};
+    use super::{
+        Checkout, Fork, Scan, Unbound, Unresolved, remote_host, remote_slug, same_remote, url_owner,
+    };
 
     fn entry(upstream: &str, origin: &str, release: Option<&str>) -> RepoEntry {
         RepoEntry {
@@ -497,6 +590,14 @@ mod tests {
         ));
         assert!(same_remote(
             "ssh://git@forge.example/org/tool",
+            "https://forge.example/org/tool"
+        ));
+    }
+
+    #[test]
+    fn an_uppercase_git_suffix_is_stripped_like_a_lowercase_one() {
+        assert!(same_remote(
+            "https://forge.example/Org/Tool.GIT",
             "https://forge.example/org/tool"
         ));
     }
@@ -537,6 +638,12 @@ mod tests {
         assert_eq!(remote_slug("git@forge.example:org/tool"), Some("org/tool"));
         assert_eq!(remote_slug("/tmp/lab/upstream"), None);
         assert_eq!(url_owner("git@forge.example:org/tool.git"), Some("org"));
+        assert_eq!(
+            remote_host("git@forge.example:org/tool.git"),
+            Some("forge.example")
+        );
+        assert_eq!(remote_host("https:///ours/work.git"), None);
+        assert_eq!(remote_host("/tmp/lab/upstream"), None);
     }
 
     #[test]
@@ -650,41 +757,86 @@ mod tests {
 
     #[test]
     fn every_refusal_renders_its_exact_text() {
+        let alpha = entry("u", "o", None);
+        let registry = Registry {
+            repos: BTreeMap::from([
+                ("alpha".to_owned(), alpha.clone()),
+                ("beta".to_owned(), alpha),
+            ]),
+            ..Registry::default()
+        };
         assert_eq!(
-            Unbound::NotInsideARepository.message(),
-            "not inside a repository; name a repo, or run this from inside one"
+            Unbound::NotInsideARepository.message(&registry),
+            "not inside a repository; name a repo, or run this from inside one; known: alpha, beta"
         );
         assert_eq!(
             Unbound::NoUpstream {
                 root: PathBuf::from("/r")
             }
-            .message(),
-            "/r has no `upstream` remote, so it is not a managed fork; name a repo"
+            .message(&registry),
+            "/r has no `upstream` remote, so it is not a managed fork; name a repo; known: alpha, beta"
         );
         assert_eq!(
             Unbound::Unregistered {
                 root: PathBuf::from("/r"),
                 upstream: "https://forge.example/o/t".to_owned()
             }
-            .message(),
-            "/r forks https://forge.example/o/t, which is not in the registry; `knives register` prints the entry"
+            .message(&registry),
+            "/r forks https://forge.example/o/t, which is not in the registry; `knives register` prints the entry; known: alpha, beta"
         );
         let name = RepoName::new("tool");
-        assert_eq!(Unresolved::Unknown.message(&name), "unknown repo tool");
+        assert_eq!(
+            Unresolved::Unknown.message(&name, &registry),
+            "unknown repo tool; known: alpha, beta"
+        );
         assert_eq!(
             Unresolved::Missing {
-                home: PathBuf::from("/home/x")
+                home: PathBuf::from("/home/x"),
+                problems: Vec::new(),
             }
-            .message(&name),
+            .message(&name, &registry),
             "no checkout of tool under /home/x"
         );
         assert_eq!(
             Unresolved::Duplicate {
                 home: PathBuf::from("/home/x"),
-                paths: vec![PathBuf::from("/home/x/a"), PathBuf::from("/home/x/b")]
+                paths: vec![PathBuf::from("/home/x/a"), PathBuf::from("/home/x/b")],
+                problems: Vec::new(),
             }
-            .message(&name),
+            .message(&name, &registry),
             "tool has 2 checkouts under /home/x: /home/x/a, /home/x/b; knives will not choose"
+        );
+    }
+
+    #[test]
+    fn an_unplaced_entry_carries_the_scan_problems_after_its_refusal() {
+        // A checkout whose remotes could not be read may be the one the entry
+        // wanted, so the refusal names it rather than dropping it.
+        let registry = Registry::default();
+        let scan = Scan {
+            home: PathBuf::from("/home/x"),
+            duplicates: BTreeMap::from([(
+                RepoName::new("twice"),
+                vec![PathBuf::from("/home/x/a"), PathBuf::from("/home/x/b")],
+            )]),
+            problems: vec![
+                "reading remotes of /home/x/broken: boom".to_owned(),
+                "cannot read /home/x/locked: denied".to_owned(),
+            ],
+            ..Scan::default()
+        };
+        assert_eq!(
+            scan.unplaced(&RepoName::new("ghost"))
+                .message(&RepoName::new("ghost"), &registry),
+            "no checkout of ghost under /home/x; could not read: reading remotes of \
+             /home/x/broken: boom; could not read: cannot read /home/x/locked: denied"
+        );
+        assert_eq!(
+            scan.unplaced(&RepoName::new("twice"))
+                .message(&RepoName::new("twice"), &registry),
+            "twice has 2 checkouts under /home/x: /home/x/a, /home/x/b; knives will not \
+             choose; could not read: reading remotes of /home/x/broken: boom; could not \
+             read: cannot read /home/x/locked: denied"
         );
     }
 }

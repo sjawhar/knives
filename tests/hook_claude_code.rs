@@ -4,12 +4,16 @@
     clippy::unreachable,
     reason = "fixture setup failures and JSON shape mismatches are test failures"
 )]
-// allow: SIZE_OK: 610 lines - real-binary adapter scenarios share one fixture and process harness.
+// allow: SIZE_OK: 997 lines - real-binary adapter scenarios share one fixture and process harness.
+
+#[path = "common/lab.rs"]
+mod lab;
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use lab::{git_repository, jj_checkout};
 use serde_json::{Value, json};
 
 const SESSION_ID: &str = "hook-test-session";
@@ -77,55 +81,6 @@ fn run_hook(home: &Path, event: &Value) -> String {
     let (success, output, errors) = run_hook_input(home, &event.to_string());
     assert!(success, "a hook must never fail the session: {errors}");
     output
-}
-
-/// A git-only repository with the given remotes, the shape an agent's `/tmp` clone has.
-fn git_repository(root: &Path, remotes: &[(&str, &str)]) {
-    std::fs::create_dir_all(root).expect("create repository");
-    assert!(
-        Command::new("git")
-            .args(["-C", root.to_str().expect("utf-8"), "init", "--quiet"])
-            .status()
-            .expect("git init")
-            .success()
-    );
-    for (name, url) in remotes {
-        assert!(
-            Command::new("git")
-                .args([
-                    "-C",
-                    root.to_str().expect("utf-8"),
-                    "remote",
-                    "add",
-                    name,
-                    url
-                ])
-                .status()
-                .expect("git remote add")
-                .success()
-        );
-    }
-}
-
-fn jj_in(root: &Path, args: &[&str]) {
-    let status = Command::new("jj")
-        .args(args)
-        .current_dir(root)
-        .env("JJ_CONFIG", "/dev/null")
-        .env("JJ_USER", "Knives Lab")
-        .env("JJ_EMAIL", "knives-lab@example.test")
-        .status()
-        .expect("run jj");
-    assert!(status.success(), "jj {args:?} failed");
-}
-
-/// A colocated jj checkout with the given remotes.
-fn jj_checkout(root: &Path, remotes: &[(&str, &str)]) {
-    std::fs::create_dir_all(root).expect("create checkout");
-    jj_in(root, &["git", "init", "--colocate"]);
-    for (name, url) in remotes {
-        jj_in(root, &["git", "remote", "add", name, url]);
-    }
 }
 
 struct Repositories {
@@ -206,7 +161,7 @@ impl Repositories {
     /// Turn a git-only fixture into a colocated jj checkout, so `seen` can key
     /// on its `.jj` and jj can still read its remotes.
     fn colocate(root: &Path) {
-        jj_in(root, &["git", "init", "--colocate"]);
+        lab::jj(root, ["git", "init", "--colocate"]);
     }
 
     fn write_state(&self, state: &Value) {
@@ -769,7 +724,7 @@ fn a_managed_checkout_outside_trust_gets_the_notice_but_no_guidance() {
     );
     let output = run_hook(repositories.home.path(), &event);
     let context = additional_context(&output);
-    assert!(context.contains("managed"), "{context}");
+    assert!(context.contains("fork managed by knives"), "{context}");
     assert!(!context.contains("beta instructions"), "{context}");
 }
 
@@ -785,7 +740,7 @@ fn a_trusted_checkout_that_is_not_a_fork_gets_guidance_but_no_notice() {
     let output = run_hook(repositories.home.path(), &event);
     let context = additional_context(&output);
     assert!(context.contains("trusted instructions"), "{context}");
-    assert!(!context.contains("managed"), "{context}");
+    assert!(!context.contains("fork managed by knives"), "{context}");
 }
 
 #[test]
@@ -799,7 +754,7 @@ fn a_checkout_that_is_both_managed_and_trusted_gets_notice_and_guidance() {
     );
     let output = run_hook(repositories.home.path(), &event);
     let context = additional_context(&output);
-    assert!(context.contains("managed"), "{context}");
+    assert!(context.contains("fork managed by knives"), "{context}");
     assert!(context.contains("alpha instructions"), "{context}");
 }
 
@@ -831,12 +786,12 @@ fn a_workspace_of_a_trusted_repository_gets_its_own_guidance() {
         &[("origin", "https://forge.invalid/company/trusted")],
     );
     std::fs::write(checkout.join("AGENTS.md"), "trusted instructions").expect("write");
-    jj_in(&checkout, &["describe", "-m", "init"]);
-    jj_in(&checkout, &["new"]);
+    lab::jj(&checkout, ["describe", "-m", "init"]);
+    lab::jj(&checkout, ["new"]);
     let workspace = repositories.home.path().join("tool-feat");
-    jj_in(
+    lab::jj(
         &checkout,
-        &[
+        [
             "workspace",
             "add",
             "--name",
@@ -885,4 +840,158 @@ fn unreadable_remotes_are_reported_and_a_trust_root_still_grants_guidance() {
         additional_context(&output).contains("root instructions"),
         "{output}"
     );
+}
+
+/// The failed read is cached under the stamp it failed under, so the broken
+/// checkout is probed — and its error printed — once per session.
+#[test]
+fn an_unreadable_checkout_is_probed_once_per_session() {
+    let repositories = Repositories::new();
+    let fake = repositories.home.path().join("under-root").join("fake");
+    std::fs::create_dir_all(fake.join(".jj")).expect("bare .jj without a repo");
+    std::fs::write(fake.join("AGENTS.md"), "root instructions").expect("write");
+    std::fs::write(fake.join("file.txt"), "content").expect("write");
+    std::fs::write(
+        repositories.home.path().join("repos.toml"),
+        format!(
+            "[trust]\nroots = [\"{}\"]\n",
+            repositories.home.path().join("under-root").display()
+        ),
+    )
+    .expect("registry");
+    let event = post_tool_use_read(
+        repositories.home.path(),
+        &fake.join("file.txt"),
+        "session-probe-once",
+    );
+    let (_, _, first) = run_hook_input(repositories.home.path(), &event.to_string());
+    assert!(first.contains("knives hook:"), "{first}");
+    let (success, _, second) = run_hook_input(repositories.home.path(), &event.to_string());
+    assert!(success);
+    assert!(!second.contains("knives hook:"), "{second}");
+}
+
+/// A cache that cannot be written is reported, never a reason to lose the
+/// match: a `roots` grant needs neither jj nor a writable config home.
+#[cfg(unix)]
+#[test]
+fn a_read_only_config_home_still_delivers_guidance_from_a_trusted_root() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let repositories = Repositories::new();
+    let elsewhere = tempfile::tempdir().expect("trusted root outside the config home");
+    let clone = elsewhere.path().join("clone");
+    git_repository(&clone, &[]);
+    std::fs::write(clone.join("AGENTS.md"), "root instructions").expect("write");
+    std::fs::write(clone.join("file.txt"), "content").expect("write");
+    std::fs::write(
+        repositories.home.path().join("repos.toml"),
+        format!("[trust]\nroots = [\"{}\"]\n", elsewhere.path().display()),
+    )
+    .expect("registry");
+    let home = repositories.home.path();
+    std::fs::set_permissions(home, std::fs::Permissions::from_mode(0o555)).expect("chmod 555");
+    // Root ignores directory permissions; there is nothing to test then.
+    if std::fs::create_dir(home.join("probe")).is_ok() {
+        std::fs::set_permissions(home, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        return;
+    }
+    let event = post_tool_use_read(home, &clone.join("file.txt"), "session-read-only");
+    let (success, output, errors) = run_hook_input(home, &event.to_string());
+    std::fs::set_permissions(home, std::fs::Permissions::from_mode(0o755)).expect("chmod 755");
+    assert!(success, "{errors}");
+    assert!(errors.contains("knives hook:"), "{errors}");
+    assert!(
+        additional_context(&output).contains("root instructions"),
+        "{output}\n{errors}"
+    );
+}
+
+/// The remotes cache follows the file the remotes live in: a `git remote add`
+/// after the first touch is seen on the next touch of the same session.
+#[test]
+fn a_remote_added_mid_session_is_seen_on_the_next_touch() {
+    let repositories = Repositories::new();
+    let clone = repositories.home.path().join("scratch").join("fresh-clone");
+    git_repository(&clone, &[]);
+    std::fs::write(clone.join("AGENTS.md"), "clone instructions").expect("write");
+    std::fs::write(clone.join("file.txt"), "content").expect("write");
+    std::fs::write(
+        repositories.home.path().join("repos.toml"),
+        "[trust]\nowners = [\"ours\"]\n",
+    )
+    .expect("registry");
+    let event = post_tool_use_read(
+        repositories.home.path(),
+        &clone.join("file.txt"),
+        "session-remote-add",
+    );
+
+    let before = run_hook(repositories.home.path(), &event);
+    assert!(
+        before.is_empty(),
+        "no remotes, no owner, no guidance: {before}"
+    );
+
+    assert!(
+        Command::new("git")
+            .args([
+                "-C",
+                clone.to_str().expect("utf-8"),
+                "remote",
+                "add",
+                "origin",
+                "https://forge.invalid/ours/x"
+            ])
+            .status()
+            .expect("git remote add")
+            .success()
+    );
+    let after = run_hook(repositories.home.path(), &event);
+    assert!(
+        additional_context(&after).contains("clone instructions"),
+        "{after}"
+    );
+}
+
+/// Facts are cached, verdicts are not: a registry edit that drops the rule is
+/// honoured on the next event of the same session, from the cached remotes.
+#[test]
+fn a_registry_edit_revokes_guidance_within_the_session_that_cached_the_remotes() {
+    let repositories = Repositories::new();
+    let clone = repositories.home.path().join("scratch").join("owned-clone");
+    git_repository(&clone, &[("origin", "https://forge.invalid/ours/x")]);
+    std::fs::write(clone.join("AGENTS.md"), "clone instructions").expect("write");
+    std::fs::write(clone.join("file.txt"), "content").expect("write");
+    let registry = repositories.home.path().join("repos.toml");
+    std::fs::write(&registry, "[trust]\nowners = [\"ours\"]\n").expect("registry");
+    let event = post_tool_use_read(
+        repositories.home.path(),
+        &clone.join("file.txt"),
+        "session-revoke",
+    );
+
+    let granted = run_hook(repositories.home.path(), &event);
+    assert!(
+        additional_context(&granted).contains("clone instructions"),
+        "{granted}"
+    );
+    let session = repositories
+        .home
+        .path()
+        .join("hook-sessions")
+        .join("claude-code-session-revoke.json");
+    let state: Value =
+        serde_json::from_str(&std::fs::read_to_string(&session).expect("session state"))
+            .expect("session state is JSON");
+    let canonical = clone.canonicalize().expect("canonical");
+    assert_eq!(
+        state["remotes"][canonical.to_str().expect("utf-8")]["remotes"]["origin"],
+        json!("https://forge.invalid/ours/x"),
+        "{state}"
+    );
+
+    std::fs::write(&registry, "[trust]\nowners = [\"someone-else\"]\n").expect("registry");
+    let revoked = run_hook(repositories.home.path(), &event);
+    assert!(revoked.is_empty(), "{revoked}");
 }

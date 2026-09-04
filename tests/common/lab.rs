@@ -719,6 +719,39 @@ pub fn jj<const N: usize>(directory: &Path, args: [&str; N]) {
     assert!(status.success(), "jj command failed");
 }
 
+/// A git-only repository with the given remotes, the shape an agent's `/tmp`
+/// clone has. Identity and `init.defaultBranch` are pinned as every lab git is.
+pub fn git_repository(root: &Path, remotes: &[(&str, &str)]) {
+    std::fs::create_dir_all(root).expect("create repository");
+    git(root, "main", ["init", "--quiet"]);
+    for (name, url) in remotes {
+        git(root, "main", ["remote", "add", name, url]);
+    }
+}
+
+/// A colocated jj checkout with the given remotes: what the scan looks for.
+pub fn jj_checkout(root: &Path, remotes: &[(&str, &str)]) {
+    std::fs::create_dir_all(root).expect("create checkout");
+    jj(root, ["git", "init", "--colocate"]);
+    for (name, url) in remotes {
+        jj(root, ["git", "remote", "add", name, url]);
+    }
+}
+
+/// The knives binary, run from `cwd` against the registry in `config_home` and
+/// scanning `scan_home` for checkouts. Returned unrun so a caller can add an
+/// environment variable (`KNIVES_OWNER`, say) before `.output()`.
+pub fn knives_command(cwd: &Path, config_home: &Path, scan_home: &Path, args: &[&str]) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_knives"));
+    command
+        .args(args)
+        .current_dir(cwd)
+        .env("KNIVES_CONFIG_HOME", config_home)
+        .env("HOME", scan_home)
+        .env("JJ_CONFIG", "/dev/null");
+    command
+}
+
 fn jj_output<const N: usize>(directory: &Path, args: [&str; N]) -> String {
     let output = Command::new("jj")
         .args(args)

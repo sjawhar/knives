@@ -55,7 +55,7 @@ fn a_cached_owner_does_not_outlive_a_registry_owner_revocation() -> anyhow::Resu
             &[root.join("file.txt")],
             &registry_trusting("old-owner"),
             cache
-        )?
+        )
         .is_some()
     );
 
@@ -64,7 +64,7 @@ fn a_cached_owner_does_not_outlive_a_registry_owner_revocation() -> anyhow::Resu
         &[root.join("file.txt")],
         &registry_trusting("new-owner"),
         cache,
-    )?;
+    );
 
     // Then: the cached checkout fact cannot preserve the revoked trust grant.
     assert!(result.is_none());
@@ -83,7 +83,7 @@ fn a_cached_owner_is_rechecked_when_the_registry_adds_the_owner() -> anyhow::Res
             &[root.join("file.txt")],
             &registry_trusting("other-owner"),
             cache
-        )?
+        )
         .is_none()
     );
 
@@ -92,7 +92,7 @@ fn a_cached_owner_is_rechecked_when_the_registry_adds_the_owner() -> anyhow::Res
         &[root.join("file.txt")],
         &registry_trusting("real-owner"),
         cache,
-    )?;
+    );
 
     // Then: the cached checkout fact is compared with the current registry.
     assert!(result.is_some());
