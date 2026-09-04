@@ -743,7 +743,7 @@ test.serial.skipIf(realBinary.length === 0)(
   "fails closed and keeps valid roots through the real binary",
   async () => {
     try {
-      await withRepository(async ({ home, root, file }) => {
+      await withRepository(async ({ home, file }) => {
         process.env["KNIVES_CONFIG_HOME"] = home;
         const hooks = createKnivesHooks(undefined, readOptions(undefined));
         await rm(join(home, "repos.toml"));
