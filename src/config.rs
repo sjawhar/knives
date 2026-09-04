@@ -482,7 +482,8 @@ pub fn expand_registry_path(path: &Path, config_home: &Path) -> PathBuf {
     config_home.join(path)
 }
 
-fn home_dir() -> PathBuf {
+/// `$HOME`, the scan root for finding checkouts; `/` when unset.
+pub fn home_dir() -> PathBuf {
     std::env::var("HOME").map_or_else(|_| PathBuf::from("/"), PathBuf::from)
 }
 

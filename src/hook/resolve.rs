@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
+pub(crate) use crate::bind::{remote_authority_and_path, url_owner};
 use crate::config::{GuidanceRoot, GuidanceRootKind, TrustRules, expand_registry_path};
 
 /// A named path and the registered repository that contains it.
@@ -142,22 +143,6 @@ pub(crate) fn guidance_name(root: &Path) -> String {
             .to_owned();
     }
     last.to_owned()
-}
-
-/// Extract the forge owner from an authority-delimited `<owner>/<repository>` remote path.
-pub(crate) fn url_owner(url: &str) -> Option<&str> {
-    let (_, path) = remote_authority_and_path(url)?;
-    let (owner, repository) = path.split_once('/')?;
-    (!owner.is_empty() && !repository.is_empty()).then_some(owner)
-}
-
-pub(crate) fn remote_authority_and_path(url: &str) -> Option<(&str, &str)> {
-    let url = url.trim_end_matches('/');
-    if let Some((_, authority_and_path)) = url.split_once("://") {
-        return authority_and_path.split_once('/');
-    }
-    let (authority, path) = url.split_once(':')?;
-    authority.contains('@').then_some((authority, path))
 }
 
 fn expand_tilde(path: &Path) -> PathBuf {

@@ -17,7 +17,9 @@
 //! - [`config`] and [`store`] own the two things that cannot be recomputed:
 //!   which repos are managed, and who is working on what and why.
 //! - [`hook`] owns harness-facing session state and behavior.
+//! - [`bind`] decides which registry entry a directory is, from its remotes.
 
+pub mod bind;
 pub mod carriage;
 pub mod cli;
 pub mod commands;

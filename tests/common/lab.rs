@@ -467,6 +467,10 @@ impl Lab {
         &self.work
     }
 
+    pub fn temp_path(&self) -> &Path {
+        self.temp.path()
+    }
+
     pub(crate) fn temp_origin(&self) -> PathBuf {
         self.temp.path().join("origin.git")
     }
@@ -685,7 +689,7 @@ fn configure_jj_repo_identity(directory: &Path) {
     );
 }
 
-fn jj<const N: usize>(directory: &Path, args: [&str; N]) {
+pub fn jj<const N: usize>(directory: &Path, args: [&str; N]) {
     let status = Command::new("jj")
         .args(args)
         .current_dir(directory)
