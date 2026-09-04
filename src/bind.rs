@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 
 use crate::config::{Registry, RepoEntry, Role};
 use crate::ids::RepoName;
+use crate::jj::{Unvouched, vouched_workspace};
 
 /// A repository root on this machine and the remotes it declares.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -317,38 +318,62 @@ pub fn checkout_root(path: &Path) -> Option<PathBuf> {
 }
 
 /// The checkout a repository root belongs to: the root itself, or — when its
-/// `.jj/repo` is a file — the checkout the pointer names.
+/// `.jj/repo` is a file and the checkout it names vouches for the root as its
+/// workspace ([`vouched_pointer`]) — that checkout.
 ///
 /// This decides where a fork verb operates ([`here`] reads that checkout's
-/// remotes) and folds a workspace into its checkout; it never decides what is
-/// trusted — the hook reads remotes at the nearest root itself. A pointer that cannot be read, or
-/// that names a store that is no longer a directory (the checkout was deleted
-/// under the workspace), returns the workspace root itself, so the remote
-/// reader surfaces jj's own error about it rather than reporting a directory
-/// that is not a repository.
+/// remotes) and folds a workspace into its checkout. A pointer the checkout
+/// does not vouch for, one that cannot be read, or one that names a store that
+/// is no longer a directory (the checkout was deleted under the workspace)
+/// leaves the root as its own, so [`remotes`] refuses it in the pointer's
+/// terms, or jj's, rather than reporting a directory that is not a repository.
 pub fn checkout_of_root(root: &Path) -> PathBuf {
+    match vouched_pointer(root) {
+        Some(Ok(checkout)) => checkout,
+        Some(Err(_)) | None => root.to_owned(),
+    }
+}
+
+/// What the `.jj/repo` pointer file at `root` says. `Ok(checkout)` when the
+/// checkout it names vouches for `root` as its workspace: the operation
+/// `root/.jj/working_copy` recorded is in that checkout's operation store, and
+/// the checkout's view at head has a working-copy commit under the workspace's
+/// name. `Err(detail)` when it does not — a pointer file is ordinary content
+/// any tree can carry, and only the checkout's records say whose workspace the
+/// tree is. `None` when `root` has no pointer file, or the pointer names no
+/// store that exists: jj's own error is the report then.
+fn vouched_pointer(root: &Path) -> Option<Result<PathBuf, String>> {
     let jj_dir = root.join(".jj");
     let pointer = jj_dir.join("repo");
     if !pointer.is_file() {
-        return root.to_owned();
+        return None;
     }
     // A workspace's pointer holds the checkout's `.jj/repo` store, relative to
     // the workspace's `.jj` when it can be; the checkout is two levels above it.
-    let Ok(text) = std::fs::read_to_string(&pointer) else {
-        return root.to_owned();
-    };
+    let text = std::fs::read_to_string(&pointer).ok()?;
     let store = jj_dir.join(text.trim());
     if !store.is_dir() {
-        return root.to_owned();
+        return None;
     }
-    store.parent().and_then(Path::parent).map_or_else(
-        || root.to_owned(),
-        |checkout| {
-            checkout
-                .canonicalize()
-                .unwrap_or_else(|_| checkout.to_owned())
-        },
-    )
+    let checkout = store.parent()?.parent()?;
+    let checkout = checkout
+        .canonicalize()
+        .unwrap_or_else(|_| checkout.to_owned());
+    Some(match vouched_workspace(&checkout, root) {
+        Ok(_) => Ok(checkout),
+        Err(Unvouched::NotARepository { detail }) => Err(format!(
+            ".jj/repo names {}, which is not a repository: {detail}",
+            checkout.display()
+        )),
+        Err(Unvouched::StateUnreadable) => Err(".jj/working_copy cannot be read".to_owned()),
+        Err(Unvouched::Unknown {
+            workspace,
+            operation,
+        }) => Err(format!(
+            ".jj/repo names {}, which has no workspace {workspace} at operation {operation}",
+            checkout.display()
+        )),
+    })
 }
 
 /// Remotes of the repository rooted at `root`, from the VCS that owns the root.
@@ -356,11 +381,12 @@ pub fn checkout_of_root(root: &Path) -> PathBuf {
 /// `.git` present (a directory, or a worktree's pointer file, which git
 /// validates itself) → `git -C root config --get-regexp '^remote\..*\.url$'`,
 /// whether or not `.jj` is beside it: a colocated checkout keeps its remotes
-/// there anyway. Otherwise `.jj` a directory → `jj -R root git remote list`,
-/// which validates a workspace's `.jj/repo` pointer itself. Git wins because a
-/// `.jj/repo` pointer *file* is ordinary content a clone can carry, while the
-/// `.git` that arrives with it holds the remotes it was actually cloned from —
-/// knives never follows a pointer to decide whose remotes to read.
+/// there anyway. Otherwise `.jj` a directory → `jj -R root git remote list`;
+/// when `.jj/repo` is a pointer file, only once the checkout it names vouches
+/// for `root` as its workspace ([`vouched_pointer`]), since `jj -R` follows any
+/// pointer whose tree carries a plausible `.jj/working_copy`. Git wins because
+/// a `.jj/repo` pointer *file* is ordinary content a clone can carry, while the
+/// `.git` that arrives with it holds the remotes it was actually cloned from.
 pub fn remotes(root: &Path) -> Result<BTreeMap<String, String>, BindError> {
     let failure = |detail: String| BindError::RemotesUnreadable {
         root: root.to_owned(),
@@ -373,6 +399,9 @@ pub fn remotes(root: &Path) -> Result<BTreeMap<String, String>, BindError> {
             .args(["config", "--get-regexp", "^remote\\..*\\.url$"])
             .output()
     } else if root.join(".jj").is_dir() {
+        if let Some(Err(detail)) = vouched_pointer(root) {
+            return Err(failure(detail));
+        }
         std::process::Command::new("jj")
             .arg("-R")
             .arg(root)

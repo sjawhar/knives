@@ -92,8 +92,10 @@ directories that differ by `.git` stay two directories.
 
 Standing inside a checkout, or inside a `knives start` workspace of one, binds it: the nearest
 `.jj` or `.git` above the current directory is the root, a workspace's `.jj/repo` pointer is
-followed to its checkout, and a clone nested inside a checkout is its own root and never inherits
-the enclosing identity. Outside one, `knives repos`, `status --all`, and naming a repository scan
+followed to its checkout when that checkout vouches for the workspace (its operation store holds
+the operation the workspace recorded, and its view knows a working copy of that name), and a
+clone nested inside a checkout is its own root and never inherits the enclosing identity.
+Outside one, `knives repos`, `status --all`, and naming a repository scan
 `$HOME` to depth three for jj checkouts (`.jj/repo` a directory), skipping dot-directories, not
 following symlinks, and not descending below a jj checkout (a `.git`-only directory is not a
 checkout and does not hide what is beneath it). An entry with no checkout found is
@@ -110,7 +112,7 @@ entry grants fork commands and the managed notice, never guidance.
 - `repos`: forge slugs (`owner/repo`) trusted by identity, matched against any remote of a checkout, case-insensitively, `.git` stripped from both sides. The file is refused on load when a value is not a slug.
 - `owners`: forge owners trusted for instruction guidance, matched case-insensitively against the owner segment of every remote URL of a checkout.
 - `roots`: directory subtrees where all contained repositories are trusted for instruction guidance; `~` expands and a relative value is taken from the config directory.
-- **Security posture:** identity and owner matching read self-declared remote URLs from the candidate checkout's own jj or git configuration. They are not forge-authenticated and grant guidance-as-data only, never fork-command access. Remotes are read at the nearest repository root, by git when `.git` exists there and else by jj — never by following a `.jj/repo` pointer file to another checkout — so a directory nested inside a checkout cannot inherit the enclosing checkout's identity, and a tree that arrives by clone cannot borrow another checkout's identity either, since the `.git` it arrives with names the remotes it was cloned from; VCS metadata written into a tree by other means is trusted as that VCS reports it. Trust names repositories, so it follows a clone wherever it lands; a checkout with no remotes matches only via `roots`. No command writes the file: `knives register` prints an entry, and a human pastes it. Verdicts are recomputed from `repos.toml` on every hook event, so human edits to the file act as the approval mechanism.
+- **Security posture:** identity and owner matching read self-declared remote URLs from the candidate checkout's own jj or git configuration. They are not forge-authenticated and grant guidance-as-data only, never fork-command access. Remotes are read at the nearest repository root, by git when `.git` exists there and else by jj. A `.jj/repo` pointer file is followed to another checkout only when that checkout vouches for the tree as its workspace — the operation the tree's `.jj/working_copy` recorded is in the checkout's operation store, and the checkout's view at head has a working copy of that name — since a pointer file, and a `.jj/working_copy` copied from any repository, are ordinary content a tree can carry. So a directory nested inside a checkout cannot inherit the enclosing checkout's identity, a tree that arrives by clone cannot borrow another checkout's identity (the `.git` it arrives with names the remotes it was cloned from), and a tree that arrives by other means cannot borrow one by naming a checkout that does not know it. Trust names repositories, so it follows a clone wherever it lands; a checkout with no remotes matches only via `roots`. No command writes the file: `knives register` prints an entry, and a human pastes it. Verdicts are recomputed from `repos.toml` on every hook event, so human edits to the file act as the approval mechanism.
 
 ## State
 

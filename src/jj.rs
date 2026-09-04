@@ -77,6 +77,61 @@ pub enum JjError {
 /// Bound the passive operation walk so status stays proportional to current work.
 pub const MAX_ACTIVITY_OPS: usize = 200;
 
+/// Why a checkout did not vouch for a directory as one of its workspaces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Unvouched {
+    /// The checkout could not be opened as a jj repository; jj's own reason.
+    NotARepository { detail: String },
+    /// The directory's own `.jj/working_copy` state could not be read.
+    StateUnreadable,
+    /// The checkout has no such workspace: the operation the directory recorded
+    /// is not in its store, or its view at head has no working-copy commit
+    /// under the workspace's name.
+    Unknown {
+        workspace: String,
+        /// The recorded operation, shortened.
+        operation: String,
+    },
+}
+
+/// Whether `checkout` vouches for `workspace` as one of its workspaces; the
+/// workspace's name when it does.
+///
+/// It vouches when the operation `workspace/.jj/working_copy` recorded exists
+/// in the checkout's operation store, and the checkout's view at head has a
+/// working-copy commit under the workspace's name. A `.jj/repo` pointer file
+/// is ordinary content any tree can carry, and a `.jj/working_copy` copied from
+/// an unrelated repository lets `jj -R` open the tree as if it were the
+/// checkout's workspace; only the checkout's own records say whether it is.
+/// Reads recorded state only; nothing is snapshotted.
+pub fn vouched_workspace(checkout: &Path, workspace: &Path) -> Result<WorkspaceName, Unvouched> {
+    let repo = Repo::open(checkout).map_err(|error| Unvouched::NotARepository {
+        detail: match error {
+            JjError::Open { detail, .. } => detail,
+            other => other.to_string(),
+        },
+    })?;
+    let working_copy = LocalWorkingCopy::load(
+        repo.repo.store().clone(),
+        workspace.to_owned(),
+        workspace.join(".jj/working_copy"),
+        repo.repo.settings(),
+    )
+    .map_err(|_| Unvouched::StateUnreadable)?;
+    let name = working_copy.workspace_name();
+    let recorded = working_copy.operation_id();
+    let unknown = || Unvouched::Unknown {
+        workspace: name.as_symbol().to_string(),
+        operation: short_id(&recorded.hex()).to_owned(),
+    };
+    block_on(repo.repo.loader().load_operation(recorded)).map_err(|_| unknown())?;
+    repo.repo
+        .view()
+        .get_wc_commit_id(name)
+        .ok_or_else(unknown)?;
+    Ok(WorkspaceName::new(name.as_symbol().to_string()))
+}
+
 #[derive(Debug)]
 pub struct Repo {
     repo: Arc<ReadonlyRepo>,

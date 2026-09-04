@@ -918,6 +918,122 @@ fn a_forged_jj_pointer_without_a_git_directory_earns_nothing() {
     assert!(!errors.contains("evil instructions"), "{errors}");
 }
 
+/// The forged pointer plus a `.jj/working_copy/{type,checkout}` copied from an
+/// unrelated repository: enough for `jj -R` to open the tree as the trusted
+/// checkout's workspace. The checkout's own records say it has no such
+/// workspace, so the pointer is not followed and the tree earns nothing.
+#[test]
+fn a_forged_jj_pointer_with_copied_working_copy_state_earns_nothing() {
+    let repositories = Repositories::new();
+    repositories.configure(true);
+    Repositories::colocate(&repositories.alpha);
+    let unrelated = repositories.home.path().join("unrelated");
+    std::fs::create_dir_all(&unrelated).expect("unrelated");
+    lab::jj(&unrelated, ["git", "init"]);
+    let evil = repositories.home.path().join("evil");
+    std::fs::create_dir_all(evil.join(".jj").join("working_copy")).expect("forged .jj");
+    std::fs::write(
+        evil.join(".jj").join("repo"),
+        repositories
+            .alpha
+            .join(".jj")
+            .join("repo")
+            .to_str()
+            .expect("utf-8"),
+    )
+    .expect("forged pointer");
+    for file in ["type", "checkout"] {
+        std::fs::copy(
+            unrelated.join(".jj").join("working_copy").join(file),
+            evil.join(".jj").join("working_copy").join(file),
+        )
+        .expect("copy working-copy state");
+    }
+    std::fs::write(evil.join("AGENTS.md"), "evil instructions").expect("write");
+    std::fs::write(evil.join("file.txt"), "content").expect("write");
+    let event = post_tool_use_read(
+        repositories.home.path(),
+        &evil.join("file.txt"),
+        "session-forged-state",
+    );
+
+    let (success, output, errors) = run_hook_input(repositories.home.path(), &event.to_string());
+
+    assert!(success, "{errors}");
+    assert!(
+        output.is_empty(),
+        "no guidance, no notice: {output}\n{errors}"
+    );
+    assert!(errors.contains(".jj/repo names"), "{errors}");
+    assert!(errors.contains("has no workspace"), "{errors}");
+    assert!(!errors.contains("evil instructions"), "{errors}");
+}
+
+/// A real workspace of a trusted, managed checkout that is not colocated, so
+/// the workspace carries no `.git` and its remotes come through the pointer:
+/// the checkout vouches for it, and the hook answers as for the checkout.
+#[test]
+fn a_real_workspace_without_a_git_directory_still_gets_the_notice_and_guidance() {
+    let repositories = Repositories::new();
+    repositories.configure(true);
+    let checkout = repositories.home.path().join("tool");
+    std::fs::create_dir_all(&checkout).expect("checkout");
+    lab::jj(&checkout, ["git", "init", "--no-colocate"]);
+    lab::jj(
+        &checkout,
+        [
+            "git",
+            "remote",
+            "add",
+            "upstream",
+            "https://forge.invalid/maintainer/alpha",
+        ],
+    );
+    lab::jj(
+        &checkout,
+        [
+            "git",
+            "remote",
+            "add",
+            "origin",
+            "https://forge.invalid/ours/alpha",
+        ],
+    );
+    std::fs::write(checkout.join("AGENTS.md"), "tool instructions").expect("write");
+    lab::jj(&checkout, ["describe", "-m", "init"]);
+    lab::jj(&checkout, ["new"]);
+    let workspace = repositories.home.path().join("tool-feat");
+    lab::jj(
+        &checkout,
+        [
+            "workspace",
+            "add",
+            "--name",
+            "feat",
+            workspace.to_str().expect("utf-8"),
+        ],
+    );
+    assert!(
+        !workspace.join(".git").exists(),
+        "a workspace of a non-colocated checkout has no .git"
+    );
+    assert!(workspace.join(".jj").join("repo").is_file());
+    std::fs::write(workspace.join("file.txt"), "content").expect("write");
+    let event = post_tool_use_read(
+        repositories.home.path(),
+        &workspace.join("file.txt"),
+        "session-real-ws",
+    );
+
+    let (success, output, errors) = run_hook_input(repositories.home.path(), &event.to_string());
+
+    assert!(success, "{errors}");
+    let context = additional_context(&output);
+    assert!(context.contains("fork managed by knives"), "{context}");
+    assert!(context.contains("tool instructions"), "{context}\n{errors}");
+    assert!(!errors.contains("knives hook:"), "{errors}");
+}
+
 /// The same forged pointer inside a genuine git clone: the remotes are read
 /// from the clone's own `.git`, so trust and identity are the attacker's, not
 /// the pointed-at checkout's.
