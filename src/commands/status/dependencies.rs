@@ -14,7 +14,7 @@ use crate::store::Store;
 /// The sibling's checkout is not consulted: its identity is its `upstream`, and
 /// it need not be on this machine for its pull requests to be asked about.
 fn upstream_identity(entry: &RepoEntry) -> Option<RepoIdentity> {
-    crate::bind::remote_slug(&entry.upstream).map(|slug| RepoIdentity {
+    crate::remote_url::remote_slug(&entry.upstream).map(|slug| RepoIdentity {
         name_with_owner: slug.to_owned(),
         id: String::new(),
     })

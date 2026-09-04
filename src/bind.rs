@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use crate::config::{Registry, RepoEntry, Role};
 use crate::ids::RepoName;
 use crate::jj::{Unvouched, vouched_workspace};
+use crate::remote_url::same_remote;
 
 /// A repository root on this machine and the remotes it declares.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,7 +79,7 @@ impl<'a> Fork<'a> {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum BindError {
     #[error("{} is neither a jj nor a git repository", root.display())]
     NotARepository { root: PathBuf },
@@ -201,104 +202,6 @@ fn known(registry: &Registry) -> String {
         .join(", ")
 }
 
-/// Whether two remote spellings name one repository.
-///
-/// A value that parses as a remote URL with a host compares as its
-/// [`host_and_path`], case-insensitively. A value that does not (a filesystem
-/// path, or a `file://` URL, whose authority is empty) compares as its trimmed
-/// text, so two directories that differ by `.git` stay two directories.
-pub fn same_remote(a: &str, b: &str) -> bool {
-    match (host_and_path(a), host_and_path(b)) {
-        (Some((host_a, path_a)), Some((host_b, path_b))) => {
-            host_a.eq_ignore_ascii_case(host_b) && path_a.eq_ignore_ascii_case(path_b)
-        }
-        (None, None) => a.trim().trim_end_matches('/') == b.trim().trim_end_matches('/'),
-        _ => false,
-    }
-}
-
-/// `(host, path)` of a remote URL as spelled: the authority without its user
-/// or port, and the path without surrounding `/` or a `.git` suffix. `None`
-/// for a non-URL: a filesystem path, or a `file://` URL, whose authority is
-/// empty. scp form without a user, `host:path`, is a URL too when the part
-/// before the colon holds no `/`; a filesystem path with a colon in a later
-/// component stays a path.
-fn host_and_path(remote: &str) -> Option<(&str, &str)> {
-    let trimmed = remote.trim().trim_end_matches('/');
-    let (authority, path) = remote_authority_and_path(trimmed).or_else(|| {
-        let (host, path) = trimmed.split_once(':')?;
-        (!host.is_empty() && !host.contains('/')).then_some((host, path))
-    })?;
-    if authority.is_empty() {
-        return None;
-    }
-    let host = authority.rsplit('@').next().unwrap_or(authority);
-    // `host:2222` is `host`: the port is how to reach it, not what it is.
-    let host = match host.rsplit_once(':') {
-        Some((name, port))
-            if !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()) =>
-        {
-            name
-        }
-        _ => host,
-    };
-    Some((host, without_git_suffix(path.trim_matches('/'))))
-}
-
-/// `path` without a trailing `.git` in any case.
-const fn without_git_suffix(path: &str) -> &str {
-    match path.split_at_checked(path.len().saturating_sub(4)) {
-        Some((stem, suffix)) if suffix.eq_ignore_ascii_case(".git") => stem,
-        _ => path,
-    }
-}
-
-/// `(authority, path)` of `scheme://authority/path` or `user@authority:path`;
-/// `None` otherwise.
-pub fn remote_authority_and_path(url: &str) -> Option<(&str, &str)> {
-    let url = url.trim_end_matches('/');
-    if let Some((_, authority_and_path)) = url.split_once("://") {
-        return authority_and_path.split_once('/');
-    }
-    let (authority, path) = url.split_once(':')?;
-    authority.contains('@').then_some((authority, path))
-}
-/// The host of a remote URL, without its user; `None` for a non-URL.
-pub fn remote_host(url: &str) -> Option<&str> {
-    let (authority, _) = remote_authority_and_path(url)?;
-    let host = authority
-        .rsplit_once('@')
-        .map_or(authority, |(_, host)| host);
-    (!host.is_empty()).then_some(host)
-}
-
-/// The owner segment of an authority-delimited `<owner>/<repository>` remote path.
-///
-/// Unlike [`remote_slug`], an empty authority (`https:///owner/repo`) still
-/// yields its owner: this feeds heuristics that should stay conservative when a
-/// URL is odd, not identity, which needs a host.
-pub fn url_owner(url: &str) -> Option<&str> {
-    let (_, path) = remote_authority_and_path(url)?;
-    let (owner, repository) = path.split_once('/')?;
-    (!owner.is_empty() && !repository.is_empty()).then_some(owner)
-}
-
-/// The `owner/repo` path of a forge remote with trailing `/` and `.git` removed;
-/// `None` for a non-URL.
-pub fn remote_slug(url: &str) -> Option<&str> {
-    let (_, path) = host_and_path(url)?;
-    let (owner, repository) = path.split_once('/')?;
-    (!owner.is_empty() && !repository.is_empty() && !repository.contains('/')).then_some(path)
-}
-
-/// The last path segment of a remote URL without `.git`: the repository's own
-/// name, whichever owner or forge holds it.
-pub fn repository_name(url: &str) -> Option<&str> {
-    let (_, repository) = url.trim_end_matches('/').rsplit_once('/')?;
-    let name = without_git_suffix(repository);
-    (!name.is_empty()).then_some(name)
-}
-
 /// The first ancestor of `path` (canonicalised) holding `.jj` or `.git`.
 ///
 /// Nearest marker of either kind wins, so a clone nested inside a checkout is
@@ -317,50 +220,56 @@ pub fn checkout_root(path: &Path) -> Option<PathBuf> {
     nearest_root(path).map(|root| checkout_of_root(&root))
 }
 
-/// The checkout a repository root belongs to: the root itself, or — when its
-/// `.jj/repo` is a file and the checkout it names vouches for the root as its
-/// workspace ([`vouched_pointer`]) — that checkout.
+/// The checkout a repository root belongs to.
+///
+/// The root itself, or — when its `.jj/repo` is a file, no enclosing git
+/// repository tracks it, and the checkout it names vouches for the root as its
+/// workspace ([`jj_store`]) — that checkout.
 ///
 /// This decides where a fork verb operates ([`here`] reads that checkout's
 /// remotes) and folds a workspace into its checkout. A pointer the checkout
-/// does not vouch for, one that cannot be read, or one that names a store that
-/// is no longer a directory (the checkout was deleted under the workspace)
-/// leaves the root as its own, so [`remotes`] refuses it in the pointer's
-/// terms, or jj's, rather than reporting a directory that is not a repository.
+/// does not vouch for, one an enclosing git repository tracks as content, one
+/// that cannot be read, or one that names a store that is no longer a directory
+/// (the checkout was deleted under the workspace) leaves the root as its own,
+/// so [`remotes`] refuses it in the pointer's terms rather than reporting a
+/// directory that is not a repository.
 pub fn checkout_of_root(root: &Path) -> PathBuf {
-    match vouched_pointer(root) {
-        Some(Ok(checkout)) => checkout,
-        Some(Err(_)) | None => root.to_owned(),
+    if !root.join(".jj").join("repo").is_file() || tracking_git_ancestor(root).is_some() {
+        return root.to_owned();
     }
+    jj_store(root).map_or_else(|_| root.to_owned(), |(checkout, _)| checkout)
 }
 
-/// What the `.jj/repo` pointer file at `root` says. `Ok(checkout)` when the
-/// checkout it names vouches for `root` as its workspace: the operation
-/// `root/.jj/working_copy` recorded is in that checkout's operation store, and
-/// the checkout's view at head has a working-copy commit under the workspace's
-/// name. `Err(detail)` when it does not — a pointer file is ordinary content
-/// any tree can carry, and only the checkout's records say whose workspace the
-/// tree is. `None` when `root` has no pointer file, or the pointer names no
-/// store that exists: jj's own error is the report then.
-fn vouched_pointer(root: &Path) -> Option<Result<PathBuf, String>> {
+/// The jj store that owns `root`, as `(checkout, checkout/.jj/repo)`: `root`'s
+/// own when `.jj/repo` is a directory; when it is a pointer file, the checkout
+/// it names, provided that checkout vouches for `root` as its workspace — the
+/// operation `root/.jj/working_copy` recorded is in the checkout's operation
+/// store ([`vouched_workspace`]). A pointer file is ordinary content any tree
+/// can carry, and only the checkout's records say whose workspace the tree is.
+/// `Err` is the refusal's detail.
+fn jj_store(root: &Path) -> Result<(PathBuf, PathBuf), String> {
     let jj_dir = root.join(".jj");
     let pointer = jj_dir.join("repo");
+    if pointer.is_dir() {
+        return Ok((root.to_owned(), pointer));
+    }
     if !pointer.is_file() {
-        return None;
+        return Err(".jj/repo is neither a store nor a pointer to one".to_owned());
     }
     // A workspace's pointer holds the checkout's `.jj/repo` store, relative to
     // the workspace's `.jj` when it can be; the checkout is two levels above it.
-    let text = std::fs::read_to_string(&pointer).ok()?;
+    let text = std::fs::read_to_string(&pointer).map_err(|_| ".jj/repo cannot be read")?;
     let store = jj_dir.join(text.trim());
-    if !store.is_dir() {
-        return None;
-    }
-    let checkout = store.parent()?.parent()?;
-    let checkout = checkout
+    let store = store
         .canonicalize()
-        .unwrap_or_else(|_| checkout.to_owned());
-    Some(match vouched_workspace(&checkout, root) {
-        Ok(_) => Ok(checkout),
+        .map_err(|_| format!(".jj/repo names {}, which does not exist", store.display()))?;
+    let checkout = store
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| format!(".jj/repo names {}, which is not a store", store.display()))?
+        .to_owned();
+    match vouched_workspace(&checkout, root) {
+        Ok(()) => Ok((checkout, store)),
         Err(Unvouched::NotARepository { detail }) => Err(format!(
             ".jj/repo names {}, which is not a repository: {detail}",
             checkout.display()
@@ -373,46 +282,133 @@ fn vouched_pointer(root: &Path) -> Option<Result<PathBuf, String>> {
             ".jj/repo names {}, which has no workspace {workspace} at operation {operation}",
             checkout.display()
         )),
+    }
+}
+
+/// The git repository a jj store keeps its objects and remotes in:
+/// `store/git` when the store owns one, else the directory `store/git_target`
+/// names (a colocated checkout's `.git`).
+fn store_git_dir(store: &Path) -> Result<PathBuf, String> {
+    let store = store.join("store");
+    let own = store.join("git");
+    if own.is_dir() {
+        return Ok(own);
+    }
+    let target = std::fs::read_to_string(store.join("git_target"))
+        .map_err(|_| format!("{} has no git backend", store.display()))?;
+    let git_dir = store.join(target.trim());
+    git_dir.canonicalize().map_err(|_| {
+        format!(
+            "{} names {}, which does not exist",
+            store.join("git_target").display(),
+            git_dir.display()
+        )
     })
 }
 
-/// Remotes of the repository rooted at `root`, from the VCS that owns the root.
+/// The nearest git repository strictly above `root` that tracks `root/.jj/repo`
+/// as content, when one does.
+///
+/// git refuses to check out a `.git` path component but not a `.jj` one, so a
+/// plain `git clone` delivers whatever `.jj` store or pointer a repository
+/// committed — a tree that would otherwise be the nearest root and speak for
+/// itself. Decided by `git ls-files --error-unmatch` at the nearest ancestor
+/// holding `.git`: exit 0 is tracked; anything else (untracked, ignored, or a
+/// `.git` git cannot open) leaves the root as its own repository. Only the
+/// nearest ancestor is asked, as git itself would.
+fn tracking_git_ancestor(root: &Path) -> Option<PathBuf> {
+    let ancestor = root
+        .ancestors()
+        .skip(1)
+        .find(|directory| directory.join(".git").exists())?;
+    let relative = root.strip_prefix(ancestor).ok()?.join(".jj").join("repo");
+    let tracked = git(ancestor)
+        .args(["--literal-pathspecs", "ls-files", "--error-unmatch", "--"])
+        .arg(relative)
+        .output()
+        .is_ok_and(|output| output.status.success());
+    tracked.then(|| ancestor.to_owned())
+}
+
+fn tracked_detail(ancestor: &Path) -> String {
+    format!(
+        ".jj is tracked by {}; a committed store is content, not a checkout",
+        ancestor.display()
+    )
+}
+
+/// A `git` invocation that reads only the repository it is pointed at.
+///
+/// git hooks, `rebase -x`, `bisect run`, and some editors export `GIT_DIR` and
+/// its companions; inherited, they would make every root report the exporting
+/// repository's configuration.
+fn git_command() -> std::process::Command {
+    let mut command = std::process::Command::new("git");
+    for variable in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_INDEX_FILE",
+    ] {
+        command.env_remove(variable);
+    }
+    command
+}
+
+/// [`git_command`] run in `directory` (`git -C`).
+pub(crate) fn git(directory: &Path) -> std::process::Command {
+    let mut command = git_command();
+    command.arg("-C").arg(directory);
+    command
+}
+
+/// Remotes of the repository rooted at `root`, from the git configuration of
+/// the repository that owns the root — never by running jj.
 ///
 /// `.git` present (a directory, or a worktree's pointer file, which git
 /// validates itself) → `git -C root config --get-regexp '^remote\..*\.url$'`,
 /// whether or not `.jj` is beside it: a colocated checkout keeps its remotes
-/// there anyway. Otherwise `.jj` a directory → `jj -R root git remote list`;
-/// when `.jj/repo` is a pointer file, only once the checkout it names vouches
-/// for `root` as its workspace ([`vouched_pointer`]), since `jj -R` follows any
-/// pointer whose tree carries a plausible `.jj/working_copy`. Git wins because
-/// a `.jj/repo` pointer *file* is ordinary content a clone can carry, while the
-/// `.git` that arrives with it holds the remotes it was actually cloned from.
+/// there anyway. Otherwise `.jj` a directory → the same query against the jj
+/// store's git backend ([`store_git_dir`]), provided no enclosing git
+/// repository tracks the `.jj` as content ([`tracking_git_ancestor`]) and,
+/// when `.jj/repo` is a pointer file, the checkout it names vouches for `root`
+/// as its workspace ([`jj_store`]). Git wins because a `.jj` is ordinary
+/// content a clone can carry, while the `.git` that arrives with it holds the
+/// remotes it was actually cloned from; jj is never run because any jj command
+/// resolves divergent operation heads by writing, and a read must not write to
+/// someone's checkout.
 pub fn remotes(root: &Path) -> Result<BTreeMap<String, String>, BindError> {
     let failure = |detail: String| BindError::RemotesUnreadable {
         root: root.to_owned(),
         detail,
     };
-    let listing = if root.join(".git").exists() {
-        std::process::Command::new("git")
-            .arg("-C")
-            .arg(root)
-            .args(["config", "--get-regexp", "^remote\\..*\\.url$"])
-            .output()
+    let mut query = if root.join(".git").exists() {
+        git(root)
     } else if root.join(".jj").is_dir() {
-        if let Some(Err(detail)) = vouched_pointer(root) {
-            return Err(failure(detail));
+        if let Some(ancestor) = tracking_git_ancestor(root) {
+            return Err(failure(tracked_detail(&ancestor)));
         }
-        std::process::Command::new("jj")
-            .arg("-R")
-            .arg(root)
-            .args(["--ignore-working-copy", "git", "remote", "list"])
-            .output()
+        let (checkout, store) = jj_store(root).map_err(failure)?;
+        // A workspace of a committed store is judged as the store is: the
+        // checkout a pointer names is content when git tracks it.
+        if checkout != root
+            && let Some(ancestor) = tracking_git_ancestor(&checkout)
+        {
+            return Err(failure(tracked_detail(&ancestor)));
+        }
+        let git_dir = store_git_dir(&store).map_err(failure)?;
+        let mut command = git_command();
+        command.arg("--git-dir").arg(git_dir);
+        command
     } else {
         return Err(BindError::NotARepository {
             root: root.to_owned(),
         });
     };
-    let output = listing.map_err(|error| failure(error.to_string()))?;
+    let output = query
+        .args(["config", "--get-regexp", "^remote\\..*\\.url$"])
+        .output()
+        .map_err(|error| failure(error.to_string()))?;
     // git exits 1 with empty output when nothing matches: no remotes, not an error.
     let no_matches =
         output.status.code() == Some(1) && output.stdout.is_empty() && output.stderr.is_empty();
@@ -423,21 +419,19 @@ pub fn remotes(root: &Path) -> Result<BTreeMap<String, String>, BindError> {
         .lines()
         .filter(|line| !line.trim().is_empty())
         .map(|line| {
-            let (key, url) = line
-                .split_once(' ')
-                .ok_or_else(|| failure(format!("unparseable remote line {line:?}")))?;
-            // jj prints `name url`; git prints `remote.name.url url`.
-            let name = key
-                .strip_prefix("remote.")
-                .and_then(|rest| rest.strip_suffix(".url"))
-                .unwrap_or(key);
-            Ok((name.to_owned(), url.trim().to_owned()))
+            // git prints `remote.<name>.url <url>`.
+            line.split_once(' ')
+                .and_then(|(key, url)| {
+                    let name = key.strip_prefix("remote.")?.strip_suffix(".url")?;
+                    Some((name.to_owned(), url.trim().to_owned()))
+                })
+                .ok_or_else(|| failure(format!("unparseable remote line {line:?}")))
         })
         .collect()
 }
-/// The line of a VCS's stderr that explains a failure: jj may print a
-/// `Warning:` (per-repo config, say) before its error and follows the error
-/// with hints; git prints the error first.
+
+/// The line of git's stderr that explains a failure: the first that is not a
+/// `warning:`, which git prints ahead of some errors, else the first line.
 fn error_line(stderr: &[u8]) -> String {
     let stderr = String::from_utf8_lossy(stderr);
     let lines = || {
@@ -447,7 +441,7 @@ fn error_line(stderr: &[u8]) -> String {
             .filter(|line| !line.is_empty())
     };
     lines()
-        .find(|line| !line.starts_with("Warning:"))
+        .find(|line| !line.to_ascii_lowercase().starts_with("warning:"))
         .or_else(|| lines().next())
         .unwrap_or_default()
         .to_owned()
@@ -508,20 +502,22 @@ pub struct Scan<'a> {
 }
 
 impl Scan<'_> {
-    /// Why `name` is not in `found`: two checkouts, or none. The scan's own
-    /// problems are reported by the caller, once, not on every entry.
-    pub fn unplaced(&self, name: &RepoName) -> Unresolved {
-        self.duplicates.get(name).map_or_else(
-            || Unresolved::Missing {
-                home: self.home.clone(),
-                problems: Vec::new(),
-            },
-            |paths| Unresolved::Duplicate {
+    /// Why `name` is not in `found`: two checkouts, or none — carrying
+    /// `problems`, the scan complaints the caller wants on this refusal. A
+    /// named verb passes the scan's, since one of them may be the checkout it
+    /// wanted; a sweep passes none and reports them once itself.
+    pub fn unplaced(&self, name: &RepoName, problems: Vec<String>) -> Unresolved {
+        match self.duplicates.get(name) {
+            Some(paths) => Unresolved::Duplicate {
                 home: self.home.clone(),
                 paths: paths.clone(),
-                problems: Vec::new(),
+                problems,
             },
-        )
+            None => Unresolved::Missing {
+                home: self.home.clone(),
+                problems,
+            },
+        }
     }
 }
 
@@ -666,7 +662,7 @@ fn checkouts_under(home: &Path, problems: &mut Vec<String>) -> Vec<PathBuf> {
 pub fn resolve<'a>(
     registry: &'a Registry,
     name: &RepoName,
-    here: Option<Fork<'a>>,
+    here: Option<&Fork<'a>>,
     home: &Path,
 ) -> Result<Fork<'a>, Unresolved> {
     if registry.get(name).is_none() {
@@ -675,18 +671,14 @@ pub fn resolve<'a>(
     if let Some(fork) = here
         && fork.name == *name
     {
-        return Ok(fork);
+        return Ok(fork.clone());
     }
     let mut scan = scan(registry, home);
     if let Some(fork) = scan.found.remove(name) {
         return Ok(fork);
     }
-    let mut why = scan.unplaced(name);
-    if let Unresolved::Missing { problems, .. } | Unresolved::Duplicate { problems, .. } = &mut why
-    {
-        *problems = scan.problems;
-    }
-    Err(why)
+    let problems = std::mem::take(&mut scan.problems);
+    Err(scan.unplaced(name, problems))
 }
 
 #[cfg(test)]
@@ -697,10 +689,7 @@ mod tests {
     use crate::config::{Registry, RepoEntry};
     use crate::ids::RepoName;
 
-    use super::{
-        BindError, Checkout, Fork, Unbound, Unresolved, error_line, remote_host, remote_slug,
-        repository_name, same_remote, url_owner,
-    };
+    use super::{BindError, Checkout, Fork, Unbound, Unresolved, error_line};
 
     fn entry(upstream: &str, origin: &str, release: Option<&str>) -> RepoEntry {
         RepoEntry {
@@ -710,119 +699,13 @@ mod tests {
     }
 
     #[test]
-    fn the_error_line_skips_a_leading_jj_warning_and_falls_back_to_it_alone() {
-        let jj = b"Warning: Per-repo config not found. Generating an empty one.\nInternal error: The repository appears broken or inaccessible\nHint: try again\n";
-        assert_eq!(
-            error_line(jj),
-            "Internal error: The repository appears broken or inaccessible"
-        );
-        let git = b"fatal: not a git repository: /x/.git\n";
-        assert_eq!(error_line(git), "fatal: not a git repository: /x/.git");
-        assert_eq!(error_line(b"Warning: only this\n"), "Warning: only this");
+    fn the_error_line_skips_a_leading_warning_and_falls_back_to_it_alone() {
+        let warned = b"warning: unable to access '/x/.gitconfig': Permission denied\nfatal: not a git repository: /x/.git\n";
+        assert_eq!(error_line(warned), "fatal: not a git repository: /x/.git");
+        let plain = b"fatal: not a git repository: /x/.git\n";
+        assert_eq!(error_line(plain), "fatal: not a git repository: /x/.git");
+        assert_eq!(error_line(b"warning: only this\n"), "warning: only this");
         assert_eq!(error_line(b"\n  \n"), "");
-    }
-
-    #[test]
-    fn https_and_ssh_spellings_of_one_repository_are_the_same_remote() {
-        assert!(same_remote(
-            "https://forge.example/org/tool",
-            "git@forge.example:org/tool.git"
-        ));
-        assert!(same_remote(
-            "https://forge.example/org/tool.git/",
-            "HTTPS://Forge.Example/Org/Tool"
-        ));
-        assert!(same_remote(
-            "ssh://git@forge.example/org/tool",
-            "https://forge.example/org/tool"
-        ));
-    }
-
-    #[test]
-    fn an_uppercase_git_suffix_is_stripped_like_a_lowercase_one() {
-        assert!(same_remote(
-            "https://forge.example/Org/Tool.GIT",
-            "https://forge.example/org/tool"
-        ));
-    }
-
-    #[test]
-    fn a_port_on_the_host_does_not_make_another_repository() {
-        assert!(same_remote(
-            "ssh://git@forge.example:2222/org/tool",
-            "https://forge.example/org/tool"
-        ));
-        assert!(same_remote(
-            "https://forge.example:443/org/tool.git",
-            "git@forge.example:org/tool"
-        ));
-    }
-
-    #[test]
-    fn scp_form_without_a_user_is_a_url_when_the_host_holds_no_slash() {
-        assert!(same_remote(
-            "forge.example:org/tool",
-            "git@forge.example:org/tool.git"
-        ));
-        assert!(same_remote(
-            "forge.example:org/tool",
-            "https://forge.example/org/tool"
-        ));
-        // A colon in a later path component does not turn a directory into a host.
-        assert!(!same_remote(
-            "/tmp/lab/a:b/tool",
-            "https://tmp/lab/a:b/tool"
-        ));
-        assert!(same_remote("/tmp/lab/a:b/tool", " /tmp/lab/a:b/tool/ "));
-    }
-
-    #[test]
-    fn different_repositories_are_not_the_same_remote() {
-        assert!(!same_remote(
-            "https://forge.example/org/tool",
-            "https://forge.example/org/tool-2"
-        ));
-        assert!(!same_remote(
-            "https://forge.example/org/tool",
-            "https://forge.example/other/tool"
-        ));
-        assert!(!same_remote(
-            "https://forge.example/org/tool",
-            "https://elsewhere.example/org/tool"
-        ));
-    }
-
-    #[test]
-    fn a_filesystem_path_compares_as_its_trimmed_text() {
-        assert!(same_remote("/tmp/lab/upstream", " /tmp/lab/upstream/ "));
-        assert!(!same_remote("/tmp/lab/upstream", "/tmp/lab/other"));
-        // Two directories that differ by `.git` are two directories, spelled
-        // as paths or as `file://` URLs.
-        assert!(!same_remote("/tmp/lab/origin.git", "/tmp/lab/origin"));
-        assert!(!same_remote("file:///tmp/x.git", "file:///tmp/x"));
-        assert!(same_remote("file:///tmp/x.git", "file:///tmp/x.git/"));
-    }
-
-    #[test]
-    fn a_remote_slug_is_the_owner_and_repository_of_a_forge_url() {
-        assert_eq!(
-            remote_slug("https://forge.example/Org/Tool.git/"),
-            Some("Org/Tool")
-        );
-        assert_eq!(remote_slug("git@forge.example:org/tool"), Some("org/tool"));
-        assert_eq!(remote_slug("/tmp/lab/upstream"), None);
-        assert_eq!(url_owner("git@forge.example:org/tool.git"), Some("org"));
-        assert_eq!(
-            remote_host("git@forge.example:org/tool.git"),
-            Some("forge.example")
-        );
-        assert_eq!(remote_host("https:///ours/work.git"), None);
-        assert_eq!(remote_host("/tmp/lab/upstream"), None);
-        assert_eq!(
-            repository_name("https://forge.invalid/someone/Tool.GIT/"),
-            Some("Tool")
-        );
-        assert_eq!(repository_name("https://forge.invalid/someone/.git"), None);
     }
 
     #[test]

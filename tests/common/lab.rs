@@ -729,6 +729,45 @@ pub fn jj_checkout(root: &Path, remotes: &[(&str, &str)]) {
     }
 }
 
+/// Stage and commit everything under `root`, `.jj` stores included: git refuses
+/// only `.git` path components.
+pub fn git_commit_all(root: &Path, message: &str) {
+    git(root, "main", ["add", "-A"]);
+    git(root, "main", ["commit", "--quiet", "-m", message]);
+}
+
+/// `git clone source destination`, quietly.
+pub fn git_clone(source: &Path, destination: &Path) {
+    let parent = destination
+        .parent()
+        .expect("clone destination has a parent");
+    std::fs::create_dir_all(parent).expect("clone parent");
+    git(
+        parent,
+        "main",
+        [
+            "clone",
+            "--quiet",
+            source.to_str().expect("utf-8"),
+            destination.to_str().expect("utf-8"),
+        ],
+    );
+}
+
+/// `jj workspace add --name name path` from `checkout`.
+pub fn jj_workspace_add(checkout: &Path, name: &str, path: &Path) {
+    jj(
+        checkout,
+        [
+            "workspace",
+            "add",
+            "--name",
+            name,
+            path.to_str().expect("utf-8"),
+        ],
+    );
+}
+
 /// The knives binary, run from `cwd` against the registry in `config_home` and
 /// scanning `scan_home` for checkouts. Returned unrun so a caller can add an
 /// environment variable (`KNIVES_OWNER`, say) before `.output()`.

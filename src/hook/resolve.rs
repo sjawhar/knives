@@ -80,11 +80,14 @@ fn existing_ancestor(path: &Path) -> Option<&Path> {
 
 /// The first touched path inside a repository, and what the registry says about it.
 ///
-/// Both facts are decided from the remotes [`bind::remotes`] reads at the
-/// nearest root itself — never at a checkout a `.jj/repo` pointer names, since
-/// a clone can carry any pointer it likes. Remotes that cannot be read are
-/// reported on stderr and contribute no facts; a `roots` rule is decided from
-/// the path alone, so it holds with no readable repository at all.
+/// Both facts are decided from the remotes [`bind::remotes`] reads for the
+/// nearest root: its own git configuration, or its jj store's git backend; a
+/// `.jj/repo` pointer to another checkout counts only when that checkout
+/// vouches for the root as its workspace, and a `.jj` an enclosing git
+/// repository tracks is content, since a clone can carry any pointer or store
+/// it likes. Remotes that cannot be read are reported on stderr and contribute
+/// no facts; a `roots` rule is decided from the path alone, so it holds with
+/// no readable repository at all.
 pub fn match_checkout(paths: &[PathBuf], registry: &Registry) -> Option<Match> {
     for path in paths {
         let Some(candidate) = canonical_path(path) else {

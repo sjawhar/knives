@@ -177,8 +177,10 @@ pub fn format_notice(repo_name: &str, root: &Path, claims: &[String], digest: &s
 
 /// Returns active claim summaries for a repository.
 ///
-/// Hooks deliberately do not open a jj repo or walk operations, so an empty
-/// operation stream is marked window-exhausted rather than claiming no activity.
+/// Hooks do not load a jj repository or walk operations — the only jj store a
+/// hook touches is a checkout's operation store, opened read-only to vouch for
+/// a workspace pointer — so an empty operation stream is marked
+/// window-exhausted rather than claiming no activity.
 pub fn claim_lines(
     claims: &[Claim],
     repo_name: &str,

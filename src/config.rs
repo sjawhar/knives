@@ -307,12 +307,12 @@ impl TrustRules {
     /// remote's `owner/repo` slug.
     pub fn grants_by_remotes(&self, remotes: &BTreeMap<String, String>) -> bool {
         remotes.values().any(|url| {
-            let owned = crate::bind::url_owner(url).is_some_and(|owner| {
+            let owned = crate::remote_url::url_owner(url).is_some_and(|owner| {
                 self.owners
                     .iter()
                     .any(|trusted| trusted.eq_ignore_ascii_case(owner))
             });
-            let listed = crate::bind::remote_slug(url).is_some_and(|slug| {
+            let listed = crate::remote_url::remote_slug(url).is_some_and(|slug| {
                 self.repos.iter().any(|trusted| {
                     trusted
                         .strip_suffix(".git")
@@ -659,7 +659,7 @@ fn reject_shared_upstreams(registry: &Registry, path: &Path) -> Result<(), Confi
     let entries: Vec<(&String, &RepoEntry)> = registry.repos.iter().collect();
     for (index, (a, first)) in entries.iter().enumerate() {
         for (b, second) in entries.iter().skip(index + 1) {
-            if crate::bind::same_remote(&first.upstream, &second.upstream) {
+            if crate::remote_url::same_remote(&first.upstream, &second.upstream) {
                 return Err(ConfigError::Invalid {
                     path: path.to_owned(),
                     detail: format!(

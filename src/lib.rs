@@ -34,6 +34,7 @@ pub mod jj;
 pub mod ledger;
 pub mod pins;
 pub mod release_model;
+pub mod remote_url;
 pub mod seen;
 pub mod snapshot;
 pub mod store;

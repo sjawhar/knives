@@ -153,13 +153,12 @@ fn dispatch() -> anyhow::Result<Exit> {
             force,
         } => {
             let ground = grounded(&loaded)?;
-            let bound = ground.bound().cloned();
             let (Some(fork), Some(branch)) =
                 (ground.one_fork(repo.as_deref())?, branch_name(&branch))
             else {
                 return Ok(Exit::Usage);
             };
-            start::run(&fork, &branch, why.as_deref(), force, bound.as_ref())
+            start::run(&fork, &branch, why.as_deref(), force, ground.bound())
         }
         Command::Finish {
             branch,
@@ -170,7 +169,6 @@ fn dispatch() -> anyhow::Result<Exit> {
             why,
         } => {
             let ground = grounded(&loaded)?;
-            let bound = ground.bound().cloned();
             let (Some(fork), Some(branch)) =
                 (ground.one_fork(repo.as_deref())?, branch_name(&branch))
             else {
@@ -185,7 +183,7 @@ fn dispatch() -> anyhow::Result<Exit> {
                     force,
                     why: why.as_deref(),
                 },
-                bound.as_ref(),
+                ground.bound(),
             )
         }
         Command::Track {
@@ -196,24 +194,21 @@ fn dispatch() -> anyhow::Result<Exit> {
             repo,
         } => {
             let ground = grounded(&loaded)?;
-            let bound = ground.bound().cloned();
             let (Some(fork), Some(branch)) =
                 (ground.one_fork(repo.as_deref())?, branch_name(&branch))
             else {
                 return Ok(Exit::Usage);
             };
-            run_track(&fork, &branch, pr, fork_only, forget, bound.as_ref())
+            run_track(&fork, &branch, pr, fork_only, forget, ground.bound())
         }
         Command::Depends { branch, on, repo } => {
             let ground = grounded(&loaded)?;
-            let registry = ground.registry;
-            let bound = ground.bound().cloned();
             let (Some(fork), Some(branch)) =
                 (ground.one_fork(repo.as_deref())?, branch_name(&branch))
             else {
                 return Ok(Exit::Usage);
             };
-            run_depends(registry, &fork, &branch, &on, bound.as_ref())
+            run_depends(ground.registry, &fork, &branch, &on, ground.bound())
         }
         Command::Notch {
             subject,
@@ -234,14 +229,13 @@ fn dispatch() -> anyhow::Result<Exit> {
                 return Ok(Exit::Usage);
             }
             let ground = grounded(&loaded)?;
-            let bound = ground.bound().cloned();
             let Some(fork) = ground.one_fork(repo.as_deref())? else {
                 return Ok(Exit::Usage);
             };
             notch::run(
                 &notch::Request {
                     fork: &fork,
-                    bound: bound.as_ref(),
+                    bound: ground.bound(),
                     subject: subject.as_deref(),
                     message: message.as_deref(),
                     evidence: &evidence,
@@ -266,13 +260,12 @@ fn dispatch() -> anyhow::Result<Exit> {
             consumer,
         } => {
             let ground = grounded(&loaded)?;
-            let bound = ground.bound().cloned();
             let Some(fork) = ground.one_fork(repo.as_deref())? else {
                 return Ok(Exit::Usage);
             };
             let extra: Vec<&std::path::Path> =
                 consumer.iter().map(std::path::PathBuf::as_path).collect();
-            dispatch_release(&fork, action, &extra, output, bound.as_ref())
+            dispatch_release(&fork, action, &extra, output, ground.bound())
         }
     }
 }
@@ -335,12 +328,11 @@ impl<'a> Ground<'a> {
     /// failed to bind — outside a repository, a git clone, a checkout whose
     /// remotes cannot be read — the verb was asked about `name`, and the scan
     /// answers for it.
-    fn named(self, name: &str) -> Option<Fork<'a>> {
+    fn named(&self, name: &str) -> Option<Fork<'a>> {
         let registry = self.registry;
         let name = RepoName::new(name);
-        let here = self.here.ok();
         let home = scan_home()?;
-        match knives::bind::resolve(registry, &name, here, &home) {
+        match knives::bind::resolve(registry, &name, self.here.as_ref().ok(), &home) {
             Ok(fork) => Some(fork),
             Err(why) => {
                 eprintln!("{}", why.message(&name, registry));
@@ -355,16 +347,15 @@ impl<'a> Ground<'a> {
     ///
     /// Requiring the name on every command is absurd when you are inside the
     /// repository, and it was the loudest complaint about using this thing.
-    fn one_fork(self, requested: Option<&str>) -> anyhow::Result<Option<Fork<'a>>> {
+    fn one_fork(&self, requested: Option<&str>) -> anyhow::Result<Option<Fork<'a>>> {
         if let Some(name) = requested {
             return Ok(self.named(name));
         }
-        let registry = self.registry;
-        match self.here {
-            Ok(fork) => Ok(Some(fork)),
-            Err(Unbound::Unreadable(error)) => Err(error.into()),
+        match &self.here {
+            Ok(fork) => Ok(Some(fork.clone())),
+            Err(Unbound::Unreadable(error)) => Err(error.clone().into()),
             Err(unbound) => {
-                eprintln!("{}", unbound.message(registry));
+                eprintln!("{}", unbound.message(self.registry));
                 Ok(None)
             }
         }
@@ -663,7 +654,7 @@ fn sweep<'a>(registry: &'a Registry, home: &std::path::Path) -> (Vec<Selected<'a
             if let Some(fork) = scan.found.remove(&name) {
                 return Some(Selected::Bound(fork));
             }
-            let why = scan.unplaced(&name);
+            let why = scan.unplaced(&name, Vec::new());
             if matches!(why, knives::bind::Unresolved::Missing { .. }) && scan.problems.is_empty() {
                 eprintln!("knives: {name}: not on this machine");
                 return None;

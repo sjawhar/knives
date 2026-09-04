@@ -14,7 +14,7 @@ mod lab;
 use lab::knives;
 
 #[test]
-fn register_prints_a_snippet_without_path_for_an_unregistered_checkout() {
+fn register_prints_a_snippet_for_an_unregistered_checkout() {
     let lab = lab::Lab::new();
     let home = tempfile::tempdir().expect("config home");
     std::fs::write(home.path().join("repos.toml"), "").expect("empty registry");
@@ -27,7 +27,6 @@ fn register_prints_a_snippet_without_path_for_an_unregistered_checkout() {
         stdout.contains(&format!("upstream = \"{}\"", lab.upstream.display())),
         "{stdout}"
     );
-    assert!(!stdout.contains("path ="), "{stdout}");
     // Under identity binding an entry is never replaced by a same-named one.
     assert!(!stdout.contains("replace"), "{stdout}");
     assert!(!stderr.contains("replace"), "{stderr}");

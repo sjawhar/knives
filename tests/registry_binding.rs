@@ -42,16 +42,7 @@ fn a_checkout_root_is_found_from_a_subdirectory_and_from_a_workspace() {
     let nested = lab.work.join("src").join("deep");
     std::fs::create_dir_all(&nested).expect("nested directory");
     let workspace = lab.temp_path().join("ws");
-    lab::jj(
-        &lab.work,
-        [
-            "workspace",
-            "add",
-            "--name",
-            "ws",
-            workspace.to_str().expect("utf-8"),
-        ],
-    );
+    lab::jj_workspace_add(&lab.work, "ws", &workspace);
 
     let expected = lab.work.canonicalize().expect("canonical work");
     assert_eq!(bind::checkout_root(&nested), Some(expected.clone()));
@@ -98,16 +89,7 @@ fn checkout_without_git_and_its_workspace(
     );
     lab::jj(&checkout, ["git", "fetch", "--remote", "upstream"]);
     let workspace = lab.temp_path().join("nocolo").join("feature");
-    lab::jj(
-        &checkout,
-        [
-            "workspace",
-            "add",
-            "--name",
-            "feature",
-            workspace.to_str().expect("utf-8"),
-        ],
-    );
+    lab::jj_workspace_add(&checkout, "feature", &workspace);
     assert!(!checkout.join(".git").exists(), "not colocated");
     assert!(
         !workspace.join(".git").exists(),
@@ -254,6 +236,142 @@ fn a_workspace_without_a_git_directory_binds_and_status_reports_the_fork() {
 }
 
 #[test]
+fn the_scan_does_not_bind_a_jj_store_committed_inside_a_git_clone() {
+    // An attacker's repository commits a jj store whose backend declares the
+    // lab's upstream; a clone of it lands under home beside the real checkout.
+    // The scan must not count it, or every named verb would refuse `demo` as
+    // having two checkouts.
+    let lab = lab::Lab::new();
+    let (home, _consumer) = lab::release_test_home(&lab);
+    let attacker = lab.temp_path().join("attacker");
+    git_repository(&attacker, &[]);
+    let evil = attacker.join("evil");
+    std::fs::create_dir_all(&evil).expect("evil");
+    lab::jj(&evil, ["git", "init", "--no-colocate"]);
+    lab::jj(
+        &evil,
+        [
+            "git",
+            "remote",
+            "add",
+            "upstream",
+            lab.upstream.to_str().expect("utf-8"),
+        ],
+    );
+    let _ = std::fs::remove_file(evil.join(".jj").join(".gitignore"));
+    lab::git_commit_all(&attacker, "attack");
+    let clone = lab.temp_path().join("victim-clone");
+    lab::git_clone(&attacker, &clone);
+    assert!(clone.join("evil").join(".jj").join("repo").is_dir());
+
+    let output = lab::knives_command(
+        lab.temp_path(),
+        home.path(),
+        lab.temp_path(),
+        &["--text", "status", "demo", "--no-landed", "--no-github"],
+    )
+    .output()
+    .expect("run knives");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        matches!(output.status.code(), Some(0 | 1)),
+        "{stdout}\n{stderr}"
+    );
+    assert!(stdout.contains("demo"), "{stdout}\n{stderr}");
+    assert!(!stderr.contains("2 checkouts"), "{stderr}");
+    assert!(!stderr.contains("could not read"), "{stderr}");
+}
+
+#[test]
+fn reading_remotes_of_a_workspace_never_writes_to_its_checkouts_operation_store() {
+    // Two operation heads in the checkout: what any jj command resolves by
+    // writing a merge operation. A read — the hook vouching for the workspace
+    // pointer and reading remotes — leaves both heads exactly as they were.
+    let lab = lab::Lab::new();
+    let (checkout, workspace) = checkout_without_git_and_its_workspace(&lab);
+    let heads = checkout
+        .join(".jj")
+        .join("repo")
+        .join("op_heads")
+        .join("heads");
+    let ops = std::process::Command::new("jj")
+        .args(["-R"])
+        .arg(&checkout)
+        .args([
+            "--ignore-working-copy",
+            "op",
+            "log",
+            "--no-graph",
+            "-n",
+            "3",
+            "-T",
+            "id ++ \"\\n\"",
+        ])
+        .env("JJ_CONFIG", "/dev/null")
+        .output()
+        .expect("op log");
+    let older = String::from_utf8_lossy(&ops.stdout)
+        .lines()
+        .last()
+        .expect("an older operation")
+        .to_owned();
+    std::fs::write(heads.join(&older), b"").expect("plant a second head");
+    let before = || {
+        let mut names: Vec<String> = std::fs::read_dir(&heads)
+            .expect("heads")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        names.sort();
+        names
+    };
+    let planted = before();
+    assert_eq!(planted.len(), 2, "{planted:?}");
+
+    let remotes = bind::remotes(&workspace).expect("remotes through the pointer");
+    assert_eq!(
+        remotes.get("upstream").map(String::as_str),
+        Some(lab.upstream.to_str().expect("utf-8"))
+    );
+    let home = tempfile::tempdir().expect("config home");
+    std::fs::write(
+        home.path().join("repos.toml"),
+        "[trust]\nowners = [\"acme\"]\n",
+    )
+    .expect("registry");
+    let mut event: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/claude_hook_post_tool_use_read.json"))
+            .expect("fixture");
+    event["session_id"] = serde_json::json!("never-writes");
+    event["cwd"] = serde_json::json!(home.path());
+    event["tool_input"]["file_path"] = serde_json::json!(workspace.join("README.md"));
+    let mut hook = std::process::Command::new(env!("CARGO_BIN_EXE_knives"));
+    hook.args(["hook", "claude-code"])
+        .env("KNIVES_CONFIG_HOME", home.path())
+        .env("HOME", lab.temp_path())
+        .env("JJ_CONFIG", "/dev/null")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = hook.spawn().expect("spawn hook");
+    std::io::Write::write_all(
+        child.stdin.as_mut().expect("stdin"),
+        event.to_string().as_bytes(),
+    )
+    .expect("write event");
+    let output = child.wait_with_output().expect("hook");
+    assert!(output.status.success());
+
+    assert_eq!(before(), planted, "a read merged the operation heads");
+}
+
+#[test]
 fn remotes_are_read_from_jj_checkouts_and_from_git_only_clones() {
     let lab = lab::Lab::new();
     let jj_remotes = bind::remotes(&lab.work).expect("jj remotes");
@@ -280,39 +398,6 @@ fn remotes_are_read_from_jj_checkouts_and_from_git_only_clones() {
     let plain = lab.temp_path().join("not-a-repo");
     std::fs::create_dir_all(&plain).expect("plain dir");
     assert!(bind::remotes(&plain).is_err());
-}
-
-#[test]
-fn here_binds_the_checkout_and_its_workspaces_to_their_entry() {
-    let lab = lab::Lab::new();
-    let registry = registry(&[(
-        "demo",
-        RepoEntry::new(
-            lab.upstream.to_str().expect("utf-8"),
-            "https://forge.invalid/acme/work.git",
-        ),
-    )]);
-    let workspace = lab.temp_path().join("ws");
-    lab::jj(
-        &lab.work,
-        [
-            "workspace",
-            "add",
-            "--name",
-            "ws",
-            workspace.to_str().expect("utf-8"),
-        ],
-    );
-
-    let from_checkout = bind::here(&registry, &lab.work).expect("bound");
-    assert_eq!(from_checkout.name, RepoName::new("demo"));
-    assert_eq!(
-        from_checkout.checkout.path,
-        lab.work.canonicalize().expect("canonical")
-    );
-
-    let from_workspace = bind::here(&registry, &workspace).expect("bound");
-    assert_eq!(from_workspace.checkout.path, from_checkout.checkout.path);
 }
 
 #[test]
@@ -414,16 +499,7 @@ fn scan_finds_each_entry_once_skips_workspaces_dot_directories_symlinks_and_dept
     let deep = deep_parent.join("default");
     std::fs::rename(&lab.work, &deep).expect("move checkout under home");
     let workspace = deep_parent.join("feature");
-    lab::jj(
-        &deep,
-        [
-            "workspace",
-            "add",
-            "--name",
-            "feature",
-            workspace.to_str().expect("utf-8"),
-        ],
-    );
+    lab::jj_workspace_add(&deep, "feature", &workspace);
     let hidden = home.join(".cache").join("tool");
     jj_checkout(&hidden, &[("upstream", "https://forge.invalid/org/hidden")]);
     let too_deep = home.join("a").join("b").join("c").join("d");
@@ -729,22 +805,22 @@ fn resolve_prefers_the_bound_directory_then_the_scan_then_says_why_not() {
     ]);
 
     let here = here_at(&registry, &lab.work);
-    let demo =
-        bind::resolve(&registry, &RepoName::new("demo"), here.clone(), &home).expect("resolved");
+    let here = here.as_ref();
+    let demo = bind::resolve(&registry, &RepoName::new("demo"), here, &home).expect("resolved");
     assert_eq!(
         demo.checkout.path,
         lab.work.canonicalize().expect("canonical")
     );
 
-    let other = bind::resolve(&registry, &RepoName::new("elsewhere"), here.clone(), &home)
-        .expect("resolved");
+    let other =
+        bind::resolve(&registry, &RepoName::new("elsewhere"), here, &home).expect("resolved");
     assert_eq!(
         other.checkout.path,
         elsewhere.canonicalize().expect("canonical")
     );
 
-    let missing = bind::resolve(&registry, &RepoName::new("absent"), here.clone(), &home)
-        .expect_err("missing");
+    let missing =
+        bind::resolve(&registry, &RepoName::new("absent"), here, &home).expect_err("missing");
     assert_eq!(
         missing,
         Unresolved::Missing {
@@ -813,16 +889,7 @@ fn a_workspace_whose_checkout_was_deleted_reports_its_vcs_s_own_error_about_the_
     let checkout = lab.temp_path().join("gone").join("default");
     jj_checkout(&checkout, &[("upstream", "https://forge.invalid/org/gone")]);
     let workspace = lab.temp_path().join("gone").join("feature");
-    lab::jj(
-        &checkout,
-        [
-            "workspace",
-            "add",
-            "--name",
-            "feature",
-            workspace.to_str().expect("utf-8"),
-        ],
-    );
+    lab::jj_workspace_add(&checkout, "feature", &workspace);
     std::fs::remove_dir_all(&checkout).expect("delete the checkout under the workspace");
     let canonical = workspace.canonicalize().expect("canonical");
 
@@ -995,12 +1062,9 @@ fn status_outside_any_checkout_sweeps_every_entry_through_the_scan() {
         "{stderr}"
     );
     assert!(!stdout.contains("could not gather"), "{stdout}");
-}
 
-#[test]
-fn status_json_all_leaves_the_absent_entry_out_of_the_document() {
-    let lab = lab::Lab::new();
-    let (home, _consumer) = home_with_a_ghost(&lab);
+    // The same sweep as a JSON document: the absent entry is not a row, and
+    // the placed one carries no problems.
     let output = knives_outside(
         &lab,
         &home,

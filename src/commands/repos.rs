@@ -344,7 +344,7 @@ pub fn gather(input: &GatherInput<'_>) -> Report {
                 .then(|| entry.remote(Role::Release).to_owned());
             let repo_name = RepoName::new(name.as_str());
             let Some(fork) = scan.found.get(&repo_name) else {
-                let problems = match scan.unplaced(&repo_name) {
+                let problems = match scan.unplaced(&repo_name, Vec::new()) {
                     why @ Unresolved::Duplicate { .. } => vec![why.message(&repo_name, registry)],
                     Unresolved::Missing { .. } | Unresolved::Unknown => Vec::new(),
                 };

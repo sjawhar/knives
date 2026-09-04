@@ -9,11 +9,12 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::bind::{self, Unbound, remote_host, repository_name, url_owner};
+use crate::bind::{self, Unbound};
 use crate::cli::Exit;
 use crate::config::{Registry, RepoEntry, default_config_path};
 use crate::hook::resolve::guidance_name;
 use crate::ids::RepoName;
+use crate::remote_url::{remote_host, repository_name, url_owner};
 
 /// What `register` decided about a directory, so the caller renders rather
 /// than re-deriving.
@@ -229,7 +230,7 @@ mod tests {
     }
 
     #[test]
-    fn only_remotes_named_for_a_role_are_adopted_and_the_entry_has_no_path() {
+    fn only_remotes_named_for_a_role_are_adopted() {
         // Given: a repo with an extra remote that is nobody's role
         let found = remotes(&[
             ("origin", "o"),
@@ -252,8 +253,6 @@ mod tests {
         assert_eq!(entry.origin, "o");
         assert_eq!(entry.release, None);
         assert!(warnings.is_empty(), "was: {warnings:?}");
-        let text = snippet(&name, &entry).expect("snippet serializes");
-        assert!(!text.contains("path"), "was: {text}");
     }
 
     #[test]

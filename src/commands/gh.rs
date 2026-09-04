@@ -604,8 +604,7 @@ fn resolve_from_inputs(inputs: TargetInputs<'_>) -> Option<String> {
 
 /// The first `gh repo set-default` marker, if git reports one (shim lines 151-164).
 fn gh_resolved_remote(cwd: &Path) -> Option<OwnedResolvedRemote> {
-    let output = Command::new("git")
-        .current_dir(cwd)
+    let output = crate::bind::git(cwd)
         .args(["config", "--get-regexp", "^remote\\..*\\.gh-resolved$"])
         .output()
         .ok()?;
