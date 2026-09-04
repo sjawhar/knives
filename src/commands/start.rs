@@ -71,10 +71,16 @@ pub fn possesses(cwd: &Path, fork: &Fork<'_>, branch: &BranchName) -> bool {
 /// A `workspaces` directory inside the checkout is refused first: it puts every
 /// branch workspace in the working copy it belongs to, which is never what
 /// anyone meant. The registry cannot check it — the checkout is found, not
-/// stated — so the two verbs that would use the directory do.
+/// stated — so the two verbs that would use the directory do. The directory is
+/// canonicalised when it exists, as the checkout already is, so a spelling
+/// through a symlink is judged by where it lands; one that does not exist yet
+/// has only its spelling.
 pub fn collides_with_checkout(fork: &Fork<'_>, branch: &BranchName) -> Option<String> {
     let checkout = &fork.checkout.path;
-    let root = fork.workspace_root();
+    let spelled = fork.workspace_root();
+    let root = spelled
+        .canonicalize()
+        .unwrap_or_else(|_| spelled.to_owned());
     if root.starts_with(checkout) {
         return Some(format!(
             "[repos.{}] workspaces {} is inside the checkout {}; branch workspaces cannot \
@@ -85,7 +91,7 @@ pub fn collides_with_checkout(fork: &Fork<'_>, branch: &BranchName) -> Option<St
         ));
     }
     let workspace = workspace_for(branch.as_str());
-    let directory = workspace_path(fork, branch);
+    let directory = root.join(&workspace);
     (workspace == "default" || checkout.starts_with(&directory)).then(|| {
         format!(
             "branch {branch} maps to workspace {workspace} at {}, which is the registered \
@@ -700,6 +706,36 @@ mod tests {
         let beside_entry = entry(Some("/home/u/tool-worktrees"));
         let beside = Fork::at("tool", &beside_entry, checkout);
         assert!(collides_with_checkout(&beside, &BranchName::new("feat/alpha")).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_workspaces_directory_spelled_through_a_symlink_into_the_checkout_is_refused() {
+        // `~/link` → the checkout: `workspaces = ~/link/.worktrees` names a
+        // directory inside the working copy without sharing its spelling.
+        let dir = tempfile::tempdir().unwrap();
+        let checkout = dir.path().join("tool");
+        std::fs::create_dir_all(checkout.join(".worktrees")).unwrap();
+        let checkout = checkout.canonicalize().unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&checkout, &link).unwrap();
+        let linked = link.join(".worktrees");
+        let linked_entry = entry(linked.to_str());
+        let fork = Fork::at("tool", &linked_entry, &checkout);
+        let refusal =
+            collides_with_checkout(&fork, &BranchName::new("feat/alpha")).expect("a refusal");
+        assert!(
+            refusal.contains("is inside the checkout"),
+            "the symlinked spelling resolves into the checkout: {refusal}"
+        );
+        // A symlink that lands beside the checkout is beside it.
+        let beside = dir.path().join("worktrees");
+        std::fs::create_dir_all(&beside).unwrap();
+        let beside_link = dir.path().join("beside-link");
+        std::os::unix::fs::symlink(&beside, &beside_link).unwrap();
+        let beside_entry = entry(beside_link.to_str());
+        let fork = Fork::at("tool", &beside_entry, &checkout);
+        assert!(collides_with_checkout(&fork, &BranchName::new("feat/alpha")).is_none());
     }
 
     #[test]

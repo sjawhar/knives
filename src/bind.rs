@@ -85,12 +85,12 @@ impl<'a> Fork<'a> {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum BindError {
     #[error("{} is neither a jj nor a git repository", root.display())]
     NotARepository { root: PathBuf },
     #[error("reading remotes of {}: {detail}", root.display())]
-    Remotes { root: PathBuf, detail: String },
+    RemotesUnreadable { root: PathBuf, detail: String },
 }
 
 /// Why `here` did not bind.
@@ -98,20 +98,30 @@ pub enum BindError {
 pub enum Unbound {
     /// No `.jj` or `.git` at or above the directory.
     NotInsideARepository,
+    /// A git clone with no `.jj`: the hook binds those, fork verbs need jj.
+    GitOnly { root: PathBuf },
     /// A repository, but it declares no `upstream` remote.
     NoUpstream { root: PathBuf },
     /// A fork of something the registry does not list.
     Unregistered { root: PathBuf, upstream: String },
+    /// A repository whose remotes could not be read.
+    Unreadable(BindError),
 }
 
 impl Unbound {
-    /// The refusal, followed by `; known: a, b`: every refusal about the
-    /// current directory ends by listing the registry's names, since the fix
-    /// is to type one of them.
+    /// The refusal. One that a repo name would fix ends with `; known: a, b`,
+    /// the registry's names; a git clone or an unreadable repository is refused
+    /// in its own words, since typing a name is not the fix.
     pub fn message(&self, registry: &Registry) -> String {
         let text = match self {
             Self::NotInsideARepository => {
                 "not inside a repository; name a repo, or run this from inside one".to_owned()
+            }
+            Self::GitOnly { root } => {
+                return format!(
+                    "{} is a git clone, not a jj checkout; fork commands need jj",
+                    root.display()
+                );
             }
             Self::NoUpstream { root } => format!(
                 "{} has no `upstream` remote, so it is not a managed fork; name a repo",
@@ -121,6 +131,7 @@ impl Unbound {
                 "{} forks {upstream}, which is not in the registry; `knives register` prints the entry",
                 root.display()
             ),
+            Self::Unreadable(error) => return error.to_string(),
         };
         format!("{text}; known: {}", known(registry))
     }
@@ -210,9 +221,25 @@ pub fn same_remote(a: &str, b: &str) -> bool {
 
 fn remote_key(remote: &str) -> String {
     let trimmed = remote.trim().trim_end_matches('/');
-    match remote_authority_and_path(trimmed) {
+    // scp form without a user, `host:path`, is a URL too when the part before
+    // the colon holds no `/`; a filesystem path with a colon in a later component
+    // stays a path.
+    let parsed = remote_authority_and_path(trimmed).or_else(|| {
+        let (host, path) = trimmed.split_once(':')?;
+        (!host.is_empty() && !host.contains('/')).then_some((host, path))
+    });
+    match parsed {
         Some((authority, path)) if !authority.is_empty() => {
             let host = authority.rsplit('@').next().unwrap_or(authority);
+            // `host:2222` is `host`: the port is how to reach it, not what it is.
+            let host = match host.rsplit_once(':') {
+                Some((name, port))
+                    if !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()) =>
+                {
+                    name
+                }
+                _ => host,
+            };
             // Lowercase first, so `.GIT` is stripped like `.git`.
             let path = path.trim_matches('/').to_ascii_lowercase();
             let path = path.strip_suffix(".git").unwrap_or(&path);
@@ -279,10 +306,13 @@ pub fn checkout_root(path: &Path) -> Option<PathBuf> {
 /// The checkout a repository root belongs to: the root itself, or — when its
 /// `.jj/repo` is a file — the checkout the pointer names.
 ///
-/// A pointer that cannot be read, or that names a store that is no longer a
-/// directory (the checkout was deleted under the workspace), returns the
-/// workspace root itself, so the remote reader surfaces jj's own error about
-/// it rather than reporting a directory that is not a repository.
+/// This decides where a fork verb operates ([`here`] reads that checkout's
+/// remotes) and folds a workspace into its checkout; it never decides what is
+/// trusted — the hook reads remotes at the nearest root itself. A pointer that cannot be read, or
+/// that names a store that is no longer a directory (the checkout was deleted
+/// under the workspace), returns the workspace root itself, so the remote
+/// reader surfaces jj's own error about it rather than reporting a directory
+/// that is not a repository.
 pub fn checkout_of_root(root: &Path) -> PathBuf {
     let jj_dir = root.join(".jj");
     let pointer = jj_dir.join("repo");
@@ -308,25 +338,32 @@ pub fn checkout_of_root(root: &Path) -> PathBuf {
     )
 }
 
-/// Remotes of the repository rooted at `root`, read from jj when `.jj` is
-/// present (colocated or not, checkout or workspace), from git when only `.git`
-/// is present.
+/// Remotes of the repository rooted at `root`, from the VCS that owns the root.
+///
+/// `.git` present (a directory, or a worktree's pointer file, which git
+/// validates itself) → `git -C root config --get-regexp '^remote\..*\.url$'`,
+/// whether or not `.jj` is beside it: a colocated checkout keeps its remotes
+/// there anyway. Otherwise `.jj` a directory → `jj -R root git remote list`,
+/// which validates a workspace's `.jj/repo` pointer itself. Git wins because a
+/// `.jj/repo` pointer *file* is ordinary content a clone can carry, while the
+/// `.git` that arrives with it holds the remotes it was actually cloned from —
+/// knives never follows a pointer to decide whose remotes to read.
 pub fn remotes(root: &Path) -> Result<BTreeMap<String, String>, BindError> {
-    let failure = |detail: String| BindError::Remotes {
+    let failure = |detail: String| BindError::RemotesUnreadable {
         root: root.to_owned(),
         detail,
     };
-    let listing = if root.join(".jj").is_dir() {
-        std::process::Command::new("jj")
-            .arg("-R")
-            .arg(root)
-            .args(["--ignore-working-copy", "git", "remote", "list"])
-            .output()
-    } else if root.join(".git").exists() {
+    let listing = if root.join(".git").exists() {
         std::process::Command::new("git")
             .arg("-C")
             .arg(root)
             .args(["config", "--get-regexp", "^remote\\..*\\.url$"])
+            .output()
+    } else if root.join(".jj").is_dir() {
+        std::process::Command::new("jj")
+            .arg("-R")
+            .arg(root)
+            .args(["--ignore-working-copy", "git", "remote", "list"])
             .output()
     } else {
         return Err(BindError::NotARepository {
@@ -338,14 +375,7 @@ pub fn remotes(root: &Path) -> Result<BTreeMap<String, String>, BindError> {
     let no_matches =
         output.status.code() == Some(1) && output.stdout.is_empty() && output.stderr.is_empty();
     if !output.status.success() && !no_matches {
-        // The first line is the error; jj follows it with hints.
-        let detail = String::from_utf8_lossy(&output.stderr)
-            .lines()
-            .map(str::trim)
-            .find(|line| !line.is_empty())
-            .unwrap_or_default()
-            .to_owned();
-        return Err(failure(detail));
+        return Err(failure(error_line(&output.stderr)));
     }
     String::from_utf8_lossy(&output.stdout)
         .lines()
@@ -363,6 +393,23 @@ pub fn remotes(root: &Path) -> Result<BTreeMap<String, String>, BindError> {
         })
         .collect()
 }
+/// The line of a VCS's stderr that explains a failure: jj may print a
+/// `Warning:` (per-repo config, say) before its error and follows the error
+/// with hints; git prints the error first.
+fn error_line(stderr: &[u8]) -> String {
+    let stderr = String::from_utf8_lossy(stderr);
+    let lines = || {
+        stderr
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+    };
+    lines()
+        .find(|line| !line.starts_with("Warning:"))
+        .or_else(|| lines().next())
+        .unwrap_or_default()
+        .to_owned()
+}
 
 /// The entry whose `upstream` matches; `None` when none does.
 pub fn entry_for<'a>(registry: &'a Registry, upstream: &str) -> Option<(RepoName, &'a RepoEntry)> {
@@ -374,31 +421,35 @@ pub fn entry_for<'a>(registry: &'a Registry, upstream: &str) -> Option<(RepoName
 }
 
 /// The fork the current directory is inside.
-pub fn here<'a>(
-    registry: &'a Registry,
-    cwd: &Path,
-) -> Result<Result<Fork<'a>, Unbound>, BindError> {
+///
+/// The checkout its nearest root belongs to, bound by the remotes read there.
+/// A verb ran in that directory, so its checkout's remotes are what the verb
+/// is about — no trust decision rests on them.
+pub fn here<'a>(registry: &'a Registry, cwd: &Path) -> Result<Fork<'a>, Unbound> {
     let Some(root) = checkout_root(cwd) else {
-        return Ok(Err(Unbound::NotInsideARepository));
+        return Err(Unbound::NotInsideARepository);
     };
-    let remotes = remotes(&root)?;
+    if !root.join(".jj").is_dir() {
+        return Err(Unbound::GitOnly { root });
+    }
+    let remotes = remotes(&root).map_err(Unbound::Unreadable)?;
     let Some(upstream) = remotes.get("upstream") else {
-        return Ok(Err(Unbound::NoUpstream { root }));
+        return Err(Unbound::NoUpstream { root });
     };
     let Some((name, entry)) = entry_for(registry, upstream) else {
-        return Ok(Err(Unbound::Unregistered {
+        return Err(Unbound::Unregistered {
             root,
             upstream: upstream.clone(),
-        }));
+        });
     };
-    Ok(Ok(Fork {
+    Ok(Fork {
         name,
         entry,
         checkout: Checkout {
             path: root,
             remotes,
         },
-    }))
+    })
 }
 
 /// Every entry's checkout under `home`, and what could not be decided.
@@ -436,72 +487,63 @@ impl Scan<'_> {
 /// `home` is depth 0; `~/a/b/c` is read and its children are not queued.
 const SCAN_DEPTH: usize = 3;
 
-/// Scan `home` to depth three for jj checkouts and bind each to its entry.
+/// Scan `home` for jj checkouts ([`checkouts_under`]) and bind each to its entry.
 ///
-/// Directories named with a leading `.` are skipped, symlinks are not followed,
-/// and nothing below a `.jj` is visited — except `home` itself, whose children
-/// are always visited: a home that is a repository (a dotfiles checkout, say)
-/// still holds the forks under it. A `.jj/repo` directory is a checkout; a
-/// `.jj/repo` file is a workspace, found through its checkout; a git-only
-/// clone is not a fork checkout, and a git-tracked parent (`~/work/.git`) does
-/// not hide the forks beneath it.
+/// Every checkout's remotes are read at once, one thread each: each read is a
+/// process spawn, and a home holds tens of checkouts, not thousands.
+///
+/// A checkout whose remotes cannot be read is a problem only while some entry
+/// is still unplaced — neither found nor found twice — since it may be where
+/// that entry lives. Once every entry is placed, unreadable strangers are
+/// dropped: the scan locates entries, it does not audit the health of every
+/// repository under `home`.
 pub fn scan<'a>(registry: &'a Registry, home: &Path) -> Scan<'a> {
     let mut scan = Scan {
         home: home.to_owned(),
         ..Scan::default()
     };
+    let checkouts = checkouts_under(home, &mut scan.problems);
+    #[allow(
+        clippy::needless_collect,
+        reason = "every reader is spawned before any is joined; the suggested form joins each before spawning the next"
+    )]
+    let read = std::thread::scope(|threads| {
+        let handles: Vec<_> = checkouts
+            .iter()
+            .map(|directory| threads.spawn(move || remotes(directory)))
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| {
+                handle
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            })
+            .collect::<Vec<_>>()
+    });
     // Keyed by name and carrying the entry, so the split below needs no lookup.
     let mut candidates: BTreeMap<RepoName, (&'a RepoEntry, Vec<Checkout>)> = BTreeMap::new();
-    let mut pending = vec![(home.to_owned(), 0usize)];
-    while let Some((directory, depth)) = pending.pop() {
-        let jj = directory.join(".jj");
-        let is_jj = jj.is_dir();
-        if is_jj && jj.join("repo").is_dir() {
-            match remotes(&directory) {
-                Ok(remotes) => {
-                    if let Some(upstream) = remotes.get("upstream")
-                        && let Some((name, entry)) = entry_for(registry, upstream)
-                    {
-                        let path = directory
-                            .canonicalize()
-                            .unwrap_or_else(|_| directory.clone());
-                        candidates
-                            .entry(name)
-                            .or_insert((entry, Vec::new()))
-                            .1
-                            .push(Checkout { path, remotes });
-                    }
+    let mut unreadable = Vec::new();
+    for (directory, remotes) in checkouts.into_iter().zip(read) {
+        match remotes {
+            Ok(remotes) => {
+                if let Some(upstream) = remotes.get("upstream")
+                    && let Some((name, entry)) = entry_for(registry, upstream)
+                {
+                    let path = directory.canonicalize().unwrap_or(directory);
+                    candidates
+                        .entry(name)
+                        .or_insert((entry, Vec::new()))
+                        .1
+                        .push(Checkout { path, remotes });
                 }
-                Err(error) => scan.problems.push(error.to_string()),
             }
+            Err(error) => unreadable.push(error.to_string()),
         }
-        if (is_jj && depth > 0) || depth == SCAN_DEPTH {
-            continue;
-        }
-        let children = match std::fs::read_dir(&directory) {
-            Ok(children) => children,
-            Err(error) => {
-                scan.problems
-                    .push(format!("cannot read {}: {error}", directory.display()));
-                continue;
-            }
-        };
-        for child in children {
-            let child = match child {
-                Ok(child) => child,
-                Err(error) => {
-                    scan.problems
-                        .push(format!("cannot read {}: {error}", directory.display()));
-                    continue;
-                }
-            };
-            // `file_type` does not follow symlinks, so a linked directory is not one.
-            let is_directory = child.file_type().is_ok_and(|kind| kind.is_dir());
-            let hidden = child.file_name().as_encoded_bytes().starts_with(b".");
-            if is_directory && !hidden {
-                pending.push((child.path(), depth + 1));
-            }
-        }
+    }
+    let every_entry_placed = registry.names().all(|name| candidates.contains_key(&name));
+    if !every_entry_placed {
+        scan.problems.extend(unreadable);
     }
     for (name, (entry, mut checkouts)) in candidates {
         checkouts.sort_by(|a, b| a.path.cmp(&b.path));
@@ -525,6 +567,53 @@ pub fn scan<'a>(registry: &'a Registry, home: &Path) -> Scan<'a> {
         }
     }
     scan
+}
+
+/// The jj checkouts (`.jj/repo` a directory) under `home`, to depth three.
+///
+/// Directories named with a leading `.` are skipped, symlinks are not followed,
+/// and nothing below a `.jj` is visited — except `home` itself, whose children
+/// are always visited: a home that is a repository (a dotfiles checkout, say)
+/// still holds the forks under it. A `.jj/repo` file is a workspace, found
+/// through its checkout; a git-only clone is not a fork checkout, and a
+/// git-tracked parent (`~/work/.git`) does not hide the forks beneath it. A
+/// directory that could not be listed is pushed to `problems`.
+fn checkouts_under(home: &Path, problems: &mut Vec<String>) -> Vec<PathBuf> {
+    let mut checkouts = Vec::new();
+    let mut pending = vec![(home.to_owned(), 0usize)];
+    while let Some((directory, depth)) = pending.pop() {
+        let jj = directory.join(".jj");
+        let is_jj = jj.is_dir();
+        if is_jj && jj.join("repo").is_dir() {
+            checkouts.push(directory.clone());
+        }
+        if (is_jj && depth > 0) || depth == SCAN_DEPTH {
+            continue;
+        }
+        let children = match std::fs::read_dir(&directory) {
+            Ok(children) => children,
+            Err(error) => {
+                problems.push(format!("cannot read {}: {error}", directory.display()));
+                continue;
+            }
+        };
+        for child in children {
+            let child = match child {
+                Ok(child) => child,
+                Err(error) => {
+                    problems.push(format!("cannot read {}: {error}", directory.display()));
+                    continue;
+                }
+            };
+            // `file_type` does not follow symlinks, so a linked directory is not one.
+            let is_directory = child.file_type().is_ok_and(|kind| kind.is_dir());
+            let hidden = child.file_name().as_encoded_bytes().starts_with(b".");
+            if is_directory && !hidden {
+                pending.push((child.path(), depth + 1));
+            }
+        }
+    }
+    checkouts
 }
 
 /// One named entry's fork: `here` when it is that entry, else the scan's.
@@ -562,7 +651,8 @@ mod tests {
     use crate::ids::RepoName;
 
     use super::{
-        Checkout, Fork, Scan, Unbound, Unresolved, remote_host, remote_slug, same_remote, url_owner,
+        BindError, Checkout, Fork, Scan, Unbound, Unresolved, error_line, remote_host, remote_slug,
+        same_remote, url_owner,
     };
 
     fn entry(upstream: &str, origin: &str, release: Option<&str>) -> RepoEntry {
@@ -576,6 +666,19 @@ mod tests {
             consumers: vec![],
             workspaces: None,
         }
+    }
+
+    #[test]
+    fn the_error_line_skips_a_leading_jj_warning_and_falls_back_to_it_alone() {
+        let jj = b"Warning: Per-repo config not found. Generating an empty one.\nInternal error: The repository appears broken or inaccessible\nHint: try again\n";
+        assert_eq!(
+            error_line(jj),
+            "Internal error: The repository appears broken or inaccessible"
+        );
+        let git = b"fatal: not a git repository: /x/.git\n";
+        assert_eq!(error_line(git), "fatal: not a git repository: /x/.git");
+        assert_eq!(error_line(b"Warning: only this\n"), "Warning: only this");
+        assert_eq!(error_line(b"\n  \n"), "");
     }
 
     #[test]
@@ -600,6 +703,36 @@ mod tests {
             "https://forge.example/Org/Tool.GIT",
             "https://forge.example/org/tool"
         ));
+    }
+
+    #[test]
+    fn a_port_on_the_host_does_not_make_another_repository() {
+        assert!(same_remote(
+            "ssh://git@forge.example:2222/org/tool",
+            "https://forge.example/org/tool"
+        ));
+        assert!(same_remote(
+            "https://forge.example:443/org/tool.git",
+            "git@forge.example:org/tool"
+        ));
+    }
+
+    #[test]
+    fn scp_form_without_a_user_is_a_url_when_the_host_holds_no_slash() {
+        assert!(same_remote(
+            "forge.example:org/tool",
+            "git@forge.example:org/tool.git"
+        ));
+        assert!(same_remote(
+            "forge.example:org/tool",
+            "https://forge.example/org/tool"
+        ));
+        // A colon in a later path component does not turn a directory into a host.
+        assert!(!same_remote(
+            "/tmp/lab/a:b/tool",
+            "https://tmp/lab/a:b/tool"
+        ));
+        assert!(same_remote("/tmp/lab/a:b/tool", " /tmp/lab/a:b/tool/ "));
     }
 
     #[test]
@@ -783,6 +916,21 @@ mod tests {
             }
             .message(&registry),
             "/r forks https://forge.example/o/t, which is not in the registry; `knives register` prints the entry; known: alpha, beta"
+        );
+        assert_eq!(
+            Unbound::GitOnly {
+                root: PathBuf::from("/r")
+            }
+            .message(&registry),
+            "/r is a git clone, not a jj checkout; fork commands need jj"
+        );
+        assert_eq!(
+            Unbound::Unreadable(BindError::RemotesUnreadable {
+                root: PathBuf::from("/r"),
+                detail: "boom".to_owned()
+            })
+            .message(&registry),
+            "reading remotes of /r: boom"
         );
         let name = RepoName::new("tool");
         assert_eq!(

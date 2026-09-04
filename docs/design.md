@@ -97,16 +97,20 @@ the enclosing identity. Outside one, `knives repos`, `status --all`, and naming 
 `$HOME` to depth three for jj checkouts (`.jj/repo` a directory), skipping dot-directories, not
 following symlinks, and not descending below a jj checkout (a `.git`-only directory is not a
 checkout and does not hide what is beneath it). An entry with no checkout found is
-`not on this machine`; an entry with two is refused with both paths named, because choosing
-would answer about the wrong copy. What the scan could not read is always named beside the
-entries it may have been: on the refusal, on the `repos` listing, once on stderr during a sweep.
+`not on this machine`: a row on the `repos` listing, one stderr line and no row during a sweep,
+never a failing exit, since the registry is shared across machines that hold different subsets.
+An entry with two is refused with both paths named, because choosing would answer about the
+wrong copy. A checkout the scan could not read is named beside the entries it may have been —
+on the refusal, on the `repos` listing, once on stderr during a sweep — while some entry is
+still unplaced; once every entry is placed it is dropped, since the scan locates entries rather
+than auditing every repository under `$HOME`.
 
 `[trust]` decides whose instructions the hook injects. It is separate from `[repos.*]`: a fork
 entry grants fork commands and the managed notice, never guidance.
 - `repos`: forge slugs (`owner/repo`) trusted by identity, matched against any remote of a checkout, case-insensitively, `.git` stripped from both sides. The file is refused on load when a value is not a slug.
 - `owners`: forge owners trusted for instruction guidance, matched case-insensitively against the owner segment of every remote URL of a checkout.
 - `roots`: directory subtrees where all contained repositories are trusted for instruction guidance; `~` expands and a relative value is taken from the config directory.
-- **Security posture:** identity and owner matching read self-declared remote URLs from the candidate checkout's own jj or git configuration. They are not forge-authenticated and grant guidance-as-data only, never fork-command access. Remotes are read from the nearest repository root (a workspace's from the checkout its `.jj/repo` pointer names), so a directory nested inside a checkout cannot inherit the enclosing checkout's identity. Trust names repositories, so it follows a clone wherever it lands; a checkout with no remotes matches only via `roots`. No command writes the file: `knives register` prints an entry, and a human pastes it. Verdicts are recomputed from `repos.toml` on every hook event, so human edits to the file act as the approval mechanism.
+- **Security posture:** identity and owner matching read self-declared remote URLs from the candidate checkout's own jj or git configuration. They are not forge-authenticated and grant guidance-as-data only, never fork-command access. Remotes are read at the nearest repository root, by git when `.git` exists there and else by jj — never by following a `.jj/repo` pointer file to another checkout — so a directory nested inside a checkout cannot inherit the enclosing checkout's identity, and a tree that arrives by clone cannot borrow another checkout's identity either, since the `.git` it arrives with names the remotes it was cloned from; VCS metadata written into a tree by other means is trusted as that VCS reports it. Trust names repositories, so it follows a clone wherever it lands; a checkout with no remotes matches only via `roots`. No command writes the file: `knives register` prints an entry, and a human pastes it. Verdicts are recomputed from `repos.toml` on every hook event, so human edits to the file act as the approval mechanism.
 
 ## State
 

@@ -526,7 +526,7 @@ pub(crate) fn resolve_target_url(args: &[String], cwd: &Path) -> Option<String> 
         .flatten();
     let bound = registry
         .as_ref()
-        .and_then(|registry| crate::bind::here(registry, cwd).ok().and_then(Result::ok));
+        .and_then(|registry| crate::bind::here(registry, cwd).ok());
     let registered_entry = bound.as_ref().map(|fork| fork.entry);
     let requires_remotes = needs_git_inputs
         && (resolved_remote

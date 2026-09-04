@@ -46,7 +46,7 @@ fn registry(entries: &[(&str, RepoEntry)]) -> Registry {
 /// The fork the lab's work checkout is inside, bound against `registry` as a
 /// verb's `Ground` binds it once.
 fn here_at<'a>(registry: &'a Registry, cwd: &Path) -> Option<bind::Fork<'a>> {
-    bind::here(registry, cwd).expect("read").ok()
+    bind::here(registry, cwd).ok()
 }
 
 #[test]
@@ -132,9 +132,7 @@ fn here_binds_the_checkout_and_its_workspaces_to_their_entry() {
         ],
     );
 
-    let from_checkout = bind::here(&registry, &lab.work)
-        .expect("read")
-        .expect("bound");
+    let from_checkout = bind::here(&registry, &lab.work).expect("bound");
     assert_eq!(from_checkout.name, RepoName::new("demo"));
     assert_eq!(
         from_checkout.checkout.path,
@@ -142,9 +140,7 @@ fn here_binds_the_checkout_and_its_workspaces_to_their_entry() {
     );
     assert!(from_checkout.checkout.is_jj());
 
-    let from_workspace = bind::here(&registry, &workspace)
-        .expect("read")
-        .expect("bound");
+    let from_workspace = bind::here(&registry, &workspace).expect("bound");
     assert_eq!(from_workspace.checkout.path, from_checkout.checkout.path);
 }
 
@@ -180,22 +176,16 @@ fn the_nearest_repository_wins_when_one_is_nested_inside_another() {
         ),
     ]);
 
-    let from_git = bind::here(&registry, &inner_git.join("src"))
-        .expect("read")
-        .expect("bound");
-    assert_eq!(from_git.name, RepoName::new("dep"));
-    assert_eq!(
-        from_git.checkout.path,
-        inner_git.canonicalize().expect("canonical")
+    // A git-only clone is its own root, so the enclosing checkout does not
+    // claim it; fork verbs still refuse it, since they need jj.
+    let from_git = bind::here(&registry, &inner_git.join("src")).expect_err("git only");
+    assert!(
+        matches!(&from_git, Unbound::GitOnly { root } if *root == inner_git.canonicalize().expect("canonical")),
+        "{from_git:?}"
     );
-    assert!(!from_git.checkout.is_jj());
-    let from_jj = bind::here(&registry, &inner_jj)
-        .expect("read")
-        .expect("bound");
+    let from_jj = bind::here(&registry, &inner_jj).expect("bound");
     assert_eq!(from_jj.name, RepoName::new("tool"));
-    let from_outer = bind::here(&registry, &lab.work.join("vendor"))
-        .expect("read")
-        .expect("bound");
+    let from_outer = bind::here(&registry, &lab.work.join("vendor")).expect("bound");
     assert_eq!(from_outer.name, RepoName::new("demo"));
 }
 
@@ -213,23 +203,19 @@ fn here_refuses_outside_a_repository_without_upstream_and_when_unregistered() {
     let nowhere = lab.temp_path().join("nowhere");
     std::fs::create_dir_all(&nowhere).expect("plain dir");
     assert_eq!(
-        bind::here(&registry, &nowhere).expect("read"),
+        bind::here(&registry, &nowhere),
         Err(Unbound::NotInsideARepository)
     );
 
     let no_upstream = lab.temp_path().join("no-upstream");
-    git_repository(
+    jj_checkout(
         &no_upstream,
         &[("origin", "https://forge.invalid/me/thing")],
     );
-    let unbound = bind::here(&registry, &no_upstream)
-        .expect("read")
-        .expect_err("unbound");
+    let unbound = bind::here(&registry, &no_upstream).expect_err("unbound");
     assert!(matches!(unbound, Unbound::NoUpstream { .. }), "{unbound:?}");
 
-    let unbound = bind::here(&registry, &lab.work)
-        .expect("read")
-        .expect_err("unbound");
+    let unbound = bind::here(&registry, &lab.work).expect_err("unbound");
     assert!(
         matches!(&unbound, Unbound::Unregistered { upstream, .. } if upstream == lab.upstream.to_str().expect("utf-8")),
         "{unbound:?}"
@@ -443,24 +429,38 @@ fn scan_descends_from_a_home_that_is_itself_a_repository() {
 }
 
 #[test]
-fn scan_names_a_checkout_whose_remotes_it_could_not_read() {
+fn scan_names_a_checkout_whose_remotes_it_could_not_read_while_an_entry_is_unplaced() {
     // A `.jj/repo` directory with nothing in it looks like a checkout; jj
-    // cannot read it. The scan says so rather than silently skipping what may
-    // be the entry it was looking for.
+    // cannot read it. While an entry is still missing, the scan says so rather
+    // than silently skipping what may be the entry it was looking for.
     let lab = lab::Lab::new();
     let home = lab.temp_path().join("home");
     let broken = home.join("broken");
     std::fs::create_dir_all(broken.join(".jj").join("repo")).expect("empty store");
-    let registry = registry(&[(
-        "ghost",
-        entry(
-            "https://forge.invalid/org/ghost",
-            "https://forge.invalid/acme/ghost",
+    jj_checkout(
+        &home.join("tool"),
+        &[("upstream", "https://forge.invalid/org/tool")],
+    );
+    let registry = registry(&[
+        (
+            "tool",
+            entry(
+                "https://forge.invalid/org/tool",
+                "https://forge.invalid/acme/tool",
+            ),
         ),
-    )]);
+        (
+            "ghost",
+            entry(
+                "https://forge.invalid/org/ghost",
+                "https://forge.invalid/acme/ghost",
+            ),
+        ),
+    ]);
 
     let scan = bind::scan(&registry, &home);
 
+    assert!(scan.found.contains_key(&RepoName::new("tool")));
     assert_eq!(scan.problems.len(), 1, "{:?}", scan.problems);
     let canonical = broken.canonicalize().expect("canonical");
     assert!(
@@ -477,6 +477,50 @@ fn scan_names_a_checkout_whose_remotes_it_could_not_read() {
             .contains("; could not read: reading remotes of"),
         "{why:?}"
     );
+}
+
+#[test]
+fn scan_drops_an_unreadable_stranger_once_every_entry_is_placed() {
+    // The scan locates entries; with every entry found (or found twice), a
+    // broken repository under home is nobody's business.
+    let lab = lab::Lab::new();
+    let home = lab.temp_path().join("home");
+    let broken = home.join("broken");
+    std::fs::create_dir_all(broken.join(".jj").join("repo")).expect("empty store");
+    jj_checkout(
+        &home.join("tool"),
+        &[("upstream", "https://forge.invalid/org/tool")],
+    );
+    jj_checkout(
+        &home.join("twice-a"),
+        &[("upstream", "https://forge.invalid/org/twice")],
+    );
+    jj_checkout(
+        &home.join("twice-b"),
+        &[("upstream", "https://forge.invalid/org/twice")],
+    );
+    let registry = registry(&[
+        (
+            "tool",
+            entry(
+                "https://forge.invalid/org/tool",
+                "https://forge.invalid/acme/tool",
+            ),
+        ),
+        (
+            "twice",
+            entry(
+                "https://forge.invalid/org/twice",
+                "https://forge.invalid/acme/twice",
+            ),
+        ),
+    ]);
+
+    let scan = bind::scan(&registry, &home);
+
+    assert!(scan.found.contains_key(&RepoName::new("tool")));
+    assert!(scan.duplicates.contains_key(&RepoName::new("twice")));
+    assert!(scan.problems.is_empty(), "{:?}", scan.problems);
 }
 
 #[test]
@@ -565,7 +609,7 @@ fn a_repository_whose_remotes_cannot_be_read_is_an_error_naming_the_directory() 
     let canonical = broken.canonicalize().expect("canonical");
     assert!(matches!(
         bind::here(&registry, &broken),
-        Err(BindError::Remotes { root, .. }) if root == canonical
+        Err(Unbound::Unreadable(BindError::RemotesUnreadable { root, .. })) if root == canonical
     ));
 
     // A workspace whose `.jj/repo` pointer cannot be read stays its own root,
@@ -577,14 +621,16 @@ fn a_repository_whose_remotes_cannot_be_read_is_an_error_naming_the_directory() 
     assert_eq!(bind::checkout_root(&stray), Some(canonical.clone()));
     assert!(matches!(
         bind::here(&registry, &stray),
-        Err(BindError::Remotes { root, .. }) if root == canonical
+        Err(Unbound::Unreadable(BindError::RemotesUnreadable { root, .. })) if root == canonical
     ));
 }
 
 #[test]
-fn a_workspace_whose_checkout_was_deleted_reports_jj_s_own_error_about_the_workspace() {
+fn a_workspace_whose_checkout_was_deleted_reports_its_vcs_s_own_error_about_the_workspace() {
     // The pointer names a store that is gone. The workspace is a repository
-    // directory jj cannot open — not a directory that is no repository at all.
+    // directory its VCS cannot open — not a directory that is no repository at
+    // all. The checkout is colocated, so its workspace carries a `.git` file
+    // and git speaks for it.
     let lab = lab::Lab::new();
     let registry = registry(&[(
         "demo",
@@ -611,8 +657,11 @@ fn a_workspace_whose_checkout_was_deleted_reports_jj_s_own_error_about_the_works
 
     assert_eq!(bind::checkout_root(&workspace), Some(canonical.clone()));
     let error = bind::here(&registry, &workspace).expect_err("unreadable");
+    let Unbound::Unreadable(error) = error else {
+        panic!("{error:?}");
+    };
     assert!(
-        matches!(&error, BindError::Remotes { root, .. } if *root == canonical),
+        matches!(&error, BindError::RemotesUnreadable { root, .. } if *root == canonical),
         "{error:?}"
     );
     assert!(
@@ -622,7 +671,7 @@ fn a_workspace_whose_checkout_was_deleted_reports_jj_s_own_error_about_the_works
         "{error}"
     );
 
-    // Through the binary: jj's words about the workspace, exit 3, no sweep.
+    // Through the binary: git's words about the workspace, exit 3, no sweep.
     let home = tempfile::tempdir().expect("config home");
     std::fs::write(
         home.path().join("repos.toml"),
@@ -646,7 +695,7 @@ fn a_workspace_whose_checkout_was_deleted_reports_jj_s_own_error_about_the_works
         stderr.contains(&format!("reading remotes of {}: ", canonical.display())),
         "{stderr}"
     );
-    assert!(stderr.contains("Cannot access"), "{stderr}");
+    assert!(stderr.contains("not a git repository"), "{stderr}");
     assert!(
         !stderr.contains("neither a jj nor a git repository"),
         "{stderr}"
@@ -776,21 +825,22 @@ fn status_inside_a_registered_git_only_clone_refuses_as_every_fork_verb_does() {
 #[test]
 fn a_named_status_from_inside_its_checkout_reads_the_remotes_once() {
     // `Ground` binds the current directory once; `resolve` is handed that
-    // binding rather than asking jj a second time. Counted through a `jj`
-    // shim on PATH that logs every `git remote list` before delegating.
+    // binding rather than asking the VCS a second time. The lab checkout is
+    // colocated, so its remotes come from git; counted through a `git` shim on
+    // PATH that logs every `config --get-regexp` before delegating.
     let lab = lab::Lab::new();
     let (home, _consumer) = lab::release_test_home(&lab);
     let shim_dir = lab.temp_path().join("shim");
     std::fs::create_dir_all(&shim_dir).expect("shim dir");
-    let log = lab.temp_path().join("jj-calls.log");
-    let real_jj = which_jj();
-    let shim = shim_dir.join("jj");
+    let log = lab.temp_path().join("git-calls.log");
+    let real_git = which("git");
+    let shim = shim_dir.join("git");
     std::fs::write(
         &shim,
         format!(
-            "#!/bin/sh\ncase \"$*\" in *\"git remote list\"*) echo \"$*\" >> '{}';; esac\nexec '{}' \"$@\"\n",
+            "#!/bin/sh\ncase \"$*\" in *\"config --get-regexp\"*) echo \"$*\" >> '{}';; esac\nexec '{}' \"$@\"\n",
             log.display(),
-            real_jj.display()
+            real_git.display()
         ),
     )
     .expect("write shim");
@@ -818,16 +868,16 @@ fn a_named_status_from_inside_its_checkout_reads_the_remotes_once() {
     assert_eq!(
         calls.lines().count(),
         1,
-        "jj git remote list was run more than once:\n{calls}"
+        "the remotes were read more than once:\n{calls}"
     );
 }
 
-/// The `jj` the tests otherwise run, so a shim can delegate to it.
-fn which_jj() -> std::path::PathBuf {
+/// The `program` the tests otherwise run, so a shim can delegate to it.
+fn which(program: &str) -> std::path::PathBuf {
     let output = std::process::Command::new("sh")
-        .args(["-c", "command -v jj"])
+        .args(["-c", &format!("command -v {program}")])
         .output()
-        .expect("locate jj");
+        .expect("locate program");
     std::path::PathBuf::from(String::from_utf8_lossy(&output.stdout).trim())
 }
 
@@ -851,7 +901,7 @@ fn status_outside_any_checkout_sweeps_every_entry_through_the_scan() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(output.status.code(), Some(3), "{stdout}\n{stderr}");
+    assert_eq!(output.status.code(), Some(0), "{stdout}\n{stderr}");
     assert!(stdout.contains("demo"), "{stdout}\n{stderr}");
     // The scan placed the checkout: the row was gathered, not refused, and
     // carries the checkout's origin note.
@@ -859,45 +909,36 @@ fn status_outside_any_checkout_sweeps_every_entry_through_the_scan() {
         stdout.contains("origin remote is "),
         "a gathered row carries the checkout's origin note:\n{stdout}\n{stderr}"
     );
-    // The entry with no checkout is still a row, refused.
-    assert!(stdout.contains("ghost"), "{stdout}\n{stderr}");
-    assert!(
-        stdout.contains("could not gather: no checkout of ghost under"),
-        "{stdout}\n{stderr}"
-    );
+    // The entry with no checkout is not on this machine: noted once, not a row.
+    assert!(!stdout.contains("ghost"), "{stdout}\n{stderr}");
     assert_eq!(
-        stdout.matches("could not gather").count(),
+        stderr
+            .lines()
+            .filter(|line| *line == "knives: ghost: not on this machine")
+            .count(),
         1,
-        "only the ghost row is refused:\n{stdout}"
+        "{stderr}"
     );
+    assert!(!stdout.contains("could not gather"), "{stdout}");
 }
 
 #[test]
-fn status_json_outside_any_checkout_carries_the_unplaced_row_as_a_problem() {
+fn status_json_all_leaves_the_absent_entry_out_of_the_document() {
     let lab = lab::Lab::new();
     let (home, _consumer) = home_with_a_ghost(&lab);
     let output = knives_outside(
         &lab,
         &home,
-        &["--json", "status", "--no-landed", "--no-github"],
+        &["--json", "status", "--all", "--no-landed", "--no-github"],
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(output.status.code(), Some(3), "{stdout}\n{stderr}");
+    assert_eq!(output.status.code(), Some(0), "{stdout}\n{stderr}");
     let reports: serde_json::Value = serde_json::from_str(&stdout).expect("json document");
     let reports = reports.as_array().expect("one document per repository");
-    let ghost = reports
-        .iter()
-        .find(|report| report["repo"] == "ghost")
-        .expect("a ghost row");
-    let problems = ghost["problems"].as_array().expect("problems array");
-    assert_eq!(problems.len(), 1, "{ghost}");
     assert!(
-        problems[0]
-            .as_str()
-            .expect("text")
-            .contains("could not gather: no checkout of ghost under"),
-        "{ghost}"
+        reports.iter().all(|report| report["repo"] != "ghost"),
+        "{stdout}"
     );
     let demo = reports
         .iter()
@@ -907,25 +948,84 @@ fn status_json_outside_any_checkout_carries_the_unplaced_row_as_a_problem() {
         demo["problems"].as_array().is_none_or(Vec::is_empty),
         "{demo}"
     );
+    assert!(
+        stderr.contains("knives: ghost: not on this machine"),
+        "{stderr}"
+    );
 }
 
 #[test]
-fn sync_all_outside_any_checkout_reports_the_unplaced_entry_and_syncs_the_rest() {
+fn sync_all_with_an_entry_absent_on_this_machine_exits_zero_and_notes_it_on_stderr() {
     let lab = lab::Lab::new();
     let (home, _consumer) = home_with_a_ghost(&lab);
     let output = knives_outside(&lab, &home, &["--text", "sync", "--all", "--no-github"]);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(output.status.code(), Some(3), "{stdout}\n{stderr}");
+    assert_eq!(output.status.code(), Some(0), "{stdout}\n{stderr}");
     assert!(stdout.contains("demo"), "{stdout}\n{stderr}");
+    assert!(!stdout.contains("ghost"), "{stdout}\n{stderr}");
     assert!(
-        stdout.contains("could not gather: no checkout of ghost under"),
-        "{stdout}\n{stderr}"
+        stderr.contains("knives: ghost: not on this machine"),
+        "{stderr}"
     );
 }
 
 #[test]
-fn a_sweep_says_once_what_the_scan_could_not_read_even_when_every_entry_is_found() {
+fn a_sweep_keeps_an_absent_entry_as_a_row_when_the_scan_could_not_read_a_checkout() {
+    // The checkout the scan could not read may be the absent entry's, so the
+    // entry is not waved off as absent: it stays a refused row, exit 3.
+    let lab = lab::Lab::new();
+    let (home, _consumer) = home_with_a_ghost(&lab);
+    let broken = lab.temp_path().join("broken");
+    std::fs::create_dir_all(broken.join(".jj").join("repo")).expect("empty store");
+    let output = knives_outside(
+        &lab,
+        &home,
+        &["--text", "status", "--all", "--no-landed", "--no-github"],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(3), "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("could not gather: no checkout of ghost under"),
+        "{stdout}\n{stderr}"
+    );
+    assert!(!stderr.contains("not on this machine"), "{stderr}");
+    assert!(
+        stderr.contains("could not read: reading remotes of"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn a_named_verb_from_a_broken_cwd_answers_about_the_named_repo() {
+    // Standing in a `.jj` with no store: the verb was asked about `demo`, and
+    // the cwd's unreadable remotes are not its answer.
+    let lab = lab::Lab::new();
+    let (home, _consumer) = lab::release_test_home(&lab);
+    let broken = lab.temp_path().join("broken-cwd");
+    std::fs::create_dir_all(broken.join(".jj")).expect("bare .jj");
+    let output = lab::knives_command(
+        &broken,
+        home.path(),
+        lab.temp_path(),
+        &["--text", "status", "demo", "--no-landed", "--no-github"],
+    )
+    .output()
+    .expect("run knives");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        matches!(output.status.code(), Some(0 | 1)),
+        "{stdout}\n{stderr}"
+    );
+    assert!(stdout.contains("demo"), "{stdout}\n{stderr}");
+    assert!(!stderr.contains("reading remotes of"), "{stderr}");
+    assert!(!stderr.contains("broken-cwd"), "{stderr}");
+}
+
+#[test]
+fn a_sweep_says_nothing_about_an_unreadable_stranger_when_every_entry_is_found() {
     let lab = lab::Lab::new();
     let (home, _consumer) = lab::release_test_home(&lab);
     let broken = lab.temp_path().join("broken");
@@ -937,13 +1037,9 @@ fn a_sweep_says_once_what_the_scan_could_not_read_even_when_every_entry_is_found
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stdout}\n{stderr}");
     assert!(stdout.contains("demo"), "{stdout}\n{stderr}");
-    assert!(
-        stderr.contains("could not read: reading remotes of"),
-        "{stderr}"
-    );
-    assert!(stderr.contains("broken"), "{stderr}");
-    assert_eq!(stderr.matches("could not read").count(), 1, "{stderr}");
-    // The document is still the document.
-    assert!(!stdout.contains("could not read"), "{stdout}");
+    assert!(!stderr.contains("could not read"), "{stderr}");
+    assert!(!stderr.contains("broken"), "{stderr}");
+    assert!(!stdout.contains("broken"), "{stdout}");
 }

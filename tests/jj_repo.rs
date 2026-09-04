@@ -53,7 +53,6 @@ fn a_jj_workspace_beside_a_registered_repo_resolves_that_repo() {
     };
 
     let bound = knives::bind::here(&registry, &workspace)
-        .expect("read remotes")
         .expect("the workspace binds to its checkout's entry");
     assert_eq!(bound.name, knives::ids::RepoName::new("demo"));
     assert_eq!(
@@ -62,7 +61,7 @@ fn a_jj_workspace_beside_a_registered_repo_resolves_that_repo() {
     );
     let unrelated = tempfile::tempdir().expect("unrelated directory");
     assert_eq!(
-        knives::bind::here(&registry, unrelated.path()).expect("no remotes to read"),
+        knives::bind::here(&registry, unrelated.path()),
         Err(knives::bind::Unbound::NotInsideARepository)
     );
 }

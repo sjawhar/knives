@@ -24,7 +24,9 @@ cut, and, where consumer slugs are recorded, whether their repository trunks are
 the newest cut. Every entry is a row whether or not a checkout was found: one the scan did not
 place reads `not on this machine` and has no release state; one found twice reads `ambiguous: 2
 checkouts` with a problem naming both paths. A checkout the scan could not read is a `?` line on
-the listing itself. Either leaves the command incomplete: exit `3`.
+the listing itself while some entry is not on this machine — it may be that entry's checkout —
+and is dropped once every entry is placed. An ambiguous entry or a `?` line leaves the command
+incomplete: exit `3`.
 
 Registered consumers are fetched by forge slug: Knives reads supported pin files at the consumer
 repository's trunk and caches the result by its commit. When the forge is down, cache-backed pins
@@ -459,10 +461,14 @@ look below a jj checkout — a plain git repository is not a checkout and does n
 beneath it. A checkout deeper than three directories under `~`, or outside `~`, is not found by
 the scan but binds as soon as you stand inside it — for every command except `knives repos`,
 which only scans, so it lists such a checkout as `not on this machine` even when run from inside
-it. A checkout the scan could not read (a `.jj/repo` jj cannot open, a directory it cannot list)
-is never dropped: a named repository's refusal ends `; could not read: <what>`, `knives repos`
-lists it as a `?` problem, and a sweep (`status --all`, `sync --all`, `audit --all`) says
-`could not read: <what>` once on stderr, whatever the output format. `HOME` must be set: the
+it. A checkout whose remotes the scan could not read is named while some entry is still
+unplaced, since it may be that entry's checkout: a named repository's refusal ends
+`; could not read: <what>`, `knives repos` lists it as a `?` problem, and a sweep (`status --all`,
+`sync --all`, `audit --all`) says `could not read: <what>` once on stderr, whatever the output
+format. Once every entry is placed, it is dropped; a directory the scan could not list is always
+reported the same way. A sweep leaves an
+entry that is `not on this machine` out of the document with one stderr line,
+`knives: <name>: not on this machine`, and exits as the entries it found did. `HOME` must be set: the
 scan refuses (`HOME is not set; knives scans $HOME for checkouts`, exit `2`) rather than scan `/`.
 
 ### Registry fields
@@ -486,7 +492,7 @@ scan refuses (`HOME is not set; knives scans $HOME for checkouts`, exit `2`) rat
   - `owners`: array of forge organization or user names; a checkout any of whose remotes belongs to one is trusted.
   - `roots`: array of directory paths; any repository inside these subtrees is trusted.
 
-> **SECURITY:** `repos` and `owners` match self-declared remote URLs read from the candidate checkout's own jj or git config — not forge-authenticated; any repo that declares itself a checkout of a trusted repository or owner (by remote URL or a `gitdir:` pointer) is accepted; remotes are read from the nearest repository root (a workspace's from the checkout its `.jj/repo` pointer names), so a directory nested inside a checkout cannot inherit the enclosing checkout's identity; a checkout that declares no remotes matches only via `roots`; grants guidance-as-data injection only, never fork-command access; prefer `roots` when in doubt.
+> **SECURITY:** `repos` and `owners` match self-declared remote URLs read from the candidate checkout's own git or jj configuration — not forge-authenticated; any repository that declares itself a checkout of a trusted repository or owner by remote URL is accepted. Remotes are read at the nearest repository root, by git when `.git` exists there and else by jj — never by following a `.jj/repo` pointer file to another checkout — so a directory nested inside a checkout cannot inherit the enclosing checkout's identity, and a tree that arrives by clone cannot borrow another checkout's identity either: the `.git` it arrives with names the remotes it was cloned from. VCS metadata written into a tree by other means is trusted as that VCS reports it. A checkout that declares no remotes matches only via `roots`; grants guidance-as-data injection only, never fork-command access; prefer `roots` when in doubt.
 
 No command writes `repos.toml`: `knives register` prints an entry and a human pastes it. Edits take effect on the next hook event or tool call (reloaded per event) — no restart required.
 

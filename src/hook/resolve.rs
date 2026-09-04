@@ -80,16 +80,12 @@ fn existing_ancestor(path: &Path) -> Option<&Path> {
 
 /// The first touched path inside a repository, and what the registry says about it.
 ///
-/// Both facts are decided from the remotes of the checkout the nearest root
-/// belongs to ([`bind::checkout_of_root`]). `remotes_of` is the (cached)
-/// reader, keyed by that checkout path; it returns `None` when remotes cannot
-/// be read — the caller has already reported why. A `roots` rule is decided
-/// from the path first, so it holds with no jj and no writable cache.
-pub fn match_checkout(
-    paths: &[PathBuf],
-    registry: &Registry,
-    remotes_of: &mut dyn FnMut(&Path) -> Option<BTreeMap<String, String>>,
-) -> Option<Match> {
+/// Both facts are decided from the remotes [`bind::remotes`] reads at the
+/// nearest root itself — never at a checkout a `.jj/repo` pointer names, since
+/// a clone can carry any pointer it likes. Remotes that cannot be read are
+/// reported on stderr and contribute no facts; a `roots` rule is decided from
+/// the path alone, so it holds with no readable repository at all.
+pub fn match_checkout(paths: &[PathBuf], registry: &Registry) -> Option<Match> {
     for path in paths {
         let Some(candidate) = canonical_path(path) else {
             continue;
@@ -101,8 +97,10 @@ pub fn match_checkout(
             continue;
         };
         let under_root = registry.trust.contains_root(&root);
-        let checkout = bind::checkout_of_root(&root);
-        let remotes = remotes_of(&checkout).unwrap_or_default();
+        let remotes = bind::remotes(&root).unwrap_or_else(|error| {
+            eprintln!("knives hook: {error}");
+            BTreeMap::new()
+        });
         let managed = remotes
             .get("upstream")
             .and_then(|upstream| bind::entry_for(registry, upstream))
@@ -172,20 +170,12 @@ fn canonical_existing_parent(path: &Path) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
 
     use crate::config::{Registry, RepoEntry, TrustRules};
     use crate::ids::RepoName;
 
-    use super::{Match, argument_paths, match_checkout};
-
-    fn remotes(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
-        pairs
-            .iter()
-            .map(|(name, url)| ((*name).to_owned(), (*url).to_owned()))
-            .collect()
-    }
+    use super::{argument_paths, match_checkout};
 
     fn registry(entries: &[(&str, &str)], trust: TrustRules) -> Registry {
         Registry {
@@ -225,26 +215,22 @@ mod tests {
         }
     }
 
-    /// A reader that answers every checkout with the same remotes and records
-    /// which checkouts it was asked about.
-    fn reader(
-        answer: Option<BTreeMap<String, String>>,
-        asked: &mut Vec<PathBuf>,
-    ) -> impl FnMut(&Path) -> Option<BTreeMap<String, String>> {
-        move |checkout: &Path| {
-            asked.push(checkout.to_owned());
-            answer.clone()
+    /// A git repository at `root` declaring `remotes`: what the hook reads.
+    fn git_repository(root: &Path, remotes: &[(&str, &str)]) {
+        std::fs::create_dir_all(root).unwrap();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        };
+        git(&["init", "--quiet"]);
+        for (name, url) in remotes {
+            git(&["remote", "add", name, url]);
         }
-    }
-
-    fn resolve(
-        paths: &[PathBuf],
-        registry: &Registry,
-        answer: Option<BTreeMap<String, String>>,
-    ) -> (Option<Match>, Vec<PathBuf>) {
-        let mut asked = Vec::new();
-        let matched = match_checkout(paths, registry, &mut reader(answer, &mut asked));
-        (matched, asked)
     }
 
     #[test]
@@ -311,49 +297,44 @@ mod tests {
 
     #[test]
     fn a_path_outside_every_repository_does_not_match() {
-        // Given: a repository and a sibling directory sharing its name as a prefix.
+        // Given: a trusted repository and a sibling directory sharing its name as a prefix.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("repo");
         let sibling = dir.path().join("repo-sibling/file");
-        std::fs::create_dir_all(root.join(".git")).unwrap();
+        git_repository(&root, &[("origin", "https://forge.invalid/ours/repo")]);
         std::fs::create_dir_all(sibling.parent().unwrap()).unwrap();
         std::fs::write(&sibling, b"x").unwrap();
         let registry = registry(&[], trusting_owner("ours"));
 
         // When: the sibling file is resolved.
-        let (matched, asked) = resolve(
-            &[sibling],
-            &registry,
-            Some(remotes(&[("origin", "https://forge.invalid/ours/repo")])),
-        );
+        let matched = match_checkout(&[sibling], &registry);
 
-        // Then: no marker above it, so no remotes are read and nothing matches.
+        // Then: no marker above it, so nothing matches.
         assert!(matched.is_none());
-        assert!(asked.is_empty());
     }
 
     #[test]
     fn the_nearest_repository_wins_for_nested_checkouts() {
-        // Given: an inner checkout nested in an outer checkout.
+        // Given: an inner checkout nested in an outer checkout, only the inner
+        // one under a trusted owner.
         let dir = tempfile::tempdir().unwrap();
         let outer = dir.path().join("outer");
         let inner = outer.join("inner");
-        std::fs::create_dir_all(outer.join(".git")).unwrap();
-        std::fs::create_dir_all(inner.join(".git")).unwrap();
+        git_repository(
+            &outer,
+            &[("origin", "https://forge.invalid/stranger/outer")],
+        );
+        git_repository(&inner, &[("origin", "https://forge.invalid/ours/inner")]);
         let registry = registry(&[], trusting_owner("ours"));
 
         // When: a nonexistent child of the inner checkout is resolved.
-        let (matched, asked) = resolve(
-            &[inner.join("file.txt")],
-            &registry,
-            Some(remotes(&[("origin", "https://forge.invalid/ours/inner")])),
-        );
+        let matched = match_checkout(&[inner.join("file.txt")], &registry);
 
-        // Then: the inner root is the match and the only checkout consulted.
+        // Then: the inner root is the match, judged by its own remotes.
         let matched = matched.unwrap();
         assert_eq!(matched.root, inner.canonicalize().unwrap());
         assert_eq!(matched.name(), "inner");
-        assert_eq!(asked, vec![inner.canonicalize().unwrap()]);
+        assert!(matched.trusted);
     }
 
     #[test]
@@ -361,15 +342,11 @@ mod tests {
         // Given: an existing root and a not-yet-created descendant.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("r");
-        std::fs::create_dir_all(root.join(".jj")).unwrap();
+        git_repository(&root, &[("origin", "https://forge.invalid/ours/r")]);
         let registry = registry(&[], trusting_owner("ours"));
 
         // When: the nonexistent descendant is resolved.
-        let (matched, _) = resolve(
-            &[root.join("not/yet/created.txt")],
-            &registry,
-            Some(remotes(&[("origin", "https://forge.invalid/ours/r")])),
-        );
+        let matched = match_checkout(&[root.join("not/yet/created.txt")], &registry);
 
         // Then: its existing parent identifies the root, and the leaf is kept.
         let matched = matched.unwrap();
@@ -383,26 +360,21 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_symlinked_path_that_escapes_the_root_is_outside() {
-        // Given: a symlink under the root that points to an outside directory.
+        // Given: a symlink under a trusted root that points to an outside directory.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("root");
         let outside = dir.path().join("outside");
-        std::fs::create_dir_all(root.join(".git")).unwrap();
+        git_repository(&root, &[("origin", "https://forge.invalid/ours/root")]);
         std::fs::create_dir_all(&outside).unwrap();
         std::fs::write(outside.join("file"), b"x").unwrap();
         std::os::unix::fs::symlink(&outside, root.join("escape")).unwrap();
         let registry = registry(&[], trusting_owner("ours"));
 
         // When: the file is named through the symlink.
-        let (matched, asked) = resolve(
-            &[root.join("escape/file")],
-            &registry,
-            Some(remotes(&[("origin", "https://forge.invalid/ours/root")])),
-        );
+        let matched = match_checkout(&[root.join("escape/file")], &registry);
 
         // Then: canonicalisation lands outside every repository.
         assert!(matched.is_none());
-        assert!(asked.is_empty());
     }
 
     #[test]
@@ -415,8 +387,8 @@ mod tests {
         std::fs::write(root.join("AGENTS.md"), "rules\n").unwrap();
         let registry = registry(&[], trusting_root(&dir.path().join("agent-c")));
 
-        // When: a file inside it is resolved and the remote reader has nothing.
-        let (matched, _) = resolve(&[root.join("AGENTS.md")], &registry, None);
+        // When: a file inside it is resolved.
+        let matched = match_checkout(&[root.join("AGENTS.md")], &registry);
 
         // Then: it is trusted, unmanaged, and named for its parent because the
         // leaf is `default`.
@@ -429,24 +401,29 @@ mod tests {
 
     #[test]
     fn a_repo_declaring_a_trusted_owner_is_trusted_through_its_remotes() {
-        // Given: an unregistered checkout whose origin names a trusted owner.
+        // Given: two unregistered clones, one whose origin names a trusted owner.
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("elsewhere/tool");
-        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let ours = dir.path().join("elsewhere/tool");
+        let theirs = dir.path().join("elsewhere/other");
+        git_repository(
+            &ours,
+            &[("origin", "https://forge.invalid/Someone/tool.git")],
+        );
+        git_repository(
+            &theirs,
+            &[("origin", "https://forge.invalid/stranger/tool")],
+        );
         let registry = registry(&[], trusting_owner("someone"));
-        let declared = remotes(&[("origin", "https://forge.invalid/Someone/tool.git")]);
 
-        // When: the candidate is resolved.
-        let (matched, asked) = resolve(&[root.join("src/lib.rs")], &registry, Some(declared));
+        // When: a file in each is resolved.
+        let matched = match_checkout(&[ours.join("src/lib.rs")], &registry);
+        let denied = match_checkout(&[theirs.join("src/lib.rs")], &registry);
 
-        // Then: the owner rule trusts this one repository root, read once.
+        // Then: the owner rule trusts the one repository root that declares it.
         let matched = matched.unwrap();
         assert!(matched.trusted);
         assert!(!matched.is_managed());
-        assert_eq!(asked, vec![root.canonicalize().unwrap()]);
-
-        let stranger = remotes(&[("origin", "https://forge.invalid/stranger/tool")]);
-        let (denied, _) = resolve(&[root.join("src/lib.rs")], &registry, Some(stranger));
+        assert_eq!(matched.root, ours.canonicalize().unwrap());
         assert!(denied.is_none());
     }
 
@@ -459,7 +436,7 @@ mod tests {
         let registry = registry(&[], trusting_root(&dir.path().join("agent-c")));
 
         // When: a file under the sibling is resolved.
-        let (matched, _) = resolve(&[outside.join("x")], &registry, None);
+        let matched = match_checkout(&[outside.join("x")], &registry);
 
         // Then: component containment rejects the string-prefix sibling.
         assert!(matched.is_none());
@@ -467,42 +444,40 @@ mod tests {
 
     #[test]
     fn managed_and_trusted_are_decided_independently() {
-        // Given: a registry entry and a trust rule that cover different remotes.
+        // Given: a registry entry and a trust rule that cover different remotes,
+        // and three clones: a fork under a stranger's account, the same fork
+        // pushed to our own account, and a clone of the maintained repository.
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("fork");
-        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let strangers = dir.path().join("strangers");
+        let ours = dir.path().join("ours");
+        let plain = dir.path().join("plain");
+        git_repository(
+            &strangers,
+            &[
+                ("upstream", "git@forge.invalid:Maintainer/tool.git"),
+                ("origin", "https://forge.invalid/stranger/tool"),
+            ],
+        );
+        git_repository(
+            &ours,
+            &[
+                ("upstream", "https://forge.invalid/maintainer/tool"),
+                ("origin", "https://forge.invalid/ours/tool"),
+            ],
+        );
+        git_repository(
+            &plain,
+            &[("origin", "https://forge.invalid/maintainer/tool")],
+        );
         let registry = registry(
             &[("tool", "https://forge.invalid/maintainer/tool")],
             trusting_owner("ours"),
         );
 
-        // When: the checkout forks the entry under a stranger's account.
-        let (managed_only, _) = resolve(
-            &[root.join("file")],
-            &registry,
-            Some(remotes(&[
-                ("upstream", "git@forge.invalid:Maintainer/tool.git"),
-                ("origin", "https://forge.invalid/stranger/tool"),
-            ])),
-        );
-        // And when: the same fork is pushed to our own account.
-        let (both, _) = resolve(
-            &[root.join("file")],
-            &registry,
-            Some(remotes(&[
-                ("upstream", "https://forge.invalid/maintainer/tool"),
-                ("origin", "https://forge.invalid/ours/tool"),
-            ])),
-        );
-        // And when: only `origin` points at the maintained repository.
-        let (neither, _) = resolve(
-            &[root.join("file")],
-            &registry,
-            Some(remotes(&[(
-                "origin",
-                "https://forge.invalid/maintainer/tool",
-            )])),
-        );
+        // When: a file in each is resolved.
+        let managed_only = match_checkout(&[strangers.join("file")], &registry);
+        let both = match_checkout(&[ours.join("file")], &registry);
+        let neither = match_checkout(&[plain.join("file")], &registry);
 
         // Then: identity is the upstream remote, trust is any remote, and
         // neither implies the other.
@@ -517,29 +492,26 @@ mod tests {
     }
 
     #[test]
-    fn a_workspace_is_its_own_root_but_reads_its_checkouts_remotes() {
-        // Given: a checkout and a jj workspace whose `.jj/repo` points back at it.
+    fn a_forged_pointer_does_not_borrow_the_checkouts_remotes() {
+        // Given: a trusted clone, and a tree beside it whose `.jj/repo` file
+        // names that clone's store — what a `git clone` of an attacker's
+        // repository would materialise — with no `.git` of its own.
         let dir = tempfile::tempdir().unwrap();
         let checkout = dir.path().join("tool/default");
-        let workspace = dir.path().join("tool/feature");
+        let forged = dir.path().join("tool/forged");
+        git_repository(&checkout, &[("origin", "https://forge.invalid/ours/tool")]);
         std::fs::create_dir_all(checkout.join(".jj/repo")).unwrap();
-        std::fs::create_dir_all(workspace.join(".jj")).unwrap();
-        std::fs::write(workspace.join(".jj/repo"), "../../default/.jj/repo").unwrap();
-        std::fs::write(workspace.join("AGENTS.md"), "rules\n").unwrap();
+        std::fs::create_dir_all(forged.join(".jj")).unwrap();
+        std::fs::write(forged.join(".jj/repo"), "../../default/.jj/repo").unwrap();
+        std::fs::write(forged.join("AGENTS.md"), "rules\n").unwrap();
         let registry = registry(&[], trusting_owner("ours"));
 
-        // When: a file in the workspace is resolved.
-        let (matched, asked) = resolve(
-            &[workspace.join("AGENTS.md")],
-            &registry,
-            Some(remotes(&[("origin", "https://forge.invalid/ours/tool")])),
-        );
+        // When: a file in the forged tree is resolved.
+        let matched = match_checkout(&[forged.join("AGENTS.md")], &registry);
 
-        // Then: guidance walks the workspace; identity comes from the checkout.
-        let matched = matched.unwrap();
-        assert_eq!(matched.root, workspace.canonicalize().unwrap());
-        assert_eq!(matched.name(), "feature");
-        assert_eq!(asked, vec![checkout.canonicalize().unwrap()]);
+        // Then: the pointer is not followed; the tree has no remotes of its own
+        // and earns nothing.
+        assert!(matched.is_none(), "{matched:?}");
     }
 
     #[test]
@@ -551,10 +523,9 @@ mod tests {
         let registry = registry(&[], trusting_root(&dir.path().join("trusted")));
 
         // When: both the unrelated path and the trusted repository path are considered.
-        let (matched, _) = resolve(
+        let matched = match_checkout(
             &[dir.path().join("outside/missing"), root.join("AGENTS.md")],
             &registry,
-            None,
         );
 
         // Then: resolution continues until it finds the trusted repository.

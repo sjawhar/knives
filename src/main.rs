@@ -23,7 +23,7 @@ use std::process::ExitCode;
 
 use branch_verbs::{FinishOptions, run_depends, run_finish, run_track};
 use clap::Parser as _;
-use knives::bind::{BindError, Fork, Unbound};
+use knives::bind::{Fork, Unbound};
 use knives::cli::{Cli, Command, Exit, Output, ReleaseAction};
 use knives::commands::claim::{Identity, Resolved, current_identity, required};
 use knives::commands::{
@@ -289,19 +289,6 @@ fn dispatch() -> anyhow::Result<Exit> {
     }
 }
 
-/// `fork` when it is a jj checkout; `None` after saying why a git clone is not
-/// one. Fork verbs need jj; only the hook binds git-only clones.
-fn jj_only(fork: Fork<'_>) -> Option<Fork<'_>> {
-    if fork.checkout.is_jj() {
-        return Some(fork);
-    }
-    eprintln!(
-        "{} is a git clone, not a jj checkout; fork commands need jj",
-        fork.checkout.path.display()
-    );
-    None
-}
-
 /// The scan root, or `None` after saying that there is none (exit `Usage`).
 fn scan_home() -> Option<std::path::PathBuf> {
     let home = home_dir();
@@ -313,8 +300,8 @@ fn scan_home() -> Option<std::path::PathBuf> {
 
 /// The fork verbs' shared step, taken once per invocation by a verb that acts
 /// on a fork: the current directory bound against the registry, the sighting
-/// recorded from that bind, and who is acting resolved from it — one
-/// `jj git remote list` for all three and the verb. Either half may be an
+/// recorded from that bind, and who is acting resolved from it — one remotes
+/// read for all three and the verb. Either half may be an
 /// error; the arm that needs it reports it, so a sighting never fails a call
 /// and a verb that only reads never asks who is acting.
 fn grounded(
@@ -338,9 +325,9 @@ fn grounded(
 /// against it once.
 struct Ground<'a> {
     registry: &'a Registry,
-    /// Exactly what `bind::here` said, so the verb reports a refusal or an
-    /// unreadable checkout as it always has, without asking jj again.
-    here: Result<Result<Fork<'a>, Unbound>, BindError>,
+    /// Exactly what `bind::here` said, so the verb reports a refusal as it
+    /// always has, without asking the VCS again.
+    here: Result<Fork<'a>, Unbound>,
 }
 
 impl<'a> Ground<'a> {
@@ -353,48 +340,44 @@ impl<'a> Ground<'a> {
 
     /// The entry the current directory is inside, when it is inside one.
     fn bound(&self) -> Option<&RepoName> {
-        self.here
-            .as_ref()
-            .ok()?
-            .as_ref()
-            .ok()
-            .map(|fork| &fork.name)
+        self.here.as_ref().ok().map(|fork| &fork.name)
     }
 
     /// The fork `name` is: the current directory's when it is that entry, else
     /// the scan's; `None` after printing why not (exit `Usage`).
     ///
-    /// A `BindError` from the current directory's own repository propagates: a
-    /// checkout whose remotes cannot be read is an error to show, not a reason
-    /// to scan elsewhere.
-    fn named(self, name: &str) -> anyhow::Result<Option<Fork<'a>>> {
+    /// The current directory matters only when it bound to `name`. However it
+    /// failed to bind — outside a repository, a git clone, a checkout whose
+    /// remotes cannot be read — the verb was asked about `name`, and the scan
+    /// answers for it.
+    fn named(self, name: &str) -> Option<Fork<'a>> {
         let registry = self.registry;
         let name = RepoName::new(name);
-        let here = self.here?.ok();
-        let Some(home) = scan_home() else {
-            return Ok(None);
-        };
+        let here = self.here.ok();
+        let home = scan_home()?;
         match knives::bind::resolve(registry, &name, here, &home) {
-            Ok(fork) => Ok(jj_only(fork)),
+            Ok(fork) => Some(fork),
             Err(why) => {
                 eprintln!("{}", why.message(&name, registry));
-                Ok(None)
+                None
             }
         }
     }
 
     /// The single fork a verb acts on: named, or the one the current directory
-    /// is inside; `None` after printing why not (exit `Usage`).
+    /// is inside; `None` after printing why not (exit `Usage`). A current
+    /// directory whose remotes cannot be read is an error (exit `Incomplete`).
     ///
     /// Requiring the name on every command is absurd when you are inside the
     /// repository, and it was the loudest complaint about using this thing.
     fn one_fork(self, requested: Option<&str>) -> anyhow::Result<Option<Fork<'a>>> {
         if let Some(name) = requested {
-            return self.named(name);
+            return Ok(self.named(name));
         }
         let registry = self.registry;
-        match self.here? {
-            Ok(fork) => Ok(jj_only(fork)),
+        match self.here {
+            Ok(fork) => Ok(Some(fork)),
+            Err(Unbound::Unreadable(error)) => Err(error.into()),
             Err(unbound) => {
                 eprintln!("{}", unbound.message(registry));
                 Ok(None)
@@ -408,10 +391,12 @@ impl<'a> Ground<'a> {
     /// nearly always what you meant, and reporting on ten repositories at once
     /// is how `status` became unreadable. `--all` asks for all of them
     /// explicitly, and standing outside every managed repo also means all of
-    /// them, since there is nothing else it could mean. An entry the scan did
-    /// not find, or found twice, is still a row — rendered as a problem — and
-    /// nothing is opened for it. What the scan could not read is said once, on
-    /// stderr, whichever output format the document takes.
+    /// them, since there is nothing else it could mean. Standing in a git clone
+    /// is refused as every fork verb refuses it, and a checkout whose remotes
+    /// cannot be read is an error, not a reason to sweep. An entry the scan
+    /// found twice is still a row — rendered as a problem — and nothing is
+    /// opened for it. What the scan could not read is said once, on stderr,
+    /// whichever output format the document takes.
     fn selected(self, scope: Scope<'_>) -> anyhow::Result<Result<Vec<Selected<'a>>, Exit>> {
         let registry = self.registry;
         if registry.is_empty() {
@@ -423,15 +408,19 @@ impl<'a> Ground<'a> {
         }
         if let Some(name) = scope.requested {
             return Ok(self
-                .named(name)?
+                .named(name)
                 .map_or(Err(Exit::Usage), |fork| Ok(vec![Selected::Bound(fork)])));
         }
-        if !scope.all
-            && let Ok(fork) = self.here?
-        {
-            return Ok(
-                jj_only(fork).map_or(Err(Exit::Usage), |fork| Ok(vec![Selected::Bound(fork)]))
-            );
+        if !scope.all {
+            match self.here {
+                Ok(fork) => return Ok(Ok(vec![Selected::Bound(fork)])),
+                Err(Unbound::Unreadable(error)) => return Err(error.into()),
+                Err(unbound @ Unbound::GitOnly { .. }) => {
+                    eprintln!("{}", unbound.message(registry));
+                    return Ok(Err(Exit::Usage));
+                }
+                Err(_) => {}
+            }
         }
         let Some(home) = scan_home() else {
             return Ok(Err(Exit::Usage));
@@ -445,18 +434,24 @@ impl<'a> Ground<'a> {
 
     /// `sync` fetches and writes, so it never sweeps by accident: a name,
     /// `--all`, or the fork the current directory is inside; anything else is
-    /// `Usage`.
+    /// `Usage`, except a checkout whose remotes cannot be read, which is an
+    /// error.
     fn sync_targets(self, scope: Scope<'_>) -> anyhow::Result<Result<Vec<Selected<'a>>, Exit>> {
         if scope.requested.is_some() || scope.all {
             return self.selected(scope);
         }
-        if let Ok(fork) = self.here? {
-            return Ok(
-                jj_only(fork).map_or(Err(Exit::Usage), |fork| Ok(vec![Selected::Bound(fork)]))
-            );
+        match self.here {
+            Ok(fork) => Ok(Ok(vec![Selected::Bound(fork)])),
+            Err(Unbound::Unreadable(error)) => Err(error.into()),
+            Err(unbound @ Unbound::GitOnly { .. }) => {
+                eprintln!("{}", unbound.message(self.registry));
+                Ok(Err(Exit::Usage))
+            }
+            Err(_) => {
+                eprintln!("give a repo name, or --all");
+                Ok(Err(Exit::Usage))
+            }
         }
-        eprintln!("give a repo name, or --all");
-        Ok(Err(Exit::Usage))
     }
 }
 
@@ -654,8 +649,9 @@ fn scribe_for(fork: &Fork<'_>, identity: &Identity) -> Scribe {
 /// One registry entry as a many-repo verb sees it after the scan.
 enum Selected<'a> {
     Bound(Fork<'a>),
-    /// Not found, or found twice: still a row, never opened. `problem` is the
-    /// refusal; the scan's own complaints are reported once, not on every row.
+    /// Found twice, or not found while the scan could not read something that
+    /// may have been it: still a row, never opened. `problem` is the refusal;
+    /// the scan's own complaints are reported once, not on every row.
     Unplaced {
         name: RepoName,
         entry: &'a RepoEntry,
@@ -663,30 +659,37 @@ enum Selected<'a> {
     },
 }
 
-/// Every entry, bound through one scan of `home`, and what the scan could not
-/// read — drained from the scan first, so each unplaced row carries only its
-/// own refusal and the caller reports the problems once, whether or not every
+/// Every entry the scan of `home` placed, and what the scan could not read —
+/// drained from the scan first, so each unplaced row carries only its own
+/// refusal and the caller reports the problems once, whether or not every
 /// entry was found.
+///
+/// An entry with no checkout under `home` is not on this machine, which is
+/// not a problem with it: the registry is shared across machines that hold
+/// different subsets. It is noted once on stderr and left out. Unless the
+/// scan failed to read something — then the missing checkout may be the one
+/// it could not read, and the entry stays a row carrying that refusal.
 fn sweep<'a>(registry: &'a Registry, home: &std::path::Path) -> (Vec<Selected<'a>>, Vec<String>) {
     let mut scan = knives::bind::scan(registry, home);
     let problems = std::mem::take(&mut scan.problems);
     let selected = registry
         .repos
         .iter()
-        .map(|(name, entry)| {
+        .filter_map(|(name, entry)| {
             let name = RepoName::new(name.clone());
             if let Some(fork) = scan.found.remove(&name) {
-                return Selected::Bound(fork);
+                return Some(Selected::Bound(fork));
             }
-            let problem = format!(
-                "could not gather: {}",
-                scan.unplaced(&name).message(&name, registry)
-            );
-            Selected::Unplaced {
-                name,
+            let why = scan.unplaced(&name);
+            if matches!(why, knives::bind::Unresolved::Missing { .. }) && problems.is_empty() {
+                eprintln!("knives: {name}: not on this machine");
+                return None;
+            }
+            Some(Selected::Unplaced {
+                name: name.clone(),
                 entry,
-                problem,
-            }
+                problem: format!("could not gather: {}", why.message(&name, registry)),
+            })
         })
         .collect();
     (selected, problems)

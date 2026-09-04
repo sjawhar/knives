@@ -283,7 +283,7 @@ impl TrustRules {
     }
 
     /// Whether `roots` contains `root` (canonicalised, component-wise). Decided
-    /// from the path alone: it needs neither jj nor the remotes cache.
+    /// from the path alone: it needs no remotes.
     pub fn contains_root(&self, root: &Path) -> bool {
         // Trust roots are tilde-expanded at load but can be symlinked; compare
         // canonical paths when possible so a real checkout under one is not missed.
@@ -618,8 +618,8 @@ fn deleted_trusted_table(raw: &toml::Table) -> Option<String> {
         })
 }
 
-/// `path` left the registry: checkouts are found by their remotes. The first
-/// offending entry by name is reported, with what replaced the field.
+/// `path` left the registry: checkouts are found by their remotes. Every
+/// offending entry is named, by name, with what replaced the field.
 fn deleted_path_field(raw: &toml::Table) -> Option<String> {
     let repos = raw.get("repos").and_then(toml::Value::as_table)?;
     let mut names: Vec<&String> = repos
@@ -632,10 +632,15 @@ fn deleted_path_field(raw: &toml::Table) -> Option<String> {
         .map(|(name, _)| name)
         .collect();
     names.sort();
-    names.first().map(|name| {
+    (!names.is_empty()).then(|| {
+        let listed = names
+            .iter()
+            .map(|name| format!("[repos.{name}]"))
+            .collect::<Vec<_>>()
+            .join(", ");
         format!(
-            "[repos.{name}] path is no longer a registry field; delete it — knives finds \
-             checkouts by their remotes"
+            "{listed} path is no longer a registry field; delete it — knives finds checkouts \
+             by their remotes"
         )
     })
 }
@@ -993,6 +998,28 @@ release = "https://example.invalid/releases.git"
             ),
             "{error}"
         );
+    }
+
+    #[test]
+    fn every_entry_carrying_a_path_field_is_named_at_once() {
+        // Naming the first would take one load per entry to migrate a registry.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("repos.toml");
+        std::fs::write(
+            &path,
+            "[repos.zeta]\npath = \"~/z\"\nupstream = \"u1\"\norigin = \"o\"\n\n\
+             [repos.alpha]\npath = \"~/a\"\nupstream = \"u2\"\norigin = \"o\"\n\n\
+             [repos.clean]\nupstream = \"u3\"\norigin = \"o\"\n",
+        )
+        .unwrap();
+        let error = load(&path).unwrap_err().to_string();
+        assert!(
+            error.contains(
+                "[repos.alpha], [repos.zeta] path is no longer a registry field; delete it — knives finds checkouts by their remotes"
+            ),
+            "{error}"
+        );
+        assert!(!error.contains("[repos.clean]"), "{error}");
     }
 
     #[test]

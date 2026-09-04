@@ -1,10 +1,9 @@
 //! `knives hook`: harness adapters that never interrupt the calling session.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 
-use crate::bind;
 use crate::cli::{Exit, HookHarness};
 use crate::commands::claim::Identity;
 use crate::config::{GuidanceRoot, Registry, default_config_path, load};
@@ -16,7 +15,7 @@ use crate::hook::guidance::{
 };
 use crate::hook::opencode::{self, Event as OpenCodeEvent, EventKind as OpenCodeEventKind};
 use crate::hook::resolve::{Match, argument_paths, match_checkout};
-use crate::hook::state::{SessionState, remotes_stamp};
+use crate::hook::state::SessionState;
 use crate::ids::RepoName;
 use crate::store::{Store, default_state_path};
 
@@ -121,7 +120,7 @@ fn run_opencode() -> anyhow::Result<Option<String>> {
     let home = config_home();
     let response = match kind {
         OpenCodeEventKind::ToolExecuteAfter => opencode_tool_after(&event, &home),
-        OpenCodeEventKind::ChatSystem => opencode_chat_system(&event, &home),
+        OpenCodeEventKind::ChatSystem => opencode_chat_system(&event),
         OpenCodeEventKind::ShellEnv => opencode_shell_env(&event),
         OpenCodeEventKind::Compacting => opencode_compacting(&event, &home),
         OpenCodeEventKind::Other => opencode::empty_response().map_err(Into::into),
@@ -149,15 +148,11 @@ fn opencode_tool_after(event: &OpenCodeEvent, home: &Path) -> anyhow::Result<Str
     let Some(session_id) = event.session_id() else {
         return opencode::tool_response("").map_err(Into::into);
     };
-    let cache = Some((home, OPENCODE, session_id));
-    let Some((registry, matched)) = relevant_tool_match(
-        &ToolCall {
-            tool: event.tool(),
-            args: event.args(),
-            relevant: OPENCODE_RELEVANT_TOOLS,
-        },
-        cache,
-    )?
+    let Some((registry, matched)) = relevant_tool_match(&ToolCall {
+        tool: event.tool(),
+        args: event.args(),
+        relevant: OPENCODE_RELEVANT_TOOLS,
+    })?
     else {
         return opencode::tool_response("").map_err(Into::into);
     };
@@ -165,7 +160,7 @@ fn opencode_tool_after(event: &OpenCodeEvent, home: &Path) -> anyhow::Result<Str
         && let Some(cwd) = event.cwd()
     {
         crate::seen::record_observation(
-            standing_in(cwd, &registry, cache).as_ref(),
+            standing_in(cwd, &registry).as_ref(),
             Path::new(cwd),
             &Identity {
                 owner: session_id.to_owned(),
@@ -208,15 +203,12 @@ fn opencode_tool_after(event: &OpenCodeEvent, home: &Path) -> anyhow::Result<Str
     opencode::tool_response(&addition).map_err(Into::into)
 }
 
-fn opencode_chat_system(event: &OpenCodeEvent, home: &Path) -> anyhow::Result<String> {
+fn opencode_chat_system(event: &OpenCodeEvent) -> anyhow::Result<String> {
     let Some(directory) = event.directory() else {
         return opencode::system_response("", &[]).map_err(Into::into);
     };
     let registry = load(&default_config_path())?;
-    let cache = event
-        .session_id()
-        .map(|session_id| (home, OPENCODE, session_id));
-    let Some(matched) = match_with_trust(&[PathBuf::from(directory)], &registry, cache) else {
+    let Some(matched) = match_checkout(&[PathBuf::from(directory)], &registry) else {
         return opencode::system_response("", &[]).map_err(Into::into);
     };
     if !matched.trusted {
@@ -308,11 +300,7 @@ fn session_start(event: &Event, home: &Path) -> anyhow::Result<Option<String>> {
         return Ok(None);
     };
     let registry = load(&default_config_path())?;
-    let Some(matched) = match_with_trust(
-        &[PathBuf::from(cwd)],
-        &registry,
-        Some((home, CLAUDE_CODE, session_id)),
-    ) else {
+    let Some(matched) = match_checkout(&[PathBuf::from(cwd)], &registry) else {
         return Ok(None);
     };
     let Some(managed) = &matched.managed else {
@@ -347,15 +335,11 @@ fn post_tool_use(event: &Event, home: &Path) -> anyhow::Result<Option<String>> {
     let Some(session_id) = event.session_id() else {
         return Ok(None);
     };
-    let cache = Some((home, CLAUDE_CODE, session_id));
-    let Some((registry, matched)) = relevant_tool_match(
-        &ToolCall {
-            tool: event.tool_name(),
-            args: event.tool_input(),
-            relevant: RELEVANT_TOOLS,
-        },
-        cache,
-    )?
+    let Some((registry, matched)) = relevant_tool_match(&ToolCall {
+        tool: event.tool_name(),
+        args: event.tool_input(),
+        relevant: RELEVANT_TOOLS,
+    })?
     else {
         return Ok(None);
     };
@@ -363,7 +347,7 @@ fn post_tool_use(event: &Event, home: &Path) -> anyhow::Result<Option<String>> {
         && let Some(cwd) = event.cwd()
     {
         crate::seen::record_observation(
-            standing_in(cwd, &registry, cache).as_ref(),
+            standing_in(cwd, &registry).as_ref(),
             Path::new(cwd),
             &Identity {
                 owner: session_id.to_owned(),
@@ -436,10 +420,7 @@ struct ToolCall<'a> {
 /// The touched-path match for a relevant tool call, with the registry it was
 /// decided against — loaded only once there is a path to decide, so a pathless
 /// call never touches (or fails on) the registry.
-fn relevant_tool_match(
-    call: &ToolCall<'_>,
-    cache: Option<(&Path, &str, &str)>,
-) -> anyhow::Result<Option<(Registry, Match)>> {
+fn relevant_tool_match(call: &ToolCall<'_>) -> anyhow::Result<Option<(Registry, Match)>> {
     let Some(tool) = call.tool else {
         return Ok(None);
     };
@@ -454,64 +435,15 @@ fn relevant_tool_match(
         return Ok(None);
     }
     let registry = load(&default_config_path())?;
-    let matched = match_with_trust(&paths, &registry, cache);
+    let matched = match_checkout(&paths, &registry);
     Ok(matched.map(|matched| (registry, matched)))
 }
 
-/// The entry the event's working directory is inside, read through the same
-/// session cache as the touched path: what a sighting keys its workspace on.
-/// The touched path may be in another repository; the workspace is the cwd's.
-fn standing_in(
-    cwd: &str,
-    registry: &Registry,
-    cache: Option<(&Path, &str, &str)>,
-) -> Option<RepoName> {
-    match_with_trust(&[PathBuf::from(cwd)], registry, cache).and_then(|matched| matched.managed)
-}
-
-/// Resolve the touched paths, reading each checkout's remotes once per session
-/// — once per rewrite of the file they live in ([`remotes_stamp`]), so a
-/// `git remote add` after the first touch is seen on the next.
-///
-/// A read failure is reported on stderr once and cached as no remote facts for
-/// that checkout; a `[trust] roots` rule still applies. A cache write failure
-/// is reported on stderr too, and the match stands: the cache is a saving, not
-/// a condition.
-fn match_with_trust(
-    paths: &[PathBuf],
-    registry: &Registry,
-    cache: Option<(&Path, &str, &str)>,
-) -> Option<Match> {
-    let mut cache_error = None;
-    let mut remotes_of = |checkout: &Path| -> Option<BTreeMap<String, String>> {
-        let stamp = remotes_stamp(checkout);
-        if let Some((home, harness, session_id)) = cache
-            && let Some(cached) =
-                SessionState::load(home, harness, session_id).remotes(checkout, stamp)
-        {
-            return Some(cached.clone());
-        }
-        let remotes = match bind::remotes(checkout) {
-            Ok(remotes) => Some(remotes),
-            Err(error) => {
-                eprintln!("knives hook: {error}");
-                None
-            }
-        };
-        if let Some((home, harness, session_id)) = cache
-            && let Err(error) = SessionState::update(home, harness, session_id, |state| {
-                state.record_remotes(checkout, stamp, remotes.clone().unwrap_or_default());
-            })
-        {
-            cache_error = Some(error);
-        }
-        remotes
-    };
-    let matched = match_checkout(paths, registry, &mut remotes_of);
-    if let Some(error) = cache_error {
-        eprintln!("knives hook: {error:#}");
-    }
-    matched
+/// The entry the event's working directory is inside: what a sighting keys its
+/// workspace on. The touched path may be in another repository; the workspace
+/// is the cwd's.
+fn standing_in(cwd: &str, registry: &Registry) -> Option<RepoName> {
+    match_checkout(&[PathBuf::from(cwd)], registry).and_then(|matched| matched.managed)
 }
 
 /// What guidance and session state key on: the match's nearest root and name.
@@ -598,7 +530,3 @@ fn write_output(output: &str) -> anyhow::Result<()> {
     stdout.write_all(output.as_bytes())?;
     Ok(())
 }
-
-#[cfg(test)]
-#[path = "hook_regression_tests.rs"]
-mod regression_tests;

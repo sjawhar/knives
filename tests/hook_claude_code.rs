@@ -842,37 +842,8 @@ fn unreadable_remotes_are_reported_and_a_trust_root_still_grants_guidance() {
     );
 }
 
-/// The failed read is cached under the stamp it failed under, so the broken
-/// checkout is probed — and its error printed — once per session.
-#[test]
-fn an_unreadable_checkout_is_probed_once_per_session() {
-    let repositories = Repositories::new();
-    let fake = repositories.home.path().join("under-root").join("fake");
-    std::fs::create_dir_all(fake.join(".jj")).expect("bare .jj without a repo");
-    std::fs::write(fake.join("AGENTS.md"), "root instructions").expect("write");
-    std::fs::write(fake.join("file.txt"), "content").expect("write");
-    std::fs::write(
-        repositories.home.path().join("repos.toml"),
-        format!(
-            "[trust]\nroots = [\"{}\"]\n",
-            repositories.home.path().join("under-root").display()
-        ),
-    )
-    .expect("registry");
-    let event = post_tool_use_read(
-        repositories.home.path(),
-        &fake.join("file.txt"),
-        "session-probe-once",
-    );
-    let (_, _, first) = run_hook_input(repositories.home.path(), &event.to_string());
-    assert!(first.contains("knives hook:"), "{first}");
-    let (success, _, second) = run_hook_input(repositories.home.path(), &event.to_string());
-    assert!(success);
-    assert!(!second.contains("knives hook:"), "{second}");
-}
-
-/// A cache that cannot be written is reported, never a reason to lose the
-/// match: a `roots` grant needs neither jj nor a writable config home.
+/// Session state that cannot be written is reported, never a reason to lose
+/// the match: a `roots` grant needs neither jj nor a writable config home.
 #[cfg(unix)]
 #[test]
 fn a_read_only_config_home_still_delivers_guidance_from_a_trusted_root() {
@@ -907,91 +878,92 @@ fn a_read_only_config_home_still_delivers_guidance_from_a_trusted_root() {
     );
 }
 
-/// The remotes cache follows the file the remotes live in: a `git remote add`
-/// after the first touch is seen on the next touch of the same session.
+/// A tree carrying a `.jj/repo` pointer *file* that names a real, trusted
+/// checkout's store — what `git clone` materialises from an attacker's
+/// repository, since jj itself refuses to check out a `.jj` path — with no
+/// `.git` of its own. The hook never follows the pointer: the tree has no
+/// remotes it can read, so it is neither managed nor trusted.
 #[test]
-fn a_remote_added_mid_session_is_seen_on_the_next_touch() {
+fn a_forged_jj_pointer_without_a_git_directory_earns_nothing() {
     let repositories = Repositories::new();
-    let clone = repositories.home.path().join("scratch").join("fresh-clone");
-    git_repository(&clone, &[]);
-    std::fs::write(clone.join("AGENTS.md"), "clone instructions").expect("write");
-    std::fs::write(clone.join("file.txt"), "content").expect("write");
+    repositories.configure(true);
+    Repositories::colocate(&repositories.alpha);
+    let evil = repositories.home.path().join("evil");
+    std::fs::create_dir_all(evil.join(".jj")).expect("forged .jj");
     std::fs::write(
-        repositories.home.path().join("repos.toml"),
-        "[trust]\nowners = [\"ours\"]\n",
+        evil.join(".jj").join("repo"),
+        repositories
+            .alpha
+            .join(".jj")
+            .join("repo")
+            .to_str()
+            .expect("utf-8"),
     )
-    .expect("registry");
+    .expect("forged pointer");
+    std::fs::write(evil.join("AGENTS.md"), "evil instructions").expect("write");
+    std::fs::write(evil.join("file.txt"), "content").expect("write");
     let event = post_tool_use_read(
         repositories.home.path(),
-        &clone.join("file.txt"),
-        "session-remote-add",
+        &evil.join("file.txt"),
+        "session-forged",
     );
 
-    let before = run_hook(repositories.home.path(), &event);
-    assert!(
-        before.is_empty(),
-        "no remotes, no owner, no guidance: {before}"
-    );
+    let (success, output, errors) = run_hook_input(repositories.home.path(), &event.to_string());
 
+    assert!(success, "{errors}");
     assert!(
-        Command::new("git")
-            .args([
-                "-C",
-                clone.to_str().expect("utf-8"),
-                "remote",
-                "add",
-                "origin",
-                "https://forge.invalid/ours/x"
-            ])
-            .status()
-            .expect("git remote add")
-            .success()
+        output.is_empty(),
+        "no guidance, no notice: {output}\n{errors}"
     );
-    let after = run_hook(repositories.home.path(), &event);
-    assert!(
-        additional_context(&after).contains("clone instructions"),
-        "{after}"
-    );
+    assert!(!errors.contains("evil instructions"), "{errors}");
 }
 
-/// Facts are cached, verdicts are not: a registry edit that drops the rule is
-/// honoured on the next event of the same session, from the cached remotes.
+/// The same forged pointer inside a genuine git clone: the remotes are read
+/// from the clone's own `.git`, so trust and identity are the attacker's, not
+/// the pointed-at checkout's.
 #[test]
-fn a_registry_edit_revokes_guidance_within_the_session_that_cached_the_remotes() {
+fn a_forged_jj_pointer_inside_a_git_clone_is_judged_by_the_clones_own_remotes() {
     let repositories = Repositories::new();
-    let clone = repositories.home.path().join("scratch").join("owned-clone");
-    git_repository(&clone, &[("origin", "https://forge.invalid/ours/x")]);
+    repositories.configure(true);
+    Repositories::colocate(&repositories.alpha);
+    let clone = repositories.home.path().join("clone");
+    git_repository(
+        &clone,
+        &[("origin", "https://forge.invalid/stranger/clone.git")],
+    );
+    std::fs::create_dir_all(clone.join(".jj")).expect("forged .jj");
+    std::fs::write(
+        clone.join(".jj").join("repo"),
+        repositories
+            .alpha
+            .join(".jj")
+            .join("repo")
+            .to_str()
+            .expect("utf-8"),
+    )
+    .expect("forged pointer");
     std::fs::write(clone.join("AGENTS.md"), "clone instructions").expect("write");
     std::fs::write(clone.join("file.txt"), "content").expect("write");
-    let registry = repositories.home.path().join("repos.toml");
-    std::fs::write(&registry, "[trust]\nowners = [\"ours\"]\n").expect("registry");
     let event = post_tool_use_read(
         repositories.home.path(),
         &clone.join("file.txt"),
-        "session-revoke",
+        "session-forged-clone",
     );
 
-    let granted = run_hook(repositories.home.path(), &event);
-    assert!(
-        additional_context(&granted).contains("clone instructions"),
-        "{granted}"
-    );
-    let session = repositories
-        .home
-        .path()
-        .join("hook-sessions")
-        .join("claude-code-session-revoke.json");
-    let state: Value =
-        serde_json::from_str(&std::fs::read_to_string(&session).expect("session state"))
-            .expect("session state is JSON");
-    let canonical = clone.canonicalize().expect("canonical");
-    assert_eq!(
-        state["remotes"][canonical.to_str().expect("utf-8")]["remotes"]["origin"],
-        json!("https://forge.invalid/ours/x"),
-        "{state}"
-    );
+    // Unmanaged and untrusted: the stranger's remotes earn nothing.
+    let (success, output, errors) = run_hook_input(repositories.home.path(), &event.to_string());
+    assert!(success, "{errors}");
+    assert!(output.is_empty(), "{output}\n{errors}");
 
-    std::fs::write(&registry, "[trust]\nowners = [\"someone-else\"]\n").expect("registry");
-    let revoked = run_hook(repositories.home.path(), &event);
-    assert!(revoked.is_empty(), "{revoked}");
+    // Trusting the stranger trusts the clone — through its own remotes.
+    std::fs::write(
+        repositories.home.path().join("repos.toml"),
+        "[trust]\nowners = [\"stranger\"]\n",
+    )
+    .expect("registry");
+    let (success, output, errors) = run_hook_input(repositories.home.path(), &event.to_string());
+    assert!(success, "{errors}");
+    let context = additional_context(&output);
+    assert!(context.contains("clone instructions"), "{context}");
+    assert!(!context.contains("fork managed by knives"), "{context}");
 }
