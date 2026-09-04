@@ -8,7 +8,6 @@
 
 use knives::bind::Fork;
 use knives::cli::Exit;
-use knives::commands::claim::{Identity, Resolved, required};
 use knives::commands::release;
 use knives::forge::github::CliForge;
 use knives::ids::{ReleaseScheme, RepoName};
@@ -37,7 +36,7 @@ pub(crate) fn run_release(
     fork: &Fork<'_>,
     extra_consumers: &[&std::path::Path],
     invocation: &ReleaseInvocation,
-    identity: Resolved<'_>,
+    bound: Option<&RepoName>,
 ) -> anyhow::Result<Exit> {
     let repo = &fork.name;
     let entry = fork.entry;
@@ -70,8 +69,6 @@ pub(crate) fn run_release(
     }
 
     if let Some(name) = cut_name {
-        // A plan reads; only a cut writes the ledger and needs to know who did.
-        let identity = required(identity)?;
         let trunk_name = entry.upstream_trunk();
         let trunk = opened.resolve_commit(&trunk_name)?;
         if let Some(orphaned) = check_orphan_commits_before_cut(&opened, fork)?
@@ -166,7 +163,7 @@ pub(crate) fn run_release(
             recorded: recorded.as_ref(),
             check: &check,
         };
-        record_cut_event(fork, &completed, identity)?;
+        record_cut_event(fork, &completed, bound)?;
         worst = worst.worst(report_completed_cut(fork, &opened, &completed)?);
     }
     Ok(worst)
@@ -371,7 +368,7 @@ struct CompletedCut<'a> {
 fn record_cut_event(
     fork: &Fork<'_>,
     cut: &CompletedCut<'_>,
-    identity: &Identity,
+    bound: Option<&RepoName>,
 ) -> anyhow::Result<()> {
     let entry = fork.entry;
     let opened = knives::jj::Repo::open(&fork.checkout.path)?;
@@ -417,7 +414,7 @@ fn record_cut_event(
             recorded.members.len()
         )
     });
-    scribe_for(fork, identity).record(&Draft {
+    scribe_for(fork, bound)?.record(&Draft {
         subject: Some(cut.name),
         kind: Kind::Event,
         disposition: None,

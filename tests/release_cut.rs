@@ -288,14 +288,11 @@ fn fixed_previous_position_keeps_the_published_remote_after_a_local_cut() {
     lab.jj_work(["bookmark", "set", "integration", "-r", "@"]);
     lab.jj_work(["new"]);
     let entry = RepoEntry {
-        upstream: lab.upstream.display().to_string(),
-        origin: lab.work.display().to_string(),
-        base: None,
-        release: None,
         release_branch: Some("integration".to_owned()),
-        test_count_command: None,
-        consumers: Vec::new(),
-        workspaces: None,
+        ..RepoEntry::new(
+            lab.upstream.display().to_string(),
+            lab.work.display().to_string(),
+        )
     };
     let repo = Repo::open(&lab.work).expect("open after local cut");
     let local = repo

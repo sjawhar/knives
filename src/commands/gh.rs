@@ -1052,16 +1052,10 @@ mod tests {
     #[test]
     fn registry_roles_beat_literal_remote_names_during_target_resolution() {
         let host = DEFAULT_HOST;
-        let entry = crate::config::RepoEntry {
-            upstream: format!("git@{host}:registered/upstream"),
-            origin: format!("git@{host}:registered/origin"),
-            base: None,
-            release: None,
-            release_branch: None,
-            test_count_command: None,
-            consumers: vec![],
-            workspaces: None,
-        };
+        let entry = crate::config::RepoEntry::new(
+            format!("git@{host}:registered/upstream"),
+            format!("git@{host}:registered/origin"),
+        );
         let remotes = BTreeMap::from([
             (
                 "upstream".to_owned(),
@@ -1090,16 +1084,10 @@ mod tests {
         // Shim lines 151-164: a gh-resolved marker ends resolution even if its
         // named base remote can no longer produce a URL.
         let host = DEFAULT_HOST;
-        let entry = crate::config::RepoEntry {
-            upstream: format!("git@{host}:registered/upstream"),
-            origin: format!("git@{host}:registered/origin"),
-            base: None,
-            release: None,
-            release_branch: None,
-            test_count_command: None,
-            consumers: vec![],
-            workspaces: None,
-        };
+        let entry = crate::config::RepoEntry::new(
+            format!("git@{host}:registered/upstream"),
+            format!("git@{host}:registered/origin"),
+        );
         let remotes = BTreeMap::from([(
             "origin".to_owned(),
             format!("https://{host}/fallback/repository"),

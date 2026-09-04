@@ -155,6 +155,20 @@ pub struct RepoEntry {
 }
 
 impl RepoEntry {
+    /// An entry with the two required remotes and every option unset.
+    pub fn new(upstream: impl Into<String>, origin: impl Into<String>) -> Self {
+        Self {
+            upstream: upstream.into(),
+            origin: origin.into(),
+            base: None,
+            release: None,
+            release_branch: None,
+            test_count_command: None,
+            consumers: Vec::new(),
+            workspaces: None,
+        }
+    }
+
     /// The remote for a role. Total: every role resolves.
     pub fn remote(&self, role: Role) -> &str {
         match role {
@@ -274,12 +288,6 @@ pub struct TrustRules {
 impl TrustRules {
     pub const fn is_empty(&self) -> bool {
         self.repos.is_empty() && self.roots.is_empty() && self.owners.is_empty()
-    }
-
-    /// Whether these rules trust a checkout at `root` declaring `remotes`:
-    /// [`Self::contains_root`] or [`Self::grants_by_remotes`].
-    pub fn grants(&self, root: &Path, remotes: &BTreeMap<String, String>) -> bool {
-        self.contains_root(root) || self.grants_by_remotes(remotes)
     }
 
     /// Whether `roots` contains `root` (canonicalised, component-wise). Decided
@@ -931,7 +939,7 @@ release = "https://example.invalid/releases.git"
             "origin".to_owned(),
             "git@forge.example:company/tool.git".to_owned(),
         )]);
-        assert!(registry.trust.grants(Path::new("/anywhere"), &by_repo));
+        assert!(registry.trust.grants_by_remotes(&by_repo));
         let by_repo_with_git_suffix_configured = BTreeMap::from([(
             "origin".to_owned(),
             "https://forge.example/company/other".to_owned(),
@@ -939,18 +947,18 @@ release = "https://example.invalid/releases.git"
         assert!(
             registry
                 .trust
-                .grants(Path::new("/anywhere"), &by_repo_with_git_suffix_configured)
+                .grants_by_remotes(&by_repo_with_git_suffix_configured)
         );
         let other = BTreeMap::from([(
             "origin".to_owned(),
             "https://forge.example/company/third".to_owned(),
         )]);
-        assert!(!registry.trust.grants(Path::new("/anywhere"), &other));
+        assert!(!registry.trust.grants_by_remotes(&other));
         let by_owner = BTreeMap::from([(
             "upstream".to_owned(),
             "https://forge.example/someone/anything".to_owned(),
         )]);
-        assert!(registry.trust.grants(Path::new("/anywhere"), &by_owner));
+        assert!(registry.trust.grants_by_remotes(&by_owner));
     }
 
     #[test]

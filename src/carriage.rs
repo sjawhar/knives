@@ -858,14 +858,11 @@ mod tests {
     #[test]
     fn an_equal_release_url_keeps_origin_release_as_a_live_target() {
         let entry = RepoEntry {
-            upstream: "https://forge.invalid/up/demo.git".to_owned(),
-            origin: "https://forge.invalid/ours/demo.git".to_owned(),
-            base: None,
             release: Some("https://forge.invalid/ours/demo.git".to_owned()),
-            release_branch: None,
-            test_count_command: None,
-            consumers: Vec::new(),
-            workspaces: None,
+            ..RepoEntry::new(
+                "https://forge.invalid/up/demo.git",
+                "https://forge.invalid/ours/demo.git",
+            )
         };
         let origin_ref = remote("release/2026-08-30", "origin");
 

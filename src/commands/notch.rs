@@ -8,7 +8,7 @@
 
 use crate::bind::Fork;
 use crate::cli::Exit;
-use crate::commands::claim::{Resolved, required};
+use crate::commands::claim::current_identity;
 use crate::ids::{BranchName, BranchTarget, RepoName, short_id};
 use crate::ledger::{
     Draft, Entry, EntryClass, Filter, Kind, Ledger, LedgerError, Scribe, VerifyFlag,
@@ -56,8 +56,9 @@ pub enum Report {
 #[derive(Debug)]
 pub struct Request<'a> {
     pub fork: &'a Fork<'a>,
-    /// Who is writing, as dispatch resolved it; read only for a write.
-    pub identity: Resolved<'a>,
+    /// The entry the current directory is inside; a write derives its author
+    /// from it, a read never asks.
+    pub bound: Option<&'a RepoName>,
     pub subject: Option<&'a str>,
     /// Present for a write, absent for a read.
     pub message: Option<&'a str>,
@@ -325,8 +326,8 @@ pub fn run(request: &Request<'_>, output: crate::cli::Output) -> anyhow::Result<
                             ))
                         })
                 });
-            let identity = required(request.identity)?;
-            let scribe = Scribe::new(ledger, repo.clone(), path.clone(), identity.owner.clone());
+            let owner = current_identity(request.bound)?.owner;
+            let scribe = Scribe::new(ledger, repo.clone(), path.clone(), owner);
             let written = scribe.record(&Draft {
                 subject: request.subject,
                 kind: Kind::Note,
@@ -502,24 +503,11 @@ mod tests {
             })
             .expect("record note");
         let repo = RepoName::new("demo");
-        let entry = crate::config::RepoEntry {
-            upstream: String::new(),
-            origin: String::new(),
-            base: None,
-            release: None,
-            release_branch: None,
-            test_count_command: None,
-            consumers: Vec::new(),
-            workspaces: None,
-        };
+        let entry = crate::config::RepoEntry::new(String::new(), String::new());
         let fork = crate::bind::Fork::at("demo", &entry, directory.path());
-        let identity = crate::commands::claim::Identity {
-            owner: "reader".to_owned(),
-            kind: crate::store::OwnerKind::OsUser,
-        };
         let request = Request {
             fork: &fork,
-            identity: Ok(&identity),
+            bound: None,
             subject: Some("feat/alpha"),
             message: None,
             evidence: &[],

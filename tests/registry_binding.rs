@@ -18,20 +18,7 @@ use std::path::Path;
 use knives::bind::{self, BindError, Unbound, Unresolved};
 use knives::config::{Registry, RepoEntry};
 use knives::ids::RepoName;
-use lab::{git_repository, jj_checkout};
-
-fn entry(upstream: &str, origin: &str) -> RepoEntry {
-    RepoEntry {
-        upstream: upstream.to_owned(),
-        origin: origin.to_owned(),
-        base: None,
-        release: None,
-        release_branch: None,
-        test_count_command: None,
-        consumers: vec![],
-        workspaces: None,
-    }
-}
+use lab::{git_repository, jj_checkout, knives};
 
 fn registry(entries: &[(&str, RepoEntry)]) -> Registry {
     Registry {
@@ -115,7 +102,7 @@ fn here_binds_the_checkout_and_its_workspaces_to_their_entry() {
     let lab = lab::Lab::new();
     let registry = registry(&[(
         "demo",
-        entry(
+        RepoEntry::new(
             lab.upstream.to_str().expect("utf-8"),
             "https://forge.invalid/acme/work.git",
         ),
@@ -138,7 +125,6 @@ fn here_binds_the_checkout_and_its_workspaces_to_their_entry() {
         from_checkout.checkout.path,
         lab.work.canonicalize().expect("canonical")
     );
-    assert!(from_checkout.checkout.is_jj());
 
     let from_workspace = bind::here(&registry, &workspace).expect("bound");
     assert_eq!(from_workspace.checkout.path, from_checkout.checkout.path);
@@ -155,21 +141,21 @@ fn the_nearest_repository_wins_when_one_is_nested_inside_another() {
     let registry = registry(&[
         (
             "demo",
-            entry(
+            RepoEntry::new(
                 lab.upstream.to_str().expect("utf-8"),
                 "https://forge.invalid/acme/work.git",
             ),
         ),
         (
             "dep",
-            entry(
+            RepoEntry::new(
                 "https://forge.invalid/org/dep",
                 "https://forge.invalid/acme/dep",
             ),
         ),
         (
             "tool",
-            entry(
+            RepoEntry::new(
                 "https://forge.invalid/org/tool",
                 "https://forge.invalid/acme/tool",
             ),
@@ -194,7 +180,7 @@ fn here_refuses_outside_a_repository_without_upstream_and_when_unregistered() {
     let lab = lab::Lab::new();
     let registry = registry(&[(
         "demo",
-        entry(
+        RepoEntry::new(
             "https://forge.invalid/org/elsewhere",
             "https://forge.invalid/acme/elsewhere",
         ),
@@ -270,42 +256,42 @@ fn scan_finds_each_entry_once_skips_workspaces_dot_directories_symlinks_and_dept
     let registry = registry(&[
         (
             "tool",
-            entry(
+            RepoEntry::new(
                 "https://forge.invalid/org/tool",
                 "https://forge.invalid/acme/tool",
             ),
         ),
         (
             "plain",
-            entry(
+            RepoEntry::new(
                 "https://forge.invalid/org/plain",
                 "https://forge.invalid/acme/plain",
             ),
         ),
         (
             "work",
-            entry(
+            RepoEntry::new(
                 lab.upstream.to_str().expect("utf-8"),
                 "https://forge.invalid/acme/work.git",
             ),
         ),
         (
             "hidden",
-            entry(
+            RepoEntry::new(
                 "https://forge.invalid/org/hidden",
                 "https://forge.invalid/acme/hidden",
             ),
         ),
         (
             "too-deep",
-            entry(
+            RepoEntry::new(
                 "https://forge.invalid/org/too-deep",
                 "https://forge.invalid/acme/too-deep",
             ),
         ),
         (
             "linked",
-            entry(
+            RepoEntry::new(
                 "https://forge.invalid/org/linked",
                 "https://forge.invalid/acme/linked",
             ),
@@ -351,7 +337,7 @@ fn scan_descends_through_a_git_tracked_parent() {
     jj_checkout(&checkout, &[("upstream", "https://forge.invalid/org/tool")]);
     let registry = registry(&[(
         "tool",
-        entry(
+        RepoEntry::new(
             "https://forge.invalid/org/tool",
             "https://forge.invalid/acme/tool",
         ),
@@ -379,7 +365,7 @@ fn scan_refuses_to_choose_between_two_checkouts_of_one_entry() {
     jj_checkout(&second, &[("upstream", "https://forge.invalid/org/tool")]);
     let registry = registry(&[(
         "tool",
-        entry(
+        RepoEntry::new(
             "https://forge.invalid/org/tool",
             "https://forge.invalid/acme/tool",
         ),
@@ -408,7 +394,7 @@ fn scan_descends_from_a_home_that_is_itself_a_repository() {
     jj_checkout(&checkout, &[("upstream", "https://forge.invalid/org/tool")]);
     let registry = registry(&[(
         "tool",
-        entry(
+        RepoEntry::new(
             "https://forge.invalid/org/tool",
             "https://forge.invalid/acme/tool",
         ),
@@ -444,14 +430,14 @@ fn scan_names_a_checkout_whose_remotes_it_could_not_read_while_an_entry_is_unpla
     let registry = registry(&[
         (
             "tool",
-            entry(
+            RepoEntry::new(
                 "https://forge.invalid/org/tool",
                 "https://forge.invalid/acme/tool",
             ),
         ),
         (
             "ghost",
-            entry(
+            RepoEntry::new(
                 "https://forge.invalid/org/ghost",
                 "https://forge.invalid/acme/ghost",
             ),
@@ -471,7 +457,7 @@ fn scan_names_a_checkout_whose_remotes_it_could_not_read_while_an_entry_is_unpla
     );
     // One line: jj's error, not its hints.
     assert!(!scan.problems[0].contains('\n'), "{:?}", scan.problems);
-    let why = scan.unplaced(&RepoName::new("ghost"));
+    let why = bind::resolve(&registry, &RepoName::new("ghost"), None, &home).expect_err("unplaced");
     assert!(
         why.message(&RepoName::new("ghost"), &registry)
             .contains("; could not read: reading remotes of"),
@@ -502,14 +488,14 @@ fn scan_drops_an_unreadable_stranger_once_every_entry_is_placed() {
     let registry = registry(&[
         (
             "tool",
-            entry(
+            RepoEntry::new(
                 "https://forge.invalid/org/tool",
                 "https://forge.invalid/acme/tool",
             ),
         ),
         (
             "twice",
-            entry(
+            RepoEntry::new(
                 "https://forge.invalid/org/twice",
                 "https://forge.invalid/acme/twice",
             ),
@@ -536,21 +522,21 @@ fn resolve_prefers_the_bound_directory_then_the_scan_then_says_why_not() {
     let registry = registry(&[
         (
             "demo",
-            entry(
+            RepoEntry::new(
                 lab.upstream.to_str().expect("utf-8"),
                 "https://forge.invalid/acme/work.git",
             ),
         ),
         (
             "elsewhere",
-            entry(
+            RepoEntry::new(
                 "https://forge.invalid/org/elsewhere",
                 "https://forge.invalid/acme/elsewhere",
             ),
         ),
         (
             "absent",
-            entry(
+            RepoEntry::new(
                 "https://forge.invalid/org/absent",
                 "https://forge.invalid/acme/absent",
             ),
@@ -597,7 +583,7 @@ fn a_repository_whose_remotes_cannot_be_read_is_an_error_naming_the_directory() 
     let lab = lab::Lab::new();
     let registry = registry(&[(
         "tool",
-        entry(
+        RepoEntry::new(
             "https://forge.invalid/org/tool",
             "https://forge.invalid/acme/tool",
         ),
@@ -634,7 +620,7 @@ fn a_workspace_whose_checkout_was_deleted_reports_its_vcs_s_own_error_about_the_
     let lab = lab::Lab::new();
     let registry = registry(&[(
         "demo",
-        entry(
+        RepoEntry::new(
             lab.upstream.to_str().expect("utf-8"),
             "https://forge.invalid/acme/work.git",
         ),
@@ -702,12 +688,6 @@ fn a_workspace_whose_checkout_was_deleted_reports_its_vcs_s_own_error_about_the_
     );
 }
 
-fn knives(lab: &lab::Lab, home: &tempfile::TempDir, args: &[&str]) -> std::process::Output {
-    lab::knives_command(&lab.work, home.path(), lab.temp_path(), args)
-        .output()
-        .expect("run knives")
-}
-
 fn knives_outside(lab: &lab::Lab, home: &tempfile::TempDir, args: &[&str]) -> std::process::Output {
     let outside = lab.temp_path().join("outside");
     std::fs::create_dir_all(&outside).expect("outside");
@@ -743,37 +723,6 @@ fn a_named_verb_whose_checkout_is_not_on_this_machine_exits_usage_and_says_so() 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("no checkout of ghost under"), "{stderr}");
     assert!(!stderr.contains("known:"), "{stderr}");
-}
-
-#[test]
-fn a_named_verb_names_what_the_scan_could_not_read_beside_the_missing_checkout() {
-    // A broken checkout under home may be the one the entry wanted; the
-    // refusal says so instead of dropping it.
-    let lab = lab::Lab::new();
-    let home = tempfile::tempdir().expect("config home");
-    std::fs::write(
-        home.path().join("repos.toml"),
-        "[repos.ghost]\nupstream = \"https://forge.invalid/org/ghost\"\norigin = \"https://forge.invalid/acme/ghost\"\n",
-    )
-    .expect("registry");
-    let broken = lab.temp_path().join("broken");
-    std::fs::create_dir_all(broken.join(".jj").join("repo")).expect("empty store");
-    let output = lab::knives_command(
-        lab.temp_path(),
-        home.path(),
-        lab.temp_path(),
-        &["--text", "notch", "--repo", "ghost"],
-    )
-    .output()
-    .expect("run knives");
-    assert_eq!(output.status.code(), Some(2));
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("no checkout of ghost under"), "{stderr}");
-    assert!(
-        stderr.contains("; could not read: reading remotes of"),
-        "{stderr}"
-    );
-    assert!(stderr.contains("broken"), "{stderr}");
 }
 
 #[test]
@@ -820,65 +769,6 @@ fn status_inside_a_registered_git_only_clone_refuses_as_every_fork_verb_does() {
         stderr.contains("is a git clone, not a jj checkout; fork commands need jj"),
         "{stderr}"
     );
-}
-
-#[test]
-fn a_named_status_from_inside_its_checkout_reads_the_remotes_once() {
-    // `Ground` binds the current directory once; `resolve` is handed that
-    // binding rather than asking the VCS a second time. The lab checkout is
-    // colocated, so its remotes come from git; counted through a `git` shim on
-    // PATH that logs every `config --get-regexp` before delegating.
-    let lab = lab::Lab::new();
-    let (home, _consumer) = lab::release_test_home(&lab);
-    let shim_dir = lab.temp_path().join("shim");
-    std::fs::create_dir_all(&shim_dir).expect("shim dir");
-    let log = lab.temp_path().join("git-calls.log");
-    let real_git = which("git");
-    let shim = shim_dir.join("git");
-    std::fs::write(
-        &shim,
-        format!(
-            "#!/bin/sh\ncase \"$*\" in *\"config --get-regexp\"*) echo \"$*\" >> '{}';; esac\nexec '{}' \"$@\"\n",
-            log.display(),
-            real_git.display()
-        ),
-    )
-    .expect("write shim");
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-    }
-    let path = format!(
-        "{}:{}",
-        shim_dir.display(),
-        std::env::var("PATH").unwrap_or_default()
-    );
-    let output = lab::knives_command(
-        &lab.work,
-        home.path(),
-        lab.temp_path(),
-        &["--text", "status", "demo", "--no-landed", "--no-github"],
-    )
-    .env("PATH", path)
-    .output()
-    .expect("run knives");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(output.status.code(), Some(0), "{stderr}");
-    let calls = std::fs::read_to_string(&log).unwrap_or_default();
-    assert_eq!(
-        calls.lines().count(),
-        1,
-        "the remotes were read more than once:\n{calls}"
-    );
-}
-
-/// The `program` the tests otherwise run, so a shim can delegate to it.
-fn which(program: &str) -> std::path::PathBuf {
-    let output = std::process::Command::new("sh")
-        .args(["-c", &format!("command -v {program}")])
-        .output()
-        .expect("locate program");
-    std::path::PathBuf::from(String::from_utf8_lossy(&output.stdout).trim())
 }
 
 #[test]

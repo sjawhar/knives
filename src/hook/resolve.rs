@@ -90,10 +90,7 @@ pub fn match_checkout(paths: &[PathBuf], registry: &Registry) -> Option<Match> {
         let Some(candidate) = canonical_path(path) else {
             continue;
         };
-        let Some(existing) = existing_ancestor(&candidate) else {
-            continue;
-        };
-        let Some(root) = bind::nearest_root(existing) else {
+        let Some(root) = existing_ancestor(&candidate).and_then(bind::nearest_root) else {
             continue;
         };
         let under_root = registry.trust.contains_root(&root);
@@ -184,16 +181,7 @@ mod tests {
                 .map(|(name, upstream)| {
                     (
                         (*name).to_owned(),
-                        RepoEntry {
-                            upstream: (*upstream).to_owned(),
-                            origin: "https://forge.invalid/ours/fork".to_owned(),
-                            base: None,
-                            release: None,
-                            release_branch: None,
-                            test_count_command: None,
-                            consumers: vec![],
-                            workspaces: None,
-                        },
+                        RepoEntry::new(*upstream, "https://forge.invalid/ours/fork"),
                     )
                 })
                 .collect(),

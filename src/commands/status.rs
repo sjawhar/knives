@@ -1296,16 +1296,7 @@ mod tests {
             branches: vec![BranchRow::bare(BranchName::new("feat/divergent"))],
             ..Report::default()
         };
-        let entry = RepoEntry {
-            upstream: String::new(),
-            origin: String::new(),
-            base: None,
-            release: None,
-            release_branch: None,
-            test_count_command: None,
-            consumers: Vec::new(),
-            workspaces: None,
-        };
+        let entry = RepoEntry::new(String::new(), String::new());
 
         let fork = Fork::at("demo", &entry, Path::new(""));
         let _ = add_branch_overlap_findings(&mut report, &mut Vec::new(), &fork, 1);
@@ -1328,16 +1319,7 @@ mod tests {
             branches: vec![row],
             ..Report::default()
         };
-        let entry = RepoEntry {
-            upstream: String::new(),
-            origin: String::new(),
-            base: None,
-            release: None,
-            release_branch: None,
-            test_count_command: None,
-            consumers: Vec::new(),
-            workspaces: None,
-        };
+        let entry = RepoEntry::new(String::new(), String::new());
 
         let fork = Fork::at("demo", &entry, scratch.path());
         let _ = add_branch_overlap_findings(&mut report, &mut Vec::new(), &fork, 1);

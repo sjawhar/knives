@@ -687,16 +687,10 @@ mod tests {
     }
 
     fn test_entry() -> RepoEntry {
-        RepoEntry {
-            upstream: "git@github.com:upstream/repo.git".to_owned(),
-            origin: "git@github.com:owner/fork.git".to_owned(),
-            base: None,
-            release: None,
-            release_branch: None,
-            test_count_command: None,
-            consumers: Vec::new(),
-            workspaces: None,
-        }
+        RepoEntry::new(
+            "git@github.com:upstream/repo.git",
+            "git@github.com:owner/fork.git",
+        )
     }
 
     fn test_pull(state: &str) -> PullRequest {
@@ -851,14 +845,11 @@ mod tests {
     #[test]
     fn an_equal_release_url_does_not_misplace_origin_release_refs() {
         let entry = RepoEntry {
-            upstream: "https://forge.invalid/up/demo.git".to_owned(),
-            origin: "https://forge.invalid/ours/demo.git".to_owned(),
-            base: None,
             release: Some("https://forge.invalid/ours/demo.git".to_owned()),
-            release_branch: None,
-            test_count_command: None,
-            consumers: Vec::new(),
-            workspaces: None,
+            ..RepoEntry::new(
+                "https://forge.invalid/up/demo.git",
+                "https://forge.invalid/ours/demo.git",
+            )
         };
         let mut report = Report {
             repo: "demo".to_owned(),
@@ -920,16 +911,10 @@ mod tests {
 
     #[test]
     fn open_pull_check_batches_the_open_owned_pull_before_comparing_positions() {
-        let entry = RepoEntry {
-            upstream: "git@github.com:upstream/repo.git".to_owned(),
-            origin: "git@github.com:owner/fork.git".to_owned(),
-            base: None,
-            release: None,
-            release_branch: None,
-            test_count_command: None,
-            consumers: Vec::new(),
-            workspaces: None,
-        };
+        let entry = RepoEntry::new(
+            "git@github.com:upstream/repo.git",
+            "git@github.com:owner/fork.git",
+        );
         let fork = Fork::at("demo", &entry, Path::new("/fake"));
         let forge = FakeForge {
             pull_requests: BTreeMap::from([(

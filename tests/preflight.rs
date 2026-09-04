@@ -22,14 +22,11 @@ fn preflight_reports_main_when_a_repo_configures_dev_as_its_trunk() {
     let lab = lab::Lab::new();
     lab.jj_work(["bookmark", "set", "dev", "-r", "main"]);
     let entry = RepoEntry {
-        upstream: lab.upstream.display().to_string(),
-        origin: lab.work.display().to_string(),
         base: Some("dev".to_owned()),
-        release: None,
-        release_branch: None,
-        test_count_command: None,
-        consumers: Vec::new(),
-        workspaces: None,
+        ..RepoEntry::new(
+            lab.upstream.display().to_string(),
+            lab.work.display().to_string(),
+        )
     };
 
     // When: preflight collects locally maintained branches.
@@ -55,14 +52,11 @@ fn preflight_treats_a_fixed_release_branch_as_a_release_not_a_branch() {
     lab.jj_work(["bookmark", "set", "integration", "-r", "main"]);
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     let entry = RepoEntry {
-        upstream: lab.upstream.display().to_string(),
-        origin: lab.work.display().to_string(),
-        base: None,
-        release: None,
         release_branch: Some("integration".to_owned()),
-        test_count_command: None,
-        consumers: Vec::new(),
-        workspaces: None,
+        ..RepoEntry::new(
+            lab.upstream.display().to_string(),
+            lab.work.display().to_string(),
+        )
     };
 
     // When: preflight collects locally maintained branches.
@@ -88,14 +82,11 @@ fn preflight_hides_a_divergent_configured_trunk_bookmark() {
     lab.branch("dev", "dev.txt", "dev\n");
     lab.rewrite_in_both_clones("dev");
     let entry = RepoEntry {
-        upstream: lab.upstream.display().to_string(),
-        origin: lab.work.display().to_string(),
         base: Some("dev".to_owned()),
-        release: None,
-        release_branch: None,
-        test_count_command: None,
-        consumers: Vec::new(),
-        workspaces: None,
+        ..RepoEntry::new(
+            lab.upstream.display().to_string(),
+            lab.work.display().to_string(),
+        )
     };
 
     // When: preflight reads divergent bookmarks before regular branch tips.
@@ -122,16 +113,10 @@ fn preflight_flags_a_branch_whose_tip_is_divergent() {
     lab.push_branch("feat/alpha");
     lab.rewrite_in_both_clones("feat/alpha");
 
-    let entry = knives::config::RepoEntry {
-        upstream: lab.upstream.display().to_string(),
-        origin: lab.work.display().to_string(),
-        base: None,
-        release: None,
-        release_branch: None,
-        test_count_command: None,
-        consumers: Vec::new(),
-        workspaces: None,
-    };
+    let entry = knives::config::RepoEntry::new(
+        lab.upstream.display().to_string(),
+        lab.work.display().to_string(),
+    );
     let states =
         knives::commands::preflight::branch_states(&lab::lab_fork(&lab, "demo", &entry), &[])
             .expect("branch states");

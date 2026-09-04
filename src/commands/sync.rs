@@ -1058,16 +1058,10 @@ mod comment_activity_tests {
                 .unwrap()
                 .success()
         );
-        crate::config::RepoEntry {
-            upstream: origin.to_string_lossy().into_owned(),
-            origin: origin.to_string_lossy().into_owned(),
-            base: None,
-            release: None,
-            release_branch: None,
-            test_count_command: None,
-            consumers: Vec::new(),
-            workspaces: None,
-        }
+        crate::config::RepoEntry::new(
+            origin.to_string_lossy().into_owned(),
+            origin.to_string_lossy().into_owned(),
+        )
     }
 
     /// A scribe writing into the fixture's own directory. Every test that calls

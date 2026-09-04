@@ -132,16 +132,10 @@ fn sync_records_one_event_for_each_pull_request_that_moved() {
     let lab = lab::Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     let name = knives::ids::RepoName::new("demo");
-    let entry = RepoEntry {
-        upstream: lab.upstream.display().to_string(),
-        origin: lab.work.display().to_string(),
-        base: None,
-        release: None,
-        release_branch: None,
-        test_count_command: None,
-        consumers: Vec::new(),
-        workspaces: None,
-    };
+    let entry = RepoEntry::new(
+        lab.upstream.display().to_string(),
+        lab.work.display().to_string(),
+    );
     let fork = lab::lab_fork(&lab, "demo", &entry);
     let mut pull_requests = BTreeMap::new();
     for (number, branch, state) in [

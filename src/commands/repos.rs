@@ -12,7 +12,7 @@ use std::path::Path;
 
 use crate::bind::{Fork, Scan, Unresolved};
 use crate::cli::Exit;
-use crate::config::{NO_HOME, Registry, RepoEntry, Role, default_config_path, home_dir, load};
+use crate::config::{Registry, RepoEntry, Role, default_config_path};
 use crate::consumer_pins::{ConsumerHeadMemo, ConsumerPinSource, scan_consumer_slug_with_heads};
 use crate::ids::RepoName;
 use crate::ids::{BookmarkRef, BranchName, ReleaseScheme, RemoteName, is_our_release};
@@ -344,22 +344,14 @@ pub fn gather(input: &GatherInput<'_>) -> Report {
                 .then(|| entry.remote(Role::Release).to_owned());
             let repo_name = RepoName::new(name.as_str());
             let Some(fork) = scan.found.get(&repo_name) else {
-                let duplicates = scan.duplicates.get(&repo_name);
-                let problems = duplicates
-                    .map(|paths| {
-                        Unresolved::Duplicate {
-                            home: scan.home.clone(),
-                            paths: paths.clone(),
-                            problems: Vec::new(),
-                        }
-                        .message(&repo_name, registry)
-                    })
-                    .into_iter()
-                    .collect();
+                let problems = match scan.unplaced(&repo_name) {
+                    why @ Unresolved::Duplicate { .. } => vec![why.message(&repo_name, registry)],
+                    Unresolved::Missing { .. } | Unresolved::Unknown => Vec::new(),
+                };
                 return RepoRow {
                     name: name.clone(),
                     path: None,
-                    ambiguous: duplicates.map_or(0, Vec::len),
+                    ambiguous: scan.duplicates.get(&repo_name).map_or(0, Vec::len),
                     release_remote,
                     newest_release: None,
                     behind: None,
@@ -464,23 +456,17 @@ pub fn exit_for(report: &Report) -> Exit {
     }
 }
 
-pub fn run(output: crate::cli::Output) -> anyhow::Result<Exit> {
-    let path = default_config_path();
-    let registry = load(&path)?;
-    let Some(home) = home_dir() else {
-        eprintln!("{NO_HOME}");
-        return Ok(Exit::Usage);
-    };
-    let scan = crate::bind::scan(&registry, &home);
+pub fn run(registry: &Registry, home: &Path, output: crate::cli::Output) -> anyhow::Result<Exit> {
+    let scan = crate::bind::scan(registry, home);
     let releases = release_state(&scan);
     let forge = crate::forge::github::CliForge;
     let cache_root = crate::forge_cache::cache_root();
     let heads = ConsumerHeadMemo::default();
     let report = gather(&GatherInput {
-        registry: &registry,
+        registry,
         scan: &scan,
         releases: &releases,
-        config_path: &path,
+        config_path: &default_config_path(),
         forge: &forge,
         cache_root: cache_root.as_deref(),
         heads: &heads,
@@ -524,14 +510,8 @@ mod tests {
 
     fn entry(release: Option<&str>) -> RepoEntry {
         RepoEntry {
-            upstream: "u".to_owned(),
-            origin: "o".to_owned(),
-            base: None,
             release: release.map(ToOwned::to_owned),
-            release_branch: None,
-            test_count_command: None,
-            consumers: Vec::new(),
-            workspaces: None,
+            ..RepoEntry::new("u", "o")
         }
     }
 
@@ -775,14 +755,11 @@ mod tests {
         };
         let heads = ConsumerHeadMemo::default();
         let entry = RepoEntry {
-            upstream: "https://forge.invalid/up/sandbox-runner".to_owned(),
-            origin: "https://forge.invalid/o/sandbox-runner".to_owned(),
-            base: None,
-            release: None,
-            release_branch: None,
-            test_count_command: None,
             consumers: vec![current.to_owned(), behind.to_owned()],
-            workspaces: None,
+            ..RepoEntry::new(
+                "https://forge.invalid/up/sandbox-runner",
+                "https://forge.invalid/o/sandbox-runner",
+            )
         };
 
         let fork = Fork::at("sandbox-runner", &entry, &dir.path().join("repo"));
@@ -829,14 +806,12 @@ mod tests {
         };
         let heads = ConsumerHeadMemo::default();
         let entry = RepoEntry {
-            upstream: "https://forge.invalid/up/sandbox-runner".to_owned(),
-            origin: "https://forge.invalid/o/sandbox-runner".to_owned(),
-            base: None,
-            release: None,
             release_branch: Some("integration".to_owned()),
-            test_count_command: None,
             consumers: vec![consumer.to_owned()],
-            workspaces: None,
+            ..RepoEntry::new(
+                "https://forge.invalid/up/sandbox-runner",
+                "https://forge.invalid/o/sandbox-runner",
+            )
         };
 
         let fork = Fork::at("sandbox-runner", &entry, &dir.path().join("repo"));
@@ -872,14 +847,12 @@ mod tests {
         };
         let heads = ConsumerHeadMemo::default();
         let entry = RepoEntry {
-            upstream: "https://forge.invalid/up/sandbox-runner".to_owned(),
-            origin: "https://forge.invalid/o/sandbox-runner".to_owned(),
-            base: None,
-            release: None,
             release_branch: Some("integration".to_owned()),
-            test_count_command: None,
             consumers: vec![consumer.to_owned()],
-            workspaces: None,
+            ..RepoEntry::new(
+                "https://forge.invalid/up/sandbox-runner",
+                "https://forge.invalid/o/sandbox-runner",
+            )
         };
 
         let fork = Fork::at("sandbox-runner", &entry, &dir.path().join("repo"));
@@ -916,14 +889,12 @@ mod tests {
         };
         let heads = ConsumerHeadMemo::default();
         let entry = RepoEntry {
-            upstream: "https://forge.invalid/up/sandbox-runner".to_owned(),
-            origin: "https://forge.invalid/o/sandbox-runner".to_owned(),
-            base: None,
-            release: None,
             release_branch: Some("integration".to_owned()),
-            test_count_command: None,
             consumers: vec![consumer.to_owned()],
-            workspaces: None,
+            ..RepoEntry::new(
+                "https://forge.invalid/up/sandbox-runner",
+                "https://forge.invalid/o/sandbox-runner",
+            )
         };
         let registry = Registry {
             repos: BTreeMap::from([("sandbox-runner".to_owned(), entry)]),

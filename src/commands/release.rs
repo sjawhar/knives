@@ -2319,16 +2319,7 @@ mod members_tests {
             &["bookmark", "create", "release/2026-08-30", "-r", "@"],
         );
 
-        let entry = RepoEntry {
-            upstream: "upstream".to_owned(),
-            origin: "origin".to_owned(),
-            base: None,
-            release: None,
-            release_branch: None,
-            test_count_command: None,
-            consumers: Vec::new(),
-            workspaces: None,
-        };
+        let entry = RepoEntry::new("upstream", "origin");
         let fork = Fork::at("demo", &entry, &repository);
         let opened = Repo::open(&repository).expect("open test repository");
         let members =
@@ -2351,16 +2342,7 @@ mod members_tests {
             &["bookmark", "create", "release/2026-08-30", "-r", "@"],
         );
 
-        let entry = RepoEntry {
-            upstream: "upstream".to_owned(),
-            origin: "origin".to_owned(),
-            base: None,
-            release: None,
-            release_branch: None,
-            test_count_command: None,
-            consumers: Vec::new(),
-            workspaces: None,
-        };
+        let entry = RepoEntry::new("upstream", "origin");
         let fork = Fork::at("demo", &entry, &repository);
         let opened = Repo::open(&repository).expect("open test repository");
         let members =

@@ -19,20 +19,6 @@ pub struct Identity {
     pub kind: OwnerKind,
 }
 
-/// What dispatch's one identity resolution produced, lent to a verb that may
-/// or may not write.
-///
-/// A verb that only reads never looks at it; one about to write takes it
-/// through [`required`], so a state file that cannot be read stops a write and
-/// nothing else.
-pub type Resolved<'a> = Result<&'a Identity, &'a anyhow::Error>;
-
-/// The identity a write needs, or the resolution's error when that is what it
-/// produced.
-pub fn required(identity: Resolved<'_>) -> anyhow::Result<&Identity> {
-    identity.map_err(|error| anyhow::anyhow!("{error:#}"))
-}
-
 /// The inputs relevant to taking or resuming a claim.
 #[derive(Debug)]
 pub struct ClaimContext<'a> {

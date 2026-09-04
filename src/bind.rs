@@ -21,14 +21,6 @@ pub struct Checkout {
     pub remotes: BTreeMap<String, String>,
 }
 
-impl Checkout {
-    /// Whether this is a jj checkout (`.jj/repo` is a directory). Fork verbs need
-    /// one; the hook binds git-only clones too.
-    pub fn is_jj(&self) -> bool {
-        self.path.join(".jj").join("repo").is_dir()
-    }
-}
-
 /// A registry entry bound to the checkout that is it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Fork<'a> {
@@ -210,42 +202,53 @@ fn known(registry: &Registry) -> String {
 
 /// Whether two remote spellings name one repository.
 ///
-/// A value that parses as a remote URL with a host compares as (host without
-/// user, path without trailing `/` or `.git`), case-insensitively. A value that
-/// does not (a filesystem path, or a `file://` URL, whose authority is empty)
-/// compares as its trimmed text, so two directories that differ by `.git` stay
-/// two directories.
+/// A value that parses as a remote URL with a host compares as its
+/// [`host_and_path`], case-insensitively. A value that does not (a filesystem
+/// path, or a `file://` URL, whose authority is empty) compares as its trimmed
+/// text, so two directories that differ by `.git` stay two directories.
 pub fn same_remote(a: &str, b: &str) -> bool {
-    remote_key(a) == remote_key(b)
+    match (host_and_path(a), host_and_path(b)) {
+        (Some((host_a, path_a)), Some((host_b, path_b))) => {
+            host_a.eq_ignore_ascii_case(host_b) && path_a.eq_ignore_ascii_case(path_b)
+        }
+        (None, None) => a.trim().trim_end_matches('/') == b.trim().trim_end_matches('/'),
+        _ => false,
+    }
 }
 
-fn remote_key(remote: &str) -> String {
+/// `(host, path)` of a remote URL as spelled: the authority without its user
+/// or port, and the path without surrounding `/` or a `.git` suffix. `None`
+/// for a non-URL: a filesystem path, or a `file://` URL, whose authority is
+/// empty. scp form without a user, `host:path`, is a URL too when the part
+/// before the colon holds no `/`; a filesystem path with a colon in a later
+/// component stays a path.
+fn host_and_path(remote: &str) -> Option<(&str, &str)> {
     let trimmed = remote.trim().trim_end_matches('/');
-    // scp form without a user, `host:path`, is a URL too when the part before
-    // the colon holds no `/`; a filesystem path with a colon in a later component
-    // stays a path.
-    let parsed = remote_authority_and_path(trimmed).or_else(|| {
+    let (authority, path) = remote_authority_and_path(trimmed).or_else(|| {
         let (host, path) = trimmed.split_once(':')?;
         (!host.is_empty() && !host.contains('/')).then_some((host, path))
-    });
-    match parsed {
-        Some((authority, path)) if !authority.is_empty() => {
-            let host = authority.rsplit('@').next().unwrap_or(authority);
-            // `host:2222` is `host`: the port is how to reach it, not what it is.
-            let host = match host.rsplit_once(':') {
-                Some((name, port))
-                    if !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()) =>
-                {
-                    name
-                }
-                _ => host,
-            };
-            // Lowercase first, so `.GIT` is stripped like `.git`.
-            let path = path.trim_matches('/').to_ascii_lowercase();
-            let path = path.strip_suffix(".git").unwrap_or(&path);
-            format!("{}/{path}", host.to_ascii_lowercase())
+    })?;
+    if authority.is_empty() {
+        return None;
+    }
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    // `host:2222` is `host`: the port is how to reach it, not what it is.
+    let host = match host.rsplit_once(':') {
+        Some((name, port))
+            if !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()) =>
+        {
+            name
         }
-        _ => trimmed.to_owned(),
+        _ => host,
+    };
+    Some((host, without_git_suffix(path.trim_matches('/'))))
+}
+
+/// `path` without a trailing `.git` in any case.
+const fn without_git_suffix(path: &str) -> &str {
+    match path.split_at_checked(path.len().saturating_sub(4)) {
+        Some((stem, suffix)) if suffix.eq_ignore_ascii_case(".git") => stem,
+        _ => path,
     }
 }
 
@@ -269,6 +272,10 @@ pub fn remote_host(url: &str) -> Option<&str> {
 }
 
 /// The owner segment of an authority-delimited `<owner>/<repository>` remote path.
+///
+/// Unlike [`remote_slug`], an empty authority (`https:///owner/repo`) still
+/// yields its owner: this feeds heuristics that should stay conservative when a
+/// URL is odd, not identity, which needs a host.
 pub fn url_owner(url: &str) -> Option<&str> {
     let (_, path) = remote_authority_and_path(url)?;
     let (owner, repository) = path.split_once('/')?;
@@ -278,11 +285,17 @@ pub fn url_owner(url: &str) -> Option<&str> {
 /// The `owner/repo` path of a forge remote with trailing `/` and `.git` removed;
 /// `None` for a non-URL.
 pub fn remote_slug(url: &str) -> Option<&str> {
-    let (_, path) = remote_authority_and_path(url.trim().trim_end_matches('/'))?;
-    let path = path.trim_matches('/');
-    let path = path.strip_suffix(".git").unwrap_or(path);
+    let (_, path) = host_and_path(url)?;
     let (owner, repository) = path.split_once('/')?;
     (!owner.is_empty() && !repository.is_empty() && !repository.contains('/')).then_some(path)
+}
+
+/// The last path segment of a remote URL without `.git`: the repository's own
+/// name, whichever owner or forge holds it.
+pub fn repository_name(url: &str) -> Option<&str> {
+    let (_, repository) = url.trim_end_matches('/').rsplit_once('/')?;
+    let name = without_git_suffix(repository);
+    (!name.is_empty()).then_some(name)
 }
 
 /// The first ancestor of `path` (canonicalised) holding `.jj` or `.git`.
@@ -466,21 +479,20 @@ pub struct Scan<'a> {
 }
 
 impl Scan<'_> {
-    /// Why `name` is not in `found`: two checkouts, or none — with the scan's
-    /// problems attached, since one of them may be the checkout it wanted.
+    /// Why `name` is not in `found`: two checkouts, or none. The scan's own
+    /// problems are reported by the caller, once, not on every entry.
     pub fn unplaced(&self, name: &RepoName) -> Unresolved {
-        let problems = self.problems.clone();
-        match self.duplicates.get(name) {
-            Some(paths) => Unresolved::Duplicate {
+        self.duplicates.get(name).map_or_else(
+            || Unresolved::Missing {
+                home: self.home.clone(),
+                problems: Vec::new(),
+            },
+            |paths| Unresolved::Duplicate {
                 home: self.home.clone(),
                 paths: paths.clone(),
-                problems,
+                problems: Vec::new(),
             },
-            None => Unresolved::Missing {
-                home: self.home.clone(),
-                problems,
-            },
-        }
+        )
     }
 }
 
@@ -620,7 +632,8 @@ fn checkouts_under(home: &Path, problems: &mut Vec<String>) -> Vec<PathBuf> {
 ///
 /// `here` is the fork the current directory is inside, bound once by the
 /// caller; a directory that did not bind is `None`, and how it failed is the
-/// caller's to report.
+/// caller's to report. The scan's problems ride on the refusal: one of them
+/// may be the checkout `name` wanted.
 pub fn resolve<'a>(
     registry: &'a Registry,
     name: &RepoName,
@@ -639,7 +652,12 @@ pub fn resolve<'a>(
     if let Some(fork) = scan.found.remove(name) {
         return Ok(fork);
     }
-    Err(scan.unplaced(name))
+    let mut why = scan.unplaced(name);
+    if let Unresolved::Missing { problems, .. } | Unresolved::Duplicate { problems, .. } = &mut why
+    {
+        *problems = scan.problems;
+    }
+    Err(why)
 }
 
 #[cfg(test)]
@@ -651,20 +669,14 @@ mod tests {
     use crate::ids::RepoName;
 
     use super::{
-        BindError, Checkout, Fork, Scan, Unbound, Unresolved, error_line, remote_host, remote_slug,
-        same_remote, url_owner,
+        BindError, Checkout, Fork, Unbound, Unresolved, error_line, remote_host, remote_slug,
+        repository_name, same_remote, url_owner,
     };
 
     fn entry(upstream: &str, origin: &str, release: Option<&str>) -> RepoEntry {
         RepoEntry {
-            upstream: upstream.to_owned(),
-            origin: origin.to_owned(),
-            base: None,
             release: release.map(str::to_owned),
-            release_branch: None,
-            test_count_command: None,
-            consumers: vec![],
-            workspaces: None,
+            ..RepoEntry::new(upstream, origin)
         }
     }
 
@@ -777,6 +789,11 @@ mod tests {
         );
         assert_eq!(remote_host("https:///ours/work.git"), None);
         assert_eq!(remote_host("/tmp/lab/upstream"), None);
+        assert_eq!(
+            repository_name("https://forge.invalid/someone/Tool.GIT/"),
+            Some("Tool")
+        );
+        assert_eq!(repository_name("https://forge.invalid/someone/.git"), None);
     }
 
     #[test]
@@ -957,34 +974,30 @@ mod tests {
     }
 
     #[test]
-    fn an_unplaced_entry_carries_the_scan_problems_after_its_refusal() {
+    fn a_refusal_carries_the_scan_problems_after_its_text() {
         // A checkout whose remotes could not be read may be the one the entry
-        // wanted, so the refusal names it rather than dropping it.
-        let registry = Registry::default();
-        let scan = Scan {
+        // wanted, so `resolve` names it rather than dropping it.
+        let why = Unresolved::Missing {
             home: PathBuf::from("/home/x"),
-            duplicates: BTreeMap::from([(
-                RepoName::new("twice"),
-                vec![PathBuf::from("/home/x/a"), PathBuf::from("/home/x/b")],
-            )]),
             problems: vec![
                 "reading remotes of /home/x/broken: boom".to_owned(),
                 "cannot read /home/x/locked: denied".to_owned(),
             ],
-            ..Scan::default()
         };
         assert_eq!(
-            scan.unplaced(&RepoName::new("ghost"))
-                .message(&RepoName::new("ghost"), &registry),
+            why.message(&RepoName::new("ghost"), &Registry::default()),
             "no checkout of ghost under /home/x; could not read: reading remotes of \
              /home/x/broken: boom; could not read: cannot read /home/x/locked: denied"
         );
+        let twice = Unresolved::Duplicate {
+            home: PathBuf::from("/home/x"),
+            paths: vec![PathBuf::from("/home/x/a"), PathBuf::from("/home/x/b")],
+            problems: vec!["reading remotes of /home/x/broken: boom".to_owned()],
+        };
         assert_eq!(
-            scan.unplaced(&RepoName::new("twice"))
-                .message(&RepoName::new("twice"), &registry),
+            twice.message(&RepoName::new("twice"), &Registry::default()),
             "twice has 2 checkouts under /home/x: /home/x/a, /home/x/b; knives will not \
-             choose; could not read: reading remotes of /home/x/broken: boom; could not \
-             read: cannot read /home/x/locked: denied"
+             choose; could not read: reading remotes of /home/x/broken: boom"
         );
     }
 }

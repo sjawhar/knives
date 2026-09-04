@@ -7,13 +7,16 @@ use std::path::{Path, PathBuf};
 use crate::bind::Fork;
 use crate::cli::Exit;
 use crate::commands::claim::{
-    ClaimContext, ClaimDecision, Identity, decide, last_seen_provenance, render_claim_context,
+    ClaimContext, ClaimDecision, Identity, current_identity, decide, last_seen_provenance,
+    render_claim_context,
 };
 use crate::commands::release::shared_base;
 use crate::commands::wip::workspace_for;
 use crate::config::Role;
 use crate::detect::BookmarkTips;
-use crate::ids::{BookmarkRef, BranchName, BranchTarget, CommitId, RemoteName, WorkspaceName};
+use crate::ids::{
+    BookmarkRef, BranchName, BranchTarget, CommitId, RemoteName, RepoName, WorkspaceName,
+};
 use crate::jj::{
     Repo, WorkspaceIdentity, add_workspace, fetch_all, is_workspace_named, repo_immutable_heads,
     set_repo_immutable_heads, user_immutable_heads, workspace_identity,
@@ -106,32 +109,26 @@ struct StartContext<'a> {
     store: &'a mut Store,
     fork: &'a Fork<'a>,
     branch: &'a BranchName,
-    identity: &'a Identity,
+    identity: Identity,
     upstream_trunk: String,
     destination: PathBuf,
     workspace: WorkspaceName,
     opened: Repo,
 }
 
-/// Inputs for one `knives start`.
-#[derive(Debug)]
-pub struct Request<'a> {
-    pub fork: &'a Fork<'a>,
-    pub branch: &'a BranchName,
-    /// Who is starting: resolved once by dispatch from where they stand.
-    pub identity: &'a Identity,
-    pub why: Option<&'a str>,
-    pub force: bool,
-}
-
-pub fn run(request: &Request<'_>) -> anyhow::Result<Exit> {
-    let Request {
-        fork,
-        branch,
-        identity,
-        why,
-        force,
-    } = *request;
+/// Claim `branch` and open its workspace. `bound` is the entry the current
+/// directory is inside, from which a terminal user's identity is derived.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the fork, the branch, the reason, the override and the cwd binding are independent inputs"
+)]
+pub fn run(
+    fork: &Fork<'_>,
+    branch: &BranchName,
+    why: Option<&str>,
+    force: bool,
+    bound: Option<&RepoName>,
+) -> anyhow::Result<Exit> {
     let repo_name = &fork.name;
     let entry = fork.entry;
     let checkout = &fork.checkout.path;
@@ -147,7 +144,7 @@ pub fn run(request: &Request<'_>) -> anyhow::Result<Exit> {
         store: &mut store,
         fork,
         branch,
-        identity,
+        identity: current_identity(bound)?,
         upstream_trunk: entry.upstream_trunk(),
         workspace: WorkspaceName::new(workspace_for(branch.as_str())),
         opened: Repo::open(checkout)?,
@@ -194,7 +191,7 @@ pub fn run(request: &Request<'_>) -> anyhow::Result<Exit> {
         .map(|claim| seen::last_seen(claim, &activity, &observations));
     let decision = decide(&ClaimContext {
         held: held.as_ref(),
-        identity: context.identity,
+        identity: &context.identity,
         in_claimed_workspace,
     });
 
@@ -379,7 +376,7 @@ fn take_claim(context: &mut StartContext<'_>, reason: &str) -> anyhow::Result<Ex
 fn record_claim(context: &mut StartContext<'_>, reason: &str, event: String) -> anyhow::Result<()> {
     let target = BranchTarget::new(context.fork.name.clone(), context.branch.clone());
     let pull = context.store.tracked_pull(&target);
-    let _ = context.store.claim(&target, context.identity, reason);
+    let _ = context.store.claim(&target, &context.identity, reason);
     Scribe::new(
         Ledger::for_repo(&context.fork.name),
         context.fork.name.clone(),
@@ -640,14 +637,8 @@ mod tests {
 
     fn entry(workspaces: Option<&str>) -> RepoEntry {
         RepoEntry {
-            upstream: "u".to_owned(),
-            origin: "o".to_owned(),
-            base: None,
-            release: None,
-            release_branch: None,
-            test_count_command: None,
-            consumers: vec![],
             workspaces: workspaces.map(PathBuf::from),
+            ..RepoEntry::new("u", "o")
         }
     }
 

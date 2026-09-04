@@ -477,30 +477,21 @@ impl Lab {
 
     pub(crate) fn repo_entry_with_release_branch(&self, name: &str) -> knives::config::RepoEntry {
         knives::config::RepoEntry {
-            upstream: self.upstream.display().to_string(),
-            // The work directory deliberately stands in for origin, per lab convention.
-            origin: self.work.display().to_string(),
-            base: None,
-            release: None,
             release_branch: Some(name.to_owned()),
-            test_count_command: None,
-            consumers: Vec::new(),
-            workspaces: None,
+            // The work directory deliberately stands in for origin, per lab convention.
+            ..knives::config::RepoEntry::new(
+                self.upstream.display().to_string(),
+                self.work.display().to_string(),
+            )
         }
     }
 }
 /// A registry entry for the lab's work checkout, which stands in for origin.
 pub fn lab_entry(lab: &Lab) -> knives::config::RepoEntry {
-    knives::config::RepoEntry {
-        upstream: lab.upstream.display().to_string(),
-        origin: lab.work.display().to_string(),
-        base: None,
-        release: None,
-        release_branch: None,
-        test_count_command: None,
-        consumers: Vec::new(),
-        workspaces: None,
-    }
+    knives::config::RepoEntry::new(
+        lab.upstream.display().to_string(),
+        lab.work.display().to_string(),
+    )
 }
 
 /// The lab's work checkout bound to `entry` under the registry name `name`, with
@@ -750,6 +741,13 @@ pub fn knives_command(cwd: &Path, config_home: &Path, scan_home: &Path, args: &[
         .env("HOME", scan_home)
         .env("JJ_CONFIG", "/dev/null");
     command
+}
+
+/// [`knives_command`] from the lab's work checkout, run to completion.
+pub fn knives(lab: &Lab, home: &tempfile::TempDir, args: &[&str]) -> std::process::Output {
+    knives_command(&lab.work, home.path(), lab.temp_path(), args)
+        .output()
+        .expect("run knives")
 }
 
 fn jj_output<const N: usize>(directory: &Path, args: [&str; N]) -> String {

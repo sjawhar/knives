@@ -64,14 +64,12 @@ fn a_fixed_pin_locked_to_an_ancestor_is_behind() {
     };
     let heads = ConsumerHeadMemo::default();
     let entry = RepoEntry {
-        upstream: "https://forge.invalid/up/repo.git".to_owned(),
-        origin: "https://forge.invalid/o/repo.git".to_owned(),
-        base: None,
-        release: None,
         release_branch: Some("integration".to_owned()),
-        test_count_command: None,
         consumers: vec![consumer.to_owned()],
-        workspaces: None,
+        ..RepoEntry::new(
+            "https://forge.invalid/up/repo.git",
+            "https://forge.invalid/o/repo.git",
+        )
     };
     let repo = Repo::open(&lab.work).expect("open advanced branch");
 

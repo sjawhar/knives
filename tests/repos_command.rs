@@ -1,5 +1,5 @@
 //! `knives repos` through the real binary: what the scan found, what it did not,
-//! what it could not read, and the one thing it needs from the environment.
+//! and the one thing it needs from the environment.
 
 #![allow(
     clippy::expect_used,
@@ -96,85 +96,4 @@ fn repos_without_a_home_directory_refuses_rather_than_scanning_the_root() {
         "HOME is not set; knives scans $HOME for checkouts"
     );
     assert!(output.stdout.is_empty());
-}
-
-#[test]
-fn repos_names_a_checkout_it_could_not_read_and_is_incomplete() {
-    let home = home();
-    let scan_home = tempfile::tempdir().expect("scan home");
-    jj_checkout(&scan_home.path().join("tool"), &[("upstream", TOOL)]);
-    let broken = scan_home.path().join("broken");
-    std::fs::create_dir_all(broken.join(".jj").join("repo")).expect("empty store");
-
-    let output = repos(&home, scan_home.path(), &["--text", "repos"]);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(output.status.code(), Some(3), "{stdout}\n{stderr}");
-    let problem = stdout
-        .lines()
-        .find(|line| line.starts_with("? "))
-        .expect("a problem line");
-    assert!(problem.contains("reading remotes of"), "{stdout}");
-    assert!(problem.contains("broken"), "{stdout}");
-    let broken_path = broken.canonicalize().expect("canonical");
-    assert_eq!(
-        stdout.matches(broken_path.to_str().expect("utf-8")).count(),
-        1,
-        "said once:\n{stdout}"
-    );
-    // The found entry is still listed with its path.
-    assert!(
-        stdout
-            .lines()
-            .any(|line| line.starts_with("tool ") && line.contains("/tool")),
-        "{stdout}"
-    );
-
-    let output = repos(&home, scan_home.path(), &["--json", "repos"]);
-    let report: Value =
-        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).expect("json document");
-    assert_eq!(output.status.code(), Some(3), "{report}");
-    let problems = report["problems"].as_array().expect("problems");
-    assert_eq!(problems.len(), 1, "{report}");
-}
-
-#[test]
-fn two_checkouts_of_one_entry_render_as_ambiguous_with_both_paths_named() {
-    let home = home();
-    let scan_home = tempfile::tempdir().expect("scan home");
-    let one = scan_home.path().join("one");
-    let two = scan_home.path().join("two");
-    jj_checkout(&one, &[("upstream", TOOL)]);
-    jj_checkout(&two, &[("upstream", TOOL)]);
-
-    let output = repos(&home, scan_home.path(), &["--text", "repos"]);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(output.status.code(), Some(3), "{stdout}\n{stderr}");
-    let row = stdout
-        .lines()
-        .find(|line| line.starts_with("tool "))
-        .expect("tool row");
-    assert!(row.contains("ambiguous: 2 checkouts"), "{stdout}");
-    assert!(!row.contains("not on this machine"), "{stdout}");
-    let problem = stdout
-        .lines()
-        .find(|line| line.trim_start().starts_with("? tool has 2 checkouts"))
-        .expect("a problem naming the checkouts");
-    let one = one.canonicalize().expect("canonical");
-    let two = two.canonicalize().expect("canonical");
-    assert!(problem.contains(one.to_str().expect("utf-8")), "{stdout}");
-    assert!(problem.contains(two.to_str().expect("utf-8")), "{stdout}");
-
-    let output = repos(&home, scan_home.path(), &["--json", "repos"]);
-    let report: Value =
-        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).expect("json document");
-    let tool = report["repos"]
-        .as_array()
-        .expect("rows")
-        .iter()
-        .find(|row| row["name"] == "tool")
-        .expect("tool row");
-    assert!(tool["path"].is_null(), "{report}");
-    assert!(tool.get("ambiguous").is_none(), "{report}");
 }

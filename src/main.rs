@@ -25,7 +25,7 @@ use branch_verbs::{FinishOptions, run_depends, run_finish, run_track};
 use clap::Parser as _;
 use knives::bind::{Fork, Unbound};
 use knives::cli::{Cli, Command, Exit, Output, ReleaseAction};
-use knives::commands::claim::{Identity, Resolved, current_identity, required};
+use knives::commands::claim::current_identity;
 use knives::commands::{
     audit, consumers, hook, notch, pr, preflight, pushed, register, repos, start, status, sync,
 };
@@ -63,28 +63,29 @@ fn dispatch() -> anyhow::Result<Exit> {
     let loaded = load(&default_config_path());
     let output = knives::cli::output_format(cli.json, cli.text);
     match cli.command {
-        // These act on no fork and need no identity: a hook event spawns
-        // nothing here (the hook binds what its event names), and a vanished
-        // cwd is none of their problem. `repos` still takes the sighting —
-        // asking what is maintained from inside a fork is a sighting of it —
-        // but nothing about it can fail the listing.
+        // These act on no fork: a hook event spawns nothing here (the hook
+        // binds what its event names), and a vanished cwd is none of their
+        // problem. `repos` still takes the sighting — asking what is
+        // maintained from inside a fork is a sighting of it — but nothing
+        // about it can fail the listing.
         Command::Hook { harness } => Ok(hook::run(harness)),
-        Command::Register { repo } => register::run(repo),
+        Command::Register { repo } => register::run(repo, &loaded?),
         Command::Repos => {
             let _ = grounded(&loaded);
-            repos::run(output)
+            let Some(home) = scan_home() else {
+                return Ok(Exit::Usage);
+            };
+            repos::run(&loaded?, &home, output)
         }
         Command::Gh { args } => match knives::commands::gh::run(&args)? {},
         Command::Consumers { fork, consumer } => {
-            let (ground, _) = grounded(&loaded);
-            let Some(fork) = ground?.one_fork(fork.as_deref())? else {
+            let Some(fork) = grounded(&loaded)?.one_fork(fork.as_deref())? else {
                 return Ok(Exit::Usage);
             };
             run_consumers(&fork, &consumer, output)
         }
         Command::Pushed { branches, repo } => {
-            let (ground, _) = grounded(&loaded);
-            let Some(fork) = ground?.one_fork(repo.as_deref())? else {
+            let Some(fork) = grounded(&loaded)?.one_fork(repo.as_deref())? else {
                 return Ok(Exit::Usage);
             };
             run_pushed(&fork, &branches, output)
@@ -93,48 +94,41 @@ fn dispatch() -> anyhow::Result<Exit> {
             repo,
             all,
             no_github,
-        } => {
-            let (ground, _) = grounded(&loaded);
-            run_audit(
-                ground?,
-                Scope {
-                    requested: repo.as_deref(),
-                    all,
-                },
-                output,
-                !no_github,
-            )
-        }
+        } => run_audit(
+            grounded(&loaded)?,
+            Scope {
+                requested: repo.as_deref(),
+                all,
+            },
+            output,
+            !no_github,
+        ),
         Command::Status {
             repo,
             all,
             verbose,
             no_landed,
             no_github,
-        } => {
-            let (ground, _) = grounded(&loaded);
-            run_status(
-                ground?,
-                StatusView {
-                    scope: Scope {
-                        requested: repo.as_deref(),
-                        all,
-                    },
-                    gather: Gather {
-                        probe: !no_landed,
-                        use_forge: !no_github,
-                    },
-                    display: Display { verbose, output },
+        } => run_status(
+            grounded(&loaded)?,
+            StatusView {
+                scope: Scope {
+                    requested: repo.as_deref(),
+                    all,
                 },
-            )
-        }
+                gather: Gather {
+                    probe: !no_landed,
+                    use_forge: !no_github,
+                },
+                display: Display { verbose, output },
+            },
+        ),
         Command::Pr {
             number,
             repo,
             timeline,
         } => {
-            let (ground, _) = grounded(&loaded);
-            let Some(fork) = ground?.one_fork(repo.as_deref())? else {
+            let Some(fork) = grounded(&loaded)?.one_fork(repo.as_deref())? else {
                 return Ok(Exit::Usage);
             };
             run_pr(&fork, number, timeline, output)
@@ -143,38 +137,29 @@ fn dispatch() -> anyhow::Result<Exit> {
             repo,
             all,
             no_github,
-        } => {
-            let (ground, identity) = grounded(&loaded);
-            run_sync(
-                ground?,
-                Scope {
-                    requested: repo.as_deref(),
-                    all,
-                },
-                output,
-                !no_github,
-                &identity?,
-            )
-        }
+        } => run_sync(
+            grounded(&loaded)?,
+            Scope {
+                requested: repo.as_deref(),
+                all,
+            },
+            output,
+            !no_github,
+        ),
         Command::Start {
             branch,
             repo,
             why,
             force,
         } => {
-            let (ground, identity) = grounded(&loaded);
+            let ground = grounded(&loaded)?;
+            let bound = ground.bound().cloned();
             let (Some(fork), Some(branch)) =
-                (ground?.one_fork(repo.as_deref())?, branch_name(&branch))
+                (ground.one_fork(repo.as_deref())?, branch_name(&branch))
             else {
                 return Ok(Exit::Usage);
             };
-            start::run(&start::Request {
-                fork: &fork,
-                branch: &branch,
-                identity: &identity?,
-                why: why.as_deref(),
-                force,
-            })
+            start::run(&fork, &branch, why.as_deref(), force, bound.as_ref())
         }
         Command::Finish {
             branch,
@@ -184,9 +169,10 @@ fn dispatch() -> anyhow::Result<Exit> {
             force,
             why,
         } => {
-            let (ground, identity) = grounded(&loaded);
+            let ground = grounded(&loaded)?;
+            let bound = ground.bound().cloned();
             let (Some(fork), Some(branch)) =
-                (ground?.one_fork(repo.as_deref())?, branch_name(&branch))
+                (ground.one_fork(repo.as_deref())?, branch_name(&branch))
             else {
                 return Ok(Exit::Usage);
             };
@@ -199,7 +185,7 @@ fn dispatch() -> anyhow::Result<Exit> {
                     force,
                     why: why.as_deref(),
                 },
-                &identity?,
+                bound.as_ref(),
             )
         }
         Command::Track {
@@ -209,24 +195,25 @@ fn dispatch() -> anyhow::Result<Exit> {
             forget,
             repo,
         } => {
-            let (ground, identity) = grounded(&loaded);
-            let (Some(fork), Some(branch)) =
-                (ground?.one_fork(repo.as_deref())?, branch_name(&branch))
-            else {
-                return Ok(Exit::Usage);
-            };
-            run_track(&fork, &branch, pr, fork_only, forget, &identity?)
-        }
-        Command::Depends { branch, on, repo } => {
-            let (ground, identity) = grounded(&loaded);
-            let ground = ground?;
-            let registry = ground.registry;
+            let ground = grounded(&loaded)?;
+            let bound = ground.bound().cloned();
             let (Some(fork), Some(branch)) =
                 (ground.one_fork(repo.as_deref())?, branch_name(&branch))
             else {
                 return Ok(Exit::Usage);
             };
-            run_depends(registry, &fork, &branch, &on, &identity?)
+            run_track(&fork, &branch, pr, fork_only, forget, bound.as_ref())
+        }
+        Command::Depends { branch, on, repo } => {
+            let ground = grounded(&loaded)?;
+            let registry = ground.registry;
+            let bound = ground.bound().cloned();
+            let (Some(fork), Some(branch)) =
+                (ground.one_fork(repo.as_deref())?, branch_name(&branch))
+            else {
+                return Ok(Exit::Usage);
+            };
+            run_depends(registry, &fork, &branch, &on, bound.as_ref())
         }
         Command::Notch {
             subject,
@@ -246,14 +233,15 @@ fn dispatch() -> anyhow::Result<Exit> {
                 eprintln!("subject cannot be empty");
                 return Ok(Exit::Usage);
             }
-            let (ground, identity) = grounded(&loaded);
-            let Some(fork) = ground?.one_fork(repo.as_deref())? else {
+            let ground = grounded(&loaded)?;
+            let bound = ground.bound().cloned();
+            let Some(fork) = ground.one_fork(repo.as_deref())? else {
                 return Ok(Exit::Usage);
             };
             notch::run(
                 &notch::Request {
                     fork: &fork,
-                    identity: identity.as_ref(),
+                    bound: bound.as_ref(),
                     subject: subject.as_deref(),
                     message: message.as_deref(),
                     evidence: &evidence,
@@ -267,8 +255,7 @@ fn dispatch() -> anyhow::Result<Exit> {
             )
         }
         Command::Preflight { repo } => {
-            let (ground, _) = grounded(&loaded);
-            let Some(fork) = ground?.one_fork(repo.as_deref())? else {
+            let Some(fork) = grounded(&loaded)?.one_fork(repo.as_deref())? else {
                 return Ok(Exit::Usage);
             };
             run_preflight(&fork)
@@ -278,13 +265,14 @@ fn dispatch() -> anyhow::Result<Exit> {
             repo,
             consumer,
         } => {
-            let (ground, identity) = grounded(&loaded);
-            let Some(fork) = ground?.one_fork(repo.as_deref())? else {
+            let ground = grounded(&loaded)?;
+            let bound = ground.bound().cloned();
+            let Some(fork) = ground.one_fork(repo.as_deref())? else {
                 return Ok(Exit::Usage);
             };
             let extra: Vec<&std::path::Path> =
                 consumer.iter().map(std::path::PathBuf::as_path).collect();
-            dispatch_release(&fork, action, &extra, output, identity.as_ref())
+            dispatch_release(&fork, action, &extra, output, bound.as_ref())
         }
     }
 }
@@ -299,14 +287,11 @@ fn scan_home() -> Option<std::path::PathBuf> {
 }
 
 /// The fork verbs' shared step, taken once per invocation by a verb that acts
-/// on a fork: the current directory bound against the registry, the sighting
-/// recorded from that bind, and who is acting resolved from it — one remotes
-/// read for all three and the verb. Either half may be an
-/// error; the arm that needs it reports it, so a sighting never fails a call
-/// and a verb that only reads never asks who is acting.
-fn grounded(
-    loaded: &Result<Registry, ConfigError>,
-) -> (anyhow::Result<Ground<'_>>, anyhow::Result<Identity>) {
+/// on a fork: the current directory bound against the registry, and the
+/// sighting recorded from that bind — one remotes read for both and the verb.
+/// The sighting never fails a call; a verb that writes resolves who is acting
+/// where it writes, from the same binding ([`Ground::bound`]).
+fn grounded(loaded: &Result<Registry, ConfigError>) -> anyhow::Result<Ground<'_>> {
     let cwd = std::env::current_dir();
     let ground = match (&cwd, loaded) {
         (Ok(cwd), Ok(registry)) => Ok(Ground::new(registry, cwd)),
@@ -314,11 +299,10 @@ fn grounded(
         (Ok(_), Err(error)) => Err(anyhow::anyhow!("{error}")),
     };
     let bound = ground.as_ref().ok().and_then(Ground::bound);
-    let identity = current_identity(bound);
-    if let (Ok(cwd), Ok(identity)) = (&cwd, &identity) {
-        knives::seen::record_observation(bound, cwd, identity);
+    if let (Ok(cwd), Ok(identity)) = (&cwd, current_identity(bound)) {
+        knives::seen::record_observation(bound, cwd, &identity);
     }
-    (ground, identity)
+    ground
 }
 
 /// What every fork verb shares: the registry, and the current directory bound
@@ -338,7 +322,8 @@ impl<'a> Ground<'a> {
         }
     }
 
-    /// The entry the current directory is inside, when it is inside one.
+    /// The entry the current directory is inside, when it is inside one: what
+    /// `current_identity` derives a terminal user's name from.
     fn bound(&self) -> Option<&RepoName> {
         self.here.as_ref().ok().map(|fork| &fork.name)
     }
@@ -552,27 +537,26 @@ fn run_audit(
 
 /// Plan, curate or cut a release.
 ///
-/// `identity` is who is acting, resolved once by dispatch; the actions that
-/// write the ledger need it, the reports do not, so a failure to resolve it is
-/// reported only where it would matter.
+/// `bound` is the entry the current directory is inside; an action that writes
+/// the ledger derives who is acting from it, the reports never ask.
 #[allow(
     clippy::too_many_arguments,
-    reason = "the fork, the action, the extra consumers, the output format and who is acting are independent inputs"
+    reason = "the fork, the action, the extra consumers, the output format and the cwd binding are independent inputs"
 )]
 fn dispatch_release(
     fork: &Fork<'_>,
     action: Option<ReleaseAction>,
     extra_consumers: &[&std::path::Path],
     output: Output,
-    identity: Resolved<'_>,
+    bound: Option<&RepoName>,
 ) -> anyhow::Result<Exit> {
     match action {
-        None => run_release(fork, extra_consumers, &ReleaseInvocation::Plan, identity),
+        None => run_release(fork, extra_consumers, &ReleaseInvocation::Plan, bound),
         Some(ReleaseAction::Cut { name, allow_drop }) => run_release(
             fork,
             extra_consumers,
             &ReleaseInvocation::Cut { name, allow_drop },
-            identity,
+            bound,
         ),
         Some(ReleaseAction::Rebase { reference, no_drop }) => {
             let cache_root = knives::forge_cache::cache_root();
@@ -582,7 +566,7 @@ fn dispatch_release(
                 no_drop,
                 extra_consumers,
                 cache_root.as_deref(),
-                required(identity)?,
+                bound,
             )
         }
         Some(ReleaseAction::Carries {
@@ -613,13 +597,13 @@ fn dispatch_release(
             fork,
             extra_consumers,
             &ReleaseEdit::Include { branch, why },
-            required(identity)?,
+            bound,
         ),
         Some(ReleaseAction::Drop { branch, why }) => run_release_edit(
             fork,
             extra_consumers,
             &ReleaseEdit::Drop { branch, why },
-            required(identity)?,
+            bound,
         ),
         Some(ReleaseAction::Advance { branches, from }) => {
             let branches = branches.into_iter().map(BranchName::new).collect();
@@ -627,23 +611,24 @@ fn dispatch_release(
                 fork,
                 extra_consumers,
                 &ReleaseEdit::Advance { branches, from },
-                required(identity)?,
+                bound,
             )
         }
     }
 }
 
-/// The ledger writer for a command acting on `fork`.
+/// The ledger writer for a command acting on `fork`, from the entry the current
+/// directory is `bound` to.
 ///
 /// The owner is resolved exactly as a claim's is, so one agent's events and its
 /// claims carry the same name and a reader can join them.
-fn scribe_for(fork: &Fork<'_>, identity: &Identity) -> Scribe {
-    Scribe::new(
+fn scribe_for(fork: &Fork<'_>, bound: Option<&RepoName>) -> anyhow::Result<Scribe> {
+    Ok(Scribe::new(
         Ledger::for_repo(&fork.name),
         fork.name.clone(),
         fork.checkout.path.clone(),
-        identity.owner.clone(),
-    )
+        current_identity(bound)?.owner,
+    ))
 }
 
 /// One registry entry as a many-repo verb sees it after the scan.
@@ -659,10 +644,9 @@ enum Selected<'a> {
     },
 }
 
-/// Every entry the scan of `home` placed, and what the scan could not read —
-/// drained from the scan first, so each unplaced row carries only its own
-/// refusal and the caller reports the problems once, whether or not every
-/// entry was found.
+/// Every entry the scan of `home` placed, and what the scan could not read,
+/// for the caller to report once: each unplaced row carries only its own
+/// refusal, whether or not every entry was found.
 ///
 /// An entry with no checkout under `home` is not on this machine, which is
 /// not a problem with it: the registry is shared across machines that hold
@@ -671,7 +655,6 @@ enum Selected<'a> {
 /// it could not read, and the entry stays a row carrying that refusal.
 fn sweep<'a>(registry: &'a Registry, home: &std::path::Path) -> (Vec<Selected<'a>>, Vec<String>) {
     let mut scan = knives::bind::scan(registry, home);
-    let problems = std::mem::take(&mut scan.problems);
     let selected = registry
         .repos
         .iter()
@@ -681,7 +664,7 @@ fn sweep<'a>(registry: &'a Registry, home: &std::path::Path) -> (Vec<Selected<'a
                 return Some(Selected::Bound(fork));
             }
             let why = scan.unplaced(&name);
-            if matches!(why, knives::bind::Unresolved::Missing { .. }) && problems.is_empty() {
+            if matches!(why, knives::bind::Unresolved::Missing { .. }) && scan.problems.is_empty() {
                 eprintln!("knives: {name}: not on this machine");
                 return None;
             }
@@ -692,7 +675,7 @@ fn sweep<'a>(registry: &'a Registry, home: &std::path::Path) -> (Vec<Selected<'a
             })
         })
         .collect();
-    (selected, problems)
+    (selected, scan.problems)
 }
 
 /// Which repos a report covers: a named one, all of them, or (neither) the one
@@ -914,17 +897,13 @@ fn run_preflight(fork: &Fork<'_>) -> anyhow::Result<Exit> {
     Ok(preflight::exit_for(&report))
 }
 
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the bound ground, the scope, the output format, the forge switch and who is acting are independent inputs"
-)]
 fn run_sync(
     ground: Ground<'_>,
     scope: Scope<'_>,
     output: knives::cli::Output,
     use_forge: bool,
-    identity: &Identity,
 ) -> anyhow::Result<Exit> {
+    let bound = ground.bound().cloned();
     let chosen = match ground.sync_targets(scope)? {
         Ok(list) => list,
         Err(exit) => return Ok(exit),
@@ -941,18 +920,21 @@ fn run_sync(
         // carrying the error as a problem; the repositories before it already
         // fetched and wrote their events, and their rows are not lost to it.
         let report = match chosen {
-            Selected::Bound(fork) => sync::sync_repo(sync::SyncInput {
-                fork,
-                store: &mut store,
-                forge,
-                scribe: &scribe_for(fork, identity),
-                cache: cache_root.as_deref(),
-            })
-            .unwrap_or_else(|error| sync::Report {
-                repo: fork.name.to_string(),
-                problems: vec![format!("could not sync: {error:#}")],
-                ..sync::Report::default()
-            }),
+            Selected::Bound(fork) => scribe_for(fork, bound.as_ref())
+                .and_then(|scribe| {
+                    sync::sync_repo(sync::SyncInput {
+                        fork,
+                        store: &mut store,
+                        forge,
+                        scribe: &scribe,
+                        cache: cache_root.as_deref(),
+                    })
+                })
+                .unwrap_or_else(|error| sync::Report {
+                    repo: fork.name.to_string(),
+                    problems: vec![format!("could not sync: {error:#}")],
+                    ..sync::Report::default()
+                }),
             Selected::Unplaced { name, problem, .. } => sync::Report {
                 repo: name.to_string(),
                 problems: vec![problem.clone()],

@@ -238,16 +238,10 @@ fn status_with_the_landed_probe_reports_a_merged_branch_and_leaves_no_trace() {
     lab.publish_pull("feat/alpha", 7);
     lab.squash_merge_pull(7, None);
 
-    let entry = knives::config::RepoEntry {
-        upstream: lab.upstream.display().to_string(),
-        origin: lab.work.display().to_string(),
-        base: None,
-        release: None,
-        release_branch: None,
-        test_count_command: None,
-        consumers: Vec::new(),
-        workspaces: None,
-    };
+    let entry = knives::config::RepoEntry::new(
+        lab.upstream.display().to_string(),
+        lab.work.display().to_string(),
+    );
     let name = knives::ids::RepoName::new("a-repo");
     let temp = std::env::temp_dir().join(format!("knives-status-{}", std::process::id()));
     let store = knives::store::Store::open(temp.join("state.json")).expect("store");
@@ -338,16 +332,10 @@ fn status_reports_branch_overlap_after_upstream_advances_without_landed_probe() 
     lab.branch("feat/alpha", "shared.txt", "alpha\n");
     lab.branch("feat/beta", "shared.txt", "beta\n");
     lab.advance_upstream("upstream advanced past the branches\n");
-    let entry = knives::config::RepoEntry {
-        upstream: lab.upstream.display().to_string(),
-        origin: lab.work.display().to_string(),
-        base: None,
-        release: None,
-        release_branch: None,
-        test_count_command: None,
-        consumers: Vec::new(),
-        workspaces: None,
-    };
+    let entry = knives::config::RepoEntry::new(
+        lab.upstream.display().to_string(),
+        lab.work.display().to_string(),
+    );
     let store_path = lab
         .work
         .parent()
@@ -392,16 +380,10 @@ fn status_reports_a_branch_carried_elsewhere() {
     lab.jj_work(["bookmark", "create", "theirs/rework", "-r", "feat/alpha"]);
     lab.jj_work(["new", "theirs/rework", "-m", "extra work on top"]);
     lab.jj_work(["bookmark", "set", "theirs/rework", "-r", "@"]);
-    let entry = knives::config::RepoEntry {
-        upstream: lab.upstream.display().to_string(),
-        origin: lab.work.display().to_string(),
-        base: None,
-        release: None,
-        release_branch: None,
-        test_count_command: None,
-        consumers: Vec::new(),
-        workspaces: None,
-    };
+    let entry = knives::config::RepoEntry::new(
+        lab.upstream.display().to_string(),
+        lab.work.display().to_string(),
+    );
     let name = knives::ids::RepoName::new("a-repo");
     let temp = std::env::temp_dir().join(format!("knives-status-{}", std::process::id()));
     let store = knives::store::Store::open(temp.join("state.json")).expect("store");
@@ -442,16 +424,10 @@ fn status_reports_a_carrier_for_a_closed_pull_request() {
     lab.jj_work(["bookmark", "create", "theirs/rework", "-r", "feat/alpha"]);
     lab.jj_work(["new", "theirs/rework", "-m", "extra work on top"]);
     lab.jj_work(["bookmark", "set", "theirs/rework", "-r", "@"]);
-    let entry = knives::config::RepoEntry {
-        upstream: lab.upstream.display().to_string(),
-        origin: lab.work.display().to_string(),
-        base: None,
-        release: None,
-        release_branch: None,
-        test_count_command: None,
-        consumers: Vec::new(),
-        workspaces: None,
-    };
+    let entry = knives::config::RepoEntry::new(
+        lab.upstream.display().to_string(),
+        lab.work.display().to_string(),
+    );
     let name = knives::ids::RepoName::new("a-repo");
     let temp = std::env::temp_dir().join(format!("knives-status-{}", std::process::id()));
     let store = knives::store::Store::open(temp.join("state.json")).expect("store");
@@ -508,16 +484,10 @@ fn status_does_not_report_trunk_as_a_carrier_without_landed_probe() {
     ]);
     lab.jj_work(["bookmark", "set", "main", "-r", "@"]);
     lab.jj_work(["new"]);
-    let entry = knives::config::RepoEntry {
-        upstream: lab.upstream.display().to_string(),
-        origin: lab.work.display().to_string(),
-        base: None,
-        release: None,
-        release_branch: None,
-        test_count_command: None,
-        consumers: Vec::new(),
-        workspaces: None,
-    };
+    let entry = knives::config::RepoEntry::new(
+        lab.upstream.display().to_string(),
+        lab.work.display().to_string(),
+    );
     let name = knives::ids::RepoName::new("a-repo");
     let temp = std::env::temp_dir().join(format!("knives-status-{}", std::process::id()));
     let store = knives::store::Store::open(temp.join("state.json")).expect("store");
@@ -555,16 +525,10 @@ fn status_carries_each_branchs_newest_notch_in_json_and_in_text() {
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     lab.branch("feat/beta", "beta.txt", "beta\n");
     let name = knives::ids::RepoName::new("demo");
-    let entry = RepoEntry {
-        upstream: lab.upstream.display().to_string(),
-        origin: lab.work.display().to_string(),
-        base: None,
-        release: None,
-        release_branch: None,
-        test_count_command: None,
-        consumers: Vec::new(),
-        workspaces: None,
-    };
+    let entry = RepoEntry::new(
+        lab.upstream.display().to_string(),
+        lab.work.display().to_string(),
+    );
     let state = tempfile::tempdir().expect("state directory");
     let store = Store::open(state.path().join("state.json")).expect("open store");
     let ledger = knives::ledger::Ledger::at(state.path().join("demo"));

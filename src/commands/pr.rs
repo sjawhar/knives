@@ -216,16 +216,7 @@ mod tests {
     use crate::ids::BranchName;
 
     fn entry() -> crate::config::RepoEntry {
-        crate::config::RepoEntry {
-            upstream: String::new(),
-            origin: String::new(),
-            base: None,
-            release: None,
-            release_branch: None,
-            test_count_command: None,
-            consumers: Vec::new(),
-            workspaces: None,
-        }
+        crate::config::RepoEntry::new(String::new(), String::new())
     }
 
     #[test]
