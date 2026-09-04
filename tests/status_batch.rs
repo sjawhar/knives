@@ -84,8 +84,7 @@ fn one_batch_answers_review_age_and_checks_for_every_branch_at_once() {
 
     // When: status gathers
     let report = status::gather(
-        &knives::ids::RepoName::new("demo"),
-        &lab_entry(&lab),
+        &lab::lab_fork(&lab, "demo", &lab_entry(&lab)),
         &store,
         &knives::commands::status::Options {
             probe: false,
@@ -158,9 +157,18 @@ fn a_measured_gather_reports_the_same_report_and_a_total_that_covers_its_phases(
     };
 
     // When: the same repository is gathered with and without measurement
-    let plain = status::gather(&name, &entry, &store, &options()).expect("gather");
-    let (measured, timings) =
-        status::gather_timed(&name, &entry, &store, &options()).expect("gather_timed");
+    let plain = status::gather(
+        &lab::lab_fork(&lab, name.as_str(), &entry),
+        &store,
+        &options(),
+    )
+    .expect("gather");
+    let (measured, timings) = status::gather_timed(
+        &lab::lab_fork(&lab, name.as_str(), &entry),
+        &store,
+        &options(),
+    )
+    .expect("gather_timed");
 
     // Then: the report's facts are unchanged; its measured forge duration is
     // specific to each run, and the total covers the phases it timed.
@@ -312,8 +320,7 @@ fn the_forge_is_asked_once_for_the_whole_report_with_one_entry_per_number() {
     let store = Store::open(state.path().join("state.json")).expect("open store");
 
     let report = status::gather(
-        &knives::ids::RepoName::new("demo"),
-        &lab_entry(&lab),
+        &lab::lab_fork(&lab, "demo", &lab_entry(&lab)),
         &store,
         &knives::commands::status::Options {
             probe: false,
@@ -376,8 +383,7 @@ fn a_failed_facts_batch_clears_review_and_check_cells() {
     let store = Store::open(state.path().join("state.json")).expect("open store");
 
     let report = status::gather(
-        &knives::ids::RepoName::new("demo"),
-        &lab_entry(&lab),
+        &lab::lab_fork(&lab, "demo", &lab_entry(&lab)),
         &store,
         &knives::commands::status::Options {
             probe: false,
@@ -429,8 +435,7 @@ fn a_consulted_false_report_carries_an_unanswered_stated_pull() {
     store.track_pull(&target, 42);
 
     let report = status::gather(
-        &name,
-        &lab_entry(&lab),
+        &lab::lab_fork(&lab, name.as_str(), &lab_entry(&lab)),
         &store,
         &knives::commands::status::Options {
             probe: false,
@@ -488,8 +493,7 @@ fn stated_pulls_and_dependencies_are_answered_from_the_one_batch() {
     };
 
     let report = status::gather(
-        &name,
-        &lab_entry(&lab),
+        &lab::lab_fork(&lab, name.as_str(), &lab_entry(&lab)),
         &store,
         &knives::commands::status::Options {
             probe: false,
@@ -549,7 +553,12 @@ fn landed_verdicts_come_from_the_cache_when_the_key_matches() {
         workers: 1,
     };
 
-    let first = status::gather(&name, &entry, &store, &options()).expect("first gather");
+    let first = status::gather(
+        &lab::lab_fork(&lab, name.as_str(), &entry),
+        &store,
+        &options(),
+    )
+    .expect("first gather");
     assert_eq!(
         first.branches[0].landed,
         Some(knives::detect::LandedVerdict::NotInTrunk),
@@ -570,7 +579,12 @@ fn landed_verdicts_come_from_the_cache_when_the_key_matches() {
         .insert(key, knives::detect::LandedVerdict::InTrunk);
     knives::forge_cache::write(&cache_file, &persisted).expect("poison landed cache entry");
 
-    let cached = status::gather(&name, &entry, &store, &options()).expect("cached gather");
+    let cached = status::gather(
+        &lab::lab_fork(&lab, name.as_str(), &entry),
+        &store,
+        &options(),
+    )
+    .expect("cached gather");
     assert_eq!(
         cached.branches[0].landed,
         Some(knives::detect::LandedVerdict::InTrunk),
@@ -578,7 +592,12 @@ fn landed_verdicts_come_from_the_cache_when_the_key_matches() {
     );
 
     extend_branch(&lab, "feat/alpha", "alpha-next.txt", "next\n");
-    let fresh = status::gather(&name, &entry, &store, &options()).expect("fresh gather");
+    let fresh = status::gather(
+        &lab::lab_fork(&lab, name.as_str(), &entry),
+        &store,
+        &options(),
+    )
+    .expect("fresh gather");
     assert_eq!(
         fresh.branches[0].landed,
         Some(knives::detect::LandedVerdict::NotInTrunk),
@@ -613,7 +632,12 @@ fn a_probe_free_run_preserves_the_landed_section() {
         workers: 1,
     };
 
-    status::gather(&name, &entry, &store, &with_probe()).expect("probe gather");
+    status::gather(
+        &lab::lab_fork(&lab, name.as_str(), &entry),
+        &store,
+        &with_probe(),
+    )
+    .expect("probe gather");
     let identity = RepoIdentity {
         name_with_owner: "fake-owner/fake-repo".to_owned(),
         id: "FAKEID".to_owned(),
@@ -624,7 +648,12 @@ fn a_probe_free_run_preserves_the_landed_section() {
         .landed;
     assert!(!before.is_empty(), "the probe wrote no landed entries");
 
-    status::gather(&name, &entry, &store, &without_probe()).expect("probe-free gather");
+    status::gather(
+        &lab::lab_fork(&lab, name.as_str(), &entry),
+        &store,
+        &without_probe(),
+    )
+    .expect("probe-free gather");
     let after = knives::forge_cache::load(&cache_file, &identity)
         .expect("cache after probe-free run")
         .landed;
@@ -653,7 +682,12 @@ fn an_unresolvable_trunk_fails_loudly_and_touches_no_landed_cache() {
         workers: 1,
     };
 
-    status::gather(&name, &entry, &store, &options()).expect("initial probe");
+    status::gather(
+        &lab::lab_fork(&lab, name.as_str(), &entry),
+        &store,
+        &options(),
+    )
+    .expect("initial probe");
     let identity = RepoIdentity {
         name_with_owner: "fake-owner/fake-repo".to_owned(),
         id: "FAKEID".to_owned(),
@@ -663,8 +697,12 @@ fn an_unresolvable_trunk_fails_loudly_and_touches_no_landed_cache() {
     let mut unresolvable = entry;
     unresolvable.base = Some("missing-trunk".to_owned());
 
-    let error = status::gather(&name, &unresolvable, &store, &options())
-        .expect_err("an unresolvable configured trunk must fail loudly");
+    let error = status::gather(
+        &lab::lab_fork(&lab, name.as_str(), &unresolvable),
+        &store,
+        &options(),
+    )
+    .expect_err("an unresolvable configured trunk must fail loudly");
     assert!(
         error.to_string().contains("missing-trunk@upstream"),
         "missing unresolved revision in error: {error:#}"
@@ -706,8 +744,18 @@ fn parallel_landed_probes_answer_exactly_what_serial_ones_did() {
     let name = knives::ids::RepoName::new("demo");
 
     // When: the same repository is gathered serially and on several threads
-    let serial = status::gather(&name, &entry, &store, &options(1)).expect("serial gather");
-    let parallel = status::gather(&name, &entry, &store, &options(8)).expect("parallel gather");
+    let serial = status::gather(
+        &lab::lab_fork(&lab, name.as_str(), &entry),
+        &store,
+        &options(1),
+    )
+    .expect("serial gather");
+    let parallel = status::gather(
+        &lab::lab_fork(&lab, name.as_str(), &entry),
+        &store,
+        &options(8),
+    )
+    .expect("parallel gather");
 
     // Then: apart from each run's elapsed forge duration, not one report token
     // differs, including the landed column.

@@ -7,14 +7,15 @@
 
 use std::path::Path;
 
+use knives::bind::Fork;
 use knives::cli::Exit;
 use knives::commands::claim::{
     ClaimContext, ClaimDecision, current_identity, decide, last_seen_provenance,
     render_claim_context,
 };
 use knives::commands::start::{collides_with_checkout, possesses, workspace_path};
-use knives::config::{default_config_path, load};
-use knives::ids::{BranchTarget, Requirement};
+use knives::config::Registry;
+use knives::ids::{BranchName, BranchTarget, RepoName, Requirement};
 use knives::jj::{Repo, WorkspaceIdentity};
 use knives::store::{Store, default_state_path};
 
@@ -66,25 +67,26 @@ enum FinishClaimGate {
 /// Removing the directory loses no work: jj snapshots a working copy into a commit, so
 /// every change made there is already in the repository and reachable by change id. What
 /// does not survive is anything jj never tracked, which is what `--no-cleanup` is for.
+/// `bound` is the entry the current directory is inside, which names a terminal
+/// user acting from a fork's workspace.
 pub(crate) fn run_finish(
-    target: &BranchTarget,
+    fork: &Fork<'_>,
+    branch: &BranchName,
     options: &FinishOptions<'_>,
+    bound: Option<&RepoName>,
 ) -> anyhow::Result<Exit> {
-    let registry = load(&default_config_path())?;
-    let Some(entry) = registry.get(&target.repo) else {
-        eprintln!("unknown repo {}", target.repo);
-        return Ok(Exit::Usage);
-    };
+    let target = &BranchTarget::new(fork.name.clone(), branch.clone());
+    let checkout_path = &fork.checkout.path;
     // Without this, `finish` would forget the primary workspace and delete the
     // checkout itself.
-    if let Some(line) = collides_with_checkout(entry, &target.branch) {
-        eprintln!("{}: {line}", target.repo);
+    if let Some(line) = collides_with_checkout(fork, branch) {
+        eprintln!("{}: {line}", fork.name);
         return Ok(Exit::Usage);
     }
     let mut store = Store::open_for_update(default_state_path())?;
-    let workspace = knives::commands::wip::workspace_for(target.branch.as_str());
-    let directory = workspace_path(entry, &target.branch);
-    let forced_release = match finish_claim_gate(target, entry, &store, options)? {
+    let workspace = knives::commands::wip::workspace_for(branch.as_str());
+    let directory = workspace_path(fork, branch);
+    let forced_release = match finish_claim_gate(fork, target, &store, options, bound)? {
         FinishClaimGate::Continue(event) => event,
         FinishClaimGate::Refuse => return Ok(Exit::Usage),
     };
@@ -103,7 +105,7 @@ pub(crate) fn run_finish(
         })
         .or_else(|| release_event(had, options.superseded_by));
     if let Some(text) = provenance {
-        scribe_for(&target.repo, entry)?.event(Some(target.branch.as_str()), text, pr)?;
+        scribe_for(fork, bound)?.event(Some(branch.as_str()), text, pr)?;
     }
     store.save()?;
 
@@ -113,10 +115,10 @@ pub(crate) fn run_finish(
     // the directory forgotten and unremovable.
     let identity = directory
         .exists()
-        .then(|| knives::jj::workspace_identity(&directory, &entry.path));
-    let registration = release_registration(&entry.path, &workspace);
+        .then(|| knives::jj::workspace_identity(&directory, checkout_path));
+    let registration = release_registration(checkout_path, &workspace);
     let shown = directory.display();
-    let checkout = entry.path.display();
+    let checkout = checkout_path.display();
     let removal = match identity {
         None => format!("no directory at {shown}"),
         Some(WorkspaceIdentity::Ours(name)) if name.as_str() == workspace => {
@@ -198,11 +200,16 @@ fn release_registration(checkout: &Path, workspace: &str) -> Registration {
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the fork, the branch, the store, the finish options and the cwd binding are independent inputs"
+)]
 fn finish_claim_gate(
+    fork: &Fork<'_>,
     target: &BranchTarget,
-    entry: &knives::config::RepoEntry,
     store: &Store,
     options: &FinishOptions<'_>,
+    bound: Option<&RepoName>,
 ) -> anyhow::Result<FinishClaimGate> {
     let Some(claim) = store
         .claims(Some(&target.repo))
@@ -214,16 +221,16 @@ fn finish_claim_gate(
     };
     let workspace = knives::commands::wip::workspace_for(target.branch.as_str());
     let cwd = std::env::current_dir()?;
-    let identity = current_identity(&cwd)?;
+    let identity = current_identity(bound)?;
     let decision = decide(&ClaimContext {
         held: Some(&claim),
         identity: &identity,
-        in_claimed_workspace: possesses(&cwd, entry, &target.branch),
+        in_claimed_workspace: possesses(&cwd, fork, &target.branch),
     });
     match decision {
         ClaimDecision::Resume { .. } | ClaimDecision::Take => Ok(FinishClaimGate::Continue(None)),
         ClaimDecision::RefuseAnonymous | ClaimDecision::RefuseHeld => {
-            let activity = Repo::open(&entry.path)?.workspace_activity(
+            let activity = Repo::open(&fork.checkout.path)?.workspace_activity(
                 &std::collections::BTreeSet::from([knives::ids::WorkspaceName::new(workspace)]),
                 knives::jj::MAX_ACTIVITY_OPS,
             )?;
@@ -252,17 +259,19 @@ fn finish_claim_gate(
 }
 
 /// State or forget which pull request a branch belongs to.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the fork, the branch, the three ways to state its pull request and the cwd binding are independent inputs"
+)]
 pub(crate) fn run_track(
-    target: &BranchTarget,
+    fork: &Fork<'_>,
+    branch: &BranchName,
     pr: Option<u64>,
     fork_only: bool,
     forget: bool,
+    bound: Option<&RepoName>,
 ) -> anyhow::Result<Exit> {
-    let registry = load(&default_config_path())?;
-    let Some(entry) = registry.get(&target.repo) else {
-        eprintln!("unknown repo {}", target.repo);
-        return Ok(Exit::Usage);
-    };
+    let target = &BranchTarget::new(fork.name.clone(), branch.clone());
     let mut store = Store::open_for_update(default_state_path())?;
     // Read before the change, so a withdrawal is still filed under the number it
     // withdrew.
@@ -297,7 +306,7 @@ pub(crate) fn run_track(
         (format!("stated as #{number}"), Some(number))
     };
     store.save()?;
-    scribe_for(&target.repo, entry)?.event(Some(target.branch.as_str()), text.clone(), stamped)?;
+    scribe_for(fork, bound)?.event(Some(branch.as_str()), text.clone(), stamped)?;
     println!("{target} {}", spoken(&text));
     Ok(Exit::Ok)
 }
@@ -320,8 +329,18 @@ fn spoken(text: &str) -> String {
 /// Requirements are validated against the registry, because a dependency on a repo
 /// knives does not manage is a typo, and a typo that records silently is worse than
 /// no dependency at all: it reads as satisfied forever.
-pub(crate) fn run_depends(target: &BranchTarget, on: &[String]) -> anyhow::Result<Exit> {
-    let registry = load(&default_config_path())?;
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the registry the requirements are checked against, the fork, the branch, the requirements and the cwd binding are independent inputs"
+)]
+pub(crate) fn run_depends(
+    registry: &Registry,
+    fork: &Fork<'_>,
+    branch: &BranchName,
+    on: &[String],
+    bound: Option<&RepoName>,
+) -> anyhow::Result<Exit> {
+    let target = &BranchTarget::new(fork.name.clone(), branch.clone());
     let mut requirements = Vec::new();
     for text in on {
         let Some(requirement) = Requirement::parse(text) else {
@@ -339,23 +358,13 @@ pub(crate) fn run_depends(target: &BranchTarget, on: &[String]) -> anyhow::Resul
         }
         requirements.push(requirement);
     }
-    // Resolved before anything is written. Dispatch already validated this name
-    // through `one_repo`, so an absent entry is an invariant violation rather
-    // than a user error — and the one thing not to do with it is mutate the
-    // store and then quietly skip the ledger, which would leave a dependency
-    // recorded and unexplained.
-    let Some(entry) = registry.get(&target.repo) else {
-        let known: Vec<String> = registry.names().map(|name| name.to_string()).collect();
-        eprintln!("unknown repo {}; known: {}", target.repo, known.join(", "));
-        return Ok(Exit::Usage);
-    };
     let mut store = Store::open_for_update(default_state_path())?;
     store.add_dependencies(target, &requirements);
     let pr = store.tracked_pull(target);
     store.save()?;
     let listed: Vec<String> = requirements.iter().map(ToString::to_string).collect();
-    scribe_for(&target.repo, entry)?.event(
-        Some(target.branch.as_str()),
+    scribe_for(fork, bound)?.event(
+        Some(branch.as_str()),
         format!("requires {}", listed.join(", ")),
         pr,
     )?;

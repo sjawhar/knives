@@ -524,16 +524,23 @@ pub(crate) fn resolve_target_url(args: &[String], cwd: &Path) -> Option<String> 
     let registry = needs_git_inputs
         .then(|| crate::config::load(&crate::config::default_config_path()).ok())
         .flatten();
-    let registered_entry = registry
+    let bound = registry
         .as_ref()
-        .and_then(|registry| registry.containing(cwd).map(|(_, entry)| entry));
-    let requires_git_remotes = needs_git_inputs
+        .and_then(|registry| crate::bind::here(registry, cwd).ok());
+    let registered_entry = bound.as_ref().map(|fork| fork.entry);
+    let requires_remotes = needs_git_inputs
         && (resolved_remote
             .as_ref()
             .is_some_and(|resolved| resolved.value == "base")
             || registered_entry.is_none());
-    let remotes = if requires_git_remotes {
-        crate::jj::git_remotes(cwd).unwrap_or_default()
+    let remotes = if requires_remotes {
+        bound
+            .as_ref()
+            .map(|fork| fork.checkout.remotes.clone())
+            .or_else(|| {
+                crate::bind::checkout_root(cwd).and_then(|root| crate::bind::remotes(&root).ok())
+            })
+            .unwrap_or_default()
     } else {
         BTreeMap::new()
     };
@@ -597,8 +604,10 @@ fn resolve_from_inputs(inputs: TargetInputs<'_>) -> Option<String> {
 
 /// The first `gh repo set-default` marker, if git reports one (shim lines 151-164).
 fn gh_resolved_remote(cwd: &Path) -> Option<OwnedResolvedRemote> {
-    let output = Command::new("git")
-        .current_dir(cwd)
+    // `bind::git` forbids discovery above the directory it is given, so it
+    // must be handed the repository root, not a subdirectory of it.
+    let root = crate::bind::checkout_root(cwd)?;
+    let output = crate::bind::git(&root)
         .args(["config", "--get-regexp", "^remote\\..*\\.gh-resolved$"])
         .output()
         .ok()?;
@@ -688,7 +697,6 @@ mod tests {
 
     use super::*;
     use std::collections::BTreeMap;
-    use std::path::PathBuf;
 
     fn with_env<T>(vars: &[(&'static str, &str)], run: impl FnOnce() -> T) -> T {
         let _lock = crate::config::test_support::environment_lock();
@@ -699,6 +707,31 @@ mod tests {
         }
         run()
         // `guard` restores every captured variable when it drops.
+    }
+
+    /// [`with_env`] with `PATH` prefixed by `directory`. The prefix is applied
+    /// under the lock: another test may hold `PATH` at a scratch value while
+    /// this one prepares, and a `PATH` read outside the lock would carry that
+    /// value in — and lose `git`.
+    fn with_path_prefix<T>(
+        directory: &Path,
+        vars: &[(&'static str, &str)],
+        run: impl FnOnce() -> T,
+    ) -> T {
+        let _lock = crate::config::test_support::environment_lock();
+        let mut names: Vec<&'static str> = vars.iter().map(|(name, _)| *name).collect();
+        names.push("PATH");
+        let guard = crate::config::test_support::EnvironmentGuard::capture(&names);
+        let path = format!(
+            "{}:{}",
+            directory.display(),
+            std::env::var("PATH").expect("PATH")
+        );
+        guard.set("PATH", &path);
+        for (name, value) in vars {
+            guard.set(name, value);
+        }
+        run()
     }
 
     #[test]
@@ -795,15 +828,10 @@ mod tests {
 
         // When: minting for a target under that host, with PATH and git config
         // pointed at the scratch versions.
-        let path = format!(
-            "{}:{}",
-            dir.path().display(),
-            std::env::var("PATH").expect("PATH")
-        );
         let gitconfig_path = gitconfig.display().to_string();
-        let token = with_env(
+        let token = with_path_prefix(
+            dir.path(),
             &[
-                ("PATH", &path),
                 ("GIT_CONFIG_GLOBAL", &gitconfig_path),
                 ("GIT_CONFIG_SYSTEM", "/dev/null"),
                 ("GIT_CONFIG_NOSYSTEM", "1"),
@@ -836,15 +864,10 @@ mod tests {
         .expect("write gitconfig");
 
         // When: the helper provides no token value.
-        let path = format!(
-            "{}:{}",
-            dir.path().display(),
-            std::env::var("PATH").expect("PATH")
-        );
         let gitconfig_path = gitconfig.display().to_string();
-        let token = with_env(
+        let token = with_path_prefix(
+            dir.path(),
             &[
-                ("PATH", &path),
                 ("GIT_CONFIG_GLOBAL", &gitconfig_path),
                 ("GIT_CONFIG_SYSTEM", "/dev/null"),
                 ("GIT_CONFIG_NOSYSTEM", "1"),
@@ -1046,17 +1069,10 @@ mod tests {
     #[test]
     fn registry_roles_beat_literal_remote_names_during_target_resolution() {
         let host = DEFAULT_HOST;
-        let entry = crate::config::RepoEntry {
-            path: PathBuf::from("/registered"),
-            upstream: format!("git@{host}:registered/upstream"),
-            origin: format!("git@{host}:registered/origin"),
-            base: None,
-            release: None,
-            release_branch: None,
-            test_count_command: None,
-            consumers: vec![],
-            workspaces: None,
-        };
+        let entry = crate::config::RepoEntry::new(
+            format!("git@{host}:registered/upstream"),
+            format!("git@{host}:registered/origin"),
+        );
         let remotes = BTreeMap::from([
             (
                 "upstream".to_owned(),
@@ -1085,17 +1101,10 @@ mod tests {
         // Shim lines 151-164: a gh-resolved marker ends resolution even if its
         // named base remote can no longer produce a URL.
         let host = DEFAULT_HOST;
-        let entry = crate::config::RepoEntry {
-            path: PathBuf::from("/registered"),
-            upstream: format!("git@{host}:registered/upstream"),
-            origin: format!("git@{host}:registered/origin"),
-            base: None,
-            release: None,
-            release_branch: None,
-            test_count_command: None,
-            consumers: vec![],
-            workspaces: None,
-        };
+        let entry = crate::config::RepoEntry::new(
+            format!("git@{host}:registered/upstream"),
+            format!("git@{host}:registered/origin"),
+        );
         let remotes = BTreeMap::from([(
             "origin".to_owned(),
             format!("https://{host}/fallback/repository"),

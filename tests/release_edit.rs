@@ -381,8 +381,7 @@ fn an_edit_refuses_when_the_upstream_trunk_cannot_resolve() {
     std::fs::write(
         home.path().join("repos.toml"),
         format!(
-            "[repos.demo]\npath = \"{}\"\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/work.git\"\nbase = \"missing\"\n",
-            lab.work.display(),
+            "[repos.demo]\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/work.git\"\nbase = \"missing\"\n",
             lab.upstream.display(),
         ),
     )

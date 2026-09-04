@@ -9,11 +9,11 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::path::Path;
 
+use crate::bind::Fork;
 use crate::cli::Exit;
-use crate::config::RepoEntry;
 use crate::detect::{Finding, divergent_changes, stale_parents};
 use crate::forge::{Forge, PullSummary};
-use crate::ids::{BookmarkRef, RepoName, is_release_name};
+use crate::ids::{BookmarkRef, is_release_name};
 use crate::jj::Repo;
 use crate::snapshot::{self, SnapshotConfig};
 use crate::store::Store;
@@ -171,8 +171,7 @@ pub struct Report {
 }
 
 pub struct GatherInput<'a> {
-    pub name: &'a RepoName,
-    pub entry: &'a RepoEntry,
+    pub fork: &'a Fork<'a>,
     pub store: &'a mut Store,
     pub forge: &'a dyn Forge,
     pub cache: Option<&'a Path>,
@@ -192,19 +191,21 @@ const fn select_none<T>(_: &snapshot::Discovery<'_>, _: &T) -> Vec<u64> {
 
 pub fn gather(input: GatherInput<'_>) -> Report {
     let GatherInput {
-        name,
-        entry,
+        fork,
         store,
         forge,
         cache,
     } = input;
+    let name = &fork.name;
+    let entry = fork.entry;
+    let checkout = &fork.checkout.path;
     let mut report = Report {
         repo: name.to_string(),
         ..Report::default()
     };
 
     for file in CONVENTION_FILES {
-        let path = entry.path.join(file);
+        let path = checkout.join(file);
         let Ok(content) = std::fs::read_to_string(&path) else {
             report.conventions.push(Convention::Absent {
                 file: (*file).to_owned(),
@@ -233,7 +234,7 @@ pub fn gather(input: GatherInput<'_>) -> Report {
 
     match snapshot::open(SnapshotConfig {
         forge,
-        path: &entry.path,
+        path: checkout,
         remotes: [
             entry.remote(crate::config::Role::Origin),
             entry.remote(crate::config::Role::Release),
@@ -249,7 +250,7 @@ pub fn gather(input: GatherInput<'_>) -> Report {
                 if let Err(note) = snapshot.persist(None) {
                     report.notes.push(note.to_string());
                 }
-                match Repo::open(&entry.path).and_then(|repo| repo.bookmark_tips()) {
+                match Repo::open(checkout).and_then(|repo| repo.bookmark_tips()) {
                     Ok(tips) => {
                         let ours: BTreeSet<String> = tips
                             .keys()
@@ -281,7 +282,7 @@ pub fn gather(input: GatherInput<'_>) -> Report {
     // The spec asks for claimed, stale, landed, or divergent. Everything but
     // landed is answerable read-only, so it is answered here; landed needs the
     // mutating probe and is reported as "not probed" rather than guessed.
-    match branch_states_with_findings(entry, &claims) {
+    match branch_states_with_findings(fork, &claims) {
         Ok((states, findings)) => {
             report.branch_state = states;
             report.findings.extend(findings);
@@ -296,17 +297,18 @@ pub fn gather(input: GatherInput<'_>) -> Report {
 /// Per-branch state, read-only. Public so an integration test can pin the
 /// change-id versus commit-id comparison, which was wrong once already.
 pub fn branch_states(
-    entry: &RepoEntry,
+    fork: &Fork<'_>,
     claims: &[&crate::store::Claim],
 ) -> anyhow::Result<Vec<BranchState>> {
-    branch_states_with_findings(entry, claims).map(|(states, _)| states)
+    branch_states_with_findings(fork, claims).map(|(states, _)| states)
 }
 
 fn branch_states_with_findings(
-    entry: &RepoEntry,
+    fork: &Fork<'_>,
     claims: &[&crate::store::Claim],
 ) -> anyhow::Result<(Vec<BranchState>, Vec<Finding>)> {
-    let repo = Repo::open(&entry.path)?;
+    let entry = fork.entry;
+    let repo = Repo::open(&fork.checkout.path)?;
     let tips = repo.bookmark_tips()?;
     let scheme = entry.release_scheme();
     let ignored: BTreeSet<crate::ids::BookmarkRef> =

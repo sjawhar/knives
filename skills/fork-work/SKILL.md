@@ -20,7 +20,14 @@ If the repository you are in, or the one you were about to clone, is in that lis
 a managed fork. It is shared with other agents, it has an upstream you may be
 contributing to, and there is already a right way to get a working copy of it.
 
-If it is not in that list, this skill does not apply — carry on normally. If a repository should be managed but is unregistered, run `knives register` inside it and hand the snippet to the human to paste into `repos.toml`. Do not edit `repos.toml` yourself.
+A row reading `not on this machine` is a scan miss, not proof of absence: the scan of `~`
+found no checkout here (three levels deep, jj checkouts only, dot-directories and symlinks
+skipped). Check deeper or elsewhere before cloning — every command except `knives repos`
+binds a checkout as soon as you stand inside it, wherever it is, so `cd` into the suspected
+directory and run `knives status`. A row naming two checkouts is a refusal: knives will not
+choose between them, and neither should you without asking.
+
+If it is not in that list, this skill does not apply — carry on normally. If a repository should be managed but is unregistered, run `knives register` inside it and hand the snippet to the human to paste into `repos.toml`; `already registered as <name>` means it is in the list under that name. Do not edit `repos.toml` yourself.
 
 ## Then find out what is going on in it
 

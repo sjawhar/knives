@@ -73,6 +73,8 @@ fn knives_cmd(scratch: &Path) -> Command {
         .env("GIT_CONFIG_GLOBAL", scratch.join("gitconfig"))
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("KNIVES_CONFIG_HOME", scratch)
+        .env("HOME", scratch)
+        .env("JJ_CONFIG", "/dev/null")
         .env_remove("GH_TOKEN");
     command
 }
@@ -478,12 +480,20 @@ fn registered_fork_roles_beat_nonstandard_remote_names() {
             &format!("https://{host}/wrong/two.git"),
         ],
     );
+    // The checkout is the registered fork because its `upstream` names the same
+    // repository as the entry, in the https spelling of the registry's git@ URL.
+    git_config(
+        &lab.work,
+        &[
+            "remote.upstream.url",
+            &format!("https://{host}/routed-a/upstream.git"),
+        ],
+    );
     let config_home = tempfile::tempdir().expect("config home");
     fs::write(
         config_home.path().join("repos.toml"),
         format!(
-            "[repos.registered]\npath = \"{}\"\nupstream = \"git@{host}:routed-a/upstream.git\"\norigin = \"git@{host}:routed-b/origin.git\"\n",
-            lab.work.display()
+            "[repos.registered]\nupstream = \"git@{host}:routed-a/upstream.git\"\norigin = \"git@{host}:routed-b/origin.git\"\n"
         ),
     )
     .expect("write registry");
@@ -498,6 +508,8 @@ fn registered_fork_roles_beat_nonstandard_remote_names() {
         .env("KNIVES_REAL_GH", dir.path().join("gh"))
         .env("FAKE_GH_LOG", &log)
         .env("KNIVES_CONFIG_HOME", config_home.path())
+        .env("HOME", lab.temp_path())
+        .env("JJ_CONFIG", "/dev/null")
         .env("PATH", helper_path(helper_dir.path()))
         .env("GIT_CONFIG_GLOBAL", &gitconfig)
         .output()
@@ -690,6 +702,8 @@ exit 127
         .env("GIT_CONFIG_GLOBAL", scripts.path().join("gitconfig"))
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("KNIVES_CONFIG_HOME", scripts.path())
+        .env("HOME", lab.temp_path())
+        .env("JJ_CONFIG", "/dev/null")
         .env_remove("GH_TOKEN")
         .env("KNIVES_REAL_GH", &real_gh)
         .env("PATH", path)

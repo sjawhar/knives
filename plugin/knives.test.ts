@@ -31,15 +31,29 @@ async function write(path: string, contents: string): Promise<void> {
   await writeFile(path, contents);
 }
 
+function gitRepository(root: string, remotes: ReadonlyArray<readonly [string, string]>): void {
+  const init = Bun.spawnSync(["git", "-C", root, "init", "--quiet"]);
+  if (init.exitCode !== 0) throw new Error(`git init failed: ${init.stderr.toString()}`);
+  for (const [name, url] of remotes) {
+    const added = Bun.spawnSync(["git", "-C", root, "remote", "add", name, url]);
+    if (added.exitCode !== 0) throw new Error(`git remote add failed: ${added.stderr.toString()}`);
+  }
+}
+
 async function repository(): Promise<Repository> {
   const home = await mkdtemp(join(tmpdir(), "knives-plugin-"));
   const root = join(home, "managed");
   const file = join(root, "src", "file.ts");
   await write(join(root, "AGENTS.md"), "PLUGIN_GUIDANCE");
   await write(file, "export {}\n");
+  // Managed (upstream matches the entry) and trusted (origin under a trusted owner).
+  gitRepository(root, [
+    ["upstream", "https://forge.invalid/maintainer/managed"],
+    ["origin", "https://forge.invalid/ours/managed"],
+  ]);
   await write(
     join(home, "repos.toml"),
-    `[repos.managed]\npath = "${root}"\nupstream = "u"\norigin = "o"\n`
+    `[repos.managed]\nupstream = "https://forge.invalid/maintainer/managed"\norigin = "https://forge.invalid/ours/managed"\n\n[trust]\nowners = ["ours"]\n`
   );
   return { home, root, file };
 }
@@ -729,7 +743,7 @@ test.serial.skipIf(realBinary.length === 0)(
   "fails closed and keeps valid roots through the real binary",
   async () => {
     try {
-      await withRepository(async ({ home, root, file }) => {
+      await withRepository(async ({ home, file }) => {
         process.env["KNIVES_CONFIG_HOME"] = home;
         const hooks = createKnivesHooks(undefined, readOptions(undefined));
         await rm(join(home, "repos.toml"));
@@ -748,9 +762,10 @@ test.serial.skipIf(realBinary.length === 0)(
         expect(malformed.output).toBe("tool output");
         const trusted = join(home, "trusted");
         await write(join(trusted, "AGENTS.md"), "TRUSTED_GUIDANCE");
+        gitRepository(trusted, [["origin", "https://forge.invalid/company/work"]]);
         await write(
           join(home, "repos.toml"),
-          `[repos.gone]\npath = "/not/here"\nupstream = "u"\norigin = "o"\n\n[repos.managed]\npath = "${root}"\nupstream = "u"\norigin = "o"\n\n[trusted.work]\npath = "${trusted}"\n`
+          `[repos.gone]\nupstream = "https://forge.invalid/maintainer/gone"\norigin = "https://forge.invalid/ours/gone"\n\n[repos.managed]\nupstream = "https://forge.invalid/maintainer/managed"\norigin = "https://forge.invalid/ours/managed"\n\n[trust]\nowners = ["ours"]\nrepos = ["company/work"]\n`
         );
         const valid = output();
         await hooks["tool.execute.after"](

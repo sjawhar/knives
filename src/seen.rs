@@ -13,8 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::commands::claim::Identity;
 use crate::commands::wip::workspace_for;
-use crate::config::{default_config_path, load as load_registry};
-use crate::ids::WorkspaceName;
+use crate::ids::{RepoName, WorkspaceName};
 use crate::jj::WorkspaceActivity;
 use crate::store::{Claim, OwnerKind, StoreLock, default_state_path};
 
@@ -44,12 +43,13 @@ pub enum LastSeen {
 ///
 /// The owner source is part of the observation key; OS-user identities are
 /// deliberately excluded because they would conflate every anonymous claimant.
-/// A resolved jj workspace also contributes its registered repository and
-/// workspace-directory name.
-pub fn record_observation(cwd: &Path, identity: &Identity) {
+/// `repo` is the entry the caller already bound `cwd` to (dispatch binds once
+/// per invocation; the hook has its match); with it, the jj workspace `cwd` is
+/// inside contributes `<repo>/<workspace-dir-name>`.
+pub fn record_observation(repo: Option<&RepoName>, cwd: &Path, identity: &Identity) {
     let owner =
         (identity.kind != OwnerKind::OsUser).then(|| (identity.kind, identity.owner.clone()));
-    let workspace = workspace_key(cwd);
+    let workspace = workspace_key(repo, cwd);
     if owner.is_none() && workspace.is_none() {
         return;
     }
@@ -136,12 +136,11 @@ fn seen_path() -> PathBuf {
     default_state_path().with_file_name("seen.json")
 }
 
-fn workspace_key(cwd: &Path) -> Option<String> {
+fn workspace_key(repo: Option<&RepoName>, cwd: &Path) -> Option<String> {
+    let repo = repo?;
     let workspace = cwd
         .ancestors()
         .find(|directory| directory.join(".jj").is_dir())?;
-    let registry = load_registry(&default_config_path()).ok()?;
-    let (repo, _) = registry.containing(workspace)?;
     let name = workspace.file_name()?.to_str()?;
     Some(format!("{repo}/{name}"))
 }
@@ -201,10 +200,12 @@ mod tests {
 
     use std::collections::BTreeMap;
 
-    use super::{LastSeen, Seen, WorkspaceActivity, last_seen, load, record_observation};
+    use super::{
+        LastSeen, Seen, WorkspaceActivity, last_seen, load, record_observation, workspace_key,
+    };
     use crate::commands::claim::Identity;
     use crate::config::test_support::{EnvironmentGuard, environment_lock};
-    use crate::ids::WorkspaceName;
+    use crate::ids::{RepoName, WorkspaceName};
     use crate::store::{Claim, OwnerKind, default_state_path};
 
     fn ts(raw: &str) -> jiff::Timestamp {
@@ -223,18 +224,54 @@ mod tests {
         }
     }
 
-    fn configured_workspace(home: &tempfile::TempDir) -> std::path::PathBuf {
+    /// A jj workspace directory named `feat-x`, with a subdirectory to stand in.
+    fn workspace(home: &tempfile::TempDir) -> std::path::PathBuf {
         let root = home.path().join("feat-x");
         std::fs::create_dir_all(root.join(".jj")).expect("create workspace marker");
-        std::fs::write(
-            home.path().join("repos.toml"),
-            format!(
-                "[repos.a]\npath = \"{}\"\nupstream = \"u\"\norigin = \"o\"\n",
-                root.display()
-            ),
-        )
-        .expect("write registry");
+        std::fs::create_dir_all(root.join("src")).expect("create a subdirectory");
         root
+    }
+
+    #[test]
+    fn a_workspace_key_is_the_bound_repository_and_the_workspace_directory_name() {
+        // The caller binds; this only names the workspace `cwd` is inside.
+        let home = tempfile::tempdir().expect("create home");
+        let root = workspace(&home);
+        let repo = RepoName::new("a");
+
+        assert_eq!(
+            workspace_key(Some(&repo), &root.join("src")).as_deref(),
+            Some("a/feat-x")
+        );
+        assert_eq!(workspace_key(None, &root.join("src")), None);
+        assert_eq!(workspace_key(Some(&repo), home.path()), None);
+    }
+
+    #[test]
+    fn an_observation_records_the_workspace_of_the_bound_repository() {
+        let _lock = environment_lock();
+        let environment = EnvironmentGuard::capture(&["KNIVES_CONFIG_HOME"]);
+        let home = tempfile::tempdir().expect("create config home");
+        environment.set(
+            "KNIVES_CONFIG_HOME",
+            home.path().to_str().expect("utf-8 path"),
+        );
+        let cwd = workspace(&home);
+        let identity = Identity {
+            owner: "agent-one".to_owned(),
+            kind: OwnerKind::HarnessSession,
+        };
+
+        record_observation(Some(&RepoName::new("a")), &cwd, &identity);
+
+        let seen = load();
+        assert!(seen.workspaces.contains_key("a/feat-x"), "was: {seen:?}");
+        assert!(
+            seen.owners
+                .get(&OwnerKind::HarnessSession)
+                .is_some_and(|owners| owners.contains_key("agent-one")),
+            "was: {seen:?}"
+        );
     }
 
     #[test]
@@ -344,9 +381,10 @@ mod tests {
             "KNIVES_CONFIG_HOME",
             home.path().to_str().expect("utf-8 path"),
         );
-        let cwd = configured_workspace(&home);
+        let cwd = workspace(&home);
 
         record_observation(
+            Some(&RepoName::new("a")),
             &cwd,
             &Identity {
                 owner: "terminal-user".to_owned(),
@@ -366,16 +404,16 @@ mod tests {
             "KNIVES_CONFIG_HOME",
             home.path().to_str().expect("utf-8 path"),
         );
-        let cwd = configured_workspace(&home);
+        let cwd = workspace(&home);
         let identity = Identity {
             owner: "agent-one".to_owned(),
             kind: OwnerKind::HarnessSession,
         };
 
-        record_observation(&cwd, &identity);
+        record_observation(Some(&RepoName::new("a")), &cwd, &identity);
         let path = default_state_path().with_file_name("seen.json");
         let first = std::fs::read_to_string(&path).expect("first observation persisted");
-        record_observation(&cwd, &identity);
+        record_observation(Some(&RepoName::new("a")), &cwd, &identity);
         let second = std::fs::read_to_string(&path).expect("second observation persisted");
 
         assert_eq!(first, second, "a fresh sighting must not rewrite seen.json");
@@ -390,7 +428,7 @@ mod tests {
             "KNIVES_CONFIG_HOME",
             home.path().to_str().expect("utf-8 path"),
         );
-        let cwd = configured_workspace(&home);
+        let cwd = workspace(&home);
         let stale = jiff::Timestamp::now()
             .checked_sub(jiff::SignedDuration::from_hours(91 * 24))
             .expect("91 days is within Jiff's timestamp range")
@@ -410,6 +448,7 @@ mod tests {
         .expect("write stale observations");
 
         record_observation(
+            Some(&RepoName::new("a")),
             &cwd,
             &Identity {
                 owner: "agent-one".to_owned(),

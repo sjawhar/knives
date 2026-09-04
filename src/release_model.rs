@@ -76,9 +76,7 @@ fn extend_scanned_texts<'a>(
 
 /// The repository's name as it appears in a dependency line, e.g. `sandbox-runner`.
 pub fn repo_slug(entry: &RepoEntry) -> Option<String> {
-    let last = entry.remote(Role::Origin).rsplit('/').next()?;
-    let trimmed = last.trim_end_matches(".git");
-    (!trimmed.is_empty()).then(|| trimmed.to_owned())
+    crate::remote_url::repository_name(entry.remote(Role::Origin)).map(str::to_owned)
 }
 
 /// The release the next cut carries: the local composition in hand, preferred

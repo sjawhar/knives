@@ -22,15 +22,12 @@ struct DiskState {
     repos: HashMap<PathBuf, RepoFlags>,
     #[serde(default)]
     seen_notices: HashMap<PathBuf, BTreeSet<String>>,
-    #[serde(default)]
-    owner_remotes: HashMap<PathBuf, Vec<String>>,
 }
 
 #[derive(Debug, Default)]
 pub struct SessionState {
     repos: HashMap<PathBuf, RepoFlags>,
     seen_notices: HashMap<PathBuf, BTreeSet<String>>,
-    owner_remotes: HashMap<PathBuf, Vec<String>>,
 }
 
 impl SessionState {
@@ -41,14 +38,6 @@ impl SessionState {
 
     pub fn repo(&self, root: &Path) -> RepoFlags {
         self.repos.get(root).copied().unwrap_or_default()
-    }
-
-    /// Returns the raw remote owners previously resolved for this checkout.
-    ///
-    /// These facts, rather than a trust verdict, are cached because a cached verdict
-    /// outlived the registry edit that should have revoked it.
-    pub fn owner_remotes(&self, root: &Path) -> Option<&[String]> {
-        self.owner_remotes.get(root).map(Vec::as_slice)
     }
 
     pub fn update(
@@ -84,18 +73,9 @@ impl SessionState {
             .is_some_and(|notices| notices.contains(digest))
     }
 
-    /// Caches resolved remote owners so registry changes can be re-evaluated without Git.
-    ///
-    /// Retaining the facts prevents a cached verdict from outliving the registry edit
-    /// that should have revoked it.
-    pub fn record_owner_remotes(&mut self, root: &Path, owners: Vec<String>) {
-        self.owner_remotes.insert(root.to_owned(), owners);
-    }
-
     pub fn clear(&mut self) {
         self.repos.clear();
         self.seen_notices.clear();
-        self.owner_remotes.clear();
     }
 
     pub fn delete(home: &Path, harness: &str, session_id: &str) {
@@ -110,7 +90,6 @@ impl SessionState {
             .map_or_else(Self::default, |disk| Self {
                 repos: disk.repos,
                 seen_notices: disk.seen_notices,
-                owner_remotes: disk.owner_remotes,
             })
     }
 
@@ -122,7 +101,6 @@ impl SessionState {
             &DiskState {
                 repos: self.repos.clone(),
                 seen_notices: self.seen_notices.clone(),
-                owner_remotes: self.owner_remotes.clone(),
             },
         )?;
         temporary.write_all(b"\n")?;
@@ -264,29 +242,6 @@ mod tests {
     }
 
     #[test]
-    fn owner_remotes_survive_updates_and_clear() {
-        // Given: remote owners recorded for an otherwise untracked repository root.
-        let home = tempfile::tempdir().unwrap();
-        let root = Path::new("/some/repo");
-        SessionState::update(home.path(), "claude-code", "s1", |state| {
-            state.record_owner_remotes(root, vec!["trusted-owner".to_owned()]);
-        })
-        .unwrap();
-
-        // When: the session is reloaded, then cleared through the persisted update path.
-        let reloaded = SessionState::load(home.path(), "claude-code", "s1");
-        SessionState::update(home.path(), "claude-code", "s1", SessionState::clear).unwrap();
-
-        // Then: the raw owners round-trip before clear and are absent afterwards.
-        let expected = vec!["trusted-owner".to_owned()];
-        assert_eq!(reloaded.owner_remotes(root), Some(expected.as_slice()));
-        assert_eq!(
-            SessionState::load(home.path(), "claude-code", "s1").owner_remotes(root),
-            None
-        );
-    }
-
-    #[test]
     fn a_corrupt_state_file_loads_as_empty() {
         let home = tempfile::tempdir().unwrap();
         let dir = home.path().join("hook-sessions");
@@ -321,7 +276,12 @@ mod tests {
         let stale = dir.join("claude-code-old.json");
         std::fs::write(&stale, b"{}").unwrap();
         let old = std::time::SystemTime::now() - std::time::Duration::from_secs(8 * 24 * 3600);
-        filetime::set_file_mtime(&stale, filetime::FileTime::from_system_time(old)).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&stale)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
         SessionState::update(home.path(), "claude-code", "s1", |state| {
             state.mark_guided(Path::new("/r"));
         })

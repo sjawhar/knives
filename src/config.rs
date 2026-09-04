@@ -106,13 +106,15 @@ impl fmt::Display for Role {
     }
 }
 
-/// One repository as it appears on disk in the registry.
+/// One repository as the registry describes it: identity, remotes by role,
+/// policy. Where its checkout lives on this machine is not registry content;
+/// [`crate::bind`] finds it by its remotes.
 ///
 /// `upstream` and `origin` are required by the type, so a registry missing
 /// either fails to parse rather than failing later at the first query.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RepoEntry {
-    pub path: PathBuf,
     pub upstream: String,
     pub origin: String,
     /// Upstream's trunk: the branch we fork from, measure landed against, and
@@ -141,36 +143,30 @@ pub struct RepoEntry {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub consumers: Vec<String>,
     /// Where this repository's branch workspaces live. Absent, they sit beside
-    /// the checkout: the `<name>/default` layout, where each workspace is a
-    /// sibling of `default`.
+    /// the found checkout: the `<name>/default` layout, where each workspace is
+    /// a sibling of `default`.
     ///
     /// Set it for a checkout at `~/<name>`: with no `default` leaf there is no
-    /// room for siblings, and each branch would land in `~` itself. Resolved
-    /// like `path`: `~` expands, and a relative value is taken from the config
-    /// directory, not the checkout.
+    /// room for siblings, and each branch would land in `~` itself. A
+    /// preference, valid on every machine: `~` expands, and a relative value is
+    /// taken from the config directory, not the checkout.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspaces: Option<PathBuf>,
 }
 
 impl RepoEntry {
-    /// The repository's location, resolved the same way the plugin resolves it.
-    ///
-    /// The two sides used to disagree: the plugin expanded `~` and resolved a
-    /// relative path against the config home, while this side used the value
-    /// verbatim, i.e. relative to the process's current directory. A
-    /// `path = "~/repos/x"` entry was therefore a working allowlist entry and a
-    /// broken CLI entry, so the trust set and the tool covered different
-    /// directories. One rule now, and it is the plugin's.
-    pub fn resolved_path(&self, config_home: &Path) -> PathBuf {
-        expand_registry_path(&self.path, config_home)
-    }
-
-    /// The directory `knives start` opens this repository's workspaces under,
-    /// and `finish` removes them from.
-    pub fn workspace_root(&self) -> &Path {
-        self.workspaces
-            .as_deref()
-            .unwrap_or_else(|| self.path.parent().unwrap_or(&self.path))
+    /// An entry with the two required remotes and every option unset.
+    pub fn new(upstream: impl Into<String>, origin: impl Into<String>) -> Self {
+        Self {
+            upstream: upstream.into(),
+            origin: origin.into(),
+            base: None,
+            release: None,
+            release_branch: None,
+            test_count_command: None,
+            consumers: Vec::new(),
+            workspaces: None,
+        }
     }
 
     /// The remote for a role. Total: every role resolves.
@@ -265,58 +261,68 @@ impl RepoEntry {
     }
 }
 
-/// A repository whose agent instructions we trust, but which we do not maintain.
-///
-/// Deliberately its own section rather than a fork entry with optional remotes.
-/// `RepoEntry` requires `upstream` and `origin` so that a malformed fork entry
-/// fails at parse time; relaxing them to fit a repository that has no upstream
-/// would trade that for a failure at the first query instead. A company repo
-/// with nothing to contribute upstream is a different kind of thing, so it gets
-/// a different shape: a path, and nothing else to get wrong.
-///
-/// No fork command reads these. They exist so the plugin can surface a
-/// repository's own instructions when an agent reads its files, which is
-/// useful well beyond the set of repositories we maintain forks of.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TrustedEntry {
-    pub path: PathBuf,
-}
-
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TrustRules {
+    /// Repositories trusted for guidance by identity: `owner/repo`, matched
+    /// against any remote of a checkout, case-insensitively, `.git` stripped
+    /// from both sides.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repos: Vec<String>,
     /// Directory subtrees whose repositories are all trusted for guidance.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub roots: Vec<PathBuf>,
     /// Forge owners whose repositories are trusted for guidance, matched
-    /// against remote URLs case-insensitively.
+    /// against every remote URL of a checkout case-insensitively.
     ///
     /// SECURITY: matches SELF-DECLARED remote URLs read from the candidate
-    /// checkout's own git config — not forge-authenticated; any cloned repo can
-    /// claim any owner; grants guidance-as-data injection only (same grant as a
-    /// `[trusted]` entry), never fork-command access; prefer roots when in doubt.
-    /// The probe accepts only the checkout's own Git toplevel, so nested directories
-    /// cannot inherit an enclosing checkout's identity. Owner rules read Git remote
-    /// config, so jj-only checkouts match only through `roots`.
+    /// checkout's own jj or git configuration — not forge-authenticated; any
+    /// cloned repo can claim any owner; grants guidance-as-data injection only,
+    /// never fork-command access; prefer roots when in doubt. Remotes are read
+    /// from the nearest repository root only, so a directory nested inside a
+    /// checkout cannot inherit the enclosing checkout's identity.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub owners: Vec<String>,
 }
 
 impl TrustRules {
     pub const fn is_empty(&self) -> bool {
-        self.roots.is_empty() && self.owners.is_empty()
+        self.repos.is_empty() && self.roots.is_empty() && self.owners.is_empty()
     }
-}
 
-/// Whether a guidance root comes from a maintained fork or trusted instructions.
-///
-/// The distinction survives resolution because callers may surface contribution
-/// guidance for either kind without treating a trusted repository as a fork.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GuidanceRootKind {
-    /// A maintained fork declared under `[repos.*]`.
-    Managed,
-    /// A repository whose instructions are trusted under `[trusted.*]`.
-    Trusted,
+    /// Whether `roots` contains `root` (canonicalised, component-wise). Decided
+    /// from the path alone: it needs no remotes.
+    pub fn contains_root(&self, root: &Path) -> bool {
+        // Trust roots are tilde-expanded at load but can be symlinked; compare
+        // canonical paths when possible so a real checkout under one is not missed.
+        self.roots.iter().any(|configured| {
+            let trusted = configured
+                .canonicalize()
+                .unwrap_or_else(|_| configured.clone());
+            root.strip_prefix(&trusted).is_ok()
+        })
+    }
+
+    /// Whether `owners` matches any remote's owner segment, or `repos` any
+    /// remote's `owner/repo` slug.
+    pub fn grants_by_remotes(&self, remotes: &BTreeMap<String, String>) -> bool {
+        remotes.values().any(|url| {
+            let owned = crate::remote_url::url_owner(url).is_some_and(|owner| {
+                self.owners
+                    .iter()
+                    .any(|trusted| trusted.eq_ignore_ascii_case(owner))
+            });
+            let listed = crate::remote_url::remote_slug(url).is_some_and(|slug| {
+                self.repos.iter().any(|trusted| {
+                    trusted
+                        .strip_suffix(".git")
+                        .unwrap_or(trusted)
+                        .eq_ignore_ascii_case(slug)
+                })
+            });
+            owned || listed
+        })
+    }
 }
 
 /// A canonical repository root eligible to provide agent guidance.
@@ -324,28 +330,15 @@ pub enum GuidanceRootKind {
 pub struct GuidanceRoot {
     pub name: String,
     pub root: PathBuf,
-    pub kind: GuidanceRootKind,
-}
-
-impl TrustedEntry {
-    /// Resolved exactly as `RepoEntry::resolved_path` resolves, and for the same
-    /// reason: the CLI and the plugin must agree on which directory an entry names.
-    pub fn resolved_path(&self, config_home: &Path) -> PathBuf {
-        expand_registry_path(&self.path, config_home)
-    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Registry {
     #[serde(default)]
     pub repos: BTreeMap<String, RepoEntry>,
-    /// Trusted but unmaintained. Present on this type, rather than ignored as an
-    /// unknown section, because `save` rewrites the whole file: a section serde
-    /// does not know about would be silently deleted the next time `init` runs.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub trusted: BTreeMap<String, TrustedEntry>,
-    /// Trust rules stay on this type because `save` rewrites the whole file;
-    /// an unknown section would otherwise be silently deleted by `init`.
+    /// Which repositories' instructions the hook injects as guidance. Decided
+    /// by remote identity or by subtree, never by a fork entry.
     #[serde(default, skip_serializing_if = "TrustRules::is_empty")]
     pub trust: TrustRules,
 }
@@ -359,91 +352,15 @@ impl Registry {
         self.repos.is_empty()
     }
 
-    /// Return the existing registry entries that may provide guidance.
-    ///
-    /// Resolve and skip each entry independently: a moved checkout must not disable
-    /// guidance for the remaining registered repositories.
-    pub fn guidance_roots(&self) -> Vec<GuidanceRoot> {
-        let managed = self.repos.iter().filter_map(|(name, entry)| {
-            entry.path.canonicalize().ok().map(|root| GuidanceRoot {
-                name: name.clone(),
-                root,
-                kind: GuidanceRootKind::Managed,
-            })
-        });
-        let trusted = self.trusted.iter().filter_map(|(name, entry)| {
-            entry.path.canonicalize().ok().map(|root| GuidanceRoot {
-                name: name.clone(),
-                root,
-                kind: GuidanceRootKind::Trusted,
-            })
-        });
-        managed.chain(trusted).collect()
-    }
-
-    /// The managed repo that contains `path`, if any.
-    ///
-    /// Longest root wins, so a repo checked out inside another repo resolves to the
-    /// inner one. When `path` is a jj workspace beside its registered checkout,
-    /// `.jj/repo` points back to that checkout's repository store; following that
-    /// pointer retains the same component-based containment rule.
-    pub fn containing(&self, path: &Path) -> Option<(RepoName, &RepoEntry)> {
-        self.containing_direct(path).or_else(|| {
-            workspace_checkout(path).and_then(|checkout| self.containing_direct(&checkout))
-        })
-    }
-
-    fn containing_direct(&self, path: &Path) -> Option<(RepoName, &RepoEntry)> {
-        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_owned());
-        self.repos
-            .iter()
-            .filter(|(_, entry)| {
-                let root = entry
-                    .path
-                    .canonicalize()
-                    .unwrap_or_else(|_| entry.path.clone());
-                canonical == root || canonical.strip_prefix(&root).is_ok()
-            })
-            .max_by_key(|(_, entry)| entry.path.components().count())
-            .map(|(name, entry)| (RepoName::new(name.clone()), entry))
-    }
-
     pub fn names(&self) -> impl Iterator<Item = RepoName> + '_ {
         self.repos.keys().map(|name| RepoName::new(name.clone()))
     }
-}
-
-/// The registered checkout behind a jj workspace, when `path` is inside one.
-fn workspace_checkout(path: &Path) -> Option<PathBuf> {
-    for directory in path.ancestors() {
-        let pointer = directory.join(".jj").join("repo");
-        if !pointer.is_file() {
-            continue;
-        }
-        let store = PathBuf::from(std::fs::read_to_string(&pointer).ok()?.trim());
-        let store = if store.is_absolute() {
-            store
-        } else {
-            pointer.parent()?.join(store)
-        };
-        let checkout = store.parent()?.parent()?;
-        return checkout
-            .canonicalize()
-            .ok()
-            .or_else(|| Some(checkout.to_owned()));
-    }
-    None
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("reading {path}: {source}")]
     Read {
-        path: PathBuf,
-        source: std::io::Error,
-    },
-    #[error("writing {path}: {source}")]
-    Write {
         path: PathBuf,
         source: std::io::Error,
     },
@@ -454,27 +371,19 @@ pub enum ConfigError {
     },
     #[error("{path} is not a valid registry: {detail}")]
     Invalid { path: PathBuf, detail: String },
-    #[error("serialising the registry: {source}")]
-    Serialise {
-        #[from]
-        source: toml::ser::Error,
-    },
 }
 
-/// Where the registry lives.
-///
-/// `KNIVES_CONFIG_HOME` wins over `XDG_CONFIG_HOME` so this tool can be pointed
-/// elsewhere without moving every other tool's config too. Redirecting
-/// `XDG_CONFIG_HOME` to isolate this tool also hides the forge CLI's
-/// credentials, which turns a working setup into an authentication failure.
 /// Expand `~` and resolve a relative registry path against the config home.
+///
+/// With no home directory `~` stays as written; the caller that needs it
+/// reports the missing home.
 pub fn expand_registry_path(path: &Path, config_home: &Path) -> PathBuf {
     let text = path.to_string_lossy();
     if text == "~" {
-        return home_dir();
+        return home_dir().unwrap_or_else(|| path.to_owned());
     }
     if let Some(rest) = text.strip_prefix("~/") {
-        return home_dir().join(rest);
+        return home_dir().map_or_else(|| path.to_owned(), |home| home.join(rest));
     }
     if path.is_absolute() {
         return path.to_owned();
@@ -482,10 +391,26 @@ pub fn expand_registry_path(path: &Path, config_home: &Path) -> PathBuf {
     config_home.join(path)
 }
 
-fn home_dir() -> PathBuf {
-    std::env::var("HOME").map_or_else(|_| PathBuf::from("/"), PathBuf::from)
+/// `$HOME`: the scan root for finding checkouts, and what `~` expands to.
+///
+/// `None` when unset or empty — the scan callers refuse rather than scanning
+/// `/`. No password-database fallback: the refusal says `HOME is not set`, and
+/// a fallback would make it unreachable on any machine with a passwd entry.
+pub fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
 }
 
+/// What the scan callers print when [`home_dir`] is `None`.
+pub const NO_HOME: &str = "HOME is not set; knives scans $HOME for checkouts";
+
+/// Where the registry lives.
+///
+/// `KNIVES_CONFIG_HOME` wins over `XDG_CONFIG_HOME` so this tool can be pointed
+/// elsewhere without moving every other tool's config too. Redirecting
+/// `XDG_CONFIG_HOME` to isolate this tool also hides the forge CLI's
+/// credentials, which turns a working setup into an authentication failure.
 pub fn default_config_path() -> PathBuf {
     if let Ok(home) = std::env::var("KNIVES_CONFIG_HOME") {
         return PathBuf::from(home).join("repos.toml");
@@ -495,8 +420,8 @@ pub fn default_config_path() -> PathBuf {
             // Never the current directory: that silently relocates the trust
             // set, and the registry decides which repositories the plugin will
             // inject guidance from.
-            std::env::var("HOME")
-                .map_or_else(|_| PathBuf::from("/nonexistent"), PathBuf::from)
+            home_dir()
+                .unwrap_or_else(|| PathBuf::from("/nonexistent"))
                 .join(".config")
         },
         PathBuf::from,
@@ -514,10 +439,28 @@ pub fn load(path: &Path) -> Result<Registry, ConfigError> {
         path: path.to_owned(),
         source,
     })?;
-    let mut registry: Registry = toml::from_str(&text).map_err(|source| ConfigError::Parse {
-        path: path.to_owned(),
-        source: Box::new(source),
-    })?;
+    let mut registry: Registry = match toml::from_str(&text) {
+        Ok(registry) => registry,
+        // A deleted field or table gets a message naming its replacement,
+        // rather than serde's "unknown field"; both are named when both remain.
+        Err(source) => {
+            let raw = raw_table(&text, path)?;
+            let rejections: Vec<String> = deleted_trusted_table(&raw)
+                .into_iter()
+                .chain(deleted_path_field(&raw))
+                .collect();
+            if rejections.is_empty() {
+                return Err(ConfigError::Parse {
+                    path: path.to_owned(),
+                    source: Box::new(source),
+                });
+            }
+            return Err(ConfigError::Invalid {
+                path: path.to_owned(),
+                detail: rejections.join("; "),
+            });
+        }
+    };
     for name in registry.repos.keys() {
         if name.is_empty()
             || name == "."
@@ -532,12 +475,12 @@ pub fn load(path: &Path) -> Result<Registry, ConfigError> {
             });
         }
     }
-    // Resolve once, here, so no caller can accidentally use the raw value and
-    // end up pointed somewhere other than the plugin's allowlist.
-    let home = path.parent().unwrap_or_else(|| Path::new(".")).to_owned();
+    reject_shared_upstreams(&registry, path)?;
+    reject_tilde_paths_without_a_home(&registry, path)?;
+    let config_home = path.parent().unwrap_or_else(|| Path::new(".")).to_owned();
     for (name, entry) in &mut registry.repos {
-        entry.path = entry.resolved_path(&home);
-        entry.workspaces = checked_workspaces(name, entry, &home, path)?;
+        entry.workspaces =
+            checked_workspaces(name, entry.workspaces.as_deref(), &config_home, path)?;
         for (role, remote) in [
             ("upstream", entry.upstream.as_str()),
             ("origin", entry.origin.as_str()),
@@ -552,34 +495,7 @@ pub fn load(path: &Path) -> Result<Registry, ConfigError> {
                 });
             }
         }
-        if let Some(name) = entry.release_branch.as_deref() {
-            if name.is_empty() {
-                return Err(ConfigError::Invalid {
-                    path: path.to_owned(),
-                    detail: "release_branch is empty; a fixed release scheme needs a branch name"
-                        .to_owned(),
-                });
-            }
-            if name == entry.trunk() {
-                return Err(ConfigError::Invalid {
-                    path: path.to_owned(),
-                    detail: format!(
-                        "release_branch {name:?} names the trunk; a release branch shadowing the \
-                         trunk corrupts every trunk exclusion"
-                    ),
-                });
-            }
-            if name.starts_with(crate::ids::RELEASE_PREFIX) {
-                return Err(ConfigError::Invalid {
-                    path: path.to_owned(),
-                    detail: format!(
-                        "release_branch {name:?} sits in the dated {} namespace; the two schemes \
-                         must not collide",
-                        crate::ids::RELEASE_PREFIX
-                    ),
-                });
-            }
-        }
+        checked_release_branch(entry, path)?;
         for consumer in &entry.consumers {
             if !is_forge_slug(consumer) {
                 return Err(ConfigError::Invalid {
@@ -593,28 +509,182 @@ pub fn load(path: &Path) -> Result<Registry, ConfigError> {
             }
         }
     }
-    for entry in registry.trusted.values_mut() {
-        entry.path = entry.resolved_path(&home);
+    for slug in &registry.trust.repos {
+        if !is_forge_slug(slug) {
+            return Err(ConfigError::Invalid {
+                path: path.to_owned(),
+                detail: format!(
+                    "[trust] repos takes forge slugs (\"<owner>/<repo>\"); found \"{slug}\""
+                ),
+            });
+        }
     }
     for root in &mut registry.trust.roots {
-        *root = expand_registry_path(root, &home);
+        *root = expand_registry_path(root, &config_home);
     }
     Ok(registry)
 }
 
-/// An entry's `workspaces`, resolved like `path` and checked. `entry.path` must
-/// already be resolved.
+/// A `~` in `workspaces` or `[trust] roots` expands through [`home_dir`]. With
+/// no home it would stay as written — a *relative* path `~/…` — and `knives
+/// start` would open workspaces under `<cwd>/~/…`. Refused by name instead.
+fn reject_tilde_paths_without_a_home(registry: &Registry, path: &Path) -> Result<(), ConfigError> {
+    if home_dir().is_some() {
+        return Ok(());
+    }
+    let is_tilde = |value: &Path| {
+        let text = value.to_string_lossy();
+        text == "~" || text.starts_with("~/")
+    };
+    let offending = registry
+        .repos
+        .iter()
+        .filter_map(|(name, entry)| {
+            let workspaces = entry
+                .workspaces
+                .as_deref()
+                .filter(|value| is_tilde(value))?;
+            Some(format!(
+                "[repos.{name}] workspaces = \"{}\" needs HOME",
+                workspaces.display()
+            ))
+        })
+        .chain(
+            registry
+                .trust
+                .roots
+                .iter()
+                .filter(|root| is_tilde(root))
+                .map(|root| format!("[trust] roots = \"{}\" needs HOME", root.display())),
+        )
+        .collect::<Vec<_>>();
+    if offending.is_empty() {
+        return Ok(());
+    }
+    Err(ConfigError::Invalid {
+        path: path.to_owned(),
+        detail: format!("{NO_HOME}: {}", offending.join("; ")),
+    })
+}
+
+/// A release branch named for the trunk would make every trunk exclusion also
+/// exclude the release, and one under the dated prefix would collide with the
+/// dated scheme's namespace. Both corrupt every downstream check.
+fn checked_release_branch(entry: &RepoEntry, path: &Path) -> Result<(), ConfigError> {
+    let Some(name) = entry.release_branch.as_deref() else {
+        return Ok(());
+    };
+    if name.is_empty() {
+        return Err(ConfigError::Invalid {
+            path: path.to_owned(),
+            detail: "release_branch is empty; a fixed release scheme needs a branch name"
+                .to_owned(),
+        });
+    }
+    if name == entry.trunk() {
+        return Err(ConfigError::Invalid {
+            path: path.to_owned(),
+            detail: format!(
+                "release_branch {name:?} names the trunk; a release branch shadowing the trunk \
+                 corrupts every trunk exclusion"
+            ),
+        });
+    }
+    if name.starts_with(crate::ids::RELEASE_PREFIX) {
+        return Err(ConfigError::Invalid {
+            path: path.to_owned(),
+            detail: format!(
+                "release_branch {name:?} sits in the dated {} namespace; the two schemes must \
+                 not collide",
+                crate::ids::RELEASE_PREFIX
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// The registry as a plain TOML table, for the checks that name a deleted field
+/// or table where serde only says "unknown field".
+fn raw_table(text: &str, path: &Path) -> Result<toml::Table, ConfigError> {
+    toml::from_str(text).map_err(|source| ConfigError::Parse {
+        path: path.to_owned(),
+        source: Box::new(source),
+    })
+}
+
+/// `[trusted.*]` was deleted with the registry's paths. A message that names the
+/// replacement beats serde's "unknown field" for the one section people had.
+fn deleted_trusted_table(raw: &toml::Table) -> Option<String> {
+    raw.get("trusted")
+        .and_then(toml::Value::as_table)
+        .and_then(|trusted| trusted.keys().next())
+        .map(|name| {
+            format!(
+                "[trusted.{name}] is no longer a registry table; move it to [trust] repos = \
+                 [\"<owner>/<repo>\"]"
+            )
+        })
+}
+
+/// `path` left the registry: checkouts are found by their remotes. Every
+/// offending entry is named, by name, with what replaced the field.
+fn deleted_path_field(raw: &toml::Table) -> Option<String> {
+    let repos = raw.get("repos").and_then(toml::Value::as_table)?;
+    let mut names: Vec<&String> = repos
+        .iter()
+        .filter(|(_, entry)| {
+            entry
+                .as_table()
+                .is_some_and(|table| table.contains_key("path"))
+        })
+        .map(|(name, _)| name)
+        .collect();
+    names.sort();
+    (!names.is_empty()).then(|| {
+        let listed = names
+            .iter()
+            .map(|name| format!("[repos.{name}]"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "{listed} path is no longer a registry field; delete it — knives finds checkouts \
+             by their remotes"
+        )
+    })
+}
+
+/// Identity is the `upstream` remote, so two entries naming one repository
+/// could never both bind. The first pair by name is reported in `a`'s spelling.
+fn reject_shared_upstreams(registry: &Registry, path: &Path) -> Result<(), ConfigError> {
+    let entries: Vec<(&String, &RepoEntry)> = registry.repos.iter().collect();
+    for (index, (a, first)) in entries.iter().enumerate() {
+        for (b, second) in entries.iter().skip(index + 1) {
+            if crate::remote_url::same_remote(&first.upstream, &second.upstream) {
+                return Err(ConfigError::Invalid {
+                    path: path.to_owned(),
+                    detail: format!(
+                        "[repos.{a}] and [repos.{b}] share upstream {}; identity must be unique",
+                        first.upstream
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// An entry's `workspaces`, expanded like every registry path and checked.
 ///
 /// Empty would resolve to the config home itself, putting every branch workspace
-/// beside the state file and the ledger; a directory inside the checkout puts
-/// them in the working copy they belong to. Neither is what anyone meant.
+/// beside the state file and the ledger. Whether it sits inside the checkout is
+/// checked where the checkout is known: `knives start` and `finish`.
 fn checked_workspaces(
     name: &str,
-    entry: &RepoEntry,
-    home: &Path,
+    raw: Option<&Path>,
+    config_home: &Path,
     path: &Path,
 ) -> Result<Option<PathBuf>, ConfigError> {
-    let Some(raw) = entry.workspaces.as_deref() else {
+    let Some(raw) = raw else {
         return Ok(None);
     };
     if raw.as_os_str().is_empty() {
@@ -623,19 +693,7 @@ fn checked_workspaces(
             detail: format!("[repos.{name}] workspaces is empty; name a directory or omit it"),
         });
     }
-    let workspaces = expand_registry_path(raw, home);
-    if workspaces.starts_with(&entry.path) {
-        return Err(ConfigError::Invalid {
-            path: path.to_owned(),
-            detail: format!(
-                "[repos.{name}] workspaces {} is inside the checkout {}; branch workspaces cannot \
-                 live in the working copy they belong to",
-                workspaces.display(),
-                entry.path.display()
-            ),
-        });
-    }
-    Ok(Some(workspaces))
+    Ok(Some(expand_registry_path(raw, config_home)))
 }
 
 fn is_forge_slug(value: &str) -> bool {
@@ -651,20 +709,6 @@ fn is_forge_slug(value: &str) -> bool {
         && !has_path_syntax(repository)
 }
 
-pub fn save(registry: &Registry, path: &Path) -> Result<(), ConfigError> {
-    let text = toml::to_string_pretty(registry)?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|source| ConfigError::Write {
-            path: parent.to_owned(),
-            source,
-        })?;
-    }
-    std::fs::write(path, text).map_err(|source| ConfigError::Write {
-        path: path.to_owned(),
-        source,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -676,12 +720,10 @@ mod tests {
 
     const SAMPLE: &str = r#"
 [repos.example]
-path = "/tmp/example"
 upstream = "https://example.invalid/upstream.git"
 origin = "https://example.invalid/origin.git"
 
 [repos.split]
-path = "/tmp/split"
 upstream = "https://example.invalid/upstream2.git"
 origin = "https://example.invalid/branches.git"
 release = "https://example.invalid/releases.git"
@@ -699,16 +741,15 @@ release = "https://example.invalid/releases.git"
         let registry = load(&write(dir.path(), SAMPLE)).unwrap();
         assert_eq!(registry.repos.len(), 2);
         assert_eq!(
-            registry.repos["example"].path,
-            PathBuf::from("/tmp/example")
+            registry.repos["example"].upstream,
+            "https://example.invalid/upstream.git"
         );
     }
 
     #[test]
     fn a_repo_name_that_escapes_the_ledger_directory_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
-        let text =
-            "[repos.\"../escape\"]\npath = \"/tmp/escape\"\nupstream = \"u\"\norigin = \"o\"\n";
+        let text = "[repos.\"../escape\"]\nupstream = \"u\"\norigin = \"o\"\n";
 
         let error = load(&write(dir.path(), text)).unwrap_err().to_string();
         assert!(error.contains("../escape"), "was: {error}");
@@ -727,14 +768,14 @@ release = "https://example.invalid/releases.git"
     #[test]
     fn the_release_scheme_is_dated_unless_a_fixed_branch_is_stated() {
         let dir = tempfile::tempdir().unwrap();
-        let plain = "[repos.demo]\npath = \"/tmp/d\"\nupstream = \"u\"\norigin = \"o\"\n";
+        let plain = "[repos.demo]\nupstream = \"u\"\norigin = \"o\"\n";
         let registry = load(&write(dir.path(), plain)).unwrap();
         assert_eq!(
             registry.repos["demo"].release_scheme(),
             crate::ids::ReleaseScheme::Dated
         );
 
-        let fixed = "[repos.demo]\npath = \"/tmp/d\"\nupstream = \"u\"\norigin = \"o\"\n\
+        let fixed = "[repos.demo]\nupstream = \"u\"\norigin = \"o\"\n\
                      release_branch = \"integration\"\n";
         let registry = load(&write(dir.path(), fixed)).unwrap();
         assert_eq!(
@@ -752,22 +793,22 @@ release = "https://example.invalid/releases.git"
         let dir = tempfile::tempdir().unwrap();
         for (text, needle) in [
             (
-                "[repos.d]\npath = \"/tmp/d\"\nupstream = \"u\"\norigin = \"o\"\n\
+                "[repos.d]\nupstream = \"u\"\norigin = \"o\"\n\
                  release_branch = \"\"\n",
                 "empty",
             ),
             (
-                "[repos.d]\npath = \"/tmp/d\"\nupstream = \"u\"\norigin = \"o\"\n\
+                "[repos.d]\nupstream = \"u\"\norigin = \"o\"\n\
                  release_branch = \"main\"\n",
                 "trunk",
             ),
             (
-                "[repos.d]\npath = \"/tmp/d\"\nupstream = \"u\"\norigin = \"o\"\n\
+                "[repos.d]\nupstream = \"u\"\norigin = \"o\"\n\
                  base = \"dev\"\nrelease_branch = \"dev\"\n",
                 "trunk",
             ),
             (
-                "[repos.d]\npath = \"/tmp/d\"\nupstream = \"u\"\norigin = \"o\"\n\
+                "[repos.d]\nupstream = \"u\"\norigin = \"o\"\n\
                  release_branch = \"release/2026-01-01\"\n",
                 "release/",
             ),
@@ -783,11 +824,11 @@ release = "https://example.invalid/releases.git"
         // expected base has to be knowable. Configurable because not every upstream calls
         // its default branch main.
         let dir = tempfile::tempdir().unwrap();
-        let plain = "[repos.demo]\npath = \"/tmp/d\"\nupstream = \"u\"\norigin = \"o\"\n";
+        let plain = "[repos.demo]\nupstream = \"u\"\norigin = \"o\"\n";
         let registry = load(&write(dir.path(), plain)).unwrap();
         assert_eq!(registry.repos["demo"].default_base(), "main");
 
-        let stated = "[repos.demo]\npath = \"/tmp/d\"\nupstream = \"u\"\norigin = \"o\"\n\
+        let stated = "[repos.demo]\nupstream = \"u\"\norigin = \"o\"\n\
                       base = \"develop\"\n";
         let registry = load(&write(dir.path(), stated)).unwrap();
         assert_eq!(registry.repos["demo"].default_base(), "develop");
@@ -798,12 +839,12 @@ release = "https://example.invalid/releases.git"
         // The trunk we fork from, measure landed against, and target PRs at are the
         // same branch in every repo we know of, so one field serves both meanings.
         let dir = tempfile::tempdir().unwrap();
-        let plain = "[repos.demo]\npath = \"/tmp/d\"\nupstream = \"u\"\norigin = \"o\"\n";
+        let plain = "[repos.demo]\nupstream = \"u\"\norigin = \"o\"\n";
         let registry = load(&write(dir.path(), plain)).unwrap();
         assert_eq!(registry.repos["demo"].trunk(), "main");
         assert_eq!(registry.repos["demo"].upstream_trunk(), "main@upstream");
 
-        let stated = "[repos.demo]\npath = \"/tmp/d\"\nupstream = \"u\"\norigin = \"o\"\n\
+        let stated = "[repos.demo]\nupstream = \"u\"\norigin = \"o\"\n\
                       base = \"dev\"\n";
         let registry = load(&write(dir.path(), stated)).unwrap();
         assert_eq!(registry.repos["demo"].trunk(), "dev");
@@ -829,7 +870,6 @@ release = "https://example.invalid/releases.git"
         let dir = tempfile::tempdir().unwrap();
         let text = "\
             [repos.demo]\n\
-            path = \"/tmp/d\"\n\
             upstream = \"https://forge.invalid/up/demo.git\"\n\
             origin = \"https://forge.invalid/ours/demo.git\"\n\
             release = \"https://forge.invalid/ours/demo.git\"\n";
@@ -845,7 +885,7 @@ release = "https://example.invalid/releases.git"
     fn a_registry_missing_a_required_role_fails_to_parse() {
         // Given: an entry with no upstream
         let dir = tempfile::tempdir().unwrap();
-        let text = "[repos.broken]\npath = \"/tmp/b\"\norigin = \"o\"\n";
+        let text = "[repos.broken]\norigin = \"o\"\n";
         // When: it is loaded
         let result = load(&write(dir.path(), text));
         // Then: it fails at parse time, naming the field, not later at query time
@@ -856,8 +896,7 @@ release = "https://example.invalid/releases.git"
     #[test]
     fn a_remote_url_that_looks_like_an_option_is_rejected_at_config_load() {
         let dir = tempfile::tempdir().unwrap();
-        let text =
-            "[repos.demo]\npath = \"/tmp/d\"\nupstream = \"u\"\norigin = \"--upload-pack=x\"\n";
+        let text = "[repos.demo]\nupstream = \"u\"\norigin = \"--upload-pack=x\"\n";
 
         let error = load(&write(dir.path(), text)).unwrap_err().to_string();
         assert!(error.contains("origin remote"), "was: {error}");
@@ -865,40 +904,9 @@ release = "https://example.invalid/releases.git"
     }
 
     #[test]
-    fn the_repo_containing_a_directory_is_found_and_a_sibling_is_not() {
-        // Requiring the repo name on every command is absurd when you are standing in
-        // the repository. Prefix matching would be worse than nothing: `<root>-2` is a
-        // different repository that shares the prefix.
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("managed");
-        let sibling = dir.path().join("managed-2");
-        std::fs::create_dir_all(root.join("src")).unwrap();
-        std::fs::create_dir_all(&sibling).unwrap();
-        let text = format!(
-            "[repos.managed]\npath = \"{}\"\nupstream = \"u\"\norigin = \"o\"\n",
-            root.display()
-        );
-        let registry = load(&write(dir.path(), &text)).unwrap();
-
-        assert_eq!(
-            registry.containing(&root.join("src")).map(|(n, _)| n),
-            Some(RepoName::new("managed"))
-        );
-        assert_eq!(
-            registry.containing(&root).map(|(n, _)| n),
-            Some(RepoName::new("managed"))
-        );
-        assert!(
-            registry.containing(&sibling).is_none(),
-            "a sibling is not inside"
-        );
-        assert!(registry.containing(dir.path()).is_none());
-    }
-
-    #[test]
     fn consumer_slugs_load_verbatim() {
         let dir = tempfile::tempdir().unwrap();
-        let text = "[repos.demo]\npath = \"/tmp/demo\"\nupstream = \"u\"\norigin = \"o\"\n\
+        let text = "[repos.demo]\nupstream = \"u\"\norigin = \"o\"\n\
                     consumers = [\"an-org/a-consumer\"]\n";
         let registry = load(&write(dir.path(), text)).unwrap();
         assert_eq!(
@@ -910,7 +918,7 @@ release = "https://example.invalid/releases.git"
     #[test]
     fn a_path_in_consumers_is_a_loud_config_error_naming_the_new_form() {
         let dir = tempfile::tempdir().unwrap();
-        let text = "[repos.demo]\npath = \"/tmp/demo\"\nupstream = \"u\"\norigin = \"o\"\n\
+        let text = "[repos.demo]\nupstream = \"u\"\norigin = \"o\"\n\
                     consumers = [\"~/one/default\"]\n";
         let error = load(&write(dir.path(), text)).unwrap_err().to_string();
         assert!(error.contains("forge slugs"), "was: {error}");
@@ -918,164 +926,211 @@ release = "https://example.invalid/releases.git"
     }
 
     #[test]
-    fn a_trusted_entry_needs_only_a_path() {
-        // Given: a repository we do not maintain and have no upstream for
+    fn trust_repos_are_forge_slugs_and_grant_by_any_remote() {
         let dir = tempfile::tempdir().unwrap();
-        let text = "[trusted.workbench]\npath = \"/tmp/workbench\"\n";
-        // When: the registry is loaded
-        let registry = load(&write(dir.path(), text)).unwrap();
-        // Then: it parses, with no remotes demanded of it
-        assert_eq!(
-            registry.trusted["workbench"].path,
-            PathBuf::from("/tmp/workbench")
-        );
-    }
-
-    #[test]
-    fn a_trusted_entry_is_invisible_to_fork_commands() {
-        // The parse-time guarantee that a fork entry carries its remotes only holds
-        // if trusted entries never reach the code that assumes it.
-        let dir = tempfile::tempdir().unwrap();
-        let text = "[trusted.workbench]\npath = \"/tmp/workbench\"\n";
-        let registry = load(&write(dir.path(), text)).unwrap();
-        assert!(registry.get(&RepoName::new("workbench")).is_none());
-        assert!(registry.repos.is_empty());
-    }
-
-    #[test]
-    fn guidance_roots_preserve_managed_and_trusted_kinds() {
-        // Given: one managed fork and one trusted repository that both exist.
-        let dir = tempfile::tempdir().unwrap();
-        let managed = dir.path().join("managed");
-        let trusted = dir.path().join("trusted");
-        std::fs::create_dir_all(&managed).unwrap();
-        std::fs::create_dir_all(&trusted).unwrap();
-        let text = format!(
-            "[repos.managed]\npath = \"{}\"\nupstream = \"u\"\norigin = \"o\"\n\n\
-             [trusted.workbench]\npath = \"{}\"\n",
-            managed.display(),
-            trusted.display()
-        );
-        let registry = load(&write(dir.path(), &text)).unwrap();
-
-        // When: their guidance roots are collected.
-        let roots = registry.guidance_roots();
-
-        // Then: the roots retain their distinct registry roles.
-        assert_eq!(roots.len(), 2);
-        assert!(roots.iter().any(|root| {
-            root.name == "managed"
-                && root.root == managed.canonicalize().unwrap()
-                && root.kind == GuidanceRootKind::Managed
-        }));
-        assert!(roots.iter().any(|root| {
-            root.name == "workbench"
-                && root.root == trusted.canonicalize().unwrap()
-                && root.kind == GuidanceRootKind::Trusted
-        }));
-    }
-
-    #[test]
-    fn guidance_roots_skip_an_unresolvable_entry_without_dropping_others() {
-        // Given: one existing managed fork and one trusted checkout that was moved away.
-        let dir = tempfile::tempdir().unwrap();
-        let managed = dir.path().join("managed");
-        std::fs::create_dir_all(&managed).unwrap();
-        let missing = dir.path().join("missing");
-        let text = format!(
-            "[repos.managed]\npath = \"{}\"\nupstream = \"u\"\norigin = \"o\"\n\n\
-             [trusted.moved]\npath = \"{}\"\n",
-            managed.display(),
-            missing.display()
-        );
-        let registry = load(&write(dir.path(), &text)).unwrap();
-
-        // When: roots are resolved from the registry.
-        let roots = registry.guidance_roots();
-
-        // Then: the moved entry is skipped without disabling the existing one.
-        assert_eq!(roots.len(), 1);
-        assert_eq!(roots[0].name, "managed");
-        assert_eq!(roots[0].kind, GuidanceRootKind::Managed);
-    }
-
-    #[test]
-    fn a_trusted_tilde_path_resolves_like_a_fork_path() {
-        let _lock = environment_lock();
-        let environment = EnvironmentGuard::capture(&["HOME"]);
-        environment.set("HOME", "/home/someone");
-        let dir = tempfile::tempdir().unwrap();
-        let text = "[trusted.workbench]\npath = \"~/workbench/default\"\n";
-        let registry = load(&write(dir.path(), text)).unwrap();
-        assert_eq!(
-            registry.trusted["workbench"].path,
-            PathBuf::from("/home/someone/workbench/default")
-        );
-    }
-
-    #[test]
-    fn workspaces_sit_beside_the_checkout_unless_the_entry_says_where() {
-        // The `<name>/default` layout: each branch's workspace is a sibling of
-        // `default`. Absent configuration keeps it, so no registered repository's
-        // existing workspaces move.
-        let dir = tempfile::tempdir().unwrap();
-        let text = "[repos.tool]\npath = \"/home/someone/forks/tool/default\"\nupstream = \"u\"\n\
-                    origin = \"o\"\n";
-        let registry = load(&write(dir.path(), text)).unwrap();
-        assert_eq!(
-            registry.repos["tool"].workspace_root(),
-            PathBuf::from("/home/someone/forks/tool")
-        );
-    }
-
-    #[test]
-    fn a_configured_workspaces_directory_is_where_workspaces_go() {
-        // A checkout at `~/<name>` has no room for siblings: they would land in `~`
-        // itself, one directory per branch across every repository.
-        let _lock = environment_lock();
-        let environment = EnvironmentGuard::capture(&["HOME"]);
-        environment.set("HOME", "/home/someone");
-        let dir = tempfile::tempdir().unwrap();
-        let text = "[repos.tool]\npath = \"~/tool\"\nupstream = \"u\"\norigin = \"o\"\n\
-                    workspaces = \"~/.worktrees/tool\"\n";
-        let registry = load(&write(dir.path(), text)).unwrap();
-        assert_eq!(
-            registry.repos["tool"].workspace_root(),
-            PathBuf::from("/home/someone/.worktrees/tool")
-        );
-    }
-
-    #[test]
-    fn saving_preserves_a_configured_workspaces_directory() {
-        // `init` rewrites the whole file; a field serde does not know about would
-        // silently move every workspace back beside the checkout.
-        let dir = tempfile::tempdir().unwrap();
-        let text = "[repos.tool]\npath = \"/tmp/tool\"\nupstream = \"u\"\norigin = \"o\"\n\
-                    workspaces = \"/tmp/worktrees/tool\"\n";
-        let path = write(dir.path(), text);
+        let path = dir.path().join("repos.toml");
+        std::fs::write(
+            &path,
+            "[trust]\nrepos = [\"Company/Tool\", \"company/other.git\"]\nowners = [\"someone\"]\n",
+        )
+        .unwrap();
         let registry = load(&path).unwrap();
+        let by_repo = BTreeMap::from([(
+            "origin".to_owned(),
+            "git@forge.example:company/tool.git".to_owned(),
+        )]);
+        assert!(registry.trust.grants_by_remotes(&by_repo));
+        let by_repo_with_git_suffix_configured = BTreeMap::from([(
+            "origin".to_owned(),
+            "https://forge.example/company/other".to_owned(),
+        )]);
+        assert!(
+            registry
+                .trust
+                .grants_by_remotes(&by_repo_with_git_suffix_configured)
+        );
+        let other = BTreeMap::from([(
+            "origin".to_owned(),
+            "https://forge.example/company/third".to_owned(),
+        )]);
+        assert!(!registry.trust.grants_by_remotes(&other));
+        let by_owner = BTreeMap::from([(
+            "upstream".to_owned(),
+            "https://forge.example/someone/anything".to_owned(),
+        )]);
+        assert!(registry.trust.grants_by_remotes(&by_owner));
+    }
 
-        save(&registry, &path).unwrap();
+    #[test]
+    fn a_trust_repo_that_is_not_a_slug_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("repos.toml");
+        std::fs::write(&path, "[trust]\nrepos = [\"~/somewhere\"]\n").unwrap();
+        let error = load(&path).unwrap_err().to_string();
+        assert!(
+            error.contains(
+                "[trust] repos takes forge slugs (\"<owner>/<repo>\"); found \"~/somewhere\""
+            ),
+            "{error}"
+        );
+    }
 
-        let reloaded = load(&path).unwrap();
+    #[test]
+    fn a_trusted_table_names_its_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("repos.toml");
+        std::fs::write(&path, "[trusted.work]\n").unwrap();
+        let error = load(&path).unwrap_err().to_string();
+        assert!(
+            error.contains(
+                "[trusted.work] is no longer a registry table; move it to [trust] repos = [\"<owner>/<repo>\"]"
+            ),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_path_field_names_its_removal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("repos.toml");
+        std::fs::write(
+            &path,
+            "[repos.tool]\npath = \"~/tool\"\nupstream = \"https://forge.example/org/tool\"\n\
+             origin = \"https://forge.example/ours/tool\"\n",
+        )
+        .unwrap();
+        let error = load(&path).unwrap_err().to_string();
+        assert!(
+            error.contains(
+                "[repos.tool] path is no longer a registry field; delete it — knives finds checkouts by their remotes"
+            ),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn every_entry_carrying_a_path_field_is_named_at_once() {
+        // Naming the first would take one load per entry to migrate a registry.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("repos.toml");
+        std::fs::write(
+            &path,
+            "[repos.zeta]\npath = \"~/z\"\nupstream = \"u1\"\norigin = \"o\"\n\n\
+             [repos.alpha]\npath = \"~/a\"\nupstream = \"u2\"\norigin = \"o\"\n\n\
+             [repos.clean]\nupstream = \"u3\"\norigin = \"o\"\n",
+        )
+        .unwrap();
+        let error = load(&path).unwrap_err().to_string();
+        assert!(
+            error.contains(
+                "[repos.alpha], [repos.zeta] path is no longer a registry field; delete it — knives finds checkouts by their remotes"
+            ),
+            "{error}"
+        );
+        assert!(!error.contains("[repos.clean]"), "{error}");
+    }
+
+    #[test]
+    fn a_registry_with_both_a_path_field_and_a_trusted_table_names_both_at_once() {
+        // The registry that predates this shape has both; naming one per load
+        // would take two rounds to migrate it.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("repos.toml");
+        std::fs::write(
+            &path,
+            "[repos.tool]\npath = \"~/tool\"\nupstream = \"u\"\norigin = \"o\"\n\n[trusted.work]\n",
+        )
+        .unwrap();
+        let error = load(&path).unwrap_err().to_string();
+        assert!(
+            error.contains("[trusted.work] is no longer a registry table"),
+            "{error}"
+        );
+        assert!(
+            error.contains("[repos.tool] path is no longer a registry field"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_field_or_table_is_refused_by_name() {
+        // `deny_unknown_fields` on every table: a misspelt key would otherwise
+        // silently mean its default.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("repos.toml");
+        std::fs::write(
+            &path,
+            "[repos.x]\nupstream = \"u\"\norigin = \"o\"\nreleas = \"r\"\n",
+        )
+        .unwrap();
+        let error = load(&path).unwrap_err().to_string();
+        assert!(error.contains("unknown field"), "{error}");
+        assert!(error.contains("releas"), "{error}");
+
+        std::fs::write(&path, "[trust]\nrepo = [\"a/b\"]\n").unwrap();
+        let error = load(&path).unwrap_err().to_string();
+        assert!(error.contains("unknown field"), "{error}");
+        assert!(error.contains("repo"), "{error}");
+
+        std::fs::write(&path, "[bogus]\nkey = 1\n").unwrap();
+        let error = load(&path).unwrap_err().to_string();
+        assert!(error.contains("unknown field"), "{error}");
+        assert!(error.contains("bogus"), "{error}");
+    }
+
+    #[test]
+    fn two_entries_sharing_an_upstream_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("repos.toml");
+        std::fs::write(
+            &path,
+            "[repos.a]\nupstream = \"https://forge.example/org/tool\"\n\
+             origin = \"https://forge.example/ours/tool\"\n\
+             [repos.b]\nupstream = \"git@forge.example:org/tool.git\"\n\
+             origin = \"https://forge.example/theirs/tool\"\n",
+        )
+        .unwrap();
+        let error = load(&path).unwrap_err().to_string();
+        assert!(
+            error.contains(
+                "[repos.a] and [repos.b] share upstream https://forge.example/org/tool; identity must be unique"
+            ),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn an_entry_without_path_loads_and_workspaces_is_a_preference() {
+        let _lock = environment_lock();
+        let environment = EnvironmentGuard::capture(&["HOME"]);
+        let dir = tempfile::tempdir().unwrap();
+        environment.set("HOME", dir.path().to_str().unwrap());
+        let path = dir.path().join("repos.toml");
+        std::fs::write(
+            &path,
+            "[repos.tool]\nupstream = \"https://forge.example/org/tool\"\n\
+             origin = \"https://forge.example/ours/tool\"\nworkspaces = \"~/.worktrees/tool\"\n",
+        )
+        .unwrap();
+        let registry = load(&path).unwrap();
+        let entry = &registry.repos["tool"];
         assert_eq!(
-            reloaded.repos["tool"].workspace_root(),
-            PathBuf::from("/tmp/worktrees/tool")
+            entry.workspaces.as_deref(),
+            Some(dir.path().join(".worktrees/tool").as_path())
         );
     }
 
     #[test]
     fn a_relative_workspaces_directory_is_resolved_against_the_config_home() {
-        // The same rule as `path`: one resolution for every registry path, so a
-        // value that works for one field cannot silently mean something else for
-        // the other.
+        // One resolution for every registry path, so a value that works for a
+        // trust root cannot silently mean something else for `workspaces`.
         let dir = tempfile::tempdir().unwrap();
-        let text = "[repos.tool]\npath = \"/tmp/tool\"\nupstream = \"u\"\norigin = \"o\"\n\
+        let text = "[repos.tool]\nupstream = \"u\"\norigin = \"o\"\n\
                     workspaces = \"worktrees/tool\"\n";
         let registry = load(&write(dir.path(), text)).unwrap();
         assert_eq!(
-            registry.repos["tool"].workspace_root(),
-            dir.path().join("worktrees").join("tool")
+            registry.repos["tool"].workspaces.as_deref(),
+            Some(dir.path().join("worktrees").join("tool").as_path())
         );
     }
 
@@ -1084,7 +1139,7 @@ release = "https://example.invalid/releases.git"
         // Empty resolves to the config home itself, which would put every branch
         // workspace beside the state file and the ledger.
         let dir = tempfile::tempdir().unwrap();
-        let text = "[repos.tool]\npath = \"/tmp/tool\"\nupstream = \"u\"\norigin = \"o\"\n\
+        let text = "[repos.tool]\nupstream = \"u\"\norigin = \"o\"\n\
                     workspaces = \"\"\n";
         let error = load(&write(dir.path(), text)).unwrap_err().to_string();
         assert!(error.contains("workspaces"), "was: {error}");
@@ -1092,51 +1147,7 @@ release = "https://example.invalid/releases.git"
     }
 
     #[test]
-    fn a_workspaces_directory_inside_the_checkout_is_a_config_error() {
-        // A workspace inside the checkout's working copy is never what anyone
-        // meant; the checkout path itself is the most likely slip.
-        let dir = tempfile::tempdir().unwrap();
-        for inside in ["/tmp/tool", "/tmp/tool/.worktrees"] {
-            let text = format!(
-                "[repos.tool]\npath = \"/tmp/tool\"\nupstream = \"u\"\norigin = \"o\"\n\
-                 workspaces = \"{inside}\"\n"
-            );
-            let error = load(&write(dir.path(), &text)).unwrap_err().to_string();
-            assert!(error.contains("workspaces"), "was: {error}");
-            assert!(error.contains("inside the checkout"), "was: {error}");
-        }
-        // Containment is by component: a sibling sharing the checkout's name as a
-        // string prefix is outside it.
-        let beside = "[repos.tool]\npath = \"/tmp/tool\"\nupstream = \"u\"\norigin = \"o\"\n\
-                      workspaces = \"/tmp/tool-worktrees\"\n";
-        assert_eq!(
-            load(&write(dir.path(), beside)).unwrap().repos["tool"].workspace_root(),
-            Path::new("/tmp/tool-worktrees")
-        );
-    }
-
-    #[test]
-    fn saving_preserves_trusted_entries() {
-        // `init` rewrites the whole file. Before `trusted` existed on the type,
-        // serde ignored the section on read and `save` then wrote it away.
-        let dir = tempfile::tempdir().unwrap();
-        let text = "[repos.demo]\npath = \"/tmp/demo\"\nupstream = \"u\"\norigin = \"o\"\n\n\
-                    [trusted.workbench]\npath = \"/tmp/workbench\"\n";
-        let path = write(dir.path(), text);
-        let registry = load(&path).unwrap();
-
-        save(&registry, &path).unwrap();
-
-        let reloaded = load(&path).unwrap();
-        assert_eq!(
-            reloaded.trusted["workbench"].path,
-            PathBuf::from("/tmp/workbench")
-        );
-        assert!(reloaded.repos.contains_key("demo"));
-    }
-
-    #[test]
-    fn trust_rules_parse_expand_and_survive_a_save() {
+    fn trust_rules_parse_and_expand() {
         let _lock = environment_lock();
         let environment = EnvironmentGuard::capture(&["HOME"]);
         environment.set("HOME", "/home/someone");
@@ -1152,18 +1163,49 @@ release = "https://example.invalid/releases.git"
             registry.trust.owners,
             vec!["some-owner".to_owned(), "some-org".to_owned()]
         );
-        // `init` rewrites the whole file; a section serde does not know about
-        // would be silently deleted the next time it runs.
-        save(&registry, &path).unwrap();
-        let reloaded = load(&path).unwrap();
-        assert_eq!(reloaded.trust.owners.len(), 2);
+    }
+
+    #[test]
+    fn a_tilde_path_is_refused_by_name_when_there_is_no_home_to_expand_it() {
+        // Left unexpanded, `~/ws` is a relative path and `knives start` would
+        // open workspaces under `<cwd>/~/ws`. Every offending key is named.
+        let _lock = environment_lock();
+        let environment = EnvironmentGuard::capture(&["HOME"]);
+        environment.remove("HOME");
+        let dir = tempfile::tempdir().unwrap();
+        let text = "[repos.demo]\nupstream = \"u\"\norigin = \"o\"\nworkspaces = \"~/ws/demo\"\n\n\
+                    [repos.plain]\nupstream = \"u2\"\norigin = \"o\"\nworkspaces = \"/abs/plain\"\n\n\
+                    [trust]\nroots = [\"~\", \"/abs/root\"]\n";
+        let error = load(&write(dir.path(), text)).unwrap_err().to_string();
+        assert!(error.contains(NO_HOME), "{error}");
+        assert!(
+            error.contains("[repos.demo] workspaces = \"~/ws/demo\" needs HOME"),
+            "{error}"
+        );
+        assert!(
+            error.contains("[trust] roots = \"~\" needs HOME"),
+            "{error}"
+        );
+        assert!(!error.contains("plain"), "{error}");
+        assert!(!error.contains("/abs/root"), "{error}");
+
+        // Without a tilde anywhere, a missing home is not the registry's problem.
+        let absolute = "[repos.plain]\nupstream = \"u\"\norigin = \"o\"\nworkspaces = \"/abs/plain\"\n\
+                        [trust]\nroots = [\"/abs/root\"]\n";
+        let registry = load(&write(dir.path(), absolute)).unwrap();
+        assert_eq!(
+            registry.repos["plain"].workspaces,
+            Some(PathBuf::from("/abs/plain"))
+        );
     }
 
     #[test]
     fn a_tilde_path_resolves_the_same_way_the_plugin_resolves_it() {
-        // The two sides disagreeing meant `path = "~/repos/x"` was a working
-        // allowlist entry and a broken CLI entry, so the trust set and the tool
-        // covered different directories.
+        // `workspaces` and `[trust] roots` go through this expansion, and the
+        // plugin's tool-argument matcher expands `~` the same way. The two sides
+        // disagreeing once meant a `~/...` entry was a working allowlist entry
+        // and a broken CLI entry, so the trust set and the tool covered
+        // different directories.
         let _lock = environment_lock();
         let environment = EnvironmentGuard::capture(&["HOME"]);
         environment.set("HOME", "/home/someone");
@@ -1194,34 +1236,8 @@ release = "https://example.invalid/releases.git"
     }
 
     #[test]
-    fn load_resolves_every_entry_so_no_caller_sees_a_raw_value() {
-        let dir = tempfile::tempdir().unwrap();
-        let text = "[repos.rel]\npath = \"sub/repo\"\nupstream = \"u\"\norigin = \"o\"\n";
-        let registry = load(&write(dir.path(), text)).unwrap();
-        assert_eq!(registry.repos["rel"].path, dir.path().join("sub/repo"));
-    }
-
-    #[test]
     fn a_missing_file_is_an_empty_registry() {
         let dir = tempfile::tempdir().unwrap();
         assert!(load(&dir.path().join("absent.toml")).unwrap().is_empty());
-    }
-
-    #[test]
-    fn save_then_load_round_trips() {
-        let dir = tempfile::tempdir().unwrap();
-        let original = load(&write(dir.path(), SAMPLE)).unwrap();
-        let target = dir.path().join("out").join("repos.toml");
-        save(&original, &target).unwrap();
-        let text = std::fs::read_to_string(&target).unwrap();
-        assert!(
-            !text.contains("release_branch"),
-            "saved registry unexpectedly names release_branch: {text}"
-        );
-        assert!(
-            !text.contains("[trust]"),
-            "saved registry unexpectedly names [trust]: {text}"
-        );
-        assert_eq!(load(&target).unwrap(), original);
     }
 }

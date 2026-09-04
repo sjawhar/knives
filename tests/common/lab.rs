@@ -467,37 +467,47 @@ impl Lab {
         &self.work
     }
 
+    pub fn temp_path(&self) -> &Path {
+        self.temp.path()
+    }
+
     pub(crate) fn temp_origin(&self) -> PathBuf {
         self.temp.path().join("origin.git")
     }
 
     pub(crate) fn repo_entry_with_release_branch(&self, name: &str) -> knives::config::RepoEntry {
         knives::config::RepoEntry {
-            path: self.work.clone(),
-            upstream: self.upstream.display().to_string(),
-            // The work directory deliberately stands in for origin, per lab convention.
-            origin: self.work.display().to_string(),
-            base: None,
-            release: None,
             release_branch: Some(name.to_owned()),
-            test_count_command: None,
-            consumers: Vec::new(),
-            workspaces: None,
+            // The work directory deliberately stands in for origin, per lab convention.
+            ..knives::config::RepoEntry::new(
+                self.upstream.display().to_string(),
+                self.work.display().to_string(),
+            )
         }
     }
 }
 /// A registry entry for the lab's work checkout, which stands in for origin.
 pub fn lab_entry(lab: &Lab) -> knives::config::RepoEntry {
-    knives::config::RepoEntry {
-        path: lab.work.clone(),
-        upstream: lab.upstream.display().to_string(),
-        origin: lab.work.display().to_string(),
-        base: None,
-        release: None,
-        release_branch: None,
-        test_count_command: None,
-        consumers: Vec::new(),
-        workspaces: None,
+    knives::config::RepoEntry::new(
+        lab.upstream.display().to_string(),
+        lab.work.display().to_string(),
+    )
+}
+
+/// The lab's work checkout bound to `entry` under the registry name `name`, with
+/// the remotes the checkout really declares.
+pub fn lab_fork<'a>(
+    lab: &Lab,
+    name: &str,
+    entry: &'a knives::config::RepoEntry,
+) -> knives::bind::Fork<'a> {
+    knives::bind::Fork {
+        name: knives::ids::RepoName::new(name),
+        entry,
+        checkout: knives::bind::Checkout {
+            path: lab.work.clone(),
+            remotes: knives::bind::remotes(&lab.work).expect("read the work checkout's remotes"),
+        },
     }
 }
 /// Registry home plus a local consumer for release tests. The registry deliberately
@@ -527,8 +537,7 @@ pub fn release_test_home_pinned(
     std::fs::write(
         home.path().join("repos.toml"),
         format!(
-            "[repos.demo]\npath = \"{}\"\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/work.git\"\n",
-            lab.work.display(),
+            "[repos.demo]\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/work.git\"\n",
             lab.upstream.display(),
         ),
     )
@@ -615,7 +624,9 @@ pub fn release_command(
     command.args(args);
     command
         .current_dir(&lab.work)
-        .env("KNIVES_CONFIG_HOME", home.path());
+        .env("KNIVES_CONFIG_HOME", home.path())
+        .env("HOME", lab.temp_path())
+        .env("JJ_CONFIG", "/dev/null");
     command
 }
 
@@ -626,7 +637,9 @@ pub fn start_command(lab: &Lab, home: &tempfile::TempDir, branch: &str) -> Comma
     command
         .args(["--text", "start", branch, "--repo", "demo", "--why", "test"])
         .current_dir(&lab.work)
-        .env("KNIVES_CONFIG_HOME", home.path());
+        .env("KNIVES_CONFIG_HOME", home.path())
+        .env("HOME", lab.temp_path())
+        .env("JJ_CONFIG", "/dev/null");
     command
 }
 
@@ -685,7 +698,7 @@ fn configure_jj_repo_identity(directory: &Path) {
     );
 }
 
-fn jj<const N: usize>(directory: &Path, args: [&str; N]) {
+pub fn jj<const N: usize>(directory: &Path, args: [&str; N]) {
     let status = Command::new("jj")
         .args(args)
         .current_dir(directory)
@@ -695,6 +708,90 @@ fn jj<const N: usize>(directory: &Path, args: [&str; N]) {
         .status()
         .expect("run jj");
     assert!(status.success(), "jj command failed");
+}
+
+/// A git-only repository with the given remotes, the shape an agent's `/tmp`
+/// clone has. Identity and `init.defaultBranch` are pinned as every lab git is.
+pub fn git_repository(root: &Path, remotes: &[(&str, &str)]) {
+    std::fs::create_dir_all(root).expect("create repository");
+    git(root, "main", ["init", "--quiet"]);
+    for (name, url) in remotes {
+        git(root, "main", ["remote", "add", name, url]);
+    }
+}
+
+/// A colocated jj checkout with the given remotes: what the scan looks for.
+pub fn jj_checkout(root: &Path, remotes: &[(&str, &str)]) {
+    std::fs::create_dir_all(root).expect("create checkout");
+    jj(root, ["git", "init", "--colocate"]);
+    for (name, url) in remotes {
+        jj(root, ["git", "remote", "add", name, url]);
+    }
+}
+
+/// Stage and commit everything under `root`, `.jj` stores included: git refuses
+/// only `.git` path components.
+pub fn git_commit_all(root: &Path, message: &str) {
+    git(root, "main", ["add", "-A"]);
+    git(root, "main", ["commit", "--quiet", "-m", message]);
+}
+
+/// `git clone source destination`, quietly.
+pub fn git_clone(source: &Path, destination: &Path) {
+    let parent = destination
+        .parent()
+        .expect("clone destination has a parent");
+    std::fs::create_dir_all(parent).expect("clone parent");
+    git(
+        parent,
+        "main",
+        [
+            "clone",
+            "--quiet",
+            source.to_str().expect("utf-8"),
+            destination.to_str().expect("utf-8"),
+        ],
+    );
+}
+
+/// `git remote set-url name url` in `root`.
+pub fn git_set_remote_url(root: &Path, name: &str, url: &str) {
+    git(root, "main", ["remote", "set-url", name, url]);
+}
+
+/// `jj workspace add --name name path` from `checkout`.
+pub fn jj_workspace_add(checkout: &Path, name: &str, path: &Path) {
+    jj(
+        checkout,
+        [
+            "workspace",
+            "add",
+            "--name",
+            name,
+            path.to_str().expect("utf-8"),
+        ],
+    );
+}
+
+/// The knives binary, run from `cwd` against the registry in `config_home` and
+/// scanning `scan_home` for checkouts. Returned unrun so a caller can add an
+/// environment variable (`KNIVES_OWNER`, say) before `.output()`.
+pub fn knives_command(cwd: &Path, config_home: &Path, scan_home: &Path, args: &[&str]) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_knives"));
+    command
+        .args(args)
+        .current_dir(cwd)
+        .env("KNIVES_CONFIG_HOME", config_home)
+        .env("HOME", scan_home)
+        .env("JJ_CONFIG", "/dev/null");
+    command
+}
+
+/// [`knives_command`] from the lab's work checkout, run to completion.
+pub fn knives(lab: &Lab, home: &tempfile::TempDir, args: &[&str]) -> std::process::Output {
+    knives_command(&lab.work, home.path(), lab.temp_path(), args)
+        .output()
+        .expect("run knives")
 }
 
 fn jj_output<const N: usize>(directory: &Path, args: [&str; N]) -> String {

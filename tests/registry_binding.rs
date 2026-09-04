@@ -1,0 +1,1134 @@
+#![allow(
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic,
+    reason = "a fixture or assertion that cannot proceed IS the test failure"
+)]
+// allow: SIZE_OK: the binding contract in one place — roots, remotes, here, scan, resolve, and the verbs through the binary.
+
+//! A checkout is bound to its registry entry by its `upstream` remote, from the
+//! directory you stand in or by scanning `$HOME`.
+
+#[path = "common/lab.rs"]
+mod lab;
+
+use std::collections::BTreeMap;
+use std::path::Path;
+
+use knives::bind::{self, BindError, Unbound, Unresolved};
+use knives::config::{Registry, RepoEntry};
+use knives::ids::RepoName;
+use lab::{git_repository, jj_checkout, knives};
+
+fn registry(entries: &[(&str, RepoEntry)]) -> Registry {
+    Registry {
+        repos: entries
+            .iter()
+            .map(|(name, entry)| ((*name).to_owned(), entry.clone()))
+            .collect(),
+        ..Registry::default()
+    }
+}
+
+/// The fork the lab's work checkout is inside, bound against `registry` as a
+/// verb's `Ground` binds it once.
+fn here_at<'a>(registry: &'a Registry, cwd: &Path) -> Option<bind::Fork<'a>> {
+    bind::here(registry, cwd).ok()
+}
+
+#[test]
+fn a_checkout_root_is_found_from_a_subdirectory_and_from_a_workspace() {
+    let lab = lab::Lab::new();
+    let nested = lab.work.join("src").join("deep");
+    std::fs::create_dir_all(&nested).expect("nested directory");
+    let workspace = lab.temp_path().join("ws");
+    lab::jj_workspace_add(&lab.work, "ws", &workspace);
+
+    let expected = lab.work.canonicalize().expect("canonical work");
+    assert_eq!(bind::checkout_root(&nested), Some(expected.clone()));
+    assert_eq!(bind::checkout_root(&workspace), Some(expected.clone()));
+    // The workspace is its own nearest root; the checkout is the subdirectory's.
+    let workspace_root = workspace.canonicalize().expect("canonical ws");
+    assert_eq!(bind::nearest_root(&workspace), Some(workspace_root.clone()));
+    assert_eq!(bind::checkout_of_root(&workspace_root), expected);
+    assert_eq!(bind::checkout_of_root(&expected), expected);
+    assert_eq!(
+        bind::nearest_root(&nested),
+        Some(lab.work.canonicalize().expect("canonical"))
+    );
+    assert_eq!(bind::checkout_root(lab.temp_path()), None);
+}
+
+/// A checkout that is not colocated, cloned from the lab's origin with the
+/// lab's upstream added: a `.jj` with no `.git`, which knives does not read.
+fn checkout_without_git(lab: &lab::Lab) -> std::path::PathBuf {
+    let checkout = lab.temp_path().join("nocolo").join("default");
+    std::fs::create_dir_all(checkout.parent().expect("parent")).expect("parent");
+    lab::jj(
+        lab.temp_path(),
+        [
+            "git",
+            "clone",
+            "--no-colocate",
+            lab.temp_path().join("origin.git").to_str().expect("utf-8"),
+            checkout.to_str().expect("utf-8"),
+        ],
+    );
+    lab::jj(
+        &checkout,
+        [
+            "git",
+            "remote",
+            "add",
+            "upstream",
+            lab.upstream.to_str().expect("utf-8"),
+        ],
+    );
+    assert!(!checkout.join(".git").exists(), "not colocated");
+    assert!(checkout.join(".jj").join("repo").is_dir());
+    checkout
+}
+
+/// A colocated checkout git cannot read: `.git` and `.jj` both empty
+/// directories. A scan candidate whose remotes fail.
+fn broken_colocated_checkout(root: &Path) {
+    std::fs::create_dir_all(root.join(".git")).expect("empty .git");
+    std::fs::create_dir_all(root.join(".jj")).expect("empty .jj");
+}
+
+#[test]
+fn a_checkout_that_is_not_colocated_is_refused_and_not_on_this_machine() {
+    // A fork verb run inside it says why; the scan passes it over without a
+    // word, so its entry is `not on this machine` — not a problem, not a
+    // duplicate — however it spells the entry's upstream.
+    let lab = lab::Lab::new();
+    let checkout = checkout_without_git(&lab);
+    let inside = checkout.join("src");
+    std::fs::create_dir_all(&inside).expect("inside");
+    let registry = registry(&[(
+        "demo",
+        RepoEntry::new(
+            lab.upstream.to_str().expect("utf-8"),
+            "https://forge.invalid/acme/work.git",
+        ),
+    )]);
+    let canonical = checkout.canonicalize().expect("canonical");
+
+    assert_eq!(bind::nearest_root(&inside), None);
+    let unbound = bind::here(&registry, &inside).expect_err("not colocated");
+    assert_eq!(
+        unbound,
+        Unbound::NotColocated {
+            root: canonical.clone()
+        }
+    );
+    assert_eq!(
+        unbound.message(&registry),
+        format!(
+            "{} has a .jj but no .git; knives reads a checkout through git, so it must be \
+             colocated",
+            canonical.display()
+        )
+    );
+
+    // Through the binary, from inside: the refusal, exit 2, no sweep.
+    let home = tempfile::tempdir().expect("config home");
+    std::fs::write(
+        home.path().join("repos.toml"),
+        format!(
+            "[repos.demo]\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/work.git\"\n",
+            lab.upstream.display()
+        ),
+    )
+    .expect("registry");
+    let output = lab::knives_command(
+        &inside,
+        home.path(),
+        lab.temp_path().join("nocolo").as_path(),
+        &["--text", "status", "--no-landed", "--no-github"],
+    )
+    .output()
+    .expect("run knives");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("has a .jj but no .git"), "{stderr}");
+
+    // `knives repos` scanning a home that holds only the non-colocated checkout.
+    let output = lab::knives_command(
+        lab.temp_path(),
+        home.path(),
+        lab.temp_path().join("nocolo").as_path(),
+        &["--json", "repos"],
+    )
+    .output()
+    .expect("run knives");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stdout}\n{stderr}");
+    let report: serde_json::Value = serde_json::from_str(&stdout).expect("json document");
+    let rows = report["repos"].as_array().expect("rows");
+    assert_eq!(rows.len(), 1, "{report}");
+    assert!(rows[0]["path"].is_null(), "{report}");
+    assert!(
+        rows[0]["ambiguous"].as_u64().is_none_or(|count| count == 0),
+        "{report}"
+    );
+    assert!(
+        rows[0]["problems"].as_array().is_none_or(Vec::is_empty),
+        "{report}"
+    );
+    assert!(
+        report["problems"].as_array().is_none_or(Vec::is_empty),
+        "{report}"
+    );
+}
+
+#[test]
+fn a_workspace_of_a_colocated_checkout_binds_to_the_checkout_through_git() {
+    // `jj workspace add` from a colocated checkout writes a `.git` file naming
+    // the checkout's worktree; git resolves it, and the workspace's remotes are
+    // the checkout's. Nothing under `.jj` is read.
+    let lab = lab::Lab::new();
+    let (home, _consumer) = lab::release_test_home(&lab);
+    let workspace = lab.temp_path().join("ws");
+    lab::jj_workspace_add(&lab.work, "ws", &workspace);
+    assert!(
+        workspace.join(".git").is_file(),
+        "a colocated workspace carries a .git file"
+    );
+    let registry = registry(&[(
+        "demo",
+        RepoEntry::new(
+            lab.upstream.to_str().expect("utf-8"),
+            "https://forge.invalid/acme/work.git",
+        ),
+    )]);
+    let checkout = lab.work.canonicalize().expect("canonical");
+
+    assert_eq!(
+        bind::nearest_root(&workspace),
+        Some(workspace.canonicalize().expect("canonical"))
+    );
+    assert_eq!(bind::checkout_root(&workspace), Some(checkout.clone()));
+    let remotes = bind::remotes(&workspace).expect("the checkout's remotes through git");
+    assert_eq!(
+        remotes.get("upstream").map(String::as_str),
+        Some(lab.upstream.to_str().expect("utf-8"))
+    );
+    let bound = bind::here(&registry, &workspace).expect("bound");
+    assert_eq!(bound.name, RepoName::new("demo"));
+    assert_eq!(bound.checkout.path, checkout);
+
+    let output = lab::knives_command(
+        &workspace,
+        home.path(),
+        lab.temp_path(),
+        &["--text", "status", "--no-landed", "--no-github"],
+    )
+    .output()
+    .expect("run knives");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        matches!(output.status.code(), Some(0 | 1)),
+        "{stdout}\n{stderr}"
+    );
+    assert!(stdout.contains("demo"), "{stdout}\n{stderr}");
+    assert!(!stderr.contains("reading remotes of"), "{stderr}");
+}
+
+#[test]
+fn the_scan_does_not_bind_a_jj_store_committed_inside_a_git_clone() {
+    // An attacker's repository commits a jj store whose backend declares the
+    // lab's upstream; a clone of it lands under home beside the real checkout.
+    // The scan must not count it, or every named verb would refuse `demo` as
+    // having two checkouts.
+    let lab = lab::Lab::new();
+    let (home, _consumer) = lab::release_test_home(&lab);
+    let attacker = lab.temp_path().join("attacker");
+    git_repository(&attacker, &[]);
+    let evil = attacker.join("evil");
+    std::fs::create_dir_all(&evil).expect("evil");
+    lab::jj(&evil, ["git", "init", "--no-colocate"]);
+    lab::jj(
+        &evil,
+        [
+            "git",
+            "remote",
+            "add",
+            "upstream",
+            lab.upstream.to_str().expect("utf-8"),
+        ],
+    );
+    let _ = std::fs::remove_file(evil.join(".jj").join(".gitignore"));
+    lab::git_commit_all(&attacker, "attack");
+    let clone = lab.temp_path().join("victim-clone");
+    lab::git_clone(&attacker, &clone);
+    assert!(clone.join("evil").join(".jj").join("repo").is_dir());
+
+    let output = lab::knives_command(
+        lab.temp_path(),
+        home.path(),
+        lab.temp_path(),
+        &["--text", "status", "demo", "--no-landed", "--no-github"],
+    )
+    .output()
+    .expect("run knives");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        matches!(output.status.code(), Some(0 | 1)),
+        "{stdout}\n{stderr}"
+    );
+    assert!(stdout.contains("demo"), "{stdout}\n{stderr}");
+    assert!(!stderr.contains("2 checkouts"), "{stderr}");
+    assert!(!stderr.contains("could not read"), "{stderr}");
+}
+
+#[test]
+fn remotes_are_read_from_jj_checkouts_and_from_git_only_clones() {
+    let lab = lab::Lab::new();
+    let jj_remotes = bind::remotes(&lab.work).expect("jj remotes");
+    assert_eq!(
+        jj_remotes.get("upstream").map(String::as_str),
+        Some(lab.upstream.to_str().expect("utf-8"))
+    );
+    assert!(jj_remotes.contains_key("origin"));
+
+    let clone = lab.temp_path().join("plain-clone");
+    git_repository(
+        &clone,
+        &[("origin", "https://forge.invalid/someone/tool.git")],
+    );
+    let clone_remotes = bind::remotes(&clone).expect("git remotes");
+    assert_eq!(
+        clone_remotes,
+        BTreeMap::from([(
+            "origin".to_owned(),
+            "https://forge.invalid/someone/tool.git".to_owned()
+        )])
+    );
+
+    let plain = lab.temp_path().join("not-a-repo");
+    std::fs::create_dir_all(&plain).expect("plain dir");
+    assert!(bind::remotes(&plain).is_err());
+}
+
+#[test]
+fn a_remote_whose_name_holds_a_space_is_read() {
+    // `git remote add` refuses such a name, but the configuration file can hold
+    // one, and a checkout with one is still a checkout.
+    let lab = lab::Lab::new();
+    let clone = lab.temp_path().join("spaced");
+    git_repository(&clone, &[("origin", "https://forge.invalid/ours/tool.git")]);
+    let set = std::process::Command::new("git")
+        .args(["-C"])
+        .arg(&clone)
+        .args([
+            "config",
+            "remote.my mirror.url",
+            "https://forge.invalid/mirror/tool.git",
+        ])
+        .status()
+        .expect("git config");
+    assert!(set.success());
+    let remotes = bind::remotes(&clone).expect("remotes with a spaced name");
+    assert_eq!(
+        remotes.get("my mirror").map(String::as_str),
+        Some("https://forge.invalid/mirror/tool.git")
+    );
+    assert!(remotes.contains_key("origin"));
+}
+
+#[test]
+fn a_broken_checkout_inside_a_repository_does_not_answer_for_it() {
+    // git would otherwise discover upward past an empty `.git` and read the
+    // enclosing repository's configuration; the root must speak for itself or
+    // not at all.
+    let lab = lab::Lab::new();
+    let outer = lab.temp_path().join("outer");
+    git_repository(
+        &outer,
+        &[("upstream", "https://forge.invalid/org/tool.git")],
+    );
+    let broken = outer.join("broken");
+    broken_colocated_checkout(&broken);
+    let error = bind::remotes(&broken).expect_err("a broken checkout is unreadable");
+    let text = error.to_string();
+    assert!(text.contains("inside a git repository"), "{text}");
+    assert!(!text.contains("org/tool"), "{text}");
+}
+
+#[test]
+fn the_nearest_repository_wins_when_one_is_nested_inside_another() {
+    let lab = lab::Lab::new();
+    let inner_git = lab.work.join("vendor").join("dep");
+    git_repository(&inner_git, &[("upstream", "https://forge.invalid/org/dep")]);
+    std::fs::create_dir_all(inner_git.join("src")).expect("nested source directory");
+    let inner_jj = inner_git.join("nested").join("tool");
+    jj_checkout(&inner_jj, &[("upstream", "https://forge.invalid/org/tool")]);
+    let registry = registry(&[
+        (
+            "demo",
+            RepoEntry::new(
+                lab.upstream.to_str().expect("utf-8"),
+                "https://forge.invalid/acme/work.git",
+            ),
+        ),
+        (
+            "dep",
+            RepoEntry::new(
+                "https://forge.invalid/org/dep",
+                "https://forge.invalid/acme/dep",
+            ),
+        ),
+        (
+            "tool",
+            RepoEntry::new(
+                "https://forge.invalid/org/tool",
+                "https://forge.invalid/acme/tool",
+            ),
+        ),
+    ]);
+
+    // A git-only clone is its own root, so the enclosing checkout does not
+    // claim it; fork verbs still refuse it, since they need jj.
+    let from_git = bind::here(&registry, &inner_git.join("src")).expect_err("git only");
+    assert!(
+        matches!(&from_git, Unbound::GitOnly { root } if *root == inner_git.canonicalize().expect("canonical")),
+        "{from_git:?}"
+    );
+    let from_jj = bind::here(&registry, &inner_jj).expect("bound");
+    assert_eq!(from_jj.name, RepoName::new("tool"));
+    let from_outer = bind::here(&registry, &lab.work.join("vendor")).expect("bound");
+    assert_eq!(from_outer.name, RepoName::new("demo"));
+}
+
+#[test]
+fn here_refuses_outside_a_repository_without_upstream_and_when_unregistered() {
+    let lab = lab::Lab::new();
+    let registry = registry(&[(
+        "demo",
+        RepoEntry::new(
+            "https://forge.invalid/org/elsewhere",
+            "https://forge.invalid/acme/elsewhere",
+        ),
+    )]);
+
+    let nowhere = lab.temp_path().join("nowhere");
+    std::fs::create_dir_all(&nowhere).expect("plain dir");
+    assert_eq!(
+        bind::here(&registry, &nowhere),
+        Err(Unbound::NotInsideARepository)
+    );
+
+    let no_upstream = lab.temp_path().join("no-upstream");
+    jj_checkout(
+        &no_upstream,
+        &[("origin", "https://forge.invalid/me/thing")],
+    );
+    let unbound = bind::here(&registry, &no_upstream).expect_err("unbound");
+    assert!(matches!(unbound, Unbound::NoUpstream { .. }), "{unbound:?}");
+
+    let unbound = bind::here(&registry, &lab.work).expect_err("unbound");
+    assert!(
+        matches!(&unbound, Unbound::Unregistered { upstream, .. } if upstream == lab.upstream.to_str().expect("utf-8")),
+        "{unbound:?}"
+    );
+}
+
+#[test]
+fn scan_finds_each_entry_once_skips_workspaces_dot_directories_symlinks_and_depth_four() {
+    // Given: a home with a checkout at depth 1, one at depth 3, a workspace, a
+    // dot-directory hiding a checkout, a checkout at depth 4, a git-only clone
+    // whose upstream matches an entry, and a symlink to a directory outside
+    // home that holds a matching checkout.
+    let lab = lab::Lab::new();
+    let home = lab.temp_path().join("home");
+    std::fs::create_dir_all(&home).expect("home");
+    let shallow = home.join("tool");
+    jj_checkout(&shallow, &[("upstream", "https://forge.invalid/org/tool")]);
+    let git_only = home.join("plain");
+    git_repository(
+        &git_only,
+        &[("upstream", "https://forge.invalid/org/plain")],
+    );
+    let deep_parent = home.join("forks").join("work");
+    std::fs::create_dir_all(&deep_parent).expect("deep parent");
+    let deep = deep_parent.join("default");
+    std::fs::rename(&lab.work, &deep).expect("move checkout under home");
+    let workspace = deep_parent.join("feature");
+    lab::jj_workspace_add(&deep, "feature", &workspace);
+    let hidden = home.join(".cache").join("tool");
+    jj_checkout(&hidden, &[("upstream", "https://forge.invalid/org/hidden")]);
+    let too_deep = home.join("a").join("b").join("c").join("d");
+    jj_checkout(
+        &too_deep,
+        &[("upstream", "https://forge.invalid/org/too-deep")],
+    );
+    let outside = lab.temp_path().join("outside");
+    jj_checkout(
+        &outside.join("linked"),
+        &[("upstream", "https://forge.invalid/org/linked")],
+    );
+    std::os::unix::fs::symlink(&outside, home.join("link")).expect("symlink");
+
+    let registry = registry(&[
+        (
+            "tool",
+            RepoEntry::new(
+                "https://forge.invalid/org/tool",
+                "https://forge.invalid/acme/tool",
+            ),
+        ),
+        (
+            "plain",
+            RepoEntry::new(
+                "https://forge.invalid/org/plain",
+                "https://forge.invalid/acme/plain",
+            ),
+        ),
+        (
+            "work",
+            RepoEntry::new(
+                lab.upstream.to_str().expect("utf-8"),
+                "https://forge.invalid/acme/work.git",
+            ),
+        ),
+        (
+            "hidden",
+            RepoEntry::new(
+                "https://forge.invalid/org/hidden",
+                "https://forge.invalid/acme/hidden",
+            ),
+        ),
+        (
+            "too-deep",
+            RepoEntry::new(
+                "https://forge.invalid/org/too-deep",
+                "https://forge.invalid/acme/too-deep",
+            ),
+        ),
+        (
+            "linked",
+            RepoEntry::new(
+                "https://forge.invalid/org/linked",
+                "https://forge.invalid/acme/linked",
+            ),
+        ),
+    ]);
+
+    let scan = bind::scan(&registry, &home);
+
+    assert_eq!(
+        scan.found
+            .keys()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        vec!["tool".to_owned(), "work".to_owned()],
+        "problems: {:?}",
+        scan.problems
+    );
+    assert_eq!(
+        scan.found[&RepoName::new("work")].checkout.path,
+        deep.canonicalize().expect("canonical")
+    );
+    assert_eq!(scan.home, home);
+    assert!(scan.duplicates.is_empty(), "{:?}", scan.duplicates);
+    assert!(scan.problems.is_empty(), "{:?}", scan.problems);
+    // `plain` (git-only), `hidden` (dot-directory), `too-deep` (depth 4) and
+    // `linked` (behind a symlink) are not found; the jj checkout is found once
+    // although its workspace is under home too.
+    std::fs::rename(&deep, &lab.work).expect("move checkout back for Lab's cleanup");
+}
+
+#[test]
+fn scan_descends_through_a_git_tracked_parent() {
+    // `~/work/.git` tracks the parent directory; the forks under it are still
+    // the forks under it. Only a `.jj` stops the descent.
+    let lab = lab::Lab::new();
+    let home = lab.temp_path().join("home");
+    let parent = home.join("work");
+    git_repository(
+        &parent,
+        &[("origin", "https://forge.invalid/someone/notes")],
+    );
+    let checkout = parent.join("tool");
+    jj_checkout(&checkout, &[("upstream", "https://forge.invalid/org/tool")]);
+    let registry = registry(&[(
+        "tool",
+        RepoEntry::new(
+            "https://forge.invalid/org/tool",
+            "https://forge.invalid/acme/tool",
+        ),
+    )]);
+
+    let scan = bind::scan(&registry, &home);
+
+    assert_eq!(
+        scan.found
+            .get(&RepoName::new("tool"))
+            .map(|fork| fork.checkout.path.clone()),
+        Some(checkout.canonicalize().expect("canonical")),
+        "problems: {:?}",
+        scan.problems
+    );
+}
+
+#[test]
+fn scan_refuses_to_choose_between_two_checkouts_of_one_entry() {
+    let lab = lab::Lab::new();
+    let home = lab.temp_path().join("home");
+    let first = home.join("one");
+    let second = home.join("two");
+    jj_checkout(&first, &[("upstream", "https://forge.invalid/org/tool")]);
+    jj_checkout(&second, &[("upstream", "https://forge.invalid/org/tool")]);
+    let registry = registry(&[(
+        "tool",
+        RepoEntry::new(
+            "https://forge.invalid/org/tool",
+            "https://forge.invalid/acme/tool",
+        ),
+    )]);
+
+    let scan = bind::scan(&registry, &home);
+
+    assert!(scan.found.is_empty());
+    assert_eq!(
+        scan.duplicates.get(&RepoName::new("tool")).map(Vec::len),
+        Some(2)
+    );
+}
+
+#[test]
+fn scan_descends_from_a_home_that_is_itself_a_repository() {
+    // A home directory kept as a dotfiles checkout holds `.git` at its root;
+    // the forks under it are still the forks under it.
+    let lab = lab::Lab::new();
+    let home = lab.temp_path().join("home");
+    git_repository(
+        &home,
+        &[("origin", "https://forge.invalid/someone/dotfiles")],
+    );
+    let checkout = home.join("forks").join("tool").join("default");
+    jj_checkout(&checkout, &[("upstream", "https://forge.invalid/org/tool")]);
+    let registry = registry(&[(
+        "tool",
+        RepoEntry::new(
+            "https://forge.invalid/org/tool",
+            "https://forge.invalid/acme/tool",
+        ),
+    )]);
+
+    let scan = bind::scan(&registry, &home);
+
+    let found = scan
+        .found
+        .get(&RepoName::new("tool"))
+        .expect("tool is found");
+    assert_eq!(
+        found.checkout.path,
+        checkout.canonicalize().expect("checkout exists")
+    );
+    assert!(scan.duplicates.is_empty(), "{:?}", scan.duplicates);
+    assert!(scan.problems.is_empty(), "{:?}", scan.problems);
+}
+
+#[test]
+fn scan_names_a_checkout_whose_remotes_it_could_not_read_while_an_entry_is_unplaced() {
+    // A `.git` beside a `.jj`, both empty: a colocated checkout git cannot
+    // read. While an entry is still missing, the scan says so rather than
+    // silently skipping what may be the entry it was looking for.
+    let lab = lab::Lab::new();
+    let home = lab.temp_path().join("home");
+    let broken = home.join("broken");
+    broken_colocated_checkout(&broken);
+    jj_checkout(
+        &home.join("tool"),
+        &[("upstream", "https://forge.invalid/org/tool")],
+    );
+    let registry = registry(&[
+        (
+            "tool",
+            RepoEntry::new(
+                "https://forge.invalid/org/tool",
+                "https://forge.invalid/acme/tool",
+            ),
+        ),
+        (
+            "ghost",
+            RepoEntry::new(
+                "https://forge.invalid/org/ghost",
+                "https://forge.invalid/acme/ghost",
+            ),
+        ),
+    ]);
+
+    let scan = bind::scan(&registry, &home);
+
+    assert!(scan.found.contains_key(&RepoName::new("tool")));
+    assert_eq!(scan.problems.len(), 1, "{:?}", scan.problems);
+    let canonical = broken.canonicalize().expect("canonical");
+    assert!(
+        scan.problems[0].starts_with(&format!("reading remotes of {}: ", canonical.display()))
+            || scan.problems[0].starts_with(&format!("reading remotes of {}: ", broken.display())),
+        "{:?}",
+        scan.problems
+    );
+    // One line: jj's error, not its hints.
+    assert!(!scan.problems[0].contains('\n'), "{:?}", scan.problems);
+    let why = bind::resolve(&registry, &RepoName::new("ghost"), None, &home).expect_err("unplaced");
+    assert!(
+        why.message(&RepoName::new("ghost"), &registry)
+            .contains("; could not read: reading remotes of"),
+        "{why:?}"
+    );
+}
+
+#[test]
+fn scan_drops_an_unreadable_stranger_once_every_entry_is_placed() {
+    // The scan locates entries; with every entry found (or found twice), a
+    // broken repository under home is nobody's business.
+    let lab = lab::Lab::new();
+    let home = lab.temp_path().join("home");
+    let broken = home.join("broken");
+    broken_colocated_checkout(&broken);
+    jj_checkout(
+        &home.join("tool"),
+        &[("upstream", "https://forge.invalid/org/tool")],
+    );
+    jj_checkout(
+        &home.join("twice-a"),
+        &[("upstream", "https://forge.invalid/org/twice")],
+    );
+    jj_checkout(
+        &home.join("twice-b"),
+        &[("upstream", "https://forge.invalid/org/twice")],
+    );
+    let registry = registry(&[
+        (
+            "tool",
+            RepoEntry::new(
+                "https://forge.invalid/org/tool",
+                "https://forge.invalid/acme/tool",
+            ),
+        ),
+        (
+            "twice",
+            RepoEntry::new(
+                "https://forge.invalid/org/twice",
+                "https://forge.invalid/acme/twice",
+            ),
+        ),
+    ]);
+
+    let scan = bind::scan(&registry, &home);
+
+    assert!(scan.found.contains_key(&RepoName::new("tool")));
+    assert!(scan.duplicates.contains_key(&RepoName::new("twice")));
+    assert!(scan.problems.is_empty(), "{:?}", scan.problems);
+}
+
+#[test]
+fn resolve_prefers_the_bound_directory_then_the_scan_then_says_why_not() {
+    let lab = lab::Lab::new();
+    let home = lab.temp_path().join("home");
+    std::fs::create_dir_all(&home).expect("home");
+    let elsewhere = home.join("elsewhere");
+    jj_checkout(
+        &elsewhere,
+        &[("upstream", "https://forge.invalid/org/elsewhere")],
+    );
+    let registry = registry(&[
+        (
+            "demo",
+            RepoEntry::new(
+                lab.upstream.to_str().expect("utf-8"),
+                "https://forge.invalid/acme/work.git",
+            ),
+        ),
+        (
+            "elsewhere",
+            RepoEntry::new(
+                "https://forge.invalid/org/elsewhere",
+                "https://forge.invalid/acme/elsewhere",
+            ),
+        ),
+        (
+            "absent",
+            RepoEntry::new(
+                "https://forge.invalid/org/absent",
+                "https://forge.invalid/acme/absent",
+            ),
+        ),
+    ]);
+
+    let here = here_at(&registry, &lab.work);
+    let here = here.as_ref();
+    let demo = bind::resolve(&registry, &RepoName::new("demo"), here, &home).expect("resolved");
+    assert_eq!(
+        demo.checkout.path,
+        lab.work.canonicalize().expect("canonical")
+    );
+
+    let other =
+        bind::resolve(&registry, &RepoName::new("elsewhere"), here, &home).expect("resolved");
+    assert_eq!(
+        other.checkout.path,
+        elsewhere.canonicalize().expect("canonical")
+    );
+
+    let missing =
+        bind::resolve(&registry, &RepoName::new("absent"), here, &home).expect_err("missing");
+    assert_eq!(
+        missing,
+        Unresolved::Missing {
+            home: home.clone(),
+            problems: Vec::new(),
+        }
+    );
+
+    let unknown =
+        bind::resolve(&registry, &RepoName::new("nope"), here, &home).expect_err("unknown");
+    assert_eq!(unknown, Unresolved::Unknown);
+
+    // Nothing bound: the scan is the only source.
+    let scanned = bind::resolve(&registry, &RepoName::new("elsewhere"), None, &home)
+        .expect("resolved from the scan");
+    assert_eq!(scanned.checkout.path, other.checkout.path);
+}
+
+#[test]
+fn a_repository_whose_remotes_cannot_be_read_is_an_error_naming_the_directory() {
+    let lab = lab::Lab::new();
+    let registry = registry(&[(
+        "tool",
+        RepoEntry::new(
+            "https://forge.invalid/org/tool",
+            "https://forge.invalid/acme/tool",
+        ),
+    )]);
+
+    // A colocated checkout whose `.git` is an empty directory: a root git
+    // cannot read, so the error names the directory the user stands in.
+    let broken = lab.temp_path().join("broken");
+    std::fs::create_dir_all(broken.join(".git")).expect("broken .git");
+    std::fs::create_dir_all(broken.join(".jj")).expect("broken .jj");
+    let canonical = broken.canonicalize().expect("canonical");
+    assert_eq!(bind::checkout_root(&broken), Some(canonical.clone()));
+    assert!(matches!(
+        bind::here(&registry, &broken),
+        Err(Unbound::Unreadable(BindError::RemotesUnreadable { root, .. })) if root == canonical
+    ));
+}
+
+#[test]
+fn a_workspace_whose_checkout_was_deleted_reports_its_vcs_s_own_error_about_the_workspace() {
+    // The pointer names a store that is gone. The workspace is a repository
+    // directory its VCS cannot open — not a directory that is no repository at
+    // all. The checkout is colocated, so its workspace carries a `.git` file
+    // and git speaks for it.
+    let lab = lab::Lab::new();
+    let registry = registry(&[(
+        "demo",
+        RepoEntry::new(
+            lab.upstream.to_str().expect("utf-8"),
+            "https://forge.invalid/acme/work.git",
+        ),
+    )]);
+    let checkout = lab.temp_path().join("gone").join("default");
+    jj_checkout(&checkout, &[("upstream", "https://forge.invalid/org/gone")]);
+    let workspace = lab.temp_path().join("gone").join("feature");
+    lab::jj_workspace_add(&checkout, "feature", &workspace);
+    std::fs::remove_dir_all(&checkout).expect("delete the checkout under the workspace");
+    let canonical = workspace.canonicalize().expect("canonical");
+
+    assert_eq!(bind::checkout_root(&workspace), Some(canonical.clone()));
+    let error = bind::here(&registry, &workspace).expect_err("unreadable");
+    let Unbound::Unreadable(error) = error else {
+        panic!("{error:?}");
+    };
+    assert!(
+        matches!(&error, BindError::RemotesUnreadable { root, .. } if *root == canonical),
+        "{error:?}"
+    );
+    assert!(
+        !error
+            .to_string()
+            .contains("neither a jj nor a git repository"),
+        "{error}"
+    );
+
+    // Through the binary: git's words about the workspace, exit 3, no sweep.
+    let home = tempfile::tempdir().expect("config home");
+    std::fs::write(
+        home.path().join("repos.toml"),
+        format!(
+            "[repos.demo]\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/work.git\"\n",
+            lab.upstream.display()
+        ),
+    )
+    .expect("registry");
+    let output = lab::knives_command(
+        &workspace,
+        home.path(),
+        lab.temp_path(),
+        &["--text", "status", "--no-landed", "--no-github"],
+    )
+    .output()
+    .expect("run knives");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(3), "{stderr}");
+    assert!(
+        stderr.contains(&format!("reading remotes of {}: ", canonical.display())),
+        "{stderr}"
+    );
+    assert!(stderr.contains("not a git repository"), "{stderr}");
+    assert!(
+        !stderr.contains("neither a jj nor a git repository"),
+        "{stderr}"
+    );
+}
+
+fn knives_outside(lab: &lab::Lab, home: &tempfile::TempDir, args: &[&str]) -> std::process::Output {
+    let outside = lab.temp_path().join("outside");
+    std::fs::create_dir_all(&outside).expect("outside");
+    lab::knives_command(&outside, home.path(), lab.temp_path(), args)
+        .output()
+        .expect("run knives")
+}
+
+/// The lab's registry with a second entry, `ghost`, that has no checkout anywhere.
+fn home_with_a_ghost(lab: &lab::Lab) -> (tempfile::TempDir, std::path::PathBuf) {
+    let (home, consumer) = lab::release_test_home(lab);
+    let path = home.path().join("repos.toml");
+    let mut text = std::fs::read_to_string(&path).expect("registry");
+    text.push_str(
+        "\n[repos.ghost]\nupstream = \"https://forge.invalid/org/ghost\"\n\
+         origin = \"https://forge.invalid/acme/ghost\"\n",
+    );
+    std::fs::write(&path, text).expect("registry");
+    (home, consumer)
+}
+
+#[test]
+fn a_named_verb_whose_checkout_is_not_on_this_machine_exits_usage_and_says_so() {
+    let lab = lab::Lab::new();
+    let home = tempfile::tempdir().expect("config home");
+    std::fs::write(
+        home.path().join("repos.toml"),
+        "[repos.ghost]\nupstream = \"https://forge.invalid/org/ghost\"\norigin = \"https://forge.invalid/acme/ghost\"\n",
+    )
+    .expect("registry");
+    let output = knives(&lab, &home, &["--text", "notch", "--repo", "ghost"]);
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("no checkout of ghost under"), "{stderr}");
+    assert!(!stderr.contains("known:"), "{stderr}");
+}
+
+#[test]
+fn status_inside_a_bound_checkout_reports_only_it_and_carries_the_origin_note() {
+    let lab = lab::Lab::new();
+    let (home, _consumer) = lab::release_test_home(&lab);
+    let output = knives(
+        &lab,
+        &home,
+        &["--text", "status", "--no-landed", "--no-github"],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("demo"), "{stdout}");
+    // The lab's checkout origin is a local bare path; the registry says a forge URL.
+    assert!(stdout.contains("origin remote is "), "{stdout}");
+    assert!(
+        stdout.contains("; registry says https://forge.invalid/acme/work.git"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn status_inside_a_registered_git_only_clone_refuses_as_every_fork_verb_does() {
+    // The hook binds git clones; fork verbs need jj. Standing in one, `status`
+    // says so rather than sweeping or opening it.
+    let lab = lab::Lab::new();
+    let (home, _consumer) = lab::release_test_home(&lab);
+    let clone = lab.temp_path().join("clone");
+    git_repository(
+        &clone,
+        &[("upstream", lab.upstream.to_str().expect("utf-8"))],
+    );
+    let output = lab::knives_command(
+        &clone,
+        home.path(),
+        lab.temp_path(),
+        &["--text", "status", "--no-landed", "--no-github"],
+    )
+    .output()
+    .expect("run knives");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("is a git clone, not a jj checkout; fork commands need jj"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn sync_outside_any_checkout_without_a_name_or_all_exits_usage() {
+    let lab = lab::Lab::new();
+    let (home, _consumer) = lab::release_test_home(&lab);
+    let output = knives_outside(&lab, &home, &["--text", "sync", "--no-github"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("give a repo name, or --all"));
+}
+
+#[test]
+fn status_outside_any_checkout_sweeps_every_entry_through_the_scan() {
+    let lab = lab::Lab::new();
+    let (home, _consumer) = home_with_a_ghost(&lab);
+    let output = knives_outside(
+        &lab,
+        &home,
+        &["--text", "status", "--no-landed", "--no-github"],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stdout}\n{stderr}");
+    assert!(stdout.contains("demo"), "{stdout}\n{stderr}");
+    // The scan placed the checkout: the row was gathered, not refused, and
+    // carries the checkout's origin note.
+    assert!(
+        stdout.contains("origin remote is "),
+        "a gathered row carries the checkout's origin note:\n{stdout}\n{stderr}"
+    );
+    // The entry with no checkout is not on this machine: noted once, not a row.
+    assert!(!stdout.contains("ghost"), "{stdout}\n{stderr}");
+    assert_eq!(
+        stderr
+            .lines()
+            .filter(|line| *line == "knives: ghost: not on this machine")
+            .count(),
+        1,
+        "{stderr}"
+    );
+    assert!(!stdout.contains("could not gather"), "{stdout}");
+
+    // The same sweep as a JSON document: the absent entry is not a row, and
+    // the placed one carries no problems.
+    let output = knives_outside(
+        &lab,
+        &home,
+        &["--json", "status", "--all", "--no-landed", "--no-github"],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stdout}\n{stderr}");
+    let reports: serde_json::Value = serde_json::from_str(&stdout).expect("json document");
+    let reports = reports.as_array().expect("one document per repository");
+    assert!(
+        reports.iter().all(|report| report["repo"] != "ghost"),
+        "{stdout}"
+    );
+    let demo = reports
+        .iter()
+        .find(|report| report["repo"] == "demo")
+        .expect("a demo row");
+    assert!(
+        demo["problems"].as_array().is_none_or(Vec::is_empty),
+        "{demo}"
+    );
+    assert!(
+        stderr.contains("knives: ghost: not on this machine"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn sync_all_with_an_entry_absent_on_this_machine_exits_zero_and_notes_it_on_stderr() {
+    let lab = lab::Lab::new();
+    let (home, _consumer) = home_with_a_ghost(&lab);
+    let output = knives_outside(&lab, &home, &["--text", "sync", "--all", "--no-github"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stdout}\n{stderr}");
+    assert!(stdout.contains("demo"), "{stdout}\n{stderr}");
+    assert!(!stdout.contains("ghost"), "{stdout}\n{stderr}");
+    assert!(
+        stderr.contains("knives: ghost: not on this machine"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn a_sweep_keeps_an_absent_entry_as_a_row_when_the_scan_could_not_read_a_checkout() {
+    // The checkout the scan could not read may be the absent entry's, so the
+    // entry is not waved off as absent: it stays a refused row, exit 3.
+    let lab = lab::Lab::new();
+    let (home, _consumer) = home_with_a_ghost(&lab);
+    let broken = lab.temp_path().join("broken");
+    broken_colocated_checkout(&broken);
+    let output = knives_outside(
+        &lab,
+        &home,
+        &["--text", "status", "--all", "--no-landed", "--no-github"],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(3), "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("could not gather: no checkout of ghost under"),
+        "{stdout}\n{stderr}"
+    );
+    assert!(!stderr.contains("not on this machine"), "{stderr}");
+    assert!(
+        stderr.contains("could not read: reading remotes of"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn a_named_verb_from_a_broken_cwd_answers_about_the_named_repo() {
+    // Standing in a colocated checkout git cannot read: the verb was asked
+    // about `demo`, and the cwd's unreadable remotes are not its answer.
+    let lab = lab::Lab::new();
+    let (home, _consumer) = lab::release_test_home(&lab);
+    let broken = lab.temp_path().join("broken-cwd");
+    broken_colocated_checkout(&broken);
+    let output = lab::knives_command(
+        &broken,
+        home.path(),
+        lab.temp_path(),
+        &["--text", "status", "demo", "--no-landed", "--no-github"],
+    )
+    .output()
+    .expect("run knives");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        matches!(output.status.code(), Some(0 | 1)),
+        "{stdout}\n{stderr}"
+    );
+    assert!(stdout.contains("demo"), "{stdout}\n{stderr}");
+    assert!(!stderr.contains("reading remotes of"), "{stderr}");
+    assert!(!stderr.contains("broken-cwd"), "{stderr}");
+}
+
+#[test]
+fn a_sweep_says_nothing_about_an_unreadable_stranger_when_every_entry_is_found() {
+    let lab = lab::Lab::new();
+    let (home, _consumer) = lab::release_test_home(&lab);
+    let broken = lab.temp_path().join("broken");
+    broken_colocated_checkout(&broken);
+    let output = knives_outside(
+        &lab,
+        &home,
+        &["--json", "status", "--all", "--no-landed", "--no-github"],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stdout}\n{stderr}");
+    assert!(stdout.contains("demo"), "{stdout}\n{stderr}");
+    assert!(!stderr.contains("could not read"), "{stderr}");
+    assert!(!stderr.contains("broken"), "{stderr}");
+    assert!(!stdout.contains("broken"), "{stdout}");
+}

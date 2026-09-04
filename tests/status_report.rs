@@ -45,15 +45,17 @@ fn status_all_reports_every_repo_in_registry_order() {
             "content\n",
         );
     }
+    // Checkouts are found by scanning one `$HOME`, so the second lab's checkout
+    // moves under the first's root; its remotes are absolute paths to its own
+    // bare repositories and survive the move.
+    std::fs::rename(&second.work, first.temp_path().join("aardvark")).expect("move checkout");
     let home = tempfile::tempdir().expect("create config home");
     std::fs::write(
         home.path().join("repos.toml"),
         format!(
-            "[repos.aardvark]\npath = \"{}\"\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/one.git\"\n\
-             [repos.zebra]\npath = \"{}\"\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/two.git\"\n",
-            second.work.display(),
+            "[repos.aardvark]\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/one.git\"\n\
+             [repos.zebra]\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/two.git\"\n",
             second.upstream.display(),
-            first.work.display(),
             first.upstream.display(),
         ),
     )
@@ -65,6 +67,8 @@ fn status_all_reports_every_repo_in_registry_order() {
         .args(["--text", "status", "--all", "--no-github", "--no-landed"])
         .current_dir(elsewhere.path())
         .env("KNIVES_CONFIG_HOME", home.path())
+        .env("HOME", first.temp_path())
+        .env("JJ_CONFIG", "/dev/null")
         .env("KNIVES_TIMING", "1")
         .output()
         .expect("run status --all");
@@ -96,6 +100,8 @@ fn status_all_reports_every_repo_in_registry_order() {
             .args(["--text", "status", repo, "--no-github", "--no-landed"])
             .current_dir(elsewhere.path())
             .env("KNIVES_CONFIG_HOME", home.path())
+            .env("HOME", first.temp_path())
+            .env("JJ_CONFIG", "/dev/null")
             .output()
             .expect("run status for one repo");
         String::from_utf8_lossy(&output.stdout)
@@ -128,6 +134,8 @@ fn status_and_plan_report_a_double_cut() {
         .args(["--text", "status", "demo", "--no-github", "--no-landed"])
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
+        .env("HOME", lab.temp_path())
+        .env("JJ_CONFIG", "/dev/null")
         .output()
         .expect("run status");
     let plan = knives_release(&lab, &home, &[]);
@@ -189,6 +197,8 @@ fn status_and_plan_report_a_double_cut() {
         .args(["--text", "status", "demo", "--no-github", "--no-landed"])
         .current_dir(&rebuilt.work)
         .env("KNIVES_CONFIG_HOME", rebuilt_home.path())
+        .env("HOME", rebuilt.temp_path())
+        .env("JJ_CONFIG", "/dev/null")
         .output()
         .expect("run rebuilt status");
     let rebuilt_plan = knives_release(&rebuilt, &rebuilt_home, &[]);
@@ -228,25 +238,17 @@ fn status_with_the_landed_probe_reports_a_merged_branch_and_leaves_no_trace() {
     lab.publish_pull("feat/alpha", 7);
     lab.squash_merge_pull(7, None);
 
-    let entry = knives::config::RepoEntry {
-        path: lab.work.clone(),
-        upstream: lab.upstream.display().to_string(),
-        origin: lab.work.display().to_string(),
-        base: None,
-        release: None,
-        release_branch: None,
-        test_count_command: None,
-        consumers: Vec::new(),
-        workspaces: None,
-    };
+    let entry = knives::config::RepoEntry::new(
+        lab.upstream.display().to_string(),
+        lab.work.display().to_string(),
+    );
     let name = knives::ids::RepoName::new("a-repo");
     let temp = std::env::temp_dir().join(format!("knives-status-{}", std::process::id()));
     let store = knives::store::Store::open(temp.join("state.json")).expect("store");
 
     let before = lab.revision(&lab.work, "children(main@upstream)", "commit_id ++ \"\\n\"");
     let report = knives::commands::status::gather(
-        &name,
-        &entry,
+        &lab::lab_fork(&lab, name.as_str(), &entry),
         &store,
         &knives::commands::status::Options {
             probe: true,
@@ -299,6 +301,8 @@ fn status_reports_empty_diff_and_deleted_head_from_completed_facts() {
         .args(["--text", "status", "demo", "--no-landed"])
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
+        .env("HOME", lab.temp_path())
+        .env("JJ_CONFIG", "/dev/null")
         .env("XDG_CACHE_HOME", shim.path().join("cache"))
         .env("PATH", path_with_gh_shim(shim.path()))
         .output()
@@ -328,17 +332,10 @@ fn status_reports_branch_overlap_after_upstream_advances_without_landed_probe() 
     lab.branch("feat/alpha", "shared.txt", "alpha\n");
     lab.branch("feat/beta", "shared.txt", "beta\n");
     lab.advance_upstream("upstream advanced past the branches\n");
-    let entry = knives::config::RepoEntry {
-        path: lab.work.clone(),
-        upstream: lab.upstream.display().to_string(),
-        origin: lab.work.display().to_string(),
-        base: None,
-        release: None,
-        release_branch: None,
-        test_count_command: None,
-        consumers: Vec::new(),
-        workspaces: None,
-    };
+    let entry = knives::config::RepoEntry::new(
+        lab.upstream.display().to_string(),
+        lab.work.display().to_string(),
+    );
     let store_path = lab
         .work
         .parent()
@@ -349,8 +346,7 @@ fn status_reports_branch_overlap_after_upstream_advances_without_landed_probe() 
 
     // When: status deliberately skips only the landed replay
     let report = knives::commands::status::gather(
-        &name,
-        &entry,
+        &lab::lab_fork(&lab, name.as_str(), &entry),
         &store,
         &knives::commands::status::Options {
             probe: false,
@@ -384,25 +380,17 @@ fn status_reports_a_branch_carried_elsewhere() {
     lab.jj_work(["bookmark", "create", "theirs/rework", "-r", "feat/alpha"]);
     lab.jj_work(["new", "theirs/rework", "-m", "extra work on top"]);
     lab.jj_work(["bookmark", "set", "theirs/rework", "-r", "@"]);
-    let entry = knives::config::RepoEntry {
-        path: lab.work.clone(),
-        upstream: lab.upstream.display().to_string(),
-        origin: lab.work.display().to_string(),
-        base: None,
-        release: None,
-        release_branch: None,
-        test_count_command: None,
-        consumers: Vec::new(),
-        workspaces: None,
-    };
+    let entry = knives::config::RepoEntry::new(
+        lab.upstream.display().to_string(),
+        lab.work.display().to_string(),
+    );
     let name = knives::ids::RepoName::new("a-repo");
     let temp = std::env::temp_dir().join(format!("knives-status-{}", std::process::id()));
     let store = knives::store::Store::open(temp.join("state.json")).expect("store");
 
     // When: status gathers the branch report
     let report = knives::commands::status::gather(
-        &name,
-        &entry,
+        &lab::lab_fork(&lab, name.as_str(), &entry),
         &store,
         &knives::commands::status::Options {
             probe: false,
@@ -436,17 +424,10 @@ fn status_reports_a_carrier_for_a_closed_pull_request() {
     lab.jj_work(["bookmark", "create", "theirs/rework", "-r", "feat/alpha"]);
     lab.jj_work(["new", "theirs/rework", "-m", "extra work on top"]);
     lab.jj_work(["bookmark", "set", "theirs/rework", "-r", "@"]);
-    let entry = knives::config::RepoEntry {
-        path: lab.work.clone(),
-        upstream: lab.upstream.display().to_string(),
-        origin: lab.work.display().to_string(),
-        base: None,
-        release: None,
-        release_branch: None,
-        test_count_command: None,
-        consumers: Vec::new(),
-        workspaces: None,
-    };
+    let entry = knives::config::RepoEntry::new(
+        lab.upstream.display().to_string(),
+        lab.work.display().to_string(),
+    );
     let name = knives::ids::RepoName::new("a-repo");
     let temp = std::env::temp_dir().join(format!("knives-status-{}", std::process::id()));
     let store = knives::store::Store::open(temp.join("state.json")).expect("store");
@@ -461,8 +442,7 @@ fn status_reports_a_carrier_for_a_closed_pull_request() {
 
     // When: status gathers the branch report with the closed pull request
     let report = knives::commands::status::gather(
-        &name,
-        &entry,
+        &lab::lab_fork(&lab, name.as_str(), &entry),
         &store,
         &knives::commands::status::Options {
             probe: false,
@@ -504,25 +484,17 @@ fn status_does_not_report_trunk_as_a_carrier_without_landed_probe() {
     ]);
     lab.jj_work(["bookmark", "set", "main", "-r", "@"]);
     lab.jj_work(["new"]);
-    let entry = knives::config::RepoEntry {
-        path: lab.work.clone(),
-        upstream: lab.upstream.display().to_string(),
-        origin: lab.work.display().to_string(),
-        base: None,
-        release: None,
-        release_branch: None,
-        test_count_command: None,
-        consumers: Vec::new(),
-        workspaces: None,
-    };
+    let entry = knives::config::RepoEntry::new(
+        lab.upstream.display().to_string(),
+        lab.work.display().to_string(),
+    );
     let name = knives::ids::RepoName::new("a-repo");
     let temp = std::env::temp_dir().join(format!("knives-status-{}", std::process::id()));
     let store = knives::store::Store::open(temp.join("state.json")).expect("store");
 
     // When: status skips the landed probe
     let report = knives::commands::status::gather(
-        &name,
-        &entry,
+        &lab::lab_fork(&lab, name.as_str(), &entry),
         &store,
         &knives::commands::status::Options {
             probe: false,
@@ -553,24 +525,17 @@ fn status_carries_each_branchs_newest_notch_in_json_and_in_text() {
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     lab.branch("feat/beta", "beta.txt", "beta\n");
     let name = knives::ids::RepoName::new("demo");
-    let entry = RepoEntry {
-        path: lab.work.clone(),
-        upstream: lab.upstream.display().to_string(),
-        origin: lab.work.display().to_string(),
-        base: None,
-        release: None,
-        release_branch: None,
-        test_count_command: None,
-        consumers: Vec::new(),
-        workspaces: None,
-    };
+    let entry = RepoEntry::new(
+        lab.upstream.display().to_string(),
+        lab.work.display().to_string(),
+    );
     let state = tempfile::tempdir().expect("state directory");
     let store = Store::open(state.path().join("state.json")).expect("open store");
     let ledger = knives::ledger::Ledger::at(state.path().join("demo"));
     let scribe = knives::ledger::Scribe::new(
         ledger.clone(),
         name.clone(),
-        lab.work,
+        lab.work.clone(),
         "ses_fff688".to_owned(),
     );
     scribe
@@ -601,8 +566,7 @@ fn status_carries_each_branchs_newest_notch_in_json_and_in_text() {
 
     // When: status gathers with the ledger available
     let report = status::gather(
-        &name,
-        &entry,
+        &lab::lab_fork(&lab, name.as_str(), &entry),
         &store,
         &knives::commands::status::Options {
             probe: false,
@@ -681,7 +645,7 @@ fn status_carries_repo_level_notches_in_json_and_text() {
     let scribe = knives::ledger::Scribe::new(
         ledger.clone(),
         name.clone(),
-        lab.work,
+        lab.work.clone(),
         "ses_fff688".to_owned(),
     );
     scribe
@@ -689,8 +653,7 @@ fn status_carries_repo_level_notches_in_json_and_text() {
         .expect("repo-level notch");
 
     let report = status::gather(
-        &name,
-        &entry,
+        &lab::lab_fork(&lab, name.as_str(), &entry),
         &store,
         &knives::commands::status::Options {
             probe: false,
@@ -733,8 +696,7 @@ fn status_reports_a_repo_level_immutable_heads_rule_that_differs_from_the_forks(
 
     // When: status gathers without a forge
     let report = status::gather(
-        &knives::ids::RepoName::new("demo"),
-        &lab_entry(&lab),
+        &lab::lab_fork(&lab, "demo", &lab_entry(&lab)),
         &store,
         &knives::commands::status::Options {
             probe: false,
@@ -776,8 +738,7 @@ fn status_is_silent_about_the_forks_own_immutable_heads_rule() {
 
     // When: status gathers without a forge
     let report = status::gather(
-        &knives::ids::RepoName::new("demo"),
-        &lab_entry(&lab),
+        &lab::lab_fork(&lab, "demo", &lab_entry(&lab)),
         &store,
         &knives::commands::status::Options {
             probe: false,

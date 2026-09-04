@@ -31,8 +31,7 @@ fn gather(
     probe: bool,
 ) -> status::Report {
     status::gather(
-        &RepoName::new("demo"),
-        &lab_entry(lab),
+        &lab::lab_fork(lab, "demo", &lab_entry(lab)),
         store,
         &status::Options {
             probe,

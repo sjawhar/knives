@@ -269,6 +269,8 @@ fn a_forced_start_on_a_divergent_branch_refuses_before_seizing_the_claim() {
         ])
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
+        .env("HOME", lab.temp_path())
+        .env("JJ_CONFIG", "/dev/null")
         .output()
         .expect("run forced start");
 

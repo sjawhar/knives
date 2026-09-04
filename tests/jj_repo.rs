@@ -52,12 +52,18 @@ fn a_jj_workspace_beside_a_registered_repo_resolves_that_repo() {
         ..Registry::default()
     };
 
+    let bound = knives::bind::here(&registry, &workspace)
+        .expect("the workspace binds to its checkout's entry");
+    assert_eq!(bound.name, knives::ids::RepoName::new("demo"));
     assert_eq!(
-        registry.containing(&workspace).map(|(name, _)| name),
-        Some(knives::ids::RepoName::new("demo"))
+        bound.checkout.path,
+        lab.work.canonicalize().expect("canonical work")
     );
     let unrelated = tempfile::tempdir().expect("unrelated directory");
-    assert!(registry.containing(unrelated.path()).is_none());
+    assert_eq!(
+        knives::bind::here(&registry, unrelated.path()),
+        Err(knives::bind::Unbound::NotInsideARepository)
+    );
 }
 
 #[test]

@@ -8,9 +8,8 @@
 //! that advice was insufficient.
 // allow: SIZE_OK: claim coordination keeps identity-resolution behavior beside its tests.
 
-use std::path::Path;
-
 use crate::commands::hook::owner_for;
+use crate::ids::RepoName;
 use crate::store::{Claim, OwnerKind};
 
 /// A claimant and the source that established its name.
@@ -131,12 +130,13 @@ pub const fn owner_kind_label(kind: OwnerKind) -> &'static str {
 /// Resolves the identity that should own a claim.
 ///
 /// `KNIVES_OWNER` is what the `OpenCode` plugin injects. Claude Code instead
-/// provides its session ID. When neither harness provides an identity, a managed
-/// working directory can identify its active owner from knives state. The OS user
-/// is the fallback for a human at a terminal.
+/// provides its session ID. When neither harness provides an identity, `repo` —
+/// the fork the caller already bound (dispatch binds the working directory once
+/// per invocation; a verb passes the fork it acts on) — can identify its active
+/// owner from knives state. The OS user is the fallback for a human at a terminal.
 /// A blank `KNIVES_OWNER` is a plugin bug, not an identity. Treating it as one
 /// would let two agents share a claim. The same applies to `CLAUDE_CODE_SESSION_ID`.
-pub fn current_identity(cwd: &Path) -> anyhow::Result<Identity> {
+pub fn current_identity(repo: Option<&RepoName>) -> anyhow::Result<Identity> {
     if let Some(owner) = std::env::var("KNIVES_OWNER")
         .ok()
         .filter(|value| !value.trim().is_empty())
@@ -155,7 +155,7 @@ pub fn current_identity(cwd: &Path) -> anyhow::Result<Identity> {
             kind: OwnerKind::HarnessSession,
         });
     }
-    if let Some(owner) = owner_for(cwd)? {
+    if let Some(owner) = owner_for(repo)? {
         return Ok(Identity {
             owner,
             kind: OwnerKind::WorkspaceDerived,
@@ -213,7 +213,7 @@ mod tests {
         environment.remove("CLAUDE_CODE_SESSION_ID");
         environment.set("USER", "terminal-user");
 
-        let identity = current_identity(Path::new("/tmp/unmanaged")).unwrap();
+        let identity = current_identity(None).unwrap();
 
         assert_eq!(identity.owner, "terminal-user");
         assert_eq!(identity.kind, crate::store::OwnerKind::OsUser);
@@ -225,7 +225,7 @@ mod tests {
         let environment =
             EnvironmentGuard::capture(&["KNIVES_OWNER", "CLAUDE_CODE_SESSION_ID", "USER"]);
         environment.set("KNIVES_OWNER", "agent-one");
-        let identity = current_identity(Path::new("/tmp/unmanaged")).unwrap();
+        let identity = current_identity(None).unwrap();
 
         assert_eq!(identity.owner, "agent-one");
         assert_eq!(identity.kind, crate::store::OwnerKind::HarnessSession);
@@ -240,7 +240,7 @@ mod tests {
         environment.set("CLAUDE_CODE_SESSION_ID", "abc-123");
         environment.set("USER", "terminal-user");
 
-        let identity = current_identity(Path::new("/tmp/unmanaged")).unwrap();
+        let identity = current_identity(None).unwrap();
 
         assert_eq!(identity.owner, "abc-123");
         assert_eq!(identity.kind, crate::store::OwnerKind::HarnessSession);
@@ -261,7 +261,7 @@ mod tests {
         environment.set("CLAUDE_CODE_SESSION_ID", "   ");
         environment.set("USER", "terminal-user");
 
-        let identity = current_identity(Path::new("/tmp/unmanaged")).unwrap();
+        let identity = current_identity(None).unwrap();
 
         assert_eq!(identity.owner, "terminal-user");
         assert_eq!(identity.kind, crate::store::OwnerKind::OsUser);
@@ -270,19 +270,34 @@ mod tests {
     #[test]
     fn the_user_fallback_is_anonymous() {
         let _lock = environment_lock();
-        let environment =
-            EnvironmentGuard::capture(&["KNIVES_OWNER", "CLAUDE_CODE_SESSION_ID", "USER"]);
+        let environment = EnvironmentGuard::capture(&[
+            "KNIVES_CONFIG_HOME",
+            "KNIVES_OWNER",
+            "CLAUDE_CODE_SESSION_ID",
+            "USER",
+        ]);
+        let config = tempfile::tempdir().unwrap();
+        environment.set("KNIVES_CONFIG_HOME", config.path().to_str().unwrap());
         environment.remove("KNIVES_OWNER");
         environment.remove("CLAUDE_CODE_SESSION_ID");
         environment.set("USER", "terminal-user");
-        let identity = current_identity(Path::new("/tmp/unmanaged")).unwrap();
+        let identity = current_identity(None).unwrap();
 
         assert_eq!(identity.owner, "terminal-user");
         assert_eq!(identity.kind, crate::store::OwnerKind::OsUser);
     }
 
+    /// A state file whose only claim, on `repo`, is held by `state-owner`.
+    fn state_with_one_claimant(home: &Path) {
+        std::fs::write(
+            home.join("state.json"),
+            r#"{"claims":{"repo/feat/owner":{"repo":"repo","branch":"feat/owner","owner":"state-owner","why":"test","started":"2026-01-01T00:00:00Z","files":[]}}}"#,
+        )
+        .unwrap();
+    }
+
     #[test]
-    fn a_managed_directory_claim_resolves_as_workspace_derived() {
+    fn a_bound_repository_with_one_claimant_resolves_as_workspace_derived() {
         let _lock = environment_lock();
         let environment = EnvironmentGuard::capture(&[
             "KNIVES_CONFIG_HOME",
@@ -291,30 +306,41 @@ mod tests {
             "USER",
         ]);
         let home = tempfile::tempdir().unwrap();
-        let repository = home.path().join("repo");
-        std::fs::create_dir(&repository).unwrap();
-        std::fs::write(
-            home.path().join("repos.toml"),
-            format!(
-                "[repos.repo]\npath = \"{}\"\nupstream = \"u\"\norigin = \"o\"\n",
-                repository.display()
-            ),
-        )
-        .unwrap();
-        std::fs::write(
-            home.path().join("state.json"),
-            r#"{"claims":{"repo/feat/owner":{"repo":"repo","branch":"feat/owner","owner":"state-owner","why":"test","started":"2026-01-01T00:00:00Z","files":[]}}}"#,
-        )
-        .unwrap();
+        state_with_one_claimant(home.path());
         environment.set("KNIVES_CONFIG_HOME", home.path().to_str().unwrap());
         environment.remove("KNIVES_OWNER");
         environment.remove("CLAUDE_CODE_SESSION_ID");
         environment.set("USER", "terminal-user");
 
-        let identity = current_identity(&repository).unwrap();
+        let identity = current_identity(Some(&RepoName::new("repo"))).unwrap();
 
         assert_eq!(identity.owner, "state-owner");
         assert_eq!(identity.kind, crate::store::OwnerKind::WorkspaceDerived);
+    }
+
+    #[test]
+    fn an_unbound_directory_derives_no_owner_from_state() {
+        // Outside any managed fork (or in one whose remotes could not be read,
+        // which dispatch reports the same way), the claims in state say nothing
+        // about who is standing here: the identity is the OS user's.
+        let _lock = environment_lock();
+        let environment = EnvironmentGuard::capture(&[
+            "KNIVES_CONFIG_HOME",
+            "KNIVES_OWNER",
+            "CLAUDE_CODE_SESSION_ID",
+            "USER",
+        ]);
+        let home = tempfile::tempdir().unwrap();
+        state_with_one_claimant(home.path());
+        environment.set("KNIVES_CONFIG_HOME", home.path().to_str().unwrap());
+        environment.remove("KNIVES_OWNER");
+        environment.remove("CLAUDE_CODE_SESSION_ID");
+        environment.set("USER", "terminal-user");
+
+        let identity = current_identity(None).unwrap();
+
+        assert_eq!(identity.owner, "terminal-user");
+        assert_eq!(identity.kind, crate::store::OwnerKind::OsUser);
     }
 
     #[test]

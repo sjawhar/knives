@@ -5,6 +5,7 @@
 //! `jj rebase -b <release> -d <target>`, with the report of what moved. The
 //! cut lives in `release_cut`; the membership verbs in `release_edit`.
 
+use knives::bind::Fork;
 use knives::cli::Exit;
 use knives::commands::release;
 use knives::forge::PullRequest;
@@ -14,7 +15,6 @@ use knives::ledger::Ledger;
 use knives::release_model::{BranchSuccessions, carried_from_tips, trunk_positions};
 
 use super::release_edit::{EditRecord, record_edit_event, release_is_locally_movable};
-use super::selected;
 
 /// Rebase the whole composition onto an upstream commit: `jj rebase -b <release> -d <target>`.
 ///
@@ -32,136 +32,115 @@ use super::selected;
     reason = "rebasing is one ordered stateful gate sequence; its inputs remain explicit and its stages must not be separated"
 )]
 pub(crate) fn run_rebase(
-    name: &str,
+    fork: &Fork<'_>,
     reference: Option<&str>,
     no_drop: bool,
     extra_consumers: &[&std::path::Path],
     cache_root: Option<&std::path::Path>,
+    bound: Option<&RepoName>,
 ) -> anyhow::Result<Exit> {
-    let chosen = match selected(Some(name), false)? {
-        Ok(list) => list,
-        Err(exit) => return Ok(exit),
-    };
+    let repo = &fork.name;
+    let entry = fork.entry;
+    let path = &fork.checkout.path;
     let mut locals = extra_consumers
         .iter()
         .map(|path| path.to_path_buf())
         .collect::<Vec<_>>();
     locals.sort();
     locals.dedup();
-    let mut worst = Exit::Ok;
     let forge = CliForge;
     let heads = knives::consumer_pins::ConsumerHeadMemo::default();
-    for (repo, entry) in chosen {
-        let opened = knives::jj::Repo::open(&entry.path)?;
-        let consumers = release::ConsumerInputs {
-            slugs: &entry.consumers,
-            locals: &locals,
-            forge: &forge,
-            cache_root,
-            heads: &heads,
-        };
-        let plan = release::plan(
-            &repo,
-            &entry,
-            &consumers,
-            &Ledger::for_repo(&repo).entries()?,
-        )?;
-        if !plan.problems.is_empty() {
-            println!("{}", release::render(&plan));
-            worst = worst.worst(Exit::Incomplete);
-            continue;
-        }
-        let Some(release_name) = plan.release.clone() else {
-            println!("{repo}: no release to move");
-            continue;
-        };
-        if !release_is_locally_movable(&opened, &repo, &release_name) {
-            worst = worst.worst(Exit::Incomplete);
-            continue;
-        }
-        let Some(destination) = rebase_target(RebaseTargetInput {
-            repo: &repo,
-            entry: &entry,
-            opened: &opened,
-            reference,
-            cache_root,
-        })?
-        else {
-            worst = worst.worst(Exit::Incomplete);
-            continue;
-        };
-        let onto = destination.onto.clone();
-        let reference = destination.reference.clone();
-        let release_commit = opened.resolve_commit(&release_name)?;
-        if let Some(exit) = existing_rebase_exit(ExistingRebaseInput {
-            opened: &opened,
-            repo: &repo,
-            entry: &entry,
-            release_name: &release_name,
-            release_commit: &release_commit,
-            destination: &destination,
-            no_drop,
-        })? {
-            worst = worst.worst(exit);
-            continue;
-        }
-        let scheme = entry.release_scheme();
-        if let Some(exit) = frozen_rebase_exit(
-            &repo,
-            &release_name,
-            &scheme,
-            release::repair_effect(
-                &plan.pins,
-                knives::ids::BookmarkRef::parse(&release_name).branch(),
-            ),
-        ) {
-            worst = worst.worst(exit);
-            continue;
-        }
-        let context = RebaseContext {
-            repo: &repo,
-            entry: &entry,
-            opened: &opened,
-        };
-        let Some((members, shed)) = classify_rebase_parents(&context, &release_name, &onto)? else {
-            return Ok(Exit::Incomplete);
-        };
-        if all_landed(&opened, &members, &onto)? {
-            println!(
-                "{repo}: every member of {release_name} has landed in {reference}; rebasing \
-                 would make the trunk the only parent, so nothing moved \u{2014} reap the release \
-                 or include new work"
-            );
-            worst = worst.worst(Exit::Incomplete);
-            continue;
-        }
-        if members.is_empty() {
-            println!("{repo}: {release_name} has no member parents to move; nothing to rebase");
-            worst = worst.worst(Exit::Incomplete);
-            continue;
-        }
-        shed_stale_bases(&entry, (&release_name, &release_commit), &members, shed)?;
-        knives::jj::rebase_branch_onto(&entry.path, &release_name, &onto)?;
-        report_rebased_release(
-            &repo,
-            &entry,
-            &RebasedRelease {
-                name: &release_name,
-                reference: &reference,
-                onto: &onto,
-                shed,
-            },
-        )?;
-        if !no_drop {
-            worst = worst.worst(drop_landed_members(
-                &repo,
-                &entry,
-                &release_name,
-                &destination,
-            )?);
-        }
+    let opened = knives::jj::Repo::open(path)?;
+    let consumers = release::ConsumerInputs {
+        slugs: &entry.consumers,
+        locals: &locals,
+        forge: &forge,
+        cache_root,
+        heads: &heads,
+    };
+    let plan = release::plan(fork, &consumers, &Ledger::for_repo(repo).entries()?)?;
+    if !plan.problems.is_empty() {
+        println!("{}", release::render(&plan));
+        return Ok(Exit::Incomplete);
     }
-    Ok(worst)
+    let Some(release_name) = plan.release.clone() else {
+        println!("{repo}: no release to move");
+        return Ok(Exit::Ok);
+    };
+    if !release_is_locally_movable(&opened, repo, &release_name) {
+        return Ok(Exit::Incomplete);
+    }
+    let Some(destination) = rebase_target(RebaseTargetInput {
+        fork,
+        opened: &opened,
+        reference,
+        cache_root,
+    })?
+    else {
+        return Ok(Exit::Incomplete);
+    };
+    let onto = destination.onto.clone();
+    let reference = destination.reference.clone();
+    let release_commit = opened.resolve_commit(&release_name)?;
+    if let Some(exit) = existing_rebase_exit(ExistingRebaseInput {
+        opened: &opened,
+        fork,
+        release_name: &release_name,
+        release_commit: &release_commit,
+        destination: &destination,
+        no_drop,
+        bound,
+    })? {
+        return Ok(exit);
+    }
+    let scheme = entry.release_scheme();
+    if let Some(exit) = frozen_rebase_exit(
+        repo,
+        &release_name,
+        &scheme,
+        release::repair_effect(
+            &plan.pins,
+            knives::ids::BookmarkRef::parse(&release_name).branch(),
+        ),
+    ) {
+        return Ok(exit);
+    }
+    let context = RebaseContext {
+        repo,
+        entry,
+        opened: &opened,
+    };
+    let Some((members, shed)) = classify_rebase_parents(&context, &release_name, &onto)? else {
+        return Ok(Exit::Incomplete);
+    };
+    if all_landed(&opened, &members, &onto)? {
+        println!(
+            "{repo}: every member of {release_name} has landed in {reference}; rebasing \
+             would make the trunk the only parent, so nothing moved \u{2014} reap the release \
+             or include new work"
+        );
+        return Ok(Exit::Incomplete);
+    }
+    if members.is_empty() {
+        println!("{repo}: {release_name} has no member parents to move; nothing to rebase");
+        return Ok(Exit::Incomplete);
+    }
+    shed_stale_bases(path, (&release_name, &release_commit), &members, shed)?;
+    knives::jj::rebase_branch_onto(path, &release_name, &onto)?;
+    report_rebased_release(
+        fork,
+        &RebasedRelease {
+            name: &release_name,
+            reference: &reference,
+            onto: &onto,
+            shed,
+        },
+        bound,
+    )?;
+    if no_drop {
+        return Ok(Exit::Ok);
+    }
+    drop_landed_members(fork, &release_name, &destination, bound)
 }
 
 fn frozen_rebase_exit(
@@ -189,7 +168,7 @@ fn frozen_rebase_exit(
 
 /// Rewrite the release to its member parents only, shedding stale bases.
 fn shed_stale_bases(
-    entry: &knives::config::RepoEntry,
+    path: &std::path::Path,
     (release_name, release_commit): (&str, &knives::ids::CommitId),
     members: &[knives::ids::CommitId],
     shed: usize,
@@ -198,7 +177,7 @@ fn shed_stale_bases(
         return Ok(());
     }
     knives::jj::write_release(
-        &entry.path,
+        path,
         &knives::jj::ReleaseWrite {
             source: Some(release_commit),
             parents: members,
@@ -291,8 +270,7 @@ struct RebaseDestination {
 
 #[derive(Clone, Copy)]
 struct RebaseTargetInput<'a> {
-    repo: &'a RepoName,
-    entry: &'a knives::config::RepoEntry,
+    fork: &'a Fork<'a>,
     opened: &'a knives::jj::Repo,
     reference: Option<&'a str>,
     cache_root: Option<&'a std::path::Path>,
@@ -301,35 +279,35 @@ struct RebaseTargetInput<'a> {
 #[derive(Clone, Copy)]
 struct ExistingRebaseInput<'a> {
     opened: &'a knives::jj::Repo,
-    repo: &'a RepoName,
-    entry: &'a knives::config::RepoEntry,
+    fork: &'a Fork<'a>,
     release_name: &'a str,
     release_commit: &'a knives::ids::CommitId,
     destination: &'a RebaseDestination,
     no_drop: bool,
+    bound: Option<&'a RepoName>,
 }
 
 fn existing_rebase_exit(input: ExistingRebaseInput<'_>) -> anyhow::Result<Option<Exit>> {
     let ExistingRebaseInput {
         opened,
-        repo,
-        entry,
+        fork,
         release_name,
         release_commit,
         destination,
         no_drop,
+        bound,
     } = input;
     if !opened.is_ancestor(&destination.onto, release_commit)? {
         return Ok(None);
     }
     println!(
-        "{repo}: {release_name} already contains {}",
-        destination.reference
+        "{}: {release_name} already contains {}",
+        fork.name, destination.reference
     );
     let exit = if no_drop {
         Exit::Ok
     } else {
-        drop_landed_members(repo, entry, release_name, destination)?
+        drop_landed_members(fork, release_name, destination, bound)?
     };
     Ok(Some(exit))
 }
@@ -341,8 +319,7 @@ fn existing_rebase_exit(input: ExistingRebaseInput<'_>) -> anyhow::Result<Option
 /// not closed, because closed landed nothing.
 fn rebase_target(input: RebaseTargetInput<'_>) -> anyhow::Result<Option<RebaseDestination>> {
     let RebaseTargetInput {
-        repo,
-        entry,
+        fork,
         opened,
         reference,
         cache_root,
@@ -354,7 +331,7 @@ fn rebase_target(input: RebaseTargetInput<'_>) -> anyhow::Result<Option<RebaseDe
             landed: Vec::new(),
         }));
     }
-    merged_rebase_target(repo, entry, opened, cache_root)
+    merged_rebase_target(fork, opened, cache_root)
 }
 
 fn select_merged_numbers(discovery: &knives::snapshot::Discovery<'_>, trunk: &str) -> Vec<u64> {
@@ -371,16 +348,17 @@ fn select_merged_numbers(discovery: &knives::snapshot::Discovery<'_>, trunk: &st
 /// nothing merged there is no such point, and which commit to move onto goes
 /// back to being a judgment the caller must make.
 fn merged_rebase_target(
-    repo: &RepoName,
-    entry: &knives::config::RepoEntry,
+    fork: &Fork<'_>,
     opened: &knives::jj::Repo,
     cache_root: Option<&std::path::Path>,
 ) -> anyhow::Result<Option<RebaseDestination>> {
+    let repo = &fork.name;
+    let entry = fork.entry;
     let trunk = entry.upstream_trunk();
     let forge = CliForge;
     let opened_snapshot = match knives::snapshot::open(knives::snapshot::SnapshotConfig {
         forge: &forge,
-        path: &entry.path,
+        path: &fork.checkout.path,
         remotes: [
             entry.remote(knives::config::Role::Origin),
             entry.remote(knives::config::Role::Release),
@@ -555,15 +533,18 @@ fn all_landed(
 /// that is said instead. The drop duplicates the release onto the kept parents,
 /// exactly as `drop` does, so recorded conflict resolutions carry forward.
 fn drop_landed_members(
-    repo: &RepoName,
-    entry: &knives::config::RepoEntry,
+    fork: &Fork<'_>,
     release_name: &str,
     destination: &RebaseDestination,
+    bound: Option<&RepoName>,
 ) -> anyhow::Result<Exit> {
     if destination.landed.is_empty() {
         return Ok(Exit::Ok);
     }
-    let opened = knives::jj::Repo::open(&entry.path)?;
+    let repo = &fork.name;
+    let entry = fork.entry;
+    let path = &fork.checkout.path;
+    let opened = knives::jj::Repo::open(path)?;
     let parents = opened.parent_commits(release_name)?;
     let mut kept = parents.clone();
     let mut deltas: Vec<String> = Vec::new();
@@ -574,7 +555,7 @@ fn drop_landed_members(
         if !parents.contains(&tip) {
             continue;
         }
-        if knives::jj::carries_work_past(&entry.path, &destination.onto, &tip)? {
+        if knives::jj::carries_work_past(path, &destination.onto, &tip)? {
             println!(
                 "{repo}: kept {}: it carries work past #{}",
                 pull.head_ref_name, pull.number
@@ -602,7 +583,7 @@ fn drop_landed_members(
     let delta = deltas.join("; ");
     let message = release::composition_message(release_name, &provenance, &delta);
     let created = knives::jj::write_release(
-        &entry.path,
+        path,
         &knives::jj::ReleaseWrite {
             source: Some(&release),
             parents: &kept,
@@ -612,8 +593,7 @@ fn drop_landed_members(
         },
     )?;
     record_edit_event(
-        repo,
-        entry,
+        fork,
         &opened,
         &EditRecord {
             release: release_name,
@@ -621,12 +601,13 @@ fn drop_landed_members(
             created: &created,
             provenance: &provenance,
         },
+        bound,
     )?;
     println!(
         "{repo}: {release_name} now has {} parent(s): {delta}",
         kept.len()
     );
-    match knives::jj::conflicted_files(&entry.path, created.as_str()) {
+    match knives::jj::conflicted_files(path, created.as_str()) {
         Ok(files) => println!("{}", release::conflict_guidance(&files)),
         Err(error) => println!("  could not list conflicts: {error}"),
     }
@@ -644,11 +625,14 @@ struct RebasedRelease<'a> {
 /// Re-describe the rebased release so the recorded provenance names the
 /// rewritten parents, and report what moved.
 fn report_rebased_release(
-    repo: &RepoName,
-    entry: &knives::config::RepoEntry,
+    fork: &Fork<'_>,
     rebased: &RebasedRelease<'_>,
+    bound: Option<&RepoName>,
 ) -> anyhow::Result<()> {
-    let reopened = knives::jj::Repo::open(&entry.path)?;
+    let repo = &fork.name;
+    let entry = fork.entry;
+    let path = &fork.checkout.path;
+    let reopened = knives::jj::Repo::open(path)?;
     let created = reopened.resolve_commit(rebased.name)?;
     let new_parents = reopened.parent_commits(rebased.name)?;
     let provenance =
@@ -656,7 +640,7 @@ fn report_rebased_release(
     let delta = format!("rebased onto {}", rebased.reference);
     let message = release::composition_message(rebased.name, &provenance, &delta);
     let described = knives::jj::describe_commit(
-        &entry.path,
+        path,
         &created,
         &message,
         &format!("knives: {}: record rebased provenance", rebased.name),
@@ -666,8 +650,7 @@ fn report_rebased_release(
     // longer among its parents, and the next edit could not tell a rebuilt
     // branch from a stranger.
     record_edit_event(
-        repo,
-        entry,
+        fork,
         &reopened,
         &EditRecord {
             release: rebased.name,
@@ -675,6 +658,7 @@ fn report_rebased_release(
             created: &described,
             provenance: &provenance,
         },
+        bound,
     )?;
     let stale_bases = if rebased.shed > 0 {
         format!(", {} stale base parent(s) shed", rebased.shed)
@@ -688,7 +672,7 @@ fn report_rebased_release(
         rebased.onto.short(),
         new_parents.len()
     );
-    match knives::jj::conflicted_files(&entry.path, described.as_str()) {
+    match knives::jj::conflicted_files(path, described.as_str()) {
         Ok(files) => println!("{}", release::conflict_guidance(&files)),
         Err(error) => println!("  could not list conflicts: {error}"),
     }

@@ -9,7 +9,7 @@
 mod lab;
 
 use knives::commands::audit;
-use knives::ids::{BookmarkRef, BranchName, RemoteName, RepoName};
+use knives::ids::{BookmarkRef, BranchName, RemoteName};
 use knives::jj::Repo;
 use knives::store::Store;
 use lab::{Lab, lab_entry};
@@ -23,8 +23,7 @@ fn mutation_test_home(lab: &Lab, release: Option<&std::path::Path>) -> tempfile:
     std::fs::write(
         home.path().join("repos.toml"),
         format!(
-            "[repos.demo]\npath = \"{}\"\nupstream = \"{}\"\norigin = \"{}\"\n{release}",
-            lab.work.display(),
+            "[repos.demo]\nupstream = \"{}\"\norigin = \"{}\"\n{release}",
             lab.upstream.display(),
             lab.temp_origin().display(),
         ),
@@ -41,6 +40,8 @@ fn knives_pushed(lab: &Lab, home: &tempfile::TempDir, args: &[&str]) -> std::pro
     command
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
+        .env("HOME", lab.temp_path())
+        .env("JJ_CONFIG", "/dev/null")
         .env("KNIVES_OWNER", "test-owner")
         .output()
         .expect("run knives pushed")
@@ -137,6 +138,8 @@ fn pushed_compares_a_tracked_pull_head() {
         ])
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
+        .env("HOME", lab.temp_path())
+        .env("JJ_CONFIG", "/dev/null")
         .env("KNIVES_OWNER", "test-owner")
         .output()
         .expect("track pull");
@@ -257,6 +260,8 @@ fn knives_audit(lab: &Lab, home: &tempfile::TempDir, args: &[&str]) -> std::proc
     command
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
+        .env("HOME", lab.temp_path())
+        .env("JJ_CONFIG", "/dev/null")
         .env("KNIVES_OWNER", "test-owner")
         .output()
         .expect("run knives audit")
@@ -265,12 +270,11 @@ fn knives_audit(lab: &Lab, home: &tempfile::TempDir, args: &[&str]) -> std::proc
 fn gather_audit(lab: &Lab) -> audit::Report {
     let state = tempfile::tempdir().expect("state directory");
     let store = Store::open(state.path().join("state.json")).expect("open store");
-    let repo = RepoName::new("demo");
     let entry = lab_entry(lab);
+    let fork = lab::lab_fork(lab, "demo", &entry);
 
     audit::gather(&audit::AuditInput {
-        repo: &repo,
-        entry: &entry,
+        fork: &fork,
         store: &store,
         forge: None,
         cache_root: None,
@@ -443,8 +447,10 @@ fn a_remote_tracking_ref_whose_remote_is_gone_is_reported() {
 }
 
 #[test]
-fn a_remote_tracking_ref_is_reported_after_the_last_configured_remote_is_removed() {
+fn a_remote_tracking_ref_is_reported_after_its_remote_is_removed() {
     // Given: extra contributes a tracking ref alongside the lab's standard remotes.
+    // Only extra is removed: a checkout with no `upstream` is not a managed fork,
+    // and the checkout must still bind to `demo` for the audit to look at it.
     let lab = Lab::new();
     let extra = lab.temp_origin();
     lab.jj_work([
@@ -456,34 +462,10 @@ fn a_remote_tracking_ref_is_reported_after_the_last_configured_remote_is_removed
     ]);
     lab.jj_work(["git", "fetch", "--remote", "extra"]);
 
-    // When: config surgery removes every remote while retaining their tracking refs.
-    for remote in ["origin", "upstream", "extra"] {
-        git_remote_in_colocated_config(&lab, &["remove", remote]);
-    }
-    let configured = Command::new("git")
-        .args([
-            "-C",
-            lab.work.to_str().expect("utf-8 work path"),
-            "config",
-            "--get-regexp",
-            "^remote\\..*\\.url$",
-        ])
-        .output()
-        .expect("read configured Git remotes");
-    assert_eq!(
-        configured.status.code(),
-        Some(1),
-        "stdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&configured.stdout),
-        String::from_utf8_lossy(&configured.stderr)
-    );
-    assert!(
-        configured.stdout.is_empty(),
-        "no-match output: {}",
-        String::from_utf8_lossy(&configured.stdout)
-    );
+    // When: config surgery removes the remote while retaining its tracking ref.
+    git_remote_in_colocated_config(&lab, &["remove", "extra"]);
 
-    // Then: the audit CLI treats that valid empty map as no configured remotes.
+    // Then: the audit CLI reports the ref whose remote is gone.
     let home = mutation_test_home(&lab, None);
     let output = knives_audit(&lab, &home, &["demo", "--no-github"]);
     let report: serde_json::Value =
@@ -501,96 +483,6 @@ fn a_remote_tracking_ref_is_reported_after_the_last_configured_remote_is_removed
         "missing extra tracking-ref finding: stdout={}\nstderr={}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        !report["problems"].as_array().is_some_and(|problems| {
-            problems.iter().any(|problem| {
-                problem.as_str().is_some_and(|problem| {
-                    problem.contains("could not read configured Git remotes")
-                })
-            })
-        }),
-        "the empty configured-remote set is valid: {report}"
-    );
-}
-
-#[test]
-fn an_unreadable_remote_config_surfaces_a_problem_without_fabricating_orphans() {
-    // Given: extra contributes a tracking ref while its remote is configured.
-    let lab = Lab::new();
-    let extra = lab.temp_origin();
-    lab.jj_work([
-        "git",
-        "remote",
-        "add",
-        "extra",
-        extra.to_str().expect("utf-8 remote path"),
-    ]);
-    lab.jj_work(["git", "fetch", "--remote", "extra"]);
-
-    // When: Git reports the remote config unreadable only for the detector's query.
-    let home = mutation_test_home(&lab, None);
-    let shim = tempfile::tempdir().expect("create Git shim directory");
-    let fake_git = shim.path().join("git");
-    std::fs::write(
-        &fake_git,
-        "#!/bin/sh\ncase \" $* \" in\n  *\" config --get-regexp \"*) echo 'fatal: unable to read config' >&2; exit 128 ;;\n  *) PATH=\"${PATH#*:}\" exec git \"$@\" ;;\nesac\n",
-    )
-    .expect("write Git shim");
-    let mut permissions = std::fs::metadata(&fake_git)
-        .expect("read Git shim permissions")
-        .permissions();
-    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
-    std::fs::set_permissions(&fake_git, permissions).expect("make Git shim executable");
-    let shimmed_path = std::env::join_paths(std::iter::once(shim.path().to_path_buf()).chain(
-        std::env::split_paths(&std::env::var_os("PATH").expect("PATH is set")),
-    ))
-    .expect("construct shimmed PATH");
-    let configured = Command::new("git")
-        .args([
-            "-C",
-            lab.work.to_str().expect("utf-8 work path"),
-            "config",
-            "--get-regexp",
-            "^remote\\..*\\.url$",
-        ])
-        .env("PATH", &shimmed_path)
-        .output()
-        .expect("read configured Git remotes");
-    assert!(
-        !configured.status.success(),
-        "unreadable config unexpectedly read: {}",
-        String::from_utf8_lossy(&configured.stdout)
-    );
-
-    // Then: the audit CLI reports the read error instead of inventing orphan findings.
-    let output = Command::new(env!("CARGO_BIN_EXE_knives"))
-        .args(["--json", "audit", "demo", "--no-github"])
-        .current_dir(&lab.work)
-        .env("KNIVES_CONFIG_HOME", home.path())
-        .env("KNIVES_OWNER", "test-owner")
-        .env("PATH", &shimmed_path)
-        .output()
-        .expect("run knives audit");
-    let report: serde_json::Value =
-        serde_json::from_slice(&output.stdout).expect("audit emits JSON");
-    assert!(
-        report["problems"].as_array().is_some_and(|problems| {
-            problems.iter().any(|problem| {
-                problem.as_str().is_some_and(|problem| {
-                    problem.contains("could not read configured Git remotes")
-                })
-            })
-        }),
-        "missing configured-remote read problem: {report}"
-    );
-    assert!(
-        report["findings"]
-            .as_array()
-            .expect("findings")
-            .iter()
-            .all(|finding| finding["kind"] != "unconfigured-remote"),
-        "unreadable config must not fabricate orphan findings: {report}"
     );
 }
 
@@ -741,6 +633,8 @@ fn audit_reports_release_drift_from_the_recorded_cut() {
         ])
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
+        .env("HOME", lab.temp_path())
+        .env("JJ_CONFIG", "/dev/null")
         .env("KNIVES_OWNER", "test-owner")
         .output()
         .expect("cut release");

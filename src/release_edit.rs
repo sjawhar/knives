@@ -5,6 +5,7 @@
 //! parent set; a branch joins or moves only through a verb here, and every
 //! write records the parent set it left behind.
 
+use knives::bind::Fork;
 use knives::cli::Exit;
 use knives::commands::release;
 use knives::forge::github::CliForge;
@@ -15,7 +16,7 @@ use knives::release_model::{
     last_recorded_parents, member_parents, members_event_text, trunk_positions,
 };
 
-use super::{scribe_for, selected};
+use super::scribe_for;
 
 /// One deliberate change to the release in hand.
 pub(crate) enum ReleaseEdit {
@@ -82,11 +83,15 @@ impl ReleaseInHand {
     }
 }
 
-/// Everything an edit reads: whose release, which repository, which release.
+/// Everything an edit reads: whose release, which repository, which release,
+/// and where the editor stands.
 struct EditContext<'a> {
     repo: &'a RepoName,
     opened: &'a knives::jj::Repo,
     release: &'a ReleaseInHand,
+    /// The entry the current directory is inside; the ledger event's author is
+    /// derived from it.
+    bound: Option<&'a RepoName>,
     /// The release's last recorded parent set, from this repository's ledger.
     ///
     /// Ancestry and change ids cover a branch that grew or was rebased by jj. A
@@ -178,38 +183,31 @@ impl EditContext<'_> {
     }
 }
 
-/// Apply one stated change to each chosen repo's release in hand.
+/// Apply one stated change to the fork's release in hand.
 pub(crate) fn run_release_edit(
-    name: &str,
+    fork: &Fork<'_>,
     extra_consumers: &[&std::path::Path],
     change: &ReleaseEdit,
+    bound: Option<&RepoName>,
 ) -> anyhow::Result<Exit> {
-    let chosen = match selected(Some(name), false)? {
-        Ok(list) => list,
-        Err(exit) => return Ok(exit),
-    };
     let mut locals = extra_consumers
         .iter()
         .map(|path| path.to_path_buf())
         .collect::<Vec<_>>();
     locals.sort();
     locals.dedup();
-    let mut worst = Exit::Ok;
     let forge = CliForge;
     let cache_root = knives::forge_cache::cache_root();
     let heads = knives::consumer_pins::ConsumerHeadMemo::default();
-    for (repo, entry) in chosen {
-        worst = worst.worst(edit_release(
-            &repo,
-            &entry,
-            &locals,
-            change,
-            &forge,
-            cache_root.as_deref(),
-            &heads,
-        )?);
-    }
-    Ok(worst)
+    edit_release(
+        fork,
+        &locals,
+        change,
+        &forge,
+        cache_root.as_deref(),
+        &heads,
+        bound,
+    )
 }
 
 /// Edit the release in hand: one change, nothing else moves.
@@ -223,15 +221,17 @@ pub(crate) fn run_release_edit(
     reason = "release-edit state and the shared consumer-scan collaborators are independently owned command inputs"
 )]
 fn edit_release(
-    repo: &RepoName,
-    entry: &knives::config::RepoEntry,
+    fork: &Fork<'_>,
     locals: &[std::path::PathBuf],
     change: &ReleaseEdit,
     forge: &dyn knives::consumer_pins::ConsumerPinSource,
     cache_root: Option<&std::path::Path>,
     heads: &knives::consumer_pins::ConsumerHeadMemo,
+    bound: Option<&RepoName>,
 ) -> anyhow::Result<Exit> {
-    let opened = knives::jj::Repo::open(&entry.path)?;
+    let repo = &fork.name;
+    let entry = fork.entry;
+    let opened = knives::jj::Repo::open(&fork.checkout.path)?;
     let consumers = release::ConsumerInputs {
         slugs: &entry.consumers,
         locals,
@@ -239,7 +239,7 @@ fn edit_release(
         cache_root,
         heads,
     };
-    let plan = release::plan(repo, entry, &consumers, &Ledger::for_repo(repo).entries()?)?;
+    let plan = release::plan(fork, &consumers, &Ledger::for_repo(repo).entries()?)?;
     if !plan.problems.is_empty() {
         println!("{}", release::render(&plan));
         println!(
@@ -301,6 +301,7 @@ fn edit_release(
         opened: &opened,
         release: &release,
         recorded: last_recorded_parents(&ledger, &release.name),
+        bound,
         stacked: StackedHistoryContext {
             repo: &opened,
             trunks: &release.trunk_tips,
@@ -318,22 +319,23 @@ fn edit_release(
         EditOutcome::Settled(exit) => return Ok(exit),
         EditOutcome::Done(parents, delta) => (parents, delta),
     };
-    apply_edit(&context, entry, &new_parents, &delta)
+    apply_edit(&context, fork, &new_parents, &delta)
 }
 
 /// Write the edited release — duplicated onto its new parent set, described,
 /// its name moved — record the parent set in the ledger, and report.
 fn apply_edit(
     context: &EditContext<'_>,
-    entry: &knives::config::RepoEntry,
+    fork: &Fork<'_>,
     new_parents: &[knives::ids::CommitId],
     delta: &str,
 ) -> anyhow::Result<Exit> {
     let (repo, opened, release) = (context.repo, context.opened, context.release);
+    let entry = fork.entry;
     let provenance = release::parent_sources(opened, entry, &entry.release_scheme(), new_parents)?;
     let message = release::composition_message(&release.name, &provenance, delta);
     let created = knives::jj::write_release(
-        &entry.path,
+        &fork.checkout.path,
         &knives::jj::ReleaseWrite {
             source: Some(&release.commit),
             parents: new_parents,
@@ -343,8 +345,7 @@ fn apply_edit(
         },
     )?;
     record_edit_event(
-        repo,
-        entry,
+        fork,
         opened,
         &EditRecord {
             release: &release.name,
@@ -352,13 +353,14 @@ fn apply_edit(
             created: &created,
             provenance: &provenance,
         },
+        context.bound,
     )?;
     println!(
         "{repo}: {} now has {} parent(s): {delta}",
         release.name,
         new_parents.len()
     );
-    match knives::jj::conflicted_files(&entry.path, created.as_str()) {
+    match knives::jj::conflicted_files(&fork.checkout.path, created.as_str()) {
         Ok(files) => println!("{}", release::conflict_guidance(&files)),
         Err(error) => println!("  could not list conflicts: {error}"),
     }
@@ -378,17 +380,17 @@ pub(crate) struct EditRecord<'a> {
 /// `advance` or `include` can still tell which parent is which branch after a
 /// rebase that left no ancestry or change id behind.
 pub(crate) fn record_edit_event(
-    repo: &RepoName,
-    entry: &knives::config::RepoEntry,
+    fork: &Fork<'_>,
     opened: &knives::jj::Repo,
     record: &EditRecord<'_>,
+    bound: Option<&RepoName>,
 ) -> anyhow::Result<()> {
     let parents: Vec<knives::ids::CommitId> = record
         .provenance
         .iter()
         .map(|(_, commit)| commit.clone())
         .collect();
-    scribe_for(repo, entry)?.record(&Draft {
+    scribe_for(fork, bound)?.record(&Draft {
         subject: Some(record.release),
         kind: Kind::Event,
         disposition: None,
@@ -402,7 +404,7 @@ pub(crate) fn record_edit_event(
             .chain(parents.iter().map(|commit| commit.as_str().to_owned()))
             .collect(),
         pr: None,
-        parents: recorded_parents(opened, entry, &parents)?,
+        parents: recorded_parents(opened, fork.entry, &parents)?,
     })?;
     Ok(())
 }

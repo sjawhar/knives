@@ -36,6 +36,8 @@ fn knives_pr_with_shim(
         .args(["--repo", "demo"])
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
+        .env("HOME", lab.temp_path())
+        .env("JJ_CONFIG", "/dev/null")
         .env("XDG_CACHE_HOME", shim.path().join("cache"))
         .env("PATH", path_with_gh_shim(shim.path()));
     if timeline {

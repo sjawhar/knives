@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 
 use knives::{
-    config::{GuidanceRoot, GuidanceRootKind},
+    config::GuidanceRoot,
     hook::guidance::{
         Guidance, InstructionFile, claim_lines, format_guidance, format_notice, guidance_for,
     },
@@ -29,7 +29,6 @@ fn repo(files: &[(&str, &str)]) -> (TempDir, GuidanceRoot) {
         GuidanceRoot {
             name: "repo".to_owned(),
             root,
-            kind: GuidanceRootKind::Managed,
         },
     )
 }
@@ -127,7 +126,6 @@ fn sibling_path_with_a_shared_prefix_is_not_inside_the_repository() {
     let repo = GuidanceRoot {
         name: "repo".to_owned(),
         root: canonical_root,
-        kind: GuidanceRootKind::Managed,
     };
 
     // When: the sibling file is considered.

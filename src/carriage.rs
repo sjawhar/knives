@@ -12,12 +12,12 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use crate::config::{RepoEntry, Role};
+use crate::bind::Fork;
+use crate::config::Role;
 use crate::detect::{BookmarkTips, RebaseOutcome};
 use crate::forge::{Forge, index_pulls};
 use crate::ids::{
-    BookmarkRef, BranchName, CommitId, ReleaseScheme, RepoName, is_our_release,
-    strict_dated_release,
+    BookmarkRef, BranchName, CommitId, ReleaseScheme, is_our_release, strict_dated_release,
 };
 use crate::jj::Repo;
 use crate::release_model;
@@ -138,12 +138,13 @@ pub struct CensusOptions<'a> {
 /// `forge: None` leaves pull-request state explicitly unknown; carriage itself
 /// remains a local repository question and still completes.
 pub fn census(
-    repo_name: &RepoName,
-    entry: &RepoEntry,
+    fork: &Fork<'_>,
     forge: Option<&dyn Forge>,
     options: CensusOptions<'_>,
 ) -> anyhow::Result<CensusReport> {
-    let repo = Repo::open(&entry.path)?;
+    let entry = fork.entry;
+    let path = &fork.checkout.path;
+    let repo = Repo::open(path)?;
     let trunk_name = entry.upstream_trunk();
     let trunk = repo.resolve_commit(&trunk_name)?;
     let tips = repo.bookmark_tips()?;
@@ -174,7 +175,7 @@ pub fn census(
         branch_pulls,
         checked: pull_requests_checked,
         notes: pull_notes,
-    } = census_pulls(forge, entry, branches.as_slice(), options.cache_root);
+    } = census_pulls(forge, fork, branches.as_slice(), options.cache_root);
     notes.extend(pull_notes);
 
     let members: Vec<CensusInput> = branches
@@ -191,7 +192,7 @@ pub fn census(
         superseded: &superseded,
         fallback: trunk_name.as_str(),
     };
-    let (members, problems) = census_rows(&entry.path, &members, targets, options.workers);
+    let (members, problems) = census_rows(path, &members, targets, options.workers);
     let orphans = members
         .iter()
         .filter(|member| member.list_as_orphan)
@@ -199,7 +200,7 @@ pub fn census(
         .collect();
     let rows = members.into_iter().map(|member| member.carriage).collect();
     Ok(CensusReport {
-        repo: repo_name.to_string(),
+        repo: fork.name.to_string(),
         rows,
         orphans,
         notes,
@@ -226,10 +227,11 @@ struct CensusPulls {
 
 fn census_pulls(
     forge: Option<&dyn Forge>,
-    entry: &RepoEntry,
+    fork: &Fork<'_>,
     branches: &[(BranchName, CommitId)],
     cache_root: Option<&Path>,
 ) -> CensusPulls {
+    let entry = fork.entry;
     let Some(forge) = forge else {
         return CensusPulls {
             branch_pulls: BTreeMap::new(),
@@ -244,7 +246,7 @@ fn census_pulls(
     };
     let opened = match snapshot::open(SnapshotConfig {
         forge,
-        path: &entry.path,
+        path: &fork.checkout.path,
         remotes: [entry.remote(Role::Origin), entry.remote(Role::Release)],
         cache_root,
     }) {
@@ -758,7 +760,6 @@ mod tests {
     use crate::config::RepoEntry;
     use crate::detect::BookmarkTips;
     use crate::ids::{BookmarkRef, BranchName, CommitId, ReleaseScheme, RemoteName};
-    use std::path::PathBuf;
 
     use super::{
         CarryCheck, CarryVerdict, CensusInput, CensusTargets, Target, TargetRole, census_member,
@@ -857,15 +858,11 @@ mod tests {
     #[test]
     fn an_equal_release_url_keeps_origin_release_as_a_live_target() {
         let entry = RepoEntry {
-            path: PathBuf::from("/tmp/demo"),
-            upstream: "https://forge.invalid/up/demo.git".to_owned(),
-            origin: "https://forge.invalid/ours/demo.git".to_owned(),
-            base: None,
             release: Some("https://forge.invalid/ours/demo.git".to_owned()),
-            release_branch: None,
-            test_count_command: None,
-            consumers: Vec::new(),
-            workspaces: None,
+            ..RepoEntry::new(
+                "https://forge.invalid/up/demo.git",
+                "https://forge.invalid/ours/demo.git",
+            )
         };
         let origin_ref = remote("release/2026-08-30", "origin");
 

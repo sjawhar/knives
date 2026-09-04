@@ -59,11 +59,9 @@ fn a_document_predating_notice_digests_survives_update_and_reload() -> anyhow::R
     })?;
     let state = SessionState::load(home.path(), "claude-code", "s1");
 
-    // Then: guidance survives, missing digest state defaults empty, and the
-    // independent remote cache remains absent.
+    // Then: guidance survives and missing digest state defaults empty.
     assert!(state.repo(Path::new("/r")).guided);
     assert!(!state.notice_seen(Path::new("/r"), "digest"));
-    assert!(state.owner_remotes(Path::new("/r")).is_none());
     Ok(())
 }
 
@@ -82,6 +80,50 @@ fn a_legacy_owner_verdict_document_loads_without_reusing_its_verdict() -> anyhow
 
     // Then: legacy verdicts are ignored rather than carried into the new cache shape.
     assert!(!rewritten.contains("owner_verdicts"));
+    Ok(())
+}
+
+#[test]
+fn a_legacy_owner_remotes_document_loads_and_is_rewritten_without_it() -> anyhow::Result<()> {
+    // Given: a session record written when owner lists were cached.
+    let home = tempfile::tempdir()?;
+    let directory = home.path().join("hook-sessions");
+    std::fs::create_dir_all(&directory)?;
+    let state_path = directory.join("claude-code-s1.json");
+    std::fs::write(&state_path, r#"{"owner_remotes":{"/r":["ours"]}}"#)?;
+
+    // When: the record is loaded, then re-persisted by a no-op update.
+    let loaded = SessionState::load(home.path(), "claude-code", "s1");
+    SessionState::update(home.path(), "claude-code", "s1", |_| {})?;
+    let rewritten = std::fs::read_to_string(state_path)?;
+
+    // Then: nothing is known about `/r`, and the legacy key is gone.
+    assert!(!loaded.repo(Path::new("/r")).guided);
+    assert!(!rewritten.contains("owner_remotes"), "{rewritten}");
+    Ok(())
+}
+
+#[test]
+fn a_legacy_remotes_cache_document_loads_and_is_rewritten_without_it() -> anyhow::Result<()> {
+    // Given: a session record written when a checkout's remotes were cached per
+    // session, stamped with the modification time of the file they came from.
+    let home = tempfile::tempdir()?;
+    let directory = home.path().join("hook-sessions");
+    std::fs::create_dir_all(&directory)?;
+    let state_path = directory.join("claude-code-s1.json");
+    std::fs::write(
+        &state_path,
+        r#"{"repos":{"/r":{"guided":true}},"remotes":{"/r":{"source":null,"remotes":{"origin":"https://forge.invalid/ours/r"}}}}"#,
+    )?;
+
+    // When: the record is loaded, then re-persisted by a no-op update.
+    let loaded = SessionState::load(home.path(), "claude-code", "s1");
+    SessionState::update(home.path(), "claude-code", "s1", |_| {})?;
+    let rewritten = std::fs::read_to_string(state_path)?;
+
+    // Then: the guidance flag survives and the cache key is gone.
+    assert!(loaded.repo(Path::new("/r")).guided);
+    assert!(!rewritten.contains("remotes"), "{rewritten}");
     Ok(())
 }
 

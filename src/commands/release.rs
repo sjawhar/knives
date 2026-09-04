@@ -10,6 +10,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+use crate::bind::Fork;
 use crate::cli::Exit;
 use crate::config::RepoEntry;
 use crate::consumer_pins::{
@@ -19,7 +20,7 @@ use crate::detect::{
     BookmarkTips, Finding, FindingKind, RebaseOutcome, ReleaseParent, Subject, stale_parents,
 };
 use crate::ids::{
-    BookmarkRef, BranchName, CommitId, ReleaseScheme, RepoName, is_our_release, is_release_name,
+    BookmarkRef, BranchName, CommitId, ReleaseScheme, is_our_release, is_release_name,
     strict_dated_release,
 };
 use crate::jj::{self, Repo};
@@ -519,22 +520,22 @@ fn live_dated_release(tips: &BookmarkTips, publish_remote: &str) -> Option<(Bran
 /// parent set is what names a member whose branch was rebased outside jj or
 /// landed upstream, where the repository no longer can.
 pub fn plan(
-    name: &RepoName,
-    entry: &RepoEntry,
+    fork: &Fork<'_>,
     consumers: &ConsumerInputs<'_>,
     ledger: &[Entry],
 ) -> anyhow::Result<Plan> {
+    let entry = fork.entry;
+    let path = &fork.checkout.path;
     let mut plan = Plan {
-        repo: name.to_string(),
+        repo: fork.name.to_string(),
         ..Plan::default()
     };
-    let repo = Repo::open(&entry.path)?;
+    let repo = Repo::open(path)?;
     let tips = repo.bookmark_tips()?;
 
     // The newest release we cut. Historical ones are frozen and not our concern.
     let scheme = entry.release_scheme();
-    let (findings, notes) =
-        double_cut_findings(&entry.path, &tips, &scheme, entry.publish_remote())?;
+    let (findings, notes) = double_cut_findings(path, &tips, &scheme, entry.publish_remote())?;
     plan.base_findings.extend(findings);
     plan.notes.extend(notes);
     let publish_remote = entry.publish_remote();
@@ -617,13 +618,13 @@ pub fn plan(
         })
         .collect();
 
-    add_consumer_pins(&mut plan, entry, consumers, &scheme);
+    add_consumer_pins(&mut plan, fork, consumers, &scheme);
     Ok(plan)
 }
 
 fn add_consumer_pins(
     plan: &mut Plan,
-    entry: &RepoEntry,
+    fork: &Fork<'_>,
     consumers: &ConsumerInputs<'_>,
     scheme: &ReleaseScheme,
 ) {
@@ -641,12 +642,12 @@ fn add_consumer_pins(
     }
     // Every consumer, not one: they can sit on different releases, so a plan that saw only
     // the first would call a release unpinned while something else was frozen on it.
-    let slug = repo_slug(entry);
+    let slug = repo_slug(fork.entry);
     for consumer in consumers.slugs {
         let scan = scan_consumer_slug_with_heads(
             consumers.forge,
             consumers.cache_root,
-            &entry.path,
+            &fork.checkout.path,
             consumer,
             slug.as_deref(),
             scheme,
@@ -869,10 +870,11 @@ fn member_label(member: &MemberRow) -> String {
 /// Gather the parents, holders, and optional content audit for a named release.
 pub fn gather_members(
     opened: &Repo,
-    entry: &RepoEntry,
+    fork: &Fork<'_>,
     name: &str,
     verify: bool,
 ) -> anyhow::Result<MembersReport> {
+    let entry = fork.entry;
     let commit = opened.resolve_commit(name)?;
     let parents = opened.parents_of(commit.as_str())?;
     let trunk_name = entry.upstream_trunk();
@@ -907,7 +909,7 @@ pub fn gather_members(
                     .map(|member| (member_label(member), member.commit.clone()))
                     .collect();
                 audit_cut(
-                    &entry.path,
+                    &fork.checkout.path,
                     &members,
                     CutSubject::Committed(&commit),
                     AuditContext {
@@ -921,7 +923,7 @@ pub fn gather_members(
         None
     };
     Ok(MembersReport {
-        repo: entry.path.display().to_string(),
+        repo: fork.checkout.path.display().to_string(),
         release: name.to_owned(),
         commit,
         parent_count: members.len(),
@@ -2009,15 +2011,16 @@ mod test_count_tests {
 /// Runs the repo's configured test command at the cut and at one parent, in
 /// throwaway workspaces. Absent configuration reports "not checked", never
 /// "passed": counting tests has no portable form, so the command is per repo.
-pub fn check_test_count(entry: &RepoEntry, cut: &CommitId, parent: &CommitId) -> TestCountCheck {
-    let Some(command) = entry.test_count_command.as_deref() else {
+pub fn check_test_count(fork: &Fork<'_>, cut: &CommitId, parent: &CommitId) -> TestCountCheck {
+    let Some(command) = fork.entry.test_count_command.as_deref() else {
         return TestCountCheck::NotConfigured;
     };
-    let root = entry.workspace_root();
-    let merged = crate::jj::output_at_revision(&entry.path, root, cut.as_str(), command)
+    let root = fork.workspace_root();
+    let path = &fork.checkout.path;
+    let merged = crate::jj::output_at_revision(path, root, cut.as_str(), command)
         .ok()
         .and_then(|out| parse_test_count(&out));
-    let single = crate::jj::output_at_revision(&entry.path, root, parent.as_str(), command)
+    let single = crate::jj::output_at_revision(path, root, parent.as_str(), command)
         .ok()
         .and_then(|out| parse_test_count(&out));
     match (merged, single) {
@@ -2316,20 +2319,11 @@ mod members_tests {
             &["bookmark", "create", "release/2026-08-30", "-r", "@"],
         );
 
-        let entry = RepoEntry {
-            path: repository,
-            upstream: "upstream".to_owned(),
-            origin: "origin".to_owned(),
-            base: None,
-            release: None,
-            release_branch: None,
-            test_count_command: None,
-            consumers: Vec::new(),
-            workspaces: None,
-        };
-        let opened = Repo::open(&entry.path).expect("open test repository");
+        let entry = RepoEntry::new("upstream", "origin");
+        let fork = Fork::at("demo", &entry, &repository);
+        let opened = Repo::open(&repository).expect("open test repository");
         let members =
-            gather_members(&opened, &entry, "release/2026-08-30", false).expect("gather members");
+            gather_members(&opened, &fork, "release/2026-08-30", false).expect("gather members");
 
         assert_eq!(members.parent_count, 2);
     }
@@ -2348,20 +2342,11 @@ mod members_tests {
             &["bookmark", "create", "release/2026-08-30", "-r", "@"],
         );
 
-        let entry = RepoEntry {
-            path: repository,
-            upstream: "upstream".to_owned(),
-            origin: "origin".to_owned(),
-            base: None,
-            release: None,
-            release_branch: None,
-            test_count_command: None,
-            consumers: Vec::new(),
-            workspaces: None,
-        };
-        let opened = Repo::open(&entry.path).expect("open test repository");
+        let entry = RepoEntry::new("upstream", "origin");
+        let fork = Fork::at("demo", &entry, &repository);
+        let opened = Repo::open(&repository).expect("open test repository");
         let members =
-            gather_members(&opened, &entry, "release/2026-08-30", false).expect("gather members");
+            gather_members(&opened, &fork, "release/2026-08-30", false).expect("gather members");
 
         assert_eq!(members.members.len(), 1);
         assert!(members.members[0].held_by.is_empty());

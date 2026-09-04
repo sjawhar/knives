@@ -1,11 +1,24 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
 use crate::commands::status::{BranchRow, Options, Report, Timings};
-use crate::config::Registry;
+use crate::config::{Registry, RepoEntry};
 use crate::detect::{Finding, FindingKind, Subject};
-use crate::forge::Forge;
+use crate::forge::{Forge, RepoIdentity};
 use crate::ids::{BranchName, BranchTarget, RepoName, Requirement};
 use crate::store::Store;
+
+/// The forge repository a sibling entry's pull requests live in, from its
+/// `upstream` URL; `None` when that is not a forge remote (a local path).
+///
+/// The sibling's checkout is not consulted: its identity is its `upstream`, and
+/// it need not be on this machine for its pull requests to be asked about.
+fn upstream_identity(entry: &RepoEntry) -> Option<RepoIdentity> {
+    crate::remote_url::remote_slug(&entry.upstream).map(|slug| RepoIdentity {
+        name_with_owner: slug.to_owned(),
+        id: String::new(),
+    })
+}
 
 /// Declared dependencies that are not satisfied yet.
 ///
@@ -17,6 +30,8 @@ use crate::store::Store;
 struct DependencyContext<'a, 'snapshot> {
     store: &'a Store,
     registry: &'a Registry,
+    /// This fork's checkout, where the forge client runs.
+    path: &'a Path,
     forge: Option<&'a dyn Forge>,
     snapshot: Option<&'a crate::snapshot::CompletedSnapshot<'snapshot>>,
 }
@@ -53,6 +68,7 @@ fn unmet_dependencies(
     let DependencyContext {
         store,
         registry,
+        path,
         forge,
         snapshot,
     } = *context;
@@ -113,16 +129,21 @@ fn unmet_dependencies(
                 }
                 continue;
             };
+            let Some(identity) = upstream_identity(entry) else {
+                outcomes.problems.push(format!(
+                    "{required_repo}: upstream {} is not a forge repository; cannot check \
+                     dependencies against it",
+                    entry.upstream
+                ));
+                continue;
+            };
             let numbers: Vec<u64> = requirements
                 .iter()
                 .map(|(_, requirement)| requirement.number)
                 .collect::<BTreeSet<_>>()
                 .into_iter()
                 .collect();
-            match forge
-                .repo_identity(&entry.path)
-                .and_then(|identity| forge.pull_facts(&entry.path, &identity, &numbers))
-            {
+            match forge.pull_facts(path, &identity, &numbers) {
                 Ok(facts) => {
                     for (branch, requirement) in requirements {
                         outcomes.record(
@@ -154,6 +175,7 @@ pub(super) struct DependencyInput<'a, 'forge, 'snapshot> {
     pub(super) report: &'a mut Report,
     pub(super) findings: &'a mut Vec<Finding>,
     pub(super) name: &'a RepoName,
+    pub(super) path: &'a Path,
     pub(super) store: &'a Store,
     pub(super) options: &'a Options<'forge>,
     pub(super) snapshot: Option<&'a crate::snapshot::CompletedSnapshot<'snapshot>>,
@@ -165,6 +187,7 @@ pub(super) fn add_dependency_findings(input: DependencyInput<'_, '_, '_>) {
         report,
         findings,
         name,
+        path,
         store,
         options,
         snapshot,
@@ -180,6 +203,7 @@ pub(super) fn add_dependency_findings(input: DependencyInput<'_, '_, '_>) {
         &DependencyContext {
             store,
             registry,
+            path,
             forge: options.forge,
             snapshot,
         },

@@ -4,11 +4,15 @@
     reason = "fixture setup failures and JSON shape mismatches are test failures"
 )]
 
+#[path = "common/lab.rs"]
+mod lab;
+
 use std::fs::File;
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use lab::git_repository;
 use serde_json::{Value, json};
 
 const SESSION_ID: &str = "opencode-hook-test-session";
@@ -26,6 +30,8 @@ fn run_hook_input_with_owner(
     command
         .args(["hook", "opencode"])
         .env("KNIVES_CONFIG_HOME", home)
+        .env("HOME", home)
+        .env("JJ_CONFIG", "/dev/null")
         .env_remove("KNIVES_OWNER")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -96,7 +102,9 @@ fn claim(branch: &str) -> Value {
 
 struct Repositories {
     home: tempfile::TempDir,
+    /// Managed AND trusted: `origin` sits under a trusted owner.
     beta: PathBuf,
+    /// Trusted only, through `[trust] repos`.
     trusted: PathBuf,
 }
 
@@ -105,20 +113,27 @@ impl Repositories {
         let home = tempfile::tempdir().expect("config home");
         let beta = home.path().join("beta");
         let trusted = home.path().join("trusted");
+        git_repository(
+            &beta,
+            &[
+                ("upstream", "https://forge.invalid/maintainer/beta"),
+                ("origin", "https://forge.invalid/ours/beta"),
+            ],
+        );
+        git_repository(
+            &trusted,
+            &[("origin", "https://forge.invalid/company/trusted.git")],
+        );
         for (root, instructions) in [
             (&beta, "beta instructions"),
             (&trusted, "trusted instructions"),
         ] {
-            std::fs::create_dir_all(root).expect("create repository");
             std::fs::write(root.join("AGENTS.md"), instructions).expect("write instructions");
             std::fs::write(root.join("file.txt"), "content").expect("write file");
         }
-        let config = format!(
-            "[repos.beta]\npath = \"{}\"\nupstream = \"u\"\norigin = \"o\"\n\n\
-             [trusted.trusted]\npath = \"{}\"\n",
-            beta.display(),
-            trusted.display()
-        );
+        let config = "[repos.beta]\nupstream = \"https://forge.invalid/maintainer/beta\"\n\
+                      origin = \"https://forge.invalid/ours/beta\"\n\n\
+                      [trust]\nowners = [\"ours\"]\nrepos = [\"company/trusted\"]\n";
         std::fs::write(home.path().join("repos.toml"), config).expect("write registry");
         let state = json!({"claims": {"beta/feat/claimed": {
             "repo": "beta", "branch": "feat/claimed", "owner": "agent-one",
@@ -130,6 +145,12 @@ impl Repositories {
             beta,
             trusted,
         }
+    }
+
+    /// Turn a git-only fixture into a colocated jj checkout, so `seen` can key
+    /// on its `.jj` and jj can still read its remotes.
+    fn colocate(root: &Path) {
+        lab::jj(root, ["git", "init", "--colocate"]);
     }
 
     fn write_state(&self, state: &Value) {
@@ -268,7 +289,7 @@ fn the_notice_tag_carries_a_stable_digest_and_a_fresh_nonce() {
 #[test]
 fn tool_after_in_a_managed_workspace_records_event_identity_and_cwd() {
     let repos = Repositories::new();
-    std::fs::create_dir_all(repos.beta.join(".jj")).expect("create workspace marker");
+    Repositories::colocate(&repos.beta);
     let mut event = tool(&repos.beta.join("file.txt"), None);
     event["cwd"] = json!(repos.beta);
 
@@ -332,7 +353,7 @@ fn tool_after_trust_roots_injects_guidance_without_managed_notice() {
     // Given: an unregistered checkout with AGENTS.md and a [trust].roots config entry.
     let home = tempfile::tempdir().expect("config home");
     let trust_root = home.path().join("unregistered-trust-root");
-    std::fs::create_dir_all(trust_root.join(".jj")).expect("create checkout");
+    std::fs::create_dir_all(trust_root.join(".git")).expect("create checkout");
     std::fs::write(trust_root.join("AGENTS.md"), "trust root instructions")
         .expect("write trust instructions");
     std::fs::write(trust_root.join("file.txt"), "content").expect("write file");
@@ -363,9 +384,12 @@ fn tool_after_trust_roots_injects_guidance_without_managed_notice() {
 }
 
 #[test]
-fn trusted_owner_guidance_requires_the_checkout_to_be_the_git_toplevel() {
-    // Given: an attacker-controlled nested `.jj` directory under a Git checkout
-    // whose remote self-declares a trusted owner.
+fn a_nested_jj_under_a_trusted_git_checkout_is_the_checkouts_content() {
+    // Given: a `.jj` directory nested under a Git checkout whose remote
+    // self-declares a trusted owner. A `.jj` is content a checkout can carry;
+    // the nearest `.git` decides, so the nested tree gets the checkout's
+    // verdict — its guidance, attributed to the checkout — and never its own
+    // identity.
     let home = tempfile::tempdir().expect("config home");
     let git_root = home.path().join("parent-git");
     let nested = git_root.join("node_modules/evil");
@@ -387,15 +411,15 @@ fn trusted_owner_guidance_requires_the_checkout_to_be_the_git_toplevel() {
         .expect("add trusted remote");
     assert!(remote_added.success());
     std::fs::create_dir_all(nested.join(".jj")).expect("create nested pseudo-checkout");
-    std::fs::write(nested.join("AGENTS.md"), "attacker instructions").expect("write guidance");
     std::fs::write(nested.join("file.txt"), "content").expect("write file");
+    std::fs::write(git_root.join("AGENTS.md"), "parent instructions").expect("write guidance");
     std::fs::write(
         home.path().join("repos.toml"),
         "[trust]\nowners = [\"trusted-owner\"]\n",
     )
     .expect("write trust config");
 
-    // When: the hook reads the nested attacker's file.
+    // When: the hook reads the nested file.
     let output = run_hook(
         home.path(),
         &tool(
@@ -404,12 +428,15 @@ fn trusted_owner_guidance_requires_the_checkout_to_be_the_git_toplevel() {
         ),
     );
 
-    // Then: the parent checkout's remote identity cannot trust nested guidance.
-    assert_eq!(addition(&output), "");
+    // Then: the checkout's guidance, as the checkout; no managed notice.
+    let added = addition(&output);
+    assert!(added.contains("repo=\"parent-git\""), "{added}");
+    assert!(added.contains("parent instructions"), "{added}");
+    assert!(!added.contains("<knives-notice-"), "{added}");
 }
 
 #[test]
-fn a_git_toplevel_with_a_trusted_origin_injects_guidance() {
+fn a_git_root_with_a_trusted_origin_injects_guidance() {
     // Given: a real Git checkout whose own origin claims a trusted owner.
     let home = tempfile::tempdir().expect("config home");
     let root = home.path().join("trusted-git");
@@ -612,6 +639,8 @@ fn unreadable_stdin_returns_an_empty_response_without_failing() {
     let output = Command::new(env!("CARGO_BIN_EXE_knives"))
         .args(["hook", "opencode"])
         .env("KNIVES_CONFIG_HOME", home.path())
+        .env("HOME", home.path())
+        .env("JJ_CONFIG", "/dev/null")
         .stdin(Stdio::from(stdin))
         .output()
         .expect("run hook");

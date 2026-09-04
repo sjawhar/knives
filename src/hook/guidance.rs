@@ -177,8 +177,9 @@ pub fn format_notice(repo_name: &str, root: &Path, claims: &[String], digest: &s
 
 /// Returns active claim summaries for a repository.
 ///
-/// Hooks deliberately do not open a jj repo or walk operations, so an empty
-/// operation stream is marked window-exhausted rather than claiming no activity.
+/// Hooks never open a jj repository or walk operations — identity is read by
+/// git — so an empty operation stream is marked window-exhausted rather than
+/// claiming no activity.
 pub fn claim_lines(
     claims: &[Claim],
     repo_name: &str,
@@ -271,7 +272,7 @@ mod tests {
         Guidance, InstructionFile, claim_lines, format_guidance, format_notice, guidance_for,
         notice_digest,
     };
-    use crate::config::{GuidanceRoot, GuidanceRootKind};
+    use crate::config::GuidanceRoot;
     use crate::seen::Seen;
     use crate::store::{Claim, OwnerKind};
 
@@ -288,7 +289,6 @@ mod tests {
             GuidanceRoot {
                 name: "r".into(),
                 root: canonical,
-                kind: GuidanceRootKind::Managed,
             },
         )
     }

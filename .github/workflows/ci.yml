@@ -42,11 +42,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
       # src/jj.rs and tests/common/lab.rs shell out to a real `jj` binary, so the
-      # suite needs one on PATH. taiki-e/install-action does not carry jj, hence the
-      # release tarball. The version is read from the jj-lib pin in Cargo.toml rather
-      # than hardcoded: the library and the binary must agree on the on-disk repo
-      # format, so they cannot be allowed to drift apart.
+      # suite needs one on PATH. knives reads a checkout's identity through git, so
+      # a workspace must carry a `.git` file beside its `.jj`: that is what
+      # sjawhar/jj's `git.auto-register-worktrees` does on `jj workspace add`, and
+      # what upstream jj does not yet, hence the fork's release. The version is
+      # read from the jj-lib pin in Cargo.toml rather than hardcoded: the library
+      # and the binary must agree on the on-disk repo format, so they cannot be
+      # allowed to drift apart; the newest fork build of that version is taken.
       - name: Install jj
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           jj_version=$(sed -n 's/^jj-lib = "=\?\([0-9.]*\)".*/\1/p' Cargo.toml)
@@ -54,8 +59,13 @@ jobs:
             echo 'could not read the jj-lib version from Cargo.toml' >&2
             exit 1
           fi
-          archive="jj-v${jj_version}-x86_64-unknown-linux-musl.tar.gz"
-          curl -fsSL "https://github.com/jj-vcs/jj/releases/download/v${jj_version}/${archive}" -o "$archive"
+          tag=$(gh api repos/sjawhar/jj/releases --jq '.[].tag_name' | grep -m1 "^v${jj_version}-sami\.")
+          if [ -z "$tag" ]; then
+            echo "no sjawhar/jj release for jj ${jj_version}" >&2
+            exit 1
+          fi
+          archive="jj-${tag}-x86_64-unknown-linux-musl.tar.gz"
+          gh release download -R sjawhar/jj "$tag" -p "$archive"
           # The tarball stores its entries under ./, so name the member explicitly.
           sudo tar xzf "$archive" -C /usr/local/bin ./jj
           jj --version

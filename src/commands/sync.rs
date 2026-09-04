@@ -3,8 +3,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+use crate::bind::Fork;
 use crate::cli::Exit;
-use crate::config::{RepoEntry, Role};
+use crate::config::Role;
 use crate::forge::{Forge, PullFacts, PullSummary};
 use crate::ids::{BranchName, BranchTarget, short_id};
 use crate::jj::{fetch_all, fetch_pull_ref, pull_heads};
@@ -170,7 +171,7 @@ pub struct Report {
 }
 
 pub struct SyncInput<'a> {
-    pub entry: &'a RepoEntry,
+    pub fork: &'a Fork<'a>,
     pub store: &'a mut Store,
     pub forge: Option<&'a dyn Forge>,
     pub scribe: &'a Scribe,
@@ -418,8 +419,8 @@ fn record_tracked_pulls(
     Ok(())
 }
 
-fn pull_heads_or_problem(entry: &RepoEntry, report: &mut Report) -> BTreeMap<u64, String> {
-    match pull_heads(&entry.path, entry.remote(Role::Upstream)) {
+fn pull_heads_or_problem(fork: &Fork<'_>, report: &mut Report) -> BTreeMap<u64, String> {
+    match pull_heads(&fork.checkout.path, fork.entry.remote(Role::Upstream)) {
         Ok(found) => found,
         Err(error) => {
             report
@@ -454,25 +455,27 @@ fn select_tracked_numbers(
 
 pub fn sync_repo(input: SyncInput<'_>) -> anyhow::Result<Report> {
     let SyncInput {
-        entry,
+        fork,
         store,
         forge,
         scribe,
         cache,
     } = input;
+    let entry = fork.entry;
+    let path = &fork.checkout.path;
     let name = scribe.repo();
     let mut report = Report {
         repo: name.to_string(),
         ..Report::default()
     };
-    fetch_all(&entry.path)?;
+    fetch_all(path)?;
 
     let seen = store.pull_heads(name);
     let foreign: BTreeSet<u64> = store.foreign_parent_numbers(name).into_iter().collect();
     let opened = if let Some(forge) = forge {
         match crate::snapshot::open(crate::snapshot::SnapshotConfig {
             forge,
-            path: &entry.path,
+            path,
             remotes: [entry.remote(Role::Origin), entry.remote(Role::Release)],
             cache_root: cache,
         }) {
@@ -506,7 +509,7 @@ pub fn sync_repo(input: SyncInput<'_>) -> anyhow::Result<Report> {
         || tracked_pull_requests(&[], &foreign, &seen),
         |snapshot| tracked_pull_requests(snapshot.ours(), &foreign, &seen),
     );
-    let heads = pull_heads_or_problem(entry, &mut report);
+    let heads = pull_heads_or_problem(fork, &mut report);
     let summaries: &[PullSummary] = snapshot
         .as_ref()
         .map_or(&[], crate::snapshot::CompletedSnapshot::rows);
@@ -525,12 +528,7 @@ pub fn sync_repo(input: SyncInput<'_>) -> anyhow::Result<Report> {
 
     persist_snapshot(snapshot.as_ref(), &mut report);
 
-    fetch_foreign(
-        &entry.path,
-        entry.remote(Role::Upstream),
-        &foreign,
-        &mut report,
-    );
+    fetch_foreign(path, entry.remote(Role::Upstream), &foreign, &mut report);
 
     report.rows.sort_by_key(|row| row.number);
     store.save()?;
@@ -543,6 +541,8 @@ pub fn render(report: &Report) -> String {
         .iter()
         .map(|note| format!("! {note}"))
         .collect();
+    // What could not be answered, so an exit of 3 never arrives unexplained.
+    lines.extend(report.problems.iter().map(|problem| format!("? {problem}")));
     if report.rows.is_empty() {
         lines.push(format!("{}: no tracked pull requests", report.repo));
         return lines.join("\n");
@@ -1058,17 +1058,10 @@ mod comment_activity_tests {
                 .unwrap()
                 .success()
         );
-        crate::config::RepoEntry {
-            path: work,
-            upstream: origin.to_string_lossy().into_owned(),
-            origin: origin.to_string_lossy().into_owned(),
-            base: None,
-            release: None,
-            release_branch: None,
-            test_count_command: None,
-            consumers: Vec::new(),
-            workspaces: None,
-        }
+        crate::config::RepoEntry::new(
+            origin.to_string_lossy().into_owned(),
+            origin.to_string_lossy().into_owned(),
+        )
     }
 
     /// A scribe writing into the fixture's own directory. Every test that calls
@@ -1087,10 +1080,11 @@ mod comment_activity_tests {
         let _lock = crate::config::test_support::environment_lock();
         let temp = TempDir::new().unwrap();
         let entry = local_entry(&temp);
+        let fork = Fork::at("test-repo", &entry, &temp.path().join("work"));
         let mut store = Store::open_for_update(temp.path().join("state.json")).unwrap();
 
         let report = sync_repo(SyncInput {
-            entry: &entry,
+            fork: &fork,
             store: &mut store,
             forge: Some(&PullListUnavailable),
             scribe: &test_scribe(&temp, &RepoName::new("test-repo")),
@@ -1115,6 +1109,7 @@ mod comment_activity_tests {
         let temp = TempDir::new().unwrap();
         let mut entry = local_entry(&temp);
         entry.upstream = temp.path().join("missing-upstream").display().to_string();
+        let fork = Fork::at("test-repo", &entry, &temp.path().join("work"));
         let mut store = Store::open_for_update(temp.path().join("state.json")).unwrap();
         let forge = ErroringForge {
             pull_requests: Vec::new(),
@@ -1123,7 +1118,7 @@ mod comment_activity_tests {
         };
 
         let report = sync_repo(SyncInput {
-            entry: &entry,
+            fork: &fork,
             store: &mut store,
             forge: Some(&forge),
             scribe: &test_scribe(&temp, &RepoName::new("test-repo")),
@@ -1147,10 +1142,11 @@ mod comment_activity_tests {
         let _lock = crate::config::test_support::environment_lock();
         let temp = TempDir::new().unwrap();
         let entry = local_entry(&temp);
+        let fork = Fork::at("test-repo", &entry, &temp.path().join("work"));
         let mut store = Store::open_for_update(temp.path().join("state.json")).unwrap();
 
         let report = sync_repo(SyncInput {
-            entry: &entry,
+            fork: &fork,
             store: &mut store,
             forge: None,
             scribe: &test_scribe(&temp, &RepoName::new("test-repo")),
@@ -1175,6 +1171,7 @@ mod comment_activity_tests {
         let store_path = temp.path().join("state.json");
         let repo_name = RepoName::new("test-repo");
         let entry = local_entry(&temp);
+        let fork = Fork::at("test-repo", &entry, &temp.path().join("work"));
         let scribe = test_scribe(&temp, &repo_name);
 
         // First sync: PR #42 with comment activity
@@ -1188,7 +1185,7 @@ mod comment_activity_tests {
         let mut store = Store::open_for_update(store_path.clone()).unwrap();
         store.record_comment_mark(&repo_name, 42, "2026-07-29T10:00:00Z");
         let report1 = sync_repo(SyncInput {
-            entry: &entry,
+            fork: &fork,
             store: &mut store,
             forge: Some(&forge_first),
             scribe: &scribe,
@@ -1222,7 +1219,7 @@ mod comment_activity_tests {
 
         let mut store = Store::open(store_path).unwrap();
         let report2 = sync_repo(SyncInput {
-            entry: &entry,
+            fork: &fork,
             store: &mut store,
             forge: Some(&forge_second),
             scribe: &scribe,
@@ -1247,6 +1244,7 @@ mod comment_activity_tests {
         let temp = TempDir::new().unwrap();
         let repo_name = RepoName::new("test-repo");
         let entry = local_entry(&temp);
+        let fork = Fork::at("test-repo", &entry, &temp.path().join("work"));
         let (_branch, pull_request) = test_pull(42, "feat/alpha");
         let forge = ErroringForge {
             pull_requests: vec![pull_request],
@@ -1255,7 +1253,7 @@ mod comment_activity_tests {
         };
         let mut store = Store::open_for_update(temp.path().join("state.json")).unwrap();
         let report = sync_repo(SyncInput {
-            entry: &entry,
+            fork: &fork,
             store: &mut store,
             forge: Some(&forge),
             scribe: &test_scribe(&temp, &repo_name),
@@ -1285,6 +1283,7 @@ mod comment_activity_tests {
         let store_path = temp.path().join("state.json");
         let repo_name = RepoName::new("test-repo");
         let entry = local_entry(&temp);
+        let fork = Fork::at("test-repo", &entry, &temp.path().join("work"));
         let (_branch, pull_request) = test_pull(42, "feat/alpha");
         let forge = ErroringForge {
             pull_requests: vec![pull_request],
@@ -1295,7 +1294,7 @@ mod comment_activity_tests {
 
         // When: the first sync observes the historical comment
         let report = sync_repo(SyncInput {
-            entry: &entry,
+            fork: &fork,
             store: &mut store,
             forge: Some(&forge),
             scribe: &test_scribe(&temp, &repo_name),
@@ -1323,6 +1322,7 @@ mod comment_activity_tests {
         let store_path = temp.path().join("state.json");
         let repo_name = RepoName::new("test-repo");
         let entry = local_entry(&temp);
+        let fork = Fork::at("test-repo", &entry, &temp.path().join("work"));
         let (_branch, mut pull_request) = test_pull(42, "feat/alpha");
         pull_request.state = "CLOSED".to_owned();
         let forge = ErroringForge {
@@ -1337,7 +1337,7 @@ mod comment_activity_tests {
         store.record_pull_state(&repo_name, 42, "OPEN");
 
         let report = sync_repo(SyncInput {
-            entry: &entry,
+            fork: &fork,
             store: &mut store,
             forge: Some(&forge),
             scribe: &test_scribe(&temp, &repo_name),
@@ -1365,6 +1365,7 @@ mod comment_activity_tests {
         let store_path = temp.path().join("state.json");
         let repo_name = RepoName::new("test-repo");
         let entry = local_entry(&temp);
+        let fork = Fork::at("test-repo", &entry, &temp.path().join("work"));
         let (_branch, mut pull_request) = test_pull(42, "feat/alpha");
         pull_request.state = "MERGED".to_owned();
         let forge = ErroringForge {
@@ -1376,7 +1377,7 @@ mod comment_activity_tests {
         let ledger = crate::ledger::Ledger::at(temp.path().join("ledger"));
 
         let report = sync_repo(SyncInput {
-            entry: &entry,
+            fork: &fork,
             store: &mut store,
             forge: Some(&forge),
             scribe: &test_scribe(&temp, &repo_name),
@@ -1405,6 +1406,7 @@ mod comment_activity_tests {
         let store_path = temp.path().join("state.json");
         let repo_name = RepoName::new("test-repo");
         let entry = local_entry(&temp);
+        let fork = Fork::at("test-repo", &entry, &temp.path().join("work"));
         let (_branch, mut pull_request) = test_pull(42, "feat/alpha");
         pull_request.state = "MERGED".to_owned();
         let scribe = test_scribe(&temp, &repo_name);
@@ -1418,7 +1420,7 @@ mod comment_activity_tests {
         };
         let mut store = Store::open_for_update(store_path.clone()).unwrap();
         sync_repo(SyncInput {
-            entry: &entry,
+            fork: &fork,
             store: &mut store,
             forge: Some(&forge_first),
             scribe: &scribe,
@@ -1435,7 +1437,7 @@ mod comment_activity_tests {
         };
         let mut store = Store::open(store_path).unwrap();
         let report = sync_repo(SyncInput {
-            entry: &entry,
+            fork: &fork,
             store: &mut store,
             forge: Some(&forge_second),
             scribe: &scribe,
@@ -1461,6 +1463,7 @@ mod comment_activity_tests {
         let store_path = temp.path().join("state.json");
         let repo_name = RepoName::new("test-repo");
         let entry = local_entry(&temp);
+        let fork = Fork::at("test-repo", &entry, &temp.path().join("work"));
         let scribe = test_scribe(&temp, &repo_name);
         let ledger = crate::ledger::Ledger::at(temp.path().join("ledger"));
 
@@ -1473,7 +1476,7 @@ mod comment_activity_tests {
         };
         let mut store = Store::open_for_update(store_path.clone()).unwrap();
         sync_repo(SyncInput {
-            entry: &entry,
+            fork: &fork,
             store: &mut store,
             forge: Some(&forge_first),
             scribe: &scribe,
@@ -1492,7 +1495,7 @@ mod comment_activity_tests {
         };
         let mut store = Store::open(store_path).unwrap();
         let report = sync_repo(SyncInput {
-            entry: &entry,
+            fork: &fork,
             store: &mut store,
             forge: Some(&forge_second),
             scribe: &scribe,
@@ -1520,6 +1523,7 @@ mod comment_activity_tests {
         let store_path = temp.path().join("state.json");
         let repo_name = RepoName::new("test-repo");
         let entry = local_entry(&temp);
+        let fork = Fork::at("test-repo", &entry, &temp.path().join("work"));
         let scribe = test_scribe(&temp, &repo_name);
 
         // First sync: open at head "aaaa".
@@ -1531,7 +1535,7 @@ mod comment_activity_tests {
         };
         let mut store = Store::open_for_update(store_path.clone()).unwrap();
         sync_repo(SyncInput {
-            entry: &entry,
+            fork: &fork,
             store: &mut store,
             forge: Some(&forge_first),
             scribe: &scribe,
@@ -1550,7 +1554,7 @@ mod comment_activity_tests {
         };
         let mut store = Store::open(store_path).unwrap();
         let report = sync_repo(SyncInput {
-            entry: &entry,
+            fork: &fork,
             store: &mut store,
             forge: Some(&forge_second),
             scribe: &scribe,

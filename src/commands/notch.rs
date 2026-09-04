@@ -6,8 +6,9 @@
 //! agent actually has — what happened in this fork lately — rather than making
 //! them name a subject they do not know yet.
 
+use crate::bind::Fork;
 use crate::cli::Exit;
-use crate::config::{default_config_path, load};
+use crate::commands::claim::current_identity;
 use crate::ids::{BranchName, BranchTarget, RepoName, short_id};
 use crate::ledger::{
     Draft, Entry, EntryClass, Filter, Kind, Ledger, LedgerError, Scribe, VerifyFlag,
@@ -54,7 +55,10 @@ pub enum Report {
 /// What one invocation asks for.
 #[derive(Debug)]
 pub struct Request<'a> {
-    pub repo: &'a RepoName,
+    pub fork: &'a Fork<'a>,
+    /// The entry the current directory is inside; a write derives its author
+    /// from it, a read never asks.
+    pub bound: Option<&'a RepoName>,
     pub subject: Option<&'a str>,
     /// Present for a write, absent for a read.
     pub message: Option<&'a str>,
@@ -300,13 +304,9 @@ fn verify(
 }
 
 pub fn run(request: &Request<'_>, output: crate::cli::Output) -> anyhow::Result<Exit> {
-    let registry = load(&default_config_path())?;
-    let Some(entry) = registry.get(request.repo) else {
-        let known: Vec<String> = registry.names().map(|name| name.to_string()).collect();
-        eprintln!("unknown repo {}; known: {}", request.repo, known.join(", "));
-        return Ok(Exit::Usage);
-    };
-    let ledger = Ledger::for_repo(request.repo);
+    let repo = &request.fork.name;
+    let path = &request.fork.checkout.path;
+    let ledger = Ledger::for_repo(repo);
     let report = match request.message {
         Some(text) => {
             // The store is read, never written: a notch changes no intent, and a
@@ -321,18 +321,13 @@ pub fn run(request: &Request<'_>, output: crate::cli::Output) -> anyhow::Result<
                         .filter(|subject| !subject.starts_with('#'))
                         .and_then(|subject| {
                             store.tracked_pull(&BranchTarget::new(
-                                request.repo.clone(),
+                                repo.clone(),
                                 BranchName::new(subject),
                             ))
                         })
                 });
-            let identity = crate::commands::claim::current_identity(&std::env::current_dir()?)?;
-            let scribe = Scribe::new(
-                ledger,
-                request.repo.clone(),
-                entry.path.clone(),
-                identity.owner,
-            );
+            let owner = current_identity(request.bound)?.owner;
+            let scribe = Scribe::new(ledger, repo.clone(), path.clone(), owner);
             let written = scribe.record(&Draft {
                 subject: request.subject,
                 kind: Kind::Note,
@@ -343,12 +338,12 @@ pub fn run(request: &Request<'_>, output: crate::cli::Output) -> anyhow::Result<
                 parents: Vec::new(),
             })?;
             Report::Written {
-                repo: request.repo.to_string(),
+                repo: repo.to_string(),
                 wrote: written,
             }
         }
-        None if request.verify => verify(&ledger, &entry.path, request.repo, request)?,
-        None => read_filtered(&ledger, request.repo, request)?,
+        None if request.verify => verify(&ledger, path, repo, request)?,
+        None => read_filtered(&ledger, repo, request)?,
     };
     if let Some(payload) = crate::cli::machine_payload(output, &report)? {
         println!("{payload}");
@@ -508,8 +503,11 @@ mod tests {
             })
             .expect("record note");
         let repo = RepoName::new("demo");
+        let entry = crate::config::RepoEntry::new(String::new(), String::new());
+        let fork = crate::bind::Fork::at("demo", &entry, directory.path());
         let request = Request {
-            repo: &repo,
+            fork: &fork,
+            bound: None,
             subject: Some("feat/alpha"),
             message: None,
             evidence: &[],

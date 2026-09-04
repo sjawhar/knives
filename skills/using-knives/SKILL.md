@@ -11,7 +11,7 @@ Several forks of several upstreams, worked concurrently by several agents. Two t
 
 It reports. It does not advise: an earlier version attached a suggested fix to every finding, and the suggestions were wrong often enough to be a liability, telling you to drop a branch that had never landed, to open a pull request that already existed. What a report says is what is true, and what to do about it is yours to decide.
 
-Every command takes its repo from the directory you are standing in. Name one only when you are somewhere else, or want a different one.
+Every command takes its repo from the directory you are standing in. Name one only when you are somewhere else, or want a different one; the checkout is then found by scanning `~` (see "How a checkout is found").
 
 `knives hook claude-code` and `knives hook opencode` are harness plumbing, not commands for people to run.
 
@@ -19,10 +19,14 @@ Every command takes its repo from the directory you are standing in. Name one on
 
 ### `knives repos`
 
-What is managed, where each checkout is, the newest release each has cut, and, where consumer
-slugs are recorded, whether their repository trunks are pinned behind the newest cut. Trusted
-entries, which are repositories whose instructions we read but do not maintain, are listed
-separately.
+What is managed, where each checkout was found on this machine, the newest release each has
+cut, and, where consumer slugs are recorded, whether their repository trunks are pinned behind
+the newest cut. Every entry is a row whether or not a checkout was found: one the scan did not
+place reads `not on this machine` and has no release state; one found twice reads `ambiguous: 2
+checkouts` with a problem naming both paths. A checkout the scan could not read is a `?` line on
+the listing itself while some entry is not on this machine — it may be that entry's checkout —
+and is dropped once every entry is placed. An ambiguous entry or a `?` line leaves the command
+incomplete: exit `3`.
 
 Registered consumers are fetched by forge slug: Knives reads supported pin files at the consumer
 repository's trunk and caches the result by its commit. When the forge is down, cache-backed pins
@@ -33,7 +37,7 @@ the branch tip.
 
 Like every report, it follows the machine-output rule: TOON when an agent runs it, `--json` for
 JSON exactly. The document is `{repos: [{name, path, release_remote?, newest_release?, behind?,
-notes?, problems?}], trusted: [{name, path}], notes?, config_path}`.
+notes?, problems?}], notes?, config_path}`; `path` is `null` for an entry with no checkout here.
 
 ### `knives consumers [FORK] [--consumer PATH]...`
 
@@ -85,8 +89,10 @@ last_seen?, seen?, workspace?, notch?}`. A `pr` cell is
 newest review or comment landed; `claim` is `{id, kind, since, why}`; and `notch` is
 `{ts, kind, text, disposition?, anchor?, count}`, where `anchor` is the subject's tip when the
 entry was written. Question-marked fields are omitted when absent. Under `--all` the machine
-output is one array of these reports, one document; naming a repository gives that report as
-one object.
+output is one array of these reports, one document, one per registry entry; an entry whose
+checkout the scan of `~` did not place is a report whose `problems` opens with `could not
+gather: no checkout of <name> under <home>` (or the two-checkouts refusal), followed by any
+checkout the scan could not read. Naming a repository gives that report as one object.
 
 `--verbose` prints one line per finding with its detail (`kind  subject: detail`) instead of
 one line per kind.
@@ -260,8 +266,8 @@ explicitly and otherwise the tracked pull request is the fallback. A `#<n>` subj
 that number without treating it as a branch. `--evidence` is repeatable and requires `-m`.
 `--disposition` is a lowercase terminal token and requires both `-m` and evidence.
 
-A `knives start` workspace resolves its registered checkout through `.jj/repo`, so ordinary
-commands infer that repository there. Keep `--repo <name>` for a cross-repository write.
+A `knives start` workspace carries a `.git` file git resolves to the registered checkout, so
+ordinary commands infer that repository there. Keep `--repo <name>` for a cross-repository write.
 
 #### What an entry holds
 
@@ -381,15 +387,15 @@ A branch forks from the release's shared base (the trunk point its members share
 
 ### `knives register [DIR]`
 
-Prints a paste-ready `[repos.<name>]` TOML entry to stdout, with diagnostic instructions on stderr.
+Prints a paste-ready `[repos.<name>]` TOML entry to stdout for the checkout `DIR` (default: the
+current directory) is inside — any subdirectory of it, or a `knives start` workspace of it, will
+do — with instructions on stderr. When the checkout's `upstream` is already an entry's, it prints
+`already registered as <name>` instead and exits `0`: the entry is the identity, and one upstream
+cannot be two entries.
 
-Writes nothing to `repos.toml` directly. The human or caller pastes the stdout snippet into `repos.toml`. Replace any existing `[repos.<name>]` section rather than appending a duplicate entry. Registry edits take effect on the next hook event or tool call without needing a daemon or service restart.
+Writes nothing to `repos.toml`. The human or caller pastes the stdout snippet into `repos.toml`. Replace any existing `[repos.<name>]` section rather than appending a duplicate entry. Registry edits take effect on the next hook event or tool call without needing a daemon or service restart.
 
-### `knives init [DIR]`
-
-Reads a checkout's remotes and outputs a registry entry or adopts the repository into the registry.
-
-Expects remotes named for their roles: `upstream` (what we contribute to) and `origin` (our fork where branches push and PR heads live), plus an optional `release` remote. Warns if an untracked remote looks like another fork of upstream (detected via case-insensitive owner and slug comparison on the same host), reminding that `origin` must point to your own fork.
+Expects remotes named for their roles: `upstream` (what we contribute to) and `origin` (our fork where branches push and PR heads live), plus an optional `release` remote; a checkout missing one is refused with the remotes it does have named. A git clone with no jj store is refused too: the hook binds those, fork commands do not. So is a jj checkout that is not colocated (`.jj` with no `.git`): knives reads a checkout through git. Warns if an untracked remote looks like another fork of upstream (detected via case-insensitive owner and slug comparison on the same host), reminding that `origin` must point to your own fork.
 
 ## Is this content carried?
 
@@ -415,35 +421,69 @@ The carriage vocabulary is exact:
 
 ## The registry
 
-`~/.config/knives/repos.toml`. Managed fork entries, trusted entries, and trust rules:
+`~/.config/knives/repos.toml` names repositories, not directories: managed fork entries and
+trust rules, no paths.
 
 ```toml
-[repos.scout]
-path = "~/forks/scout/default"
-upstream = "https://forge.invalid/org/scout"
-origin = "https://forge.invalid/ours/scout"
-base = "main"                         # optional: upstream's trunk (defaults to main; set e.g. "dev" for opencode-style forks)
-release_branch = "release"            # optional: fixed release branch scheme (omit for dated release/YYYY-MM-DD)
-consumers = ["acme/workbench"]       # optional: forge slugs whose trunks pin this repo's releases
+[repos.libcore]
+upstream = "https://forge.example/org/libcore"
+origin = "https://forge.example/ours/libcore"
+base = "main"                         # optional: upstream's trunk (defaults to main)
+release = "https://forge.example/company/libcore"   # optional: where releases publish
+consumers = ["company/workbench"]     # optional: forge slugs that pin this repo's releases
 
 [repos.tool]
-path = "~/tool"
-upstream = "https://forge.invalid/org/tool"
-origin = "https://forge.invalid/ours/tool"
+upstream = "https://forge.example/org/tool"
+origin = "https://forge.example/ours/tool"
+release_branch = "integration"        # optional: fixed release branch instead of dated cuts
 workspaces = "~/.worktrees/tool"      # optional: where `knives start` opens branch workspaces
 
-[trusted.workbench]
-path = "~/workbench/default"       # instructions read, not maintained
-
 [trust]
-roots = ["~/projects/company"]      # subtrees whose repos are all trusted for guidance
-owners = ["orgname"]               # forge owners whose repos are trusted for guidance
+repos = ["company/workbench"]         # repositories whose AGENTS.md is injected, by identity
+owners = ["ours", "company"]          # every repository under these owners
+roots = ["~/projects/company"]        # every repository under these directories
 ```
+
+### How a checkout is found
+
+A checkout is the entry whose `upstream` its own `upstream` remote matches
+(`.git`, trailing `/`, and case do not matter). Standing inside one — or inside
+a `knives start` workspace of one — binds it. From anywhere else, `knives repos`,
+`status --all`, and naming a repository scan `~` to depth three for checkouts;
+an entry with no checkout found reads `not on this machine`, and an entry with
+two is refused with both paths named. A checkout whose `origin` or `release`
+remote differs from the registry still binds, and `status` and `repos` carry a
+note saying so: `origin remote is <X>; registry says <Y>`.
+
+Knives manages colocated jj checkouts (what `jj git init`/`clone` make by default) and reads
+identity through git; a workspace
+must carry a `.git` file too, which `jj workspace add` writes only when it registers a git
+worktree for it (`git.auto-register-worktrees`, not yet in upstream jj), so knives requires such
+a jj build. The scan
+reads directories holding a `.git` directory beside a real `.jj` directory (a workspace carries a
+`.git` file, is not a candidate, and binds when you stand inside it), skips directories whose name starts with `.`, does not follow symlinks, and does not
+look below a `.jj` — a plain git repository is not a checkout and does not hide the forks beneath
+it, and a `.jj` with no `.git` (a non-colocated checkout, or a `.jj` some tree carries as content)
+is passed over in silence; a fork verb run inside one is refused: `<root> has a .jj but no .git;
+knives reads a checkout through git, so it must be colocated`.
+A checkout deeper than three directories under `~`, or outside `~`, is not found by
+the scan but binds as soon as you stand inside it — for every command except `knives repos`,
+which only scans, so it lists such a checkout as `not on this machine` even when run from inside
+it. A checkout whose remotes the scan could not read is named while some entry is still
+unplaced, since it may be that entry's checkout: a named repository's refusal ends
+`; could not read: <what>`, `knives repos` lists it as a `?` problem, and a sweep (`status --all`,
+`sync --all`, `audit --all`) says `could not read: <what>` once on stderr, whatever the output
+format. Once every entry is placed, it is dropped; a directory the scan could not list is always
+reported the same way. A sweep leaves an
+entry that is `not on this machine` out of the document with one stderr line,
+`knives: <name>: not on this machine`, and exits as the entries it found did. `HOME` must be set: the
+scan refuses (`HOME is not set; knives scans $HOME for checkouts`, exit `2`) rather than scan `/`.
 
 ### Registry fields
 
-- `[repos.*]`: managed forks. `upstream` and `origin` are required.
+- `[repos.*]`: managed forks. `upstream` and `origin` are required; two entries may not share an `upstream`, and a `path` field is refused on load.
   - `base`: upstream's trunk — the branch we fork from, measure landed state against, and target pull requests at. Defaults to `main`. Configurable because upstreams use different trunk names (for example, opencode-style forks set `base = "dev"`).
+  - `release`: a third remote, for when releases publish somewhere other than `origin`. Falls back to `origin`.
   - `release_branch`: configures a fixed release branch scheme (e.g., `"release"` or `"integration"`). Must not be empty, equal to `base`, or sit under the `release/` prefix.
   - `consumers`: forge slugs for repositories that pin this repository's releases. Knives scans
     each slug's trunk through the forge and caches it by commit; use `--consumer PATH` for an
@@ -451,19 +491,18 @@ owners = ["orgname"]               # forge owners whose repos are trusted for gu
   - `workspaces`: the directory `knives start` opens this repository's branch workspaces under,
     and `finish` removes them from. Absent, they sit beside the checkout — the `<name>/default`
     layout, where each workspace is a sibling of `default`. Set it for a checkout at `~/<name>`,
-    which has no room for siblings: without it every branch would land in `~`. Resolved like
-    `path` (`~` expands; a relative value is taken from the config directory), so write it as
-    `~/…`. A value inside the checkout is refused at load.
+    which has no room for siblings: without it every branch would land in `~`. `~` expands and a
+    relative value is taken from the config directory, so write it as `~/…`. A value inside the
+    checkout is refused by `knives start` and `finish`, the two verbs that use it.
 
-- `[trusted.*]`: unmaintained repositories whose agent instructions are trusted for reading.
+- `[trust]`: which repositories' instructions the hook injects. A fork entry grants none of this; a fork whose `AGENTS.md` you want injected needs a `[trust]` rule too.
+  - `repos`: array of forge slugs (`owner/repo`); a checkout any of whose remotes names that repository is trusted, wherever it is cloned. A value that is not a slug is refused on load.
+  - `owners`: array of forge organization or user names; a checkout any of whose remotes belongs to one is trusted.
+  - `roots`: array of directory paths; any repository inside these subtrees is trusted.
 
-- `[trust]`: rules for trusting instructions from unmanaged repositories.
-  - `roots`: array of directory paths; any repository inside these subtrees is trusted for guidance.
-  - `owners`: array of forge organization or user names.
+> **SECURITY:** `repos` and `owners` match self-declared remote URLs read from the candidate checkout's own git configuration file (`git config --local`; the user's, the system's and the environment's configuration — `GIT_DIR`, `GIT_WORK_TREE`, every `GIT_CONFIG_*` — are never consulted) — not forge-authenticated; any repository that declares itself a checkout of a trusted repository or owner by remote URL is accepted. The root is the nearest `.git`, the one marker a clone cannot carry: git refuses `.git` path components whatever their type, while a `.jj` — a store, a pointer file, a symlink, a working-copy record — is content any tree can commit and a clone delivers. So a `.jj` without `.git` is not a repository to knives, a `.jj` under a `.git` is that repository's content and gets that repository's verdict, a directory nested inside a checkout cannot inherit the enclosing checkout's identity, and a tree that arrives by clone cannot borrow another checkout's identity (the `.git` it arrives with names the remotes it was cloned from). jj is never run to decide identity, so a read never writes into anyone's checkout. A checkout that declares no remotes matches only via `roots`; grants guidance-as-data injection only, never fork-command access; prefer `roots` when in doubt.
 
-> **SECURITY:** `owners` matches self-declared remote URLs read from the candidate checkout's own git config — not forge-authenticated; any repo that declares itself a checkout of a trusted owner's repo (by remote URL or a `gitdir:` pointer) is accepted; the probe verifies the directory is the repository's own git toplevel, so nested directories do NOT inherit an enclosing repo's identity; owner rules read GIT remote config, so jj-only (non-colocated) checkouts match only via `roots`; grants guidance-as-data injection only (same grant as a `[trusted]` entry), never fork-command access; prefer `roots` when in doubt.
-
-Edits to `repos.toml` take effect on the next hook event or tool call (reloaded per event) — no restart required.
+No command writes `repos.toml`: `knives register` prints an entry and a human pastes it. Edits take effect on the next hook event or tool call (reloaded per event) — no restart required.
 
 ## Machine output
 
@@ -475,7 +514,7 @@ When the environment indicates an agent is running a command (or stdout is not a
 
 ## The OpenCode plugin
 
-Ships alongside the CLI. Once per repository per session, the first time a call names a file inside a managed repository, it announces that the repository is managed and shared, names any claims, and appends the repository's own `AGENTS.md` as data. It also exports `KNIVES_OWNER` into shell environments.
+Ships alongside the CLI. Once per repository per session, the first time a call names a file inside a repository the registry knows, it announces that a managed fork is managed and shared, names any claims, and appends the `AGENTS.md` of a repository `[trust]` names as data — a fork entry alone brings the notice, not the guidance. It also exports `KNIVES_OWNER` into shell environments.
 
 Configured from its entry in `opencode.json`, all defaulting to on:
 

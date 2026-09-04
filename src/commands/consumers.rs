@@ -4,20 +4,20 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
+use crate::bind::Fork;
 use crate::cli::Exit;
 use crate::config::{RepoEntry, Role};
 use crate::consumer_pins::{
     ConsumerHeadMemo, ConsumerPinSource, scan_consumer_for, scan_consumer_slug_with_heads,
 };
-use crate::ids::{CommitId, ReleaseScheme, RepoName, short_id, strict_dated_release};
+use crate::ids::{CommitId, ReleaseScheme, short_id, strict_dated_release};
 use crate::jj::{self, Repo};
 use crate::pins::{Pin, PinVerdict};
 use crate::release_model::{ConsumerScan, newest_release, repo_slug};
 
 /// Inputs for one fork's consumer-pin census.
 pub struct Request<'a> {
-    pub fork: &'a RepoName,
-    pub entry: &'a RepoEntry,
+    pub fork: &'a Fork<'a>,
     pub slugs: &'a [String],
     pub locals: &'a [PathBuf],
     pub forge: &'a dyn ConsumerPinSource,
@@ -30,7 +30,6 @@ impl std::fmt::Debug for Request<'_> {
         formatter
             .debug_struct("Request")
             .field("fork", self.fork)
-            .field("entry", self.entry)
             .field("slugs", &self.slugs)
             .field("locals", &self.locals)
             .field("forge", &"<Forge>")
@@ -106,11 +105,13 @@ struct ConsumerContext<'a> {
 
 /// Classify every registered and explicitly named consumer against live release refs.
 pub fn gather(request: &Request<'_>) -> Report {
-    let scheme = request.entry.release_scheme();
-    let positions = positions(request.entry, &scheme);
-    let slug = repo_slug(request.entry);
+    let entry = request.fork.entry;
+    let path = &request.fork.checkout.path;
+    let scheme = entry.release_scheme();
+    let positions = positions(entry, path, &scheme);
+    let slug = repo_slug(entry);
     let context = ConsumerContext {
-        fork: request.fork.as_str(),
+        fork: request.fork.name.as_str(),
         slug: slug.as_deref(),
         scheme: &scheme,
         live: &positions.refs,
@@ -118,7 +119,7 @@ pub fn gather(request: &Request<'_>) -> Report {
         forge: request.forge,
         cache_root: request.cache_root,
         heads: request.heads,
-        repo_path: &request.entry.path,
+        repo_path: path,
     };
     let mut consumers = request
         .slugs
@@ -135,7 +136,7 @@ pub fn gather(request: &Request<'_>) -> Report {
     let mut notes = positions.notes;
     add_skew_note(&consumers, &mut notes);
     Report {
-        fork: request.fork.to_string(),
+        fork: request.fork.name.to_string(),
         newest: positions.newest,
         consumers,
         notes,
@@ -143,10 +144,10 @@ pub fn gather(request: &Request<'_>) -> Report {
     }
 }
 
-fn positions(entry: &RepoEntry, scheme: &ReleaseScheme) -> Positions {
+fn positions(entry: &RepoEntry, path: &Path, scheme: &ReleaseScheme) -> Positions {
     let mut notes = Vec::new();
     let mut problems = Vec::new();
-    let local = local_positions(entry, scheme, &mut problems);
+    let local = local_positions(entry, path, scheme, &mut problems);
     let pattern = release_pattern(scheme);
     let remote = entry.remote(Role::Release);
     match jj::remote_refs(remote, &[&pattern]) {
@@ -208,20 +209,18 @@ struct LocalPositions {
 
 fn local_positions(
     entry: &RepoEntry,
+    path: &Path,
     scheme: &ReleaseScheme,
     problems: &mut Vec<String>,
 ) -> LocalPositions {
-    let Ok(repo) = Repo::open(&entry.path) else {
-        problems.push(format!(
-            "could not open local checkout {}",
-            entry.path.display()
-        ));
+    let Ok(repo) = Repo::open(path) else {
+        problems.push(format!("could not open local checkout {}", path.display()));
         return LocalPositions { newest: None };
     };
     let Ok(tips) = repo.bookmark_tips() else {
         problems.push(format!(
             "could not read local release refs from {}",
-            entry.path.display()
+            path.display()
         ));
         return LocalPositions { newest: None };
     };
