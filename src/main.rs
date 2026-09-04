@@ -23,13 +23,13 @@ use std::process::ExitCode;
 
 use branch_verbs::{FinishOptions, run_depends, run_finish, run_track};
 use clap::Parser as _;
-use knives::bind::{Fork, Unresolved};
+use knives::bind::{BindError, Fork, Unbound, Unresolved};
 use knives::cli::{Cli, Command, Exit, Output, ReleaseAction};
-use knives::commands::claim::current_identity;
+use knives::commands::claim::{Identity, Resolved, current_identity, required};
 use knives::commands::{
     audit, consumers, hook, notch, pr, preflight, pushed, register, repos, start, status, sync,
 };
-use knives::config::{Registry, RepoEntry, default_config_path, home_dir, load};
+use knives::config::{ConfigError, Registry, RepoEntry, default_config_path, home_dir, load};
 use knives::forge::Forge;
 use knives::forge::github::CliForge;
 use knives::ids::{BranchName, RepoName};
@@ -58,27 +58,31 @@ fn main() -> ExitCode {
 )]
 fn dispatch() -> anyhow::Result<Exit> {
     let cli = Cli::parse();
-    let _ = (|| -> anyhow::Result<()> {
-        let cwd = std::env::current_dir()?;
-        let identity = current_identity(&cwd)?;
-        knives::seen::record_observation(&cwd, &identity);
-        Ok(())
-    })();
+    let loaded = load(&default_config_path());
     let output = knives::cli::output_format(cli.json, cli.text);
     match cli.command {
+        // These act on no fork and need no identity: a hook event spawns
+        // nothing here (the hook binds what its event names), and a vanished
+        // cwd is none of their problem. `repos` still takes the sighting —
+        // asking what is maintained from inside a fork is a sighting of it —
+        // but nothing about it can fail the listing.
         Command::Hook { harness } => Ok(hook::run(harness)),
         Command::Register { repo } => register::run(repo),
-        Command::Repos => repos::run(output),
+        Command::Repos => {
+            let _ = grounded(&loaded);
+            repos::run(output)
+        }
+        Command::Gh { args } => match knives::commands::gh::run(&args)? {},
         Command::Consumers { fork, consumer } => {
-            let registry = load(&default_config_path())?;
-            let Some(fork) = one_fork(&registry, fork.as_deref())? else {
+            let (ground, _) = grounded(&loaded);
+            let Some(fork) = ground?.one_fork(fork.as_deref())? else {
                 return Ok(Exit::Usage);
             };
             run_consumers(&fork, &consumer, output)
         }
         Command::Pushed { branches, repo } => {
-            let registry = load(&default_config_path())?;
-            let Some(fork) = one_fork(&registry, repo.as_deref())? else {
+            let (ground, _) = grounded(&loaded);
+            let Some(fork) = ground?.one_fork(repo.as_deref())? else {
                 return Ok(Exit::Usage);
             };
             run_pushed(&fork, &branches, output)
@@ -87,31 +91,48 @@ fn dispatch() -> anyhow::Result<Exit> {
             repo,
             all,
             no_github,
-        } => run_audit(repo.as_deref(), all, output, !no_github),
+        } => {
+            let (ground, _) = grounded(&loaded);
+            run_audit(
+                ground?,
+                Scope {
+                    requested: repo.as_deref(),
+                    all,
+                },
+                output,
+                !no_github,
+            )
+        }
         Command::Status {
             repo,
             all,
             verbose,
             no_landed,
             no_github,
-        } => run_status(
-            repo.as_deref(),
-            StatusView {
-                scope: Scope { all },
-                gather: Gather {
-                    probe: !no_landed,
-                    use_forge: !no_github,
+        } => {
+            let (ground, _) = grounded(&loaded);
+            run_status(
+                ground?,
+                StatusView {
+                    scope: Scope {
+                        requested: repo.as_deref(),
+                        all,
+                    },
+                    gather: Gather {
+                        probe: !no_landed,
+                        use_forge: !no_github,
+                    },
+                    display: Display { verbose, output },
                 },
-                display: Display { verbose, output },
-            },
-        ),
+            )
+        }
         Command::Pr {
             number,
             repo,
             timeline,
         } => {
-            let registry = load(&default_config_path())?;
-            let Some(fork) = one_fork(&registry, repo.as_deref())? else {
+            let (ground, _) = grounded(&loaded);
+            let Some(fork) = ground?.one_fork(repo.as_deref())? else {
                 return Ok(Exit::Usage);
             };
             run_pr(&fork, number, timeline, output)
@@ -120,20 +141,38 @@ fn dispatch() -> anyhow::Result<Exit> {
             repo,
             all,
             no_github,
-        } => run_sync(repo.as_deref(), all, output, !no_github),
+        } => {
+            let (ground, identity) = grounded(&loaded);
+            run_sync(
+                ground?,
+                Scope {
+                    requested: repo.as_deref(),
+                    all,
+                },
+                output,
+                !no_github,
+                &identity?,
+            )
+        }
         Command::Start {
             branch,
             repo,
             why,
             force,
         } => {
-            let registry = load(&default_config_path())?;
+            let (ground, identity) = grounded(&loaded);
             let (Some(fork), Some(branch)) =
-                (one_fork(&registry, repo.as_deref())?, branch_name(&branch))
+                (ground?.one_fork(repo.as_deref())?, branch_name(&branch))
             else {
                 return Ok(Exit::Usage);
             };
-            start::run(&fork, &branch, why.as_deref(), force)
+            start::run(&start::Request {
+                fork: &fork,
+                branch: &branch,
+                identity: &identity?,
+                why: why.as_deref(),
+                force,
+            })
         }
         Command::Finish {
             branch,
@@ -143,9 +182,9 @@ fn dispatch() -> anyhow::Result<Exit> {
             force,
             why,
         } => {
-            let registry = load(&default_config_path())?;
+            let (ground, identity) = grounded(&loaded);
             let (Some(fork), Some(branch)) =
-                (one_fork(&registry, repo.as_deref())?, branch_name(&branch))
+                (ground?.one_fork(repo.as_deref())?, branch_name(&branch))
             else {
                 return Ok(Exit::Usage);
             };
@@ -158,6 +197,7 @@ fn dispatch() -> anyhow::Result<Exit> {
                     force,
                     why: why.as_deref(),
                 },
+                &identity?,
             )
         }
         Command::Track {
@@ -167,22 +207,24 @@ fn dispatch() -> anyhow::Result<Exit> {
             forget,
             repo,
         } => {
-            let registry = load(&default_config_path())?;
+            let (ground, identity) = grounded(&loaded);
             let (Some(fork), Some(branch)) =
-                (one_fork(&registry, repo.as_deref())?, branch_name(&branch))
+                (ground?.one_fork(repo.as_deref())?, branch_name(&branch))
             else {
                 return Ok(Exit::Usage);
             };
-            run_track(&fork, &branch, pr, fork_only, forget)
+            run_track(&fork, &branch, pr, fork_only, forget, &identity?)
         }
         Command::Depends { branch, on, repo } => {
-            let registry = load(&default_config_path())?;
+            let (ground, identity) = grounded(&loaded);
+            let ground = ground?;
+            let registry = ground.registry;
             let (Some(fork), Some(branch)) =
-                (one_fork(&registry, repo.as_deref())?, branch_name(&branch))
+                (ground.one_fork(repo.as_deref())?, branch_name(&branch))
             else {
                 return Ok(Exit::Usage);
             };
-            run_depends(&registry, &fork, &branch, &on)
+            run_depends(registry, &fork, &branch, &on, &identity?)
         }
         Command::Notch {
             subject,
@@ -202,13 +244,14 @@ fn dispatch() -> anyhow::Result<Exit> {
                 eprintln!("subject cannot be empty");
                 return Ok(Exit::Usage);
             }
-            let registry = load(&default_config_path())?;
-            let Some(fork) = one_fork(&registry, repo.as_deref())? else {
+            let (ground, identity) = grounded(&loaded);
+            let Some(fork) = ground?.one_fork(repo.as_deref())? else {
                 return Ok(Exit::Usage);
             };
             notch::run(
                 &notch::Request {
                     fork: &fork,
+                    identity: identity.as_ref(),
                     subject: subject.as_deref(),
                     message: message.as_deref(),
                     evidence: &evidence,
@@ -222,8 +265,8 @@ fn dispatch() -> anyhow::Result<Exit> {
             )
         }
         Command::Preflight { repo } => {
-            let registry = load(&default_config_path())?;
-            let Some(fork) = one_fork(&registry, repo.as_deref())? else {
+            let (ground, _) = grounded(&loaded);
+            let Some(fork) = ground?.one_fork(repo.as_deref())? else {
                 return Ok(Exit::Usage);
             };
             run_preflight(&fork)
@@ -233,15 +276,14 @@ fn dispatch() -> anyhow::Result<Exit> {
             repo,
             consumer,
         } => {
-            let registry = load(&default_config_path())?;
-            let Some(fork) = one_fork(&registry, repo.as_deref())? else {
+            let (ground, identity) = grounded(&loaded);
+            let Some(fork) = ground?.one_fork(repo.as_deref())? else {
                 return Ok(Exit::Usage);
             };
             let extra: Vec<&std::path::Path> =
                 consumer.iter().map(std::path::PathBuf::as_path).collect();
-            dispatch_release(&fork, action, &extra, output)
+            dispatch_release(&fork, action, &extra, output, identity.as_ref())
         }
-        Command::Gh { args } => match knives::commands::gh::run(&args)? {},
     }
 }
 
@@ -254,48 +296,156 @@ fn known(registry: &Registry) -> String {
         .join(", ")
 }
 
-/// The single fork a verb acts on: named, or the one the current directory is
-/// inside; `None` after printing why not (exit `Usage`).
-///
-/// Requiring the name on every command is absurd when you are inside the
-/// repository, and it was the loudest complaint about using this thing. Only an
-/// unknown name gets the registry's names appended: the other refusals are
-/// about a directory, and listing entries would not help find one.
-fn one_fork<'a>(
-    registry: &'a Registry,
-    requested: Option<&str>,
-) -> anyhow::Result<Option<Fork<'a>>> {
-    let cwd = std::env::current_dir()?;
-    let fork = if let Some(name) = requested {
-        let name = RepoName::new(name);
-        match knives::bind::resolve(registry, &name, &cwd, &home_dir())? {
-            Ok(fork) => fork,
-            Err(why @ Unresolved::Unknown) => {
-                eprintln!("{}; known: {}", why.message(&name), known(registry));
-                return Ok(None);
-            }
-            Err(why) => {
-                eprintln!("{}", why.message(&name));
-                return Ok(None);
-            }
-        }
-    } else {
-        match knives::bind::here(registry, &cwd)? {
-            Ok(fork) => fork,
-            Err(unbound) => {
-                eprintln!("{}; known: {}", unbound.message(), known(registry));
-                return Ok(None);
-            }
-        }
+/// The fork verbs' shared step, taken once per invocation by a verb that acts
+/// on a fork: the current directory bound against the registry, the sighting
+/// recorded from that bind, and who is acting resolved from it — one
+/// `jj git remote list` for all three and the verb. Either half may be an
+/// error; the arm that needs it reports it, so a sighting never fails a call
+/// and a verb that only reads never asks who is acting.
+fn grounded(
+    loaded: &Result<Registry, ConfigError>,
+) -> (anyhow::Result<Ground<'_>>, anyhow::Result<Identity>) {
+    let cwd = std::env::current_dir();
+    let ground = match (&cwd, loaded) {
+        (Ok(cwd), Ok(registry)) => Ok(Ground::new(registry, cwd)),
+        (Err(error), _) => Err(anyhow::anyhow!("reading the current directory: {error}")),
+        (Ok(_), Err(error)) => Err(anyhow::anyhow!("{error}")),
     };
-    if !fork.checkout.is_jj() {
-        eprintln!(
-            "{} is a git clone, not a jj checkout; fork commands need jj",
-            fork.checkout.path.display()
-        );
-        return Ok(None);
+    let bound = ground.as_ref().ok().and_then(Ground::bound);
+    let identity = current_identity(bound);
+    if let (Ok(cwd), Ok(identity)) = (&cwd, &identity) {
+        knives::seen::record_observation(bound, cwd, identity);
     }
-    Ok(Some(fork))
+    (ground, identity)
+}
+
+/// What every fork verb shares: the registry, and the current directory bound
+/// against it once.
+struct Ground<'a> {
+    registry: &'a Registry,
+    /// Exactly what `bind::here` said, so the verb reports a refusal or an
+    /// unreadable checkout as it always has, without asking jj again.
+    here: Result<Result<Fork<'a>, Unbound>, BindError>,
+}
+
+impl<'a> Ground<'a> {
+    fn new(registry: &'a Registry, cwd: &std::path::Path) -> Self {
+        Self {
+            registry,
+            here: knives::bind::here(registry, cwd),
+        }
+    }
+
+    /// The entry the current directory is inside, when it is inside one.
+    fn bound(&self) -> Option<&RepoName> {
+        self.here
+            .as_ref()
+            .ok()?
+            .as_ref()
+            .ok()
+            .map(|fork| &fork.name)
+    }
+
+    /// The single fork a verb acts on: named, or the one the current directory
+    /// is inside; `None` after printing why not (exit `Usage`).
+    ///
+    /// Requiring the name on every command is absurd when you are inside the
+    /// repository, and it was the loudest complaint about using this thing.
+    /// Every refusal about the current directory (not inside a repository, no
+    /// `upstream`, not registered) and an unknown name append the registry's
+    /// names, since the fix is to type one of them; a name that is known but has
+    /// no checkout, or two, does not, since listing entries would not help find
+    /// a directory.
+    fn one_fork(self, requested: Option<&str>) -> anyhow::Result<Option<Fork<'a>>> {
+        let registry = self.registry;
+        let fork = if let Some(name) = requested {
+            let name = RepoName::new(name);
+            let cwd = std::env::current_dir()?;
+            match knives::bind::resolve(registry, &name, &cwd, &home_dir())? {
+                Ok(fork) => fork,
+                Err(why @ Unresolved::Unknown) => {
+                    eprintln!("{}; known: {}", why.message(&name), known(registry));
+                    return Ok(None);
+                }
+                Err(why) => {
+                    eprintln!("{}", why.message(&name));
+                    return Ok(None);
+                }
+            }
+        } else {
+            match self.here? {
+                Ok(fork) => fork,
+                Err(unbound) => {
+                    eprintln!("{}; known: {}", unbound.message(), known(registry));
+                    return Ok(None);
+                }
+            }
+        };
+        if !fork.checkout.is_jj() {
+            eprintln!(
+                "{} is a git clone, not a jj checkout; fork commands need jj",
+                fork.checkout.path.display()
+            );
+            return Ok(None);
+        }
+        Ok(Some(fork))
+    }
+
+    /// Every entry a many-repo verb covers, bound where the scan could.
+    ///
+    /// A name wins. Otherwise the repo you are standing in, because that is
+    /// nearly always what you meant, and reporting on ten repositories at once
+    /// is how `status` became unreadable. `--all` asks for all of them
+    /// explicitly, and standing outside every managed repo also means all of
+    /// them, since there is nothing else it could mean. An entry the scan did
+    /// not find, or found twice, is still a row — rendered as a problem, exactly
+    /// as an unopenable path was before — and nothing is opened for it.
+    fn selected(self, scope: Scope<'_>) -> anyhow::Result<Result<Vec<Selected<'a>>, Exit>> {
+        let registry = self.registry;
+        if registry.is_empty() {
+            eprintln!(
+                "no repos configured; add entries to {}",
+                default_config_path().display()
+            );
+            return Ok(Err(Exit::Usage));
+        }
+        let home = home_dir();
+        if let Some(name) = scope.requested {
+            let name = RepoName::new(name);
+            let cwd = std::env::current_dir()?;
+            return Ok(match knives::bind::resolve(registry, &name, &cwd, &home)? {
+                Ok(fork) => Ok(vec![Selected::Bound(fork)]),
+                Err(why @ Unresolved::Unknown) => {
+                    eprintln!("{}; known: {}", why.message(&name), known(registry));
+                    Err(Exit::Usage)
+                }
+                Err(why) => {
+                    eprintln!("{}", why.message(&name));
+                    Err(Exit::Usage)
+                }
+            });
+        }
+        if !scope.all
+            && let Ok(fork) = self.here?
+        {
+            return Ok(Ok(vec![Selected::Bound(fork)]));
+        }
+        Ok(Ok(sweep(registry, &home)))
+    }
+
+    /// `sync` fetches and writes, so it never sweeps by accident: a name,
+    /// `--all`, or the fork the current directory is inside; anything else is
+    /// `Usage`.
+    fn sync_targets(self, scope: Scope<'_>) -> anyhow::Result<Result<Vec<Selected<'a>>, Exit>> {
+        if scope.requested.is_some() || scope.all {
+            return self.selected(scope);
+        }
+        if let Ok(fork) = self.here? {
+            return Ok(Ok(vec![Selected::Bound(fork)]));
+        }
+        eprintln!("give a repo name, or --all");
+        Ok(Err(Exit::Usage))
+    }
 }
 
 /// The branch a verb acts on, or `None` after saying why the name is not one.
@@ -354,13 +504,12 @@ fn run_pushed(fork: &Fork<'_>, branches: &[String], output: Output) -> anyhow::R
 
 /// Reconcile every requested fork's remote refs, release records, and anonymous heads.
 fn run_audit(
-    requested: Option<&str>,
-    all: bool,
+    ground: Ground<'_>,
+    scope: Scope<'_>,
     output: Output,
     use_forge: bool,
 ) -> anyhow::Result<Exit> {
-    let registry = load(&default_config_path())?;
-    let chosen = match selected(&registry, requested, all)? {
+    let chosen = match ground.selected(scope)? {
         Ok(chosen) => chosen,
         Err(exit) => return Ok(exit),
     };
@@ -388,25 +537,35 @@ fn run_audit(
         worst = worst.worst(audit::exit_for(&report));
         reports.push(report);
     }
-    knives::cli::emit_reports(output, all, &reports, |reports| {
+    knives::cli::emit_reports(output, scope.all, &reports, |reports| {
         knives::cli::joined(reports, "\n", audit::render)
     })?;
     Ok(worst)
 }
 
 /// Plan, curate or cut a release.
+///
+/// `identity` is who is acting, resolved once by dispatch; the actions that
+/// write the ledger need it, the reports do not, so a failure to resolve it is
+/// reported only where it would matter.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the fork, the action, the extra consumers, the output format and who is acting are independent inputs"
+)]
 fn dispatch_release(
     fork: &Fork<'_>,
     action: Option<ReleaseAction>,
     extra_consumers: &[&std::path::Path],
     output: Output,
+    identity: Resolved<'_>,
 ) -> anyhow::Result<Exit> {
     match action {
-        None => run_release(fork, extra_consumers, &ReleaseInvocation::Plan),
+        None => run_release(fork, extra_consumers, &ReleaseInvocation::Plan, identity),
         Some(ReleaseAction::Cut { name, allow_drop }) => run_release(
             fork,
             extra_consumers,
             &ReleaseInvocation::Cut { name, allow_drop },
+            identity,
         ),
         Some(ReleaseAction::Rebase { reference, no_drop }) => {
             let cache_root = knives::forge_cache::cache_root();
@@ -416,6 +575,7 @@ fn dispatch_release(
                 no_drop,
                 extra_consumers,
                 cache_root.as_deref(),
+                required(identity)?,
             )
         }
         Some(ReleaseAction::Carries {
@@ -442,18 +602,25 @@ fn dispatch_release(
             },
         ),
         Some(ReleaseAction::Reap) => run_reap(fork),
-        Some(ReleaseAction::Include { branch, why }) => {
-            run_release_edit(fork, extra_consumers, &ReleaseEdit::Include { branch, why })
-        }
-        Some(ReleaseAction::Drop { branch, why }) => {
-            run_release_edit(fork, extra_consumers, &ReleaseEdit::Drop { branch, why })
-        }
+        Some(ReleaseAction::Include { branch, why }) => run_release_edit(
+            fork,
+            extra_consumers,
+            &ReleaseEdit::Include { branch, why },
+            required(identity)?,
+        ),
+        Some(ReleaseAction::Drop { branch, why }) => run_release_edit(
+            fork,
+            extra_consumers,
+            &ReleaseEdit::Drop { branch, why },
+            required(identity)?,
+        ),
         Some(ReleaseAction::Advance { branches, from }) => {
             let branches = branches.into_iter().map(BranchName::new).collect();
             run_release_edit(
                 fork,
                 extra_consumers,
                 &ReleaseEdit::Advance { branches, from },
+                required(identity)?,
             )
         }
     }
@@ -463,14 +630,13 @@ fn dispatch_release(
 ///
 /// The owner is resolved exactly as a claim's is, so one agent's events and its
 /// claims carry the same name and a reader can join them.
-fn scribe_for(fork: &Fork<'_>) -> anyhow::Result<Scribe> {
-    let identity = knives::commands::claim::current_identity(&std::env::current_dir()?)?;
-    Ok(Scribe::new(
+fn scribe_for(fork: &Fork<'_>, identity: &Identity) -> Scribe {
+    Scribe::new(
         Ledger::for_repo(&fork.name),
         fork.name.clone(),
         fork.checkout.path.clone(),
-        identity.owner,
-    ))
+        identity.owner.clone(),
+    )
 }
 
 /// One registry entry as a many-repo verb sees it after the scan.
@@ -484,58 +650,6 @@ enum Selected<'a> {
         entry: &'a RepoEntry,
         problems: Vec<String>,
     },
-}
-
-impl Selected<'_> {
-    const fn name(&self) -> &RepoName {
-        match self {
-            Self::Bound(fork) => &fork.name,
-            Self::Unplaced { name, .. } => name,
-        }
-    }
-}
-
-/// Every entry a many-repo verb covers, bound where the scan could.
-///
-/// A name wins. Otherwise the repo you are standing in, because that is nearly
-/// always what you meant, and reporting on ten repositories at once is how
-/// `status` became unreadable. `--all` asks for all of them explicitly, and
-/// standing outside every managed repo also means all of them, since there is
-/// nothing else it could mean. An entry the scan did not find, or found twice,
-/// is still a row — rendered as a problem, exactly as an unopenable path was
-/// before — and nothing is opened for it.
-fn selected<'a>(
-    registry: &'a Registry,
-    requested: Option<&str>,
-    all: bool,
-) -> anyhow::Result<Result<Vec<Selected<'a>>, Exit>> {
-    if registry.is_empty() {
-        eprintln!(
-            "no repos configured; add entries to {}",
-            default_config_path().display()
-        );
-        return Ok(Err(Exit::Usage));
-    }
-    let cwd = std::env::current_dir()?;
-    let home = home_dir();
-    if let Some(name) = requested {
-        let name = RepoName::new(name);
-        return Ok(match knives::bind::resolve(registry, &name, &cwd, &home)? {
-            Ok(fork) => Ok(vec![Selected::Bound(fork)]),
-            Err(why @ Unresolved::Unknown) => {
-                eprintln!("{}; known: {}", why.message(&name), known(registry));
-                Err(Exit::Usage)
-            }
-            Err(why) => {
-                eprintln!("{}", why.message(&name));
-                Err(Exit::Usage)
-            }
-        });
-    }
-    if !all && let Ok(fork) = knives::bind::here(registry, &cwd)? {
-        return Ok(Ok(vec![Selected::Bound(fork)]));
-    }
-    Ok(Ok(sweep(registry, &home)))
 }
 
 /// Every entry, bound through one scan of `home`.
@@ -570,16 +684,18 @@ fn sweep<'a>(registry: &'a Registry, home: &std::path::Path) -> Vec<Selected<'a>
         .collect()
 }
 
-/// Which repos a report covers.
+/// Which repos a report covers: a named one, all of them, or (neither) the one
+/// the current directory is inside.
 #[derive(Debug, Clone, Copy)]
-struct Scope {
+struct Scope<'a> {
+    requested: Option<&'a str>,
     all: bool,
 }
 
 /// How a report is produced and shown.
 #[derive(Debug, Clone, Copy)]
-struct StatusView {
-    scope: Scope,
+struct StatusView<'a> {
+    scope: Scope<'a>,
     /// What the report gathers, as opposed to how it is displayed.
     gather: Gather,
     display: Display,
@@ -638,20 +754,54 @@ fn run_pr(
     Ok(pr::exit_for(&report))
 }
 
-/// One registry entry's status, or why it could not be gathered.
-type GatheredStatus<'a> = (
-    &'a Selected<'a>,
-    anyhow::Result<(status::Report, status::Timings)>,
-);
+/// One repository's row in the status document, with the timings of the gather
+/// that produced it when one did.
+///
+/// A repository that cannot be gathered is still a row: its report carries the
+/// error as a problem, so one broken registry entry does not swallow every other
+/// repository's answer. An entry the scan did not place carries the scan's
+/// reasons instead, and nothing is opened for it.
+fn status_row(
+    chosen: &Selected<'_>,
+    gather: impl FnOnce(&Fork<'_>) -> anyhow::Result<(status::Report, status::Timings)>,
+) -> (status::Report, Option<status::Timings>) {
+    match chosen {
+        Selected::Bound(fork) => match gather(fork) {
+            Ok((report, timings)) => (report, Some(timings)),
+            Err(error) => (
+                status::Report {
+                    repo: fork.name.to_string(),
+                    trunk: fork.entry.trunk().to_owned(),
+                    problems: vec![format!("could not gather: {error:#}")],
+                    ..status::Report::default()
+                },
+                None,
+            ),
+        },
+        Selected::Unplaced {
+            name,
+            entry,
+            problems,
+        } => (
+            status::Report {
+                repo: name.to_string(),
+                trunk: entry.trunk().to_owned(),
+                problems: problems.clone(),
+                ..status::Report::default()
+            },
+            None,
+        ),
+    }
+}
 
-fn run_status(requested: Option<&str>, view: StatusView) -> anyhow::Result<Exit> {
+fn run_status(ground: Ground<'_>, view: StatusView<'_>) -> anyhow::Result<Exit> {
     let StatusView {
-        scope: Scope { all },
+        scope,
         gather: Gather { probe, use_forge },
         display: Display { verbose, output },
     } = view;
-    let registry = load(&default_config_path())?;
-    let chosen = match selected(&registry, requested, all)? {
+    let registry = ground.registry;
+    let chosen = match ground.selected(scope)? {
         Ok(list) => list,
         Err(exit) => return Ok(exit),
     };
@@ -671,8 +821,7 @@ fn run_status(requested: Option<&str>, view: StatusView) -> anyhow::Result<Exit>
     let (repo_workers, probe_workers) = worker_budget(chosen.len(), parallelism());
     let chunk = chosen.len().div_ceil(repo_workers).max(1);
     let store = &store;
-    let registry = &registry;
-    let gathered: Vec<GatheredStatus<'_>> = std::thread::scope(|scope| {
+    let rows: Vec<(status::Report, Option<status::Timings>)> = std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(repo_workers);
         for slice in chosen.chunks(chunk) {
             handles.push((
@@ -681,25 +830,21 @@ fn run_status(requested: Option<&str>, view: StatusView) -> anyhow::Result<Exit>
                     slice
                         .iter()
                         .map(|chosen| {
-                            let gathered = match chosen {
-                                Selected::Bound(fork) => {
-                                    let ledger = Ledger::for_repo(&fork.name);
-                                    status::gather_timed(
-                                        fork,
-                                        store,
-                                        &status::Options {
-                                            probe,
-                                            forge,
-                                            cache,
-                                            registry: Some(registry),
-                                            ledger: Some(&ledger),
-                                            workers: probe_workers,
-                                        },
-                                    )
-                                }
-                                Selected::Unplaced { .. } => Err(anyhow::anyhow!("not placed")),
-                            };
-                            (chosen, gathered)
+                            status_row(chosen, |fork| {
+                                let ledger = Ledger::for_repo(&fork.name);
+                                status::gather_timed(
+                                    fork,
+                                    store,
+                                    &status::Options {
+                                        probe,
+                                        forge,
+                                        cache,
+                                        registry: Some(registry),
+                                        ledger: Some(&ledger),
+                                        workers: probe_workers,
+                                    },
+                                )
+                            })
                         })
                         .collect::<Vec<_>>()
                 }),
@@ -712,10 +857,9 @@ fn run_status(requested: Option<&str>, view: StatusView) -> anyhow::Result<Exit>
                     slice
                         .iter()
                         .map(|chosen| {
-                            (
-                                chosen,
-                                Err(anyhow::anyhow!("gathering {} panicked", chosen.name())),
-                            )
+                            status_row(chosen, |fork| {
+                                Err(anyhow::anyhow!("gathering {} panicked", fork.name))
+                            })
                         })
                         .collect()
                 })
@@ -725,58 +869,23 @@ fn run_status(requested: Option<&str>, view: StatusView) -> anyhow::Result<Exit>
 
     // One document per invocation: an array under `--all`, the object otherwise.
     let mut worst = Exit::Ok;
-    let mut reports = Vec::with_capacity(gathered.len());
-    for (chosen, gathered) in gathered {
-        let report = status_row(chosen, gathered);
+    let mut reports = Vec::with_capacity(rows.len());
+    for (report, timings) in rows {
+        // stderr, so a timed run's stdout is still the report a script parses.
+        if let Some(timings) = timings
+            && knives::timing::enabled()
+        {
+            eprintln!("{}", timings.line(&report.repo));
+        }
         worst = worst.worst(status::exit_for(&report));
         reports.push(report);
     }
-    knives::cli::emit_reports(output, all, &reports, |reports| {
+    knives::cli::emit_reports(output, scope.all, &reports, |reports| {
         knives::cli::joined(reports, "\n\n", |report| {
             status::render::render(report, verbose)
         })
     })?;
     Ok(worst)
-}
-
-/// One repository's row in the status document.
-///
-/// A repository that cannot be gathered is still a row: its report carries the
-/// error as a problem, so one broken registry entry does not swallow every other
-/// repository's answer. An entry the scan did not place carries the scan's
-/// reasons instead.
-fn status_row(
-    chosen: &Selected<'_>,
-    gathered: anyhow::Result<(status::Report, status::Timings)>,
-) -> status::Report {
-    match (chosen, gathered) {
-        (_, Ok((report, timings))) => {
-            // stderr, so a timed run's stdout is still the report a script parses.
-            if knives::timing::enabled() {
-                eprintln!("{}", timings.line(chosen.name().as_str()));
-            }
-            report
-        }
-        (
-            Selected::Unplaced {
-                name,
-                entry,
-                problems,
-            },
-            Err(_),
-        ) => status::Report {
-            repo: name.to_string(),
-            trunk: entry.trunk().to_owned(),
-            problems: problems.clone(),
-            ..status::Report::default()
-        },
-        (Selected::Bound(fork), Err(error)) => status::Report {
-            repo: fork.name.to_string(),
-            trunk: fork.entry.trunk().to_owned(),
-            problems: vec![format!("could not gather: {error:#}")],
-            ..status::Report::default()
-        },
-    }
 }
 
 fn run_preflight(fork: &Fork<'_>) -> anyhow::Result<Exit> {
@@ -794,14 +903,18 @@ fn run_preflight(fork: &Fork<'_>) -> anyhow::Result<Exit> {
     Ok(preflight::exit_for(&report))
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the bound ground, the scope, the output format, the forge switch and who is acting are independent inputs"
+)]
 fn run_sync(
-    requested: Option<&str>,
-    all: bool,
+    ground: Ground<'_>,
+    scope: Scope<'_>,
     output: knives::cli::Output,
     use_forge: bool,
+    identity: &Identity,
 ) -> anyhow::Result<Exit> {
-    let registry = load(&default_config_path())?;
-    let chosen = match sync_targets(&registry, requested, all)? {
+    let chosen = match ground.sync_targets(scope)? {
         Ok(list) => list,
         Err(exit) => return Ok(exit),
     };
@@ -817,21 +930,18 @@ fn run_sync(
         // carrying the error as a problem; the repositories before it already
         // fetched and wrote their events, and their rows are not lost to it.
         let report = match chosen {
-            Selected::Bound(fork) => scribe_for(fork)
-                .and_then(|scribe| {
-                    sync::sync_repo(sync::SyncInput {
-                        fork,
-                        store: &mut store,
-                        forge,
-                        scribe: &scribe,
-                        cache: cache_root.as_deref(),
-                    })
-                })
-                .unwrap_or_else(|error| sync::Report {
-                    repo: fork.name.to_string(),
-                    problems: vec![format!("could not sync: {error:#}")],
-                    ..sync::Report::default()
-                }),
+            Selected::Bound(fork) => sync::sync_repo(sync::SyncInput {
+                fork,
+                store: &mut store,
+                forge,
+                scribe: &scribe_for(fork, identity),
+                cache: cache_root.as_deref(),
+            })
+            .unwrap_or_else(|error| sync::Report {
+                repo: fork.name.to_string(),
+                problems: vec![format!("could not sync: {error:#}")],
+                ..sync::Report::default()
+            }),
             Selected::Unplaced { name, problems, .. } => sync::Report {
                 repo: name.to_string(),
                 problems: problems.clone(),
@@ -841,28 +951,10 @@ fn run_sync(
         worst = worst.worst(sync::exit_for(&report));
         reports.push(report);
     }
-    knives::cli::emit_reports(output, all, &reports, |reports| {
+    knives::cli::emit_reports(output, scope.all, &reports, |reports| {
         knives::cli::joined(reports, "\n", sync::render)
     })?;
     Ok(worst)
-}
-
-/// `sync` fetches and writes, so it never sweeps by accident: a name, `--all`,
-/// or the fork the current directory is inside; anything else is `Usage`.
-fn sync_targets<'a>(
-    registry: &'a Registry,
-    requested: Option<&str>,
-    all: bool,
-) -> anyhow::Result<Result<Vec<Selected<'a>>, Exit>> {
-    if requested.is_some() || all {
-        return selected(registry, requested, all);
-    }
-    let cwd = std::env::current_dir()?;
-    if let Ok(fork) = knives::bind::here(registry, &cwd)? {
-        return Ok(Ok(vec![Selected::Bound(fork)]));
-    }
-    eprintln!("give a repo name, or --all");
-    Ok(Err(Exit::Usage))
 }
 
 #[cfg(test)]

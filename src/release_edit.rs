@@ -7,6 +7,7 @@
 
 use knives::bind::Fork;
 use knives::cli::Exit;
+use knives::commands::claim::Identity;
 use knives::commands::release;
 use knives::forge::github::CliForge;
 use knives::ids::{BranchName, CommitId, ReleaseScheme, RepoName};
@@ -83,11 +84,14 @@ impl ReleaseInHand {
     }
 }
 
-/// Everything an edit reads: whose release, which repository, which release.
+/// Everything an edit reads: whose release, which repository, which release,
+/// and who is editing.
 struct EditContext<'a> {
     repo: &'a RepoName,
     opened: &'a knives::jj::Repo,
     release: &'a ReleaseInHand,
+    /// Who is acting, resolved once by dispatch; the ledger event names them.
+    identity: &'a Identity,
     /// The release's last recorded parent set, from this repository's ledger.
     ///
     /// Ancestry and change ids cover a branch that grew or was rebased by jj. A
@@ -184,6 +188,7 @@ pub(crate) fn run_release_edit(
     fork: &Fork<'_>,
     extra_consumers: &[&std::path::Path],
     change: &ReleaseEdit,
+    identity: &Identity,
 ) -> anyhow::Result<Exit> {
     let mut locals = extra_consumers
         .iter()
@@ -194,7 +199,15 @@ pub(crate) fn run_release_edit(
     let forge = CliForge;
     let cache_root = knives::forge_cache::cache_root();
     let heads = knives::consumer_pins::ConsumerHeadMemo::default();
-    edit_release(fork, &locals, change, &forge, cache_root.as_deref(), &heads)
+    edit_release(
+        fork,
+        &locals,
+        change,
+        &forge,
+        cache_root.as_deref(),
+        &heads,
+        identity,
+    )
 }
 
 /// Edit the release in hand: one change, nothing else moves.
@@ -214,6 +227,7 @@ fn edit_release(
     forge: &dyn knives::consumer_pins::ConsumerPinSource,
     cache_root: Option<&std::path::Path>,
     heads: &knives::consumer_pins::ConsumerHeadMemo,
+    identity: &Identity,
 ) -> anyhow::Result<Exit> {
     let repo = &fork.name;
     let entry = fork.entry;
@@ -286,6 +300,7 @@ fn edit_release(
         repo,
         opened: &opened,
         release: &release,
+        identity,
         recorded: last_recorded_parents(&ledger, &release.name),
         stacked: StackedHistoryContext {
             repo: &opened,
@@ -338,6 +353,7 @@ fn apply_edit(
             created: &created,
             provenance: &provenance,
         },
+        context.identity,
     )?;
     println!(
         "{repo}: {} now has {} parent(s): {delta}",
@@ -367,13 +383,14 @@ pub(crate) fn record_edit_event(
     fork: &Fork<'_>,
     opened: &knives::jj::Repo,
     record: &EditRecord<'_>,
+    identity: &Identity,
 ) -> anyhow::Result<()> {
     let parents: Vec<knives::ids::CommitId> = record
         .provenance
         .iter()
         .map(|(_, commit)| commit.clone())
         .collect();
-    scribe_for(fork)?.record(&Draft {
+    scribe_for(fork, identity).record(&Draft {
         subject: Some(record.release),
         kind: Kind::Event,
         disposition: None,

@@ -38,12 +38,18 @@ fn event(name: &str, cwd: &Path, path: Option<&Path>) -> Value {
     event
 }
 
-fn run_hook_input(home: &Path, input: &str) -> (bool, String, String) {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_knives"))
-        .args(["hook", "claude-code"])
+fn hook_command(home: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_knives"));
+    command.args(["hook", "claude-code"]);
+    command
         .env("KNIVES_CONFIG_HOME", home)
         .env("HOME", home)
-        .env("JJ_CONFIG", "/dev/null")
+        .env("JJ_CONFIG", "/dev/null");
+    command
+}
+
+fn run_command_input(mut command: Command, input: &str) -> (bool, String, String) {
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -61,6 +67,10 @@ fn run_hook_input(home: &Path, input: &str) -> (bool, String, String) {
         String::from_utf8(output.stdout).expect("hook output is UTF-8"),
         String::from_utf8(output.stderr).expect("hook errors are UTF-8"),
     )
+}
+
+fn run_hook_input(home: &Path, input: &str) -> (bool, String, String) {
+    run_command_input(hook_command(home), input)
 }
 
 fn run_hook(home: &Path, event: &Value) -> String {
@@ -487,6 +497,58 @@ fn post_tool_use_in_a_managed_workspace_records_event_identity_and_cwd() {
             .is_some_and(|timestamp| timestamp.parse::<jiff::Timestamp>().is_ok()),
         "was: {seen}"
     );
+}
+
+#[test]
+fn a_hook_whose_own_working_directory_has_vanished_still_answers() {
+    // The hook process inherits the harness's cwd, which a finished workspace
+    // can take away under it. The hook never binds its own cwd — the event
+    // carries the one that matters — so it must answer as if nothing happened.
+    let repos = Repositories::new();
+    repos.configure(false);
+    // A shell started in a fresh directory removes it from under itself, then
+    // becomes knives with that vanished cwd.
+    let from_vanished_cwd = |event: &Value| {
+        let vanishing = tempfile::tempdir_in(repos.home.path()).expect("directory to vanish");
+        let mut command = Command::new("sh");
+        command
+            .args([
+                "-c",
+                r#"rmdir "$0" && exec "$1" hook claude-code"#,
+                vanishing.path().to_str().expect("utf-8 path"),
+                env!("CARGO_BIN_EXE_knives"),
+            ])
+            .current_dir(vanishing.path())
+            .env("KNIVES_CONFIG_HOME", repos.home.path())
+            .env("HOME", repos.home.path())
+            .env("JJ_CONFIG", "/dev/null");
+        let answer = run_command_input(command, &event.to_string());
+        assert!(
+            !vanishing.path().exists(),
+            "the fixture must have taken the cwd away"
+        );
+        // Already gone; keep `TempDir`'s drop from reporting it.
+        let _ = vanishing.keep();
+        answer
+    };
+
+    let (success, output, errors) = from_vanished_cwd(&event("post-tool-bash", &repos.alpha, None));
+    assert!(success, "a hook must never fail the session: {errors}");
+    assert!(output.is_empty(), "was: {output}");
+    assert!(errors.is_empty(), "was: {errors}");
+
+    let read = event(
+        "post-tool-read",
+        &repos.alpha,
+        Some(&repos.beta.join("file.txt")),
+    );
+    let (success, output, errors) = from_vanished_cwd(&read);
+    assert!(success, "a hook must never fail the session: {errors}");
+    assert!(
+        additional_context(&output).contains("beta"),
+        "the event's own cwd still drives the notice: {output}\n{errors}"
+    );
+    assert!(errors.is_empty(), "was: {errors}");
 }
 
 #[test]

@@ -1726,11 +1726,10 @@ impl Candidate {
         let previous_tree = previous.tree();
         let candidate_tree = self.commit.tree();
         let mut files = Vec::new();
-        for changed in
-            collect_stream(previous_tree.diff_stream(&candidate_tree, &EverythingMatcher))
+        for entry in collect_stream(previous_tree.diff_stream(&candidate_tree, &EverythingMatcher))
         {
-            changed.values.map_err(|error| store_error(&error))?;
-            files.push(changed.path.as_internal_file_string().to_owned());
+            entry.values.map_err(|error| store_error(&error))?;
+            files.push(entry.path.as_internal_file_string().to_owned());
         }
         Ok(files)
     }

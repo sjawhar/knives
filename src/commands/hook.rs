@@ -17,6 +17,7 @@ use crate::hook::guidance::{
 use crate::hook::opencode::{self, Event as OpenCodeEvent, EventKind as OpenCodeEventKind};
 use crate::hook::resolve::{Match, argument_paths, match_checkout};
 use crate::hook::state::SessionState;
+use crate::ids::RepoName;
 use crate::store::{Store, default_state_path};
 
 const CLAUDE_CODE: &str = "claude-code";
@@ -148,11 +149,14 @@ fn opencode_tool_after(event: &OpenCodeEvent, home: &Path) -> anyhow::Result<Str
     let Some(session_id) = event.session_id() else {
         return opencode::tool_response("").map_err(Into::into);
     };
-    let Some(matched) = relevant_tool_match(
-        event.tool(),
-        event.args(),
-        OPENCODE_RELEVANT_TOOLS,
-        Some((home, OPENCODE, session_id)),
+    let cache = Some((home, OPENCODE, session_id));
+    let Some((registry, matched)) = relevant_tool_match(
+        &ToolCall {
+            tool: event.tool(),
+            args: event.args(),
+            relevant: OPENCODE_RELEVANT_TOOLS,
+        },
+        cache,
     )?
     else {
         return opencode::tool_response("").map_err(Into::into);
@@ -161,6 +165,7 @@ fn opencode_tool_after(event: &OpenCodeEvent, home: &Path) -> anyhow::Result<Str
         && let Some(cwd) = event.cwd()
     {
         crate::seen::record_observation(
+            standing_in(cwd, &registry, cache)?.as_ref(),
             Path::new(cwd),
             &Identity {
                 owner: session_id.to_owned(),
@@ -234,17 +239,20 @@ fn opencode_shell_env(event: &OpenCodeEvent) -> anyhow::Result<String> {
     opencode::environment_response(event.session_id()).map_err(Into::into)
 }
 
-pub(crate) fn owner_for(cwd: &Path) -> anyhow::Result<Option<String>> {
+/// The owner a claim from inside `repo` would carry when no harness names one:
+/// the store's current agent, else the sole claimant of that repository.
+///
+/// `repo` is the entry the caller already bound the working directory to; a
+/// directory outside any managed fork, or whose remotes could not be read, is
+/// `None` and derives no owner.
+pub(crate) fn owner_for(repo: Option<&RepoName>) -> anyhow::Result<Option<String>> {
     if let Some(owner) = std::env::var("KNIVES_OWNER")
         .ok()
         .filter(|owner| !owner.trim().is_empty())
     {
         return Ok(Some(owner));
     }
-    let registry = load(&default_config_path())?;
-    // Not inside a managed fork, or a repository whose remotes cannot be read:
-    // no derived owner, never a failed command.
-    let Ok(Ok(fork)) = bind::here(&registry, cwd) else {
+    let Some(repo) = repo else {
         return Ok(None);
     };
     let store = Store::open(default_state_path())?;
@@ -254,7 +262,7 @@ pub(crate) fn owner_for(cwd: &Path) -> anyhow::Result<Option<String>> {
     let owners = store
         .claims(None)
         .into_iter()
-        .filter(|claim| claim.repo == fork.name.as_str())
+        .filter(|claim| claim.repo == repo.as_str())
         .map(|claim| claim.owner.clone())
         .collect::<BTreeSet<_>>();
     Ok((owners.len() == 1)
@@ -308,17 +316,18 @@ fn session_start(event: &Event, home: &Path) -> anyhow::Result<Option<String>> {
     else {
         return Ok(None);
     };
-    if !matched.is_managed() {
+    let Some(managed) = &matched.managed else {
         return Ok(None);
-    }
-    let repo = guidance_root(&matched);
+    };
     crate::seen::record_observation(
+        Some(managed),
         Path::new(cwd),
         &Identity {
             owner: session_id.to_owned(),
             kind: crate::store::OwnerKind::HarnessSession,
         },
     );
+    let repo = guidance_root(&matched);
     if compact {
         return Ok(None);
     }
@@ -339,11 +348,14 @@ fn post_tool_use(event: &Event, home: &Path) -> anyhow::Result<Option<String>> {
     let Some(session_id) = event.session_id() else {
         return Ok(None);
     };
-    let Some(matched) = relevant_tool_match(
-        event.tool_name(),
-        event.tool_input(),
-        RELEVANT_TOOLS,
-        Some((home, CLAUDE_CODE, session_id)),
+    let cache = Some((home, CLAUDE_CODE, session_id));
+    let Some((registry, matched)) = relevant_tool_match(
+        &ToolCall {
+            tool: event.tool_name(),
+            args: event.tool_input(),
+            relevant: RELEVANT_TOOLS,
+        },
+        cache,
     )?
     else {
         return Ok(None);
@@ -352,6 +364,7 @@ fn post_tool_use(event: &Event, home: &Path) -> anyhow::Result<Option<String>> {
         && let Some(cwd) = event.cwd()
     {
         crate::seen::record_observation(
+            standing_in(cwd, &registry, cache)?.as_ref(),
             Path::new(cwd),
             &Identity {
                 owner: session_id.to_owned(),
@@ -403,19 +416,28 @@ fn post_tool_use(event: &Event, home: &Path) -> anyhow::Result<Option<String>> {
         .map_err(Into::into)
 }
 
+/// The tool an event says was called, and which tools the harness treats as
+/// touching repository content.
+struct ToolCall<'a> {
+    tool: Option<&'a str>,
+    args: Option<&'a serde_json::Value>,
+    relevant: &'a [&'a str],
+}
+
+/// The touched-path match for a relevant tool call, with the registry it was
+/// decided against — loaded only once there is a path to decide, so a pathless
+/// call never touches (or fails on) the registry.
 fn relevant_tool_match(
-    tool: Option<&str>,
-    args: Option<&serde_json::Value>,
-    relevant_tools: &[&str],
+    call: &ToolCall<'_>,
     cache: Option<(&Path, &str, &str)>,
-) -> anyhow::Result<Option<Match>> {
-    let Some(tool) = tool else {
+) -> anyhow::Result<Option<(Registry, Match)>> {
+    let Some(tool) = call.tool else {
         return Ok(None);
     };
-    if !relevant_tools.contains(&tool) {
+    if !call.relevant.contains(&tool) {
         return Ok(None);
     }
-    let Some(args) = args else {
+    let Some(args) = call.args else {
         return Ok(None);
     };
     let paths = argument_paths(tool, args);
@@ -423,7 +445,20 @@ fn relevant_tool_match(
         return Ok(None);
     }
     let registry = load(&default_config_path())?;
-    match_with_trust(&paths, &registry, cache)
+    let matched = match_with_trust(&paths, &registry, cache)?;
+    Ok(matched.map(|matched| (registry, matched)))
+}
+
+/// The entry the event's working directory is inside, read through the same
+/// session cache as the touched path: what a sighting keys its workspace on.
+/// The touched path may be in another repository; the workspace is the cwd's.
+fn standing_in(
+    cwd: &str,
+    registry: &Registry,
+    cache: Option<(&Path, &str, &str)>,
+) -> anyhow::Result<Option<RepoName>> {
+    Ok(match_with_trust(&[PathBuf::from(cwd)], registry, cache)?
+        .and_then(|matched| matched.managed))
 }
 
 /// Resolve the touched paths, reading each checkout's remotes once per session.

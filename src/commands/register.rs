@@ -205,12 +205,7 @@ pub fn run(target: Option<PathBuf>) -> anyhow::Result<Exit> {
         Some(given) => given,
         None => std::env::current_dir()?,
     };
-    let outcome = outcome_for(&path, &registry)?;
-    if let Some(line) = refusal(&outcome) {
-        eprintln!("{line}");
-        return Ok(Exit::Usage);
-    }
-    match outcome {
+    match outcome_for(&path, &registry)? {
         Outcome::AlreadyRegistered { name } => {
             println!("already registered as {name}");
             Ok(Exit::Ok)
@@ -230,9 +225,14 @@ pub fn run(target: Option<PathBuf>) -> anyhow::Result<Exit> {
             );
             Ok(Exit::Ok)
         }
-        Outcome::NotARepository { .. }
+        refused @ (Outcome::NotARepository { .. }
         | Outcome::NotAJjCheckout { .. }
-        | Outcome::MissingRoles { .. } => Ok(Exit::Usage),
+        | Outcome::MissingRoles { .. }) => {
+            if let Some(line) = refusal(&refused) {
+                eprintln!("{line}");
+            }
+            Ok(Exit::Usage)
+        }
     }
 }
 

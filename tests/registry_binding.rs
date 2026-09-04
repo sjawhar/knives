@@ -395,6 +395,40 @@ fn scan_refuses_to_choose_between_two_checkouts_of_one_entry() {
 }
 
 #[test]
+fn scan_descends_from_a_home_that_is_itself_a_repository() {
+    // A home directory kept as a dotfiles checkout holds `.git` at its root;
+    // the forks under it are still the forks under it.
+    let lab = lab::Lab::new();
+    let home = lab.temp_path().join("home");
+    git_repository(
+        &home,
+        &[("origin", "https://forge.invalid/someone/dotfiles")],
+    );
+    let checkout = home.join("forks").join("tool").join("default");
+    jj_checkout(&checkout, &[("upstream", "https://forge.invalid/org/tool")]);
+    let registry = registry(&[(
+        "tool",
+        entry(
+            "https://forge.invalid/org/tool",
+            "https://forge.invalid/acme/tool",
+        ),
+    )]);
+
+    let scan = bind::scan(&registry, &home);
+
+    let found = scan
+        .found
+        .get(&RepoName::new("tool"))
+        .expect("tool is found");
+    assert_eq!(
+        found.checkout.path,
+        checkout.canonicalize().expect("checkout exists")
+    );
+    assert!(scan.duplicates.is_empty(), "{:?}", scan.duplicates);
+    assert!(scan.problems.is_empty(), "{:?}", scan.problems);
+}
+
+#[test]
 fn resolve_prefers_the_current_directory_then_the_scan_then_says_why_not() {
     let lab = lab::Lab::new();
     let home = lab.temp_path().join("home");
@@ -576,9 +610,15 @@ fn status_outside_any_checkout_sweeps_every_entry_through_the_scan() {
         &["--text", "status", "--no-landed", "--no-github"],
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stdout.contains("demo"), "{stdout}\n{stderr}");
+    // The scan placed the checkout: the row was gathered, not refused.
     assert!(
-        stdout.contains("demo"),
-        "{stdout}\n{}",
-        String::from_utf8_lossy(&output.stderr)
+        !stdout.contains("could not gather"),
+        "the sweep should bind the checkout, not report it missing:\n{stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.contains("origin remote is "),
+        "a gathered row carries the checkout's origin note:\n{stdout}\n{stderr}"
     );
 }

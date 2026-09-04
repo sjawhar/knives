@@ -130,6 +130,9 @@ pub enum Unresolved {
 }
 
 impl Unresolved {
+    /// `Unknown` renders `unknown repo <name>`, `Missing` renders
+    /// `no checkout of <name> under <home>`, and `Duplicate` renders
+    /// `<name> has <n> checkouts under <home>: <paths>; knives will not choose`.
     /// The caller appends `; known: a, b` to `Unknown` — the registry's names are
     /// its to list.
     pub fn message(&self, name: &RepoName) -> String {
@@ -154,10 +157,11 @@ impl Unresolved {
 
 /// Whether two remote spellings name one repository.
 ///
-/// A value that parses as a remote URL compares as (host without user, path
-/// without trailing `/` or `.git`), case-insensitively. A value that does not
-/// (a filesystem path) compares as its trimmed text, so two directories that
-/// differ by `.git` stay two directories.
+/// A value that parses as a remote URL with a host compares as (host without
+/// user, path without trailing `/` or `.git`), case-insensitively. A value that
+/// does not (a filesystem path, or a `file://` URL, whose authority is empty)
+/// compares as its trimmed text, so two directories that differ by `.git` stay
+/// two directories.
 pub fn same_remote(a: &str, b: &str) -> bool {
     remote_key(a) == remote_key(b)
 }
@@ -165,7 +169,7 @@ pub fn same_remote(a: &str, b: &str) -> bool {
 fn remote_key(remote: &str) -> String {
     let trimmed = remote.trim().trim_end_matches('/');
     match remote_authority_and_path(trimmed) {
-        Some((authority, path)) => {
+        Some((authority, path)) if !authority.is_empty() => {
             let host = authority.rsplit('@').next().unwrap_or(authority);
             let path = path.trim_matches('/');
             let path = path.strip_suffix(".git").unwrap_or(path);
@@ -175,7 +179,7 @@ fn remote_key(remote: &str) -> String {
                 path.to_ascii_lowercase()
             )
         }
-        None => trimmed.to_owned(),
+        _ => trimmed.to_owned(),
     }
 }
 
@@ -353,7 +357,9 @@ const SCAN_DEPTH: usize = 3;
 /// Scan `home` to depth three for jj checkouts and bind each to its entry.
 ///
 /// Directories named with a leading `.` are skipped, symlinks are not followed,
-/// and nothing below a `.jj` or `.git` is visited. A `.jj/repo` directory is a
+/// and nothing below a `.jj` or `.git` is visited — except `home` itself, whose
+/// children are always visited: a home that is a repository (a dotfiles
+/// checkout, say) still holds the forks under it. A `.jj/repo` directory is a
 /// checkout; a `.jj/repo` file is a workspace, found through its checkout; a
 /// git-only clone is not a fork checkout.
 pub fn scan<'a>(registry: &'a Registry, home: &Path) -> Scan<'a> {
@@ -363,29 +369,28 @@ pub fn scan<'a>(registry: &'a Registry, home: &Path) -> Scan<'a> {
     let mut pending = vec![(home.to_owned(), 0usize)];
     while let Some((directory, depth)) = pending.pop() {
         let jj = directory.join(".jj");
-        if jj.is_dir() {
-            if jj.join("repo").is_dir() {
-                match remotes(&directory) {
-                    Ok(remotes) => {
-                        if let Some(upstream) = remotes.get("upstream")
-                            && let Some((name, entry)) = entry_for(registry, upstream)
-                        {
-                            let path = directory
-                                .canonicalize()
-                                .unwrap_or_else(|_| directory.clone());
-                            candidates
-                                .entry(name)
-                                .or_insert((entry, Vec::new()))
-                                .1
-                                .push(Checkout { path, remotes });
-                        }
+        let is_jj = jj.is_dir();
+        if is_jj && jj.join("repo").is_dir() {
+            match remotes(&directory) {
+                Ok(remotes) => {
+                    if let Some(upstream) = remotes.get("upstream")
+                        && let Some((name, entry)) = entry_for(registry, upstream)
+                    {
+                        let path = directory
+                            .canonicalize()
+                            .unwrap_or_else(|_| directory.clone());
+                        candidates
+                            .entry(name)
+                            .or_insert((entry, Vec::new()))
+                            .1
+                            .push(Checkout { path, remotes });
                     }
-                    Err(error) => scan.problems.push(error.to_string()),
                 }
+                Err(error) => scan.problems.push(error.to_string()),
             }
-            continue;
         }
-        if directory.join(".git").exists() || depth == SCAN_DEPTH {
+        let is_repository = is_jj || directory.join(".git").exists();
+        if (is_repository && depth > 0) || depth == SCAN_DEPTH {
             continue;
         }
         let Ok(children) = std::fs::read_dir(&directory) else {
@@ -516,8 +521,11 @@ mod tests {
     fn a_filesystem_path_compares_as_its_trimmed_text() {
         assert!(same_remote("/tmp/lab/upstream", " /tmp/lab/upstream/ "));
         assert!(!same_remote("/tmp/lab/upstream", "/tmp/lab/other"));
-        // Two directories that differ by `.git` are two directories.
+        // Two directories that differ by `.git` are two directories, spelled
+        // as paths or as `file://` URLs.
         assert!(!same_remote("/tmp/lab/origin.git", "/tmp/lab/origin"));
+        assert!(!same_remote("file:///tmp/x.git", "file:///tmp/x"));
+        assert!(same_remote("file:///tmp/x.git", "file:///tmp/x.git/"));
     }
 
     #[test]

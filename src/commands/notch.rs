@@ -8,6 +8,7 @@
 
 use crate::bind::Fork;
 use crate::cli::Exit;
+use crate::commands::claim::{Resolved, required};
 use crate::ids::{BranchName, BranchTarget, RepoName, short_id};
 use crate::ledger::{
     Draft, Entry, EntryClass, Filter, Kind, Ledger, LedgerError, Scribe, VerifyFlag,
@@ -55,6 +56,8 @@ pub enum Report {
 #[derive(Debug)]
 pub struct Request<'a> {
     pub fork: &'a Fork<'a>,
+    /// Who is writing, as dispatch resolved it; read only for a write.
+    pub identity: Resolved<'a>,
     pub subject: Option<&'a str>,
     /// Present for a write, absent for a read.
     pub message: Option<&'a str>,
@@ -322,8 +325,8 @@ pub fn run(request: &Request<'_>, output: crate::cli::Output) -> anyhow::Result<
                             ))
                         })
                 });
-            let identity = crate::commands::claim::current_identity(&std::env::current_dir()?)?;
-            let scribe = Scribe::new(ledger, repo.clone(), path.clone(), identity.owner);
+            let identity = required(request.identity)?;
+            let scribe = Scribe::new(ledger, repo.clone(), path.clone(), identity.owner.clone());
             let written = scribe.record(&Draft {
                 subject: request.subject,
                 kind: Kind::Note,
@@ -510,8 +513,13 @@ mod tests {
             workspaces: None,
         };
         let fork = crate::bind::Fork::at("demo", &entry, directory.path());
+        let identity = crate::commands::claim::Identity {
+            owner: "reader".to_owned(),
+            kind: crate::store::OwnerKind::OsUser,
+        };
         let request = Request {
             fork: &fork,
+            identity: Ok(&identity),
             subject: Some("feat/alpha"),
             message: None,
             evidence: &[],

@@ -10,8 +10,7 @@ use std::path::Path;
 use knives::bind::Fork;
 use knives::cli::Exit;
 use knives::commands::claim::{
-    ClaimContext, ClaimDecision, current_identity, decide, last_seen_provenance,
-    render_claim_context,
+    ClaimContext, ClaimDecision, Identity, decide, last_seen_provenance, render_claim_context,
 };
 use knives::commands::start::{collides_with_checkout, possesses, workspace_path};
 use knives::config::Registry;
@@ -71,6 +70,7 @@ pub(crate) fn run_finish(
     fork: &Fork<'_>,
     branch: &BranchName,
     options: &FinishOptions<'_>,
+    identity: &Identity,
 ) -> anyhow::Result<Exit> {
     let target = &BranchTarget::new(fork.name.clone(), branch.clone());
     let checkout_path = &fork.checkout.path;
@@ -83,7 +83,7 @@ pub(crate) fn run_finish(
     let mut store = Store::open_for_update(default_state_path())?;
     let workspace = knives::commands::wip::workspace_for(branch.as_str());
     let directory = workspace_path(fork, branch);
-    let forced_release = match finish_claim_gate(fork, target, &store, options)? {
+    let forced_release = match finish_claim_gate(fork, target, &store, options, identity)? {
         FinishClaimGate::Continue(event) => event,
         FinishClaimGate::Refuse => return Ok(Exit::Usage),
     };
@@ -102,7 +102,7 @@ pub(crate) fn run_finish(
         })
         .or_else(|| release_event(had, options.superseded_by));
     if let Some(text) = provenance {
-        scribe_for(fork)?.event(Some(branch.as_str()), text, pr)?;
+        scribe_for(fork, identity).event(Some(branch.as_str()), text, pr)?;
     }
     store.save()?;
 
@@ -197,11 +197,16 @@ fn release_registration(checkout: &Path, workspace: &str) -> Registration {
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the fork, the branch, the store, the finish options and who is acting are independent inputs"
+)]
 fn finish_claim_gate(
     fork: &Fork<'_>,
     target: &BranchTarget,
     store: &Store,
     options: &FinishOptions<'_>,
+    identity: &Identity,
 ) -> anyhow::Result<FinishClaimGate> {
     let Some(claim) = store
         .claims(Some(&target.repo))
@@ -213,10 +218,9 @@ fn finish_claim_gate(
     };
     let workspace = knives::commands::wip::workspace_for(target.branch.as_str());
     let cwd = std::env::current_dir()?;
-    let identity = current_identity(&cwd)?;
     let decision = decide(&ClaimContext {
         held: Some(&claim),
-        identity: &identity,
+        identity,
         in_claimed_workspace: possesses(&cwd, fork, &target.branch),
     });
     match decision {
@@ -253,7 +257,7 @@ fn finish_claim_gate(
 /// State or forget which pull request a branch belongs to.
 #[allow(
     clippy::too_many_arguments,
-    reason = "the fork, the branch, and the three ways to state its pull request are independent inputs"
+    reason = "the fork, the branch, the three ways to state its pull request and who is acting are independent inputs"
 )]
 pub(crate) fn run_track(
     fork: &Fork<'_>,
@@ -261,6 +265,7 @@ pub(crate) fn run_track(
     pr: Option<u64>,
     fork_only: bool,
     forget: bool,
+    identity: &Identity,
 ) -> anyhow::Result<Exit> {
     let target = &BranchTarget::new(fork.name.clone(), branch.clone());
     let mut store = Store::open_for_update(default_state_path())?;
@@ -297,7 +302,7 @@ pub(crate) fn run_track(
         (format!("stated as #{number}"), Some(number))
     };
     store.save()?;
-    scribe_for(fork)?.event(Some(branch.as_str()), text.clone(), stamped)?;
+    scribe_for(fork, identity).event(Some(branch.as_str()), text.clone(), stamped)?;
     println!("{target} {}", spoken(&text));
     Ok(Exit::Ok)
 }
@@ -320,11 +325,16 @@ fn spoken(text: &str) -> String {
 /// Requirements are validated against the registry, because a dependency on a repo
 /// knives does not manage is a typo, and a typo that records silently is worse than
 /// no dependency at all: it reads as satisfied forever.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the registry the requirements are checked against, the fork, the branch, the requirements and who is acting are independent inputs"
+)]
 pub(crate) fn run_depends(
     registry: &Registry,
     fork: &Fork<'_>,
     branch: &BranchName,
     on: &[String],
+    identity: &Identity,
 ) -> anyhow::Result<Exit> {
     let target = &BranchTarget::new(fork.name.clone(), branch.clone());
     let mut requirements = Vec::new();
@@ -349,7 +359,7 @@ pub(crate) fn run_depends(
     let pr = store.tracked_pull(target);
     store.save()?;
     let listed: Vec<String> = requirements.iter().map(ToString::to_string).collect();
-    scribe_for(fork)?.event(
+    scribe_for(fork, identity).event(
         Some(branch.as_str()),
         format!("requires {}", listed.join(", ")),
         pr,

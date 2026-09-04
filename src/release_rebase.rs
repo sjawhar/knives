@@ -7,6 +7,7 @@
 
 use knives::bind::Fork;
 use knives::cli::Exit;
+use knives::commands::claim::Identity;
 use knives::commands::release;
 use knives::forge::PullRequest;
 use knives::forge::github::CliForge;
@@ -37,6 +38,7 @@ pub(crate) fn run_rebase(
     no_drop: bool,
     extra_consumers: &[&std::path::Path],
     cache_root: Option<&std::path::Path>,
+    identity: &Identity,
 ) -> anyhow::Result<Exit> {
     let repo = &fork.name;
     let entry = fork.entry;
@@ -88,6 +90,7 @@ pub(crate) fn run_rebase(
         release_commit: &release_commit,
         destination: &destination,
         no_drop,
+        identity,
     })? {
         return Ok(exit);
     }
@@ -133,11 +136,12 @@ pub(crate) fn run_rebase(
             onto: &onto,
             shed,
         },
+        identity,
     )?;
     if no_drop {
         return Ok(Exit::Ok);
     }
-    drop_landed_members(fork, &release_name, &destination)
+    drop_landed_members(fork, &release_name, &destination, identity)
 }
 
 fn frozen_rebase_exit(
@@ -281,6 +285,7 @@ struct ExistingRebaseInput<'a> {
     release_commit: &'a knives::ids::CommitId,
     destination: &'a RebaseDestination,
     no_drop: bool,
+    identity: &'a Identity,
 }
 
 fn existing_rebase_exit(input: ExistingRebaseInput<'_>) -> anyhow::Result<Option<Exit>> {
@@ -291,6 +296,7 @@ fn existing_rebase_exit(input: ExistingRebaseInput<'_>) -> anyhow::Result<Option
         release_commit,
         destination,
         no_drop,
+        identity,
     } = input;
     if !opened.is_ancestor(&destination.onto, release_commit)? {
         return Ok(None);
@@ -302,7 +308,7 @@ fn existing_rebase_exit(input: ExistingRebaseInput<'_>) -> anyhow::Result<Option
     let exit = if no_drop {
         Exit::Ok
     } else {
-        drop_landed_members(fork, release_name, destination)?
+        drop_landed_members(fork, release_name, destination, identity)?
     };
     Ok(Some(exit))
 }
@@ -531,6 +537,7 @@ fn drop_landed_members(
     fork: &Fork<'_>,
     release_name: &str,
     destination: &RebaseDestination,
+    identity: &Identity,
 ) -> anyhow::Result<Exit> {
     if destination.landed.is_empty() {
         return Ok(Exit::Ok);
@@ -595,6 +602,7 @@ fn drop_landed_members(
             created: &created,
             provenance: &provenance,
         },
+        identity,
     )?;
     println!(
         "{repo}: {release_name} now has {} parent(s): {delta}",
@@ -617,7 +625,11 @@ struct RebasedRelease<'a> {
 
 /// Re-describe the rebased release so the recorded provenance names the
 /// rewritten parents, and report what moved.
-fn report_rebased_release(fork: &Fork<'_>, rebased: &RebasedRelease<'_>) -> anyhow::Result<()> {
+fn report_rebased_release(
+    fork: &Fork<'_>,
+    rebased: &RebasedRelease<'_>,
+    identity: &Identity,
+) -> anyhow::Result<()> {
     let repo = &fork.name;
     let entry = fork.entry;
     let path = &fork.checkout.path;
@@ -647,6 +659,7 @@ fn report_rebased_release(fork: &Fork<'_>, rebased: &RebasedRelease<'_>) -> anyh
             created: &described,
             provenance: &provenance,
         },
+        identity,
     )?;
     let stale_bases = if rebased.shed > 0 {
         format!(", {} stale base parent(s) shed", rebased.shed)

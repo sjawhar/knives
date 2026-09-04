@@ -22,8 +22,8 @@ use knives::detect::landed::RebaseOutcome;
 use knives::ids::ReleaseScheme;
 use knives::jj::Repo;
 use lab::{
-    Lab, commit_at, knives_release, newest_operation_description, operation_ids, release_parents,
-    release_test_home,
+    Lab, ReleaseOutput, commit_at, knives_release, newest_operation_description, operation_ids,
+    release_command, release_parents, release_test_home,
 };
 
 #[test]
@@ -77,6 +77,54 @@ fn release_plan_exits_with_findings_when_the_current_release_lags_the_upstream_t
         "trunk lag not rendered: {text}"
     );
     assert_eq!(output.status.code(), Some(1), "stdout: {text}");
+}
+
+#[test]
+fn a_release_plan_reads_nothing_about_who_is_asking() {
+    // Given: a state file nobody can read. Resolving who is acting reads it (a
+    // terminal user inside a fork is named by the fork's claims); a plan writes
+    // nothing, so it must never ask.
+    let lab = lab::Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let (home, _consumer) = release_test_home(&lab);
+    std::fs::write(home.path().join("state.json"), "{not json").expect("corrupt state");
+
+    // When: the plan is asked for by an anonymous terminal user.
+    let output = release_command(&lab, &home, ReleaseOutput::Text, &[])
+        .env_remove("KNIVES_OWNER")
+        .env_remove("CLAUDE_CODE_SESSION_ID")
+        .output()
+        .expect("run knives release");
+    let text = String::from_utf8_lossy(&output.stdout);
+    let errors = String::from_utf8_lossy(&output.stderr);
+
+    // Then: the plan renders (a first cut has nothing to repair yet); the
+    // unreadable state is nobody's problem here.
+    assert!(
+        text.contains("the first cut has nothing to repair"),
+        "stdout: {text}\nstderr: {errors}"
+    );
+    assert!(!errors.contains("state.json"), "stderr: {errors}");
+    assert_ne!(
+        output.status.code(),
+        Some(3),
+        "stdout: {text}\nstderr: {errors}"
+    );
+
+    // And: a cut, which writes the ledger in the asker's name, is stopped by it.
+    let cut = release_command(
+        &lab,
+        &home,
+        ReleaseOutput::Text,
+        &["cut", "release/2026-08-05"],
+    )
+    .env_remove("KNIVES_OWNER")
+    .env_remove("CLAUDE_CODE_SESSION_ID")
+    .output()
+    .expect("run knives release cut");
+    let errors = String::from_utf8_lossy(&cut.stderr);
+    assert_eq!(cut.status.code(), Some(3), "stderr: {errors}");
+    assert!(errors.contains("state.json"), "stderr: {errors}");
 }
 
 #[test]

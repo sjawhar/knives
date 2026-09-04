@@ -431,6 +431,55 @@ fn a_read_of_a_repo_with_no_ledger_yet_is_success_and_says_so() {
 }
 
 #[test]
+fn a_read_never_asks_who_is_reading_and_a_write_is_stopped_by_an_unreadable_state() {
+    // Resolving who is acting reads state.json (a terminal user inside a fork
+    // is named by the fork's claims). A read writes nothing in anyone's name,
+    // so an unreadable state file is not its problem; a write is stopped by it.
+    let checkout = checkout();
+    let home = home();
+    std::fs::write(home.path().join("state.json"), "{not json").expect("corrupt state");
+    let anonymous = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_knives"))
+            .args(args)
+            .current_dir(checkout.path().join("a-repo"))
+            .env("KNIVES_CONFIG_HOME", home.path())
+            .env("HOME", checkout.path())
+            .env("JJ_CONFIG", "/dev/null")
+            .env_remove("KNIVES_OWNER")
+            .env_remove("CLAUDE_CODE_SESSION_ID")
+            .output()
+            .expect("run knives")
+    };
+
+    for read in [
+        &["--text", "notch"][..],
+        &["--text", "notch", "--verify"],
+        &["--text", "notch", "--events"],
+    ] {
+        let output = anonymous(read);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{read:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !String::from_utf8_lossy(&output.stderr).contains("state.json"),
+            "{read:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let write = anonymous(&["--text", "notch", "feat/alpha", "-m", "a note"]);
+    assert_eq!(write.status.code(), Some(3));
+    assert!(
+        String::from_utf8_lossy(&write.stderr).contains("state.json"),
+        "was: {}",
+        String::from_utf8_lossy(&write.stderr)
+    );
+}
+
+#[test]
 fn an_empty_subject_is_usage_and_does_not_write_a_nameless_entry() {
     let checkout = checkout();
     let home = home();

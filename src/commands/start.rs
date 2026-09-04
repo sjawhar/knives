@@ -7,8 +7,7 @@ use std::path::{Path, PathBuf};
 use crate::bind::Fork;
 use crate::cli::Exit;
 use crate::commands::claim::{
-    ClaimContext, ClaimDecision, current_identity, decide, last_seen_provenance,
-    render_claim_context,
+    ClaimContext, ClaimDecision, Identity, decide, last_seen_provenance, render_claim_context,
 };
 use crate::commands::release::shared_base;
 use crate::commands::wip::workspace_for;
@@ -101,19 +100,32 @@ struct StartContext<'a> {
     store: &'a mut Store,
     fork: &'a Fork<'a>,
     branch: &'a BranchName,
-    identity: crate::commands::claim::Identity,
+    identity: &'a Identity,
     upstream_trunk: String,
     destination: PathBuf,
     workspace: WorkspaceName,
     opened: Repo,
 }
 
-pub fn run(
-    fork: &Fork<'_>,
-    branch: &BranchName,
-    why: Option<&str>,
-    force: bool,
-) -> anyhow::Result<Exit> {
+/// Inputs for one `knives start`.
+#[derive(Debug)]
+pub struct Request<'a> {
+    pub fork: &'a Fork<'a>,
+    pub branch: &'a BranchName,
+    /// Who is starting: resolved once by dispatch from where they stand.
+    pub identity: &'a Identity,
+    pub why: Option<&'a str>,
+    pub force: bool,
+}
+
+pub fn run(request: &Request<'_>) -> anyhow::Result<Exit> {
+    let Request {
+        fork,
+        branch,
+        identity,
+        why,
+        force,
+    } = *request;
     let repo_name = &fork.name;
     let entry = fork.entry;
     let checkout = &fork.checkout.path;
@@ -129,7 +141,7 @@ pub fn run(
         store: &mut store,
         fork,
         branch,
-        identity: current_identity(&cwd)?,
+        identity,
         upstream_trunk: entry.upstream_trunk(),
         workspace: WorkspaceName::new(workspace_for(branch.as_str())),
         opened: Repo::open(checkout)?,
@@ -176,7 +188,7 @@ pub fn run(
         .map(|claim| seen::last_seen(claim, &activity, &observations));
     let decision = decide(&ClaimContext {
         held: held.as_ref(),
-        identity: &context.identity,
+        identity: context.identity,
         in_claimed_workspace,
     });
 
@@ -361,7 +373,7 @@ fn take_claim(context: &mut StartContext<'_>, reason: &str) -> anyhow::Result<Ex
 fn record_claim(context: &mut StartContext<'_>, reason: &str, event: String) -> anyhow::Result<()> {
     let target = BranchTarget::new(context.fork.name.clone(), context.branch.clone());
     let pull = context.store.tracked_pull(&target);
-    let _ = context.store.claim(&target, &context.identity, reason);
+    let _ = context.store.claim(&target, context.identity, reason);
     Scribe::new(
         Ledger::for_repo(&context.fork.name),
         context.fork.name.clone(),

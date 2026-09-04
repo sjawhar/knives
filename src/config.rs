@@ -1016,9 +1016,11 @@ release = "https://example.invalid/releases.git"
 
     #[test]
     fn a_tilde_path_resolves_the_same_way_the_plugin_resolves_it() {
-        // The two sides disagreeing meant `path = "~/repos/x"` was a working
-        // allowlist entry and a broken CLI entry, so the trust set and the tool
-        // covered different directories.
+        // `workspaces` and `[trust] roots` go through this expansion, and the
+        // plugin's tool-argument matcher expands `~` the same way. The two sides
+        // disagreeing once meant a `~/...` entry was a working allowlist entry
+        // and a broken CLI entry, so the trust set and the tool covered
+        // different directories.
         let _lock = environment_lock();
         let environment = EnvironmentGuard::capture(&["HOME"]);
         environment.set("HOME", "/home/someone");
