@@ -7,8 +7,8 @@ use crate::config::{Registry, TrustRules};
 fn registry_trusting(owner: &str) -> Registry {
     Registry {
         trust: TrustRules {
-            roots: Vec::new(),
             owners: vec![owner.to_owned()],
+            ..TrustRules::default()
         },
         ..Registry::default()
     }

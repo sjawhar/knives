@@ -271,7 +271,7 @@ mod tests {
         Guidance, InstructionFile, claim_lines, format_guidance, format_notice, guidance_for,
         notice_digest,
     };
-    use crate::config::{GuidanceRoot, GuidanceRootKind};
+    use crate::config::GuidanceRoot;
     use crate::seen::Seen;
     use crate::store::{Claim, OwnerKind};
 
@@ -288,7 +288,6 @@ mod tests {
             GuidanceRoot {
                 name: "r".into(),
                 root: canonical,
-                kind: GuidanceRootKind::Managed,
             },
         )
     }

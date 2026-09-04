@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -23,14 +23,14 @@ struct DiskState {
     #[serde(default)]
     seen_notices: HashMap<PathBuf, BTreeSet<String>>,
     #[serde(default)]
-    owner_remotes: HashMap<PathBuf, Vec<String>>,
+    remotes: HashMap<PathBuf, BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Default)]
 pub struct SessionState {
     repos: HashMap<PathBuf, RepoFlags>,
     seen_notices: HashMap<PathBuf, BTreeSet<String>>,
-    owner_remotes: HashMap<PathBuf, Vec<String>>,
+    remotes: HashMap<PathBuf, BTreeMap<String, String>>,
 }
 
 impl SessionState {
@@ -43,12 +43,12 @@ impl SessionState {
         self.repos.get(root).copied().unwrap_or_default()
     }
 
-    /// Returns the raw remote owners previously resolved for this checkout.
+    /// The remotes previously read for a checkout in this session.
     ///
-    /// These facts, rather than a trust verdict, are cached because a cached verdict
+    /// These facts, rather than a verdict, are cached because a cached verdict
     /// outlived the registry edit that should have revoked it.
-    pub fn owner_remotes(&self, root: &Path) -> Option<&[String]> {
-        self.owner_remotes.get(root).map(Vec::as_slice)
+    pub fn remotes(&self, root: &Path) -> Option<&BTreeMap<String, String>> {
+        self.remotes.get(root)
     }
 
     pub fn update(
@@ -84,18 +84,19 @@ impl SessionState {
             .is_some_and(|notices| notices.contains(digest))
     }
 
-    /// Caches resolved remote owners so registry changes can be re-evaluated without Git.
+    /// Caches a checkout's remotes so registry changes can be re-evaluated
+    /// without jj or git.
     ///
-    /// Retaining the facts prevents a cached verdict from outliving the registry edit
-    /// that should have revoked it.
-    pub fn record_owner_remotes(&mut self, root: &Path, owners: Vec<String>) {
-        self.owner_remotes.insert(root.to_owned(), owners);
+    /// Retaining the facts prevents a cached verdict from outliving the registry
+    /// edit that should have revoked it.
+    pub fn record_remotes(&mut self, root: &Path, remotes: BTreeMap<String, String>) {
+        self.remotes.insert(root.to_owned(), remotes);
     }
 
     pub fn clear(&mut self) {
         self.repos.clear();
         self.seen_notices.clear();
-        self.owner_remotes.clear();
+        self.remotes.clear();
     }
 
     pub fn delete(home: &Path, harness: &str, session_id: &str) {
@@ -110,7 +111,7 @@ impl SessionState {
             .map_or_else(Self::default, |disk| Self {
                 repos: disk.repos,
                 seen_notices: disk.seen_notices,
-                owner_remotes: disk.owner_remotes,
+                remotes: disk.remotes,
             })
     }
 
@@ -122,7 +123,7 @@ impl SessionState {
             &DiskState {
                 repos: self.repos.clone(),
                 seen_notices: self.seen_notices.clone(),
-                owner_remotes: self.owner_remotes.clone(),
+                remotes: self.remotes.clone(),
             },
         )?;
         temporary.write_all(b"\n")?;
@@ -172,6 +173,7 @@ fn prune_stale_siblings(directory: &Path) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::path::Path;
 
     use super::SessionState;
@@ -264,12 +266,16 @@ mod tests {
     }
 
     #[test]
-    fn owner_remotes_survive_updates_and_clear() {
-        // Given: remote owners recorded for an otherwise untracked repository root.
+    fn remotes_survive_updates_and_clear() {
+        // Given: remotes recorded for an otherwise untracked checkout.
         let home = tempfile::tempdir().unwrap();
         let root = Path::new("/some/repo");
+        let remotes = BTreeMap::from([(
+            "origin".to_owned(),
+            "https://forge.invalid/trusted-owner/repo".to_owned(),
+        )]);
         SessionState::update(home.path(), "claude-code", "s1", |state| {
-            state.record_owner_remotes(root, vec!["trusted-owner".to_owned()]);
+            state.record_remotes(root, remotes.clone());
         })
         .unwrap();
 
@@ -277,11 +283,10 @@ mod tests {
         let reloaded = SessionState::load(home.path(), "claude-code", "s1");
         SessionState::update(home.path(), "claude-code", "s1", SessionState::clear).unwrap();
 
-        // Then: the raw owners round-trip before clear and are absent afterwards.
-        let expected = vec!["trusted-owner".to_owned()];
-        assert_eq!(reloaded.owner_remotes(root), Some(expected.as_slice()));
+        // Then: the raw remotes round-trip before clear and are absent afterwards.
+        assert_eq!(reloaded.remotes(root), Some(&remotes));
         assert_eq!(
-            SessionState::load(home.path(), "claude-code", "s1").owner_remotes(root),
+            SessionState::load(home.path(), "claude-code", "s1").remotes(root),
             None
         );
     }

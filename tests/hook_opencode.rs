@@ -94,9 +94,39 @@ fn claim(branch: &str) -> Value {
     })
 }
 
+/// A git-only repository with the given remotes.
+fn git_repository(root: &Path, remotes: &[(&str, &str)]) {
+    std::fs::create_dir_all(root).expect("create repository");
+    assert!(
+        Command::new("git")
+            .args(["-C", root.to_str().expect("utf-8"), "init", "--quiet"])
+            .status()
+            .expect("git init")
+            .success()
+    );
+    for (name, url) in remotes {
+        assert!(
+            Command::new("git")
+                .args([
+                    "-C",
+                    root.to_str().expect("utf-8"),
+                    "remote",
+                    "add",
+                    name,
+                    url
+                ])
+                .status()
+                .expect("git remote add")
+                .success()
+        );
+    }
+}
+
 struct Repositories {
     home: tempfile::TempDir,
+    /// Managed AND trusted: `origin` sits under a trusted owner.
     beta: PathBuf,
+    /// Trusted only, through `[trust] repos`.
     trusted: PathBuf,
 }
 
@@ -105,19 +135,31 @@ impl Repositories {
         let home = tempfile::tempdir().expect("config home");
         let beta = home.path().join("beta");
         let trusted = home.path().join("trusted");
+        git_repository(
+            &beta,
+            &[
+                ("upstream", "https://forge.invalid/maintainer/beta"),
+                ("origin", "https://forge.invalid/ours/beta"),
+            ],
+        );
+        git_repository(
+            &trusted,
+            &[("origin", "https://forge.invalid/company/trusted.git")],
+        );
         for (root, instructions) in [
             (&beta, "beta instructions"),
             (&trusted, "trusted instructions"),
         ] {
-            std::fs::create_dir_all(root).expect("create repository");
             std::fs::write(root.join("AGENTS.md"), instructions).expect("write instructions");
             std::fs::write(root.join("file.txt"), "content").expect("write file");
         }
+        // `path` is still a required field until Task 3 deletes it; the hook
+        // code never reads it.
         let config = format!(
-            "[repos.beta]\npath = \"{}\"\nupstream = \"u\"\norigin = \"o\"\n\n\
-             [trusted.trusted]\npath = \"{}\"\n",
+            "[repos.beta]\npath = \"{}\"\nupstream = \"https://forge.invalid/maintainer/beta\"\n\
+             origin = \"https://forge.invalid/ours/beta\"\n\n\
+             [trust]\nowners = [\"ours\"]\nrepos = [\"company/trusted\"]\n",
             beta.display(),
-            trusted.display()
         );
         std::fs::write(home.path().join("repos.toml"), config).expect("write registry");
         let state = json!({"claims": {"beta/feat/claimed": {
@@ -130,6 +172,20 @@ impl Repositories {
             beta,
             trusted,
         }
+    }
+
+    /// Turn a git-only fixture into a colocated jj checkout, so `seen` can key
+    /// on its `.jj` and jj can still read its remotes.
+    fn colocate(root: &Path) {
+        let status = Command::new("jj")
+            .args(["git", "init", "--colocate"])
+            .current_dir(root)
+            .env("JJ_CONFIG", "/dev/null")
+            .env("JJ_USER", "Knives Lab")
+            .env("JJ_EMAIL", "knives-lab@example.test")
+            .status()
+            .expect("run jj");
+        assert!(status.success(), "jj git init --colocate failed");
     }
 
     fn write_state(&self, state: &Value) {
@@ -268,7 +324,7 @@ fn the_notice_tag_carries_a_stable_digest_and_a_fresh_nonce() {
 #[test]
 fn tool_after_in_a_managed_workspace_records_event_identity_and_cwd() {
     let repos = Repositories::new();
-    std::fs::create_dir_all(repos.beta.join(".jj")).expect("create workspace marker");
+    Repositories::colocate(&repos.beta);
     let mut event = tool(&repos.beta.join("file.txt"), None);
     event["cwd"] = json!(repos.beta);
 

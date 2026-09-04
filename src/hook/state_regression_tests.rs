@@ -63,7 +63,7 @@ fn a_document_predating_notice_digests_survives_update_and_reload() -> anyhow::R
     // independent remote cache remains absent.
     assert!(state.repo(Path::new("/r")).guided);
     assert!(!state.notice_seen(Path::new("/r"), "digest"));
-    assert!(state.owner_remotes(Path::new("/r")).is_none());
+    assert!(state.remotes(Path::new("/r")).is_none());
     Ok(())
 }
 

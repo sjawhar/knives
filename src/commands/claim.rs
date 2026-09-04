@@ -270,8 +270,14 @@ mod tests {
     #[test]
     fn the_user_fallback_is_anonymous() {
         let _lock = environment_lock();
-        let environment =
-            EnvironmentGuard::capture(&["KNIVES_OWNER", "CLAUDE_CODE_SESSION_ID", "USER"]);
+        let environment = EnvironmentGuard::capture(&[
+            "KNIVES_CONFIG_HOME",
+            "KNIVES_OWNER",
+            "CLAUDE_CODE_SESSION_ID",
+            "USER",
+        ]);
+        let config = tempfile::tempdir().unwrap();
+        environment.set("KNIVES_CONFIG_HOME", config.path().to_str().unwrap());
         environment.remove("KNIVES_OWNER");
         environment.remove("CLAUDE_CODE_SESSION_ID");
         environment.set("USER", "terminal-user");
@@ -279,6 +285,24 @@ mod tests {
 
         assert_eq!(identity.owner, "terminal-user");
         assert_eq!(identity.kind, crate::store::OwnerKind::OsUser);
+    }
+
+    /// A git repository whose `upstream` is the registry's, the shape a fork
+    /// checkout has.
+    fn fork_checkout(root: &Path, upstream: &str) {
+        std::fs::create_dir_all(root).unwrap();
+        for args in [
+            vec!["init", "--quiet"],
+            vec!["remote", "add", "upstream", upstream],
+        ] {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(&args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        }
     }
 
     #[test]
@@ -292,11 +316,12 @@ mod tests {
         ]);
         let home = tempfile::tempdir().unwrap();
         let repository = home.path().join("repo");
-        std::fs::create_dir(&repository).unwrap();
+        fork_checkout(&repository, "https://forge.invalid/maintainer/repo");
         std::fs::write(
             home.path().join("repos.toml"),
             format!(
-                "[repos.repo]\npath = \"{}\"\nupstream = \"u\"\norigin = \"o\"\n",
+                "[repos.repo]\npath = \"{}\"\nupstream = \"https://forge.invalid/maintainer/repo.git\"\n\
+                 origin = \"https://forge.invalid/ours/repo\"\n",
                 repository.display()
             ),
         )
@@ -315,6 +340,37 @@ mod tests {
 
         assert_eq!(identity.owner, "state-owner");
         assert_eq!(identity.kind, crate::store::OwnerKind::WorkspaceDerived);
+    }
+
+    #[test]
+    fn a_directory_whose_remotes_cannot_be_read_falls_back_to_the_os_user() {
+        // A bare `.jj/` with no repository inside: jj cannot read it, and a
+        // claim from there must still resolve an identity rather than fail.
+        let _lock = environment_lock();
+        let environment = EnvironmentGuard::capture(&[
+            "KNIVES_CONFIG_HOME",
+            "KNIVES_OWNER",
+            "CLAUDE_CODE_SESSION_ID",
+            "USER",
+        ]);
+        let home = tempfile::tempdir().unwrap();
+        let broken = home.path().join("broken");
+        std::fs::create_dir_all(broken.join(".jj")).unwrap();
+        std::fs::write(
+            home.path().join("repos.toml"),
+            "[repos.repo]\npath = \"/unused\"\nupstream = \"https://forge.invalid/maintainer/repo\"\n\
+             origin = \"https://forge.invalid/ours/repo\"\n",
+        )
+        .unwrap();
+        environment.set("KNIVES_CONFIG_HOME", home.path().to_str().unwrap());
+        environment.remove("KNIVES_OWNER");
+        environment.remove("CLAUDE_CODE_SESSION_ID");
+        environment.set("USER", "terminal-user");
+
+        let identity = current_identity(&broken).unwrap();
+
+        assert_eq!(identity.owner, "terminal-user");
+        assert_eq!(identity.kind, crate::store::OwnerKind::OsUser);
     }
 
     #[test]

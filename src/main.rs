@@ -836,7 +836,6 @@ mod tests {
         );
         let registry = Registry {
             repos,
-            trusted: BTreeMap::new(),
             trust: TrustRules::default(),
         };
 
@@ -867,7 +866,6 @@ mod tests {
         );
         let registry = Registry {
             repos,
-            trusted: BTreeMap::new(),
             trust: TrustRules::default(),
         };
 

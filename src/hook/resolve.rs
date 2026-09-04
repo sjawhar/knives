@@ -1,17 +1,41 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
+use crate::bind;
+// `init` reads URL helpers through here; Task 3 deletes it and this re-export.
 pub(crate) use crate::bind::{remote_authority_and_path, url_owner};
-use crate::config::{GuidanceRoot, GuidanceRootKind, TrustRules, expand_registry_path};
+use crate::config::{Registry, expand_registry_path};
+use crate::ids::RepoName;
 
-/// A named path and the registered repository that contains it.
+/// A touched path inside a repository, and what the registry says about it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Match {
-    pub repo: GuidanceRoot,
+    /// The nearest repository root containing the touched path (a jj workspace
+    /// is its own root). Guidance walks this tree; session-state keys use it.
+    pub root: PathBuf,
+    /// The touched path, canonicalised.
     pub candidate: PathBuf,
+    /// The registry name when the *checkout's* `upstream` matches an entry.
+    pub managed: Option<RepoName>,
+    /// Whether `[trust]` grants guidance for this checkout (any remote, or `roots`).
+    pub trusted: bool,
+}
+
+impl Match {
+    /// The registry name when managed, else `guidance_name(&self.root)`.
+    pub fn name(&self) -> String {
+        self.managed
+            .as_ref()
+            .map_or_else(|| guidance_name(&self.root), ToString::to_string)
+    }
+
+    pub const fn is_managed(&self) -> bool {
+        self.managed.is_some()
+    }
 }
 
 /// Extract file paths directly named by a tool invocation.
@@ -45,83 +69,53 @@ pub fn argument_paths(_tool: &str, args: &Value) -> Vec<PathBuf> {
     paths
 }
 
-/// Find the first named path inside a guidance root, preferring nested roots.
-pub fn managed_repo_for(paths: &[PathBuf], roots: &[GuidanceRoot]) -> Option<Match> {
-    for path in paths {
-        let Some(candidate) = canonical_path(path) else {
-            continue;
-        };
-        let repo = roots
-            .iter()
-            .filter(|root| candidate.strip_prefix(&root.root).is_ok())
-            .max_by_key(|root| root.root.components().count());
-        if let Some(repo) = repo {
-            return Some(Match {
-                repo: repo.clone(),
-                candidate,
-            });
-        }
-    }
-    None
-}
-
-/// Find the nearest checkout root at or above a path's canonical existing parent.
-pub fn repo_root_above(path: &Path) -> Option<PathBuf> {
+/// The nearest repository root above a path that may not exist yet: a file
+/// about to be written has no canonical form, but its repository does.
+pub(crate) fn nearest_root(path: &Path) -> Option<PathBuf> {
     let candidate = canonical_path(path)?;
-    let mut directory = if candidate.is_dir() {
-        candidate
-    } else {
-        candidate.parent()?.to_owned()
-    };
-
-    loop {
-        if directory.join(".jj").exists() || directory.join(".git").exists() {
-            return Some(directory);
-        }
-        if !directory.pop() {
-            return None;
-        }
-    }
+    bind::nearest_root(existing_ancestor(&candidate)?)
 }
 
-/// Find the first checkout whose configured trust rule grants guidance.
-pub fn trust_rule_match(
+fn existing_ancestor(path: &Path) -> Option<&Path> {
+    path.ancestors().find(|ancestor| ancestor.exists())
+}
+
+/// The first touched path inside a repository, and what the registry says about it.
+///
+/// Both facts are decided from the remotes of the checkout `bind::checkout_root`
+/// resolves to. `remotes_of` is the (cached) reader, keyed by that checkout path;
+/// it returns `None` when remotes cannot be read — the caller has already
+/// reported why. A `roots` rule still applies then.
+pub fn match_checkout(
     paths: &[PathBuf],
-    trust: &TrustRules,
-    probe: &mut dyn FnMut(&Path) -> Option<bool>,
+    registry: &Registry,
+    remotes_of: &mut dyn FnMut(&Path) -> Option<BTreeMap<String, String>>,
 ) -> Option<Match> {
-    if trust.is_empty() {
-        return None;
-    }
-    // Trust roots are tilde-expanded at config load but can be symlinked; compare
-    // canonical paths when possible so a real checkout under one is not missed.
-    let trusted_roots = trust
-        .roots
-        .iter()
-        .map(|configured_root| {
-            std::fs::canonicalize(configured_root).unwrap_or_else(|_| configured_root.clone())
-        })
-        .collect::<Vec<_>>();
     for path in paths {
         let Some(candidate) = canonical_path(path) else {
             continue;
         };
-        let Some(root) = repo_root_above(&candidate) else {
+        let Some(existing) = existing_ancestor(&candidate) else {
             continue;
         };
-        let under_trusted_root = trusted_roots
-            .iter()
-            .any(|trusted_root| root.strip_prefix(trusted_root).is_ok());
-        if under_trusted_root
-            || (!trust.owners.is_empty() && probe(&root).is_some_and(|verdict| verdict))
-        {
+        let Some(root) = bind::nearest_root(existing) else {
+            continue;
+        };
+        let Some(checkout) = bind::checkout_root(existing) else {
+            continue;
+        };
+        let remotes = remotes_of(&checkout).unwrap_or_default();
+        let managed = remotes
+            .get("upstream")
+            .and_then(|upstream| bind::entry_for(registry, upstream))
+            .map(|(name, _)| name);
+        let trusted = registry.trust.grants(&root, &remotes);
+        if managed.is_some() || trusted {
             return Some(Match {
-                repo: GuidanceRoot {
-                    name: guidance_name(&root),
-                    root,
-                    kind: GuidanceRootKind::Trusted,
-                },
+                root,
                 candidate,
+                managed,
+                trusted,
             });
         }
     }
@@ -180,11 +174,81 @@ fn canonical_existing_parent(path: &Path) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
 
-    use crate::config::{GuidanceRoot, GuidanceRootKind, TrustRules};
+    use crate::config::{Registry, RepoEntry, TrustRules};
+    use crate::ids::RepoName;
 
-    use super::{argument_paths, managed_repo_for, repo_root_above, trust_rule_match};
+    use super::{Match, argument_paths, match_checkout};
+
+    fn remotes(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(name, url)| ((*name).to_owned(), (*url).to_owned()))
+            .collect()
+    }
+
+    fn registry(entries: &[(&str, &str)], trust: TrustRules) -> Registry {
+        Registry {
+            repos: entries
+                .iter()
+                .map(|(name, upstream)| {
+                    (
+                        (*name).to_owned(),
+                        RepoEntry {
+                            path: PathBuf::from("/unused"), // Task 3 deletes this field
+                            upstream: (*upstream).to_owned(),
+                            origin: "https://forge.invalid/ours/fork".to_owned(),
+                            base: None,
+                            release: None,
+                            release_branch: None,
+                            test_count_command: None,
+                            consumers: vec![],
+                            workspaces: None,
+                        },
+                    )
+                })
+                .collect(),
+            trust,
+        }
+    }
+
+    fn trusting_owner(owner: &str) -> TrustRules {
+        TrustRules {
+            owners: vec![owner.to_owned()],
+            ..TrustRules::default()
+        }
+    }
+
+    fn trusting_root(root: &Path) -> TrustRules {
+        TrustRules {
+            roots: vec![root.to_owned()],
+            ..TrustRules::default()
+        }
+    }
+
+    /// A reader that answers every checkout with the same remotes and records
+    /// which checkouts it was asked about.
+    fn reader(
+        answer: Option<BTreeMap<String, String>>,
+        asked: &mut Vec<PathBuf>,
+    ) -> impl FnMut(&Path) -> Option<BTreeMap<String, String>> {
+        move |checkout: &Path| {
+            asked.push(checkout.to_owned());
+            answer.clone()
+        }
+    }
+
+    fn resolve(
+        paths: &[PathBuf],
+        registry: &Registry,
+        answer: Option<BTreeMap<String, String>>,
+    ) -> (Option<Match>, Vec<PathBuf>) {
+        let mut asked = Vec::new();
+        let matched = match_checkout(paths, registry, &mut reader(answer, &mut asked));
+        (matched, asked)
+    }
 
     #[test]
     fn command_strings_yield_absolute_and_home_paths_only() {
@@ -249,70 +313,74 @@ mod tests {
     }
 
     #[test]
-    fn a_sibling_directory_sharing_the_root_name_is_outside() {
-        // Given: a root and a sibling with the root name as a string prefix.
+    fn a_path_outside_every_repository_does_not_match() {
+        // Given: a repository and a sibling directory sharing its name as a prefix.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("repo");
         let sibling = dir.path().join("repo-sibling/file");
-        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
         std::fs::create_dir_all(sibling.parent().unwrap()).unwrap();
         std::fs::write(&sibling, b"x").unwrap();
-        let roots = vec![GuidanceRoot {
-            name: "repo".into(),
-            root: root.canonicalize().unwrap(),
-            kind: GuidanceRootKind::Managed,
-        }];
+        let registry = registry(&[], trusting_owner("ours"));
 
         // When: the sibling file is resolved.
-        let match_ = managed_repo_for(&[sibling], &roots);
+        let (matched, asked) = resolve(
+            &[sibling],
+            &registry,
+            Some(remotes(&[("origin", "https://forge.invalid/ours/repo")])),
+        );
 
-        // Then: component containment rejects it.
-        assert!(match_.is_none());
+        // Then: no marker above it, so no remotes are read and nothing matches.
+        assert!(matched.is_none());
+        assert!(asked.is_empty());
     }
 
     #[test]
-    fn the_longest_root_wins_for_nested_checkouts() {
+    fn the_nearest_repository_wins_for_nested_checkouts() {
         // Given: an inner checkout nested in an outer checkout.
         let dir = tempfile::tempdir().unwrap();
         let outer = dir.path().join("outer");
         let inner = outer.join("inner");
-        std::fs::create_dir_all(&inner).unwrap();
-        let roots = vec![
-            GuidanceRoot {
-                name: "outer".into(),
-                root: outer.canonicalize().unwrap(),
-                kind: GuidanceRootKind::Managed,
-            },
-            GuidanceRoot {
-                name: "inner".into(),
-                root: inner.canonicalize().unwrap(),
-                kind: GuidanceRootKind::Managed,
-            },
-        ];
+        std::fs::create_dir_all(outer.join(".git")).unwrap();
+        std::fs::create_dir_all(inner.join(".git")).unwrap();
+        let registry = registry(&[], trusting_owner("ours"));
 
         // When: a nonexistent child of the inner checkout is resolved.
-        let hit = managed_repo_for(&[inner.join("file.txt")], &roots).unwrap();
+        let (matched, asked) = resolve(
+            &[inner.join("file.txt")],
+            &registry,
+            Some(remotes(&[("origin", "https://forge.invalid/ours/inner")])),
+        );
 
-        // Then: the more specific root is selected.
-        assert_eq!(hit.repo.name, "inner");
+        // Then: the inner root is the match and the only checkout consulted.
+        let matched = matched.unwrap();
+        assert_eq!(matched.root, inner.canonicalize().unwrap());
+        assert_eq!(matched.name(), "inner");
+        assert_eq!(asked, vec![inner.canonicalize().unwrap()]);
     }
 
     #[test]
     fn nonexistent_leaves_resolve_through_their_existing_parent() {
         // Given: an existing root and a not-yet-created descendant.
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
-        let roots = vec![GuidanceRoot {
-            name: "r".into(),
-            root: root.clone(),
-            kind: GuidanceRootKind::Managed,
-        }];
+        let root = dir.path().join("r");
+        std::fs::create_dir_all(root.join(".jj")).unwrap();
+        let registry = registry(&[], trusting_owner("ours"));
 
         // When: the nonexistent descendant is resolved.
-        let hit = managed_repo_for(&[root.join("not/yet/created.txt")], &roots).unwrap();
+        let (matched, _) = resolve(
+            &[root.join("not/yet/created.txt")],
+            &registry,
+            Some(remotes(&[("origin", "https://forge.invalid/ours/r")])),
+        );
 
-        // Then: its existing parent identifies the root.
-        assert_eq!(hit.repo.name, "r");
+        // Then: its existing parent identifies the root, and the leaf is kept.
+        let matched = matched.unwrap();
+        assert_eq!(matched.root, root.canonicalize().unwrap());
+        assert_eq!(
+            matched.candidate,
+            root.canonicalize().unwrap().join("not/yet/created.txt")
+        );
     }
 
     #[cfg(unix)]
@@ -322,96 +390,67 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("root");
         let outside = dir.path().join("outside");
-        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
         std::fs::create_dir_all(&outside).unwrap();
         std::fs::write(outside.join("file"), b"x").unwrap();
         std::os::unix::fs::symlink(&outside, root.join("escape")).unwrap();
-        let roots = vec![GuidanceRoot {
-            name: "root".into(),
-            root: root.canonicalize().unwrap(),
-            kind: GuidanceRootKind::Managed,
-        }];
+        let registry = registry(&[], trusting_owner("ours"));
 
         // When: the file is named through the symlink.
-        let match_ = managed_repo_for(&[root.join("escape/file")], &roots);
+        let (matched, asked) = resolve(
+            &[root.join("escape/file")],
+            &registry,
+            Some(remotes(&[("origin", "https://forge.invalid/ours/root")])),
+        );
 
-        // Then: canonicalization prevents the escape from being attributed to the root.
-        assert!(match_.is_none());
+        // Then: canonicalisation lands outside every repository.
+        assert!(matched.is_none());
+        assert!(asked.is_empty());
     }
 
     #[test]
-    fn a_repo_under_a_trust_root_is_a_trusted_guidance_root() {
-        // Given: a workspace-shaped checkout under a trusted subtree, never registered.
+    fn a_repo_under_a_trust_root_is_trusted_without_readable_remotes() {
+        // Given: a workspace-shaped checkout under a trusted subtree whose remotes
+        // cannot be read, never registered.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("agent-c/platform/default");
         std::fs::create_dir_all(root.join(".jj")).unwrap();
         std::fs::write(root.join("AGENTS.md"), "rules\n").unwrap();
-        let trust = TrustRules {
-            roots: vec![dir.path().join("agent-c")],
-            owners: vec![],
-        };
-        let mut probe = |_: &Path| None;
+        let registry = registry(&[], trusting_root(&dir.path().join("agent-c")));
 
-        // When: a file inside it is resolved with no owner probe available.
-        let hit = trust_rule_match(&[root.join("AGENTS.md")], &trust, &mut probe)
-            .expect("a root rule needs no probe");
+        // When: a file inside it is resolved and the remote reader has nothing.
+        let (matched, _) = resolve(&[root.join("AGENTS.md")], &registry, None);
 
-        // Then: it is trusted, named for its parent because the leaf is `default`.
-        assert_eq!(hit.repo.kind, GuidanceRootKind::Trusted);
-        assert_eq!(hit.repo.name, "platform");
-        assert_eq!(hit.repo.root, root.canonicalize().unwrap());
+        // Then: it is trusted, unmanaged, and named for its parent because the
+        // leaf is `default`.
+        let matched = matched.expect("a root rule needs no remotes");
+        assert!(matched.trusted);
+        assert!(!matched.is_managed());
+        assert_eq!(matched.name(), "platform");
+        assert_eq!(matched.root, root.canonicalize().unwrap());
     }
 
     #[test]
-    fn a_trust_root_skips_owner_probing_even_when_owners_are_configured() -> anyhow::Result<()> {
-        // Given: a checkout matches a trusted root while owner rules are also configured.
-        let directory = tempfile::tempdir()?;
-        let root = directory.path().join("trusted/repo");
-        std::fs::create_dir_all(root.join(".jj"))?;
-        let trust = TrustRules {
-            roots: vec![directory.path().join("trusted")],
-            owners: vec!["also-trusted".to_owned()],
-        };
-        let mut probes = 0;
-        let mut probe = |_: &Path| {
-            probes += 1;
-            Some(true)
-        };
-
-        // When: a file under the trusted root is resolved.
-        let hit = trust_rule_match(&[root.join("src/lib.rs")], &trust, &mut probe);
-
-        // Then: root trust succeeds without starting an owner probe.
-        assert!(hit.is_some());
-        assert_eq!(probes, 0);
-        Ok(())
-    }
-
-    #[test]
-    fn a_repo_matching_a_trusted_owner_is_found_through_the_probe() {
-        // Given: an unregistered checkout whose owner probe accepts its root.
+    fn a_repo_declaring_a_trusted_owner_is_trusted_through_its_remotes() {
+        // Given: an unregistered checkout whose origin names a trusted owner.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("elsewhere/tool");
         std::fs::create_dir_all(root.join(".git")).unwrap();
-        let trust = TrustRules {
-            roots: vec![],
-            owners: vec!["someone".to_owned()],
-        };
-        let mut asked = Vec::new();
-        let mut probe = |path: &Path| {
-            asked.push(path.to_owned());
-            Some(true)
-        };
+        let registry = registry(&[], trusting_owner("someone"));
+        let declared = remotes(&[("origin", "https://forge.invalid/Someone/tool.git")]);
 
-        // When: the candidate is resolved through the owner probe.
-        let hit = trust_rule_match(&[root.join("src/lib.rs")], &trust, &mut probe);
+        // When: the candidate is resolved.
+        let (matched, asked) = resolve(&[root.join("src/lib.rs")], &registry, Some(declared));
 
-        // Then: the owner rule trusts this one repository root once.
-        assert!(hit.is_some());
-        assert_eq!(asked.len(), 1, "the probe is asked once per root");
+        // Then: the owner rule trusts this one repository root, read once.
+        let matched = matched.unwrap();
+        assert!(matched.trusted);
+        assert!(!matched.is_managed());
+        assert_eq!(asked, vec![root.canonicalize().unwrap()]);
 
-        let mut deny = |_: &Path| Some(false);
-        assert!(trust_rule_match(&[root.join("src/lib.rs")], &trust, &mut deny).is_none());
+        let stranger = remotes(&[("origin", "https://forge.invalid/stranger/tool")]);
+        let (denied, _) = resolve(&[root.join("src/lib.rs")], &registry, Some(stranger));
+        assert!(denied.is_none());
     }
 
     #[test]
@@ -420,78 +459,111 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let outside = dir.path().join("agent-c-2/repo");
         std::fs::create_dir_all(outside.join(".jj")).unwrap();
-        let trust = TrustRules {
-            roots: vec![dir.path().join("agent-c")],
-            owners: vec![],
-        };
-        let mut probe = |_: &Path| None;
+        let registry = registry(&[], trusting_root(&dir.path().join("agent-c")));
 
         // When: a file under the sibling is resolved.
-        let hit = trust_rule_match(&[outside.join("x")], &trust, &mut probe);
+        let (matched, _) = resolve(&[outside.join("x")], &registry, None);
 
         // Then: component containment rejects the string-prefix sibling.
-        assert!(hit.is_none());
+        assert!(matched.is_none());
     }
 
     #[test]
-    fn a_repo_self_declaring_a_trusted_owner_is_a_trusted_guidance_root() {
-        // Given: a checkout outside every trusted root that claims a trusted owner.
+    fn managed_and_trusted_are_decided_independently() {
+        // Given: a registry entry and a trust rule that cover different remotes.
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("untrusted/repo");
+        let root = dir.path().join("fork");
         std::fs::create_dir_all(root.join(".git")).unwrap();
-        let trust = TrustRules {
-            roots: vec![dir.path().join("trusted")],
-            owners: vec!["trusted-owner".to_owned()],
-        };
-        // This is the accepted, documented trade-off: remotes are self-declared,
-        // and the grant is guidance-as-data only, never fork-command access.
-        let mut probe = |_: &Path| Some(true);
+        let registry = registry(
+            &[("tool", "https://forge.invalid/maintainer/tool")],
+            trusting_owner("ours"),
+        );
 
-        // When: the owner-based rule is evaluated.
-        let hit = trust_rule_match(&[root.join("AGENTS.md")], &trust, &mut probe)
-            .expect("the self-declared owner is accepted for guidance");
+        // When: the checkout forks the entry under a stranger's account.
+        let (managed_only, _) = resolve(
+            &[root.join("file")],
+            &registry,
+            Some(remotes(&[
+                ("upstream", "git@forge.invalid:Maintainer/tool.git"),
+                ("origin", "https://forge.invalid/stranger/tool"),
+            ])),
+        );
+        // And when: the same fork is pushed to our own account.
+        let (both, _) = resolve(
+            &[root.join("file")],
+            &registry,
+            Some(remotes(&[
+                ("upstream", "https://forge.invalid/maintainer/tool"),
+                ("origin", "https://forge.invalid/ours/tool"),
+            ])),
+        );
+        // And when: only `origin` points at the maintained repository.
+        let (neither, _) = resolve(
+            &[root.join("file")],
+            &registry,
+            Some(remotes(&[(
+                "origin",
+                "https://forge.invalid/maintainer/tool",
+            )])),
+        );
 
-        // Then: it gets only the trusted guidance classification.
-        assert_eq!(hit.repo.kind, GuidanceRootKind::Trusted);
+        // Then: identity is the upstream remote, trust is any remote, and
+        // neither implies the other.
+        let managed_only = managed_only.unwrap();
+        assert_eq!(managed_only.managed, Some(RepoName::new("tool")));
+        assert_eq!(managed_only.name(), "tool");
+        assert!(!managed_only.trusted);
+        let both = both.unwrap();
+        assert!(both.is_managed());
+        assert!(both.trusted);
+        assert!(neither.is_none());
     }
 
     #[test]
-    fn an_unrelated_path_does_not_hide_a_later_trust_match() {
+    fn a_workspace_is_its_own_root_but_reads_its_checkouts_remotes() {
+        // Given: a checkout and a jj workspace whose `.jj/repo` points back at it.
+        let dir = tempfile::tempdir().unwrap();
+        let checkout = dir.path().join("tool/default");
+        let workspace = dir.path().join("tool/feature");
+        std::fs::create_dir_all(checkout.join(".jj/repo")).unwrap();
+        std::fs::create_dir_all(workspace.join(".jj")).unwrap();
+        std::fs::write(workspace.join(".jj/repo"), "../../default/.jj/repo").unwrap();
+        std::fs::write(workspace.join("AGENTS.md"), "rules\n").unwrap();
+        let registry = registry(&[], trusting_owner("ours"));
+
+        // When: a file in the workspace is resolved.
+        let (matched, asked) = resolve(
+            &[workspace.join("AGENTS.md")],
+            &registry,
+            Some(remotes(&[("origin", "https://forge.invalid/ours/tool")])),
+        );
+
+        // Then: guidance walks the workspace; identity comes from the checkout.
+        let matched = matched.unwrap();
+        assert_eq!(matched.root, workspace.canonicalize().unwrap());
+        assert_eq!(matched.name(), "feature");
+        assert_eq!(asked, vec![checkout.canonicalize().unwrap()]);
+    }
+
+    #[test]
+    fn an_unrelated_path_does_not_hide_a_later_match() {
         // Given: an unresolved path before a repository under a trusted root.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("trusted/repo");
         std::fs::create_dir_all(root.join(".jj")).unwrap();
-        let trust = TrustRules {
-            roots: vec![dir.path().join("trusted")],
-            owners: vec![],
-        };
-        let mut probe = |_: &Path| None;
+        let registry = registry(&[], trusting_root(&dir.path().join("trusted")));
 
-        // When: both the unrelated path and trusted repository path are considered.
-        let hit = trust_rule_match(
+        // When: both the unrelated path and the trusted repository path are considered.
+        let (matched, _) = resolve(
             &[dir.path().join("outside/missing"), root.join("AGENTS.md")],
-            &trust,
-            &mut probe,
+            &registry,
+            None,
         );
 
         // Then: resolution continues until it finds the trusted repository.
         assert_eq!(
-            hit.map(|matched| matched.repo.root),
+            matched.map(|matched| matched.root),
             Some(root.canonicalize().unwrap())
         );
-    }
-
-    #[test]
-    fn a_repo_root_is_found_above_a_missing_descendant() {
-        // Given: an existing repository root and a missing descendant path.
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("repo");
-        std::fs::create_dir_all(root.join(".jj")).unwrap();
-
-        // When: its repository root is located.
-        let found = repo_root_above(&root.join("src/new/file.rs"));
-
-        // Then: the canonical checkout root is returned.
-        assert_eq!(found, Some(root.canonicalize().unwrap()));
     }
 }

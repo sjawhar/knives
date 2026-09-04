@@ -265,58 +265,69 @@ impl RepoEntry {
     }
 }
 
-/// A repository whose agent instructions we trust, but which we do not maintain.
-///
-/// Deliberately its own section rather than a fork entry with optional remotes.
-/// `RepoEntry` requires `upstream` and `origin` so that a malformed fork entry
-/// fails at parse time; relaxing them to fit a repository that has no upstream
-/// would trade that for a failure at the first query instead. A company repo
-/// with nothing to contribute upstream is a different kind of thing, so it gets
-/// a different shape: a path, and nothing else to get wrong.
-///
-/// No fork command reads these. They exist so the plugin can surface a
-/// repository's own instructions when an agent reads its files, which is
-/// useful well beyond the set of repositories we maintain forks of.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TrustedEntry {
-    pub path: PathBuf,
-}
-
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TrustRules {
+    /// Repositories trusted for guidance by identity: `owner/repo`, matched
+    /// against any remote of a checkout, case-insensitively, `.git` stripped
+    /// from both sides.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repos: Vec<String>,
     /// Directory subtrees whose repositories are all trusted for guidance.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub roots: Vec<PathBuf>,
     /// Forge owners whose repositories are trusted for guidance, matched
-    /// against remote URLs case-insensitively.
+    /// against every remote URL of a checkout case-insensitively.
     ///
     /// SECURITY: matches SELF-DECLARED remote URLs read from the candidate
-    /// checkout's own git config — not forge-authenticated; any cloned repo can
-    /// claim any owner; grants guidance-as-data injection only (same grant as a
-    /// `[trusted]` entry), never fork-command access; prefer roots when in doubt.
-    /// The probe accepts only the checkout's own Git toplevel, so nested directories
-    /// cannot inherit an enclosing checkout's identity. Owner rules read Git remote
-    /// config, so jj-only checkouts match only through `roots`.
+    /// checkout's own jj or git configuration — not forge-authenticated; any
+    /// cloned repo can claim any owner; grants guidance-as-data injection only,
+    /// never fork-command access; prefer roots when in doubt. Remotes are read
+    /// from the nearest repository root only, so a directory nested inside a
+    /// checkout cannot inherit the enclosing checkout's identity.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub owners: Vec<String>,
 }
 
 impl TrustRules {
     pub const fn is_empty(&self) -> bool {
-        self.roots.is_empty() && self.owners.is_empty()
+        self.repos.is_empty() && self.roots.is_empty() && self.owners.is_empty()
     }
-}
 
-/// Whether a guidance root comes from a maintained fork or trusted instructions.
-///
-/// The distinction survives resolution because callers may surface contribution
-/// guidance for either kind without treating a trusted repository as a fork.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GuidanceRootKind {
-    /// A maintained fork declared under `[repos.*]`.
-    Managed,
-    /// A repository whose instructions are trusted under `[trusted.*]`.
-    Trusted,
+    /// Whether these rules trust a checkout at `root` declaring `remotes`.
+    ///
+    /// `roots` contains the root (canonicalised, component-wise); `owners`
+    /// matches any remote's owner segment; `repos` matches any remote's
+    /// `owner/repo` slug. Any rule true is enough.
+    pub fn grants(&self, root: &Path, remotes: &BTreeMap<String, String>) -> bool {
+        // Trust roots are tilde-expanded at load but can be symlinked; compare
+        // canonical paths when possible so a real checkout under one is not missed.
+        let under_root = self.roots.iter().any(|configured| {
+            let trusted = configured
+                .canonicalize()
+                .unwrap_or_else(|_| configured.clone());
+            root.strip_prefix(&trusted).is_ok()
+        });
+        if under_root {
+            return true;
+        }
+        remotes.values().any(|url| {
+            let owned = crate::bind::url_owner(url).is_some_and(|owner| {
+                self.owners
+                    .iter()
+                    .any(|trusted| trusted.eq_ignore_ascii_case(owner))
+            });
+            let listed = crate::bind::remote_slug(url).is_some_and(|slug| {
+                self.repos.iter().any(|trusted| {
+                    trusted
+                        .strip_suffix(".git")
+                        .unwrap_or(trusted)
+                        .eq_ignore_ascii_case(slug)
+                })
+            });
+            owned || listed
+        })
+    }
 }
 
 /// A canonical repository root eligible to provide agent guidance.
@@ -324,28 +335,15 @@ pub enum GuidanceRootKind {
 pub struct GuidanceRoot {
     pub name: String,
     pub root: PathBuf,
-    pub kind: GuidanceRootKind,
-}
-
-impl TrustedEntry {
-    /// Resolved exactly as `RepoEntry::resolved_path` resolves, and for the same
-    /// reason: the CLI and the plugin must agree on which directory an entry names.
-    pub fn resolved_path(&self, config_home: &Path) -> PathBuf {
-        expand_registry_path(&self.path, config_home)
-    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Registry {
     #[serde(default)]
     pub repos: BTreeMap<String, RepoEntry>,
-    /// Trusted but unmaintained. Present on this type, rather than ignored as an
-    /// unknown section, because `save` rewrites the whole file: a section serde
-    /// does not know about would be silently deleted the next time `init` runs.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub trusted: BTreeMap<String, TrustedEntry>,
-    /// Trust rules stay on this type because `save` rewrites the whole file;
-    /// an unknown section would otherwise be silently deleted by `init`.
+    /// Which repositories' instructions the hook injects as guidance. Decided
+    /// by remote identity or by subtree, never by a fork entry.
     #[serde(default, skip_serializing_if = "TrustRules::is_empty")]
     pub trust: TrustRules,
 }
@@ -357,28 +355,6 @@ impl Registry {
 
     pub fn is_empty(&self) -> bool {
         self.repos.is_empty()
-    }
-
-    /// Return the existing registry entries that may provide guidance.
-    ///
-    /// Resolve and skip each entry independently: a moved checkout must not disable
-    /// guidance for the remaining registered repositories.
-    pub fn guidance_roots(&self) -> Vec<GuidanceRoot> {
-        let managed = self.repos.iter().filter_map(|(name, entry)| {
-            entry.path.canonicalize().ok().map(|root| GuidanceRoot {
-                name: name.clone(),
-                root,
-                kind: GuidanceRootKind::Managed,
-            })
-        });
-        let trusted = self.trusted.iter().filter_map(|(name, entry)| {
-            entry.path.canonicalize().ok().map(|root| GuidanceRoot {
-                name: name.clone(),
-                root,
-                kind: GuidanceRootKind::Trusted,
-            })
-        });
-        managed.chain(trusted).collect()
     }
 
     /// The managed repo that contains `path`, if any.
@@ -515,6 +491,7 @@ pub fn load(path: &Path) -> Result<Registry, ConfigError> {
         path: path.to_owned(),
         source,
     })?;
+    reject_deleted_trusted_table(&text, path)?;
     let mut registry: Registry = toml::from_str(&text).map_err(|source| ConfigError::Parse {
         path: path.to_owned(),
         source: Box::new(source),
@@ -594,13 +571,41 @@ pub fn load(path: &Path) -> Result<Registry, ConfigError> {
             }
         }
     }
-    for entry in registry.trusted.values_mut() {
-        entry.path = entry.resolved_path(&home);
+    for slug in &registry.trust.repos {
+        if !is_forge_slug(slug) {
+            return Err(ConfigError::Invalid {
+                path: path.to_owned(),
+                detail: format!(
+                    "[trust] repos takes forge slugs (\"<owner>/<repo>\"); found \"{slug}\""
+                ),
+            });
+        }
     }
     for root in &mut registry.trust.roots {
         *root = expand_registry_path(root, &home);
     }
     Ok(registry)
+}
+
+/// `[trusted.*]` was deleted with the registry's paths. A message that names the
+/// replacement beats serde's "unknown field" for the one section people had.
+fn reject_deleted_trusted_table(text: &str, path: &Path) -> Result<(), ConfigError> {
+    let raw: toml::Table = toml::from_str(text).map_err(|source| ConfigError::Parse {
+        path: path.to_owned(),
+        source: Box::new(source),
+    })?;
+    raw.get("trusted")
+        .and_then(toml::Value::as_table)
+        .and_then(|trusted| trusted.keys().next())
+        .map_or(Ok(()), |name| {
+            Err(ConfigError::Invalid {
+                path: path.to_owned(),
+                detail: format!(
+                    "[trusted.{name}] is no longer a registry table; move it to [trust] repos = \
+                     [\"<owner>/<repo>\"]"
+                ),
+            })
+        })
 }
 
 /// An entry's `workspaces`, resolved like `path` and checked. `entry.path` must
@@ -919,98 +924,66 @@ release = "https://example.invalid/releases.git"
     }
 
     #[test]
-    fn a_trusted_entry_needs_only_a_path() {
-        // Given: a repository we do not maintain and have no upstream for
+    fn trust_repos_are_forge_slugs_and_grant_by_any_remote() {
         let dir = tempfile::tempdir().unwrap();
-        let text = "[trusted.workbench]\npath = \"/tmp/workbench\"\n";
-        // When: the registry is loaded
-        let registry = load(&write(dir.path(), text)).unwrap();
-        // Then: it parses, with no remotes demanded of it
-        assert_eq!(
-            registry.trusted["workbench"].path,
-            PathBuf::from("/tmp/workbench")
+        let path = dir.path().join("repos.toml");
+        std::fs::write(
+            &path,
+            "[trust]\nrepos = [\"Company/Tool\", \"company/other.git\"]\nowners = [\"someone\"]\n",
+        )
+        .unwrap();
+        let registry = load(&path).unwrap();
+        let by_repo = BTreeMap::from([(
+            "origin".to_owned(),
+            "git@forge.example:company/tool.git".to_owned(),
+        )]);
+        assert!(registry.trust.grants(Path::new("/anywhere"), &by_repo));
+        let by_repo_with_git_suffix_configured = BTreeMap::from([(
+            "origin".to_owned(),
+            "https://forge.example/company/other".to_owned(),
+        )]);
+        assert!(
+            registry
+                .trust
+                .grants(Path::new("/anywhere"), &by_repo_with_git_suffix_configured)
+        );
+        let other = BTreeMap::from([(
+            "origin".to_owned(),
+            "https://forge.example/company/third".to_owned(),
+        )]);
+        assert!(!registry.trust.grants(Path::new("/anywhere"), &other));
+        let by_owner = BTreeMap::from([(
+            "upstream".to_owned(),
+            "https://forge.example/someone/anything".to_owned(),
+        )]);
+        assert!(registry.trust.grants(Path::new("/anywhere"), &by_owner));
+    }
+
+    #[test]
+    fn a_trust_repo_that_is_not_a_slug_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("repos.toml");
+        std::fs::write(&path, "[trust]\nrepos = [\"~/somewhere\"]\n").unwrap();
+        let error = load(&path).unwrap_err().to_string();
+        assert!(
+            error.contains(
+                "[trust] repos takes forge slugs (\"<owner>/<repo>\"); found \"~/somewhere\""
+            ),
+            "{error}"
         );
     }
 
     #[test]
-    fn a_trusted_entry_is_invisible_to_fork_commands() {
-        // The parse-time guarantee that a fork entry carries its remotes only holds
-        // if trusted entries never reach the code that assumes it.
+    fn a_trusted_table_names_its_replacement() {
         let dir = tempfile::tempdir().unwrap();
-        let text = "[trusted.workbench]\npath = \"/tmp/workbench\"\n";
-        let registry = load(&write(dir.path(), text)).unwrap();
-        assert!(registry.get(&RepoName::new("workbench")).is_none());
-        assert!(registry.repos.is_empty());
-    }
-
-    #[test]
-    fn guidance_roots_preserve_managed_and_trusted_kinds() {
-        // Given: one managed fork and one trusted repository that both exist.
-        let dir = tempfile::tempdir().unwrap();
-        let managed = dir.path().join("managed");
-        let trusted = dir.path().join("trusted");
-        std::fs::create_dir_all(&managed).unwrap();
-        std::fs::create_dir_all(&trusted).unwrap();
-        let text = format!(
-            "[repos.managed]\npath = \"{}\"\nupstream = \"u\"\norigin = \"o\"\n\n\
-             [trusted.workbench]\npath = \"{}\"\n",
-            managed.display(),
-            trusted.display()
-        );
-        let registry = load(&write(dir.path(), &text)).unwrap();
-
-        // When: their guidance roots are collected.
-        let roots = registry.guidance_roots();
-
-        // Then: the roots retain their distinct registry roles.
-        assert_eq!(roots.len(), 2);
-        assert!(roots.iter().any(|root| {
-            root.name == "managed"
-                && root.root == managed.canonicalize().unwrap()
-                && root.kind == GuidanceRootKind::Managed
-        }));
-        assert!(roots.iter().any(|root| {
-            root.name == "workbench"
-                && root.root == trusted.canonicalize().unwrap()
-                && root.kind == GuidanceRootKind::Trusted
-        }));
-    }
-
-    #[test]
-    fn guidance_roots_skip_an_unresolvable_entry_without_dropping_others() {
-        // Given: one existing managed fork and one trusted checkout that was moved away.
-        let dir = tempfile::tempdir().unwrap();
-        let managed = dir.path().join("managed");
-        std::fs::create_dir_all(&managed).unwrap();
-        let missing = dir.path().join("missing");
-        let text = format!(
-            "[repos.managed]\npath = \"{}\"\nupstream = \"u\"\norigin = \"o\"\n\n\
-             [trusted.moved]\npath = \"{}\"\n",
-            managed.display(),
-            missing.display()
-        );
-        let registry = load(&write(dir.path(), &text)).unwrap();
-
-        // When: roots are resolved from the registry.
-        let roots = registry.guidance_roots();
-
-        // Then: the moved entry is skipped without disabling the existing one.
-        assert_eq!(roots.len(), 1);
-        assert_eq!(roots[0].name, "managed");
-        assert_eq!(roots[0].kind, GuidanceRootKind::Managed);
-    }
-
-    #[test]
-    fn a_trusted_tilde_path_resolves_like_a_fork_path() {
-        let _lock = environment_lock();
-        let environment = EnvironmentGuard::capture(&["HOME"]);
-        environment.set("HOME", "/home/someone");
-        let dir = tempfile::tempdir().unwrap();
-        let text = "[trusted.workbench]\npath = \"~/workbench/default\"\n";
-        let registry = load(&write(dir.path(), text)).unwrap();
-        assert_eq!(
-            registry.trusted["workbench"].path,
-            PathBuf::from("/home/someone/workbench/default")
+        let path = dir.path().join("repos.toml");
+        std::fs::write(&path, "[trusted.work]\npath = \"~/work\"\n").unwrap();
+        let error = load(&path).unwrap_err().to_string();
+        assert!(
+            error.contains(
+                "[trusted.work] is no longer a registry table; move it to [trust] repos = [\"<owner>/<repo>\"]"
+            ),
+            "{error}"
         );
     }
 
@@ -1114,26 +1087,6 @@ release = "https://example.invalid/releases.git"
             load(&write(dir.path(), beside)).unwrap().repos["tool"].workspace_root(),
             Path::new("/tmp/tool-worktrees")
         );
-    }
-
-    #[test]
-    fn saving_preserves_trusted_entries() {
-        // `init` rewrites the whole file. Before `trusted` existed on the type,
-        // serde ignored the section on read and `save` then wrote it away.
-        let dir = tempfile::tempdir().unwrap();
-        let text = "[repos.demo]\npath = \"/tmp/demo\"\nupstream = \"u\"\norigin = \"o\"\n\n\
-                    [trusted.workbench]\npath = \"/tmp/workbench\"\n";
-        let path = write(dir.path(), text);
-        let registry = load(&path).unwrap();
-
-        save(&registry, &path).unwrap();
-
-        let reloaded = load(&path).unwrap();
-        assert_eq!(
-            reloaded.trusted["workbench"].path,
-            PathBuf::from("/tmp/workbench")
-        );
-        assert!(reloaded.repos.contains_key("demo"));
     }
 
     #[test]

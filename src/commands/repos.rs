@@ -252,13 +252,12 @@ fn fixed_pin_lag(
     }
 }
 
-/// What `knives repos` reports: per-repo release/consumer state, trusted mounts,
-/// and any registry-level notes (where to add entries, or that pin state lives
-/// in consumers).
+/// What `knives repos` reports: per-repo release/consumer state and any
+/// registry-level notes (where to add entries, or that pin state lives in
+/// consumers).
 #[derive(Debug, serde::Serialize)]
 pub struct Report {
     pub repos: Vec<RepoRow>,
-    pub trusted: Vec<TrustedRow>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub notes: Vec<String>,
     pub config_path: String,
@@ -281,14 +280,6 @@ pub struct RepoRow {
     pub problems: Vec<String>,
 }
 
-/// A trusted-but-unmaintained mount: instructions are read, nothing here is
-/// pinned or released.
-#[derive(Debug, serde::Serialize)]
-pub struct TrustedRow {
-    pub name: String,
-    pub path: String,
-}
-
 /// What one listing reads: the registry, each repository's release state, and
 /// the consumer-scan collaborators every row shares.
 pub struct GatherInput<'a> {
@@ -309,8 +300,7 @@ impl std::fmt::Debug for GatherInput<'_> {
     }
 }
 
-/// Collects release state and consumer pin lag for every maintained and
-/// trusted registry entry.
+/// Collects release state and consumer pin lag for every registry entry.
 pub fn gather(input: &GatherInput<'_>) -> Report {
     let GatherInput {
         registry,
@@ -347,26 +337,14 @@ pub fn gather(input: &GatherInput<'_>) -> Report {
             }
         })
         .collect::<Vec<_>>();
-    let trusted = registry
-        .trusted
-        .iter()
-        .map(|(name, entry)| TrustedRow {
-            name: name.clone(),
-            path: entry.path.display().to_string(),
-        })
-        .collect::<Vec<_>>();
 
-    // Saying where to add entries beats printing nothing and exiting zero; a
-    // trusted-only registry is a real configuration, not an empty one, so that
-    // note only fires when both sections are empty.
+    // Saying where to add entries beats printing nothing and exiting zero.
     let mut notes = Vec::new();
     if repos.is_empty() {
-        if trusted.is_empty() {
-            notes.push(format!(
-                "no repos configured; add entries to {}",
-                config_path.display()
-            ));
-        }
+        notes.push(format!(
+            "no repos configured; add entries to {}",
+            config_path.display()
+        ));
     } else {
         notes.push(
             "pin state lives in consumers: record them as `consumers = [...]` in the registry"
@@ -376,42 +354,14 @@ pub fn gather(input: &GatherInput<'_>) -> Report {
 
     Report {
         repos,
-        trusted,
         notes,
         config_path: config_path.display().to_string(),
     }
 }
 
-/// Trusted-but-unmaintained entries, listed apart from the forks.
-///
-/// Shown because a registry entry nothing ever prints is one nobody can debug:
-/// these change what guidance an agent receives, so they have to be visible. Kept
-/// under their own heading because they are not answers to "what am I
-/// maintaining" — no fork command touches them.
-fn trusted_lines(trusted: &[TrustedRow]) -> Vec<String> {
-    if trusted.is_empty() {
-        return Vec::new();
-    }
-    let width = trusted
-        .iter()
-        .map(|entry| entry.name.len())
-        .max()
-        .unwrap_or(0);
-    let mut lines = vec!["trusted (instructions read, not maintained):".to_owned()];
-    lines.extend(
-        trusted
-            .iter()
-            .map(|entry| format!("  {:<width$}  {}", entry.name, entry.path)),
-    );
-    lines
-}
-
 pub fn render(report: &Report) -> String {
     if report.repos.is_empty() {
-        if report.trusted.is_empty() {
-            return report.notes.first().cloned().unwrap_or_default();
-        }
-        return trusted_lines(&report.trusted).join("\n");
+        return report.notes.first().cloned().unwrap_or_default();
     }
 
     let width = report
@@ -439,7 +389,6 @@ pub fn render(report: &Report) -> String {
         lines.extend(repo.notes.iter().map(|note| format!("  ! {note}")));
         lines.extend(repo.problems.iter().map(|problem| format!("  ? {problem}")));
     }
-    lines.extend(trusted_lines(&report.trusted));
     lines.extend(report.notes.iter().cloned());
     lines.join("\n")
 }
@@ -486,7 +435,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::config::{RepoEntry, TrustedEntry};
+    use crate::config::RepoEntry;
     use crate::consumer_pins::ConsumerHeadMemo;
     use crate::forge::{ConsumerHead, fake::FakeForge};
     use crate::ids::{BookmarkRef, BranchName, CommitId, RemoteName};
@@ -970,7 +919,7 @@ mod tests {
     }
 
     #[test]
-    fn a_gathered_report_serializes_release_state_and_trusted_entries() {
+    fn a_gathered_report_serializes_release_state() {
         let dir = tempfile::tempdir().unwrap();
         let consumer = "acme/behind";
         let commit = "aaaaaaaaaaaaaaaa";
@@ -996,12 +945,6 @@ mod tests {
         sandbox.consumers = vec![consumer.to_owned()];
         let registry = Registry {
             repos: BTreeMap::from([("sandbox-runner".to_owned(), sandbox)]),
-            trusted: BTreeMap::from([(
-                "legacy".to_owned(),
-                TrustedEntry {
-                    path: PathBuf::from("/tmp/legacy"),
-                },
-            )]),
             ..Registry::default()
         };
         let releases = BTreeMap::from([(
@@ -1032,6 +975,5 @@ mod tests {
                 .is_some_and(|behind| behind.contains("acme/behind pins release/2026-07-20")),
             "was: {json:#?}"
         );
-        assert_eq!(json["trusted"][0]["name"], "legacy");
     }
 }

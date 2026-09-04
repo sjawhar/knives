@@ -67,10 +67,62 @@ fn run_hook(home: &Path, event: &Value) -> String {
     output
 }
 
+/// A git-only repository with the given remotes, the shape an agent's `/tmp` clone has.
+fn git_repository(root: &Path, remotes: &[(&str, &str)]) {
+    std::fs::create_dir_all(root).expect("create repository");
+    assert!(
+        Command::new("git")
+            .args(["-C", root.to_str().expect("utf-8"), "init", "--quiet"])
+            .status()
+            .expect("git init")
+            .success()
+    );
+    for (name, url) in remotes {
+        assert!(
+            Command::new("git")
+                .args([
+                    "-C",
+                    root.to_str().expect("utf-8"),
+                    "remote",
+                    "add",
+                    name,
+                    url
+                ])
+                .status()
+                .expect("git remote add")
+                .success()
+        );
+    }
+}
+
+fn jj_in(root: &Path, args: &[&str]) {
+    let status = Command::new("jj")
+        .args(args)
+        .current_dir(root)
+        .env("JJ_CONFIG", "/dev/null")
+        .env("JJ_USER", "Knives Lab")
+        .env("JJ_EMAIL", "knives-lab@example.test")
+        .status()
+        .expect("run jj");
+    assert!(status.success(), "jj {args:?} failed");
+}
+
+/// A colocated jj checkout with the given remotes.
+fn jj_checkout(root: &Path, remotes: &[(&str, &str)]) {
+    std::fs::create_dir_all(root).expect("create checkout");
+    jj_in(root, &["git", "init", "--colocate"]);
+    for (name, url) in remotes {
+        jj_in(root, &["git", "remote", "add", name, url]);
+    }
+}
+
 struct Repositories {
     home: tempfile::TempDir,
+    /// Managed AND trusted: `origin` sits under a trusted owner.
     alpha: PathBuf,
+    /// Managed, NOT trusted: `origin` belongs to a stranger.
     beta: PathBuf,
+    /// Trusted only, through `[trust] repos`.
     trusted: PathBuf,
 }
 
@@ -80,12 +132,29 @@ impl Repositories {
         let alpha = home.path().join("alpha");
         let beta = home.path().join("beta");
         let trusted = home.path().join("trusted");
+        git_repository(
+            &alpha,
+            &[
+                ("upstream", "https://forge.invalid/maintainer/alpha"),
+                ("origin", "https://forge.invalid/ours/alpha"),
+            ],
+        );
+        git_repository(
+            &beta,
+            &[
+                ("upstream", "https://forge.invalid/maintainer/beta"),
+                ("origin", "https://forge.invalid/stranger/beta"),
+            ],
+        );
+        git_repository(
+            &trusted,
+            &[("origin", "https://forge.invalid/company/trusted.git")],
+        );
         for (root, instructions) in [
             (&alpha, "alpha instructions"),
             (&beta, "beta instructions"),
             (&trusted, "trusted instructions"),
         ] {
-            std::fs::create_dir_all(root).expect("create repository");
             std::fs::write(root.join("AGENTS.md"), instructions).expect("write instructions");
             std::fs::write(root.join("file.txt"), "content").expect("write file");
         }
@@ -98,18 +167,20 @@ impl Repositories {
     }
 
     fn configure(&self, include_trusted: bool) {
-        let trusted = include_trusted.then(|| {
-            format!(
-                "\n[trusted.trusted]\npath = \"{}\"\n",
-                self.trusted.display()
-            )
-        });
+        let trust = if include_trusted {
+            "[trust]\nowners = [\"ours\"]\nrepos = [\"company/trusted\"]\n"
+        } else {
+            "[trust]\nowners = [\"ours\"]\n"
+        };
+        // `path` is still a required field until Task 3 deletes it; the hook
+        // code never reads it.
         let config = format!(
-            "[repos.alpha]\npath = \"{}\"\nupstream = \"u\"\norigin = \"o\"\n\n\
-             [repos.beta]\npath = \"{}\"\nupstream = \"u\"\norigin = \"o\"\n{}",
+            "[repos.alpha]\npath = \"{}\"\nupstream = \"https://forge.invalid/maintainer/alpha\"\n\
+             origin = \"https://forge.invalid/ours/alpha\"\n\n\
+             [repos.beta]\npath = \"{}\"\nupstream = \"https://forge.invalid/maintainer/beta\"\n\
+             origin = \"https://forge.invalid/ours/beta\"\n\n{trust}",
             self.alpha.display(),
             self.beta.display(),
-            trusted.unwrap_or_default(),
         );
         std::fs::write(self.home.path().join("repos.toml"), config).expect("write registry");
         let state = json!({"claims": {"beta/feat/claimed": {
@@ -122,6 +193,12 @@ impl Repositories {
         }}});
         std::fs::write(self.home.path().join("state.json"), state.to_string())
             .expect("write state");
+    }
+
+    /// Turn a git-only fixture into a colocated jj checkout, so `seen` can key
+    /// on its `.jj` and jj can still read its remotes.
+    fn colocate(root: &Path) {
+        jj_in(root, &["git", "init", "--colocate"]);
     }
 
     fn write_state(&self, state: &Value) {
@@ -214,7 +291,7 @@ fn session_start_reemits_a_notice_when_the_roster_changes() {
 fn session_start_in_a_managed_workspace_records_passive_observations() {
     let repos = Repositories::new();
     repos.configure(false);
-    std::fs::create_dir_all(repos.beta.join(".jj")).expect("create workspace marker");
+    Repositories::colocate(&repos.beta);
     let start = event("session-start", &repos.beta, None);
 
     let _ = run_hook(repos.home.path(), &start);
@@ -242,7 +319,7 @@ fn session_start_in_a_managed_workspace_records_passive_observations() {
 fn compact_session_start_in_a_managed_workspace_records_passive_observations() {
     let repos = Repositories::new();
     repos.configure(false);
-    std::fs::create_dir_all(repos.beta.join(".jj")).expect("create workspace marker");
+    Repositories::colocate(&repos.beta);
     let mut compact = event("session-start", &repos.beta, None);
     compact["source"] = json!("compact");
 
@@ -318,27 +395,28 @@ fn an_unknown_hook_event_emits_nothing() {
 
 #[test]
 fn post_tool_use_on_a_foreign_repo_emits_notice_and_guidance_once() {
-    // Given: a session in alpha that reads a file in beta.
+    // Given: a session in beta that reads a file in alpha, a fork that is both
+    // managed and trusted.
     let repos = Repositories::new();
     repos.configure(false);
     let read = event(
         "post-tool-read",
-        &repos.alpha,
-        Some(&repos.beta.join("file.txt")),
+        &repos.beta,
+        Some(&repos.alpha.join("file.txt")),
     );
 
     // When: the same foreign file is read twice.
     let first = run_hook(repos.home.path(), &read);
     let second = run_hook(repos.home.path(), &read);
 
-    // Then: only the first read carries beta's notice and guidance.
+    // Then: only the first read carries alpha's notice and guidance.
     let context = additional_context(&first);
     assert_eq!(
         response_event_name(&first),
         read["hook_event_name"].as_str().expect("event name")
     );
     assert!(context.contains("fork managed by knives"), "was: {context}");
-    assert!(context.contains("beta instructions"), "was: {context}");
+    assert!(context.contains("alpha instructions"), "was: {context}");
     assert!(second.is_empty(), "was: {second}");
 }
 
@@ -385,7 +463,7 @@ fn post_tool_use_reemits_a_notice_when_the_roster_changes() {
 fn post_tool_use_in_a_managed_workspace_records_event_identity_and_cwd() {
     let repos = Repositories::new();
     repos.configure(false);
-    std::fs::create_dir_all(repos.alpha.join(".jj")).expect("create alpha workspace marker");
+    Repositories::colocate(&repos.alpha);
     let read = event(
         "post-tool-read",
         &repos.alpha,
@@ -415,13 +493,13 @@ fn post_tool_use_in_a_managed_workspace_records_event_identity_and_cwd() {
 
 #[test]
 fn post_tool_use_without_cwd_emits_notice_without_guidance() {
-    // Given: a managed file in a PostToolUse event that has no session cwd.
+    // Given: a managed, trusted file in a PostToolUse event that has no session cwd.
     let repos = Repositories::new();
     repos.configure(false);
     let mut read = event(
         "post-tool-read",
-        &repos.alpha,
-        Some(&repos.beta.join("file.txt")),
+        &repos.beta,
+        Some(&repos.alpha.join("file.txt")),
     );
     read.as_object_mut().expect("event object").remove("cwd");
 
@@ -430,7 +508,7 @@ fn post_tool_use_without_cwd_emits_notice_without_guidance() {
 
     // Then: the managed-repository notice remains but repository guidance is omitted.
     assert!(context.contains("fork managed by knives"), "was: {context}");
-    assert!(!context.contains("beta instructions"), "was: {context}");
+    assert!(!context.contains("alpha instructions"), "was: {context}");
 }
 
 #[test]
@@ -453,15 +531,15 @@ fn post_tool_use_on_the_session_repo_never_injects_its_guidance() {
 
 #[test]
 fn compaction_resets_the_budget() {
-    // Given: a foreign repository was announced once.
+    // Given: a foreign trusted repository was announced once.
     let repos = Repositories::new();
     repos.configure(false);
     let read = event(
         "post-tool-read",
-        &repos.alpha,
-        Some(&repos.beta.join("file.txt")),
+        &repos.beta,
+        Some(&repos.alpha.join("file.txt")),
     );
-    let compact = event("pre-compact", &repos.alpha, None);
+    let compact = event("pre-compact", &repos.beta, None);
     let first = run_hook(repos.home.path(), &read);
 
     // When: Claude Code compacts its context and reads that repository again.
@@ -469,8 +547,8 @@ fn compaction_resets_the_budget() {
     let second = run_hook(repos.home.path(), &read);
 
     // Then: both reads receive the full foreign guidance.
-    assert!(additional_context(&first).contains("beta instructions"));
-    assert!(additional_context(&second).contains("beta instructions"));
+    assert!(additional_context(&first).contains("alpha instructions"));
+    assert!(additional_context(&second).contains("alpha instructions"));
 }
 
 #[test]
@@ -552,20 +630,21 @@ fn a_trusted_repo_gets_guidance_but_never_the_notice() {
 
 #[test]
 fn missing_guidance_does_not_consume_the_session_budget() {
-    // Given: a managed repository initially has no instruction file.
+    // Given: a managed, trusted repository initially has no instruction file.
     let repos = Repositories::new();
     repos.configure(false);
-    std::fs::remove_file(repos.beta.join("AGENTS.md")).expect("remove instructions");
+    std::fs::remove_file(repos.alpha.join("AGENTS.md")).expect("remove instructions");
     let read = event(
         "post-tool-read",
-        &repos.alpha,
-        Some(&repos.beta.join("file.txt")),
+        &repos.beta,
+        Some(&repos.alpha.join("file.txt")),
     );
 
     // When: the notice emitted on the first read, then instructions appear.
     let first = run_hook(repos.home.path(), &read);
     assert!(additional_context(&first).contains("fork managed by knives"));
-    std::fs::write(repos.beta.join("AGENTS.md"), "later instructions").expect("write instructions");
+    std::fs::write(repos.alpha.join("AGENTS.md"), "later instructions")
+        .expect("write instructions");
     let output = run_hook(repos.home.path(), &read);
 
     // Then: the later guidance remains injectable.
@@ -607,4 +686,143 @@ fn pathless_calls_exit_before_touching_the_registry() {
     assert!(success, "a hook must never fail the session");
     assert!(output.is_empty(), "was: {output}");
     assert!(errors.is_empty(), "was: {errors}");
+}
+
+/// A `Read` of `path` from a session whose cwd is the config home, so the file's
+/// repository is foreign to the session and eligible for guidance.
+fn post_tool_use_read(home: &Path, path: &Path, session_id: &str) -> Value {
+    let mut read = fixture("post-tool-read");
+    read["session_id"] = json!(session_id);
+    read["cwd"] = json!(home);
+    read["tool_input"]["file_path"] = json!(path);
+    read
+}
+
+#[test]
+fn a_managed_checkout_outside_trust_gets_the_notice_but_no_guidance() {
+    let repositories = Repositories::new();
+    repositories.configure(true);
+    let event = post_tool_use_read(
+        repositories.home.path(),
+        &repositories.beta.join("file.txt"),
+        "session-beta",
+    );
+    let output = run_hook(repositories.home.path(), &event);
+    let context = additional_context(&output);
+    assert!(context.contains("managed"), "{context}");
+    assert!(!context.contains("beta instructions"), "{context}");
+}
+
+#[test]
+fn a_trusted_checkout_that_is_not_a_fork_gets_guidance_but_no_notice() {
+    let repositories = Repositories::new();
+    repositories.configure(true);
+    let event = post_tool_use_read(
+        repositories.home.path(),
+        &repositories.trusted.join("file.txt"),
+        "session-trusted",
+    );
+    let output = run_hook(repositories.home.path(), &event);
+    let context = additional_context(&output);
+    assert!(context.contains("trusted instructions"), "{context}");
+    assert!(!context.contains("managed"), "{context}");
+}
+
+#[test]
+fn a_checkout_that_is_both_managed_and_trusted_gets_notice_and_guidance() {
+    let repositories = Repositories::new();
+    repositories.configure(true);
+    let event = post_tool_use_read(
+        repositories.home.path(),
+        &repositories.alpha.join("file.txt"),
+        "session-alpha",
+    );
+    let output = run_hook(repositories.home.path(), &event);
+    let context = additional_context(&output);
+    assert!(context.contains("managed"), "{context}");
+    assert!(context.contains("alpha instructions"), "{context}");
+}
+
+#[test]
+fn a_plain_git_clone_under_a_trusted_owner_gets_guidance_wherever_it_is() {
+    let repositories = Repositories::new();
+    repositories.configure(true);
+    let clone = repositories.home.path().join("scratch").join("tmp-clone");
+    git_repository(&clone, &[("origin", "https://forge.invalid/ours/anything")]);
+    std::fs::write(clone.join("AGENTS.md"), "clone instructions").expect("write");
+    std::fs::write(clone.join("file.txt"), "content").expect("write");
+    let event = post_tool_use_read(
+        repositories.home.path(),
+        &clone.join("file.txt"),
+        "session-clone",
+    );
+    let output = run_hook(repositories.home.path(), &event);
+    assert!(additional_context(&output).contains("clone instructions"));
+}
+
+/// A jj workspace of a trusted repository: guidance comes from the workspace's own tree.
+#[test]
+fn a_workspace_of_a_trusted_repository_gets_its_own_guidance() {
+    let repositories = Repositories::new();
+    repositories.configure(true);
+    let checkout = repositories.home.path().join("tool");
+    jj_checkout(
+        &checkout,
+        &[("origin", "https://forge.invalid/company/trusted")],
+    );
+    std::fs::write(checkout.join("AGENTS.md"), "trusted instructions").expect("write");
+    jj_in(&checkout, &["describe", "-m", "init"]);
+    jj_in(&checkout, &["new"]);
+    let workspace = repositories.home.path().join("tool-feat");
+    jj_in(
+        &checkout,
+        &[
+            "workspace",
+            "add",
+            "--name",
+            "feat",
+            workspace.to_str().expect("utf-8"),
+        ],
+    );
+    std::fs::write(workspace.join("file.txt"), "content").expect("write");
+    let event = post_tool_use_read(
+        repositories.home.path(),
+        &workspace.join("file.txt"),
+        "session-ws",
+    );
+    let output = run_hook(repositories.home.path(), &event);
+    assert!(
+        additional_context(&output).contains("trusted instructions"),
+        "{output}"
+    );
+}
+
+/// Remotes that cannot be read are reported, and a `roots` rule still grants guidance.
+#[test]
+fn unreadable_remotes_are_reported_and_a_trust_root_still_grants_guidance() {
+    let repositories = Repositories::new();
+    let fake = repositories.home.path().join("under-root").join("fake");
+    std::fs::create_dir_all(fake.join(".jj")).expect("bare .jj without a repo");
+    std::fs::write(fake.join("AGENTS.md"), "root instructions").expect("write");
+    std::fs::write(fake.join("file.txt"), "content").expect("write");
+    std::fs::write(
+        repositories.home.path().join("repos.toml"),
+        format!(
+            "[trust]\nroots = [\"{}\"]\n",
+            repositories.home.path().join("under-root").display()
+        ),
+    )
+    .expect("registry");
+    let event = post_tool_use_read(
+        repositories.home.path(),
+        &fake.join("file.txt"),
+        "session-fake",
+    );
+    let (success, output, errors) = run_hook_input(repositories.home.path(), &event.to_string());
+    assert!(success);
+    assert!(errors.contains("knives hook:"), "{errors}");
+    assert!(
+        additional_context(&output).contains("root instructions"),
+        "{output}"
+    );
 }
