@@ -135,62 +135,75 @@ Or build from source with a Rust toolchain:
 cargo install --path .
 ```
 
-Register a checkout and the tool reads its remotes:
+Then stand inside a checkout and print its registry entry:
 
 ```
-knives init ~/forks/libcore/default
+knives register
 ```
 
 ## Configuration
 
-`~/.config/knives/repos.toml`:
+`~/.config/knives/repos.toml` names repositories, not directories. knives finds
+the checkout by its `upstream` remote — walking up from where you stand, or
+scanning `~` to depth three when you are not inside one.
 
 ```toml
 [repos.libcore]
-path = "~/forks/libcore/default"
 upstream = "https://forge.example/org/libcore"
 origin = "https://forge.example/ours/libcore"
 base = "main"                         # optional: upstream's trunk (defaults to main)
-release_branch = "release"            # optional: fixed release branch scheme (omit for dated release/YYYY-MM-DD)
-consumers = ["acme/workbench"]       # optional: forge slugs whose trunks pin this repo's releases
+release = "https://forge.example/company/libcore"   # optional: where releases publish
+consumers = ["company/workbench"]     # optional: forge slugs that pin this repo's releases
 
 [repos.tool]
-path = "~/tool"
 upstream = "https://forge.example/org/tool"
 origin = "https://forge.example/ours/tool"
+release_branch = "integration"        # optional: fixed release branch instead of dated cuts
 workspaces = "~/.worktrees/tool"      # optional: where `knives start` opens branch workspaces
 
-[trusted.workbench]
-path = "~/workbench/default"       # instructions read, not maintained
-
 [trust]
-roots = ["~/projects/company"]      # optional: subtrees whose repos are trusted for guidance
+repos = ["company/workbench"]         # repositories whose AGENTS.md is injected, by identity
+owners = ["ours", "company"]          # every repository under these owners
+roots = ["~/projects/company"]        # every repository under these directories
 ```
 
+A fork entry does not grant guidance; `[trust]` does, and it follows the
+repository wherever it is cloned. From anywhere inside a checkout,
+`knives register` prints the entry for it; nothing writes the file for you.
+
 A fork entry must carry `upstream` and `origin`. That is enforced when the file parses, so a
-malformed entry fails there rather than at the first query. `release` is a fourth optional
+malformed entry fails there rather than at the first query. `release` is a third optional
 remote for when releases are consumed somewhere other than your own fork; it falls back to
-`origin`.
+`origin`. Two entries cannot share an `upstream`: the entry is the repository's identity, so the
+file is refused on load with both names.
+
+A checkout is the entry whose `upstream` its own `upstream` remote matches; `.git`, a trailing
+`/`, and letter case do not matter, and a value that is not a URL (a filesystem path) compares as
+its trimmed text. A checkout whose `origin` or `release` remote differs from the registry still
+binds, and `status` and `repos` carry a note saying so: `origin remote is <X>; registry says <Y>`.
 
 `knives start` opens a branch's workspace beside the checkout, named for the branch: the
 `<name>/default` layout, where the workspaces are `default`'s siblings. A checkout at `~/<name>`
 has no room for siblings, so its entry sets `workspaces` to the directory they go in instead;
-`finish` removes them from the same place. Like `path`, `~` expands and a relative value is taken
-from the config directory, so write it as `~/…`. A `workspaces` inside the checkout is refused.
+`finish` removes them from the same place. `~` expands and a relative value is taken from the
+config directory, so write it as `~/…`. A `workspaces` inside the checkout is refused by `knives
+start` and `finish`, the two verbs that use it.
 
 `consumers` records forge slugs, not checkout paths. Knives reads supported pin files from each
 consumer repository's trunk and caches that scan by the trunk commit. If the forge is unavailable,
 cached results are labeled as such and the command is incomplete; pass `--consumer PATH` for an
 ad-hoc local scan without recording the path.
 
-Every command takes its repo from the directory you are standing in. Name one only when you
-are somewhere else.
+Every command takes its repo from the directory you are standing in, wherever that checkout
+lives. Name one only when you are somewhere else; knives then scans `~` three directories deep
+for jj checkouts, as `knives repos` and `status --all` always do. An entry with no checkout found
+reads `not on this machine`, and an entry with two is refused with both paths named.
 
 ## Commands
 
 | | |
 |---|---|
-| `knives repos` | what is managed, the newest release each has cut, and whether registered forge consumers pin it |
+| `knives repos` | what is managed, where each checkout was found (or `not on this machine`), the newest release each has cut, and whether registered forge consumers pin it |
 | `knives consumers [FORK] [--consumer PATH]...` | compare registered forge consumers and ad-hoc local scans with the newest release on the live publish remote; reports only |
 | `knives pushed [BRANCH]... [--repo REPO]` | compare local branches with the live remote refs that own them; reports only |
 | `knives audit [REPO] [--all] [--no-github]` | reconcile remote refs, open pull heads, recorded cuts, and anonymous heads; reports only and never repairs |
@@ -206,7 +219,7 @@ are somewhere else.
 | `knives release` | plan a release, edit its membership, cut one, or reap superseded cuts |
 | `knives release carries [REVISION] [--in TARGET] [--all]` | compare a revision's content with live releases and upstream trunk; `--all` censuses maintained branches, conditionally checks superseded releases, and reports qualified orphans |
 | `knives release members [REF] [--verify]` | list a release's direct member parents, their holders and advances; `--verify` audits every member's content in the release |
-| `knives init` | register a checkout |
+| `knives register [DIR]` | print the registry entry for a checkout, or `already registered as <name>`; writes nothing |
 | `knives hook` | harness plumbing, not for humans |
 | `knives gh` | fork-aware `gh` passthrough |
 
@@ -286,11 +299,12 @@ add separate guidance for the session repository because Claude Code already loa
 repository's `CLAUDE.md`.
 
 The boundary that made the gap is a security control, so both adapters re-establish an equivalent
-one rather than removing it. The registry is the allowlist: only repositories listed there
-contribute guidance, containment is checked by path components rather than string prefix,
-symlinks are resolved first, and nested guidance inside a repository is mentioned rather than
-injected. Guidance arrives wrapped in a per-injection nonce and framed as data, so a repository
-whose files you are reading cannot forge an instruction to you.
+one rather than removing it. The `[trust]` rules are the allowlist: only a repository they name —
+by identity, owner, or directory — contributes guidance, and a fork entry alone contributes the
+managed notice and nothing more. Containment is checked by path components rather than string
+prefix, symlinks are resolved first, and nested guidance inside a repository is mentioned rather
+than injected. Guidance arrives wrapped in a per-injection nonce and framed as data, so a
+repository whose files you are reading cannot forge an instruction to you.
 
 Three skills ship with both adapters: `fork-work` for what to check before touching a fork,
 `using-knives` for the CLI, and `pr-preflight` for contributing upstream.

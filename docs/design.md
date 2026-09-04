@@ -75,10 +75,36 @@ commit differs from the newest live release as a finding. It also reports local 
 disagreement with the live publish remote rather than treating the checkout as authority. The
 command never edits consumer checkouts.
 
-`[trust]` configures automated guidance rules for repositories outside `[repos.*]` and `[trusted.*]`:
-- `roots`: Directory subtrees where all contained repositories are trusted for instruction guidance.
-- `owners`: Remote URL owners trusted for instruction guidance, matched case-insensitively against git remote URLs.
-- **Security posture:** Owner matching reads self-declared remote URLs from the candidate checkout's git config. It is not forge-authenticated and grants guidance-as-data only, never fork-command access. The probe accepts only a directory that is its own git toplevel, so nested directories cannot inherit an enclosing repo's identity. Owner rules read git remote config, so jj-only checkouts match only via `roots`. Verdicts are recomputed from `repos.toml` on every hook event, so human edits to the file act as the approval mechanism.
+**The registry names repositories, not directories.** A `[repos.*]` entry carries `upstream`,
+`origin`, and the optional `base`, `release`, `release_branch`, `test_count_command`,
+`consumers`, and `workspaces`; there is no path field, and a file that still has one is refused
+on load with the entry named.
+A checkout is the entry whose `upstream` its own `upstream` remote matches, so an entry
+follows the repository to wherever it is cloned and a machine's layout is not configuration.
+Two entries cannot share an `upstream`; the file is refused with both names. `origin` and
+`release` are compared and reported as notes (`origin remote is <X>; registry says <Y>`), never
+used to bind.
+
+Remote spellings are normalised before comparison: a value that parses as a URL (`scheme://` or
+`user@host:path`) compares as host without user and path without trailing `/` or `.git`,
+case-insensitively; a value that does not (a filesystem path) compares as its trimmed text, so two
+directories that differ by `.git` stay two directories.
+
+Standing inside a checkout, or inside a `knives start` workspace of one, binds it: the nearest
+`.jj` or `.git` above the current directory is the root, a workspace's `.jj/repo` pointer is
+followed to its checkout, and a clone nested inside a checkout is its own root and never inherits
+the enclosing identity. Outside one, `knives repos`, `status --all`, and naming a repository scan
+`$HOME` to depth three for jj checkouts (`.jj/repo` a directory), skipping dot-directories, not
+following symlinks, and not descending below a repository. An entry with no checkout found is
+`not on this machine`; an entry with two is refused with both paths named, because choosing
+would answer about the wrong copy.
+
+`[trust]` decides whose instructions the hook injects. It is separate from `[repos.*]`: a fork
+entry grants fork commands and the managed notice, never guidance.
+- `repos`: forge slugs (`owner/repo`) trusted by identity, matched against any remote of a checkout, case-insensitively, `.git` stripped from both sides. The file is refused on load when a value is not a slug.
+- `owners`: forge owners trusted for instruction guidance, matched case-insensitively against the owner segment of every remote URL of a checkout.
+- `roots`: directory subtrees where all contained repositories are trusted for instruction guidance; `~` expands and a relative value is taken from the config directory.
+- **Security posture:** identity and owner matching read self-declared remote URLs from the candidate checkout's own jj or git configuration. They are not forge-authenticated and grant guidance-as-data only, never fork-command access. Remotes are read from the nearest repository root (a workspace's from the checkout its `.jj/repo` pointer names), so a directory nested inside a checkout cannot inherit the enclosing checkout's identity. Trust names repositories, so it follows a clone wherever it lands; a checkout with no remotes matches only via `roots`. No command writes the file: `knives register` prints an entry, and a human pastes it. Verdicts are recomputed from `repos.toml` on every hook event, so human edits to the file act as the approval mechanism.
 
 ## State
 
@@ -230,12 +256,15 @@ The contrast is the whole rule: a **local** rewrite auto-rebases the octopus and
 
 ## Command surface
 
-Every command takes the repo from the directory you are standing in. Naming it is for when you are somewhere else, or want a different one. Requiring the name everywhere was the loudest complaint from actually using this.
+Every command takes the repo from the directory you are standing in. Naming it is for when you are somewhere else, or want a different one; the checkout is then found by scanning `$HOME` to depth three. Requiring the name everywhere was the loudest complaint from actually using this.
 
 ```
-knives init [DIR]              configure remote roles for a repo; warn when untracked remotes look like upstream forks
-knives register [DIR]          print a paste-ready [repos.<name>] snippet on stdout without writing to disk
-knives repos                   the repos knives manages, their release state, and whether a
+knives register [DIR]          print a paste-ready [repos.<name>] snippet on stdout for the checkout
+                               DIR (default: cwd) is inside, or `already registered as <name>` when
+                               its upstream is an entry's; never writes; warns when an untracked
+                               remote looks like another fork of upstream
+knives repos                   the repos knives manages, where each checkout was found (or
+                               `not on this machine`), their release state, and whether a
                                recorded consumer is pinned behind the newest cut
 knives consumers [FORK] [--consumer PATH]...
                                compare consumer pins with the newest live published release
@@ -435,10 +464,10 @@ For a session rooted in one repo reading a file in another, that is false on ent
 
 So the adapters re-establish an equivalent boundary rather than removing it:
 
-- **The allowlist is the registry, which provides three ways to configure guidance roots.** `[repos.*]` names maintained forks. `[trusted.*]` names repositories whose instructions we want an agent to see but which we do not maintain, such as a company repo with no upstream to contribute to. `[trust]` configures automated rules via `roots` (subtree paths) and `owners` (remote URL owners matched case-insensitively). All act as trust roots for guidance;
-  only `[repos.*]` entries are touched by fork commands. Any unlisted tree receives no guidance.
-  - Distinct sections preserve parse-time invariants. A fork entry requires `upstream` and `origin` so malformed entries fail on load. `[trust]` rules stay in the registry struct so `init` rewrites preserve them rather than silently dropping unknown TOML tables.
-- **Inject only root-level guidance from a managed repo**, plus our own overlay, which lives outside the repo. A nested `AGENTS.md` inside a managed repo is *mentioned, not injected*.
+- **The allowlist is `[trust]`, which provides three ways to name guidance roots.** `repos` names repositories by identity (`owner/repo`, matched against any remote of a checkout), `owners` names forge owners (matched case-insensitively against remote URLs), and `roots` names directory subtrees. Any one rule true is enough; any tree none of them names receives no guidance.
+  `[repos.*]` names maintained forks and provides fork commands and the managed notice only; a fork entry grants no guidance, and trust for a fork's own instructions is a `[trust]` rule like any other.
+  - Distinct sections preserve parse-time invariants. A fork entry requires `upstream` and `origin` so malformed entries fail on load, and a `[trust] repos` value that is not a forge slug fails there too. No command writes the file, so nothing can drop a table on rewrite.
+- **Inject only root-level guidance from a trusted repo**, plus our own overlay, which lives outside the repo. A nested `AGENTS.md` inside a trusted repo is *mentioned, not injected*.
 - **Mention `CONTRIBUTING.md` rather than injecting it.** Flagging that it exists is what the agent needs; its contents are long, and every injected byte is instruction-channel surface.
 - **Containment by `relative()`, never string prefix**, so a sibling path like `<dir>-2` cannot pass as `<dir>`.
 - **Canonicalise symlinks before the containment test**, or a symlink inside a managed repo can smuggle an untrusted tree's guidance in.
@@ -458,15 +487,16 @@ One genuine upstream bug found nearby: the boundary test uses a raw string prefi
 
 ### What it injects, and when
 
-When a relevant call names a file inside a managed repository, the adapters can produce these
-two parts:
+When a relevant call names a file inside a repository the registry knows — a managed fork, a
+trusted repository, or both — the adapters can produce these two parts:
 
-- **A notice.** That this is a knives-managed fork, that another agent may be working in
-  it, which branches are claimed and by whom, and to use knives rather than jj or git
-  directly. This is the one place the tool addresses the reader directly. It is emitted
+- **A notice**, for a managed fork. That this is a knives-managed fork, that another agent may
+  be working in it, which branches are claimed and by whom, and to use knives rather than jj or
+  git directly. This is the one place the tool addresses the reader directly. It is emitted
   even when the repository has no `AGENTS.md`, which used to mean nothing was emitted at
   all and an agent was never told where it had walked into.
-- **The repository's own guidance**, when it has any, framed as data.
+- **The repository's own guidance**, for a repository `[trust]` names, when it has any, framed
+  as data. A managed fork that no trust rule names gets the notice and no guidance.
 
 Triggered by files a call actually names, `path`, `filePath`, or an absolute or `~`-rooted path
 in a command, and deliberately not by a command's working directory. A
