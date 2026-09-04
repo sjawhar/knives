@@ -4,6 +4,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+use crate::bind::Fork;
 use crate::cli::Exit;
 use crate::commands::claim::{
     ClaimContext, ClaimDecision, current_identity, decide, last_seen_provenance,
@@ -11,11 +12,9 @@ use crate::commands::claim::{
 };
 use crate::commands::release::shared_base;
 use crate::commands::wip::workspace_for;
-use crate::config::{RepoEntry, Role, default_config_path, load};
+use crate::config::Role;
 use crate::detect::BookmarkTips;
-use crate::ids::{
-    BookmarkRef, BranchName, BranchTarget, CommitId, RemoteName, RepoName, WorkspaceName,
-};
+use crate::ids::{BookmarkRef, BranchName, BranchTarget, CommitId, RemoteName, WorkspaceName};
 use crate::jj::{
     Repo, WorkspaceIdentity, add_workspace, fetch_all, is_workspace_named, repo_immutable_heads,
     set_repo_immutable_heads, user_immutable_heads, workspace_identity,
@@ -31,8 +30,8 @@ use crate::store::{Store, default_state_path};
 /// Workspaces are cheap to create, well under a second, because tracked content
 /// is small even in a large checkout. The real cost is rebuilding language
 /// environments, not the checkout.
-pub fn workspace_path(entry: &RepoEntry, branch: &BranchName) -> PathBuf {
-    entry.workspace_root().join(workspace_for(branch.as_str()))
+pub fn workspace_path(fork: &Fork<'_>, branch: &BranchName) -> PathBuf {
+    fork.workspace_root().join(workspace_for(branch.as_str()))
 }
 
 /// Whether the current directory is inside this branch's workspace.
@@ -44,14 +43,14 @@ pub fn workspace_path(entry: &RepoEntry, branch: &BranchName) -> PathBuf {
 /// otherwise. And the directory must be this checkout's workspace of this name:
 /// with `workspaces` free to point anywhere, standing in a directory at the path
 /// is not standing in the workspace.
-pub fn possesses(cwd: &Path, entry: &RepoEntry, branch: &BranchName) -> bool {
-    let directory = workspace_path(entry, branch);
+pub fn possesses(cwd: &Path, fork: &Fork<'_>, branch: &BranchName) -> bool {
+    let directory = workspace_path(fork, branch);
     directory
         .canonicalize()
         .is_ok_and(|canonical| cwd.starts_with(canonical))
         && is_workspace_named(
             &directory,
-            &entry.path,
+            &fork.checkout.path,
             &WorkspaceName::new(workspace_for(branch.as_str())),
         )
 }
@@ -69,23 +68,38 @@ pub fn possesses(cwd: &Path, entry: &RepoEntry, branch: &BranchName) -> bool {
 /// when it lived in `finish` alone, `start default` under a configured directory
 /// reached `jj workspace add --name default` and died on jj's raw "already
 /// exists".
-pub fn collides_with_checkout(entry: &RepoEntry, branch: &BranchName) -> Option<String> {
+///
+/// A `workspaces` directory inside the checkout is refused first: it puts every
+/// branch workspace in the working copy it belongs to, which is never what
+/// anyone meant. The registry cannot check it — the checkout is found, not
+/// stated — so the two verbs that would use the directory do.
+pub fn collides_with_checkout(fork: &Fork<'_>, branch: &BranchName) -> Option<String> {
+    let checkout = &fork.checkout.path;
+    let root = fork.workspace_root();
+    if root.starts_with(checkout) {
+        return Some(format!(
+            "[repos.{}] workspaces {} is inside the checkout {}; branch workspaces cannot \
+             live in the working copy they belong to",
+            fork.name,
+            root.display(),
+            checkout.display()
+        ));
+    }
     let workspace = workspace_for(branch.as_str());
-    let directory = workspace_path(entry, branch);
-    (workspace == "default" || entry.path.starts_with(&directory)).then(|| {
+    let directory = workspace_path(fork, branch);
+    (workspace == "default" || checkout.starts_with(&directory)).then(|| {
         format!(
             "branch {branch} maps to workspace {workspace} at {}, which is the registered \
              checkout itself or contains it; refusing to touch {}",
             directory.display(),
-            entry.path.display()
+            checkout.display()
         )
     })
 }
 
 struct StartContext<'a> {
     store: &'a mut Store,
-    entry: &'a RepoEntry,
-    repo_name: &'a RepoName,
+    fork: &'a Fork<'a>,
     branch: &'a BranchName,
     identity: crate::commands::claim::Identity,
     upstream_trunk: String,
@@ -95,33 +109,30 @@ struct StartContext<'a> {
 }
 
 pub fn run(
-    repo_name: &RepoName,
+    fork: &Fork<'_>,
     branch: &BranchName,
     why: Option<&str>,
     force: bool,
 ) -> anyhow::Result<Exit> {
-    let registry = load(&default_config_path())?;
-    let Some(entry) = registry.get(repo_name) else {
-        eprintln!("unknown repo {repo_name}");
-        return Ok(Exit::Usage);
-    };
-    if let Some(line) = collides_with_checkout(entry, branch) {
+    let repo_name = &fork.name;
+    let entry = fork.entry;
+    let checkout = &fork.checkout.path;
+    if let Some(line) = collides_with_checkout(fork, branch) {
         eprintln!("{repo_name}: {line}");
         return Ok(Exit::Usage);
     }
     let mut store = Store::open_for_update(default_state_path())?;
     let cwd = std::env::current_dir()?;
-    let destination = workspace_path(entry, branch);
-    let in_claimed_workspace = possesses(&cwd, entry, branch);
+    let destination = workspace_path(fork, branch);
+    let in_claimed_workspace = possesses(&cwd, fork, branch);
     let mut context = StartContext {
         store: &mut store,
-        entry,
-        repo_name,
+        fork,
         branch,
         identity: current_identity(&cwd)?,
         upstream_trunk: entry.upstream_trunk(),
         workspace: WorkspaceName::new(workspace_for(branch.as_str())),
-        opened: Repo::open(&entry.path)?,
+        opened: Repo::open(checkout)?,
         destination,
     };
     // A rule a human stated is their decision: `status` reports one that
@@ -132,7 +143,7 @@ pub fn run(
     // to the repository, and the agent about to run jj here is the one jj's
     // default would have walled.
     let rule = entry.immutable_heads();
-    let stated = repo_immutable_heads(&entry.path)?;
+    let stated = repo_immutable_heads(checkout)?;
     let verb = match &stated {
         None => Some("written to"),
         Some(stated) if stated.written_by_knives && stated.rule != rule => Some("refreshed in"),
@@ -140,11 +151,11 @@ pub fn run(
     };
     if let Some(verb) = verb {
         let shadowed = if stated.is_none() {
-            user_immutable_heads(&entry.path)?
+            user_immutable_heads(checkout)?
         } else {
             None
         };
-        set_repo_immutable_heads(&entry.path, &rule)?;
+        set_repo_immutable_heads(checkout, &rule)?;
         let shadow = shadowed.map_or_else(String::new, |user_rule| {
             format!(" (shadows the user-level rule {user_rule} here)")
         });
@@ -265,16 +276,16 @@ fn resume_claim(
         "resumed"
     };
     Scribe::new(
-        Ledger::for_repo(context.repo_name),
-        context.repo_name.clone(),
-        context.entry.path.clone(),
+        Ledger::for_repo(&context.fork.name),
+        context.fork.name.clone(),
+        context.fork.checkout.path.clone(),
         context.identity.owner.clone(),
     )
     .event(
         Some(context.branch.as_str()),
         event.to_owned(),
         context.store.tracked_pull(&BranchTarget::new(
-            context.repo_name.clone(),
+            context.fork.name.clone(),
             context.branch.clone(),
         )),
     )?;
@@ -289,7 +300,7 @@ fn take_claim(context: &mut StartContext<'_>, reason: &str) -> anyhow::Result<Ex
     if context.destination.exists() {
         if let Some(line) = adoption_refusal(
             &context.destination,
-            &context.entry.path,
+            &context.fork.checkout.path,
             &context.workspace,
         ) {
             eprintln!("{line}");
@@ -304,7 +315,10 @@ fn take_claim(context: &mut StartContext<'_>, reason: &str) -> anyhow::Result<Ex
             context
                 .opened
                 .reattach_workspace(&context.destination, &context.workspace)?;
-            workspace_change(&Repo::open(&context.entry.path)?, &context.workspace)?
+            workspace_change(
+                &Repo::open(&context.fork.checkout.path)?,
+                &context.workspace,
+            )?
         };
         record_claim(
             context,
@@ -314,7 +328,7 @@ fn take_claim(context: &mut StartContext<'_>, reason: &str) -> anyhow::Result<Ex
         println!(
             "adopted existing workspace {} at {change}; left as-is\nclaimed {}/{} for {}",
             context.destination.display(),
-            context.repo_name,
+            context.fork.name,
             context.branch,
             context.identity.owner,
         );
@@ -329,12 +343,15 @@ fn take_claim(context: &mut StartContext<'_>, reason: &str) -> anyhow::Result<Ex
             return Ok(Exit::Usage);
         }
     };
-    let change = workspace_change(&Repo::open(&context.entry.path)?, &context.workspace)?;
+    let change = workspace_change(
+        &Repo::open(&context.fork.checkout.path)?,
+        &context.workspace,
+    )?;
     record_claim(context, reason, format!("claimed: {reason}"))?;
     println!(
         "workspace {} at {change} based on {base_revision} ({base_label})\nclaimed {}/{} for {}",
         context.destination.display(),
-        context.repo_name,
+        context.fork.name,
         context.branch,
         context.identity.owner,
     );
@@ -342,13 +359,13 @@ fn take_claim(context: &mut StartContext<'_>, reason: &str) -> anyhow::Result<Ex
 }
 
 fn record_claim(context: &mut StartContext<'_>, reason: &str, event: String) -> anyhow::Result<()> {
-    let target = BranchTarget::new(context.repo_name.clone(), context.branch.clone());
+    let target = BranchTarget::new(context.fork.name.clone(), context.branch.clone());
     let pull = context.store.tracked_pull(&target);
     let _ = context.store.claim(&target, &context.identity, reason);
     Scribe::new(
-        Ledger::for_repo(context.repo_name),
-        context.repo_name.clone(),
-        context.entry.path.clone(),
+        Ledger::for_repo(&context.fork.name),
+        context.fork.name.clone(),
+        context.fork.checkout.path.clone(),
         context.identity.owner.clone(),
     )
     .event(Some(context.branch.as_str()), event, pull)?;
@@ -432,7 +449,7 @@ fn workspace_notice(
     if context.destination.exists() {
         if let Some(line) = adoption_refusal(
             &context.destination,
-            &context.entry.path,
+            &context.fork.checkout.path,
             &context.workspace,
         ) {
             return Ok(Err(line));
@@ -448,7 +465,10 @@ fn workspace_notice(
         WorkspaceBase::Created { revision, label } => Ok(format!(
             "created missing workspace {} at {} based on {revision} ({label})",
             context.destination.display(),
-            workspace_change(&Repo::open(&context.entry.path)?, &context.workspace)?,
+            workspace_change(
+                &Repo::open(&context.fork.checkout.path)?,
+                &context.workspace
+            )?,
         )),
         WorkspaceBase::Divergent(tips) => Err(divergent_refusal_line(context.branch, &tips)),
     })
@@ -490,12 +510,14 @@ fn divergent_refusal_line(branch: &BranchName, tips: &[CommitId]) -> String {
 /// `@`: an agent in a release workspace could otherwise run `jj new` and
 /// silently inherit the release merge as a parent.
 fn create_workspace(context: &StartContext<'_>) -> anyhow::Result<WorkspaceBase> {
-    fetch_all(&context.entry.path)?;
-    let opened = Repo::open(&context.entry.path)?;
+    let entry = context.fork.entry;
+    let checkout = &context.fork.checkout.path;
+    fetch_all(checkout)?;
+    let opened = Repo::open(checkout)?;
     let tips = opened.bookmark_tips()?;
     let ours = [
         RemoteName::new(Role::Origin.to_string()),
-        RemoteName::new(context.entry.publish_remote()),
+        RemoteName::new(entry.publish_remote()),
     ];
     let (revision, label) = match branch_tip(&opened, &tips, context.branch, &ours)? {
         BranchTip::Local(tip) => (tip.as_str().to_owned(), format!("{}'s tip", context.branch)),
@@ -506,8 +528,8 @@ fn create_workspace(context: &StartContext<'_>) -> anyhow::Result<WorkspaceBase>
         BranchTip::Divergent(targets) => return Ok(WorkspaceBase::Divergent(targets)),
         BranchTip::Unknown => {
             let upstream_trunk = context.upstream_trunk.as_str();
-            let scheme = context.entry.release_scheme();
-            let base = match newest_release(&tips, &scheme, context.entry.publish_remote()) {
+            let scheme = entry.release_scheme();
+            let base = match newest_release(&tips, &scheme, entry.publish_remote()) {
                 Some((_, release)) => {
                     let trunk_tip = opened.resolve_commit(upstream_trunk)?;
                     shared_base(&opened, &release, &trunk_tip)?
@@ -531,7 +553,7 @@ fn create_workspace(context: &StartContext<'_>) -> anyhow::Result<WorkspaceBase>
         }
     };
     add_workspace(
-        &context.entry.path,
+        checkout,
         context.workspace.as_str(),
         &context.destination,
         &revision,
@@ -596,10 +618,10 @@ mod tests {
         reason = "indexing a result in a test is the assertion; a panic is the failure"
     )]
     use super::*;
+    use crate::config::RepoEntry;
 
-    fn entry(path: &str, workspaces: Option<&str>) -> RepoEntry {
+    fn entry(workspaces: Option<&str>) -> RepoEntry {
         RepoEntry {
-            path: PathBuf::from(path),
             upstream: "u".to_owned(),
             origin: "o".to_owned(),
             base: None,
@@ -617,37 +639,62 @@ mod tests {
         // an intermediate component of the checkout path maps to an ancestor of the
         // checkout, and `default` maps to a directory that is not the checkout at
         // all — but is still the primary workspace's name.
-        let sibling = entry("/home/u/forks/tool/default", None);
-        let configured = entry(
-            "/home/u/forks/tool/default",
-            Some("/home/u/.worktrees/tool"),
-        );
-        let above = entry("/home/u/forks/tool/default", Some("/home/u/forks"));
-        for (entry, branch) in [
+        let checkout = Path::new("/home/u/forks/tool/default");
+        let sibling_entry = entry(None);
+        let configured_entry = entry(Some("/home/u/.worktrees/tool"));
+        let above_entry = entry(Some("/home/u/forks"));
+        let sibling = Fork::at("tool", &sibling_entry, checkout);
+        let configured = Fork::at("tool", &configured_entry, checkout);
+        let above = Fork::at("tool", &above_entry, checkout);
+        for (fork, branch) in [
             (&sibling, "default"),
             (&configured, "default"),
             (&above, "tool"),
         ] {
-            let line =
-                collides_with_checkout(entry, &BranchName::new(branch)).expect("a collision");
+            let line = collides_with_checkout(fork, &BranchName::new(branch)).expect("a collision");
             assert!(line.contains("registered checkout"), "was: {line}");
         }
-        for (entry, branch) in [
+        for (fork, branch) in [
             (&sibling, "tool-fix"),
             (&configured, "feat/alpha"),
             (&above, "tool-fix"),
         ] {
             assert!(
-                collides_with_checkout(entry, &BranchName::new(branch)).is_none(),
+                collides_with_checkout(fork, &BranchName::new(branch)).is_none(),
                 "{branch} was refused"
             );
         }
     }
 
     #[test]
+    fn a_workspaces_directory_inside_the_checkout_is_refused_for_every_branch() {
+        // The checkout path itself is the most likely slip. Containment is by
+        // component: a sibling sharing the checkout's name as a string prefix is
+        // outside it.
+        let checkout = Path::new("/home/u/tool");
+        for inside in ["/home/u/tool", "/home/u/tool/.worktrees"] {
+            let inside_entry = entry(Some(inside));
+            let fork = Fork::at("tool", &inside_entry, checkout);
+            let line =
+                collides_with_checkout(&fork, &BranchName::new("feat/alpha")).expect("a refusal");
+            assert_eq!(
+                line,
+                format!(
+                    "[repos.tool] workspaces {inside} is inside the checkout /home/u/tool; \
+                     branch workspaces cannot live in the working copy they belong to"
+                )
+            );
+        }
+        let beside_entry = entry(Some("/home/u/tool-worktrees"));
+        let beside = Fork::at("tool", &beside_entry, checkout);
+        assert!(collides_with_checkout(&beside, &BranchName::new("feat/alpha")).is_none());
+    }
+
+    #[test]
     fn a_workspace_is_a_sibling_named_for_the_branch() {
+        let sibling = entry(None);
         let path = workspace_path(
-            &entry("/home/u/forks/work/default", None),
+            &Fork::at("work", &sibling, Path::new("/home/u/forks/work/default")),
             &BranchName::new("feat/alpha"),
         );
         assert_eq!(path, PathBuf::from("/home/u/forks/work/feat-alpha"));
@@ -657,8 +704,9 @@ mod tests {
     fn a_configured_workspaces_directory_holds_the_workspace_instead() {
         // A checkout at `~/<name>` has no `default` leaf to sit beside; without
         // this, every branch of every such repository would land in `~`.
+        let configured = entry(Some("/home/u/.worktrees/work"));
         let path = workspace_path(
-            &entry("/home/u/work", Some("/home/u/.worktrees/work")),
+            &Fork::at("work", &configured, Path::new("/home/u/work")),
             &BranchName::new("feat/alpha"),
         );
         assert_eq!(path, PathBuf::from("/home/u/.worktrees/work/feat-alpha"));
@@ -668,8 +716,9 @@ mod tests {
     fn slashes_in_a_branch_name_do_not_create_nested_directories() {
         // `feat/a/b` must not become three directories deep, or the workspace
         // lands somewhere nobody looks.
+        let sibling = entry(None);
         let path = workspace_path(
-            &entry("/repos/x/default", None),
+            &Fork::at("x", &sibling, Path::new("/repos/x/default")),
             &BranchName::new("feat/a/b"),
         );
         assert_eq!(path.file_name().and_then(|n| n.to_str()), Some("feat-a-b"));

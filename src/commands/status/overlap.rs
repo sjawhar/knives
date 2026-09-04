@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
+use crate::bind::Fork;
 use crate::commands::status::Report;
-use crate::config::RepoEntry;
 use crate::detect::{BookmarkTips, Finding, LandedVerdict};
 use crate::ids::{BookmarkRef, ReleaseScheme};
 use crate::jj::Repo;
@@ -62,13 +62,14 @@ type BranchOverlapOutcome = (String, Option<BranchFiles>);
 pub(super) fn add_branch_overlap_findings(
     report: &mut Report,
     findings: &mut Vec<Finding>,
-    entry: &RepoEntry,
+    fork: &Fork<'_>,
     workers: usize,
 ) -> std::time::Duration {
+    let entry = fork.entry;
+    let path = &fork.checkout.path;
     let started = std::time::Instant::now();
     let rows = &report.branches;
     let upstream_trunk = entry.upstream_trunk();
-    let path = &entry.path;
     let outcomes: Vec<BranchOverlapOutcome> = if rows.is_empty() {
         Vec::new()
     } else {

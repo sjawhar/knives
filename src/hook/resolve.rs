@@ -6,8 +6,6 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 
 use crate::bind;
-// `init` reads URL helpers through here; Task 3 deletes it and this re-export.
-pub(crate) use crate::bind::{remote_authority_and_path, url_owner};
 use crate::config::{Registry, expand_registry_path};
 use crate::ids::RepoName;
 
@@ -197,7 +195,6 @@ mod tests {
                     (
                         (*name).to_owned(),
                         RepoEntry {
-                            path: PathBuf::from("/unused"), // Task 3 deletes this field
                             upstream: (*upstream).to_owned(),
                             origin: "https://forge.invalid/ours/fork".to_owned(),
                             base: None,

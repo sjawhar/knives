@@ -45,6 +45,8 @@ fn starting_and_finishing_a_branch_leaves_its_reason_in_the_ledger() {
         ])
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
+        .env("HOME", lab.temp_path())
+        .env("JJ_CONFIG", "/dev/null")
         .env("KNIVES_OWNER", "ses_fff688")
         .output()
         .expect("run start");
@@ -79,6 +81,8 @@ fn starting_and_finishing_a_branch_leaves_its_reason_in_the_ledger() {
         ])
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
+        .env("HOME", lab.temp_path())
+        .env("JJ_CONFIG", "/dev/null")
         .env("KNIVES_OWNER", "ses_fff688")
         .output()
         .expect("run finish");
@@ -133,6 +137,8 @@ fn start_claim_for_finish(
         ])
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
+        .env("HOME", lab.temp_path())
+        .env("JJ_CONFIG", "/dev/null")
         .env("KNIVES_OWNER", owner)
         .output()
         .expect("start held branch");
@@ -155,6 +161,8 @@ fn knives_finish(lab: &lab::Lab, home: &tempfile::TempDir, args: &[&str]) -> std
         .args(["--repo", "demo"])
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
+        .env("HOME", lab.temp_path())
+        .env("JJ_CONFIG", "/dev/null")
         .env("KNIVES_OWNER", "ses_fff688")
         .output()
         .expect("run finish")
@@ -175,6 +183,8 @@ fn knives_finish_with_failing_forge(
         .args(["--repo", "demo"])
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
+        .env("HOME", lab.temp_path())
+        .env("JJ_CONFIG", "/dev/null")
         .env("KNIVES_OWNER", "ses_fff688")
         .env("XDG_CACHE_HOME", shim.path().join("cache"))
         .env("PATH", path_with_gh_shim(shim.path()))
@@ -278,6 +288,8 @@ fn finish_refuses_to_release_anothers_claim_without_force() {
         .args(["--text", "finish", "feat/gamma", "--repo", "demo"])
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
+        .env("HOME", lab.temp_path())
+        .env("JJ_CONFIG", "/dev/null")
         .env("KNIVES_OWNER", "agent-two")
         .output()
         .expect("finish another agent's claim");
@@ -327,6 +339,8 @@ fn finish_force_releases_and_records_provenance() {
         ])
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
+        .env("HOME", lab.temp_path())
+        .env("JJ_CONFIG", "/dev/null")
         .env("KNIVES_OWNER", "agent-two")
         .output()
         .expect("force finish another agent's claim");
@@ -357,6 +371,8 @@ fn finish_force_releases_and_records_provenance() {
         ])
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
+        .env("HOME", lab.temp_path())
+        .env("JJ_CONFIG", "/dev/null")
         .env("KNIVES_OWNER", "agent-two")
         .output()
         .expect("read forced-release events");
@@ -394,6 +410,8 @@ fn finish_force_requires_why() {
         ])
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
+        .env("HOME", lab.temp_path())
+        .env("JJ_CONFIG", "/dev/null")
         .output()
         .expect("parse forced finish");
 
@@ -417,6 +435,8 @@ fn finish_by_possession_still_releases() {
         .args(["--text", "finish", "feat/gamma", "--repo", "demo"])
         .current_dir(&workspace)
         .env("KNIVES_CONFIG_HOME", home.path())
+        .env("HOME", lab.temp_path())
+        .env("JJ_CONFIG", "/dev/null")
         .env_remove("KNIVES_OWNER")
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .env("USER", "terminal-user")
@@ -428,44 +448,6 @@ fn finish_by_possession_still_releases() {
         "stdout: {}\nstderr: {}",
         String::from_utf8_lossy(&finished.stdout),
         String::from_utf8_lossy(&finished.stderr)
-    );
-}
-
-#[test]
-fn finish_by_owner_releases_when_checkout_activity_is_unavailable() {
-    // The ownership decision is complete without an operation walk. An
-    // unavailable checkout may prevent forgetting a workspace, but cannot turn
-    // a same-owner release into a claim that remains held.
-    let lab = lab::Lab::new();
-    let (home, _consumer) = release_test_home(&lab);
-    hold_claim(&home, "feat/alpha");
-    let unavailable = home.path().join("unavailable");
-    std::fs::write(
-        home.path().join("repos.toml"),
-        format!(
-            "[repos.demo]\npath = \"{}\"\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/work.git\"\n",
-            unavailable.display(),
-            lab.upstream.display(),
-        ),
-    )
-    .expect("make configured checkout unavailable");
-
-    let finished = knives_finish(&lab, &home, &["feat/alpha"]);
-
-    assert!(
-        finished.status.success(),
-        "stdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&finished.stdout),
-        String::from_utf8_lossy(&finished.stderr)
-    );
-    let state: Value = serde_json::from_str(
-        &std::fs::read_to_string(home.path().join("state.json")).expect("read state"),
-    )
-    .expect("parse state");
-    assert!(
-        state["claims"].get("demo/feat/alpha").is_none(),
-        "claim remained: {}",
-        state["claims"]
     );
 }
 
@@ -542,15 +524,12 @@ fn stating_a_pull_request_and_a_dependency_leaves_both_statements_in_the_ledger(
     let lab = lab::Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     let home = tempfile::tempdir().expect("create config home");
-    let sibling = home.path().join("sibling");
     std::fs::write(
         home.path().join("repos.toml"),
         format!(
-            "[repos.demo]\npath = \"{}\"\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/work.git\"\n\
-             [repos.sibling]\npath = \"{}\"\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/other.git\"\n",
-            lab.work.display(),
-            lab.upstream.display(),
-            sibling.display(),
+            "[repos.demo]\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/work.git\"\n\
+             [repos.sibling]\nupstream = \"https://forge.invalid/maintainer/other.git\"\n\
+             origin = \"https://forge.invalid/acme/other.git\"\n",
             lab.upstream.display(),
         ),
     )
@@ -560,6 +539,8 @@ fn stating_a_pull_request_and_a_dependency_leaves_both_statements_in_the_ledger(
             .args(args)
             .current_dir(&lab.work)
             .env("KNIVES_CONFIG_HOME", home.path())
+            .env("HOME", lab.temp_path())
+            .env("JJ_CONFIG", "/dev/null")
             .env("KNIVES_OWNER", "ses_fff688")
             .output()
             .expect("run knives")
@@ -646,6 +627,8 @@ fn a_fork_only_statement_is_recorded_as_the_decision_it_is() {
         ])
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
+        .env("HOME", lab.temp_path())
+        .env("JJ_CONFIG", "/dev/null")
         .env("KNIVES_OWNER", "ses_fff688")
         .output()
         .expect("run track");

@@ -25,9 +25,8 @@ fn home_with_workspaces(lab: &Lab) -> (tempfile::TempDir, PathBuf) {
     std::fs::write(
         home.path().join("repos.toml"),
         format!(
-            "[repos.demo]\npath = \"{}\"\nupstream = \"{}\"\n\
+            "[repos.demo]\nupstream = \"{}\"\n\
              origin = \"https://forge.invalid/acme/work.git\"\nworkspaces = \"{}\"\n",
-            lab.work.display(),
             lab.upstream.display(),
             workspaces.display(),
         ),
@@ -41,6 +40,8 @@ fn knives(lab: &Lab, home: &tempfile::TempDir, args: &[&str]) -> std::process::O
         .args(args)
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
+        .env("HOME", lab.temp_path())
+        .env("JJ_CONFIG", "/dev/null")
         .env("KNIVES_OWNER", "ses_fff688")
         .output()
         .expect("run knives")
@@ -275,6 +276,8 @@ fn finish_from_inside_the_configured_workspace_releases_by_possession() {
         .args(["--text", "finish", "feat/gamma"])
         .current_dir(&workspace)
         .env("KNIVES_CONFIG_HOME", home.path())
+        .env("HOME", lab.temp_path())
+        .env("JJ_CONFIG", "/dev/null")
         .env("KNIVES_OWNER", "someone-else")
         .output()
         .expect("run finish from inside");
@@ -302,10 +305,9 @@ fn a_cut_measures_tests_under_the_configured_workspaces_directory() {
     std::fs::write(
         home.path().join("repos.toml"),
         format!(
-            "[repos.demo]\npath = \"{}\"\nupstream = \"{}\"\n\
+            "[repos.demo]\nupstream = \"{}\"\n\
              origin = \"https://forge.invalid/acme/work.git\"\nworkspaces = \"{}\"\n\
              test_count_command = \"pwd -P >> {}; printf 10\"\n",
-            lab.work.display(),
             lab.upstream.display(),
             workspaces.display(),
             measured.display(),
@@ -325,6 +327,8 @@ fn a_cut_measures_tests_under_the_configured_workspaces_directory() {
         ])
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
+        .env("HOME", lab.temp_path())
+        .env("JJ_CONFIG", "/dev/null")
         .output()
         .expect("run cut");
 
@@ -421,9 +425,8 @@ fn finish_by_possession_sees_through_a_symlinked_workspaces_directory() {
     std::fs::write(
         home.path().join("repos.toml"),
         format!(
-            "[repos.demo]\npath = \"{}\"\nupstream = \"{}\"\n\
+            "[repos.demo]\nupstream = \"{}\"\n\
              origin = \"https://forge.invalid/acme/work.git\"\nworkspaces = \"{}\"\n",
-            lab.work.display(),
             lab.upstream.display(),
             link.join("demo").display(),
         ),
@@ -441,6 +444,8 @@ fn finish_by_possession_sees_through_a_symlinked_workspaces_directory() {
         .args(["--text", "finish", "feat/gamma", "--repo", "demo"])
         .current_dir(&workspace)
         .env("KNIVES_CONFIG_HOME", home.path())
+        .env("HOME", lab.temp_path())
+        .env("JJ_CONFIG", "/dev/null")
         .env("KNIVES_OWNER", "someone-else")
         .output()
         .expect("run finish from inside");
@@ -489,6 +494,8 @@ fn finish_leaves_the_directory_when_the_registration_could_not_be_forgotten() {
         .args(["--text", "finish", "feat/gamma", "--repo", "demo"])
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
+        .env("HOME", lab.temp_path())
+        .env("JJ_CONFIG", "/dev/null")
         .env("KNIVES_OWNER", "ses_fff688")
         .env("PATH", path)
         .output()

@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::bind::Fork;
 use crate::cli::Exit;
 use crate::config::{RepoEntry, Role};
 use crate::detect::BookmarkTips;
@@ -137,14 +138,14 @@ fn reconcile_branch(input: &ReconcileInput<'_>, branch: &BranchName) -> Row {
 }
 
 /// Read live remote refs once per owning push remote, then reconcile requested bookmarks.
-pub fn gather(repo: &RepoName, entry: &RepoEntry, store: &Store, named: &[String]) -> Report {
-    let opened = match Repo::open(&entry.path) {
+pub fn gather(fork: &Fork<'_>, store: &Store, named: &[String]) -> Report {
+    let repo = &fork.name;
+    let entry = fork.entry;
+    let path = &fork.checkout.path;
+    let opened = match Repo::open(path) {
         Ok(opened) => opened,
         Err(error) => {
-            return problem_report(
-                repo,
-                format!("could not open {}: {error}", entry.path.display()),
-            );
+            return problem_report(repo, format!("could not open {}: {error}", path.display()));
         }
     };
     let tips = match opened.bookmark_tips() {

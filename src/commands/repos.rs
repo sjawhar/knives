@@ -8,9 +8,11 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::Path;
 
+use crate::bind::{Fork, Scan, Unresolved};
 use crate::cli::Exit;
-use crate::config::{Registry, RepoEntry, Role, default_config_path, load};
+use crate::config::{Registry, RepoEntry, Role, default_config_path, home_dir, load};
 use crate::consumer_pins::{ConsumerHeadMemo, ConsumerPinSource, scan_consumer_slug_with_heads};
+use crate::ids::RepoName;
 use crate::ids::{BookmarkRef, BranchName, ReleaseScheme, RemoteName, is_our_release};
 use crate::jj::Repo;
 use crate::release_model::{release_order, repo_slug};
@@ -50,17 +52,17 @@ fn newest_release(tips: &crate::detect::BookmarkTips, entry: &RepoEntry) -> Opti
     }
 }
 
-fn release_state(registry: &Registry) -> BTreeMap<String, ReleaseState> {
-    registry
-        .repos
+/// Release state for every checkout the scan found; an entry without one has none.
+fn release_state(scan: &Scan<'_>) -> BTreeMap<String, ReleaseState> {
+    scan.found
         .iter()
-        .map(|(name, entry)| {
-            let repo = Repo::open(&entry.path).ok();
+        .map(|(name, fork)| {
+            let repo = Repo::open(&fork.checkout.path).ok();
             let newest = repo
                 .as_ref()
                 .and_then(|repo| repo.bookmark_tips().ok())
-                .and_then(|tips| newest_release(&tips, entry));
-            (name.clone(), ReleaseState { newest, repo })
+                .and_then(|tips| newest_release(&tips, fork.entry));
+            (name.to_string(), ReleaseState { newest, repo })
         })
         .collect()
 }
@@ -87,18 +89,18 @@ fn consumer_label(consumer: &str) -> String {
     reason = "the current release state and shared consumer-scan collaborators have independent owners and lifetimes"
 )]
 pub fn pin_lag(
-    entry: &RepoEntry,
+    fork: &Fork<'_>,
     newest: Option<&String>,
     repo: Option<&Repo>,
     forge: &dyn ConsumerPinSource,
     cache_root: Option<&Path>,
     heads: &ConsumerHeadMemo,
 ) -> PinLag {
-    let scheme = entry.release_scheme();
+    let scheme = fork.entry.release_scheme();
     match &scheme {
-        ReleaseScheme::Dated => dated_pin_lag(entry, newest, &scheme, forge, cache_root, heads),
+        ReleaseScheme::Dated => dated_pin_lag(fork, newest, &scheme, forge, cache_root, heads),
         ReleaseScheme::Fixed(fixed) => {
-            fixed_pin_lag(entry, repo, fixed, &scheme, forge, cache_root, heads)
+            fixed_pin_lag(fork, repo, fixed, &scheme, forge, cache_root, heads)
         }
     }
 }
@@ -108,13 +110,14 @@ pub fn pin_lag(
     reason = "dated pin lag needs a release comparison target and each shared scan collaborator independently"
 )]
 fn dated_pin_lag(
-    entry: &RepoEntry,
+    fork: &Fork<'_>,
     newest: Option<&String>,
     scheme: &ReleaseScheme,
     forge: &dyn ConsumerPinSource,
     cache_root: Option<&Path>,
     heads: &ConsumerHeadMemo,
 ) -> PinLag {
+    let entry = fork.entry;
     if entry.consumers.is_empty() {
         return PinLag::default();
     }
@@ -136,7 +139,7 @@ fn dated_pin_lag(
         let mut scan = scan_consumer_slug_with_heads(
             forge,
             cache_root,
-            &entry.path,
+            &fork.checkout.path,
             consumer,
             slug.as_deref(),
             scheme,
@@ -176,7 +179,7 @@ fn dated_pin_lag(
     reason = "fixed pin lag needs both fixed-release comparison inputs and each shared scan collaborator independently"
 )]
 fn fixed_pin_lag(
-    entry: &RepoEntry,
+    fork: &Fork<'_>,
     repo: Option<&Repo>,
     fixed: &BranchName,
     scheme: &ReleaseScheme,
@@ -184,6 +187,7 @@ fn fixed_pin_lag(
     cache_root: Option<&Path>,
     heads: &ConsumerHeadMemo,
 ) -> PinLag {
+    let entry = fork.entry;
     let slug = repo_slug(entry);
     let local_tip = repo.and_then(|repo| {
         repo.bookmark_tips()
@@ -197,7 +201,7 @@ fn fixed_pin_lag(
         let mut scan = scan_consumer_slug_with_heads(
             forge,
             cache_root,
-            &entry.path,
+            &fork.checkout.path,
             consumer,
             slug.as_deref(),
             scheme,
@@ -267,7 +271,8 @@ pub struct Report {
 #[derive(Debug, serde::Serialize)]
 pub struct RepoRow {
     pub name: String,
-    pub path: String,
+    /// Where the checkout was found under `$HOME`; `None` when it was not.
+    pub path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub release_remote: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -280,10 +285,14 @@ pub struct RepoRow {
     pub problems: Vec<String>,
 }
 
-/// What one listing reads: the registry, each repository's release state, and
-/// the consumer-scan collaborators every row shares.
+/// What one listing reads: the registry, the scan that placed its entries on
+/// this machine, each found repository's release state, and the consumer-scan
+/// collaborators every row shares.
 pub struct GatherInput<'a> {
     pub registry: &'a Registry,
+    pub scan: &'a Scan<'a>,
+    /// The scan root, named when an entry has more than one checkout under it.
+    pub home: &'a Path,
     pub releases: &'a BTreeMap<String, ReleaseState>,
     pub config_path: &'a Path,
     pub forge: &'a dyn ConsumerPinSource,
@@ -301,9 +310,15 @@ impl std::fmt::Debug for GatherInput<'_> {
 }
 
 /// Collects release state and consumer pin lag for every registry entry.
+///
+/// Every entry is a row. One the scan found carries its checkout path, remote
+/// notes, and pin lag; one found twice carries the refusal as a problem; one
+/// not found carries neither, and renders as not on this machine.
 pub fn gather(input: &GatherInput<'_>) -> Report {
     let GatherInput {
         registry,
+        scan,
+        home,
         releases,
         config_path,
         forge,
@@ -314,25 +329,52 @@ pub fn gather(input: &GatherInput<'_>) -> Report {
         .repos
         .iter()
         .map(|(name, entry)| {
+            let release_remote = entry
+                .has_split_release()
+                .then(|| entry.remote(Role::Release).to_owned());
+            let repo_name = RepoName::new(name.as_str());
+            let Some(fork) = scan.found.get(&repo_name) else {
+                let problems = scan
+                    .duplicates
+                    .get(&repo_name)
+                    .map(|paths| {
+                        Unresolved::Duplicate {
+                            home: home.to_owned(),
+                            paths: paths.clone(),
+                        }
+                        .message(&repo_name)
+                    })
+                    .into_iter()
+                    .collect();
+                return RepoRow {
+                    name: name.clone(),
+                    path: None,
+                    release_remote,
+                    newest_release: None,
+                    behind: None,
+                    notes: Vec::new(),
+                    problems,
+                };
+            };
             let state = releases.get(name);
             let newest = state.and_then(|state| state.newest.as_ref());
             let pin_lag = pin_lag(
-                entry,
+                fork,
                 newest,
                 state.and_then(|state| state.repo.as_ref()),
                 forge,
                 cache_root,
                 heads,
             );
+            let mut notes = fork.remote_notes();
+            notes.extend(pin_lag.notes);
             RepoRow {
                 name: name.clone(),
-                path: entry.path.display().to_string(),
-                release_remote: entry
-                    .has_split_release()
-                    .then(|| entry.remote(Role::Release).to_owned()),
+                path: Some(fork.checkout.path.display().to_string()),
+                release_remote,
                 newest_release: newest.cloned(),
                 behind: pin_lag.lag,
-                notes: pin_lag.notes,
+                notes,
                 problems: pin_lag.problems,
             }
         })
@@ -351,6 +393,7 @@ pub fn gather(input: &GatherInput<'_>) -> Report {
                 .to_owned(),
         );
     }
+    notes.extend(scan.problems.iter().cloned());
 
     Report {
         repos,
@@ -372,7 +415,11 @@ pub fn render(report: &Report) -> String {
         .unwrap_or(0);
     let mut lines = Vec::new();
     for repo in &report.repos {
-        let mut line = format!("{:<width$}  {}", repo.name, repo.path);
+        let mut line = format!(
+            "{:<width$}  {}",
+            repo.name,
+            repo.path.as_deref().unwrap_or("not on this machine")
+        );
         if let Some(release_remote) = &repo.release_remote {
             let _ = write!(line, "  release-remote={release_remote}");
         }
@@ -406,12 +453,16 @@ pub fn exit_for(report: &Report) -> Exit {
 pub fn run(output: crate::cli::Output) -> anyhow::Result<Exit> {
     let path = default_config_path();
     let registry = load(&path)?;
-    let releases = release_state(&registry);
+    let home = home_dir();
+    let scan = crate::bind::scan(&registry, &home);
+    let releases = release_state(&scan);
     let forge = crate::forge::github::CliForge;
     let cache_root = crate::forge_cache::cache_root();
     let heads = ConsumerHeadMemo::default();
     let report = gather(&GatherInput {
         registry: &registry,
+        scan: &scan,
+        home: &home,
         releases: &releases,
         config_path: &path,
         forge: &forge,
@@ -432,16 +483,31 @@ mod tests {
         clippy::indexing_slicing,
         reason = "indexing a result in a test is the assertion; a panic is the failure"
     )]
-    use std::path::PathBuf;
-
     use super::*;
     use crate::config::RepoEntry;
     use crate::consumer_pins::ConsumerHeadMemo;
     use crate::forge::{ConsumerHead, fake::FakeForge};
     use crate::ids::{BookmarkRef, BranchName, CommitId, RemoteName};
+
+    /// A scan that placed every entry of `registry` at `<dir>/<name>`.
+    fn found<'a>(registry: &'a Registry, dir: &Path) -> Scan<'a> {
+        Scan {
+            found: registry
+                .repos
+                .iter()
+                .map(|(name, entry)| {
+                    (
+                        RepoName::new(name.as_str()),
+                        Fork::at(name, entry, &dir.join(name)),
+                    )
+                })
+                .collect(),
+            ..Scan::default()
+        }
+    }
+
     fn entry(release: Option<&str>) -> RepoEntry {
         RepoEntry {
-            path: PathBuf::from("/tmp/a-repo"),
             upstream: "u".to_owned(),
             origin: "o".to_owned(),
             base: None,
@@ -543,10 +609,13 @@ mod tests {
     fn repos_are_listed_one_per_line_sorted_by_name() {
         // Given: two repos out of order
         let registry = registry(&[("beta", None), ("alpha", None)]);
-        let releases = release_state(&registry);
+        let scan = Scan::default();
+        let releases = release_state(&scan);
         // When: gathered and rendered
         let report = gather(&GatherInput {
             registry: &registry,
+            scan: &scan,
+            home: Path::new("/home/someone"),
             releases: &releases,
             config_path: Path::new("/tmp/repos.toml"),
             forge: &FakeForge::default(),
@@ -559,6 +628,53 @@ mod tests {
         assert_eq!(lines.len(), 3);
         assert!(lines[0].starts_with("alpha"));
         assert!(lines[1].starts_with("beta"));
+    }
+
+    #[test]
+    fn an_entry_the_scan_did_not_place_is_still_a_row() {
+        // Not found renders as not on this machine; found twice is a problem
+        // naming both paths; a checkout whose remotes could not be read is a
+        // report note. Nothing is opened for any of them.
+        let registry = registry(&[("absent", None), ("twice", None)]);
+        let home = Path::new("/home/someone");
+        let scan = Scan {
+            duplicates: BTreeMap::from([(
+                RepoName::new("twice"),
+                vec![home.join("a/twice"), home.join("b/twice")],
+            )]),
+            problems: vec!["reading remotes of /home/someone/broken: boom".to_owned()],
+            ..Scan::default()
+        };
+        let report = gather(&GatherInput {
+            registry: &registry,
+            scan: &scan,
+            home,
+            releases: &BTreeMap::new(),
+            config_path: Path::new("/tmp/repos.toml"),
+            forge: &FakeForge::default(),
+            cache_root: None,
+            heads: &ConsumerHeadMemo::default(),
+        });
+
+        assert_eq!(report.repos[0].path, None);
+        assert_eq!(
+            report.repos[1].problems,
+            vec![
+                "twice has 2 checkouts under /home/someone: /home/someone/a/twice, \
+                 /home/someone/b/twice; knives will not choose"
+            ]
+        );
+        assert!(
+            report
+                .notes
+                .contains(&"reading remotes of /home/someone/broken: boom".to_owned())
+        );
+        let rendered = render(&report);
+        assert!(
+            rendered.starts_with("absent  not on this machine"),
+            "{rendered}"
+        );
+        assert_eq!(exit_for(&report), Exit::Incomplete);
     }
 
     #[test]
@@ -602,7 +718,6 @@ mod tests {
         };
         let heads = ConsumerHeadMemo::default();
         let entry = RepoEntry {
-            path: dir.path().join("repo"),
             upstream: "https://forge.invalid/up/sandbox-runner".to_owned(),
             origin: "https://forge.invalid/o/sandbox-runner".to_owned(),
             base: None,
@@ -613,8 +728,9 @@ mod tests {
             workspaces: None,
         };
 
+        let fork = Fork::at("sandbox-runner", &entry, &dir.path().join("repo"));
         let lag = pin_lag(
-            &entry,
+            &fork,
             Some(&"release/2026-07-28@origin".to_owned()),
             None,
             &forge,
@@ -656,7 +772,6 @@ mod tests {
         };
         let heads = ConsumerHeadMemo::default();
         let entry = RepoEntry {
-            path: dir.path().join("repo"),
             upstream: "https://forge.invalid/up/sandbox-runner".to_owned(),
             origin: "https://forge.invalid/o/sandbox-runner".to_owned(),
             base: None,
@@ -667,7 +782,8 @@ mod tests {
             workspaces: None,
         };
 
-        let pin_lag = pin_lag(&entry, None, None, &forge, None, &heads);
+        let fork = Fork::at("sandbox-runner", &entry, &dir.path().join("repo"));
+        let pin_lag = pin_lag(&fork, None, None, &forge, None, &heads);
 
         assert_eq!(pin_lag.lag, None);
         assert!(
@@ -699,7 +815,6 @@ mod tests {
         };
         let heads = ConsumerHeadMemo::default();
         let entry = RepoEntry {
-            path: dir.path().join("repo"),
             upstream: "https://forge.invalid/up/sandbox-runner".to_owned(),
             origin: "https://forge.invalid/o/sandbox-runner".to_owned(),
             base: None,
@@ -710,7 +825,8 @@ mod tests {
             workspaces: None,
         };
 
-        let pin_lag = pin_lag(&entry, None, None, &forge, None, &heads);
+        let fork = Fork::at("sandbox-runner", &entry, &dir.path().join("repo"));
+        let pin_lag = pin_lag(&fork, None, None, &forge, None, &heads);
 
         assert_eq!(pin_lag.lag, None);
         assert!(
@@ -743,7 +859,6 @@ mod tests {
         };
         let heads = ConsumerHeadMemo::default();
         let entry = RepoEntry {
-            path: dir.path().join("repo"),
             upstream: "https://forge.invalid/up/sandbox-runner".to_owned(),
             origin: "https://forge.invalid/o/sandbox-runner".to_owned(),
             base: None,
@@ -757,6 +872,7 @@ mod tests {
             repos: BTreeMap::from([("sandbox-runner".to_owned(), entry)]),
             ..Registry::default()
         };
+        let scan = found(&registry, dir.path());
         let releases = BTreeMap::from([(
             "sandbox-runner".to_owned(),
             ReleaseState {
@@ -767,6 +883,8 @@ mod tests {
 
         let report = gather(&GatherInput {
             registry: &registry,
+            scan: &scan,
+            home: dir.path(),
             releases: &releases,
             config_path: Path::new("/tmp/repos.toml"),
             forge: &forge,
@@ -794,6 +912,7 @@ mod tests {
             repos: BTreeMap::from([("tool".to_owned(), entry)]),
             ..Registry::default()
         };
+        let scan = found(&registry, cache.path());
         let releases = BTreeMap::from([(
             "tool".to_owned(),
             ReleaseState {
@@ -819,6 +938,8 @@ mod tests {
         let priming_heads = ConsumerHeadMemo::default();
         let priming_report = gather(&GatherInput {
             registry: &registry,
+            scan: &scan,
+            home: cache.path(),
             releases: &releases,
             config_path: Path::new("/tmp/repos.toml"),
             forge: &priming_forge,
@@ -834,6 +955,8 @@ mod tests {
         let unavailable_heads = ConsumerHeadMemo::default();
         let report = gather(&GatherInput {
             registry: &registry,
+            scan: &scan,
+            home: cache.path(),
             releases: &releases,
             config_path: Path::new("/tmp/repos.toml"),
             forge: &unavailable_forge,
@@ -853,9 +976,12 @@ mod tests {
     #[test]
     fn a_split_release_remote_is_shown() {
         let registry = registry(&[("split", Some("r"))]);
-        let releases = release_state(&registry);
+        let scan = Scan::default();
+        let releases = release_state(&scan);
         let report = gather(&GatherInput {
             registry: &registry,
+            scan: &scan,
+            home: Path::new("/home/someone"),
             releases: &releases,
             config_path: Path::new("/tmp/repos.toml"),
             forge: &FakeForge::default(),
@@ -868,9 +994,12 @@ mod tests {
     #[test]
     fn the_release_column_is_omitted_when_it_defaults_to_origin() {
         let registry = registry(&[("simple", None)]);
-        let releases = release_state(&registry);
+        let scan = Scan::default();
+        let releases = release_state(&scan);
         let report = gather(&GatherInput {
             registry: &registry,
+            scan: &scan,
+            home: Path::new("/home/someone"),
             releases: &releases,
             config_path: Path::new("/tmp/repos.toml"),
             forge: &FakeForge::default(),
@@ -885,6 +1014,8 @@ mod tests {
         // Printing nothing would be indistinguishable from a broken command.
         let report = gather(&GatherInput {
             registry: &Registry::default(),
+            scan: &Scan::default(),
+            home: Path::new("/home/someone"),
             releases: &BTreeMap::new(),
             config_path: Path::new("/tmp/somewhere/repos.toml"),
             forge: &FakeForge::default(),
@@ -902,6 +1033,8 @@ mod tests {
         // TOON/JSON consumers see it too.
         let report = gather(&GatherInput {
             registry: &Registry::default(),
+            scan: &Scan::default(),
+            home: Path::new("/home/someone"),
             releases: &BTreeMap::new(),
             config_path: Path::new("/tmp/somewhere/repos.toml"),
             forge: &FakeForge::default(),
@@ -940,13 +1073,13 @@ mod tests {
         };
         let heads = ConsumerHeadMemo::default();
         let mut sandbox = entry(None);
-        sandbox.path = dir.path().join("repo");
         sandbox.origin = "https://forge.invalid/o/sandbox-runner".to_owned();
         sandbox.consumers = vec![consumer.to_owned()];
         let registry = Registry {
             repos: BTreeMap::from([("sandbox-runner".to_owned(), sandbox)]),
             ..Registry::default()
         };
+        let scan = found(&registry, dir.path());
         let releases = BTreeMap::from([(
             "sandbox-runner".to_owned(),
             ReleaseState {
@@ -957,6 +1090,8 @@ mod tests {
 
         let report = gather(&GatherInput {
             registry: &registry,
+            scan: &scan,
+            home: dir.path(),
             releases: &releases,
             config_path: Path::new("/tmp/repos.toml"),
             forge: &forge,

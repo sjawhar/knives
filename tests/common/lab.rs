@@ -477,7 +477,6 @@ impl Lab {
 
     pub(crate) fn repo_entry_with_release_branch(&self, name: &str) -> knives::config::RepoEntry {
         knives::config::RepoEntry {
-            path: self.work.clone(),
             upstream: self.upstream.display().to_string(),
             // The work directory deliberately stands in for origin, per lab convention.
             origin: self.work.display().to_string(),
@@ -493,7 +492,6 @@ impl Lab {
 /// A registry entry for the lab's work checkout, which stands in for origin.
 pub fn lab_entry(lab: &Lab) -> knives::config::RepoEntry {
     knives::config::RepoEntry {
-        path: lab.work.clone(),
         upstream: lab.upstream.display().to_string(),
         origin: lab.work.display().to_string(),
         base: None,
@@ -502,6 +500,23 @@ pub fn lab_entry(lab: &Lab) -> knives::config::RepoEntry {
         test_count_command: None,
         consumers: Vec::new(),
         workspaces: None,
+    }
+}
+
+/// The lab's work checkout bound to `entry` under the registry name `name`, with
+/// the remotes the checkout really declares.
+pub fn lab_fork<'a>(
+    lab: &Lab,
+    name: &str,
+    entry: &'a knives::config::RepoEntry,
+) -> knives::bind::Fork<'a> {
+    knives::bind::Fork {
+        name: knives::ids::RepoName::new(name),
+        entry,
+        checkout: knives::bind::Checkout {
+            path: lab.work.clone(),
+            remotes: knives::bind::remotes(&lab.work).expect("read the work checkout's remotes"),
+        },
     }
 }
 /// Registry home plus a local consumer for release tests. The registry deliberately
@@ -531,8 +546,7 @@ pub fn release_test_home_pinned(
     std::fs::write(
         home.path().join("repos.toml"),
         format!(
-            "[repos.demo]\npath = \"{}\"\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/work.git\"\n",
-            lab.work.display(),
+            "[repos.demo]\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/work.git\"\n",
             lab.upstream.display(),
         ),
     )
@@ -619,7 +633,9 @@ pub fn release_command(
     command.args(args);
     command
         .current_dir(&lab.work)
-        .env("KNIVES_CONFIG_HOME", home.path());
+        .env("KNIVES_CONFIG_HOME", home.path())
+        .env("HOME", lab.temp_path())
+        .env("JJ_CONFIG", "/dev/null");
     command
 }
 
@@ -630,7 +646,9 @@ pub fn start_command(lab: &Lab, home: &tempfile::TempDir, branch: &str) -> Comma
     command
         .args(["--text", "start", branch, "--repo", "demo", "--why", "test"])
         .current_dir(&lab.work)
-        .env("KNIVES_CONFIG_HOME", home.path());
+        .env("KNIVES_CONFIG_HOME", home.path())
+        .env("HOME", lab.temp_path())
+        .env("JJ_CONFIG", "/dev/null");
     command
 }
 

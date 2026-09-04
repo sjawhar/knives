@@ -319,11 +319,8 @@ mod tests {
         fork_checkout(&repository, "https://forge.invalid/maintainer/repo");
         std::fs::write(
             home.path().join("repos.toml"),
-            format!(
-                "[repos.repo]\npath = \"{}\"\nupstream = \"https://forge.invalid/maintainer/repo.git\"\n\
-                 origin = \"https://forge.invalid/ours/repo\"\n",
-                repository.display()
-            ),
+            "[repos.repo]\nupstream = \"https://forge.invalid/maintainer/repo.git\"\n\
+             origin = \"https://forge.invalid/ours/repo\"\n",
         )
         .unwrap();
         std::fs::write(
@@ -358,7 +355,7 @@ mod tests {
         std::fs::create_dir_all(broken.join(".jj")).unwrap();
         std::fs::write(
             home.path().join("repos.toml"),
-            "[repos.repo]\npath = \"/unused\"\nupstream = \"https://forge.invalid/maintainer/repo\"\n\
+            "[repos.repo]\nupstream = \"https://forge.invalid/maintainer/repo\"\n\
              origin = \"https://forge.invalid/ours/repo\"\n",
         )
         .unwrap();

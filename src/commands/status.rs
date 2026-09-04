@@ -2,7 +2,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::path::Path;
 
+use crate::bind::Fork;
 use crate::cli::Exit;
 use crate::config::{Registry, RepoEntry, Role};
 use crate::detect::{
@@ -499,9 +501,9 @@ fn note_fetched_heads(report: &mut Report, fetched_heads: usize) {
 /// rule nobody stated is nobody's decision to disagree with. A rule knives itself
 /// wrote earlier, now stale because the entry changed, is reported too — `start`
 /// is what refreshes it, and the detail says so.
-fn immutable_heads_finding(entry: &RepoEntry) -> Result<Option<Finding>, JjError> {
+fn immutable_heads_finding(entry: &RepoEntry, path: &Path) -> Result<Option<Finding>, JjError> {
     let rule = entry.immutable_heads();
-    let Some(stated) = repo_immutable_heads(&entry.path)? else {
+    let Some(stated) = repo_immutable_heads(path)? else {
         return Ok(None);
     };
     if stated.rule == rule {
@@ -522,7 +524,7 @@ fn immutable_heads_finding(entry: &RepoEntry) -> Result<Option<Finding>, JjError
     };
     Ok(Some(Finding::new(
         FindingKind::ImmutableHeadsRule,
-        Subject::File(repo_config_path(&entry.path)?.display().to_string()),
+        Subject::File(repo_config_path(path)?.display().to_string()),
         detail,
     )))
 }
@@ -532,8 +534,9 @@ fn add_immutable_heads_finding(
     report: &mut Report,
     findings: &mut Vec<Finding>,
     entry: &RepoEntry,
+    path: &Path,
 ) {
-    match immutable_heads_finding(entry) {
+    match immutable_heads_finding(entry, path) {
         Ok(finding) => findings.extend(finding),
         Err(error) => report
             .problems
@@ -555,8 +558,7 @@ struct FinalStatusInput<'a, 'snapshot> {
 
 /// Inputs that turn completed phases into the report's visible rows and findings.
 struct PostPhaseInput<'a> {
-    name: &'a RepoName,
-    entry: &'a RepoEntry,
+    fork: &'a Fork<'a>,
     repo: &'a Repo,
     store: &'a Store,
     options: &'a Options<'a>,
@@ -607,6 +609,7 @@ fn settle_rows_after_phases(
     input: &PostPhaseInput<'_>,
     index: &PullIndex,
 ) -> anyhow::Result<()> {
+    let entry = input.fork.entry;
     merged::settle_merged_landed(
         report,
         merged::MergedLandedInput {
@@ -617,21 +620,21 @@ fn settle_rows_after_phases(
             trunk_tip: input.trunk_commit,
         },
     )?;
-    let scheme = input.entry.release_scheme();
+    let scheme = entry.release_scheme();
     findings.extend(carried_findings(CarriedFindingInput {
         report,
         repo: input.repo,
         tips: input.tips,
-        trunk: input.entry.trunk(),
+        trunk: entry.trunk(),
         scheme: &scheme,
-        publish_remote: input.entry.publish_remote(),
+        publish_remote: entry.publish_remote(),
     })?);
-    let trunks = crate::release_model::trunk_positions(input.repo, input.entry)?;
+    let trunks = crate::release_model::trunk_positions(input.repo, entry)?;
     if !trunks.is_empty() {
         let releases = crate::release_model::release_refs_by_commit(
             input.tips,
             &scheme,
-            input.entry.publish_remote(),
+            entry.publish_remote(),
         );
         findings.extend(stacked_pull_findings(
             report,
@@ -754,12 +757,17 @@ fn fold_phase_outcome(
     timings.forge = phases.forge.duration;
     timings.probes = phases.probe.duration;
 
+    let name = &input.fork.name;
+    let entry = input.fork.entry;
     let phase = std::time::Instant::now();
-    let origin_phase =
-        phases::origin_phase(&input.entry.path, &probe_inputs, input.options.workers);
+    let origin_phase = phases::origin_phase(
+        &input.fork.checkout.path,
+        &probe_inputs,
+        input.options.workers,
+    );
     let unjudged = rows::branch_rows(
         rows::RowInput {
-            name: input.name,
+            name,
             store: input.store,
             probe_inputs,
             verdicts: std::mem::take(&mut phases.probe.verdicts),
@@ -767,7 +775,7 @@ fn fold_phase_outcome(
             index,
             snapshot,
             notches: input.notches,
-            expected_base: input.entry.default_base(),
+            expected_base: entry.default_base(),
         },
         report,
         findings,
@@ -779,12 +787,12 @@ fn fold_phase_outcome(
         &rows::DivergentInput {
             branches: &divergent_names,
             tips: input.tips,
-            name: input.name,
+            name,
             store: input.store,
             snapshot,
             index,
             notches: input.notches,
-            expected_base: input.entry.default_base(),
+            expected_base: entry.default_base(),
         },
         report,
         findings,
@@ -794,7 +802,7 @@ fn fold_phase_outcome(
     timings.carried_findings = phase.elapsed();
 
     timings.touching =
-        add_branch_overlap_findings(report, findings, input.entry, input.options.workers);
+        add_branch_overlap_findings(report, findings, input.fork, input.options.workers);
 
     let phase = std::time::Instant::now();
     let seen = crate::seen::load();
@@ -803,7 +811,7 @@ fn fold_phase_outcome(
         findings,
         ClaimFoldInput {
             repo: input.repo,
-            name: input.name,
+            name,
             store: input.store,
             seen: &seen,
             tips: input.tips,
@@ -818,7 +826,8 @@ fn fold_phase_outcome(
     add_dependency_findings(DependencyInput {
         report,
         findings,
-        name: input.name,
+        name,
+        path: &input.fork.checkout.path,
         store: input.store,
         options: input.options,
         snapshot,
@@ -838,23 +847,48 @@ fn fold_phase_outcome(
     Ok(())
 }
 
+/// The forge snapshot, or `None` after noting why the forge could not answer.
+fn open_forge_or_note<'a>(
+    report: &mut Report,
+    fork: &'a Fork<'a>,
+    options: &'a Options<'a>,
+) -> Option<crate::snapshot::Opened<'a>> {
+    match phases::open_forge_snapshot(
+        options.forge,
+        fork.entry,
+        &fork.checkout.path,
+        options.cache,
+    ) {
+        Ok(opened) => opened,
+        Err(error) => {
+            report
+                .problems
+                .push(format!("pull request state unavailable: {error}"));
+            None
+        }
+    }
+}
+
 /// The report, and where the run spent its time.
 ///
 /// One function rather than two paths, so a measured run and an unmeasured one
 /// cannot drift: `gather` is this with the measurement dropped.
 pub fn gather_timed(
-    name: &RepoName,
-    entry: &RepoEntry,
+    fork: &Fork<'_>,
     store: &Store,
     options: &Options<'_>,
 ) -> anyhow::Result<(Report, Timings)> {
+    let name = &fork.name;
+    let entry = fork.entry;
+    let path = &fork.checkout.path;
     let started = std::time::Instant::now();
     let mut timings = Timings::default();
     let phase = std::time::Instant::now();
-    let repo = Repo::open(&entry.path)?;
+    let repo = Repo::open(path)?;
     let mut report = Report {
         repo: name.to_string(),
         trunk: entry.trunk().to_owned(),
+        notes: fork.remote_notes(),
         ..Report::default()
     };
     let mut findings = Vec::new();
@@ -868,6 +902,7 @@ pub fn gather_timed(
             repo: &repo,
             tips: &tips,
             entry,
+            path,
         },
     )?;
     timings.releases = phase.elapsed();
@@ -886,27 +921,19 @@ pub fn gather_timed(
     let notches = notches_from_ledger(options.ledger, &mut report);
     report.repo_notches = repo_notches(&notches);
     note_fetched_heads(&mut report, fetched_heads);
-    add_immutable_heads_finding(&mut report, &mut findings, entry);
+    add_immutable_heads_finding(&mut report, &mut findings, entry, path);
     timings.setup = phase.elapsed();
 
     let forge_started = std::time::Instant::now();
-    let opened = match phases::open_forge_snapshot(options.forge, entry, options.cache) {
-        Ok(opened) => opened,
-        Err(error) => {
-            report
-                .problems
-                .push(format!("pull request state unavailable: {error}"));
-            None
-        }
-    };
+    let opened = open_forge_or_note(&mut report, fork, options);
     let opened_ref = opened.as_ref();
     let trunk_commit = repo.resolve_commit(&entry.upstream_trunk()).ok();
     let probe_ran = options.probe && trunk_commit.is_some();
     let (mut phases, health) = std::thread::scope(|scope| {
-        let health =
-            scope.spawn(|| phases::repository_health(&entry.path, &tips, entry.publish_remote()));
+        let health = scope.spawn(|| phases::repository_health(path, &tips, entry.publish_remote()));
         let phases = phases::run_status_phases(phases::StatusPhaseInput {
             entry,
+            path,
             options,
             probe_inputs: &probe_inputs,
             opened: opened_ref,
@@ -931,8 +958,7 @@ pub fn gather_timed(
             timings: &mut timings,
         },
         &PostPhaseInput {
-            name,
-            entry,
+            fork,
             repo: &repo,
             store,
             options,
@@ -950,13 +976,8 @@ pub fn gather_timed(
     Ok((report, timings))
 }
 
-pub fn gather(
-    name: &RepoName,
-    entry: &RepoEntry,
-    store: &Store,
-    options: &Options<'_>,
-) -> anyhow::Result<Report> {
-    gather_timed(name, entry, store, options).map(|(report, _)| report)
+pub fn gather(fork: &Fork<'_>, store: &Store, options: &Options<'_>) -> anyhow::Result<Report> {
+    gather_timed(fork, store, options).map(|(report, _)| report)
 }
 
 /// One grouped subject per raw finding. Relationship findings include the
@@ -1276,7 +1297,6 @@ mod tests {
             ..Report::default()
         };
         let entry = RepoEntry {
-            path: std::path::PathBuf::new(),
             upstream: String::new(),
             origin: String::new(),
             base: None,
@@ -1287,7 +1307,8 @@ mod tests {
             workspaces: None,
         };
 
-        let _ = add_branch_overlap_findings(&mut report, &mut Vec::new(), &entry, 1);
+        let fork = Fork::at("demo", &entry, Path::new(""));
+        let _ = add_branch_overlap_findings(&mut report, &mut Vec::new(), &fork, 1);
 
         assert!(
             report
@@ -1308,7 +1329,6 @@ mod tests {
             ..Report::default()
         };
         let entry = RepoEntry {
-            path: scratch.path().to_owned(),
             upstream: String::new(),
             origin: String::new(),
             base: None,
@@ -1319,7 +1339,8 @@ mod tests {
             workspaces: None,
         };
 
-        let _ = add_branch_overlap_findings(&mut report, &mut Vec::new(), &entry, 1);
+        let fork = Fork::at("demo", &entry, scratch.path());
+        let _ = add_branch_overlap_findings(&mut report, &mut Vec::new(), &fork, 1);
 
         assert_eq!(exit_for(&report), Exit::Incomplete);
     }

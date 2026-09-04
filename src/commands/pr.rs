@@ -2,11 +2,11 @@
 
 use std::path::Path;
 
+use crate::bind::Fork;
 use crate::cli::Exit;
-use crate::config::RepoEntry;
 use crate::detect::pull_state::{PullState, pull_state_findings};
 use crate::forge::{DiffTotals, Forge, PullDetails, TimelineEvent, TimelineEventKind};
-use crate::ids::{RepoName, short_id};
+use crate::ids::short_id;
 
 #[derive(Debug, serde::Serialize)]
 pub struct Report {
@@ -35,8 +35,7 @@ pub struct Report {
 }
 
 pub struct Request<'a> {
-    pub repo: &'a RepoName,
-    pub entry: &'a RepoEntry,
+    pub fork: &'a Fork<'a>,
     pub number: u64,
     pub timeline: bool,
     pub forge: &'a dyn Forge,
@@ -47,8 +46,7 @@ impl std::fmt::Debug for Request<'_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("Request")
-            .field("repo", self.repo)
-            .field("entry", self.entry)
+            .field("fork", self.fork)
             .field("number", &self.number)
             .field("forge", &true)
             .field("timeline", &self.timeline)
@@ -59,25 +57,23 @@ impl std::fmt::Debug for Request<'_> {
 
 /// `Ok(None)` when the forge answered and the number does not exist there.
 pub fn gather(request: &Request<'_>) -> anyhow::Result<Option<Report>> {
+    let entry = request.fork.entry;
+    let path = &request.fork.checkout.path;
     let remotes = [
-        request.entry.remote(crate::config::Role::Origin),
-        request.entry.remote(crate::config::Role::Release),
+        entry.remote(crate::config::Role::Origin),
+        entry.remote(crate::config::Role::Release),
     ];
     let opened = crate::snapshot::open(crate::snapshot::SnapshotConfig {
         forge: request.forge,
-        path: &request.entry.path,
+        path,
         remotes,
         cache_root: request.cache_root,
     })?;
     let number = request.number;
     let snapshot = opened.complete_with(&number, |_, number| vec![*number])?;
     let timeline = if request.timeline && snapshot.fact(number).is_some() {
-        let target = request.forge.repo_identity(&request.entry.path)?;
-        Some(
-            request
-                .forge
-                .pull_timeline(&request.entry.path, &target, number)?,
-        )
+        let target = request.forge.repo_identity(path)?;
+        Some(request.forge.pull_timeline(path, &target, number)?)
     } else {
         None
     };
@@ -89,7 +85,7 @@ pub fn gather(request: &Request<'_>) -> anyhow::Result<Option<Report>> {
     let report = snapshot.fact(number).map(|fact| {
         let pull = &fact.pull;
         Report {
-            repo: request.repo.to_string(),
+            repo: request.fork.name.to_string(),
             number,
             state: pull.state.clone(),
             branch: pull.head_ref_name.clone(),
@@ -217,11 +213,10 @@ mod tests {
     use crate::cli::Exit;
     use crate::forge::fake::FakeForge;
     use crate::forge::{DiffTotals, PullRequest};
-    use crate::ids::{BranchName, RepoName};
+    use crate::ids::BranchName;
 
     fn entry() -> crate::config::RepoEntry {
         crate::config::RepoEntry {
-            path: std::path::PathBuf::new(),
             upstream: String::new(),
             origin: String::new(),
             base: None,
@@ -249,9 +244,9 @@ mod tests {
             ..FakeForge::default()
         };
         let entry = entry();
+        let fork = Fork::at("demo", &entry, Path::new(""));
         let request = Request {
-            repo: &RepoName::new("demo"),
-            entry: &entry,
+            fork: &fork,
             number: 4545,
             forge: &forge,
             cache_root: None,
@@ -271,9 +266,9 @@ mod tests {
     #[test]
     fn an_unanswered_number_is_none() {
         let entry = entry();
+        let fork = Fork::at("demo", &entry, Path::new(""));
         let request = Request {
-            repo: &RepoName::new("demo"),
-            entry: &entry,
+            fork: &fork,
             number: 9,
             forge: &FakeForge::default(),
             cache_root: None,

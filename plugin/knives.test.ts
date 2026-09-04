@@ -51,10 +51,9 @@ async function repository(): Promise<Repository> {
     ["upstream", "https://forge.invalid/maintainer/managed"],
     ["origin", "https://forge.invalid/ours/managed"],
   ]);
-  // `path` is still a required registry field until Task 3 deletes it.
   await write(
     join(home, "repos.toml"),
-    `[repos.managed]\npath = "${root}"\nupstream = "https://forge.invalid/maintainer/managed"\norigin = "https://forge.invalid/ours/managed"\n\n[trust]\nowners = ["ours"]\n`
+    `[repos.managed]\nupstream = "https://forge.invalid/maintainer/managed"\norigin = "https://forge.invalid/ours/managed"\n\n[trust]\nowners = ["ours"]\n`
   );
   return { home, root, file };
 }
@@ -766,7 +765,7 @@ test.serial.skipIf(realBinary.length === 0)(
         gitRepository(trusted, [["origin", "https://forge.invalid/company/work"]]);
         await write(
           join(home, "repos.toml"),
-          `[repos.gone]\npath = "/not/here"\nupstream = "https://forge.invalid/maintainer/gone"\norigin = "https://forge.invalid/ours/gone"\n\n[repos.managed]\npath = "${root}"\nupstream = "https://forge.invalid/maintainer/managed"\norigin = "https://forge.invalid/ours/managed"\n\n[trust]\nowners = ["ours"]\nrepos = ["company/work"]\n`
+          `[repos.gone]\nupstream = "https://forge.invalid/maintainer/gone"\norigin = "https://forge.invalid/ours/gone"\n\n[repos.managed]\nupstream = "https://forge.invalid/maintainer/managed"\norigin = "https://forge.invalid/ours/managed"\n\n[trust]\nowners = ["ours"]\nrepos = ["company/work"]\n`
         );
         const valid = output();
         await hooks["tool.execute.after"](

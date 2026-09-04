@@ -240,7 +240,6 @@ fn fixed_previous_position_keeps_the_published_remote_after_a_local_cut() {
     lab.jj_work(["bookmark", "set", "integration", "-r", "@"]);
     lab.jj_work(["new"]);
     let entry = RepoEntry {
-        path: lab.work.clone(),
         upstream: lab.upstream.display().to_string(),
         origin: lab.work.display().to_string(),
         base: None,
@@ -425,13 +424,9 @@ fn plan_for_a_fixed_release_ignores_a_non_publish_remote() {
         cache_root: None,
         heads: &heads,
     };
-    let plan = knives::commands::release::plan(
-        &knives::ids::RepoName::new("a-repo"),
-        &entry,
-        &consumers,
-        &[],
-    )
-    .expect("plan");
+    let plan =
+        knives::commands::release::plan(&lab::lab_fork(&lab, "a-repo", &entry), &consumers, &[])
+            .expect("plan");
 
     // Then: upstream cannot be mistaken for the publish remote's release.
     assert_eq!(plan.release.as_deref(), Some("integration@origin"));
@@ -541,8 +536,7 @@ fn a_named_cut_that_drops_the_test_count_returns_findings() {
     std::fs::write(
         home.path().join("repos.toml"),
         format!(
-            "[repos.demo]\npath = \"{}\"\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/work.git\"\ntest_count_command = \"if test -f branch-count; then cat branch-count; else printf 10; fi\"\n",
-            lab.work.display(),
+            "[repos.demo]\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/work.git\"\ntest_count_command = \"if test -f branch-count; then cat branch-count; else printf 10; fi\"\n",
             lab.upstream.display(),
         ),
     )
@@ -651,8 +645,7 @@ fn a_fixed_scheme_cut_carries_the_local_release_in_hand() {
     std::fs::write(
         home.path().join("repos.toml"),
         format!(
-            "[repos.demo]\npath = \"{}\"\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/work.git\"\nrelease_branch = \"integration\"\n",
-            lab.work.display(),
+            "[repos.demo]\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/work.git\"\nrelease_branch = \"integration\"\n",
             lab.upstream.display(),
         ),
     )

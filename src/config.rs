@@ -106,13 +106,15 @@ impl fmt::Display for Role {
     }
 }
 
-/// One repository as it appears on disk in the registry.
+/// One repository as the registry describes it: identity, remotes by role,
+/// policy. Where its checkout lives on this machine is not registry content;
+/// [`crate::bind`] finds it by its remotes.
 ///
 /// `upstream` and `origin` are required by the type, so a registry missing
 /// either fails to parse rather than failing later at the first query.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RepoEntry {
-    pub path: PathBuf,
     pub upstream: String,
     pub origin: String,
     /// Upstream's trunk: the branch we fork from, measure landed against, and
@@ -141,38 +143,18 @@ pub struct RepoEntry {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub consumers: Vec<String>,
     /// Where this repository's branch workspaces live. Absent, they sit beside
-    /// the checkout: the `<name>/default` layout, where each workspace is a
-    /// sibling of `default`.
+    /// the found checkout: the `<name>/default` layout, where each workspace is
+    /// a sibling of `default`.
     ///
     /// Set it for a checkout at `~/<name>`: with no `default` leaf there is no
-    /// room for siblings, and each branch would land in `~` itself. Resolved
-    /// like `path`: `~` expands, and a relative value is taken from the config
-    /// directory, not the checkout.
+    /// room for siblings, and each branch would land in `~` itself. A
+    /// preference, valid on every machine: `~` expands, and a relative value is
+    /// taken from the config directory, not the checkout.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspaces: Option<PathBuf>,
 }
 
 impl RepoEntry {
-    /// The repository's location, resolved the same way the plugin resolves it.
-    ///
-    /// The two sides used to disagree: the plugin expanded `~` and resolved a
-    /// relative path against the config home, while this side used the value
-    /// verbatim, i.e. relative to the process's current directory. A
-    /// `path = "~/repos/x"` entry was therefore a working allowlist entry and a
-    /// broken CLI entry, so the trust set and the tool covered different
-    /// directories. One rule now, and it is the plugin's.
-    pub fn resolved_path(&self, config_home: &Path) -> PathBuf {
-        expand_registry_path(&self.path, config_home)
-    }
-
-    /// The directory `knives start` opens this repository's workspaces under,
-    /// and `finish` removes them from.
-    pub fn workspace_root(&self) -> &Path {
-        self.workspaces
-            .as_deref()
-            .unwrap_or_else(|| self.path.parent().unwrap_or(&self.path))
-    }
-
     /// The remote for a role. Total: every role resolves.
     pub fn remote(&self, role: Role) -> &str {
         match role {
@@ -357,69 +339,15 @@ impl Registry {
         self.repos.is_empty()
     }
 
-    /// The managed repo that contains `path`, if any.
-    ///
-    /// Longest root wins, so a repo checked out inside another repo resolves to the
-    /// inner one. When `path` is a jj workspace beside its registered checkout,
-    /// `.jj/repo` points back to that checkout's repository store; following that
-    /// pointer retains the same component-based containment rule.
-    pub fn containing(&self, path: &Path) -> Option<(RepoName, &RepoEntry)> {
-        self.containing_direct(path).or_else(|| {
-            workspace_checkout(path).and_then(|checkout| self.containing_direct(&checkout))
-        })
-    }
-
-    fn containing_direct(&self, path: &Path) -> Option<(RepoName, &RepoEntry)> {
-        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_owned());
-        self.repos
-            .iter()
-            .filter(|(_, entry)| {
-                let root = entry
-                    .path
-                    .canonicalize()
-                    .unwrap_or_else(|_| entry.path.clone());
-                canonical == root || canonical.strip_prefix(&root).is_ok()
-            })
-            .max_by_key(|(_, entry)| entry.path.components().count())
-            .map(|(name, entry)| (RepoName::new(name.clone()), entry))
-    }
-
     pub fn names(&self) -> impl Iterator<Item = RepoName> + '_ {
         self.repos.keys().map(|name| RepoName::new(name.clone()))
     }
-}
-
-/// The registered checkout behind a jj workspace, when `path` is inside one.
-fn workspace_checkout(path: &Path) -> Option<PathBuf> {
-    for directory in path.ancestors() {
-        let pointer = directory.join(".jj").join("repo");
-        if !pointer.is_file() {
-            continue;
-        }
-        let store = PathBuf::from(std::fs::read_to_string(&pointer).ok()?.trim());
-        let store = if store.is_absolute() {
-            store
-        } else {
-            pointer.parent()?.join(store)
-        };
-        let checkout = store.parent()?.parent()?;
-        return checkout
-            .canonicalize()
-            .ok()
-            .or_else(|| Some(checkout.to_owned()));
-    }
-    None
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("reading {path}: {source}")]
     Read {
-        path: PathBuf,
-        source: std::io::Error,
-    },
-    #[error("writing {path}: {source}")]
-    Write {
         path: PathBuf,
         source: std::io::Error,
     },
@@ -430,11 +358,6 @@ pub enum ConfigError {
     },
     #[error("{path} is not a valid registry: {detail}")]
     Invalid { path: PathBuf, detail: String },
-    #[error("serialising the registry: {source}")]
-    Serialise {
-        #[from]
-        source: toml::ser::Error,
-    },
 }
 
 /// Where the registry lives.
@@ -491,7 +414,9 @@ pub fn load(path: &Path) -> Result<Registry, ConfigError> {
         path: path.to_owned(),
         source,
     })?;
-    reject_deleted_trusted_table(&text, path)?;
+    let raw = raw_table(&text, path)?;
+    reject_deleted_trusted_table(&raw, path)?;
+    reject_deleted_path_field(&raw, path)?;
     let mut registry: Registry = toml::from_str(&text).map_err(|source| ConfigError::Parse {
         path: path.to_owned(),
         source: Box::new(source),
@@ -510,12 +435,10 @@ pub fn load(path: &Path) -> Result<Registry, ConfigError> {
             });
         }
     }
-    // Resolve once, here, so no caller can accidentally use the raw value and
-    // end up pointed somewhere other than the plugin's allowlist.
+    reject_shared_upstreams(&registry, path)?;
     let home = path.parent().unwrap_or_else(|| Path::new(".")).to_owned();
     for (name, entry) in &mut registry.repos {
-        entry.path = entry.resolved_path(&home);
-        entry.workspaces = checked_workspaces(name, entry, &home, path)?;
+        entry.workspaces = checked_workspaces(name, entry.workspaces.as_deref(), &home, path)?;
         for (role, remote) in [
             ("upstream", entry.upstream.as_str()),
             ("origin", entry.origin.as_str()),
@@ -530,34 +453,7 @@ pub fn load(path: &Path) -> Result<Registry, ConfigError> {
                 });
             }
         }
-        if let Some(name) = entry.release_branch.as_deref() {
-            if name.is_empty() {
-                return Err(ConfigError::Invalid {
-                    path: path.to_owned(),
-                    detail: "release_branch is empty; a fixed release scheme needs a branch name"
-                        .to_owned(),
-                });
-            }
-            if name == entry.trunk() {
-                return Err(ConfigError::Invalid {
-                    path: path.to_owned(),
-                    detail: format!(
-                        "release_branch {name:?} names the trunk; a release branch shadowing the \
-                         trunk corrupts every trunk exclusion"
-                    ),
-                });
-            }
-            if name.starts_with(crate::ids::RELEASE_PREFIX) {
-                return Err(ConfigError::Invalid {
-                    path: path.to_owned(),
-                    detail: format!(
-                        "release_branch {name:?} sits in the dated {} namespace; the two schemes \
-                         must not collide",
-                        crate::ids::RELEASE_PREFIX
-                    ),
-                });
-            }
-        }
+        checked_release_branch(entry, path)?;
         for consumer in &entry.consumers {
             if !is_forge_slug(consumer) {
                 return Err(ConfigError::Invalid {
@@ -587,13 +483,54 @@ pub fn load(path: &Path) -> Result<Registry, ConfigError> {
     Ok(registry)
 }
 
-/// `[trusted.*]` was deleted with the registry's paths. A message that names the
-/// replacement beats serde's "unknown field" for the one section people had.
-fn reject_deleted_trusted_table(text: &str, path: &Path) -> Result<(), ConfigError> {
-    let raw: toml::Table = toml::from_str(text).map_err(|source| ConfigError::Parse {
+/// A release branch named for the trunk would make every trunk exclusion also
+/// exclude the release, and one under the dated prefix would collide with the
+/// dated scheme's namespace. Both corrupt every downstream check.
+fn checked_release_branch(entry: &RepoEntry, path: &Path) -> Result<(), ConfigError> {
+    let Some(name) = entry.release_branch.as_deref() else {
+        return Ok(());
+    };
+    if name.is_empty() {
+        return Err(ConfigError::Invalid {
+            path: path.to_owned(),
+            detail: "release_branch is empty; a fixed release scheme needs a branch name"
+                .to_owned(),
+        });
+    }
+    if name == entry.trunk() {
+        return Err(ConfigError::Invalid {
+            path: path.to_owned(),
+            detail: format!(
+                "release_branch {name:?} names the trunk; a release branch shadowing the trunk \
+                 corrupts every trunk exclusion"
+            ),
+        });
+    }
+    if name.starts_with(crate::ids::RELEASE_PREFIX) {
+        return Err(ConfigError::Invalid {
+            path: path.to_owned(),
+            detail: format!(
+                "release_branch {name:?} sits in the dated {} namespace; the two schemes must \
+                 not collide",
+                crate::ids::RELEASE_PREFIX
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// The registry as a plain TOML table, for the checks that name a deleted field
+/// or table before serde's "unknown field" gets to complain about it.
+fn raw_table(text: &str, path: &Path) -> Result<toml::Table, ConfigError> {
+    toml::from_str(text).map_err(|source| ConfigError::Parse {
         path: path.to_owned(),
         source: Box::new(source),
-    })?;
+    })
+}
+
+/// `[trusted.*]` was deleted with the registry's paths. A message that names the
+/// replacement beats serde's "unknown field" for the one section people had.
+fn reject_deleted_trusted_table(raw: &toml::Table, path: &Path) -> Result<(), ConfigError> {
     raw.get("trusted")
         .and_then(toml::Value::as_table)
         .and_then(|trusted| trusted.keys().next())
@@ -608,19 +545,65 @@ fn reject_deleted_trusted_table(text: &str, path: &Path) -> Result<(), ConfigErr
         })
 }
 
-/// An entry's `workspaces`, resolved like `path` and checked. `entry.path` must
-/// already be resolved.
+/// `path` left the registry: checkouts are found by their remotes. The first
+/// offending entry by name is reported, with what replaced the field.
+fn reject_deleted_path_field(raw: &toml::Table, path: &Path) -> Result<(), ConfigError> {
+    let Some(repos) = raw.get("repos").and_then(toml::Value::as_table) else {
+        return Ok(());
+    };
+    let mut names: Vec<&String> = repos
+        .iter()
+        .filter(|(_, entry)| {
+            entry
+                .as_table()
+                .is_some_and(|table| table.contains_key("path"))
+        })
+        .map(|(name, _)| name)
+        .collect();
+    names.sort();
+    names.first().map_or(Ok(()), |name| {
+        Err(ConfigError::Invalid {
+            path: path.to_owned(),
+            detail: format!(
+                "[repos.{name}] path is no longer a registry field; delete it — knives finds \
+                 checkouts by their remotes"
+            ),
+        })
+    })
+}
+
+/// Identity is the `upstream` remote, so two entries naming one repository
+/// could never both bind. The first pair by name is reported in `a`'s spelling.
+fn reject_shared_upstreams(registry: &Registry, path: &Path) -> Result<(), ConfigError> {
+    let entries: Vec<(&String, &RepoEntry)> = registry.repos.iter().collect();
+    for (index, (a, first)) in entries.iter().enumerate() {
+        for (b, second) in entries.iter().skip(index + 1) {
+            if crate::bind::same_remote(&first.upstream, &second.upstream) {
+                return Err(ConfigError::Invalid {
+                    path: path.to_owned(),
+                    detail: format!(
+                        "[repos.{a}] and [repos.{b}] share upstream {}; identity must be unique",
+                        first.upstream
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// An entry's `workspaces`, expanded like every registry path and checked.
 ///
 /// Empty would resolve to the config home itself, putting every branch workspace
-/// beside the state file and the ledger; a directory inside the checkout puts
-/// them in the working copy they belong to. Neither is what anyone meant.
+/// beside the state file and the ledger. Whether it sits inside the checkout is
+/// checked where the checkout is known: `knives start` and `finish`.
 fn checked_workspaces(
     name: &str,
-    entry: &RepoEntry,
+    raw: Option<&Path>,
     home: &Path,
     path: &Path,
 ) -> Result<Option<PathBuf>, ConfigError> {
-    let Some(raw) = entry.workspaces.as_deref() else {
+    let Some(raw) = raw else {
         return Ok(None);
     };
     if raw.as_os_str().is_empty() {
@@ -629,19 +612,7 @@ fn checked_workspaces(
             detail: format!("[repos.{name}] workspaces is empty; name a directory or omit it"),
         });
     }
-    let workspaces = expand_registry_path(raw, home);
-    if workspaces.starts_with(&entry.path) {
-        return Err(ConfigError::Invalid {
-            path: path.to_owned(),
-            detail: format!(
-                "[repos.{name}] workspaces {} is inside the checkout {}; branch workspaces cannot \
-                 live in the working copy they belong to",
-                workspaces.display(),
-                entry.path.display()
-            ),
-        });
-    }
-    Ok(Some(workspaces))
+    Ok(Some(expand_registry_path(raw, home)))
 }
 
 fn is_forge_slug(value: &str) -> bool {
@@ -657,20 +628,6 @@ fn is_forge_slug(value: &str) -> bool {
         && !has_path_syntax(repository)
 }
 
-pub fn save(registry: &Registry, path: &Path) -> Result<(), ConfigError> {
-    let text = toml::to_string_pretty(registry)?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|source| ConfigError::Write {
-            path: parent.to_owned(),
-            source,
-        })?;
-    }
-    std::fs::write(path, text).map_err(|source| ConfigError::Write {
-        path: path.to_owned(),
-        source,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -682,12 +639,10 @@ mod tests {
 
     const SAMPLE: &str = r#"
 [repos.example]
-path = "/tmp/example"
 upstream = "https://example.invalid/upstream.git"
 origin = "https://example.invalid/origin.git"
 
 [repos.split]
-path = "/tmp/split"
 upstream = "https://example.invalid/upstream2.git"
 origin = "https://example.invalid/branches.git"
 release = "https://example.invalid/releases.git"
@@ -705,16 +660,15 @@ release = "https://example.invalid/releases.git"
         let registry = load(&write(dir.path(), SAMPLE)).unwrap();
         assert_eq!(registry.repos.len(), 2);
         assert_eq!(
-            registry.repos["example"].path,
-            PathBuf::from("/tmp/example")
+            registry.repos["example"].upstream,
+            "https://example.invalid/upstream.git"
         );
     }
 
     #[test]
     fn a_repo_name_that_escapes_the_ledger_directory_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
-        let text =
-            "[repos.\"../escape\"]\npath = \"/tmp/escape\"\nupstream = \"u\"\norigin = \"o\"\n";
+        let text = "[repos.\"../escape\"]\nupstream = \"u\"\norigin = \"o\"\n";
 
         let error = load(&write(dir.path(), text)).unwrap_err().to_string();
         assert!(error.contains("../escape"), "was: {error}");
@@ -733,14 +687,14 @@ release = "https://example.invalid/releases.git"
     #[test]
     fn the_release_scheme_is_dated_unless_a_fixed_branch_is_stated() {
         let dir = tempfile::tempdir().unwrap();
-        let plain = "[repos.demo]\npath = \"/tmp/d\"\nupstream = \"u\"\norigin = \"o\"\n";
+        let plain = "[repos.demo]\nupstream = \"u\"\norigin = \"o\"\n";
         let registry = load(&write(dir.path(), plain)).unwrap();
         assert_eq!(
             registry.repos["demo"].release_scheme(),
             crate::ids::ReleaseScheme::Dated
         );
 
-        let fixed = "[repos.demo]\npath = \"/tmp/d\"\nupstream = \"u\"\norigin = \"o\"\n\
+        let fixed = "[repos.demo]\nupstream = \"u\"\norigin = \"o\"\n\
                      release_branch = \"integration\"\n";
         let registry = load(&write(dir.path(), fixed)).unwrap();
         assert_eq!(
@@ -758,22 +712,22 @@ release = "https://example.invalid/releases.git"
         let dir = tempfile::tempdir().unwrap();
         for (text, needle) in [
             (
-                "[repos.d]\npath = \"/tmp/d\"\nupstream = \"u\"\norigin = \"o\"\n\
+                "[repos.d]\nupstream = \"u\"\norigin = \"o\"\n\
                  release_branch = \"\"\n",
                 "empty",
             ),
             (
-                "[repos.d]\npath = \"/tmp/d\"\nupstream = \"u\"\norigin = \"o\"\n\
+                "[repos.d]\nupstream = \"u\"\norigin = \"o\"\n\
                  release_branch = \"main\"\n",
                 "trunk",
             ),
             (
-                "[repos.d]\npath = \"/tmp/d\"\nupstream = \"u\"\norigin = \"o\"\n\
+                "[repos.d]\nupstream = \"u\"\norigin = \"o\"\n\
                  base = \"dev\"\nrelease_branch = \"dev\"\n",
                 "trunk",
             ),
             (
-                "[repos.d]\npath = \"/tmp/d\"\nupstream = \"u\"\norigin = \"o\"\n\
+                "[repos.d]\nupstream = \"u\"\norigin = \"o\"\n\
                  release_branch = \"release/2026-01-01\"\n",
                 "release/",
             ),
@@ -789,11 +743,11 @@ release = "https://example.invalid/releases.git"
         // expected base has to be knowable. Configurable because not every upstream calls
         // its default branch main.
         let dir = tempfile::tempdir().unwrap();
-        let plain = "[repos.demo]\npath = \"/tmp/d\"\nupstream = \"u\"\norigin = \"o\"\n";
+        let plain = "[repos.demo]\nupstream = \"u\"\norigin = \"o\"\n";
         let registry = load(&write(dir.path(), plain)).unwrap();
         assert_eq!(registry.repos["demo"].default_base(), "main");
 
-        let stated = "[repos.demo]\npath = \"/tmp/d\"\nupstream = \"u\"\norigin = \"o\"\n\
+        let stated = "[repos.demo]\nupstream = \"u\"\norigin = \"o\"\n\
                       base = \"develop\"\n";
         let registry = load(&write(dir.path(), stated)).unwrap();
         assert_eq!(registry.repos["demo"].default_base(), "develop");
@@ -804,12 +758,12 @@ release = "https://example.invalid/releases.git"
         // The trunk we fork from, measure landed against, and target PRs at are the
         // same branch in every repo we know of, so one field serves both meanings.
         let dir = tempfile::tempdir().unwrap();
-        let plain = "[repos.demo]\npath = \"/tmp/d\"\nupstream = \"u\"\norigin = \"o\"\n";
+        let plain = "[repos.demo]\nupstream = \"u\"\norigin = \"o\"\n";
         let registry = load(&write(dir.path(), plain)).unwrap();
         assert_eq!(registry.repos["demo"].trunk(), "main");
         assert_eq!(registry.repos["demo"].upstream_trunk(), "main@upstream");
 
-        let stated = "[repos.demo]\npath = \"/tmp/d\"\nupstream = \"u\"\norigin = \"o\"\n\
+        let stated = "[repos.demo]\nupstream = \"u\"\norigin = \"o\"\n\
                       base = \"dev\"\n";
         let registry = load(&write(dir.path(), stated)).unwrap();
         assert_eq!(registry.repos["demo"].trunk(), "dev");
@@ -835,7 +789,6 @@ release = "https://example.invalid/releases.git"
         let dir = tempfile::tempdir().unwrap();
         let text = "\
             [repos.demo]\n\
-            path = \"/tmp/d\"\n\
             upstream = \"https://forge.invalid/up/demo.git\"\n\
             origin = \"https://forge.invalid/ours/demo.git\"\n\
             release = \"https://forge.invalid/ours/demo.git\"\n";
@@ -851,7 +804,7 @@ release = "https://example.invalid/releases.git"
     fn a_registry_missing_a_required_role_fails_to_parse() {
         // Given: an entry with no upstream
         let dir = tempfile::tempdir().unwrap();
-        let text = "[repos.broken]\npath = \"/tmp/b\"\norigin = \"o\"\n";
+        let text = "[repos.broken]\norigin = \"o\"\n";
         // When: it is loaded
         let result = load(&write(dir.path(), text));
         // Then: it fails at parse time, naming the field, not later at query time
@@ -862,8 +815,7 @@ release = "https://example.invalid/releases.git"
     #[test]
     fn a_remote_url_that_looks_like_an_option_is_rejected_at_config_load() {
         let dir = tempfile::tempdir().unwrap();
-        let text =
-            "[repos.demo]\npath = \"/tmp/d\"\nupstream = \"u\"\norigin = \"--upload-pack=x\"\n";
+        let text = "[repos.demo]\nupstream = \"u\"\norigin = \"--upload-pack=x\"\n";
 
         let error = load(&write(dir.path(), text)).unwrap_err().to_string();
         assert!(error.contains("origin remote"), "was: {error}");
@@ -871,40 +823,9 @@ release = "https://example.invalid/releases.git"
     }
 
     #[test]
-    fn the_repo_containing_a_directory_is_found_and_a_sibling_is_not() {
-        // Requiring the repo name on every command is absurd when you are standing in
-        // the repository. Prefix matching would be worse than nothing: `<root>-2` is a
-        // different repository that shares the prefix.
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("managed");
-        let sibling = dir.path().join("managed-2");
-        std::fs::create_dir_all(root.join("src")).unwrap();
-        std::fs::create_dir_all(&sibling).unwrap();
-        let text = format!(
-            "[repos.managed]\npath = \"{}\"\nupstream = \"u\"\norigin = \"o\"\n",
-            root.display()
-        );
-        let registry = load(&write(dir.path(), &text)).unwrap();
-
-        assert_eq!(
-            registry.containing(&root.join("src")).map(|(n, _)| n),
-            Some(RepoName::new("managed"))
-        );
-        assert_eq!(
-            registry.containing(&root).map(|(n, _)| n),
-            Some(RepoName::new("managed"))
-        );
-        assert!(
-            registry.containing(&sibling).is_none(),
-            "a sibling is not inside"
-        );
-        assert!(registry.containing(dir.path()).is_none());
-    }
-
-    #[test]
     fn consumer_slugs_load_verbatim() {
         let dir = tempfile::tempdir().unwrap();
-        let text = "[repos.demo]\npath = \"/tmp/demo\"\nupstream = \"u\"\norigin = \"o\"\n\
+        let text = "[repos.demo]\nupstream = \"u\"\norigin = \"o\"\n\
                     consumers = [\"an-org/a-consumer\"]\n";
         let registry = load(&write(dir.path(), text)).unwrap();
         assert_eq!(
@@ -916,7 +837,7 @@ release = "https://example.invalid/releases.git"
     #[test]
     fn a_path_in_consumers_is_a_loud_config_error_naming_the_new_form() {
         let dir = tempfile::tempdir().unwrap();
-        let text = "[repos.demo]\npath = \"/tmp/demo\"\nupstream = \"u\"\norigin = \"o\"\n\
+        let text = "[repos.demo]\nupstream = \"u\"\norigin = \"o\"\n\
                     consumers = [\"~/one/default\"]\n";
         let error = load(&write(dir.path(), text)).unwrap_err().to_string();
         assert!(error.contains("forge slugs"), "was: {error}");
@@ -977,7 +898,7 @@ release = "https://example.invalid/releases.git"
     fn a_trusted_table_names_its_replacement() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("repos.toml");
-        std::fs::write(&path, "[trusted.work]\npath = \"~/work\"\n").unwrap();
+        std::fs::write(&path, "[trusted.work]\n").unwrap();
         let error = load(&path).unwrap_err().to_string();
         assert!(
             error.contains(
@@ -988,68 +909,77 @@ release = "https://example.invalid/releases.git"
     }
 
     #[test]
-    fn workspaces_sit_beside_the_checkout_unless_the_entry_says_where() {
-        // The `<name>/default` layout: each branch's workspace is a sibling of
-        // `default`. Absent configuration keeps it, so no registered repository's
-        // existing workspaces move.
+    fn a_path_field_names_its_removal() {
         let dir = tempfile::tempdir().unwrap();
-        let text = "[repos.tool]\npath = \"/home/someone/forks/tool/default\"\nupstream = \"u\"\n\
-                    origin = \"o\"\n";
-        let registry = load(&write(dir.path(), text)).unwrap();
-        assert_eq!(
-            registry.repos["tool"].workspace_root(),
-            PathBuf::from("/home/someone/forks/tool")
+        let path = dir.path().join("repos.toml");
+        std::fs::write(
+            &path,
+            "[repos.tool]\npath = \"~/tool\"\nupstream = \"https://forge.example/org/tool\"\n\
+             origin = \"https://forge.example/ours/tool\"\n",
+        )
+        .unwrap();
+        let error = load(&path).unwrap_err().to_string();
+        assert!(
+            error.contains(
+                "[repos.tool] path is no longer a registry field; delete it — knives finds checkouts by their remotes"
+            ),
+            "{error}"
         );
     }
 
     #[test]
-    fn a_configured_workspaces_directory_is_where_workspaces_go() {
-        // A checkout at `~/<name>` has no room for siblings: they would land in `~`
-        // itself, one directory per branch across every repository.
+    fn two_entries_sharing_an_upstream_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("repos.toml");
+        std::fs::write(
+            &path,
+            "[repos.a]\nupstream = \"https://forge.example/org/tool\"\n\
+             origin = \"https://forge.example/ours/tool\"\n\
+             [repos.b]\nupstream = \"git@forge.example:org/tool.git\"\n\
+             origin = \"https://forge.example/theirs/tool\"\n",
+        )
+        .unwrap();
+        let error = load(&path).unwrap_err().to_string();
+        assert!(
+            error.contains(
+                "[repos.a] and [repos.b] share upstream https://forge.example/org/tool; identity must be unique"
+            ),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn an_entry_without_path_loads_and_workspaces_is_a_preference() {
         let _lock = environment_lock();
         let environment = EnvironmentGuard::capture(&["HOME"]);
-        environment.set("HOME", "/home/someone");
         let dir = tempfile::tempdir().unwrap();
-        let text = "[repos.tool]\npath = \"~/tool\"\nupstream = \"u\"\norigin = \"o\"\n\
-                    workspaces = \"~/.worktrees/tool\"\n";
-        let registry = load(&write(dir.path(), text)).unwrap();
-        assert_eq!(
-            registry.repos["tool"].workspace_root(),
-            PathBuf::from("/home/someone/.worktrees/tool")
-        );
-    }
-
-    #[test]
-    fn saving_preserves_a_configured_workspaces_directory() {
-        // `init` rewrites the whole file; a field serde does not know about would
-        // silently move every workspace back beside the checkout.
-        let dir = tempfile::tempdir().unwrap();
-        let text = "[repos.tool]\npath = \"/tmp/tool\"\nupstream = \"u\"\norigin = \"o\"\n\
-                    workspaces = \"/tmp/worktrees/tool\"\n";
-        let path = write(dir.path(), text);
+        environment.set("HOME", dir.path().to_str().unwrap());
+        let path = dir.path().join("repos.toml");
+        std::fs::write(
+            &path,
+            "[repos.tool]\nupstream = \"https://forge.example/org/tool\"\n\
+             origin = \"https://forge.example/ours/tool\"\nworkspaces = \"~/.worktrees/tool\"\n",
+        )
+        .unwrap();
         let registry = load(&path).unwrap();
-
-        save(&registry, &path).unwrap();
-
-        let reloaded = load(&path).unwrap();
+        let entry = &registry.repos["tool"];
         assert_eq!(
-            reloaded.repos["tool"].workspace_root(),
-            PathBuf::from("/tmp/worktrees/tool")
+            entry.workspaces.as_deref(),
+            Some(dir.path().join(".worktrees/tool").as_path())
         );
     }
 
     #[test]
     fn a_relative_workspaces_directory_is_resolved_against_the_config_home() {
-        // The same rule as `path`: one resolution for every registry path, so a
-        // value that works for one field cannot silently mean something else for
-        // the other.
+        // One resolution for every registry path, so a value that works for a
+        // trust root cannot silently mean something else for `workspaces`.
         let dir = tempfile::tempdir().unwrap();
-        let text = "[repos.tool]\npath = \"/tmp/tool\"\nupstream = \"u\"\norigin = \"o\"\n\
+        let text = "[repos.tool]\nupstream = \"u\"\norigin = \"o\"\n\
                     workspaces = \"worktrees/tool\"\n";
         let registry = load(&write(dir.path(), text)).unwrap();
         assert_eq!(
-            registry.repos["tool"].workspace_root(),
-            dir.path().join("worktrees").join("tool")
+            registry.repos["tool"].workspaces.as_deref(),
+            Some(dir.path().join("worktrees").join("tool").as_path())
         );
     }
 
@@ -1058,7 +988,7 @@ release = "https://example.invalid/releases.git"
         // Empty resolves to the config home itself, which would put every branch
         // workspace beside the state file and the ledger.
         let dir = tempfile::tempdir().unwrap();
-        let text = "[repos.tool]\npath = \"/tmp/tool\"\nupstream = \"u\"\norigin = \"o\"\n\
+        let text = "[repos.tool]\nupstream = \"u\"\norigin = \"o\"\n\
                     workspaces = \"\"\n";
         let error = load(&write(dir.path(), text)).unwrap_err().to_string();
         assert!(error.contains("workspaces"), "was: {error}");
@@ -1066,31 +996,7 @@ release = "https://example.invalid/releases.git"
     }
 
     #[test]
-    fn a_workspaces_directory_inside_the_checkout_is_a_config_error() {
-        // A workspace inside the checkout's working copy is never what anyone
-        // meant; the checkout path itself is the most likely slip.
-        let dir = tempfile::tempdir().unwrap();
-        for inside in ["/tmp/tool", "/tmp/tool/.worktrees"] {
-            let text = format!(
-                "[repos.tool]\npath = \"/tmp/tool\"\nupstream = \"u\"\norigin = \"o\"\n\
-                 workspaces = \"{inside}\"\n"
-            );
-            let error = load(&write(dir.path(), &text)).unwrap_err().to_string();
-            assert!(error.contains("workspaces"), "was: {error}");
-            assert!(error.contains("inside the checkout"), "was: {error}");
-        }
-        // Containment is by component: a sibling sharing the checkout's name as a
-        // string prefix is outside it.
-        let beside = "[repos.tool]\npath = \"/tmp/tool\"\nupstream = \"u\"\norigin = \"o\"\n\
-                      workspaces = \"/tmp/tool-worktrees\"\n";
-        assert_eq!(
-            load(&write(dir.path(), beside)).unwrap().repos["tool"].workspace_root(),
-            Path::new("/tmp/tool-worktrees")
-        );
-    }
-
-    #[test]
-    fn trust_rules_parse_expand_and_survive_a_save() {
+    fn trust_rules_parse_and_expand() {
         let _lock = environment_lock();
         let environment = EnvironmentGuard::capture(&["HOME"]);
         environment.set("HOME", "/home/someone");
@@ -1106,11 +1012,6 @@ release = "https://example.invalid/releases.git"
             registry.trust.owners,
             vec!["some-owner".to_owned(), "some-org".to_owned()]
         );
-        // `init` rewrites the whole file; a section serde does not know about
-        // would be silently deleted the next time it runs.
-        save(&registry, &path).unwrap();
-        let reloaded = load(&path).unwrap();
-        assert_eq!(reloaded.trust.owners.len(), 2);
     }
 
     #[test]
@@ -1148,34 +1049,8 @@ release = "https://example.invalid/releases.git"
     }
 
     #[test]
-    fn load_resolves_every_entry_so_no_caller_sees_a_raw_value() {
-        let dir = tempfile::tempdir().unwrap();
-        let text = "[repos.rel]\npath = \"sub/repo\"\nupstream = \"u\"\norigin = \"o\"\n";
-        let registry = load(&write(dir.path(), text)).unwrap();
-        assert_eq!(registry.repos["rel"].path, dir.path().join("sub/repo"));
-    }
-
-    #[test]
     fn a_missing_file_is_an_empty_registry() {
         let dir = tempfile::tempdir().unwrap();
         assert!(load(&dir.path().join("absent.toml")).unwrap().is_empty());
-    }
-
-    #[test]
-    fn save_then_load_round_trips() {
-        let dir = tempfile::tempdir().unwrap();
-        let original = load(&write(dir.path(), SAMPLE)).unwrap();
-        let target = dir.path().join("out").join("repos.toml");
-        save(&original, &target).unwrap();
-        let text = std::fs::read_to_string(&target).unwrap();
-        assert!(
-            !text.contains("release_branch"),
-            "saved registry unexpectedly names release_branch: {text}"
-        );
-        assert!(
-            !text.contains("[trust]"),
-            "saved registry unexpectedly names [trust]: {text}"
-        );
-        assert_eq!(load(&target).unwrap(), original);
     }
 }

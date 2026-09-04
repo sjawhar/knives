@@ -12,7 +12,7 @@
 mod lab;
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use knives::bind::{self, BindError, Unbound, Unresolved};
 use knives::config::{Registry, RepoEntry};
@@ -20,7 +20,6 @@ use knives::ids::RepoName;
 
 fn entry(upstream: &str, origin: &str) -> RepoEntry {
     RepoEntry {
-        path: PathBuf::from("/unused"), // Task 3 deletes this field and this line
         upstream: upstream.to_owned(),
         origin: origin.to_owned(),
         base: None,
@@ -133,9 +132,9 @@ fn remotes_are_read_from_jj_checkouts_and_from_git_only_clones() {
         &clone,
         &[("origin", "https://forge.invalid/someone/tool.git")],
     );
-    let git_remotes = bind::remotes(&clone).expect("git remotes");
+    let clone_remotes = bind::remotes(&clone).expect("git remotes");
     assert_eq!(
-        git_remotes,
+        clone_remotes,
         BTreeMap::from([(
             "origin".to_owned(),
             "https://forge.invalid/someone/tool.git".to_owned()
@@ -497,4 +496,89 @@ fn a_repository_whose_remotes_cannot_be_read_is_an_error_not_a_reason_to_scan() 
         bind::here(&registry, &stray),
         Err(BindError::Remotes { root, .. }) if root == canonical
     ));
+}
+
+fn knives(lab: &lab::Lab, home: &tempfile::TempDir, args: &[&str]) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_knives"))
+        .args(args)
+        .current_dir(&lab.work)
+        .env("KNIVES_CONFIG_HOME", home.path())
+        .env("HOME", lab.temp_path())
+        .env("JJ_CONFIG", "/dev/null")
+        .output()
+        .expect("run knives")
+}
+
+fn knives_outside(lab: &lab::Lab, home: &tempfile::TempDir, args: &[&str]) -> std::process::Output {
+    let outside = lab.temp_path().join("outside");
+    std::fs::create_dir_all(&outside).expect("outside");
+    std::process::Command::new(env!("CARGO_BIN_EXE_knives"))
+        .args(args)
+        .current_dir(&outside)
+        .env("KNIVES_CONFIG_HOME", home.path())
+        .env("HOME", lab.temp_path())
+        .env("JJ_CONFIG", "/dev/null")
+        .output()
+        .expect("run knives")
+}
+
+#[test]
+fn a_named_verb_whose_checkout_is_not_on_this_machine_exits_usage_and_says_so() {
+    let lab = lab::Lab::new();
+    let home = tempfile::tempdir().expect("config home");
+    std::fs::write(
+        home.path().join("repos.toml"),
+        "[repos.ghost]\nupstream = \"https://forge.invalid/org/ghost\"\norigin = \"https://forge.invalid/acme/ghost\"\n",
+    )
+    .expect("registry");
+    let output = knives(&lab, &home, &["--text", "notch", "--repo", "ghost"]);
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("no checkout of ghost under"), "{stderr}");
+    assert!(!stderr.contains("known:"), "{stderr}");
+}
+
+#[test]
+fn status_inside_a_bound_checkout_reports_only_it_and_carries_the_origin_note() {
+    let lab = lab::Lab::new();
+    let (home, _consumer) = lab::release_test_home(&lab);
+    let output = knives(
+        &lab,
+        &home,
+        &["--text", "status", "--no-landed", "--no-github"],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("demo"), "{stdout}");
+    // The lab's checkout origin is a local bare path; the registry says a forge URL.
+    assert!(stdout.contains("origin remote is "), "{stdout}");
+    assert!(
+        stdout.contains("; registry says https://forge.invalid/acme/work.git"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn sync_outside_any_checkout_without_a_name_or_all_exits_usage() {
+    let lab = lab::Lab::new();
+    let (home, _consumer) = lab::release_test_home(&lab);
+    let output = knives_outside(&lab, &home, &["--text", "sync", "--no-github"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("give a repo name, or --all"));
+}
+
+#[test]
+fn status_outside_any_checkout_sweeps_every_entry_through_the_scan() {
+    let lab = lab::Lab::new();
+    let (home, _consumer) = lab::release_test_home(&lab);
+    let output = knives_outside(
+        &lab,
+        &home,
+        &["--text", "status", "--no-landed", "--no-github"],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("demo"),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

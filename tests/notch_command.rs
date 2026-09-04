@@ -11,25 +11,66 @@
 use std::path::Path;
 use std::process::{Command, Output};
 
-/// A config home with one managed repo whose checkout is `path`.
-fn home(path: &Path) -> tempfile::TempDir {
+const UPSTREAM: &str = "https://forge.invalid/org/work.git";
+
+/// A config home with one managed repo, `a-repo`, known by its upstream.
+fn home() -> tempfile::TempDir {
     let home = tempfile::tempdir().expect("create config home");
     std::fs::write(
         home.path().join("repos.toml"),
         format!(
-            "[repos.a-repo]\npath = \"{}\"\nupstream = \"https://forge.invalid/org/work.git\"\norigin = \"https://forge.invalid/ours/work.git\"\n",
-            path.display()
+            "[repos.a-repo]\nupstream = \"{UPSTREAM}\"\norigin = \"https://forge.invalid/ours/work.git\"\n"
         ),
     )
     .expect("write registry");
     home
 }
 
-fn knives(home: &tempfile::TempDir, cwd: &Path, args: &[&str]) -> Output {
+/// A directory standing in for `$HOME`, holding the one jj checkout whose
+/// `upstream` remote is `a-repo`'s, so `--repo a-repo` finds it from anywhere.
+fn checkout() -> tempfile::TempDir {
+    let scan_root = tempfile::tempdir().expect("checkout");
+    let repo = scan_root.path().join("a-repo");
+    let jj = |args: &[&str]| {
+        let status = Command::new("jj")
+            .args(args)
+            .env("JJ_CONFIG", "/dev/null")
+            .env("JJ_USER", "Knives Lab")
+            .env("JJ_EMAIL", "knives-lab@example.test")
+            .status()
+            .expect("run jj");
+        assert!(status.success(), "jj {args:?}");
+    };
+    jj(&[
+        "git",
+        "init",
+        "--colocate",
+        repo.to_str().expect("utf-8 path"),
+    ]);
+    jj(&[
+        "-R",
+        repo.to_str().expect("utf-8 path"),
+        "git",
+        "remote",
+        "add",
+        "upstream",
+        UPSTREAM,
+    ]);
+    scan_root
+}
+
+fn knives(
+    home: &tempfile::TempDir,
+    scan_root: &tempfile::TempDir,
+    cwd: &Path,
+    args: &[&str],
+) -> Output {
     Command::new(env!("CARGO_BIN_EXE_knives"))
         .args(args)
         .current_dir(cwd)
         .env("KNIVES_CONFIG_HOME", home.path())
+        .env("HOME", scan_root.path())
+        .env("JJ_CONFIG", "/dev/null")
         .env("KNIVES_OWNER", "ses_fff688")
         .output()
         .expect("run knives")
@@ -44,13 +85,14 @@ fn a_note_written_from_outside_the_repo_is_read_back_in_both_modes() {
     // Given: a config home naming one repo, and a cwd that is not it — the case
     // the --repo flag exists for: you learn something about the library fork
     // while standing in the consumer fork.
-    let checkout = tempfile::tempdir().expect("checkout");
-    let home = home(checkout.path());
+    let checkout = checkout();
+    let home = home();
     let elsewhere = tempfile::tempdir().expect("somewhere else");
 
     // When: a note is written for that repo by name
     let wrote = knives(
         &home,
+        &checkout,
         elsewhere.path(),
         &[
             "--text",
@@ -82,6 +124,7 @@ fn a_note_written_from_outside_the_repo_is_read_back_in_both_modes() {
     // And: the prose read shows the entry, its kind and its evidence
     let text = knives(
         &home,
+        &checkout,
         elsewhere.path(),
         &["--text", "notch", "--repo", "a-repo"],
     );
@@ -93,6 +136,7 @@ fn a_note_written_from_outside_the_repo_is_read_back_in_both_modes() {
     // And: the JSON read carries the same facts as fields
     let json = knives(
         &home,
+        &checkout,
         elsewhere.path(),
         &["--json", "notch", "--repo", "a-repo"],
     );
@@ -104,8 +148,8 @@ fn a_note_written_from_outside_the_repo_is_read_back_in_both_modes() {
     assert_eq!(parsed["entries"][0]["owner"], "ses_fff688");
     assert_eq!(parsed["entries"][0]["subject"], "feat/log-queue");
     assert_eq!(parsed["entries"][0]["evidence"][0], "06d778b9");
-    // The checkout is a temporary directory, not a repository, so the subject's
-    // tip does not resolve and the entry says so by omission.
+    // The checkout has no bookmark of that name, so the subject's tip does not
+    // resolve and the entry says so by omission.
     assert!(parsed["entries"][0].get("anchor").is_none());
 }
 
@@ -114,10 +158,11 @@ fn the_machine_default_is_toon_and_decodes_to_exactly_the_json_report() {
     // Given: a written note. The machine default changed from JSON to TOON for
     // token cost; the contract is that nothing else changed — the TOON output
     // is the same report, losslessly.
-    let checkout = tempfile::tempdir().expect("checkout");
-    let home = home(checkout.path());
+    let checkout = checkout();
+    let home = home();
     let wrote = knives(
         &home,
+        &checkout,
         checkout.path(),
         &[
             "--text",
@@ -135,9 +180,15 @@ fn the_machine_default_is_toon_and_decodes_to_exactly_the_json_report() {
 
     // When: the report is read with no format flag (stdout is a pipe, so the
     // machine default applies) and once more with explicit --json.
-    let bare = knives(&home, checkout.path(), &["notch", "--repo", "a-repo"]);
+    let bare = knives(
+        &home,
+        &checkout,
+        checkout.path(),
+        &["notch", "--repo", "a-repo"],
+    );
     let json = knives(
         &home,
+        &checkout,
         checkout.path(),
         &["--json", "notch", "--repo", "a-repo"],
     );
@@ -157,12 +208,13 @@ fn the_machine_default_is_toon_and_decodes_to_exactly_the_json_report() {
 
 #[test]
 fn a_json_write_emits_only_the_entry_it_wrote() {
-    let checkout = tempfile::tempdir().expect("checkout");
-    let home = home(checkout.path());
+    let checkout = checkout();
+    let home = home();
     let elsewhere = tempfile::tempdir().expect("somewhere else");
 
     let wrote = knives(
         &home,
+        &checkout,
         elsewhere.path(),
         &[
             "--json",
@@ -190,12 +242,13 @@ fn a_json_write_emits_only_the_entry_it_wrote() {
 
 #[test]
 fn a_write_pr_stamps_the_entry_and_a_pr_read_finds_it() {
-    let checkout = tempfile::tempdir().expect("checkout");
-    let home = home(checkout.path());
+    let checkout = checkout();
+    let home = home();
     let elsewhere = tempfile::tempdir().expect("somewhere else");
 
     let wrote = knives(
         &home,
+        &checkout,
         elsewhere.path(),
         &[
             "--json",
@@ -215,6 +268,7 @@ fn a_write_pr_stamps_the_entry_and_a_pr_read_finds_it() {
 
     let read = knives(
         &home,
+        &checkout,
         elsewhere.path(),
         &["--json", "notch", "--pr", "4891", "--repo", "a-repo"],
     );
@@ -226,8 +280,8 @@ fn a_write_pr_stamps_the_entry_and_a_pr_read_finds_it() {
 
 #[test]
 fn a_write_without_pr_uses_the_tracked_pull_stamp() {
-    let checkout = tempfile::tempdir().expect("checkout");
-    let home = home(checkout.path());
+    let checkout = checkout();
+    let home = home();
     std::fs::write(
         home.path().join("state.json"),
         r#"{"tracked_pulls":{"a-repo/feat/alpha":1157}}"#,
@@ -236,6 +290,7 @@ fn a_write_without_pr_uses_the_tracked_pull_stamp() {
 
     let wrote = knives(
         &home,
+        &checkout,
         checkout.path(),
         &[
             "--json",
@@ -254,8 +309,8 @@ fn a_write_without_pr_uses_the_tracked_pull_stamp() {
 
 #[test]
 fn a_subject_read_shows_that_refs_chronology_and_a_bare_read_windows_the_repo() {
-    let checkout = tempfile::tempdir().expect("checkout");
-    let home = home(checkout.path());
+    let checkout = checkout();
+    let home = home();
     std::fs::write(
         home.path().join("state.json"),
         r#"{"tracked_pulls":{"a-repo/feat/alpha":1157}}"#,
@@ -271,6 +326,7 @@ fn a_subject_read_shows_that_refs_chronology_and_a_bare_read_windows_the_repo() 
         };
         let wrote = knives(
             &home,
+            &checkout,
             checkout.path(),
             &["--text", "notch", subject, "-m", &text, "--repo", "a-repo"],
         );
@@ -280,6 +336,7 @@ fn a_subject_read_shows_that_refs_chronology_and_a_bare_read_windows_the_repo() 
     // A bare read windows to the newest 20 and says how many it did not show.
     let bare = knives(
         &home,
+        &checkout,
         checkout.path(),
         &["--json", "notch", "--repo", "a-repo"],
     );
@@ -291,6 +348,7 @@ fn a_subject_read_shows_that_refs_chronology_and_a_bare_read_windows_the_repo() 
     // A subject read is not windowed: it is that ref's whole chronology.
     let subject = knives(
         &home,
+        &checkout,
         checkout.path(),
         &["--json", "notch", "feat/alpha", "--repo", "a-repo"],
     );
@@ -302,6 +360,7 @@ fn a_subject_read_shows_that_refs_chronology_and_a_bare_read_windows_the_repo() 
     // whole chronology.
     let pull_request = knives(
         &home,
+        &checkout,
         checkout.path(),
         &["--json", "notch", "--pr", "1157", "--repo", "a-repo"],
     );
@@ -312,8 +371,8 @@ fn a_subject_read_shows_that_refs_chronology_and_a_bare_read_windows_the_repo() 
 
 #[test]
 fn an_unreadable_ledger_is_incomplete_and_an_unknown_repo_is_usage() {
-    let checkout = tempfile::tempdir().expect("checkout");
-    let home = home(checkout.path());
+    let checkout = checkout();
+    let home = home();
 
     // Given: a ledger directory holding a file that is not an entry
     let ledger = home.path().join("ledger").join("a-repo");
@@ -327,6 +386,7 @@ fn an_unreadable_ledger_is_incomplete_and_an_unknown_repo_is_usage() {
     // When / Then: reading it cannot answer, and says so with exit 3
     let broken = knives(
         &home,
+        &checkout,
         checkout.path(),
         &["--text", "notch", "--repo", "a-repo"],
     );
@@ -340,6 +400,7 @@ fn an_unreadable_ledger_is_incomplete_and_an_unknown_repo_is_usage() {
     // And: a repo nobody manages is a usage error, naming the ones we do
     let unknown = knives(
         &home,
+        &checkout,
         checkout.path(),
         &["--text", "notch", "--repo", "nope"],
     );
@@ -353,10 +414,11 @@ fn an_unreadable_ledger_is_incomplete_and_an_unknown_repo_is_usage() {
 
 #[test]
 fn a_read_of_a_repo_with_no_ledger_yet_is_success_and_says_so() {
-    let checkout = tempfile::tempdir().expect("checkout");
-    let home = home(checkout.path());
+    let checkout = checkout();
+    let home = home();
     let empty = knives(
         &home,
+        &checkout,
         checkout.path(),
         &["--text", "notch", "--repo", "a-repo"],
     );
@@ -370,11 +432,12 @@ fn a_read_of_a_repo_with_no_ledger_yet_is_success_and_says_so() {
 
 #[test]
 fn an_empty_subject_is_usage_and_does_not_write_a_nameless_entry() {
-    let checkout = tempfile::tempdir().expect("checkout");
-    let home = home(checkout.path());
+    let checkout = checkout();
+    let home = home();
 
     let empty_read = knives(
         &home,
+        &checkout,
         checkout.path(),
         &["--text", "notch", "", "--repo", "a-repo"],
     );
@@ -387,6 +450,7 @@ fn an_empty_subject_is_usage_and_does_not_write_a_nameless_entry() {
 
     let empty_write = knives(
         &home,
+        &checkout,
         checkout.path(),
         &[
             "--text",
@@ -407,6 +471,7 @@ fn an_empty_subject_is_usage_and_does_not_write_a_nameless_entry() {
 
     let whitespace_write = knives(
         &home,
+        &checkout,
         checkout.path(),
         &[
             "--text",
@@ -427,6 +492,7 @@ fn an_empty_subject_is_usage_and_does_not_write_a_nameless_entry() {
 
     let ledger = knives(
         &home,
+        &checkout,
         checkout.path(),
         &["--json", "notch", "--repo", "a-repo"],
     );

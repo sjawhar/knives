@@ -1231,58 +1231,6 @@ pub fn add_workspace(
     Ok(())
 }
 
-/// Reads git's remote configuration because jj-lib does not expose remote URLs as a typed repository view.
-pub fn git_toplevel(repo: &Path) -> Result<PathBuf, JjError> {
-    let repo = path(repo);
-    let output = command("git", ["-C", &repo, "rev-parse", "--show-toplevel"])?;
-    Ok(PathBuf::from(output.trim()))
-}
-
-/// Reads git's remote configuration because jj-lib does not expose remote URLs as a typed repository view.
-///
-/// `git config --get-regexp` uses exit 1 with no output for no matches, which is an empty map.
-pub fn git_remotes(repo: &Path) -> Result<BTreeMap<String, String>, JjError> {
-    let repo = path(repo);
-    let output = Command::new("git")
-        .args(["-C", &repo, "config", "--get-regexp", "^remote\\..*\\.url$"])
-        .output()
-        .map_err(|error| JjError::Process {
-            program: "git".to_owned(),
-            detail: error.to_string(),
-        })?;
-    let output = if output.status.success() {
-        String::from_utf8(output.stdout).map_err(|error| JjError::Parse {
-            detail: error.to_string(),
-        })?
-    } else if output.status.code() == Some(1)
-        && output.stdout.is_empty()
-        && output.stderr.is_empty()
-    {
-        String::new()
-    } else {
-        return Err(JjError::Command {
-            program: "git".to_owned(),
-            status: output.status.to_string(),
-            stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-        });
-    };
-    output
-        .lines()
-        .try_fold(BTreeMap::new(), |mut remotes, line| {
-            let (key, url) = line.split_once(' ').ok_or_else(|| JjError::Parse {
-                detail: line.to_owned(),
-            })?;
-            let name = key
-                .strip_prefix("remote.")
-                .and_then(|value| value.strip_suffix(".url"))
-                .ok_or_else(|| JjError::Parse {
-                    detail: line.to_owned(),
-                })?;
-            remotes.insert(name.to_owned(), url.to_owned());
-            Ok(remotes)
-        })
-}
-
 pub(crate) enum OriginTrunk {
     NotRepository,
     Missing,
@@ -1778,10 +1726,11 @@ impl Candidate {
         let previous_tree = previous.tree();
         let candidate_tree = self.commit.tree();
         let mut files = Vec::new();
-        for entry in collect_stream(previous_tree.diff_stream(&candidate_tree, &EverythingMatcher))
+        for changed in
+            collect_stream(previous_tree.diff_stream(&candidate_tree, &EverythingMatcher))
         {
-            entry.values.map_err(|error| store_error(&error))?;
-            files.push(entry.path.as_internal_file_string().to_owned());
+            changed.values.map_err(|error| store_error(&error))?;
+            files.push(changed.path.as_internal_file_string().to_owned());
         }
         Ok(files)
     }

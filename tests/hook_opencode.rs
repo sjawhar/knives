@@ -26,6 +26,8 @@ fn run_hook_input_with_owner(
     command
         .args(["hook", "opencode"])
         .env("KNIVES_CONFIG_HOME", home)
+        .env("HOME", home)
+        .env("JJ_CONFIG", "/dev/null")
         .env_remove("KNIVES_OWNER")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -153,14 +155,9 @@ impl Repositories {
             std::fs::write(root.join("AGENTS.md"), instructions).expect("write instructions");
             std::fs::write(root.join("file.txt"), "content").expect("write file");
         }
-        // `path` is still a required field until Task 3 deletes it; the hook
-        // code never reads it.
-        let config = format!(
-            "[repos.beta]\npath = \"{}\"\nupstream = \"https://forge.invalid/maintainer/beta\"\n\
-             origin = \"https://forge.invalid/ours/beta\"\n\n\
-             [trust]\nowners = [\"ours\"]\nrepos = [\"company/trusted\"]\n",
-            beta.display(),
-        );
+        let config = "[repos.beta]\nupstream = \"https://forge.invalid/maintainer/beta\"\n\
+                      origin = \"https://forge.invalid/ours/beta\"\n\n\
+                      [trust]\nowners = [\"ours\"]\nrepos = [\"company/trusted\"]\n";
         std::fs::write(home.path().join("repos.toml"), config).expect("write registry");
         let state = json!({"claims": {"beta/feat/claimed": {
             "repo": "beta", "branch": "feat/claimed", "owner": "agent-one",
@@ -419,7 +416,7 @@ fn tool_after_trust_roots_injects_guidance_without_managed_notice() {
 }
 
 #[test]
-fn trusted_owner_guidance_requires_the_checkout_to_be_the_git_toplevel() {
+fn trusted_owner_guidance_requires_the_checkout_to_be_the_git_root() {
     // Given: an attacker-controlled nested `.jj` directory under a Git checkout
     // whose remote self-declares a trusted owner.
     let home = tempfile::tempdir().expect("config home");
@@ -465,7 +462,7 @@ fn trusted_owner_guidance_requires_the_checkout_to_be_the_git_toplevel() {
 }
 
 #[test]
-fn a_git_toplevel_with_a_trusted_origin_injects_guidance() {
+fn a_git_root_with_a_trusted_origin_injects_guidance() {
     // Given: a real Git checkout whose own origin claims a trusted owner.
     let home = tempfile::tempdir().expect("config home");
     let root = home.path().join("trusted-git");
@@ -668,6 +665,8 @@ fn unreadable_stdin_returns_an_empty_response_without_failing() {
     let output = Command::new(env!("CARGO_BIN_EXE_knives"))
         .args(["hook", "opencode"])
         .env("KNIVES_CONFIG_HOME", home.path())
+        .env("HOME", home.path())
+        .env("JJ_CONFIG", "/dev/null")
         .stdin(Stdio::from(stdin))
         .output()
         .expect("run hook");

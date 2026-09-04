@@ -462,6 +462,7 @@ pub(super) fn repository_health(
 pub(super) fn open_forge_snapshot<'a>(
     forge: Option<&'a dyn Forge>,
     entry: &'a RepoEntry,
+    path: &'a std::path::Path,
     cache_root: Option<&'a std::path::Path>,
 ) -> Result<Option<crate::snapshot::Opened<'a>>, crate::forge::ForgeError> {
     let Some(forge) = forge else {
@@ -469,7 +470,7 @@ pub(super) fn open_forge_snapshot<'a>(
     };
     crate::snapshot::open(crate::snapshot::SnapshotConfig {
         forge,
-        path: &entry.path,
+        path,
         remotes: [entry.remote(Role::Origin), entry.remote(Role::Release)],
         cache_root,
     })
@@ -486,6 +487,7 @@ pub(super) struct StatusPhases<'snapshot> {
 #[derive(Clone, Copy)]
 pub(super) struct StatusPhaseInput<'a, 'forge, 'snapshot> {
     pub(super) entry: &'a RepoEntry,
+    pub(super) path: &'a std::path::Path,
     pub(super) options: &'a Options<'forge>,
     pub(super) probe_inputs: &'a [ProbeInput],
     pub(super) opened: Option<&'snapshot crate::snapshot::Opened<'snapshot>>,
@@ -501,6 +503,7 @@ pub(super) fn run_status_phases<'snapshot>(
 ) -> StatusPhases<'snapshot> {
     let StatusPhaseInput {
         entry,
+        path,
         options,
         probe_inputs,
         opened,
@@ -511,7 +514,7 @@ pub(super) fn run_status_phases<'snapshot>(
     } = input;
     let upstream_trunk = entry.upstream_trunk();
     let context = ProbeContext {
-        path: &entry.path,
+        path,
         options,
         upstream_trunk: &upstream_trunk,
         opened,

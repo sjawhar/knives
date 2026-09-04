@@ -64,7 +64,6 @@ fn a_fixed_pin_locked_to_an_ancestor_is_behind() {
     };
     let heads = ConsumerHeadMemo::default();
     let entry = RepoEntry {
-        path: lab.work.clone(),
         upstream: "https://forge.invalid/up/repo.git".to_owned(),
         origin: "https://forge.invalid/o/repo.git".to_owned(),
         base: None,
@@ -76,7 +75,8 @@ fn a_fixed_pin_locked_to_an_ancestor_is_behind() {
     };
     let repo = Repo::open(&lab.work).expect("open advanced branch");
 
-    let lag = repos::pin_lag(&entry, None, Some(&repo), &forge, None, &heads);
+    let fork = lab::lab_fork(&lab, "demo", &entry);
+    let lag = repos::pin_lag(&fork, None, Some(&repo), &forge, None, &heads);
 
     assert!(
         lag.lag.as_ref().is_some_and(|lag| lag.contains(&locked)),
@@ -171,8 +171,7 @@ fn consumers_reports_stale_and_behind_locks() {
     std::fs::write(
         home.path().join("repos.toml"),
         format!(
-            "[repos.demo]\npath = \"{}\"\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/tool.git\"\nrelease = \"{}\"\n",
-            lab.work.display(),
+            "[repos.demo]\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/tool.git\"\nrelease = \"{}\"\n",
             lab.upstream.display(),
             lab.temp_origin().display(),
         ),
@@ -189,6 +188,8 @@ fn consumers_reports_stale_and_behind_locks() {
             ])
             .current_dir(&lab.work)
             .env("KNIVES_CONFIG_HOME", home.path())
+            .env("HOME", lab.temp_path())
+            .env("JJ_CONFIG", "/dev/null")
             .output()
             .expect("run consumers")
     };
@@ -225,8 +226,7 @@ fn consumers_reports_a_missing_local_path_as_incomplete() {
     std::fs::write(
         home.path().join("repos.toml"),
         format!(
-            "[repos.demo]\npath = \"{}\"\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/tool.git\"\nrelease = \"{}\"\n",
-            lab.work.display(),
+            "[repos.demo]\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/tool.git\"\nrelease = \"{}\"\n",
             lab.upstream.display(),
             lab.temp_origin().display(),
         ),
@@ -243,6 +243,8 @@ fn consumers_reports_a_missing_local_path_as_incomplete() {
         ])
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
+        .env("HOME", lab.temp_path())
+        .env("JJ_CONFIG", "/dev/null")
         .output()
         .expect("run consumers");
 
@@ -270,8 +272,7 @@ fn consumers_leaves_pins_unclassified_when_live_release_refs_fail() {
     std::fs::write(
         home.path().join("repos.toml"),
         format!(
-            "[repos.demo]\npath = \"{}\"\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/tool.git\"\nrelease = \"{}\"\n",
-            lab.work.display(),
+            "[repos.demo]\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/tool.git\"\nrelease = \"{}\"\n",
             lab.upstream.display(),
             unavailable.display(),
         ),
@@ -288,6 +289,8 @@ fn consumers_leaves_pins_unclassified_when_live_release_refs_fail() {
         ])
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
+        .env("HOME", lab.temp_path())
+        .env("JJ_CONFIG", "/dev/null")
         .output()
         .expect("run consumers");
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -311,8 +314,7 @@ fn consumers_reports_an_unreadable_pin_file_as_incomplete() {
     std::fs::write(
         home.path().join("repos.toml"),
         format!(
-            "[repos.demo]\npath = \"{}\"\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/tool.git\"\nrelease = \"{}\"\n",
-            lab.work.display(),
+            "[repos.demo]\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/tool.git\"\nrelease = \"{}\"\n",
             lab.upstream.display(),
             lab.temp_origin().display(),
         ),
@@ -329,6 +331,8 @@ fn consumers_reports_an_unreadable_pin_file_as_incomplete() {
         ])
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
+        .env("HOME", lab.temp_path())
+        .env("JJ_CONFIG", "/dev/null")
         .output()
         .expect("run consumers");
     let stdout = String::from_utf8_lossy(&output.stdout);

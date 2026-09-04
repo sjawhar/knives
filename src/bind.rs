@@ -68,6 +68,22 @@ impl Fork<'_> {
     }
 }
 
+#[cfg(test)]
+impl<'a> Fork<'a> {
+    /// A fork whose checkout is at `path` and declares no remotes, for unit
+    /// tests that need a checkout location without a repository.
+    pub(crate) fn at(name: &str, entry: &'a RepoEntry, path: &Path) -> Self {
+        Self {
+            name: RepoName::new(name),
+            entry,
+            checkout: Checkout {
+                path: path.to_owned(),
+                remotes: BTreeMap::new(),
+            },
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum BindError {
     #[error("{} is neither a jj nor a git repository", root.display())]
@@ -453,7 +469,6 @@ mod tests {
 
     fn entry(upstream: &str, origin: &str, release: Option<&str>) -> RepoEntry {
         RepoEntry {
-            path: PathBuf::from("/unused"), // Task 3 deletes this field and this line
             upstream: upstream.to_owned(),
             origin: origin.to_owned(),
             base: None,

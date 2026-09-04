@@ -10,7 +10,6 @@ pub mod claim;
 pub mod consumers;
 pub mod gh;
 pub mod hook;
-pub mod init;
 pub mod notch;
 pub mod pr;
 pub mod preflight;

@@ -6,6 +6,7 @@
 //! composition lives in `release_rebase`; the membership verbs in
 //! `release_edit`.
 
+use knives::bind::Fork;
 use knives::cli::Exit;
 use knives::commands::release;
 use knives::forge::github::CliForge;
@@ -17,7 +18,7 @@ use knives::release_model::{
 };
 
 use super::release_edit::recorded_parents;
-use super::{scribe_for, selected};
+use super::scribe_for;
 
 pub(crate) enum ReleaseInvocation {
     Plan,
@@ -32,15 +33,13 @@ pub(crate) enum ReleaseInvocation {
     reason = "cutting is one ordered transaction whose candidate, audits, composition gate, publication, and ledger event must stay together"
 )]
 pub(crate) fn run_release(
-    name: &str,
+    fork: &Fork<'_>,
     extra_consumers: &[&std::path::Path],
     invocation: &ReleaseInvocation,
 ) -> anyhow::Result<Exit> {
-    let chosen = match selected(Some(name), false)? {
-        Ok(list) => list,
-        Err(exit) => return Ok(exit),
-    };
-    let mut worst = Exit::Ok;
+    let repo = &fork.name;
+    let entry = fork.entry;
+    let path = &fork.checkout.path;
     let mut locals = extra_consumers
         .iter()
         .map(|path| path.to_path_buf())
@@ -50,126 +49,121 @@ pub(crate) fn run_release(
     let forge = CliForge;
     let cache_root = knives::forge_cache::cache_root();
     let heads = knives::consumer_pins::ConsumerHeadMemo::default();
-    for (repo, entry) in chosen {
-        let opened = knives::jj::Repo::open(&entry.path)?;
-        let scheme = entry.release_scheme();
-        let (cut_name, allow_drop) = match requested_cut(invocation, &scheme) {
-            Ok(request) => request,
-            Err(exit) => return Ok(exit),
-        };
-        let plan_exit = release_plan_exit(
-            &repo,
-            &entry,
-            &locals,
-            &opened,
-            &forge,
-            cache_root.as_deref(),
-            &heads,
-        )?;
-        worst = worst.worst(plan_exit);
-        if plan_exit == Exit::Incomplete {
-            continue;
-        }
+    let opened = knives::jj::Repo::open(path)?;
+    let scheme = entry.release_scheme();
+    let (cut_name, allow_drop) = match requested_cut(invocation, &scheme) {
+        Ok(request) => request,
+        Err(exit) => return Ok(exit),
+    };
+    let mut worst = release_plan_exit(
+        fork,
+        &locals,
+        &opened,
+        &forge,
+        cache_root.as_deref(),
+        &heads,
+    )?;
+    if worst == Exit::Incomplete {
+        return Ok(worst);
+    }
 
-        if let Some(name) = cut_name {
-            let trunk_name = entry.upstream_trunk();
-            let trunk = opened.resolve_commit(&trunk_name)?;
-            if let Some(orphaned) = check_orphan_commits_before_cut(&opened, &entry)?
-                && let Some(exit) = report_orphaned_cut(&repo, &orphaned, allow_drop)
-            {
-                return Ok(exit);
-            }
-            let tips = opened.bookmark_tips()?;
-            let previous = previous_release_for_cut(&entry, &tips);
-            let previous_commit = previous.as_ref().map(|(_, commit)| commit.clone());
-            // A cut is a new name for the composition in hand, never a recomputation:
-            // with a previous release its parents are carried verbatim — nothing joins,
-            // nothing advances, and a branch enters through `release include`. Only the
-            // first cut has no composition to carry, so it starts from every branch: a
-            // release is a flat merge of feature and fix branches, and the upstream
-            // base is never a direct parent — it is reachable through every member.
-            let (carried, members, audit_base) = if let Some((_, previous)) = &previous {
-                let parents = opened.parent_commits(previous.as_str())?;
-                let carried = release::parent_sources(&opened, &entry, &scheme, &parents)?;
-                let members = carried.clone();
-                let base = release::shared_base(&opened, previous, &trunk)?
-                    .unwrap_or_else(|| trunk.clone());
-                (carried, members, base)
-            } else {
-                let carried = carried_branches(&opened, entry.trunk(), &scheme)?;
-                if carried.is_empty() {
-                    println!(
-                        "{repo}: no branches to cut; a release is a flat merge of feature \
-                         and fix branches, and there are none"
-                    );
-                    return Ok(Exit::Incomplete);
-                }
-                // The first cut composes every branch with no include to gate it,
-                // so the gate include applies runs here: a branch whose history
-                // carries a merge would make the cut carry everything that merge
-                // carried, and the plan would report it the moment it existed.
-                if refuse_stacked_first_cut(&repo, &opened, &entry, &carried)? {
-                    return Ok(Exit::Incomplete);
-                }
-                let members = carried.clone();
-                // The first cut audits each branch from the fork point too:
-                // measuring from the trunk tip charges every commit upstream
-                // landed since the fork to the branches themselves.
-                let member_tips: Vec<knives::ids::CommitId> =
-                    carried.iter().map(|(_, tip)| tip.clone()).collect();
-                let base = opened
-                    .common_ancestor(&member_tips, &trunk)?
-                    .unwrap_or_else(|| trunk.clone());
-                (carried, members, base)
-            };
-            let request = release::Cut::from_carried(name.clone(), &carried);
-            let mut candidate =
-                release::candidate_cut(&entry.path, &request, previous_commit.as_ref())?;
-            // An audit error or failure simply DROPS the candidate: the merge
-            // was never a published operation, so there is nothing to abandon
-            // and no crash window that strands one.
-            let audit = release::audit_cut(
-                &entry.path,
-                &members,
-                release::CutSubject::Candidate(&mut candidate),
-                release::AuditContext {
-                    previous: previous_commit.as_ref(),
-                    trunk: &audit_base,
-                },
-            )?;
-            if let Some(exit) = report_cut_audit(&repo, &audit) {
-                return Ok(exit);
-            }
-            // The orphan gate protects unreachable commits; this protects the
-            // composition itself. The previous cut's ledger event is the only
-            // record of a parent set that survives the bookmark moving, so the
-            // candidate is held against it before anything is published.
-            let gate = CompositionGate {
-                opened: &opened,
-                parents: &request.parents,
-                base: &audit_base,
-                trunk: &trunk,
-                tips: &tips,
-            };
-            let (recorded, check) =
-                match recorded_composition_check(&repo, &mut candidate, &gate, allow_drop)? {
-                    Ok(verdict) => verdict,
-                    Err(exit) => return Ok(exit),
-                };
-            let created = release::publish_cut(candidate, &request.name, &scheme)?;
-            let completed = CompletedCut {
-                name: &name,
-                request: &request,
-                carried: &carried,
-                created: &created,
-                audit: &audit,
-                scheme: &scheme,
-                recorded: recorded.as_ref(),
-                check: &check,
-            };
-            record_cut_event(&repo, &entry, &completed)?;
-            worst = worst.worst(report_completed_cut(&repo, &entry, &opened, &completed)?);
+    if let Some(name) = cut_name {
+        let trunk_name = entry.upstream_trunk();
+        let trunk = opened.resolve_commit(&trunk_name)?;
+        if let Some(orphaned) = check_orphan_commits_before_cut(&opened, fork)?
+            && let Some(exit) = report_orphaned_cut(repo, &orphaned, allow_drop)
+        {
+            return Ok(exit);
         }
+        let tips = opened.bookmark_tips()?;
+        let previous = previous_release_for_cut(entry, &tips);
+        let previous_commit = previous.as_ref().map(|(_, commit)| commit.clone());
+        // A cut is a new name for the composition in hand, never a recomputation:
+        // with a previous release its parents are carried verbatim — nothing joins,
+        // nothing advances, and a branch enters through `release include`. Only the
+        // first cut has no composition to carry, so it starts from every branch: a
+        // release is a flat merge of feature and fix branches, and the upstream
+        // base is never a direct parent — it is reachable through every member.
+        let (carried, members, audit_base) = if let Some((_, previous)) = &previous {
+            let parents = opened.parent_commits(previous.as_str())?;
+            let carried = release::parent_sources(&opened, entry, &scheme, &parents)?;
+            let members = carried.clone();
+            let base =
+                release::shared_base(&opened, previous, &trunk)?.unwrap_or_else(|| trunk.clone());
+            (carried, members, base)
+        } else {
+            let carried = carried_branches(&opened, entry.trunk(), &scheme)?;
+            if carried.is_empty() {
+                println!(
+                    "{repo}: no branches to cut; a release is a flat merge of feature \
+                     and fix branches, and there are none"
+                );
+                return Ok(Exit::Incomplete);
+            }
+            // The first cut composes every branch with no include to gate it,
+            // so the gate include applies runs here: a branch whose history
+            // carries a merge would make the cut carry everything that merge
+            // carried, and the plan would report it the moment it existed.
+            if refuse_stacked_first_cut(repo, &opened, entry, &carried)? {
+                return Ok(Exit::Incomplete);
+            }
+            let members = carried.clone();
+            // The first cut audits each branch from the fork point too:
+            // measuring from the trunk tip charges every commit upstream
+            // landed since the fork to the branches themselves.
+            let member_tips: Vec<knives::ids::CommitId> =
+                carried.iter().map(|(_, tip)| tip.clone()).collect();
+            let base = opened
+                .common_ancestor(&member_tips, &trunk)?
+                .unwrap_or_else(|| trunk.clone());
+            (carried, members, base)
+        };
+        let request = release::Cut::from_carried(name.clone(), &carried);
+        let mut candidate = release::candidate_cut(path, &request, previous_commit.as_ref())?;
+        // An audit error or failure simply DROPS the candidate: the merge
+        // was never a published operation, so there is nothing to abandon
+        // and no crash window that strands one.
+        let audit = release::audit_cut(
+            path,
+            &members,
+            release::CutSubject::Candidate(&mut candidate),
+            release::AuditContext {
+                previous: previous_commit.as_ref(),
+                trunk: &audit_base,
+            },
+        )?;
+        if let Some(exit) = report_cut_audit(repo, &audit) {
+            return Ok(exit);
+        }
+        // The orphan gate protects unreachable commits; this protects the
+        // composition itself. The previous cut's ledger event is the only
+        // record of a parent set that survives the bookmark moving, so the
+        // candidate is held against it before anything is published.
+        let gate = CompositionGate {
+            opened: &opened,
+            parents: &request.parents,
+            base: &audit_base,
+            trunk: &trunk,
+            tips: &tips,
+        };
+        let (recorded, check) =
+            match recorded_composition_check(repo, &mut candidate, &gate, allow_drop)? {
+                Ok(verdict) => verdict,
+                Err(exit) => return Ok(exit),
+            };
+        let created = release::publish_cut(candidate, &request.name, &scheme)?;
+        let completed = CompletedCut {
+            name: &name,
+            request: &request,
+            carried: &carried,
+            created: &created,
+            audit: &audit,
+            scheme: &scheme,
+            recorded: recorded.as_ref(),
+            check: &check,
+        };
+        record_cut_event(fork, &completed)?;
+        worst = worst.worst(report_completed_cut(fork, &opened, &completed)?);
     }
     Ok(worst)
 }
@@ -197,14 +191,14 @@ fn requested_cut(
     reason = "the release plan needs explicit repository state and each independently owned consumer-scan collaborator"
 )]
 fn release_plan_exit(
-    repo: &RepoName,
-    entry: &knives::config::RepoEntry,
+    fork: &Fork<'_>,
     locals: &[std::path::PathBuf],
     opened: &knives::jj::Repo,
     forge: &dyn knives::consumer_pins::ConsumerPinSource,
     cache_root: Option<&std::path::Path>,
     heads: &knives::consumer_pins::ConsumerHeadMemo,
 ) -> anyhow::Result<Exit> {
+    let entry = fork.entry;
     let consumers = release::ConsumerInputs {
         slugs: &entry.consumers,
         locals,
@@ -212,7 +206,7 @@ fn release_plan_exit(
         cache_root,
         heads,
     };
-    let plan = release::plan(repo, entry, &consumers, &Ledger::for_repo(repo).entries()?)?;
+    let plan = release::plan(fork, &consumers, &Ledger::for_repo(&fork.name).entries()?)?;
     println!("{}", release::render(&plan));
     let mut exit = release::exit_for(&plan);
     if let Some(lag) = release::trunk_lag(opened, plan.release.as_deref(), &entry.upstream_trunk())
@@ -370,12 +364,9 @@ struct CompletedCut<'a> {
 /// change id survives the
 /// rewrite and still resolves to the release. Evidence keeps the commit first:
 /// the composition gate parses it from that position.
-fn record_cut_event(
-    repo: &RepoName,
-    entry: &knives::config::RepoEntry,
-    cut: &CompletedCut<'_>,
-) -> anyhow::Result<()> {
-    let opened = knives::jj::Repo::open(&entry.path)?;
+fn record_cut_event(fork: &Fork<'_>, cut: &CompletedCut<'_>) -> anyhow::Result<()> {
+    let entry = fork.entry;
+    let opened = knives::jj::Repo::open(&fork.checkout.path)?;
     let parents = opened.parent_commits(cut.created.as_str())?;
     let change = opened.change_id_of(cut.created.as_str())?;
     let members = release::parent_sources(&opened, entry, cut.scheme, &parents)?;
@@ -418,7 +409,7 @@ fn record_cut_event(
             recorded.members.len()
         )
     });
-    scribe_for(repo, entry)?.record(&Draft {
+    scribe_for(fork)?.record(&Draft {
         subject: Some(cut.name),
         kind: Kind::Event,
         disposition: None,
@@ -437,11 +428,11 @@ fn record_cut_event(
 }
 
 fn report_completed_cut(
-    repo: &RepoName,
-    entry: &knives::config::RepoEntry,
+    fork: &Fork<'_>,
     opened: &knives::jj::Repo,
     cut: &CompletedCut<'_>,
 ) -> anyhow::Result<Exit> {
+    let entry = fork.entry;
     let mut post_cut_exit =
         if cut.audit.inconclusive.is_empty() && cut.check.inconclusive.is_empty() {
             Exit::Ok
@@ -455,12 +446,12 @@ fn report_completed_cut(
         cut.created.short(),
         cut.request.parents.len()
     );
-    match knives::jj::conflicted_files(&entry.path, cut.created.as_str()) {
+    match knives::jj::conflicted_files(&fork.checkout.path, cut.created.as_str()) {
         Ok(files) => println!("{}", release::conflict_guidance(&files)),
         Err(error) => println!("  could not list conflicts: {error}"),
     }
     if let Some(first) = cut.request.parents.first() {
-        let test_count = release::check_test_count(entry, cut.created, first);
+        let test_count = release::check_test_count(fork, cut.created, first);
         println!("{}", test_count.render());
         if matches!(test_count, release::TestCountCheck::Dropped { .. }) {
             post_cut_exit = post_cut_exit.worst(Exit::Findings);
@@ -494,7 +485,7 @@ fn report_completed_cut(
         );
         println!("  remove with `jj workspace forget <name>` once you have checked them");
     }
-    Ok(post_cut_exit.worst(reap_after_cut(repo, entry)?))
+    Ok(post_cut_exit.worst(reap_after_cut(fork)?))
 }
 
 struct OrphanedLineage {
@@ -529,15 +520,16 @@ fn report_orphaned_cut(
 
 fn check_orphan_commits_before_cut(
     opened: &knives::jj::Repo,
-    entry: &knives::config::RepoEntry,
+    fork: &Fork<'_>,
 ) -> anyhow::Result<Option<OrphanedLineage>> {
+    let entry = fork.entry;
     let tips = opened.bookmark_tips()?;
     let Some(previous) = previous_release_for_cut(entry, &tips) else {
         return Ok(None);
     };
     let keep = release::cut_keepers(opened, entry, &tips, &previous.1)?;
     let orphans = release::orphaned_commits(release::OrphanedCommitInput {
-        repo_path: &entry.path,
+        repo_path: &fork.checkout.path,
         previous: &previous.1,
         keep: &keep,
         tips: &tips,
@@ -590,27 +582,21 @@ fn refuse_stacked_first_cut(
 /// this is a no-op there. Opens the repository again deliberately: the caller's
 /// handle predates the cut and reads stale tips, under which the superseded cut
 /// is still the newest dated name and nothing is reaped at all.
-fn reap_after_cut(repo: &RepoName, entry: &knives::config::RepoEntry) -> anyhow::Result<Exit> {
-    let reopened = knives::jj::Repo::open(&entry.path)?;
-    let report = release::reap_superseded(&entry.path, &reopened, entry.publish_remote())?;
-    print_reap(&repo.to_string(), &report);
+fn reap_after_cut(fork: &Fork<'_>) -> anyhow::Result<Exit> {
+    let path = &fork.checkout.path;
+    let reopened = knives::jj::Repo::open(path)?;
+    let report = release::reap_superseded(path, &reopened, fork.entry.publish_remote())?;
+    print_reap(fork.name.as_str(), &report);
     Ok(reap_exit(&report))
 }
 
 /// Reap superseded dated cuts on demand.
-pub(crate) fn run_reap(name: &str) -> anyhow::Result<Exit> {
-    let chosen = match selected(Some(name), false)? {
-        Ok(list) => list,
-        Err(exit) => return Ok(exit),
-    };
-    let mut worst = Exit::Ok;
-    for (repo, entry) in chosen {
-        let opened = knives::jj::Repo::open(&entry.path)?;
-        let report = release::reap_superseded(&entry.path, &opened, entry.publish_remote())?;
-        print_reap(&repo.to_string(), &report);
-        worst = worst.worst(reap_exit(&report));
-    }
-    Ok(worst)
+pub(crate) fn run_reap(fork: &Fork<'_>) -> anyhow::Result<Exit> {
+    let path = &fork.checkout.path;
+    let opened = knives::jj::Repo::open(path)?;
+    let report = release::reap_superseded(path, &opened, fork.entry.publish_remote())?;
+    print_reap(fork.name.as_str(), &report);
+    Ok(reap_exit(&report))
 }
 
 /// Return a finding when reaping leaves work behind — a cut with descendants

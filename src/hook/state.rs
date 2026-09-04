@@ -158,15 +158,15 @@ fn prune_stale_siblings(directory: &Path) {
     let Ok(entries) = std::fs::read_dir(directory) else {
         return;
     };
-    for entry in entries.flatten() {
-        let Ok(metadata) = std::fs::metadata(entry.path()) else {
+    for file in entries.flatten() {
+        let Ok(metadata) = std::fs::metadata(file.path()) else {
             continue;
         };
         let Ok(modified) = metadata.modified() else {
             continue;
         };
         if metadata.is_file() && modified < stale_before {
-            let _ = std::fs::remove_file(entry.path());
+            let _ = std::fs::remove_file(file.path());
         }
     }
 }

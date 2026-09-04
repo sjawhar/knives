@@ -22,7 +22,6 @@ fn preflight_reports_main_when_a_repo_configures_dev_as_its_trunk() {
     let lab = lab::Lab::new();
     lab.jj_work(["bookmark", "set", "dev", "-r", "main"]);
     let entry = RepoEntry {
-        path: lab.work.clone(),
         upstream: lab.upstream.display().to_string(),
         origin: lab.work.display().to_string(),
         base: Some("dev".to_owned()),
@@ -34,7 +33,9 @@ fn preflight_reports_main_when_a_repo_configures_dev_as_its_trunk() {
     };
 
     // When: preflight collects locally maintained branches.
-    let states = knives::commands::preflight::branch_states(&entry, &[]).expect("branch states");
+    let states =
+        knives::commands::preflight::branch_states(&lab::lab_fork(&lab, "demo", &entry), &[])
+            .expect("branch states");
 
     // Then: dev is the only excluded trunk; main remains work to report.
     assert!(
@@ -54,7 +55,6 @@ fn preflight_treats_a_fixed_release_branch_as_a_release_not_a_branch() {
     lab.jj_work(["bookmark", "set", "integration", "-r", "main"]);
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     let entry = RepoEntry {
-        path: lab.work.clone(),
         upstream: lab.upstream.display().to_string(),
         origin: lab.work.display().to_string(),
         base: None,
@@ -66,7 +66,9 @@ fn preflight_treats_a_fixed_release_branch_as_a_release_not_a_branch() {
     };
 
     // When: preflight collects locally maintained branches.
-    let states = knives::commands::preflight::branch_states(&entry, &[]).expect("branch states");
+    let states =
+        knives::commands::preflight::branch_states(&lab::lab_fork(&lab, "demo", &entry), &[])
+            .expect("branch states");
 
     // Then: the fixed cut is excluded while feature work remains visible.
     assert!(
@@ -86,7 +88,6 @@ fn preflight_hides_a_divergent_configured_trunk_bookmark() {
     lab.branch("dev", "dev.txt", "dev\n");
     lab.rewrite_in_both_clones("dev");
     let entry = RepoEntry {
-        path: lab.work.clone(),
         upstream: lab.upstream.display().to_string(),
         origin: lab.work.display().to_string(),
         base: Some("dev".to_owned()),
@@ -98,7 +99,9 @@ fn preflight_hides_a_divergent_configured_trunk_bookmark() {
     };
 
     // When: preflight reads divergent bookmarks before regular branch tips.
-    let states = knives::commands::preflight::branch_states(&entry, &[]).expect("branch states");
+    let states =
+        knives::commands::preflight::branch_states(&lab::lab_fork(&lab, "demo", &entry), &[])
+            .expect("branch states");
 
     // Then: the trunk is excluded even when it is divergent.
     assert!(
@@ -120,7 +123,6 @@ fn preflight_flags_a_branch_whose_tip_is_divergent() {
     lab.rewrite_in_both_clones("feat/alpha");
 
     let entry = knives::config::RepoEntry {
-        path: lab.work.clone(),
         upstream: lab.upstream.display().to_string(),
         origin: lab.work.display().to_string(),
         base: None,
@@ -130,7 +132,9 @@ fn preflight_flags_a_branch_whose_tip_is_divergent() {
         consumers: Vec::new(),
         workspaces: None,
     };
-    let states = knives::commands::preflight::branch_states(&entry, &[]).expect("branch states");
+    let states =
+        knives::commands::preflight::branch_states(&lab::lab_fork(&lab, "demo", &entry), &[])
+            .expect("branch states");
     assert!(
         states.iter().any(|state| state.divergent),
         "a branch whose tip is divergent must be reported as divergent, got {states:#?}"

@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::Path;
 
+use crate::bind::Fork;
 use crate::cli::Exit;
 use crate::commands::pushed::{self, ReconcileInput, Row};
 use crate::config::{RepoEntry, Role};
@@ -32,8 +33,7 @@ pub struct Report {
 
 /// Dependencies shared by the read-only estate checks.
 pub struct AuditInput<'a> {
-    pub repo: &'a RepoName,
-    pub entry: &'a RepoEntry,
+    pub fork: &'a Fork<'a>,
     pub store: &'a Store,
     pub forge: Option<&'a dyn Forge>,
     pub cache_root: Option<&'a Path>,
@@ -43,8 +43,7 @@ impl std::fmt::Debug for AuditInput<'_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("AuditInput")
-            .field("repo", self.repo)
-            .field("entry", self.entry)
+            .field("fork", self.fork)
             .field("forge", &self.forge.is_some())
             .field("cache_root", &self.cache_root)
             .finish()
@@ -53,19 +52,21 @@ impl std::fmt::Debug for AuditInput<'_> {
 
 /// Gather the estate facts without writing a repository, remote, store, or ledger.
 pub fn gather(input: &AuditInput<'_>) -> Report {
+    let fork = input.fork;
+    let entry = fork.entry;
+    let path = &fork.checkout.path;
     let mut report = Report {
-        repo: input.repo.to_string(),
+        repo: fork.name.to_string(),
         findings: Vec::new(),
         notes: Vec::new(),
         problems: Vec::new(),
     };
-    let opened = match Repo::open(&input.entry.path) {
+    let opened = match Repo::open(path) {
         Ok(opened) => opened,
         Err(error) => {
-            report.problems.push(format!(
-                "could not open {}: {error}",
-                input.entry.path.display()
-            ));
+            report
+                .problems
+                .push(format!("could not open {}: {error}", path.display()));
             return report;
         }
     };
@@ -78,9 +79,9 @@ pub fn gather(input: &AuditInput<'_>) -> Report {
             return report;
         }
     };
-    add_unconfigured_remote_refs(&mut report, &opened, &input.entry.path, &tips);
+    add_unconfigured_remote_refs(&mut report, &opened, &fork.checkout.remotes, &tips);
     let local = pushed::local_tips(tips);
-    let live = match pushed::live_refs(input.entry) {
+    let live = match pushed::live_refs(entry) {
         Ok(live) => live,
         Err(error) => {
             report
@@ -89,9 +90,9 @@ pub fn gather(input: &AuditInput<'_>) -> Report {
             return report;
         }
     };
-    let scheme = input.entry.release_scheme();
+    let scheme = entry.release_scheme();
     let requested: Vec<BranchName> = local.keys().cloned().collect();
-    let tracked = tracked(input.store, input.repo, &requested);
+    let tracked = tracked(input.store, &fork.name, &requested);
     let rows = pushed::reconcile(&ReconcileInput {
         tips_local: &local,
         origin_refs: live.origin(),
@@ -102,9 +103,9 @@ pub fn gather(input: &AuditInput<'_>) -> Report {
     });
     report.findings.extend(remote_drifts(&rows));
     report.findings.extend(zombie_branches(&ZombieInput {
-        entry: input.entry,
+        entry,
         store: input.store,
-        repo: input.repo,
+        repo: &fork.name,
         local: &local,
         live: &live,
         scheme: &scheme,
@@ -115,17 +116,12 @@ pub fn gather(input: &AuditInput<'_>) -> Report {
             local: &local,
             published: live.release(),
             scheme: &scheme,
-            publish_remote: input.entry.publish_remote(),
-            ledger: &Ledger::for_repo(input.repo),
+            publish_remote: entry.publish_remote(),
+            ledger: &Ledger::for_repo(&fork.name),
         },
     );
-    add_misplaced_origin_release_refs(
-        &mut report,
-        live.origin(),
-        &scheme,
-        input.entry.publish_remote(),
-    );
-    add_orphan_commits(&mut report, &opened, &input.entry.path);
+    add_misplaced_origin_release_refs(&mut report, live.origin(), &scheme, entry.publish_remote());
+    add_orphan_commits(&mut report, &opened, path);
     add_open_pull_head_checks(&mut report, input, &local, live.origin());
     report
 }
@@ -133,7 +129,7 @@ pub fn gather(input: &AuditInput<'_>) -> Report {
 fn add_unconfigured_remote_refs(
     report: &mut Report,
     opened: &Repo,
-    path: &Path,
+    configured: &BTreeMap<String, String>,
     tips: &BookmarkTips,
 ) {
     let conflicted = match opened.conflicted_bookmarks() {
@@ -142,15 +138,6 @@ fn add_unconfigured_remote_refs(
             report
                 .problems
                 .push(format!("could not read conflicted bookmarks: {error}"));
-            return;
-        }
-    };
-    let configured = match jj::git_remotes(path) {
-        Ok(remotes) => remotes,
-        Err(error) => {
-            report
-                .problems
-                .push(format!("could not read configured Git remotes: {error}"));
             return;
         }
     };
@@ -478,7 +465,7 @@ fn add_open_pull_head_checks(
         return;
     };
     let request = PullHeadInput {
-        entry: input.entry,
+        fork: input.fork,
         forge,
         cache_root: input.cache_root,
         local,
@@ -493,7 +480,7 @@ fn add_open_pull_head_checks(
 }
 
 struct PullHeadInput<'a> {
-    entry: &'a RepoEntry,
+    fork: &'a Fork<'a>,
     forge: &'a dyn Forge,
     cache_root: Option<&'a Path>,
     local: &'a BTreeMap<BranchName, CommitId>,
@@ -505,13 +492,11 @@ fn pull_head_findings(
     findings: &mut Vec<Finding>,
     notes: &mut Vec<String>,
 ) -> Result<Vec<String>, crate::forge::ForgeError> {
+    let entry = input.fork.entry;
     let opened = snapshot::open(SnapshotConfig {
         forge: input.forge,
-        path: &input.entry.path,
-        remotes: [
-            input.entry.remote(Role::Origin),
-            input.entry.remote(Role::Release),
-        ],
+        path: &input.fork.checkout.path,
+        remotes: [entry.remote(Role::Origin), entry.remote(Role::Release)],
         cache_root: input.cache_root,
     })?;
     let snapshot = opened.complete_with(&(), |discovery, ()| {
@@ -624,6 +609,7 @@ mod tests {
         add_open_pull_head_checks, add_release_drifts, exit_for, pull_head_findings,
         pull_position_findings, recorded_commit, same_commit,
     };
+    use crate::bind::Fork;
     use crate::cli::Exit;
     use crate::config::RepoEntry;
     use crate::detect::{FindingKind, Subject};
@@ -635,7 +621,7 @@ mod tests {
     use crate::ledger::{Entry, Kind, Ledger};
     use crate::store::Store;
     use std::collections::BTreeMap;
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
 
     #[derive(Debug)]
     struct ChangingFactsForge {
@@ -702,7 +688,6 @@ mod tests {
 
     fn test_entry() -> RepoEntry {
         RepoEntry {
-            path: PathBuf::from("/fake"),
             upstream: "git@github.com:upstream/repo.git".to_owned(),
             origin: "git@github.com:owner/fork.git".to_owned(),
             base: None,
@@ -866,7 +851,6 @@ mod tests {
     #[test]
     fn an_equal_release_url_does_not_misplace_origin_release_refs() {
         let entry = RepoEntry {
-            path: PathBuf::from("/tmp/demo"),
             upstream: "https://forge.invalid/up/demo.git".to_owned(),
             origin: "https://forge.invalid/ours/demo.git".to_owned(),
             base: None,
@@ -937,7 +921,6 @@ mod tests {
     #[test]
     fn open_pull_check_batches_the_open_owned_pull_before_comparing_positions() {
         let entry = RepoEntry {
-            path: PathBuf::from("/fake"),
             upstream: "git@github.com:upstream/repo.git".to_owned(),
             origin: "git@github.com:owner/fork.git".to_owned(),
             base: None,
@@ -947,6 +930,7 @@ mod tests {
             consumers: Vec::new(),
             workspaces: None,
         };
+        let fork = Fork::at("demo", &entry, Path::new("/fake"));
         let forge = FakeForge {
             pull_requests: BTreeMap::from([(
                 BranchName::new("feat/alpha"),
@@ -976,7 +960,7 @@ mod tests {
 
         pull_head_findings(
             &PullHeadInput {
-                entry: &entry,
+                fork: &fork,
                 forge: &forge,
                 cache_root: None,
                 local: &local,
@@ -998,6 +982,7 @@ mod tests {
     #[test]
     fn open_pull_head_check_persists_its_completed_snapshot() {
         let entry = test_entry();
+        let fork = Fork::at("demo", &entry, Path::new("/fake"));
         let forge = FakeForge {
             pull_requests: BTreeMap::from([(BranchName::new("feat/alpha"), test_pull("OPEN"))]),
             ..FakeForge::default()
@@ -1015,8 +1000,7 @@ mod tests {
         add_open_pull_head_checks(
             &mut report,
             &AuditInput {
-                repo: &repo,
-                entry: &entry,
+                fork: &fork,
                 store: &store,
                 forge: Some(&forge),
                 cache_root: Some(temp.path()),
@@ -1037,6 +1021,7 @@ mod tests {
     #[test]
     fn open_pull_head_check_notes_a_completed_snapshot_cache_write_failure() {
         let entry = test_entry();
+        let fork = Fork::at("demo", &entry, Path::new("/fake"));
         let forge = FakeForge {
             pull_requests: BTreeMap::from([(BranchName::new("feat/alpha"), test_pull("OPEN"))]),
             ..FakeForge::default()
@@ -1056,8 +1041,7 @@ mod tests {
         add_open_pull_head_checks(
             &mut report,
             &AuditInput {
-                repo: &repo,
-                entry: &entry,
+                fork: &fork,
                 store: &store,
                 forge: Some(&forge),
                 cache_root: Some(&blocked_root),
@@ -1077,6 +1061,7 @@ mod tests {
     #[test]
     fn a_withheld_open_pull_fact_makes_the_audit_incomplete() {
         let entry = test_entry();
+        let fork = Fork::at("demo", &entry, Path::new("/fake"));
         let forge = ChangingFactsForge {
             discovery: test_pull("OPEN"),
             fact: None,
@@ -1096,8 +1081,7 @@ mod tests {
         add_open_pull_head_checks(
             &mut report,
             &AuditInput {
-                repo: &repo,
-                entry: &entry,
+                fork: &fork,
                 store: &store,
                 forge: Some(&forge),
                 cache_root: None,
@@ -1116,6 +1100,7 @@ mod tests {
     #[test]
     fn pull_that_closes_during_the_live_batch_has_no_head_drift() {
         let entry = test_entry();
+        let fork = Fork::at("demo", &entry, Path::new("/fake"));
         let forge = ChangingFactsForge {
             discovery: test_pull("OPEN"),
             fact: Some(test_pull("CLOSED")),
@@ -1133,7 +1118,7 @@ mod tests {
 
         pull_head_findings(
             &PullHeadInput {
-                entry: &entry,
+                fork: &fork,
                 forge: &forge,
                 cache_root: None,
                 local: &local,

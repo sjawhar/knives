@@ -62,8 +62,8 @@ fn source_files(root: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(root) else {
         return;
     };
-    for entry in entries.flatten() {
-        let path = entry.path();
+    for child in entries.flatten() {
+        let path = child.path();
         if path.is_dir() {
             if path.file_name().is_some_and(|name| name == "node_modules") {
                 continue;

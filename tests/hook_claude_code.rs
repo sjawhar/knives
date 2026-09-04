@@ -42,6 +42,8 @@ fn run_hook_input(home: &Path, input: &str) -> (bool, String, String) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_knives"))
         .args(["hook", "claude-code"])
         .env("KNIVES_CONFIG_HOME", home)
+        .env("HOME", home)
+        .env("JJ_CONFIG", "/dev/null")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -172,15 +174,11 @@ impl Repositories {
         } else {
             "[trust]\nowners = [\"ours\"]\n"
         };
-        // `path` is still a required field until Task 3 deletes it; the hook
-        // code never reads it.
         let config = format!(
-            "[repos.alpha]\npath = \"{}\"\nupstream = \"https://forge.invalid/maintainer/alpha\"\n\
+            "[repos.alpha]\nupstream = \"https://forge.invalid/maintainer/alpha\"\n\
              origin = \"https://forge.invalid/ours/alpha\"\n\n\
-             [repos.beta]\npath = \"{}\"\nupstream = \"https://forge.invalid/maintainer/beta\"\n\
-             origin = \"https://forge.invalid/ours/beta\"\n\n{trust}",
-            self.alpha.display(),
-            self.beta.display(),
+             [repos.beta]\nupstream = \"https://forge.invalid/maintainer/beta\"\n\
+             origin = \"https://forge.invalid/ours/beta\"\n\n{trust}"
         );
         std::fs::write(self.home.path().join("repos.toml"), config).expect("write registry");
         let state = json!({"claims": {"beta/feat/claimed": {

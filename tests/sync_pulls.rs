@@ -31,6 +31,7 @@ fn sync_fails_closed_when_the_facts_batch_fails() {
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     let name = knives::ids::RepoName::new("demo");
     let entry = lab_entry(&lab);
+    let fork = lab::lab_fork(&lab, "demo", &entry);
     let forge = knives::forge::fake::FakeForge {
         pull_requests: BTreeMap::from([(
             BranchName::new("feat/alpha"),
@@ -49,7 +50,7 @@ fn sync_fails_closed_when_the_facts_batch_fails() {
     );
 
     let report = sync::sync_repo(sync::SyncInput {
-        entry: &entry,
+        fork: &fork,
         store: &mut store,
         forge: Some(&forge),
         scribe: &scribe,
@@ -76,6 +77,7 @@ fn a_listed_state_wins_and_a_vanished_number_is_answered_by_the_batch() {
     lab.publish_pull("feat/alpha", 43);
     let name = knives::ids::RepoName::new("demo");
     let entry = lab_entry(&lab);
+    let fork = lab::lab_fork(&lab, "demo", &entry);
     let forge = knives::forge::fake::FakeForge {
         pull_requests: BTreeMap::from([(
             BranchName::new("feat/alpha"),
@@ -95,7 +97,7 @@ fn a_listed_state_wins_and_a_vanished_number_is_answered_by_the_batch() {
     );
 
     let report = sync::sync_repo(sync::SyncInput {
-        entry: &entry,
+        fork: &fork,
         store: &mut store,
         forge: Some(&forge),
         scribe: &scribe,
@@ -131,7 +133,6 @@ fn sync_records_one_event_for_each_pull_request_that_moved() {
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     let name = knives::ids::RepoName::new("demo");
     let entry = RepoEntry {
-        path: lab.work.clone(),
         upstream: lab.upstream.display().to_string(),
         origin: lab.work.display().to_string(),
         base: None,
@@ -141,6 +142,7 @@ fn sync_records_one_event_for_each_pull_request_that_moved() {
         consumers: Vec::new(),
         workspaces: None,
     };
+    let fork = lab::lab_fork(&lab, "demo", &entry);
     let mut pull_requests = BTreeMap::new();
     for (number, branch, state) in [
         (10, "feat/merged", "MERGED"),
@@ -179,7 +181,7 @@ fn sync_records_one_event_for_each_pull_request_that_moved() {
 
     // When: sync classifies them.
     let report = sync::sync_repo(sync::SyncInput {
-        entry: &entry,
+        fork: &fork,
         store: &mut store,
         forge: Some(&forge),
         scribe: &scribe,
@@ -219,6 +221,7 @@ fn sync_records_a_settled_pull_request_once_across_repeated_runs() {
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     let name = knives::ids::RepoName::new("demo");
     let entry = lab_entry(&lab);
+    let fork = lab::lab_fork(&lab, "demo", &entry);
     let forge = knives::forge::fake::FakeForge {
         pull_requests: BTreeMap::from([(
             BranchName::new("feat/alpha"),
@@ -236,7 +239,7 @@ fn sync_records_a_settled_pull_request_once_across_repeated_runs() {
 
     // When: the same settled pull request is seen twice.
     sync::sync_repo(sync::SyncInput {
-        entry: &entry,
+        fork: &fork,
         store: &mut store,
         forge: Some(&forge),
         scribe: &scribe,
@@ -244,7 +247,7 @@ fn sync_records_a_settled_pull_request_once_across_repeated_runs() {
     })
     .expect("first sync");
     sync::sync_repo(sync::SyncInput {
-        entry: &entry,
+        fork: &fork,
         store: &mut store,
         forge: Some(&forge),
         scribe: &scribe,
@@ -271,6 +274,7 @@ fn sync_records_an_advanced_pull_request_then_its_merge() {
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     let name = knives::ids::RepoName::new("demo");
     let entry = lab_entry(&lab);
+    let fork = lab::lab_fork(&lab, "demo", &entry);
     let advanced = knives::forge::fake::FakeForge {
         pull_requests: BTreeMap::from([(
             BranchName::new("feat/alpha"),
@@ -294,7 +298,7 @@ fn sync_records_an_advanced_pull_request_then_its_merge() {
 
     // When: the head advances, then the forge marks that same pull request merged.
     sync::sync_repo(sync::SyncInput {
-        entry: &entry,
+        fork: &fork,
         store: &mut store,
         forge: Some(&advanced),
         scribe: &scribe,
@@ -302,7 +306,7 @@ fn sync_records_an_advanced_pull_request_then_its_merge() {
     })
     .expect("advanced sync");
     sync::sync_repo(sync::SyncInput {
-        entry: &entry,
+        fork: &fork,
         store: &mut store,
         forge: Some(&merged),
         scribe: &scribe,
@@ -329,6 +333,7 @@ fn sync_records_each_consecutive_advance() {
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     let name = knives::ids::RepoName::new("demo");
     let entry = lab_entry(&lab);
+    let fork = lab::lab_fork(&lab, "demo", &entry);
     let first_advance = knives::forge::fake::FakeForge {
         pull_requests: BTreeMap::from([(
             BranchName::new("feat/alpha"),
@@ -352,7 +357,7 @@ fn sync_records_each_consecutive_advance() {
 
     // When: the pull request advances from A to B, then from B to C.
     sync::sync_repo(sync::SyncInput {
-        entry: &entry,
+        fork: &fork,
         store: &mut store,
         forge: Some(&first_advance),
         scribe: &scribe,
@@ -360,7 +365,7 @@ fn sync_records_each_consecutive_advance() {
     })
     .expect("first advance");
     sync::sync_repo(sync::SyncInput {
-        entry: &entry,
+        fork: &fork,
         store: &mut store,
         forge: Some(&second_advance),
         scribe: &scribe,

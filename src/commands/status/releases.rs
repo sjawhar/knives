@@ -149,6 +149,7 @@ pub(super) struct ReleaseInput<'a> {
     pub(super) repo: &'a Repo,
     pub(super) tips: &'a BookmarkTips,
     pub(super) entry: &'a RepoEntry,
+    pub(super) path: &'a std::path::Path,
 }
 
 /// Fold the release scan into a report.
@@ -161,7 +162,12 @@ pub(super) fn add_releases(
     findings: &mut Vec<Finding>,
     input: ReleaseInput<'_>,
 ) -> anyhow::Result<()> {
-    let ReleaseInput { repo, tips, entry } = input;
+    let ReleaseInput {
+        repo,
+        tips,
+        entry,
+        path,
+    } = input;
     let scheme = entry.release_scheme();
     report.newest_release =
         crate::release_model::newest_release(tips, &scheme, entry.publish_remote())
@@ -180,7 +186,7 @@ pub(super) fn add_releases(
     report.releases = names;
     findings.extend(release_findings);
     let (double_cut_findings, double_cut_notes) =
-        double_cut_findings(&entry.path, tips, &scheme, entry.publish_remote())?;
+        double_cut_findings(path, tips, &scheme, entry.publish_remote())?;
     findings.extend(double_cut_findings);
     report.notes.extend(double_cut_notes);
     if skipped > 0 {

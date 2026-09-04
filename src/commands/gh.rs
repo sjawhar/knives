@@ -524,16 +524,23 @@ pub(crate) fn resolve_target_url(args: &[String], cwd: &Path) -> Option<String> 
     let registry = needs_git_inputs
         .then(|| crate::config::load(&crate::config::default_config_path()).ok())
         .flatten();
-    let registered_entry = registry
+    let bound = registry
         .as_ref()
-        .and_then(|registry| registry.containing(cwd).map(|(_, entry)| entry));
-    let requires_git_remotes = needs_git_inputs
+        .and_then(|registry| crate::bind::here(registry, cwd).ok().and_then(Result::ok));
+    let registered_entry = bound.as_ref().map(|fork| fork.entry);
+    let requires_remotes = needs_git_inputs
         && (resolved_remote
             .as_ref()
             .is_some_and(|resolved| resolved.value == "base")
             || registered_entry.is_none());
-    let remotes = if requires_git_remotes {
-        crate::jj::git_remotes(cwd).unwrap_or_default()
+    let remotes = if requires_remotes {
+        bound
+            .as_ref()
+            .map(|fork| fork.checkout.remotes.clone())
+            .or_else(|| {
+                crate::bind::checkout_root(cwd).and_then(|root| crate::bind::remotes(&root).ok())
+            })
+            .unwrap_or_default()
     } else {
         BTreeMap::new()
     };
@@ -688,7 +695,6 @@ mod tests {
 
     use super::*;
     use std::collections::BTreeMap;
-    use std::path::PathBuf;
 
     fn with_env<T>(vars: &[(&'static str, &str)], run: impl FnOnce() -> T) -> T {
         let _lock = crate::config::test_support::environment_lock();
@@ -1047,7 +1053,6 @@ mod tests {
     fn registry_roles_beat_literal_remote_names_during_target_resolution() {
         let host = DEFAULT_HOST;
         let entry = crate::config::RepoEntry {
-            path: PathBuf::from("/registered"),
             upstream: format!("git@{host}:registered/upstream"),
             origin: format!("git@{host}:registered/origin"),
             base: None,
@@ -1086,7 +1091,6 @@ mod tests {
         // named base remote can no longer produce a URL.
         let host = DEFAULT_HOST;
         let entry = crate::config::RepoEntry {
-            path: PathBuf::from("/registered"),
             upstream: format!("git@{host}:registered/upstream"),
             origin: format!("git@{host}:registered/origin"),
             base: None,

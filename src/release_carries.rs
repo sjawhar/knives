@@ -6,6 +6,7 @@
 //! branch. Each verb is a gather, an exit code and a renderer; the repository
 //! is only read.
 
+use knives::bind::Fork;
 use knives::carriage::{
     self, CarriesReport, CensusOptions, CensusReport, CheckInput, Target, TargetCheck, TargetRole,
 };
@@ -13,7 +14,6 @@ use knives::cli::{Exit, Output};
 use knives::commands::release;
 use knives::forge::Forge;
 use knives::forge::github::CliForge;
-use knives::ids::RepoName;
 use knives::jj::Repo;
 use knives::ledger::Ledger;
 
@@ -37,11 +37,12 @@ pub(crate) struct MembersInvocation<'a> {
 
 /// Inspect a release's direct parents and, on request, replay their content.
 pub(crate) fn run_release_members(
-    repo: &RepoName,
-    entry: &knives::config::RepoEntry,
+    fork: &Fork<'_>,
     request: MembersInvocation<'_>,
 ) -> anyhow::Result<Exit> {
-    let opened = Repo::open(&entry.path)?;
+    let repo = &fork.name;
+    let entry = fork.entry;
+    let opened = Repo::open(&fork.checkout.path)?;
     let forge = CliForge;
     let cache_root = knives::forge_cache::cache_root();
     let heads = knives::consumer_pins::ConsumerHeadMemo::default();
@@ -55,14 +56,14 @@ pub(crate) fn run_release_members(
             cache_root: cache_root.as_deref(),
             heads: &heads,
         };
-        let plan = release::plan(repo, entry, &consumers, &Ledger::for_repo(repo).entries()?)?;
+        let plan = release::plan(fork, &consumers, &Ledger::for_repo(repo).entries()?)?;
         let Some(reference) = plan.release else {
             println!("{repo}: no release to inspect; cut one first");
             return Ok(Exit::Incomplete);
         };
         std::borrow::Cow::Owned(reference)
     };
-    let report = release::gather_members(&opened, entry, &reference, request.verify)?;
+    let report = release::gather_members(&opened, fork, &reference, request.verify)?;
     let exit = members_exit(&report, request.verify);
     print_members(&report, request.output)?;
     Ok(exit)
@@ -100,8 +101,7 @@ enum CarriesMode {
 
 /// Answer one revision's carriage, or census every maintained branch.
 pub(crate) fn run_release_carries(
-    repo: &RepoName,
-    entry: &knives::config::RepoEntry,
+    fork: &Fork<'_>,
     request: CarriesInvocation<'_>,
 ) -> anyhow::Result<Exit> {
     if request.all {
@@ -109,8 +109,7 @@ pub(crate) fn run_release_carries(
         let forge: Option<&dyn Forge> = (!request.no_github).then_some(&forge);
         let cache_root = knives::forge_cache::cache_root();
         let report = carriage::census(
-            repo,
-            entry,
+            fork,
             forge,
             CensusOptions {
                 cache_root: cache_root.as_deref(),
@@ -124,16 +123,17 @@ pub(crate) fn run_release_carries(
     let Some(revision) = request.revision else {
         return Ok(Exit::Usage);
     };
-    run_revision_carries(repo, entry, request, revision)
+    run_revision_carries(fork, request, revision)
 }
 
 fn run_revision_carries(
-    repo: &RepoName,
-    entry: &knives::config::RepoEntry,
+    fork: &Fork<'_>,
     request: CarriesInvocation<'_>,
     revision: &str,
 ) -> anyhow::Result<Exit> {
-    let opened = Repo::open(&entry.path)?;
+    let repo = &fork.name;
+    let entry = fork.entry;
+    let opened = Repo::open(&fork.checkout.path)?;
     let tip = match opened.resolve_commit(revision) {
         Ok(tip) => tip,
         Err(error) => {
@@ -277,7 +277,11 @@ fn carries_safe(report: &CarriesReport) -> bool {
     })
 }
 
-fn carries_problem(repo: &RepoName, revision: String, problem: String) -> CarriesReport {
+fn carries_problem(
+    repo: &knives::ids::RepoName,
+    revision: String,
+    problem: String,
+) -> CarriesReport {
     CarriesReport {
         repo: repo.to_string(),
         revision,

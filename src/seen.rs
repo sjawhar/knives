@@ -141,9 +141,9 @@ fn workspace_key(cwd: &Path) -> Option<String> {
         .ancestors()
         .find(|directory| directory.join(".jj").is_dir())?;
     let registry = load_registry(&default_config_path()).ok()?;
-    let (repo, _) = registry.containing(workspace)?;
+    let fork = crate::bind::here(&registry, workspace).ok()?.ok()?;
     let name = workspace.file_name()?.to_str()?;
-    Some(format!("{repo}/{name}"))
+    Some(format!("{}/{name}", fork.name))
 }
 
 fn read(path: &Path) -> Result<Seen, ()> {
@@ -228,10 +228,7 @@ mod tests {
         std::fs::create_dir_all(root.join(".jj")).expect("create workspace marker");
         std::fs::write(
             home.path().join("repos.toml"),
-            format!(
-                "[repos.a]\npath = \"{}\"\nupstream = \"u\"\norigin = \"o\"\n",
-                root.display()
-            ),
+            "[repos.a]\nupstream = \"u\"\norigin = \"o\"\n",
         )
         .expect("write registry");
         root

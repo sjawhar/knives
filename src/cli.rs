@@ -182,11 +182,6 @@ pub enum Command {
         #[arg(value_enum)]
         harness: HookHarness,
     },
-    /// Configure remote roles for a repo. Writes the registry.
-    Init {
-        /// Repo directory. Defaults to the current directory.
-        repo: Option<PathBuf>,
-    },
     /// Print a registry snippet for this repo. Writes nothing: registration is a trust grant, so a human pastes it.
     /// Output is TOML regardless of `--json`.
     Register {
@@ -645,7 +640,6 @@ mod tests {
     fn every_designed_command_is_reachable() {
         // Given: the command surface from the design, with minimum arguments
         let invocations: Vec<Vec<&str>> = vec![
-            vec!["knives", "init"],
             vec!["knives", "register"],
             vec!["knives", "hook", "claude-code"],
             vec!["knives", "repos"],
