@@ -1132,6 +1132,42 @@ fn the_forbidden_scan_measures_from_the_fork_point_not_the_trunk_tip() {
 }
 
 #[test]
+fn an_unresolvable_upstream_trunk_skips_every_scan_with_one_problem() {
+    // Given: three branches, a `forbidden` list, and an entry whose trunk name
+    // upstream never had, so `<trunk>@upstream` resolves to nothing.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.py", "# wired for acme-corp's IaC\n");
+    lab.branch("feat/beta", "beta.py", "# plain\n");
+    lab.branch("feat/gamma", "gamma.py", "# acme-corp\n");
+    let mut entry = origin_entry(&lab);
+    entry.base = Some("trunk-that-does-not-exist".to_owned());
+    entry.forbidden = vec!["acme-corp".to_owned()];
+
+    // When: the audit gathers.
+    let report = gather_with(&lab, &entry, None);
+
+    // Then: one problem names the trunk, and no row was scanned.
+    let scan_problems: Vec<&String> = report
+        .problems
+        .iter()
+        .filter(|problem| problem.contains("forbidden"))
+        .collect();
+    assert_eq!(scan_problems.len(), 1, "was: {:?}", report.problems);
+    assert!(
+        scan_problems[0].starts_with(
+            "upstream trunk trunk-that-does-not-exist@upstream cannot be resolved; forbidden scans skipped"
+        ),
+        "was: {}",
+        scan_problems[0]
+    );
+    // `main` is a maintained branch too now that the trunk is named otherwise.
+    for branch in ["feat/alpha", "feat/beta", "feat/gamma", "main"] {
+        let row = row(&report, branch);
+        assert!(row.forbidden.is_none(), "scanned anyway: {row:?}");
+    }
+}
+
+#[test]
 fn many_branches_are_scanned_in_parallel_with_one_row_each() {
     // Given: four branches — two naming the term, one clean, one fork-only that
     // names it — scanned across four threads.

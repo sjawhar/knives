@@ -10,6 +10,7 @@
 //! change a fork.
 
 use std::collections::BTreeMap;
+use std::fs::{File, TryLockError};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -167,17 +168,14 @@ impl LockWait {
     };
 }
 
-/// The lock file a wait gave up on, or whose holder turned out to be gone:
-/// the writer's pid when the file names one, and the file's age either way.
+/// The lock file a wait gave up on: the writer's pid when the file names one,
+/// and the file's age either way.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LockHolder {
-    /// `None` for a lock file without a pid (an older binary's, or one still
-    /// being written).
+    /// `None` for a lock file without a pid (an older binary's, or one whose
+    /// holder had not written its pid yet).
     pub pid: Option<u32>,
     pub held_for: Duration,
-    /// `Some(false)` when the platform can say the pid is not running
-    /// (`/proc/<pid>` absent on Linux); `None` where it cannot, or without a pid.
-    pub running: Option<bool>,
 }
 
 fn locked_message(path: &Path, holder: Option<&LockHolder>) -> String {
@@ -185,16 +183,6 @@ fn locked_message(path: &Path, holder: Option<&LockHolder>) -> String {
         Some(LockHolder {
             pid: Some(pid),
             held_for,
-            running: Some(false),
-        }) => format!(
-            "{} is held by pid {pid}, which is not running (lock written {}s ago); knives does not remove it",
-            path.display(),
-            held_for.as_secs()
-        ),
-        Some(LockHolder {
-            pid: Some(pid),
-            held_for,
-            ..
         }) => format!(
             "another knives command (pid {pid}, holding for {}s) is holding {}; try again in a moment",
             held_for.as_secs(),
@@ -203,7 +191,6 @@ fn locked_message(path: &Path, holder: Option<&LockHolder>) -> String {
         Some(LockHolder {
             pid: None,
             held_for,
-            ..
         }) => format!(
             "another knives command (holder unknown, lock written {}s ago) is holding {}; try again in a moment",
             held_for.as_secs(),
@@ -239,17 +226,8 @@ fn random_u64() -> u64 {
         .finish()
 }
 
-fn pid_running(pid: u32) -> Option<bool> {
-    if cfg!(target_os = "linux") {
-        Some(Path::new("/proc").join(pid.to_string()).exists())
-    } else {
-        None
-    }
-}
-
-/// The lock file's first token is the writer's pid; a file without one has an
-/// unknown holder but still an age. `None` only when the file itself cannot be
-/// read (removed between the failed create and this read).
+/// The lock file's first token is the holder's pid; a file without one has an
+/// unknown holder but still an age. `None` only when the file cannot be read.
 fn read_holder(path: &Path) -> Option<LockHolder> {
     let text = std::fs::read_to_string(path).ok()?;
     let pid: Option<u32> = text
@@ -262,11 +240,7 @@ fn read_holder(path: &Path) -> Option<LockHolder> {
         .ok()?
         .elapsed()
         .unwrap_or_default();
-    Some(LockHolder {
-        pid,
-        held_for,
-        running: pid.and_then(pid_running),
-    })
+    Some(LockHolder { pid, held_for })
 }
 
 /// Held for the duration of a read-modify-write.
@@ -277,21 +251,32 @@ fn read_holder(path: &Path) -> Option<LockHolder> {
 /// collisions between agents visible before they cost work, the coordination
 /// record cannot itself lose writes.
 ///
-/// An exclusive-create lockfile rather than a dependency: `create_new` is atomic
-/// on every platform this runs on. The file holds the writer's pid, so a waiter
-/// that gives up can name who it waited on, and a lock left behind by a dead
-/// process is refused at once instead of waited on for the whole budget. It is
-/// not removed automatically: a reused pid would make that delete a live
-/// holder's lock.
+/// The lock is the operating system's advisory lock on `state.lock`
+/// ([`File::try_lock`]), held by the open file handle: the kernel releases it
+/// when the holder exits, however it exits — a SIGKILL from a harness that
+/// timed a command out, a Ctrl-C, a panic — so a stale lock cannot outlive a
+/// crashed writer and nobody has to remove a file. The file itself is never
+/// unlinked: it is the shared inode every waiter locks, and deleting it by
+/// path after an unlock would put two waiters on two different inodes, each
+/// holding "the" lock. After acquiring, the holder writes its pid into the
+/// file so a waiter that gives up can name who it waited on; the file's
+/// mtime gives the age. A knives built before this lock (exclusive-create of
+/// the same path) reads the persistent file as always locked while both
+/// binaries run on one machine.
 #[derive(Debug)]
 pub(crate) struct StoreLock {
-    path: PathBuf,
+    /// Dropping the handle releases the lock.
+    #[expect(
+        dead_code,
+        reason = "an RAII guard is used by existing, not by being read"
+    )]
+    file: File,
 }
 
 impl StoreLock {
     /// Beside the file it guards, named for that file's stem: `state.json` is
     /// guarded by `state.lock`. Waits per `wait`, then gives up loudly:
-    /// blocking forever on a stale lock would be worse than saying so.
+    /// blocking forever would hide a holder that has hung.
     pub(crate) fn acquire(target: &Path, wait: LockWait) -> Result<Self, StoreError> {
         let path = target.with_extension("lock");
         if let Some(parent) = path.parent() {
@@ -300,43 +285,44 @@ impl StoreLock {
                 source,
             })?;
         }
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|source| StoreError::Write {
+                path: path.clone(),
+                source,
+            })?;
         let started = std::time::Instant::now();
         let mut attempt = 0u32;
         loop {
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-            {
-                Ok(mut file) => {
-                    if let Err(source) = writeln!(file, "{}", std::process::id()) {
-                        let _ = std::fs::remove_file(&path);
-                        return Err(StoreError::Write { path, source });
-                    }
-                    return Ok(Self { path });
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let holder = read_holder(&path);
+            match file.try_lock() {
+                Ok(()) => break,
+                Err(TryLockError::WouldBlock) => {
                     let elapsed = started.elapsed();
-                    let holder_gone = holder
-                        .as_ref()
-                        .is_some_and(|holder| holder.running == Some(false));
-                    if holder_gone || elapsed >= wait.deadline {
-                        return Err(StoreError::Locked { path, holder });
+                    if elapsed >= wait.deadline {
+                        return Err(StoreError::Locked {
+                            holder: read_holder(&path),
+                            path,
+                        });
                     }
                     let remaining = wait.deadline.saturating_sub(elapsed);
                     std::thread::sleep(pause(attempt, wait, random_u64()).min(remaining));
                     attempt += 1;
                 }
-                Err(source) => return Err(StoreError::Write { path, source }),
+                Err(TryLockError::Error(source)) => {
+                    return Err(StoreError::Write { path, source });
+                }
             }
         }
-    }
-}
-
-impl Drop for StoreLock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        // Ours now: name ourselves for whoever waits on us. A write failure is
+        // not a lock failure, only a nameless holder in the give-up message.
+        if file.set_len(0).is_ok() {
+            let _ = writeln!(file, "{}", std::process::id());
+        }
+        Ok(Self { file })
     }
 }
 
@@ -919,11 +905,21 @@ mod lock_tests {
     }
 
     #[test]
-    fn a_lock_file_without_a_pid_reports_an_unknown_holder_and_the_locks_age() {
+    fn a_holder_that_wrote_no_pid_reports_an_unknown_holder_and_the_locks_age() {
+        // Given: something holds the OS lock on the file without naming itself.
         let dir = tempfile::tempdir().expect("state dir");
         let path = dir.path().join("state.json");
-        std::fs::write(path.with_extension("lock"), b"").expect("stale lock");
+        let nameless = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path.with_extension("lock"))
+            .expect("open lock file");
+        nameless.try_lock().expect("hold the lock");
+
         let error = Store::open_for_update_with(path, QUICK).expect_err("locked");
+
         let StoreError::Locked {
             holder: Some(holder),
             ..
@@ -931,7 +927,7 @@ mod lock_tests {
         else {
             panic!("expected a Locked error with an aged holder, got {error:?}");
         };
-        assert_eq!((holder.pid, holder.running), (None, None));
+        assert_eq!(holder.pid, None);
         assert!(holder.held_for < Duration::from_secs(5), "{holder:?}");
         let text = error.to_string();
         assert!(
@@ -966,34 +962,70 @@ mod lock_tests {
         holder.join().expect("holder thread");
     }
 
-    #[cfg(target_os = "linux")]
+    /// The lock file the child-process helper below takes, when run as a child.
+    const HELPER_LOCK_TARGET: &str = "KNIVES_TEST_LOCK_TARGET";
+
+    /// Not a test: the body of the child process in
+    /// [`a_lock_held_by_a_killed_process_is_free_at_once`]. Takes the lock on
+    /// the target the environment names, says so on stdout, and sleeps until
+    /// killed.
     #[test]
-    fn a_lock_whose_holder_is_not_running_is_refused_without_waiting() {
+    #[ignore = "a helper run as a child process by the killed-holder test"]
+    fn helper_holds_the_lock_until_killed() {
+        let Some(target) = std::env::var_os(HELPER_LOCK_TARGET) else {
+            return;
+        };
+        let _lock = StoreLock::acquire(Path::new(&target), QUICK).expect("child takes the lock");
+        println!("HOLDING");
+        std::io::stdout().flush().expect("flush");
+        std::thread::sleep(Duration::from_secs(30));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_lock_held_by_a_killed_process_is_free_at_once() {
+        // Given: another process holds the lock and is killed with SIGKILL, so
+        // nothing of its own runs at exit.
+        use std::io::BufRead as _;
         let dir = tempfile::tempdir().expect("state dir");
         let path = dir.path().join("state.json");
-        let dead = (2_000_000u32..4_194_304)
-            .rev()
-            .find(|pid| !std::path::Path::new(&format!("/proc/{pid}")).exists())
-            .expect("an unused pid");
-        std::fs::write(path.with_extension("lock"), format!("{dead}\n")).expect("stale lock");
+        let mut child = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "--ignored",
+                "--nocapture",
+                "store::lock_tests::helper_holds_the_lock_until_killed",
+            ])
+            .env(HELPER_LOCK_TARGET, &path)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn the holder");
+        let stdout = child.stdout.take().expect("piped stdout");
+        let mut lines = std::io::BufReader::new(stdout).lines();
+        let held = lines
+            .by_ref()
+            .map_while(Result::ok)
+            .any(|line| line.trim() == "HOLDING");
+        assert!(held, "the child never reported holding the lock");
+        let blocked = Store::open_for_update_with(path.clone(), QUICK);
+        assert!(
+            matches!(blocked, Err(StoreError::Locked { .. })),
+            "the child's lock was not seen: {blocked:?}"
+        );
+
+        // When: the holder is killed.
+        child.kill().expect("SIGKILL the holder");
+        let _ = child.wait();
+
+        // Then: the lock is free at once; no file to remove, no age to judge.
         let started = std::time::Instant::now();
-        let error = Store::open_for_update_with(path, QUICK).expect_err("refused");
+        let _mine = Store::open_for_update_with(path, QUICK).expect("acquired after the kill");
         assert!(
             started.elapsed() < QUICK.deadline / 2,
             "waited {:?}",
             started.elapsed()
         );
-        let StoreError::Locked {
-            holder: Some(holder),
-            ..
-        } = &error
-        else {
-            panic!("{error:?}")
-        };
-        assert_eq!((holder.pid, holder.running), (Some(dead), Some(false)));
-        let text = error.to_string();
-        assert!(text.contains("which is not running"), "{text}");
-        assert!(text.ends_with("knives does not remove it"), "{text}");
     }
 
     #[test]

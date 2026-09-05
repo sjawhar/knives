@@ -345,10 +345,13 @@ reports none), `checks` (`total`, `pending`, a `conclusions` histogram), `unreso
 and `template` (the upstream trunk's pull-request template `file`, its `headings`, and the ones
 `missing_from_body`) — and `forbidden`, every line the branch adds over its fork point with the
 upstream trunk that contains a term the entry's `forbidden` key names, each as `{file, line, term,
-text}`. `pull` is absent when no open pull request answered (always under `--no-github`);
-`forbidden` is absent when the entry configures no terms, the branch is fork-only, or the diff
-could not be read (a `problems` line names the branch). Every field is an observation and `null`
-means unobserved; the facts never move the exit code.
+text}`; a branch sharing no history with the trunk is measured from the root, so its whole tree
+counts as added. `pull` is absent when no open pull request answered (always under `--no-github`);
+`forbidden` is absent when the entry configures no terms, the branch is fork-only, the diff could
+not be read (a `problems` line names the branch), or `<trunk>@upstream` cannot be resolved (one
+`problems` line, every scan skipped). Every field is an observation and `null` means unobserved;
+the facts never move the exit code. The scans run on at most eight threads however wide the
+machine: several owners audit one checkout in the same minute.
 
 `knives notch` has two moods, split by `-m`: bare it reads, `-m` writes.
 Reading is intentional and nothing injects notches into a session, so the bare form returns the
@@ -392,7 +395,7 @@ Workspaces are effectively free: 0.15 to 0.55s to create, because tracked conten
 
 `knives start` bases new work on the release's **shared base** when a release exists, falling back to the fetched trunk when none does, never on the current `@`. The shared base is the trunk point every member forks from, so a branch started there composes into the release without dragging newer upstream into the cut. Moving the composition to a newer trunk is `knives release rebase`: an intentional, separate decision, never a side effect of starting a branch. Never `@`, because an agent in a release workspace who runs `jj new` would inherit the release merge as a parent.
 
-Every claim writer (`start`, `finish`, `track`, `depends`, …) takes one lock on the claim store and waits up to 60 s for it, with pauses that double from 20 ms to a 2 s ceiling under uniform jitter, so a wave of concurrently dispatched `start`s serialises; the lock file holds the holder's pid. A wait that gives up names the holder's pid and how long it has held the lock (`another knives command (pid 4242, holding for 73s) is holding <path>; try again in a moment`), or, for a lock file without a pid, that the holder is unknown and how old the file is (`another knives command (holder unknown, lock written 73s ago) is holding <path>; try again in a moment`). A lock whose pid is not running is refused at once rather than waited on, stating the pid, the lock's age, and that knives leaves the file in place: `<path> is held by pid 4242, which is not running (lock written 73s ago); knives does not remove it`. The sidecar locks — sightings, the hook's session state — wait one second (20 ms doubling to a 200 ms ceiling): a stale one must never stall a hook event.
+Every claim writer (`start`, `finish`, `track`, `depends`, …) takes one lock on the claim store and waits up to 60 s for it, with pauses that double from 20 ms to a 2 s ceiling under uniform jitter, so a wave of concurrently dispatched `start`s serialises. The lock is the operating system's advisory lock on `state.lock` (`File::try_lock`, `flock` on Linux), held by the open handle and released by the kernel when the holder exits however it exits — SIGKILL, Ctrl-C, panic — so a stale lock cannot outlive a crashed writer and no dead-holder detection exists. The file is never unlinked: it is the inode every waiter locks, and a path delete after an unlock would put two waiters on two inodes, each holding "the" lock. The holder writes its pid into the file after acquiring, so a wait that gives up names the holder's pid and how long it has held (`another knives command (pid 4242, holding for 73s) is holding <path>; try again in a moment`), or, for a lock file without a pid, that the holder is unknown and how old the file is (`another knives command (holder unknown, lock written 73s ago) is holding <path>; try again in a moment`). A knives built before this lock (exclusive-create of the same path) reads the persistent file as always locked while both binaries run on one machine. The sidecar locks — sightings, the hook's session state — wait one second (20 ms doubling to a 200 ms ceiling): a stale one must never stall a hook event.
 
 `knives start` also states the fork's `immutable_heads()` (detector 11 has the rule and why) in the repository's own jj config when that config states none, refreshes the one it wrote earlier when the entry's rule has changed, and says so on stdout — naming a user-level rule the write now shadows, when there is one. knives' own library-side rewrites (`describe`, `abandon`, reap) keep jj's default pin set on purpose: a rebase may move a member out from under a stale ref; knives never rewrites what a remote still names.
 

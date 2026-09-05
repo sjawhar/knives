@@ -78,9 +78,14 @@ impl SessionState {
         self.seen_notices.clear();
     }
 
+    /// Remove the session's record and the lock file beside it. Unlike the
+    /// claim store's lock, this lock is the session's alone and the session is
+    /// over: nothing waits on it, so deleting the inode strands no waiter.
     pub fn delete(home: &Path, harness: &str, session_id: &str) {
         let directory = session_directory(home);
-        let _ = std::fs::remove_file(state_path(&directory, harness, session_id));
+        let path = state_path(&directory, harness, session_id);
+        let _ = std::fs::remove_file(path.with_extension("lock"));
+        let _ = std::fs::remove_file(path);
     }
 
     fn load_path(path: &Path) -> Self {

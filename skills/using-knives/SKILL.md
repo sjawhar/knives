@@ -110,7 +110,9 @@ comment or a fenced code block are not headings. `forbidden` is every line the b
 its fork point with the upstream trunk (`jj diff --git --context 0 --from
 "fork_point(<trunk>@upstream | <branch>)" --to <branch>`, added lines only) that contains one of
 the registry entry's `forbidden` terms as a case-insensitive substring, each hit as `{file, line,
-term, text}`.
+term, text}`. A branch sharing no history with the trunk is measured from the root, so its whole
+tree counts as added. When `<trunk>@upstream` itself cannot be resolved (never fetched), one
+`problems` line says so and no row carries `forbidden`.
 
 Every field is an observation and `null` means unobserved. The rows never move the exit code;
 findings and problems do — a branch whose diff or template could not be read is a `problems` line
@@ -118,7 +120,7 @@ and therefore exit 3. `--no-github` leaves `pull` absent on every row and report
 pull-head reconciliation was skipped (--no-github)` as a problem. The text report prints the rows as a `branches:` block, one line
 per branch: `<branch>  tip <short>  origin same|differs|absent  [fork-only]  pr #N STATE
 mergeable=… state=… review=… head=matches|differs | no-pr  checks <total> (<CONCLUSION count>, …;
-<pending> pending) | checks -  threads <n> unresolved | threads -  template ok | template
+<pending> pending) | checks -  threads <n> unresolved | threads -  template none missing | template
 missing: A, B | template -  forbidden none | forbidden <N> hits: file:line term, … | forbidden -`.
 
 ### `knives pr NUMBER [--repo REPO] [--timeline]`
@@ -264,7 +266,7 @@ The facts you need before contributing upstream: convention files present and wh
 
 `start` claims the branch and opens a jj workspace for it. A branch that already exists — locally, or on one of our remotes (`origin`, the publish remote) after the fetch — is continued from its tip; a name that exists only on `upstream` is somebody else's branch, and a fork branch of that name is new here: the workspace's `@` is an empty child of the branch tip, so your next commit is the branch's next commit (`jj bookmark set <branch> -r @` when you want the bookmark to follow, or `jj squash` into it). A divergent bookmark has no one tip to continue from; `start` refuses and names the tips so you can `jj bookmark set` one first. A new branch starts on the release's shared base (or the fetched upstream trunk when no release exists) rather than wherever `@` happens to be. The shared base is where every member forks from, so a branch started there composes into the release without dragging newer upstream into the cut; moving the whole release to a newer trunk is `knives release rebase`, an intentional decision of its own, never a side effect of starting a branch. An agent sitting in a release workspace who runs `jj new` silently inherits the release merge as a parent, which is why `@` is never used.
 
-Every command that writes a claim — `start`, `finish`, `track`, `depends` — takes one lock on the claim store, and waits for it: up to a minute, with pauses that double from 20 ms to a 2 s ceiling under jitter, so a wave of concurrently dispatched `start`s serialises instead of failing. A `start` that pauses is waiting for another agent's command; let it. A wait that gives up names the holder — `another knives command (pid 4242, holding for 73s) is holding <path>; try again in a moment`, or `another knives command (holder unknown, lock written 73s ago) is holding <path>; try again in a moment` for a lock file without a pid — and exits `3`. A lock whose holder is not running is refused at once instead of waited on: `<path> is held by pid 4242, which is not running (lock written 73s ago); knives does not remove it`. knives never removes that file itself, since a reused pid could belong to a live holder.
+Every command that writes a claim — `start`, `finish`, `track`, `depends` — takes one lock on the claim store, and waits for it: up to a minute, with pauses that double from 20 ms to a 2 s ceiling under jitter, so a wave of concurrently dispatched `start`s serialises instead of failing. A `start` that pauses is waiting for another agent's command; let it. The lock is the operating system's advisory lock on `state.lock`, released when its holder exits however it exits — a timeout's SIGKILL, a Ctrl-C, a panic — so a stale lock cannot outlive a crashed writer and there is never a file to remove. A wait that gives up names the holder — `another knives command (pid 4242, holding for 73s) is holding <path>; try again in a moment`, or `another knives command (holder unknown, lock written 73s ago) is holding <path>; try again in a moment` for a lock file without a pid — and exits `3`; a lock still held after the wait belongs to a process that is still running.
 
 `start` also states the fork's `immutable_heads()` — trunk and tags, with the trunk named on every knives remote — in the repository's own jj config when that config states none, and prints `jj immutable_heads() written to <repo>'s repository config: <rule>` when it does, adding `(shadows the user-level rule <rule> here)` when jj's user layer stated one. jj's default rule adds `untracked_remote_bookmarks()`, which in a fork are superseded release cuts a fetch re-materialized and other forks' pull request heads. The write is jj's table form with a `doc` naming knives, so a later `start` refreshes knives' own rule when the entry changes (`refreshed in` instead of `written to`) and leaves a rule a human stated alone; `status` reports either when it differs.
 

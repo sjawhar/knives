@@ -343,7 +343,7 @@ pub fn gather(input: &AuditInput<'_>) -> Report {
         tracked: &tracked,
         template: template.as_ref(),
     };
-    add_branch_facts(&mut report, input, &facts);
+    add_branch_facts(&mut report, input, &opened, &facts);
     add_open_pull_head_checks(&mut report, input, &facts);
     report
 }
@@ -366,8 +366,15 @@ struct LocalFacts<'a> {
 
 /// One row per maintained branch with its local facts and, when configured
 /// and not exempt, the forbidden-identifier scan of the lines it adds over its
-/// fork point with upstream's trunk.
-fn add_branch_facts(report: &mut Report, input: &AuditInput<'_>, facts: &LocalFacts<'_>) {
+/// fork point with upstream's trunk. A trunk the checkout cannot resolve (never
+/// fetched) is one problem line, not one per branch, and leaves every row's
+/// `forbidden` absent.
+fn add_branch_facts(
+    report: &mut Report,
+    input: &AuditInput<'_>,
+    opened: &Repo,
+    facts: &LocalFacts<'_>,
+) {
     let fork = input.fork;
     let entry = fork.entry;
     let mut rows: Vec<BranchFacts> = facts
@@ -389,28 +396,44 @@ fn add_branch_facts(report: &mut Report, input: &AuditInput<'_>, facts: &LocalFa
         })
         .collect();
     if !entry.forbidden.is_empty() {
-        let scanned: Vec<&str> = rows
-            .iter()
-            .filter(|row| !row.fork_only)
-            .map(|row| row.branch.as_str())
-            .collect();
-        let mut results = forbidden_scans(&fork.checkout.path, entry, &scanned, input.workers);
-        for row in &mut rows {
-            match results.remove(row.branch.as_str()) {
-                Some(Ok(hits)) => row.forbidden = Some(hits),
-                Some(Err(problem)) => report.problems.push(problem),
-                None => {}
+        let upstream_trunk = entry.upstream_trunk();
+        match opened.resolve_commit(&upstream_trunk) {
+            Ok(_) => {
+                let scanned: Vec<&str> = rows
+                    .iter()
+                    .filter(|row| !row.fork_only)
+                    .map(|row| row.branch.as_str())
+                    .collect();
+                let mut results =
+                    forbidden_scans(&fork.checkout.path, entry, &scanned, input.workers);
+                for row in &mut rows {
+                    match results.remove(row.branch.as_str()) {
+                        Some(Ok(hits)) => row.forbidden = Some(hits),
+                        Some(Err(problem)) => report.problems.push(problem),
+                        None => {}
+                    }
+                }
             }
+            Err(error) => report.problems.push(format!(
+                "upstream trunk {upstream_trunk} cannot be resolved; forbidden scans skipped: {error}"
+            )),
         }
     }
     report.branches.extend(rows);
 }
 
+/// The most `jj diff` subprocesses one audit runs at once. The scan is bound by
+/// the subprocess and the disk, not the CPU, and several owners audit the same
+/// checkout in the same minute: a machine's full width per audit would put
+/// hundreds of `jj` processes on one repository.
+const MAX_SCAN_WORKERS: usize = 8;
+
 /// The forbidden-identifier scan of every named branch's diff from its fork
 /// point with upstream's trunk — so upstream's own newer lines are never the
-/// branch's additions — one `jj diff` subprocess per branch across `workers`
-/// threads: fifty branches at two hundred milliseconds each is ten seconds
-/// serial. An unreadable diff is a problem line naming the branch.
+/// branch's additions — one `jj diff` subprocess per branch across at most
+/// `workers` threads (capped by [`MAX_SCAN_WORKERS`]): fifty branches at two
+/// hundred milliseconds each is ten seconds serial. An unreadable diff is a
+/// problem line naming the branch.
 fn forbidden_scans(
     path: &Path,
     entry: &RepoEntry,
@@ -422,7 +445,7 @@ fn forbidden_scans(
     }
     let upstream_trunk = entry.upstream_trunk();
     let upstream_trunk = upstream_trunk.as_str();
-    let workers = workers.clamp(1, branches.len());
+    let workers = workers.min(MAX_SCAN_WORKERS).clamp(1, branches.len());
     let chunk = branches.len().div_ceil(workers);
     std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(workers);
@@ -1048,7 +1071,7 @@ fn render_branch(row: &BranchFacts) -> String {
             }
             match &pull.template {
                 Some(template) if template.missing_from_body.is_empty() => {
-                    line.push_str("  template ok");
+                    line.push_str("  template none missing");
                 }
                 Some(template) => {
                     let _ = write!(
@@ -1841,6 +1864,17 @@ mod tests {
         assert_eq!(
             render_branch(&full),
             "feat/b  tip aaaaaaaaaaaa  origin differs  pr #7 OPEN mergeable=MERGEABLE state=- review=- head=matches  checks 3 (SUCCESS 2; 1 pending)  threads 2 unresolved  template missing: Approach  forbidden 1 hits: infra/app.py:9 acme-corp"
+        );
+        // And: a body carrying every heading renders as a fact, not a verdict.
+        if let Some(pull) = full.pull.as_mut()
+            && let Some(template) = pull.template.as_mut()
+        {
+            template.missing_from_body.clear();
+        }
+        assert!(
+            render_branch(&full).contains("  template none missing  forbidden 1 hits"),
+            "was: {}",
+            render_branch(&full)
         );
     }
 
