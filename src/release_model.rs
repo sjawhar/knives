@@ -84,10 +84,9 @@ pub fn repo_slug(entry: &RepoEntry) -> Option<String> {
 pub fn previous_release_for_cut(
     entry: &RepoEntry,
     tips: &BookmarkTips,
-) -> Option<(String, CommitId)> {
+) -> Option<(BookmarkRef, CommitId)> {
     let scheme = entry.release_scheme();
     newest_release(tips, &scheme, entry.publish_remote())
-        .map(|(reference, commit)| (reference.to_string(), commit))
 }
 
 /// Every locally held, non-release, non-trunk branch and its current tip.

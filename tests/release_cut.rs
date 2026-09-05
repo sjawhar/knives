@@ -540,6 +540,132 @@ fn cutting_a_release_reaps_the_superseded_one() {
 }
 
 #[test]
+fn a_cut_identical_to_the_published_previous_cut_is_refused() {
+    // Given: a cut that origin already holds at exactly this tree.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let (home, _consumer) = release_test_home(&lab);
+    let first = knives_release(&lab, &home, &["cut", "release/2026-08-04"]);
+    assert!(first.status.success(), "{first:?}");
+    lab.jj_work([
+        "git",
+        "push",
+        "--remote",
+        "origin",
+        "--bookmark",
+        "release/2026-08-04",
+    ]);
+    lab.fetch_work();
+
+    // When: nothing joined, advanced or moved, and a new name is asked for.
+    let second = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
+
+    // Then: the name is refused, the reason names the published cut, nothing is created.
+    let stdout = String::from_utf8_lossy(&second.stdout);
+    assert!(
+        stdout.contains("identical to release/2026-08-04@origin"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("nothing to cut"), "{stdout}");
+    assert_eq!(
+        second.status.code(),
+        Some(i32::from(knives::cli::Exit::Incomplete.code())),
+        "{stdout}"
+    );
+    let tips = Repo::open(&lab.work)
+        .expect("reopen")
+        .bookmark_tips()
+        .expect("tips");
+    assert!(
+        !tips
+            .keys()
+            .any(|reference| reference.branch().as_str() == "release/2026-08-05")
+    );
+}
+
+#[test]
+fn a_cut_whose_composition_changed_since_publishing_is_named() {
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let (home, _consumer) = release_test_home(&lab);
+    assert!(
+        knives_release(&lab, &home, &["cut", "release/2026-08-04"])
+            .status
+            .success()
+    );
+    lab.jj_work([
+        "git",
+        "push",
+        "--remote",
+        "origin",
+        "--bookmark",
+        "release/2026-08-04",
+    ]);
+    lab.fetch_work();
+    lab.branch("feat/gamma", "gamma.txt", "gamma\n");
+    let include = knives_release(&lab, &home, &["include", "feat/gamma", "--why", "test"]);
+    assert!(include.status.success(), "{include:?}");
+
+    let second = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
+
+    // Then: the new name lands. The include moved local release/2026-08-04 past
+    // its published copy, so the plan reports the two positions' trees differing
+    // and the exit is Findings, not Ok; this test asserts only that the new name
+    // landed and the identical-cut refusal did not fire.
+    let stdout = String::from_utf8_lossy(&second.stdout);
+    assert!(
+        stdout.contains("cut release/2026-08-05 as"),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert!(!stdout.contains("nothing to cut"), "{stdout}");
+    assert_ne!(
+        second.status.code(),
+        Some(i32::from(knives::cli::Exit::Incomplete.code())),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn a_cut_identical_to_a_published_cut_known_only_remotely_is_refused() {
+    // The newest release can be known only as `release/X@origin` (the local
+    // bookmark forgotten after a push — tests/release_edit.rs does this);
+    // previous_release_for_cut then names the remote ref and the comparison
+    // must still find the published copy.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let (home, _consumer) = release_test_home(&lab);
+    assert!(
+        knives_release(&lab, &home, &["cut", "release/2026-08-04"])
+            .status
+            .success()
+    );
+    lab.jj_work([
+        "git",
+        "push",
+        "--remote",
+        "origin",
+        "--bookmark",
+        "release/2026-08-04",
+    ]);
+    lab.jj_work(["bookmark", "forget", "release/2026-08-04"]);
+    lab.fetch_work();
+
+    let second = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
+
+    let stdout = String::from_utf8_lossy(&second.stdout);
+    assert!(
+        stdout.contains("identical to release/2026-08-04@origin ("),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("@origin@origin"), "{stdout}");
+    assert_eq!(second.status.code(), Some(3), "{stdout}");
+}
+
+#[test]
 fn a_named_cut_with_an_inconclusive_content_audit_returns_findings() {
     // Given: two members entangled in one file, so the cut is conflicted from birth
     // and every member's replay onto it answers nothing either way.

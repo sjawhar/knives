@@ -10,7 +10,7 @@ use knives::bind::Fork;
 use knives::cli::Exit;
 use knives::commands::release;
 use knives::forge::github::CliForge;
-use knives::ids::{ReleaseScheme, RepoName};
+use knives::ids::{BookmarkRef, ReleaseScheme, RemoteName, RepoName};
 use knives::ledger::{Draft, Kind, Ledger};
 use knives::release_model::{
     RecordedCut, StackedHistoryContext, carried_branches, last_recorded_cut, members_event_text,
@@ -121,6 +121,28 @@ pub(crate) fn run_release(
         };
         let request = release::Cut::from_carried(name.clone(), &carried);
         let mut candidate = release::candidate_cut(path, &request, previous_commit.as_ref())?;
+        // A cut names a composition consumers can pin. When the publish remote
+        // already holds the previous cut at exactly this tree, a new name ships
+        // nothing and only burns a dated name and a re-pin nobody asked for.
+        // The comparison is against the published copy: the candidate is a
+        // duplicate of the in-hand previous release, so their trees always match.
+        if let Some((previous_ref, _)) = &previous {
+            let publish_remote = entry.publish_remote();
+            let published = tips.get(&BookmarkRef::Remote {
+                branch: previous_ref.branch().clone(),
+                remote: RemoteName::new(publish_remote),
+            });
+            if let Some(published) = published
+                && candidate.tree_matches(published.as_str())?
+            {
+                println!(
+                    "{repo}: refusing to cut {name}: identical to {}@{publish_remote} ({}); nothing to cut — a branch enters through `knives release include`, members move with `advance`, the base with `rebase`",
+                    previous_ref.branch(),
+                    published.short()
+                );
+                return Ok(Exit::Incomplete);
+            }
+        }
         // An audit error or failure simply DROPS the candidate: the merge
         // was never a published operation, so there is nothing to abandon
         // and no crash window that strands one.
@@ -544,7 +566,7 @@ fn check_orphan_commits_before_cut(
         return Ok(None);
     }
     Ok(Some(OrphanedLineage {
-        previous: previous.0,
+        previous: previous.0.to_string(),
         commits: orphans,
     }))
 }

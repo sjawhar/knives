@@ -1672,6 +1672,12 @@ impl Candidate {
         commit_id(self.commit.id())
     }
 
+    /// Whether the candidate's tree is exactly `other`'s tree.
+    pub fn tree_matches(&self, other: &str) -> Result<bool, JjError> {
+        let other = self.repo.commit(other)?;
+        Ok(other.tree_ids() == self.commit.tree_ids())
+    }
+
     pub fn parent_count(&self) -> usize {
         self.commit.parent_ids().len()
     }
