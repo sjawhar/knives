@@ -15,7 +15,8 @@
 //!   half of state that [`store`] deletes when intent changes.
 //! - [`forge`] is the only module that talks to a hosting service.
 //! - [`config`] and [`store`] own the two things that cannot be recomputed:
-//!   which repos are managed, and who is working on what and why.
+//!   which repos are managed, and who is working on what and why; [`lock`] is
+//!   the advisory file lock every writer of such a file holds.
 //! - [`hook`] owns harness-facing session state and behavior.
 //! - [`bind`] decides which registry entry a directory is, from its remotes.
 
@@ -33,6 +34,7 @@ pub mod hook;
 pub mod ids;
 pub mod jj;
 pub mod ledger;
+pub mod lock;
 pub mod pins;
 pub mod release_model;
 pub mod remote_url;

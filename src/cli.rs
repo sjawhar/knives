@@ -518,21 +518,24 @@ pub enum ReleaseAction {
     Members {
         /// The release ref to inspect. Defaults to the release in hand. With
         /// `--carries`, the one target to check instead of every target.
-        #[arg(conflicts_with = "census")]
         reference: Option<String>,
         /// Replay each member's content against the release (heavier: one
         /// replay per member) and report drop-guard anchors.
-        #[arg(long, conflicts_with_all = ["carries", "census"])]
+        #[arg(long, conflicts_with = "carries")]
         verify: bool,
         /// A branch name, or any revision when no bookmark fits.
-        #[arg(long, value_name = "REV", conflicts_with = "census")]
+        #[arg(long, value_name = "REV")]
         carries: Option<String>,
         /// Every maintained branch against the live releases and upstream trunk;
         /// superseded releases only after a complete, everywhere-not-carried
         /// primary matrix. Answers "what would deleting this lose".
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["reference", "verify", "carries"])]
         census: bool,
         /// Skip pull request lookups during a census; the orphan test then reports unknown.
+        // `requires` alone does not keep this beside `--census`: clap waives a
+        // required argument when a present one conflicts with it, so
+        // `--carries x --no-github` would parse. The conflicts state the rule
+        // in the direction clap enforces.
         #[arg(long, requires = "census", conflicts_with_all = ["reference", "verify", "carries"])]
         no_github: bool,
     },

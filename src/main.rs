@@ -38,7 +38,7 @@ use knives::ids::{BranchName, RepoName};
 use knives::ledger::{Ledger, Scribe};
 use knives::store::{Store, default_state_path};
 use release_carries::{
-    CarriesInvocation, CarriesRequest, MembersInvocation, run_release_carries, run_release_members,
+    MembersInvocation, run_release_census, run_release_members, run_revision_carries,
 };
 use release_cut::{ReleaseInvocation, run_reap, run_release};
 use release_edit::{ReleaseEdit, run_release_edit};
@@ -571,23 +571,10 @@ fn dispatch_release(
             // The parser keeps `--census` apart from REF, `--carries` and
             // `--verify`, so a census request never has a target to lose here.
             match (census, carries.as_deref()) {
-                (true, _) => run_release_carries(
-                    fork,
-                    CarriesInvocation {
-                        request: CarriesRequest::Census { no_github },
-                        output,
-                    },
-                ),
-                (false, Some(revision)) => run_release_carries(
-                    fork,
-                    CarriesInvocation {
-                        request: CarriesRequest::Revision {
-                            revision,
-                            target: reference.as_deref(),
-                        },
-                        output,
-                    },
-                ),
+                (true, _) => run_release_census(fork, no_github, output),
+                (false, Some(revision)) => {
+                    run_revision_carries(fork, revision, reference.as_deref(), output)
+                }
                 (false, None) => run_release_members(
                     fork,
                     MembersInvocation {

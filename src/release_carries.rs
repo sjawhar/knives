@@ -2,9 +2,11 @@
 //!
 //! Content questions about a release, each a gather, an exit code and a
 //! renderer over a read-only repository. Bare `members` asks which parents the
-//! release has and who still holds each; `--carries REV` asks the other
-//! direction, whether a revision's net content is actually carried by a
-//! release or the trunk; `--census` asks that of every maintained branch.
+//! release has and who still holds each ([`run_release_members`]); `--carries
+//! REV` asks the other direction, whether a revision's net content is actually
+//! carried by a release or the trunk ([`run_revision_carries`]); `--census`
+//! asks that of every maintained branch ([`run_release_census`]). The parser
+//! keeps the three apart, so `main` calls each directly.
 
 use knives::bind::Fork;
 use knives::carriage::{
@@ -18,27 +20,6 @@ use knives::jj::Repo;
 use knives::ledger::Ledger;
 
 use super::parallelism;
-
-/// Which carriage question `members --carries` / `members --census` asked.
-///
-/// The parser guarantees exactly one shape: a revision (with or without one
-/// explicit target), or the census. No variant needs a usage error.
-#[derive(Clone, Copy)]
-pub(crate) enum CarriesRequest<'a> {
-    /// One revision against every target, or against `target` alone.
-    Revision {
-        revision: &'a str,
-        target: Option<&'a str>,
-    },
-    /// Every maintained branch against the live releases and upstream trunk.
-    Census { no_github: bool },
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct CarriesInvocation<'a> {
-    pub(crate) request: CarriesRequest<'a>,
-    pub(crate) output: Output,
-}
 
 #[derive(Clone, Copy)]
 pub(crate) struct MembersInvocation<'a> {
@@ -111,35 +92,31 @@ enum CarriesMode {
     ExplicitTarget,
 }
 
-/// Answer one revision's carriage, or census every maintained branch.
-pub(crate) fn run_release_carries(
+/// Census every maintained branch against the live releases and upstream trunk.
+pub(crate) fn run_release_census(
     fork: &Fork<'_>,
-    invocation: CarriesInvocation<'_>,
+    no_github: bool,
+    output: Output,
 ) -> anyhow::Result<Exit> {
-    match invocation.request {
-        CarriesRequest::Census { no_github } => {
-            let forge = CliForge;
-            let forge: Option<&dyn Forge> = (!no_github).then_some(&forge);
-            let cache_root = knives::forge_cache::cache_root();
-            let report = carriage::census(
-                fork,
-                forge,
-                CensusOptions {
-                    cache_root: cache_root.as_deref(),
-                    workers: parallelism(),
-                },
-            )?;
-            let exit = census_exit(&report);
-            print_census(&report, invocation.output)?;
-            Ok(exit)
-        }
-        CarriesRequest::Revision { revision, target } => {
-            run_revision_carries(fork, revision, target, invocation.output)
-        }
-    }
+    let forge = CliForge;
+    let forge: Option<&dyn Forge> = (!no_github).then_some(&forge);
+    let cache_root = knives::forge_cache::cache_root();
+    let report = carriage::census(
+        fork,
+        forge,
+        CensusOptions {
+            cache_root: cache_root.as_deref(),
+            workers: parallelism(),
+        },
+    )?;
+    let exit = census_exit(&report);
+    print_census(&report, output)?;
+    Ok(exit)
 }
 
-fn run_revision_carries(
+/// Answer one revision's carriage: against `target` alone when given,
+/// otherwise against every live release and the upstream trunk.
+pub(crate) fn run_revision_carries(
     fork: &Fork<'_>,
     revision: &str,
     target: Option<&str>,

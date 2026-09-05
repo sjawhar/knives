@@ -74,9 +74,8 @@ knives notch <branch> -m "what you decided and why" --evidence <commit-or-ref>
 Cite something. Every audit claim that survived review cited a commit or a `file:line`;
 every false one did not.
 
-Notes written by an agent that owned a pull request end-to-end carry the prefixes the
-`using-knives` skill's `knives notch` section defines (`recon:` through `handback:`); read them
-in that order, and treat an unanswered `decision:` as still open.
+A branch's notes may carry a workflow's own prefixes; the workflow that wrote them defines
+them, and a note that says it is open is open.
 
 ## Get your own working copy the managed way
 

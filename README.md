@@ -201,8 +201,8 @@ ad-hoc local scan without recording the path.
 
 `forbidden` lists identifiers an upstream-bound diff must not add: your org, your product, your
 hosts. `knives audit` reports every line a branch adds over its fork point with the upstream trunk
-that contains one, as a case-insensitive substring; a branch stated `--fork-only` is exempt. A
-blank term or a term listed twice (case-insensitively) is refused on load. Absent, no scan runs.
+that contains one; a branch stated `--fork-only` is exempt. Absent, no scan runs. The `using-knives`
+skill has the matching and load rules.
 
 Every command takes its repo from the directory you are standing in, wherever that checkout
 lives. Name one only when you are somewhere else; knives then scans `~` three directories deep
@@ -221,7 +221,7 @@ reads `not on this machine`, and an entry with two is refused with both paths na
 | `knives pr NUMBER [--repo REPO] [--timeline]` | one pull request's live state; `--timeline` adds its bounded forge event log |
 | `knives sync` | fetch, then classify what happened to each tracked pull request |
 | `knives preflight` | the facts to check before contributing upstream |
-| `knives start` | take a branch and get your own workspace: on its tip, or on the release's shared base for a new one; waits with backoff up to a minute for the claim lock — an OS advisory lock on `state.lock`, released when its holder exits however it exits, so a stale lock cannot outlive a crashed writer; a refused wait names the holder's pid and how long it has held, or reads `holder unknown` for a lock file without a pid; states the fork's `immutable_heads()` (trunk and tags, with the trunk named on every knives remote) in the repo's jj config where none is stated |
+| `knives start` | take a branch and get your own workspace: on its tip, or on the release's shared base for a new one; waits for the claim lock — an OS advisory lock released when its holder exits however it exits — and a refusal names the holder; a knives that takes the lock by exclusive create instead must not run concurrently with this one on the same machine, hooks included; states the fork's `immutable_heads()` (trunk and tags, with the trunk named on every knives remote) in the repo's jj config where none is stated |
 | `knives finish` | hand a branch back so another agent can pick it up; its bookmark and any open pull request survive |
 | `knives track` | state which pull request a branch belongs to, when inference cannot find it |
 | `knives depends` | record that a branch cannot land before another repo's pull request |

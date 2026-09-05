@@ -10,15 +10,14 @@
 //! change a fork.
 
 use std::collections::BTreeMap;
-use std::fs::{File, TryLockError};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
 use crate::config::default_config_path;
 use crate::ids::{BranchTarget, RepoName, Requirement};
+use crate::lock::{FileLock, LockError, LockWait};
 
 use crate::commands::claim::Identity;
 pub fn default_state_path() -> PathBuf {
@@ -124,206 +123,13 @@ pub enum StoreError {
         path: PathBuf,
         source: serde_json::Error,
     },
-    #[error("{}", locked_message(path, holder.as_ref()))]
-    Locked {
-        path: PathBuf,
-        holder: Option<LockHolder>,
-    },
+    #[error(transparent)]
+    Lock(#[from] LockError),
     #[error("serialising state: {source}")]
     Serialise {
         #[from]
         source: serde_json::Error,
     },
-}
-
-/// How long a writer waits for the lock and how it spaces its attempts.
-///
-/// `start` holds the lock for the whole workspace creation, so a waiter must
-/// outlast several holds; pauses grow so a long hold is not polled hundreds
-/// of times, and jitter keeps waiters out of lockstep.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct LockWait {
-    pub deadline: Duration,
-    pub floor: Duration,
-    pub ceiling: Duration,
-}
-
-impl Default for LockWait {
-    fn default() -> Self {
-        Self {
-            deadline: Duration::from_secs(60),
-            floor: Duration::from_millis(20),
-            ceiling: Duration::from_secs(2),
-        }
-    }
-}
-
-impl LockWait {
-    /// One second, for the best-effort sidecar locks (`seen`, the hook's
-    /// session state): a stale one must never stall a command or a hook event.
-    pub(crate) const BRIEF: Self = Self {
-        deadline: Duration::from_secs(1),
-        floor: Duration::from_millis(20),
-        ceiling: Duration::from_millis(200),
-    };
-}
-
-/// The lock file a wait gave up on: the writer's pid when the file names one,
-/// and the file's age either way.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LockHolder {
-    /// `None` for a lock file without a pid (an older binary's, or one whose
-    /// holder had not written its pid yet).
-    pub pid: Option<u32>,
-    pub held_for: Duration,
-}
-
-fn locked_message(path: &Path, holder: Option<&LockHolder>) -> String {
-    match holder {
-        Some(LockHolder {
-            pid: Some(pid),
-            held_for,
-        }) => format!(
-            "another knives command (pid {pid}, holding for {}s) is holding {}; try again in a moment",
-            held_for.as_secs(),
-            path.display()
-        ),
-        Some(LockHolder {
-            pid: None,
-            held_for,
-        }) => format!(
-            "another knives command (holder unknown, lock written {}s ago) is holding {}; try again in a moment",
-            held_for.as_secs(),
-            path.display()
-        ),
-        None => format!(
-            "another knives command (holder unknown) is holding {}; try again in a moment",
-            path.display()
-        ),
-    }
-}
-
-/// Uniform in `[floor, min(ceiling, floor * 2^attempt)]`: `random` is scaled
-/// onto the span rather than reduced modulo it, so `0` is the floor and
-/// `u64::MAX` the cap.
-fn pause(attempt: u32, wait: LockWait, random: u64) -> Duration {
-    let cap = wait
-        .floor
-        .saturating_mul(1 << attempt.min(16))
-        .min(wait.ceiling);
-    let span = u64::try_from(cap.saturating_sub(wait.floor).as_nanos()).unwrap_or(u64::MAX);
-    let scaled = (u128::from(random) * (u128::from(span) + 1)) >> 64;
-    let jitter = u64::try_from(scaled).unwrap_or(span);
-    wait.floor + Duration::from_nanos(jitter)
-}
-
-/// Jitter source. The standard library's per-process randomised hasher is
-/// enough to break lockstep between waiters, and costs no dependency.
-fn random_u64() -> u64 {
-    use std::hash::{BuildHasher as _, Hasher as _};
-    std::collections::hash_map::RandomState::new()
-        .build_hasher()
-        .finish()
-}
-
-/// The lock file's first token is the holder's pid; a file without one has an
-/// unknown holder but still an age. `None` only when the file cannot be read.
-fn read_holder(path: &Path) -> Option<LockHolder> {
-    let text = std::fs::read_to_string(path).ok()?;
-    let pid: Option<u32> = text
-        .split_whitespace()
-        .next()
-        .and_then(|token| token.parse().ok());
-    let held_for = std::fs::metadata(path)
-        .ok()?
-        .modified()
-        .ok()?
-        .elapsed()
-        .unwrap_or_default();
-    Some(LockHolder { pid, held_for })
-}
-
-/// Held for the duration of a read-modify-write.
-///
-/// Without it the store is last-writer-wins: two `knives start` runs that
-/// interleave read, decide and write both see "unclaimed", both report success,
-/// and the second erases the first. For a tool whose stated purpose is to make
-/// collisions between agents visible before they cost work, the coordination
-/// record cannot itself lose writes.
-///
-/// The lock is the operating system's advisory lock on `state.lock`
-/// ([`File::try_lock`]), held by the open file handle: the kernel releases it
-/// when the holder exits, however it exits — a SIGKILL from a harness that
-/// timed a command out, a Ctrl-C, a panic — so a stale lock cannot outlive a
-/// crashed writer and nobody has to remove a file. The file itself is never
-/// unlinked: it is the shared inode every waiter locks, and deleting it by
-/// path after an unlock would put two waiters on two different inodes, each
-/// holding "the" lock. After acquiring, the holder writes its pid into the
-/// file so a waiter that gives up can name who it waited on; the file's
-/// mtime gives the age. A knives built before this lock (exclusive-create of
-/// the same path) reads the persistent file as always locked while both
-/// binaries run on one machine.
-#[derive(Debug)]
-pub(crate) struct StoreLock {
-    /// Dropping the handle releases the lock.
-    #[expect(
-        dead_code,
-        reason = "an RAII guard is used by existing, not by being read"
-    )]
-    file: File,
-}
-
-impl StoreLock {
-    /// Beside the file it guards, named for that file's stem: `state.json` is
-    /// guarded by `state.lock`. Waits per `wait`, then gives up loudly:
-    /// blocking forever would hide a holder that has hung.
-    pub(crate) fn acquire(target: &Path, wait: LockWait) -> Result<Self, StoreError> {
-        let path = target.with_extension("lock");
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|source| StoreError::Write {
-                path: parent.to_owned(),
-                source,
-            })?;
-        }
-        let mut file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)
-            .map_err(|source| StoreError::Write {
-                path: path.clone(),
-                source,
-            })?;
-        let started = std::time::Instant::now();
-        let mut attempt = 0u32;
-        loop {
-            match file.try_lock() {
-                Ok(()) => break,
-                Err(TryLockError::WouldBlock) => {
-                    let elapsed = started.elapsed();
-                    if elapsed >= wait.deadline {
-                        return Err(StoreError::Locked {
-                            holder: read_holder(&path),
-                            path,
-                        });
-                    }
-                    let remaining = wait.deadline.saturating_sub(elapsed);
-                    std::thread::sleep(pause(attempt, wait, random_u64()).min(remaining));
-                    attempt += 1;
-                }
-                Err(TryLockError::Error(source)) => {
-                    return Err(StoreError::Write { path, source });
-                }
-            }
-        }
-        // Ours now: name ourselves for whoever waits on us. A write failure is
-        // not a lock failure, only a nameless holder in the give-up message.
-        if file.set_len(0).is_ok() {
-            let _ = writeln!(file, "{}", std::process::id());
-        }
-        Ok(Self { file })
-    }
 }
 
 #[derive(Debug)]
@@ -332,11 +138,7 @@ pub struct Store {
     state: State,
     /// Present only for a store opened to be written. Held, not read: its whole
     /// job is to exist until this value is dropped.
-    #[expect(
-        dead_code,
-        reason = "an RAII guard is used by existing, not by being read"
-    )]
-    lock: Option<StoreLock>,
+    _lock: Option<FileLock>,
 }
 
 impl Store {
@@ -346,18 +148,18 @@ impl Store {
     }
 
     /// For a read-modify-write. Holds the lock until dropped, and waits the
-    /// full claim-writer budget (`LockWait::default`) for another writer.
+    /// full claim-writer budget ([`LockWait::CLAIM`]) for another writer.
     pub fn open_for_update(path: PathBuf) -> Result<Self, StoreError> {
-        Self::open_for_update_with(path, LockWait::default())
+        Self::open_for_update_with(path, LockWait::CLAIM)
     }
 
     /// [`Self::open_for_update`] with an explicit wait budget.
     fn open_for_update_with(path: PathBuf, wait: LockWait) -> Result<Self, StoreError> {
-        let lock = StoreLock::acquire(&path, wait)?;
+        let lock = FileLock::acquire(&path, wait)?;
         Self::read(path, Some(lock))
     }
 
-    fn read(path: PathBuf, lock: Option<StoreLock>) -> Result<Self, StoreError> {
+    fn read(path: PathBuf, lock: Option<FileLock>) -> Result<Self, StoreError> {
         let state = if path.exists() {
             let text = std::fs::read_to_string(&path).map_err(|source| StoreError::Read {
                 path: path.clone(),
@@ -370,7 +172,11 @@ impl Store {
         } else {
             State::default()
         };
-        Ok(Self { path, state, lock })
+        Ok(Self {
+            path,
+            state,
+            _lock: lock,
+        })
     }
 
     /// Write atomically, so a crash mid-write cannot truncate the file and a
@@ -843,31 +649,25 @@ mod tests {
         );
         assert_eq!(subject.pull_state(&RepoName::new("other-repo"), 7), None);
     }
-}
-
-#[cfg(test)]
-mod lock_tests {
-    use super::*;
-
-    const QUICK: LockWait = LockWait {
-        deadline: Duration::from_millis(200),
-        floor: Duration::from_millis(5),
-        ceiling: Duration::from_millis(40),
-    };
 
     #[test]
-    fn a_second_writer_cannot_open_while_the_first_holds_the_lock() {
-        // Two concurrent claim writers that interleave read, decide and write both used
-        // to see "unclaimed", both report success, and the second erase the
-        // first. The tool exists to make collisions visible, so its own record
-        // must not lose them.
+    fn a_second_writer_waits_for_the_lock_and_a_reader_does_not() {
+        // Two claim writers that interleave read, decide and write would both
+        // see "unclaimed", both report success, and the second erase the
+        // first. The tool exists to make collisions visible, so its own
+        // record must not lose them.
+        let quick = LockWait {
+            deadline: std::time::Duration::from_millis(200),
+            floor: std::time::Duration::from_millis(5),
+            ceiling: std::time::Duration::from_millis(40),
+        };
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.json");
-        let first = Store::open_for_update_with(path.clone(), QUICK).unwrap();
+        let first = Store::open_for_update_with(path.clone(), quick).unwrap();
 
-        let second = Store::open_for_update_with(path.clone(), QUICK);
+        let second = Store::open_for_update_with(path.clone(), quick);
         assert!(
-            matches!(second, Err(StoreError::Locked { .. })),
+            matches!(second, Err(StoreError::Lock(LockError::Held { .. }))),
             "a second writer got in"
         );
 
@@ -876,189 +676,8 @@ mod lock_tests {
 
         drop(first);
         assert!(
-            Store::open_for_update_with(path, QUICK).is_ok(),
+            Store::open_for_update_with(path, quick).is_ok(),
             "the lock outlived its holder"
-        );
-    }
-
-    #[test]
-    fn a_locked_error_names_the_holders_pid_and_age() {
-        let dir = tempfile::tempdir().expect("state dir");
-        let path = dir.path().join("state.json");
-        let _first = Store::open_for_update_with(path.clone(), QUICK).expect("first writer");
-        let error = Store::open_for_update_with(path, QUICK).expect_err("second writer");
-        let StoreError::Locked {
-            holder: Some(holder),
-            ..
-        } = &error
-        else {
-            panic!("expected a Locked error with a holder, got {error:?}");
-        };
-        assert_eq!(holder.pid, Some(std::process::id()));
-        assert!(holder.held_for < Duration::from_secs(5), "{holder:?}");
-        let text = error.to_string();
-        assert!(
-            text.contains(&format!("pid {}", std::process::id())),
-            "{text}"
-        );
-        assert!(text.contains("holding for"), "{text}");
-    }
-
-    #[test]
-    fn a_holder_that_wrote_no_pid_reports_an_unknown_holder_and_the_locks_age() {
-        // Given: something holds the OS lock on the file without naming itself.
-        let dir = tempfile::tempdir().expect("state dir");
-        let path = dir.path().join("state.json");
-        let nameless = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(path.with_extension("lock"))
-            .expect("open lock file");
-        nameless.try_lock().expect("hold the lock");
-
-        let error = Store::open_for_update_with(path, QUICK).expect_err("locked");
-
-        let StoreError::Locked {
-            holder: Some(holder),
-            ..
-        } = &error
-        else {
-            panic!("expected a Locked error with an aged holder, got {error:?}");
-        };
-        assert_eq!(holder.pid, None);
-        assert!(holder.held_for < Duration::from_secs(5), "{holder:?}");
-        let text = error.to_string();
-        assert!(
-            text.contains(&format!(
-                "holder unknown, lock written {}s ago",
-                holder.held_for.as_secs()
-            )),
-            "{text}"
-        );
-    }
-
-    #[test]
-    fn a_waiting_writer_acquires_once_the_holder_releases() {
-        let dir = tempfile::tempdir().expect("state dir");
-        let path = dir.path().join("state.json");
-        let held = Store::open_for_update_with(path.clone(), QUICK).expect("first writer");
-        let holder = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(60));
-            drop(held);
-        });
-        let started = std::time::Instant::now();
-        let patient = LockWait {
-            deadline: Duration::from_secs(2),
-            ..QUICK
-        };
-        let _second = Store::open_for_update_with(path, patient).expect("acquired after release");
-        assert!(
-            started.elapsed() >= Duration::from_millis(60),
-            "{:?}",
-            started.elapsed()
-        );
-        holder.join().expect("holder thread");
-    }
-
-    /// The lock file the child-process helper below takes, when run as a child.
-    const HELPER_LOCK_TARGET: &str = "KNIVES_TEST_LOCK_TARGET";
-
-    /// Not a test: the body of the child process in
-    /// [`a_lock_held_by_a_killed_process_is_free_at_once`]. Takes the lock on
-    /// the target the environment names, says so on stdout, and sleeps until
-    /// killed.
-    #[test]
-    #[ignore = "a helper run as a child process by the killed-holder test"]
-    fn helper_holds_the_lock_until_killed() {
-        let Some(target) = std::env::var_os(HELPER_LOCK_TARGET) else {
-            return;
-        };
-        let _lock = StoreLock::acquire(Path::new(&target), QUICK).expect("child takes the lock");
-        println!("HOLDING");
-        std::io::stdout().flush().expect("flush");
-        std::thread::sleep(Duration::from_secs(30));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn a_lock_held_by_a_killed_process_is_free_at_once() {
-        // Given: another process holds the lock and is killed with SIGKILL, so
-        // nothing of its own runs at exit.
-        use std::io::BufRead as _;
-        let dir = tempfile::tempdir().expect("state dir");
-        let path = dir.path().join("state.json");
-        let mut child = std::process::Command::new(std::env::current_exe().expect("test binary"))
-            .args([
-                "--exact",
-                "--ignored",
-                "--nocapture",
-                "store::lock_tests::helper_holds_the_lock_until_killed",
-            ])
-            .env(HELPER_LOCK_TARGET, &path)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("spawn the holder");
-        let stdout = child.stdout.take().expect("piped stdout");
-        let mut lines = std::io::BufReader::new(stdout).lines();
-        let held = lines
-            .by_ref()
-            .map_while(Result::ok)
-            .any(|line| line.trim() == "HOLDING");
-        assert!(held, "the child never reported holding the lock");
-        let blocked = Store::open_for_update_with(path.clone(), QUICK);
-        assert!(
-            matches!(blocked, Err(StoreError::Locked { .. })),
-            "the child's lock was not seen: {blocked:?}"
-        );
-
-        // When: the holder is killed.
-        child.kill().expect("SIGKILL the holder");
-        let _ = child.wait();
-
-        // Then: the lock is free at once; no file to remove, no age to judge.
-        let started = std::time::Instant::now();
-        let _mine = Store::open_for_update_with(path, QUICK).expect("acquired after the kill");
-        assert!(
-            started.elapsed() < QUICK.deadline / 2,
-            "waited {:?}",
-            started.elapsed()
-        );
-    }
-
-    #[test]
-    fn pauses_double_to_the_ceiling_and_never_drop_below_the_floor() {
-        for attempt in 0..12 {
-            for random in [0, 1, u64::MAX / 3, u64::MAX] {
-                let pause = pause(attempt, QUICK, random);
-                let cap = QUICK
-                    .floor
-                    .saturating_mul(1 << attempt.min(16))
-                    .min(QUICK.ceiling);
-                assert!(
-                    pause >= QUICK.floor && pause <= cap,
-                    "attempt {attempt}: {pause:?} not in [{:?}, {cap:?}]",
-                    QUICK.floor
-                );
-            }
-        }
-        assert_eq!(pause(0, QUICK, 0), QUICK.floor);
-        assert_eq!(pause(10, QUICK, u64::MAX), QUICK.ceiling);
-    }
-
-    #[test]
-    fn the_wait_gives_up_by_its_deadline() {
-        let dir = tempfile::tempdir().expect("state dir");
-        let path = dir.path().join("state.json");
-        let _first = Store::open_for_update_with(path.clone(), QUICK).expect("first writer");
-        let started = std::time::Instant::now();
-        let _ = Store::open_for_update_with(path, QUICK).expect_err("locked");
-        let waited = started.elapsed();
-        assert!(
-            waited >= QUICK.deadline && waited < QUICK.deadline * 3,
-            "{waited:?}"
         );
     }
 }
