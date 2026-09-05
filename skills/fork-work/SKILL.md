@@ -74,6 +74,10 @@ knives notch <branch> -m "what you decided and why" --evidence <commit-or-ref>
 Cite something. Every audit claim that survived review cited a commit or a `file:line`;
 every false one did not.
 
+Notes written by an agent that owned a pull request end-to-end carry the prefixes the
+`using-knives` skill's `knives notch` section defines (`recon:` through `handback:`); read them
+in that order, and treat an unanswered `decision:` as still open.
+
 ## Get your own working copy the managed way
 
 ```
@@ -83,8 +87,10 @@ knives start <branch> --why "what you are doing"
 This claims the branch and creates a jj workspace for it: on the branch's own tip when the
 branch already exists (your `@` is an empty child of it), or on the release's shared base
 (the fetched upstream trunk when no release exists) for a new branch, so it composes into
-the release without forcing a rebase. As soon as your active work there stops — including
-when it now waits on something external, such as a pull request in review:
+the release without forcing a rebase. A `start` that pauses is waiting for another agent's
+knives command to release the claim lock; let it. A refusal names the holder — the
+`using-knives` skill has the messages. As soon as your active work there stops —
+including when it now waits on something external, such as a pull request in review:
 
 ```
 knives finish <branch>
@@ -105,39 +111,27 @@ has a knives command that does the same job safely:
 - **Do not create a scratch or temporary checkout** to "just try something". Use
   `knives start` and get a real workspace that other agents can see you are using.
 - **Do not start a branch in the default workspace of a managed fork.** Another agent may
-  be working there. `knives start` gives you your own workspace on the branch's tip, or
-  for a new branch on the release's shared base (the fetched upstream trunk if no release
-  exists), which also avoids silently inheriting a release merge as a parent. This is
-  about these shared forks specifically; branching normally in your own projects is fine.
-- **Do not keep two copies of a branch** — a "release-lineage" or "sibling" branch carrying
-  a pull request's content on an older base so the release can carry it while the pull
-  request branch is rebased for the maintainer. One branch is both the release member and the
-  pull request head. When members need a newer base, `knives release rebase` moves every
-  member and the release together; one branch alone is `jj rebase -b <branch> -d <trunk>`,
-  which keeps its change ids so `knives release advance <branch>` follows it. Either rebase
-  also moves whatever was built on the branch, other forks' untracked refs included — a
-  superseded release cut, somebody's pull request head — leaving the moved copies as
-  bookmark-less heads while the remote refs stay on the old commits. Those copies carry
-  nothing of yours; `jj abandon` them. If a branch does not compose into the release, the
-  release is behind: move the release, do not fork the branch.
-- **Do not `jj duplicate` a branch, and do not `--ignore-immutable` a rebase.** A managed
-  fork runs under `immutable_heads()` = trunk and tags, with the trunk named on every knives
-  remote (the `using-knives` skill and detector 11 in the design doc spell it out), which
-  `knives start` writes into the repository's jj config where none is stated; under it,
-  `Commit X is immutable` on a rebase means a trunk or a tag, and that refusal is the
-  protection — stop. Under jj's default rule the pin is instead a stale remote ref — a
-  superseded release cut a fetch re-materialized, another fork's pull request head — and
-  protects nothing, because a local rewrite never reaches a remote: run `knives start`, then
-  rebase again. If `knives status` shows `immutable-heads-rule`, the repository states a
-  different rule — read the finding before rebasing: knives refreshes its own stale write on
-  the next `start` and never overwrites a human's. Either way
-  `jj log -r 'immutable_heads() & descendants(<rev>)'` names the pin. A duplicate mints new
-  commit ids the release cannot match to the branch (`knives release advance --from` is the
-  repair), and `--ignore-immutable` rewrites the pinning commits themselves.
+  be working there. `knives start` gives you your own workspace, based where the section
+  above says, so you never inherit a release merge as a parent by accident. This is about
+  these shared forks specifically; branching normally in your own projects is fine.
+- **The two sanctioned moves.** A branch that needs a newer base moves one of two ways, and
+  which one depends on whether the branch is a release member (`knives release members` lists
+  the parents of the release in hand; a branch named there is a member). A member moves with
+  `knives release rebase`: every member and the release together, so the composition stays
+  whole. A lone branch moves with `jj rebase -b <branch> -d <trunk>@upstream`, which keeps its
+  change ids so `knives release advance <branch>` follows it — and, because `-b` rebases
+  descendants, also carries any release merge built on it, which is expected: the release
+  follows its member, and superseded cuts are `knives release reap`ed. Never `jj duplicate` a
+  branch: it mints new commit ids the release cannot match to the branch (`knives release
+  advance --from` is the repair, not the plan). Never keep two copies of a branch — a
+  "release-lineage" or "sibling" branch carrying a pull request's content on an older base so
+  the release can carry it while the pull request branch is rebased for the maintainer. One
+  branch is both the release member and the pull request head; if it does not compose into the
+  release, the release is behind: move the release, do not fork the branch.
 - **Do not build a branch on top of a release merge.** A branch whose history carries a
   release cut carries every member of that cut, and a pull request from it asks the
   maintainer to review the whole fork. `knives status` and `knives preflight` report it as
-  `stacked-history`; `jj rebase -b <branch> -d <trunk>` fixes it and keeps the change ids.
+  `stacked-history`; `jj rebase -b <branch> -d <trunk>@upstream` fixes it and keeps the change ids.
 - **Do not `jj op restore`.** It discards other agents' operations along with your own
   mistake.
 - **Do not push to `upstream`.** Contributions go through a pull request.
