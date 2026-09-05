@@ -1,6 +1,6 @@
 ---
 name: maintaining-fork-pr
-description: Use when dispatched to own one fork pull request — an orchestrator running the fork sweep has handed you a single PR's coordinates (repo, number, URL, branch; the PR facts you gather yourself) and the repo's section of the estate document, and you are the agent who takes that PR from its current state to reviewed, repaired, verified and handed back.
+description: Use when dispatched to own one fork pull request — an orchestrator running the fork sweep has handed you a single PR's coordinates (repo, number, URL, branch; the PR facts you gather yourself) and the repo's section and the `## For every dispatch` section of the estate document, and you are the agent who takes that PR from its current state to reviewed, repaired, verified and handed back.
 ---
 
 # Owning one fork pull request
@@ -12,13 +12,13 @@ sweep's scratch directory your dispatch names (failing that, one under your sess
 by path in your report): anything written inside the workspace snapshots into `@`.
 
 Your dispatch supplies what this skill leaves open: the PR's coordinates (registry repo name and
-upstream slug, number, URL, branch); the branch's `knives status` row; the repo's section of the
-**estate document** (the per-library tacit-knowledge document your estate keeps; its `##` section for
-this repo carries the gate commands, what a PR owes these maintainers, *CI reality*, the maintainers'
-known positions and the outbound-prose rule); the `pr-preflight` skill text; the orchestrator's address
-and scratch directory; and the **term list** of forbidden identifiers you scan the diff and body for
-(if the dispatch carries none, ask the orchestrator for it over `hub` before recon — never guess a
-list). The **maintainer of record** is the human who owns the estate: `gh auth status` names the
+upstream slug, number, URL, branch); the branch's `knives status` row; two sections of the **estate
+document**, your estate's per-library tacit-knowledge document: the repo's `##` section (gate commands,
+what a PR owes these maintainers, *CI reality*, the maintainers' known positions) and `## For every
+dispatch` (the outbound-prose rule and the **term list** of forbidden identifiers you scan the diff and
+body for; if the dispatch carries none, ask the orchestrator for it over `hub` before recon — never
+guess a list); the `pr-preflight` skill text; the orchestrator's address and scratch directory. The
+**maintainer of record** is the human who owns the estate: `gh auth status` names the
 account, every publish action writes upstream as it, and `decision:` notches escalate to them. Read
 all of it before step 1. `fork-work` is the on-ramp for a managed fork; `using-knives` the reference
 for every knives command; `using-jj` for version control. PR facts (head, mergeability, review
@@ -194,10 +194,9 @@ neither, a `decision:` handback beats guessing. Check 1's facts come from step 2
 prints every branch; read your branch's row and the convention-file block (it records the digests it
 reports, so `CHANGED since last seen` shows once per change — read the file then). One override: where
 its Check 4 says to open an issue the repository requires, the owner never does; that is Escalation.
-Prose you write in this step (body, replies) follows the repo section's outbound-prose rule: identify
-as the agent acting on the PR author's behalf, plain and factual (the template's text is not yours).
-**Done when** the draft body, every thread reply and the re-review decision exist in the scratch
-directory, and the draft body is true of the head the reviewer is about to see.
+Your prose here (body, replies) follows `## For every dispatch`'s outbound-prose rule; the template's
+text is not yours. **Done when** the draft body, every thread reply and the re-review decision exist
+in the scratch directory, and the draft body is true of the head the reviewer is about to see.
 
 ## 6. Verify, push, publish
 

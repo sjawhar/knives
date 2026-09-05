@@ -9,14 +9,16 @@ description: Use when asked to review, fix, or land the fork pull requests as a 
 
 You are the owner, the agent orchestrating the sweep. The scope is the open pull requests of the
 forks that have a `##` section in the **estate document** — the per-library tacit-knowledge document
-your estate keeps for its forks, one `##` section per repo named for the tail of the registry entry's
-upstream slug — and nothing else: knives manages more repositories (`knives repos`), out of scope. The
-**maintainer of record** is the human who owns the estate: `gh auth status` names the account every
-publish action writes as, and `decision:` notches escalate to them. You own every pull request you
-sweep until it merges or the maintainer of record reassigns it: one you dispatched and never heard back
-about is still yours. The numbered steps below are in order; each ends with the observable state that
-lets you move on. What an owner does is `maintaining-fork-pr`, pasted whole into every dispatch; this
-skill does not restate it, and names that skill's section where an owner rule matters here.
+your estate keeps for its forks: one `##` section per repo, named for the tail of the registry entry's
+upstream slug, plus one `## For every dispatch` section holding the outbound-prose rule and the term
+list of forbidden identifiers — and nothing else: knives manages more repositories (`knives repos`),
+out of scope. The **maintainer of record** is the human who owns the estate: `gh auth status` names
+the account every publish action writes as, and `decision:` notches escalate to them. You own every
+pull request you sweep until it merges or the maintainer of record reassigns it: one you dispatched and
+never heard back about is still yours. The numbered steps below are in order; each ends with the
+observable state that lets you move on. What an owner does is `maintaining-fork-pr`, pasted whole into
+every dispatch; this skill does not restate it, and names that skill's section where an owner rule
+matters here.
 
 **Done when** you can name the forks in scope, not from memory: the registry is
 `~/.config/knives/repos.toml`; a repo's upstream slug is the `owner/repo` path of its `upstream`
@@ -69,17 +71,18 @@ The dispatch prompt is, in this order:
 2. The pull request's coordinates: registry repo name and upstream slug, number, URL, branch, and the
    branch's whole status row from step 1, pasted as JSON (no `head`: the owner derives it from
    `headRefOid` in its step 2; the row's `tip` may be absent — divergent — and is not the head).
-3. The repo's section of the estate document, pasted whole. The `##` section is named for the
-   upstream repository — the tail of the upstream slug in the coordinates — not for the registry
-   name. It carries the gate commands, what a PR owes those maintainers, *CI reality*, the
-   maintainers' known positions and the outbound-prose rule. The owner runs in a fork workspace where
-   your estate's skills are not discoverable, so it arrives in the prompt or not at all.
+3. The repo's section of the estate document and its `## For every dispatch` section, both pasted
+   whole. The repo's `##` section is named for the upstream repository — the tail of the upstream
+   slug in the coordinates — not for the registry name; it carries the gate commands, what a PR owes
+   those maintainers, *CI reality* and the maintainers' known positions. `## For every dispatch`
+   carries the outbound-prose rule and the term list. The owner runs in a fork workspace where your
+   estate's skills are not discoverable, so both arrive in the prompt or not at all.
 4. The whole text of the `pr-preflight` skill (`skill://pr-preflight`, shipped with knives; a fork
    workspace may not resolve it, or may resolve a stale copy).
 5. Your address for the reviewer relay below (your `hub` id, or your messaging session id) and the
    sweep's scratch directory path from step 1.
 6. The term list of forbidden identifiers the owner scans the fork-point diff and PR body for by
-   hand — always.
+   hand, from `## For every dispatch` — always.
 
 A pull request whose row shows `claim` held by someone who is not one of your owners is not
 dispatched: name the holder in the report and leave it. A divergent bookmark is just a row; the
