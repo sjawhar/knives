@@ -120,7 +120,9 @@ jobs:
             "$staging/share/knives/opencode/plugins/lib/internals.ts" \
             "$staging/share/knives/opencode/skills/fork-work/SKILL.md" \
             "$staging/share/knives/opencode/skills/using-knives/SKILL.md" \
-            "$staging/share/knives/opencode/skills/pr-preflight/SKILL.md"; do
+            "$staging/share/knives/opencode/skills/pr-preflight/SKILL.md" \
+            "$staging/share/knives/opencode/skills/maintaining-fork-release/SKILL.md" \
+            "$staging/share/knives/opencode/skills/maintaining-fork-pr/SKILL.md"; do
             if ! tar --list --gzip --file="$archive" | grep --fixed-strings --line-regexp -- "$artifact" >/dev/null; then
               printf 'release archive is missing required artifact: %s\n' "$artifact" >&2
               exit 1

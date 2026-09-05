@@ -139,4 +139,5 @@ has a knives command that does the same job safely:
 
 This is the on-ramp. For the rest of the CLI — what the three remotes mean, stating a
 pull request that inference cannot find, recording that one branch cannot land before
-another, planning and cutting releases, JSON output — read the `using-knives` skill.
+another, planning and cutting releases, JSON output — read the `using-knives` skill. The
+per-pull-request and sweep workflows are `maintaining-fork-pr` and `maintaining-fork-release`.

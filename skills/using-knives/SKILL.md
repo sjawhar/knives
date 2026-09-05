@@ -268,7 +268,7 @@ Checking comments costs one extra forge call per open tracked pull request. The 
 
 ### `knives preflight [REPO]`
 
-The facts you need before contributing upstream: convention files present and whether they have changed since last seen, any stated cap on open pull requests, branch state. It reports; the judgment is yours. The `pr-preflight` skill walks the gate.
+The facts you need before contributing upstream: convention files present and whether they have changed since last seen, any stated cap on open pull requests, branch state. It reports; the judgment is yours. The `pr-preflight` skill walks the gate; the per-pull-request and sweep workflows that run it are `maintaining-fork-pr` and `maintaining-fork-release`.
 
 ### `knives start <branch>` and `knives finish <branch>`
 

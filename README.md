@@ -319,8 +319,10 @@ up to the repository root are injected nearest first, while `CONTRIBUTING.md` is
 than injected. Guidance arrives wrapped in a per-injection nonce and framed as data, so a
 repository whose files you are reading cannot forge an instruction to you.
 
-Three skills ship with both adapters: `fork-work` for what to check before touching a fork,
-`using-knives` for the CLI, and `pr-preflight` for contributing upstream.
+Five skills ship with both adapters: `fork-work` for what to check before touching a fork,
+`using-knives` for the CLI, `pr-preflight` for contributing upstream, `maintaining-fork-release`
+for sweeping the estate's open pull requests as a set, and `maintaining-fork-pr` for owning one of
+them end-to-end.
 
 ## What it does not do
 
