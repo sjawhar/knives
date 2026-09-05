@@ -561,13 +561,17 @@ fn a_cut_identical_to_the_published_previous_cut_is_refused() {
     // When: nothing joined, advanced or moved, and a new name is asked for.
     let second = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
 
-    // Then: the name is refused, the reason names the published cut, nothing is created.
+    // Then: the name is refused with the facts — the published cut and its
+    // commit — and nothing else; nothing is created.
     let stdout = String::from_utf8_lossy(&second.stdout);
+    let published = commit_at(&lab, "release/2026-08-04@origin");
     assert!(
-        stdout.contains("identical to release/2026-08-04@origin"),
+        stdout.contains(&format!(
+            "demo: refusing to cut release/2026-08-05: identical to release/2026-08-04@origin ({}); nothing to cut\n",
+            published.short()
+        )),
         "{stdout}"
     );
-    assert!(stdout.contains("nothing to cut"), "{stdout}");
     assert_eq!(
         second.status.code(),
         Some(i32::from(knives::cli::Exit::Incomplete.code())),
@@ -586,6 +590,7 @@ fn a_cut_identical_to_the_published_previous_cut_is_refused() {
 
 #[test]
 fn a_cut_whose_composition_changed_since_publishing_is_named() {
+    // Given: a published cut, then a third branch included locally.
     let lab = Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     lab.branch("feat/beta", "beta.txt", "beta\n");
@@ -608,6 +613,7 @@ fn a_cut_whose_composition_changed_since_publishing_is_named() {
     let include = knives_release(&lab, &home, &["include", "feat/gamma", "--why", "test"]);
     assert!(include.status.success(), "{include:?}");
 
+    // When: a new name is asked for.
     let second = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
 
     // Then: the new name lands. The include moved local release/2026-08-04 past
@@ -629,11 +635,72 @@ fn a_cut_whose_composition_changed_since_publishing_is_named() {
 }
 
 #[test]
+fn a_cut_whose_member_was_rewritten_with_the_same_content_is_a_new_composition() {
+    // Given: a published cut whose member is then re-described — same tree,
+    // new commit — and advanced onto the release. The candidate's tree equals
+    // the published cut's; its parents do not.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let (home, _consumer) = release_test_home(&lab);
+    assert!(
+        knives_release(&lab, &home, &["cut", "release/2026-08-04"])
+            .status
+            .success()
+    );
+    lab.jj_work([
+        "git",
+        "push",
+        "--remote",
+        "origin",
+        "--bookmark",
+        "release/2026-08-04",
+    ]);
+    lab.fetch_work();
+    let old_alpha = commit_at(&lab, "feat/alpha");
+    lab.jj_work(["describe", "feat/alpha", "-m", "feat/alpha, reworded"]);
+    let new_alpha = commit_at(&lab, "feat/alpha");
+    assert_ne!(old_alpha, new_alpha, "describe must rewrite the member");
+    let advance = knives_release(&lab, &home, &["advance", "feat/alpha"]);
+    assert!(advance.status.success(), "{advance:?}");
+    let parents = release_parents(&lab, "release/2026-08-04");
+    assert!(
+        parents.contains(&new_alpha) && !parents.contains(&old_alpha),
+        "the release must hold the rewritten member: {parents:?}"
+    );
+    assert_eq!(
+        knives::jj::changed_files_between(
+            &lab.work,
+            "release/2026-08-04@origin",
+            "release/2026-08-04"
+        )
+        .expect("compare trees"),
+        Vec::<String>::new(),
+        "the rewrite must leave the tree unchanged, or this test proves nothing"
+    );
+
+    // When: a new name is asked for.
+    let second = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
+
+    // Then: same tree, different parents: the cut lands rather than being refused.
+    let stdout = String::from_utf8_lossy(&second.stdout);
+    assert!(
+        stdout.contains("cut release/2026-08-05 as"),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert!(!stdout.contains("nothing to cut"), "{stdout}");
+    assert!(
+        release_parents(&lab, "release/2026-08-05").contains(&new_alpha),
+        "the new cut must carry the rewritten member"
+    );
+}
+
+#[test]
 fn a_cut_identical_to_a_published_cut_known_only_remotely_is_refused() {
-    // The newest release can be known only as `release/X@origin` (the local
-    // bookmark forgotten after a push — tests/release_edit.rs does this);
-    // previous_release_for_cut then names the remote ref and the comparison
-    // must still find the published copy.
+    // Given: the newest release is known only as `release/X@origin` (the local
+    // bookmark forgotten after a push — tests/release_edit.rs does this), so
+    // previous_release_for_cut names the remote ref.
     let lab = Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     lab.branch("feat/beta", "beta.txt", "beta\n");
@@ -654,8 +721,10 @@ fn a_cut_identical_to_a_published_cut_known_only_remotely_is_refused() {
     lab.jj_work(["bookmark", "forget", "release/2026-08-04"]);
     lab.fetch_work();
 
+    // When: a new name is asked for.
     let second = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
 
+    // Then: the comparison still finds the published copy, named once.
     let stdout = String::from_utf8_lossy(&second.stdout);
     assert!(
         stdout.contains("identical to release/2026-08-04@origin ("),
@@ -663,6 +732,44 @@ fn a_cut_identical_to_a_published_cut_known_only_remotely_is_refused() {
     );
     assert!(!stdout.contains("@origin@origin"), "{stdout}");
     assert_eq!(second.status.code(), Some(3), "{stdout}");
+}
+
+#[test]
+fn a_fixed_scheme_cut_identical_to_its_published_position_is_refused() {
+    // Given: a fixed release branch, cut and pushed, with nothing changed since.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let (home, _consumer) = fixed_scheme_home(&lab);
+    let first = knives_release(&lab, &home, &["cut"]);
+    assert!(
+        Repo::open(&lab.work)
+            .expect("open first fixed cut")
+            .resolve_commit("integration")
+            .is_ok(),
+        "first fixed cut was not named: {first:?}"
+    );
+    lab.push_branch("integration");
+    lab.fetch_work();
+    let published = commit_at(&lab, "integration@origin");
+
+    // When: the fixed branch is cut again.
+    let second = knives_release(&lab, &home, &["cut"]);
+
+    // Then: refused as identical to the published position; the bookmark stays.
+    let stdout = String::from_utf8_lossy(&second.stdout);
+    assert!(
+        stdout.contains(&format!(
+            "demo: refusing to cut integration: identical to integration@origin ({}); nothing to cut\n",
+            published.short()
+        )),
+        "{stdout}"
+    );
+    assert_eq!(
+        second.status.code(),
+        Some(i32::from(knives::cli::Exit::Incomplete.code())),
+        "{stdout}"
+    );
+    assert_eq!(commit_at(&lab, "integration"), published);
 }
 
 #[test]
@@ -805,13 +912,9 @@ fn a_discarded_candidate_leaves_no_trace() {
     );
 }
 
-#[test]
-fn a_fixed_scheme_cut_carries_the_local_release_in_hand() {
-    // Given: a fixed release branch, published, then edited locally. The cut
-    // must name what is here — duplicating the stale published position would
-    // silently revert the unpushed include.
-    let lab = Lab::new();
-    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+/// Registry home with `demo` on the fixed `integration` release branch, and the
+/// local consumer the release command reads.
+fn fixed_scheme_home(lab: &Lab) -> (tempfile::TempDir, tempfile::TempDir) {
     let home = tempfile::tempdir().expect("create config home");
     std::fs::write(
         home.path().join("repos.toml"),
@@ -827,6 +930,17 @@ fn a_fixed_scheme_cut_carries_the_local_release_in_hand() {
         consumer.path().display().to_string(),
     )
     .expect("write local consumer fixture path");
+    (home, consumer)
+}
+
+#[test]
+fn a_fixed_scheme_cut_carries_the_local_release_in_hand() {
+    // Given: a fixed release branch, published, then edited locally. The cut
+    // must name what is here — duplicating the stale published position would
+    // silently revert the unpushed include.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let (home, _consumer) = fixed_scheme_home(&lab);
     let first = knives_release(&lab, &home, &["cut"]);
     assert!(
         Repo::open(&lab.work)

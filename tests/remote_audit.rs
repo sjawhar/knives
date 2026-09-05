@@ -291,6 +291,7 @@ fn gather_audit(lab: &Lab) -> audit::Report {
         store: &store,
         forge: None,
         cache_root: None,
+        workers: 1,
     })
 }
 
@@ -726,6 +727,53 @@ fn audit_with_no_github_still_reconciles() {
     );
 }
 
+/// Registry home like [`mutation_test_home`] with a `forbidden` list on `demo`.
+fn forbidden_test_home(lab: &Lab, terms: &[&str]) -> tempfile::TempDir {
+    let home = tempfile::tempdir().expect("create config home");
+    let terms = terms
+        .iter()
+        .map(|term| format!("{term:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    std::fs::write(
+        home.path().join("repos.toml"),
+        format!(
+            "[repos.demo]\nupstream = \"{}\"\norigin = \"{}\"\nforbidden = [{terms}]\n",
+            lab.upstream.display(),
+            lab.temp_origin().display(),
+        ),
+    )
+    .expect("write registry");
+    home
+}
+
+/// The audit gathered over `entry` with `forge` and a fresh, empty store.
+fn gather_with(
+    lab: &Lab,
+    entry: &knives::config::RepoEntry,
+    forge: Option<&dyn knives::forge::Forge>,
+) -> audit::Report {
+    let fork = lab::lab_fork(lab, "demo", entry);
+    let state = tempfile::tempdir().expect("state");
+    let store = Store::open(state.path().join("state.json")).expect("store");
+    audit::gather(&audit::AuditInput {
+        fork: &fork,
+        store: &store,
+        forge,
+        cache_root: None,
+        workers: 4,
+    })
+}
+
+/// The row for `branch`, or a panic naming every row there is.
+fn row<'a>(report: &'a audit::Report, branch: &str) -> &'a audit::BranchFacts {
+    report
+        .branches
+        .iter()
+        .find(|row| row.branch.as_str() == branch)
+        .unwrap_or_else(|| panic!("no row for {branch}: {:?}", report.branches))
+}
+
 #[test]
 fn audit_json_carries_a_branches_array_with_local_facts() {
     // Given: one pushed branch and no forge transport.
@@ -751,39 +799,57 @@ fn audit_json_carries_a_branches_array_with_local_facts() {
 }
 
 #[test]
-fn file_text_and_diff_git_read_the_upstream_trunk() {
-    // Given: a template on upstream's trunk and a branch adding one line.
+fn audit_json_without_github_has_no_pull_key_and_names_the_skip_as_a_problem() {
+    // Given: one branch, a `forbidden` list, and no forge transport.
     let lab = Lab::new();
-    lab.upstream_trunk_file(".github/pull_request_template.md", "## Overview\n");
-    lab.branch("feat/alpha", "alpha.py", "# wired for acme-corp's IaC\n");
+    lab.branch("feat/alpha", "alpha.py", "# plain\n");
+    let home = forbidden_test_home(&lab, &["acme-corp"]);
 
-    // When/Then: the file reads at `main@upstream`, is absent at `main@origin`,
-    // and the diff names the added line.
-    let text = knives::jj::file_text(
-        lab.work_path(),
-        "main@upstream",
-        ".github/pull_request_template.md",
-    )
-    .expect("read a present file");
-    assert_eq!(text.as_deref(), Some("## Overview\n"));
-    let absent = knives::jj::file_text(
-        lab.work_path(),
-        "main@origin",
-        ".github/pull_request_template.md",
-    )
-    .expect("a missing path is not an error");
-    assert_eq!(absent, None);
-    let unresolvable = knives::jj::file_text(lab.work_path(), "no-such-rev", "alpha.py");
-    assert!(
-        unresolvable.is_err(),
-        "a bad revision must not read as absent"
+    // When: the binary audits with --no-github as JSON.
+    let output = knives_audit(&lab, &home, &["demo", "--no-github"]);
+
+    // Then: the row has exactly the local keys plus `forbidden: []` (scanned,
+    // nothing found), no `pull` key at all, and the skipped reconciliation is a
+    // problem line, so the exit is 3.
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("audit emits JSON");
+    let rows = report["branches"].as_array().expect("branches is an array");
+    let row = rows
+        .iter()
+        .find(|row| row["branch"] == "feat/alpha")
+        .unwrap_or_else(|| panic!("feat/alpha row: {report}"));
+    let keys: Vec<&str> = row
+        .as_object()
+        .expect("row is an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        keys,
+        [
+            "branch",
+            "tip",
+            "origin_tip",
+            "tip_matches_origin",
+            "fork_only",
+            "forbidden",
+        ],
+        "was: {row}"
     );
-    let diff = knives::jj::diff_git(lab.work_path(), "main@upstream", "feat/alpha").expect("diff");
-    assert!(diff.contains("+++ b/alpha.py"), "was: {diff}");
-    assert!(diff.contains("+# wired for acme-corp's IaC"), "was: {diff}");
+    assert_eq!(row["forbidden"], serde_json::json!([]));
+    assert_eq!(row["origin_tip"], serde_json::Value::Null);
     assert!(
-        diff.contains("--- a/.github/pull_request_template.md") && diff.contains("+++ /dev/null"),
-        "the branch lacks upstream's newer template, so the diff removes it: {diff}"
+        report["problems"]
+            .as_array()
+            .expect("problems")
+            .iter()
+            .any(|problem| problem == "open pull-head reconciliation was skipped (--no-github)"),
+        "was: {report}"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(i32::from(knives::cli::Exit::Incomplete.code())),
+        "{report}"
     );
 }
 
@@ -800,7 +866,6 @@ fn audit_reports_branch_and_pull_facts() {
     lab.push_branch("feat/alpha");
     let mut entry = origin_entry(&lab);
     entry.forbidden = vec!["acme-corp".to_owned()];
-    let fork = lab::lab_fork(&lab, "demo", &entry);
     let tip = commit_at(&lab, "feat/alpha");
     let fake = FakeForge {
         pull_requests: BTreeMap::from([(
@@ -838,23 +903,15 @@ fn audit_reports_branch_and_pull_facts() {
         unresolved_threads: BTreeMap::from([(7, 2)]),
         ..FakeForge::default()
     };
-    let state = tempfile::tempdir().expect("state");
-    let store = Store::open(state.path().join("state.json")).expect("store");
 
-    let report = audit::gather(&audit::AuditInput {
-        fork: &fork,
-        store: &store,
-        forge: Some(&fake),
-        cache_root: None,
-    });
+    // When: the audit gathers with the fake forge.
+    let report = gather_with(&lab, &entry, Some(&fake));
 
-    let row = report
-        .branches
-        .iter()
-        .find(|row| row.branch == "feat/alpha")
-        .expect("row");
-    assert_eq!(row.tip, tip.as_str());
-    assert_eq!(row.tip_matches_origin, Some(true));
+    // Then: the row carries the local facts, every pull fact, the template
+    // comparison and the one forbidden hit, and nothing was unanswered.
+    let row = row(&report, "feat/alpha");
+    assert_eq!(row.tip, tip);
+    assert_eq!(row.tip_matches_origin(), Some(true));
     assert!(!row.fork_only);
     let pull = row.pull.as_ref().expect("pull facts");
     assert_eq!(
@@ -865,7 +922,7 @@ fn audit_reports_branch_and_pull_facts() {
         ),
         (7, Some("MERGEABLE"), Some("CLEAN"))
     );
-    assert_eq!(pull.review_decision, "REVIEW_REQUIRED");
+    assert_eq!(pull.review_decision.as_deref(), Some("REVIEW_REQUIRED"));
     assert!(pull.head_matches_tip);
     let checks = pull.checks.as_ref().expect("checks");
     assert_eq!((checks.total, checks.pending), (3, 1));
@@ -889,9 +946,38 @@ fn audit_reports_branch_and_pull_facts() {
 }
 
 #[test]
+fn a_pull_with_no_review_decision_is_null_in_the_row() {
+    // Given: an open pull the forge reports with an empty review decision.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.push_branch("feat/alpha");
+    let entry = origin_entry(&lab);
+    let tip = commit_at(&lab, "feat/alpha");
+    let fake = FakeForge {
+        pull_requests: BTreeMap::from([(
+            BranchName::new("feat/alpha"),
+            pulls::pull_request_with_head(7, "OPEN", "feat/alpha", tip.as_str()),
+        )]),
+        ..FakeForge::default()
+    };
+
+    // When: the audit gathers.
+    let report = gather_with(&lab, &entry, Some(&fake));
+
+    // Then: the row's `review_decision` is `None`, and serialises as `null`.
+    let pull = row(&report, "feat/alpha")
+        .pull
+        .as_ref()
+        .expect("pull facts");
+    assert_eq!(pull.review_decision, None);
+    let json = serde_json::to_value(pull).expect("serialise");
+    assert_eq!(json["review_decision"], serde_json::Value::Null);
+}
+
+#[test]
 fn an_uppercase_pull_request_template_is_read_too() {
-    // Given: upstream names its template `.github/PULL_REQUEST_TEMPLATE.md`, as
-    // several registered upstreams do, and a pull whose body lacks one heading.
+    // Given: upstream names its template in upper case, `.github/PULL_REQUEST_TEMPLATE.md`,
+    // and a pull whose body lacks one heading.
     let lab = Lab::new();
     lab.upstream_trunk_file(
         ".github/PULL_REQUEST_TEMPLATE.md",
@@ -900,7 +986,6 @@ fn an_uppercase_pull_request_template_is_read_too() {
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     lab.push_branch("feat/alpha");
     let entry = origin_entry(&lab);
-    let fork = lab::lab_fork(&lab, "demo", &entry);
     let tip = commit_at(&lab, "feat/alpha");
     let fake = FakeForge {
         pull_requests: BTreeMap::from([(
@@ -910,22 +995,13 @@ fn an_uppercase_pull_request_template_is_read_too() {
         bodies: BTreeMap::from([(9, "# summary\nwhat changed\n".to_owned())]),
         ..FakeForge::default()
     };
-    let state = tempfile::tempdir().expect("state");
-    let store = Store::open(state.path().join("state.json")).expect("store");
 
-    let report = audit::gather(&audit::AuditInput {
-        fork: &fork,
-        store: &store,
-        forge: Some(&fake),
-        cache_root: None,
-    });
+    // When: the audit gathers.
+    let report = gather_with(&lab, &entry, Some(&fake));
 
-    let row = report
-        .branches
-        .iter()
-        .find(|row| row.branch == "feat/alpha")
-        .expect("row");
-    let template = row
+    // Then: the upper-case file is the template, and its headings are held
+    // against the body case-insensitively.
+    let template = row(&report, "feat/alpha")
         .pull
         .as_ref()
         .and_then(|pull| pull.template.as_ref())
@@ -949,42 +1025,27 @@ fn origin_parity_reports_differs_and_absent() {
     lab.advance_origin_branch("feat/moved", "two\n"); // origin moves; local does not
     lab.branch("feat/unpushed", "u.txt", "u\n");
     let entry = origin_entry(&lab);
-    let fork = lab::lab_fork(&lab, "demo", &entry);
-    let state = tempfile::tempdir().expect("state");
-    let store = Store::open(state.path().join("state.json")).expect("store");
 
-    let report = audit::gather(&audit::AuditInput {
-        fork: &fork,
-        store: &store,
-        forge: None,
-        cache_root: None,
-    });
+    // When: the audit gathers without a forge.
+    let report = gather_with(&lab, &entry, None);
 
-    let row = |name: &str| {
-        report
-            .branches
-            .iter()
-            .find(|row| row.branch == name)
-            .expect(name)
-    };
-    assert_eq!(row("feat/moved").tip_matches_origin, Some(false));
-    assert!(row("feat/moved").origin_tip.is_some());
-    assert_ne!(
-        row("feat/moved").origin_tip.as_deref(),
-        Some(row("feat/moved").tip.as_str())
-    );
-    assert_eq!(row("feat/unpushed").tip_matches_origin, None);
-    assert_eq!(row("feat/unpushed").origin_tip, None);
+    // Then: the moved branch differs from its origin tip; the unpushed one has none.
+    let moved = row(&report, "feat/moved");
+    assert_eq!(moved.tip_matches_origin(), Some(false));
+    assert!(moved.origin_tip.is_some());
+    assert_ne!(moved.origin_tip.as_ref(), Some(&moved.tip));
+    let unpushed = row(&report, "feat/unpushed");
+    assert_eq!(unpushed.tip_matches_origin(), None);
+    assert_eq!(unpushed.origin_tip, None);
 }
 
 #[test]
-fn a_fork_only_branch_is_exempt_from_the_forbidden_scan_and_no_config_means_no_scan() {
-    // Given: a branch whose diff names the configured term.
+fn a_fork_only_branch_is_exempt_from_the_forbidden_scan() {
+    // Given: a term is configured, one branch names it but is stated fork-only,
+    // another branch is clean.
     let lab = Lab::new();
     lab.branch("feat/alpha", "alpha.py", "# wired for acme-corp's IaC\n");
     lab.branch("feat/beta", "beta.py", "# plain\n");
-
-    // (1) The term is configured and the branch is stated fork-only: no scan.
     let mut entry = origin_entry(&lab);
     entry.forbidden = vec!["acme-corp".to_owned()];
     let fork = lab::lab_fork(&lab, "demo", &entry);
@@ -995,51 +1056,141 @@ fn a_fork_only_branch_is_exempt_from_the_forbidden_scan_and_no_config_means_no_s
         "test",
     );
 
+    // When: the audit gathers.
     let report = audit::gather(&audit::AuditInput {
         fork: &fork,
         store: &store,
         forge: None,
         cache_root: None,
+        workers: 4,
     });
 
-    let alpha = report
-        .branches
-        .iter()
-        .find(|row| row.branch == "feat/alpha")
-        .expect("feat/alpha row");
+    // Then: the fork-only row is not scanned at all; the other is scanned and clean.
+    let alpha = row(&report, "feat/alpha");
     assert!(alpha.fork_only);
     assert!(alpha.forbidden.is_none(), "exempt: {alpha:?}");
-    let beta = report
-        .branches
-        .iter()
-        .find(|row| row.branch == "feat/beta")
-        .expect("feat/beta row");
+    let beta = row(&report, "feat/beta");
     assert!(!beta.fork_only);
     assert_eq!(
         beta.forbidden.as_deref(),
         Some(&[][..]),
         "scanned, nothing found: {beta:?}"
     );
-    drop(store);
+}
 
-    // (2) No term configured: no scan on any row, and nothing is fork-only.
+#[test]
+fn no_forbidden_list_means_no_scan_on_any_row() {
+    // Given: two branches and a registry entry with no `forbidden` list.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.py", "# wired for acme-corp's IaC\n");
+    lab.branch("feat/beta", "beta.py", "# plain\n");
     let entry = origin_entry(&lab);
-    let fork = lab::lab_fork(&lab, "demo", &entry);
-    let state = tempfile::tempdir().expect("state");
-    let store = Store::open(state.path().join("state.json")).expect("store");
 
-    let report = audit::gather(&audit::AuditInput {
-        fork: &fork,
-        store: &store,
-        forge: None,
-        cache_root: None,
-    });
+    // When: the audit gathers.
+    let report = gather_with(&lab, &entry, None);
 
+    // Then: no row is scanned and none is fork-only.
     assert!(!report.branches.is_empty());
     for row in &report.branches {
         assert!(row.forbidden.is_none(), "not configured: {row:?}");
         assert!(!row.fork_only, "{row:?}");
     }
+}
+
+#[test]
+fn the_forbidden_scan_measures_from_the_fork_point_not_the_trunk_tip() {
+    // Given: the trunk both forks share names the term in NOTES.md; a branch forks
+    // from it and adds a clean file; upstream then rewrites NOTES.md. Diffed from
+    // the trunk tip, the branch's untouched NOTES.md would read as re-adding the
+    // term; diffed from the fork point, the branch adds only its own file.
+    let lab = Lab::new();
+    lab.upstream_trunk_file("NOTES.md", "hosted at acme-corp\n");
+    lab.mirror_upstream_trunk_to_origin();
+    lab.branch("feat/alpha", "alpha.py", "# plain\n");
+    lab.upstream_trunk_file("NOTES.md", "hosted elsewhere\n");
+    let mut entry = origin_entry(&lab);
+    entry.forbidden = vec!["acme-corp".to_owned()];
+
+    // When: the audit scans the branch.
+    let report = gather_with(&lab, &entry, None);
+
+    // Then: the trunk's own line is never the branch's addition: zero hits.
+    let alpha = row(&report, "feat/alpha");
+    assert_eq!(
+        alpha.forbidden.as_deref(),
+        Some(&[][..]),
+        "the trunk's line was charged to the branch: {alpha:?}"
+    );
+    assert!(
+        !report
+            .problems
+            .iter()
+            .any(|problem| problem.contains("forbidden")),
+        "was: {:?}",
+        report.problems
+    );
+}
+
+#[test]
+fn many_branches_are_scanned_in_parallel_with_one_row_each() {
+    // Given: four branches — two naming the term, one clean, one fork-only that
+    // names it — scanned across four threads.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.py", "# wired for acme-corp's IaC\n");
+    lab.branch("feat/beta", "beta.py", "# plain\n");
+    lab.branch(
+        "feat/gamma",
+        "gamma.py",
+        "print(\"Acme-Corp\")\nx = 1\ny = \"acme-corp\"\n",
+    );
+    lab.branch("feat/delta", "delta.py", "# acme-corp internal\n");
+    let mut entry = origin_entry(&lab);
+    entry.forbidden = vec!["acme-corp".to_owned()];
+    let fork = lab::lab_fork(&lab, "demo", &entry);
+    let state = tempfile::tempdir().expect("state");
+    let mut store = Store::open_for_update(state.path().join("state.json")).expect("store");
+    store.mark_fork_only(
+        &BranchTarget::new(RepoName::new("demo"), BranchName::new("feat/delta")),
+        "test",
+    );
+
+    // When: the audit gathers.
+    let report = audit::gather(&audit::AuditInput {
+        fork: &fork,
+        store: &store,
+        forge: None,
+        cache_root: None,
+        workers: 4,
+    });
+
+    // Then: one row per branch in bookmark order, each with its own answer.
+    let names: Vec<&str> = report
+        .branches
+        .iter()
+        .map(|row| row.branch.as_str())
+        .collect();
+    assert_eq!(
+        names,
+        ["feat/alpha", "feat/beta", "feat/delta", "feat/gamma"]
+    );
+    let lines = |branch: &str| -> Option<Vec<usize>> {
+        row(&report, branch)
+            .forbidden
+            .as_ref()
+            .map(|hits| hits.iter().map(|hit| hit.line).collect())
+    };
+    assert_eq!(lines("feat/alpha"), Some(vec![1]));
+    assert_eq!(lines("feat/beta"), Some(Vec::new()));
+    assert_eq!(lines("feat/gamma"), Some(vec![1, 3]));
+    assert_eq!(lines("feat/delta"), None, "fork-only is exempt");
+    assert!(
+        !report
+            .problems
+            .iter()
+            .any(|problem| problem.contains("forbidden")),
+        "was: {:?}",
+        report.problems
+    );
 }
 
 #[test]
@@ -1050,31 +1201,19 @@ fn audit_without_github_still_reports_local_branch_facts() {
     lab.push_branch("feat/alpha");
     lab.branch("feat/beta", "beta.txt", "beta\n");
     let entry = origin_entry(&lab);
-    let fork = lab::lab_fork(&lab, "demo", &entry);
-    let state = tempfile::tempdir().expect("state");
-    let store = Store::open(state.path().join("state.json")).expect("store");
 
-    let report = audit::gather(&audit::AuditInput {
-        fork: &fork,
-        store: &store,
-        forge: None,
-        cache_root: None,
-    });
+    // When: the audit gathers without a forge.
+    let report = gather_with(&lab, &entry, None);
 
+    // Then: the local facts are on every row, no row has pull facts, and the
+    // skipped reconciliation is a problem.
     assert!(!report.branches.is_empty());
-    let row = |name: &str| {
-        report
-            .branches
-            .iter()
-            .find(|row| row.branch == name)
-            .expect(name)
-    };
     assert_eq!(
-        row("feat/alpha").tip,
-        commit_at(&lab, "feat/alpha").as_str()
+        row(&report, "feat/alpha").tip,
+        commit_at(&lab, "feat/alpha")
     );
-    assert_eq!(row("feat/alpha").tip_matches_origin, Some(true));
-    assert_eq!(row("feat/beta").tip_matches_origin, None);
+    assert_eq!(row(&report, "feat/alpha").tip_matches_origin(), Some(true));
+    assert_eq!(row(&report, "feat/beta").tip_matches_origin(), None);
     for row in &report.branches {
         assert!(row.pull.is_none(), "no forge, no pull facts: {row:?}");
     }

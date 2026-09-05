@@ -80,7 +80,7 @@ neither the trunk nor a release name. In `--json` that is `branches`, each row s
     "head": "<headRefOid>", "head_matches_tip": true,
     "mergeable": "MERGEABLE" | "CONFLICTING" | "UNKNOWN" | null,
     "merge_state_status": "CLEAN" | "BEHIND" | "DIRTY" | "BLOCKED" | "UNSTABLE" | "UNKNOWN" | null,
-    "review_decision": "APPROVED" | "CHANGES_REQUESTED" | "REVIEW_REQUIRED" | "",
+    "review_decision": "APPROVED" | "CHANGES_REQUESTED" | "REVIEW_REQUIRED" | null,
     "checks": { "total": 13, "pending": 0, "conclusions": { "SUCCESS": 11, "ACTION_REQUIRED": 2 } } | null,
     "unresolved_review_threads": 2 | null,
     "template": { "file": ".github/pull_request_template.md", "headings": ["Overview", …], "missing_from_body": ["Approach"] } | null
@@ -96,21 +96,25 @@ branch and `tip_matches_origin` compares the two (`null` when origin has no such
 the open pull request the forge answered for the branch, with `head` the pull request's head
 commit and `head_matches_tip` whether that is the local tip; `mergeable` and
 `merge_state_status` are the forge's own words and `null` when it has not computed them;
-`review_decision` is empty when the forge reports none. `checks` counts the check runs on the
+`review_decision` is `null` when the forge reports none. `checks` counts the check runs on the
 pull request's head: `total`, `pending` (no conclusion yet), and a `conclusions` histogram keyed
 by the forge's upper-case conclusion (`ACTION_REQUIRED` is a workflow held for a maintainer's
-approval, so nothing of it ran); `null` when the forge answered no checks.
+approval, so nothing of it ran); `null` when the forge did not answer the checks field; a head
+with no check runs is `total: 0`.
 `unresolved_review_threads` is the count of review threads not marked resolved, `null` when the
 forge did not answer or the thread list was longer than one page. `template` reads the
 pull-request template at the upstream trunk once per run: its `file`, its `headings`, and the
 ones with no matching heading in the pull request body (`missing_from_body`); `null` when the
-trunk has no template or the body was not answered. `forbidden` is every line the branch adds
-over the upstream trunk (`jj diff --git --from <trunk>@upstream --to <branch>`, added lines
-only) that contains one of the registry entry's `forbidden` terms as a case-insensitive
-substring, each hit as `{file, line, term, text}`.
+trunk has no template or the body was not answered; template and body headings inside an HTML
+comment or a fenced code block are not headings. `forbidden` is every line the branch adds over
+its fork point with the upstream trunk (`jj diff --git --context 0 --from
+"fork_point(<trunk>@upstream | <branch>)" --to <branch>`, added lines only) that contains one of
+the registry entry's `forbidden` terms as a case-insensitive substring, each hit as `{file, line,
+term, text}`.
 
-Every field is an observation and `null` means unobserved. The rows never move the exit code: it
-is the findings' alone. `--no-github` leaves `pull` absent on every row and reports `open
+Every field is an observation and `null` means unobserved. The rows never move the exit code;
+findings and problems do — a branch whose diff or template could not be read is a `problems` line
+and therefore exit 3. `--no-github` leaves `pull` absent on every row and reports `open
 pull-head reconciliation was skipped (--no-github)` as a problem. The text report prints the rows as a `branches:` block, one line
 per branch: `<branch>  tip <short>  origin same|differs|absent  [fork-only]  pr #N STATE
 mergeable=… state=… review=… head=matches|differs | no-pr  checks <total> (<CONCLUSION count>, …;
@@ -260,7 +264,7 @@ The facts you need before contributing upstream: convention files present and wh
 
 `start` claims the branch and opens a jj workspace for it. A branch that already exists — locally, or on one of our remotes (`origin`, the publish remote) after the fetch — is continued from its tip; a name that exists only on `upstream` is somebody else's branch, and a fork branch of that name is new here: the workspace's `@` is an empty child of the branch tip, so your next commit is the branch's next commit (`jj bookmark set <branch> -r @` when you want the bookmark to follow, or `jj squash` into it). A divergent bookmark has no one tip to continue from; `start` refuses and names the tips so you can `jj bookmark set` one first. A new branch starts on the release's shared base (or the fetched upstream trunk when no release exists) rather than wherever `@` happens to be. The shared base is where every member forks from, so a branch started there composes into the release without dragging newer upstream into the cut; moving the whole release to a newer trunk is `knives release rebase`, an intentional decision of its own, never a side effect of starting a branch. An agent sitting in a release workspace who runs `jj new` silently inherits the release merge as a parent, which is why `@` is never used.
 
-Every command that writes a claim — `start`, `finish`, `track`, `depends` — takes one lock on the claim store, and waits for it: up to a minute, with pauses that double from 20 ms to a 2 s ceiling under jitter, so a wave of concurrently dispatched `start`s serialises instead of failing. A `start` that pauses is waiting for another agent's command; let it. A wait that gives up names the holder — `another knives command (pid 4242, holding for 73s) is holding <path>; try again in a moment`, or `(holder unknown)` for a lock file without a pid — and exits `3`. A lock whose holder is not running is refused at once instead of waited on: `<path> is held by pid 4242, which is not running (lock written 73s ago); remove the lock file to proceed`. knives never removes that file itself, since a reused pid could belong to a live holder.
+Every command that writes a claim — `start`, `finish`, `track`, `depends` — takes one lock on the claim store, and waits for it: up to a minute, with pauses that double from 20 ms to a 2 s ceiling under jitter, so a wave of concurrently dispatched `start`s serialises instead of failing. A `start` that pauses is waiting for another agent's command; let it. A wait that gives up names the holder — `another knives command (pid 4242, holding for 73s) is holding <path>; try again in a moment`, or `another knives command (holder unknown, lock written 73s ago) is holding <path>; try again in a moment` for a lock file without a pid — and exits `3`. A lock whose holder is not running is refused at once instead of waited on: `<path> is held by pid 4242, which is not running (lock written 73s ago); knives does not remove it`. knives never removes that file itself, since a reused pid could belong to a live holder.
 
 `start` also states the fork's `immutable_heads()` — trunk and tags, with the trunk named on every knives remote — in the repository's own jj config when that config states none, and prints `jj immutable_heads() written to <repo>'s repository config: <rule>` when it does, adding `(shadows the user-level rule <rule> here)` when jj's user layer stated one. jj's default rule adds `untracked_remote_bookmarks()`, which in a fork are superseded release cuts a fetch re-materialized and other forks' pull request heads. The write is jj's table form with a `doc` naming knives, so a later `start` refreshes knives' own rule when the entry changes (`refreshed in` instead of `written to`) and leaves a rule a human stated alone; `status` reports either when it differs.
 
@@ -431,7 +435,7 @@ A branch forks from the release's shared base (the trunk point its members share
 #### Release subcommands and options
 
 - `knives release cut [NAME] [--allow-drop]`: audits a candidate cut of the composition in hand — the previous release's parents carried verbatim (by commit id, so a member whose bookmark has since become divergent is still carried and never read as dropped), nothing joining and nothing advancing — and names it only when the audit passes: each member's net diff, measured from the members' fork point with the upstream trunk, must be present in the cut tree. Divergence the previous release already carried (a recorded conflict resolution) is reported as carried forward, never refused. A failed audit writes nothing at all; a passing one creates and names the release as one operation. Only the first cut, with no composition to carry, starts from every branch. The orphan gate refuses a cut that would strand commits reachable only from the previous lineage; `--allow-drop` overrides it.
-- Before the audit, a cut whose tree equals the previous cut as the publish remote holds it is refused: `refusing to cut <name>: identical to release/<previous>@<publish remote> (<commit>); nothing to cut`, exit `3`, nothing created. A new name would ship nothing and only ask consumers to re-pin; a branch enters through `include`, members move with `advance`, the base with `rebase`. The comparison is against the *published* copy (the candidate is a duplicate of the in-hand previous release, so their trees always match locally); a previous cut not yet pushed has no consumer to protect and is not compared.
+- After the orphan gate and before the content audit, a cut with the same tree and the same parents as the previous cut on the publish remote is refused: `<repo>: refusing to cut <name>: identical to release/<previous>@<publish remote> (<commit>); nothing to cut`, exit `3`, nothing created. A new name would ship nothing and only ask consumers to re-pin; a branch enters through `include`, members move with `advance`, the base with `rebase`. A member rewritten with the same content (a `jj describe`, a rebuild) is a different parent, so a cut of it is a new composition and lands. The comparison is against the *published* copy (the candidate is a duplicate of the in-hand previous release, so its tree and parents always match locally); a previous cut not yet pushed has no consumer to protect and is not compared.
 - The composition gate: before publishing, the candidate is held against the previous cut's ledger event — the only record of a parent set that survives the release bookmark moving. A recorded member the candidate does not carry (not a parent, not an ancestor of one, and its net diff absent from the candidate tree) refuses the cut and is named, whether it vanished through a hand-rebuilt merge, an out-of-band bookmark move, or a `drop` since the last cut; a member that landed upstream and entered through the base passes without comment. `--allow-drop` states the drop is intended, and the new cut's event records exactly which members were dropped. A recorded commit the repository cannot resolve counts as dropped — unverifiable must not read as carried.
 - `knives release reap`: reaps superseded dated release bookmarks by forgetting their refs locally and across tracking remotes, then abandoning their merge commits. Reaping also runs automatically after every successful dated cut and never modifies remote repositories. While the live cut still carries unresolved conflicts, every superseded cut is kept: the previous release is the only record of how those conflicts were last resolved, and an abandon-and-recut needs it. A superseded cut something outside the release refs still pins — a tag, an untracked remote bookmark — has its refs forgotten and its commit kept, reported as `reaped <name> (refs forgotten everywhere; commit kept, <commit> still pinned by <pin>)` and exits `0`: that is the expected outcome for a tagged release, with nothing left to act on. A superseded cut with local descendants (someone's stacked work) is kept untouched and exits `1`.
 - `knives release rebase [REF]`: the equivalent of `jj rebase -b <release> -d <REF>`. Bare, it asks the forge which of our pull requests merged (merged, not closed) and targets the first upstream trunk commit that contains every one of their merge commits — the point past which nothing merged is missing from the members' shared history; with nothing merged there is no default, and it asks for a commit. Every member branch's commits move onto the target and the release merge moves with them, bookmarks and workspaces following; recorded conflict resolutions replay as ordinary rebase semantics. After a bare rebase (or a bare run that finds the release already at its target), members whose pull requests landed and whose branches carry nothing past the target are dropped, the reason recorded on the release; `--no-drop` keeps them, and a branch with work past its pull is kept and says so. An unheld stale parent refuses with `Incomplete`, naming the branch that continues it (by ancestry or change id) and `knives release advance` as the way to move the member first, or `drop` when no branch continues it; a legacy trunk parent is shed on the way through, since the base is never a parent. A merged pull request whose merge commit is not in the local trunk view also refuses — `knives sync` first. A composition whose every member has landed refuses to rebase (the trunk would become its only parent) and refuses to drop its last parent: reap it or include new work.
@@ -559,10 +563,11 @@ scan refuses (`HOME is not set; knives scans $HOME for checkouts`, exit `2`) rat
     relative value is taken from the config directory, so write it as `~/…`. A value inside the
     checkout is refused by `knives start` and `finish`, the two verbs that use it.
   - `forbidden`: identifiers an upstream-bound diff must not add — your org, your product, your
-    hosts. `knives audit` reports every line a branch adds over the upstream trunk that contains
-    one as a case-insensitive substring, per branch as `forbidden` hits; a branch stated
-    `--fork-only` is exempt. Absent or empty, no scan runs and the rows carry no `forbidden`
-    field. Nothing else reads it: knives reports the hits and never blocks on them.
+    hosts. `knives audit` reports every line a branch adds over its fork point with the upstream
+    trunk that contains one as a case-insensitive substring, per branch as `forbidden` hits; a
+    branch stated `--fork-only` is exempt. A blank term, or a term listed twice in any case, is
+    refused on load with the entry named. Absent or empty, no scan runs and the rows carry no
+    `forbidden` field. Nothing else reads it: knives reports the hits and never blocks on them.
 
 - `[trust]`: which repositories' instructions the hook injects. A fork entry grants none of this; a fork whose `AGENTS.md` you want injected needs a `[trust]` rule too.
   - `repos`: array of forge slugs (`owner/repo`); a checkout any of whose remotes names that repository is trusted, wherever it is cloned. A value that is not a slug is refused on load.

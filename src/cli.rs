@@ -533,7 +533,7 @@ pub enum ReleaseAction {
         #[arg(long)]
         census: bool,
         /// Skip pull request lookups during a census; the orphan test then reports unknown.
-        #[arg(long, requires = "census")]
+        #[arg(long, requires = "census", conflicts_with_all = ["reference", "verify", "carries"])]
         no_github: bool,
     },
     /// Reap superseded dated cuts: forget their bookmarks everywhere, abandon their commits.
@@ -676,6 +676,40 @@ mod tests {
                 "failed to parse {argv:?}"
             );
         }
+    }
+
+    #[test]
+    fn members_keeps_the_census_apart_from_a_target_a_replay_and_a_revision() {
+        // Given: the parser is asked for two of the `members` questions at once,
+        // or for `--no-github` beside anything but `--census`.
+        let rejected: Vec<Vec<&str>> = vec![
+            vec!["knives", "release", "members", "--verify", "--carries", "x"],
+            vec!["knives", "release", "members", "--verify", "--census"],
+            vec!["knives", "release", "members", "r", "--census"],
+            vec!["knives", "release", "members", "--carries", "x", "--census"],
+            vec!["knives", "release", "members", "--no-github"],
+            vec![
+                "knives",
+                "release",
+                "members",
+                "--carries",
+                "x",
+                "--no-github",
+            ],
+            vec!["knives", "release", "members", "--verify", "--no-github"],
+            vec!["knives", "release", "members", "r", "--no-github"],
+        ];
+        for argv in rejected {
+            // Then: clap refuses rather than letting the dispatcher pick one.
+            assert!(
+                Cli::try_parse_from(&argv).is_err(),
+                "parsed an incompatible members invocation: {argv:?}"
+            );
+        }
+        assert!(
+            Cli::try_parse_from(["knives", "release", "members", "--census", "--no-github"])
+                .is_ok()
+        );
     }
 
     #[test]

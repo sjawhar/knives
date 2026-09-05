@@ -971,23 +971,12 @@ fn tip_commit_empty(tip: &RollupHolder) -> Option<bool> {
     parent.tree.as_ref().map(|parent| tree.oid == parent.oid)
 }
 
-fn details_from(payload: &FactsPayload) -> Result<PullDetails, ForgeError> {
-    let newest_review = payload
-        .reviews
-        .iter()
-        .flat_map(|list| list.nodes.iter())
-        .filter_map(|review| review.submitted_at.as_deref())
-        .max();
-    let newest_commit = payload
-        .commits
-        .iter()
-        .flat_map(|list| list.nodes.iter())
-        .map(|node| node.commit.committed_date.as_str())
-        .max();
-    let review_predates_head = match (newest_review, newest_commit) {
-        (Some(review), Some(commit)) => Some(review < commit),
-        _ => None,
-    };
+/// The check runs on the pull request's head: whatever ran, then whatever the
+/// forge refused to start. A gated workflow has no check run to appear in the
+/// rollup, so without the suites an approval-gated pull request reads as green
+/// on its one unconditional check. A second page of either is refused: a
+/// truncated list would read as fewer checks than there are.
+fn check_runs(payload: &FactsPayload) -> Result<Vec<CheckRun>, ForgeError> {
     let tip_commits = || {
         payload
             .rollup
@@ -1018,10 +1007,6 @@ fn details_from(payload: &FactsPayload) -> Result<PullDetails, ForgeError> {
             ),
         });
     }
-
-    // Whatever ran, then whatever the forge refused to start. A gated workflow
-    // has no check run to appear in the rollup, so without the suites an
-    // approval-gated pull request reads as green on its one unconditional check.
     let mut runs: Vec<CheckRun> = tip_commits()
         .filter_map(|tip| tip.rollup.as_ref())
         .filter_map(|rollup| rollup.contexts.as_ref())
@@ -1034,7 +1019,31 @@ fn details_from(payload: &FactsPayload) -> Result<PullDetails, ForgeError> {
             .flat_map(|suites| suites.nodes.iter())
             .filter_map(CheckSuiteNode::gated_workflow),
     );
-    let checks = Some(ChecksSummary { runs });
+    Ok(runs)
+}
+
+/// One pull request's facts from its batch payload, which is consumed so the
+/// body and the summary move rather than copy.
+fn facts_from(payload: FactsPayload) -> Result<PullFacts, ForgeError> {
+    let newest_review = payload
+        .reviews
+        .iter()
+        .flat_map(|list| list.nodes.iter())
+        .filter_map(|review| review.submitted_at.as_deref())
+        .max();
+    let newest_commit = payload
+        .commits
+        .iter()
+        .flat_map(|list| list.nodes.iter())
+        .map(|node| node.commit.committed_date.as_str())
+        .max();
+    let review_predates_head = match (newest_review, newest_commit) {
+        (Some(review), Some(commit)) => Some(review < commit),
+        _ => None,
+    };
+    let checks = Some(ChecksSummary {
+        runs: check_runs(&payload)?,
+    });
     let diff = match (payload.additions, payload.deletions, payload.changed_files) {
         (Some(additions), Some(deletions), Some(changed_files)) => Some(DiffTotals {
             additions,
@@ -1069,14 +1078,32 @@ fn details_from(payload: &FactsPayload) -> Result<PullDetails, ForgeError> {
                 .filter(|thread| !thread.is_resolved)
                 .count()
         });
-    Ok(PullDetails {
-        review_predates_head,
-        checks,
-        diff,
-        head_ref_deleted,
-        tip_commit_empty,
-        body: payload.body.clone(),
-        unresolved_review_threads,
+    let newest_comment = payload
+        .reviews
+        .iter()
+        .flat_map(|list| list.nodes.iter())
+        .filter_map(|review| review.submitted_at.as_deref())
+        .chain(
+            payload
+                .comments
+                .iter()
+                .flat_map(|list| list.nodes.iter())
+                .map(|comment| comment.created_at.as_str()),
+        )
+        .max()
+        .map(str::to_owned);
+    Ok(PullFacts {
+        pull: payload.pull,
+        details: PullDetails {
+            review_predates_head,
+            checks,
+            diff,
+            head_ref_deleted,
+            tip_commit_empty,
+            body: payload.body,
+            unresolved_review_threads,
+        },
+        newest_comment,
     })
 }
 
@@ -1107,30 +1134,8 @@ pub fn parse_pull_facts(
     };
     let mut facts = BTreeMap::new();
     for payload in repository.into_values().flatten() {
-        let details = details_from(&payload)?;
-        let newest_comment = payload
-            .reviews
-            .iter()
-            .flat_map(|list| list.nodes.iter())
-            .filter_map(|review| review.submitted_at.as_deref())
-            .chain(
-                payload
-                    .comments
-                    .iter()
-                    .flat_map(|list| list.nodes.iter())
-                    .map(|comment| comment.created_at.as_str()),
-            )
-            .max()
-            .map(str::to_owned);
         let number = payload.pull.number;
-        let _ = facts.insert(
-            number,
-            PullFacts {
-                pull: payload.pull,
-                details,
-                newest_comment,
-            },
-        );
+        let _ = facts.insert(number, facts_from(payload)?);
     }
     Ok(facts)
 }

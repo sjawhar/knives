@@ -309,7 +309,7 @@ knives notch [SUBJECT]         read what happened here (bare: newest 20 human no
                                folded machine-event count; a subject: its whole chronology);
                                -m writes a note, --disposition requires --evidence
 knives release [NAME]          plan, cut, edit or reap a release under the configured scheme
-knives release cut [NAME]      name a new cut of the composition in hand, verbatim (first cut: every branch); refuses a candidate identical to the previous cut as published, refuses to orphan commits or to silently drop members the previous cut's ledger event recorded ([--allow-drop] overrides the last two); never pushes
+knives release cut [NAME]      name a new cut of the composition in hand, verbatim (first cut: every branch); refuses to orphan commits or to silently drop members the previous cut's ledger event recorded ([--allow-drop] overrides both), and refuses a candidate with the same tree and the same parents as the previous cut on the publish remote; never pushes
 knives release reap            reap superseded dated release bookmarks everywhere locally and abandon their commits; all kept while the live cut carries conflicts
 knives release include BRANCH  add a branch (or revision) to the release as one new parent; nothing else moves
 knives release drop BRANCH     remove a branch's parent from the release; the branch and its bookmark are untouched
@@ -340,15 +340,15 @@ The report also carries `branches`, one row of facts per maintained branch (ever
 that is neither the trunk nor a release name): `tip`, `origin_tip` and `tip_matches_origin`
 (`null` when origin has no ref), `fork_only` (what `knives track --fork-only` stated), a `pull`
 object when an open pull request answered for the branch — `number`, `state`, `url`, `head`,
-`head_matches_tip`, `mergeable`, `merge_state_status`, `review_decision`, `checks` (`total`,
-`pending`, a `conclusions` histogram), `unresolved_review_threads`, and `template` (the upstream
-trunk's pull-request template `file`, its `headings`, and the ones `missing_from_body`) — and
-`forbidden`, the added lines of the branch's diff over the upstream trunk that contain a term the
-entry's `forbidden` key names, each as `{file, line, term, text}`. `pull` is absent when no open
-pull request answered (always under `--no-github`); `forbidden` is absent when the entry
-configures no terms, the branch is fork-only, or the diff could not be read (a `problems` line
-names the branch). Every field is an observation and `null` means unobserved; the facts never
-move the exit code.
+`head_matches_tip`, `mergeable`, `merge_state_status`, `review_decision` (`null` when the forge
+reports none), `checks` (`total`, `pending`, a `conclusions` histogram), `unresolved_review_threads`,
+and `template` (the upstream trunk's pull-request template `file`, its `headings`, and the ones
+`missing_from_body`) — and `forbidden`, every line the branch adds over its fork point with the
+upstream trunk that contains a term the entry's `forbidden` key names, each as `{file, line, term,
+text}`. `pull` is absent when no open pull request answered (always under `--no-github`);
+`forbidden` is absent when the entry configures no terms, the branch is fork-only, or the diff
+could not be read (a `problems` line names the branch). Every field is an observation and `null`
+means unobserved; the facts never move the exit code.
 
 `knives notch` has two moods, split by `-m`: bare it reads, `-m` writes.
 Reading is intentional and nothing injects notches into a session, so the bare form returns the
@@ -392,7 +392,7 @@ Workspaces are effectively free: 0.15 to 0.55s to create, because tracked conten
 
 `knives start` bases new work on the release's **shared base** when a release exists, falling back to the fetched trunk when none does, never on the current `@`. The shared base is the trunk point every member forks from, so a branch started there composes into the release without dragging newer upstream into the cut. Moving the composition to a newer trunk is `knives release rebase`: an intentional, separate decision, never a side effect of starting a branch. Never `@`, because an agent in a release workspace who runs `jj new` would inherit the release merge as a parent.
 
-Every claim writer (`start`, `finish`, `track`, `depends`, …) takes one lock on the claim store and waits up to 60 s for it, with pauses that double from 20 ms to a 2 s ceiling under uniform jitter, so a wave of concurrently dispatched `start`s serialises; the lock file holds the holder's pid. A wait that gives up names the holder's pid and how long it has held the lock (or that the holder is unknown, for a lock file without a pid), and a lock whose pid is not running is refused at once rather than waited on, naming the pid, the lock's age, and the lock file to remove. The sidecar locks — sightings, the hook's session state — wait one second (20 ms doubling to a 200 ms ceiling): a stale one must never stall a hook event.
+Every claim writer (`start`, `finish`, `track`, `depends`, …) takes one lock on the claim store and waits up to 60 s for it, with pauses that double from 20 ms to a 2 s ceiling under uniform jitter, so a wave of concurrently dispatched `start`s serialises; the lock file holds the holder's pid. A wait that gives up names the holder's pid and how long it has held the lock (`another knives command (pid 4242, holding for 73s) is holding <path>; try again in a moment`), or, for a lock file without a pid, that the holder is unknown and how old the file is (`another knives command (holder unknown, lock written 73s ago) is holding <path>; try again in a moment`). A lock whose pid is not running is refused at once rather than waited on, stating the pid, the lock's age, and that knives leaves the file in place: `<path> is held by pid 4242, which is not running (lock written 73s ago); knives does not remove it`. The sidecar locks — sightings, the hook's session state — wait one second (20 ms doubling to a 200 ms ceiling): a stale one must never stall a hook event.
 
 `knives start` also states the fork's `immutable_heads()` (detector 11 has the rule and why) in the repository's own jj config when that config states none, refreshes the one it wrote earlier when the entry's rule has changed, and says so on stdout — naming a user-level rule the write now shadows, when there is one. knives' own library-side rewrites (`describe`, `abandon`, reap) keep jj's default pin set on purpose: a rebase may move a member out from under a stale ref; knives never rewrites what a remote still names.
 
@@ -429,7 +429,7 @@ beyond one. `--verify` replays every member's content into the release, reports 
 unexplained audit buckets, and makes either bucket a finding. Parent counts come from the
 repository's parent list, not text that happens to look like a parent declaration.
 
-Before the audit runs, a cut is refused (exit `3`) when its tree equals the previous cut's as the publish remote holds it: the candidate is built by duplicating the in-hand previous release onto the same parents, so its tree always matches the local previous release, and the published copy is the one consumers can pin; a previous cut not yet pushed is not compared.
+After the orphan gate and before the content audit, a cut is refused (exit `3`) when it has the same tree and the same parents as the previous cut on the publish remote: the candidate is built by duplicating the in-hand previous release onto the same parents, so its tree and parents always match the local previous release, and the published copy is the one consumers can pin. A member rewritten with the same content is a different parent, so a cut of it is a new composition and lands; a previous cut not yet pushed is not compared.
 
 Every mutating verb applies as **one jj operation**, written through jj-lib in a single transaction and described in the operation log as knives' own act (`knives: release/X: included feat/y`, `knives: cut release/X`, `knives: reap …`) rather than as a trail of raw `jj` invocations. Failure before the commit writes nothing, so a half-applied edit is unconstructible. A cut audits a **candidate** built in a scratch transaction that is never committed: a failed audit evaporates without a trace, and a passing one rebuilds the spec, verifies the published tree is identical to the audited one, and creates-and-names the release in one operation. Git refs are exported in the same step, so `git` and `gh` in a colocated checkout see the result immediately. Rewrites honor jj's stock `immutable_heads()` (trunk, tags, untracked remote bookmarks) — the reap flow depends on that refusal. Identity for written commits resolves the way the jj CLI resolves it (`JJ_USER`/`JJ_EMAIL`, repo config, user config); every behavioral setting stays at jj's defaults. Only `jj git fetch` and the composition rebase (`release rebase`, defined as `jj rebase -b <release> -d <target>`) remain subprocess calls, deliberately (#18).
 

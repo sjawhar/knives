@@ -5,7 +5,7 @@ use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
-use crate::store::StoreLock;
+use crate::store::{LockWait, StoreLock};
 
 const SESSIONS_DIRECTORY: &str = "hook-sessions";
 const PRUNE_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
@@ -48,7 +48,7 @@ impl SessionState {
     ) -> anyhow::Result<Self> {
         let directory = session_directory(home);
         let path = state_path(&directory, harness, session_id);
-        let _lock = StoreLock::acquire(&path)?;
+        let _lock = StoreLock::acquire(&path, LockWait::BRIEF)?;
         let mut state = Self::load_path(&path);
         apply(&mut state);
         state.persist(&directory, &path)?;

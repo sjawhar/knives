@@ -200,8 +200,9 @@ cached results are labeled as such and the command is incomplete; pass `--consum
 ad-hoc local scan without recording the path.
 
 `forbidden` lists identifiers an upstream-bound diff must not add: your org, your product, your
-hosts. `knives audit` reports every line a branch adds over the upstream trunk that contains one,
-as a case-insensitive substring; a branch stated `--fork-only` is exempt. Absent, no scan runs.
+hosts. `knives audit` reports every line a branch adds over its fork point with the upstream trunk
+that contains one, as a case-insensitive substring; a branch stated `--fork-only` is exempt. A
+blank term or a term listed twice (case-insensitively) is refused on load. Absent, no scan runs.
 
 Every command takes its repo from the directory you are standing in, wherever that checkout
 lives. Name one only when you are somewhere else; knives then scans `~` three directories deep
@@ -215,7 +216,7 @@ reads `not on this machine`, and an entry with two is refused with both paths na
 | `knives repos` | what is managed, where each checkout was found (or `not on this machine`), the newest release each has cut, and whether registered forge consumers pin it |
 | `knives consumers [FORK] [--consumer PATH]...` | compare registered forge consumers and ad-hoc local scans with the newest release on the live publish remote; reports only |
 | `knives pushed [BRANCH]... [--repo REPO]` | compare local branches with the live remote refs that own them; reports only |
-| `knives audit [REPO] [--all] [--no-github]` | reconcile remote refs, open pull heads, recorded cuts, and anonymous heads; per branch: tip vs origin, pull mergeability / merge state / review decision, check-run counts on the head, unresolved review threads, PR-template headings missing from the body, configured `forbidden` identifiers in the diff over upstream trunk; reports only and never repairs |
+| `knives audit [REPO] [--all] [--no-github]` | reconcile remote refs, open pull heads, recorded cuts, and anonymous heads; per branch: tip vs origin, pull mergeability / merge state / review decision, check-run counts on the head, unresolved review threads, PR-template headings missing from the body, configured `forbidden` identifiers in the lines added over the branch's fork point with the upstream trunk; reports only and never repairs |
 | `knives status` | the main report |
 | `knives pr NUMBER [--repo REPO] [--timeline]` | one pull request's live state; `--timeline` adds its bounded forge event log |
 | `knives sync` | fetch, then classify what happened to each tracked pull request |
@@ -281,9 +282,9 @@ the cut `flat`.
 upstream trunk; `knives release members TARGET --carries REVISION` asks exactly one target;
 `knives release members --census` asks that of every maintained branch.
 
-Before any gate runs, a cut whose tree equals the previous cut as the publish remote holds it is refused: a new name would ship nothing and only ask consumers to re-pin. A previous cut not yet pushed has no consumer to protect and is not compared.
-
 Before cutting, the orphan gate verifies that no commits exist reachable only from the previous release lineage or its descendants; if commits would be stranded without a remaining bookmark or upstream trunk reaching them, the cut refuses and lists the exact commit IDs. Passing `--allow-drop` overrides this refusal when dropping those commits is intentional.
+
+Before the content audit runs, a cut with the same tree and the same parents as the previous cut on the publish remote is refused: a new name would ship nothing and only ask consumers to re-pin. A member rewritten with the same content is a new parent, so a cut of it is a new composition. A previous cut not yet pushed has no consumer to protect and is not compared.
 
 A second pre-publish gate holds the candidate against the previous cut's ledger event — the only record of a parent set that survives the release bookmark moving, since every edit relocates the name and the next cut reaps the superseded commit. A recorded member whose content the candidate does not carry (not a parent, not an ancestor of one, and its net diff absent from the candidate tree) refuses the cut and is named; a member that landed upstream and entered the candidate through its base passes without comment. `--allow-drop` states the drop is intended, and the new cut's ledger event then records exactly which members were dropped.
 

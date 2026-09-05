@@ -1364,11 +1364,14 @@ pub fn file_text(repo: &Path, revision: &str, file: &str) -> Result<Option<Strin
 
 /// The `--git` diff between two commits with no context lines, so every `+`
 /// line is an addition and hunk headers give exact new-file line numbers.
+///
+/// Decoded lossily: a branch that adds a Latin-1 or binary file is still a
+/// diff to scan, and a replacement character never completes a configured term.
 pub fn diff_git(repo: &Path, from: &str, to: &str) -> Result<String, JjError> {
     let repo_path = path(repo);
-    command(
+    command_output(
         "jj",
-        [
+        &[
             "--repository",
             repo_path.as_str(),
             "--ignore-working-copy",
@@ -1382,6 +1385,7 @@ pub fn diff_git(repo: &Path, from: &str, to: &str) -> Result<String, JjError> {
             to,
         ],
     )
+    .map(|(stdout, _)| stdout)
 }
 
 fn changed_files_for_diff_args(repo: &Path, diff_args: &[&str]) -> Result<Vec<String>, JjError> {
@@ -1725,10 +1729,14 @@ impl Candidate {
         commit_id(self.commit.id())
     }
 
-    /// Whether the candidate's tree is exactly `other`'s tree.
-    pub fn tree_matches(&self, other: &str) -> Result<bool, JjError> {
+    /// Whether the candidate is exactly `other`: the same tree on the same
+    /// parent commits. A rebuilt member with the same content is a different
+    /// parent, so a cut of it is a new composition even though nothing in the
+    /// tree changed.
+    pub fn matches(&self, other: &str) -> Result<bool, JjError> {
         let other = self.repo.commit(other)?;
-        Ok(other.tree_ids() == self.commit.tree_ids())
+        Ok(other.tree_ids() == self.commit.tree_ids()
+            && other.parent_ids() == self.commit.parent_ids())
     }
 
     pub fn parent_count(&self) -> usize {

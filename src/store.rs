@@ -167,32 +167,46 @@ impl LockWait {
     };
 }
 
-/// The process holding a lock, read from the lock file when a wait gives up
-/// or when the holder turns out to be gone.
+/// The lock file a wait gave up on, or whose holder turned out to be gone:
+/// the writer's pid when the file names one, and the file's age either way.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LockHolder {
-    pub pid: u32,
+    /// `None` for a lock file without a pid (an older binary's, or one still
+    /// being written).
+    pub pid: Option<u32>,
     pub held_for: Duration,
     /// `Some(false)` when the platform can say the pid is not running
-    /// (`/proc/<pid>` absent on Linux); `None` where it cannot.
+    /// (`/proc/<pid>` absent on Linux); `None` where it cannot, or without a pid.
     pub running: Option<bool>,
 }
 
 fn locked_message(path: &Path, holder: Option<&LockHolder>) -> String {
     match holder {
         Some(LockHolder {
-            pid,
+            pid: Some(pid),
             held_for,
             running: Some(false),
         }) => format!(
-            "{} is held by pid {pid}, which is not running (lock written {}s ago); remove the lock file to proceed",
+            "{} is held by pid {pid}, which is not running (lock written {}s ago); knives does not remove it",
             path.display(),
             held_for.as_secs()
         ),
-        Some(holder) => format!(
-            "another knives command (pid {}, holding for {}s) is holding {}; try again in a moment",
-            holder.pid,
-            holder.held_for.as_secs(),
+        Some(LockHolder {
+            pid: Some(pid),
+            held_for,
+            ..
+        }) => format!(
+            "another knives command (pid {pid}, holding for {}s) is holding {}; try again in a moment",
+            held_for.as_secs(),
+            path.display()
+        ),
+        Some(LockHolder {
+            pid: None,
+            held_for,
+            ..
+        }) => format!(
+            "another knives command (holder unknown, lock written {}s ago) is holding {}; try again in a moment",
+            held_for.as_secs(),
             path.display()
         ),
         None => format!(
@@ -233,15 +247,15 @@ fn pid_running(pid: u32) -> Option<bool> {
     }
 }
 
-/// The lock file's first token is the writer's pid; a file without one (an
-/// older binary's, or one still being written) has an unknown holder.
+/// The lock file's first token is the writer's pid; a file without one has an
+/// unknown holder but still an age. `None` only when the file itself cannot be
+/// read (removed between the failed create and this read).
 fn read_holder(path: &Path) -> Option<LockHolder> {
-    let pid = std::fs::read_to_string(path)
-        .ok()?
+    let text = std::fs::read_to_string(path).ok()?;
+    let pid: Option<u32> = text
         .split_whitespace()
-        .next()?
-        .parse()
-        .ok()?;
+        .next()
+        .and_then(|token| token.parse().ok());
     let held_for = std::fs::metadata(path)
         .ok()?
         .modified()
@@ -251,7 +265,7 @@ fn read_holder(path: &Path) -> Option<LockHolder> {
     Some(LockHolder {
         pid,
         held_for,
-        running: pid_running(pid),
+        running: pid.and_then(pid_running),
     })
 }
 
@@ -275,15 +289,10 @@ pub(crate) struct StoreLock {
 }
 
 impl StoreLock {
-    /// The best-effort wait: sidecar locks that must never stall a command.
-    pub(crate) fn acquire(target: &Path) -> Result<Self, StoreError> {
-        Self::acquire_with(target, LockWait::BRIEF)
-    }
-
     /// Beside the file it guards, named for that file's stem: `state.json` is
     /// guarded by `state.lock`. Waits per `wait`, then gives up loudly:
     /// blocking forever on a stale lock would be worse than saying so.
-    pub(crate) fn acquire_with(target: &Path, wait: LockWait) -> Result<Self, StoreError> {
+    pub(crate) fn acquire(target: &Path, wait: LockWait) -> Result<Self, StoreError> {
         let path = target.with_extension("lock");
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|source| StoreError::Write {
@@ -358,7 +367,7 @@ impl Store {
 
     /// [`Self::open_for_update`] with an explicit wait budget.
     fn open_for_update_with(path: PathBuf, wait: LockWait) -> Result<Self, StoreError> {
-        let lock = StoreLock::acquire_with(&path, wait)?;
+        let lock = StoreLock::acquire(&path, wait)?;
         Self::read(path, Some(lock))
     }
 
@@ -899,7 +908,7 @@ mod lock_tests {
         else {
             panic!("expected a Locked error with a holder, got {error:?}");
         };
-        assert_eq!(holder.pid, std::process::id());
+        assert_eq!(holder.pid, Some(std::process::id()));
         assert!(holder.held_for < Duration::from_secs(5), "{holder:?}");
         let text = error.to_string();
         assert!(
@@ -910,16 +919,28 @@ mod lock_tests {
     }
 
     #[test]
-    fn a_lock_file_without_a_pid_reports_an_unknown_holder() {
+    fn a_lock_file_without_a_pid_reports_an_unknown_holder_and_the_locks_age() {
         let dir = tempfile::tempdir().expect("state dir");
         let path = dir.path().join("state.json");
         std::fs::write(path.with_extension("lock"), b"").expect("stale lock");
         let error = Store::open_for_update_with(path, QUICK).expect_err("locked");
+        let StoreError::Locked {
+            holder: Some(holder),
+            ..
+        } = &error
+        else {
+            panic!("expected a Locked error with an aged holder, got {error:?}");
+        };
+        assert_eq!((holder.pid, holder.running), (None, None));
+        assert!(holder.held_for < Duration::from_secs(5), "{holder:?}");
+        let text = error.to_string();
         assert!(
-            matches!(&error, StoreError::Locked { holder: None, .. }),
-            "{error:?}"
+            text.contains(&format!(
+                "holder unknown, lock written {}s ago",
+                holder.held_for.as_secs()
+            )),
+            "{text}"
         );
-        assert!(error.to_string().contains("holder unknown"), "{error}");
     }
 
     #[test]
@@ -969,11 +990,10 @@ mod lock_tests {
         else {
             panic!("{error:?}")
         };
-        assert_eq!((holder.pid, holder.running), (dead, Some(false)));
-        assert!(
-            error.to_string().contains("which is not running"),
-            "{error}"
-        );
+        assert_eq!((holder.pid, holder.running), (Some(dead), Some(false)));
+        let text = error.to_string();
+        assert!(text.contains("which is not running"), "{text}");
+        assert!(text.ends_with("knives does not remove it"), "{text}");
     }
 
     #[test]

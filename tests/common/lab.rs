@@ -144,6 +144,11 @@ impl Lab {
     }
 
     pub(crate) fn branch(&self, name: &str, file: &str, content: &str) {
+        self.branch_with_bytes(name, file, content.as_bytes());
+    }
+
+    /// [`Self::branch`] with content that need not be UTF-8.
+    pub(crate) fn branch_with_bytes(&self, name: &str, file: &str, content: &[u8]) {
         let origin_trunk = format!("{}@origin", self.trunk);
         jj(&self.work, ["new", "-r", &origin_trunk, "-m", name]);
         std::fs::write(self.work.join(file), content).expect("write branch content");
