@@ -150,12 +150,7 @@ impl Store {
     /// For a read-modify-write. Holds the lock until dropped, and waits the
     /// full claim-writer budget ([`LockWait::CLAIM`]) for another writer.
     pub fn open_for_update(path: PathBuf) -> Result<Self, StoreError> {
-        Self::open_for_update_with(path, LockWait::CLAIM)
-    }
-
-    /// [`Self::open_for_update`] with an explicit wait budget.
-    fn open_for_update_with(path: PathBuf, wait: LockWait) -> Result<Self, StoreError> {
-        let lock = FileLock::acquire(&path, wait)?;
+        let lock = FileLock::acquire(&path, LockWait::CLAIM)?;
         Self::read(path, Some(lock))
     }
 
@@ -651,32 +646,17 @@ mod tests {
     }
 
     #[test]
-    fn a_second_writer_waits_for_the_lock_and_a_reader_does_not() {
-        // Two claim writers that interleave read, decide and write would both
-        // see "unclaimed", both report success, and the second erase the
-        // first. The tool exists to make collisions visible, so its own
-        // record must not lose them.
-        let quick = LockWait {
-            deadline: std::time::Duration::from_millis(200),
-            floor: std::time::Duration::from_millis(5),
-            ceiling: std::time::Duration::from_millis(40),
-        };
+    fn a_reader_is_never_blocked_by_a_writer() {
+        // Reading cannot lose a write, so a held writer lock keeps out writers only.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.json");
-        let first = Store::open_for_update_with(path.clone(), quick).unwrap();
+        let writer = Store::open_for_update(path.clone()).unwrap();
 
-        let second = Store::open_for_update_with(path.clone(), quick);
-        assert!(
-            matches!(second, Err(StoreError::Lock(LockError::Held { .. }))),
-            "a second writer got in"
-        );
-
-        // A reader is never blocked: reading cannot lose a write.
         assert!(Store::open(path.clone()).is_ok());
 
-        drop(first);
+        drop(writer);
         assert!(
-            Store::open_for_update_with(path, quick).is_ok(),
+            Store::open_for_update(path).is_ok(),
             "the lock outlived its holder"
         );
     }

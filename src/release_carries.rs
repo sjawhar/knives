@@ -21,17 +21,13 @@ use knives::ledger::Ledger;
 
 use super::parallelism;
 
-#[derive(Clone, Copy)]
-pub(crate) struct MembersInvocation<'a> {
-    pub(crate) reference: Option<&'a str>,
-    pub(crate) verify: bool,
-    pub(crate) output: Output,
-}
-
-/// Inspect a release's direct parents and, on request, replay their content.
+/// Inspect a release's direct parents and, on request, replay their content:
+/// the release `reference` names, or the one in hand.
 pub(crate) fn run_release_members(
     fork: &Fork<'_>,
-    request: MembersInvocation<'_>,
+    reference: Option<&str>,
+    verify: bool,
+    output: Output,
 ) -> anyhow::Result<Exit> {
     let repo = &fork.name;
     let entry = fork.entry;
@@ -39,7 +35,7 @@ pub(crate) fn run_release_members(
     let forge = CliForge;
     let cache_root = knives::forge_cache::cache_root();
     let heads = knives::consumer_pins::ConsumerHeadMemo::default();
-    let reference = if let Some(reference) = request.reference {
+    let reference = if let Some(reference) = reference {
         std::borrow::Cow::Borrowed(reference)
     } else {
         let consumers = release::ConsumerInputs {
@@ -56,9 +52,9 @@ pub(crate) fn run_release_members(
         };
         std::borrow::Cow::Owned(reference)
     };
-    let report = release::gather_members(&opened, fork, &reference, request.verify)?;
-    let exit = members_exit(&report, request.verify);
-    print_members(&report, request.output)?;
+    let report = release::gather_members(&opened, fork, &reference, verify)?;
+    let exit = members_exit(&report, verify);
+    print_members(&report, output)?;
     Ok(exit)
 }
 
@@ -84,12 +80,6 @@ fn print_members(report: &release::MembersReport, output: Output) -> anyhow::Res
         println!("{}", release::render_members(report));
     }
     Ok(())
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CarriesMode {
-    Bare,
-    ExplicitTarget,
 }
 
 /// Census every maintained branch against the live releases and upstream trunk.
@@ -157,7 +147,6 @@ pub(crate) fn run_revision_carries(
         (trunk_name.as_str(), trunk),
         entry.publish_remote(),
     );
-    let mode = target.map_or(CarriesMode::Bare, |_| CarriesMode::ExplicitTarget);
     let (mut selected, superseded) = match target {
         Some(target) => match selected_carries_targets(&opened, &all_targets, target) {
             Ok(targets) => (targets, Vec::new()),
@@ -196,39 +185,32 @@ pub(crate) fn run_revision_carries(
         problems: Vec::new(),
     };
     checks.append(&mut report, selected);
-    let exit = carries_exit(&mut report, &checks, superseded, mode);
+    let exit = carries_exit(&mut report, &checks, superseded, target);
     print_carries(&report, output)?;
     Ok(exit)
 }
 
+/// The outcome: unanswered checks outrank everything; against an explicit
+/// `target` every check must carry; bare, a live release or the trunk must,
+/// with the superseded releases consulted only after those miss.
 fn carries_exit(
     report: &mut CarriesReport,
     checks: &CarriesChecks<'_>,
     superseded: Vec<Target>,
-    mode: CarriesMode,
+    target: Option<&str>,
 ) -> Exit {
     if !report.problems.is_empty() {
         return Exit::Incomplete;
     }
-    match mode {
-        CarriesMode::Bare => {
-            if !carries_safe(report) {
-                checks.append(report, superseded);
-            }
-            if carries_safe(report) {
-                Exit::Ok
-            } else {
-                Exit::Findings
-            }
+    let carried = if target.is_some() {
+        report.checks.iter().all(|check| check.verdict.carried())
+    } else {
+        if !carries_safe(report) {
+            checks.append(report, superseded);
         }
-        CarriesMode::ExplicitTarget => {
-            if report.checks.iter().all(|check| check.verdict.carried()) {
-                Exit::Ok
-            } else {
-                Exit::Findings
-            }
-        }
-    }
+        carries_safe(report)
+    };
+    if carried { Exit::Ok } else { Exit::Findings }
 }
 
 struct CarriesChecks<'a> {

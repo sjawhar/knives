@@ -289,9 +289,8 @@ knives pushed [BRANCH]... [--repo REPO]
                                compare local tips with the live remote refs that own them
 knives audit [REPO] [--all] [--no-github]
                                reconcile remote refs, open pull heads, recorded cuts, and
-                               anonymous heads; per branch: tip vs origin, release membership,
-                               pull merge state, checks, review threads, template headings,
-                               forbidden identifiers; reports only, never repairs
+                               anonymous heads, with one row of facts per maintained branch;
+                               reports only, never repairs
 knives sync [REPO|--all]       fetch all remotes and tracked pull/N/head refs; classify each
                                tracked PR as new | unchanged | advanced | merged | closed
 knives preflight [REPO]        programmatic pre-contribution facts (see below)
@@ -338,24 +337,12 @@ on-demand `knives pr <n> --timeline` read.
 
 The report also carries `branches`, one row of facts per maintained branch (every local bookmark
 that is neither the trunk nor a release name), and `template`, the upstream trunk's pull-request
-template (`file`, `headings`) once per report, `null` when the trunk has none or no forge was
-asked. Each row: `tip`, `origin_tip` and `tip_matches_origin` (`null` when origin has no ref),
-`fork_only` (what `knives track --fork-only` stated), `member_of` (every local release-name
-bookmark whose release commit has the tip as a direct parent; `[]` for a lone branch), a `pull`
-object when an open pull request answered for the branch — `number`, `url`, `head`,
-`head_matches_tip`, `mergeable`, `merge_state_status`, `review_decision` (`null` when the forge
-reports none), `checks` (`total`, `pending`, a `conclusions` histogram), `unresolved_review_threads`,
-and `template_missing` (the report's template headings the body lacks) — and `forbidden`, every
-line the branch adds over its fork point with the upstream trunk that contains a term the entry's
-`forbidden` key names, each as `{file, line, term, text}`; a branch sharing no history with the
-trunk is measured from the root, so its whole tree counts as added. `pull` is absent when no open
-pull request answered (always under `--no-github`); `forbidden` is absent when the entry configures
-no terms, the branch is fork-only, the diff could not be read (a `problems` line names the branch),
-or `<trunk>@upstream` cannot be resolved (one `problems` line, every scan skipped). A divergent
-(conflicted) bookmark has no single tip, so it has no row and one `problems` line names it. Every
-field is an observation and `null` means unobserved; the facts never move the exit code. The scans
-run on at most eight threads however wide the machine: several owners audit one checkout in the
-same minute.
+template once per report; the `using-knives` skill is the field list. Every field is an
+observation and `null` means unobserved; the facts never move the exit code. A divergent
+(conflicted) bookmark has no single tip: a branch gets a `problems` line instead of a row, a
+release-name bookmark gets its own `problems` line, and the trunk is `knives status`'s
+`divergence` finding, not the audit's. The forbidden-identifier scans run on at most eight threads
+however wide the machine: several owners audit one checkout in the same minute.
 
 `knives notch` has two moods, split by `-m`: bare it reads, `-m` writes.
 Reading is intentional and nothing injects notches into a session, so the bare form returns the
@@ -399,7 +386,7 @@ Workspaces are effectively free: 0.15 to 0.55s to create, because tracked conten
 
 `knives start` bases new work on the release's **shared base** when a release exists, falling back to the fetched trunk when none does, never on the current `@`. The shared base is the trunk point every member forks from, so a branch started there composes into the release without dragging newer upstream into the cut. Moving the composition to a newer trunk is `knives release rebase`: an intentional, separate decision, never a side effect of starting a branch. Never `@`, because an agent in a release workspace who runs `jj new` would inherit the release merge as a parent.
 
-Every claim writer (`start`, `finish`, `track`, `depends`, …) takes one lock on the claim store and waits for it with growing, jittered pauses, so a wave of concurrently dispatched `start`s serialises instead of failing; the `using-knives` skill has the wait budget, the pause figures and the refusal messages. The lock is the operating system's advisory lock on `state.lock` (`File::try_lock`, `flock` on Linux), held by the open handle and released by the kernel when the holder exits however it exits — SIGKILL, Ctrl-C, panic — so a stale lock cannot outlive a crashed writer and no dead-holder detection exists. The file is never unlinked: it is the inode every waiter locks, and a path delete after an unlock would put two waiters on two inodes, each holding "the" lock. The holder writes its pid into the file after acquiring, so a wait that gives up names the holder's pid and how long it has held, or, for a lock file without a pid, that the holder is unknown and how old the file is. `start` holds the lock across `fetch_all` and workspace creation, so a wave of N concurrent `start`s waits about N times one start's hold. A knives that takes this path by exclusive create and unlinks it on drop reads the persistent file as always held, and holds no OS lock while it runs, so this binary acquires beside it and its unlink leaves the two on two inodes; the two binaries must not run concurrently on one machine, hooks included. The sidecar locks — sightings, the hook's session state — wait a fraction of the claim budget: a stale one must never stall a hook event.
+Every claim writer (`start`, `finish`, `track`, `depends`, …) takes one lock on the claim store and waits for it with growing, jittered pauses, so a wave of concurrently dispatched `start`s serialises instead of failing; the `using-knives` skill states the lock's mechanism, the wait budget, the pause figures and the refusal messages. The lock is the kernel's advisory lock on `state.lock` (`File::try_lock`, `flock` on Linux), held by the open handle and gone with the holder's process. The file is never unlinked: it is the inode every waiter locks, and a path delete after an unlock would put two waiters on two inodes, each holding "the" lock. A knives that takes this path by exclusive create and unlinks it on drop reads the persistent file as always held, and holds no OS lock while it runs, so this binary acquires beside it and its unlink leaves the two on two inodes; the two binaries must not run concurrently on one machine, hooks included. The holder writes its pid into the file after acquiring; a refusal names it. `start` holds the lock across `fetch_all` and workspace creation, so a wave of N concurrent `start`s waits about N times one start's hold. The sidecar locks — sightings, the hook's session state — wait a fraction of the claim budget: a stale one must never stall a hook event.
 
 `knives start` also states the fork's `immutable_heads()` (detector 11 has the rule and why) in the repository's own jj config when that config states none, refreshes the one it wrote earlier when the entry's rule has changed, and says so on stdout — naming a user-level rule the write now shadows, when there is one. knives' own library-side rewrites (`describe`, `abandon`, reap) keep jj's default pin set on purpose: a rebase may move a member out from under a stale ref; knives never rewrites what a remote still names.
 

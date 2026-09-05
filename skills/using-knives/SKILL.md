@@ -67,11 +67,14 @@ the command never deletes refs, changes local bookmarks, pushes, repairs, or ope
 
 The report also carries one row of facts per maintained branch — every local bookmark that is
 neither the trunk nor a release name and has one target. A divergent (conflicted) bookmark has
-no single tip: it gets no row and one `problems` line, `bookmark <name> is divergent (<n>
-targets); no row`, so the exit is 3. In `--json` the rows are `branches`, and the report carries
-the upstream trunk's pull-request template once as `template` (`{ "file":
-".github/pull_request_template.md", "headings": ["Overview", …] }`, or `null` when the trunk has
-none or no forge was asked). Each row is shaped as:
+no single tip and is one `problems` line, so the exit is 3: a branch gets `bookmark <name> is
+divergent (<n> targets); no row` instead of a row; a release-name bookmark gets `release <name>
+is divergent (<n> targets)`, and its drift from the recorded cut goes unread until it is
+resolved; a divergent trunk is `knives status`'s `divergence` finding, not the audit's. In
+`--json` the rows are `branches`, and the report carries the upstream trunk's pull-request
+template once as `template` (`{ "file": ".github/pull_request_template.md", "headings":
+["Overview", …] }`, or `null` when the trunk has none or no forge was asked). Each row is shaped
+as:
 
 ```jsonc
 {
@@ -80,7 +83,6 @@ none or no forge was asked). Each row is shaped as:
   "origin_tip": "<full commit id>" | null,
   "tip_matches_origin": true | false | null,     // null: origin has no ref for the branch
   "fork_only": false,                              // stated with `knives track --fork-only`
-  "member_of": ["release/2026-09-05"],             // every local release whose commit has this tip as a direct parent; [] when lone
   "pull": {                                        // absent: no open pull request answered for this branch
     "number": 1426, "url": "https://…",
     "head": "<headRefOid>", "head_matches_tip": true,
@@ -99,8 +101,6 @@ none or no forge was asked). Each row is shaped as:
 
 What each field is: `tip` is the local bookmark's commit; `origin_tip` is where origin holds the
 branch and `tip_matches_origin` compares the two (`null` when origin has no such ref).
-`member_of` names every local release-name bookmark whose release commit has the row's tip as a
-direct parent, in bookmark order; a release whose parents cannot be read is a `problems` line.
 `pull` is the open pull request the forge answered for the branch, with `head` the pull request's
 head commit and `head_matches_tip` whether that is the local tip; `mergeable` and
 `merge_state_status` are the forge's own words and `null` when it has not computed them;
@@ -126,10 +126,10 @@ findings and problems do — a branch whose diff or template could not be read i
 and therefore exit 3. `--no-github` leaves `pull` absent on every row, `template` null, and
 reports `open pull-head reconciliation was skipped (--no-github)` as a problem. The text report
 prints the rows as a `branches:` block, one line per branch: `<branch>  tip <short>  origin
-same|differs|absent  [fork-only]  member of <release>[, …] | lone  pr #N mergeable=…
-merge_state=… review=… head=matches|differs | no-pr  checks <total> (<CONCLUSION count>, …;
-<pending> pending) | checks -  threads <n> unresolved | threads -  template none missing | template
-missing: A, B | template -  forbidden none | forbidden <N> hits: file:line term, … | forbidden -`.
+same|differs|absent  [fork-only]  pr #N mergeable=… merge_state=… review=… head=matches|differs |
+no-pr  checks <total> (<CONCLUSION count>, …; <pending> pending) | checks -  threads <n>
+unresolved | threads -  template none missing | template missing: A, B | template -  forbidden
+none | forbidden <N> hits: file:line term, … | forbidden -`.
 
 ### `knives pr NUMBER [--repo REPO] [--timeline]`
 

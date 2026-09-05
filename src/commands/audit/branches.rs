@@ -9,6 +9,7 @@ use crate::config::RepoEntry;
 use crate::forge::ChecksSummary;
 use crate::ids::{BookmarkRef, BranchName, BranchTarget, CommitId, ReleaseScheme, is_release_name};
 use crate::jj::{self, Repo};
+use crate::snapshot::CompletedSnapshot;
 
 use super::{AuditInput, Report};
 
@@ -25,9 +26,6 @@ pub struct BranchFacts {
     /// Stated with `knives track --fork-only`: no pull request is expected and
     /// the forbidden-identifier scan does not apply.
     pub fork_only: bool,
-    /// Every local release-name bookmark whose release commit has this tip as
-    /// a direct parent; empty for a lone branch.
-    pub member_of: Vec<BranchName>,
     /// Absent when no open pull request was answered for this branch.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pull: Option<PullSnapshot>,
@@ -51,7 +49,6 @@ impl BranchFacts {
             tip,
             origin_tip,
             fork_only,
-            member_of: Vec::new(),
             pull: None,
             forbidden: None,
         }
@@ -94,7 +91,7 @@ pub struct CheckCounts {
 impl CheckCounts {
     /// Count `runs`: every run once in `total`, the unfinished ones in
     /// `pending`, and the finished ones under their upper-cased conclusion.
-    pub fn from_runs(checks: &ChecksSummary) -> Self {
+    fn from_runs(checks: &ChecksSummary) -> Self {
         let mut conclusions: BTreeMap<String, usize> = BTreeMap::new();
         let mut pending = 0;
         for run in &checks.runs {
@@ -121,7 +118,7 @@ pub struct Template {
 impl Template {
     /// The headings `body` does not carry: a body heading whose text equals
     /// the heading case-insensitively carries it.
-    pub fn missing_from(&self, body: &str) -> Vec<String> {
+    fn missing_from(&self, body: &str) -> Vec<String> {
         let carried: Vec<String> = headings(body).map(str::to_lowercase).collect();
         self.headings
             .iter()
@@ -190,8 +187,8 @@ pub(super) fn read_template(
     Ok(None)
 }
 
-/// What the checkout, the live origin refs and the store say, before any forge
-/// is asked.
+/// What the checkout, the live origin refs and the store say, held against
+/// the forge's answers.
 pub(super) struct LocalFacts<'a> {
     pub(super) local: &'a BTreeMap<BranchName, CommitId>,
     pub(super) origin_refs: &'a BTreeMap<String, CommitId>,
@@ -205,7 +202,8 @@ pub(super) struct LocalFacts<'a> {
 
 /// The bookmarks the rows are built from.
 pub(super) struct RowInput<'a> {
-    pub(super) facts: &'a LocalFacts<'a>,
+    /// The live origin refs, `refs/heads/<branch>` to commit.
+    pub(super) origin_refs: &'a BTreeMap<String, CommitId>,
     /// Every local bookmark that is neither the trunk nor a release, with its
     /// tip, in bookmark order: the branches that get a row.
     pub(super) carried: &'a [(String, CommitId)],
@@ -213,13 +211,12 @@ pub(super) struct RowInput<'a> {
     pub(super) conflicted: &'a [(BookmarkRef, Vec<CommitId>)],
 }
 
-/// One row per carried branch with its local facts, its release membership
-/// and, when configured and not exempt, the forbidden-identifier scan of the
-/// lines it adds over its fork point with upstream's trunk. A divergent
-/// (conflicted) local bookmark has no single tip and gets a `problems` line
-/// instead of a row. A trunk the checkout cannot resolve (never fetched) is
-/// one problem line, not one per branch, and leaves every row's `forbidden`
-/// absent.
+/// One row per carried branch with its local facts and, when configured and
+/// not exempt, the forbidden-identifier scan of the lines it adds over its fork
+/// point with upstream's trunk. A divergent (conflicted) local bookmark has no
+/// single tip and gets a `problems` line instead of a row. A trunk the checkout
+/// cannot resolve (never fetched) is one problem line, not one per branch, and
+/// leaves every row's `forbidden` absent.
 pub(super) fn add_branch_facts(
     report: &mut Report,
     input: &AuditInput<'_>,
@@ -228,27 +225,27 @@ pub(super) fn add_branch_facts(
 ) {
     let fork = input.fork;
     let entry = fork.entry;
-    let scheme = entry.release_scheme();
-    add_divergent_problems(report, rows.conflicted, entry.trunk(), &scheme);
-    let memberships = release_memberships(report, opened, rows.facts.local, &scheme);
+    add_divergent_problems(
+        report,
+        rows.conflicted,
+        entry.trunk(),
+        &entry.release_scheme(),
+    );
     let mut built: Vec<BranchFacts> = rows
         .carried
         .iter()
         .map(|(branch, tip)| {
             let branch = BranchName::new(branch);
-            let mut row = BranchFacts::local(
+            BranchFacts::local(
                 branch.clone(),
                 tip.clone(),
-                rows.facts
-                    .origin_refs
+                rows.origin_refs
                     .get(&format!("refs/heads/{branch}"))
                     .cloned(),
                 input
                     .store
                     .is_fork_only(&BranchTarget::new(fork.name.clone(), branch)),
-            );
-            row.member_of = memberships.get(tip).cloned().unwrap_or_default();
-            row
+            )
         })
         .collect();
     if !entry.forbidden.is_empty() {
@@ -257,8 +254,10 @@ pub(super) fn add_branch_facts(
     report.branches.extend(built);
 }
 
-/// One problem line per conflicted local bookmark that would otherwise get a
-/// row: it has no single tip, so it has no row.
+/// One problem line per conflicted local bookmark: a branch that would
+/// otherwise get a row has no single tip, so it has no row; a release has no
+/// single tip either, so its drift from the recorded cut goes unread. The trunk
+/// is `knives status`'s `divergence` finding and not repeated here.
 fn add_divergent_problems(
     report: &mut Report,
     conflicted: &[(BookmarkRef, Vec<CommitId>)],
@@ -269,42 +268,16 @@ fn add_divergent_problems(
         let BookmarkRef::Local(branch) = reference else {
             continue;
         };
-        if branch.as_str() == trunk || is_release_name(branch, scheme) {
+        if branch.as_str() == trunk {
             continue;
         }
-        report.problems.push(format!(
-            "bookmark {branch} is divergent ({} targets); no row",
-            targets.len()
-        ));
+        let targets = targets.len();
+        report.problems.push(if is_release_name(branch, scheme) {
+            format!("release {branch} is divergent ({targets} targets)")
+        } else {
+            format!("bookmark {branch} is divergent ({targets} targets); no row")
+        });
     }
-}
-
-/// Every local release-name bookmark, keyed by each commit its release commit
-/// has as a direct parent, in bookmark order. A release whose parents cannot
-/// be read is a problem line.
-fn release_memberships(
-    report: &mut Report,
-    opened: &Repo,
-    local: &BTreeMap<BranchName, CommitId>,
-    scheme: &ReleaseScheme,
-) -> BTreeMap<CommitId, Vec<BranchName>> {
-    let mut memberships: BTreeMap<CommitId, Vec<BranchName>> = BTreeMap::new();
-    for (release, tip) in local {
-        if !is_release_name(release, scheme) {
-            continue;
-        }
-        match opened.parent_commits(tip.as_str()) {
-            Ok(parents) => {
-                for parent in parents {
-                    memberships.entry(parent).or_default().push(release.clone());
-                }
-            }
-            Err(error) => report.problems.push(format!(
-                "could not read the parents of release {release}: {error}"
-            )),
-        }
-    }
-    memberships
 }
 
 /// Scan every row that is not fork-only, once upstream's trunk resolves.
@@ -406,9 +379,33 @@ fn forbidden_scans(
     })
 }
 
+/// A [`PullSnapshot`] on every row whose primary pull request the batch
+/// answered open: the branch's primary by the crate's one rule (open beats
+/// closed), with a `tracked` number standing in when discovery listed none.
+pub(super) fn attach_pulls(
+    rows: &mut [BranchFacts],
+    snapshot: &CompletedSnapshot<'_>,
+    tracked: &BTreeMap<BranchName, u64>,
+    template: Option<&Template>,
+) {
+    for row in rows {
+        let number = snapshot
+            .index()
+            .by_branch
+            .get(&row.branch)
+            .filter(|primary| primary.is_open())
+            .map(|primary| primary.number)
+            .or_else(|| tracked.get(&row.branch).copied());
+        row.pull = number
+            .and_then(|number| snapshot.fact(number))
+            .filter(|fact| fact.pull.is_open())
+            .map(|fact| pull_snapshot(fact, &row.tip, template));
+    }
+}
+
 /// The pull-request facts the live batch answered, counted and held against
 /// the branch tip and upstream's template.
-pub(super) fn pull_snapshot(
+fn pull_snapshot(
     fact: &crate::forge::PullFacts,
     tip: &CommitId,
     template: Option<&Template>,
@@ -443,17 +440,6 @@ pub(super) fn render_branch(row: &BranchFacts) -> String {
     let mut line = format!("{}  tip {}  origin {origin}", row.branch, row.tip.short());
     if row.fork_only {
         line.push_str("  fork-only");
-    }
-    if row.member_of.is_empty() {
-        line.push_str("  lone");
-    } else {
-        let releases = row
-            .member_of
-            .iter()
-            .map(BranchName::as_str)
-            .collect::<Vec<_>>()
-            .join(", ");
-        let _ = write!(line, "  member of {releases}");
     }
     let pull = row.pull.as_ref();
     match pull {
@@ -542,14 +528,66 @@ fn push_forbidden(line: &mut String, hits: Option<&[crate::forbidden::Hit]>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{BranchFacts, CheckCounts, PullSnapshot, Template, headings, render_branch};
-    use crate::forge::{CheckRun, ChecksSummary};
+    use super::{
+        BranchFacts, CheckCounts, PullSnapshot, Template, attach_pulls, headings, render_branch,
+    };
+    use crate::forge::{Account, CheckRun, ChecksSummary, Forge, PullRequest, fake::FakeForge};
     use crate::ids::{BranchName, CommitId};
+    use crate::snapshot::{self, CompletedSnapshot, Opened, SnapshotConfig};
     use std::collections::BTreeMap;
+    use std::path::Path;
+
+    /// The fork remote whose owner makes a pull request ours: the ssh form, so
+    /// the identity guard's forge-URL needle does not match.
+    const ORIGIN: &str = "git@github.com:owner/fork.git";
+
+    static NO_TRACKED: BTreeMap<BranchName, u64> = BTreeMap::new();
 
     /// A row for `branch` at `tip`, the way `add_branch_facts` shapes one.
     fn local_row(branch: &str, tip: &str) -> BranchFacts {
         BranchFacts::local(BranchName::new(branch), CommitId::new(tip), None, false)
+    }
+
+    /// An open pull request `number` from `owner`'s fork, head `branch` at `head`.
+    fn open_pull(number: u64, owner: &str, branch: &str, head: &str) -> PullRequest {
+        PullRequest {
+            number,
+            state: "OPEN".to_owned(),
+            head_ref_name: branch.to_owned(),
+            head_ref_oid: head.to_owned(),
+            head_repository_owner: Some(Account {
+                login: owner.to_owned(),
+            }),
+            ..PullRequest::default()
+        }
+    }
+
+    /// The forge opened for the fork at [`ORIGIN`], with no cache.
+    fn opened(forge: &dyn Forge) -> Opened<'_> {
+        snapshot::open(SnapshotConfig {
+            forge,
+            path: Path::new("/fake"),
+            remotes: [ORIGIN, ORIGIN],
+            cache_root: None,
+        })
+        .expect("the fake forge answers its identity")
+    }
+
+    /// One live batch over every pull request of ours and every `tracked` number.
+    fn batch<'o>(
+        opened: &'o Opened<'o>,
+        tracked: &BTreeMap<BranchName, u64>,
+    ) -> CompletedSnapshot<'o> {
+        opened
+            .complete_with(tracked, |discovery, tracked| {
+                discovery
+                    .ours()
+                    .iter()
+                    .map(|pull| pull.number)
+                    .chain(tracked.values().copied())
+                    .collect()
+            })
+            .expect("the fake forge answers the batch")
     }
 
     #[test]
@@ -578,7 +616,7 @@ mod tests {
         let unscanned = serde_json::to_value(&unscanned).expect("serialise");
 
         // Then: `forbidden: []` says "scanned, nothing found"; absent says "not scanned";
-        // `member_of: []` says "lone"; the newtypes serialise as the plain strings they were.
+        // the newtypes serialise as the plain strings they were.
         assert_eq!(scanned.get("forbidden"), Some(&serde_json::json!([])));
         assert!(unscanned.get("forbidden").is_none(), "was: {unscanned}");
         assert!(unscanned.get("pull").is_none(), "was: {unscanned}");
@@ -590,7 +628,6 @@ mod tests {
                 "origin_tip": null,
                 "tip_matches_origin": null,
                 "fork_only": false,
-                "member_of": [],
             })
         );
     }
@@ -623,7 +660,7 @@ mod tests {
 
     #[test]
     fn a_branch_row_renders_every_fact_as_a_fixed_token() {
-        // Given: a lone row without a pull and a release member with every pull fact answered.
+        // Given: a fork-only row without a pull and a row with every pull fact answered.
         let tip = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let mut bare = local_row("feat/a", tip);
         bare.fork_only = true;
@@ -633,10 +670,6 @@ mod tests {
             Some(CommitId::new("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")),
             false,
         );
-        full.member_of = vec![
-            BranchName::new("release/2026-01-01"),
-            BranchName::new("release/2026-01-02"),
-        ];
         full.pull = Some(PullSnapshot {
             number: 7,
             url: "https://forge.example/r/pull/7".to_owned(),
@@ -663,11 +696,11 @@ mod tests {
         // Then: one line each, every column present, `-` for an unanswered fact.
         assert_eq!(
             render_branch(&bare),
-            "feat/a  tip aaaaaaaaaaaa  origin absent  fork-only  lone  no-pr  checks -  threads -  template -  forbidden -"
+            "feat/a  tip aaaaaaaaaaaa  origin absent  fork-only  no-pr  checks -  threads -  template -  forbidden -"
         );
         assert_eq!(
             render_branch(&full),
-            "feat/b  tip aaaaaaaaaaaa  origin differs  member of release/2026-01-01, release/2026-01-02  pr #7 mergeable=MERGEABLE merge_state=- review=- head=matches  checks 3 (SUCCESS 2; 1 pending)  threads 2 unresolved  template missing: Approach  forbidden 1 hits: infra/app.py:9 acme-corp"
+            "feat/b  tip aaaaaaaaaaaa  origin differs  pr #7 mergeable=MERGEABLE merge_state=- review=- head=matches  checks 3 (SUCCESS 2; 1 pending)  threads 2 unresolved  template missing: Approach  forbidden 1 hits: infra/app.py:9 acme-corp"
         );
         // And: a body carrying every heading renders as a fact, not a verdict.
         if let Some(pull) = full.pull.as_mut() {
@@ -678,6 +711,74 @@ mod tests {
             "was: {}",
             render_branch(&full)
         );
+    }
+
+    #[test]
+    fn a_tracked_pull_of_another_author_fills_the_row() {
+        // Given: `knives track --pr 41` on feat/alpha names a pull request someone
+        // else opened from their fork, whose head equals our local tip; discovery
+        // does not list it as ours.
+        let tip = "expected0000000000000000000000000000000";
+        let forge = FakeForge {
+            pull_requests: BTreeMap::from([(
+                BranchName::new("their/branch"),
+                open_pull(41, "someone-else", "their/branch", tip),
+            )]),
+            ..FakeForge::default()
+        };
+        let tracked = BTreeMap::from([(BranchName::new("feat/alpha"), 41)]);
+        let opened = opened(&forge);
+        let snapshot = batch(&opened, &tracked);
+        let mut rows = [local_row("feat/alpha", tip)];
+
+        attach_pulls(&mut rows, &snapshot, &tracked, None);
+
+        // Then: the tracked number stands in for the primary the index lacks.
+        let pull = rows[0].pull.as_ref().expect("tracked pull facts");
+        assert_eq!((pull.number, pull.head_matches_tip), (41, true));
+    }
+
+    #[test]
+    fn a_pull_head_that_differs_from_the_local_tip_is_a_row_fact() {
+        // Given: our open pull's head is one commit behind the local bookmark.
+        let head = "expected0000000000000000000000000000000";
+        let forge = FakeForge {
+            pull_requests: BTreeMap::from([(
+                BranchName::new("feat/alpha"),
+                open_pull(7, "owner", "feat/alpha", head),
+            )]),
+            ..FakeForge::default()
+        };
+        let opened = opened(&forge);
+        let snapshot = batch(&opened, &NO_TRACKED);
+        let mut rows = [local_row(
+            "feat/alpha",
+            "local000000000000000000000000000000000000",
+        )];
+
+        attach_pulls(&mut rows, &snapshot, &NO_TRACKED, None);
+
+        // Then: the row says the head differs; it is a fact, not a finding.
+        let pull = rows[0].pull.as_ref().expect("pull facts");
+        assert_eq!(pull.head, head);
+        assert!(!pull.head_matches_tip, "was: {pull:?}");
+    }
+
+    #[test]
+    fn an_unanswered_tracked_number_leaves_the_row_without_a_pull() {
+        // Given: a tracked number the forge no longer knows (deleted, or mistyped).
+        let forge = FakeForge::default();
+        let tracked = BTreeMap::from([(BranchName::new("feat/alpha"), 41)]);
+        let opened = opened(&forge);
+        let snapshot = batch(&opened, &tracked);
+        let mut rows = [local_row(
+            "feat/alpha",
+            "local000000000000000000000000000000000000",
+        )];
+
+        attach_pulls(&mut rows, &snapshot, &tracked, None);
+
+        assert!(rows[0].pull.is_none(), "was: {:?}", rows[0].pull);
     }
 
     #[test]

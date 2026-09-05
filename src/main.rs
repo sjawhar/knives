@@ -37,9 +37,7 @@ use knives::forge::github::CliForge;
 use knives::ids::{BranchName, RepoName};
 use knives::ledger::{Ledger, Scribe};
 use knives::store::{Store, default_state_path};
-use release_carries::{
-    MembersInvocation, run_release_census, run_release_members, run_revision_carries,
-};
+use release_carries::{run_release_census, run_release_members, run_revision_carries};
 use release_cut::{ReleaseInvocation, run_reap, run_release};
 use release_edit::{ReleaseEdit, run_release_edit};
 use release_rebase::run_rebase;
@@ -575,14 +573,7 @@ fn dispatch_release(
                 (false, Some(revision)) => {
                     run_revision_carries(fork, revision, reference.as_deref(), output)
                 }
-                (false, None) => run_release_members(
-                    fork,
-                    MembersInvocation {
-                        reference: reference.as_deref(),
-                        verify,
-                        output,
-                    },
-                ),
+                (false, None) => run_release_members(fork, reference.as_deref(), verify, output),
             }
         }
         Some(ReleaseAction::Reap) => run_reap(fork),

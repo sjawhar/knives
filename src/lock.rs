@@ -41,7 +41,7 @@ impl LockWait {
 
 /// The lock file a wait gave up on: the holder's pid when the file names one,
 /// and the file's age either way.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct LockHolder {
     /// `None` for a lock file without a pid: one whose holder had not written
     /// its pid yet, or one written by something other than this lock.
@@ -199,30 +199,13 @@ mod tests {
     };
 
     #[test]
-    fn a_second_acquirer_is_refused_while_the_first_holds_the_lock() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("state.json");
-        let first = FileLock::acquire(&path, QUICK).unwrap();
-
-        let second = FileLock::acquire(&path, QUICK);
-        assert!(
-            matches!(second, Err(LockError::Held { .. })),
-            "a second acquirer got in"
-        );
-
-        drop(first);
-        assert!(
-            FileLock::acquire(&path, QUICK).is_ok(),
-            "the lock outlived its holder"
-        );
-    }
-
-    #[test]
-    fn a_held_error_names_the_holders_pid_and_age() {
+    fn a_second_acquirer_is_refused_and_told_the_holders_pid_and_age() {
         let dir = tempfile::tempdir().expect("state dir");
         let path = dir.path().join("state.json");
-        let _first = FileLock::acquire(&path, QUICK).expect("first writer");
+        let first = FileLock::acquire(&path, QUICK).expect("first writer");
+
         let error = FileLock::acquire(&path, QUICK).expect_err("second writer");
+
         let LockError::Held { holder, .. } = &error else {
             panic!("expected a Held error, got {error:?}");
         };
@@ -234,6 +217,12 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("holding for"), "{text}");
+
+        drop(first);
+        assert!(
+            FileLock::acquire(&path, QUICK).is_ok(),
+            "the lock outlived its holder"
+        );
     }
 
     #[test]

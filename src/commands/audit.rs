@@ -23,7 +23,7 @@ mod branches;
 
 pub use branches::{BranchFacts, CheckCounts, PullSnapshot, Template};
 use branches::{
-    LocalFacts, RowInput, add_branch_facts, pull_snapshot, read_template, render_branch,
+    LocalFacts, RowInput, add_branch_facts, attach_pulls, read_template, render_branch,
 };
 
 const ORPHAN_REVSET: &str = r#"heads(all()) ~ ::(bookmarks() | remote_bookmarks() | tags()) ~ working_copies() ~ (empty() & description(exact:""))"#;
@@ -159,23 +159,26 @@ pub fn gather(input: &AuditInput<'_>) -> Report {
     add_misplaced_origin_release_refs(&mut report, live.origin(), &scheme, entry.publish_remote());
     add_orphan_commits(&mut report, &opened, path);
     let template = template_for_pulls(&mut report, input);
-    let facts = LocalFacts {
-        local: &local,
-        origin_refs: live.origin(),
-        tracked: &tracked,
-        template: template.as_ref(),
-    };
     add_branch_facts(
         &mut report,
         input,
         &opened,
         &RowInput {
-            facts: &facts,
+            origin_refs: live.origin(),
             carried: &carried,
             conflicted: &conflicted,
         },
     );
-    add_open_pull_head_checks(&mut report, input, &facts);
+    add_open_pull_head_checks(
+        &mut report,
+        input,
+        &LocalFacts {
+            local: &local,
+            origin_refs: live.origin(),
+            tracked: &tracked,
+            template: template.as_ref(),
+        },
+    );
     report.template = template;
     report
 }
@@ -583,21 +586,12 @@ fn pull_head_findings(
             )),
         }
     }
-    for row in &mut report.branches {
-        // The branch's primary pull request by the crate's one rule (open beats
-        // closed); a tracked number stands in when discovery did not list one.
-        let number = snapshot
-            .index()
-            .by_branch
-            .get(&row.branch)
-            .filter(|primary| primary.is_open())
-            .map(|primary| primary.number)
-            .or_else(|| facts.tracked.get(&row.branch).copied());
-        row.pull = number
-            .and_then(|number| snapshot.fact(number))
-            .filter(|fact| fact.pull.is_open())
-            .map(|fact| pull_snapshot(fact, &row.tip, facts.template));
-    }
+    attach_pulls(
+        &mut report.branches,
+        &snapshot,
+        facts.tracked,
+        facts.template,
+    );
     if let Err(note) = snapshot.persist(None) {
         report.notes.push(note.to_string());
     }
@@ -691,9 +685,9 @@ pub fn render(report: &Report) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AuditInput, BranchFacts, LocalFacts, ReleaseDriftScan, Report,
-        add_misplaced_origin_release_refs, add_open_pull_head_checks, add_release_drifts, exit_for,
-        pull_head_findings, pull_position_findings, recorded_commit, same_commit,
+        AuditInput, LocalFacts, ReleaseDriftScan, Report, add_misplaced_origin_release_refs,
+        add_open_pull_head_checks, add_release_drifts, exit_for, pull_head_findings,
+        pull_position_findings, recorded_commit, same_commit,
     };
     use crate::bind::Fork;
     use crate::cli::Exit;
@@ -1201,20 +1195,8 @@ mod tests {
         assert!(report.findings.is_empty(), "was: {:?}", report.findings);
     }
 
-    /// A report over one row for `branch` at `tip`, the way `add_branch_facts` shapes one.
-    fn report_with_row(branch: &str, tip: &str) -> Report {
-        let mut report = Report::new("demo");
-        report.branches.push(BranchFacts::local(
-            BranchName::new(branch),
-            CommitId::new(tip),
-            None,
-            false,
-        ));
-        report
-    }
-
     #[test]
-    fn a_tracked_pull_of_another_author_fills_the_row_without_moving_the_exit() {
+    fn a_tracked_pull_of_another_author_does_not_move_the_exit() {
         // Given: `knives track --pr 41` on feat/alpha names a pull request someone
         // else opened from their fork, whose head equals our local tip.
         let entry = test_entry();
@@ -1238,7 +1220,7 @@ mod tests {
         };
         let local = BTreeMap::from([(BranchName::new("feat/alpha"), CommitId::new(tip))]);
         let tracked = BTreeMap::from([(BranchName::new("feat/alpha"), 41)]);
-        let mut report = report_with_row("feat/alpha", tip);
+        let mut report = Report::new("demo");
 
         batch(
             &fork,
@@ -1248,61 +1230,11 @@ mod tests {
         )
         .expect("the tracked number is answered");
 
-        // Then: the row carries the pull's facts, and nothing else moves — their
-        // branch name is not ours to reconcile against origin or a bookmark.
-        let pull = report
-            .branches
-            .first()
-            .expect("one row")
-            .pull
-            .as_ref()
-            .expect("tracked pull facts");
-        assert_eq!((pull.number, pull.head_matches_tip), (41, true));
+        // Then: nothing moves — their branch name is not ours to reconcile
+        // against origin or a bookmark.
         assert!(report.findings.is_empty(), "was: {:?}", report.findings);
         assert!(report.problems.is_empty(), "was: {:?}", report.problems);
         assert_eq!(exit_for(&report), Exit::Ok);
-    }
-
-    #[test]
-    fn a_pull_head_that_differs_from_the_local_tip_is_a_row_fact() {
-        // Given: our open pull's head is one commit behind the local bookmark.
-        let entry = test_entry();
-        let fork = Fork::at("demo", &entry, Path::new("/fake"));
-        let forge = FakeForge {
-            pull_requests: BTreeMap::from([(BranchName::new("feat/alpha"), test_pull("OPEN"))]),
-            ..FakeForge::default()
-        };
-        let tip = "local000000000000000000000000000000000000";
-        let local = BTreeMap::from([(BranchName::new("feat/alpha"), CommitId::new(tip))]);
-        let mut report = report_with_row("feat/alpha", tip);
-
-        // When: the batch answers the pull.
-        batch(
-            &fork,
-            &forge,
-            &facts_over(&local, &NO_REFS, &NO_TRACKED),
-            &mut report,
-        )
-        .expect("the open pull is answered");
-
-        // Then: the row says the head differs, and the pushed-head finding says so too.
-        let pull = report
-            .branches
-            .first()
-            .expect("one row")
-            .pull
-            .as_ref()
-            .expect("pull facts");
-        assert_eq!(pull.head, "expected0000000000000000000000000000000");
-        assert!(!pull.head_matches_tip, "was: {pull:?}");
-        assert!(
-            report
-                .findings
-                .iter()
-                .any(|finding| finding.detail.contains("local bookmark")),
-            "was: {:?}",
-            report.findings
-        );
     }
 
     #[test]
@@ -1311,10 +1243,12 @@ mod tests {
         let entry = test_entry();
         let fork = Fork::at("demo", &entry, Path::new("/fake"));
         let forge = FakeForge::default();
-        let tip = "local000000000000000000000000000000000000";
-        let local = BTreeMap::from([(BranchName::new("feat/alpha"), CommitId::new(tip))]);
+        let local = BTreeMap::from([(
+            BranchName::new("feat/alpha"),
+            CommitId::new("local000000000000000000000000000000000000"),
+        )]);
         let tracked = BTreeMap::from([(BranchName::new("feat/alpha"), 41)]);
-        let mut report = report_with_row("feat/alpha", tip);
+        let mut report = Report::new("demo");
 
         batch(
             &fork,
@@ -1324,7 +1258,6 @@ mod tests {
         )
         .expect("an unanswered tracked number is not a batch failure");
 
-        assert!(report.branches.first().expect("one row").pull.is_none());
         assert_eq!(
             report.notes,
             vec!["tracked pull request #41 was not answered by the live batch"]
