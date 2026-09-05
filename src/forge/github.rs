@@ -467,6 +467,7 @@ pub fn pull_facts_query(numbers: &[u64]) -> String {
          fragment facts on PullRequest {{ number state reviewDecision headRefName headRefOid \
          updatedAt isDraft url headRepositoryOwner {{ login }} baseRefName mergeable \
          mergeStateStatus mergeCommit {{ oid }} additions deletions changedFiles headRef {{ name }} \
+         body reviewThreads(first: 100) {{ pageInfo {{ hasNextPage }} nodes {{ isResolved }} }} \
          reviews(last: 100) {{ nodes {{ submittedAt }} }} \
          commits(last: 100) {{ nodes {{ commit {{ committedDate }} }} }} \
          rollup: commits(last: 1) {{ nodes {{ commit {{ tree {{ oid }} \
@@ -749,6 +750,17 @@ struct FactsPayload {
     rollup: Option<Nodes<RollupNode>>,
     #[serde(default)]
     comments: Option<Nodes<Created>>,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default, rename = "reviewThreads")]
+    review_threads: Option<Nodes<ReviewThreadNode>>,
+}
+
+/// One review thread on the pull request: resolved, or still waiting on us.
+#[derive(Deserialize)]
+struct ReviewThreadNode {
+    #[serde(rename = "isResolved")]
+    is_resolved: bool,
 }
 
 #[derive(Deserialize)]
@@ -959,23 +971,12 @@ fn tip_commit_empty(tip: &RollupHolder) -> Option<bool> {
     parent.tree.as_ref().map(|parent| tree.oid == parent.oid)
 }
 
-fn details_from(payload: &FactsPayload) -> Result<PullDetails, ForgeError> {
-    let newest_review = payload
-        .reviews
-        .iter()
-        .flat_map(|list| list.nodes.iter())
-        .filter_map(|review| review.submitted_at.as_deref())
-        .max();
-    let newest_commit = payload
-        .commits
-        .iter()
-        .flat_map(|list| list.nodes.iter())
-        .map(|node| node.commit.committed_date.as_str())
-        .max();
-    let review_predates_head = match (newest_review, newest_commit) {
-        (Some(review), Some(commit)) => Some(review < commit),
-        _ => None,
-    };
+/// The check runs on the pull request's head: whatever ran, then whatever the
+/// forge refused to start. A gated workflow has no check run to appear in the
+/// rollup, so without the suites an approval-gated pull request reads as green
+/// on its one unconditional check. A second page of either is refused: a
+/// truncated list would read as fewer checks than there are.
+fn check_runs(payload: &FactsPayload) -> Result<Vec<CheckRun>, ForgeError> {
     let tip_commits = || {
         payload
             .rollup
@@ -1006,10 +1007,6 @@ fn details_from(payload: &FactsPayload) -> Result<PullDetails, ForgeError> {
             ),
         });
     }
-
-    // Whatever ran, then whatever the forge refused to start. A gated workflow
-    // has no check run to appear in the rollup, so without the suites an
-    // approval-gated pull request reads as green on its one unconditional check.
     let mut runs: Vec<CheckRun> = tip_commits()
         .filter_map(|tip| tip.rollup.as_ref())
         .filter_map(|rollup| rollup.contexts.as_ref())
@@ -1022,7 +1019,31 @@ fn details_from(payload: &FactsPayload) -> Result<PullDetails, ForgeError> {
             .flat_map(|suites| suites.nodes.iter())
             .filter_map(CheckSuiteNode::gated_workflow),
     );
-    let checks = Some(ChecksSummary { runs });
+    Ok(runs)
+}
+
+/// One pull request's facts from its batch payload, which is consumed so the
+/// body and the summary move rather than copy.
+fn facts_from(payload: FactsPayload) -> Result<PullFacts, ForgeError> {
+    let newest_review = payload
+        .reviews
+        .iter()
+        .flat_map(|list| list.nodes.iter())
+        .filter_map(|review| review.submitted_at.as_deref())
+        .max();
+    let newest_commit = payload
+        .commits
+        .iter()
+        .flat_map(|list| list.nodes.iter())
+        .map(|node| node.commit.committed_date.as_str())
+        .max();
+    let review_predates_head = match (newest_review, newest_commit) {
+        (Some(review), Some(commit)) => Some(review < commit),
+        _ => None,
+    };
+    let checks = Some(ChecksSummary {
+        runs: check_runs(&payload)?,
+    });
     let diff = match (payload.additions, payload.deletions, payload.changed_files) {
         (Some(additions), Some(deletions), Some(changed_files)) => Some(DiffTotals {
             additions,
@@ -1042,12 +1063,47 @@ fn details_from(payload: &FactsPayload) -> Result<PullDetails, ForgeError> {
         .flat_map(|list| list.nodes.iter())
         .last()
         .and_then(|tip| tip_commit_empty(&tip.commit));
-    Ok(PullDetails {
-        review_predates_head,
-        checks,
-        diff,
-        head_ref_deleted,
-        tip_commit_empty,
+    // A second page of threads leaves the count unanswered rather than failing
+    // the batch: `facts_from` serves `status` and `sync` too, and a long-lived
+    // pull request with more than 100 threads is realistic where 100 check
+    // contexts is not. `None` is the field's own meaning, "the batch did not answer".
+    let unresolved_review_threads = payload
+        .review_threads
+        .as_ref()
+        .filter(|threads| !threads.page_info.has_next_page)
+        .map(|threads| {
+            threads
+                .nodes
+                .iter()
+                .filter(|thread| !thread.is_resolved)
+                .count()
+        });
+    let newest_comment = payload
+        .reviews
+        .iter()
+        .flat_map(|list| list.nodes.iter())
+        .filter_map(|review| review.submitted_at.as_deref())
+        .chain(
+            payload
+                .comments
+                .iter()
+                .flat_map(|list| list.nodes.iter())
+                .map(|comment| comment.created_at.as_str()),
+        )
+        .max()
+        .map(str::to_owned);
+    Ok(PullFacts {
+        pull: payload.pull,
+        details: PullDetails {
+            review_predates_head,
+            checks,
+            diff,
+            head_ref_deleted,
+            tip_commit_empty,
+            body: payload.body,
+            unresolved_review_threads,
+        },
+        newest_comment,
     })
 }
 
@@ -1078,30 +1134,8 @@ pub fn parse_pull_facts(
     };
     let mut facts = BTreeMap::new();
     for payload in repository.into_values().flatten() {
-        let details = details_from(&payload)?;
-        let newest_comment = payload
-            .reviews
-            .iter()
-            .flat_map(|list| list.nodes.iter())
-            .filter_map(|review| review.submitted_at.as_deref())
-            .chain(
-                payload
-                    .comments
-                    .iter()
-                    .flat_map(|list| list.nodes.iter())
-                    .map(|comment| comment.created_at.as_str()),
-            )
-            .max()
-            .map(str::to_owned);
         let number = payload.pull.number;
-        let _ = facts.insert(
-            number,
-            PullFacts {
-                pull: payload.pull,
-                details,
-                newest_comment,
-            },
-        );
+        let _ = facts.insert(number, facts_from(payload)?);
     }
     Ok(facts)
 }
@@ -1862,6 +1896,60 @@ printf '{}'
             facts[&7].newest_comment.as_deref(),
             Some("2026-08-03T00:00:00Z")
         );
+    }
+
+    #[test]
+    fn the_body_and_unresolved_review_threads_are_read_from_the_facts_row() {
+        let payload = facts_payload(
+            r###""p7":{"number":7,"state":"OPEN","headRefName":"feat/a","headRefOid":"aa",
+            "updatedAt":"2026-08-01T00:00:00Z",
+            "body":"## Overview\nfix\n",
+            "reviewThreads":{"pageInfo":{"hasNextPage":false},"nodes":[
+            {"isResolved":true},{"isResolved":false},{"isResolved":false}]}}"###,
+        );
+        let facts = parse_pull_facts(&payload, &[7]).expect("facts parse");
+        let details = &facts[&7].details;
+        assert_eq!(details.body.as_deref(), Some("## Overview\nfix\n"));
+        assert_eq!(details.unresolved_review_threads, Some(2));
+        let query = pull_facts_query(&[7]);
+        assert!(query.contains(" body "), "was: {query}");
+        assert!(
+            query.contains(
+                "reviewThreads(first: 100) { pageInfo { hasNextPage } nodes { isResolved } }"
+            ),
+            "was: {query}"
+        );
+    }
+
+    #[test]
+    fn a_facts_row_without_body_or_threads_answers_none_for_both() {
+        // An old recorded payload, or a forge that refused the fields: "not
+        // answered", never "no body" or "no threads".
+        let payload = facts_payload(
+            r#""p7":{"number":7,"state":"OPEN","headRefName":"feat/a","headRefOid":"aa",
+            "updatedAt":"2026-08-01T00:00:00Z"}"#,
+        );
+        let facts = parse_pull_facts(&payload, &[7]).expect("facts parse");
+        let details = &facts[&7].details;
+        assert_eq!(details.body, None);
+        assert_eq!(details.unresolved_review_threads, None);
+    }
+
+    #[test]
+    fn a_second_page_of_review_threads_leaves_the_count_unanswered_without_failing() {
+        // Unlike the rollup and suite refusals, a long-lived pull request with more
+        // than 100 review threads is realistic, and `facts_from` serves `status`
+        // and `sync` too: the count reads as unanswered and everything else stands.
+        let payload = facts_payload(
+            r#""p7":{"number":7,"state":"OPEN","headRefName":"feat/a","headRefOid":"aa",
+            "updatedAt":"2026-08-01T00:00:00Z","body":"text",
+            "reviewThreads":{"pageInfo":{"hasNextPage":true},"nodes":[{"isResolved":false}]}}"#,
+        );
+        let facts =
+            parse_pull_facts(&payload, &[7]).expect("a truncated thread list is not an error");
+        let details = &facts[&7].details;
+        assert_eq!(details.unresolved_review_threads, None);
+        assert_eq!(details.body.as_deref(), Some("text"));
     }
 
     #[test]

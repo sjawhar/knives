@@ -18,12 +18,18 @@ use crate::jj::Repo;
 use crate::snapshot::{self, SnapshotConfig};
 use crate::store::Store;
 
+/// The two spellings a forge reads a pull-request template under.
+pub const PULL_REQUEST_TEMPLATES: [&str; 2] = [
+    ".github/pull_request_template.md",
+    ".github/PULL_REQUEST_TEMPLATE.md",
+];
+
 /// Files a project uses to state how to contribute.
 pub const CONVENTION_FILES: &[&str] = &[
     "AGENTS.md",
     "CONTRIBUTING.md",
-    ".github/pull_request_template.md",
-    ".github/PULL_REQUEST_TEMPLATE.md",
+    PULL_REQUEST_TEMPLATES[0],
+    PULL_REQUEST_TEMPLATES[1],
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]

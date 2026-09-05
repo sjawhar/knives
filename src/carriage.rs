@@ -84,7 +84,7 @@ pub struct TargetCheck {
     pub evidence: CommitId,
 }
 
-/// The complete answer to a `release carries` query.
+/// The complete answer to a `release members --carries` query.
 #[derive(Debug, serde::Serialize)]
 pub struct CarriesReport {
     pub repo: String,

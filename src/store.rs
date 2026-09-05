@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::default_config_path;
 use crate::ids::{BranchTarget, RepoName, Requirement};
+use crate::lock::{FileLock, LockError, LockWait};
 
 use crate::commands::claim::Identity;
 pub fn default_state_path() -> PathBuf {
@@ -122,64 +123,13 @@ pub enum StoreError {
         path: PathBuf,
         source: serde_json::Error,
     },
-    #[error("another knives command is holding {path}; try again in a moment")]
-    Locked { path: PathBuf },
+    #[error(transparent)]
+    Lock(#[from] LockError),
     #[error("serialising state: {source}")]
     Serialise {
         #[from]
         source: serde_json::Error,
     },
-}
-
-/// Held for the duration of a read-modify-write.
-///
-/// Without it the store is last-writer-wins: two `knives start` runs that
-/// interleave read, decide and write both see "unclaimed", both report success,
-/// and the second erases the first. For a tool whose stated purpose is to make
-/// collisions between agents visible before they cost work, the coordination
-/// record cannot itself lose writes.
-///
-/// An exclusive-create lockfile rather than a dependency: `create_new` is atomic
-/// on every platform this runs on.
-#[derive(Debug)]
-pub(crate) struct StoreLock {
-    path: PathBuf,
-}
-
-impl StoreLock {
-    /// Beside the file it guards, named for that file's stem: `state.json` is
-    /// guarded by `state.lock`.
-    pub(crate) fn acquire(target: &Path) -> Result<Self, StoreError> {
-        let path = target.with_extension("lock");
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|source| StoreError::Write {
-                path: parent.to_owned(),
-                source,
-            })?;
-        }
-        // A short wait, then give up loudly. Blocking forever on a stale lock
-        // would be worse than saying so.
-        for _ in 0..50 {
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-            {
-                Ok(_) => return Ok(Self { path }),
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    std::thread::sleep(std::time::Duration::from_millis(20));
-                }
-                Err(source) => return Err(StoreError::Write { path, source }),
-            }
-        }
-        Err(StoreError::Locked { path })
-    }
-}
-
-impl Drop for StoreLock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
 }
 
 #[derive(Debug)]
@@ -188,11 +138,7 @@ pub struct Store {
     state: State,
     /// Present only for a store opened to be written. Held, not read: its whole
     /// job is to exist until this value is dropped.
-    #[expect(
-        dead_code,
-        reason = "an RAII guard is used by existing, not by being read"
-    )]
-    lock: Option<StoreLock>,
+    _lock: Option<FileLock>,
 }
 
 impl Store {
@@ -201,13 +147,14 @@ impl Store {
         Self::read(path, None)
     }
 
-    /// For a read-modify-write. Holds the lock until dropped.
+    /// For a read-modify-write. Holds the lock until dropped, and waits the
+    /// full claim-writer budget ([`LockWait::CLAIM`]) for another writer.
     pub fn open_for_update(path: PathBuf) -> Result<Self, StoreError> {
-        let lock = StoreLock::acquire(&path)?;
+        let lock = FileLock::acquire(&path, LockWait::CLAIM)?;
         Self::read(path, Some(lock))
     }
 
-    fn read(path: PathBuf, lock: Option<StoreLock>) -> Result<Self, StoreError> {
+    fn read(path: PathBuf, lock: Option<FileLock>) -> Result<Self, StoreError> {
         let state = if path.exists() {
             let text = std::fs::read_to_string(&path).map_err(|source| StoreError::Read {
                 path: path.clone(),
@@ -220,7 +167,11 @@ impl Store {
         } else {
             State::default()
         };
-        Ok(Self { path, state, lock })
+        Ok(Self {
+            path,
+            state,
+            _lock: lock,
+        })
     }
 
     /// Write atomically, so a crash mid-write cannot truncate the file and a
@@ -693,32 +644,17 @@ mod tests {
         );
         assert_eq!(subject.pull_state(&RepoName::new("other-repo"), 7), None);
     }
-}
-
-#[cfg(test)]
-mod lock_tests {
-    use super::*;
 
     #[test]
-    fn a_second_writer_cannot_open_while_the_first_holds_the_lock() {
-        // Two concurrent claim writers that interleave read, decide and write both used
-        // to see "unclaimed", both report success, and the second erase the
-        // first. The tool exists to make collisions visible, so its own record
-        // must not lose them.
+    fn a_reader_is_never_blocked_by_a_writer() {
+        // Reading cannot lose a write, so a held writer lock keeps out writers only.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.json");
-        let first = Store::open_for_update(path.clone()).unwrap();
+        let writer = Store::open_for_update(path.clone()).unwrap();
 
-        let second = Store::open_for_update(path.clone());
-        assert!(
-            matches!(second, Err(StoreError::Locked { .. })),
-            "a second writer got in"
-        );
-
-        // A reader is never blocked: reading cannot lose a write.
         assert!(Store::open(path.clone()).is_ok());
 
-        drop(first);
+        drop(writer);
         assert!(
             Store::open_for_update(path).is_ok(),
             "the lock outlived its holder"

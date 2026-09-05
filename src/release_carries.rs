@@ -1,10 +1,12 @@
-//! `knives release members` and `knives carries`.
+//! `knives release members`.
 //!
-//! Content questions about a release: which parents it has and who still
-//! holds each, and whether a revision's net content is actually carried by a
-//! release or the trunk — one revision, or a census over every maintained
-//! branch. Each verb is a gather, an exit code and a renderer; the repository
-//! is only read.
+//! Content questions about a release, each a gather, an exit code and a
+//! renderer over a read-only repository. Bare `members` asks which parents the
+//! release has and who still holds each ([`run_release_members`]); `--carries
+//! REV` asks the other direction, whether a revision's net content is actually
+//! carried by a release or the trunk ([`run_revision_carries`]); `--census`
+//! asks that of every maintained branch ([`run_release_census`]). The parser
+//! keeps the three apart, so `main` calls each directly.
 
 use knives::bind::Fork;
 use knives::carriage::{
@@ -19,26 +21,13 @@ use knives::ledger::Ledger;
 
 use super::parallelism;
 
-#[derive(Clone, Copy)]
-pub(crate) struct CarriesInvocation<'a> {
-    pub(crate) revision: Option<&'a str>,
-    pub(crate) target: Option<&'a str>,
-    pub(crate) all: bool,
-    pub(crate) no_github: bool,
-    pub(crate) output: Output,
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct MembersInvocation<'a> {
-    pub(crate) reference: Option<&'a str>,
-    pub(crate) verify: bool,
-    pub(crate) output: Output,
-}
-
-/// Inspect a release's direct parents and, on request, replay their content.
+/// Inspect a release's direct parents and, on request, replay their content:
+/// the release `reference` names, or the one in hand.
 pub(crate) fn run_release_members(
     fork: &Fork<'_>,
-    request: MembersInvocation<'_>,
+    reference: Option<&str>,
+    verify: bool,
+    output: Output,
 ) -> anyhow::Result<Exit> {
     let repo = &fork.name;
     let entry = fork.entry;
@@ -46,7 +35,7 @@ pub(crate) fn run_release_members(
     let forge = CliForge;
     let cache_root = knives::forge_cache::cache_root();
     let heads = knives::consumer_pins::ConsumerHeadMemo::default();
-    let reference = if let Some(reference) = request.reference {
+    let reference = if let Some(reference) = reference {
         std::borrow::Cow::Borrowed(reference)
     } else {
         let consumers = release::ConsumerInputs {
@@ -63,9 +52,9 @@ pub(crate) fn run_release_members(
         };
         std::borrow::Cow::Owned(reference)
     };
-    let report = release::gather_members(&opened, fork, &reference, request.verify)?;
-    let exit = members_exit(&report, request.verify);
-    print_members(&report, request.output)?;
+    let report = release::gather_members(&opened, fork, &reference, verify)?;
+    let exit = members_exit(&report, verify);
+    print_members(&report, output)?;
     Ok(exit)
 }
 
@@ -93,43 +82,35 @@ fn print_members(report: &release::MembersReport, output: Output) -> anyhow::Res
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CarriesMode {
-    Bare,
-    ExplicitTarget,
-}
-
-/// Answer one revision's carriage, or census every maintained branch.
-pub(crate) fn run_release_carries(
+/// Census every maintained branch against the live releases and upstream trunk.
+pub(crate) fn run_release_census(
     fork: &Fork<'_>,
-    request: CarriesInvocation<'_>,
+    no_github: bool,
+    output: Output,
 ) -> anyhow::Result<Exit> {
-    if request.all {
-        let forge = CliForge;
-        let forge: Option<&dyn Forge> = (!request.no_github).then_some(&forge);
-        let cache_root = knives::forge_cache::cache_root();
-        let report = carriage::census(
-            fork,
-            forge,
-            CensusOptions {
-                cache_root: cache_root.as_deref(),
-                workers: parallelism(),
-            },
-        )?;
-        let exit = census_exit(&report);
-        print_census(&report, request.output)?;
-        return Ok(exit);
-    }
-    let Some(revision) = request.revision else {
-        return Ok(Exit::Usage);
-    };
-    run_revision_carries(fork, request, revision)
+    let forge = CliForge;
+    let forge: Option<&dyn Forge> = (!no_github).then_some(&forge);
+    let cache_root = knives::forge_cache::cache_root();
+    let report = carriage::census(
+        fork,
+        forge,
+        CensusOptions {
+            cache_root: cache_root.as_deref(),
+            workers: parallelism(),
+        },
+    )?;
+    let exit = census_exit(&report);
+    print_census(&report, output)?;
+    Ok(exit)
 }
 
-fn run_revision_carries(
+/// Answer one revision's carriage: against `target` alone when given,
+/// otherwise against every live release and the upstream trunk.
+pub(crate) fn run_revision_carries(
     fork: &Fork<'_>,
-    request: CarriesInvocation<'_>,
     revision: &str,
+    target: Option<&str>,
+    output: Output,
 ) -> anyhow::Result<Exit> {
     let repo = &fork.name;
     let entry = fork.entry;
@@ -142,7 +123,7 @@ fn run_revision_carries(
                 revision.to_owned(),
                 format!("cannot resolve revision {revision}: {error}"),
             );
-            print_carries(&report, request.output)?;
+            print_carries(&report, output)?;
             return Ok(Exit::Incomplete);
         }
     };
@@ -155,7 +136,7 @@ fn run_revision_carries(
                 carries_revision(revision, &tip),
                 format!("cannot resolve upstream trunk {trunk_name}: {error}"),
             );
-            print_carries(&report, request.output)?;
+            print_carries(&report, output)?;
             return Ok(Exit::Incomplete);
         }
     };
@@ -166,10 +147,7 @@ fn run_revision_carries(
         (trunk_name.as_str(), trunk),
         entry.publish_remote(),
     );
-    let mode = request
-        .target
-        .map_or(CarriesMode::Bare, |_| CarriesMode::ExplicitTarget);
-    let (mut selected, superseded) = match request.target {
+    let (mut selected, superseded) = match target {
         Some(target) => match selected_carries_targets(&opened, &all_targets, target) {
             Ok(targets) => (targets, Vec::new()),
             Err(error) => {
@@ -178,7 +156,7 @@ fn run_revision_carries(
                     carries_revision(revision, &tip),
                     format!("cannot resolve target {target}: {error}"),
                 );
-                print_carries(&report, request.output)?;
+                print_carries(&report, output)?;
                 return Ok(Exit::Incomplete);
             }
         },
@@ -186,7 +164,7 @@ fn run_revision_carries(
             .into_iter()
             .partition(|target| target.role != TargetRole::SupersededRelease),
     };
-    if let (Some(requested), Some(selected_target)) = (request.target, selected.first_mut())
+    if let (Some(requested), Some(selected_target)) = (target, selected.first_mut())
         && requested == trunk_name
     {
         selected_target.role = TargetRole::UpstreamTrunk;
@@ -197,7 +175,7 @@ fn run_revision_carries(
             revision,
             tip: &tip,
         },
-        fallback: request.target.unwrap_or(trunk_name.as_str()),
+        fallback: target.unwrap_or(trunk_name.as_str()),
     };
     let mut report = CarriesReport {
         repo: repo.to_string(),
@@ -207,39 +185,32 @@ fn run_revision_carries(
         problems: Vec::new(),
     };
     checks.append(&mut report, selected);
-    let exit = carries_exit(&mut report, &checks, superseded, mode);
-    print_carries(&report, request.output)?;
+    let exit = carries_exit(&mut report, &checks, superseded, target);
+    print_carries(&report, output)?;
     Ok(exit)
 }
 
+/// The outcome: unanswered checks outrank everything; against an explicit
+/// `target` every check must carry; bare, a live release or the trunk must,
+/// with the superseded releases consulted only after those miss.
 fn carries_exit(
     report: &mut CarriesReport,
     checks: &CarriesChecks<'_>,
     superseded: Vec<Target>,
-    mode: CarriesMode,
+    target: Option<&str>,
 ) -> Exit {
     if !report.problems.is_empty() {
         return Exit::Incomplete;
     }
-    match mode {
-        CarriesMode::Bare => {
-            if !carries_safe(report) {
-                checks.append(report, superseded);
-            }
-            if carries_safe(report) {
-                Exit::Ok
-            } else {
-                Exit::Findings
-            }
+    let carried = if target.is_some() {
+        report.checks.iter().all(|check| check.verdict.carried())
+    } else {
+        if !carries_safe(report) {
+            checks.append(report, superseded);
         }
-        CarriesMode::ExplicitTarget => {
-            if report.checks.iter().all(|check| check.verdict.carried()) {
-                Exit::Ok
-            } else {
-                Exit::Findings
-            }
-        }
-    }
+        carries_safe(report)
+    };
+    if carried { Exit::Ok } else { Exit::Findings }
 }
 
 struct CarriesChecks<'a> {

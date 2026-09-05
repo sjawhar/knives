@@ -144,6 +144,11 @@ impl Lab {
     }
 
     pub(crate) fn branch(&self, name: &str, file: &str, content: &str) {
+        self.branch_with_bytes(name, file, content.as_bytes());
+    }
+
+    /// [`Self::branch`] with content that need not be UTF-8.
+    pub(crate) fn branch_with_bytes(&self, name: &str, file: &str, content: &[u8]) {
         let origin_trunk = format!("{}@origin", self.trunk);
         jj(&self.work, ["new", "-r", &origin_trunk, "-m", name]);
         std::fs::write(self.work.join(file), content).expect("write branch content");
@@ -290,6 +295,26 @@ impl Lab {
 
     pub(crate) fn advance_upstream(&self, content: &str) {
         self.advance_upstream_unfetched(content);
+        jj(&self.work, ["git", "fetch", "--remote", "upstream"]);
+    }
+
+    /// Commit `file` on upstream's trunk (creating its directories) and fetch it into
+    /// the work checkout, so `<trunk>@upstream` carries it.
+    pub(crate) fn upstream_trunk_file(&self, file: &str, content: &str) {
+        let path = self.maintainer.join(file);
+        std::fs::create_dir_all(path.parent().expect("file has a parent")).expect("create dirs");
+        std::fs::write(&path, content).expect("write upstream trunk file");
+        git(&self.maintainer, &self.trunk, ["add", file]);
+        git(
+            &self.maintainer,
+            &self.trunk,
+            ["commit", "-m", "upstream trunk file"],
+        );
+        git(
+            &self.maintainer,
+            &self.trunk,
+            ["push", "origin", self.trunk.as_str()],
+        );
         jj(&self.work, ["git", "fetch", "--remote", "upstream"]);
     }
 

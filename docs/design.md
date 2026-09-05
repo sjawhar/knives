@@ -77,7 +77,8 @@ command never edits consumer checkouts.
 
 **The registry names repositories, not directories.** A `[repos.*]` entry carries `upstream`,
 `origin`, and the optional `base`, `release`, `release_branch`, `test_count_command`,
-`consumers`, and `workspaces`; there is no path field, and a file that still has one is refused
+`consumers`, `workspaces`, and `forbidden` (identifiers an upstream-bound diff must not add; `audit`
+scans for them); there is no path field, and a file that still has one is refused
 on load with the entry named.
 A checkout is the entry whose `upstream` its own `upstream` remote matches, so an entry
 follows the repository to wherever it is cloned and a machine's layout is not configuration.
@@ -288,7 +289,8 @@ knives pushed [BRANCH]... [--repo REPO]
                                compare local tips with the live remote refs that own them
 knives audit [REPO] [--all] [--no-github]
                                reconcile remote refs, open pull heads, recorded cuts, and
-                               anonymous heads; reports only, never repairs
+                               anonymous heads, with one row of facts per maintained branch;
+                               reports only, never repairs
 knives sync [REPO|--all]       fetch all remotes and tracked pull/N/head refs; classify each
                                tracked PR as new | unchanged | advanced | merged | closed
 knives preflight [REPO]        programmatic pre-contribution facts (see below)
@@ -297,7 +299,7 @@ knives status [REPO|--all]     problem-first status map; aligned branch rows (br
                                grouped findings, and unmatched workspaces
 knives pr NUMBER [--repo REPO] [--timeline]
                                one pull request's live state; --timeline reads its bounded forge event log
-knives start BRANCH            claim, create the workspace, base it on the release's shared base (falling back to fetched trunk)
+knives start BRANCH            claim (waiting for the claim lock; a refusal names the holder), create the workspace, base it on the release's shared base (falling back to fetched trunk)
 knives finish BRANCH           hand back claim and remove workspace; the branch, its bookmark,
                                and any open pull request survive the release
 knives track BRANCH --pr N     state which PR a branch belongs to, overriding inference
@@ -306,14 +308,16 @@ knives notch [SUBJECT]         read what happened here (bare: newest 20 human no
                                folded machine-event count; a subject: its whole chronology);
                                -m writes a note, --disposition requires --evidence
 knives release [NAME]          plan, cut, edit or reap a release under the configured scheme
-knives release cut [NAME]      name a new cut of the composition in hand, verbatim (first cut: every branch); refuses to orphan commits or to silently drop members the previous cut's ledger event recorded ([--allow-drop] overrides); never pushes
+knives release cut [NAME]      name a new cut of the composition in hand, verbatim (first cut: every branch); refuses to orphan commits or to silently drop members the previous cut's ledger event recorded ([--allow-drop] overrides both), and refuses a candidate with the same tree and the same parents as the previous cut on the publish remote; never pushes
 knives release reap            reap superseded dated release bookmarks everywhere locally and abandon their commits; all kept while the live cut carries conflicts
 knives release include BRANCH  add a branch (or revision) to the release as one new parent; nothing else moves
 knives release drop BRANCH     remove a branch's parent from the release; the branch and its bookmark are untouched
 knives release advance [BR..] [--from SHA]  move member parents to their branches' tips; named branches only, or every advanced member when bare; refuses a candidate that would replace more than one parent; --from names one branch's old parent directly, for a branch (e.g. `jj duplicate`-rebuilt) whose ancestry back to it is gone
-knives release carries [REVISION] [--in TARGET] [--all]
-                               bare replay is multi-target; --in selects one explicit target;
-                               --all censuses maintained branches
+knives release members [REF] [--verify] [--carries REV] [--census] [--no-github]
+                               the release's parents and holders; --verify replays every member;
+                               --carries REV asks whether REV's content is carried (by REF, else
+                               by every live release and upstream trunk); --census asks that of
+                               every maintained branch
 ```
 
 TOON is the machine default on any command when the environment says an agent is running it (or stdout is not a terminal): agents were grepping human output to count findings by detector, and JSON answered that at more tokens than the same structure needs. `--json` forces JSON exactly; `--text` forces prose.
@@ -330,6 +334,15 @@ deleted locally while its remote ref remained. It changes neither remote nor loc
 release-cut evidence, and anonymous heads. Its findings identify the observed drift; it never
 repairs, deletes, pushes, or opens a pull request. Per-pull history remains the separate,
 on-demand `knives pr <n> --timeline` read.
+
+The report also carries `branches`, one row of facts per maintained branch (every local bookmark
+that is neither the trunk nor a release name), and `template`, the upstream trunk's pull-request
+template once per report; the `using-knives` skill is the field list. Every field is an
+observation and `null` means unobserved; the facts never move the exit code. A divergent
+(conflicted) bookmark has no single tip: a branch gets a `problems` line instead of a row, a
+release-name bookmark gets its own `problems` line, and the trunk is `knives status`'s
+`divergence` finding, not the audit's. The forbidden-identifier scans run on at most eight threads
+however wide the machine: several owners audit one checkout in the same minute.
 
 `knives notch` has two moods, split by `-m`: bare it reads, `-m` writes.
 Reading is intentional and nothing injects notches into a session, so the bare form returns the
@@ -373,6 +386,8 @@ Workspaces are effectively free: 0.15 to 0.55s to create, because tracked conten
 
 `knives start` bases new work on the release's **shared base** when a release exists, falling back to the fetched trunk when none does, never on the current `@`. The shared base is the trunk point every member forks from, so a branch started there composes into the release without dragging newer upstream into the cut. Moving the composition to a newer trunk is `knives release rebase`: an intentional, separate decision, never a side effect of starting a branch. Never `@`, because an agent in a release workspace who runs `jj new` would inherit the release merge as a parent.
 
+Every claim writer (`start`, `finish`, `track`, `depends`, …) takes one lock on the claim store and waits for it with growing, jittered pauses, so a wave of concurrently dispatched `start`s serialises instead of failing; the `using-knives` skill states the lock's mechanism, the wait budget, the pause figures and the refusal messages. The lock is the kernel's advisory lock on `state.lock` (`File::try_lock`, `flock` on Linux), held by the open handle and gone with the holder's process. The file is never unlinked: it is the inode every waiter locks, and a path delete after an unlock would put two waiters on two inodes, each holding "the" lock. A knives that takes this path by exclusive create and unlinks it on drop reads the persistent file as always held, and holds no OS lock while it runs, so this binary acquires beside it and its unlink leaves the two on two inodes; the two binaries must not run concurrently on one machine, hooks included. The holder writes its pid into the file after acquiring; a refusal names it. `start` holds the lock across `fetch_all` and workspace creation, so a wave of N concurrent `start`s waits about N times one start's hold. The sidecar locks — sightings, the hook's session state — wait a fraction of the claim budget: a stale one must never stall a hook event.
+
 `knives start` also states the fork's `immutable_heads()` (detector 11 has the rule and why) in the repository's own jj config when that config states none, refreshes the one it wrote earlier when the entry's rule has changed, and says so on stdout — naming a user-level rule the write now shadows, when there is one. knives' own library-side rewrites (`describe`, `abandon`, reap) keep jj's default pin set on purpose: a rebase may move a member out from under a stale ref; knives never rewrites what a remote still names.
 
 A branch that does get rebased onto a newer trunk (a maintainer asks for it) is still its own member: `advance`, `include` and `drop` match a member to its branch by change id as well as ancestry (`MemberSuccession`), and fall back to the parent set the release's last cut or edit event recorded — a `parents` field naming every bookmark at each parent (`release_model::member_parents`), which is what answers for a branch rebased outside jj or landed upstream, where the repository itself no longer can. Reading a rebased branch as a stranger to its release is what led agents to keep a second "release-lineage" copy of each pull request branch. One branch, on the shared base, rebased only when someone decides to; the release follows.
@@ -383,17 +398,16 @@ Cuts, edits or repairs a release under the repository's configured scheme. Every
 
 A release's parent set is its membership: a flat merge of feature and fix branches, never the upstream base — members fork from it, so it is reachable through every one of them, and no base/member role exists to classify. `include`, `drop` and `advance` are the membership edits, each duplicating the release onto the changed parent set so recorded conflict resolutions carry forward; a cut names the composition in hand verbatim. Nothing recomputes membership from the branch list after the first cut.
 
-`knives release carries REVISION` is the content answer rather than an ancestry guess. Bare
-form compares the revision with every live release and the upstream trunk, reporting an exact,
-rewritten, conflicted, or not-carried verdict with the commit the replay judged. This deliberately
-changes the earlier release-in-hand contract: bare `carries` is multi-target, while `--in TARGET`
-retains the explicit single-target query. It also answers when no release exists, against the
-upstream trunk alone, rather than refusing; that is the only target needed to decide whether
-unreleased work would be orphaned. A revision is safe only when a live release or the trunk
-carries its content; a superseded release is consulted only after those targets miss and does not
-make the result safe.
+`knives release members --carries REVISION` is the content answer rather than an ancestry guess.
+With no REF it compares the revision with every live release and the upstream trunk, reporting an
+exact, rewritten, conflicted, or not-carried verdict with the commit the replay judged; `knives
+release members REF --carries REVISION` retains the explicit single-target query. It also answers
+when no release exists, against the upstream trunk alone, rather than refusing; that is the only
+target needed to decide whether unreleased work would be orphaned. A revision is safe only when a
+live release or the trunk carries its content; a superseded release is consulted only after those
+targets miss and does not make the result safe.
 
-`knives release carries --all` turns that same check into a census. Its primary matrix contains
+`knives release members --census` turns that same check into a census. Its primary matrix contains
 every maintained branch against the live releases and upstream trunk. Superseded releases are
 checked only when that matrix is complete and every answered verdict is not-carried; an unanswered
 row stays unanswered. Anonymous heads belong to `knives audit`'s orphan-commit detector.
@@ -408,6 +422,8 @@ source of truth, and names every bookmark still holding a parent plus branch tip
 beyond one. `--verify` replays every member's content into the release, reports missing and
 unexplained audit buckets, and makes either bucket a finding. Parent counts come from the
 repository's parent list, not text that happens to look like a parent declaration.
+
+After the orphan gate and before the content audit, a cut is refused (exit `3`) when it has the same tree and the same parents as the previous cut on the publish remote: the candidate is built by duplicating the in-hand previous release onto the same parents, so its tree and parents always match the local previous release, and the published copy is the one consumers can pin. A member rewritten with the same content is a different parent, so a cut of it is a new composition and lands; a previous cut not yet pushed is not compared.
 
 Every mutating verb applies as **one jj operation**, written through jj-lib in a single transaction and described in the operation log as knives' own act (`knives: release/X: included feat/y`, `knives: cut release/X`, `knives: reap …`) rather than as a trail of raw `jj` invocations. Failure before the commit writes nothing, so a half-applied edit is unconstructible. A cut audits a **candidate** built in a scratch transaction that is never committed: a failed audit evaporates without a trace, and a passing one rebuilds the spec, verifies the published tree is identical to the audited one, and creates-and-names the release in one operation. Git refs are exported in the same step, so `git` and `gh` in a colocated checkout see the result immediately. Rewrites honor jj's stock `immutable_heads()` (trunk, tags, untracked remote bookmarks) — the reap flow depends on that refusal. Identity for written commits resolves the way the jj CLI resolves it (`JJ_USER`/`JJ_EMAIL`, repo config, user config); every behavioral setting stays at jj's defaults. Only `jj git fetch` and the composition rebase (`release rebase`, defined as `jj rebase -b <release> -d <target>`) remain subprocess calls, deliberately (#18).
 

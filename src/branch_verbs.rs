@@ -108,6 +108,10 @@ pub(crate) fn run_finish(
         scribe_for(fork, bound)?.event(Some(branch.as_str()), text, pr)?;
     }
     store.save()?;
+    // The claim is recorded; nothing below touches the store, and removing a
+    // workspace with a build tree in it can take seconds another writer would
+    // otherwise spend waiting for the lock.
+    drop(store);
 
     let claim = if had { "released" } else { "was not held" };
     // Read what is at the path before writing anything to the repository: a jj

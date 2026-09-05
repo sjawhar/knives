@@ -37,9 +37,7 @@ use knives::forge::github::CliForge;
 use knives::ids::{BranchName, RepoName};
 use knives::ledger::{Ledger, Scribe};
 use knives::store::{Store, default_state_path};
-use release_carries::{
-    CarriesInvocation, MembersInvocation, run_release_carries, run_release_members,
-};
+use release_carries::{run_release_census, run_release_members, run_revision_carries};
 use release_cut::{ReleaseInvocation, run_reap, run_release};
 use release_edit::{ReleaseEdit, run_release_edit};
 use release_rebase::run_rebase;
@@ -500,6 +498,7 @@ fn run_audit(
     let cli_forge = CliForge;
     let forge = use_forge.then_some(&cli_forge as &dyn Forge);
     let cache_root = knives::forge_cache::cache_root();
+    let workers = parallelism();
     let mut worst = Exit::Ok;
     let mut reports = Vec::with_capacity(chosen.len());
     for chosen in &chosen {
@@ -509,13 +508,13 @@ fn run_audit(
                 store: &store,
                 forge,
                 cache_root: cache_root.as_deref(),
+                workers,
             }),
-            Selected::Unplaced { name, problem, .. } => audit::Report {
-                repo: name.to_string(),
-                findings: Vec::new(),
-                notes: Vec::new(),
-                problems: vec![problem.clone()],
-            },
+            Selected::Unplaced { name, problem, .. } => {
+                let mut report = audit::Report::new(name.to_string());
+                report.problems.push(problem.clone());
+                report
+            }
         };
         worst = worst.worst(audit::exit_for(&report));
         reports.push(report);
@@ -560,29 +559,23 @@ fn dispatch_release(
                 bound,
             )
         }
-        Some(ReleaseAction::Carries {
-            revision,
-            target,
-            all,
+        Some(ReleaseAction::Members {
+            reference,
+            verify,
+            carries,
+            census,
             no_github,
-        }) => run_release_carries(
-            fork,
-            CarriesInvocation {
-                revision: revision.as_deref(),
-                target: target.as_deref(),
-                all,
-                no_github,
-                output,
-            },
-        ),
-        Some(ReleaseAction::Members { reference, verify }) => run_release_members(
-            fork,
-            MembersInvocation {
-                reference: reference.as_deref(),
-                verify,
-                output,
-            },
-        ),
+        }) => {
+            // The parser keeps `--census` apart from REF, `--carries` and
+            // `--verify`, so a census request never has a target to lose here.
+            match (census, carries.as_deref()) {
+                (true, _) => run_release_census(fork, no_github, output),
+                (false, Some(revision)) => {
+                    run_revision_carries(fork, revision, reference.as_deref(), output)
+                }
+                (false, None) => run_release_members(fork, reference.as_deref(), verify, output),
+            }
+        }
         Some(ReleaseAction::Reap) => run_reap(fork),
         Some(ReleaseAction::Include { branch, why }) => run_release_edit(
             fork,

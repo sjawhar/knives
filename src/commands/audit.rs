@@ -15,20 +15,48 @@ use crate::ids::{
 };
 use crate::jj::{self, Repo};
 use crate::ledger::{Entry, Ledger};
+use crate::release_model::carried_from_tips;
 use crate::snapshot::{self, SnapshotConfig};
 use crate::store::Store;
 
+mod branches;
+
+pub use branches::{BranchFacts, CheckCounts, PullSnapshot, Template};
+use branches::{
+    LocalFacts, RowInput, add_branch_facts, attach_pulls, read_template, render_branch,
+};
+
 const ORPHAN_REVSET: &str = r#"heads(all()) ~ ::(bookmarks() | remote_bookmarks() | tags()) ~ working_copies() ~ (empty() & description(exact:""))"#;
 
-/// Every audit finding, note, and unanswered check for one repository.
+/// Every audit finding, note, and unanswered check for one repository, with
+/// one row of facts per maintained branch.
 #[derive(Debug, serde::Serialize)]
 pub struct Report {
     pub repo: String,
+    /// Upstream's pull-request template, read once per run; `None` when the
+    /// trunk carries none or no forge was asked.
+    pub template: Option<Template>,
+    /// One row per maintained branch: what is observed, never what to do.
+    pub branches: Vec<BranchFacts>,
     pub findings: Vec<Finding>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub notes: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub problems: Vec<String>,
+}
+
+impl Report {
+    /// An empty report for `repo`, before anything is observed.
+    pub fn new(repo: impl Into<String>) -> Self {
+        Self {
+            repo: repo.into(),
+            template: None,
+            branches: Vec::new(),
+            findings: Vec::new(),
+            notes: Vec::new(),
+            problems: Vec::new(),
+        }
+    }
 }
 
 /// Dependencies shared by the read-only estate checks.
@@ -37,6 +65,8 @@ pub struct AuditInput<'a> {
     pub store: &'a Store,
     pub forge: Option<&'a dyn Forge>,
     pub cache_root: Option<&'a Path>,
+    /// Threads for the per-branch diff scans.
+    pub workers: usize,
 }
 
 impl std::fmt::Debug for AuditInput<'_> {
@@ -46,6 +76,7 @@ impl std::fmt::Debug for AuditInput<'_> {
             .field("fork", self.fork)
             .field("forge", &self.forge.is_some())
             .field("cache_root", &self.cache_root)
+            .field("workers", &self.workers)
             .finish()
     }
 }
@@ -55,12 +86,7 @@ pub fn gather(input: &AuditInput<'_>) -> Report {
     let fork = input.fork;
     let entry = fork.entry;
     let path = &fork.checkout.path;
-    let mut report = Report {
-        repo: fork.name.to_string(),
-        findings: Vec::new(),
-        notes: Vec::new(),
-        problems: Vec::new(),
-    };
+    let mut report = Report::new(fork.name.to_string());
     let opened = match Repo::open(path) {
         Ok(opened) => opened,
         Err(error) => {
@@ -79,7 +105,18 @@ pub fn gather(input: &AuditInput<'_>) -> Report {
             return report;
         }
     };
-    add_unconfigured_remote_refs(&mut report, &opened, &fork.checkout.remotes, &tips);
+    let conflicted = match opened.conflicted_bookmarks() {
+        Ok(conflicted) => conflicted,
+        Err(error) => {
+            report
+                .problems
+                .push(format!("could not read conflicted bookmarks: {error}"));
+            return report;
+        }
+    };
+    add_unconfigured_remote_refs(&mut report, &fork.checkout.remotes, &tips, &conflicted);
+    let scheme = entry.release_scheme();
+    let carried = carried_from_tips(&tips, entry.trunk(), &scheme);
     let local = pushed::local_tips(tips);
     let live = match pushed::live_refs(entry) {
         Ok(live) => live,
@@ -90,7 +127,6 @@ pub fn gather(input: &AuditInput<'_>) -> Report {
             return report;
         }
     };
-    let scheme = entry.release_scheme();
     let requested: Vec<BranchName> = local.keys().cloned().collect();
     let tracked = tracked(input.store, &fork.name, &requested);
     let rows = pushed::reconcile(&ReconcileInput {
@@ -122,25 +158,51 @@ pub fn gather(input: &AuditInput<'_>) -> Report {
     );
     add_misplaced_origin_release_refs(&mut report, live.origin(), &scheme, entry.publish_remote());
     add_orphan_commits(&mut report, &opened, path);
-    add_open_pull_head_checks(&mut report, input, &local, live.origin());
+    let template = template_for_pulls(&mut report, input);
+    add_branch_facts(
+        &mut report,
+        input,
+        &opened,
+        &RowInput {
+            origin_refs: live.origin(),
+            carried: &carried,
+            conflicted: &conflicted,
+        },
+    );
+    add_open_pull_head_checks(
+        &mut report,
+        input,
+        &LocalFacts {
+            local: &local,
+            origin_refs: live.origin(),
+            tracked: &tracked,
+            template: template.as_ref(),
+        },
+    );
+    report.template = template;
     report
+}
+
+/// Upstream's pull-request template, read only when a forge will answer the
+/// bodies it is held against; an unreadable template is a problem line.
+fn template_for_pulls(report: &mut Report, input: &AuditInput<'_>) -> Option<Template> {
+    input.forge?;
+    let entry = input.fork.entry;
+    read_template(&input.fork.checkout.path, entry).unwrap_or_else(|error| {
+        report.problems.push(format!(
+            "could not read the pull-request template at {}: {error}",
+            entry.upstream_trunk()
+        ));
+        None
+    })
 }
 
 fn add_unconfigured_remote_refs(
     report: &mut Report,
-    opened: &Repo,
     configured: &BTreeMap<String, String>,
     tips: &BookmarkTips,
+    conflicted: &[(BookmarkRef, Vec<CommitId>)],
 ) {
-    let conflicted = match opened.conflicted_bookmarks() {
-        Ok(conflicted) => conflicted,
-        Err(error) => {
-            report
-                .problems
-                .push(format!("could not read conflicted bookmarks: {error}"));
-            return;
-        }
-    };
     let unconfigured: BTreeSet<&str> = tips
         .keys()
         .chain(conflicted.iter().map(|(reference, _)| reference))
@@ -452,77 +514,88 @@ fn add_orphan_commits(report: &mut Report, opened: &Repo, path: &Path) {
     }
 }
 
-fn add_open_pull_head_checks(
-    report: &mut Report,
-    input: &AuditInput<'_>,
-    local: &BTreeMap<BranchName, CommitId>,
-    origin_refs: &BTreeMap<String, CommitId>,
-) {
+fn add_open_pull_head_checks(report: &mut Report, input: &AuditInput<'_>, facts: &LocalFacts<'_>) {
     let Some(forge) = input.forge else {
         report
             .problems
             .push("open pull-head reconciliation was skipped (--no-github)".to_owned());
         return;
     };
-    let request = PullHeadInput {
-        fork: input.fork,
-        forge,
-        cache_root: input.cache_root,
-        local,
-        origin_refs,
-    };
-    match pull_head_findings(&request, &mut report.findings, &mut report.notes) {
-        Ok(problems) => report.problems.extend(problems),
-        Err(error) => report
+    if let Err(error) = pull_head_findings(input, forge, facts, report) {
+        report
             .problems
-            .push(format!("could not read open pull-request heads: {error}")),
+            .push(format!("could not read open pull-request heads: {error}"));
     }
 }
 
-struct PullHeadInput<'a> {
-    fork: &'a Fork<'a>,
-    forge: &'a dyn Forge,
-    cache_root: Option<&'a Path>,
-    local: &'a BTreeMap<BranchName, CommitId>,
-    origin_refs: &'a BTreeMap<String, CommitId>,
-}
-
+/// One live batch over the open pull requests we own and the tracked numbers,
+/// then: head-position findings per open pull of ours, a problem per open pull
+/// of ours the batch withheld, the cache write, and a [`PullSnapshot`] on every
+/// branch row whose primary pull request the batch answered open.
 fn pull_head_findings(
-    input: &PullHeadInput<'_>,
-    findings: &mut Vec<Finding>,
-    notes: &mut Vec<String>,
-) -> Result<Vec<String>, crate::forge::ForgeError> {
-    let entry = input.fork.entry;
+    input: &AuditInput<'_>,
+    forge: &dyn Forge,
+    facts: &LocalFacts<'_>,
+    report: &mut Report,
+) -> Result<(), crate::forge::ForgeError> {
+    let fork = input.fork;
+    let entry = fork.entry;
     let opened = snapshot::open(SnapshotConfig {
-        forge: input.forge,
-        path: &input.fork.checkout.path,
+        forge,
+        path: &fork.checkout.path,
         remotes: [entry.remote(Role::Origin), entry.remote(Role::Release)],
         cache_root: input.cache_root,
     })?;
-    let snapshot = opened.complete_with(&(), |discovery, ()| {
+    let snapshot = opened.complete_with(facts.tracked, |discovery, tracked| {
         discovery
             .ours()
             .iter()
             .filter(|pull| pull.is_open())
             .map(|pull| pull.number)
+            .chain(tracked.values().copied())
             .collect()
     })?;
-    let mut problems = Vec::new();
+    // Findings and problems concern the pull requests we own. A tracked number
+    // another author opened has a head on their fork, which no local bookmark
+    // or origin ref of ours is expected to match: its facts go on the row
+    // (`head_matches_tip`), and facts never move the exit.
+    let ours_open: BTreeSet<u64> = snapshot
+        .ours()
+        .iter()
+        .filter(|pull| pull.is_open())
+        .map(|pull| pull.number)
+        .collect();
     for number in snapshot.requested() {
         match snapshot.fact(*number) {
-            Some(fact) if fact.pull.is_open() => {
-                pull_position_findings(&fact.pull, input.local, input.origin_refs, findings);
+            Some(fact) if fact.pull.is_open() && ours_open.contains(number) => {
+                pull_position_findings(
+                    &fact.pull,
+                    facts.local,
+                    facts.origin_refs,
+                    &mut report.findings,
+                );
             }
             Some(_) => {}
-            None => problems.push(format!(
-                "open pull request #{number} was not answered by the live batch"
+            None if ours_open.contains(number) => {
+                report.problems.push(format!(
+                    "open pull request #{number} was not answered by the live batch"
+                ));
+            }
+            None => report.notes.push(format!(
+                "tracked pull request #{number} was not answered by the live batch"
             )),
         }
     }
+    attach_pulls(
+        &mut report.branches,
+        &snapshot,
+        facts.tracked,
+        facts.template,
+    );
     if let Err(note) = snapshot.persist(None) {
-        notes.push(note.to_string());
+        report.notes.push(note.to_string());
     }
-    Ok(problems)
+    Ok(())
 }
 
 fn pull_position_findings(
@@ -575,11 +648,18 @@ pub const fn exit_for(report: &Report) -> Exit {
     }
 }
 
-/// Render findings grouped by detector, followed by the one deeper-history surface.
+/// Render problems, the per-branch facts, findings grouped by detector, notes,
+/// and the one deeper-history surface.
 pub fn render(report: &Report) -> String {
     let mut lines = format!("{}: audit", report.repo);
     for problem in &report.problems {
         let _ = write!(lines, "\n  PROBLEM: {problem}");
+    }
+    if !report.branches.is_empty() {
+        lines.push_str("\n  branches:");
+        for row in &report.branches {
+            let _ = write!(lines, "\n    {}", render_branch(row));
+        }
     }
     let mut groups: BTreeMap<FindingKind, Vec<&Finding>> = BTreeMap::new();
     for finding in &report.findings {
@@ -605,7 +685,7 @@ pub fn render(report: &Report) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AuditInput, PullHeadInput, ReleaseDriftScan, Report, add_misplaced_origin_release_refs,
+        AuditInput, LocalFacts, ReleaseDriftScan, Report, add_misplaced_origin_release_refs,
         add_open_pull_head_checks, add_release_drifts, exit_for, pull_head_findings,
         pull_position_findings, recorded_commit, same_commit,
     };
@@ -617,11 +697,72 @@ mod tests {
         Account, Forge, ForgeError, PullDetails, PullFacts, PullRequest, PullSummary, RepoIdentity,
         SweepPage, TimelineEvent, fake::FakeForge,
     };
-    use crate::ids::{BookmarkRef, BranchName, CommitId, RepoName};
+    use crate::ids::{BookmarkRef, BranchName, CommitId};
     use crate::ledger::{Entry, Kind, Ledger};
     use crate::store::Store;
     use std::collections::BTreeMap;
     use std::path::Path;
+
+    static NO_TIPS: BTreeMap<BranchName, CommitId> = BTreeMap::new();
+    static NO_REFS: BTreeMap<String, CommitId> = BTreeMap::new();
+    static NO_TRACKED: BTreeMap<BranchName, u64> = BTreeMap::new();
+
+    /// A checkout with no bookmarks, no origin refs, nothing tracked, no template.
+    fn no_local_facts() -> LocalFacts<'static> {
+        LocalFacts {
+            local: &NO_TIPS,
+            origin_refs: &NO_REFS,
+            tracked: &NO_TRACKED,
+            template: None,
+        }
+    }
+
+    /// Local facts over `local` and `origin`, with `tracked` numbers and no template.
+    fn facts_over<'a>(
+        local: &'a BTreeMap<BranchName, CommitId>,
+        origin: &'a BTreeMap<String, CommitId>,
+        tracked: &'a BTreeMap<BranchName, u64>,
+    ) -> LocalFacts<'a> {
+        LocalFacts {
+            local,
+            origin_refs: origin,
+            tracked,
+            template: None,
+        }
+    }
+
+    /// The audit's dependencies with one scan thread and no cache.
+    fn audit_input<'a>(
+        fork: &'a Fork<'a>,
+        store: &'a Store,
+        forge: Option<&'a dyn Forge>,
+        cache_root: Option<&'a Path>,
+    ) -> AuditInput<'a> {
+        AuditInput {
+            fork,
+            store,
+            forge,
+            cache_root,
+            workers: 1,
+        }
+    }
+
+    /// One live batch against `forge` over an empty store and no cache.
+    fn batch(
+        fork: &Fork<'_>,
+        forge: &dyn Forge,
+        facts: &LocalFacts<'_>,
+        report: &mut Report,
+    ) -> Result<(), ForgeError> {
+        let temp = tempfile::tempdir().expect("create test store");
+        let store = Store::open(temp.path().join("state.json")).expect("open test store");
+        pull_head_findings(
+            &audit_input(fork, &store, Some(forge), None),
+            forge,
+            facts,
+            report,
+        )
+    }
 
     #[derive(Debug)]
     struct ChangingFactsForge {
@@ -771,12 +912,7 @@ mod tests {
                 parents: Vec::new(),
             })
             .expect("record cut");
-        let mut report = Report {
-            repo: "demo".to_owned(),
-            findings: Vec::new(),
-            notes: Vec::new(),
-            problems: Vec::new(),
-        };
+        let mut report = Report::new("demo");
         let published = BTreeMap::from([(
             "refs/heads/release/2026-08-15".to_owned(),
             CommitId::new("cccccccccccccccccccccccccccccccccccccccc"),
@@ -811,12 +947,7 @@ mod tests {
 
     #[test]
     fn an_origin_release_ref_is_misplaced_when_another_remote_publishes_releases() {
-        let mut report = Report {
-            repo: "demo".to_owned(),
-            findings: Vec::new(),
-            notes: Vec::new(),
-            problems: Vec::new(),
-        };
+        let mut report = Report::new("demo");
         add_misplaced_origin_release_refs(
             &mut report,
             &BTreeMap::from([(
@@ -851,12 +982,7 @@ mod tests {
                 "https://forge.invalid/ours/demo.git",
             )
         };
-        let mut report = Report {
-            repo: "demo".to_owned(),
-            findings: Vec::new(),
-            notes: Vec::new(),
-            problems: Vec::new(),
-        };
+        let mut report = Report::new("demo");
 
         add_misplaced_origin_release_refs(
             &mut report,
@@ -940,22 +1066,17 @@ mod tests {
             "refs/heads/feat/alpha".to_owned(),
             CommitId::new("origin00000000000000000000000000000000000"),
         )]);
-        let mut findings = Vec::new();
-        let mut notes = Vec::new();
+        let mut report = Report::new("demo");
 
-        pull_head_findings(
-            &PullHeadInput {
-                fork: &fork,
-                forge: &forge,
-                cache_root: None,
-                local: &local,
-                origin_refs: &origin,
-            },
-            &mut findings,
-            &mut notes,
+        batch(
+            &fork,
+            &forge,
+            &facts_over(&local, &origin, &NO_TRACKED),
+            &mut report,
         )
         .expect("fake forge should complete the open pull batch");
 
+        let findings = report.findings;
         assert_eq!(findings.len(), 2);
         assert!(
             findings
@@ -974,24 +1095,12 @@ mod tests {
         };
         let temp = tempfile::tempdir().expect("create test cache");
         let store = Store::open(temp.path().join("state.json")).expect("open test store");
-        let repo = RepoName::new("demo");
-        let mut report = Report {
-            repo: repo.to_string(),
-            findings: Vec::new(),
-            notes: Vec::new(),
-            problems: Vec::new(),
-        };
+        let mut report = Report::new("demo");
 
         add_open_pull_head_checks(
             &mut report,
-            &AuditInput {
-                fork: &fork,
-                store: &store,
-                forge: Some(&forge),
-                cache_root: Some(temp.path()),
-            },
-            &BTreeMap::new(),
-            &BTreeMap::new(),
+            &audit_input(&fork, &store, Some(&forge), Some(temp.path())),
+            &no_local_facts(),
         );
 
         let identity = RepoIdentity {
@@ -1015,24 +1124,12 @@ mod tests {
         let blocked_root = temp.path().join("blocked-cache-root");
         std::fs::write(&blocked_root, "not a directory").expect("block cache root");
         let store = Store::open(temp.path().join("state.json")).expect("open test store");
-        let repo = RepoName::new("demo");
-        let mut report = Report {
-            repo: repo.to_string(),
-            findings: Vec::new(),
-            notes: Vec::new(),
-            problems: Vec::new(),
-        };
+        let mut report = Report::new("demo");
 
         add_open_pull_head_checks(
             &mut report,
-            &AuditInput {
-                fork: &fork,
-                store: &store,
-                forge: Some(&forge),
-                cache_root: Some(&blocked_root),
-            },
-            &BTreeMap::new(),
-            &BTreeMap::new(),
+            &audit_input(&fork, &store, Some(&forge), Some(&blocked_root)),
+            &no_local_facts(),
         );
 
         assert!(
@@ -1043,6 +1140,7 @@ mod tests {
             "cache-write failure was not noted: {report:?}"
         );
     }
+
     #[test]
     fn a_withheld_open_pull_fact_makes_the_audit_incomplete() {
         let entry = test_entry();
@@ -1053,26 +1151,12 @@ mod tests {
         };
         let temp = tempfile::tempdir().expect("create test store");
         let store = Store::open(temp.path().join("state.json")).expect("open test store");
-        let repo = RepoName::new("demo");
-        let local = BTreeMap::new();
-        let origin = BTreeMap::new();
-        let mut report = Report {
-            repo: repo.to_string(),
-            findings: Vec::new(),
-            notes: Vec::new(),
-            problems: Vec::new(),
-        };
+        let mut report = Report::new("demo");
 
         add_open_pull_head_checks(
             &mut report,
-            &AuditInput {
-                fork: &fork,
-                store: &store,
-                forge: Some(&forge),
-                cache_root: None,
-            },
-            &local,
-            &origin,
+            &audit_input(&fork, &store, Some(&forge), None),
+            &no_local_facts(),
         );
 
         assert_eq!(
@@ -1098,22 +1182,87 @@ mod tests {
             "refs/heads/feat/alpha".to_owned(),
             CommitId::new("origin00000000000000000000000000000000000"),
         )]);
-        let mut findings = Vec::new();
-        let mut notes = Vec::new();
+        let mut report = Report::new("demo");
 
-        pull_head_findings(
-            &PullHeadInput {
-                fork: &fork,
-                forge: &forge,
-                cache_root: None,
-                local: &local,
-                origin_refs: &origin,
-            },
-            &mut findings,
-            &mut notes,
+        batch(
+            &fork,
+            &forge,
+            &facts_over(&local, &origin, &NO_TRACKED),
+            &mut report,
         )
         .expect("the changed pull fact is still a successful batch answer");
 
-        assert!(findings.is_empty(), "was: {findings:?}");
+        assert!(report.findings.is_empty(), "was: {:?}", report.findings);
+    }
+
+    #[test]
+    fn a_tracked_pull_of_another_author_does_not_move_the_exit() {
+        // Given: `knives track --pr 41` on feat/alpha names a pull request someone
+        // else opened from their fork, whose head equals our local tip.
+        let entry = test_entry();
+        let fork = Fork::at("demo", &entry, Path::new("/fake"));
+        let tip = "expected0000000000000000000000000000000";
+        let forge = FakeForge {
+            pull_requests: BTreeMap::from([(
+                BranchName::new("their/branch"),
+                PullRequest {
+                    number: 41,
+                    state: "OPEN".to_owned(),
+                    head_ref_name: "their/branch".to_owned(),
+                    head_ref_oid: tip.to_owned(),
+                    head_repository_owner: Some(Account {
+                        login: "someone-else".to_owned(),
+                    }),
+                    ..PullRequest::default()
+                },
+            )]),
+            ..FakeForge::default()
+        };
+        let local = BTreeMap::from([(BranchName::new("feat/alpha"), CommitId::new(tip))]);
+        let tracked = BTreeMap::from([(BranchName::new("feat/alpha"), 41)]);
+        let mut report = Report::new("demo");
+
+        batch(
+            &fork,
+            &forge,
+            &facts_over(&local, &NO_REFS, &tracked),
+            &mut report,
+        )
+        .expect("the tracked number is answered");
+
+        // Then: nothing moves — their branch name is not ours to reconcile
+        // against origin or a bookmark.
+        assert!(report.findings.is_empty(), "was: {:?}", report.findings);
+        assert!(report.problems.is_empty(), "was: {:?}", report.problems);
+        assert_eq!(exit_for(&report), Exit::Ok);
+    }
+
+    #[test]
+    fn an_unanswered_tracked_number_is_a_note_not_a_problem() {
+        // Given: a tracked number the forge no longer knows (deleted, or mistyped).
+        let entry = test_entry();
+        let fork = Fork::at("demo", &entry, Path::new("/fake"));
+        let forge = FakeForge::default();
+        let local = BTreeMap::from([(
+            BranchName::new("feat/alpha"),
+            CommitId::new("local000000000000000000000000000000000000"),
+        )]);
+        let tracked = BTreeMap::from([(BranchName::new("feat/alpha"), 41)]);
+        let mut report = Report::new("demo");
+
+        batch(
+            &fork,
+            &forge,
+            &facts_over(&local, &NO_REFS, &tracked),
+            &mut report,
+        )
+        .expect("an unanswered tracked number is not a batch failure");
+
+        assert_eq!(
+            report.notes,
+            vec!["tracked pull request #41 was not answered by the live batch"]
+        );
+        assert!(report.problems.is_empty(), "was: {:?}", report.problems);
+        assert_eq!(exit_for(&report), Exit::Ok);
     }
 }

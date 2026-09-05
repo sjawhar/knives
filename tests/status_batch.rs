@@ -263,6 +263,8 @@ impl Forge for CountingForge {
                                     diff: None,
                                     head_ref_deleted: None,
                                     tip_commit_empty: None,
+                                    body: None,
+                                    unresolved_review_threads: None,
                                 },
                                 newest_comment: None,
                             },

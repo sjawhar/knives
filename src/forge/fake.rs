@@ -31,6 +31,10 @@ pub struct FakeForge {
     /// history a batch can still answer about).
     pub vanished_states: BTreeMap<u64, String>,
     pub newest_comments: BTreeMap<u64, String>,
+    /// Pull-request bodies by number; a number absent here answers `body: None`.
+    pub bodies: BTreeMap<u64, String>,
+    /// Unresolved review-thread counts by number; absent answers `None`.
+    pub unresolved_threads: BTreeMap<u64, usize>,
     pub timeline: BTreeMap<u64, Vec<TimelineEvent>>,
     pub fail_identity: bool,
     pub fail_list: bool,
@@ -154,6 +158,11 @@ impl Forge for FakeForge {
                                     diff: None,
                                     head_ref_deleted: None,
                                     tip_commit_empty: None,
+                                    body: self.bodies.get(number).cloned(),
+                                    unresolved_review_threads: self
+                                        .unresolved_threads
+                                        .get(number)
+                                        .copied(),
                                 },
                                 newest_comment: self.newest_comments.get(number).cloned(),
                             })

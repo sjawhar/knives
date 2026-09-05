@@ -158,6 +158,7 @@ origin = "https://forge.example/ours/libcore"
 base = "main"                         # optional: upstream's trunk (defaults to main)
 release = "https://forge.example/company/libcore"   # optional: where releases publish
 consumers = ["company/workbench"]     # optional: forge slugs that pin this repo's releases
+forbidden = ["acme-corp", "internal.example"]   # optional: identifiers an upstream-bound diff must not add
 
 [repos.tool]
 upstream = "https://forge.example/org/tool"
@@ -198,6 +199,11 @@ consumer repository's trunk and caches that scan by the trunk commit. If the for
 cached results are labeled as such and the command is incomplete; pass `--consumer PATH` for an
 ad-hoc local scan without recording the path.
 
+`forbidden` lists identifiers an upstream-bound diff must not add: your org, your product, your
+hosts. `knives audit` reports every line a branch adds over its fork point with the upstream trunk
+that contains one; a branch stated `--fork-only` is exempt. Absent, no scan runs. The `using-knives`
+skill has the matching and load rules.
+
 Every command takes its repo from the directory you are standing in, wherever that checkout
 lives. Name one only when you are somewhere else; knives then scans `~` three directories deep
 for jj checkouts, as `knives repos` and `status --all` always do. An entry with no checkout found
@@ -210,19 +216,18 @@ reads `not on this machine`, and an entry with two is refused with both paths na
 | `knives repos` | what is managed, where each checkout was found (or `not on this machine`), the newest release each has cut, and whether registered forge consumers pin it |
 | `knives consumers [FORK] [--consumer PATH]...` | compare registered forge consumers and ad-hoc local scans with the newest release on the live publish remote; reports only |
 | `knives pushed [BRANCH]... [--repo REPO]` | compare local branches with the live remote refs that own them; reports only |
-| `knives audit [REPO] [--all] [--no-github]` | reconcile remote refs, open pull heads, recorded cuts, and anonymous heads; reports only and never repairs |
+| `knives audit [REPO] [--all] [--no-github]` | reconcile remote refs, open pull heads, recorded cuts, and anonymous heads, with one row of facts per maintained branch (the `using-knives` skill has the fields); reports only and never repairs |
 | `knives status` | the main report |
 | `knives pr NUMBER [--repo REPO] [--timeline]` | one pull request's live state; `--timeline` adds its bounded forge event log |
 | `knives sync` | fetch, then classify what happened to each tracked pull request |
 | `knives preflight` | the facts to check before contributing upstream |
-| `knives start` | take a branch and get your own workspace: on its tip, or on the release's shared base for a new one; states the fork's `immutable_heads()` (trunk and tags, with the trunk named on every knives remote) in the repo's jj config where none is stated |
+| `knives start` | take a branch and get your own workspace: on its tip, or on the release's shared base for a new one; waits for the claim lock, and a refusal names the holder (the `using-knives` skill has the lock's mechanism, wait and messages); states the fork's `immutable_heads()` (trunk and tags, with the trunk named on every knives remote) in the repo's jj config where none is stated |
 | `knives finish` | hand a branch back so another agent can pick it up; its bookmark and any open pull request survive |
 | `knives track` | state which pull request a branch belongs to, when inference cannot find it |
 | `knives depends` | record that a branch cannot land before another repo's pull request |
 | `knives notch [SUBJECT] [-m TEXT] [--disposition TOKEN]` | read the ledger or write a human note; dispositions require evidence, `--dispositions` reads terminal rulings, and `--verify` re-checks selected entries |
 | `knives release` | plan a release, edit its membership, cut one, or reap superseded cuts |
-| `knives release carries [REVISION] [--in TARGET] [--all]` | compare a revision's content with live releases and upstream trunk; `--all` censuses maintained branches, conditionally checks superseded releases, and reports qualified orphans |
-| `knives release members [REF] [--verify]` | list a release's direct member parents, their holders and advances; `--verify` audits every member's content in the release |
+| `knives release members [REF] [--verify] [--carries REV] [--census] [--no-github]` | list a release's direct member parents, their holders and advances; `--verify` audits every member's content in the release; `--carries REV` asks whether REV's content is carried — by REF, or by every live release and upstream trunk; `--census` asks that of every maintained branch, conditionally checks superseded releases, and reports qualified orphans |
 | `knives register [DIR]` | print the registry entry for a checkout, or `already registered as <name>`; writes nothing |
 | `knives hook` | harness plumbing, not for humans |
 | `knives gh` | fork-aware `gh` passthrough |
@@ -273,10 +278,13 @@ never mint a "release-lineage" sibling of the branch on an older base. A member 
 history carries a release merge is reported as `stacked-history`, and the plan stops calling
 the cut `flat`.
 
-`knives release carries REVISION` compares the revision with every live release and the upstream
-trunk. `--in TARGET` selects exactly one target; `--all` censuses every maintained branch.
+`knives release members --carries REVISION` compares the revision with every live release and the
+upstream trunk; `knives release members TARGET --carries REVISION` asks exactly one target;
+`knives release members --census` asks that of every maintained branch.
 
 Before cutting, the orphan gate verifies that no commits exist reachable only from the previous release lineage or its descendants; if commits would be stranded without a remaining bookmark or upstream trunk reaching them, the cut refuses and lists the exact commit IDs. Passing `--allow-drop` overrides this refusal when dropping those commits is intentional.
+
+Before the content audit runs, a cut with the same tree and the same parents as the previous cut on the publish remote is refused: a new name would ship nothing and only ask consumers to re-pin. A member rewritten with the same content is a new parent, so a cut of it is a new composition. A previous cut not yet pushed has no consumer to protect and is not compared.
 
 A second pre-publish gate holds the candidate against the previous cut's ledger event — the only record of a parent set that survives the release bookmark moving, since every edit relocates the name and the next cut reaps the superseded commit. A recorded member whose content the candidate does not carry (not a parent, not an ancestor of one, and its net diff absent from the candidate tree) refuses the cut and is named; a member that landed upstream and entered the candidate through its base passes without comment. `--allow-drop` states the drop is intended, and the new cut's ledger event then records exactly which members were dropped.
 
@@ -311,8 +319,10 @@ up to the repository root are injected nearest first, while `CONTRIBUTING.md` is
 than injected. Guidance arrives wrapped in a per-injection nonce and framed as data, so a
 repository whose files you are reading cannot forge an instruction to you.
 
-Three skills ship with both adapters: `fork-work` for what to check before touching a fork,
-`using-knives` for the CLI, and `pr-preflight` for contributing upstream.
+Five skills ship with both adapters: `fork-work` for what to check before touching a fork,
+`using-knives` for the CLI, `pr-preflight` for contributing upstream, `maintaining-fork-release`
+for sweeping the estate's open pull requests as a set, and `maintaining-fork-pr` for owning one of
+them end-to-end.
 
 ## What it does not do
 

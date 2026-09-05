@@ -15,7 +15,8 @@ use crate::commands::claim::Identity;
 use crate::commands::wip::workspace_for;
 use crate::ids::{RepoName, WorkspaceName};
 use crate::jj::WorkspaceActivity;
-use crate::store::{Claim, OwnerKind, StoreLock, default_state_path};
+use crate::lock::{FileLock, LockWait};
+use crate::store::{Claim, OwnerKind, default_state_path};
 
 const PRUNE_AGE: jiff::SignedDuration = jiff::SignedDuration::from_hours(90 * 24);
 const THROTTLE_AGE: jiff::SignedDuration = jiff::SignedDuration::from_secs(60);
@@ -55,7 +56,7 @@ pub fn record_observation(repo: Option<&RepoName>, cwd: &Path, identity: &Identi
     }
 
     let path = seen_path();
-    let Ok(_lock) = StoreLock::acquire(&path) else {
+    let Ok(_lock) = FileLock::acquire(&path, LockWait::BRIEF) else {
         return;
     };
     let Ok(mut seen) = read(&path) else {

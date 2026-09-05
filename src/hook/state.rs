@@ -5,7 +5,7 @@ use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
-use crate::store::StoreLock;
+use crate::lock::{FileLock, LockWait};
 
 const SESSIONS_DIRECTORY: &str = "hook-sessions";
 const PRUNE_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
@@ -48,7 +48,7 @@ impl SessionState {
     ) -> anyhow::Result<Self> {
         let directory = session_directory(home);
         let path = state_path(&directory, harness, session_id);
-        let _lock = StoreLock::acquire(&path)?;
+        let _lock = FileLock::acquire(&path, LockWait::BRIEF)?;
         let mut state = Self::load_path(&path);
         apply(&mut state);
         state.persist(&directory, &path)?;
@@ -78,9 +78,14 @@ impl SessionState {
         self.seen_notices.clear();
     }
 
+    /// Remove the session's record and the lock file beside it. Unlike the
+    /// claim store's lock, this lock is the session's alone and the session is
+    /// over: nothing waits on it, so deleting the inode strands no waiter.
     pub fn delete(home: &Path, harness: &str, session_id: &str) {
         let directory = session_directory(home);
-        let _ = std::fs::remove_file(state_path(&directory, harness, session_id));
+        let path = state_path(&directory, harness, session_id);
+        let _ = std::fs::remove_file(path.with_extension("lock"));
+        let _ = std::fs::remove_file(path);
     }
 
     fn load_path(path: &Path) -> Self {

@@ -152,6 +152,11 @@ pub struct RepoEntry {
     /// taken from the config directory, not the checkout.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspaces: Option<PathBuf>,
+    /// Identifiers an upstream-bound diff must not add: our org, our product,
+    /// our hosts. `knives audit` reports every added line that names one;
+    /// branches stated `--fork-only` are exempt. Case-insensitive substrings.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub forbidden: Vec<String>,
 }
 
 impl RepoEntry {
@@ -166,6 +171,7 @@ impl RepoEntry {
             test_count_command: None,
             consumers: Vec::new(),
             workspaces: None,
+            forbidden: Vec::new(),
         }
     }
 
@@ -508,6 +514,7 @@ pub fn load(path: &Path) -> Result<Registry, ConfigError> {
                 });
             }
         }
+        checked_forbidden(name, &entry.forbidden, path)?;
     }
     for slug in &registry.trust.repos {
         if !is_forge_slug(slug) {
@@ -599,6 +606,32 @@ fn checked_release_branch(entry: &RepoEntry, path: &Path) -> Result<(), ConfigEr
                 crate::ids::RELEASE_PREFIX
             ),
         });
+    }
+    Ok(())
+}
+
+/// A blank term is a substring of every line, so the scan would report every
+/// added line; a term listed twice (case-insensitively, as the scan matches)
+/// would report every hit twice.
+fn checked_forbidden(name: &str, terms: &[String], path: &Path) -> Result<(), ConfigError> {
+    let mut seen = std::collections::BTreeSet::new();
+    for term in terms {
+        if term.trim().is_empty() {
+            return Err(ConfigError::Invalid {
+                path: path.to_owned(),
+                detail: format!(
+                    "[repos.{name}] forbidden holds an empty term; every term must have text"
+                ),
+            });
+        }
+        if !seen.insert(term.to_lowercase()) {
+            return Err(ConfigError::Invalid {
+                path: path.to_owned(),
+                detail: format!(
+                    "[repos.{name}] forbidden lists {term:?} twice; terms match case-insensitively"
+                ),
+            });
+        }
     }
     Ok(())
 }
@@ -782,6 +815,45 @@ release = "https://example.invalid/releases.git"
             registry.repos["demo"].release_scheme(),
             crate::ids::ReleaseScheme::Fixed(crate::ids::BranchName::new("integration"))
         );
+    }
+
+    #[test]
+    fn forbidden_identifiers_parse_and_default_to_empty() {
+        // The list is kept as written: the scan lowercases at match time, so the
+        // registry may spell a term the way its owner writes it.
+        let dir = tempfile::tempdir().unwrap();
+        let with = "[repos.demo]\nupstream = \"u\"\norigin = \"o\"\n\
+                    forbidden = [\"Widgets-Inc\", \"acme-corp\"]\n";
+        let registry = load(&write(dir.path(), with)).unwrap();
+        assert_eq!(
+            registry.repos["demo"].forbidden,
+            ["Widgets-Inc", "acme-corp"]
+        );
+
+        let without = "[repos.demo]\nupstream = \"u\"\norigin = \"o\"\n";
+        let registry = load(&write(dir.path(), without)).unwrap();
+        assert!(registry.repos["demo"].forbidden.is_empty());
+        assert!(RepoEntry::new("u", "o").forbidden.is_empty());
+    }
+
+    #[test]
+    fn a_blank_forbidden_term_is_a_loud_config_error_naming_the_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = "[repos.demo]\nupstream = \"u\"\norigin = \"o\"\n\
+                    forbidden = [\"acme-corp\", \"  \"]\n";
+        let error = load(&write(dir.path(), text)).unwrap_err().to_string();
+        assert!(error.contains("[repos.demo]"), "was: {error}");
+        assert!(error.contains("empty term"), "was: {error}");
+    }
+
+    #[test]
+    fn a_forbidden_term_listed_twice_in_any_case_is_a_loud_config_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = "[repos.demo]\nupstream = \"u\"\norigin = \"o\"\n\
+                    forbidden = [\"acme-corp\", \"ACME-Corp\"]\n";
+        let error = load(&write(dir.path(), text)).unwrap_err().to_string();
+        assert!(error.contains("[repos.demo]"), "was: {error}");
+        assert!(error.contains("\"ACME-Corp\" twice"), "was: {error}");
     }
 
     #[test]

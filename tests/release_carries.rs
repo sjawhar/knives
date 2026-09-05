@@ -1,4 +1,4 @@
-//! `knives release members`, `knives carries` and the carriage census.
+//! `knives release members`, its `--carries` question and the `--census`.
 //!
 //! Members counts the repository's parents and names who holds each; `--verify`
 //! reports a dropped member's content. Carries compares a revision's net content
@@ -196,7 +196,7 @@ fn release_carries_answers_carried_for_a_member() {
     assert!(cut.status.success(), "{cut:?}");
 
     // When: carries checks every release target and the upstream trunk.
-    let output = knives_release(&lab, &home, &["carries", "feat/alpha"]);
+    let output = knives_release(&lab, &home, &["members", "--carries", "feat/alpha"]);
 
     // Then: the live release says it carries alpha exactly, so the answer is safe.
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -230,7 +230,7 @@ fn release_carries_stops_before_superseded_targets_when_live_release_carries() {
     publish_remote_bookmark(&lab, "history/alpha-release@origin", "release/2026-08-04");
 
     // When: carries finds alpha in the live release or trunk census.
-    let output = knives_release(&lab, &home, &["carries", "feat/alpha"]);
+    let output = knives_release(&lab, &home, &["members", "--carries", "feat/alpha"]);
 
     // Then: that safe answer does not probe or print stale release targets.
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -256,7 +256,7 @@ fn release_carries_answers_not_carried_for_outside_work() {
     lab.branch("feat/beta", "beta.txt", "beta\n");
 
     // When: beta is checked against every release target and the trunk.
-    let output = knives_release(&lab, &home, &["carries", "feat/beta"]);
+    let output = knives_release(&lab, &home, &["members", "--carries", "feat/beta"]);
 
     // Then: no safe target carries it, so the answer names the real remaining diff.
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -265,7 +265,7 @@ fn release_carries_answers_not_carried_for_outside_work() {
 }
 
 #[test]
-fn release_carries_in_checks_only_the_requested_target() {
+fn members_with_a_target_checks_only_the_requested_target() {
     // Given: alpha is in the release but absent from the upstream trunk.
     let lab = Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
@@ -277,7 +277,7 @@ fn release_carries_in_checks_only_the_requested_target() {
     let output = knives_release(
         &lab,
         &home,
-        &["carries", "feat/alpha", "--in", "main@upstream"],
+        &["members", "main@upstream", "--carries", "feat/alpha"],
     );
 
     // Then: the live release cannot make a single-target trunk query safe.
@@ -291,7 +291,7 @@ fn release_carries_in_checks_only_the_requested_target() {
 }
 
 #[test]
-fn release_carries_in_exits_successfully_when_the_selected_historical_release_carries() {
+fn members_with_a_superseded_target_exits_successfully_when_it_carries() {
     // Given: alpha was carried by a release that later became superseded.
     let lab = Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
@@ -315,10 +315,15 @@ fn release_carries_in_exits_successfully_when_the_selected_historical_release_ca
     let output = knives_release(
         &lab,
         &home,
-        &["carries", "feat/alpha", "--in", "release/2026-08-04@origin"],
+        &[
+            "members",
+            "release/2026-08-04@origin",
+            "--carries",
+            "feat/alpha",
+        ],
     );
 
-    // Then: --in reports the direct target verdict, not its safe-delete role.
+    // Then: an explicit REF reports the direct target verdict, not its safe-delete role.
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success(), "{stdout}");
     assert!(
@@ -335,7 +340,7 @@ fn release_carries_answers_against_the_trunk_when_no_release_exists() {
     let (home, _consumer) = release_test_home(&lab);
 
     // When: carries has no explicit target.
-    let output = knives_release(&lab, &home, &["carries", "feat/alpha"]);
+    let output = knives_release(&lab, &home, &["members", "--carries", "feat/alpha"]);
 
     // Then: the orphan question is answered against the upstream trunk.
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -363,7 +368,7 @@ fn release_carries_reports_carried_rewritten_for_a_squash_landed_branch() {
     let (home, _consumer) = release_test_home(&lab);
 
     // When: alpha is checked without any release.
-    let output = knives_release(&lab, &home, &["carries", "feat/alpha"]);
+    let output = knives_release(&lab, &home, &["members", "--carries", "feat/alpha"]);
 
     // Then: the trunk's tree-content evidence proves its rewritten carriage.
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -444,7 +449,7 @@ fn carries_superseded_only_carriage_is_findings() {
     lab.jj_work(["git", "fetch", "--remote", "origin"]);
 
     // When: bare carries finds alpha only in the historical remote cut.
-    let output = knives_release(&lab, &home, &["carries", "feat/alpha"]);
+    let output = knives_release(&lab, &home, &["members", "--carries", "feat/alpha"]);
 
     // Then: the historical row is visible, but it cannot make the result safe.
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -500,7 +505,7 @@ fn census_finds_the_orphan_branch() {
     let (lab, home) = census_lab();
 
     // When: census asks only local carriage questions, so PR state is explicitly unknown.
-    let output = knives_release(&lab, &home, &["carries", "--all", "--no-github"]);
+    let output = knives_release(&lab, &home, &["members", "--census", "--no-github"]);
 
     // Then: a carried member names its live carrier but does not spend a
     // superseded probe, while a non-carried member proves the negative against
@@ -545,7 +550,7 @@ fn census_marks_unknown_pull_orphans_as_unanswered_in_json() {
     let (lab, home) = census_lab();
 
     // When: the census is emitted as its machine report.
-    let output = knives_release_json(&lab, &home, &["carries", "--all", "--no-github"]);
+    let output = knives_release_json(&lab, &home, &["members", "--census", "--no-github"]);
 
     // Then: the qualified text listing remains actionable, but JSON cannot
     // represent beta as a pull-safe, proven orphan.
@@ -582,7 +587,7 @@ fn census_respects_an_open_pull() {
         home: &home,
         pulls: &pulls,
         withheld_facts: &[],
-        args: &["carries", "--all"],
+        args: &["members", "--census"],
         output: ReleaseOutput::Json,
     });
 
@@ -623,7 +628,7 @@ fn census_withholds_a_selected_pull_fact_as_unanswered() {
         home: &home,
         pulls: &pulls,
         withheld_facts: &[17],
-        args: &["carries", "--all"],
+        args: &["members", "--census"],
         output: ReleaseOutput::Json,
     });
 
@@ -647,7 +652,7 @@ fn census_keeps_local_orphans_when_the_forge_is_unavailable() {
     let (lab, home) = census_lab();
 
     // When: census attempts the normal forge snapshot.
-    let output = knives_release_with_failing_forge(&lab, &home, &["carries", "--all"]);
+    let output = knives_release_with_failing_forge(&lab, &home, &["members", "--census"]);
 
     // Then: failure changes pull-request knowledge to unknown without hiding
     // the local orphan finding, and the unanswered deletion-safety check wins.
@@ -673,7 +678,7 @@ fn census_excludes_anonymous_heads() {
     lab.jj_work(["new", "main@upstream"]);
 
     // When: the maintained-branch census runs without a pull-request lookup.
-    let output = knives_release_json(&lab, &home, &["carries", "--all", "--no-github"]);
+    let output = knives_release_json(&lab, &home, &["members", "--census", "--no-github"]);
 
     // Then: the unnamed head is audit population, not a census row or schema field.
     assert_eq!(output.status.code(), Some(3), "{output:?}");

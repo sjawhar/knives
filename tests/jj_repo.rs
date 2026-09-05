@@ -21,7 +21,9 @@ mod lab;
 use knives::commands::status::{self, OriginRelation};
 use knives::config::Registry;
 use knives::ids::{BookmarkRef, BranchName, CommitId, ReleaseScheme, RemoteName, WorkspaceName};
-use knives::jj::{Repo, changed_files, changed_files_between, pull_heads, remote_refs};
+use knives::jj::{
+    Repo, changed_files, changed_files_between, diff_git, file_text, pull_heads, remote_refs,
+};
 use lab::{Lab, lab_entry, operation_ids};
 use std::collections::{BTreeMap, BTreeSet};
 use std::process::Command;
@@ -635,6 +637,95 @@ fn changed_files_between_handles_a_branch_behind_advanced_upstream() {
         lab.revision(&lab.work, "@", "change_id"),
         working_copy_before
     );
+}
+
+#[test]
+fn file_text_reads_a_present_path_at_the_upstream_trunk() {
+    // Given: a template committed on upstream's trunk.
+    let lab = lab::Lab::new();
+    lab.upstream_trunk_file(".github/pull_request_template.md", "## Overview\n");
+
+    // When: the path is read at `main@upstream`.
+    let text = file_text(
+        &lab.work,
+        "main@upstream",
+        ".github/pull_request_template.md",
+    )
+    .expect("read a present file");
+
+    // Then: the file's text comes back verbatim.
+    assert_eq!(text.as_deref(), Some("## Overview\n"));
+}
+
+#[test]
+fn file_text_reads_an_absent_path_as_none() {
+    // Given: origin's trunk never had the template.
+    let lab = lab::Lab::new();
+    lab.upstream_trunk_file(".github/pull_request_template.md", "## Overview\n");
+
+    // When: the path is read at `main@origin`.
+    let absent = file_text(&lab.work, "main@origin", ".github/pull_request_template.md")
+        .expect("a missing path is not an error");
+
+    // Then: absence is `None`, not an error.
+    assert_eq!(absent, None);
+}
+
+#[test]
+fn file_text_at_an_unresolvable_revision_is_an_error() {
+    // Given: a revision that names nothing.
+    let lab = lab::Lab::new();
+    lab.branch("feat/alpha", "alpha.py", "# alpha\n");
+
+    // When: a real path is read there.
+    let unresolvable = file_text(&lab.work, "no-such-rev", "alpha.py");
+
+    // Then: the answer is an error; a mistyped trunk must not read as "no file".
+    assert!(
+        unresolvable.is_err(),
+        "a bad revision must not read as absent"
+    );
+}
+
+#[test]
+fn diff_git_writes_headers_and_added_lines_without_context() {
+    // Given: a branch adding one file over the trunk.
+    let lab = lab::Lab::new();
+    lab.branch("feat/alpha", "alpha.py", "# wired for acme-corp's IaC\n");
+
+    // When: the branch is diffed from its fork point with the upstream trunk.
+    let diff = diff_git(
+        &lab.work,
+        "fork_point(main@upstream | feat/alpha)",
+        "feat/alpha",
+    )
+    .expect("diff");
+
+    // Then: the git shape the forbidden scan reads — `+++ b/<path>`, a hunk
+    // header, and the added line — and nothing else changes.
+    assert!(diff.contains("+++ b/alpha.py"), "was: {diff}");
+    assert!(diff.contains("@@ -0,0 +1,1 @@"), "was: {diff}");
+    assert!(diff.contains("+# wired for acme-corp's IaC"), "was: {diff}");
+    assert_eq!(diff.matches("diff --git").count(), 1, "was: {diff}");
+}
+
+#[test]
+fn diff_git_reads_a_branch_adding_a_latin_1_file() {
+    // Given: a branch adding a file whose bytes are not UTF-8.
+    let lab = lab::Lab::new();
+    lab.branch_with_bytes("feat/latin", "latin.txt", b"caf\xe9 acme-corp\n");
+
+    // When: the branch is diffed.
+    let diff = diff_git(
+        &lab.work,
+        "fork_point(main@upstream | feat/latin)",
+        "feat/latin",
+    )
+    .expect("a non-UTF-8 file is still a diff");
+
+    // Then: the added line is there, its bad byte a replacement character.
+    assert!(diff.contains("+++ b/latin.txt"), "was: {diff}");
+    assert!(diff.contains("+caf\u{FFFD} acme-corp"), "was: {diff}");
 }
 
 #[test]
