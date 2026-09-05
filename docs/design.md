@@ -289,9 +289,9 @@ knives pushed [BRANCH]... [--repo REPO]
                                compare local tips with the live remote refs that own them
 knives audit [REPO] [--all] [--no-github]
                                reconcile remote refs, open pull heads, recorded cuts, and
-                               anonymous heads; per branch: tip vs origin, pull merge state,
-                               checks, review threads, template headings, forbidden identifiers;
-                               reports only, never repairs
+                               anonymous heads; per branch: tip vs origin, release membership,
+                               pull merge state, checks, review threads, template headings,
+                               forbidden identifiers; reports only, never repairs
 knives sync [REPO|--all]       fetch all remotes and tracked pull/N/head refs; classify each
                                tracked PR as new | unchanged | advanced | merged | closed
 knives preflight [REPO]        programmatic pre-contribution facts (see below)
@@ -337,21 +337,25 @@ repairs, deletes, pushes, or opens a pull request. Per-pull history remains the 
 on-demand `knives pr <n> --timeline` read.
 
 The report also carries `branches`, one row of facts per maintained branch (every local bookmark
-that is neither the trunk nor a release name): `tip`, `origin_tip` and `tip_matches_origin`
-(`null` when origin has no ref), `fork_only` (what `knives track --fork-only` stated), a `pull`
-object when an open pull request answered for the branch — `number`, `state`, `url`, `head`,
+that is neither the trunk nor a release name), and `template`, the upstream trunk's pull-request
+template (`file`, `headings`) once per report, `null` when the trunk has none or no forge was
+asked. Each row: `tip`, `origin_tip` and `tip_matches_origin` (`null` when origin has no ref),
+`fork_only` (what `knives track --fork-only` stated), `member_of` (every local release-name
+bookmark whose release commit has the tip as a direct parent; `[]` for a lone branch), a `pull`
+object when an open pull request answered for the branch — `number`, `url`, `head`,
 `head_matches_tip`, `mergeable`, `merge_state_status`, `review_decision` (`null` when the forge
 reports none), `checks` (`total`, `pending`, a `conclusions` histogram), `unresolved_review_threads`,
-and `template` (the upstream trunk's pull-request template `file`, its `headings`, and the ones
-`missing_from_body`) — and `forbidden`, every line the branch adds over its fork point with the
-upstream trunk that contains a term the entry's `forbidden` key names, each as `{file, line, term,
-text}`; a branch sharing no history with the trunk is measured from the root, so its whole tree
-counts as added. `pull` is absent when no open pull request answered (always under `--no-github`);
-`forbidden` is absent when the entry configures no terms, the branch is fork-only, the diff could
-not be read (a `problems` line names the branch), or `<trunk>@upstream` cannot be resolved (one
-`problems` line, every scan skipped). Every field is an observation and `null` means unobserved;
-the facts never move the exit code. The scans run on at most eight threads however wide the
-machine: several owners audit one checkout in the same minute.
+and `template_missing` (the report's template headings the body lacks) — and `forbidden`, every
+line the branch adds over its fork point with the upstream trunk that contains a term the entry's
+`forbidden` key names, each as `{file, line, term, text}`; a branch sharing no history with the
+trunk is measured from the root, so its whole tree counts as added. `pull` is absent when no open
+pull request answered (always under `--no-github`); `forbidden` is absent when the entry configures
+no terms, the branch is fork-only, the diff could not be read (a `problems` line names the branch),
+or `<trunk>@upstream` cannot be resolved (one `problems` line, every scan skipped). A divergent
+(conflicted) bookmark has no single tip, so it has no row and one `problems` line names it. Every
+field is an observation and `null` means unobserved; the facts never move the exit code. The scans
+run on at most eight threads however wide the machine: several owners audit one checkout in the
+same minute.
 
 `knives notch` has two moods, split by `-m`: bare it reads, `-m` writes.
 Reading is intentional and nothing injects notches into a session, so the bare form returns the

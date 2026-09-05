@@ -1064,7 +1064,7 @@ fn facts_from(payload: FactsPayload) -> Result<PullFacts, ForgeError> {
         .last()
         .and_then(|tip| tip_commit_empty(&tip.commit));
     // A second page of threads leaves the count unanswered rather than failing
-    // the batch: `details_from` serves `status` and `sync` too, and a long-lived
+    // the batch: `facts_from` serves `status` and `sync` too, and a long-lived
     // pull request with more than 100 threads is realistic where 100 check
     // contexts is not. `None` is the field's own meaning, "the batch did not answer".
     let unresolved_review_threads = payload
@@ -1938,7 +1938,7 @@ printf '{}'
     #[test]
     fn a_second_page_of_review_threads_leaves_the_count_unanswered_without_failing() {
         // Unlike the rollup and suite refusals, a long-lived pull request with more
-        // than 100 review threads is realistic, and `details_from` serves `status`
+        // than 100 review threads is realistic, and `facts_from` serves `status`
         // and `sync` too: the count reads as unanswered and everything else stands.
         let payload = facts_payload(
             r#""p7":{"number":7,"state":"OPEN","headRefName":"feat/a","headRefOid":"aa",

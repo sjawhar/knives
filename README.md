@@ -216,7 +216,7 @@ reads `not on this machine`, and an entry with two is refused with both paths na
 | `knives repos` | what is managed, where each checkout was found (or `not on this machine`), the newest release each has cut, and whether registered forge consumers pin it |
 | `knives consumers [FORK] [--consumer PATH]...` | compare registered forge consumers and ad-hoc local scans with the newest release on the live publish remote; reports only |
 | `knives pushed [BRANCH]... [--repo REPO]` | compare local branches with the live remote refs that own them; reports only |
-| `knives audit [REPO] [--all] [--no-github]` | reconcile remote refs, open pull heads, recorded cuts, and anonymous heads; per branch: tip vs origin, pull mergeability / merge state / review decision, check-run counts on the head, unresolved review threads, PR-template headings missing from the body, configured `forbidden` identifiers in the lines added over the branch's fork point with the upstream trunk; reports only and never repairs |
+| `knives audit [REPO] [--all] [--no-github]` | reconcile remote refs, open pull heads, recorded cuts, and anonymous heads; per branch: tip vs origin, release membership, pull mergeability / merge state / review decision, check-run counts on the head, unresolved review threads, PR-template headings missing from the body, configured `forbidden` identifiers in the lines added over the branch's fork point with the upstream trunk; reports only and never repairs |
 | `knives status` | the main report |
 | `knives pr NUMBER [--repo REPO] [--timeline]` | one pull request's live state; `--timeline` adds its bounded forge event log |
 | `knives sync` | fetch, then classify what happened to each tracked pull request |

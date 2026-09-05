@@ -66,7 +66,12 @@ Runs the estate-wide, read-only reconciliation. It checks remote drift, open pul
 the command never deletes refs, changes local bookmarks, pushes, repairs, or opens a pull request.
 
 The report also carries one row of facts per maintained branch — every local bookmark that is
-neither the trunk nor a release name. In `--json` that is `branches`, each row shaped as:
+neither the trunk nor a release name and has one target. A divergent (conflicted) bookmark has
+no single tip: it gets no row and one `problems` line, `bookmark <name> is divergent (<n>
+targets); no row`, so the exit is 3. In `--json` the rows are `branches`, and the report carries
+the upstream trunk's pull-request template once as `template` (`{ "file":
+".github/pull_request_template.md", "headings": ["Overview", …] }`, or `null` when the trunk has
+none or no forge was asked). Each row is shaped as:
 
 ```jsonc
 {
@@ -75,15 +80,16 @@ neither the trunk nor a release name. In `--json` that is `branches`, each row s
   "origin_tip": "<full commit id>" | null,
   "tip_matches_origin": true | false | null,     // null: origin has no ref for the branch
   "fork_only": false,                              // stated with `knives track --fork-only`
+  "member_of": ["release/2026-09-05"],             // every local release whose commit has this tip as a direct parent; [] when lone
   "pull": {                                        // absent: no open pull request answered for this branch
-    "number": 1426, "state": "OPEN", "url": "https://…",
+    "number": 1426, "url": "https://…",
     "head": "<headRefOid>", "head_matches_tip": true,
     "mergeable": "MERGEABLE" | "CONFLICTING" | "UNKNOWN" | null,
     "merge_state_status": "CLEAN" | "BEHIND" | "DIRTY" | "BLOCKED" | "UNSTABLE" | "UNKNOWN" | null,
     "review_decision": "APPROVED" | "CHANGES_REQUESTED" | "REVIEW_REQUIRED" | null,
     "checks": { "total": 13, "pending": 0, "conclusions": { "SUCCESS": 11, "ACTION_REQUIRED": 2 } } | null,
     "unresolved_review_threads": 2 | null,
-    "template": { "file": ".github/pull_request_template.md", "headings": ["Overview", …], "missing_from_body": ["Approach"] } | null
+    "template_missing": ["Approach"] | null        // the report's template headings the body lacks
   },
   "forbidden": [{ "file": "infra/app.py", "line": 9, "term": "acme-corp", "text": "<the added line>" }]
                                                    // absent: no `forbidden` configured for the repo, the branch is fork-only,
@@ -92,34 +98,36 @@ neither the trunk nor a release name. In `--json` that is `branches`, each row s
 ```
 
 What each field is: `tip` is the local bookmark's commit; `origin_tip` is where origin holds the
-branch and `tip_matches_origin` compares the two (`null` when origin has no such ref). `pull` is
-the open pull request the forge answered for the branch, with `head` the pull request's head
-commit and `head_matches_tip` whether that is the local tip; `mergeable` and
+branch and `tip_matches_origin` compares the two (`null` when origin has no such ref).
+`member_of` names every local release-name bookmark whose release commit has the row's tip as a
+direct parent, in bookmark order; a release whose parents cannot be read is a `problems` line.
+`pull` is the open pull request the forge answered for the branch, with `head` the pull request's
+head commit and `head_matches_tip` whether that is the local tip; `mergeable` and
 `merge_state_status` are the forge's own words and `null` when it has not computed them;
 `review_decision` is `null` when the forge reports none. `checks` counts the check runs on the
 pull request's head: `total`, `pending` (no conclusion yet), and a `conclusions` histogram keyed
 by the forge's upper-case conclusion (`ACTION_REQUIRED` is a workflow held for a maintainer's
-approval, so nothing of it ran); `null` when the forge did not answer the checks field; a head
-with no check runs is `total: 0`.
+approval, so nothing of it ran); a head with no check runs is `total: 0`; `null` only when a forge
+answers a pull without its checks field, which the GitHub forge does not.
 `unresolved_review_threads` is the count of review threads not marked resolved, `null` when the
-forge did not answer or the thread list was longer than one page. `template` reads the
-pull-request template at the upstream trunk once per run: its `file`, its `headings`, and the
-ones with no matching heading in the pull request body (`missing_from_body`); `null` when the
-trunk has no template or the body was not answered; template and body headings inside an HTML
-comment or a fenced code block are not headings. `forbidden` is every line the branch adds over
-its fork point with the upstream trunk (`jj diff --git --context 0 --from
-"fork_point(<trunk>@upstream | <branch>)" --to <branch>`, added lines only) that contains one of
-the registry entry's `forbidden` terms as a case-insensitive substring, each hit as `{file, line,
-term, text}`. A branch sharing no history with the trunk is measured from the root, so its whole
-tree counts as added. When `<trunk>@upstream` itself cannot be resolved (never fetched), one
+forge did not answer or the thread list was longer than one page. `template_missing` is every
+heading of the report's `template` with no matching heading in the pull request body, compared
+case-insensitively; `null` when the trunk has no template or the body was not answered; template
+and body headings inside an HTML comment or a fenced code block are not headings. `forbidden` is
+every line the branch adds over its fork point with the upstream trunk (`jj diff --git --context 0
+--from "fork_point(<trunk>@upstream | <branch>)" --to <branch>`, added lines only) that contains
+one of the registry entry's `forbidden` terms as a case-insensitive substring, each hit as `{file,
+line, term, text}`. A branch sharing no history with the trunk is measured from the root, so its
+whole tree counts as added. When `<trunk>@upstream` itself cannot be resolved (never fetched), one
 `problems` line says so and no row carries `forbidden`.
 
 Every field is an observation and `null` means unobserved. The rows never move the exit code;
 findings and problems do — a branch whose diff or template could not be read is a `problems` line
-and therefore exit 3. `--no-github` leaves `pull` absent on every row and reports `open
-pull-head reconciliation was skipped (--no-github)` as a problem. The text report prints the rows as a `branches:` block, one line
-per branch: `<branch>  tip <short>  origin same|differs|absent  [fork-only]  pr #N STATE
-mergeable=… state=… review=… head=matches|differs | no-pr  checks <total> (<CONCLUSION count>, …;
+and therefore exit 3. `--no-github` leaves `pull` absent on every row, `template` null, and
+reports `open pull-head reconciliation was skipped (--no-github)` as a problem. The text report
+prints the rows as a `branches:` block, one line per branch: `<branch>  tip <short>  origin
+same|differs|absent  [fork-only]  member of <release>[, …] | lone  pr #N mergeable=…
+merge_state=… review=… head=matches|differs | no-pr  checks <total> (<CONCLUSION count>, …;
 <pending> pending) | checks -  threads <n> unresolved | threads -  template none missing | template
 missing: A, B | template -  forbidden none | forbidden <N> hits: file:line term, … | forbidden -`.
 
