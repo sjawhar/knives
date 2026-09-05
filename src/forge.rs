@@ -277,6 +277,13 @@ pub struct PullDetails {
     /// Whether the newest commit's tree equals its one parent tree: a tip that a
     /// rebase or duplicate emptied while the branch reads healthy.
     pub tip_commit_empty: Option<bool>,
+    /// The pull request's description as the forge holds it. `None` means the
+    /// batch did not answer it, never "no body": an empty body is `Some("")`.
+    pub body: Option<String>,
+    /// How many review threads are still unresolved. `None` means the batch did
+    /// not answer — an old payload, or more threads than one page holds — and
+    /// must never render as "no threads".
+    pub unresolved_review_threads: Option<usize>,
 }
 
 /// Cheap row for wide lists, the cache, and discovery.

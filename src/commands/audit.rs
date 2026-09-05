@@ -24,11 +24,133 @@ const ORPHAN_REVSET: &str = r#"heads(all()) ~ ::(bookmarks() | remote_bookmarks(
 #[derive(Debug, serde::Serialize)]
 pub struct Report {
     pub repo: String,
+    /// One row per maintained branch: what is observed, never what to do.
+    pub branches: Vec<BranchFacts>,
     pub findings: Vec<Finding>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub notes: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub problems: Vec<String>,
+}
+
+/// Facts about one maintained branch and its pull request. Facts, never
+/// verdicts: each field is an observation, and `None` means unobserved.
+#[derive(Debug, serde::Serialize)]
+pub struct BranchFacts {
+    pub branch: String,
+    pub tip: String,
+    /// Where origin holds the branch; `None` when origin has no such ref.
+    pub origin_tip: Option<String>,
+    pub tip_matches_origin: Option<bool>,
+    /// Stated with `knives track --fork-only`: no pull request is expected and
+    /// the forbidden-identifier scan does not apply.
+    pub fork_only: bool,
+    /// Absent when no open pull request was answered for this branch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pull: Option<PullSnapshot>,
+    /// Absent when no `forbidden` list is configured, the branch is fork-only,
+    /// or the diff could not be read (a `problems` line names the branch).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub forbidden: Option<Vec<crate::forbidden::Hit>>,
+}
+
+/// The open pull request on a maintained branch, as the live batch answered it.
+#[derive(Debug, serde::Serialize)]
+pub struct PullSnapshot {
+    pub number: u64,
+    pub state: String,
+    pub url: String,
+    pub head: String,
+    pub head_matches_tip: bool,
+    pub mergeable: Option<String>,
+    pub merge_state_status: Option<String>,
+    pub review_decision: String,
+    pub checks: Option<CheckCounts>,
+    pub unresolved_review_threads: Option<usize>,
+    /// `None` when upstream's trunk has no pull-request template or the batch
+    /// did not answer the body.
+    pub template: Option<TemplateFacts>,
+}
+
+/// Check runs on the pull request's head, counted by conclusion.
+#[derive(Debug, serde::Serialize)]
+pub struct CheckCounts {
+    pub total: usize,
+    pub pending: usize,
+    pub conclusions: BTreeMap<String, usize>,
+}
+
+/// Upstream's pull-request template held against the pull request's body.
+#[derive(Debug, serde::Serialize)]
+pub struct TemplateFacts {
+    pub file: String,
+    pub headings: Vec<String>,
+    pub missing_from_body: Vec<String>,
+}
+
+/// Upstream's pull-request template, read once per run.
+#[derive(Debug)]
+struct Template {
+    file: String,
+    headings: Vec<String>,
+}
+
+impl Template {
+    /// The headings the body does not carry: a body line whose `#`-stripped,
+    /// trimmed text equals the heading case-insensitively carries it.
+    fn against(&self, body: &str) -> TemplateFacts {
+        let carried: Vec<String> = body
+            .lines()
+            .filter_map(heading_text)
+            .map(str::to_lowercase)
+            .collect();
+        TemplateFacts {
+            file: self.file.clone(),
+            headings: self.headings.clone(),
+            missing_from_body: self
+                .headings
+                .iter()
+                .filter(|heading| !carried.contains(&heading.to_lowercase()))
+                .cloned()
+                .collect(),
+        }
+    }
+}
+
+/// A Markdown ATX heading's text: `^#{1,6}\s+(.+)$`, trimmed.
+fn heading_text(line: &str) -> Option<&str> {
+    let hashes = line.bytes().take_while(|byte| *byte == b'#').count();
+    if !(1..=6).contains(&hashes) {
+        return None;
+    }
+    let rest = line.get(hashes..)?;
+    if !rest.starts_with([' ', '\t']) {
+        return None;
+    }
+    let text = rest.trim();
+    (!text.is_empty()).then_some(text)
+}
+
+/// The first pull-request template among the convention files that upstream's
+/// trunk carries, or `None` when it carries none.
+fn read_template(path: &Path, entry: &RepoEntry) -> Result<Option<Template>, jj::JjError> {
+    let trunk = entry.upstream_trunk();
+    for file in crate::commands::preflight::CONVENTION_FILES
+        .iter()
+        .filter(|file| file.to_ascii_lowercase().contains("pull_request_template"))
+    {
+        if let Some(text) = jj::file_text(path, &trunk, file)? {
+            return Ok(Some(Template {
+                file: (*file).to_owned(),
+                headings: text
+                    .lines()
+                    .filter_map(heading_text)
+                    .map(str::to_owned)
+                    .collect(),
+            }));
+        }
+    }
+    Ok(None)
 }
 
 /// Dependencies shared by the read-only estate checks.
@@ -57,6 +179,7 @@ pub fn gather(input: &AuditInput<'_>) -> Report {
     let path = &fork.checkout.path;
     let mut report = Report {
         repo: fork.name.to_string(),
+        branches: Vec::new(),
         findings: Vec::new(),
         notes: Vec::new(),
         problems: Vec::new(),
@@ -122,8 +245,155 @@ pub fn gather(input: &AuditInput<'_>) -> Report {
     );
     add_misplaced_origin_release_refs(&mut report, live.origin(), &scheme, entry.publish_remote());
     add_orphan_commits(&mut report, &opened, path);
-    add_open_pull_head_checks(&mut report, input, &local, live.origin());
+    // Upstream's template is only held against pull bodies, so it is read only
+    // when a forge will answer them.
+    let template = match input.forge.map(|_| read_template(path, entry)) {
+        Some(Ok(template)) => template,
+        Some(Err(error)) => {
+            report.problems.push(format!(
+                "could not read the pull-request template at {}: {error}",
+                entry.upstream_trunk()
+            ));
+            None
+        }
+        None => None,
+    };
+    let facts = LocalFacts {
+        local: &local,
+        origin_refs: live.origin(),
+        scheme: &scheme,
+        tracked: &tracked,
+        template: template.as_ref(),
+    };
+    add_branch_facts(&mut report, input, &facts);
+    add_open_pull_head_checks(&mut report, input, &facts);
     report
+}
+
+/// What the checkout, the live origin refs and the store say, before any forge
+/// is asked.
+struct LocalFacts<'a> {
+    local: &'a BTreeMap<BranchName, CommitId>,
+    origin_refs: &'a BTreeMap<String, CommitId>,
+    scheme: &'a crate::ids::ReleaseScheme,
+    /// Pull numbers the store tracks per branch.
+    tracked: &'a BTreeMap<BranchName, u64>,
+    /// Upstream's pull-request template, when its trunk carries one.
+    template: Option<&'a Template>,
+}
+
+/// One row per maintained branch — every local bookmark that is neither the
+/// trunk nor a release — with its local facts and, when configured and not
+/// exempt, the forbidden-identifier scan of its diff over upstream's trunk.
+fn add_branch_facts(report: &mut Report, input: &AuditInput<'_>, facts: &LocalFacts<'_>) {
+    let fork = input.fork;
+    let entry = fork.entry;
+    let mut rows: Vec<BranchFacts> = facts
+        .local
+        .iter()
+        .filter(|(branch, _)| {
+            !is_release_name(branch, facts.scheme) && branch.as_str() != entry.trunk()
+        })
+        .map(|(branch, tip)| {
+            let origin_tip = facts.origin_refs.get(&format!("refs/heads/{branch}"));
+            BranchFacts {
+                branch: branch.to_string(),
+                tip: tip.to_string(),
+                origin_tip: origin_tip.map(ToString::to_string),
+                tip_matches_origin: origin_tip.map(|origin| origin == tip),
+                fork_only: input
+                    .store
+                    .is_fork_only(&BranchTarget::new(fork.name.clone(), branch.clone())),
+                pull: None,
+                forbidden: None,
+            }
+        })
+        .collect();
+    if !entry.forbidden.is_empty() {
+        let scanned: Vec<&str> = facts
+            .local
+            .keys()
+            .map(BranchName::as_str)
+            .filter(|branch| {
+                rows.iter()
+                    .any(|row| row.branch == *branch && !row.fork_only)
+            })
+            .collect();
+        let mut results = forbidden_scans(&fork.checkout.path, entry, &scanned);
+        for row in &mut rows {
+            match results.remove(row.branch.as_str()) {
+                Some(Ok(hits)) => row.forbidden = Some(hits),
+                Some(Err(problem)) => report.problems.push(problem),
+                None => {}
+            }
+        }
+    }
+    report.branches.extend(rows);
+}
+
+/// The forbidden-identifier scan of every named branch's diff over upstream's
+/// trunk, one `jj diff` subprocess per branch, run across as many threads as
+/// the machine offers: fifty branches at two hundred milliseconds each is ten
+/// seconds serial. An unreadable diff is a problem line naming the branch.
+fn forbidden_scans<'b>(
+    path: &Path,
+    entry: &RepoEntry,
+    branches: &[&'b str],
+) -> BTreeMap<&'b str, Result<Vec<crate::forbidden::Hit>, String>> {
+    if branches.is_empty() {
+        return BTreeMap::new();
+    }
+    let upstream_trunk = entry.upstream_trunk();
+    let workers = std::thread::available_parallelism()
+        .map_or(1, std::num::NonZero::get)
+        .clamp(1, branches.len());
+    let chunk = branches.len().div_ceil(workers);
+    std::thread::scope(|scope| {
+        // Collected on purpose: every worker must be spawned before the first
+        // join, or the chunks run one after another on this thread.
+        #[allow(
+            clippy::needless_collect,
+            reason = "spawn every chunk before joining any; a lazy chain would serialise them"
+        )]
+        let handles: Vec<_> = branches
+            .chunks(chunk)
+            .map(|slice| {
+                let upstream_trunk = upstream_trunk.as_str();
+                let handle = scope.spawn(move || {
+                    slice
+                        .iter()
+                        .map(|branch| {
+                            let scan = jj::diff_git(path, upstream_trunk, branch)
+                                .map(|diff| crate::forbidden::scan(&diff, &entry.forbidden))
+                                .map_err(|error| {
+                                    format!(
+                                        "could not diff {branch} against {upstream_trunk} for the forbidden scan: {error}"
+                                    )
+                                });
+                            (*branch, scan)
+                        })
+                        .collect::<Vec<_>>()
+                });
+                (slice, handle)
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|(slice, handle)| {
+                handle.join().unwrap_or_else(|_| {
+                    slice
+                        .iter()
+                        .map(|branch| {
+                            (
+                                *branch,
+                                Err(format!("forbidden scan task panicked for {branch}")),
+                            )
+                        })
+                        .collect()
+                })
+            })
+            .collect()
+    })
 }
 
 fn add_unconfigured_remote_refs(
@@ -452,12 +722,7 @@ fn add_orphan_commits(report: &mut Report, opened: &Repo, path: &Path) {
     }
 }
 
-fn add_open_pull_head_checks(
-    report: &mut Report,
-    input: &AuditInput<'_>,
-    local: &BTreeMap<BranchName, CommitId>,
-    origin_refs: &BTreeMap<String, CommitId>,
-) {
+fn add_open_pull_head_checks(report: &mut Report, input: &AuditInput<'_>, facts: &LocalFacts<'_>) {
     let Some(forge) = input.forge else {
         report
             .problems
@@ -468,14 +733,15 @@ fn add_open_pull_head_checks(
         fork: input.fork,
         forge,
         cache_root: input.cache_root,
-        local,
-        origin_refs,
+        local: facts.local,
+        origin_refs: facts.origin_refs,
+        tracked: facts.tracked,
+        template: facts.template,
     };
-    match pull_head_findings(&request, &mut report.findings, &mut report.notes) {
-        Ok(problems) => report.problems.extend(problems),
-        Err(error) => report
+    if let Err(error) = pull_head_findings(&request, report) {
+        report
             .problems
-            .push(format!("could not read open pull-request heads: {error}")),
+            .push(format!("could not read open pull-request heads: {error}"));
     }
 }
 
@@ -485,13 +751,22 @@ struct PullHeadInput<'a> {
     cache_root: Option<&'a Path>,
     local: &'a BTreeMap<BranchName, CommitId>,
     origin_refs: &'a BTreeMap<String, CommitId>,
+    /// Pull numbers the store tracks per branch, asked for beside the open
+    /// ones: a tracked pull request another owner submitted is not discovered
+    /// as ours, and its head is still the head to compare.
+    tracked: &'a BTreeMap<BranchName, u64>,
+    /// Upstream's pull-request template, when its trunk carries one.
+    template: Option<&'a Template>,
 }
 
+/// One live batch over the open pull requests we own and the tracked numbers,
+/// then: head-position findings per open pull of ours, a problem per open pull
+/// of ours the batch withheld, the cache write, and a [`PullSnapshot`] on every
+/// branch row whose primary pull request the batch answered open.
 fn pull_head_findings(
     input: &PullHeadInput<'_>,
-    findings: &mut Vec<Finding>,
-    notes: &mut Vec<String>,
-) -> Result<Vec<String>, crate::forge::ForgeError> {
+    report: &mut Report,
+) -> Result<(), crate::forge::ForgeError> {
     let entry = input.fork.entry;
     let opened = snapshot::open(SnapshotConfig {
         forge: input.forge,
@@ -499,30 +774,112 @@ fn pull_head_findings(
         remotes: [entry.remote(Role::Origin), entry.remote(Role::Release)],
         cache_root: input.cache_root,
     })?;
-    let snapshot = opened.complete_with(&(), |discovery, ()| {
+    let snapshot = opened.complete_with(input.tracked, |discovery, tracked| {
         discovery
             .ours()
             .iter()
             .filter(|pull| pull.is_open())
             .map(|pull| pull.number)
+            .chain(tracked.values().copied())
             .collect()
     })?;
-    let mut problems = Vec::new();
+    // Findings and problems concern the pull requests we own. A tracked number
+    // another author opened has a head on their fork, which no local bookmark
+    // or origin ref of ours is expected to match: its facts go on the row
+    // (`head_matches_tip`), and facts never move the exit.
+    let ours_open: BTreeSet<u64> = snapshot
+        .ours()
+        .iter()
+        .filter(|pull| pull.is_open())
+        .map(|pull| pull.number)
+        .collect();
     for number in snapshot.requested() {
         match snapshot.fact(*number) {
-            Some(fact) if fact.pull.is_open() => {
-                pull_position_findings(&fact.pull, input.local, input.origin_refs, findings);
+            Some(fact) if fact.pull.is_open() && ours_open.contains(number) => {
+                pull_position_findings(
+                    &fact.pull,
+                    input.local,
+                    input.origin_refs,
+                    &mut report.findings,
+                );
             }
             Some(_) => {}
-            None => problems.push(format!(
-                "open pull request #{number} was not answered by the live batch"
+            None if ours_open.contains(number) => {
+                report.problems.push(format!(
+                    "open pull request #{number} was not answered by the live batch"
+                ));
+            }
+            None => report.notes.push(format!(
+                "tracked pull request #{number} was not answered by the live batch"
             )),
         }
     }
-    if let Err(note) = snapshot.persist(None) {
-        notes.push(note.to_string());
+    for row in &mut report.branches {
+        let branch = BranchName::new(row.branch.as_str());
+        // The branch's primary pull request by the crate's one rule (open beats
+        // closed); a tracked number stands in when discovery did not list one.
+        let number = snapshot
+            .index()
+            .by_branch
+            .get(&branch)
+            .filter(|primary| primary.is_open())
+            .map(|primary| primary.number)
+            .or_else(|| input.tracked.get(&branch).copied());
+        row.pull = number
+            .and_then(|number| snapshot.fact(number))
+            .filter(|fact| fact.pull.is_open())
+            .map(|fact| pull_snapshot(fact, row.tip.as_str(), input.template));
     }
-    Ok(problems)
+    if let Err(note) = snapshot.persist(None) {
+        report.notes.push(note.to_string());
+    }
+    Ok(())
+}
+
+/// The pull-request facts the live batch answered, counted and held against
+/// the branch tip and upstream's template.
+fn pull_snapshot(
+    fact: &crate::forge::PullFacts,
+    tip: &str,
+    template: Option<&Template>,
+) -> PullSnapshot {
+    let pull = &fact.pull;
+    let details = &fact.details;
+    let checks = details.checks.as_ref().map(|checks| {
+        let mut conclusions: BTreeMap<String, usize> = BTreeMap::new();
+        for conclusion in checks
+            .runs
+            .iter()
+            .filter_map(|run| run.conclusion.as_deref())
+        {
+            *conclusions.entry(conclusion.to_uppercase()).or_default() += 1;
+        }
+        CheckCounts {
+            total: checks.runs.len(),
+            pending: checks
+                .runs
+                .iter()
+                .filter(|run| run.conclusion.is_none())
+                .count(),
+            conclusions,
+        }
+    });
+    PullSnapshot {
+        number: pull.number,
+        state: pull.state.clone(),
+        url: pull.url.clone(),
+        head: pull.head_ref_oid.clone(),
+        head_matches_tip: pull.head_ref_oid == tip,
+        mergeable: pull.mergeable.clone(),
+        merge_state_status: pull.merge_state_status.clone(),
+        review_decision: pull.review_decision.clone(),
+        checks,
+        unresolved_review_threads: details.unresolved_review_threads,
+        template: match (template, details.body.as_deref()) {
+            (Some(template), Some(body)) => Some(template.against(body)),
+            _ => None,
+        },
+    }
 }
 
 fn pull_position_findings(
@@ -575,11 +932,18 @@ pub const fn exit_for(report: &Report) -> Exit {
     }
 }
 
-/// Render findings grouped by detector, followed by the one deeper-history surface.
+/// Render problems, the per-branch facts, findings grouped by detector, notes,
+/// and the one deeper-history surface.
 pub fn render(report: &Report) -> String {
     let mut lines = format!("{}: audit", report.repo);
     for problem in &report.problems {
         let _ = write!(lines, "\n  PROBLEM: {problem}");
+    }
+    if !report.branches.is_empty() {
+        lines.push_str("\n  branches:");
+        for row in &report.branches {
+            let _ = write!(lines, "\n    {}", render_branch(row));
+        }
     }
     let mut groups: BTreeMap<FindingKind, Vec<&Finding>> = BTreeMap::new();
     for finding in &report.findings {
@@ -602,12 +966,100 @@ pub fn render(report: &Report) -> String {
     lines
 }
 
+/// One branch row, every fact as a fixed token so a reader can scan a column.
+fn render_branch(row: &BranchFacts) -> String {
+    let origin = match row.tip_matches_origin {
+        Some(true) => "same",
+        Some(false) => "differs",
+        None => "absent",
+    };
+    let mut line = format!(
+        "{}  tip {}  origin {origin}",
+        row.branch,
+        short_id(&row.tip)
+    );
+    if row.fork_only {
+        line.push_str("  fork-only");
+    }
+    match &row.pull {
+        Some(pull) => {
+            let _ = write!(
+                line,
+                "  pr #{} {} mergeable={} state={} review={} head={}",
+                pull.number,
+                pull.state,
+                pull.mergeable.as_deref().unwrap_or("-"),
+                pull.merge_state_status.as_deref().unwrap_or("-"),
+                if pull.review_decision.is_empty() {
+                    "-"
+                } else {
+                    pull.review_decision.as_str()
+                },
+                if pull.head_matches_tip {
+                    "matches"
+                } else {
+                    "differs"
+                }
+            );
+            match &pull.checks {
+                Some(checks) => {
+                    let conclusions = checks
+                        .conclusions
+                        .iter()
+                        .map(|(conclusion, count)| format!("{conclusion} {count}"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let _ = write!(
+                        line,
+                        "  checks {} ({conclusions}; {} pending)",
+                        checks.total, checks.pending
+                    );
+                }
+                None => line.push_str("  checks -"),
+            }
+            match pull.unresolved_review_threads {
+                Some(count) => {
+                    let _ = write!(line, "  threads {count} unresolved");
+                }
+                None => line.push_str("  threads -"),
+            }
+            match &pull.template {
+                Some(template) if template.missing_from_body.is_empty() => {
+                    line.push_str("  template ok");
+                }
+                Some(template) => {
+                    let _ = write!(
+                        line,
+                        "  template missing: {}",
+                        template.missing_from_body.join(", ")
+                    );
+                }
+                None => line.push_str("  template -"),
+            }
+        }
+        None => line.push_str("  no-pr  checks -  threads -  template -"),
+    }
+    match &row.forbidden {
+        Some(hits) if hits.is_empty() => line.push_str("  forbidden none"),
+        Some(hits) => {
+            let places = hits
+                .iter()
+                .map(|hit| format!("{}:{} {}", hit.file, hit.line, hit.term))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = write!(line, "  forbidden {} hits: {places}", hits.len());
+        }
+        None => line.push_str("  forbidden -"),
+    }
+    line
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        AuditInput, PullHeadInput, ReleaseDriftScan, Report, add_misplaced_origin_release_refs,
-        add_open_pull_head_checks, add_release_drifts, exit_for, pull_head_findings,
-        pull_position_findings, recorded_commit, same_commit,
+        AuditInput, LocalFacts, PullHeadInput, ReleaseDriftScan, Report,
+        add_misplaced_origin_release_refs, add_open_pull_head_checks, add_release_drifts, exit_for,
+        pull_head_findings, pull_position_findings, recorded_commit, same_commit,
     };
     use crate::bind::Fork;
     use crate::cli::Exit;
@@ -617,11 +1069,26 @@ mod tests {
         Account, Forge, ForgeError, PullDetails, PullFacts, PullRequest, PullSummary, RepoIdentity,
         SweepPage, TimelineEvent, fake::FakeForge,
     };
-    use crate::ids::{BookmarkRef, BranchName, CommitId, RepoName};
+    use crate::ids::{BookmarkRef, BranchName, CommitId, ReleaseScheme, RepoName};
     use crate::ledger::{Entry, Kind, Ledger};
     use crate::store::Store;
     use std::collections::BTreeMap;
     use std::path::Path;
+
+    static NO_TIPS: BTreeMap<BranchName, CommitId> = BTreeMap::new();
+    static NO_REFS: BTreeMap<String, CommitId> = BTreeMap::new();
+    static NO_TRACKED: BTreeMap<BranchName, u64> = BTreeMap::new();
+
+    /// A checkout with no bookmarks, no origin refs, nothing tracked, no template.
+    fn no_local_facts() -> LocalFacts<'static> {
+        LocalFacts {
+            local: &NO_TIPS,
+            origin_refs: &NO_REFS,
+            scheme: &ReleaseScheme::Dated,
+            tracked: &NO_TRACKED,
+            template: None,
+        }
+    }
 
     #[derive(Debug)]
     struct ChangingFactsForge {
@@ -773,6 +1240,7 @@ mod tests {
             .expect("record cut");
         let mut report = Report {
             repo: "demo".to_owned(),
+            branches: Vec::new(),
             findings: Vec::new(),
             notes: Vec::new(),
             problems: Vec::new(),
@@ -813,6 +1281,7 @@ mod tests {
     fn an_origin_release_ref_is_misplaced_when_another_remote_publishes_releases() {
         let mut report = Report {
             repo: "demo".to_owned(),
+            branches: Vec::new(),
             findings: Vec::new(),
             notes: Vec::new(),
             problems: Vec::new(),
@@ -853,6 +1322,7 @@ mod tests {
         };
         let mut report = Report {
             repo: "demo".to_owned(),
+            branches: Vec::new(),
             findings: Vec::new(),
             notes: Vec::new(),
             problems: Vec::new(),
@@ -940,8 +1410,13 @@ mod tests {
             "refs/heads/feat/alpha".to_owned(),
             CommitId::new("origin00000000000000000000000000000000000"),
         )]);
-        let mut findings = Vec::new();
-        let mut notes = Vec::new();
+        let mut report = Report {
+            repo: "demo".to_owned(),
+            branches: Vec::new(),
+            findings: Vec::new(),
+            notes: Vec::new(),
+            problems: Vec::new(),
+        };
 
         pull_head_findings(
             &PullHeadInput {
@@ -950,12 +1425,14 @@ mod tests {
                 cache_root: None,
                 local: &local,
                 origin_refs: &origin,
+                tracked: &BTreeMap::new(),
+                template: None,
             },
-            &mut findings,
-            &mut notes,
+            &mut report,
         )
         .expect("fake forge should complete the open pull batch");
 
+        let findings = report.findings;
         assert_eq!(findings.len(), 2);
         assert!(
             findings
@@ -977,6 +1454,7 @@ mod tests {
         let repo = RepoName::new("demo");
         let mut report = Report {
             repo: repo.to_string(),
+            branches: Vec::new(),
             findings: Vec::new(),
             notes: Vec::new(),
             problems: Vec::new(),
@@ -990,8 +1468,7 @@ mod tests {
                 forge: Some(&forge),
                 cache_root: Some(temp.path()),
             },
-            &BTreeMap::new(),
-            &BTreeMap::new(),
+            &no_local_facts(),
         );
 
         let identity = RepoIdentity {
@@ -1018,6 +1495,7 @@ mod tests {
         let repo = RepoName::new("demo");
         let mut report = Report {
             repo: repo.to_string(),
+            branches: Vec::new(),
             findings: Vec::new(),
             notes: Vec::new(),
             problems: Vec::new(),
@@ -1031,8 +1509,7 @@ mod tests {
                 forge: Some(&forge),
                 cache_root: Some(&blocked_root),
             },
-            &BTreeMap::new(),
-            &BTreeMap::new(),
+            &no_local_facts(),
         );
 
         assert!(
@@ -1058,6 +1535,7 @@ mod tests {
         let origin = BTreeMap::new();
         let mut report = Report {
             repo: repo.to_string(),
+            branches: Vec::new(),
             findings: Vec::new(),
             notes: Vec::new(),
             problems: Vec::new(),
@@ -1071,8 +1549,13 @@ mod tests {
                 forge: Some(&forge),
                 cache_root: None,
             },
-            &local,
-            &origin,
+            &LocalFacts {
+                local: &local,
+                origin_refs: &origin,
+                scheme: &ReleaseScheme::Dated,
+                tracked: &NO_TRACKED,
+                template: None,
+            },
         );
 
         assert_eq!(
@@ -1098,8 +1581,13 @@ mod tests {
             "refs/heads/feat/alpha".to_owned(),
             CommitId::new("origin00000000000000000000000000000000000"),
         )]);
-        let mut findings = Vec::new();
-        let mut notes = Vec::new();
+        let mut report = Report {
+            repo: "demo".to_owned(),
+            branches: Vec::new(),
+            findings: Vec::new(),
+            notes: Vec::new(),
+            problems: Vec::new(),
+        };
 
         pull_head_findings(
             &PullHeadInput {
@@ -1108,12 +1596,128 @@ mod tests {
                 cache_root: None,
                 local: &local,
                 origin_refs: &origin,
+                tracked: &BTreeMap::new(),
+                template: None,
             },
-            &mut findings,
-            &mut notes,
+            &mut report,
         )
         .expect("the changed pull fact is still a successful batch answer");
 
-        assert!(findings.is_empty(), "was: {findings:?}");
+        assert!(report.findings.is_empty(), "was: {:?}", report.findings);
+    }
+
+    /// A row for `branch` at `tip`, the way `add_branch_facts` shapes one.
+    fn local_row(branch: &str, tip: &str) -> super::BranchFacts {
+        super::BranchFacts {
+            branch: branch.to_owned(),
+            tip: tip.to_owned(),
+            origin_tip: None,
+            tip_matches_origin: None,
+            fork_only: false,
+            pull: None,
+            forbidden: None,
+        }
+    }
+
+    #[test]
+    fn a_tracked_pull_of_another_author_fills_the_row_without_moving_the_exit() {
+        // Given: `knives track --pr 41` on feat/alpha names a pull request someone
+        // else opened from their fork, whose head equals our local tip.
+        let entry = test_entry();
+        let fork = Fork::at("demo", &entry, Path::new("/fake"));
+        let tip = "expected0000000000000000000000000000000";
+        let forge = FakeForge {
+            pull_requests: BTreeMap::from([(
+                BranchName::new("their/branch"),
+                PullRequest {
+                    number: 41,
+                    state: "OPEN".to_owned(),
+                    head_ref_name: "their/branch".to_owned(),
+                    head_ref_oid: tip.to_owned(),
+                    head_repository_owner: Some(Account {
+                        login: "someone-else".to_owned(),
+                    }),
+                    ..PullRequest::default()
+                },
+            )]),
+            ..FakeForge::default()
+        };
+        let local = BTreeMap::from([(BranchName::new("feat/alpha"), CommitId::new(tip))]);
+        let tracked = BTreeMap::from([(BranchName::new("feat/alpha"), 41)]);
+        let mut report = Report {
+            repo: "demo".to_owned(),
+            branches: vec![local_row("feat/alpha", tip)],
+            findings: Vec::new(),
+            notes: Vec::new(),
+            problems: Vec::new(),
+        };
+
+        pull_head_findings(
+            &PullHeadInput {
+                fork: &fork,
+                forge: &forge,
+                cache_root: None,
+                local: &local,
+                origin_refs: &BTreeMap::new(),
+                tracked: &tracked,
+                template: None,
+            },
+            &mut report,
+        )
+        .expect("the tracked number is answered");
+
+        // Then: the row carries the pull's facts, and nothing else moves — their
+        // branch name is not ours to reconcile against origin or a bookmark.
+        let pull = report
+            .branches
+            .first()
+            .expect("one row")
+            .pull
+            .as_ref()
+            .expect("tracked pull facts");
+        assert_eq!((pull.number, pull.head_matches_tip), (41, true));
+        assert!(report.findings.is_empty(), "was: {:?}", report.findings);
+        assert!(report.problems.is_empty(), "was: {:?}", report.problems);
+        assert_eq!(exit_for(&report), Exit::Ok);
+    }
+
+    #[test]
+    fn an_unanswered_tracked_number_is_a_note_not_a_problem() {
+        // Given: a tracked number the forge no longer knows (deleted, or mistyped).
+        let entry = test_entry();
+        let fork = Fork::at("demo", &entry, Path::new("/fake"));
+        let forge = FakeForge::default();
+        let tip = "local000000000000000000000000000000000000";
+        let local = BTreeMap::from([(BranchName::new("feat/alpha"), CommitId::new(tip))]);
+        let tracked = BTreeMap::from([(BranchName::new("feat/alpha"), 41)]);
+        let mut report = Report {
+            repo: "demo".to_owned(),
+            branches: vec![local_row("feat/alpha", tip)],
+            findings: Vec::new(),
+            notes: Vec::new(),
+            problems: Vec::new(),
+        };
+
+        pull_head_findings(
+            &PullHeadInput {
+                fork: &fork,
+                forge: &forge,
+                cache_root: None,
+                local: &local,
+                origin_refs: &BTreeMap::new(),
+                tracked: &tracked,
+                template: None,
+            },
+            &mut report,
+        )
+        .expect("an unanswered tracked number is not a batch failure");
+
+        assert!(report.branches.first().expect("one row").pull.is_none());
+        assert_eq!(
+            report.notes,
+            vec!["tracked pull request #41 was not answered by the live batch"]
+        );
+        assert!(report.problems.is_empty(), "was: {:?}", report.problems);
+        assert_eq!(exit_for(&report), Exit::Ok);
     }
 }

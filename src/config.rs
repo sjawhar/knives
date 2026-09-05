@@ -152,6 +152,11 @@ pub struct RepoEntry {
     /// taken from the config directory, not the checkout.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspaces: Option<PathBuf>,
+    /// Identifiers an upstream-bound diff must not add: our org, our product,
+    /// our hosts. `knives audit` reports every added line that names one;
+    /// branches stated `--fork-only` are exempt. Case-insensitive substrings.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub forbidden: Vec<String>,
 }
 
 impl RepoEntry {
@@ -166,6 +171,7 @@ impl RepoEntry {
             test_count_command: None,
             consumers: Vec::new(),
             workspaces: None,
+            forbidden: Vec::new(),
         }
     }
 
@@ -782,6 +788,25 @@ release = "https://example.invalid/releases.git"
             registry.repos["demo"].release_scheme(),
             crate::ids::ReleaseScheme::Fixed(crate::ids::BranchName::new("integration"))
         );
+    }
+
+    #[test]
+    fn forbidden_identifiers_parse_and_default_to_none() {
+        // The list is kept as written: the scan lowercases at match time, so the
+        // registry may spell a term the way its owner writes it.
+        let dir = tempfile::tempdir().unwrap();
+        let with = "[repos.demo]\nupstream = \"u\"\norigin = \"o\"\n\
+                    forbidden = [\"Widgets-Inc\", \"acme-corp\"]\n";
+        let registry = load(&write(dir.path(), with)).unwrap();
+        assert_eq!(
+            registry.repos["demo"].forbidden,
+            ["Widgets-Inc", "acme-corp"]
+        );
+
+        let without = "[repos.demo]\nupstream = \"u\"\norigin = \"o\"\n";
+        let registry = load(&write(dir.path(), without)).unwrap();
+        assert!(registry.repos["demo"].forbidden.is_empty());
+        assert!(RepoEntry::new("u", "o").forbidden.is_empty());
     }
 
     #[test]

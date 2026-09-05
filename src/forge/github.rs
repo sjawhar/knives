@@ -467,6 +467,7 @@ pub fn pull_facts_query(numbers: &[u64]) -> String {
          fragment facts on PullRequest {{ number state reviewDecision headRefName headRefOid \
          updatedAt isDraft url headRepositoryOwner {{ login }} baseRefName mergeable \
          mergeStateStatus mergeCommit {{ oid }} additions deletions changedFiles headRef {{ name }} \
+         body reviewThreads(first: 100) {{ pageInfo {{ hasNextPage }} nodes {{ isResolved }} }} \
          reviews(last: 100) {{ nodes {{ submittedAt }} }} \
          commits(last: 100) {{ nodes {{ commit {{ committedDate }} }} }} \
          rollup: commits(last: 1) {{ nodes {{ commit {{ tree {{ oid }} \
@@ -749,6 +750,17 @@ struct FactsPayload {
     rollup: Option<Nodes<RollupNode>>,
     #[serde(default)]
     comments: Option<Nodes<Created>>,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default, rename = "reviewThreads")]
+    review_threads: Option<Nodes<ReviewThreadNode>>,
+}
+
+/// One review thread on the pull request: resolved, or still waiting on us.
+#[derive(Deserialize)]
+struct ReviewThreadNode {
+    #[serde(rename = "isResolved")]
+    is_resolved: bool,
 }
 
 #[derive(Deserialize)]
@@ -1042,12 +1054,29 @@ fn details_from(payload: &FactsPayload) -> Result<PullDetails, ForgeError> {
         .flat_map(|list| list.nodes.iter())
         .last()
         .and_then(|tip| tip_commit_empty(&tip.commit));
+    // A second page of threads leaves the count unanswered rather than failing
+    // the batch: `details_from` serves `status` and `sync` too, and a long-lived
+    // pull request with more than 100 threads is realistic where 100 check
+    // contexts is not. `None` is the field's own meaning, "the batch did not answer".
+    let unresolved_review_threads = payload
+        .review_threads
+        .as_ref()
+        .filter(|threads| !threads.page_info.has_next_page)
+        .map(|threads| {
+            threads
+                .nodes
+                .iter()
+                .filter(|thread| !thread.is_resolved)
+                .count()
+        });
     Ok(PullDetails {
         review_predates_head,
         checks,
         diff,
         head_ref_deleted,
         tip_commit_empty,
+        body: payload.body.clone(),
+        unresolved_review_threads,
     })
 }
 
@@ -1862,6 +1891,60 @@ printf '{}'
             facts[&7].newest_comment.as_deref(),
             Some("2026-08-03T00:00:00Z")
         );
+    }
+
+    #[test]
+    fn the_body_and_unresolved_review_threads_are_read_from_the_facts_row() {
+        let payload = facts_payload(
+            r###""p7":{"number":7,"state":"OPEN","headRefName":"feat/a","headRefOid":"aa",
+            "updatedAt":"2026-08-01T00:00:00Z",
+            "body":"## Overview\nfix\n",
+            "reviewThreads":{"pageInfo":{"hasNextPage":false},"nodes":[
+            {"isResolved":true},{"isResolved":false},{"isResolved":false}]}}"###,
+        );
+        let facts = parse_pull_facts(&payload, &[7]).expect("facts parse");
+        let details = &facts[&7].details;
+        assert_eq!(details.body.as_deref(), Some("## Overview\nfix\n"));
+        assert_eq!(details.unresolved_review_threads, Some(2));
+        let query = pull_facts_query(&[7]);
+        assert!(query.contains(" body "), "was: {query}");
+        assert!(
+            query.contains(
+                "reviewThreads(first: 100) { pageInfo { hasNextPage } nodes { isResolved } }"
+            ),
+            "was: {query}"
+        );
+    }
+
+    #[test]
+    fn a_facts_row_without_body_or_threads_answers_none_for_both() {
+        // An old recorded payload, or a forge that refused the fields: "not
+        // answered", never "no body" or "no threads".
+        let payload = facts_payload(
+            r#""p7":{"number":7,"state":"OPEN","headRefName":"feat/a","headRefOid":"aa",
+            "updatedAt":"2026-08-01T00:00:00Z"}"#,
+        );
+        let facts = parse_pull_facts(&payload, &[7]).expect("facts parse");
+        let details = &facts[&7].details;
+        assert_eq!(details.body, None);
+        assert_eq!(details.unresolved_review_threads, None);
+    }
+
+    #[test]
+    fn a_second_page_of_review_threads_leaves_the_count_unanswered_without_failing() {
+        // Unlike the rollup and suite refusals, a long-lived pull request with more
+        // than 100 review threads is realistic, and `details_from` serves `status`
+        // and `sync` too: the count reads as unanswered and everything else stands.
+        let payload = facts_payload(
+            r#""p7":{"number":7,"state":"OPEN","headRefName":"feat/a","headRefOid":"aa",
+            "updatedAt":"2026-08-01T00:00:00Z","body":"text",
+            "reviewThreads":{"pageInfo":{"hasNextPage":true},"nodes":[{"isResolved":false}]}}"#,
+        );
+        let facts =
+            parse_pull_facts(&payload, &[7]).expect("a truncated thread list is not an error");
+        let details = &facts[&7].details;
+        assert_eq!(details.unresolved_review_threads, None);
+        assert_eq!(details.body.as_deref(), Some("text"));
     }
 
     #[test]

@@ -293,6 +293,26 @@ impl Lab {
         jj(&self.work, ["git", "fetch", "--remote", "upstream"]);
     }
 
+    /// Commit `file` on upstream's trunk (creating its directories) and fetch it into
+    /// the work checkout, so `<trunk>@upstream` carries it.
+    pub(crate) fn upstream_trunk_file(&self, file: &str, content: &str) {
+        let path = self.maintainer.join(file);
+        std::fs::create_dir_all(path.parent().expect("file has a parent")).expect("create dirs");
+        std::fs::write(&path, content).expect("write upstream trunk file");
+        git(&self.maintainer, &self.trunk, ["add", file]);
+        git(
+            &self.maintainer,
+            &self.trunk,
+            ["commit", "-m", "upstream trunk file"],
+        );
+        git(
+            &self.maintainer,
+            &self.trunk,
+            ["push", "origin", self.trunk.as_str()],
+        );
+        jj(&self.work, ["git", "fetch", "--remote", "upstream"]);
+    }
+
     /// A branch of upstream's own, forked from its trunk tip and pushed there:
     /// somebody else's work, visible here as `<name>@upstream` after the fetch.
     pub(crate) fn upstream_branch(&self, name: &str, file: &str, content: &str) {

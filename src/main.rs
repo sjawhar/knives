@@ -512,6 +512,7 @@ fn run_audit(
             }),
             Selected::Unplaced { name, problem, .. } => audit::Report {
                 repo: name.to_string(),
+                branches: Vec::new(),
                 findings: Vec::new(),
                 notes: Vec::new(),
                 problems: vec![problem.clone()],

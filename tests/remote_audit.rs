@@ -7,13 +7,26 @@
 
 #[path = "common/lab.rs"]
 mod lab;
+#[path = "common/pulls.rs"]
+mod pulls;
 
 use knives::commands::audit;
-use knives::ids::{BookmarkRef, BranchName, RemoteName};
+use knives::forge::fake::FakeForge;
+use knives::forge::{CheckRun, ChecksSummary, PullRequest};
+use knives::ids::{BookmarkRef, BranchName, BranchTarget, RemoteName, RepoName};
 use knives::jj::Repo;
 use knives::store::Store;
-use lab::{Lab, lab_entry};
+use lab::{Lab, commit_at, lab_entry};
+use std::collections::BTreeMap;
 use std::process::Command;
+
+/// The lab entry with the bare origin as origin, so live origin refs are the pushed ones.
+fn origin_entry(lab: &Lab) -> knives::config::RepoEntry {
+    knives::config::RepoEntry::new(
+        lab.upstream.display().to_string(),
+        lab.temp_origin().display().to_string(),
+    )
+}
 /// Registry home for commands that reconcile the lab's live bare remotes.
 fn mutation_test_home(lab: &Lab, release: Option<&std::path::Path>) -> tempfile::TempDir {
     let home = tempfile::tempdir().expect("create config home");
@@ -710,5 +723,367 @@ fn audit_with_no_github_still_reconciles() {
                 .as_str()
                 .is_some_and(|problem| problem.contains("pull-head reconciliation was skipped"))),
         "was: {report}"
+    );
+}
+
+#[test]
+fn audit_json_carries_a_branches_array_with_local_facts() {
+    // Given: one pushed branch and no forge transport.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.push_branch("feat/alpha");
+    let home = mutation_test_home(&lab, None);
+
+    // When: the binary audits with --no-github.
+    let output = knives_audit(&lab, &home, &["demo", "--no-github"]);
+
+    // Then: every row carries its local facts even though no pull was consulted.
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("audit emits JSON");
+    let rows = report["branches"].as_array().expect("branches is an array");
+    let row = rows
+        .iter()
+        .find(|row| row["branch"] == "feat/alpha")
+        .unwrap_or_else(|| panic!("feat/alpha row: {report}"));
+    assert_eq!(row["tip"], commit_at(&lab, "feat/alpha").as_str());
+    assert_eq!(row["tip_matches_origin"], true);
+    assert!(row.get("pull").is_none(), "no forge, no pull facts: {row}");
+}
+
+#[test]
+fn file_text_and_diff_git_read_the_upstream_trunk() {
+    // Given: a template on upstream's trunk and a branch adding one line.
+    let lab = Lab::new();
+    lab.upstream_trunk_file(".github/pull_request_template.md", "## Overview\n");
+    lab.branch("feat/alpha", "alpha.py", "# wired for acme-corp's IaC\n");
+
+    // When/Then: the file reads at `main@upstream`, is absent at `main@origin`,
+    // and the diff names the added line.
+    let text = knives::jj::file_text(
+        lab.work_path(),
+        "main@upstream",
+        ".github/pull_request_template.md",
+    )
+    .expect("read a present file");
+    assert_eq!(text.as_deref(), Some("## Overview\n"));
+    let absent = knives::jj::file_text(
+        lab.work_path(),
+        "main@origin",
+        ".github/pull_request_template.md",
+    )
+    .expect("a missing path is not an error");
+    assert_eq!(absent, None);
+    let unresolvable = knives::jj::file_text(lab.work_path(), "no-such-rev", "alpha.py");
+    assert!(
+        unresolvable.is_err(),
+        "a bad revision must not read as absent"
+    );
+    let diff = knives::jj::diff_git(lab.work_path(), "main@upstream", "feat/alpha").expect("diff");
+    assert!(diff.contains("+++ b/alpha.py"), "was: {diff}");
+    assert!(diff.contains("+# wired for acme-corp's IaC"), "was: {diff}");
+    assert!(
+        diff.contains("--- a/.github/pull_request_template.md") && diff.contains("+++ /dev/null"),
+        "the branch lacks upstream's newer template, so the diff removes it: {diff}"
+    );
+}
+
+#[test]
+fn audit_reports_branch_and_pull_facts() {
+    // Given: a branch whose diff names a forbidden term, a PR answered by the forge
+    // with a body missing one template heading, and an upstream trunk carrying the template.
+    let lab = Lab::new();
+    lab.upstream_trunk_file(
+        ".github/pull_request_template.md",
+        "## Overview\n\n## Approach\n\n## Testing & validation\n",
+    );
+    lab.branch("feat/alpha", "alpha.py", "# wired for acme-corp's IaC\n");
+    lab.push_branch("feat/alpha");
+    let mut entry = origin_entry(&lab);
+    entry.forbidden = vec!["acme-corp".to_owned()];
+    let fork = lab::lab_fork(&lab, "demo", &entry);
+    let tip = commit_at(&lab, "feat/alpha");
+    let fake = FakeForge {
+        pull_requests: BTreeMap::from([(
+            BranchName::new("feat/alpha"),
+            PullRequest {
+                mergeable: Some("MERGEABLE".into()),
+                merge_state_status: Some("CLEAN".into()),
+                review_decision: "REVIEW_REQUIRED".into(),
+                ..pulls::pull_request_with_head(7, "OPEN", "feat/alpha", tip.as_str())
+            },
+        )]),
+        checks: BTreeMap::from([(
+            7,
+            ChecksSummary {
+                runs: vec![
+                    CheckRun {
+                        name: "lint".into(),
+                        conclusion: Some("SUCCESS".into()),
+                    },
+                    CheckRun {
+                        name: "test".into(),
+                        conclusion: None,
+                    },
+                    CheckRun {
+                        name: "e2e".into(),
+                        conclusion: Some("ACTION_REQUIRED".into()),
+                    },
+                ],
+            },
+        )]),
+        bodies: BTreeMap::from([(
+            7,
+            "## Overview\nfix\n\n## Testing & validation\nran it\n".to_owned(),
+        )]),
+        unresolved_threads: BTreeMap::from([(7, 2)]),
+        ..FakeForge::default()
+    };
+    let state = tempfile::tempdir().expect("state");
+    let store = Store::open(state.path().join("state.json")).expect("store");
+
+    let report = audit::gather(&audit::AuditInput {
+        fork: &fork,
+        store: &store,
+        forge: Some(&fake),
+        cache_root: None,
+    });
+
+    let row = report
+        .branches
+        .iter()
+        .find(|row| row.branch == "feat/alpha")
+        .expect("row");
+    assert_eq!(row.tip, tip.as_str());
+    assert_eq!(row.tip_matches_origin, Some(true));
+    assert!(!row.fork_only);
+    let pull = row.pull.as_ref().expect("pull facts");
+    assert_eq!(
+        (
+            pull.number,
+            pull.mergeable.as_deref(),
+            pull.merge_state_status.as_deref()
+        ),
+        (7, Some("MERGEABLE"), Some("CLEAN"))
+    );
+    assert_eq!(pull.review_decision, "REVIEW_REQUIRED");
+    assert!(pull.head_matches_tip);
+    let checks = pull.checks.as_ref().expect("checks");
+    assert_eq!((checks.total, checks.pending), (3, 1));
+    assert_eq!(checks.conclusions.get("SUCCESS"), Some(&1));
+    assert_eq!(checks.conclusions.get("ACTION_REQUIRED"), Some(&1));
+    assert_eq!(pull.unresolved_review_threads, Some(2));
+    let template = pull.template.as_ref().expect("template");
+    assert_eq!(template.file, ".github/pull_request_template.md");
+    assert_eq!(
+        template.headings,
+        ["Overview", "Approach", "Testing & validation"]
+    );
+    assert_eq!(template.missing_from_body, ["Approach"]);
+    let hits = row.forbidden.as_ref().expect("scan ran");
+    assert_eq!(hits.len(), 1, "was: {hits:?}");
+    assert_eq!(
+        (hits[0].file.as_str(), hits[0].line, hits[0].term.as_str()),
+        ("alpha.py", 1, "acme-corp")
+    );
+    assert_eq!(report.problems, Vec::<String>::new());
+}
+
+#[test]
+fn an_uppercase_pull_request_template_is_read_too() {
+    // Given: upstream names its template `.github/PULL_REQUEST_TEMPLATE.md`, as
+    // several registered upstreams do, and a pull whose body lacks one heading.
+    let lab = Lab::new();
+    lab.upstream_trunk_file(
+        ".github/PULL_REQUEST_TEMPLATE.md",
+        "# Summary\n\n# Checklist\n",
+    );
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.push_branch("feat/alpha");
+    let entry = origin_entry(&lab);
+    let fork = lab::lab_fork(&lab, "demo", &entry);
+    let tip = commit_at(&lab, "feat/alpha");
+    let fake = FakeForge {
+        pull_requests: BTreeMap::from([(
+            BranchName::new("feat/alpha"),
+            pulls::pull_request_with_head(9, "OPEN", "feat/alpha", tip.as_str()),
+        )]),
+        bodies: BTreeMap::from([(9, "# summary\nwhat changed\n".to_owned())]),
+        ..FakeForge::default()
+    };
+    let state = tempfile::tempdir().expect("state");
+    let store = Store::open(state.path().join("state.json")).expect("store");
+
+    let report = audit::gather(&audit::AuditInput {
+        fork: &fork,
+        store: &store,
+        forge: Some(&fake),
+        cache_root: None,
+    });
+
+    let row = report
+        .branches
+        .iter()
+        .find(|row| row.branch == "feat/alpha")
+        .expect("row");
+    let template = row
+        .pull
+        .as_ref()
+        .and_then(|pull| pull.template.as_ref())
+        .expect("the uppercase template was read");
+    assert_eq!(template.file, ".github/PULL_REQUEST_TEMPLATE.md");
+    assert_eq!(template.headings, ["Summary", "Checklist"]);
+    assert_eq!(
+        template.missing_from_body,
+        ["Checklist"],
+        "heading comparison is case-insensitive"
+    );
+    assert_eq!(report.problems, Vec::<String>::new());
+}
+
+#[test]
+fn origin_parity_reports_differs_and_absent() {
+    // Given: one branch origin holds at a different tip, one origin never saw.
+    let lab = Lab::new();
+    lab.branch("feat/moved", "moved.txt", "one\n");
+    lab.push_branch("feat/moved");
+    lab.advance_origin_branch("feat/moved", "two\n"); // origin moves; local does not
+    lab.branch("feat/unpushed", "u.txt", "u\n");
+    let entry = origin_entry(&lab);
+    let fork = lab::lab_fork(&lab, "demo", &entry);
+    let state = tempfile::tempdir().expect("state");
+    let store = Store::open(state.path().join("state.json")).expect("store");
+
+    let report = audit::gather(&audit::AuditInput {
+        fork: &fork,
+        store: &store,
+        forge: None,
+        cache_root: None,
+    });
+
+    let row = |name: &str| {
+        report
+            .branches
+            .iter()
+            .find(|row| row.branch == name)
+            .expect(name)
+    };
+    assert_eq!(row("feat/moved").tip_matches_origin, Some(false));
+    assert!(row("feat/moved").origin_tip.is_some());
+    assert_ne!(
+        row("feat/moved").origin_tip.as_deref(),
+        Some(row("feat/moved").tip.as_str())
+    );
+    assert_eq!(row("feat/unpushed").tip_matches_origin, None);
+    assert_eq!(row("feat/unpushed").origin_tip, None);
+}
+
+#[test]
+fn a_fork_only_branch_is_exempt_from_the_forbidden_scan_and_no_config_means_no_scan() {
+    // Given: a branch whose diff names the configured term.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.py", "# wired for acme-corp's IaC\n");
+    lab.branch("feat/beta", "beta.py", "# plain\n");
+
+    // (1) The term is configured and the branch is stated fork-only: no scan.
+    let mut entry = origin_entry(&lab);
+    entry.forbidden = vec!["acme-corp".to_owned()];
+    let fork = lab::lab_fork(&lab, "demo", &entry);
+    let state = tempfile::tempdir().expect("state");
+    let mut store = Store::open_for_update(state.path().join("state.json")).expect("store");
+    store.mark_fork_only(
+        &BranchTarget::new(RepoName::new("demo"), BranchName::new("feat/alpha")),
+        "test",
+    );
+
+    let report = audit::gather(&audit::AuditInput {
+        fork: &fork,
+        store: &store,
+        forge: None,
+        cache_root: None,
+    });
+
+    let alpha = report
+        .branches
+        .iter()
+        .find(|row| row.branch == "feat/alpha")
+        .expect("feat/alpha row");
+    assert!(alpha.fork_only);
+    assert!(alpha.forbidden.is_none(), "exempt: {alpha:?}");
+    let beta = report
+        .branches
+        .iter()
+        .find(|row| row.branch == "feat/beta")
+        .expect("feat/beta row");
+    assert!(!beta.fork_only);
+    assert_eq!(
+        beta.forbidden.as_deref(),
+        Some(&[][..]),
+        "scanned, nothing found: {beta:?}"
+    );
+    drop(store);
+
+    // (2) No term configured: no scan on any row, and nothing is fork-only.
+    let entry = origin_entry(&lab);
+    let fork = lab::lab_fork(&lab, "demo", &entry);
+    let state = tempfile::tempdir().expect("state");
+    let store = Store::open(state.path().join("state.json")).expect("store");
+
+    let report = audit::gather(&audit::AuditInput {
+        fork: &fork,
+        store: &store,
+        forge: None,
+        cache_root: None,
+    });
+
+    assert!(!report.branches.is_empty());
+    for row in &report.branches {
+        assert!(row.forbidden.is_none(), "not configured: {row:?}");
+        assert!(!row.fork_only, "{row:?}");
+    }
+}
+
+#[test]
+fn audit_without_github_still_reports_local_branch_facts() {
+    // Given: one pushed and one unpushed branch, and no forge transport.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.push_branch("feat/alpha");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let entry = origin_entry(&lab);
+    let fork = lab::lab_fork(&lab, "demo", &entry);
+    let state = tempfile::tempdir().expect("state");
+    let store = Store::open(state.path().join("state.json")).expect("store");
+
+    let report = audit::gather(&audit::AuditInput {
+        fork: &fork,
+        store: &store,
+        forge: None,
+        cache_root: None,
+    });
+
+    assert!(!report.branches.is_empty());
+    let row = |name: &str| {
+        report
+            .branches
+            .iter()
+            .find(|row| row.branch == name)
+            .expect(name)
+    };
+    assert_eq!(
+        row("feat/alpha").tip,
+        commit_at(&lab, "feat/alpha").as_str()
+    );
+    assert_eq!(row("feat/alpha").tip_matches_origin, Some(true));
+    assert_eq!(row("feat/beta").tip_matches_origin, None);
+    for row in &report.branches {
+        assert!(row.pull.is_none(), "no forge, no pull facts: {row:?}");
+    }
+    assert!(
+        report
+            .problems
+            .iter()
+            .any(|problem| problem == "open pull-head reconciliation was skipped (--no-github)"),
+        "was: {:?}",
+        report.problems
     );
 }

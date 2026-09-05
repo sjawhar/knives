@@ -1331,6 +1331,59 @@ pub fn changed_files_between(repo: &Path, from: &str, to: &str) -> Result<Vec<St
     changed_files_for_diff_args(repo, &["--from", from, "--to", to])
 }
 
+/// One file's text at `revision`, or `None` when the revision has no such path.
+///
+/// Only jj's "No such path" reads as `None`; an unresolvable revision or any
+/// other failure is an error, so a mistyped trunk never reads as "no template".
+pub fn file_text(repo: &Path, revision: &str, file: &str) -> Result<Option<String>, JjError> {
+    let repo_path = path(repo);
+    // `jj file show` resolves a bare path against the caller's cwd, not the
+    // repository; the `root:` fileset names it repo-relative from anywhere.
+    let fileset = format!(
+        "root:\"{}\"",
+        file.replace('\\', "\\\\").replace('"', "\\\"")
+    );
+    match command(
+        "jj",
+        [
+            "--repository",
+            repo_path.as_str(),
+            "--ignore-working-copy",
+            "file",
+            "show",
+            "-r",
+            revision,
+            fileset.as_str(),
+        ],
+    ) {
+        Ok(text) => Ok(Some(text)),
+        Err(JjError::Command { stderr, .. }) if stderr.contains("No such path") => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// The `--git` diff between two commits with no context lines, so every `+`
+/// line is an addition and hunk headers give exact new-file line numbers.
+pub fn diff_git(repo: &Path, from: &str, to: &str) -> Result<String, JjError> {
+    let repo_path = path(repo);
+    command(
+        "jj",
+        [
+            "--repository",
+            repo_path.as_str(),
+            "--ignore-working-copy",
+            "diff",
+            "--git",
+            "--context",
+            "0",
+            "--from",
+            from,
+            "--to",
+            to,
+        ],
+    )
+}
+
 fn changed_files_for_diff_args(repo: &Path, diff_args: &[&str]) -> Result<Vec<String>, JjError> {
     let repo_path = path(repo);
     let mut args = vec![
