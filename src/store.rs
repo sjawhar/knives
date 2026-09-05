@@ -12,6 +12,7 @@
 use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -122,13 +123,136 @@ pub enum StoreError {
         path: PathBuf,
         source: serde_json::Error,
     },
-    #[error("another knives command is holding {path}; try again in a moment")]
-    Locked { path: PathBuf },
+    #[error("{}", locked_message(path, holder.as_ref()))]
+    Locked {
+        path: PathBuf,
+        holder: Option<LockHolder>,
+    },
     #[error("serialising state: {source}")]
     Serialise {
         #[from]
         source: serde_json::Error,
     },
+}
+
+/// How long a writer waits for the lock and how it spaces its attempts.
+///
+/// `start` holds the lock for the whole workspace creation, so a waiter must
+/// outlast several holds; pauses grow so a long hold is not polled hundreds
+/// of times, and jitter keeps waiters out of lockstep.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LockWait {
+    pub deadline: Duration,
+    pub floor: Duration,
+    pub ceiling: Duration,
+}
+
+impl Default for LockWait {
+    fn default() -> Self {
+        Self {
+            deadline: Duration::from_secs(60),
+            floor: Duration::from_millis(20),
+            ceiling: Duration::from_secs(2),
+        }
+    }
+}
+
+impl LockWait {
+    /// One second, for the best-effort sidecar locks (`seen`, the hook's
+    /// session state): a stale one must never stall a command or a hook event.
+    pub(crate) const BRIEF: Self = Self {
+        deadline: Duration::from_secs(1),
+        floor: Duration::from_millis(20),
+        ceiling: Duration::from_millis(200),
+    };
+}
+
+/// The process holding a lock, read from the lock file when a wait gives up
+/// or when the holder turns out to be gone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LockHolder {
+    pub pid: u32,
+    pub held_for: Duration,
+    /// `Some(false)` when the platform can say the pid is not running
+    /// (`/proc/<pid>` absent on Linux); `None` where it cannot.
+    pub running: Option<bool>,
+}
+
+fn locked_message(path: &Path, holder: Option<&LockHolder>) -> String {
+    match holder {
+        Some(LockHolder {
+            pid,
+            held_for,
+            running: Some(false),
+        }) => format!(
+            "{} is held by pid {pid}, which is not running (lock written {}s ago); remove the lock file to proceed",
+            path.display(),
+            held_for.as_secs()
+        ),
+        Some(holder) => format!(
+            "another knives command (pid {}, holding for {}s) is holding {}; try again in a moment",
+            holder.pid,
+            holder.held_for.as_secs(),
+            path.display()
+        ),
+        None => format!(
+            "another knives command (holder unknown) is holding {}; try again in a moment",
+            path.display()
+        ),
+    }
+}
+
+/// Uniform in `[floor, min(ceiling, floor * 2^attempt)]`: `random` is scaled
+/// onto the span rather than reduced modulo it, so `0` is the floor and
+/// `u64::MAX` the cap.
+fn pause(attempt: u32, wait: LockWait, random: u64) -> Duration {
+    let cap = wait
+        .floor
+        .saturating_mul(1 << attempt.min(16))
+        .min(wait.ceiling);
+    let span = u64::try_from(cap.saturating_sub(wait.floor).as_nanos()).unwrap_or(u64::MAX);
+    let scaled = (u128::from(random) * (u128::from(span) + 1)) >> 64;
+    let jitter = u64::try_from(scaled).unwrap_or(span);
+    wait.floor + Duration::from_nanos(jitter)
+}
+
+/// Jitter source. The standard library's per-process randomised hasher is
+/// enough to break lockstep between waiters, and costs no dependency.
+fn random_u64() -> u64 {
+    use std::hash::{BuildHasher as _, Hasher as _};
+    std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish()
+}
+
+fn pid_running(pid: u32) -> Option<bool> {
+    if cfg!(target_os = "linux") {
+        Some(Path::new("/proc").join(pid.to_string()).exists())
+    } else {
+        None
+    }
+}
+
+/// The lock file's first token is the writer's pid; a file without one (an
+/// older binary's, or one still being written) has an unknown holder.
+fn read_holder(path: &Path) -> Option<LockHolder> {
+    let pid = std::fs::read_to_string(path)
+        .ok()?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()?;
+    let held_for = std::fs::metadata(path)
+        .ok()?
+        .modified()
+        .ok()?
+        .elapsed()
+        .unwrap_or_default();
+    Some(LockHolder {
+        pid,
+        held_for,
+        running: pid_running(pid),
+    })
 }
 
 /// Held for the duration of a read-modify-write.
@@ -140,16 +264,26 @@ pub enum StoreError {
 /// record cannot itself lose writes.
 ///
 /// An exclusive-create lockfile rather than a dependency: `create_new` is atomic
-/// on every platform this runs on.
+/// on every platform this runs on. The file holds the writer's pid, so a waiter
+/// that gives up can name who it waited on, and a lock left behind by a dead
+/// process is refused at once instead of waited on for the whole budget. It is
+/// not removed automatically: a reused pid would make that delete a live
+/// holder's lock.
 #[derive(Debug)]
 pub(crate) struct StoreLock {
     path: PathBuf,
 }
 
 impl StoreLock {
-    /// Beside the file it guards, named for that file's stem: `state.json` is
-    /// guarded by `state.lock`.
+    /// The best-effort wait: sidecar locks that must never stall a command.
     pub(crate) fn acquire(target: &Path) -> Result<Self, StoreError> {
+        Self::acquire_with(target, LockWait::BRIEF)
+    }
+
+    /// Beside the file it guards, named for that file's stem: `state.json` is
+    /// guarded by `state.lock`. Waits per `wait`, then gives up loudly:
+    /// blocking forever on a stale lock would be worse than saying so.
+    pub(crate) fn acquire_with(target: &Path, wait: LockWait) -> Result<Self, StoreError> {
         let path = target.with_extension("lock");
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|source| StoreError::Write {
@@ -157,22 +291,37 @@ impl StoreLock {
                 source,
             })?;
         }
-        // A short wait, then give up loudly. Blocking forever on a stale lock
-        // would be worse than saying so.
-        for _ in 0..50 {
+        let started = std::time::Instant::now();
+        let mut attempt = 0u32;
+        loop {
             match std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .open(&path)
             {
-                Ok(_) => return Ok(Self { path }),
+                Ok(mut file) => {
+                    if let Err(source) = writeln!(file, "{}", std::process::id()) {
+                        let _ = std::fs::remove_file(&path);
+                        return Err(StoreError::Write { path, source });
+                    }
+                    return Ok(Self { path });
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    let holder = read_holder(&path);
+                    let elapsed = started.elapsed();
+                    let holder_gone = holder
+                        .as_ref()
+                        .is_some_and(|holder| holder.running == Some(false));
+                    if holder_gone || elapsed >= wait.deadline {
+                        return Err(StoreError::Locked { path, holder });
+                    }
+                    let remaining = wait.deadline.saturating_sub(elapsed);
+                    std::thread::sleep(pause(attempt, wait, random_u64()).min(remaining));
+                    attempt += 1;
                 }
                 Err(source) => return Err(StoreError::Write { path, source }),
             }
         }
-        Err(StoreError::Locked { path })
     }
 }
 
@@ -201,9 +350,15 @@ impl Store {
         Self::read(path, None)
     }
 
-    /// For a read-modify-write. Holds the lock until dropped.
+    /// For a read-modify-write. Holds the lock until dropped, and waits the
+    /// full claim-writer budget (`LockWait::default`) for another writer.
     pub fn open_for_update(path: PathBuf) -> Result<Self, StoreError> {
-        let lock = StoreLock::acquire(&path)?;
+        Self::open_for_update_with(path, LockWait::default())
+    }
+
+    /// [`Self::open_for_update`] with an explicit wait budget.
+    fn open_for_update_with(path: PathBuf, wait: LockWait) -> Result<Self, StoreError> {
+        let lock = StoreLock::acquire_with(&path, wait)?;
         Self::read(path, Some(lock))
     }
 
@@ -699,6 +854,12 @@ mod tests {
 mod lock_tests {
     use super::*;
 
+    const QUICK: LockWait = LockWait {
+        deadline: Duration::from_millis(200),
+        floor: Duration::from_millis(5),
+        ceiling: Duration::from_millis(40),
+    };
+
     #[test]
     fn a_second_writer_cannot_open_while_the_first_holds_the_lock() {
         // Two concurrent claim writers that interleave read, decide and write both used
@@ -707,9 +868,9 @@ mod lock_tests {
         // must not lose them.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.json");
-        let first = Store::open_for_update(path.clone()).unwrap();
+        let first = Store::open_for_update_with(path.clone(), QUICK).unwrap();
 
-        let second = Store::open_for_update(path.clone());
+        let second = Store::open_for_update_with(path.clone(), QUICK);
         assert!(
             matches!(second, Err(StoreError::Locked { .. })),
             "a second writer got in"
@@ -720,8 +881,132 @@ mod lock_tests {
 
         drop(first);
         assert!(
-            Store::open_for_update(path).is_ok(),
+            Store::open_for_update_with(path, QUICK).is_ok(),
             "the lock outlived its holder"
+        );
+    }
+
+    #[test]
+    fn a_locked_error_names_the_holders_pid_and_age() {
+        let dir = tempfile::tempdir().expect("state dir");
+        let path = dir.path().join("state.json");
+        let _first = Store::open_for_update_with(path.clone(), QUICK).expect("first writer");
+        let error = Store::open_for_update_with(path, QUICK).expect_err("second writer");
+        let StoreError::Locked {
+            holder: Some(holder),
+            ..
+        } = &error
+        else {
+            panic!("expected a Locked error with a holder, got {error:?}");
+        };
+        assert_eq!(holder.pid, std::process::id());
+        assert!(holder.held_for < Duration::from_secs(5), "{holder:?}");
+        let text = error.to_string();
+        assert!(
+            text.contains(&format!("pid {}", std::process::id())),
+            "{text}"
+        );
+        assert!(text.contains("holding for"), "{text}");
+    }
+
+    #[test]
+    fn a_lock_file_without_a_pid_reports_an_unknown_holder() {
+        let dir = tempfile::tempdir().expect("state dir");
+        let path = dir.path().join("state.json");
+        std::fs::write(path.with_extension("lock"), b"").expect("stale lock");
+        let error = Store::open_for_update_with(path, QUICK).expect_err("locked");
+        assert!(
+            matches!(&error, StoreError::Locked { holder: None, .. }),
+            "{error:?}"
+        );
+        assert!(error.to_string().contains("holder unknown"), "{error}");
+    }
+
+    #[test]
+    fn a_waiting_writer_acquires_once_the_holder_releases() {
+        let dir = tempfile::tempdir().expect("state dir");
+        let path = dir.path().join("state.json");
+        let held = Store::open_for_update_with(path.clone(), QUICK).expect("first writer");
+        let holder = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(60));
+            drop(held);
+        });
+        let started = std::time::Instant::now();
+        let patient = LockWait {
+            deadline: Duration::from_secs(2),
+            ..QUICK
+        };
+        let _second = Store::open_for_update_with(path, patient).expect("acquired after release");
+        assert!(
+            started.elapsed() >= Duration::from_millis(60),
+            "{:?}",
+            started.elapsed()
+        );
+        holder.join().expect("holder thread");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_lock_whose_holder_is_not_running_is_refused_without_waiting() {
+        let dir = tempfile::tempdir().expect("state dir");
+        let path = dir.path().join("state.json");
+        let dead = (2_000_000u32..4_194_304)
+            .rev()
+            .find(|pid| !std::path::Path::new(&format!("/proc/{pid}")).exists())
+            .expect("an unused pid");
+        std::fs::write(path.with_extension("lock"), format!("{dead}\n")).expect("stale lock");
+        let started = std::time::Instant::now();
+        let error = Store::open_for_update_with(path, QUICK).expect_err("refused");
+        assert!(
+            started.elapsed() < QUICK.deadline / 2,
+            "waited {:?}",
+            started.elapsed()
+        );
+        let StoreError::Locked {
+            holder: Some(holder),
+            ..
+        } = &error
+        else {
+            panic!("{error:?}")
+        };
+        assert_eq!((holder.pid, holder.running), (dead, Some(false)));
+        assert!(
+            error.to_string().contains("which is not running"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn pauses_double_to_the_ceiling_and_never_drop_below_the_floor() {
+        for attempt in 0..12 {
+            for random in [0, 1, u64::MAX / 3, u64::MAX] {
+                let pause = pause(attempt, QUICK, random);
+                let cap = QUICK
+                    .floor
+                    .saturating_mul(1 << attempt.min(16))
+                    .min(QUICK.ceiling);
+                assert!(
+                    pause >= QUICK.floor && pause <= cap,
+                    "attempt {attempt}: {pause:?} not in [{:?}, {cap:?}]",
+                    QUICK.floor
+                );
+            }
+        }
+        assert_eq!(pause(0, QUICK, 0), QUICK.floor);
+        assert_eq!(pause(10, QUICK, u64::MAX), QUICK.ceiling);
+    }
+
+    #[test]
+    fn the_wait_gives_up_by_its_deadline() {
+        let dir = tempfile::tempdir().expect("state dir");
+        let path = dir.path().join("state.json");
+        let _first = Store::open_for_update_with(path.clone(), QUICK).expect("first writer");
+        let started = std::time::Instant::now();
+        let _ = Store::open_for_update_with(path, QUICK).expect_err("locked");
+        let waited = started.elapsed();
+        assert!(
+            waited >= QUICK.deadline && waited < QUICK.deadline * 3,
+            "{waited:?}"
         );
     }
 }
