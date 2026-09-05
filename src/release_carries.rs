@@ -1,10 +1,10 @@
-//! `knives release members` and `knives carries`.
+//! `knives release members`.
 //!
-//! Content questions about a release: which parents it has and who still
-//! holds each, and whether a revision's net content is actually carried by a
-//! release or the trunk — one revision, or a census over every maintained
-//! branch. Each verb is a gather, an exit code and a renderer; the repository
-//! is only read.
+//! Content questions about a release, each a gather, an exit code and a
+//! renderer over a read-only repository. Bare `members` asks which parents the
+//! release has and who still holds each; `--carries REV` asks the other
+//! direction, whether a revision's net content is actually carried by a
+//! release or the trunk; `--census` asks that of every maintained branch.
 
 use knives::bind::Fork;
 use knives::carriage::{
@@ -19,12 +19,24 @@ use knives::ledger::Ledger;
 
 use super::parallelism;
 
+/// Which carriage question `members --carries` / `members --census` asked.
+///
+/// The parser guarantees exactly one shape: a revision (with or without one
+/// explicit target), or the census. No variant needs a usage error.
+#[derive(Clone, Copy)]
+pub(crate) enum CarriesRequest<'a> {
+    /// One revision against every target, or against `target` alone.
+    Revision {
+        revision: &'a str,
+        target: Option<&'a str>,
+    },
+    /// Every maintained branch against the live releases and upstream trunk.
+    Census { no_github: bool },
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct CarriesInvocation<'a> {
-    pub(crate) revision: Option<&'a str>,
-    pub(crate) target: Option<&'a str>,
-    pub(crate) all: bool,
-    pub(crate) no_github: bool,
+    pub(crate) request: CarriesRequest<'a>,
     pub(crate) output: Output,
 }
 
@@ -102,34 +114,36 @@ enum CarriesMode {
 /// Answer one revision's carriage, or census every maintained branch.
 pub(crate) fn run_release_carries(
     fork: &Fork<'_>,
-    request: CarriesInvocation<'_>,
+    invocation: CarriesInvocation<'_>,
 ) -> anyhow::Result<Exit> {
-    if request.all {
-        let forge = CliForge;
-        let forge: Option<&dyn Forge> = (!request.no_github).then_some(&forge);
-        let cache_root = knives::forge_cache::cache_root();
-        let report = carriage::census(
-            fork,
-            forge,
-            CensusOptions {
-                cache_root: cache_root.as_deref(),
-                workers: parallelism(),
-            },
-        )?;
-        let exit = census_exit(&report);
-        print_census(&report, request.output)?;
-        return Ok(exit);
+    match invocation.request {
+        CarriesRequest::Census { no_github } => {
+            let forge = CliForge;
+            let forge: Option<&dyn Forge> = (!no_github).then_some(&forge);
+            let cache_root = knives::forge_cache::cache_root();
+            let report = carriage::census(
+                fork,
+                forge,
+                CensusOptions {
+                    cache_root: cache_root.as_deref(),
+                    workers: parallelism(),
+                },
+            )?;
+            let exit = census_exit(&report);
+            print_census(&report, invocation.output)?;
+            Ok(exit)
+        }
+        CarriesRequest::Revision { revision, target } => {
+            run_revision_carries(fork, revision, target, invocation.output)
+        }
     }
-    let Some(revision) = request.revision else {
-        return Ok(Exit::Usage);
-    };
-    run_revision_carries(fork, request, revision)
 }
 
 fn run_revision_carries(
     fork: &Fork<'_>,
-    request: CarriesInvocation<'_>,
     revision: &str,
+    target: Option<&str>,
+    output: Output,
 ) -> anyhow::Result<Exit> {
     let repo = &fork.name;
     let entry = fork.entry;
@@ -142,7 +156,7 @@ fn run_revision_carries(
                 revision.to_owned(),
                 format!("cannot resolve revision {revision}: {error}"),
             );
-            print_carries(&report, request.output)?;
+            print_carries(&report, output)?;
             return Ok(Exit::Incomplete);
         }
     };
@@ -155,7 +169,7 @@ fn run_revision_carries(
                 carries_revision(revision, &tip),
                 format!("cannot resolve upstream trunk {trunk_name}: {error}"),
             );
-            print_carries(&report, request.output)?;
+            print_carries(&report, output)?;
             return Ok(Exit::Incomplete);
         }
     };
@@ -166,10 +180,8 @@ fn run_revision_carries(
         (trunk_name.as_str(), trunk),
         entry.publish_remote(),
     );
-    let mode = request
-        .target
-        .map_or(CarriesMode::Bare, |_| CarriesMode::ExplicitTarget);
-    let (mut selected, superseded) = match request.target {
+    let mode = target.map_or(CarriesMode::Bare, |_| CarriesMode::ExplicitTarget);
+    let (mut selected, superseded) = match target {
         Some(target) => match selected_carries_targets(&opened, &all_targets, target) {
             Ok(targets) => (targets, Vec::new()),
             Err(error) => {
@@ -178,7 +190,7 @@ fn run_revision_carries(
                     carries_revision(revision, &tip),
                     format!("cannot resolve target {target}: {error}"),
                 );
-                print_carries(&report, request.output)?;
+                print_carries(&report, output)?;
                 return Ok(Exit::Incomplete);
             }
         },
@@ -186,7 +198,7 @@ fn run_revision_carries(
             .into_iter()
             .partition(|target| target.role != TargetRole::SupersededRelease),
     };
-    if let (Some(requested), Some(selected_target)) = (request.target, selected.first_mut())
+    if let (Some(requested), Some(selected_target)) = (target, selected.first_mut())
         && requested == trunk_name
     {
         selected_target.role = TargetRole::UpstreamTrunk;
@@ -197,7 +209,7 @@ fn run_revision_carries(
             revision,
             tip: &tip,
         },
-        fallback: request.target.unwrap_or(trunk_name.as_str()),
+        fallback: target.unwrap_or(trunk_name.as_str()),
     };
     let mut report = CarriesReport {
         repo: repo.to_string(),
@@ -208,7 +220,7 @@ fn run_revision_carries(
     };
     checks.append(&mut report, selected);
     let exit = carries_exit(&mut report, &checks, superseded, mode);
-    print_carries(&report, request.output)?;
+    print_carries(&report, output)?;
     Ok(exit)
 }
 

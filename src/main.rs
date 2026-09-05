@@ -38,7 +38,7 @@ use knives::ids::{BranchName, RepoName};
 use knives::ledger::{Ledger, Scribe};
 use knives::store::{Store, default_state_path};
 use release_carries::{
-    CarriesInvocation, MembersInvocation, run_release_carries, run_release_members,
+    CarriesInvocation, CarriesRequest, MembersInvocation, run_release_carries, run_release_members,
 };
 use release_cut::{ReleaseInvocation, run_reap, run_release};
 use release_edit::{ReleaseEdit, run_release_edit};
@@ -560,29 +560,35 @@ fn dispatch_release(
                 bound,
             )
         }
-        Some(ReleaseAction::Carries {
-            revision,
-            target,
-            all,
+        Some(ReleaseAction::Members {
+            reference,
+            verify,
+            carries,
+            census,
             no_github,
-        }) => run_release_carries(
-            fork,
-            CarriesInvocation {
-                revision: revision.as_deref(),
-                target: target.as_deref(),
-                all,
-                no_github,
-                output,
-            },
-        ),
-        Some(ReleaseAction::Members { reference, verify }) => run_release_members(
-            fork,
-            MembersInvocation {
-                reference: reference.as_deref(),
-                verify,
-                output,
-            },
-        ),
+        }) => {
+            // The parser keeps `--census` apart from REF and `--carries`, so a
+            // census request never has a target to lose here.
+            let carriage = if census {
+                Some(CarriesRequest::Census { no_github })
+            } else {
+                carries.as_deref().map(|revision| CarriesRequest::Revision {
+                    revision,
+                    target: reference.as_deref(),
+                })
+            };
+            let Some(request) = carriage else {
+                return run_release_members(
+                    fork,
+                    MembersInvocation {
+                        reference: reference.as_deref(),
+                        verify,
+                        output,
+                    },
+                );
+            };
+            run_release_carries(fork, CarriesInvocation { request, output })
+        }
         Some(ReleaseAction::Reap) => run_reap(fork),
         Some(ReleaseAction::Include { branch, why }) => run_release_edit(
             fork,

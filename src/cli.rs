@@ -506,41 +506,35 @@ pub enum ReleaseAction {
         #[arg(long)]
         from: Option<String>,
     },
-    /// Whether a revision's content is actually carried by releases or the upstream trunk.
+    /// The release's parents, or whether a revision's content is carried.
     ///
-    /// The rigorous answer to "is this fix safe to delete": compare the
-    /// revision's net content with each target. Matching content is carried; a
-    /// remaining diff is not carried; grep answers a different question. Bare
-    /// form checks live releases and the upstream trunk before consulting
-    /// superseded releases. `--in` checks one arbitrary revset instead.
-    Carries {
-        /// A branch name, or any revision when no bookmark fits.
-        #[arg(required_unless_present = "all")]
-        revision: Option<String>,
-        /// The one release ref or revision to check instead of every target.
-        #[arg(long = "in")]
-        target: Option<String>,
-        /// Every maintained branch against the live releases and upstream trunk;
-        /// superseded releases are checked only after a complete, everywhere-not-carried
-        /// primary matrix. The census that answers "what would deleting this lose".
-        #[arg(long, conflicts_with_all = ["revision", "target"])]
-        all: bool,
-        /// Skip pull request lookups; the orphan test then reports unknown.
-        #[arg(long, requires = "all")]
-        no_github: bool,
-    },
-    /// The release's parents: count, commits, and who still holds each.
-    ///
-    /// The count uses the repository's own parent list — the audit's worst
-    /// instrument error was counting `^parent` lines in prose. `--verify`
-    /// replays every member against the release and reports what it lacks.
+    /// Bare: count, commits, and who still holds each parent — the repository's
+    /// own parent list, never `^parent` lines in prose. `--verify` replays every
+    /// member against the release and reports what it lacks. `--carries REV` asks
+    /// the other direction: is REV's net content carried — by REF when one is
+    /// given, otherwise by every live release and the upstream trunk before any
+    /// superseded cut (the rigorous "is this safe to delete"; grep answers a
+    /// different question). `--census` asks that of every maintained branch at once.
     Members {
-        /// The release ref to inspect. Defaults to the release in hand.
+        /// The release ref to inspect. Defaults to the release in hand. With
+        /// `--carries`, the one target to check instead of every target.
+        #[arg(conflicts_with = "census")]
         reference: Option<String>,
         /// Replay each member's content against the release (heavier: one
         /// replay per member) and report drop-guard anchors.
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["carries", "census"])]
         verify: bool,
+        /// A branch name, or any revision when no bookmark fits.
+        #[arg(long, value_name = "REV", conflicts_with = "census")]
+        carries: Option<String>,
+        /// Every maintained branch against the live releases and upstream trunk;
+        /// superseded releases only after a complete, everywhere-not-carried
+        /// primary matrix. Answers "what would deleting this lose".
+        #[arg(long)]
+        census: bool,
+        /// Skip pull request lookups during a census; the orphan test then reports unknown.
+        #[arg(long, requires = "census")]
+        no_github: bool,
     },
     /// Reap superseded dated cuts: forget their bookmarks everywhere, abandon their commits.
     /// The remote is never touched.
@@ -662,6 +656,10 @@ mod tests {
             vec!["knives", "release", "drop", "feat/y", "--why", "because"],
             vec!["knives", "release", "advance"],
             vec!["knives", "release", "advance", "feat/x"],
+            vec!["knives", "release", "members"],
+            vec!["knives", "release", "members", "--carries", "x"],
+            vec!["knives", "release", "members", "r", "--carries", "x"],
+            vec!["knives", "release", "members", "--census"],
             vec!["knives", "depends", "a-branch", "--on", "other#1"],
             vec!["knives", "track", "a-branch", "--pr", "7"],
             vec!["knives", "notch"],
