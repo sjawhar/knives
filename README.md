@@ -326,13 +326,6 @@ for maintaining release members and open pull requests through release/consumer 
 `maintaining-fork-pr` for owning one PR end-to-end. Both read inherited decisions with `knives notch`
 before acting and use the same ledger for new evidence; no separate inventory document is required.
 
-Behavioral regression prompts live in `skills/maintaining-fork-release/evals/evals.json`.
-Run each prompt in five fresh contexts with both maintenance skills, compare with the previous
-versions and a no-skill control, and have an independent evaluator score the listed expectations
-against the actual responses. These are tool-free tabletop simulations, not authorization to
-maintain real forks. Preserve raw responses and grading evidence; a prose scan alone does not
-verify that an agent follows the workflow.
-
 ## What it does not do
 
 It does not create pull requests. That is `gh pr create`.
