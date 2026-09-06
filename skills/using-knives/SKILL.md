@@ -432,7 +432,7 @@ A branch forks from the release's shared base (the trunk point its members share
 
 #### Scheme variants
 
-- Dated scheme (default, when `release_branch` is absent): cuts create a new dated branch named `release/YYYY-MM-DD` (or `.1`, `.2` for repair cuts). Cutting requires an explicit name argument: `knives release cut release/YYYY-MM-DD`.
+- Dated scheme (default, when `release_branch` is absent): valid names are exactly `release/YYYY-MM-DD` and `release/YYYY-MM-DD.N`; there is no `.N.M`. New names come only from `knives release cut NAME`, and only when the `include`/`advance`/`drop`/`rebase` pin gate refuses in-place editing. Hand-composed releases (`jj bookmark create release/X -r release/Y` plus later `advance`) are forbidden.
 - Fixed scheme (when `release_branch = "<name>"` is set): cuts advance the configured release branch in place using jj's internal `--allow-backwards` mechanism. Cutting needs no name argument (`knives release cut` alone); passing a dated name is refused. A cut carries the local composition in hand, unpushed edits included; the *published* position (read from the publish remote, `release` when set in the entry, falling back to `origin`) is what consumers observe and is reported alongside.
 
 #### Release subcommands and options

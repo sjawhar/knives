@@ -105,6 +105,9 @@ request all survive the release.
 These are the improvisations that cost work in a shared repository, and every one of them
 has a knives command that does the same job safely:
 
+- **Do not cut a new release name for an unpinned release.** Edit the current release in
+  place through `knives release` and push the moved release ref. A PR branch that references
+  the name is not a pin; only a consumer's `main` is.
 - **Do not clone the repository again**, into `/tmp` or anywhere else. There is already a
   checkout, and a second one has its own bookmarks that will diverge from the first.
 - **Do not create a scratch or temporary checkout** to "just try something". Use
