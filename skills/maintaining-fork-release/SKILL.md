@@ -27,7 +27,19 @@ knives notch --pr <number> --repo <repo>
 
 Bare `notch` gives recent context (the newest 20 human notes and an event summary), not every branch's history. Named branch/release reads give the full chronology; `--pr` also finds records across a PR's former branches. Read all relevant chains. Older notes without this workflow's prefixes remain valid context: never discard them as invisible. Check timestamps, anchors and evidence against the current head; a note on an earlier tip may have been superseded. A recorded requirement still matters even if a later release lost its implementation. Use `knives notch --verify <subject> --repo <repo>` to check recorded anchors/evidence, then investigate discrepancies rather than treating an old assertion as current proof.
 
-**Read knives' default compact output.** Use `--json` only for an actual JSON consumer, such as `jq` calculating a set or a script consuming fields. Default machine output and JSON carry the same data; JSON does not defeat a harness's line/output truncation. Recover the complete captured output or page the saved output when truncated. Do not conclude from an elision, and do not change format merely to read it yourself.
+**For direct reading, run the command examples above as written: no `--json`.** Looking up
+branch, commit or evidence fields, saving a capture, and preparing a JSON final report are
+still direct reading. The model interpreting output is a reader, not an executed JSON parser.
+
+Request `--json` only when the bytes feed executed code doing a real filter, count, join or
+other programmatic operation that needs JSON. Keep that consumer with the command evidence.
+`jq .`, parse-and-reprint wrappers, or a filename ending in `.json` do not create that need;
+do not invent a parser step just to justify the flag. Save native output unchanged for records
+you will read yourself.
+
+Default machine output and JSON carry the same data; JSON does not defeat a harness's
+line/output truncation. Recover the complete captured output or page its saved form when
+truncated. Do not conclude from an elision or change serialization merely to read it yourself.
 
 `fork-work` governs workspace entry; `using-knives` governs command semantics; `using-jj` governs version control. Read upstream contribution files and workflows for current gates and requirements. Read relevant project guidance for consumer wiring. Put new branch/release decisions in `knives notch`, not in another document.
 
