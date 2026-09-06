@@ -82,11 +82,16 @@ pub fn run(args: &[String]) -> anyhow::Result<std::convert::Infallible> {
         gh.args(args);
         std::process::exit(gh_exit_code(&mut gh));
     };
-    // Unlike the shim, non-PR calls bypass this read-only probe: only PR calls use
-    // its result, so delaying it preserves gh arguments while avoiding needless work.
+    // Unlike the shim, non-PR calls bypass this probe: only PR calls use its
+    // result, so delaying it preserves gh arguments while avoiding needless work.
+    // `--ignore-working-copy` is what makes it read-only: without it every jj
+    // command snapshots the working copy first, and in a colocated workspace
+    // that takes the repository-wide Git import/export lock — so a plain `gh pr
+    // view` from each of many agents on one shared repository queued behind each
+    // other's snapshots for tens of seconds.
     let in_jj_repo = Command::new("jj")
         .current_dir(&cwd)
-        .arg("root")
+        .args(["root", "--ignore-working-copy"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -172,10 +177,26 @@ fn die_no_bookmark() -> ! {
 /// The first safe bookmark on `@`, if jj can provide one (shim lines 225-237).
 /// Deliberately unlike the shim, whose character class is locale-dependent and accepts
 /// non-ASCII under UTF-8 locales: ASCII-only matches the charset the shim comment intends.
+///
+/// Read as jj last recorded it, without snapshotting: a snapshot rewrites `@`
+/// in place and carries its bookmarks along, so skipping it changes nothing
+/// about the answer, and the repository lock is never taken. What is also
+/// skipped is the colocated Git import, so a `git checkout` made behind jj's
+/// back is not seen until the next jj command runs. That is the accepted
+/// contract: knives-managed checkouts are driven through jj, and `@` here means
+/// jj's `@`.
 pub(crate) fn current_bookmark(cwd: &Path) -> Option<String> {
     let output = Command::new("jj")
         .current_dir(cwd)
-        .args(["log", "-r", "@", "--no-graph", "-T", "self.bookmarks()"])
+        .args([
+            "--ignore-working-copy",
+            "log",
+            "-r",
+            "@",
+            "--no-graph",
+            "-T",
+            "self.bookmarks()",
+        ])
         .output()
         .ok()?;
     if !output.status.success() {

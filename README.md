@@ -101,10 +101,11 @@ masks, so the question "what is this weird branch" is usually answered before yo
 ## Install
 
 knives reads a checkout's identity through git, so a jj workspace must carry a `.git` file beside
-its `.jj`. That needs a jj whose `jj workspace add` registers a git worktree for the workspace
-(`git.auto-register-worktrees`); upstream jj does not yet, so install a build that does — the one
-your fleet's tool configuration names. Then download the knives release archive for your platform
-and put `bin/` on your `PATH`:
+its `.jj`. `jj workspace add` writes one when it creates a Git worktree for the workspace, which
+it does by default when the workspace it runs from is colocated and `git.colocate` is `true`
+(jj-vcs/jj#9941, after 0.45.0; `--colocate` forces it, `--no-colocate` opts out). Install a jj
+at least that new — the one your fleet's tool configuration names. Then download the knives
+release archive for your platform and put `bin/` on your `PATH`:
 
 ```
 tar xzf knives-v0.1.2-linux-x86_64.tar.gz

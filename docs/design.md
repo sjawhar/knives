@@ -93,10 +93,10 @@ directories that differ by `.git` stay two directories.
 
 Knives manages **colocated** jj checkouts — what `jj git init` and `jj git clone` make by default —
 and reads every checkout through
-git. A workspace must be colocated too: knives requires a jj whose `jj workspace add` registers
-a git worktree for the new workspace (`git.auto-register-worktrees`), writing the `.git` file
-beside its `.jj`; upstream jj does not do this yet, so the jj build knives is installed with must
-(the fleet's mise configuration and CI name it). Standing inside a checkout, or inside a `knives start` workspace of one, binds it: the
+git. A workspace must be colocated too: `jj workspace add` creates a git worktree for the new
+workspace, writing the `.git` file beside its `.jj`, when the workspace it runs from is colocated
+and `git.colocate` is `true` (jj-vcs/jj#9941, after 0.45.0) — the default in every checkout knives
+manages, and `--colocate` forces it. Standing inside a checkout, or inside a `knives start` workspace of one, binds it: the
 nearest `.git` above the current directory is the root (a directory, or the pointer file a
 linked worktree carries, which git resolves to its checkout), a fork checkout is a root that also
 holds a real `.jj` directory, and a clone nested inside a checkout is its own root and never
