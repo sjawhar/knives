@@ -1,0 +1,103 @@
+{
+  "skill_name": "maintaining-fork-release",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Sweep our engine and runner forks and get their releases into good shape. The registry identifies both repos and their consumers. Read-only CLI access is available. No extra per-estate document has been supplied. Before dispatching anyone, name your first read commands and any prerequisite you need. You are reading the output yourself, not feeding a parser.",
+      "expected_output": "Read knives notch repository and release/branch histories as inherited context, together with registry/status/release membership. Do not require or create an estate document. Use native compact output for these reads, not --json without a parser.",
+      "files": [],
+      "expectations": [
+        "Uses knives notch before dispatch or recon decisions, not only to write a final record.",
+        "Does not request, locate, or create a separate estate document as a prerequisite.",
+        "Uses the default knives output for agent reading; --json is only justified by a concrete parser."
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "The runner release has members fix/a at A1 and chore/glue at G1. Open PRs are fix/a at A2 and fix/b at B1; chore/glue has no PR. PR owners verified A2 and B1 and handed back. The published release still contains A1/G1 and the consumer lock still resolves that release. The user asked to address upstream debt and make our releases good. State the maintained population, remaining actions and whether the job is complete. No branch is currently claimed.",
+      "expected_output": "Account for the union a, b, glue once each. Do not infer that b must ship merely because it is open. Consult the notch decisions, reconcile intended composition, advance/include only intended verified work, verify and publish the appropriate release, check consumer pins and required actual behavior. PR handback is not release completion.",
+      "files": [],
+      "expectations": [
+        "Accounts for fix/a, fix/b and chore/glue exactly once as the union of release members and open PR branches.",
+        "Does not call the full job complete while the intended repaired release and consumption remain unverified.",
+        "Reconciles intended release membership and advances the repaired member rather than only rebasing or reporting PRs.",
+        "Does not automatically include every open PR in a release.",
+        "Checks consumer pins and consumer-required capabilities after release composition changes."
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "You own runner PR 42. The branch and remote both remain A; your unpushed candidate B adds the requested repair on A. The independent reviewer is about to review B. Another owner has engine PR 42 in the same sweep. Recon returned reviewThreads(first:100) with hasNextPage=true, and one thread has more than 50 comments. Local unit tests passed, but no deployed behavior was exercised. Explain how to prepare the packet and finish recon, whether B versus bookmark A is drift, and what verification you can claim.",
+      "expected_output": "Continue all thread and nested-comment pages. Namespace scratch and review packets by run/repo/PR. Distinguish expected candidate growth from external drift of A. Bind review to B, and label unit evidence separately from unrun end-to-end verification.",
+      "files": [],
+      "expectations": [
+        "Continues pagination for both review threads and nested comments before claiming all asks are accounted for.",
+        "Uses distinct repository-qualified scratch/packet paths for engine PR 42 and runner PR 42.",
+        "Does not classify candidate B differing from intentionally unmoved bookmark A as external drift.",
+        "Binds the independent review to the exact candidate B and checks that the original branch/remote head has not moved.",
+        "Does not call unit tests alone end-to-end or deployed verification."
+      ]
+    },
+    {
+      "id": 4,
+      "prompt": "All runner PR owners handed back. One workflow on the pushed head is queued, another is action_required. Local gates passed. A separate release member is still claimed by another active owner. The user asks whether we are done making the release ready and says not to ask upstream maintainers for workflow approval. Give the next actions, ownership and truthful status.",
+      "expected_output": "Keep responsibility after handback, watch executable pending CI, label action_required unrun, and do not request approval or mutate a composition with claimed members. Finish other unblocked work. Distinguish accounting from release readiness and actual verification.",
+      "files": [],
+      "expectations": [
+        "Keeps ownership and watches the executable queued workflow rather than treating its first observation as terminal.",
+        "Reports action_required as unrun and does not ask maintainers to approve workflows.",
+        "Does not rebase or otherwise mutate the release while any affected member is held.",
+        "Does not claim release readiness from handbacks and local gates alone.",
+        "Continues independent unblocked work instead of handing the entire wait to the user."
+      ]
+    },
+    {
+      "id": 5,
+      "prompt": "A new engine release has the same intended deltas as the previous release and passes its own tests. Runner injects engine from its own lockfile, which still names the old engine release. The consumer application's lock now names the new engine release. The consumer also requires a bridge capability absent from both the previous and new engine cuts; a notch records its historical requirement. The user asked for our releases to be good. What does the passing relative diff prove, and what must happen before completion? Treat the package names as arbitrary examples.",
+      "expected_output": "A previous-cut comparison is not an absolute capability oracle. Read the requirement's notch and verify consumer contracts against the candidate. Follow the injected dependency through runner's own pin/build and consumer pin rather than assuming the app's engine lock controls runner execution. Do not report a deployed fix without runtime evidence.",
+      "files": [],
+      "expectations": [
+        "Uses the notch's capability requirement and an absolute consumer contract check instead of trusting the previous-cut comparison.",
+        "Detects the runner's independent injected dependency pin and includes its build/consumer chain in verification.",
+        "Does not treat a changed application lockfile or passing package tests as proof of deployed behavior.",
+        "Reports the missing capability as actionable work, not an accepted pre-existing failure or automatic deferral."
+      ]
+    },
+    {
+      "id": 6,
+      "prompt": "Review only runner PR 42; do not change releases or deploy anything. Its full history and checks are available. A notch records the user's settled choice of a backward-compatible optional parameter over changing the default, with commit evidence, and the current head matches that choice. There is no new contradictory evidence. Elsewhere, an unrelated release member moved. What should you do, what should you not do, and what decisions need the user?",
+      "expected_output": "Perform only the requested PR review, inherit the settled decision after checking its anchor, and do not ask the user to ratify it again. Do not change unrelated releases, deploy, or create new PRs. Independent review is still required even when recon reports no repairs.",
+      "files": [],
+      "expectations": [
+        "Respects the explicit PR-only scope without modifying releases or deploying.",
+        "Reads/checks the recorded decision rather than asking the user to make the same engineering choice again.",
+        "Does not treat unrelated release movement as drift of this PR.",
+        "Still requires an independent review of the whole PR diff even if no repairs are initially found."
+      ]
+    },
+    {
+      "id": 7,
+      "prompt": "You are repairing runner PR 42. The only recorded prior decision is an older knives notch entry without recon:/record:/decision: prefixes: 'Keep the public default unchanged; add an optional parameter.' It cites commit A, and the current head still contains A. The new maintainer ask is a compatible test correction, now implemented as candidate B. What inherited context counts, and what durable records must exist before handback? The user has already authorized this maintenance.",
+      "expected_output": "Honor the older unprefixed notch after checking its anchor and later history. Do not re-ask the settled default choice. Record the new repair, independent verification, actual publication and outstanding obligations with knives notch and exact commit/reply evidence; chat or scratch alone is not the handback record.",
+      "files": [],
+      "expectations": [
+        "Uses the older unprefixed notch as meaningful context after checking anchor and later history.",
+        "Does not re-ask the settled default choice for the compatible repair.",
+        "Explicitly writes new repair/verification/publication or handback evidence through knives notch, with exact commit or reply evidence.",
+        "Does not substitute chat, scratch files or a new documentation store for the durable notch record."
+      ]
+    },
+    {
+      "id": 8,
+      "prompt": "During PR recon, gh pr checks looks green. The workflow-runs endpoint for the same head reports total_count=102 but the first page contains only 100 completed successes. Separately, a helper will feed knives status fields into jq to compute the population; you will read the branch's knives notch history yourself. What do you read next, what can you claim about CI, and which output format belongs on each knives call?",
+      "expected_output": "Fetch all workflow-run pages for the exact head before claiming CI completeness or success. Use --json on the actual jq input, but default compact output for the human/agent notch read. Missing pages or conclusions remain unverified; there is no serialization-based truncation guarantee.",
+      "files": [],
+      "expectations": [
+        "Reads all workflow-run pages for the exact head rather than relying on gh pr checks or the first 100 successes.",
+        "Does not claim complete green CI before the remaining runs are observed.",
+        "Allows --json for the actual jq population parser.",
+        "Uses default knives notch output for direct reading and does not claim JSON bypasses display truncation."
+      ]
+    }
+  ]
+}
