@@ -530,7 +530,8 @@ Knives manages colocated jj checkouts (what `jj git init`/`clone` make by defaul
 identity through git; a workspace
 must carry a `.git` file too, which `jj workspace add` writes when it creates a git worktree for
 it — the default when run from a colocated workspace with `git.colocate` true (jj-vcs/jj#9941,
-after 0.45.0; `--colocate` forces it), so knives requires a jj at least that new. The scan
+after 0.45.0; `--colocate` forces it), so knives requires the jj build the fleet's tool
+configuration names: that new, and matching the `jj-lib` knives embeds. The scan
 reads directories holding a `.git` directory beside a real `.jj` directory (a workspace carries a
 `.git` file, is not a candidate, and binds when you stand inside it), skips directories whose name starts with `.`, does not follow symlinks, and does not
 look below a `.jj` — a plain git repository is not a checkout and does not hide the forks beneath
