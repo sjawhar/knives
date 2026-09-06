@@ -22,7 +22,15 @@ knives start <branch> --repo <repo> --why '<PR number>: <work being owned>'
 
 Read full named chains, including older unprefixed notes and events; the workflow prefixes below organize new writes, not which history counts. Bare `knives notch --repo <repo>` shows recent repository context, not every historical obligation. An old anchor may describe another tip: check its evidence and any later correcting note before inheriting it. For every new workflow record, use the matching prefix (`recon:`, `rehome:`, `repair:`, `verify:`, `record:`, `decision:`, `handback:`), stamp the PR with `--pr` when it concerns that PR, and cite evidence that names the commit, URL or file state you relied on; `file:line` evidence comes from the file at that cited commit, not from a diff hunk. Do not write new unprefixed or evidence-free obligations. Do not re-ask a settled choice without contradictory evidence or a genuine change in the user's goal.
 
-Use **default compact knives output for reading**. `--json` is for an actual JSON parser, not a preference for verbose output and not a truncation workaround. Default machine output and JSON contain the same data. If the harness clips a line or output, recover the full captured output or page its saved file before relying on unseen content.
+**Direct Knives reads use the examples as written, without `--json`.** Reading individual
+fields yourself or returning a JSON final report does not make the model a programmatic parser.
+Use `--json` only for bytes consumed by executed code performing a real filter, calculation or
+join, and retain that consumer in the evidence. Identity formatting such as `jq .`, saving a
+`.json` filename, or an imagined later parser is not a reason to add the flag.
+
+Save default compact output for records you will read yourself. Both serializations contain
+the same data; if the harness clips output, recover or page the full captured output rather
+than switching to JSON and assuming the missing content returned.
 
 A claim is yours by the `why` text and workspace, not merely a shared OS username. Enter the workspace `start` prints and confirm your row. `@` begins as an empty child of the branch. A claim-lock wait is normal; a refusal naming another holder goes to the orchestrator, never a forced takeover. Quiet `seen` data does not prove the holder died.
 
