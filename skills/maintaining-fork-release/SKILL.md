@@ -1,232 +1,145 @@
 ---
 name: maintaining-fork-release
-description: Use when asked to review, fix, or land the fork pull requests as a set — a sweep over the open pull requests of the forks knives manages rather than work on one of them. One pull request is the `maintaining-fork-pr` skill; a knives command is `using-knives`; stepping into a fork checkout is `fork-work`.
+description: Use when asked to maintain a set of fork pull requests, address upstream debt, or verify and ship the forks' releases and consumer pins. One pull request alone is maintaining-fork-pr; command semantics are using-knives.
 ---
 
-# Sweeping the fork pull requests
+# Maintaining fork pull requests and releases
 
-## You own the sweep
+You own the requested outcome, not just the dispatched PRs. A PR-only request ends with verified PR maintenance; a request to address upstream debt or make releases good also requires release and consumer verification below. Respect explicit exclusions such as no deployment. Do not turn a PR-only request into a release or deployment change.
 
-You are the owner, the agent orchestrating the sweep. The scope is the open pull requests of the
-forks that have a `##` section in the **estate document** — the per-library tacit-knowledge document
-your estate keeps for its forks: one `##` section per repo, named for the tail of the registry entry's
-upstream slug, plus one `## For every dispatch` section holding the outbound-prose rule and the term
-list of forbidden identifiers — and nothing else: knives manages more repositories (`knives repos`),
-out of scope. The **maintainer of record** is the human who owns the estate: `gh auth status` names
-the account every publish action writes as, and `decision:` notches escalate to them. You own every
-pull request you sweep until it merges or the maintainer of record reassigns it: one you dispatched and
-never heard back about is still yours. The numbered steps below are in order; each ends with the
-observable state that lets you move on. What an owner does is `maintaining-fork-pr`, pasted whole into
-every dispatch; this skill does not restate it, and names that skill's section where an owner rule
-matters here.
+## 1. Start with `knives notch`, not a new document
 
-**Done when** you can name the forks in scope, not from memory: the registry is
-`~/.config/knives/repos.toml`; a repo's upstream slug is the `owner/repo` path of its `upstream`
-URL with any `.git` stripped (the PR URL carries the same `owner/repo`); the `##` section name is
-that slug's tail, which may differ from the registry name.
+**`knives notch` is the existing read/write record of this work. Read it before deciding, dispatching, or repairing.** It holds prior decisions, maintainer promises, rejections, release changes and verification evidence. There is no separate estate document to find or create, and no Markdown inventory to maintain beside knives.
 
-## 1. Population
+Use the requested repositories, mapped through `knives repos` and the registry at `~/.config/knives/repos.toml`. An existing project skill can identify a library family and its consumer-specific requirements; it does not replace the live records. The registry name and upstream slug are different identifiers: take the slug from the entry's `upstream` URL, stripping `.git`.
 
-Create the sweep's scratch directory first, outside `/tmp` and outside every workspace
-(`~/.cache/knives-sweep/<date>/`); name it in the report and in every dispatch. It holds working
-material only (the JSON below, the reviewer packets); the record is the notches and the published PR.
+Read these in order, substituting names from the preceding output:
 
-```
-knives status --all --json
+```sh
+knives repos
+knives status <repo>
+knives notch --repo <repo>
+knives release --repo <repo> members
+knives notch <release> --repo <repo>
+knives notch <branch> --repo <repo>
+knives notch --pr <number> --repo <repo>
 ```
 
-One array, one report per registry entry (every managed repository, not only the forks in scope),
-each with `repo`, `releases[]` and `branches[]` (the row shape is `using-knives`'s; you read two
-fields, `pr.state` and `claim`). The population is every row of a fork in scope whose `pr.state` is
-`"open"`: `jq '.[] | select(.repo == "<repo>") | .branches[] | select(.pr.state? == "open")'`. Count
-it; that count is the first line of your report, and it comes from this run — never from memory, a
-prior sweep, a tracker, or a `gh` search (`gh` is the maintainer of record's account and `--author
-@me` resolves to them; the registry, not a search, defines the population). Open rows in the other
-reports are listed once as out of scope and are not dispatched. A row with `claim` set is already
-held; note the holder by its `why` text (`maintaining-fork-pr` step 1). The facts about each pull
-request (head, mergeability, review decision, checks, threads, template) are the owner's to gather in
-its recon with `gh` and `jj`; you dispatch from the status row alone. `status` exits non-zero on
-findings with the JSON still complete (`using-knives`). Save the output whole to the scratch directory
-(`status.json`) so the report's every number points at a file.
+Bare `notch` gives recent context (the newest 20 human notes and an event summary), not every branch's history. Named branch/release reads give the full chronology; `--pr` also finds records across a PR's former branches. Read all relevant chains. Older notes without this workflow's prefixes remain valid context: never discard them as invisible. Check timestamps, anchors and evidence against the current head; a note on an earlier tip may have been superseded. A recorded requirement still matters even if a later release lost its implementation. Use `knives notch --verify <subject> --repo <repo>` to check recorded anchors/evidence, then investigate discrepancies rather than treating an old assertion as current proof.
 
-**Done when** the report's first line reads `Population: <n> open pull requests across <m> forks
-in scope (knives status --all --json, <timestamp>)`, every open row in scope is saved, and
-out-of-scope open rows are listed.
+**Read knives' default compact output.** Use `--json` only for an actual JSON consumer, such as `jq` calculating a set or a script consuming fields. Default machine output and JSON carry the same data; JSON does not defeat a harness's line/output truncation. Recover the complete captured output or page the saved output when truncated. Do not conclude from an elision, and do not change format merely to read it yourself.
 
-## 2. Dispatch
+`fork-work` governs workspace entry; `using-knives` governs command semantics; `using-jj` governs version control. Read upstream contribution files and workflows for current gates and requirements. Read relevant project guidance for consumer wiring. Put new branch/release decisions in `knives notch`, not in another document.
 
-One `maintaining-fork-pr` owner per pull request. No role lanes: no "rebase lane", no "review
-lane", no agent that touches several branches. Waves of eight: a wave's owners are dispatched
-together; the next wave goes out when every dispatched branch shows a `claim` in `knives status
-<repo> --json`, or its owner reported a refusal, or a stopping `decision:` or a `handback:` notch is
-present. `start` waits for the claim lock (`using-knives` has the wait), so eight concurrent starts
-serialising behind each other's fetches is normal — a waiting `start` waits on a live holder, not a
-hung owner. The owners of one fork share one jj operation log, so a wave stays safe only because
-owners append, never rewrite; `maintaining-fork-pr` step 4 lists the sanctioned rewrites, one of which
-— `knives release rebase` — is yours (step 4 below).
+**Done when:** requested repo identities are known and their relevant notch histories have been read, with inherited obligations distinguished from stale assertions.
 
-The dispatch prompt is, in this order:
+## 2. Account for release members and open PRs
 
-1. The whole text of the `maintaining-fork-pr` skill (`skills/maintaining-fork-pr/SKILL.md`, beside this skill).
-2. The pull request's coordinates: registry repo name and upstream slug, number, URL, branch, and the
-   branch's whole status row from step 1, pasted as JSON (no `head`: the owner derives it from
-   `headRefOid` in its step 2; the row's `tip` may be absent — divergent — and is not the head).
-3. The repo's section of the estate document and its `## For every dispatch` section, both pasted
-   whole. The repo's `##` section is named for the upstream repository — the tail of the upstream
-   slug in the coordinates — not for the registry name; it carries the gate commands, what a PR owes
-   those maintainers, *CI reality* and the maintainers' known positions. `## For every dispatch`
-   carries the outbound-prose rule and the term list. The owner runs in a fork workspace where your
-   estate's skills are not discoverable, so both arrive in the prompt or not at all.
-4. The whole text of the `pr-preflight` skill (`skill://pr-preflight`, shipped with knives; a fork
-   workspace may not resolve it, or may resolve a stale copy).
-5. Your address for the reviewer relay below (your `hub` id, or your messaging session id) and the
-   sweep's scratch directory path from step 1.
-6. The term list of forbidden identifiers the owner scans the fork-point diff and PR body for by
-   hand, from `## For every dispatch` — always.
+The maintained population is the **union of release members and open PR branches**, not only the open PRs. An open PR outside the release is still maintained; a release member without a PR is still accounted for; an overlapping branch is counted once as a work item but keeps both identities. Deduplicate PR aliases by upstream slug and PR number, and identify release-only members by the release parent commit. When a release parent, branch tip and PR head differ, keep all three revisions in the row; that is a composition gap to resolve, not a duplicate to collapse.
 
-A pull request whose row shows `claim` held by someone who is not one of your owners is not
-dispatched: name the holder in the report and leave it. A divergent bookmark is just a row; the
-owner's step 1 meets the refusal and resolves it.
+Use the current `knives status <repo>`, `knives release --repo <repo> members`, `knives audit <repo>` and, for consumer state, `knives consumers <repo>`. Reconcile open-head discrepancies the audit reports before claiming complete coverage. Read the corresponding notch chains before classifying any member. A merged or closed PR does not by itself prove that a release no longer needs its delta.
 
-**Done when** every open pull request in the population has exactly one owner dispatched (or a
-named reason it was not), and every dispatched branch of the wave shows a `claim` in `knives
-status <repo> --json` (or its owner reported a refusal, or a stopping `decision:` or a `handback:`
-notch is present) before the next wave goes out.
+`status` exit 1 means findings; exit 3 or `problems` means unanswered data. A missing checkout, unconsulted forge, unreadable record, or incomplete page is not zero work. Keep counts provisional and investigate the missing source; proceed on complete independent repos while repairing the gap. A search result is corroboration, not a substitute for the registry and release membership. Repositories outside the requested set are listed once and not dispatched.
 
-## 3. Record
+Create one scratch directory outside workspaces and `/tmp`, `~/.cache/knives-sweep/<unique-run>/`, with one `<repo>/pr-<number>/` directory per PR and a separate `<repo>/release/` directory. Include a run-unique suffix, not just the date. Save pre/post command output, diffs, drafts and gate logs there in their native formats; name the paths in dispatches and reports. Scratch is working material; notches and published PRs are the record.
 
-Owners write the record as notches on their branch, with the prefixes and `--evidence` rule
-`maintaining-fork-pr` defines. You read it, `--repo` because you stand in no fork checkout (`status`
-takes the name positionally), `--json` saved to the scratch directory and read there:
+The report starts with `Population: <p> open PRs and <r> release-only members, <u> distinct work items across <n> requested forks; coverage complete|incomplete (<timestamp>)`. State every incomplete source. A PR-only request labels release-only items outside its repair scope; it does not claim they were verified.
 
-```
-knives notch <branch> --repo <repo> --json   # the owner's chain, oldest first
-knives status <repo> --json | jq '.branches[] | select(.name=="<branch>")'   # the row after the owner's push: tip, claim gone
+**Done when:** every union member is accounted for, all counts cite saved output, and missing observations are explicit rather than silently filtered away.
+
+## 3. Dispatch one owner per PR
+
+One `maintaining-fork-pr` owner per PR, end to end. Dispatch batches of at most eight and keep at most eight active PR owners. Observe every start's claim or refusal before filling the next batch; claim-lock waits are normal. Release a worker slot on handback, but retain responsibility for the PR until merge or explicit reassignment.
+
+A claim held by someone outside this sweep is respected: report its `why` text and continue independent work. Do not infer death from a quiet `seen` field. If an owner stops unexpectedly, establish its state through coordination and the existing claim/workspace, then use the supported claim-recovery procedure before taking over. Never blindly force a claim or restore the shared jj operation log.
+
+Each dispatch contains, in order:
+
+1. The whole shipped `maintaining-fork-pr` skill.
+2. Registry repo name, upstream slug, PR number/URL, branch, and its current status row, in the format already captured. For a PR whose branch is a release member, also include the release member row and parent commit. The owner obtains the authoritative PR head from the forge and reports the original PR head, expected branch/bookmark head and candidate head as separate revisions.
+3. The relevant **`knives notch` history**, including inherited promises, decisions, release membership evidence and unresolved obligations. Supply complete captured entries or a readable saved path; do not replace them with your summary. The owner refreshes them before acting.
+4. Relevant upstream/project guidance, its source paths, and any recorded publication constraints. The owner derives exact gates from current repository files; there is no prerequisite per-repo document. Supply the registry's configured `forbidden` terms and applicable existing outbound-prose rules. If none are configured, say so; do not invent a list. An empty configured list is not a privacy waiver.
+5. The whole shipped `pr-preflight` skill, your reviewer-relay address, and the **per-PR** scratch path.
+
+The orchestrator handles release-only members under the same claim, evidence and independent-review discipline, without inventing PR numbers or opening PRs to satisfy the inventory. A named branch is claimed before anyone edits it; an anonymous member is carried, dropped or classified by release evidence and `knives notch` records, not by fabricating a branch. A bounded branch implementation can be delegated to one owner only when the requested scope already authorizes that work. Classify with evidence: supplied upstream, still proposed upstream, justified fork-only work, downstream configuration, or obsolete. Record the reason and disposition with `knives notch <branch> -m ... --evidence ...` when a branch exists, or on the release/repo subject for anonymous members. Do not automatically include an open PR in a release or upstream every fork-only branch.
+
+**Done when:** every open PR has one owner or a named reason it cannot be worked, and every release-only item has an owner/disposition appropriate to the requested scope.
+
+## 4. Review, record, and coordinate integration
+
+### Reviewer relay
+
+When an owner sends its packet path, check the packet's repo/PR identity, original PR head, expected branch/bookmark head and candidate head against the dispatch. Dispatch a fresh-context reviewer with the packet unedited and this verdict contract: `PASS (no repairs)`, `PASS per fix (k/k)`, or `FAIL: fix|body|drift`, with evidence for every question. The reviewer independently examines the **whole PR diff**, not just the owner's finding list, even when recon found nothing.
+
+Reject an owner packet whose PR evidence is only a first page or truncated capture. Comments, reviews, review threads, check runs and workflow runs must be complete for the PR head being judged, or the missing page is an unanswered source and the owner returns to recon. A `null` thread count, elided saved output, or bounded `first:100` result with more pages available is not a clean review input.
+
+Relay the verdict verbatim within 20 minutes; do not substitute your judgment or soften a FAIL. A malformed verdict is returned to the reviewer for correction. The owner waits 30 minutes, then records `decision: reviewer verdict outstanding; repair commits <ids>; bookmark not moved` and hands back. That timeout is your work, not a decision for the human: obtain the verdict and resume the owner at verification with the original PR head, expected branch/bookmark head and candidate commits preserved.
+
+### Notches are the handback record
+
+Read, do not merely request, each owner's records:
+
+```sh
+knives notch <branch> --repo <repo>
+knives status <repo>
 ```
 
-A `handback:` notch followed by a released claim (`knives status` shows none on the branch) is a
-finished owner. An owner's final message that disagrees with its notches is wrong; the notch is the
-record. Acceptance is dispositions-with-evidence, never PR counts or URLs: a thread is addressed when
-a `record:` notch carries one of its three shapes for it (`-> <commit>` | `declined: <reason>` |
-`already answered <url>`), with the new reply's url as `--evidence` where a reply was published
-(`maintaining-fork-pr` step 6's template).
+New entries use `recon:`, `rehome:`, `repair:`, `record:`, `verify:`, `decision:` and `handback:`, each with `--evidence`. Preserve and read older formats. A `handback:` plus released claim ends the worker's active ownership, not the overall task. Accept a thread disposition only with evidence: `-> <commit>`, `declined: <reason>`, or `already answered <reply-url>`. Record outstanding promises explicitly, with the reply URL, rather than counting them as fulfilled. Verify new replies actually published before reporting them as addressed.
 
-**Done when** every dispatched branch has a `handback:` (or a stopping `decision:`) notch and a
-post-run status row saved beside the pre-run one.
+### Single writer and release-wide changes
 
-## Mid-wave duties
+Ordinary branch writes belong to its claim holder. Owners append repair commits; they do not rewrite shared ancestry. A lone branch's necessary rebase follows `fork-work`; a release-member rebase belongs to the orchestrator. The release claim is the write lease for release refs and release-wide mutations, not permission to push an owner's PR head. Stop admitting owners for that repo, wait until **every affected member claim is released**, hold the release claim while integrating, and recheck the no-claim barrier immediately before the write; if a new external claim appears, back off instead of racing it. An unrelated repo can continue.
 
-**The reviewer relay.** An owner has no `task` tool, so its step 6 judgment is yours to dispatch. The
-owner sends you the path of its packet, `reviewer-packet-<n>.md` in the scratch directory (questions,
-head, workspace path, reviewer rule, recon notch and working list, fork-point diff, drafts, gate log
-paths). Dispatch a fresh-context reviewer agent with that packet, unedited, and relay the verdict to
-the owner verbatim within 20 minutes of the path arriving (the owner waits 30 from sending, then hands
-back). The verdict vocabulary, stated once here: `PASS (no repairs)`, `PASS per fix (k/k)` or `FAIL:
-<kind>` with `kind` one of `fix`, `body`, `drift`, and one clause of evidence per question. You add
-nothing, soften nothing, never rule yourself; the owner pastes it into its `verify:` notch, which the
-census's thermonuclear cell reads. A `decision: reviewer verdict outstanding` notch is yours, not the
-maintainer of record's: it names the repair commit ids and says the bookmark was not moved; relay the
-verdict and re-dispatch the owner at its step 6 with the head and those commit ids in the coordinates.
-
-**A branch moved under an owner.** The notch `maintaining-fork-pr` "If the branch moves under you"
-defines — `decision: branch moved under me, <old tip>→<new tip>; pending: <k> repair commits |
-rehome; which head does the PR get` — means an actor other than you rebased a release the branch
-belongs to and the owner handed back with a push pending. You decide which head the PR gets: when
-`jj -R <fork path> --ignore-working-copy diff --from <old tip> --to <new tip>` (the path from
-`knives repos --json`) passes the owner's step 3 test, the new tip — the pending commits already sit
-on it, and the re-dispatched owner records a `rehome:` notch and pushes as its step 6 says; anything
-else is a decision for the maintainer of record, reported, not guessed. Re-dispatch with the head you
-chose in the coordinates.
-
-**Done when** every packet path an owner sent has a verdict relayed verbatim, every timed-out owner
-is re-dispatched with it, and every moved-branch `decision:` notch has your ruling on the head and a
-re-dispatch (or a line for the maintainer of record).
-
-## 4. Single writer
-
-A branch is touched only under a `knives start` claim, by the agent holding it (the pre-claim
-exception is `maintaining-fork-pr` step 1's). You never push to, rebase, or amend a branch an owner
-holds. If you must act on a branch yourself — an owner died mid-claim, a hand-back left something
-undone — you claim it like any owner, `knives start <branch> --repo <repo> --why "<PR number>: <what
-you are finishing>"`, then follow `maintaining-fork-pr` yourself through its step 7.
-
-**Between waves, and only then**, the one move that is yours: a release-member rehome. An owner
-whose branch is a parent of the release in hand cannot rebase it alone — `knives release rebase`
-moves every member and the release together — so it hands back a `decision:` notch asking for the
-rehome (`maintaining-fork-pr` step 3). When one or more owners have, and no parent is claimed:
-
-```
-knives release --repo <repo> members --json | jq -r '.members[].held_by[0]'              # before: the members (release in hand only)
-knives status <repo> --json | jq '.branches[] | select(.claim != null) | .name'          # before: none of them
+```sh
+knives release --repo <repo> members
+knives status <repo>
 knives release --repo <repo> rebase [<target>]
-knives notch <release> --repo <repo> -m "rehome: onto <target> for #<n>, #<m>" --evidence <release commit>
-jj -R <fork path> --ignore-working-copy log -r '<target> ~ ::<member>' --no-graph   # after, per member: empty = on the target
 ```
 
-Bare, `rebase` targets the first upstream trunk commit that contains every merged pull request
-and needs an explicit target when nothing has merged (`knives release rebase --help`). Run it
-once per release per gap. Its exit 0 is no proof that the members moved: it reports "already
-contains <target>" from the release commit's ancestry, and members have been seen still on the old
-base after it, so confirm per member before re-dispatching; a member for which that log prints
-anything is still on the old base, reported as such, never assumed moved. Then re-dispatch those pull
-requests in the next wave with their new rows.
+Choose the target from the actual need; bare rebase uses the documented merged-PR target and may require an explicit target. Record `rehome:` with the target and resulting release commit. Exit 0 is not enough: confirm each affected member is actually on the target, its patch survived and its commits are conflict-free. A member still on the old base is unresolved work. Resume verification for **all affected PR heads**, not just the owner that requested the rebase; never push their rewritten heads without their claims and fresh verification, and keep the original PR head, expected bookmark head and candidate head distinct in the re-dispatch.
 
-**Done when** no branch was written to by two agents in the sweep — every push in the report
-matches a notch by the claim holder at that time — and every rehome has a `rehome:` notch on
-the release with the new commit as evidence.
+Use the existing release plan and `knives release --repo <repo> members <release> --verify` to check current parents and content carriage. Also check target ancestry explicitly for each member with `jj -R <checkout> --ignore-working-copy log -r '<target> ~ ::<member-commit>' --no-graph` (empty means the target is an ancestor), and check each member's conflicts. Content carriage or the release merge containing the target does not prove every member moved onto it.
 
-## 5. Report
+If an external actor moves a branch under an owner, inspect old-to-new content. Trunk-context-only movement can be ruled on by the orchestrator, with the original head, chosen new head and reparented candidate commits recorded. Resume the owner to re-review/re-test the resulting candidate before pushing. A semantic conflict with the user's intent requires a real decision; do not guess or reuse a verdict for a different tree.
 
-The report is assembled from step 3's notches and rows. Per pull request, in this order:
+**Done when:** each packet has a verdict, each handback has been checked against notches and current state, and every integration mutation has one owner and preserved-content evidence.
 
-- **What maintainers asked** — from the `recon:` notch (asks and unresolved threads).
-- **What we changed** — one line per `repair:`/`record:` notch, the commit named; a thread is
-  addressed when the `record:` notch carries one of its three shapes for it: `-> <commit>`,
-  `declined: <reason>`, or `already answered <existing reply url>`.
-- **Evidence** — the PR URL, the commits, the `verify:` notch's quoted gate output.
-- **What is unverified** — from the `verify:`/`handback:` notches; runs without a conclusion and
-  `action_required` runs are unverified, not passing.
-- **Forbidden** — the `record:` notch's remaining count, each remaining hit named as intended.
-- **Decisions only the maintainer of record can make** — every `decision:` notch, quoted, with its
-  evidence, except the two kinds Mid-wave duties already ruled on (`reviewer verdict outstanding`; a
-  moved branch whose diff passed the step-3 test), which are reported as ruled, with your ruling.
+## 5. Finish release and consumer verification
 
-Never a headline defect count without severity. No pull request is "handled" in prose unless the
-notch that says so is cited; one with no notches from this sweep is reported as not swept, with the
-reason. **Done when** every line of the report cites a notch, a commit, a URL, or a saved row field,
-and the first line is step 1's population count.
+Run this phase when the request includes releases, upstream debt or consumption. PR-only scope does not authorize release edits or deployment.
 
-## 6. After the sweep: the census
+1. **Reconcile intended content.** Read the release and member notches again, the release plan, the content census and consumers:
+   ```sh
+   knives release --repo <repo>
+   knives release --repo <repo> members --census
+   knives consumers <repo>
+   ```
+   For each maintained delta, record whether the intended release must carry it, inherits it upstream, deliberately excludes it, or needs repair. Use `members <target> --carries <revision>` for content carriage; an upstream PR's merged state or a source-text match alone is not proof. A conflicted probe needs investigation, not an automatic drop.
+2. **Compose the intended release.** Use the existing `release advance`, `include`, `drop --why`, `rebase` and `cut` commands as documented in `using-knives`, under the integration barrier. Advance repaired members to verified heads. Include an unreleased PR only when it is intended and ready to ship. Read actual consumer pin constraints before choosing an in-place edit or a new cut: a consumer frozen on an older release is still behind but does not block editing the current release, while a tool refusal that every pin of the release being edited is frozen on a revision means an in-place edit would reach nobody and the answer is a new cut, not a parallel lineage or forced ref move. Keep required old refs reachable. Do not generate an identical release just to have a new name.
+3. **Verify the composed candidate.** Run its complete applicable gates and exercise the changed public surface on the candidate itself. Check every member and integration resolution. For a pure restructure, require tree identity with the verified reference; otherwise account for the exact intended delta. Then run **absolute consumer capability contracts**: a capability lost before the preceding release will escape a previous-cut comparison. Read historical requirements in `knives notch`; a previously lost required capability is a defect to fix, not a baseline to accept.
+4. **Verify the consumer chain.** Identify authoritative consumer trunk pins, resolved lock commits, build inputs, submodule/binary artifacts and any intermediate package that injects its own dependencies. A consumer's direct package pin does not necessarily control a runner's independently installed version. Verify the full relevant chain against the intended candidate. Use existing project deployment/verification guidance for the real surface, not an upstream's unrelated dev environment. Local gates, a changed lockfile, a published branch and deployed behavior are distinct evidence.
+5. **Publish and consume deliberately.** A local cut or in-place release edit is not published; a published ref is not consumed unless the authoritative consumer resolves it. Publish the verified release to the registry's publish remote (`release`, otherwise `origin`), verify the remote ref with `knives pushed`, and complete the consumer pin/build/deployment steps required by the user's goal. Do not deploy when explicitly excluded or bypass credentials/approvals. Verify the final resolved and, where required, running revision and exercise the intended behavior there. Re-run verification after a relevant change. Record `record:` and `verify:` on the release with exact candidate, published and consumed commits plus gate/runtime evidence.
 
-Then answer for CI, review comments, verification and the forbidden scan on every swept pull request,
-one line each: `<repo>#<n>: CI <…> / review comments <…> / thermonuclear <…> / e2e <…> / forbidden
-<…>`.
+If publication or consumption cannot proceed because of a real external prerequisite, complete independent work, record the exact blocker and report that stage **blocked**, not ready with a follow-up. Do not ask the human to ratify ordinary membership, naming, rehome or backward-compatible repair judgments already within the task; consult evidence and prior notches and decide. Ask only for missing authority, a genuine change in direction, or a conflict with the user's stated intent.
 
-- **CI** — the histogram the owner's `verify:` notch quotes from the workflow runs on the pushed head;
-  a suite awaiting maintainer approval reads `action_required`, and that is what you write, not
-  "green".
-- **review comments** — unresolved threads after the push (the `handback:` notch's count, from the
-  owner's step-7 read) and how many the owner's `record:` notch answered (any of its three shapes).
-- **thermonuclear** — the fresh-context review you dispatched on the owner's packet (Mid-wave
-  duties), as its `verify:` notch records the verdict; absent means not run, and you write that.
-- **e2e** — end-to-end evidence on the real surface, as the owner's `verify:` notch quotes it: the
-  repo's full gate and the test target run in the claimed workspace; a CI run that did not start
-  is not this.
-- **forbidden** — the `record:` notch's remaining count (`0`, or each hit as intended).
+**Done when:** intended content is verified in the release and at the requested consumer/runtime boundary, or the unmet boundary is explicitly blocked with evidence. A PR push alone cannot satisfy this phase.
 
-**Done when** every pull request in the population has a census line and every cell names its
-notch or row field, including the cells that read `not run`.
+## 6. Report verified outcomes, not just completed accounting
 
-## What the orchestrator never does
+Assemble the report from the saved live observations and the **`knives notch` chains**. Refresh the population for PRs that moved/merged during the sweep; reconcile changes rather than silently losing a row. Every original item retains a disposition. All newly discovered in-scope obligations are accounted for.
 
-- Open a pull request or issue the maintainer of record did not ask for.
-- Route around a human-tier credential gate; a timed-out grant is a no.
-- Ask maintainers for workflow approval.
-- Keep the record anywhere but notches and the published PR; scratch lives in the sweep's directory.
-- Touch the estate document or the skills mid-sweep; a gap in this text is reported after the sweep.
+Per PR: maintainer asks, each repair/disposition and its commit/reply evidence, verification on the exact head, unresolved threads, remaining forbidden hits with reasons, and genuine blockers. Per release-only member: its ownership/disposition, carriage evidence and verification, without pretending a PR review occurred. Per requested release: intended composition, candidate/published/consumed revisions, absolute capability and runtime evidence, and any unmet boundary.
 
-## Where the detail lives
+Use separate statuses: **accounted for**, **verified**, **published**, **consumed**, **blocked**. A handback or complete inventory proves only accounting. A decision note is not a repair. Never report a skipped gate, an unstarted workflow or a unit suite as successful end-to-end verification.
 
-The commands and their JSON are the `using-knives` skill; what an owner does with one pull
-request is `maintaining-fork-pr`; how the estate uses each library, per fork, is the estate
-document; what any agent does before touching a fork checkout is `fork-work`.
+For every PR, keep the census line:
+
+`<repo>#<n>: CI <head-specific run conclusions/pending> / review comments <unresolved, dispositions> / thermonuclear <fresh-context verdict> / e2e <actual surface evidence or not run> / forbidden <remaining hits>`
+
+Each cell cites a notch or saved observation. For every requested release add:
+
+`<repo>/<release>: composition <verified|blocked> / published <revision|not published> / consumers <resolved revisions|blocked> / runtime <evidence|not run>`
+
+Executable pending CI remains owned after owner handback and watched through a real background watcher/event subscription; refresh on completion and repair failures before calling the PR verified. Approval-gated `action_required` stays **unrun**: reproduce the applicable job locally, retain the limitation, and never ask maintainers to approve workflows. Continue independent work while an item waits. Existing upstream PRs remain owned after handback; release verification is independent of waiting for an upstream merge.
+
+Do not open unsolicited PRs/issues, route around credential gates, or change shared/global configuration to get a gate green. The evidence and the user's requested boundary, not the number of handbacks, determine completion.
