@@ -22,7 +22,14 @@ path = "src/main.rs"
 # No `watchman` feature: that was only ever a workaround for an unreleased tree
 # where gitattributes.rs used tokio while tokio was optional. The published crate
 # does not carry that code, so the workaround is not needed here.
-jj-lib = "=0.43.0"
+#
+# 0.45.1 matches the installed jj (sjawhar/jj sami, 0.45.1). This is the
+# invariant two paragraphs up made concrete: 0.45.0 added a Git HEAD per
+# colocated workspace to the view (jj-vcs/jj f3115e386), and a 0.43 build
+# merging divergent op heads rewrote the view WITHOUT those entries — every
+# affected workspace's next jj command then re-imported HEAD from disk and
+# replaced its working-copy commit. tests/view_compat.rs locks the agreement.
+jj-lib = "=0.45.1"
 
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }

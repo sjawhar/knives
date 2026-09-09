@@ -8,6 +8,9 @@ use std::task::{Context, Poll, Waker};
 use futures_core::Stream as _;
 use jj_lib::backend::CommitId as JjCommitId;
 use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
+use jj_lib::default_backend_factories::{
+    default_backend_factories, default_working_copy_factories,
+};
 use jj_lib::local_working_copy::LocalWorkingCopy;
 use jj_lib::matchers::EverythingMatcher;
 use jj_lib::merge::Merge;
@@ -15,13 +18,13 @@ use jj_lib::merged_tree::MergedTree;
 use jj_lib::object_id::ObjectId as _;
 use jj_lib::op_store::{RefTarget, RemoteRef};
 use jj_lib::ref_name::{RefName as JjRefName, RemoteName as JjRemoteName};
-use jj_lib::repo::{MutableRepo, ReadonlyRepo, Repo as _, RepoLoader, StoreFactories};
+use jj_lib::repo::{MutableRepo, ReadonlyRepo, Repo as _, RepoLoader};
 use jj_lib::revset::{SymbolResolver, walk_revs};
 use jj_lib::rewrite::{duplicate_commits, merge_commit_trees, rebase_commit};
 use jj_lib::settings::UserSettings;
 use jj_lib::transaction::Transaction;
 use jj_lib::working_copy::WorkingCopy as _;
-use jj_lib::workspace::{Workspace, default_working_copy_factories};
+use jj_lib::workspace::Workspace;
 use thiserror::Error;
 
 use crate::detect::landed::RebaseOutcome;
@@ -167,7 +170,7 @@ impl Repo {
         let loader = RepoLoader::init_from_file_system(
             &settings,
             &path.join(".jj/repo"),
-            &StoreFactories::default(),
+            &default_backend_factories(),
         )
         .map_err(|error| JjError::Open {
             path: path.display().to_string(),
@@ -229,7 +232,7 @@ impl Repo {
         let mut workspace = Workspace::load(
             &settings,
             destination,
-            &StoreFactories::default(),
+            &default_backend_factories(),
             &default_working_copy_factories(),
         )
         .map_err(|error| JjError::Open {
@@ -661,13 +664,12 @@ impl Repo {
         ancestor: &JjCommitId,
         descendant: &JjCommitId,
     ) -> Result<bool, JjError> {
-        self.repo
-            .index()
-            .is_ancestor(ancestor, descendant)
-            .map_err(|error| JjError::Revision {
+        block_on(self.repo.index().is_ancestor(ancestor, descendant)).map_err(|error| {
+            JjError::Revision {
                 revision: descendant.to_string(),
                 detail: error.to_string(),
-            })
+            }
+        })
     }
 
     /// Commits reachable from `tip` but not from any of `bases` — `bases..tip` —
@@ -717,14 +719,15 @@ impl Repo {
         let mut common = vec![self.commit(tip.as_str())?.id().clone()];
         for commit in commits {
             let commit = self.commit(commit.as_str())?.id().clone();
-            common = self
-                .repo
-                .index()
-                .common_ancestors(&common, std::slice::from_ref(&commit))
-                .map_err(|error| JjError::Revision {
-                    revision: commit.to_string(),
-                    detail: error.to_string(),
-                })?;
+            common = block_on(
+                self.repo
+                    .index()
+                    .common_ancestors(&common, std::slice::from_ref(&commit)),
+            )
+            .map_err(|error| JjError::Revision {
+                revision: commit.to_string(),
+                detail: error.to_string(),
+            })?;
         }
         match common.as_slice() {
             [only] => Ok(Some(commit_id(only))),
@@ -1185,7 +1188,7 @@ fn workspace_name_at(directory: &Path) -> Result<WorkspaceName, JjError> {
     let workspace = Workspace::load(
         &settings,
         directory,
-        &StoreFactories::default(),
+        &default_backend_factories(),
         &default_working_copy_factories(),
     )
     .map_err(|error| JjError::Open {
@@ -1491,6 +1494,15 @@ fn command_or_none(result: Result<String, JjError>) -> Result<Option<String>, Jj
     }
 }
 
+/// Drive a jj-lib future to completion without an executor.
+///
+/// Sound only because every future polled here resolves without suspending:
+/// jj-lib's default store, index and working-copy implementations are
+/// synchronous behind async signatures (as of 0.45.1, `Index::is_ancestor`
+/// and `common_ancestors` included). A future that genuinely parked on a
+/// wakeup would spin here forever, since the noop waker never fires. Re-check
+/// this on every jj-lib bump; the day it stops holding, replace with a real
+/// executor such as `pollster`.
 fn block_on<F: Future>(future: F) -> F::Output {
     let waker = Waker::noop();
     let mut context = Context::from_waker(waker);
@@ -1915,12 +1927,12 @@ fn assert_mutable(
     let pins = immutable_pins(repo);
     for target in targets {
         for pin in &pins {
-            let pinned = repo
-                .index()
-                .is_ancestor(target.id(), &pin.commit)
-                .map_err(|error| JjError::Revision {
-                    revision: target.id().to_string(),
-                    detail: error.to_string(),
+            let pinned =
+                block_on(repo.index().is_ancestor(target.id(), &pin.commit)).map_err(|error| {
+                    JjError::Revision {
+                        revision: target.id().to_string(),
+                        detail: error.to_string(),
+                    }
                 })?;
             if pinned {
                 return Err(JjError::Immutable {
@@ -2342,13 +2354,12 @@ fn guard_bookmark_motion(
             .view()
             .get_local_bookmark(JjRefName::new(name))
             .as_normal()
-        && !repo
-            .index()
-            .is_ancestor(current, target)
-            .map_err(|error| JjError::Revision {
+        && !block_on(repo.index().is_ancestor(current, target)).map_err(|error| {
+            JjError::Revision {
                 revision: target.to_string(),
                 detail: error.to_string(),
-            })?
+            }
+        })?
     {
         return Err(JjError::Revision {
             revision: name.to_owned(),
