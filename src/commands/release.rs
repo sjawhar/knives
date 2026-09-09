@@ -2070,6 +2070,7 @@ mod consumer_scope_tests {
         // These forks cut releases on one dated scheme, so the same release name exists
         // in several of them. Unscoped, a sibling's pin was attributed to this repo,
         // which reads as "pinned at the newest cut" when this repo is not pinned at all.
+        let _environment = crate::config::test_support::environment_lock();
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("uv.lock"),
