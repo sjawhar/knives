@@ -211,8 +211,12 @@ impl Repo {
     /// Re-registers a workspace that `jj workspace forget` left on disk.
     ///
     /// The forgotten workspace's state points at the operation that last owned
-    /// its working-copy commit. Reinstating that mapping and advancing only the
-    /// state operation preserves the files and change exactly as they were.
+    /// its working-copy commit. Reinstating everything `forget` removed from the
+    /// view — the working-copy commit and, for a colocated workspace, the Git
+    /// HEAD it had recorded — and advancing only the state operation preserves
+    /// the files and change exactly as they were. Without the recorded HEAD,
+    /// jj's next command in a colocated workspace reads HEAD from disk as if it
+    /// had moved and replaces the working-copy commit, silently.
     pub fn reattach_workspace(
         &self,
         destination: &Path,
@@ -285,9 +289,11 @@ impl Repo {
                     name.as_symbol()
                 ),
             })?;
+        let git_head = historical.view().git_head(&name).clone();
 
         let mut transaction = self.repo.start_transaction();
         transaction.set_workspace_name(&name);
+        transaction.repo_mut().set_git_head_target(&name, git_head);
         transaction
             .repo_mut()
             .set_wc_commit(name, commit)
@@ -1871,10 +1877,11 @@ struct ImmutablePin {
 }
 
 /// The pins `builtin_immutable_heads()` names under jj's defaults:
-/// `present(trunk()) | tags() | untracked_remote_bookmarks()`. Trunk is read
-/// wider than jj's alias — a trunk-named bookmark on ANY remote rather than
-/// one chosen remote's — which can only refuse more, never less, and no
-/// knives verb rewrites trunk ancestry on purpose.
+/// `trunk() | tags() | untracked_remote_bookmarks() | untracked_remote_tags()`.
+/// Every remote tag is pinned, tracked or not, and trunk is read wider than
+/// jj's alias — a trunk-named bookmark on ANY remote rather than one chosen
+/// remote's — which can only refuse more, never less, and no knives verb
+/// rewrites trunk ancestry on purpose.
 fn immutable_pins(repo: &dyn jj_lib::repo::Repo) -> Vec<ImmutablePin> {
     let mut pins = Vec::new();
     let view = repo.view();
