@@ -63,6 +63,8 @@ The report starts with `Population: <p> open PRs and <r> release-only members, <
 
 One `maintaining-fork-pr` owner per PR, end to end. Dispatch batches of at most eight and keep at most eight active PR owners. Observe every start's claim or refusal before filling the next batch; claim-lock waits are normal. Release a worker slot on handback, but retain responsibility for the PR until merge or explicit reassignment.
 
+**An owner runs on a strong model, never the harness's default fast/cheap subagent tier.** Owning a PR is judgment work — reading a maintainer's question and forming a position, deciding which stale text would actually mislead and which is harmless, recognizing that a `decision:` in the chain already answers today's question. A fast model works the steps as a checklist and produces exactly the failure this skill exists to prevent: correcting replies nobody needed, resolved threads reopened, settled decisions re-escalated. If the harness's generic task agent maps to a fast tier (check its model-role configuration before the first dispatch), select an agent type or model override that runs a strong model, and say which in the dispatch record. The fresh-context reviewer in step 4 has the same requirement. Only read-only recon that will be re-judged by an owner may run on a fast tier.
+
 A claim held by someone outside this sweep is respected: report its `why` text and continue independent work. Do not infer death from a quiet `seen` field. If an owner stops unexpectedly, establish its state through coordination and the existing claim/workspace, then use the supported claim-recovery procedure before taking over. Never blindly force a claim or restore the shared jj operation log.
 
 Each dispatch contains, in order:
@@ -97,6 +99,17 @@ knives status <repo>
 ```
 
 New entries use `recon:`, `rehome:`, `repair:`, `record:`, `verify:`, `decision:` and `handback:`, each with `--evidence`. Preserve and read older formats. A `handback:` plus released claim ends the worker's active ownership, not the overall task. Accept a thread disposition only with evidence: `-> <commit>`, `declined: <reason>`, or `already answered <reply-url>`. Record outstanding promises explicitly, with the reply URL, rather than counting them as fulfilled. Verify new replies actually published before reporting them as addressed.
+
+### Decisions that reach the human
+
+You are the last filter before a question reaches the maintainer of record, and you own the same judgment `maintaining-fork-pr` asks of an owner. Before forwarding any `decision:` an owner wrote:
+
+- Read the branch's whole chain yourself. If an earlier note answers it, the decision is closed: write a `decision:` notch quoting that note, re-dispatch the owner with the answer, and never show the human the question. One PR carried the same A-or-B question through four owners over three weeks because each orchestrator forwarded the newest `decision:` without reading the one dated before it.
+- Read the maintainer's words yourself, not the owner's summary of them. A summary that says "declined the CIDR ask" for a thread that actually said "you introduced a second system, please unify" sends the human a question about the wrong thing and takes several rounds to unwind. When you put a maintainer's ask in front of the human, quote it.
+- Bring a position. The human gets: what was asked (quoted), what the record says, what you would do and why, what changes under the alternative — in the repository's own terms, with every identifier expanded on first use. A bare `#1075` or a fork's internal vocabulary is not a question the human can answer.
+- A question about the PR's design or scope is not a decision for the human unless it needs authority you lack (money, an upstream commitment, removing something the human asked for). Confidence you lack is your work to do, not theirs.
+
+Record the human's ruling as a `decision:` notch on the branch, in full — the reasoning, not just the verdict — so no later owner can re-open it by reading only the prefix. A ruling that establishes a standing rule (for example, "infra PRs bake in the upstream's defaults and our settings live in our own configuration") is also recorded on the repository subject with `knives notch --repo <repo>`, where every future dispatch reads it.
 
 ### Single writer and release-wide changes
 

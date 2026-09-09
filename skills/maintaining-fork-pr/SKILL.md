@@ -1,11 +1,21 @@
 ---
 name: maintaining-fork-pr
-description: Use when dispatched to maintain one existing fork pull request through recon, repair, independent review, publication and handback. The orchestrator supplies the PR coordinates and inherited knives records, not a separate estate document.
+description: Use when you own one existing fork pull request — its path to merge or close is yours — through recon, repair, independent review, publication and handback. The orchestrator supplies the PR coordinates and inherited knives records, not a separate estate document; the judgment about what the PR needs is yours, not the dispatch's.
 ---
 
 # Owning one fork pull request
 
 One agent owns one PR end to end, under one branch claim. The orchestrator owns the wider release/consumer outcome. Your handback ends active work in the claimed workspace; it does not declare the release ready or end responsibility for pending CI and maintainer obligations.
+
+## What owning means
+
+You are this pull request's maintainer toward upstream. Its job is to get merged or get closed; yours is to move it toward whichever is right, and to hold a view on every question it raises. The steps below are the order of operations for doing that, not a checklist that produces the outcome when worked mechanically.
+
+Judge every item from its own record, not from a rule about its kind. A thread that names a commit no longer on the head is a defect only if a maintainer reading it today would misunderstand what the PR does now. A resolved thread was resolved by a maintainer; you reopen it only if the head has since broken what it settled. A comment on the PR reaches a human maintainer's inbox and is noise unless it moves the PR. A body sentence that is stale but harmless is not worth a publish. Nothing in this skill is a "must reply" or "must correct" — every item asks whether acting on it moves the PR toward merge or close, and the record is where the answer lives.
+
+A maintainer's design question is yours to answer, not to forward. Read the thread, the diff and the notch chain, form a position, and either implement it or state it on the thread with your reasoning. The one thing you do not do is send it back up with "Sami decision" attached and no position of your own. That is how one PR carried the same A-or-B question through four owners and three weeks of `decision:` notches, each owner re-escalating a choice that had been made and recorded on 2026-09-05, because none of them read past the prefix.
+
+**Before writing any `decision:` notch**, three things must be true and the notch must say so: (1) you read the entire chain for this branch and the release, and no prior note answers it — quote the closest one and say why it does not; (2) you have a recommendation and give it, with the evidence that produced it; (3) the choice needs authority you lack — money, an upstream commitment, removing something the maintainer of record asked for — not merely confidence you lack. A `decision:` that fails any of the three is your own work not yet done. When a prior note does answer it, cite it, apply it, and move on; the human should never be asked twice.
 
 ## 1. Read `knives notch`, then claim
 
@@ -79,16 +89,16 @@ Use `knives preflight` as facts, not judgment: convention-file presence and chan
 
 Start template/identifier checks with the branch's `knives audit` fields `template_missing` and `forbidden`. Missing or null fields can mean unobserved data, no configured terms, or a fork-only exemption; read the registry and reported problems rather than treating absence as zero hits. These fields describe the current bookmark and published body. They do not scan a later unpushed candidate or draft prose, which still require an explicit candidate scan before review.
 
-Build a working list with one disposition for each:
+Build a working list with one disposition for each item, judged from what you read — the thread, the diff at the head, and the chain — not from the item's category:
 
-- Maintainer ask, including every ask in a resolved thread. Resolution does not prove the current head still obeys it.
-- Defect found by examining the **whole diff**, not just review comments.
-- Inherited promise or decision from `knives notch` and whether the head satisfies it.
-- Stale body/reply claim, including a reply naming a rewritten commit or another PR.
-- Missing template requirement or heading.
-- Forbidden identifier in added lines or proposed upstream prose, using the configured registry terms and applicable publication rules. If no list is configured, state that; still check for private hosts, credentials and internal process details.
+- A maintainer ask. Check whether the head does what was asked; a thread being resolved is evidence a maintainer was satisfied, and you disturb that only when the head has since stopped doing it.
+- A defect you found by examining the **whole diff**, not just review comments.
+- An inherited promise or decision from `knives notch`, and whether the head satisfies it. A decision already recorded is applied, not re-asked.
+- A body or reply claim that would mislead a maintainer about what the PR does now. A commit id that has since been rebased away is not, by itself, misleading — the prose is usually still true. Ask what a reviewer reading it today would believe, and whether that belief is wrong.
+- A missing template requirement or heading.
+- A forbidden identifier in added lines or proposed upstream prose, using the configured registry terms and applicable publication rules. If no list is configured, state that; still check for private hosts, credentials and internal process details.
 
-Dispositions are: already addressed (commit/reply evidence), to repair, declined (reason to give upstream), genuine decision needed, or currently unverifiable (specific external prerequisite). An outstanding promise is not already addressed. Note whether the branch is a release member, using the actual parent associations from `release members`; an advanced branch may succeed an older released parent.
+Dispositions are: already addressed (commit/reply evidence), to repair, declined (reason to give upstream), leave alone (say why — this is a real disposition, not a gap), genuine decision needed (only after the three conditions in "What owning means"), or currently unverifiable (specific external prerequisite). An outstanding promise is not already addressed. Note whether the branch is a release member, using the actual parent associations from `release members`; an advanced branch may succeed an older released parent.
 
 Record the recon and its evidence:
 
@@ -124,8 +134,10 @@ Record each repair via `knives notch <branch> -m 'repair: <finding>; red: <comma
 
 Draft in scratch; publish only after the reviewer approves the candidate and the remote has it.
 
+Every word you publish lands in a human maintainer's notifications. The bar for a comment is that the maintainer needs to read it to review or merge the PR: an ask answered, a change since their last look explained, a wrong claim that would misdirect their review corrected. A comment that only tidies the record — restates what the diff already shows, updates a commit id in an old reply, re-announces an unchanged position — fails that bar and is not drafted. When you are unsure, the answer is no; the notch chain is where tidiness goes.
+
 - Preserve the repository template and all required headings. Describe the final change and requested-versus-added changes since the last human review.
-- Draft one factual reply per thread lacking a reply true of the candidate. Address each ask with a commit or a reason for declining; do not repeat an existing accurate reply. Correct stale attribution explicitly.
+- Answer each ask the maintainer is still waiting on: with the commit that does it, a reason for declining, or your position on the question they raised. Do not repeat an existing accurate reply; do not reply on a thread the maintainer resolved unless the head broke what it settled.
 - Record any remaining promise with its concrete obligation; a promise to do work is not its completion.
 - Request re-review only from a human maintainer whose review is outstanding or whose requests the candidate addresses. A bot review does not justify a human re-review request.
 - Scan final added lines and draft prose for configured forbidden terms and private/internal details. Give each intended remaining hit a reason; an unexplained hit blocks publication.
@@ -166,7 +178,7 @@ Record `verify:` with the verbatim reviewer verdict, original-to-published commi
 Publish only the exact draft text the reviewer approved, after the candidate is on the PR. If you edit body or reply prose after review, refresh the packet. Compare the published body to the approved draft before editing and skip an unchanged body; post necessary thread replies, and request re-review where due and permitted. If that request is unavailable to an outside contributor, record the actual limitation instead of claiming it succeeded. Save every returned reply URL. Record:
 
 ```sh
-knives notch <branch> --pr <number> -m 'record: body <updated|unchanged>; threads: <id> -> <commit> | declined: <reason> | already answered <URL>; promises outstanding: <obligation or none>; re-review: <actual result>; forbidden remaining: <hits/reasons>' --evidence <PR-url> --evidence <new-reply-url>
+knives notch <branch> --pr <number> -m 'record: body <updated|unchanged>; threads: <id> -> <commit> | declined: <reason> | already answered <URL> | left alone: <reason>; promises outstanding: <obligation or none>; re-review: <actual result>; forbidden remaining: <hits/reasons>' --evidence <PR-url> --evidence <new-reply-url>
 ```
 
 Only include evidence arguments that exist. Publish no fabricated counts or blanket green claims while required verification is pending.
@@ -183,6 +195,6 @@ Run `knives finish <branch>` from the claimed workspace, then confirm the claim 
 
 ## Cross-scope decisions and interruptions
 
-Bring ordinary placement, membership, compatible repair and coordination questions to the orchestrator with evidence. Apply recorded choices rather than asking the human to make them again. The orchestrator decides within the authorized goal; only missing authority, a genuine change in direction, or an unresolved conflict with user intent reaches the human. Do not change defaults/remove functionality contrary to the approved goal merely to make a gate pass. New external credentials require the existing approval mechanism; never route around a denial or timeout. Finish independent reachable work while a dependency waits.
+Bring ordinary placement, membership, compatible repair and coordination questions to the orchestrator with evidence and your recommendation. Apply recorded choices rather than asking the human to make them again. The orchestrator decides within the authorized goal; only missing authority, a genuine change in direction, or an unresolved conflict with user intent reaches the human — and it reaches them as a question you have already done the work on: what was asked, what the record says, what you would do and why, what changes if they choose otherwise. A maintainer's technical question about the PR's design is never in this category; that is your work (see "What owning means"). Do not change defaults/remove functionality contrary to the approved goal merely to make a gate pass. New external credentials require the existing approval mechanism; never route around a denial or timeout. Finish independent reachable work while a dependency waits.
 
 If another actor reparents your branch, update the stale workspace once and record the old/new tips and reparented repair commits. Do not push. Notify the orchestrator with the pending candidate and hand back if necessary; it chooses the head using content evidence and resumes you. Re-run review and affected verification on the resulting candidate. Never assume an old-tree PASS survived a rebase, even when it has no textual conflicts.
