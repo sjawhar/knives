@@ -172,17 +172,20 @@ fn current_operation(lab: &Lab) -> String {
         .to_owned()
 }
 
-fn fetch_remote_without_integrating(lab: &Lab, operation: &str, remote: &str) -> String {
+/// Fetch `remote` as a new operation whose parent is `operation` rather than
+/// the current head.
+///
+/// Two fetches run at the same past operation become sibling operation heads;
+/// the next reader reconciles them, and a remote ref the two fetches saw at
+/// non-ancestral targets comes out conflicted. That is the fixture for a
+/// conflicted remote-tracking ref. The earlier form of this helper built the
+/// siblings with `--no-integrate-operation` and integrated them afterwards;
+/// jj 0.44 refuses that flag on `git fetch` (jj-vcs/jj 10a93ddc0), since a
+/// fetch writes the Git remote refs on disk and an unintegrated operation
+/// would leave them ahead of the view.
+fn fetch_remote_at_operation(lab: &Lab, operation: &str, remote: &str) {
     let output = Command::new("jj")
-        .args([
-            "--at-op",
-            operation,
-            "--no-integrate-operation",
-            "git",
-            "fetch",
-            "--remote",
-            remote,
-        ])
+        .args(["--at-op", operation, "git", "fetch", "--remote", remote])
         .current_dir(&lab.work)
         .env("JJ_CONFIG", "/dev/null")
         .env("JJ_USER", "Knives Lab")
@@ -192,36 +195,6 @@ fn fetch_remote_without_integrating(lab: &Lab, operation: &str, remote: &str) ->
     assert!(
         output.status.success(),
         "fetch {remote} at {operation} failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8(output.stdout).expect("utf-8 fetch stdout");
-    let stderr = String::from_utf8(output.stderr).expect("utf-8 fetch stderr");
-    let operation = if stdout.trim().is_empty() {
-        stderr.as_str()
-    } else {
-        stdout.as_str()
-    };
-    operation
-        .split_whitespace()
-        .last()
-        .unwrap_or_else(|| {
-            panic!("unintegrated operation id: stdout={stdout:?}, stderr={stderr:?}")
-        })
-        .to_owned()
-}
-
-fn integrate_operation(lab: &Lab, operation: &str) {
-    let output = Command::new("jj")
-        .args(["op", "integrate", operation])
-        .current_dir(&lab.work)
-        .env("JJ_CONFIG", "/dev/null")
-        .env("JJ_USER", "Knives Lab")
-        .env("JJ_EMAIL", "knives-lab@example.test")
-        .output()
-        .expect("integrate operation");
-    assert!(
-        output.status.success(),
-        "integrate {operation} failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 }
@@ -528,7 +501,7 @@ fn a_remote_tracking_ref_is_reported_after_its_remote_is_removed() {
 
 #[test]
 fn a_conflicted_ref_on_an_unconfigured_remote_is_still_reported() {
-    // Given: two concurrent fetches see non-ancestral extra/main moves.
+    // Given: two sibling operations fetched extra/main at non-ancestral targets.
     let lab = Lab::new();
     lab.advance_origin_branch("main", "origin main advance\n");
     lab.advance_upstream("upstream main advance\n");
@@ -541,7 +514,7 @@ fn a_conflicted_ref_on_an_unconfigured_remote_is_still_reported() {
         extra.to_str().expect("utf-8 remote path"),
     ]);
     let before_fetch = current_operation(&lab);
-    let origin_fetch = fetch_remote_without_integrating(&lab, &before_fetch, "extra");
+    fetch_remote_at_operation(&lab, &before_fetch, "extra");
     git_remote_in_colocated_config(
         &lab,
         &[
@@ -550,9 +523,9 @@ fn a_conflicted_ref_on_an_unconfigured_remote_is_still_reported() {
             lab.upstream.to_str().expect("utf-8 remote path"),
         ],
     );
-    let upstream_fetch = fetch_remote_without_integrating(&lab, &before_fetch, "extra");
-    integrate_operation(&lab, &origin_fetch);
-    integrate_operation(&lab, &upstream_fetch);
+    fetch_remote_at_operation(&lab, &before_fetch, "extra");
+    // Opening the repository reconciles the two heads; the merge is where
+    // main@extra becomes conflicted.
     let conflicted = Repo::open(&lab.work)
         .expect("open lab")
         .conflicted_bookmarks()

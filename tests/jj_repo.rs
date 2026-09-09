@@ -103,6 +103,56 @@ fn workspace_activity_reports_nothing_for_a_workspace_that_never_moved() {
     assert!(activity.horizon.is_none(), "was: {activity:?}");
 }
 
+/// The workspace names the merged view records a Git HEAD for, read through
+/// the installed `jj`.
+fn git_head_workspaces(lab: &Lab) -> Vec<String> {
+    let view = lab.jj_work_output(["debug", "object", "view", "--op", "@"]);
+    let start = view
+        .find("git_heads:")
+        .expect("view dump has a git_heads field");
+    let block = &view[start..];
+    let block = &block[..block.find("wc_commit_ids").unwrap_or(block.len())];
+    block
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix('"')?.split('"').next())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+#[test]
+fn reattaching_a_forgotten_workspace_restores_its_recorded_git_head() {
+    // Given: a colocated workspace with a recorded Git HEAD, then forgotten.
+    // `jj workspace forget` removes the working-copy commit AND the Git HEAD
+    // from the view; the directory stays.
+    let lab = Lab::new();
+    let workspace = lab.work.parent().expect("parent").join("feat-x-ws");
+    knives::jj::add_workspace(&lab.work, "feat-x", &workspace, "main@upstream")
+        .expect("add workspace");
+    let change = lab.revision(&workspace, "@", "change_id");
+    assert!(
+        git_head_workspaces(&lab).contains(&"feat-x".to_owned()),
+        "fixture: the workspace has no recorded Git HEAD to lose"
+    );
+    lab.jj_work(["workspace", "forget", "feat-x"]);
+    assert!(!git_head_workspaces(&lab).contains(&"feat-x".to_owned()));
+
+    // When: knives re-registers it.
+    Repo::open(&lab.work)
+        .expect("open")
+        .reattach_workspace(&workspace, &WorkspaceName::new("feat-x"))
+        .expect("reattach");
+
+    // Then: the view has back everything forget removed — the working-copy
+    // commit and the Git HEAD. Without the HEAD, jj's next command in a
+    // colocated workspace would read HEAD from disk as a move and replace the
+    // working-copy commit.
+    assert!(
+        git_head_workspaces(&lab).contains(&"feat-x".to_owned()),
+        "reattach restored the working-copy commit but not the Git HEAD"
+    );
+    assert_eq!(lab.revision(&workspace, "@", "change_id"), change);
+}
+
 #[test]
 fn local_commit_after_push_is_ahead_of_origin() {
     // Given: a branch already pushed to origin and one additional local commit.
