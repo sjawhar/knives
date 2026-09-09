@@ -79,6 +79,20 @@ pub(crate) fn run_release(
         let tips = opened.bookmark_tips()?;
         let previous = previous_release_for_cut(entry, &tips);
         let previous_commit = previous.as_ref().map(|(_, commit)| commit.clone());
+        // A dated cut takes a name that sorts after the newest release: the reap
+        // that follows every dated cut keeps only the newest name, so any other
+        // name would be created and taken straight back as superseded in the
+        // same command, reported as a success that left nothing behind.
+        if let Some((previous_ref, _)) = &previous
+            && matches!(scheme, ReleaseScheme::Dated)
+            && release_order(&name) <= release_order(previous_ref.branch().as_str())
+        {
+            println!(
+                "{repo}: refusing to cut {name}: {} is the newest release, so a dated cut takes a name that sorts after it (the reap after a cut keeps only the newest name)",
+                previous_ref.branch()
+            );
+            return Ok(Exit::Incomplete);
+        }
         // A cut is a new name for the composition in hand, never a recomputation:
         // with a previous release its parents are carried verbatim — nothing joins,
         // nothing advances, and a branch enters through `release include`. Only the
@@ -134,9 +148,8 @@ pub(crate) fn run_release(
         // A verbatim cut under a new dated name is then the only editable
         // composition, so it is allowed and says why; the edits and the re-pin
         // follow it. The name has to be genuinely new: a fixed branch has no
-        // other name to take, and a dated name that does not sort after the
-        // previous cut is either that cut's own name or one the reap that
-        // follows every dated cut would take straight back as superseded.
+        // other name to take (a dated name that does not sort after the previous
+        // cut was refused above).
         if let Some((previous_ref, _)) = &previous {
             let publish_remote = entry.publish_remote();
             let published = tips.get(&BookmarkRef::Remote {
@@ -147,7 +160,6 @@ pub(crate) fn run_release(
                 && candidate.matches(published.as_str())?
             {
                 let frozen_previous = matches!(scheme, ReleaseScheme::Dated)
-                    && release_order(&name) > release_order(previous_ref.branch().as_str())
                     && release::repair_effect(&pins, previous_ref.branch())
                         == release::RepairEffect::NewDatedName;
                 if frozen_previous {

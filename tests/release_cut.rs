@@ -689,32 +689,56 @@ fn an_identical_cut_is_still_refused_when_a_consumer_follows_the_previous_cut() 
     assert!(!has_release(&lab, "release/2026-08-05"));
 }
 
+fn assert_refused_as_not_newest(output: &std::process::Output, name: &str) {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        output.status.code(),
+        Some(i32::from(knives::cli::Exit::Incomplete.code())),
+        "{name}: {stdout}"
+    );
+    assert!(
+        stdout.contains(&format!(
+            "demo: refusing to cut {name}: release/2026-08-04 is the newest release, so a dated cut takes a name that sorts after it (the reap after a cut keeps only the newest name)\n"
+        )),
+        "{name}: {stdout}"
+    );
+}
+
 #[test]
-fn an_identical_cut_under_a_name_not_newer_than_the_frozen_previous_cut_is_refused() {
-    // Given: the published cut every pin freezes. Only a name that sorts after
-    // it becomes the release in hand: its own name has nowhere to move, and an
-    // older name would be reaped as superseded by the cut that created it.
+fn a_dated_cut_refuses_a_name_that_does_not_sort_after_the_newest_release() {
+    // Given: a published cut a consumer follows, then a third branch included
+    // locally, so the composition in hand differs from anything published.
+    let (lab, home) = published_release_pinned("branch = \"release/2026-08-04\"");
+    lab.branch("feat/gamma", "gamma.txt", "gamma\n");
+    let included = knives_release(&lab, &home, &["include", "feat/gamma"]);
+    assert!(included.status.success(), "{included:?}");
+    let edited = commit_at(&lab, "release/2026-08-04");
+
+    for name in ["release/2026-08-04", "release/2026-08-03"] {
+        // When: a name that does not sort after the newest release is asked for.
+        let cut = knives_release(&lab, &home, &["cut", name]);
+
+        // Then: refused before anything is built; the reap that follows a cut
+        // would have taken the new name straight back.
+        assert_refused_as_not_newest(&cut, name);
+    }
+    assert!(!has_release(&lab, "release/2026-08-03"));
+    assert_eq!(commit_at(&lab, "release/2026-08-04"), edited);
+}
+
+#[test]
+fn an_identical_cut_under_the_frozen_previous_cuts_own_or_an_older_name_is_refused() {
+    // Given: the published cut every pin freezes — the state whose identical
+    // cut is admitted under a newer name.
     let (lab, home) = published_release_pinned("rev = \"release/2026-08-04\"");
     let published = commit_at(&lab, "release/2026-08-04@origin");
 
     for name in ["release/2026-08-04", "release/2026-08-03"] {
-        // When: that name is asked for with nothing changed.
+        // When: the cut's own name or an older one is asked for, nothing changed.
         let cut = knives_release(&lab, &home, &["cut", name]);
 
-        // Then: the frozen-pin exception does not apply; refused as identical.
-        let stdout = String::from_utf8_lossy(&cut.stdout);
-        assert_eq!(
-            cut.status.code(),
-            Some(i32::from(knives::cli::Exit::Incomplete.code())),
-            "{name}: {stdout}"
-        );
-        assert!(
-            stdout.contains(&format!(
-                "demo: refusing to cut {name}: identical to release/2026-08-04@origin ({}); nothing to cut\n",
-                published.short()
-            )),
-            "{name}: {stdout}"
-        );
+        // Then: the name is refused before the frozen-pin exception can admit it.
+        assert_refused_as_not_newest(&cut, name);
     }
     assert!(!has_release(&lab, "release/2026-08-03"));
     assert_eq!(commit_at(&lab, "release/2026-08-04"), published);
