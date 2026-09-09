@@ -14,7 +14,7 @@ use knives::ids::{BookmarkRef, ReleaseScheme, RemoteName, RepoName};
 use knives::ledger::{Draft, Kind, Ledger};
 use knives::release_model::{
     RecordedCut, StackedHistoryContext, carried_branches, last_recorded_cut, members_event_text,
-    previous_release_for_cut, trunk_positions,
+    previous_release_for_cut, release_order, trunk_positions,
 };
 
 use super::release_edit::recorded_parents;
@@ -56,7 +56,7 @@ pub(crate) fn run_release(
         Ok(request) => request,
         Err(exit) => return Ok(exit),
     };
-    let (mut worst, previous_effect) = release_plan_exit(
+    let (mut worst, pins) = release_plan_exit(
         fork,
         &locals,
         &opened,
@@ -77,11 +77,6 @@ pub(crate) fn run_release(
             return Ok(exit);
         }
         let tips = opened.bookmark_tips()?;
-        // `previous_effect` was judged for the plan's release in hand, which the
-        // plan selects with the same `newest_release` over its own tips read.
-        // The two reads are not one transaction: a jj operation landing between
-        // them could pair one release's effect with another's comparison. A cut
-        // runs on a checkout nothing else is editing, so the reads agree.
         let previous = previous_release_for_cut(entry, &tips);
         let previous_commit = previous.as_ref().map(|(_, commit)| commit.clone());
         // A cut is a new name for the composition in hand, never a recomputation:
@@ -136,8 +131,12 @@ pub(crate) fn run_release(
         // The one exception is a previous release every consumer pins by
         // revision: `include`, `drop`, `advance` and `rebase` all refuse to edit
         // it, because the edit would reach nobody, and send the operator here.
-        // A verbatim cut under a new name is then the only editable composition,
-        // so it is allowed and says why; the edits and the re-pin follow it.
+        // A verbatim cut under a new dated name is then the only editable
+        // composition, so it is allowed and says why; the edits and the re-pin
+        // follow it. The name has to be genuinely new: a fixed branch has no
+        // other name to take, and a dated name that does not sort after the
+        // previous cut is either that cut's own name or one the reap that
+        // follows every dated cut would take straight back as superseded.
         if let Some((previous_ref, _)) = &previous {
             let publish_remote = entry.publish_remote();
             let published = tips.get(&BookmarkRef::Remote {
@@ -147,9 +146,13 @@ pub(crate) fn run_release(
             if let Some(published) = published
                 && candidate.matches(published.as_str())?
             {
-                if previous_effect == Some(release::RepairEffect::NewDatedName) {
+                let frozen_previous = matches!(scheme, ReleaseScheme::Dated)
+                    && release_order(&name) > release_order(previous_ref.branch().as_str())
+                    && release::repair_effect(&pins, previous_ref.branch())
+                        == release::RepairEffect::NewDatedName;
+                if frozen_previous {
                     println!(
-                        "{repo}: {name} starts identical to {}@{publish_remote} ({}); every pin of {} is frozen, so this new name is the composition to edit — `include`, `advance` or `drop` it before pushing",
+                        "{repo}: {name} starts identical to {}@{publish_remote} ({}); every pin of {} is frozen, so this new name is the composition to edit — `include`, `advance`, `drop` or `rebase` it before pushing",
                         previous_ref.branch(),
                         published.short(),
                         previous_ref.branch()
@@ -230,10 +233,10 @@ fn requested_cut(
     }
 }
 
-/// The plan's exit, and how a repair of the release in hand would reach its
-/// consumers. The cut needs the second answer: when every pin of the previous
-/// release is frozen, a new dated name is the only editable composition, so
-/// the identical-composition refusal must stand down for it.
+/// The plan's exit, and the consumer pins it scanned. The cut judges the pins
+/// itself, against the release it compares the candidate with: when every pin
+/// of that release is frozen, a new dated name is the only editable
+/// composition, so the identical-composition refusal must stand down for it.
 #[allow(
     clippy::too_many_arguments,
     reason = "the release plan needs explicit repository state and each independently owned consumer-scan collaborator"
@@ -245,7 +248,7 @@ fn release_plan_exit(
     forge: &dyn knives::consumer_pins::ConsumerPinSource,
     cache_root: Option<&std::path::Path>,
     heads: &knives::consumer_pins::ConsumerHeadMemo,
-) -> anyhow::Result<(Exit, Option<release::RepairEffect>)> {
+) -> anyhow::Result<(Exit, Vec<knives::pins::Pin>)> {
     let entry = fork.entry;
     let consumers = release::ConsumerInputs {
         slugs: &entry.consumers,
@@ -262,11 +265,7 @@ fn release_plan_exit(
         println!("  !! {lag}");
         exit = exit.worst(Exit::Findings);
     }
-    let effect = plan
-        .release
-        .as_deref()
-        .map(|release| release::repair_effect(&plan.pins, BookmarkRef::parse(release).branch()));
-    Ok((exit, effect))
+    Ok((exit, plan.pins))
 }
 
 /// Say what the audit found; refuse when it failed.

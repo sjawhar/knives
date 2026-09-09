@@ -588,82 +588,86 @@ fn a_cut_identical_to_the_published_previous_cut_is_refused() {
     );
 }
 
+/// A two-member `release/2026-08-04`, cut by hand, pushed to origin and fetched
+/// back, with a consumer whose current pin is `origin_pin`. The consumer's
+/// checkout content is never scanned (pins are read at its origin trunk), so
+/// only `origin_pin` decides how the release is pinned.
+fn published_release_pinned(origin_pin: &str) -> (Lab, tempfile::TempDir) {
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    lab.octopus("release/2026-08-04", "feat/alpha", "feat/beta");
+    lab.push_branch("release/2026-08-04");
+    lab.fetch_work();
+    let (home, _consumer) =
+        release_test_home_pinned(&lab, "branch = \"release/2026-08-03\"", origin_pin);
+    (lab, home)
+}
+
+fn has_release(lab: &Lab, name: &str) -> bool {
+    Repo::open(&lab.work)
+        .expect("reopen")
+        .bookmark_tips()
+        .expect("tips")
+        .keys()
+        .any(|reference| reference.branch().as_str() == name)
+}
+
 #[test]
 fn an_identical_cut_is_allowed_when_every_pin_of_the_previous_cut_is_frozen() {
     // Given: a published cut that a consumer pins by revision. The edit verbs
     // refuse to touch it (editing in place reaches nobody) and point at a new
     // dated cut; a verbatim cut under the new name is therefore the only way
     // to obtain an editable composition, and must not be refused as identical.
-    let lab = Lab::new();
-    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
-    lab.branch("feat/beta", "beta.txt", "beta\n");
-    lab.octopus("release/2026-08-04", "feat/alpha", "feat/beta");
-    lab.jj_work([
-        "git",
-        "push",
-        "--remote",
-        "origin",
-        "--bookmark",
-        "release/2026-08-04",
-    ]);
-    lab.fetch_work();
+    let (lab, home) = published_release_pinned("rev = \"release/2026-08-04\"");
     lab.branch("feat/gamma", "gamma.txt", "gamma\n");
-    let (home, _consumer) = release_test_home_pinned(
-        &lab,
-        "rev = \"release/2026-08-03\"",
-        "rev = \"release/2026-08-04\"",
-    );
     let refused = knives_release(&lab, &home, &["include", "feat/gamma"]);
     assert_eq!(refused.status.code(), Some(3), "{refused:?}");
+    let published = commit_at(&lab, "release/2026-08-04@origin");
+    let mut carried = release_parents(&lab, "release/2026-08-04");
+    carried.sort();
 
     // When: the new dated name the refusal asked for is cut, verbatim.
     let cut = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
 
-    // Then: it is named, says why an identical composition was allowed, and
-    // the new name (which nothing pins) takes the edit the old one refused.
+    // Then: it is named with the previous composition, says why an identical
+    // composition was allowed, supersedes the pinned cut, and takes the edit
+    // the old name refused.
     let stdout = String::from_utf8_lossy(&cut.stdout);
-    assert!(cut.status.success(), "{stdout}");
-    assert!(
-        stdout.contains("starts identical to release/2026-08-04@origin")
-            && stdout.contains("every pin of release/2026-08-04 is frozen"),
+    assert_eq!(
+        cut.status.code(),
+        Some(i32::from(knives::cli::Exit::Ok.code())),
         "{stdout}"
     );
-    let before = release_parents(&lab, "release/2026-08-05");
+    assert!(
+        stdout.contains(&format!(
+            "demo: release/2026-08-05 starts identical to release/2026-08-04@origin ({}); every pin of release/2026-08-04 is frozen, so this new name is the composition to edit — `include`, `advance`, `drop` or `rebase` it before pushing\n",
+            published.short()
+        )),
+        "{stdout}"
+    );
+    let mut parents = release_parents(&lab, "release/2026-08-05");
+    parents.sort();
+    assert_eq!(parents, carried, "{stdout}");
+    assert!(stdout.contains("reaped release/2026-08-04"), "{stdout}");
+    assert!(!has_release(&lab, "release/2026-08-04"), "{stdout}");
     let included = knives_release(&lab, &home, &["include", "feat/gamma"]);
     let included_stdout = String::from_utf8_lossy(&included.stdout);
     assert!(included.status.success(), "{included_stdout}");
-    assert_eq!(
-        release_parents(&lab, "release/2026-08-05").len(),
-        before.len() + 1,
-        "{included_stdout}"
-    );
+    let mut parents = release_parents(&lab, "release/2026-08-05");
+    parents.sort();
+    carried.push(commit_at(&lab, "feat/gamma"));
+    carried.sort();
+    assert_eq!(parents, carried, "{included_stdout}");
 }
 
 #[test]
 fn an_identical_cut_is_still_refused_when_a_consumer_follows_the_previous_cut() {
-    // Given: the same published cut, but its current consumer follows the
-    // branch (`branch =`), with an older frozen pin only in its history. A
-    // repair reaches that consumer in place, so a verbatim cut under a new
-    // name would ship nothing: the frozen exception must key on the pins of
-    // the release being compared against, not on any frozen pin in sight.
-    let lab = Lab::new();
-    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
-    lab.branch("feat/beta", "beta.txt", "beta\n");
-    lab.octopus("release/2026-08-04", "feat/alpha", "feat/beta");
-    lab.jj_work([
-        "git",
-        "push",
-        "--remote",
-        "origin",
-        "--bookmark",
-        "release/2026-08-04",
-    ]);
-    lab.fetch_work();
-    let (home, _consumer) = release_test_home_pinned(
-        &lab,
-        "rev = \"release/2026-08-03\"",
-        "branch = \"release/2026-08-04\"",
-    );
+    // Given: the same published cut, but its consumer follows the branch
+    // (`branch =`), so a repair reaches it in place and a verbatim cut under a
+    // new name would ship nothing.
+    let (lab, home) = published_release_pinned("branch = \"release/2026-08-04\"");
+    let published = commit_at(&lab, "release/2026-08-04@origin");
 
     // When: a new name is asked for with nothing changed.
     let cut = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
@@ -676,20 +680,44 @@ fn an_identical_cut_is_still_refused_when_a_consumer_follows_the_previous_cut() 
         "{stdout}"
     );
     assert!(
-        stdout.contains(
-            "demo: refusing to cut release/2026-08-05: identical to release/2026-08-04@origin ("
-        ),
+        stdout.contains(&format!(
+            "demo: refusing to cut release/2026-08-05: identical to release/2026-08-04@origin ({}); nothing to cut\n",
+            published.short()
+        )),
         "{stdout}"
     );
-    let tips = Repo::open(&lab.work)
-        .expect("reopen")
-        .bookmark_tips()
-        .expect("tips");
-    assert!(
-        !tips
-            .keys()
-            .any(|reference| reference.branch().as_str() == "release/2026-08-05")
-    );
+    assert!(!has_release(&lab, "release/2026-08-05"));
+}
+
+#[test]
+fn an_identical_cut_under_a_name_not_newer_than_the_frozen_previous_cut_is_refused() {
+    // Given: the published cut every pin freezes. Only a name that sorts after
+    // it becomes the release in hand: its own name has nowhere to move, and an
+    // older name would be reaped as superseded by the cut that created it.
+    let (lab, home) = published_release_pinned("rev = \"release/2026-08-04\"");
+    let published = commit_at(&lab, "release/2026-08-04@origin");
+
+    for name in ["release/2026-08-04", "release/2026-08-03"] {
+        // When: that name is asked for with nothing changed.
+        let cut = knives_release(&lab, &home, &["cut", name]);
+
+        // Then: the frozen-pin exception does not apply; refused as identical.
+        let stdout = String::from_utf8_lossy(&cut.stdout);
+        assert_eq!(
+            cut.status.code(),
+            Some(i32::from(knives::cli::Exit::Incomplete.code())),
+            "{name}: {stdout}"
+        );
+        assert!(
+            stdout.contains(&format!(
+                "demo: refusing to cut {name}: identical to release/2026-08-04@origin ({}); nothing to cut\n",
+                published.short()
+            )),
+            "{name}: {stdout}"
+        );
+    }
+    assert!(!has_release(&lab, "release/2026-08-03"));
+    assert_eq!(commit_at(&lab, "release/2026-08-04"), published);
 }
 
 #[test]
@@ -877,6 +905,41 @@ fn a_fixed_scheme_cut_identical_to_its_published_position_is_refused() {
 }
 
 #[test]
+fn a_fixed_scheme_cut_identical_to_its_published_position_is_refused_when_every_pin_is_frozen() {
+    // Given: a fixed release branch, cut and pushed, that its only consumer
+    // freezes by revision. A dated release in that state escapes through a new
+    // dated name; a fixed branch has no other name to take, so the identical
+    // cut stays refused and the remedy stays the edit verbs' fixed-scheme one.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let home = fixed_scheme_home_pinned(&lab, "rev = \"integration\"");
+    let first = knives_release(&lab, &home, &["cut"]);
+    assert!(first.status.success(), "{first:?}");
+    lab.push_branch("integration");
+    lab.fetch_work();
+    let published = commit_at(&lab, "integration@origin");
+
+    // When: the fixed branch is cut again with nothing changed.
+    let second = knives_release(&lab, &home, &["cut"]);
+
+    // Then: refused as identical; the bookmark stays where it was published.
+    let stdout = String::from_utf8_lossy(&second.stdout);
+    assert_eq!(
+        second.status.code(),
+        Some(i32::from(knives::cli::Exit::Incomplete.code())),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(&format!(
+            "demo: refusing to cut integration: identical to integration@origin ({}); nothing to cut\n",
+            published.short()
+        )),
+        "{stdout}"
+    );
+    assert_eq!(commit_at(&lab, "integration"), published);
+}
+
+#[test]
 fn a_named_cut_with_an_inconclusive_content_audit_returns_findings() {
     // Given: two members entangled in one file, so the cut is conflicted from birth
     // and every member's replay onto it answers nothing either way.
@@ -1016,9 +1079,8 @@ fn a_discarded_candidate_leaves_no_trace() {
     );
 }
 
-/// Registry home with `demo` on the fixed `integration` release branch, and the
-/// local consumer the release command reads.
-fn fixed_scheme_home(lab: &Lab) -> (tempfile::TempDir, tempfile::TempDir) {
+/// Registry home with `demo` on the fixed `integration` release branch.
+fn fixed_scheme_registry(lab: &Lab) -> tempfile::TempDir {
     let home = tempfile::tempdir().expect("create config home");
     std::fs::write(
         home.path().join("repos.toml"),
@@ -1028,6 +1090,13 @@ fn fixed_scheme_home(lab: &Lab) -> (tempfile::TempDir, tempfile::TempDir) {
         ),
     )
     .expect("write fixed-scheme registry");
+    home
+}
+
+/// [`fixed_scheme_registry`] plus an empty local consumer the release command
+/// reads: nothing pins the fixed branch.
+fn fixed_scheme_home(lab: &Lab) -> (tempfile::TempDir, tempfile::TempDir) {
+    let home = fixed_scheme_registry(lab);
     let consumer = tempfile::tempdir().expect("create local consumer");
     std::fs::write(
         home.path().join("local-consumer"),
@@ -1035,6 +1104,27 @@ fn fixed_scheme_home(lab: &Lab) -> (tempfile::TempDir, tempfile::TempDir) {
     )
     .expect("write local consumer fixture path");
     (home, consumer)
+}
+
+/// [`fixed_scheme_registry`] plus a local consumer whose current pin is `pin`
+/// (`branch = "…"` follows the fixed branch, `rev = "…"` freezes on it).
+fn fixed_scheme_home_pinned(lab: &Lab, pin: &str) -> tempfile::TempDir {
+    let home = fixed_scheme_registry(lab);
+    let consumer = lab.consumer_with_pin_history(
+        "pyproject.toml",
+        &format!(
+            "# checkout pin\nwork = {{ git = \"https://forge.invalid/acme/work.git\", {pin} }}\n"
+        ),
+        &format!(
+            "# origin pin\nwork = {{ git = \"https://forge.invalid/acme/work.git\", {pin} }}\n"
+        ),
+    );
+    std::fs::write(
+        home.path().join("local-consumer"),
+        consumer.display().to_string(),
+    )
+    .expect("write local consumer fixture path");
+    home
 }
 
 #[test]
