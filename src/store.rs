@@ -20,6 +20,7 @@ use crate::ids::{BranchTarget, RepoName, Requirement};
 use crate::lock::{FileLock, LockError, LockWait};
 
 use crate::commands::claim::Identity;
+use crate::commands::sync::ForgeState;
 pub fn default_state_path() -> PathBuf {
     default_config_path().with_file_name("state.json")
 }
@@ -371,13 +372,24 @@ impl Store {
             .insert(number.to_string(), sha.to_owned());
     }
 
-    pub fn record_pull_state(&mut self, repo: &RepoName, number: u64, state: &str) {
+    /// Record where the forge said a pull request stands. The parameter type is
+    /// the invariant: a record is a forge state, never the transition sync
+    /// classified from it.
+    pub fn record_pull_state(&mut self, repo: &RepoName, number: u64, state: ForgeState) {
         let _ = self
             .state
             .pull_states
-            .insert(format!("{repo}#{number}"), state.to_owned());
+            .insert(format!("{repo}#{number}"), state.as_recorded().to_owned());
     }
 
+    /// Drop a record this version cannot read, so its problem is reported once.
+    pub fn forget_pull_state(&mut self, repo: &RepoName, number: u64) {
+        let _ = self.state.pull_states.remove(&format!("{repo}#{number}"));
+    }
+
+    /// The recorded state as the file spells it: `record_pull_state` writes a
+    /// forge state, but a file an earlier version wrote may spell otherwise, and
+    /// the reader decides what that means.
     pub fn pull_state(&self, repo: &RepoName, number: u64) -> Option<&str> {
         self.state
             .pull_states
@@ -634,13 +646,13 @@ mod tests {
         let path = dir.path().join("state.json");
         {
             let mut subject = Store::open_for_update(path.clone()).unwrap();
-            subject.record_pull_state(&RepoName::new("a-repo"), 7, "merged");
+            subject.record_pull_state(&RepoName::new("a-repo"), 7, ForgeState::Merged);
             subject.save().unwrap();
         }
         let subject = Store::open(path).unwrap();
         assert_eq!(
             subject.pull_state(&RepoName::new("a-repo"), 7),
-            Some("merged")
+            Some("MERGED")
         );
         assert_eq!(subject.pull_state(&RepoName::new("other-repo"), 7), None);
     }

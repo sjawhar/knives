@@ -262,6 +262,8 @@ Fetches every remote and every tracked pull request head, then classifies what h
 
 Running `sync` with no arguments inside a managed repository selects that repository. Outside any managed repository, it asks for a repository name or `--all`.
 
+The last forge state seen lives in state as `pull_states`, keyed `<repo>#<number>`, and every forge-backed run rewrites it. A record that spells a transition instead (`new`, `advanced`, `unchanged` — what an earlier knives wrote there) is read as open, and a forge-backed run replaces it and says so once for the whole run: `#<n> \`<label>\`, …: the transition an earlier knives recorded where the forge state belongs; read as open`. A record in nobody's spelling is a problem (`recorded state of #<n> unreadable: …`, exit 3), but the row is still classified and recorded and the record is dropped, so the problem is said once, not on every run.
+
 `sync` also checks for new comment activity on open tracked pull requests. When a pull request has comments newer than the last sync mark, it prints a note: `#<n> has comment activity newer than the last sync`. Agents can grep for this exact string. Activity goes to notes (exit 0, informational). A comment query failure goes to problems (exit 3). `--no-github` skips pull-request and comment lookups while retaining local fetch and head checks.
 
 Checking comments costs one extra forge call per open tracked pull request. The mark lives in state as `comment_marks`, keyed `<repo>#<number>`, and advances forward. The first time a pull request is seen, the mark is recorded silently without printing a note, avoiding noise on first run. Edited comments are invisible because the forge `createdAt` timestamp does not move on edit.
