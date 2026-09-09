@@ -63,7 +63,7 @@ impl ForgeState {
     }
 
     /// The token the state file records: the forge's own spelling.
-    const fn as_recorded(self) -> &'static str {
+    pub(crate) const fn as_recorded(self) -> &'static str {
         match self {
             Self::Open => "OPEN",
             Self::Merged => "MERGED",
@@ -95,6 +95,39 @@ impl fmt::Display for ForgeState {
             Self::Merged => "merged",
             Self::Closed => "closed",
         })
+    }
+}
+
+/// What a `pull_states` record says.
+///
+/// The record is the forge's own state, except one written before knives#58
+/// (2026-09-02), which held the transition sync had classified. `merged` and
+/// `closed` spell a forge state either way. `new`, `advanced` and `unchanged`
+/// do not: that version read `merged`/`closed` off the forge and substituted
+/// `OPEN` when no forge was asked, so a transition label was only ever written
+/// for a pull request that run believed open, and it reads as open here.
+/// `reopened` never reached a record: that classification arrived with the
+/// forge-state record. Anything else is nobody's spelling and an error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecordedState {
+    Forge(ForgeState),
+    /// A transition label, spelled as the file spells it.
+    Legacy(&'static str),
+}
+
+impl std::str::FromStr for RecordedState {
+    type Err = String;
+
+    fn from_str(record: &str) -> Result<Self, Self::Err> {
+        match record.parse::<ForgeState>() {
+            Ok(state) => Ok(Self::Forge(state)),
+            Err(error) => match record {
+                "new" => Ok(Self::Legacy("new")),
+                "advanced" => Ok(Self::Legacy("advanced")),
+                "unchanged" => Ok(Self::Legacy("unchanged")),
+                _ => Err(error),
+            },
+        }
     }
 }
 
@@ -305,7 +338,7 @@ fn record_transition_event(
         )?;
     }
     if let Some(forge_state) = transition.forge_state {
-        store.record_pull_state(scribe.repo(), transition.number, forge_state.as_recorded());
+        store.record_pull_state(scribe.repo(), transition.number, forge_state);
     }
     Ok(())
 }
@@ -320,10 +353,31 @@ struct TrackingInput<'a, 'snapshot> {
     store: &'a mut Store,
 }
 
+/// One note naming every pull request whose record an earlier knives wrote and
+/// this run replaced.
+///
+/// One note per pull request would repeat the same explanation dozens of times
+/// on the first forge-backed sync after upgrading, and that sync is the only
+/// one that sees them: it records the forge's state over each.
+fn legacy_records_note(records: &[(u64, &str)]) -> Option<String> {
+    if records.is_empty() {
+        return None;
+    }
+    let listed: Vec<String> = records
+        .iter()
+        .map(|(number, label)| format!("#{number} `{label}`"))
+        .collect();
+    Some(format!(
+        "{}: the transition an earlier knives recorded where the forge state belongs; read as open",
+        listed.join(", ")
+    ))
+}
+
 fn record_tracked_pulls(
     input: TrackingInput<'_, '_>,
     report: &mut Report,
 ) -> Result<(), crate::ledger::LedgerError> {
+    let mut legacy_records = Vec::new();
     for (number, label) in input.tracked {
         let fact = input.snapshot.and_then(|snapshot| snapshot.fact(number));
         if input.snapshot.is_some() && fact.is_none() {
@@ -357,17 +411,31 @@ fn record_tracked_pulls(
             }
             None => None,
         };
+        // A legacy label reads as open, and is noted when a forge answered:
+        // only then does this run's record replace it, and a run without one
+        // classifies by head movement whatever the record said. A record this
+        // version cannot read is a problem, not a reason to skip the row —
+        // skipping left the record in place, so the same problem repeated on
+        // every run — and is dropped, so the problem is said once and a
+        // forge-backed run records its own state in its place.
         let previous_state = match input
             .store
             .pull_state(input.scribe.repo(), number)
-            .map(str::parse::<ForgeState>)
+            .map(str::parse::<RecordedState>)
         {
-            Some(Ok(state)) => Some(state),
+            Some(Ok(RecordedState::Forge(state))) => Some(state),
+            Some(Ok(RecordedState::Legacy(label))) => {
+                if forge_state.is_some() {
+                    legacy_records.push((number, label));
+                }
+                Some(ForgeState::Open)
+            }
             Some(Err(error)) => {
                 report
                     .problems
                     .push(format!("recorded state of #{number} unreadable: {error}"));
-                continue;
+                input.store.forget_pull_state(input.scribe.repo(), number);
+                None
             }
             None => None,
         };
@@ -416,6 +484,7 @@ fn record_tracked_pulls(
             }
         }
     }
+    report.notes.extend(legacy_records_note(&legacy_records));
     Ok(())
 }
 
@@ -660,6 +729,56 @@ mod tests {
                 sighting("a", Some("OPEN"))
             ),
             PullState::Unchanged
+        );
+    }
+
+    #[test]
+    fn a_head_recorded_without_a_state_is_a_prior_sighting_while_open() {
+        // A record this version could not read leaves the head alone, as a run
+        // without the forge does: settling and moving are still transitions,
+        // and neither is a first sighting.
+        assert_eq!(
+            classify_pull(recorded(Some("a"), None), sighting("a", Some("MERGED"))),
+            PullState::Merged
+        );
+        assert_eq!(
+            classify_pull(recorded(Some("a"), None), sighting("b", Some("OPEN"))),
+            PullState::Advanced
+        );
+    }
+
+    #[test]
+    fn a_settled_pull_request_the_forge_calls_open_again_is_reopened() {
+        assert_eq!(
+            classify_pull(
+                recorded(Some("a"), Some("MERGED")),
+                sighting("a", Some("OPEN"))
+            ),
+            PullState::Reopened
+        );
+        assert_eq!(
+            transition_text(9, PullState::Reopened, "head-9").as_deref(),
+            Some("#9 reopened")
+        );
+    }
+
+    #[test]
+    fn every_record_an_earlier_knives_wrote_reads_as_a_forge_state_or_a_legacy_label() {
+        // The set is closed: the version that recorded transitions had exactly
+        // these labels, and `merged`/`closed` already spell a forge state.
+        for (record, expected) in [
+            ("new", RecordedState::Legacy("new")),
+            ("advanced", RecordedState::Legacy("advanced")),
+            ("unchanged", RecordedState::Legacy("unchanged")),
+            ("merged", RecordedState::Forge(ForgeState::Merged)),
+            ("closed", RecordedState::Forge(ForgeState::Closed)),
+            ("OPEN", RecordedState::Forge(ForgeState::Open)),
+        ] {
+            assert_eq!(record.parse::<RecordedState>(), Ok(expected), "{record}");
+        }
+        assert_eq!(
+            "reopened".parse::<RecordedState>(),
+            Err("`reopened` is not a pull request state".to_owned())
         );
     }
 
@@ -1334,7 +1453,7 @@ mod comment_activity_tests {
         // A first sighting of a closed pull is `New`, not `Closed` (that
         // history belongs to the forge). Seed a prior open state so this
         // sync observes the open-to-closed transition under test.
-        store.record_pull_state(&repo_name, 42, "OPEN");
+        store.record_pull_state(&repo_name, 42, ForgeState::Open);
 
         let report = sync_repo(SyncInput {
             fork: &fork,
@@ -1567,5 +1686,254 @@ mod comment_activity_tests {
             Some(&PullState::Advanced),
             "was: {report:?}"
         );
+    }
+
+    /// A state file an earlier knives left: `pull_states` spelled as this
+    /// version's writer cannot spell them, beside the heads that run saw.
+    fn write_state_left_by_an_earlier_knives(
+        path: &Path,
+        heads: &[(u64, &str)],
+        states: &[(u64, &str)],
+    ) {
+        let heads: serde_json::Map<String, serde_json::Value> = heads
+            .iter()
+            .map(|(number, head)| (number.to_string(), serde_json::Value::from(*head)))
+            .collect();
+        let states: serde_json::Map<String, serde_json::Value> = states
+            .iter()
+            .map(|(number, state)| {
+                (
+                    format!("test-repo#{number}"),
+                    serde_json::Value::from(*state),
+                )
+            })
+            .collect();
+        let state = serde_json::json!({
+            "pull_heads": { "test-repo": heads },
+            "pull_states": states,
+        });
+        std::fs::write(path, serde_json::to_vec(&state).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn legacy_transition_records_read_as_open_and_are_replaced_by_the_forge_state() {
+        let _lock = crate::config::test_support::environment_lock();
+        let temp = TempDir::new().unwrap();
+        let store_path = temp.path().join("state.json");
+        let repo_name = RepoName::new("test-repo");
+        let entry = local_entry(&temp);
+        let fork = Fork::at("test-repo", &entry, &temp.path().join("work"));
+        let scribe = test_scribe(&temp, &repo_name);
+        let ledger = crate::ledger::Ledger::at(temp.path().join("ledger"));
+        let (_branch, mut settled) = test_pull(42, "feat/alpha");
+        settled.state = "CLOSED".to_owned();
+        let (_branch, still_open) = test_pull(43, "feat/beta");
+        let forge = ErroringForge {
+            pull_requests: vec![settled, still_open],
+            newest_comments: BTreeMap::new(),
+            error_on_comment: None,
+        };
+        // Given: records written by a knives that stored the transition it
+        // classified rather than the forge's state, both for pull requests
+        // that run believed open.
+        write_state_left_by_an_earlier_knives(
+            &store_path,
+            &[(42, "aaaa"), (43, "aaaa")],
+            &[(42, "unchanged"), (43, "advanced")],
+        );
+        let mut store = Store::open_for_update(store_path).unwrap();
+
+        let report = sync_repo(SyncInput {
+            fork: &fork,
+            store: &mut store,
+            forge: Some(&forge),
+            scribe: &scribe,
+            cache: None,
+        })
+        .unwrap();
+
+        // Then: the one that settled reports closed and the one still open
+        // reports unchanged — read as settled it would report reopened — both
+        // records are replaced, and the reading is one note, not a problem.
+        assert_eq!(
+            report
+                .rows
+                .iter()
+                .map(|row| (row.number, row.state))
+                .collect::<Vec<_>>(),
+            vec![(42, PullState::Closed), (43, PullState::Unchanged)],
+            "was: {report:?}"
+        );
+        assert!(report.problems.is_empty(), "was: {report:?}");
+        let legacy: Vec<&String> = report
+            .notes
+            .iter()
+            .filter(|note| note.contains("an earlier knives recorded"))
+            .collect();
+        assert_eq!(legacy.len(), 1, "was: {report:?}");
+        assert!(
+            legacy.first().is_some_and(|note| {
+                note.contains("#42 `unchanged`") && note.contains("#43 `advanced`")
+            }),
+            "was: {legacy:?}"
+        );
+        assert_eq!(store.pull_state(&repo_name, 42), Some("CLOSED"));
+        assert_eq!(store.pull_state(&repo_name, 43), Some("OPEN"));
+        let events = ledger.entries().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["#42 closed"],
+            "was: {events:?}"
+        );
+    }
+
+    #[test]
+    fn a_legacy_record_without_a_head_is_a_prior_sighting_not_a_first_one() {
+        let _lock = crate::config::test_support::environment_lock();
+        let temp = TempDir::new().unwrap();
+        let store_path = temp.path().join("state.json");
+        let repo_name = RepoName::new("test-repo");
+        let entry = local_entry(&temp);
+        let fork = Fork::at("test-repo", &entry, &temp.path().join("work"));
+        let scribe = test_scribe(&temp, &repo_name);
+        let ledger = crate::ledger::Ledger::at(temp.path().join("ledger"));
+        let (_branch, mut pull_request) = test_pull(42, "feat/alpha");
+        pull_request.state = "MERGED".to_owned();
+        let forge = ErroringForge {
+            pull_requests: vec![pull_request],
+            newest_comments: BTreeMap::new(),
+            error_on_comment: None,
+        };
+        // Given: a legacy record alone, the shape a hand-written state file
+        // takes. With no head to fall back on, the record is the only evidence
+        // that this pull request was seen before.
+        write_state_left_by_an_earlier_knives(&store_path, &[], &[(42, "unchanged")]);
+        let mut store = Store::open_for_update(store_path).unwrap();
+
+        let report = sync_repo(SyncInput {
+            fork: &fork,
+            store: &mut store,
+            forge: Some(&forge),
+            scribe: &scribe,
+            cache: None,
+        })
+        .unwrap();
+
+        // Then: it settled since that sighting, which is a transition, not the
+        // silent first sighting an unrecorded pull request would be.
+        assert_eq!(
+            report.rows.first().map(|row| &row.state),
+            Some(&PullState::Merged),
+            "was: {report:?}"
+        );
+        assert_eq!(store.pull_state(&repo_name, 42), Some("MERGED"));
+        let events = ledger.entries().unwrap();
+        assert_eq!(
+            events.first().map(|event| event.text.as_str()),
+            Some("#42 merged"),
+            "was: {events:?}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_recorded_state_is_a_problem_that_still_records_the_head_and_state() {
+        let _lock = crate::config::test_support::environment_lock();
+        let temp = TempDir::new().unwrap();
+        let store_path = temp.path().join("state.json");
+        let repo_name = RepoName::new("test-repo");
+        let entry = local_entry(&temp);
+        let fork = Fork::at("test-repo", &entry, &temp.path().join("work"));
+        let (_branch, pull_request) = test_pull(42, "feat/alpha");
+        let forge = ErroringForge {
+            pull_requests: vec![pull_request],
+            newest_comments: BTreeMap::new(),
+            error_on_comment: None,
+        };
+        // Given: a record in a spelling no version of knives ever wrote, on a
+        // pull request whose head has since moved.
+        write_state_left_by_an_earlier_knives(&store_path, &[(42, "bbbb")], &[(42, "garbage")]);
+        let mut store = Store::open_for_update(store_path).unwrap();
+
+        let report = sync_repo(SyncInput {
+            fork: &fork,
+            store: &mut store,
+            forge: Some(&forge),
+            scribe: &test_scribe(&temp, &repo_name),
+            cache: None,
+        })
+        .unwrap();
+
+        // Then: the token is reported, but the row is classified from the head
+        // and this run's head and state replace the record, so the problem
+        // does not repeat next run.
+        assert!(
+            report
+                .problems
+                .iter()
+                .any(|problem| problem.contains("recorded state of #42 unreadable")),
+            "was: {report:?}"
+        );
+        assert_eq!(
+            report.rows.first().map(|row| &row.state),
+            Some(&PullState::Advanced),
+            "was: {report:?}"
+        );
+        assert_eq!(store.pull_state(&repo_name, 42), Some("OPEN"));
+        assert_eq!(
+            store.pull_heads(&repo_name).get("42").map(String::as_str),
+            Some("aaaa")
+        );
+    }
+
+    #[test]
+    fn a_run_without_the_forge_leaves_a_legacy_record_and_drops_an_unreadable_one() {
+        // `sync_repo` without a forge cannot see a pull request the checkout
+        // has no ref for, so this drives the tracking step directly.
+        let temp = TempDir::new().unwrap();
+        let store_path = temp.path().join("state.json");
+        let repo_name = RepoName::new("test-repo");
+        let scribe = test_scribe(&temp, &repo_name);
+        write_state_left_by_an_earlier_knives(
+            &store_path,
+            &[(42, "aaaa"), (43, "aaaa")],
+            &[(42, "unchanged"), (43, "garbage")],
+        );
+        let mut store = Store::open_for_update(store_path).unwrap();
+        let seen = store.pull_heads(&repo_name);
+        let heads = BTreeMap::from([(42, "aaaa".to_owned()), (43, "aaaa".to_owned())]);
+        let run = |store: &mut Store| {
+            let mut report = Report::default();
+            record_tracked_pulls(
+                TrackingInput {
+                    tracked: BTreeMap::from([(42, "#42".to_owned()), (43, "#43".to_owned())]),
+                    seen: &seen,
+                    heads: &heads,
+                    summaries: &[],
+                    snapshot: None,
+                    scribe: &scribe,
+                    store,
+                },
+                &mut report,
+            )
+            .unwrap();
+            report
+        };
+
+        let first = run(&mut store);
+
+        // Then: nothing is recorded over a state nobody observed, so the legacy
+        // record stays and is not announced as replaced; the unreadable one is
+        // dropped with its problem, and neither is heard from again.
+        assert!(first.notes.is_empty(), "was: {first:?}");
+        assert_eq!(first.problems.len(), 1, "was: {first:?}");
+        assert_eq!(store.pull_state(&repo_name, 42), Some("unchanged"));
+        assert_eq!(store.pull_state(&repo_name, 43), None);
+
+        let second = run(&mut store);
+        assert!(second.problems.is_empty(), "was: {second:?}");
+        assert!(second.notes.is_empty(), "was: {second:?}");
     }
 }
