@@ -23,7 +23,7 @@ use knives::ids::ReleaseScheme;
 use knives::jj::Repo;
 use lab::{
     Lab, ReleaseOutput, commit_at, knives_release, newest_operation_description, operation_ids,
-    release_command, release_parents, release_test_home,
+    release_command, release_parents, release_test_home, release_test_home_pinned,
 };
 
 #[test]
@@ -575,6 +575,110 @@ fn a_cut_identical_to_the_published_previous_cut_is_refused() {
     assert_eq!(
         second.status.code(),
         Some(i32::from(knives::cli::Exit::Incomplete.code())),
+        "{stdout}"
+    );
+    let tips = Repo::open(&lab.work)
+        .expect("reopen")
+        .bookmark_tips()
+        .expect("tips");
+    assert!(
+        !tips
+            .keys()
+            .any(|reference| reference.branch().as_str() == "release/2026-08-05")
+    );
+}
+
+#[test]
+fn an_identical_cut_is_allowed_when_every_pin_of_the_previous_cut_is_frozen() {
+    // Given: a published cut that a consumer pins by revision. The edit verbs
+    // refuse to touch it (editing in place reaches nobody) and point at a new
+    // dated cut; a verbatim cut under the new name is therefore the only way
+    // to obtain an editable composition, and must not be refused as identical.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    lab.octopus("release/2026-08-04", "feat/alpha", "feat/beta");
+    lab.jj_work([
+        "git",
+        "push",
+        "--remote",
+        "origin",
+        "--bookmark",
+        "release/2026-08-04",
+    ]);
+    lab.fetch_work();
+    lab.branch("feat/gamma", "gamma.txt", "gamma\n");
+    let (home, _consumer) = release_test_home_pinned(
+        &lab,
+        "rev = \"release/2026-08-03\"",
+        "rev = \"release/2026-08-04\"",
+    );
+    let refused = knives_release(&lab, &home, &["include", "feat/gamma"]);
+    assert_eq!(refused.status.code(), Some(3), "{refused:?}");
+
+    // When: the new dated name the refusal asked for is cut, verbatim.
+    let cut = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
+
+    // Then: it is named, says why an identical composition was allowed, and
+    // the new name (which nothing pins) takes the edit the old one refused.
+    let stdout = String::from_utf8_lossy(&cut.stdout);
+    assert!(cut.status.success(), "{stdout}");
+    assert!(
+        stdout.contains("starts identical to release/2026-08-04@origin")
+            && stdout.contains("every pin of release/2026-08-04 is frozen"),
+        "{stdout}"
+    );
+    let before = release_parents(&lab, "release/2026-08-05");
+    let included = knives_release(&lab, &home, &["include", "feat/gamma"]);
+    let included_stdout = String::from_utf8_lossy(&included.stdout);
+    assert!(included.status.success(), "{included_stdout}");
+    assert_eq!(
+        release_parents(&lab, "release/2026-08-05").len(),
+        before.len() + 1,
+        "{included_stdout}"
+    );
+}
+
+#[test]
+fn an_identical_cut_is_still_refused_when_a_consumer_follows_the_previous_cut() {
+    // Given: the same published cut, but its current consumer follows the
+    // branch (`branch =`), with an older frozen pin only in its history. A
+    // repair reaches that consumer in place, so a verbatim cut under a new
+    // name would ship nothing: the frozen exception must key on the pins of
+    // the release being compared against, not on any frozen pin in sight.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    lab.octopus("release/2026-08-04", "feat/alpha", "feat/beta");
+    lab.jj_work([
+        "git",
+        "push",
+        "--remote",
+        "origin",
+        "--bookmark",
+        "release/2026-08-04",
+    ]);
+    lab.fetch_work();
+    let (home, _consumer) = release_test_home_pinned(
+        &lab,
+        "rev = \"release/2026-08-03\"",
+        "branch = \"release/2026-08-04\"",
+    );
+
+    // When: a new name is asked for with nothing changed.
+    let cut = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
+
+    // Then: refused as identical, exactly as with no consumer at all.
+    let stdout = String::from_utf8_lossy(&cut.stdout);
+    assert_eq!(
+        cut.status.code(),
+        Some(i32::from(knives::cli::Exit::Incomplete.code())),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "demo: refusing to cut release/2026-08-05: identical to release/2026-08-04@origin ("
+        ),
         "{stdout}"
     );
     let tips = Repo::open(&lab.work)
