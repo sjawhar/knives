@@ -598,7 +598,6 @@ fn drop_landed_members(
     Ok(Exit::Ok)
 }
 
-
 /// A resolved rebase destination: the commit, the label the report and
 /// provenance use, and which of our pull requests the forge says landed by it.
 struct RebaseDestination {
@@ -652,7 +651,6 @@ fn existing_rebase_exit(input: ExistingRebaseInput<'_>) -> anyhow::Result<Option
     };
     Ok(Some(exit))
 }
-
 
 /// A composition rebase that just happened: what moved, and onto what.
 struct RebasedRelease<'a> {

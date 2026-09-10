@@ -143,17 +143,26 @@ fn scan_releases(
             let members: Vec<CommitId> = repo
                 .parents_of(commit.as_str())?
                 .into_iter()
-                .filter(|parent| !repo.is_ancestor(&parent.commit, &trunk_tip).unwrap_or(false))
+                .filter(|parent| {
+                    !repo
+                        .is_ancestor(&parent.commit, &trunk_tip)
+                        .unwrap_or(false)
+                })
                 .map(|parent| parent.commit)
                 .collect();
-            if let Some(points) = crate::commands::release::mixed_fork_points(repo, &members, &trunk_tip)? {
+            if let Some(points) =
+                crate::commands::release::mixed_fork_points(repo, &members, &trunk_tip)?
+            {
                 let parents = points
                     .into_iter()
                     .map(|point| {
                         let name = branches
                             .iter()
                             .find(|(_, tip)| *tip == point.parent)
-                            .map_or_else(|| point.parent.short().to_owned(), |(name, _)| name.clone());
+                            .map_or_else(
+                                || point.parent.short().to_owned(),
+                                |(name, _)| name.clone(),
+                            );
                         let fork_point = point
                             .fork_point
                             .as_ref()

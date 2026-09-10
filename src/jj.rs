@@ -2407,14 +2407,17 @@ pub fn retain_and_repoint_release(
 /// Push precisely the release and retention bookmarks to the configured release
 /// remote. This is deliberately a porcelain boundary: only jj owns remote
 /// transport and its configured credentials.
-pub fn push_bookmarks(
-    repo: &Path,
-    remote: &str,
-    bookmarks: &[&str],
-) -> Result<(), JjError> {
+pub fn push_bookmarks(repo: &Path, remote: &str, bookmarks: &[&str]) -> Result<(), JjError> {
     let repo_path = path(repo);
     let mut command = Command::new("jj");
-    command.args(["--repository", &repo_path, "git", "push", "--remote", remote]);
+    command.args([
+        "--repository",
+        &repo_path,
+        "git",
+        "push",
+        "--remote",
+        remote,
+    ]);
     for bookmark in bookmarks {
         command.args(["--bookmark", bookmark]);
     }

@@ -248,9 +248,28 @@ pub struct ParentForkPoint {
     pub fork_point: Option<CommitId>,
 }
 
-/// Return every parent and its fork point when this parent set cannot prove one
-/// shared upstream base. The returned rows let callers name every implicated
-/// parent rather than reporting only an opaque count.
+/// Compute every parent and the point where it forked from the upstream trunk.
+/// `None` means jj found several common ancestors for that member.
+pub fn parent_fork_points(
+    repo: &Repo,
+    parents: &[CommitId],
+    trunk_tip: &CommitId,
+) -> anyhow::Result<Vec<ParentForkPoint>> {
+    parents
+        .iter()
+        .map(|parent| {
+            Ok(ParentForkPoint {
+                parent: parent.clone(),
+                fork_point: repo.common_ancestor(std::slice::from_ref(parent), trunk_tip)?,
+            })
+        })
+        .collect()
+}
+
+/// Return every parent and its fork point when a release already spans more
+/// than one upstream base. [`shared_base_for_parents`] remains the authority
+/// for a single shared base; a criss-cross with no authoritative base is also
+/// reported rather than hidden.
 pub fn mixed_fork_points(
     repo: &Repo,
     parents: &[CommitId],
@@ -260,20 +279,31 @@ pub fn mixed_fork_points(
         return Ok(None);
     }
     let shared = shared_base_for_parents(repo, parents, trunk_tip)?;
-    let points = parents
+    let points = parent_fork_points(repo, parents, trunk_tip)?;
+    let distinct = points
         .iter()
-        .map(|parent| {
-            Ok(ParentForkPoint {
-                parent: parent.clone(),
-                fork_point: repo.common_ancestor(std::slice::from_ref(parent), trunk_tip)?,
-            })
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    let uniform = shared.is_some()
-        && points
-            .iter()
-            .all(|point| point.fork_point.as_ref() == shared.as_ref());
-    Ok((!uniform).then_some(points))
+        .map(|point| point.fork_point.clone())
+        .collect::<BTreeSet<_>>();
+    Ok((distinct.len() > 1 || shared.is_none()).then_some(points))
+}
+
+/// The prospective members that would introduce a fork point the current
+/// release does not already have. This makes base integrity a ratchet: old
+/// mixed-base debt stays visible, but `include` and `advance` cannot grow it.
+pub fn introduced_fork_points(
+    repo: &Repo,
+    current: &[CommitId],
+    prospective: &[CommitId],
+    trunk_tip: &CommitId,
+) -> anyhow::Result<Vec<ParentForkPoint>> {
+    let existing = parent_fork_points(repo, current, trunk_tip)?
+        .into_iter()
+        .map(|point| point.fork_point)
+        .collect::<BTreeSet<_>>();
+    Ok(parent_fork_points(repo, prospective, trunk_tip)?
+        .into_iter()
+        .filter(|point| !existing.contains(&point.fork_point))
+        .collect())
 }
 
 /// What a recut keeps reachable: the commits the orphan gate treats as work.

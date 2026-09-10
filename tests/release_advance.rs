@@ -525,7 +525,12 @@ fn advance_refuses_a_member_at_a_second_fork_point() {
     let (home, _consumer) = home_after_first_cut(&lab);
     let old_beta = commit_at(&lab, "feat/beta");
     lab.advance_upstream("upstream advance\n");
-    lab.jj_work(["new", "main@upstream", "-m", "beta rebuilt onto newer upstream"]);
+    lab.jj_work([
+        "new",
+        "main@upstream",
+        "-m",
+        "beta rebuilt onto newer upstream",
+    ]);
     std::fs::write(lab.work.join("beta.txt"), "beta\n").expect("rebuild beta");
     lab.jj_work([
         "bookmark",
@@ -551,9 +556,9 @@ fn advance_refuses_a_member_at_a_second_fork_point() {
     assert_eq!(output.status.code(), Some(3), "{stdout}");
     assert!(
         stdout.contains("refusing to advance")
-            && stdout.contains("feat/alpha")
             && stdout.contains("feat/beta")
-            && stdout.contains("fork point"),
+            && stdout.contains("fork point")
+            && stdout.contains("existing fork point(s)"),
         "{stdout}"
     );
     assert_eq!(release_parents(&lab, "release/2026-08-04"), before);

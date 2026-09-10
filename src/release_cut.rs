@@ -13,8 +13,8 @@ use knives::forge::github::CliForge;
 use knives::ids::{BookmarkRef, ReleaseScheme, RemoteName, RepoName};
 use knives::ledger::{Draft, Kind, Ledger};
 use knives::release_model::{
-    RecordedCut, StackedHistoryContext, carried_branches, last_recorded_cut, members_event_text,
-    previous_release_for_cut, release_order, trunk_positions,
+    RecordedCut, StackedHistoryContext, carried_branches, last_recorded_cut, last_recorded_parents,
+    members_event_text, previous_release_for_cut, release_order, trunk_positions,
 };
 
 use super::release_edit::recorded_parents;
@@ -316,7 +316,10 @@ pub(crate) fn run_republish(fork: &Fork<'_>, bound: Option<&RepoName>) -> anyhow
             replacement.short(),
             published.short()
         ),
-        evidence: vec![replacement.as_str().to_owned(), published.as_str().to_owned()],
+        evidence: vec![
+            replacement.as_str().to_owned(),
+            published.as_str().to_owned(),
+        ],
         pr: None,
         parents: recorded_parents(&reopened, entry, &parents)?,
     })?;
@@ -376,7 +379,8 @@ fn dotted_predecessor(name: &str) -> Option<String> {
 }
 
 fn predecessor_is_pinned(pins: &[knives::pins::Pin], predecessor: &str) -> bool {
-    pins.iter().any(|pin| pin.on_scheme && pin.reference == predecessor)
+    pins.iter()
+        .any(|pin| pin.on_scheme && pin.reference == predecessor)
 }
 
 fn retention_name(release: &str, sha8: &str) -> String {
@@ -384,9 +388,10 @@ fn retention_name(release: &str, sha8: &str) -> String {
     format!("keep/release-{}-{sha8}", name.replace('/', "-"))
 }
 
-/// Refuse a recut of member commits that branch tips have already superseded.
-/// `gather_members(..., true)` is the `release members --verify` computation,
-/// so the cut uses the same current-tip evidence it shows the operator.
+/// Refuse a recut when the named branch a release event recorded has moved on.
+/// The ledger records which branch owned each exact parent; checking every
+/// arbitrary descendant would mistake a historical-carriage branch for the
+/// member's own current tip.
 fn stale_member_cut_exit(
     opened: &knives::jj::Repo,
     fork: &Fork<'_>,
@@ -395,18 +400,23 @@ fn stale_member_cut_exit(
     allowed: bool,
     why: Option<&str>,
 ) -> anyhow::Result<Option<Exit>> {
-    let report = release::gather_members(opened, fork, release, true)?;
-    let stale = report
-        .members
+    let release = BookmarkRef::parse(release).branch().to_string();
+    let entries = Ledger::for_repo(&fork.name).entries()?;
+    let stale = last_recorded_parents(&entries, &release)
         .iter()
-        .filter(|member| !member.base_parent)
-        .flat_map(|member| {
-            member.advanced.iter().map(move |advanced| {
-                format!(
-                    "recorded member {} is not its branch's current tip: {advanced}",
-                    member.commit.short()
-                )
-            })
+        .flat_map(|parent| {
+            parent.branches.iter().filter_map(|branch| {
+                opened
+                    .local_bookmark_tip(branch)
+                    .filter(|tip| tip.as_str() != parent.commit)
+                    .map(|tip| {
+                        format!(
+                            "recorded member {branch}@{} is not its branch's current tip: {}",
+                            knives::ids::short_id(&parent.commit),
+                            tip.short()
+                        )
+                    })
+                })
         })
         .collect::<Vec<_>>();
     if stale.is_empty() {
@@ -430,9 +440,7 @@ fn stale_member_cut_exit(
     for member in stale {
         println!("  {member}");
     }
-    println!(
-        "  run `knives release advance`, or re-run with --allow-stale-member --why <reason>"
-    );
+    println!("  run `knives release advance`, or re-run with --allow-stale-member --why <reason>");
     Ok(Some(Exit::Incomplete))
 }
 

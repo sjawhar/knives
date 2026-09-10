@@ -558,6 +558,7 @@ fn a_drop_whose_content_survives_through_another_member_stays_quiet() {
     std::fs::write(lab.work.join("beta.txt"), "beta\n").expect("write beta");
     lab.jj_work(["bookmark", "create", "feat/beta", "-r", "@"]);
     lab.jj_work(["new"]);
+
     let (home, _consumer) = release_test_home(&lab);
     let first = knives_release(&lab, &home, &["cut", "release/2026-08-04"]);
     assert!(first.status.success(), "{first:?}");
@@ -576,6 +577,32 @@ fn a_drop_whose_content_survives_through_another_member_stays_quiet() {
     );
     let parents = release_parents(&lab, "release/2026-08-04");
     assert_eq!(parents, vec![commit_at(&lab, "feat/beta")], "{parents:?}");
+}
+#[test]
+fn advance_along_an_existing_mixed_base_member_remains_allowed() {
+    // Given: alpha and beta already occupy two fork points in a historical
+    // release. Alpha then grows on its own original base.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.advance_upstream("upstream advance\n");
+    lab.mirror_upstream_trunk_to_origin();
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    lab.octopus("release/2026-08-04", "feat/alpha", "feat/beta");
+    let (home, _consumer) = release_test_home(&lab);
+    extend_branch(&lab, "feat/alpha", "alpha.txt", "alpha\nmore\n");
+    let advanced = commit_at(&lab, "feat/alpha");
+
+    // When: the member follows its own existing fork point.
+    let output = knives_release(&lab, &home, &["advance", "feat/alpha"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Then: the ratchet permits the update rather than freezing pre-existing
+    // mixed-base debt indefinitely.
+    assert!(output.status.success(), "{stdout}");
+    assert!(
+        release_parents(&lab, "release/2026-08-04").contains(&advanced),
+        "the member did not advance: {stdout}"
+    );
 }
 
 #[test]
@@ -735,12 +762,17 @@ fn an_edit_refuses_a_release_held_only_as_a_remote_ref() {
 
 #[test]
 fn include_refuses_a_parent_at_a_second_fork_point() {
-    // Given: alpha is already in the release at its original fork point, then
-    // gamma starts after upstream moves. Including gamma would mix bases.
+    // Given: alpha and beta already span two fork points in the release, then
+    // gamma starts at a third upstream point. Including gamma would grow that
+    // known mixed-base debt rather than merely retaining it.
     let lab = Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
-    let (home, _consumer) = home_after_first_cut(&lab);
-    lab.advance_upstream("upstream advance\n");
+    lab.advance_upstream("first upstream advance\n");
+    lab.mirror_upstream_trunk_to_origin();
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    lab.octopus("release/2026-08-04", "feat/alpha", "feat/beta");
+    let (home, _consumer) = release_test_home(&lab);
+    lab.advance_upstream("second upstream advance\n");
     lab.mirror_upstream_trunk_to_origin();
     lab.branch("feat/gamma", "gamma.txt", "gamma\n");
     let before = release_parents(&lab, "release/2026-08-04");
@@ -753,10 +785,49 @@ fn include_refuses_a_parent_at_a_second_fork_point() {
     assert_eq!(output.status.code(), Some(3), "{stdout}");
     assert!(
         stdout.contains("refusing to include")
-            && stdout.contains("feat/alpha")
             && stdout.contains("feat/gamma")
-            && stdout.contains("fork point"),
+            && stdout.contains("fork point")
+            && stdout.contains("existing fork point(s)"),
         "{stdout}"
     );
     assert_eq!(release_parents(&lab, "release/2026-08-04"), before);
+}
+
+#[test]
+fn advance_rebases_a_resolved_release_without_reopening_its_overlap() {
+    // Given: alpha and beta overlap, and their release merge was deliberately
+    // resolved to bytes that neither member supplies on its own.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "shared.txt", "alpha\n");
+    lab.branch("feat/beta", "shared.txt", "beta\n");
+    lab.octopus("release/2026-08-04", "feat/alpha", "feat/beta");
+    lab.jj_work(["edit", "release/2026-08-04"]);
+    std::fs::write(lab.work.join("shared.txt"), "resolved\n").expect("resolve overlap");
+    lab.jj_work(["bookmark", "set", "release/2026-08-04", "-r", "@"]);
+    lab.jj_work(["new"]);
+    let (home, _consumer) = release_test_home(&lab);
+    extend_branch(
+        &lab,
+        "feat/alpha",
+        "alpha-followup.txt",
+        "non-overlapping follow-up\n",
+    );
+
+    // When: alpha advances along its existing fork point.
+    let output = knives_release(&lab, &home, &["advance", "feat/alpha"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Then: only the new alpha content joins; the previously resolved region
+    // remains byte-identical and the release has no conflict to resolve again.
+    assert!(output.status.success(), "{stdout}");
+    assert_eq!(
+        file_at_revision(&lab, "release/2026-08-04", "shared.txt"),
+        "resolved\n"
+    );
+    assert!(
+        knives::jj::conflicted_files(&lab.work, "release/2026-08-04")
+            .expect("list release conflicts")
+            .is_empty(),
+        "advance reopened an already-resolved overlap: {stdout}"
+    );
 }

@@ -1381,9 +1381,13 @@ fn republish_retains_the_published_head_before_moving_an_unpinned_release() {
     let old = commit_at(&lab, "release/2026-08-04@origin");
     lab.branch("feat/beta", "beta.txt", "beta\n");
     assert!(
-        knives_release(&lab, &home, &["include", "feat/beta", "--why", "new member"])
-            .status
-            .success()
+        knives_release(
+            &lab,
+            &home,
+            &["include", "feat/beta", "--why", "new member"]
+        )
+        .status
+        .success()
     );
     let edited = commit_at(&lab, "release/2026-08-04");
 
@@ -1395,10 +1399,7 @@ fn republish_retains_the_published_head_before_moving_an_unpinned_release() {
     // reaches the edit and `keep/` reaches the former remote head.
     assert!(output.status.success(), "{stdout}");
     lab.fetch_work();
-    let keep = format!(
-        "keep/release-2026-08-04-{}",
-        &old.as_str()[..8]
-    );
+    let keep = format!("keep/release-2026-08-04-{}", &old.as_str()[..8]);
     assert_eq!(commit_at(&lab, "release/2026-08-04@origin"), edited);
     assert_eq!(commit_at(&lab, &format!("{keep}@origin")), old);
     assert!(stdout.contains(&keep), "{stdout}");
