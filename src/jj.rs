@@ -1209,6 +1209,8 @@ fn workspace_name_at(directory: &Path) -> Result<WorkspaceName, JjError> {
 /// The destination's parent is created first: a configured `workspaces`
 /// directory need not exist yet, and the released `jj` refuses a destination
 /// whose parent is missing (`Cannot access …: No such file or directory`).
+/// A failed `add` leaves the directory it had created; an empty one is removed
+/// again, so the failure does not also block the retry.
 pub fn add_workspace(
     repo: &Path,
     name: &str,
@@ -1221,9 +1223,10 @@ pub fn add_workspace(
             detail: error.to_string(),
         })?;
     }
+    let existed = destination.exists();
     let repo = path(repo);
-    let destination = path(destination);
-    command(
+    let shown = path(destination);
+    let added = command(
         "jj",
         [
             "--repository",
@@ -1234,10 +1237,60 @@ pub fn add_workspace(
             name,
             "-r",
             revision,
-            &destination,
+            &shown,
         ],
+    );
+    if added.is_err() && !existed && is_empty_directory(destination) {
+        let _ = std::fs::remove_dir(destination);
+    }
+    added.map(|_| ())
+}
+
+fn is_empty_directory(directory: &Path) -> bool {
+    std::fs::read_dir(directory).is_ok_and(|mut entries| entries.next().is_none())
+}
+
+/// Removes the Git worktree registration at `destination` when git itself
+/// reports it `prunable` — its working tree is gone — and says whether it did.
+///
+/// A colocated `jj workspace add` registers the new directory as a Git worktree
+/// under `.git/worktrees/<name>` and `jj workspace forget` unregisters it. A
+/// directory removed before the forget (by hand, or by a jj that did not
+/// unlink) leaves the registration behind, and the next `add` at that path
+/// fails on it. Only a prunable registration is touched: `git worktree remove`
+/// on a live one would delete its directory.
+pub fn remove_prunable_worktree(checkout: &Path, destination: &Path) -> Result<bool, JjError> {
+    let checkout = path(checkout);
+    let listing = command("git", ["-C", &checkout, "worktree", "list", "--porcelain"])?;
+    let wanted = comparable_path(destination);
+    let prunable = listing.split("\n\n").any(|entry| {
+        let mut lines = entry.lines();
+        let registered = lines
+            .next()
+            .and_then(|line| line.strip_prefix("worktree "))
+            .map(|registered| comparable_path(Path::new(registered)));
+        registered == Some(wanted.clone()) && lines.any(|line| line.starts_with("prunable"))
+    });
+    if !prunable {
+        return Ok(false);
+    }
+    command(
+        "git",
+        ["-C", &checkout, "worktree", "remove", &path(destination)],
     )?;
-    Ok(())
+    Ok(true)
+}
+
+/// `directory` with its parent resolved through symbolic links, so a path
+/// git recorded canonically compares equal to the one this tool computed.
+/// The directory itself need not exist.
+fn comparable_path(directory: &Path) -> PathBuf {
+    match (directory.parent(), directory.file_name()) {
+        (Some(parent), Some(name)) => parent
+            .canonicalize()
+            .map_or_else(|_| directory.to_path_buf(), |parent| parent.join(name)),
+        _ => directory.to_path_buf(),
+    }
 }
 
 pub(crate) enum OriginTrunk {

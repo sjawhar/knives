@@ -22,7 +22,7 @@ use forge_shim::{install_failing_gh, path_with_gh_shim};
 use knives::ids::BranchName;
 use knives::jj::Repo;
 use knives::store::{OwnerKind, Store};
-use lab::{Lab, release_test_home};
+use lab::{Lab, knives_start, release_test_home};
 use serde_json::Value;
 use std::process::Command;
 
@@ -640,4 +640,57 @@ fn a_fork_only_statement_is_recorded_as_the_decision_it_is() {
         .expect("read ledger");
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].text, "stated as having no upstream pull request");
+}
+
+/// Git's registrations of a checkout's worktrees, one `worktree <path>` block
+/// per entry, `prunable` marked where the working tree is gone.
+fn git_worktrees(checkout: &std::path::Path) -> String {
+    let output = Command::new("git")
+        .args(["worktree", "list", "--porcelain"])
+        .current_dir(checkout)
+        .output()
+        .expect("git worktree list");
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+#[test]
+fn finishing_a_workspace_whose_directory_vanished_clears_its_git_registration() {
+    // Given: a started branch whose workspace directory was removed by hand.
+    // `jj workspace forget` unlinks a worktree that is still on disk; with the
+    // directory already gone, git keeps the registration and reports it
+    // prunable, and the next `start` at that path fails on it.
+    let lab = lab::Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let workspace = start_claim_for_finish(&lab, &home, "ses_fff688", "feat/gamma");
+    std::fs::remove_dir_all(&workspace).expect("remove the workspace directory by hand");
+
+    let finished = knives_finish(&lab, &home, &["feat/gamma"]);
+
+    let stdout = String::from_utf8_lossy(&finished.stdout);
+    assert!(
+        finished.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&finished.stderr)
+    );
+    assert!(
+        stdout.contains("stale Git worktree registration removed"),
+        "{stdout}"
+    );
+    let registrations = git_worktrees(&lab.work);
+    assert!(
+        !registrations.contains("prunable"),
+        "a prunable registration survived finish:\n{registrations}"
+    );
+    // And: the branch can be started again at the same path.
+    let restarted = knives_start(&lab, &home, "feat/gamma");
+    assert!(
+        restarted.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&restarted.stdout),
+        String::from_utf8_lossy(&restarted.stderr)
+    );
+    assert!(
+        workspace.join(".jj").is_dir(),
+        "the workspace was not recreated"
+    );
 }
