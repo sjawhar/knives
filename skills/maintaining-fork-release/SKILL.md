@@ -85,7 +85,7 @@ Fork-only work uses one permanent `chore/fork-glue` branch. A `keep/*` branch is
 
 The orchestrator owns the composition gate. After every `release rebase`, `release advance`, or `release include`, and before dispatching the next wave for that fork, gate the release in hand. **Done when:** every member has one fork point against upstream trunk, no member is conflicted, and the release gate is green. A rebase that leaves a member conflicted or on an older base is failed work to repair, not a successful rebase to advance past.
 
-An unpinned release is mutable: edit it in place and republish under the same name. Retain the prior remote head as `keep/release-<name>-<sha8>` on the release remote. A dotted successor is for a predecessor agent-c main already pins; do not mint a new name merely because it was convenient to do so.
+An unpinned release is mutable: edit it in place and republish under the same name. Retain the prior remote head as `keep/release-<name>-<sha8>` on the release remote. A dotted successor is for a predecessor the consumer's main already pins; do not mint a new name merely because it was convenient to do so. A mutable release is safe only while every consumer pins it **by commit**, never by branch name — a name pin followed the moved branch and broke every deployed runner venv the first night this rule was used. The flip side: a commit pin goes stale the moment the lower release moves, so whoever republishes a release checks each registered consumer's lock (`knives consumers <repo>`) for a commit the republish superseded and re-cuts that consumer pin-only, in the same sitting.
 
 ## 5. Review, record, and coordinate integration
 
