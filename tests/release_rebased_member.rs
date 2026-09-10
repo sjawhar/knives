@@ -72,27 +72,21 @@ fn advance_follows_a_member_rebased_onto_a_newer_trunk() {
     let before = release_parents(&lab, "release/2026-08-04").len();
 
     let output = knives_release(&lab, &home, &["advance", "feat/alpha"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
 
+    // A member rebased onto a new trunk point changes the composition's base,
+    // which only `release rebase` may do.
+    assert_eq!(output.status.code(), Some(3), "{stdout}");
     assert!(
-        output.status.success(),
-        "advance refused a rebased member: {}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+        stdout.contains("introduce a fork point") && stdout.contains("feat/alpha"),
+        "{stdout}"
     );
     let parents = release_parents(&lab, "release/2026-08-04");
     assert!(
-        parents.contains(&new_alpha),
-        "alpha not advanced: {parents:?}"
+        parents.contains(&old_alpha) && !parents.contains(&new_alpha),
+        "{parents:?}"
     );
-    assert!(
-        !parents.contains(&old_alpha),
-        "old alpha survived: {parents:?}"
-    );
-    assert_eq!(
-        parents.len(),
-        before,
-        "the member count must not change: {parents:?}"
-    );
+    assert_eq!(parents.len(), before);
 }
 
 #[test]
@@ -100,18 +94,12 @@ fn a_bare_advance_moves_the_rebased_member_too() {
     let (lab, home, old_alpha, new_alpha) = rebased_alpha();
 
     let output = knives_release(&lab, &home, &["advance"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
 
-    assert!(
-        output.status.success(),
-        "bare advance refused: {}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert_eq!(output.status.code(), Some(3), "{stdout}");
+    assert!(stdout.contains("introduce a fork point"), "{stdout}");
     let parents = release_parents(&lab, "release/2026-08-04");
-    assert!(
-        parents.contains(&new_alpha) && !parents.contains(&old_alpha),
-        "{parents:?}"
-    );
+    assert!(parents.contains(&old_alpha) && !parents.contains(&new_alpha));
 }
 
 #[test]
@@ -226,18 +214,12 @@ fn advance_finds_a_member_rebuilt_outside_jj_through_the_cut_record() {
     let before = release_parents(&lab, "release/2026-08-04").len();
 
     let output = knives_release(&lab, &home, &["advance", "feat/alpha"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
 
-    assert!(
-        output.status.success(),
-        "advance refused a member the cut record names: {}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert_eq!(output.status.code(), Some(3), "{stdout}");
+    assert!(stdout.contains("introduce a fork point"), "{stdout}");
     let parents = release_parents(&lab, "release/2026-08-04");
-    assert!(
-        parents.contains(&new_alpha) && !parents.contains(&old_alpha),
-        "{parents:?}"
-    );
+    assert!(parents.contains(&old_alpha) && !parents.contains(&new_alpha));
     assert_eq!(parents.len(), before);
 }
 
@@ -328,18 +310,12 @@ fn advance_moves_a_member_when_an_anchor_bookmark_shared_its_recorded_tip() {
     let before = release_parents(&lab, "release/2026-08-04").len();
 
     let output = knives_release(&lab, &home, &["advance", "feat/alpha"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
 
-    assert!(
-        output.status.success(),
-        "advance refused a member the cut record names under a second bookmark: {}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert_eq!(output.status.code(), Some(3), "{stdout}");
+    assert!(stdout.contains("introduce a fork point"), "{stdout}");
     let parents = release_parents(&lab, "release/2026-08-04");
-    assert!(
-        parents.contains(&new_alpha) && !parents.contains(&old_alpha),
-        "{parents:?}"
-    );
+    assert!(parents.contains(&old_alpha) && !parents.contains(&new_alpha));
     assert_eq!(parents.len(), before);
 }
 
@@ -382,18 +358,12 @@ fn a_member_that_joined_by_include_is_found_through_the_edit_record() {
     let before = release_parents(&lab, "release/2026-08-04").len();
 
     let output = knives_release(&lab, &home, &["advance", "feat/gamma"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
 
-    assert!(
-        output.status.success(),
-        "advance refused a member the edit record names: {}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert_eq!(output.status.code(), Some(3), "{stdout}");
+    assert!(stdout.contains("introduce a fork point"), "{stdout}");
     let parents = release_parents(&lab, "release/2026-08-04");
-    assert!(
-        parents.contains(&new_gamma) && !parents.contains(&old_gamma),
-        "{parents:?}"
-    );
+    assert!(parents.contains(&old_gamma) && !parents.contains(&new_gamma));
     assert_eq!(parents.len(), before);
 }
 
@@ -423,33 +393,22 @@ fn a_member_landed_by_merge_commit_has_no_successor_among_fresh_trunk_branches()
     let gamma = commit_at(&lab, "feat/gamma");
     let before = release_parents(&lab, "release/2026-08-04");
 
-    // When: gamma is included, and a bare advance runs.
+    // When: gamma starts at the newer trunk fork point, so include must not
+    // enlarge the release's established base set.
     let included = knives_release(&lab, &home, &["include", "feat/gamma"]);
     let advanced = knives_release(&lab, &home, &["advance"]);
+    let included_stdout = String::from_utf8_lossy(&included.stdout);
 
-    // Then: gamma joins as a new parent, alpha's landed parent stays untouched
-    // (retiring it is `rebase`'s job), and nothing is advanced onto gamma.
+    assert_eq!(included.status.code(), Some(3), "{included_stdout}");
     assert!(
-        included.status.success(),
-        "include misrouted a fresh branch to advance: {}",
-        String::from_utf8_lossy(&included.stdout)
+        included_stdout.contains("introduce a fork point")
+            && included_stdout.contains("feat/gamma"),
+        "{included_stdout}"
     );
     let parents = release_parents(&lab, "release/2026-08-04");
-    assert_eq!(parents.len(), before.len() + 1, "{parents:?}");
-    assert!(
-        parents.contains(&alpha),
-        "the landed member was replaced: {parents:?}"
-    );
-    assert!(parents.contains(&gamma), "gamma did not join: {parents:?}");
-    assert!(
-        advanced.status.success(),
-        "{}",
-        String::from_utf8_lossy(&advanced.stdout)
-    );
-    assert!(
-        release_parents(&lab, "release/2026-08-04").contains(&alpha),
-        "a bare advance swapped the landed member for a fresh branch"
-    );
+    assert_eq!(parents, before, "{parents:?}");
+    assert!(parents.contains(&alpha) && !parents.contains(&gamma));
+    assert!(advanced.status.success(), "{advanced:?}");
 }
 
 #[test]
@@ -519,16 +478,16 @@ fn a_landed_member_that_kept_growing_gets_one_answer_from_plan_include_and_advan
         "include must refuse the second copy for the right reason: {include_text}"
     );
     assert_eq!(release_parents(&lab, "release/2026-08-04").len(), before);
+    assert_eq!(advance.status.code(), Some(3), "{advance_text}");
     assert!(
-        advance.status.success()
-            && advance_text.contains("that parent has landed upstream")
-            && !advance_text.contains("nothing in the repository ties them"),
-        "advance must move the member and say why the record decided: {advance_text}\n{}",
+        advance_text.contains("that parent has landed upstream")
+            && advance_text.contains("introduce a fork point"),
+        "{advance_text}\n{}",
         String::from_utf8_lossy(&advance.stderr)
     );
     let parents = release_parents(&lab, "release/2026-08-04");
     assert!(
-        parents.contains(&new_alpha) && !parents.contains(&old_alpha),
+        parents.contains(&old_alpha) && !parents.contains(&new_alpha),
         "{parents:?}"
     );
     assert_eq!(parents.len(), before);

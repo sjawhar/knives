@@ -102,14 +102,17 @@ pub(crate) fn run_release(
         let tips = opened.bookmark_tips()?;
         let previous = previous_release_for_cut(entry, &tips);
         if let Some((previous, _)) = &previous
-            && let Some(exit) = stale_member_cut_exit(
-                &opened,
+            && opened
+                .local_bookmark_tip(previous.branch().as_str())
+                .is_some()
+            && let Some(exit) = stale_member_cut_exit(StaleMemberCut {
+                opened: &opened,
                 fork,
-                &previous.to_string(),
-                &name,
-                options.allow_stale_member,
-                options.why.as_deref(),
-            )?
+                release: &previous.to_string(),
+                name: &name,
+                allowed: options.allow_stale_member,
+                why: options.why.as_deref(),
+            })?
         {
             return Ok(exit);
         }
@@ -303,7 +306,15 @@ pub(crate) fn run_republish(fork: &Fork<'_>, bound: Option<&RepoName>) -> anyhow
         return Ok(Exit::Ok);
     }
     let keep = retention_name(&release, &published.as_str()[..8]);
-    knives::jj::retain_and_repoint_release(path, &release, &published, &replacement, &keep)?;
+    knives::jj::retain_and_repoint_release(
+        path,
+        &knives::jj::RepublishWrite {
+            release: &release,
+            published: &published,
+            replacement: &replacement,
+            keep: &keep,
+        },
+    )?;
     knives::jj::push_bookmarks(path, entry.publish_remote(), &[&keep, &release])?;
     let reopened = knives::jj::Repo::open(path)?;
     let parents = reopened.parent_commits(&release)?;
@@ -388,22 +399,39 @@ fn retention_name(release: &str, sha8: &str) -> String {
     format!("keep/release-{}-{sha8}", name.replace('/', "-"))
 }
 
+#[derive(Clone, Copy)]
+struct StaleMemberCut<'a> {
+    opened: &'a knives::jj::Repo,
+    fork: &'a Fork<'a>,
+    release: &'a str,
+    name: &'a str,
+    allowed: bool,
+    why: Option<&'a str>,
+}
+
 /// Refuse a recut when the named branch a release event recorded has moved on.
 /// The ledger records which branch owned each exact parent; checking every
 /// arbitrary descendant would mistake a historical-carriage branch for the
 /// member's own current tip.
-fn stale_member_cut_exit(
-    opened: &knives::jj::Repo,
-    fork: &Fork<'_>,
-    release: &str,
-    name: &str,
-    allowed: bool,
-    why: Option<&str>,
-) -> anyhow::Result<Option<Exit>> {
+fn stale_member_cut_exit(input: StaleMemberCut<'_>) -> anyhow::Result<Option<Exit>> {
+    let StaleMemberCut {
+        opened,
+        fork,
+        release,
+        name,
+        allowed,
+        why,
+    } = input;
     let release = BookmarkRef::parse(release).branch().to_string();
+    let current_parents = opened.parent_commits(&release)?;
     let entries = Ledger::for_repo(&fork.name).entries()?;
     let stale = last_recorded_parents(&entries, &release)
         .iter()
+        .filter(|parent| {
+            current_parents
+                .iter()
+                .any(|current| current.as_str() == parent.commit)
+        })
         .flat_map(|parent| {
             parent.branches.iter().filter_map(|branch| {
                 opened
@@ -416,7 +444,7 @@ fn stale_member_cut_exit(
                             tip.short()
                         )
                     })
-                })
+            })
         })
         .collect::<Vec<_>>();
     if stale.is_empty() {

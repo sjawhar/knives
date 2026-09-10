@@ -267,9 +267,10 @@ pub fn parent_fork_points(
 }
 
 /// Return every parent and its fork point when a release already spans more
-/// than one upstream base. [`shared_base_for_parents`] remains the authority
-/// for a single shared base; a criss-cross with no authoritative base is also
-/// reported rather than hidden.
+/// than one upstream base.
+///
+/// [`shared_base_for_parents`] remains the authority for a single shared base;
+/// a criss-cross with no authoritative base is also reported rather than hidden.
 pub fn mixed_fork_points(
     repo: &Repo,
     parents: &[CommitId],
@@ -288,8 +289,10 @@ pub fn mixed_fork_points(
 }
 
 /// The prospective members that would introduce a fork point the current
-/// release does not already have. This makes base integrity a ratchet: old
-/// mixed-base debt stays visible, but `include` and `advance` cannot grow it.
+/// release does not already have.
+///
+/// This makes base integrity a ratchet: old mixed-base debt stays visible, but
+/// `include` and `advance` cannot grow it.
 pub fn introduced_fork_points(
     repo: &Repo,
     current: &[CommitId],

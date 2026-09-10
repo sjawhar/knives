@@ -2359,22 +2359,35 @@ pub fn set_bookmark_anywhere(repo: &Path, name: &str, revision: &str) -> Result<
     move_bookmark(repo, (name, revision), BookmarkMotion::Anywhere)
 }
 
-/// Retain the published release head locally before moving `release` to its
-/// already-audited replacement. Both bookmarks become visible in one operation
-/// before the caller pushes them together to the release remote.
+/// Inputs for retaining the published head before an in-place release move.
+#[derive(Debug)]
+pub struct RepublishWrite<'a> {
+    pub release: &'a str,
+    pub published: &'a CommitId,
+    pub replacement: &'a CommitId,
+    pub keep: &'a str,
+}
+
+/// Retain the published release head before moving the release replacement.
+///
+/// Both bookmarks become visible in one operation before the caller pushes them
+/// together to the release remote.
 pub fn retain_and_repoint_release(
     repo_path: &Path,
-    release: &str,
-    published: &CommitId,
-    replacement: &CommitId,
-    keep: &str,
+    write: &RepublishWrite<'_>,
 ) -> Result<(), JjError> {
+    let RepublishWrite {
+        release,
+        published,
+        replacement,
+        keep,
+    } = write;
     let repo = Repo::open(repo_path)?;
     if let Some(existing) = repo.local_bookmark_tip(keep)
-        && existing != *published
+        && existing != **published
     {
         return Err(JjError::Revision {
-            revision: keep.to_owned(),
+            revision: (*keep).to_owned(),
             detail: format!(
                 "retention bookmark already points at {}, not published release {}",
                 existing.short(),
