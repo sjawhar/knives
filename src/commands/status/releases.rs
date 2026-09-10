@@ -1,6 +1,6 @@
 use crate::commands::status::Report;
 use crate::config::RepoEntry;
-use crate::detect::{BookmarkTips, Finding, Subject};
+use crate::detect::{BookmarkTips, Finding, FindingKind, Subject};
 use crate::ids::{BookmarkRef, CommitId, ReleaseScheme, is_our_release};
 use crate::jj::Repo;
 use crate::release_model::{
@@ -138,6 +138,39 @@ fn scan_releases(
                 "parent {} is no longer the tip of its branch ({where_now})",
                 parent.short()
             );
+        }
+        if let Ok(trunk_tip) = repo.resolve_commit(input.trunk) {
+            let members: Vec<CommitId> = repo
+                .parents_of(commit.as_str())?
+                .into_iter()
+                .filter(|parent| !repo.is_ancestor(&parent.commit, &trunk_tip).unwrap_or(false))
+                .map(|parent| parent.commit)
+                .collect();
+            if let Some(points) = crate::commands::release::mixed_fork_points(repo, &members, &trunk_tip)? {
+                let parents = points
+                    .into_iter()
+                    .map(|point| {
+                        let name = branches
+                            .iter()
+                            .find(|(_, tip)| *tip == point.parent)
+                            .map_or_else(|| point.parent.short().to_owned(), |(name, _)| name.clone());
+                        let fork_point = point
+                            .fork_point
+                            .as_ref()
+                            .map_or("no single fork point", CommitId::short);
+                        format!("{name} ({}) -> {fork_point}", point.parent.short())
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                findings.push(Finding::new(
+                    FindingKind::MixedBase,
+                    Subject::Bookmark(release.clone()),
+                    format!(
+                        "member parents have more than one fork point against {}: {parents}",
+                        input.trunk
+                    ),
+                ));
+            }
         }
         findings.extend(stale);
     }

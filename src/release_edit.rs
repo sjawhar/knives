@@ -44,6 +44,12 @@ impl ReleaseEdit {
     }
 }
 
+impl ReleaseEdit {
+    const fn requires_one_fork_point(&self) -> bool {
+        matches!(self, Self::Include { .. } | Self::Advance { .. })
+    }
+}
+
 /// What an edit decided: a new parent set to write with the delta that describes
 /// it, or an already-reported end.
 enum EditOutcome {
@@ -319,9 +325,53 @@ fn edit_release(
         EditOutcome::Settled(exit) => return Ok(exit),
         EditOutcome::Done(parents, delta) => (parents, delta),
     };
+    if change.requires_one_fork_point()
+        && refuse_mixed_fork_points(&context, fork, &new_parents, change.verb())?
+    {
+        return Ok(Exit::Incomplete);
+    }
     apply_edit(&context, fork, &new_parents, &delta)
 }
 
+/// Refuse an edit that would make a release's members fork from different
+/// upstream positions. Only `release rebase` changes member bases together.
+fn refuse_mixed_fork_points(
+    context: &EditContext<'_>,
+    fork: &Fork<'_>,
+    parents: &[knives::ids::CommitId],
+    verb: &str,
+) -> anyhow::Result<bool> {
+    let trunk_name = fork.entry.upstream_trunk();
+    let trunk = context.opened.resolve_commit(&trunk_name)?;
+    let Some(points) = release::mixed_fork_points(context.opened, parents, &trunk)? else {
+        return Ok(false);
+    };
+    let sources = release::parent_sources(
+        context.opened,
+        fork.entry,
+        &fork.entry.release_scheme(),
+        parents,
+    )?;
+    println!(
+        "{}: refusing to {verb} {}: member parents have more than one fork point against {trunk_name}:",
+        context.repo, context.release.name
+    );
+    for point in points {
+        let source = sources
+            .iter()
+            .find(|(_, parent)| parent == &point.parent)
+            .map_or_else(|| point.parent.short(), |(source, _)| source.as_str());
+        let fork_point = point
+            .fork_point
+            .as_ref()
+            .map_or("no single fork point", knives::ids::CommitId::short);
+        println!("  {source} ({}) -> fork point {fork_point}", point.parent.short());
+    }
+    println!(
+        "  `knives release rebase` is the only way to change a release's member base"
+    );
+    Ok(true)
+}
 /// Write the edited release — duplicated onto its new parent set, described,
 /// its name moved — record the parent set in the ledger, and report.
 fn apply_edit(

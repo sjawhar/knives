@@ -25,7 +25,18 @@ pub(crate) enum ReleaseInvocation {
     Cut {
         name: Option<String>,
         allow_drop: bool,
+        allow_stale_member: bool,
+        force_new_name: bool,
+        why: Option<String>,
     },
+}
+
+struct CutRequest {
+    name: Option<String>,
+    allow_drop: bool,
+    allow_stale_member: bool,
+    force_new_name: bool,
+    why: Option<String>,
 }
 
 #[allow(
@@ -52,8 +63,8 @@ pub(crate) fn run_release(
     let heads = knives::consumer_pins::ConsumerHeadMemo::default();
     let opened = knives::jj::Repo::open(path)?;
     let scheme = entry.release_scheme();
-    let (cut_name, allow_drop) = match requested_cut(invocation, &scheme) {
-        Ok(request) => request,
+    let options = match requested_cut(invocation, &scheme) {
+        Ok(options) => options,
         Err(exit) => return Ok(exit),
     };
     let (mut worst, pins) = release_plan_exit(
@@ -68,16 +79,40 @@ pub(crate) fn run_release(
         return Ok(worst);
     }
 
-    if let Some(name) = cut_name {
+    let exception = cut_exception_reason(&options);
+    if let Some(name) = options.name {
+        if let Some(predecessor) = dotted_predecessor(&name)
+            && !options.force_new_name
+            && !predecessor_is_pinned(&pins, &predecessor)
+        {
+            println!(
+                "{repo}: {predecessor} is not pinned by any consumer; edit it in place and \
+                 republish under the same name (retain the old head as {})",
+                retention_name(&predecessor, "<sha8>")
+            );
+            return Ok(Exit::Incomplete);
+        }
         let trunk_name = entry.upstream_trunk();
         let trunk = opened.resolve_commit(&trunk_name)?;
         if let Some(orphaned) = check_orphan_commits_before_cut(&opened, fork)?
-            && let Some(exit) = report_orphaned_cut(repo, &orphaned, allow_drop)
+            && let Some(exit) = report_orphaned_cut(repo, &orphaned, options.allow_drop)
         {
             return Ok(exit);
         }
         let tips = opened.bookmark_tips()?;
         let previous = previous_release_for_cut(entry, &tips);
+        if let Some((previous, _)) = &previous
+            && let Some(exit) = stale_member_cut_exit(
+                &opened,
+                fork,
+                &previous.to_string(),
+                &name,
+                options.allow_stale_member,
+                options.why.as_deref(),
+            )?
+        {
+            return Ok(exit);
+        }
         let previous_commit = previous.as_ref().map(|(_, commit)| commit.clone());
         // A dated cut takes a name that sorts after the newest release: the reap
         // that follows every dated cut keeps only the newest name, so any other
@@ -206,7 +241,7 @@ pub(crate) fn run_release(
             tips: &tips,
         };
         let (recorded, check) =
-            match recorded_composition_check(repo, &mut candidate, &gate, allow_drop)? {
+            match recorded_composition_check(repo, &mut candidate, &gate, options.allow_drop)? {
                 Ok(verdict) => verdict,
                 Err(exit) => return Ok(exit),
             };
@@ -220,6 +255,7 @@ pub(crate) fn run_release(
             scheme: &scheme,
             recorded: recorded.as_ref(),
             check: &check,
+            exception: exception.as_deref(),
         };
         record_cut_event(fork, &completed, bound)?;
         worst = worst.worst(report_completed_cut(fork, &opened, &completed)?);
@@ -227,22 +263,194 @@ pub(crate) fn run_release(
     Ok(worst)
 }
 
+/// Republish the edited release in hand without minting a needless successor.
+/// The old remote head is retained first, then exactly those two refs are pushed
+/// to the configured release remote.
+pub(crate) fn run_republish(fork: &Fork<'_>, bound: Option<&RepoName>) -> anyhow::Result<Exit> {
+    let repo = &fork.name;
+    let entry = fork.entry;
+    let path = &fork.checkout.path;
+    let opened = knives::jj::Repo::open(path)?;
+    let tips = opened.bookmark_tips()?;
+    let Some((reference, _)) = previous_release_for_cut(entry, &tips) else {
+        println!("{repo}: no release to republish");
+        return Ok(Exit::Incomplete);
+    };
+    let release = reference.branch().to_string();
+    let Some(replacement) = opened.local_bookmark_tip(&release) else {
+        println!(
+            "{repo}: {release} has no single local position; resolve its divergence or track it first"
+        );
+        return Ok(Exit::Incomplete);
+    };
+    let published_ref = BookmarkRef::Remote {
+        branch: reference.branch().clone(),
+        remote: RemoteName::new(entry.publish_remote()),
+    };
+    let Some(published) = tips.get(&published_ref).cloned() else {
+        println!(
+            "{repo}: {release} is not present on {}; nothing can be retained before republishing",
+            entry.publish_remote()
+        );
+        return Ok(Exit::Incomplete);
+    };
+    if published == replacement {
+        println!(
+            "{repo}: {release} already matches {} at {}; nothing republished",
+            entry.publish_remote(),
+            published.short()
+        );
+        return Ok(Exit::Ok);
+    }
+    let keep = retention_name(&release, &published.as_str()[..8]);
+    knives::jj::retain_and_repoint_release(path, &release, &published, &replacement, &keep)?;
+    knives::jj::push_bookmarks(path, entry.publish_remote(), &[&keep, &release])?;
+    let reopened = knives::jj::Repo::open(path)?;
+    let parents = reopened.parent_commits(&release)?;
+    scribe_for(fork, bound)?.record(&Draft {
+        subject: Some(&release),
+        kind: Kind::Event,
+        disposition: None,
+        text: format!(
+            "republished {release} as {}; retained published {} as {keep}",
+            replacement.short(),
+            published.short()
+        ),
+        evidence: vec![replacement.as_str().to_owned(), published.as_str().to_owned()],
+        pr: None,
+        parents: recorded_parents(&reopened, entry, &parents)?,
+    })?;
+    println!(
+        "{repo}: republished {release} as {}; retained {} as {keep} on {}",
+        replacement.short(),
+        published.short(),
+        entry.publish_remote()
+    );
+    Ok(Exit::Ok)
+}
+
 fn requested_cut(
     invocation: &ReleaseInvocation,
     scheme: &knives::ids::ReleaseScheme,
-) -> Result<(Option<String>, bool), Exit> {
+) -> Result<CutRequest, Exit> {
     match invocation {
-        ReleaseInvocation::Plan => Ok((None, false)),
-        ReleaseInvocation::Cut { name, allow_drop } => {
-            match release::cut_name(scheme, name.as_deref()) {
-                Ok(name) => Ok((Some(name), *allow_drop)),
-                Err(message) => {
-                    eprintln!("{message}");
-                    Err(Exit::Usage)
-                }
+        ReleaseInvocation::Plan => Ok(CutRequest {
+            name: None,
+            allow_drop: false,
+            allow_stale_member: false,
+            force_new_name: false,
+            why: None,
+        }),
+        ReleaseInvocation::Cut {
+            name,
+            allow_drop,
+            allow_stale_member,
+            force_new_name,
+            why,
+        } => match release::cut_name(scheme, name.as_deref()) {
+            Ok(name) => Ok(CutRequest {
+                name: Some(name),
+                allow_drop: *allow_drop,
+                allow_stale_member: *allow_stale_member,
+                force_new_name: *force_new_name,
+                why: why.clone(),
+            }),
+            Err(message) => {
+                eprintln!("{message}");
+                Err(Exit::Usage)
             }
-        }
+        },
     }
+}
+
+/// The predecessor of a dotted dated-release name, if it has one.
+fn dotted_predecessor(name: &str) -> Option<String> {
+    let (date, suffix) = knives::ids::strict_dated_release(name)?;
+    (suffix > 0).then(|| {
+        if suffix == 1 {
+            format!("release/{date}")
+        } else {
+            format!("release/{date}.{}", suffix - 1)
+        }
+    })
+}
+
+fn predecessor_is_pinned(pins: &[knives::pins::Pin], predecessor: &str) -> bool {
+    pins.iter().any(|pin| pin.on_scheme && pin.reference == predecessor)
+}
+
+fn retention_name(release: &str, sha8: &str) -> String {
+    let name = release.strip_prefix("release/").unwrap_or(release);
+    format!("keep/release-{}-{sha8}", name.replace('/', "-"))
+}
+
+/// Refuse a recut of member commits that branch tips have already superseded.
+/// `gather_members(..., true)` is the `release members --verify` computation,
+/// so the cut uses the same current-tip evidence it shows the operator.
+fn stale_member_cut_exit(
+    opened: &knives::jj::Repo,
+    fork: &Fork<'_>,
+    release: &str,
+    name: &str,
+    allowed: bool,
+    why: Option<&str>,
+) -> anyhow::Result<Option<Exit>> {
+    let report = release::gather_members(opened, fork, release, true)?;
+    let stale = report
+        .members
+        .iter()
+        .filter(|member| !member.base_parent)
+        .flat_map(|member| {
+            member.advanced.iter().map(move |advanced| {
+                format!(
+                    "recorded member {} is not its branch's current tip: {advanced}",
+                    member.commit.short()
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    if stale.is_empty() {
+        return Ok(None);
+    }
+    let repo = &fork.name;
+    if allowed {
+        let Some(why) = why else {
+            eprintln!("--allow-stale-member requires --why");
+            return Ok(Some(Exit::Usage));
+        };
+        println!(
+            "{repo}: --allow-stale-member: cutting {name} with stale recorded member(s): {}; why: {why}",
+            stale.join("; ")
+        );
+        return Ok(None);
+    }
+    println!(
+        "{repo}: refusing to cut {name}: recorded member(s) are not their branch's current tip:"
+    );
+    for member in stale {
+        println!("  {member}");
+    }
+    println!(
+        "  run `knives release advance`, or re-run with --allow-stale-member --why <reason>"
+    );
+    Ok(Some(Exit::Incomplete))
+}
+
+fn cut_exception_reason(options: &CutRequest) -> Option<String> {
+    let mut exceptions = Vec::new();
+    if options.allow_stale_member {
+        exceptions.push(format!(
+            "--allow-stale-member: {}",
+            options.why.as_deref().unwrap_or("missing reason")
+        ));
+    }
+    if options.force_new_name {
+        exceptions.push(format!(
+            "--force-new-name: {}",
+            options.why.as_deref().unwrap_or("missing reason")
+        ));
+    }
+    (!exceptions.is_empty()).then(|| exceptions.join("; "))
 }
 
 /// The plan's exit, and the consumer pins it scanned. The cut judges the pins
@@ -417,6 +625,7 @@ struct CompletedCut<'a> {
     scheme: &'a ReleaseScheme,
     recorded: Option<&'a RecordedCut>,
     check: &'a release::CompositionCheck,
+    exception: Option<&'a str>,
 }
 
 /// Record which branches and commits became a published release cut.
@@ -476,12 +685,15 @@ fn record_cut_event(
             recorded.members.len()
         )
     });
+    let exception = cut
+        .exception
+        .map_or_else(String::new, |reason| format!("; exception: {reason}"));
     scribe_for(fork, bound)?.record(&Draft {
         subject: Some(cut.name),
         kind: Kind::Event,
         disposition: None,
         text: format!(
-            "cut {} as {} (change {}) with {} parent(s): {members_text}{delta}",
+            "cut {} as {} (change {}) with {} parent(s): {members_text}{delta}{exception}",
             cut.name,
             cut.created.short(),
             change.short(),

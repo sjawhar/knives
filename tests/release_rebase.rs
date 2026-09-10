@@ -965,3 +965,38 @@ fn a_rebase_refuses_a_release_held_only_as_a_remote_ref() {
         "the remote-only release was rebased anyway"
     );
 }
+
+#[test]
+fn release_rebase_reports_a_conflicted_rebuilt_merge_as_a_finding() {
+    // Given: two members conflict in the release merge. Rebasing them onto a
+    // newer trunk moves the whole composition but does not resolve that work.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "shared.txt", "alpha\n");
+    lab.branch("feat/beta", "shared.txt", "beta\n");
+    lab.octopus("release/2026-08-04", "feat/alpha", "feat/beta");
+    let (home, _consumer) = release_test_home(&lab);
+    lab.advance_upstream("upstream advance\n");
+
+    // When: the full composition moves to the newer trunk.
+    let output = knives_release(&lab, &home, &["rebase", "main@upstream"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Then: the rebase happened, but automation receives a non-zero result
+    // and the conflicted release is listed rather than silently reported green.
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert!(
+        stdout.contains("rebase completed with conflicts")
+            && stdout.contains("release/2026-08-04")
+            && stdout.contains("shared.txt"),
+        "{stdout}"
+    );
+    let repo = Repo::open(&lab.work).expect("reopen after conflict report");
+    assert!(
+        repo.is_ancestor(
+            &commit_at(&lab, "main@upstream"),
+            &commit_at(&lab, "release/2026-08-04")
+        )
+        .expect("ancestry"),
+        "the conflict report must follow a completed rebase"
+    );
+}

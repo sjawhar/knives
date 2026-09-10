@@ -732,3 +732,31 @@ fn an_edit_refuses_a_release_held_only_as_a_remote_ref() {
         "the remote-only release was edited anyway"
     );
 }
+
+#[test]
+fn include_refuses_a_parent_at_a_second_fork_point() {
+    // Given: alpha is already in the release at its original fork point, then
+    // gamma starts after upstream moves. Including gamma would mix bases.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let (home, _consumer) = home_after_first_cut(&lab);
+    lab.advance_upstream("upstream advance\n");
+    lab.mirror_upstream_trunk_to_origin();
+    lab.branch("feat/gamma", "gamma.txt", "gamma\n");
+    let before = release_parents(&lab, "release/2026-08-04");
+
+    // When: a new-base branch is included.
+    let output = knives_release(&lab, &home, &["include", "feat/gamma"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Then: the release remains unchanged and the diagnostic is actionable.
+    assert_eq!(output.status.code(), Some(3), "{stdout}");
+    assert!(
+        stdout.contains("refusing to include")
+            && stdout.contains("feat/alpha")
+            && stdout.contains("feat/gamma")
+            && stdout.contains("fork point"),
+        "{stdout}"
+    );
+    assert_eq!(release_parents(&lab, "release/2026-08-04"), before);
+}

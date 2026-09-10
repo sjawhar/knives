@@ -205,8 +205,19 @@ pub fn shared_base(
     trunk_tip: &CommitId,
 ) -> anyhow::Result<Option<CommitId>> {
     let parents = repo.parent_commits(release.as_str())?;
+    shared_base_for_parents(repo, &parents, trunk_tip)
+}
+
+/// The common fork point of a prospective release parent set and the upstream
+/// trunk. Kept beneath [`shared_base`] so live releases and prospective edits
+/// use one definition of their base.
+fn shared_base_for_parents(
+    repo: &Repo,
+    parents: &[CommitId],
+    trunk_tip: &CommitId,
+) -> anyhow::Result<Option<CommitId>> {
     let mut bases = Vec::new();
-    for parent in &parents {
+    for parent in parents {
         if repo.is_ancestor(parent, trunk_tip)? {
             bases.push(parent.clone());
         }
@@ -225,7 +236,44 @@ pub fn shared_base(
         // criss-cross, and guessing a base here would misattribute content.
         return Ok(None);
     }
-    Ok(repo.common_ancestor(&parents, trunk_tip)?)
+    Ok(repo.common_ancestor(parents, trunk_tip)?)
+}
+
+/// One prospective member and the point where it forked from the upstream
+/// trunk. `None` is itself unsafe: jj found several common ancestors and could
+/// not establish a single fork point for that member.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParentForkPoint {
+    pub parent: CommitId,
+    pub fork_point: Option<CommitId>,
+}
+
+/// Return every parent and its fork point when this parent set cannot prove one
+/// shared upstream base. The returned rows let callers name every implicated
+/// parent rather than reporting only an opaque count.
+pub fn mixed_fork_points(
+    repo: &Repo,
+    parents: &[CommitId],
+    trunk_tip: &CommitId,
+) -> anyhow::Result<Option<Vec<ParentForkPoint>>> {
+    if parents.len() < 2 {
+        return Ok(None);
+    }
+    let shared = shared_base_for_parents(repo, parents, trunk_tip)?;
+    let points = parents
+        .iter()
+        .map(|parent| {
+            Ok(ParentForkPoint {
+                parent: parent.clone(),
+                fork_point: repo.common_ancestor(std::slice::from_ref(parent), trunk_tip)?,
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let uniform = shared.is_some()
+        && points
+            .iter()
+            .all(|point| point.fork_point.as_ref() == shared.as_ref());
+    Ok((!uniform).then_some(points))
 }
 
 /// What a recut keeps reachable: the commits the orphan gate treats as work.

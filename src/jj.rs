@@ -2002,6 +2002,15 @@ fn repo_settings(path: &Path) -> Result<UserSettings, JjError> {
         detail,
     };
     let mut config = StackedConfig::with_defaults();
+    for file in user_config_files() {
+        load_config_file(&mut config, ConfigSource::User, &file, &open_error)?;
+    }
+    for file in repo_config_files(path)? {
+        load_config_file(&mut config, ConfigSource::Repo, &file, &open_error)?;
+    }
+    // Environment identity is jj's highest-precedence source. The rest of the
+    // configuration remains intact so the in-process writer uses the same
+    // signing backend and behavior that jj itself would use for this checkout.
     let (name, email) = resolved_identity(path)?;
     let mut lines = Vec::new();
     if let Some(name) = name {
@@ -2011,11 +2020,42 @@ fn repo_settings(path: &Path) -> Result<UserSettings, JjError> {
         lines.push(format!("user.email = {}", toml_string(&email)));
     }
     if !lines.is_empty() {
-        let layer = ConfigLayer::parse(ConfigSource::User, &lines.join("\n"))
+        let layer = ConfigLayer::parse(ConfigSource::CommandArg, &lines.join("\n"))
             .map_err(|error| open_error(error.to_string()))?;
         config.add_layer(layer);
     }
     UserSettings::from_config(config).map_err(|error| open_error(error.to_string()))
+}
+
+fn load_config_file(
+    config: &mut StackedConfig,
+    source: ConfigSource,
+    file: &Path,
+    open_error: &impl Fn(String) -> JjError,
+) -> Result<(), JjError> {
+    if file.exists() {
+        config
+            .load_file(source, file)
+            .map_err(|error| open_error(error.to_string()))?;
+    }
+    Ok(())
+}
+
+/// User configuration paths after `JJ_CONFIG` replaces the default lookup.
+fn user_config_files() -> Vec<PathBuf> {
+    if let Ok(paths) = std::env::var("JJ_CONFIG") {
+        return std::env::split_paths(&paths).collect();
+    }
+    let mut files = Vec::new();
+    if let Some(home) = config_home() {
+        files.push(home.join("jj/config.toml"));
+    }
+    if let Ok(home) = std::env::var("HOME")
+        && !home.is_empty()
+    {
+        files.push(PathBuf::from(home).join(".jjconfig.toml"));
+    }
+    files
 }
 
 /// A string as a quoted, escaped TOML literal.
@@ -2317,6 +2357,79 @@ pub fn set_bookmark(repo: &Path, name: &str, revision: &str) -> Result<(), JjErr
 /// move that motivated this distinction means these helpers are not interchangeable.
 pub fn set_bookmark_anywhere(repo: &Path, name: &str, revision: &str) -> Result<(), JjError> {
     move_bookmark(repo, (name, revision), BookmarkMotion::Anywhere)
+}
+
+/// Retain the published release head locally before moving `release` to its
+/// already-audited replacement. Both bookmarks become visible in one operation
+/// before the caller pushes them together to the release remote.
+pub fn retain_and_repoint_release(
+    repo_path: &Path,
+    release: &str,
+    published: &CommitId,
+    replacement: &CommitId,
+    keep: &str,
+) -> Result<(), JjError> {
+    let repo = Repo::open(repo_path)?;
+    if let Some(existing) = repo.local_bookmark_tip(keep)
+        && existing != *published
+    {
+        return Err(JjError::Revision {
+            revision: keep.to_owned(),
+            detail: format!(
+                "retention bookmark already points at {}, not published release {}",
+                existing.short(),
+                published.short()
+            ),
+        });
+    }
+    let published = repo.commit(published.as_str())?;
+    let replacement = repo.commit(replacement.as_str())?;
+    let mut tx = repo.repo.start_transaction();
+    tx.repo_mut().set_local_bookmark_target(
+        JjRefName::new(keep),
+        RefTarget::normal(published.id().clone()),
+    );
+    tx.repo_mut().set_local_bookmark_target(
+        JjRefName::new(release),
+        RefTarget::normal(replacement.id().clone()),
+    );
+    commit_mutation(
+        &repo,
+        tx,
+        &format!(
+            "knives: republish {release} as {}; retain {} as {keep}",
+            replacement.id().hex(),
+            published.id().hex()
+        ),
+    )
+}
+
+/// Push precisely the release and retention bookmarks to the configured release
+/// remote. This is deliberately a porcelain boundary: only jj owns remote
+/// transport and its configured credentials.
+pub fn push_bookmarks(
+    repo: &Path,
+    remote: &str,
+    bookmarks: &[&str],
+) -> Result<(), JjError> {
+    let repo_path = path(repo);
+    let mut command = Command::new("jj");
+    command.args(["--repository", &repo_path, "git", "push", "--remote", remote]);
+    for bookmark in bookmarks {
+        command.args(["--bookmark", bookmark]);
+    }
+    let output = command.output().map_err(|error| JjError::Process {
+        program: "jj git push".to_owned(),
+        detail: error.to_string(),
+    })?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(JjError::Command {
+        program: format!("jj git push --remote {remote}"),
+        status: output.status.to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+    })
 }
 
 /// How far a bookmark may move: [`BookmarkMotion::ForwardOnly`] refuses
