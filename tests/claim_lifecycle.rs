@@ -107,6 +107,7 @@ fn start_refuses_two_anonymous_owners_with_the_same_name() {
             .env("JJ_CONFIG", "/dev/null")
             .env_remove("KNIVES_OWNER")
             .env_remove("CLAUDE_CODE_SESSION_ID")
+            .env_remove("OMP_SESSION_ID")
             .env("USER", "terminal-user")
             .output()
             .expect("run start")
@@ -238,6 +239,7 @@ fn start_from_inside_the_claimed_workspace_resumes_by_possession() {
         .env("JJ_CONFIG", "/dev/null")
         .env_remove("KNIVES_OWNER")
         .env_remove("CLAUDE_CODE_SESSION_ID")
+        .env_remove("OMP_SESSION_ID")
         .env("USER", "terminal-user")
         .output()
         .expect("resume from workspace");

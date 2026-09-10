@@ -127,29 +127,29 @@ pub const fn owner_kind_label(kind: OwnerKind) -> &'static str {
     }
 }
 
+/// How a harness names the session a shell belongs to, in precedence order.
+///
+/// `KNIVES_OWNER` is what this tool's own `OpenCode` plugin injects; Claude Code
+/// and OMP each export their session id.
+pub const HARNESS_SESSION_VARIABLES: [&str; 3] =
+    ["KNIVES_OWNER", "CLAUDE_CODE_SESSION_ID", "OMP_SESSION_ID"];
+
 /// Resolves the identity that should own a claim.
 ///
-/// `KNIVES_OWNER` is what the `OpenCode` plugin injects. Claude Code instead
-/// provides its session ID. When neither harness provides an identity, `repo` —
-/// the fork the caller already bound (dispatch binds the working directory once
-/// per invocation; a verb passes the fork it acts on) — can identify its active
-/// owner from knives state. The OS user is the fallback for a human at a terminal.
-/// A blank `KNIVES_OWNER` is a plugin bug, not an identity. Treating it as one
-/// would let two agents share a claim. The same applies to `CLAUDE_CODE_SESSION_ID`.
+/// A harness that names its session (`HARNESS_SESSION_VARIABLES`) is the
+/// identity. When none does, `repo` — the fork the caller already bound
+/// (dispatch binds the working directory once per invocation; a verb passes the
+/// fork it acts on) — can identify its active owner from knives state. The OS
+/// user is the fallback for a human at a terminal.
+///
+/// A blank harness variable is a harness bug, not an identity: every session of
+/// that harness would share one claim.
 pub fn current_identity(repo: Option<&RepoName>) -> anyhow::Result<Identity> {
-    if let Some(owner) = std::env::var("KNIVES_OWNER")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-    {
-        return Ok(Identity {
-            owner,
-            kind: OwnerKind::HarnessSession,
-        });
-    }
-    if let Some(owner) = std::env::var("CLAUDE_CODE_SESSION_ID")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-    {
+    if let Some(owner) = HARNESS_SESSION_VARIABLES.iter().find_map(|name| {
+        std::env::var(name)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+    }) {
         return Ok(Identity {
             owner,
             kind: OwnerKind::HarnessSession,
@@ -205,12 +205,14 @@ mod tests {
             "KNIVES_CONFIG_HOME",
             "KNIVES_OWNER",
             "CLAUDE_CODE_SESSION_ID",
+            "OMP_SESSION_ID",
             "USER",
         ]);
         let config = tempfile::tempdir().unwrap();
         environment.set("KNIVES_CONFIG_HOME", config.path().to_str().unwrap());
         environment.set("KNIVES_OWNER", "   ");
         environment.remove("CLAUDE_CODE_SESSION_ID");
+        environment.remove("OMP_SESSION_ID");
         environment.set("USER", "terminal-user");
 
         let identity = current_identity(None).unwrap();
@@ -222,8 +224,12 @@ mod tests {
     #[test]
     fn a_harness_owner_resolves_as_a_harness_session() {
         let _lock = environment_lock();
-        let environment =
-            EnvironmentGuard::capture(&["KNIVES_OWNER", "CLAUDE_CODE_SESSION_ID", "USER"]);
+        let environment = EnvironmentGuard::capture(&[
+            "KNIVES_OWNER",
+            "CLAUDE_CODE_SESSION_ID",
+            "OMP_SESSION_ID",
+            "USER",
+        ]);
         environment.set("KNIVES_OWNER", "agent-one");
         let identity = current_identity(None).unwrap();
 
@@ -234,8 +240,12 @@ mod tests {
     #[test]
     fn a_claude_code_session_resolves_as_a_harness_session() {
         let _lock = environment_lock();
-        let environment =
-            EnvironmentGuard::capture(&["KNIVES_OWNER", "CLAUDE_CODE_SESSION_ID", "USER"]);
+        let environment = EnvironmentGuard::capture(&[
+            "KNIVES_OWNER",
+            "CLAUDE_CODE_SESSION_ID",
+            "OMP_SESSION_ID",
+            "USER",
+        ]);
         environment.remove("KNIVES_OWNER");
         environment.set("CLAUDE_CODE_SESSION_ID", "abc-123");
         environment.set("USER", "terminal-user");
@@ -247,18 +257,43 @@ mod tests {
     }
 
     #[test]
+    fn an_omp_session_resolves_as_a_harness_session() {
+        // OMP exports its session id into every shell it spawns and nothing
+        // else; without this, two OMP sessions in one repository fall through to
+        // the same derived owner and resume each other's claims.
+        let _lock = environment_lock();
+        let environment = EnvironmentGuard::capture(&[
+            "KNIVES_OWNER",
+            "CLAUDE_CODE_SESSION_ID",
+            "OMP_SESSION_ID",
+            "USER",
+        ]);
+        environment.remove("KNIVES_OWNER");
+        environment.remove("CLAUDE_CODE_SESSION_ID");
+        environment.set("OMP_SESSION_ID", "01a0-session");
+        environment.set("USER", "terminal-user");
+
+        let identity = current_identity(None).unwrap();
+
+        assert_eq!(identity.owner, "01a0-session");
+        assert_eq!(identity.kind, crate::store::OwnerKind::HarnessSession);
+    }
+
+    #[test]
     fn a_blank_claude_code_session_falls_back_to_the_os_user() {
         let _lock = environment_lock();
         let environment = EnvironmentGuard::capture(&[
             "KNIVES_CONFIG_HOME",
             "KNIVES_OWNER",
             "CLAUDE_CODE_SESSION_ID",
+            "OMP_SESSION_ID",
             "USER",
         ]);
         let config = tempfile::tempdir().unwrap();
         environment.set("KNIVES_CONFIG_HOME", config.path().to_str().unwrap());
         environment.remove("KNIVES_OWNER");
         environment.set("CLAUDE_CODE_SESSION_ID", "   ");
+        environment.remove("OMP_SESSION_ID");
         environment.set("USER", "terminal-user");
 
         let identity = current_identity(None).unwrap();
@@ -274,12 +309,14 @@ mod tests {
             "KNIVES_CONFIG_HOME",
             "KNIVES_OWNER",
             "CLAUDE_CODE_SESSION_ID",
+            "OMP_SESSION_ID",
             "USER",
         ]);
         let config = tempfile::tempdir().unwrap();
         environment.set("KNIVES_CONFIG_HOME", config.path().to_str().unwrap());
         environment.remove("KNIVES_OWNER");
         environment.remove("CLAUDE_CODE_SESSION_ID");
+        environment.remove("OMP_SESSION_ID");
         environment.set("USER", "terminal-user");
         let identity = current_identity(None).unwrap();
 
@@ -287,11 +324,14 @@ mod tests {
         assert_eq!(identity.kind, crate::store::OwnerKind::OsUser);
     }
 
-    /// A state file whose only claim, on `repo`, is held by `state-owner`.
-    fn state_with_one_claimant(home: &Path) {
+    /// A state file whose only claim, on `repo`, is held by `state-owner` with
+    /// the given identity kind.
+    fn state_with_one_claimant(home: &Path, kind: &str) {
         std::fs::write(
             home.join("state.json"),
-            r#"{"claims":{"repo/feat/owner":{"repo":"repo","branch":"feat/owner","owner":"state-owner","why":"test","started":"2026-01-01T00:00:00Z","files":[]}}}"#,
+            format!(
+                r#"{{"claims":{{"repo/feat/owner":{{"repo":"repo","branch":"feat/owner","owner":"state-owner","kind":"{kind}","why":"test","started":"2026-01-01T00:00:00Z","files":[]}}}}}}"#
+            ),
         )
         .unwrap();
     }
@@ -303,19 +343,47 @@ mod tests {
             "KNIVES_CONFIG_HOME",
             "KNIVES_OWNER",
             "CLAUDE_CODE_SESSION_ID",
+            "OMP_SESSION_ID",
             "USER",
         ]);
         let home = tempfile::tempdir().unwrap();
-        state_with_one_claimant(home.path());
+        state_with_one_claimant(home.path(), "harness-session");
         environment.set("KNIVES_CONFIG_HOME", home.path().to_str().unwrap());
         environment.remove("KNIVES_OWNER");
         environment.remove("CLAUDE_CODE_SESSION_ID");
+        environment.remove("OMP_SESSION_ID");
         environment.set("USER", "terminal-user");
 
         let identity = current_identity(Some(&RepoName::new("repo"))).unwrap();
 
         assert_eq!(identity.owner, "state-owner");
         assert_eq!(identity.kind, crate::store::OwnerKind::WorkspaceDerived);
+    }
+
+    #[test]
+    fn an_anonymous_claimant_seeds_no_derived_owner() {
+        // An OS-user claim names nobody in particular. Deriving it as the
+        // repository's owner would hand the next anonymous caller the same
+        // name — and `decide` would let them resume a claim that is not theirs.
+        let _lock = environment_lock();
+        let environment = EnvironmentGuard::capture(&[
+            "KNIVES_CONFIG_HOME",
+            "KNIVES_OWNER",
+            "CLAUDE_CODE_SESSION_ID",
+            "OMP_SESSION_ID",
+            "USER",
+        ]);
+        let home = tempfile::tempdir().unwrap();
+        state_with_one_claimant(home.path(), "os-user");
+        environment.set("KNIVES_CONFIG_HOME", home.path().to_str().unwrap());
+        environment.remove("KNIVES_OWNER");
+        environment.remove("CLAUDE_CODE_SESSION_ID");
+        environment.remove("OMP_SESSION_ID");
+        environment.set("USER", "state-owner");
+
+        let identity = current_identity(Some(&RepoName::new("repo"))).unwrap();
+
+        assert_eq!(identity.kind, crate::store::OwnerKind::OsUser);
     }
 
     #[test]
@@ -328,13 +396,15 @@ mod tests {
             "KNIVES_CONFIG_HOME",
             "KNIVES_OWNER",
             "CLAUDE_CODE_SESSION_ID",
+            "OMP_SESSION_ID",
             "USER",
         ]);
         let home = tempfile::tempdir().unwrap();
-        state_with_one_claimant(home.path());
+        state_with_one_claimant(home.path(), "harness-session");
         environment.set("KNIVES_CONFIG_HOME", home.path().to_str().unwrap());
         environment.remove("KNIVES_OWNER");
         environment.remove("CLAUDE_CODE_SESSION_ID");
+        environment.remove("OMP_SESSION_ID");
         environment.set("USER", "terminal-user");
 
         let identity = current_identity(None).unwrap();

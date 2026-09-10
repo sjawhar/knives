@@ -801,6 +801,10 @@ pub fn jj_workspace_add(checkout: &Path, name: &str, path: &Path) {
 /// The knives binary, run from `cwd` against the registry in `config_home` and
 /// scanning `scan_home` for checkouts. Returned unrun so a caller can add an
 /// environment variable (`KNIVES_OWNER`, say) before `.output()`.
+///
+/// The harness running the suite names its own session in the environment
+/// (`OMP_SESSION_ID`, `CLAUDE_CODE_SESSION_ID`, `KNIVES_OWNER`); those are
+/// removed so a test's identity is the one it states, whoever runs it.
 pub fn knives_command(cwd: &Path, config_home: &Path, scan_home: &Path, args: &[&str]) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_knives"));
     command
@@ -809,6 +813,9 @@ pub fn knives_command(cwd: &Path, config_home: &Path, scan_home: &Path, args: &[
         .env("KNIVES_CONFIG_HOME", config_home)
         .env("HOME", scan_home)
         .env("JJ_CONFIG", "/dev/null");
+    for name in knives::commands::claim::HARNESS_SESSION_VARIABLES {
+        command.env_remove(name);
+    }
     command
 }
 

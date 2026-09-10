@@ -476,11 +476,14 @@ more than four children in flight per process, degrading to an empty response in
 Code shell wrapper bounds its own stdin read with `timeout 35 cat` where timeout(1) exists,
 covering the window before the binary's watchdog can arm.
 
-The OMP extension uses Pi's native `bash` implementation rather than replacing it. OMP exposes no
-session environment variable to tool shells; its bash output is not a terminal, so CLI output is
-machine-readable through the non-terminal fallback. Commands that need an owner use
-`KNIVES_OWNER`, then the Claude Code session identifier, then the managed working directory's
-recorded owner, before falling back to the operating-system user.
+The OMP extension uses Pi's native `bash` implementation rather than replacing it. OMP exports
+`OMP_SESSION_ID` (and `CLAUDECODE=1`) into its tool shells; the bash output is not a terminal,
+so CLI output is machine-readable through the agent-environment path. Commands that need an
+owner take the first harness session variable set — `KNIVES_OWNER`, the Claude Code session
+identifier, then `OMP_SESSION_ID` — then the managed working directory's recorded owner (never
+one an anonymous claim recorded), before falling back to the operating-system user. Two
+sessions of one harness under one OS user are two claimants; only the harness's own name for
+the session tells them apart.
 
 ### Trust boundary
 

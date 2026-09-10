@@ -93,6 +93,7 @@ fn a_release_plan_reads_nothing_about_who_is_asking() {
     let output = release_command(&lab, &home, ReleaseOutput::Text, &[])
         .env_remove("KNIVES_OWNER")
         .env_remove("CLAUDE_CODE_SESSION_ID")
+        .env_remove("OMP_SESSION_ID")
         .output()
         .expect("run knives release");
     let text = String::from_utf8_lossy(&output.stdout);
@@ -120,6 +121,7 @@ fn a_release_plan_reads_nothing_about_who_is_asking() {
     )
     .env_remove("KNIVES_OWNER")
     .env_remove("CLAUDE_CODE_SESSION_ID")
+    .env_remove("OMP_SESSION_ID")
     .output()
     .expect("run knives release cut");
     let errors = String::from_utf8_lossy(&cut.stderr);
