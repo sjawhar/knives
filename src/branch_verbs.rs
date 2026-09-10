@@ -16,7 +16,7 @@ use knives::commands::claim::{
 use knives::commands::start::{collides_with_checkout, possesses, workspace_path};
 use knives::config::Registry;
 use knives::ids::{BranchName, BranchTarget, RepoName, Requirement};
-use knives::jj::{Repo, WorkspaceIdentity};
+use knives::jj::{Repo, WorkspaceIdentity, remove_prunable_worktree};
 use knives::store::{Store, default_state_path};
 
 use super::scribe_for;
@@ -124,7 +124,10 @@ pub(crate) fn run_finish(
     let shown = directory.display();
     let checkout = checkout_path.display();
     let removal = match identity {
-        None => format!("no directory at {shown}"),
+        None => format!(
+            "no directory at {shown}{}",
+            stale_worktree_note(checkout_path, &directory)
+        ),
         Some(WorkspaceIdentity::Ours(name)) if name.as_str() == workspace => {
             // A registration that could not be forgotten keeps its directory: with
             // the directory gone, every later `start` dies on jj's "already exists",
@@ -135,7 +138,10 @@ pub(crate) fn run_finish(
                 // the work is in the repository and reachable by change id. Untracked
                 // files are the exception, which is what --no-cleanup is for.
                 std::fs::remove_dir_all(&directory)?;
-                format!("{shown} removed; its commits remain in the repository")
+                format!(
+                    "{shown} removed; its commits remain in the repository{}",
+                    stale_worktree_note(checkout_path, &directory)
+                )
             } else {
                 format!("{shown} left on disk")
             }
@@ -167,6 +173,18 @@ pub(crate) fn run_finish(
     };
     println!("{target}: claim {claim}; workspace {workspace} {registration}; {removal}");
     Ok(Exit::Ok)
+}
+
+/// The Git side of a workspace whose directory is now gone: `jj workspace
+/// forget` unlinks the worktree it registered, but a directory that vanished
+/// before the forget leaves git's `.git/worktrees/<name>` entry behind, and the
+/// next `start` at that path would fail on it.
+fn stale_worktree_note(checkout: &Path, directory: &Path) -> String {
+    match remove_prunable_worktree(checkout, directory) {
+        Ok(true) => "; stale Git worktree registration removed".to_owned(),
+        Ok(false) => String::new(),
+        Err(error) => format!("; Git worktree registration not checked ({error})"),
+    }
 }
 
 /// What became of the branch's workspace registration.

@@ -501,3 +501,75 @@ fn start_says_when_the_forks_rule_shadows_a_user_level_one() {
         "the shadowed rule must be named: {stdout}"
     );
 }
+
+#[test]
+fn start_clears_a_prunable_git_registration_at_its_path() {
+    // Given: git still registers the branch's workspace path as a worktree whose
+    // directory is gone — a `jj workspace forget` that ran after the directory
+    // was removed leaves exactly this. `jj workspace add` refuses the path
+    // ("already registered") and leaves an empty directory behind.
+    let lab = Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let workspace = lab.work.parent().expect("parent").join("feat-alpha");
+    knives::jj::add_workspace(&lab.work, "feat-alpha", &workspace, "main@upstream")
+        .expect("add the workspace");
+    std::fs::remove_dir_all(&workspace).expect("remove the directory first");
+    knives::jj::forget_workspace(&lab.work, "feat-alpha").expect("forget the workspace");
+    let before = git_worktrees(&lab.work);
+    assert!(
+        before.contains("prunable"),
+        "fixture is not stale:\n{before}"
+    );
+
+    let output = knives_start(&lab, &home, "feat/alpha");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("removed a stale Git worktree registration"),
+        "{stdout}"
+    );
+    assert!(
+        workspace.join(".jj").is_dir(),
+        "the workspace was not created"
+    );
+    let after = git_worktrees(&lab.work);
+    assert!(!after.contains("prunable"), "{after}");
+}
+
+#[test]
+fn a_failed_workspace_add_leaves_no_empty_directory() {
+    // jj creates the destination before git registers it as a worktree; when
+    // git refuses (a stale registration at the path), the empty directory used
+    // to stay behind, and the next attempt then found "something" at the path.
+    let lab = Lab::new();
+    let workspace = lab.work.parent().expect("parent").join("feat-alpha");
+    knives::jj::add_workspace(&lab.work, "feat-alpha", &workspace, "main@upstream")
+        .expect("add the workspace");
+    std::fs::remove_dir_all(&workspace).expect("remove the directory first");
+    knives::jj::forget_workspace(&lab.work, "feat-alpha").expect("forget the workspace");
+
+    let result = knives::jj::add_workspace(&lab.work, "feat-alpha", &workspace, "main@upstream");
+
+    assert!(result.is_err(), "add succeeded over a stale registration");
+    assert!(
+        !workspace.exists(),
+        "an empty directory was left at {}",
+        workspace.display()
+    );
+}
+
+/// Git's registrations of the checkout's worktrees, `prunable` marked where the
+/// working tree is gone.
+fn git_worktrees(checkout: &std::path::Path) -> String {
+    let output = std::process::Command::new("git")
+        .args(["worktree", "list", "--porcelain"])
+        .current_dir(checkout)
+        .output()
+        .expect("git worktree list");
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}

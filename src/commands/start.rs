@@ -18,8 +18,9 @@ use crate::ids::{
     BookmarkRef, BranchName, BranchTarget, CommitId, RemoteName, RepoName, WorkspaceName,
 };
 use crate::jj::{
-    Repo, WorkspaceIdentity, add_workspace, fetch_all, is_workspace_named, repo_immutable_heads,
-    set_repo_immutable_heads, user_immutable_heads, workspace_identity,
+    Repo, WorkspaceIdentity, add_workspace, fetch_all, is_workspace_named,
+    remove_prunable_worktree, repo_immutable_heads, set_repo_immutable_heads, user_immutable_heads,
+    workspace_identity,
 };
 use crate::ledger::{Ledger, Scribe};
 use crate::release_model::newest_release;
@@ -567,6 +568,14 @@ fn create_workspace(context: &StartContext<'_>) -> anyhow::Result<WorkspaceBase>
             )
         }
     };
+    // A registration whose directory is gone would make `add` fail on git's
+    // "already registered" and leave an empty directory at the path.
+    if remove_prunable_worktree(checkout, &context.destination)? {
+        println!(
+            "removed a stale Git worktree registration at {} (its directory was gone)",
+            context.destination.display()
+        );
+    }
     add_workspace(
         checkout,
         context.workspace.as_str(),
