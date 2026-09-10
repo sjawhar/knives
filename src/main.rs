@@ -38,7 +38,7 @@ use knives::ids::{BranchName, RepoName};
 use knives::ledger::{Ledger, Scribe};
 use knives::store::{Store, default_state_path};
 use release_carries::{run_release_census, run_release_members, run_revision_carries};
-use release_cut::{ReleaseInvocation, run_reap, run_release};
+use release_cut::{ReleaseInvocation, run_reap, run_release, run_republish};
 use release_edit::{ReleaseEdit, run_release_edit};
 use release_rebase::run_rebase;
 
@@ -542,10 +542,22 @@ fn dispatch_release(
 ) -> anyhow::Result<Exit> {
     match action {
         None => run_release(fork, extra_consumers, &ReleaseInvocation::Plan, bound),
-        Some(ReleaseAction::Cut { name, allow_drop }) => run_release(
+        Some(ReleaseAction::Cut {
+            name,
+            allow_drop,
+            allow_stale_member,
+            force_new_name,
+            why,
+        }) => run_release(
             fork,
             extra_consumers,
-            &ReleaseInvocation::Cut { name, allow_drop },
+            &ReleaseInvocation::Cut {
+                name,
+                allow_drop,
+                allow_stale_member,
+                force_new_name,
+                why,
+            },
             bound,
         ),
         Some(ReleaseAction::Rebase { reference, no_drop }) => {
@@ -576,6 +588,7 @@ fn dispatch_release(
                 (false, None) => run_release_members(fork, reference.as_deref(), verify, output),
             }
         }
+        Some(ReleaseAction::Republish) => run_republish(fork, bound),
         Some(ReleaseAction::Reap) => run_reap(fork),
         Some(ReleaseAction::Include { branch, why }) => run_release_edit(
             fork,

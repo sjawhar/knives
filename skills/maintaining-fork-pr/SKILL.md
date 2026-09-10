@@ -132,7 +132,7 @@ Record each repair via `knives notch <branch> -m 'repair: <finding>; red: <comma
 
 ## 5. Draft truthful upstream communication
 
-Draft in scratch; publish only after the reviewer approves the candidate and the remote has it.
+Draft in scratch; publish only after the reviewer approves the candidate, the remote has it, and the release/consumer gate below is green. For a release-member branch, the PR body includes this exact rendered line: `running in trajectory`-`labs-pbc/<fork> since release/<name>`.
 
 Every word you publish lands in a human maintainer's notifications. The bar for a comment is that the maintainer needs to read it to review or merge the PR: an ask answered, a change since their last look explained, a wrong claim that would misdirect their review corrected. A comment that only tidies the record — restates what the diff already shows, updates a commit id in an old reply, re-announces an unchanged position — fails that bar and is not drafted. When you are unsure, the answer is no; the notch chain is where tidiness goes.
 
@@ -158,20 +158,20 @@ Write `<per-PR-scratch>/reviewer-packet.md` with:
 - Reviewer rules: independently examine the **whole diff** for correctness, security and regressions, including when the owner reports no repairs. Check every recon/inherited obligation, scope of each fix, body truth, red/green evidence and remaining forbidden hits. Reproduce applicable claims; do not merely accept the owner's logs. No commit, notch, bookmark or forge mutation. Any gate-generated change must be reported, never silently folded in.
 - Required first-line verdict: `PASS (no repairs)`, `PASS per fix (k/k)`, or `FAIL: fix|body|drift`, followed by evidence per question and any newly discovered finding. A question with no object says `none`.
 
-Send the packet to the orchestrator for a fresh-context reviewer. Wait up to 30 minutes; an acknowledgement is not a verdict. On timeout, write `decision: reviewer verdict outstanding; repair commits <ids>; bookmark not moved` with evidence and hand back. The orchestrator owns obtaining the verdict and resuming you, not the human.
+Obtain the fresh-context verdict: spawn the reviewer yourself from this packet when your harness gives you a subagent tool; otherwise write the packet to the sweep's scratch directory and send its path to the orchestrator, who dispatches the reviewer and returns the verdict verbatim. Either way the owner records the returned verdict verbatim, may spawn or request gate runners the same way, and reconciles their output. Wait up to 30 minutes; an acknowledgement is not a verdict. On timeout, write `decision: reviewer verdict outstanding; repair commits <ids>; bookmark not moved` with evidence and hand back. Obtaining the verdict and resuming verification is the owner's work, not the human's.
 
 **Candidate growth is not drift when it is intentional and reviewed.** Candidate B may intentionally differ from bookmark A until publication. Drift means the observed local bookmark differs from the packet's **expected branch tip**, the remote differs from its **original PR head**, the candidate commit/tree differs from what was reviewed, or any tracked working-copy change exists outside the candidate. Check these identities immediately before publishing and after any owner or reviewer command that can rewrite generated files. If a gate generated changes, the verdict is not a pass on those files; fold them into a new candidate through step 4 and send a fresh packet. An unrelated branch moving is not this PR drifting.
 
 Paste the returned verdict into a `verify:` notch verbatim. A malformed verdict returns for clarification. A FAIL blocks publication: repair code/body or resolve actual drift, refresh the packet and obtain a new review. A verdict for an old tree does not approve a new candidate.
 
-After PASS and the identity/tree checks:
+After PASS and the identity/tree checks, an upstream push is conditional: the branch must be a member of a release that has passed the octopus gate, been published to the release remote, and been pinned and green in the consumer (consumer CI and dev1). Confirm that chain with the release orchestrator's evidence before moving the PR head. If any link is absent, record it and hand back; do not open or push the upstream PR yet.
 
 ```sh
 jj bookmark set <branch> -r <candidate>
 jj git push --remote origin -b <branch>
 ```
 
-Use the actual configured PR-head remote if it differs from `origin`; `knives pushed <branch>` and a fresh `knives pr <number>` must confirm the remote branch and live PR have the candidate. With no repairs/rehome, there is no push. Re-read paginated workflow runs on the exact published head. Failure is actionable repair work. Executable pending runs need a real watcher, owned by you or explicitly retained by the orchestrator after handback; do not sample once and forget them. `action_required` is unrun, not a request to upstream for approval. Missing/blocked runtime evidence stays explicit.
+Use the actual configured PR-head remote if it differs from `origin`; `knives pushed <branch>` and a fresh `knives pr <number>` must confirm the remote branch and live PR have the candidate. A NEW upstream PR opens from the personal fork (`origin`), never the org fork: GitHub grants "allow edits by maintainers" only on personal-fork heads, and upstreams that require branches to be current before merge depend on it to update a branch that falls behind. An existing PR whose head is on the org fork stays there (moving it means close-and-reopen, which is noise) — push to that remote's branch and note it in `record:`. With no repairs/rehome, there is no push. Re-read paginated workflow runs on the exact published head. Failure is actionable repair work. Executable pending runs need a real watcher, owned by you or explicitly retained by the orchestrator after handback; do not sample once and forget them. `action_required` is unrun, not a request to upstream for approval. Missing/blocked runtime evidence stays explicit.
 
 Record `verify:` with the verbatim reviewer verdict, original-to-published commits (or no push), each local gate's last result and complete log path, real-surface evidence separately, and CI conclusions/pending on that head. A passing gate at another commit does not fill this record.
 
@@ -183,11 +183,11 @@ knives notch <branch> --pr <number> -m 'record: body <updated|unchanged>; thread
 
 Only include evidence arguments that exist. Publish no fabricated counts or blanket green claims while required verification is pending.
 
-**Done when:** the exact candidate has independent approval, the live PR head matches, publication is confirmed, and all pending checks/runtime obligations have an explicit continuing owner.
+**Done when:** the exact candidate has independent approval; its branch is a member of a one-fork-point, conflict-free release; that release is published, pinned, and green in the consumer; the live PR head matches; publication is confirmed; and all pending checks/runtime obligations have an explicit continuing owner.
 
 ## 7. Hand back without losing the release obligation
 
-Freshly read the PR head, comments/reviews and **all pages** of review threads after publication. Compare with recon to confirm the changes actually made, and count unresolved threads without a page cap. Read `knives notch <branch>` once more to reconcile the record.
+After publication — or after an unmet release/consumer gate requires a no-push handback — freshly read the PR head, comments/reviews and **all pages** of review threads. Compare with recon to confirm the changes actually made, and count unresolved threads without a page cap. Read `knives notch <branch>` once more to reconcile the record.
 
 Write `handback:` with the original/candidate/published commits, what changed, rehome result, unresolved-thread count, outstanding promises, remaining verification/CI and its owner, and the release relationship: member/lone, released parent commit if any, whether that parent equals the published head/candidate, and who owns any required `knives release advance` or release-wide action. Do not claim the released parent advanced just because the PR bookmark moved. If the dispatch explicitly requested release or consumer assurance, include the exact proof or continuing owner; otherwise do not expand a PR-only handback into a release-ready claim. Cite the head, PR and relevant release commit.
 

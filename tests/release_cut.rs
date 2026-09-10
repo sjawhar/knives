@@ -22,8 +22,8 @@ use knives::detect::landed::RebaseOutcome;
 use knives::ids::ReleaseScheme;
 use knives::jj::Repo;
 use lab::{
-    Lab, ReleaseOutput, commit_at, knives_release, newest_operation_description, operation_ids,
-    release_command, release_parents, release_test_home, release_test_home_pinned,
+    Lab, ReleaseOutput, commit_at, extend_branch, knives_release, newest_operation_description,
+    operation_ids, release_command, release_parents, release_test_home, release_test_home_pinned,
 };
 
 #[test]
@@ -1207,4 +1207,200 @@ fn a_fixed_scheme_cut_carries_the_local_release_in_hand() {
         parents.contains(&alpha),
         "the cut lost a member it started with: {parents:?}\n{stdout}"
     );
+}
+
+#[test]
+fn cut_refuses_stale_members_unless_the_caller_records_why() {
+    // Given: alpha has advanced while the release still records its old tip.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let (home, _consumer) = release_test_home(&lab);
+    assert!(
+        knives_release(&lab, &home, &["cut", "release/2026-08-04"])
+            .status
+            .success()
+    );
+    extend_branch(&lab, "feat/alpha", "alpha.txt", "alpha\nmore\n");
+
+    // When: a later dated cut is requested without first advancing alpha.
+    let refused = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
+    let stdout = String::from_utf8_lossy(&refused.stdout);
+
+    // Then: the stale member is named and no new cut exists.
+    assert_eq!(refused.status.code(), Some(3), "{stdout}");
+    assert!(
+        stdout.contains("recorded member")
+            && stdout.contains("feat/alpha")
+            && stdout.contains("current tip"),
+        "{stdout}"
+    );
+    assert!(
+        Repo::open(&lab.work)
+            .expect("open after stale-member refusal")
+            .resolve_commit("release/2026-08-05")
+            .is_err(),
+        "a refused cut named the new release"
+    );
+
+    // And: a caller can make an exceptional stale cut, but only with a reason.
+    let allowed = knives_release(
+        &lab,
+        &home,
+        &[
+            "cut",
+            "release/2026-08-05",
+            "--allow-stale-member",
+            "--why",
+            "the release deliberately retains alpha's previous tested tip",
+        ],
+    );
+    assert_ne!(allowed.status.code(), Some(3), "{allowed:?}");
+    assert!(
+        Repo::open(&lab.work)
+            .expect("open after allowed stale-member cut")
+            .resolve_commit("release/2026-08-05")
+            .is_ok(),
+        "an allowed stale-member cut did not name the requested release: {allowed:?}"
+    );
+}
+
+#[test]
+fn dotted_cut_without_a_consumer_pin_requires_an_in_place_republish() {
+    // Given: the predecessor exists but no registered or ad-hoc consumer pins it.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let home = tempfile::tempdir().expect("create config home");
+    std::fs::write(
+        home.path().join("repos.toml"),
+        format!(
+            "[repos.demo]\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/work.git\"\n",
+            lab.upstream.display()
+        ),
+    )
+    .expect("write no-consumer registry");
+    assert!(
+        knives_release(&lab, &home, &["cut", "release/2026-08-04"])
+            .status
+            .success()
+    );
+
+    // When: a dotted successor is requested.
+    let refused = knives_release(&lab, &home, &["cut", "release/2026-08-04.1"]);
+    let stdout = String::from_utf8_lossy(&refused.stdout);
+
+    // Then: no gratuitous successor is named, and the stable in-place rule is
+    // stated verbatim for operators.
+    assert_eq!(refused.status.code(), Some(3), "{stdout}");
+    assert!(
+        stdout.contains("release/2026-08-04 is not pinned by any consumer; edit it in place")
+            && stdout.contains("retain the old head as keep/release-2026-08-04-"),
+        "{stdout}"
+    );
+
+    // And: the exceptional new name remains available only with an explicit reason.
+    let forced = knives_release(
+        &lab,
+        &home,
+        &[
+            "cut",
+            "release/2026-08-04.1",
+            "--force-new-name",
+            "--why",
+            "an external frozen consumer needs a distinct release name",
+        ],
+    );
+    assert!(forced.status.success(), "{forced:?}");
+}
+
+#[test]
+fn generated_release_merge_honors_jj_signing_configuration() {
+    // Given: a repository with an SSH signing key and jj configured to sign
+    // commits authored by this identity.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let key_dir = tempfile::tempdir().expect("create signing key directory");
+    let key = key_dir.path().join("release-signing-key");
+    let generated = std::process::Command::new("ssh-keygen")
+        .args([
+            "-q",
+            "-t",
+            "ed25519",
+            "-N",
+            "",
+            "-f",
+            key.to_str().expect("utf-8 signing key path"),
+        ])
+        .output()
+        .expect("run ssh-keygen");
+    assert!(generated.status.success(), "{generated:?}");
+    lab.jj_work(["config", "set", "--repo", "signing.backend", "ssh"]);
+    lab.jj_work(["config", "set", "--repo", "signing.behavior", "own"]);
+    lab.jj_work([
+        "config",
+        "set",
+        "--repo",
+        "signing.key",
+        key.to_str().expect("utf-8 signing key path"),
+    ]);
+    let (home, _consumer) = release_test_home(&lab);
+
+    // When: knives writes the flat release merge.
+    let output = knives_release(&lab, &home, &["cut", "release/2026-08-04"]);
+    assert!(output.status.success(), "{output:?}");
+    let commit = commit_at(&lab, "release/2026-08-04");
+    let object = std::process::Command::new("git")
+        .args(["cat-file", "-p", commit.as_str()])
+        .current_dir(&lab.work)
+        .output()
+        .expect("inspect generated merge object");
+    assert!(object.status.success(), "{object:?}");
+
+    // Then: the Git object itself carries the signature that a consumer sees.
+    assert!(
+        String::from_utf8_lossy(&object.stdout).contains("gpgsig "),
+        "{}",
+        String::from_utf8_lossy(&object.stdout)
+    );
+}
+
+#[test]
+fn republish_retains_the_published_head_before_moving_an_unpinned_release() {
+    // Given: the first cut is published, then locally edited in place. Its old
+    // remote head must remain reachable when the same release name is republished.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let (home, _consumer) = release_test_home(&lab);
+    assert!(
+        knives_release(&lab, &home, &["cut", "release/2026-08-04"])
+            .status
+            .success()
+    );
+    lab.push_branch("release/2026-08-04");
+    lab.fetch_work();
+    let old = commit_at(&lab, "release/2026-08-04@origin");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    assert!(
+        knives_release(
+            &lab,
+            &home,
+            &["include", "feat/beta", "--why", "new member"]
+        )
+        .status
+        .success()
+    );
+    let edited = commit_at(&lab, "release/2026-08-04");
+
+    // When: the edited release is republished under its existing name.
+    let output = knives_release(&lab, &home, &["republish"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Then: both remote refs are moved as one release publication: the live name
+    // reaches the edit and `keep/` reaches the former remote head.
+    assert!(output.status.success(), "{stdout}");
+    lab.fetch_work();
+    let keep = format!("keep/release-2026-08-04-{}", &old.as_str()[..8]);
+    assert_eq!(commit_at(&lab, "release/2026-08-04@origin"), edited);
+    assert_eq!(commit_at(&lab, &format!("{keep}@origin")), old);
+    assert!(stdout.contains(&keep), "{stdout}");
 }

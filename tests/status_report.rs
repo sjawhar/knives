@@ -25,7 +25,7 @@ use knives::config::RepoEntry;
 use knives::ids::BranchName;
 use knives::store::Store;
 use lab::{
-    Lab, commit_at, home_after_first_cut, knives_release, lab_entry, release_test_home,
+    Lab, commit_at, home_after_first_cut, knives, knives_release, lab_entry, release_test_home,
     without_forge_elapsed,
 };
 use std::process::Command;
@@ -759,5 +759,44 @@ fn status_is_silent_about_the_forks_own_immutable_heads_rule() {
             .any(|finding| finding.kind == knives::detect::FindingKind::ImmutableHeadsRule),
         "was: {:?}",
         report.findings
+    );
+}
+
+#[test]
+fn status_reports_mixed_base_for_a_release_with_two_fork_points() {
+    // Given: alpha began at the original trunk and beta after upstream moved,
+    // but a release was assembled from them anyway.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.advance_upstream("upstream advance\n");
+    lab.mirror_upstream_trunk_to_origin();
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    lab.octopus("release/2026-08-04", "feat/alpha", "feat/beta");
+    let home = tempfile::tempdir().expect("create config home");
+    std::fs::write(
+        home.path().join("repos.toml"),
+        format!(
+            "[repos.demo]\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/work.git\"\n",
+            lab.upstream.display()
+        ),
+    )
+    .expect("write registry");
+
+    // When: status examines the release in hand.
+    let output = knives(
+        &lab,
+        &home,
+        &["--text", "status", "demo", "--no-github", "--no-landed"],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Then: mixed-base is a first-class finding naming the release and both members.
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert!(
+        stdout.contains("mixed-base")
+            && stdout.contains("release/2026-08-04")
+            && stdout.contains("feat/alpha")
+            && stdout.contains("feat/beta"),
+        "{stdout}"
     );
 }

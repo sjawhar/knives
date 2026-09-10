@@ -513,3 +513,53 @@ fn advance_refuses_the_trunk_and_the_release_by_name() {
         );
     }
 }
+
+#[test]
+fn advance_refuses_a_member_at_a_second_fork_point() {
+    // Given: beta was rebased onto a newer upstream commit while alpha remains
+    // on the release's original base. Advancing beta would silently turn one
+    // flat release into a mixed-base octopus.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let (home, _consumer) = home_after_first_cut(&lab);
+    let old_beta = commit_at(&lab, "feat/beta");
+    lab.advance_upstream("upstream advance\n");
+    lab.jj_work([
+        "new",
+        "main@upstream",
+        "-m",
+        "beta rebuilt onto newer upstream",
+    ]);
+    std::fs::write(lab.work.join("beta.txt"), "beta\n").expect("rebuild beta");
+    lab.jj_work([
+        "bookmark",
+        "set",
+        "feat/beta",
+        "-r",
+        "@",
+        "--allow-backwards",
+    ]);
+    lab.jj_work(["new"]);
+    let before = release_parents(&lab, "release/2026-08-04");
+
+    // When: the moved member is advanced into the composition.
+    let output = knives_release(
+        &lab,
+        &home,
+        &["advance", "feat/beta", "--from", old_beta.as_str()],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Then: no write occurs, and every implicated parent and fork point is
+    // named so the caller can rebase the whole composition instead.
+    assert_eq!(output.status.code(), Some(3), "{stdout}");
+    assert!(
+        stdout.contains("refusing to advance")
+            && stdout.contains("feat/beta")
+            && stdout.contains("fork point")
+            && stdout.contains("existing fork point(s)"),
+        "{stdout}"
+    );
+    assert_eq!(release_parents(&lab, "release/2026-08-04"), before);
+}

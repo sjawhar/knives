@@ -442,6 +442,17 @@ pub enum ReleaseAction {
         /// cut's ledger event recorded. The refusal lists exactly what.
         #[arg(long)]
         allow_drop: bool,
+        /// Cut from the release's recorded member commits even though a named
+        /// branch has moved on. Requires an explicit reason in the ledger.
+        #[arg(long, requires = "why")]
+        allow_stale_member: bool,
+        /// Name an unpinned dotted successor instead of repairing and
+        /// republishing its predecessor in place. Requires an explicit reason.
+        #[arg(long, requires = "why")]
+        force_new_name: bool,
+        /// Why an exceptional stale-member or new-name cut is necessary.
+        #[arg(long)]
+        why: Option<String>,
     },
     /// Rebase the composition onto an upstream commit: `jj rebase -b <release> -d <target>`.
     ///
@@ -539,6 +550,9 @@ pub enum ReleaseAction {
         #[arg(long, requires = "census", conflicts_with_all = ["reference", "verify", "carries"])]
         no_github: bool,
     },
+    /// Retain the published head, then publish the locally edited release under
+    /// the same name on the configured release remote.
+    Republish,
     /// Reap superseded dated cuts: forget their bookmarks everywhere, abandon their commits.
     /// The remote is never touched.
     ///

@@ -127,6 +127,7 @@ pub(crate) fn run_rebase(
     }
     shed_stale_bases(path, (&release_name, &release_commit), &members, shed)?;
     knives::jj::rebase_branch_onto(path, &release_name, &onto)?;
+    let conflict_exit = report_rebase_conflicts(repo, path, &release_name)?;
     report_rebased_release(
         fork,
         &RebasedRelease {
@@ -138,9 +139,46 @@ pub(crate) fn run_rebase(
         bound,
     )?;
     if no_drop {
+        return Ok(conflict_exit);
+    }
+    Ok(conflict_exit.worst(drop_landed_members(
+        fork,
+        &release_name,
+        &destination,
+        bound,
+    )?))
+}
+
+/// Report conflicts left by a completed rebase and make them a non-zero result.
+/// A rebase records conflicts in member and merge commits rather than failing at
+/// the mutation boundary, so success from jj alone cannot mean the composition
+/// is publishable.
+fn report_rebase_conflicts(
+    repo: &RepoName,
+    path: &std::path::Path,
+    release_name: &str,
+) -> anyhow::Result<Exit> {
+    let opened = knives::jj::Repo::open(path)?;
+    let release = opened.resolve_commit(release_name)?;
+    let mut members = Vec::new();
+    for parent in opened.parent_commits(release.as_str())? {
+        let files = knives::jj::conflicted_files(path, parent.as_str())?;
+        if !files.is_empty() {
+            members.push((parent, files));
+        }
+    }
+    let release_files = knives::jj::conflicted_files(path, release.as_str())?;
+    if members.is_empty() && release_files.is_empty() {
         return Ok(Exit::Ok);
     }
-    drop_landed_members(fork, &release_name, &destination, bound)
+    println!("{repo}: {release_name} rebase completed with conflicts:");
+    for (member, files) in members {
+        println!("  member {}: {}", member.short(), files.join(", "));
+    }
+    if !release_files.is_empty() {
+        println!("  release {release_name}: {}", release_files.join(", "));
+    }
+    Ok(Exit::Findings)
 }
 
 fn frozen_rebase_exit(
@@ -256,60 +294,6 @@ fn classify_rebase_parents(
         return Ok(None);
     }
     Ok(Some((members, shed)))
-}
-
-/// A resolved rebase destination: the commit, the label the report and
-/// provenance use, and which of our pull requests the forge says landed by it.
-struct RebaseDestination {
-    onto: knives::ids::CommitId,
-    reference: String,
-    /// Empty for an explicit reference: dropping is the bare default's job,
-    /// because only it knows the target covers every landing.
-    landed: Vec<PullRequest>,
-}
-
-#[derive(Clone, Copy)]
-struct RebaseTargetInput<'a> {
-    fork: &'a Fork<'a>,
-    opened: &'a knives::jj::Repo,
-    reference: Option<&'a str>,
-    cache_root: Option<&'a std::path::Path>,
-}
-
-#[derive(Clone, Copy)]
-struct ExistingRebaseInput<'a> {
-    opened: &'a knives::jj::Repo,
-    fork: &'a Fork<'a>,
-    release_name: &'a str,
-    release_commit: &'a knives::ids::CommitId,
-    destination: &'a RebaseDestination,
-    no_drop: bool,
-    bound: Option<&'a RepoName>,
-}
-
-fn existing_rebase_exit(input: ExistingRebaseInput<'_>) -> anyhow::Result<Option<Exit>> {
-    let ExistingRebaseInput {
-        opened,
-        fork,
-        release_name,
-        release_commit,
-        destination,
-        no_drop,
-        bound,
-    } = input;
-    if !opened.is_ancestor(&destination.onto, release_commit)? {
-        return Ok(None);
-    }
-    println!(
-        "{}: {release_name} already contains {}",
-        fork.name, destination.reference
-    );
-    let exit = if no_drop {
-        Exit::Ok
-    } else {
-        drop_landed_members(fork, release_name, destination, bound)?
-    };
-    Ok(Some(exit))
 }
 
 /// The commit a rebase moves onto, with the label the report and provenance use.
@@ -612,6 +596,60 @@ fn drop_landed_members(
         Err(error) => println!("  could not list conflicts: {error}"),
     }
     Ok(Exit::Ok)
+}
+
+/// A resolved rebase destination: the commit, the label the report and
+/// provenance use, and which of our pull requests the forge says landed by it.
+struct RebaseDestination {
+    onto: knives::ids::CommitId,
+    reference: String,
+    /// Empty for an explicit reference: dropping is the bare default's job,
+    /// because only it knows the target covers every landing.
+    landed: Vec<PullRequest>,
+}
+
+#[derive(Clone, Copy)]
+struct RebaseTargetInput<'a> {
+    fork: &'a Fork<'a>,
+    opened: &'a knives::jj::Repo,
+    reference: Option<&'a str>,
+    cache_root: Option<&'a std::path::Path>,
+}
+
+#[derive(Clone, Copy)]
+struct ExistingRebaseInput<'a> {
+    opened: &'a knives::jj::Repo,
+    fork: &'a Fork<'a>,
+    release_name: &'a str,
+    release_commit: &'a knives::ids::CommitId,
+    destination: &'a RebaseDestination,
+    no_drop: bool,
+    bound: Option<&'a RepoName>,
+}
+
+fn existing_rebase_exit(input: ExistingRebaseInput<'_>) -> anyhow::Result<Option<Exit>> {
+    let ExistingRebaseInput {
+        opened,
+        fork,
+        release_name,
+        release_commit,
+        destination,
+        no_drop,
+        bound,
+    } = input;
+    if !opened.is_ancestor(&destination.onto, release_commit)? {
+        return Ok(None);
+    }
+    println!(
+        "{}: {release_name} already contains {}",
+        fork.name, destination.reference
+    );
+    let exit = if no_drop {
+        Exit::Ok
+    } else {
+        drop_landed_members(fork, release_name, destination, bound)?
+    };
+    Ok(Some(exit))
 }
 
 /// A composition rebase that just happened: what moved, and onto what.

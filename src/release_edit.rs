@@ -44,6 +44,12 @@ impl ReleaseEdit {
     }
 }
 
+impl ReleaseEdit {
+    const fn guards_fork_point_growth(&self) -> bool {
+        matches!(self, Self::Include { .. } | Self::Advance { .. })
+    }
+}
+
 /// What an edit decided: a new parent set to write with the delta that describes
 /// it, or an already-reported end.
 enum EditOutcome {
@@ -319,9 +325,84 @@ fn edit_release(
         EditOutcome::Settled(exit) => return Ok(exit),
         EditOutcome::Done(parents, delta) => (parents, delta),
     };
+    if change.guards_fork_point_growth()
+        && refuse_introduced_fork_points(&context, fork, &new_parents, change.verb())?
+    {
+        return Ok(Exit::Incomplete);
+    }
     apply_edit(&context, fork, &new_parents, &delta)
 }
 
+/// Refuse an edit that grows a release's set of member fork points. Existing
+/// mixed-base releases remain workable, but only `release rebase` may change
+/// their base set.
+fn refuse_introduced_fork_points(
+    context: &EditContext<'_>,
+    fork: &Fork<'_>,
+    parents: &[knives::ids::CommitId],
+    verb: &str,
+) -> anyhow::Result<bool> {
+    let trunk_name = fork.entry.upstream_trunk();
+    let trunk = context.opened.resolve_commit(&trunk_name)?;
+    let current = member_parents_at_trunk(context, &context.release.parents, &trunk)?;
+    let prospective = member_parents_at_trunk(context, parents, &trunk)?;
+    let introduced =
+        release::introduced_fork_points(context.opened, &current, &prospective, &trunk)?;
+    if introduced.is_empty() {
+        return Ok(false);
+    }
+    let sources = release::parent_sources(
+        context.opened,
+        fork.entry,
+        &fork.entry.release_scheme(),
+        parents,
+    )?;
+    let mut existing = release::parent_fork_points(context.opened, &current, &trunk)?
+        .into_iter()
+        .map(|point| {
+            point.fork_point.map_or_else(
+                || "no single fork point".to_owned(),
+                |point| point.short().to_owned(),
+            )
+        })
+        .collect::<Vec<_>>();
+    existing.sort();
+    existing.dedup();
+    println!(
+        "{}: refusing to {verb} {}: the member set would introduce a fork point against {trunk_name}:",
+        context.repo, context.release.name
+    );
+    println!("  existing fork point(s): {}", existing.join(", "));
+    for point in introduced {
+        let source = sources
+            .iter()
+            .find(|(_, parent)| parent == &point.parent)
+            .map_or_else(|| point.parent.short(), |(source, _)| source.as_str());
+        let fork_point = point
+            .fork_point
+            .as_ref()
+            .map_or("no single fork point", knives::ids::CommitId::short);
+        println!(
+            "  {source} ({}) -> fork point {fork_point}",
+            point.parent.short()
+        );
+    }
+    println!("  `knives release rebase` is the only way to change a release's member base");
+    Ok(true)
+}
+
+fn member_parents_at_trunk(
+    context: &EditContext<'_>,
+    parents: &[knives::ids::CommitId],
+    trunk: &knives::ids::CommitId,
+) -> anyhow::Result<Vec<knives::ids::CommitId>> {
+    parents.iter().try_fold(Vec::new(), |mut members, parent| {
+        if !context.opened.is_ancestor(parent, trunk)? {
+            members.push(parent.clone());
+        }
+        Ok(members)
+    })
+}
 /// Write the edited release — duplicated onto its new parent set, described,
 /// its name moved — record the parent set in the ledger, and report.
 fn apply_edit(
