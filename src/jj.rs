@@ -792,6 +792,36 @@ impl Repo {
         ))
     }
 
+    /// The visible commits that share `revision`'s change id, other than
+    /// `revision` itself: what a `jj rebase` (or a resolved conflict) left in
+    /// the commit's place. Empty for a commit whose change was never rewritten
+    /// or whose rewrites were all abandoned.
+    ///
+    /// A rewrite carries the change's intent, not necessarily its exact tree —
+    /// a divergent change names several trees at once — so a caller reading
+    /// "the member is here in rewritten form" must say that, not "identical".
+    pub fn rewrites_of(&self, revision: &str) -> Result<Vec<CommitId>, JjError> {
+        let commit = self.commit(revision)?;
+        let resolved =
+            block_on(self.repo.resolve_change_id(commit.change_id())).map_err(|error| {
+                JjError::Revision {
+                    revision: revision.to_owned(),
+                    detail: error.to_string(),
+                }
+            })?;
+        Ok(resolved
+            .into_iter()
+            .flat_map(|targets| {
+                targets
+                    .visible_with_offsets()
+                    .map(|(_, id)| id.clone())
+                    .collect::<Vec<_>>()
+            })
+            .filter(|id| id != commit.id())
+            .map(|id| commit_id(&id))
+            .collect())
+    }
+
     /// Merge commits reachable from `tip` but not from any of `bases` that join
     /// two or more lines none of the bases has, newest first.
     ///

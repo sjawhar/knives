@@ -1,13 +1,18 @@
 //! Whether content is actually carried — by replay and ancestry, never text.
 //!
 //! The audit's worst near-miss class was a branch deleted while its content
-//! was uncarried. The verdicts here are content-based only: sha ancestry for
+//! was uncarried. The verdicts here are content-based first: sha ancestry for
 //! carried-exact, a three-way tree merge for carried-rewritten (jj divergent
 //! change-ids force tree comparison — the same change id can name two
-//! different trees), and merge conflicts for human judgment. A net-zero
-//! revision is vacuously carried: it contributes no content for the target to
-//! lack. Every verdict names an evidence commit a notch can cite and a later
-//! reader can re-resolve.
+//! different trees). Only when the tree says otherwise does the change id
+//! speak, and it says something weaker on purpose: carried-rebased means a
+//! rewrite of the change (`jj rebase` keeps the change id) is in the target's
+//! ancestry, so the change lives on there in the form its author gave it on
+//! the new base — not that this exact tree does. Merge conflicts with no such
+//! rewrite stay a matter for human judgment. A net-zero revision is vacuously
+//! carried: it contributes no content for the target to lack. Every verdict
+//! names an evidence commit a notch can cite and a later reader can
+//! re-resolve.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -52,6 +57,10 @@ pub enum CarryVerdict {
     /// Its net tree change leaves the target unchanged, whether the same content
     /// arrived through different commits or the revision itself has no net content.
     CarriedRewritten,
+    /// Its tree does not replay cleanly, but a rewrite of its change — same
+    /// change id, a different commit — is an ancestor of the target: the change
+    /// is carried as its author rebased it, and that rewrite is the evidence.
+    CarriedRebased,
     NotCarried,
     /// The replay conflicted while the target itself is clean: some content
     /// is there or unrelated work touched the same files; judge by eye.
@@ -60,13 +69,18 @@ pub enum CarryVerdict {
 
 impl CarryVerdict {
     pub const fn carried(self) -> bool {
-        matches!(self, Self::CarriedExact | Self::CarriedRewritten)
+        matches!(
+            self,
+            Self::CarriedExact | Self::CarriedRewritten | Self::CarriedRebased
+        )
     }
 }
 
-/// One verdict with the commit that proves it: the revision tip for
-/// carried-exact (it IS in the target's ancestry), the target commit
-/// otherwise (the tree the replay was judged against).
+/// One verdict with the commit that proves it.
+///
+/// The revision tip for carried-exact (it IS in the target's ancestry), the
+/// rewrite for carried-rebased (the same change, in the target's ancestry),
+/// the target commit otherwise (the tree the replay was judged against).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct CarryCheck {
     pub verdict: CarryVerdict,
@@ -601,12 +615,14 @@ fn render_check(check: &TargetCheck, indent: &str) -> String {
     let verdict = match check.verdict {
         CarryVerdict::CarriedExact => "carried-exact",
         CarryVerdict::CarriedRewritten => "carried-rewritten",
+        CarryVerdict::CarriedRebased => "carried-rebased",
         CarryVerdict::NotCarried => "NOT carried",
         CarryVerdict::Conflicted => "conflicted",
     };
     let reason = match check.verdict {
         CarryVerdict::CarriedExact => "tip is an ancestor",
         CarryVerdict::CarriedRewritten => "no net content remains",
+        CarryVerdict::CarriedRebased => "a rewrite of the change is an ancestor",
         CarryVerdict::NotCarried => "replay leaves real diffs",
         CarryVerdict::Conflicted => "judge by eye",
     };
@@ -744,6 +760,16 @@ pub fn check(input: &CheckInput<'_>, target: &Target) -> anyhow::Result<CarryChe
         RebaseOutcome::CleanNonEmpty => CarryVerdict::NotCarried,
         RebaseOutcome::Conflicted => CarryVerdict::Conflicted,
     };
+    if verdict != CarryVerdict::CarriedRewritten {
+        for rewrite in input.repo.rewrites_of(input.tip.as_str())? {
+            if input.repo.is_ancestor(&rewrite, &target.commit)? {
+                return Ok(CarryCheck {
+                    verdict: CarryVerdict::CarriedRebased,
+                    evidence: rewrite,
+                });
+            }
+        }
+    }
     Ok(CarryCheck {
         verdict,
         evidence: target.commit.clone(),

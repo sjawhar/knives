@@ -1731,14 +1731,18 @@ pub struct CompositionDelta<'a> {
 /// Recorded members of the previous cut that the candidate does not carry.
 ///
 /// Identity and ancestry account for a member that is still a parent, was
-/// advanced past, or entered through the candidate's base; the content replay
-/// accounts for one that landed upstream as a squash — the same measure
-/// [`audit_cut`] applies to current members, taken from the member's own fork
-/// point so a moved base is never charged to the member. A member the trunk
-/// reaches but the candidate does not is dropped without a replay: its fork
-/// point degenerates to the member itself, and that replay would read empty
-/// without consulting the candidate at all. A recorded commit this repository
-/// cannot resolve counts as dropped: unverifiable must not read as carried.
+/// advanced past, or entered through the candidate's base. A member whose
+/// change was rewritten — `jj rebase` keeps the change id and mints a new
+/// commit — is carried when a rewrite is reachable from a parent or the base,
+/// the same succession `advance` recognises; the recorded commit itself is
+/// never an ancestor again after a rebase. The content replay accounts for one
+/// that landed upstream as a squash — the same measure [`audit_cut`] applies
+/// to current members, taken from the member's own fork point so a moved base
+/// is never charged to the member. A member the trunk reaches but the
+/// candidate does not is dropped without a replay: its fork point degenerates
+/// to the member itself, and that replay would read empty without consulting
+/// the candidate at all. A recorded commit this repository cannot resolve
+/// counts as dropped: unverifiable must not read as carried.
 pub fn uncarried_recorded_members(
     repo: &Repo,
     candidate: &mut jj::Candidate,
@@ -1756,14 +1760,18 @@ pub fn uncarried_recorded_members(
                 .push(format!("{} (not known to this repository)", member.short()));
             continue;
         }
-        let mut carried = repo.is_ancestor(member, delta.base)?;
-        for parent in delta.parents {
-            if carried {
+        if reaches_any(repo, member, delta)? {
+            continue;
+        }
+        let rewrites = repo.rewrites_of(member.as_str())?;
+        let mut rewritten = false;
+        for rewrite in &rewrites {
+            if reaches_any(repo, rewrite, delta)? {
+                rewritten = true;
                 break;
             }
-            carried = repo.is_ancestor(member, parent)?;
         }
-        if carried {
+        if rewritten {
             continue;
         }
         if repo.is_ancestor(member, delta.trunk)? {
@@ -1787,6 +1795,23 @@ pub fn uncarried_recorded_members(
         }
     }
     Ok(check)
+}
+
+/// Whether the candidate's base or any of its parents reaches `commit`.
+fn reaches_any(
+    repo: &Repo,
+    commit: &CommitId,
+    delta: &CompositionDelta<'_>,
+) -> anyhow::Result<bool> {
+    if repo.is_ancestor(commit, delta.base)? {
+        return Ok(true);
+    }
+    for parent in delta.parents {
+        if repo.is_ancestor(commit, parent)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// `feat/gamma@a9a6c3e8ad93` when a local bookmark still holds the commit,

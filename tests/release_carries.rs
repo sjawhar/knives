@@ -246,6 +246,47 @@ fn release_carries_stops_before_superseded_targets_when_live_release_carries() {
 }
 
 #[test]
+fn release_carries_answers_carried_rebased_for_a_rewritten_member_the_release_holds() {
+    // Given: a member rebased onto the advanced trunk and adapted there, then
+    // advanced onto the release; the recorded commit (the pre-rebase one) is
+    // asked about. Its tree no longer replays cleanly, but the release holds a
+    // rewrite of the same change.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let (home, _consumer) = home_after_first_cut(&lab);
+    let recorded = commit_at(&lab, "feat/alpha");
+    lab.advance_upstream("upstream advance\n");
+    lab.jj_work(["rebase", "-b", "feat/alpha", "-d", "main@upstream"]);
+    lab.jj_work(["new", "feat/alpha"]);
+    std::fs::write(
+        lab.work.join("alpha.txt"),
+        "alpha, adapted to the new trunk\n",
+    )
+    .expect("adapt the member on its new base");
+    lab.jj_work(["squash", "--into", "feat/alpha"]);
+    let rewritten = commit_at(&lab, "feat/alpha");
+    let advanced = knives_release(&lab, &home, &["advance", "feat/alpha"]);
+    assert!(advanced.status.success(), "{advanced:?}");
+
+    // When: the pre-rebase commit is checked against the release.
+    let output = knives_release(&lab, &home, &["members", "--carries", recorded.as_str()]);
+
+    // Then: carried, in rebased form, with the rewrite as the evidence — and
+    // the exit says carried, so a deletion-safety reader is not sent to judge
+    // by eye.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}");
+    assert!(
+        stdout.contains("carried-rebased    release/2026-08-04"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("evidence {}", rewritten.short())),
+        "{stdout}"
+    );
+}
+
+#[test]
 fn release_carries_answers_not_carried_for_outside_work() {
     // Given: a release cut carrying alpha and an independent beta branch.
     let lab = Lab::new();

@@ -254,6 +254,74 @@ fn a_recorded_member_that_landed_upstream_is_carried_not_dropped() {
 }
 
 #[test]
+fn a_recorded_member_rebased_and_adapted_is_carried_not_dropped() {
+    // Given: a member rebased onto the advanced trunk and adapted there — its
+    // file rewritten on the new base, so the recorded commit's own diff no
+    // longer replays cleanly onto anything carrying the adapted version. jj
+    // kept the change id; the composition follows the rebased branch through
+    // `advance`. Observed on hawk 2026-09-10: a member recorded by commit at
+    // one cut, rebased and folded into another parent, refused as "absent".
+    let lab = lab::Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let (home, _consumer) = home_after_first_cut(&lab);
+    let recorded = commit_at(&lab, "feat/alpha");
+    lab.advance_upstream("upstream advance\n");
+    lab.jj_work(["rebase", "-b", "feat/alpha", "-d", "main@upstream"]);
+    lab.jj_work(["new", "feat/alpha"]);
+    std::fs::write(
+        lab.work.join("alpha.txt"),
+        "alpha, adapted to the new trunk\n",
+    )
+    .expect("adapt the member on its new base");
+    lab.jj_work(["squash", "--into", "feat/alpha"]);
+    let rewritten = commit_at(&lab, "feat/alpha");
+    assert_ne!(recorded, rewritten, "the rebase must rewrite the member");
+    assert_eq!(
+        Repo::open(&lab.work)
+            .expect("open")
+            .change_id_of(rewritten.as_str())
+            .expect("change id"),
+        Repo::open(&lab.work)
+            .expect("open")
+            .change_id_of(recorded.as_str())
+            .expect("change id"),
+        "the rewrite must keep the change id, or this test proves nothing"
+    );
+    let advanced = knives_release(&lab, &home, &["advance", "feat/alpha"]);
+    assert!(advanced.status.success(), "{advanced:?}");
+
+    // When: the next cut is taken without --allow-drop.
+    let output = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
+
+    // Then: the member is carried in its rebased form, not reported dropped.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("cut release/2026-08-05 as"),
+        "a rebased member was treated as dropped: {stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        release_parents(&lab, "release/2026-08-05").contains(&rewritten),
+        "the new cut must carry the rewritten member"
+    );
+    let entries = knives::ledger::Ledger::at(home.path().join("ledger").join("demo"))
+        .entries()
+        .expect("read ledger");
+    let event = entries
+        .iter()
+        .find(|entry| entry.subject.as_deref() == Some("release/2026-08-05"))
+        .unwrap_or_else(|| panic!("no cut entry: {entries:?}"));
+    assert!(
+        event
+            .text
+            .contains("previous cut release/2026-08-04 recorded 2 member(s); all carried"),
+        "was: {}",
+        event.text
+    );
+}
+
+#[test]
 fn a_recorded_member_this_repository_cannot_resolve_is_named_in_the_refusal() {
     // Given: a ledger whose newest cut event names a commit this checkout has
     // never seen — a stale ledger, or a re-clone. Unverifiable must not read
