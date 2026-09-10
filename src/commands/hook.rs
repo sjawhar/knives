@@ -17,7 +17,7 @@ use crate::hook::opencode::{self, Event as OpenCodeEvent, EventKind as OpenCodeE
 use crate::hook::resolve::{Match, argument_paths, match_checkout};
 use crate::hook::state::SessionState;
 use crate::ids::RepoName;
-use crate::store::{Store, default_state_path};
+use crate::store::{OwnerKind, Store, default_state_path};
 
 const CLAUDE_CODE: &str = "claude-code";
 const OPENCODE: &str = "opencode";
@@ -236,7 +236,10 @@ fn opencode_shell_env(event: &OpenCodeEvent) -> anyhow::Result<String> {
 ///
 /// `repo` is the entry the caller already bound the working directory to; a
 /// directory outside any managed fork, or whose remotes could not be read, is
-/// `None` and derives no owner.
+/// `None` and derives no owner. An OS-user claim names nobody in particular, so
+/// it seeds no derived owner: otherwise one anonymous claim would hand every
+/// later anonymous caller the same "derived" name, and they would resume each
+/// other's claims.
 pub(crate) fn owner_for(repo: Option<&RepoName>) -> anyhow::Result<Option<String>> {
     if let Some(owner) = std::env::var("KNIVES_OWNER")
         .ok()
@@ -254,7 +257,7 @@ pub(crate) fn owner_for(repo: Option<&RepoName>) -> anyhow::Result<Option<String
     let owners = store
         .claims(None)
         .into_iter()
-        .filter(|claim| claim.repo == repo.as_str())
+        .filter(|claim| claim.repo == repo.as_str() && claim.kind != OwnerKind::OsUser)
         .map(|claim| claim.owner.clone())
         .collect::<BTreeSet<_>>();
     Ok((owners.len() == 1)

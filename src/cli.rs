@@ -101,8 +101,8 @@ pub enum Output {
 /// unnecessary. The machine default is TOON — measured on real reports it carries
 /// the same structure at fewer tokens — and `--json` stays as the stable opt-in.
 /// `KNIVES_OWNER` is set by this tool's own `OpenCode` plugin, so it is a direct harness
-/// signal rather than a guess. OMP exposes no such variable to its bash shells; that tool's
-/// stdout is not a terminal, so OMP lands on the non-terminal fallback below.
+/// signal rather than a guess; OMP sets `CLAUDECODE=1` in its bash shells for the same
+/// reason, and either way that stdout is not a terminal.
 pub fn output_format(json: bool, text: bool) -> Output {
     if json {
         return Output::Json;
