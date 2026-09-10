@@ -1,6 +1,6 @@
 {
   "name": "@sjawhar/opencode-knives",
-  "version": "2.0.8",
+  "version": "2.0.9",
   "description": "OpenCode plugin for knives, the multi-fork multi-agent maintenance tool.",
   "type": "module",
   "main": "plugin/knives.ts",
