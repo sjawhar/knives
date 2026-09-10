@@ -122,7 +122,7 @@ Record the human's ruling as a `decision:` notch on the branch, in full — the 
 
 ### Single writer and release-wide changes
 
-Ordinary branch writes belong to its claim holder. Owners append repair commits; they do not rewrite shared ancestry. A lone branch's necessary rebase follows `fork-work`; a release-member rebase belongs to the orchestrator. The release claim is the write lease for release refs and release-wide mutations, not permission to push an owner's PR head. Stop admitting owners for that repo, wait until **every affected member claim is released**, hold the release claim while integrating, and recheck the no-claim barrier immediately before the write; if a new external claim appears, back off instead of racing it. An unrelated repo can continue.
+Ordinary branch writes belong to its claim holder. Owners append repair commits; they do not rewrite shared ancestry. A lone branch's necessary rebase follows `fork-work`; a release-member rebase belongs to the orchestrator. The release claim is a seconds-long mutex on one release write, never a schedule: two owners whose members do not overlap include into the same release one after the other without coordinating, and each proves its member on its own integration branch (`jj new <member> <release>`) before touching the release. Never make an owner wait for another owner's claim, review, or publish; the only thing that waits is the write itself. One release in hand per fork, and every mutation under `knives start <release>`.
 
 ```sh
 knives release --repo <repo> members
