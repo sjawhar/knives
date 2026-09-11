@@ -446,11 +446,7 @@ pub enum ReleaseAction {
         /// branch has moved on. Requires an explicit reason in the ledger.
         #[arg(long, requires = "why")]
         allow_stale_member: bool,
-        /// Name an unpinned dotted successor instead of repairing and
-        /// republishing its predecessor in place. Requires an explicit reason.
-        #[arg(long, requires = "why")]
-        force_new_name: bool,
-        /// Why an exceptional stale-member or new-name cut is necessary.
+        /// Why an exceptional stale-member cut is necessary.
         #[arg(long)]
         why: Option<String>,
     },

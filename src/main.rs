@@ -546,7 +546,6 @@ fn dispatch_release(
             name,
             allow_drop,
             allow_stale_member,
-            force_new_name,
             why,
         }) => run_release(
             fork,
@@ -555,7 +554,6 @@ fn dispatch_release(
                 name,
                 allow_drop,
                 allow_stale_member,
-                force_new_name,
                 why,
             },
             bound,

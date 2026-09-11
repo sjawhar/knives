@@ -26,7 +26,6 @@ pub(crate) enum ReleaseInvocation {
         name: Option<String>,
         allow_drop: bool,
         allow_stale_member: bool,
-        force_new_name: bool,
         why: Option<String>,
     },
 }
@@ -35,7 +34,6 @@ struct CutRequest {
     name: Option<String>,
     allow_drop: bool,
     allow_stale_member: bool,
-    force_new_name: bool,
     why: Option<String>,
 }
 
@@ -81,17 +79,9 @@ pub(crate) fn run_release(
 
     let exception = cut_exception_reason(&options);
     if let Some(name) = options.name {
-        if let Some(predecessor) = dotted_predecessor(&name)
-            && !options.force_new_name
-            && !predecessor_is_pinned(&pins, &predecessor)
-        {
-            println!(
-                "{repo}: {predecessor} is not pinned by any consumer; edit it in place and \
-                 republish under the same name (retain the old head as {})",
-                retention_name(&predecessor, "<sha8>")
-            );
-            return Ok(Exit::Incomplete);
-        }
+        // Whether a dotted successor is warranted is the owner's reading of the
+        // consumer's own trunk lock, recorded in the cut notch; knives reports
+        // pin state to inform that call and does not adjudicate it.
         let trunk_name = entry.upstream_trunk();
         let trunk = opened.resolve_commit(&trunk_name)?;
         if let Some(orphaned) = check_orphan_commits_before_cut(&opened, fork)?
@@ -352,21 +342,18 @@ fn requested_cut(
             name: None,
             allow_drop: false,
             allow_stale_member: false,
-            force_new_name: false,
             why: None,
         }),
         ReleaseInvocation::Cut {
             name,
             allow_drop,
             allow_stale_member,
-            force_new_name,
             why,
         } => match release::cut_name(scheme, name.as_deref()) {
             Ok(name) => Ok(CutRequest {
                 name: Some(name),
                 allow_drop: *allow_drop,
                 allow_stale_member: *allow_stale_member,
-                force_new_name: *force_new_name,
                 why: why.clone(),
             }),
             Err(message) => {
@@ -375,23 +362,6 @@ fn requested_cut(
             }
         },
     }
-}
-
-/// The predecessor of a dotted dated-release name, if it has one.
-fn dotted_predecessor(name: &str) -> Option<String> {
-    let (date, suffix) = knives::ids::strict_dated_release(name)?;
-    (suffix > 0).then(|| {
-        if suffix == 1 {
-            format!("release/{date}")
-        } else {
-            format!("release/{date}.{}", suffix - 1)
-        }
-    })
-}
-
-fn predecessor_is_pinned(pins: &[knives::pins::Pin], predecessor: &str) -> bool {
-    pins.iter()
-        .any(|pin| pin.on_scheme && pin.reference == predecessor)
 }
 
 fn retention_name(release: &str, sha8: &str) -> String {
@@ -473,20 +443,12 @@ fn stale_member_cut_exit(input: StaleMemberCut<'_>) -> anyhow::Result<Option<Exi
 }
 
 fn cut_exception_reason(options: &CutRequest) -> Option<String> {
-    let mut exceptions = Vec::new();
-    if options.allow_stale_member {
-        exceptions.push(format!(
+    options.allow_stale_member.then(|| {
+        format!(
             "--allow-stale-member: {}",
             options.why.as_deref().unwrap_or("missing reason")
-        ));
-    }
-    if options.force_new_name {
-        exceptions.push(format!(
-            "--force-new-name: {}",
-            options.why.as_deref().unwrap_or("missing reason")
-        ));
-    }
-    (!exceptions.is_empty()).then(|| exceptions.join("; "))
+        )
+    })
 }
 
 /// The plan's exit, and the consumer pins it scanned. The cut judges the pins

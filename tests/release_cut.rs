@@ -1266,8 +1266,10 @@ fn cut_refuses_stale_members_unless_the_caller_records_why() {
 }
 
 #[test]
-fn dotted_cut_without_a_consumer_pin_requires_an_in_place_republish() {
-    // Given: the predecessor exists but no registered or ad-hoc consumer pins it.
+fn dotted_cut_does_not_adjudicate_consumer_pins() {
+    // Given: the predecessor exists and no registered or ad-hoc consumer pins it.
+    // Whether that warrants a successor or an in-place republish is the owner's
+    // reading of the consumer's trunk lock; the cut reports pins, it does not rule.
     let lab = Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     let home = tempfile::tempdir().expect("create config home");
@@ -1284,33 +1286,26 @@ fn dotted_cut_without_a_consumer_pin_requires_an_in_place_republish() {
             .status
             .success()
     );
-
-    // When: a dotted successor is requested.
-    let refused = knives_release(&lab, &home, &["cut", "release/2026-08-04.1"]);
-    let stdout = String::from_utf8_lossy(&refused.stdout);
-
-    // Then: no gratuitous successor is named, and the stable in-place rule is
-    // stated verbatim for operators.
-    assert_eq!(refused.status.code(), Some(3), "{stdout}");
-    assert!(
-        stdout.contains("release/2026-08-04 is not pinned by any consumer; edit it in place")
-            && stdout.contains("retain the old head as keep/release-2026-08-04-"),
-        "{stdout}"
-    );
-
-    // And: the exceptional new name remains available only with an explicit reason.
-    let forced = knives_release(
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let included = knives_release(
         &lab,
         &home,
-        &[
-            "cut",
-            "release/2026-08-04.1",
-            "--force-new-name",
-            "--why",
-            "an external frozen consumer needs a distinct release name",
-        ],
+        &["include", "feat/beta", "--why", "new member"],
     );
-    assert!(forced.status.success(), "{forced:?}");
+    assert!(included.status.success(), "{included:?}");
+
+    // When: a dotted successor is requested with no exceptional flag.
+    let cut = knives_release(&lab, &home, &["cut", "release/2026-08-04.1"]);
+
+    // Then: it is named on ordinary grounds; no consumer-pin refusal exists.
+    assert!(cut.status.success(), "{cut:?}");
+    assert!(
+        Repo::open(&lab.work)
+            .expect("open after dotted cut")
+            .resolve_commit("release/2026-08-04.1")
+            .is_ok(),
+        "the dotted successor was not named: {cut:?}"
+    );
 }
 
 #[test]
