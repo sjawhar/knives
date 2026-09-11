@@ -77,6 +77,58 @@ every false one did not.
 A branch's notes may carry a workflow's own prefixes; the workflow that wrote them defines
 them, and a note that says it is open is open.
 
+## Challenge upstream placement before implementation
+
+When proposing an upstream change, establish its owning layer before anyone
+implements it or creates an upstream-specific branch. Read-only investigation does
+not need this review.
+
+Have someone other than the proposer challenge the placement: an existing reviewer,
+the orchestrator, or — working alone — a fresh-context subagent arguing for the
+other layers. Where none can be dispatched, write out the competing layer
+hypotheses and the evidence that disproves each; a challenge that names no
+alternative layer is not one. A green gate, a plausible patch and a peer's "go" do
+not establish that upstream owns the problem. This is not a question for the human.
+
+Record the result as a `placement:` notch with `--evidence`, naming the proposer and
+the challenger (session or role): on the branch once it exists, otherwise on the
+repository subject, where a standing rule also lives. Carry a copy into the reviewer
+packet or the member's `knives notch` disposition; `pr-preflight` Check 7 reads it
+back before any upstream PR opens:
+
+```
+knives notch <branch> -m "placement: owning layer <layer>; proposer <id>; challenger <id>; <the four answers below>" --evidence <revision-or-url>
+```
+
+Answer:
+
+- What failure or missing capability is evidenced, at which revision? Cite the
+  actual observation; a premise inherited from another session's summary, or
+  inferred from counters rather than read from the run, is not proof.
+- Which layer owns it: our configuration, caller, open feature branch, fork-only
+  plumbing, or upstream? Inspect the real launch path, installed version,
+  supported options and existing lifecycle/recovery mechanisms before choosing.
+  Repair an existing owned branch when that is where the defect lives.
+- For an upstream bug, demonstrate the violated supported contract with a minimal
+  reproduction on unmodified upstream at a cited revision — released upstream
+  packages installed for the purpose, or the upstream source when the defect is in
+  its tests, build or docs — never a second checkout of our fork, and without our
+  application or fork patches. Name any unavoidable prerequisite — another fork, a
+  pending branch — with the revision used; inconvenience of reproduction is not
+  evidence of our ownership. A documentation, typo or build-metadata defect is
+  evidenced by the upstream file and the behavior it states, at a cited revision.
+  For a feature, establish the general extension case instead; a new capability
+  need not have a broken upstream baseline. Preserve existing defaults and explain
+  why supported configuration or extension points are insufficient.
+- Why is an upstream change worth its maintainer review, CI, rebase and ongoing
+  consumer-maintenance cost? A small diff does not remove that cost.
+
+If the record cannot establish ownership, investigate rather than publish or
+relabel an unsupported bug claim as "hardening". Reuse a still-valid recorded
+decision; recheck when its evidence, scope or consumer contract changes. These are
+engineering judgments, not requests for human approval. Escalate only a genuine
+authority or direction decision.
+
 ## Get your own working copy the managed way
 
 ```

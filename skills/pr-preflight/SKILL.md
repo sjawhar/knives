@@ -11,6 +11,11 @@ Opening a pull request against an upstream repository requires adhering to that 
 
 Never open an upstream PR without walking this gate.
 
+Before implementation, complete `fork-work`'s upstream-placement challenge. Its
+**Owning layer and contract evidence** notch must still cover the actual diff at
+publication; Check 7 verifies that. The other checks establish contribution
+compliance, not ownership; a passing checklist cannot substitute for that evidence.
+
 ## Step 1: Obtain Programmatic Facts
 
 Run the preflight command for the target repository:
@@ -69,6 +74,13 @@ Walk each check sequentially. Each check specifies what facts to verify, what ev
 - **If Failed**:
   - *Incorrect Routing*: Refactor and relocate the changes to the permitted package, directory, or extension location defined by upstream policy.
 
+### Check 7: Owning Layer and Contract Evidence
+- **Verification**: Verify the branch — or, for a standing rule, the repository subject — carries the `fork-work` `placement:` notch naming a challenger other than the proposer, and that its evidence still describes the diff being published.
+- **Evidence**: `knives notch <branch>` (or `knives notch --repo <repo>` for a standing rule) shows the `placement:` record with `--evidence`; its cited failure/capability, owning layer and reproduction, cited-file evidence or extension case match the current diff.
+- **If Failed**:
+  - *Record Missing*: Do not open a PR. Return to `fork-work`'s placement challenge and investigate the owning layer.
+  - *Record Stale*: The diff outgrew its evidence. Re-run the challenge for the current diff before publishing.
+
 ## Step 3: Record What You Promised
 
 A pull request review is a conversation with a person who will not be here next session,
@@ -87,7 +99,7 @@ unanswered is a different question, derived from the forge, and not this.
 
 ## Step 4: Execution
 
-When all six checks pass with verified evidence, proceed with opening the pull request:
+When all seven checks pass with verified evidence, proceed with opening the pull request:
 
 ```bash
 gh pr create --title "..." --body "..."

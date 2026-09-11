@@ -74,6 +74,7 @@ Each dispatch contains, in order:
 3. The relevant **`knives notch` history**, including inherited promises, decisions, release membership evidence and unresolved obligations. Supply complete captured entries or a readable saved path; do not replace them with your summary. The owner refreshes them before acting.
 4. Relevant upstream/project guidance, its source paths, and any recorded publication constraints. The owner derives exact gates from current repository files; there is no prerequisite per-repo document. Supply the registry's configured `forbidden` terms and applicable existing outbound-prose rules. If none are configured, say so; do not invent a list. An empty configured list is not a privacy waiver.
 5. The whole shipped `pr-preflight` skill, your reviewer-relay address, and the **per-PR** scratch path.
+6. The `fork-work` **Owning layer and contract evidence** notch for the branch, or a statement that none exists. Reuse the existing record rather than asking an owner to reconstruct it from a "go" message. When you yourself propose upstream-bound work for a release member, complete that challenge before dispatching the implementation.
 
 The orchestrator handles release-only members under the same claim, evidence and independent-review discipline, without inventing PR numbers or opening PRs to satisfy the inventory. A named branch is claimed before anyone edits it; an anonymous member is carried, dropped or classified by release evidence and `knives notch` records, not by fabricating a branch. A bounded branch implementation can be delegated to one owner only when the requested scope already authorizes that work. Classify with evidence: supplied upstream, still proposed upstream, justified fork-only work, downstream configuration, or obsolete. Record the reason and disposition with `knives notch <branch> -m ... --evidence ...` when a branch exists, or on the release/repo subject for anonymous members. Do not automatically include an open PR in a release or upstream every fork-only branch.
 
@@ -83,9 +84,13 @@ The orchestrator handles release-only members under the same claim, evidence and
 
 ### Reviewer relay
 
-When an owner sends its packet path, check the packet's repo/PR identity, original PR head, expected branch/bookmark head and candidate head against the dispatch. Dispatch a fresh-context reviewer with the packet unedited and this verdict contract: `PASS (no repairs)`, `PASS per fix (k/k)`, or `FAIL: fix|body|drift`, with evidence for every question. The reviewer independently examines the **whole PR diff**, not just the owner's finding list, even when recon found nothing.
+When an owner sends its packet path, check the packet's repo/PR identity, original PR head, expected branch/bookmark head and candidate head against the dispatch. Dispatch a fresh-context reviewer with the packet unedited and this verdict contract: `PASS (no repairs)`, `PASS per fix (k/k)`, or `FAIL: fix|body|drift|placement`, with evidence for every question, including the owning layer. The reviewer independently examines the **whole PR diff**, not just the owner's finding list, even when recon found nothing.
 
 Reject an owner packet whose PR evidence is only a first page or truncated capture. Comments, reviews, review threads, check runs and workflow runs must be complete for the PR head being judged, or the missing page is an unanswered source and the owner returns to recon. A `null` thread count, elided saved output, or bounded `first:100` result with more pages available is not a clean review input.
+
+Reject a packet that lacks the owning-layer record or substitutes an approval or
+test result for its evidence. Return that gap to the owner's recon; it is not a
+human-approval question.
 
 Relay the verdict verbatim within 20 minutes; do not substitute your judgment or soften a FAIL. A malformed verdict is returned to the reviewer for correction. The owner waits 30 minutes, then records `decision: reviewer verdict outstanding; repair commits <ids>; bookmark not moved` and hands back. That timeout is your work, not a decision for the human: obtain the verdict and resume the owner at verification with the original PR head, expected branch/bookmark head and candidate commits preserved.
 
@@ -98,7 +103,7 @@ knives notch <branch> --repo <repo>
 knives status <repo>
 ```
 
-New entries use `recon:`, `rehome:`, `repair:`, `record:`, `verify:`, `decision:` and `handback:`, each with `--evidence`. Preserve and read older formats. A `handback:` plus released claim ends the worker's active ownership, not the overall task. Accept a thread disposition only with evidence: `-> <commit>`, `declined: <reason>`, or `already answered <reply-url>`. Record outstanding promises explicitly, with the reply URL, rather than counting them as fulfilled. Verify new replies actually published before reporting them as addressed.
+New entries use `placement:`, `recon:`, `rehome:`, `repair:`, `record:`, `verify:`, `decision:` and `handback:`, each with `--evidence`. Preserve and read older formats. A `handback:` plus released claim ends the worker's active ownership, not the overall task. Accept a thread disposition only with evidence: `-> <commit>`, `declined: <reason>`, or `already answered <reply-url>`. Record outstanding promises explicitly, with the reply URL, rather than counting them as fulfilled. Verify new replies actually published before reporting them as addressed.
 
 ### Decisions that reach the human
 
