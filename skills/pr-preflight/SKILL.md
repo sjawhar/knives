@@ -11,10 +11,7 @@ Opening a pull request against an upstream repository requires adhering to that 
 
 Never open an upstream PR without walking this gate.
 
-Before implementation, complete `fork-work`'s upstream-placement challenge. Its
-**Owning layer and contract evidence** notch must still cover the actual diff at
-publication; Check 7 verifies that. The other checks establish contribution
-compliance, not ownership; a passing checklist cannot substitute for that evidence.
+Complete `fork-work`'s challenge before implementation; Check 7 verifies the `placement:` notch before publication.
 
 ## Step 1: Obtain Programmatic Facts
 
@@ -74,12 +71,12 @@ Walk each check sequentially. Each check specifies what facts to verify, what ev
 - **If Failed**:
   - *Incorrect Routing*: Refactor and relocate the changes to the permitted package, directory, or extension location defined by upstream policy.
 
-### Check 7: Owning Layer and Contract Evidence
-- **Verification**: Verify the branch — or, for a standing rule, the repository subject — carries the `fork-work` `placement:` notch naming a challenger other than the proposer, and that its evidence still describes the diff being published.
-- **Evidence**: `knives notch <branch>` (or `knives notch --repo <repo>` for a standing rule) shows the `placement:` record with `--evidence`; its cited failure/capability, owning layer and reproduction, cited-file evidence or extension case match the current diff.
+### Check 7: `placement:` notch
+- **Verification**: Challenger differs from proposer; evidence covers the published diff.
+- **Evidence**: The `placement:` notch, read with `knives notch <branch>` (repository subject for standing rules).
 - **If Failed**:
-  - *Record Missing*: Do not open a PR. Return to `fork-work`'s placement challenge and investigate the owning layer.
-  - *Record Stale*: The diff outgrew its evidence. Re-run the challenge for the current diff before publishing.
+  - *Missing*: No PR; return to `fork-work`'s challenge.
+  - *Stale*: Re-run the challenge.
 
 ## Step 3: Record What You Promised
 
