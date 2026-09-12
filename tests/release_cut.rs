@@ -388,6 +388,92 @@ fn a_fixed_release_branch_is_cut_in_place_and_its_previous_position_is_the_old_c
 }
 
 #[test]
+fn a_fixed_cut_with_a_published_unrecorded_composition_records_instead_of_refusing() {
+    // Given: a fixed release cut whose first recorded composition is published.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let (home, _consumer) = release_test_home(&lab);
+    std::fs::remove_file(home.path().join("local-consumer")).expect("remove local consumer");
+    let registry = home.path().join("repos.toml");
+    let config = std::fs::read_to_string(&registry).expect("read registry");
+    std::fs::write(
+        &registry,
+        format!("{config}release_branch = \"integration\"\n"),
+    )
+    .expect("configure fixed release branch");
+    let first = knives_release(&lab, &home, &["cut"]);
+    assert!(first.status.success(), "{first:?}");
+    lab.push_branch("integration");
+    lab.fetch_work();
+    let first_published = commit_at(&lab, "integration@origin");
+
+    // When: a composition edit is pushed before a cut records it.
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let included = knives_release(&lab, &home, &["include", "feat/beta"]);
+    assert!(included.status.success(), "{included:?}");
+    let published = commit_at(&lab, "integration");
+    assert_ne!(
+        published, first_published,
+        "include must move the composition"
+    );
+    lab.push_branch("integration");
+    lab.fetch_work();
+    assert_eq!(commit_at(&lab, "integration@origin"), published);
+
+    // Then: cut records the published composition without moving its bookmark.
+    let recorded = knives_release(&lab, &home, &["cut"]);
+    let stdout = String::from_utf8_lossy(&recorded.stdout);
+    assert!(
+        recorded.status.success()
+            || recorded.status.code() == Some(i32::from(knives::cli::Exit::Findings.code())),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&recorded.stderr)
+    );
+    assert!(
+        stdout.contains(&format!(
+            "demo: recorded published composition integration@origin ({}) as the cut; previous recorded cut integration was {}",
+            published.short(),
+            first_published.short()
+        )),
+        "{stdout}"
+    );
+    assert_eq!(commit_at(&lab, "integration"), published);
+    assert_eq!(commit_at(&lab, "integration@origin"), published);
+    let entries = knives::ledger::Ledger::at(home.path().join("ledger").join("demo"))
+        .entries()
+        .expect("read ledger");
+    let cut = entries
+        .iter()
+        .rev()
+        .find(|entry| {
+            entry.subject.as_deref() == Some("integration")
+                && entry.text.starts_with("cut integration as ")
+        })
+        .unwrap_or_else(|| panic!("no recorded fixed cut: {entries:?}"));
+    assert_eq!(
+        cut.evidence.first().map(String::as_str),
+        Some(published.as_str()),
+        "the record-only cut must anchor its evidence at the published composition"
+    );
+
+    // And: once recorded, the identical published composition keeps the usual refusal.
+    let repeated = knives_release(&lab, &home, &["cut"]);
+    let repeated_stdout = String::from_utf8_lossy(&repeated.stdout);
+    assert_eq!(
+        repeated.status.code(),
+        Some(i32::from(knives::cli::Exit::Incomplete.code())),
+        "{repeated_stdout}"
+    );
+    assert!(
+        repeated_stdout.contains(&format!(
+            "demo: refusing to cut integration: identical to integration@origin ({}); nothing to cut\n",
+            published.short()
+        )),
+        "{repeated_stdout}"
+    );
+}
+
+#[test]
 fn a_dated_cut_refuses_a_sideways_bookmark_move() {
     // Given: two unrelated flat dated cuts.
     let lab = Lab::new();
