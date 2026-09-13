@@ -11,6 +11,8 @@ Opening a pull request against an upstream repository requires adhering to that 
 
 Never open an upstream PR without walking this gate.
 
+Complete `fork-work`'s challenge before implementation; Check 7 verifies the `placement:` notch before publication.
+
 ## Step 1: Obtain Programmatic Facts
 
 Run the preflight command for the target repository:
@@ -69,6 +71,13 @@ Walk each check sequentially. Each check specifies what facts to verify, what ev
 - **If Failed**:
   - *Incorrect Routing*: Refactor and relocate the changes to the permitted package, directory, or extension location defined by upstream policy.
 
+### Check 7: `placement:` notch
+- **Verification**: Challenger differs from proposer; evidence covers the published diff.
+- **Evidence**: The `placement:` notch, read with `knives notch <branch>` (repository subject for standing rules).
+- **If Failed**:
+  - *Missing*: No PR; return to `fork-work`'s challenge.
+  - *Stale*: Re-run the challenge.
+
 ## Step 3: Record What You Promised
 
 A pull request review is a conversation with a person who will not be here next session,
@@ -87,7 +96,7 @@ unanswered is a different question, derived from the forge, and not this.
 
 ## Step 4: Execution
 
-When all six checks pass with verified evidence, proceed with opening the pull request:
+When all seven checks pass with verified evidence, proceed with opening the pull request:
 
 ```bash
 gh pr create --title "..." --body "..."

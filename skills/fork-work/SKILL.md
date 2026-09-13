@@ -77,6 +77,24 @@ every false one did not.
 A branch's notes may carry a workflow's own prefixes; the workflow that wrote them defines
 them, and a note that says it is open is open.
 
+## Challenge upstream placement before implementation
+
+Before implementing an upstream change or creating its branch, someone other than the proposer challenges ownership: a reviewer, orchestrator, or solo fresh-context subagent arguing for other layers. With none available, write competing layer hypotheses and what disproves each.
+Read-only investigation is exempt. A green gate, plausible patch or peer's "go" establishes no ownership. This is not a question for the human.
+
+Record a `placement:` notch with `--evidence`, naming proposer and challenger, on the branch (repository subject before branching or for a standing rule):
+
+```
+knives notch <branch> -m "placement: proposer <id>; challenger <id>; <four answers>" --evidence <revision-or-url>
+```
+
+- Cite the observed failure or missing capability and revision, not an inherited summary or counter.
+- Choose our configuration, caller, open feature branch, fork-only plumbing or upstream, after checking the real launch path, installed version, options and existing lifecycle/recovery mechanisms.
+- For a bug, give a minimal reproduction on unmodified upstream at a cited revision, without our fork checkout or application patches; for a feature, establish the general extension case preserving upstream defaults.
+- Explain why upstream review, CI, rebase and maintenance are worthwhile.
+
+Ownership unestablished: investigate, never relabel unsupported bugs as "hardening". Reuse a valid `placement:` notch; recheck when evidence or scope changes.
+
 ## Get your own working copy the managed way
 
 ```
