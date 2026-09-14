@@ -251,9 +251,9 @@ standard error for every forge call. Timing is diagnostic output and does not ch
 
 `knives gh -- <args...>` absorbs the fork-routing logic of the `gh` bash shim:
 
-* **Shim re-entry**: invoked directly (no `KNIVES_REAL_GH`) with the `knives-gh-shim` first on PATH, `knives gh` hands the call to that shim verbatim and does nothing else. The shim applies its agent-session rules (no keyring login, the App routing include) and re-enters knives with `KNIVES_REAL_GH` set, so a direct `knives gh` never runs gh on the user's own login where `gh` would not.
+* **Shim re-entry**: invoked with the `knives-gh-shim` first on PATH and no `KNIVES_GH_SHIM_DEPTH` marker, `knives gh` hands the call to that shim verbatim and does nothing else. The shim applies its agent-session rules (no keyring login, the App routing include) and re-enters knives with the depth marker and `KNIVES_REAL_GH` set, so a direct `knives gh` never runs gh on the user's own login where `gh` would not. The depth marker decides, not `KNIVES_REAL_GH`: a hand-set override with the shim on PATH still re-enters it, so the override is not a way around the shim.
 * **Target resolution**: `-R` passthrough, `gh repo set-default` markers, remote preference, and `gh api` owner extraction.
-* **Token export**: queries git credential config for `gh-app-token`, asks it over the credential-helper protocol, and exports `GH_TOKEN` for the child process. The helper's stderr is relayed; when it exits non-zero or answers `quit=1`, `knives gh` exits with that code instead of running gh. Only an exit-0 answer with no password leaves gh on its own auth.
+* **Token export**: queries git credential config for `gh-app-token`, asks it over the credential-helper protocol, and exports `GH_TOKEN` for the child process. The helper's stderr is relayed; when it exits non-zero, answers `quit=1`, or answers something that is not UTF-8, `knives gh` exits with that code (1 for the last two) instead of running gh. Only an exit-0 answer with no password leaves gh on its own auth.
 * **Detached HEAD compensation**: injects the active jj bookmark into `gh pr` subcommands when git reports no symbolic HEAD.
 
 The `--` delimiter is required. All arguments after `--` are passed to `gh` verbatim.
@@ -263,7 +263,7 @@ The routing table stays in gitconfig (`gh-resolved` markers, credential helpers)
 Escape hatches:
 
 * `KNIVES_GH_BYPASS` on the shim bypasses `knives gh` entirely; a direct `knives gh` reaches the shim first, so the bypass holds there too.
-* `KNIVES_REAL_GH` points `knives gh` at a specific real `gh` binary. A value that is itself a marker-bearing shim is ignored in favor of the PATH scan — a poisoned override must never re-enter the shim.
+* `KNIVES_REAL_GH` points `knives gh` at a specific real `gh` binary on the shim's inner pass. A value that is itself a marker-bearing shim is ignored in favor of the PATH scan — a poisoned override must never re-enter the shim — and setting it does not skip the shim re-entry above.
 
 ## Release workflow
 

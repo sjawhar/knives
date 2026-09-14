@@ -2,7 +2,7 @@
 //!
 //! This command executes `gh` directly, so the usual render/run split does not apply:
 //! there is no knives result to render.
-// allow: SIZE_OK: 1630 lines - single passthrough pipeline; splitting would separate resolution steps that read as one procedure.
+// allow: SIZE_OK: 1657 lines - single passthrough pipeline; splitting would separate resolution steps that read as one procedure.
 use std::collections::BTreeMap;
 use std::io::Read as _;
 use std::os::unix::{
@@ -69,8 +69,9 @@ const DETACHED_BOOKMARK: &str = "__jj_detached__";
 pub fn run(args: &[String]) -> anyhow::Result<std::convert::Infallible> {
     if let Some(shim) = reentry_shim() {
         // The shim applies the agent-context rules and the routing include, then
-        // re-enters knives with KNIVES_REAL_GH set, so that pass mints normally.
-        // Recursion is bounded by construction; the shim's depth guard is the backstop.
+        // re-enters knives with the depth marker and KNIVES_REAL_GH set, so that pass
+        // mints normally. Recursion is bounded by construction; the shim's depth
+        // guard is the backstop.
         let error = Command::new(&shim).args(args).exec();
         eprintln!("knives gh: cannot exec {}: {error}", shim.display());
         std::process::exit(126);
@@ -323,7 +324,8 @@ pub(crate) fn inject_positional(args: &[String], subcommand: &str, bookmark: &st
 }
 
 /// The caller's explicit real-gh choice: `KNIVES_REAL_GH` when set and non-empty.
-/// The shim sets it on every re-entry, so its absence means knives was invoked directly.
+/// The shim sets it on every re-entry; a hand-set value chooses the binary and nothing
+/// more (whether this is the shim's inner pass is [`reentry_shim`]'s question).
 fn real_gh_override() -> Option<PathBuf> {
     std::env::var_os("KNIVES_REAL_GH")
         .filter(|path| !path.is_empty())
@@ -347,16 +349,21 @@ pub(crate) fn real_gh() -> anyhow::Result<PathBuf> {
         .ok_or_else(|| anyhow::anyhow!("real gh not found"))
 }
 
-/// The shim to hand a direct `knives gh` invocation back to: with no `KNIVES_REAL_GH`,
-/// the first executable `gh` on PATH when it carries the shim marker.
+/// The shim to hand a direct `knives gh` invocation back to: the first executable `gh`
+/// on PATH when it carries the shim marker and `KNIVES_GH_SHIM_DEPTH` is unset.
 ///
 /// The shim is what applies the agent-context rules (no keyring login, the routing
 /// include) before re-entering knives; a direct invocation from an environment that lost
 /// `GIT_CONFIG_*` would otherwise leave gh on the user's own login (measured 2026-09-14:
-/// `knives gh -- api user` from an agent session answered the user). With the override
-/// set, or with no shim first on PATH, there is nothing to re-enter.
+/// `knives gh -- api user` from an agent session answered the user). The shim sets the
+/// depth marker on every pass before re-entering knives, so its presence is the inner
+/// pass and there is nothing to hand back. `KNIVES_REAL_GH` does not decide: it is only
+/// the binary choice, and a hand-set override with the shim first on PATH still
+/// re-enters, so the override is not a way around the shim (a depth marker set but
+/// empty is treated as unset for the same reason). With no shim first on PATH nothing
+/// is re-entered.
 pub(crate) fn reentry_shim() -> Option<PathBuf> {
-    if real_gh_override().is_some() {
+    if std::env::var_os("KNIVES_GH_SHIM_DEPTH").is_some_and(|depth| !depth.is_empty()) {
         return None;
     }
     let first = first_executable_gh(|_| true)?;
@@ -453,9 +460,9 @@ pub(crate) enum Mint {
     /// No helper is routed for the host, or it answered without a password: gh runs
     /// on its own auth.
     Unrouted,
-    /// The helper refused — a non-zero exit, a `quit=1` answer, or it could not run —
-    /// and has already said why on stderr: knives exits with this code instead of
-    /// running gh.
+    /// The helper refused — a non-zero exit, a `quit=1` answer, an answer that is not
+    /// UTF-8, or it could not run — and has already said why on stderr: knives exits
+    /// with this code instead of running gh.
     Refused(i32),
 }
 
@@ -474,8 +481,9 @@ pub(crate) enum Mint {
 ///
 /// The exit status is checked and there is an empty-password guard: trusting a
 /// failed process's output is wrong even while today's helper never prints a
-/// password on a failing path. Only an exit-0 answer with no password is
-/// [`Mint::Unrouted`], like a host no helper is configured for.
+/// password on a failing path. Only an exit-0 UTF-8 answer with no password is
+/// [`Mint::Unrouted`], like a host no helper is configured for; an exit-0 answer
+/// knives cannot read is a refusal, not a fall-through to gh's own auth.
 pub(crate) fn mint_token(target_url: &str) -> Mint {
     let Some(path) = credential_path(target_url) else {
         return Mint::Unrouted;
@@ -531,7 +539,8 @@ pub(crate) fn mint_token(target_url: &str) -> Mint {
         return Mint::Refused(exit_code(output.status));
     }
     let Ok(answer) = std::str::from_utf8(&output.stdout) else {
-        return Mint::Unrouted;
+        eprintln!("knives gh: gh-app-token {profile} answered non-UTF-8");
+        return Mint::Refused(1);
     };
     if answer
         .lines()
@@ -982,6 +991,17 @@ mod tests {
         let (_dir, mint) = mint_through("#!/bin/sh\ncat > /dev/null\nprintf 'quit=1\\n'\n");
 
         // Then: quit is a refusal, not a fall-through to gh's own auth.
+        assert_eq!(mint, Mint::Refused(1));
+    }
+
+    #[test]
+    fn a_non_utf8_answer_with_exit_zero_refuses() {
+        // Given: a helper that exits 0 with a password knives cannot read as UTF-8.
+        // When: minting.
+        let (_dir, mint) =
+            mint_through("#!/bin/sh\ncat > /dev/null\nprintf 'password=\\377\\376\\n'\n");
+
+        // Then: an unreadable answer is a refusal, not a fall-through to gh's own auth.
         assert_eq!(mint, Mint::Refused(1));
     }
 
@@ -1459,15 +1479,17 @@ mod tests {
         (path, shim, real)
     }
 
+    const REENTRY_ENV: [&str; 3] = ["KNIVES_GH_SHIM_DEPTH", "KNIVES_REAL_GH", "PATH"];
+
     #[test]
     fn a_direct_invocation_re_enters_the_shim_first_on_path() {
-        // Given: no KNIVES_REAL_GH (knives was not invoked by the shim) and a PATH
-        // whose first gh is the marked shim.
+        // Given: no depth marker (knives was not invoked by the shim) and a PATH whose
+        // first gh is the marked shim.
         let scratch = tempfile::tempdir().expect("scratch");
         let (path, shim, _) = shim_then_real_path(scratch.path());
         let _lock = crate::config::test_support::environment_lock();
-        let guard =
-            crate::config::test_support::EnvironmentGuard::capture(&["KNIVES_REAL_GH", "PATH"]);
+        let guard = crate::config::test_support::EnvironmentGuard::capture(&REENTRY_ENV);
+        guard.remove("KNIVES_GH_SHIM_DEPTH");
         guard.remove("KNIVES_REAL_GH");
         guard.set("PATH", &path);
 
@@ -1479,30 +1501,32 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_override_counts_as_a_direct_invocation() {
-        // Given: KNIVES_REAL_GH set but empty, the same rule real_gh() applies.
+    fn a_hand_set_override_without_the_depth_marker_still_re_enters() {
+        // Given: KNIVES_REAL_GH set by hand (not by the shim, which also sets the depth
+        // marker) and the same shim-first PATH.
         let scratch = tempfile::tempdir().expect("scratch");
-        let (path, shim, _) = shim_then_real_path(scratch.path());
+        let (path, shim, real) = shim_then_real_path(scratch.path());
+        let real_value = real.display().to_string();
         let _lock = crate::config::test_support::environment_lock();
-        let guard =
-            crate::config::test_support::EnvironmentGuard::capture(&["KNIVES_REAL_GH", "PATH"]);
-        guard.set("KNIVES_REAL_GH", "");
+        let guard = crate::config::test_support::EnvironmentGuard::capture(&REENTRY_ENV);
+        guard.remove("KNIVES_GH_SHIM_DEPTH");
+        guard.set("KNIVES_REAL_GH", &real_value);
         guard.set("PATH", &path);
 
-        // When / Then: the shim is re-entered.
+        // When / Then: the override is not a way around the shim; it is re-entered.
         assert_eq!(reentry_shim(), Some(shim));
     }
 
     #[test]
     fn a_shim_re_entry_does_not_re_enter_again() {
-        // Given: KNIVES_REAL_GH set, as the shim sets it on every pass into knives,
-        // and the same shim-first PATH.
+        // Given: the depth marker and KNIVES_REAL_GH set, as the shim sets both on every
+        // pass into knives, and the same shim-first PATH.
         let scratch = tempfile::tempdir().expect("scratch");
         let (path, _, real) = shim_then_real_path(scratch.path());
         let real_value = real.display().to_string();
         let _lock = crate::config::test_support::environment_lock();
-        let guard =
-            crate::config::test_support::EnvironmentGuard::capture(&["KNIVES_REAL_GH", "PATH"]);
+        let guard = crate::config::test_support::EnvironmentGuard::capture(&REENTRY_ENV);
+        guard.set("KNIVES_GH_SHIM_DEPTH", "1");
         guard.set("KNIVES_REAL_GH", &real_value);
         guard.set("PATH", &path);
 
@@ -1524,8 +1548,8 @@ mod tests {
             .expect("chmod real gh");
         let path = scratch.path().display().to_string();
         let _lock = crate::config::test_support::environment_lock();
-        let guard =
-            crate::config::test_support::EnvironmentGuard::capture(&["KNIVES_REAL_GH", "PATH"]);
+        let guard = crate::config::test_support::EnvironmentGuard::capture(&REENTRY_ENV);
+        guard.remove("KNIVES_GH_SHIM_DEPTH");
         guard.remove("KNIVES_REAL_GH");
         guard.set("PATH", &path);
 
