@@ -7,7 +7,7 @@
 
 #[path = "common/lab.rs"]
 mod lab;
-// allow: SIZE_OK: 714 lines - real-binary gh passthrough scenarios share one fixture and process harness.
+// allow: SIZE_OK: 820 lines - real-binary gh passthrough scenarios share one fixture and process harness.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
@@ -594,35 +594,127 @@ fn pr_create_does_not_duplicate_explicit_head() {
     assert_eq!(recorded.lines().filter(|line| *line == "--head").count(), 1);
 }
 
+/// A marked shim `gh` that records its arguments and exits 99 without running anything.
+fn marker_shim() -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir().expect("marker shim dir");
+    let log = dir.path().join("shim.log");
+    let shim = dir.path().join("gh");
+    fs::write(
+        &shim,
+        "#!/bin/sh\n# knives-gh-shim\nprintf '%s\\n' \"$@\" > \"$SHIM_LOG\"\nexit 99\n",
+    )
+    .expect("write marker shim");
+    fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).expect("chmod marker shim");
+    (dir, log)
+}
+
 #[test]
-fn marker_shim_is_skipped_during_real_gh_discovery() {
-    // Given: PATH begins with a marked shim and then a real fake gh.
+fn direct_invocation_re_enters_the_marker_shim_with_the_original_arguments() {
+    // Given: PATH begins with the marked shim and then a real fake gh, and no override:
+    // knives was invoked directly, not by the shim.
     let scratch = tempfile::tempdir().expect("scratch");
-    let marker_dir = tempfile::tempdir().expect("marker shim dir");
-    let marker = marker_dir.path().join("gh");
-    fs::write(&marker, "#!/bin/sh\n# knives-gh-shim\nexit 99\n").expect("write marker shim");
-    fs::set_permissions(&marker, fs::Permissions::from_mode(0o755)).expect("chmod marker shim");
-    let (real_dir, log) = fake_gh();
+    let (shim_dir, shim_log) = marker_shim();
+    let (real_dir, gh_log) = fake_gh();
     let path = format!(
         "{}:{}:{}",
-        marker_dir.path().display(),
+        shim_dir.path().display(),
         real_dir.path().display(),
         std::env::var("PATH").expect("PATH")
     );
 
-    // When: knives discovers gh without an explicit override.
+    // When: knives gh runs.
     let output = knives_cmd(scratch.path())
-        .args(["gh", "--", "api", "rate_limit"])
+        .args(["gh", "--", "api", "rate_limit", "--jq", ".rate"])
         .current_dir(scratch.path())
         .env("PATH", path)
-        .env("FAKE_GH_LOG", &log)
+        .env("SHIM_LOG", &shim_log)
+        .env("FAKE_GH_LOG", &gh_log)
         .env_remove("KNIVES_REAL_GH")
         .output()
         .expect("run knives gh");
 
-    // Then: it skipped the marked script and invoked the following candidate.
+    // Then: the shim got the call verbatim and its status is knives'; the real gh never ran.
+    assert_eq!(output.status.code(), Some(99));
+    assert_eq!(
+        fs::read_to_string(&shim_log).expect("shim ran"),
+        "api\nrate_limit\n--jq\n.rate\n"
+    );
+    assert!(
+        !gh_log.exists(),
+        "the real gh must not run on the direct pass"
+    );
+}
+
+#[test]
+fn a_shim_re_entry_with_the_override_set_runs_the_real_gh() {
+    // Given: the same shim-first PATH, but KNIVES_REAL_GH set as the shim sets it.
+    let scratch = tempfile::tempdir().expect("scratch");
+    let (shim_dir, shim_log) = marker_shim();
+    let (real_dir, gh_log) = fake_gh();
+    let path = format!(
+        "{}:{}",
+        shim_dir.path().display(),
+        std::env::var("PATH").expect("PATH")
+    );
+
+    // When: knives gh runs as the shim's re-entry.
+    let output = knives_cmd(scratch.path())
+        .args(["gh", "--", "api", "rate_limit"])
+        .current_dir(scratch.path())
+        .env("PATH", path)
+        .env("SHIM_LOG", &shim_log)
+        .env("FAKE_GH_LOG", &gh_log)
+        .env("KNIVES_REAL_GH", real_dir.path().join("gh"))
+        .output()
+        .expect("run knives gh");
+
+    // Then: the override is used and the shim is not re-entered.
     assert!(output.status.success());
-    assert!(log.exists(), "unmarked fake gh should run");
+    assert!(gh_log.exists(), "the real gh should run");
+    assert!(
+        !shim_log.exists(),
+        "the shim must not be re-entered a second time"
+    );
+}
+
+#[test]
+fn a_helper_refusal_is_relayed_and_stops_gh() {
+    // Given: a routed helper that refuses the way gh-app-token does for an owner it
+    // cannot serve: reason on stderr, quit=1 on stdout, exit 1.
+    let lab = lab::Lab::new();
+    let (dir, log) = fake_gh();
+    let helper_dir = tempfile::tempdir().expect("fake helper dir");
+    let helper = helper_dir.path().join("gh-app-token");
+    fs::write(
+        &helper,
+        "#!/bin/sh\ncat > /dev/null\necho \"gh-app-token: no App installation for owner acme and no fallback-secret on profile $1\" >&2\nprintf 'quit=1\\n'\nexit 1\n",
+    )
+    .expect("write refusing gh-app-token");
+    fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).expect("chmod helper");
+    let gitconfig = token_config(helper_dir.path(), "agent");
+
+    // When: a routed request is refused.
+    let output = knives_cmd(helper_dir.path())
+        .args(["gh", "--", "api", "repos/acme/work/pulls"])
+        .current_dir(&lab.work)
+        .env("KNIVES_REAL_GH", dir.path().join("gh"))
+        .env("FAKE_GH_LOG", &log)
+        .env("PATH", helper_path(helper_dir.path()))
+        .env("GIT_CONFIG_GLOBAL", &gitconfig)
+        .output()
+        .expect("run refused knives gh");
+
+    // Then: the helper's reason reaches the caller, its status is knives', and gh never runs.
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "gh-app-token: no App installation for owner acme and no fallback-secret on profile agent\n"
+    );
+    assert!(output.stdout.is_empty(), "{:?}", output.stdout);
+    assert!(
+        !log.exists(),
+        "gh must not run on its own auth after a refusal"
+    );
 }
 
 #[test]

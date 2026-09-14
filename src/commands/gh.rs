@@ -2,10 +2,13 @@
 //!
 //! This command executes `gh` directly, so the usual render/run split does not apply:
 //! there is no knives result to render.
-// allow: SIZE_OK: 1425 lines - single passthrough pipeline; splitting would separate resolution steps that read as one procedure.
+// allow: SIZE_OK: 1630 lines - single passthrough pipeline; splitting would separate resolution steps that read as one procedure.
 use std::collections::BTreeMap;
 use std::io::Read as _;
-use std::os::unix::{fs::PermissionsExt as _, process::ExitStatusExt as _};
+use std::os::unix::{
+    fs::PermissionsExt as _,
+    process::{CommandExt as _, ExitStatusExt as _},
+};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -57,24 +60,37 @@ exit 127
 
 const DETACHED_BOOKMARK: &str = "__jj_detached__";
 
-/// Mints an app token when routed, compensates for jj's detached HEAD on `gh pr`, and
-/// relays gh's inherited terminal I/O and exit code unchanged.
+/// Re-enters the gh shim when invoked directly, otherwise mints an app token when
+/// routed, compensates for jj's detached HEAD on `gh pr`, and relays gh's inherited
+/// terminal I/O and exit code unchanged.
 ///
 /// Every successful execution path exits the process, making the `Infallible` success type
 /// compiler-checked.
 pub fn run(args: &[String]) -> anyhow::Result<std::convert::Infallible> {
+    if let Some(shim) = reentry_shim() {
+        // The shim applies the agent-context rules and the routing include, then
+        // re-enters knives with KNIVES_REAL_GH set, so that pass mints normally.
+        // Recursion is bounded by construction; the shim's depth guard is the backstop.
+        let error = Command::new(&shim).args(args).exec();
+        eprintln!("knives gh: cannot exec {}: {error}", shim.display());
+        std::process::exit(126);
+    }
     let cwd = std::env::current_dir()?;
-    let token = std::env::var_os("GH_TOKEN").is_none().then(|| {
-        resolve_target_url(args, &cwd)
-            .as_deref()
-            .and_then(mint_token)
-    });
+    let token = if std::env::var_os("GH_TOKEN").is_some() {
+        None
+    } else {
+        match resolve_target_url(args, &cwd).as_deref().map(mint_token) {
+            Some(Mint::Token(token)) => Some(token),
+            Some(Mint::Refused(code)) => std::process::exit(code),
+            Some(Mint::Unrouted) | None => None,
+        }
+    };
     let Ok(real_gh) = real_gh() else {
         eprintln!("knives gh: real gh not found");
         std::process::exit(127);
     };
     let mut gh = Command::new(real_gh);
-    if let Some(token) = token.flatten() {
+    if let Some(token) = token {
         gh.env("GH_TOKEN", token);
     }
 
@@ -150,13 +166,16 @@ fn gh_exit_code(gh: &mut Command) -> i32 {
                 eprintln!("knives gh: real gh not found");
                 127
             },
-            |status| {
-                status
-                    .code()
-                    .or_else(|| status.signal().map(|signal| 128 + signal))
-                    .unwrap_or(1)
-            },
+            exit_code,
         )
+}
+
+/// The shell's view of a child's status: its exit code, or 128 + the signal that killed it.
+fn exit_code(status: std::process::ExitStatus) -> i32 {
+    status
+        .code()
+        .or_else(|| status.signal().map(|signal| 128 + signal))
+        .unwrap_or(1)
 }
 
 fn die_no_bookmark() -> ! {
@@ -303,6 +322,14 @@ pub(crate) fn inject_positional(args: &[String], subcommand: &str, bookmark: &st
     injected
 }
 
+/// The caller's explicit real-gh choice: `KNIVES_REAL_GH` when set and non-empty.
+/// The shim sets it on every re-entry, so its absence means knives was invoked directly.
+fn real_gh_override() -> Option<PathBuf> {
+    std::env::var_os("KNIVES_REAL_GH")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+}
+
 /// Finds the real `gh`, never returning a marker-bearing shim (shim lines 206-215).
 ///
 /// The `KNIVES_REAL_GH` override is trusted only while it is not provably the
@@ -311,26 +338,41 @@ pub(crate) fn inject_positional(args: &[String], subcommand: &str, bookmark: &st
 /// override stays trusted — the spawn fails loudly with exit 127 — because the
 /// override never promised to be scannable, only to be the caller's choice.
 pub(crate) fn real_gh() -> anyhow::Result<PathBuf> {
-    if let Some(path) = std::env::var_os("KNIVES_REAL_GH").filter(|path| !path.is_empty()) {
-        let candidate = PathBuf::from(path);
-        if shim_marker(&candidate) != Some(true) {
-            return Ok(candidate);
-        }
+    if let Some(candidate) = real_gh_override()
+        && shim_marker(&candidate) != Some(true)
+    {
+        return Ok(candidate);
     }
+    first_executable_gh(|candidate| shim_marker(candidate) == Some(false))
+        .ok_or_else(|| anyhow::anyhow!("real gh not found"))
+}
+
+/// The shim to hand a direct `knives gh` invocation back to: with no `KNIVES_REAL_GH`,
+/// the first executable `gh` on PATH when it carries the shim marker.
+///
+/// The shim is what applies the agent-context rules (no keyring login, the routing
+/// include) before re-entering knives; a direct invocation from an environment that lost
+/// `GIT_CONFIG_*` would otherwise leave gh on the user's own login (measured 2026-09-14:
+/// `knives gh -- api user` from an agent session answered the user). With the override
+/// set, or with no shim first on PATH, there is nothing to re-enter.
+pub(crate) fn reentry_shim() -> Option<PathBuf> {
+    if real_gh_override().is_some() {
+        return None;
+    }
+    let first = first_executable_gh(|_| true)?;
+    (shim_marker(&first) == Some(true)).then_some(first)
+}
+
+/// The first executable regular file named `gh` on PATH that `accept` takes.
+fn first_executable_gh(accept: impl Fn(&Path) -> bool) -> Option<PathBuf> {
     let path = std::env::var_os("PATH").unwrap_or_default();
-    for directory in std::env::split_paths(&path) {
-        let candidate = directory.join("gh");
-        let executable = candidate
-            .metadata()
-            .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0);
-        if !executable {
-            continue;
-        }
-        if shim_marker(&candidate) == Some(false) {
-            return Ok(candidate);
-        }
-    }
-    Err(anyhow::anyhow!("real gh not found"))
+    std::env::split_paths(&path)
+        .map(|directory| directory.join("gh"))
+        .find(|candidate| {
+            candidate.metadata().is_ok_and(|metadata| {
+                metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+            }) && accept(candidate)
+        })
 }
 
 /// Whether the file's first 512 bytes carry the shim marker; None when the
@@ -403,59 +445,105 @@ pub(crate) fn credential_path(url: &str) -> Option<&str> {
     Some(path)
 }
 
-/// The token gh should run with, or None to leave gh on the user's own auth.
+/// The credential helper's answer for one target.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Mint {
+    /// The helper answered with this token; gh runs with it.
+    Token(String),
+    /// No helper is routed for the host, or it answered without a password: gh runs
+    /// on its own auth.
+    Unrouted,
+    /// The helper refused — a non-zero exit, a `quit=1` answer, or it could not run —
+    /// and has already said why on stderr: knives exits with this code instead of
+    /// running gh.
+    Refused(i32),
+}
+
+/// Asks git's routed credential helper for the token gh should run with.
 ///
 /// Reads git's own credential config and speaks the credential-helper protocol
 /// to gh-app-token, which routes by the request path (shim lines 181-204).
 /// The routing table stays in gh-app-routes.gitconfig — single source of truth for
-/// git and knives alike; knives reads, never owns.
-/// The shim silences helper diagnostics; knives' stdout/stderr must stay gh's own.
+/// git and knives alike; knives reads, never owns. The helper answers every
+/// owner-bearing request on its own or quits: an owner the App covers gets an
+/// installation token, any other owner the profile's fallback secret, and an
+/// owner it cannot serve a `quit=1` with the reason on stderr. That stderr is
+/// relayed as knives' own, and a refusal stops knives before gh runs: the
+/// alternative, gh on its own auth, is a "run gh auth login" hint in an agent
+/// session and the user's keyring login in an interactive one.
 ///
-/// Deliberately, unlike the shim, this checks the helper's exit status and has an
-/// empty-password guard: its pipeline takes sed's status and would accept a token from a failing
-/// helper. This is unreachable with
-/// today's helper (every password=-printing path exits 0), but trusting failed
-/// process output is wrong.
-/// Any failure is None: falling back to user auth is the shim's contract, not
-/// an error (shim lines 184-188).
-pub(crate) fn mint_token(target_url: &str) -> Option<String> {
-    let path = credential_path(target_url)?;
+/// The exit status is checked and there is an empty-password guard: trusting a
+/// failed process's output is wrong even while today's helper never prints a
+/// password on a failing path. Only an exit-0 answer with no password is
+/// [`Mint::Unrouted`], like a host no helper is configured for.
+pub(crate) fn mint_token(target_url: &str) -> Mint {
+    let Some(path) = credential_path(target_url) else {
+        return Mint::Unrouted;
+    };
     let helper_key = format!("credential.https://{DEFAULT_HOST}/.helper");
     // NO .current_dir()/ -C on purpose: this is config, not repo state; unlike
     // gh_resolved_remote, adding a cwd would break the GIT_CONFIG_GLOBAL test override.
-    let output = Command::new("git")
+    let Ok(helpers) = Command::new("git")
         .args(["config", "--get-all"])
         .arg(helper_key)
         .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let helpers = std::str::from_utf8(&output.stdout).ok()?;
-    let profile = helpers
-        .lines()
-        .find_map(|helper| helper.strip_prefix("!gh-app-token "))?;
+    else {
+        return Mint::Unrouted;
+    };
+    let Some(profile) = std::str::from_utf8(&helpers.stdout)
+        .ok()
+        .filter(|_| helpers.status.success())
+        .and_then(|helpers| {
+            helpers
+                .lines()
+                .find_map(|helper| helper.strip_prefix("!gh-app-token "))
+        })
+    else {
+        return Mint::Unrouted;
+    };
     let request = format!("protocol=https\nhost={DEFAULT_HOST}\npath={path}\n\n");
-    let mut child = Command::new("gh-app-token")
+    let mut child = match Command::new("gh-app-token")
         .args([profile, "get"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
         .spawn()
-        .ok()?;
     {
-        let mut input = child.stdin.take()?;
-        std::io::Write::write_all(&mut input, request.as_bytes()).ok()?;
+        Ok(child) => child,
+        Err(error) => {
+            eprintln!("knives gh: cannot run gh-app-token {profile}: {error}");
+            return Mint::Refused(127);
+        }
+    };
+    // A helper that decides before reading its request closes stdin early; its
+    // answer, not the broken pipe, is what counts.
+    if let Some(mut input) = child.stdin.take() {
+        let _ = std::io::Write::write_all(&mut input, request.as_bytes());
     }
-    let output = child.wait_with_output().ok()?;
+    let output = match child.wait_with_output() {
+        Ok(output) => output,
+        Err(error) => {
+            eprintln!("knives gh: gh-app-token {profile}: {error}");
+            return Mint::Refused(1);
+        }
+    };
     if !output.status.success() {
-        return None;
+        return Mint::Refused(exit_code(output.status));
     }
-    std::str::from_utf8(&output.stdout)
-        .ok()?
+    let Ok(answer) = std::str::from_utf8(&output.stdout) else {
+        return Mint::Unrouted;
+    };
+    if answer
+        .lines()
+        .any(|line| line == "quit=1" || line == "quit=true")
+    {
+        return Mint::Refused(1);
+    }
+    answer
         .lines()
         .find_map(|line| line.strip_prefix("password=").map(str::to_owned))
         .filter(|token| !token.is_empty())
+        .map_or(Mint::Unrouted, Mint::Token)
 }
 
 /// The owner a `gh api` invocation targets, or None when it carries no signal.
@@ -819,17 +907,13 @@ mod tests {
         assert_eq!(credential_path("http://forge.example/acme/work.git"), None);
     }
 
-    #[test]
-    fn a_routed_target_gets_a_minted_token() {
-        // Given: a git config routing the default host to gh-app-token, and a
-        // fake gh-app-token that echoes a password when fed a path.
+    /// Runs [`mint_token`] for `acme/work` with git routing the default host to a
+    /// fake `gh-app-token` whose body is `script`; the scratch dir is returned so
+    /// a test can read what the fake recorded.
+    fn mint_through(script: &str) -> (tempfile::TempDir, Mint) {
         let dir = tempfile::tempdir().expect("scratch");
         let fake = dir.path().join("gh-app-token");
-        std::fs::write(
-            &fake,
-            "#!/bin/sh\ncat > \"$0.request\"\nprintf 'username=x-access-token\\npassword=tok-%s\\n' \"$1\"\n",
-        )
-        .expect("write fake helper");
+        std::fs::write(&fake, script).expect("write fake helper");
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         let gitconfig = dir.path().join("gitconfig");
         let host = concat!("github", ".com");
@@ -838,11 +922,8 @@ mod tests {
             format!("[credential \"https://{host}/\"]\n\thelper = !gh-app-token acme\n"),
         )
         .expect("write gitconfig");
-
-        // When: minting for a target under that host, with PATH and git config
-        // pointed at the scratch versions.
         let gitconfig_path = gitconfig.display().to_string();
-        let token = with_path_prefix(
+        let mint = with_path_prefix(
             dir.path(),
             &[
                 ("GIT_CONFIG_GLOBAL", &gitconfig_path),
@@ -852,49 +933,71 @@ mod tests {
             ],
             || mint_token(&format!("https://{host}/acme/work.git")),
         );
+        (dir, mint)
+    }
+
+    #[test]
+    fn a_routed_target_gets_a_minted_token() {
+        // Given: a fake gh-app-token that echoes a password when fed a path.
+        // When: minting for a target under the routed host.
+        let (dir, mint) = mint_through(
+            "#!/bin/sh\ncat > \"$0.request\"\nprintf 'username=x-access-token\\npassword=tok-%s\\n' \"$1\"\n",
+        );
 
         // Then: the token comes back and the helper saw the credential request.
-        assert_eq!(token.as_deref(), Some("tok-acme"));
+        assert_eq!(mint, Mint::Token("tok-acme".to_owned()));
         let request = std::fs::read_to_string(dir.path().join("gh-app-token.request"))
             .expect("request captured");
         assert!(request.contains("path=acme/work.git"), "{request}");
     }
 
     #[test]
-    fn a_routed_target_with_an_empty_password_gets_no_minted_token() {
-        // Given: a routed helper that responds with an empty password.
-        let dir = tempfile::tempdir().expect("scratch");
-        let fake = dir.path().join("gh-app-token");
-        std::fs::write(&fake, "#!/bin/sh\ncat > /dev/null\nprintf 'password=\\n'\n")
-            .expect("write fake helper");
-        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-        let gitconfig = dir.path().join("gitconfig");
-        let host = concat!("github", ".com");
-        std::fs::write(
-            &gitconfig,
-            format!("[credential \"https://{host}/\"]\n\thelper = !gh-app-token acme\n"),
-        )
-        .expect("write gitconfig");
-
+    fn a_routed_target_with_an_empty_password_leaves_gh_on_its_own_auth() {
+        // Given: a routed helper that responds with an empty password and exit 0.
         // When: the helper provides no token value.
-        let gitconfig_path = gitconfig.display().to_string();
-        let token = with_path_prefix(
-            dir.path(),
-            &[
-                ("GIT_CONFIG_GLOBAL", &gitconfig_path),
-                ("GIT_CONFIG_SYSTEM", "/dev/null"),
-                ("GIT_CONFIG_NOSYSTEM", "1"),
-                ("GIT_CONFIG_COUNT", "0"),
-            ],
-            || mint_token(&format!("https://{host}/acme/work.git")),
-        );
+        let (_dir, mint) = mint_through("#!/bin/sh\ncat > /dev/null\nprintf 'password=\\n'\n");
 
-        // Then: the caller falls back to the user's own GitHub auth.
-        assert_eq!(token, None);
+        // Then: gh runs on its own auth, as for a host no helper is configured for.
+        assert_eq!(mint, Mint::Unrouted);
     }
 
     #[test]
-    fn an_unrouted_target_gets_no_minted_token() {
+    fn a_helper_that_exits_non_zero_refuses_with_its_code() {
+        // Given: a routed helper that fails the way gh-app-token does for an owner it
+        // cannot serve: quit=1 on stdout, the reason on stderr, exit 1. A password it
+        // printed anyway must not be trusted.
+        // When: minting.
+        let (_dir, mint) = mint_through(
+            "#!/bin/sh\ncat > /dev/null\necho 'gh-app-token: no App installation for owner acme' >&2\nprintf 'quit=1\\npassword=tok-stale\\n'\nexit 3\n",
+        );
+
+        // Then: the refusal carries the helper's exit code; knives must not run gh.
+        assert_eq!(mint, Mint::Refused(3));
+    }
+
+    #[test]
+    fn a_quit_answer_with_exit_zero_refuses() {
+        // Given: a helper that answers quit=1 but exits 0, as git's protocol allows.
+        // When: minting.
+        let (_dir, mint) = mint_through("#!/bin/sh\ncat > /dev/null\nprintf 'quit=1\\n'\n");
+
+        // Then: quit is a refusal, not a fall-through to gh's own auth.
+        assert_eq!(mint, Mint::Refused(1));
+    }
+
+    #[test]
+    fn a_helper_that_decides_before_reading_its_request_is_still_heard() {
+        // Given: a helper that exits without consuming stdin (knives' write hits a
+        // closed pipe).
+        // When: minting.
+        let (_dir, mint) = mint_through("#!/bin/sh\nexit 2\n");
+
+        // Then: its exit status, not the broken pipe, decides the outcome.
+        assert_eq!(mint, Mint::Refused(2));
+    }
+
+    #[test]
+    fn an_unrouted_target_leaves_gh_on_its_own_auth() {
         // Given: Git has no credential helper for the default host.
         // GIT_CONFIG_GLOBAL/NOSYSTEM mask global+system, not a repo-local helper; this checkout has none.
         let dir = tempfile::tempdir().expect("scratch");
@@ -904,7 +1007,7 @@ mod tests {
         let host = concat!("github", ".com");
 
         // When: minting a token for the default host.
-        let token = with_env(
+        let mint = with_env(
             &[
                 ("GIT_CONFIG_GLOBAL", &gitconfig_path),
                 ("GIT_CONFIG_SYSTEM", "/dev/null"),
@@ -914,8 +1017,8 @@ mod tests {
             || mint_token(&format!("https://{host}/acme/work.git")),
         );
 
-        // Then: the caller can fall back to the user's own GitHub auth.
-        assert_eq!(token, None);
+        // Then: nothing is routed, so gh runs on its own auth.
+        assert_eq!(mint, Mint::Unrouted);
     }
 
     #[test]
@@ -1338,12 +1441,10 @@ mod tests {
         assert_eq!(injected, args(&["pr", "view", "feat/x", "--json", "title"]));
     }
 
-    #[test]
-    fn real_gh_skips_a_path_candidate_marked_as_the_knives_shim() {
-        // Given: a PATH where the first executable gh carries the shim marker.
-        let scratch = tempfile::tempdir().expect("scratch");
-        let shim_dir = scratch.path().join("shim");
-        let real_dir = scratch.path().join("real");
+    /// A PATH of two directories: a marked shim `gh` first, then a clean `gh`.
+    fn shim_then_real_path(scratch: &Path) -> (String, PathBuf, PathBuf) {
+        let shim_dir = scratch.join("shim");
+        let real_dir = scratch.join("real");
         std::fs::create_dir(&shim_dir).expect("create shim directory");
         std::fs::create_dir(&real_dir).expect("create real directory");
         let shim = shim_dir.join("gh");
@@ -1355,6 +1456,89 @@ mod tests {
                 .expect("chmod executable");
         }
         let path = format!("{}:{}", shim_dir.display(), real_dir.display());
+        (path, shim, real)
+    }
+
+    #[test]
+    fn a_direct_invocation_re_enters_the_shim_first_on_path() {
+        // Given: no KNIVES_REAL_GH (knives was not invoked by the shim) and a PATH
+        // whose first gh is the marked shim.
+        let scratch = tempfile::tempdir().expect("scratch");
+        let (path, shim, _) = shim_then_real_path(scratch.path());
+        let _lock = crate::config::test_support::environment_lock();
+        let guard =
+            crate::config::test_support::EnvironmentGuard::capture(&["KNIVES_REAL_GH", "PATH"]);
+        guard.remove("KNIVES_REAL_GH");
+        guard.set("PATH", &path);
+
+        // When: deciding whether to hand the call back to the shim.
+        let reentry = reentry_shim();
+
+        // Then: the shim gets the call, so its agent-context rules apply before any minting.
+        assert_eq!(reentry, Some(shim));
+    }
+
+    #[test]
+    fn an_empty_override_counts_as_a_direct_invocation() {
+        // Given: KNIVES_REAL_GH set but empty, the same rule real_gh() applies.
+        let scratch = tempfile::tempdir().expect("scratch");
+        let (path, shim, _) = shim_then_real_path(scratch.path());
+        let _lock = crate::config::test_support::environment_lock();
+        let guard =
+            crate::config::test_support::EnvironmentGuard::capture(&["KNIVES_REAL_GH", "PATH"]);
+        guard.set("KNIVES_REAL_GH", "");
+        guard.set("PATH", &path);
+
+        // When / Then: the shim is re-entered.
+        assert_eq!(reentry_shim(), Some(shim));
+    }
+
+    #[test]
+    fn a_shim_re_entry_does_not_re_enter_again() {
+        // Given: KNIVES_REAL_GH set, as the shim sets it on every pass into knives,
+        // and the same shim-first PATH.
+        let scratch = tempfile::tempdir().expect("scratch");
+        let (path, _, real) = shim_then_real_path(scratch.path());
+        let real_value = real.display().to_string();
+        let _lock = crate::config::test_support::environment_lock();
+        let guard =
+            crate::config::test_support::EnvironmentGuard::capture(&["KNIVES_REAL_GH", "PATH"]);
+        guard.set("KNIVES_REAL_GH", &real_value);
+        guard.set("PATH", &path);
+
+        // When: deciding whether to re-enter.
+        let reentry = reentry_shim();
+
+        // Then: nothing to hand back; this pass mints and runs the real gh.
+        assert_eq!(reentry, None);
+        assert_eq!(real_gh().expect("use override"), real);
+    }
+
+    #[test]
+    fn no_shim_on_path_means_no_re_entry() {
+        // Given: no override and a PATH whose only gh is clean (a machine without the shim).
+        let scratch = tempfile::tempdir().expect("scratch");
+        let real = scratch.path().join("gh");
+        std::fs::write(&real, "#!/bin/sh\n").expect("write real gh");
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod real gh");
+        let path = scratch.path().display().to_string();
+        let _lock = crate::config::test_support::environment_lock();
+        let guard =
+            crate::config::test_support::EnvironmentGuard::capture(&["KNIVES_REAL_GH", "PATH"]);
+        guard.remove("KNIVES_REAL_GH");
+        guard.set("PATH", &path);
+
+        // When / Then: today's behaviour stands; PATH gh is the real gh.
+        assert_eq!(reentry_shim(), None);
+        assert_eq!(real_gh().expect("find real gh"), real);
+    }
+
+    #[test]
+    fn real_gh_skips_a_path_candidate_marked_as_the_knives_shim() {
+        // Given: a PATH where the first executable gh carries the shim marker.
+        let scratch = tempfile::tempdir().expect("scratch");
+        let (path, _, real) = shim_then_real_path(scratch.path());
         let _lock = crate::config::test_support::environment_lock();
         let guard =
             crate::config::test_support::EnvironmentGuard::capture(&["KNIVES_REAL_GH", "PATH"]);
