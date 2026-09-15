@@ -135,6 +135,18 @@ pub(crate) fn run_release(
         };
         let request = release::Cut::from_carried(name.clone(), &carried);
         let mut candidate = release::candidate_cut(path, &request, previous_commit.as_ref())?;
+        // The orphan gate protects unreachable commits; this protects the
+        // composition itself. The previous cut's ledger event is the only
+        // record of a parent set that survives the bookmark moving, so every
+        // subject is held against it before anything is recorded or published.
+        let gate = CompositionGate {
+            opened: &opened,
+            path,
+            parents: &request.parents,
+            base: &audit_base,
+            trunk: &trunk,
+            tips: &tips,
+        };
         // A cut names a composition consumers can pin. When the publish remote
         // already holds the previous cut with exactly this tree on exactly these
         // parents, a new name ships nothing and only burns a dated name and a
@@ -169,6 +181,58 @@ pub(crate) fn run_release(
                         published.short(),
                         previous_ref.branch()
                     );
+                } else if matches!(scheme, ReleaseScheme::Fixed(_))
+                    && let previous_recorded =
+                        last_recorded_cut(&Ledger::for_repo(repo).entries()?, None)
+                    && previous_recorded
+                        .as_ref()
+                        .is_none_or(|recorded| recorded.commit != *published)
+                {
+                    let audit = release::audit_cut(
+                        path,
+                        &members,
+                        release::CutSubject::Committed(published),
+                        release::AuditContext {
+                            previous: previous_commit.as_ref(),
+                            trunk: &audit_base,
+                        },
+                    )?;
+                    if let Some(exit) = report_cut_audit(repo, &audit) {
+                        return Ok(exit);
+                    }
+                    let mut subject = release::CutSubject::Committed(published);
+                    let (recorded, check) =
+                        match recorded_composition_check(repo, &mut subject, &gate, allow_drop)? {
+                            Ok(verdict) => verdict,
+                            Err(exit) => return Ok(exit),
+                        };
+                    let completed = CompletedCut {
+                        name: &name,
+                        request: &request,
+                        carried: &carried,
+                        created: published,
+                        audit: &audit,
+                        scheme: &scheme,
+                        recorded: recorded.as_ref(),
+                        check: &check,
+                    };
+                    record_cut_event(fork, &completed, bound)?;
+                    match &previous_recorded {
+                        Some(recorded) => println!(
+                            "{repo}: recorded published composition {name}@{publish_remote} ({}) as the cut; previous recorded cut {} was {}",
+                            published.short(),
+                            recorded.name,
+                            recorded.commit.short()
+                        ),
+                        None => println!(
+                            "{repo}: recorded published composition {name}@{publish_remote} ({}) as the cut; no previous recorded cut",
+                            published.short()
+                        ),
+                    }
+                    if !audit.inconclusive.is_empty() || !check.inconclusive.is_empty() {
+                        worst = worst.worst(Exit::Findings);
+                    }
+                    return Ok(worst);
                 } else {
                     println!(
                         "{repo}: refusing to cut {name}: identical to {}@{publish_remote} ({}); nothing to cut",
@@ -194,22 +258,13 @@ pub(crate) fn run_release(
         if let Some(exit) = report_cut_audit(repo, &audit) {
             return Ok(exit);
         }
-        // The orphan gate protects unreachable commits; this protects the
-        // composition itself. The previous cut's ledger event is the only
-        // record of a parent set that survives the bookmark moving, so the
-        // candidate is held against it before anything is published.
-        let gate = CompositionGate {
-            opened: &opened,
-            parents: &request.parents,
-            base: &audit_base,
-            trunk: &trunk,
-            tips: &tips,
-        };
-        let (recorded, check) =
-            match recorded_composition_check(repo, &mut candidate, &gate, allow_drop)? {
+        let (recorded, check) = {
+            let mut subject = release::CutSubject::Candidate(&mut candidate);
+            match recorded_composition_check(repo, &mut subject, &gate, allow_drop)? {
                 Ok(verdict) => verdict,
                 Err(exit) => return Ok(exit),
-            };
+            }
+        };
         let created = release::publish_cut(candidate, &request.name, &scheme)?;
         let completed = CompletedCut {
             name: &name,
@@ -317,22 +372,23 @@ fn report_cut_audit(repo: &RepoName, audit: &release::CutAudit) -> Option<Exit> 
 }
 
 /// The composition gate's inputs: everything the recorded-member check reads
-/// beside the candidate itself.
+/// beside the cut subject.
 struct CompositionGate<'a> {
     opened: &'a knives::jj::Repo,
+    path: &'a std::path::Path,
     parents: &'a [knives::ids::CommitId],
     base: &'a knives::ids::CommitId,
     trunk: &'a knives::ids::CommitId,
     tips: &'a knives::detect::BookmarkTips,
 }
 
-/// Hold the candidate against the previous cut's recorded composition.
+/// Hold the cut subject against the previous cut's recorded composition.
 ///
 /// `Err` is the refusal, already reported. `Ok` carries what the ledger
 /// recorded and what the check found, for the cut event to restate.
 fn recorded_composition_check(
     repo: &RepoName,
-    candidate: &mut knives::jj::Candidate,
+    subject: &mut release::CutSubject<'_>,
     gate: &CompositionGate<'_>,
     allow_drop: bool,
 ) -> anyhow::Result<Result<(Option<RecordedCut>, release::CompositionCheck), Exit>> {
@@ -340,7 +396,8 @@ fn recorded_composition_check(
     let check = match &recorded {
         Some(recorded) => release::uncarried_recorded_members(
             gate.opened,
-            candidate,
+            gate.path,
+            subject,
             &release::CompositionDelta {
                 recorded,
                 parents: gate.parents,
@@ -351,26 +408,43 @@ fn recorded_composition_check(
         )?,
         None => release::CompositionCheck::default(),
     };
-    if let Some(exit) = report_uncarried_cut(repo, recorded.as_ref(), &check, allow_drop) {
+    let on_drop = match (allow_drop, &*subject) {
+        (true, _) => DropDisposition::Allowed,
+        (false, release::CutSubject::Candidate(_)) => DropDisposition::RefuseDiscardingCandidate,
+        (false, release::CutSubject::Committed(_)) => DropDisposition::RefuseRecordingNothing,
+    };
+    if let Some(exit) = report_uncarried_cut(repo, recorded.as_ref(), &check, on_drop) {
         return Ok(Err(exit));
     }
     Ok(Ok((recorded, check)))
 }
 
+/// What a cut does about members the previous cut recorded but this one lacks.
+#[derive(Clone, Copy)]
+enum DropDisposition {
+    /// `--allow-drop`: state the drop and carry on.
+    Allowed,
+    /// Refuse; the candidate commit was never published, so it is simply gone.
+    RefuseDiscardingCandidate,
+    /// Refuse; the composition is already on origin, so nothing changes there.
+    RefuseRecordingNothing,
+}
+
 /// Say what the recorded-composition check found; refuse when members are gone.
 ///
 /// Inconclusive members are reported without refusing, for the same reason the
-/// audit's are: a conflicted replay onto a conflicted candidate answers nothing
-/// either way. A member the candidate does not carry refuses the cut, because
+/// audit's are: a conflicted replay onto a conflicted cut subject answers
+/// nothing either way. A member the cut subject does not carry refuses the cut,
 /// the previous cut's ledger event is the only surviving record of the
 /// composition — every edit moves the bookmark, and the next cut reaps the
-/// superseded commit. The refused candidate was never published, so nothing is
-/// abandoned and nothing needs cleanup.
+/// superseded commit. A refused candidate was never published and a refused
+/// record leaves origin as it was, so nothing is abandoned and nothing needs
+/// cleanup.
 fn report_uncarried_cut(
     repo: &RepoName,
     recorded: Option<&RecordedCut>,
     check: &release::CompositionCheck,
-    allow_drop: bool,
+    on_drop: DropDisposition,
 ) -> Option<Exit> {
     let recorded = recorded?;
     for member in &check.inconclusive {
@@ -383,7 +457,7 @@ fn report_uncarried_cut(
     if check.dropped.is_empty() {
         return None;
     }
-    if allow_drop {
+    if matches!(on_drop, DropDisposition::Allowed) {
         println!(
             "{repo}: --allow-drop: cutting without {} member(s) the previous cut {} recorded: {}",
             check.dropped.len(),
@@ -401,8 +475,14 @@ fn report_uncarried_cut(
     for member in &check.dropped {
         println!("    {member}");
     }
+    let outcome = match on_drop {
+        DropDisposition::RefuseDiscardingCandidate => "the candidate was discarded",
+        DropDisposition::Allowed | DropDisposition::RefuseRecordingNothing => {
+            "nothing was recorded"
+        }
+    };
     println!(
-        "  the candidate was discarded; `knives release include <branch>` restores a member, \
+        "  {outcome}; `knives release include <branch>` restores a member, \
          or re-run with --allow-drop to state the drop is intended"
     );
     Some(Exit::Incomplete)

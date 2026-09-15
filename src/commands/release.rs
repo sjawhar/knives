@@ -1710,46 +1710,47 @@ pub struct CompositionCheck {
     pub inconclusive: Vec<Unverified>,
 }
 
-/// What the composition gate compares: the candidate's parents against the
-/// members the previous cut's ledger event recorded.
+/// What the composition gate compares: the cut's parents against the members
+/// the previous cut's ledger event recorded.
 #[derive(Debug)]
 pub struct CompositionDelta<'a> {
     pub recorded: &'a RecordedCut,
-    /// The candidate's parents, for the identity and ancestry fast paths.
+    /// The cut's parents, for the identity and ancestry fast paths.
     pub parents: &'a [CommitId],
     /// The audit's base: what every current member forks from. A recorded
-    /// member that is an ancestor of it entered the candidate through the
-    /// base — how a merge-landed member reads as carried after a rebase.
+    /// member that is an ancestor of it entered the cut through the base — how
+    /// a merge-landed member reads as carried after a rebase.
     pub base: &'a CommitId,
     /// The upstream trunk tip. A member reachable from it but not from the
-    /// base or any parent landed upstream past what the candidate ships:
-    /// the trunk carries it, this cut does not, and that is a drop.
+    /// base or any parent landed upstream past what the cut ships: the trunk
+    /// carries it, this cut does not, and that is a drop.
     pub trunk: &'a CommitId,
     pub tips: &'a BookmarkTips,
 }
 
-/// Recorded members of the previous cut that the candidate does not carry.
+/// Recorded members of the previous cut that the cut subject does not carry.
 ///
 /// Identity and ancestry account for a member that is still a parent, was
-/// advanced past, or entered through the candidate's base. A member whose
-/// change was rewritten — `jj rebase` keeps the change id and mints a new
-/// commit — is carried when a rewrite is reachable from a parent or the base,
-/// the same succession `advance` recognises; the recorded commit itself is
-/// never an ancestor again after a rebase. The content replay accounts for one
-/// that landed upstream as a squash — the same measure [`audit_cut`] applies
-/// to current members, taken from the member's own fork point so a moved base
-/// is never charged to the member. A member the trunk reaches but the
-/// candidate does not is dropped without a replay: its fork point degenerates
-/// to the member itself, and that replay would read empty without consulting
-/// the candidate at all. A recorded commit this repository cannot resolve
-/// counts as dropped: unverifiable must not read as carried.
+/// advanced past, or entered through the cut's base. A member whose change was
+/// rewritten — `jj rebase` keeps the change id and mints a new commit — is
+/// carried when a rewrite is reachable from a parent or the base, the same
+/// succession `advance` recognises; the recorded commit itself is never an
+/// ancestor again after a rebase. The content replay accounts for one that
+/// landed upstream as a squash — the same measure [`audit_cut`] applies to
+/// current members, taken from the member's own fork point so a moved base is
+/// never charged to the member. A member the trunk reaches but the cut subject
+/// does not is dropped without a replay: its fork point degenerates to the
+/// member itself, and that replay would read empty without consulting the cut
+/// subject at all. A recorded commit this repository cannot resolve counts as
+/// dropped: unverifiable must not read as carried.
 pub fn uncarried_recorded_members(
     repo: &Repo,
-    candidate: &mut jj::Candidate,
+    path: &Path,
+    subject: &mut CutSubject<'_>,
     delta: &CompositionDelta<'_>,
 ) -> anyhow::Result<CompositionCheck> {
     let mut check = CompositionCheck::default();
-    let candidate_conflicted = !candidate.conflicted_files()?.is_empty();
+    let cut_is_conflicted = !subject.conflicted_files(path)?.is_empty();
     for member in &delta.recorded.members {
         if delta.parents.contains(member) {
             continue;
@@ -1781,9 +1782,9 @@ pub fn uncarried_recorded_members(
         let base = repo
             .common_ancestor(std::slice::from_ref(member), delta.trunk)?
             .unwrap_or_else(|| delta.trunk.clone());
-        match candidate.replay_outcome(base.as_str(), member.as_str())? {
+        match subject.replay_outcome(path, base.as_str(), member.as_str())? {
             RebaseOutcome::Empty => {}
-            RebaseOutcome::Conflicted if candidate_conflicted => {
+            RebaseOutcome::Conflicted if cut_is_conflicted => {
                 check.inconclusive.push(Unverified {
                     commit: member.clone(),
                     name: recorded_member_name(member, delta.tips),
@@ -1797,7 +1798,7 @@ pub fn uncarried_recorded_members(
     Ok(check)
 }
 
-/// Whether the candidate's base or any of its parents reaches `commit`.
+/// Whether the cut's base or any of its parents reaches `commit`.
 fn reaches_any(
     repo: &Repo,
     commit: &CommitId,
