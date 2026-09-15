@@ -610,10 +610,65 @@ pub(crate) fn owner_from_api_args(args: &[String]) -> Option<String> {
         .into_iter()
         .filter_map(|(keyword, field)| graphql_field(&joined, keyword, field))
         .min_by_key(|(offset, _)| *offset);
-    if let Some((_, owner)) = candidates {
-        return Some(owner);
+    match candidates {
+        Some((_, GraphqlValue::Literal(owner))) => Some(owner),
+        // The query names the owner through a variable; its value travels as a
+        // separate `-f owner=acme` field argument (how knives' own forge queries
+        // and gh's documentation write it).
+        Some((_, GraphqlValue::Variable(name))) => field_argument(args, &name),
+        None => None,
+    }
+}
+
+/// The value bound to GraphQL variable `name` by a `gh api` field argument, in
+/// every spelling gh's flag parser accepts: `-f name=value`, `-fname=value`,
+/// `-f=name=value`, the same three for `-F`, and `--raw-field`/`--field` as
+/// `--flag name=value` or `--flag=name=value`. A value gh reads from a file
+/// (`-F name=@path`) or that is not shaped like a login is no signal; `-F`
+/// coercions such as `true` or `42` pass the charset and route like the login
+/// they spell, which is what `-f` would have sent anyway.
+fn field_argument(args: &[String], name: &str) -> Option<String> {
+    let mut index = 0;
+    while let Some(argument) = args.get(index) {
+        let assignment = match argument.as_str() {
+            "-f" | "-F" | "--raw-field" | "--field" => {
+                index += 1;
+                args.get(index).map(String::as_str)
+            }
+            _ => argument
+                .strip_prefix("--raw-field=")
+                .or_else(|| argument.strip_prefix("--field="))
+                .or_else(|| argument.strip_prefix("-f"))
+                .or_else(|| argument.strip_prefix("-F"))
+                .map(|attached| attached.strip_prefix('=').unwrap_or(attached)),
+        };
+        if let Some((key, value)) = assignment.and_then(|assignment| assignment.split_once('='))
+            && key == name
+            && is_owner_shaped(value)
+        {
+            return Some(value.to_owned());
+        }
+        index += 1;
     }
     None
+}
+
+/// The characters a GitHub login or organization name may carry.
+fn is_owner_shaped(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+/// The repository a command targets when its arguments carry no `-R`: gh's own
+/// `GH_REPO` override, applied whenever it is set and `-R` is absent, inside a
+/// checkout or not (shim parity has no equivalent; the shim predates scripts
+/// that target by environment).
+fn gh_repo_environment() -> Option<String> {
+    std::env::var("GH_REPO")
+        .ok()
+        .filter(|spec| !spec.is_empty())
 }
 
 /// The value of the first explicit repository flag (shim lines 137-150).
@@ -643,7 +698,7 @@ pub(crate) fn repo_flag(args: &[String]) -> Option<String> {
 /// The https URL targeted by this invocation (shim lines 75-179).
 pub(crate) fn resolve_target_url(args: &[String], cwd: &Path) -> Option<String> {
     let api_owner = owner_from_api_args(args);
-    let repo_spec = repo_flag(args);
+    let repo_spec = repo_flag(args).or_else(gh_repo_environment);
     let needs_git_inputs = api_owner.is_none() && repo_spec.is_none();
     let resolved_remote = needs_git_inputs.then(|| gh_resolved_remote(cwd)).flatten();
     let registry = needs_git_inputs
@@ -775,11 +830,19 @@ fn preferred_remote_url(
         })
 }
 
-/// First `keyword ( ... field : "value" ... )` in the text, quote-agnostic,
-/// returned with the byte offset of the match so callers can pick the leftmost
-/// across several keywords (shim parity: one regex, first match wins).
-/// Shim line 113 requires the field to be first inside the parentheses.
-fn graphql_field(text: &str, keyword: &str, field: &str) -> Option<(usize, String)> {
+/// How a GraphQL query names an owner: inline, or through a variable whose value
+/// arrives as a separate field argument.
+enum GraphqlValue {
+    Literal(String),
+    Variable(String),
+}
+
+/// First `keyword ( ... field : "value" ... )` or `keyword ( ... field : $var ... )`
+/// in the text, quote-agnostic, returned with the byte offset of the match so
+/// callers can pick the leftmost across several keywords (shim parity: one
+/// regex, first match wins). Shim line 113 requires the field to be first inside
+/// the parentheses.
+fn graphql_field(text: &str, keyword: &str, field: &str) -> Option<(usize, GraphqlValue)> {
     let mut search = text;
     let mut consumed = 0usize; // byte offset of `search` within `text`
     while let Some(at) = search.find(keyword) {
@@ -796,12 +859,16 @@ fn graphql_field(text: &str, keyword: &str, field: &str) -> Option<(usize, Strin
                     if let Some(quote) = rest.chars().next().filter(|c| matches!(c, '"' | '\'')) {
                         let value: String =
                             rest.chars().skip(1).take_while(|c| *c != quote).collect();
-                        if !value.is_empty()
-                            && value
-                                .chars()
-                                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
-                        {
-                            return Some((match_offset, value));
+                        if is_owner_shaped(&value) {
+                            return Some((match_offset, GraphqlValue::Literal(value)));
+                        }
+                    } else if let Some(variable) = rest.strip_prefix('$') {
+                        let name: String = variable
+                            .chars()
+                            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                            .collect();
+                        if !name.is_empty() {
+                            return Some((match_offset, GraphqlValue::Variable(name)));
                         }
                     }
                 }
@@ -1195,6 +1262,125 @@ mod tests {
             .as_deref(),
             Some("b")
         );
+    }
+
+    #[test]
+    fn a_variable_bound_graphql_owner_resolves_through_its_field_argument() {
+        // knives' own forge queries bind the target as `-f owner=… -f name=…`
+        // and reference `$owner` in the query, so the query text alone names no
+        // owner. A run from a fork checkout asking about a *different* repo
+        // (the consumer-head query) then routed by cwd to the fork's owner and
+        // answered "Could not resolve to a Repository" for the private consumer.
+        let args = |a: &[&str]| a.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        let query = "query=query($owner: String!, $name: String!) { repository(owner: $owner, name: $name) { id } }";
+        for argv in [
+            vec![
+                "api",
+                "graphql",
+                "-f",
+                "owner=acme",
+                "-f",
+                "name=work",
+                "-f",
+                query,
+            ],
+            vec!["api", "graphql", "-F", "owner=acme", "-f", query],
+            vec!["api", "graphql", "--raw-field", "owner=acme", "-f", query],
+            vec!["api", "graphql", "--raw-field=owner=acme", "-f", query],
+            vec!["api", "graphql", "--field", "owner=acme", "-f", query],
+            vec!["api", "graphql", "--field=owner=acme", "-f", query],
+            // pflag's attached short spellings.
+            vec!["api", "graphql", "-fowner=acme", "-f", query],
+            vec!["api", "graphql", "-f=owner=acme", "-f", query],
+            vec!["api", "graphql", "-Fowner=acme", "-f", query],
+            // The query may precede its bindings.
+            vec!["api", "graphql", "-f", query, "-f", "owner=acme"],
+        ] {
+            assert_eq!(
+                owner_from_api_args(&args(&argv)).as_deref(),
+                Some("acme"),
+                "argv {argv:?}"
+            );
+        }
+        // Variable names are matched whole: `$owner` is not bound by `owner_id=`.
+        assert_eq!(
+            owner_from_api_args(&args(&[
+                "api",
+                "graphql",
+                "-f",
+                "owner_id=acme",
+                "-f",
+                query
+            ])),
+            None
+        );
+        // An unbound variable is no signal; gh would reject the query anyway.
+        assert_eq!(
+            owner_from_api_args(&args(&["api", "graphql", "-f", query])),
+            None
+        );
+        // A binding gh reads from a file or that is not an owner-shaped value is no signal.
+        assert_eq!(
+            owner_from_api_args(&args(&[
+                "api",
+                "graphql",
+                "-F",
+                "owner=@owner.txt",
+                "-f",
+                query
+            ])),
+            None
+        );
+        // Leftmost still wins when the earlier field is variable-bound.
+        assert_eq!(
+            owner_from_api_args(&args(&[
+                "api",
+                "graphql",
+                "-f",
+                "org=first",
+                "-f",
+                r#"query=query($org: String!) { organization(login: $org) { id } repository(owner: "second", name: "x") { id } }"#,
+            ]))
+            .as_deref(),
+            Some("first")
+        );
+    }
+
+    #[test]
+    fn gh_repo_in_the_environment_targets_like_the_repo_flag() {
+        // gh's own `GH_REPO` override selects the repository when the command is
+        // not run inside its checkout; -R beats it, as in gh.
+        let args = |a: &[&str]| a.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        let host = DEFAULT_HOST;
+        let scratch = tempfile::tempdir().expect("tempdir");
+        with_env(&[("GH_REPO", "acme/work")], || {
+            assert_eq!(
+                resolve_target_url(&args(&["pr", "list"]), scratch.path()),
+                Some(format!("https://{host}/acme/work.git"))
+            );
+            assert_eq!(
+                resolve_target_url(
+                    &args(&["api", "repos/{owner}/{repo}/pulls"]),
+                    scratch.path()
+                ),
+                Some(format!("https://{host}/acme/work.git"))
+            );
+            assert_eq!(
+                resolve_target_url(&args(&["pr", "list", "-R", "other/repo"]), scratch.path()),
+                Some(format!("https://{host}/other/repo.git"))
+            );
+            // A path literal is the request's real target and still wins.
+            assert_eq!(
+                resolve_target_url(&args(&["api", "repos/literal/repo/pulls"]), scratch.path()),
+                Some(format!("https://{host}/literal/gh-api.git"))
+            );
+        });
+        with_env(&[("GH_REPO", "")], || {
+            assert_eq!(
+                resolve_target_url(&args(&["pr", "list"]), scratch.path()),
+                None
+            );
+        });
     }
 
     #[test]
