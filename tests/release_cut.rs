@@ -424,8 +424,7 @@ fn a_fixed_cut_with_a_published_unrecorded_composition_records_instead_of_refusi
     let recorded = knives_release(&lab, &home, &["cut"]);
     let stdout = String::from_utf8_lossy(&recorded.stdout);
     assert!(
-        recorded.status.success()
-            || recorded.status.code() == Some(i32::from(knives::cli::Exit::Findings.code())),
+        recorded.status.success(),
         "{stdout}\n{}",
         String::from_utf8_lossy(&recorded.stderr)
     );
@@ -455,6 +454,16 @@ fn a_fixed_cut_with_a_published_unrecorded_composition_records_instead_of_refusi
         Some(published.as_str()),
         "the record-only cut must anchor its evidence at the published composition"
     );
+    let mut recorded_members: Vec<&str> = cut.evidence[1..].iter().map(String::as_str).collect();
+    recorded_members.sort_unstable();
+    let alpha = lab.revision(&lab.work, "feat/alpha", "commit_id");
+    let beta = lab.revision(&lab.work, "feat/beta", "commit_id");
+    let mut published_members = [alpha.trim(), beta.trim()];
+    published_members.sort_unstable();
+    assert_eq!(
+        recorded_members, published_members,
+        "the record-only cut must record the members the published composition carries"
+    );
 
     // And: once recorded, the identical published composition keeps the usual refusal.
     let repeated = knives_release(&lab, &home, &["cut"]);
@@ -470,6 +479,64 @@ fn a_fixed_cut_with_a_published_unrecorded_composition_records_instead_of_refusi
             published.short()
         )),
         "{repeated_stdout}"
+    );
+}
+
+#[test]
+fn a_fixed_cut_records_a_published_composition_that_has_no_recorded_cut_yet() {
+    // Given: a fixed release whose bookmark is published but whose ledger has
+    // never recorded a cut (an adopted branch, or a ledger started fresh).
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let (home, _consumer) = release_test_home(&lab);
+    std::fs::remove_file(home.path().join("local-consumer")).expect("remove local consumer");
+    let registry = home.path().join("repos.toml");
+    let config = std::fs::read_to_string(&registry).expect("read registry");
+    std::fs::write(
+        &registry,
+        format!("{config}release_branch = \"integration\"\n"),
+    )
+    .expect("configure fixed release branch");
+    let first = knives_release(&lab, &home, &["cut"]);
+    assert!(first.status.success(), "{first:?}");
+    lab.push_branch("integration");
+    lab.fetch_work();
+    let published = commit_at(&lab, "integration@origin");
+    let ledger_dir = home.path().join("ledger").join("demo");
+    std::fs::remove_dir_all(&ledger_dir).expect("forget every recorded cut");
+
+    // When: cut runs with local == origin and nothing recorded.
+    let recorded = knives_release(&lab, &home, &["cut"]);
+    let stdout = String::from_utf8_lossy(&recorded.stdout);
+
+    // Then: the published composition is recorded as the first cut.
+    assert!(
+        recorded.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&recorded.stderr)
+    );
+    assert!(
+        stdout.contains(&format!(
+            "demo: recorded published composition integration@origin ({}) as the cut; no previous recorded cut",
+            published.short()
+        )),
+        "{stdout}"
+    );
+    assert_eq!(commit_at(&lab, "integration@origin"), published);
+    let entries = knives::ledger::Ledger::at(ledger_dir)
+        .entries()
+        .expect("read ledger");
+    let cut = entries
+        .iter()
+        .rev()
+        .find(|entry| {
+            entry.subject.as_deref() == Some("integration")
+                && entry.text.starts_with("cut integration as ")
+        })
+        .unwrap_or_else(|| panic!("no recorded fixed cut: {entries:?}"));
+    assert_eq!(
+        cut.evidence.first().map(String::as_str),
+        Some(published.as_str())
     );
 }
 

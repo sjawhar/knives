@@ -182,9 +182,11 @@ pub(crate) fn run_release(
                         previous_ref.branch()
                     );
                 } else if matches!(scheme, ReleaseScheme::Fixed(_))
-                    && let Some(previous_recorded) =
+                    && let previous_recorded =
                         last_recorded_cut(&Ledger::for_repo(repo).entries()?, None)
-                    && previous_recorded.commit != *published
+                    && previous_recorded
+                        .as_ref()
+                        .is_none_or(|recorded| recorded.commit != *published)
                 {
                     let audit = release::audit_cut(
                         path,
@@ -215,12 +217,18 @@ pub(crate) fn run_release(
                         check: &check,
                     };
                     record_cut_event(fork, &completed, bound)?;
-                    println!(
-                        "{repo}: recorded published composition {name}@{publish_remote} ({}) as the cut; previous recorded cut {} was {}",
-                        published.short(),
-                        previous_recorded.name,
-                        previous_recorded.commit.short()
-                    );
+                    match &previous_recorded {
+                        Some(recorded) => println!(
+                            "{repo}: recorded published composition {name}@{publish_remote} ({}) as the cut; previous recorded cut {} was {}",
+                            published.short(),
+                            recorded.name,
+                            recorded.commit.short()
+                        ),
+                        None => println!(
+                            "{repo}: recorded published composition {name}@{publish_remote} ({}) as the cut; no previous recorded cut",
+                            published.short()
+                        ),
+                    }
                     if !audit.inconclusive.is_empty() || !check.inconclusive.is_empty() {
                         worst = worst.worst(Exit::Findings);
                     }
@@ -400,10 +408,26 @@ fn recorded_composition_check(
         )?,
         None => release::CompositionCheck::default(),
     };
-    if let Some(exit) = report_uncarried_cut(repo, recorded.as_ref(), &check, allow_drop) {
+    let on_drop = match (allow_drop, &*subject) {
+        (true, _) => DropDisposition::Allowed,
+        (false, release::CutSubject::Candidate(_)) => DropDisposition::RefuseDiscardingCandidate,
+        (false, release::CutSubject::Committed(_)) => DropDisposition::RefuseRecordingNothing,
+    };
+    if let Some(exit) = report_uncarried_cut(repo, recorded.as_ref(), &check, on_drop) {
         return Ok(Err(exit));
     }
     Ok(Ok((recorded, check)))
+}
+
+/// What a cut does about members the previous cut recorded but this one lacks.
+#[derive(Clone, Copy)]
+enum DropDisposition {
+    /// `--allow-drop`: state the drop and carry on.
+    Allowed,
+    /// Refuse; the candidate commit was never published, so it is simply gone.
+    RefuseDiscardingCandidate,
+    /// Refuse; the composition is already on origin, so nothing changes there.
+    RefuseRecordingNothing,
 }
 
 /// Say what the recorded-composition check found; refuse when members are gone.
@@ -413,13 +437,14 @@ fn recorded_composition_check(
 /// nothing either way. A member the cut subject does not carry refuses the cut,
 /// the previous cut's ledger event is the only surviving record of the
 /// composition — every edit moves the bookmark, and the next cut reaps the
-/// superseded commit. The refused candidate was never published, so nothing is
-/// abandoned and nothing needs cleanup.
+/// superseded commit. A refused candidate was never published and a refused
+/// record leaves origin as it was, so nothing is abandoned and nothing needs
+/// cleanup.
 fn report_uncarried_cut(
     repo: &RepoName,
     recorded: Option<&RecordedCut>,
     check: &release::CompositionCheck,
-    allow_drop: bool,
+    on_drop: DropDisposition,
 ) -> Option<Exit> {
     let recorded = recorded?;
     for member in &check.inconclusive {
@@ -432,7 +457,7 @@ fn report_uncarried_cut(
     if check.dropped.is_empty() {
         return None;
     }
-    if allow_drop {
+    if matches!(on_drop, DropDisposition::Allowed) {
         println!(
             "{repo}: --allow-drop: cutting without {} member(s) the previous cut {} recorded: {}",
             check.dropped.len(),
@@ -450,8 +475,14 @@ fn report_uncarried_cut(
     for member in &check.dropped {
         println!("    {member}");
     }
+    let outcome = match on_drop {
+        DropDisposition::RefuseDiscardingCandidate => "the candidate was discarded",
+        DropDisposition::Allowed | DropDisposition::RefuseRecordingNothing => {
+            "nothing was recorded"
+        }
+    };
     println!(
-        "  the candidate was discarded; `knives release include <branch>` restores a member, \
+        "  {outcome}; `knives release include <branch>` restores a member, \
          or re-run with --allow-drop to state the drop is intended"
     );
     Some(Exit::Incomplete)
