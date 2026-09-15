@@ -375,6 +375,74 @@ fn routed_invocation_mints_token_and_explicit_token_is_preserved() {
 }
 
 #[test]
+fn auth_commands_pass_through_without_a_routed_token() {
+    // Given: a credential helper that routes the acme owner, and a cwd it routes.
+    let lab = lab::Lab::new();
+    let (dir, log) = fake_gh();
+    let helper_dir = fake_app_token();
+    let gitconfig = token_config(helper_dir.path(), "acme");
+    let path = helper_path(helper_dir.path());
+
+    // When: git's fallback credential helper asks gh for the user's own credential.
+    let output = knives_cmd(helper_dir.path())
+        .args(["gh", "--", "auth", "git-credential", "get"])
+        .current_dir(&lab.work)
+        .env("KNIVES_REAL_GH", dir.path().join("gh"))
+        .env("FAKE_GH_LOG", &log)
+        .env("PATH", &path)
+        .env("GIT_CONFIG_GLOBAL", &gitconfig)
+        .output()
+        .expect("run knives gh auth git-credential");
+
+    // Then: gh runs with no App token, so an owner the App is not installed on gets no
+    // credential instead of the cwd repo's.
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let recorded = fs::read_to_string(&log).expect("fake gh ran");
+    assert!(recorded.contains("GH_TOKEN=unset"), "{recorded}");
+    assert!(
+        recorded.starts_with("auth\ngit-credential\nget\n"),
+        "{recorded}"
+    );
+
+    // When: an auth invocation whose values spell a PR subcommand.
+    let output = knives_cmd(helper_dir.path())
+        .args([
+            "gh",
+            "--",
+            "auth",
+            "token",
+            "--hostname",
+            "pr",
+            "--user",
+            "view",
+        ])
+        .current_dir(&lab.work)
+        .env("KNIVES_REAL_GH", dir.path().join("gh"))
+        .env("FAKE_GH_LOG", &log)
+        .env("PATH", &path)
+        .env("GIT_CONFIG_GLOBAL", &gitconfig)
+        .output()
+        .expect("run knives gh auth token");
+
+    // Then: it reaches gh verbatim rather than the `gh pr view` bookmark path.
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let recorded = fs::read_to_string(&log).expect("fake gh ran again");
+    assert!(
+        recorded.starts_with("auth\ntoken\n--hostname\npr\n--user\nview\n"),
+        "{recorded}"
+    );
+    assert!(recorded.contains("GH_TOKEN=unset"), "{recorded}");
+}
+
+#[test]
 fn repo_flag_routes_token_even_when_cwd_remotes_differ() {
     // Given: an acme credential route and a jj repo with unrelated remotes.
     let lab = lab::Lab::new();

@@ -76,6 +76,17 @@ pub fn run(args: &[String]) -> anyhow::Result<std::convert::Infallible> {
         eprintln!("knives gh: cannot exec {}: {error}", shim.display());
         std::process::exit(126);
     }
+    let Ok(real_gh) = real_gh() else {
+        eprintln!("knives gh: real gh not found");
+        std::process::exit(127);
+    };
+    let mut gh = Command::new(real_gh);
+    if is_auth_command(args) {
+        // Verbatim, and before the PR scanner: `gh auth token --hostname pr --user view`
+        // would otherwise read as `gh pr view` and die on a bookmark it never needed.
+        gh.args(args);
+        std::process::exit(gh_exit_code(&mut gh));
+    }
     let cwd = std::env::current_dir()?;
     let token = if std::env::var_os("GH_TOKEN").is_some() {
         None
@@ -86,11 +97,6 @@ pub fn run(args: &[String]) -> anyhow::Result<std::convert::Infallible> {
             Some(Mint::Unrouted) | None => None,
         }
     };
-    let Ok(real_gh) = real_gh() else {
-        eprintln!("knives gh: real gh not found");
-        std::process::exit(127);
-    };
-    let mut gh = Command::new(real_gh);
     if let Some(token) = token {
         gh.env("GH_TOKEN", token);
     }
@@ -464,6 +470,15 @@ pub(crate) enum Mint {
     /// UTF-8, or it could not run — and has already said why on stderr: knives exits
     /// with this code instead of running gh.
     Refused(i32),
+}
+
+/// `gh auth …` is about the user's own login, never a routed App: `gh auth status` and
+/// `gh auth token` report who the user is. Minting here would make `gh auth status`
+/// report the cwd repo's App as a login. In an agent session the shim has already
+/// refused every `gh auth` verb but `status` before knives runs; this keeps the one
+/// that reaches knives honest.
+pub(crate) fn is_auth_command(args: &[String]) -> bool {
+    args.first().map(String::as_str) == Some("auth")
 }
 
 /// Asks git's routed credential helper for the token gh should run with.
