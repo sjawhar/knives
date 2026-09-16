@@ -172,7 +172,7 @@ pub(crate) fn run_release(
                 && candidate.matches(published.as_str())?
             {
                 let frozen_previous = matches!(scheme, ReleaseScheme::Dated)
-                    && release::repair_effect(&pins, previous_ref.branch())
+                    && release::repair_effect(&pins, previous_ref.branch(), Some(published))
                         == release::RepairEffect::NewDatedName;
                 if frozen_previous {
                     println!(
