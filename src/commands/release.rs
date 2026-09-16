@@ -20,7 +20,7 @@ use crate::detect::{
     BookmarkTips, Finding, FindingKind, RebaseOutcome, ReleaseParent, Subject, stale_parents,
 };
 use crate::ids::{
-    BookmarkRef, BranchName, CommitId, ReleaseScheme, is_our_release, is_release_name,
+    BookmarkRef, BranchName, CommitId, ReleaseScheme, RemoteName, is_our_release, is_release_name,
     strict_dated_release,
 };
 use crate::jj::{self, Repo};
@@ -70,17 +70,35 @@ pub enum RepairEffect {
 /// What moving or editing `release` would reach, judged by the pins of that
 /// release alone.
 ///
-/// A consumer frozen on an older release is not reached by an edit to this
-/// one either way, and must not block it: judged over every pin, a fork whose
-/// consumer sat frozen on one old cut refused to edit any release at all,
-/// including a brand-new unpinned cut. A pin names the branch, so the release's
-/// local and publish-remote views are the same release to it.
-pub fn repair_effect(pins: &[Pin], release: &BranchName) -> RepairEffect {
-    // Off-scheme pins consume the fork at a tag or branch of their own choosing;
-    // they neither receive an in-place repair nor demand a new dated name.
+/// A pin is of this release when it names the branch, or when it freezes the
+/// exact commit the publish remote holds for it (`published`). The second form
+/// is how a lockfile written from an installed commit pins: `?rev=<sha>`, never
+/// the release name. Judged by name alone, such a consumer read as no pin at
+/// all, so the fork's only release could be edited in place although the edit
+/// reached nobody, and a verbatim recut under a new dated name — the one thing
+/// that would reach it — was refused as identical.
+///
+/// A consumer frozen on an older release, or on some other commit, is not
+/// reached by an edit to this one either way, and must not block it: judged
+/// over every pin, a fork whose consumer sat frozen on one old cut refused to
+/// edit any release at all, including a brand-new unpinned cut. A pin names the
+/// branch, so the release's local and publish-remote views are the same release
+/// to it. Off-scheme pins at a tag or branch of the consumer's own choosing
+/// neither receive an in-place repair nor demand a new dated name. Only a
+/// frozen pin counts by commit: a follower's lock fragment records where it
+/// resolved last time, not where it is held.
+pub fn repair_effect(
+    pins: &[Pin],
+    release: &BranchName,
+    published: Option<&CommitId>,
+) -> RepairEffect {
     let mut of_release = pins
         .iter()
-        .filter(|pin| pin.on_scheme && pin.reference == release.as_str())
+        .filter(|pin| {
+            (pin.on_scheme && pin.reference == release.as_str())
+                || (pin.kind == PinKind::Frozen
+                    && published.is_some_and(|commit| freezes_commit(pin, commit)))
+        })
         .peekable();
     if of_release.peek().is_none() {
         return RepairEffect::Unpinned;
@@ -89,6 +107,25 @@ pub fn repair_effect(pins: &[Pin], release: &BranchName) -> RepairEffect {
         return RepairEffect::RepairInPlace;
     }
     RepairEffect::NewDatedName
+}
+
+/// Whether `pin` holds its consumer at exactly `commit`: the reference is the
+/// commit itself, or the lock fragment resolved whatever the reference names
+/// (`?rev=<tag>#<sha>`) to it. An abbreviation counts from seven hex digits,
+/// the shortest git itself prints; six is the lock scanner's floor for a
+/// fragment being hex at all, not for it being one commit.
+fn freezes_commit(pin: &Pin, commit: &CommitId) -> bool {
+    let abbreviates = |candidate: &str| {
+        candidate.len() >= 7
+            && candidate
+                .chars()
+                .all(|character| character.is_ascii_hexdigit())
+            && commit
+                .as_str()
+                .get(..candidate.len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(candidate))
+    };
+    abbreviates(&pin.reference) || pin.locked.as_deref().is_some_and(abbreviates)
 }
 
 pub fn cut_name(scheme: &ReleaseScheme, requested: Option<&str>) -> Result<String, String> {
@@ -151,6 +188,11 @@ pub struct Plan {
     pub repo: String,
     pub base_findings: Vec<Finding>,
     pub release: Option<String>,
+    /// The commit the publish remote holds for `release`, when it has one. A
+    /// consumer frozen on exactly this commit pins the release without naming
+    /// it; [`repair_effect`] needs it to say so. `None` for a cut that has not
+    /// been pushed yet, which nothing can have pinned by commit.
+    pub published: Option<CommitId>,
     pub parents: Vec<(CommitId, Vec<String>)>,
     pub stale: Vec<Finding>,
     pub pins: Vec<Pin>,
@@ -553,6 +595,12 @@ pub fn plan(
         return Ok(plan);
     };
     plan.release = Some(reference.to_string());
+    plan.published = tips
+        .get(&BookmarkRef::Remote {
+            branch: reference.branch().clone(),
+            remote: RemoteName::new(publish_remote),
+        })
+        .cloned();
 
     let parents = repo.parents_of(commit.as_str())?;
     let trunk_tip = repo.resolve_commit(&entry.upstream_trunk()).ok();
@@ -1057,7 +1105,11 @@ pub fn render(plan: &Plan) -> String {
     // A consumer that could not be consulted may hold the pin the verdict would
     // deny; the census refuses the same no-pin claim after a failed scan.
     lines.push(if plan.problems.is_empty() {
-        match repair_effect(&plan.pins, BookmarkRef::parse(release).branch()) {
+        match repair_effect(
+            &plan.pins,
+            BookmarkRef::parse(release).branch(),
+            plan.published.as_ref(),
+        ) {
             RepairEffect::RepairInPlace => {
                 "  at least one consumer follows the branch: repair in place, no new dated name"
                     .to_owned()
@@ -1067,7 +1119,14 @@ pub fn render(plan: &Plan) -> String {
              needs a new dated suffix"
                     .to_owned()
             }
-            RepairEffect::Unpinned => "  nothing pins this release: either is safe".to_owned(),
+            // The list above may name pins of something else — an older cut, a
+            // tag of the consumer's own — so the verdict says which claim it makes.
+            RepairEffect::Unpinned if plan.pins.is_empty() => {
+                "  nothing pins this release: either is safe".to_owned()
+            }
+            RepairEffect::Unpinned => {
+                "  none of these pins is of this release: either is safe".to_owned()
+            }
         }
     } else {
         "  pinned-ness unknown: a consumer could not be consulted (see above)".to_owned()
@@ -1267,7 +1326,7 @@ mod tests {
         // A needless dated name burns the name and forces a re-pin nobody wanted.
         let pins = vec![pin(PinKind::Frozen), pin(PinKind::Follows)];
         assert_eq!(
-            repair_effect(&pins, &BranchName::new("release/2026-07-28")),
+            repair_effect(&pins, &BranchName::new("release/2026-07-28"), None),
             RepairEffect::RepairInPlace
         );
     }
@@ -1277,7 +1336,8 @@ mod tests {
         assert_eq!(
             repair_effect(
                 &[pin(PinKind::Frozen)],
-                &BranchName::new("release/2026-07-28")
+                &BranchName::new("release/2026-07-28"),
+                None
             ),
             RepairEffect::NewDatedName
         );
@@ -1286,7 +1346,7 @@ mod tests {
     #[test]
     fn nothing_pinning_it_leaves_the_choice_open() {
         assert_eq!(
-            repair_effect(&[], &BranchName::new("release/2026-07-28")),
+            repair_effect(&[], &BranchName::new("release/2026-07-28"), None),
             RepairEffect::Unpinned
         );
     }
@@ -1298,13 +1358,14 @@ mod tests {
         // pin, a fork with one such consumer could edit no release at all.
         let pins = [pin(PinKind::Frozen)];
         assert_eq!(
-            repair_effect(&pins, &BranchName::new("release/2026-08-31")),
+            repair_effect(&pins, &BranchName::new("release/2026-08-31"), None),
             RepairEffect::Unpinned
         );
         assert_eq!(
             repair_effect(
                 &pins,
-                BookmarkRef::parse("release/2026-07-28@release").branch()
+                BookmarkRef::parse("release/2026-07-28@release").branch(),
+                None
             ),
             RepairEffect::NewDatedName,
             "the publish remote's view of the same release is the same release"
@@ -1314,13 +1375,119 @@ mod tests {
     #[test]
     fn an_off_scheme_pin_alone_leaves_the_repair_choice_open() {
         // A consumer pinned at its own tag is not consuming releases: repairing in
-        // place cannot reach it and a new dated name would not either.
+        // place cannot reach it and a new dated name would not either — also when
+        // the release has a published commit to compare against.
         let mut off_scheme = pin(PinKind::Frozen);
         off_scheme.on_scheme = false;
         off_scheme.reference = "acme-pin-0.4.47.dev7".to_owned();
+        let published = CommitId::new(PUBLISHED);
         assert_eq!(
-            repair_effect(&[off_scheme], &BranchName::new("acme-pin-0.4.47.dev7")),
+            repair_effect(
+                &[off_scheme],
+                &BranchName::new("acme-pin-0.4.47.dev7"),
+                Some(&published)
+            ),
             RepairEffect::Unpinned
+        );
+    }
+
+    #[test]
+    fn a_following_pin_last_resolved_at_the_published_commit_is_not_frozen_there() {
+        // `?branch=integration#<sha>`: the lock says where the follower resolved
+        // last time, not where it is held. Counting it as a pin of this release
+        // would let one such consumer, next to a genuinely frozen one, turn the
+        // verdict back into "repair in place" — the edit allowed, reaching nobody.
+        let published = CommitId::new(PUBLISHED);
+        let release = BranchName::new("release/2026-09-11");
+        let mut follower = sha_pin("integration");
+        follower.kind = PinKind::Follows;
+        follower.locked = Some(PUBLISHED.to_owned());
+        assert_eq!(
+            repair_effect(&[follower.clone()], &release, Some(&published)),
+            RepairEffect::Unpinned
+        );
+        assert_eq!(
+            repair_effect(&[sha_pin(PUBLISHED), follower], &release, Some(&published)),
+            RepairEffect::NewDatedName
+        );
+    }
+
+    const PUBLISHED: &str = "c2638ddd8d5dd9127cb8b9ba2c2e349a3b79782b";
+
+    /// A consumer that pins the fork by raw commit, the way a lockfile written
+    /// from an installed commit does: `?rev=<sha>`.
+    fn sha_pin(reference: &str) -> Pin {
+        Pin {
+            file: "uv.lock".to_owned(),
+            line: 2008,
+            reference: reference.to_owned(),
+            kind: PinKind::Frozen,
+            locked: None,
+            on_scheme: false,
+            source: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_consumer_frozen_on_the_published_commit_pins_the_release() {
+        // The consumer never names the release: its lockfile carries the exact
+        // commit the publish remote holds for it. That is a frozen pin of this
+        // release, so editing it in place reaches nobody and the next cut needs
+        // a new dated name. Judged by name alone, the same fork read as unpinned
+        // and both gates were wrong at once.
+        let published = CommitId::new(PUBLISHED);
+        let release = BranchName::new("release/2026-09-11");
+        assert_eq!(
+            repair_effect(&[sha_pin(PUBLISHED)], &release, Some(&published)),
+            RepairEffect::NewDatedName
+        );
+        assert_eq!(
+            repair_effect(&[sha_pin("c2638ddd")], &release, Some(&published)),
+            RepairEffect::NewDatedName,
+            "an abbreviated commit is the same pin"
+        );
+    }
+
+    #[test]
+    fn a_consumer_frozen_on_another_commit_does_not_freeze_this_release() {
+        // Frozen on some other commit — an older cut, a tag of its own — the
+        // consumer is reached neither by an edit nor by a new name.
+        let published = CommitId::new(PUBLISHED);
+        let release = BranchName::new("release/2026-09-11");
+        assert_eq!(
+            repair_effect(
+                &[sha_pin("55a837ea6c1f0d2b3a4c5d6e7f8091a2b3c4d5e6")],
+                &release,
+                Some(&published)
+            ),
+            RepairEffect::Unpinned
+        );
+        assert_eq!(
+            repair_effect(&[sha_pin("c2638d")], &release, Some(&published)),
+            RepairEffect::Unpinned,
+            "fewer than seven hex digits is not a commit pin"
+        );
+        assert_eq!(
+            repair_effect(&[sha_pin(PUBLISHED)], &release, None),
+            RepairEffect::Unpinned,
+            "with no published commit to compare against, a raw commit pins nothing knowable"
+        );
+    }
+
+    #[test]
+    fn a_lock_fragment_at_the_published_commit_counts_whatever_the_reference_names() {
+        // A lockfile can carry `?rev=<tag>#<sha>`: the reference is a tag of the
+        // consumer's own, but the lock resolved it to this release's commit.
+        let published = CommitId::new(PUBLISHED);
+        let mut tagged = sha_pin("acme-pin-0.4.47.dev7");
+        tagged.locked = Some("c2638ddd8d5d".to_owned());
+        assert_eq!(
+            repair_effect(
+                &[tagged],
+                &BranchName::new("release/2026-09-11"),
+                Some(&published)
+            ),
+            RepairEffect::NewDatedName
         );
     }
 

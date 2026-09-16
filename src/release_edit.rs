@@ -259,6 +259,7 @@ fn edit_release(
     if release::repair_effect(
         &plan.pins,
         knives::ids::BookmarkRef::parse(&release_name).branch(),
+        plan.published.as_ref(),
     ) == release::RepairEffect::NewDatedName
     {
         match entry.release_scheme() {
