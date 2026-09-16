@@ -5,7 +5,7 @@ description: Check knives before working in a repository we maintain a fork of. 
 
 # About to work in a fork
 
-> **Upstream PRs are Sami's decision, per change, after evidence** — opening one, editing one that is open, or pushing to its head branch. The default for every fix is a fork member (single signed commit on the release's shared base → pushed to the fork remote → `knives notch` → tip + red→green evidence to the inspect release owner for include-time review → next cut → agent-c pin bump). Write down why upstream is needed before asking.
+> **Upstream PRs are a placement judgment, not a permission.** Before opening one, load `maintaining-inspect` (with this skill and `using-knives` for the fork mechanics) and write down whether the change needs to go upstream at all: a defect any user of the library would hit, fixed with evidence (a reproduction or red→green test), is upstream material; a fork-specific workaround, a knob only we use, or an unproven fix is not. That answer is recorded in the `placement:` notch and the PR body — nobody is asked and no approval is awaited (Sami, 2026-09-16: "I didn't ask to be in the loop for every upstream interaction"). The default for every fix is a fork member (single signed commit on the release's shared base → pushed to the fork remote → `knives notch` → tip + red→green evidence to the inspect release owner for include-time review → next cut → agent-c pin bump). Once an upstream PR is open, its lifecycle — review rounds, body edits, rebases, the close — is the owning session's own work, never parked on a human.
 
 ## Stop and find out where you are
 
@@ -82,7 +82,7 @@ them, and a note that says it is open is open.
 ## Challenge upstream placement before implementation
 
 Before implementing an upstream change or creating its branch, someone other than the proposer challenges ownership: a reviewer, orchestrator, or solo fresh-context subagent arguing for other layers. With none available, write competing layer hypotheses and what disproves each.
-Read-only investigation is exempt. A green gate, plausible patch or peer's "go" establishes no ownership. The placement challenge is not a question for the human; whether to open, edit, or push to the upstream PR is (the callout at the top of this skill), and a `placement:` notch that concludes "upstream" is the written case that question is asked with, not the go itself.
+Read-only investigation is exempt. A green gate, plausible patch or peer's "go" establishes no ownership. This is not a question for the human: a `placement:` notch that concludes "upstream" is the written judgment the callout at the top of this skill asks for, and the PR is opened on that judgment, not on anyone's go.
 
 Record a `placement:` notch with `--evidence`, naming proposer and challenger, on the branch (repository subject before branching or for a standing rule):
 
