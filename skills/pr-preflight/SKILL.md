@@ -1,17 +1,19 @@
 ---
 name: pr-preflight
-description: Pre-PR contribution judgment gate for upstream repositories. Use when opening a PR, contributing upstream, doing a pre-PR check, preparing to run gh pr create, or contributing to a fork.
+description: Pre-PR contribution judgment gate for upstream repositories. Use when opening a PR, editing or pushing to an open upstream PR, contributing upstream, doing a pre-PR check, preparing to run gh pr create, or contributing to a fork.
 ---
 
 # Upstream PR Preflight Gate
+
+> **Upstream PRs are Sami's decision, per change, after evidence** — opening one, editing one that is open, or pushing to its head branch. The default for every fix is a fork member (single signed commit on the release's shared base → pushed to the fork remote → `knives notch` → tip + red→green evidence to the inspect release owner for include-time review → next cut → agent-c pin bump). Write down why upstream is needed before asking.
 
 ## Overview
 
 Opening a pull request against an upstream repository requires adhering to that project's specific contribution guidelines. The `knives` CLI provides programmatic facts through `knives preflight`. The agent provides the human judgment to evaluate compliance before executing `gh pr create`.
 
-Never open an upstream PR without walking this gate.
+Never open, edit, or push to an upstream PR without walking this gate, and never without Sami's explicit go on that specific change, given after evidence it works. The gate is what makes a PR opened in his name defensible; it does not stand in for the go.
 
-Complete `fork-work`'s challenge before implementation; Check 7 verifies the `placement:` notch before publication.
+Load `maintaining-inspect` first — it owns this rule; this skill, `fork-work` and `using-knives` are the fork mechanics. Complete `fork-work`'s challenge before implementation; Check 7 verifies the `placement:` notch before publication.
 
 ## Step 1: Obtain Programmatic Facts
 
@@ -44,7 +46,7 @@ Walk each check sequentially. Each check specifies what facts to verify, what ev
 - **Verification**: Verify our open PR count against the target repo is below the repo policy cap, and that the branch is claimed by your current workspace.
 - **Evidence**: Current open PR count is strictly less than the repository limit, and claim status matches your active workspace.
 - **If Failed**:
-  - *Cap Reached*: Do not open a new PR. Review open PRs against the target repo. Combine related fixes into an existing open PR, or wait until open PRs are merged or closed.
+  - *Cap Reached*: Do not open a new PR. Review open PRs against the target repo. Folding the fix into an existing open PR is a push to an upstream PR and needs Sami's go on that fold like any other change; without it, the fix stays a fork member (the callout at the top of this skill) or waits until open PRs are merged or closed.
   - *Unclaimed or Claimed Elsewhere*: Claim the branch in your active workspace before making commits or submitting work.
 
 ### Check 3: Policy File Review
@@ -96,7 +98,7 @@ unanswered is a different question, derived from the forge, and not this.
 
 ## Step 4: Execution
 
-When all seven checks pass with verified evidence, proceed with opening the pull request:
+When all seven checks pass with verified evidence and Sami's go on this change is in hand, proceed with opening the pull request — and treat every later push or edit to it as a new change under the same rule:
 
 ```bash
 gh pr create --title "..." --body "..."

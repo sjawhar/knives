@@ -5,6 +5,8 @@ description: Check knives before working in a repository we maintain a fork of. 
 
 # About to work in a fork
 
+> **Upstream PRs are Sami's decision, per change, after evidence** — opening one, editing one that is open, or pushing to its head branch. The default for every fix is a fork member (single signed commit on the release's shared base → pushed to the fork remote → `knives notch` → tip + red→green evidence to the inspect release owner for include-time review → next cut → agent-c pin bump). Write down why upstream is needed before asking.
+
 ## Stop and find out where you are
 
 Reading counts, not just writing. Investigating how one of these projects works is the
@@ -80,7 +82,7 @@ them, and a note that says it is open is open.
 ## Challenge upstream placement before implementation
 
 Before implementing an upstream change or creating its branch, someone other than the proposer challenges ownership: a reviewer, orchestrator, or solo fresh-context subagent arguing for other layers. With none available, write competing layer hypotheses and what disproves each.
-Read-only investigation is exempt. A green gate, plausible patch or peer's "go" establishes no ownership. This is not a question for the human.
+Read-only investigation is exempt. A green gate, plausible patch or peer's "go" establishes no ownership. The placement challenge is not a question for the human; whether to open, edit, or push to the upstream PR is (the callout at the top of this skill), and a `placement:` notch that concludes "upstream" is the written case that question is asked with, not the go itself.
 
 Record a `placement:` notch with `--evidence`, naming proposer and challenger, on the branch (repository subject before branching or for a standing rule):
 
@@ -161,4 +163,4 @@ has a knives command that does the same job safely:
 This is the on-ramp. For the rest of the CLI — what the three remotes mean, stating a
 pull request that inference cannot find, recording that one branch cannot land before
 another, planning and cutting releases, JSON output — read the `using-knives` skill. The
-per-pull-request and sweep workflows are `maintaining-fork-pr` and `maintaining-fork-release`.
+per-pull-request and sweep workflows are `maintaining-fork-pr` and `maintaining-fork-release`. The rule at the top of this skill is `maintaining-inspect`'s; load it before any upstream work.
