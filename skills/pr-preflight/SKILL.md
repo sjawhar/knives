@@ -7,6 +7,8 @@ description: Pre-PR contribution judgment gate for upstream repositories. Use wh
 
 > **Upstream PRs are a placement judgment, not a permission.** Before opening one, load `maintaining-inspect` (with `fork-work` and `using-knives` for the fork mechanics) and write down whether the change needs to go upstream at all: a defect any user of the library would hit, fixed with evidence (a reproduction or red→green test), is upstream material; a fork-specific workaround, a knob only we use, or an unproven fix is not. That answer is recorded in the `placement:` notch and the PR body — nobody is asked and no approval is awaited (Sami, 2026-09-16: "I didn't ask to be in the loop for every upstream interaction"). The default for every fix is a fork member (single signed commit on the release's shared base → pushed to the fork remote → `knives notch` → tip + red→green evidence to the inspect release owner for include-time review → next cut → agent-c pin bump). Once an upstream PR is open, its lifecycle — review rounds, body edits, rebases, the close — is the owning session's own work, never parked on a human.
 
+> **Where a change lives comes before whether it goes upstream.** A managed fork is a product the consumer repository uses; the consumer is where its own deployment's operating policy lives — lifetimes and reaping of jobs, caps, quotas, schedules, alerting, node sizing, who-may-do-what defaults — and is the default home for anything policy-shaped. A fork member is for a defect in the library's own machinery or a capability nothing outside the library can provide, which is also what makes it upstream-bound. `fork-work` carries the test (*if the fork were replaced by upstream main tomorrow, would anyone but us miss this?* No means the consumer) and the valve (when the fork genuinely looks like the right home for something policy-shaped, that is a question to the owner with options, and the owner's answer decides — a default with a valve, not a prohibition). A change that belongs in the consumer has no branch in the fork and no upstream PR. Two questions, side by side: this one is *fork or consumer*; the callout above is *upstream or fork-only*. `maintaining-inspect` owns both.
+
 ## Overview
 
 Opening a pull request against an upstream repository requires adhering to that project's specific contribution guidelines. The `knives` CLI provides programmatic facts through `knives preflight`. The agent provides the human judgment to evaluate compliance before executing `gh pr create`.
@@ -75,7 +77,7 @@ Walk each check sequentially. Each check specifies what facts to verify, what ev
 
 ### Check 7: `placement:` notch
 - **Verification**: Challenger differs from proposer; evidence covers the published diff.
-- **Evidence**: The `placement:` notch, read with `knives notch <branch>` (repository subject for standing rules).
+- **Evidence**: The `placement:` notch, read with `knives notch <branch>` (repository subject for standing rules). For a member that changes runtime behavior, the notch and the commit body also carry the ownership answer and the ruling it implements (`fork-work`).
 - **If Failed**:
   - *Missing*: No PR; return to `fork-work`'s challenge.
   - *Stale*: Re-run the challenge.
