@@ -18,7 +18,7 @@
 mod lab;
 
 use knives::jj::Repo;
-use lab::{Lab, operation_ids, release_test_home};
+use lab::{Lab, operation_ids, release_test_home, state_placement};
 use serde_json::Value;
 use std::process::Command;
 #[test]
@@ -27,6 +27,8 @@ fn start_resumes_the_same_harness_sessions_claim_without_mutating_it() {
     // existing claim rather than overwrite its timestamp or reason.
     let lab = lab::Lab::new();
     let (home, _consumer) = release_test_home(&lab);
+    // The verdict a new branch needs, recorded as `start --placement` would.
+    state_placement(&lab, &home, "feat/gamma", "FORK");
     let run = |args: &[&str]| {
         Command::new(env!("CARGO_BIN_EXE_knives"))
             .args(args)
@@ -97,6 +99,8 @@ fn start_refuses_two_anonymous_owners_with_the_same_name() {
     // anonymous terminal must receive the claim context and an explicit override.
     let lab = lab::Lab::new();
     let (home, _consumer) = release_test_home(&lab);
+    // The verdict a new branch needs, recorded as `start --placement` would.
+    state_placement(&lab, &home, "feat/gamma", "FORK");
     let outside = tempfile::tempdir().expect("create unmanaged terminal");
     let run = |args: &[&str]| {
         Command::new(env!("CARGO_BIN_EXE_knives"))
@@ -152,6 +156,8 @@ fn start_refuses_another_harness_session_and_names_the_holder() {
     // silently; the refusal names enough context to make the override auditable.
     let lab = lab::Lab::new();
     let (home, _consumer) = release_test_home(&lab);
+    // The verdict a new branch needs, recorded as `start --placement` would.
+    state_placement(&lab, &home, "feat/gamma", "FORK");
     let run = |owner: &str, args: &[&str]| {
         Command::new(env!("CARGO_BIN_EXE_knives"))
             .args(args)
@@ -207,6 +213,8 @@ fn start_from_inside_the_claimed_workspace_resumes_by_possession() {
     // its own ledger trail instead of mutating the held claim.
     let lab = lab::Lab::new();
     let (home, _consumer) = release_test_home(&lab);
+    // The verdict a new branch needs, recorded as `start --placement` would.
+    state_placement(&lab, &home, "feat/gamma", "FORK");
     let first = Command::new(env!("CARGO_BIN_EXE_knives"))
         .args([
             "--text",
@@ -288,6 +296,8 @@ fn start_force_seizes_and_records_the_previous_owner() {
     // identity and the new reason in the durable event stream.
     let lab = lab::Lab::new();
     let (home, _consumer) = release_test_home(&lab);
+    // The verdict a new branch needs, recorded as `start --placement` would.
+    state_placement(&lab, &home, "feat/gamma", "FORK");
     let run = |owner: &str, args: &[&str]| {
         Command::new(env!("CARGO_BIN_EXE_knives"))
             .args(args)
@@ -429,6 +439,8 @@ fn start_adopts_a_no_cleanup_forgotten_workspace_without_resetting_it() {
     // registration. Starting it again must reattach that exact working copy.
     let lab = lab::Lab::new();
     let (home, _consumer) = release_test_home(&lab);
+    // The verdict a new branch needs, recorded as `start --placement` would.
+    state_placement(&lab, &home, "feat/gamma", "FORK");
     let run_start = |why: &str| {
         Command::new(env!("CARGO_BIN_EXE_knives"))
             .args([
@@ -598,6 +610,8 @@ fn start_resume_reports_a_missing_workspace_without_rebuilding_it() {
     // Given: the claim survives after its workspace directory is removed.
     let lab = lab::Lab::new();
     let (home, _consumer) = release_test_home(&lab);
+    // The verdict a new branch needs, recorded as `start --placement` would.
+    state_placement(&lab, &home, "feat/gamma", "FORK");
     let run = |args: &[&str]| {
         Command::new(env!("CARGO_BIN_EXE_knives"))
             .args(args)
@@ -638,6 +652,8 @@ fn force_claim_does_not_save_state_when_its_provenance_cannot_be_appended() {
     // Given: a held claim and a ledger path deliberately made unwritable as a directory.
     let lab = lab::Lab::new();
     let (home, _consumer) = release_test_home(&lab);
+    // The verdict a new branch needs, recorded as `start --placement` would.
+    state_placement(&lab, &home, "feat/gamma", "FORK");
     let run = |owner: &str, args: &[&str]| {
         Command::new(env!("CARGO_BIN_EXE_knives"))
             .args(args)
@@ -698,6 +714,8 @@ fn force_claim_does_not_save_state_when_its_provenance_cannot_be_appended() {
 fn force_finish_does_not_save_state_when_its_provenance_cannot_be_appended() {
     let lab = lab::Lab::new();
     let (home, _consumer) = release_test_home(&lab);
+    // The verdict a new branch needs, recorded as `start --placement` would.
+    state_placement(&lab, &home, "feat/gamma", "FORK");
     let start = Command::new(env!("CARGO_BIN_EXE_knives"))
         .args([
             "--text",
@@ -757,6 +775,8 @@ fn forced_finish_with_supersession_writes_one_atomic_provenance_event() {
     // Given: another owner holds the claim that this terminal must force-release.
     let lab = lab::Lab::new();
     let (home, _consumer) = release_test_home(&lab);
+    // The verdict a new branch needs, recorded as `start --placement` would.
+    state_placement(&lab, &home, "feat/gamma", "FORK");
     let start = Command::new(env!("CARGO_BIN_EXE_knives"))
         .args([
             "--text",
@@ -804,8 +824,9 @@ fn forced_finish_with_supersession_writes_one_atomic_provenance_event() {
     let entries = knives::ledger::Ledger::at(home.path().join("ledger").join("demo"))
         .entries()
         .expect("read ledger");
-    assert_eq!(entries.len(), 2, "was: {entries:?}");
-    let event = &entries[1].text;
+    // The placement note, the claim, and the one release event.
+    assert_eq!(entries.len(), 3, "was: {entries:?}");
+    let event = &entries[2].text;
     assert!(
         event.contains("released agent-one's claim by force"),
         "event: {event}"

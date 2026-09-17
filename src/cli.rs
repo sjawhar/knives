@@ -272,6 +272,14 @@ pub enum Command {
     /// Claiming a branch and opening a workspace for it were two commands for no
     /// reason: starting work on a branch is one act. `finish` is its inverse.
     ///
+    /// A branch that does not exist yet — not locally, not on any of our remotes —
+    /// is a new fork member, and a fork member states the non-fork alternative it
+    /// rejected before it exists: `--placement <file>` names the placement
+    /// red-team's verdict (first line `verdict: CONSUMER | FORK | UPSTREAM`), which
+    /// is recorded on the branch in the ledger and read back by `release include`,
+    /// `release advance` and `knives gh`. A `CONSUMER` verdict starts no branch.
+    /// An existing branch needs none.
+    ///
     /// Also states the fork's `immutable_heads()` — jj's trunk, tags, and the trunk
     /// by name on every knives remote — in the repository's jj config when that
     /// config states none, and says so on stdout. jj's default pins every commit beneath an untracked
@@ -288,6 +296,11 @@ pub enum Command {
         /// Replace an existing claim. Requires a new reason for the ledger.
         #[arg(long, requires = "why")]
         force: bool,
+        /// The placement red-team's verdict file for a new branch: first line
+        /// `verdict: CONSUMER | FORK | UPSTREAM`, then the alternative it rejected.
+        /// Recorded on the branch as a `placement:` ledger note.
+        #[arg(long, value_name = "FILE")]
+        placement: Option<std::path::PathBuf>,
     },
     /// Hand a branch back and remove its workspace. The inverse of `start`.
     ///

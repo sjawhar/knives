@@ -149,6 +149,7 @@ fn dispatch() -> anyhow::Result<Exit> {
             repo,
             why,
             force,
+            placement,
         } => {
             let ground = grounded(&loaded)?;
             let (Some(fork), Some(branch)) =
@@ -156,7 +157,26 @@ fn dispatch() -> anyhow::Result<Exit> {
             else {
                 return Ok(Exit::Usage);
             };
-            start::run(&fork, &branch, why.as_deref(), force, ground.bound())
+            let placement = placement
+                .as_deref()
+                .map(|path| {
+                    let text = std::fs::read_to_string(path).map_err(|error| {
+                        anyhow::anyhow!("--placement {}: {error}", path.display())
+                    })?;
+                    knives::placement::Placement::parse(&text)
+                        .map_err(|error| anyhow::anyhow!("--placement {}: {error}", path.display()))
+                })
+                .transpose()?;
+            start::run(
+                &fork,
+                &branch,
+                &start::Options {
+                    why: why.as_deref(),
+                    force,
+                    placement: placement.as_ref(),
+                },
+                ground.bound(),
+            )
         }
         Command::Finish {
             branch,

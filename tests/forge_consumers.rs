@@ -13,7 +13,10 @@ use knives::config::RepoEntry;
 use knives::consumer_pins::{ConsumerHeadMemo, scan_consumer_for};
 use knives::forge::ConsumerHead;
 use knives::jj::Repo;
-use lab::{Lab, commit_at, knives_release, operation_ids, release_parents, release_test_home};
+use lab::{
+    Lab, commit_at, knives_release, operation_ids, release_parents, release_test_home,
+    state_placement,
+};
 use std::collections::BTreeMap;
 use std::process::Command;
 
@@ -410,6 +413,7 @@ fn no_recorded_consumers_is_an_answer_not_a_refusal() {
     // When: the plan is asked, then an edit is applied.
     let plan = knives_release(&lab, &home, &[]);
     let planned = String::from_utf8_lossy(&plan.stdout);
+    state_placement(&lab, &home, "feat/gamma", "FORK");
     let include = knives_release(&lab, &home, &["include", "feat/gamma"]);
 
     // Then: nothing recorded pins the release, which is an answer: the plan says

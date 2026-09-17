@@ -655,12 +655,57 @@ pub fn release_command(
     command
 }
 
-/// `knives start <branch> --repo demo --why test` from the work checkout, for
-/// callers that add an environment variable before running it.
+/// A placement verdict file in the config home: `verdict: <verdict>` plus the
+/// fields the red-team brief produces.
+pub fn placement_file(home: &tempfile::TempDir, verdict: &str) -> std::path::PathBuf {
+    let path = home
+        .path()
+        .join(format!("placement-{}.md", verdict.to_ascii_lowercase()));
+    std::fs::write(
+        &path,
+        format!(
+            "verdict: {verdict}\nalternative: a consumer-side setting; the library exposes none \
+             for this\nclass: gap-others-need\njudge: lab-red-team\n"
+        ),
+    )
+    .expect("write placement verdict");
+    path
+}
+
+/// Record a placement verdict for `subject` in the `demo` ledger directly, the
+/// note `knives start --placement` writes, for a branch a test made without
+/// `start` (through `lab.branch`) that a release verb is about to admit.
+pub fn state_placement(lab: &Lab, home: &tempfile::TempDir, subject: &str, verdict: &str) {
+    let placement = knives::placement::Placement::parse(&format!("verdict: {verdict}\n"))
+        .expect("parse placement verdict");
+    knives::ledger::Scribe::new(
+        knives::ledger::Ledger::at(home.path().join("ledger").join("demo")),
+        knives::ids::RepoName::new("demo"),
+        lab.work.clone(),
+        "lab".to_owned(),
+    )
+    .record(&knives::ledger::Draft {
+        subject: Some(subject),
+        kind: knives::ledger::Kind::Note,
+        disposition: None,
+        text: placement.note_text(),
+        evidence: Vec::new(),
+        pr: None,
+        parents: Vec::new(),
+    })
+    .expect("record placement verdict");
+}
+
+/// `knives start <branch> --repo demo --why test --placement <FORK verdict>` from
+/// the work checkout, for callers that add an environment variable before
+/// running it. The verdict is what a new branch needs; an existing one ignores it.
 pub fn start_command(lab: &Lab, home: &tempfile::TempDir, branch: &str) -> Command {
+    let placement = placement_file(home, "FORK");
     let mut command = Command::new(env!("CARGO_BIN_EXE_knives"));
     command
         .args(["--text", "start", branch, "--repo", "demo", "--why", "test"])
+        .arg("--placement")
+        .arg(placement)
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
         .env("HOME", lab.temp_path())
@@ -668,7 +713,7 @@ pub fn start_command(lab: &Lab, home: &tempfile::TempDir, branch: &str) -> Comma
     command
 }
 
-/// Run `knives start <branch> --repo demo --why test` from the work checkout.
+/// Run [`start_command`] to completion.
 pub fn knives_start(lab: &Lab, home: &tempfile::TempDir, branch: &str) -> std::process::Output {
     start_command(lab, home, branch)
         .output()

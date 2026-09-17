@@ -23,7 +23,7 @@ use knives::ids::ReleaseScheme;
 use knives::jj::Repo;
 use lab::{
     Lab, ReleaseOutput, commit_at, knives_release, newest_operation_description, operation_ids,
-    release_command, release_parents, release_test_home, release_test_home_pinned,
+    release_command, release_parents, release_test_home, release_test_home_pinned, state_placement,
 };
 
 #[test]
@@ -409,6 +409,7 @@ fn a_fixed_cut_with_a_published_unrecorded_composition_records_instead_of_refusi
 
     // When: a composition edit is pushed before a cut records it.
     lab.branch("feat/beta", "beta.txt", "beta\n");
+    state_placement(&lab, &home, "feat/beta", "FORK");
     let included = knives_release(&lab, &home, &["include", "feat/beta"]);
     assert!(included.status.success(), "{included:?}");
     let published = commit_at(&lab, "integration");
@@ -776,6 +777,7 @@ fn an_identical_cut_is_allowed_when_every_pin_of_the_previous_cut_is_frozen() {
     // to obtain an editable composition, and must not be refused as identical.
     let (lab, home) = published_release_pinned("rev = \"release/2026-08-04\"");
     lab.branch("feat/gamma", "gamma.txt", "gamma\n");
+    state_placement(&lab, &home, "feat/gamma", "FORK");
     let refused = knives_release(&lab, &home, &["include", "feat/gamma"]);
     assert_eq!(refused.status.code(), Some(3), "{refused:?}");
     let published = commit_at(&lab, "release/2026-08-04@origin");
@@ -865,6 +867,7 @@ fn a_dated_cut_refuses_a_name_that_does_not_sort_after_the_newest_release() {
     // locally, so the composition in hand differs from anything published.
     let (lab, home) = published_release_pinned("branch = \"release/2026-08-04\"");
     lab.branch("feat/gamma", "gamma.txt", "gamma\n");
+    state_placement(&lab, &home, "feat/gamma", "FORK");
     let included = knives_release(&lab, &home, &["include", "feat/gamma"]);
     assert!(included.status.success(), "{included:?}");
     let edited = commit_at(&lab, "release/2026-08-04");
@@ -921,6 +924,7 @@ fn a_cut_whose_composition_changed_since_publishing_is_named() {
     ]);
     lab.fetch_work();
     lab.branch("feat/gamma", "gamma.txt", "gamma\n");
+    state_placement(&lab, &home, "feat/gamma", "FORK");
     let include = knives_release(&lab, &home, &["include", "feat/gamma", "--why", "test"]);
     assert!(include.status.success(), "{include:?}");
 
@@ -1325,6 +1329,7 @@ fn a_fixed_scheme_cut_carries_the_local_release_in_hand() {
     lab.push_branch("integration");
     lab.fetch_work();
     lab.branch("feat/beta", "beta.txt", "beta\n");
+    state_placement(&lab, &home, "feat/beta", "FORK");
     let included = knives_release(&lab, &home, &["include", "feat/beta"]);
     assert!(
         String::from_utf8_lossy(&included.stdout).contains("included feat/beta"),

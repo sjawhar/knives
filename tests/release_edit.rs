@@ -22,7 +22,7 @@ use knives::jj::Repo;
 use lab::{
     Lab, commit_at, extend_branch, file_at_revision, home_after_first_cut, knives_release,
     newest_operation_description, operation_ids, release_parents, release_test_home,
-    release_test_home_pinned,
+    release_test_home_pinned, state_placement,
 };
 
 #[test]
@@ -142,6 +142,7 @@ fn include_adds_one_parent_and_changes_nothing_else() {
     let before = release_parents(&lab, "release/2026-08-04");
 
     // When: the branch is included.
+    state_placement(&lab, &home, "feat/gamma", "FORK");
     let output = knives_release(&lab, &home, &["include", "feat/gamma"]);
     assert!(
         output.status.success(),
@@ -188,6 +189,7 @@ fn a_release_edit_is_one_operation_described_for_the_op_log() {
     let operations_before = operation_ids(&lab.work);
 
     // When: the branch is included.
+    state_placement(&lab, &home, "feat/gamma", "FORK");
     let output = knives_release(&lab, &home, &["include", "feat/gamma"]);
     assert!(
         output.status.success(),
@@ -222,6 +224,7 @@ fn an_edited_release_carries_the_repository_identity() {
     lab.branch("feat/gamma", "gamma.txt", "gamma\n");
 
     // When: the release is edited.
+    state_placement(&lab, &home, "feat/gamma", "FORK");
     let output = knives_release(&lab, &home, &["include", "feat/gamma"]);
     assert!(output.status.success(), "{output:?}");
 
@@ -437,6 +440,8 @@ fn include_by_commit_id_adds_that_exact_parent() {
     let loose = commit_at(&lab, "feat/loose");
     lab.jj_work(["bookmark", "forget", "feat/loose"]);
     let before = release_parents(&lab, "release/2026-08-04");
+    // A commit no branch names still states its placement, under its id.
+    state_placement(&lab, &home, loose.as_str(), "FORK");
 
     let output = knives_release(&lab, &home, &["include", loose.as_str()]);
 
@@ -661,6 +666,7 @@ fn a_pin_frozen_on_an_older_release_does_not_refuse_editing_the_release_in_hand(
     );
     let before = release_parents(&lab, release).len();
 
+    state_placement(&lab, &home, "feat/gamma", "FORK");
     let output = knives_release(&lab, &home, &["include", "feat/gamma"]);
 
     let stdout = String::from_utf8_lossy(&output.stdout);

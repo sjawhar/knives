@@ -43,6 +43,7 @@ fn knives(lab: &Lab, home: &tempfile::TempDir, args: &[&str]) -> std::process::O
 
 /// Start `feat/gamma` into the configured directory; the fixture every test shares.
 fn start_gamma(lab: &Lab, home: &tempfile::TempDir) -> std::process::Output {
+    let placement = lab::placement_file(home, "FORK");
     knives(
         lab,
         home,
@@ -54,6 +55,8 @@ fn start_gamma(lab: &Lab, home: &tempfile::TempDir) -> std::process::Output {
             "demo",
             "--why",
             "port it",
+            "--placement",
+            placement.to_str().expect("utf-8 path"),
         ],
     )
 }

@@ -20,7 +20,7 @@ mod lab;
 use knives::jj::Repo;
 use lab::{
     Lab, commit_at, extend_branch, file_at_revision, home_after_first_cut, knives_release,
-    release_parents, release_test_home,
+    release_parents, release_test_home, state_placement,
 };
 
 #[test]
@@ -254,6 +254,9 @@ fn advance_from_recovers_a_branch_rebuilt_with_jj_duplicate() {
         plain_stdout.contains("carries no parent of feat/alpha"),
         "{plain_stdout}"
     );
+    // With the record gone, `--from` admits the branch on the caller's word alone,
+    // so it is gated like a new inclusion and needs its placement verdict.
+    state_placement(&lab, &home, "feat/alpha", "FORK");
 
     // But naming the exact old parent it replaces succeeds.
     let output = knives_release(

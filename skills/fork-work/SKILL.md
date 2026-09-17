@@ -5,7 +5,7 @@ description: Check knives before working in a repository we maintain a fork of. 
 
 # About to work in a fork
 
-> **Upstream PRs are a placement judgment, not a permission.** Before opening one, load `maintaining-inspect` (with this skill and `using-knives` for the fork mechanics) and write down whether the change needs to go upstream at all: a defect any user of the library would hit, fixed with evidence (a reproduction or red→green test), is upstream material; a fork-specific workaround, a knob only we use, or an unproven fix is not. That answer is recorded in the `placement:` notch and the PR body — nobody is asked and no approval is awaited (Sami, 2026-09-16: "I didn't ask to be in the loop for every upstream interaction"). The default for every fix is a fork member (single signed commit on the release's shared base → pushed to the fork remote → `knives notch` → tip + red→green evidence to the inspect release owner for include-time review → next cut → agent-c pin bump). Once an upstream PR is open, its lifecycle — review rounds, body edits, rebases, the close — is the owning session's own work, never parked on a human.
+> **A fork branch states the non-fork alternative it rejected — before it exists.** Most effects a consumer wants from a library need no fork: a configuration value the library already exposes, a resource-level override in the consumer's own deployment tooling, or the consumer's own code. `knives start` refuses to create a new branch until the placement red-team (below) has answered CONSUMER / FORK / UPSTREAM and its verdict file is passed with `--placement`; a CONSUMER verdict starts no branch. FORK members ride the release cut and never become a pull request. UPSTREAM is the only verdict that leads to an upstream pull request — and never for a change to upstream defaults made to suit one deployment's preferences. Nobody is asked and no approval is awaited: the verdict is the written judgment, recorded as a `placement:` notch on the branch, and `release include`, `release advance` and `knives gh` read it back.
 
 ## Stop and find out where you are
 
@@ -79,23 +79,39 @@ every false one did not.
 A branch's notes may carry a workflow's own prefixes; the workflow that wrote them defines
 them, and a note that says it is open is open.
 
-## Challenge upstream placement before implementation
+## Run the placement red-team before any new branch
 
-Before implementing an upstream change or creating its branch, someone other than the proposer challenges ownership: a reviewer, orchestrator, or solo fresh-context subagent arguing for other layers. With none available, write competing layer hypotheses and what disproves each.
-Read-only investigation is exempt. A green gate, plausible patch or peer's "go" establishes no ownership. This is not a question for the human: a `placement:` notch that concludes "upstream" is the written judgment the callout at the top of this skill asks for, and the PR is opened on that judgment, not on anyone's go.
+Before creating a fork branch — and again before proposing anything upstream — dispatch a
+fresh-context subagent with the brief in
+[references/placement-red-team.md](references/placement-red-team.md). Its job is to argue
+AGAINST the fork change: name the most direct non-fork way to get the effect, classify the
+change (library-defect / gap-others-need / deployment-preference), and default to CONSUMER
+when in doubt — the burden is on the change. With no subagent available, write the brief's
+answers yourself in a fresh context, arguing each alternative honestly before rejecting it.
+Read-only investigation is exempt; a green gate, plausible patch or peer's "go" establishes
+nothing.
 
-Record a `placement:` notch with `--evidence`, naming proposer and challenger, on the branch (repository subject before branching or for a standing rule):
+The red-team's output is the verdict file:
 
 ```
-knives notch <branch> -m "placement: proposer <id>; challenger <id>; <four answers>" --evidence <revision-or-url>
+verdict: CONSUMER | FORK | UPSTREAM
+alternative: <the consumer-side mechanism considered, and why it fails or is hacky>
+class: library-defect | gap-others-need | deployment-preference
+judge: <the red-team subagent's id or handle>
+<free text: evidence, reproduction, upstream signal>
 ```
 
-- Cite the observed failure or missing capability and revision, not an inherited summary or counter.
-- Choose our configuration, caller, open feature branch, fork-only plumbing or upstream, after checking the real launch path, installed version, options and existing lifecycle/recovery mechanisms.
-- For a bug, give a minimal reproduction on unmodified upstream at a cited revision, without our fork checkout or application patches; for a feature, establish the general extension case preserving upstream defaults.
-- Explain why upstream review, CI, rebase and maintenance are worthwhile.
+`knives start <branch> --placement <file>` records it on the branch as a `placement:`
+ledger note. CONSUMER means no branch: implement the alternative in the consumer instead.
+A verdict is re-checked, not inherited, when evidence or scope changes — record the newer
+one the same way (`knives start` on the existing branch with `--placement`, or `knives
+notch <branch> -m "placement: verdict: …"`), and the newest wins.
 
-Ownership unestablished: investigate, never relabel unsupported bugs as "hardening". Reuse a valid `placement:` notch; recheck when evidence or scope changes.
+For an UPSTREAM candidate the brief additionally checks: does the change preserve upstream
+defaults, does a user outside this deployment benefit, and does the upstream repository
+want it (an issue, a maintainer signal)? For a bug, that means a minimal reproduction on
+unmodified upstream at a cited revision; for a feature, the general extension case. Never
+relabel an unsupported bug as "hardening".
 
 ## Get your own working copy the managed way
 
@@ -106,7 +122,9 @@ knives start <branch> --why "what you are doing"
 This claims the branch and creates a jj workspace for it: on the branch's own tip when the
 branch already exists (your `@` is an empty child of it), or on the release's shared base
 (the fetched upstream trunk when no release exists) for a new branch, so it composes into
-the release without forcing a rebase. A `start` that pauses is waiting for another agent's
+the release without forcing a rebase. A new branch — one that exists nowhere yet — is
+refused without `--placement <file>`: run the red-team above first and pass its verdict.
+A `start` that pauses is waiting for another agent's
 knives command to release the claim lock; let it. A refusal names the holder — the
 `using-knives` skill has the messages. As soon as your active work there stops —
 including when it now waits on something external, such as a pull request in review:
@@ -163,4 +181,4 @@ has a knives command that does the same job safely:
 This is the on-ramp. For the rest of the CLI — what the three remotes mean, stating a
 pull request that inference cannot find, recording that one branch cannot land before
 another, planning and cutting releases, JSON output — read the `using-knives` skill. The
-per-pull-request and sweep workflows are `maintaining-fork-pr` and `maintaining-fork-release`. The rule at the top of this skill is `maintaining-inspect`'s; load it before any upstream work.
+per-pull-request and sweep workflows are `maintaining-fork-pr` and `maintaining-fork-release`; before any upstream pull request, `pr-preflight`.

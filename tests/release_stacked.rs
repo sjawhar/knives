@@ -16,7 +16,7 @@
 #[path = "common/lab.rs"]
 mod lab;
 
-use lab::{Lab, knives_release, release_test_home};
+use lab::{Lab, knives_release, release_test_home, state_placement};
 
 #[test]
 fn a_member_built_on_a_prior_release_is_reported_stacked() {
@@ -107,6 +107,7 @@ fn a_branch_forked_past_a_stale_upstream_view_is_not_stacked() {
     // When: the plan is read and the branch is included.
     let plan = knives_release(&lab, &home, &[]);
     let plan_text = String::from_utf8_lossy(&plan.stdout).to_string();
+    state_placement(&lab, &home, "feat/beta", "FORK");
     let include = knives_release(&lab, &home, &["include", "feat/beta"]);
     let include_text = String::from_utf8_lossy(&include.stdout).to_string();
 

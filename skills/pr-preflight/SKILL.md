@@ -5,15 +5,15 @@ description: Pre-PR contribution judgment gate for upstream repositories. Use wh
 
 # Upstream PR Preflight Gate
 
-> **Upstream PRs are a placement judgment, not a permission.** Before opening one, load `maintaining-inspect` (with `fork-work` and `using-knives` for the fork mechanics) and write down whether the change needs to go upstream at all: a defect any user of the library would hit, fixed with evidence (a reproduction or red→green test), is upstream material; a fork-specific workaround, a knob only we use, or an unproven fix is not. That answer is recorded in the `placement:` notch and the PR body — nobody is asked and no approval is awaited (Sami, 2026-09-16: "I didn't ask to be in the loop for every upstream interaction"). The default for every fix is a fork member (single signed commit on the release's shared base → pushed to the fork remote → `knives notch` → tip + red→green evidence to the inspect release owner for include-time review → next cut → agent-c pin bump). Once an upstream PR is open, its lifecycle — review rounds, body edits, rebases, the close — is the owning session's own work, never parked on a human.
+> **An upstream PR requires `verdict: UPSTREAM`.** Every fork branch carries a placement verdict — the placement red-team's ruling (skill `fork-work`), recorded as a `placement:` notch by `knives start --placement` — and only `UPSTREAM` leads to an upstream pull request; `knives gh` refuses `gh pr create` toward a registered upstream for any other verdict. UPSTREAM means: a defect any user of the library would hit, fixed with evidence (a reproduction or red→green test), or a capability users outside this deployment need, extended the general way. **We do not change upstream defaults to suit one deployment's preferences** — a deployment-preference change is CONSUMER or FORK, never a PR. And **most fork work never becomes a PR — too many open PRs is a cost**, paid by the upstream maintainer and by every later sweep of ours: the default for a fix is a fork member that rides the release cut, invisible to upstream. Nobody is asked and no approval is awaited; the verdict is the written judgment.
 
 ## Overview
 
 Opening a pull request against an upstream repository requires adhering to that project's specific contribution guidelines. The `knives` CLI provides programmatic facts through `knives preflight`. The agent provides the human judgment to evaluate compliance before executing `gh pr create`.
 
-Never open an upstream PR without walking this gate, and never without the written answer to whether the change belongs upstream at all (the callout above). The gate and that written judgment are what make a PR opened in Sami's name defensible; neither is a permission to ask him for.
+Never open an upstream PR without walking this gate, and never without the branch's recorded `verdict: UPSTREAM` (the callout above). The gate and that verdict are what make the PR defensible; neither is a permission to ask a human for.
 
-Load `maintaining-inspect` first — it owns this rule; this skill, `fork-work` and `using-knives` are the fork mechanics. Complete `fork-work`'s challenge before implementation; Check 7 verifies the `placement:` notch before publication.
+Complete `fork-work`'s placement red-team before implementation — `knives start` will not create the branch without its verdict; Check 7 re-reads the verdict before publication.
 
 ## Step 1: Obtain Programmatic Facts
 
@@ -73,12 +73,13 @@ Walk each check sequentially. Each check specifies what facts to verify, what ev
 - **If Failed**:
   - *Incorrect Routing*: Refactor and relocate the changes to the permitted package, directory, or extension location defined by upstream policy.
 
-### Check 7: `placement:` notch
-- **Verification**: Challenger differs from proposer; evidence covers the published diff.
-- **Evidence**: The `placement:` notch, read with `knives notch <branch>` (repository subject for standing rules).
+### Check 7: Placement verdict
+- **Verification**: The branch's newest `placement:` notch rules `verdict: UPSTREAM`, its judge differs from the proposer, and its evidence covers the published diff — the alternative it rejected is still the alternative, and the class is still what the PR claims.
+- **Evidence**: The `placement:` notch, read with `knives notch <branch>`.
 - **If Failed**:
-  - *Missing*: No PR; return to `fork-work`'s challenge.
-  - *Stale*: Re-run the challenge.
+  - *Missing*: No PR; return to `fork-work`'s placement red-team. `knives gh` refuses the create anyway.
+  - *Verdict is FORK or CONSUMER*: No PR. A FORK member ships through the release; a CONSUMER change belongs in the consumer and its branch should be finished.
+  - *Stale (scope or evidence moved on)*: Re-run the red-team and record the fresh verdict before opening.
 
 ## Step 3: Record What You Promised
 

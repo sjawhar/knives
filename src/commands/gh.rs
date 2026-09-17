@@ -88,6 +88,12 @@ pub fn run(args: &[String]) -> anyhow::Result<std::convert::Infallible> {
         std::process::exit(gh_exit_code(&mut gh));
     }
     let cwd = std::env::current_dir()?;
+    // Before minting: an upstream pull request the placement verdict does not
+    // allow is refused without spending a token on it.
+    if let Some(refusal) = upstream_pull_refusal(args, &cwd)? {
+        eprintln!("knives gh: {refusal}");
+        std::process::exit(crate::cli::Exit::Usage.code().into());
+    }
     let token = if std::env::var_os("GH_TOKEN").is_some() {
         None
     } else {
@@ -828,6 +834,215 @@ fn preferred_remote_url(
                 .filter(|(name, _)| !matches!(name.as_str(), "upstream" | "github" | "origin"))
                 .find_map(|(_, url)| normalize_url(url))
         })
+}
+
+/// How an invocation would open a pull request, and on which head.
+#[derive(Debug, PartialEq, Eq)]
+enum PullOpening {
+    /// `gh pr create`; the head is `--head`'s value when given.
+    Create { head: Option<String> },
+    /// `gh api repos/{owner}/{repo}/pulls` with a body: REST creation.
+    Rest {
+        owner: String,
+        repo: String,
+        head: Option<String>,
+    },
+    /// A GraphQL `createPullRequest` mutation, which names its repository by
+    /// node id and so carries no owner knives can read.
+    Graphql { head: Option<String> },
+}
+
+/// Whether this invocation opens a pull request, and how (`None`: it does not).
+///
+/// The placement verdict governs opening a pull request upstream, so this is
+/// deliberately narrow: `pr create`, the REST endpoint that creates one, and
+/// the GraphQL mutation that does. Comments, reviews and edits on a pull
+/// request that already exists are maintenance of work already open and pass
+/// as before.
+fn pull_opening(args: &[String]) -> Option<PullOpening> {
+    if let Some((subcommand, _)) = pr_subcommand(args) {
+        return (subcommand == "create").then(|| PullOpening::Create {
+            head: flag_value(args, "--head").map(|head| strip_head_owner(&head).to_owned()),
+        });
+    }
+    if args.first().map(String::as_str) != Some("api") {
+        return None;
+    }
+    let joined = args.join(" ");
+    if joined.contains("createPullRequest") {
+        return Some(PullOpening::Graphql {
+            head: field_argument_any(args, "headRefName"),
+        });
+    }
+    // A request with fields is a POST in gh's own default; `-X GET` on the
+    // pulls endpoint lists them and opens nothing.
+    let method = flag_value(args, "-X")
+        .or_else(|| flag_value(args, "--method"))
+        .map(|method| method.to_ascii_uppercase());
+    let has_body = args.iter().any(|argument| {
+        matches!(
+            argument.as_str(),
+            "-f" | "-F" | "--raw-field" | "--field" | "--input"
+        ) || argument.starts_with("--raw-field=")
+            || argument.starts_with("--field=")
+            || argument.starts_with("--input=")
+    });
+    let creates = match method.as_deref() {
+        Some("POST") => true,
+        Some(_) => false,
+        None => has_body,
+    };
+    if !creates {
+        return None;
+    }
+    let path = args
+        .iter()
+        .skip(1)
+        .find(|argument| !argument.starts_with('-'))?;
+    let bare = path.strip_prefix('/').unwrap_or(path);
+    let bare = bare.split('?').next().unwrap_or(bare);
+    let mut segments = bare.split('/');
+    if segments.next() != Some("repos") {
+        return None;
+    }
+    let (owner, repo) = (segments.next()?, segments.next()?);
+    if segments.next() != Some("pulls") || segments.next().is_some() {
+        return None;
+    }
+    Some(PullOpening::Rest {
+        owner: owner.to_owned(),
+        repo: repo.to_owned(),
+        head: field_argument_any(args, "head").map(|head| strip_head_owner(&head).to_owned()),
+    })
+}
+
+/// The value of `--flag value` or `--flag=value`, first occurrence.
+fn flag_value(args: &[String], flag: &str) -> Option<String> {
+    let mut index = 0;
+    while let Some(argument) = args.get(index) {
+        if argument == flag {
+            return args.get(index + 1).cloned();
+        }
+        if let Some(value) = argument
+            .strip_prefix(flag)
+            .and_then(|rest| rest.strip_prefix('='))
+        {
+            return Some(value.to_owned());
+        }
+        index += 1;
+    }
+    None
+}
+
+/// [`field_argument`] without the login charset: a branch name may carry `/`.
+fn field_argument_any(args: &[String], name: &str) -> Option<String> {
+    let mut index = 0;
+    while let Some(argument) = args.get(index) {
+        let assignment = match argument.as_str() {
+            "-f" | "-F" | "--raw-field" | "--field" => {
+                index += 1;
+                args.get(index).map(String::as_str)
+            }
+            _ => argument
+                .strip_prefix("--raw-field=")
+                .or_else(|| argument.strip_prefix("--field="))
+                .or_else(|| argument.strip_prefix("-f"))
+                .or_else(|| argument.strip_prefix("-F"))
+                .map(|attached| attached.strip_prefix('=').unwrap_or(attached)),
+        };
+        if let Some((key, value)) = assignment.and_then(|assignment| assignment.split_once('='))
+            && key == name
+            && !value.is_empty()
+        {
+            return Some(value.to_owned());
+        }
+        index += 1;
+    }
+    None
+}
+
+/// `owner:branch` names a fork's branch from the base repository's side; the
+/// branch is what the ledger knows.
+fn strip_head_owner(head: &str) -> &str {
+    head.rsplit_once(':').map_or(head, |(_, branch)| branch)
+}
+
+/// Why this invocation may not open the pull request it is about to, or `None`
+/// when it opens none, opens it somewhere other than a registered fork's
+/// upstream, or opens it for a branch whose recorded placement verdict is
+/// `UPSTREAM`.
+///
+/// Every registry entry names the upstream it forks. A pull request opened
+/// there is the one act a fork branch's placement verdict exists to govern:
+/// the branch was started with the red-team's ruling (`knives start
+/// --placement`), and only `UPSTREAM` says upstream wants the change. Pull
+/// requests on the fork's own origin — a review branch, a release — are not
+/// upstream's business and pass. A registry that does not load leaves nothing
+/// to gate against, as it leaves nothing to route a token by.
+fn upstream_pull_refusal(args: &[String], cwd: &Path) -> anyhow::Result<Option<String>> {
+    let Some(opening) = pull_opening(args) else {
+        return Ok(None);
+    };
+    let Ok(registry) = crate::config::load(&crate::config::default_config_path()) else {
+        return Ok(None);
+    };
+    let (repo, head, stated_head_required) = match opening {
+        PullOpening::Create { head } => {
+            let Some(target) = resolve_target_url(args, cwd) else {
+                return Ok(None);
+            };
+            let Some(repo) = upstream_of(&registry, &target) else {
+                return Ok(None);
+            };
+            (repo, head, false)
+        }
+        PullOpening::Rest { owner, repo, head } => {
+            let Some(target) = url_from_spec(&format!("{owner}/{repo}")) else {
+                return Ok(None);
+            };
+            let Some(repo) = upstream_of(&registry, &target) else {
+                return Ok(None);
+            };
+            (repo, head, true)
+        }
+        PullOpening::Graphql { head } => {
+            // No owner to read: inside a registered fork the mutation is
+            // refused rather than guessed at, since `gh pr create` says where
+            // it goes; outside one there is no fork whose rule applies.
+            let Ok(fork) = crate::bind::here(&registry, cwd) else {
+                return Ok(None);
+            };
+            return Ok(Some(format!(
+                "a GraphQL createPullRequest names its repository by node id, so knives cannot \
+                 tell whether it targets {}'s upstream; open it with `gh pr create` (head {})",
+                fork.name,
+                head.as_deref().unwrap_or("<branch>")
+            )));
+        }
+    };
+    let head = match head.or_else(|| current_bookmark(cwd)) {
+        Some(head) => head,
+        // An API creation with no head stated has no branch to look up; `pr
+        // create` without one dies on its own diagnostic further down.
+        None if stated_head_required => {
+            return Ok(Some(format!(
+                "an upstream pull request for {repo} needs a head branch (`-f head=<branch>`) \
+                 to check its placement verdict"
+            )));
+        }
+        None => return Ok(None),
+    };
+    let entries = crate::ledger::Ledger::for_repo(&repo).entries()?;
+    Ok(crate::placement::upstream_pull_refusal(&entries, &head)?)
+}
+
+/// The registered repository whose `upstream` is `target`, if any.
+fn upstream_of(registry: &crate::config::Registry, target: &str) -> Option<crate::ids::RepoName> {
+    registry
+        .repos
+        .iter()
+        .find(|(_, entry)| crate::remote_url::same_remote(&entry.upstream, target))
+        .map(|(name, _)| crate::ids::RepoName::new(name))
 }
 
 /// How a GraphQL query names an owner: inline, or through a variable whose value

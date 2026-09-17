@@ -22,7 +22,7 @@ use forge_shim::{install_failing_gh, path_with_gh_shim};
 use knives::ids::BranchName;
 use knives::jj::Repo;
 use knives::store::{OwnerKind, Store};
-use lab::{Lab, knives_start, release_test_home};
+use lab::{Lab, knives_start, placement_file, release_test_home};
 use serde_json::Value;
 use std::process::Command;
 
@@ -32,7 +32,8 @@ fn starting_and_finishing_a_branch_leaves_its_reason_in_the_ledger() {
     let lab = lab::Lab::new();
     let (home, _consumer) = release_test_home(&lab);
 
-    // When: a branch is started through the binary with a reason
+    // When: a branch is started through the binary with a reason and a verdict
+    let placement = placement_file(&home, "FORK");
     let started = Command::new(env!("CARGO_BIN_EXE_knives"))
         .args([
             "--text",
@@ -42,7 +43,9 @@ fn starting_and_finishing_a_branch_leaves_its_reason_in_the_ledger() {
             "demo",
             "--why",
             "carrying the queue fix",
+            "--placement",
         ])
+        .arg(&placement)
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
         .env("HOME", lab.temp_path())
@@ -56,17 +59,29 @@ fn starting_and_finishing_a_branch_leaves_its_reason_in_the_ledger() {
         String::from_utf8_lossy(&started.stderr)
     );
 
-    // Then: the ledger holds the claim event. `start` opens a workspace at the
-    // base revision and does not create a bookmark, so only the Scribe may decide
-    // whether a ref anchor exists; here it correctly records none.
+    // Then: the ledger holds the claim event, then the placement verdict as a
+    // note. `start` opens a workspace at the base revision and does not create a
+    // bookmark, so only the Scribe may decide whether a ref anchor exists; here
+    // it correctly records none.
     let ledger = knives::ledger::Ledger::at(home.path().join("ledger").join("demo"));
     let entries = ledger.entries().expect("read ledger");
-    assert_eq!(entries.len(), 1, "was: {entries:?}");
+    assert_eq!(entries.len(), 2, "was: {entries:?}");
     assert_eq!(entries[0].kind, knives::ledger::Kind::Event);
     assert_eq!(entries[0].owner, "ses_fff688");
     assert_eq!(entries[0].subject.as_deref(), Some("feat/alpha"));
     assert_eq!(entries[0].text, "claimed: carrying the queue fix");
     assert_eq!(entries[0].anchor, None);
+    assert_eq!(entries[1].kind, knives::ledger::Kind::Note);
+    assert_eq!(entries[1].subject.as_deref(), Some("feat/alpha"));
+    assert_eq!(
+        entries[1].text,
+        format!(
+            "placement: {}",
+            std::fs::read_to_string(&placement)
+                .expect("read verdict")
+                .trim_end()
+        )
+    );
 
     // When: it is handed back naming its successor
     let finished = Command::new(env!("CARGO_BIN_EXE_knives"))
@@ -94,9 +109,9 @@ fn starting_and_finishing_a_branch_leaves_its_reason_in_the_ledger() {
 
     // Then: the supersession is recorded as an event rather than only as state
     let entries = ledger.entries().expect("read ledger");
-    assert_eq!(entries.len(), 2, "was: {entries:?}");
+    assert_eq!(entries.len(), 3, "was: {entries:?}");
     assert_eq!(
-        entries[1].text,
+        entries[2].text,
         "claim released; superseded by feat/replacement"
     );
 }
@@ -134,7 +149,9 @@ fn start_claim_for_finish(
             "demo",
             "--why",
             "carry the queue fix",
+            "--placement",
         ])
+        .arg(placement_file(home, "FORK"))
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
         .env("HOME", lab.temp_path())

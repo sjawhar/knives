@@ -22,7 +22,8 @@ use crate::jj::{
     remove_prunable_worktree, repo_immutable_heads, set_repo_immutable_heads, user_immutable_heads,
     workspace_identity,
 };
-use crate::ledger::{Ledger, Scribe};
+use crate::ledger::{Draft, Kind, Ledger, Scribe};
+use crate::placement::{self, Placement};
 use crate::release_model::newest_release;
 use crate::seen;
 use crate::store::{Store, default_state_path};
@@ -115,26 +116,46 @@ struct StartContext<'a> {
     destination: PathBuf,
     workspace: WorkspaceName,
     opened: Repo,
+    /// The verdict `--placement` supplied, read and parsed by the caller.
+    placement: Option<&'a Placement>,
+}
+
+/// What a `start` was asked for beyond the branch.
+#[derive(Debug, Default)]
+pub struct Options<'a> {
+    pub why: Option<&'a str>,
+    pub force: bool,
+    /// The placement red-team's verdict for a new branch. Recorded on the branch
+    /// once the workspace exists; required when the branch does not exist yet
+    /// and no earlier `start` recorded one.
+    pub placement: Option<&'a Placement>,
 }
 
 /// Claim `branch` and open its workspace. `bound` is the entry the current
 /// directory is inside, from which a terminal user's identity is derived.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the fork, the branch, the reason, the override and the cwd binding are independent inputs"
-)]
 pub fn run(
     fork: &Fork<'_>,
     branch: &BranchName,
-    why: Option<&str>,
-    force: bool,
+    options: &Options<'_>,
     bound: Option<&RepoName>,
 ) -> anyhow::Result<Exit> {
     let repo_name = &fork.name;
     let entry = fork.entry;
     let checkout = &fork.checkout.path;
+    let (why, force) = (options.why, options.force);
     if let Some(line) = collides_with_checkout(fork, branch) {
         eprintln!("{repo_name}: {line}");
+        return Ok(Exit::Usage);
+    }
+    if let Some(placement) = options.placement
+        && placement.verdict == placement::Verdict::Consumer
+    {
+        // The verdict answered the forcing question: the effect belongs in the
+        // consumer, so there is no fork branch to start.
+        eprintln!(
+            "{repo_name}: {}; no branch is started for {branch}",
+            placement::CONSUMER_REFUSAL
+        );
         return Ok(Exit::Usage);
     }
     let mut store = Store::open_for_update(default_state_path())?;
@@ -150,6 +171,7 @@ pub fn run(
         workspace: WorkspaceName::new(workspace_for(branch.as_str())),
         opened: Repo::open(checkout)?,
         destination,
+        placement: options.placement,
     };
     // A rule a human stated is their decision: `status` reports one that
     // differs, and nothing overwrites it. knives' own earlier write (marked by
@@ -358,6 +380,12 @@ fn take_claim(context: &mut StartContext<'_>, reason: &str) -> anyhow::Result<Ex
             eprintln!("{}", divergent_refusal_line(context.branch, &tips));
             return Ok(Exit::Usage);
         }
+        WorkspaceBase::Unplaced => {
+            // Nothing was claimed: the agent consults the red-team and starts
+            // again with its verdict.
+            eprintln!("{}", placement::forcing_question(context.branch.as_str()));
+            return Ok(Exit::Usage);
+        }
     };
     let change = workspace_change(
         &Repo::open(&context.fork.checkout.path)?,
@@ -378,13 +406,27 @@ fn record_claim(context: &mut StartContext<'_>, reason: &str, event: String) -> 
     let target = BranchTarget::new(context.fork.name.clone(), context.branch.clone());
     let pull = context.store.tracked_pull(&target);
     let _ = context.store.claim(&target, &context.identity, reason);
-    Scribe::new(
+    let scribe = Scribe::new(
         Ledger::for_repo(&context.fork.name),
         context.fork.name.clone(),
         context.fork.checkout.path.clone(),
         context.identity.owner.clone(),
-    )
-    .event(Some(context.branch.as_str()), event, pull)?;
+    );
+    scribe.event(Some(context.branch.as_str()), event, pull)?;
+    // The verdict rides beside the claim as a note the release verbs and `gh`
+    // read back. Recorded whenever one is given, new branch or not: this is
+    // also how a branch that predates the gate states its placement later.
+    if let Some(placement) = context.placement {
+        scribe.record(&Draft {
+            subject: Some(context.branch.as_str()),
+            kind: Kind::Note,
+            disposition: None,
+            text: placement.note_text(),
+            evidence: Vec::new(),
+            pr: pull,
+            parents: Vec::new(),
+        })?;
+    }
     context.store.save()?;
     Ok(())
 }
@@ -487,6 +529,7 @@ fn workspace_notice(
             )?,
         )),
         WorkspaceBase::Divergent(tips) => Err(divergent_refusal_line(context.branch, &tips)),
+        WorkspaceBase::Unplaced => Err(placement::forcing_question(context.branch.as_str())),
     })
 }
 
@@ -499,6 +542,29 @@ enum WorkspaceBase {
     /// The branch's local bookmark names several commits, so there is no one tip
     /// to continue from.
     Divergent(Vec<CommitId>),
+    /// A new fork branch with no placement verdict — not on the command line,
+    /// not in the ledger.
+    Unplaced,
+}
+
+/// Whether a new branch may be created without a verdict on the command line:
+/// only when an earlier `start` already recorded one (a workspace removed by
+/// `finish` and rebuilt, a claim seized with `--force`).
+///
+/// Every registered repository is a fork of the `upstream` its entry names, so
+/// the question applies to every new branch here; an existing branch, local or
+/// on one of our remotes, was started before and is continued unasked.
+fn placed(context: &StartContext<'_>) -> anyhow::Result<bool> {
+    if context.placement.is_some() || context.fork.entry.upstream.is_empty() {
+        return Ok(true);
+    }
+    let entries = Ledger::for_repo(&context.fork.name).entries()?;
+    Ok(
+        match placement::recorded(&entries, context.branch.as_str()) {
+            None => false,
+            Some(recorded) => recorded?.verdict != placement::Verdict::Consumer,
+        },
+    )
 }
 
 /// The refusal for a divergent branch: which tips, and how to pick one. Nothing
@@ -543,6 +609,9 @@ fn create_workspace(context: &StartContext<'_>) -> anyhow::Result<WorkspaceBase>
         ),
         BranchTip::Divergent(targets) => return Ok(WorkspaceBase::Divergent(targets)),
         BranchTip::Unknown => {
+            if !placed(context)? {
+                return Ok(WorkspaceBase::Unplaced);
+            }
             let upstream_trunk = context.upstream_trunk.as_str();
             let scheme = entry.release_scheme();
             let base = match newest_release(&tips, &scheme, entry.publish_remote()) {

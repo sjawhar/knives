@@ -667,6 +667,235 @@ fn pr_create_does_not_duplicate_explicit_head() {
     assert_eq!(recorded.lines().filter(|line| *line == "--head").count(), 1);
 }
 
+/// A config home whose registry forks `<host>/routed-a/upstream`, plus its path,
+/// for the placement-gate scenarios. The ledger for the entry sits beside it.
+fn placement_gate_home() -> tempfile::TempDir {
+    let host = concat!("github", ".com");
+    let config_home = tempfile::tempdir().expect("config home");
+    fs::write(
+        config_home.path().join("repos.toml"),
+        format!(
+            "[repos.registered]\nupstream = \"git@{host}:routed-a/upstream.git\"\norigin = \"git@{host}:routed-b/origin.git\"\n"
+        ),
+    )
+    .expect("write registry");
+    config_home
+}
+
+/// Record a placement verdict for `branch` in the `registered` entry's ledger.
+fn record_placement(config_home: &Path, branch: &str, verdict: &str) {
+    let placement = knives::placement::Placement::parse(&format!("verdict: {verdict}\n"))
+        .expect("parse verdict");
+    knives::ledger::Ledger::at(config_home.join("ledger").join("registered"))
+        .append(&knives::ledger::Entry {
+            ts: "2026-09-17T10:00:00Z".to_owned(),
+            owner: "lab".to_owned(),
+            subject: Some(branch.to_owned()),
+            kind: knives::ledger::Kind::Note,
+            disposition: None,
+            text: placement.note_text(),
+            evidence: Vec::new(),
+            anchor: None,
+            pr: None,
+            parents: Vec::new(),
+        })
+        .expect("record verdict");
+}
+
+#[test]
+fn an_upstream_pr_create_without_a_verdict_is_refused_before_gh_runs() {
+    // Given: the registered upstream as the explicit target, and no ledger note.
+    let config_home = placement_gate_home();
+    let scratch = tempfile::tempdir().expect("scratch");
+    let (dir, log) = fake_gh();
+
+    // When: a pull request is created there for a branch with no verdict.
+    let output = knives_cmd(scratch.path())
+        .args([
+            "gh",
+            "--",
+            "pr",
+            "create",
+            "-R",
+            "routed-a/upstream",
+            "--head",
+            "feat/gamma",
+        ])
+        .current_dir(scratch.path())
+        .env("KNIVES_CONFIG_HOME", config_home.path())
+        .env("KNIVES_REAL_GH", dir.path().join("gh"))
+        .env("FAKE_GH_LOG", &log)
+        .output()
+        .expect("run knives gh");
+
+    // Then: refused with the member text, and gh never ran.
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr).trim_end(),
+        format!(
+            "knives gh: {}",
+            knives::placement::missing_member_refusal("feat/gamma")
+        )
+    );
+    assert!(!log.exists(), "gh ran despite the refusal");
+}
+
+#[test]
+fn an_upstream_pr_create_for_a_fork_verdict_names_the_verdict_in_the_refusal() {
+    // Given: the branch's recorded verdict says FORK: it rides the release cut
+    // and never becomes an upstream pull request.
+    let config_home = placement_gate_home();
+    record_placement(config_home.path(), "feat/gamma", "FORK");
+    let scratch = tempfile::tempdir().expect("scratch");
+    let (dir, log) = fake_gh();
+
+    let output = knives_cmd(scratch.path())
+        .args([
+            "gh",
+            "--",
+            "pr",
+            "create",
+            "-R",
+            "routed-a/upstream",
+            "--head",
+            "feat/gamma",
+        ])
+        .current_dir(scratch.path())
+        .env("KNIVES_CONFIG_HOME", config_home.path())
+        .env("KNIVES_REAL_GH", dir.path().join("gh"))
+        .env("FAKE_GH_LOG", &log)
+        .output()
+        .expect("run knives gh");
+
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("has placement verdict FORK, not UPSTREAM"),
+        "{stderr}"
+    );
+    assert!(!log.exists(), "gh ran despite the refusal");
+}
+
+#[test]
+fn an_upstream_pr_create_with_an_upstream_verdict_passes_through() {
+    let config_home = placement_gate_home();
+    record_placement(config_home.path(), "feat/gamma", "UPSTREAM");
+    let (dir, log) = fake_gh();
+    let helper_dir = fake_app_token();
+    let gitconfig = token_config(helper_dir.path(), "routed-a");
+
+    let output = knives_cmd(helper_dir.path())
+        .args([
+            "gh",
+            "--",
+            "pr",
+            "create",
+            "-R",
+            "routed-a/upstream",
+            "--head",
+            "feat/gamma",
+        ])
+        .current_dir(helper_dir.path())
+        .env("KNIVES_CONFIG_HOME", config_home.path())
+        .env("KNIVES_REAL_GH", dir.path().join("gh"))
+        .env("FAKE_GH_LOG", &log)
+        .env("PATH", helper_path(helper_dir.path()))
+        .env("GIT_CONFIG_GLOBAL", &gitconfig)
+        .output()
+        .expect("run knives gh");
+
+    assert!(output.status.success(), "{output:?}");
+    let recorded = fs::read_to_string(&log).expect("fake gh ran");
+    assert!(recorded.contains("feat/gamma"), "{recorded}");
+}
+
+#[test]
+fn a_pr_create_toward_a_repository_that_is_no_registered_upstream_passes() {
+    // The verdict governs upstream pull requests; the fork's own origin (and any
+    // unregistered repository) is not upstream's business.
+    let config_home = placement_gate_home();
+    let (dir, log) = fake_gh();
+    let helper_dir = fake_app_token();
+    let gitconfig = token_config(helper_dir.path(), "routed-b");
+
+    let output = knives_cmd(helper_dir.path())
+        .args([
+            "gh",
+            "--",
+            "pr",
+            "create",
+            "-R",
+            "routed-b/origin",
+            "--head",
+            "feat/gamma",
+        ])
+        .current_dir(helper_dir.path())
+        .env("KNIVES_CONFIG_HOME", config_home.path())
+        .env("KNIVES_REAL_GH", dir.path().join("gh"))
+        .env("FAKE_GH_LOG", &log)
+        .env("PATH", helper_path(helper_dir.path()))
+        .env("GIT_CONFIG_GLOBAL", &gitconfig)
+        .output()
+        .expect("run knives gh");
+
+    assert!(output.status.success(), "{output:?}");
+    assert!(log.exists(), "gh should run for a non-upstream target");
+}
+
+#[test]
+fn a_rest_pull_creation_against_the_upstream_is_gated_like_pr_create() {
+    // Given: `gh api repos/<upstream>/pulls` with a body — REST creation — for a
+    // branch whose verdict is FORK.
+    let config_home = placement_gate_home();
+    record_placement(config_home.path(), "feat/gamma", "FORK");
+    let scratch = tempfile::tempdir().expect("scratch");
+    let (dir, log) = fake_gh();
+
+    let output = knives_cmd(scratch.path())
+        .args([
+            "gh",
+            "--",
+            "api",
+            "repos/routed-a/upstream/pulls",
+            "-f",
+            "title=x",
+            "-f",
+            "head=feat/gamma",
+            "-f",
+            "base=main",
+        ])
+        .current_dir(scratch.path())
+        .env("KNIVES_CONFIG_HOME", config_home.path())
+        .env("KNIVES_REAL_GH", dir.path().join("gh"))
+        .env("FAKE_GH_LOG", &log)
+        .output()
+        .expect("run knives gh");
+
+    // Then: refused, naming the verdict; listing the same endpoint still works.
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("has placement verdict FORK, not UPSTREAM"),
+        "{output:?}"
+    );
+    assert!(!log.exists(), "gh ran despite the refusal");
+
+    let helper_dir = fake_app_token();
+    let gitconfig = token_config(helper_dir.path(), "routed-a");
+    let listed = knives_cmd(helper_dir.path())
+        .args(["gh", "--", "api", "repos/routed-a/upstream/pulls"])
+        .current_dir(scratch.path())
+        .env("KNIVES_CONFIG_HOME", config_home.path())
+        .env("KNIVES_REAL_GH", dir.path().join("gh"))
+        .env("FAKE_GH_LOG", &log)
+        .env("PATH", helper_path(helper_dir.path()))
+        .env("GIT_CONFIG_GLOBAL", &gitconfig)
+        .output()
+        .expect("run knives gh");
+    assert!(listed.status.success(), "{listed:?}");
+    assert!(log.exists(), "a bodyless GET must pass");
+}
+
 /// A marked shim `gh` that records its arguments and exits 99 without running anything.
 fn marker_shim() -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::tempdir().expect("marker shim dir");

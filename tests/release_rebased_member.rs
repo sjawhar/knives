@@ -18,7 +18,7 @@ mod lab;
 
 use knives::ids::CommitId;
 use knives::jj::Repo;
-use lab::{Lab, commit_at, knives_release, release_parents, release_test_home};
+use lab::{Lab, commit_at, knives_release, release_parents, release_test_home, state_placement};
 
 /// A release cut from two members forked from the old trunk, then alpha rebased
 /// onto the advanced upstream — the shape a maintainer's "please rebase"
@@ -358,6 +358,7 @@ fn a_member_that_joined_by_include_is_found_through_the_edit_record() {
         String::from_utf8_lossy(&cut.stdout)
     );
     lab.branch("feat/gamma", "gamma.txt", "gamma\n");
+    state_placement(&lab, &home, "feat/gamma", "FORK");
     let included = knives_release(&lab, &home, &["include", "feat/gamma"]);
     assert!(
         included.status.success(),
@@ -424,6 +425,7 @@ fn a_member_landed_by_merge_commit_has_no_successor_among_fresh_trunk_branches()
     let before = release_parents(&lab, "release/2026-08-04");
 
     // When: gamma is included, and a bare advance runs.
+    state_placement(&lab, &home, "feat/gamma", "FORK");
     let included = knives_release(&lab, &home, &["include", "feat/gamma"]);
     let advanced = knives_release(&lab, &home, &["advance"]);
 

@@ -103,6 +103,9 @@ struct EditContext<'a> {
     /// was written, every bookmark at each parent, and it is what keeps
     /// `include` from carrying the branch twice and lets `advance` still move it.
     recorded: &'a [knives::ledger::RecordedParent],
+    /// Every entry of this repository's ledger: where a branch's placement
+    /// verdict and its history as a member are read from.
+    ledger: &'a [knives::ledger::Entry],
     stacked: StackedHistoryContext<'a>,
 }
 
@@ -179,6 +182,26 @@ impl EditContext<'_> {
                 self.release.name
             ),
         }
+        Ok(true)
+    }
+}
+
+impl EditContext<'_> {
+    /// Refuse, saying why, a branch entering the release without a placement
+    /// verdict behind it; `false` for one that may enter.
+    ///
+    /// A fork member states the non-fork alternative it rejected before it
+    /// exists (`knives start --placement`), and the release reads that
+    /// statement back here rather than the author's summary. Grandfathering:
+    /// the gate arrived with members already in releases and no note behind
+    /// them, so a branch any recorded cut or edit named as a parent is an
+    /// existing member and passes — a recut carries it, `advance` moves it.
+    /// Only a branch no composition has ever carried is a new inclusion.
+    fn refuse_unplaced(&self, branch: &str) -> anyhow::Result<bool> {
+        let Some(refusal) = knives::placement::member_refusal(self.ledger, branch)? else {
+            return Ok(false);
+        };
+        println!("{}: {refusal}", self.repo);
         Ok(true)
     }
 }
@@ -302,6 +325,7 @@ fn edit_release(
         opened: &opened,
         release: &release,
         recorded: last_recorded_parents(&ledger, &release.name),
+        ledger: &ledger,
         bound,
         stacked: StackedHistoryContext {
             repo: &opened,
@@ -541,6 +565,11 @@ fn include_edit(
         }
         return Ok(EditOutcome::Settled(Exit::Incomplete));
     }
+    // Everything above answered "is it already a member"; this is a new
+    // inclusion, the one act the placement verdict gates.
+    if context.refuse_unplaced(target)? {
+        return Ok(EditOutcome::Settled(Exit::Incomplete));
+    }
     let mut parents = release.parents.clone();
     parents.push(tip);
     let why = why.map_or_else(String::new, |why| format!(" ({why})"));
@@ -653,6 +682,18 @@ fn advance_edit(
     let Some((parents, moved)) = outcome else {
         return Ok(EditOutcome::Settled(Exit::Incomplete));
     };
+    // A member found by succession or by the release's record is an existing
+    // one, whatever its age: the repository itself ties its tip to a current
+    // parent. `--from` bypasses that search on the caller's word, so the branch
+    // it names may be entering the release for the first time, and then it is
+    // gated exactly as an `include` is.
+    if from.is_some() {
+        for branch in &moved {
+            if context.refuse_unplaced(branch)? {
+                return Ok(EditOutcome::Settled(Exit::Incomplete));
+            }
+        }
+    }
     if moved.is_empty() {
         // Only a bare advance looked at every member, so only it can say so; a
         // named advance has already reported each branch it found at its tip.
