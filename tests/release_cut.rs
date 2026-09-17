@@ -17,13 +17,16 @@
 #[path = "common/lab.rs"]
 mod lab;
 
+#[path = "common/forge_shim.rs"]
+mod forge_shim;
+
 use knives::config::RepoEntry;
 use knives::detect::landed::RebaseOutcome;
 use knives::ids::ReleaseScheme;
 use knives::jj::Repo;
 use lab::{
     Lab, ReleaseOutput, commit_at, knives_release, newest_operation_description, operation_ids,
-    release_command, release_parents, release_test_home, release_test_home_pinned,
+    release_command, release_parents, release_test_home,
 };
 
 #[test]
@@ -694,68 +697,16 @@ fn cutting_a_release_reaps_the_superseded_one() {
     );
 }
 
-#[test]
-fn a_cut_identical_to_the_published_previous_cut_is_refused() {
-    // Given: a cut that origin already holds at exactly this tree.
-    let lab = Lab::new();
-    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
-    lab.branch("feat/beta", "beta.txt", "beta\n");
-    let (home, _consumer) = release_test_home(&lab);
-    let first = knives_release(&lab, &home, &["cut", "release/2026-08-04"]);
-    assert!(first.status.success(), "{first:?}");
-    lab.jj_work([
-        "git",
-        "push",
-        "--remote",
-        "origin",
-        "--bookmark",
-        "release/2026-08-04",
-    ]);
-    lab.fetch_work();
-
-    // When: nothing joined, advanced or moved, and a new name is asked for.
-    let second = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
-
-    // Then: the name is refused with the facts — the published cut and its
-    // commit — and nothing else; nothing is created.
-    let stdout = String::from_utf8_lossy(&second.stdout);
-    let published = commit_at(&lab, "release/2026-08-04@origin");
-    assert!(
-        stdout.contains(&format!(
-            "demo: refusing to cut release/2026-08-05: identical to release/2026-08-04@origin ({}); nothing to cut\n",
-            published.short()
-        )),
-        "{stdout}"
-    );
-    assert_eq!(
-        second.status.code(),
-        Some(i32::from(knives::cli::Exit::Incomplete.code())),
-        "{stdout}"
-    );
-    let tips = Repo::open(&lab.work)
-        .expect("reopen")
-        .bookmark_tips()
-        .expect("tips");
-    assert!(
-        !tips
-            .keys()
-            .any(|reference| reference.branch().as_str() == "release/2026-08-05")
-    );
-}
-
-/// A two-member `release/2026-08-04`, cut by hand, pushed to origin and fetched
-/// back, with a consumer whose current pin is `origin_pin`. The consumer's
-/// checkout content is never scanned (pins are read at its origin trunk), so
-/// only `origin_pin` decides how the release is pinned.
-fn published_release_pinned(origin_pin: &str) -> (Lab, tempfile::TempDir) {
+/// A two-member `release/2026-08-04`, cut by hand, pushed to origin and
+/// fetched back.
+fn published_release() -> (Lab, tempfile::TempDir) {
     let lab = Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     lab.branch("feat/beta", "beta.txt", "beta\n");
     lab.octopus("release/2026-08-04", "feat/alpha", "feat/beta");
     lab.push_branch("release/2026-08-04");
     lab.fetch_work();
-    let (home, _consumer) =
-        release_test_home_pinned(&lab, "branch = \"release/2026-08-03\"", origin_pin);
+    let (home, _consumer) = release_test_home(&lab);
     (lab, home)
 }
 
@@ -769,79 +720,151 @@ fn has_release(lab: &Lab, name: &str) -> bool {
 }
 
 #[test]
-fn an_identical_cut_is_allowed_when_every_pin_of_the_previous_cut_is_frozen() {
-    // Given: a published cut that a consumer pins by revision. The edit verbs
-    // refuse to touch it (editing in place reaches nobody) and point at a new
-    // dated cut; a verbatim cut under the new name is therefore the only way
-    // to obtain an editable composition, and must not be refused as identical.
-    let (lab, home) = published_release_pinned("rev = \"release/2026-08-04\"");
-    lab.branch("feat/gamma", "gamma.txt", "gamma\n");
-    let refused = knives_release(&lab, &home, &["include", "feat/gamma"]);
-    assert_eq!(refused.status.code(), Some(3), "{refused:?}");
-    let published = commit_at(&lab, "release/2026-08-04@origin");
-    let mut carried = release_parents(&lab, "release/2026-08-04");
-    carried.sort();
+fn a_recut_of_a_published_release_requires_a_consumption_statement() {
+    // Given: a dated release has been published, so the next dated name needs
+    // a durable statement of where the earlier release is actually consumed.
+    let (lab, home) = published_release();
 
-    // When: the new dated name the refusal asked for is cut, verbatim.
+    // When: an operator asks for another name without that statement.
     let cut = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
-
-    // Then: it is named with the previous composition, says why an identical
-    // composition was allowed, supersedes the pinned cut, and takes the edit
-    // the old name refused.
     let stdout = String::from_utf8_lossy(&cut.stdout);
-    assert_eq!(
-        cut.status.code(),
-        Some(i32::from(knives::cli::Exit::Ok.code())),
-        "{stdout}"
-    );
-    assert!(
-        stdout.contains(&format!(
-            "demo: release/2026-08-05 starts identical to release/2026-08-04@origin ({}); every pin of release/2026-08-04 is frozen, so this new name is the composition to edit — `include`, `advance`, `drop` or `rebase` it before pushing\n",
-            published.short()
-        )),
-        "{stdout}"
-    );
-    let mut parents = release_parents(&lab, "release/2026-08-05");
-    parents.sort();
-    assert_eq!(parents, carried, "{stdout}");
-    assert!(stdout.contains("reaped release/2026-08-04"), "{stdout}");
-    assert!(!has_release(&lab, "release/2026-08-04"), "{stdout}");
-    let included = knives_release(&lab, &home, &["include", "feat/gamma"]);
-    let included_stdout = String::from_utf8_lossy(&included.stdout);
-    assert!(included.status.success(), "{included_stdout}");
-    let mut parents = release_parents(&lab, "release/2026-08-05");
-    parents.sort();
-    carried.push(commit_at(&lab, "feat/gamma"));
-    carried.sort();
-    assert_eq!(parents, carried, "{included_stdout}");
-}
 
-#[test]
-fn an_identical_cut_is_still_refused_when_a_consumer_follows_the_previous_cut() {
-    // Given: the same published cut, but its consumer follows the branch
-    // (`branch =`), so a repair reaches it in place and a verbatim cut under a
-    // new name would ship nothing.
-    let (lab, home) = published_release_pinned("branch = \"release/2026-08-04\"");
-    let published = commit_at(&lab, "release/2026-08-04@origin");
-
-    // When: a new name is asked for with nothing changed.
-    let cut = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
-
-    // Then: refused as identical, exactly as with no consumer at all.
-    let stdout = String::from_utf8_lossy(&cut.stdout);
+    // Then: it is refused before a redundant name can be created.
     assert_eq!(
         cut.status.code(),
         Some(i32::from(knives::cli::Exit::Incomplete.code())),
         "{stdout}"
     );
     assert!(
-        stdout.contains(&format!(
-            "demo: refusing to cut release/2026-08-05: identical to release/2026-08-04@origin ({}); nothing to cut\n",
-            published.short()
-        )),
+        stdout.contains(
+            "demo: a new dated name ships nothing until a consumer pins it; say where the previous release is pinned and why this cut is needed — `--consumed-by '<where and why>'`"
+        ),
         "{stdout}"
     );
-    assert!(!has_release(&lab, "release/2026-08-05"));
+    let refusal = stdout
+        .find("a new dated name ships nothing until a consumer pins it")
+        .expect("refusal text");
+    let scan = stdout
+        .find("knives' own scan")
+        .expect("informational consumer scan");
+    assert!(
+        stdout.contains("partial and informational")
+            || stdout.contains("knives' own scan unavailable:"),
+        "{stdout}"
+    );
+    assert!(scan > refusal, "{stdout}");
+    assert!(!has_release(&lab, "release/2026-08-05"), "{stdout}");
+}
+
+#[test]
+fn a_missing_consumption_statement_precedes_an_unavailable_consumer_scan() {
+    // Given: a published release and a registered forge consumer whose lookup
+    // fails. The existing release plan therefore cannot complete.
+    let (lab, home) = published_release();
+    std::fs::write(
+        home.path().join("repos.toml"),
+        format!(
+            "[repos.demo]\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/work.git\"\nconsumers = [\"consumer/project\"]\n",
+            lab.upstream.display()
+        ),
+    )
+    .expect("write consumer registry");
+    let shim = tempfile::tempdir().expect("create failing forge");
+    let log = shim.path().join("gh.log");
+    forge_shim::install_failing_gh(shim.path(), &log);
+
+    // When: the new dated release omits its consumption statement.
+    let output = release_command(
+        &lab,
+        &home,
+        ReleaseOutput::Text,
+        &["cut", "release/2026-08-05"],
+    )
+    .env("XDG_CACHE_HOME", shim.path().join("cache"))
+    .env("PATH", forge_shim::path_with_gh_shim(shim.path()))
+    .output()
+    .expect("run cut with a failing consumer lookup");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Then: the local statement requirement wins, while the unavailable scan
+    // remains diagnostic only.
+    assert_eq!(output.status.code(), Some(3), "{stdout}");
+    let refusal = stdout
+        .find("a new dated name ships nothing until a consumer pins it")
+        .expect("missing-statement refusal");
+    let scan = stdout
+        .find("knives' own scan unavailable:")
+        .expect("unavailable consumer scan");
+    assert!(scan > refusal, "{stdout}");
+}
+
+#[test]
+fn a_recut_records_the_consumption_statement_verbatim() {
+    // Given: a published release.
+    let (lab, home) = published_release();
+    let statement = "release/2026-08-04 is pinned by consumer/project.toml:44 at main abcdef0; the new cut contains a repaired library defect";
+
+    // When: the operator states where consumption was checked and why a new
+    // name is needed.
+    let cut = knives_release(
+        &lab,
+        &home,
+        &["cut", "release/2026-08-05", "--consumed-by", statement],
+    );
+    let stdout = String::from_utf8_lossy(&cut.stdout);
+
+    // Then: the statement is printed and preserved in the immutable cut event.
+    assert_eq!(
+        cut.status.code(),
+        Some(i32::from(knives::cli::Exit::Ok.code())),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&cut.stderr)
+    );
+    assert!(stdout.contains(statement), "{stdout}");
+    let entries = knives::ledger::Ledger::at(home.path().join("ledger").join("demo"))
+        .entries()
+        .expect("read ledger");
+    let event = entries
+        .iter()
+        .find(|entry| entry.subject.as_deref() == Some("release/2026-08-05"))
+        .unwrap_or_else(|| panic!("no cut entry: {entries:?}"));
+    assert!(
+        event.text.ends_with(&format!("; consumed by: {statement}")),
+        "was: {}",
+        event.text
+    );
+}
+
+#[test]
+fn an_unpublished_local_recut_still_requires_a_consumption_statement() {
+    // Given: a published predecessor and a later local dated cut. The local
+    // name has not reached any consumer, but it must not hide the published
+    // predecessor when another dated name is requested.
+    let (lab, home) = published_release();
+    let first_recut = knives_release(
+        &lab,
+        &home,
+        &[
+            "cut",
+            "release/2026-08-05",
+            "--consumed-by",
+            "release/2026-08-04 is pinned in the consumer tree; the first recut is needed",
+        ],
+    );
+    assert!(first_recut.status.success(), "{first_recut:?}");
+    lab.fetch_work();
+
+    // When: the next cut omits the statement.
+    let second_recut = knives_release(&lab, &home, &["cut", "release/2026-08-06"]);
+    let stdout = String::from_utf8_lossy(&second_recut.stdout);
+
+    // Then: the published predecessor still requires an explicit judgment.
+    assert_eq!(second_recut.status.code(), Some(3), "{stdout}");
+    assert!(
+        stdout.contains("a new dated name ships nothing until a consumer pins it"),
+        "{stdout}"
+    );
+    assert!(!has_release(&lab, "release/2026-08-06"), "{stdout}");
 }
 
 fn assert_refused_as_not_newest(output: &std::process::Output, name: &str) {
@@ -861,9 +884,9 @@ fn assert_refused_as_not_newest(output: &std::process::Output, name: &str) {
 
 #[test]
 fn a_dated_cut_refuses_a_name_that_does_not_sort_after_the_newest_release() {
-    // Given: a published cut a consumer follows, then a third branch included
-    // locally, so the composition in hand differs from anything published.
-    let (lab, home) = published_release_pinned("branch = \"release/2026-08-04\"");
+    // Given: a published cut, then a third branch included locally, so the
+    // composition in hand differs from anything published.
+    let (lab, home) = published_release();
     lab.branch("feat/gamma", "gamma.txt", "gamma\n");
     let included = knives_release(&lab, &home, &["include", "feat/gamma"]);
     assert!(included.status.success(), "{included:?}");
@@ -882,17 +905,16 @@ fn a_dated_cut_refuses_a_name_that_does_not_sort_after_the_newest_release() {
 }
 
 #[test]
-fn an_identical_cut_under_the_frozen_previous_cuts_own_or_an_older_name_is_refused() {
-    // Given: the published cut every pin freezes — the state whose identical
-    // cut is admitted under a newer name.
-    let (lab, home) = published_release_pinned("rev = \"release/2026-08-04\"");
+fn a_dated_cut_rejects_its_own_or_an_older_name_before_the_consumption_gate() {
+    // Given: a published cut.
+    let (lab, home) = published_release();
     let published = commit_at(&lab, "release/2026-08-04@origin");
 
     for name in ["release/2026-08-04", "release/2026-08-03"] {
         // When: the cut's own name or an older one is asked for, nothing changed.
         let cut = knives_release(&lab, &home, &["cut", name]);
 
-        // Then: the name is refused before the frozen-pin exception can admit it.
+        // Then: name ordering refuses before a consumption statement matters.
         assert_refused_as_not_newest(&cut, name);
     }
     assert!(!has_release(&lab, "release/2026-08-03"));
@@ -925,7 +947,16 @@ fn a_cut_whose_composition_changed_since_publishing_is_named() {
     assert!(include.status.success(), "{include:?}");
 
     // When: a new name is asked for.
-    let second = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
+    let second = knives_release(
+        &lab,
+        &home,
+        &[
+            "cut",
+            "release/2026-08-05",
+            "--consumed-by",
+            "release/2026-08-04 is pinned in the consumer tree; the included member needs a new name",
+        ],
+    );
 
     // Then: the new name lands. The include moved local release/2026-08-04 past
     // its published copy, so the plan reports the two positions' trees differing
@@ -991,7 +1022,16 @@ fn a_cut_whose_member_was_rewritten_with_the_same_content_is_a_new_composition()
     );
 
     // When: a new name is asked for.
-    let second = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
+    let second = knives_release(
+        &lab,
+        &home,
+        &[
+            "cut",
+            "release/2026-08-05",
+            "--consumed-by",
+            "release/2026-08-04 is pinned in the consumer tree; the rewritten parent needs a new name",
+        ],
+    );
 
     // Then: same tree, different parents: the cut lands rather than being refused.
     let stdout = String::from_utf8_lossy(&second.stdout);
@@ -1008,10 +1048,9 @@ fn a_cut_whose_member_was_rewritten_with_the_same_content_is_a_new_composition()
 }
 
 #[test]
-fn a_cut_identical_to_a_published_cut_known_only_remotely_is_refused() {
-    // Given: the newest release is known only as `release/X@origin` (the local
-    // bookmark forgotten after a push — tests/release_edit.rs does this), so
-    // previous_release_for_cut names the remote ref.
+fn a_recut_with_a_remote_only_previous_release_requires_a_consumer_statement() {
+    // Given: the newest release is known only as `release/X@origin` after its
+    // local bookmark was forgotten.
     let lab = Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     lab.branch("feat/beta", "beta.txt", "beta\n");
@@ -1032,16 +1071,17 @@ fn a_cut_identical_to_a_published_cut_known_only_remotely_is_refused() {
     lab.jj_work(["bookmark", "forget", "release/2026-08-04"]);
     lab.fetch_work();
 
-    // When: a new name is asked for.
+    // When: a new dated name is asked for without a consumer statement.
     let second = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
-
-    // Then: the comparison still finds the published copy, named once.
     let stdout = String::from_utf8_lossy(&second.stdout);
+
+    // Then: the remote-only predecessor still requires the statement.
     assert!(
-        stdout.contains("identical to release/2026-08-04@origin ("),
+        stdout.contains(
+            "demo: a new dated name ships nothing until a consumer pins it; say where the previous release is pinned and why this cut is needed — `--consumed-by '<where and why>'`"
+        ),
         "{stdout}"
     );
-    assert!(!stdout.contains("@origin@origin"), "{stdout}");
     assert_eq!(second.status.code(), Some(3), "{stdout}");
 }
 

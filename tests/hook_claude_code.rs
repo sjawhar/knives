@@ -328,6 +328,40 @@ fn compact_session_start_resets_the_notice_budget() {
 }
 
 #[test]
+fn a_bash_fork_command_gets_placement_guidance_once_per_compaction() {
+    // Given: a fork-management Bash command in a managed checkout.
+    let repos = Repositories::new();
+    repos.configure(false);
+    let mut bash = event("post-tool-bash", &repos.alpha, None);
+    bash["tool_input"]["command"] = json!("knives start feat/placement");
+    let compact = event("pre-compact", &repos.alpha, None);
+
+    // When: it runs twice, then Claude Code compacts and it runs again.
+    let first = run_hook(repos.home.path(), &bash);
+    let second = run_hook(repos.home.path(), &bash);
+    let compacted = run_hook(repos.home.path(), &compact);
+    let after_compaction = run_hook(repos.home.path(), &bash);
+
+    // Then: the special guidance spends one flag until the next compaction.
+    assert!(
+        additional_context(&first)
+            .contains("A release no consumer's main pins is rewritten in place"),
+        "first: {first}"
+    );
+    assert!(
+        additional_context(&first).contains("release cut --consumed-by"),
+        "first: {first}"
+    );
+    assert!(second.is_empty(), "second: {second}");
+    assert!(compacted.is_empty(), "compacted: {compacted}");
+    assert!(
+        additional_context(&after_compaction)
+            .contains("A release no consumer's main pins is rewritten in place"),
+        "after compaction: {after_compaction}"
+    );
+}
+
+#[test]
 fn session_start_inside_a_trusted_root_emits_nothing() {
     // Given: Claude Code starts in a trusted root.
     let repos = Repositories::new();

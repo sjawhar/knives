@@ -5,6 +5,8 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+use serde_json::Value;
+
 use crate::commands::claim::{owner_kind_label, render_claim_line};
 use crate::config::GuidanceRoot;
 use crate::jj::WorkspaceActivity;
@@ -25,6 +27,10 @@ pub struct InstructionFile {
 
 const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+const PLACEMENT_FACT: &str = "**A release no consumer's main pins is rewritten in place under the same name; a new name is the exception, and an open PR that mentions the name is not a reason to cut one.**";
+const PLACEMENT_SOURCE: &str = "Source: docs/architecture/facts.md.";
+const PLACEMENT_ACTION: &str = "State the placement judgment in `knives start -m` and, before a dated recut, `knives release cut --consumed-by '<where and why>'`. `knives consumers` reports only its known pin files; that list is partial, so inspect the consumer tree yourself.";
 
 const fn fnv1a(mut hash: u64, mut bytes: &[u8]) -> u64 {
     while let [byte, rest @ ..] = bytes {
@@ -101,6 +107,54 @@ pub fn format_guidance(repo_name: &str, guidance: &Guidance) -> String {
     .join("\n");
 
     format!("\n\n{header}\n{body}\n{footer}")
+}
+
+/// Formats the fork-placement judgment prompt inside an unguessable guidance
+/// envelope. The fact is quoted from the source path, without attribution.
+pub fn format_placement_guidance(repo_name: &str) -> String {
+    let nonce = envelope_nonce();
+    let header = format!(
+        "<knives-guidance-{nonce} repo=\"{}\">",
+        safe_attribute(repo_name)
+    );
+    let footer = format!("</knives-guidance-{nonce}>");
+    format!("\n\n{header}\n{PLACEMENT_FACT}\n{PLACEMENT_SOURCE}\n{PLACEMENT_ACTION}\n{footer}")
+}
+
+/// Whether a Bash invocation is an action that needs a fresh placement
+/// judgment. This recognizes commands after a shell separator without trying
+/// to interpret shell syntax.
+pub fn is_placement_command(tool: Option<&str>, args: Option<&Value>) -> bool {
+    if !tool.is_some_and(|tool| tool.eq_ignore_ascii_case("bash")) {
+        return false;
+    }
+    let Some(command) = args
+        .and_then(|args| args.get("command"))
+        .and_then(Value::as_str)
+    else {
+        return false;
+    };
+    let mut words = command
+        .split(|character: char| {
+            character.is_whitespace()
+                || matches!(character, ';' | '|' | '&' | '(' | ')' | '\'' | '"')
+        })
+        .filter(|word| !word.is_empty());
+    while let Some(word) = words.next() {
+        if word != "knives" {
+            continue;
+        }
+        match words.next() {
+            Some("start") => return true,
+            Some("release")
+                if matches!(words.next(), Some("cut" | "advance" | "include" | "drop")) =>
+            {
+                return true;
+            }
+            Some(_) | None => {}
+        }
+    }
+    false
 }
 
 /// Returns the time-invariant digest of a repository's active claim roster.
@@ -270,7 +324,7 @@ mod tests {
 
     use super::{
         Guidance, InstructionFile, claim_lines, format_guidance, format_notice, guidance_for,
-        notice_digest,
+        is_placement_command, notice_digest,
     };
     use crate::config::GuidanceRoot;
     use crate::seen::Seen;
@@ -382,6 +436,37 @@ mod tests {
         let text = format_guidance("evil\" ><inject>", &guidance);
 
         assert!(!text.contains("<inject>"));
+    }
+
+    #[test]
+    fn fork_management_commands_are_the_placement_guidance_boundary() {
+        // A broad `knives` substring would guide unrelated commands, while
+        // omitting a verb would silently skip a write that needs judgment.
+        for command in [
+            "knives start feat/x",
+            "knives release cut release/2026-08-05",
+            "knives release advance feat/x",
+            "knives release include feat/x",
+            "knives release drop feat/x",
+            "cd work && knives start feat/x",
+        ] {
+            assert!(
+                is_placement_command(Some("Bash"), Some(&serde_json::json!({"command": command}))),
+                "{command}"
+            );
+        }
+        for command in [
+            "knives status",
+            "knives release rebase main",
+            "knives include feat/x",
+            "knives drop feat/x",
+            "not-knives start feat/x",
+        ] {
+            assert!(
+                !is_placement_command(Some("Bash"), Some(&serde_json::json!({"command": command}))),
+                "{command}"
+            );
+        }
     }
 
     #[test]

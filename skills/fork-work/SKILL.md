@@ -100,7 +100,7 @@ Ownership unestablished: investigate, never relabel unsupported bugs as "hardeni
 ## Get your own working copy the managed way
 
 ```
-knives start <branch> --why "what you are doing"
+knives start <branch> --why "what you are doing" -m "where this change belongs and why"
 ```
 
 This claims the branch and creates a jj workspace for it: on the branch's own tip when the
@@ -110,6 +110,10 @@ the release without forcing a rebase. A `start` that pauses is waiting for anoth
 knives command to release the claim lock; let it. A refusal names the holder — the
 `using-knives` skill has the messages. As soon as your active work there stops —
 including when it now waits on something external, such as a pull request in review:
+
+`-m` is optional, but use it when the start carries a placement judgment. It is
+recorded in the branch's durable chronology and shown by `knives status` and
+`knives notch`.
 
 ```
 knives finish <branch>

@@ -70,6 +70,7 @@ pub(super) struct ClaimFoldInput<'a> {
     pub(super) store: &'a Store,
     pub(super) seen: &'a Seen,
     pub(super) tips: &'a crate::detect::BookmarkTips,
+    pub(super) notches: &'a [Notch],
 }
 
 /// Whether anything in the repository still names this branch: a bookmark
@@ -106,6 +107,7 @@ pub(super) fn fold_claims(
         store,
         seen,
         tips,
+        notches,
     } = input;
     let claims: Vec<Claim> = store.claims(Some(name)).into_iter().cloned().collect();
     let wanted: BTreeSet<WorkspaceName> = claims
@@ -176,6 +178,11 @@ pub(super) fn fold_claims(
             since: claim.started.clone(),
             why: claim.why.clone(),
         });
+        row.notch = LastNotch::of(
+            notches
+                .iter()
+                .filter(|notch| notch.subject.as_deref() == Some(claim.branch.as_str())),
+        );
         match claim_last_seen(claim, activity.as_ref(), seen) {
             LastSeen::At(timestamp) => row.last_seen = Some(timestamp.to_string()),
             LastSeen::NoneSinceClaim => {

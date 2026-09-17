@@ -101,8 +101,9 @@ fn seen_cell(row: &BranchRow) -> String {
     }
 }
 
-/// How much of a notch's text a branch line carries.
-const NOTCH_TEXT: usize = 32;
+/// How much of a notch's text a branch line carries. This retains ordinary
+/// placement judgments while keeping an agent's arbitrary message bounded.
+const NOTCH_TEXT: usize = 120;
 
 /// `"text…" (3d @1a2b3c4d5e6f)`: the entry, its age, and the tip it was written
 /// against. The anchor is what lets a reader tell a note that still describes

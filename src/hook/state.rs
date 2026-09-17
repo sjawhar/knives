@@ -14,6 +14,8 @@ const PRUNE_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 pub struct RepoFlags {
     #[serde(default)]
     pub guided: bool,
+    #[serde(default)]
+    pub placement_guided: bool,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -58,6 +60,13 @@ impl SessionState {
 
     pub fn mark_guided(&mut self, root: &Path) {
         self.repos.entry(root.to_owned()).or_default().guided = true;
+    }
+
+    pub fn mark_placement_guided(&mut self, root: &Path) {
+        self.repos
+            .entry(root.to_owned())
+            .or_default()
+            .placement_guided = true;
     }
 
     pub fn record_notice(&mut self, root: &Path, digest: String) {

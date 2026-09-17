@@ -8,9 +8,9 @@
 
 use knives::bind::Fork;
 use knives::cli::Exit;
-use knives::commands::release;
+use knives::commands::{consumers, release};
 use knives::forge::github::CliForge;
-use knives::ids::{BookmarkRef, ReleaseScheme, RemoteName, RepoName};
+use knives::ids::{BookmarkRef, ReleaseScheme, RemoteName, RepoName, is_release_name};
 use knives::ledger::{Draft, Kind, Ledger};
 use knives::release_model::{
     RecordedCut, StackedHistoryContext, carried_branches, last_recorded_cut, members_event_text,
@@ -24,6 +24,7 @@ pub(crate) enum ReleaseInvocation {
     Plan,
     Cut {
         name: Option<String>,
+        consumed_by: Option<String>,
         allow_drop: bool,
     },
 }
@@ -52,11 +53,30 @@ pub(crate) fn run_release(
     let heads = knives::consumer_pins::ConsumerHeadMemo::default();
     let opened = knives::jj::Repo::open(path)?;
     let scheme = entry.release_scheme();
-    let (cut_name, allow_drop) = match requested_cut(invocation, &scheme) {
+    let (cut_name, consumed_by, allow_drop) = match requested_cut(invocation, &scheme) {
         Ok(request) => request,
         Err(exit) => return Ok(exit),
     };
-    let (mut worst, pins) = release_plan_exit(
+    let tips = opened.bookmark_tips()?;
+    if let Some(name) = cut_name.as_deref()
+        && matches!(scheme, ReleaseScheme::Dated)
+        && has_published_predecessor(entry, &tips, name)
+        && consumed_by.is_none_or(|statement| statement.trim().is_empty())
+    {
+        println!(
+            "{repo}: a new dated name ships nothing until a consumer pins it; say where the previous release is pinned and why this cut is needed — `--consumed-by '<where and why>'`"
+        );
+        let inputs = release::ConsumerInputs {
+            slugs: &entry.consumers,
+            locals: &locals,
+            forge: &forge,
+            cache_root: cache_root.as_deref(),
+            heads: &heads,
+        };
+        print_known_pin_report(fork, &inputs);
+        return Ok(Exit::Incomplete);
+    }
+    let mut worst = release_plan_exit(
         fork,
         &locals,
         &opened,
@@ -76,9 +96,14 @@ pub(crate) fn run_release(
         {
             return Ok(exit);
         }
-        let tips = opened.bookmark_tips()?;
         let previous = previous_release_for_cut(entry, &tips);
         let previous_commit = previous.as_ref().map(|(_, commit)| commit.clone());
+        let published_previous = previous.as_ref().and_then(|(previous_ref, _)| {
+            tips.get(&BookmarkRef::Remote {
+                branch: previous_ref.branch().clone(),
+                remote: RemoteName::new(entry.publish_remote()),
+            })
+        });
         // A dated cut takes a name that sorts after the newest release: the reap
         // that follows every dated cut keeps only the newest name, so any other
         // name would be created and taken straight back as superseded in the
@@ -147,41 +172,16 @@ pub(crate) fn run_release(
             trunk: &trunk,
             tips: &tips,
         };
-        // A cut names a composition consumers can pin. When the publish remote
-        // already holds the previous cut with exactly this tree on exactly these
-        // parents, a new name ships nothing and only burns a dated name and a
-        // re-pin nobody asked for. The comparison is against the published copy:
-        // the candidate is a duplicate of the in-hand previous release, so their
-        // trees and parents always match locally.
-        //
-        // The one exception is a previous release every consumer pins by
-        // revision: `include`, `drop`, `advance` and `rebase` all refuse to edit
-        // it, because the edit would reach nobody, and send the operator here.
-        // A verbatim cut under a new dated name is then the only editable
-        // composition, so it is allowed and says why; the edits and the re-pin
-        // follow it. The name has to be genuinely new: a fixed branch has no
-        // other name to take (a dated name that does not sort after the previous
-        // cut was refused above).
+        // A dated cut after a published predecessor has an explicit consumer
+        // statement as its valve. Knives records the statement without trying
+        // to infer where a consumer keeps its pins.
         if let Some((previous_ref, _)) = &previous {
             let publish_remote = entry.publish_remote();
-            let published = tips.get(&BookmarkRef::Remote {
-                branch: previous_ref.branch().clone(),
-                remote: RemoteName::new(publish_remote),
-            });
-            if let Some(published) = published
+            if let Some(published) = published_previous
                 && candidate.matches(published.as_str())?
+                && !(matches!(scheme, ReleaseScheme::Dated) && consumed_by.is_some())
             {
-                let frozen_previous = matches!(scheme, ReleaseScheme::Dated)
-                    && release::repair_effect(&pins, previous_ref.branch(), Some(published))
-                        == release::RepairEffect::NewDatedName;
-                if frozen_previous {
-                    println!(
-                        "{repo}: {name} starts identical to {}@{publish_remote} ({}); every pin of {} is frozen, so this new name is the composition to edit — `include`, `advance`, `drop` or `rebase` it before pushing",
-                        previous_ref.branch(),
-                        published.short(),
-                        previous_ref.branch()
-                    );
-                } else if matches!(scheme, ReleaseScheme::Fixed(_))
+                if matches!(scheme, ReleaseScheme::Fixed(_))
                     && let previous_recorded =
                         last_recorded_cut(&Ledger::for_repo(repo).entries()?, None)
                     && previous_recorded
@@ -213,6 +213,7 @@ pub(crate) fn run_release(
                         created: published,
                         audit: &audit,
                         scheme: &scheme,
+                        consumed_by,
                         recorded: recorded.as_ref(),
                         check: &check,
                     };
@@ -233,14 +234,13 @@ pub(crate) fn run_release(
                         worst = worst.worst(Exit::Findings);
                     }
                     return Ok(worst);
-                } else {
-                    println!(
-                        "{repo}: refusing to cut {name}: identical to {}@{publish_remote} ({}); nothing to cut",
-                        previous_ref.branch(),
-                        published.short()
-                    );
-                    return Ok(Exit::Incomplete);
                 }
+                println!(
+                    "{repo}: refusing to cut {name}: identical to {}@{publish_remote} ({}); nothing to cut",
+                    previous_ref.branch(),
+                    published.short()
+                );
+                return Ok(Exit::Incomplete);
             }
         }
         // An audit error or failure simply DROPS the candidate: the merge
@@ -273,6 +273,7 @@ pub(crate) fn run_release(
             created: &created,
             audit: &audit,
             scheme: &scheme,
+            consumed_by,
             recorded: recorded.as_ref(),
             check: &check,
         };
@@ -282,28 +283,89 @@ pub(crate) fn run_release(
     Ok(worst)
 }
 
-fn requested_cut(
-    invocation: &ReleaseInvocation,
+fn requested_cut<'a>(
+    invocation: &'a ReleaseInvocation,
     scheme: &knives::ids::ReleaseScheme,
-) -> Result<(Option<String>, bool), Exit> {
+) -> Result<(Option<String>, Option<&'a str>, bool), Exit> {
     match invocation {
-        ReleaseInvocation::Plan => Ok((None, false)),
-        ReleaseInvocation::Cut { name, allow_drop } => {
-            match release::cut_name(scheme, name.as_deref()) {
-                Ok(name) => Ok((Some(name), *allow_drop)),
-                Err(message) => {
-                    eprintln!("{message}");
-                    Err(Exit::Usage)
-                }
+        ReleaseInvocation::Plan => Ok((None, None, false)),
+        ReleaseInvocation::Cut {
+            name,
+            consumed_by,
+            allow_drop,
+        } => match release::cut_name(scheme, name.as_deref()) {
+            Ok(name) => Ok((Some(name), consumed_by.as_deref(), *allow_drop)),
+            Err(message) => {
+                eprintln!("{message}");
+                Err(Exit::Usage)
             }
-        }
+        },
     }
 }
 
-/// The plan's exit, and the consumer pins it scanned. The cut judges the pins
-/// itself, against the release it compares the candidate with: when every pin
-/// of that release is frozen, a new dated name is the only editable
-/// composition, so the identical-composition refusal must stand down for it.
+/// Whether a published dated release predates `candidate`.
+///
+/// A newer local release may not yet be published. It cannot hide the earlier
+/// published name whose consumption the next dated cut must state.
+fn has_published_predecessor(
+    entry: &knives::config::RepoEntry,
+    tips: &knives::detect::BookmarkTips,
+    candidate: &str,
+) -> bool {
+    tips.keys().any(|reference| {
+        matches!(
+            reference,
+            BookmarkRef::Remote { remote, .. } if remote.as_str() == entry.publish_remote()
+        ) && is_release_name(reference.branch(), &ReleaseScheme::Dated)
+            && release_order(reference.branch().as_str()) < release_order(candidate)
+    })
+}
+
+/// Print the existing consumer report beside the statement requirement.
+///
+/// The report is informational only: its contents never feed the cut
+/// decision, because the scanner deliberately covers only known root files.
+fn print_known_pin_report(fork: &Fork<'_>, inputs: &release::ConsumerInputs<'_>) {
+    let report = consumers::gather(&consumers::Request {
+        fork,
+        slugs: inputs.slugs,
+        locals: inputs.locals,
+        forge: inputs.forge,
+        cache_root: inputs.cache_root,
+        heads: inputs.heads,
+    });
+    let problems = report
+        .problems
+        .iter()
+        .map(String::as_str)
+        .chain(
+            report
+                .consumers
+                .iter()
+                .filter_map(|consumer| consumer.problem.as_deref()),
+        )
+        .collect::<Vec<_>>();
+    if !problems.is_empty() {
+        println!("  knives' own scan unavailable: {}", problems.join("; "));
+        return;
+    }
+    println!(
+        "  knives' own scan (root pin files only; partial and informational; check the consumer's tree yourself):"
+    );
+    for line in consumers::render(&report).lines() {
+        println!("    {line}");
+    }
+    if report
+        .consumers
+        .iter()
+        .all(|consumer| consumer.pins.is_empty())
+    {
+        println!("    no pins found in the files knives reads");
+    }
+}
+
+/// The plan's exit. It reports consumer information but the cut itself makes
+/// no decision from parsed consumer pins.
 #[allow(
     clippy::too_many_arguments,
     reason = "the release plan needs explicit repository state and each independently owned consumer-scan collaborator"
@@ -315,7 +377,7 @@ fn release_plan_exit(
     forge: &dyn knives::consumer_pins::ConsumerPinSource,
     cache_root: Option<&std::path::Path>,
     heads: &knives::consumer_pins::ConsumerHeadMemo,
-) -> anyhow::Result<(Exit, Vec<knives::pins::Pin>)> {
+) -> anyhow::Result<Exit> {
     let entry = fork.entry;
     let consumers = release::ConsumerInputs {
         slugs: &entry.consumers,
@@ -332,7 +394,7 @@ fn release_plan_exit(
         println!("  !! {lag}");
         exit = exit.worst(Exit::Findings);
     }
-    Ok((exit, plan.pins))
+    Ok(exit)
 }
 
 /// Say what the audit found; refuse when it failed.
@@ -495,6 +557,7 @@ struct CompletedCut<'a> {
     created: &'a knives::ids::CommitId,
     audit: &'a release::CutAudit,
     scheme: &'a ReleaseScheme,
+    consumed_by: Option<&'a str>,
     recorded: Option<&'a RecordedCut>,
     check: &'a release::CompositionCheck,
 }
@@ -556,12 +619,15 @@ fn record_cut_event(
             recorded.members.len()
         )
     });
+    let consumption = cut.consumed_by.map_or_else(String::new, |statement| {
+        format!("; consumed by: {statement}")
+    });
     scribe_for(fork, bound)?.record(&Draft {
         subject: Some(cut.name),
         kind: Kind::Event,
         disposition: None,
         text: format!(
-            "cut {} as {} (change {}) with {} parent(s): {members_text}{delta}",
+            "cut {} as {} (change {}) with {} parent(s): {members_text}{delta}{consumption}",
             cut.name,
             cut.created.short(),
             change.short(),
@@ -571,6 +637,9 @@ fn record_cut_event(
         pr: None,
         parents: recorded_parents(&opened, entry, &parents)?,
     })?;
+    if let Some(statement) = cut.consumed_by {
+        println!("{}: consumed by: {statement}", fork.name);
+    }
     Ok(())
 }
 

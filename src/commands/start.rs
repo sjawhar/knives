@@ -111,6 +111,7 @@ struct StartContext<'a> {
     fork: &'a Fork<'a>,
     branch: &'a BranchName,
     identity: Identity,
+    placement: Option<String>,
     upstream_trunk: String,
     destination: PathBuf,
     workspace: WorkspaceName,
@@ -121,12 +122,13 @@ struct StartContext<'a> {
 /// directory is inside, from which a terminal user's identity is derived.
 #[allow(
     clippy::too_many_arguments,
-    reason = "the fork, the branch, the reason, the override and the cwd binding are independent inputs"
+    reason = "the fork, branch, reason, placement, override, and cwd binding are independent inputs"
 )]
 pub fn run(
     fork: &Fork<'_>,
     branch: &BranchName,
     why: Option<&str>,
+    placement: Option<String>,
     force: bool,
     bound: Option<&RepoName>,
 ) -> anyhow::Result<Exit> {
@@ -146,6 +148,7 @@ pub fn run(
         fork,
         branch,
         identity: current_identity(bound)?,
+        placement,
         upstream_trunk: entry.upstream_trunk(),
         workspace: WorkspaceName::new(workspace_for(branch.as_str())),
         opened: Repo::open(checkout)?,
@@ -291,6 +294,7 @@ fn resume_claim(
     } else {
         "resumed"
     };
+    let recorded_event = event_with_placement(event.to_owned(), context.placement.as_deref());
     Scribe::new(
         Ledger::for_repo(&context.fork.name),
         context.fork.name.clone(),
@@ -299,14 +303,14 @@ fn resume_claim(
     )
     .event(
         Some(context.branch.as_str()),
-        event.to_owned(),
+        recorded_event.clone(),
         context.store.tracked_pull(&BranchTarget::new(
             context.fork.name.clone(),
             context.branch.clone(),
         )),
     )?;
     println!(
-        "{event}\n{}\n{workspace_notice}",
+        "{recorded_event}\n{}\n{workspace_notice}",
         render_claim_context(claim, last_seen, jiff::Timestamp::now()),
     );
     Ok(Exit::Ok)
@@ -384,9 +388,20 @@ fn record_claim(context: &mut StartContext<'_>, reason: &str, event: String) -> 
         context.fork.checkout.path.clone(),
         context.identity.owner.clone(),
     )
-    .event(Some(context.branch.as_str()), event, pull)?;
+    .event(
+        Some(context.branch.as_str()),
+        event_with_placement(event, context.placement.as_deref()),
+        pull,
+    )?;
     context.store.save()?;
     Ok(())
+}
+
+fn event_with_placement(event: String, placement: Option<&str>) -> String {
+    match placement {
+        Some(placement) => format!("{event}; placement: {placement}"),
+        None => event,
+    }
 }
 
 fn resume_workspace_notice(context: &StartContext<'_>) -> String {

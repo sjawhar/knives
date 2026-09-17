@@ -119,6 +119,53 @@ fn start_without_a_release_uses_the_fetched_upstream_trunk() {
 }
 
 #[test]
+fn a_start_placement_note_round_trips_through_status_and_notch() {
+    // Given: a branch start with a placement judgment.
+    let lab = Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let placement = "fork-only deployment adjustment";
+    let started = start_command(&lab, &home, "feat/placement")
+        .args(["-m", placement])
+        .output()
+        .expect("start branch");
+
+    // When: the status and durable chronology are read through the binary.
+    assert!(
+        started.status.success(),
+        "start failed: {}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let status = Command::new(env!("CARGO_BIN_EXE_knives"))
+        .args(["--text", "status", "demo", "--no-github", "--no-landed"])
+        .current_dir(&lab.work)
+        .env("KNIVES_CONFIG_HOME", home.path())
+        .env("HOME", lab.temp_path())
+        .env("JJ_CONFIG", "/dev/null")
+        .output()
+        .expect("read status");
+    let notch = Command::new(env!("CARGO_BIN_EXE_knives"))
+        .args(["--text", "notch", "feat/placement", "--repo", "demo"])
+        .current_dir(&lab.work)
+        .env("KNIVES_CONFIG_HOME", home.path())
+        .env("HOME", lab.temp_path())
+        .env("JJ_CONFIG", "/dev/null")
+        .output()
+        .expect("read notch");
+
+    // Then: both reader surfaces show the agent's unchanged judgment.
+    assert!(
+        String::from_utf8_lossy(&status.stdout).contains(placement),
+        "status: {}",
+        String::from_utf8_lossy(&status.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&notch.stdout).contains(placement),
+        "notch: {}",
+        String::from_utf8_lossy(&notch.stdout)
+    );
+}
+
+#[test]
 fn start_bases_a_new_branch_on_a_flat_releases_fork_point() {
     // Given: a doctrine-flat release — no trunk parent to find — and an
     // upstream that has advanced past the members' fork point.

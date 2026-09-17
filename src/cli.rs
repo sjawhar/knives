@@ -285,6 +285,10 @@ pub enum Command {
         /// What you are doing and why. A claim nobody can read is noise.
         #[arg(long)]
         why: Option<String>,
+        /// The judgment of where this change belongs. Recorded in the branch's
+        /// durable chronology and shown by `status` and `notch`.
+        #[arg(short = 'm', long)]
+        placement: Option<String>,
         /// Replace an existing claim. Requires a new reason for the ledger.
         #[arg(long, requires = "why")]
         force: bool,
@@ -437,6 +441,10 @@ pub enum ReleaseAction {
     Cut {
         /// The dated release name. Omit it for a configured fixed release branch.
         name: Option<String>,
+        /// State where the previous release is consumed and why this new dated
+        /// name is needed. Knives records this statement without validating it.
+        #[arg(long)]
+        consumed_by: Option<String>,
         /// Proceed even when the cut would drop something: commits reachable
         /// only from the previous release lineage, or members the previous
         /// cut's ledger event recorded. The refusal lists exactly what.

@@ -11,7 +11,8 @@ use crate::hook::claude_code::{
     Event, EventKind, POST_TOOL_USE_WIRE_NAME, SESSION_START_WIRE_NAME, response,
 };
 use crate::hook::guidance::{
-    claim_lines, format_guidance, format_notice, guidance_for, notice_digest,
+    claim_lines, format_guidance, format_notice, format_placement_guidance, guidance_for,
+    is_placement_command, notice_digest,
 };
 use crate::hook::opencode::{self, Event as OpenCodeEvent, EventKind as OpenCodeEventKind};
 use crate::hook::resolve::{Match, argument_paths, match_checkout};
@@ -148,11 +149,14 @@ fn opencode_tool_after(event: &OpenCodeEvent, home: &Path) -> anyhow::Result<Str
     let Some(session_id) = event.session_id() else {
         return opencode::tool_response("").map_err(Into::into);
     };
-    let Some((registry, matched)) = relevant_tool_match(&ToolCall {
+    let call = ToolCall {
         tool: event.tool(),
         args: event.args(),
         relevant: OPENCODE_RELEVANT_TOOLS,
-    })?
+    };
+    let placement_requested = is_placement_command(call.tool, call.args);
+    let Some((registry, matched, from_path)) =
+        relevant_or_placement_match(&call, event.cwd(), placement_requested)?
     else {
         return opencode::tool_response("").map_err(Into::into);
     };
@@ -172,10 +176,15 @@ fn opencode_tool_after(event: &OpenCodeEvent, home: &Path) -> anyhow::Result<Str
     let state = SessionState::load(home, OPENCODE, session_id);
     let flags = state.repo(&repo.root);
     let requested = event.parts();
-    let notice = notice_if_requested(&repo, &state, requested.notice && matched.is_managed())?;
-    let guidance = (requested.guidance && matched.trusted && !flags.guided)
+    let notice = notice_if_requested(
+        &repo,
+        &state,
+        requested.notice && matched.is_managed() && from_path,
+    )?;
+    let guidance = (requested.guidance && from_path && matched.trusted && !flags.guided)
         .then(|| guidance_for(&repo, &matched.candidate))
         .flatten();
+    let placement = placement_requested && matched.is_managed() && !flags.placement_guided;
 
     let (notice_text, notice_update) = notice.map_or((None, None), |notice| {
         let (text, update) = notice.into_parts();
@@ -189,6 +198,9 @@ fn opencode_tool_after(event: &OpenCodeEvent, home: &Path) -> anyhow::Result<Str
     if let Some(guidance) = guidance {
         additions.push(format_guidance(&repo.name, &guidance));
     }
+    if placement {
+        additions.push(format_placement_guidance(&repo.name));
+    }
     let addition = additions.join("\n");
     if !addition.is_empty() {
         remember(home, OPENCODE, session_id, move |state| {
@@ -197,6 +209,9 @@ fn opencode_tool_after(event: &OpenCodeEvent, home: &Path) -> anyhow::Result<Str
             }
             if guidance_rendered {
                 state.mark_guided(&repo.root);
+            }
+            if placement {
+                state.mark_placement_guided(&repo.root);
             }
         });
     }
@@ -338,11 +353,14 @@ fn post_tool_use(event: &Event, home: &Path) -> anyhow::Result<Option<String>> {
     let Some(session_id) = event.session_id() else {
         return Ok(None);
     };
-    let Some((registry, matched)) = relevant_tool_match(&ToolCall {
+    let call = ToolCall {
         tool: event.tool_name(),
         args: event.tool_input(),
         relevant: RELEVANT_TOOLS,
-    })?
+    };
+    let placement_requested = is_placement_command(call.tool, call.args);
+    let Some((registry, matched, from_path)) =
+        relevant_or_placement_match(&call, event.cwd(), placement_requested)?
     else {
         return Ok(None);
     };
@@ -361,14 +379,16 @@ fn post_tool_use(event: &Event, home: &Path) -> anyhow::Result<Option<String>> {
     let repo = guidance_root(&matched);
     let state = SessionState::load(home, CLAUDE_CODE, session_id);
     let flags = state.repo(&repo.root);
-    let notice = notice_if_requested(&repo, &state, matched.is_managed())?;
+    let notice = notice_if_requested(&repo, &state, matched.is_managed() && from_path)?;
     let include_notice = notice.is_some();
-    let include_guidance = matched.trusted
+    let include_guidance = from_path
+        && matched.trusted
         && !flags.guided
         && event
             .cwd()
             .is_some_and(|cwd| !contains_cwd(&repo.root, cwd));
-    if !include_notice && !include_guidance {
+    let placement = placement_requested && matched.is_managed() && !flags.placement_guided;
+    if !include_notice && !include_guidance && !placement {
         return Ok(None);
     }
 
@@ -386,6 +406,9 @@ fn post_tool_use(event: &Event, home: &Path) -> anyhow::Result<Option<String>> {
     if let Some(guidance) = &guidance {
         parts.push(format_guidance(&repo.name, guidance));
     }
+    if placement {
+        parts.push(format_placement_guidance(&repo.name));
+    }
     if parts.is_empty() {
         return Ok(None);
     }
@@ -395,6 +418,9 @@ fn post_tool_use(event: &Event, home: &Path) -> anyhow::Result<Option<String>> {
         }
         if guidance.is_some() {
             state.mark_guided(&repo.root);
+        }
+        if placement {
+            state.mark_placement_guided(&repo.root);
         }
     });
     response(POST_TOOL_USE_WIRE_NAME, &parts.join("\n"))
@@ -420,9 +446,27 @@ struct ToolCall<'a> {
     relevant: &'a [&'a str],
 }
 
-/// The touched-path match for a relevant tool call, with the registry it was
-/// decided against — loaded only once there is a path to decide, so a pathless
-/// call never touches (or fails on) the registry.
+/// The touched-path match for a relevant tool call, or the working-directory
+/// match for a fork-management command that has no explicit path.
+fn relevant_or_placement_match(
+    call: &ToolCall<'_>,
+    cwd: Option<&str>,
+    placement_requested: bool,
+) -> anyhow::Result<Option<(Registry, Match, bool)>> {
+    if let Some((registry, matched)) = relevant_tool_match(call)? {
+        return Ok(Some((registry, matched, true)));
+    }
+    if !placement_requested {
+        return Ok(None);
+    }
+    let Some(cwd) = cwd else {
+        return Ok(None);
+    };
+    let registry = load(&default_config_path())?;
+    Ok(match_checkout(&[PathBuf::from(cwd)], &registry).map(|matched| (registry, matched, false)))
+}
+
+/// The touched-path match for a relevant tool call.
 fn relevant_tool_match(call: &ToolCall<'_>) -> anyhow::Result<Option<(Registry, Match)>> {
     let Some(tool) = call.tool else {
         return Ok(None);

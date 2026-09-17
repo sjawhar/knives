@@ -815,6 +815,7 @@ fn fold_phase_outcome(
             store: input.store,
             seen: &seen,
             tips: input.tips,
+            notches: input.notches,
         },
     )?;
     timings.claims = phase.elapsed();

@@ -593,6 +593,42 @@ fn shell_env_returns_no_owner_for_distinct_claim_owners() {
 }
 
 #[test]
+fn a_bash_fork_command_gets_placement_guidance_once_per_compaction() {
+    // Given: a fork-management Bash command with no absolute path argument.
+    let repos = Repositories::new();
+    let event = json!({
+        "event": "tool.execute.after",
+        "session_id": SESSION_ID,
+        "tool": "bash",
+        "args": {"command": "knives release cut release/2026-08-05"},
+        "cwd": repos.beta,
+    });
+
+    // When: it runs twice, then the session compacts and it runs again.
+    let first = run_hook(repos.home.path(), &event);
+    let second = run_hook(repos.home.path(), &event);
+    let compacted = run_hook(
+        repos.home.path(),
+        &json!({"event": "compacting", "session_id": SESSION_ID}),
+    );
+    let after_compaction = run_hook(repos.home.path(), &event);
+
+    // Then: the placement guidance is injected once per compaction epoch.
+    assert!(
+        addition(&first).contains("A release no consumer's main pins is rewritten in place"),
+        "first: {first}"
+    );
+    assert!(addition(&first).contains("start -m"), "first: {first}");
+    assert_eq!(addition(&second), "", "second: {second}");
+    assert_eq!(compacted, json!({}));
+    assert!(
+        addition(&after_compaction)
+            .contains("A release no consumer's main pins is rewritten in place"),
+        "after compaction: {after_compaction}"
+    );
+}
+
+#[test]
 fn compacting_resets_the_tool_after_budget() {
     // Given: a session that has spent its managed-repository budget.
     let repos = Repositories::new();

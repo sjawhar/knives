@@ -148,6 +148,7 @@ fn dispatch() -> anyhow::Result<Exit> {
             branch,
             repo,
             why,
+            placement,
             force,
         } => {
             let ground = grounded(&loaded)?;
@@ -156,7 +157,14 @@ fn dispatch() -> anyhow::Result<Exit> {
             else {
                 return Ok(Exit::Usage);
             };
-            start::run(&fork, &branch, why.as_deref(), force, ground.bound())
+            start::run(
+                &fork,
+                &branch,
+                why.as_deref(),
+                placement,
+                force,
+                ground.bound(),
+            )
         }
         Command::Finish {
             branch,
@@ -542,10 +550,18 @@ fn dispatch_release(
 ) -> anyhow::Result<Exit> {
     match action {
         None => run_release(fork, extra_consumers, &ReleaseInvocation::Plan, bound),
-        Some(ReleaseAction::Cut { name, allow_drop }) => run_release(
+        Some(ReleaseAction::Cut {
+            name,
+            consumed_by,
+            allow_drop,
+        }) => run_release(
             fork,
             extra_consumers,
-            &ReleaseInvocation::Cut { name, allow_drop },
+            &ReleaseInvocation::Cut {
+                name,
+                consumed_by,
+                allow_drop,
+            },
             bound,
         ),
         Some(ReleaseAction::Rebase { reference, no_drop }) => {
