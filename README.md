@@ -306,12 +306,18 @@ numeric repository id (`repositories/<id>/pulls`), a flag gh does not define. Th
 rule folds `www.` off both sides and any subdomain of the registered host onto it
 (`foo.github.com` is `github.com`), a superset of gh's own fold; a registry origin knives reads no
 owner from is refused with its remedy. The checkout's remotes are read as git uses them (`git remote
--v`, `insteadOf` applied; a push URL when the fetch URL names no repository, as gh falls back)
-with ssh aliases resolved through `ssh -G` as gh resolves them. gh's config keys are read as YAML
-keys (ASCII space and tab the only whitespace) at whatever indent the map sits at; any column-0
-`hosts` key in `config.yml` is the hosts region, read or refused, never a fall-through to `hosts.yml`;
-a shape knives cannot read is refused, never zero hosts. A fetch URL gh's parser rejects (an invalid
-`%` escape, whitespace, a backslash) yields to the push URL as it does in gh. With no head stated knives states `--head <fork-owner>:<branch in hand>`
+-v`, `insteadOf` applied) with ssh aliases resolved through `ssh -G` as gh resolves them, each by
+one canonical remote grammar — `http(s)://`/`ssh://[user@]HOST[:PORT]/OWNER/REPO[.git]` or
+`[user@]HOST:OWNER/REPO[.git]`, with no `%`, `?`, `#`, whitespace, empty host, port or segment
+anywhere — the fetch URL when readable, else the last readable push URL (gh's own fallback), else a
+local path; a remote with no readable URL leaves the target uncertifiable and is refused with the
+`-R` remedy, and a registry remote outside the grammar is a configuration error at load. gh's
+`config.yml` and `hosts.yml` are read whole, in the grammar gh writes (block mappings, keys of
+`[A-Za-z0-9._:-]` behind one quote layer, space indentation, `# comments`, `key: {}`, one document);
+the first line outside it in either file makes the default host unknown — refused naming the file
+and line, never read past, never a fall-through to the other file — and a `hosts` heading in
+`config.yml` is the hosts region, read or refused. The cost, by design, is a hand-edited file gh
+reads that knives refuses; the remedy is in the refusal. With no head stated knives states `--head <fork-owner>:<branch in hand>`
 itself, in jj and plain-git checkouts alike, so gh never resolves a head knives did not read. A
 document read from a file, a gh alias, and a gh extension are not inspected: the gate
 reads gh's own verbs. A token is routed only for a canonical owner on a host that folds to
