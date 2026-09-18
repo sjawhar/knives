@@ -294,7 +294,7 @@ verb lookup and pflag's flag grammar over gh 2.98.0's own flag tables: flags any
 line, clusters expanded, aliases normalised, `--` ending flags, a switch's `=value` a Go bool
 (`--help=false` runs the command). The comparison does not reproduce gh's or GitHub's
 normalisation: knives compares only what it can read byte for byte — a repository as
-`OWNER/REPO` or `HOST/OWNER/REPO` (segments of `[A-Za-z0-9._-]`; a two-part spelling on `GH_HOST`,
+`OWNER/REPO` or `HOST/OWNER/REPO` (segments of `[A-Za-z0-9._-]`; only a two-part spelling asks for gh's default host — `GH_HOST`,
 else the one host gh is configured for — `config.yml`'s `hosts:` block, else `hosts.yml` — else
 `github.com`), a head as `<fork-owner>:<branch>`, an endpoint as `repos/OWNER/REPO/pulls` —
 and refuses every other spelling toward a registered upstream with the canonical one: a URL-form or
