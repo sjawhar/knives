@@ -484,9 +484,11 @@ pub enum ReleaseAction {
     ///
     /// A branch entering the release for the first time needs the placement
     /// verdict `knives start --placement` recorded, and not a `CONSUMER` one; a
-    /// member some cut or edit already carried passes unasked. The gate is a
-    /// branch gate: a bare commit id, which no `start` ever named, is included
-    /// on your word.
+    /// member some cut or edit already carried, or one this release carries
+    /// now, passes unasked. The gate is a branch gate, read from the bookmarks
+    /// at the commit — local or `<name>@<remote>`, whatever spelling named it,
+    /// a branch name or the sha its tip happens to be. A commit no bookmark
+    /// names is a bare commit no `start` ever named, included on your word.
     Include {
         /// A branch name, or any revision when no bookmark fits.
         branch: String,
@@ -522,7 +524,11 @@ pub enum ReleaseAction {
     ///
     /// A name entering the release for the first time — a branch stacked on a
     /// member's tip, or one admitted on `--from`'s word — is gated on its
-    /// placement verdict exactly as an `include` is.
+    /// placement verdict exactly as an `include` is; every refused name is
+    /// reported and nothing moves, since moving the rest would deliver a
+    /// composition nobody asked for. A member the release carries now — its
+    /// tip at a parent, or grown past a parent nothing else holds — is an
+    /// existing member whatever the ledger recorded of its cut.
     Advance {
         /// Branches to advance. Empty means every member that has advanced.
         branches: Vec<String>,

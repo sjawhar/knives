@@ -187,18 +187,84 @@ impl EditContext<'_> {
 }
 
 impl EditContext<'_> {
-    /// Refuse, saying why, a branch entering the release without a placement
-    /// verdict behind it; `false` for one that may enter.
+    /// Whether the release in hand carries the branch at `tip` now, by the
+    /// repository's own evidence: the tip is a parent, or it succeeds a parent
+    /// no carried bookmark still holds — the member grew or was rebased, and
+    /// its old parent stands vacated behind it. A branch stacked on a member
+    /// still at its tip also succeeds that parent, but the member's bookmark
+    /// holds it, so the stacked branch is what it looks like: a new one.
+    ///
+    /// This is what grandfathers a member whose cut predates the ledger's
+    /// parent records — a release with members and no `[[parents]]` block in
+    /// any event, or with no cut event at all — where `composed` has nothing
+    /// to read.
+    fn currently_member(
+        &self,
+        tip: &knives::ids::CommitId,
+        carried: &[(String, knives::ids::CommitId)],
+    ) -> anyhow::Result<bool> {
+        if self.release.parents.contains(tip) {
+            return Ok(true);
+        }
+        let succession = MemberSuccession::of(self.opened, &self.release.trunk_tips, tip)?;
+        for parent in &self.release.parents {
+            if succession.succeeds(parent)? && !carried.iter().any(|(_, held)| held == parent) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Why the branch `name` at `tip` may not enter the release, or `None` when
+    /// it may.
     ///
     /// A fork member states the non-fork alternative it rejected before it
     /// exists (`knives start --placement`), and the release reads that
     /// statement back here rather than the author's summary. Grandfathering:
     /// the gate arrived with members already in releases and no note behind
-    /// them, so a branch any recorded cut or edit named as a parent is an
-    /// existing member and passes — a recut carries it, `advance` moves it.
-    /// Only a branch no composition has ever carried is a new inclusion.
-    fn refuse_unplaced(&self, branch: &str) -> anyhow::Result<bool> {
-        let Some(refusal) = knives::placement::member_refusal(self.ledger, branch)? else {
+    /// them, so a branch any recorded cut or edit named as a parent, or one the
+    /// release in hand carries now ([`Self::currently_member`]), is an existing
+    /// member and passes — a recut carries it, `advance` moves it. Only a
+    /// branch no composition has ever carried is a new inclusion.
+    fn unplaced_refusal(
+        &self,
+        name: &str,
+        tip: &knives::ids::CommitId,
+        carried: &[(String, knives::ids::CommitId)],
+    ) -> anyhow::Result<Option<String>> {
+        Ok(knives::placement::member_refusal(
+            self.ledger,
+            name,
+            self.currently_member(tip, carried)?,
+        )?)
+    }
+
+    /// Refuse, saying why, a commit entering the release without a placement
+    /// verdict behind the branch that names it; `false` for one that may enter.
+    ///
+    /// The gate is a branch gate: `names` are every bookmark at the commit,
+    /// local or remote, and one of them with a verdict — or already a member —
+    /// answers for the commit. A commit no bookmark names is a bare commit no
+    /// `start` ever named, included on the caller's word. When every name
+    /// refuses, a `CONSUMER` verdict is the reason given — it is a ruling, where
+    /// a missing verdict is an absence — else the first name's.
+    fn refuse_unplaced_commit(
+        &self,
+        names: &[String],
+        tip: &knives::ids::CommitId,
+        carried: &[(String, knives::ids::CommitId)],
+    ) -> anyhow::Result<bool> {
+        let mut refusals = Vec::new();
+        for name in names {
+            match self.unplaced_refusal(name, tip, carried)? {
+                None => return Ok(false),
+                Some(refusal) => refusals.push(refusal),
+            }
+        }
+        let consumer = refusals
+            .iter()
+            .find(|refusal| *refusal == knives::placement::CONSUMER_REFUSAL);
+        let Some(refusal) = consumer.or_else(|| refusals.first()) else {
             return Ok(false);
         };
         println!("{}: {refusal}", self.repo);
@@ -334,7 +400,9 @@ fn edit_release(
         },
     };
     let outcome = match change {
-        ReleaseEdit::Include { branch, why } => include_edit(&context, branch, why.as_deref())?,
+        ReleaseEdit::Include { branch, why } => {
+            include_edit(&context, entry, branch, why.as_deref())?
+        }
         ReleaseEdit::Drop { branch, why } => drop_edit(&context, branch, why)?,
         ReleaseEdit::Advance { branches, from } => {
             advance_edit(&context, entry, branches, from.as_deref())?
@@ -480,6 +548,7 @@ pub(crate) fn release_is_locally_movable(
 
 fn include_edit(
     context: &EditContext<'_>,
+    entry: &knives::config::RepoEntry,
     target: &str,
     why: Option<&str>,
 ) -> anyhow::Result<EditOutcome> {
@@ -567,9 +636,20 @@ fn include_edit(
     }
     // Everything above answered "is it already a member"; this is a new
     // inclusion, the one act the placement verdict gates. The gate is a branch
-    // gate — the verdict was stated when the branch was started — so a bare
-    // commit id, which no `start` ever named, is included on the caller's word.
-    if opened.local_bookmark_tip(target).is_some() && context.refuse_unplaced(target)? {
+    // gate — the verdict was stated when the branch was started — so it reads
+    // the bookmarks at the commit, local or remote, whatever spelling named it:
+    // a branch name, `<name>@<remote>`, or the sha a branch's tip happens to
+    // be. A commit no bookmark names is a bare commit no `start` ever named,
+    // included on the caller's word.
+    let tips = opened.bookmark_tips()?;
+    let mut names =
+        knives::release_model::branch_names_at(&tips, entry.trunk(), &entry.release_scheme(), &tip);
+    // The name the caller used answers first when it is one of them.
+    if let Some(index) = names.iter().position(|name| name == target) {
+        names.swap(0, index);
+    }
+    let carried = carried_from_tips(&tips, entry.trunk(), &entry.release_scheme());
+    if context.refuse_unplaced_commit(&names, &tip, &carried)? {
         return Ok(EditOutcome::Settled(Exit::Incomplete));
     }
     let mut parents = release.parents.clone();
@@ -689,12 +769,37 @@ fn advance_edit(
     // itself does, so a name `moved` carries may be entering the release for
     // the first time — stacked on a member's tip, or admitted on `--from`'s
     // word — and then it is gated exactly as an `include` is. A name some cut
-    // or edit already recorded passes unasked, so genuine members are
-    // untouched.
+    // or edit already recorded, or one the release carries now, passes
+    // unasked, so genuine members are untouched. Every refused name is
+    // reported and nothing moves: a bare `advance` promises every advanced
+    // member, and moving some while refusing others would deliver a
+    // composition nobody asked for while reporting success.
+    let mut refusals = Vec::new();
     for branch in &moved {
-        if context.refuse_unplaced(branch)? {
-            return Ok(EditOutcome::Settled(Exit::Incomplete));
+        // Every moved name is a carried bookmark; were one not, it has no tip
+        // to be a current member by, and the ledger alone answers for it.
+        let held = carried.iter().find(|(name, _)| name == branch);
+        let refusal = match held {
+            Some((_, tip)) => context.unplaced_refusal(branch, tip, &carried)?,
+            None => knives::placement::member_refusal(context.ledger, branch, false)?,
+        };
+        if let Some(refusal) = refusal {
+            refusals.push(refusal);
         }
+    }
+    if !refusals.is_empty() {
+        for refusal in &refusals {
+            println!("{}: {refusal}", context.repo);
+        }
+        println!(
+            "{}: nothing advanced; {} of {} branch(es) would enter {} for the first time \
+             without a placement verdict",
+            context.repo,
+            refusals.len(),
+            moved.len(),
+            context.release.name
+        );
+        return Ok(EditOutcome::Settled(Exit::Incomplete));
     }
     if moved.is_empty() {
         // Only a bare advance looked at every member, so only it can say so; a

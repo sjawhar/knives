@@ -21,7 +21,7 @@ mod lab;
 
 use knives::ledger::{Kind, Ledger};
 use knives::placement::{
-    CONSUMER_REFUSAL, Verdict, forcing_question, missing_member_refusal, recorded,
+    CONSUMER_REFUSAL, Verdict, forcing_question, missing_member_refusal, notch_remedy, recorded,
 };
 use lab::{
     Lab, home_after_first_cut, knives, knives_command, knives_release, placement_file,
@@ -435,10 +435,17 @@ fn advance_refuses_a_never_composed_branch_that_succeeds_a_member_by_ancestry() 
 
         // Then: refused as a first-time member; the release is untouched.
         assert_eq!(output.status.code(), Some(3), "{args:?}: {output:?}");
-        assert_eq!(
-            String::from_utf8_lossy(&output.stdout).trim_end(),
-            format!("demo: {}", missing_member_refusal("feat/sneaky")),
-            "{args:?}"
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.starts_with(&format!(
+                "demo: {}\n",
+                missing_member_refusal("feat/sneaky")
+            )),
+            "{args:?}: {stdout}"
+        );
+        assert!(
+            stdout.contains("nothing advanced; 1 of 1 branch(es)"),
+            "{args:?}: {stdout}"
         );
         assert_eq!(
             release_parents(&lab, "release/2026-08-04"),
@@ -516,20 +523,215 @@ fn a_prose_placement_note_is_ordinary_and_an_unknown_verdict_names_the_branch_an
     notch("placement: verdict: MAYBE\nalternative: none");
     let unknown = knives_release(&lab, &home, &["include", "feat/gamma"]);
 
-    // Then: that is an error, and it names the branch and the way forward.
+    // Then: that is an error, and it names the branch and the way forward —
+    // both lines the tool reads, since a one-line notch is itself refused —
+    // and says it once.
     assert_eq!(unknown.status.code(), Some(3), "{unknown:?}");
     let stderr = String::from_utf8_lossy(&unknown.stderr);
     assert!(
         stderr.contains("feat/gamma's newest placement note is not a verdict knives can read"),
         "{stderr}"
     );
-    assert!(
-        stderr.contains("knives notch feat/gamma -m \"placement: verdict:"),
-        "{stderr}"
+    assert!(stderr.contains(&notch_remedy("feat/gamma")), "{stderr}");
+    assert_eq!(
+        stderr.matches("the first line was").count(),
+        1,
+        "the cause is printed once: {stderr}"
     );
 
-    // And: the remedy works — the newest verdict is read.
+    // And: a one-line notch — the verdict without its alternative — is the
+    // same error, so the remedy must show both lines; following it works.
+    notch("placement: verdict: FORK");
+    let bare = knives_release(&lab, &home, &["include", "feat/gamma"]);
+    assert_eq!(bare.status.code(), Some(3), "{bare:?}");
+    assert!(
+        String::from_utf8_lossy(&bare.stderr).contains("`alternative:` line"),
+        "{bare:?}"
+    );
     notch("placement: verdict: FORK\nalternative: none");
     let included = knives_release(&lab, &home, &["include", "feat/gamma"]);
     assert!(included.status.success(), "{included:?}");
+}
+
+#[test]
+fn include_gates_the_branch_whatever_spelling_names_its_commit() {
+    // The gate is a branch gate, read from the bookmarks at the commit: a
+    // remote-only ref (a colleague's pushed branch), the sha a branch's tip
+    // happens to be, and a bare commit nothing names.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let (home, _consumer) = home_after_first_cut(&lab);
+    lab.foreign_origin_branch("main@origin", "pushed-fix", "remote\n");
+    lab.fetch_work();
+    lab.branch("feat/gamma", "gamma.txt", "gamma\n");
+    let gamma = lab::commit_at(&lab, "feat/gamma");
+    let before = release_parents(&lab, "release/2026-08-04");
+
+    // When: the pushed branch is included by its remote spelling.
+    let remote = knives_release(&lab, &home, &["include", "pushed-fix@origin"]);
+
+    // Then: refused as the branch it is, by its branch name.
+    assert_eq!(remote.status.code(), Some(3), "{remote:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&remote.stdout).trim_end(),
+        format!("demo: {}", missing_member_refusal("pushed-fix"))
+    );
+
+    // When: an unverdicted branch's tip is included by its sha.
+    let by_sha = knives_release(&lab, &home, &["include", gamma.as_str()]);
+
+    // Then: the sha is that branch, and refused as it.
+    assert_eq!(by_sha.status.code(), Some(3), "{by_sha:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&by_sha.stdout).trim_end(),
+        format!("demo: {}", missing_member_refusal("feat/gamma"))
+    );
+    assert_eq!(release_parents(&lab, "release/2026-08-04"), before);
+
+    // When: the pushed branch has a verdict and is included again.
+    state_placement(&lab, &home, "pushed-fix", "FORK");
+    let included = knives_release(&lab, &home, &["include", "pushed-fix@origin"]);
+
+    // Then: it joins, and the record carries its branch name — so a later
+    // track and advance find it an existing member.
+    assert!(included.status.success(), "{included:?}");
+    let entries = ledger(&home).entries().expect("read ledger");
+    let recorded = knives::release_model::last_recorded_parents(&entries, "release/2026-08-04");
+    assert!(
+        recorded
+            .iter()
+            .any(|parent| parent.branches.iter().any(|name| name == "pushed-fix")),
+        "the remote branch's name was not recorded: {recorded:?}"
+    );
+    assert!(knives::placement::composed(&entries, "pushed-fix"));
+}
+
+#[test]
+fn a_member_of_a_release_with_no_parent_record_is_grandfathered_by_the_repository() {
+    // Given: a release whose cut left no record behind — the ledger of a
+    // release cut before parent records existed, or with no cut event at all —
+    // and a member that has since grown.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let (home, _consumer) = home_after_first_cut(&lab);
+    std::fs::remove_dir_all(home.path().join("ledger")).expect("forget the cut record");
+    lab::extend_branch(&lab, "feat/alpha", "alpha2.txt", "more alpha\n");
+
+    // When: it is advanced by name, with no verdict anywhere.
+    let named = knives_release(&lab, &home, &["advance", "feat/alpha"]);
+
+    // Then: the release in hand carries it — its old parent stands vacated
+    // behind its tip — and it moves unasked.
+    assert!(named.status.success(), "{named:?}");
+    assert!(
+        String::from_utf8_lossy(&named.stdout).contains("advanced feat/alpha"),
+        "{named:?}"
+    );
+
+    // And: a bare advance treats the other member the same way.
+    std::fs::remove_dir_all(home.path().join("ledger")).expect("forget the advance record");
+    lab::extend_branch(&lab, "feat/beta", "beta2.txt", "more beta\n");
+    let bare = knives_release(&lab, &home, &["advance"]);
+    assert!(bare.status.success(), "{bare:?}");
+    assert!(
+        String::from_utf8_lossy(&bare.stdout).contains("advanced feat/beta"),
+        "{bare:?}"
+    );
+
+    // But: a branch stacked on a member still at its tip is not that member,
+    // whatever the ledger lacks.
+    lab.jj_work(["new", "feat/alpha", "-m", "sneaky"]);
+    std::fs::write(lab.work.join("sneaky.txt"), "x\n").expect("write sneaky");
+    lab.jj_work(["bookmark", "create", "feat/sneaky", "-r", "@"]);
+    lab.jj_work(["new"]);
+    let sneaky = knives_release(&lab, &home, &["advance", "feat/sneaky"]);
+    assert_eq!(sneaky.status.code(), Some(3), "{sneaky:?}");
+    assert!(
+        String::from_utf8_lossy(&sneaky.stdout).contains(&missing_member_refusal("feat/sneaky")),
+        "{sneaky:?}"
+    );
+}
+
+#[test]
+fn advance_names_every_unplaced_branch_and_moves_nothing() {
+    // Given: two members, each with an unverdicted branch stacked on its tip.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let (home, _consumer) = home_after_first_cut(&lab);
+    for (base, name) in [
+        ("feat/alpha", "feat/sneaky-a"),
+        ("feat/beta", "feat/sneaky-b"),
+    ] {
+        lab.jj_work(["new", base, "-m", name]);
+        std::fs::write(
+            lab.work.join(format!("{}.txt", name.replace('/', "-"))),
+            "x\n",
+        )
+        .expect("write stacked");
+        lab.jj_work(["bookmark", "create", name, "-r", "@"]);
+        lab.jj_work(["new"]);
+    }
+    let before = release_parents(&lab, "release/2026-08-04");
+
+    // When: a bare advance finds both.
+    let output = knives_release(&lab, &home, &["advance"]);
+
+    // Then: every refused name is reported, nothing moves, and the summary
+    // counts them.
+    assert_eq!(output.status.code(), Some(3), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(&missing_member_refusal("feat/sneaky-a")),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(&missing_member_refusal("feat/sneaky-b")),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("nothing advanced; 2 of 2 branch(es) would enter release/2026-08-04"),
+        "{stdout}"
+    );
+    assert_eq!(release_parents(&lab, "release/2026-08-04"), before);
+
+    // And: with one placed, the other still holds everything back.
+    state_placement(&lab, &home, "feat/sneaky-a", "FORK");
+    let partial = knives_release(&lab, &home, &["advance"]);
+    assert_eq!(partial.status.code(), Some(3), "{partial:?}");
+    assert!(
+        String::from_utf8_lossy(&partial.stdout)
+            .contains("nothing advanced; 1 of 2 branch(es) would enter"),
+        "{partial:?}"
+    );
+    assert_eq!(release_parents(&lab, "release/2026-08-04"), before);
+}
+
+#[test]
+fn advance_from_refuses_an_unplaced_first_time_name() {
+    // Given: a release with alpha, and a branch that is not a member rebuilt
+    // with no history back to any parent.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let (home, _consumer) = home_after_first_cut(&lab);
+    let old_alpha = lab::commit_at(&lab, "feat/alpha");
+    lab.branch("feat/gamma", "gamma.txt", "gamma\n");
+    let before = release_parents(&lab, "release/2026-08-04");
+
+    // When: `--from` asserts gamma replaces alpha's parent, on the caller's
+    // word alone.
+    let output = knives_release(
+        &lab,
+        &home,
+        &["advance", "feat/gamma", "--from", old_alpha.as_str()],
+    );
+
+    // Then: a first-time name is gated like an include; nothing moved.
+    assert_eq!(output.status.code(), Some(3), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains(&missing_member_refusal("feat/gamma")),
+        "{output:?}"
+    );
+    assert_eq!(release_parents(&lab, "release/2026-08-04"), before);
 }

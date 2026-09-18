@@ -126,8 +126,9 @@ pub struct Entry {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecordedParent {
     pub commit: String,
-    /// Every local bookmark at the commit when the event was written; empty for
-    /// a parent nothing named.
+    /// Every branch name at the commit when the event was written — local
+    /// bookmarks and remote refs alike, by branch name; empty for a parent
+    /// nothing named.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub branches: Vec<String>,
 }

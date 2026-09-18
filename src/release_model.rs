@@ -594,8 +594,37 @@ pub struct RecordedCut {
     pub members: Vec<CommitId>,
 }
 
-/// The parent set a cut or edit records: each parent with every carried branch
-/// at its commit when the record was written.
+/// Every branch name at `commit`: local bookmarks and remote refs alike, a
+/// remote one by its branch name with `@<remote>` dropped, less the trunk and
+/// the release names; deduplicated, in name order.
+///
+/// A branch another clone pushed is `<name>@origin` here until someone tracks
+/// it, and it is that branch — the one a `start` named — whichever ref holds
+/// it. What names a commit decides whether an `include` is a branch entering
+/// the release (gated on its verdict) or a bare commit nothing names, and is
+/// what a cut or edit records so the member is known later.
+pub fn branch_names_at(
+    tips: &BookmarkTips,
+    trunk: &str,
+    scheme: &ReleaseScheme,
+    commit: &CommitId,
+) -> Vec<String> {
+    let mut names: Vec<String> = tips
+        .iter()
+        .filter(|(_, tip)| *tip == commit)
+        .map(|(reference, _)| match reference {
+            BookmarkRef::Local(branch) | BookmarkRef::Remote { branch, .. } => branch,
+        })
+        .filter(|branch| !is_release_name(branch, scheme) && branch.as_str() != trunk)
+        .map(ToString::to_string)
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// The parent set a cut or edit records: each parent with every branch at its
+/// commit when the record was written ([`branch_names_at`]).
 ///
 /// Every name is kept, not the first. A parent's branch may share its tip with
 /// an anchor bookmark another agent set (`keep/…`, `anchor/…`), and a record
@@ -608,16 +637,11 @@ pub fn parents_with_branches(
     scheme: &ReleaseScheme,
     parents: &[CommitId],
 ) -> Vec<RecordedParent> {
-    let carried = carried_from_tips(tips, trunk, scheme);
     parents
         .iter()
         .map(|commit| RecordedParent {
             commit: commit.as_str().to_owned(),
-            branches: carried
-                .iter()
-                .filter(|(_, tip)| tip == commit)
-                .map(|(branch, _)| branch.clone())
-                .collect(),
+            branches: branch_names_at(tips, trunk, scheme, commit),
         })
         .collect()
 }

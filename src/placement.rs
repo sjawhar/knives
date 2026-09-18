@@ -12,9 +12,10 @@
 //!
 //! The verdict file is written by a placement red-team — an adversarial
 //! reviewer whose job is to argue against the fork change; the `fork-work`
-//! skill carries its brief. knives stores the file and reads one line of it:
-//! the first, `verdict: CONSUMER | FORK | UPSTREAM`. The rest is prose for the
-//! next reader (`alternative:`, `class:`, `judge:`, free text).
+//! skill carries its brief. knives stores the file and reads two lines of it:
+//! the first, `verdict: CONSUMER | FORK | UPSTREAM`, and an `alternative:` line
+//! naming the non-fork mechanism the branch rejected. The rest is prose for
+//! the next reader (`class:`, `judge:`, free text).
 
 use crate::ledger::{Entry, Kind};
 
@@ -94,17 +95,25 @@ pub enum PlacementError {
          none was given"
     )]
     Alternative,
-    /// A ledger note that carries the marker but a verdict token knives does
-    /// not know: named so the reader knows which branch, and how to move on.
+    /// A ledger note that carries the marker but no verdict knives can read:
+    /// named so the reader knows which branch, and how to move on. The cause is
+    /// part of the message and not a chained source — a field named `source`
+    /// would be one implicitly — so it renders once.
     #[error(
-        "{branch}'s newest placement note is not a verdict knives can read ({source}); record a \
-         newer one with `knives notch {branch} -m \"placement: verdict: CONSUMER | FORK | UPSTREAM …\"`"
+        "{branch}'s newest placement note is not a verdict knives can read ({cause}); record a \
+         newer one with `{}`",
+        notch_remedy(branch)
     )]
-    Note {
-        branch: String,
-        #[source]
-        source: Box<Self>,
-    },
+    Note { branch: String, cause: Box<Self> },
+}
+
+/// The command that records a verdict on `branch` by hand: both lines the
+/// tool reads, since a note with the first alone is refused.
+pub fn notch_remedy(branch: &str) -> String {
+    format!(
+        "knives notch {branch} -m $'placement: verdict: CONSUMER | FORK | UPSTREAM\\nalternative: \
+         <the non-fork mechanism it rejected>'"
+    )
 }
 
 impl Placement {
@@ -157,9 +166,9 @@ pub fn recorded(entries: &[Entry], branch: &str) -> Option<Result<Placement, Pla
         .filter(|entry| entry.text.starts_with(NOTE_PREFIX))
         .find_map(|entry| entry.text.strip_prefix(NOTE_LEAD))
         .map(|body| {
-            Placement::parse(body).map_err(|source| PlacementError::Note {
+            Placement::parse(body).map_err(|cause| PlacementError::Note {
                 branch: branch.to_owned(),
-                source: Box::new(source),
+                cause: Box::new(cause),
             })
         })
 }
@@ -210,16 +219,24 @@ pub fn not_upstream_refusal(branch: &str, verdict: Verdict) -> String {
 ///
 /// A recorded verdict decides first, whatever the branch's age: the newest
 /// one wins, and `CONSUMER` refuses even a member some composition already
-/// carried. Only a branch with no verdict at all falls back to grandfathering
-/// (see [`composed`]); a new one with none is refused.
-pub fn member_refusal(entries: &[Entry], branch: &str) -> Result<Option<String>, PlacementError> {
+/// carried. Only a branch with no verdict at all falls back to grandfathering:
+/// a name some recorded composition carried (see [`composed`]), or one the
+/// caller found the release in hand carrying now (`current_member` — its tip at
+/// a parent, or succeeding a parent nothing else holds; the repository's own
+/// evidence, for members whose cut predates the ledger's parent records). A
+/// new one with none is refused.
+pub fn member_refusal(
+    entries: &[Entry],
+    branch: &str,
+    current_member: bool,
+) -> Result<Option<String>, PlacementError> {
     match recorded(entries, branch) {
         Some(Err(error)) => Err(error),
         Some(Ok(placement)) if placement.verdict == Verdict::Consumer => {
             Ok(Some(CONSUMER_REFUSAL.to_owned()))
         }
         Some(Ok(_)) => Ok(None),
-        None if composed(entries, branch) => Ok(None),
+        None if current_member || composed(entries, branch) => Ok(None),
         None => Ok(Some(missing_member_refusal(branch))),
     }
 }
@@ -341,17 +358,22 @@ mod tests {
         let error = recorded(&entries, "feat/a").unwrap().unwrap_err();
         assert!(matches!(
             &error,
-            PlacementError::Note { branch, source }
-                if branch == "feat/a" && matches!(**source, PlacementError::Verdict(_))
+            PlacementError::Note { branch, cause }
+                if branch == "feat/a" && matches!(**cause, PlacementError::Verdict(_))
         ));
         let text = error.to_string();
         assert!(text.contains("feat/a's newest placement note"), "{text}");
+        assert!(text.contains(&notch_remedy("feat/a")), "{text}");
         assert!(
-            text.contains("knives notch feat/a -m \"placement: verdict:"),
-            "{text}"
+            text.contains("placement: verdict: CONSUMER | FORK | UPSTREAM\\nalternative: "),
+            "the remedy shows both lines the tool reads: {text}"
         );
         assert!(text.contains("\"verdict: MAYBE\""), "{text}");
-        assert!(member_refusal(&entries, "feat/a").is_err());
+        // The cause is in the message once; anyhow's chain adds nothing.
+        let rendered = format!("{:#}", anyhow::Error::from(error));
+        assert_eq!(rendered.matches("verdict: MAYBE").count(), 1, "{rendered}");
+        assert!(member_refusal(&entries, "feat/a", false).is_err());
+        assert!(member_refusal(&entries, "feat/a", true).is_err());
         assert!(upstream_pull_refusal(&entries, "feat/a").is_err());
     }
 
@@ -381,7 +403,7 @@ mod tests {
     #[test]
     fn a_member_needs_a_verdict_that_is_not_consumer_unless_already_composed() {
         assert_eq!(
-            member_refusal(&[], "feat/new").unwrap(),
+            member_refusal(&[], "feat/new", false).unwrap(),
             Some(missing_member_refusal("feat/new"))
         );
         assert_eq!(
@@ -390,7 +412,8 @@ mod tests {
                     "feat/new",
                     "placement: verdict: CONSUMER\nalternative: a config value"
                 )],
-                "feat/new"
+                "feat/new",
+                false
             )
             .unwrap(),
             Some(CONSUMER_REFUSAL.to_owned())
@@ -401,34 +424,39 @@ mod tests {
                     "feat/new",
                     "placement: verdict: FORK\nalternative: a config value"
                 )],
-                "feat/new"
+                "feat/new",
+                false
             )
             .unwrap(),
             None
         );
         // Grandfathered: a composition recorded it, so no note is asked for.
         assert_eq!(
-            member_refusal(&[cut_event(&["feat/old"])], "feat/old").unwrap(),
+            member_refusal(&[cut_event(&["feat/old"])], "feat/old", false).unwrap(),
             None
         );
         assert_eq!(
-            member_refusal(&[cut_event(&["feat/old"])], "feat/new").unwrap(),
+            member_refusal(&[cut_event(&["feat/old"])], "feat/new", false).unwrap(),
             Some(missing_member_refusal("feat/new"))
         );
-        // But a verdict recorded later is newer than the composition and wins:
+        // Or the release in hand carries it now, whatever the ledger recorded:
+        // a member whose cut predates the parent records.
+        assert_eq!(member_refusal(&[], "feat/legacy", true).unwrap(), None);
+        // But a verdict recorded later is newer than either and wins:
         // CONSUMER refuses an existing member too.
+        let consumer_after_cut = [
+            cut_event(&["feat/old"]),
+            note(
+                "feat/old",
+                "placement: verdict: CONSUMER\nalternative: a config value",
+            ),
+        ];
         assert_eq!(
-            member_refusal(
-                &[
-                    cut_event(&["feat/old"]),
-                    note(
-                        "feat/old",
-                        "placement: verdict: CONSUMER\nalternative: a config value"
-                    )
-                ],
-                "feat/old"
-            )
-            .unwrap(),
+            member_refusal(&consumer_after_cut, "feat/old", false).unwrap(),
+            Some(CONSUMER_REFUSAL.to_owned())
+        );
+        assert_eq!(
+            member_refusal(&consumer_after_cut, "feat/old", true).unwrap(),
             Some(CONSUMER_REFUSAL.to_owned())
         );
     }
