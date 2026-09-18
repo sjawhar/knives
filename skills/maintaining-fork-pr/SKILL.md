@@ -98,6 +98,7 @@ Build a working list with one disposition for each item, judged from what you re
 - A missing template requirement or heading.
 - A forbidden identifier in added lines or proposed upstream prose, using the configured registry terms and applicable publication rules. If no list is configured, state that; still check for private hosts, credentials and internal process details.
 - Does the `placement:` notch cover this head? Missing or stale: investigate in recon, never backfill to unblock finished work.
+- For a member that changes runtime behavior: do its notch and commit body carry `fork-work`'s ownership answer (why it does not live in the consumer — *if the fork were replaced by upstream main tomorrow, would anyone but us miss this?*) and the ruling it implements, and does the head implement that ruling's words? A mismatch ("idle" ruled, "from creation" built) is a finding to repair or escalate, not a nuance.
 
 Dispositions are: already addressed (commit/reply evidence), to repair, declined (reason to give upstream), leave alone (say why — this is a real disposition, not a gap), genuine decision needed (only after the three conditions in "What owning means"), or currently unverifiable (specific external prerequisite). An outstanding promise is not already addressed. Note whether the branch is a release member, using the actual parent associations from `release members`; an advanced branch may succeed an older released parent.
 
