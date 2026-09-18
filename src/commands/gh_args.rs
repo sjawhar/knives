@@ -19,15 +19,19 @@
 //! value spellings `--flag v`, `--flag=v`, `-f v`, `-fv`, `-f=v`, shorthand
 //! clusters whose first valued shorthand takes the rest of the cluster or
 //! the next argument, `--flag=true|false` and `-d=true` on a switch, `--`
-//! ending flags, string flags last-wins, and gh's own aliases of the verbs
-//! knives reads (`pr new` is `pr create`, `pr co` is `pr checkout`)
-//! normalised. `--help` is a genuine switch at every level (gh registers it
+//! ending flags, every occurrence of a flag recorded in order (gh keeps a
+//! string flag last-wins; the readers refuse one stated twice rather than
+//! pick), and gh's own aliases of the verbs knives reads (`pr new` is `pr
+//! create`, `pr co` is `pr checkout`) normalised. `--help` is a genuine switch at every level (gh registers it
 //! once, persistently, with no shorthand); `-h` is not registered anywhere,
 //! so this module's own scan for a command or a verb always reads it as an
 //! unknown flag that consumes whatever follows — only a leaf's real flag
-//! parse (below) treats a stray `-h` as `--help`. A dash-argument the table
-//! does not define is kept by name, for the caller that must refuse rather
-//! than guess.
+//! parse (below) treats a stray `-h` as `--help`, and there pflag stops at
+//! it, whatever follows: `-h=false` is help. A switch's `=value` is a Go
+//! bool ([`super::gh_canon::parse_bool`]); `--help=false` is a switch given
+//! false, and the command runs. A dash-argument the table does not define,
+//! or a switch given a value that is not a bool, is kept by name, for the
+//! caller that must refuse rather than guess.
 
 /// What a flag does with the argument after it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -196,6 +200,8 @@ pub struct Flag {
     /// Its value; `None` for a switch given bare, or a valued flag with no
     /// argument left to take (gh's own error).
     pub value: Option<String>,
+    /// Spelled as its shorthand (`-h`), not its long name (`--help`).
+    pub short: bool,
 }
 
 /// A `gh` command line, read once.
@@ -213,6 +219,10 @@ pub struct GhInvocation {
     pub positionals: Vec<String>,
     /// Every dash-argument the command's table does not define, as written.
     pub unknown: Vec<String>,
+    /// Every switch given an `=value` that is not a Go bool, as written:
+    /// gh's own `invalid argument` error, which knives refuses rather than
+    /// reads either way.
+    pub malformed: Vec<String>,
 }
 
 impl GhInvocation {
@@ -309,18 +319,25 @@ impl GhInvocation {
             .filter_map(|flag| flag.value.as_deref())
     }
 
-    /// The value gh keeps for a string flag: the last one given.
-    pub fn last(&self, name: &str) -> Option<&str> {
-        self.flags
-            .iter()
-            .rev()
-            .find(|flag| flag.name == name && flag.value.is_some())
-            .and_then(|flag| flag.value.as_deref())
-    }
-
     /// Whether the flag `name` appeared at all, with a value or without.
     pub fn has(&self, name: &str) -> bool {
         self.flags.iter().any(|flag| flag.name == name)
+    }
+
+    /// Whether gh prints help and runs nothing, read as cobra reads it: any
+    /// `-h` (pflag stops at an unregistered `-h` whatever its `=` tail), or
+    /// a long `--help` whose last occurrence is bare or a true bool —
+    /// `--help=false` is a switch given false, and the command runs.
+    pub fn help_in_effect(&self) -> bool {
+        let mut help = self.flags.iter().filter(|flag| flag.name == "help");
+        if help.clone().any(|flag| flag.short) {
+            return true;
+        }
+        help.next_back().is_some_and(|flag| {
+            flag.value
+                .as_deref()
+                .is_none_or(|value| super::gh_canon::parse_bool(value) == Some(true))
+        })
     }
 
     /// The `pr` verb, alias-normalised.
@@ -356,12 +373,18 @@ impl GhInvocation {
 /// command); `-h` never is, at any level — gh gives it no shorthand
 /// anywhere — so it is always read as an unknown flag here, consuming
 /// whatever follows it exactly like any other one this scan does not
-/// recognise.
+/// recognise. A bare `-` and an empty argument are neither a flag nor a
+/// word to `stripFlags` — skipped here, and left for the leaf parse to
+/// record as the stray positionals gh then refuses.
 fn find_verb<'a>(rest: &'a [String], parent: &[Spec]) -> Option<(&'a str, usize)> {
     let mut index = 0;
     while let Some(argument) = rest.get(index) {
         if argument == "--" {
             return None;
+        }
+        if argument.is_empty() || argument == "-" {
+            index += 1;
+            continue;
         }
         if let Some(long) = argument.strip_prefix("--") {
             let bare = long.split_once('=').is_none();
@@ -388,6 +411,23 @@ fn find_verb<'a>(rest: &'a [String], parent: &[Spec]) -> Option<(&'a str, usize)
     None
 }
 
+/// The arguments a flag parse walks: what is left of `rest`, and the index
+/// the next one sits at.
+struct Cursor<'a> {
+    rest: &'a [String],
+    index: usize,
+}
+
+impl Cursor<'_> {
+    /// The next argument, consumed; `None` at the end (a valued flag with no
+    /// argument left to take — gh's own error).
+    fn take(&mut self) -> Option<String> {
+        let taken = self.rest.get(self.index).cloned();
+        self.index += 1;
+        taken
+    }
+}
+
 /// Read every flag and positional in `rest` against `grammar`, pflag's way;
 /// `skip` is the verb's index in `rest`, a positional that is not recorded.
 fn parse_flags(
@@ -396,17 +436,17 @@ fn parse_flags(
     grammar: Grammar,
     invocation: &mut GhInvocation,
 ) {
-    let mut index = 0;
-    while let Some(argument) = rest.get(index) {
-        let at = index;
-        index += 1;
+    let mut cursor = Cursor { rest, index: 0 };
+    while let Some(argument) = cursor.rest.get(cursor.index) {
+        let at = cursor.index;
+        cursor.index += 1;
         if Some(at) == skip {
             continue;
         }
         if argument == "--" {
             invocation
                 .positionals
-                .extend(rest.get(index..).unwrap_or(&[]).iter().cloned());
+                .extend(rest.get(cursor.index..).unwrap_or(&[]).iter().cloned());
             return;
         }
         if let Some(long) = argument.strip_prefix("--") {
@@ -427,14 +467,23 @@ fn parse_flags(
                 continue;
             };
             let value = match (kind, inline) {
-                (_, Some(value)) => Some(value.to_owned()),
-                (Kind::Valued, None) => {
-                    index += 1;
-                    rest.get(index - 1).cloned()
+                (Kind::Switch, Some(value)) => {
+                    // pflag reads a switch's `=value` as a Go bool and errors
+                    // on anything else; kept by name for the refusal.
+                    if super::gh_canon::parse_bool(value).is_none() {
+                        invocation.malformed.push(argument.clone());
+                    }
+                    Some(value.to_owned())
                 }
+                (Kind::Valued, Some(value)) => Some(value.to_owned()),
+                (Kind::Valued, None) => cursor.take(),
                 (Kind::Switch, None) => None,
             };
-            invocation.flags.push(Flag { name, value });
+            invocation.flags.push(Flag {
+                name,
+                value,
+                short: false,
+            });
             continue;
         }
         let Some(cluster) = argument.strip_prefix('-').filter(|rest| !rest.is_empty()) else {
@@ -442,45 +491,80 @@ fn parse_flags(
             invocation.positionals.push(argument.clone());
             continue;
         };
-        for (offset, short) in cluster.char_indices() {
-            let tail = cluster.get(offset + short.len_utf8()..).unwrap_or("");
-            let Some(Spec {
-                long: name, kind, ..
-            }) = grammar.lookup_short(short)
-            else {
-                match grammar.strictness {
-                    Strictness::Complete => invocation.unknown.push(argument.clone()),
-                    Strictness::ValuedOnly => {}
-                }
-                break;
-            };
-            match *kind {
-                Kind::Switch => {
-                    // pflag: a switch shorthand followed by `=` takes what
-                    // follows as its (boolean) value and ends the cluster.
-                    if let Some(value) = tail.strip_prefix('=') {
-                        invocation.flags.push(Flag {
-                            name,
-                            value: Some(value.to_owned()),
-                        });
-                        break;
+        parse_cluster(cluster, &mut cursor, grammar, invocation);
+    }
+}
+
+/// Read one shorthand cluster (`-dHfeat/x`, the text after the dash) against
+/// `grammar`, pflag's way; `cursor` supplies the next argument when a valued
+/// shorthand ends the cluster with nothing attached.
+fn parse_cluster(
+    cluster: &str,
+    cursor: &mut Cursor<'_>,
+    grammar: Grammar,
+    invocation: &mut GhInvocation,
+) {
+    let argument = format!("-{cluster}");
+    for (offset, short) in cluster.char_indices() {
+        let tail = cluster.get(offset + short.len_utf8()..).unwrap_or("");
+        let Some(Spec {
+            long: name, kind, ..
+        }) = grammar.lookup_short(short)
+        else {
+            match grammar.strictness {
+                Strictness::Complete => invocation.unknown.push(argument),
+                Strictness::ValuedOnly => {}
+            }
+            return;
+        };
+        match *kind {
+            Kind::Switch if short == 'h' => {
+                // gh registers no `-h` anywhere; pflag meets it as an
+                // unregistered shorthand and stops at it with help,
+                // whatever the rest of the cluster or an `=` tail says.
+                invocation.flags.push(Flag {
+                    name,
+                    value: None,
+                    short: true,
+                });
+                return;
+            }
+            Kind::Switch => {
+                // pflag: a switch shorthand followed by `=` takes what
+                // follows as its (boolean) value and ends the cluster.
+                if let Some(value) = tail.strip_prefix('=') {
+                    if super::gh_canon::parse_bool(value).is_none() {
+                        invocation.malformed.push(argument);
                     }
-                    invocation.flags.push(Flag { name, value: None });
+                    invocation.flags.push(Flag {
+                        name,
+                        value: Some(value.to_owned()),
+                        short: true,
+                    });
+                    return;
                 }
-                Kind::Valued => {
-                    // pflag: `-Hv` and `-H=v` give `v`; `-H=` alone gives `=`;
-                    // an empty tail takes the next argument.
-                    let value = if tail.is_empty() {
-                        index += 1;
-                        rest.get(index - 1).cloned()
-                    } else if tail.len() > 1 {
-                        Some(tail.strip_prefix('=').unwrap_or(tail).to_owned())
-                    } else {
-                        Some(tail.to_owned())
-                    };
-                    invocation.flags.push(Flag { name, value });
-                    break;
-                }
+                invocation.flags.push(Flag {
+                    name,
+                    value: None,
+                    short: true,
+                });
+            }
+            Kind::Valued => {
+                // pflag: `-Hv` and `-H=v` give `v`; `-H=` alone gives `=`;
+                // an empty tail takes the next argument.
+                let value = if tail.is_empty() {
+                    cursor.take()
+                } else if tail.len() > 1 {
+                    Some(tail.strip_prefix('=').unwrap_or(tail).to_owned())
+                } else {
+                    Some(tail.to_owned())
+                };
+                invocation.flags.push(Flag {
+                    name,
+                    value,
+                    short: true,
+                });
+                return;
             }
         }
     }
@@ -555,7 +639,7 @@ mod tests {
             let parsed = GhInvocation::parse(&args(&argv));
             assert_eq!(parsed.command.as_deref(), Some("pr"), "{argv:?}");
             assert_eq!(parsed.verb(), Some("create"), "{argv:?}");
-            assert_eq!(parsed.last("repo"), Some("o/r"), "{argv:?}");
+            assert_eq!(parsed.values("repo").last(), Some("o/r"), "{argv:?}");
         }
         let stated = GhInvocation::parse(&args(&["-H", "feat/x", "pr", "create", "-R", "o/r"]));
         assert_eq!(stated.values("head").collect::<Vec<_>>(), ["feat/x"]);
@@ -569,7 +653,7 @@ mod tests {
             "head=x",
         ]));
         assert_eq!(posted.command.as_deref(), Some("api"));
-        assert_eq!(posted.last("method"), Some("POST"));
+        assert_eq!(posted.values("method").last(), Some("POST"));
         assert_eq!(posted.fields("head").collect::<Vec<_>>(), ["x"]);
 
         let fielded = GhInvocation::parse(&args(&["-f", "head=x", "api", "repos/o/r/pulls"]));
@@ -613,7 +697,7 @@ mod tests {
         // Every occurrence, in order; the last is gh's.
         let two = GhInvocation::parse(&args(&["pr", "create", "--head", "feat/x", "-Hfeat/y"]));
         assert_eq!(heads(&two), ["feat/x", "feat/y"]);
-        assert_eq!(two.last("head"), Some("feat/y"));
+        assert_eq!(two.values("head").last(), Some("feat/y"));
         // A valued flag's value is never a head, whatever it looks like.
         for argv in [
             vec!["pr", "create", "--title", "t", "--body", "-Hfeat/x"],
@@ -633,7 +717,8 @@ mod tests {
             GhInvocation::parse(&args(&["pr", "create", "-H"])).flags,
             [Flag {
                 name: "head",
-                value: None
+                value: None,
+                short: true,
             }]
         );
         assert_eq!(
@@ -678,17 +763,21 @@ mod tests {
             vec!["pr", "create", "--body", "-R", "--repo", "acme/work"],
         ] {
             assert_eq!(
-                GhInvocation::parse(&args(&argv)).last("repo"),
+                GhInvocation::parse(&args(&argv)).values("repo").last(),
                 Some("acme/work"),
                 "{argv:?}"
             );
         }
         assert_eq!(
-            GhInvocation::parse(&args(&["pr", "list"])).last("repo"),
+            GhInvocation::parse(&args(&["pr", "list"]))
+                .values("repo")
+                .last(),
             None
         );
         assert_eq!(
-            GhInvocation::parse(&args(&["pr", "list", "-R"])).last("repo"),
+            GhInvocation::parse(&args(&["pr", "list", "-R"]))
+                .values("repo")
+                .last(),
             None
         );
     }
@@ -711,12 +800,12 @@ mod tests {
             "repos/zz/yy/pulls",
         ]));
         assert_eq!(parsed.positionals, ["repos/o/r/pulls"]);
-        assert_eq!(parsed.last("method"), Some("POST"));
+        assert_eq!(parsed.values("method").last(), Some("POST"));
         assert_eq!(parsed.fields("head").collect::<Vec<_>>(), ["feat/x"]);
         assert_eq!(parsed.fields("base").collect::<Vec<_>>(), ["main"]);
         assert!(parsed.has("input"));
         assert!(parsed.unknown.is_empty());
-        // The method is last-wins, and the attached spelling is read.
+        // Every method is recorded in order; the attached spelling is read.
         let parsed = GhInvocation::parse(&args(&[
             "api",
             "-X",
@@ -725,10 +814,100 @@ mod tests {
             "POST",
             "repos/o/r/pulls",
         ]));
-        assert_eq!(parsed.last("method"), Some("POST"));
+        assert_eq!(parsed.values("method").last(), Some("POST"));
         let parsed = GhInvocation::parse(&args(&["api", "-XGET", "repos/o/r/pulls"]));
-        assert_eq!(parsed.last("method"), Some("GET"));
+        assert_eq!(parsed.values("method").last(), Some("GET"));
         let parsed = GhInvocation::parse(&args(&["api", "--method=get", "repos/o/r/pulls"]));
-        assert_eq!(parsed.last("method"), Some("get"));
+        assert_eq!(parsed.values("method").last(), Some("get"));
+    }
+
+    #[test]
+    fn help_is_in_effect_as_cobra_reads_it_not_whenever_the_word_appears() {
+        // `--help=false` is a bool switch given false: gh runs the command
+        // (round-7 code F1). `-h` is help whatever follows it, at any
+        // position, since pflag stops at the unregistered shorthand.
+        for argv in [
+            vec!["pr", "create", "--help"],
+            vec!["pr", "create", "-h"],
+            vec!["pr", "create", "-h=false"],
+            vec!["pr", "create", "-dh"],
+            vec!["pr", "create", "--help=true"],
+            vec!["pr", "create", "--help=1"],
+            vec!["pr", "create", "--help=false", "--help"],
+            vec!["pr", "create", "-h", "--help=false"],
+            vec!["pr", "create", "--help=false", "-h"],
+            vec!["api", "--help", "repos/o/r/pulls"],
+        ] {
+            assert!(
+                GhInvocation::parse(&args(&argv)).help_in_effect(),
+                "{argv:?}"
+            );
+        }
+        for argv in [
+            vec!["pr", "create", "--help=false"],
+            vec!["pr", "create", "--help=0"],
+            vec!["pr", "create", "--help=F"],
+            vec!["pr", "create", "--help", "--help=false"],
+            vec!["--help=false", "pr", "create"],
+            vec!["api", "--help=false", "repos/o/r/pulls"],
+            vec!["pr", "create"],
+        ] {
+            assert!(
+                !GhInvocation::parse(&args(&argv)).help_in_effect(),
+                "{argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_switch_value_that_is_not_a_bool_is_kept_by_name() {
+        for (argv, malformed) in [
+            (vec!["pr", "create", "--help=maybe"], "--help=maybe"),
+            (vec!["pr", "create", "--draft=yes"], "--draft=yes"),
+            (vec!["pr", "create", "-d=on"], "-d=on"),
+            (vec!["api", "--paginate=2", "user"], "--paginate=2"),
+        ] {
+            let parsed = GhInvocation::parse(&args(&argv));
+            assert_eq!(parsed.malformed, [malformed], "{argv:?}");
+        }
+        for argv in [
+            vec!["pr", "create", "--draft=true", "-d=F", "--web=0"],
+            vec!["pr", "create", "-d"],
+            vec!["api", "--paginate", "user"],
+        ] {
+            let parsed = GhInvocation::parse(&args(&argv));
+            assert!(
+                parsed.malformed.is_empty(),
+                "{argv:?}: {:?}",
+                parsed.malformed
+            );
+        }
+    }
+
+    #[test]
+    fn a_bare_dash_or_an_empty_argument_is_neither_a_command_word_nor_a_verb() {
+        // cobra's `stripFlags` keeps only a non-empty word not beginning
+        // with `-` as a candidate; both are left as the stray positionals
+        // gh refuses (round-7 deep L1).
+        for argv in [
+            vec!["-", "pr", "create", "-R", "o/r"],
+            vec!["", "pr", "create", "-R", "o/r"],
+            vec!["pr", "-", "create", "-R", "o/r"],
+            vec!["pr", "", "create", "-R", "o/r"],
+        ] {
+            let parsed = GhInvocation::parse(&args(&argv));
+            assert_eq!(parsed.command.as_deref(), Some("pr"), "{argv:?}");
+            assert_eq!(parsed.verb(), Some("create"), "{argv:?}");
+            assert_eq!(parsed.values("repo").last(), Some("o/r"), "{argv:?}");
+            assert_eq!(
+                parsed.positionals.len(),
+                1,
+                "{argv:?}: {:?}",
+                parsed.positionals
+            );
+        }
+        let parsed = GhInvocation::parse(&args(&["-", "api", "-", "repos/o/r/pulls"]));
+        assert_eq!(parsed.command.as_deref(), Some("api"));
+        assert_eq!(parsed.positionals, ["-", "-", "repos/o/r/pulls"]);
     }
 }

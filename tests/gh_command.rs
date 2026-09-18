@@ -7,7 +7,7 @@
 
 #[path = "common/lab.rs"]
 mod lab;
-// allow: SIZE_OK: 2281 lines - real-binary gh passthrough scenarios share one fixture and process harness.
+// allow: SIZE_OK: 3447 lines - real-binary gh passthrough scenarios share one fixture and process harness.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
@@ -503,8 +503,17 @@ fn resolved_base_remote_routes_token_from_remote_url() {
 
 #[test]
 fn resolved_remote_spec_routes_token_from_spec_url() {
-    // Given: a remote that resolves to a different owner/repository spec.
+    // Given: a remote that resolves to a different owner/repository spec;
+    // the value's host is the marked remote's, as gh reads it.
     let lab = lab::Lab::new();
+    let host = concat!("github", ".com");
+    git_config(
+        &lab.work,
+        &[
+            "remote.token-spec.url",
+            &format!("https://{host}/decoy/other.git"),
+        ],
+    );
     git_config(&lab.work, &["remote.token-spec.gh-resolved", "other/repo"]);
     let (dir, log) = fake_gh();
     let helper_dir = fake_app_token();
@@ -1491,10 +1500,12 @@ fn the_gate_reads_pr_create_as_gh_parses_it_whatever_the_flag_order_alias_or_spe
         &["pr", "--title", "t", "create", "-R", up, "--body", "b"],
         eps,
     );
-    // A second -R: gh keeps the last; a decoy first one mints nothing for the decoy.
+    // A second -R: refused naming both, not read last-wins; a decoy first
+    // one mints nothing for the decoy. A `--body` whose value is `-R` is a
+    // body, and the one `--repo` is the upstream.
     refused(
         &["pr", "create", "-R", "zz/yy", "-R", up, "-H", "feat/none"],
-        &none,
+        "states 2 repositories (-R \"zz/yy\", \"routed-a/upstream\")",
     );
     refused(
         &[
@@ -1509,12 +1520,20 @@ fn the_gate_reads_pr_create_as_gh_parses_it_whatever_the_flag_order_alias_or_spe
         ],
         &none,
     );
-    // URL forms of the upstream, with the suffixes gh tolerates.
+    // URL forms of the upstream are outside the grammar knives compares:
+    // refused with the canonical spelling, whatever they would name to gh.
     let host = concat!("github", ".com");
     let slash = format!("https://{host}/{up}/");
     let dotgit = format!("https://{host}/{up}.git");
-    refused(&["pr", "create", "-R", &slash, "-H", "feat/none"], &none);
-    refused(&["pr", "create", "-R", &dotgit, "-H", "feat/none"], &none);
+    let canonical = "knives compares repositories only as OWNER/REPO or HOST/OWNER/REPO";
+    refused(
+        &["pr", "create", "-R", &slash, "-H", "feat/none"],
+        canonical,
+    );
+    refused(
+        &["pr", "create", "-R", &dotgit, "-H", "feat/none"],
+        canonical,
+    );
     // An empty head: gh would open the current branch, which that spelling
     // gives knives no way to certify.
     refused(
@@ -1598,20 +1617,6 @@ fn an_upstream_head_in_any_pflag_spelling_passes_with_one_head_and_the_upstream_
             "--body",
             "b",
         ][..],
-        &[
-            "pr",
-            "create",
-            "-R",
-            "zz/yy",
-            "-R",
-            up,
-            "-H",
-            "feat/gamma",
-            "--title",
-            "t",
-            "--body",
-            "b",
-        ][..],
     ] {
         let output = run(arguments);
         assert!(output.status.success(), "{arguments:?}: {output:?}");
@@ -1663,9 +1668,16 @@ fn the_gate_reads_gh_api_as_gh_parses_it_and_a_flag_value_is_never_the_endpoint(
     let none = knives::placement::missing_member_refusal("feat/none");
     let pulls = "repos/routed-a/upstream/pulls";
     let decoy = "repos/zz/yy/pulls";
+    // Two methods are refused rather than read last-wins.
+    let two = run(&["-X", "GET", "-X", "POST", pulls, "-f", "head=feat/none"]);
+    assert_eq!(two.status.code(), Some(2), "{two:?}");
+    assert!(
+        String::from_utf8_lossy(&two.stderr)
+            .contains("states 2 methods (-X GET, -X POST); gh would use the last"),
+        "{two:?}"
+    );
+    assert!(!log.exists(), "gh ran despite the refusal");
     for arguments in [
-        // The method is last-wins.
-        &["-X", "GET", "-X", "POST", pulls, "-f", "head=feat/none"][..],
         // A flag's value shaped like an endpoint is not the endpoint.
         &["-X", "POST", "-t", decoy, pulls, "-f", "head=feat/none"][..],
         &["--jq", decoy, "-X", "POST", pulls, "-f", "head=feat/none"][..],
@@ -2501,11 +2513,14 @@ fn a_flag_before_the_command_word_still_passes_an_upstream_creation() {
 }
 
 #[test]
-fn every_repo_spec_spelling_of_the_upstream_is_still_the_upstream() {
+fn a_repository_spelled_outside_the_grammar_is_refused_with_the_canonical_spelling() {
     // Given: `@` on feat/eps (FORK) inside a fork checkout. Every `-R`
-    // spelling below names the same registered upstream to gh — scp form,
-    // `www.`, a query string, and a `#fragment` — and pass 6's normalisation
-    // read none of them.
+    // spelling below names the registered upstream to gh in some
+    // normalisation knives no longer reproduces — scp form, `www.`, a query
+    // string, a fragment, a percent-escape, a `.git` suffix, a trailing
+    // slash — so each is refused with the canonical spelling rather than
+    // compared (round-7 code F3 / deep H1, and every earlier round's
+    // spelling).
     let config_home = placement_gate_home();
     record_placement(config_home.path(), "feat/eps", "FORK");
     let lab = fork_checkout_of_the_registered_upstream();
@@ -2528,51 +2543,731 @@ fn every_repo_spec_spelling_of_the_upstream_is_still_the_upstream() {
         }
         command.output().expect("run knives gh")
     };
-    let refused = |arguments: &[&str], extra_env: &[(&str, &str)]| {
+    let refused = |arguments: &[&str], extra_env: &[(&str, &str)], text: &str| {
         let output = run(arguments, extra_env);
         assert_eq!(output.status.code(), Some(2), "{arguments:?}: {output:?}");
         assert!(
-            String::from_utf8_lossy(&output.stderr).contains("feat/eps has placement verdict FORK"),
+            String::from_utf8_lossy(&output.stderr).contains(text),
             "{arguments:?}: {output:?}"
         );
         assert!(!log.exists(), "{arguments:?}: gh ran despite the refusal");
     };
+    let canonical = "knives compares repositories only as OWNER/REPO or HOST/OWNER/REPO";
 
     for spec in [
         format!("git@{host}:routed-a/upstream"),
         format!("git@{host}:routed-a/upstream.git"),
-        format!("www.{host}/routed-a/upstream"),
         format!("https://www.{host}/routed-a/upstream"),
-        "WWW.GitHub.com/routed-a/upstream".to_owned(),
         format!("https://{host}/routed-a/upstream?tab=readme"),
         format!("https://{host}/routed-a/upstream#readme"),
         format!("https://{host}/routed-a/upstream.git?x=1"),
+        format!("https://{host}/routed-a/%75pstream"),
+        format!("https://{host}/%72outed-a/upstream"),
+        format!("git@{host}:routed-a/%75pstream.git"),
+        format!("ssh://git@{host}/%72outed-a/upstream"),
+        format!("HTTPS://{host}/routed-a/upstream"),
+        "routed-a/upstream/".to_owned(),
+        "routed-a/upstream.git".to_owned(),
+        "routed-a/upstream/extra/more".to_owned(),
+        String::new(),
     ] {
         refused(
             &["pr", "create", "-R", &spec, "--title", "t", "--body", "b"],
             &[],
+            &format!(
+                "{canonical} (each segment of [A-Za-z0-9._-]); -R {spec:?} is not one: state it that way"
+            ),
         );
     }
-    // `GH_REPO` reads the same spec the same way.
+    refused(
+        &["pr", "create", "--repo=", "--title", "t", "--body", "b"],
+        &[],
+        "-R \"\" is not one",
+    );
+}
+
+#[test]
+fn a_canonical_repository_is_compared_and_a_second_or_environment_one_is_read_the_same_way() {
+    // Given: the same fork checkout, `@` on feat/eps (FORK).
+    let config_home = placement_gate_home();
+    record_placement(config_home.path(), "feat/eps", "FORK");
+    let lab = fork_checkout_of_the_registered_upstream();
+    lab.branch("feat/eps", "eps.txt", "eps\n");
+    lab.jj_work(["edit", "feat/eps"]);
+    let (dir, log) = fake_gh();
+    let host = concat!("github", ".com");
+    let run = |arguments: &[&str], extra_env: &[(&str, &str)]| {
+        let mut command = knives_cmd(config_home.path());
+        command
+            .args(["gh", "--"])
+            .args(arguments)
+            .current_dir(&lab.work)
+            .env("KNIVES_CONFIG_HOME", config_home.path())
+            .env("HOME", lab.temp_path())
+            .env("KNIVES_REAL_GH", dir.path().join("gh"))
+            .env("FAKE_GH_LOG", &log);
+        for (name, value) in extra_env {
+            command.env(name, value);
+        }
+        command.output().expect("run knives gh")
+    };
+    let refused = |arguments: &[&str], extra_env: &[(&str, &str)], text: &str| {
+        let output = run(arguments, extra_env);
+        assert_eq!(output.status.code(), Some(2), "{arguments:?}: {output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(text),
+            "{arguments:?}: {output:?}"
+        );
+        assert!(!log.exists(), "{arguments:?}: gh ran despite the refusal");
+    };
+    let canonical = "knives compares repositories only as OWNER/REPO or HOST/OWNER/REPO";
+
+    // `GH_REPO` is read the same way, and a `-R` spelled canonically is the
+    // upstream: the FORK verdict refuses it.
     refused(
         &["pr", "create", "--title", "t", "--body", "b"],
-        &[("GH_REPO", &format!("git@{host}:routed-a/upstream"))],
+        &[("GH_REPO", &format!("https://{host}/routed-a/%75pstream"))],
+        &format!("{canonical} (each segment of [A-Za-z0-9._-]); GH_REPO"),
+    );
+    refused(
+        &[
+            "pr",
+            "create",
+            "-R",
+            "routed-a/upstream",
+            "--title",
+            "t",
+            "--body",
+            "b",
+        ],
+        &[],
+        "feat/eps has placement verdict FORK",
+    );
+    refused(
+        &[
+            "pr",
+            "create",
+            "-R",
+            &format!("{host}/routed-a/upstream"),
+            "--title",
+            "t",
+        ],
+        &[],
+        "feat/eps has placement verdict FORK",
+    );
+    // Two repositories are refused naming both, not read last-wins.
+    refused(
+        &[
+            "pr",
+            "create",
+            "-R",
+            "zz/yy",
+            "-R",
+            "routed-a/upstream",
+            "--title",
+            "t",
+        ],
+        &[],
+        "states 2 repositories (-R \"zz/yy\", \"routed-a/upstream\")",
+    );
+}
+
+/// A fork checkout with `@` on FORK `feat/eps`, a routed token helper, and a
+/// runner for `knives gh -- <arguments>` in it (extra environment per call).
+struct GateLab {
+    config_home: tempfile::TempDir,
+    lab: lab::Lab,
+    gh: tempfile::TempDir,
+    log: PathBuf,
+    helper_dir: tempfile::TempDir,
+    gitconfig: PathBuf,
+}
+
+impl GateLab {
+    fn on_fork_bookmark() -> Self {
+        let config_home = placement_gate_home();
+        record_placement(config_home.path(), "feat/eps", "FORK");
+        record_placement(config_home.path(), "feat/up", "UPSTREAM");
+        let lab = fork_checkout_of_the_registered_upstream();
+        lab.branch("feat/eps", "eps.txt", "eps\n");
+        lab.jj_work(["edit", "feat/eps"]);
+        let (gh, log) = fake_gh();
+        let helper_dir = fake_app_token();
+        let gitconfig = token_config(helper_dir.path(), "routed-a");
+        Self {
+            config_home,
+            lab,
+            gh,
+            log,
+            helper_dir,
+            gitconfig,
+        }
+    }
+
+    fn run(&self, arguments: &[&str], extra_env: &[(&str, &str)]) -> std::process::Output {
+        let mut command = knives_cmd(self.helper_dir.path());
+        command
+            .args(["gh", "--"])
+            .args(arguments)
+            .current_dir(&self.lab.work)
+            .env("KNIVES_CONFIG_HOME", self.config_home.path())
+            .env("HOME", self.lab.temp_path())
+            .env("KNIVES_REAL_GH", self.gh.path().join("gh"))
+            .env("FAKE_GH_LOG", &self.log)
+            .env("PATH", helper_path(self.helper_dir.path()))
+            .env("GIT_CONFIG_GLOBAL", &self.gitconfig);
+        for (name, value) in extra_env {
+            command.env(name, value);
+        }
+        command.output().expect("run knives gh")
+    }
+
+    /// Refused before gh runs, with `text` on stderr.
+    fn refused(&self, arguments: &[&str], extra_env: &[(&str, &str)], text: &str) {
+        let output = self.run(arguments, extra_env);
+        assert_eq!(output.status.code(), Some(2), "{arguments:?}: {output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(text),
+            "{arguments:?}: {output:?}"
+        );
+        assert!(
+            !self.log.exists(),
+            "{arguments:?}: gh ran despite the refusal"
+        );
+    }
+
+    /// Passed to gh; what the fake gh recorded (argv, then `GH_TOKEN=`).
+    fn passed(&self, arguments: &[&str], extra_env: &[(&str, &str)]) -> String {
+        let output = self.run(arguments, extra_env);
+        assert!(output.status.success(), "{arguments:?}: {output:?}");
+        let recorded = fs::read_to_string(&self.log).expect("fake gh ran");
+        fs::remove_file(&self.log).expect("reset the gh log");
+        recorded
+    }
+}
+
+/// `gh api -X POST <path>` with a feat/none head and a base: a REST creation
+/// at gh's placeholders.
+fn placeholder_creation(path: &str) -> Vec<&str> {
+    let mut arguments = vec!["api", "-X", "POST", path];
+    arguments.extend(["-f", "head=feat/none", "-f", "base=main", "-f", "title=t"]);
+    arguments
+}
+
+/// `gh api -X POST <extra…> <path>` with a feat/none head and a base.
+fn rest_creation<'a>(path: &'a str, extra: &[&'a str]) -> Vec<&'a str> {
+    let mut arguments = vec!["api", "-X", "POST"];
+    arguments.extend(extra);
+    arguments.push(path);
+    arguments.extend(["-f", "head=feat/none", "-f", "base=main"]);
+    arguments
+}
+
+#[test]
+fn help_disables_the_gate_only_when_gh_would_print_help() {
+    // `--help=false` is a bool switch given false: gh runs the command, so
+    // the gate reads on (round-7 code F1). `-h` is help whatever follows it;
+    // a last `--help` that is bare or true is help; a value that is not a
+    // bool is gh's own error, refused rather than read either way.
+    let gate = GateLab::on_fork_bookmark();
+    let up = "routed-a/upstream";
+    let none = knives::placement::missing_member_refusal("feat/none");
+    let eps = "feat/eps has placement verdict FORK";
+    let pulls = "repos/routed-a/upstream/pulls";
+    gate.refused(
+        &[
+            "pr",
+            "create",
+            "--help=false",
+            "-R",
+            up,
+            "-H",
+            "feat/none",
+            "-t",
+            "t",
+            "-b",
+            "b",
+        ],
+        &[],
+        &none,
+    );
+    gate.refused(
+        &["pr", "create", "--help=0", "-R", up, "-H", "feat/none"],
+        &[],
+        &none,
+    );
+    gate.refused(
+        &["pr", "create", "--help=false", "-t", "t", "-b", "b"],
+        &[],
+        eps,
+    );
+    gate.refused(
+        &["--help=false", "pr", "create", "-R", up, "-H", "feat/none"],
+        &[],
+        &none,
+    );
+    gate.refused(
+        &[
+            "pr",
+            "create",
+            "--help",
+            "--help=false",
+            "-R",
+            up,
+            "-H",
+            "feat/none",
+        ],
+        &[],
+        &none,
+    );
+    gate.refused(
+        &[
+            "api",
+            "--help=false",
+            "-X",
+            "POST",
+            pulls,
+            "-f",
+            "head=feat/none",
+            "-f",
+            "base=main",
+        ],
+        &[],
+        &none,
+    );
+    gate.refused(
+        &["pr", "create", "--help=maybe", "-R", up, "-H", "feat/none"],
+        &[],
+        "--help=maybe gives a switch a value that is not a bool",
+    );
+    gate.refused(
+        &["pr", "create", "-d=yes", "-R", up, "-H", "feat/up"],
+        &[],
+        "-d=yes gives a switch a value that is not a bool",
+    );
+    // Help in effect: gh prints help and opens nothing, so the FORK bookmark
+    // and the unverdicted head pass through to it.
+    for arguments in [
+        &[
+            "pr",
+            "create",
+            "--help=false",
+            "--help",
+            "-R",
+            up,
+            "-H",
+            "feat/none",
+        ][..],
+        &["pr", "create", "-h=false", "-R", up, "-H", "feat/none"][..],
+        &["pr", "create", "-h", "--help=false", "-R", up, "-t", "t"][..],
+        &["pr", "create", "--help=true", "-R", up, "-t", "t"][..],
+    ] {
+        gate.passed(arguments, &[]);
+    }
+}
+
+#[test]
+fn an_empty_or_second_repository_is_refused_not_read_as_gh_would_fall_back() {
+    // `-R ""` and `--repo=` are "no -R" to gh, which falls back to `GH_REPO`
+    // and then the checkout's base repository — the upstream here (round-7
+    // code F2). knives reads an empty repository as one outside the grammar
+    // and refuses it, wherever it runs; a second `-R` is refused naming both.
+    let gate = GateLab::on_fork_bookmark();
+    let up = "routed-a/upstream";
+    let empty = "-R \"\" is not one: state it that way";
+    gate.refused(
+        &[
+            "pr",
+            "create",
+            "-R",
+            "",
+            "-H",
+            "feat/none",
+            "-t",
+            "t",
+            "-b",
+            "b",
+        ],
+        &[],
+        empty,
+    );
+    gate.refused(
+        &["pr", "create", "--repo=", "-t", "t", "-b", "b"],
+        &[],
+        empty,
+    );
+    gate.refused(
+        &["pr", "create", "-R", "", "-H", "feat/none"],
+        &[("GH_REPO", up)],
+        empty,
+    );
+    gate.refused(
+        &["pr", "create", "--repo", "-t", "t"],
+        &[],
+        "-R \"-t\" is not one",
+    );
+    gate.refused(
+        &[
+            "pr",
+            "create",
+            "-R",
+            "routed-b/origin",
+            "-R",
+            "",
+            "-H",
+            "feat/none",
+        ],
+        &[],
+        "states 2 repositories (-R \"routed-b/origin\", \"\")",
+    );
+    // Outside any checkout the same spelling is refused the same way: the
+    // grammar does not depend on where the command runs.
+    let scratch = tempfile::tempdir().expect("scratch");
+    let output = knives_cmd(gate.helper_dir.path())
+        .args([
+            "gh",
+            "--",
+            "pr",
+            "create",
+            "-R",
+            "",
+            "-H",
+            "feat/none",
+            "-t",
+            "t",
+        ])
+        .current_dir(scratch.path())
+        .env("KNIVES_CONFIG_HOME", gate.config_home.path())
+        .env("KNIVES_REAL_GH", gate.gh.path().join("gh"))
+        .env("FAKE_GH_LOG", &gate.log)
+        .output()
+        .expect("run knives gh");
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains(empty),
+        "{output:?}"
+    );
+}
+
+#[test]
+fn a_percent_escaped_environment_repository_or_a_marker_with_a_host_is_refused() {
+    // `GH_REPO` fills `repos/{owner}/{repo}/pulls` verbatim and GitHub
+    // decodes the escape (round-7 code F4); a `gh-resolved` marker's host is
+    // the remote's to gh whatever the value says (code F5). Both are read
+    // only in canonical form.
+    let gate = GateLab::on_fork_bookmark();
+    let canonical = "knives compares repositories only as OWNER/REPO or HOST/OWNER/REPO";
+    gate.refused(
+        &placeholder_creation("repos/{owner}/{repo}/pulls"),
+        &[("GH_REPO", "routed-a/upstre%61m")],
+        &format!("{canonical} (each segment of [A-Za-z0-9._-]); GH_REPO \"routed-a/upstre%61m\""),
+    );
+    gate.refused(
+        &placeholder_creation("repos/:owner/:repo/pulls"),
+        &[("GH_REPO", "routed-%61/upstream")],
+        "GH_REPO \"routed-%61/upstream\" is not one",
+    );
+    // A canonical `GH_REPO` fills the placeholders with the upstream, and
+    // the unverdicted head is refused by name.
+    gate.refused(
+        &placeholder_creation("repos/{owner}/{repo}/pulls"),
+        &[("GH_REPO", "routed-a/upstream")],
+        &knives::placement::missing_member_refusal("feat/none"),
     );
 
-    // Controls: a spec go-gh itself would refuse never resolves to the
-    // upstream, so it is not gated (it passes through, and real gh would
-    // error on it too).
-    for spec in [
-        format!("HTTPS://{host}/routed-a/upstream"),
-        "routed-a/upstream/".to_owned(),
-        "routed-a/upstream/extra/more".to_owned(),
-    ] {
-        let output = run(
-            &["pr", "create", "-R", &spec, "--title", "t", "--body", "b"],
+    // Markers: `base` and `OWNER/REPO` are gh's own two spellings; a value
+    // carrying a host, or anything else, is refused with the remedy.
+    let marker = |value: &str| {
+        git_config(&gate.lab.work, &["remote.upstream.gh-resolved", value]);
+    };
+    let create = ["pr", "create", "-t", "t", "-b", "b"];
+    marker("other.example/routed-a/upstream");
+    gate.refused(
+        &create,
+        &[],
+        "remote.upstream.gh-resolved is read only as `base` or `OWNER/REPO` (the host is the \
+         remote's, as gh reads it); \"other.example/routed-a/upstream\" is neither",
+    );
+    marker("https://other.example/routed-a/upstream");
+    gate.refused(
+        &create,
+        &[],
+        "\"https://other.example/routed-a/upstream\" is neither",
+    );
+    marker("routed-a/upstream");
+    gate.refused(&create, &[], "feat/eps has placement verdict FORK");
+    marker("base");
+    gate.refused(&create, &[], "feat/eps has placement verdict FORK");
+    // A marker naming another repository on the remote's host is that
+    // repository: unregistered, so the creation passes.
+    marker("decoy/other");
+    let recorded = gate.passed(&create, &[]);
+    assert!(recorded.contains("GH_TOKEN=tok-decoy"), "{recorded}");
+}
+
+#[test]
+fn a_cross_repository_or_malformed_head_does_not_borrow_this_forks_verdict() {
+    // gh's `--head OWNER:BRANCH` names a branch of another repository, which
+    // the ledger never ruled on (round-7 deep M1); knives refuses every head
+    // carrying `:` — the fork's own owner included, since the branch alone is
+    // the canonical spelling — and every head outside the branch grammar.
+    let gate = GateLab::on_fork_bookmark();
+    let up = "routed-a/upstream";
+    let cross =
+        "state the head as a branch of this fork (a cross-repository head cannot be checked here)";
+    for head in ["decoy:feat/up", "routed-b:feat/up"] {
+        gate.refused(
+            &[
+                "pr", "create", "-R", up, "-t", "t", "-b", "b", "--head", head,
+            ],
             &[],
+            cross,
         );
-        assert!(output.status.success(), "{spec}: {output:?}");
-        fs::remove_file(&log).expect("reset the gh log");
+        gate.refused(
+            &[
+                "pr",
+                "create",
+                "-R",
+                up,
+                "-t",
+                "t",
+                &format!("--head={head}"),
+            ],
+            &[],
+            cross,
+        );
+        gate.refused(
+            &["pr", "create", "-R", up, "-t", "t", "-H", head],
+            &[],
+            cross,
+        );
+        gate.refused(
+            &[
+                "api",
+                "repos/routed-a/upstream/pulls",
+                "-f",
+                &format!("head={head}"),
+                "-f",
+                "base=main",
+            ],
+            &[],
+            cross,
+        );
+    }
+    gate.refused(
+        &["pr", "create", "-R", up, "--head", "feat up"],
+        &[],
+        "knives compares heads only as a branch name",
+    );
+    gate.refused(
+        &[
+            "api",
+            "repos/routed-a/upstream/pulls",
+            "-f",
+            "head=@{-1}",
+            "-f",
+            "base=main",
+        ],
+        &[],
+        "-f head \"@{-1}\" for registered is not one: state the branch",
+    );
+    // Two `head` fields on a REST creation are refused like two `--head`s.
+    gate.refused(
+        &[
+            "api",
+            "repos/routed-a/upstream/pulls",
+            "-f",
+            "head=feat/up",
+            "-f",
+            "head=feat/none",
+        ],
+        &[],
+        "states 2 heads (feat/up, feat/none)",
+    );
+    // The branch alone, ruled UPSTREAM, passes with the upstream's token.
+    let recorded = gate.passed(
+        &[
+            "pr", "create", "-R", up, "-t", "t", "-b", "b", "--head", "feat/up",
+        ],
+        &[],
+    );
+    assert!(recorded.contains("GH_TOKEN=tok-routed-a"), "{recorded}");
+}
+
+#[test]
+fn a_bare_dash_or_empty_argument_is_not_the_command_word_or_the_verb() {
+    // cobra skips both when finding the command and the verb; gh then
+    // refuses the stray positional (round-7 deep L1). knives reads `pr
+    // create` past them the same way, so the gate applies.
+    let gate = GateLab::on_fork_bookmark();
+    let up = "routed-a/upstream";
+    let none = knives::placement::missing_member_refusal("feat/none");
+    for arguments in [
+        &["-", "pr", "create", "-R", up, "-H", "feat/none"][..],
+        &["", "pr", "create", "-R", up, "-H", "feat/none"][..],
+        &["pr", "-", "create", "-R", up, "-H", "feat/none"][..],
+        &["pr", "", "create", "-R", up, "-H", "feat/none"][..],
+    ] {
+        gate.refused(arguments, &[], &none);
+    }
+}
+
+#[test]
+fn a_token_is_routed_only_for_a_canonical_owner() {
+    // An owner read from a remote URL through a `//` or `git@host:/` path is
+    // empty; one read from an endpoint through a percent-escape is not a
+    // segment. Neither mints a token — for a decoy owner or for the
+    // checkout's own (round-7 deep L2).
+    let gate = GateLab::on_fork_bookmark();
+    let host = concat!("github", ".com");
+    let recorded = gate.passed(&["api", "-XGET", "repos/%72outed-a/upstream/pulls"], &[]);
+    assert!(recorded.contains("GH_TOKEN=unset"), "{recorded}");
+    let recorded = gate.passed(&["api", "-XGET", "repos//upstream/pulls"], &[]);
+    assert!(recorded.contains("GH_TOKEN=unset"), "{recorded}");
+    // A URL-form `-R` on a command the gate does not judge routes nothing
+    // and says so once; gh runs on its own auth.
+    let output = gate.run(
+        &[
+            "pr",
+            "list",
+            "-R",
+            &format!("git@{host}:/routed-a/upstream"),
+        ],
+        &[],
+    );
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("knives gh: no token routed: knives compares repositories only as"),
+        "{output:?}"
+    );
+    let recorded = fs::read_to_string(&gate.log).expect("fake gh ran");
+    assert!(recorded.contains("GH_TOKEN=unset"), "{recorded}");
+    fs::remove_file(&gate.log).expect("reset the gh log");
+    // A checkout remote spelled `git@host:/owner/repo` has an empty owner
+    // segment once normalised: nothing is minted for it.
+    let plain = lab::Lab::new();
+    git_config(
+        &plain.work,
+        &["remote.origin.url", &format!("git@{host}:/decoy/other.git")],
+    );
+    let output = knives_cmd(gate.helper_dir.path())
+        .args(["gh", "--", "api", "rate_limit"])
+        .current_dir(&plain.work)
+        .env("KNIVES_REAL_GH", gate.gh.path().join("gh"))
+        .env("FAKE_GH_LOG", &gate.log)
+        .env("PATH", helper_path(gate.helper_dir.path()))
+        .env("GIT_CONFIG_GLOBAL", &gate.gitconfig)
+        .output()
+        .expect("run knives gh");
+    assert!(output.status.success(), "{output:?}");
+    let recorded = fs::read_to_string(&gate.log).expect("fake gh ran");
+    assert!(recorded.contains("GH_TOKEN=unset"), "{recorded}");
+}
+
+#[test]
+fn a_graphql_creation_inside_a_plain_git_clone_of_the_fork_is_refused_too() {
+    // The fork's checkout may be a plain git clone (an agent's /tmp
+    // checkout, no jj); the mutation names its repository by node id there
+    // as anywhere, and is refused inside the registered fork (round-7 code L1).
+    let config_home = placement_gate_home();
+    let host = concat!("github", ".com");
+    let scratch = tempfile::tempdir().expect("scratch");
+    let clone = scratch.path().join("clone");
+    lab::git_repository(&clone, &[]);
+    fs::write(clone.join("README.md"), "seed\n").expect("write seed");
+    lab::git_commit_all(&clone, "seed");
+    git_config(
+        &clone,
+        &[
+            "remote.upstream.url",
+            &format!("https://{host}/routed-a/upstream.git"),
+        ],
+    );
+    let (dir, log) = fake_gh();
+    let mutation = "mutation { createPullRequest(input:{repositoryId:\"x\",headRefName:\"feat/none\"}) \
+                     { pullRequest { id } } }";
+    let output = knives_cmd(scratch.path())
+        .args([
+            "gh",
+            "--",
+            "api",
+            "graphql",
+            "-f",
+            &format!("query={mutation}"),
+        ])
+        .current_dir(&clone)
+        .env("KNIVES_CONFIG_HOME", config_home.path())
+        .env("KNIVES_REAL_GH", dir.path().join("gh"))
+        .env("FAKE_GH_LOG", &log)
+        .output()
+        .expect("run knives gh");
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("a GraphQL createPullRequest names its repository by node id, so knives cannot tell whether it targets registered's upstream"),
+        "{output:?}"
+    );
+    assert!(!log.exists(), "gh ran despite the refusal");
+}
+
+#[test]
+fn a_rest_creation_states_its_host_with_hostname_and_nothing_else_is_compared() {
+    // `--hostname` is the host a REST creation addresses; a foreign absolute
+    // URL, an empty segment, and a numeric repository id are refused rather
+    // than compared.
+    let gate = GateLab::on_fork_bookmark();
+    let host = concat!("github", ".com");
+    let none = knives::placement::missing_member_refusal("feat/none");
+    gate.refused(
+        &rest_creation("repos/routed-a/upstream/pulls", &["--hostname", host]),
+        &[],
+        &none,
+    );
+    gate.refused(
+        &rest_creation(
+            &format!("https://api.{host}/repos/routed-a/upstream/pulls"),
+            &[],
+        ),
+        &[],
+        &none,
+    );
+    // Another host is another repository: not the registered upstream.
+    let recorded = gate.passed(
+        &rest_creation(
+            "repos/routed-a/upstream/pulls",
+            &["--hostname", "ghe.example"],
+        ),
+        &[],
+    );
+    assert!(recorded.contains("--hostname"), "{recorded}");
+    for (path, text) in [
+        (
+            format!("https://API.{host}/repos/routed-a/upstream/pulls"),
+            "addresses a host knives does not compare",
+        ),
+        (
+            format!("http://api.{host}/repos/routed-a/upstream/pulls"),
+            "addresses a host knives does not compare",
+        ),
+        (
+            "repos//upstream/pulls".to_owned(),
+            "has an empty path segment",
+        ),
+        (
+            "repos/routed-a//pulls".to_owned(),
+            "has an empty path segment",
+        ),
+        (
+            "repos/routed-a/upstream.git/pulls".to_owned(),
+            "names its repository outside the grammar knives compares",
+        ),
+        (
+            "repositories/1318902388/pulls".to_owned(),
+            "cannot be checked against the registry",
+        ),
+    ] {
+        gate.refused(&rest_creation(&path, &[]), &[], text);
     }
 }
 
@@ -2613,8 +3308,8 @@ fn a_percent_encoded_rest_or_graphql_creation_is_refused_not_guessed() {
         );
         assert!(!log.exists(), "{arguments:?}: gh ran despite the refusal");
     };
-    let encoded = "cannot be checked against the registry: state the repository as \
-                   repos/<owner>/<repo>, unencoded";
+    let encoded = "is percent-encoded, which GitHub decodes and knives does not: state the \
+                   endpoint unencoded, as repos/OWNER/REPO/pulls";
 
     refused(
         &[
@@ -2646,17 +3341,14 @@ fn a_percent_encoded_rest_or_graphql_creation_is_refused_not_guessed() {
     );
     let mutation = "mutation { createPullRequest(input:{repositoryId:\"x\",headRefName:\"feat/eps\"}) \
                      { pullRequest { id } } }";
-    refused(
-        &["gra%70hql", "-f", &format!("query={mutation}")],
-        "a GraphQL createPullRequest names its repository by node id",
-    );
+    refused(&["gra%70hql", "-f", &format!("query={mutation}")], encoded);
 
-    // A GET on the same percent-encoded path is not a creation, and the
-    // owner it routes a token for is decoded.
+    // A GET on the same percent-encoded path is not a creation; its owner is
+    // outside the grammar, so no token is routed for it either.
     let listed = run(&["-XGET", "repos/%72outed-a/upstream/pulls"]);
     assert!(listed.status.success(), "{listed:?}");
     let recorded = fs::read_to_string(&log).expect("fake gh ran");
-    assert!(recorded.contains("GH_TOKEN=tok-routed-a"), "{recorded}");
+    assert!(recorded.contains("GH_TOKEN=unset"), "{recorded}");
 }
 
 #[test]
