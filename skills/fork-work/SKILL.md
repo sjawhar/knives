@@ -5,6 +5,8 @@ description: Check knives before working in a repository we maintain a fork of. 
 
 # About to work in a fork
 
+> **Where a change lives comes before whether it goes upstream.** A managed fork is a product the consumer repository uses; the consumer repository is where its own deployment's operating policy lives — lifetimes and reaping of jobs, caps, quotas, schedules, alerting, node sizing, who-may-do-what defaults. The default home for anything policy-shaped is the consumer's own infrastructure (its own scheduled jobs and janitors, a config value the library already exposes); a fork member is for a defect in the library's own machinery or a capability nothing outside the library can provide (a missing field, an endpoint), which is also what makes it upstream-bound. The test, applied by the author here and again by the release owner at include time: *if the fork were replaced by upstream main tomorrow, would anyone but us miss this?* No means it belongs in the consumer. When the fork genuinely looks like the right home for something policy-shaped, that is a question to the owner with options, and the owner's answer decides — a default with a valve, not a prohibition. The case that made this a rule: a fixed creation-time lifetime cap on every job, built into the fork's own janitor as a fork member from a duration study and pinned into production with a PR body that named neither the number nor that only one deployment carried it; the same behavior was a scheduled job in the consumer's own cluster against the library's API. Two questions, side by side: this one is *fork or consumer*; the callout below is *upstream or fork-only*; neither is an approval step. The reflex both guard against: fixing at the point of mechanism (the janitor code lives in the fork, so the cap went in the fork) instead of the point of ownership (the policy is the consumer's). `maintaining-inspect` owns this rule and the consumer's record of the incident carries the owner's words verbatim; read that record, not a relay of it.
+
 > **A fork branch states the non-fork alternative it rejected — before it exists.** Most effects a consumer wants from a library need no fork: a configuration value the library already exposes, a resource-level override in the consumer's own deployment tooling, or the consumer's own code. `knives start` refuses to create a new branch until the placement red-team (below) has answered CONSUMER / FORK / UPSTREAM and its verdict file is passed with `--placement`; a CONSUMER verdict starts no branch. FORK members ride the release cut and never become a pull request. UPSTREAM is the only verdict that leads to an upstream pull request — and never for a change to upstream defaults made to suit one deployment's preferences. Nobody is asked and no approval is awaited: the verdict is the written judgment, recorded as a `placement: verdict:` notch on the branch, and `release include`, `release advance` and `knives gh` read it back.
 
 ## Stop and find out where you are
@@ -81,7 +83,9 @@ them, and a note that says it is open is open.
 
 ## Run the placement red-team before any new branch
 
-Before creating a fork branch — and again before proposing anything upstream — dispatch a
+Apply the ownership test at the top of this skill first: a change that fails it belongs in
+the consumer and gets no branch here unless the owner has said otherwise. Then, before
+creating a fork branch — and again before proposing anything upstream — dispatch a
 fresh-context subagent with the brief in
 [references/placement-red-team.md](references/placement-red-team.md). Its job is to argue
 AGAINST the fork change: name the most direct non-fork way to get the effect, classify the
@@ -115,6 +119,8 @@ defaults, does a user outside this deployment benefit, and does the upstream rep
 want it (an issue, a maintainer signal)? For a bug, that means a minimal reproduction on
 unmodified upstream at a cited revision; for a feature, the general extension case. Never
 relabel an unsupported bug as "hardening".
+
+A fork member that changes runtime behavior — anything a production operator would notice — states, in its `placement: verdict:` notch (the red-team's file, past the verdict line) **and** in its commit body, why it does not live in the consumer (the ownership test's answer, or the owner's ruling that put it in the fork) and which recorded decision it implements (the ruling's id or link), or that it implements none and is a defect fix carried by red→green evidence. The implementation matches the ruling's words: the member behind the rule above cited a ruling that said warn after twelve hours idle and reclaim after twenty-four, and built a kill at twelve hours from creation with no warning — "idle" against "from creation" is not a nuance, it is the whole behavior. A member carrying neither statement is `neither` to the release owner and is not composed (`maintaining-fork-release` step 5). The consumer's pin PR then states every production behavior change the pin carries, in plain numbers, under `## Production behavior delta` — disclosure, so the reviewer sees the policy, not a gate.
 
 ## Get your own working copy the managed way
 

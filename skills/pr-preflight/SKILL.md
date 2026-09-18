@@ -5,6 +5,8 @@ description: Pre-PR contribution judgment gate for upstream repositories. Use wh
 
 # Upstream PR Preflight Gate
 
+> **Where a change lives comes before whether it goes upstream.** A managed fork is a product the consumer repository uses; the consumer is where its own deployment's operating policy lives — lifetimes and reaping of jobs, caps, quotas, schedules, alerting, node sizing, who-may-do-what defaults — and is the default home for anything policy-shaped. A fork member is for a defect in the library's own machinery or a capability nothing outside the library can provide, which is also what makes it upstream-bound. `fork-work` carries the test (*if the fork were replaced by upstream main tomorrow, would anyone but us miss this?* No means the consumer) and the valve (when the fork genuinely looks like the right home for something policy-shaped, that is a question to the owner with options, and the owner's answer decides — a default with a valve, not a prohibition). A change that belongs in the consumer has no branch in the fork and no upstream PR. Two questions, side by side: this one is *fork or consumer*; the callout below is *upstream or fork-only*. `maintaining-inspect` owns both.
+
 > **An upstream PR requires `verdict: UPSTREAM`.** Every fork branch carries a placement verdict — the placement red-team's ruling (skill `fork-work`), recorded as a `placement: verdict:` notch by `knives start --placement` — and only `UPSTREAM` leads to an upstream pull request; `knives gh` refuses `gh pr create` toward a registered upstream for any other verdict. UPSTREAM means: a defect any user of the library would hit, fixed with evidence (a reproduction or red→green test), or a capability users outside this deployment need, extended the general way. **We do not change upstream defaults to suit one deployment's preferences** — a deployment-preference change is CONSUMER or FORK, never a PR. And **most fork work never becomes a PR — too many open PRs is a cost**, paid by the upstream maintainer and by every later sweep of ours: the default for a fix is a fork member that rides the release cut, invisible to upstream. Nobody is asked and no approval is awaited; the verdict is the written judgment.
 
 ## Overview
@@ -75,7 +77,7 @@ Walk each check sequentially. Each check specifies what facts to verify, what ev
 
 ### Check 7: Placement verdict
 - **Verification**: The branch's newest `placement: verdict:` notch rules `verdict: UPSTREAM`, its judge differs from the proposer, and its evidence covers the published diff — the alternative it rejected is still the alternative, and the class is still what the PR claims. Prose `placement:` notes on the branch are context, not the verdict.
-- **Evidence**: The `placement: verdict:` notch, read with `knives notch <branch>`.
+- **Evidence**: The `placement: verdict:` notch, read with `knives notch <branch>`. For a member that changes runtime behavior, the notch and the commit body also carry the ownership answer and the ruling it implements (`fork-work`).
 - **If Failed**:
   - *Missing*: No PR; return to `fork-work`'s placement red-team. `knives gh` refuses the create anyway.
   - *Verdict is FORK or CONSUMER*: No PR. A FORK member ships through the release; a CONSUMER change belongs in the consumer and its branch should be finished.
