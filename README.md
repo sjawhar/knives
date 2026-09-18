@@ -223,7 +223,7 @@ reads `not on this machine`, and an entry with two is refused with both paths na
 | `knives pr NUMBER [--repo REPO] [--timeline]` | one pull request's live state; `--timeline` adds its bounded forge event log |
 | `knives sync` | fetch, then classify what happened to each tracked pull request |
 | `knives preflight` | the facts to check before contributing upstream |
-| `knives start` | take a branch and get your own workspace: on its tip, or on the release's shared base for a new one; a NEW branch requires `--placement <file>`, a placement-verdict file (first line `verdict: CONSUMER \| FORK \| UPSTREAM`) recorded on the branch as a `placement: verdict:` ledger note — a `CONSUMER` verdict starts no branch; a `--placement` on an existing branch (claimed, resumed or seized) records a fresh verdict and the newest wins; waits for the claim lock, and a refusal names the holder (the `using-knives` skill has the lock's mechanism, wait and messages); states the fork's `immutable_heads()` (trunk and tags, with the trunk named on every knives remote) in the repo's jj config where none is stated |
+| `knives start` | take a branch and get your own workspace: on its tip, or on the release's shared base for a new one; a NEW branch requires `--placement <file>`, the red-team's verdict file (`verdict: CONSUMER \| FORK \| UPSTREAM`, then `alternative:`, `class:` and `judge:`, all required) recorded on the branch as a `placement: verdict:` ledger note — a `CONSUMER` verdict starts no branch; a `--placement` on an existing branch (claimed, resumed or seized; CONSUMER included, under the same claim rules) records a fresh verdict and the newest wins; waits for the claim lock, and a refusal names the holder (the `using-knives` skill has the lock's mechanism, wait and messages); states the fork's `immutable_heads()` (trunk and tags, with the trunk named on every knives remote) in the repo's jj config where none is stated |
 | `knives finish` | hand a branch back so another agent can pick it up; its bookmark and any open pull request survive |
 | `knives track` | state which pull request a branch belongs to, when inference cannot find it |
 | `knives depends` | record that a branch cannot land before another repo's pull request |
@@ -283,8 +283,9 @@ the cut `flat`.
 
 A fork member states the non-fork alternative it rejected before it exists: `knives start
 --placement` records the placement verdict as a `placement: verdict:` ledger note (the
-`fork-work` skill has the red-team brief that produces it; a `placement:` note that continues
-as prose is an ordinary note), `release include` and `release advance` refuse a first-time
+`fork-work` skill has the red-team brief that produces it; the file's `verdict:`,
+`alternative:`, `class:` and `judge:` lines are all required, and a `placement:` note that
+continues as prose is an ordinary note), `release include` and `release advance` refuse a first-time
 member with no verdict note, and any member whose newest verdict is `CONSUMER`, and `knives
 gh` refuses an upstream `pr create` (or the REST pulls creation, in any spelling gh accepts:
 flags before the path, an absolute URL, `{owner}`/`:owner` placeholders) for a branch whose

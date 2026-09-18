@@ -95,11 +95,13 @@ answers yourself in a fresh context, arguing each alternative honestly before re
 Read-only investigation is exempt; a green gate, plausible patch or peer's "go" establishes
 nothing.
 
-The red-team's output is the verdict file:
+The red-team's output is the verdict file. knives reads and requires the first four lines —
+`verdict:`, `alternative:`, `class:` (one of the three, spelled exactly so) and `judge:` — and
+refuses a file missing any of them, naming the line; the free text is for the next reader:
 
 ```
 verdict: CONSUMER | FORK | UPSTREAM
-alternative: <the consumer-side mechanism considered, and why it fails or is hacky -- required; knives refuses a verdict that leaves this empty>
+alternative: <the consumer-side mechanism considered, and why it fails or is hacky>
 class: library-defect | gap-others-need | deployment-preference
 judge: <the red-team subagent's id or handle>
 <free text: evidence, reproduction, upstream signal>
@@ -111,10 +113,12 @@ begins `placement: verdict:` — the only note shape the tool reads as a verdict
 implement the alternative in the consumer instead. A verdict is re-checked, not inherited,
 when evidence or scope changes — record the newer one the same way (`knives start` on the
 existing branch with `--placement`, whether that claims, resumes or seizes it, or by hand
-with both lines the tool reads, since a verdict without its `alternative:` is refused:
-`knives notch <branch> -m $'placement: verdict: FORK\nalternative: <the non-fork mechanism
-rejected, and why>'`), and the newest wins: a CONSUMER re-verdict is recorded on the
-existing branch and `start` says `knives finish <branch>` retires it.
+with every line the tool reads, since a notch missing one is refused: `knives notch <branch>
+-m $'placement: verdict: FORK\nalternative: <the non-fork mechanism rejected, and why>\nclass:
+<one of the three>\njudge: <who ruled>'`), and the newest wins. A CONSUMER re-verdict goes
+through the same claim path as any `start` — remotes fetched first, a held claim counted as an
+existing branch, another owner's claim refused without `--force --why` — and is recorded on
+the existing branch; `start` then says `knives finish <branch>` retires it.
 
 For an UPSTREAM candidate the brief additionally checks: does the change preserve upstream
 defaults, does a user outside this deployment benefit, and does the upstream repository
