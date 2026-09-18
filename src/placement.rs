@@ -87,6 +87,13 @@ pub enum PlacementError {
     Verdict(String),
     #[error("a placement verdict is empty")]
     Empty,
+    /// The branch's premise is the non-fork mechanism it rejected; a verdict that
+    /// names none has not answered the forcing question.
+    #[error(
+        "a placement verdict names the non-fork mechanism it rejected on an `alternative:` line; \
+         none was given"
+    )]
+    Alternative,
     /// A ledger note that carries the marker but a verdict token knives does
     /// not know: named so the reader knows which branch, and how to move on.
     #[error(
@@ -101,7 +108,8 @@ pub enum PlacementError {
 }
 
 impl Placement {
-    /// Parse a verdict file. The first non-blank line decides; everything is
+    /// Parse a verdict file. The first non-blank line decides and an `alternative:`
+    /// line must name the rejected non-fork mechanism; everything is
     /// kept, less the whitespace around it, so the note begins with the verdict.
     pub fn parse(text: &str) -> Result<Self, PlacementError> {
         let first = text
@@ -113,6 +121,14 @@ impl Placement {
             .strip_prefix("verdict:")
             .and_then(|rest| Verdict::parse(rest.trim()))
             .ok_or_else(|| PlacementError::Verdict(first.to_owned()))?;
+        let names_alternative = text
+            .lines()
+            .map(str::trim)
+            .filter_map(|line| line.strip_prefix("alternative:"))
+            .any(|rest| !rest.trim().is_empty());
+        if !names_alternative {
+            return Err(PlacementError::Alternative);
+        }
         Ok(Self {
             verdict,
             text: text.trim().to_owned(),
@@ -283,15 +299,31 @@ mod tests {
             Placement::parse("verdict: maybe"),
             Err(PlacementError::Verdict("verdict: maybe".to_owned()))
         );
+        // The branch's premise is the alternative it rejected: a verdict alone,
+        // or an empty `alternative:` line, has not answered the question.
+        assert_eq!(
+            Placement::parse("verdict: FORK"),
+            Err(PlacementError::Alternative)
+        );
+        assert_eq!(
+            Placement::parse("verdict: FORK\nalternative:   "),
+            Err(PlacementError::Alternative)
+        );
         assert_eq!(Placement::parse("  \n"), Err(PlacementError::Empty));
     }
 
     #[test]
     fn the_newest_placement_note_wins_and_other_notes_are_ignored() {
         let entries = [
-            note("feat/a", "placement: verdict: CONSUMER"),
+            note(
+                "feat/a",
+                "placement: verdict: CONSUMER\nalternative: a config value",
+            ),
             note("feat/a", "reviewed, looks fine"),
-            note("feat/b", "placement: verdict: UPSTREAM"),
+            note(
+                "feat/b",
+                "placement: verdict: UPSTREAM\nalternative: a config value",
+            ),
             note("feat/a", "placement: verdict: FORK\nalternative: none"),
         ];
         let newest = recorded(&entries, "feat/a").unwrap().unwrap();
@@ -333,7 +365,10 @@ mod tests {
         assert!(recorded(&[note("feat/a", "placement: whatever")], "feat/a").is_none());
         // It hides nothing: the search continues to the older verdict behind it.
         let entries = [
-            note("feat/a", "placement: verdict: UPSTREAM"),
+            note(
+                "feat/a",
+                "placement: verdict: UPSTREAM\nalternative: a config value",
+            ),
             note("feat/a", prose),
         ];
         assert_eq!(
@@ -351,14 +386,24 @@ mod tests {
         );
         assert_eq!(
             member_refusal(
-                &[note("feat/new", "placement: verdict: CONSUMER")],
+                &[note(
+                    "feat/new",
+                    "placement: verdict: CONSUMER\nalternative: a config value"
+                )],
                 "feat/new"
             )
             .unwrap(),
             Some(CONSUMER_REFUSAL.to_owned())
         );
         assert_eq!(
-            member_refusal(&[note("feat/new", "placement: verdict: FORK")], "feat/new").unwrap(),
+            member_refusal(
+                &[note(
+                    "feat/new",
+                    "placement: verdict: FORK\nalternative: a config value"
+                )],
+                "feat/new"
+            )
+            .unwrap(),
             None
         );
         // Grandfathered: a composition recorded it, so no note is asked for.
@@ -376,7 +421,10 @@ mod tests {
             member_refusal(
                 &[
                     cut_event(&["feat/old"]),
-                    note("feat/old", "placement: verdict: CONSUMER")
+                    note(
+                        "feat/old",
+                        "placement: verdict: CONSUMER\nalternative: a config value"
+                    )
                 ],
                 "feat/old"
             )
@@ -394,15 +442,27 @@ mod tests {
         );
         assert_eq!(
             upstream_pull_refusal(
-                &[composed, note("feat/old", "placement: verdict: FORK")],
+                &[
+                    composed,
+                    note(
+                        "feat/old",
+                        "placement: verdict: FORK\nalternative: a config value"
+                    )
+                ],
                 "feat/old"
             )
             .unwrap(),
             Some(not_upstream_refusal("feat/old", Verdict::Fork))
         );
         assert_eq!(
-            upstream_pull_refusal(&[note("feat/x", "placement: verdict: UPSTREAM")], "feat/x")
-                .unwrap(),
+            upstream_pull_refusal(
+                &[note(
+                    "feat/x",
+                    "placement: verdict: UPSTREAM\nalternative: a config value"
+                )],
+                "feat/x"
+            )
+            .unwrap(),
             None
         );
     }

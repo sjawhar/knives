@@ -99,7 +99,7 @@ The red-team's output is the verdict file:
 
 ```
 verdict: CONSUMER | FORK | UPSTREAM
-alternative: <the consumer-side mechanism considered, and why it fails or is hacky>
+alternative: <the consumer-side mechanism considered, and why it fails or is hacky -- required; knives refuses a verdict that leaves this empty>
 class: library-defect | gap-others-need | deployment-preference
 judge: <the red-team subagent's id or handle>
 <free text: evidence, reproduction, upstream signal>

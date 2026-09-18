@@ -676,8 +676,10 @@ pub fn placement_file(home: &tempfile::TempDir, verdict: &str) -> std::path::Pat
 /// note `knives start --placement` writes, for a branch a test made without
 /// `start` (through `lab.branch`) that a release verb is about to admit.
 pub fn state_placement(lab: &Lab, home: &tempfile::TempDir, subject: &str, verdict: &str) {
-    let placement = knives::placement::Placement::parse(&format!("verdict: {verdict}\n"))
-        .expect("parse placement verdict");
+    let placement = knives::placement::Placement::parse(&format!(
+        "verdict: {verdict}\nalternative: a consumer-side setting; the library exposes none for this\n"
+    ))
+    .expect("parse placement verdict");
     knives::ledger::Scribe::new(
         knives::ledger::Ledger::at(home.path().join("ledger").join("demo")),
         knives::ids::RepoName::new("demo"),
