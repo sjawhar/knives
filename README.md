@@ -287,15 +287,16 @@ A fork member states the non-fork alternative it rejected before it exists: `kni
 `alternative:`, `class:` and `judge:` lines are all required, and a `placement:` note that
 continues as prose is an ordinary note), `release include` and `release advance` refuse a first-time
 member with no verdict note, and any member whose newest verdict is `CONSUMER`, and `knives
-gh` refuses an upstream `pr create` (or the REST pulls creation, in any spelling gh accepts:
-flags before the path, an absolute URL, `{owner}`/`:owner` placeholders) for a branch whose
-verdict is not `UPSTREAM`; the head is read as gh's own parser reads `pr create` (each flag gh
-defines consuming its value, shorthand clusters expanded, `--` ending flags), so the branch the
-gate checks is the one gh receives, and outside jj git's checked-out branch is the head gh would
-use; a flag gh does not define, or two stated heads, is refused rather than guessed. A creation
-addressed by numeric repository id (`repositories/<id>/pulls`) is refused and routes no token.
-A GraphQL document read from a file, a gh alias, and a gh extension are not inspected: the gate
-reads gh's own verbs. Branches that predate the gate are
+gh` refuses an upstream `pr create`, the REST pulls creation (`api … repos/<owner>/<repo>/pulls`,
+method POST) and, inside a fork checkout, a GraphQL `createPullRequest`, for a branch whose
+verdict is not `UPSTREAM`. The command line is read once, as gh reads it — cobra's verb lookup and
+pflag's flag grammar over gh 2.98.0's own flag tables: flags anywhere after the command, string
+flags last-wins, clusters expanded, aliases normalised, `--` ending flags — so the head and the
+repository the gate checks are the ones gh receives; a flag gh does not define, an empty or a
+second head, and a creation by numeric repository id (`repositories/<id>/pulls`) are refused
+rather than guessed. A document read from a file, a gh alias, and a gh extension are not inspected:
+the gate reads gh's own verbs. A missing registry gates nothing and says so once on stderr; an
+unreadable one is an error. Branches that predate the gate are
 grandfathered as members on either the ledger's evidence (a branch any recorded cut or edit
 names as a parent) or, where the ledger has none, the repository's (a branch the release in
 hand carries now — at a parent, or grown past a parent no record names and no bookmark
