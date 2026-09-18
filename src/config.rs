@@ -435,8 +435,11 @@ pub fn default_config_path() -> PathBuf {
     base.join("knives").join("repos.toml")
 }
 
-/// Read the registry. A missing file is an empty registry, which the commands
-/// surface explicitly rather than treating as "nothing to do".
+/// Read the registry.
+///
+/// A missing file is an empty registry — each command says what that means
+/// for it (`repos` lists nothing, `knives gh` gates nothing and says so); a
+/// file that is present but cannot be read or parsed is an error.
 pub fn load(path: &Path) -> Result<Registry, ConfigError> {
     if !path.exists() {
         return Ok(Registry::default());

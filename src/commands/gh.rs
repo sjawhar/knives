@@ -2,7 +2,15 @@
 //!
 //! This command executes `gh` directly, so the usual render/run split does not apply:
 //! there is no knives result to render.
-// allow: SIZE_OK: 1657 lines - single passthrough pipeline; splitting would separate resolution steps that read as one procedure.
+//!
+//! Every question asked of the arguments — the repository a `pr create`
+//! targets, the head it states, the endpoint a `gh api` call addresses — is a
+//! lookup on the one [`GhInvocation`] built at the top of [`run`], read the way
+//! cobra and pflag read gh's command line (see `gh_args`): flags anywhere after
+//! the command, string flags last-wins, shorthand clusters expanded, gh's own
+//! verb aliases normalised, a flag the tables do not define kept by name so
+//! the gate refuses rather than guesses. Nothing here scans argv twice.
+// allow: SIZE_OK: 2362 lines - single passthrough pipeline; splitting would separate resolution steps that read as one procedure.
 use std::collections::BTreeMap;
 use std::io::Read as _;
 use std::os::unix::{
@@ -11,6 +19,8 @@ use std::os::unix::{
 };
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+
+use super::gh_args::GhInvocation;
 
 const DEFAULT_HOST: &str = "github.com";
 
@@ -81,7 +91,8 @@ pub fn run(args: &[String]) -> anyhow::Result<std::convert::Infallible> {
         std::process::exit(127);
     };
     let mut gh = Command::new(real_gh);
-    if is_auth_command(args) {
+    let invocation = GhInvocation::parse(args);
+    if is_auth_command(&invocation) {
         // Verbatim, and before the PR scanner: `gh auth token --hostname pr --user view`
         // would otherwise read as `gh pr view` and die on a bookmark it never needed.
         gh.args(args);
@@ -90,14 +101,17 @@ pub fn run(args: &[String]) -> anyhow::Result<std::convert::Infallible> {
     let cwd = std::env::current_dir()?;
     // Before minting: an upstream pull request the placement verdict does not
     // allow is refused without spending a token on it.
-    if let Some(refusal) = upstream_pull_refusal(args, &cwd)? {
+    if let Some(refusal) = upstream_pull_refusal(&invocation, &cwd)? {
         eprintln!("knives gh: {refusal}");
         std::process::exit(crate::cli::Exit::Usage.code().into());
     }
     let token = if std::env::var_os("GH_TOKEN").is_some() {
         None
     } else {
-        match resolve_target_url(args, &cwd).as_deref().map(mint_token) {
+        match resolve_target_url(&invocation, &cwd)
+            .as_deref()
+            .map(mint_token)
+        {
             Some(Mint::Token(token)) => Some(token),
             Some(Mint::Refused(code)) => std::process::exit(code),
             Some(Mint::Unrouted) | None => None,
@@ -107,7 +121,7 @@ pub fn run(args: &[String]) -> anyhow::Result<std::convert::Infallible> {
         gh.env("GH_TOKEN", token);
     }
 
-    let Some((subcommand, _)) = pr_subcommand(args) else {
+    let Some((subcommand, verb_index)) = invocation.verb.clone() else {
         gh.args(args);
         std::process::exit(gh_exit_code(&mut gh));
     };
@@ -128,12 +142,9 @@ pub fn run(args: &[String]) -> anyhow::Result<std::convert::Infallible> {
 
     let bookmark = current_bookmark(&cwd);
     let arguments = match subcommand.as_str() {
-        // A head the caller stated — in any spelling — is the head; adding the
-        // current bookmark behind it would be the one gh honours. A command
-        // whose heads cannot be read was refused by the gate above; `Err` here
-        // means the target was not a registered upstream, and gh is left to
-        // parse its own arguments.
-        "create" if stated_heads(args).is_ok_and(|heads| heads.is_empty()) => {
+        // A head the caller stated — in any spelling gh reads — is the head;
+        // adding the current bookmark behind it would be the one gh honours.
+        "create" if !invocation.has("head") => {
             let Some(bookmark) = bookmark.as_deref() else {
                 die_no_bookmark();
             };
@@ -144,12 +155,12 @@ pub fn run(args: &[String]) -> anyhow::Result<std::convert::Infallible> {
         }
         "view" | "checks" | "diff" | "merge" | "checkout" | "edit" | "comment" | "ready"
         | "review" | "update-branch"
-            if !has_positional_target(&subcommand, args) =>
+            if invocation.positionals.is_empty() =>
         {
             let Some(bookmark) = bookmark.as_deref() else {
                 die_no_bookmark();
             };
-            inject_positional(args, &subcommand, bookmark)
+            inject_positional(args, verb_index, bookmark)
         }
         _ => args.to_vec(),
     };
@@ -243,106 +254,13 @@ pub(crate) fn current_bookmark(cwd: &Path) -> Option<String> {
         .then(|| bookmark.to_owned())
 }
 
-/// The `gh pr <subcommand>` this invocation is, skipping flags (shim lines 308-329).
-///
-/// `-R`/`--repo` is a persistent flag on `gh pr`, so cobra accepts it before the
-/// verb (`gh pr -R o/r create`); its value is skipped with it, as
-/// [`has_positional_target`] skips it after the verb, or the value would read
-/// as the subcommand and neither the gate nor the head injection would see
-/// the `create`. The one-argument spellings (`--repo=o/r`, `-Ro/r`) are
-/// dash-prefixed already.
-pub(crate) fn pr_subcommand(args: &[String]) -> Option<(String, usize)> {
-    let mut found_pr = false;
-    let mut previous_was_value_flag = false;
-    for (index, argument) in args.iter().enumerate() {
-        if found_pr {
-            if previous_was_value_flag {
-                previous_was_value_flag = false;
-                continue;
-            }
-            if argument.starts_with('-') {
-                previous_was_value_flag = matches!(argument.as_str(), "-R" | "--repo");
-                continue;
-            }
-            return Some((argument.clone(), index));
-        } else if argument == "pr" {
-            found_pr = true;
-        }
-    }
-    None
-}
-
-/// Whether a positional target follows `subcommand` (shim lines 343-384).
-pub(crate) fn has_positional_target(subcommand: &str, args: &[String]) -> bool {
-    let mut found_subcommand = false;
-    let mut previous_was_value_flag = false;
-    for argument in args {
-        if previous_was_value_flag {
-            previous_was_value_flag = false;
-            continue;
-        }
-        if found_subcommand {
-            if argument.starts_with('-') {
-                if !argument.contains('=')
-                    && matches!(
-                        argument.as_str(),
-                        "-R" | "--repo"
-                            | "-q"
-                            | "--jq"
-                            | "-t"
-                            | "--template"
-                            | "--json"
-                            | "-b"
-                            | "--body"
-                            | "-F"
-                            | "--body-file"
-                            | "--branch"
-                            | "-c"
-                            | "--comment"
-                            | "-r"
-                            | "--reason"
-                            | "--color"
-                            | "-i"
-                            | "--interval"
-                            | "--subject"
-                            | "--match-head-commit"
-                            | "--author-email"
-                            | "-A"
-                            | "-l"
-                            | "--label"
-                            | "-m"
-                            | "--milestone"
-                            | "-p"
-                            | "--project"
-                            | "--reviewer"
-                            | "--assignee"
-                            | "-T"
-                            | "--title"
-                            | "--recover"
-                    )
-                {
-                    previous_was_value_flag = true;
-                }
-                continue;
-            }
-            return true;
-        }
-        if argument == subcommand {
-            found_subcommand = true;
-        }
-    }
-    false
-}
-
-/// Inserts `bookmark` directly after the first `subcommand` (shim lines 388-403).
-pub(crate) fn inject_positional(args: &[String], subcommand: &str, bookmark: &str) -> Vec<String> {
+/// Inserts `bookmark` directly after the verb at `verb_index` (shim lines 388-403).
+pub(crate) fn inject_positional(args: &[String], verb_index: usize, bookmark: &str) -> Vec<String> {
     let mut injected = Vec::with_capacity(args.len() + 1);
-    let mut inserted = false;
-    for argument in args {
+    for (index, argument) in args.iter().enumerate() {
         injected.push(argument.clone());
-        if !inserted && argument == subcommand {
+        if index == verb_index {
             injected.push(bookmark.to_owned());
-            inserted = true;
         }
     }
     injected
@@ -443,6 +361,11 @@ pub(crate) fn normalize_url(url: &str) -> Option<String> {
     if let Some(rest) = url.strip_prefix("ssh://git@") {
         url = format!("https://{rest}");
     }
+    // `https://host/owner/repo/` is the same repository to gh; without this the
+    // suffix would make it `…/repo/.git`, which matches nothing.
+    while url.ends_with('/') {
+        url.pop();
+    }
     #[allow(
         clippy::case_sensitive_file_extension_comparisons,
         reason = "The canonical remote suffix is the literal lowercase .git."
@@ -496,8 +419,8 @@ pub(crate) enum Mint {
 /// report the cwd repo's App as a login. In an agent session the shim has already
 /// refused every `gh auth` verb but `status` before knives runs; this keeps the one
 /// that reaches knives honest.
-pub(crate) fn is_auth_command(args: &[String]) -> bool {
-    args.first().map(String::as_str) == Some("auth")
+pub(crate) fn is_auth_command(invocation: &GhInvocation) -> bool {
+    invocation.command.as_deref() == Some("auth")
 }
 
 /// Asks git's routed credential helper for the token gh should run with.
@@ -596,13 +519,18 @@ pub(crate) fn mint_token(target_url: &str) -> Mint {
 /// that is the failure this exists for (shim lines 80-86). Pure node-id
 /// GraphQL mutations genuinely have no signal; `gh-app-token` honors
 /// `GH_APP_OWNER` for those, which is out of knives' hands.
-pub(crate) fn owner_from_api_args(args: &[String]) -> Option<String> {
-    if args.first().map(String::as_str) != Some("api") {
+pub(crate) fn owner_from_api_args(invocation: &GhInvocation) -> Option<String> {
+    if invocation.command.as_deref() != Some("api") {
         return None;
     }
-    for path in api_paths(args) {
+    if let Some(endpoint) = api_endpoint(invocation) {
+        // A repository addressed by numeric id names no owner: no token is
+        // minted for it, as none is for a placeholder path.
+        if endpoint.starts_with("repositories/") {
+            return None;
+        }
         for prefix in ["repos/", "orgs/", "users/"] {
-            if let Some(rest) = path.strip_prefix(prefix) {
+            if let Some(rest) = endpoint.strip_prefix(prefix) {
                 let owner = rest.split('/').next().unwrap_or("");
                 if !owner.is_empty() && !is_api_placeholder(owner) {
                     return Some(owner.to_owned());
@@ -615,7 +543,7 @@ pub(crate) fn owner_from_api_args(args: &[String]) -> Option<String> {
     // accept `owner:"acme'`, while we require matching quotes (mismatched quotes are
     // invalid GraphQL); its sequential prefix stripping maps `repos/orgs/foo` to
     // `foo`, while we yield `orgs` (those apparent path owners are GitHub-reserved).
-    let joined = args.join(" ");
+    let joined = graphql_text(invocation);
     // LEFTMOST match wins across BOTH patterns — the shim's single alternation
     // regex returns the first match in the text, so a query naming
     // organization(login:"a") before repository(owner:"b") routes to "a".
@@ -629,42 +557,25 @@ pub(crate) fn owner_from_api_args(args: &[String]) -> Option<String> {
         // The query names the owner through a variable; its value travels as a
         // separate `-f owner=acme` field argument (how knives' own forge queries
         // and gh's documentation write it).
-        Some((_, GraphqlValue::Variable(name))) => field_argument(args, &name),
+        Some((_, GraphqlValue::Variable(name))) => invocation
+            .fields(&name)
+            .find(|value| is_owner_shaped(value))
+            .map(str::to_owned),
         None => None,
     }
 }
 
-/// The value bound to GraphQL variable `name` by a `gh api` field argument, in
-/// every spelling gh's flag parser accepts: `-f name=value`, `-fname=value`,
-/// `-f=name=value`, the same three for `-F`, and `--raw-field`/`--field` as
-/// `--flag name=value` or `--flag=name=value`. A value gh reads from a file
-/// (`-F name=@path`) or that is not shaped like a login is no signal; `-F`
-/// coercions such as `true` or `42` pass the charset and route like the login
-/// they spell, which is what `-f` would have sent anyway.
-fn field_argument(args: &[String], name: &str) -> Option<String> {
-    let mut index = 0;
-    while let Some(argument) = args.get(index) {
-        let assignment = match argument.as_str() {
-            "-f" | "-F" | "--raw-field" | "--field" => {
-                index += 1;
-                args.get(index).map(String::as_str)
-            }
-            _ => argument
-                .strip_prefix("--raw-field=")
-                .or_else(|| argument.strip_prefix("--field="))
-                .or_else(|| argument.strip_prefix("-f"))
-                .or_else(|| argument.strip_prefix("-F"))
-                .map(|attached| attached.strip_prefix('=').unwrap_or(attached)),
-        };
-        if let Some((key, value)) = assignment.and_then(|assignment| assignment.split_once('='))
-            && key == name
-            && is_owner_shaped(value)
-        {
-            return Some(value.to_owned());
-        }
-        index += 1;
-    }
-    None
+/// The GraphQL text a `gh api` call carries in its arguments: every field
+/// value, in order (`-f query=…` is where a document travels). A document gh
+/// reads from a file (`--input`, `-F query=@file`) is not opened.
+fn graphql_text(invocation: &GhInvocation) -> String {
+    invocation
+        .flags
+        .iter()
+        .filter(|flag| matches!(flag.name, "raw-field" | "field"))
+        .filter_map(|flag| flag.value.as_deref())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// The characters a GitHub login or organization name may carry.
@@ -685,38 +596,26 @@ fn gh_repo_environment() -> Option<String> {
         .filter(|spec| !spec.is_empty())
 }
 
-/// The value of the first explicit repository flag (shim lines 137-150).
-pub(crate) fn repo_flag(args: &[String]) -> Option<String> {
-    let mut index = 0;
-    while let Some(argument) = args.get(index) {
-        match argument.as_str() {
-            "-R" | "--repo" => {
-                // A missing value means this flag is necessarily last, so ending
-                // the scan is equivalent to the shim falling through.
-                return args.get(index + 1).cloned();
-            }
-            _ => {
-                if let Some(repo) = argument.strip_prefix("--repo=") {
-                    return Some(repo.to_owned());
-                }
-                // `-R=<spec>` and the attached `-R<spec>`, both pflag-legal.
-                if let Some(attached) = argument.strip_prefix("-R")
-                    && !attached.is_empty()
-                {
-                    return Some(attached.strip_prefix('=').unwrap_or(attached).to_owned());
-                }
-            }
-        }
-        index += 1;
-    }
-    None
+/// The REST endpoint a `gh api` call addresses, as gh reads it: its first
+/// positional, less a leading `/`, less an absolute `https://<host>/` gh sends
+/// verbatim, and less its query string and any `#fragment` (which Go's client
+/// never sends). A flag's value is never the endpoint, whatever it looks like.
+fn api_endpoint(invocation: &GhInvocation) -> Option<&str> {
+    let argument = invocation.positionals.first()?;
+    let path = argument
+        .strip_prefix("https://")
+        .or_else(|| argument.strip_prefix("http://"))
+        .and_then(|rest| rest.split_once('/'))
+        .map_or(argument.as_str(), |(_, path)| path);
+    let path = path.strip_prefix('/').unwrap_or(path);
+    Some(path.split(['?', '#']).next().unwrap_or(path))
 }
 
 /// Whether a `gh api` call addresses a repository by GitHub's numeric id
 /// (`repositories/<id>/…`), which names no owner knives can read.
-fn names_repository_by_id(args: &[String]) -> bool {
-    args.first().map(String::as_str) == Some("api")
-        && api_paths(args).any(|path| path.starts_with("repositories/"))
+fn names_repository_by_id(invocation: &GhInvocation) -> bool {
+    invocation.command.as_deref() == Some("api")
+        && api_endpoint(invocation).is_some_and(|endpoint| endpoint.starts_with("repositories/"))
 }
 
 /// The https URL targeted by this invocation (shim lines 75-179).
@@ -726,12 +625,15 @@ fn names_repository_by_id(args: &[String]) -> bool {
 /// no token is minted for it, and the checkout's own remotes — the fallback a
 /// path with no owner (`api user`) resolves through — are not consulted,
 /// since the call is about whichever repository the id names, not this one.
-pub(crate) fn resolve_target_url(args: &[String], cwd: &Path) -> Option<String> {
-    if names_repository_by_id(args) {
+pub(crate) fn resolve_target_url(invocation: &GhInvocation, cwd: &Path) -> Option<String> {
+    if names_repository_by_id(invocation) {
         return None;
     }
-    let api_owner = owner_from_api_args(args);
-    let repo_spec = repo_flag(args).or_else(gh_repo_environment);
+    let api_owner = owner_from_api_args(invocation);
+    let repo_spec = invocation
+        .last("repo")
+        .map(str::to_owned)
+        .or_else(gh_repo_environment);
     let needs_git_inputs = api_owner.is_none() && repo_spec.is_none();
     let resolved_remote = needs_git_inputs.then(|| gh_resolved_remote(cwd)).flatten();
     let registry = needs_git_inputs
@@ -866,9 +768,9 @@ fn preferred_remote_url(
 /// How an invocation would open a pull request, and on which head.
 #[derive(Debug, PartialEq, Eq)]
 enum PullOpening {
-    /// `gh pr create`; every head `--head`/`-H` states, in order, or the
-    /// dash-argument gh does not define that made the heads unreadable.
-    Create { heads: Result<Vec<String>, String> },
+    /// `gh pr create` (or its alias `pr new`); every head `--head`/`-H` states,
+    /// in order, as gh's parser reads them.
+    Create { heads: Vec<String> },
     /// `gh api repos/{owner}/{repo}/pulls` with a body: REST creation. The
     /// owner and repo are as written, gh placeholders (`{owner}`) included.
     Rest {
@@ -894,213 +796,59 @@ enum PullOpening {
 /// is matched as a token, not a substring. A GraphQL document gh reads from a
 /// file (`--input <file>`, `-f query=@file`) is not opened: only the arguments
 /// are read.
-fn pull_opening(args: &[String]) -> Option<PullOpening> {
-    if let Some((subcommand, _)) = pr_subcommand(args) {
-        return (subcommand == "create").then(|| PullOpening::Create {
-            heads: stated_heads(args).map(|heads| {
-                heads
-                    .iter()
+fn pull_opening(invocation: &GhInvocation) -> Option<PullOpening> {
+    match invocation.command.as_deref() {
+        Some("pr") => {
+            return (invocation.verb() == Some("create")).then(|| PullOpening::Create {
+                heads: invocation
+                    .values("head")
                     .map(|head| strip_head_owner(head).to_owned())
-                    .collect()
-            }),
-        });
+                    .collect(),
+            });
+        }
+        Some("api") => {}
+        _ => return None,
     }
-    if args.first().map(String::as_str) != Some("api") {
-        return None;
-    }
-    let joined = args.join(" ");
-    if names_mutation(&joined, "createPullRequest") {
+    let endpoint = api_endpoint(invocation)?;
+    if endpoint == "graphql" && names_mutation(&graphql_text(invocation), "createPullRequest") {
         return Some(PullOpening::Graphql {
-            head: field_argument_any(args, "headRefName"),
+            head: invocation
+                .fields("headRefName")
+                .find(|value| !value.is_empty())
+                .map(str::to_owned),
         });
     }
     // A request with fields is a POST in gh's own default; `-X GET` on the
-    // pulls endpoint lists them and opens nothing.
-    let method = flag_value(args, "-X")
-        .or_else(|| flag_value(args, "--method"))
-        .map(|method| method.to_ascii_uppercase());
-    // Every spelling of a field or body gh accepts, as `field_argument_any`
-    // reads them: `-f`/`-F` whole or attached (`-fhead=…`), and the long flags
-    // with or without `=`.
-    let has_body = args.iter().any(|argument| {
-        argument.starts_with("-f")
-            || argument.starts_with("-F")
-            || ["--raw-field", "--field", "--input"]
+    // pulls endpoint lists them and opens nothing. The method is the last one
+    // given, as gh keeps it, in any case.
+    let creates = invocation.last("method").map_or_else(
+        || {
+            ["raw-field", "field", "input"]
                 .iter()
-                .any(|flag| argument == flag || argument.starts_with(&format!("{flag}=")))
-    });
-    let creates = match method.as_deref() {
-        Some("POST") => true,
-        Some(_) => false,
-        None => has_body,
-    };
+                .any(|flag| invocation.has(flag))
+        },
+        |method| method.eq_ignore_ascii_case("POST"),
+    );
     if !creates {
         return None;
     }
     // GitHub serves every repository endpoint under `repos/<owner>/<repo>/…`
     // and, by numeric id, `repositories/<id>/…`; both are read.
-    api_paths(args).find_map(|path| {
-        if let Some(rest) = path.strip_prefix("repositories/") {
-            let mut segments = rest.split('/');
-            let id = segments.next()?;
-            return (segments.next() == Some("pulls") && segments.next().is_none())
-                .then(|| PullOpening::RestById { id: id.to_owned() });
-        }
-        let mut segments = path.strip_prefix("repos/")?.split('/');
-        let (owner, repo) = (segments.next()?, segments.next()?);
-        (segments.next() == Some("pulls") && segments.next().is_none()).then(|| PullOpening::Rest {
-            owner: owner.to_owned(),
-            repo: repo.to_owned(),
-            head: field_argument_any(args, "head").map(|head| strip_head_owner(&head).to_owned()),
-        })
-    })
-}
-
-/// The flags `gh pr create` accepts, as gh defines them (`pkg/cmd/pr/create`,
-/// plus `pr`'s persistent `--repo`): long name, shorthand, and whether the
-/// flag takes a value. pflag's `--flag v`, `--flag=v`, `-f v`, `-fv`, `-f=v`
-/// and shorthand clusters (`-dHv`: `d` a switch, `H` valued, `v` its value)
-/// are all read from this table.
-const PR_CREATE_FLAGS: &[(&str, Option<char>, bool)] = &[
-    ("assignee", Some('a'), true),
-    ("base", Some('B'), true),
-    ("body", Some('b'), true),
-    ("body-file", Some('F'), true),
-    ("head", Some('H'), true),
-    ("label", Some('l'), true),
-    ("milestone", Some('m'), true),
-    ("project", Some('p'), true),
-    ("reviewer", Some('r'), true),
-    ("template", Some('T'), true),
-    ("title", Some('t'), true),
-    ("repo", Some('R'), true),
-    ("recover", None, true),
-    ("draft", Some('d'), false),
-    ("fill", Some('f'), false),
-    ("fill-first", None, false),
-    ("fill-verbose", None, false),
-    ("web", Some('w'), false),
-    ("editor", Some('e'), false),
-    ("no-maintainer-edit", None, false),
-    ("dry-run", None, false),
-    ("help", Some('h'), false),
-];
-
-/// Whether a long flag of `pr create` takes a value; `None` for one gh does not define.
-fn pr_create_long_takes_value(name: &str) -> Option<bool> {
-    PR_CREATE_FLAGS
-        .iter()
-        .find(|(long, _, _)| *long == name)
-        .map(|(_, _, valued)| *valued)
-}
-
-/// Whether a shorthand of `pr create` takes a value; `None` for one gh does not define.
-fn pr_create_short_takes_value(short: char) -> Option<bool> {
-    PR_CREATE_FLAGS
-        .iter()
-        .find(|(_, shorthand, _)| *shorthand == Some(short))
-        .map(|(_, _, valued)| *valued)
-}
-
-/// Every head branch a `pr create` states, in order, read the way gh's flag
-/// parser (pflag) reads the command: from the verb on, each valued flag
-/// consumes its value — `--flag v`, `--flag=v`, `-f v`, `-fv`, `-f=v`, and in
-/// a shorthand cluster the rest of the cluster or the next argument once a
-/// valued shorthand is reached — so a `--body -Hx` is a body, `-dHfeat/x` is a
-/// head, and `--` ends flags.
-///
-/// One reader for both uses of the answer — the branch whose verdict the gate
-/// checks, and whether knives adds `--head <current bookmark>` for gh — so the
-/// pull request gh opens is the one the gate read. gh keeps the last head it
-/// is given, so a stated head with an added one behind it opened the current
-/// bookmark's pull request while the gate certified the stated branch; and two
-/// stated heads are not resolved to either — the gate refuses them, since the
-/// one gh would honour is not the one a reader of the command expects.
-///
-/// `Err` names a dash-argument gh does not define for `pr create`: whether it
-/// takes a value cannot be known, so which head gh would open cannot be, and
-/// nothing unverifiable is let through.
-pub(crate) fn stated_heads(args: &[String]) -> Result<Vec<String>, String> {
-    let start = pr_subcommand(args).map_or(0, |(_, index)| index + 1);
-    let mut heads = Vec::new();
-    let mut index = start;
-    while let Some(argument) = args.get(index) {
-        index += 1;
-        if argument == "--" {
-            break;
-        }
-        if let Some(long) = argument.strip_prefix("--") {
-            let (name, inline) = long
-                .split_once('=')
-                .map_or((long, None), |(name, value)| (name, Some(value)));
-            let Some(valued) = pr_create_long_takes_value(name) else {
-                return Err(argument.clone());
-            };
-            let value = match (valued, inline) {
-                (true, Some(value)) => Some(value.to_owned()),
-                (true, None) => {
-                    index += 1;
-                    args.get(index - 1).cloned()
-                }
-                (false, _) => None,
-            };
-            if name == "head"
-                && let Some(value) = value
-            {
-                heads.push(value);
-            }
-            continue;
-        }
-        let Some(cluster) = argument.strip_prefix('-').filter(|rest| !rest.is_empty()) else {
-            // A positional, or a bare `-`: gh's own business.
-            continue;
-        };
-        for (at, short) in cluster.char_indices() {
-            let Some(valued) = pr_create_short_takes_value(short) else {
-                return Err(argument.clone());
-            };
-            if !valued {
-                continue;
-            }
-            let rest = cluster.get(at + short.len_utf8()..).unwrap_or("");
-            let value = if rest.is_empty() {
-                index += 1;
-                args.get(index - 1).cloned()
-            } else {
-                Some(rest.strip_prefix('=').unwrap_or(rest).to_owned())
-            };
-            if short == 'H'
-                && let Some(value) = value
-            {
-                heads.push(value);
-            }
-            break;
-        }
+    if let Some(rest) = endpoint.strip_prefix("repositories/") {
+        let mut segments = rest.split('/');
+        let id = segments.next()?;
+        return (segments.next() == Some("pulls") && segments.next().is_none())
+            .then(|| PullOpening::RestById { id: id.to_owned() });
     }
-    Ok(heads)
-}
-
-/// Every REST path a `gh api` invocation names, as gh reads it: each non-dash
-/// argument after `api`, less a leading `/`, less an absolute
-/// `https://<host>/` gh sends verbatim, and less its query string and any
-/// `#fragment` (which Go's client never sends).
-///
-/// gh's own path handling (`pkg/cmd/api/http.go`): a path with `://` is used
-/// as the URL; anything else is joined onto the API root. The first argument
-/// shaped like an endpoint is the endpoint; callers scan in order and stop at
-/// the first path whose prefix they know.
-fn api_paths(args: &[String]) -> impl Iterator<Item = &str> {
-    args.iter().skip(1).filter_map(|argument| {
-        if argument.starts_with('-') {
-            return None;
-        }
-        let path = argument
-            .strip_prefix("https://")
-            .or_else(|| argument.strip_prefix("http://"))
-            .and_then(|rest| rest.split_once('/'))
-            .map_or(argument.as_str(), |(_, path)| path);
-        let path = path.strip_prefix('/').unwrap_or(path);
-        Some(path.split(['?', '#']).next().unwrap_or(path))
+    let mut segments = endpoint.strip_prefix("repos/")?.split('/');
+    let (owner, repo) = (segments.next()?, segments.next()?);
+    (segments.next() == Some("pulls") && segments.next().is_none()).then(|| PullOpening::Rest {
+        owner: owner.to_owned(),
+        repo: repo.to_owned(),
+        head: invocation
+            .fields("head")
+            .find(|value| !value.is_empty())
+            .map(|head| strip_head_owner(head).to_owned()),
     })
 }
 
@@ -1125,51 +873,6 @@ fn names_mutation(text: &str, name: &str) -> bool {
     })
 }
 
-/// The value of `--flag value` or `--flag=value`, first occurrence.
-fn flag_value(args: &[String], flag: &str) -> Option<String> {
-    let mut index = 0;
-    while let Some(argument) = args.get(index) {
-        if argument == flag {
-            return args.get(index + 1).cloned();
-        }
-        if let Some(value) = argument
-            .strip_prefix(flag)
-            .and_then(|rest| rest.strip_prefix('='))
-        {
-            return Some(value.to_owned());
-        }
-        index += 1;
-    }
-    None
-}
-
-/// [`field_argument`] without the login charset: a branch name may carry `/`.
-fn field_argument_any(args: &[String], name: &str) -> Option<String> {
-    let mut index = 0;
-    while let Some(argument) = args.get(index) {
-        let assignment = match argument.as_str() {
-            "-f" | "-F" | "--raw-field" | "--field" => {
-                index += 1;
-                args.get(index).map(String::as_str)
-            }
-            _ => argument
-                .strip_prefix("--raw-field=")
-                .or_else(|| argument.strip_prefix("--field="))
-                .or_else(|| argument.strip_prefix("-f"))
-                .or_else(|| argument.strip_prefix("-F"))
-                .map(|attached| attached.strip_prefix('=').unwrap_or(attached)),
-        };
-        if let Some((key, value)) = assignment.and_then(|assignment| assignment.split_once('='))
-            && key == name
-            && !value.is_empty()
-        {
-            return Some(value.to_owned());
-        }
-        index += 1;
-    }
-    None
-}
-
 /// `owner:branch` names a fork's branch from the base repository's side; the
 /// branch is what the ledger knows.
 fn strip_head_owner(head: &str) -> &str {
@@ -1186,40 +889,46 @@ fn strip_head_owner(head: &str) -> &str {
 /// the branch was started with the red-team's ruling (`knives start
 /// --placement`), and only `UPSTREAM` says upstream wants the change. Pull
 /// requests on the fork's own origin — a review branch, a release — are not
-/// upstream's business and pass. A registry that does not load leaves nothing
-/// to gate against, as it leaves nothing to route a token by; since the gate
-/// guards policy, stderr says so once and the command passes through.
-fn upstream_pull_refusal(args: &[String], cwd: &Path) -> anyhow::Result<Option<String>> {
-    let Some(opening) = pull_opening(args) else {
+/// upstream's business and pass. No registry file at all means no fork is
+/// registered and nothing is gated; since the gate guards policy, stderr says
+/// so once and the command passes through. A registry file that is present
+/// and cannot be read is an error, not an absence: nothing is let through on
+/// a ledger the tool cannot read.
+fn upstream_pull_refusal(invocation: &GhInvocation, cwd: &Path) -> anyhow::Result<Option<String>> {
+    // A flag gh's table does not define leaves the whole command unreadable:
+    // whether it takes a value decides which arguments are values and which
+    // the endpoint or a head, so nothing about a `pr create` or `gh api` with
+    // one can be told — the target included. Refused before anything is read.
+    let table = match (invocation.command.as_deref(), invocation.verb()) {
+        (Some("pr"), Some("create")) => Some(("pr create", "PR_CREATE_FLAGS")),
+        (Some("api"), _) => Some(("api", "API_FLAGS")),
+        _ => None,
+    };
+    if let Some((command, table)) = table
+        && let Some(refusal) = unknown_flag_refusal(invocation, command, table)
+    {
+        return Ok(Some(refusal));
+    }
+    let Some(opening) = pull_opening(invocation) else {
         return Ok(None);
     };
-    let registry = match crate::config::load(&crate::config::default_config_path()) {
-        Ok(registry) => registry,
-        Err(error) => {
-            eprintln!("knives: placement gate skipped: {error:#}");
-            return Ok(None);
-        }
-    };
+    // No registry file: nothing is registered, so nothing is gated — said
+    // once, so a silent pass is never mistaken for a verdict. A registry that
+    // is present but unreadable is an error: nothing passes on a ledger the
+    // tool cannot read.
+    let path = crate::config::default_config_path();
+    if !path.exists() {
+        eprintln!("knives: no registry at {}; nothing to gate", path.display());
+        return Ok(None);
+    }
+    let registry = crate::config::load(&path)?;
     let (repo, head) = match opening {
         PullOpening::Create { heads } => {
-            let Some(target) = resolve_target_url(args, cwd) else {
+            let Some(target) = resolve_target_url(invocation, cwd) else {
                 return Ok(None);
             };
             let Some(repo) = upstream_of(&registry, &target) else {
                 return Ok(None);
-            };
-            // A flag gh does not define for `pr create` leaves the heads
-            // unreadable: whether it takes a value decides which arguments
-            // are values, so which head gh would open cannot be told.
-            let heads = match heads {
-                Ok(heads) => heads,
-                Err(unknown) => {
-                    return Ok(Some(format!(
-                        "knives cannot tell whether {unknown} takes a value, so it cannot tell \
-                         which head gh would open for {repo}: spell the head as --head=<branch> \
-                         and put it first"
-                    )));
-                }
             };
             // gh keeps the last head it is given; a command that states two
             // is refused rather than read either way.
@@ -1229,6 +938,15 @@ fn upstream_pull_refusal(args: &[String], cwd: &Path) -> anyhow::Result<Option<S
                      {last} while a reader expects {first}: state one",
                     heads.len(),
                     heads.join(", ")
+                )));
+            }
+            // `--head=` with nothing after it makes gh fall back to the current
+            // branch, which that spelling gives knives no way to certify.
+            if heads.iter().any(String::is_empty) {
+                return Ok(Some(format!(
+                    "an upstream pull request for {repo} states an empty head (`--head=`): gh \
+                     would open the current branch, which knives cannot certify from that \
+                     spelling; state the branch"
                 )));
             }
             // The head gh will use when none is stated: the bookmark on `@`
@@ -1255,7 +973,7 @@ fn upstream_pull_refusal(args: &[String], cwd: &Path) -> anyhow::Result<Option<S
             // repository", which in a fork checkout is the upstream; resolved
             // the way `pr create` without `-R` is.
             let target = if is_api_placeholder(&owner) || is_api_placeholder(&repo) {
-                resolve_target_url(args, cwd)
+                resolve_target_url(invocation, cwd)
             } else {
                 url_from_spec(&format!("{owner}/{repo}"))
             };
@@ -1304,6 +1022,18 @@ fn upstream_pull_refusal(args: &[String], cwd: &Path) -> anyhow::Result<Option<S
     };
     let entries = crate::ledger::Ledger::for_repo(&repo).entries()?;
     Ok(crate::placement::upstream_pull_refusal(&entries, &head)?)
+}
+
+/// The refusal for a dash-argument gh's table for `command` does not define,
+/// or `None` when every flag is known. Whether the argument takes a value
+/// decides which arguments are values, so with one unknown nothing about the
+/// command can be told; the remedy is one an operator can follow.
+fn unknown_flag_refusal(invocation: &GhInvocation, command: &str, table: &str) -> Option<String> {
+    let unknown = invocation.unknown.first()?;
+    Some(format!(
+        "knives does not know gh's flag {unknown} for {command}: if gh accepts it, add it to \
+         {table} in src/commands/gh_args.rs; otherwise remove it"
+    ))
 }
 
 /// The branch git has checked out at the checkout `cwd` is inside, if any:
@@ -1390,6 +1120,11 @@ mod tests {
 
     use super::*;
     use std::collections::BTreeMap;
+
+    /// The one reading every reader is a lookup on.
+    fn parsed(args: &[String]) -> GhInvocation {
+        GhInvocation::parse(args)
+    }
 
     fn with_env<T>(vars: &[(&'static str, &str)], run: impl FnOnce() -> T) -> T {
         let _lock = crate::config::test_support::environment_lock();
@@ -1628,36 +1363,48 @@ mod tests {
     fn rest_paths_yield_their_owner_segment() {
         let args = |a: &[&str]| a.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
         assert_eq!(
-            owner_from_api_args(&args(&["api", "repos/acme/work/pulls"])).as_deref(),
+            owner_from_api_args(&parsed(&args(&["api", "repos/acme/work/pulls"]))).as_deref(),
             Some("acme")
         );
         assert_eq!(
-            owner_from_api_args(&args(&["api", "/orgs/acme/teams"])).as_deref(),
+            owner_from_api_args(&parsed(&args(&["api", "/orgs/acme/teams"]))).as_deref(),
             Some("acme")
         );
         assert_eq!(
-            owner_from_api_args(&args(&["api", "users/someone"])).as_deref(),
+            owner_from_api_args(&parsed(&args(&["api", "users/someone"]))).as_deref(),
             Some("someone")
         );
         // Query strings on bare segments are stripped (shim line 99).
         assert_eq!(
-            owner_from_api_args(&args(&["api", "orgs/acme?page=2"])).as_deref(),
+            owner_from_api_args(&parsed(&args(&["api", "orgs/acme?page=2"]))).as_deref(),
             Some("acme")
         );
-        // Placeholders expand from the current repo: no owner signal (line 101).
+        // Placeholders expand from the current repo: no owner signal.
         assert_eq!(
-            owner_from_api_args(&args(&["api", "repos/{owner}/{repo}/pulls"])),
+            owner_from_api_args(&parsed(&args(&["api", "repos/{owner}/{repo}/pulls"]))),
             None
         );
-        // Flags are skipped while scanning for the path (line 92).
+        // A flag and its value are read as such; the path is the positional.
         assert_eq!(
-            owner_from_api_args(&args(&["api", "-X", "POST", "repos/acme/work/issues"])).as_deref(),
+            owner_from_api_args(&parsed(&args(&[
+                "api",
+                "-X",
+                "POST",
+                "repos/acme/work/issues"
+            ])))
+            .as_deref(),
             Some("acme")
         );
-        assert_eq!(owner_from_api_args(&args(&["api", "repos/"])), None);
-        assert_eq!(owner_from_api_args(&args(&["api", "orgs/?page=2"])), None);
         assert_eq!(
-            owner_from_api_args(&args(&["pr", "list", "repos/acme/work"])),
+            owner_from_api_args(&parsed(&args(&["api", "repos/"]))),
+            None
+        );
+        assert_eq!(
+            owner_from_api_args(&parsed(&args(&["api", "orgs/?page=2"]))),
+            None
+        );
+        assert_eq!(
+            owner_from_api_args(&parsed(&args(&["pr", "list", "repos/acme/work"]))),
             None
         );
     }
@@ -1666,12 +1413,12 @@ mod tests {
     fn the_first_path_shaped_argument_ends_the_rest_scan() {
         let args = |a: &[&str]| a.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
         assert_eq!(
-            owner_from_api_args(&args(&[
+            owner_from_api_args(&parsed(&args(&[
                 "api",
                 "repos/{owner}/{repo}",
                 "-f",
                 r#"query=query { repository(owner: "acme") { id } }"#,
-            ])),
+            ]))),
             None
         );
     }
@@ -1680,52 +1427,52 @@ mod tests {
     fn graphql_bodies_yield_their_first_owner() {
         let args = |a: &[&str]| a.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
         assert_eq!(
-            owner_from_api_args(&args(&[
+            owner_from_api_args(&parsed(&args(&[
                 "api",
                 "graphql",
                 "-f",
                 r#"query=query { repository(owner: "acme", name: "work") { id } }"#,
-            ]))
+            ])))
             .as_deref(),
             Some("acme")
         );
         assert_eq!(
-            owner_from_api_args(&args(&[
+            owner_from_api_args(&parsed(&args(&[
                 "api",
                 "graphql",
                 "-f",
                 "query=query { organization(login: 'acme') { id } }",
-            ]))
+            ])))
             .as_deref(),
             Some("acme")
         );
         // Pure node-id mutations carry no owner signal (line 84).
         assert_eq!(
-            owner_from_api_args(&args(&[
+            owner_from_api_args(&parsed(&args(&[
                 "api",
                 "graphql",
                 "-f",
                 "query=mutation { addProjectV2ItemById(input: {}) { item { id } } }",
-            ])),
+            ]))),
             None
         );
         assert_eq!(
-            owner_from_api_args(&args(&[
+            owner_from_api_args(&parsed(&args(&[
                 "api",
                 "graphql",
                 "-f",
                 r#"query=query { repository (owner: "x") { id } }"#,
-            ]))
+            ])))
             .as_deref(),
             Some("x")
         );
         assert_eq!(
-            owner_from_api_args(&args(&[
+            owner_from_api_args(&parsed(&args(&[
                 "api",
                 "graphql",
                 "-f",
                 r#"query=query { repository(owner: "ac me") { id } }"#,
-            ])),
+            ]))),
             None
         );
     }
@@ -1736,12 +1483,12 @@ mod tests {
         // the text, whichever pattern it is.
         let args = |a: &[&str]| a.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
         assert_eq!(
-            owner_from_api_args(&args(&[
+            owner_from_api_args(&parsed(&args(&[
                 "api",
                 "graphql",
                 "-f",
                 r#"query=query { organization(login: "first") { id } repository(owner: "second", name: "x") { id } }"#,
-            ]))
+            ])))
             .as_deref(),
             Some("first")
         );
@@ -1754,12 +1501,12 @@ mod tests {
         // Field-anywhere scanning minted a token for the WRONG owner here.
         let args = |a: &[&str]| a.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
         assert_eq!(
-            owner_from_api_args(&args(&[
+            owner_from_api_args(&parsed(&args(&[
                 "api",
                 "graphql",
                 "-f",
                 r#"query=query { repository(name: "x", owner: "a") { id } organization(login: "b") { id } }"#,
-            ]))
+            ])))
             .as_deref(),
             Some("b")
         );
@@ -1798,50 +1545,50 @@ mod tests {
             vec!["api", "graphql", "-f", query, "-f", "owner=acme"],
         ] {
             assert_eq!(
-                owner_from_api_args(&args(&argv)).as_deref(),
+                owner_from_api_args(&parsed(&args(&argv))).as_deref(),
                 Some("acme"),
                 "argv {argv:?}"
             );
         }
         // Variable names are matched whole: `$owner` is not bound by `owner_id=`.
         assert_eq!(
-            owner_from_api_args(&args(&[
+            owner_from_api_args(&parsed(&args(&[
                 "api",
                 "graphql",
                 "-f",
                 "owner_id=acme",
                 "-f",
                 query
-            ])),
+            ]))),
             None
         );
         // An unbound variable is no signal; gh would reject the query anyway.
         assert_eq!(
-            owner_from_api_args(&args(&["api", "graphql", "-f", query])),
+            owner_from_api_args(&parsed(&args(&["api", "graphql", "-f", query]))),
             None
         );
         // A binding gh reads from a file or that is not an owner-shaped value is no signal.
         assert_eq!(
-            owner_from_api_args(&args(&[
+            owner_from_api_args(&parsed(&args(&[
                 "api",
                 "graphql",
                 "-F",
                 "owner=@owner.txt",
                 "-f",
                 query
-            ])),
+            ]))),
             None
         );
         // Leftmost still wins when the earlier field is variable-bound.
         assert_eq!(
-            owner_from_api_args(&args(&[
+            owner_from_api_args(&parsed(&args(&[
                 "api",
                 "graphql",
                 "-f",
                 "org=first",
                 "-f",
                 r#"query=query($org: String!) { organization(login: $org) { id } repository(owner: "second", name: "x") { id } }"#,
-            ]))
+            ])))
             .as_deref(),
             Some("first")
         );
@@ -1856,53 +1603,38 @@ mod tests {
         let scratch = tempfile::tempdir().expect("tempdir");
         with_env(&[("GH_REPO", "acme/work")], || {
             assert_eq!(
-                resolve_target_url(&args(&["pr", "list"]), scratch.path()),
+                resolve_target_url(&parsed(&args(&["pr", "list"])), scratch.path()),
                 Some(format!("https://{host}/acme/work.git"))
             );
             assert_eq!(
                 resolve_target_url(
-                    &args(&["api", "repos/{owner}/{repo}/pulls"]),
+                    &parsed(&args(&["api", "repos/{owner}/{repo}/pulls"])),
                     scratch.path()
                 ),
                 Some(format!("https://{host}/acme/work.git"))
             );
             assert_eq!(
-                resolve_target_url(&args(&["pr", "list", "-R", "other/repo"]), scratch.path()),
+                resolve_target_url(
+                    &parsed(&args(&["pr", "list", "-R", "other/repo"])),
+                    scratch.path()
+                ),
                 Some(format!("https://{host}/other/repo.git"))
             );
             // A path literal is the request's real target and still wins.
             assert_eq!(
-                resolve_target_url(&args(&["api", "repos/literal/repo/pulls"]), scratch.path()),
+                resolve_target_url(
+                    &parsed(&args(&["api", "repos/literal/repo/pulls"])),
+                    scratch.path()
+                ),
                 Some(format!("https://{host}/literal/gh-api.git"))
             );
         });
         with_env(&[("GH_REPO", "")], || {
             assert_eq!(
-                resolve_target_url(&args(&["pr", "list"]), scratch.path()),
+                resolve_target_url(&parsed(&args(&["pr", "list"])), scratch.path()),
                 None
             );
         });
-    }
-
-    #[test]
-    fn the_repo_flag_is_found_in_all_five_spellings() {
-        let args = |a: &[&str]| a.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
-        for argv in [
-            vec!["pr", "list", "-R", "acme/work"],
-            vec!["pr", "list", "--repo", "acme/work"],
-            vec!["pr", "list", "--repo=acme/work"],
-            vec!["pr", "list", "-R=acme/work"],
-            vec!["pr", "list", "-Racme/work"],
-        ] {
-            assert_eq!(
-                repo_flag(&args(&argv)).as_deref(),
-                Some("acme/work"),
-                "spelling {argv:?}"
-            );
-        }
-        assert_eq!(repo_flag(&args(&["pr", "list"])), None);
-        // A dangling -R with no value is not a target.
-        assert_eq!(repo_flag(&args(&["pr", "list", "-R"])), None);
     }
 
     #[test]
@@ -2074,155 +1806,6 @@ mod tests {
     }
 
     #[test]
-    fn the_pr_subcommand_is_found_past_intervening_flags() {
-        // Given: gh arguments with and without a pull-request command.
-        let args = |arguments: &[&str]| {
-            arguments
-                .iter()
-                .map(|argument| (*argument).to_owned())
-                .collect::<Vec<_>>()
-        };
-
-        // When: locating the pull-request subcommand.
-        let direct = pr_subcommand(&args(&["pr", "view", "123"]));
-        let after_flag = pr_subcommand(&args(&["pr", "--help", "create"]));
-
-        // Then: flags between `pr` and the subcommand are skipped (shim line
-        // 317); a valued one takes its value with it (`-R o/r create` reads
-        // `create`, tested below), so `-R create` alone names no verb.
-        assert_eq!(
-            direct.map(|(subcommand, _)| subcommand),
-            Some("view".to_owned())
-        );
-        assert_eq!(
-            after_flag.map(|(subcommand, _)| subcommand),
-            Some("create".to_owned())
-        );
-        assert_eq!(pr_subcommand(&args(&["pr", "-R", "create"])), None);
-        assert_eq!(pr_subcommand(&args(&["issue", "list"])), None);
-        assert_eq!(pr_subcommand(&args(&["api", "repos/a/b"])), None);
-    }
-
-    #[test]
-    fn positional_targets_are_detected_through_value_taking_flags() {
-        // Given: pull-request view invocations with flags, values, and targets.
-        let args = |arguments: &[&str]| {
-            arguments
-                .iter()
-                .map(|argument| (*argument).to_owned())
-                .collect::<Vec<_>>()
-        };
-
-        // When: checking for a positional target after the subcommand.
-        let only_repo_value =
-            has_positional_target("view", &args(&["pr", "view", "--repo", "acme/work"]));
-        let direct_target = has_positional_target("view", &args(&["pr", "view", "123"]));
-        let target_after_repo =
-            has_positional_target("view", &args(&["pr", "view", "--repo", "acme/work", "123"]));
-        let inline_json = has_positional_target("view", &args(&["pr", "view", "--json=title"]));
-
-        // Then: flag values do not become targets, including `--flag=value` forms.
-        assert!(!only_repo_value);
-        assert!(direct_target);
-        assert!(target_after_repo);
-        assert!(!inline_json);
-    }
-
-    #[test]
-    fn every_stated_head_is_read_in_every_spelling_gh_accepts() {
-        // One reader decides both what the gate checks and whether knives adds
-        // `--head <current bookmark>`; every pflag spelling of the string flag,
-        // every occurrence, in order — two heads are the gate's to refuse.
-        let args = |arguments: &[&str]| {
-            arguments
-                .iter()
-                .map(|argument| (*argument).to_owned())
-                .collect::<Vec<_>>()
-        };
-        let heads = |arguments: &[&str]| stated_heads(&args(arguments)).expect("known flags");
-
-        assert!(heads(&["pr", "create"]).is_empty());
-        for argv in [
-            vec!["pr", "create", "--head", "feat/x"],
-            vec!["pr", "create", "--head=feat/x"],
-            vec!["pr", "create", "-H", "feat/x"],
-            vec!["pr", "create", "-H=feat/x"],
-            vec!["pr", "create", "-Hfeat/x"],
-            vec!["pr", "create", "--title", "t", "-Hfeat/x", "--body", "b"],
-            // Shorthand clusters: switches before the valued `H`, whose value
-            // is the rest of the cluster or the next argument.
-            vec!["pr", "create", "-dHfeat/x"],
-            vec!["pr", "create", "-fHfeat/x", "--title", "t"],
-            vec!["pr", "create", "-dH", "feat/x"],
-            vec!["pr", "create", "-wdH=feat/x"],
-            // A repo flag before the verb is skipped with its value.
-            vec!["pr", "-R", "o/r", "create", "-H", "feat/x"],
-        ] {
-            assert_eq!(heads(&argv), ["feat/x"], "{argv:?}");
-        }
-        assert_eq!(
-            heads(&["pr", "create", "--head", "feat/x", "-Hfeat/y"]),
-            ["feat/x", "feat/y"]
-        );
-        // A valued flag's value is never a head, whatever it looks like.
-        for argv in [
-            vec!["pr", "create", "--title", "t", "--body", "-Hfeat/x"],
-            vec!["pr", "create", "--body=-Hfeat/x"],
-            vec!["pr", "create", "-b", "-Hfeat/x"],
-            vec!["pr", "create", "-b-Hfeat/x"],
-            vec!["pr", "create", "-l", "--head", "feat/x"],
-            vec!["pr", "create", "--recover", "--head=feat/x"],
-            // `--` ends flags; what follows is gh's positional business.
-            vec!["pr", "create", "--", "--head", "feat/x"],
-            // `-H` alone at the end has no value to give.
-            vec!["pr", "create", "-H"],
-        ] {
-            assert!(heads(&argv).is_empty(), "{argv:?}");
-        }
-        // A flag gh does not define for `pr create` makes the heads unreadable.
-        assert_eq!(
-            stated_heads(&args(&["pr", "create", "--mystery", "x", "-H", "feat/x"])),
-            Err("--mystery".to_owned())
-        );
-        assert_eq!(
-            stated_heads(&args(&["pr", "create", "-dZ", "-H", "feat/x"])),
-            Err("-dZ".to_owned())
-        );
-    }
-
-    #[test]
-    fn the_pr_verb_is_found_past_a_valued_repo_flag() {
-        // `-R`/`--repo` is a persistent flag on `gh pr`, so cobra accepts it
-        // before the verb; its value is not the verb.
-        let args = |arguments: &[&str]| {
-            arguments
-                .iter()
-                .map(|argument| (*argument).to_owned())
-                .collect::<Vec<_>>()
-        };
-        for argv in [
-            vec!["pr", "-R", "o/r", "create", "--title", "t"],
-            vec!["pr", "--repo", "o/r", "create"],
-            vec!["pr", "--repo=o/r", "create"],
-            vec!["pr", "-Ro/r", "create"],
-            vec!["pr", "create", "-R", "o/r"],
-        ] {
-            assert_eq!(
-                pr_subcommand(&args(&argv)).map(|(verb, _)| verb),
-                Some("create".to_owned()),
-                "{argv:?}"
-            );
-        }
-        assert_eq!(
-            pull_opening(&args(&["pr", "-R", "o/r", "create", "-H", "feat/x"])),
-            Some(PullOpening::Create {
-                heads: Ok(vec!["feat/x".to_owned()]),
-            })
-        );
-        assert_eq!(pr_subcommand(&args(&["pr", "-R", "o/r"])), None);
-    }
-
-    #[test]
     fn a_rest_pull_creation_is_seen_whatever_precedes_its_path() {
         // `gh api -X POST repos/o/r/pulls` is the documented spelling; a valued
         // flag before the path must not be taken for the path.
@@ -2275,44 +1858,47 @@ mod tests {
                 "head=feat/x",
             ],
         ] {
-            assert_eq!(pull_opening(&args(&argv)), rest, "{argv:?}");
+            assert_eq!(pull_opening(&parsed(&args(&argv))), rest, "{argv:?}");
         }
         // gh sends an absolute URL verbatim; the path is the same endpoint.
         let absolute = format!("https://api.{DEFAULT_HOST}/repos/o/r/pulls?x=1");
         assert_eq!(
-            pull_opening(&args(&[
+            pull_opening(&parsed(&args(&[
                 "api",
                 "-X",
                 "POST",
                 &absolute,
                 "-f",
                 "head=feat/x"
-            ])),
+            ]))),
             rest,
             "{absolute}"
         );
         // A GET lists; a path that is not the pulls endpoint opens nothing.
-        assert_eq!(pull_opening(&args(&["api", "repos/o/r/pulls"])), None);
         assert_eq!(
-            pull_opening(&args(&[
+            pull_opening(&parsed(&args(&["api", "repos/o/r/pulls"]))),
+            None
+        );
+        assert_eq!(
+            pull_opening(&parsed(&args(&[
                 "api",
                 "-X",
                 "GET",
                 "repos/o/r/pulls",
                 "-f",
                 "state=open"
-            ])),
+            ]))),
             None
         );
         assert_eq!(
-            pull_opening(&args(&[
+            pull_opening(&parsed(&args(&[
                 "api",
                 "-X",
                 "POST",
                 "repos/o/r/pulls/1/comments",
                 "-f",
                 "body=hi"
-            ])),
+            ]))),
             None
         );
     }
@@ -2333,41 +1919,41 @@ mod tests {
             head: Some("feat/x".to_owned()),
         });
         assert_eq!(
-            pull_opening(&args(&[
+            pull_opening(&parsed(&args(&[
                 "api",
                 "repos/o/r/pulls",
                 "-ftitle=x",
                 "-fhead=feat/x"
-            ])),
+            ]))),
             rest,
             "attached fields"
         );
         assert_eq!(
-            pull_opening(&args(&["api", "repos/o/r/pulls", "-Fhead=feat/x"])),
+            pull_opening(&parsed(&args(&["api", "repos/o/r/pulls", "-Fhead=feat/x"]))),
             rest,
             "attached typed field"
         );
         assert_eq!(
-            pull_opening(&args(&[
+            pull_opening(&parsed(&args(&[
                 "api",
                 "-X",
                 "POST",
                 "repos/o/r/pulls#x",
                 "-f",
                 "head=feat/x"
-            ])),
+            ]))),
             rest,
             "fragment"
         );
         assert_eq!(
-            pull_opening(&args(&[
+            pull_opening(&parsed(&args(&[
                 "api",
                 "-X",
                 "POST",
                 "repos/o/r/pulls?a=1#x",
                 "-f",
                 "head=feat/x"
-            ])),
+            ]))),
             rest,
             "query and fragment"
         );
@@ -2405,22 +1991,22 @@ mod tests {
             ],
             vec!["api", "-X", "POST", absolute.as_str(), "-f", "head=feat/x"],
         ] {
-            assert_eq!(pull_opening(&args(&argv)), by_id, "{argv:?}");
+            assert_eq!(pull_opening(&parsed(&args(&argv))), by_id, "{argv:?}");
         }
         // A GET lists; a sibling endpoint opens nothing.
         assert_eq!(
-            pull_opening(&args(&["api", "repositories/1318902388/pulls"])),
+            pull_opening(&parsed(&args(&["api", "repositories/1318902388/pulls"]))),
             None
         );
         assert_eq!(
-            pull_opening(&args(&[
+            pull_opening(&parsed(&args(&[
                 "api",
                 "-X",
                 "POST",
                 "repositories/1318902388/issues",
                 "-f",
                 "title=t"
-            ])),
+            ]))),
             None
         );
         for argv in [
@@ -2434,7 +2020,7 @@ mod tests {
                 "head=feat/x",
             ],
         ] {
-            assert_eq!(owner_from_api_args(&args(&argv)), None, "{argv:?}");
+            assert_eq!(owner_from_api_args(&parsed(&args(&argv))), None, "{argv:?}");
         }
     }
 
@@ -2455,7 +2041,7 @@ mod tests {
             let repo = format!("{open}repo{close}");
             let placeholder = format!("repos/{owner}/{repo}/pulls");
             assert_eq!(
-                pull_opening(&args(&["api", "-X", "POST", &placeholder])),
+                pull_opening(&parsed(&args(&["api", "-X", "POST", &placeholder]))),
                 Some(PullOpening::Rest {
                     owner: owner.clone(),
                     repo,
@@ -2463,12 +2049,15 @@ mod tests {
                 }),
                 "{placeholder}"
             );
-            assert_eq!(owner_from_api_args(&args(&["api", &placeholder])), None);
+            assert_eq!(
+                owner_from_api_args(&parsed(&args(&["api", &placeholder]))),
+                None
+            );
             assert!(is_api_placeholder(&owner), "{owner}");
         }
         let absolute = format!("https://api.{DEFAULT_HOST}/repos/o/r/pulls");
         assert_eq!(
-            owner_from_api_args(&args(&["api", &absolute])).as_deref(),
+            owner_from_api_args(&parsed(&args(&["api", &absolute]))).as_deref(),
             Some("o")
         );
         assert!(!is_api_placeholder("routed-a"));
@@ -2483,24 +2072,28 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         let head = Some(PullOpening::Create {
-            heads: Ok(vec!["feat/x".to_owned()]),
+            heads: vec!["feat/x".to_owned()],
         });
-        assert_eq!(pull_opening(&args(&["pr", "create", "-H", "feat/x"])), head);
         assert_eq!(
-            pull_opening(&args(&["pr", "create", "--head", "o:feat/x"])),
+            pull_opening(&parsed(&args(&["pr", "create", "-H", "feat/x"]))),
             head
         );
         assert_eq!(
-            pull_opening(&args(&["pr", "create", "--head=feat/x"])),
+            pull_opening(&parsed(&args(&["pr", "create", "--head", "o:feat/x"]))),
             head
         );
         assert_eq!(
-            pull_opening(&args(&["pr", "create"])),
-            Some(PullOpening::Create {
-                heads: Ok(Vec::new())
-            })
+            pull_opening(&parsed(&args(&["pr", "create", "--head=feat/x"]))),
+            head
         );
-        assert_eq!(pull_opening(&args(&["pr", "view", "-H", "feat/x"])), None);
+        assert_eq!(
+            pull_opening(&parsed(&args(&["pr", "create"]))),
+            Some(PullOpening::Create { heads: Vec::new() })
+        );
+        assert_eq!(
+            pull_opening(&parsed(&args(&["pr", "view", "-H", "feat/x"]))),
+            None
+        );
     }
 
     #[test]
@@ -2524,7 +2117,12 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    pull_opening(&args(&["api", "graphql", "-f", &format!("query={query}")])),
+                    pull_opening(&parsed(&args(&[
+                        "api",
+                        "graphql",
+                        "-f",
+                        &format!("query={query}")
+                    ]))),
                     Some(PullOpening::Graphql { .. })
                 ),
                 "{query}"
@@ -2536,7 +2134,12 @@ mod tests {
             "mutation { createPullRequestReviewComment(input:{pullRequestReviewId:\"V\",body:\"hi\"}) { clientMutationId } }",
         ] {
             assert_eq!(
-                pull_opening(&args(&["api", "graphql", "-f", &format!("query={query}")])),
+                pull_opening(&parsed(&args(&[
+                    "api",
+                    "graphql",
+                    "-f",
+                    &format!("query={query}")
+                ]))),
                 None,
                 "{query}"
             );
@@ -2554,8 +2157,9 @@ mod tests {
         };
 
         // When: inserting the current bookmark as the default pull-request target.
-        let injected =
-            inject_positional(&args(&["pr", "view", "--json", "title"]), "view", "feat/x");
+        let command = args(&["pr", "view", "--json", "title"]);
+        let (_, verb_index) = parsed(&command).verb.expect("a pr verb");
+        let injected = inject_positional(&command, verb_index, "feat/x");
 
         // Then: the bookmark is the argument immediately after the subcommand.
         assert_eq!(injected, args(&["pr", "view", "feat/x", "--json", "title"]));

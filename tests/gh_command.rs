@@ -7,7 +7,7 @@
 
 #[path = "common/lab.rs"]
 mod lab;
-// allow: SIZE_OK: 905 lines - real-binary gh passthrough scenarios share one fixture and process harness.
+// allow: SIZE_OK: 2281 lines - real-binary gh passthrough scenarios share one fixture and process harness.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
@@ -610,11 +610,17 @@ fn pr_create_without_bookmark_fails_without_invoking_gh() {
         .output()
         .expect("run knives gh");
 
-    // Then: knives emits the exact diagnostic before spawning gh.
+    // Then: knives emits the exact diagnostic before spawning gh (after the
+    // gate's one line that no registry is at this scratch config home).
     assert_eq!(output.status.code(), Some(1));
-    assert_eq!(
-        output.stderr,
-        b"Error: No jj bookmark at current change (@)\n\nCreate one with:\n  jj bookmark create <name>\n\nOr push and create in one step:\n  jj git push --named=<name>=@\n"
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.starts_with("knives: no registry at "), "{stderr}");
+    assert!(
+        stderr.ends_with(
+            "Error: No jj bookmark at current change (@)\n\nCreate one with:\n  jj bookmark \
+             create <name>\n\nOr push and create in one step:\n  jj git push --named=<name>=@\n"
+        ),
+        "{stderr}"
     );
     assert!(!log.exists(), "fake gh should not run");
 }
@@ -1362,11 +1368,10 @@ fn heads_are_read_as_gh_parses_them_values_clusters_and_the_terminator() {
     assert_eq!(unknown.status.code(), Some(2), "{unknown:?}");
     let stderr = String::from_utf8_lossy(&unknown.stderr);
     assert!(
-        stderr.contains("knives cannot tell whether --mystery takes a value"),
-        "{stderr}"
-    );
-    assert!(
-        stderr.contains("spell the head as --head=<branch> and put it first"),
+        stderr.contains(
+            "knives does not know gh's flag --mystery for pr create: if gh accepts it, add it \
+             to PR_CREATE_FLAGS in src/commands/gh_args.rs; otherwise remove it"
+        ),
         "{stderr}"
     );
     assert!(!log.exists(), "gh ran despite the refusal");
@@ -1428,6 +1433,335 @@ fn a_clustered_head_in_a_plain_git_clone_is_the_head_the_gate_reads() {
     let passed = run(&["-dHfeat/allowed", "--title", "t", "--body", "b"]);
     assert!(passed.status.success(), "{passed:?}");
     assert!(log.exists(), "gh must run for an UPSTREAM head");
+}
+
+#[test]
+fn the_gate_reads_pr_create_as_gh_parses_it_whatever_the_flag_order_alias_or_spelling() {
+    // Given: `@` on feat/eps (FORK) inside a fork checkout, feat/gamma
+    // UPSTREAM, feat/none unverdicted, and a routed token helper so a minted
+    // token is observable. Every shape here is one gh 2.98.0 accepts as a
+    // `pr create` toward the upstream.
+    let config_home = placement_gate_home();
+    record_placement(config_home.path(), "feat/eps", "FORK");
+    record_placement(config_home.path(), "feat/gamma", "UPSTREAM");
+    let lab = fork_checkout_of_the_registered_upstream();
+    lab.branch("feat/eps", "eps.txt", "eps\n");
+    lab.jj_work(["edit", "feat/eps"]);
+    let (dir, log) = fake_gh();
+    let helper_dir = fake_app_token();
+    let gitconfig = token_config(helper_dir.path(), "routed-a");
+    let run = |arguments: &[&str]| {
+        knives_cmd(helper_dir.path())
+            .args(["gh", "--"])
+            .args(arguments)
+            .current_dir(&lab.work)
+            .env("KNIVES_CONFIG_HOME", config_home.path())
+            .env("HOME", lab.temp_path())
+            .env("KNIVES_REAL_GH", dir.path().join("gh"))
+            .env("FAKE_GH_LOG", &log)
+            .env("PATH", helper_path(helper_dir.path()))
+            .env("GIT_CONFIG_GLOBAL", &gitconfig)
+            .output()
+            .expect("run knives gh")
+    };
+    let refused = |arguments: &[&str], text: &str| {
+        let output = run(arguments);
+        assert_eq!(output.status.code(), Some(2), "{arguments:?}: {output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(text),
+            "{arguments:?}: {output:?}"
+        );
+        assert!(!log.exists(), "{arguments:?}: gh ran despite the refusal");
+    };
+    let up = "routed-a/upstream";
+    let none = knives::placement::missing_member_refusal("feat/none");
+    let eps = "feat/eps has placement verdict FORK";
+
+    // gh's own alias of the verb.
+    refused(&["pr", "new", "-R", up, "-H", "feat/none"], &none);
+    refused(&["pr", "new", "-R", up, "--title", "t", "--body", "b"], eps);
+    // A head or any valued flag before the verb: cobra hands the child every flag.
+    refused(&["pr", "-H", "feat/none", "create", "-R", up], &none);
+    refused(&["pr", "--head=feat/none", "create", "-R", up], &none);
+    refused(
+        &["pr", "--title", "t", "create", "-R", up, "-H", "feat/none"],
+        &none,
+    );
+    refused(
+        &["pr", "--title", "t", "create", "-R", up, "--body", "b"],
+        eps,
+    );
+    // A second -R: gh keeps the last; a decoy first one mints nothing for the decoy.
+    refused(
+        &["pr", "create", "-R", "zz/yy", "-R", up, "-H", "feat/none"],
+        &none,
+    );
+    refused(
+        &[
+            "pr",
+            "create",
+            "--body",
+            "-R",
+            "--repo",
+            up,
+            "-H",
+            "feat/none",
+        ],
+        &none,
+    );
+    // URL forms of the upstream, with the suffixes gh tolerates.
+    let host = concat!("github", ".com");
+    let slash = format!("https://{host}/{up}/");
+    let dotgit = format!("https://{host}/{up}.git");
+    refused(&["pr", "create", "-R", &slash, "-H", "feat/none"], &none);
+    refused(&["pr", "create", "-R", &dotgit, "-H", "feat/none"], &none);
+    // An empty head: gh would open the current branch, which that spelling
+    // gives knives no way to certify.
+    refused(
+        &["pr", "create", "-R", up, "--head=", "--title", "t"],
+        "states an empty head (`--head=`)",
+    );
+    // A flag gh does not define for `pr create`: refused with a remedy an
+    // operator can follow.
+    refused(
+        &[
+            "pr",
+            "create",
+            "-R",
+            up,
+            "--head=feat/gamma",
+            "--mystery",
+            "x",
+        ],
+        "knives does not know gh's flag --mystery for pr create: if gh accepts it, add it to \
+         PR_CREATE_FLAGS in src/commands/gh_args.rs; otherwise remove it",
+    );
+}
+
+#[test]
+fn an_upstream_head_in_any_pflag_spelling_passes_with_one_head_and_the_upstream_token() {
+    // Given: the same fork checkout, FORK bookmark on `@`, feat/gamma UPSTREAM.
+    // Given: `@` on feat/eps (FORK) inside a fork checkout, feat/gamma
+    // UPSTREAM, feat/none unverdicted, and a routed token helper so a minted
+    // token is observable. Every shape here is one gh 2.98.0 accepts as a
+    // `pr create` toward the upstream.
+    let config_home = placement_gate_home();
+    record_placement(config_home.path(), "feat/eps", "FORK");
+    record_placement(config_home.path(), "feat/gamma", "UPSTREAM");
+    let lab = fork_checkout_of_the_registered_upstream();
+    lab.branch("feat/eps", "eps.txt", "eps\n");
+    lab.jj_work(["edit", "feat/eps"]);
+    let (dir, log) = fake_gh();
+    let helper_dir = fake_app_token();
+    let gitconfig = token_config(helper_dir.path(), "routed-a");
+    let run = |arguments: &[&str]| {
+        knives_cmd(helper_dir.path())
+            .args(["gh", "--"])
+            .args(arguments)
+            .current_dir(&lab.work)
+            .env("KNIVES_CONFIG_HOME", config_home.path())
+            .env("HOME", lab.temp_path())
+            .env("KNIVES_REAL_GH", dir.path().join("gh"))
+            .env("FAKE_GH_LOG", &log)
+            .env("PATH", helper_path(helper_dir.path()))
+            .env("GIT_CONFIG_GLOBAL", &gitconfig)
+            .output()
+            .expect("run knives gh")
+    };
+    let up = "routed-a/upstream";
+
+    // Then: an UPSTREAM head in a pflag-legal spelling passes with exactly
+    // one head in gh's argv and the routed token for the upstream.
+    for arguments in [
+        &[
+            "pr",
+            "create",
+            "-R",
+            up,
+            "-d=true",
+            "-H",
+            "feat/gamma",
+            "--title",
+            "t",
+            "--body",
+            "b",
+        ][..],
+        &[
+            "pr",
+            "-H",
+            "feat/gamma",
+            "new",
+            "-R",
+            up,
+            "--title",
+            "t",
+            "--body",
+            "b",
+        ][..],
+        &[
+            "pr",
+            "create",
+            "-R",
+            "zz/yy",
+            "-R",
+            up,
+            "-H",
+            "feat/gamma",
+            "--title",
+            "t",
+            "--body",
+            "b",
+        ][..],
+    ] {
+        let output = run(arguments);
+        assert!(output.status.success(), "{arguments:?}: {output:?}");
+        let recorded = fs::read_to_string(&log).expect("fake gh ran");
+        let argv: Vec<&str> = recorded
+            .lines()
+            .take_while(|line| !line.starts_with("GH_TOKEN="))
+            .collect();
+        assert_eq!(
+            argv.iter()
+                .filter(|a| **a == "--head" || **a == "-H")
+                .count(),
+            1,
+            "{arguments:?}: {recorded}"
+        );
+        assert!(!argv.contains(&"feat/eps"), "{arguments:?}: {recorded}");
+        assert!(
+            recorded.contains("GH_TOKEN=tok-routed-a"),
+            "{arguments:?}: {recorded}"
+        );
+        fs::remove_file(&log).expect("reset the gh log");
+    }
+}
+
+#[test]
+fn the_gate_reads_gh_api_as_gh_parses_it_and_a_flag_value_is_never_the_endpoint() {
+    // Given: a fork checkout on FORK feat/eps, feat/none unverdicted, and the
+    // routed token helper on PATH.
+    let config_home = placement_gate_home();
+    record_placement(config_home.path(), "feat/eps", "FORK");
+    let lab = fork_checkout_of_the_registered_upstream();
+    let (dir, log) = fake_gh();
+    let helper_dir = fake_app_token();
+    let gitconfig = token_config(helper_dir.path(), "routed-a");
+    let run = |arguments: &[&str]| {
+        knives_cmd(helper_dir.path())
+            .args(["gh", "--", "api"])
+            .args(arguments)
+            .current_dir(&lab.work)
+            .env("KNIVES_CONFIG_HOME", config_home.path())
+            .env("HOME", lab.temp_path())
+            .env("KNIVES_REAL_GH", dir.path().join("gh"))
+            .env("FAKE_GH_LOG", &log)
+            .env("PATH", helper_path(helper_dir.path()))
+            .env("GIT_CONFIG_GLOBAL", &gitconfig)
+            .output()
+            .expect("run knives gh")
+    };
+    let none = knives::placement::missing_member_refusal("feat/none");
+    let pulls = "repos/routed-a/upstream/pulls";
+    let decoy = "repos/zz/yy/pulls";
+    for arguments in [
+        // The method is last-wins.
+        &["-X", "GET", "-X", "POST", pulls, "-f", "head=feat/none"][..],
+        // A flag's value shaped like an endpoint is not the endpoint.
+        &["-X", "POST", "-t", decoy, pulls, "-f", "head=feat/none"][..],
+        &["--jq", decoy, "-X", "POST", pulls, "-f", "head=feat/none"][..],
+        &["--input", decoy, pulls, "-f", "head=feat/none"][..],
+        &[
+            "-H",
+            "X-Decoy: repos/zz/yy/pulls",
+            "-X",
+            "POST",
+            pulls,
+            "-f",
+            "head=feat/none",
+        ][..],
+    ] {
+        let output = run(arguments);
+        assert_eq!(output.status.code(), Some(2), "{arguments:?}: {output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(&none),
+            "{arguments:?}: {output:?}"
+        );
+        assert!(!log.exists(), "{arguments:?}: gh ran despite the refusal");
+    }
+    // An attached method is read: `-XGET` on the pulls endpoint lists, and
+    // the fields do not make it a creation; the upstream's token is minted.
+    let listed = run(&["-XGET", pulls, "-f", "state=open"]);
+    assert!(listed.status.success(), "{listed:?}");
+    let recorded = fs::read_to_string(&log).expect("fake gh ran");
+    assert!(recorded.contains("GH_TOKEN=tok-routed-a"), "{recorded}");
+    fs::remove_file(&log).expect("reset the gh log");
+    // A flag gh does not define for `api` is refused with the table remedy.
+    let unknown = run(&["--nope", "x", "-X", "POST", pulls, "-f", "head=feat/none"]);
+    assert_eq!(unknown.status.code(), Some(2), "{unknown:?}");
+    assert!(
+        String::from_utf8_lossy(&unknown.stderr).contains(
+            "knives does not know gh's flag --nope for api: if gh accepts it, add it to API_FLAGS \
+             in src/commands/gh_args.rs; otherwise remove it"
+        ),
+        "{unknown:?}"
+    );
+    assert!(!log.exists(), "gh ran despite the refusal");
+}
+
+#[test]
+fn a_missing_registry_says_so_once_and_an_unreadable_one_refuses() {
+    // No registry file: nothing is registered, so nothing is gated — said once
+    // on stderr. A registry file that cannot be read is an error: nothing
+    // passes on a ledger the tool cannot read.
+    let scratch = tempfile::tempdir().expect("scratch");
+    let (dir, log) = fake_gh();
+    let helper_dir = fake_app_token();
+    let gitconfig = token_config(helper_dir.path(), "routed-a");
+    let run = |config_home: &Path| {
+        knives_cmd(helper_dir.path())
+            .args([
+                "gh",
+                "--",
+                "pr",
+                "create",
+                "-R",
+                "routed-a/upstream",
+                "--head",
+                "feat/none",
+            ])
+            .current_dir(scratch.path())
+            .env("KNIVES_CONFIG_HOME", config_home)
+            .env("KNIVES_REAL_GH", dir.path().join("gh"))
+            .env("FAKE_GH_LOG", &log)
+            .env("PATH", helper_path(helper_dir.path()))
+            .env("GIT_CONFIG_GLOBAL", &gitconfig)
+            .output()
+            .expect("run knives gh")
+    };
+
+    let missing = tempfile::tempdir().expect("config home");
+    let output = run(missing.path());
+    assert!(output.status.success(), "{output:?}");
+    assert!(log.exists(), "gh must run when nothing is registered");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&format!(
+            "knives: no registry at {}; nothing to gate",
+            missing.path().join("repos.toml").display()
+        )),
+        "{stderr}"
+    );
+    fs::remove_file(&log).expect("reset the gh log");
+
+    let broken = tempfile::tempdir().expect("config home");
+    fs::write(broken.path().join("repos.toml"), "[repos.broken\n").expect("write registry");
+    let output = run(broken.path());
+    assert_eq!(output.status.code(), Some(3), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("is not a valid registry"),
+        "{output:?}"
+    );
+    assert!(!log.exists(), "gh ran on a registry knives could not read");
 }
 
 #[test]
@@ -1639,47 +1973,6 @@ fn a_review_mutation_inside_a_fork_checkout_passes_while_the_create_mutation_is_
         );
         assert!(!log.exists(), "{query}: gh ran despite the refusal");
     }
-}
-
-#[test]
-fn a_registry_that_does_not_load_skips_the_gate_and_says_so() {
-    // The gate guards policy, so its absence is said once on stderr; the
-    // command itself passes through as it always did.
-    let config_home = tempfile::tempdir().expect("config home");
-    fs::write(config_home.path().join("repos.toml"), "[repos.broken\n").expect("write registry");
-    let (dir, log) = fake_gh();
-    let helper_dir = fake_app_token();
-    let gitconfig = token_config(helper_dir.path(), "routed-a");
-
-    let output = knives_cmd(helper_dir.path())
-        .args([
-            "gh",
-            "--",
-            "pr",
-            "create",
-            "-R",
-            "routed-a/upstream",
-            "--head",
-            "feat/gamma",
-        ])
-        .current_dir(helper_dir.path())
-        .env("KNIVES_CONFIG_HOME", config_home.path())
-        .env("KNIVES_REAL_GH", dir.path().join("gh"))
-        .env("FAKE_GH_LOG", &log)
-        .env("PATH", helper_path(helper_dir.path()))
-        .env("GIT_CONFIG_GLOBAL", &gitconfig)
-        .output()
-        .expect("run knives gh");
-
-    assert!(output.status.success(), "{output:?}");
-    assert!(
-        log.exists(),
-        "gh must run when there is nothing to gate against"
-    );
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("knives: placement gate skipped: "),
-        "{output:?}"
-    );
 }
 
 /// A marked shim `gh` that records its arguments and exits 99 without running anything.
