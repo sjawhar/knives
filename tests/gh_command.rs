@@ -7,7 +7,7 @@
 
 #[path = "common/lab.rs"]
 mod lab;
-// allow: SIZE_OK: 5545 lines - real-binary gh passthrough scenarios share one fixture and process harness.
+// allow: SIZE_OK: 5741 lines - real-binary gh passthrough scenarios share one fixture and process harness.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
@@ -4088,7 +4088,7 @@ fn hosts_yml_is_found_by_go_ghs_config_dir_precedence() {
     );
     refused(
         "ghe example:\n    user: m\n",
-        "the one host in gh's hosts.yml, \"ghe example\", is not a host knives compares",
+        "is not a hosts map knives can read (line \"ghe example:\")",
     );
     fs::remove_file(gh_config.path().join("hosts.yml")).expect("remove hosts.yml");
     // The directory precedence is go-gh's: GH_CONFIG_DIR, then $XDG_CONFIG_HOME/gh.
@@ -5190,6 +5190,202 @@ fn a_fetch_url_naming_a_repository_wins_over_the_push_url_as_in_gh() {
     assert!(output.status.success(), "{output:?}");
     let recorded = recorded.expect("fake gh ran");
     assert!(recorded.contains("GH_TOKEN=tok-other"), "{recorded}");
+}
+
+#[test]
+fn any_spelling_of_a_hosts_heading_is_the_hosts_region_and_never_falls_through() {
+    // Measured (round-12 reviews, both lanes): gh reads `hosts  : {…}`,
+    // `"hosts" : {…}`, `'hosts' : {…}`, `hosts<TAB>: {…}` and `hosts:<TAB># c`
+    // as the hosts key. A heading knives did not enumerate fell through to
+    // hosts.yml and certified the wrong default host. Now any column-0 line
+    // whose key token is `hosts` IS the hosts region: read when its block is
+    // readable, refused otherwise — never hosts.yml.
+    let hosts = HostsLab::new();
+    // hosts.yml names the GHE host, so a fall-through would look gated;
+    // discriminate by naming github.com in config.yml's region instead: a
+    // fall-through gates (wrongly), the correct read passes.
+    hosts.write("hosts.yml", "ghe.example:\n    user: m\n");
+    for heading in [
+        "hosts  :",
+        "\"hosts\" :",
+        "'hosts' :",
+        "hosts\t:",
+        "hosts:\t# c",
+        "\"hosts\":\t# c",
+    ] {
+        hosts.write(
+            "config.yml",
+            &format!(
+                "version: \"1\"\n{heading}\n    {}:\n        user: m\n",
+                concat!("github", ".com")
+            ),
+        );
+        hosts.passed(heading);
+    }
+    // The same spellings with a value on the line are the region too, and
+    // refused — not hosts.yml's GHE host.
+    for heading in [
+        "hosts  : {ghe.example: {user: m}}",
+        "\"hosts\" : {ghe.example: {user: m}}",
+        "'hosts' : {ghe.example: {user: m}}",
+        "hosts\t: {ghe.example: {user: m}}",
+        "hosts: ~",
+    ] {
+        hosts.write("config.yml", &format!("version: \"1\"\n{heading}\n"));
+        hosts.refused(heading, "is not a hosts map knives can read");
+    }
+    // A BOM before a first-line heading is the heading.
+    hosts.write(
+        "config.yml",
+        &format!(
+            "\u{feff}hosts:\n    {}:\n        user: m\n",
+            concat!("github", ".com")
+        ),
+    );
+    hosts.passed("BOM heading");
+    // A column-0 line whose key is not `hosts` is not the region: `hostsx:`,
+    // `hosts.old:`, a key ending in `hosts`.
+    for other in ["hostsx:", "hosts.old:", "old_hosts:", "\"hosts x\":"] {
+        hosts.write(
+            "config.yml",
+            &format!(
+                "version: \"1\"\n{other}\n    {}:\n        user: m\n",
+                concat!("github", ".com")
+            ),
+        );
+        hosts.gated(other);
+    }
+}
+
+#[test]
+fn only_ascii_space_and_tab_are_yaml_whitespace_to_the_config_reader() {
+    // Measured (pass 13): a hosts.yml whose key is led by a no-break space
+    // is content to YAML — gh reads zero hosts and acts on github.com with
+    // no warning — while Rust's trim read it as a host (round-12 deep F2).
+    // Such a key, or any key with a character outside the host charset, is
+    // refused; knives never reads a host gh does not.
+    let hosts = HostsLab::new();
+    hosts.remove("config.yml");
+    for text in [
+        "\u{a0}ghe.example:\n\u{a0}\u{a0}\u{a0}\u{a0}user: m\n",
+        "ghe.example\u{a0}:\n    user: m\n",
+        "\u{2003}ghe.example:\n    user: m\n",
+        "ghe.ex\u{200b}ample:\n    user: m\n",
+        "ghe/example:\n    user: m\n",
+    ] {
+        hosts.write("hosts.yml", text);
+        hosts.refused(text, "is not a hosts map knives can read");
+    }
+    // In config.yml a no-break-space-led heading is a column-0 key that is
+    // not `hosts`; the region is then hosts.yml's (github.com here) — as gh
+    // reads it: the NBSP line is some other key.
+    hosts.write("hosts.yml", concat!("github", ".com", ":\n    user: m\n"));
+    hosts.write(
+        "config.yml",
+        "version: \"1\"\n\u{a0}hosts:\n    ghe.example:\n        user: m\n",
+    );
+    hosts.passed("NBSP-led heading is another key");
+    // A tab before the colon and a tab-then-comment are YAML whitespace.
+    hosts.write(
+        "config.yml",
+        "version: \"1\"\nhosts\t:\n    ghe.example\t:\t# main\n        user: m\n",
+    );
+    hosts.gated("tabs around the colons");
+}
+
+#[test]
+fn a_fetch_url_gh_s_parser_rejects_yields_to_the_push_url() {
+    // Measured (pass 13, MEASUREMENT.md): an invalid `%` escape in the path
+    // or userinfo, whitespace, an encoded slash making three segments, or a
+    // backslash in an scp value is no URL to gh, which falls to the push
+    // URL; knives' textual reader called each a repository (round-12 F1/F3,
+    // both lanes). A valid escape is decoded, as gh decodes it.
+    let config_home = placement_gate_home();
+    record_placement(config_home.path(), "feat/eps", "FORK");
+    let host = concat!("github", ".com");
+    let upstream = format!("https://{host}/routed-a/upstream.git");
+    let fetches = [
+        format!("https://{host}/routed%zz/decoy.git"),
+        format!("https://x%zz@{host}/routed-a/decoy.git"),
+        format!("https://{host}/other%2Fdecoy/x.git"),
+        format!("https://{host}/rou ted/decoy.git"),
+        format!("{host}:a\\b/decoy"),
+        format!("git@{host}:routed%zz/decoy.git"),
+        format!("ssh://git@{host}/routed%zz/decoy.git"),
+    ];
+    for fetch in &fetches {
+        let (output, recorded) = run_in_clone_with_upstream_config(
+            config_home.path(),
+            &[
+                ("remote.upstream.url", fetch.as_str()),
+                ("remote.upstream.pushurl", upstream.as_str()),
+            ],
+            &[
+                "pr",
+                "create",
+                "-t",
+                "t",
+                "-b",
+                "b",
+                "--head",
+                "routed-b:feat/eps",
+            ],
+        );
+        assert_eq!(output.status.code(), Some(2), "{fetch}: {output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("feat/eps has placement verdict FORK"),
+            "{fetch}: {output:?}"
+        );
+        assert!(recorded.is_none(), "{fetch}: gh ran: {recorded:?}");
+    }
+    // A valid escape spells the upstream itself: decoded, it is the upstream.
+    let (output, recorded) = run_in_clone_with_upstream_config(
+        config_home.path(),
+        &[(
+            "remote.upstream.url",
+            &format!("https://{host}/routed-a/upstre%61m.git"),
+        )],
+        &[
+            "pr",
+            "create",
+            "-t",
+            "t",
+            "-b",
+            "b",
+            "--head",
+            "routed-b:feat/eps",
+        ],
+    );
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(recorded.is_none(), "gh ran: {recorded:?}");
+    // A bad escape in the query only does not invalidate the URL: the valid
+    // decoy fetch still wins over the push URL, as in gh.
+    let (output, recorded) = run_in_clone_with_upstream_config(
+        config_home.path(),
+        &[
+            (
+                "remote.upstream.url",
+                &format!("https://{host}/other/decoy.git?x=%zz"),
+            ),
+            ("remote.upstream.pushurl", upstream.as_str()),
+        ],
+        &[
+            "pr",
+            "create",
+            "-t",
+            "t",
+            "-b",
+            "b",
+            "--head",
+            "routed-b:feat/eps",
+        ],
+    );
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        recorded
+            .expect("fake gh ran")
+            .contains("GH_TOKEN=tok-other")
+    );
 }
 
 #[test]

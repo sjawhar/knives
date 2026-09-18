@@ -308,10 +308,12 @@ pub(crate) fn git(directory: &Path) -> std::process::Command {
 /// one git would fetch from. The raw `remote.<name>.url` value would call a
 /// remote spelled through an alias another repository. Each remote is read
 /// the way gh's `TranslateRemotes` reads it: its fetch URL when that names a
-/// repository (a host and an `owner/repo` path), else the last of its push
-/// URLs that does — a push-only remote (`pushurl` with no `url`), or a fetch
-/// URL that is a path or a one-segment URL, is the repository its push URL
-/// names (measured against gh 2.98.0) — else the fetch URL as written.
+/// repository to gh's URL parser (`remote_url::repository_url`: a host, an
+/// `owner/repo` path after valid escapes are decoded, no invalid escape,
+/// whitespace or backslash), else the last of its push URLs that does — a
+/// push-only remote (`pushurl` with no `url`), or a fetch URL that is a path,
+/// a one-segment URL or an invalid URL, is the repository its push URL names
+/// (measured against gh 2.98.0) — else the fetch URL as written.
 /// Configuration reaches the read the way it reaches git: the repository's
 /// own file, the user's and the system's; `GIT_CONFIG_*` environment
 /// overrides do not (every git read knives makes strips them, see
@@ -362,17 +364,14 @@ pub fn remotes(root: &Path) -> Result<BTreeMap<String, String>, BindError> {
         .into_iter()
         .map(|(name, fetch_url)| {
             let fetch_url = resolved(&fetch_url);
-            let url = if crate::remote_url::remote_slug(&fetch_url).is_some() {
-                fetch_url
-            } else {
+            let url = crate::remote_url::repository_url(&fetch_url).unwrap_or_else(|| {
                 push.get(&name)
                     .into_iter()
                     .flatten()
                     .rev()
-                    .map(|push_url| resolved(push_url))
-                    .find(|push_url| crate::remote_url::remote_slug(push_url).is_some())
+                    .find_map(|push_url| crate::remote_url::repository_url(&resolved(push_url)))
                     .unwrap_or(fetch_url)
-            };
+            });
             (name, url)
         })
         .collect())

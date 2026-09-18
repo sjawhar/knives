@@ -198,6 +198,81 @@ fn ssh_hostname(host: &str) -> Option<String> {
     })
 }
 
+/// `url` as gh reads a remote that names a repository, or `None` when gh
+/// reads none from it and falls to the remote's push URL.
+///
+/// gh parses a remote with Go's `url.Parse` (an scp form first rewritten to
+/// `ssh://`) and then requires a host and exactly two path segments
+/// (`ghrepo.FromURL`), measured against gh 2.98.0: a `%` not followed by two
+/// hex digits anywhere before the query or fragment (path or userinfo) is
+/// an invalid URL; a valid escape in the path is decoded before the segment
+/// count (`other%2Fdecoy/x` is three segments); ASCII whitespace or a
+/// control byte is an invalid URL; a `\` makes an scp-looking value no scp
+/// URL at all. The query is not validated. What comes back is the URL with
+/// its path escapes decoded — what gh compares — so a checkout remote
+/// spelled `…/upstre%61m.git` is the upstream to knives as to gh.
+pub fn repository_url(url: &str) -> Option<String> {
+    let (authority, path) = authority_and_path(url)?;
+    if authority.is_empty() {
+        return None;
+    }
+    let scp = !url.contains("://");
+    let before_query = url.split(['?', '#']).next().unwrap_or(url);
+    if before_query
+        .bytes()
+        .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
+        || (scp && before_query.contains('\\'))
+        || !valid_escapes(before_query)
+    {
+        return None;
+    }
+    let decoded_path = percent_decode(path);
+    let decoded = if path.contains('%') {
+        // The path is a subslice of `url`; splice the decoded text in.
+        let offset = path.as_ptr() as usize - url.as_ptr() as usize;
+        let mut rewritten = String::with_capacity(url.len());
+        rewritten.push_str(&url[..offset]);
+        rewritten.push_str(&decoded_path);
+        rewritten.push_str(&url[offset + path.len()..]);
+        rewritten
+    } else {
+        url.to_owned()
+    };
+    remote_slug(&decoded).is_some().then_some(decoded)
+}
+
+/// Whether every `%` in `text` begins a `%XX` hex escape.
+fn valid_escapes(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    bytes.iter().enumerate().all(|(at, byte)| {
+        *byte != b'%'
+            || bytes
+                .get(at + 1..at + 3)
+                .is_some_and(|pair| pair.iter().all(u8::is_ascii_hexdigit))
+    })
+}
+
+/// `text` with every `%XX` escape decoded (the caller has checked they are
+/// all valid); a decoded byte that is not UTF-8 is kept as `%XX`.
+fn percent_decode(text: &str) -> String {
+    let mut out = Vec::with_capacity(text.len());
+    let mut rest = text.as_bytes();
+    while let Some((&byte, after)) = rest.split_first() {
+        if byte == b'%'
+            && let Some((pair, tail)) = after.split_at_checked(2)
+            && let Ok(hex) = std::str::from_utf8(pair)
+            && let Ok(decoded) = u8::from_str_radix(hex, 16)
+        {
+            out.push(decoded);
+            rest = tail;
+        } else {
+            out.push(byte);
+            rest = after;
+        }
+    }
+    String::from_utf8(out).unwrap_or_else(|_| text.to_owned())
+}
+
 /// The host of a remote URL, without its user or port; `None` for a non-URL.
 pub fn remote_host(url: &str) -> Option<&str> {
     host_and_path(url).map(|(host, _)| host)
@@ -233,7 +308,10 @@ pub fn repository_name(url: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{remote_host, remote_slug, repository_name, same_host, same_remote, url_owner};
+    use super::{
+        remote_host, remote_slug, repository_name, repository_url, same_host, same_remote,
+        url_owner,
+    };
 
     #[test]
     fn https_and_ssh_spellings_of_one_repository_are_the_same_remote() {
@@ -339,6 +417,45 @@ mod tests {
         assert_eq!(url_owner("https://forge.example//org/tool"), Some("org"));
         assert_eq!(url_owner("/tmp/lab/upstream"), None);
         assert_eq!(url_owner("forge.example:tool"), None);
+    }
+
+    #[test]
+    fn a_remote_names_a_repository_only_when_gh_s_url_parser_reads_one() {
+        // Measured against gh 2.98.0 (pass 13): an invalid escape, whitespace
+        // or a backslash-carrying scp form is no URL to gh, which falls to
+        // the push URL; a valid escape is decoded before the segment count.
+        assert_eq!(
+            repository_url("https://forge.example/org/tool.git").as_deref(),
+            Some("https://forge.example/org/tool.git")
+        );
+        assert_eq!(
+            repository_url("https://forge.example/o%72g/tool.git").as_deref(),
+            Some("https://forge.example/org/tool.git")
+        );
+        assert_eq!(
+            repository_url("git@forge.example:org/to%6fl.git").as_deref(),
+            Some("git@forge.example:org/tool.git")
+        );
+        assert_eq!(
+            repository_url("https://forge.example/org/tool.git?x=%zz").as_deref(),
+            Some("https://forge.example/org/tool.git?x=%zz")
+        );
+        for url in [
+            "https://forge.example/org%zz/tool.git",
+            "https://u%zz@forge.example/org/tool.git",
+            "https://forge.example/org%2Ftool/x.git",
+            "https://forge.example/or g/tool.git",
+            "https://forge.example/org/tool.git\t",
+            "forge.example:a\\b/tool",
+            "git@forge.example:org%zz/tool.git",
+            "ssh://git@forge.example/org%zz/tool.git",
+            "https://forge.example/org",
+            "/srv/git/tool.git",
+            "x",
+            "",
+        ] {
+            assert_eq!(repository_url(url), None, "{url:?}");
+        }
         assert_eq!(
             repository_name("https://forge.invalid/someone/Tool.GIT/"),
             Some("Tool")
