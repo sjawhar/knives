@@ -6,25 +6,54 @@
 //! not a URL — a filesystem path, or a `file://` URL, whose authority is empty
 //! — is only ever equal to itself.
 
-/// Whether two remote spellings name one repository.
+/// Whether the remote spelling `stated` names the repository `registered`
+/// names.
 ///
 /// A value that parses as a remote URL with a host compares as its
-/// [`host_and_path`], case-insensitively. A value that does not (a filesystem
-/// path, or a `file://` URL, whose authority is empty) compares as its trimmed
-/// text, so two directories that differ by `.git` stay two directories.
-pub fn same_remote(a: &str, b: &str) -> bool {
-    match (host_and_path(a), host_and_path(b)) {
-        (Some((host_a, path_a)), Some((host_b, path_b))) => {
-            host_a.eq_ignore_ascii_case(host_b) && path_a.eq_ignore_ascii_case(path_b)
+/// [`host_and_path`]: the paths case-insensitively, the hosts by
+/// [`same_host`] — `stated`'s host may be a subdomain spelling of
+/// `registered`'s. A value that does not (a filesystem path, or a `file://`
+/// URL, whose authority is empty) compares as its trimmed text, so two
+/// directories that differ by `.git` stay two directories.
+pub fn same_remote(registered: &str, stated: &str) -> bool {
+    match (host_and_path(registered), host_and_path(stated)) {
+        (Some((host_r, path_r)), Some((host_s, path_s))) => {
+            same_host(host_s, host_r) && path_s.eq_ignore_ascii_case(path_r)
         }
-        (None, None) => a.trim().trim_end_matches('/') == b.trim().trim_end_matches('/'),
+        (None, None) => {
+            registered.trim().trim_end_matches('/') == stated.trim().trim_end_matches('/')
+        }
         _ => false,
     }
 }
 
+/// Whether the host spelling `stated` names the forge `registered` names.
+///
+/// Equal, or a subdomain of it — `www.github.com`, `api.github.com`,
+/// `foo.github.com` are all `github.com` — case-insensitively, a trailing
+/// `.` ignored.
+///
+/// gh folds every `*.github.com` to `github.com` (and `*.<tenant>.ghe.com`,
+/// `*.localhost` likewise) when choosing the token and the endpoint; this is
+/// the superset of that fold — any subdomain of a registered host is that
+/// host — so a spelling gh would send to a registered upstream is never
+/// compared as some other host. The cost is over-matching a distinct host
+/// that happens to be a subdomain of a registered one, which gates and
+/// routes more, never less.
+pub fn same_host(stated: &str, registered: &str) -> bool {
+    let stated = stated.trim_end_matches('.');
+    let registered = registered.trim_end_matches('.');
+    stated.eq_ignore_ascii_case(registered)
+        || (stated.len() > registered.len() + 1
+            && stated.as_bytes().get(stated.len() - registered.len() - 1) == Some(&b'.')
+            && stated
+                .get(stated.len() - registered.len()..)
+                .is_some_and(|suffix| suffix.eq_ignore_ascii_case(registered)))
+}
+
 /// `(host, path)` of a remote URL as spelled: the authority without its user
-/// or port and with a leading `www.` folded off, and the path without its
-/// query or fragment, surrounding `/`, or a `.git` suffix. `None` for a
+/// or port, and the path without its query or fragment, surrounding `/`, or
+/// a `.git` suffix. `None` for a
 /// non-URL: a filesystem path, or a `file://` URL, whose authority is
 /// empty. scp form without a user, `host:path`, is a URL too when the part
 /// before the colon holds no `/`; a filesystem path with a colon in a later
@@ -46,14 +75,6 @@ fn host_and_path(remote: &str) -> Option<(&str, &str)> {
         {
             name
         }
-        _ => host,
-    };
-    // `www.` (any case) names the same host to a browser and to gh's own
-    // `ghrepo.normalizeHostname`; folding it here means a spec normalized
-    // upstream of comparison and a raw, hand-typed registry entry agree
-    // whichever one carries it.
-    let host = match host.get(..4) {
-        Some(prefix) if prefix.eq_ignore_ascii_case("www.") => &host[4..],
         _ => host,
     };
     // A query string or `#fragment` is never part of a repository's
@@ -116,7 +137,7 @@ pub fn repository_name(url: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{remote_host, remote_slug, repository_name, same_remote, url_owner};
+    use super::{remote_host, remote_slug, repository_name, same_host, same_remote, url_owner};
 
     #[test]
     fn https_and_ssh_spellings_of_one_repository_are_the_same_remote() {
@@ -216,29 +237,49 @@ mod tests {
     }
 
     #[test]
-    fn a_leading_www_does_not_make_another_host() {
-        assert!(same_remote(
+    fn a_subdomain_of_a_host_is_that_host() {
+        // gh folds every `*.github.com` to `github.com`; the one comparison
+        // rule folds any subdomain of a registered host, a superset.
+        for host in [
+            "www.forge.example",
+            "WWW.Forge.Example",
+            "api.forge.example",
+            "foo.forge.example",
+            "www.www.forge.example",
+            "forge.example.",
+        ] {
+            assert!(
+                same_remote(
+                    "https://forge.example/org/tool",
+                    &format!("https://{host}/org/tool")
+                ),
+                "{host}"
+            );
+            assert!(same_host(host, "forge.example"), "{host}");
+        }
+        // The fold is directional: the stated host may be a subdomain of the
+        // registered one, not the other way around.
+        assert!(!same_host("forge.example", "www.forge.example"));
+        assert!(!same_remote(
             "https://www.forge.example/org/tool",
             "https://forge.example/org/tool"
         ));
         assert!(same_remote(
-            "https://WWW.Forge.Example/org/tool",
-            "https://forge.example/org/tool"
+            "https://forge.example/org/tool",
+            "www.forge.example:org/tool"
         ));
-        assert!(same_remote(
-            "www.forge.example:org/tool",
-            "https://forge.example/org/tool"
-        ));
-        // `www` as the whole host, or as an interior label, names a
-        // different host and is not folded.
-        assert!(!same_remote(
-            "https://www/org/tool",
-            "https://forge.example/org/tool"
-        ));
-        assert!(!same_remote(
-            "https://www.example.forge.example/org/tool",
-            "https://forge.example/org/tool"
-        ));
+        // A host that merely ends in the other's text, or is another host
+        // altogether, is not folded.
+        for host in ["www", "notforge.example", "forge.example.evil", "example"] {
+            assert!(
+                !same_remote(
+                    "https://forge.example/org/tool",
+                    &format!("https://{host}/org/tool")
+                ),
+                "{host}"
+            );
+            assert!(!same_host(host, "forge.example"), "{host}");
+        }
     }
 
     #[test]

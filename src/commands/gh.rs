@@ -14,13 +14,20 @@
 //!
 //! What those readings are compared against is never normalised the way gh,
 //! go-gh or GitHub would normalise it (see `gh_canon`): a repository is read
-//! only as `OWNER/REPO` or `HOST/OWNER/REPO`, a head only as a branch name,
-//! an endpoint only as `repos/OWNER/REPO/pulls`, and every other spelling
+//! only as `OWNER/REPO` or `HOST/OWNER/REPO` (two parts on `GH_HOST`, else
+//! the default host), a head only as `<fork-owner>:<branch>` — gh reads a
+//! bare branch as the base repository's own — an endpoint only as
+//! `repos/OWNER/REPO/pulls` on the host the request goes to (an absolute
+//! URL's own, else `--hostname`, else the default), and every other spelling
 //! toward a registered upstream — a URL of any form, an empty or second
-//! `-R`, an `OWNER:BRANCH` head, a percent-escape, a marker carrying a host —
-//! is refused with the canonical spelling. A token is routed only for a
-//! canonical owner.
-// allow: SIZE_OK: 3055 lines - single passthrough pipeline; splitting would separate resolution steps that read as one procedure.
+//! `-R`, a bare or another owner's head, a percent-escape, a marker carrying
+//! a host, a `--hostname` disagreeing with the URL — is refused with the
+//! canonical spelling. The one comparison rule folds any subdomain of the
+//! registered host onto it (`remote_url::same_host`), a superset of gh's own
+//! fold. With no head stated the gate states `<fork-owner>:<branch in hand>`
+//! itself, so gh never resolves one knives did not read. A token is routed
+//! only for a canonical owner on a host that folds to the default host.
+// allow: SIZE_OK: 3236 lines - single passthrough pipeline; splitting would separate resolution steps that read as one procedure.
 use std::collections::BTreeMap;
 use std::io::Read as _;
 use std::os::unix::{
@@ -111,31 +118,18 @@ pub fn run(args: &[String]) -> anyhow::Result<std::convert::Infallible> {
     }
     let cwd = std::env::current_dir()?;
     // Before minting: an upstream pull request the placement verdict does not
-    // allow is refused without spending a token on it.
-    if let Some(refusal) = upstream_pull_refusal(&invocation, &cwd)? {
-        eprintln!("knives gh: {refusal}");
-        std::process::exit(crate::cli::Exit::Usage.code().into());
-    }
-    let token = if std::env::var_os("GH_TOKEN").is_some() {
-        None
-    } else {
-        match target(&invocation, &cwd) {
-            Target::Repo(url) => match mint_token(&url) {
-                Mint::Token(token) => Some(token),
-                Mint::Refused(code) => std::process::exit(code),
-                Mint::Unrouted => None,
-            },
-            Target::Absent => None,
-            // A repository stated in a spelling knives does not compare
-            // routes nothing; gh runs on its own auth, and stderr says why
-            // so a missing token is never a mystery.
-            Target::Unreadable(why) => {
-                eprintln!("knives gh: no token routed: {why}");
-                None
-            }
+    // allow is refused without spending a token on it. One it allows and the
+    // caller left gh to resolve gets its head stated, below, in the one
+    // spelling that names the fork's branch.
+    let upstream_head = match upstream_pull_refusal(&invocation, &cwd)? {
+        Gate::Refuse(refusal) => {
+            eprintln!("knives gh: {refusal}");
+            std::process::exit(crate::cli::Exit::Usage.code().into());
         }
+        Gate::Pass => None,
+        Gate::PassStating(head) => Some(head),
     };
-    if let Some(token) = token {
+    if let Some(token) = routed_token(&invocation, &cwd) {
         gh.env("GH_TOKEN", token);
     }
 
@@ -153,22 +147,30 @@ pub fn run(args: &[String]) -> anyhow::Result<std::convert::Infallible> {
         .stderr(Stdio::null())
         .status()
         .is_ok_and(|status| status.success());
-    if !in_jj_repo {
+    if !in_jj_repo && upstream_head.is_none() {
         gh.args(args);
         std::process::exit(gh_exit_code(&mut gh));
     }
 
-    let bookmark = current_bookmark(&cwd);
+    let bookmark = in_jj_repo.then(|| current_bookmark(&cwd)).flatten();
     let arguments = match subcommand.as_str() {
         // A head the caller stated — in any spelling gh reads — is the head;
-        // adding the current bookmark behind it would be the one gh honours.
+        // adding one behind it would be the one gh honours. Toward a
+        // registered upstream the gate has read the head and names the
+        // fork's branch as `OWNER:BRANCH` — gh would otherwise resolve one
+        // knives did not read, from git configuration or as the upstream's
+        // own branch — in a jj checkout and a plain git clone alike; toward
+        // any other repository, in a jj checkout, the bookmark on `@` stands
+        // in for git's detached HEAD.
         "create" if !invocation.has("head") => {
-            let Some(bookmark) = bookmark.as_deref() else {
-                die_no_bookmark();
+            let head = match (&upstream_head, bookmark.as_deref()) {
+                (Some(head), _) => head.clone(),
+                (None, Some(bookmark)) => bookmark.to_owned(),
+                (None, None) => die_no_bookmark(),
             };
             let mut arguments = args.to_vec();
             arguments.push("--head".to_owned());
-            arguments.push(bookmark.to_owned());
+            arguments.push(head);
             arguments
         }
         "view" | "checks" | "diff" | "merge" | "checkout" | "edit" | "comment" | "ready"
@@ -182,6 +184,11 @@ pub fn run(args: &[String]) -> anyhow::Result<std::convert::Infallible> {
         }
         _ => args.to_vec(),
     };
+    if !in_jj_repo {
+        // A plain git clone: gh reads git's own HEAD; only the head was added.
+        gh.args(&arguments);
+        std::process::exit(gh_exit_code(&mut gh));
+    }
     let exit_code = {
         let wrapper = tempfile::tempdir()?;
         std::fs::set_permissions(wrapper.path(), std::fs::Permissions::from_mode(0o700))?;
@@ -198,6 +205,29 @@ pub fn run(args: &[String]) -> anyhow::Result<std::convert::Infallible> {
         gh_exit_code(&mut gh)
     };
     std::process::exit(exit_code);
+}
+
+/// The token gh runs with, when one is routed: none when the caller already
+/// set `GH_TOKEN`, when the target names no repository, or when the
+/// repository is stated in a spelling knives does not compare — that last
+/// said once on stderr, so a missing token is never a mystery. A helper
+/// refusal exits here with the helper's code.
+fn routed_token(invocation: &GhInvocation, cwd: &Path) -> Option<String> {
+    if std::env::var_os("GH_TOKEN").is_some() {
+        return None;
+    }
+    match target(invocation, cwd) {
+        Target::Repo(url) => match mint_token(&url) {
+            Mint::Token(token) => Some(token),
+            Mint::Refused(code) => std::process::exit(code),
+            Mint::Unrouted => None,
+        },
+        Target::Absent => None,
+        Target::Unreadable(why) => {
+            eprintln!("knives gh: no token routed: {why}");
+            None
+        }
+    }
 }
 
 /// Waits for gh while preserving its interactive terminal ownership and exit code.
@@ -453,6 +483,15 @@ pub(crate) fn mint_token(target_url: &str) -> Mint {
     let Some(path) = credential_path(target_url) else {
         return Mint::Unrouted;
     };
+    // The App token is a credential for the default host: a target on any
+    // other host — one gh would send to without `GH_TOKEN` — mints nothing.
+    // The host is compared by the one rule (`same_host`): a subdomain
+    // spelling of the default host is the default host, as gh folds it.
+    if !crate::remote_url::remote_host(target_url)
+        .is_some_and(|host| crate::remote_url::same_host(host, DEFAULT_HOST))
+    {
+        return Mint::Unrouted;
+    }
     // The helper routes by the owner segment; one that is not a canonical
     // segment — empty after a `//`, a percent-escape, anything GitHub would
     // read differently from the helper — routes nothing rather than a token
@@ -626,12 +665,16 @@ fn gh_repo_environment() -> Option<String> {
 
 /// The REST endpoint a `gh api` call addresses: its first positional, less
 /// one leading `/`, less its query string and any `#fragment` (which Go's
-/// client never sends). An absolute URL — which gh sends verbatim — is read
-/// only as `https://api.<default host>/<path>`, spelled exactly so; any
-/// other is `foreign`, a host knives does not compare. A flag's value is
-/// never the endpoint, whatever it looks like.
+/// client never sends). An absolute URL — which gh sends verbatim, whatever
+/// `--hostname` or `GH_HOST` say — is read only as `https://api.<default
+/// host>/<path>`, spelled exactly so, and then states its host
+/// (`url_host`); any other is `foreign`, a host knives does not compare. A
+/// flag's value is never the endpoint, whatever it looks like.
 struct ApiPath<'a> {
     path: &'a str,
+    /// The host the URL itself states, when the endpoint is an absolute URL
+    /// knives reads.
+    url_host: Option<&'static str>,
     foreign: bool,
 }
 
@@ -645,10 +688,12 @@ fn api_endpoint(invocation: &GhInvocation) -> Option<ApiPath<'_>> {
         return Some(path.map_or_else(
             || ApiPath {
                 path: without_query(argument),
+                url_host: None,
                 foreign: true,
             },
             |path| ApiPath {
                 path: without_query(path),
+                url_host: Some(DEFAULT_HOST),
                 foreign: false,
             },
         ));
@@ -656,8 +701,28 @@ fn api_endpoint(invocation: &GhInvocation) -> Option<ApiPath<'_>> {
     let path = argument.strip_prefix('/').unwrap_or(argument);
     Some(ApiPath {
         path: without_query(path),
+        url_host: None,
         foreign: false,
     })
+}
+
+/// The host gh addresses when none is stated: `GH_HOST` when set and
+/// non-empty (gh's own override, read verbatim — a literal, nothing to
+/// normalise), else the default host. A `GH_HOST` outside the grammar
+/// knives compares is refused rather than read.
+fn default_host() -> Result<String, String> {
+    match std::env::var("GH_HOST") {
+        Ok(host) if !host.is_empty() => gh_canon::is_segment(&host)
+            .then(|| host.clone())
+            .ok_or_else(|| {
+                format!(
+                    "GH_HOST {host:?} is not a host knives compares (one segment of [{}]): state \
+                     it that way, or unset it",
+                    gh_canon::SEGMENT_CHARS
+                )
+            }),
+        _ => Ok(DEFAULT_HOST.to_owned()),
+    }
 }
 
 /// `path` less its query string and any `#fragment`.
@@ -703,17 +768,17 @@ fn stated_repository(invocation: &GhInvocation) -> Option<Result<Repo, String>> 
         .filter(|flag| flag.name == "repo")
         .map(|flag| flag.value.as_deref().unwrap_or(""))
         .collect();
+    // A two-part spec is on gh's default host, which `GH_HOST` overrides.
+    let read = |source: &str, spec: &str| -> Result<Repo, String> {
+        let host = default_host()?;
+        Repo::parse(spec, &host).ok_or_else(|| gh_canon::repo_refusal(source, spec))
+    };
     match stated.as_slice() {
         [] => {
             let spec = gh_repo_environment()?;
-            Some(
-                Repo::parse(&spec, DEFAULT_HOST)
-                    .ok_or_else(|| gh_canon::repo_refusal("GH_REPO", &spec)),
-            )
+            Some(read("GH_REPO", &spec))
         }
-        [spec] => {
-            Some(Repo::parse(spec, DEFAULT_HOST).ok_or_else(|| gh_canon::repo_refusal("-R", spec)))
-        }
+        [spec] => Some(read("-R", spec)),
         several => Some(Err(format!(
             "states {} repositories (-R {}); gh would use the last while a reader expects the \
              first: state one",
@@ -738,8 +803,18 @@ fn target(invocation: &GhInvocation, cwd: &Path) -> Target {
     if names_repository_by_id(invocation) {
         return Target::Absent;
     }
+    // An owner read from a `gh api` endpoint is on the host the request goes
+    // to: the URL's, `--hostname`'s, or the default (`GH_HOST`, else
+    // github.com).
     let api_owner = match owner_from_api_args(invocation) {
-        Ok(owner) => owner,
+        Ok(Some(owner)) => {
+            let url_host = api_endpoint(invocation).and_then(|endpoint| endpoint.url_host);
+            match rest_host(invocation, url_host) {
+                Ok(host) => Some((host, owner)),
+                Err(why) => return Target::Unreadable(format!("the gh api call {why}")),
+            }
+        }
+        Ok(None) => None,
         Err(refusal) => return Target::Unreadable(refusal),
     };
     let stated = stated_repository(invocation);
@@ -769,7 +844,9 @@ fn target(invocation: &GhInvocation, cwd: &Path) -> Target {
     };
 
     resolve_from_inputs(TargetInputs {
-        api_owner: api_owner.as_deref(),
+        api_owner: api_owner
+            .as_ref()
+            .map(|(host, owner)| (host.as_str(), owner.as_str())),
         stated,
         resolved_remote: resolved_remote.as_ref().map(|resolved| ResolvedRemote {
             name: &resolved.name,
@@ -794,8 +871,8 @@ struct ResolvedRemote<'a> {
 
 /// The borrowed candidates for the pure target-resolution seam.
 struct TargetInputs<'a> {
-    /// The owner a `gh api` endpoint names, a canonical segment.
-    api_owner: Option<&'a str>,
+    /// The host and owner a `gh api` endpoint names, canonical segments.
+    api_owner: Option<(&'a str, &'a str)>,
     /// `-R`/`GH_REPO` as [`stated_repository`] read it.
     stated: Option<Result<Repo, String>>,
     resolved_remote: Option<ResolvedRemote<'a>>,
@@ -813,10 +890,10 @@ struct TargetInputs<'a> {
 /// refused rather than read with either host. The remotes themselves are the
 /// checkout's own configuration and are normalised ([`normalize_url`]).
 fn resolve_from_inputs(inputs: TargetInputs<'_>) -> Target {
-    if let Some(owner) = inputs.api_owner {
+    if let Some((host, owner)) = inputs.api_owner {
         return Target::Repo(
             Repo {
-                host: DEFAULT_HOST.to_owned(),
+                host: host.to_owned(),
                 owner: owner.to_owned(),
                 name: "gh-api".to_owned(),
             }
@@ -1060,14 +1137,18 @@ fn pull_opening(invocation: &GhInvocation) -> Option<PullOpening> {
             ))
         });
     }
-    rest_opening(invocation, path)
+    rest_opening(invocation, path, endpoint.url_host)
 }
 
 /// The REST creation a POST to `path` is, if it is one: `repos/OWNER/REPO/pulls`
 /// at a repository named in canonical form, the same at gh's placeholders, or
 /// unreadable — an empty segment, a segment outside the grammar, a host stated
 /// outside it. `None` for any other endpoint under `repos/`.
-fn rest_opening(invocation: &GhInvocation, path: &str) -> Option<PullOpening> {
+fn rest_opening(
+    invocation: &GhInvocation,
+    path: &str,
+    url_host: Option<&str>,
+) -> Option<PullOpening> {
     let canonical = format!(
         "repos/OWNER/REPO/pulls (each segment of [{}])",
         gh_canon::SEGMENT_CHARS
@@ -1090,16 +1171,8 @@ fn rest_opening(invocation: &GhInvocation, path: &str) -> Option<PullOpening> {
     let segments = (gh_canon::is_segment(owner), gh_canon::is_segment(name));
     Some(match (placeholders, segments) {
         ((true, true), _) => PullOpening::RestAtBase { heads },
-        (_, (true, true)) => rest_host(invocation).map_or_else(
-            || {
-                PullOpening::Unreadable(format!(
-                    "a POST to {path:?} states its host outside the grammar knives compares \
-                     (--hostname {}): state one host, of [{}]",
-                    stated_values(invocation, "hostname").join(", --hostname "),
-                    gh_canon::SEGMENT_CHARS
-                ))
-            },
-            |host| PullOpening::Rest {
+        (_, (true, true)) => match rest_host(invocation, url_host) {
+            Ok(host) => PullOpening::Rest {
                 repo: Repo {
                     host,
                     owner: (*owner).to_owned(),
@@ -1107,7 +1180,8 @@ fn rest_opening(invocation: &GhInvocation, path: &str) -> Option<PullOpening> {
                 },
                 heads,
             },
-        ),
+            Err(why) => PullOpening::Unreadable(format!("a POST to {path:?} {why}")),
+        },
         _ => PullOpening::Unreadable(format!(
             "a POST to {path:?} names its repository outside the grammar knives compares: state \
              the endpoint as {canonical}, or as repos/{{owner}}/{{repo}}/pulls for the current \
@@ -1128,15 +1202,42 @@ fn stated_values(invocation: &GhInvocation, name: &str) -> Vec<String> {
         .collect()
 }
 
-/// The host a `gh api` REST call addresses: `--hostname` when stated once
-/// and canonical, else the default host; `None` — read as unreadable by the
-/// caller — for two hostnames or one outside the grammar.
-fn rest_host(invocation: &GhInvocation) -> Option<String> {
+/// The host a `gh api` REST call addresses. An absolute URL states its own
+/// host and gh sends to it verbatim, so that host wins; a `--hostname` that
+/// disagrees with it is refused rather than read either way. A relative
+/// path goes to `--hostname` when stated once and canonical, else to the
+/// default host (`GH_HOST`, else `github.com`). Two hostnames, or one
+/// outside the grammar, are refused.
+fn rest_host(invocation: &GhInvocation, url_host: Option<&str>) -> Result<String, String> {
     let hostnames = stated_values(invocation, "hostname");
-    match hostnames.as_slice() {
-        [] => Some(DEFAULT_HOST.to_owned()),
-        [hostname] if gh_canon::is_segment(hostname) => Some(hostname.clone()),
-        _ => None,
+    let hostname = match hostnames.as_slice() {
+        [] => None,
+        [hostname] if gh_canon::is_segment(hostname) => Some(hostname.as_str()),
+        [hostname] => {
+            return Err(format!(
+                "states its host outside the grammar knives compares (--hostname {hostname:?}): \
+                 state one host, of [{}]",
+                gh_canon::SEGMENT_CHARS
+            ));
+        }
+        several => {
+            return Err(format!(
+                "states {} hosts (--hostname {}): state one",
+                several.len(),
+                several.join(", --hostname ")
+            ));
+        }
+    };
+    match (url_host, hostname) {
+        (Some(url_host), Some(hostname)) if !crate::remote_url::same_host(hostname, url_host) => {
+            Err(format!(
+                "states two hosts (--hostname {hostname}, URL host {url_host}); gh sends to the \
+                 URL's host whatever --hostname says: state one"
+            ))
+        }
+        (Some(url_host), _) => Ok(url_host.to_owned()),
+        (None, Some(hostname)) => Ok(hostname.to_owned()),
+        (None, None) => default_host(),
     }
 }
 
@@ -1182,7 +1283,7 @@ fn names_mutation(text: &str, name: &str) -> bool {
 /// a ledger the tool cannot read. A creation whose repository or head is
 /// spelled outside the grammar knives compares is refused with the canonical
 /// spelling, never read the way gh would read it.
-fn upstream_pull_refusal(invocation: &GhInvocation, cwd: &Path) -> anyhow::Result<Option<String>> {
+fn upstream_pull_refusal(invocation: &GhInvocation, cwd: &Path) -> anyhow::Result<Gate> {
     // A flag gh's table does not define leaves the whole command unreadable:
     // whether it takes a value decides which arguments are values and which
     // the endpoint or a head, so nothing about a `pr create` or `gh api` with
@@ -1195,10 +1296,10 @@ fn upstream_pull_refusal(invocation: &GhInvocation, cwd: &Path) -> anyhow::Resul
     if let Some((command, table)) = table
         && let Some(refusal) = unreadable_flag_refusal(invocation, command, table)
     {
-        return Ok(Some(refusal));
+        return Ok(Gate::Refuse(refusal));
     }
     let Some(opening) = pull_opening(invocation) else {
-        return Ok(None);
+        return Ok(Gate::Pass);
     };
     // No registry file: nothing is registered, so nothing is gated — said
     // once, so a silent pass is never mistaken for a verdict. A registry that
@@ -1207,16 +1308,38 @@ fn upstream_pull_refusal(invocation: &GhInvocation, cwd: &Path) -> anyhow::Resul
     let path = crate::config::default_config_path();
     if !path.exists() {
         eprintln!("knives: no registry at {}; nothing to gate", path.display());
-        return Ok(None);
+        return Ok(Gate::Pass);
     }
     let registry = crate::config::load(&path)?;
-    let (repo, head) = match opening_subject(opening, &registry, invocation, cwd) {
+    let subject = match opening_subject(opening, &registry, invocation, cwd) {
         Ok(subject) => subject,
-        Err(Early::Pass) => return Ok(None),
-        Err(Early::Refuse(refusal)) => return Ok(Some(refusal)),
+        Err(Early::Pass) => return Ok(Gate::Pass),
+        Err(Early::Refuse(refusal)) => return Ok(Gate::Refuse(refusal)),
     };
-    let entries = crate::ledger::Ledger::for_repo(&repo).entries()?;
-    Ok(crate::placement::upstream_pull_refusal(&entries, &head)?)
+    let entries = crate::ledger::Ledger::for_repo(&subject.repo).entries()?;
+    if let Some(refusal) = crate::placement::upstream_pull_refusal(&entries, &subject.branch)? {
+        return Ok(Gate::Refuse(refusal));
+    }
+    Ok(subject.state.map_or(Gate::Pass, Gate::PassStating))
+}
+
+/// The gate's word on an invocation: run it, refuse it, or run it with the
+/// head stated as `OWNER:BRANCH` — the fork's branch the gate certified,
+/// which the caller left gh to resolve.
+#[derive(Debug, PartialEq, Eq)]
+enum Gate {
+    Pass,
+    Refuse(String),
+    PassStating(String),
+}
+
+/// What a creation toward a registered upstream is about: the registered
+/// repository, the fork's branch whose verdict decides, and the `--head` to
+/// add when the caller stated none.
+struct Subject {
+    repo: crate::ids::RepoName,
+    branch: String,
+    state: Option<String>,
 }
 
 /// The registered repository and head a creation is about, or why the gate
@@ -1227,43 +1350,60 @@ fn opening_subject(
     registry: &crate::config::Registry,
     invocation: &GhInvocation,
     cwd: &Path,
-) -> Result<(crate::ids::RepoName, String), Early> {
+) -> Result<Subject, Early> {
     Ok(match opening {
         PullOpening::Unreadable(refusal) => return Err(Early::Refuse(refusal)),
         PullOpening::Create { heads } => {
-            let repo = upstream_target(registry, invocation, cwd)?;
-            // The head gh will use when none is stated: the bookmark on `@`
-            // (what knives adds for `pr create` in a jj checkout), else git's
-            // checked-out branch (gh's own default, in a plain clone). With
-            // neither, nothing verifiable is let through.
-            let head = match one_head(&repo, &heads, "--head")? {
-                Some(head) => head,
-                None => match current_bookmark(cwd).or_else(|| git_head_branch(cwd)) {
-                    Some(head) => head,
-                    None => {
-                        return Err(Early::Refuse(format!(
-                            "an upstream pull request for {repo} needs a head branch to check \
-                             its placement verdict: state one (`--head <branch>`), or run from \
-                             a checkout with a bookmark on @ or a git branch checked out"
-                        )));
-                    }
-                },
+            let fork = upstream_target(registry, invocation, cwd)?;
+            if let Some(branch) = one_head(&fork, &heads, "--head")? {
+                return Ok(Subject {
+                    repo: fork.name,
+                    branch,
+                    state: None,
+                });
+            }
+            // None stated: gh would read git configuration knives does not —
+            // the branch's push target, which may be another branch of the
+            // fork — or abort. knives certifies the branch in hand (the
+            // bookmark on `@` in a jj checkout, git's checked-out branch in
+            // a plain clone) and states it to gh as the fork's own; with
+            // neither, nothing is let through.
+            let Some(branch) = current_bookmark(cwd).or_else(|| git_head_branch(cwd)) else {
+                return Err(Early::Refuse(format!(
+                    "an upstream pull request for {} needs a head branch to check its placement \
+                     verdict: state one (`--head {}:<branch>`), or run from a checkout with a \
+                     bookmark on @ or a git branch checked out",
+                    fork.name, fork.owner
+                )));
             };
-            (repo, head)
+            let state = format!("{}:{branch}", fork.owner);
+            Subject {
+                repo: fork.name,
+                branch,
+                state: Some(state),
+            }
         }
         PullOpening::Rest { repo: at, heads } => {
-            let repo = upstream_of(registry, &at.url()).ok_or(Early::Pass)?;
-            let head = rest_head(&repo, &heads)?;
-            (repo, head)
+            let fork = Fork::of(registry, &at.url()).ok_or(Early::Pass)?;
+            let branch = rest_head(&fork, &heads)?;
+            Subject {
+                repo: fork.name,
+                branch,
+                state: None,
+            }
         }
         PullOpening::RestAtBase { heads } => {
             // `repos/{owner}/{repo}/pulls` and `repos/:owner/:repo/pulls` are
             // gh's own spellings for "the current directory's base
             // repository", which in a fork checkout is the upstream; resolved
             // the way `pr create` without `-R` is.
-            let repo = upstream_target(registry, invocation, cwd)?;
-            let head = rest_head(&repo, &heads)?;
-            (repo, head)
+            let fork = upstream_target(registry, invocation, cwd)?;
+            let branch = rest_head(&fork, &heads)?;
+            Subject {
+                repo: fork.name,
+                branch,
+                state: None,
+            }
         }
         PullOpening::Graphql { head } => {
             // No owner to read: inside a registered fork's checkout — jj or a
@@ -1295,54 +1435,104 @@ fn upstream_target(
     registry: &crate::config::Registry,
     invocation: &GhInvocation,
     cwd: &Path,
-) -> Result<crate::ids::RepoName, Early> {
+) -> Result<Fork, Early> {
     match target(invocation, cwd) {
-        Target::Repo(url) => upstream_of(registry, &url).ok_or(Early::Pass),
+        Target::Repo(url) => Fork::of(registry, &url).ok_or(Early::Pass),
         Target::Absent => Err(Early::Pass),
         Target::Unreadable(refusal) => Err(Early::Refuse(refusal)),
     }
 }
 
-/// The one head a creation states, read canonically, or none. Two are
-/// refused rather than read last-wins; an empty one, a cross-repository
-/// `OWNER:BRANCH`, or one outside the branch grammar is refused rather than
-/// read the way gh would.
-fn one_head(
-    repo: &crate::ids::RepoName,
-    heads: &[String],
-    spelling: &str,
-) -> Result<Option<String>, Early> {
-    match heads {
-        [] => Ok(None),
-        [head] if head.is_empty() => Err(Early::Refuse(format!(
-            "an upstream pull request for {repo} states an empty head (`{spelling}=`): gh would \
-             open the current branch, which knives cannot certify from that spelling; state \
-             the branch"
-        ))),
-        [head] if gh_canon::is_branch(head) => Ok(Some(head.clone())),
-        [head] => Err(Early::Refuse(gh_canon::head_refusal(
-            &repo.to_string(),
-            spelling,
-            head,
-        ))),
-        [first, .., last] => Err(Early::Refuse(format!(
-            "an upstream pull request for {repo} states {} heads ({}); gh would open {last} \
-             while a reader expects {first}: state one",
-            heads.len(),
-            heads.join(", ")
-        ))),
+/// A registered fork whose upstream a creation addresses: its registry name
+/// and the owner of its `origin`, the one owner whose `OWNER:BRANCH` head
+/// names a branch the fork's ledger rules on.
+struct Fork {
+    name: crate::ids::RepoName,
+    owner: String,
+}
+
+impl Fork {
+    /// The registered fork whose `upstream` is `target`, if any. A registry
+    /// entry whose origin names no owner is a registry problem, surfaced as
+    /// a fork with an empty owner that no head can match.
+    fn of(registry: &crate::config::Registry, target: &str) -> Option<Self> {
+        let (name, entry) = crate::bind::entry_for(registry, target)?;
+        let owner = crate::remote_url::url_owner(entry.remote(crate::config::Role::Origin))
+            .unwrap_or_default()
+            .to_owned();
+        Some(Self { name, owner })
     }
 }
 
-/// The head a REST creation states in its `head` field. Without one the
-/// creation is gh's error to give, but the head may also travel in a body
-/// file knives does not read (`--input`); either way its verdict cannot be
-/// checked, and nothing unverifiable is let through.
-fn rest_head(repo: &crate::ids::RepoName, heads: &[String]) -> Result<String, Early> {
-    one_head(repo, heads, "-f head")?.ok_or_else(|| {
+impl std::fmt::Display for Fork {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.name.fmt(f)
+    }
+}
+
+/// The fork's branch the one stated head names, or none stated. To gh and
+/// to GitHub's REST API alike a bare `BRANCH` is the base repository's own
+/// branch and only `OWNER:BRANCH` names another repository's (measured
+/// against gh 2.98.0: `--head feat/x` → `headRefName: "feat/x"` on the base;
+/// `--head owner:feat/x` → `"owner:feat/x"`); so toward a registered
+/// upstream a bare head is refused with the fork's spelling, `OWNER:BRANCH`
+/// is read only when `OWNER` is the fork's own origin owner (the ledger
+/// rules on no other repository's branches), and the branch must be one
+/// knives compares. Two heads are refused rather than read last-wins; an
+/// empty one likewise.
+fn one_head(fork: &Fork, heads: &[String], spelling: &str) -> Result<Option<String>, Early> {
+    let refuse = |text: String| Err(Early::Refuse(text));
+    match heads {
+        [] => Ok(None),
+        [head] if head.is_empty() => refuse(format!(
+            "an upstream pull request for {fork} states an empty head (`{spelling}=`): gh would \
+             open the current branch, which knives cannot certify from that spelling; state \
+             the branch as {}:<branch>",
+            fork.owner
+        )),
+        [head] => match head.split_once(':') {
+            None if gh_canon::is_branch(head) => refuse(format!(
+                "an upstream pull request for {fork} states the head {spelling} {head:?} without \
+                 an owner, which gh opens from the upstream's own branch, not this fork's: state \
+                 it as {}:{head}",
+                fork.owner
+            )),
+            None => refuse(gh_canon::head_refusal(&fork.to_string(), spelling, head)),
+            Some((_, branch)) if !gh_canon::is_branch(branch) => {
+                refuse(gh_canon::head_refusal(&fork.to_string(), spelling, head))
+            }
+            Some((owner, branch)) if owner.eq_ignore_ascii_case(&fork.owner) => {
+                Ok(Some(branch.to_owned()))
+            }
+            Some((owner, branch)) => refuse(format!(
+                "an upstream pull request for {fork} states the head {spelling} {head:?}, a branch \
+                 of {owner}'s repository, which this fork's ledger never ruled on: state it as \
+                 {}:{branch}, the fork's own branch (a cross-repository head cannot be checked \
+                 here)",
+                fork.owner
+            )),
+        },
+        [first, .., last] => refuse(format!(
+            "an upstream pull request for {fork} states {} heads ({}); gh would open {last} \
+             while a reader expects {first}: state one",
+            heads.len(),
+            heads.join(", ")
+        )),
+    }
+}
+
+/// The fork's branch a REST creation states in its `head` field, by the same
+/// rule as `--head` (GitHub's REST `head` is `owner:branch` for another
+/// repository's branch too). Without one the creation is gh's error to
+/// give, but the head may also travel in a body file knives does not read
+/// (`--input`); either way its verdict cannot be checked, and nothing
+/// unverifiable is let through.
+fn rest_head(fork: &Fork, heads: &[String]) -> Result<String, Early> {
+    one_head(fork, heads, "-f head")?.ok_or_else(|| {
         Early::Refuse(format!(
-            "an upstream pull request for {repo} needs a head branch (`-f head=<branch>`) to \
-             check its placement verdict"
+            "an upstream pull request for {fork} needs a head branch (`-f head={}:<branch>`) to \
+             check its placement verdict",
+            fork.owner
         ))
     })
 }
@@ -1398,15 +1588,6 @@ fn git_head_branch(cwd: &Path) -> Option<String> {
     }
     let branch = std::str::from_utf8(&output.stdout).ok()?.trim();
     (!branch.is_empty()).then(|| branch.to_owned())
-}
-
-/// The registered repository whose `upstream` is `target`, if any.
-fn upstream_of(registry: &crate::config::Registry, target: &str) -> Option<crate::ids::RepoName> {
-    registry
-        .repos
-        .iter()
-        .find(|(_, entry)| crate::remote_url::same_remote(&entry.upstream, target))
-        .map(|(name, _)| crate::ids::RepoName::new(name))
 }
 
 /// How a GraphQL query names an owner: inline, or through a variable whose value
@@ -2120,7 +2301,7 @@ mod tests {
 
         assert_eq!(
             resolve_from_inputs(TargetInputs {
-                api_owner: Some("api-owner"),
+                api_owner: Some((DEFAULT_HOST, "api-owner")),
                 stated: Some(Ok(Repo {
                     host: host.to_owned(),
                     owner: "explicit".to_owned(),

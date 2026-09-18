@@ -52,7 +52,7 @@ impl Fork<'_> {
             let expected = expected?;
             match self.checkout.remotes.get(role) {
                 None => Some(format!("{role} remote absent; registry says {expected}")),
-                Some(actual) if !same_remote(actual, expected) => Some(format!(
+                Some(actual) if !same_remote(expected, actual) => Some(format!(
                     "{role} remote is {actual}; registry says {expected}"
                 )),
                 Some(_) => None,

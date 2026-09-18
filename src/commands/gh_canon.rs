@@ -113,24 +113,14 @@ pub fn is_branch(text: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'/'))
 }
 
-/// The refusal for a head spelled outside the grammar.
-///
-/// A head carrying `:` is gh's `OWNER:BRANCH`, a branch of some other
-/// repository the ledger never ruled on; any other shape is not a branch
-/// name knives compares.
+/// The refusal for a head whose branch is spelled outside the grammar: not
+/// a branch name knives compares (the owner, if any, is judged by the
+/// caller).
 pub fn head_refusal(repo: &str, spelling: &str, text: &str) -> String {
-    if text.contains(':') {
-        format!(
-            "an upstream pull request for {repo} states the head {spelling} {text:?}, a branch of \
-             another repository: state the head as a branch of this fork (a cross-repository \
-             head cannot be checked here)"
-        )
-    } else {
-        format!(
-            "knives compares heads only as a branch name (of [{BRANCH_CHARS}], not beginning \
-             with -); {spelling} {text:?} for {repo} is not one: state the branch"
-        )
-    }
+    format!(
+        "knives compares heads only as OWNER:BRANCH with the branch of [{BRANCH_CHARS}], not \
+         beginning with -; {spelling} {text:?} for {repo} is not one: state the branch"
+    )
 }
 
 /// Go's `strconv.ParseBool`, the reading pflag gives a switch's `=value`.
@@ -323,12 +313,13 @@ mod tests {
     ];
 
     #[test]
-    fn every_generated_repository_spelling_is_read_canonically_or_refused_never_guessed() {
-        // For 400 generated strings, plus the pieces themselves: a spelling
-        // is either read — in which case every segment is canonical and the
-        // reading round-trips to itself, so there is exactly one (host,
-        // owner, name) it can be — or refused. There is no third outcome,
-        // and nothing read was normalised on the way in.
+    fn the_repository_parser_never_normalises_what_it_reads() {
+        // A smoke test of the parser over 400 generated strings plus the
+        // pieces themselves: whatever it reads respells to the input byte
+        // for byte and round-trips, and whatever it refuses is refused with
+        // the canonical form named. It says nothing about gh or GitHub —
+        // which spellings gh would send to a registered upstream is the
+        // integration suite's question (`tests/gh_command.rs`).
         let mut generator = Generator(0x9E37_79B9_7F4A_7C15);
         let mut corpus: Vec<String> = PIECES.iter().map(|piece| (*piece).to_owned()).collect();
         for _ in 0..400 {
@@ -376,17 +367,8 @@ mod tests {
             repo.contains(&format!("GH_REPO \"https://{HOST}/acme/work\"")),
             "{repo}"
         );
-        let cross = head_refusal("registered", "--head", "other:feat/x");
-        assert!(
-            cross.contains("state the head as a branch of this fork"),
-            "{cross}"
-        );
-        assert!(
-            cross.contains("cross-repository head cannot be checked here"),
-            "{cross}"
-        );
-        let shape = head_refusal("registered", "-f head=", "feat x");
-        assert!(shape.contains("only as a branch name"), "{shape}");
+        let shape = head_refusal("registered", "-f head=", "o:feat x");
+        assert!(shape.contains("only as OWNER:BRANCH"), "{shape}");
         assert!(shape.contains("state the branch"), "{shape}");
         assert!(shape.contains(BRANCH_CHARS), "{shape}");
     }

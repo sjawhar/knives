@@ -699,7 +699,9 @@ fn reject_shared_upstreams(registry: &Registry, path: &Path) -> Result<(), Confi
     let entries: Vec<(&String, &RepoEntry)> = registry.repos.iter().collect();
     for (index, (a, first)) in entries.iter().enumerate() {
         for (b, second) in entries.iter().skip(index + 1) {
-            if crate::remote_url::same_remote(&first.upstream, &second.upstream) {
+            if crate::remote_url::same_remote(&first.upstream, &second.upstream)
+                || crate::remote_url::same_remote(&second.upstream, &first.upstream)
+            {
                 return Err(ConfigError::Invalid {
                     path: path.to_owned(),
                     detail: format!(
