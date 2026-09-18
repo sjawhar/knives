@@ -289,9 +289,13 @@ continues as prose is an ordinary note), `release include` and `release advance`
 member with no verdict note, and any member whose newest verdict is `CONSUMER`, and `knives
 gh` refuses an upstream `pr create` (or the REST pulls creation, in any spelling gh accepts:
 flags before the path, an absolute URL, `{owner}`/`:owner` placeholders) for a branch whose
-verdict is not `UPSTREAM`; the head is read once (`--head`, `-H`, attached or not) and is the
-one head gh receives, and outside jj git's checked-out branch is the head gh would use. A
-GraphQL document read from a file is not inspected. Branches that predate the gate are
+verdict is not `UPSTREAM`; the head is read as gh's own parser reads `pr create` (each flag gh
+defines consuming its value, shorthand clusters expanded, `--` ending flags), so the branch the
+gate checks is the one gh receives, and outside jj git's checked-out branch is the head gh would
+use; a flag gh does not define, or two stated heads, is refused rather than guessed. A creation
+addressed by numeric repository id (`repositories/<id>/pulls`) is refused and routes no token.
+A GraphQL document read from a file, a gh alias, and a gh extension are not inspected: the gate
+reads gh's own verbs. Branches that predate the gate are
 grandfathered as members on either the ledger's evidence (a branch any recorded cut or edit
 names as a parent) or, where the ledger has none, the repository's (a branch the release in
 hand carries now — at a parent, or grown past a parent no record names and no bookmark
