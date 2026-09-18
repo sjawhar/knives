@@ -11,7 +11,11 @@ description: Pre-PR contribution judgment gate for upstream repositories. Use wh
 
 ## Overview
 
-Opening a pull request against an upstream repository requires adhering to that project's specific contribution guidelines. The `knives` CLI provides programmatic facts through `knives preflight`. The agent provides the human judgment to evaluate compliance before executing `gh pr create`.
+Opening a pull request against the upstream repository — the target repository, never our
+fork — requires adhering to that project's specific contribution guidelines. The `knives` CLI
+provides programmatic facts through `knives preflight`. The judgment is whether the change
+complies with the upstream project's conventions. The placement judgment in the callout above
+remains required; the destination is settled.
 
 Never open an upstream PR without walking this gate, and never without the written answer to whether the change belongs upstream at all (the callout above). The gate and that written judgment are what make a PR opened in Sami's name defensible; neither is a permission to ask him for.
 
@@ -30,7 +34,7 @@ Read the command output to identify three categories of facts:
 2. Open PR accounting: current open PR count and repository policy cap limits.
 3. Branch status: whether the branch is claimed, stale, landed, or divergent.
 
-`knives preflight` supplies the facts. You supply the judgment.
+`knives preflight` supplies the facts. You supply the compliance judgment.
 
 ## Step 2: Verification Checklist
 
