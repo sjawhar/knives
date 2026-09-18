@@ -1,6 +1,6 @@
 ---
 name: fork-work
-description: Check knives before working in a repository we maintain a fork of. Make sure to use this skill whenever you are about to change, fix, implement, refactor or test anything in such a repository, and equally when you are only reading or investigating one — tracing how it works, finding where something is implemented, reviewing its history. Also use it before cloning or re-cloning one of these projects or making any scratch or temporary checkout of it, and when asked which branch to use, whether another agent is working somewhere, or how to get a working copy. These repositories are shared with other agents and coordinated by the knives CLI, so improvising a checkout costs real work; consult this first even when the request sounds like ordinary coding or plain code reading.
+description: Check knives before working in a repository we maintain a fork of. Make sure to use this skill whenever you are about to change, fix, implement, refactor or test anything in such a repository, and equally when you are only reading or investigating one — tracing how it works, finding where something is implemented, reviewing its history. Also use it before cloning or re-cloning one of these projects or making any scratch or temporary checkout of it, when deciding where a pull request goes, when preparing to run gh pr create against a fork, and when asked which branch to use, whether another agent is working somewhere, or how to get a working copy. These repositories are shared with other agents and coordinated by the knives CLI, so improvising a checkout costs real work; consult this first even when the request sounds like ordinary coding or plain code reading.
 ---
 
 # About to work in a fork
@@ -8,6 +8,7 @@ description: Check knives before working in a repository we maintain a fork of. 
 > **Where a change lives comes before whether it goes upstream.** A managed fork is a product the consumer repository uses; the consumer repository is where its own deployment's operating policy lives — lifetimes and reaping of jobs, caps, quotas, schedules, alerting, node sizing, who-may-do-what defaults. The default home for anything policy-shaped is the consumer's own infrastructure (its own scheduled jobs and janitors, a config value the library already exposes); a fork member is for a defect in the library's own machinery or a capability nothing outside the library can provide (a missing field, an endpoint), which is also what makes it upstream-bound. The test, applied by the author here and again by the release owner at include time: *if the fork were replaced by upstream main tomorrow, would anyone but us miss this?* No means it belongs in the consumer. When the fork genuinely looks like the right home for something policy-shaped, that is a question to the owner with options, and the owner's answer decides — a default with a valve, not a prohibition. The case that made this a rule: a fixed creation-time lifetime cap on every job, built into the fork's own janitor as a fork member from a duration study and pinned into production with a PR body that named neither the number nor that only one deployment carried it; the same behavior was a scheduled job in the consumer's own cluster against the library's API. Two questions, side by side: this one is *fork or consumer*; the callout below is *upstream or fork-only*; neither is an approval step. The reflex both guard against: fixing at the point of mechanism (the janitor code lives in the fork, so the cap went in the fork) instead of the point of ownership (the policy is the consumer's). `maintaining-inspect` owns this rule and the consumer's record of the incident carries the owner's words verbatim; read that record, not a relay of it.
 
 > **Upstream PRs are a placement judgment, not a permission.** Before opening one, load `maintaining-inspect` (with this skill and `using-knives` for the fork mechanics) and write down whether the change needs to go upstream at all: a defect any user of the library would hit, fixed with evidence (a reproduction or red→green test), is upstream material; a fork-specific workaround, a knob only we use, or an unproven fix is not. That answer is recorded in the `placement:` notch and the PR body — nobody is asked and no approval is awaited (Sami, 2026-09-16: "I didn't ask to be in the loop for every upstream interaction"). The default for every fix is a fork member (single signed commit on the release's shared base → pushed to the fork remote → `knives notch` → tip + red→green evidence to the inspect release owner for include-time review → next cut → agent-c pin bump). Once an upstream PR is open, its lifecycle — review rounds, body edits, rebases, the close — is the owning session's own work, never parked on a human.
+> **PRs always go upstream.** Apply the ownership test above first. A change that belongs in the consumer has no fork branch and no upstream PR. For a change that belongs in the fork, its pull request targets the upstream repository `knives repos` reports, never our fork. Genuine fork-only changes are very few and require Sami's explicit approval. If you believe you have one, stop and ask; do not decide it yourself.
 
 ## Stop and find out where you are
 
@@ -140,26 +141,39 @@ has a knives command that does the same job safely:
   be working there. `knives start` gives you your own workspace, based where the section
   above says, so you never inherit a release merge as a parent by accident. This is about
   these shared forks specifically; branching normally in your own projects is fine.
-- **The two sanctioned moves.** A branch that needs a newer base moves one of two ways, and
-  which one depends on whether the branch is a release member (`knives release members` lists
-  the parents of the release in hand; a branch named there is a member). A member moves with
-  `knives release rebase`: every member and the release together, so the composition stays
-  whole. A lone branch moves with `jj rebase -b <branch> -d <trunk>@upstream`, which keeps its
-  change ids so `knives release advance <branch>` follows it — and, because `-b` rebases
-  descendants, also carries any release merge built on it, which is expected: the release
-  follows its member, and superseded cuts are `knives release reap`ed. Never `jj duplicate` a
-  branch: it mints new commit ids the release cannot match to the branch (`knives release
-  advance --from` is the repair, not the plan). Never keep two copies of a branch — a
-  "release-lineage" or "sibling" branch carrying a pull request's content on an older base so
-  the release can carry it while the pull request branch is rebased for the maintainer. One
-  branch is both the release member and the pull request head; if it does not compose into the
-  release, the release is behind: move the release, do not fork the branch.
+- **Do not open a PR against our fork.** Fork pull requests are disabled deliberately: a
+  fork's `/pulls` 404 confirms it is not a review surface, not a blocker. Run `gh pr create
+  --repo <upstream>` against the upstream `knives repos` reports.
+- **The two sanctioned moves.** Before `-b`, test direct membership and release ancestry:
+  `knives release members` says whether the branch is a direct member; take `<release>` from
+  its `release:` line, then run `jj log -r '::<branch> & (bookmarks(glob:"release/*") |
+  remote_bookmarks(glob:"release/*") | <release>)'`. The query covers every local and remote
+  dated release ref, including retained superseded cuts, and the release in hand. A direct
+  member uses `knives release rebase`. Any query output, or an unanswered report or query,
+  means never `-b`: move one commit with `jj rebase -r <revision> -d <trunk>@upstream`, or
+  move the release with `knives release rebase`. Only a branch absent from the members report
+  and with a confirmed empty query moves with `jj rebase -b <branch> -d <trunk>@upstream`.
+  `jj rebase -b` on a member or a branch with release ancestry rewrites the release and every
+  member with it: shared-store breakage that damages other agents' branches, not a local
+  inconvenience. `jj rebase -r` moves one commit without sweeping descendants; `knives release
+  rebase` moves the whole composition. No one `knives` command answers both direct membership
+  and release ancestry. Never `jj duplicate` a branch: it mints new commit ids the release
+  cannot match to the branch (`knives release advance --from` is the repair, not the plan).
+  Never keep two copies of a branch — a "release-lineage" or "sibling" branch carrying a pull
+  request's content on an older base so the release can carry it while the pull request branch
+  is rebased for the maintainer. One branch is both the release member and the pull request
+  head; if it does not compose into the release, the release is behind: move the release, do
+  not fork the branch.
 - **Do not build a branch on top of a release merge.** A branch whose history carries a
   release cut carries every member of that cut, and a pull request from it asks the
   maintainer to review the whole fork. `knives status` and `knives preflight` report it as
-  `stacked-history`; `jj rebase -b <branch> -d <trunk>@upstream` fixes it and keeps the change ids.
+  `stacked-history`; move the one commit with `jj rebase -r <branch> -d
+  <trunk>@upstream`, not `-b`.
 - **Do not `jj op restore`.** It discards other agents' operations along with your own
-  mistake.
+  mistake. Do not authorize it yourself. Stop and obtain explicit approval from a
+  coordinator other than the caller. That coordinator may authorize `jj op restore` only
+  after inspecting `jj op log` and confirming that the exact requested operation range
+  contains only the caller's operations; without that approval, it is not a repair path.
 - **Do not push to `upstream`.** Contributions go through a pull request.
 
 ## Where the detail lives
