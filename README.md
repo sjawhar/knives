@@ -309,11 +309,14 @@ owner from is refused with its remedy. The checkout's remotes are read as git us
 -v`, `insteadOf` applied) with ssh aliases resolved through `ssh -G` as gh resolves them, each by
 one canonical remote grammar — `http(s)://`/`ssh://[user@]HOST[:PORT]/OWNER/REPO[.git]` or
 `[user@]HOST:OWNER/REPO[.git]`, with no `%`, `?`, `#`, whitespace, empty host, port or segment
-anywhere — the fetch URL when readable, else the last readable push URL (gh's own fallback), else a
-local path; a remote with no readable URL leaves the target uncertifiable and is refused with the
-`-R` remedy, and a registry remote outside the grammar is a configuration error at load. gh's
-`config.yml` and `hosts.yml` are read whole, in the grammar gh writes (block mappings, keys of
-`[A-Za-z0-9._:-]` behind one quote layer, space indentation, `# comments`, `key: {}`, one document);
+anywhere — the fetch URL when readable, or a local path with no distinct push URL; the push URL is
+read only for a remote with no fetch URL at all (where gh reads it too). A remote whose fetch URL
+knives does not read is unreadable whatever its push URL says — gh reads a `?query` or `#fragment`
+fetch URL, and falling to the push URL certified a decoy — and is refused with the `-R` remedy; a
+registry remote outside the grammar is a configuration error at load. gh's `config.yml` and
+`hosts.yml` are read whole, in the grammar gh writes (block mappings, keys of `[A-Za-z0-9._:-]`
+behind one quote layer read verbatim, space indentation, `# comments`, `key: {}`, one document, or
+the whole-file `{}` that `gh auth logout` leaves);
 the first line outside it in either file makes the default host unknown — refused naming the file
 and line, never read past, never a fall-through to the other file — and a `hosts` heading in
 `config.yml` is the hosts region, read or refused. The cost, by design, is a hand-edited file gh
