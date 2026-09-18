@@ -289,17 +289,19 @@ continues as prose is an ordinary note), `release include` and `release advance`
 member with no verdict note, and any member whose newest verdict is `CONSUMER`, and `knives
 gh` refuses an upstream `pr create`, the REST pulls creation (`api … repos/<owner>/<repo>/pulls`,
 method POST) and, inside a fork checkout, a GraphQL `createPullRequest`, for a branch whose
-verdict is not `UPSTREAM`. The command line is read once, as gh reads it — cobra's command and
+verdict is not `UPSTREAM`. The arguments are read once, as gh reads them — cobra's command and
 verb lookup and pflag's flag grammar over gh 2.98.0's own flag tables: flags anywhere in the
-line, before or after the command word, string flags last-wins, clusters expanded, aliases
-normalised, `--` ending flags — so the head and the repository the gate checks are the ones gh
-receives. A `-R`/`GH_REPO` repo spec is read the way go-gh reads it — a URL (the scp shorthand,
-`www.`, and a query or fragment included) or a `[HOST/]OWNER/REPO` shorthand; a flag gh does not
-define, an empty or a second head, a creation by numeric repository id
-(`repositories/<id>/pulls`), a percent-encoded owner, repository, or `graphql` endpoint, and a
-repo spec that fits neither of go-gh's own forms are refused rather than guessed. A document read
-from a file, a gh alias, and a gh extension are not inspected: the gate reads gh's own verbs. A
-missing registry gates nothing and says so once on stderr; an unreadable one is an error. Branches
+line, clusters expanded, aliases normalised, `--` ending flags, a switch's `=value` a Go bool
+(`--help=false` runs the command). The comparison does not reproduce gh's or GitHub's
+normalisation: knives compares only what it can read byte for byte — a repository as
+`OWNER/REPO` or `HOST/OWNER/REPO` (segments of `[A-Za-z0-9._-]`), a head as a branch name, an
+endpoint as `repos/OWNER/REPO/pulls` — and refuses every other spelling toward a registered
+upstream with the canonical one: a URL-form or empty `-R`, a second `-R`, `--head OWNER:BRANCH`,
+a percent-escaped or foreign-host endpoint, two methods, a `gh-resolved` marker carrying a
+host, a creation by numeric repository id (`repositories/<id>/pulls`), a flag gh does not
+define. A document read from a file, a gh alias, and a gh extension are not inspected: the gate
+reads gh's own verbs. A token is routed only for a canonical owner. A missing registry gates
+nothing and says so once on stderr; an unreadable one is an error. Branches
 that predate the gate are
 grandfathered as members on either the ledger's evidence (a branch any recorded cut or edit
 names as a parent) or, where the ledger has none, the repository's (a branch the release in
