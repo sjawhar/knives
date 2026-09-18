@@ -33,16 +33,18 @@
 //! own fold. The checkout's remotes are git's effective URLs (`git remote
 //! -v`, `insteadOf` applied) with ssh aliases resolved as go-gh resolves
 //! them, each read by the canonical remote grammar (`remote_url::classify`,
-//! `bind::all_remotes`): the fetch URL when readable, else the last
-//! readable push URL, else a local path; a remote with no readable URL
-//! leaves the target uncertifiable and is refused with the `-R` remedy.
+//! `bind::all_remotes`): the fetch URL when readable, or a local path; the
+//! push URL only for a remote with no fetch URL at all. A remote whose
+//! fetch URL knives does not read is unreadable whatever its push URL says
+//! (gh reads a `?query` fetch URL; falling to the push URL certified a
+//! decoy) and is refused with the `-R` remedy.
 //! gh's `config.yml` and `hosts.yml` are read whole in the grammar gh
 //! writes them in (`gh_config`); the first line outside it in either file
 //! makes the default host unknown — refused naming the file and the line,
 //! never read past, never a fall-through to the other file. With no head stated the gate states `<fork-owner>:<branch in hand>`
 //! itself, so gh never resolves one knives did not read. A token is routed
 //! only for a canonical owner on a host that folds to the default host.
-// allow: SIZE_OK: 3405 lines - single passthrough pipeline; splitting would separate resolution steps that read as one procedure.
+// allow: SIZE_OK: 3407 lines - single passthrough pipeline; splitting would separate resolution steps that read as one procedure.
 use std::collections::BTreeMap;
 use std::io::Read as _;
 use std::os::unix::{

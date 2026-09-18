@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use crate::config::{Registry, RepoEntry, Role};
 use crate::ids::RepoName;
-use crate::remote_url::same_remote;
+use crate::remote_url::{Remote, classify, same_remote};
 
 /// A repository root on this machine and the remotes it declares.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -308,10 +308,11 @@ pub struct Remotes {
     /// Each remote's URL knives reads — a forge URL in the canonical remote
     /// grammar, or a local path — by name.
     pub readable: BTreeMap<String, String>,
-    /// Each remote none of whose URLs knives reads, by name, with the URL
-    /// git listed first: URL-shaped, outside the grammar. gh may read a
-    /// repository from it that knives cannot compare, so the checkout's
-    /// target cannot be certified while such a remote exists.
+    /// Each remote knives does not read, by name, with the URL git listed
+    /// first: a fetch URL outside the grammar, or a local fetch path beside
+    /// a push URL. gh may read a repository from it that knives cannot
+    /// compare, so the repository the checkout addresses cannot be read
+    /// while such a remote exists.
     pub unreadable: BTreeMap<String, String>,
 }
 
@@ -327,13 +328,16 @@ pub fn remotes(root: &Path) -> Result<BTreeMap<String, String>, BindError> {
 /// `url.<base>.insteadOf` rewrite applied — the listing gh reads — and the
 /// one git would fetch from. The raw `remote.<name>.url` value would call a
 /// remote spelled through an alias another repository. Each remote is read
-/// the way gh's `TranslateRemotes` reads it, by the canonical remote grammar
-/// (`remote_url::classify`): its fetch URL when that is readable, else the
-/// last of its push URLs that is — a push-only remote (`pushurl` with no
-/// `url`), or a fetch URL that is a path, a one-segment URL or an invalid
-/// URL, is the repository its push URL names (measured against gh 2.98.0)
-/// — else, when the fetch URL is a local path, that path; a remote with no
-/// readable URL and no local one is [`Remotes::unreadable`]. Configuration
+/// by the canonical remote grammar (`remote_url::classify`), fail-closed:
+/// its fetch URL when that is readable, or a local path with no push URL
+/// beside it. A remote with a fetch URL knives does not read is
+/// [`Remotes::unreadable`] whatever its push URLs say — gh reads a
+/// repository from a fetch URL carrying a `?query`, a `#fragment` or a
+/// decodable `%` escape, and telling that apart from a fetch URL gh also
+/// rejects is the mimicry this module does not do. The one push-URL reading
+/// is gh's own for a remote with NO fetch URL at all (`pushurl` with no
+/// `url`; measured against gh 2.98.0): the last of its push URLs that is
+/// readable, else a local push path, else unreadable. Configuration
 /// reaches the read the way it reaches git: the repository's own file, the
 /// user's and the system's; `GIT_CONFIG_*` environment overrides do not
 /// (every git read knives makes strips them, see [`git_command`]). An ssh
@@ -389,35 +393,33 @@ pub fn all_remotes(root: &Path) -> Result<Remotes, BindError> {
             .flatten()
             .map(|push_url| resolved(push_url))
             .collect();
-        let readable = |url: &String| {
-            matches!(
-                crate::remote_url::classify(url),
-                crate::remote_url::Remote::Readable { .. }
+        // The URLs in the order gh's fallback reads them: the fetch URL when
+        // there is one, else the push URLs last first.
+        let (candidates, first_listed): (Vec<&String>, &String) = if fetch_url.is_empty() {
+            (
+                push_urls.iter().rev().collect(),
+                push_urls.first().unwrap_or(&fetch_url),
             )
-        };
-        let chosen = if readable(&fetch_url) {
-            Some(fetch_url.clone())
         } else {
-            push_urls.iter().rev().find(|url| readable(url)).cloned()
+            (vec![&fetch_url], &fetch_url)
         };
-        match chosen {
-            Some(url) => {
-                remotes.readable.insert(name, url);
-            }
-            None if !fetch_url.is_empty()
-                && crate::remote_url::classify(&fetch_url) == crate::remote_url::Remote::Local =>
+        let chosen = candidates.iter().find_map(|url| match classify(url) {
+            Remote::Readable { .. } => Some((*url).clone()),
+            // A local path is a remote knives reads only with nothing gh
+            // could read instead: a fetch path whose push URLs (git lists
+            // the fetch URL itself when none is configured) are all that
+            // same path, or the last push URL of a pushurl-only remote.
+            Remote::Local
+                if fetch_url.is_empty() || push_urls.iter().all(|push| *push == fetch_url) =>
             {
-                remotes.readable.insert(name, fetch_url);
+                Some((*url).clone())
             }
-            None => {
-                let first = if fetch_url.is_empty() {
-                    push_urls.first().cloned().unwrap_or_default()
-                } else {
-                    fetch_url
-                };
-                remotes.unreadable.insert(name, first);
-            }
-        }
+            Remote::Local | Remote::Unreadable => None,
+        });
+        match chosen {
+            Some(url) => remotes.readable.insert(name, url),
+            None => remotes.unreadable.insert(name, first_listed.clone()),
+        };
     }
     Ok(remotes)
 }

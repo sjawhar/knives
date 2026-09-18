@@ -10,9 +10,9 @@
 //! canonical remote grammar admits a forge URL knives reads byte for byte
 //! and a local path, and calls everything else [`Remote::Unreadable`] — a
 //! `%` escape, a query, a fragment, whitespace, an empty host or port —
-//! whatever gh's URL parser would make of it. A checkout remote with no
-//! readable URL is a refusal at the gate; a registry remote outside the
-//! grammar is a configuration error at load.
+//! whatever gh's URL parser would make of it. A checkout remote whose
+//! fetch URL is unreadable is a refusal at the gate (`bind::all_remotes`);
+//! a registry remote outside the grammar is a configuration error at load.
 
 /// Whether the remote spelling `stated` names the repository `registered`
 /// names.

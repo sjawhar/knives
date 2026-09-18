@@ -12,7 +12,8 @@
 //! block mappings of `key:`, `key: scalar` and `key: {}` lines (the empty
 //! map gh writes for a user with no stored token), keys of one canonical
 //! charset behind at most one layer of quotes, space indentation, `#`
-//! comments, blank lines, one document — and the first line outside that
+//! comments, blank lines, one document, or the one-line document `{}` gh
+//! leaves after the last `gh auth logout` — and the first line outside that
 //! grammar, in either file, makes the default host unknown, which refuses
 //! every creation that needs it with the remedy to state the host. There is
 //! no reading past such a line and no falling through from one file to the
@@ -172,8 +173,9 @@ enum Rest<'a> {
 /// entry's at any depth and every later one at the depth of an open map —
 /// deeper only directly under a `key:` with no scalar, shallower only to a
 /// depth already open; KEY of [`is_key`]'s charset, behind one layer of matching
-/// `"` or `'` containing neither quote nor `\`, separation whitespace
-/// allowed before the colon, unique within its map; SCALAR plain (no
+/// `"` or `'` whose content is read verbatim (a space inside the quotes is
+/// outside the charset, not trimmed), separation whitespace allowed before
+/// the colon, unique within its map; SCALAR plain (no
 /// leading [`INDICATORS`], no `: ` inside, no trailing `:`), in one layer
 /// of quotes, or the empty map `{}`, on the one line, followed by nothing
 /// but a comment. Every
@@ -183,6 +185,12 @@ enum Rest<'a> {
 /// control byte — is the error.
 pub fn parse(text: &str) -> Result<Vec<Entry>, (usize, String)> {
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    // The empty map gh writes as a whole file (measured: `gh auth logout` of
+    // the only account leaves hosts.yml as exactly `{}` and a newline): no
+    // entries. Only that document; `{}` among entries stays outside.
+    if text.trim_end_matches(['\n', '\r']) == "{}" {
+        return Ok(Vec::new());
+    }
     let mut entries = Vec::new();
     // The open maps: each level's indent and the keys seen in it.
     let mut levels: Vec<(usize, Vec<String>)> = Vec::new();
@@ -247,6 +255,8 @@ pub fn parse(text: &str) -> Result<Vec<Entry>, (usize, String)> {
 /// `content` (no surrounding whitespace) as `(key, rest)`, or `None` when
 /// it is not an entry of the grammar.
 fn entry(content: &str) -> Option<(&str, Rest<'_>)> {
+    // A quoted key is its content verbatim; a bare key ends before the
+    // separation whitespace that may precede its colon.
     let (key, rest) = if let quote @ ('"' | '\'') = content.chars().next()? {
         let body = content.get(1..)?;
         let close = body.find(quote)?;
@@ -260,9 +270,11 @@ fn entry(content: &str) -> Option<(&str, Rest<'_>)> {
                 .get(at + 1..)
                 .is_some_and(|after| after.is_empty() || after.starts_with(SPACE))
         })?;
-        (content.get(..colon)?, content.get(colon..)?)
+        (
+            content.get(..colon)?.trim_end_matches(SPACE),
+            content.get(colon..)?,
+        )
     };
-    let key = key.trim_end_matches(SPACE);
     if !is_key(key) {
         return None;
     }
@@ -436,6 +448,13 @@ mod tests {
             ("a.example\u{a0}:\n", 1),
             ("a/example:\n", 1),
             ("\"a.example\\\"\":\n", 1),
+            ("\"a.example \":\n    user: m\n", 1),
+            ("' a.example':\n    user: m\n", 1),
+            ("\"hosts \":\n    a.example:\n", 1),
+            ("{}\na.example:\n", 1),
+            ("a.example:\n{}\n", 2),
+            (" {}\n", 1),
+            ("{} # c\n", 1),
             ("a.example:\n    user: \"m\n", 2),
             ("a.example:\n    user: \"m\" x\n", 2),
             ("a.example:\n    user: m: n\n", 2),
@@ -469,5 +488,9 @@ mod tests {
         );
         assert_eq!(parse(""), Ok(Vec::new()));
         assert_eq!(parse("# only\n\n"), Ok(Vec::new()));
+        // The whole-file empty map gh writes after the last logout.
+        assert_eq!(parse("{}\n"), Ok(Vec::new()));
+        assert_eq!(parse("{}"), Ok(Vec::new()));
+        assert_eq!(parse("\u{feff}{}\r\n"), Ok(Vec::new()));
     }
 }

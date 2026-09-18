@@ -7,7 +7,7 @@
 
 #[path = "common/lab.rs"]
 mod lab;
-// allow: SIZE_OK: 6217 lines - real-binary gh passthrough scenarios share one fixture and process harness.
+// allow: SIZE_OK: 6372 lines - real-binary gh passthrough scenarios share one fixture and process harness.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
@@ -5098,6 +5098,11 @@ fn a_push_only_or_degenerate_fetch_upstream_remote_is_the_upstream_gh_targets() 
     // — a pushurl-only remote, a one-segment fetch URL, a path fetch URL all
     // resolve routed-a/upstream and send createPullRequest. Reading only the
     // `(fetch)` lines dropped or misread them (round-11 M1/F1, both lanes).
+    // knives reads the push URL only for a remote with NO fetch URL (round-15
+    // deep F1): a pushurl-only remote is the upstream and gates; a remote
+    // with a fetch URL knives does not read is an unreadable remote, refused
+    // with the `-R` remedy, whatever its push URL says — telling a fetch URL
+    // gh also rejects from one gh reads is the mimicry knives does not do.
     let config_home = placement_gate_home();
     record_placement(config_home.path(), "feat/eps", "FORK");
     let host = concat!("github", ".com");
@@ -5139,6 +5144,12 @@ fn a_push_only_or_degenerate_fetch_upstream_remote_is_the_upstream_gh_targets() 
         ),
     ];
     for (what, config) in &shapes {
+        let expected = match config.first() {
+            Some(("remote.upstream.url", fetch)) => {
+                format!("remote upstream's URL ({fetch}) is outside the grammar knives compares")
+            }
+            _ => "feat/eps has placement verdict FORK".to_owned(),
+        };
         for arguments in [
             &[
                 "pr",
@@ -5169,8 +5180,7 @@ fn a_push_only_or_degenerate_fetch_upstream_remote_is_the_upstream_gh_targets() 
                 "{what} {arguments:?}: {output:?}"
             );
             assert!(
-                String::from_utf8_lossy(&output.stderr)
-                    .contains("feat/eps has placement verdict FORK"),
+                String::from_utf8_lossy(&output.stderr).contains(&expected),
                 "{what} {arguments:?}: {output:?}"
             );
             assert!(
@@ -5331,14 +5341,16 @@ fn only_ascii_space_and_tab_are_yaml_whitespace_to_the_config_reader() {
 }
 
 #[test]
-fn a_fetch_url_gh_s_parser_rejects_yields_to_the_push_url() {
+fn a_fetch_url_outside_the_grammar_makes_the_remote_unreadable_whatever_its_push_url() {
     // Measured (pass 13, MEASUREMENT.md): an invalid `%` escape in the path
     // or userinfo, whitespace, an encoded slash making three segments, or a
     // backslash in an scp value is no URL to gh, which falls to the push
     // URL; knives' textual reader called each a repository (round-12 F1/F3,
     // both lanes). knives reads each by the canonical remote grammar
-    // (round-13): outside it, a URL is unreadable and yields to a readable
-    // push URL, whatever gh's parser would make of it.
+    // (round-13): outside it, the remote is unreadable — never the push URL
+    // (round-15 deep F1: a `?query` fetch URL is read by gh and refused by
+    // knives, so falling to the push URL certified a decoy) — refused with
+    // the `-R` remedy.
     let config_home = placement_gate_home();
     record_placement(config_home.path(), "feat/eps", "FORK");
     let host = concat!("github", ".com");
@@ -5372,15 +5384,17 @@ fn a_fetch_url_gh_s_parser_rejects_yields_to_the_push_url() {
         );
         assert_eq!(output.status.code(), Some(2), "{fetch}: {output:?}");
         assert!(
-            String::from_utf8_lossy(&output.stderr).contains("feat/eps has placement verdict FORK"),
+            String::from_utf8_lossy(&output.stderr).contains(&format!(
+                "remote upstream's URL ({fetch}) is outside the grammar knives compares"
+            )),
             "{fetch}: {output:?}"
         );
         assert!(recorded.is_none(), "{fetch}: gh ran: {recorded:?}");
     }
-    // A valid escape gh decodes to the upstream itself is still a `%`: with
-    // no readable push URL the remote is unreadable and the target cannot be
-    // certified — refused with the `-R` remedy, never read around (the
-    // accepted over-refusal, round-13).
+    // A valid escape gh decodes to the upstream itself is still a `%`: the
+    // remote is unreadable and the repository cannot be read — refused with
+    // the `-R` remedy, never read around (the accepted over-refusal,
+    // round-13).
     let (output, recorded) = run_in_clone_with_upstream_config(
         config_home.path(),
         &[(
@@ -5407,8 +5421,8 @@ fn a_fetch_url_gh_s_parser_rejects_yields_to_the_push_url() {
     );
     assert!(recorded.is_none(), "gh ran: {recorded:?}");
     // A query on the fetch URL puts it outside the grammar too, though gh
-    // reads the decoy repository from it: the readable push URL is the
-    // remote, and the upstream gate applies.
+    // reads the decoy repository from it: the remote is unreadable, and the
+    // push URL is not read.
     let (output, recorded) = run_in_clone_with_upstream_config(
         config_home.path(),
         &[
@@ -5431,7 +5445,9 @@ fn a_fetch_url_gh_s_parser_rejects_yields_to_the_push_url() {
     );
     assert_eq!(output.status.code(), Some(2), "{output:?}");
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("feat/eps has placement verdict FORK"),
+        String::from_utf8_lossy(&output.stderr).contains(&format!(
+            "remote upstream's URL (https://{host}/other/decoy.git?x=%zz) is outside the grammar knives compares"
+        )),
         "{output:?}"
     );
     assert!(recorded.is_none(), "gh ran: {recorded:?}");
@@ -5443,10 +5459,9 @@ fn a_remote_outside_the_canonical_grammar_is_never_read_around() {
     // `%` escape in the authority, a query or fragment however spelled, an
     // escape past a decoded slash — each a spelling gh's parser reads one
     // way or another and knives' reader read differently. knives now reads a
-    // remote by one grammar: outside it the URL is unreadable; a readable
-    // push URL is then the remote (gh's own fallback), and a remote with no
-    // readable URL leaves the target uncertifiable — refused with the `-R`
-    // remedy, never guessed.
+    // remote by one grammar: outside it the remote is unreadable, whatever
+    // its push URL says (round-15 deep F1) — refused with the `-R` remedy,
+    // never guessed.
     let config_home = placement_gate_home();
     record_placement(config_home.path(), "feat/eps", "FORK");
     let host = concat!("github", ".com");
@@ -5488,9 +5503,9 @@ fn a_remote_outside_the_canonical_grammar_is_never_read_around() {
             "{fetch}: {output:?}"
         );
         assert!(recorded.is_none(), "{fetch}: gh ran: {recorded:?}");
-        // With a readable push URL: that is the remote, and it is the
-        // upstream — the FORK verdict refuses, whatever repository gh would
-        // have read from the fetch URL.
+        // With a readable push URL beside it: still unreadable — the push
+        // URL is read only for a remote with no fetch URL (round-15 deep
+        // F1), whatever repository gh would read from either.
         let (output, recorded) = run_in_clone_with_upstream_config(
             config_home.path(),
             &[
@@ -5501,7 +5516,9 @@ fn a_remote_outside_the_canonical_grammar_is_never_read_around() {
         );
         assert_eq!(output.status.code(), Some(2), "{fetch} + push: {output:?}");
         assert!(
-            String::from_utf8_lossy(&output.stderr).contains("feat/eps has placement verdict FORK"),
+            String::from_utf8_lossy(&output.stderr).contains(&format!(
+                "remote upstream's URL ({fetch}) is outside the grammar knives compares"
+            )),
             "{fetch} + push: {output:?}"
         );
         assert!(recorded.is_none(), "{fetch} + push: gh ran: {recorded:?}");
@@ -5863,6 +5880,144 @@ fn a_repo_flag_on_gh_api_is_read_for_the_gate_and_gh_itself_refuses_it() {
         &[],
     );
     assert!(recorded.contains("-R\nother/decoy\n"), "{recorded}");
+}
+
+#[test]
+fn the_upstream_on_a_fetch_url_gh_reads_and_a_decoy_on_the_push_url_is_never_the_decoy() {
+    // Round-15 deep F1 (measured by the reviewer against gh 2.98.0): gh
+    // reads the repository from a fetch URL carrying `?a=b`, `#frag` or a
+    // decodable `%` escape and ignores the push URL. knives read those as
+    // unreadable and fell to the readable push URL — a decoy — certifying
+    // the decoy while gh created on the upstream: an ungated PR with the
+    // decoy's token. The push URL is now read only for a remote with no
+    // fetch URL: such a remote is unreadable, refused with the `-R` remedy.
+    let config_home = placement_gate_home();
+    record_placement(config_home.path(), "feat/eps", "FORK");
+    let host = concat!("github", ".com");
+    let decoy = format!("https://{host}/other/decoy.git");
+    let create = [
+        "pr",
+        "create",
+        "-t",
+        "t",
+        "-b",
+        "b",
+        "--head",
+        "routed-b:feat/eps",
+    ];
+    for fetch in [
+        format!("https://{host}/routed-a/upstream.git?a=b"),
+        format!("https://{host}/routed-a/upstream.git#frag"),
+        format!("https://{host}/routed-a/upstre%61m.git"),
+        format!("https://{host}/routed-a/upstream.git/extra"),
+        format!("https://{host}/routed-a"),
+        "/srv/git/upstream.git".to_owned(),
+    ] {
+        let (output, recorded) = run_in_clone_with_upstream_config(
+            config_home.path(),
+            &[
+                ("remote.upstream.url", fetch.as_str()),
+                ("remote.upstream.pushurl", decoy.as_str()),
+            ],
+            &create,
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "{fetch}: {output:?}");
+        assert!(
+            stderr.contains(&format!(
+                "remote upstream's URL ({fetch}) is outside the grammar knives compares"
+            )),
+            "{fetch}: {output:?}"
+        );
+        assert!(recorded.is_none(), "{fetch}: gh ran: {recorded:?}");
+    }
+    // Inside the grammar the fetch URL is the remote whatever the push URL
+    // says: the upstream, gated.
+    let (output, recorded) = run_in_clone_with_upstream_config(
+        config_home.path(),
+        &[
+            (
+                "remote.upstream.url",
+                &format!("https://{host}/routed-a/upstream.git/"),
+            ),
+            ("remote.upstream.pushurl", decoy.as_str()),
+        ],
+        &create,
+    );
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("feat/eps has placement verdict FORK"),
+        "{output:?}"
+    );
+    assert!(recorded.is_none(), "gh ran: {recorded:?}");
+    // Control: a pushurl-only remote is read from its push URL, as gh reads
+    // it — the upstream gates; a decoy alone passes as the decoy.
+    let upstream = format!("https://{host}/routed-a/upstream.git");
+    let (output, recorded) = run_in_clone_with_upstream_config(
+        config_home.path(),
+        &[("remote.upstream.pushurl", upstream.as_str())],
+        &create,
+    );
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("feat/eps has placement verdict FORK"),
+        "{output:?}"
+    );
+    assert!(recorded.is_none(), "gh ran: {recorded:?}");
+    let (output, recorded) = run_in_clone_with_upstream_config(
+        config_home.path(),
+        &[("remote.upstream.pushurl", decoy.as_str())],
+        &create,
+    );
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        recorded
+            .expect("fake gh ran")
+            .contains("GH_TOKEN=tok-other")
+    );
+}
+
+#[test]
+fn the_empty_map_gh_writes_after_logout_is_zero_hosts_and_a_quoted_key_is_verbatim() {
+    // Round-15 deep L1 (measured, pass 16: `gh auth logout` of the only
+    // account leaves hosts.yml as exactly `{}` and a newline; gh then reads
+    // zero hosts): the file gh writes is never refused — zero hosts,
+    // github.com. L2: a quoted key is its content verbatim, so `"ghe.test ":`
+    // carries a space outside the charset and refuses the file, where the
+    // reader had trimmed it to `ghe.test` and gated on a host gh does not
+    // read.
+    let hosts = HostsLab::new();
+    hosts.remove("config.yml");
+    hosts.write("hosts.yml", "{}\n");
+    hosts.passed("gh-written {} hosts.yml");
+    hosts.write("hosts.yml", "{}");
+    hosts.passed("{} without a newline");
+    hosts.write("config.yml", "version: \"1\"\n");
+    hosts.write("hosts.yml", "\u{feff}{}\r\n");
+    hosts.passed("{} behind a BOM with CRLF");
+    // `{}` beside entries, or indented, or commented, is not the document
+    // gh writes: refused.
+    for text in [
+        "{}\nghe.example:\n    user: m\n",
+        " {}\n",
+        "{} # logged out\n",
+        "ghe.example:\n    user: m\n{}\n",
+    ] {
+        hosts.write("hosts.yml", text);
+        hosts.refused(text, "is not YAML knives reads");
+    }
+    hosts.write("hosts.yml", "\"ghe.example \":\n    user: m\n");
+    hosts.refused(
+        "quoted key with a trailing space",
+        "is not YAML knives reads (line 1: \"\\\"ghe.example \\\":\")",
+    );
+    hosts.write("hosts.yml", "' ghe.example':\n    user: m\n");
+    hosts.refused(
+        "quoted key with a leading space",
+        "is not YAML knives reads (line 1: \"' ghe.example':\")",
+    );
+    hosts.write("hosts.yml", "\"ghe.example\" :\n    user: m\n");
+    hosts.gated("space outside the quotes is separation");
 }
 
 #[test]
