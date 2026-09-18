@@ -278,7 +278,9 @@ pub enum Command {
     /// red-team's verdict (first line `verdict: CONSUMER | FORK | UPSTREAM`), which
     /// is recorded on the branch in the ledger and read back by `release include`,
     /// `release advance` and `knives gh`. A `CONSUMER` verdict starts no branch.
-    /// An existing branch needs none.
+    /// An existing branch needs none; given one — claimed, resumed or seized — it
+    /// records a fresh verdict, and the newest wins. A `CONSUMER` verdict on an
+    /// existing branch is recorded and the branch is left to `finish`.
     ///
     /// Also states the fork's `immutable_heads()` — jj's trunk, tags, and the trunk
     /// by name on every knives remote — in the repository's jj config when that
@@ -479,6 +481,12 @@ pub enum ReleaseAction {
     /// Nothing else changes: every other parent stays at the commit the release
     /// already has. A member whose branch has advanced is not moved — that is a
     /// content change beyond including it, and `advance` is how it is asked for.
+    ///
+    /// A branch entering the release for the first time needs the placement
+    /// verdict `knives start --placement` recorded, and not a `CONSUMER` one; a
+    /// member some cut or edit already carried passes unasked. The gate is a
+    /// branch gate: a bare commit id, which no `start` ever named, is included
+    /// on your word.
     Include {
         /// A branch name, or any revision when no bookmark fits.
         branch: String,
@@ -511,6 +519,10 @@ pub enum ReleaseAction {
     /// commit it replaces. `--from` names that old commit directly, for exactly
     /// one branch, so the caller asserts the mapping instead of losing the
     /// release's recorded conflict resolution to a `drop` + `include`.
+    ///
+    /// A name entering the release for the first time — a branch stacked on a
+    /// member's tip, or one admitted on `--from`'s word — is gated on its
+    /// placement verdict exactly as an `include` is.
     Advance {
         /// Branches to advance. Empty means every member that has advanced.
         branches: Vec<String>,

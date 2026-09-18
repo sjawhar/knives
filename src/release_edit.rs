@@ -566,8 +566,10 @@ fn include_edit(
         return Ok(EditOutcome::Settled(Exit::Incomplete));
     }
     // Everything above answered "is it already a member"; this is a new
-    // inclusion, the one act the placement verdict gates.
-    if context.refuse_unplaced(target)? {
+    // inclusion, the one act the placement verdict gates. The gate is a branch
+    // gate — the verdict was stated when the branch was started — so a bare
+    // commit id, which no `start` ever named, is included on the caller's word.
+    if opened.local_bookmark_tip(target).is_some() && context.refuse_unplaced(target)? {
         return Ok(EditOutcome::Settled(Exit::Incomplete));
     }
     let mut parents = release.parents.clone();
@@ -682,16 +684,16 @@ fn advance_edit(
     let Some((parents, moved)) = outcome else {
         return Ok(EditOutcome::Settled(Exit::Incomplete));
     };
-    // A member found by succession or by the release's record is an existing
-    // one, whatever its age: the repository itself ties its tip to a current
-    // parent. `--from` bypasses that search on the caller's word, so the branch
-    // it names may be entering the release for the first time, and then it is
-    // gated exactly as an `include` is.
-    if from.is_some() {
-        for branch in &moved {
-            if context.refuse_unplaced(branch)? {
-                return Ok(EditOutcome::Settled(Exit::Incomplete));
-            }
+    // Succession is by commit ancestry: a different bookmark whose tip descends
+    // from a member's released parent succeeds it as readily as the member
+    // itself does, so a name `moved` carries may be entering the release for
+    // the first time — stacked on a member's tip, or admitted on `--from`'s
+    // word — and then it is gated exactly as an `include` is. A name some cut
+    // or edit already recorded passes unasked, so genuine members are
+    // untouched.
+    for branch in &moved {
+        if context.refuse_unplaced(branch)? {
+            return Ok(EditOutcome::Settled(Exit::Incomplete));
         }
     }
     if moved.is_empty() {

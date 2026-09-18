@@ -2,10 +2,12 @@
 //!
 //! `start` refuses a new branch with no placement verdict and asks the forcing
 //! question; a verdict on the command line is recorded on the branch as a
-//! `placement:` note, and a `CONSUMER` verdict starts nothing. `release
-//! include` and `release advance --from` read the note back: a branch no
-//! composition ever carried needs one that is not `CONSUMER`, while a member
-//! some cut or edit recorded is grandfathered.
+//! `placement: verdict:` note — on a claim, a resume or a seizure alike — and a
+//! `CONSUMER` verdict starts nothing. `release include` and `release advance`
+//! read the note back: the newest verdict decides, `CONSUMER` refuses even a
+//! member some cut or edit recorded, and only a branch with no verdict at all
+//! falls back to grandfathering — a first-time name is refused. A `placement:`
+//! note that carries no `verdict:` is prose, not a verdict.
 
 #![allow(
     clippy::expect_used,
@@ -18,10 +20,12 @@
 mod lab;
 
 use knives::ledger::{Kind, Ledger};
-use knives::placement::{CONSUMER_REFUSAL, forcing_question, missing_member_refusal};
+use knives::placement::{
+    CONSUMER_REFUSAL, Verdict, forcing_question, missing_member_refusal, recorded,
+};
 use lab::{
-    Lab, home_after_first_cut, knives_command, knives_release, placement_file, release_parents,
-    release_test_home, state_placement,
+    Lab, home_after_first_cut, knives, knives_command, knives_release, placement_file,
+    release_parents, release_test_home, state_placement,
 };
 
 /// `knives start <branch> --repo demo --why test [extra…]` without the lab
@@ -306,4 +310,226 @@ fn a_member_some_cut_recorded_is_grandfathered_into_include_and_advance() {
         String::from_utf8_lossy(&advanced.stdout).contains("advanced feat/alpha"),
         "{advanced:?}"
     );
+}
+
+#[test]
+fn a_verdict_on_a_held_claim_is_recorded_on_resume() {
+    // Given: a branch started with FORK and still held — the common case for a
+    // re-verdict: the workspace is open and a pull request is about to be opened.
+    let lab = Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let fork = placement_file(&home, "FORK");
+    let first = start(
+        &lab,
+        &home,
+        "feat/gamma",
+        &["--placement", fork.to_str().expect("utf-8 path")],
+    );
+    assert!(first.status.success(), "{first:?}");
+
+    // When: the red-team re-rules it UPSTREAM and `start` is run again with it.
+    let upstream = placement_file(&home, "UPSTREAM");
+    let again = start(
+        &lab,
+        &home,
+        "feat/gamma",
+        &["--placement", upstream.to_str().expect("utf-8 path")],
+    );
+
+    // Then: the claim is resumed and the newest recorded verdict is UPSTREAM.
+    assert!(again.status.success(), "{again:?}");
+    assert!(
+        String::from_utf8_lossy(&again.stdout).starts_with("resumed"),
+        "{again:?}"
+    );
+    let entries = ledger(&home).entries().expect("read ledger");
+    let newest = recorded(&entries, "feat/gamma")
+        .expect("a verdict is recorded")
+        .expect("and it reads");
+    assert_eq!(newest.verdict, Verdict::Upstream);
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|entry| entry.kind == Kind::Note)
+            .count(),
+        2,
+        "both verdicts are kept: {entries:?}"
+    );
+}
+
+#[test]
+fn a_consumer_verdict_on_an_existing_branch_is_recorded_and_says_finish() {
+    // Given: a branch that exists — a bookmark in the checkout — with no verdict.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let (home, _consumer) = release_test_home(&lab);
+    let consumer = placement_file(&home, "CONSUMER");
+
+    // When: the red-team rules it CONSUMER.
+    let output = start(
+        &lab,
+        &home,
+        "feat/alpha",
+        &["--placement", consumer.to_str().expect("utf-8 path")],
+    );
+
+    // Then: refused, the verdict is now the branch's newest, and the line says
+    // how the branch is retired.
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(CONSUMER_REFUSAL), "{stderr}");
+    assert!(
+        stderr.contains("`knives finish feat/alpha` retires it"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("no branch is started"), "{stderr}");
+    let entries = ledger(&home).entries().expect("read ledger");
+    assert_eq!(
+        recorded(&entries, "feat/alpha")
+            .expect("a verdict is recorded")
+            .expect("and it reads")
+            .verdict,
+        Verdict::Consumer
+    );
+    assert!(
+        !lab.work
+            .parent()
+            .expect("parent")
+            .join("feat-alpha")
+            .exists(),
+        "a consumer verdict opened a workspace"
+    );
+
+    // And: a branch that does not exist is told so, and nothing is recorded.
+    let absent = start(
+        &lab,
+        &home,
+        "feat/gamma",
+        &["--placement", consumer.to_str().expect("utf-8 path")],
+    );
+    assert_eq!(absent.status.code(), Some(2), "{absent:?}");
+    assert!(
+        String::from_utf8_lossy(&absent.stderr).contains("no branch is started for feat/gamma"),
+        "{absent:?}"
+    );
+    assert!(recorded(&ledger(&home).entries().expect("read ledger"), "feat/gamma").is_none());
+}
+
+#[test]
+fn advance_refuses_a_never_composed_branch_that_succeeds_a_member_by_ancestry() {
+    // Given: a release cut from alpha alone, and a new bookmark on a child of
+    // alpha's tip — succession by ancestry, which is how a member that grew
+    // looks too, but this name no composition ever carried and no verdict names.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let (home, _consumer) = home_after_first_cut(&lab);
+    lab.jj_work(["new", "feat/alpha", "-m", "sneaky"]);
+    std::fs::write(lab.work.join("sneaky.txt"), "x\n").expect("write sneaky");
+    lab.jj_work(["bookmark", "create", "feat/sneaky", "-r", "@"]);
+    lab.jj_work(["new"]);
+    let before = release_parents(&lab, "release/2026-08-04");
+
+    // When: it is advanced by name, and by a bare advance.
+    for args in [&["advance", "feat/sneaky"][..], &["advance"][..]] {
+        let output = knives_release(&lab, &home, args);
+
+        // Then: refused as a first-time member; the release is untouched.
+        assert_eq!(output.status.code(), Some(3), "{args:?}: {output:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim_end(),
+            format!("demo: {}", missing_member_refusal("feat/sneaky")),
+            "{args:?}"
+        );
+        assert_eq!(
+            release_parents(&lab, "release/2026-08-04"),
+            before,
+            "{args:?}"
+        );
+    }
+
+    // And: with a verdict behind it, the named advance moves the parent.
+    state_placement(&lab, &home, "feat/sneaky", "FORK");
+    let advanced = knives_release(&lab, &home, &["advance", "feat/sneaky"]);
+    assert!(advanced.status.success(), "{advanced:?}");
+    assert!(
+        String::from_utf8_lossy(&advanced.stdout).contains("advanced feat/sneaky"),
+        "{advanced:?}"
+    );
+}
+
+#[test]
+fn a_newer_consumer_verdict_refuses_even_a_grandfathered_member() {
+    // Given: a release cut from alpha and beta, beta dropped, and then the
+    // red-team ruling beta CONSUMER — newer than the cut that composed it.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let (home, _consumer) = home_after_first_cut(&lab);
+    let dropped = knives_release(&lab, &home, &["drop", "feat/beta", "--why", "recut"]);
+    assert!(dropped.status.success(), "{dropped:?}");
+    let before = release_parents(&lab, "release/2026-08-04");
+    state_placement(&lab, &home, "feat/beta", "CONSUMER");
+
+    // When: beta is included again.
+    let included = knives_release(&lab, &home, &["include", "feat/beta"]);
+
+    // Then: the newest verdict wins over the composition record.
+    assert_eq!(included.status.code(), Some(3), "{included:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&included.stdout).trim_end(),
+        format!("demo: {CONSUMER_REFUSAL}")
+    );
+    assert_eq!(release_parents(&lab, "release/2026-08-04"), before);
+}
+
+#[test]
+fn a_prose_placement_note_is_ordinary_and_an_unknown_verdict_names_the_branch_and_remedy() {
+    // Given: a cut release and a branch whose only `placement:` note is
+    // workflow prose — the shape ledgers held before the gate.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let (home, _consumer) = home_after_first_cut(&lab);
+    lab.branch("feat/gamma", "gamma.txt", "gamma\n");
+    let notch = |text: &str| {
+        let output = knives(
+            &lab,
+            &home,
+            &["notch", "feat/gamma", "--repo", "demo", "-m", text],
+        );
+        assert!(output.status.success(), "{output:?}");
+    };
+    notch("placement: belongs upstream eventually; the fork member ships the fix now");
+
+    // When: it is included.
+    let prose = knives_release(&lab, &home, &["include", "feat/gamma"]);
+
+    // Then: the note is no verdict, so the refusal is the missing-verdict one,
+    // not an unreadable ledger.
+    assert_eq!(prose.status.code(), Some(3), "{prose:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&prose.stdout).trim_end(),
+        format!("demo: {}", missing_member_refusal("feat/gamma"))
+    );
+    assert!(prose.stderr.is_empty(), "{prose:?}");
+
+    // When: a note carries the marker with a verdict knives does not know.
+    notch("placement: verdict: MAYBE\nalternative: none");
+    let unknown = knives_release(&lab, &home, &["include", "feat/gamma"]);
+
+    // Then: that is an error, and it names the branch and the way forward.
+    assert_eq!(unknown.status.code(), Some(3), "{unknown:?}");
+    let stderr = String::from_utf8_lossy(&unknown.stderr);
+    assert!(
+        stderr.contains("feat/gamma's newest placement note is not a verdict knives can read"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("knives notch feat/gamma -m \"placement: verdict:"),
+        "{stderr}"
+    );
+
+    // And: the remedy works — the newest verdict is read.
+    notch("placement: verdict: FORK\nalternative: none");
+    let included = knives_release(&lab, &home, &["include", "feat/gamma"]);
+    assert!(included.status.success(), "{included:?}");
 }

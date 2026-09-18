@@ -40,6 +40,9 @@ fn rebased_alpha() -> (Lab, tempfile::TempDir, CommitId, CommitId) {
         String::from_utf8_lossy(&cut.stderr)
     );
     std::fs::remove_dir_all(home.path().join("ledger")).expect("forget the cut record");
+    // With the cut record gone nothing says alpha was ever a member, so an
+    // advance gates it like a first-time inclusion and reads its verdict.
+    state_placement(&lab, &home, "feat/alpha", "FORK");
     let old_alpha = commit_at(&lab, "feat/alpha");
     let old_release = commit_at(&lab, "release/2026-08-04");
     lab.advance_upstream("upstream advance\n");

@@ -432,7 +432,9 @@ fn a_drop_without_a_why_is_a_usage_error() {
 
 #[test]
 fn include_by_commit_id_adds_that_exact_parent() {
-    // A commit that no bookmark names is still includable by id.
+    // A commit that no bookmark names is still includable by id, and on the
+    // caller's word: the placement gate is a branch gate, and a bare commit
+    // id has no branch that was ever started.
     let lab = Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     let (home, _consumer) = home_after_first_cut(&lab);
@@ -440,8 +442,6 @@ fn include_by_commit_id_adds_that_exact_parent() {
     let loose = commit_at(&lab, "feat/loose");
     lab.jj_work(["bookmark", "forget", "feat/loose"]);
     let before = release_parents(&lab, "release/2026-08-04");
-    // A commit no branch names still states its placement, under its id.
-    state_placement(&lab, &home, loose.as_str(), "FORK");
 
     let output = knives_release(&lab, &home, &["include", loose.as_str()]);
 

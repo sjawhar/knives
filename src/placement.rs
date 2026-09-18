@@ -18,11 +18,18 @@
 
 use crate::ledger::{Entry, Kind};
 
+/// The lead every placement note carries; the verdict file follows it.
+const NOTE_LEAD: &str = "placement: ";
+
 /// The text prefix that marks a ledger note as a placement verdict.
 ///
 /// The ledger distinguishes note purposes by their text, not by a field
-/// (`claimed: …`, `seized from …`); a placement note follows suit.
-pub const NOTE_PREFIX: &str = "placement: ";
+/// (`claimed: …`, `seized from …`); a placement note follows suit. The marker
+/// is the lead plus the verdict file's own first line, because `placement:`
+/// alone is also how workflow prose about a branch's placement begins
+/// (`placement: belongs upstream eventually …`); such a note is an ordinary
+/// note, not a verdict, and is skipped.
+pub const NOTE_PREFIX: &str = "placement: verdict:";
 
 /// The refusal an upstream-side `include` gives a verdict that says the change
 /// belongs in the consumer.
@@ -80,10 +87,22 @@ pub enum PlacementError {
     Verdict(String),
     #[error("a placement verdict is empty")]
     Empty,
+    /// A ledger note that carries the marker but a verdict token knives does
+    /// not know: named so the reader knows which branch, and how to move on.
+    #[error(
+        "{branch}'s newest placement note is not a verdict knives can read ({source}); record a \
+         newer one with `knives notch {branch} -m \"placement: verdict: CONSUMER | FORK | UPSTREAM …\"`"
+    )]
+    Note {
+        branch: String,
+        #[source]
+        source: Box<Self>,
+    },
 }
 
 impl Placement {
-    /// Parse a verdict file. The first non-blank line decides; everything is kept.
+    /// Parse a verdict file. The first non-blank line decides; everything is
+    /// kept, less the whitespace around it, so the note begins with the verdict.
     pub fn parse(text: &str) -> Result<Self, PlacementError> {
         let first = text
             .lines()
@@ -96,13 +115,14 @@ impl Placement {
             .ok_or_else(|| PlacementError::Verdict(first.to_owned()))?;
         Ok(Self {
             verdict,
-            text: text.trim_end().to_owned(),
+            text: text.trim().to_owned(),
         })
     }
 
-    /// The ledger note text: the marker, then the file as written.
+    /// The ledger note text: the lead, then the file as written — which starts
+    /// with its `verdict:` line, so the whole begins with [`NOTE_PREFIX`].
     pub fn note_text(&self) -> String {
-        format!("{NOTE_PREFIX}{}", self.text)
+        format!("{NOTE_LEAD}{}", self.text)
     }
 }
 
@@ -111,14 +131,21 @@ impl Placement {
 ///
 /// A note that carries the marker but no readable verdict is an error, not an
 /// absence: a ledger the tool cannot read must not read as a ledger that says
-/// nothing.
+/// nothing. A `placement:` note that does not continue `verdict:` is prose about
+/// the branch, not a verdict, and the search continues past it.
 pub fn recorded(entries: &[Entry], branch: &str) -> Option<Result<Placement, PlacementError>> {
     entries
         .iter()
         .rev()
         .filter(|entry| entry.kind == Kind::Note && entry.subject.as_deref() == Some(branch))
-        .find_map(|entry| entry.text.strip_prefix(NOTE_PREFIX))
-        .map(Placement::parse)
+        .filter(|entry| entry.text.starts_with(NOTE_PREFIX))
+        .find_map(|entry| entry.text.strip_prefix(NOTE_LEAD))
+        .map(|body| {
+            Placement::parse(body).map_err(|source| PlacementError::Note {
+                branch: branch.to_owned(),
+                source: Box::new(source),
+            })
+        })
 }
 
 /// Whether any recorded release composition named `branch` as a parent.
@@ -165,19 +192,19 @@ pub fn not_upstream_refusal(branch: &str, verdict: Verdict) -> String {
 
 /// Whether `branch` may become a member of a release, or why not.
 ///
-/// Passes an existing member unasked (see [`composed`]); a new one needs a
-/// recorded verdict that is not `CONSUMER`.
+/// A recorded verdict decides first, whatever the branch's age: the newest
+/// one wins, and `CONSUMER` refuses even a member some composition already
+/// carried. Only a branch with no verdict at all falls back to grandfathering
+/// (see [`composed`]); a new one with none is refused.
 pub fn member_refusal(entries: &[Entry], branch: &str) -> Result<Option<String>, PlacementError> {
-    if composed(entries, branch) {
-        return Ok(None);
-    }
     match recorded(entries, branch) {
-        None => Ok(Some(missing_member_refusal(branch))),
         Some(Err(error)) => Err(error),
         Some(Ok(placement)) if placement.verdict == Verdict::Consumer => {
             Ok(Some(CONSUMER_REFUSAL.to_owned()))
         }
         Some(Ok(_)) => Ok(None),
+        None if composed(entries, branch) => Ok(None),
+        None => Ok(Some(missing_member_refusal(branch))),
     }
 }
 
@@ -244,7 +271,10 @@ mod tests {
     fn the_first_non_blank_line_decides_the_verdict() {
         let placement = Placement::parse("\n  verdict: UPSTREAM \nalternative: none\n").unwrap();
         assert_eq!(placement.verdict, Verdict::Upstream);
-        assert_eq!(placement.text, "\n  verdict: UPSTREAM \nalternative: none");
+        // The stored text starts with the verdict line, so the note carries the
+        // marker whatever whitespace the file opened with.
+        assert_eq!(placement.text, "verdict: UPSTREAM \nalternative: none");
+        assert!(placement.note_text().starts_with(NOTE_PREFIX));
         assert_eq!(
             Placement::parse("alternative: x\nverdict: FORK"),
             Err(PlacementError::Verdict("alternative: x".to_owned()))
@@ -271,13 +301,46 @@ mod tests {
     }
 
     #[test]
-    fn a_marked_note_without_a_verdict_is_an_error_not_an_absence() {
-        let entries = [note("feat/a", "placement: whatever")];
+    fn a_marked_note_whose_verdict_is_unknown_is_an_error_naming_the_branch_and_remedy() {
+        let entries = [note(
+            "feat/a",
+            "placement: verdict: MAYBE\nalternative: none",
+        )];
+        let error = recorded(&entries, "feat/a").unwrap().unwrap_err();
         assert!(matches!(
-            recorded(&entries, "feat/a"),
-            Some(Err(PlacementError::Verdict(_)))
+            &error,
+            PlacementError::Note { branch, source }
+                if branch == "feat/a" && matches!(**source, PlacementError::Verdict(_))
         ));
+        let text = error.to_string();
+        assert!(text.contains("feat/a's newest placement note"), "{text}");
+        assert!(
+            text.contains("knives notch feat/a -m \"placement: verdict:"),
+            "{text}"
+        );
+        assert!(text.contains("\"verdict: MAYBE\""), "{text}");
         assert!(member_refusal(&entries, "feat/a").is_err());
+        assert!(upstream_pull_refusal(&entries, "feat/a").is_err());
+    }
+
+    #[test]
+    fn a_prose_placement_note_is_an_ordinary_note_not_a_verdict() {
+        // The shape the live ledger holds from before the gate: workflow prose
+        // under the `placement:` prefix, no verdict line.
+        let prose = "placement: general provider correctness belongs upstream eventually; the \
+                     fork member ships the fix now and an upstream PR remains required.";
+        assert!(recorded(&[note("feat/a", prose)], "feat/a").is_none());
+        assert!(recorded(&[note("feat/a", "placement: whatever")], "feat/a").is_none());
+        // It hides nothing: the search continues to the older verdict behind it.
+        let entries = [
+            note("feat/a", "placement: verdict: UPSTREAM"),
+            note("feat/a", prose),
+        ];
+        assert_eq!(
+            recorded(&entries, "feat/a").unwrap().unwrap().verdict,
+            Verdict::Upstream
+        );
+        assert_eq!(upstream_pull_refusal(&entries, "feat/a").unwrap(), None);
     }
 
     #[test]
@@ -306,6 +369,19 @@ mod tests {
         assert_eq!(
             member_refusal(&[cut_event(&["feat/old"])], "feat/new").unwrap(),
             Some(missing_member_refusal("feat/new"))
+        );
+        // But a verdict recorded later is newer than the composition and wins:
+        // CONSUMER refuses an existing member too.
+        assert_eq!(
+            member_refusal(
+                &[
+                    cut_event(&["feat/old"]),
+                    note("feat/old", "placement: verdict: CONSUMER")
+                ],
+                "feat/old"
+            )
+            .unwrap(),
+            Some(CONSUMER_REFUSAL.to_owned())
         );
     }
 
