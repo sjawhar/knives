@@ -110,9 +110,11 @@ begins `placement: verdict:` — the only note shape the tool reads as a verdict
 `placement:` note that continues as prose is an ordinary note. CONSUMER means no branch:
 implement the alternative in the consumer instead. A verdict is re-checked, not inherited,
 when evidence or scope changes — record the newer one the same way (`knives start` on the
-existing branch with `--placement`, whether that claims, resumes or seizes it, or `knives
-notch <branch> -m "placement: verdict: …"`), and the newest wins: a CONSUMER re-verdict is
-recorded on the existing branch and `start` says `knives finish <branch>` retires it.
+existing branch with `--placement`, whether that claims, resumes or seizes it, or by hand
+with both lines the tool reads, since a verdict without its `alternative:` is refused:
+`knives notch <branch> -m $'placement: verdict: FORK\nalternative: <the non-fork mechanism
+rejected, and why>'`), and the newest wins: a CONSUMER re-verdict is recorded on the
+existing branch and `start` says `knives finish <branch>` retires it.
 
 For an UPSTREAM candidate the brief additionally checks: does the change preserve upstream
 defaults, does a user outside this deployment benefit, and does the upstream repository

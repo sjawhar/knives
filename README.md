@@ -286,12 +286,17 @@ A fork member states the non-fork alternative it rejected before it exists: `kni
 `fork-work` skill has the red-team brief that produces it; a `placement:` note that continues
 as prose is an ordinary note), `release include` and `release advance` refuse a first-time
 member with no verdict note, and any member whose newest verdict is `CONSUMER`, and `knives
-gh` refuses an upstream `pr create` (or the REST pulls creation, with whatever flags precede
-the path) for a branch whose verdict is not `UPSTREAM`; a GraphQL document read from a file is
-not inspected. Branches that predate the gate are grandfathered as members: a branch any
-recorded cut or edit names as a parent, with no verdict note, recuts and advances unasked; a
-bare commit id is included on your word; only new inclusions and upstream pull requests are
-gated.
+gh` refuses an upstream `pr create` (or the REST pulls creation, in any spelling gh accepts:
+flags before the path, an absolute URL, `{owner}`/`:owner` placeholders) for a branch whose
+verdict is not `UPSTREAM`; the head is read once (`--head`, `-H`, attached or not) and is the
+one head gh receives, and outside jj git's checked-out branch is the head gh would use. A
+GraphQL document read from a file is not inspected. Branches that predate the gate are
+grandfathered as members on either the ledger's evidence (a branch any recorded cut or edit
+names as a parent) or the repository's (a branch the release in hand carries now — at a
+parent, or grown past a parent nothing else holds): they recut and advance unasked. The gate
+reads the bookmarks at the commit being included, so `feat/x`, `feat/x@origin` and `feat/x`'s
+tip sha are all `feat/x`; a commit no bookmark names is included on your word. Only new
+inclusions and upstream pull requests are gated.
 
 `knives release members --carries REVISION` compares the revision with every live release and the
 upstream trunk; `knives release members TARGET --carries REVISION` asks exactly one target;
