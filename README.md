@@ -306,7 +306,9 @@ numeric repository id (`repositories/<id>/pulls`), a flag gh does not define. Th
 rule folds `www.` off both sides and any subdomain of the registered host onto it
 (`foo.github.com` is `github.com`), a superset of gh's own fold; a registry origin knives reads no
 owner from is refused with its remedy. The checkout's remotes are read as git uses them (`git remote
--v`, `insteadOf` applied) with ssh aliases resolved through `ssh -G` as gh resolves them. With no head stated knives states `--head <fork-owner>:<branch in hand>`
+-v`, `insteadOf` applied; a push URL when the fetch URL names no repository, as gh falls back)
+with ssh aliases resolved through `ssh -G` as gh resolves them. gh's config keys are read as YAML
+keys at whatever indent the map sits at; a shape knives cannot read is refused, never zero hosts. With no head stated knives states `--head <fork-owner>:<branch in hand>`
 itself, in jj and plain-git checkouts alike, so gh never resolves a head knives did not read. A
 document read from a file, a gh alias, and a gh extension are not inspected: the gate
 reads gh's own verbs. A token is routed only for a canonical owner on a host that folds to
