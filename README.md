@@ -295,14 +295,15 @@ line, clusters expanded, aliases normalised, `--` ending flags, a switch's `=val
 (`--help=false` runs the command). The comparison does not reproduce gh's or GitHub's
 normalisation: knives compares only what it can read byte for byte — a repository as
 `OWNER/REPO` or `HOST/OWNER/REPO` (segments of `[A-Za-z0-9._-]`; a two-part spelling on `GH_HOST`,
-else `github.com`), a head as `<fork-owner>:<branch>`, an endpoint as `repos/OWNER/REPO/pulls` —
+else the one host in gh's `hosts.yml`, else `github.com`), a head as `<fork-owner>:<branch>`, an endpoint as `repos/OWNER/REPO/pulls` —
 and refuses every other spelling toward a registered upstream with the canonical one: a URL-form or
 empty `-R`, a second `-R`, a bare `--head BRANCH` (gh reads it as the upstream's own branch) or
-another owner's `OWNER:BRANCH`, a percent-escaped or foreign-host endpoint, a `--hostname` disagreeing
-with an absolute URL's host, two methods, a `gh-resolved` marker carrying a host, a creation by
+another owner's `OWNER:BRANCH`, a percent-escaped or foreign-host endpoint, a REST creation with `--input` (gh moves
+the fields to the query string), a `--hostname` disagreeing with an absolute URL's host, two methods, a `gh-resolved` marker carrying a host, a creation by
 numeric repository id (`repositories/<id>/pulls`), a flag gh does not define. The one comparison
-rule folds any subdomain of the registered host onto it (`foo.github.com` is `github.com`), a
-superset of gh's own fold. With no head stated knives states `--head <fork-owner>:<branch in hand>`
+rule folds `www.` off both sides and any subdomain of the registered host onto it
+(`foo.github.com` is `github.com`), a superset of gh's own fold; a registry origin knives reads no
+owner from is refused with its remedy. With no head stated knives states `--head <fork-owner>:<branch in hand>`
 itself, in jj and plain-git checkouts alike, so gh never resolves a head knives did not read. A
 document read from a file, a gh alias, and a gh extension are not inspected: the gate
 reads gh's own verbs. A token is routed only for a canonical owner on a host that folds to
