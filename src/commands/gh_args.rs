@@ -9,17 +9,25 @@
 //! first occurrence where gh keeps the last, or a valued flag before the verb
 //! as the verb. A single parse removes the class.
 //!
-//! The grammar is gh's: `gh [--help|--version] <command> [flags…] <verb>
-//! [flags…] [positionals…]`, flags anywhere after the command, a persistent
-//! `-R/--repo` valid before or after the verb, each flag's kind from a
-//! per-command table (the tables are audited against gh's own `--help` text,
-//! kept under `tests/fixtures`), value spellings `--flag v`, `--flag=v`,
-//! `-f v`, `-fv`, `-f=v`, shorthand clusters whose first valued shorthand takes
-//! the rest of the cluster or the next argument, `--flag=true|false` and
-//! `-d=true` on a switch, `--` ending flags, string flags last-wins, and gh's
-//! own aliases of the verbs knives reads (`pr new` is `pr create`, `pr co` is
-//! `pr checkout`) normalised. A dash-argument the table does not define is
-//! kept by name, for the caller that must refuse rather than guess.
+//! The grammar is gh's: `gh [flags…] <command> [flags…] <verb> [flags…]
+//! [positionals…]`, flags anywhere in the line — cobra locates the command
+//! word and the verb by walking argv with `stripFlags`, which does not stop
+//! at the command word, so a flag before it is read by the eventual leaf
+//! grammar exactly like one after — a persistent `-R/--repo` valid before or
+//! after the verb, each flag's kind from a per-command table (the tables
+//! are audited against gh's own `--help` text, kept under `tests/fixtures`),
+//! value spellings `--flag v`, `--flag=v`, `-f v`, `-fv`, `-f=v`, shorthand
+//! clusters whose first valued shorthand takes the rest of the cluster or
+//! the next argument, `--flag=true|false` and `-d=true` on a switch, `--`
+//! ending flags, string flags last-wins, and gh's own aliases of the verbs
+//! knives reads (`pr new` is `pr create`, `pr co` is `pr checkout`)
+//! normalised. `--help` is a genuine switch at every level (gh registers it
+//! once, persistently, with no shorthand); `-h` is not registered anywhere,
+//! so this module's own scan for a command or a verb always reads it as an
+//! unknown flag that consumes whatever follows — only a leaf's real flag
+//! parse (below) treats a stray `-h` as `--help`. A dash-argument the table
+//! does not define is kept by name, for the caller that must refuse rather
+//! than guess.
 
 /// What a flag does with the argument after it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +64,13 @@ const fn switch(long: &'static str, short: Option<char>) -> Spec {
 
 /// cobra's own flags, on every command.
 const COBRA_FLAGS: &[Spec] = &[switch("help", Some('h'))];
+
+/// gh's own root flag: `--version`, with no shorthand. `--help` is not
+/// listed here — [`find_verb`] treats a long `--help` as a switch
+/// unconditionally (gh registers it once, persistently, on every command),
+/// and never treats a short `-h` as one, since gh never gives it a
+/// shorthand anywhere.
+const ROOT_FLAGS: &[Spec] = &[switch("version", None)];
 
 /// `gh pr`'s persistent flags, valid before or after the verb.
 pub const PR_FLAGS: &[Spec] = &[valued("repo", Some('R'))];
@@ -203,23 +218,44 @@ pub struct GhInvocation {
 impl GhInvocation {
     /// Read `args` — everything after `gh` — as gh would.
     pub fn parse(args: &[String]) -> Self {
-        let Some(command) = args.first().filter(|first| !first.starts_with('-')) else {
+        // cobra's root `Find` walks the whole line for the first word that
+        // is not a flag or a flag's value, using only the root's own flags
+        // (`--help`, `--version`) to tell them apart — a flag before the
+        // command word is not special, and is handed to the eventual leaf
+        // grammar below exactly like one after.
+        let Some((command, index)) = find_verb(args, ROOT_FLAGS) else {
             return Self::default();
         };
+        let command = command.to_owned();
         let mut invocation = Self {
             command: Some(command.clone()),
             ..Self::default()
         };
-        let rest = args.get(1..).unwrap_or(&[]);
+        // `argsMinusFirstX`: only the one command-word occurrence is
+        // removed; every flag around it, before or after, rides along for
+        // the leaf grammar to read.
+        let mut rest = args.to_vec();
+        rest.remove(index);
+        // A `rest`-relative index converted back to its position in `args`:
+        // unchanged before the removed word, shifted one past it.
+        let to_args_index = |rest_index: usize| {
+            if rest_index < index {
+                rest_index
+            } else {
+                rest_index + 1
+            }
+        };
         match command.as_str() {
             "pr" => {
-                let verb = find_verb(rest, PR_FLAGS).map(|(verb, index)| {
+                let found = find_verb(&rest, PR_FLAGS);
+                let skip = found.map(|(_, index)| index);
+                let verb = found.map(|(verb, index)| {
                     let canonical = match verb {
                         "new" => "create",
                         "co" => "checkout",
                         other => other,
                     };
-                    (canonical.to_owned(), index + 1)
+                    (canonical.to_owned(), to_args_index(index))
                 });
                 let grammar = match verb.as_ref().map(|(verb, _)| verb.as_str()) {
                     Some("create") => Grammar {
@@ -231,16 +267,15 @@ impl GhInvocation {
                         strictness: Strictness::ValuedOnly,
                     },
                 };
-                let skip = verb.as_ref().map(|(_, index)| index - 1);
                 invocation.verb = verb;
-                parse_flags(rest, skip, grammar, &mut invocation);
+                parse_flags(&rest, skip, grammar, &mut invocation);
             }
             "api" => {
                 // `-R` is not a `gh api` flag (gh refuses it), but the shim
                 // routed a token by it and scripts pass it; read, so the
                 // routing keeps working and the endpoint stays a positional.
                 parse_flags(
-                    rest,
+                    &rest,
                     None,
                     Grammar {
                         tables: [COBRA_FLAGS, API_FLAGS, PR_FLAGS],
@@ -253,7 +288,7 @@ impl GhInvocation {
                 // A command knives only routes a token for: `-R/--repo` is
                 // read (the shim did), nothing else is judged.
                 parse_flags(
-                    rest,
+                    &rest,
                     None,
                     Grammar {
                         tables: [COBRA_FLAGS, PR_FLAGS, &[]],
@@ -309,12 +344,19 @@ impl GhInvocation {
     }
 }
 
-/// The verb the way cobra's `stripFlags` finds it: the first argument after
-/// the command that is not a flag or a flag's value. Between the command and
-/// its verb, a `--long` without `=` or a two-character `-x` that is not one of
-/// the parent's own switches takes the next argument with it — cobra does not
-/// know the child's flags yet, so it assumes a value; a longer cluster (`-dH…`)
-/// or an `=` form stands alone.
+/// The next command word the way cobra's `stripFlags` finds it: the first
+/// argument that is not a flag or a flag's value, using `parent`'s flags to
+/// tell them apart — gh's own root `Find` for the command itself (`parent`:
+/// [`ROOT_FLAGS`]), then this same scan again for `pr`'s verb (`parent`:
+/// [`PR_FLAGS`]). A `--long` without `=`, or a two-character `-x`, that is
+/// not one of `parent`'s own switches takes the next argument with it —
+/// cobra does not know the eventual leaf's flags yet, so it assumes a
+/// value; a longer cluster (`-dH…`) or an `=` form stands alone. `--help`
+/// is always a known switch (gh registers it once, persistently, on every
+/// command); `-h` never is, at any level — gh gives it no shorthand
+/// anywhere — so it is always read as an unknown flag here, consuming
+/// whatever follows it exactly like any other one this scan does not
+/// recognise.
 fn find_verb<'a>(rest: &'a [String], parent: &[Spec]) -> Option<(&'a str, usize)> {
     let mut index = 0;
     while let Some(argument) = rest.get(index) {
@@ -334,11 +376,10 @@ fn find_verb<'a>(rest: &'a [String], parent: &[Spec]) -> Option<(&'a str, usize)
             && !shorts.is_empty()
         {
             let two = shorts.chars().count() == 1;
-            let parent_switch = shorts == "h"
-                || parent.iter().any(|spec| {
-                    spec.short.is_some_and(|short| shorts == short.to_string())
-                        && spec.kind == Kind::Switch
-                });
+            let parent_switch = parent.iter().any(|spec| {
+                spec.short.is_some_and(|short| shorts == short.to_string())
+                    && spec.kind == Kind::Switch
+            });
             index += if two && !parent_switch { 2 } else { 1 };
             continue;
         }
@@ -471,19 +512,23 @@ mod tests {
             (vec!["pr", "--head=feat/x", "create"], "create"),
             (vec!["pr", "--title", "t", "create"], "create"),
             (vec!["pr", "--help", "create"], "create"),
-            (vec!["pr", "-h", "view"], "view"),
             (vec!["pr", "-dHfeat/x", "create"], "create"),
         ] {
             let parsed = GhInvocation::parse(&args(&argv));
             assert_eq!(parsed.verb(), Some(verb), "{argv:?}");
         }
         // cobra treats an unlisted switch before the verb as valued and eats
-        // the verb; gh then errors. `-R` with no value likewise names no verb.
+        // the verb; gh then errors. `-R` with no value likewise names no
+        // verb. `-h` is never a known switch anywhere in gh (no shorthand is
+        // ever registered for `--help`), so it always eats the next
+        // argument too — `pr -h view` finds no verb, and gh shows `pr`'s own
+        // help rather than `view`'s.
         for argv in [
             vec!["pr", "--draft", "create"],
             vec!["pr", "-R", "create"],
             vec!["pr", "-R", "o/r"],
             vec!["pr", "--", "create"],
+            vec!["pr", "-h", "view"],
         ] {
             assert_eq!(GhInvocation::parse(&args(&argv)).verb(), None, "{argv:?}");
         }
@@ -494,6 +539,50 @@ mod tests {
             Some("issue")
         );
         assert_eq!(GhInvocation::parse(&args(&["--version"])).command, None);
+        assert_eq!(GhInvocation::parse(&args(&["-h"])).command, None);
+    }
+
+    #[test]
+    fn a_flag_before_the_command_word_is_read_by_the_leaf_grammar_too() {
+        // cobra's root `Find` does not stop scanning at the command word;
+        // a flag before it is handed to the eventual leaf grammar exactly
+        // like one after (round-6 code F1 / deep parser audit).
+        for argv in [
+            vec!["-R", "o/r", "pr", "create", "-H", "feat/x"],
+            vec!["--repo", "o/r", "pr", "create"],
+            vec!["-H", "feat/x", "pr", "create", "-R", "o/r"],
+        ] {
+            let parsed = GhInvocation::parse(&args(&argv));
+            assert_eq!(parsed.command.as_deref(), Some("pr"), "{argv:?}");
+            assert_eq!(parsed.verb(), Some("create"), "{argv:?}");
+            assert_eq!(parsed.last("repo"), Some("o/r"), "{argv:?}");
+        }
+        let stated = GhInvocation::parse(&args(&["-H", "feat/x", "pr", "create", "-R", "o/r"]));
+        assert_eq!(stated.values("head").collect::<Vec<_>>(), ["feat/x"]);
+
+        let posted = GhInvocation::parse(&args(&[
+            "-X",
+            "POST",
+            "api",
+            "repos/o/r/pulls",
+            "-f",
+            "head=x",
+        ]));
+        assert_eq!(posted.command.as_deref(), Some("api"));
+        assert_eq!(posted.last("method"), Some("POST"));
+        assert_eq!(posted.fields("head").collect::<Vec<_>>(), ["x"]);
+
+        let fielded = GhInvocation::parse(&args(&["-f", "head=x", "api", "repos/o/r/pulls"]));
+        assert_eq!(fielded.command.as_deref(), Some("api"));
+        assert_eq!(fielded.fields("head").collect::<Vec<_>>(), ["x"]);
+
+        // The insertion index a caller uses to place a bookmark after the
+        // verb accounts for the flags that sat before the command word too.
+        let (verb, index) = GhInvocation::parse(&args(&["-R", "o/r", "pr", "create"]))
+            .verb
+            .expect("a verb");
+        assert_eq!(verb, "create");
+        assert_eq!(index, 3);
     }
 
     #[test]

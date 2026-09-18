@@ -289,14 +289,18 @@ continues as prose is an ordinary note), `release include` and `release advance`
 member with no verdict note, and any member whose newest verdict is `CONSUMER`, and `knives
 gh` refuses an upstream `pr create`, the REST pulls creation (`api … repos/<owner>/<repo>/pulls`,
 method POST) and, inside a fork checkout, a GraphQL `createPullRequest`, for a branch whose
-verdict is not `UPSTREAM`. The command line is read once, as gh reads it — cobra's verb lookup and
-pflag's flag grammar over gh 2.98.0's own flag tables: flags anywhere after the command, string
-flags last-wins, clusters expanded, aliases normalised, `--` ending flags — so the head and the
-repository the gate checks are the ones gh receives; a flag gh does not define, an empty or a
-second head, and a creation by numeric repository id (`repositories/<id>/pulls`) are refused
-rather than guessed. A document read from a file, a gh alias, and a gh extension are not inspected:
-the gate reads gh's own verbs. A missing registry gates nothing and says so once on stderr; an
-unreadable one is an error. Branches that predate the gate are
+verdict is not `UPSTREAM`. The command line is read once, as gh reads it — cobra's command and
+verb lookup and pflag's flag grammar over gh 2.98.0's own flag tables: flags anywhere in the
+line, before or after the command word, string flags last-wins, clusters expanded, aliases
+normalised, `--` ending flags — so the head and the repository the gate checks are the ones gh
+receives. A `-R`/`GH_REPO` repo spec is read the way go-gh reads it — a URL (the scp shorthand,
+`www.`, and a query or fragment included) or a `[HOST/]OWNER/REPO` shorthand; a flag gh does not
+define, an empty or a second head, a creation by numeric repository id
+(`repositories/<id>/pulls`), a percent-encoded owner, repository, or `graphql` endpoint, and a
+repo spec that fits neither of go-gh's own forms are refused rather than guessed. A document read
+from a file, a gh alias, and a gh extension are not inspected: the gate reads gh's own verbs. A
+missing registry gates nothing and says so once on stderr; an unreadable one is an error. Branches
+that predate the gate are
 grandfathered as members on either the ledger's evidence (a branch any recorded cut or edit
 names as a parent) or, where the ledger has none, the repository's (a branch the release in
 hand carries now — at a parent, or grown past a parent no record names and no bookmark

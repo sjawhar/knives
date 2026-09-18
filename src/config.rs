@@ -365,15 +365,19 @@ impl Registry {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
-    #[error("reading {path}: {source}")]
+    // The cause is part of the message and not a chained source — a field
+    // named `source` (or `#[source]`) would be one implicitly, and
+    // anyone printing the full error chain (as `anyhow` does) would then
+    // show it a second time. See `PlacementError::Note` for the same rule.
+    #[error("reading {path}: {cause}")]
     Read {
         path: PathBuf,
-        source: std::io::Error,
+        cause: std::io::Error,
     },
-    #[error("{path} is not a valid registry: {source}")]
+    #[error("{path} is not a valid registry: {cause}")]
     Parse {
         path: PathBuf,
-        source: Box<toml::de::Error>,
+        cause: Box<toml::de::Error>,
     },
     #[error("{path} is not a valid registry: {detail}")]
     Invalid { path: PathBuf, detail: String },
@@ -444,9 +448,9 @@ pub fn load(path: &Path) -> Result<Registry, ConfigError> {
     if !path.exists() {
         return Ok(Registry::default());
     }
-    let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
+    let text = std::fs::read_to_string(path).map_err(|cause| ConfigError::Read {
         path: path.to_owned(),
-        source,
+        cause,
     })?;
     let mut registry: Registry = match toml::from_str(&text) {
         Ok(registry) => registry,
@@ -461,7 +465,7 @@ pub fn load(path: &Path) -> Result<Registry, ConfigError> {
             if rejections.is_empty() {
                 return Err(ConfigError::Parse {
                     path: path.to_owned(),
-                    source: Box::new(source),
+                    cause: Box::new(source),
                 });
             }
             return Err(ConfigError::Invalid {
@@ -642,9 +646,9 @@ fn checked_forbidden(name: &str, terms: &[String], path: &Path) -> Result<(), Co
 /// The registry as a plain TOML table, for the checks that name a deleted field
 /// or table where serde only says "unknown field".
 fn raw_table(text: &str, path: &Path) -> Result<toml::Table, ConfigError> {
-    toml::from_str(text).map_err(|source| ConfigError::Parse {
+    toml::from_str(text).map_err(|cause| ConfigError::Parse {
         path: path.to_owned(),
-        source: Box::new(source),
+        cause: Box::new(cause),
     })
 }
 
@@ -966,6 +970,24 @@ release = "https://example.invalid/releases.git"
         // Then: it fails at parse time, naming the field, not later at query time
         let message = result.unwrap_err().to_string();
         assert!(message.contains("upstream"), "message was: {message}");
+    }
+
+    #[test]
+    fn the_parse_error_cause_does_not_render_twice_through_anyhow() {
+        // The cause lives in the message, not as a chained `source` field
+        // (`PlacementError::Note` established the same rule) — a field
+        // literally named `source` is wired as one implicitly, and anyone
+        // printing the full chain, as `anyhow` does, would then show it
+        // twice.
+        let dir = tempfile::tempdir().unwrap();
+        let text = "[repos.broken\nupstream = \"u\"\norigin = \"o\"\n";
+        let error = load(&write(dir.path(), text)).unwrap_err();
+        let rendered = format!("{:#}", anyhow::Error::from(error));
+        assert_eq!(
+            rendered.matches("TOML parse error").count(),
+            1,
+            "{rendered}"
+        );
     }
 
     #[test]

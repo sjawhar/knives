@@ -6,10 +6,16 @@
 //! Every question asked of the arguments — the repository a `pr create`
 //! targets, the head it states, the endpoint a `gh api` call addresses — is a
 //! lookup on the one [`GhInvocation`] built at the top of [`run`], read the way
-//! cobra and pflag read gh's command line (see `gh_args`): flags anywhere after
-//! the command, string flags last-wins, shorthand clusters expanded, gh's own
-//! verb aliases normalised, a flag the tables do not define kept by name so
-//! the gate refuses rather than guesses. Nothing here scans argv twice.
+//! cobra and pflag read gh's command line (see `gh_args`): flags anywhere in
+//! the line, before or after the command word, string flags last-wins,
+//! shorthand clusters expanded, gh's own verb aliases normalised, a flag the
+//! tables do not define kept by name so the gate refuses rather than
+//! guesses. A `-R`/`GH_REPO` repo spec and a `gh api` endpoint are read the
+//! way go-gh and GitHub's own router read them — a URL (including the scp
+//! shorthand, `www.`, and a query or fragment go-gh drops) or a
+//! `[HOST/]OWNER/REPO` shorthand, and a percent-escaped owner, repository or
+//! `graphql` endpoint is refused rather than compared unread. Nothing here
+//! scans argv twice.
 // allow: SIZE_OK: 2362 lines - single passthrough pipeline; splitting would separate resolution steps that read as one procedure.
 use std::collections::BTreeMap;
 use std::io::Read as _;
@@ -349,7 +355,13 @@ pub(crate) fn normalize_url(url: &str) -> Option<String> {
     if url.is_empty() {
         return None;
     }
-    let mut url = url.to_owned();
+    // A query string or `#fragment` is never part of a repository's
+    // identity; Go's URL client drops both before routing, so cut them here
+    // before anything below treats what follows as part of the path.
+    let mut url = url.split(['?', '#']).next().unwrap_or(url).to_owned();
+    if url.is_empty() {
+        return None;
+    }
     // SSH scp-form git@host:owner/repo -> https://host/owner/repo
     if let Some(rest) = url.strip_prefix("git@")
         && let Some((host, path)) = rest.split_once(':')
@@ -376,20 +388,55 @@ pub(crate) fn normalize_url(url: &str) -> Option<String> {
     Some(url)
 }
 
-/// An https URL from a gh repo spec: URL, host/owner/repo, or owner/repo (lines 59-73).
+/// Whether go-gh treats `spec` as a URL rather than an `[HOST/]OWNER/REPO`
+/// shorthand (`internal/git.IsURL`): the scp-like `git@` prefix, or one of
+/// gh's six recognised schemes, checked as a literal, case-sensitive
+/// prefix — an upper-cased scheme like `HTTPS://…` is not a URL to gh
+/// either, and falls through to the plain-parts rule below, which refuses
+/// it (gh does too: it splits on every `/`, and the `//` after an
+/// unrecognised `SCHEME:` becomes an empty segment).
+fn is_url_spec(spec: &str) -> bool {
+    spec.starts_with("git@")
+        || ["ssh:", "git+ssh:", "git:", "http:", "git+https:", "https:"]
+            .iter()
+            .any(|prefix| spec.starts_with(prefix))
+}
+
+/// An https URL from a gh repo spec, read the way go-gh's `ParseWithHost`
+/// reads `-R` and `GH_REPO` (lines 59-73): a URL (`is_url_spec`) whose host
+/// is non-empty and whose path — its query, fragment, and surrounding
+/// slashes already gone via [`normalize_url`] — is exactly two segments
+/// (`.git` trimmed from the second by `normalize_url` when it was already
+/// there, kept otherwise since it is still one segment); otherwise
+/// `[HOST/]OWNER/REPO` split on `/`, every part non-empty, no more than
+/// three of them, the two-part form defaulting onto [`DEFAULT_HOST`]. A
+/// spec that fits neither is unreadable and is refused, not guessed at —
+/// gh itself errors on the same shapes (`expected the "[HOST/]OWNER/REPO"
+/// format`).
 pub(crate) fn url_from_spec(spec: &str) -> Option<String> {
     if spec.is_empty() {
         return None;
     }
-    if spec.contains("://") {
-        return normalize_url(spec);
+    if is_url_spec(spec) {
+        let url = normalize_url(spec)?;
+        let (authority, path) = crate::remote_url::remote_authority_and_path(&url)?;
+        if authority.is_empty() {
+            return None;
+        }
+        let mut segments = path.trim_matches('/').splitn(3, '/');
+        let (owner, repo) = (segments.next()?, segments.next()?);
+        return (!owner.is_empty() && !repo.is_empty() && segments.next().is_none()).then_some(url);
     }
-    let slashes = spec.matches('/').count();
-    if slashes >= 2 {
-        normalize_url(&format!("https://{spec}"))
-    } else {
-        normalize_url(&format!("https://{DEFAULT_HOST}/{spec}"))
-    }
+    let mut parts = spec.splitn(4, '/');
+    let (first, second) = (parts.next()?, parts.next()?);
+    let (host, owner, repo) = match (parts.next(), parts.next()) {
+        (Some(third), None) => (first, second, third),
+        (None, None) => (DEFAULT_HOST, first, second),
+        _ => return None,
+    };
+    (!host.is_empty() && !owner.is_empty() && !repo.is_empty())
+        .then(|| normalize_url(&format!("https://{host}/{owner}/{repo}")))
+        .flatten()
 }
 
 /// The `path` part a credential request wants: everything after the host (line 192).
@@ -533,7 +580,10 @@ pub(crate) fn owner_from_api_args(invocation: &GhInvocation) -> Option<String> {
             if let Some(rest) = endpoint.strip_prefix(prefix) {
                 let owner = rest.split('/').next().unwrap_or("");
                 if !owner.is_empty() && !is_api_placeholder(owner) {
-                    return Some(owner.to_owned());
+                    // GitHub decodes the owner it routes on before ever
+                    // reading it; the credential request should name the
+                    // real owner too, not the escape gh sent verbatim.
+                    return Some(percent_decode(owner));
                 }
                 return None;
             }
@@ -717,7 +767,26 @@ fn resolve_from_inputs(inputs: TargetInputs<'_>) -> Option<String> {
     preferred_remote_url(inputs.registered_entry, inputs.remotes)
 }
 
-/// The first `gh repo set-default` marker, if git reports one (shim lines 151-164).
+/// gh's own remote-preference score (`context.remoteNameSortScore`): named
+/// remotes rank above every other name, which all tie at zero and keep
+/// git's own listing order — a stable pick of the first among those, below.
+fn resolved_remote_rank(name: &str) -> u8 {
+    match name.to_ascii_lowercase().as_str() {
+        "upstream" => 3,
+        "github" => 2,
+        "origin" => 1,
+        _ => 0,
+    }
+}
+
+/// The highest-ranked `gh repo set-default` marker, if git reports one (shim
+/// lines 151-164). gh's own `Remotes.Sort` ranks named remotes
+/// (`upstream` > `github` > `origin` > everything else, `resolved_remote_rank`)
+/// and then takes the first with any resolved value at all
+/// (`Remotes.ResolvedRemote`); two markers on differently-named remotes are
+/// not a disagreement to gh, only a config carrying more than one — this
+/// reads all of them and ranks them the same way, rather than picking
+/// whichever git config happens to list first.
 fn gh_resolved_remote(cwd: &Path) -> Option<OwnedResolvedRemote> {
     // `bind::git` forbids discovery above the directory it is given, so it
     // must be handed the repository root, not a subdirectory of it.
@@ -729,15 +798,30 @@ fn gh_resolved_remote(cwd: &Path) -> Option<OwnedResolvedRemote> {
     if !output.status.success() {
         return None;
     }
-    let line = std::str::from_utf8(&output.stdout).ok()?.lines().next()?;
-    // Unlike the shim, a valueless marker remains terminal with an empty target, so it mints no token instead of passing a garbage URL onward.
-    let (key_with_value, value) = line.rsplit_once(char::is_whitespace).unwrap_or((line, ""));
-    let (key, _) = key_with_value.rsplit_once(".gh-resolved")?;
-    let name = key.strip_prefix("remote.")?;
-    Some(OwnedResolvedRemote {
-        name: name.to_owned(),
-        value: value.to_owned(),
-    })
+    let text = std::str::from_utf8(&output.stdout).ok()?;
+    let mut best: Option<(u8, OwnedResolvedRemote)> = None;
+    for line in text.lines() {
+        // Unlike the shim, a valueless marker remains terminal with an empty
+        // target, so it mints no token instead of passing a garbage URL onward.
+        let (key_with_value, value) = line.rsplit_once(char::is_whitespace).unwrap_or((line, ""));
+        let Some((key, _)) = key_with_value.rsplit_once(".gh-resolved") else {
+            continue;
+        };
+        let Some(name) = key.strip_prefix("remote.") else {
+            continue;
+        };
+        let rank = resolved_remote_rank(name);
+        if best.as_ref().is_none_or(|(best_rank, _)| rank > *best_rank) {
+            best = Some((
+                rank,
+                OwnedResolvedRemote {
+                    name: name.to_owned(),
+                    value: value.to_owned(),
+                },
+            ));
+        }
+    }
+    best.map(|(_, resolved)| resolved)
 }
 
 /// Prefers configured fork roles before the shim's ordered remote fallback (shim lines 165-178).
@@ -784,6 +868,11 @@ enum PullOpening {
     /// `gh api repositories/<numeric id>/pulls` with a body: the same REST
     /// creation addressed by GitHub's repository id, which names no owner.
     RestById { id: String },
+    /// `gh api repos/{owner}/{repo}/pulls` with a body whose owner or
+    /// repository segment carries a `%`-escape: GitHub decodes it before
+    /// routing, so the creation's real target cannot be read from the
+    /// argument as written.
+    PercentEncoded,
 }
 
 /// Whether this invocation opens a pull request, and how (`None`: it does not).
@@ -797,6 +886,12 @@ enum PullOpening {
 /// file (`--input <file>`, `-f query=@file`) is not opened: only the arguments
 /// are read.
 fn pull_opening(invocation: &GhInvocation) -> Option<PullOpening> {
+    // `--help`/`-h` anywhere makes gh print help and run nothing at all —
+    // `pr create` and `gh api` alike — so nothing about the rest of the
+    // invocation can open a pull request past it.
+    if invocation.has("help") {
+        return None;
+    }
     match invocation.command.as_deref() {
         Some("pr") => {
             return (invocation.verb() == Some("create")).then(|| PullOpening::Create {
@@ -810,7 +905,17 @@ fn pull_opening(invocation: &GhInvocation) -> Option<PullOpening> {
         _ => return None,
     }
     let endpoint = api_endpoint(invocation)?;
-    if endpoint == "graphql" && names_mutation(&graphql_text(invocation), "createPullRequest") {
+    // GitHub's `graphql` handler answers to more spellings than gh's own
+    // literal, case-sensitive check: a case variant (`/GRAPHQL`, `/Graphql`)
+    // and a percent-escape anywhere in it (`/gra%70hql`) both route there
+    // server-side (verified read-only against github.com), even though gh's
+    // own client never treats either as its GraphQL mode — it just posts
+    // the `-f`/`-F` fields as a REST body, which for a `query` field is
+    // exactly the GraphQL request body GitHub's server still executes.
+    // Either shape is read as `graphql` here, the same way the literal one is.
+    let is_graphql_endpoint = endpoint.eq_ignore_ascii_case("graphql")
+        || percent_decode(endpoint).eq_ignore_ascii_case("graphql");
+    if is_graphql_endpoint && names_mutation(&graphql_text(invocation), "createPullRequest") {
         return Some(PullOpening::Graphql {
             head: invocation
                 .fields("headRefName")
@@ -842,7 +947,17 @@ fn pull_opening(invocation: &GhInvocation) -> Option<PullOpening> {
     }
     let mut segments = endpoint.strip_prefix("repos/")?.split('/');
     let (owner, repo) = (segments.next()?, segments.next()?);
-    (segments.next() == Some("pulls") && segments.next().is_none()).then(|| PullOpening::Rest {
+    if !(segments.next() == Some("pulls") && segments.next().is_none()) {
+        return None;
+    }
+    // GitHub decodes the owner and repository it routes on before ever
+    // matching the registry (verified read-only against github.com); a raw
+    // `%` in either is a creation knives cannot check without guessing at
+    // the decoded byte, so it is refused rather than compared unread.
+    if owner.contains('%') || repo.contains('%') {
+        return Some(PullOpening::PercentEncoded);
+    }
+    Some(PullOpening::Rest {
         owner: owner.to_owned(),
         repo: repo.to_owned(),
         head: invocation
@@ -850,6 +965,30 @@ fn pull_opening(invocation: &GhInvocation) -> Option<PullOpening> {
             .find(|value| !value.is_empty())
             .map(|head| strip_head_owner(head).to_owned()),
     })
+}
+
+/// A percent-decoded copy of `text`; an incomplete or non-hex `%` escape is
+/// left exactly as written rather than treated as a decode error, since this
+/// feeds only an endpoint- or owner-shaped comparison, never a path knives
+/// itself sends anywhere.
+fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while let Some(&byte) = bytes.get(index) {
+        if byte == b'%'
+            && let Some(hex) = bytes.get(index + 1..index + 3)
+            && let Ok(hex) = std::str::from_utf8(hex)
+            && let Ok(decoded_byte) = u8::from_str_radix(hex, 16)
+        {
+            decoded.push(decoded_byte);
+            index += 3;
+        } else {
+            decoded.push(byte);
+            index += 1;
+        }
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
 }
 
 /// Whether a path segment is one gh fills in from the current repository:
@@ -1005,6 +1144,7 @@ fn upstream_pull_refusal(invocation: &GhInvocation, cwd: &Path) -> anyhow::Resul
                  against the registry: state the repository as repos/<owner>/<repo>"
             )));
         }
+        PullOpening::PercentEncoded => return Ok(Some(percent_encoded_refusal())),
         PullOpening::Graphql { head } => {
             // No owner to read: inside a registered fork the mutation is
             // refused rather than guessed at, since `gh pr create` says where
@@ -1022,6 +1162,18 @@ fn upstream_pull_refusal(invocation: &GhInvocation, cwd: &Path) -> anyhow::Resul
     };
     let entries = crate::ledger::Ledger::for_repo(&repo).entries()?;
     Ok(crate::placement::upstream_pull_refusal(&entries, &head)?)
+}
+
+/// Why a percent-encoded REST creation cannot be checked against the
+/// registry (`PullOpening::PercentEncoded`): GitHub decodes the owner and
+/// repository before routing, so knives cannot tell what this really names
+/// without guessing at the decoded byte; the same call is one unencoded
+/// `repos/` spelling away, so nothing is lost by refusing it outright.
+fn percent_encoded_refusal() -> String {
+    "a pull request creation whose repository is percent-encoded \
+     (repos/<owner>/<repo>/pulls) cannot be checked against the registry: state the \
+     repository as repos/<owner>/<repo>, unencoded"
+        .to_owned()
 }
 
 /// The refusal for a dash-argument gh's table for `command` does not define,
@@ -1210,16 +1362,88 @@ mod tests {
             url_from_spec("forge.example/acme/work").unwrap(),
             "https://forge.example/acme/work.git"
         );
-        assert_eq!(
-            url_from_spec("forge.example/acme/work/extra").unwrap(),
-            "https://forge.example/acme/work/extra.git"
-        );
+        // A fourth `/`-separated part does not glue onto the repo name: gh's
+        // own `[HOST/]OWNER/REPO` rule accepts exactly two or three parts,
+        // and refuses this the same way it refuses `a/b/c/d`.
+        assert_eq!(url_from_spec("forge.example/acme/work/extra"), None);
         // A full URL passes through normalization (line 64).
         assert_eq!(
             url_from_spec(&format!("https://{host}/acme/work.git")).unwrap(),
             format!("https://{host}/acme/work.git")
         );
         assert_eq!(url_from_spec(""), None);
+    }
+
+    #[test]
+    fn a_repo_spec_url_is_read_the_way_go_gh_reads_it() {
+        let host = concat!("github", ".com");
+        let want = format!("https://{host}/routed-a/upstream.git");
+        // The scp-like shorthand `git.IsURL` recognises without a scheme,
+        // with and without an explicit `.git`.
+        assert_eq!(
+            url_from_spec(&format!("git@{host}:routed-a/upstream")).unwrap(),
+            want
+        );
+        assert_eq!(
+            url_from_spec(&format!("git@{host}:routed-a/upstream.git")).unwrap(),
+            want
+        );
+        // A `www.` host, bare or wrapped in a scheme, still names a
+        // readable target (folded to the same repository at comparison
+        // time by `remote_url::host_and_path`, not here).
+        assert_eq!(
+            url_from_spec(&format!("www.{host}/routed-a/upstream")).unwrap(),
+            format!("https://www.{host}/routed-a/upstream.git")
+        );
+        assert_eq!(
+            url_from_spec(&format!("https://www.{host}/routed-a/upstream")).unwrap(),
+            format!("https://www.{host}/routed-a/upstream.git")
+        );
+        assert_eq!(
+            url_from_spec("WWW.GitHub.com/routed-a/upstream").unwrap(),
+            "https://WWW.GitHub.com/routed-a/upstream.git"
+        );
+        // A query string or `#fragment` on a URL-form spec never reaches
+        // the path go-gh (or knives) reads.
+        assert_eq!(
+            url_from_spec(&format!("https://{host}/routed-a/upstream?x=1")).unwrap(),
+            want
+        );
+        assert_eq!(
+            url_from_spec(&format!("https://{host}/routed-a/upstream#frag")).unwrap(),
+            want
+        );
+        assert_eq!(
+            url_from_spec(&format!("https://{host}/routed-a/upstream.git?x=1")).unwrap(),
+            want
+        );
+        // Refused, not guessed at: an upper-cased scheme is not a URL to gh
+        // either (`git.IsURL` is a literal-prefix check), and it does not
+        // fit the plain-parts rule either — the `//` after `HTTPS:` is an
+        // empty segment, one more than the rule allows.
+        assert_eq!(
+            url_from_spec(&format!("HTTPS://{host}/routed-a/upstream")),
+            None
+        );
+        // A URL whose path is not exactly two segments.
+        assert_eq!(
+            url_from_spec(&format!("https://{host}/routed-a/upstream/extra")),
+            None
+        );
+        assert_eq!(url_from_spec(&format!("https://{host}/routed-a")), None);
+        // `[HOST/]OWNER/REPO`: more than three parts, or any empty part, is
+        // refused; gh errors on the same shapes.
+        assert_eq!(url_from_spec("a/b/c/d"), None);
+        assert_eq!(url_from_spec("owner/repo/"), None);
+        assert_eq!(url_from_spec("/owner/repo"), None);
+        assert_eq!(url_from_spec("owner//repo"), None);
+        // Three non-empty parts with no scheme is `host/owner/repo` and
+        // stays valid, even with a one-letter "host" — exactly as gh reads
+        // it.
+        assert_eq!(
+            url_from_spec("o/routed-a/upstream").unwrap(),
+            "https://o/routed-a/upstream.git"
+        );
     }
 
     #[test]
@@ -2022,6 +2246,131 @@ mod tests {
         ] {
             assert_eq!(owner_from_api_args(&parsed(&args(&argv))), None, "{argv:?}");
         }
+    }
+
+    #[test]
+    fn a_help_flag_anywhere_opens_nothing() {
+        // gh prints help and never reaches the API when `--help`/`-h` is
+        // anywhere in the line, `pr create` and `gh api` alike; nothing past
+        // it can open a pull request.
+        let args = |arguments: &[&str]| {
+            arguments
+                .iter()
+                .map(|argument| (*argument).to_owned())
+                .collect::<Vec<_>>()
+        };
+        for argv in [
+            vec!["pr", "create", "-R", "o/r", "-H", "feat/x", "--help"],
+            vec!["pr", "create", "-R", "o/r", "-H", "feat/x", "-h"],
+            vec!["pr", "create", "--help", "-R", "o/r"],
+            vec![
+                "api",
+                "--help",
+                "-X",
+                "POST",
+                "repos/o/r/pulls",
+                "-f",
+                "head=feat/x",
+            ],
+            vec![
+                "api",
+                "-X",
+                "POST",
+                "repos/o/r/pulls",
+                "-f",
+                "head=feat/x",
+                "-h",
+            ],
+        ] {
+            assert_eq!(pull_opening(&parsed(&args(&argv))), None, "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn a_percent_encoded_owner_or_repo_is_refused_not_guessed() {
+        // GitHub decodes the dynamic owner and repository segments before
+        // routing; a `%` in either is a creation knives cannot check
+        // without guessing at the decoded byte.
+        let args = |arguments: &[&str]| {
+            arguments
+                .iter()
+                .map(|argument| (*argument).to_owned())
+                .collect::<Vec<_>>()
+        };
+        for argv in [
+            vec![
+                "api",
+                "-X",
+                "POST",
+                "repos/%72outed-a/upstream/pulls",
+                "-f",
+                "head=feat/x",
+            ],
+            vec![
+                "api",
+                "-X",
+                "POST",
+                "repos/routed-a/%75pstream/pulls",
+                "-f",
+                "head=feat/x",
+            ],
+        ] {
+            assert_eq!(
+                pull_opening(&parsed(&args(&argv))),
+                Some(PullOpening::PercentEncoded),
+                "{argv:?}"
+            );
+        }
+        // A GET on the same percent-encoded path is not a creation, and the
+        // owner it routes a token for is decoded.
+        let get = args(&["api", "-XGET", "repos/%72outed-a/upstream/pulls"]);
+        assert_eq!(pull_opening(&parsed(&get)), None);
+        assert_eq!(
+            owner_from_api_args(&parsed(&get)).as_deref(),
+            Some("routed-a")
+        );
+    }
+
+    #[test]
+    fn graphql_answers_to_case_and_percent_variants_too() {
+        // GitHub's `graphql` handler answers to a case variant and a
+        // percent-escape too (verified read-only against github.com), even
+        // though gh's own client only ever spells it the one way.
+        let args = |arguments: &[&str]| {
+            arguments
+                .iter()
+                .map(|argument| (*argument).to_owned())
+                .collect::<Vec<_>>()
+        };
+        let mutation = "mutation { createPullRequest(input:{repositoryId:\"x\",headRefName:$h}) { pullRequest { id } } }";
+        for endpoint in ["GRAPHQL", "Graphql", "gra%70hql"] {
+            let opening = pull_opening(&parsed(&args(&[
+                "api",
+                endpoint,
+                "-f",
+                &format!("query={mutation}"),
+                "-f",
+                "headRefName=feat/x",
+            ])));
+            assert_eq!(
+                opening,
+                Some(PullOpening::Graphql {
+                    head: Some("feat/x".to_owned())
+                }),
+                "{endpoint}"
+            );
+        }
+        // A review mutation at the same percent-encoded endpoint is still
+        // maintenance on an existing pull request, not an opening.
+        assert_eq!(
+            pull_opening(&parsed(&args(&[
+                "api",
+                "gra%70hql",
+                "-f",
+                "query=mutation { createPullRequestReview(input:{pullRequestId:\"x\"}) { clientMutationId } }"
+            ]))),
+            None
+        );
     }
 
     #[test]

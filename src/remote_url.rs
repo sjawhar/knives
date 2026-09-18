@@ -23,8 +23,9 @@ pub fn same_remote(a: &str, b: &str) -> bool {
 }
 
 /// `(host, path)` of a remote URL as spelled: the authority without its user
-/// or port, and the path without surrounding `/` or a `.git` suffix. `None`
-/// for a non-URL: a filesystem path, or a `file://` URL, whose authority is
+/// or port and with a leading `www.` folded off, and the path without its
+/// query or fragment, surrounding `/`, or a `.git` suffix. `None` for a
+/// non-URL: a filesystem path, or a `file://` URL, whose authority is
 /// empty. scp form without a user, `host:path`, is a URL too when the part
 /// before the colon holds no `/`; a filesystem path with a colon in a later
 /// component stays a path.
@@ -47,6 +48,18 @@ fn host_and_path(remote: &str) -> Option<(&str, &str)> {
         }
         _ => host,
     };
+    // `www.` (any case) names the same host to a browser and to gh's own
+    // `ghrepo.normalizeHostname`; folding it here means a spec normalized
+    // upstream of comparison and a raw, hand-typed registry entry agree
+    // whichever one carries it.
+    let host = match host.get(..4) {
+        Some(prefix) if prefix.eq_ignore_ascii_case("www.") => &host[4..],
+        _ => host,
+    };
+    // A query string or `#fragment` is never part of a repository's
+    // identity; cut before trimming slashes or the `.git` suffix so
+    // `owner/repo?x=1` and `owner/repo#frag` compare as `owner/repo`.
+    let path = path.split(['?', '#']).next().unwrap_or(path);
     Some((host, without_git_suffix(path.trim_matches('/'))))
 }
 
@@ -200,6 +213,52 @@ mod tests {
             Some("Tool")
         );
         assert_eq!(repository_name("https://forge.invalid/someone/.git"), None);
+    }
+
+    #[test]
+    fn a_leading_www_does_not_make_another_host() {
+        assert!(same_remote(
+            "https://www.forge.example/org/tool",
+            "https://forge.example/org/tool"
+        ));
+        assert!(same_remote(
+            "https://WWW.Forge.Example/org/tool",
+            "https://forge.example/org/tool"
+        ));
+        assert!(same_remote(
+            "www.forge.example:org/tool",
+            "https://forge.example/org/tool"
+        ));
+        // `www` as the whole host, or as an interior label, names a
+        // different host and is not folded.
+        assert!(!same_remote(
+            "https://www/org/tool",
+            "https://forge.example/org/tool"
+        ));
+        assert!(!same_remote(
+            "https://www.example.forge.example/org/tool",
+            "https://forge.example/org/tool"
+        ));
+    }
+
+    #[test]
+    fn a_query_string_or_fragment_is_not_part_of_the_path() {
+        assert!(same_remote(
+            "https://forge.example/org/tool?tab=readme",
+            "https://forge.example/org/tool"
+        ));
+        assert!(same_remote(
+            "https://forge.example/org/tool#readme",
+            "https://forge.example/org/tool"
+        ));
+        assert!(same_remote(
+            "https://forge.example/org/tool.git?x=1",
+            "https://forge.example/org/tool"
+        ));
+        assert!(!same_remote(
+            "https://forge.example/org/tool?x=1",
+            "https://forge.example/org/tool-2"
+        ));
     }
 
     #[test]
