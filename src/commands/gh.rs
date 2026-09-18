@@ -30,16 +30,18 @@
 //! comparison rule folds `www.` off both sides and any subdomain of the
 //! registered host onto it (`remote_url::same_host`), a superset of gh's
 //! own fold. The checkout's remotes are git's effective URLs (`git remote
-//! -v`, `insteadOf` applied, a push URL when the fetch URL names no
-//! repository) with ssh aliases resolved as go-gh resolves them
-//! (`bind::remotes`); gh's configured hosts are read as YAML keys (ASCII
-//! space and tab the only whitespace) at the map's own indent, any
-//! column-0 `hosts` key in `config.yml` is the hosts region — read or
-//! refused, never a fall-through — and a shape knives cannot read is
-//! refused, never read as zero hosts. With no head stated the gate states `<fork-owner>:<branch in hand>`
+//! -v`, `insteadOf` applied) with ssh aliases resolved as go-gh resolves
+//! them, each read by the canonical remote grammar (`remote_url::classify`,
+//! `bind::all_remotes`): the fetch URL when readable, else the last
+//! readable push URL, else a local path; a remote with no readable URL
+//! leaves the target uncertifiable and is refused with the `-R` remedy.
+//! gh's `config.yml` and `hosts.yml` are read whole in the grammar gh
+//! writes them in (`gh_config`); the first line outside it in either file
+//! makes the default host unknown — refused naming the file and the line,
+//! never read past, never a fall-through to the other file. With no head stated the gate states `<fork-owner>:<branch in hand>`
 //! itself, so gh never resolves one knives did not read. A token is routed
 //! only for a canonical owner on a host that folds to the default host.
-// allow: SIZE_OK: 3573 lines - single passthrough pipeline; splitting would separate resolution steps that read as one procedure.
+// allow: SIZE_OK: 3391 lines - single passthrough pipeline; splitting would separate resolution steps that read as one procedure.
 use std::collections::BTreeMap;
 use std::io::Read as _;
 use std::os::unix::{
@@ -749,7 +751,7 @@ fn default_host() -> Result<String, String> {
     {
         return canonical_host("GH_HOST", &host);
     }
-    let (source, hosts) = configured_hosts()?;
+    let (source, hosts) = super::gh_config::configured_hosts()?;
     match hosts.as_slice() {
         [host] => canonical_host(&format!("the one host in gh's {source}"), host),
         _ => Ok(DEFAULT_HOST.to_owned()),
@@ -773,205 +775,6 @@ fn canonical_host(source: &str, host: &str) -> Result<String, String> {
                 gh_canon::SEGMENT_CHARS
             )
         })
-}
-
-/// gh's configuration directory, by go-gh's `ConfigDir` precedence
-/// (`pkg/config/config.go`): `GH_CONFIG_DIR`, `$XDG_CONFIG_HOME/gh`,
-/// `$HOME/.config/gh` (the Windows `AppData` step has no Unix reading).
-fn gh_config_dir() -> Option<PathBuf> {
-    if let Some(dir) = std::env::var_os("GH_CONFIG_DIR").filter(|dir| !dir.is_empty()) {
-        return Some(PathBuf::from(dir));
-    }
-    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").filter(|dir| !dir.is_empty()) {
-        return Some(PathBuf::from(xdg).join("gh"));
-    }
-    std::env::home_dir().map(|home| home.join(".config").join("gh"))
-}
-
-/// The hosts gh is configured for, in file order, with the file they came
-/// from: `config.yml`'s `hosts:` block when it has one, else `hosts.yml`'s
-/// top-level keys; none when neither file has any. Each is read as a YAML
-/// block map the way gh reads the shapes it writes and the hand-edited
-/// shapes it tolerates: a key is a `key:` line — surrounding whitespace, one
-/// layer of matching quotes and a trailing ` # comment` stripped — with
-/// nothing else after the colon (its value is the deeper-indented map
-/// below); the map's indent is its first content line's, at any level, and
-/// every key sits at that level. Any other shape — a flow map, a scalar
-/// after the colon, a list item, a line with no colon, a mixed indent (gh
-/// errors on that one too) — or a file that cannot be read, is a refusal
-/// rather than a guess at what gh would do with it; a block with content
-/// but no readable key is never zero hosts.
-fn configured_hosts() -> Result<(&'static str, Vec<String>), String> {
-    let Some(dir) = gh_config_dir() else {
-        return Ok(("hosts.yml", Vec::new()));
-    };
-    let general = read_gh_file(&dir.join("config.yml"))?;
-    if let Some(block) = hosts_block_of_config(&general) {
-        return hosts_in(&dir.join("config.yml"), &block).map(|hosts| ("config.yml", hosts));
-    }
-    let hosts = read_gh_file(&dir.join("hosts.yml"))?;
-    hosts_in(&dir.join("hosts.yml"), &hosts).map(|hosts| ("hosts.yml", hosts))
-}
-
-/// A gh configuration file's text, a leading UTF-8 byte-order mark dropped;
-/// empty when absent; the refusal when it cannot be read.
-fn read_gh_file(path: &Path) -> Result<String, String> {
-    match std::fs::read_to_string(path) {
-        Ok(text) => Ok(text.trim_start_matches('\u{feff}').to_owned()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
-        Err(error) => Err(format!(
-            "gh's {} cannot be read ({error}), so the default host cannot be told: state the host \
-             in the command (-R HOST/OWNER/REPO, --hostname) or set GH_HOST",
-            path.display()
-        )),
-    }
-}
-
-/// YAML's whitespace: ASCII space and tab, nothing else. Rust's `trim` would
-/// also strip a no-break space or a Unicode space, which YAML reads as
-/// content — a key gh does not read must not become one knives reads.
-const YAML_SPACE: [char; 2] = [' ', '\t'];
-
-/// A YAML line that carries no key: blank, a `#` comment, `---`, `{}`.
-fn is_yaml_noise(line: &str) -> bool {
-    let content = line.trim_matches(YAML_SPACE);
-    content.is_empty() || content.starts_with('#') || content == "---" || content == "{}"
-}
-
-/// A YAML block-map line read as `key: rest`: the key token — YAML
-/// whitespace and one layer of matching quotes stripped, whitespace before
-/// the colon tolerated — and whether anything but a comment follows the
-/// colon. `None` for a list item or a line with no colon. The key is
-/// returned as written otherwise; whether its characters are ones knives
-/// reads is [`host_key`]'s question.
-fn yaml_entry(line: &str) -> Option<(&str, bool)> {
-    let content = line.trim_matches(YAML_SPACE);
-    if content.starts_with('-') {
-        return None;
-    }
-    // The key ends at YAML's mapping indicator: the first `:` outside quotes
-    // that is followed by whitespace or ends the content — `ghe.example:8443:`
-    // is one key, its inner colon plain text.
-    let close = match content.chars().next() {
-        Some(quote @ ('"' | '\'')) => content[1..].find(quote).map(|at| at + 2),
-        _ => None,
-    };
-    let start = close.unwrap_or(0);
-    let colon = content[start..]
-        .match_indices(':')
-        .map(|(at, _)| start + at)
-        .find(|&at| {
-            content[at + 1..]
-                .chars()
-                .next()
-                .is_none_or(|next| YAML_SPACE.contains(&next))
-        })?;
-    let key = content[..colon].trim_end_matches(YAML_SPACE);
-    let key = match (key.chars().next(), key.chars().last()) {
-        (Some('"'), Some('"')) | (Some('\''), Some('\'')) if key.len() >= 2 => {
-            &key[1..key.len() - 1]
-        }
-        _ => key,
-    };
-    // What follows the colon: a value, or only YAML whitespace and a
-    // `# comment`.
-    let rest = content[colon + 1..].trim_start_matches(YAML_SPACE);
-    let has_value = !rest.is_empty() && !rest.starts_with('#');
-    (!key.is_empty()).then_some((key, has_value))
-}
-
-/// The key of a `key:` line that names a host or the `hosts` heading, as
-/// knives reads it: no value on the line, and every character one a host
-/// may carry (`[A-Za-z0-9._:-]`, the port colon included) — a key carrying
-/// any other character, a no-break space among them, is a key gh may read
-/// differently and is refused.
-fn host_key(line: &str) -> Result<Option<&str>, ()> {
-    let Some((key, has_value)) = yaml_entry(line) else {
-        return Ok(None);
-    };
-    if has_value
-        || !key
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':'))
-    {
-        return Err(());
-    }
-    Ok(Some(key))
-}
-
-/// Whether a line begins at column 0 — no YAML whitespace before its
-/// content. A no-break space is content, so a line beginning with one is a
-/// column-0 line whose key carries it.
-fn at_column_zero(line: &str) -> bool {
-    !line.starts_with(YAML_SPACE)
-}
-
-/// The lines under a column-0 `hosts` key in `config.yml` — every line after
-/// it up to the next column-0 content line — or `None` when the file has
-/// no such key. Any column-0 line whose key token is `hosts` (`"hosts" :`,
-/// `hosts<TAB>:`, `hosts:  # c`, with or without a value) IS the hosts
-/// region, as it is to gh; one with a value on the line (a flow map, `~`)
-/// is returned as that one line for the block reader to refuse — a hosts
-/// heading never falls through to `hosts.yml`.
-fn hosts_block_of_config(text: &str) -> Option<String> {
-    let mut lines = text.lines();
-    let heading = lines.find(|line| {
-        at_column_zero(line) && yaml_entry(line).is_some_and(|(key, _)| key == "hosts")
-    })?;
-    if yaml_entry(heading).is_some_and(|(_, has_value)| has_value) {
-        return Some(heading.to_owned());
-    }
-    Some(
-        lines
-            .take_while(|line| is_yaml_noise(line) || !at_column_zero(line))
-            .collect::<Vec<_>>()
-            .join("\n"),
-    )
-}
-
-/// The host keys in `text`, a YAML block map at whatever indent its first
-/// content line sits at: the `key:` lines at exactly that indent; lines
-/// indented deeper (a host's own map) and noise are skipped; anything else
-/// — a key-less line, a key carrying a value or a character outside the
-/// host charset, a shallower or otherwise inconsistent indent — is refused
-/// naming `path` and the line. Indent counts YAML whitespace only.
-fn hosts_in(path: &Path, text: &str) -> Result<Vec<String>, String> {
-    let mut hosts = Vec::new();
-    let mut indent: Option<usize> = None;
-    // The indent a host's own map sits at, once seen: a line between the
-    // keys' level and it is a mixed indent (gh errors on it too).
-    let mut child: Option<usize> = None;
-    for line in text.lines() {
-        if is_yaml_noise(line) {
-            continue;
-        }
-        let depth = line.len() - line.trim_start_matches(YAML_SPACE).len();
-        let level = *indent.get_or_insert(depth);
-        if depth > level {
-            if hosts.is_empty() || child.is_some_and(|child| depth < child) {
-                return Err(hosts_refusal(path, line.trim_end_matches(YAML_SPACE)));
-            }
-            child.get_or_insert(depth);
-            continue;
-        }
-        if depth < level {
-            return Err(hosts_refusal(path, line.trim_end_matches(YAML_SPACE)));
-        }
-        let Ok(Some(key)) = host_key(line) else {
-            return Err(hosts_refusal(path, line.trim_end_matches(YAML_SPACE)));
-        };
-        hosts.push(key.to_owned());
-        child = None;
-    }
-    Ok(hosts)
-}
-
-fn hosts_refusal(path: &Path, line: &str) -> String {
-    format!(
-        "gh's {} is not a hosts map knives can read (line {line:?}), so the default host cannot be \
-         told: state the host in the command (-R HOST/OWNER/REPO, --hostname) or set GH_HOST",
-        path.display()
-    )
 }
 
 /// `path` less its query string and any `#fragment`.
@@ -1072,6 +875,22 @@ fn target(invocation: &GhInvocation, cwd: &Path) -> Target {
     let registry = needs_git_inputs
         .then(|| crate::config::load(&crate::config::default_config_path()).ok())
         .flatten();
+    // The target comes from the checkout's own configuration: a remote none
+    // of whose URLs knives reads is one gh may resolve to a repository knives
+    // cannot compare, so nothing about the target can be certified while
+    // such a remote exists — refused, naming the remote and the remedy. With
+    // a stated `-R`/`GH_REPO` or an endpoint owner the remotes are not
+    // consulted and an unreadable one is irrelevant.
+    if needs_git_inputs
+        && let Some(root) = crate::bind::checkout_root(cwd)
+        && let Ok(all) = crate::bind::all_remotes(&root)
+        && let Some((name, url)) = all.unreadable.iter().next()
+    {
+        return Target::Unreadable(format!(
+            "remote {name}'s URL ({url}) is outside the grammar knives compares, so the \
+             creation's target cannot be certified: state the repository (-R OWNER/REPO)"
+        ));
+    }
     let bound = registry
         .as_ref()
         .and_then(|registry| crate::bind::here(registry, cwd).ok());

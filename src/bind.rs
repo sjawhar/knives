@@ -301,30 +301,50 @@ pub(crate) fn git(directory: &Path) -> std::process::Command {
     command
 }
 
+/// A checkout's remotes as knives reads them: the ones it compares, and the
+/// ones it cannot.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Remotes {
+    /// Each remote's URL knives reads — a forge URL in the canonical remote
+    /// grammar, or a local path — by name.
+    pub readable: BTreeMap<String, String>,
+    /// Each remote none of whose URLs knives reads, by name, with the URL
+    /// git listed first: URL-shaped, outside the grammar. gh may read a
+    /// repository from it that knives cannot compare, so the checkout's
+    /// target cannot be certified while such a remote exists.
+    pub unreadable: BTreeMap<String, String>,
+}
+
+/// Remotes of the repository rooted at `root`, as git and gh use them —
+/// the readable ones ([`Remotes::readable`]).
+pub fn remotes(root: &Path) -> Result<BTreeMap<String, String>, BindError> {
+    all_remotes(root).map(|remotes| remotes.readable)
+}
+
 /// Remotes of the repository rooted at `root`, as git and gh use them.
 ///
 /// `git -C root remote -v`: git's *effective* URLs, with every
 /// `url.<base>.insteadOf` rewrite applied — the listing gh reads — and the
 /// one git would fetch from. The raw `remote.<name>.url` value would call a
 /// remote spelled through an alias another repository. Each remote is read
-/// the way gh's `TranslateRemotes` reads it: its fetch URL when that names a
-/// repository to gh's URL parser (`remote_url::repository_url`: a host, an
-/// `owner/repo` path after valid escapes are decoded, no invalid escape,
-/// whitespace or backslash), else the last of its push URLs that does — a
-/// push-only remote (`pushurl` with no `url`), or a fetch URL that is a path,
-/// a one-segment URL or an invalid URL, is the repository its push URL names
-/// (measured against gh 2.98.0) — else the fetch URL as written.
-/// Configuration reaches the read the way it reaches git: the repository's
-/// own file, the user's and the system's; `GIT_CONFIG_*` environment
-/// overrides do not (every git read knives makes strips them, see
-/// [`git_command`]). An ssh URL's host is then translated the way go-gh's
-/// ssh translator translates it — `ssh -G <host>` and its `hostname` answer
-/// — so an ssh-config alias names the host it stands for; without `ssh` on
-/// PATH, or on any failure, the host stays as written (gh's own fallback).
-/// For a linked worktree the configuration is the common repository's, so a
-/// jj workspace of a colocated checkout reports the checkout's remotes. A
-/// root with no `.git` is not a repository knives reads.
-pub fn remotes(root: &Path) -> Result<BTreeMap<String, String>, BindError> {
+/// the way gh's `TranslateRemotes` reads it, by the canonical remote grammar
+/// (`remote_url::classify`): its fetch URL when that is readable, else the
+/// last of its push URLs that is — a push-only remote (`pushurl` with no
+/// `url`), or a fetch URL that is a path, a one-segment URL or an invalid
+/// URL, is the repository its push URL names (measured against gh 2.98.0)
+/// — else, when the fetch URL is a local path, that path; a remote with no
+/// readable URL and no local one is [`Remotes::unreadable`]. Configuration
+/// reaches the read the way it reaches git: the repository's own file, the
+/// user's and the system's; `GIT_CONFIG_*` environment overrides do not
+/// (every git read knives makes strips them, see [`git_command`]). An ssh
+/// URL's host is first translated the way go-gh's ssh translator translates
+/// it — `ssh -G <host>` and its `hostname` answer — so an ssh-config alias
+/// names the host it stands for; without `ssh` on PATH, or on any failure,
+/// the host stays as written (gh's own fallback). For a linked worktree the
+/// configuration is the common repository's, so a jj workspace of a
+/// colocated checkout reports the checkout's remotes. A root with no `.git`
+/// is not a repository knives reads.
+pub fn all_remotes(root: &Path) -> Result<Remotes, BindError> {
     let failure = |detail: String| BindError::RemotesUnreadable {
         root: root.to_owned(),
         detail,
@@ -360,21 +380,46 @@ pub fn remotes(root: &Path) -> Result<BTreeMap<String, String>, BindError> {
     }
     let mut aliases = BTreeMap::new();
     let mut resolved = |url: &str| crate::remote_url::with_ssh_alias_resolved(url, &mut aliases);
-    Ok(fetch
-        .into_iter()
-        .map(|(name, fetch_url)| {
-            let fetch_url = resolved(&fetch_url);
-            let url = crate::remote_url::repository_url(&fetch_url).unwrap_or_else(|| {
-                push.get(&name)
-                    .into_iter()
-                    .flatten()
-                    .rev()
-                    .find_map(|push_url| crate::remote_url::repository_url(&resolved(push_url)))
-                    .unwrap_or(fetch_url)
-            });
-            (name, url)
-        })
-        .collect())
+    let mut remotes = Remotes::default();
+    for (name, fetch_url) in fetch {
+        let fetch_url = resolved(&fetch_url);
+        let push_urls: Vec<String> = push
+            .get(&name)
+            .into_iter()
+            .flatten()
+            .map(|push_url| resolved(push_url))
+            .collect();
+        let readable = |url: &String| {
+            matches!(
+                crate::remote_url::classify(url),
+                crate::remote_url::Remote::Readable { .. }
+            )
+        };
+        let chosen = if readable(&fetch_url) {
+            Some(fetch_url.clone())
+        } else {
+            push_urls.iter().rev().find(|url| readable(url)).cloned()
+        };
+        match chosen {
+            Some(url) => {
+                remotes.readable.insert(name, url);
+            }
+            None if !fetch_url.is_empty()
+                && crate::remote_url::classify(&fetch_url) == crate::remote_url::Remote::Local =>
+            {
+                remotes.readable.insert(name, fetch_url);
+            }
+            None => {
+                let first = if fetch_url.is_empty() {
+                    push_urls.first().cloned().unwrap_or_default()
+                } else {
+                    fetch_url
+                };
+                remotes.unreadable.insert(name, first);
+            }
+        }
+    }
+    Ok(remotes)
 }
 
 /// The line of git's stderr that explains a failure: the first that is not a

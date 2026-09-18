@@ -5,6 +5,14 @@
 //! `.git`, and letter case are all spellings of one repository. A value that is
 //! not a URL — a filesystem path, or a `file://` URL, whose authority is empty
 //! — is only ever equal to itself.
+//!
+//! Which URLs enter a comparison at all is [`classify`]'s question: the
+//! canonical remote grammar admits a forge URL knives reads byte for byte
+//! and a local path, and calls everything else [`Remote::Unreadable`] — a
+//! `%` escape, a query, a fragment, whitespace, an empty host or port —
+//! whatever gh's URL parser would make of it. A checkout remote with no
+//! readable URL is a refusal at the gate; a registry remote outside the
+//! grammar is a configuration error at load.
 
 /// Whether the remote spelling `stated` names the repository `registered`
 /// names.
@@ -198,79 +206,121 @@ fn ssh_hostname(host: &str) -> Option<String> {
     })
 }
 
-/// `url` as gh reads a remote that names a repository, or `None` when gh
-/// reads none from it and falls to the remote's push URL.
+/// How knives reads a remote's URL: as a forge repository it compares, as a
+/// local path it never compares to a forge, or as nothing at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Remote {
+    /// A URL in the canonical remote grammar: `http(s)://[user@]HOST[:PORT]/
+    /// OWNER/REPO[.git][/]`, `ssh://[user@]HOST[:PORT]/OWNER/REPO[.git][/]`
+    /// or the scp form `[user@]HOST:OWNER/REPO[.git]` — HOST of
+    /// `[A-Za-z0-9-]` labels joined by `.` (a trailing `.` allowed), PORT
+    /// digits, OWNER and REPO canonical segments, and nowhere a `%`, a
+    /// `?`, a `#`, whitespace or a control byte. Compared byte for byte
+    /// (case-insensitively, `www.` and a subdomain folded) and nothing else.
+    Readable {
+        host: String,
+        owner: String,
+        repo: String,
+    },
+    /// A filesystem path or a `file://` URL: a repository knives compares
+    /// only to its own spelling, never to a forge. gh reads no host from it.
+    Local,
+    /// URL-shaped, but outside the grammar: gh may read a repository from it
+    /// that knives cannot compare, so it never enters a comparison — a
+    /// remote with nothing else is a refusal, a registry entry is an error.
+    Unreadable,
+}
+
+/// Read `url` by the canonical remote grammar ([`Remote`]).
 ///
-/// gh parses a remote with Go's `url.Parse` (an scp form first rewritten to
-/// `ssh://`) and then requires a host and exactly two path segments
-/// (`ghrepo.FromURL`), measured against gh 2.98.0: a `%` not followed by two
-/// hex digits anywhere before the query or fragment (path or userinfo) is
-/// an invalid URL; a valid escape in the path is decoded before the segment
-/// count (`other%2Fdecoy/x` is three segments); ASCII whitespace or a
-/// control byte is an invalid URL; a `\` makes an scp-looking value no scp
-/// URL at all. The query is not validated. What comes back is the URL with
-/// its path escapes decoded — what gh compares — so a checkout remote
-/// spelled `…/upstre%61m.git` is the upstream to knives as to gh.
-pub fn repository_url(url: &str) -> Option<String> {
-    let (authority, path) = authority_and_path(url)?;
-    if authority.is_empty() {
-        return None;
+/// Nothing partially understood is read around: a `%` anywhere (an escape
+/// Go's parser might accept, decode, or reject), a query or fragment (text
+/// gh's parser validates past where knives reads), an empty or non-digit
+/// port, an empty host, an empty path segment, a `\` — each makes the URL
+/// [`Remote::Unreadable`], whatever gh would make of it. `file://` and a
+/// path with no scheme and no `host:` authority are [`Remote::Local`].
+pub fn classify(url: &str) -> Remote {
+    if url.starts_with("file://") {
+        return Remote::Local;
     }
-    let scp = !url.contains("://");
-    let before_query = url.split(['?', '#']).next().unwrap_or(url);
-    if before_query
+    if url
         .bytes()
         .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
-        || (scp && before_query.contains('\\'))
-        || !valid_escapes(before_query)
     {
-        return None;
+        return Remote::Unreadable;
     }
-    let decoded_path = percent_decode(path);
-    let decoded = if path.contains('%') {
-        // The path is a subslice of `url`; splice the decoded text in.
-        let offset = path.as_ptr() as usize - url.as_ptr() as usize;
-        let mut rewritten = String::with_capacity(url.len());
-        rewritten.push_str(&url[..offset]);
-        rewritten.push_str(&decoded_path);
-        rewritten.push_str(&url[offset + path.len()..]);
-        rewritten
-    } else {
-        url.to_owned()
-    };
-    remote_slug(&decoded).is_some().then_some(decoded)
-}
-
-/// Whether every `%` in `text` begins a `%XX` hex escape.
-fn valid_escapes(text: &str) -> bool {
-    let bytes = text.as_bytes();
-    bytes.iter().enumerate().all(|(at, byte)| {
-        *byte != b'%'
-            || bytes
-                .get(at + 1..at + 3)
-                .is_some_and(|pair| pair.iter().all(u8::is_ascii_hexdigit))
-    })
-}
-
-/// `text` with every `%XX` escape decoded (the caller has checked they are
-/// all valid); a decoded byte that is not UTF-8 is kept as `%XX`.
-fn percent_decode(text: &str) -> String {
-    let mut out = Vec::with_capacity(text.len());
-    let mut rest = text.as_bytes();
-    while let Some((&byte, after)) = rest.split_first() {
-        if byte == b'%'
-            && let Some((pair, tail)) = after.split_at_checked(2)
-            && let Ok(hex) = std::str::from_utf8(pair)
-            && let Ok(decoded) = u8::from_str_radix(hex, 16)
-        {
-            out.push(decoded);
-            rest = tail;
-        } else {
-            out.push(byte);
-            rest = after;
+    let (authority, path) = if let Some((scheme, rest)) = url.split_once("://") {
+        if !matches!(scheme, "http" | "https" | "ssh") {
+            return Remote::Unreadable;
         }
+        let Some((authority, path)) = rest.split_once('/') else {
+            return Remote::Unreadable;
+        };
+        (authority, path)
+    } else if let Some((authority, path)) = url.split_once(':') {
+        // scp form: what precedes the colon holds no `/` (else a path with
+        // a colon in a later component: local).
+        if authority.contains('/') {
+            return Remote::Local;
+        }
+        if path.contains('\\') || authority.is_empty() {
+            return Remote::Unreadable;
+        }
+        (authority, path)
+    } else {
+        return Remote::Local;
+    };
+    if url.contains(['%', '?', '#']) {
+        return Remote::Unreadable;
     }
-    String::from_utf8(out).unwrap_or_else(|_| text.to_owned())
+    let host_port = authority.rsplit('@').next().unwrap_or(authority);
+    if authority.matches('@').count() > 1 || host_port.is_empty() {
+        return Remote::Unreadable;
+    }
+    let host = match host_port.rsplit_once(':') {
+        Some((host, port)) => {
+            if port.is_empty() || !port.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Remote::Unreadable;
+            }
+            host
+        }
+        None => host_port,
+    };
+    if !is_host(host) {
+        return Remote::Unreadable;
+    }
+    let path = path.strip_suffix('/').unwrap_or(path);
+    let path = match path.split_at_checked(path.len().saturating_sub(4)) {
+        Some((stem, suffix)) if suffix.eq_ignore_ascii_case(".git") => stem,
+        _ => path,
+    };
+    let Some((owner, repo)) = path.split_once('/') else {
+        return Remote::Unreadable;
+    };
+    if !crate::commands::gh_canon::is_segment(owner)
+        || !crate::commands::gh_canon::is_segment(repo)
+        || repo.contains('/')
+    {
+        return Remote::Unreadable;
+    }
+    Remote::Readable {
+        host: host.to_owned(),
+        owner: owner.to_owned(),
+        repo: repo.to_owned(),
+    }
+}
+
+/// Whether `host` is labels of `[A-Za-z0-9-]` joined by `.`, none empty
+/// but for one trailing `.`.
+fn is_host(host: &str) -> bool {
+    let host = host.strip_suffix('.').unwrap_or(host);
+    !host.is_empty()
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
 }
 
 /// The host of a remote URL, without its user or port; `None` for a non-URL.
@@ -309,8 +359,7 @@ pub fn repository_name(url: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        remote_host, remote_slug, repository_name, repository_url, same_host, same_remote,
-        url_owner,
+        Remote, classify, is_host, remote_host, remote_slug, same_host, same_remote, url_owner,
     };
 
     #[test]
@@ -420,47 +469,160 @@ mod tests {
     }
 
     #[test]
-    fn a_remote_names_a_repository_only_when_gh_s_url_parser_reads_one() {
-        // Measured against gh 2.98.0 (pass 13): an invalid escape, whitespace
-        // or a backslash-carrying scp form is no URL to gh, which falls to
-        // the push URL; a valid escape is decoded before the segment count.
-        assert_eq!(
-            repository_url("https://forge.example/org/tool.git").as_deref(),
-            Some("https://forge.example/org/tool.git")
-        );
-        assert_eq!(
-            repository_url("https://forge.example/o%72g/tool.git").as_deref(),
-            Some("https://forge.example/org/tool.git")
-        );
-        assert_eq!(
-            repository_url("git@forge.example:org/to%6fl.git").as_deref(),
-            Some("git@forge.example:org/tool.git")
-        );
-        assert_eq!(
-            repository_url("https://forge.example/org/tool.git?x=%zz").as_deref(),
-            Some("https://forge.example/org/tool.git?x=%zz")
-        );
+    fn a_remote_is_readable_in_the_canonical_grammar_local_or_nothing() {
+        let readable = |host: &str, owner: &str, repo: &str| Remote::Readable {
+            host: host.to_owned(),
+            owner: owner.to_owned(),
+            repo: repo.to_owned(),
+        };
         for url in [
-            "https://forge.example/org%zz/tool.git",
-            "https://u%zz@forge.example/org/tool.git",
-            "https://forge.example/org%2Ftool/x.git",
-            "https://forge.example/or g/tool.git",
-            "https://forge.example/org/tool.git\t",
-            "forge.example:a\\b/tool",
-            "git@forge.example:org%zz/tool.git",
-            "ssh://git@forge.example/org%zz/tool.git",
-            "https://forge.example/org",
+            "https://forge.example/org/tool.git",
+            "https://forge.example/org/tool",
+            "https://forge.example/org/tool/",
+            "http://forge.example/org/tool.GIT",
+            "https://user@forge.example:443/org/tool.git",
+            "ssh://git@forge.example:22/org/tool.git",
+            "ssh://forge.example/org/tool",
+            "git@forge.example:org/tool.git",
+            "forge.example:org/tool",
+            "git@www.forge.example.:org/tool",
+        ] {
+            let host = if url.contains("www.") {
+                "www.forge.example."
+            } else {
+                "forge.example"
+            };
+            assert_eq!(classify(url), readable(host, "org", "tool"), "{url}");
+        }
+        for url in [
             "/srv/git/tool.git",
+            "file:///srv/git/tool.git",
             "x",
+            "u",
+            "../tool",
+            "/tmp/lab/a:b/tool",
             "",
         ] {
-            assert_eq!(repository_url(url), None, "{url:?}");
+            assert_eq!(classify(url), Remote::Local, "{url:?}");
         }
-        assert_eq!(
-            repository_name("https://forge.invalid/someone/Tool.GIT/"),
-            Some("Tool")
-        );
-        assert_eq!(repository_name("https://forge.invalid/someone/.git"), None);
+        for url in [
+            "https://forge.example/o%72g/tool.git",
+            "https://forge%2Eexample/org/tool.git",
+            "https://forge.example/org/tool.git?x=1",
+            "https://forge.example/org/tool.git#f",
+            "https://forge.example/org/tool.git?x=%zz",
+            "https://forge.example:/org/tool.git",
+            "https://:8080/org/tool.git",
+            "https://forge.example:x/org/tool.git",
+            "https://forge.example//org/tool.git",
+            "https://forge.example/org",
+            "https://forge.example/org/tool/extra.git",
+            "https://forge.example/or g/tool.git",
+            "https://forge.example/org/tool.git\t",
+            "https://forge..example/org/tool.git",
+            "https://forge_example/org/tool.git",
+            "git://forge.example/org/tool.git",
+            "git+ssh://git@forge.example/org/tool.git",
+            "forge.example:a\\b/tool",
+            "git@forge.example:/org/tool.git",
+            "git@forge.example:org%zz/tool.git",
+            ":org/tool",
+            "a@b@forge.example:org/tool",
+            "https://forge.example/o rg/tool",
+        ] {
+            assert_eq!(classify(url), Remote::Unreadable, "{url:?}");
+        }
+    }
+
+    /// A deterministic xorshift generator, so the corpus is the same on every run.
+    struct Generator(u64);
+
+    impl Generator {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+
+        fn pick<'a>(&mut self, from: &[&'a str]) -> &'a str {
+            let at =
+                usize::try_from(self.next() % u64::try_from(from.len()).unwrap_or(1)).unwrap_or(0);
+            from.get(at).copied().unwrap_or("")
+        }
+    }
+
+    #[test]
+    fn every_generated_remote_spelling_is_readable_with_canonical_parts_local_or_unreadable() {
+        // Over the URL alphabet with escapes, whitespace, controls, colons,
+        // query and fragment marks: a spelling is either readable — every
+        // part canonical, and its canonical respelling readable to the same
+        // parts — or local, or unreadable. Nothing else, and nothing
+        // readable carries a `%`, `?`, `#`, whitespace or a control byte.
+        const PIECES: &[&str] = &[
+            "https://",
+            "http://",
+            "ssh://",
+            "git://",
+            "file://",
+            "git@",
+            "user@",
+            "forge.example",
+            "FORGE.example.",
+            "www.forge.example",
+            ":443",
+            ":",
+            ":/",
+            "/",
+            "//",
+            "org",
+            "tool",
+            ".git",
+            "%",
+            "%2F",
+            "%zz",
+            "%FF",
+            "?x=1",
+            "#f",
+            " ",
+            "\t",
+            "\u{1}",
+            "\\",
+            "\u{a0}",
+            "_",
+            "-",
+            "..",
+            "8080",
+        ];
+        let mut generator = Generator(0x9E37_79B9_7F4A_7C15);
+        for _ in 0..300 {
+            let length = 1 + usize::try_from(generator.next() % 8).unwrap_or(0);
+            let url: String = (0..length).map(|_| generator.pick(PIECES)).collect();
+            match classify(&url) {
+                Remote::Readable { host, owner, repo } => {
+                    assert!(is_host(&host), "{url:?} -> host {host:?}");
+                    assert!(crate::commands::gh_canon::is_segment(&owner), "{url:?}");
+                    assert!(crate::commands::gh_canon::is_segment(&repo), "{url:?}");
+                    assert!(!url.contains(['%', '?', '#']), "{url:?}");
+                    assert!(
+                        !url.bytes()
+                            .any(|b| b.is_ascii_whitespace() || b.is_ascii_control()),
+                        "{url:?}"
+                    );
+                    let canonical = format!("https://{host}/{owner}/{repo}.git");
+                    assert_eq!(
+                        classify(&canonical),
+                        Remote::Readable { host, owner, repo },
+                        "{url:?} -> {canonical}"
+                    );
+                }
+                Remote::Local => assert!(
+                    url.starts_with("file://") || !url.contains("://"),
+                    "{url:?} local"
+                ),
+                Remote::Unreadable => {}
+            }
+        }
     }
 
     #[test]

@@ -494,20 +494,7 @@ pub fn load(path: &Path) -> Result<Registry, ConfigError> {
     for (name, entry) in &mut registry.repos {
         entry.workspaces =
             checked_workspaces(name, entry.workspaces.as_deref(), &config_home, path)?;
-        for (role, remote) in [
-            ("upstream", entry.upstream.as_str()),
-            ("origin", entry.origin.as_str()),
-        ]
-        .into_iter()
-        .chain(entry.release.as_deref().map(|remote| ("release", remote)))
-        {
-            if remote.starts_with('-') {
-                return Err(ConfigError::Invalid {
-                    path: path.to_owned(),
-                    detail: format!("{role} remote {remote:?} must not start with `-`"),
-                });
-            }
-        }
+        checked_remotes(name, entry, path)?;
         checked_release_branch(entry, path)?;
         for consumer in &entry.consumers {
             if !is_forge_slug(consumer) {
@@ -537,6 +524,40 @@ pub fn load(path: &Path) -> Result<Registry, ConfigError> {
         *root = expand_registry_path(root, &config_home);
     }
     Ok(registry)
+}
+
+/// Every remote of an entry, spelled so knives can compare it: not beginning
+/// with `-`, and either a local path or a forge URL in the canonical remote
+/// grammar (`remote_url::classify`). The trusted side is compared by the
+/// same grammar as a checkout's remotes: a forge URL knives cannot read byte
+/// for byte is a registry error, not a repository nobody matches.
+fn checked_remotes(name: &str, entry: &RepoEntry, path: &Path) -> Result<(), ConfigError> {
+    for (role, remote) in [
+        ("upstream", entry.upstream.as_str()),
+        ("origin", entry.origin.as_str()),
+    ]
+    .into_iter()
+    .chain(entry.release.as_deref().map(|remote| ("release", remote)))
+    {
+        if remote.starts_with('-') {
+            return Err(ConfigError::Invalid {
+                path: path.to_owned(),
+                detail: format!("{role} remote {remote:?} must not start with `-`"),
+            });
+        }
+        if crate::remote_url::classify(remote) == crate::remote_url::Remote::Unreadable {
+            return Err(ConfigError::Invalid {
+                path: path.to_owned(),
+                detail: format!(
+                    "[repos.{name}] {role} = {remote:?} is outside the remote grammar knives \
+                     compares (https://HOST/OWNER/REPO[.git], ssh://[user@]HOST/OWNER/REPO, \
+                     [user@]HOST:OWNER/REPO, or a local path; no `%`, `?`, `#`, whitespace, empty \
+                     host or port): spell it that way"
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// A `~` in `workspaces` or `[trust] roots` expands through [`home_dir`]. With
@@ -762,13 +783,13 @@ mod tests {
 
     const SAMPLE: &str = r#"
 [repos.example]
-upstream = "https://example.invalid/upstream.git"
-origin = "https://example.invalid/origin.git"
+upstream = "https://example.invalid/org/upstream.git"
+origin = "https://example.invalid/org/origin.git"
 
 [repos.split]
-upstream = "https://example.invalid/upstream2.git"
-origin = "https://example.invalid/branches.git"
-release = "https://example.invalid/releases.git"
+upstream = "https://example.invalid/org/upstream2.git"
+origin = "https://example.invalid/org/branches.git"
+release = "https://example.invalid/org/releases.git"
 "#;
 
     fn write(dir: &Path, text: &str) -> PathBuf {
@@ -784,7 +805,7 @@ release = "https://example.invalid/releases.git"
         assert_eq!(registry.repos.len(), 2);
         assert_eq!(
             registry.repos["example"].upstream,
-            "https://example.invalid/upstream.git"
+            "https://example.invalid/org/upstream.git"
         );
     }
 
@@ -940,7 +961,7 @@ release = "https://example.invalid/releases.git"
         let entry = &registry.repos["split"];
         assert_eq!(
             entry.remote(Role::Release),
-            "https://example.invalid/releases.git"
+            "https://example.invalid/org/releases.git"
         );
         assert_eq!(entry.publish_remote(), "release");
         assert!(entry.has_split_release());
@@ -972,6 +993,60 @@ release = "https://example.invalid/releases.git"
         // Then: it fails at parse time, naming the field, not later at query time
         let message = result.unwrap_err().to_string();
         assert!(message.contains("upstream"), "message was: {message}");
+    }
+
+    #[test]
+    fn a_registry_remote_outside_the_canonical_grammar_is_a_config_error() {
+        // The trusted side is compared by the same grammar as a checkout's
+        // remotes (round-13): a forge URL knives cannot read byte for byte
+        // is refused at load, naming the entry, the role and the grammar —
+        // never a repository nobody matches. A local path stays a remote.
+        let dir = tempfile::tempdir().unwrap();
+        for (role, remote) in [
+            ("upstream", "https://forge.example/org/tool.git?x=1"),
+            ("origin", "https://forge.example/org/tool.git#f"),
+            ("release", "https://forge%2Eexample/org/tool.git"),
+            ("upstream", "https://forge.example:/org/tool.git"),
+            ("origin", "https://:8080/org/tool.git"),
+            ("upstream", "https://forge.example/tool.git"),
+            ("origin", "https://forge.example/"),
+            ("release", "git://forge.example/org/tool.git"),
+            ("upstream", "https://forge.example/o rg/tool.git"),
+        ] {
+            let mut lines = vec![
+                "[repos.x]".to_owned(),
+                "upstream = \"https://forge.example/org/up.git\"".to_owned(),
+                "origin = \"https://forge.example/org/or.git\"".to_owned(),
+            ];
+            let at = match role {
+                "upstream" => 1,
+                "origin" => 2,
+                _ => {
+                    lines.push(String::new());
+                    3
+                }
+            };
+            lines[at] = format!("{role} = {remote:?}");
+            let message = load(&write(dir.path(), &format!("{}\n", lines.join("\n"))))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                message.contains(&format!(
+                    "[repos.x] {role} = {remote:?} is outside the remote grammar knives compares"
+                )),
+                "{role} {remote}: {message}"
+            );
+            assert!(message.contains("spell it that way"), "{message}");
+        }
+        for local in [
+            "/srv/git/tool.git",
+            "file:///srv/git/tool.git",
+            "u",
+            "../tool",
+        ] {
+            let text = format!("[repos.x]\nupstream = {local:?}\norigin = \"o\"\n");
+            assert!(load(&write(dir.path(), &text)).is_ok(), "{local}");
+        }
     }
 
     #[test]

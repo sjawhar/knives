@@ -7,7 +7,7 @@
 
 #[path = "common/lab.rs"]
 mod lab;
-// allow: SIZE_OK: 5741 lines - real-binary gh passthrough scenarios share one fixture and process harness.
+// allow: SIZE_OK: 6023 lines - real-binary gh passthrough scenarios share one fixture and process harness.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
@@ -4080,15 +4080,12 @@ fn hosts_yml_is_found_by_go_ghs_config_dir_precedence() {
     // A file knives cannot read as a hosts map — anything but `key:` lines
     // with the indented map below, as gh writes it — or a host outside the
     // grammar, is refused rather than guessed.
-    refused("this: [is: not\n", "is not a hosts map knives can read");
-    refused("- ghe.example\n", "is not a hosts map knives can read");
-    refused(
-        "ghe.example: scalar\n",
-        "is not a hosts map knives can read",
-    );
+    refused("this: [is: not\n", "is not YAML knives reads");
+    refused("- ghe.example\n", "is not YAML knives reads");
+    refused("ghe.example: scalar\n", "is not YAML knives reads");
     refused(
         "ghe example:\n    user: m\n",
-        "is not a hosts map knives can read (line \"ghe example:\")",
+        "is not YAML knives reads (line 1: \"ghe example:\")",
     );
     fs::remove_file(gh_config.path().join("hosts.yml")).expect("remove hosts.yml");
     // The directory precedence is go-gh's: GH_CONFIG_DIR, then $XDG_CONFIG_HOME/gh.
@@ -4253,13 +4250,24 @@ fn a_registry_origin_without_a_readable_owner_is_refused_and_a_userless_scp_one_
         let recorded = fs::read_to_string(&log).unwrap_or_default();
         (output, recorded)
     };
-    // An origin naming no owner: refused with the registry remedy, whether a
-    // head is stated (bare, `:branch`, the real owner) or not.
-    for origin in [
-        "/srv/git/origin.git",
-        "file:///srv/git/origin.git",
-        &format!("https://{host}/"),
-    ] {
+    // A forge URL naming no owner is outside the remote grammar: the
+    // registry itself is refused at load, before any gate (round-13).
+    for arguments in [&[][..], &["--head", "routed-b:feat/up"][..]] {
+        let origin = format!("https://{host}/");
+        let (output, recorded) = run_with(&origin, arguments);
+        assert_eq!(output.status.code(), Some(3), "{arguments:?}: {output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(&format!(
+                "is not a valid registry: [repos.registered] origin = \"{origin}\" is outside the remote grammar knives compares"
+            )),
+            "{arguments:?}: {stderr}"
+        );
+        assert!(recorded.is_empty(), "{arguments:?}: gh ran: {recorded}");
+    }
+    // A local origin names no owner: refused with the registry remedy,
+    // whether a head is stated (bare, `:branch`, the real owner) or not.
+    for origin in ["/srv/git/origin.git", "file:///srv/git/origin.git"] {
         for arguments in [
             &[][..],
             &["--head", ":feat/up"][..],
@@ -4706,9 +4714,9 @@ fn without_a_hosts_block_config_yml_yields_to_hosts_yml_and_an_unreadable_block_
         "config.yml",
         "version: \"1\"\nhosts: {ghe.example: {user: m}}\n",
     );
-    refused("is not a hosts map knives can read");
+    refused("is not YAML knives reads");
     write("config.yml", "version: \"1\"\nhosts:\n    ghe.example: m\n");
-    refused("is not a hosts map knives can read");
+    refused("is not YAML knives reads");
 }
 
 #[test]
@@ -4949,7 +4957,7 @@ fn a_quoted_or_padded_hosts_heading_and_host_key_are_read_as_gh_reads_them() {
     // read as `hosts.yml`'s.
     for heading in ["\"hosts\": {ghe.example: {user: m}}", "hosts : ~"] {
         hosts.write("config.yml", &format!("version: \"1\"\n{heading}\n"));
-        hosts.refused(heading, "is not a hosts map knives can read");
+        hosts.refused(heading, "is not YAML knives reads");
     }
 }
 
@@ -4975,7 +4983,7 @@ fn an_indented_hosts_map_is_read_at_its_own_indent_and_never_as_zero_hosts() {
     );
     hosts.refused(
         "mixed indent 0 then 2",
-        "is not a hosts map knives can read (line \"  other.example:\")",
+        "is not YAML knives reads (line 3: \"  other.example:\")",
     );
     hosts.write(
         "hosts.yml",
@@ -4983,15 +4991,18 @@ fn an_indented_hosts_map_is_read_at_its_own_indent_and_never_as_zero_hosts() {
     );
     hosts.refused(
         "mixed indent 2 then 0",
-        "is not a hosts map knives can read (line \"other.example:\")",
+        "is not YAML knives reads (line 3: \"other.example:\")",
     );
     hosts.write("hosts.yml", "    user: m\n");
     hosts.refused(
         "content with no key",
-        "is not a hosts map knives can read (line \"    user: m\")",
+        "is not YAML knives reads (line 1: \"    user: m\")",
     );
     hosts.write("hosts.yml", "ghe.example:\n  - x\n");
-    hosts.gated("a list under a read key is that key's own value");
+    hosts.refused(
+        "a list under a read key is outside the grammar",
+        "is not YAML knives reads (line 2: \"  - x\")",
+    );
     // config.yml blocks at 5 and 2 spaces read; a block whose first line is
     // shallower than the heading's children cannot be (it ends the block).
     hosts.write("hosts.yml", concat!("github", ".com", ":\n    user: m\n"));
@@ -5008,7 +5019,7 @@ fn an_indented_hosts_map_is_read_at_its_own_indent_and_never_as_zero_hosts() {
     hosts.write("config.yml", "version: \"1\"\nhosts:\n    ghe.example:\n        user: m\n  other.example:\n        user: m\n");
     hosts.refused(
         "mixed config block",
-        "is not a hosts map knives can read (line \"  other.example:\")",
+        "is not YAML knives reads (line 5: \"  other.example:\")",
     );
     // Genuinely empty files and blocks are zero hosts: github.com.
     hosts.write("config.yml", "version: \"1\"\nhosts:\n");
@@ -5232,7 +5243,7 @@ fn any_spelling_of_a_hosts_heading_is_the_hosts_region_and_never_falls_through()
         "hosts: ~",
     ] {
         hosts.write("config.yml", &format!("version: \"1\"\n{heading}\n"));
-        hosts.refused(heading, "is not a hosts map knives can read");
+        hosts.refused(heading, "is not YAML knives reads");
     }
     // A BOM before a first-line heading is the heading.
     hosts.write(
@@ -5245,7 +5256,7 @@ fn any_spelling_of_a_hosts_heading_is_the_hosts_region_and_never_falls_through()
     hosts.passed("BOM heading");
     // A column-0 line whose key is not `hosts` is not the region: `hostsx:`,
     // `hosts.old:`, a key ending in `hosts`.
-    for other in ["hostsx:", "hosts.old:", "old_hosts:", "\"hosts x\":"] {
+    for other in ["hostsx:", "hosts.old:", "old_hosts:"] {
         hosts.write(
             "config.yml",
             &format!(
@@ -5255,6 +5266,19 @@ fn any_spelling_of_a_hosts_heading_is_the_hosts_region_and_never_falls_through()
         );
         hosts.gated(other);
     }
+    // A key with a character outside the grammar is the whole file refused,
+    // whichever key it is (round-13: no reading around a line).
+    hosts.write(
+        "config.yml",
+        &format!(
+            "version: \"1\"\n\"hosts x\":\n    {}:\n        user: m\n",
+            concat!("github", ".com")
+        ),
+    );
+    hosts.refused(
+        "\"hosts x\":",
+        "is not YAML knives reads (line 2: \"\\\"hosts x\\\":\")",
+    );
 }
 
 #[test]
@@ -5274,17 +5298,21 @@ fn only_ascii_space_and_tab_are_yaml_whitespace_to_the_config_reader() {
         "ghe/example:\n    user: m\n",
     ] {
         hosts.write("hosts.yml", text);
-        hosts.refused(text, "is not a hosts map knives can read");
+        hosts.refused(text, "is not YAML knives reads");
     }
-    // In config.yml a no-break-space-led heading is a column-0 key that is
-    // not `hosts`; the region is then hosts.yml's (github.com here) — as gh
-    // reads it: the NBSP line is some other key.
+    // In config.yml a no-break-space-led heading is a key outside the
+    // grammar — gh reads it as some other key and hosts.yml's github.com
+    // would pass — and the whole file is refused (round-13): knives reads
+    // nothing around a line it does not read.
     hosts.write("hosts.yml", concat!("github", ".com", ":\n    user: m\n"));
     hosts.write(
         "config.yml",
         "version: \"1\"\n\u{a0}hosts:\n    ghe.example:\n        user: m\n",
     );
-    hosts.passed("NBSP-led heading is another key");
+    hosts.refused(
+        "NBSP-led heading",
+        "is not YAML knives reads (line 2: \"\\u{a0}hosts:\")",
+    );
     // A tab before the colon and a tab-then-comment are YAML whitespace.
     hosts.write(
         "config.yml",
@@ -5299,7 +5327,9 @@ fn a_fetch_url_gh_s_parser_rejects_yields_to_the_push_url() {
     // or userinfo, whitespace, an encoded slash making three segments, or a
     // backslash in an scp value is no URL to gh, which falls to the push
     // URL; knives' textual reader called each a repository (round-12 F1/F3,
-    // both lanes). A valid escape is decoded, as gh decodes it.
+    // both lanes). knives reads each by the canonical remote grammar
+    // (round-13): outside it, a URL is unreadable and yields to a readable
+    // push URL, whatever gh's parser would make of it.
     let config_home = placement_gate_home();
     record_placement(config_home.path(), "feat/eps", "FORK");
     let host = concat!("github", ".com");
@@ -5338,7 +5368,10 @@ fn a_fetch_url_gh_s_parser_rejects_yields_to_the_push_url() {
         );
         assert!(recorded.is_none(), "{fetch}: gh ran: {recorded:?}");
     }
-    // A valid escape spells the upstream itself: decoded, it is the upstream.
+    // A valid escape gh decodes to the upstream itself is still a `%`: with
+    // no readable push URL the remote is unreadable and the target cannot be
+    // certified — refused with the `-R` remedy, never read around (the
+    // accepted over-refusal, round-13).
     let (output, recorded) = run_in_clone_with_upstream_config(
         config_home.path(),
         &[(
@@ -5357,9 +5390,16 @@ fn a_fetch_url_gh_s_parser_rejects_yields_to_the_push_url() {
         ],
     );
     assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains(&format!(
+            "remote upstream's URL (https://{host}/routed-a/upstre%61m.git) is outside the grammar knives compares, so the creation's target cannot be certified: state the repository (-R OWNER/REPO)"
+        )),
+        "{output:?}"
+    );
     assert!(recorded.is_none(), "gh ran: {recorded:?}");
-    // A bad escape in the query only does not invalidate the URL: the valid
-    // decoy fetch still wins over the push URL, as in gh.
+    // A query on the fetch URL puts it outside the grammar too, though gh
+    // reads the decoy repository from it: the readable push URL is the
+    // remote, and the upstream gate applies.
     let (output, recorded) = run_in_clone_with_upstream_config(
         config_home.path(),
         &[
@@ -5380,12 +5420,255 @@ fn a_fetch_url_gh_s_parser_rejects_yields_to_the_push_url() {
             "routed-b:feat/eps",
         ],
     );
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("feat/eps has placement verdict FORK"),
+        "{output:?}"
+    );
+    assert!(recorded.is_none(), "gh ran: {recorded:?}");
+}
+
+#[test]
+fn a_remote_outside_the_canonical_grammar_is_never_read_around() {
+    // Round-13 (code F1-F3, deep F1-F2): an empty port, an empty host, a
+    // `%` escape in the authority, a query or fragment however spelled, an
+    // escape past a decoded slash — each a spelling gh's parser reads one
+    // way or another and knives' reader read differently. knives now reads a
+    // remote by one grammar: outside it the URL is unreadable; a readable
+    // push URL is then the remote (gh's own fallback), and a remote with no
+    // readable URL leaves the target uncertifiable — refused with the `-R`
+    // remedy, never guessed.
+    let config_home = placement_gate_home();
+    record_placement(config_home.path(), "feat/eps", "FORK");
+    let host = concat!("github", ".com");
+    let upstream = format!("https://{host}/routed-a/upstream.git");
+    let outside = [
+        format!("https://{host}:/routed-a/upstream.git"),
+        "https://:8080/routed-a/upstream.git".to_owned(),
+        "https://github%2Ecom/routed-a/upstream.git".to_owned(),
+        format!("https://{host}/other/decoy.git#%zz"),
+        format!("https://{host}/other/decoy.git?a=%20b"),
+        format!("https://{host}/other/decoy.git#a-b"),
+        format!("https://{host}/other/decoy.git?a=b"),
+        format!("https://{host}/a%2Fb%FF/decoy.git"),
+        format!("https://{host}/other/decoy.git/extra"),
+        format!("git@{host}:other/decoy.git#f"),
+    ];
+    let create = [
+        "pr",
+        "create",
+        "-t",
+        "t",
+        "-b",
+        "b",
+        "--head",
+        "routed-b:feat/eps",
+    ];
+    for fetch in &outside {
+        // Alone: unreadable, refused with the remedy.
+        let (output, recorded) = run_in_clone_with_upstream_config(
+            config_home.path(),
+            &[("remote.upstream.url", fetch.as_str())],
+            &create,
+        );
+        assert_eq!(output.status.code(), Some(2), "{fetch}: {output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(&format!(
+                "remote upstream's URL ({fetch}) is outside the grammar knives compares, so the creation's target cannot be certified: state the repository (-R OWNER/REPO)"
+            )),
+            "{fetch}: {output:?}"
+        );
+        assert!(recorded.is_none(), "{fetch}: gh ran: {recorded:?}");
+        // With a readable push URL: that is the remote, and it is the
+        // upstream — the FORK verdict refuses, whatever repository gh would
+        // have read from the fetch URL.
+        let (output, recorded) = run_in_clone_with_upstream_config(
+            config_home.path(),
+            &[
+                ("remote.upstream.url", fetch.as_str()),
+                ("remote.upstream.pushurl", upstream.as_str()),
+            ],
+            &create,
+        );
+        assert_eq!(output.status.code(), Some(2), "{fetch} + push: {output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("feat/eps has placement verdict FORK"),
+            "{fetch} + push: {output:?}"
+        );
+        assert!(recorded.is_none(), "{fetch} + push: gh ran: {recorded:?}");
+    }
+    // A stated repository does not consult the remotes: the unreadable one
+    // is irrelevant and the gate is on the stated upstream.
+    let (output, recorded) = run_in_clone_with_upstream_config(
+        config_home.path(),
+        &[("remote.upstream.url", &outside[0])],
+        &[
+            "pr",
+            "create",
+            "-R",
+            "routed-a/upstream",
+            "-t",
+            "t",
+            "-b",
+            "b",
+            "--head",
+            "routed-b:feat/eps",
+        ],
+    );
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("feat/eps has placement verdict FORK"),
+        "{output:?}"
+    );
+    assert!(recorded.is_none(), "gh ran: {recorded:?}");
+    // Control: a readable fetch URL naming another repository is the remote
+    // whatever the push URL says, and that repository passes.
+    let (output, recorded) = run_in_clone_with_upstream_config(
+        config_home.path(),
+        &[
+            (
+                "remote.upstream.url",
+                &format!("https://{host}/other/decoy.git"),
+            ),
+            ("remote.upstream.pushurl", upstream.as_str()),
+        ],
+        &create,
+    );
     assert!(output.status.success(), "{output:?}");
     assert!(
         recorded
             .expect("fake gh ran")
             .contains("GH_TOKEN=tok-other")
     );
+}
+
+#[test]
+fn a_config_file_outside_the_grammar_gh_writes_is_refused_whole_and_never_falls_through() {
+    // Round-13 (code F4, deep F3-F4 and the Lows): a `hosts` heading YAML
+    // decodes from `"\x68osts":`, a complex key, an anchor, a flow document,
+    // a second document, a bare scalar line, a tab indent, an empty flow map
+    // after a block — each read by knives' line reader as something gh reads
+    // differently (or, for the last two, as a file gh rejects outright).
+    // Either file with a line outside the grammar gh writes makes the
+    // default host unknown: refused naming the file and the line, and never
+    // read from the other file.
+    let hosts = HostsLab::new();
+    // hosts.yml names the GHE host: a fall-through would gate (exit 2 with
+    // the FORK text), the correct read refuses with the file text.
+    hosts.write("hosts.yml", "ghe.example:\n    user: m\n");
+    let github = concat!("github", ".com");
+    for (text, line) in [
+        (
+            format!("version: \"1\"\n\"\\x68osts\":\n    {github}:\n        user: m\n"),
+            "line 2: \"\\\"\\\\x68osts\\\":\"",
+        ),
+        (
+            format!("version: \"1\"\n? hosts\n: {{{github}: {{user: m}}}}\n"),
+            "line 2: \"? hosts\"",
+        ),
+        (
+            format!("{{version: \"1\", hosts: {{{github}: {{user: m}}}}}}\n"),
+            "line 1: \"{version:",
+        ),
+        (
+            format!("version: \"1\"\n&a hosts:\n    {github}:\n        user: m\n"),
+            "line 2: \"&a hosts:\"",
+        ),
+        (
+            format!("version: \"1\"\n---\nhosts:\n    {github}:\n        user: m\n"),
+            "line 2: \"---\"",
+        ),
+        ("version: \"1\"\nhosts\n".to_owned(), "line 2: \"hosts\""),
+        (
+            format!("version: \"1\"\nhosts: !!map\n    {github}:\n        user: m\n"),
+            "line 2: \"hosts: !!map\"",
+        ),
+        (
+            format!("version: \"1\"\nhosts: *h\n    {github}:\n        user: m\n"),
+            "line 2: \"hosts: *h\"",
+        ),
+        (
+            format!(
+                "version: \"1\"\nhosts:\n    {github}:\n        user: m\n    {github}:\n        user: n\n"
+            ),
+            "line 5:",
+        ),
+        (
+            "version: \"1\"\nversion: \"2\"\n".to_owned(),
+            "line 2: \"version: \\\"2\\\"\"",
+        ),
+        (
+            "version: \"1\"\n- hosts\n".to_owned(),
+            "line 2: \"- hosts\"",
+        ),
+        (
+            "version: \"1\"\nhosts: >\n    text\n".to_owned(),
+            "line 2: \"hosts: >\"",
+        ),
+    ] {
+        hosts.write("config.yml", &text);
+        hosts.refused(
+            &text,
+            &format!(
+                "gh's {} is not YAML knives reads ({line}",
+                hosts.gh_config.path().join("config.yml").display()
+            ),
+        );
+    }
+}
+
+#[test]
+fn a_hosts_file_outside_the_grammar_is_refused_and_the_files_gh_writes_are_read() {
+    // The hosts.yml half of the round-13 sweep, and the control: the
+    // shapes gh itself writes — `m: {}` for a token-less user, an unquoted
+    // version, gh's comments — read as gh reads them.
+    let hosts = HostsLab::new();
+    hosts.remove("config.yml");
+    // hosts.yml outside the grammar: refused, not zero hosts and not
+    // github.com — including the shapes gh itself rejects.
+    for (text, line) in [
+        ("ghe.example:\n\tuser: m\n", "line 2: \"\\tuser: m\""),
+        ("ghe.example:\n    user: m\n{}\n", "line 3: \"{}\""),
+        (
+            "ghe.example:\n    user: m\n---\nother.example:\n",
+            "line 3: \"---\"",
+        ),
+        (
+            "ghe.example: {user: m}\n",
+            "line 1: \"ghe.example: {user: m}\"",
+        ),
+        (
+            "ghe.example:\n    user: m\n    user: n\n",
+            "line 3: \"    user: n\"",
+        ),
+        ("*ghe :\n    user: m\n", "line 1: \"*ghe :\""),
+        ("\"ghe.example\\n\":\n    user: m\n", "line 1:"),
+        ("ghe.example:\n    user: \"m\n", "line 2:"),
+    ] {
+        hosts.write("hosts.yml", text);
+        hosts.refused(
+            text,
+            &format!(
+                "gh's {} is not YAML knives reads ({line}",
+                hosts.gh_config.path().join("hosts.yml").display()
+            ),
+        );
+    }
+    // The shapes gh writes read: a host with a token-less user (`m: {}`),
+    // an unquoted version, gh's own comments, `config.yml` with no hosts key.
+    hosts.write(
+        "hosts.yml",
+        "ghe.example:\n    users:\n        m: {}\n    git_protocol: https\n    user: m\n",
+    );
+    hosts.write(
+        "config.yml",
+        "# The current version of the config schema\nversion: 1\n# What protocol to use when performing git operations. Supported values: ssh, https\ngit_protocol: https\neditor:\naliases:\n    co: pr checkout\nhttp_unix_socket:\n",
+    );
+    hosts.gated("gh-written files");
+    // `hosts: {}` in config.yml is the hosts region, empty: zero hosts,
+    // github.com — hosts.yml's GHE host is not read.
+    hosts.write("config.yml", "version: \"1\"\nhosts: {}\n");
+    hosts.passed("empty flow map as the hosts region");
 }
 
 #[test]
