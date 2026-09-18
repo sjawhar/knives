@@ -312,7 +312,8 @@ fn a_cut_measures_tests_under_the_configured_workspaces_directory() {
     )
     .expect("configure test counter");
 
-    // When: a release is cut
+    // When: a release is cut, each branch carrying the verdict the cut gates on
+    lab::state_placements_for_carried(&lab, &home);
     let cut = lab::knives_command(
         &lab.work,
         home.path(),

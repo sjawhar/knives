@@ -48,6 +48,7 @@ fn registry_home(lab: &Lab, extra: &str) -> tempfile::TempDir {
         ),
     )
     .expect("write registry");
+    lab::state_placements_for_carried(lab, &home);
     home
 }
 

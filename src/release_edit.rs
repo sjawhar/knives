@@ -188,27 +188,35 @@ impl EditContext<'_> {
 
 impl EditContext<'_> {
     /// Whether the release in hand carries the branch at `tip` now, by the
-    /// repository's own evidence: the tip is a parent, or it succeeds a parent
-    /// no carried bookmark still holds — the member grew or was rebased, and
-    /// its old parent stands vacated behind it. A branch stacked on a member
-    /// still at its tip also succeeds that parent, but the member's bookmark
-    /// holds it, so the stacked branch is what it looks like: a new one.
+    /// repository's own evidence, where the ledger has none to offer: the tip
+    /// is a parent, or it succeeds a parent that no cut or edit record ever
+    /// named a branch for and that no bookmark — local or remote — still
+    /// holds. The member grew or was rebased, and its old parent stands
+    /// vacated behind it.
     ///
     /// This is what grandfathers a member whose cut predates the ledger's
     /// parent records — a release with members and no `[[parents]]` block in
     /// any event, or with no cut event at all — where `composed` has nothing
-    /// to read.
+    /// to read. Where a record names the parent's branch, that record is
+    /// authoritative: the branch it names is grandfathered by `composed`, and
+    /// anything else succeeding the same parent — a new branch forked from a
+    /// member's released commit after the member grew — is what it looks like,
+    /// a newcomer. A branch stacked on a member still at its tip succeeds that
+    /// parent too, but a bookmark holds it, so it is a newcomer as well.
     fn currently_member(
         &self,
         tip: &knives::ids::CommitId,
-        carried: &[(String, knives::ids::CommitId)],
+        bookmarks: &Bookmarks<'_>,
     ) -> anyhow::Result<bool> {
         if self.release.parents.contains(tip) {
             return Ok(true);
         }
         let succession = MemberSuccession::of(self.opened, &self.release.trunk_tips, tip)?;
         for parent in &self.release.parents {
-            if succession.succeeds(parent)? && !carried.iter().any(|(_, held)| held == parent) {
+            if parent_has_a_record(self.ledger, parent) {
+                continue;
+            }
+            if bookmarks.names_at(parent).is_empty() && succession.succeeds(parent)? {
                 return Ok(true);
             }
         }
@@ -230,12 +238,12 @@ impl EditContext<'_> {
         &self,
         name: &str,
         tip: &knives::ids::CommitId,
-        carried: &[(String, knives::ids::CommitId)],
+        bookmarks: &Bookmarks<'_>,
     ) -> anyhow::Result<Option<String>> {
         Ok(knives::placement::member_refusal(
             self.ledger,
             name,
-            self.currently_member(tip, carried)?,
+            self.currently_member(tip, bookmarks)?,
         )?)
     }
 
@@ -252,11 +260,11 @@ impl EditContext<'_> {
         &self,
         names: &[String],
         tip: &knives::ids::CommitId,
-        carried: &[(String, knives::ids::CommitId)],
+        bookmarks: &Bookmarks<'_>,
     ) -> anyhow::Result<bool> {
         let mut refusals = Vec::new();
         for name in names {
-            match self.unplaced_refusal(name, tip, carried)? {
+            match self.unplaced_refusal(name, tip, bookmarks)? {
                 None => return Ok(false),
                 Some(refusal) => refusals.push(refusal),
             }
@@ -269,6 +277,41 @@ impl EditContext<'_> {
         };
         println!("{}: {refusal}", self.repo);
         Ok(true)
+    }
+}
+
+/// Whether some cut or edit event recorded `parent` with the branches at it.
+///
+/// Such a record is the ledger's word on which branch that parent is: the
+/// name it carries is grandfathered by `composed`, and the repository's guess
+/// about what succeeds the parent is not consulted over it.
+fn parent_has_a_record(entries: &[knives::ledger::Entry], parent: &knives::ids::CommitId) -> bool {
+    entries.iter().any(|entry| {
+        entry
+            .parents
+            .iter()
+            .any(|recorded| recorded.commit == parent.as_str() && !recorded.branches.is_empty())
+    })
+}
+
+/// Every bookmark the checkout knows, local and remote, with what the entry
+/// says is not a branch (the trunk, the release names): the view a gate reads
+/// to learn which branches name a commit.
+struct Bookmarks<'a> {
+    tips: &'a knives::detect::BookmarkTips,
+    entry: &'a knives::config::RepoEntry,
+}
+
+impl Bookmarks<'_> {
+    /// The branch names at `commit`, local and remote refs alike
+    /// ([`knives::release_model::branch_names_at`]).
+    fn names_at(&self, commit: &knives::ids::CommitId) -> Vec<String> {
+        knives::release_model::branch_names_at(
+            self.tips,
+            self.entry.trunk(),
+            &self.entry.release_scheme(),
+            commit,
+        )
     }
 }
 
@@ -642,14 +685,13 @@ fn include_edit(
     // be. A commit no bookmark names is a bare commit no `start` ever named,
     // included on the caller's word.
     let tips = opened.bookmark_tips()?;
-    let mut names =
-        knives::release_model::branch_names_at(&tips, entry.trunk(), &entry.release_scheme(), &tip);
+    let bookmarks = Bookmarks { tips: &tips, entry };
+    let mut names = bookmarks.names_at(&tip);
     // The name the caller used answers first when it is one of them.
     if let Some(index) = names.iter().position(|name| name == target) {
         names.swap(0, index);
     }
-    let carried = carried_from_tips(&tips, entry.trunk(), &entry.release_scheme());
-    if context.refuse_unplaced_commit(&names, &tip, &carried)? {
+    if context.refuse_unplaced_commit(&names, &tip, &bookmarks)? {
         return Ok(EditOutcome::Settled(Exit::Incomplete));
     }
     let mut parents = release.parents.clone();
@@ -780,7 +822,9 @@ fn advance_edit(
         // to be a current member by, and the ledger alone answers for it.
         let held = carried.iter().find(|(name, _)| name == branch);
         let refusal = match held {
-            Some((_, tip)) => context.unplaced_refusal(branch, tip, &carried)?,
+            Some((_, tip)) => {
+                context.unplaced_refusal(branch, tip, &Bookmarks { tips: &tips, entry })?
+            }
             None => knives::placement::member_refusal(context.ledger, branch, false)?,
         };
         if let Some(refusal) = refusal {

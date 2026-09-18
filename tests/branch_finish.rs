@@ -26,6 +26,17 @@ use lab::{Lab, knives_start, placement_file, release_test_home};
 use serde_json::Value;
 use std::process::Command;
 
+/// The `demo` ledger's entries less the placement verdicts the fixture states
+/// for every carried branch: what the verb under test wrote.
+fn written_entries(home: &tempfile::TempDir) -> Vec<knives::ledger::Entry> {
+    knives::ledger::Ledger::at(home.path().join("ledger").join("demo"))
+        .entries()
+        .expect("read ledger")
+        .into_iter()
+        .filter(|entry| !entry.text.starts_with(knives::placement::NOTE_PREFIX))
+        .collect()
+}
+
 #[test]
 fn starting_and_finishing_a_branch_leaves_its_reason_in_the_ledger() {
     // Given: a managed fork and a config home
@@ -479,9 +490,7 @@ fn finishing_a_held_branch_without_a_successor_records_only_the_release() {
     let finished = knives_finish(&lab, &home, &["feat/alpha"]);
     assert!(finished.status.success());
 
-    let entries = knives::ledger::Ledger::at(home.path().join("ledger").join("demo"))
-        .entries()
-        .expect("read ledger");
+    let entries = written_entries(&home);
     assert_eq!(entries.len(), 1, "was: {entries:?}");
     assert_eq!(entries[0].text, "claim released");
 }
@@ -504,9 +513,7 @@ fn finishing_a_branch_nobody_held_records_no_release_that_never_happened() {
         String::from_utf8_lossy(&finished.stdout)
     );
 
-    let entries = knives::ledger::Ledger::at(home.path().join("ledger").join("demo"))
-        .entries()
-        .expect("read ledger");
+    let entries = written_entries(&home);
     assert!(
         entries.is_empty(),
         "a release that never happened: {entries:?}"
@@ -529,9 +536,7 @@ fn finishing_an_unheld_branch_still_records_the_supersession_it_did_record() {
     );
     assert!(finished.status.success());
 
-    let entries = knives::ledger::Ledger::at(home.path().join("ledger").join("demo"))
-        .entries()
-        .expect("read ledger");
+    let entries = written_entries(&home);
     assert_eq!(entries.len(), 1, "was: {entries:?}");
     assert_eq!(entries[0].text, "superseded by feat/replacement");
 }
@@ -584,9 +589,7 @@ fn stating_a_pull_request_and_a_dependency_leaves_both_statements_in_the_ledger(
 
     // Then: all three statements are in order, anchored, and the stated pull
     // request is stamped on the entries written while it was stated
-    let entries = knives::ledger::Ledger::at(home.path().join("ledger").join("demo"))
-        .entries()
-        .expect("read ledger");
+    let entries = written_entries(&home);
     let texts: Vec<&str> = entries.iter().map(|entry| entry.text.as_str()).collect();
     assert_eq!(
         texts,
@@ -652,9 +655,7 @@ fn a_fork_only_statement_is_recorded_as_the_decision_it_is() {
         .expect("run track");
     assert!(output.status.success());
 
-    let entries = knives::ledger::Ledger::at(home.path().join("ledger").join("demo"))
-        .entries()
-        .expect("read ledger");
+    let entries = written_entries(&home);
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].text, "stated as having no upstream pull request");
 }

@@ -538,6 +538,11 @@ pub fn lab_fork<'a>(
 /// Registry home plus a local consumer for release tests. The registry deliberately
 /// keeps no local consumer path: command helpers supply this checkout via
 /// `--consumer`, as production callers must.
+///
+/// Every branch `lab` carries at this point gets the `FORK` verdict `knives
+/// start --placement` would have recorded for it — the first cut composes them
+/// all and gates each on one. A test about a branch with no verdict makes that
+/// branch afterwards, or forgets the verdicts ([`forget_placements`]).
 pub fn release_test_home(lab: &Lab) -> (tempfile::TempDir, std::path::PathBuf) {
     release_test_home_pinned(
         lab,
@@ -572,6 +577,7 @@ pub fn release_test_home_pinned(
         consumer.display().to_string(),
     )
     .expect("write local consumer fixture path");
+    state_placements_for_carried(lab, &home);
     (home, consumer)
 }
 /// The commit `revision` resolves to in the work checkout right now.
@@ -986,6 +992,40 @@ pub fn file_at_revision(lab: &Lab, revision: &str, file: &str) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8(output.stdout).expect("utf-8 file content")
+}
+
+/// State a `FORK` verdict for every branch `lab` carries locally — every local
+/// bookmark but the trunk and the release names — as `knives start --placement`
+/// would have for each: what a first cut needs, since it composes them all.
+pub fn state_placements_for_carried(lab: &Lab, home: &tempfile::TempDir) {
+    let tips = knives::jj::Repo::open(&lab.work)
+        .expect("open for carried branches")
+        .bookmark_tips()
+        .expect("read bookmark tips");
+    for reference in tips.keys() {
+        let knives::ids::BookmarkRef::Local(branch) = reference else {
+            continue;
+        };
+        let name = branch.as_str();
+        if name == "main" || name.starts_with("release/") {
+            continue;
+        }
+        state_placement(lab, home, name, "FORK");
+    }
+}
+
+/// Remove every placement verdict from the `demo` ledger, leaving its events —
+/// the cut and edit records — in place: the shape of a release whose members
+/// predate the gate, for tests of what grandfathers them.
+pub fn forget_placements(home: &tempfile::TempDir) {
+    let ledger = home.path().join("ledger").join("demo");
+    for entry in std::fs::read_dir(&ledger).expect("read ledger dir") {
+        let path = entry.expect("ledger entry").path();
+        let text = std::fs::read_to_string(&path).expect("read ledger entry");
+        if text.contains(knives::placement::NOTE_PREFIX) {
+            std::fs::remove_file(&path).expect("remove placement note");
+        }
+    }
 }
 
 /// [`release_test_home`], with `release/2026-08-04` already cut from whatever

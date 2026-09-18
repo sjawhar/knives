@@ -334,12 +334,14 @@ fn include_refuses_a_new_member_without_a_verdict_and_a_consumer_one() {
 #[test]
 fn a_member_some_cut_recorded_is_grandfathered_into_include_and_advance() {
     // Given: a release cut from alpha and beta — the cut event records both as
-    // parents — with no verdict behind either, as every member predating the
-    // gate stands. Beta is then dropped.
+    // parents — and then every verdict forgotten, as every member predating
+    // the gate stands. Beta is then dropped.
     let lab = Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     lab.branch("feat/beta", "beta.txt", "beta\n");
     let (home, _consumer) = home_after_first_cut(&lab);
+    lab::forget_placements(&home);
+    assert!(recorded(&ledger(&home).entries().expect("read ledger"), "feat/beta").is_none());
     let dropped = knives_release(&lab, &home, &["drop", "feat/beta", "--why", "recut"]);
     assert!(dropped.status.success(), "{dropped:?}");
 
@@ -579,7 +581,14 @@ fn a_consumer_verdict_over_another_owners_claim_needs_force_like_any_take() {
         stderr.contains("`knives start feat/alpha --force --why \"…\"` to seize the claim"),
         "{stderr}"
     );
-    assert!(recorded(&ledger(&home).entries().expect("read ledger"), "feat/alpha").is_none());
+    // The fixture's FORK verdict stands; no CONSUMER was recorded over it.
+    let newest = || {
+        recorded(&ledger(&home).entries().expect("read ledger"), "feat/alpha")
+            .expect("the fixture's verdict")
+            .expect("reads")
+            .verdict
+    };
+    assert_eq!(newest(), Verdict::Fork);
 
     // And: --force without --why is the usual usage error, clap's own.
     let no_why = as_two(&["--force"]);
@@ -588,7 +597,7 @@ fn a_consumer_verdict_over_another_owners_claim_needs_force_like_any_take() {
         String::from_utf8_lossy(&no_why.stderr).contains("--why <WHY>"),
         "{no_why:?}"
     );
-    assert!(recorded(&ledger(&home).entries().expect("read ledger"), "feat/alpha").is_none());
+    assert_eq!(newest(), Verdict::Fork);
 
     // And: with --force --why the verdict is recorded.
     let forced = as_two(&["--force", "--why", "retire it"]);
@@ -674,6 +683,139 @@ fn a_newer_consumer_verdict_refuses_even_a_grandfathered_member() {
         format!("demo: {CONSUMER_REFUSAL}")
     );
     assert_eq!(release_parents(&lab, "release/2026-08-04"), before);
+}
+
+#[test]
+fn advance_refuses_a_never_composed_branch_forked_from_a_grown_members_released_commit() {
+    // Given: a release cut from alpha (the cut event names feat/alpha), alpha
+    // then grown past its released commit P, and an unverdicted feat/sneaky
+    // forked from P — the ordinary state of an active release between cuts.
+    // P now looks vacated, and sneaky succeeds it by ancestry.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let (home, _consumer) = home_after_first_cut(&lab);
+    let released = lab::commit_at(&lab, "feat/alpha");
+    lab::extend_branch(&lab, "feat/alpha", "alpha2.txt", "more alpha\n");
+    lab.jj_work(["new", released.as_str(), "-m", "sneaky"]);
+    std::fs::write(lab.work.join("sneaky.txt"), "x\n").expect("write sneaky");
+    lab.jj_work(["bookmark", "create", "feat/sneaky", "-r", "@"]);
+    lab.jj_work(["new"]);
+    let before = release_parents(&lab, "release/2026-08-04");
+
+    // When: sneaky is advanced by name, and on --from's word.
+    for args in [
+        &["advance", "feat/sneaky"][..],
+        &["advance", "feat/sneaky", "--from", released.as_str()][..],
+    ] {
+        let output = knives_release(&lab, &home, args);
+
+        // Then: the ledger's record names alpha for that parent, so the
+        // repository's guess is not consulted; sneaky is a newcomer, refused,
+        // and alpha's parent is not replaced.
+        assert_eq!(output.status.code(), Some(3), "{args:?}: {output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .contains(&missing_member_refusal("feat/sneaky")),
+            "{args:?}: {output:?}"
+        );
+        assert_eq!(
+            release_parents(&lab, "release/2026-08-04"),
+            before,
+            "{args:?}"
+        );
+    }
+
+    // And: alpha itself, the member that grew, still advances unasked.
+    let alpha = knives_release(&lab, &home, &["advance", "feat/alpha"]);
+    assert!(alpha.status.success(), "{alpha:?}");
+}
+
+#[test]
+fn advance_refuses_a_never_composed_branch_stacked_on_a_remote_only_member() {
+    // Given: a member held only as `pushed-fix@origin` — a colleague's pushed
+    // branch, included by that spelling — and an unverdicted feat/sneaky
+    // stacked on its tip. The remote ref holds the parent as a local one would.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let (home, _consumer) = home_after_first_cut(&lab);
+    lab.foreign_origin_branch("main@origin", "pushed-fix", "remote\n");
+    lab.fetch_work();
+    state_placement(&lab, &home, "pushed-fix", "FORK");
+    let included = knives_release(&lab, &home, &["include", "pushed-fix@origin"]);
+    assert!(included.status.success(), "{included:?}");
+    lab.jj_work(["new", "pushed-fix@origin", "-m", "sneaky"]);
+    std::fs::write(lab.work.join("sneaky.txt"), "x\n").expect("write sneaky");
+    lab.jj_work(["bookmark", "create", "feat/sneaky", "-r", "@"]);
+    lab.jj_work(["new"]);
+    let before = release_parents(&lab, "release/2026-08-04");
+
+    // When: sneaky is advanced by name, and by a bare advance.
+    for args in [&["advance", "feat/sneaky"][..], &["advance"][..]] {
+        let output = knives_release(&lab, &home, args);
+
+        // Then: refused exactly as the same shape on a local member is.
+        assert_eq!(output.status.code(), Some(3), "{args:?}: {output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .contains(&missing_member_refusal("feat/sneaky")),
+            "{args:?}: {output:?}"
+        );
+        assert_eq!(
+            release_parents(&lab, "release/2026-08-04"),
+            before,
+            "{args:?}"
+        );
+    }
+}
+
+#[test]
+fn the_first_cut_refuses_every_branch_without_a_verdict() {
+    // Given: two branches, one with a verdict, and no release yet.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let (home, _consumer) = release_test_home(&lab);
+    lab::forget_placements(&home);
+    state_placement(&lab, &home, "feat/alpha", "FORK");
+
+    // When: the first release is cut.
+    let refused = knives_release(&lab, &home, &["cut", "release/2026-08-04"]);
+
+    // Then: the branch without a verdict is named, nothing is cut.
+    assert_eq!(refused.status.code(), Some(3), "{refused:?}");
+    let stdout = String::from_utf8_lossy(&refused.stdout);
+    assert!(
+        stdout.contains(&missing_member_refusal("feat/beta")),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains(&missing_member_refusal("feat/alpha")),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("nothing cut; 1 of 2 branch(es) would enter the first release"),
+        "{stdout}"
+    );
+    assert!(
+        knives::jj::Repo::open(&lab.work)
+            .expect("open")
+            .local_bookmark_tip("release/2026-08-04")
+            .is_none(),
+        "a refused first cut created the release"
+    );
+
+    // And: a CONSUMER verdict refuses the same way; a FORK one lets it cut.
+    state_placement(&lab, &home, "feat/beta", "CONSUMER");
+    let consumer = knives_release(&lab, &home, &["cut", "release/2026-08-04"]);
+    assert_eq!(consumer.status.code(), Some(3), "{consumer:?}");
+    assert!(
+        String::from_utf8_lossy(&consumer.stdout).contains(CONSUMER_REFUSAL),
+        "{consumer:?}"
+    );
+    state_placement(&lab, &home, "feat/beta", "FORK");
+    let cut = knives_release(&lab, &home, &["cut", "release/2026-08-04"]);
+    assert!(cut.status.success(), "{cut:?}");
+    assert_eq!(release_parents(&lab, "release/2026-08-04").len(), 2);
 }
 
 #[test]

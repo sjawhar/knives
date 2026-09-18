@@ -1273,6 +1273,7 @@ fn fixed_scheme_registry(lab: &Lab) -> tempfile::TempDir {
         ),
     )
     .expect("write fixed-scheme registry");
+    lab::state_placements_for_carried(lab, &home);
     home
 }
 

@@ -388,6 +388,7 @@ fn a_bare_advance_under_the_fixed_scheme_ignores_the_release_bookmark() {
         consumer.path().display().to_string(),
     )
     .expect("write local consumer fixture path");
+    lab::state_placements_for_carried(&lab, &home);
     let first = knives_release(&lab, &home, &["cut"]);
     let released = Repo::open(&lab.work)
         .expect("open first fixed cut")

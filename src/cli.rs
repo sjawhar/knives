@@ -454,6 +454,11 @@ pub enum HookHarness {
 #[derive(Debug, Subcommand)]
 pub enum ReleaseAction {
     /// Name a new cut of the composition in hand, verbatim. Never pushes.
+    ///
+    /// The first cut, having no composition to carry, composes every carried
+    /// branch — and gates each on the placement verdict `knives start
+    /// --placement` recorded, exactly as `include` would; a branch without one,
+    /// or with a `CONSUMER` one, refuses the cut and is named.
     Cut {
         /// The dated release name. Omit it for a configured fixed release branch.
         name: Option<String>,
@@ -531,9 +536,9 @@ pub enum ReleaseAction {
     /// member's tip, or one admitted on `--from`'s word — is gated on its
     /// placement verdict exactly as an `include` is; every refused name is
     /// reported and nothing moves, since moving the rest would deliver a
-    /// composition nobody asked for. A member the release carries now — its
-    /// tip at a parent, or grown past a parent nothing else holds — is an
-    /// existing member whatever the ledger recorded of its cut.
+    /// composition nobody asked for. Where the ledger recorded nothing of a
+    /// parent, a member the release carries now — its tip at that parent, or
+    /// grown past it with no bookmark left holding it — is an existing member.
     Advance {
         /// Branches to advance. Empty means every member that has advanced.
         branches: Vec<String>,

@@ -116,10 +116,16 @@ pub(crate) fn run_release(
                 return Ok(Exit::Incomplete);
             }
             // The first cut composes every branch with no include to gate it,
-            // so the gate include applies runs here: a branch whose history
+            // so the gates include applies run here. A branch whose history
             // carries a merge would make the cut carry everything that merge
-            // carried, and the plan would report it the moment it existed.
+            // carried, and the plan would report it the moment it existed; and
+            // a branch without a placement verdict cannot enter a release by
+            // any verb — there is no release yet for the repository to
+            // grandfather it into, so the ledger alone answers.
             if refuse_stacked_first_cut(repo, &opened, entry, &carried)? {
+                return Ok(Exit::Incomplete);
+            }
+            if refuse_unplaced_first_cut(repo, &Ledger::for_repo(repo).entries()?, &carried)? {
                 return Ok(Exit::Incomplete);
             }
             let members = carried.clone();
@@ -721,6 +727,35 @@ fn refuse_stacked_first_cut(
         }
     }
     Ok(refused)
+}
+
+/// Refuse a first cut while any branch it would compose has no placement
+/// verdict behind it, or a `CONSUMER` one, naming each; `false` when every
+/// branch may enter.
+///
+/// The same gate `include` and `advance` apply to a first-time member. There
+/// is no release yet, so the repository has no membership to grandfather by;
+/// a branch some earlier composition recorded passes as it would there.
+fn refuse_unplaced_first_cut(
+    repo: &RepoName,
+    ledger: &[knives::ledger::Entry],
+    carried: &[(String, knives::ids::CommitId)],
+) -> anyhow::Result<bool> {
+    let mut refused = 0usize;
+    for (branch, _) in carried {
+        if let Some(refusal) = knives::placement::member_refusal(ledger, branch, false)? {
+            println!("{repo}: {refusal}");
+            refused += 1;
+        }
+    }
+    if refused > 0 {
+        println!(
+            "{repo}: nothing cut; {refused} of {} branch(es) would enter the first release \
+             without a placement verdict",
+            carried.len()
+        );
+    }
+    Ok(refused > 0)
 }
 
 /// Reap superseded dated cuts now that a newer one exists.
