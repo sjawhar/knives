@@ -978,6 +978,179 @@ fn an_upstream_pr_create_with_the_short_head_flag_is_gated() {
     assert!(!log.exists(), "gh ran despite the refusal");
 }
 
+#[test]
+fn a_stated_head_inside_a_jj_checkout_is_the_only_head_gh_receives() {
+    // Given: `@` on feat/eps (FORK) inside a fork checkout, and feat/gamma
+    // ruled UPSTREAM. gh takes the last head it is given, so a `--head
+    // <current>` added behind the stated one would open feat/eps upstream —
+    // the branch the gate never read.
+    let config_home = placement_gate_home();
+    record_placement(config_home.path(), "feat/eps", "FORK");
+    record_placement(config_home.path(), "feat/gamma", "UPSTREAM");
+    let lab = fork_checkout_of_the_registered_upstream();
+    lab.branch("feat/eps", "eps.txt", "eps\n");
+    lab.jj_work(["edit", "feat/eps"]);
+    let (dir, log) = fake_gh();
+    let helper_dir = fake_app_token();
+    let gitconfig = token_config(helper_dir.path(), "routed-a");
+    let run = |head: &[&str]| {
+        knives_cmd(helper_dir.path())
+            .args(["gh", "--", "pr", "create", "-R", "routed-a/upstream"])
+            .args(head)
+            .args(["--title", "t", "--body", "b"])
+            .current_dir(&lab.work)
+            .env("KNIVES_CONFIG_HOME", config_home.path())
+            .env("HOME", lab.temp_path())
+            .env("KNIVES_REAL_GH", dir.path().join("gh"))
+            .env("FAKE_GH_LOG", &log)
+            .env("PATH", helper_path(helper_dir.path()))
+            .env("GIT_CONFIG_GLOBAL", &gitconfig)
+            .output()
+            .expect("run knives gh")
+    };
+
+    // Then: with no head stated, the current bookmark is gated — and refused.
+    let current = run(&[]);
+    assert_eq!(current.status.code(), Some(2), "{current:?}");
+    assert!(
+        String::from_utf8_lossy(&current.stderr).contains("feat/eps has placement verdict FORK"),
+        "{current:?}"
+    );
+    assert!(!log.exists(), "gh ran despite the refusal");
+
+    // And: a stated head, in either spelling, is gated and is the one head gh
+    // receives; nothing is added behind it.
+    for head in [&["-H", "feat/gamma"][..], &["-Hfeat/gamma"][..]] {
+        let output = run(head);
+        assert!(output.status.success(), "{head:?}: {output:?}");
+        let recorded = fs::read_to_string(&log).expect("fake gh ran");
+        // The fake gh logs its argv first, then its environment (`GH_TOKEN=`,
+        // `BRANCH=`); only the argv is what gh was told.
+        let argv: Vec<&str> = recorded
+            .lines()
+            .take_while(|line| !line.starts_with("GH_TOKEN="))
+            .collect();
+        let heads: Vec<&str> = argv
+            .iter()
+            .enumerate()
+            .filter_map(|(index, argument)| match *argument {
+                "--head" | "-H" => argv.get(index + 1).copied(),
+                attached => attached
+                    .strip_prefix("--head=")
+                    .or_else(|| attached.strip_prefix("-H")),
+            })
+            .collect();
+        assert_eq!(heads, ["feat/gamma"], "{head:?}: {recorded}");
+        assert!(
+            !argv.contains(&"feat/eps"),
+            "the current bookmark reached gh: {head:?}: {recorded}"
+        );
+        fs::remove_file(&log).expect("reset the gh log");
+    }
+}
+
+#[test]
+fn a_pr_create_from_a_plain_git_clone_gates_the_checked_out_branch() {
+    // Given: a git-only clone (an agent's /tmp checkout, no jj) on an
+    // unverdicted branch; gh defaults the head to git's current branch.
+    let config_home = placement_gate_home();
+    let scratch = tempfile::tempdir().expect("scratch");
+    let clone = scratch.path().join("clone");
+    lab::git_repository(&clone, &[]);
+    fs::write(clone.join("README.md"), "seed\n").expect("write seed");
+    lab::git_commit_all(&clone, "seed");
+    let git = |args: &[&str]| {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(&clone)
+            .args(args)
+            .status()
+            .expect("run git");
+        assert!(status.success(), "git {args:?}");
+    };
+    git(&["checkout", "--quiet", "-b", "feat/none"]);
+    let (dir, log) = fake_gh();
+    let run = || {
+        knives_cmd(scratch.path())
+            .args([
+                "gh",
+                "--",
+                "pr",
+                "create",
+                "-R",
+                "routed-a/upstream",
+                "--title",
+                "t",
+                "--body",
+                "b",
+            ])
+            .current_dir(&clone)
+            .env("KNIVES_CONFIG_HOME", config_home.path())
+            .env("KNIVES_REAL_GH", dir.path().join("gh"))
+            .env("FAKE_GH_LOG", &log)
+            .output()
+            .expect("run knives gh")
+    };
+
+    // When: a pull request is opened toward the registered upstream with no
+    // head stated.
+    let output = run();
+
+    // Then: git's branch is the head, and it is refused by name.
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr).trim_end(),
+        format!(
+            "knives gh: {}",
+            knives::placement::missing_member_refusal("feat/none")
+        )
+    );
+    assert!(!log.exists(), "gh ran despite the refusal");
+
+    // And: with nothing checked out at all, nothing verifiable is let through.
+    git(&["checkout", "--quiet", "--detach"]);
+    let detached = run();
+    assert_eq!(detached.status.code(), Some(2), "{detached:?}");
+    let stderr = String::from_utf8_lossy(&detached.stderr);
+    assert!(
+        stderr.contains("needs a head branch to check its placement verdict"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("`--head <branch>`"), "{stderr}");
+    assert!(!log.exists(), "gh ran despite the refusal");
+}
+
+#[test]
+fn a_rest_pull_creation_by_absolute_url_or_colon_placeholders_is_gated() {
+    // gh sends an absolute URL verbatim and fills `:owner/:repo` from the
+    // current directory's base repository, exactly as it does `{owner}`.
+    let config_home = placement_gate_home();
+    record_placement(config_home.path(), "feat/gamma", "FORK");
+    let lab = fork_checkout_of_the_registered_upstream();
+    let (dir, log) = fake_gh();
+    let host = concat!("api.github", ".com");
+    let absolute = format!("https://{host}/repos/routed-a/upstream/pulls");
+    for path in [absolute.as_str(), "repos/:owner/:repo/pulls"] {
+        let output = knives_cmd(config_home.path())
+            .args(["gh", "--", "api", "-X", "POST", path])
+            .args(["-f", "title=x", "-f", "head=feat/gamma", "-f", "base=main"])
+            .current_dir(&lab.work)
+            .env("KNIVES_CONFIG_HOME", config_home.path())
+            .env("HOME", lab.temp_path())
+            .env("KNIVES_REAL_GH", dir.path().join("gh"))
+            .env("FAKE_GH_LOG", &log)
+            .output()
+            .expect("run knives gh");
+        assert_eq!(output.status.code(), Some(2), "{path}: {output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("has placement verdict FORK, not UPSTREAM"),
+            "{path}: {output:?}"
+        );
+        assert!(!log.exists(), "{path}: gh ran despite the refusal");
+    }
+}
+
 /// A lab checkout whose `upstream` remote is the registered fork's upstream,
 /// so commands run inside it resolve their target the way `gh` does from a
 /// fork checkout: to the upstream.
