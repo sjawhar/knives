@@ -30,11 +30,14 @@
 //! comparison rule folds `www.` off both sides and any subdomain of the
 //! registered host onto it (`remote_url::same_host`), a superset of gh's
 //! own fold. The checkout's remotes are git's effective URLs (`git remote
-//! -v`, `insteadOf` applied) with ssh aliases resolved as go-gh resolves
-//! them (`bind::remotes`). With no head stated the gate states `<fork-owner>:<branch in hand>`
+//! -v`, `insteadOf` applied, a push URL when the fetch URL names no
+//! repository) with ssh aliases resolved as go-gh resolves them
+//! (`bind::remotes`); gh's configured hosts are read as YAML keys at the
+//! map's own indent, and a shape knives cannot read is refused, never
+//! read as zero hosts. With no head stated the gate states `<fork-owner>:<branch in hand>`
 //! itself, so gh never resolves one knives did not read. A token is routed
 //! only for a canonical owner on a host that folds to the default host.
-// allow: SIZE_OK: 3478 lines - single passthrough pipeline; splitting would separate resolution steps that read as one procedure.
+// allow: SIZE_OK: 3534 lines - single passthrough pipeline; splitting would separate resolution steps that read as one procedure.
 use std::collections::BTreeMap;
 use std::io::Read as _;
 use std::os::unix::{
@@ -785,24 +788,27 @@ fn gh_config_dir() -> Option<PathBuf> {
 
 /// The hosts gh is configured for, in file order, with the file they came
 /// from: `config.yml`'s `hosts:` block when it has one, else `hosts.yml`'s
-/// top-level keys; none when neither file has any. Each is read as gh
-/// writes it: a YAML block map whose keys are `key:` lines with nothing
-/// after the colon (the value is the indented map below) — at column 0 in
-/// `hosts.yml`, one level under `hosts:` in `config.yml`. Any other shape —
-/// a flow map, a scalar after the colon, a list item, a line with no colon
-/// — or a file that cannot be read, is a refusal rather than a guess at
-/// what gh would do with it.
+/// top-level keys; none when neither file has any. Each is read as a YAML
+/// block map the way gh reads the shapes it writes and the hand-edited
+/// shapes it tolerates: a key is a `key:` line — surrounding whitespace, one
+/// layer of matching quotes and a trailing ` # comment` stripped — with
+/// nothing else after the colon (its value is the deeper-indented map
+/// below); the map's indent is its first content line's, at any level, and
+/// every key sits at that level. Any other shape — a flow map, a scalar
+/// after the colon, a list item, a line with no colon, a mixed indent (gh
+/// errors on that one too) — or a file that cannot be read, is a refusal
+/// rather than a guess at what gh would do with it; a block with content
+/// but no readable key is never zero hosts.
 fn configured_hosts() -> Result<(&'static str, Vec<String>), String> {
     let Some(dir) = gh_config_dir() else {
         return Ok(("hosts.yml", Vec::new()));
     };
     let general = read_gh_file(&dir.join("config.yml"))?;
     if let Some(block) = hosts_block_of_config(&general) {
-        return hosts_in(&dir.join("config.yml"), &block, "    ")
-            .map(|hosts| ("config.yml", hosts));
+        return hosts_in(&dir.join("config.yml"), &block).map(|hosts| ("config.yml", hosts));
     }
     let hosts = read_gh_file(&dir.join("hosts.yml"))?;
-    hosts_in(&dir.join("hosts.yml"), &hosts, "").map(|hosts| ("hosts.yml", hosts))
+    hosts_in(&dir.join("hosts.yml"), &hosts).map(|hosts| ("hosts.yml", hosts))
 }
 
 /// A gh configuration file's text, a leading UTF-8 byte-order mark dropped;
@@ -819,54 +825,104 @@ fn read_gh_file(path: &Path) -> Result<String, String> {
     }
 }
 
+/// A YAML line that carries no key: blank, a `#` comment, `---`, `{}`.
+fn is_yaml_noise(line: &str) -> bool {
+    let content = line.trim();
+    content.is_empty() || content.starts_with('#') || content == "---" || content == "{}"
+}
+
+/// The key a YAML block-map line states, when the line is `key:` and
+/// nothing else: surrounding whitespace, one layer of matching quotes and a
+/// trailing ` # comment` stripped. `None` for a line with a value after the
+/// colon, a list item, or no colon.
+fn yaml_key(line: &str) -> Option<&str> {
+    let content = line.trim();
+    // A ` #` outside quotes begins a comment; inside a quoted key it is text.
+    let content = match content.find(" #") {
+        Some(at) if content[..at].matches(['"', '\'']).count().is_multiple_of(2) => {
+            content[..at].trim_end()
+        }
+        _ => content,
+    };
+    let key = content.strip_suffix(':')?.trim_end();
+    let key = match (key.chars().next(), key.chars().last()) {
+        (Some('"'), Some('"')) | (Some('\''), Some('\'')) if key.len() >= 2 => {
+            &key[1..key.len() - 1]
+        }
+        _ => key,
+    };
+    (!key.is_empty() && !key.starts_with('-')).then_some(key)
+}
+
+/// Whether a column-0 line is a `hosts:` key with a value on the same line
+/// (`hosts: {…}`, `"hosts": ~`) — gh reads the value, knives refuses it.
+fn names_hosts_with_a_value(line: &str) -> bool {
+    let content = line.trim();
+    ["hosts:", "\"hosts\":", "'hosts':", "hosts :"]
+        .iter()
+        .any(|spelling| {
+            content.strip_prefix(spelling).is_some_and(|rest| {
+                let rest = rest.trim();
+                !rest.is_empty() && !rest.starts_with('#')
+            })
+        })
+}
+
 /// The lines under a column-0 `hosts:` key in `config.yml` — every line
-/// after it up to the next column-0 line — or `None` when the file has no
-/// such key. A `hosts:` line with a value on it (a flow map, `~`) is
-/// returned as that one line for the block reader to refuse.
+/// after it up to the next column-0 content line — or `None` when the file
+/// has no such key. The heading is matched as a YAML key (`"hosts":`,
+/// `hosts :`, `hosts:  # comment` are all it, as gh reads them); a `hosts:`
+/// heading with a value on the line (a flow map, `~`) is returned as that
+/// one line for the block reader to refuse.
 fn hosts_block_of_config(text: &str) -> Option<String> {
     let mut lines = text.lines();
-    let heading =
-        lines.find(|line| line.trim_end() == "hosts:" || line.trim_end().starts_with("hosts: "))?;
-    if heading.trim_end() != "hosts:" {
+    let heading = lines.find(|line| {
+        !line.starts_with(char::is_whitespace)
+            && (yaml_key(line) == Some("hosts") || names_hosts_with_a_value(line))
+    })?;
+    if yaml_key(heading) != Some("hosts") {
         return Some(heading.to_owned());
     }
     Some(
         lines
-            .take_while(|line| line.trim().is_empty() || line.starts_with(char::is_whitespace))
+            .take_while(|line| is_yaml_noise(line) || line.starts_with(char::is_whitespace))
             .collect::<Vec<_>>()
             .join("\n"),
     )
 }
 
-/// The host keys in `text`, a block map whose keys sit at `indent`: the
-/// `key:` lines at exactly that indentation; lines indented deeper (a
-/// host's own map), blank lines, comments, `---` and `{}` are skipped;
-/// anything else is refused naming `path` and the line.
-fn hosts_in(path: &Path, text: &str, indent: &str) -> Result<Vec<String>, String> {
+/// The host keys in `text`, a YAML block map at whatever indent its first
+/// content line sits at: the `key:` lines at exactly that indent; lines
+/// indented deeper (a host's own map) and noise are skipped; anything else
+/// — a key-less line, a shallower or otherwise inconsistent indent — is
+/// refused naming `path` and the line.
+fn hosts_in(path: &Path, text: &str) -> Result<Vec<String>, String> {
     let mut hosts = Vec::new();
+    let mut indent: Option<usize> = None;
+    // The indent a host's own map sits at, once seen: a line between the
+    // keys' level and it is a mixed indent (gh errors on it too).
+    let mut child: Option<usize> = None;
     for line in text.lines() {
-        let trimmed = line.trim_end();
-        if trimmed.trim().is_empty()
-            || trimmed.trim_start().starts_with('#')
-            || trimmed == "---"
-            || trimmed.trim() == "{}"
-        {
+        if is_yaml_noise(line) {
             continue;
         }
-        let Some(rest) = trimmed.strip_prefix(indent) else {
-            return Err(hosts_refusal(path, trimmed));
-        };
-        if rest.starts_with(char::is_whitespace) {
+        let depth = line.len() - line.trim_start().len();
+        let level = *indent.get_or_insert(depth);
+        if depth > level {
+            if hosts.is_empty() || child.is_some_and(|child| depth < child) {
+                return Err(hosts_refusal(path, line.trim_end()));
+            }
+            child.get_or_insert(depth);
             continue;
         }
-        let key = rest
-            .strip_suffix(':')
-            .map(|key| key.trim().trim_matches(['"', '\'']))
-            .filter(|key| !key.is_empty());
-        let Some(key) = key else {
-            return Err(hosts_refusal(path, trimmed));
+        if depth < level {
+            return Err(hosts_refusal(path, line.trim_end()));
+        }
+        let Some(key) = yaml_key(line) else {
+            return Err(hosts_refusal(path, line.trim_end()));
         };
         hosts.push(key.to_owned());
+        child = None;
     }
     Ok(hosts)
 }

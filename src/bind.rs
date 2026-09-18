@@ -303,21 +303,25 @@ pub(crate) fn git(directory: &Path) -> std::process::Command {
 
 /// Remotes of the repository rooted at `root`, as git and gh use them.
 ///
-/// `git -C root remote -v`, the fetch URL of each remote: git's *effective*
-/// URL, with every `url.<base>.insteadOf` rewrite applied — the URL gh reads
-/// (`git remote -v` is gh's own remote listing) and the one git would fetch
-/// from. The raw `remote.<name>.url` value would call a remote spelled
-/// through an alias another repository. Configuration reaches the read the
-/// way it reaches git: the repository's own file, the user's and the
-/// system's; `GIT_CONFIG_*` environment overrides do not (every git read
-/// knives makes strips them, see [`git_command`]). An ssh URL's host is then
-/// translated the way go-gh's ssh translator translates it — `ssh -G <host>`
-/// and its `hostname` answer — so an ssh-config alias names the host it
-/// stands for; without `ssh` on PATH, or on any failure, the host stays as
-/// written (gh's own fallback). For a linked worktree the configuration is
-/// the common repository's, so a jj workspace of a colocated checkout reports
-/// the checkout's remotes. A root with no `.git` is not a repository knives
-/// reads.
+/// `git -C root remote -v`: git's *effective* URLs, with every
+/// `url.<base>.insteadOf` rewrite applied — the listing gh reads — and the
+/// one git would fetch from. The raw `remote.<name>.url` value would call a
+/// remote spelled through an alias another repository. Each remote is read
+/// the way gh's `TranslateRemotes` reads it: its fetch URL when that names a
+/// repository (a host and an `owner/repo` path), else the last of its push
+/// URLs that does — a push-only remote (`pushurl` with no `url`), or a fetch
+/// URL that is a path or a one-segment URL, is the repository its push URL
+/// names (measured against gh 2.98.0) — else the fetch URL as written.
+/// Configuration reaches the read the way it reaches git: the repository's
+/// own file, the user's and the system's; `GIT_CONFIG_*` environment
+/// overrides do not (every git read knives makes strips them, see
+/// [`git_command`]). An ssh URL's host is then translated the way go-gh's
+/// ssh translator translates it — `ssh -G <host>` and its `hostname` answer
+/// — so an ssh-config alias names the host it stands for; without `ssh` on
+/// PATH, or on any failure, the host stays as written (gh's own fallback).
+/// For a linked worktree the configuration is the common repository's, so a
+/// jj workspace of a colocated checkout reports the checkout's remotes. A
+/// root with no `.git` is not a repository knives reads.
 pub fn remotes(root: &Path) -> Result<BTreeMap<String, String>, BindError> {
     let failure = |detail: String| BindError::RemotesUnreadable {
         root: root.to_owned(),
@@ -330,20 +334,48 @@ pub fn remotes(root: &Path) -> Result<BTreeMap<String, String>, BindError> {
     if !output.status.success() {
         return Err(failure(error_line(&output.stderr)));
     }
+    // `<name>\t<url> (fetch)` / `<name>\t<url> (push)`, one line per URL; a
+    // remote with no fetch URL is printed as `<name>\t` with no marker.
+    let mut fetch: BTreeMap<String, String> = BTreeMap::new();
+    let mut push: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let (name, rest) = line
+            .split_once('\t')
+            .ok_or_else(|| failure(format!("unparseable remote line {line:?}")))?;
+        if let Some(url) = rest.strip_suffix(" (push)") {
+            push.entry(name.to_owned())
+                .or_default()
+                .push(url.trim().to_owned());
+        } else if let Some(url) = rest.strip_suffix(" (fetch)") {
+            fetch
+                .entry(name.to_owned())
+                .or_insert_with(|| url.trim().to_owned());
+        } else if rest.trim().is_empty() {
+            fetch.entry(name.to_owned()).or_default();
+        } else {
+            return Err(failure(format!("unparseable remote line {line:?}")));
+        }
+    }
     let mut aliases = BTreeMap::new();
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| line.strip_suffix(" (fetch)"))
-        .map(|line| {
-            // `<name>\t<url> (fetch)`; a remote with no URL configured is
-            // listed by git with an empty URL, which stays empty.
-            let (name, url) = line
-                .split_once('\t')
-                .ok_or_else(|| failure(format!("unparseable remote line {line:?}")))?;
-            let url = crate::remote_url::with_ssh_alias_resolved(url.trim(), &mut aliases);
-            Ok((name.to_owned(), url))
+    let mut resolved = |url: &str| crate::remote_url::with_ssh_alias_resolved(url, &mut aliases);
+    Ok(fetch
+        .into_iter()
+        .map(|(name, fetch_url)| {
+            let fetch_url = resolved(&fetch_url);
+            let url = if crate::remote_url::remote_slug(&fetch_url).is_some() {
+                fetch_url
+            } else {
+                push.get(&name)
+                    .into_iter()
+                    .flatten()
+                    .rev()
+                    .map(|push_url| resolved(push_url))
+                    .find(|push_url| crate::remote_url::remote_slug(push_url).is_some())
+                    .unwrap_or(fetch_url)
+            };
+            (name, url)
         })
-        .collect()
+        .collect())
 }
 
 /// The line of git's stderr that explains a failure: the first that is not a
