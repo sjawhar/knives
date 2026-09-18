@@ -839,9 +839,10 @@ fn preferred_remote_url(
 /// How an invocation would open a pull request, and on which head.
 #[derive(Debug, PartialEq, Eq)]
 enum PullOpening {
-    /// `gh pr create`; the head is `--head`'s value when given.
+    /// `gh pr create`; the head is `--head`/`-H`'s value when given.
     Create { head: Option<String> },
-    /// `gh api repos/{owner}/{repo}/pulls` with a body: REST creation.
+    /// `gh api repos/{owner}/{repo}/pulls` with a body: REST creation. The
+    /// owner and repo are as written, gh placeholders (`{owner}`) included.
     Rest {
         owner: String,
         repo: String,
@@ -858,18 +859,23 @@ enum PullOpening {
 /// deliberately narrow: `pr create`, the REST endpoint that creates one, and
 /// the GraphQL mutation that does. Comments, reviews and edits on a pull
 /// request that already exists are maintenance of work already open and pass
-/// as before.
+/// as before — `createPullRequestReview` is one of those, so the mutation name
+/// is matched as a token, not a substring. A GraphQL document gh reads from a
+/// file (`--input <file>`, `-f query=@file`) is not opened: only the arguments
+/// are read.
 fn pull_opening(args: &[String]) -> Option<PullOpening> {
     if let Some((subcommand, _)) = pr_subcommand(args) {
         return (subcommand == "create").then(|| PullOpening::Create {
-            head: flag_value(args, "--head").map(|head| strip_head_owner(&head).to_owned()),
+            head: flag_value(args, "--head")
+                .or_else(|| flag_value(args, "-H"))
+                .map(|head| strip_head_owner(&head).to_owned()),
         });
     }
     if args.first().map(String::as_str) != Some("api") {
         return None;
     }
     let joined = args.join(" ");
-    if joined.contains("createPullRequest") {
+    if names_mutation(&joined, "createPullRequest") {
         return Some(PullOpening::Graphql {
             head: field_argument_any(args, "headRefName"),
         });
@@ -895,24 +901,37 @@ fn pull_opening(args: &[String]) -> Option<PullOpening> {
     if !creates {
         return None;
     }
-    let path = args
-        .iter()
-        .skip(1)
-        .find(|argument| !argument.starts_with('-'))?;
-    let bare = path.strip_prefix('/').unwrap_or(path);
-    let bare = bare.split('?').next().unwrap_or(bare);
-    let mut segments = bare.split('/');
-    if segments.next() != Some("repos") {
-        return None;
-    }
-    let (owner, repo) = (segments.next()?, segments.next()?);
-    if segments.next() != Some("pulls") || segments.next().is_some() {
-        return None;
-    }
+    // The endpoint is whichever non-dash argument names a repository path;
+    // flags with values (`-X POST`, `-H 'Accept: …'`) may precede it, as
+    // `owner_from_api_args` already allows for.
+    let (owner, repo) = args.iter().skip(1).find_map(|argument| {
+        if argument.starts_with('-') {
+            return None;
+        }
+        let bare = argument.strip_prefix('/').unwrap_or(argument);
+        let bare = bare.split('?').next().unwrap_or(bare);
+        let mut segments = bare.strip_prefix("repos/")?.split('/');
+        let (owner, repo) = (segments.next()?, segments.next()?);
+        (segments.next() == Some("pulls") && segments.next().is_none()).then_some((owner, repo))
+    })?;
     Some(PullOpening::Rest {
         owner: owner.to_owned(),
         repo: repo.to_owned(),
         head: field_argument_any(args, "head").map(|head| strip_head_owner(&head).to_owned()),
+    })
+}
+
+/// Whether `text` names the GraphQL mutation `name` as a token: followed by
+/// its argument list, its selection set, or whitespace before either — so
+/// `createPullRequest(` matches and `createPullRequestReview(` does not.
+fn names_mutation(text: &str, name: &str) -> bool {
+    text.match_indices(name).any(|(at, _)| {
+        let before = text.get(..at).and_then(|head| head.chars().next_back());
+        let after = text
+            .get(at + name.len()..)
+            .and_then(|tail| tail.chars().next());
+        !before.is_some_and(|c| c.is_alphanumeric() || c == '_')
+            && after.is_none_or(|c| matches!(c, '(' | '{') || c.is_whitespace())
     })
 }
 
@@ -978,13 +997,18 @@ fn strip_head_owner(head: &str) -> &str {
 /// --placement`), and only `UPSTREAM` says upstream wants the change. Pull
 /// requests on the fork's own origin — a review branch, a release — are not
 /// upstream's business and pass. A registry that does not load leaves nothing
-/// to gate against, as it leaves nothing to route a token by.
+/// to gate against, as it leaves nothing to route a token by; since the gate
+/// guards policy, stderr says so once and the command passes through.
 fn upstream_pull_refusal(args: &[String], cwd: &Path) -> anyhow::Result<Option<String>> {
     let Some(opening) = pull_opening(args) else {
         return Ok(None);
     };
-    let Ok(registry) = crate::config::load(&crate::config::default_config_path()) else {
-        return Ok(None);
+    let registry = match crate::config::load(&crate::config::default_config_path()) {
+        Ok(registry) => registry,
+        Err(error) => {
+            eprintln!("knives: placement gate skipped: {error:#}");
+            return Ok(None);
+        }
     };
     let (repo, head, stated_head_required) = match opening {
         PullOpening::Create { head } => {
@@ -997,7 +1021,15 @@ fn upstream_pull_refusal(args: &[String], cwd: &Path) -> anyhow::Result<Option<S
             (repo, head, false)
         }
         PullOpening::Rest { owner, repo, head } => {
-            let Some(target) = url_from_spec(&format!("{owner}/{repo}")) else {
+            // `repos/{owner}/{repo}/pulls` is gh's own spelling for "the
+            // current directory's base repository", which in a fork checkout
+            // is the upstream; resolved the way `pr create` without `-R` is.
+            let target = if owner.contains('{') || repo.contains('{') {
+                resolve_target_url(args, cwd)
+            } else {
+                url_from_spec(&format!("{owner}/{repo}"))
+            };
+            let Some(target) = target else {
                 return Ok(None);
             };
             let Some(repo) = upstream_of(&registry, &target) else {
@@ -1857,6 +1889,160 @@ mod tests {
         assert!(!absent);
         assert!(separate);
         assert!(inline);
+    }
+
+    #[test]
+    fn a_rest_pull_creation_is_seen_whatever_precedes_its_path() {
+        // `gh api -X POST repos/o/r/pulls` is the documented spelling; a valued
+        // flag before the path must not be taken for the path.
+        let args = |arguments: &[&str]| {
+            arguments
+                .iter()
+                .map(|argument| (*argument).to_owned())
+                .collect::<Vec<_>>()
+        };
+        let rest = Some(PullOpening::Rest {
+            owner: "o".to_owned(),
+            repo: "r".to_owned(),
+            head: Some("feat/x".to_owned()),
+        });
+        for argv in [
+            vec!["api", "repos/o/r/pulls", "-f", "head=feat/x"],
+            vec!["api", "-X", "POST", "repos/o/r/pulls", "-f", "head=feat/x"],
+            vec![
+                "api",
+                "--method",
+                "POST",
+                "repos/o/r/pulls",
+                "-f",
+                "head=feat/x",
+            ],
+            vec![
+                "api",
+                "-H",
+                "Accept: x",
+                "repos/o/r/pulls",
+                "-f",
+                "head=feat/x",
+            ],
+            vec![
+                "api",
+                "--hostname",
+                "example.test",
+                "/repos/o/r/pulls",
+                "-f",
+                "head=feat/x",
+            ],
+            vec![
+                "api",
+                "-X",
+                "POST",
+                "repos/o/r/pulls",
+                "--input",
+                "pr.json",
+                "-f",
+                "head=feat/x",
+            ],
+        ] {
+            assert_eq!(pull_opening(&args(&argv)), rest, "{argv:?}");
+        }
+        // A GET lists; a path that is not the pulls endpoint opens nothing.
+        assert_eq!(pull_opening(&args(&["api", "repos/o/r/pulls"])), None);
+        assert_eq!(
+            pull_opening(&args(&[
+                "api",
+                "-X",
+                "GET",
+                "repos/o/r/pulls",
+                "-f",
+                "state=open"
+            ])),
+            None
+        );
+        assert_eq!(
+            pull_opening(&args(&[
+                "api",
+                "-X",
+                "POST",
+                "repos/o/r/pulls/1/comments",
+                "-f",
+                "body=hi"
+            ])),
+            None
+        );
+        // gh's placeholders are carried as written for the caller to resolve.
+        assert_eq!(
+            pull_opening(&args(&["api", "-X", "POST", "repos/{owner}/{repo}/pulls"])),
+            Some(PullOpening::Rest {
+                owner: "{owner}".to_owned(),
+                repo: "{repo}".to_owned(),
+                head: None,
+            })
+        );
+    }
+
+    #[test]
+    fn pr_create_reads_the_short_head_flag_too() {
+        let args = |arguments: &[&str]| {
+            arguments
+                .iter()
+                .map(|argument| (*argument).to_owned())
+                .collect::<Vec<_>>()
+        };
+        let head = Some(PullOpening::Create {
+            head: Some("feat/x".to_owned()),
+        });
+        assert_eq!(pull_opening(&args(&["pr", "create", "-H", "feat/x"])), head);
+        assert_eq!(
+            pull_opening(&args(&["pr", "create", "--head", "o:feat/x"])),
+            head
+        );
+        assert_eq!(
+            pull_opening(&args(&["pr", "create", "--head=feat/x"])),
+            head
+        );
+        assert_eq!(
+            pull_opening(&args(&["pr", "create"])),
+            Some(PullOpening::Create { head: None })
+        );
+        assert_eq!(pull_opening(&args(&["pr", "view", "-H", "feat/x"])), None);
+    }
+
+    #[test]
+    fn the_create_mutation_is_matched_as_a_token_not_a_prefix() {
+        // Reviews and review threads are maintenance of an open pull request
+        // and pass; only the mutation that opens one is caught.
+        let args = |arguments: &[&str]| {
+            arguments
+                .iter()
+                .map(|argument| (*argument).to_owned())
+                .collect::<Vec<_>>()
+        };
+        for query in [
+            "mutation { createPullRequest(input:{repositoryId:\"R\",headRefName:\"feat/x\"}) { clientMutationId } }",
+            "mutation{createPullRequest (input:$i){clientMutationId}}",
+            "mutation { createPullRequest {\n clientMutationId } }",
+            "mutation Open { createPullRequest\n(input: $input) { clientMutationId } }",
+        ] {
+            assert!(
+                matches!(
+                    pull_opening(&args(&["api", "graphql", "-f", &format!("query={query}")])),
+                    Some(PullOpening::Graphql { .. })
+                ),
+                "{query}"
+            );
+        }
+        for query in [
+            "mutation { createPullRequestReview(input:{pullRequestId:\"P\",event:COMMENT,body:\"hi\"}) { clientMutationId } }",
+            "mutation { createPullRequestReviewThread(input:{pullRequestId:\"P\",body:\"hi\"}) { clientMutationId } }",
+            "mutation { createPullRequestReviewComment(input:{pullRequestReviewId:\"V\",body:\"hi\"}) { clientMutationId } }",
+        ] {
+            assert_eq!(
+                pull_opening(&args(&["api", "graphql", "-f", &format!("query={query}")])),
+                None,
+                "{query}"
+            );
+        }
     }
 
     #[test]
