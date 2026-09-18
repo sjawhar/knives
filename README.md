@@ -293,8 +293,10 @@ verdict is not `UPSTREAM`; the head is read once (`--head`, `-H`, attached or no
 one head gh receives, and outside jj git's checked-out branch is the head gh would use. A
 GraphQL document read from a file is not inspected. Branches that predate the gate are
 grandfathered as members on either the ledger's evidence (a branch any recorded cut or edit
-names as a parent) or the repository's (a branch the release in hand carries now — at a
-parent, or grown past a parent nothing else holds): they recut and advance unasked. The gate
+names as a parent) or, where the ledger has none, the repository's (a branch the release in
+hand carries now — at a parent, or grown past a parent no record names and no bookmark
+holds): they recut and advance unasked. The first cut gates every branch it composes the same
+way; a repository's first release takes no branch without a verdict. The gate
 reads the bookmarks at the commit being included, so `feat/x`, `feat/x@origin` and `feat/x`'s
 tip sha are all `feat/x`; a commit no bookmark names is included on your word. Only new
 inclusions and upstream pull requests are gated.
