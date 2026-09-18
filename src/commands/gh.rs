@@ -14,20 +14,23 @@
 //!
 //! What those readings are compared against is never normalised the way gh,
 //! go-gh or GitHub would normalise it (see `gh_canon`): a repository is read
-//! only as `OWNER/REPO` or `HOST/OWNER/REPO` (two parts on `GH_HOST`, else
-//! the default host), a head only as `<fork-owner>:<branch>` — gh reads a
-//! bare branch as the base repository's own — an endpoint only as
-//! `repos/OWNER/REPO/pulls` on the host the request goes to (an absolute
-//! URL's own, else `--hostname`, else the default), and every other spelling
-//! toward a registered upstream — a URL of any form, an empty or second
-//! `-R`, a bare or another owner's head, a percent-escape, a marker carrying
-//! a host, a `--hostname` disagreeing with the URL — is refused with the
-//! canonical spelling. The one comparison rule folds any subdomain of the
-//! registered host onto it (`remote_url::same_host`), a superset of gh's own
-//! fold. With no head stated the gate states `<fork-owner>:<branch in hand>`
+//! only as `OWNER/REPO` or `HOST/OWNER/REPO` (two parts on gh's default
+//! host: `GH_HOST`, else the one host in `hosts.yml`, else github.com), a
+//! head only as `<fork-owner>:<branch>` — gh reads a bare branch as the
+//! base repository's own — an endpoint only as `repos/OWNER/REPO/pulls` on
+//! the host the request goes to (an absolute URL's own, else `--hostname`,
+//! else the default) with its body in `-f` fields (with `--input` gh moves
+//! the fields to the query string and knives does not read the file), and
+//! every other spelling toward a registered upstream — a URL of any form,
+//! an empty or second `-R`, a bare or another owner's head, a percent-
+//! escape, a marker carrying a host, a `--hostname` disagreeing with the
+//! URL, a body file — is refused with the canonical spelling. The one
+//! comparison rule folds `www.` off both sides and any subdomain of the
+//! registered host onto it (`remote_url::same_host`), a superset of gh's
+//! own fold. With no head stated the gate states `<fork-owner>:<branch in hand>`
 //! itself, so gh never resolves one knives did not read. A token is routed
 //! only for a canonical owner on a host that folds to the default host.
-// allow: SIZE_OK: 3236 lines - single passthrough pipeline; splitting would separate resolution steps that read as one procedure.
+// allow: SIZE_OK: 3383 lines - single passthrough pipeline; splitting would separate resolution steps that read as one procedure.
 use std::collections::BTreeMap;
 use std::io::Read as _;
 use std::os::unix::{
@@ -642,7 +645,7 @@ pub(crate) fn owner_from_api_args(invocation: &GhInvocation) -> Result<Option<St
 
 /// The GraphQL text a `gh api` call carries in its arguments: every field
 /// value, in order (`-f query=…` is where a document travels). A document gh
-/// reads from a file (`--input`, `-F query=@file`) is not opened.
+/// reads from a file (`--input`, `-F query=@file`; `-f` expands no `@file`) is not opened.
 fn graphql_text(invocation: &GhInvocation) -> String {
     invocation
         .flags
@@ -706,23 +709,103 @@ fn api_endpoint(invocation: &GhInvocation) -> Option<ApiPath<'_>> {
     })
 }
 
-/// The host gh addresses when none is stated: `GH_HOST` when set and
-/// non-empty (gh's own override, read verbatim — a literal, nothing to
-/// normalise), else the default host. A `GH_HOST` outside the grammar
-/// knives compares is refused rather than read.
+/// The host gh addresses when none is stated, read as go-gh's `DefaultHost`
+/// reads it (`pkg/auth/auth.go`): `GH_HOST` when set and non-empty (read
+/// verbatim — a literal, nothing to normalise); else the one host in gh's
+/// `hosts.yml` when it holds exactly one; else the default host — with
+/// several hosts configured gh uses the default host whichever they are
+/// (measured: `ghe.test` + `other.test` → github.com). A host outside the
+/// grammar knives compares is refused rather than read, as is a `hosts.yml`
+/// knives cannot read — gh itself errors on invalid YAML there, and knives
+/// refuses rather than reproduces what gh would do with any other shape.
 fn default_host() -> Result<String, String> {
-    match std::env::var("GH_HOST") {
-        Ok(host) if !host.is_empty() => gh_canon::is_segment(&host)
-            .then(|| host.clone())
-            .ok_or_else(|| {
-                format!(
-                    "GH_HOST {host:?} is not a host knives compares (one segment of [{}]): state \
-                     it that way, or unset it",
-                    gh_canon::SEGMENT_CHARS
-                )
-            }),
+    if let Ok(host) = std::env::var("GH_HOST")
+        && !host.is_empty()
+    {
+        return canonical_host("GH_HOST", &host);
+    }
+    let hosts = configured_hosts()?;
+    match hosts.as_slice() {
+        [host] => canonical_host("the one host in gh's hosts.yml", host),
         _ => Ok(DEFAULT_HOST.to_owned()),
     }
+}
+
+/// `host` when it is one canonical segment; the refusal naming `source`
+/// otherwise.
+fn canonical_host(source: &str, host: &str) -> Result<String, String> {
+    gh_canon::is_segment(host)
+        .then(|| host.to_owned())
+        .ok_or_else(|| {
+            format!(
+                "{source}, {host:?}, is not a host knives compares (one segment of [{}]): state it \
+                 that way, or state the host in the command (-R HOST/OWNER/REPO, --hostname)",
+                gh_canon::SEGMENT_CHARS
+            )
+        })
+}
+
+/// gh's configuration directory, by go-gh's `ConfigDir` precedence
+/// (`pkg/config/config.go`): `GH_CONFIG_DIR`, `$XDG_CONFIG_HOME/gh`,
+/// `$HOME/.config/gh` (the Windows `AppData` step has no Unix reading).
+fn gh_config_dir() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("GH_CONFIG_DIR").filter(|dir| !dir.is_empty()) {
+        return Some(PathBuf::from(dir));
+    }
+    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").filter(|dir| !dir.is_empty()) {
+        return Some(PathBuf::from(xdg).join("gh"));
+    }
+    std::env::home_dir().map(|home| home.join(".config").join("gh"))
+}
+
+/// The top-level keys of gh's `hosts.yml` — the hosts gh is logged in to —
+/// in file order; none when the file is absent or empty. The file is read
+/// as gh writes it: a YAML map whose keys sit at column 0, each a `key:`
+/// line with nothing after the colon (its value is the indented map below).
+/// Any other shape — a scalar after the colon, a list item, a line with no
+/// colon — or a file that cannot be read, is a refusal rather than a guess
+/// at what gh would do with it (gh itself errors on invalid YAML).
+fn configured_hosts() -> Result<Vec<String>, String> {
+    let Some(path) = gh_config_dir().map(|dir| dir.join("hosts.yml")) else {
+        return Ok(Vec::new());
+    };
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(format!(
+                "gh's {} cannot be read ({error}), so the default host cannot be told: state the \
+                 host in the command (-R HOST/OWNER/REPO, --hostname) or set GH_HOST",
+                path.display()
+            ));
+        }
+    };
+    let mut hosts = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim_end();
+        if trimmed.is_empty()
+            || trimmed.starts_with('#')
+            || trimmed.starts_with("---")
+            || trimmed == "{}"
+            || trimmed.starts_with(char::is_whitespace)
+        {
+            continue;
+        }
+        let key = trimmed
+            .strip_suffix(':')
+            .map(|key| key.trim().trim_matches(['"', '\'']))
+            .filter(|key| !key.is_empty() && !key.contains(':'));
+        let Some(key) = key else {
+            return Err(format!(
+                "gh's {} is not a hosts map knives can read (line {trimmed:?}), so the default host \
+                 cannot be told: state the host in the command (-R HOST/OWNER/REPO, --hostname) or \
+                 set GH_HOST",
+                path.display()
+            ));
+        };
+        hosts.push(key.to_owned());
+    }
+    Ok(hosts)
 }
 
 /// `path` less its query string and any `#fragment`.
@@ -1053,7 +1136,7 @@ enum PullOpening {
 /// request that already exists are maintenance of work already open and pass
 /// as before — `createPullRequestReview` is one of those, so the mutation name
 /// is matched as a token, not a substring. A GraphQL document gh reads from a
-/// file (`--input <file>`, `-f query=@file`) is not opened: only the arguments
+/// file (`--input <file>`, `-F query=@file`) is not opened: only the arguments
 /// are read.
 fn pull_opening(invocation: &GhInvocation) -> Option<PullOpening> {
     // Help in effect makes gh print help and run nothing at all — `pr
@@ -1163,6 +1246,18 @@ fn rest_opening(
     let [owner, name, "pulls"] = segments.as_slice() else {
         return None;
     };
+    // With `--input`, gh takes the body from the file and puts every `-f`/`-F`
+    // field on the query string (api.go:369-376); GitHub reads `head` for
+    // this endpoint from the body only. knives does not read bodies, so a
+    // creation whose body travels in a file is refused whatever fields sit
+    // beside it — a `-f head=` there certifies nothing GitHub will use.
+    if invocation.has("input") {
+        return Some(PullOpening::Unreadable(format!(
+            "a POST to {path:?} takes its body from --input, which knives does not read (gh puts \
+             -f/-F fields on the query string, not in the body): state the head as -f \
+             head=<fork-owner>:<branch> and the other fields as -f, without --input"
+        )));
+    }
     let heads = invocation
         .fields("head")
         .map(str::to_owned)
@@ -1384,7 +1479,9 @@ fn opening_subject(
             }
         }
         PullOpening::Rest { repo: at, heads } => {
-            let fork = Fork::of(registry, &at.url()).ok_or(Early::Pass)?;
+            let fork = Fork::of(registry, &at.url())
+                .ok_or(Early::Pass)?
+                .map_err(Early::Refuse)?;
             let branch = rest_head(&fork, &heads)?;
             Subject {
                 repo: fork.name,
@@ -1437,7 +1534,9 @@ fn upstream_target(
     cwd: &Path,
 ) -> Result<Fork, Early> {
     match target(invocation, cwd) {
-        Target::Repo(url) => Fork::of(registry, &url).ok_or(Early::Pass),
+        Target::Repo(url) => Fork::of(registry, &url)
+            .ok_or(Early::Pass)?
+            .map_err(Early::Refuse),
         Target::Absent => Err(Early::Pass),
         Target::Unreadable(refusal) => Err(Early::Refuse(refusal)),
     }
@@ -1452,15 +1551,34 @@ struct Fork {
 }
 
 impl Fork {
-    /// The registered fork whose `upstream` is `target`, if any. A registry
-    /// entry whose origin names no owner is a registry problem, surfaced as
-    /// a fork with an empty owner that no head can match.
-    fn of(registry: &crate::config::Registry, target: &str) -> Option<Self> {
+    /// The registered fork whose `upstream` is `target`: `None` when none is,
+    /// `Some(Err)` when one is but its `origin` names no owner knives can
+    /// state a head with — the registry is trusted configuration, but a head
+    /// qualified with an empty or non-canonical owner is one gh sends as the
+    /// upstream's own branch, so the entry is refused with its remedy rather
+    /// than read.
+    fn of(registry: &crate::config::Registry, target: &str) -> Option<Result<Self, String>> {
         let (name, entry) = crate::bind::entry_for(registry, target)?;
-        let owner = crate::remote_url::url_owner(entry.remote(crate::config::Role::Origin))
-            .unwrap_or_default()
-            .to_owned();
-        Some(Self { name, owner })
+        let origin = entry.remote(crate::config::Role::Origin);
+        // The owner is read through the identity reader (`remote_slug`: a
+        // host and an `owner/repo` path in any URL spelling `same_remote`
+        // reads), so a spelling the registry binds by never names a
+        // different owner here; a filesystem or `file://` origin names none.
+        let owner = crate::remote_url::remote_slug(origin)
+            .and_then(|slug| slug.split_once('/'))
+            .map(|(owner, _)| owner)
+            .filter(|owner| gh_canon::is_segment(owner));
+        let Some(owner) = owner else {
+            return Some(Err(format!(
+                "the registry's origin for {name} ({origin}) names no owner knives can read: state \
+                 it as https://<host>/OWNER/REPO in {}",
+                crate::config::default_config_path().display()
+            )));
+        };
+        Some(Ok(Self {
+            name,
+            owner: owner.to_owned(),
+        }))
     }
 }
 
@@ -1524,9 +1642,8 @@ fn one_head(fork: &Fork, heads: &[String], spelling: &str) -> Result<Option<Stri
 /// The fork's branch a REST creation states in its `head` field, by the same
 /// rule as `--head` (GitHub's REST `head` is `owner:branch` for another
 /// repository's branch too). Without one the creation is gh's error to
-/// give, but the head may also travel in a body file knives does not read
-/// (`--input`); either way its verdict cannot be checked, and nothing
-/// unverifiable is let through.
+/// give; its verdict cannot be checked, and nothing unverifiable is let
+/// through. (A body file, `--input`, was refused before this is reached.)
 fn rest_head(fork: &Fork, heads: &[String]) -> Result<String, Early> {
     one_head(fork, heads, "-f head")?.ok_or_else(|| {
         Early::Refuse(format!(
@@ -2479,16 +2596,6 @@ mod tests {
                 "-f",
                 "head=feat/x",
             ],
-            vec![
-                "api",
-                "-X",
-                "POST",
-                "repos/o/r/pulls",
-                "--input",
-                "pr.json",
-                "-f",
-                "head=feat/x",
-            ],
         ] {
             assert_eq!(pull_opening(&parsed(&args(&argv))), rest, "{argv:?}");
         }
@@ -2533,6 +2640,46 @@ mod tests {
             ]))),
             None
         );
+    }
+
+    #[test]
+    fn a_body_file_makes_a_rest_creation_unreadable_whatever_its_fields() {
+        let args = |arguments: &[&str]| {
+            arguments
+                .iter()
+                .map(|argument| (*argument).to_owned())
+                .collect::<Vec<_>>()
+        };
+        // `--input` moves every field to the query string and takes the body
+        // from a file knives does not read: unreadable, whatever `-f head=`
+        // sits beside it (round-9 H1).
+        for argv in [
+            vec![
+                "api",
+                "-X",
+                "POST",
+                "repos/o/r/pulls",
+                "--input",
+                "pr.json",
+                "-f",
+                "head=o:feat/x",
+            ],
+            vec!["api", "repos/o/r/pulls", "--input=-"],
+            vec![
+                "api",
+                "-X",
+                "POST",
+                "repos/{owner}/{repo}/pulls",
+                "--input",
+                "pr.json",
+            ],
+        ] {
+            let opening = pull_opening(&parsed(&args(&argv)));
+            assert!(
+                matches!(&opening, Some(PullOpening::Unreadable(why)) if why.contains("takes its body from --input")),
+                "{argv:?}: {opening:?}"
+            );
+        }
     }
 
     #[test]

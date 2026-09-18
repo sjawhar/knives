@@ -12,9 +12,11 @@
 //!
 //! The grammar: a repository is `OWNER/REPO` or `HOST/OWNER/REPO`, every
 //! segment of [`SEGMENT_CHARS`] (GitHub's own charset for a login or a
-//! repository name; a host is spelled the same way); a head is a branch of
-//! [`BRANCH_CHARS`] not beginning with `-`, never `OWNER:BRANCH`; a switch's
-//! `=value` is one of Go's `strconv.ParseBool` spellings. A spelling outside
+//! repository name; a host is spelled the same way); a head is
+//! `OWNER:BRANCH` with `OWNER` the registered fork's own origin owner and
+//! `BRANCH` of [`BRANCH_CHARS`] not beginning with `-` — a bare branch is
+//! the base repository's own to gh, and is refused toward an upstream; a
+//! switch's `=value` is one of Go's `strconv.ParseBool` spellings. A spelling outside
 //! the grammar is [`Err`] carrying the refusal, never a guess.
 
 /// The characters one repository segment — a host, an owner, a name — may carry.

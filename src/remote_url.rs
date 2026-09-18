@@ -31,7 +31,10 @@ pub fn same_remote(registered: &str, stated: &str) -> bool {
 ///
 /// Equal, or a subdomain of it — `www.github.com`, `api.github.com`,
 /// `foo.github.com` are all `github.com` — case-insensitively, a trailing
-/// `.` ignored.
+/// `.` ignored, and a leading `www.` folded off both sides first: the
+/// registered side is trusted configuration, but a registry that spells its
+/// upstream on `www.github.com` names the same repository gh's own
+/// `normalizeHostname` reads, and must match the canonical `o/r`.
 ///
 /// gh folds every `*.github.com` to `github.com` (and `*.<tenant>.ghe.com`,
 /// `*.localhost` likewise) when choosing the token and the endpoint; this is
@@ -41,8 +44,8 @@ pub fn same_remote(registered: &str, stated: &str) -> bool {
 /// that happens to be a subdomain of a registered one, which gates and
 /// routes more, never less.
 pub fn same_host(stated: &str, registered: &str) -> bool {
-    let stated = stated.trim_end_matches('.');
-    let registered = registered.trim_end_matches('.');
+    let stated = without_www(stated.trim_end_matches('.'));
+    let registered = without_www(registered.trim_end_matches('.'));
     stated.eq_ignore_ascii_case(registered)
         || (stated.len() > registered.len() + 1
             && stated.as_bytes().get(stated.len() - registered.len() - 1) == Some(&b'.')
@@ -51,19 +54,34 @@ pub fn same_host(stated: &str, registered: &str) -> bool {
                 .is_some_and(|suffix| suffix.eq_ignore_ascii_case(registered)))
 }
 
-/// `(host, path)` of a remote URL as spelled: the authority without its user
-/// or port, and the path without its query or fragment, surrounding `/`, or
-/// a `.git` suffix. `None` for a
-/// non-URL: a filesystem path, or a `file://` URL, whose authority is
-/// empty. scp form without a user, `host:path`, is a URL too when the part
-/// before the colon holds no `/`; a filesystem path with a colon in a later
-/// component stays a path.
-fn host_and_path(remote: &str) -> Option<(&str, &str)> {
+/// `host` less one leading `www.` in any case.
+fn without_www(host: &str) -> &str {
+    match host.get(..4) {
+        Some(prefix) if prefix.eq_ignore_ascii_case("www.") => &host[4..],
+        _ => host,
+    }
+}
+
+/// `(authority, path)` of a remote in any URL spelling — `scheme://…`,
+/// `user@host:path`, or the user-less scp form `host:path` when the part
+/// before the colon holds no `/` (a filesystem path with a colon in a later
+/// component stays a path) — the authority possibly empty. The one reader
+/// [`host_and_path`] and [`url_owner`] share, so identity and the owner a
+/// head is qualified with never disagree about a spelling.
+fn authority_and_path(remote: &str) -> Option<(&str, &str)> {
     let trimmed = remote.trim().trim_end_matches('/');
-    let (authority, path) = remote_authority_and_path(trimmed).or_else(|| {
+    remote_authority_and_path(trimmed).or_else(|| {
         let (host, path) = trimmed.split_once(':')?;
         (!host.is_empty() && !host.contains('/')).then_some((host, path))
-    })?;
+    })
+}
+
+/// `(host, path)` of a remote URL as spelled: the authority without its user
+/// or port, and the path without its query or fragment, surrounding `/`, or
+/// a `.git` suffix. `None` for a non-URL: a filesystem path, or a `file://`
+/// URL, whose authority is empty.
+fn host_and_path(remote: &str) -> Option<(&str, &str)> {
+    let (authority, path) = authority_and_path(remote)?;
     if authority.is_empty() {
         return None;
     }
@@ -108,14 +126,15 @@ pub fn remote_host(url: &str) -> Option<&str> {
     host_and_path(url).map(|(host, _)| host)
 }
 
-/// The owner segment of an authority-delimited `<owner>/<repository>` remote path.
+/// The owner segment of a remote's `<owner>/<repository>` path, in every
+/// URL spelling [`same_remote`] reads (the user-less scp form included).
 ///
 /// Unlike [`remote_slug`], an empty authority (`https:///owner/repo`) still
 /// yields its owner: this feeds heuristics that should stay conservative when a
 /// URL is odd, not identity, which needs a host.
 pub fn url_owner(url: &str) -> Option<&str> {
-    let (_, path) = remote_authority_and_path(url)?;
-    let (owner, repository) = path.split_once('/')?;
+    let (_, path) = authority_and_path(url)?;
+    let (owner, repository) = path.trim_start_matches('/').split_once('/')?;
     (!owner.is_empty() && !repository.is_empty()).then_some(owner)
 }
 
@@ -229,6 +248,20 @@ mod tests {
         assert_eq!(remote_slug("git@forge.example:org/tool"), Some("org/tool"));
         assert_eq!(remote_slug("/tmp/lab/upstream"), None);
         assert_eq!(url_owner("git@forge.example:org/tool.git"), Some("org"));
+        // The owner is read from every spelling `same_remote` reads, the
+        // user-less scp form included, and from a userinfo/port URL.
+        assert_eq!(url_owner("forge.example:org/tool.git"), Some("org"));
+        assert_eq!(
+            url_owner("ssh://git@forge.example:22/org/tool"),
+            Some("org")
+        );
+        assert_eq!(
+            url_owner("https://u:p@forge.example:443/org/tool/"),
+            Some("org")
+        );
+        assert_eq!(url_owner("https://forge.example//org/tool"), Some("org"));
+        assert_eq!(url_owner("/tmp/lab/upstream"), None);
+        assert_eq!(url_owner("forge.example:tool"), None);
         assert_eq!(
             repository_name("https://forge.invalid/someone/Tool.GIT/"),
             Some("Tool")
@@ -257,13 +290,26 @@ mod tests {
             );
             assert!(same_host(host, "forge.example"), "{host}");
         }
-        // The fold is directional: the stated host may be a subdomain of the
-        // registered one, not the other way around.
-        assert!(!same_host("forge.example", "www.forge.example"));
+        // The suffix fold is directional: the stated host may be a subdomain
+        // of the registered one, not the other way around…
+        assert!(!same_host("forge.example", "api.forge.example"));
         assert!(!same_remote(
+            "https://api.forge.example/org/tool",
+            "https://forge.example/org/tool"
+        ));
+        // …but a leading `www.` is folded off both sides first: a registry
+        // spelled on `www.` names the repository the canonical spelling does.
+        assert!(same_host("forge.example", "www.forge.example"));
+        assert!(same_host("forge.example", "WWW.Forge.Example"));
+        assert!(same_remote(
             "https://www.forge.example/org/tool",
             "https://forge.example/org/tool"
         ));
+        assert!(same_remote(
+            "git@www.forge.example:org/tool.git",
+            "forge.example:org/tool"
+        ));
+        assert!(!same_host("forge.example", "www.api.forge.example"));
         assert!(same_remote(
             "https://forge.example/org/tool",
             "www.forge.example:org/tool"
