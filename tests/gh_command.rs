@@ -685,9 +685,10 @@ fn placement_gate_home() -> tempfile::TempDir {
 /// Record a placement verdict for `branch` in the `registered` entry's ledger.
 fn record_placement(config_home: &Path, branch: &str, verdict: &str) {
     let placement = knives::placement::Placement::parse(&format!(
-        "verdict: {verdict}\nalternative: a consumer-side setting; the library exposes none for this\n"
+        "verdict: {verdict}\nalternative: a consumer-side setting; the library exposes none for \
+         this\nclass: gap-others-need\njudge: lab-red-team\n"
     ))
-        .expect("parse verdict");
+    .expect("parse verdict");
     knives::ledger::Ledger::at(config_home.join("ledger").join("registered"))
         .append(&knives::ledger::Entry {
             ts: "2026-09-17T10:00:00Z".to_owned(),

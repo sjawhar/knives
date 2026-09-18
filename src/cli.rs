@@ -275,12 +275,17 @@ pub enum Command {
     /// A branch that does not exist yet — not locally, not on any of our remotes —
     /// is a new fork member, and a fork member states the non-fork alternative it
     /// rejected before it exists: `--placement <file>` names the placement
-    /// red-team's verdict (first line `verdict: CONSUMER | FORK | UPSTREAM`), which
-    /// is recorded on the branch in the ledger and read back by `release include`,
-    /// `release advance` and `knives gh`. A `CONSUMER` verdict starts no branch.
-    /// An existing branch needs none; given one — claimed, resumed or seized — it
+    /// red-team's verdict — `verdict: CONSUMER | FORK | UPSTREAM` first, then
+    /// `alternative:`, `class: library-defect | gap-others-need |
+    /// deployment-preference` and `judge:`, each required — which is recorded on
+    /// the branch in the ledger and read back by `release include`, `release
+    /// advance` and `knives gh`. A `CONSUMER` verdict starts no branch. An
+    /// existing branch needs none; given one — claimed, resumed or seized — it
     /// records a fresh verdict, and the newest wins. A `CONSUMER` verdict on an
-    /// existing branch is recorded and the branch is left to `finish`.
+    /// existing branch — a bookmark here or on our remotes after the fetch, or a
+    /// claim someone holds — is recorded under the same claim rules as any start
+    /// (another owner's claim needs `--force --why`) and the branch is left to
+    /// `finish`.
     ///
     /// Also states the fork's `immutable_heads()` — jj's trunk, tags, and the trunk
     /// by name on every knives remote — in the repository's jj config when that
@@ -298,9 +303,9 @@ pub enum Command {
         /// Replace an existing claim. Requires a new reason for the ledger.
         #[arg(long, requires = "why")]
         force: bool,
-        /// The placement red-team's verdict file for a new branch: first line
-        /// `verdict: CONSUMER | FORK | UPSTREAM`, then the alternative it rejected.
-        /// Recorded on the branch as a `placement:` ledger note.
+        /// The placement red-team's verdict file: `verdict: CONSUMER | FORK |
+        /// UPSTREAM`, then `alternative:`, `class:` and `judge:` lines, all
+        /// required. Recorded on the branch as a `placement: verdict:` ledger note.
         #[arg(long, value_name = "FILE")]
         placement: Option<std::path::PathBuf>,
     },

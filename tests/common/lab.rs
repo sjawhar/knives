@@ -677,7 +677,8 @@ pub fn placement_file(home: &tempfile::TempDir, verdict: &str) -> std::path::Pat
 /// `start` (through `lab.branch`) that a release verb is about to admit.
 pub fn state_placement(lab: &Lab, home: &tempfile::TempDir, subject: &str, verdict: &str) {
     let placement = knives::placement::Placement::parse(&format!(
-        "verdict: {verdict}\nalternative: a consumer-side setting; the library exposes none for this\n"
+        "verdict: {verdict}\nalternative: a consumer-side setting; the library exposes none for \
+         this\nclass: gap-others-need\njudge: lab-red-team\n"
     ))
     .expect("parse placement verdict");
     knives::ledger::Scribe::new(

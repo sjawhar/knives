@@ -12,10 +12,11 @@
 //!
 //! The verdict file is written by a placement red-team — an adversarial
 //! reviewer whose job is to argue against the fork change; the `fork-work`
-//! skill carries its brief. knives stores the file and reads two lines of it:
-//! the first, `verdict: CONSUMER | FORK | UPSTREAM`, and an `alternative:` line
-//! naming the non-fork mechanism the branch rejected. The rest is prose for
-//! the next reader (`class:`, `judge:`, free text).
+//! skill carries its brief. knives stores the file and reads four lines of
+//! it: the first, `verdict: CONSUMER | FORK | UPSTREAM`; an `alternative:`
+//! line naming the non-fork mechanism the branch rejected; a `class:` line
+//! with one of the brief's three classifications; and a `judge:` line naming
+//! the reviewer. The rest is prose for the next reader.
 
 use crate::ledger::{Entry, Kind};
 
@@ -95,6 +96,18 @@ pub enum PlacementError {
          none was given"
     )]
     Alternative,
+    /// The classification is what decides between CONSUMER, FORK and UPSTREAM
+    /// in the brief; a verdict without one, or with a class the brief does not
+    /// define, has not shown its reasoning.
+    #[error(
+        "a placement verdict states its class on a `class: library-defect | gap-others-need | \
+         deployment-preference` line; {0}"
+    )]
+    Class(String),
+    /// The judge is who the verdict is accountable to: the red-team, not the
+    /// proposer.
+    #[error("a placement verdict names its red-team judge on a `judge:` line; none was given")]
+    Judge,
     /// A ledger note that carries the marker but no verdict knives can read:
     /// named so the reader knows which branch, and how to move on. The cause is
     /// part of the message and not a chained source — a field named `source`
@@ -107,19 +120,33 @@ pub enum PlacementError {
     Note { branch: String, cause: Box<Self> },
 }
 
-/// The command that records a verdict on `branch` by hand: both lines the
-/// tool reads, since a note with the first alone is refused.
+/// The classifications the red-team brief defines.
+pub const CLASSES: [&str; 3] = ["library-defect", "gap-others-need", "deployment-preference"];
+
+/// The command that records a verdict on `branch` by hand: every line the
+/// tool reads, since a note missing any of them is refused.
 pub fn notch_remedy(branch: &str) -> String {
     format!(
         "knives notch {branch} -m $'placement: verdict: CONSUMER | FORK | UPSTREAM\\nalternative: \
-         <the non-fork mechanism it rejected>'"
+         <the non-fork mechanism it rejected>\\nclass: library-defect | gap-others-need | \
+         deployment-preference\\njudge: <who ruled>'"
     )
 }
 
+/// The first non-blank value of the `field:` line in a verdict file.
+fn field_value<'a>(text: &'a str, field: &str) -> Option<&'a str> {
+    text.lines()
+        .map(str::trim)
+        .filter_map(|line| line.strip_prefix(field))
+        .map(str::trim)
+        .find(|value| !value.is_empty())
+}
+
 impl Placement {
-    /// Parse a verdict file. The first non-blank line decides and an `alternative:`
-    /// line must name the rejected non-fork mechanism; everything is
-    /// kept, less the whitespace around it, so the note begins with the verdict.
+    /// Parse a verdict file. The first non-blank line decides; `alternative:`
+    /// names the rejected non-fork mechanism, `class:` is one of [`CLASSES`],
+    /// `judge:` names the reviewer; everything is kept, less the whitespace
+    /// around it, so the note begins with the verdict.
     pub fn parse(text: &str) -> Result<Self, PlacementError> {
         let first = text
             .lines()
@@ -130,13 +157,18 @@ impl Placement {
             .strip_prefix("verdict:")
             .and_then(|rest| Verdict::parse(rest.trim()))
             .ok_or_else(|| PlacementError::Verdict(first.to_owned()))?;
-        let names_alternative = text
-            .lines()
-            .map(str::trim)
-            .filter_map(|line| line.strip_prefix("alternative:"))
-            .any(|rest| !rest.trim().is_empty());
-        if !names_alternative {
+        if field_value(text, "alternative:").is_none() {
             return Err(PlacementError::Alternative);
+        }
+        match field_value(text, "class:") {
+            None => return Err(PlacementError::Class("none was given".to_owned())),
+            Some(class) if !CLASSES.contains(&class) => {
+                return Err(PlacementError::Class(format!("it was {class:?}")));
+            }
+            Some(_) => {}
+        }
+        if field_value(text, "judge:").is_none() {
+            return Err(PlacementError::Judge);
         }
         Ok(Self {
             verdict,
@@ -302,11 +334,13 @@ mod tests {
 
     #[test]
     fn the_first_non_blank_line_decides_the_verdict() {
-        let placement = Placement::parse("\n  verdict: UPSTREAM \nalternative: none\n").unwrap();
+        let complete = "\n  verdict: UPSTREAM \nalternative: none\nclass: gap-others-need\n\
+                        judge: red-team\n";
+        let placement = Placement::parse(complete).unwrap();
         assert_eq!(placement.verdict, Verdict::Upstream);
         // The stored text starts with the verdict line, so the note carries the
         // marker whatever whitespace the file opened with.
-        assert_eq!(placement.text, "verdict: UPSTREAM \nalternative: none");
+        assert_eq!(placement.text, complete.trim());
         assert!(placement.note_text().starts_with(NOTE_PREFIX));
         assert_eq!(
             Placement::parse("alternative: x\nverdict: FORK"),
@@ -316,6 +350,11 @@ mod tests {
             Placement::parse("verdict: maybe"),
             Err(PlacementError::Verdict("verdict: maybe".to_owned()))
         );
+        assert_eq!(Placement::parse("  \n"), Err(PlacementError::Empty));
+    }
+
+    #[test]
+    fn every_line_the_brief_produces_is_required_and_the_first_missing_one_is_named() {
         // The branch's premise is the alternative it rejected: a verdict alone,
         // or an empty `alternative:` line, has not answered the question.
         assert_eq!(
@@ -323,10 +362,52 @@ mod tests {
             Err(PlacementError::Alternative)
         );
         assert_eq!(
-            Placement::parse("verdict: FORK\nalternative:   "),
+            Placement::parse("verdict: FORK\nalternative:   \nclass: library-defect\njudge: x"),
             Err(PlacementError::Alternative)
         );
-        assert_eq!(Placement::parse("  \n"), Err(PlacementError::Empty));
+        // The class is the brief's reasoning; it is one of three, spelled as
+        // the brief spells them.
+        assert_eq!(
+            Placement::parse("verdict: FORK\nalternative: a setting\njudge: x"),
+            Err(PlacementError::Class("none was given".to_owned()))
+        );
+        assert_eq!(
+            Placement::parse("verdict: FORK\nalternative: a setting\nclass:  \njudge: x"),
+            Err(PlacementError::Class("none was given".to_owned()))
+        );
+        assert_eq!(
+            Placement::parse(
+                "verdict: FORK\nalternative: a setting\nclass: Library-Defect\njudge: x"
+            ),
+            Err(PlacementError::Class(
+                "it was \"Library-Defect\"".to_owned()
+            ))
+        );
+        // The judge is who the verdict is accountable to.
+        assert_eq!(
+            Placement::parse("verdict: FORK\nalternative: a setting\nclass: library-defect"),
+            Err(PlacementError::Judge)
+        );
+        assert_eq!(
+            Placement::parse(
+                "verdict: FORK\nalternative: a setting\nclass: library-defect\njudge:"
+            ),
+            Err(PlacementError::Judge)
+        );
+        for class in CLASSES {
+            let text = format!("verdict: FORK\nalternative: a setting\nclass: {class}\njudge: x");
+            assert!(Placement::parse(&text).is_ok(), "{class} was refused");
+        }
+        // The remedy an unreadable note prints spells every required line.
+        let remedy = notch_remedy("feat/a");
+        for line in [
+            "placement: verdict:",
+            "\\nalternative:",
+            "\\nclass:",
+            "\\njudge:",
+        ] {
+            assert!(remedy.contains(line), "{line} missing from {remedy}");
+        }
     }
 
     #[test]
@@ -334,14 +415,17 @@ mod tests {
         let entries = [
             note(
                 "feat/a",
-                "placement: verdict: CONSUMER\nalternative: a config value",
+                "placement: verdict: CONSUMER\nalternative: a config value\nclass: gap-others-need\njudge: red-team",
             ),
             note("feat/a", "reviewed, looks fine"),
             note(
                 "feat/b",
-                "placement: verdict: UPSTREAM\nalternative: a config value",
+                "placement: verdict: UPSTREAM\nalternative: a config value\nclass: gap-others-need\njudge: red-team",
             ),
-            note("feat/a", "placement: verdict: FORK\nalternative: none"),
+            note(
+                "feat/a",
+                "placement: verdict: FORK\nalternative: none\nclass: gap-others-need\njudge: red-team",
+            ),
         ];
         let newest = recorded(&entries, "feat/a").unwrap().unwrap();
         assert_eq!(newest.verdict, Verdict::Fork);
@@ -389,7 +473,7 @@ mod tests {
         let entries = [
             note(
                 "feat/a",
-                "placement: verdict: UPSTREAM\nalternative: a config value",
+                "placement: verdict: UPSTREAM\nalternative: a config value\nclass: gap-others-need\njudge: red-team",
             ),
             note("feat/a", prose),
         ];
@@ -410,7 +494,7 @@ mod tests {
             member_refusal(
                 &[note(
                     "feat/new",
-                    "placement: verdict: CONSUMER\nalternative: a config value"
+                    "placement: verdict: CONSUMER\nalternative: a config value\nclass: gap-others-need\njudge: red-team"
                 )],
                 "feat/new",
                 false
@@ -422,7 +506,7 @@ mod tests {
             member_refusal(
                 &[note(
                     "feat/new",
-                    "placement: verdict: FORK\nalternative: a config value"
+                    "placement: verdict: FORK\nalternative: a config value\nclass: gap-others-need\njudge: red-team"
                 )],
                 "feat/new",
                 false
@@ -448,7 +532,7 @@ mod tests {
             cut_event(&["feat/old"]),
             note(
                 "feat/old",
-                "placement: verdict: CONSUMER\nalternative: a config value",
+                "placement: verdict: CONSUMER\nalternative: a config value\nclass: gap-others-need\njudge: red-team",
             ),
         ];
         assert_eq!(
@@ -474,7 +558,7 @@ mod tests {
                     composed,
                     note(
                         "feat/old",
-                        "placement: verdict: FORK\nalternative: a config value"
+                        "placement: verdict: FORK\nalternative: a config value\nclass: gap-others-need\njudge: red-team"
                     )
                 ],
                 "feat/old"
@@ -486,7 +570,7 @@ mod tests {
             upstream_pull_refusal(
                 &[note(
                     "feat/x",
-                    "placement: verdict: UPSTREAM\nalternative: a config value"
+                    "placement: verdict: UPSTREAM\nalternative: a config value\nclass: gap-others-need\njudge: red-team"
                 )],
                 "feat/x"
             )

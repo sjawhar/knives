@@ -177,6 +177,58 @@ fn a_verdict_file_without_a_verdict_line_is_refused_before_anything_happens() {
 }
 
 #[test]
+fn a_verdict_file_missing_any_line_the_brief_produces_is_refused_before_anything_happens() {
+    // The brief produces four lines the tool reads; a file short of any of
+    // them has not shown the red-team's work, and nothing is claimed.
+    let lab = Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    for (text, missing) in [
+        (
+            "verdict: FORK\nclass: gap-others-need\njudge: red-team\n",
+            "`alternative:` line",
+        ),
+        (
+            "verdict: FORK\nalternative: a setting\njudge: red-team\n",
+            "`class: library-defect | gap-others-need | deployment-preference` line; none was given",
+        ),
+        (
+            "verdict: FORK\nalternative: a setting\nclass: hardening\njudge: red-team\n",
+            "it was \"hardening\"",
+        ),
+        (
+            "verdict: FORK\nalternative: a setting\nclass: gap-others-need\n",
+            "`judge:` line",
+        ),
+    ] {
+        let file = home.path().join("incomplete.md");
+        std::fs::write(&file, text).expect("write file");
+        let output = start(
+            &lab,
+            &home,
+            "feat/gamma",
+            &["--placement", file.to_str().expect("utf-8 path")],
+        );
+        assert_eq!(output.status.code(), Some(3), "{text:?}: {output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(missing),
+            "{text:?}: {output:?}"
+        );
+        assert!(
+            !lab.work
+                .parent()
+                .expect("parent")
+                .join("feat-gamma")
+                .exists(),
+            "{text:?}: an incomplete verdict opened a workspace"
+        );
+        assert!(
+            ledger(&home).entries().expect("read ledger").is_empty(),
+            "{text:?}: an incomplete verdict wrote to the ledger"
+        );
+    }
+}
+
+#[test]
 fn an_existing_branch_is_continued_without_a_verdict() {
     // The gate is on creation: a branch already on one of our remotes was
     // started before, and continuing it asks nothing.
@@ -416,6 +468,141 @@ fn a_consumer_verdict_on_an_existing_branch_is_recorded_and_says_finish() {
 }
 
 #[test]
+fn a_consumer_verdict_finds_a_branch_pushed_since_the_last_fetch() {
+    // Given: another clone pushed a branch after this checkout's last fetch —
+    // the branch a plain `start` would fetch and continue.
+    let lab = Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    lab.foreign_origin_branch("main@origin", "pushed-fix", "remote\n");
+    let consumer = placement_file(&home, "CONSUMER");
+
+    // When: the red-team rules it CONSUMER.
+    let output = start(
+        &lab,
+        &home,
+        "pushed-fix",
+        &["--placement", consumer.to_str().expect("utf-8 path")],
+    );
+
+    // Then: the fetch finds it, the verdict is recorded on it, and `finish`
+    // is named — not "no branch is started".
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("`knives finish pushed-fix` retires it"),
+        "{stderr}"
+    );
+    assert_eq!(
+        recorded(&ledger(&home).entries().expect("read ledger"), "pushed-fix")
+            .expect("a verdict is recorded")
+            .expect("and it reads")
+            .verdict,
+        Verdict::Consumer
+    );
+}
+
+#[test]
+fn a_consumer_verdict_is_recorded_on_a_held_branch_with_no_bookmark_yet() {
+    // Given: a branch just started — claim and workspace, no bookmark named
+    // yet — whose owner re-rules it CONSUMER.
+    let lab = Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let fork = placement_file(&home, "FORK");
+    let started = start(
+        &lab,
+        &home,
+        "feat/gamma",
+        &["--placement", fork.to_str().expect("utf-8 path")],
+    );
+    assert!(started.status.success(), "{started:?}");
+    let consumer = placement_file(&home, "CONSUMER");
+
+    // When: the same owner records the CONSUMER verdict.
+    let output = start(
+        &lab,
+        &home,
+        "feat/gamma",
+        &["--placement", consumer.to_str().expect("utf-8 path")],
+    );
+
+    // Then: a held claim is an existing branch; the note is recorded and is
+    // the newest.
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("`knives finish feat/gamma` retires it"),
+        "{output:?}"
+    );
+    assert_eq!(
+        recorded(&ledger(&home).entries().expect("read ledger"), "feat/gamma")
+            .expect("a verdict is recorded")
+            .expect("and it reads")
+            .verdict,
+        Verdict::Consumer
+    );
+}
+
+#[test]
+fn a_consumer_verdict_over_another_owners_claim_needs_force_like_any_take() {
+    // Given: agent-one holds feat/alpha.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let (home, _consumer) = release_test_home(&lab);
+    let claimed = start(&lab, &home, "feat/alpha", &[]);
+    assert!(claimed.status.success(), "{claimed:?}");
+    let consumer = placement_file(&home, "CONSUMER");
+    let as_two = |extra: &[&str]| {
+        let mut args = vec![
+            "--text",
+            "start",
+            "feat/alpha",
+            "--repo",
+            "demo",
+            "--placement",
+            consumer.to_str().expect("utf-8 path"),
+        ];
+        args.extend_from_slice(extra);
+        knives_command(&lab.work, home.path(), lab.temp_path(), &args)
+            .env("KNIVES_OWNER", "agent-two")
+            .output()
+            .expect("run knives start")
+    };
+
+    // When: agent-two records CONSUMER over it without --force.
+    let refused = as_two(&[]);
+
+    // Then: refused as any other take is — the holder named, the remedy given
+    // — and nothing is recorded.
+    assert_eq!(refused.status.code(), Some(2), "{refused:?}");
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(stderr.contains("agent-one"), "{stderr}");
+    assert!(
+        stderr.contains("`knives start feat/alpha --force --why \"…\"` to seize the claim"),
+        "{stderr}"
+    );
+    assert!(recorded(&ledger(&home).entries().expect("read ledger"), "feat/alpha").is_none());
+
+    // And: --force without --why is the usual usage error, clap's own.
+    let no_why = as_two(&["--force"]);
+    assert_eq!(no_why.status.code(), Some(2), "{no_why:?}");
+    assert!(
+        String::from_utf8_lossy(&no_why.stderr).contains("--why <WHY>"),
+        "{no_why:?}"
+    );
+    assert!(recorded(&ledger(&home).entries().expect("read ledger"), "feat/alpha").is_none());
+
+    // And: with --force --why the verdict is recorded.
+    let forced = as_two(&["--force", "--why", "retire it"]);
+    assert_eq!(forced.status.code(), Some(2), "{forced:?}");
+    assert_eq!(
+        recorded(&ledger(&home).entries().expect("read ledger"), "feat/alpha")
+            .expect("a verdict is recorded")
+            .expect("and it reads")
+            .verdict,
+        Verdict::Consumer
+    );
+}
+
+#[test]
 fn advance_refuses_a_never_composed_branch_that_succeeds_a_member_by_ancestry() {
     // Given: a release cut from alpha alone, and a new bookmark on a child of
     // alpha's tip — succession by ancestry, which is how a member that grew
@@ -520,11 +707,11 @@ fn a_prose_placement_note_is_ordinary_and_an_unknown_verdict_names_the_branch_an
     assert!(prose.stderr.is_empty(), "{prose:?}");
 
     // When: a note carries the marker with a verdict knives does not know.
-    notch("placement: verdict: MAYBE\nalternative: none");
+    notch("placement: verdict: MAYBE\nalternative: none\nclass: gap-others-need\njudge: x");
     let unknown = knives_release(&lab, &home, &["include", "feat/gamma"]);
 
     // Then: that is an error, and it names the branch and the way forward —
-    // both lines the tool reads, since a one-line notch is itself refused —
+    // every line the tool reads, since a note missing one is itself refused —
     // and says it once.
     assert_eq!(unknown.status.code(), Some(3), "{unknown:?}");
     let stderr = String::from_utf8_lossy(&unknown.stderr);
@@ -539,16 +726,33 @@ fn a_prose_placement_note_is_ordinary_and_an_unknown_verdict_names_the_branch_an
         "the cause is printed once: {stderr}"
     );
 
-    // And: a one-line notch — the verdict without its alternative — is the
-    // same error, so the remedy must show both lines; following it works.
-    notch("placement: verdict: FORK");
-    let bare = knives_release(&lab, &home, &["include", "feat/gamma"]);
-    assert_eq!(bare.status.code(), Some(3), "{bare:?}");
-    assert!(
-        String::from_utf8_lossy(&bare.stderr).contains("`alternative:` line"),
-        "{bare:?}"
-    );
-    notch("placement: verdict: FORK\nalternative: none");
+    // And: a notch missing any of the lines the brief produces is the same
+    // error, naming the line, so the remedy must show all of them.
+    for (text, missing) in [
+        ("placement: verdict: FORK", "`alternative:` line"),
+        (
+            "placement: verdict: FORK\nalternative: none\njudge: x",
+            "`class: library-defect | gap-others-need | deployment-preference` line; none was given",
+        ),
+        (
+            "placement: verdict: FORK\nalternative: none\nclass: hardening\njudge: x",
+            "it was \"hardening\"",
+        ),
+        (
+            "placement: verdict: FORK\nalternative: none\nclass: gap-others-need",
+            "`judge:` line",
+        ),
+    ] {
+        notch(text);
+        let partial = knives_release(&lab, &home, &["include", "feat/gamma"]);
+        assert_eq!(partial.status.code(), Some(3), "{text:?}: {partial:?}");
+        assert!(
+            String::from_utf8_lossy(&partial.stderr).contains(missing),
+            "{text:?}: {partial:?}"
+        );
+    }
+    // Following the remedy works.
+    notch("placement: verdict: FORK\nalternative: none\nclass: gap-others-need\njudge: x");
     let included = knives_release(&lab, &home, &["include", "feat/gamma"]);
     assert!(included.status.success(), "{included:?}");
 }
