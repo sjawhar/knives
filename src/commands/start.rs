@@ -147,17 +147,18 @@ pub fn run(
         eprintln!("{repo_name}: {line}");
         return Ok(Exit::Usage);
     }
-    if let Some(placement) = options.placement
-        && placement.verdict == placement::Verdict::Consumer
-    {
-        // The verdict answered the forcing question: the effect belongs in the
-        // consumer, so there is no fork branch to start. One that already
-        // exists gets the verdict recorded — it is the newest, and the release
-        // verbs and `gh` read it back — and is told how to retire.
-        return consumer_refusal(fork, branch, placement, bound);
-    }
+    let consumer = options
+        .placement
+        .filter(|placement| placement.verdict == placement::Verdict::Consumer);
     let mut store = Store::open_for_update(default_state_path())?;
     let cwd = std::env::current_dir()?;
+    if consumer.is_some() {
+        // The verdict answered the forcing question: the effect belongs in the
+        // consumer, so no workspace opens. Whether a branch exists to record it
+        // on is judged the way `create_workspace` judges it — after the fetch
+        // that brings in a branch another clone pushed since the last one.
+        fetch_all(checkout)?;
+    }
     let destination = workspace_path(fork, branch);
     let in_claimed_workspace = possesses(&cwd, fork, branch);
     let mut context = StartContext {
@@ -215,6 +216,23 @@ pub fn run(
         identity: &context.identity,
         in_claimed_workspace,
     });
+
+    if consumer.is_some() {
+        // A CONSUMER verdict observes the branch and claim state exactly as an
+        // ordinary start does — a held claim is an existing branch, and another
+        // owner's claim needs the same `--force --why` (clap requires the pair)
+        // before its recorded verdict is superseded — and then records the
+        // note in place of a claim, since there is nothing to work on.
+        return consumer_refusal(
+            &context,
+            &ClaimState {
+                held: held.as_ref(),
+                seen: claim_seen,
+                decision,
+                force,
+            },
+        );
+    }
 
     if force && held.is_some() {
         let (previous, last_seen) = claim_context(held.as_ref(), claim_seen)?;
@@ -442,54 +460,69 @@ fn record_placement(
     Ok(())
 }
 
-/// The `CONSUMER` refusal: no branch is started. When the branch already
-/// exists — a bookmark in the checkout, ours or on one of our remotes — the
-/// verdict is recorded on it first, so it is the newest one the release verbs
-/// and `gh` read, and the line says `finish` retires the branch.
-fn consumer_refusal(
-    fork: &Fork<'_>,
-    branch: &BranchName,
-    placement: &Placement,
-    bound: Option<&RepoName>,
-) -> anyhow::Result<Exit> {
-    let repo_name = &fork.name;
-    let opened = Repo::open(&fork.checkout.path)?;
-    let tips = opened.bookmark_tips()?;
+/// The claim a `start` found on its branch, what it decided about it, and
+/// whether `--force` was given: the state a CONSUMER verdict honours as any
+/// other start does.
+struct ClaimState<'a> {
+    held: Option<&'a crate::store::Claim>,
+    seen: Option<crate::seen::LastSeen>,
+    decision: ClaimDecision,
+    force: bool,
+}
+
+/// The `CONSUMER` refusal: no workspace opens. A branch that exists — a
+/// bookmark in the checkout, ours or on one of our remotes after the fetch,
+/// or a claim someone holds, which is a branch started whether or not its
+/// first bookmark exists yet — gets the verdict recorded first, so it is the
+/// newest one the release verbs and `gh` read, and the line says `finish`
+/// retires the branch. The claim decision is honoured as on any other start:
+/// another owner's claim refuses with the same text and the same `--force
+/// --why` remedy, and the note lands only on a resume, a take, or a seizure.
+fn consumer_refusal(context: &StartContext<'_>, claim: &ClaimState<'_>) -> anyhow::Result<Exit> {
+    let repo_name = &context.fork.name;
+    let branch = context.branch;
+    let tips = context.opened.bookmark_tips()?;
     let ours = [
         RemoteName::new(Role::Origin.to_string()),
-        RemoteName::new(fork.entry.publish_remote()),
+        RemoteName::new(context.fork.entry.publish_remote()),
     ];
-    if matches!(
-        branch_tip(&opened, &tips, branch, &ours)?,
+    let named = !matches!(
+        branch_tip(&context.opened, &tips, branch, &ours)?,
         BranchTip::Unknown
-    ) {
+    );
+    if !named && claim.held.is_none() {
         eprintln!(
             "{repo_name}: {}; no branch is started for {branch}",
             placement::CONSUMER_REFUSAL
         );
         return Ok(Exit::Usage);
     }
-    let identity = current_identity(bound)?;
-    let store = Store::open(default_state_path())?;
-    let pull = store.tracked_pull(&BranchTarget::new(repo_name.clone(), branch.clone()));
-    Scribe::new(
+    if !claim.force {
+        match claim.decision {
+            ClaimDecision::RefuseAnonymous => {
+                let (held, last_seen) = claim_context(claim.held, claim.seen)?;
+                return Ok(refuse_claim(branch, held, last_seen, true));
+            }
+            ClaimDecision::RefuseHeld => {
+                let (held, last_seen) = claim_context(claim.held, claim.seen)?;
+                return Ok(refuse_claim(branch, held, last_seen, false));
+            }
+            ClaimDecision::Take | ClaimDecision::Resume { .. } => {}
+        }
+    }
+    let pull = context
+        .store
+        .tracked_pull(&BranchTarget::new(repo_name.clone(), branch.clone()));
+    let scribe = Scribe::new(
         Ledger::for_repo(repo_name),
         repo_name.clone(),
-        fork.checkout.path.clone(),
-        identity.owner,
-    )
-    .record(&Draft {
-        subject: Some(branch.as_str()),
-        kind: Kind::Note,
-        disposition: None,
-        text: placement.note_text(),
-        evidence: Vec::new(),
-        pr: pull,
-        parents: Vec::new(),
-    })?;
+        context.fork.checkout.path.clone(),
+        context.identity.owner.clone(),
+    );
+    record_placement(&scribe, context, pull)?;
     eprintln!(
-        "{repo_name}: {}; recorded on {branch}, which already exists: `knives finish {branch}` \
-         retires it",
+        "{repo_name}: {}; recorded on {branch}, which is already started: `knives finish \
+         {branch}` retires it",
         placement::CONSUMER_REFUSAL
     );
     Ok(Exit::Usage)
