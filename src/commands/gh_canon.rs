@@ -52,24 +52,40 @@ pub struct Repo {
 }
 
 impl Repo {
-    /// `OWNER/REPO` on `default_host`, or `HOST/OWNER/REPO`; `None` for
-    /// anything else — a URL of any scheme, an scp shorthand, a `.git`
+    /// `OWNER/REPO` on gh's default host, or `HOST/OWNER/REPO`; `Ok(None)`
+    /// for anything else — a URL of any scheme, an scp shorthand, a `.git`
     /// suffix, a trailing `/`, a percent-escape, an empty segment, a fourth
     /// part.
-    pub fn parse(spec: &str, default_host: &str) -> Option<Self> {
+    ///
+    /// `default_host` is asked only for a two-part spec: a three-part one
+    /// names its host and consults nothing else, so the remedy `-R
+    /// HOST/OWNER/REPO` clears a refusal about gh's configuration files
+    /// rather than repeating it. Its error is this function's.
+    pub fn parse<E>(
+        spec: &str,
+        default_host: impl FnOnce() -> Result<String, E>,
+    ) -> Result<Option<Self>, E> {
         let mut parts = spec.split('/');
         let (first, second, third, fourth) =
             (parts.next(), parts.next(), parts.next(), parts.next());
         let (host, owner, name) = match (first, second, third, fourth) {
-            (Some(owner), Some(name), None, None) => (default_host, owner, name),
-            (Some(host), Some(owner), Some(name), None) => (host, owner, name),
-            _ => return None,
+            (Some(owner), Some(name), None, None) => {
+                if !is_segment(owner) || !is_segment(name) {
+                    return Ok(None);
+                }
+                (default_host()?, owner, name)
+            }
+            (Some(host), Some(owner), Some(name), None) => (host.to_owned(), owner, name),
+            _ => return Ok(None),
         };
-        ([host, owner, name].into_iter().all(is_segment)).then(|| Self {
-            host: host.to_owned(),
+        if !is_segment(&host) || !is_segment(owner) || !is_segment(name) {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            host,
             owner: owner.to_owned(),
             name: name.to_owned(),
-        })
+        }))
     }
 
     /// `OWNER/REPO` exactly, on the given `host` — the shape a `gh repo
@@ -148,6 +164,42 @@ mod tests {
 
     const HOST: &str = concat!("github", ".com");
 
+    /// `spec` parsed with [`HOST`] as the default host.
+    fn parsed(spec: &str) -> Option<Repo> {
+        Repo::parse(spec, || Ok::<_, ()>(HOST.to_owned())).expect("the default host is given")
+    }
+
+    #[test]
+    fn a_three_part_spec_never_asks_for_the_default_host() {
+        // Round-14 F1: a stated `HOST/OWNER/REPO` names its host, so a
+        // refusal about gh's configuration files must not repeat for the
+        // very remedy it names. Only a two-part spec asks; a spec outside
+        // the grammar asks for nothing either.
+        let refused = || Err::<String, _>("the files are unreadable".to_owned());
+        assert_eq!(
+            Repo::parse("forge.example/acme/work", refused),
+            Ok(Some(Repo {
+                host: "forge.example".to_owned(),
+                owner: "acme".to_owned(),
+                name: "work".to_owned(),
+            }))
+        );
+        assert_eq!(
+            Repo::parse("acme/work", refused),
+            Err("the files are unreadable".to_owned())
+        );
+        for outside in [
+            "",
+            "acme",
+            "a/b/c/d",
+            "acme/wo rk",
+            "https://x/acme/work",
+            "acme/work.git",
+        ] {
+            assert_eq!(Repo::parse(outside, refused), Ok(None), "{outside:?}");
+        }
+    }
+
     #[test]
     fn a_repository_is_two_or_three_canonical_segments_and_nothing_else() {
         let repo = |host: &str, owner: &str, name: &str| Repo {
@@ -155,16 +207,13 @@ mod tests {
             owner: owner.to_owned(),
             name: name.to_owned(),
         };
+        assert_eq!(parsed("acme/work"), Some(repo(HOST, "acme", "work")));
         assert_eq!(
-            Repo::parse("acme/work", HOST),
-            Some(repo(HOST, "acme", "work"))
-        );
-        assert_eq!(
-            Repo::parse("forge.example/acme/work", HOST),
+            parsed("forge.example/acme/work"),
             Some(repo("forge.example", "acme", "work"))
         );
         assert_eq!(
-            Repo::parse("Acme_1/wo.rk-2", HOST),
+            parsed("Acme_1/wo.rk-2"),
             Some(repo(HOST, "Acme_1", "wo.rk-2"))
         );
         assert_eq!(
@@ -198,7 +247,7 @@ mod tests {
             "-",
             "./work",
         ] {
-            assert_eq!(Repo::parse(spec, HOST), None, "{spec:?}");
+            assert_eq!(parsed(spec), None, "{spec:?}");
         }
     }
 
@@ -330,7 +379,7 @@ mod tests {
         }
         let mut read = 0;
         for spec in &corpus {
-            let Some(repo) = Repo::parse(spec, HOST) else {
+            let Some(repo) = parsed(spec) else {
                 // Refused: and the refusal names the canonical form.
                 let refusal = repo_refusal("-R", spec);
                 assert!(
@@ -352,7 +401,7 @@ mod tests {
                 repo.to_string()
             };
             assert_eq!(&respelled, spec, "{spec:?} was normalised to {repo}");
-            assert_eq!(Repo::parse(&repo.to_string(), HOST), Some(repo.clone()));
+            assert_eq!(parsed(&repo.to_string()), Some(repo.clone()));
             assert_eq!(
                 Repo::parse_on(&format!("{}/{}", repo.owner, repo.name), &repo.host),
                 Some(repo)

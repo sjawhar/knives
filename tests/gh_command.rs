@@ -7,7 +7,7 @@
 
 #[path = "common/lab.rs"]
 mod lab;
-// allow: SIZE_OK: 6023 lines - real-binary gh passthrough scenarios share one fixture and process harness.
+// allow: SIZE_OK: 6217 lines - real-binary gh passthrough scenarios share one fixture and process harness.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
@@ -4861,10 +4861,8 @@ impl HostsLab {
     }
 
     fn run(&self) -> std::process::Output {
-        knives_cmd(self.helper_dir.path())
-            .args([
-                "gh",
-                "--",
+        self.run_with(
+            &[
                 "pr",
                 "create",
                 "-R",
@@ -4873,7 +4871,18 @@ impl HostsLab {
                 "t",
                 "-b",
                 "b",
-            ])
+            ],
+            &[],
+        )
+    }
+
+    /// `knives gh -- <arguments>` in the fork checkout with `environment`
+    /// added, gh's configuration under this lab's directory.
+    fn run_with(&self, arguments: &[&str], environment: &[(&str, &str)]) -> std::process::Output {
+        knives_cmd(self.helper_dir.path())
+            .args(["gh", "--"])
+            .args(arguments)
+            .envs(environment.iter().copied())
             .current_dir(&self.lab.work)
             .env("KNIVES_CONFIG_HOME", self.config_home.path())
             .env("HOME", self.lab.temp_path())
@@ -5392,7 +5401,7 @@ fn a_fetch_url_gh_s_parser_rejects_yields_to_the_push_url() {
     assert_eq!(output.status.code(), Some(2), "{output:?}");
     assert!(
         String::from_utf8_lossy(&output.stderr).contains(&format!(
-            "remote upstream's URL (https://{host}/routed-a/upstre%61m.git) is outside the grammar knives compares, so the creation's target cannot be certified: state the repository (-R OWNER/REPO)"
+            "remote upstream's URL (https://{host}/routed-a/upstre%61m.git) is outside the grammar knives compares, so the repository this checkout addresses cannot be read: state the repository (-R OWNER/REPO)"
         )),
         "{output:?}"
     );
@@ -5474,7 +5483,7 @@ fn a_remote_outside_the_canonical_grammar_is_never_read_around() {
         assert_eq!(output.status.code(), Some(2), "{fetch}: {output:?}");
         assert!(
             String::from_utf8_lossy(&output.stderr).contains(&format!(
-                "remote upstream's URL ({fetch}) is outside the grammar knives compares, so the creation's target cannot be certified: state the repository (-R OWNER/REPO)"
+                "remote upstream's URL ({fetch}) is outside the grammar knives compares, so the repository this checkout addresses cannot be read: state the repository (-R OWNER/REPO)"
             )),
             "{fetch}: {output:?}"
         );
@@ -5669,6 +5678,191 @@ fn a_hosts_file_outside_the_grammar_is_refused_and_the_files_gh_writes_are_read(
     // github.com — hosts.yml's GHE host is not read.
     hosts.write("config.yml", "version: \"1\"\nhosts: {}\n");
     hosts.passed("empty flow map as the hosts region");
+}
+
+#[test]
+fn a_three_part_repository_or_an_absolute_url_reads_no_configuration_file() {
+    // Round-14 F1: the config-file refusal names `-R HOST/OWNER/REPO` as
+    // its first remedy, and the reader consulted the files before parsing
+    // the spec — so the remedy refused again and only GH_HOST cleared it.
+    // A spec that names its host, in `-R` or `GH_REPO`, and an endpoint
+    // with an absolute URL, read nothing from gh's files; a two-part spec
+    // still does, and is still refused.
+    let hosts = HostsLab::new();
+    hosts.write("hosts.yml", "ghe.example:\n    user: m\n");
+    hosts.write(
+        "config.yml",
+        "version: \"1\"\n? hosts\n: {ghe.example: {user: m}}\n",
+    );
+    let config_refusal = format!(
+        "gh's {} is not YAML knives reads (line 2: \"? hosts\")",
+        hosts.gh_config.path().join("config.yml").display()
+    );
+    hosts.refused("two-part -R", &config_refusal);
+    let gated = |what: &str, output: std::process::Output| {
+        assert_eq!(output.status.code(), Some(2), "{what}: {output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("feat/eps has placement verdict FORK"),
+            "{what}: {output:?}"
+        );
+        assert!(
+            !stderr.contains("is not YAML knives reads"),
+            "{what}: {stderr}"
+        );
+        assert!(!hosts.log.exists(), "{what}: gh ran despite the refusal");
+    };
+    gated(
+        "three-part -R",
+        hosts.run_with(
+            &[
+                "pr",
+                "create",
+                "-R",
+                "ghe.example/routed-a/upstream",
+                "-t",
+                "t",
+                "-b",
+                "b",
+            ],
+            &[],
+        ),
+    );
+    gated(
+        "three-part GH_REPO",
+        hosts.run_with(
+            &["pr", "create", "-t", "t", "-b", "b"],
+            &[("GH_REPO", "ghe.example/routed-a/upstream")],
+        ),
+    );
+    gated(
+        "three-part -R on a placeholder REST creation",
+        hosts.run_with(
+            &[
+                "api",
+                "-X",
+                "POST",
+                "-R",
+                "ghe.example/routed-a/upstream",
+                "repos/{owner}/{repo}/pulls",
+                "-f",
+                "head=routed-b:feat/eps",
+            ],
+            &[],
+        ),
+    );
+    // A two-part GH_REPO still needs the default host: the config refusal.
+    let output = hosts.run_with(
+        &["pr", "create", "-t", "t", "-b", "b"],
+        &[("GH_REPO", "routed-a/upstream")],
+    );
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains(&config_refusal),
+        "{output:?}"
+    );
+    // An absolute URL names its host: another host's repository, another
+    // owner — passed to gh with no file read (the placement gate is on the
+    // GHE upstream only).
+    let output = hosts.run_with(
+        &[
+            "api",
+            "-X",
+            "POST",
+            &format!(
+                "https://api.{}/repos/other/decoy/pulls",
+                concat!("github", ".com")
+            ),
+            "-f",
+            "head=routed-b:feat/eps",
+        ],
+        &[],
+    );
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("is not YAML knives reads"),
+        "{output:?}"
+    );
+}
+
+#[test]
+fn an_upstream_remote_spelled_with_an_uppercase_git_suffix_is_the_upstream() {
+    // Round-14 L1 (measured by the reviewer): gh preserves the case of a
+    // `.GIT` remote and GitHub 404s the path, so the creation failed for
+    // GitHub's reason and not knives'. The registry compare strips the
+    // suffix in any case; the target's spelling now does too, so
+    // `…/upstream.GIT` is the upstream, gated, and never `…/upstream.GIT.git`.
+    let config_home = placement_gate_home();
+    record_placement(config_home.path(), "feat/eps", "FORK");
+    let host = concat!("github", ".com");
+    for upstream in [
+        format!("https://{host}/routed-a/upstream.GIT"),
+        format!("https://{host}/routed-a/upstream.Git/"),
+        format!("git@{host}:routed-a/upstream.GIT"),
+    ] {
+        let (output, recorded) = run_in_clone_with_upstream_config(
+            config_home.path(),
+            &[("remote.upstream.url", upstream.as_str())],
+            &[
+                "pr",
+                "create",
+                "-t",
+                "t",
+                "-b",
+                "b",
+                "--head",
+                "routed-b:feat/eps",
+            ],
+        );
+        assert_eq!(output.status.code(), Some(2), "{upstream}: {output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("feat/eps has placement verdict FORK"),
+            "{upstream}: {output:?}"
+        );
+        assert!(recorded.is_none(), "{upstream}: gh ran: {recorded:?}");
+    }
+}
+
+#[test]
+fn a_repo_flag_on_gh_api_is_read_for_the_gate_and_gh_itself_refuses_it() {
+    // Measured (pass 15, MEASUREMENT.md): gh 2.98.0 `api` defines no
+    // `-R`/`--repo` — `unknown shorthand flag: 'R' in -R`, exit 1, before
+    // any request. knives reads the flag on `api` by the shim's convention
+    // (token routing; a placeholder endpoint's repository), so with it
+    // present the outcome is either knives' refusal or gh's own: the flag is
+    // passed through as written, and no creation can ride it.
+    let gate = GateLab::on_fork_bookmark();
+    let placeholder = "repos/{owner}/{repo}/pulls";
+    // Toward the registered upstream: knives refuses (the over-gate).
+    gate.refused(
+        &[
+            "api",
+            "-X",
+            "POST",
+            "-R",
+            "routed-a/upstream",
+            placeholder,
+            "-f",
+            "head=routed-b:feat/eps",
+        ],
+        &[],
+        "feat/eps has placement verdict FORK",
+    );
+    // Toward another repository: passed, `-R` intact for gh to refuse.
+    let recorded = gate.passed(
+        &[
+            "api",
+            "-X",
+            "POST",
+            "-R",
+            "other/decoy",
+            placeholder,
+            "-f",
+            "head=routed-b:feat/eps",
+        ],
+        &[],
+    );
+    assert!(recorded.contains("-R\nother/decoy\n"), "{recorded}");
 }
 
 #[test]

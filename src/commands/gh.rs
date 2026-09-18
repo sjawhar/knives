@@ -16,7 +16,8 @@
 //! go-gh or GitHub would normalise it (see `gh_canon`): a repository is read
 //! only as `OWNER/REPO` or `HOST/OWNER/REPO` (two parts on gh's default
 //! host: `GH_HOST`, else the one host in gh's configuration — `config.yml`'s
-//! `hosts:` block, else `hosts.yml` — else github.com), a
+//! `hosts:` block, else `hosts.yml` — else github.com; three parts, or an
+//! absolute URL, name their host and read no file), a
 //! head only as `<fork-owner>:<branch>` — gh reads a bare branch as the
 //! base repository's own — an endpoint only as `repos/OWNER/REPO/pulls` on
 //! the host the request goes to (an absolute URL's own, else `--hostname`,
@@ -41,7 +42,7 @@
 //! never read past, never a fall-through to the other file. With no head stated the gate states `<fork-owner>:<branch in hand>`
 //! itself, so gh never resolves one knives did not read. A token is routed
 //! only for a canonical owner on a host that folds to the default host.
-// allow: SIZE_OK: 3391 lines - single passthrough pipeline; splitting would separate resolution steps that read as one procedure.
+// allow: SIZE_OK: 3405 lines - single passthrough pipeline; splitting would separate resolution steps that read as one procedure.
 use std::collections::BTreeMap;
 use std::io::Read as _;
 use std::os::unix::{
@@ -434,13 +435,19 @@ pub(crate) fn normalize_url(url: &str) -> Option<String> {
     while url.ends_with('/') {
         url.pop();
     }
-    #[allow(
-        clippy::case_sensitive_file_extension_comparisons,
-        reason = "The canonical remote suffix is the literal lowercase .git."
-    )]
-    if !url.ends_with(".git") {
-        url.push_str(".git");
+    // The suffix in any case is the one repository to GitHub's redirects and
+    // to `remote_url::same_remote`; respelled lowercase, so `…/repo.GIT`
+    // never becomes `…/repo.GIT.git`, a path the registry matches nothing
+    // with, and a compare cannot depend on how GitHub answers a spelling
+    // (round-14 L1).
+    let stem = url.len().saturating_sub(4);
+    if url
+        .get(stem..)
+        .is_some_and(|suffix| suffix.eq_ignore_ascii_case(".git"))
+    {
+        url.truncate(stem);
     }
+    url.push_str(".git");
     Some(url)
 }
 
@@ -820,10 +827,10 @@ fn stated_repository(invocation: &GhInvocation) -> Option<Result<Repo, String>> 
         .filter(|flag| flag.name == "repo")
         .map(|flag| flag.value.as_deref().unwrap_or(""))
         .collect();
-    // A two-part spec is on gh's default host, which `GH_HOST` overrides.
+    // A two-part spec is on gh's default host, which `GH_HOST` overrides;
+    // a three-part one names its host and reads no configuration file.
     let read = |source: &str, spec: &str| -> Result<Repo, String> {
-        let host = default_host()?;
-        Repo::parse(spec, &host).ok_or_else(|| gh_canon::repo_refusal(source, spec))
+        Repo::parse(spec, default_host)?.ok_or_else(|| gh_canon::repo_refusal(source, spec))
     };
     match stated.as_slice() {
         [] => {
@@ -888,7 +895,8 @@ fn target(invocation: &GhInvocation, cwd: &Path) -> Target {
     {
         return Target::Unreadable(format!(
             "remote {name}'s URL ({url}) is outside the grammar knives compares, so the \
-             creation's target cannot be certified: state the repository (-R OWNER/REPO)"
+             repository this checkout addresses cannot be read: state the repository (-R \
+             OWNER/REPO)"
         ));
     }
     let bound = registry
@@ -1834,9 +1842,15 @@ mod tests {
             normalize_url("git@:acme/work").unwrap(),
             "git@:acme/work.git"
         );
+        // The suffix in any case is respelled lowercase (round-14 L1), so the
+        // compare never depends on GitHub's answer to `…/work.GIT`.
         assert_eq!(
             normalize_url(&format!("https://{host}/acme/work.GIT")).unwrap(),
-            format!("https://{host}/acme/work.GIT.git")
+            format!("https://{host}/acme/work.git")
+        );
+        assert_eq!(
+            normalize_url(&format!("git@{host}:acme/work.Git/")).unwrap(),
+            format!("https://{host}/acme/work.git")
         );
         assert_eq!(normalize_url(""), None);
     }
