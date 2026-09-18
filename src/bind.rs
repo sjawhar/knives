@@ -301,12 +301,21 @@ pub(crate) fn git(directory: &Path) -> std::process::Command {
     command
 }
 
-/// Remotes of the repository rooted at `root`, from its own git configuration.
+/// Remotes of the repository rooted at `root`, as git and gh use them.
 ///
-/// `git -C root config --local --get-regexp '^remote\..*\.url$'`: the
-/// repository's own configuration file and nothing else — not the user's, not
-/// the system's, not the environment's. For a linked worktree that is the
-/// common repository's file, so a jj workspace of a colocated checkout reports
+/// `git -C root remote -v`, the fetch URL of each remote: git's *effective*
+/// URL, with every `url.<base>.insteadOf` rewrite applied — the URL gh reads
+/// (`git remote -v` is gh's own remote listing) and the one git would fetch
+/// from. The raw `remote.<name>.url` value would call a remote spelled
+/// through an alias another repository. Configuration reaches the read the
+/// way it reaches git: the repository's own file, the user's and the
+/// system's; `GIT_CONFIG_*` environment overrides do not (every git read
+/// knives makes strips them, see [`git_command`]). An ssh URL's host is then
+/// translated the way go-gh's ssh translator translates it — `ssh -G <host>`
+/// and its `hostname` answer — so an ssh-config alias names the host it
+/// stands for; without `ssh` on PATH, or on any failure, the host stays as
+/// written (gh's own fallback). For a linked worktree the configuration is
+/// the common repository's, so a jj workspace of a colocated checkout reports
 /// the checkout's remotes. A root with no `.git` is not a repository knives
 /// reads.
 pub fn remotes(root: &Path) -> Result<BTreeMap<String, String>, BindError> {
@@ -315,33 +324,24 @@ pub fn remotes(root: &Path) -> Result<BTreeMap<String, String>, BindError> {
         detail,
     };
     let output = git(root)
-        .args([
-            "config",
-            "--local",
-            "-z",
-            "--get-regexp",
-            "^remote\\..*\\.url$",
-        ])
+        .args(["remote", "-v"])
         .output()
         .map_err(|error| failure(error.to_string()))?;
-    // git exits 1 with empty output when nothing matches: no remotes, not an error.
-    let no_matches =
-        output.status.code() == Some(1) && output.stdout.is_empty() && output.stderr.is_empty();
-    if !output.status.success() && !no_matches {
+    if !output.status.success() {
         return Err(failure(error_line(&output.stderr)));
     }
+    let mut aliases = BTreeMap::new();
     String::from_utf8_lossy(&output.stdout)
-        .split('\0')
-        .filter(|record| !record.is_empty())
-        .map(|record| {
-            // With `-z`, git prints `remote.<name>.url\n<url>` per NUL-terminated record.
-            record
-                .split_once('\n')
-                .and_then(|(key, url)| {
-                    let name = key.strip_prefix("remote.")?.strip_suffix(".url")?;
-                    Some((name.to_owned(), url.trim().to_owned()))
-                })
-                .ok_or_else(|| failure(format!("unparseable remote record {record:?}")))
+        .lines()
+        .filter_map(|line| line.strip_suffix(" (fetch)"))
+        .map(|line| {
+            // `<name>\t<url> (fetch)`; a remote with no URL configured is
+            // listed by git with an empty URL, which stays empty.
+            let (name, url) = line
+                .split_once('\t')
+                .ok_or_else(|| failure(format!("unparseable remote line {line:?}")))?;
+            let url = crate::remote_url::with_ssh_alias_resolved(url.trim(), &mut aliases);
+            Ok((name.to_owned(), url))
         })
         .collect()
 }

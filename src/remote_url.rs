@@ -121,6 +121,83 @@ pub fn remote_authority_and_path(url: &str) -> Option<(&str, &str)> {
     authority.contains('@').then_some((authority, path))
 }
 
+/// `url` with its ssh host alias resolved the way go-gh's ssh translator
+/// resolves it.
+///
+/// For an ssh remote (`ssh://…`, `git+ssh://…`, or the scp form
+/// `[user@]host:path`) the host is what `ssh -G <host>` answers as
+/// `hostname` — an ssh-config `Host` alias names the host it stands for;
+/// `ssh.github.com` folds to `github.com` as gh folds it. Any other URL, or
+/// any failure — no `ssh` on PATH, a non-zero exit, no `hostname` line —
+/// leaves the URL as written (gh's own fallback). `cache` remembers each
+/// host's answer for the caller's run.
+pub fn with_ssh_alias_resolved(
+    url: &str,
+    cache: &mut std::collections::BTreeMap<String, String>,
+) -> String {
+    let Some((authority, _)) = authority_and_path(url) else {
+        return url.to_owned();
+    };
+    let is_ssh = url.starts_with("ssh://") || url.starts_with("git+ssh://") || !url.contains("://");
+    if !is_ssh || authority.is_empty() {
+        return url.to_owned();
+    }
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    let host = match host.rsplit_once(':') {
+        Some((name, port))
+            if !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()) =>
+        {
+            name
+        }
+        _ => host,
+    };
+    if host.is_empty() {
+        return url.to_owned();
+    }
+    let resolved = cache
+        .entry(host.to_ascii_lowercase())
+        .or_insert_with(|| ssh_hostname(host).unwrap_or_else(|| host.to_owned()))
+        .clone();
+    if resolved.eq_ignore_ascii_case(host) {
+        return url.to_owned();
+    }
+    // The host is a subslice of `url`; splice the answer in its place.
+    let offset = host.as_ptr() as usize - url.as_ptr() as usize;
+    let mut rewritten = String::with_capacity(url.len() + resolved.len());
+    rewritten.push_str(&url[..offset]);
+    rewritten.push_str(&resolved);
+    rewritten.push_str(&url[offset + host.len()..]);
+    rewritten
+}
+
+/// What `ssh -G host` answers as `hostname` (the last such line), with
+/// `ssh.github.com` folded to `github.com`; `None` on any failure.
+fn ssh_hostname(host: &str) -> Option<String> {
+    let output = std::process::Command::new("ssh")
+        .args(["-G", host])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let answer = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .rev()
+        .find_map(|line| line.strip_prefix("hostname "))?
+        .trim()
+        .to_owned();
+    if answer.is_empty() {
+        return None;
+    }
+    Some(if answer.eq_ignore_ascii_case("ssh.github.com") {
+        "github.com".to_owned()
+    } else {
+        answer
+    })
+}
+
 /// The host of a remote URL, without its user or port; `None` for a non-URL.
 pub fn remote_host(url: &str) -> Option<&str> {
     host_and_path(url).map(|(host, _)| host)

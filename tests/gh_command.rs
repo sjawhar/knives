@@ -7,7 +7,7 @@
 
 #[path = "common/lab.rs"]
 mod lab;
-// allow: SIZE_OK: 4660 lines - real-binary gh passthrough scenarios share one fixture and process harness.
+// allow: SIZE_OK: 5163 lines - real-binary gh passthrough scenarios share one fixture and process harness.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
@@ -4305,6 +4305,509 @@ fn a_registry_origin_without_a_readable_owner_is_refused_and_a_userless_scp_one_
         String::from_utf8_lossy(&output.stderr).contains("a branch of 's repository"),
         "{output:?}"
     );
+}
+
+/// A fake `ssh` whose `-G <host>` answers `hostname <target>` for one alias
+/// and echoes any other host, the way go-gh's own tests inject the command.
+fn fake_ssh(alias: &str, target: &str) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("fake ssh dir");
+    let script = dir.path().join("ssh");
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\n[ \"$1\" = -G ] || exit 255\ncase \"$2\" in\n  {alias}) printf 'user git\\nhostname {target}\\n' ;;\n  *) printf 'hostname %s\\n' \"$2\" ;;\nesac\n"
+        ),
+    )
+    .expect("write fake ssh");
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod fake ssh");
+    dir
+}
+
+/// A plain git clone of the fork on `branch`, its `upstream` remote spelled
+/// `upstream_url` and its `origin` the fork; `configure` runs `git config`
+/// lines in it.
+fn fork_clone_with_upstream(
+    scratch: &Path,
+    branch: &str,
+    upstream_url: &str,
+    configure: &[(&str, &str)],
+) -> PathBuf {
+    let host = concat!("github", ".com");
+    let clone = scratch.join("clone");
+    lab::git_repository(&clone, &[]);
+    fs::write(clone.join("README.md"), "seed\n").expect("write seed");
+    lab::git_commit_all(&clone, "seed");
+    git_config(
+        &clone,
+        &[
+            "remote.origin.url",
+            &format!("https://{host}/routed-b/origin.git"),
+        ],
+    );
+    git_config(&clone, &["remote.upstream.url", upstream_url]);
+    for (key, value) in configure {
+        git_config(&clone, &[*key, *value]);
+    }
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(&clone)
+        .args(["checkout", "--quiet", "-b", branch])
+        .status()
+        .expect("git checkout");
+    assert!(status.success());
+    clone
+}
+
+#[test]
+fn an_insteadof_rewritten_upstream_remote_is_the_upstream_to_gh_and_to_knives() {
+    // gh lists remotes with `git remote -v`, which applies `url.<base>.insteadOf`;
+    // reading the raw `remote.<n>.url` called an aliased upstream another
+    // repository, and a FORK branch reached the upstream with no -R
+    // (round-10 M2, both lanes). knives now reads the effective URL.
+    let config_home = placement_gate_home();
+    record_placement(config_home.path(), "feat/eps", "FORK");
+    record_placement(config_home.path(), "feat/up", "UPSTREAM");
+    let host = concat!("github", ".com");
+    let scratch = tempfile::tempdir().expect("scratch");
+    let clone = fork_clone_with_upstream(
+        scratch.path(),
+        "feat/eps",
+        "gh:routed-a/upstream.git",
+        &[(&format!("url.https://{host}/.insteadOf"), "gh:")],
+    );
+    let (dir, log) = fake_gh();
+    let helper_dir = fake_app_token();
+    let gitconfig = token_config(helper_dir.path(), "routed-a");
+    let run = |arguments: &[&str]| {
+        knives_cmd(helper_dir.path())
+            .args(["gh", "--"])
+            .args(arguments)
+            .current_dir(&clone)
+            .env("KNIVES_CONFIG_HOME", config_home.path())
+            .env("HOME", scratch.path())
+            .env("KNIVES_REAL_GH", dir.path().join("gh"))
+            .env("FAKE_GH_LOG", &log)
+            .env("PATH", helper_path(helper_dir.path()))
+            .env("GIT_CONFIG_GLOBAL", &gitconfig)
+            .output()
+            .expect("run knives gh")
+    };
+    let fork = "feat/eps has placement verdict FORK";
+    for arguments in [
+        &[
+            "pr",
+            "create",
+            "-t",
+            "t",
+            "-b",
+            "b",
+            "--head",
+            "routed-b:feat/eps",
+        ][..],
+        &["pr", "create", "-t", "t", "-b", "b"][..],
+        &[
+            "api",
+            "-X",
+            "POST",
+            "repos/{owner}/{repo}/pulls",
+            "-f",
+            "head=routed-b:feat/eps",
+            "-f",
+            "base=main",
+        ][..],
+    ] {
+        let output = run(arguments);
+        assert_eq!(output.status.code(), Some(2), "{arguments:?}: {output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(fork),
+            "{arguments:?}: {output:?}"
+        );
+        assert!(!log.exists(), "{arguments:?}: gh ran despite the refusal");
+    }
+    // The GraphQL creation is refused inside the recognised fork too.
+    let mutation = "mutation { createPullRequest(input:{repositoryId:\"x\",headRefName:\"feat/eps\"}) { pullRequest { id } } }";
+    let output = run(&["api", "graphql", "-f", &format!("query={mutation}")]);
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("targets registered's upstream"),
+        "{output:?}"
+    );
+    // The UPSTREAM branch passes with the head stated and the upstream's token.
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(&clone)
+        .args(["checkout", "--quiet", "-b", "feat/up"])
+        .status()
+        .expect("git");
+    assert!(status.success());
+    let output = run(&["pr", "create", "-t", "t", "-b", "b"]);
+    assert!(output.status.success(), "{output:?}");
+    let recorded = fs::read_to_string(&log).expect("fake gh ran");
+    assert!(recorded.contains("--head\nrouted-b:feat/up"), "{recorded}");
+    assert!(recorded.contains("GH_TOKEN=tok-routed-a"), "{recorded}");
+}
+
+#[test]
+fn an_ssh_alias_in_the_upstream_remote_is_resolved_the_way_gh_resolves_it() {
+    // gh translates an ssh remote's host through `ssh -G <host>` (go-gh's
+    // ssh translator); an ssh-config alias for github.com names the upstream.
+    // ssh reads the passwd home's config, not $HOME, so the alias is answered
+    // by a fake `ssh` on PATH, as go-gh's own tests inject the command.
+    let config_home = placement_gate_home();
+    record_placement(config_home.path(), "feat/eps", "FORK");
+    let host = concat!("github", ".com");
+    let scratch = tempfile::tempdir().expect("scratch");
+    let clone = fork_clone_with_upstream(
+        scratch.path(),
+        "feat/eps",
+        "git@ghalias:routed-a/upstream.git",
+        &[],
+    );
+    let (dir, log) = fake_gh();
+    let helper_dir = fake_app_token();
+    let gitconfig = token_config(helper_dir.path(), "routed-a");
+    let ssh = fake_ssh("ghalias", host);
+    let run = |arguments: &[&str], with_ssh: bool| {
+        let path = if with_ssh {
+            format!(
+                "{}:{}",
+                ssh.path().display(),
+                helper_path(helper_dir.path())
+            )
+        } else {
+            helper_path(helper_dir.path())
+        };
+        knives_cmd(helper_dir.path())
+            .args(["gh", "--"])
+            .args(arguments)
+            .current_dir(&clone)
+            .env("KNIVES_CONFIG_HOME", config_home.path())
+            .env("HOME", scratch.path())
+            .env("KNIVES_REAL_GH", dir.path().join("gh"))
+            .env("FAKE_GH_LOG", &log)
+            .env("PATH", path)
+            .env("GIT_CONFIG_GLOBAL", &gitconfig)
+            .output()
+            .expect("run knives gh")
+    };
+    let create = [
+        "pr",
+        "create",
+        "-t",
+        "t",
+        "-b",
+        "b",
+        "--head",
+        "routed-b:feat/eps",
+    ];
+    let output = run(&create, true);
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("feat/eps has placement verdict FORK"),
+        "{output:?}"
+    );
+    assert!(!log.exists(), "gh ran despite the refusal");
+    // A scp URL spelled with an ssh:// scheme and a port resolves the same.
+    git_config(
+        &clone,
+        &[
+            "remote.upstream.url",
+            "ssh://git@ghalias:22/routed-a/upstream.git",
+        ],
+    );
+    let output = run(&create, true);
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    // Without ssh on PATH the host stays as written — gh's own fallback —
+    // and the alias is another repository; the real ssh on this box answers
+    // the alias with itself (no such Host in the passwd home's config).
+    let output = run(&create, false);
+    assert!(output.status.success(), "{output:?}");
+    let recorded = fs::read_to_string(&log).expect("fake gh ran");
+    assert!(recorded.contains("GH_TOKEN=unset"), "{recorded}");
+}
+
+#[test]
+fn a_hosts_block_inside_config_yml_is_gh_s_default_host_too() {
+    // go-gh's `load` keeps config.yml's own `hosts` entry ahead of hosts.yml's
+    // (pass-11 MEASUREMENT.md rows A–E, I, J): the pre-multi-account layout
+    // gh still reads. Read first; hosts.yml only when config.yml has no
+    // `hosts:` block (round-10 M1, both lanes).
+    let config_home = enterprise_gate_home();
+    record_placement(config_home.path(), "feat/eps", "FORK");
+    let lab = lab::Lab::new();
+    lab.branch("feat/eps", "eps.txt", "eps\n");
+    lab.jj_work(["edit", "feat/eps"]);
+    let (dir, log) = fake_gh();
+    let helper_dir = fake_app_token();
+    let gitconfig = token_config(helper_dir.path(), "routed-a");
+    let gh_config = tempfile::tempdir().expect("gh config dir");
+    let write = |name: &str, text: &str| {
+        fs::write(gh_config.path().join(name), text).expect("write gh file");
+    };
+    let remove = |name: &str| {
+        let _ = fs::remove_file(gh_config.path().join(name));
+    };
+    let create = [
+        "pr",
+        "create",
+        "-R",
+        "routed-a/upstream",
+        "-t",
+        "t",
+        "-b",
+        "b",
+    ];
+    let run = || {
+        knives_cmd(helper_dir.path())
+            .args(["gh", "--"])
+            .args(create)
+            .current_dir(&lab.work)
+            .env("KNIVES_CONFIG_HOME", config_home.path())
+            .env("HOME", lab.temp_path())
+            .env("KNIVES_REAL_GH", dir.path().join("gh"))
+            .env("FAKE_GH_LOG", &log)
+            .env("PATH", helper_path(helper_dir.path()))
+            .env("GIT_CONFIG_GLOBAL", &gitconfig)
+            .env_remove("GH_HOST")
+            .env("GH_CONFIG_DIR", gh_config.path())
+            .output()
+            .expect("run knives gh")
+    };
+    let refused = |text: &str| {
+        let output = run();
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(text),
+            "{output:?}"
+        );
+        assert!(!log.exists(), "gh ran despite the refusal");
+    };
+    let passed = || {
+        let output = run();
+        assert!(output.status.success(), "{output:?}");
+        fs::remove_file(&log).expect("reset the gh log");
+    };
+    let fork = "feat/eps has placement verdict FORK";
+    let ghe_block =
+        "version: \"1\"\nhosts:\n    ghe.example:\n        user: m\n        oauth_token: x\n";
+    // Rows A–E: config.yml's block wins over an absent, github.com-only,
+    // empty, `{}`, or other-host hosts.yml.
+    write("config.yml", ghe_block);
+    remove("hosts.yml");
+    refused(fork);
+    write("hosts.yml", concat!("github", ".com", ":\n    user: m\n"));
+    refused(fork);
+    write("hosts.yml", "");
+    refused(fork);
+    write("hosts.yml", "{}\n");
+    refused(fork);
+    write("hosts.yml", "other.example:\n    user: m\n");
+    refused(fork);
+    // Row F (control): config.yml's block names github.com; hosts.yml's GHE
+    // host is not read.
+    write(
+        "config.yml",
+        concat!(
+            "version: \"1\"\nhosts:\n    ",
+            "github",
+            ".com",
+            ":\n        user: m\n"
+        ),
+    );
+    write("hosts.yml", "ghe.example:\n    user: m\n");
+    passed();
+    // Row J: two hosts in the block → github.com. A versionless block reads
+    // the same way (gh migrates it in place).
+    write(
+        "config.yml",
+        "version: \"1\"\nhosts:\n    ghe.example:\n        user: m\n    other.example:\n        user: m\n",
+    );
+    remove("hosts.yml");
+    passed();
+    write("config.yml", "hosts:\n    ghe.example:\n        user: m\n");
+    refused(fork);
+}
+
+#[test]
+fn without_a_hosts_block_config_yml_yields_to_hosts_yml_and_an_unreadable_block_is_refused() {
+    // go-gh's `load` keeps config.yml's own `hosts` entry ahead of hosts.yml's
+    // (pass-11 MEASUREMENT.md rows A–E, I, J): the pre-multi-account layout
+    // gh still reads. Read first; hosts.yml only when config.yml has no
+    // `hosts:` block (round-10 M1, both lanes).
+    let config_home = enterprise_gate_home();
+    record_placement(config_home.path(), "feat/eps", "FORK");
+    let lab = lab::Lab::new();
+    lab.branch("feat/eps", "eps.txt", "eps\n");
+    lab.jj_work(["edit", "feat/eps"]);
+    let (dir, log) = fake_gh();
+    let helper_dir = fake_app_token();
+    let gitconfig = token_config(helper_dir.path(), "routed-a");
+    let gh_config = tempfile::tempdir().expect("gh config dir");
+    let write = |name: &str, text: &str| {
+        fs::write(gh_config.path().join(name), text).expect("write gh file");
+    };
+    let remove = |name: &str| {
+        let _ = fs::remove_file(gh_config.path().join(name));
+    };
+    let create = [
+        "pr",
+        "create",
+        "-R",
+        "routed-a/upstream",
+        "-t",
+        "t",
+        "-b",
+        "b",
+    ];
+    let run = || {
+        knives_cmd(helper_dir.path())
+            .args(["gh", "--"])
+            .args(create)
+            .current_dir(&lab.work)
+            .env("KNIVES_CONFIG_HOME", config_home.path())
+            .env("HOME", lab.temp_path())
+            .env("KNIVES_REAL_GH", dir.path().join("gh"))
+            .env("FAKE_GH_LOG", &log)
+            .env("PATH", helper_path(helper_dir.path()))
+            .env("GIT_CONFIG_GLOBAL", &gitconfig)
+            .env_remove("GH_HOST")
+            .env("GH_CONFIG_DIR", gh_config.path())
+            .output()
+            .expect("run knives gh")
+    };
+    let refused = |text: &str| {
+        let output = run();
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(text),
+            "{output:?}"
+        );
+        assert!(!log.exists(), "gh ran despite the refusal");
+    };
+    let passed = || {
+        let output = run();
+        assert!(output.status.success(), "{output:?}");
+        fs::remove_file(&log).expect("reset the gh log");
+    };
+    let fork = "feat/eps has placement verdict FORK";
+    // No `hosts:` block: hosts.yml decides, as before; other config.yml keys
+    // (`git_protocol`, `editor`, `aliases:` with its own indented map) are not hosts.
+    write(
+        "config.yml",
+        "version: \"1\"\ngit_protocol: https\naliases:\n    co: pr checkout\n",
+    );
+    write("hosts.yml", "ghe.example:\n    user: m\n");
+    refused(fork);
+    remove("hosts.yml");
+    passed();
+    // Row I: a flow-mapped block gh reads is refused rather than parsed; so
+    // is a scalar under `hosts:`.
+    write(
+        "config.yml",
+        "version: \"1\"\nhosts: {ghe.example: {user: m}}\n",
+    );
+    refused("is not a hosts map knives can read");
+    write("config.yml", "version: \"1\"\nhosts:\n    ghe.example: m\n");
+    refused("is not a hosts map knives can read");
+}
+
+#[test]
+fn a_bom_and_a_port_in_hosts_yml_are_read_as_gh_reads_them() {
+    // Two shapes gh reads that pass 10 over-refused (round-10 L1): a UTF-8
+    // byte-order mark before the first key, and a `HOST:PORT:` key, whose
+    // host is the host.
+    let config_home = enterprise_gate_home();
+    record_placement(config_home.path(), "feat/eps", "FORK");
+    let lab = lab::Lab::new();
+    lab.branch("feat/eps", "eps.txt", "eps\n");
+    lab.jj_work(["edit", "feat/eps"]);
+    let (dir, log) = fake_gh();
+    let gh_config = tempfile::tempdir().expect("gh config dir");
+    for text in [
+        "\u{feff}ghe.example:\n    user: m\n",
+        "ghe.example:8443:\n    user: m\n",
+    ] {
+        fs::write(gh_config.path().join("hosts.yml"), text).expect("write hosts.yml");
+        let output = knives_cmd(config_home.path())
+            .args([
+                "gh",
+                "--",
+                "pr",
+                "create",
+                "-R",
+                "routed-a/upstream",
+                "-t",
+                "t",
+                "-b",
+                "b",
+            ])
+            .current_dir(&lab.work)
+            .env("KNIVES_CONFIG_HOME", config_home.path())
+            .env("HOME", lab.temp_path())
+            .env("KNIVES_REAL_GH", dir.path().join("gh"))
+            .env("FAKE_GH_LOG", &log)
+            .env_remove("GH_HOST")
+            .env("GH_CONFIG_DIR", gh_config.path())
+            .output()
+            .expect("run knives gh");
+        assert_eq!(output.status.code(), Some(2), "{text:?}: {output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("feat/eps has placement verdict FORK"),
+            "{text:?}: {output:?}"
+        );
+    }
+}
+
+#[test]
+fn a_query_string_on_the_creation_endpoint_is_refused() {
+    // GitHub may read a query parameter over the body knives certifies the
+    // head from (unverified either way without a real token): fail closed
+    // (round-10 deep L2). A `#fragment` is never sent and is still stripped.
+    let gate = GateLab::on_fork_bookmark();
+    let host = concat!("github", ".com");
+    let text = "carries a query string, which GitHub may read over the body: state the endpoint as \
+                repos/OWNER/REPO/pulls and the fields as -f";
+    gate.refused(
+        &rest_creation("repos/routed-a/upstream/pulls?head=routed-b:feat/eps", &[]),
+        &[],
+        text,
+    );
+    gate.refused(
+        &rest_creation(
+            &format!("https://api.{host}/repos/routed-a/upstream/pulls?x=1"),
+            &[],
+        ),
+        &[],
+        text,
+    );
+    gate.refused(
+        &[
+            "api",
+            "repos/routed-a/upstream/pulls?x=1#f",
+            "-f",
+            "head=routed-b:feat/up",
+        ],
+        &[],
+        text,
+    );
+    // The fragment alone is stripped; the UPSTREAM head passes.
+    let recorded = gate.passed(
+        &[
+            "api",
+            "-X",
+            "POST",
+            "repos/routed-a/upstream/pulls#f",
+            "-f",
+            "head=routed-b:feat/up",
+            "-f",
+            "base=main",
+        ],
+        &[],
+    );
+    assert!(recorded.contains("GH_TOKEN=tok-routed-a"), "{recorded}");
+    // A query on a GET is nothing to the gate.
+    let recorded = gate.passed(&["api", "repos/routed-a/upstream/pulls?state=open"], &[]);
+    assert!(recorded.contains("GH_TOKEN=tok-routed-a"), "{recorded}");
 }
 
 #[test]

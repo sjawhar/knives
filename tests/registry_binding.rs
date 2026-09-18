@@ -355,7 +355,7 @@ fn a_broken_checkout_inside_a_repository_does_not_answer_for_it() {
     broken_colocated_checkout(&broken);
     let error = bind::remotes(&broken).expect_err("a broken checkout is unreadable");
     let text = error.to_string();
-    assert!(text.contains("inside a git repository"), "{text}");
+    assert!(text.contains("git repository"), "{text}");
     assert!(!text.contains("org/tool"), "{text}");
 }
 
