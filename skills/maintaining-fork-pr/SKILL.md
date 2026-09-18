@@ -21,7 +21,7 @@ A maintainer's design question is yours to answer, not to forward. Read the thre
 
 **Read the existing `knives notch` history before making a recon or repair decision.** This is where prior maintainers and agents recorded promises, settled choices, rejected approaches, release relationships and verification evidence. It is not merely somewhere to write your final report. No separate estate document is required.
 
-Your dispatch supplies the registry repo name, upstream slug, PR number/URL, branch, current status row, relevant captured notches/guidance, the branch's `placement:` notch (or states none exists), the shipped `pr-preflight` skill, the orchestrator's address and a run/repo/PR-qualified scratch path. Ask the orchestrator for genuinely missing coordinates; derive current requirements from the repo and its records, not an invented document. Read `fork-work`, `using-knives` and `using-jj` for the tools' contracts.
+Your dispatch supplies the registry repo name, upstream slug, PR number/URL, branch, current status row, relevant captured notches/guidance, the branch's `placement: verdict:` notch (or states none exists), the shipped `pr-preflight` skill, the orchestrator's address and a run/repo/PR-qualified scratch path. Ask the orchestrator for genuinely missing coordinates; derive current requirements from the repo and its records, not an invented document. Read `fork-work`, `using-knives` and `using-jj` for the tools' contracts.
 
 ```sh
 knives notch <branch> --repo <repo>
@@ -30,7 +30,7 @@ knives status <repo>
 knives start <branch> --repo <repo> --why '<PR number>: <work being owned>'
 ```
 
-Read full named chains, including older unprefixed notes and events; the workflow prefixes below organize new writes, not which history counts. Bare `knives notch --repo <repo>` shows recent repository context, not every historical obligation. An old anchor may describe another tip: check its evidence and any later correcting note before inheriting it. For every new workflow record, use the matching prefix (`placement:`, `recon:`, `rehome:`, `repair:`, `verify:`, `record:`, `decision:`, `handback:`), stamp the PR with `--pr` when it concerns that PR, and cite evidence that names the commit, URL or file state you relied on; `file:line` evidence comes from the file at that cited commit, not from a diff hunk. Do not write new unprefixed or evidence-free obligations. Do not rewrite or delete existing entries.
+Read full named chains, including older unprefixed notes and events; the workflow prefixes below organize new writes, not which history counts. Bare `knives notch --repo <repo>` shows recent repository context, not every historical obligation. An old anchor may describe another tip: check its evidence and any later correcting note before inheriting it. For every new workflow record, use the matching prefix (`recon:`, `rehome:`, `repair:`, `verify:`, `record:`, `decision:`, `handback:`), stamp the PR with `--pr` when it concerns that PR, and cite evidence that names the commit, URL or file state you relied on; `file:line` evidence comes from the file at that cited commit, not from a diff hunk. The placement record is not a prose prefix: it is the verdict note `knives start --placement` writes (`placement: verdict: CONSUMER | FORK | UPSTREAM`, then the red-team's file), or the same shape written by hand with `knives notch <branch> -m "placement: verdict: …"`, and the tool reads back only that shape — a note that begins `placement:` and continues as prose is an ordinary note, read by people and skipped by `release include`, `release advance` and `knives gh`. Do not write new unprefixed or evidence-free obligations. Do not rewrite or delete existing entries.
 
 **Direct Knives reads use the examples as written, without `--json`.** Reading individual
 fields yourself or returning a JSON final report does not make the model a programmatic parser.
@@ -97,7 +97,7 @@ Build a working list with one disposition for each item, judged from what you re
 - A body or reply claim that would mislead a maintainer about what the PR does now. A commit id that has since been rebased away is not, by itself, misleading — the prose is usually still true. Ask what a reviewer reading it today would believe, and whether that belief is wrong.
 - A missing template requirement or heading.
 - A forbidden identifier in added lines or proposed upstream prose, using the configured registry terms and applicable publication rules. If no list is configured, state that; still check for private hosts, credentials and internal process details.
-- Does the `placement:` notch cover this head? Missing or stale: investigate in recon, never backfill to unblock finished work.
+- Does the `placement: verdict:` notch cover this head? Missing or stale: investigate in recon, never backfill to unblock finished work.
 
 Dispositions are: already addressed (commit/reply evidence), to repair, declined (reason to give upstream), leave alone (say why — this is a real disposition, not a gap), genuine decision needed (only after the three conditions in "What owning means"), or currently unverifiable (specific external prerequisite). An outstanding promise is not already addressed. Note whether the branch is a release member, using the actual parent associations from `release members`; an advanced branch may succeed an older released parent.
 
@@ -154,7 +154,7 @@ Follow the user's applicable outbound-prose/disclosure rules and upstream policy
 Write `<per-PR-scratch>/reviewer-packet.md` with:
 
 - Repo, PR, branch, original PR head, expected branch tip, candidate head and claimed workspace.
-- The `placement:` notch; the reviewer challenges its evidence, not just whether the patch passes.
+- The `placement: verdict:` notch; the reviewer challenges its evidence, not just whether the patch passes.
 - Full fork-point-to-candidate diff and commit list; recon notch, inherited notch context and working list.
 - Draft body/replies, configured scan terms, exact gate commands and full log paths.
 - Reviewer rules: independently examine the **whole diff** for correctness, security and regressions, including when the owner reports no repairs. Check every recon/inherited obligation, scope of each fix, body truth, red/green evidence and remaining forbidden hits. Reproduce applicable claims; do not merely accept the owner's logs. No commit, notch, bookmark or forge mutation. Any gate-generated change must be reported, never silently folded in.

@@ -223,7 +223,7 @@ reads `not on this machine`, and an entry with two is refused with both paths na
 | `knives pr NUMBER [--repo REPO] [--timeline]` | one pull request's live state; `--timeline` adds its bounded forge event log |
 | `knives sync` | fetch, then classify what happened to each tracked pull request |
 | `knives preflight` | the facts to check before contributing upstream |
-| `knives start` | take a branch and get your own workspace: on its tip, or on the release's shared base for a new one; a NEW branch requires `--placement <file>`, a placement-verdict file (first line `verdict: CONSUMER \| FORK \| UPSTREAM`) recorded on the branch as a `placement:` ledger note — a `CONSUMER` verdict starts no branch; waits for the claim lock, and a refusal names the holder (the `using-knives` skill has the lock's mechanism, wait and messages); states the fork's `immutable_heads()` (trunk and tags, with the trunk named on every knives remote) in the repo's jj config where none is stated |
+| `knives start` | take a branch and get your own workspace: on its tip, or on the release's shared base for a new one; a NEW branch requires `--placement <file>`, a placement-verdict file (first line `verdict: CONSUMER \| FORK \| UPSTREAM`) recorded on the branch as a `placement: verdict:` ledger note — a `CONSUMER` verdict starts no branch; a `--placement` on an existing branch (claimed, resumed or seized) records a fresh verdict and the newest wins; waits for the claim lock, and a refusal names the holder (the `using-knives` skill has the lock's mechanism, wait and messages); states the fork's `immutable_heads()` (trunk and tags, with the trunk named on every knives remote) in the repo's jj config where none is stated |
 | `knives finish` | hand a branch back so another agent can pick it up; its bookmark and any open pull request survive |
 | `knives track` | state which pull request a branch belongs to, when inference cannot find it |
 | `knives depends` | record that a branch cannot land before another repo's pull request |
@@ -282,12 +282,16 @@ history carries a release merge is reported as `stacked-history`, and the plan s
 the cut `flat`.
 
 A fork member states the non-fork alternative it rejected before it exists: `knives start
---placement` records the placement verdict (the `fork-work` skill has the red-team brief that
-produces it), `release include` and `release advance --from` refuse a first-time member with no
-`placement:` note or a `CONSUMER` one, and `knives gh` refuses an upstream `pr create` (or the
-REST pulls creation) for a branch whose verdict is not `UPSTREAM`. Branches that predate the
-gate are grandfathered as members: a branch any recorded cut or edit names as a parent recuts
-and advances unasked; only new inclusions and upstream pull requests are gated.
+--placement` records the placement verdict as a `placement: verdict:` ledger note (the
+`fork-work` skill has the red-team brief that produces it; a `placement:` note that continues
+as prose is an ordinary note), `release include` and `release advance` refuse a first-time
+member with no verdict note, and any member whose newest verdict is `CONSUMER`, and `knives
+gh` refuses an upstream `pr create` (or the REST pulls creation, with whatever flags precede
+the path) for a branch whose verdict is not `UPSTREAM`; a GraphQL document read from a file is
+not inspected. Branches that predate the gate are grandfathered as members: a branch any
+recorded cut or edit names as a parent, with no verdict note, recuts and advances unasked; a
+bare commit id is included on your word; only new inclusions and upstream pull requests are
+gated.
 
 `knives release members --carries REVISION` compares the revision with every live release and the
 upstream trunk; `knives release members TARGET --carries REVISION` asks exactly one target;

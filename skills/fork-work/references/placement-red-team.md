@@ -25,8 +25,9 @@ The caller fills in:
      field, an environment the library reads, a documented extension point. Read the
      library's actual surface; do not trust the proposer's summary of it.
    - A resource-level override in the consumer's own deployment tooling on the resource
-     the library creates — e.g. a Pulumi stack transformation on the resource a library's
-     `deploy()` provisions. The library keeps its defaults; the consumer restates its own.
+     the library creates — e.g. a transformation the consumer's infrastructure-as-code
+     applies to the resource a library's `deploy()` provisions. The library keeps its
+     defaults; the consumer restates its own.
    - The consumer's own code: a wrapper, a subclass, a small reimplementation of the one
      behavior wanted, a cleanup job on the consumer's side of the boundary.
    "Hacky" means it depends on undocumented internals, breaks on routine library updates,

@@ -5,7 +5,7 @@ description: Check knives before working in a repository we maintain a fork of. 
 
 # About to work in a fork
 
-> **A fork branch states the non-fork alternative it rejected — before it exists.** Most effects a consumer wants from a library need no fork: a configuration value the library already exposes, a resource-level override in the consumer's own deployment tooling, or the consumer's own code. `knives start` refuses to create a new branch until the placement red-team (below) has answered CONSUMER / FORK / UPSTREAM and its verdict file is passed with `--placement`; a CONSUMER verdict starts no branch. FORK members ride the release cut and never become a pull request. UPSTREAM is the only verdict that leads to an upstream pull request — and never for a change to upstream defaults made to suit one deployment's preferences. Nobody is asked and no approval is awaited: the verdict is the written judgment, recorded as a `placement:` notch on the branch, and `release include`, `release advance` and `knives gh` read it back.
+> **A fork branch states the non-fork alternative it rejected — before it exists.** Most effects a consumer wants from a library need no fork: a configuration value the library already exposes, a resource-level override in the consumer's own deployment tooling, or the consumer's own code. `knives start` refuses to create a new branch until the placement red-team (below) has answered CONSUMER / FORK / UPSTREAM and its verdict file is passed with `--placement`; a CONSUMER verdict starts no branch. FORK members ride the release cut and never become a pull request. UPSTREAM is the only verdict that leads to an upstream pull request — and never for a change to upstream defaults made to suit one deployment's preferences. Nobody is asked and no approval is awaited: the verdict is the written judgment, recorded as a `placement: verdict:` notch on the branch, and `release include`, `release advance` and `knives gh` read it back.
 
 ## Stop and find out where you are
 
@@ -101,11 +101,14 @@ judge: <the red-team subagent's id or handle>
 <free text: evidence, reproduction, upstream signal>
 ```
 
-`knives start <branch> --placement <file>` records it on the branch as a `placement:`
-ledger note. CONSUMER means no branch: implement the alternative in the consumer instead.
-A verdict is re-checked, not inherited, when evidence or scope changes — record the newer
-one the same way (`knives start` on the existing branch with `--placement`, or `knives
-notch <branch> -m "placement: verdict: …"`), and the newest wins.
+`knives start <branch> --placement <file>` records it on the branch as a ledger note that
+begins `placement: verdict:` — the only note shape the tool reads as a verdict; a
+`placement:` note that continues as prose is an ordinary note. CONSUMER means no branch:
+implement the alternative in the consumer instead. A verdict is re-checked, not inherited,
+when evidence or scope changes — record the newer one the same way (`knives start` on the
+existing branch with `--placement`, whether that claims, resumes or seizes it, or `knives
+notch <branch> -m "placement: verdict: …"`), and the newest wins: a CONSUMER re-verdict is
+recorded on the existing branch and `start` says `knives finish <branch>` retires it.
 
 For an UPSTREAM candidate the brief additionally checks: does the change preserve upstream
 defaults, does a user outside this deployment benefit, and does the upstream repository

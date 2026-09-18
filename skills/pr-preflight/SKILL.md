@@ -5,7 +5,7 @@ description: Pre-PR contribution judgment gate for upstream repositories. Use wh
 
 # Upstream PR Preflight Gate
 
-> **An upstream PR requires `verdict: UPSTREAM`.** Every fork branch carries a placement verdict — the placement red-team's ruling (skill `fork-work`), recorded as a `placement:` notch by `knives start --placement` — and only `UPSTREAM` leads to an upstream pull request; `knives gh` refuses `gh pr create` toward a registered upstream for any other verdict. UPSTREAM means: a defect any user of the library would hit, fixed with evidence (a reproduction or red→green test), or a capability users outside this deployment need, extended the general way. **We do not change upstream defaults to suit one deployment's preferences** — a deployment-preference change is CONSUMER or FORK, never a PR. And **most fork work never becomes a PR — too many open PRs is a cost**, paid by the upstream maintainer and by every later sweep of ours: the default for a fix is a fork member that rides the release cut, invisible to upstream. Nobody is asked and no approval is awaited; the verdict is the written judgment.
+> **An upstream PR requires `verdict: UPSTREAM`.** Every fork branch carries a placement verdict — the placement red-team's ruling (skill `fork-work`), recorded as a `placement: verdict:` notch by `knives start --placement` — and only `UPSTREAM` leads to an upstream pull request; `knives gh` refuses `gh pr create` toward a registered upstream for any other verdict. UPSTREAM means: a defect any user of the library would hit, fixed with evidence (a reproduction or red→green test), or a capability users outside this deployment need, extended the general way. **We do not change upstream defaults to suit one deployment's preferences** — a deployment-preference change is CONSUMER or FORK, never a PR. And **most fork work never becomes a PR — too many open PRs is a cost**, paid by the upstream maintainer and by every later sweep of ours: the default for a fix is a fork member that rides the release cut, invisible to upstream. Nobody is asked and no approval is awaited; the verdict is the written judgment.
 
 ## Overview
 
@@ -74,8 +74,8 @@ Walk each check sequentially. Each check specifies what facts to verify, what ev
   - *Incorrect Routing*: Refactor and relocate the changes to the permitted package, directory, or extension location defined by upstream policy.
 
 ### Check 7: Placement verdict
-- **Verification**: The branch's newest `placement:` notch rules `verdict: UPSTREAM`, its judge differs from the proposer, and its evidence covers the published diff — the alternative it rejected is still the alternative, and the class is still what the PR claims.
-- **Evidence**: The `placement:` notch, read with `knives notch <branch>`.
+- **Verification**: The branch's newest `placement: verdict:` notch rules `verdict: UPSTREAM`, its judge differs from the proposer, and its evidence covers the published diff — the alternative it rejected is still the alternative, and the class is still what the PR claims. Prose `placement:` notes on the branch are context, not the verdict.
+- **Evidence**: The `placement: verdict:` notch, read with `knives notch <branch>`.
 - **If Failed**:
   - *Missing*: No PR; return to `fork-work`'s placement red-team. `knives gh` refuses the create anyway.
   - *Verdict is FORK or CONSUMER*: No PR. A FORK member ships through the release; a CONSUMER change belongs in the consumer and its branch should be finished.
