@@ -902,42 +902,187 @@ fn a_rest_pull_creation_against_the_upstream_is_gated_like_pr_create() {
 #[test]
 fn a_rest_pull_creation_is_gated_with_flags_before_its_path() {
     // `gh api -X POST repos/…/pulls` is how GitHub's documentation spells it; a
-    // method, or a header, before the path is the same request.
+    // method, or a header, before the path is the same request; so is one
+    // whose fields are attached to their flags (gh infers POST from them), or
+    // whose path carries a `#fragment` the server never sees.
     let config_home = placement_gate_home();
     record_placement(config_home.path(), "feat/gamma", "FORK");
     let scratch = tempfile::tempdir().expect("scratch");
     let (dir, log) = fake_gh();
-    for leading in [
-        ["-X", "POST"],
-        ["--method", "POST"],
-        ["-H", "Accept: application/vnd.github+json"],
-    ] {
+    let spellings: [&[&str]; 5] = [
+        &[
+            "-X",
+            "POST",
+            "repos/routed-a/upstream/pulls",
+            "-f",
+            "title=x",
+            "-f",
+            "head=feat/gamma",
+            "-f",
+            "base=main",
+        ],
+        &[
+            "--method",
+            "POST",
+            "repos/routed-a/upstream/pulls",
+            "-f",
+            "title=x",
+            "-f",
+            "head=feat/gamma",
+            "-f",
+            "base=main",
+        ],
+        &[
+            "-H",
+            "Accept: application/vnd.github+json",
+            "repos/routed-a/upstream/pulls",
+            "-f",
+            "title=x",
+            "-f",
+            "head=feat/gamma",
+            "-f",
+            "base=main",
+        ],
+        &[
+            "repos/routed-a/upstream/pulls",
+            "-ftitle=x",
+            "-fhead=feat/gamma",
+            "-fbase=main",
+        ],
+        &[
+            "-X",
+            "POST",
+            "repos/routed-a/upstream/pulls#x",
+            "-f",
+            "title=x",
+            "-f",
+            "head=feat/gamma",
+        ],
+    ];
+    for spelling in spellings {
         let output = knives_cmd(scratch.path())
             .args(["gh", "--", "api"])
-            .args(leading)
-            .args([
-                "repos/routed-a/upstream/pulls",
-                "-f",
-                "title=x",
-                "-f",
-                "head=feat/gamma",
-                "-f",
-                "base=main",
-            ])
+            .args(spelling)
             .current_dir(scratch.path())
             .env("KNIVES_CONFIG_HOME", config_home.path())
             .env("KNIVES_REAL_GH", dir.path().join("gh"))
             .env("FAKE_GH_LOG", &log)
             .output()
             .expect("run knives gh");
-        assert_eq!(output.status.code(), Some(2), "{leading:?}: {output:?}");
+        assert_eq!(output.status.code(), Some(2), "{spelling:?}: {output:?}");
         assert!(
             String::from_utf8_lossy(&output.stderr)
                 .contains("has placement verdict FORK, not UPSTREAM"),
-            "{leading:?}: {output:?}"
+            "{spelling:?}: {output:?}"
         );
-        assert!(!log.exists(), "{leading:?}: gh ran despite the refusal");
+        assert!(!log.exists(), "{spelling:?}: gh ran despite the refusal");
     }
+}
+
+#[test]
+fn a_repo_flag_before_the_pr_verb_is_still_a_pr_create() {
+    // `-R` is a persistent flag on `gh pr`, so cobra accepts `pr -R o/r create`;
+    // the gate and the head injection must both see the `create`.
+    let config_home = placement_gate_home();
+    record_placement(config_home.path(), "feat/eps", "FORK");
+    record_placement(config_home.path(), "feat/gamma", "UPSTREAM");
+    let lab = fork_checkout_of_the_registered_upstream();
+    lab.branch("feat/eps", "eps.txt", "eps\n");
+    lab.jj_work(["edit", "feat/eps"]);
+    let (dir, log) = fake_gh();
+    let helper_dir = fake_app_token();
+    let gitconfig = token_config(helper_dir.path(), "routed-a");
+    let run = |middle: &[&str]| {
+        knives_cmd(helper_dir.path())
+            .args(["gh", "--", "pr"])
+            .args(middle)
+            .args(["--title", "t", "--body", "b"])
+            .current_dir(&lab.work)
+            .env("KNIVES_CONFIG_HOME", config_home.path())
+            .env("HOME", lab.temp_path())
+            .env("KNIVES_REAL_GH", dir.path().join("gh"))
+            .env("FAKE_GH_LOG", &log)
+            .env("PATH", helper_path(helper_dir.path()))
+            .env("GIT_CONFIG_GLOBAL", &gitconfig)
+            .output()
+            .expect("run knives gh")
+    };
+
+    // Then: with no head stated, @'s FORK bookmark is gated and refused, in
+    // either spelling of the flag.
+    for middle in [
+        &["-R", "routed-a/upstream", "create"][..],
+        &["--repo", "routed-a/upstream", "create"][..],
+    ] {
+        let refused = run(middle);
+        assert_eq!(refused.status.code(), Some(2), "{middle:?}: {refused:?}");
+        assert!(
+            String::from_utf8_lossy(&refused.stderr)
+                .contains("feat/eps has placement verdict FORK"),
+            "{middle:?}: {refused:?}"
+        );
+        assert!(!log.exists(), "{middle:?}: gh ran despite the refusal");
+    }
+
+    // And: an UPSTREAM head stated after the verb reaches gh as the one head.
+    let passed = run(&["-R", "routed-a/upstream", "create", "-H", "feat/gamma"]);
+    assert!(passed.status.success(), "{passed:?}");
+    let recorded = fs::read_to_string(&log).expect("fake gh ran");
+    let argv: Vec<&str> = recorded
+        .lines()
+        .take_while(|line| !line.starts_with("GH_TOKEN="))
+        .collect();
+    assert_eq!(
+        argv.iter()
+            .filter(|a| **a == "--head" || **a == "-H")
+            .count(),
+        1,
+        "{recorded}"
+    );
+    assert!(!argv.contains(&"feat/eps"), "{recorded}");
+}
+
+#[test]
+fn two_stated_heads_are_refused_naming_both() {
+    // gh keeps the last head it is given; the gate would have read the first.
+    let config_home = placement_gate_home();
+    record_placement(config_home.path(), "feat/gamma", "UPSTREAM");
+    let scratch = tempfile::tempdir().expect("scratch");
+    let (dir, log) = fake_gh();
+
+    let output = knives_cmd(scratch.path())
+        .args([
+            "gh",
+            "--",
+            "pr",
+            "create",
+            "-R",
+            "routed-a/upstream",
+            "--head",
+            "feat/gamma",
+            "-H",
+            "feat/none",
+            "--title",
+            "t",
+        ])
+        .current_dir(scratch.path())
+        .env("KNIVES_CONFIG_HOME", config_home.path())
+        .env("KNIVES_REAL_GH", dir.path().join("gh"))
+        .env("FAKE_GH_LOG", &log)
+        .output()
+        .expect("run knives gh");
+
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("states 2 heads (feat/gamma, feat/none)"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("gh would open feat/none while a reader expects feat/gamma"),
+        "{stderr}"
+    );
+    assert!(!log.exists(), "gh ran despite the refusal");
 }
 
 #[test]
@@ -1241,18 +1386,24 @@ fn a_review_mutation_inside_a_fork_checkout_passes_while_the_create_mutation_is_
     assert!(log.exists(), "the review mutation must reach gh");
     fs::remove_file(&log).expect("reset the gh log");
 
-    // Opening one names its repository by node id, which knives cannot read.
-    let create = run(
+    // Opening one names its repository by node id, which knives cannot read —
+    // however GraphQL's insignificant tokens (a comma, a `#` comment) are
+    // placed after the mutation's name.
+    for query in [
         "mutation { createPullRequest(input:{repositoryId:\"R\",headRefName:\"feat/gamma\",\
          baseRefName:\"main\",title:\"t\"}) { clientMutationId } }",
-    );
-    assert_eq!(create.status.code(), Some(2), "{create:?}");
-    assert!(
-        String::from_utf8_lossy(&create.stderr)
-            .contains("a GraphQL createPullRequest names its repository by node id"),
-        "{create:?}"
-    );
-    assert!(!log.exists(), "gh ran despite the refusal");
+        "mutation { createPullRequest,(input:{repositoryId:\"R\"}) { clientMutationId } }",
+        "mutation { createPullRequest#c\n(input:{repositoryId:\"R\"}) { clientMutationId } }",
+    ] {
+        let create = run(query);
+        assert_eq!(create.status.code(), Some(2), "{query}: {create:?}");
+        assert!(
+            String::from_utf8_lossy(&create.stderr)
+                .contains("a GraphQL createPullRequest names its repository by node id"),
+            "{query}: {create:?}"
+        );
+        assert!(!log.exists(), "{query}: gh ran despite the refusal");
+    }
 }
 
 #[test]
