@@ -1,6 +1,6 @@
 ---
 name: fork-work
-description: Check knives before working in a repository we maintain a fork of. Make sure to use this skill whenever you are about to change, fix, implement, refactor or test anything in such a repository, and equally when you are only reading or investigating one — tracing how it works, finding where something is implemented, reviewing its history. Also use it before cloning or re-cloning one of these projects or making any scratch or temporary checkout of it, and when asked which branch to use, whether another agent is working somewhere, or how to get a working copy. These repositories are shared with other agents and coordinated by the knives CLI, so improvising a checkout costs real work; consult this first even when the request sounds like ordinary coding or plain code reading.
+description: Check knives before working in a repository we maintain a fork of, and red-team placement before starting a branch there. Make sure to use this skill whenever you are about to start a new branch (`knives start`) in such a repository, or to change, fix, implement, refactor or test anything in it, and equally when you are only reading or investigating one — tracing how it works, finding where something is implemented, reviewing its history. Also use it before cloning or re-cloning one of these projects or making any scratch or temporary checkout of it, and when asked which branch to use, whether another agent is working somewhere, or how to get a working copy. These repositories are shared with other agents and coordinated by the knives CLI, so improvising a checkout costs real work; consult this first even when the request sounds like ordinary coding or plain code reading.
 ---
 
 # About to work in a fork
@@ -81,15 +81,20 @@ every false one did not.
 A branch's notes may carry a workflow's own prefixes; the workflow that wrote them defines
 them, and a note that says it is open is open.
 
-## Challenge upstream placement before implementation
+## Red-team placement before `knives start`
 
-Apply the ownership test at the top of this skill first: a change that fails it belongs in the consumer and gets no branch here unless the owner has said otherwise. Then, before implementing an upstream change or creating its branch, someone other than the proposer challenges ownership: a reviewer, orchestrator, or solo fresh-context subagent arguing for other layers. With none available, write competing layer hypotheses and what disproves each.
-Read-only investigation is exempt. A green gate, plausible patch or peer's "go" establishes no ownership. This is not a question for the human: a `placement:` notch that concludes "upstream" is the written judgment the callout at the top of this skill asks for, and the PR is opened on that judgment, not on anyone's go.
+Before creating a branch in a managed fork, dispatch a fresh-context subagent whose brief is to argue that the change does **not** belong in the fork: that the consumer can get the effect from its own configuration, IaC or code (the ownership test at the top of this skill), or that it is a library defect any user would hit and so belongs upstream. Give it the observed failure or missing capability with its revision, the real launch path and installed version, and the library's existing options and recovery mechanisms; it returns one of three verdicts with its reasoning. This is a subagent you dispatch, not a knives command — knives records the verdict, it does not judge or spawn anything.
 
-Record a `placement:` notch with `--evidence`, naming proposer and challenger, on the branch (repository subject before branching or for a standing rule):
+- **CONSUMER** — no branch. Implement the config value, stack transformation or consumer-side job instead.
+- **FORK** — a fork member on the release's shared base, reviewed through the release; not upstream-bound.
+- **UPSTREAM** — a fork member that also goes upstream, with a minimal reproduction on unmodified upstream at a cited revision (or, for a feature, the general extension case preserving upstream defaults).
+
+Read-only investigation is exempt. A green gate, plausible patch or peer's "go" establishes no ownership. This is not a question for the human: a `placement:` notch that concludes UPSTREAM is the written judgment the callout at the top of this skill asks for, and the PR is opened on that judgment, not on anyone's go.
+
+Record the verdict as the branch's first `placement:` notch with `--evidence`, naming proposer and red-teamer (repository subject when the verdict is CONSUMER and no branch exists, or for a standing rule):
 
 ```
-knives notch <branch> -m "placement: proposer <id>; challenger <id>; <four answers>" --evidence <revision-or-url>
+knives notch <branch> -m "placement: verdict: CONSUMER|FORK|UPSTREAM; proposer <id>; red-teamer <id>; <four answers>" --evidence <revision-or-url>
 ```
 
 - Cite the observed failure or missing capability and revision, not an inherited summary or counter.
