@@ -7,7 +7,7 @@
 
 #[path = "common/lab.rs"]
 mod lab;
-// allow: SIZE_OK: 6682 lines - real-binary gh passthrough scenarios share one fixture and process harness.
+// allow: SIZE_OK: 6770 lines - real-binary gh passthrough scenarios share one fixture and process harness.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
@@ -6104,15 +6104,44 @@ fn the_empty_map_gh_writes_after_logout_is_zero_hosts_and_a_quoted_key_is_verbat
     hosts.gated("space outside the quotes is separation");
 }
 
+/// Whether this git prints a URL configured as the empty string as a blank
+/// URL line (git < 2.46) or lets it reset the list (git >= 2.46, where
+/// `remote.<n>.url = ""` and `pushurl = ""` clear what precedes them).
+fn git_prints_a_blank_url_line() -> bool {
+    let scratch = tempfile::tempdir().expect("scratch");
+    let repo = scratch.path().join("repo");
+    lab::git_repository(&repo, &[]);
+    for value in ["https://x.example/o/r.git", ""] {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["config", "--add", "remote.x.pushurl", value])
+            .status()
+            .expect("git config");
+        assert!(status.success());
+    }
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["remote", "-v"])
+        .output()
+        .expect("git remote -v");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .any(|line| line.trim_end() == "x\t (push)")
+}
+
 #[test]
 fn a_blank_push_line_is_no_line_and_the_previous_push_line_is_read() {
     // Round-17 code F1 (measured by the reviewer against gh 2.98.0):
     // `git config --add remote.upstream.pushurl ""` prints an empty `(push)`
-    // line, last; go-gh's remote pattern skips it and gh reads the previous
-    // push line. knives read `""` as a local path — readable, matching
-    // nothing — and the placement refusal became a pass with the fork's
-    // token while gh created on the upstream. A blank URL line is dropped
-    // before the last push line is chosen.
+    // line, last (git < 2.46; from 2.46 the empty value resets the list
+    // instead, and git prints no push line at all); go-gh's remote pattern
+    // skips a blank line and gh reads the previous push line. knives read
+    // `""` as a local path — readable, matching nothing — and the placement
+    // refusal became a pass with the fork's token while gh created on the
+    // upstream. A blank URL line is dropped before the last push line is
+    // chosen; a remote left with no URL at all is skipped, as gh skips it.
     let config_home = placement_gate_home();
     record_placement(config_home.path(), "feat/eps", "FORK");
     let host = concat!("github", ".com");
@@ -6128,62 +6157,121 @@ fn a_blank_push_line_is_no_line_and_the_previous_push_line_is_read() {
         "--head",
         "routed-b:feat/eps",
     ];
-    for config in [
-        vec![
-            ("remote.upstream.pushurl", upstream.as_str()),
-            ("remote.upstream.pushurl", ""),
-        ],
-        vec![
-            ("remote.upstream.pushurl", upstream.as_str()),
-            ("remote.upstream.pushurl", "   "),
-        ],
-        vec![
-            ("remote.upstream.pushurl", decoy.as_str()),
-            ("remote.upstream.pushurl", ""),
-            ("remote.upstream.pushurl", upstream.as_str()),
-            ("remote.upstream.pushurl", ""),
-        ],
-        // A blank fetch URL is no fetch URL: the remote is pushurl-only.
-        vec![
-            ("remote.upstream.url", ""),
-            ("remote.upstream.pushurl", upstream.as_str()),
-        ],
-    ] {
-        let (output, recorded) =
-            run_in_clone_with_upstream_config(config_home.path(), &config, &create);
-        assert_eq!(output.status.code(), Some(2), "{config:?}: {output:?}");
+    let gated = |what: &str, (output, recorded): (std::process::Output, Option<String>)| {
+        assert_eq!(output.status.code(), Some(2), "{what}: {output:?}");
         assert!(
             String::from_utf8_lossy(&output.stderr).contains("feat/eps has placement verdict FORK"),
-            "{config:?}: {output:?}"
+            "{what}: {output:?}"
         );
-        assert!(recorded.is_none(), "{config:?}: gh ran: {recorded:?}");
-    }
+        assert!(recorded.is_none(), "{what}: gh ran: {recorded:?}");
+    };
+    let passed_as =
+        |what: &str, owner: &str, (output, recorded): (std::process::Output, Option<String>)| {
+            assert!(output.status.success(), "{what}: {output:?}");
+            assert!(
+                recorded
+                    .expect("fake gh ran")
+                    .contains(&format!("GH_TOKEN=tok-{owner}")),
+                "{what}"
+            );
+        };
+    // Whitespace-only URLs are stored by every git and printed as blank
+    // lines: dropped, the previous line is read.
+    gated(
+        "upstream then whitespace",
+        run_in_clone_with_upstream_config(
+            config_home.path(),
+            &[
+                ("remote.upstream.pushurl", upstream.as_str()),
+                ("remote.upstream.pushurl", "   "),
+            ],
+            &create,
+        ),
+    );
+    gated(
+        "decoy, whitespace, upstream, whitespace",
+        run_in_clone_with_upstream_config(
+            config_home.path(),
+            &[
+                ("remote.upstream.pushurl", decoy.as_str()),
+                ("remote.upstream.pushurl", " "),
+                ("remote.upstream.pushurl", upstream.as_str()),
+                ("remote.upstream.pushurl", "\t"),
+            ],
+            &create,
+        ),
+    );
     // Control (gh parity): a blank line between does not end the reading;
     // the decoy last is the decoy.
-    let (output, recorded) = run_in_clone_with_upstream_config(
+    passed_as(
+        "upstream, whitespace, decoy",
+        "other",
+        run_in_clone_with_upstream_config(
+            config_home.path(),
+            &[
+                ("remote.upstream.pushurl", upstream.as_str()),
+                ("remote.upstream.pushurl", " "),
+                ("remote.upstream.pushurl", decoy.as_str()),
+            ],
+            &create,
+        ),
+    );
+    // The reviewer's shape, an empty string: what git prints decides what
+    // both gh and knives read — a blank line (dropped: the upstream, gated)
+    // or nothing for the remote (skipped: origin, the fork, passed).
+    let blank_lines = git_prints_a_blank_url_line();
+    let empty_last = run_in_clone_with_upstream_config(
         config_home.path(),
         &[
             ("remote.upstream.pushurl", upstream.as_str()),
             ("remote.upstream.pushurl", ""),
-            ("remote.upstream.pushurl", decoy.as_str()),
         ],
         &create,
     );
-    assert!(output.status.success(), "{output:?}");
-    assert!(
-        recorded
-            .expect("fake gh ran")
-            .contains("GH_TOKEN=tok-other")
+    if blank_lines {
+        gated("upstream then empty", empty_last);
+    } else {
+        passed_as("upstream then empty (reset)", "routed-b", empty_last);
+    }
+    // A blank fetch URL is no fetch URL: the remote is pushurl-only (or,
+    // where the empty value resets, has its push URL alone — the same).
+    gated(
+        "blank fetch URL",
+        run_in_clone_with_upstream_config(
+            config_home.path(),
+            &[
+                ("remote.upstream.url", "  "),
+                ("remote.upstream.pushurl", upstream.as_str()),
+            ],
+            &create,
+        ),
     );
-    // A remote with no URL at all (a refspec only) is skipped, as gh skips
-    // it: the fork's origin is the repository, passed with its token.
+}
+
+#[test]
+fn a_remote_with_no_url_at_all_is_skipped_as_gh_skips_it() {
+    // A refspec-only remote prints as a bare `upstream<TAB>` line: gh skips
+    // it (measured, round-17 deep lane) and reads the next remote — the
+    // fork's origin, passed with its token. knives reads nothing for it
+    // either: neither readable nor unreadable.
+    let config_home = placement_gate_home();
+    record_placement(config_home.path(), "feat/eps", "FORK");
     let (output, recorded) = run_in_clone_with_upstream_config(
         config_home.path(),
         &[(
             "remote.upstream.fetch",
             "+refs/heads/*:refs/remotes/upstream/*",
         )],
-        &create,
+        &[
+            "pr",
+            "create",
+            "-t",
+            "t",
+            "-b",
+            "b",
+            "--head",
+            "routed-b:feat/eps",
+        ],
     );
     assert!(output.status.success(), "{output:?}");
     assert!(
