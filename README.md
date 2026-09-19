@@ -311,9 +311,12 @@ one canonical remote grammar — `http(s)://`/`ssh://[user@]HOST[:PORT]/OWNER/RE
 `[user@]HOST:OWNER/REPO[.git]`, with no `%`, `?`, `#`, whitespace, empty host, port or segment
 anywhere — the fetch URL when readable, or a local path with no distinct push URL; the push URL is
 read only for a remote with no fetch URL at all, and then only its last non-blank push line, the one
-gh reads. A local path never binds (gh drops such a remote and reads the next), and a creation whose
-repository is read from the checkout is gated on any remote naming a registered upstream, whatever
-remote knives would rank first — which remotes gh sees is not certified. A remote whose fetch URL
+gh reads. A remote is gh-visible to knives only on a host it can certify gh knows (the default host,
+gh's configured hosts, a stated `--hostname`); a marker on any other remote is refused, a local path
+or foreign-host remote never ends the ranking (gh drops it and reads the next), and a creation whose
+repository is read from the checkout — by marker or rank, whatever it resolved to — is gated on every
+readable remote naming a registered upstream, each entry's verdict consulted; a failed remotes read
+refuses. A remote whose fetch URL
 knives does not read is unreadable whatever its push URL says — gh reads a `?query` or `#fragment`
 fetch URL, and falling to the push URL certified a decoy — and is refused with the `-R` remedy; a
 registry remote outside the grammar is a configuration error at load. gh's `config.yml` and
