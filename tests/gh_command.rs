@@ -7,7 +7,7 @@
 
 #[path = "common/lab.rs"]
 mod lab;
-// allow: SIZE_OK: 6444 lines - real-binary gh passthrough scenarios share one fixture and process harness.
+// allow: SIZE_OK: 6682 lines - real-binary gh passthrough scenarios share one fixture and process harness.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
@@ -5045,18 +5045,27 @@ fn run_in_clone_with_upstream_config(
     arguments: &[&str],
 ) -> (std::process::Output, Option<String>) {
     let host = concat!("github", ".com");
+    run_in_clone_with_remotes(
+        config_home,
+        &format!("https://{host}/routed-b/origin.git"),
+        config,
+        arguments,
+    )
+}
+
+/// [`run_in_clone_with_upstream_config`] with `origin`'s URL given.
+fn run_in_clone_with_remotes(
+    config_home: &Path,
+    origin: &str,
+    config: &[(&str, &str)],
+    arguments: &[&str],
+) -> (std::process::Output, Option<String>) {
     let scratch = tempfile::tempdir().expect("scratch");
     let clone = scratch.path().join("clone");
     lab::git_repository(&clone, &[]);
     fs::write(clone.join("README.md"), "seed\n").expect("write seed");
     lab::git_commit_all(&clone, "seed");
-    git_config(
-        &clone,
-        &[
-            "remote.origin.url",
-            &format!("https://{host}/routed-b/origin.git"),
-        ],
-    );
+    git_config(&clone, &["remote.origin.url", origin]);
     for (key, value) in config {
         let status = Command::new("git")
             .arg("-C")
@@ -6028,11 +6037,14 @@ fn a_pushurl_only_remote_is_its_last_push_line_readable_or_not() {
         );
         let stderr = String::from_utf8_lossy(&output.stderr);
         if last.starts_with('/') {
-            // A local last push line is the remote, as a path: another
-            // repository to the registry, passed tokenless.
+            // A local last push line is a remote gh drops, reading the next
+            // one — here `origin`, the fork: not an upstream, passed with
+            // the fork owner's token (round-17 F2: a path never binds).
             assert!(output.status.success(), "{last}: {output:?}");
             assert!(
-                recorded.expect("fake gh ran").contains("GH_TOKEN=unset"),
+                recorded
+                    .expect("fake gh ran")
+                    .contains("GH_TOKEN=tok-routed-b"),
                 "{last}"
             );
             continue;
@@ -6090,6 +6102,232 @@ fn the_empty_map_gh_writes_after_logout_is_zero_hosts_and_a_quoted_key_is_verbat
     );
     hosts.write("hosts.yml", "\"ghe.example\" :\n    user: m\n");
     hosts.gated("space outside the quotes is separation");
+}
+
+#[test]
+fn a_blank_push_line_is_no_line_and_the_previous_push_line_is_read() {
+    // Round-17 code F1 (measured by the reviewer against gh 2.98.0):
+    // `git config --add remote.upstream.pushurl ""` prints an empty `(push)`
+    // line, last; go-gh's remote pattern skips it and gh reads the previous
+    // push line. knives read `""` as a local path — readable, matching
+    // nothing — and the placement refusal became a pass with the fork's
+    // token while gh created on the upstream. A blank URL line is dropped
+    // before the last push line is chosen.
+    let config_home = placement_gate_home();
+    record_placement(config_home.path(), "feat/eps", "FORK");
+    let host = concat!("github", ".com");
+    let upstream = format!("https://{host}/routed-a/upstream.git");
+    let decoy = format!("https://{host}/other/decoy.git");
+    let create = [
+        "pr",
+        "create",
+        "-t",
+        "t",
+        "-b",
+        "b",
+        "--head",
+        "routed-b:feat/eps",
+    ];
+    for config in [
+        vec![
+            ("remote.upstream.pushurl", upstream.as_str()),
+            ("remote.upstream.pushurl", ""),
+        ],
+        vec![
+            ("remote.upstream.pushurl", upstream.as_str()),
+            ("remote.upstream.pushurl", "   "),
+        ],
+        vec![
+            ("remote.upstream.pushurl", decoy.as_str()),
+            ("remote.upstream.pushurl", ""),
+            ("remote.upstream.pushurl", upstream.as_str()),
+            ("remote.upstream.pushurl", ""),
+        ],
+        // A blank fetch URL is no fetch URL: the remote is pushurl-only.
+        vec![
+            ("remote.upstream.url", ""),
+            ("remote.upstream.pushurl", upstream.as_str()),
+        ],
+    ] {
+        let (output, recorded) =
+            run_in_clone_with_upstream_config(config_home.path(), &config, &create);
+        assert_eq!(output.status.code(), Some(2), "{config:?}: {output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("feat/eps has placement verdict FORK"),
+            "{config:?}: {output:?}"
+        );
+        assert!(recorded.is_none(), "{config:?}: gh ran: {recorded:?}");
+    }
+    // Control (gh parity): a blank line between does not end the reading;
+    // the decoy last is the decoy.
+    let (output, recorded) = run_in_clone_with_upstream_config(
+        config_home.path(),
+        &[
+            ("remote.upstream.pushurl", upstream.as_str()),
+            ("remote.upstream.pushurl", ""),
+            ("remote.upstream.pushurl", decoy.as_str()),
+        ],
+        &create,
+    );
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        recorded
+            .expect("fake gh ran")
+            .contains("GH_TOKEN=tok-other")
+    );
+    // A remote with no URL at all (a refspec only) is skipped, as gh skips
+    // it: the fork's origin is the repository, passed with its token.
+    let (output, recorded) = run_in_clone_with_upstream_config(
+        config_home.path(),
+        &[(
+            "remote.upstream.fetch",
+            "+refs/heads/*:refs/remotes/upstream/*",
+        )],
+        &create,
+    );
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        recorded
+            .expect("fake gh ran")
+            .contains("GH_TOKEN=tok-routed-b")
+    );
+}
+
+#[test]
+fn a_remote_gh_drops_never_hides_a_registered_upstream_on_another_remote() {
+    // Round-17 code F2 (measured by the reviewer against gh 2.98.0): a
+    // remote gh cannot use — a local path as its read line, or an
+    // in-grammar host gh is not configured for — is dropped by gh, which
+    // reads the NEXT remote by rank. knives took the dropped remote as the
+    // repository ("another one, pass") while gh created on `origin`: the
+    // registered upstream, ungated. Which remotes gh sees is not something
+    // knives certifies, so when the repository is read from the checkout
+    // the gate reads every remote gh could rank: a registered upstream on
+    // any of them is gated.
+    let config_home = placement_gate_home();
+    record_placement(config_home.path(), "feat/eps", "FORK");
+    let host = concat!("github", ".com");
+    let upstream = format!("https://{host}/routed-a/upstream.git");
+    let decoy = format!("https://{host}/other/decoy.git");
+    let create = [
+        "pr",
+        "create",
+        "-t",
+        "t",
+        "-b",
+        "b",
+        "--head",
+        "routed-b:feat/eps",
+    ];
+    for (what, config) in [
+        (
+            "path last push line",
+            vec![
+                ("remote.upstream.pushurl", decoy.as_str()),
+                ("remote.upstream.pushurl", "/srv/git/upstream.git"),
+            ],
+        ),
+        (
+            "path fetch URL",
+            vec![("remote.upstream.url", "/srv/git/upstream.git")],
+        ),
+        (
+            "in-grammar host gh is not configured for",
+            vec![("remote.upstream.url", "https://ghe.example/other/thing.git")],
+        ),
+        (
+            "in-grammar other repository outranking origin",
+            vec![("remote.upstream.url", decoy.as_str())],
+        ),
+        ("no other remote", vec![]),
+    ] {
+        let (output, recorded) =
+            run_in_clone_with_remotes(config_home.path(), &upstream, &config, &create);
+        assert_eq!(output.status.code(), Some(2), "{what}: {output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("feat/eps has placement verdict FORK"),
+            "{what}: {output:?}"
+        );
+        assert!(recorded.is_none(), "{what}: gh ran: {recorded:?}");
+    }
+    // A stated repository does not consult the remotes: `-R other/decoy`
+    // passes whatever origin names.
+    let (output, recorded) = run_in_clone_with_remotes(
+        config_home.path(),
+        &upstream,
+        &[("remote.upstream.url", "/srv/git/upstream.git")],
+        &[
+            "pr",
+            "create",
+            "-R",
+            "other/decoy",
+            "-t",
+            "t",
+            "-b",
+            "b",
+            "--head",
+            "routed-b:feat/eps",
+        ],
+    );
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        recorded
+            .expect("fake gh ran")
+            .contains("GH_TOKEN=tok-other")
+    );
+    // Control: no remote names a registered upstream — the dropped remote
+    // beside the fork's origin passes with the origin owner's token, as gh
+    // reads origin.
+    let (output, recorded) = run_in_clone_with_upstream_config(
+        config_home.path(),
+        &[("remote.upstream.url", "/srv/git/upstream.git")],
+        &create,
+    );
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        recorded
+            .expect("fake gh ran")
+            .contains("GH_TOKEN=tok-routed-b")
+    );
+}
+
+#[test]
+fn a_base_marker_on_a_remote_gh_drops_is_refused() {
+    // A `gh repo set-default` marker on a remote whose URL gh reads no
+    // repository from (a local path): gh ignores the marker and ranks the
+    // remaining remotes, which knives cannot follow — refused with the
+    // unset/-R remedy rather than read as the path (round-17 F2, the marker
+    // route).
+    let config_home = placement_gate_home();
+    record_placement(config_home.path(), "feat/eps", "FORK");
+    let host = concat!("github", ".com");
+    let upstream = format!("https://{host}/routed-a/upstream.git");
+    let (output, recorded) = run_in_clone_with_remotes(
+        config_home.path(),
+        &upstream,
+        &[
+            ("remote.upstream.url", "/srv/git/upstream.git"),
+            ("remote.upstream.gh-resolved", "base"),
+        ],
+        &[
+            "pr",
+            "create",
+            "-t",
+            "t",
+            "-b",
+            "b",
+            "--head",
+            "routed-b:feat/eps",
+        ],
+    );
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains(
+            "remote.upstream.gh-resolved = base names a remote whose URL (/srv/git/upstream.git) is not a repository gh reads, so gh ignores the marker: unset it (git config --unset remote.upstream.gh-resolved) or state the repository (-R OWNER/REPO)"
+        ),
+        "{output:?}"
+    );
+    assert!(recorded.is_none(), "gh ran: {recorded:?}");
 }
 
 #[test]

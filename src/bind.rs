@@ -308,11 +308,12 @@ pub struct Remotes {
     /// Each remote's URL knives reads — a forge URL in the canonical remote
     /// grammar, or a local path — by name.
     pub readable: BTreeMap<String, String>,
-    /// Each remote knives does not read, by name, with the URL git listed
-    /// first: a fetch URL outside the grammar, or a local fetch path beside
-    /// a push URL. gh may read a repository from it that knives cannot
-    /// compare, so the repository the checkout addresses cannot be read
-    /// while such a remote exists.
+    /// Each remote knives does not read, by name, with the one URL that was
+    /// read for it (the fetch URL, else the last push line): a URL outside
+    /// the grammar, or a local fetch path beside a distinct push URL. gh may
+    /// read a repository from it that knives cannot compare, so the
+    /// repository the checkout addresses cannot be read while such a remote
+    /// exists.
     pub unreadable: BTreeMap<String, String>,
 }
 
@@ -339,8 +340,12 @@ pub fn remotes(root: &Path) -> Result<BTreeMap<String, String>, BindError> {
 /// `url`; measured against gh 2.98.0): gh reads that remote's LAST push
 /// line and no other, readable or not — so knives reads exactly that line
 /// (readable, a local path, or the remote is unreadable) and never scans
-/// the earlier push URLs for one it can read. One URL is read per remote,
-/// and it is the one gh reads. Configuration
+/// the earlier push URLs for one it can read. A blank URL line (`url =` or
+/// `pushurl =` with no value; git prints the line with an empty URL) is no
+/// line to go-gh's remote pattern and none here: a blank fetch URL is no
+/// fetch URL, a blank last push line yields to the one before it. A remote
+/// with no URL at all (a refspec only) is skipped, as gh skips it. One URL
+/// is read per remote, and it is the one gh reads. Configuration
 /// reaches the read the way it reaches git: the repository's own file, the
 /// user's and the system's; `GIT_CONFIG_*` environment overrides do not
 /// (every git read knives makes strips them, see [`git_command`]). An ssh
@@ -364,7 +369,9 @@ pub fn all_remotes(root: &Path) -> Result<Remotes, BindError> {
         return Err(failure(error_line(&output.stderr)));
     }
     // `<name>\t<url> (fetch)` / `<name>\t<url> (push)`, one line per URL; a
-    // remote with no fetch URL is printed as `<name>\t` with no marker.
+    // remote with no fetch URL is printed as `<name>\t` with no marker, and
+    // a blank URL as `<name>\t (fetch)` — a line go-gh's pattern skips, so
+    // it is dropped here (round-17 F1).
     let mut fetch: BTreeMap<String, String> = BTreeMap::new();
     let mut push: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for line in String::from_utf8_lossy(&output.stdout).lines() {
@@ -372,13 +379,18 @@ pub fn all_remotes(root: &Path) -> Result<Remotes, BindError> {
             .split_once('\t')
             .ok_or_else(|| failure(format!("unparseable remote line {line:?}")))?;
         if let Some(url) = rest.strip_suffix(" (push)") {
-            push.entry(name.to_owned())
-                .or_default()
-                .push(url.trim().to_owned());
+            let url = url.trim();
+            fetch.entry(name.to_owned()).or_default();
+            if !url.is_empty() {
+                push.entry(name.to_owned())
+                    .or_default()
+                    .push(url.to_owned());
+            }
         } else if let Some(url) = rest.strip_suffix(" (fetch)") {
-            fetch
-                .entry(name.to_owned())
-                .or_insert_with(|| url.trim().to_owned());
+            let entry = fetch.entry(name.to_owned()).or_default();
+            if entry.is_empty() {
+                url.trim().clone_into(entry);
+            }
         } else if rest.trim().is_empty() {
             fetch.entry(name.to_owned()).or_default();
         } else {
@@ -398,9 +410,13 @@ pub fn all_remotes(root: &Path) -> Result<Remotes, BindError> {
             .collect();
         // The one URL gh reads for this remote: its fetch URL when it has
         // one, else its last push line (round-16: the last line, readable or
-        // not — never an earlier push URL knives happens to read).
+        // not — never an earlier push URL knives happens to read). A remote
+        // with neither is no remote to gh and none here.
         let read = if fetch_url.is_empty() {
-            push_urls.last().cloned().unwrap_or_default()
+            match push_urls.last() {
+                Some(last) => last.clone(),
+                None => continue,
+            }
         } else {
             fetch_url.clone()
         };

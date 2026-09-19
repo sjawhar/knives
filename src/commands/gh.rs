@@ -34,17 +34,21 @@
 //! -v`, `insteadOf` applied) with ssh aliases resolved as go-gh resolves
 //! them, each read by the canonical remote grammar (`remote_url::classify`,
 //! `bind::all_remotes`): the fetch URL when readable, or a local path; the
-//! last push line only for a remote with no fetch URL at all. A remote whose
-//! fetch URL knives does not read is unreadable whatever its push URL says
-//! (gh reads a `?query` fetch URL; falling to the push URL certified a
-//! decoy) and is refused with the `-R` remedy.
+//! last non-blank push line only for a remote with no fetch URL at all. A
+//! remote whose fetch URL knives does not read is unreadable whatever its
+//! push URL says (gh reads a `?query` fetch URL; falling to the push URL
+//! certified a decoy) and is refused with the `-R` remedy; a local path
+//! never binds (gh drops the remote and reads the next); and a creation
+//! whose repository is read from the checkout is gated on any remote naming
+//! a registered upstream (`checkout_upstream`), since which remotes gh sees
+//! is not certified.
 //! gh's `config.yml` and `hosts.yml` are read whole in the grammar gh
 //! writes them in (`gh_config`); the first line outside it in either file
 //! makes the default host unknown — refused naming the file and the line,
 //! never read past, never a fall-through to the other file. With no head stated the gate states `<fork-owner>:<branch in hand>`
 //! itself, so gh never resolves one knives did not read. A token is routed
 //! only for a canonical owner on a host that folds to the default host.
-// allow: SIZE_OK: 3407 lines - single passthrough pipeline; splitting would separate resolution steps that read as one procedure.
+// allow: SIZE_OK: 3466 lines - single passthrough pipeline; splitting would separate resolution steps that read as one procedure.
 use std::collections::BTreeMap;
 use std::io::Read as _;
 use std::os::unix::{
@@ -234,7 +238,7 @@ fn routed_token(invocation: &GhInvocation, cwd: &Path) -> Option<String> {
         return None;
     }
     match target(invocation, cwd) {
-        Target::Repo(url) => match mint_token(&url) {
+        Target::Repo(url) | Target::Ranked(url) => match mint_token(&url) {
             Mint::Token(token) => Some(token),
             Mint::Refused(code) => std::process::exit(code),
             Mint::Unrouted => None,
@@ -808,6 +812,12 @@ enum Target {
     /// A repository, as the https URL the registry is compared by
     /// (`remote_url::same_remote`: host and path, each case-insensitively).
     Repo(String),
+    /// A repository read from the checkout's remotes by gh's ranking, the
+    /// same URL form. Which remote gh ranks first is not certified — gh
+    /// drops remotes knives cannot see it dropping — so the gate reads every
+    /// remote for a registered upstream ([`checkout_upstream`]) before
+    /// trusting this one; a token is minted for it as for [`Target::Repo`].
+    Ranked(String),
     /// Nothing states one and the checkout offers none: gh's own error to
     /// give.
     Absent,
@@ -987,15 +997,23 @@ fn resolve_from_inputs(inputs: TargetInputs<'_>) -> Target {
         let source = format!("remote.{}.gh-resolved", resolved.name);
         let remote = inputs.remotes.get(resolved.name);
         if resolved.value == "base" {
-            return remote.and_then(|url| normalize_url(url)).map_or_else(
-                || {
-                    Target::Unreadable(format!(
-                        "{source} = base names a remote with no URL: give it one, or unset the \
-                         marker (git config --unset {source})"
-                    ))
-                },
-                Target::Repo,
-            );
+            // The marked remote's URL must name a repository gh reads: a
+            // local path is a remote gh drops, and the marker with it — gh
+            // then ranks the remaining remotes, which knives cannot follow.
+            return match remote.map(|url| (url, crate::remote_url::classify(url))) {
+                Some((url, crate::remote_url::Remote::Readable { .. })) => {
+                    normalize_url(url).map_or(Target::Absent, Target::Repo)
+                }
+                Some((url, _)) => Target::Unreadable(format!(
+                    "{source} = base names a remote whose URL ({url}) is not a repository gh \
+                     reads, so gh ignores the marker: unset it (git config --unset {source}) \
+                     or state the repository (-R OWNER/REPO)"
+                )),
+                None => Target::Unreadable(format!(
+                    "{source} = base names a remote with no URL: give it one, or unset the \
+                     marker (git config --unset {source})"
+                )),
+            };
         }
         let Some(host) = remote.and_then(|url| crate::remote_url::remote_host(url)) else {
             return Target::Unreadable(format!(
@@ -1017,7 +1035,7 @@ fn resolve_from_inputs(inputs: TargetInputs<'_>) -> Target {
         );
     }
     preferred_remote_url(inputs.registered_entry, inputs.remotes)
-        .map_or(Target::Absent, Target::Repo)
+        .map_or(Target::Absent, Target::Ranked)
 }
 
 /// gh's own remote-preference score (`context.remoteNameSortScore`): named
@@ -1081,6 +1099,10 @@ fn gh_resolved_remote(cwd: &Path) -> Option<OwnedResolvedRemote> {
 ///
 /// Role-first selection is our intentional divergence: the shim has no registry concept,
 /// and a registered fork with nonstandard remote names would otherwise misroute.
+/// Among a checkout's own remotes only a forge URL in the grammar binds: a
+/// local path is a remote gh reads no repository from and drops, moving on
+/// to the next remote (measured, round-17), so it never ends the ranking
+/// here either.
 fn preferred_remote_url(
     registered_entry: Option<&crate::config::RepoEntry>,
     remotes: &BTreeMap<String, String>,
@@ -1090,16 +1112,47 @@ fn preferred_remote_url(
             .into_iter()
             .find_map(|role| normalize_url(entry.remote(role)));
     }
+    ranked_remotes(remotes).find_map(|(_, url)| normalize_url(url))
+}
 
-    ["upstream", "github", "origin"]
+/// The checkout's remotes gh reads a repository from, in gh's rank order:
+/// `upstream`, `github`, `origin`, then the rest by name. A local path is
+/// not among them.
+fn ranked_remotes(remotes: &BTreeMap<String, String>) -> impl Iterator<Item = (&String, &String)> {
+    let named = ["upstream", "github", "origin"]
         .into_iter()
-        .find_map(|name| remotes.get(name).and_then(|url| normalize_url(url)))
-        .or_else(|| {
-            remotes
-                .iter()
-                .filter(|(name, _)| !matches!(name.as_str(), "upstream" | "github" | "origin"))
-                .find_map(|(_, url)| normalize_url(url))
-        })
+        .filter_map(|name| remotes.get_key_value(name));
+    let rest = remotes
+        .iter()
+        .filter(|(name, _)| !matches!(name.as_str(), "upstream" | "github" | "origin"));
+    named.chain(rest).filter(|(_, url)| {
+        matches!(
+            crate::remote_url::classify(url),
+            crate::remote_url::Remote::Readable { .. }
+        )
+    })
+}
+
+/// The registered fork whose upstream any of the checkout's readable
+/// remotes names, the highest-ranked first; `None` when none does.
+///
+/// gh ranks the remotes it can see — a remote on a host it is not
+/// configured for, or whose URL it cannot parse, is dropped and the next
+/// one is read (measured, round-17). Which remotes gh sees is not something
+/// knives certifies, so when a creation's repository is read from the
+/// checkout the gate asks the one question it can answer: does any remote
+/// gh could read name a registered upstream? If one does, the gate is on
+/// that upstream whatever remote knives would have ranked first. The cost
+/// is an over-refusal for a checkout that names a registered upstream on a
+/// remote gh would outrank; the remedy states the repository (`-R`).
+fn checkout_upstream(
+    registry: &crate::config::Registry,
+    cwd: &Path,
+) -> Option<Result<Fork, String>> {
+    let root = crate::bind::checkout_root(cwd)?;
+    let remotes = crate::bind::remotes(&root).ok()?;
+    ranked_remotes(&remotes)
+        .find_map(|(_, url)| normalize_url(url).and_then(|url| Fork::of(registry, &url)))
 }
 
 /// How an invocation would open a pull request, and on which head.
@@ -1540,6 +1593,12 @@ fn upstream_target(
 ) -> Result<Fork, Early> {
     match target(invocation, cwd) {
         Target::Repo(url) => Fork::of(registry, &url)
+            .ok_or(Early::Pass)?
+            .map_err(Early::Refuse),
+        // Read from the remotes by ranking: the ranked one when it is a
+        // registered upstream, else any remote gh could rank instead.
+        Target::Ranked(url) => Fork::of(registry, &url)
+            .or_else(|| checkout_upstream(registry, cwd))
             .ok_or(Early::Pass)?
             .map_err(Early::Refuse),
         Target::Absent => Err(Early::Pass),
@@ -2310,7 +2369,7 @@ mod tests {
                 registered_entry: Some(&entry),
                 remotes: &remotes,
             }),
-            Target::Repo(format!("https://{host}/registered/upstream.git"))
+            Target::Ranked(format!("https://{host}/registered/upstream.git"))
         );
     }
 
@@ -2535,7 +2594,7 @@ mod tests {
                 registered_entry: None,
                 remotes: &remotes,
             }),
-            Target::Repo(format!("https://{host}/github/repository.git"))
+            Target::Ranked(format!("https://{host}/github/repository.git"))
         );
 
         let remotes = BTreeMap::from([
@@ -2556,7 +2615,7 @@ mod tests {
                 registered_entry: None,
                 remotes: &remotes,
             }),
-            Target::Repo(format!("https://{host}/alpha/repository.git"))
+            Target::Ranked(format!("https://{host}/alpha/repository.git"))
         );
         assert_eq!(
             resolve_from_inputs(TargetInputs {

@@ -236,16 +236,18 @@ pub enum Remote {
 /// Nothing partially understood is read around: a `%` anywhere (an escape
 /// Go's parser might accept, decode, or reject), a query or fragment (text
 /// gh's parser validates past where knives reads), an empty or non-digit
-/// port, an empty host, an empty path segment, a `\` — each makes the URL
-/// [`Remote::Unreadable`], whatever gh would make of it. `file://` and a
-/// path with no scheme and no `host:` authority are [`Remote::Local`].
+/// port, an empty host, an empty path segment, a `\`, or nothing at all —
+/// each makes the URL [`Remote::Unreadable`], whatever gh would make of it.
+/// `file://` and a non-empty path with no scheme and no `host:` authority
+/// are [`Remote::Local`].
 pub fn classify(url: &str) -> Remote {
     if url.starts_with("file://") {
         return Remote::Local;
     }
-    if url
-        .bytes()
-        .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
+    if url.is_empty()
+        || url
+            .bytes()
+            .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
     {
         return Remote::Unreadable;
     }
@@ -501,10 +503,11 @@ mod tests {
             "u",
             "../tool",
             "/tmp/lab/a:b/tool",
-            "",
         ] {
             assert_eq!(classify(url), Remote::Local, "{url:?}");
         }
+        // Nothing is not a path (round-17 F1: a blank `pushurl =` line).
+        assert_eq!(classify(""), Remote::Unreadable);
         for url in [
             "https://forge.example/o%72g/tool.git",
             "https://forge%2Eexample/org/tool.git",
@@ -617,7 +620,7 @@ mod tests {
                     );
                 }
                 Remote::Local => assert!(
-                    url.starts_with("file://") || !url.contains("://"),
+                    !url.is_empty() && (url.starts_with("file://") || !url.contains("://")),
                     "{url:?} local"
                 ),
                 Remote::Unreadable => {}
