@@ -310,7 +310,7 @@ owner from is refused with its remedy. The checkout's remotes are read as git us
 one canonical remote grammar — `http(s)://`/`ssh://[user@]HOST[:PORT]/OWNER/REPO[.git]` or
 `[user@]HOST:OWNER/REPO[.git]`, with no `%`, `?`, `#`, whitespace, empty host, port or segment
 anywhere — the fetch URL when readable, or a local path with no distinct push URL; the push URL is
-read only for a remote with no fetch URL at all (where gh reads it too). A remote whose fetch URL
+read only for a remote with no fetch URL at all, and then only its last push line, the one gh reads. A remote whose fetch URL
 knives does not read is unreadable whatever its push URL says — gh reads a `?query` or `#fragment`
 fetch URL, and falling to the push URL certified a decoy — and is refused with the `-R` remedy; a
 registry remote outside the grammar is a configuration error at load. gh's `config.yml` and
