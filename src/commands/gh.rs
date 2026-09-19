@@ -37,18 +37,21 @@
 //! last non-blank push line only for a remote with no fetch URL at all. A
 //! remote whose fetch URL knives does not read is unreadable whatever its
 //! push URL says (gh reads a `?query` fetch URL; falling to the push URL
-//! certified a decoy) and is refused with the `-R` remedy; a local path
-//! never binds (gh drops the remote and reads the next); and a creation
-//! whose repository is read from the checkout is gated on any remote naming
-//! a registered upstream (`checkout_upstream`), since which remotes gh sees
-//! is not certified.
+//! certified a decoy) and is refused with the `-R` remedy; only a remote on
+//! a host knives can certify gh knows (`visible_hosts`) binds a marker or
+//! the ranking — a local path or a foreign host never ends it (gh drops the
+//! remote and reads the next) and a marker on one is refused; and a
+//! creation whose repository is read from the checkout, by marker or rank,
+//! is gated on every readable remote naming a registered upstream
+//! (`checkout_upstreams`), each entry's verdict consulted, since which
+//! remote gh ranks first is not certified.
 //! gh's `config.yml` and `hosts.yml` are read whole in the grammar gh
 //! writes them in (`gh_config`); the first line outside it in either file
 //! makes the default host unknown — refused naming the file and the line,
 //! never read past, never a fall-through to the other file. With no head stated the gate states `<fork-owner>:<branch in hand>`
 //! itself, so gh never resolves one knives did not read. A token is routed
 //! only for a canonical owner on a host that folds to the default host.
-// allow: SIZE_OK: 3466 lines - single passthrough pipeline; splitting would separate resolution steps that read as one procedure.
+// allow: SIZE_OK: 3633 lines - single passthrough pipeline; splitting would separate resolution steps that read as one procedure.
 use std::collections::BTreeMap;
 use std::io::Read as _;
 use std::os::unix::{
@@ -238,12 +241,12 @@ fn routed_token(invocation: &GhInvocation, cwd: &Path) -> Option<String> {
         return None;
     }
     match target(invocation, cwd) {
-        Target::Repo(url) | Target::Ranked(url) => match mint_token(&url) {
+        Target::Repo(url) | Target::Checkout(Some(url)) => match mint_token(&url) {
             Mint::Token(token) => Some(token),
             Mint::Refused(code) => std::process::exit(code),
             Mint::Unrouted => None,
         },
-        Target::Absent => None,
+        Target::Checkout(None) | Target::Absent => None,
         Target::Unreadable(why) => {
             eprintln!("knives gh: no token routed: {why}");
             None
@@ -809,17 +812,20 @@ fn names_repository_by_id(invocation: &GhInvocation) -> bool {
 /// [`Target::Repo`] against the registry and refuses [`Target::Unreadable`].
 #[derive(Debug, PartialEq, Eq)]
 enum Target {
-    /// A repository, as the https URL the registry is compared by
+    /// A repository the command states (`-R`, `GH_REPO`, an endpoint's
+    /// owner), as the https URL the registry is compared by
     /// (`remote_url::same_remote`: host and path, each case-insensitively).
     Repo(String),
-    /// A repository read from the checkout's remotes by gh's ranking, the
-    /// same URL form. Which remote gh ranks first is not certified — gh
-    /// drops remotes knives cannot see it dropping — so the gate reads every
-    /// remote for a registered upstream ([`checkout_upstream`]) before
-    /// trusting this one; a token is minted for it as for [`Target::Repo`].
-    Ranked(String),
-    /// Nothing states one and the checkout offers none: gh's own error to
-    /// give.
+    /// The repository read from the checkout's remotes — a `gh repo
+    /// set-default` marker, else gh's ranking — over the remotes gh can see
+    /// ([`visible_hosts`]), the same URL form; `None` when no visible remote
+    /// binds (gh's own error to give). A token is minted for it, and the
+    /// gate trusts none of it: every readable remote is read for a
+    /// registered upstream ([`checkout_upstreams`]), whatever this resolved
+    /// to, since which remote gh ranks first is not certified.
+    Checkout(Option<String>),
+    /// Nothing addresses a repository knives can read an owner from (a
+    /// creation by numeric id).
     Absent,
     /// One is stated in a spelling knives does not compare; the remedy
     /// names the canonical spelling.
@@ -890,6 +896,17 @@ fn target(invocation: &GhInvocation, cwd: &Path) -> Target {
     };
     let stated = stated_repository(invocation);
     let needs_git_inputs = api_owner.is_none() && stated.is_none();
+    // Which of the checkout's remotes gh can see decides what it resolves;
+    // with that unknown (gh's files outside the grammar) nothing read from
+    // the checkout is certified.
+    let visible = if needs_git_inputs {
+        match visible_hosts(invocation) {
+            Ok(hosts) => hosts,
+            Err(refusal) => return Target::Unreadable(refusal),
+        }
+    } else {
+        Vec::new()
+    };
     let resolved_remote = needs_git_inputs.then(|| gh_resolved_remote(cwd)).flatten();
     let registry = needs_git_inputs
         .then(|| crate::config::load(&crate::config::default_config_path()).ok())
@@ -942,6 +959,42 @@ fn target(invocation: &GhInvocation, cwd: &Path) -> Target {
         }),
         registered_entry,
         remotes: &remotes,
+        visible: &visible,
+    })
+}
+
+/// The hosts knives can certify gh sees a remote on: gh's default host
+/// (`GH_HOST`, else the one configured host, else github.com), every host in
+/// gh's configuration files, and a stated `--hostname`. gh filters a
+/// checkout's remotes by the hosts it knows before reading a marker or
+/// ranking them (measured, round-18: a marker on a remote gh is not
+/// configured for is ignored with its remote, and the next-ranked remote is
+/// resolved), so a remote on any other host is invisible to it here. With
+/// `GH_HOST` set the files are not read (as for the default host); with
+/// them outside the grammar the set is unknown — the refusal names the file.
+fn visible_hosts(invocation: &GhInvocation) -> Result<Vec<String>, String> {
+    let mut hosts = vec![default_host()?];
+    if !std::env::var("GH_HOST").is_ok_and(|host| !host.is_empty()) {
+        let (source, configured) = super::gh_config::configured_hosts()?;
+        for host in configured {
+            hosts.push(canonical_host(&format!("a host in gh's {source}"), &host)?);
+        }
+    }
+    for hostname in stated_values(invocation, "hostname") {
+        if gh_canon::is_segment(&hostname) {
+            hosts.push(hostname);
+        }
+    }
+    hosts.dedup();
+    Ok(hosts)
+}
+
+/// Whether `url`, a readable remote, is on a host gh can see ([`visible_hosts`]).
+fn is_visible(url: &str, visible: &[String]) -> bool {
+    crate::remote_url::remote_host(url).is_some_and(|host| {
+        visible
+            .iter()
+            .any(|seen| crate::remote_url::same_host(host, seen))
     })
 }
 
@@ -966,6 +1019,8 @@ struct TargetInputs<'a> {
     resolved_remote: Option<ResolvedRemote<'a>>,
     registered_entry: Option<&'a crate::config::RepoEntry>,
     remotes: &'a BTreeMap<String, String>,
+    /// The hosts gh sees remotes on ([`visible_hosts`]).
+    visible: &'a [String],
 }
 
 /// Resolves steps 0–3 in shim order: API owner, explicit repo, marker, then remotes.
@@ -996,32 +1051,54 @@ fn resolve_from_inputs(inputs: TargetInputs<'_>) -> Target {
     if let Some(resolved) = inputs.resolved_remote {
         let source = format!("remote.{}.gh-resolved", resolved.name);
         let remote = inputs.remotes.get(resolved.name);
-        if resolved.value == "base" {
-            // The marked remote's URL must name a repository gh reads: a
-            // local path is a remote gh drops, and the marker with it — gh
-            // then ranks the remaining remotes, which knives cannot follow.
-            return match remote.map(|url| (url, crate::remote_url::classify(url))) {
-                Some((url, crate::remote_url::Remote::Readable { .. })) => {
-                    normalize_url(url).map_or(Target::Absent, Target::Repo)
-                }
-                Some((url, _)) => Target::Unreadable(format!(
-                    "{source} = base names a remote whose URL ({url}) is not a repository gh \
-                     reads, so gh ignores the marker: unset it (git config --unset {source}) \
-                     or state the repository (-R OWNER/REPO)"
-                )),
-                None => Target::Unreadable(format!(
-                    "{source} = base names a remote with no URL: give it one, or unset the \
-                     marker (git config --unset {source})"
-                )),
+        // The marked remote must be one gh sees: its URL a repository gh
+        // reads (a local path is not) on a host gh knows. gh drops any
+        // other remote, and the marker with it, then ranks the remaining
+        // remotes — which knives does not follow: refused with the remedy.
+        // `base` as written; another value quoted, as the other refusals show it.
+        let shown = if resolved.value == "base" {
+            "base".to_owned()
+        } else {
+            format!("{:?}", resolved.value)
+        };
+        let Some(url) = remote else {
+            let wanted = if resolved.value == "base" {
+                ""
+            } else {
+                " to take the host from"
             };
-        }
-        let Some(host) = remote.and_then(|url| crate::remote_url::remote_host(url)) else {
             return Target::Unreadable(format!(
-                "{source} = {:?} names a remote with no URL to take the host from: give it one, \
-                 or unset the marker (git config --unset {source})",
-                resolved.value
+                "{source} = {shown} names a remote with no URL{wanted}: give it one, or unset the \
+                 marker (git config --unset {source})"
             ));
         };
+        if !matches!(
+            crate::remote_url::classify(url),
+            crate::remote_url::Remote::Readable { .. }
+        ) {
+            return Target::Unreadable(format!(
+                "{source} = {shown} names a remote whose URL ({url}) is not a repository gh reads, \
+                 so gh ignores the marker: unset it (git config --unset {source}) or state the \
+                 repository (-R OWNER/REPO)"
+            ));
+        }
+        let Some(host) = crate::remote_url::remote_host(url) else {
+            // Unreachable for a readable URL, which always has a host.
+            return Target::Unreadable(format!(
+                "{source} = {shown} names a remote whose URL ({url}) has no host: unset the marker \
+                 (git config --unset {source}) or state the repository (-R OWNER/REPO)"
+            ));
+        };
+        if !is_visible(url, inputs.visible) {
+            return Target::Unreadable(format!(
+                "{source} = {shown} names a remote on {host}, and gh is not configured for that \
+                 host, so it ignores the marker: unset it (git config --unset {source}) or state \
+                 the repository (-R OWNER/REPO)"
+            ));
+        }
+        if resolved.value == "base" {
+            return Target::Checkout(normalize_url(url));
+        }
         return Repo::parse_on(resolved.value, host).map_or_else(
             || {
                 Target::Unreadable(format!(
@@ -1031,11 +1108,14 @@ fn resolve_from_inputs(inputs: TargetInputs<'_>) -> Target {
                     resolved.value
                 ))
             },
-            |repo| Target::Repo(repo.url()),
+            |repo| Target::Checkout(Some(repo.url())),
         );
     }
-    preferred_remote_url(inputs.registered_entry, inputs.remotes)
-        .map_or(Target::Absent, Target::Ranked)
+    Target::Checkout(preferred_remote_url(
+        inputs.registered_entry,
+        inputs.remotes,
+        inputs.visible,
+    ))
 }
 
 /// gh's own remote-preference score (`context.remoteNameSortScore`): named
@@ -1099,25 +1179,30 @@ fn gh_resolved_remote(cwd: &Path) -> Option<OwnedResolvedRemote> {
 ///
 /// Role-first selection is our intentional divergence: the shim has no registry concept,
 /// and a registered fork with nonstandard remote names would otherwise misroute.
-/// Among a checkout's own remotes only a forge URL in the grammar binds: a
-/// local path is a remote gh reads no repository from and drops, moving on
-/// to the next remote (measured, round-17), so it never ends the ranking
-/// here either.
+/// Among a checkout's own remotes only a forge URL in the grammar on a host
+/// gh sees binds: a local path is a remote gh reads no repository from, a
+/// host gh is not configured for one it filters out — either is dropped,
+/// and gh moves on to the next remote (measured, rounds 17-18), so neither
+/// ends the ranking here.
 fn preferred_remote_url(
     registered_entry: Option<&crate::config::RepoEntry>,
     remotes: &BTreeMap<String, String>,
+    visible: &[String],
 ) -> Option<String> {
     if let Some(entry) = registered_entry {
         return [crate::config::Role::Upstream, crate::config::Role::Origin]
             .into_iter()
             .find_map(|role| normalize_url(entry.remote(role)));
     }
-    ranked_remotes(remotes).find_map(|(_, url)| normalize_url(url))
+    ranked_remotes(remotes)
+        .filter(|(_, url)| is_visible(url, visible))
+        .find_map(|(_, url)| normalize_url(url))
 }
 
-/// The checkout's remotes gh reads a repository from, in gh's rank order:
-/// `upstream`, `github`, `origin`, then the rest by name. A local path is
-/// not among them.
+/// The checkout's remotes knives reads a repository from, in gh's rank
+/// order: `upstream`, `github`, `origin`, then the rest by name. A local
+/// path is not among them; a host gh cannot see is ([`is_visible`] is the
+/// ranking's further filter — the gate's sweep reads every one).
 fn ranked_remotes(remotes: &BTreeMap<String, String>) -> impl Iterator<Item = (&String, &String)> {
     let named = ["upstream", "github", "origin"]
         .into_iter()
@@ -1133,26 +1218,42 @@ fn ranked_remotes(remotes: &BTreeMap<String, String>) -> impl Iterator<Item = (&
     })
 }
 
-/// The registered fork whose upstream any of the checkout's readable
-/// remotes names, the highest-ranked first; `None` when none does.
+/// Every registered fork whose upstream one of the checkout's readable
+/// remotes names, in rank order, each once; empty when none does.
 ///
 /// gh ranks the remotes it can see — a remote on a host it is not
 /// configured for, or whose URL it cannot parse, is dropped and the next
-/// one is read (measured, round-17). Which remotes gh sees is not something
-/// knives certifies, so when a creation's repository is read from the
-/// checkout the gate asks the one question it can answer: does any remote
-/// gh could read name a registered upstream? If one does, the gate is on
-/// that upstream whatever remote knives would have ranked first. The cost
-/// is an over-refusal for a checkout that names a registered upstream on a
-/// remote gh would outrank; the remedy states the repository (`-R`).
-fn checkout_upstream(
-    registry: &crate::config::Registry,
-    cwd: &Path,
-) -> Option<Result<Fork, String>> {
-    let root = crate::bind::checkout_root(cwd)?;
-    let remotes = crate::bind::remotes(&root).ok()?;
-    ranked_remotes(&remotes)
-        .find_map(|(_, url)| normalize_url(url).and_then(|url| Fork::of(registry, &url)))
+/// one is read (measured, rounds 17-18). Which remotes gh sees is not
+/// something knives certifies, so when a creation's repository is read from
+/// the checkout the gate asks the one question it can answer: which
+/// registered upstreams does any remote gh could read name? The branch's
+/// verdict must pass for every one of them, whatever remote knives — or gh
+/// — would rank first. The cost is an over-refusal for a checkout naming a
+/// registered upstream on a remote gh drops or outranks; the remedy states
+/// the repository (`-R`). A remotes read that fails is a refusal, never a
+/// pass.
+fn checkout_upstreams(registry: &crate::config::Registry, cwd: &Path) -> Result<Vec<Fork>, String> {
+    let Some(root) = crate::bind::checkout_root(cwd) else {
+        return Ok(Vec::new());
+    };
+    let remotes = crate::bind::remotes(&root).map_err(|error| {
+        format!(
+            "the checkout's remotes cannot be read ({error}), so the repository this checkout \
+             addresses cannot be read: state the repository (-R OWNER/REPO)"
+        )
+    })?;
+    let mut forks: Vec<Fork> = Vec::new();
+    for (_, url) in ranked_remotes(&remotes) {
+        if let Some(url) = normalize_url(url)
+            && let Some(fork) = Fork::of(registry, &url)
+        {
+            let fork = fork?;
+            if !forks.iter().any(|seen| seen.name == fork.name) {
+                forks.push(fork);
+            }
+        }
+    }
+    Ok(forks)
 }
 
 /// How an invocation would open a pull request, and on which head.
@@ -1469,9 +1570,18 @@ fn upstream_pull_refusal(invocation: &GhInvocation, cwd: &Path) -> anyhow::Resul
         Err(Early::Pass) => return Ok(Gate::Pass),
         Err(Early::Refuse(refusal)) => return Ok(Gate::Refuse(refusal)),
     };
-    let entries = crate::ledger::Ledger::for_repo(&subject.repo).entries()?;
-    if let Some(refusal) = crate::placement::upstream_pull_refusal(&entries, &subject.branch)? {
-        return Ok(Gate::Refuse(refusal));
+    // Every registered upstream the creation may reach must rule the
+    // branch UPSTREAM: one refusal, naming the repository when there are
+    // several, stops it.
+    for repo in &subject.repos {
+        let entries = crate::ledger::Ledger::for_repo(repo).entries()?;
+        if let Some(refusal) = crate::placement::upstream_pull_refusal(&entries, &subject.branch)? {
+            return Ok(Gate::Refuse(if subject.repos.len() > 1 {
+                format!("{repo}: {refusal}")
+            } else {
+                refusal
+            }));
+        }
     }
     Ok(subject.state.map_or(Gate::Pass, Gate::PassStating))
 }
@@ -1487,12 +1597,63 @@ enum Gate {
 }
 
 /// What a creation toward a registered upstream is about: the registered
-/// repository, the fork's branch whose verdict decides, and the `--head` to
-/// add when the caller stated none.
+/// repositories (one stated, or every one the checkout's remotes name), the
+/// fork's branch whose verdict decides in each, and the `--head` to add when
+/// the caller stated none.
 struct Subject {
-    repo: crate::ids::RepoName,
+    repos: Vec<crate::ids::RepoName>,
     branch: String,
     state: Option<String>,
+}
+
+/// `Subject` for the forks a creation addresses with `branch` in hand:
+/// the branch is the same in every fork's ledger; the head to state, when
+/// `state` is wanted, is the one owner the forks share — forks whose
+/// origins name different owners cannot be stated one head, and are
+/// refused.
+fn subject_of(forks: Vec<Fork>, branch: String, state: bool) -> Result<Subject, Early> {
+    let state = if state {
+        let owners: Vec<&str> = forks.iter().map(|fork| fork.owner.as_str()).collect();
+        let Some(owner) = owners
+            .first()
+            .filter(|first| owners.iter().all(|owner| owner == *first))
+        else {
+            return Err(Early::Refuse(format!(
+                "this checkout's remotes name {} registered upstreams ({}) whose forks belong \
+                 to different owners ({}), so no one head names the branch in all of them: state \
+                 the repository (-R OWNER/REPO) and the head (--head OWNER:BRANCH)",
+                forks.len(),
+                forks
+                    .iter()
+                    .map(|fork| fork.name.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                owners.join(", ")
+            )));
+        };
+        Some(format!("{owner}:{branch}"))
+    } else {
+        None
+    };
+    Ok(Subject {
+        repos: forks.into_iter().map(|fork| fork.name).collect(),
+        branch,
+        state,
+    })
+}
+
+/// The one branch `read` names for every fork — `Ok(None)` when none is
+/// stated — or the first fork's refusal: each fork reads the same head, so
+/// they agree on the branch when they all accept it.
+fn branch_for_all(
+    forks: &[Fork],
+    read: impl Fn(&Fork) -> Result<Option<String>, Early>,
+) -> Result<Option<String>, Early> {
+    let mut branch = None;
+    for fork in forks {
+        branch = read(fork)?;
+    }
+    Ok(branch)
 }
 
 /// The registered repository and head a creation is about, or why the gate
@@ -1507,13 +1668,9 @@ fn opening_subject(
     Ok(match opening {
         PullOpening::Unreadable(refusal) => return Err(Early::Refuse(refusal)),
         PullOpening::Create { heads } => {
-            let fork = upstream_target(registry, invocation, cwd)?;
-            if let Some(branch) = one_head(&fork, &heads, "--head")? {
-                return Ok(Subject {
-                    repo: fork.name,
-                    branch,
-                    state: None,
-                });
+            let forks = upstream_targets(registry, invocation, cwd)?;
+            if let Some(branch) = branch_for_all(&forks, |fork| one_head(fork, &heads, "--head"))? {
+                return subject_of(forks, branch, false);
             }
             // None stated: gh would read git configuration knives does not —
             // the branch's push target, which may be another branch of the
@@ -1522,6 +1679,7 @@ fn opening_subject(
             // a plain clone) and states it to gh as the fork's own; with
             // neither, nothing is let through.
             let Some(branch) = current_bookmark(cwd).or_else(|| git_head_branch(cwd)) else {
+                let fork = forks.first().ok_or(Early::Pass)?;
                 return Err(Early::Refuse(format!(
                     "an upstream pull request for {} needs a head branch to check its placement \
                      verdict: state one (`--head {}:<branch>`), or run from a checkout with a \
@@ -1529,12 +1687,7 @@ fn opening_subject(
                     fork.name, fork.owner
                 )));
             };
-            let state = format!("{}:{branch}", fork.owner);
-            Subject {
-                repo: fork.name,
-                branch,
-                state: Some(state),
-            }
+            return subject_of(forks, branch, true);
         }
         PullOpening::Rest { repo: at, heads } => {
             let fork = Fork::of(registry, &at.url())
@@ -1542,7 +1695,7 @@ fn opening_subject(
                 .map_err(Early::Refuse)?;
             let branch = rest_head(&fork, &heads)?;
             Subject {
-                repo: fork.name,
+                repos: vec![fork.name],
                 branch,
                 state: None,
             }
@@ -1552,13 +1705,10 @@ fn opening_subject(
             // gh's own spellings for "the current directory's base
             // repository", which in a fork checkout is the upstream; resolved
             // the way `pr create` without `-R` is.
-            let fork = upstream_target(registry, invocation, cwd)?;
-            let branch = rest_head(&fork, &heads)?;
-            Subject {
-                repo: fork.name,
-                branch,
-                state: None,
-            }
+            let forks = upstream_targets(registry, invocation, cwd)?;
+            let branch = branch_for_all(&forks, |fork| rest_head(fork, &heads).map(Some))?
+                .ok_or(Early::Pass)?;
+            return subject_of(forks, branch, false);
         }
         PullOpening::Graphql { head } => {
             // No owner to read: inside a registered fork's checkout — jj or a
@@ -1582,25 +1732,30 @@ enum Early {
     Refuse(String),
 }
 
-/// The registered repository whose upstream this invocation addresses, or
-/// why the gate stops: another repository or none at all (`Early::Pass` —
-/// gh's own error to give), or a repository stated in a spelling knives does
-/// not compare (`Early::Refuse`, naming the canonical one).
-fn upstream_target(
+/// The registered repositories whose upstream this invocation addresses —
+/// one, for a stated repository; every one any readable remote names, for
+/// a repository read from the checkout ([`checkout_upstreams`]) — or why
+/// the gate stops: another repository or none at all (`Early::Pass` — gh's
+/// own error to give), or a repository stated in a spelling knives does not
+/// compare (`Early::Refuse`, naming the canonical one). Never empty.
+fn upstream_targets(
     registry: &crate::config::Registry,
     invocation: &GhInvocation,
     cwd: &Path,
-) -> Result<Fork, Early> {
+) -> Result<Vec<Fork>, Early> {
     match target(invocation, cwd) {
         Target::Repo(url) => Fork::of(registry, &url)
             .ok_or(Early::Pass)?
+            .map(|fork| vec![fork])
             .map_err(Early::Refuse),
-        // Read from the remotes by ranking: the ranked one when it is a
-        // registered upstream, else any remote gh could rank instead.
-        Target::Ranked(url) => Fork::of(registry, &url)
-            .or_else(|| checkout_upstream(registry, cwd))
-            .ok_or(Early::Pass)?
-            .map_err(Early::Refuse),
+        Target::Checkout(_) => {
+            let forks = checkout_upstreams(registry, cwd).map_err(Early::Refuse)?;
+            if forks.is_empty() {
+                Err(Early::Pass)
+            } else {
+                Ok(forks)
+            }
+        }
         Target::Absent => Err(Early::Pass),
         Target::Unreadable(refusal) => Err(Early::Refuse(refusal)),
     }
@@ -1827,6 +1982,9 @@ mod tests {
     )]
 
     use super::*;
+
+    /// The one host every resolution test's remotes sit on, visible to gh.
+    const HOST_VISIBLE: &str = concat!("github", ".com");
     use std::collections::BTreeMap;
 
     /// The one reading every reader is a lookup on.
@@ -2328,7 +2486,7 @@ mod tests {
         with_env(&[("GH_REPO", "")], || {
             assert_eq!(
                 target(&parsed(&args(&["pr", "list"])), scratch.path()),
-                Target::Absent
+                Target::Checkout(None)
             );
         });
         // A `GH_REPO` outside the grammar is unreadable, not guessed at.
@@ -2368,8 +2526,9 @@ mod tests {
                 resolved_remote: None,
                 registered_entry: Some(&entry),
                 remotes: &remotes,
+                visible: &[HOST_VISIBLE.to_owned()],
             }),
-            Target::Ranked(format!("https://{host}/registered/upstream.git"))
+            Target::Checkout(Some(format!("https://{host}/registered/upstream.git")))
         );
     }
 
@@ -2397,6 +2556,7 @@ mod tests {
             }),
             registered_entry: Some(&entry),
             remotes: &remotes,
+            visible: &[HOST_VISIBLE.to_owned()],
         }) else {
             panic!("a dangling base marker must be unreadable");
         };
@@ -2473,6 +2633,7 @@ mod tests {
                 resolved_remote: None,
                 registered_entry: None,
                 remotes: &remotes,
+                visible: &[HOST_VISIBLE.to_owned()],
             }),
             Target::Unreadable("refused".to_owned())
         );
@@ -2500,6 +2661,7 @@ mod tests {
                 }),
                 registered_entry: None,
                 remotes: &remotes,
+                visible: &[HOST_VISIBLE.to_owned()],
             }),
             Target::Repo(format!("https://{host}/api-owner/gh-api.git"))
         );
@@ -2524,11 +2686,12 @@ mod tests {
                 resolved_remote: Some(ResolvedRemote { name, value }),
                 registered_entry: None,
                 remotes: &remotes,
+                visible: &[HOST_VISIBLE.to_owned()],
             })
         };
         assert_eq!(
             resolve("acme/work", "origin"),
-            Target::Repo(format!("https://{host}/acme/work.git"))
+            Target::Checkout(Some(format!("https://{host}/acme/work.git")))
         );
         for value in [
             "other.example/acme/work",
@@ -2583,8 +2746,9 @@ mod tests {
                 }),
                 registered_entry: None,
                 remotes: &remotes,
+                visible: &[HOST_VISIBLE.to_owned()],
             }),
-            Target::Repo(format!("https://{host}/zebra/repository.git"))
+            Target::Checkout(Some(format!("https://{host}/zebra/repository.git")))
         );
         assert_eq!(
             resolve_from_inputs(TargetInputs {
@@ -2593,8 +2757,9 @@ mod tests {
                 resolved_remote: None,
                 registered_entry: None,
                 remotes: &remotes,
+                visible: &[HOST_VISIBLE.to_owned()],
             }),
-            Target::Ranked(format!("https://{host}/github/repository.git"))
+            Target::Checkout(Some(format!("https://{host}/github/repository.git")))
         );
 
         let remotes = BTreeMap::from([
@@ -2614,8 +2779,9 @@ mod tests {
                 resolved_remote: None,
                 registered_entry: None,
                 remotes: &remotes,
+                visible: &[HOST_VISIBLE.to_owned()],
             }),
-            Target::Ranked(format!("https://{host}/alpha/repository.git"))
+            Target::Checkout(Some(format!("https://{host}/alpha/repository.git")))
         );
         assert_eq!(
             resolve_from_inputs(TargetInputs {
@@ -2624,8 +2790,9 @@ mod tests {
                 resolved_remote: None,
                 registered_entry: None,
                 remotes: &BTreeMap::new(),
+                visible: &[HOST_VISIBLE.to_owned()],
             }),
-            Target::Absent
+            Target::Checkout(None)
         );
     }
 
