@@ -7,7 +7,7 @@
 
 #[path = "common/lab.rs"]
 mod lab;
-// allow: SIZE_OK: 6372 lines - real-binary gh passthrough scenarios share one fixture and process harness.
+// allow: SIZE_OK: 6444 lines - real-binary gh passthrough scenarios share one fixture and process harness.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
@@ -5950,31 +5950,103 @@ fn the_upstream_on_a_fetch_url_gh_reads_and_a_decoy_on_the_push_url_is_never_the
         "{output:?}"
     );
     assert!(recorded.is_none(), "gh ran: {recorded:?}");
-    // Control: a pushurl-only remote is read from its push URL, as gh reads
-    // it — the upstream gates; a decoy alone passes as the decoy.
+}
+
+#[test]
+fn a_pushurl_only_remote_is_its_last_push_line_readable_or_not() {
+    // A pushurl-only remote is read from its LAST push line, as gh reads it
+    // (round-16 code review, measured: gh reads that line and no other,
+    // readable or not) — the upstream last gates; a decoy last passes as
+    // the decoy, whatever precedes it.
+    let config_home = placement_gate_home();
+    record_placement(config_home.path(), "feat/eps", "FORK");
+    let host = concat!("github", ".com");
+    let decoy = format!("https://{host}/other/decoy.git");
+    let create = [
+        "pr",
+        "create",
+        "-t",
+        "t",
+        "-b",
+        "b",
+        "--head",
+        "routed-b:feat/eps",
+    ];
     let upstream = format!("https://{host}/routed-a/upstream.git");
-    let (output, recorded) = run_in_clone_with_upstream_config(
-        config_home.path(),
-        &[("remote.upstream.pushurl", upstream.as_str())],
-        &create,
-    );
-    assert_eq!(output.status.code(), Some(2), "{output:?}");
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("feat/eps has placement verdict FORK"),
-        "{output:?}"
-    );
-    assert!(recorded.is_none(), "gh ran: {recorded:?}");
-    let (output, recorded) = run_in_clone_with_upstream_config(
-        config_home.path(),
-        &[("remote.upstream.pushurl", decoy.as_str())],
-        &create,
-    );
-    assert!(output.status.success(), "{output:?}");
-    assert!(
-        recorded
-            .expect("fake gh ran")
-            .contains("GH_TOKEN=tok-other")
-    );
+    for config in [
+        vec![("remote.upstream.pushurl", upstream.as_str())],
+        vec![
+            ("remote.upstream.pushurl", decoy.as_str()),
+            ("remote.upstream.pushurl", upstream.as_str()),
+        ],
+    ] {
+        let (output, recorded) =
+            run_in_clone_with_upstream_config(config_home.path(), &config, &create);
+        assert_eq!(output.status.code(), Some(2), "{config:?}: {output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("feat/eps has placement verdict FORK"),
+            "{config:?}: {output:?}"
+        );
+        assert!(recorded.is_none(), "{config:?}: gh ran: {recorded:?}");
+    }
+    for config in [
+        vec![("remote.upstream.pushurl", decoy.as_str())],
+        vec![
+            ("remote.upstream.pushurl", upstream.as_str()),
+            ("remote.upstream.pushurl", decoy.as_str()),
+        ],
+    ] {
+        let (output, recorded) =
+            run_in_clone_with_upstream_config(config_home.path(), &config, &create);
+        assert!(output.status.success(), "{config:?}: {output:?}");
+        assert!(
+            recorded
+                .expect("fake gh ran")
+                .contains("GH_TOKEN=tok-other"),
+            "{config:?}"
+        );
+    }
+    // The round-16 shape: a readable decoy before an unreadable upstream.
+    // gh reads the last line — the upstream, with `?a=b` — and knives read
+    // the first readable one from the end: the decoy, certified with its
+    // token while gh created on the upstream. Now the last line alone is
+    // read: unreadable, refused with the `-R` remedy.
+    for last in [
+        format!("https://{host}/routed-a/upstream.git?a=b"),
+        format!("https://{host}/routed-a/upstream.git#frag"),
+        format!("https://{host}/routed-a/upstre%61m.git"),
+        format!("https://{host}/routed-a"),
+        "/srv/git/upstream.git".to_owned(),
+    ] {
+        let (output, recorded) = run_in_clone_with_upstream_config(
+            config_home.path(),
+            &[
+                ("remote.upstream.pushurl", decoy.as_str()),
+                ("remote.upstream.pushurl", last.as_str()),
+            ],
+            &create,
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if last.starts_with('/') {
+            // A local last push line is the remote, as a path: another
+            // repository to the registry, passed tokenless.
+            assert!(output.status.success(), "{last}: {output:?}");
+            assert!(
+                recorded.expect("fake gh ran").contains("GH_TOKEN=unset"),
+                "{last}"
+            );
+            continue;
+        }
+        assert_eq!(output.status.code(), Some(2), "{last}: {output:?}");
+        assert!(
+            stderr.contains(&format!(
+                "remote upstream's URL ({last}) is outside the grammar knives compares"
+            )),
+            "{last}: {output:?}"
+        );
+        assert!(!stderr.contains("tok-other"), "{last}: {stderr}");
+        assert!(recorded.is_none(), "{last}: gh ran: {recorded:?}");
+    }
 }
 
 #[test]

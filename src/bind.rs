@@ -336,8 +336,11 @@ pub fn remotes(root: &Path) -> Result<BTreeMap<String, String>, BindError> {
 /// decodable `%` escape, and telling that apart from a fetch URL gh also
 /// rejects is the mimicry this module does not do. The one push-URL reading
 /// is gh's own for a remote with NO fetch URL at all (`pushurl` with no
-/// `url`; measured against gh 2.98.0): the last of its push URLs that is
-/// readable, else a local push path, else unreadable. Configuration
+/// `url`; measured against gh 2.98.0): gh reads that remote's LAST push
+/// line and no other, readable or not — so knives reads exactly that line
+/// (readable, a local path, or the remote is unreadable) and never scans
+/// the earlier push URLs for one it can read. One URL is read per remote,
+/// and it is the one gh reads. Configuration
 /// reaches the read the way it reaches git: the repository's own file, the
 /// user's and the system's; `GIT_CONFIG_*` environment overrides do not
 /// (every git read knives makes strips them, see [`git_command`]). An ssh
@@ -393,33 +396,30 @@ pub fn all_remotes(root: &Path) -> Result<Remotes, BindError> {
             .flatten()
             .map(|push_url| resolved(push_url))
             .collect();
-        // The URLs in the order gh's fallback reads them: the fetch URL when
-        // there is one, else the push URLs last first.
-        let (candidates, first_listed): (Vec<&String>, &String) = if fetch_url.is_empty() {
-            (
-                push_urls.iter().rev().collect(),
-                push_urls.first().unwrap_or(&fetch_url),
-            )
+        // The one URL gh reads for this remote: its fetch URL when it has
+        // one, else its last push line (round-16: the last line, readable or
+        // not — never an earlier push URL knives happens to read).
+        let read = if fetch_url.is_empty() {
+            push_urls.last().cloned().unwrap_or_default()
         } else {
-            (vec![&fetch_url], &fetch_url)
+            fetch_url.clone()
         };
-        let chosen = candidates.iter().find_map(|url| match classify(url) {
-            Remote::Readable { .. } => Some((*url).clone()),
+        let readable = match classify(&read) {
+            Remote::Readable { .. } => true,
             // A local path is a remote knives reads only with nothing gh
             // could read instead: a fetch path whose push URLs (git lists
             // the fetch URL itself when none is configured) are all that
-            // same path, or the last push URL of a pushurl-only remote.
-            Remote::Local
-                if fetch_url.is_empty() || push_urls.iter().all(|push| *push == fetch_url) =>
-            {
-                Some((*url).clone())
+            // same path, or the last push line of a pushurl-only remote.
+            Remote::Local => {
+                fetch_url.is_empty() || push_urls.iter().all(|push| *push == fetch_url)
             }
-            Remote::Local | Remote::Unreadable => None,
-        });
-        match chosen {
-            Some(url) => remotes.readable.insert(name, url),
-            None => remotes.unreadable.insert(name, first_listed.clone()),
+            Remote::Unreadable => false,
         };
+        if readable {
+            remotes.readable.insert(name, read);
+        } else {
+            remotes.unreadable.insert(name, read);
+        }
     }
     Ok(remotes)
 }

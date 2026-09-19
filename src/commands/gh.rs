@@ -34,7 +34,7 @@
 //! -v`, `insteadOf` applied) with ssh aliases resolved as go-gh resolves
 //! them, each read by the canonical remote grammar (`remote_url::classify`,
 //! `bind::all_remotes`): the fetch URL when readable, or a local path; the
-//! push URL only for a remote with no fetch URL at all. A remote whose
+//! last push line only for a remote with no fetch URL at all. A remote whose
 //! fetch URL knives does not read is unreadable whatever its push URL says
 //! (gh reads a `?query` fetch URL; falling to the push URL certified a
 //! decoy) and is refused with the `-R` remedy.
