@@ -130,7 +130,7 @@ Local state is computed on demand. Store only what no amount of computing can re
 - who is working on what, and why (the repo cannot know this; and it cannot be inferred from session working directories either, since an agent launched elsewhere may need to change a fork)
 - why we carry a foreign PR as a release parent
 - supersession pointers, when one of our PRs closes in favour of another
-- **fork-only marks**: a branch we deliberately keep with no upstream PR. This should be the minority, but it is real, and it covers CI we want on our fork but not upstream. Without a mark, every such branch reads as an error in `knives status` forever.
+- **fork-only marks**: a branch we deliberately keep with no upstream PR. This should be the minority, but it is real, and it covers CI we want on our fork but not upstream. Without a mark, every such branch reads as an error in `knives status` forever. (2026-09-19: this mark predates Sami's ruling that "fork-only is not a real option" — a marked branch is an UPSTREAM member whose PR has not yet been opened, not a third destination.)
 - **what happened, and what was decided**: an append-only ledger per repo, beside the state
   file. Everything above is current intent, rewritten whole on each change; `knives finish`
   deletes the one "why" the tool records. The ledger is the past tense: events this tool
@@ -605,7 +605,7 @@ Measured or reproduced, not reasoned: workspace creation cost and tracked-versus
 
 ## Open questions
 
-- Closed-not-merged while the branch lives on, which staleness bots produce. Distinguish from supersession and from a deliberate fork-only branch.
+- Closed-not-merged while the branch lives on, which staleness bots produce. Distinguish from supersession and from a deliberate fork-only branch. (2026-09-19: same note as above — a deliberate fork-only branch predates the ruling that fork-only is not a real option; treat it as an UPSTREAM member awaiting its PR, not a third state.)
 - A foreign `pull/N/head` advancing under a release, and whether re-cutting should be automatic or offered.
 - Whether the claim gate's hard refusal earns its cost. The finish guard's did not: holding a claim through review blocked other agents for nothing, since a released branch, its bookmark, and its pull request all survive.
 - Workspace lifecycle beyond what `knives finish` cleans up. They are cheap to create, which is why they accumulate.
