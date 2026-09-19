@@ -114,7 +114,23 @@ knives notch <branch> --pr <number> -m 'recon: <member/lone>; asks and inherited
 
 Rehome when the PR conflicts, a maintainer actually requests it, or verification requires newer trunk behavior. Do not reset review context merely because a mergeable PR is behind trunk.
 
-A lone branch follows `fork-work`'s `jj rebase -b <branch> -d <trunk>@upstream`. A release member does not move independently: record `rehome needed: parent of <release>` and hand back to the orchestrator, which performs release-wide changes only with all affected member claims released. Never duplicate a feature/fix branch or construct a release-lineage copy.
+A branch `fork-work`'s bidirectional gate confirms clean of both hazards — no direct parent
+slot in the release in hand, and an empty ancestry query in both directions across every
+release ref this fork's scheme can produce (the dated `release/*` glob, or the one exact
+configured branch under a fixed scheme — `fork-work` has the scheme check) plus retention
+bookmarks — follows `jj rebase -b <branch> -d <trunk>@upstream`. A
+direct release member does not move independently: record `rehome needed: parent of <release>`
+and hand back to the orchestrator, which performs release-wide changes only with all affected
+member claims released. A branch that is a parent of a release/keep merge with no current
+membership — ancestry from a retained or superseded cut — is the same hand-back, not a
+lone-branch rehome: record `rehome needed: ancestor of retained release <name/ref>` and hand
+back; do not `-b`, `-s`, or `-r` it yourself. A branch that instead *descends from* a
+release/keep merge (`stacked-history`) is your own rehome to make once that merge has ever
+been pushed: a bare `-b` is destructive here too (it drags the merge along and rewrites it,
+current or retained); rebase only the branch's own commits with `jj rebase -s
+'<release-or-keep-ref>..<branch>' -d <trunk>@upstream`, which leaves the merge's commit id
+untouched — no hand-back needed for this direction, since it never touches the release's own
+composition. Never duplicate a feature/fix branch or construct a release-lineage copy.
 
 After your legitimate rehome, record both old/new commits, update the expected branch tip and verify patch preservation and conflict-free ancestry. The remote still has the original PR head until publication. A trunk-context-only diff is evidence of a rehome, not a substitute for exercising the resulting code. Push only after candidate review.
 

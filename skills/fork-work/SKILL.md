@@ -144,24 +144,78 @@ has a knives command that does the same job safely:
   be working there. `knives start` gives you your own workspace, based where the section
   above says, so you never inherit a release merge as a parent by accident. This is about
   these shared forks specifically; branching normally in your own projects is fine.
-- **The two sanctioned moves.** A branch that needs a newer base moves one of two ways, and
-  which one depends on whether the branch is a release member (`knives release members` lists
-  the parents of the release in hand; a branch named there is a member). A member moves with
-  `knives release rebase`: every member and the release together, so the composition stays
-  whole. A lone branch moves with `jj rebase -b <branch> -d <trunk>@upstream`, which keeps its
-  change ids so `knives release advance <branch>` follows it — and, because `-b` rebases
-  descendants, also carries any release merge built on it, which is expected: the release
-  follows its member, and superseded cuts are `knives release reap`ed. Never `jj duplicate` a
-  branch: it mints new commit ids the release cannot match to the branch (`knives release
-  advance --from` is the repair, not the plan). Never keep two copies of a branch — a
-  "release-lineage" or "sibling" branch carrying a pull request's content on an older base so
-  the release can carry it while the pull request branch is rebased for the maintainer. One
-  branch is both the release member and the pull request head; if it does not compose into the
-  release, the release is behind: move the release, do not fork the branch.
+- **The sanctioned moves.** A branch that needs a newer base can be entangled with a release in
+  two different, opposite directions, and a raw `jj rebase -b`/`-s`/`-r` handles neither safely
+  once that release ref has ever been pushed. First establish the release-ref term for *this*
+  repo's scheme — `knives status` (or `knives repos`) names the `newest_release`; a value
+  shaped `release/YYYY-MM-DD[.N]` means the dated scheme (the default, no `release_branch` set
+  in `repos.toml`), and any other exact name (for example `integration`) *is* the fixed
+  scheme's one release branch, configured as that repo's `repos.toml` `[repos.<name>]
+  release_branch = "<name>"` and never present under a second concurrent or differently-named
+  instance — a fixed name cannot start with `release/` (the config loader refuses that), so the
+  dated glob below never matches it, which is exactly how a fixed-scheme member goes undetected
+  if you use the dated term unconditionally. Build `RELEASE_REFS` accordingly: dated —
+  `bookmarks(glob:"release/*") | remote_bookmarks(glob:"release/*")` (the glob, not just the
+  named newest release, so a not-yet-reaped older dated cut is still caught); fixed —
+  `bookmarks(exact:"<name>") | remote_bookmarks(exact:"<name>")` naming the one configured
+  branch (no glob needed: a fixed release never has a second, differently-named instance to
+  also catch). Then run the bidirectional gate: `jj log -r '(::<branch> | <branch>::) &
+  (RELEASE_REFS | bookmarks(glob:"keep/*") | remote_bookmarks(glob:"keep/*"))'` — substituting
+  `RELEASE_REFS` and this fork's actual retention-bookmark convention if it differs from
+  `keep/*` (a `~ ::trunk()` exclusion is unnecessary and was checked — a release/keep ref can
+  never be an ancestor of the trunk it was cut from, so it never intersects `::trunk()`).
+  Empty: the branch is genuinely lone, and `jj rebase -b <branch> -d <trunk>@upstream` is
+  correct, keeping its change ids so `knives release advance <branch>` follows it. Non-empty:
+  which direction the hit is in decides the remedy, and the two are opposite operations:
+  1. **The branch is a parent of the release/keep merge** (`jj log -r '<branch>:: & (...)'`
+     names it) — the branch feeds a member's content into the release. Bare `knives release
+     members` alone does not settle this: it answers only direct membership in the release *in
+     hand* (`src/release_carries.rs::run_release_members` resolves just
+     `release::plan(...).release`), never a *retained* superseded dated release — one kept
+     because it still has local descendants, or because a consumer or some other pin is still
+     frozen on it, under whatever name that pin uses: the old dated `release/<date>` name itself
+     if it has not been reaped yet, or a separate retention bookmark such as `keep/…` if the
+     name has been reaped but something else still pins the commit (`reap_superseded`,
+     `src/commands/release.rs`). Run `knives release members` too: named there — a direct member
+     of the release in hand — moves only with `knives release rebase`, never independently: it
+     rebases every member and the release merge together, replaying recorded conflict
+     resolutions, so the composition stays whole. Not named there — release ancestry with no
+     *current* membership — the branch is entangled with a release something else still depends
+     on for its exact commit identity. Do not `-b`, `-s`, or `-r` it: every one of them either
+     rewrites the retained release's commit (`-b`/`-s` — verified: silently moved and, on push,
+     force-moved a retained `keep/…` ref with no confirmation and no error) or silently drops
+     the branch as that release's parent, corrupting its recorded membership with no conflict
+     and no warning (`-r` — verified the same way; it is not a safer partial move here, it is a
+     different failure). Treat it like `stacked-history`: stop and get the release owner's
+     sign-off before touching it, or wait for the retained cut to lose its last local descendant
+     so `knives release reap` retires it and the query goes empty on its own.
+  2. **The branch descends from the release/keep merge** (`jj log -r '::<branch> & (...)'`
+     names it) — someone built new work on top of a cut instead of the trunk (`stacked-history`,
+     below). `jj rebase -b <branch> -d <trunk>@upstream` is *not* the fix here once that merge
+     has ever been pushed: `-b`'s root computation includes the merge itself, since it is not
+     yet reachable from the new destination, so it silently rewrites the very release/keep ref
+     this check just found — verified against both a *retained* cut and a still-current, pushed
+     one; the mechanism is graph-topological (whether the destination already contains the
+     commit), not release-state-aware, so `-b` is equally destructive against either. The safe
+     move rebases only the branch's own commits and never the merge: `jj rebase -s
+     '<release-or-keep-ref>..<branch>' -d <trunk>@upstream` — verified to leave the merge's
+     commit id byte-identical while cleanly relocating one or several commits stacked on top of
+     it. Only when the found merge has never been pushed anywhere (a local-only, still-in-hand
+     cut nobody else can see) is plain `-b` harmless, since nothing external pins the old
+     commit.
+  Never `jj duplicate` a branch: it mints new commit ids the release cannot match to the branch
+  (`knives release advance --from` is the repair, not the plan). Never keep two copies of a
+  branch — a "release-lineage" or "sibling" branch carrying a pull request's content on an
+  older base so the release can carry it while the pull request branch is rebased for the
+  maintainer. One branch is both the release member and the pull request head; if it does not
+  compose into the release, the release is behind: move the release, do not fork the branch.
 - **Do not build a branch on top of a release merge.** A branch whose history carries a
   release cut carries every member of that cut, and a pull request from it asks the
   maintainer to review the whole fork. `knives status` and `knives preflight` report it as
-  `stacked-history`; `jj rebase -b <branch> -d <trunk>@upstream` fixes it and keeps the change ids.
+  `stacked-history` — but only once the branch has an open pull request; a pre-PR branch gets
+  no such warning, so run the bidirectional gate above regardless of PR state. Case 2 above is
+  the remedy for this direction — a bare `-b` is the destructive operation, not the fix, once
+  the merge underneath has been pushed.
 - **Do not `jj op restore`.** It discards other agents' operations along with your own
   mistake.
 - **Do not push to `upstream`.** Contributions go through a pull request.
