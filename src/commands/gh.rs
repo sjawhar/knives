@@ -91,7 +91,18 @@ pub fn run(args: &[String]) -> anyhow::Result<std::convert::Infallible> {
     let token = if std::env::var_os("GH_TOKEN").is_some() {
         None
     } else {
-        match resolve_target_url(args, &cwd).as_deref().map(mint_token) {
+        let resolved = match resolve_target_url(args, &cwd) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                // A checkout whose git is broken is not an unrouted target:
+                // falling through would run gh on ambient auth, and an agent
+                // session has none, so the agent would see gh's login error
+                // instead of git's.
+                eprintln!("knives gh: {error}");
+                std::process::exit(1);
+            }
+        };
+        match resolved.as_deref().map(mint_token) {
             Some(Mint::Token(token)) => Some(token),
             Some(Mint::Refused(code)) => std::process::exit(code),
             Some(Mint::Unrouted) | None => None,
@@ -695,8 +706,21 @@ pub(crate) fn repo_flag(args: &[String]) -> Option<String> {
     None
 }
 
-/// The https URL targeted by this invocation (shim lines 75-179).
-pub(crate) fn resolve_target_url(args: &[String], cwd: &Path) -> Option<String> {
+/// The https URL targeted by this invocation (shim lines 75-179), or `Ok(None)`
+/// when nothing routes (outside any repository, or a repository with no usable
+/// remote).
+///
+/// Errs when routing needs git and the invocation sits inside a checkout whose
+/// git cannot be read — a broken worktree registration, say. Arguments that
+/// name the target themselves (`-R`, `GH_REPO`, a `gh api` owner) read no git
+/// and still resolve. The caller reports git's own words and stops: resolving
+/// such a checkout to "no target" would run gh on ambient auth, which an agent
+/// session does not have, so the agent would see gh's login error instead of
+/// git's.
+pub(crate) fn resolve_target_url(
+    args: &[String],
+    cwd: &Path,
+) -> Result<Option<String>, crate::bind::BindError> {
     let api_owner = owner_from_api_args(args);
     let repo_spec = repo_flag(args).or_else(gh_repo_environment);
     let needs_git_inputs = api_owner.is_none() && repo_spec.is_none();
@@ -704,9 +728,14 @@ pub(crate) fn resolve_target_url(args: &[String], cwd: &Path) -> Option<String> 
     let registry = needs_git_inputs
         .then(|| crate::config::load(&crate::config::default_config_path()).ok())
         .flatten();
-    let bound = registry
+    let bound = match registry
         .as_ref()
-        .and_then(|registry| crate::bind::here(registry, cwd).ok());
+        .map(|registry| crate::bind::here(registry, cwd))
+    {
+        Some(Ok(fork)) => Some(fork),
+        Some(Err(crate::bind::Unbound::Unreadable(error))) => return Err(error),
+        Some(Err(_)) | None => None,
+    };
     let registered_entry = bound.as_ref().map(|fork| fork.entry);
     let requires_remotes = needs_git_inputs
         && (resolved_remote
@@ -714,18 +743,18 @@ pub(crate) fn resolve_target_url(args: &[String], cwd: &Path) -> Option<String> 
             .is_some_and(|resolved| resolved.value == "base")
             || registered_entry.is_none());
     let remotes = if requires_remotes {
-        bound
-            .as_ref()
-            .map(|fork| fork.checkout.remotes.clone())
-            .or_else(|| {
-                crate::bind::checkout_root(cwd).and_then(|root| crate::bind::remotes(&root).ok())
-            })
-            .unwrap_or_default()
+        match bound.as_ref().map(|fork| fork.checkout.remotes.clone()) {
+            Some(remotes) => remotes,
+            None => match crate::bind::checkout_root(cwd) {
+                Some(root) => crate::bind::remotes(&root)?,
+                None => BTreeMap::new(),
+            },
+        }
     } else {
         BTreeMap::new()
     };
 
-    resolve_from_inputs(TargetInputs {
+    Ok(resolve_from_inputs(TargetInputs {
         api_owner: api_owner.as_deref(),
         repo_spec: repo_spec.as_deref(),
         resolved_remote: resolved_remote.as_ref().map(|resolved| ResolvedRemote {
@@ -734,7 +763,7 @@ pub(crate) fn resolve_target_url(args: &[String], cwd: &Path) -> Option<String> 
         }),
         registered_entry,
         remotes: &remotes,
-    })
+    }))
 }
 
 /// A `gh-resolved` marker owned after parsing git config at the process boundary.
@@ -1356,29 +1385,29 @@ mod tests {
         with_env(&[("GH_REPO", "acme/work")], || {
             assert_eq!(
                 resolve_target_url(&args(&["pr", "list"]), scratch.path()),
-                Some(format!("https://{host}/acme/work.git"))
+                Ok(Some(format!("https://{host}/acme/work.git")))
             );
             assert_eq!(
                 resolve_target_url(
                     &args(&["api", "repos/{owner}/{repo}/pulls"]),
                     scratch.path()
                 ),
-                Some(format!("https://{host}/acme/work.git"))
+                Ok(Some(format!("https://{host}/acme/work.git")))
             );
             assert_eq!(
                 resolve_target_url(&args(&["pr", "list", "-R", "other/repo"]), scratch.path()),
-                Some(format!("https://{host}/other/repo.git"))
+                Ok(Some(format!("https://{host}/other/repo.git")))
             );
             // A path literal is the request's real target and still wins.
             assert_eq!(
                 resolve_target_url(&args(&["api", "repos/literal/repo/pulls"]), scratch.path()),
-                Some(format!("https://{host}/literal/gh-api.git"))
+                Ok(Some(format!("https://{host}/literal/gh-api.git")))
             );
         });
         with_env(&[("GH_REPO", "")], || {
             assert_eq!(
                 resolve_target_url(&args(&["pr", "list"]), scratch.path()),
-                None
+                Ok(None)
             );
         });
     }
