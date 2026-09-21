@@ -186,6 +186,62 @@ fn outside_jj_repo_arguments_pass_through_untouched() {
 }
 
 #[test]
+fn a_git_failure_inside_a_checkout_is_reported_not_fallen_through() {
+    // Given: a worktree whose admin registration was pruned away — the cwd is a
+    // checkout, and every git read in it fails fatally.
+    let scratch = tempfile::tempdir().expect("scratch");
+    let main = scratch.path().join("main");
+    fs::create_dir(&main).expect("mkdir main");
+    let git = |dir: &Path, args: &[&str]| {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.com")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.com")
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&main, &["init", "-q"]);
+    git(&main, &["commit", "-q", "--allow-empty", "-m", "init"]);
+    git(&main, &["worktree", "add", "-q", "../wt", "-b", "b1"]);
+    fs::remove_dir_all(main.join(".git/worktrees/wt")).expect("prune the registration");
+    let worktree = scratch.path().join("wt");
+    let (dir, log) = fake_gh();
+
+    // When: knives gh runs a routed command from that worktree.
+    let output = knives_cmd(scratch.path())
+        .args(["gh", "--", "pr", "list"])
+        .current_dir(&worktree)
+        .env("KNIVES_REAL_GH", dir.path().join("gh"))
+        .env("FAKE_GH_LOG", &log)
+        .output()
+        .expect("run knives gh");
+
+    // Then: git's own error reaches stderr, knives exits non-zero, and gh never
+    // runs on its own auth (a fall-through here read as a gh login problem).
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.starts_with("knives gh: reading remotes of"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("not a git repository"), "{stderr}");
+    assert!(
+        !log.exists(),
+        "gh must not run on its own auth when git fails in a checkout"
+    );
+}
+
+#[test]
 fn bare_gh_separator_passes_zero_args_through() {
     // Given: a fake gh outside any jj repository.
     let scratch = tempfile::tempdir().expect("scratch");
