@@ -761,13 +761,17 @@ impl Repo {
     /// Answers where work went when it was not merged: a maintainer building their own
     /// branch on our commits leaves the branch itself untouched, so the only trace is that
     /// its tip is reachable from somewhere else.
+    ///
+    /// One evaluation answers for every bookmark: `commit::tips` holds exactly the
+    /// tips that descend from `commit`. A fork carries every upstream branch as a
+    /// bookmark, so an ancestry query per tip would be a thousand walks per branch.
     pub fn branches_containing(
         &self,
         commit: &CommitId,
         scheme: &ReleaseScheme,
         publish_remote: &str,
     ) -> Result<Vec<BookmarkRef>, JjError> {
-        let mut found = Vec::new();
+        let mut candidates = Vec::new();
         for (reference, tip) in self.bookmark_tips()? {
             if &tip == commit {
                 continue;
@@ -788,11 +792,27 @@ impl Repo {
             {
                 continue;
             }
-            if self.is_ancestor(commit, &tip)? {
-                found.push(reference);
-            }
+            let tip = JjCommitId::try_from_hex(tip.as_str()).ok_or_else(|| JjError::Revision {
+                revision: reference.to_string(),
+                detail: "bookmark tip is not a hex commit id".to_owned(),
+            })?;
+            candidates.push((reference, tip));
         }
-        Ok(found)
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+        let root = self.commit(commit.as_str())?.id().clone();
+        let tips = candidates.iter().map(|(_, tip)| tip.clone()).collect();
+        let descendants = self.revset_ids(
+            ResolvedRevsetExpression::commit(root)
+                .dag_range_to(&ResolvedRevsetExpression::commits(tips)),
+            commit.as_str(),
+        )?;
+        Ok(candidates
+            .into_iter()
+            .filter(|(_, tip)| descendants.contains(tip))
+            .map(|(reference, _)| reference)
+            .collect())
     }
 
     pub fn resolve_commit(&self, revision: &str) -> Result<CommitId, JjError> {
