@@ -1,7 +1,7 @@
 //! `probe_landed`: whether a branch's content reached the trunk, ancestry aside.
 //!
 //! A squash merge lands content ancestry cannot see. The probe replays the
-//! branch onto the trunk in scratch commits it always cleans up, writes nothing
+//! branch onto the trunk in scratch commits no operation ever records, writes nothing
 //! to the shared op log, never abandons a commit it did not create, forks and
 //! probes against the configured trunk, and answers the same from many threads
 //! as from one.
@@ -19,8 +19,33 @@ mod lab;
 use knives::detect::landed::RebaseOutcome;
 use knives::ids::{BookmarkRef, BranchName};
 use knives::jj::{Repo, probe_landed};
-use lab::{Lab, operation_ids};
+use lab::{Lab, extend_branch, operation_ids};
+use std::path::Path;
 use std::process::Command;
+
+/// Every commit object in a colocated checkout's git store, reachable or not.
+/// A probe's replay runs in a transaction it drops, so no operation records
+/// the commits it wrote, but their objects stay: this counts what it replayed.
+fn stored_commits(checkout: &Path) -> usize {
+    let output = Command::new("git")
+        .args([
+            "cat-file",
+            "--batch-all-objects",
+            "--batch-check=%(objecttype)",
+        ])
+        .current_dir(checkout)
+        .output()
+        .expect("list the git store's objects");
+    assert!(
+        output.status.success(),
+        "git cat-file failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| *line == "commit")
+        .count()
+}
 
 #[test]
 fn a_fork_whose_trunk_is_dev_probes_and_forks_against_dev() {
@@ -312,14 +337,14 @@ fn the_net_probe_cleans_up_its_bookmark_and_commits() {
 
 #[test]
 fn the_range_probe_cleans_up_every_scratch_commit() {
-    // Given: an octopus range whose duplicate creates a parent/child scratch chain.
+    // Given: an octopus range whose replay creates a parent/child scratch chain.
     let lab = lab::Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     lab.branch("feat/beta", "beta.txt", "beta\n");
     lab.octopus("feat/pair", "feat/alpha", "feat/beta");
     let before = lab.revision(&lab.work, "all()", "commit_id ++ \"\\n\"");
 
-    // When: the landed-range probe cleans up the commits it duplicated.
+    // When: the landed-range probe cleans up the commits it replayed.
     let outcome = knives::jj::probe_landed(
         &lab.work,
         &knives::ids::BranchName::new("feat/pair"),
@@ -369,4 +394,79 @@ fn the_probe_never_abandons_a_commit_it_did_not_create() {
         lab.work.join("their-wip.txt").exists(),
         "the probe destroyed another agent's uncommitted file"
     );
+}
+
+#[test]
+fn a_branch_that_conflicts_at_its_first_commit_is_judged_without_replaying_the_rest() {
+    // Replaying a commit onto a conflicted parent carries the parent's conflict
+    // forward with this commit's change added to it, so down a long branch whose
+    // first replay conflicts the unresolved conflict accumulates terms and each
+    // replay costs more than the last: a branch of a thousand commits forked far
+    // behind the trunk keeps `knives status` busy for over an hour. The first
+    // conflict already decides the verdict, so nothing past it is replayed.
+    // Given: upstream adds a file, and a twelve-commit branch writes its own
+    // version of it in every commit
+    let lab = Lab::new();
+    lab.upstream_trunk_file("shared.txt", "upstream\n");
+    lab.branch("feat/long", "shared.txt", "ours 0\n");
+    for index in 1..12 {
+        extend_branch(&lab, "feat/long", "shared.txt", &format!("ours {index}\n"));
+    }
+    let before = stored_commits(&lab.work);
+
+    // When: the branch is probed against the trunk
+    let outcome = probe_landed(&lab.work, &BranchName::new("feat/long"), "main@upstream")
+        .expect("probe landed");
+
+    // Then: it conflicts, and only the commit that conflicted was replayed
+    assert_eq!(outcome, RebaseOutcome::Conflicted);
+    assert_eq!(
+        stored_commits(&lab.work) - before,
+        1,
+        "the probe replayed past the first conflict"
+    );
+}
+
+#[test]
+fn a_conflict_after_clean_commits_still_conflicts() {
+    // Given: a branch whose first two commits replay clean onto the trunk and
+    // whose third conflicts with it
+    let lab = Lab::new();
+    lab.upstream_trunk_file("shared.txt", "upstream\n");
+    lab.branch("feat/late", "first.txt", "first\n");
+    extend_branch(&lab, "feat/late", "second.txt", "second\n");
+    extend_branch(&lab, "feat/late", "shared.txt", "ours\n");
+    extend_branch(&lab, "feat/late", "fourth.txt", "fourth\n");
+    let before = stored_commits(&lab.work);
+
+    // When: the branch is probed against the trunk
+    let outcome = probe_landed(&lab.work, &BranchName::new("feat/late"), "main@upstream")
+        .expect("probe landed");
+
+    // Then: the late conflict decides it, and the replay stopped there
+    assert_eq!(outcome, RebaseOutcome::Conflicted);
+    assert_eq!(
+        stored_commits(&lab.work) - before,
+        3,
+        "the probe replayed past the conflicting third commit"
+    );
+}
+
+#[test]
+fn each_commit_is_replayed_onto_the_replay_of_its_parent() {
+    // Given: a branch whose second commit rewrites the file its first commit
+    // adds, and a trunk that has moved on without that file
+    let lab = Lab::new();
+    lab.advance_upstream("advance\n");
+    lab.branch("feat/pair", "added.txt", "first\n");
+    extend_branch(&lab, "feat/pair", "added.txt", "second\n");
+
+    // When: the branch is probed against the trunk
+    let outcome = probe_landed(&lab.work, &BranchName::new("feat/pair"), "main@upstream")
+        .expect("probe landed");
+
+    // Then: it replays clean. The second commit lands on the replay of the
+    // first, which has the file; replayed onto the trunk itself it would edit
+    // a file the trunk does not have, and conflict.
+    assert_eq!(outcome, RebaseOutcome::CleanNonEmpty);
 }
