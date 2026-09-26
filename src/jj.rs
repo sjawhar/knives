@@ -20,7 +20,7 @@ use jj_lib::op_store::{RefTarget, RemoteRef};
 use jj_lib::ref_name::{RefName as JjRefName, RemoteName as JjRemoteName};
 use jj_lib::repo::{MutableRepo, ReadonlyRepo, Repo as _, RepoLoader};
 use jj_lib::revset::{SymbolResolver, walk_revs};
-use jj_lib::rewrite::{duplicate_commits, merge_commit_trees, rebase_commit};
+use jj_lib::rewrite::{CommitRewriter, duplicate_commits, merge_commit_trees, rebase_commit};
 use jj_lib::settings::UserSettings;
 use jj_lib::transaction::Transaction;
 use jj_lib::working_copy::WorkingCopy as _;
@@ -67,8 +67,6 @@ pub enum JjError {
     },
     #[error("could not run `{program}`: {detail}")]
     Process { program: String, detail: String },
-    #[error("probe did not create exactly one root commit")]
-    ProbeRoot,
     #[error("the landed probe for `{branch}` panicked")]
     ProbePanic { branch: String },
     #[error("could not parse command output: {detail}")]
@@ -679,7 +677,7 @@ impl Repo {
     }
 
     /// Commits reachable from `tip` but not from any of `bases` — `bases..tip` —
-    /// children before parents: the order [`duplicate_commits`] requires.
+    /// children before parents: the order [`replay_range`] replays in reverse.
     fn range_newest_first(
         &self,
         bases: &[JjCommitId],
@@ -1095,9 +1093,8 @@ pub fn probe_net_diff(
 /// Replays `base..revision` onto a target and classifies the resulting content.
 ///
 /// A read, not a mutation, in the same dropped-transaction style as
-/// [`probe_net_diff`]. [`duplicate_commits`] is the code `jj duplicate -r
-/// <range> -d <onto>` itself runs, so replay semantics are unchanged from the
-/// porcelain implementation this replaces.
+/// [`probe_net_diff`]. Each commit is placed where `jj duplicate -r <range> -d
+/// <onto>` puts it, by the rewrite that command runs (see [`replay_range`]).
 pub fn probe_revision(
     repo: &Path,
     base: &str,
@@ -1115,31 +1112,70 @@ pub fn probe_revision(
         return Ok(RebaseOutcome::Empty);
     }
     let mut tx = repo.repo.start_transaction();
-    let stats = block_on(duplicate_commits(
-        tx.repo_mut(),
-        &targets,
-        &std::collections::HashMap::new(),
-        std::slice::from_ref(onto.id()),
-        &[],
-    ))
-    .map_err(|error| store_error(&error))?;
-    // Every duplicated commit, not just the first. A branch of several commits
-    // duplicates as several, and judging the branch by one of them answers a
-    // different question.
-    let mut conflicted = false;
-    let mut all_empty = true;
-    for replayed in stats.duplicated_commits.values() {
-        conflicted = conflicted || replayed.has_conflict();
-        all_empty = all_empty
-            && block_on(replayed.is_empty(tx.repo())).map_err(|error| store_error(&error))?;
-    }
+    let outcome = replay_range(tx.repo_mut(), &targets, onto.id())?;
     drop(tx);
-    if stats.duplicated_commits.is_empty() {
-        return Err(JjError::ProbeRoot);
+    Ok(outcome)
+}
+
+/// Replays `targets` — a `base..tip` range, children before parents — onto
+/// `onto`, parents first, and classifies what the replays hold.
+///
+/// Placement is `jj duplicate`'s: a commit none of whose parents is in the
+/// range goes onto `onto`, and every other commit onto the replays of its
+/// in-range parents. That is exactly what `duplicate_commits` computes for a
+/// `base..tip` range, since no parent outside such a range has an ancestor
+/// inside it.
+///
+/// Every replay counts, not just the first: a branch of several commits
+/// replays as several, and judging it by one of them answers a different
+/// question. The first conflicted replay ends the replay, because it already
+/// decides the outcome and because replaying past it does not scale: a commit
+/// replayed onto a conflicted parent carries that conflict with its own change
+/// added, so down a long branch the unresolved conflict accumulates terms and
+/// each replay costs more than the one before.
+fn replay_range(
+    mut_repo: &mut MutableRepo,
+    targets: &[JjCommitId],
+    onto: &JjCommitId,
+) -> Result<RebaseOutcome, JjError> {
+    let mut replays: std::collections::HashMap<&JjCommitId, JjCommitId> =
+        std::collections::HashMap::new();
+    let mut all_empty = true;
+    for original in targets.iter().rev() {
+        let commit = mut_repo
+            .store()
+            .get_commit(original)
+            .map_err(|error| store_error(&error))?;
+        let mut parents = Vec::new();
+        for parent in commit.parent_ids() {
+            if let Some(replayed) = replays.get(parent)
+                && !parents.contains(replayed)
+            {
+                parents.push(replayed.clone());
+            }
+        }
+        if parents.is_empty() {
+            parents.push(onto.clone());
+        }
+        let rewriter = CommitRewriter::new(mut_repo, commit, parents);
+        let replayed = block_on(async {
+            rewriter
+                .rebase()
+                .await?
+                .clear_rewrite_source()
+                .generate_new_change_id()
+                .write()
+                .await
+        })
+        .map_err(|error| store_error(&error))?;
+        if replayed.has_conflict() {
+            return Ok(RebaseOutcome::Conflicted);
+        }
+        all_empty = all_empty
+            && block_on(replayed.is_empty(mut_repo)).map_err(|error| store_error(&error))?;
+        let _ = replays.insert(original, replayed.id().clone());
     }
-    Ok(if conflicted {
-        RebaseOutcome::Conflicted
-    } else if all_empty {
+    Ok(if all_empty {
         RebaseOutcome::Empty
     } else {
         RebaseOutcome::CleanNonEmpty
