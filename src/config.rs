@@ -209,19 +209,32 @@ impl RepoEntry {
         format!("{}@{}", self.trunk(), Role::Upstream)
     }
 
-    /// The `immutable_heads()` this fork runs under: jj's `trunk()`, tags, and the
-    /// trunk by name on every remote knives knows — upstream, origin, and the
-    /// release remote when one is configured.
+    /// The `immutable_heads()` this fork runs under: jj's `trunk()`, the trunk by
+    /// name on every remote knives knows — upstream, origin, and the release
+    /// remote when one is configured — and every tag fetched from upstream.
     ///
-    /// jj's default adds `untracked_remote_bookmarks()`. In a fork, a remote ref
-    /// that is not trunk is ours or something we build on — a superseded release
-    /// cut a fetch re-materialized, another fork's pull request head — and
-    /// freezing its ancestors protects nothing (a local rewrite never reaches a
-    /// remote; the next fetch restores whatever was dropped) while refusing every
-    /// routine `jj rebase` of a member whose old tip sits under one. The trunks
-    /// are named outright because `trunk()` need not resolve to them: `jj git
-    /// clone` pins the alias to `<trunk>@origin`, and the default picks whichever
-    /// trunk-named ref is newest. Each remote is named, never
+    /// jj's default adds `untracked_remote_bookmarks()` and `tags()`. In a fork, a
+    /// remote ref that is not trunk is ours or something we build on — a
+    /// superseded release cut a fetch re-materialized, another fork's pull request
+    /// head — and freezing its ancestors protects nothing (a local rewrite never
+    /// reaches a remote; the next fetch restores whatever was dropped) while
+    /// refusing every routine `jj rebase` of a member whose old tip sits under
+    /// one. The fork's own tags are the same: a rewrite moves bookmarks, never
+    /// tags, so the tag keeps naming the published original — locally, so no push
+    /// can move it on the remote. Every release this fork publishes is tagged,
+    /// and a tag on a release merge pinned every member commit beneath it.
+    ///
+    /// Upstream's tags stay pinned, by where they were fetched from rather than
+    /// by a naming convention: `remote_tags(remote=exact:"upstream")`. Ancestry
+    /// does not cover them — most of the upstream tags a fork fetches sit off
+    /// upstream's trunk (oh-my-pi had 457). Every other tag is the fork's own: its
+    /// published releases and its retention tags alike, which `knives release
+    /// rebase` copies when it moves the members beneath them and then cleans up
+    /// after.
+    ///
+    /// The trunks are named outright because `trunk()` need not resolve to them:
+    /// `jj git clone` pins the alias to `<trunk>@origin`, and the default picks
+    /// whichever trunk-named ref is newest. Each remote is named, never
     /// `remote_bookmarks(exact:"<trunk>")` alone, which also matches the `@git`
     /// export of whatever the local bookmark points at. `knives start` writes
     /// this into the repository's jj config; knives' own in-process rewrites keep
@@ -236,7 +249,11 @@ impl RepoEntry {
             .iter()
             .map(|remote| format!("remote_bookmarks(exact:\"{trunk}\", exact:\"{remote}\")"))
             .collect();
-        format!("trunk() | tags() | {}", pinned.join(" | "))
+        format!(
+            "trunk() | {} | remote_tags(remote=exact:\"{}\")",
+            pinned.join(" | "),
+            Role::Upstream
+        )
     }
 
     /// The branch a pull request from this repo should target.

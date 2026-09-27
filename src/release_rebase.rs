@@ -2,8 +2,9 @@
 //!
 //! One ordered gate sequence — frozen pins, stale bases, the target's
 //! provenance, the landed members a bare rebase sheds — around one
-//! `jj rebase -b <release> -d <target>`, with the report of what moved. The
-//! cut lives in `release_cut`; the membership verbs in `release_edit`.
+//! `jj rebase -b <release> -d <target>`, with the cleanup of the copies it
+//! makes of earlier tagged releases and the report of what moved. The cut
+//! lives in `release_cut`; the membership verbs in `release_edit`.
 
 use knives::bind::Fork;
 use knives::cli::Exit;
@@ -23,9 +24,12 @@ use super::release_edit::{EditRecord, record_edit_event, release_is_locally_mova
 /// conflict resolutions replay as ordinary rebase semantics. The upstream base
 /// is never a release parent; this is how the release's members change theirs.
 /// A cut deliberately does not do this: which upstream commit to move onto,
-/// and whether to move at all, is a judgment. After a bare rebase, members
-/// whose pull requests landed and carry nothing more are dropped — the work
-/// reaches the release through its new base — unless `--no-drop` keeps them.
+/// and whether to move at all, is a judgment. Earlier published releases
+/// resting on member commits keep their tags and commit ids; the untagged
+/// copies the rebase makes of them are abandoned unless something rests on
+/// them. After a bare rebase, members whose pull requests landed and carry
+/// nothing more are dropped — the work reaches the release through its new
+/// base — unless `--no-drop` keeps them.
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
@@ -69,6 +73,9 @@ pub(crate) fn run_rebase(
     };
     if !release_is_locally_movable(&opened, repo, &release_name) {
         return Ok(Exit::Incomplete);
+    }
+    if let Some(exit) = stale_rule_exit(fork)? {
+        return Ok(exit);
     }
     let Some(destination) = rebase_target(RebaseTargetInput {
         fork,
@@ -127,6 +134,7 @@ pub(crate) fn run_rebase(
         return Ok(Exit::Incomplete);
     }
     shed_stale_bases(path, (&release_name, &release_commit), &members, shed)?;
+    let tagged = knives::jj::tagged_commits_a_rebase_copies(path, &release_name, &onto)?;
     knives::jj::rebase_branch_onto(path, &release_name, &onto)?;
     report_rebased_release(
         fork,
@@ -138,6 +146,15 @@ pub(crate) fn run_rebase(
         },
         bound,
     )?;
+    // After the provenance is recorded, so a failed cleanup cannot leave the
+    // rebased release described with its pre-rebase parents.
+    let copies = knives::jj::abandon_tagged_copies(
+        path,
+        &tagged,
+        &onto,
+        &format!("knives: {release_name}: abandon rebased copies of tagged releases"),
+    )?;
+    report_tagged_copies(repo, &copies);
     if no_drop {
         return Ok(Exit::Ok);
     }
@@ -165,6 +182,28 @@ fn frozen_rebase_exit(
         ),
     }
     Some(Exit::Incomplete)
+}
+
+/// Refuse while the checkout's jj config states a rule an earlier `knives start`
+/// wrote that is no longer this fork's: the tag-pinning rule knives wrote before
+/// its own release tags were exempt froze every member beneath a tagged release,
+/// and `jj rebase` would fail with jj's bare "is immutable". Refreshing is
+/// `start`'s job; a rule a human stated is theirs, and `status` reports it.
+fn stale_rule_exit(fork: &Fork<'_>) -> anyhow::Result<Option<Exit>> {
+    let rule = fork.entry.immutable_heads();
+    let Some(stated) = knives::jj::repo_immutable_heads(&fork.checkout.path)? else {
+        return Ok(None);
+    };
+    if !stated.written_by_knives || stated.rule == rule {
+        return Ok(None);
+    }
+    println!(
+        "{}: this checkout's jj config states immutable_heads() = `{}`, written by an \
+         earlier `knives start`; this fork runs under `{rule}`. Any `knives start <branch>` \
+         in this fork refreshes it; rebase again after that. Nothing moved",
+        fork.name, stated.rule
+    );
+    Ok(Some(Exit::Incomplete))
 }
 
 /// Rewrite the release to its member parents only, shedding stale bases.
@@ -678,6 +717,25 @@ fn report_rebased_release(
         Err(error) => println!("  could not list conflicts: {error}"),
     }
     Ok(())
+}
+
+/// One line per copy the rebase made of an earlier tagged release: abandoned,
+/// or kept with a note naming what rests on it.
+fn report_tagged_copies(repo: &RepoName, copies: &[knives::jj::TaggedCopy]) {
+    for copy in copies {
+        let of = format!(
+            "the rebased copy of {} (tag {})",
+            copy.original.short(),
+            copy.tags.join(", ")
+        );
+        match &copy.kept {
+            None => println!(
+                "{repo}: abandoned {}, {of}; the tag still names the original",
+                copy.copy.short()
+            ),
+            Some(reason) => println!("{repo}: note: kept {}, {of}: {reason}", copy.copy.short()),
+        }
+    }
 }
 
 /// `feat/alpha (now 1a2b3c4d5e6f)` for every maintained branch that continues a

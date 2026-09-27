@@ -338,6 +338,27 @@ impl Lab {
         jj(&self.work, ["git", "fetch", "--remote", "upstream"]);
     }
 
+    /// An annotated tag of upstream's own on `revision` in its repository, pushed
+    /// there and fetched: `<name>` and `<name>@upstream` here.
+    pub(crate) fn upstream_tag(&self, name: &str, revision: &str) {
+        git(
+            &self.maintainer,
+            &self.trunk,
+            [
+                "-c",
+                "tag.gpgSign=false",
+                "tag",
+                "-a",
+                "-m",
+                name,
+                name,
+                revision,
+            ],
+        );
+        git(&self.maintainer, &self.trunk, ["push", "origin", name]);
+        jj(&self.work, ["git", "fetch", "--remote", "upstream"]);
+    }
+
     /// [`Self::advance_upstream`] without the work checkout fetching upstream
     /// afterwards: its `main@upstream` view stays behind.
     pub(crate) fn advance_upstream_unfetched(&self, content: &str) {

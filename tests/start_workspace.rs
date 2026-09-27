@@ -365,7 +365,7 @@ fn start_makes_a_branch_pinned_only_by_an_untracked_remote_ref_rebasable() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains(
-            "jj immutable_heads() written to demo's repository config: trunk() | tags() | remote_bookmarks(exact:\"main\", exact:\"upstream\") | remote_bookmarks(exact:\"main\", exact:\"origin\")"
+            "jj immutable_heads() written to demo's repository config: trunk() | remote_bookmarks(exact:\"main\", exact:\"upstream\") | remote_bookmarks(exact:\"main\", exact:\"origin\") | remote_tags(remote=exact:\"upstream\")"
         ),
         "the rule write must be disclosed: {stdout}"
     );
@@ -389,6 +389,48 @@ fn start_makes_a_branch_pinned_only_by_an_untracked_remote_ref_rebasable() {
         !String::from_utf8_lossy(&again.stdout).contains("immutable_heads()"),
         "a stated rule is written once: {}",
         String::from_utf8_lossy(&again.stdout)
+    );
+}
+
+#[test]
+fn start_keeps_upstreams_tags_immutable_and_leaves_the_forks_own_rewritable() {
+    // Given: a tag upstream published off its trunk, as most of the upstream
+    // tags oh-my-pi fetched are, and the fork's own release tag, pushed to
+    // origin as the fork's build publishes it
+    let lab = Lab::new();
+    lab.upstream_branch("v0.x", "maintenance.txt", "maintenance\n");
+    lab.upstream_tag("v0.9.1", "v0.x");
+    lab.branch("feat/ours", "ours.txt", "ours\n");
+    lab.jj_work(["tag", "set", "v1.0.0-fork.1", "-r", "feat/ours"]);
+    lab.jj_work([
+        "git",
+        "push",
+        "--remote",
+        "origin",
+        "--tag",
+        "v1.0.0-fork.1",
+    ]);
+    assert_eq!(
+        lab.revision(&lab.work, "v0.9.1 & ::main@upstream", "commit_id"),
+        "",
+        "the upstream tag must sit off the upstream trunk or the test proves nothing"
+    );
+    let (home, _consumer) = release_test_home(&lab);
+
+    // When: the fork's rule is written
+    let output = knives_start(&lab, &home, "feat/gamma");
+
+    // Then: upstream's tag stays immutable wherever it sits; ours is rewritable
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        lab.revision(&lab.work, "v0.9.1", "immutable"),
+        "true",
+        "a tag upstream published must stay immutable off its trunk too"
+    );
+    assert_eq!(
+        lab.revision(&lab.work, "v1.0.0-fork.1", "immutable"),
+        "false",
+        "the fork's own release tag must not pin the commits beneath it"
     );
 }
 
@@ -432,7 +474,8 @@ fn start_leaves_a_repo_level_immutable_heads_rule_a_human_set() {
 #[test]
 fn start_refreshes_the_rule_it_wrote_when_the_entry_moves_on() {
     // Given: knives' own earlier write — recognisable by its `doc` — stating a
-    // rule this entry no longer produces, as after a registry change
+    // rule this entry no longer produces: the one knives wrote while tags were
+    // still pinned, which every fork started before the change carries
     let lab = Lab::new();
     lab.jj_work([
         "config",
@@ -440,7 +483,11 @@ fn start_refreshes_the_rule_it_wrote_when_the_entry_moves_on() {
         "--repo",
         "revset-aliases.\"immutable_heads()\"",
         &format!(
-            "{{ definition = \"trunk() | tags()\", doc = \"{}\" }}",
+            "{{ definition = {}, doc = \"{}\" }}",
+            toml::Value::String(
+                "trunk() | tags() | remote_bookmarks(exact:\"main\", exact:\"upstream\") | remote_bookmarks(exact:\"main\", exact:\"origin\")"
+                    .to_owned()
+            ),
             knives::jj::KNIVES_IMMUTABLE_HEADS_DOC
         ),
     ]);
@@ -454,7 +501,7 @@ fn start_refreshes_the_rule_it_wrote_when_the_entry_moves_on() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains(
-            "jj immutable_heads() refreshed in demo's repository config: trunk() | tags() | remote_bookmarks(exact:\"main\", exact:\"upstream\") | remote_bookmarks(exact:\"main\", exact:\"origin\")"
+            "jj immutable_heads() refreshed in demo's repository config: trunk() | remote_bookmarks(exact:\"main\", exact:\"upstream\") | remote_bookmarks(exact:\"main\", exact:\"origin\") | remote_tags(remote=exact:\"upstream\")"
         ),
         "was: {stdout}"
     );
