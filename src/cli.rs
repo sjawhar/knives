@@ -272,11 +272,12 @@ pub enum Command {
     /// Claiming a branch and opening a workspace for it were two commands for no
     /// reason: starting work on a branch is one act. `finish` is its inverse.
     ///
-    /// Also states the fork's `immutable_heads()` — jj's trunk, tags, and the trunk
-    /// by name on every knives remote — in the repository's jj config when that
-    /// config states none, and says so on stdout. jj's default pins every commit beneath an untracked
-    /// remote ref, which in a fork is a superseded release cut or another fork's
-    /// pull request head walling `jj rebase`; a stated rule is left alone.
+    /// Also states the fork's `immutable_heads()` — jj's trunk and the trunk by
+    /// name on every knives remote — in the repository's jj config when that
+    /// config states none, and says so on stdout. jj's default pins every commit
+    /// beneath an untracked remote ref or a tag, which in a fork is a superseded
+    /// release cut, another fork's pull request head, or the fork's own tagged
+    /// release walling `jj rebase`; a stated rule is left alone.
     Start {
         branch: String,
         /// Registry name. Defaults to the repo you are standing in.
@@ -447,7 +448,10 @@ pub enum ReleaseAction {
     ///
     /// Every member branch's commits move onto the target and the release
     /// merge moves with them, bookmarks and workspaces following; recorded
-    /// conflict resolutions replay as ordinary rebase semantics. The base is
+    /// conflict resolutions replay as ordinary rebase semantics. Earlier
+    /// published releases resting on the members keep their tags and commit
+    /// ids; the untagged copies the rebase makes of them are abandoned, except
+    /// one something rests on, which is kept and named. The base is
     /// never a release parent — this is how the members change theirs. Bare,
     /// it targets the first upstream trunk commit that contains every merged
     /// pull request, then drops the members whose landed branches carry
@@ -544,9 +548,9 @@ pub enum ReleaseAction {
     ///
     /// Runs automatically after every cut; exists standalone for pre-knives repos carrying
     /// years of historical refs. A later fetch re-materializes forgotten refs as untracked;
-    /// re-run to clear them. Under the fork's `immutable_heads()` (trunk and tags, with the
-    /// trunk named on every knives remote, which `knives start` writes) those refs pin nothing
-    /// for `jj rebase`, so reaping is tidiness, never an unlock.
+    /// re-run to clear them. Under the fork's `immutable_heads()` (the trunk, named on every
+    /// knives remote, which `knives start` writes) those refs pin nothing for `jj rebase`, so
+    /// reaping is tidiness, never an unlock.
     ///
     /// Keeps every superseded cut while the live one still carries conflicts: the previous
     /// cut is the only record of how they were last resolved.

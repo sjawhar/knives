@@ -2,8 +2,9 @@
 //!
 //! One ordered gate sequence — frozen pins, stale bases, the target's
 //! provenance, the landed members a bare rebase sheds — around one
-//! `jj rebase -b <release> -d <target>`, with the report of what moved. The
-//! cut lives in `release_cut`; the membership verbs in `release_edit`.
+//! `jj rebase -b <release> -d <target>`, with the cleanup of the copies it
+//! makes of earlier tagged releases and the report of what moved. The cut
+//! lives in `release_cut`; the membership verbs in `release_edit`.
 
 use knives::bind::Fork;
 use knives::cli::Exit;
@@ -23,9 +24,12 @@ use super::release_edit::{EditRecord, record_edit_event, release_is_locally_mova
 /// conflict resolutions replay as ordinary rebase semantics. The upstream base
 /// is never a release parent; this is how the release's members change theirs.
 /// A cut deliberately does not do this: which upstream commit to move onto,
-/// and whether to move at all, is a judgment. After a bare rebase, members
-/// whose pull requests landed and carry nothing more are dropped — the work
-/// reaches the release through its new base — unless `--no-drop` keeps them.
+/// and whether to move at all, is a judgment. Earlier published releases
+/// resting on member commits keep their tags and commit ids; the untagged
+/// copies the rebase makes of them are abandoned unless something rests on
+/// them. After a bare rebase, members whose pull requests landed and carry
+/// nothing more are dropped — the work reaches the release through its new
+/// base — unless `--no-drop` keeps them.
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
@@ -127,6 +131,7 @@ pub(crate) fn run_rebase(
         return Ok(Exit::Incomplete);
     }
     shed_stale_bases(path, (&release_name, &release_commit), &members, shed)?;
+    let tagged = knives::jj::tagged_commits_a_rebase_copies(path, &release_name, &onto)?;
     knives::jj::rebase_branch_onto(path, &release_name, &onto)?;
     report_rebased_release(
         fork,
@@ -138,6 +143,15 @@ pub(crate) fn run_rebase(
         },
         bound,
     )?;
+    // After the provenance is recorded, so a failed cleanup cannot leave the
+    // rebased release described with its pre-rebase parents.
+    let copies = knives::jj::abandon_tagged_copies(
+        path,
+        &tagged,
+        &onto,
+        &format!("knives: {release_name}: abandon rebased copies of tagged releases"),
+    )?;
+    report_tagged_copies(repo, &copies);
     if no_drop {
         return Ok(Exit::Ok);
     }
@@ -678,6 +692,25 @@ fn report_rebased_release(
         Err(error) => println!("  could not list conflicts: {error}"),
     }
     Ok(())
+}
+
+/// One line per copy the rebase made of an earlier tagged release: abandoned,
+/// or kept with a note naming what rests on it.
+fn report_tagged_copies(repo: &RepoName, copies: &[knives::jj::TaggedCopy]) {
+    for copy in copies {
+        let of = format!(
+            "the rebased copy of {} (tag {})",
+            copy.original.short(),
+            copy.tags.join(", ")
+        );
+        match &copy.kept {
+            None => println!(
+                "{repo}: abandoned {}, {of}; the tag still names the original",
+                copy.copy.short()
+            ),
+            Some(reason) => println!("{repo}: note: kept {}, {of}: {reason}", copy.copy.short()),
+        }
+    }
 }
 
 /// `feat/alpha (now 1a2b3c4d5e6f)` for every maintained branch that continues a

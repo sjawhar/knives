@@ -2590,6 +2590,154 @@ pub fn abandon_commits(repo: &Path, commits: &[CommitId], operation: &str) -> Re
     commit_mutation(&repo, tx, operation)
 }
 
+/// The tagged commits `jj rebase -b <rev> -d <dest>` will copy rather than move.
+///
+/// Those are the visible tagged commits in `roots(dest..rev)::` that are not
+/// ancestors of `rev`: in a fork, earlier published releases resting on member
+/// commits.
+///
+/// A rewrite moves bookmarks, never tags, so each tagged original stays where
+/// it is under its tag and the rebase leaves an untagged copy with the same
+/// change id beside it: what [`abandon_tagged_copies`] cleans up. Ask before
+/// the rebase; afterwards the originals are no longer on the moved branch.
+pub fn tagged_commits_a_rebase_copies(
+    repo: &Path,
+    rev: &str,
+    dest: &CommitId,
+) -> Result<Vec<CommitId>, JjError> {
+    commits_matching(
+        repo,
+        &format!(
+            "(roots({dest}..({rev}))::) & tags() ~ ::({rev})",
+            dest = dest.as_str()
+        ),
+    )
+}
+
+/// A rebase's copy of a tagged commit, and what became of it.
+#[derive(Debug)]
+pub struct TaggedCopy {
+    /// The tagged original, which keeps its commit id.
+    pub original: CommitId,
+    /// The tags on the original.
+    pub tags: Vec<String>,
+    /// The untagged copy the rebase made: same change id, descended from the target.
+    pub copy: CommitId,
+    /// Why the copy was left in place; `None` when it was abandoned.
+    pub kept: Option<String>,
+}
+
+/// Abandon the copies a rebase onto `dest` made of `originals`, as ONE
+/// described operation.
+///
+/// A copy is a visible commit sharing an original's change id that descends
+/// from `dest`. It is abandoned only when nothing rests on it: no descendants,
+/// no local bookmark, no workspace's working copy, and nothing jj's default
+/// rule pins ([`assert_mutable`]). Otherwise it stays, and [`TaggedCopy::kept`]
+/// says why — a commit someone built on, or checked out, is theirs to decide
+/// about. The originals, their tags and every remote ref are untouched.
+pub fn abandon_tagged_copies(
+    repo: &Path,
+    originals: &[CommitId],
+    dest: &CommitId,
+    operation: &str,
+) -> Result<Vec<TaggedCopy>, JjError> {
+    if originals.is_empty() {
+        return Ok(Vec::new());
+    }
+    let repo = Repo::open(repo)?;
+    let dest = repo.commit(dest.as_str())?.id().clone();
+    let mut copies = Vec::new();
+    let mut abandoned = Vec::new();
+    for original in originals {
+        let original_id = repo.commit(original.as_str())?.id().clone();
+        let tags: Vec<String> = repo
+            .repo
+            .view()
+            .local_tags()
+            .filter(|(_, target)| target.added_ids().any(|id| id == &original_id))
+            .map(|(name, _)| name.as_str().to_owned())
+            .collect();
+        for copy in repo.rewrites_of(original.as_str())? {
+            let commit = repo.commit(copy.as_str())?;
+            if !repo.backend_is_ancestor(&dest, commit.id())? {
+                continue;
+            }
+            let kept = match what_rests_on(&repo, commit.id())? {
+                Some(reason) => Some(reason),
+                None => assert_mutable(repo.repo.as_ref(), std::slice::from_ref(&commit))
+                    .err()
+                    .map(|error| error.to_string()),
+            };
+            if kept.is_none() {
+                abandoned.push(commit);
+            }
+            copies.push(TaggedCopy {
+                original: original.clone(),
+                tags: tags.clone(),
+                copy,
+                kept,
+            });
+        }
+    }
+    if !abandoned.is_empty() {
+        let mut tx = repo.repo.start_transaction();
+        for commit in &abandoned {
+            tx.repo_mut().record_abandoned_commit(commit);
+        }
+        commit_mutation(&repo, tx, operation)?;
+    }
+    Ok(copies)
+}
+
+/// What rests on `id` — workspaces with it checked out, local bookmarks on it,
+/// descendants — as one sentence, or `None` when nothing does.
+fn what_rests_on(repo: &Repo, id: &JjCommitId) -> Result<Option<String>, JjError> {
+    let view = repo.repo.view();
+    let checked_out = |commit: &JjCommitId| -> Vec<String> {
+        view.wc_commit_ids()
+            .iter()
+            .filter(|(_, wc)| *wc == commit)
+            .map(|(name, _)| name.as_str().to_owned())
+            .collect()
+    };
+    let mut reasons = Vec::new();
+    let workspaces = checked_out(id);
+    if !workspaces.is_empty() {
+        reasons.push(format!(
+            "it is the working copy of {}",
+            workspaces.join(", ")
+        ));
+    }
+    let bookmarks: Vec<&str> = view
+        .local_bookmarks_for_commit(id)
+        .map(|(name, _)| name.as_str())
+        .collect();
+    if !bookmarks.is_empty() {
+        reasons.push(format!("bookmark {} points at it", bookmarks.join(", ")));
+    }
+    if !view.heads().contains(id) {
+        let mut descendants = Vec::new();
+        for head in view.heads() {
+            if head != id && repo.backend_is_ancestor(id, head)? {
+                let short = short_id(&head.to_string()).to_owned();
+                let workspaces = checked_out(head);
+                descendants.push(if workspaces.is_empty() {
+                    short
+                } else {
+                    format!("{short}, the working copy of {}", workspaces.join(", "))
+                });
+            }
+        }
+        descendants.sort();
+        reasons.push(format!(
+            "it has descendants, whose heads are {}",
+            descendants.join("; ")
+        ));
+    }
+    Ok((!reasons.is_empty()).then(|| reasons.join("; ")))
+}
+
 /// The git repository jj keeps its objects in.
 fn backing_git_dir(repo: &Path) -> Result<PathBuf, JjError> {
     let store = repo.join(".jj/repo/store");
