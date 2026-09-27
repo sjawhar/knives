@@ -7,7 +7,7 @@
 
 #[path = "common/lab.rs"]
 mod lab;
-// allow: SIZE_OK: 905 lines - real-binary gh passthrough scenarios share one fixture and process harness.
+// allow: SIZE_OK: 1113 lines - real-binary gh passthrough scenarios share one fixture and process harness.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
@@ -73,6 +73,12 @@ fn helper_path(helper_dir: &Path) -> String {
 /// removes it.
 fn knives_cmd(scratch: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_knives"));
+    knives_env(&mut command, scratch);
+    command
+}
+
+/// The `knives_cmd` environment on a command that reaches knives some other way.
+fn knives_env(command: &mut Command, scratch: &Path) {
     command
         .env("GIT_CONFIG_GLOBAL", scratch.join("gitconfig"))
         .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -81,7 +87,6 @@ fn knives_cmd(scratch: &Path) -> Command {
         .env("JJ_CONFIG", "/dev/null")
         .env("KNIVES_GH_SHIM_DEPTH", "1")
         .env_remove("GH_TOKEN");
-    command
 }
 
 fn git_config(work: &Path, args: &[&str]) {
@@ -944,6 +949,39 @@ fn nonexistent_real_gh_path_reports_not_found() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("knives gh: real gh not found"));
 }
 
+/// A terminal `git` under `scripts/terminal` that records each `git remote` call as one
+/// line of `scripts/terminal-git.log` and answers everything else with silent success.
+/// Returns its directory and that log.
+fn terminal_git(scripts: &Path) -> (PathBuf, PathBuf) {
+    let terminal = scripts.join("terminal");
+    fs::create_dir(&terminal).expect("terminal directory");
+    let log = scripts.join("terminal-git.log");
+    let git = terminal.join("git");
+    fs::write(
+        &git,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = remote ]; then\n    printf 'terminal git\\n' >> '{}'\nfi\n",
+            log.display()
+        ),
+    )
+    .expect("write terminal git");
+    fs::set_permissions(&git, fs::Permissions::from_mode(0o755)).expect("chmod terminal git");
+    (terminal, log)
+}
+
+/// `knives gh -- pr view` in `lab` with `real_gh` on `path`, under a 10 s `timeout`: the
+/// regression these scenarios guard is two git wrappers exec'ing each other forever.
+fn bounded_pr_view(lab: &lab::Lab, scripts: &Path, real_gh: &Path, path: &str) -> Command {
+    let mut command = Command::new("timeout");
+    command.args(["10", env!("CARGO_BIN_EXE_knives"), "gh", "--", "pr", "view"]);
+    knives_env(&mut command, scripts);
+    command
+        .current_dir(&lab.work)
+        .env("KNIVES_REAL_GH", real_gh)
+        .env("PATH", path);
+    command
+}
+
 #[test]
 fn stacked_git_wrappers_reach_terminal_git_once() {
     // Given: a bookmarked repo, a foreign wrapper left by an older gh shim, and terminal git.
@@ -951,11 +989,9 @@ fn stacked_git_wrappers_reach_terminal_git_once() {
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     lab.jj_work(["edit", "feat/alpha"]);
     let scripts = tempfile::tempdir().expect("script directory");
+    let (terminal, terminal_log) = terminal_git(scripts.path());
     let foreign_wrapper = scripts.path().join("foreign-wrapper");
-    let terminal = scripts.path().join("terminal");
     fs::create_dir(&foreign_wrapper).expect("foreign wrapper directory");
-    fs::create_dir(&terminal).expect("terminal directory");
-    let terminal_log = scripts.path().join("terminal-git.log");
     let real_gh = scripts.path().join("gh");
     fs::write(
         &real_gh,
@@ -980,15 +1016,6 @@ exit 127
     .expect("write foreign git wrapper");
     fs::set_permissions(&foreign_git, fs::Permissions::from_mode(0o755))
         .expect("chmod foreign git wrapper");
-    let terminal_git = terminal.join("git");
-    fs::write(
-        &terminal_git,
-        "#!/bin/sh\nif [ \"$1\" = remote ]; then\n\
-         printf 'terminal git\n' >> \"$TERMINAL_GIT_LOG\"\nfi\n",
-    )
-    .expect("write terminal git");
-    fs::set_permissions(&terminal_git, fs::Permissions::from_mode(0o755))
-        .expect("chmod terminal git");
     let path = format!(
         "{}:{}",
         terminal.display(),
@@ -996,27 +1023,86 @@ exit 127
     );
 
     // When: knives prepends its wrapper before invoking a real gh that passes through to git.
-    let output = std::process::Command::new("timeout")
-        .args(["10", env!("CARGO_BIN_EXE_knives"), "gh", "--", "pr", "view"])
-        .current_dir(&lab.work)
-        .env("GIT_CONFIG_GLOBAL", scripts.path().join("gitconfig"))
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("KNIVES_CONFIG_HOME", scripts.path())
-        .env("HOME", lab.temp_path())
-        .env("JJ_CONFIG", "/dev/null")
-        .env_remove("GH_TOKEN")
-        .env("KNIVES_GH_SHIM_DEPTH", "1")
-        .env("KNIVES_REAL_GH", &real_gh)
-        .env("PATH", path)
+    let output = bounded_pr_view(&lab, scripts.path(), &real_gh, &path)
         .env("FOREIGN_WRAPPER_DIR", &foreign_wrapper)
-        .env("TERMINAL_GIT_LOG", &terminal_log)
         .output()
         .expect("run timeout-bounded knives gh");
 
     // Then: each wrapper skips itself and the terminal git receives the passthrough once.
     assert!(
         output.status.success(),
-        "knives gh failed: {}",
+        "knives gh failed ({:?}, 124 is the timeout): {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&terminal_log)
+            .expect("terminal git ran")
+            .lines()
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn a_content_scanning_git_shim_below_the_wrapper_reaches_terminal_git_once() {
+    // Given: a bookmarked repo, a real gh that runs `git remote -v`, and below knives'
+    // wrapper on PATH a shim that finds "the real git" by scanning PATH from the top for
+    // the first git whose content lacks its own marker. Handed a PATH it is still on, it
+    // picks the wrapper above it, which hands straight back; a re-entered shim names the
+    // git it chose and exits 1, so that ring is a one-line failure instead of a hang.
+    let lab = lab::Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.jj_work(["edit", "feat/alpha"]);
+    let scripts = tempfile::tempdir().expect("script directory");
+    let (terminal, terminal_log) = terminal_git(scripts.path());
+    let content_shim = scripts.path().join("content-shim");
+    fs::create_dir(&content_shim).expect("content shim directory");
+    let real_gh = scripts.path().join("gh");
+    fs::write(&real_gh, "#!/bin/sh\ngit remote -v\n").expect("write real gh");
+    fs::set_permissions(&real_gh, fs::Permissions::from_mode(0o755)).expect("chmod real gh");
+    let shim_git = content_shim.join("git");
+    fs::write(
+        &shim_git,
+        r#"#!/bin/bash
+# content-scanning-shim
+if [[ -n "$CONTENT_SHIM_CHOSE" ]]; then
+    echo "content-scanning shim re-entered after choosing $CONTENT_SHIM_CHOSE" >&2
+    exit 1
+fi
+IFS=':' read -ra _path_dirs <<< "$PATH"
+for _d in "${_path_dirs[@]}"; do
+    [[ -x "$_d/git" ]] || continue
+    _header=""
+    IFS= read -r -n 512 -d '' _header < "$_d/git" || true
+    [[ "$_header" == *content-scanning-shim* ]] && continue
+    CONTENT_SHIM_CHOSE="$_d/git" exec "$_d/git" "$@"
+done
+echo "error: git not found" >&2
+exit 127
+"#,
+    )
+    .expect("write content-scanning git shim");
+    fs::set_permissions(&shim_git, fs::Permissions::from_mode(0o755))
+        .expect("chmod content-scanning git shim");
+    let path = format!(
+        "{}:{}:{}",
+        content_shim.display(),
+        terminal.display(),
+        std::env::var("PATH").expect("PATH")
+    );
+
+    // When: knives prepends its wrapper before invoking a real gh that passes through to git.
+    let output = bounded_pr_view(&lab, scripts.path(), &real_gh, &path)
+        .output()
+        .expect("run timeout-bounded knives gh");
+
+    // Then: the wrapper hands the shim a PATH it is no longer on, so the shim's scan
+    // lands on the terminal git, which receives the passthrough once.
+    assert!(
+        output.status.success(),
+        "knives gh failed ({:?}, 124 is the timeout): {}",
+        output.status.code(),
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(

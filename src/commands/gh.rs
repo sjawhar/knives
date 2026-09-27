@@ -2,7 +2,7 @@
 //!
 //! This command executes `gh` directly, so the usual render/run split does not apply:
 //! there is no knives result to render.
-// allow: SIZE_OK: 1657 lines - single passthrough pipeline; splitting would separate resolution steps that read as one procedure.
+// allow: SIZE_OK: 1886 lines - single passthrough pipeline; splitting would separate resolution steps that read as one procedure.
 use std::collections::BTreeMap;
 use std::io::Read as _;
 use std::os::unix::{
@@ -41,21 +41,20 @@ case "$1" in
         ;;
 esac
 # Pass through every other invocation so gh's writes use the real git unchanged.
-# Unlike the shim, do not use an inherited wrapper-dir variable: stacked gh shims
-# overwrite it, causing wrappers to select each other forever. Skip the current wrapper.
-_self_dir="$(cd "$(dirname "$0")" && pwd)"
-_after_self=false
-IFS=':' read -ra _path_dirs <<< "$PATH"
-for _d in "${_path_dirs[@]}"; do
-    if [[ "$_d" == "$_self_dir" ]]; then
-        _after_self=true
-        continue
-    fi
-    [[ "$_after_self" == true ]] || continue
-    [[ -x "$_d/git" ]] && exec "$_d/git" "$@"
-done
-echo "error: git not found" >&2
-exit 127
+# The next git gets the PATH tail past this directory, not the full PATH: a shim
+# below that finds "the real git" by scanning the whole PATH for content would
+# otherwise pick this wrapper and exec back here forever. This directory comes
+# from $0, not an inherited wrapper-dir variable: stacked gh shims overwrite
+# that, and the wrappers then select each other forever.
+_self_dir="${0%/*}"
+_path=":$PATH:"
+_tail="${_path#*:"$_self_dir":}"
+# Not on PATH, or last on it: an empty PATH would send bash's search to the cwd.
+if [[ "$_tail" == "$_path" || -z "$_tail" ]]; then
+    echo "error: no git past $_self_dir on PATH" >&2
+    exit 127
+fi
+PATH="${_tail%:}" exec git "$@"
 "#;
 
 const DETACHED_BOOKMARK: &str = "__jj_detached__";
@@ -159,7 +158,15 @@ pub fn run(args: &[String]) -> anyhow::Result<std::convert::Infallible> {
         let git = wrapper.path().join("git");
         std::fs::write(&git, GIT_WRAPPER)?;
         std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755))?;
-        let mut path = wrapper.path().as_os_str().to_os_string();
+        // The wrapper finds its own PATH entry by string comparison with `${0%/*}`, and
+        // gh (Go's `exec.LookPath`) hands it a lexically cleaned `$0`; a TMPDIR spelled
+        // `/tmp//` or `/tmp/./` would otherwise never match. Collecting the components
+        // is that same cleaning.
+        let mut path = wrapper
+            .path()
+            .components()
+            .collect::<PathBuf>()
+            .into_os_string();
         path.push(":");
         path.push(std::env::var_os("PATH").unwrap_or_default());
         gh.args(&arguments).env("PATH", path).env(
