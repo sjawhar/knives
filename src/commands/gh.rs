@@ -221,6 +221,11 @@ fn die_no_bookmark() -> ! {
 /// `--ignore-working-copy`: bookmarks ride on `@` through a snapshot, so the answer
 /// is the same without one, and a snapshot would take the repository-wide jj lock.
 /// A `git checkout` made behind jj's back is not seen until the next jj command.
+///
+/// Names only: rendering the bookmark objects themselves appends jj's status marks
+/// (`feat/x*` for a bookmark ahead of its remote, `feat/x??` for a conflicted one), and
+/// the charset check below would then read a real bookmark as none. Local bookmarks
+/// only: a remote-only `feat/x@origin` on `@` is not a head gh can name.
 pub(crate) fn current_bookmark(cwd: &Path) -> Option<String> {
     let output = Command::new("jj")
         .current_dir(cwd)
@@ -231,7 +236,7 @@ pub(crate) fn current_bookmark(cwd: &Path) -> Option<String> {
             "@",
             "--no-graph",
             "-T",
-            "self.bookmarks()",
+            r#"local_bookmarks.map(|bookmark| bookmark.name()).join(" ")"#,
         ])
         .output()
         .ok()?;

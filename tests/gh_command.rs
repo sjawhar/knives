@@ -132,6 +132,44 @@ fn pr_view_injects_current_bookmark_and_wrapper_branch() {
 }
 
 #[test]
+fn pr_view_injects_a_bookmark_that_is_ahead_of_its_remote() {
+    // Given: the working copy is a bookmarked change amended since its push, which jj's
+    // own rendering marks `feat/alpha*`.
+    let lab = lab::Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.push_branch("feat/alpha");
+    lab.jj_work(["edit", "feat/alpha"]);
+    fs::write(lab.work.join("alpha.txt"), "alpha, amended\n").expect("amend the branch");
+    assert_eq!(
+        lab.jj_work_output(["log", "-r", "@", "--no-graph", "-T", "bookmarks"]),
+        "feat/alpha*"
+    );
+    let (dir, log) = fake_gh();
+
+    // When: gh pr view has no positional target.
+    let output = knives_cmd(dir.path())
+        .args(["gh", "--", "pr", "view", "--json", "title"])
+        .current_dir(&lab.work)
+        .env("KNIVES_REAL_GH", dir.path().join("gh"))
+        .env("FAKE_GH_LOG", &log)
+        .output()
+        .expect("run knives gh");
+
+    // Then: the bookmark's name is injected, without the mark.
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let recorded = fs::read_to_string(&log).expect("fake gh ran");
+    let lines: Vec<&str> = recorded.lines().collect();
+    assert_eq!(
+        &lines[..5],
+        &["pr", "view", "feat/alpha", "--json", "title"]
+    );
+}
+
+#[test]
 fn spawn_failure_cleans_up_the_git_wrapper_tempdir() {
     // Given: a bookmarked jj repo and a TMPDIR-local nonexistent real gh.
     let lab = lab::Lab::new();
