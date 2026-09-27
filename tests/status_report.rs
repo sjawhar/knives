@@ -720,7 +720,7 @@ fn status_reports_a_repo_level_immutable_heads_rule_that_differs_from_the_forks(
     assert!(
         detail.contains("= `trunk() | tags() | bookmarks(exact:\"keep\")`;")
             && detail.contains(
-                "under `trunk() | remote_bookmarks(exact:\"main\", exact:\"upstream\") | remote_bookmarks(exact:\"main\", exact:\"origin\")`"
+                "under `trunk() | remote_bookmarks(exact:\"main\", exact:\"upstream\") | remote_bookmarks(exact:\"main\", exact:\"origin\") | remote_tags(remote=exact:\"upstream\")`"
             ),
         "both rules must be named: {detail}"
     );

@@ -209,9 +209,9 @@ impl RepoEntry {
         format!("{}@{}", self.trunk(), Role::Upstream)
     }
 
-    /// The `immutable_heads()` this fork runs under: jj's `trunk()` and the trunk
-    /// by name on every remote knives knows — upstream, origin, and the release
-    /// remote when one is configured.
+    /// The `immutable_heads()` this fork runs under: jj's `trunk()`, the trunk by
+    /// name on every remote knives knows — upstream, origin, and the release
+    /// remote when one is configured — and every tag fetched from upstream.
     ///
     /// jj's default adds `untracked_remote_bookmarks()` and `tags()`. In a fork, a
     /// remote ref that is not trunk is ours or something we build on — a
@@ -223,12 +223,14 @@ impl RepoEntry {
     /// tags, so the tag keeps naming the published original — locally, so no push
     /// can move it on the remote. Every release this fork publishes is tagged,
     /// and a tag on a release merge pinned every member commit beneath it.
-    /// Upstream's published tags sit on its trunk and stay immutable through
-    /// `<trunk>@upstream`'s ancestry, so no tag term is needed: a fork's own
-    /// publication is any tag the upstream trunk does not contain, which this
-    /// states by ancestry rather than a naming convention. `knives release
-    /// rebase` abandons the untagged copies a rebase makes of those tagged
-    /// commits.
+    ///
+    /// Upstream's tags stay pinned, by where they were fetched from rather than
+    /// by a naming convention: `remote_tags(remote=exact:"upstream")`. Ancestry
+    /// does not cover them — most of the upstream tags a fork fetches sit off
+    /// upstream's trunk (oh-my-pi had 457). Every other tag is the fork's own: its
+    /// published releases and its retention tags alike, which `knives release
+    /// rebase` copies when it moves the members beneath them and then cleans up
+    /// after.
     ///
     /// The trunks are named outright because `trunk()` need not resolve to them:
     /// `jj git clone` pins the alias to `<trunk>@origin`, and the default picks
@@ -247,7 +249,11 @@ impl RepoEntry {
             .iter()
             .map(|remote| format!("remote_bookmarks(exact:\"{trunk}\", exact:\"{remote}\")"))
             .collect();
-        format!("trunk() | {}", pinned.join(" | "))
+        format!(
+            "trunk() | {} | remote_tags(remote=exact:\"{}\")",
+            pinned.join(" | "),
+            Role::Upstream
+        )
     }
 
     /// The branch a pull request from this repo should target.

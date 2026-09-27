@@ -822,6 +822,23 @@ impl Repo {
             .collect())
     }
 
+    /// The visible descendants of `id`, itself excluded.
+    fn descendants_of(&self, id: &JjCommitId) -> Result<Vec<JjCommitId>, JjError> {
+        let revision_error = |error: &dyn std::fmt::Display| JjError::Revision {
+            revision: id.to_string(),
+            detail: error.to_string(),
+        };
+        let revset = jj_lib::revset::ResolvedRevsetExpression::commits(vec![id.clone()])
+            .descendants()
+            .evaluate(self.repo.as_ref())
+            .map_err(|error| revision_error(&error))?;
+        collect_stream(revset.stream())
+            .into_iter()
+            .filter(|descendant| descendant.as_ref().map_or(true, |found| found != id))
+            .map(|descendant| descendant.map_err(|error| revision_error(&error)))
+            .collect()
+    }
+
     /// Merge commits reachable from `tip` but not from any of `bases` that join
     /// two or more lines none of the bases has, newest first.
     ///
@@ -2631,24 +2648,34 @@ pub struct TaggedCopy {
 /// described operation.
 ///
 /// A copy is a visible commit sharing an original's change id that descends
-/// from `dest`. It is abandoned only when nothing rests on it: no descendants,
-/// no local bookmark, no workspace's working copy, and nothing jj's default
-/// rule pins ([`assert_mutable`]). Otherwise it stays, and [`TaggedCopy::kept`]
-/// says why — a commit someone built on, or checked out, is theirs to decide
-/// about. The originals, their tags and every remote ref are untouched.
+/// from `dest`. It is abandoned only when nothing rests on it: no local
+/// bookmark, no workspace's working copy, nothing jj's default rule pins
+/// ([`assert_mutable`]), and no descendant that stays — a descendant that is
+/// itself a copy being abandoned does not count, so tagged commits stacked on
+/// each other go together, children first. Otherwise the copy stays, and
+/// [`TaggedCopy::kept`] says why: a commit someone built on, or checked out, is
+/// theirs to decide about. The originals, their tags and every remote ref are
+/// untouched.
 pub fn abandon_tagged_copies(
     repo: &Path,
     originals: &[CommitId],
     dest: &CommitId,
     operation: &str,
 ) -> Result<Vec<TaggedCopy>, JjError> {
+    struct Found {
+        original: CommitId,
+        tags: Vec<String>,
+        commit: jj_lib::commit::Commit,
+        /// Why it stays whatever happens to its descendants.
+        held: Option<String>,
+        descendants: Vec<JjCommitId>,
+    }
     if originals.is_empty() {
         return Ok(Vec::new());
     }
     let repo = Repo::open(repo)?;
     let dest = repo.commit(dest.as_str())?.id().clone();
-    let mut copies = Vec::new();
-    let mut abandoned = Vec::new();
+    let mut found = Vec::new();
     for original in originals {
         let original_id = repo.commit(original.as_str())?.id().clone();
         let tags: Vec<String> = repo
@@ -2663,79 +2690,137 @@ pub fn abandon_tagged_copies(
             if !repo.backend_is_ancestor(&dest, commit.id())? {
                 continue;
             }
-            let kept = match what_rests_on(&repo, commit.id())? {
+            let held = match what_holds(&repo, commit.id()) {
                 Some(reason) => Some(reason),
                 None => assert_mutable(repo.repo.as_ref(), std::slice::from_ref(&commit))
                     .err()
                     .map(|error| error.to_string()),
             };
-            if kept.is_none() {
-                abandoned.push(commit);
-            }
-            copies.push(TaggedCopy {
+            let descendants = repo.descendants_of(commit.id())?;
+            found.push(Found {
                 original: original.clone(),
                 tags: tags.clone(),
-                copy,
-                kept,
+                commit,
+                held,
+                descendants,
             });
         }
     }
+    // Children first: a copy goes once everything resting on it goes too.
+    let mut abandoned: BTreeSet<JjCommitId> = BTreeSet::new();
+    loop {
+        let before = abandoned.len();
+        for copy in &found {
+            if copy.held.is_none()
+                && copy
+                    .descendants
+                    .iter()
+                    .all(|descendant| abandoned.contains(descendant))
+            {
+                abandoned.insert(copy.commit.id().clone());
+            }
+        }
+        if abandoned.len() == before {
+            break;
+        }
+    }
+    let mut copies = Vec::with_capacity(found.len());
+    for copy in &found {
+        let kept = if abandoned.contains(copy.commit.id()) {
+            None
+        } else {
+            let staying: Vec<&JjCommitId> = copy
+                .descendants
+                .iter()
+                .filter(|descendant| !abandoned.contains(*descendant))
+                .collect();
+            let mut reasons: Vec<String> = copy.held.iter().cloned().collect();
+            if !staying.is_empty() {
+                reasons.push(descendants_that_stay(&repo, &staying)?);
+            }
+            Some(reasons.join("; "))
+        };
+        copies.push(TaggedCopy {
+            original: copy.original.clone(),
+            tags: copy.tags.clone(),
+            copy: commit_id(copy.commit.id()),
+            kept,
+        });
+    }
     if !abandoned.is_empty() {
         let mut tx = repo.repo.start_transaction();
-        for commit in &abandoned {
-            tx.repo_mut().record_abandoned_commit(commit);
+        for copy in found
+            .iter()
+            .filter(|copy| abandoned.contains(copy.commit.id()))
+        {
+            tx.repo_mut().record_abandoned_commit(&copy.commit);
         }
         commit_mutation(&repo, tx, operation)?;
     }
     Ok(copies)
 }
 
-/// What rests on `id` — workspaces with it checked out, local bookmarks on it,
-/// descendants — as one sentence, or `None` when nothing does.
-fn what_rests_on(repo: &Repo, id: &JjCommitId) -> Result<Option<String>, JjError> {
-    let view = repo.repo.view();
-    let checked_out = |commit: &JjCommitId| -> Vec<String> {
-        view.wc_commit_ids()
-            .iter()
-            .filter(|(_, wc)| *wc == commit)
-            .map(|(name, _)| name.as_str().to_owned())
-            .collect()
-    };
+/// The workspaces with `id` checked out.
+fn checked_out_by(repo: &Repo, id: &JjCommitId) -> Vec<String> {
+    repo.repo
+        .view()
+        .wc_commit_ids()
+        .iter()
+        .filter(|(_, wc)| *wc == id)
+        .map(|(name, _)| name.as_str().to_owned())
+        .collect()
+}
+
+/// Workspaces with `id` checked out and local bookmarks on it, as one
+/// sentence, or `None` when there are neither.
+fn what_holds(repo: &Repo, id: &JjCommitId) -> Option<String> {
     let mut reasons = Vec::new();
-    let workspaces = checked_out(id);
+    let workspaces = checked_out_by(repo, id);
     if !workspaces.is_empty() {
         reasons.push(format!(
             "it is the working copy of {}",
             workspaces.join(", ")
         ));
     }
-    let bookmarks: Vec<&str> = view
+    let bookmarks: Vec<&str> = repo
+        .repo
+        .view()
         .local_bookmarks_for_commit(id)
         .map(|(name, _)| name.as_str())
         .collect();
     if !bookmarks.is_empty() {
         reasons.push(format!("bookmark {} points at it", bookmarks.join(", ")));
     }
-    if !view.heads().contains(id) {
-        let mut descendants = Vec::new();
-        for head in view.heads() {
-            if head != id && repo.backend_is_ancestor(id, head)? {
-                let short = short_id(&head.to_string()).to_owned();
-                let workspaces = checked_out(head);
-                descendants.push(if workspaces.is_empty() {
-                    short
-                } else {
-                    format!("{short}, the working copy of {}", workspaces.join(", "))
-                });
+    (!reasons.is_empty()).then(|| reasons.join("; "))
+}
+
+/// "it has descendants, whose heads are …": the newest of `staying`, each
+/// with the workspaces that have it checked out.
+fn descendants_that_stay(repo: &Repo, staying: &[&JjCommitId]) -> Result<String, JjError> {
+    let mut heads = Vec::new();
+    for candidate in staying {
+        let mut is_head = true;
+        for other in staying {
+            if other != candidate && repo.backend_is_ancestor(candidate, other)? {
+                is_head = false;
+                break;
             }
         }
-        descendants.sort();
-        reasons.push(format!(
-            "it has descendants, whose heads are {}",
-            descendants.join("; ")
-        ));
+        if is_head {
+            let short = short_id(&candidate.to_string()).to_owned();
+            let workspaces = checked_out_by(repo, candidate);
+            heads.push(if workspaces.is_empty() {
+                short
+            } else {
+                format!("{short}, the working copy of {}", workspaces.join(", "))
+            });
+        }
     }
-    Ok((!reasons.is_empty()).then(|| reasons.join("; ")))
+    heads.sort();
+    Ok(format!(
+        "it has descendants, whose heads are {}",
+        heads.join("; ")
+    ))
 }
 
 /// The git repository jj keeps its objects in.

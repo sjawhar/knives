@@ -74,6 +74,9 @@ pub(crate) fn run_rebase(
     if !release_is_locally_movable(&opened, repo, &release_name) {
         return Ok(Exit::Incomplete);
     }
+    if let Some(exit) = stale_rule_exit(fork)? {
+        return Ok(exit);
+    }
     let Some(destination) = rebase_target(RebaseTargetInput {
         fork,
         opened: &opened,
@@ -179,6 +182,28 @@ fn frozen_rebase_exit(
         ),
     }
     Some(Exit::Incomplete)
+}
+
+/// Refuse while the checkout's jj config states a rule an earlier `knives start`
+/// wrote that is no longer this fork's: the tag-pinning rule knives wrote before
+/// its own release tags were exempt froze every member beneath a tagged release,
+/// and `jj rebase` would fail with jj's bare "is immutable". Refreshing is
+/// `start`'s job; a rule a human stated is theirs, and `status` reports it.
+fn stale_rule_exit(fork: &Fork<'_>) -> anyhow::Result<Option<Exit>> {
+    let rule = fork.entry.immutable_heads();
+    let Some(stated) = knives::jj::repo_immutable_heads(&fork.checkout.path)? else {
+        return Ok(None);
+    };
+    if !stated.written_by_knives || stated.rule == rule {
+        return Ok(None);
+    }
+    println!(
+        "{}: this checkout's jj config states immutable_heads() = `{}`, written by an \
+         earlier `knives start`; this fork runs under `{rule}`. Any `knives start <branch>` \
+         in this fork refreshes it; rebase again after that. Nothing moved",
+        fork.name, stated.rule
+    );
+    Ok(Some(Exit::Incomplete))
 }
 
 /// Rewrite the release to its member parents only, shedding stale bases.

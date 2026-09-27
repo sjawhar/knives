@@ -272,12 +272,13 @@ pub enum Command {
     /// Claiming a branch and opening a workspace for it were two commands for no
     /// reason: starting work on a branch is one act. `finish` is its inverse.
     ///
-    /// Also states the fork's `immutable_heads()` — jj's trunk and the trunk by
-    /// name on every knives remote — in the repository's jj config when that
-    /// config states none, and says so on stdout. jj's default pins every commit
-    /// beneath an untracked remote ref or a tag, which in a fork is a superseded
-    /// release cut, another fork's pull request head, or the fork's own tagged
-    /// release walling `jj rebase`; a stated rule is left alone.
+    /// Also states the fork's `immutable_heads()` — jj's trunk, the trunk by name
+    /// on every knives remote, and every tag fetched from upstream — in the
+    /// repository's jj config when that config states none, and says so on
+    /// stdout. jj's default pins every commit beneath an untracked remote ref or
+    /// any tag, which in a fork is a superseded release cut, another fork's pull
+    /// request head, or the fork's own tagged release walling `jj rebase`; a
+    /// stated rule is left alone.
     Start {
         branch: String,
         /// Registry name. Defaults to the repo you are standing in.
@@ -451,12 +452,14 @@ pub enum ReleaseAction {
     /// conflict resolutions replay as ordinary rebase semantics. Earlier
     /// published releases resting on the members keep their tags and commit
     /// ids; the untagged copies the rebase makes of them are abandoned, except
-    /// one something rests on, which is kept and named. The base is
-    /// never a release parent — this is how the members change theirs. Bare,
-    /// it targets the first upstream trunk commit that contains every merged
-    /// pull request, then drops the members whose landed branches carry
-    /// nothing more; with nothing merged there is no default, and which commit
-    /// to move onto is a decision — a cut does not make it for you.
+    /// one something rests on, which is kept and named. A stale rule an
+    /// earlier `knives start` wrote refuses first, naming `start` as the
+    /// refresh. The base is never a release parent — this is how the members
+    /// change theirs. Bare, it targets the first upstream trunk commit that
+    /// contains every merged pull request, then drops the members whose landed
+    /// branches carry nothing more; with nothing merged there is no default,
+    /// and which commit to move onto is a decision — a cut does not make it
+    /// for you.
     Rebase {
         /// The rebase target. Bare, the first upstream trunk commit containing
         /// every merged pull request; required when nothing has merged.
@@ -549,8 +552,8 @@ pub enum ReleaseAction {
     /// Runs automatically after every cut; exists standalone for pre-knives repos carrying
     /// years of historical refs. A later fetch re-materializes forgotten refs as untracked;
     /// re-run to clear them. Under the fork's `immutable_heads()` (the trunk, named on every
-    /// knives remote, which `knives start` writes) those refs pin nothing for `jj rebase`, so
-    /// reaping is tidiness, never an unlock.
+    /// knives remote, and upstream's tags, which `knives start` writes) those refs pin nothing
+    /// for `jj rebase`, so reaping is tidiness, never an unlock.
     ///
     /// Keeps every superseded cut while the live one still carries conflicts: the previous
     /// cut is the only record of how they were last resolved.

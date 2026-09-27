@@ -1082,3 +1082,140 @@ fn a_rebase_keeps_and_reports_a_stray_copy_something_rests_on() {
         "the kept copy and why must be reported: {stdout}"
     );
 }
+
+#[test]
+fn a_rebase_abandons_stray_copies_of_tagged_commits_stacked_on_each_other() {
+    // Given: a retention tag on a commit built on the old tagged release, the
+    // shape oh-my-pi's keep/* tags take, with nothing else resting on either
+    let lab = Lab::new();
+    let (home, tagged) = fork_with_an_old_tagged_release(&lab);
+    lab.jj_work(["new", OLD_RELEASE_TAG, "-m", "kept fix"]);
+    std::fs::write(lab.work.join("fix.txt"), "fix\n").expect("write fix");
+    lab.jj_work(["tag", "set", "keep/fix/x", "-r", "@"]);
+    lab.jj_work(["new", "main@origin"]);
+    let kept_fix = commit_at(&lab, "keep/fix/x");
+
+    // When
+    let output = knives_release(&lab, &home, &["rebase", "main@upstream"]);
+
+    // Then: both copies go, the lower one included, and both tags stay put
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "stdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(commit_at(&lab, OLD_RELEASE_TAG), tagged, "the tag moved");
+    assert_eq!(commit_at(&lab, "keep/fix/x"), kept_fix, "the tag moved");
+    assert_eq!(
+        copies_of(&lab, &tagged),
+        Vec::<String>::new(),
+        "a copy whose only descendant is another abandoned copy must go too: {stdout}"
+    );
+    assert_eq!(copies_of(&lab, &kept_fix), Vec::<String>::new(), "{stdout}");
+    assert!(
+        !stdout.contains("kept"),
+        "nothing rests on either: {stdout}"
+    );
+}
+
+#[test]
+fn a_rebase_keeps_a_stray_copy_a_bookmark_points_at() {
+    // Given: a bookmark somebody left on the old tagged release
+    let lab = Lab::new();
+    let (home, tagged) = fork_with_an_old_tagged_release(&lab);
+    lab.jj_work([
+        "bookmark",
+        "create",
+        "old-release-backup",
+        "-r",
+        OLD_RELEASE_TAG,
+    ]);
+
+    // When
+    let output = knives_release(&lab, &home, &["rebase", "main@upstream"]);
+
+    // Then: the bookmark followed the rewrite, so its copy stays and is named
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "stdout: {stdout}");
+    let copies = copies_of(&lab, &tagged);
+    assert_eq!(
+        copies,
+        vec![commit_at(&lab, "old-release-backup").as_str().to_owned()],
+        "the bookmarked copy must be kept"
+    );
+    assert!(
+        stdout.contains(&format!("kept {}", &copies[0][..12]))
+            && stdout.contains("bookmark old-release-backup points at it"),
+        "the kept copy and why must be reported: {stdout}"
+    );
+}
+
+#[test]
+fn a_rebase_keeps_a_stray_copy_that_is_a_working_copy() {
+    // Given: the checkout editing the old tagged release itself
+    let lab = Lab::new();
+    let (home, tagged) = fork_with_an_old_tagged_release(&lab);
+    lab.jj_work(["edit", OLD_RELEASE_TAG]);
+
+    // When
+    let output = knives_release(&lab, &home, &["rebase", "main@upstream"]);
+
+    // Then: the working copy followed the rewrite onto the copy, which stays
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "stdout: {stdout}");
+    let copies = copies_of(&lab, &tagged);
+    assert_eq!(
+        copies,
+        vec![lab.revision(&lab.work, "@", "commit_id")],
+        "the checked-out copy must be kept"
+    );
+    assert!(
+        stdout.contains(&format!("kept {}", &copies[0][..12]))
+            && stdout.contains("it is the working copy of default"),
+        "the kept copy and why must be reported: {stdout}"
+    );
+}
+
+#[test]
+fn a_rebase_refuses_under_the_tag_pinning_rule_an_earlier_knives_start_wrote() {
+    // Given: the fork's config still states the rule knives wrote before its own
+    // release tags were exempt, which pins every member beneath the tagged release
+    let lab = Lab::new();
+    let (home, tagged) = fork_with_an_old_tagged_release(&lab);
+    let stale = "trunk() | tags() | remote_bookmarks(exact:\"main\", exact:\"upstream\") | remote_bookmarks(exact:\"main\", exact:\"origin\")";
+    lab.jj_work([
+        "config",
+        "set",
+        "--repo",
+        "revset-aliases.\"immutable_heads()\"",
+        &format!(
+            "{{ definition = {}, doc = \"{}\" }}",
+            toml::Value::String(stale.to_owned()),
+            knives::jj::KNIVES_IMMUTABLE_HEADS_DOC
+        ),
+    ]);
+    let release = commit_at(&lab, "release/2026-08-04");
+
+    // When
+    let output = knives_release(&lab, &home, &["rebase", "main@upstream"]);
+
+    // Then: it refuses before touching anything and names the refresh
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "stdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("knives start") && stdout.contains(stale),
+        "the refusal must name the stale rule and the refresh: {stdout}"
+    );
+    assert_eq!(
+        commit_at(&lab, "release/2026-08-04"),
+        release,
+        "the release moved"
+    );
+    assert_eq!(copies_of(&lab, &tagged), Vec::<String>::new());
+}
