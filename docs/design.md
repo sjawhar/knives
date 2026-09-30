@@ -219,7 +219,7 @@ Ten detection rules, all resting on mechanical fields and graph queries rather t
 
 **1. Stale release parent (`stale-parent`).** Rests on `Repo::bookmark_tips` compared against release parent commits. When a PR branch is rebased upstream, jj moves the local bookmark to the new commit but the octopus keeps the old one, leaving a parent whose bookmark has moved to a descendant. The release then ships pre-rebase code with nothing in the bookmark list saying so.
 
-**2. Landed upstream (`landed`).** Rests on `classify_landed`, which replays the branch onto the upstream trunk (defaulting to `main`) inside a dropped jj-lib transaction — a pure read that writes no operation and is invisible to concurrent agents — and inspects the tree diff. A matching landed-verdict cache key reuses that result; a changed branch tip, trunk tip, knives version, or probe schema runs the replay again:
+**2. Landed upstream (`landed`).** Rests on `classify_landed`, which replays the branch onto the upstream trunk (defaulting to `main`) inside a dropped jj-lib transaction — a pure read that writes no operation and is invisible to concurrent agents — and inspects the tree diff. The replay goes commit by commit and stops at the first conflict, which already decides the verdict: a commit replayed onto a conflicted parent carries the conflict forward, so down a long branch the conflict accumulates terms and each further replay costs more than the last. A matching landed-verdict cache key reuses that result; a changed branch tip, trunk tip, knives version, or probe schema runs the replay again:
 
 | Result | Meaning |
 |---|---|
