@@ -27,6 +27,8 @@ type ToolInput = {
   readonly sessionID: string;
   readonly callID: string;
   readonly args: unknown;
+  /** The session's effective system prompt, where the harness shows it to the hook. */
+  readonly system?: readonly string[];
 };
 type ToolOutput = { title: string; output: string; metadata: unknown };
 type ShellInput = { readonly cwd: string; readonly sessionID?: string; readonly callID?: string };
@@ -364,6 +366,8 @@ export function createKnivesHooks(
         tool: input.tool,
         args: input.args,
         parts: { notice: options.notice, guidance: options.guidance },
+        // The binary drops guidance this text already carries.
+        ...(input.system === undefined ? {} : { system: input.system }),
       });
       const addition = response === null ? null : stringValue(response["addition"]);
       if (addition !== null) output.output += addition;

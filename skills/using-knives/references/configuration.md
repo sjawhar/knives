@@ -161,8 +161,11 @@ Trust permits **guidance-as-data injection only**, never fork-command access.
 Ships alongside the CLI. Once per repository per session, when a call first
 names a file in a registered repository, the plugin announces that the fork is
 managed/shared and names claims. It appends trusted repository instructions as
-**data**; a fork entry alone brings the notice, not guidance. It supplies
-`KNIVES_OWNER` to shell environments.
+**data**; a fork entry alone brings the notice, not guidance. An instruction file whose text the
+session already holds is left out: one its system prompt carries (under oh-my-pi, whose adapter
+passes the prompt along, that includes the session's own `AGENTS.md`), or the same text injected
+earlier in the session from any checkout, until compaction. It supplies `KNIVES_OWNER` to shell
+environments.
 
 The entry in `opencode.json` has three options, all defaulting on:
 

@@ -27,14 +27,22 @@ export default function knivesExtension(pi: ExtensionAPI): void {
     hooks = createKnivesHooks(ctx.cwd, options);
   });
 
-  pi.on("tool_result", async (event) => {
+  pi.on("tool_result", async (event, ctx: ExtensionContext) => {
     if (!relevantTools.has(event.toolName) || sessionId === undefined || hooks === undefined)
       return;
 
     const output = { title: "", output: "", metadata: {} };
     await hooks["tool.execute.after"](
-      // OMP assigns this opaque id to the actual tool call, so preserve it for the hook boundary.
-      { tool: event.toolName, sessionID: sessionId, callID: event.toolCallId, args: event.input },
+      {
+        tool: event.toolName,
+        sessionID: sessionId,
+        // OMP assigns this opaque id to the actual tool call, so preserve it for the hook boundary.
+        callID: event.toolCallId,
+        args: event.input,
+        // What the session already holds — its AGENTS.md, CLAUDE.md, this plugin's own
+        // chat guidance — so the binary injects none of it into a tool result again.
+        system: ctx.getSystemPrompt(),
+      },
       output
     );
 

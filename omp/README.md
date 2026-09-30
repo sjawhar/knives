@@ -1,11 +1,20 @@
 # oh-my-pi extension
 
 `extensions/knives.ts` adapts the OpenCode plugin's hooks (`plugin/lib/internals.ts`) onto
-oh-my-pi's extension events. It adds no exports to the plugin and changes no plugin file. It
-leaves oh-my-pi's built-in bash tool in place, so its approval and sandbox behavior is unchanged.
+oh-my-pi's extension events. It adds no exports to the plugin. It leaves oh-my-pi's built-in bash
+tool in place, so its approval and sandbox behavior is unchanged. Each tool result's hook call
+carries the session's effective system prompt (`ctx.getSystemPrompt()`), and the binary leaves
+out any instruction file whose text that prompt already holds — the session's own `AGENTS.md`
+or `CLAUDE.md`, and the guidance this adapter adds to the prompt each turn.
 
 Install:
 
     ln -sfn "$PWD/omp/extensions/knives.ts" ~/.omp/agent/extensions/knives-omp.ts
 
 oh-my-pi caches extension load failures by mtime, so `touch` that symlink after editing.
+
+To try a checkout without touching the installed plugin tree, run one session with discovery
+off and this file loaded explicitly, against the checkout's build:
+
+    cargo build
+    KNIVES_BIN="$PWD/target/debug/knives" omp --no-extensions -e "$PWD/omp/extensions/knives.ts" -p "…"

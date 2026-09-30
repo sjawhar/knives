@@ -313,6 +313,13 @@ Claude Code adds guidance when a relevant tool call reaches a foreign repository
 add separate guidance for the session repository because Claude Code already loads that
 repository's `CLAUDE.md`.
 
+The OpenCode hook, which the oh-my-pi extension (`omp/`) also drives, leaves out any instruction
+file whose text the session already holds: one the session's system prompt carries, and the same
+text injected earlier in the session from any checkout, until compaction clears that record. Only
+oh-my-pi shows the hook its system prompt, so only there is the session's own `AGENTS.md` never
+injected a second time. Parallel tool calls claim guidance under one lock, so one of them injects
+it.
+
 The boundary that made the gap is a security control, so both adapters re-establish an equivalent
 one rather than removing it. The `[trust]` rules are the allowlist: only a repository they name —
 by identity, owner, or directory — contributes guidance, and a fork entry alone contributes the

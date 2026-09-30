@@ -714,6 +714,33 @@ test.serial.skipIf(realBinary.length === 0)("injects once through the real binar
 });
 
 test.serial.skipIf(realBinary.length === 0)(
+  "leaves out guidance the system prompt already carries through the real binary",
+  async () => {
+    try {
+      await withRepository(async ({ home, file }) => {
+        process.env["KNIVES_CONFIG_HOME"] = home;
+        const hooks = createKnivesHooks(undefined, readOptions(undefined));
+        const held = output();
+        await hooks["tool.execute.after"](
+          {
+            tool: "read",
+            sessionID: "held",
+            callID: "one",
+            args: { filePath: file },
+            system: ["base prompt", "project context:\nPLUGIN_GUIDANCE\n"],
+          },
+          held
+        );
+        expect(held.output).toContain("<knives-notice-");
+        expect(held.output).not.toContain("<knives-guidance-");
+      });
+    } finally {
+      restoreEnvironment();
+    }
+  }
+);
+
+test.serial.skipIf(realBinary.length === 0)(
   "preserves the binary budget after pathless bash",
   async () => {
     try {

@@ -61,6 +61,17 @@ impl Event {
         self.text("cwd")
     }
 
+    /// The session's effective system prompt, from an adapter whose harness
+    /// shows it (oh-my-pi); empty when the event carries none.
+    pub fn system(&self) -> Vec<&str> {
+        self.value
+            .get("system")
+            .and_then(Value::as_array)
+            .map_or_else(Vec::new, |entries| {
+                entries.iter().filter_map(Value::as_str).collect()
+            })
+    }
+
     pub fn parts(&self) -> Parts {
         Parts {
             notice: self

@@ -22,12 +22,16 @@ struct DiskState {
     repos: HashMap<PathBuf, RepoFlags>,
     #[serde(default)]
     seen_notices: HashMap<PathBuf, BTreeSet<String>>,
+    #[serde(default)]
+    guidance_bodies: BTreeSet<String>,
 }
 
 #[derive(Debug, Default)]
 pub struct SessionState {
     repos: HashMap<PathBuf, RepoFlags>,
     seen_notices: HashMap<PathBuf, BTreeSet<String>>,
+    /// Digests of the instruction bodies injected since the last compaction.
+    guidance_bodies: BTreeSet<String>,
 }
 
 impl SessionState {
@@ -48,10 +52,15 @@ impl SessionState {
     ) -> anyhow::Result<Self> {
         let directory = session_directory(home);
         let path = state_path(&directory, harness, session_id);
-        let _lock = FileLock::acquire(&path, LockWait::BRIEF)?;
-        let mut state = Self::load_path(&path);
-        apply(&mut state);
-        state.persist(&directory, &path)?;
+        let state = {
+            let _lock = FileLock::acquire(&path, LockWait::BRIEF)?;
+            let mut state = Self::load_path(&path);
+            apply(&mut state);
+            state.persist(&directory, &path)?;
+            state
+        };
+        // After the lock: scanning every session's file must not lengthen the
+        // wait of this session's other hook calls.
         prune_stale_siblings(&directory);
         Ok(state)
     }
@@ -73,9 +82,18 @@ impl SessionState {
             .is_some_and(|notices| notices.contains(digest))
     }
 
+    pub fn record_guidance_body(&mut self, digest: String) {
+        self.guidance_bodies.insert(digest);
+    }
+
+    pub fn guidance_body_seen(&self, digest: &str) -> bool {
+        self.guidance_bodies.contains(digest)
+    }
+
     pub fn clear(&mut self) {
         self.repos.clear();
         self.seen_notices.clear();
+        self.guidance_bodies.clear();
     }
 
     /// Remove the session's record and the lock file beside it. Unlike the
@@ -95,6 +113,7 @@ impl SessionState {
             .map_or_else(Self::default, |disk| Self {
                 repos: disk.repos,
                 seen_notices: disk.seen_notices,
+                guidance_bodies: disk.guidance_bodies,
             })
     }
 
@@ -106,6 +125,7 @@ impl SessionState {
             &DiskState {
                 repos: self.repos.clone(),
                 seen_notices: self.seen_notices.clone(),
+                guidance_bodies: self.guidance_bodies.clone(),
             },
         )?;
         temporary.write_all(b"\n")?;
