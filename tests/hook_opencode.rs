@@ -383,6 +383,415 @@ fn tool_after_trust_roots_injects_guidance_without_managed_notice() {
     );
 }
 
+/// A tool event from a harness that can see its session's system prompt.
+fn tool_seeing(path: &Path, system: &[&str]) -> Value {
+    let mut event = tool(path, None);
+    event["system"] = json!(system);
+    event
+}
+
+#[test]
+fn guidance_the_system_prompt_already_carries_is_not_injected_again() {
+    // Given: a session standing in beta, whose harness loaded beta's AGENTS.md
+    // into the system prompt.
+    let repos = Repositories::new();
+    let system = [
+        "You are an agent.",
+        "<file path=\"beta/AGENTS.md\">\nbeta instructions\n</file>",
+    ];
+
+    // When: a file in beta is read.
+    let output = run_hook(
+        repos.home.path(),
+        &tool_seeing(&repos.beta.join("file.txt"), &system),
+    );
+
+    // Then: the fork's live notice still arrives, the instructions do not arrive twice.
+    assert!(
+        addition(&output).contains("<knives-notice-"),
+        "was: {output}"
+    );
+    assert!(
+        !addition(&output).contains("<knives-guidance-"),
+        "was: {output}"
+    );
+}
+
+#[test]
+fn guidance_for_a_repository_outside_the_system_prompt_still_arrives() {
+    // Given: a session whose system prompt carries beta's instructions only.
+    let repos = Repositories::new();
+
+    // When: a file in another trusted repository is read.
+    let output = run_hook(
+        repos.home.path(),
+        &tool_seeing(&repos.trusted.join("file.txt"), &["beta instructions"]),
+    );
+
+    // Then: that repository's instructions are injected.
+    assert!(
+        addition(&output).contains("<knives-guidance-"),
+        "was: {output}"
+    );
+    assert!(
+        addition(&output).contains("trusted instructions"),
+        "was: {output}"
+    );
+}
+
+#[test]
+fn only_the_instruction_files_the_system_prompt_lacks_are_injected() {
+    // Given: beta's root instructions are in the system prompt, a subdirectory's are not.
+    let repos = Repositories::new();
+    std::fs::create_dir_all(repos.beta.join("sub")).expect("create subdirectory");
+    std::fs::write(repos.beta.join("sub/AGENTS.md"), "sub instructions")
+        .expect("write nested instructions");
+    std::fs::write(repos.beta.join("sub/file.txt"), "content").expect("write nested file");
+
+    // When: a file under the subdirectory is read.
+    let output = run_hook(
+        repos.home.path(),
+        &tool_seeing(&repos.beta.join("sub/file.txt"), &["beta instructions"]),
+    );
+
+    // Then: the nested instructions arrive without a second copy of the root's.
+    assert!(
+        addition(&output).contains("sub instructions"),
+        "was: {output}"
+    );
+    assert!(
+        !addition(&output).contains("beta instructions"),
+        "was: {output}"
+    );
+}
+
+#[test]
+fn the_same_instructions_from_a_second_checkout_are_not_injected_twice() {
+    // Given: two checkouts of one trusted repository carrying the same AGENTS.md.
+    let repos = Repositories::new();
+    let second = repos.home.path().join("trusted-second");
+    git_repository(
+        &second,
+        &[("origin", "https://forge.invalid/company/trusted.git")],
+    );
+    std::fs::write(second.join("AGENTS.md"), "trusted instructions").expect("write instructions");
+    std::fs::write(second.join("file.txt"), "content").expect("write file");
+
+    // When: a file in each is read in one session.
+    let first = run_hook(
+        repos.home.path(),
+        &tool(&repos.trusted.join("file.txt"), None),
+    );
+    let repeat = run_hook(repos.home.path(), &tool(&second.join("file.txt"), None));
+
+    // Then: the instructions arrive once.
+    assert!(
+        addition(&first).contains("trusted instructions"),
+        "was: {first}"
+    );
+    assert_eq!(addition(&repeat), "", "was: {repeat}");
+}
+
+#[test]
+fn concurrent_tool_calls_inject_the_guidance_once() {
+    // Given: one session issuing several tool calls in one turn, which the
+    // harness runs in parallel.
+    let repos = Repositories::new();
+    let event = tool(&repos.trusted.join("file.txt"), None).to_string();
+
+    // When: their hooks run at the same time.
+    #[expect(
+        clippy::needless_collect,
+        reason = "every hook must be running before the first is awaited"
+    )]
+    let children: Vec<_> = (0..8)
+        .map(|_| {
+            let mut child = Command::new(env!("CARGO_BIN_EXE_knives"))
+                .args(["hook", "opencode"])
+                .env("KNIVES_CONFIG_HOME", repos.home.path())
+                .env("HOME", repos.home.path())
+                .env("JJ_CONFIG", "/dev/null")
+                .env_remove("KNIVES_OWNER")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn hook");
+            child
+                .stdin
+                .take()
+                .expect("hook stdin")
+                .write_all(event.as_bytes())
+                .expect("write hook input");
+            child
+        })
+        .collect();
+    let additions: Vec<String> = children
+        .into_iter()
+        .map(|child| {
+            let output = child.wait_with_output().expect("wait for hook");
+            let value: Value = serde_json::from_slice(&output.stdout).expect("hook output JSON");
+            addition(&value).to_owned()
+        })
+        .collect();
+
+    // Then: exactly one of them carries the guidance.
+    let guided = additions
+        .iter()
+        .filter(|addition| addition.contains("<knives-guidance-"))
+        .count();
+    assert_eq!(guided, 1, "was: {additions:?}");
+}
+
+#[test]
+fn a_call_that_finds_the_session_record_held_leaves_the_guidance_for_a_later_call() {
+    // Given: another hook call of the same session holding its record's lock.
+    let repos = Repositories::new();
+    let sessions = repos.home.path().join("hook-sessions");
+    std::fs::create_dir_all(&sessions).expect("sessions directory");
+    let lock = File::create(sessions.join(format!("opencode-{SESSION_ID}.lock")))
+        .expect("session lock file");
+    lock.lock().expect("hold the session lock");
+    let event = tool(&repos.trusted.join("file.txt"), None);
+
+    // When: a file in a trusted repository is read while it is held, then after.
+    let held = run_hook(repos.home.path(), &event);
+    lock.unlock().expect("release the session lock");
+    let released = run_hook(repos.home.path(), &event);
+
+    // Then: the waiting call renders nothing rather than a second copy, and
+    // the guidance is still due for the next call.
+    assert_eq!(addition(&held), "", "was: {held}");
+    assert!(
+        addition(&released).contains("trusted instructions"),
+        "was: {released}"
+    );
+}
+
+/// A tool event from a harness that shows the model's context: the turn that
+/// made the call, and the envelope nonces of the guidance blocks it holds.
+fn tool_in_context(path: &Path, turn: &str, held: &[&str]) -> Value {
+    let mut event = tool(path, None);
+    event["context"] = json!({"turn": turn, "guidance": held});
+    event
+}
+
+/// The envelope nonces of the guidance blocks in a tool addition.
+fn guidance_nonces(addition: &str) -> Vec<&str> {
+    addition
+        .lines()
+        .filter_map(|line| line.strip_prefix("<knives-guidance-"))
+        .filter_map(|rest| rest.split_once(' ').map(|(nonce, _)| nonce))
+        .collect()
+}
+
+#[test]
+fn guidance_the_context_lost_is_injected_again_once() {
+    // Given: a session whose first read in a trusted repository got its guidance.
+    let repos = Repositories::new();
+    let file = repos.trusted.join("file.txt");
+    let first = run_hook(repos.home.path(), &tool_in_context(&file, "one", &[]));
+    let delivered = guidance_nonces(addition(&first));
+    assert_eq!(delivered.len(), 1, "was: {first}");
+
+    // When: a later turn reads there while the context holds the block, then
+    // two more after the harness shook it out of the context.
+    let held = run_hook(
+        repos.home.path(),
+        &tool_in_context(&file, "two", &delivered),
+    );
+    let lost = run_hook(repos.home.path(), &tool_in_context(&file, "three", &[]));
+    let again = guidance_nonces(addition(&lost));
+    let after = run_hook(repos.home.path(), &tool_in_context(&file, "four", &again));
+
+    // Then: the guidance comes back once, the first time it is missing.
+    assert_eq!(addition(&held), "", "was: {held}");
+    assert_eq!(again.len(), 1, "was: {lost}");
+    assert!(
+        addition(&lost).contains("trusted instructions"),
+        "was: {lost}"
+    );
+    assert_eq!(addition(&after), "", "was: {after}");
+}
+
+#[test]
+fn a_block_counts_as_held_until_its_turn_is_over() {
+    // Given: two tool calls of one turn, the second made before the first's
+    // result reaches the context.
+    let repos = Repositories::new();
+    let file = repos.trusted.join("file.txt");
+    let first = run_hook(repos.home.path(), &tool_in_context(&file, "one", &[]));
+    let parallel = run_hook(repos.home.path(), &tool_in_context(&file, "one", &[]));
+
+    // When: a later turn's context does not hold the block either (its result
+    // never reached the model).
+    let later = run_hook(repos.home.path(), &tool_in_context(&file, "two", &[]));
+
+    // Then: the turn delivers it once, and the next turn delivers it again.
+    assert_eq!(guidance_nonces(addition(&first)).len(), 1, "was: {first}");
+    assert_eq!(addition(&parallel), "", "was: {parallel}");
+    assert_eq!(guidance_nonces(addition(&later)).len(), 1, "was: {later}");
+}
+
+#[test]
+fn a_second_checkout_gets_the_instructions_once_their_only_block_is_lost() {
+    // Given: two checkouts of one trusted repository carrying the same AGENTS.md,
+    // the second read while the first's block is in the context.
+    let repos = Repositories::new();
+    let second = repos.home.path().join("trusted-second");
+    git_repository(
+        &second,
+        &[("origin", "https://forge.invalid/company/trusted.git")],
+    );
+    std::fs::write(second.join("AGENTS.md"), "trusted instructions").expect("write instructions");
+    std::fs::write(second.join("file.txt"), "content").expect("write file");
+    let first = run_hook(
+        repos.home.path(),
+        &tool_in_context(&repos.trusted.join("file.txt"), "one", &[]),
+    );
+    let delivered = guidance_nonces(addition(&first));
+    let repeat = run_hook(
+        repos.home.path(),
+        &tool_in_context(&second.join("file.txt"), "two", &delivered),
+    );
+
+    // When: the second checkout is read after that block left the context.
+    let lost = run_hook(
+        repos.home.path(),
+        &tool_in_context(&second.join("file.txt"), "three", &[]),
+    );
+
+    // Then: the instructions arrive again, once.
+    assert_eq!(addition(&repeat), "", "was: {repeat}");
+    assert_eq!(guidance_nonces(addition(&lost)).len(), 1, "was: {lost}");
+    assert!(
+        addition(&lost).contains("trusted instructions"),
+        "was: {lost}"
+    );
+}
+
+#[test]
+fn a_root_the_system_prompt_guided_stays_guided_whatever_the_context_holds() {
+    // Given: trusted's root instructions are in the system prompt, and a
+    // subdirectory has its own.
+    let repos = Repositories::new();
+    std::fs::create_dir_all(repos.trusted.join("sub")).expect("create subdirectory");
+    std::fs::write(repos.trusted.join("sub/AGENTS.md"), "sub instructions")
+        .expect("write nested instructions");
+    std::fs::write(repos.trusted.join("sub/file.txt"), "content").expect("write nested file");
+    let seeing = |path: &Path, turn: &str| {
+        let mut event = tool_in_context(path, turn, &[]);
+        event["system"] = json!(["trusted instructions"]);
+        event
+    };
+
+    // When: the root is read first, then the subdirectory on a later turn
+    // whose context holds no guidance block.
+    let root = run_hook(
+        repos.home.path(),
+        &seeing(&repos.trusted.join("file.txt"), "one"),
+    );
+    let nested = run_hook(
+        repos.home.path(),
+        &seeing(&repos.trusted.join("sub/file.txt"), "two"),
+    );
+
+    // Then: the root counts as guided by its first read, as without a
+    // context, so neither read injects anything.
+    assert_eq!(addition(&root), "", "was: {root}");
+    assert_eq!(addition(&nested), "", "was: {nested}");
+}
+
+#[test]
+fn guidance_recorded_before_the_context_was_shown_is_checked_against_it() {
+    // Given: a session guided by a hook call that carried no context, as from
+    // an adapter predating the context field.
+    let repos = Repositories::new();
+    let file = repos.trusted.join("file.txt");
+    let unseen = run_hook(repos.home.path(), &tool(&file, None));
+    assert!(
+        addition(&unseen).contains("trusted instructions"),
+        "was: {unseen}"
+    );
+
+    // When: a call shows a context that holds no guidance block.
+    let shown = run_hook(repos.home.path(), &tool_in_context(&file, "one", &[]));
+
+    // Then: the guidance arrives again.
+    assert!(
+        addition(&shown).contains("trusted instructions"),
+        "was: {shown}"
+    );
+}
+
+#[test]
+fn guidance_the_chat_hook_put_in_the_system_prompt_is_not_injected_again() {
+    // Given: beta with a CONTRIBUTING.md, and the guidance the chat hook
+    // renders into the system prompt of a session standing in beta.
+    let repos = Repositories::new();
+    std::fs::write(repos.beta.join("CONTRIBUTING.md"), "contribution guide")
+        .expect("write contributing guide");
+    let chat = run_hook(
+        repos.home.path(),
+        &json!({"event": "chat.system", "session_id": "chat", "directory": repos.beta}),
+    );
+    let system = chat["system"].as_str().expect("chat guidance");
+    let mut unseen = tool(&repos.beta.join("file.txt"), None);
+    unseen["session_id"] = json!("a-session-without-that-prompt");
+
+    // When: a file in beta is read with that prompt, and in a session without it.
+    let seeing = run_hook(
+        repos.home.path(),
+        &tool_seeing(&repos.beta.join("file.txt"), &["base prompt", system]),
+    );
+    let unseen = run_hook(repos.home.path(), &unseen);
+
+    // Then: neither the instructions nor the CONTRIBUTING.md pointer arrive a
+    // second time; without the prompt, both do.
+    assert!(
+        !addition(&seeing).contains("<knives-guidance-"),
+        "was: {seeing}"
+    );
+    assert!(
+        addition(&unseen).contains("Additional guidance exists at"),
+        "was: {unseen}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_read_only_config_home_still_delivers_guidance_and_still_leaves_out_held_text() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    // Given: a config home the hook cannot write, and a prompt carrying beta's instructions.
+    let repos = Repositories::new();
+    let home = repos.home.path();
+    std::fs::set_permissions(home, std::fs::Permissions::from_mode(0o555)).expect("chmod 555");
+    // Root ignores directory permissions; there is nothing to test then.
+    if std::fs::create_dir(home.join("probe")).is_ok() {
+        std::fs::set_permissions(home, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        return;
+    }
+
+    // When: a file in another trusted repository is read, then one in beta.
+    let system = ["beta instructions"];
+    let (trusted_ok, trusted, trusted_errors) = run_hook_input(
+        home,
+        &tool_seeing(&repos.trusted.join("file.txt"), &system).to_string(),
+    );
+    let (beta_ok, beta, beta_errors) = run_hook_input(
+        home,
+        &tool_seeing(&repos.beta.join("file.txt"), &system).to_string(),
+    );
+    std::fs::set_permissions(home, std::fs::Permissions::from_mode(0o755)).expect("chmod 755");
+
+    // Then: the unrecordable state costs no guidance, and held text stays out.
+    assert!(trusted_ok && beta_ok, "{trusted_errors}{beta_errors}");
+    assert!(trusted_errors.contains("knives hook:"), "{trusted_errors}");
+    assert!(trusted.contains("trusted instructions"), "{trusted}");
+    assert!(!beta.contains("beta instructions"), "{beta}");
+}
+
 #[test]
 fn a_nested_jj_under_a_trusted_git_checkout_is_the_checkouts_content() {
     // Given: a `.jj` directory nested under a Git checkout whose remote
@@ -610,6 +1019,7 @@ fn compacting_resets_the_tool_after_budget() {
     assert_eq!(compacted, json!({}));
     assert!(addition(&first).contains("<knives-notice-"));
     assert!(addition(&second).contains("<knives-notice-"));
+    assert!(addition(&second).contains("beta instructions"));
 }
 
 #[test]

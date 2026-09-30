@@ -11,12 +11,14 @@ use crate::hook::claude_code::{
     Event, EventKind, POST_TOOL_USE_WIRE_NAME, SESSION_START_WIRE_NAME, response,
 };
 use crate::hook::guidance::{
-    claim_lines, format_guidance, format_notice, guidance_for, notice_digest,
+    Guidance, body_digest, claim_lines, envelope_nonce, format_guidance, format_notice,
+    guidance_for, mention_line, notice_digest,
 };
 use crate::hook::opencode::{self, Event as OpenCodeEvent, EventKind as OpenCodeEventKind};
 use crate::hook::resolve::{Match, argument_paths, match_checkout};
-use crate::hook::state::SessionState;
+use crate::hook::state::{Envelope, SessionState};
 use crate::ids::RepoName;
+use crate::lock::LockError;
 use crate::store::{OwnerKind, Store, default_state_path};
 
 const CLAUDE_CODE: &str = "claude-code";
@@ -169,38 +171,202 @@ fn opencode_tool_after(event: &OpenCodeEvent, home: &Path) -> anyhow::Result<Str
         );
     }
     let repo = guidance_root(&matched);
-    let state = SessionState::load(home, OPENCODE, session_id);
-    let flags = state.repo(&repo.root);
     let requested = event.parts();
-    let notice = notice_if_requested(&repo, &state, requested.notice && matched.is_managed())?;
-    let guidance = (requested.guidance && matched.trusted && !flags.guided)
+    let context = event.context();
+    let mut unlocked = SessionState::load(home, OPENCODE, session_id);
+    if let Some(context) = &context {
+        unlocked.reconcile(context.turn, &context.guidance);
+    }
+    let notice = notice_if_requested(&repo, &unlocked, requested.notice && matched.is_managed())?;
+    let guidance = (requested.guidance && matched.trusted && !unlocked.repo(&repo.root).guided)
         .then(|| guidance_for(&repo, &matched.candidate))
         .flatten();
+    let candidates = Candidates::new(&repo, notice.as_ref(), guidance.as_ref(), &event.system());
+    let outstanding = candidates.outstanding(&unlocked);
+    if outstanding.is_empty() {
+        return opencode::tool_response("").map_err(Into::into);
+    }
 
-    let (notice_text, notice_update) = notice.map_or((None, None), |notice| {
-        let (text, update) = notice.into_parts();
-        (Some(text), Some(update))
+    // Parallel tool calls each found these parts outstanding above; only the
+    // one that records them under the session lock renders them.
+    let nonce = envelope_nonce();
+    let envelope = context.as_ref().map(|context| Envelope {
+        nonce: &nonce,
+        turn: context.turn,
     });
+    let mut claimed = None;
+    let outstanding = match SessionState::update(home, OPENCODE, session_id, |state| {
+        if let Some(context) = &context {
+            state.reconcile(context.turn, &context.guidance);
+        }
+        let locked = candidates.outstanding(state);
+        candidates.record(state, &locked, envelope);
+        claimed = Some(locked);
+    }) {
+        Ok(_) => claimed.unwrap_or_default(),
+        // Another call of this session holds the record: it delivers what it
+        // claims, and whatever it leaves stays due for a later call.
+        Err(error) if matches!(error.downcast_ref(), Some(LockError::Held { .. })) => {
+            Outstanding::default()
+        }
+        Err(error) => {
+            // The state file is a saving: a read-only config home gets its
+            // additions on every event rather than never.
+            eprintln!("knives hook: {error:#}");
+            outstanding
+        }
+    };
+
     let mut additions = Vec::new();
-    if let Some(text) = notice_text {
-        additions.push(text);
+    if outstanding.notice
+        && let Some(notice) = notice
+    {
+        additions.push(notice.text);
     }
-    let guidance_rendered = guidance.is_some();
-    if let Some(guidance) = guidance {
-        additions.push(format_guidance(&repo.name, &guidance));
+    if let Some(guidance) =
+        guidance.and_then(|guidance| guidance.keeping(&outstanding.bodies, &outstanding.mentions))
+    {
+        additions.push(format_guidance(&repo.name, &guidance, &nonce));
     }
-    let addition = additions.join("\n");
-    if !addition.is_empty() {
-        remember(home, OPENCODE, session_id, move |state| {
-            if let Some(update) = notice_update {
-                update.apply(state, &repo.root);
-            }
-            if guidance_rendered {
-                state.mark_guided(&repo.root);
-            }
+    opencode::tool_response(&additions.join("\n")).map_err(Into::into)
+}
+
+/// What one tool call could add, and which of its parts the session's system
+/// prompt already carries, so no session state can make them due again.
+struct Candidates<'a> {
+    repo: &'a GuidanceRoot,
+    notice: Option<&'a PreparedNotice>,
+    guidance: Option<&'a Guidance>,
+    /// Per instruction file of `guidance`: its body's digest, and whether the
+    /// system prompt already carries the body.
+    bodies: Vec<(String, bool)>,
+    /// Per mention of `guidance`: whether the system prompt already carries its line.
+    mentions_held: Vec<bool>,
+}
+
+impl<'a> Candidates<'a> {
+    fn new(
+        repo: &'a GuidanceRoot,
+        notice: Option<&'a PreparedNotice>,
+        guidance: Option<&'a Guidance>,
+        system: &[&str],
+    ) -> Self {
+        let held = |text: &str| system.iter().any(|entry| entry.contains(text));
+        let bodies = guidance.map_or_else(Vec::new, |guidance| {
+            guidance
+                .bodies
+                .iter()
+                .map(|file| (body_digest(&file.body), held(&file.body)))
+                .collect()
         });
+        let mentions_held = guidance.map_or_else(Vec::new, |guidance| {
+            guidance
+                .mentions
+                .iter()
+                .map(|path| held(&mention_line(path)))
+                .collect()
+        });
+        Self {
+            repo,
+            notice,
+            guidance,
+            bodies,
+            mentions_held,
+        }
     }
-    opencode::tool_response(&addition).map_err(Into::into)
+
+    /// The parts `state` says the session does not have yet.
+    fn outstanding(&self, state: &SessionState) -> Outstanding {
+        let notice = self
+            .notice
+            .is_some_and(|notice| !state.notice_seen(&self.repo.root, &notice.update.digest));
+        let guidance = self.guidance.is_some() && !state.repo(&self.repo.root).guided;
+        if !guidance {
+            return Outstanding {
+                notice,
+                ..Outstanding::default()
+            };
+        }
+        Outstanding {
+            notice,
+            guidance,
+            bodies: self
+                .bodies
+                .iter()
+                .map(|(digest, held)| !held && !state.guidance_body_seen(digest))
+                .collect(),
+            mentions: self.mentions_held.iter().map(|held| !held).collect(),
+        }
+    }
+
+    /// Records `outstanding` as delivered. A root whose guidance was due is
+    /// guided even when the session held all of it already.
+    ///
+    /// With an `envelope` (the harness shows the model's context), the block
+    /// is recorded as a delivery, and the root's mark rests on it and on every
+    /// earlier block that carried one of its bodies, so the mark goes when the
+    /// context loses them.
+    fn record(
+        &self,
+        state: &mut SessionState,
+        outstanding: &Outstanding,
+        envelope: Option<Envelope<'_>>,
+    ) {
+        if outstanding.notice
+            && let Some(notice) = self.notice
+        {
+            state.record_notice(&self.repo.root, notice.update.digest.clone());
+        }
+        if outstanding.guidance {
+            state.mark_guided(&self.repo.root);
+        }
+        let rendered = self
+            .bodies
+            .iter()
+            .zip(&outstanding.bodies)
+            .filter(|(_, rendered)| **rendered)
+            .map(|((digest, _), _)| digest.clone())
+            .collect::<BTreeSet<_>>();
+        for digest in &rendered {
+            state.record_guidance_body(digest.clone());
+        }
+        let Some(envelope) = envelope.filter(|_| outstanding.guidance) else {
+            return;
+        };
+        for ((digest, held), rendered) in self.bodies.iter().zip(&outstanding.bodies) {
+            if !held && !rendered {
+                state.rest_on_body(&self.repo.root, digest);
+            }
+        }
+        if outstanding.renders() {
+            state.record_delivery(envelope, &self.repo.root, rendered);
+        }
+    }
+}
+
+/// The parts of a tool call's candidates the session does not have yet.
+#[derive(Debug, Default)]
+struct Outstanding {
+    notice: bool,
+    /// The root's guidance was due, whether or not any of it is left to render.
+    guidance: bool,
+    /// Per instruction file and per mention: whether to render it.
+    bodies: Vec<bool>,
+    mentions: Vec<bool>,
+}
+
+impl Outstanding {
+    const fn is_empty(&self) -> bool {
+        !self.notice && !self.guidance
+    }
+
+    /// Whether any instruction file or mention is left to render.
+    fn renders(&self) -> bool {
+        self.bodies
+            .iter()
+            .chain(&self.mentions)
+            .any(|render| *render)
+    }
 }
 
 fn opencode_chat_system(event: &OpenCodeEvent) -> anyhow::Result<String> {
@@ -223,7 +389,7 @@ fn opencode_chat_system(event: &OpenCodeEvent) -> anyhow::Result<String> {
         .iter()
         .map(|instruction| instruction.body.clone())
         .collect::<Vec<_>>();
-    let system = format_guidance(&repo.name, &guidance);
+    let system = format_guidance(&repo.name, &guidance, &envelope_nonce());
     opencode::system_response(&system, &bodies).map_err(Into::into)
 }
 
@@ -384,7 +550,7 @@ fn post_tool_use(event: &Event, home: &Path) -> anyhow::Result<Option<String>> {
         .then(|| guidance_for(&repo, &matched.candidate))
         .flatten();
     if let Some(guidance) = &guidance {
-        parts.push(format_guidance(&repo.name, guidance));
+        parts.push(format_guidance(&repo.name, guidance, &envelope_nonce()));
     }
     if parts.is_empty() {
         return Ok(None);

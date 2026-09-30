@@ -714,6 +714,144 @@ test.serial.skipIf(realBinary.length === 0)("injects once through the real binar
 });
 
 test.serial.skipIf(realBinary.length === 0)(
+  "leaves out guidance the system prompt already carries through the real binary",
+  async () => {
+    try {
+      await withRepository(async ({ home, file }) => {
+        process.env["KNIVES_CONFIG_HOME"] = home;
+        const hooks = createKnivesHooks(undefined, readOptions(undefined));
+        const held = output();
+        await hooks["tool.execute.after"](
+          {
+            tool: "read",
+            sessionID: "held",
+            callID: "one",
+            args: { filePath: file },
+            system: ["base prompt", "project context:\nPLUGIN_GUIDANCE\n"],
+          },
+          held
+        );
+        expect(held.output).toContain("<knives-notice-");
+        expect(held.output).not.toContain("<knives-guidance-");
+      });
+    } finally {
+      restoreEnvironment();
+    }
+  }
+);
+
+test.serial.skipIf(realBinary.length === 0)(
+  "the OMP adapter puts its chat guidance back on every turn",
+  async () => {
+    type Handler = (event: unknown, ctx: unknown) => Promise<unknown>;
+    try {
+      await withRepository(async ({ home, root }) => {
+        process.env["KNIVES_CONFIG_HOME"] = home;
+        const handlers = new Map<string, Handler>();
+        // Loaded by path, not imported statically: a static import would pull oh-my-pi's
+        // types (and their DOM globals) into the plugin's typecheck, which omp/ has its own of.
+        const adapter = join(import.meta.dir, "..", "omp", "extensions", "knives.ts");
+        const knivesExtension = (await import(adapter)).default as (api: unknown) => void;
+        knivesExtension({ on: (name: string, handler: Handler) => handlers.set(name, handler) });
+        await handlers.get("session_start")?.(
+          {},
+          { cwd: root, sessionManager: { getSessionId: () => "turns" } }
+        );
+        // omp hands each turn its freshly built base prompt as `event.systemPrompt`, while
+        // `ctx.getSystemPrompt()` still returns what the previous turn ended with.
+        const turn = async (previous: readonly string[]) =>
+          (await handlers.get("before_agent_start")?.(
+            { type: "before_agent_start", prompt: "p", systemPrompt: ["base"] },
+            { getSystemPrompt: () => [...previous] }
+          )) as { systemPrompt?: string[] } | undefined;
+        const first = await turn(["base"]);
+        const second = await turn(first?.systemPrompt ?? ["base"]);
+        expect(first?.systemPrompt?.join("\n")).toContain("PLUGIN_GUIDANCE");
+        expect(second?.systemPrompt?.join("\n")).toContain("PLUGIN_GUIDANCE");
+      });
+    } finally {
+      restoreEnvironment();
+    }
+  }
+);
+
+test.serial.skipIf(realBinary.length === 0)(
+  "the OMP adapter gives guidance again once its block leaves the context",
+  async () => {
+    type Handler = (event: unknown, ctx: unknown) => Promise<unknown>;
+    type Part = { readonly type: string; readonly text?: string; readonly id?: string };
+    type Entry = {
+      readonly type: string;
+      readonly id: string;
+      readonly message: { readonly role: string; content: Part[] };
+    };
+    try {
+      await withRepository(async ({ home, root, file }) => {
+        process.env["KNIVES_CONFIG_HOME"] = home;
+        const handlers = new Map<string, Handler>();
+        // Loaded by path for the reason the chat-turn test above gives: omp's types stay out of
+        // the plugin's typecheck.
+        const adapter = join(import.meta.dir, "..", "omp", "extensions", "knives.ts");
+        const knivesExtension = (await import(adapter)).default as (api: unknown) => void;
+        knivesExtension({ on: (name: string, handler: Handler) => handlers.set(name, handler) });
+        await handlers.get("session_start")?.(
+          {},
+          { cwd: root, sessionManager: { getSessionId: () => "shaken" } }
+        );
+        // The session's branch as omp keeps it: each turn's assistant message, then its result.
+        const branch: Entry[] = [];
+        const ctx = {
+          getSystemPrompt: () => ["base"],
+          sessionManager: { getBranch: () => [...branch] },
+        };
+        const read = async (turn: string): Promise<number> => {
+          const call = `${turn}-call`;
+          branch.push({
+            type: "message",
+            id: turn,
+            message: { role: "assistant", content: [{ type: "toolCall", id: call }] },
+          });
+          const result = (await handlers.get("tool_result")?.(
+            {
+              toolName: "read",
+              toolCallId: call,
+              input: { path: file },
+              content: [{ type: "text", text: "tool output" }],
+            },
+            ctx
+          )) as { content?: Part[] } | undefined;
+          const content = result?.content ?? [{ type: "text", text: "tool output" }];
+          branch.push({
+            type: "message",
+            id: `${turn}-result`,
+            message: { role: "toolResult", content },
+          });
+          return (
+            content
+              .map((part) => part.text ?? "")
+              .join("")
+              .split("<knives-guidance-").length - 1
+          );
+        };
+
+        const first = await read("one");
+        const held = await read("two");
+        // omp's shake swaps an old tool result for a recovery placeholder in place.
+        const shaken = branch.find((entry) => entry.id === "one-result");
+        if (shaken === undefined) throw new Error("the first result is missing from the branch");
+        shaken.message.content = [{ type: "text", text: "[shaken ~6000 tokens]" }];
+        const lost = await read("three");
+        const after = await read("four");
+
+        expect([first, held, lost, after]).toEqual([1, 0, 1, 0]);
+      });
+    } finally {
+      restoreEnvironment();
+    }
+  }
+);
+
+test.serial.skipIf(realBinary.length === 0)(
   "preserves the binary budget after pathless bash",
   async () => {
     try {

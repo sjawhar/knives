@@ -1,5 +1,7 @@
 //! `OpenCode`'s hook-envelope wire format.
 
+use std::collections::BTreeSet;
+
 use serde::Serialize;
 use serde_json::Value;
 
@@ -22,6 +24,17 @@ pub struct Event {
 pub struct Parts {
     pub notice: bool,
     pub guidance: bool,
+}
+
+/// What an adapter whose harness shows it (oh-my-pi) says about the model's
+/// context at this tool call.
+#[derive(Debug)]
+pub struct ModelContext<'a> {
+    /// The turn that made this call: until a turn's tool results reach the
+    /// context, what they carry is still on its way.
+    pub turn: &'a str,
+    /// The envelope nonces of the knives guidance blocks the context holds.
+    pub guidance: BTreeSet<&'a str>,
 }
 
 impl Event {
@@ -59,6 +72,32 @@ impl Event {
 
     pub fn cwd(&self) -> Option<&str> {
         self.text("cwd")
+    }
+
+    /// The session's effective system prompt, from an adapter whose harness
+    /// shows it (oh-my-pi); empty when the event carries none.
+    pub fn system(&self) -> Vec<&str> {
+        self.value
+            .get("system")
+            .and_then(Value::as_array)
+            .map_or_else(Vec::new, |entries| {
+                entries.iter().filter_map(Value::as_str).collect()
+            })
+    }
+
+    /// The model's context, from an adapter whose harness shows it; `None`
+    /// when the event does not carry one.
+    pub fn context(&self) -> Option<ModelContext<'_>> {
+        let context = self.value.get("context")?;
+        Some(ModelContext {
+            turn: context.get("turn").and_then(Value::as_str)?,
+            guidance: context
+                .get("guidance")
+                .and_then(Value::as_array)?
+                .iter()
+                .filter_map(Value::as_str)
+                .collect(),
+        })
     }
 
     pub fn parts(&self) -> Parts {
