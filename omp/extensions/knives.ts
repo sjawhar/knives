@@ -50,10 +50,12 @@ export default function knivesExtension(pi: ExtensionAPI): void {
     return { content: [...event.content, { type: "text", text: output.output }] };
   });
 
-  pi.on("before_agent_start", async (_event, ctx: ExtensionContext) => {
+  pi.on("before_agent_start", async (event) => {
     if (sessionId === undefined || hooks === undefined) return;
 
-    const baseSystem = ctx.getSystemPrompt();
+    // The turn's freshly built base, not `ctx.getSystemPrompt()`: that still holds the previous
+    // turn's prompt with this block in it, and returning nothing publishes the base without it.
+    const baseSystem = event.systemPrompt;
     const system = [...baseSystem];
     await hooks["experimental.chat.system.transform"]({ sessionID: sessionId }, { system });
     if (system.length === baseSystem.length) return;

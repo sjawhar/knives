@@ -741,6 +741,41 @@ test.serial.skipIf(realBinary.length === 0)(
 );
 
 test.serial.skipIf(realBinary.length === 0)(
+  "the OMP adapter puts its chat guidance back on every turn",
+  async () => {
+    type Handler = (event: unknown, ctx: unknown) => Promise<unknown>;
+    try {
+      await withRepository(async ({ home, root }) => {
+        process.env["KNIVES_CONFIG_HOME"] = home;
+        const handlers = new Map<string, Handler>();
+        // Loaded by path, not imported statically: a static import would pull oh-my-pi's
+        // types (and their DOM globals) into the plugin's typecheck, which omp/ has its own of.
+        const adapter = join(import.meta.dir, "..", "omp", "extensions", "knives.ts");
+        const knivesExtension = (await import(adapter)).default as (api: unknown) => void;
+        knivesExtension({ on: (name: string, handler: Handler) => handlers.set(name, handler) });
+        await handlers.get("session_start")?.(
+          {},
+          { cwd: root, sessionManager: { getSessionId: () => "turns" } }
+        );
+        // omp hands each turn its freshly built base prompt as `event.systemPrompt`, while
+        // `ctx.getSystemPrompt()` still returns what the previous turn ended with.
+        const turn = async (previous: readonly string[]) =>
+          (await handlers.get("before_agent_start")?.(
+            { type: "before_agent_start", prompt: "p", systemPrompt: ["base"] },
+            { getSystemPrompt: () => [...previous] }
+          )) as { systemPrompt?: string[] } | undefined;
+        const first = await turn(["base"]);
+        const second = await turn(first?.systemPrompt ?? ["base"]);
+        expect(first?.systemPrompt?.join("\n")).toContain("PLUGIN_GUIDANCE");
+        expect(second?.systemPrompt?.join("\n")).toContain("PLUGIN_GUIDANCE");
+      });
+    } finally {
+      restoreEnvironment();
+    }
+  }
+);
+
+test.serial.skipIf(realBinary.length === 0)(
   "preserves the binary budget after pathless bash",
   async () => {
     try {
