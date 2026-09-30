@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -16,6 +16,30 @@ pub struct RepoFlags {
     pub guided: bool,
 }
 
+/// A guidance block this session's hook put into a tool result, recorded while
+/// the harness shows the hook the model's context (oh-my-pi), keyed by the
+/// block's envelope nonce.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Delivery {
+    /// The turn whose tool call carried the block. Until that turn's results
+    /// reach the context, the block counts as held even though the context
+    /// does not show it yet.
+    turn: String,
+    /// The roots whose guided mark rests on the block being in the context.
+    #[serde(default)]
+    roots: BTreeSet<PathBuf>,
+    /// Digests of the instruction bodies the block carried.
+    #[serde(default)]
+    bodies: BTreeSet<String>,
+}
+
+/// The envelope a tool call's guidance renders in, and the turn of that call.
+#[derive(Debug, Clone, Copy)]
+pub struct Envelope<'a> {
+    pub nonce: &'a str,
+    pub turn: &'a str,
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct DiskState {
     #[serde(default)]
@@ -24,6 +48,8 @@ struct DiskState {
     seen_notices: HashMap<PathBuf, BTreeSet<String>>,
     #[serde(default)]
     guidance_bodies: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    deliveries: Option<BTreeMap<String, Delivery>>,
 }
 
 #[derive(Debug, Default)]
@@ -32,6 +58,10 @@ pub struct SessionState {
     seen_notices: HashMap<PathBuf, BTreeSet<String>>,
     /// Digests of the instruction bodies injected since the last compaction.
     guidance_bodies: BTreeSet<String>,
+    /// The guidance blocks injected into tool results, by envelope nonce, once
+    /// the harness shows the model's context; `None` while it never has, so
+    /// the guided marks and body digests above carry no delivery.
+    deliveries: Option<BTreeMap<String, Delivery>>,
 }
 
 impl SessionState {
@@ -90,10 +120,81 @@ impl SessionState {
         self.guidance_bodies.contains(digest)
     }
 
+    /// Drops every guidance record the model's context no longer backs.
+    ///
+    /// A delivery is backed while its turn is `turn` or its envelope nonce is
+    /// among `held`, the blocks the context holds now; one that is neither was
+    /// shaken, pruned or compacted out, or never landed. Its body digests go,
+    /// and so does the guided mark of every root that rests on it, so the next
+    /// call touching such a root injects that guidance again. A root guided
+    /// without a delivery (the system prompt held all of it) stays guided: the
+    /// prompt is rebuilt every turn.
+    ///
+    /// Guided marks and digests recorded before the harness showed the context
+    /// carry no delivery to check, so the first reconcile drops them all.
+    pub fn reconcile(&mut self, turn: &str, held: &BTreeSet<&str>) {
+        let Some(deliveries) = &mut self.deliveries else {
+            self.repos.clear();
+            self.guidance_bodies.clear();
+            self.deliveries = Some(BTreeMap::new());
+            return;
+        };
+        let lost = deliveries
+            .iter()
+            .filter(|(nonce, delivery)| delivery.turn != turn && !held.contains(nonce.as_str()))
+            .map(|(nonce, _)| nonce.clone())
+            .collect::<Vec<_>>();
+        for nonce in lost {
+            let Some(delivery) = deliveries.remove(&nonce) else {
+                continue;
+            };
+            for root in &delivery.roots {
+                self.repos.remove(root);
+            }
+            for digest in &delivery.bodies {
+                self.guidance_bodies.remove(digest);
+            }
+        }
+    }
+
+    /// Records the block `envelope` names as what `root`'s guidance and the
+    /// `bodies` digests rest on.
+    pub fn record_delivery(
+        &mut self,
+        envelope: Envelope<'_>,
+        root: &Path,
+        bodies: BTreeSet<String>,
+    ) {
+        self.deliveries.get_or_insert_default().insert(
+            envelope.nonce.to_owned(),
+            Delivery {
+                turn: envelope.turn.to_owned(),
+                roots: BTreeSet::from([root.to_owned()]),
+                bodies,
+            },
+        );
+    }
+
+    /// Makes `root`'s guided mark rest on the delivery that carried the body
+    /// `digest` too: that body reached the session only through it.
+    pub fn rest_on_body(&mut self, root: &Path, digest: &str) {
+        if let Some(delivery) = self
+            .deliveries
+            .iter_mut()
+            .flat_map(BTreeMap::values_mut)
+            .find(|delivery| delivery.bodies.contains(digest))
+        {
+            delivery.roots.insert(root.to_owned());
+        }
+    }
+
     pub fn clear(&mut self) {
         self.repos.clear();
         self.seen_notices.clear();
         self.guidance_bodies.clear();
+        if let Some(deliveries) = &mut self.deliveries {
+            deliveries.clear();
+        }
     }
 
     /// Remove the session's record and the lock file beside it. Unlike the
@@ -114,6 +215,7 @@ impl SessionState {
                 repos: disk.repos,
                 seen_notices: disk.seen_notices,
                 guidance_bodies: disk.guidance_bodies,
+                deliveries: disk.deliveries,
             })
     }
 
@@ -126,6 +228,7 @@ impl SessionState {
                 repos: self.repos.clone(),
                 seen_notices: self.seen_notices.clone(),
                 guidance_bodies: self.guidance_bodies.clone(),
+                deliveries: self.deliveries.clone(),
             },
         )?;
         temporary.write_all(b"\n")?;

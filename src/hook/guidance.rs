@@ -100,9 +100,9 @@ pub fn mention_line(path: &Path) -> String {
     )
 }
 
-/// Formats repository-owned guidance as data inside a per-injection envelope.
-pub fn format_guidance(repo_name: &str, guidance: &Guidance) -> String {
-    let nonce = envelope_nonce();
+/// Formats repository-owned guidance as data inside the envelope `nonce` names;
+/// every injection takes a fresh one from [`envelope_nonce`].
+pub fn format_guidance(repo_name: &str, guidance: &Guidance, nonce: &str) -> String {
     let header = format!(
         "<knives-guidance-{nonce} repo=\"{}\">",
         safe_attribute(repo_name)
@@ -251,7 +251,7 @@ fn directory_guidance(directory: &Path) -> Option<InstructionFile> {
     None
 }
 
-fn envelope_nonce() -> String {
+pub fn envelope_nonce() -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     let timestamp = jiff::Timestamp::now().as_nanosecond();
@@ -295,8 +295,8 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        Guidance, InstructionFile, claim_lines, format_guidance, format_notice, guidance_for,
-        notice_digest,
+        Guidance, InstructionFile, claim_lines, envelope_nonce, format_guidance, format_notice,
+        guidance_for, notice_digest,
     };
     use crate::config::GuidanceRoot;
     use crate::seen::Seen;
@@ -391,11 +391,11 @@ mod tests {
             mentions: vec![],
         };
 
-        let text = format_guidance("r", &guidance);
+        let text = format_guidance("r", &guidance, &envelope_nonce());
         let closing = text.rsplit_once('\n').unwrap().1;
 
         assert_ne!(guidance.bodies[0].body, closing);
-        assert_ne!(text, format_guidance("r", &guidance));
+        assert_ne!(text, format_guidance("r", &guidance, &envelope_nonce()));
     }
 
     #[test]
@@ -405,7 +405,7 @@ mod tests {
             mentions: vec![PathBuf::from("/r/CONTRIBUTING.md")],
         };
 
-        let text = format_guidance("evil\" ><inject>", &guidance);
+        let text = format_guidance("evil\" ><inject>", &guidance, &envelope_nonce());
 
         assert!(!text.contains("<inject>"));
     }

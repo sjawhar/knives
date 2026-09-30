@@ -164,7 +164,9 @@ managed/shared and names claims. It appends trusted repository instructions as
 **data**; a fork entry alone brings the notice, not guidance. An instruction file whose text the
 session already holds is left out: one its system prompt carries (under oh-my-pi, whose adapter
 passes the prompt along, that includes the session's own `AGENTS.md`), or the same text injected
-earlier in the session from any checkout, until compaction. It supplies `KNIVES_OWNER` to shell
+earlier in the session from any checkout, until compaction. Under oh-my-pi, "held" also means
+still in the model's context: when shake, pruning or compaction removes an injected block, the
+next call touching that repository injects it again, once. It supplies `KNIVES_OWNER` to shell
 environments.
 
 The entry in `opencode.json` has three options, all defaulting on:

@@ -9,7 +9,8 @@ use std::path::{Path, PathBuf};
 use knives::{
     config::GuidanceRoot,
     hook::guidance::{
-        Guidance, InstructionFile, claim_lines, format_guidance, format_notice, guidance_for,
+        Guidance, InstructionFile, claim_lines, envelope_nonce, format_guidance, format_notice,
+        guidance_for,
     },
     seen::Seen,
     store::{Claim, OwnerKind},
@@ -52,7 +53,10 @@ fn guidance_format_matches_the_plugin_prose_exactly() {
     };
 
     // When: the formatter produces an injection envelope.
-    let actual = normalize_nonce(&format_guidance("example-repo", &guidance), "guidance");
+    let actual = normalize_nonce(
+        &format_guidance("example-repo", &guidance, &envelope_nonce()),
+        "guidance",
+    );
 
     // Then: every non-nonce byte equals the TypeScript formatter's text.
     assert_eq!(

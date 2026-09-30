@@ -22,6 +22,11 @@ const inflightKey = "__knives_opencode_inflight__";
 const inflightCap = 4;
 const defaultInvokeTimeoutMs = 10_000;
 
+/**
+ * What the harness shows of the model's context at a tool call: the turn that made the call, and
+ * the envelope nonces of the knives guidance blocks the context still holds.
+ */
+export type ModelContext = { readonly turn: string; readonly guidance: readonly string[] };
 type ToolInput = {
   readonly tool: string;
   readonly sessionID: string;
@@ -29,6 +34,8 @@ type ToolInput = {
   readonly args: unknown;
   /** The session's effective system prompt, where the harness shows it to the hook. */
   readonly system?: readonly string[];
+  /** The model's context, where the harness shows it to the hook. */
+  readonly context?: ModelContext;
 };
 type ToolOutput = { title: string; output: string; metadata: unknown };
 type ShellInput = { readonly cwd: string; readonly sessionID?: string; readonly callID?: string };
@@ -368,6 +375,8 @@ export function createKnivesHooks(
         parts: { notice: options.notice, guidance: options.guidance },
         // The binary drops guidance this text already carries.
         ...(input.system === undefined ? {} : { system: input.system }),
+        // And gives again guidance whose block the context lost.
+        ...(input.context === undefined ? {} : { context: input.context }),
       });
       const addition = response === null ? null : stringValue(response["addition"]);
       if (addition !== null) output.output += addition;

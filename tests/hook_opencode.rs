@@ -568,6 +568,162 @@ fn a_call_that_finds_the_session_record_held_leaves_the_guidance_for_a_later_cal
     );
 }
 
+/// A tool event from a harness that shows the model's context: the turn that
+/// made the call, and the envelope nonces of the guidance blocks it holds.
+fn tool_in_context(path: &Path, turn: &str, held: &[&str]) -> Value {
+    let mut event = tool(path, None);
+    event["context"] = json!({"turn": turn, "guidance": held});
+    event
+}
+
+/// The envelope nonces of the guidance blocks in a tool addition.
+fn guidance_nonces(addition: &str) -> Vec<&str> {
+    addition
+        .lines()
+        .filter_map(|line| line.strip_prefix("<knives-guidance-"))
+        .filter_map(|rest| rest.split_once(' ').map(|(nonce, _)| nonce))
+        .collect()
+}
+
+#[test]
+fn guidance_the_context_lost_is_injected_again_once() {
+    // Given: a session whose first read in a trusted repository got its guidance.
+    let repos = Repositories::new();
+    let file = repos.trusted.join("file.txt");
+    let first = run_hook(repos.home.path(), &tool_in_context(&file, "one", &[]));
+    let delivered = guidance_nonces(addition(&first));
+    assert_eq!(delivered.len(), 1, "was: {first}");
+
+    // When: a later turn reads there while the context holds the block, then
+    // two more after the harness shook it out of the context.
+    let held = run_hook(
+        repos.home.path(),
+        &tool_in_context(&file, "two", &delivered),
+    );
+    let lost = run_hook(repos.home.path(), &tool_in_context(&file, "three", &[]));
+    let again = guidance_nonces(addition(&lost));
+    let after = run_hook(repos.home.path(), &tool_in_context(&file, "four", &again));
+
+    // Then: the guidance comes back once, the first time it is missing.
+    assert_eq!(addition(&held), "", "was: {held}");
+    assert_eq!(again.len(), 1, "was: {lost}");
+    assert!(
+        addition(&lost).contains("trusted instructions"),
+        "was: {lost}"
+    );
+    assert_eq!(addition(&after), "", "was: {after}");
+}
+
+#[test]
+fn a_block_counts_as_held_until_its_turn_is_over() {
+    // Given: two tool calls of one turn, the second made before the first's
+    // result reaches the context.
+    let repos = Repositories::new();
+    let file = repos.trusted.join("file.txt");
+    let first = run_hook(repos.home.path(), &tool_in_context(&file, "one", &[]));
+    let parallel = run_hook(repos.home.path(), &tool_in_context(&file, "one", &[]));
+
+    // When: a later turn's context does not hold the block either (its result
+    // never reached the model).
+    let later = run_hook(repos.home.path(), &tool_in_context(&file, "two", &[]));
+
+    // Then: the turn delivers it once, and the next turn delivers it again.
+    assert_eq!(guidance_nonces(addition(&first)).len(), 1, "was: {first}");
+    assert_eq!(addition(&parallel), "", "was: {parallel}");
+    assert_eq!(guidance_nonces(addition(&later)).len(), 1, "was: {later}");
+}
+
+#[test]
+fn a_second_checkout_gets_the_instructions_once_their_only_block_is_lost() {
+    // Given: two checkouts of one trusted repository carrying the same AGENTS.md,
+    // the second read while the first's block is in the context.
+    let repos = Repositories::new();
+    let second = repos.home.path().join("trusted-second");
+    git_repository(
+        &second,
+        &[("origin", "https://forge.invalid/company/trusted.git")],
+    );
+    std::fs::write(second.join("AGENTS.md"), "trusted instructions").expect("write instructions");
+    std::fs::write(second.join("file.txt"), "content").expect("write file");
+    let first = run_hook(
+        repos.home.path(),
+        &tool_in_context(&repos.trusted.join("file.txt"), "one", &[]),
+    );
+    let delivered = guidance_nonces(addition(&first));
+    let repeat = run_hook(
+        repos.home.path(),
+        &tool_in_context(&second.join("file.txt"), "two", &delivered),
+    );
+
+    // When: the second checkout is read after that block left the context.
+    let lost = run_hook(
+        repos.home.path(),
+        &tool_in_context(&second.join("file.txt"), "three", &[]),
+    );
+
+    // Then: the instructions arrive again, once.
+    assert_eq!(addition(&repeat), "", "was: {repeat}");
+    assert_eq!(guidance_nonces(addition(&lost)).len(), 1, "was: {lost}");
+    assert!(
+        addition(&lost).contains("trusted instructions"),
+        "was: {lost}"
+    );
+}
+
+#[test]
+fn a_root_the_system_prompt_guided_stays_guided_whatever_the_context_holds() {
+    // Given: trusted's root instructions are in the system prompt, and a
+    // subdirectory has its own.
+    let repos = Repositories::new();
+    std::fs::create_dir_all(repos.trusted.join("sub")).expect("create subdirectory");
+    std::fs::write(repos.trusted.join("sub/AGENTS.md"), "sub instructions")
+        .expect("write nested instructions");
+    std::fs::write(repos.trusted.join("sub/file.txt"), "content").expect("write nested file");
+    let seeing = |path: &Path, turn: &str| {
+        let mut event = tool_in_context(path, turn, &[]);
+        event["system"] = json!(["trusted instructions"]);
+        event
+    };
+
+    // When: the root is read first, then the subdirectory on a later turn
+    // whose context holds no guidance block.
+    let root = run_hook(
+        repos.home.path(),
+        &seeing(&repos.trusted.join("file.txt"), "one"),
+    );
+    let nested = run_hook(
+        repos.home.path(),
+        &seeing(&repos.trusted.join("sub/file.txt"), "two"),
+    );
+
+    // Then: the root counts as guided by its first read, as without a
+    // context, so neither read injects anything.
+    assert_eq!(addition(&root), "", "was: {root}");
+    assert_eq!(addition(&nested), "", "was: {nested}");
+}
+
+#[test]
+fn guidance_recorded_before_the_context_was_shown_is_checked_against_it() {
+    // Given: a session guided by a hook call that carried no context, as from
+    // an adapter predating the context field.
+    let repos = Repositories::new();
+    let file = repos.trusted.join("file.txt");
+    let unseen = run_hook(repos.home.path(), &tool(&file, None));
+    assert!(
+        addition(&unseen).contains("trusted instructions"),
+        "was: {unseen}"
+    );
+
+    // When: a call shows a context that holds no guidance block.
+    let shown = run_hook(repos.home.path(), &tool_in_context(&file, "one", &[]));
+
+    // Then: the guidance arrives again.
+    assert!(
+        addition(&shown).contains("trusted instructions"),
+        "was: {shown}"
+    );
+}
+
 #[test]
 fn guidance_the_chat_hook_put_in_the_system_prompt_is_not_injected_again() {
     // Given: beta with a CONTRIBUTING.md, and the guidance the chat hook
