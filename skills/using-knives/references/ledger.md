@@ -120,7 +120,8 @@ allowing newer writers and older readers; there is no version-number field.
 directory or entry. A repository with no ledger yet is different: exit `0` with
 `no notches yet`.
 
-Every command that reads branch statements (`status`, `audit`, `pushed`, `track`,
-`start`, a `notch` write, and the rest) reads every repository's ledger when it
-starts. An unreadable entry in any of them stops the command with exit `3` naming
-the file, rather than reading that ledger's statements as absent.
+A command that reads branch statements (`status`, `audit`, `pushed`, `sync`,
+`track`, `depends`, `finish`, `start`, a `notch` write) reads the ledger of each
+fork it works on when it starts, and no other. An unreadable entry in one of
+those stops the command with exit `3` naming the file, rather than reading that
+ledger's statements as absent.

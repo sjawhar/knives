@@ -6,8 +6,9 @@
 //!
 //! What a person stated about a branch — its pull request, that it has none
 //! upstream on purpose, what superseded it, what it cannot land before — lives on
-//! the ledger entry that recorded the statement. The store reads those back when
-//! it opens and answers for them, so a reader asks the store either way.
+//! the ledger entry that recorded the statement. The store reads back the ledgers
+//! of the repositories its caller names when it opens, and answers for them, so a
+//! reader asks the store either way.
 //!
 //! Intent cannot be inferred from the repository, and it cannot be inferred from
 //! session working directories either: an agent launched elsewhere may need to
@@ -124,32 +125,40 @@ pub enum StoreError {
 pub struct Store {
     path: PathBuf,
     state: State,
-    /// Every repository's live statements, keyed by repository, read from the
-    /// ledger once when the store opens.
-    statements: BTreeMap<String, Statements>,
+    /// The live statements of each repository the store was opened for, read
+    /// from its ledger once when the store opens.
+    statements: BTreeMap<RepoName, Statements>,
     /// Present only for a store opened to be written. Held, not read: its whole
     /// job is to exist until this value is dropped.
     _lock: Option<FileLock>,
 }
 
 impl Store {
-    /// Read-only. Cheap, and cannot block another agent.
+    /// Read-only. Cannot block another agent.
     ///
+    /// `repos` are the repositories whose branch statements the caller will ask
+    /// about, and only their ledgers are read: a ledger costs a read of its whole
+    /// history, which a command about one fork must not pay for every other.
     /// Either open fails on a ledger it cannot read, as it does on a state file
     /// it cannot read: a statement the store could not read must not answer as
     /// no statement.
-    pub fn open(path: PathBuf) -> Result<Self, StoreError> {
-        Self::read(path, None)
+    pub fn open(path: PathBuf, repos: &[&RepoName]) -> Result<Self, StoreError> {
+        Self::read(path, repos, None)
     }
 
     /// For a read-modify-write. Holds the lock until dropped, and waits the
     /// full claim-writer budget ([`LockWait::CLAIM`]) for another writer.
-    pub fn open_for_update(path: PathBuf) -> Result<Self, StoreError> {
+    /// `repos` as for [`Store::open`].
+    pub fn open_for_update(path: PathBuf, repos: &[&RepoName]) -> Result<Self, StoreError> {
         let lock = FileLock::acquire(&path, LockWait::CLAIM)?;
-        Self::read(path, Some(lock))
+        Self::read(path, repos, Some(lock))
     }
 
-    fn read(path: PathBuf, lock: Option<FileLock>) -> Result<Self, StoreError> {
+    fn read(
+        path: PathBuf,
+        repos: &[&RepoName],
+        lock: Option<FileLock>,
+    ) -> Result<Self, StoreError> {
         let state = if path.exists() {
             let text = std::fs::read_to_string(&path).map_err(|source| StoreError::Read {
                 path: path.clone(),
@@ -162,7 +171,7 @@ impl Store {
         } else {
             State::default()
         };
-        let statements = read_statements(&path.with_file_name("ledger"))?;
+        let statements = read_statements(&path.with_file_name("ledger"), repos)?;
         Ok(Self {
             path,
             state,
@@ -236,9 +245,13 @@ impl Store {
 
     /// Without this statement, a branch we deliberately keep with no upstream
     /// pull request reads as an error in every status report, forever.
+    ///
+    /// This and the other statement accessors panic for a repository the store
+    /// was not opened for: that is a knives bug, and answering "no statement"
+    /// would hide it behind a wrong report.
     pub fn is_fork_only(&self, target: &BranchTarget) -> bool {
         self.stated_in(&target.repo)
-            .is_some_and(|stated| stated.fork_only(target.branch.as_str()))
+            .fork_only(target.branch.as_str())
     }
 
     pub fn record_foreign_parent(&mut self, repo: &RepoName, number: u64, why: &str) {
@@ -268,20 +281,17 @@ impl Store {
     /// and from a deliberate fork-only branch, needs intent. Intent cannot be
     /// recomputed, so `finish --superseded-by` states it.
     pub fn superseded_by(&self, target: &BranchTarget) -> Option<&str> {
-        self.stated_in(&target.repo)?
+        self.stated_in(&target.repo)
             .superseded_by(target.branch.as_str())
     }
 
     /// What `target` cannot land before.
     pub fn dependencies(&self, target: &BranchTarget) -> Vec<Requirement> {
         self.stated_in(&target.repo)
-            .map_or_else(Vec::new, |stated| {
-                stated
-                    .depends(target.branch.as_str())
-                    .iter()
-                    .filter_map(|text| Requirement::parse(text))
-                    .collect()
-            })
+            .depends(target.branch.as_str())
+            .iter()
+            .filter_map(|text| Requirement::parse(text))
+            .collect()
     }
 
     /// The pull request stated for `target`, if any. Overrides inference.
@@ -293,11 +303,19 @@ impl Store {
     /// else, nor somebody else's that we are carrying because ours was
     /// superseded. A statement accepts any number in any state from any author.
     pub fn tracked_pull(&self, target: &BranchTarget) -> Option<u64> {
-        self.stated_in(&target.repo)?.pull(target.branch.as_str())
+        self.stated_in(&target.repo).pull(target.branch.as_str())
     }
 
-    fn stated_in(&self, repo: &RepoName) -> Option<&Statements> {
-        self.statements.get(repo.as_str())
+    #[allow(
+        clippy::panic,
+        reason = "a store asked about a repository it was not opened for is a knives bug; answering no statement would be the silent wrong report this exists to prevent"
+    )]
+    fn stated_in(&self, repo: &RepoName) -> &Statements {
+        self.statements.get(repo).unwrap_or_else(|| {
+            panic!(
+                "knives bug: asked about {repo}'s branch statements, but the store was opened without {repo}'s ledger"
+            )
+        })
     }
 
     pub fn convention_digest(&self, repo: &RepoName, file: &str) -> Option<&str> {
@@ -371,44 +389,24 @@ impl Store {
     }
 }
 
-/// Every repository's live statements, from the ledgers beside the state file.
+/// The live statements of each of `repos`, from its ledger beside the state file.
 ///
 /// `ledger/<repo>/` beside `state.json` is where
 /// [`crate::ledger::default_ledger_path`] puts each repository's ledger, so a
 /// store opened at the default path reads the default ledgers and one opened
-/// anywhere else reads only what sits beside it. A ledger root that does not
-/// exist yet holds no statements. Hidden directories, such as the ledger's own
-/// `.git`, anything that is not a directory, and a name that is not UTF-8 are
-/// not a repository's ledger: knives writes none of them.
-fn read_statements(root: &Path) -> Result<BTreeMap<String, Statements>, StoreError> {
-    let unreadable = |path: &Path, source| StoreError::Read {
-        path: path.to_owned(),
-        source,
-    };
-    let listing = match std::fs::read_dir(root) {
-        Ok(listing) => listing,
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(BTreeMap::new());
-        }
-        Err(source) => return Err(unreadable(root, source)),
-    };
-    let mut statements = BTreeMap::new();
-    for dirent in listing {
-        let path = dirent.map_err(|source| unreadable(root, source))?.path();
-        let Some(repo) = path.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        if repo.starts_with('.')
-            || !std::fs::metadata(&path)
-                .map_err(|source| unreadable(&path, source))?
-                .is_dir()
-        {
-            continue;
-        }
-        let entries = Ledger::at(path.clone()).entries()?;
-        let _ = statements.insert(repo.to_owned(), Statements::from_entries(&entries));
-    }
-    Ok(statements)
+/// anywhere else reads only what sits beside it. A repository nobody has
+/// stated anything about yet has no ledger, and so no statements.
+fn read_statements(
+    root: &Path,
+    repos: &[&RepoName],
+) -> Result<BTreeMap<RepoName, Statements>, StoreError> {
+    repos
+        .iter()
+        .map(|repo| {
+            let entries = Ledger::at(root.join(repo.as_str())).entries()?;
+            Ok(((*repo).clone(), Statements::from_entries(&entries)))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -422,8 +420,9 @@ mod tests {
     use crate::ledger::{Entry, Kind};
     use crate::statement::{Statement, StatementKind};
 
+    /// A store over `dir`'s state file, open for `a-repo`'s statements.
     fn store(dir: &Path) -> Store {
-        Store::open(dir.join("state.json")).unwrap()
+        Store::open(dir.join("state.json"), &[&repo()]).unwrap()
     }
 
     /// Append to `a-repo`'s ledger beside `dir`'s state file an event stating
@@ -479,7 +478,7 @@ mod tests {
             owner: "someone".to_owned(),
             kind: OwnerKind::HarnessSession,
         };
-        let mut first = Store::open(path.clone()).unwrap();
+        let mut first = Store::open(path.clone(), &[]).unwrap();
         let _ = first.claim(&target(), &identity, "fixing the parser");
         first.save().unwrap();
 
@@ -489,7 +488,7 @@ mod tests {
             "state was: {text}"
         );
 
-        let reloaded = Store::open(path).unwrap();
+        let reloaded = Store::open(path, &[]).unwrap();
         let claims = reloaded.claims(None);
         assert_eq!(claims.len(), 1);
         assert_eq!(claims[0].why, "fixing the parser");
@@ -507,7 +506,7 @@ mod tests {
         )
         .unwrap();
 
-        let store = Store::open(path).unwrap();
+        let store = Store::open(path, &[]).unwrap();
         let claims = store.claims(None);
 
         assert_eq!(claims.len(), 1);
@@ -583,8 +582,9 @@ mod tests {
             Some("CI we want here but not upstream"),
         );
 
-        // When: the store opens
-        let subject = store(dir.path());
+        // When: the store opens for this repository and one with no ledger
+        let other = RepoName::new("other-repo");
+        let subject = Store::open(dir.path().join("state.json"), &[&repo(), &other]).unwrap();
 
         // Then: each accessor answers from the ledger
         assert_eq!(subject.tracked_pull(&target()), Some(4545));
@@ -605,12 +605,27 @@ mod tests {
         assert!(subject.is_fork_only(&BranchTarget::new(repo(), BranchName::new("feat/ci-only"))));
         assert!(!subject.is_fork_only(&target()));
 
-        // And: the same branch name in another repository states nothing
-        let elsewhere =
-            BranchTarget::new(RepoName::new("other-repo"), BranchName::new("feat/alpha"));
+        // And: the same branch name in a repository nobody stated anything about
+        // states nothing
+        let elsewhere = BranchTarget::new(other, BranchName::new("feat/alpha"));
         assert_eq!(subject.tracked_pull(&elsewhere), None);
         assert_eq!(subject.superseded_by(&elsewhere), None);
         assert!(subject.dependencies(&elsewhere).is_empty());
+        assert!(!subject.is_fork_only(&elsewhere));
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "asked about other-repo's branch statements, but the store was opened without other-repo's ledger"
+    )]
+    fn asking_about_a_repository_the_store_was_not_opened_for_is_a_bug() {
+        // Answering "no statement" here would hide the bug behind a wrong
+        // report: a fork-only branch shown as one missing its pull request.
+        let dir = tempfile::tempdir().unwrap();
+        let _ = store(dir.path()).is_fork_only(&BranchTarget::new(
+            RepoName::new("other-repo"),
+            BranchName::new("feat/alpha"),
+        ));
     }
 
     #[test]
@@ -653,25 +668,27 @@ mod tests {
         .unwrap();
         let path = dir.path().join("state.json");
 
-        let read = Store::open(path.clone()).unwrap_err();
+        let read = Store::open(path.clone(), &[&repo()]).unwrap_err();
         assert!(
             matches!(read, StoreError::Ledger(LedgerError::Parse { .. })),
             "was: {read}"
         );
-        let write = Store::open_for_update(path).unwrap_err();
+        let write = Store::open_for_update(path, &[&repo()]).unwrap_err();
         assert!(matches!(write, StoreError::Ledger(_)), "was: {write}");
     }
 
     #[test]
-    fn only_a_repository_ledger_directory_is_read() {
-        // The ledger root is a git repository in practice, and an editor or a sync
-        // tool can leave a file beside the repositories' directories. Each of these
-        // holds a file that would fail to parse as an entry.
+    fn only_the_ledgers_of_the_repositories_named_are_read() {
+        // A ledger costs a read of its whole history, so a command about one fork
+        // reads only that fork's. Here every other ledger would fail the open.
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("ledger");
-        std::fs::create_dir_all(root.join(".git")).unwrap();
-        std::fs::write(root.join(".git").join("HEAD.md"), "ref: refs/heads/main\n").unwrap();
-        std::fs::write(root.join("README.md"), "not a repository's ledger\n").unwrap();
+        let other = dir.path().join("ledger").join("other-repo");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(
+            other.join("20260815T221403.000000000Z-0000.md"),
+            "not a ledger entry at all\n",
+        )
+        .unwrap();
         state(
             dir.path(),
             "2026-08-15T22:14:01Z",
@@ -681,6 +698,7 @@ mod tests {
         );
 
         assert_eq!(store(dir.path()).tracked_pull(&target()), Some(4545));
+        assert!(Store::open(dir.path().join("state.json"), &[]).is_ok());
     }
 
     #[test]
@@ -702,7 +720,7 @@ mod tests {
         );
 
         assert_eq!(
-            Store::open(default_state_path())
+            Store::open(default_state_path(), &[&repo()])
                 .unwrap()
                 .tracked_pull(&target()),
             Some(1157),
@@ -724,7 +742,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut subject = Store::open(path.clone()).unwrap();
+        let mut subject = Store::open(path.clone(), &[&repo()]).unwrap();
         assert_eq!(subject.tracked_pull(&target()), None);
         assert!(!subject.is_fork_only(&target()));
         assert_eq!(subject.superseded_by(&target()), None);
@@ -750,7 +768,7 @@ mod tests {
         let path = dir.path().join("state.json");
         std::fs::write(&path, r#"{"claims":{},"from_the_future":{"k":"v"}}"#).unwrap();
         // When: an older binary loads, changes, and saves it
-        let mut subject = Store::open(path.clone()).unwrap();
+        let mut subject = Store::open(path.clone(), &[]).unwrap();
         let _ = subject.claim(&target(), &os_user("x"), "w");
         subject.save().unwrap();
         // Then: the unknown key is still there
@@ -804,11 +822,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.json");
         {
-            let mut store = Store::open_for_update(path.clone()).unwrap();
+            let mut store = Store::open_for_update(path.clone(), &[]).unwrap();
             store.record_comment_mark(&RepoName::new("a-repo"), 7, "2026-07-30T00:00:00Z");
             store.save().unwrap();
         }
-        let store = Store::open(path).unwrap();
+        let store = Store::open(path, &[]).unwrap();
         assert_eq!(
             store.comment_mark(&RepoName::new("a-repo"), 7),
             Some("2026-07-30T00:00:00Z")
@@ -821,11 +839,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.json");
         {
-            let mut subject = Store::open_for_update(path.clone()).unwrap();
+            let mut subject = Store::open_for_update(path.clone(), &[]).unwrap();
             subject.record_pull_state(&RepoName::new("a-repo"), 7, ForgeState::Merged);
             subject.save().unwrap();
         }
-        let subject = Store::open(path).unwrap();
+        let subject = Store::open(path, &[]).unwrap();
         assert_eq!(
             subject.pull_state(&RepoName::new("a-repo"), 7),
             Some("MERGED")
@@ -838,13 +856,13 @@ mod tests {
         // Reading cannot lose a write, so a held writer lock keeps out writers only.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.json");
-        let writer = Store::open_for_update(path.clone()).unwrap();
+        let writer = Store::open_for_update(path.clone(), &[]).unwrap();
 
-        assert!(Store::open(path.clone()).is_ok());
+        assert!(Store::open(path.clone(), &[]).is_ok());
 
         drop(writer);
         assert!(
-            Store::open_for_update(path).is_ok(),
+            Store::open_for_update(path, &[]).is_ok(),
             "the lock outlived its holder"
         );
     }

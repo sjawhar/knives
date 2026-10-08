@@ -81,7 +81,11 @@ fn one_batch_answers_review_age_and_checks_for_every_branch_at_once() {
         ..knives::forge::fake::FakeForge::default()
     };
     let state = tempfile::tempdir().expect("state directory");
-    let store = Store::open(state.path().join("state.json")).expect("open store");
+    let store = Store::open(
+        state.path().join("state.json"),
+        &[&knives::ids::RepoName::new("demo")],
+    )
+    .expect("open store");
 
     // When: status gathers
     let report = status::gather(
@@ -147,7 +151,7 @@ fn a_measured_gather_reports_the_same_report_and_a_total_that_covers_its_phases(
     let name = knives::ids::RepoName::new("demo");
     let entry = lab_entry(&lab);
     let state = tempfile::tempdir().expect("state directory");
-    let store = Store::open(state.path().join("state.json")).expect("open store");
+    let store = Store::open(state.path().join("state.json"), &[&name]).expect("open store");
     let options = || knives::commands::status::Options {
         probe: true,
         forge: None,
@@ -320,7 +324,11 @@ fn the_forge_is_asked_once_for_the_whole_report_with_one_entry_per_number() {
         asked: std::sync::Mutex::new(Vec::new()),
     };
     let state = tempfile::tempdir().expect("state directory");
-    let store = Store::open(state.path().join("state.json")).expect("open store");
+    let store = Store::open(
+        state.path().join("state.json"),
+        &[&knives::ids::RepoName::new("demo")],
+    )
+    .expect("open store");
 
     let report = status::gather(
         &lab::lab_fork(&lab, "demo", &lab_entry(&lab)),
@@ -383,7 +391,11 @@ fn a_failed_facts_batch_clears_review_and_check_cells() {
         ..knives::forge::fake::FakeForge::default()
     };
     let state = tempfile::tempdir().expect("state directory");
-    let store = Store::open(state.path().join("state.json")).expect("open store");
+    let store = Store::open(
+        state.path().join("state.json"),
+        &[&knives::ids::RepoName::new("demo")],
+    )
+    .expect("open store");
 
     let report = status::gather(
         &lab::lab_fork(&lab, "demo", &lab_entry(&lab)),
@@ -440,7 +452,7 @@ fn a_consulted_false_report_carries_an_unanswered_stated_pull() {
         StatementKind::Pull,
         Some("42"),
     );
-    let store = Store::open(state.path().join("state.json")).expect("open store");
+    let store = Store::open(state.path().join("state.json"), &[&name]).expect("open store");
 
     let report = status::gather(
         &lab::lab_fork(&lab, name.as_str(), &lab_entry(&lab)),
@@ -499,7 +511,7 @@ fn stated_pulls_and_dependencies_are_answered_from_the_one_batch() {
         StatementKind::Depends,
         Some(&format!("{name}#43")),
     );
-    let store = Store::open(state.path().join("state.json")).expect("open store");
+    let store = Store::open(state.path().join("state.json"), &[&name]).expect("open store");
     let registry = Registry {
         repos: BTreeMap::from([("demo".to_owned(), lab_entry(&lab))]),
         ..Registry::default()
@@ -556,7 +568,7 @@ fn landed_verdicts_come_from_the_cache_when_the_key_matches() {
     let forge = knives::forge::fake::FakeForge::default();
     let state = tempfile::tempdir().expect("state directory");
     let cache = tempfile::tempdir().expect("cache directory");
-    let store = Store::open(state.path().join("state.json")).expect("open store");
+    let store = Store::open(state.path().join("state.json"), &[&name]).expect("open store");
     let options = || knives::commands::status::Options {
         probe: true,
         forge: Some(&forge),
@@ -627,7 +639,7 @@ fn a_probe_free_run_preserves_the_landed_section() {
     let forge = knives::forge::fake::FakeForge::default();
     let state = tempfile::tempdir().expect("state directory");
     let cache = tempfile::tempdir().expect("cache directory");
-    let store = Store::open(state.path().join("state.json")).expect("open store");
+    let store = Store::open(state.path().join("state.json"), &[&name]).expect("open store");
     let with_probe = || knives::commands::status::Options {
         probe: true,
         forge: Some(&forge),
@@ -685,7 +697,7 @@ fn an_unresolvable_trunk_fails_loudly_and_touches_no_landed_cache() {
     let forge = knives::forge::fake::FakeForge::default();
     let state = tempfile::tempdir().expect("state directory");
     let cache = tempfile::tempdir().expect("cache directory");
-    let store = Store::open(state.path().join("state.json")).expect("open store");
+    let store = Store::open(state.path().join("state.json"), &[&name]).expect("open store");
     let options = || knives::commands::status::Options {
         probe: true,
         forge: Some(&forge),
@@ -745,7 +757,8 @@ fn parallel_landed_probes_answer_exactly_what_serial_ones_did() {
     lab.fetch_work();
     let entry = lab_entry(&lab);
     let state = tempfile::tempdir().expect("state directory");
-    let store = Store::open(state.path().join("state.json")).expect("open store");
+    let name = knives::ids::RepoName::new("demo");
+    let store = Store::open(state.path().join("state.json"), &[&name]).expect("open store");
     let options = |workers: usize| knives::commands::status::Options {
         probe: true,
         forge: None,
@@ -754,7 +767,6 @@ fn parallel_landed_probes_answer_exactly_what_serial_ones_did() {
         ledger: None,
         workers,
     };
-    let name = knives::ids::RepoName::new("demo");
 
     // When: the same repository is gathered serially and on several threads
     let serial = status::gather(

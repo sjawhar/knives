@@ -137,7 +137,7 @@ pub fn run(
         eprintln!("{repo_name}: {line}");
         return Ok(Exit::Usage);
     }
-    let mut store = Store::open_for_update(default_state_path())?;
+    let mut store = Store::open_for_update(default_state_path(), &[repo_name])?;
     let cwd = std::env::current_dir()?;
     let destination = workspace_path(fork, branch);
     let in_claimed_workspace = possesses(&cwd, fork, branch);

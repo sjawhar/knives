@@ -311,7 +311,7 @@ pub fn run(request: &Request<'_>, output: crate::cli::Output) -> anyhow::Result<
         Some(text) => {
             // The store is read, never written: a notch changes no intent, and a
             // ledger append needs no store lock.
-            let store = Store::open(default_state_path())?;
+            let store = Store::open(default_state_path(), &[repo])?;
             let pr = request
                 .pr
                 .or_else(|| pr_subject(request.subject))

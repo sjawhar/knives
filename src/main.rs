@@ -473,7 +473,7 @@ fn run_consumers(
 
 /// Reconcile one fork's local bookmarks with the live refs on their owning remotes.
 fn run_pushed(fork: &Fork<'_>, branches: &[String], output: Output) -> anyhow::Result<Exit> {
-    let store = Store::open(default_state_path())?;
+    let store = Store::open(default_state_path(), &[&fork.name])?;
     let report = pushed::gather(fork, &store, branches);
     if let Some(payload) = knives::cli::machine_payload(output, &report)? {
         println!("{payload}");
@@ -494,7 +494,7 @@ fn run_audit(
         Ok(chosen) => chosen,
         Err(exit) => return Ok(exit),
     };
-    let store = Store::open(default_state_path())?;
+    let store = Store::open(default_state_path(), &placed(&chosen))?;
     let cli_forge = CliForge;
     let forge = use_forge.then_some(&cli_forge as &dyn Forge);
     let cache_root = knives::forge_cache::cache_root();
@@ -626,6 +626,18 @@ enum Selected<'a> {
         entry: &'a RepoEntry,
         problem: String,
     },
+}
+
+/// The repositories among `chosen` that a verb will gather, and so whose branch
+/// statements it will ask the store about. An unplaced entry is never opened.
+fn placed<'s>(chosen: &'s [Selected<'_>]) -> Vec<&'s RepoName> {
+    chosen
+        .iter()
+        .filter_map(|chosen| match chosen {
+            Selected::Bound(fork) => Some(&fork.name),
+            Selected::Unplaced { .. } => None,
+        })
+        .collect()
 }
 
 /// Every entry the scan of `home` placed, and what the scan could not read,
@@ -783,7 +795,7 @@ fn run_status(ground: Ground<'_>, view: StatusView<'_>) -> anyhow::Result<Exit> 
         Ok(list) => list,
         Err(exit) => return Ok(exit),
     };
-    let store = Store::open(default_state_path())?;
+    let store = Store::open(default_state_path(), &placed(&chosen))?;
     let cli_forge = CliForge;
     let forge: Option<&dyn Forge> = if use_forge { Some(&cli_forge) } else { None };
     let cache_root = knives::forge_cache::cache_root();
@@ -867,7 +879,8 @@ fn run_status(ground: Ground<'_>, view: StatusView<'_>) -> anyhow::Result<Exit> 
 }
 
 fn run_preflight(fork: &Fork<'_>) -> anyhow::Result<Exit> {
-    let mut store = Store::open_for_update(default_state_path())?;
+    // Convention digests and claims only: no branch statement is asked about.
+    let mut store = Store::open_for_update(default_state_path(), &[])?;
     let forge = CliForge;
     let cache_root = knives::forge_cache::cache_root();
     let report = preflight::gather(preflight::GatherInput {
@@ -892,7 +905,7 @@ fn run_sync(
         Ok(list) => list,
         Err(exit) => return Ok(exit),
     };
-    let mut store = Store::open_for_update(default_state_path())?;
+    let mut store = Store::open_for_update(default_state_path(), &placed(&chosen))?;
     let cli_forge = CliForge;
     let forge = use_forge.then_some(&cli_forge as &dyn Forge);
     let cache_root = knives::forge_cache::cache_root();

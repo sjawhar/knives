@@ -41,7 +41,8 @@ fn sync_fails_closed_when_the_facts_batch_fails() {
         ..knives::forge::fake::FakeForge::default()
     };
     let state = tempfile::tempdir().expect("state directory");
-    let mut store = Store::open_for_update(state.path().join("state.json")).expect("store");
+    let mut store =
+        Store::open_for_update(state.path().join("state.json"), &[&name]).expect("store");
     let scribe = knives::ledger::Scribe::new(
         knives::ledger::Ledger::at(state.path().join("ledger")),
         name,
@@ -87,7 +88,8 @@ fn a_listed_state_wins_and_a_vanished_number_is_answered_by_the_batch() {
         ..knives::forge::fake::FakeForge::default()
     };
     let state = tempfile::tempdir().expect("state directory");
-    let mut store = Store::open_for_update(state.path().join("state.json")).expect("store");
+    let mut store =
+        Store::open_for_update(state.path().join("state.json"), &[&name]).expect("store");
     store.record_pull_head(&name, 43, "previous");
     let scribe = knives::ledger::Scribe::new(
         knives::ledger::Ledger::at(state.path().join("ledger")),
@@ -158,7 +160,8 @@ fn sync_records_one_event_for_each_pull_request_that_moved() {
         ..knives::forge::fake::FakeForge::default()
     };
     let state = tempfile::tempdir().expect("state directory");
-    let mut store = Store::open_for_update(state.path().join("state.json")).expect("open store");
+    let mut store =
+        Store::open_for_update(state.path().join("state.json"), &[&name]).expect("open store");
     // Every one of them was seen before: a first sighting is recorded silently,
     // whatever the forge already did to it, so only prior sightings can move.
     store.record_pull_head(&name, 10, "head-10");
@@ -224,7 +227,8 @@ fn sync_records_a_settled_pull_request_once_across_repeated_runs() {
         ..knives::forge::fake::FakeForge::default()
     };
     let state = tempfile::tempdir().expect("state directory");
-    let mut store = Store::open_for_update(state.path().join("state.json")).expect("open store");
+    let mut store =
+        Store::open_for_update(state.path().join("state.json"), &[&name]).expect("open store");
     // Seen while open, so the merge is a transition rather than a first sighting.
     store.record_pull_head(&name, 10, "head-10");
     let ledger = knives::ledger::Ledger::at(state.path().join("demo"));
@@ -284,7 +288,8 @@ fn sync_records_an_advanced_pull_request_then_its_merge() {
         ..knives::forge::fake::FakeForge::default()
     };
     let state = tempfile::tempdir().expect("state directory");
-    let mut store = Store::open_for_update(state.path().join("state.json")).expect("open store");
+    let mut store =
+        Store::open_for_update(state.path().join("state.json"), &[&name]).expect("open store");
     store.record_pull_head(&name, 12, "older");
     let ledger = knives::ledger::Ledger::at(state.path().join("demo"));
     let scribe =
@@ -343,7 +348,8 @@ fn sync_records_each_consecutive_advance() {
         ..knives::forge::fake::FakeForge::default()
     };
     let state = tempfile::tempdir().expect("state directory");
-    let mut store = Store::open_for_update(state.path().join("state.json")).expect("open store");
+    let mut store =
+        Store::open_for_update(state.path().join("state.json"), &[&name]).expect("open store");
     store.record_pull_head(&name, 12, "head-a");
     let ledger = knives::ledger::Ledger::at(state.path().join("demo"));
     let scribe =

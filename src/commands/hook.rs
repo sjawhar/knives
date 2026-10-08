@@ -416,7 +416,8 @@ pub(crate) fn owner_for(repo: Option<&RepoName>) -> anyhow::Result<Option<String
     let Some(repo) = repo else {
         return Ok(None);
     };
-    let store = Store::open(default_state_path())?;
+    // Claims and the current agent only: no branch statement is asked about.
+    let store = Store::open(default_state_path(), &[])?;
     if let Some(owner) = store.current_agent() {
         return Ok(Some(owner.to_owned()));
     }
@@ -672,7 +673,7 @@ fn notice_if_requested(
     if !requested {
         return Ok(None);
     }
-    let store = Store::open(default_state_path())?;
+    let store = Store::open(default_state_path(), &[])?;
     let claims = all_claims(&store);
     let digest = notice_digest(&repo.name, &repo.root, &claims);
     if state.notice_seen(&repo.root, &digest) {

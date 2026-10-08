@@ -613,8 +613,8 @@ mod tests {
             8,
             "the current open pull request is primary"
         );
-        let store = Store::open(cache.path().join("state.json")).expect("open state");
         let repo = RepoName::new("test-repo");
+        let store = Store::open(cache.path().join("state.json"), &[&repo]).expect("open state");
         let mut report = Report::default();
         branch_rows(
             RowInput {

@@ -1200,7 +1200,8 @@ mod comment_activity_tests {
         let temp = TempDir::new().unwrap();
         let entry = local_entry(&temp);
         let fork = Fork::at("test-repo", &entry, &temp.path().join("work"));
-        let mut store = Store::open_for_update(temp.path().join("state.json")).unwrap();
+        let mut store =
+            Store::open_for_update(temp.path().join("state.json"), &[&fork.name]).unwrap();
 
         let report = sync_repo(SyncInput {
             fork: &fork,
@@ -1229,7 +1230,8 @@ mod comment_activity_tests {
         let mut entry = local_entry(&temp);
         entry.upstream = temp.path().join("missing-upstream").display().to_string();
         let fork = Fork::at("test-repo", &entry, &temp.path().join("work"));
-        let mut store = Store::open_for_update(temp.path().join("state.json")).unwrap();
+        let mut store =
+            Store::open_for_update(temp.path().join("state.json"), &[&fork.name]).unwrap();
         let forge = ErroringForge {
             pull_requests: Vec::new(),
             newest_comments: BTreeMap::new(),
@@ -1262,7 +1264,8 @@ mod comment_activity_tests {
         let temp = TempDir::new().unwrap();
         let entry = local_entry(&temp);
         let fork = Fork::at("test-repo", &entry, &temp.path().join("work"));
-        let mut store = Store::open_for_update(temp.path().join("state.json")).unwrap();
+        let mut store =
+            Store::open_for_update(temp.path().join("state.json"), &[&fork.name]).unwrap();
 
         let report = sync_repo(SyncInput {
             fork: &fork,
@@ -1301,7 +1304,7 @@ mod comment_activity_tests {
             error_on_comment: None,
         };
 
-        let mut store = Store::open_for_update(store_path.clone()).unwrap();
+        let mut store = Store::open_for_update(store_path.clone(), &[&fork.name]).unwrap();
         store.record_comment_mark(&repo_name, 42, "2026-07-29T10:00:00Z");
         let report1 = sync_repo(SyncInput {
             fork: &fork,
@@ -1336,7 +1339,7 @@ mod comment_activity_tests {
             error_on_comment: None,
         };
 
-        let mut store = Store::open(store_path).unwrap();
+        let mut store = Store::open(store_path, &[&fork.name]).unwrap();
         let report2 = sync_repo(SyncInput {
             fork: &fork,
             store: &mut store,
@@ -1370,7 +1373,8 @@ mod comment_activity_tests {
             newest_comments: BTreeMap::new(),
             error_on_comment: Some(42),
         };
-        let mut store = Store::open_for_update(temp.path().join("state.json")).unwrap();
+        let mut store =
+            Store::open_for_update(temp.path().join("state.json"), &[&fork.name]).unwrap();
         let report = sync_repo(SyncInput {
             fork: &fork,
             store: &mut store,
@@ -1409,7 +1413,7 @@ mod comment_activity_tests {
             newest_comments: BTreeMap::from([(42, "2026-07-30T10:00:00Z".to_owned())]),
             error_on_comment: None,
         };
-        let mut store = Store::open_for_update(store_path).unwrap();
+        let mut store = Store::open_for_update(store_path, &[&fork.name]).unwrap();
 
         // When: the first sync observes the historical comment
         let report = sync_repo(SyncInput {
@@ -1449,7 +1453,7 @@ mod comment_activity_tests {
             newest_comments: BTreeMap::from([(42, "2026-07-30T10:00:00Z".to_owned())]),
             error_on_comment: None,
         };
-        let mut store = Store::open_for_update(store_path).unwrap();
+        let mut store = Store::open_for_update(store_path, &[&fork.name]).unwrap();
         // A first sighting of a closed pull is `New`, not `Closed` (that
         // history belongs to the forge). Seed a prior open state so this
         // sync observes the open-to-closed transition under test.
@@ -1492,7 +1496,7 @@ mod comment_activity_tests {
             newest_comments: BTreeMap::new(),
             error_on_comment: None,
         };
-        let mut store = Store::open_for_update(store_path).unwrap();
+        let mut store = Store::open_for_update(store_path, &[&fork.name]).unwrap();
         let ledger = crate::ledger::Ledger::at(temp.path().join("ledger"));
 
         let report = sync_repo(SyncInput {
@@ -1537,7 +1541,7 @@ mod comment_activity_tests {
             newest_comments: BTreeMap::new(),
             error_on_comment: None,
         };
-        let mut store = Store::open_for_update(store_path.clone()).unwrap();
+        let mut store = Store::open_for_update(store_path.clone(), &[&fork.name]).unwrap();
         sync_repo(SyncInput {
             fork: &fork,
             store: &mut store,
@@ -1554,7 +1558,7 @@ mod comment_activity_tests {
             newest_comments: BTreeMap::new(),
             error_on_comment: None,
         };
-        let mut store = Store::open(store_path).unwrap();
+        let mut store = Store::open(store_path, &[&fork.name]).unwrap();
         let report = sync_repo(SyncInput {
             fork: &fork,
             store: &mut store,
@@ -1593,7 +1597,7 @@ mod comment_activity_tests {
             newest_comments: BTreeMap::new(),
             error_on_comment: None,
         };
-        let mut store = Store::open_for_update(store_path.clone()).unwrap();
+        let mut store = Store::open_for_update(store_path.clone(), &[&fork.name]).unwrap();
         sync_repo(SyncInput {
             fork: &fork,
             store: &mut store,
@@ -1612,7 +1616,7 @@ mod comment_activity_tests {
             newest_comments: BTreeMap::new(),
             error_on_comment: None,
         };
-        let mut store = Store::open(store_path).unwrap();
+        let mut store = Store::open(store_path, &[&fork.name]).unwrap();
         let report = sync_repo(SyncInput {
             fork: &fork,
             store: &mut store,
@@ -1652,7 +1656,7 @@ mod comment_activity_tests {
             newest_comments: BTreeMap::new(),
             error_on_comment: None,
         };
-        let mut store = Store::open_for_update(store_path.clone()).unwrap();
+        let mut store = Store::open_for_update(store_path.clone(), &[&fork.name]).unwrap();
         sync_repo(SyncInput {
             fork: &fork,
             store: &mut store,
@@ -1671,7 +1675,7 @@ mod comment_activity_tests {
             newest_comments: BTreeMap::new(),
             error_on_comment: None,
         };
-        let mut store = Store::open(store_path).unwrap();
+        let mut store = Store::open(store_path, &[&fork.name]).unwrap();
         let report = sync_repo(SyncInput {
             fork: &fork,
             store: &mut store,
@@ -1741,7 +1745,7 @@ mod comment_activity_tests {
             &[(42, "aaaa"), (43, "aaaa")],
             &[(42, "unchanged"), (43, "advanced")],
         );
-        let mut store = Store::open_for_update(store_path).unwrap();
+        let mut store = Store::open_for_update(store_path, &[&fork.name]).unwrap();
 
         let report = sync_repo(SyncInput {
             fork: &fork,
@@ -1811,7 +1815,7 @@ mod comment_activity_tests {
         // takes. With no head to fall back on, the record is the only evidence
         // that this pull request was seen before.
         write_state_left_by_an_earlier_knives(&store_path, &[], &[(42, "unchanged")]);
-        let mut store = Store::open_for_update(store_path).unwrap();
+        let mut store = Store::open_for_update(store_path, &[&fork.name]).unwrap();
 
         let report = sync_repo(SyncInput {
             fork: &fork,
@@ -1855,7 +1859,7 @@ mod comment_activity_tests {
         // Given: a record in a spelling no version of knives ever wrote, on a
         // pull request whose head has since moved.
         write_state_left_by_an_earlier_knives(&store_path, &[(42, "bbbb")], &[(42, "garbage")]);
-        let mut store = Store::open_for_update(store_path).unwrap();
+        let mut store = Store::open_for_update(store_path, &[&fork.name]).unwrap();
 
         let report = sync_repo(SyncInput {
             fork: &fork,
@@ -1901,7 +1905,7 @@ mod comment_activity_tests {
             &[(42, "aaaa"), (43, "aaaa")],
             &[(42, "unchanged"), (43, "garbage")],
         );
-        let mut store = Store::open_for_update(store_path).unwrap();
+        let mut store = Store::open_for_update(store_path, &[&repo_name]).unwrap();
         let seen = store.pull_heads(&repo_name);
         let heads = BTreeMap::from([(42, "aaaa".to_owned()), (43, "aaaa".to_owned())]);
         let run = |store: &mut Store| {

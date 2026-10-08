@@ -244,7 +244,7 @@ fn status_with_the_landed_probe_reports_a_merged_branch_and_leaves_no_trace() {
     );
     let name = knives::ids::RepoName::new("a-repo");
     let temp = std::env::temp_dir().join(format!("knives-status-{}", std::process::id()));
-    let store = knives::store::Store::open(temp.join("state.json")).expect("store");
+    let store = knives::store::Store::open(temp.join("state.json"), &[&name]).expect("store");
 
     let before = lab.revision(&lab.work, "children(main@upstream)", "commit_id ++ \"\\n\"");
     let report = knives::commands::status::gather(
@@ -341,8 +341,8 @@ fn status_reports_branch_overlap_after_upstream_advances_without_landed_probe() 
         .parent()
         .expect("lab work directory has a parent")
         .join("state.json");
-    let store = knives::store::Store::open(store_path).expect("store");
     let name = knives::ids::RepoName::new("a-repo");
+    let store = knives::store::Store::open(store_path, &[&name]).expect("store");
 
     // When: status deliberately skips only the landed replay
     let report = knives::commands::status::gather(
@@ -386,7 +386,7 @@ fn status_reports_a_branch_carried_elsewhere() {
     );
     let name = knives::ids::RepoName::new("a-repo");
     let temp = std::env::temp_dir().join(format!("knives-status-{}", std::process::id()));
-    let store = knives::store::Store::open(temp.join("state.json")).expect("store");
+    let store = knives::store::Store::open(temp.join("state.json"), &[&name]).expect("store");
 
     // When: status gathers the branch report
     let report = knives::commands::status::gather(
@@ -430,7 +430,7 @@ fn status_reports_a_carrier_for_a_closed_pull_request() {
     );
     let name = knives::ids::RepoName::new("a-repo");
     let temp = std::env::temp_dir().join(format!("knives-status-{}", std::process::id()));
-    let store = knives::store::Store::open(temp.join("state.json")).expect("store");
+    let store = knives::store::Store::open(temp.join("state.json"), &[&name]).expect("store");
     let forge = knives::forge::fake::FakeForge {
         pull_requests: std::iter::once((
             BranchName::new("feat/alpha"),
@@ -490,7 +490,7 @@ fn status_does_not_report_trunk_as_a_carrier_without_landed_probe() {
     );
     let name = knives::ids::RepoName::new("a-repo");
     let temp = std::env::temp_dir().join(format!("knives-status-{}", std::process::id()));
-    let store = knives::store::Store::open(temp.join("state.json")).expect("store");
+    let store = knives::store::Store::open(temp.join("state.json"), &[&name]).expect("store");
 
     // When: status skips the landed probe
     let report = knives::commands::status::gather(
@@ -530,7 +530,7 @@ fn status_carries_each_branchs_newest_notch_in_json_and_in_text() {
         lab.work.display().to_string(),
     );
     let state = tempfile::tempdir().expect("state directory");
-    let store = Store::open(state.path().join("state.json")).expect("open store");
+    let store = Store::open(state.path().join("state.json"), &[&name]).expect("open store");
     let ledger = knives::ledger::Ledger::at(state.path().join("demo"));
     let scribe = knives::ledger::Scribe::new(
         ledger.clone(),
@@ -641,7 +641,7 @@ fn status_carries_repo_level_notches_in_json_and_text() {
     let name = knives::ids::RepoName::new("demo");
     let entry = lab_entry(&lab);
     let state = tempfile::tempdir().expect("state directory");
-    let store = Store::open(state.path().join("state.json")).expect("open store");
+    let store = Store::open(state.path().join("state.json"), &[&name]).expect("open store");
     let ledger = knives::ledger::Ledger::at(state.path().join("demo"));
     let scribe = knives::ledger::Scribe::new(
         ledger.clone(),
@@ -693,7 +693,11 @@ fn status_reports_a_repo_level_immutable_heads_rule_that_differs_from_the_forks(
         "trunk() | tags() | bookmarks(exact:\"keep\")",
     ]);
     let state = tempfile::tempdir().expect("state directory");
-    let store = Store::open(state.path().join("state.json")).expect("open store");
+    let store = Store::open(
+        state.path().join("state.json"),
+        &[&knives::ids::RepoName::new("demo")],
+    )
+    .expect("open store");
 
     // When: status gathers without a forge
     let report = status::gather(
@@ -735,7 +739,11 @@ fn status_is_silent_about_the_forks_own_immutable_heads_rule() {
     let started = lab::knives_start(&lab, &home, "feat/beta");
     assert!(started.status.success(), "{started:?}");
     let state = tempfile::tempdir().expect("state directory");
-    let store = Store::open(state.path().join("state.json")).expect("open store");
+    let store = Store::open(
+        state.path().join("state.json"),
+        &[&knives::ids::RepoName::new("demo")],
+    )
+    .expect("open store");
 
     // When: status gathers without a forge
     let report = status::gather(

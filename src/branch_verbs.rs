@@ -86,7 +86,7 @@ pub(crate) fn run_finish(
         eprintln!("{}: {line}", fork.name);
         return Ok(Exit::Usage);
     }
-    let mut store = Store::open_for_update(default_state_path())?;
+    let mut store = Store::open_for_update(default_state_path(), &[&fork.name])?;
     let workspace = knives::commands::wip::workspace_for(branch.as_str());
     let directory = workspace_path(fork, branch);
     let forced_release = match finish_claim_gate(fork, target, &store, options, bound)? {
@@ -305,7 +305,7 @@ pub(crate) fn run_track(
     // Opened for update to hold the lock while the statement is read and the next
     // one appended: a concurrent `track` then reads this one's statement rather
     // than the one before it. Nothing here writes the state file.
-    let store = Store::open_for_update(default_state_path())?;
+    let store = Store::open_for_update(default_state_path(), &[&fork.name])?;
     // Read before the change, so a withdrawal is still filed under the number it
     // withdrew.
     let stated = store.tracked_pull(target);
@@ -409,7 +409,7 @@ pub(crate) fn run_depends(
     // Held while the list is read and the next statement appended, so two
     // concurrent `depends` each add to the other's list rather than racing.
     // Nothing here writes the state file.
-    let store = Store::open_for_update(default_state_path())?;
+    let store = Store::open_for_update(default_state_path(), &[&fork.name])?;
     let required = with_requirements(&store.dependencies(target), &requirements);
     let pr = store.tracked_pull(target);
     let listed: Vec<String> = requirements.iter().map(ToString::to_string).collect();
