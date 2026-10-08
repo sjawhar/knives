@@ -115,8 +115,8 @@ pub struct Entry {
     /// no anchor; a tip that has moved tells the reader to re-verify.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchor: Option<String>,
-    /// The pull request stated for the subject, from `tracked_pulls` only. Never
-    /// a forge call: this is a write path.
+    /// The pull request stated for the subject, from its live `pull` statement
+    /// only. Never a forge call: this is a write path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pr: Option<u64>,
     /// The parent set a release cut or edit left behind, one item per parent

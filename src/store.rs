@@ -1,9 +1,13 @@
 //! The things no amount of computing can recover.
 //!
 //! Detectors are cheap and local, so nothing derived is cached here. What lives
-//! here is intent: who is working on what and why, which branches we keep with
-//! no upstream pull request on purpose, why we carry someone else's pull request
-//! as a release parent, and where a superseded pull request went.
+//! here is intent: who is working on what and why, and why we carry someone
+//! else's pull request as a release parent.
+//!
+//! What a person stated about a branch — its pull request, that it has none
+//! upstream on purpose, what superseded it, what it cannot land before — lives on
+//! the ledger entry that recorded the statement. The store reads those back when
+//! it opens and answers for them, so a reader asks the store either way.
 //!
 //! Intent cannot be inferred from the repository, and it cannot be inferred from
 //! session working directories either: an agent launched elsewhere may need to
@@ -17,7 +21,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::default_config_path;
 use crate::ids::{BranchTarget, RepoName, Requirement};
+use crate::ledger::{Ledger, LedgerError};
 use crate::lock::{FileLock, LockError, LockWait};
+use crate::statement::Statements;
 
 use crate::commands::claim::Identity;
 use crate::commands::sync::ForgeState;
@@ -62,35 +68,13 @@ pub struct State {
     #[serde(default)]
     pub claims: BTreeMap<String, Claim>,
     #[serde(default)]
-    pub fork_only: BTreeMap<String, String>,
-    #[serde(default)]
     pub foreign_parents: BTreeMap<String, String>,
-    #[serde(default)]
-    pub superseded: BTreeMap<String, String>,
     #[serde(default)]
     pub pull_heads: BTreeMap<String, BTreeMap<String, String>>,
     /// Digest of each convention file the last time we looked, so preflight can
     /// say "this changed since you last read it" rather than only "it exists".
     #[serde(default)]
     pub conventions: BTreeMap<String, String>,
-    /// What a branch cannot land before. Keyed by `<repo>/<branch>`, holding
-    /// `<repo>#<number>` requirements that may name any managed repo, not just this
-    /// one: a change here can need a pull request in a sibling fork, and dropping the
-    /// thing it needs from a release without dropping this too ships something that
-    /// cannot work.
-    #[serde(default)]
-    pub dependencies: BTreeMap<String, Vec<String>>,
-    /// A branch's pull request, stated rather than inferred. Keyed by
-    /// `<repo>/<branch>`.
-    ///
-    /// Inference matches an open pull request from our own copy of the repository,
-    /// which is right as a default and wrong as the only option. A pull request opened
-    /// before this tool existed cannot be found that way; neither can one that was
-    /// closed because the maintainer wanted something else, nor somebody else's that we
-    /// are carrying because ours was superseded. Stating it accepts any number in any
-    /// state from any author.
-    #[serde(default)]
-    pub tracked_pulls: BTreeMap<String, u64>,
     #[serde(default)]
     pub comment_marks: BTreeMap<String, String>,
     /// The latest pull-request state sync observed. Keyed by `<repo>#<number>`
@@ -102,7 +86,8 @@ pub struct State {
     /// Release membership is the release commit's own parent set, edited by
     /// `release include|drop|advance`, so nothing states it here; whatever an
     /// older version wrote lands in this map and rides along rather than
-    /// failing the read.
+    /// failing the read. So do the branch statements an older version kept
+    /// here: nothing reads them, and nothing drops them either.
     #[serde(flatten)]
     pub extra: BTreeMap<String, serde_json::Value>,
 }
@@ -126,6 +111,8 @@ pub enum StoreError {
     },
     #[error(transparent)]
     Lock(#[from] LockError),
+    #[error(transparent)]
+    Ledger(#[from] LedgerError),
     #[error("serialising state: {source}")]
     Serialise {
         #[from]
@@ -137,6 +124,9 @@ pub enum StoreError {
 pub struct Store {
     path: PathBuf,
     state: State,
+    /// Every repository's live statements, keyed by repository, read from the
+    /// ledger once when the store opens.
+    statements: BTreeMap<String, Statements>,
     /// Present only for a store opened to be written. Held, not read: its whole
     /// job is to exist until this value is dropped.
     _lock: Option<FileLock>,
@@ -144,6 +134,10 @@ pub struct Store {
 
 impl Store {
     /// Read-only. Cheap, and cannot block another agent.
+    ///
+    /// Either open fails on a ledger it cannot read, as it does on a state file
+    /// it cannot read: a statement the store could not read must not answer as
+    /// no statement.
     pub fn open(path: PathBuf) -> Result<Self, StoreError> {
         Self::read(path, None)
     }
@@ -168,9 +162,11 @@ impl Store {
         } else {
             State::default()
         };
+        let statements = read_statements(&path.with_file_name("ledger"))?;
         Ok(Self {
             path,
             state,
+            statements,
             _lock: lock,
         })
     }
@@ -238,17 +234,11 @@ impl Store {
             .filter(|agent| !agent.trim().is_empty())
     }
 
-    pub fn mark_fork_only(&mut self, target: &BranchTarget, why: &str) {
-        let _ = self
-            .state
-            .fork_only
-            .insert(target.to_string(), why.to_owned());
-    }
-
-    /// Without this mark, a branch we deliberately keep with no upstream pull
-    /// request reads as an error in every status report, forever.
+    /// Without this statement, a branch we deliberately keep with no upstream
+    /// pull request reads as an error in every status report, forever.
     pub fn is_fork_only(&self, target: &BranchTarget) -> bool {
-        self.state.fork_only.contains_key(&target.to_string())
+        self.stated_in(&target.repo)
+            .is_some_and(|stated| stated.fork_only(target.branch.as_str()))
     }
 
     pub fn record_foreign_parent(&mut self, repo: &RepoName, number: u64, why: &str) {
@@ -272,73 +262,42 @@ impl Store {
             .collect()
     }
 
-    /// Record that one branch's work continued as another.
+    /// Where one branch's work continued, if it was stated.
     ///
     /// Distinguishing supersession from a staleness bot closing a live branch,
     /// and from a deliberate fork-only branch, needs intent. Intent cannot be
-    /// recomputed, so it is stored.
-    pub fn supersede(&mut self, target: &BranchTarget, new: &str) {
-        let _ = self
-            .state
-            .superseded
-            .insert(target.to_string(), new.to_owned());
-    }
-
+    /// recomputed, so `finish --superseded-by` states it.
     pub fn superseded_by(&self, target: &BranchTarget) -> Option<&str> {
-        self.state
-            .superseded
-            .get(&target.to_string())
-            .map(String::as_str)
-    }
-
-    /// Record that `target` cannot land before `requirements` do.
-    ///
-    /// Additive and deduplicated, so declaring the same requirement twice is not an
-    /// error and re-running a script does not accumulate duplicates.
-    pub fn add_dependencies(&mut self, target: &BranchTarget, requirements: &[Requirement]) {
-        let entry = self
-            .state
-            .dependencies
-            .entry(target.to_string())
-            .or_default();
-        for requirement in requirements {
-            let text = requirement.to_string();
-            if !entry.contains(&text) {
-                entry.push(text);
-            }
-        }
-        entry.sort();
+        self.stated_in(&target.repo)?
+            .superseded_by(target.branch.as_str())
     }
 
     /// What `target` cannot land before.
     pub fn dependencies(&self, target: &BranchTarget) -> Vec<Requirement> {
-        self.state
-            .dependencies
-            .get(&target.to_string())
-            .map(|list| {
-                list.iter()
+        self.stated_in(&target.repo)
+            .map_or_else(Vec::new, |stated| {
+                stated
+                    .depends(target.branch.as_str())
+                    .iter()
                     .filter_map(|text| Requirement::parse(text))
                     .collect()
             })
-            .unwrap_or_default()
-    }
-
-    /// State that `target`'s pull request is `number`, whatever its state or author.
-    pub fn track_pull(&mut self, target: &BranchTarget, number: u64) {
-        let _ = self.state.tracked_pulls.insert(target.to_string(), number);
-    }
-
-    /// Stop associating `target` with a stated pull request.
-    pub fn untrack_pull(&mut self, target: &BranchTarget) -> bool {
-        self.state
-            .tracked_pulls
-            .remove(&target.to_string())
-            .is_some()
     }
 
     /// The pull request stated for `target`, if any. Overrides inference.
+    ///
+    /// Inference matches an open pull request from our own copy of the
+    /// repository, which is right as a default and wrong as the only option. A
+    /// pull request opened before this tool existed cannot be found that way;
+    /// neither can one that was closed because the maintainer wanted something
+    /// else, nor somebody else's that we are carrying because ours was
+    /// superseded. A statement accepts any number in any state from any author.
     pub fn tracked_pull(&self, target: &BranchTarget) -> Option<u64> {
-        self.state.tracked_pulls.get(&target.to_string()).copied()
+        self.stated_in(&target.repo)?.pull(target.branch.as_str())
+    }
+
+    fn stated_in(&self, repo: &RepoName) -> Option<&Statements> {
+        self.statements.get(repo.as_str())
     }
 
     pub fn convention_digest(&self, repo: &RepoName, file: &str) -> Option<&str> {
@@ -412,6 +371,46 @@ impl Store {
     }
 }
 
+/// Every repository's live statements, from the ledgers beside the state file.
+///
+/// `ledger/<repo>/` beside `state.json` is where
+/// [`crate::ledger::default_ledger_path`] puts each repository's ledger, so a
+/// store opened at the default path reads the default ledgers and one opened
+/// anywhere else reads only what sits beside it. A ledger root that does not
+/// exist yet holds no statements. Hidden directories, such as the ledger's own
+/// `.git`, anything that is not a directory, and a name that is not UTF-8 are
+/// not a repository's ledger: knives writes none of them.
+fn read_statements(root: &Path) -> Result<BTreeMap<String, Statements>, StoreError> {
+    let unreadable = |path: &Path, source| StoreError::Read {
+        path: path.to_owned(),
+        source,
+    };
+    let listing = match std::fs::read_dir(root) {
+        Ok(listing) => listing,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(BTreeMap::new());
+        }
+        Err(source) => return Err(unreadable(root, source)),
+    };
+    let mut statements = BTreeMap::new();
+    for dirent in listing {
+        let path = dirent.map_err(|source| unreadable(root, source))?.path();
+        let Some(repo) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if repo.starts_with('.')
+            || !std::fs::metadata(&path)
+                .map_err(|source| unreadable(&path, source))?
+                .is_dir()
+        {
+            continue;
+        }
+        let entries = Ledger::at(path.clone()).entries()?;
+        let _ = statements.insert(repo.to_owned(), Statements::from_entries(&entries));
+    }
+    Ok(statements)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -419,9 +418,39 @@ mod tests {
         reason = "indexing a result in a test is the assertion; a panic is the failure"
     )]
     use super::*;
+    use crate::ids::BranchName;
+    use crate::ledger::{Entry, Kind};
+    use crate::statement::{Statement, StatementKind};
 
     fn store(dir: &Path) -> Store {
         Store::open(dir.join("state.json")).unwrap()
+    }
+
+    /// Append to `a-repo`'s ledger beside `dir`'s state file an event stating
+    /// `kind` about `branch`, as `track`, `depends` and `finish` write one.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "a fixture: where, when, about which branch, and the statement are independent"
+    )]
+    fn state(dir: &Path, ts: &str, branch: &str, kind: StatementKind, value: Option<&str>) {
+        Ledger::at(dir.join("ledger").join("a-repo"))
+            .append(&Entry {
+                ts: ts.to_owned(),
+                owner: "ses_fff688".to_owned(),
+                subject: Some(branch.to_owned()),
+                kind: Kind::Event,
+                disposition: None,
+                statement: Some(Statement {
+                    kind,
+                    value: value.map(str::to_owned),
+                }),
+                text: "stated".to_owned(),
+                evidence: Vec::new(),
+                anchor: None,
+                pr: None,
+                parents: Vec::new(),
+            })
+            .unwrap();
     }
 
     fn repo() -> RepoName {
@@ -521,38 +550,197 @@ mod tests {
     }
 
     #[test]
-    fn a_stated_pull_request_survives_a_round_trip_whatever_its_state() {
-        // The case that motivated it: a pull request opened before this tool existed,
-        // then closed because the maintainer wanted a different approach. Inference
-        // looks only at open pull requests from our own fork, so it can never find it.
+    fn each_statement_on_the_ledger_answers_through_its_accessor() {
+        // Given: a ledger beside the state file holding one statement of each kind
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("state.json");
-        let target = BranchTarget::new(
-            RepoName::new("ai"),
-            crate::ids::BranchName::new("feat/alpha"),
+        let at = |second: u8| format!("2026-08-15T22:14:0{second}Z");
+        state(
+            dir.path(),
+            &at(1),
+            "feat/alpha",
+            StatementKind::Pull,
+            Some("4545"),
         );
-        {
-            let mut store = Store::open_for_update(path.clone()).unwrap();
-            store.track_pull(&target, 4545);
-            store.save().unwrap();
-        }
-        let store = Store::open(path.clone()).unwrap();
-        assert_eq!(store.tracked_pull(&target), Some(4545));
-        {
-            let mut store = Store::open_for_update(path.clone()).unwrap();
-            assert!(store.untrack_pull(&target));
-            store.save().unwrap();
-        }
-        assert_eq!(Store::open(path).unwrap().tracked_pull(&target), None);
+        state(
+            dir.path(),
+            &at(2),
+            "feat/alpha",
+            StatementKind::Superseded,
+            Some("feat/replacement"),
+        );
+        state(
+            dir.path(),
+            &at(3),
+            "feat/alpha",
+            StatementKind::Depends,
+            Some("a-repo#7,sibling#49"),
+        );
+        state(
+            dir.path(),
+            &at(4),
+            "feat/ci-only",
+            StatementKind::ForkOnly,
+            Some("CI we want here but not upstream"),
+        );
+
+        // When: the store opens
+        let subject = store(dir.path());
+
+        // Then: each accessor answers from the ledger
+        assert_eq!(subject.tracked_pull(&target()), Some(4545));
+        assert_eq!(subject.superseded_by(&target()), Some("feat/replacement"));
+        assert_eq!(
+            subject.dependencies(&target()),
+            [
+                Requirement {
+                    repo: repo(),
+                    number: 7
+                },
+                Requirement {
+                    repo: RepoName::new("sibling"),
+                    number: 49
+                },
+            ]
+        );
+        assert!(subject.is_fork_only(&BranchTarget::new(repo(), BranchName::new("feat/ci-only"))));
+        assert!(!subject.is_fork_only(&target()));
+
+        // And: the same branch name in another repository states nothing
+        let elsewhere =
+            BranchTarget::new(RepoName::new("other-repo"), BranchName::new("feat/alpha"));
+        assert_eq!(subject.tracked_pull(&elsewhere), None);
+        assert_eq!(subject.superseded_by(&elsewhere), None);
+        assert!(subject.dependencies(&elsewhere).is_empty());
     }
 
     #[test]
-    fn a_fork_only_mark_survives_a_round_trip() {
+    fn a_stated_pull_request_answers_until_a_newer_forget() {
+        // The case that motivated stating: a pull request opened before this tool
+        // existed, then closed because the maintainer wanted a different approach.
+        // Inference looks only at open pull requests from our own fork, so it can
+        // never find it.
         let dir = tempfile::tempdir().unwrap();
-        let mut subject = store(dir.path());
-        subject.mark_fork_only(&target(), "CI we want here but not upstream");
+        state(
+            dir.path(),
+            "2026-08-15T22:14:01Z",
+            "feat/alpha",
+            StatementKind::Pull,
+            Some("4545"),
+        );
+        assert_eq!(store(dir.path()).tracked_pull(&target()), Some(4545));
+
+        state(
+            dir.path(),
+            "2026-08-15T22:14:02Z",
+            "feat/alpha",
+            StatementKind::Pull,
+            None,
+        );
+        assert_eq!(store(dir.path()).tracked_pull(&target()), None);
+    }
+
+    #[test]
+    fn a_ledger_the_store_cannot_read_fails_the_open() {
+        // A statement the store could not read must not answer as no statement:
+        // a fork-only branch would then read as one missing its pull request.
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = dir.path().join("ledger").join("a-repo");
+        std::fs::create_dir_all(&ledger).unwrap();
+        std::fs::write(
+            ledger.join("20260815T221403.000000000Z-0000.md"),
+            "not a ledger entry at all\n",
+        )
+        .unwrap();
+        let path = dir.path().join("state.json");
+
+        let read = Store::open(path.clone()).unwrap_err();
+        assert!(
+            matches!(read, StoreError::Ledger(LedgerError::Parse { .. })),
+            "was: {read}"
+        );
+        let write = Store::open_for_update(path).unwrap_err();
+        assert!(matches!(write, StoreError::Ledger(_)), "was: {write}");
+    }
+
+    #[test]
+    fn only_a_repository_ledger_directory_is_read() {
+        // The ledger root is a git repository in practice, and an editor or a sync
+        // tool can leave a file beside the repositories' directories. Each of these
+        // holds a file that would fail to parse as an entry.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("ledger");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join(".git").join("HEAD.md"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(root.join("README.md"), "not a repository's ledger\n").unwrap();
+        state(
+            dir.path(),
+            "2026-08-15T22:14:01Z",
+            "feat/alpha",
+            StatementKind::Pull,
+            Some("4545"),
+        );
+
+        assert_eq!(store(dir.path()).tracked_pull(&target()), Some(4545));
+    }
+
+    #[test]
+    fn a_store_reads_the_ledger_beside_its_own_state_file() {
+        // The default ledger is the config home's. A store opened anywhere else
+        // must not read it, or a test would answer from the developer's real
+        // ledgers instead of its own fixture.
+        let _lock = crate::config::test_support::environment_lock();
+        let environment =
+            crate::config::test_support::EnvironmentGuard::capture(&["KNIVES_CONFIG_HOME"]);
+        let home = tempfile::tempdir().unwrap();
+        environment.set("KNIVES_CONFIG_HOME", home.path().to_str().unwrap());
+        state(
+            home.path(),
+            "2026-08-15T22:14:01Z",
+            "feat/alpha",
+            StatementKind::Pull,
+            Some("1157"),
+        );
+
+        assert_eq!(
+            Store::open(default_state_path())
+                .unwrap()
+                .tracked_pull(&target()),
+            Some(1157),
+            "the default store reads the config home's ledger"
+        );
+        let elsewhere = tempfile::tempdir().unwrap();
+        assert_eq!(store(elsewhere.path()).tracked_pull(&target()), None);
+    }
+
+    #[test]
+    fn statements_an_older_version_kept_in_the_state_file_ride_along_unread() {
+        // Nothing reads them now, and a save must not drop them either: they are
+        // the record a later migration moves onto the ledger.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        std::fs::write(
+            &path,
+            r#"{"tracked_pulls":{"a-repo/feat/alpha":4545},"fork_only":{"a-repo/feat/alpha":"why"},"superseded":{"a-repo/feat/alpha":"feat/replacement"},"dependencies":{"a-repo/feat/alpha":["a-repo#7"]}}"#,
+        )
+        .unwrap();
+
+        let mut subject = Store::open(path.clone()).unwrap();
+        assert_eq!(subject.tracked_pull(&target()), None);
+        assert!(!subject.is_fork_only(&target()));
+        assert_eq!(subject.superseded_by(&target()), None);
+        assert!(subject.dependencies(&target()).is_empty());
+
+        let _ = subject.claim(&target(), &os_user("x"), "w");
         subject.save().unwrap();
-        assert!(store(dir.path()).is_fork_only(&target()));
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["tracked_pulls"]["a-repo/feat/alpha"], 4545);
+        assert_eq!(saved["fork_only"]["a-repo/feat/alpha"], "why");
+        assert_eq!(saved["superseded"]["a-repo/feat/alpha"], "feat/replacement");
+        assert_eq!(
+            saved["dependencies"]["a-repo/feat/alpha"],
+            serde_json::json!(["a-repo#7"])
+        );
     }
 
     #[test]
@@ -594,18 +782,6 @@ mod tests {
         subject.record_foreign_parent(&repo(), 4677, "maintainer's fix, we carry it");
         subject.record_foreign_parent(&RepoName::new("other"), 99, "unrelated");
         assert_eq!(subject.foreign_parent_numbers(&repo()), [4677]);
-    }
-
-    #[test]
-    fn supersession_records_where_the_work_went() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut subject = store(dir.path());
-        subject.supersede(&target(), "feat/replacement");
-        subject.save().unwrap();
-        assert_eq!(
-            store(dir.path()).superseded_by(&target()),
-            Some("feat/replacement")
-        );
     }
 
     #[test]

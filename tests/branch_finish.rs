@@ -209,15 +209,13 @@ fn finish_releases_without_consulting_the_forge() {
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     let (home, _consumer) = release_test_home(&lab);
     hold_claim(&home, "feat/alpha");
-    {
-        let target = knives::ids::BranchTarget::new(
-            knives::ids::RepoName::new("demo"),
-            BranchName::new("feat/alpha"),
-        );
-        let mut store = Store::open_for_update(home.path().join("state.json")).expect("open store");
-        store.track_pull(&target, 7);
-        store.save().expect("save stated pull");
-    }
+    lab::state_on_ledger(
+        home.path(),
+        "demo",
+        "feat/alpha",
+        StatementKind::Pull,
+        Some("7"),
+    );
     let tip_before = lab.revision(&lab.work, "feat/alpha", "commit_id");
     let state = tempfile::tempdir().expect("test state");
     let log = state.path().join("gh.log");
@@ -245,10 +243,24 @@ fn finish_releases_without_consulting_the_forge() {
         "claim remained: {}",
         state["claims"]
     );
+    let target = knives::ids::BranchTarget::new(
+        knives::ids::RepoName::new("demo"),
+        BranchName::new("feat/alpha"),
+    );
     assert_eq!(
-        state["tracked_pulls"]["demo/feat/alpha"],
-        Value::from(7),
+        Store::open(home.path().join("state.json"))
+            .expect("reopen store")
+            .tracked_pull(&target),
+        Some(7),
         "the stated pull request did not survive the release"
+    );
+    let entries = knives::ledger::Ledger::at(home.path().join("ledger").join("demo"))
+        .entries()
+        .expect("read ledger");
+    assert_eq!(
+        entries.last().map(|entry| (entry.text.as_str(), entry.pr)),
+        Some(("claim released", Some(7))),
+        "the release is filed under the pull request stated on the ledger: {entries:?}"
     );
     assert_eq!(
         lab.revision(&lab.work, "feat/alpha", "commit_id"),
@@ -685,6 +697,81 @@ fn a_fork_only_statement_is_recorded_as_the_decision_it_is() {
             StatementKind::ForkOnly,
             Some("stated with `knives track --fork-only`")
         ))
+    );
+}
+
+#[test]
+fn a_stated_pull_request_lives_on_the_ledger_and_status_shows_it() {
+    // Given: a managed fork with a branch and no stated pull request, and a state
+    // file that already exists because the branch is claimed
+    let lab = lab::Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let (home, _consumer) = release_test_home(&lab);
+    hold_claim(&home, "feat/alpha");
+    let state_path = home.path().join("state.json");
+    let state_before = std::fs::read(&state_path).expect("read state");
+    let knives = |args: &[&str]| {
+        lab::knives_command(&lab.work, home.path(), lab.temp_path(), args)
+            .env("KNIVES_OWNER", "ses_fff688")
+            .output()
+            .expect("run knives")
+    };
+
+    // When: its pull request is stated
+    let tracked = knives(&["--text", "track", "feat/alpha", "--pr", "1234"]);
+    assert!(
+        tracked.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&tracked.stderr)
+    );
+
+    // Then: one ledger entry says so in prose and states it as data
+    let entries = knives::ledger::Ledger::at(home.path().join("ledger").join("demo"))
+        .entries()
+        .expect("read ledger");
+    assert_eq!(entries.len(), 1, "was: {entries:?}");
+    assert_eq!(entries[0].text, "stated as #1234");
+    assert_eq!(
+        entries[0].statement,
+        Some(stating(StatementKind::Pull, Some("1234")))
+    );
+
+    // And: the state file is untouched and carries no statement map
+    assert_eq!(
+        std::fs::read(&state_path).expect("read state"),
+        state_before,
+        "track rewrote the state file"
+    );
+    let state: Value =
+        serde_json::from_str(&std::fs::read_to_string(&state_path).expect("read state"))
+            .expect("parse state");
+    assert!(state.get("tracked_pulls").is_none(), "state was: {state}");
+
+    // And: status, which never reads the forge here, shows the stated pull
+    // request on the branch's row in both output modes
+    let status = knives(&["--json", "status", "demo", "--no-github", "--no-landed"]);
+    let stdout = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        status.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let report: Value = serde_json::from_str(&stdout).expect("status emits JSON");
+    let row = report["branches"]
+        .as_array()
+        .expect("branch rows")
+        .iter()
+        .find(|row| row["name"] == "feat/alpha")
+        .unwrap_or_else(|| panic!("no feat/alpha row: {report}"));
+    assert_eq!(row["pr"]["number"], 1234, "row was: {row}");
+    assert_eq!(row["pr"]["stated"], true, "row was: {row}");
+
+    let text = knives(&["--text", "status", "demo", "--no-github", "--no-landed"]);
+    let text = String::from_utf8_lossy(&text.stdout);
+    assert!(
+        text.lines()
+            .any(|line| line.contains("feat/alpha") && line.contains("#1234 (stated)")),
+        "status did not show the stated pull request: {text}"
     );
 }
 

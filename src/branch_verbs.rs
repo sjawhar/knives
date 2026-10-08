@@ -3,7 +3,8 @@
 //! `finish` hands a claimed branch back and removes its workspace; `track`
 //! states which pull request a branch belongs to, overriding inference;
 //! `depends` records that a branch cannot land before something else does.
-//! Each is one state write with its ledger event.
+//! Each records one ledger event, and a statement rides on that event;
+//! `finish` also writes the released claim to the state file.
 
 use std::path::Path;
 
@@ -93,9 +94,6 @@ pub(crate) fn run_finish(
         FinishClaimGate::Refuse => return Ok(Exit::Usage),
     };
     let had = store.release_claim(target);
-    if let Some(new) = options.superseded_by {
-        store.supersede(target, new);
-    }
     let pr = store.tracked_pull(target);
     // Persist the immutable explanation before the mutable claim state. A failed
     // append then leaves the old claim in place instead of silently releasing or
@@ -304,7 +302,10 @@ pub(crate) fn run_track(
     bound: Option<&RepoName>,
 ) -> anyhow::Result<Exit> {
     let target = &BranchTarget::new(fork.name.clone(), branch.clone());
-    let mut store = Store::open_for_update(default_state_path())?;
+    // Opened for update to hold the lock while the statement is read and the next
+    // one appended: a concurrent `track` then reads this one's statement rather
+    // than the one before it. Nothing here writes the state file.
+    let store = Store::open_for_update(default_state_path())?;
     // Read before the change, so a withdrawal is still filed under the number it
     // withdrew.
     let stated = store.tracked_pull(target);
@@ -314,20 +315,17 @@ pub(crate) fn run_track(
     // value there — usually nothing — would hide it from the only filter the
     // field exists for.
     let (text, stamped, statement) = if fork_only {
-        let why = "stated with `knives track --fork-only`";
-        store.mark_fork_only(target, why);
         (
             "stated as having no upstream pull request".to_owned(),
             stated,
             Statement {
                 kind: StatementKind::ForkOnly,
-                value: Some(why.to_owned()),
+                value: Some("stated with `knives track --fork-only`".to_owned()),
             },
         )
     } else if forget {
-        let had = store.untrack_pull(target);
         (
-            if had {
+            if stated.is_some() {
                 "pull request statement forgotten".to_owned()
             } else {
                 "no pull request statement to forget".to_owned()
@@ -343,7 +341,6 @@ pub(crate) fn run_track(
             eprintln!("give --pr <number>, or --forget");
             return Ok(Exit::Usage);
         };
-        store.track_pull(target, number);
         (
             format!("stated as #{number}"),
             Some(number),
@@ -353,11 +350,11 @@ pub(crate) fn run_track(
             },
         )
     };
-    store.save()?;
     scribe_for(fork, bound)?.record(&Draft {
         statement: Some(statement),
         ..Draft::event(Some(branch.as_str()), text.clone(), stamped)
     })?;
+    drop(store);
     println!("{target} {}", spoken(&text));
     Ok(Exit::Ok)
 }
@@ -409,11 +406,12 @@ pub(crate) fn run_depends(
         }
         requirements.push(requirement);
     }
-    let mut store = Store::open_for_update(default_state_path())?;
+    // Held while the list is read and the next statement appended, so two
+    // concurrent `depends` each add to the other's list rather than racing.
+    // Nothing here writes the state file.
+    let store = Store::open_for_update(default_state_path())?;
     let required = with_requirements(&store.dependencies(target), &requirements);
-    store.add_dependencies(target, &requirements);
     let pr = store.tracked_pull(target);
-    store.save()?;
     let listed: Vec<String> = requirements.iter().map(ToString::to_string).collect();
     scribe_for(fork, bound)?.record(&Draft {
         statement: Some(Statement {
@@ -426,6 +424,7 @@ pub(crate) fn run_depends(
             pr,
         )
     })?;
+    drop(store);
     println!("{target} now requires {}", listed.join(", "));
     Ok(Exit::Ok)
 }

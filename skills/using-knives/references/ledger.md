@@ -57,6 +57,7 @@ treating it as a branch. `--evidence` repeats and requires `-m`.
 | `evidence` | Optional commit ids, `file:line`, `<repo>#<number>` or URLs, including other repositories. |
 | `anchor` | Automatic subject tip at write time; absent if it did not resolve. |
 | `pr` | Explicit write stamp, else tracked PR for the subject. |
+| `statement` | What `track`, `depends` and `finish --superseded-by` stated about the branch: `{ kind, value }`, kind `pull`, `fork-only`, `superseded` or `depends`. The newest per branch and kind is live; a `pull` with no value is a forget. Prose never states anything. |
 
 There are two kinds, not three. A disposition selects a class of note.
 `finish --superseded-by` and `start --why` record supersessions and parkings as
@@ -118,3 +119,8 @@ allowing newer writers and older readers; there is no version-number field.
 `0` is a completed read/write, `2` a usage error, and `3` an unreadable ledger
 directory or entry. A repository with no ledger yet is different: exit `0` with
 `no notches yet`.
+
+Every command that reads branch statements (`status`, `audit`, `pushed`, `track`,
+`start`, a `notch` write, and the rest) reads every repository's ledger when it
+starts. An unreadable entry in any of them stops the command with exit `3` naming
+the file, rather than reading that ledger's statements as absent.

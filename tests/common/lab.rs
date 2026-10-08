@@ -847,6 +847,36 @@ pub fn knives(lab: &Lab, home: &tempfile::TempDir, args: &[&str]) -> std::proces
         .expect("run knives")
 }
 
+/// State `kind` about `branch` on `repo`'s ledger in the config home `home`,
+/// through the same scribe `track`, `depends` and `finish --superseded-by`
+/// write with. A store opened afterwards at `home/state.json` answers for it.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a fixture: where the ledger is, whose it is, and the one statement it writes are independent"
+)]
+pub fn state_on_ledger(
+    home: &Path,
+    repo: &str,
+    branch: &str,
+    kind: knives::statement::StatementKind,
+    value: Option<&str>,
+) {
+    knives::ledger::Scribe::new(
+        knives::ledger::Ledger::at(home.join("ledger").join(repo)),
+        knives::ids::RepoName::new(repo),
+        home.to_owned(),
+        "a-test".to_owned(),
+    )
+    .record(&knives::ledger::Draft {
+        statement: Some(knives::statement::Statement {
+            kind,
+            value: value.map(str::to_owned),
+        }),
+        ..knives::ledger::Draft::event(Some(branch), "stated".to_owned(), None)
+    })
+    .expect("state on the ledger");
+}
+
 fn jj_output<const N: usize>(directory: &Path, args: [&str; N]) -> String {
     let output = Command::new("jj")
         .args(args)

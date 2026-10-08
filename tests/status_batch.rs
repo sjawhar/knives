@@ -28,6 +28,7 @@ use knives::forge::{
 };
 use knives::ids::BranchName;
 use knives::jj::Repo;
+use knives::statement::StatementKind;
 use knives::store::Store;
 use lab::{extend_branch, lab_entry, without_forge_elapsed};
 use pulls::pull_request_with_head;
@@ -423,7 +424,6 @@ fn a_consulted_false_report_carries_an_unanswered_stated_pull() {
     let lab = lab::Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     let name = knives::ids::RepoName::new("demo");
-    let target = knives::ids::BranchTarget::new(name.clone(), BranchName::new("feat/alpha"));
     let forge = knives::forge::fake::FakeForge {
         pull_requests: BTreeMap::from([(
             BranchName::new("feat/alpha"),
@@ -433,8 +433,14 @@ fn a_consulted_false_report_carries_an_unanswered_stated_pull() {
         ..knives::forge::fake::FakeForge::default()
     };
     let state = tempfile::tempdir().expect("state directory");
-    let mut store = Store::open_for_update(state.path().join("state.json")).expect("open store");
-    store.track_pull(&target, 42);
+    lab::state_on_ledger(
+        state.path(),
+        name.as_str(),
+        "feat/alpha",
+        StatementKind::Pull,
+        Some("42"),
+    );
+    let store = Store::open(state.path().join("state.json")).expect("open store");
 
     let report = status::gather(
         &lab::lab_fork(&lab, name.as_str(), &lab_entry(&lab)),
@@ -470,7 +476,6 @@ fn stated_pulls_and_dependencies_are_answered_from_the_one_batch() {
     let lab = lab::Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     let name = knives::ids::RepoName::new("demo");
-    let target = knives::ids::BranchTarget::new(name.clone(), BranchName::new("feat/alpha"));
     let forge = knives::forge::fake::FakeForge {
         pull_requests: BTreeMap::from([(
             BranchName::new("feat/alpha"),
@@ -480,15 +485,21 @@ fn stated_pulls_and_dependencies_are_answered_from_the_one_batch() {
         ..knives::forge::fake::FakeForge::default()
     };
     let state = tempfile::tempdir().expect("state directory");
-    let mut store = Store::open_for_update(state.path().join("state.json")).expect("open store");
-    store.track_pull(&target, 42);
-    store.add_dependencies(
-        &target,
-        &[knives::ids::Requirement {
-            repo: name.clone(),
-            number: 43,
-        }],
+    lab::state_on_ledger(
+        state.path(),
+        name.as_str(),
+        "feat/alpha",
+        StatementKind::Pull,
+        Some("42"),
     );
+    lab::state_on_ledger(
+        state.path(),
+        name.as_str(),
+        "feat/alpha",
+        StatementKind::Depends,
+        Some(&format!("{name}#43")),
+    );
+    let store = Store::open(state.path().join("state.json")).expect("open store");
     let registry = Registry {
         repos: BTreeMap::from([("demo".to_owned(), lab_entry(&lab))]),
         ..Registry::default()

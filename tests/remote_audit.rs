@@ -13,7 +13,7 @@ mod pulls;
 use knives::commands::audit;
 use knives::forge::fake::FakeForge;
 use knives::forge::{CheckRun, ChecksSummary, PullRequest};
-use knives::ids::{BookmarkRef, BranchName, BranchTarget, RemoteName, RepoName};
+use knives::ids::{BookmarkRef, BranchName, RemoteName};
 use knives::jj::Repo;
 use knives::store::Store;
 use lab::{Lab, commit_at, lab_entry};
@@ -81,7 +81,7 @@ fn knives_audit(lab: &Lab, home: &tempfile::TempDir, args: &[&str]) -> std::proc
     knives_cmd(lab, home, "audit", args)
 }
 
-/// The audit gathered over `entry` with `forge` and a store that marks
+/// The audit gathered over `entry` with `forge` and a store that states
 /// `fork_only` as fork-only and nothing else.
 fn gather_with(
     lab: &Lab,
@@ -91,13 +91,16 @@ fn gather_with(
 ) -> audit::Report {
     let fork = lab::lab_fork(lab, "demo", entry);
     let state = tempfile::tempdir().expect("state");
-    let mut store = Store::open_for_update(state.path().join("state.json")).expect("store");
     for branch in fork_only {
-        store.mark_fork_only(
-            &BranchTarget::new(RepoName::new("demo"), BranchName::new(*branch)),
-            "test",
+        lab::state_on_ledger(
+            state.path(),
+            "demo",
+            branch,
+            knives::statement::StatementKind::ForkOnly,
+            Some("test"),
         );
     }
+    let store = Store::open(state.path().join("state.json")).expect("store");
     audit::gather(&audit::AuditInput {
         fork: &fork,
         store: &store,

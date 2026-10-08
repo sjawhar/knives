@@ -663,7 +663,10 @@ fn force_claim_does_not_save_state_when_its_provenance_cannot_be_appended() {
     );
     assert!(first.status.success(), "{first:?}");
     let state_before = std::fs::read(home.path().join("state.json")).expect("read state");
-    let ledger = home.path().join("ledger");
+    // Block the repository's ledger, not the ledger root: the store reads every
+    // ledger when it opens, and a root it cannot read would stop the command
+    // there, before the append this test is about.
+    let ledger = home.path().join("ledger").join("demo");
     std::fs::rename(&ledger, home.path().join("ledger-backup")).expect("move ledger aside");
     std::fs::write(&ledger, "not a directory").expect("block ledger append");
 
@@ -717,7 +720,8 @@ fn force_finish_does_not_save_state_when_its_provenance_cannot_be_appended() {
         .expect("start claim");
     assert!(start.status.success(), "{start:?}");
     let state_before = std::fs::read(home.path().join("state.json")).expect("read state");
-    let ledger = home.path().join("ledger");
+    // Block the repository's ledger, not the ledger root, as above.
+    let ledger = home.path().join("ledger").join("demo");
     std::fs::rename(&ledger, home.path().join("ledger-backup")).expect("move ledger aside");
     std::fs::write(&ledger, "not a directory").expect("block ledger append");
 

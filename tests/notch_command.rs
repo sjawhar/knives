@@ -255,11 +255,13 @@ fn a_write_pr_stamps_the_entry_and_a_pr_read_finds_it() {
 fn a_write_without_pr_uses_the_tracked_pull_stamp() {
     let checkout = checkout();
     let home = home();
-    std::fs::write(
-        home.path().join("state.json"),
-        r#"{"tracked_pulls":{"a-repo/feat/alpha":1157}}"#,
-    )
-    .expect("seed tracked pull");
+    lab::state_on_ledger(
+        home.path(),
+        "a-repo",
+        "feat/alpha",
+        knives::statement::StatementKind::Pull,
+        Some("1157"),
+    );
 
     let wrote = knives(
         &home,
@@ -284,11 +286,13 @@ fn a_write_without_pr_uses_the_tracked_pull_stamp() {
 fn a_subject_read_shows_that_refs_chronology_and_a_bare_read_windows_the_repo() {
     let checkout = checkout();
     let home = home();
-    std::fs::write(
-        home.path().join("state.json"),
-        r#"{"tracked_pulls":{"a-repo/feat/alpha":1157}}"#,
-    )
-    .expect("seed tracked pull");
+    lab::state_on_ledger(
+        home.path(),
+        "a-repo",
+        "feat/alpha",
+        knives::statement::StatementKind::Pull,
+        Some("1157"),
+    );
 
     for index in 0..42 {
         let text = format!("entry {index}");
@@ -314,6 +318,7 @@ fn a_subject_read_shows_that_refs_chronology_and_a_bare_read_windows_the_repo() 
         &["--json", "notch", "--repo", "a-repo"],
     );
     let parsed: serde_json::Value = serde_json::from_slice(&bare.stdout).expect("JSON");
+    // A bare read windows to the newest 20 notes and says how many it did not show.
     assert_eq!(parsed["matched"], 42);
     assert_eq!(parsed["entries"].as_array().expect("array").len(), 20);
     assert_eq!(parsed["entries"][0]["text"], "entry 22");
@@ -325,9 +330,10 @@ fn a_subject_read_shows_that_refs_chronology_and_a_bare_read_windows_the_repo() 
         checkout.path(),
         &["--json", "notch", "feat/alpha", "--repo", "a-repo"],
     );
+    // The statement event is part of feat/alpha's chronology too.
     let parsed: serde_json::Value = serde_json::from_slice(&subject.stdout).expect("JSON");
-    assert_eq!(parsed["matched"], 21);
-    assert_eq!(parsed["entries"].as_array().expect("array").len(), 21);
+    assert_eq!(parsed["matched"], 22);
+    assert_eq!(parsed["entries"].as_array().expect("array").len(), 22);
 
     // A pull-request read is not windowed either: it is that pull request's
     // whole chronology.
@@ -337,6 +343,8 @@ fn a_subject_read_shows_that_refs_chronology_and_a_bare_read_windows_the_repo() 
         checkout.path(),
         &["--json", "notch", "--pr", "1157", "--repo", "a-repo"],
     );
+    // The statement event itself is unstamped, so the pull request's chronology
+    // is the 21 notes it stamped.
     let parsed: serde_json::Value = serde_json::from_slice(&pull_request.stdout).expect("JSON");
     assert_eq!(parsed["matched"], 21);
     assert_eq!(parsed["entries"].as_array().expect("array").len(), 21);
