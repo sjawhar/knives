@@ -57,6 +57,7 @@ fn append(machine: &Path, owner: &str, count: usize, padding: usize) {
                 subject: Some("feat/transport".to_owned()),
                 kind: Kind::Note,
                 disposition: None,
+                statement: None,
                 text: format!("{owner} learned thing {index}\n{}", "x".repeat(padding)),
                 evidence: Vec::new(),
                 anchor: None,
