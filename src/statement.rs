@@ -267,7 +267,7 @@ mod tests {
         );
 
         assert_eq!(
-            Statements::from_entries(&[first.clone()]).depends("feat/alpha"),
+            Statements::from_entries(std::slice::from_ref(&first)).depends("feat/alpha"),
             ["other#1", "other#2"]
         );
         assert_eq!(
