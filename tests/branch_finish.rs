@@ -21,10 +21,19 @@ mod lab;
 use forge_shim::{install_failing_gh, path_with_gh_shim};
 use knives::ids::BranchName;
 use knives::jj::Repo;
+use knives::statement::{Statement, StatementKind};
 use knives::store::{OwnerKind, Store};
 use lab::{Lab, knives_start, release_test_home};
 use serde_json::Value;
 use std::process::Command;
+
+/// The statement an entry is expected to carry.
+fn stating(kind: StatementKind, value: Option<&str>) -> Statement {
+    Statement {
+        kind,
+        value: value.map(str::to_owned),
+    }
+}
 
 #[test]
 fn starting_and_finishing_a_branch_leaves_its_reason_in_the_ledger() {
@@ -467,6 +476,7 @@ fn finishing_a_held_branch_without_a_successor_records_only_the_release() {
         .expect("read ledger");
     assert_eq!(entries.len(), 1, "was: {entries:?}");
     assert_eq!(entries[0].text, "claim released");
+    assert_eq!(entries[0].statement, None, "a plain release states nothing");
 }
 
 #[test]
@@ -517,6 +527,11 @@ fn finishing_an_unheld_branch_still_records_the_supersession_it_did_record() {
         .expect("read ledger");
     assert_eq!(entries.len(), 1, "was: {entries:?}");
     assert_eq!(entries[0].text, "superseded by feat/replacement");
+    assert_eq!(
+        entries[0].statement,
+        Some(stating(StatementKind::Superseded, Some("feat/replacement"))),
+        "the supersession rides on the entry that names it"
+    );
 }
 
 #[test]
@@ -547,7 +562,7 @@ fn stating_a_pull_request_and_a_dependency_leaves_both_statements_in_the_ledger(
             .expect("run knives")
     };
 
-    // When: the branch's pull request is stated, then a dependency, then the
+    // When: the branch's pull request is stated, then two dependencies, then the
     // statement is withdrawn
     assert!(
         knives(&["--text", "track", "feat/alpha", "--pr", "4545"])
@@ -560,13 +575,18 @@ fn stating_a_pull_request_and_a_dependency_leaves_both_statements_in_the_ledger(
             .success()
     );
     assert!(
+        knives(&["--text", "depends", "feat/alpha", "--on", "sibling#12"])
+            .status
+            .success()
+    );
+    assert!(
         knives(&["--text", "track", "feat/alpha", "--forget"])
             .status
             .success()
     );
 
-    // Then: all three statements are in order, anchored, and the stated pull
-    // request is stamped on the entries written while it was stated
+    // Then: every statement is in order, anchored, and the stated pull request
+    // is stamped on the entries written while it was stated
     let entries = knives::ledger::Ledger::at(home.path().join("ledger").join("demo"))
         .entries()
         .expect("read ledger");
@@ -576,7 +596,26 @@ fn stating_a_pull_request_and_a_dependency_leaves_both_statements_in_the_ledger(
         [
             "stated as #4545",
             "requires sibling#49",
+            "requires sibling#12",
             "pull request statement forgotten"
+        ],
+        "was: {entries:?}"
+    );
+    // And: each entry carries its statement beside the prose. A second
+    // `depends` adds to the list, so its statement is the whole list.
+    assert_eq!(
+        entries
+            .iter()
+            .map(|entry| entry.statement.clone())
+            .collect::<Vec<_>>(),
+        [
+            Some(stating(StatementKind::Pull, Some("4545"))),
+            Some(stating(StatementKind::Depends, Some("sibling#49"))),
+            Some(stating(
+                StatementKind::Depends,
+                Some("sibling#12,sibling#49")
+            )),
+            Some(stating(StatementKind::Pull, None)),
         ],
         "was: {entries:?}"
     );
@@ -586,10 +625,10 @@ fn stating_a_pull_request_and_a_dependency_leaves_both_statements_in_the_ledger(
             .all(|entry| entry.subject.as_deref() == Some("feat/alpha"))
     );
     // Each entry is stamped with the number it is about: the one that created the
-    // association, the one recorded while it stood, and the one it withdrew.
+    // association, the ones recorded while it stood, and the one it withdrew.
     assert_eq!(
         entries.iter().map(|entry| entry.pr).collect::<Vec<_>>(),
-        [Some(4545), Some(4545), Some(4545)],
+        [Some(4545), Some(4545), Some(4545), Some(4545)],
         "was: {entries:?}"
     );
     let tip = Repo::open(&lab.work)
@@ -608,7 +647,7 @@ fn stating_a_pull_request_and_a_dependency_leaves_both_statements_in_the_ledger(
     let filtered = knives(&["--json", "notch", "--pr", "4545"]);
     let parsed: serde_json::Value =
         serde_json::from_slice(&filtered.stdout).expect("notch --json emits JSON");
-    assert_eq!(parsed["matched"], 3, "was: {parsed}");
+    assert_eq!(parsed["matched"], 4, "was: {parsed}");
 }
 
 #[test]
@@ -640,6 +679,13 @@ fn a_fork_only_statement_is_recorded_as_the_decision_it_is() {
         .expect("read ledger");
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].text, "stated as having no upstream pull request");
+    assert_eq!(
+        entries[0].statement,
+        Some(stating(
+            StatementKind::ForkOnly,
+            Some("stated with `knives track --fork-only`")
+        ))
+    );
 }
 
 /// Git's registrations of a checkout's worktrees, one `worktree <path>` block

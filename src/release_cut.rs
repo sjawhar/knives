@@ -560,6 +560,7 @@ fn record_cut_event(
         subject: Some(cut.name),
         kind: Kind::Event,
         disposition: None,
+        statement: None,
         text: format!(
             "cut {} as {} (change {}) with {} parent(s): {members_text}{delta}",
             cut.name,

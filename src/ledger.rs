@@ -513,6 +513,8 @@ pub struct Draft<'a> {
     pub kind: Kind,
     /// A terminal ruling token when this note is a disposition.
     pub disposition: Option<String>,
+    /// What the entry states about its subject, beside its prose.
+    pub statement: Option<Statement>,
     pub text: String,
     pub evidence: Vec<String>,
     /// The pull request stated for the subject, read from the store by the
@@ -522,6 +524,23 @@ pub struct Draft<'a> {
     /// The parent set a release cut or edit leaves behind; empty for every
     /// other entry.
     pub parents: Vec<RecordedParent>,
+}
+
+impl<'a> Draft<'a> {
+    /// An event: something this tool did, recorded as part of doing it. It
+    /// states nothing until the caller sets [`Draft::statement`].
+    pub const fn event(subject: Option<&'a str>, text: String, pr: Option<u64>) -> Self {
+        Self {
+            subject,
+            kind: Kind::Event,
+            disposition: None,
+            statement: None,
+            text,
+            evidence: Vec::new(),
+            pr,
+            parents: Vec::new(),
+        }
+    }
 }
 
 /// Where automatic events go, and who is writing them.
@@ -559,7 +578,7 @@ impl Scribe {
             subject: draft.subject.map(str::to_owned),
             kind: draft.kind,
             disposition: draft.disposition.clone(),
-            statement: None,
+            statement: draft.statement.clone(),
             text: draft.text.clone(),
             evidence: draft.evidence.clone(),
             anchor: self.anchor(draft.subject),
@@ -577,15 +596,7 @@ impl Scribe {
         text: String,
         pr: Option<u64>,
     ) -> Result<Entry, LedgerError> {
-        self.record(&Draft {
-            subject,
-            kind: Kind::Event,
-            disposition: None,
-            text,
-            evidence: Vec::new(),
-            pr,
-            parents: Vec::new(),
-        })
+        self.record(&Draft::event(subject, text, pr))
     }
 
     /// The subject's tip now, or nothing when it does not resolve.
@@ -1320,6 +1331,7 @@ mod tests {
                 subject: None,
                 kind: Kind::Note,
                 disposition: None,
+                statement: None,
                 text: "the release remote is out of date".to_owned(),
                 evidence: vec!["06d778b9".to_owned(), "a-repo#1157".to_owned()],
                 pr: None,

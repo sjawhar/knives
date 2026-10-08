@@ -17,6 +17,8 @@ use knives::commands::start::{collides_with_checkout, possesses, workspace_path}
 use knives::config::Registry;
 use knives::ids::{BranchName, BranchTarget, RepoName, Requirement};
 use knives::jj::{Repo, WorkspaceIdentity, remove_prunable_worktree};
+use knives::ledger::Draft;
+use knives::statement::{Statement, StatementKind};
 use knives::store::{Store, default_state_path};
 
 use super::scribe_for;
@@ -105,7 +107,15 @@ pub(crate) fn run_finish(
         })
         .or_else(|| release_event(had, options.superseded_by));
     if let Some(text) = provenance {
-        scribe_for(fork, bound)?.event(Some(branch.as_str()), text, pr)?;
+        // `--superseded-by` always leaves provenance to carry it: the replacement
+        // rides on the one entry that already names it.
+        scribe_for(fork, bound)?.record(&Draft {
+            statement: options.superseded_by.map(|replacement| Statement {
+                kind: StatementKind::Superseded,
+                value: Some(replacement.to_owned()),
+            }),
+            ..Draft::event(Some(branch.as_str()), text, pr)
+        })?;
     }
     store.save()?;
     // The claim is recorded; nothing below touches the store, and removing a
@@ -303,11 +313,16 @@ pub(crate) fn run_track(
     // one `knives notch --pr <n>` most needs to find, and stamping the prior
     // value there — usually nothing — would hide it from the only filter the
     // field exists for.
-    let (text, stamped) = if fork_only {
-        store.mark_fork_only(target, "stated with `knives track --fork-only`");
+    let (text, stamped, statement) = if fork_only {
+        let why = "stated with `knives track --fork-only`";
+        store.mark_fork_only(target, why);
         (
             "stated as having no upstream pull request".to_owned(),
             stated,
+            Statement {
+                kind: StatementKind::ForkOnly,
+                value: Some(why.to_owned()),
+            },
         )
     } else if forget {
         let had = store.untrack_pull(target);
@@ -318,6 +333,10 @@ pub(crate) fn run_track(
                 "no pull request statement to forget".to_owned()
             },
             stated,
+            Statement {
+                kind: StatementKind::Pull,
+                value: None,
+            },
         )
     } else {
         let Some(number) = pr else {
@@ -325,10 +344,20 @@ pub(crate) fn run_track(
             return Ok(Exit::Usage);
         };
         store.track_pull(target, number);
-        (format!("stated as #{number}"), Some(number))
+        (
+            format!("stated as #{number}"),
+            Some(number),
+            Statement {
+                kind: StatementKind::Pull,
+                value: Some(number.to_string()),
+            },
+        )
     };
     store.save()?;
-    scribe_for(fork, bound)?.event(Some(branch.as_str()), text.clone(), stamped)?;
+    scribe_for(fork, bound)?.record(&Draft {
+        statement: Some(statement),
+        ..Draft::event(Some(branch.as_str()), text.clone(), stamped)
+    })?;
     println!("{target} {}", spoken(&text));
     Ok(Exit::Ok)
 }
@@ -381,22 +410,47 @@ pub(crate) fn run_depends(
         requirements.push(requirement);
     }
     let mut store = Store::open_for_update(default_state_path())?;
+    let required = with_requirements(&store.dependencies(target), &requirements);
     store.add_dependencies(target, &requirements);
     let pr = store.tracked_pull(target);
     store.save()?;
     let listed: Vec<String> = requirements.iter().map(ToString::to_string).collect();
-    scribe_for(fork, bound)?.event(
-        Some(branch.as_str()),
-        format!("requires {}", listed.join(", ")),
-        pr,
-    )?;
+    scribe_for(fork, bound)?.record(&Draft {
+        statement: Some(Statement {
+            kind: StatementKind::Depends,
+            value: Some(required.join(",")),
+        }),
+        ..Draft::event(
+            Some(branch.as_str()),
+            format!("requires {}", listed.join(", ")),
+            pr,
+        )
+    })?;
     println!("{target} now requires {}", listed.join(", "));
     Ok(Exit::Ok)
 }
 
+/// Everything a branch requires once `added` joins what it already `required`.
+///
+/// Additive and deduplicated, so declaring the same requirement twice is not an
+/// error and re-running a script does not accumulate duplicates. The result is
+/// the whole list, because each `depends` statement replaces the one before.
+fn with_requirements(required: &[Requirement], added: &[Requirement]) -> Vec<String> {
+    let mut texts: Vec<String> = required.iter().map(ToString::to_string).collect();
+    for requirement in added {
+        let text = requirement.to_string();
+        if !texts.contains(&text) {
+            texts.push(text);
+        }
+    }
+    texts.sort();
+    texts
+}
+
 #[cfg(test)]
 mod tests {
-    use super::spoken;
+    use super::{spoken, with_requirements};
+    use knives::ids::Requirement;
 
     #[test]
     fn track_prose_preserves_the_established_human_output() {
@@ -417,5 +471,17 @@ mod tests {
         ] {
             assert_eq!(spoken(event), expected);
         }
+    }
+
+    #[test]
+    fn requirements_join_what_was_already_required_without_duplicates() {
+        let parse = |text: &str| Requirement::parse(text).expect("a requirement");
+        assert_eq!(
+            with_requirements(
+                &[parse("sibling#49"), parse("other#7")],
+                &[parse("sibling#49"), parse("another#3")],
+            ),
+            ["another#3", "other#7", "sibling#49"]
+        );
     }
 }

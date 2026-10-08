@@ -815,6 +815,14 @@ fn forced_finish_with_supersession_writes_one_atomic_provenance_event() {
         event.contains("superseded by feat/replacement"),
         "event: {event}"
     );
+    assert_eq!(
+        entries[1].statement,
+        Some(knives::statement::Statement {
+            kind: knives::statement::StatementKind::Superseded,
+            value: Some("feat/replacement".to_owned()),
+        }),
+        "the forced release's one event carries the supersession"
+    );
 }
 
 #[test]

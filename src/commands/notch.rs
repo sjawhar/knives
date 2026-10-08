@@ -332,6 +332,7 @@ pub fn run(request: &Request<'_>, output: crate::cli::Output) -> anyhow::Result<
                 subject: request.subject,
                 kind: Kind::Note,
                 disposition: request.disposition.map(str::to_owned),
+                statement: None,
                 text: text.to_owned(),
                 evidence: request.evidence.to_vec(),
                 pr,

@@ -395,6 +395,7 @@ pub(crate) fn record_edit_event(
         subject: Some(record.release),
         kind: Kind::Event,
         disposition: None,
+        statement: None,
         text: format!(
             "edited {}: {}; parents: {}",
             record.release,
