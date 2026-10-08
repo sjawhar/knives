@@ -34,6 +34,7 @@ pub mod hook;
 pub mod ids;
 pub mod jj;
 pub mod ledger;
+pub mod ledger_git;
 pub mod lock;
 pub mod pins;
 pub mod release_model;
