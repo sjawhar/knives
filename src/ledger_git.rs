@@ -70,10 +70,10 @@ pub enum GitError {
         path: PathBuf,
         detail: &'static str,
     },
-    #[error("{path:?} is a directory on disk but a file in this machine's ref")]
+    #[error("{path:?} is a file on disk and a directory in this machine's ref, or the reverse")]
     Shape { path: PathBuf },
     #[error(
-        "refusing to push {machine}: {remote} has its ref but this checkout never committed as it, so it is another machine's"
+        "refusing to write as {machine}: {remote} has its ref but this checkout never committed as it, so the name is another machine's"
     )]
     NotOwn { machine: String, remote: String },
 }
@@ -87,6 +87,11 @@ pub enum GitError {
 /// materialised from a peer is not committed again as this machine's own.
 /// `Ok(None)` when nothing is new, and the ref is then untouched.
 ///
+/// A remote that has `machine`'s ref when this checkout has none means the
+/// name is another machine's, or this checkout was recreated; either way a
+/// commit here would start a second history that the push then rejects, so
+/// the call refuses with [`GitError::NotOwn`] instead, as [`push`] does.
+///
 /// The ref moves by compare-and-swap against the value read at the start, so
 /// a second writer for the same machine racing this one fails loudly rather
 /// than lose the other's commit.
@@ -95,7 +100,15 @@ pub fn commit_new_entries(repo_dir: &Path, machine: &str) -> Result<Option<Commi
     let mut previous = None;
     let mut base = Vec::new();
     let mut carried = BTreeSet::new();
+    let mut fetched_copy = None;
     for (name, commit) in references(repo_dir, &[OWN, FETCHED])? {
+        if let Some((remote, fetched)) = name
+            .strip_prefix(FETCHED)
+            .and_then(|rest| rest.split_once('/'))
+            && fetched == machine
+        {
+            fetched_copy.get_or_insert_with(|| remote.to_owned());
+        }
         let items = tree_items(repo_dir, &commit)?;
         if name == reference {
             carried.extend(
@@ -114,6 +127,14 @@ pub fn commit_new_entries(repo_dir: &Path, machine: &str) -> Result<Option<Commi
                     .map(|item| item.path),
             );
         }
+    }
+    if previous.is_none()
+        && let Some(remote) = fetched_copy
+    {
+        return Err(GitError::NotOwn {
+            machine: machine.to_owned(),
+            remote,
+        });
     }
     let mut added = local_entries(repo_dir)?;
     added.retain(|path| !carried.contains(path));
@@ -206,9 +227,10 @@ pub fn push(repo_dir: &Path, remote: &str, machine: &str) -> Result<(), GitError
 ///
 /// Each entry is written whole to a temporary name and renamed into place,
 /// never over a file already there; see [`write_entry`]. A tree item that is
-/// not a regular file, or whose path would leave `repo_dir` or enter a `.git`,
-/// fails the whole call before anything is written: a peer's ref must not
-/// reach outside the ledger.
+/// not an entry file, or whose path would leave `repo_dir` or enter a `.git`,
+/// fails the whole call before anything is written: `mktree` accepts names
+/// like `..` and `.git`, so a peer's ref must be checked before it reaches the
+/// filesystem.
 pub fn materialise(repo_dir: &Path, refs: &[MachineRef]) -> Result<usize, GitError> {
     let mut missing = BTreeMap::new();
     for machine_ref in refs {
@@ -415,10 +437,13 @@ fn write_tree(
             kind: "blob".to_owned(),
             oid,
         };
-        directories
+        let replaced = directories
             .entry(directory.clone())
             .or_default()
             .insert(name, blob);
+        if replaced.is_some_and(|node| node.is_tree()) {
+            return Err(GitError::Shape { path });
+        }
         while let Some((parent, name)) = split(&directory) {
             if !dirty.insert(directory.clone()) {
                 break;
@@ -484,7 +509,9 @@ fn split(path: &Path) -> Option<(PathBuf, OsString)> {
 ///
 /// The machine is author and committer, with an empty email, so a ledger
 /// commit neither depends on nor carries the git identity of whoever set up
-/// the box: a machine with no `user.name` still commits.
+/// the box: a machine with no `user.name` still commits. It is never signed,
+/// so a `commit.gpgSign` meant for the box's own commits cannot stall a sweep
+/// on a passphrase or a signing agent.
 fn commit_tree(
     repo_dir: &Path,
     machine: &str,
@@ -494,6 +521,7 @@ fn commit_tree(
     let mut command = crate::bind::git(repo_dir);
     command.args([
         "commit-tree",
+        "--no-gpg-sign",
         "-m",
         &format!("{machine}: new ledger entries"),
     ]);
@@ -573,12 +601,14 @@ fn tree_item(record: &[u8]) -> Option<TreeItem> {
     })
 }
 
-/// Refuse a tree item that is not a regular file, or whose path leaves the
-/// ledger directory or enters a `.git`.
+/// Refuse a tree item that is not an entry file as [`commit_new_entries`]
+/// writes one (a `100644` blob named `*.md`), or whose path leaves the ledger
+/// directory or enters a `.git`.
 fn check_entry(commit: &CommitId, item: &TreeItem) -> Result<(), GitError> {
-    let detail = if !item.node.is_blob() || !matches!(item.node.mode.as_str(), "100644" | "100755")
-    {
-        Some("not a regular file")
+    let detail = if !item.node.is_blob() || item.node.mode != "100644" {
+        Some("not a regular, non-executable file")
+    } else if item.path.extension() != Some(OsStr::new("md")) {
+        Some("not named *.md")
     } else if !item.path.components().all(
         |component| matches!(component, Component::Normal(name) if !name.eq_ignore_ascii_case(".git")),
     ) {

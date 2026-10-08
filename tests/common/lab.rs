@@ -704,8 +704,17 @@ pub fn knives_release(lab: &Lab, home: &tempfile::TempDir, args: &[&str]) -> std
 }
 
 fn git<const N: usize>(directory: &Path, trunk: &str, args: [&str; N]) {
-    let status = Command::new("git")
+    let status = git_command(directory, trunk)
         .args(args)
+        .status()
+        .expect("run git");
+    assert!(status.success(), "git command failed");
+}
+
+/// `git` in `directory` with the lab's identity and initial branch pinned.
+fn git_command(directory: &Path, trunk: &str) -> Command {
+    let mut command = Command::new("git");
+    command
         .current_dir(directory)
         .env("GIT_AUTHOR_NAME", "Knives Lab")
         .env("GIT_AUTHOR_EMAIL", "knives-lab@example.test")
@@ -717,10 +726,8 @@ fn git<const N: usize>(directory: &Path, trunk: &str, args: [&str; N]) {
         // locally, red in CI, which is exactly the difference a test harness must avoid.
         .env("GIT_CONFIG_COUNT", "1")
         .env("GIT_CONFIG_KEY_0", "init.defaultBranch")
-        .env("GIT_CONFIG_VALUE_0", trunk)
-        .status()
-        .expect("run git");
-    assert!(status.success(), "git command failed");
+        .env("GIT_CONFIG_VALUE_0", trunk);
+    command
 }
 
 fn configure_jj_repo_identity(directory: &Path) {
@@ -764,6 +771,40 @@ pub fn git_repository(root: &Path, remotes: &[(&str, &str)]) {
     for (name, url) in remotes {
         git(root, "main", ["remote", "add", name, url]);
     }
+}
+
+/// `git init --bare` at `root`: the shape of a remote several machines share.
+pub fn git_bare_repository(root: &Path) {
+    let parent = root.parent().expect("repository path has a parent");
+    std::fs::create_dir_all(parent).expect("create repository parent");
+    git(
+        parent,
+        "main",
+        [
+            "init",
+            "--quiet",
+            "--bare",
+            root.to_str().expect("utf-8 path"),
+        ],
+    );
+}
+
+/// git's trimmed stdout in `directory`, with the lab's identity pinned as
+/// every lab git is; the command must succeed.
+pub fn git_output<const N: usize>(directory: &Path, args: [&str; N]) -> String {
+    let output = git_command(directory, "main")
+        .args(args)
+        .output()
+        .expect("run git");
+    assert!(
+        output.status.success(),
+        "git command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("utf-8 git output")
+        .trim()
+        .to_owned()
 }
 
 /// A colocated jj checkout with the given remotes: what the scan looks for.
