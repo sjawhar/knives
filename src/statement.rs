@@ -183,10 +183,7 @@ mod tests {
         );
 
         // When / Then: the newer instant is live in either arrival order
-        for entries in [
-            [older.clone(), newer.clone()],
-            [newer.clone(), older.clone()],
-        ] {
+        for entries in [[older.clone(), newer.clone()], [newer, older]] {
             assert_eq!(
                 Statements::from_entries(&entries).pull("feat/alpha"),
                 Some(1234)

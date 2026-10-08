@@ -1235,6 +1235,7 @@ mod tests {
             subject: Some("feat/alpha".to_owned()),
             kind: crate::ledger::Kind::Note,
             disposition: Some("ruled-out".to_owned()),
+            statement: None,
             text: format!("first\n{}", "x".repeat(140)),
             evidence: Vec::new(),
             anchor: None,

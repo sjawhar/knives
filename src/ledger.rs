@@ -1,4 +1,4 @@
-// allow: SIZE_OK: 1490 lines - entry type, storage, filters, and writer are one domain.
+// allow: SIZE_OK: 1586 lines - entry type, storage, filters, and writer are one domain.
 //! What agents did and decided here, in order, forever.
 //!
 //! [`crate::store`] holds current intent and is rewritten whole on every change:
@@ -181,6 +181,22 @@ impl Frontmatter {
         }
     }
 
+    /// The frontmatter as TOML, with any statement as one inline table.
+    ///
+    /// toml writes every nested struct as a `[section]`, never inline, so the
+    /// statement is rendered on its own and put first: the first line of a
+    /// document always belongs to its root table, whatever sections follow.
+    fn into_toml(mut self) -> Result<String, toml::ser::Error> {
+        let mut text = String::new();
+        if let Some(statement) = self.statement.take() {
+            text.push_str("statement = ");
+            statement.serialize(toml::ser::ValueSerializer::new(&mut text))?;
+            text.push('\n');
+        }
+        text.push_str(&toml::to_string(&self)?);
+        Ok(text)
+    }
+
     fn into_entry(self, text: String) -> Entry {
         Entry {
             ts: self.ts,
@@ -259,7 +275,7 @@ impl Ledger {
         })?;
         let contents = format!(
             "+++\n{}+++\n{}\n",
-            toml::to_string(&Frontmatter::of(entry))?,
+            Frontmatter::of(entry).into_toml()?,
             entry.text
         );
         std::fs::create_dir_all(&self.path).map_err(|source| LedgerError::Write {
@@ -733,6 +749,7 @@ mod tests {
             pr: None,
             parents: Vec::new(),
             disposition: None,
+            statement: None,
         }
     }
     fn entry_at(ts: &str, subject: Option<&str>, text: &str) -> Entry {
@@ -1357,6 +1374,74 @@ mod tests {
             .unwrap();
         let text = std::fs::read_to_string(only_file(plain.path())).unwrap();
         assert!(!text.contains("disposition"), "was: {text}");
+    }
+
+    #[test]
+    fn a_statement_round_trips_as_an_inline_table_and_an_entry_without_one_stays_clean() {
+        // The statement is one machine-readable line in the file, and a forget
+        // (no value) must come back as a forget rather than as no statement.
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = Ledger::at(dir.path().join("a-repo"));
+        let stated = Entry {
+            kind: Kind::Event,
+            statement: Some(Statement {
+                kind: crate::statement::StatementKind::Pull,
+                value: Some("1234".to_owned()),
+            }),
+            ..entry(Some("feat/alpha"), "stated as #1234")
+        };
+        ledger.append(&stated).unwrap();
+        assert_eq!(ledger.entries().unwrap(), vec![stated]);
+        let text = std::fs::read_to_string(only_file(ledger.path())).unwrap();
+        assert!(
+            text.contains("\nstatement = { kind = \"pull\", value = \"1234\" }\n"),
+            "was: {text}"
+        );
+
+        let forget_dir = tempfile::tempdir().unwrap();
+        let forget_ledger = Ledger::at(forget_dir.path().join("a-repo"));
+        let forget = Entry {
+            kind: Kind::Event,
+            statement: Some(Statement {
+                kind: crate::statement::StatementKind::Pull,
+                value: None,
+            }),
+            ..entry(Some("feat/alpha"), "pull request statement forgotten")
+        };
+        forget_ledger.append(&forget).unwrap();
+        assert_eq!(forget_ledger.entries().unwrap(), vec![forget]);
+        let text = std::fs::read_to_string(only_file(forget_ledger.path())).unwrap();
+        assert!(
+            text.contains("\nstatement = { kind = \"pull\" }\n"),
+            "was: {text}"
+        );
+
+        // And: beside a field toml writes as a section, the statement still
+        // reads back as the entry's own rather than as part of the section.
+        let sectioned_dir = tempfile::tempdir().unwrap();
+        let sectioned_ledger = Ledger::at(sectioned_dir.path().join("a-repo"));
+        let sectioned = Entry {
+            kind: Kind::Event,
+            statement: Some(Statement {
+                kind: crate::statement::StatementKind::Superseded,
+                value: Some("feat/alpha-v2".to_owned()),
+            }),
+            parents: vec![RecordedParent {
+                commit: "a".repeat(40),
+                branches: vec!["feat/alpha".to_owned()],
+            }],
+            ..entry(Some("feat/alpha"), "superseded by feat/alpha-v2")
+        };
+        sectioned_ledger.append(&sectioned).unwrap();
+        assert_eq!(sectioned_ledger.entries().unwrap(), vec![sectioned]);
+
+        let plain_dir = tempfile::tempdir().unwrap();
+        let plain = Ledger::at(plain_dir.path().join("a-repo"));
+        plain
+            .append(&entry(Some("feat/beta"), "still investigating"))
+            .unwrap();
+        let text = std::fs::read_to_string(only_file(plain.path())).unwrap();
+        assert!(!text.contains("statement"), "was: {text}");
     }
 
     #[test]

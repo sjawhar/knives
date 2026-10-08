@@ -2056,6 +2056,7 @@ mod cut_tests {
             subject: Some(subject.to_owned()),
             kind: Kind::Event,
             disposition: None,
+            statement: None,
             text: format!(
                 "cut {subject} as {created} with {} parent(s)",
                 members.len()
