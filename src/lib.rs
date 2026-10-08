@@ -40,5 +40,6 @@ pub mod release_model;
 pub mod remote_url;
 pub mod seen;
 pub mod snapshot;
+pub mod statement;
 pub mod store;
 pub mod timing;

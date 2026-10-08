@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::default_config_path;
 use crate::ids::RepoName;
+use crate::statement::Statement;
 
 /// Where a repository's ledger lives: a directory of entry files beside
 /// `state.json`.
@@ -97,6 +98,11 @@ pub struct Entry {
     /// unknown frontmatter keys are the ledger's compatible extension point.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disposition: Option<String>,
+    /// A statement about the subject that knives cannot infer — its pull
+    /// request, that it has none upstream, what superseded it, what it needs
+    /// first. Only this field states anything: an event's prose never does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub statement: Option<Statement>,
     pub text: String,
     /// Free strings backing the entry: commit ids, `file:line`, `<repo>#<number>`,
     /// URLs, and they may name other repositories. Every audit claim that
@@ -147,6 +153,8 @@ struct Frontmatter {
     kind: Kind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     disposition: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    statement: Option<Statement>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     evidence: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -165,6 +173,7 @@ impl Frontmatter {
             subject: entry.subject.clone(),
             kind: entry.kind,
             disposition: entry.disposition.clone(),
+            statement: entry.statement.clone(),
             evidence: entry.evidence.clone(),
             anchor: entry.anchor.clone(),
             pr: entry.pr,
@@ -179,6 +188,7 @@ impl Frontmatter {
             subject: self.subject,
             kind: self.kind,
             disposition: self.disposition,
+            statement: self.statement,
             text,
             evidence: self.evidence,
             anchor: self.anchor,
@@ -533,6 +543,7 @@ impl Scribe {
             subject: draft.subject.map(str::to_owned),
             kind: draft.kind,
             disposition: draft.disposition.clone(),
+            statement: None,
             text: draft.text.clone(),
             evidence: draft.evidence.clone(),
             anchor: self.anchor(draft.subject),
