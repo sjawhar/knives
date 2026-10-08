@@ -310,8 +310,18 @@ pub fn run(request: &Request<'_>, output: crate::cli::Output) -> anyhow::Result<
     let report = match request.message {
         Some(text) => {
             // The store is read, never written: a notch changes no intent, and a
-            // ledger append needs no store lock.
-            let store = Store::open(default_state_path(), &[repo])?;
+            // ledger append needs no store lock. Only a note about a branch, with
+            // no number given, asks it for the branch's stated pull request, so
+            // only that note reads the fork's ledger.
+            let asks_stated_pull = request.pr.is_none()
+                && request
+                    .subject
+                    .is_some_and(|subject| !subject.starts_with('#'));
+            let fork = [repo];
+            let store = Store::open(
+                default_state_path(),
+                if asks_stated_pull { &fork } else { &[] },
+            )?;
             let pr = request
                 .pr
                 .or_else(|| pr_subject(request.subject))

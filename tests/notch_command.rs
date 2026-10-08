@@ -394,6 +394,80 @@ fn an_unreadable_ledger_is_incomplete_and_an_unknown_repo_is_usage() {
 }
 
 #[test]
+fn only_a_note_about_a_branch_reads_the_ledger_for_its_stated_pull_request() {
+    // Given: a ledger holding a file that is not an entry
+    let checkout = checkout();
+    let home = home();
+    let ledger = home.path().join("ledger").join("a-repo");
+    std::fs::create_dir_all(&ledger).expect("ledger directory");
+    std::fs::write(
+        ledger.join("20260815T221403.000000000Z-0000.md"),
+        "not a ledger entry at all\n",
+    )
+    .expect("corrupt entry");
+    let write = |args: &[&str]| knives(&home, &checkout, checkout.path(), args);
+
+    // When / Then: a note that asks nothing about a branch's statements is an
+    // append, and an append reads no entry
+    for args in [
+        &[
+            "--text",
+            "notch",
+            "--repo",
+            "a-repo",
+            "-m",
+            "about the fork",
+        ][..],
+        &[
+            "--text",
+            "notch",
+            "#1157",
+            "--repo",
+            "a-repo",
+            "-m",
+            "about a pull request",
+        ][..],
+        &[
+            "--text",
+            "notch",
+            "feat/alpha",
+            "--pr",
+            "1157",
+            "--repo",
+            "a-repo",
+            "-m",
+            "numbered",
+        ][..],
+    ] {
+        let written = write(args);
+        assert_eq!(
+            written.status.code(),
+            Some(0),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&written.stderr)
+        );
+    }
+
+    // And: a note about a branch with no number asks for its stated pull
+    // request, so it cannot answer and says which file stopped it
+    let branch = write(&[
+        "--text",
+        "notch",
+        "feat/alpha",
+        "--repo",
+        "a-repo",
+        "-m",
+        "about a branch",
+    ]);
+    assert_eq!(branch.status.code(), Some(3));
+    assert!(
+        String::from_utf8_lossy(&branch.stderr).contains("0000.md"),
+        "the error must name the entry file; was: {}",
+        String::from_utf8_lossy(&branch.stderr)
+    );
+}
+
+#[test]
 fn a_read_of_a_repo_with_no_ledger_yet_is_success_and_says_so() {
     let checkout = checkout();
     let home = home();
