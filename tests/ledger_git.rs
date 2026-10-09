@@ -16,12 +16,17 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use knives::ids::RepoName;
+use knives::ids::UpstreamName;
 use knives::ledger::{Entry, Kind, Ledger};
 use knives::ledger_git::{self, GitError, MachineRef, Repository};
 
-const REPO: &str = "a-repo";
-const OTHER: &str = "other-repo";
+/// A fork's ledger directory is its upstream's `<owner>/<name>`.
+const REPO: &str = "acme/a-repo";
+/// Another fork of the same owner, so that carrying [`REPO`] alone must still
+/// leave this one's directory out of every tree.
+const OTHER: &str = "acme/other-repo";
+/// The directory [`REPO`] and [`OTHER`] share.
+const OWNER: &str = "acme";
 
 /// A bare remote and a temporary directory to hold the machines that share it.
 fn remote() -> (tempfile::TempDir, PathBuf) {
@@ -44,7 +49,7 @@ fn carrying(machine: &Path, forks: &[&str]) -> Repository {
     Repository::new(
         &machine.join(".git"),
         machine,
-        forks.iter().map(|fork| RepoName::new(*fork)),
+        forks.iter().map(|fork| UpstreamName::new(*fork)),
     )
     .expect("a repository over the machine's ledger root")
 }
@@ -486,22 +491,24 @@ fn a_repository_commits_and_materialises_only_the_forks_it_carries() {
     // entry, and pushes.
     ledger_git::commit_new_entries(&carried, "alpha")
         .expect("commit")
-        .expect("a-repo's entries are new");
+        .expect("acme/a-repo's entries are new");
     append_to(&alpha, REPO, "ses_alpha", 1);
     append_to(&alpha, OTHER, "ses_alpha", 1);
     ledger_git::commit_new_entries(&carried, "alpha")
         .expect("commit")
-        .expect("a-repo's newest entry is new");
+        .expect("acme/a-repo's newest entry is new");
     ledger_git::push(&carried, "origin", "alpha").expect("push");
 
     // Then: no tree of any commit the ref reaches, here or on the remote,
-    // names the fork it does not carry; every entry of the one it does is there.
+    // names the fork it does not carry; every entry of the one it does is
+    // there. The owner directory both forks share is in the tree, as the
+    // parent of the one it carries.
     for git_dir in [alpha.join(".git"), company] {
         let paths = paths_ever_under(&git_dir, "refs/knives/alpha");
         assert!(
             paths
                 .iter()
-                .all(|path| path == REPO || path.starts_with(&format!("{REPO}/"))),
+                .all(|path| path == OWNER || path == REPO || path.starts_with(&format!("{REPO}/"))),
             "{} carries a fork it was not given: {paths:?}",
             git_dir.display()
         );
@@ -521,12 +528,12 @@ fn a_repository_commits_and_materialises_only_the_forks_it_carries() {
         .expect("both forks' entries are new");
     ledger_git::push(&both, "origin", "peer").expect("push");
 
-    // When: a repository carrying only a-repo fetches and materialises them.
+    // When: a repository carrying only acme/a-repo fetches and materialises them.
     let only_repo = repository(&beta);
     let found = ledger_git::fetch(&only_repo, "origin").expect("fetch");
     let written = ledger_git::materialise(&only_repo, &found).expect("materialise");
 
-    // Then: only a-repo's entry is written; the other fork's directory never appears.
+    // Then: only acme/a-repo's entry is written; the other fork's directory never appears.
     assert_eq!(written, 1);
     assert_eq!(file_names(&beta).len(), 1);
     assert!(!beta.join(OTHER).exists(), "an uncarried fork was written");
@@ -534,9 +541,9 @@ fn a_repository_commits_and_materialises_only_the_forks_it_carries() {
 
 #[test]
 fn two_repositories_over_one_ledger_root_each_carry_their_own_forks_to_their_own_remote() {
-    // Given: one ledger root, its own `.git` carrying a-repo to one remote,
-    // and a git directory elsewhere over the same root carrying other-repo to
-    // another.
+    // Given: one ledger root, its own `.git` carrying acme/a-repo to one
+    // remote, and a git directory elsewhere over the same root carrying
+    // acme/other-repo to another.
     let (root, company) = remote();
     let personal = root.path().join("personal-remote.git");
     lab::git_bare_repository(&personal);
@@ -560,7 +567,7 @@ fn two_repositories_over_one_ledger_root_each_carry_their_own_forks_to_their_own
     append_to(&alpha, REPO, "ses_alpha", 2);
     append_to(&alpha, OTHER, "ses_alpha", 3);
     let first = repository(&alpha);
-    let other = Repository::new(&second_git_dir, &alpha, [RepoName::new(OTHER)])
+    let other = Repository::new(&second_git_dir, &alpha, [UpstreamName::new(OTHER)])
         .expect("a second repository over the root");
 
     // When: each commits as alpha and pushes to its own remote.
@@ -597,13 +604,25 @@ fn two_repositories_over_one_ledger_root_each_carry_their_own_forks_to_their_own
 }
 
 #[test]
-fn a_fork_name_that_is_not_one_directory_of_the_root_is_refused() {
+fn a_fork_name_that_is_not_an_owner_and_a_name_is_refused() {
     let (root, remote) = remote();
     let alpha = machine(root.path(), "alpha", &remote);
-    for name in ["", ".", "..", "../escape", "a/b", "a\\b", ".git", ".GIT"] {
+    for name in [
+        "",
+        ".",
+        "..",
+        "a-repo",
+        "../escape",
+        "acme/..",
+        "acme/a/b",
+        "a\\b",
+        "acme/a\\b",
+        ".git",
+        "acme/.GIT",
+    ] {
         assert!(
             matches!(
-                Repository::new(&alpha.join(".git"), &alpha, [RepoName::new(name)]),
+                Repository::new(&alpha.join(".git"), &alpha, [UpstreamName::new(name)]),
                 Err(GitError::Fork { .. })
             ),
             "{name:?} was accepted"

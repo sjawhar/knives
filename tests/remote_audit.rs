@@ -100,7 +100,7 @@ fn gather_with(
             Some("test"),
         );
     }
-    let store = Store::open(state.path().join("state.json"), &[&fork.name]).expect("store");
+    let store = Store::open(state.path().join("state.json"), &[&fork.upstream]).expect("store");
     audit::gather(&audit::AuditInput {
         fork: &fork,
         store: &store,

@@ -117,7 +117,7 @@ fn hold_claim(home: &tempfile::TempDir, branch: &str) {
         Store::open_for_update(home.path().join("state.json"), &[]).expect("open store");
     let _ = store.claim(
         &knives::ids::BranchTarget::new(
-            knives::ids::RepoName::new("demo"),
+            knives::ids::UpstreamName::new("demo"),
             BranchName::new(branch),
         ),
         &knives::commands::claim::Identity {
@@ -245,7 +245,7 @@ fn finish_releases_without_consulting_the_forge() {
         state["claims"]
     );
     let target = knives::ids::BranchTarget::new(
-        knives::ids::RepoName::new("demo"),
+        knives::ids::UpstreamName::new("demo"),
         BranchName::new("feat/alpha"),
     );
     assert_eq!(
@@ -599,7 +599,9 @@ fn stating_a_pull_request_and_a_dependency_leaves_both_statements_in_the_ledger(
     );
 
     // Then: every statement is in order, anchored, and the stated pull request
-    // is stamped on the entries written while it was stated
+    // is stamped on the entries written while it was stated. A requirement
+    // typed by the sibling's registry key is recorded under its repository's
+    // `<owner>/<name>`, so it names the same fork on every machine.
     let entries = knives::ledger::Ledger::at(home.path().join("ledger").join("demo"))
         .entries()
         .expect("read ledger");
@@ -608,8 +610,8 @@ fn stating_a_pull_request_and_a_dependency_leaves_both_statements_in_the_ledger(
         texts,
         [
             "stated as #4545",
-            "requires sibling#49",
-            "requires sibling#12",
+            "requires maintainer/other#49",
+            "requires maintainer/other#12",
             "pull request statement forgotten"
         ],
         "was: {entries:?}"
@@ -623,10 +625,10 @@ fn stating_a_pull_request_and_a_dependency_leaves_both_statements_in_the_ledger(
             .collect::<Vec<_>>(),
         [
             Some(stating(StatementKind::Pull, Some("4545"))),
-            Some(stating(StatementKind::Depends, Some("sibling#49"))),
+            Some(stating(StatementKind::Depends, Some("maintainer/other#49"))),
             Some(stating(
                 StatementKind::Depends,
-                Some("sibling#12,sibling#49")
+                Some("maintainer/other#12,maintainer/other#49")
             )),
             Some(stating(StatementKind::Pull, None)),
         ],

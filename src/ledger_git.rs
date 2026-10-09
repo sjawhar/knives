@@ -1058,7 +1058,7 @@ mod tests {
 
     #[test]
     fn a_fork_is_exactly_an_owner_and_a_name() {
-        for name in ["metr/hawk", "ukgovernmentbeis/inspect_ai", "a.b/c-d"] {
+        for name in ["acme/tool", "acme-labs/tool_kit", "a.b/c-d"] {
             assert_eq!(
                 fork_directory(UpstreamName::new(name)).unwrap().as_str(),
                 name
@@ -1066,17 +1066,17 @@ mod tests {
         }
         for name in [
             "",
-            "hawk",
-            "metr/",
-            "/hawk",
-            "metr/hawk/x",
-            "../hawk",
-            "metr/..",
-            "./hawk",
-            ".git/hawk",
-            "metr/.GIT",
-            "metr\\hawk/x",
-            "metr/ha\\wk",
+            "tool",
+            "acme/",
+            "/tool",
+            "acme/tool/x",
+            "../tool",
+            "acme/..",
+            "./tool",
+            ".git/tool",
+            "acme/.GIT",
+            "acme\\tool/x",
+            "acme/to\\ol",
         ] {
             assert!(
                 matches!(

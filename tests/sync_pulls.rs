@@ -29,7 +29,7 @@ use std::collections::BTreeMap;
 fn sync_fails_closed_when_the_facts_batch_fails() {
     let lab = lab::Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
-    let name = knives::ids::RepoName::new("demo");
+    let name = knives::ids::UpstreamName::new("demo");
     let entry = lab_entry(&lab);
     let fork = lab::lab_fork(&lab, "demo", &entry);
     let forge = knives::forge::fake::FakeForge {
@@ -76,7 +76,7 @@ fn a_listed_state_wins_and_a_vanished_number_is_answered_by_the_batch() {
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     lab.publish_pull("feat/alpha", 42);
     lab.publish_pull("feat/alpha", 43);
-    let name = knives::ids::RepoName::new("demo");
+    let name = knives::ids::UpstreamName::new("demo");
     let entry = lab_entry(&lab);
     let fork = lab::lab_fork(&lab, "demo", &entry);
     let forge = knives::forge::fake::FakeForge {
@@ -133,7 +133,7 @@ fn sync_records_one_event_for_each_pull_request_that_moved() {
     // Given: three tracked pull requests that moved and one that did not.
     let lab = lab::Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
-    let name = knives::ids::RepoName::new("demo");
+    let name = knives::ids::UpstreamName::new("demo");
     let entry = RepoEntry::new(
         lab.upstream.display().to_string(),
         lab.work.display().to_string(),
@@ -216,7 +216,7 @@ fn sync_records_a_settled_pull_request_once_across_repeated_runs() {
     // Given: a merged pull request that remains listed by the forge.
     let lab = lab::Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
-    let name = knives::ids::RepoName::new("demo");
+    let name = knives::ids::UpstreamName::new("demo");
     let entry = lab_entry(&lab);
     let fork = lab::lab_fork(&lab, "demo", &entry);
     let forge = knives::forge::fake::FakeForge {
@@ -270,7 +270,7 @@ fn sync_records_an_advanced_pull_request_then_its_merge() {
     // Given: a tracked pull request whose head advanced before the forge reports it merged.
     let lab = lab::Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
-    let name = knives::ids::RepoName::new("demo");
+    let name = knives::ids::UpstreamName::new("demo");
     let entry = lab_entry(&lab);
     let fork = lab::lab_fork(&lab, "demo", &entry);
     let advanced = knives::forge::fake::FakeForge {
@@ -330,7 +330,7 @@ fn sync_records_each_consecutive_advance() {
     // Given: an open pull request whose head changes twice between sync runs.
     let lab = lab::Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
-    let name = knives::ids::RepoName::new("demo");
+    let name = knives::ids::UpstreamName::new("demo");
     let entry = lab_entry(&lab);
     let fork = lab::lab_fork(&lab, "demo", &entry);
     let first_advance = knives::forge::fake::FakeForge {

@@ -150,7 +150,7 @@ fn a_second_migration_writes_nothing_and_leaves_one_entry_per_statement() {
         .expect("the depends entry");
     assert_eq!(alpha_depends.pr, Some(4545));
     assert_eq!(alpha_depends.owner, "ses_migrate");
-    let repo = knives::ids::RepoName::new("a-repo");
+    let repo = knives::ids::UpstreamName::new("a-repo");
     let store = knives::store::Store::open(home.path().join("state.json"), &[&repo])
         .expect("open the store");
     let alpha = knives::ids::BranchTarget::new(repo, knives::ids::BranchName::new("feat/alpha"));

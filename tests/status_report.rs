@@ -242,7 +242,7 @@ fn status_with_the_landed_probe_reports_a_merged_branch_and_leaves_no_trace() {
         lab.upstream.display().to_string(),
         lab.work.display().to_string(),
     );
-    let name = knives::ids::RepoName::new("a-repo");
+    let name = knives::ids::UpstreamName::new("a-repo");
     let temp = std::env::temp_dir().join(format!("knives-status-{}", std::process::id()));
     let store = knives::store::Store::open(temp.join("state.json"), &[&name]).expect("store");
 
@@ -341,7 +341,7 @@ fn status_reports_branch_overlap_after_upstream_advances_without_landed_probe() 
         .parent()
         .expect("lab work directory has a parent")
         .join("state.json");
-    let name = knives::ids::RepoName::new("a-repo");
+    let name = knives::ids::UpstreamName::new("a-repo");
     let store = knives::store::Store::open(store_path, &[&name]).expect("store");
 
     // When: status deliberately skips only the landed replay
@@ -384,7 +384,7 @@ fn status_reports_a_branch_carried_elsewhere() {
         lab.upstream.display().to_string(),
         lab.work.display().to_string(),
     );
-    let name = knives::ids::RepoName::new("a-repo");
+    let name = knives::ids::UpstreamName::new("a-repo");
     let temp = std::env::temp_dir().join(format!("knives-status-{}", std::process::id()));
     let store = knives::store::Store::open(temp.join("state.json"), &[&name]).expect("store");
 
@@ -428,7 +428,7 @@ fn status_reports_a_carrier_for_a_closed_pull_request() {
         lab.upstream.display().to_string(),
         lab.work.display().to_string(),
     );
-    let name = knives::ids::RepoName::new("a-repo");
+    let name = knives::ids::UpstreamName::new("a-repo");
     let temp = std::env::temp_dir().join(format!("knives-status-{}", std::process::id()));
     let store = knives::store::Store::open(temp.join("state.json"), &[&name]).expect("store");
     let forge = knives::forge::fake::FakeForge {
@@ -488,7 +488,7 @@ fn status_does_not_report_trunk_as_a_carrier_without_landed_probe() {
         lab.upstream.display().to_string(),
         lab.work.display().to_string(),
     );
-    let name = knives::ids::RepoName::new("a-repo");
+    let name = knives::ids::UpstreamName::new("a-repo");
     let temp = std::env::temp_dir().join(format!("knives-status-{}", std::process::id()));
     let store = knives::store::Store::open(temp.join("state.json"), &[&name]).expect("store");
 
@@ -524,7 +524,7 @@ fn status_carries_each_branchs_newest_notch_in_json_and_in_text() {
     let lab = lab::Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     lab.branch("feat/beta", "beta.txt", "beta\n");
-    let name = knives::ids::RepoName::new("demo");
+    let name = knives::ids::UpstreamName::new("demo");
     let entry = RepoEntry::new(
         lab.upstream.display().to_string(),
         lab.work.display().to_string(),
@@ -638,7 +638,7 @@ fn status_carries_each_branchs_newest_notch_in_json_and_in_text() {
 fn status_carries_repo_level_notches_in_json_and_text() {
     let lab = lab::Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
-    let name = knives::ids::RepoName::new("demo");
+    let name = knives::ids::UpstreamName::new("demo");
     let entry = lab_entry(&lab);
     let state = tempfile::tempdir().expect("state directory");
     let store = Store::open(state.path().join("state.json"), &[&name]).expect("open store");
@@ -695,7 +695,7 @@ fn status_reports_a_repo_level_immutable_heads_rule_that_differs_from_the_forks(
     let state = tempfile::tempdir().expect("state directory");
     let store = Store::open(
         state.path().join("state.json"),
-        &[&knives::ids::RepoName::new("demo")],
+        &[&knives::ids::UpstreamName::new("demo")],
     )
     .expect("open store");
 
@@ -741,7 +741,7 @@ fn status_is_silent_about_the_forks_own_immutable_heads_rule() {
     let state = tempfile::tempdir().expect("state directory");
     let store = Store::open(
         state.path().join("state.json"),
-        &[&knives::ids::RepoName::new("demo")],
+        &[&knives::ids::UpstreamName::new("demo")],
     )
     .expect("open store");
 

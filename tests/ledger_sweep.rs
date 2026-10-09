@@ -20,6 +20,29 @@ use std::time::{Duration, Instant};
 
 use knives::ledger::{Entry, Kind, Ledger};
 
+/// The forge repository the lab fork's upstream is reached by in these
+/// tests. A filesystem upstream names no repository another machine could
+/// share, so its fork is kept under its registry key, and a destination
+/// refuses to carry a name that is not an `<owner>/<name>`.
+const UPSTREAM: &str = "https://forge.invalid/acme/demo";
+/// [`UPSTREAM`]'s `<owner>/<name>`: what the ledger keeps the lab fork under.
+const FORK: &str = "acme/demo";
+
+/// A config home whose registry calls the lab fork `demo`, with [`UPSTREAM`]
+/// as its upstream, and the lab's work checkout pointing there too.
+fn shared_home(lab: &lab::Lab) -> tempfile::TempDir {
+    let (home, _consumer) = lab::release_test_home(lab);
+    lab.upstream_at_forge_url(UPSTREAM);
+    let registry = home.path().join("repos.toml");
+    let text = std::fs::read_to_string(&registry).expect("read the registry");
+    std::fs::write(
+        &registry,
+        text.replace(&lab.upstream.display().to_string(), UPSTREAM),
+    )
+    .expect("write the registry");
+    home
+}
+
 /// Make `home`'s ledger root a repository that shares `forks` with `remote`
 /// as `machine`, and return the root.
 fn share(home: &Path, machine: &str, remote: &Path, forks: &[&str]) -> PathBuf {
@@ -139,8 +162,8 @@ fn a_burst_of_concurrent_sweeps_makes_one_commit_and_no_error() {
     const SWEEPS: usize = 16;
     let home = tempfile::tempdir().expect("config home");
     let (_remote_dir, remote) = bare_remote();
-    let root = share(home.path(), "alpha", &remote, &["a-repo"]);
-    append(&root, "a-repo", 12);
+    let root = share(home.path(), "alpha", &remote, &["acme/a-repo"]);
+    append(&root, "acme/a-repo", 12);
 
     // When: sixteen sweeps start at once.
     let children: Vec<_> = (0..SWEEPS)
@@ -207,8 +230,8 @@ fn a_sweep_with_nothing_new_does_nothing_and_succeeds() {
     // Given: a machine whose one entry is already swept.
     let home = tempfile::tempdir().expect("config home");
     let (_remote_dir, remote) = bare_remote();
-    let root = share(home.path(), "alpha", &remote, &["a-repo"]);
-    append(&root, "a-repo", 1);
+    let root = share(home.path(), "alpha", &remote, &["acme/a-repo"]);
+    append(&root, "acme/a-repo", 1);
     assert!(sweep(home.path()).status.success());
     let git_dir = root.join(".git");
     let before = git_in(&git_dir, &["rev-parse", "refs/knives/alpha"]).expect("a ref");
@@ -294,9 +317,9 @@ fn a_write_hands_off_to_a_sweep_and_does_not_wait_for_it() {
     // ledger repository's transport lock held, so any sweep stalls in its
     // first pass until the test lets go.
     let lab = lab::Lab::new();
-    let (home, _consumer) = lab::release_test_home(&lab);
+    let home = shared_home(&lab);
     let (_remote_dir, remote) = bare_remote();
-    let root = share(home.path(), "alpha", &remote, &["demo"]);
+    let root = share(home.path(), "alpha", &remote, &[FORK]);
     let transport = File::options()
         .read(true)
         .write(true)
@@ -348,9 +371,9 @@ fn a_burst_of_concurrent_writes_reaches_the_remote_without_a_failure() {
     // Given: a managed fork on a machine that shares its ledger.
     const WRITES: usize = 16;
     let lab = lab::Lab::new();
-    let (home, _consumer) = lab::release_test_home(&lab);
+    let home = shared_home(&lab);
     let (_remote_dir, remote) = bare_remote();
-    share(home.path(), "alpha", &remote, &["demo"]);
+    share(home.path(), "alpha", &remote, &[FORK]);
 
     // When: sixteen notes are written at once, each handing off.
     let children: Vec<_> = (0..WRITES)
@@ -438,11 +461,11 @@ fn a_statement_made_on_one_machine_shows_in_status_on_another_after_a_sweep() {
     // home and ledger, and a branch both can see.
     let lab = lab::Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
-    let (alpha, _consumer) = lab::release_test_home(&lab);
+    let alpha = shared_home(&lab);
     let beta = second_machine(alpha.path());
     let (_remote_dir, remote) = bare_remote();
-    share(alpha.path(), "alpha", &remote, &["demo"]);
-    share(beta.path(), "beta", &remote, &["demo"]);
+    share(alpha.path(), "alpha", &remote, &[FORK]);
+    share(beta.path(), "beta", &remote, &[FORK]);
 
     // When: alpha states the branch's pull request, and the sweep that write
     // handed off has carried it to the remote.
@@ -461,7 +484,7 @@ fn a_statement_made_on_one_machine_shows_in_status_on_another_after_a_sweep() {
     });
     settle(alpha.path());
     assert!(
-        !beta.path().join("ledger").join("demo").exists(),
+        !beta.path().join("ledger").join(FORK).exists(),
         "beta had alpha's entry before it asked"
     );
 
@@ -485,12 +508,12 @@ fn a_status_that_cannot_pull_says_so_and_still_answers() {
     // Given: a machine whose ledger remote cannot be reached.
     let lab = lab::Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
-    let (home, _consumer) = lab::release_test_home(&lab);
+    let home = shared_home(&lab);
     share(
         home.path(),
         "alpha",
         Path::new("/nonexistent/ledger.git"),
-        &["demo"],
+        &[FORK],
     );
 
     // When: status runs.
@@ -519,10 +542,10 @@ fn a_status_that_cannot_pull_says_so_and_still_answers() {
 fn status_counts_entries_the_remote_lacks_and_names_a_failed_sweeps_log() {
     // Given: a shared ledger with one entry no sweep has carried.
     let lab = lab::Lab::new();
-    let (home, _consumer) = lab::release_test_home(&lab);
+    let home = shared_home(&lab);
     let (_remote_dir, remote) = bare_remote();
-    let root = share(home.path(), "alpha", &remote, &["demo"]);
-    append(&root, "demo", 1);
+    let root = share(home.path(), "alpha", &remote, &[FORK]);
+    append(&root, FORK, 1);
 
     // When: status runs.
     let (code, report) = status_on(&lab, home.path());
@@ -570,12 +593,12 @@ fn a_release_cut_is_refused_when_the_ledger_cannot_be_pulled() {
     // cannot be reached.
     let lab = lab::Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
-    let (home, _consumer) = lab::release_test_home(&lab);
+    let home = shared_home(&lab);
     share(
         home.path(),
         "alpha",
         Path::new("/nonexistent/ledger.git"),
-        &["demo"],
+        &[FORK],
     );
 
     // When: the cut is asked for.

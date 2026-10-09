@@ -19,7 +19,7 @@ use std::collections::BTreeMap;
 use knives::commands::status::{self, BranchState};
 use knives::detect::{FindingKind, LandedVerdict};
 use knives::forge::{CheckRun, ChecksSummary, MergeCommit, PullRequest};
-use knives::ids::{BranchName, RepoName};
+use knives::ids::{BranchName, UpstreamName};
 use knives::jj::Repo;
 use knives::store::Store;
 use lab::{Lab, commit_at, lab_entry};
@@ -77,8 +77,11 @@ fn a_squash_merged_pull_the_trunk_contains_reads_in_trunk_despite_a_conflicting_
         ..knives::forge::fake::FakeForge::default()
     };
     let state = tempfile::tempdir().expect("state directory");
-    let store = Store::open(state.path().join("state.json"), &[&RepoName::new("demo")])
-        .expect("open store");
+    let store = Store::open(
+        state.path().join("state.json"),
+        &[&UpstreamName::new("demo")],
+    )
+    .expect("open store");
 
     // When: status gathers with the landed probe on
     let report = gather(&lab, &forge, &store, true);
@@ -115,8 +118,11 @@ fn a_branch_carrying_work_past_its_merged_pull_keeps_the_replay_verdict_and_says
         ..knives::forge::fake::FakeForge::default()
     };
     let state = tempfile::tempdir().expect("state directory");
-    let store = Store::open(state.path().join("state.json"), &[&RepoName::new("demo")])
-        .expect("open store");
+    let store = Store::open(
+        state.path().join("state.json"),
+        &[&UpstreamName::new("demo")],
+    )
+    .expect("open store");
 
     let report = gather(&lab, &forge, &store, true);
 
@@ -159,8 +165,11 @@ fn a_workflow_awaiting_approval_is_action_required_not_ok() {
         ..knives::forge::fake::FakeForge::default()
     };
     let state = tempfile::tempdir().expect("state directory");
-    let store = Store::open(state.path().join("state.json"), &[&RepoName::new("demo")])
-        .expect("open store");
+    let store = Store::open(
+        state.path().join("state.json"),
+        &[&UpstreamName::new("demo")],
+    )
+    .expect("open store");
 
     let report = gather(&lab, &forge, &store, false);
 
@@ -192,7 +201,7 @@ fn a_claim_on_a_branch_nothing_names_is_an_orphaned_claim_finding() {
     // workspace was never opened, beside a claim on a live branch
     let lab = Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
-    let name = RepoName::new("demo");
+    let name = UpstreamName::new("demo");
     let state = tempfile::tempdir().expect("state directory");
     let mut store = Store::open_for_update(state.path().join("state.json"), &[&name])
         .expect("open store for update");

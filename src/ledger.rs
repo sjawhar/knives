@@ -43,7 +43,7 @@ pub fn default_ledger_root() -> PathBuf {
 /// treats an owner and a repository name case-insensitively, and so does
 /// knives everywhere it compares remotes ([`crate::remote_url::same_remote`]
 /// uses `eq_ignore_ascii_case`): two machines whose `repos.toml` spells
-/// `metr/hawk` and `METR/hawk` check out one repository. Spelled as written,
+/// `acme/tool` and `Acme/Tool` check out one repository. Spelled as written,
 /// they would file that repository's entries in two directories on a
 /// case-sensitive filesystem, each machine reading only its own half, and the
 /// ledger would diverge without a word. That divergence is what naming a
@@ -1023,12 +1023,12 @@ mod tests {
             crate::config::test_support::EnvironmentGuard::capture(&["KNIVES_CONFIG_HOME"]);
         environment.set("KNIVES_CONFIG_HOME", "/tmp/knives-home");
         let entry = crate::config::RepoEntry::new(
-            "https://github.com/METR/Hawk.git",
-            "https://github.com/ours/hawk.git",
+            "https://forge.invalid/Acme/Tool.git",
+            "https://forge.invalid/ours/tool.git",
         );
         assert_eq!(
-            default_ledger_path(&entry.upstream_name("h")),
-            std::path::PathBuf::from("/tmp/knives-home/ledger/metr/hawk")
+            default_ledger_path(&entry.upstream_name("t")),
+            std::path::PathBuf::from("/tmp/knives-home/ledger/acme/tool")
         );
     }
 

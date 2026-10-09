@@ -247,7 +247,7 @@ fn a_forced_start_on_a_divergent_branch_refuses_before_seizing_the_claim() {
         };
         let _ = store.claim(
             &knives::ids::BranchTarget::new(
-                knives::ids::RepoName::new("demo"),
+                knives::ids::UpstreamName::new("demo"),
                 BranchName::new("feat/alpha"),
             ),
             &held,
@@ -286,7 +286,7 @@ fn a_forced_start_on_a_divergent_branch_refuses_before_seizing_the_claim() {
     );
     let store = Store::open(home.path().join("state.json"), &[]).expect("reopen store");
     let claim = store
-        .claims(Some(&knives::ids::RepoName::new("demo")))
+        .claims(Some(&knives::ids::UpstreamName::new("demo")))
         .into_iter()
         .find(|claim| claim.branch == "feat/alpha")
         .expect("the claim is still held");

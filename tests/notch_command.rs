@@ -15,6 +15,9 @@ use std::path::Path;
 use std::process::Output;
 
 const UPSTREAM: &str = "https://forge.invalid/org/work.git";
+/// Where `a-repo`'s ledger lives: [`UPSTREAM`]'s `<owner>/<name>`, not the
+/// registry key, which a store refuses as a name an older knives used.
+const LEDGER: &str = "org/work";
 
 /// A config home with one managed repo, `a-repo`, known by its upstream.
 fn home() -> tempfile::TempDir {
@@ -257,7 +260,7 @@ fn a_write_without_pr_uses_the_tracked_pull_stamp() {
     let home = home();
     lab::state_on_ledger(
         home.path(),
-        "a-repo",
+        LEDGER,
         "feat/alpha",
         knives::statement::StatementKind::Pull,
         Some("1157"),
@@ -288,7 +291,7 @@ fn a_subject_read_shows_that_refs_chronology_and_a_bare_read_windows_the_repo() 
     let home = home();
     lab::state_on_ledger(
         home.path(),
-        "a-repo",
+        LEDGER,
         "feat/alpha",
         knives::statement::StatementKind::Pull,
         Some("1157"),
@@ -356,7 +359,7 @@ fn an_unreadable_ledger_is_incomplete_and_an_unknown_repo_is_usage() {
     let home = home();
 
     // Given: a ledger directory holding a file that is not an entry
-    let ledger = home.path().join("ledger").join("a-repo");
+    let ledger = home.path().join("ledger").join(LEDGER);
     std::fs::create_dir_all(&ledger).expect("ledger directory");
     std::fs::write(
         ledger.join("20260815T221403.000000000Z-0000.md"),
@@ -398,7 +401,7 @@ fn only_a_note_about_a_branch_reads_the_ledger_for_its_stated_pull_request() {
     // Given: a ledger holding a file that is not an entry
     let checkout = checkout();
     let home = home();
-    let ledger = home.path().join("ledger").join("a-repo");
+    let ledger = home.path().join("ledger").join(LEDGER);
     std::fs::create_dir_all(&ledger).expect("ledger directory");
     std::fs::write(
         ledger.join("20260815T221403.000000000Z-0000.md"),

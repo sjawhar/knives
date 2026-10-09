@@ -83,7 +83,7 @@ fn one_batch_answers_review_age_and_checks_for_every_branch_at_once() {
     let state = tempfile::tempdir().expect("state directory");
     let store = Store::open(
         state.path().join("state.json"),
-        &[&knives::ids::RepoName::new("demo")],
+        &[&knives::ids::UpstreamName::new("demo")],
     )
     .expect("open store");
 
@@ -148,7 +148,7 @@ fn a_measured_gather_reports_the_same_report_and_a_total_that_covers_its_phases(
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     lab.branch("feat/beta", "beta.txt", "beta\n");
     lab.octopus("release/2026-08-15", "feat/alpha", "feat/beta");
-    let name = knives::ids::RepoName::new("demo");
+    let name = knives::ids::UpstreamName::new("demo");
     let entry = lab_entry(&lab);
     let state = tempfile::tempdir().expect("state directory");
     let store = Store::open(state.path().join("state.json"), &[&name]).expect("open store");
@@ -326,7 +326,7 @@ fn the_forge_is_asked_once_for_the_whole_report_with_one_entry_per_number() {
     let state = tempfile::tempdir().expect("state directory");
     let store = Store::open(
         state.path().join("state.json"),
-        &[&knives::ids::RepoName::new("demo")],
+        &[&knives::ids::UpstreamName::new("demo")],
     )
     .expect("open store");
 
@@ -393,7 +393,7 @@ fn a_failed_facts_batch_clears_review_and_check_cells() {
     let state = tempfile::tempdir().expect("state directory");
     let store = Store::open(
         state.path().join("state.json"),
-        &[&knives::ids::RepoName::new("demo")],
+        &[&knives::ids::UpstreamName::new("demo")],
     )
     .expect("open store");
 
@@ -435,7 +435,7 @@ fn a_failed_facts_batch_clears_review_and_check_cells() {
 fn a_consulted_false_report_carries_an_unanswered_stated_pull() {
     let lab = lab::Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
-    let name = knives::ids::RepoName::new("demo");
+    let name = knives::ids::UpstreamName::new("demo");
     let forge = knives::forge::fake::FakeForge {
         pull_requests: BTreeMap::from([(
             BranchName::new("feat/alpha"),
@@ -487,7 +487,7 @@ fn a_consulted_false_report_carries_an_unanswered_stated_pull() {
 fn stated_pulls_and_dependencies_are_answered_from_the_one_batch() {
     let lab = lab::Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
-    let name = knives::ids::RepoName::new("demo");
+    let name = knives::ids::UpstreamName::new("demo");
     let forge = knives::forge::fake::FakeForge {
         pull_requests: BTreeMap::from([(
             BranchName::new("feat/alpha"),
@@ -563,7 +563,7 @@ fn stated_pulls_and_dependencies_are_answered_from_the_one_batch() {
 fn landed_verdicts_come_from_the_cache_when_the_key_matches() {
     let lab = lab::Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
-    let name = knives::ids::RepoName::new("demo");
+    let name = knives::ids::UpstreamName::new("demo");
     let entry = lab_entry(&lab);
     let forge = knives::forge::fake::FakeForge::default();
     let state = tempfile::tempdir().expect("state directory");
@@ -634,7 +634,7 @@ fn landed_verdicts_come_from_the_cache_when_the_key_matches() {
 fn a_probe_free_run_preserves_the_landed_section() {
     let lab = lab::Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
-    let name = knives::ids::RepoName::new("demo");
+    let name = knives::ids::UpstreamName::new("demo");
     let entry = lab_entry(&lab);
     let forge = knives::forge::fake::FakeForge::default();
     let state = tempfile::tempdir().expect("state directory");
@@ -692,7 +692,7 @@ fn a_probe_free_run_preserves_the_landed_section() {
 fn an_unresolvable_trunk_fails_loudly_and_touches_no_landed_cache() {
     let lab = lab::Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
-    let name = knives::ids::RepoName::new("demo");
+    let name = knives::ids::UpstreamName::new("demo");
     let entry = lab_entry(&lab);
     let forge = knives::forge::fake::FakeForge::default();
     let state = tempfile::tempdir().expect("state directory");
@@ -757,7 +757,7 @@ fn parallel_landed_probes_answer_exactly_what_serial_ones_did() {
     lab.fetch_work();
     let entry = lab_entry(&lab);
     let state = tempfile::tempdir().expect("state directory");
-    let name = knives::ids::RepoName::new("demo");
+    let name = knives::ids::UpstreamName::new("demo");
     let store = Store::open(state.path().join("state.json"), &[&name]).expect("open store");
     let options = |workers: usize| knives::commands::status::Options {
         probe: true,
