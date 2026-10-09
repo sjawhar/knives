@@ -274,6 +274,77 @@ fn a_sighting_inside_the_claimed_workspace_reaches_the_notice() {
     );
 }
 
+#[test]
+fn a_claims_repo_finds_its_checkout_by_the_repos_listings_upstream_name() {
+    // Given: a claimed branch of a fork whose registry key is not its
+    // upstream name, beside a second fork with a filesystem upstream.
+    let (lab, home) = forge_fork();
+    let registry = home.path().join("repos.toml");
+    let text = std::fs::read_to_string(&registry).expect("read registry");
+    std::fs::write(
+        &registry,
+        format!(
+            "{text}\n[repos.local]\nupstream = \"/srv/local-upstream\"\n\
+             origin = \"https://forge.invalid/acme/local.git\"\n"
+        ),
+    )
+    .expect("write registry");
+    claim_gamma(&lab, home.path());
+
+    // When: a consumer reads the claim from the state file, as one holding
+    // only `state.json` does, and lists the managed forks.
+    let state: Value = serde_json::from_str(
+        &std::fs::read_to_string(home.path().join("state.json")).expect("read state"),
+    )
+    .expect("state JSON");
+    let claimed = state["claims"]
+        .as_object()
+        .expect("claims")
+        .values()
+        .next()
+        .expect("one claim")["repo"]
+        .as_str()
+        .expect("a claim's repo")
+        .to_owned();
+    let listing = succeeded(&knives_as(
+        &lab,
+        home.path(),
+        &lab.work,
+        None,
+        &["--json", "repos"],
+    ))
+    .stdout
+    .clone();
+    let report: Value = serde_json::from_slice(&listing).expect("repos JSON");
+    let rows = report["repos"].as_array().expect("repos");
+
+    // Then: exactly one row's upstream name is the claim's repo, and it is
+    // the claimed fork's, with its checkout; the registry key matches none.
+    let matching: Vec<&Value> = rows
+        .iter()
+        .filter(|row| row["upstream_name"] == claimed.as_str())
+        .collect();
+    assert_eq!(matching.len(), 1, "claim repo {claimed}: {report}");
+    let row = matching[0];
+    assert_eq!(row["name"], "demo", "{row}");
+    assert_eq!(row["upstream_name"], KEPT_UNDER, "{row}");
+    assert_eq!(
+        row["path"].as_str().map(Path::new),
+        Some(lab.work.canonicalize().expect("canonical work").as_path()),
+        "{row}"
+    );
+    assert!(
+        rows.iter().all(|row| row["name"] != claimed.as_str()),
+        "{report}"
+    );
+    // And: a fork whose upstream is a filesystem path is kept under its key.
+    let local = rows
+        .iter()
+        .find(|row| row["name"] == "local")
+        .unwrap_or_else(|| panic!("no local row: {report}"));
+    assert_eq!(local["upstream_name"], "local", "{local}");
+}
+
 /// The fork's status report, from a status run as the terminal user.
 fn status_of_demo(lab: &Lab, home: &Path) -> Output {
     knives_as(

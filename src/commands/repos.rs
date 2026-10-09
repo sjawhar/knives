@@ -278,6 +278,12 @@ pub struct Report {
 #[derive(Debug, serde::Serialize)]
 pub struct RepoRow {
     pub name: String,
+    /// What this fork's ledger, claims and state are kept under
+    /// ([`crate::config::RepoEntry::upstream_name`]): the lowercase
+    /// `<owner>/<name>` of its upstream, or the registry key for an upstream
+    /// that is a filesystem path. A `state.json` claim's `repo` is this, so
+    /// a reader holding one finds its fork's row here.
+    pub upstream_name: String,
     /// Where the checkout was found under `$HOME`; `None` when it was not, or
     /// when more than one was.
     pub path: Option<String>,
@@ -350,6 +356,7 @@ pub fn gather(input: &GatherInput<'_>) -> Report {
                 };
                 return RepoRow {
                     name: name.clone(),
+                    upstream_name: entry.upstream_name(name).to_string(),
                     path: None,
                     ambiguous: scan.duplicates.get(&repo_name).map_or(0, Vec::len),
                     release_remote,
@@ -373,6 +380,7 @@ pub fn gather(input: &GatherInput<'_>) -> Report {
             notes.extend(pin_lag.notes);
             RepoRow {
                 name: name.clone(),
+                upstream_name: fork.upstream.to_string(),
                 path: Some(fork.checkout.path.display().to_string()),
                 ambiguous: 0,
                 release_remote,

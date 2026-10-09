@@ -27,9 +27,16 @@ a locked commit is behind when it is an ancestor of the branch tip.
 TOON and JSON share this document shape (`?` marks an optional field):
 
 ```text
-{repos: [{name, path, release_remote?, newest_release?, behind?,
+{repos: [{name, upstream_name, path, release_remote?, newest_release?, behind?,
           notes?, problems?}], notes?, config_path}
 ```
+
+`name` is the registry key, what you type. `upstream_name` is what the fork's
+ledger, claims and state are kept under: its upstream's lowercase
+`<owner>/<name>`, or the registry key when the upstream is a filesystem path.
+A claim's `repo` in `state.json` is an `upstream_name`, so to find the checkout
+for a claim, match the claim's `repo` against `upstream_name`, never `name`.
+Every row carries it, placed or not.
 
 ## `knives consumers [FORK] [--consumer PATH]...`
 
