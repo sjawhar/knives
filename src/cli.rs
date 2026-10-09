@@ -412,7 +412,8 @@ pub enum Command {
         #[arg(long)]
         consumer: Vec<PathBuf>,
     },
-    /// Carry this machine's ledger to the machines that share it.
+    /// Carry this machine's ledger to the machines that share it, or move what
+    /// an older knives kept in `state.json` onto it.
     Ledger {
         #[command(subcommand)]
         action: LedgerAction,
@@ -450,6 +451,15 @@ pub enum LedgerAction {
     /// `knives.fork` git config; with neither set, the ledger is not shared
     /// and this does nothing.
     Sweep,
+    /// Move the branch statements an older knives kept in `state.json` onto
+    /// the ledger, one statement entry each, then drop them from `state.json`.
+    ///
+    /// Existing entries are left as they are: an event's prose states nothing,
+    /// so nothing is read back out of it. A statement some entry about that
+    /// branch already makes, kind and value alike, is skipped, so a second run
+    /// writes nothing. `state.json` keeps every statement until all of them
+    /// reach the ledger.
+    Migrate,
 }
 
 #[derive(Debug, Subcommand)]
@@ -696,6 +706,8 @@ mod tests {
             vec!["knives", "notch", "feat/alpha", "-m", "superseded"],
             vec!["knives", "notch", "--pr", "1157"],
             vec!["knives", "notch", "release/2026-08-15", "--repo", "a-repo"],
+            vec!["knives", "ledger", "sweep"],
+            vec!["knives", "ledger", "migrate"],
             vec!["knives", "gh", "--", "pr", "list"],
         ];
         // When / Then: each parses

@@ -39,7 +39,7 @@ pub enum StatementKind {
 ///
 /// Written into an entry file as one inline table:
 /// `statement = { kind = "pull", value = "1234" }`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Statement {
     pub kind: StatementKind,
     /// What [`StatementKind`] says it holds. `None` forgets: the subject no

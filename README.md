@@ -237,6 +237,7 @@ reads `not on this machine`, and an entry with two is refused with both paths na
 | `knives depends` | record that a branch cannot land before another repo's pull request |
 | `knives notch [SUBJECT] [-m TEXT] [--disposition TOKEN]` | read the ledger or write a human note; dispositions require evidence, `--dispositions` reads terminal rulings, and `--verify` re-checks selected entries |
 | `knives ledger sweep` | commit, pull and push the shared ledger; every write starts one in the background |
+| `knives ledger migrate` | move the branch statements an older knives kept in `state.json` onto the ledger, one statement entry each; a second run writes nothing |
 | `knives release` | plan a release, edit its membership, cut one, or reap superseded cuts |
 | `knives release members [REF] [--verify] [--carries REV] [--census] [--no-github]` | list a release's direct member parents, their holders and advances; `--verify` audits every member's content in the release; `--carries REV` asks whether REV's content is carried — by REF, or by every live release and upstream trunk; `--census` asks that of every maintained branch, conditionally checks superseded releases, and reports qualified orphans |
 | `knives register [DIR]` | print the registry entry for a checkout, or `already registered as <name>`; writes nothing |

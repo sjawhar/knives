@@ -253,9 +253,10 @@ fn dispatch() -> anyhow::Result<Exit> {
                 output,
             )
         }
-        Command::Ledger {
-            action: LedgerAction::Sweep,
-        } => ledger::run_sweep(output),
+        Command::Ledger { action } => match action {
+            LedgerAction::Sweep => ledger::run_sweep(output),
+            LedgerAction::Migrate => ledger::run_migrate(output),
+        },
         Command::Preflight { repo } => {
             let Some(fork) = grounded(&loaded)?.one_fork(repo.as_deref())? else {
                 return Ok(Exit::Usage);

@@ -126,6 +126,14 @@ fork it works on when it starts, and no other. An unreadable entry in one of
 those stops the command with exit `3` naming the file, rather than reading that
 ledger's statements as absent.
 
+An older knives kept these statements in `state.json` (`tracked_pulls`,
+`fork_only`, `superseded`, `dependencies`), and this one does not read them
+there. `knives ledger migrate` writes one statement entry per statement it finds
+and then drops the four maps. It reads nothing out of existing entries' prose,
+and it skips a statement some entry about that branch already makes with the
+same kind and value, so a second run writes nothing. If any statement cannot
+reach its ledger, `state.json` keeps all of them and the command exits `3`.
+
 ## Sharing between machines
 
 A ledger travels between machines once its root, `~/.config/knives/ledger/`, is

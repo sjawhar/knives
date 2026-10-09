@@ -565,8 +565,9 @@ impl<'a> Draft<'a> {
 pub struct Scribe {
     ledger: Ledger,
     repo: RepoName,
-    /// The checkout whose refs anchor entries.
-    path: PathBuf,
+    /// The checkout whose refs anchor entries; none for a writer acting on the
+    /// ledger alone.
+    checkout: Option<PathBuf>,
     owner: String,
 }
 
@@ -575,13 +576,28 @@ impl Scribe {
         Self {
             ledger,
             repo,
-            path,
+            checkout: Some(path),
+            owner,
+        }
+    }
+
+    /// A writer with no checkout of the fork to ask, whose entries carry no
+    /// anchor.
+    pub const fn unanchored(ledger: Ledger, repo: RepoName, owner: String) -> Self {
+        Self {
+            ledger,
+            repo,
+            checkout: None,
             owner,
         }
     }
 
     pub const fn repo(&self) -> &RepoName {
         &self.repo
+    }
+
+    pub const fn ledger(&self) -> &Ledger {
+        &self.ledger
     }
 
     /// Append `draft`, stamping the fields no caller supplies.
@@ -620,7 +636,7 @@ impl Scribe {
     /// none of them is a reason to lose the entry.
     fn anchor(&self, subject: Option<&str>) -> Option<String> {
         let subject = subject?;
-        crate::jj::Repo::open(&self.path)
+        crate::jj::Repo::open(self.checkout.as_ref()?)
             .ok()?
             .resolve_commit(subject)
             .ok()

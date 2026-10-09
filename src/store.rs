@@ -24,7 +24,7 @@ use crate::config::default_config_path;
 use crate::ids::{BranchTarget, RepoName, Requirement};
 use crate::ledger::{Ledger, LedgerError};
 use crate::lock::{FileLock, LockError, LockWait};
-use crate::statement::Statements;
+use crate::statement::{Statement, StatementKind, Statements};
 
 use crate::commands::claim::Identity;
 use crate::commands::sync::ForgeState;
@@ -88,9 +88,23 @@ pub struct State {
     /// `release include|drop|advance`, so nothing states it here; whatever an
     /// older version wrote lands in this map and rides along rather than
     /// failing the read. So do the branch statements an older version kept
-    /// here: nothing reads them, and nothing drops them either.
+    /// here, until `knives ledger migrate` moves them onto the ledger
+    /// ([`Store::legacy_statements`]) and drops them.
     #[serde(flatten)]
     pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+/// The maps an older knives kept branch statements in, each keyed
+/// `<repo>/<branch>`: a pull request, fork-only, superseded-by and
+/// depends-on.
+const LEGACY_STATEMENTS: [&str; 4] = ["tracked_pulls", "fork_only", "superseded", "dependencies"];
+
+/// One branch statement an older knives kept in the state file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyStatement {
+    /// `<repo>/<branch>`, as the older knives keyed it.
+    pub key: String,
+    pub statement: Statement,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -386,6 +400,74 @@ impl Store {
             .comment_marks
             .get(&format!("{repo}#{number}"))
             .map(String::as_str)
+    }
+
+    /// Every branch statement an older knives kept in the state file, in map
+    /// order: pull requests, then fork-only, superseded-by and depends-on.
+    ///
+    /// A depends-on list is one statement, comma-joined as the ledger carries
+    /// it; an empty list states that the branch needs nothing. A map that does
+    /// not have the shape the older knives wrote fails the read, so nothing is
+    /// migrated from a file nobody can vouch for.
+    pub fn legacy_statements(&self) -> Result<Vec<LegacyStatement>, StoreError> {
+        #[derive(Deserialize)]
+        struct Legacy {
+            #[serde(default)]
+            tracked_pulls: BTreeMap<String, u64>,
+            #[serde(default)]
+            fork_only: BTreeMap<String, String>,
+            #[serde(default)]
+            superseded: BTreeMap<String, String>,
+            #[serde(default)]
+            dependencies: BTreeMap<String, Vec<String>>,
+        }
+        let maps: serde_json::Map<String, serde_json::Value> = LEGACY_STATEMENTS
+            .iter()
+            .filter_map(|name| {
+                self.state
+                    .extra
+                    .get(*name)
+                    .map(|map| ((*name).to_owned(), map.clone()))
+            })
+            .collect();
+        let legacy: Legacy =
+            serde_json::from_value(serde_json::Value::Object(maps)).map_err(|source| {
+                StoreError::Parse {
+                    path: self.path.clone(),
+                    source,
+                }
+            })?;
+        let stated = |key: String, kind: StatementKind, value: Option<String>| LegacyStatement {
+            key,
+            statement: Statement { kind, value },
+        };
+        Ok(legacy
+            .tracked_pulls
+            .into_iter()
+            .map(|(key, number)| stated(key, StatementKind::Pull, Some(number.to_string())))
+            .chain(
+                legacy
+                    .fork_only
+                    .into_iter()
+                    .map(|(key, why)| stated(key, StatementKind::ForkOnly, Some(why))),
+            )
+            .chain(legacy.superseded.into_iter().map(|(key, replacement)| {
+                stated(key, StatementKind::Superseded, Some(replacement))
+            }))
+            .chain(legacy.dependencies.into_iter().map(|(key, required)| {
+                let value = (!required.is_empty()).then(|| required.join(","));
+                stated(key, StatementKind::Depends, value)
+            }))
+            .collect())
+    }
+
+    /// Drop the maps [`Store::legacy_statements`] reads; whether there were any.
+    pub fn drop_legacy_statements(&mut self) -> bool {
+        let before = self.state.extra.len();
+        self.state
+            .extra
+            .retain(|name, _| !LEGACY_STATEMENTS.contains(&name.as_str()));
+        self.state.extra.len() != before
     }
 }
 
@@ -732,8 +814,8 @@ mod tests {
 
     #[test]
     fn statements_an_older_version_kept_in_the_state_file_ride_along_unread() {
-        // Nothing reads them now, and a save must not drop them either: they are
-        // the record a later migration moves onto the ledger.
+        // No accessor reads them, and a save must not drop them either: they are
+        // what `knives ledger migrate` moves onto the ledger.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.json");
         std::fs::write(
@@ -759,6 +841,58 @@ mod tests {
             saved["dependencies"]["a-repo/feat/alpha"],
             serde_json::json!(["a-repo#7"])
         );
+    }
+
+    #[test]
+    fn the_statements_an_older_version_kept_read_back_one_per_statement() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        std::fs::write(
+            &path,
+            r#"{"tracked_pulls":{"a-repo/feat/alpha":4545},"fork_only":{"a-repo/ci":"why"},"superseded":{"a-repo/old":"feat/alpha"},"dependencies":{"a-repo/feat/alpha":["a-repo#7","b#9"],"a-repo/none":[]}}"#,
+        )
+        .unwrap();
+        let mut subject = Store::open(path, &[]).unwrap();
+
+        let stated = |key: &str, kind, value: Option<&str>| LegacyStatement {
+            key: key.to_owned(),
+            statement: Statement {
+                kind,
+                value: value.map(str::to_owned),
+            },
+        };
+        assert_eq!(
+            subject.legacy_statements().unwrap(),
+            [
+                stated("a-repo/feat/alpha", StatementKind::Pull, Some("4545")),
+                stated("a-repo/ci", StatementKind::ForkOnly, Some("why")),
+                stated("a-repo/old", StatementKind::Superseded, Some("feat/alpha")),
+                stated(
+                    "a-repo/feat/alpha",
+                    StatementKind::Depends,
+                    Some("a-repo#7,b#9")
+                ),
+                stated("a-repo/none", StatementKind::Depends, None),
+            ]
+        );
+
+        assert!(subject.drop_legacy_statements());
+        assert!(subject.legacy_statements().unwrap().is_empty());
+        assert!(!subject.drop_legacy_statements());
+    }
+
+    #[test]
+    fn a_legacy_map_of_the_wrong_shape_fails_the_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        std::fs::write(&path, r#"{"tracked_pulls":{"a-repo/feat/alpha":"soon"}}"#).unwrap();
+
+        let error = Store::open(path, &[])
+            .unwrap()
+            .legacy_statements()
+            .unwrap_err();
+
+        assert!(matches!(error, StoreError::Parse { .. }), "was: {error}");
     }
 
     #[test]
