@@ -124,6 +124,13 @@ pub enum StoreError {
         path: PathBuf,
         source: serde_json::Error,
     },
+    #[error(
+        "{} still holds the branch statements an older knives kept there ({maps}); this \
+         knives reads them only from the ledger, so it would report every one of them as \
+         unstated. Run `knives ledger migrate` once to move them",
+        path.display()
+    )]
+    Unmigrated { path: PathBuf, maps: String },
     #[error(transparent)]
     Lock(#[from] LockError),
     #[error(transparent)]
@@ -157,7 +164,7 @@ impl Store {
     /// it cannot read: a statement the store could not read must not answer as
     /// no statement.
     pub fn open(path: PathBuf, repos: &[&RepoName]) -> Result<Self, StoreError> {
-        Self::read(path, repos, None)
+        Self::read(path, repos, None)?.migrated()
     }
 
     /// For a read-modify-write. Holds the lock until dropped, and waits the
@@ -165,7 +172,35 @@ impl Store {
     /// `repos` as for [`Store::open`].
     pub fn open_for_update(path: PathBuf, repos: &[&RepoName]) -> Result<Self, StoreError> {
         let lock = FileLock::acquire(&path, LockWait::CLAIM)?;
-        Self::read(path, repos, Some(lock))
+        Self::read(path, repos, Some(lock))?.migrated()
+    }
+
+    /// [`Store::open_for_update`] for `knives ledger migrate` alone: it opens
+    /// the state file an older knives left, which every other open refuses.
+    pub fn open_to_migrate(path: PathBuf) -> Result<Self, StoreError> {
+        let lock = FileLock::acquire(&path, LockWait::CLAIM)?;
+        Self::read(path, &[], Some(lock))
+    }
+
+    /// Refuse a state file still holding the maps an older knives kept branch
+    /// statements in. This knives reads statements only from the ledger, so
+    /// such a file would report every stated pull request, fork-only branch,
+    /// supersession and dependency as absent, which reads exactly like a
+    /// clean slate. A refusal naming the command that fixes it is the only
+    /// honest answer.
+    fn migrated(self) -> Result<Self, StoreError> {
+        let held: Vec<&str> = LEGACY_STATEMENTS
+            .into_iter()
+            .filter(|name| self.state.extra.contains_key(*name))
+            .collect();
+        if held.is_empty() {
+            Ok(self)
+        } else {
+            Err(StoreError::Unmigrated {
+                path: self.path,
+                maps: held.join(", "),
+            })
+        }
     }
 
     fn read(
@@ -813,9 +848,10 @@ mod tests {
     }
 
     #[test]
-    fn statements_an_older_version_kept_in_the_state_file_ride_along_unread() {
-        // No accessor reads them, and a save must not drop them either: they are
-        // what `knives ledger migrate` moves onto the ledger.
+    fn a_state_file_still_holding_the_older_statement_maps_is_refused_naming_the_fix() {
+        // Opened as this knives, it would answer "no statement" for every one
+        // of them, which reads as a clean slate. Both opens refuse, naming the
+        // maps and the command that moves them; only the migration opens it.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.json");
         std::fs::write(
@@ -824,23 +860,29 @@ mod tests {
         )
         .unwrap();
 
-        let mut subject = Store::open(path.clone(), &[&repo()]).unwrap();
-        assert_eq!(subject.tracked_pull(&target()), None);
-        assert!(!subject.is_fork_only(&target()));
-        assert_eq!(subject.superseded_by(&target()), None);
-        assert!(subject.dependencies(&target()).is_empty());
-
-        let _ = subject.claim(&target(), &os_user("x"), "w");
-        subject.save().unwrap();
-        let saved: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(saved["tracked_pulls"]["a-repo/feat/alpha"], 4545);
-        assert_eq!(saved["fork_only"]["a-repo/feat/alpha"], "why");
-        assert_eq!(saved["superseded"]["a-repo/feat/alpha"], "feat/replacement");
-        assert_eq!(
-            saved["dependencies"]["a-repo/feat/alpha"],
-            serde_json::json!(["a-repo#7"])
-        );
+        for error in [
+            Store::open(path.clone(), &[&repo()]).unwrap_err(),
+            Store::open_for_update(path.clone(), &[]).unwrap_err(),
+        ] {
+            let message = error.to_string();
+            assert!(
+                matches!(error, StoreError::Unmigrated { .. }),
+                "was: {message}"
+            );
+            assert!(
+                message.contains("`knives ledger migrate`"),
+                "was: {message}"
+            );
+            assert!(
+                message.contains("tracked_pulls, fork_only, superseded, dependencies"),
+                "was: {message}"
+            );
+        }
+        let mut migrating = Store::open_to_migrate(path.clone()).unwrap();
+        assert!(migrating.drop_legacy_statements());
+        migrating.save().unwrap();
+        drop(migrating);
+        assert!(Store::open(path, &[&repo()]).is_ok());
     }
 
     #[test]
@@ -852,7 +894,7 @@ mod tests {
             r#"{"tracked_pulls":{"a-repo/feat/alpha":4545},"fork_only":{"a-repo/ci":"why"},"superseded":{"a-repo/old":"feat/alpha"},"dependencies":{"a-repo/feat/alpha":["a-repo#7","b#9"],"a-repo/none":[]}}"#,
         )
         .unwrap();
-        let mut subject = Store::open(path, &[]).unwrap();
+        let mut subject = Store::open_to_migrate(path).unwrap();
 
         let stated = |key: &str, kind, value: Option<&str>| LegacyStatement {
             key: key.to_owned(),
@@ -887,7 +929,7 @@ mod tests {
         let path = dir.path().join("state.json");
         std::fs::write(&path, r#"{"tracked_pulls":{"a-repo/feat/alpha":"soon"}}"#).unwrap();
 
-        let error = Store::open(path, &[])
+        let error = Store::open_to_migrate(path)
             .unwrap()
             .legacy_statements()
             .unwrap_err();

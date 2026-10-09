@@ -12,14 +12,14 @@ use crate::hook::claude_code::{
 };
 use crate::hook::guidance::{
     Guidance, body_digest, claim_lines, envelope_nonce, format_guidance, format_notice,
-    guidance_for, mention_line, notice_digest,
+    format_refusal, guidance_for, mention_line, notice_digest,
 };
 use crate::hook::opencode::{self, Event as OpenCodeEvent, EventKind as OpenCodeEventKind};
 use crate::hook::resolve::{Match, argument_paths, match_checkout};
 use crate::hook::state::{Envelope, SessionState};
 use crate::ids::RepoName;
 use crate::lock::LockError;
-use crate::store::{OwnerKind, Store, default_state_path};
+use crate::store::{OwnerKind, Store, StoreError, default_state_path};
 
 const CLAUDE_CODE: &str = "claude-code";
 const OPENCODE: &str = "opencode";
@@ -665,6 +665,14 @@ impl NoticeStateUpdate {
     }
 }
 
+/// The notice for `repo`, when one was asked for and the session lacks it.
+///
+/// A state file this knives refuses to read ([`StoreError::Unmigrated`]) is
+/// the notice instead: the claims it holds cannot be read, and an empty
+/// roster would tell the agent nobody holds the branch it is about to take.
+/// The refusal goes into the agent's context, not stderr, because the model
+/// never reads a hook's stderr; its digest is the refusal's, so it repeats
+/// once per session until the migration runs.
 fn notice_if_requested(
     repo: &GuidanceRoot,
     state: &SessionState,
@@ -673,7 +681,21 @@ fn notice_if_requested(
     if !requested {
         return Ok(None);
     }
-    let store = Store::open(default_state_path(), &[])?;
+    let store = match Store::open(default_state_path(), &[]) {
+        Ok(store) => store,
+        Err(error @ StoreError::Unmigrated { .. }) => {
+            let text = error.to_string();
+            let digest = format!("unmigrated:{}", body_digest(&text));
+            if state.notice_seen(&repo.root, &digest) {
+                return Ok(None);
+            }
+            return Ok(Some(PreparedNotice {
+                text: format_refusal(&repo.name, &text),
+                update: NoticeStateUpdate { digest },
+            }));
+        }
+        Err(error) => return Err(error.into()),
+    };
     let claims = all_claims(&store);
     let digest = notice_digest(&repo.name, &repo.root, &claims);
     if state.notice_seen(&repo.root, &digest) {

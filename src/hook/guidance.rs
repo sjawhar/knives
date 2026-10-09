@@ -201,6 +201,26 @@ pub fn format_notice(repo_name: &str, root: &Path, claims: &[String], digest: &s
     .join("\n")
 }
 
+/// The notice in place of the claim roster when knives cannot read the claims:
+/// the agent must not take the silence as "nobody holds this branch".
+pub fn format_refusal(repo_name: &str, refusal: &str) -> String {
+    let nonce = envelope_nonce();
+    [
+        String::new(),
+        String::new(),
+        format!(
+            "<knives-notice-{nonce} repo=\"{}\">",
+            safe_attribute(repo_name)
+        ),
+        "knives cannot read who has claimed which branch of this fork, so do not assume a \
+         branch is free:"
+            .to_owned(),
+        refusal.to_owned(),
+        format!("</knives-notice-{nonce}>"),
+    ]
+    .join("\n")
+}
+
 /// Returns active claim summaries for a repository.
 ///
 /// Hooks never open a jj repository or walk operations — identity is read by

@@ -128,7 +128,9 @@ ledger's statements as absent.
 
 An older knives kept these statements in `state.json` (`tracked_pulls`,
 `fork_only`, `superseded`, `dependencies`), and this one does not read them
-there. `knives ledger migrate` writes one statement entry per statement it finds
+there. Until they move, every other command refuses that state file, `knives hook`
+included, naming the command to run: it would otherwise report every stated pull
+request and claim as absent. `knives ledger migrate` writes one statement entry per statement it finds
 and then drops the four maps. It reads nothing out of existing entries' prose,
 and it skips a statement some entry about that branch already makes with the
 same kind and value, so a second run writes nothing. If any statement cannot

@@ -131,7 +131,7 @@ pub struct Migrated {
 /// over it between the read and the drop, and it is saved only when every
 /// statement reached the ledger.
 pub fn migrate(state_path: &Path, root: &Path, owner: &str) -> anyhow::Result<Migrated> {
-    let mut store = Store::open_for_update(state_path.to_owned(), &[])?;
+    let mut store = Store::open_to_migrate(state_path.to_owned())?;
     let mut migrated = Migrated::default();
     let mut by_repo: BTreeMap<RepoName, Vec<(String, LegacyStatement)>> = BTreeMap::new();
     for legacy in store.legacy_statements()? {

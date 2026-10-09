@@ -200,3 +200,83 @@ fn a_ledger_that_cannot_be_read_keeps_every_statement_in_the_state_file() {
     .expect("parse state");
     assert_eq!(state["tracked_pulls"]["b-repo/feat/beta"], 7);
 }
+
+#[test]
+fn an_unmigrated_state_file_is_refused_naming_the_command_and_opens_after_migrating() {
+    // Given: an older knives's state file, holding a claim and statements,
+    // in a config home whose registry manages one fork.
+    let lab = lab::Lab::new();
+    let (home, _consumer) = lab::release_test_home(&lab);
+    let legacy = r#"{
+  "claims": {"demo/feat/claimed": {"repo": "demo", "branch": "feat/claimed",
+    "owner": "agent-one", "why": "porting", "started": "2026-01-01T00:00:00Z", "files": []}},
+  "tracked_pulls": {"demo/feat/claimed": 4545}
+}"#;
+    std::fs::write(home.path().join("state.json"), legacy).expect("write state");
+    let status = || {
+        lab::knives_command(
+            &lab.work,
+            home.path(),
+            lab.temp_path(),
+            &["--json", "status", "demo", "--no-github", "--no-landed"],
+        )
+        .output()
+        .expect("run knives status")
+    };
+    let hook = |cwd: &Path| {
+        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_knives"))
+            .args(["hook", "claude-code"])
+            .env("KNIVES_CONFIG_HOME", home.path())
+            .env("HOME", home.path())
+            .env("JJ_CONFIG", "/dev/null")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn hook");
+        let event = serde_json::json!({
+            "session_id": "migrate-test",
+            "hook_event_name": "SessionStart",
+            "source": "startup",
+            "cwd": cwd,
+        });
+        std::io::Write::write_all(
+            &mut child.stdin.take().expect("stdin"),
+            event.to_string().as_bytes(),
+        )
+        .expect("write event");
+        child.wait_with_output().expect("wait for hook")
+    };
+
+    // When: status runs, and an agent session starts in the fork.
+    let refused = status();
+    let noticed = hook(&lab.work);
+
+    // Then: status exits incomplete naming the command verbatim, and the
+    // session is told so in its context rather than shown an empty roster.
+    let errors = String::from_utf8_lossy(&refused.stderr);
+    assert_eq!(refused.status.code(), Some(3), "{errors}");
+    assert!(errors.contains("Run `knives ledger migrate`"), "{errors}");
+    assert!(noticed.status.success());
+    let context = String::from_utf8_lossy(&noticed.stdout);
+    assert!(
+        context.contains("Run `knives ledger migrate`")
+            && context.contains("do not assume a branch is free"),
+        "{context}"
+    );
+    assert!(!context.contains("No branch is claimed"), "{context}");
+
+    // When: the migration runs, and the same two commands run again.
+    report(&migrate(home.path()));
+    let opened = status();
+    let claimed = hook(&lab.work);
+
+    // Then: status answers with the migrated statement and the hook shows
+    // the claim the state file still holds.
+    let report: serde_json::Value = serde_json::from_slice(&opened.stdout).unwrap_or_else(|_| {
+        panic!("{}", String::from_utf8_lossy(&opened.stderr));
+    });
+    assert!(report.get("problems").is_none(), "{report}");
+    let context = String::from_utf8_lossy(&claimed.stdout);
+    assert!(context.contains("feat/claimed (agent-one"), "{context}");
+}
