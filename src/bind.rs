@@ -10,7 +10,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use crate::config::{Registry, RepoEntry, Role};
-use crate::ids::RepoName;
+use crate::ids::{RepoName, UpstreamName};
 use crate::remote_url::same_remote;
 
 /// A repository root on this machine and the remotes it declares.
@@ -25,7 +25,11 @@ pub struct Checkout {
 /// A registry entry bound to the checkout that is it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Fork<'a> {
+    /// The registry key: what a person types and reads.
     pub name: RepoName,
+    /// What this fork's ledger and state are kept under
+    /// ([`RepoEntry::upstream_name`]).
+    pub upstream: UpstreamName,
     pub entry: &'a RepoEntry,
     pub checkout: Checkout,
 }
@@ -69,6 +73,7 @@ impl<'a> Fork<'a> {
     pub(crate) fn at(name: &str, entry: &'a RepoEntry, path: &Path) -> Self {
         Self {
             name: RepoName::new(name),
+            upstream: entry.upstream_name(name),
             entry,
             checkout: Checkout {
                 path: path.to_owned(),
@@ -418,6 +423,7 @@ pub fn here<'a>(registry: &'a Registry, cwd: &Path) -> Result<Fork<'a>, Unbound>
         });
     };
     Ok(Fork {
+        upstream: entry.upstream_name(name.as_str()),
         name,
         entry,
         checkout: Checkout {
@@ -529,6 +535,7 @@ pub fn scan<'a>(registry: &'a Registry, home: &Path) -> Scan<'a> {
                 scan.found.insert(
                     name.clone(),
                     Fork {
+                        upstream: entry.upstream_name(name.as_str()),
                         name,
                         entry,
                         checkout,
@@ -705,6 +712,7 @@ mod tests {
         );
         let fork = Fork {
             name: RepoName::new("tool"),
+            upstream: registry_entry.upstream_name("tool"),
             entry: &registry_entry,
             checkout: Checkout {
                 path: PathBuf::from("/checkout"),
@@ -736,6 +744,7 @@ mod tests {
         );
         let fork = Fork {
             name: RepoName::new("tool"),
+            upstream: registry_entry.upstream_name("tool"),
             entry: &registry_entry,
             checkout: Checkout {
                 path: PathBuf::from("/checkout"),
@@ -769,6 +778,7 @@ mod tests {
         );
         let fork = Fork {
             name: RepoName::new("tool"),
+            upstream: registry_entry.upstream_name("tool"),
             entry: &registry_entry,
             checkout: Checkout {
                 path: PathBuf::from("/checkout"),
@@ -789,6 +799,7 @@ mod tests {
         let registry_entry = entry("u", "o", None);
         let fork = Fork {
             name: RepoName::new("tool"),
+            upstream: registry_entry.upstream_name("tool"),
             entry: &registry_entry,
             checkout: Checkout {
                 path: PathBuf::from("/forks/tool/default"),

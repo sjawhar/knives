@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::RepoName;
+use crate::ids::{RepoName, UpstreamName};
 
 #[cfg(test)]
 #[allow(
@@ -182,6 +182,15 @@ impl RepoEntry {
             Role::Origin => &self.origin,
             Role::Release => self.release.as_deref().unwrap_or(&self.origin),
         }
+    }
+
+    /// The name this fork's ledger and state are kept under: `<owner>/<name>`
+    /// of its `upstream`, as the registry spells it, so every machine keys
+    /// them alike whatever its registry calls the fork. An `upstream` that is
+    /// not a forge URL (a filesystem path) names no repository another
+    /// machine could share, and the fork is kept under its registry `key`.
+    pub fn upstream_name(&self, key: &str) -> UpstreamName {
+        UpstreamName::new(crate::remote_url::remote_slug(&self.upstream).unwrap_or(key))
     }
 
     /// The branch upstream treats as its trunk: what we fork from, measure
@@ -377,6 +386,24 @@ impl Registry {
 
     pub fn names(&self) -> impl Iterator<Item = RepoName> + '_ {
         self.repos.keys().map(|name| RepoName::new(name.clone()))
+    }
+
+    /// The fork `text` names, by its registry key or by its
+    /// [`RepoEntry::upstream_name`] in any letter case, with the name its
+    /// ledger and state are kept under.
+    pub fn resolve(&self, text: &str) -> Option<(RepoName, &RepoEntry, UpstreamName)> {
+        self.repos.get_key_value(text).map_or_else(
+            || {
+                self.repos.iter().find_map(|(key, entry)| {
+                    let upstream = entry.upstream_name(key);
+                    upstream
+                        .as_str()
+                        .eq_ignore_ascii_case(text)
+                        .then(|| (RepoName::new(key.as_str()), entry, upstream))
+                })
+            },
+            |(key, entry)| Some((RepoName::new(key.as_str()), entry, entry.upstream_name(key))),
+        )
     }
 }
 

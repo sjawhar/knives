@@ -39,7 +39,11 @@ string_id!(
     "A jj change. Stable across rewrites, and identical across disconnected clones, which is why the same change rewritten in two places collides."
 );
 string_id!(CommitId, "One concrete commit. A change may have several.");
-string_id!(RepoName, "A managed repo's name in the registry.");
+string_id!(RepoName, "A managed repo's name in the registry: the command-line shorthand.");
+string_id!(
+    UpstreamName,
+    "The repository a fork is a fork of, as `<owner>/<name>`: what a fork's ledger directory and its state are kept under, so every machine keys them alike whatever its registry calls the fork. An upstream that is a filesystem path names no forge repository, and the fork's registry key is its name. See [`crate::config::RepoEntry::upstream_name`]."
+);
 string_id!(
     RemoteName,
     "A remote's name, which this tool only ever derives from a role."
@@ -110,14 +114,16 @@ pub fn short_id(id: &str) -> &str {
 /// These two always travel together: every claim, mark, and supersession is
 /// keyed by the pair. Passing them separately duplicated the key formatting
 /// across six store methods and pushed several signatures past four arguments.
+/// The repository is the fork's [`UpstreamName`], the name its state is kept
+/// under; a message for a person names the fork by its registry key instead.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
 pub struct BranchTarget {
-    pub repo: RepoName,
+    pub repo: UpstreamName,
     pub branch: BranchName,
 }
 
 impl BranchTarget {
-    pub const fn new(repo: RepoName, branch: BranchName) -> Self {
+    pub const fn new(repo: UpstreamName, branch: BranchName) -> Self {
         Self { repo, branch }
     }
 }
@@ -283,24 +289,28 @@ pub fn pull_number_from_bookmark(name: &str) -> Option<u64> {
 
 /// Something a branch cannot land before: a pull request in some managed repo.
 ///
-/// Written `<repo>#<number>`. The repo is named because dependencies cross forks,
+/// Written `<repo>#<number>`, where `<repo>` is the required fork's
+/// [`UpstreamName`]. The repo is named because dependencies cross forks,
 /// which is the case that motivated this: a change in one fork needing a pull request
 /// in a sibling, where dropping one from a release without the other ships a release
 /// that cannot work.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
 pub struct Requirement {
-    pub repo: RepoName,
+    pub repo: UpstreamName,
     pub number: u64,
 }
 
 impl Requirement {
+    /// `<repo>#<number>` as written. The repo is split off at the last `#`,
+    /// and is whatever was written there; `knives depends` resolves a
+    /// registry key to the fork's upstream name before recording it.
     pub fn parse(text: &str) -> Option<Self> {
-        let (repo, number) = text.split_once('#')?;
+        let (repo, number) = text.rsplit_once('#')?;
         if repo.is_empty() {
             return None;
         }
         Some(Self {
-            repo: RepoName::new(repo),
+            repo: UpstreamName::new(repo),
             number: number.parse().ok()?,
         })
     }
