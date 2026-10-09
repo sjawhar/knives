@@ -94,13 +94,14 @@ fictional branch. Bare `knives notch` shows the newest human notes and folds mac
 one count; `--events` reads their full chronology. `--verify` re-checks selected
 commit-shaped evidence and anchors against the repository as it is now.
 
-The ledger travels between machines once its directory is a git repository naming this machine
-(`knives.machine`) and the forks it shares (`knives.fork`, one per fork): every write starts
-`knives ledger sweep` in the background, which commits new entries to the machine's own ref,
-pulls every other machine's, and pushes. One sweep runs at a time and nothing ever rebases. A
-command that decides from the ledger (`status`, `sync`, `audit`, `pushed`, the release verbs)
-pulls it first, and says so in its problems when it cannot. The `using-knives` skill's ledger
-reference has the setup.
+A fork's ledger travels between machines when its `repos.toml` entry names the repository its
+ledger belongs to (`ledger = "<owner>/<name>"`), and the ledger directory is a git repository
+whose `origin` is that repository and whose config names this machine (`knives.machine`): every
+write starts `knives ledger sweep` in the background, which commits new entries to the machine's
+own ref, pulls every other machine's, and pushes. One sweep runs at a time and nothing ever
+rebases. A command that decides from the ledger (`status`, `sync`, `audit`, `pushed`, the release
+verbs) pulls it first, and says so in its problems when it cannot. The `using-knives` skill's
+ledger reference has the setup.
 
 `knives status` carries the newest human note for each branch, preferring it over a newer machine
 event. Its compact notch cell prefixes a disposition, if any, and appends the count of entries it
@@ -169,6 +170,7 @@ base = "main"                         # optional: upstream's trunk (defaults to 
 release = "https://forge.example/company/libcore"   # optional: where releases publish
 consumers = ["company/workbench"]     # optional: forge slugs that pin this repo's releases
 forbidden = ["acme-corp", "internal.example"]   # optional: identifiers an upstream-bound diff must not add
+ledger = "company/knives-ledger"      # optional: the repository this fork's ledger is shared through
 
 [repos.tool]
 upstream = "https://forge.example/org/tool"
@@ -213,6 +215,13 @@ ad-hoc local scan without recording the path.
 hosts. `knives audit` reports every line a branch adds over its fork point with the upstream trunk
 that contains one; a branch stated `--fork-only` is exempt. Absent, no scan runs. The `using-knives`
 skill has the matching and load rules.
+
+`ledger` names, as `<owner>/<name>`, the repository a fork's ledger belongs to: the one that
+carries its entries between machines. Without it the fork's ledger stays on each machine that
+writes it. A fork whose `upstream` is a filesystem path names no repository another machine could
+share, so `ledger` is refused on it. An older knives refuses a `repos.toml` that sets `ledger`,
+because every entry refuses a field it does not know: upgrade knives on every machine that reads
+the file before adding it.
 
 Every command takes its repo from the directory you are standing in, wherever that checkout
 lives. Name one only when you are somewhere else; knives then scans `~` three directories deep

@@ -157,6 +157,13 @@ pub struct RepoEntry {
     /// branches stated `--fork-only` are exempt. Case-insensitive substrings.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub forbidden: Vec<String>,
+    /// The `<owner>/<name>` of the repository this fork's ledger belongs to:
+    /// what carries its entries between machines. A machine shares the fork's
+    /// ledger through the git repository at its ledger root whose `origin` is
+    /// that repository ([`crate::ledger_sweep::destinations`]). Absent, the
+    /// fork's ledger is not shared and stays on each machine that writes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ledger: Option<String>,
 }
 
 impl RepoEntry {
@@ -172,6 +179,7 @@ impl RepoEntry {
             consumers: Vec::new(),
             workspaces: None,
             forbidden: Vec::new(),
+            ledger: None,
         }
     }
 
@@ -297,6 +305,19 @@ impl RepoEntry {
         } else {
             "origin"
         }
+    }
+
+    /// Whether [`RepoEntry::ledger`] names the repository `slug`, an
+    /// `<owner>/<name>`: letter case and a `.git` suffix do not matter, as
+    /// they do not for any repository knives compares. `false` for a fork
+    /// whose ledger is not shared.
+    pub fn shares_ledger_with(&self, slug: &str) -> bool {
+        self.ledger.as_deref().is_some_and(|ledger| {
+            ledger
+                .strip_suffix(".git")
+                .unwrap_or(ledger)
+                .eq_ignore_ascii_case(slug)
+        })
     }
 }
 
@@ -581,6 +602,7 @@ pub fn load(path: &Path) -> Result<Registry, ConfigError> {
             }
         }
         checked_forbidden(name, &entry.forbidden, path)?;
+        checked_ledger(name, entry, path)?;
     }
     for slug in &registry.trust.repos {
         if !is_forge_slug(slug) {
@@ -672,6 +694,36 @@ fn checked_release_branch(entry: &RepoEntry, path: &Path) -> Result<(), ConfigEr
                 crate::ids::RELEASE_PREFIX
             ),
         });
+    }
+    Ok(())
+}
+
+/// A `ledger` names a repository, so it is `<owner>/<name>`. A fork whose
+/// upstream is a filesystem path is kept under its registry key, which names
+/// no repository another machine checks out, so its ledger has nothing to be
+/// shared as.
+fn checked_ledger(name: &str, entry: &RepoEntry, path: &Path) -> Result<(), ConfigError> {
+    let Some(ledger) = entry.ledger.as_deref() else {
+        return Ok(());
+    };
+    let invalid = |detail: String| {
+        Err(ConfigError::Invalid {
+            path: path.to_owned(),
+            detail,
+        })
+    };
+    if !is_forge_slug(ledger) {
+        return invalid(format!(
+            "[repos.{name}] ledger names the repository its ledger belongs to as \
+             \"<owner>/<name>\"; found \"{ledger}\""
+        ));
+    }
+    if crate::remote_url::remote_slug(&entry.upstream).is_none() {
+        return invalid(format!(
+            "[repos.{name}] sets ledger, but its upstream {} is not a forge URL, so its \
+             ledger is kept under the registry key and no other machine can share it",
+            entry.upstream
+        ));
     }
     Ok(())
 }
@@ -1029,6 +1081,46 @@ release = "https://example.invalid/releases.git"
         // Then: it fails at parse time, naming the field, not later at query time
         let message = result.unwrap_err().to_string();
         assert!(message.contains("upstream"), "message was: {message}");
+    }
+
+    #[test]
+    fn a_ledger_names_the_repository_a_forks_ledger_belongs_to() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = "[repos.demo]\nupstream = \"https://forge.example/org/demo\"\n\
+                    origin = \"o\"\nledger = \"Company/Ledger.git\"\n\n\
+                    [repos.other]\nupstream = \"https://forge.example/org/other\"\norigin = \"p\"\n";
+        let registry = load(&write(dir.path(), text)).unwrap();
+        let demo = &registry.repos["demo"];
+        assert_eq!(demo.ledger.as_deref(), Some("Company/Ledger.git"));
+        assert!(demo.shares_ledger_with("company/ledger"));
+        assert!(!demo.shares_ledger_with("company/elsewhere"));
+        assert_eq!(registry.repos["other"].ledger, None);
+        assert!(!registry.repos["other"].shares_ledger_with("company/ledger"));
+    }
+
+    #[test]
+    fn a_ledger_that_is_not_a_repository_or_has_no_forge_upstream_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let not_a_slug = "[repos.demo]\nupstream = \"https://forge.example/org/demo\"\n\
+                          origin = \"o\"\nledger = \"~/ledger\"\n";
+        let error = load(&write(dir.path(), not_a_slug))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("[repos.demo] ledger names the repository")
+                && error.contains("found \"~/ledger\""),
+            "was: {error}"
+        );
+
+        let path_upstream = "[repos.demo]\nupstream = \"/srv/upstream\"\n\
+                             origin = \"o\"\nledger = \"company/ledger\"\n";
+        let error = load(&write(dir.path(), path_upstream))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("[repos.demo] sets ledger, but its upstream /srv/upstream"),
+            "was: {error}"
+        );
     }
 
     #[test]

@@ -7,8 +7,9 @@
 
 //! `knives ledger sweep`, the hand-off every write makes to it, and the pull
 //! a deciding command makes first, through the real binary: a config home
-//! whose ledger root is a git repository sharing a bare remote, as a machine
-//! set up to share its ledger has.
+//! whose registry shares a fork's ledger with a repository, and whose ledger
+//! root is a git repository with that repository as its `origin`, as a
+//! machine set up to share its ledger has.
 
 #[path = "common/lab.rs"]
 mod lab;
@@ -22,14 +23,20 @@ use knives::ledger::{Entry, Kind, Ledger};
 
 /// The forge repository the lab fork's upstream is reached by in these
 /// tests. A filesystem upstream names no repository another machine could
-/// share, so its fork is kept under its registry key, and a destination
-/// refuses to carry a name that is not an `<owner>/<name>`.
+/// share, so its fork is kept under its registry key, and the registry
+/// refuses a `ledger` for it.
 const UPSTREAM: &str = "https://forge.invalid/acme/demo";
 /// [`UPSTREAM`]'s `<owner>/<name>`: what the ledger keeps the lab fork under.
 const FORK: &str = "acme/demo";
+/// The repository each fork's registry entry says its ledger belongs to.
+const LEDGER: &str = "acme/ledger";
+/// [`LEDGER`] as each ledger root's `origin` spells it; git reaches it at a
+/// bare remote through `insteadOf`.
+const LEDGER_URL: &str = "https://forge.invalid/acme/ledger";
 
 /// A config home whose registry calls the lab fork `demo`, with [`UPSTREAM`]
-/// as its upstream, and the lab's work checkout pointing there too.
+/// as its upstream and its ledger shared with [`LEDGER`], and the lab's work
+/// checkout pointing there too.
 fn shared_home(lab: &lab::Lab) -> tempfile::TempDir {
     let (home, _consumer) = lab::release_test_home(lab);
     lab.upstream_at_forge_url(UPSTREAM);
@@ -37,21 +44,41 @@ fn shared_home(lab: &lab::Lab) -> tempfile::TempDir {
     let text = std::fs::read_to_string(&registry).expect("read the registry");
     std::fs::write(
         &registry,
-        text.replace(&lab.upstream.display().to_string(), UPSTREAM),
+        format!(
+            "{}ledger = \"{LEDGER}\"\n",
+            text.replace(&lab.upstream.display().to_string(), UPSTREAM)
+        ),
     )
     .expect("write the registry");
     home
 }
 
-/// Make `home`'s ledger root a repository that shares `forks` with `remote`
-/// as `machine`, and return the root.
-fn share(home: &Path, machine: &str, remote: &Path, forks: &[&str]) -> PathBuf {
+/// A config home whose registry names one fork, kept under `acme/a-repo`,
+/// sharing its ledger with [`LEDGER`].
+fn a_repo_home() -> tempfile::TempDir {
+    let home = tempfile::tempdir().expect("config home");
+    std::fs::write(
+        home.path().join("repos.toml"),
+        format!(
+            "[repos.a-repo]\nupstream = \"https://forge.invalid/acme/a-repo\"\n\
+             origin = \"https://forge.invalid/ours/a-repo\"\nledger = \"{LEDGER}\"\n"
+        ),
+    )
+    .expect("write the registry");
+    home
+}
+
+/// Make `home`'s ledger root a repository whose `origin` is [`LEDGER_URL`],
+/// reached at `remote`, committing as `machine`; return the root.
+fn share(home: &Path, machine: &str, remote: &Path) -> PathBuf {
     let root = home.join("ledger");
-    lab::git_repository(&root, &[("origin", remote.to_str().expect("utf-8"))]);
+    lab::git_repository(&root, &[("origin", LEDGER_URL)]);
+    let reached = remote.to_str().expect("utf-8");
+    lab::git_output(
+        &root,
+        ["config", &format!("url.{reached}.insteadOf"), LEDGER_URL],
+    );
     lab::git_output(&root, ["config", "knives.machine", machine]);
-    for fork in forks {
-        lab::git_output(&root, ["config", "--add", "knives.fork", fork]);
-    }
     root
 }
 
@@ -160,9 +187,9 @@ fn settle(home: &Path) {
 fn a_burst_of_concurrent_sweeps_makes_one_commit_and_no_error() {
     // Given: twelve entries on a machine that shares its ledger.
     const SWEEPS: usize = 16;
-    let home = tempfile::tempdir().expect("config home");
+    let home = a_repo_home();
     let (_remote_dir, remote) = bare_remote();
-    let root = share(home.path(), "alpha", &remote, &["acme/a-repo"]);
+    let root = share(home.path(), "alpha", &remote);
     append(&root, "acme/a-repo", 12);
 
     // When: sixteen sweeps start at once.
@@ -228,9 +255,9 @@ fn a_burst_of_concurrent_sweeps_makes_one_commit_and_no_error() {
 #[test]
 fn a_sweep_with_nothing_new_does_nothing_and_succeeds() {
     // Given: a machine whose one entry is already swept.
-    let home = tempfile::tempdir().expect("config home");
+    let home = a_repo_home();
     let (_remote_dir, remote) = bare_remote();
-    let root = share(home.path(), "alpha", &remote, &["acme/a-repo"]);
+    let root = share(home.path(), "alpha", &remote);
     append(&root, "acme/a-repo", 1);
     assert!(sweep(home.path()).status.success());
     let git_dir = root.join(".git");
@@ -258,7 +285,8 @@ fn a_sweep_with_nothing_new_does_nothing_and_succeeds() {
 #[test]
 fn a_ledger_nobody_set_up_to_share_is_swept_as_nothing_and_touched_nowhere() {
     // Given: a config home whose ledger root is no repository at all, and
-    // another whose repository names no machine or fork.
+    // another whose repository names no machine, with a registry sharing no
+    // fork's ledger.
     for initialised in [false, true] {
         let home = tempfile::tempdir().expect("config home");
         let root = home.path().join("ledger");
@@ -287,11 +315,11 @@ fn a_ledger_nobody_set_up_to_share_is_swept_as_nothing_and_touched_nowhere() {
 
 #[test]
 fn a_destination_with_forks_but_no_machine_name_fails_naming_the_fix() {
-    // Given: a ledger repository that carries a fork and names no machine.
-    let home = tempfile::tempdir().expect("config home");
+    // Given: a registry sharing a fork's ledger with the root's origin, and
+    // a root that names no machine.
+    let home = a_repo_home();
     let root = home.path().join("ledger");
-    lab::git_repository(&root, &[]);
-    lab::git_output(&root, ["config", "knives.fork", "a-repo"]);
+    lab::git_repository(&root, &[("origin", LEDGER_URL)]);
 
     // When: a sweep runs.
     let swept = sweep(home.path());
@@ -312,6 +340,35 @@ fn a_destination_with_forks_but_no_machine_name_fails_naming_the_fix() {
 }
 
 #[test]
+fn a_fork_whose_ledger_belongs_elsewhere_is_carried_nowhere_and_said_so() {
+    // Given: a registry sharing a fork's ledger with one repository, a root
+    // whose origin is another, and an entry of that fork's on disk.
+    let home = tempfile::tempdir().expect("config home");
+    std::fs::write(
+        home.path().join("repos.toml"),
+        "[repos.a-repo]\nupstream = \"https://forge.invalid/acme/a-repo\"\n\
+         origin = \"https://forge.invalid/ours/a-repo\"\nledger = \"acme/elsewhere\"\n",
+    )
+    .expect("write the registry");
+    let (_remote_dir, remote) = bare_remote();
+    let root = share(home.path(), "alpha", &remote);
+    append(&root, "acme/a-repo", 1);
+
+    // When: a sweep runs.
+    let swept = sweep(home.path());
+
+    // Then: it fails naming the repository the registry says, carries the
+    // entry nowhere, and leaves the reason in the log.
+    assert_eq!(swept.status.code(), Some(3), "{swept:?}");
+    let report: serde_json::Value = serde_json::from_slice(&swept.stdout).expect("JSON");
+    let said = "repos.toml says its ledger belongs to acme/elsewhere";
+    assert!(report["problems"].to_string().contains(said), "{report}");
+    assert_eq!(entries_on(&remote, "alpha"), 0);
+    let log = std::fs::read_to_string(home.path().join("ledger-sweep.log")).expect("a log");
+    assert!(log.contains(said), "{log}");
+}
+
+#[test]
 fn a_write_hands_off_to_a_sweep_and_does_not_wait_for_it() {
     // Given: a managed fork on a machine that shares its ledger, with the
     // ledger repository's transport lock held, so any sweep stalls in its
@@ -319,7 +376,7 @@ fn a_write_hands_off_to_a_sweep_and_does_not_wait_for_it() {
     let lab = lab::Lab::new();
     let home = shared_home(&lab);
     let (_remote_dir, remote) = bare_remote();
-    let root = share(home.path(), "alpha", &remote, &[FORK]);
+    let root = share(home.path(), "alpha", &remote);
     let transport = File::options()
         .read(true)
         .write(true)
@@ -373,7 +430,7 @@ fn a_burst_of_concurrent_writes_reaches_the_remote_without_a_failure() {
     let lab = lab::Lab::new();
     let home = shared_home(&lab);
     let (_remote_dir, remote) = bare_remote();
-    share(home.path(), "alpha", &remote, &[FORK]);
+    share(home.path(), "alpha", &remote);
 
     // When: sixteen notes are written at once, each handing off.
     let children: Vec<_> = (0..WRITES)
@@ -464,8 +521,8 @@ fn a_statement_made_on_one_machine_shows_in_status_on_another_after_a_sweep() {
     let alpha = shared_home(&lab);
     let beta = second_machine(alpha.path());
     let (_remote_dir, remote) = bare_remote();
-    share(alpha.path(), "alpha", &remote, &[FORK]);
-    share(beta.path(), "beta", &remote, &[FORK]);
+    share(alpha.path(), "alpha", &remote);
+    share(beta.path(), "beta", &remote);
 
     // When: alpha states the branch's pull request, and the sweep that write
     // handed off has carried it to the remote.
@@ -509,12 +566,7 @@ fn a_status_that_cannot_pull_says_so_and_still_answers() {
     let lab = lab::Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     let home = shared_home(&lab);
-    share(
-        home.path(),
-        "alpha",
-        Path::new("/nonexistent/ledger.git"),
-        &[FORK],
-    );
+    share(home.path(), "alpha", Path::new("/nonexistent/ledger.git"));
 
     // When: status runs.
     let (code, report) = status_on(&lab, home.path());
@@ -544,7 +596,7 @@ fn status_counts_entries_the_remote_lacks_and_names_a_failed_sweeps_log() {
     let lab = lab::Lab::new();
     let home = shared_home(&lab);
     let (_remote_dir, remote) = bare_remote();
-    let root = share(home.path(), "alpha", &remote, &[FORK]);
+    let root = share(home.path(), "alpha", &remote);
     append(&root, FORK, 1);
 
     // When: status runs.
@@ -594,12 +646,7 @@ fn a_release_cut_is_refused_when_the_ledger_cannot_be_pulled() {
     let lab = lab::Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     let home = shared_home(&lab);
-    share(
-        home.path(),
-        "alpha",
-        Path::new("/nonexistent/ledger.git"),
-        &[FORK],
-    );
+    share(home.path(), "alpha", Path::new("/nonexistent/ledger.git"));
 
     // When: the cut is asked for.
     let cut = lab::knives_release(&lab, &home, &["cut", "release/2026-08-04"]);

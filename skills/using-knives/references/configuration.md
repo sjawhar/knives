@@ -45,6 +45,7 @@ base = "main"
 release = "https://forge.example/company/libcore"
 consumers = ["company/workbench"]
 forbidden = ["acme-corp", "internal.example"]
+ledger = "company/knives-ledger"
 
 [repos.tool]
 upstream = "https://forge.example/org/tool"
@@ -79,6 +80,13 @@ roots = ["~/projects/company"]
   Blank terms or case-insensitive duplicates are refused with the entry named.
   Absent/empty means no scan and no `forbidden` field. Audit reports hits, never
   blocks on them; no other command reads the list.
+- `ledger`: the `<owner>/<name>` of the repository this fork's ledger belongs
+  to, through which its entries travel between machines (the ledger reference
+  has the setup). Absent, the fork's ledger is not shared. Letter case and a
+  `.git` suffix do not matter. Refused when it is not `<owner>/<name>`, or when
+  the fork's `upstream` is a filesystem path. An older knives refuses a file
+  that sets it, as every entry refuses a field it does not know: upgrade every
+  machine that reads the file before adding it.
 
 ## How a checkout is found
 

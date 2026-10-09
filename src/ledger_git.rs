@@ -402,18 +402,21 @@ pub fn unsent(repository: &Repository, remote: &str) -> Result<BTreeSet<PathBuf>
     Ok(local)
 }
 
-/// Every `knives.*` key in the repository at `git_dir`'s own config.
+/// Every key of the repository at `git_dir`'s own config that `pattern`, a
+/// `git config --get-regexp` pattern, matches.
 ///
-/// Lowercased as git prints it, with its value, in file order: a key set
-/// twice appears twice. A key with no value at all reads as empty.
-pub fn knives_config(git_dir: &Path) -> Result<Vec<(String, String)>, GitError> {
+/// Lowercased as git prints it (a remote's name excepted), with its value, in
+/// file order: a key set twice appears twice. A key with no value at all
+/// reads as empty. Values are as written: a `url.<base>.insteadOf` rewrites
+/// where git fetches, never what a remote's `url` says it is.
+pub fn local_config(git_dir: &Path, pattern: &str) -> Result<Vec<(String, String)>, GitError> {
     let mut command = crate::bind::git_command();
     command.arg("--git-dir").arg(git_dir).args([
         "config",
         "--local",
         "-z",
         "--get-regexp",
-        "^knives\\.",
+        pattern,
     ]);
     let output = command
         .stdin(Stdio::null())

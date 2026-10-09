@@ -138,18 +138,26 @@ reach its ledger, `state.json` keeps all of them and the command exits `3`.
 
 ## Sharing between machines
 
-A ledger travels between machines once its root, `~/.config/knives/ledger/`, is
-the working tree of a git repository that names this machine and the forks it
-shares:
+A fork's ledger travels between machines when its `repos.toml` entry names the
+repository the ledger belongs to, as `ledger = "<owner>/<name>"`, and this
+machine's ledger root, `~/.config/knives/ledger/`, is the working tree of a git
+repository whose `origin` is that repository and whose config names this machine:
 
 ```bash
+git init ~/.config/knives/ledger
+git -C ~/.config/knives/ledger remote add origin <the ledger repository's URL>
 git -C ~/.config/knives/ledger config knives.machine <name>    # unique among machines on the remote
-git -C ~/.config/knives/ledger config --add knives.fork <repo>  # once per fork it shares
 ```
 
-A fork's entries go to that repository's `origin` and nowhere else; a fork it
-does not list stays on this machine, and a repository listing none shares
-nothing. With neither key set the ledger is not shared, and nothing says so.
+A fork's entries go to that `origin` and nowhere else. A fork without `ledger`
+stays on this machine. A fork whose `ledger` names some other repository than
+the root's `origin` travels nowhere from here, and every sweep, and every pull
+that asks about it, says so as a problem. With no fork's `ledger` set the
+ledger is not shared, and nothing says so. `ledger` is refused on a fork whose
+`upstream` is a filesystem path, which names no repository another machine
+could share. The repository's git config names the machine and nothing else: a
+`knives.*` key other than `knives.machine` is refused with the command that
+removes it.
 
 Every command that appends an entry starts `knives ledger sweep` in the
 background as it exits, without waiting for it. A sweep commits new entries to
