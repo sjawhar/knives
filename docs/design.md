@@ -307,6 +307,8 @@ knives depends BRANCH --on R#N  record that a branch cannot land before somethin
 knives notch [SUBJECT]         read what happened here (bare: newest 20 human notes plus a
                                folded machine-event count; a subject: its whole chronology);
                                -m writes a note, --disposition requires --evidence
+knives ledger sweep            commit, pull and push the shared ledger; single-flight, and every
+                               write starts one detached as it exits
 knives release [NAME]          plan, cut, edit or reap a release under the configured scheme
 knives release cut [NAME]      name a new cut of the composition in hand, verbatim (first cut: every branch); refuses to orphan commits or to silently drop members the previous cut's ledger event recorded ([--allow-drop] overrides both), and refuses a candidate with the same tree and the same parents as the previous cut on the publish remote; never pushes
 knives release reap            reap superseded dated release bookmarks everywhere locally and abandon their commits; all kept while the live cut carries conflicts

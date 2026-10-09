@@ -22,7 +22,7 @@ use std::ffi::OsStr;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -30,15 +30,27 @@ use crate::config::default_config_path;
 use crate::ids::RepoName;
 use crate::statement::Statement;
 
+/// The directory holding every repository's ledger, beside `state.json`.
+pub fn default_ledger_root() -> PathBuf {
+    default_config_path().with_file_name("ledger")
+}
+
 /// Where a repository's ledger lives: a directory of entry files beside
 /// `state.json`.
 ///
 /// Each entry is immutable, so concurrent writers never share a file and a git
 /// history over the directory is pure additions.
 pub fn default_ledger_path(repo: &RepoName) -> PathBuf {
-    default_config_path()
-        .with_file_name("ledger")
-        .join(repo.to_string())
+    default_ledger_root().join(repo.to_string())
+}
+
+/// Set once this process has appended an entry; see [`appended`].
+static APPENDED: AtomicBool = AtomicBool::new(false);
+
+/// Whether this process has appended an entry to any ledger, so that it has
+/// something to hand to [`crate::ledger_sweep::hand_off`] before it exits.
+pub fn appended() -> bool {
+    APPENDED.load(Ordering::Relaxed)
 }
 
 /// Who put an entry there.
@@ -294,7 +306,9 @@ impl Ledger {
                 path: path.clone(),
                 source,
             })?;
-        persist_entry(temporary, path)
+        persist_entry(temporary, path)?;
+        APPENDED.store(true, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Every entry, oldest first: lexicographic filename order, which the

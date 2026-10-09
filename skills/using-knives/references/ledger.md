@@ -125,3 +125,28 @@ A command that reads branch statements (`status`, `audit`, `pushed`, `sync`,
 fork it works on when it starts, and no other. An unreadable entry in one of
 those stops the command with exit `3` naming the file, rather than reading that
 ledger's statements as absent.
+
+## Sharing between machines
+
+A ledger travels between machines once its root, `~/.config/knives/ledger/`, is
+the working tree of a git repository that names this machine and the forks it
+shares:
+
+```bash
+git -C ~/.config/knives/ledger config knives.machine <name>    # unique among machines on the remote
+git -C ~/.config/knives/ledger config --add knives.fork <repo>  # once per fork it shares
+```
+
+A fork's entries go to that repository's `origin` and nowhere else; a fork it
+does not list stays on this machine, and a repository listing none shares
+nothing. With neither key set the ledger is not shared, and nothing says so.
+
+Every command that appends an entry starts `knives ledger sweep` in the
+background as it exits, without waiting for it. A sweep commits new entries to
+`refs/knives/<machine>` (git plumbing only, never the index), fetches every
+machine's ref, writes in the entries this machine lacks, and pushes its own ref,
+which no other machine writes. One sweep runs at a time, holding `ledger.lock`
+beside the state file; a sweep that finds it held exits `0` at once, because the
+holder looks again before it stops. A failing sweep leaves its errors in
+`ledger-sweep.log` beside the state file, which exists only while the last sweep
+failed. Run `knives ledger sweep` by hand to see what one carries.

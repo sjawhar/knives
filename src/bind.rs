@@ -271,7 +271,7 @@ pub fn checkout_of_root(root: &Path) -> PathBuf {
 /// its companions, and `git -c` exports `GIT_CONFIG_PARAMETERS` to every
 /// subprocess; inherited, they would make a root report another repository's
 /// configuration, or configuration that lives in no repository at all.
-fn git_command() -> std::process::Command {
+pub(crate) fn git_command() -> std::process::Command {
     let mut command = std::process::Command::new("git");
     for variable in [
         "GIT_DIR",

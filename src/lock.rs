@@ -37,6 +37,15 @@ impl LockWait {
         floor: Duration::from_millis(20),
         ceiling: Duration::from_millis(200),
     };
+
+    /// One minute, for a ledger repository's transport lock: a sweep's pass
+    /// holds it across a fetch and a push, so a command pulling before it
+    /// decides waits out one network round trip rather than failing on it.
+    pub(crate) const TRANSPORT: Self = Self {
+        deadline: Duration::from_secs(60),
+        floor: Duration::from_millis(20),
+        ceiling: Duration::from_secs(2),
+    };
 }
 
 /// The lock file a wait gave up on: the holder's pid when the file names one,
@@ -139,23 +148,7 @@ impl FileLock {
     /// guarded by `state.lock`. Waits per `wait`, then gives up loudly:
     /// blocking forever would hide a holder that has hung.
     pub(crate) fn acquire(target: &Path, wait: LockWait) -> Result<Self, LockError> {
-        let path = target.with_extension("lock");
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|source| LockError::Io {
-                path: parent.to_owned(),
-                source,
-            })?;
-        }
-        let mut file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)
-            .map_err(|source| LockError::Io {
-                path: path.clone(),
-                source,
-            })?;
+        let (path, file) = open(target)?;
         let started = std::time::Instant::now();
         let mut attempt = 0u32;
         loop {
@@ -179,13 +172,51 @@ impl FileLock {
                 }
             }
         }
-        // Ours now: name ourselves for whoever waits on us. A write failure is
-        // not a lock failure, only a nameless holder in the give-up message.
+        Ok(Self::held(file))
+    }
+
+    /// [`Self::acquire`] without waiting: `None` when another holder has it.
+    /// For a caller whose work the holder already does, so that finding the
+    /// lock taken is the answer rather than a reason to wait.
+    pub(crate) fn try_acquire(target: &Path) -> Result<Option<Self>, LockError> {
+        let (path, file) = open(target)?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(Self::held(file))),
+            Err(TryLockError::WouldBlock) => Ok(None),
+            Err(TryLockError::Error(source)) => Err(LockError::Io { path, source }),
+        }
+    }
+
+    /// Ours now: name ourselves for whoever waits on us. A write failure is
+    /// not a lock failure, only a nameless holder in the give-up message.
+    fn held(mut file: File) -> Self {
         if file.set_len(0).is_ok() {
             let _ = writeln!(file, "{}", std::process::id());
         }
-        Ok(Self { _file: file })
+        Self { _file: file }
     }
+}
+
+/// The lock file beside `target`, created if absent, open for locking.
+fn open(target: &Path) -> Result<(PathBuf, File), LockError> {
+    let path = target.with_extension("lock");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|source| LockError::Io {
+            path: parent.to_owned(),
+            source,
+        })?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|source| LockError::Io {
+            path: path.clone(),
+            source,
+        })?;
+    Ok((path, file))
 }
 
 #[cfg(test)]
@@ -335,13 +366,13 @@ mod tests {
         child.kill().expect("SIGKILL the holder");
         let _ = child.wait();
 
-        // Then: the lock is free at once; no file to remove, no age to judge.
-        let started = std::time::Instant::now();
-        let _mine = FileLock::acquire(&path, QUICK).expect("acquired after the kill");
+        // Then: the lock is free at once, taken on the first try with no wait
+        // at all; no file to remove, no age to judge.
         assert!(
-            started.elapsed() < QUICK.deadline / 2,
-            "waited {:?}",
-            started.elapsed()
+            FileLock::try_acquire(&path)
+                .expect("try after the kill")
+                .is_some(),
+            "the killed holder's lock was still held"
         );
     }
 
@@ -377,5 +408,21 @@ mod tests {
             waited >= QUICK.deadline && waited < QUICK.deadline * 3,
             "{waited:?}"
         );
+    }
+
+    #[test]
+    fn trying_a_held_lock_answers_at_once_and_a_free_one_is_taken() {
+        let dir = tempfile::tempdir().expect("state dir");
+        let path = dir.path().join("ledger");
+        let first = FileLock::try_acquire(&path)
+            .expect("try")
+            .expect("a free lock is taken");
+
+        let started = std::time::Instant::now();
+        assert!(FileLock::try_acquire(&path).expect("try").is_none());
+        assert!(started.elapsed() < Duration::from_millis(100));
+
+        drop(first);
+        assert!(FileLock::try_acquire(&path).expect("try").is_some());
     }
 }

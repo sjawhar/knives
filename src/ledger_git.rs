@@ -1,19 +1,23 @@
 //! Ledger entries between machines, through git, without git's index or a
 //! checkout.
 //!
-//! The ledger directory is the working tree of a git repository that git never
-//! stages into, checks out, or rewrites. Each machine commits the entries it
-//! wrote to its own ref, `refs/knives/<machine>`; a fetch copies every
-//! machine's ref to `refs/knives-remotes/<remote>/<machine>`; materialising
-//! writes the entries the directory lacks.
+//! The ledger root, one directory per fork, is the working tree of one or
+//! more git repositories that git never stages into, checks out, or rewrites.
+//! Each [`Repository`] carries the forks it names and no others: an entry is
+//! about one fork, and the fork decides which remote may see it. Each machine
+//! commits the entries it wrote to its own ref, `refs/knives/<machine>`; a
+//! fetch copies every machine's ref to `refs/knives-remotes/<remote>/<machine>`;
+//! materialising writes the entries the directory lacks.
 //!
 //! Only plumbing runs here. A repository has one `.git/index` and one lock on
 //! it, so staging entries with `git add` makes concurrent writers contend for
 //! that lock and fail on it, when the ledger is one file per entry precisely so
 //! that no two writers share anything. `hash-object`, `mktree`, `commit-tree`
-//! and `update-ref` write objects and one ref, never an index. A machine moves
-//! only its own ref, and only forward, so its push is a fast-forward nothing
-//! else contends for, and nothing is ever rebased.
+//! and `update-ref` write objects and one ref, never an index, and so never
+//! consult an exclude file either: which entries a repository carries is its
+//! fork list and nothing else. A machine moves only its own ref, and only
+//! forward, so its push is a fast-forward nothing else contends for, and
+//! nothing is ever rebased.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
@@ -22,7 +26,7 @@ use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
-use crate::ids::CommitId;
+use crate::ids::{CommitId, RepoName};
 
 /// Each machine's own ref: `refs/knives/<machine>`.
 const OWN: &str = "refs/knives/";
@@ -36,12 +40,99 @@ pub struct MachineRef {
     pub commit: CommitId,
 }
 
+/// One git repository over the ledger root, and the forks it carries.
+///
+/// Its git directory is named outright rather than discovered from the
+/// working tree, so a second repository over the same root (a git directory
+/// elsewhere whose working tree is that root) is reached exactly as the first
+/// is. Entries are committed from, and materialised into, only the
+/// directories of the forks it names; a repository naming no fork carries
+/// nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Repository {
+    git_dir: PathBuf,
+    work_tree: PathBuf,
+    forks: BTreeSet<RepoName>,
+}
+
+impl Repository {
+    /// The repository at `git_dir` over the ledger root `work_tree`, carrying
+    /// `forks`. A fork name that is not one directory name in the root is
+    /// refused: it would reach entries outside that fork's directory.
+    pub fn new(
+        git_dir: &Path,
+        work_tree: &Path,
+        forks: impl IntoIterator<Item = RepoName>,
+    ) -> Result<Self, GitError> {
+        let absolute = |path: &Path| {
+            std::path::absolute(path).map_err(|source| GitError::Read {
+                path: path.to_owned(),
+                source,
+            })
+        };
+        Ok(Self {
+            git_dir: absolute(git_dir)?,
+            work_tree: absolute(work_tree)?,
+            forks: forks
+                .into_iter()
+                .map(fork_directory)
+                .collect::<Result<_, _>>()?,
+        })
+    }
+
+    pub fn git_dir(&self) -> &Path {
+        &self.git_dir
+    }
+
+    pub fn work_tree(&self) -> &Path {
+        &self.work_tree
+    }
+
+    pub const fn forks(&self) -> &BTreeSet<RepoName> {
+        &self.forks
+    }
+
+    /// Whether the entry at `path`, relative to the root, lies in the
+    /// directory of a fork this repository carries.
+    fn carries_entry(&self, path: &Path) -> bool {
+        let mut components = path.components();
+        matches!(
+            (components.next(), components.next()),
+            (Some(Component::Normal(fork)), Some(_))
+                if self.forks.iter().any(|carried| fork == OsStr::new(carried.as_str()))
+        )
+    }
+
+    /// `git` on this repository, run in the ledger root.
+    ///
+    /// `--git-dir` and `--work-tree` leave nothing to discovery. No terminal
+    /// prompt: a ledger command has nobody to answer one, whether it is a
+    /// sweep running detached or a pull a report is waiting on, and a
+    /// credential prompt would hold the ledger's lock until someone noticed.
+    fn git(&self) -> Command {
+        let mut command = crate::bind::git_command();
+        command
+            .arg("-C")
+            .arg(&self.work_tree)
+            .arg("--git-dir")
+            .arg(&self.git_dir)
+            .arg("--work-tree")
+            .arg(&self.work_tree)
+            .env("GIT_TERMINAL_PROMPT", "0");
+        command
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum GitError {
     #[error(
         "refusing {role} name {name:?}: it must be one git ref name component, with no `/` and no leading `-`"
     )]
     Name { role: &'static str, name: String },
+    #[error(
+        "refusing fork name {name:?}: it must be one directory name in the ledger root, other than .git"
+    )]
+    Fork { name: String },
     #[error("running {invocation}: {source}")]
     Run {
         invocation: String,
@@ -78,14 +169,17 @@ pub enum GitError {
     NotOwn { machine: String, remote: String },
 }
 
-/// Commit every entry under `repo_dir` that no knives ref carries yet to
-/// `refs/knives/<machine>`, as a child of the commit that ref holds now.
+/// Commit every entry in the forks `repository` carries that no knives ref
+/// carries yet to `refs/knives/<machine>`, as a child of the commit that ref
+/// holds now.
 ///
-/// An entry is a `*.md` regular file anywhere under `repo_dir` outside `.git`,
-/// the files [`crate::ledger::Ledger::entries`] reads. "Carried" counts every
-/// ref under `refs/knives/` and `refs/knives-remotes/`, so an entry
-/// materialised from a peer is not committed again as this machine's own.
-/// `Ok(None)` when nothing is new, and the ref is then untouched.
+/// An entry is a `*.md` regular file anywhere under a carried fork's
+/// directory outside `.git`, the files [`crate::ledger::Ledger::entries`]
+/// reads; no other fork's directory is read, however the root is shared.
+/// "Carried" counts every ref under `refs/knives/` and `refs/knives-remotes/`,
+/// so an entry materialised from a peer is not committed again as this
+/// machine's own. `Ok(None)` when nothing is new, and the ref is then
+/// untouched.
 ///
 /// A remote that has `machine`'s ref when this checkout has none means the
 /// name is another machine's, or this checkout was recreated; either way a
@@ -95,13 +189,52 @@ pub enum GitError {
 /// The ref moves by compare-and-swap against the value read at the start, so
 /// a second writer for the same machine racing this one fails loudly rather
 /// than lose the other's commit.
-pub fn commit_new_entries(repo_dir: &Path, machine: &str) -> Result<Option<CommitId>, GitError> {
+pub fn commit_new_entries(
+    repository: &Repository,
+    machine: &str,
+) -> Result<Option<CommitId>, GitError> {
+    let Pending {
+        reference,
+        previous,
+        base,
+        added,
+    } = pending(repository, machine)?;
+    if added.is_empty() {
+        return Ok(None);
+    }
+    let blobs = hash_objects(repository, &added)?;
+    let tree = write_tree(repository, base, added.into_iter().zip(blobs))?;
+    let commit = commit_tree(repository, machine, &tree, previous.as_ref())?;
+    run(repository.git().args([
+        "update-ref",
+        &reference,
+        commit.as_str(),
+        previous.as_ref().map_or("", CommitId::as_str),
+    ]))?;
+    Ok(Some(commit))
+}
+
+/// Whether [`commit_new_entries`] would commit anything now. It only reads,
+/// so it can run while another process holds the ledger's lock and commits.
+pub fn has_new_entries(repository: &Repository, machine: &str) -> Result<bool, GitError> {
+    Ok(!pending(repository, machine)?.added.is_empty())
+}
+
+/// What a commit as one machine would start from and add.
+struct Pending {
+    reference: String,
+    previous: Option<CommitId>,
+    base: Vec<TreeItem>,
+    added: BTreeSet<PathBuf>,
+}
+
+fn pending(repository: &Repository, machine: &str) -> Result<Pending, GitError> {
     let reference = own_ref(machine)?;
     let mut previous = None;
     let mut base = Vec::new();
     let mut carried = BTreeSet::new();
     let mut fetched_copy = None;
-    for (name, commit) in references(repo_dir, &[OWN, FETCHED])? {
+    for (name, commit) in references(repository, &[OWN, FETCHED])? {
         if let Some((remote, fetched)) = name
             .strip_prefix(FETCHED)
             .and_then(|rest| rest.split_once('/'))
@@ -109,7 +242,7 @@ pub fn commit_new_entries(repo_dir: &Path, machine: &str) -> Result<Option<Commi
         {
             fetched_copy.get_or_insert_with(|| remote.to_owned());
         }
-        let items = tree_items(repo_dir, &commit)?;
+        let items = tree_items(repository, &commit)?;
         if name == reference {
             carried.extend(
                 items
@@ -136,21 +269,14 @@ pub fn commit_new_entries(repo_dir: &Path, machine: &str) -> Result<Option<Commi
             remote,
         });
     }
-    let mut added = local_entries(repo_dir)?;
+    let mut added = local_entries(repository)?;
     added.retain(|path| !carried.contains(path));
-    if added.is_empty() {
-        return Ok(None);
-    }
-    let blobs = hash_objects(repo_dir, &added)?;
-    let tree = write_tree(repo_dir, base, added.into_iter().zip(blobs))?;
-    let commit = commit_tree(repo_dir, machine, &tree, previous.as_ref())?;
-    run(crate::bind::git(repo_dir).args([
-        "update-ref",
-        &reference,
-        commit.as_str(),
-        previous.as_ref().map_or("", CommitId::as_str),
-    ]))?;
-    Ok(Some(commit))
+    Ok(Pending {
+        reference,
+        previous,
+        base,
+        added,
+    })
 }
 
 /// Fetch every machine's ref from `remote` into `refs/knives-remotes/<remote>/`
@@ -161,10 +287,10 @@ pub fn commit_new_entries(repo_dir: &Path, machine: &str) -> Result<Option<Commi
 /// ref forward, so a copy that would move backward means some writer rewrote
 /// history, and the fetch fails rather than follow it. `--prune` drops the copy
 /// of a ref the remote no longer has, so the report is the remote's refs now.
-pub fn fetch(repo_dir: &Path, remote: &str) -> Result<Vec<MachineRef>, GitError> {
+pub fn fetch(repository: &Repository, remote: &str) -> Result<Vec<MachineRef>, GitError> {
     let remote = ref_component("remote", remote)?;
     let namespace = format!("{FETCHED}{remote}/");
-    run(crate::bind::git(repo_dir).args([
+    run(repository.git().args([
         "fetch",
         "--quiet",
         "--no-tags",
@@ -173,7 +299,7 @@ pub fn fetch(repo_dir: &Path, remote: &str) -> Result<Vec<MachineRef>, GitError>
         remote,
         &format!("{OWN}*:{namespace}*"),
     ]))?;
-    Ok(references(repo_dir, &[&namespace])?
+    Ok(references(repository, &[&namespace])?
         .into_iter()
         .filter_map(|(name, commit)| {
             Some(MachineRef {
@@ -190,19 +316,22 @@ pub fn fetch(repo_dir: &Path, remote: &str) -> Result<Vec<MachineRef>, GitError>
 /// writes only its own ref" holds. The refspec is spelled from the machine name
 /// alone and never forced, and a name that could spell any other ref (a glob,
 /// a second refspec, a nested path) is refused before git runs. Only
-/// [`commit_new_entries`] writes under `refs/knives/` and [`fetch`] writes
-/// peers' refs elsewhere, so `refs/knives/<machine>` exists here only if this
-/// checkout committed as that machine. A machine `remote` has but this
-/// checkout never committed as is a peer, and pushing it is refused; a machine
-/// neither side has has nothing to send, and the call succeeds having sent
-/// nothing. git rejecting the push means some other writer moved this
-/// machine's ref on `remote`.
-pub fn push(repo_dir: &Path, remote: &str, machine: &str) -> Result<(), GitError> {
+/// [`commit_new_entries`] writes under `refs/knives/`, so
+/// `refs/knives/<machine>` exists here only if this checkout committed as that
+/// machine. A machine `remote` has but this checkout never committed as is a
+/// peer, and pushing it is refused; a machine neither side has has nothing to
+/// send, and the call succeeds having sent nothing. git rejecting the push
+/// means some other writer moved this machine's ref on `remote`.
+///
+/// Once `remote` has taken the commit, it is recorded as `remote`'s copy,
+/// where [`fetch`] leaves copies, so [`unpushed`] knows it was sent without
+/// asking the remote again.
+pub fn push(repository: &Repository, remote: &str, machine: &str) -> Result<(), GitError> {
     let reference = own_ref(machine)?;
     let remote = ref_component("remote", remote)?;
     let fetched = format!("{FETCHED}{remote}/{machine}");
-    let found = references(repo_dir, &[&reference, &fetched])?;
-    if !found.iter().any(|(name, _)| *name == reference) {
+    let found = references(repository, &[&reference, &fetched])?;
+    let Some((_, commit)) = found.iter().find(|(name, _)| *name == reference) else {
         return if found.iter().any(|(name, _)| *name == fetched) {
             Err(GitError::NotOwn {
                 machine: machine.to_owned(),
@@ -211,38 +340,98 @@ pub fn push(repo_dir: &Path, remote: &str, machine: &str) -> Result<(), GitError
         } else {
             Ok(())
         };
-    }
-    run(crate::bind::git(repo_dir).args([
+    };
+    run(repository.git().args([
         "push",
         "--quiet",
         "--no-follow-tags",
         remote,
         &format!("{reference}:{reference}"),
     ]))?;
+    run(repository
+        .git()
+        .args(["update-ref", &fetched, commit.as_str()]))?;
     Ok(())
 }
 
-/// Write every entry `refs` carry that `repo_dir` lacks, returning how many
-/// this call wrote.
+/// Whether `refs/knives/<machine>` holds a commit `remote` was not last seen
+/// holding, by a [`fetch`] or by this machine's own [`push`]: what a sweep
+/// with nothing new to commit still has to send.
+pub fn unpushed(repository: &Repository, remote: &str, machine: &str) -> Result<bool, GitError> {
+    let reference = own_ref(machine)?;
+    let remote = ref_component("remote", remote)?;
+    let fetched = format!("{FETCHED}{remote}/{machine}");
+    let found = references(repository, &[&reference, &fetched])?;
+    let at = |wanted: &str| {
+        found
+            .iter()
+            .find(|(name, _)| name == wanted)
+            .map(|(_, commit)| commit)
+    };
+    Ok(at(&reference).is_some_and(|own| at(&fetched) != Some(own)))
+}
+
+/// Every `knives.*` key in the repository at `git_dir`'s own config.
+///
+/// Lowercased as git prints it, with its value, in file order: a key set
+/// twice appears twice. A key with no value at all reads as empty.
+pub fn knives_config(git_dir: &Path) -> Result<Vec<(String, String)>, GitError> {
+    let mut command = crate::bind::git_command();
+    command.arg("--git-dir").arg(git_dir).args([
+        "config",
+        "--local",
+        "-z",
+        "--get-regexp",
+        "^knives\\.",
+    ]);
+    let output = command
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|source| GitError::Run {
+            invocation: invocation(&command),
+            source,
+        })?;
+    // `--get-regexp` exits 1, printing nothing, when no key matches.
+    if output.status.code() == Some(1) && output.stdout.is_empty() {
+        return Ok(Vec::new());
+    }
+    let answer = succeeded(&command, output)?;
+    answer
+        .split(|&byte| byte == 0)
+        .filter(|record| !record.is_empty())
+        .map(|record| {
+            let text = std::str::from_utf8(record)
+                .map_err(|_| output_error(&command, "UTF-8 `<key>\\n<value>` records"))?;
+            let (key, value) = text.split_once('\n').unwrap_or((text, ""));
+            Ok((key.to_owned(), value.to_owned()))
+        })
+        .collect()
+}
+
+/// Write every entry `refs` carry, in a fork `repository` carries, that the
+/// ledger root lacks, returning how many this call wrote.
 ///
 /// Each entry is written whole to a temporary name and renamed into place,
 /// never over a file already there; see [`write_entry`]. A tree item that is
-/// not an entry file, or whose path would leave `repo_dir` or enter a `.git`,
-/// fails the whole call before anything is written: `mktree` accepts names
-/// like `..` and `.git`, so a peer's ref must be checked before it reaches the
-/// filesystem.
-pub fn materialise(repo_dir: &Path, refs: &[MachineRef]) -> Result<usize, GitError> {
+/// not an entry file, or whose path would leave the root or enter a `.git`,
+/// fails the whole call before anything is written, whichever fork it names:
+/// `mktree` accepts names like `..` and `.git`, so a peer's ref must be
+/// checked before it reaches the filesystem. An entry in a fork this
+/// repository does not carry is left out: it came through a remote that fork
+/// does not belong to, and written into the shared root it would be committed
+/// again by the repository that does carry the fork.
+pub fn materialise(repository: &Repository, refs: &[MachineRef]) -> Result<usize, GitError> {
     let mut missing = BTreeMap::new();
     for machine_ref in refs {
-        for item in tree_items(repo_dir, &machine_ref.commit)? {
+        for item in tree_items(repository, &machine_ref.commit)? {
             if item.node.is_tree() {
                 continue;
             }
             check_entry(&machine_ref.commit, &item)?;
-            if missing.contains_key(&item.path) {
+            if !repository.carries_entry(&item.path) || missing.contains_key(&item.path) {
                 continue;
             }
-            let path = repo_dir.join(&item.path);
+            let path = repository.work_tree.join(&item.path);
             let present = path.try_exists().map_err(|source| GitError::Read {
                 path: path.clone(),
                 source,
@@ -260,7 +449,7 @@ pub fn materialise(repo_dir: &Path, refs: &[MachineRef]) -> Result<usize, GitErr
         input.extend_from_slice(oid.as_bytes());
         input.push(b'\n');
     }
-    let mut command = crate::bind::git(repo_dir);
+    let mut command = repository.git();
     command.args(["cat-file", "--batch"]);
     let answer = run_with_input(&mut command, &input)?;
     let blobs = batch_blobs(&answer)
@@ -268,7 +457,7 @@ pub fn materialise(repo_dir: &Path, refs: &[MachineRef]) -> Result<usize, GitErr
         .ok_or_else(|| output_error(&command, "each requested blob, in order"))?;
     let mut written = 0;
     for (relative, content) in missing.keys().zip(blobs) {
-        if write_entry(&repo_dir.join(relative), content)? {
+        if write_entry(&repository.work_tree.join(relative), content)? {
             written += 1;
         }
     }
@@ -340,18 +529,46 @@ fn ref_component<'a>(role: &'static str, name: &'a str) -> Result<&'a str, GitEr
     }
 }
 
-/// Every `*.md` regular file under `repo_dir`, relative to it, with every
-/// `.git` skipped.
-fn local_entries(repo_dir: &Path) -> Result<BTreeSet<PathBuf>, GitError> {
+/// `fork` when it names exactly one directory in the ledger root, as a
+/// registry key must ([`crate::config::load`]), and not a `.git`.
+fn fork_directory(fork: RepoName) -> Result<RepoName, GitError> {
+    let name = fork.as_str();
+    let plain = !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains(['/', '\\'])
+        && !name.eq_ignore_ascii_case(".git");
+    if plain {
+        Ok(fork)
+    } else {
+        Err(GitError::Fork {
+            name: name.to_owned(),
+        })
+    }
+}
+
+/// Every `*.md` regular file under the directories of the forks `repository`
+/// carries, relative to the root, with every `.git` skipped. A fork with no
+/// directory yet has no entries.
+fn local_entries(repository: &Repository) -> Result<BTreeSet<PathBuf>, GitError> {
     let mut found = BTreeSet::new();
-    let mut pending = vec![PathBuf::new()];
+    let mut pending: Vec<PathBuf> = repository
+        .forks
+        .iter()
+        .map(|fork| PathBuf::from(fork.as_str()))
+        .collect();
     while let Some(relative) = pending.pop() {
-        let directory = repo_dir.join(&relative);
+        let directory = repository.work_tree.join(&relative);
         let unreadable = |source| GitError::Read {
             path: directory.clone(),
             source,
         };
-        for dirent in std::fs::read_dir(&directory).map_err(unreadable)? {
+        let listing = match std::fs::read_dir(&directory) {
+            Ok(listing) => listing,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(source) => return Err(unreadable(source)),
+        };
+        for dirent in listing {
             let dirent = dirent.map_err(unreadable)?;
             let name = dirent.file_name();
             let kind = dirent.file_type().map_err(unreadable)?;
@@ -370,13 +587,16 @@ fn local_entries(repo_dir: &Path) -> Result<BTreeSet<PathBuf>, GitError> {
 ///
 /// `--no-filters`, so a blob is the file's exact bytes whatever
 /// `.gitattributes` says, and a peer materialises it byte for byte.
-fn hash_objects(repo_dir: &Path, paths: &BTreeSet<PathBuf>) -> Result<Vec<String>, GitError> {
+fn hash_objects(
+    repository: &Repository,
+    paths: &BTreeSet<PathBuf>,
+) -> Result<Vec<String>, GitError> {
     let mut input = Vec::new();
     for path in paths {
         push_quoted(&mut input, path);
         input.push(b'\n');
     }
-    let mut command = crate::bind::git(repo_dir);
+    let mut command = repository.git();
     command.args(["hash-object", "-w", "--no-filters", "--stdin-paths"]);
     let answer = run_with_input(&mut command, &input)?;
     let ids = object_ids(&command, &answer)?;
@@ -414,7 +634,7 @@ fn push_quoted(out: &mut Vec<u8>, path: &Path) {
 /// `mktree` per directory it touches rather than one per directory the ledger
 /// has.
 fn write_tree(
-    repo_dir: &Path,
+    repository: &Repository,
     base: Vec<TreeItem>,
     added: impl Iterator<Item = (PathBuf, String)>,
 ) -> Result<String, GitError> {
@@ -463,12 +683,12 @@ fn write_tree(
             directory = parent;
         }
     }
-    write_directory(repo_dir, &directories, &dirty, Path::new(""))
+    write_directory(repository, &directories, &dirty, Path::new(""))
 }
 
 /// Write `directory`'s tree, writing each subtree in `dirty` first.
 fn write_directory(
-    repo_dir: &Path,
+    repository: &Repository,
     directories: &Directories,
     dirty: &BTreeSet<PathBuf>,
     directory: &Path,
@@ -478,7 +698,7 @@ fn write_directory(
         let path = directory.join(name);
         let rewritten;
         let oid = if dirty.contains(&path) {
-            rewritten = write_directory(repo_dir, directories, dirty, &path)?;
+            rewritten = write_directory(repository, directories, dirty, &path)?;
             &rewritten
         } else {
             &node.oid
@@ -491,7 +711,7 @@ fn write_directory(
         input.extend_from_slice(name.as_bytes());
         input.push(0);
     }
-    let mut command = crate::bind::git(repo_dir);
+    let mut command = repository.git();
     command.args(["mktree", "-z"]);
     let answer = run_with_input(&mut command, &input)?;
     single_id(&command, &answer)
@@ -513,12 +733,12 @@ fn split(path: &Path) -> Option<(PathBuf, OsString)> {
 /// so a `commit.gpgSign` meant for the box's own commits cannot stall a sweep
 /// on a passphrase or a signing agent.
 fn commit_tree(
-    repo_dir: &Path,
+    repository: &Repository,
     machine: &str,
     tree: &str,
     parent: Option<&CommitId>,
 ) -> Result<CommitId, GitError> {
-    let mut command = crate::bind::git(repo_dir);
+    let mut command = repository.git();
     command.args([
         "commit-tree",
         "--no-gpg-sign",
@@ -547,8 +767,11 @@ fn commit_tree(
 /// A pattern matches whole components, so `refs/knives/a` never matches
 /// `refs/knives/ab`; unlike `rev-parse`, a missing `refs/knives/a` never
 /// resolves to a branch that happens to be spelled `refs/knives/a`.
-fn references(repo_dir: &Path, patterns: &[&str]) -> Result<Vec<(String, CommitId)>, GitError> {
-    let mut command = crate::bind::git(repo_dir);
+fn references(
+    repository: &Repository,
+    patterns: &[&str],
+) -> Result<Vec<(String, CommitId)>, GitError> {
+    let mut command = repository.git();
     command
         .args(["for-each-ref", "--format=%(objectname) %(refname)"])
         .args(patterns);
@@ -567,8 +790,8 @@ fn references(repo_dir: &Path, patterns: &[&str]) -> Result<Vec<(String, CommitI
 }
 
 /// Every blob and subtree under `commit`, by path from its root.
-fn tree_items(repo_dir: &Path, commit: &CommitId) -> Result<Vec<TreeItem>, GitError> {
-    let mut command = crate::bind::git(repo_dir);
+fn tree_items(repository: &Repository, commit: &CommitId) -> Result<Vec<TreeItem>, GitError> {
+    let mut command = repository.git();
     command.args(["ls-tree", "-r", "-t", "-z", commit.as_str()]);
     let answer = run(&mut command)?;
     answer

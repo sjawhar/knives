@@ -6,8 +6,8 @@
 )]
 
 //! Ledger entries carried between machines through real git repositories: a
-//! bare remote both machines share, and a ledger directory per machine that is
-//! a git repository nothing ever stages into or checks out.
+//! bare remote both machines share, and a ledger root per machine that is the
+//! working tree of a git repository nothing ever stages into or checks out.
 
 #[path = "common/lab.rs"]
 mod lab;
@@ -16,10 +16,12 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+use knives::ids::RepoName;
 use knives::ledger::{Entry, Kind, Ledger};
-use knives::ledger_git::{self, GitError, MachineRef};
+use knives::ledger_git::{self, GitError, MachineRef, Repository};
 
 const REPO: &str = "a-repo";
+const OTHER: &str = "other-repo";
 
 /// A bare remote and a temporary directory to hold the machines that share it.
 fn remote() -> (tempfile::TempDir, PathBuf) {
@@ -37,8 +39,27 @@ fn machine(root: &Path, name: &str, remote: &Path) -> PathBuf {
     directory
 }
 
+/// The repository at `machine`'s own `.git`, carrying `forks`.
+fn carrying(machine: &Path, forks: &[&str]) -> Repository {
+    Repository::new(
+        &machine.join(".git"),
+        machine,
+        forks.iter().map(|fork| RepoName::new(*fork)),
+    )
+    .expect("a repository over the machine's ledger root")
+}
+
+/// The repository at `machine`'s own `.git`, carrying [`REPO`].
+fn repository(machine: &Path) -> Repository {
+    carrying(machine, &[REPO])
+}
+
 fn ledger(machine: &Path) -> Ledger {
-    Ledger::at(machine.join(REPO))
+    ledger_of(machine, REPO)
+}
+
+fn ledger_of(machine: &Path, fork: &str) -> Ledger {
+    Ledger::at(machine.join(fork))
 }
 
 /// Append `count` notes by `owner`, each with `padding` bytes after its text.
@@ -46,8 +67,16 @@ fn ledger(machine: &Path) -> Ledger {
 /// Every entry this process appends gets its own nanosecond, so two calls
 /// never leave a pair of file names to the random suffix alone.
 fn append(machine: &Path, owner: &str, count: usize, padding: usize) {
+    append_padded(&ledger(machine), owner, count, padding);
+}
+
+/// `count` unpadded notes by `owner` in `fork`'s directory.
+fn append_to(machine: &Path, fork: &str, owner: &str, count: usize) {
+    append_padded(&ledger_of(machine, fork), owner, count, 0);
+}
+
+fn append_padded(ledger: &Ledger, owner: &str, count: usize, padding: usize) {
     static STAMP: AtomicUsize = AtomicUsize::new(0);
-    let ledger = ledger(machine);
     for index in 0..count {
         let nanosecond = STAMP.fetch_add(1, Ordering::Relaxed);
         ledger
@@ -95,11 +124,41 @@ fn knives_refs(repository: &Path) -> String {
 }
 
 fn commit_and_push(machine: &Path, name: &str) -> knives::ids::CommitId {
-    let commit = ledger_git::commit_new_entries(machine, name)
+    let repository = repository(machine);
+    let commit = ledger_git::commit_new_entries(&repository, name)
         .expect("commit new entries")
         .expect("there were new entries");
-    ledger_git::push(machine, "origin", name).expect("push the machine's own ref");
+    ledger_git::push(&repository, "origin", name).expect("push the machine's own ref");
     commit
+}
+
+/// Every path in every tree of every commit `reference` reaches in `git_dir`.
+fn paths_ever_under(git_dir: &Path, reference: &str) -> BTreeSet<String> {
+    let git_dir = git_dir.to_str().expect("utf-8");
+    let commits = lab::git_output(
+        Path::new("/"),
+        ["--git-dir", git_dir, "rev-list", reference],
+    );
+    commits
+        .lines()
+        .flat_map(|commit| {
+            lab::git_output(
+                Path::new("/"),
+                [
+                    "--git-dir",
+                    git_dir,
+                    "ls-tree",
+                    "-r",
+                    "-t",
+                    "--name-only",
+                    commit,
+                ],
+            )
+            .lines()
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+        })
+        .collect()
 }
 
 #[test]
@@ -112,8 +171,8 @@ fn entries_committed_on_one_machine_materialise_on_another_and_parse() {
     let commit = commit_and_push(&alpha, "alpha");
 
     // When: beta fetches every machine's ref and materialises what it lacks.
-    let found = ledger_git::fetch(&beta, "origin").expect("fetch");
-    let written = ledger_git::materialise(&beta, &found).expect("materialise");
+    let found = ledger_git::fetch(&repository(&beta), "origin").expect("fetch");
+    let written = ledger_git::materialise(&repository(&beta), &found).expect("materialise");
 
     // Then: beta has both entry files under alpha's names, and they parse to
     // exactly the entries alpha wrote.
@@ -148,9 +207,9 @@ fn two_machines_exchange_entries_and_neither_ref_is_rewritten() {
 
     // When: each fetches and materialises the other's entries.
     for machine in [&alpha, &beta] {
-        let found = ledger_git::fetch(machine, "origin").expect("fetch");
+        let found = ledger_git::fetch(&repository(machine), "origin").expect("fetch");
         assert_eq!(found.len(), 2, "both machines' refs are on the remote");
-        ledger_git::materialise(machine, &found).expect("materialise");
+        ledger_git::materialise(&repository(machine), &found).expect("materialise");
     }
 
     // Then: both hold all five entries, and the peer's entries are not taken
@@ -163,7 +222,7 @@ fn two_machines_exchange_entries_and_neither_ref_is_rewritten() {
     );
     for (machine, name) in [(&alpha, "alpha"), (&beta, "beta")] {
         assert_eq!(
-            ledger_git::commit_new_entries(machine, name).expect("commit"),
+            ledger_git::commit_new_entries(&repository(machine), name).expect("commit"),
             None,
             "{name} recommitted its peer's entries as its own"
         );
@@ -172,9 +231,10 @@ fn two_machines_exchange_entries_and_neither_ref_is_rewritten() {
     // When: alpha writes once more and pushes; beta fetches again.
     append(&alpha, "ses_alpha_later", 1, 0);
     let alpha_second = commit_and_push(&alpha, "alpha");
-    let found = ledger_git::fetch(&beta, "origin").expect("a fetch with no forced update");
+    let found =
+        ledger_git::fetch(&repository(&beta), "origin").expect("a fetch with no forced update");
     assert_eq!(
-        ledger_git::materialise(&beta, &found).expect("materialise"),
+        ledger_git::materialise(&repository(&beta), &found).expect("materialise"),
         1
     );
 
@@ -218,12 +278,13 @@ fn a_reader_never_sees_a_partial_entry_while_materialise_writes() {
     append(&alpha, "ses_alpha", ENTRIES - 1, 64 << 10);
     commit_and_push(&alpha, "alpha");
     let written_by_alpha = ledger(&alpha).entries().expect("alpha's ledger");
-    let found = ledger_git::fetch(&beta, "origin").expect("fetch");
+    let found = ledger_git::fetch(&repository(&beta), "origin").expect("fetch");
 
     // When: readers loop over beta's ledger while materialise writes into it,
     // each read kept as the stamp and text length of every entry it parsed.
     let done = AtomicBool::new(false);
     let reader = ledger(&beta);
+    let beta_repository = repository(&beta);
     let (written, reads) = std::thread::scope(|scope| {
         let readers: Vec<_> = (0..READERS)
             .map(|_| {
@@ -241,7 +302,7 @@ fn a_reader_never_sees_a_partial_entry_while_materialise_writes() {
                 })
             })
             .collect();
-        let written = ledger_git::materialise(&beta, &found);
+        let written = ledger_git::materialise(&beta_repository, &found);
         done.store(true, Ordering::Release);
         let reads: Vec<_> = readers
             .into_iter()
@@ -290,20 +351,20 @@ fn committing_with_nothing_new_returns_none_and_moves_no_ref() {
 
     // When / Then: there is nothing to commit, and no ref appears.
     assert_eq!(
-        ledger_git::commit_new_entries(&alpha, "alpha").expect("commit"),
+        ledger_git::commit_new_entries(&repository(&alpha), "alpha").expect("commit"),
         None
     );
     assert_eq!(knives_refs(&alpha), "");
 
     // Given: one entry, committed.
     append(&alpha, "ses_alpha", 1, 0);
-    let commit = ledger_git::commit_new_entries(&alpha, "alpha")
+    let commit = ledger_git::commit_new_entries(&repository(&alpha), "alpha")
         .expect("commit")
         .expect("one new entry");
 
     // When / Then: a second commit finds nothing new and leaves the ref alone.
     assert_eq!(
-        ledger_git::commit_new_entries(&alpha, "alpha").expect("commit"),
+        ledger_git::commit_new_entries(&repository(&alpha), "alpha").expect("commit"),
         None
     );
     assert_eq!(knives_refs(&alpha), format!("refs/knives/alpha {commit}"));
@@ -317,18 +378,18 @@ fn a_push_of_any_ref_but_the_machines_own_is_refused() {
     let beta = machine(root.path(), "beta", &remote);
     append(&alpha, "ses_alpha", 1, 0);
     let commit = commit_and_push(&alpha, "alpha");
-    ledger_git::fetch(&beta, "origin").expect("fetch");
+    ledger_git::fetch(&repository(&beta), "origin").expect("fetch");
 
     // When / Then: beta pushing alpha's ref is refused, and so is committing
     // as alpha, which would start a second history under alpha's name; so is
     // any name that would spell some other ref or refspec.
     assert!(matches!(
-        ledger_git::push(&beta, "origin", "alpha"),
+        ledger_git::push(&repository(&beta), "origin", "alpha"),
         Err(GitError::NotOwn { .. })
     ));
     append(&beta, "ses_beta", 1, 0);
     assert!(matches!(
-        ledger_git::commit_new_entries(&beta, "alpha"),
+        ledger_git::commit_new_entries(&repository(&beta), "alpha"),
         Err(GitError::NotOwn { .. })
     ));
     assert_eq!(knives_refs(&beta), "");
@@ -341,19 +402,19 @@ fn a_push_of_any_ref_but_the_machines_own_is_refused() {
     ] {
         assert!(
             matches!(
-                ledger_git::push(&beta, "origin", name),
+                ledger_git::push(&repository(&beta), "origin", name),
                 Err(GitError::Name { .. })
             ),
             "{name:?} was not refused"
         );
     }
     assert!(matches!(
-        ledger_git::push(&beta, "--mirror", "beta"),
+        ledger_git::push(&repository(&beta), "--mirror", "beta"),
         Err(GitError::Name { .. })
     ));
     // A machine that never committed and that the remote has never seen has
     // nothing to send.
-    ledger_git::push(&beta, "origin", "beta").expect("an empty push");
+    ledger_git::push(&repository(&beta), "origin", "beta").expect("an empty push");
     assert_eq!(knives_refs(&remote), format!("refs/knives/alpha {commit}"));
 }
 
@@ -397,7 +458,7 @@ fn a_peer_tree_that_is_not_ledger_entries_is_refused_and_nothing_is_written() {
         // When / Then: materialise refuses it and writes nothing.
         assert!(
             matches!(
-                ledger_git::materialise(&beta, &[hostile]),
+                ledger_git::materialise(&repository(&beta), &[hostile]),
                 Err(GitError::NotAnEntry { .. })
             ),
             "{name:?} at {mode} was not refused"
@@ -409,4 +470,163 @@ fn a_peer_tree_that_is_not_ledger_entries_is_refused_and_nothing_is_written() {
             .collect();
         assert!(written.is_empty(), "{name:?} wrote {written:?}");
     }
+}
+
+#[test]
+fn a_repository_commits_and_materialises_only_the_forks_it_carries() {
+    // Given: alpha's ledger root holds entries for two forks, and the
+    // repository over it carries only one of them.
+    let (root, company) = remote();
+    let alpha = machine(root.path(), "alpha", &company);
+    append_to(&alpha, REPO, "ses_alpha", 2);
+    append_to(&alpha, OTHER, "ses_alpha", 2);
+    let carried = repository(&alpha);
+
+    // When: it commits twice, the second time after both forks gained an
+    // entry, and pushes.
+    ledger_git::commit_new_entries(&carried, "alpha")
+        .expect("commit")
+        .expect("a-repo's entries are new");
+    append_to(&alpha, REPO, "ses_alpha", 1);
+    append_to(&alpha, OTHER, "ses_alpha", 1);
+    ledger_git::commit_new_entries(&carried, "alpha")
+        .expect("commit")
+        .expect("a-repo's newest entry is new");
+    ledger_git::push(&carried, "origin", "alpha").expect("push");
+
+    // Then: no tree of any commit the ref reaches, here or on the remote,
+    // names the fork it does not carry; every entry of the one it does is there.
+    for git_dir in [alpha.join(".git"), company] {
+        let paths = paths_ever_under(&git_dir, "refs/knives/alpha");
+        assert!(
+            paths
+                .iter()
+                .all(|path| path == REPO || path.starts_with(&format!("{REPO}/"))),
+            "{} carries a fork it was not given: {paths:?}",
+            git_dir.display()
+        );
+        let carried_entries = paths.iter().filter(|path| is_entry(path)).count();
+        assert_eq!(carried_entries, 3, "{paths:?}");
+    }
+
+    // Given: a peer that carries both forks pushed entries for both.
+    let (peer_root, shared) = remote();
+    let peer = machine(peer_root.path(), "peer", &shared);
+    let beta = machine(peer_root.path(), "beta", &shared);
+    append_to(&peer, REPO, "ses_peer", 1);
+    append_to(&peer, OTHER, "ses_peer", 1);
+    let both = carrying(&peer, &[REPO, OTHER]);
+    ledger_git::commit_new_entries(&both, "peer")
+        .expect("commit")
+        .expect("both forks' entries are new");
+    ledger_git::push(&both, "origin", "peer").expect("push");
+
+    // When: a repository carrying only a-repo fetches and materialises them.
+    let only_repo = repository(&beta);
+    let found = ledger_git::fetch(&only_repo, "origin").expect("fetch");
+    let written = ledger_git::materialise(&only_repo, &found).expect("materialise");
+
+    // Then: only a-repo's entry is written; the other fork's directory never appears.
+    assert_eq!(written, 1);
+    assert_eq!(file_names(&beta).len(), 1);
+    assert!(!beta.join(OTHER).exists(), "an uncarried fork was written");
+}
+
+#[test]
+fn two_repositories_over_one_ledger_root_each_carry_their_own_forks_to_their_own_remote() {
+    // Given: one ledger root, its own `.git` carrying a-repo to one remote,
+    // and a git directory elsewhere over the same root carrying other-repo to
+    // another.
+    let (root, company) = remote();
+    let personal = root.path().join("personal-remote.git");
+    lab::git_bare_repository(&personal);
+    let alpha = machine(root.path(), "alpha", &company);
+    let second_git_dir = root.path().join("second.git");
+    lab::git_bare_repository(&second_git_dir);
+    let second = second_git_dir.to_str().expect("utf-8");
+    for args in [
+        vec!["config", "core.bare", "false"],
+        vec!["config", "core.worktree", alpha.to_str().expect("utf-8")],
+        vec!["remote", "add", "origin", personal.to_str().expect("utf-8")],
+    ] {
+        let mut with_git_dir = vec!["--git-dir", second];
+        with_git_dir.extend(args);
+        let status = std::process::Command::new("git")
+            .args(&with_git_dir)
+            .status()
+            .expect("run git");
+        assert!(status.success(), "git {with_git_dir:?} failed");
+    }
+    append_to(&alpha, REPO, "ses_alpha", 2);
+    append_to(&alpha, OTHER, "ses_alpha", 3);
+    let first = repository(&alpha);
+    let other = Repository::new(&second_git_dir, &alpha, [RepoName::new(OTHER)])
+        .expect("a second repository over the root");
+
+    // When: each commits as alpha and pushes to its own remote.
+    for repository in [&first, &other] {
+        ledger_git::commit_new_entries(repository, "alpha")
+            .expect("commit")
+            .expect("its fork's entries are new");
+        ledger_git::push(repository, "origin", "alpha").expect("push");
+    }
+
+    // Then: each remote holds exactly its own fork's entries.
+    for (remote, fork, count) in [(&company, REPO, 2), (&personal, OTHER, 3)] {
+        let entries: Vec<_> = paths_ever_under(remote, "refs/knives/alpha")
+            .into_iter()
+            .filter(|path| is_entry(path))
+            .collect();
+        assert_eq!(entries.len(), count, "{}: {entries:?}", remote.display());
+        assert!(
+            entries
+                .iter()
+                .all(|path| path.starts_with(&format!("{fork}/"))),
+            "{} holds another fork's entries: {entries:?}",
+            remote.display()
+        );
+    }
+    // And: the second repository's ref lives in its own git directory only.
+    assert_eq!(
+        paths_ever_under(&alpha.join(".git"), "refs/knives/alpha")
+            .iter()
+            .filter(|path| is_entry(path))
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn a_fork_name_that_is_not_one_directory_of_the_root_is_refused() {
+    let (root, remote) = remote();
+    let alpha = machine(root.path(), "alpha", &remote);
+    for name in ["", ".", "..", "../escape", "a/b", "a\\b", ".git", ".GIT"] {
+        assert!(
+            matches!(
+                Repository::new(&alpha.join(".git"), &alpha, [RepoName::new(name)]),
+                Err(GitError::Fork { .. })
+            ),
+            "{name:?} was accepted"
+        );
+    }
+}
+
+#[test]
+fn a_repository_carrying_no_fork_commits_nothing() {
+    let (root, remote) = remote();
+    let alpha = machine(root.path(), "alpha", &remote);
+    append(&alpha, "ses_alpha", 2, 0);
+    let nothing = carrying(&alpha, &[]);
+
+    assert_eq!(
+        ledger_git::commit_new_entries(&nothing, "alpha").expect("commit"),
+        None
+    );
+    assert!(!ledger_git::has_new_entries(&nothing, "alpha").expect("look"));
+    assert_eq!(knives_refs(&alpha), "");
+}
+
+/// Whether `path` names a ledger entry file.
+fn is_entry(path: &str) -> bool {
+    Path::new(path).extension() == Some(std::ffi::OsStr::new("md"))
 }

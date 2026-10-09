@@ -94,6 +94,12 @@ fictional branch. Bare `knives notch` shows the newest human notes and folds mac
 one count; `--events` reads their full chronology. `--verify` re-checks selected
 commit-shaped evidence and anchors against the repository as it is now.
 
+The ledger travels between machines once its directory is a git repository naming this machine
+(`knives.machine`) and the forks it shares (`knives.fork`, one per fork): every write starts
+`knives ledger sweep` in the background, which commits new entries to the machine's own ref,
+pulls every other machine's, and pushes. One sweep runs at a time and nothing ever rebases; the
+`using-knives` skill's ledger reference has the setup.
+
 `knives status` carries the newest human note for each branch, preferring it over a newer machine
 event. Its compact notch cell prefixes a disposition, if any, and appends the count of entries it
 masks, so the question "what is this weird branch" is usually answered before you ask it.
@@ -228,6 +234,7 @@ reads `not on this machine`, and an entry with two is refused with both paths na
 | `knives track` | state which pull request a branch belongs to, when inference cannot find it |
 | `knives depends` | record that a branch cannot land before another repo's pull request |
 | `knives notch [SUBJECT] [-m TEXT] [--disposition TOKEN]` | read the ledger or write a human note; dispositions require evidence, `--dispositions` reads terminal rulings, and `--verify` re-checks selected entries |
+| `knives ledger sweep` | commit, pull and push the shared ledger; every write starts one in the background |
 | `knives release` | plan a release, edit its membership, cut one, or reap superseded cuts |
 | `knives release members [REF] [--verify] [--carries REV] [--census] [--no-github]` | list a release's direct member parents, their holders and advances; `--verify` audits every member's content in the release; `--carries REV` asks whether REV's content is carried — by REF, or by every live release and upstream trunk; `--census` asks that of every maintained branch, conditionally checks superseded releases, and reports qualified orphans |
 | `knives register [DIR]` | print the registry entry for a checkout, or `already registered as <name>`; writes nothing |

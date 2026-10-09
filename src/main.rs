@@ -24,10 +24,11 @@ use std::process::ExitCode;
 use branch_verbs::{FinishOptions, run_depends, run_finish, run_track};
 use clap::Parser as _;
 use knives::bind::{Fork, Unbound};
-use knives::cli::{Cli, Command, Exit, Output, ReleaseAction};
+use knives::cli::{Cli, Command, Exit, LedgerAction, Output, ReleaseAction};
 use knives::commands::claim::current_identity;
 use knives::commands::{
-    audit, consumers, hook, notch, pr, preflight, pushed, register, repos, start, status, sync,
+    audit, consumers, hook, ledger, notch, pr, preflight, pushed, register, repos, start, status,
+    sync,
 };
 use knives::config::{
     ConfigError, NO_HOME, Registry, RepoEntry, default_config_path, home_dir, load,
@@ -43,13 +44,19 @@ use release_edit::{ReleaseEdit, run_release_edit};
 use release_rebase::run_rebase;
 
 fn main() -> ExitCode {
-    match dispatch() {
+    let exit = match dispatch() {
         Ok(exit) => ExitCode::from(exit.code()),
         Err(error) => {
             eprintln!("knives: {error:#}");
             ExitCode::from(Exit::Incomplete.code())
         }
+    };
+    // Once, after whatever the command wrote, however it ended: one hand-off
+    // per process rather than per entry, and every write path reaches it.
+    if knives::ledger::appended() {
+        knives::ledger_sweep::hand_off();
     }
+    exit
 }
 
 #[allow(
@@ -246,6 +253,9 @@ fn dispatch() -> anyhow::Result<Exit> {
                 output,
             )
         }
+        Command::Ledger {
+            action: LedgerAction::Sweep,
+        } => ledger::run_sweep(output),
         Command::Preflight { repo } => {
             let Some(fork) = grounded(&loaded)?.one_fork(repo.as_deref())? else {
                 return Ok(Exit::Usage);

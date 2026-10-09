@@ -12,7 +12,8 @@
 //! - [`jj`] is the only module that opens a repository.
 //! - [`ledger`] is the only module that knows what a notch is: an append-only
 //!   record per repository of what happened and what was decided, which is the
-//!   half of state that [`store`] deletes when intent changes.
+//!   half of state that [`store`] deletes when intent changes; [`ledger_git`]
+//!   and [`ledger_sweep`] carry it between machines.
 //! - [`forge`] is the only module that talks to a hosting service.
 //! - [`config`] and [`store`] own the two things that cannot be recomputed:
 //!   which repos are managed, and who is working on what and why; [`lock`] is
@@ -35,6 +36,7 @@ pub mod ids;
 pub mod jj;
 pub mod ledger;
 pub mod ledger_git;
+pub mod ledger_sweep;
 pub mod lock;
 pub mod pins;
 pub mod release_model;

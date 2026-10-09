@@ -79,9 +79,11 @@ as an unconditional reading list.
 | Configure identity, trust or the plugin | `register`, registry/plugin settings | [Configuration](references/configuration.md) |
 
 `sync` fetches and records state; it is not read-only. `start`, `finish`,
-`track`, `depends`, ledger writes and release edits also mutate local state.
+`track`, `depends`, ledger writes and release edits also mutate local state,
+and a ledger write hands its entry to a background sweep that pushes it when
+the ledger is [shared](references/ledger.md#sharing-between-machines).
 `audit` and `pushed` report without repairing, deleting, pushing or opening PRs.
-Release planning is the default; release commands never push. Publication is a
+Release planning is the default; release commands never push a release. Publication is a
 separate, intentional `jj git push --remote <publish-remote> --bookmark <name>`.
 
 `knives hook claude-code` and `knives hook opencode` are harness plumbing, not

@@ -412,6 +412,11 @@ pub enum Command {
         #[arg(long)]
         consumer: Vec<PathBuf>,
     },
+    /// Carry this machine's ledger to the machines that share it.
+    Ledger {
+        #[command(subcommand)]
+        action: LedgerAction,
+    },
     /// Run the real gh with fork-aware fixes applied. Plumbing for the gh shim.
     ///
     /// Three fixes, in order: export a GitHub-App token for the repo the
@@ -431,6 +436,20 @@ pub enum Command {
 pub enum HookHarness {
     ClaudeCode,
     Opencode,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum LedgerAction {
+    /// Commit new entries, pull every peer's, and push this machine's.
+    ///
+    /// Every command that writes an entry starts one in the background as it
+    /// exits, so this rarely needs typing. One sweep runs at a time: a sweep
+    /// that finds another running exits at once, successfully, because the
+    /// running one looks again before it stops. The machine's name and the
+    /// forks it shares are the ledger repository's `knives.machine` and
+    /// `knives.fork` git config; with neither set, the ledger is not shared
+    /// and this does nothing.
+    Sweep,
 }
 
 #[derive(Debug, Subcommand)]
