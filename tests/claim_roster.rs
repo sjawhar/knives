@@ -437,6 +437,7 @@ fn a_ledger_still_kept_under_the_registry_key_is_refused_until_migrated() {
         .append(&knives::ledger::Entry {
             ts: "2026-01-01T00:00:00Z".to_owned(),
             owner: "ses_older".to_owned(),
+            email: None,
             subject: None,
             kind: knives::ledger::Kind::Note,
             disposition: None,

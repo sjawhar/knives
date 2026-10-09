@@ -381,6 +381,7 @@ mod tests {
         Entry {
             ts: "2026-08-15T22:14:03Z".to_owned(),
             owner: "ses_fff688".to_owned(),
+            email: None,
             subject: subject.map(str::to_owned),
             kind,
             disposition: None,
@@ -490,6 +491,7 @@ mod tests {
                 .append(&Entry {
                     ts: format!("2026-08-15T22:14:{second:02}Z"),
                     owner: "test".to_owned(),
+                    email: None,
                     subject: Some("feat/alpha".to_owned()),
                     kind: Kind::Event,
                     disposition: None,
@@ -506,6 +508,7 @@ mod tests {
             .append(&Entry {
                 ts: "2026-08-15T22:15:00Z".to_owned(),
                 owner: "test".to_owned(),
+                email: None,
                 subject: Some("feat/alpha".to_owned()),
                 kind: Kind::Note,
                 disposition: None,

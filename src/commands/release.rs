@@ -2058,6 +2058,7 @@ mod cut_tests {
         Entry {
             ts: "2026-08-15T00:00:00Z".to_owned(),
             owner: "an-agent".to_owned(),
+            email: None,
             subject: Some(subject.to_owned()),
             kind: Kind::Event,
             disposition: None,

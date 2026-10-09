@@ -870,6 +870,7 @@ mod tests {
             Entry {
                 ts: "2026-08-15T00:00:00Z".to_owned(),
                 owner: "test".to_owned(),
+                email: None,
                 subject: Some("release/2026-08-15".to_owned()),
                 kind: Kind::Event,
                 disposition: None,
@@ -883,6 +884,7 @@ mod tests {
             Entry {
                 ts: "2026-08-16T00:00:00Z".to_owned(),
                 owner: "test".to_owned(),
+                email: None,
                 subject: Some("release/2026-08-15".to_owned()),
                 kind: Kind::Note,
                 disposition: Some("ruled-out".to_owned()),
@@ -909,6 +911,7 @@ mod tests {
             .append(&Entry {
                 ts: "2026-08-15T00:00:00Z".to_owned(),
                 owner: "test".to_owned(),
+                email: None,
                 subject: Some("release/2026-08-15".to_owned()),
                 kind: Kind::Event,
                 disposition: None,

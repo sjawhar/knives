@@ -1233,6 +1233,7 @@ mod tests {
         let note = Notch {
             ts: "2026-08-15T22:14:01Z".to_owned(),
             owner: "ses_fff688".to_owned(),
+            email: None,
             subject: Some("feat/alpha".to_owned()),
             kind: crate::ledger::Kind::Note,
             disposition: Some("ruled-out".to_owned()),

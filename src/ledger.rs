@@ -112,6 +112,11 @@ pub struct Entry {
     pub ts: String,
     /// Resolved exactly as a claim's owner is.
     pub owner: String,
+    /// The writer's `git config user.email` where it wrote, so a reader can
+    /// tell whose machine an `owner` was: absent when none was configured,
+    /// and on every entry written before knives recorded it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
     /// The ref this is about — a branch or a release name. Absent for an entry
     /// about the repository itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -173,6 +178,8 @@ struct Frontmatter {
     ts: String,
     owner: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    email: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     subject: Option<String>,
     kind: Kind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -194,6 +201,7 @@ impl Frontmatter {
         Self {
             ts: entry.ts.clone(),
             owner: entry.owner.clone(),
+            email: entry.email.clone(),
             subject: entry.subject.clone(),
             kind: entry.kind,
             disposition: entry.disposition.clone(),
@@ -225,6 +233,7 @@ impl Frontmatter {
         Entry {
             ts: self.ts,
             owner: self.owner,
+            email: self.email,
             subject: self.subject,
             kind: self.kind,
             disposition: self.disposition,
@@ -581,6 +590,9 @@ pub struct Scribe {
     /// ledger alone.
     checkout: Option<PathBuf>,
     owner: String,
+    /// The writer's `git config user.email`, asked once, at the first entry:
+    /// a command that writes nothing never asks.
+    email: std::sync::OnceLock<Option<String>>,
 }
 
 impl Scribe {
@@ -590,6 +602,7 @@ impl Scribe {
             repo,
             checkout: Some(path),
             owner,
+            email: std::sync::OnceLock::new(),
         }
     }
 
@@ -601,6 +614,7 @@ impl Scribe {
             repo,
             checkout: None,
             owner,
+            email: std::sync::OnceLock::new(),
         }
     }
 
@@ -617,6 +631,10 @@ impl Scribe {
         let entry = Entry {
             ts: monotonic_now().to_string(),
             owner: self.owner.clone(),
+            email: self
+                .email
+                .get_or_init(|| git_user_email(self.checkout.as_deref()))
+                .clone(),
             subject: draft.subject.map(str::to_owned),
             kind: draft.kind,
             disposition: draft.disposition.clone(),
@@ -654,6 +672,24 @@ impl Scribe {
             .ok()
             .map(|commit| commit.as_str().to_owned())
     }
+}
+
+/// `git config user.email` where the writer writes: in the fork's checkout,
+/// where a repository's own identity overrides the user's, or where the
+/// command runs when there is no checkout. `None` when git reports none, or
+/// an empty one: an entry carries the address git would commit as, or no
+/// address, never a guess.
+fn git_user_email(checkout: Option<&Path>) -> Option<String> {
+    let mut command = checkout.map_or_else(crate::bind::git_command, crate::bind::git);
+    let output = command
+        .args(["config", "--get", "user.email"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|output| output.status.success())?;
+    let email = String::from_utf8(output.stdout).ok()?;
+    let email = email.trim();
+    (!email.is_empty()).then(|| email.to_owned())
 }
 
 /// Make a completed temporary entry visible without replacing an existing one.
@@ -794,6 +830,7 @@ mod tests {
         Entry {
             ts: "2026-08-15T22:14:03Z".to_owned(),
             owner: "ses_fff688".to_owned(),
+            email: None,
             subject: subject.map(str::to_owned),
             kind: Kind::Note,
             text: text.to_owned(),
@@ -1355,6 +1392,49 @@ mod tests {
         );
         // And: it is on disk, not just returned.
         assert_eq!(scribe.ledger.entries().unwrap(), vec![written]);
+    }
+
+    #[test]
+    fn an_entry_carries_the_writers_git_email_and_none_when_git_has_none() {
+        // Given: a checkout whose own config names its committer.
+        let dir = tempfile::tempdir().unwrap();
+        let checkout = dir.path().join("checkout");
+        std::fs::create_dir_all(&checkout).unwrap();
+        for args in [
+            &["init", "--quiet"][..],
+            &["config", "user.email", "writer@example.test"][..],
+        ] {
+            let status = crate::bind::git(&checkout).args(args).status().unwrap();
+            assert!(status.success(), "git {args:?}");
+        }
+        let scribe = Scribe::new(
+            Ledger::at(dir.path().join("ledger").join("a-repo")),
+            UpstreamName::new("a-repo"),
+            checkout,
+            "ses_fff688".to_owned(),
+        );
+
+        // When: it writes an entry.
+        let written = scribe.event(None, "noted".to_owned(), None).unwrap();
+
+        // Then: the entry carries that address, on disk as in the report.
+        assert_eq!(written.email.as_deref(), Some("writer@example.test"));
+        let text = std::fs::read_to_string(only_file(scribe.ledger.path())).unwrap();
+        assert!(
+            text.contains("email = \"writer@example.test\""),
+            "was: {text}"
+        );
+        assert_eq!(scribe.ledger.entries().unwrap(), vec![written]);
+
+        // And: an entry with no address writes no email field, and reads
+        // back as none, as every entry written before the field does.
+        let plain_dir = tempfile::tempdir().unwrap();
+        let plain = Ledger::at(plain_dir.path().join("a-repo"));
+        let bare = entry(None, "no address");
+        plain.append(&bare).unwrap();
+        let text = std::fs::read_to_string(only_file(plain.path())).unwrap();
+        assert!(!text.contains("email"), "was: {text}");
+        assert_eq!(plain.entries().unwrap(), vec![bare]);
     }
 
     #[test]

@@ -74,6 +74,7 @@ fn a_second_migration_writes_nothing_and_leaves_one_entry_per_statement() {
         .append(&Entry {
             ts: "2026-08-15T22:14:03Z".to_owned(),
             owner: "ses_older".to_owned(),
+            email: None,
             subject: Some("feat/alpha".to_owned()),
             kind: knives::ledger::Kind::Event,
             disposition: None,
@@ -305,6 +306,7 @@ fn note(home: &Path, fork: &str, ts: &str, text: &str) -> std::path::PathBuf {
         .append(&Entry {
             ts: ts.to_owned(),
             owner: "ses_older".to_owned(),
+            email: None,
             subject: None,
             kind: knives::ledger::Kind::Note,
             disposition: None,

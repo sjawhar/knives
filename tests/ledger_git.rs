@@ -88,6 +88,7 @@ fn append_padded(ledger: &Ledger, owner: &str, count: usize, padding: usize) {
             .append(&Entry {
                 ts: format!("2026-10-08T12:00:00.{nanosecond:09}Z"),
                 owner: owner.to_owned(),
+                email: None,
                 subject: Some("feat/transport".to_owned()),
                 kind: Kind::Note,
                 disposition: None,

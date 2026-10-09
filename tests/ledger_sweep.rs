@@ -97,6 +97,7 @@ fn append(root: &Path, fork: &str, count: usize) {
             .append(&Entry {
                 ts: format!("2026-10-09T12:00:00.{index:09}Z"),
                 owner: "ses_sweep".to_owned(),
+                email: None,
                 subject: None,
                 kind: Kind::Note,
                 disposition: None,

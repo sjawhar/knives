@@ -143,6 +143,7 @@ mod tests {
         Entry {
             ts: ts.to_owned(),
             owner: "ses_fff688".to_owned(),
+            email: None,
             subject: Some(subject.to_owned()),
             kind: Kind::Event,
             disposition: None,
