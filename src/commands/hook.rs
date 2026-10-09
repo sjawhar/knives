@@ -15,9 +15,9 @@ use crate::hook::guidance::{
     format_refusal, guidance_for, mention_line, notice_digest,
 };
 use crate::hook::opencode::{self, Event as OpenCodeEvent, EventKind as OpenCodeEventKind};
-use crate::hook::resolve::{Match, argument_paths, match_checkout};
+use crate::hook::resolve::{Managed, Match, argument_paths, match_checkout};
 use crate::hook::state::{Envelope, SessionState};
-use crate::ids::RepoName;
+use crate::ids::UpstreamName;
 use crate::lock::LockError;
 use crate::store::{OwnerKind, Store, StoreError, default_state_path};
 
@@ -177,7 +177,11 @@ fn opencode_tool_after(event: &OpenCodeEvent, home: &Path) -> anyhow::Result<Str
     if let Some(context) = &context {
         unlocked.reconcile(context.turn, &context.guidance);
     }
-    let notice = notice_if_requested(&repo, &unlocked, requested.notice && matched.is_managed())?;
+    let notice = notice_if_requested(
+        &repo,
+        matched.managed.as_ref().filter(|_| requested.notice),
+        &unlocked,
+    )?;
     let guidance = (requested.guidance && matched.trusted && !unlocked.repo(&repo.root).guided)
         .then(|| guidance_for(&repo, &matched.candidate))
         .flatten();
@@ -400,13 +404,13 @@ fn opencode_shell_env(event: &OpenCodeEvent) -> anyhow::Result<String> {
 /// The owner a claim from inside `repo` would carry when no harness names one:
 /// the store's current agent, else the sole claimant of that repository.
 ///
-/// `repo` is the entry the caller already bound the working directory to; a
-/// directory outside any managed fork, or whose remotes could not be read, is
-/// `None` and derives no owner. An OS-user claim names nobody in particular, so
-/// it seeds no derived owner: otherwise one anonymous claim would hand every
-/// later anonymous caller the same "derived" name, and they would resume each
-/// other's claims.
-pub(crate) fn owner_for(repo: Option<&RepoName>) -> anyhow::Result<Option<String>> {
+/// `repo` is the fork the caller already bound the working directory to, by
+/// the name its claims are kept under; a directory outside any managed fork,
+/// or whose remotes could not be read, is `None` and derives no owner. An
+/// OS-user claim names nobody in particular, so it seeds no derived owner:
+/// otherwise one anonymous claim would hand every later anonymous caller the
+/// same "derived" name, and they would resume each other's claims.
+pub(crate) fn owner_for(repo: Option<&UpstreamName>) -> anyhow::Result<Option<String>> {
     if let Some(owner) = std::env::var("KNIVES_OWNER")
         .ok()
         .filter(|owner| !owner.trim().is_empty())
@@ -422,9 +426,9 @@ pub(crate) fn owner_for(repo: Option<&RepoName>) -> anyhow::Result<Option<String
         return Ok(Some(owner.to_owned()));
     }
     let owners = store
-        .claims(None)
+        .claims(Some(repo))
         .into_iter()
-        .filter(|claim| claim.repo == repo.as_str() && claim.kind != OwnerKind::OsUser)
+        .filter(|claim| claim.kind != OwnerKind::OsUser)
         .map(|claim| claim.owner.clone())
         .collect::<BTreeSet<_>>();
     Ok((owners.len() == 1)
@@ -477,7 +481,7 @@ fn session_start(event: &Event, home: &Path) -> anyhow::Result<Option<String>> {
         return Ok(None);
     };
     crate::seen::record_observation(
-        Some(managed),
+        Some(&managed.upstream),
         Path::new(cwd),
         &Identity {
             owner: session_id.to_owned(),
@@ -489,7 +493,7 @@ fn session_start(event: &Event, home: &Path) -> anyhow::Result<Option<String>> {
         return Ok(None);
     }
     let state = SessionState::load(home, CLAUDE_CODE, session_id);
-    let Some(notice) = notice_if_requested(&repo, &state, true)? else {
+    let Some(notice) = notice_if_requested(&repo, Some(managed), &state)? else {
         return Ok(None);
     };
     let (notice, update) = notice.into_parts();
@@ -528,7 +532,7 @@ fn post_tool_use(event: &Event, home: &Path) -> anyhow::Result<Option<String>> {
     let repo = guidance_root(&matched);
     let state = SessionState::load(home, CLAUDE_CODE, session_id);
     let flags = state.repo(&repo.root);
-    let notice = notice_if_requested(&repo, &state, matched.is_managed())?;
+    let notice = notice_if_requested(&repo, matched.managed.as_ref(), &state)?;
     let include_notice = notice.is_some();
     let include_guidance = matched.trusted
         && !flags.guided
@@ -609,11 +613,13 @@ fn relevant_tool_match(call: &ToolCall<'_>) -> anyhow::Result<Option<(Registry, 
     Ok(matched.map(|matched| (registry, matched)))
 }
 
-/// The entry the event's working directory is inside: what a sighting keys its
-/// workspace on. The touched path may be in another repository; the workspace
-/// is the cwd's.
-fn standing_in(cwd: &str, registry: &Registry) -> Option<RepoName> {
-    match_checkout(&[PathBuf::from(cwd)], registry).and_then(|matched| matched.managed)
+/// The fork the event's working directory is inside, by the name its claims
+/// are kept under: what a sighting keys its workspace on. The touched path may
+/// be in another repository; the workspace is the cwd's.
+fn standing_in(cwd: &str, registry: &Registry) -> Option<UpstreamName> {
+    match_checkout(&[PathBuf::from(cwd)], registry)
+        .and_then(|matched| matched.managed)
+        .map(|managed| managed.upstream)
 }
 
 /// What guidance and session state key on: the match's nearest root and name.
@@ -665,25 +671,30 @@ impl NoticeStateUpdate {
     }
 }
 
-/// The notice for `repo`, when one was asked for and the session lacks it.
+/// The notice for `repo`, the root of the managed fork `managed`, when one was
+/// asked for (`managed` is `None` when it was not) and the session lacks it.
 ///
-/// A state file this knives refuses to read ([`StoreError::Unmigrated`]) is
-/// the notice instead: the claims it holds cannot be read, and an empty
-/// roster would tell the agent nobody holds the branch it is about to take.
-/// The refusal goes into the agent's context, not stderr, because the model
-/// never reads a hook's stderr; its digest is the refusal's, so it repeats
-/// once per session until the migration runs.
+/// The roster is the claims kept under the fork's upstream name; the notice
+/// names the fork by its registry key.
+///
+/// A state file this knives refuses to read ([`StoreError::Unmigrated`], or
+/// [`StoreError::FormerNames`] for one still keeping forks under their registry
+/// keys) is the notice instead: the claims it holds cannot be read, and an
+/// empty roster would tell the agent nobody holds the branch it is about to
+/// take. The refusal goes into the agent's context, not stderr, because the
+/// model never reads a hook's stderr; its digest is the refusal's, so it
+/// repeats once per session until the migration runs.
 fn notice_if_requested(
     repo: &GuidanceRoot,
+    managed: Option<&Managed>,
     state: &SessionState,
-    requested: bool,
 ) -> anyhow::Result<Option<PreparedNotice>> {
-    if !requested {
+    let Some(managed) = managed else {
         return Ok(None);
-    }
+    };
     let store = match Store::open(default_state_path(), &[]) {
         Ok(store) => store,
-        Err(error @ StoreError::Unmigrated { .. }) => {
+        Err(error @ (StoreError::Unmigrated { .. } | StoreError::FormerNames { .. })) => {
             let text = error.to_string();
             let digest = format!("unmigrated:{}", body_digest(&text));
             if state.notice_seen(&repo.root, &digest) {
@@ -697,19 +708,24 @@ fn notice_if_requested(
         Err(error) => return Err(error.into()),
     };
     let claims = all_claims(&store);
-    let digest = notice_digest(&repo.name, &repo.root, &claims);
+    let digest = notice_digest(&managed.upstream, &repo.root, &claims);
     if state.notice_seen(&repo.root, &digest) {
         return Ok(None);
     }
     Ok(Some(PreparedNotice {
-        text: format_notice_for(repo, &digest, &claims),
+        text: format_notice_for(repo, &managed.upstream, &digest, &claims),
         update: NoticeStateUpdate { digest },
     }))
 }
 
-fn format_notice_for(repo: &GuidanceRoot, digest: &str, claims: &[crate::store::Claim]) -> String {
+fn format_notice_for(
+    repo: &GuidanceRoot,
+    upstream: &UpstreamName,
+    digest: &str,
+    claims: &[crate::store::Claim],
+) -> String {
     let observations = crate::seen::load();
-    let visible_claims = claim_lines(claims, &repo.name, &observations, jiff::Timestamp::now());
+    let visible_claims = claim_lines(claims, upstream, &observations, jiff::Timestamp::now());
     format_notice(&repo.name, &repo.root, &visible_claims, digest)
 }
 

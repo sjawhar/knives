@@ -12,6 +12,7 @@ use knives::{
         Guidance, InstructionFile, claim_lines, envelope_nonce, format_guidance, format_notice,
         guidance_for,
     },
+    ids::UpstreamName,
     seen::Seen,
     store::{Claim, OwnerKind},
 };
@@ -171,7 +172,7 @@ fn claim_lines_filter_the_repo_and_render_claim_provenance() {
     let now = "2026-08-03T00:00:00Z".parse().expect("valid timestamp");
 
     // When: lines are rendered for `repo`.
-    let lines = claim_lines(&claims, "repo", &Seen::default(), now);
+    let lines = claim_lines(&claims, &UpstreamName::new("repo"), &Seen::default(), now);
 
     // Then: only matching claims remain with explicit ownership provenance.
     assert_eq!(

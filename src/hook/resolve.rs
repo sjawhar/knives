@@ -7,7 +7,17 @@ use serde_json::Value;
 
 use crate::bind;
 use crate::config::{Registry, expand_registry_path};
-use crate::ids::RepoName;
+use crate::ids::{RepoName, UpstreamName};
+
+/// The registry entry a checkout is, by both of its names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Managed {
+    /// The registry key: what a person reads.
+    pub name: RepoName,
+    /// What the fork's claims and sightings are kept under
+    /// ([`crate::config::RepoEntry::upstream_name`]).
+    pub upstream: UpstreamName,
+}
 
 /// A touched path inside a repository, and what the registry says about it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -17,8 +27,8 @@ pub struct Match {
     pub root: PathBuf,
     /// The touched path, canonicalised.
     pub candidate: PathBuf,
-    /// The registry name when the *checkout's* `upstream` matches an entry.
-    pub managed: Option<RepoName>,
+    /// The registry entry, when the *checkout's* `upstream` matches one.
+    pub managed: Option<Managed>,
     /// Whether `[trust]` grants guidance for this checkout (any remote, or `roots`).
     pub trusted: bool,
 }
@@ -26,9 +36,10 @@ pub struct Match {
 impl Match {
     /// The registry name when managed, else `guidance_name(&self.root)`.
     pub fn name(&self) -> String {
-        self.managed
-            .as_ref()
-            .map_or_else(|| guidance_name(&self.root), ToString::to_string)
+        self.managed.as_ref().map_or_else(
+            || guidance_name(&self.root),
+            |managed| managed.name.to_string(),
+        )
     }
 
     pub const fn is_managed(&self) -> bool {
@@ -103,7 +114,10 @@ pub fn match_checkout(paths: &[PathBuf], registry: &Registry) -> Option<Match> {
         let managed = remotes
             .get("upstream")
             .and_then(|upstream| bind::entry_for(registry, upstream))
-            .map(|(name, _)| name);
+            .map(|(name, entry)| Managed {
+                upstream: entry.upstream_name(name.as_str()),
+                name,
+            });
         let trusted = under_root || registry.trust.grants_by_remotes(&remotes);
         if managed.is_some() || trusted {
             return Some(Match {
@@ -172,9 +186,9 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use crate::config::{Registry, RepoEntry, TrustRules};
-    use crate::ids::RepoName;
+    use crate::ids::{RepoName, UpstreamName};
 
-    use super::{argument_paths, match_checkout};
+    use super::{Managed, argument_paths, match_checkout};
 
     fn registry(entries: &[(&str, &str)], trust: TrustRules) -> Registry {
         Registry {
@@ -472,7 +486,13 @@ mod tests {
         // Then: identity is the upstream remote, trust is any remote, and
         // neither implies the other.
         let managed_only = managed_only.unwrap();
-        assert_eq!(managed_only.managed, Some(RepoName::new("tool")));
+        assert_eq!(
+            managed_only.managed,
+            Some(Managed {
+                name: RepoName::new("tool"),
+                upstream: UpstreamName::new("maintainer/tool"),
+            })
+        );
         assert_eq!(managed_only.name(), "tool");
         assert!(!managed_only.trusted);
         let both = both.unwrap();

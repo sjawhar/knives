@@ -146,8 +146,8 @@ impl Repositories {
              origin = \"https://forge.invalid/ours/beta\"\n\n{trust}"
         );
         std::fs::write(self.home.path().join("repos.toml"), config).expect("write registry");
-        let state = json!({"claims": {"beta/feat/claimed": {
-            "repo": "beta",
+        let state = json!({"claims": {"maintainer/beta/feat/claimed": {
+            "repo": "maintainer/beta",
             "branch": "feat/claimed",
             "owner": "agent-one",
             "why": "porting",
@@ -224,16 +224,16 @@ fn session_start_reemits_a_notice_when_the_roster_changes() {
 
     let _ = run_hook(repos.home.path(), &start);
     repos.write_state(&json!({"claims": {
-        "beta/feat/claimed": {
-            "repo": "beta",
+        "maintainer/beta/feat/claimed": {
+            "repo": "maintainer/beta",
             "branch": "feat/claimed",
             "owner": "agent-one",
             "why": "porting",
             "started": "2026-01-01T00:00:00Z",
             "files": []
         },
-        "beta/feat/new": {
-            "repo": "beta",
+        "maintainer/beta/feat/new": {
+            "repo": "maintainer/beta",
             "branch": "feat/new",
             "owner": "agent-two",
             "why": "reviewing",
@@ -271,7 +271,7 @@ fn session_start_in_a_managed_workspace_records_passive_observations() {
         "was: {seen}"
     );
     assert!(
-        seen["workspaces"]["beta/beta"]
+        seen["workspaces"]["maintainer/beta/beta"]
             .as_str()
             .is_some_and(|timestamp| timestamp.parse::<jiff::Timestamp>().is_ok()),
         "was: {seen}"
@@ -300,7 +300,7 @@ fn compact_session_start_in_a_managed_workspace_records_passive_observations() {
         "was: {seen}"
     );
     assert!(
-        seen["workspaces"]["beta/beta"]
+        seen["workspaces"]["maintainer/beta/beta"]
             .as_str()
             .is_some_and(|timestamp| timestamp.parse::<jiff::Timestamp>().is_ok()),
         "was: {seen}"
@@ -397,16 +397,16 @@ fn post_tool_use_reemits_a_notice_when_the_roster_changes() {
 
     let _ = run_hook(repos.home.path(), &read);
     repos.write_state(&json!({"claims": {
-        "beta/feat/claimed": {
-            "repo": "beta",
+        "maintainer/beta/feat/claimed": {
+            "repo": "maintainer/beta",
             "branch": "feat/claimed",
             "owner": "agent-one",
             "why": "porting",
             "started": "2026-01-01T00:00:00Z",
             "files": []
         },
-        "beta/feat/new": {
-            "repo": "beta",
+        "maintainer/beta/feat/new": {
+            "repo": "maintainer/beta",
             "branch": "feat/new",
             "owner": "agent-two",
             "why": "reviewing",
@@ -447,7 +447,7 @@ fn post_tool_use_in_a_managed_workspace_records_event_identity_and_cwd() {
         "was: {seen}"
     );
     assert!(
-        seen["workspaces"]["alpha/alpha"]
+        seen["workspaces"]["maintainer/alpha/alpha"]
             .as_str()
             .is_some_and(|timestamp| timestamp.parse::<jiff::Timestamp>().is_ok()),
         "was: {seen}"

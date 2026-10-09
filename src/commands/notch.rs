@@ -9,7 +9,7 @@
 use crate::bind::Fork;
 use crate::cli::Exit;
 use crate::commands::claim::current_identity;
-use crate::ids::{BranchName, BranchTarget, RepoName, short_id};
+use crate::ids::{BranchName, BranchTarget, RepoName, UpstreamName, short_id};
 use crate::ledger::{
     Draft, Entry, EntryClass, Filter, Kind, Ledger, LedgerError, Scribe, VerifyFlag,
     body_human_text, inline_human_text, select, verify_entries,
@@ -56,9 +56,9 @@ pub enum Report {
 #[derive(Debug)]
 pub struct Request<'a> {
     pub fork: &'a Fork<'a>,
-    /// The entry the current directory is inside; a write derives its author
-    /// from it, a read never asks.
-    pub bound: Option<&'a RepoName>,
+    /// The fork the current directory is inside, by the name its claims are
+    /// kept under; a write derives its author from it, a read never asks.
+    pub bound: Option<&'a UpstreamName>,
     pub subject: Option<&'a str>,
     /// Present for a write, absent for a read.
     pub message: Option<&'a str>,

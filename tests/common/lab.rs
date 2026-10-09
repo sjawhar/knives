@@ -531,6 +531,24 @@ impl Lab {
             )
         }
     }
+
+    /// Point the work checkout's `upstream` remote at the forge URL `url`,
+    /// which git rewrites to the lab's upstream repository when it fetches.
+    ///
+    /// Every other lab fork's upstream is a filesystem path, which names no
+    /// forge repository, so its claims, sightings and ledger are kept under
+    /// its registry key and a reader keyed by that key looks right. A fork
+    /// whose upstream is a forge URL, as every real one is, is kept under
+    /// the URL's lowercase `<owner>/<name>` instead.
+    pub(crate) fn upstream_at_forge_url(&self, url: &str) {
+        let rewrite = format!("url.{}.insteadOf", self.upstream.display());
+        git(&self.work, &self.trunk, ["config", &rewrite, url]);
+        git(
+            &self.work,
+            &self.trunk,
+            ["remote", "set-url", "upstream", url],
+        );
+    }
 }
 /// A registry entry for the lab's work checkout, which stands in for origin.
 pub fn lab_entry(lab: &Lab) -> knives::config::RepoEntry {
@@ -549,6 +567,7 @@ pub fn lab_fork<'a>(
 ) -> knives::bind::Fork<'a> {
     knives::bind::Fork {
         name: knives::ids::RepoName::new(name),
+        upstream: entry.upstream_name(name),
         entry,
         checkout: knives::bind::Checkout {
             path: lab.work.clone(),
@@ -904,7 +923,7 @@ pub fn state_on_ledger(
 ) {
     knives::ledger::Scribe::new(
         knives::ledger::Ledger::at(home.join("ledger").join(repo)),
-        knives::ids::RepoName::new(repo),
+        knives::ids::UpstreamName::new(repo),
         home.to_owned(),
         "a-test".to_owned(),
     )

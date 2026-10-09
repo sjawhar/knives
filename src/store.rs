@@ -700,10 +700,11 @@ impl State {
         match renamed.map {
             StateMap::Claims => {
                 let moved = rekey(&mut self.claims, renamed);
-                if moved && let Some(claim) = self.claims.get_mut(&renamed.to) {
-                    if let Some(now) = former.get(claim.repo.as_str()) {
-                        claim.repo = now.to_string();
-                    }
+                if moved
+                    && let Some(claim) = self.claims.get_mut(&renamed.to)
+                    && let Some(now) = former.get(claim.repo.as_str())
+                {
+                    claim.repo = now.to_string();
                 }
                 moved
             }
@@ -1217,7 +1218,10 @@ mod tests {
             store.comment_mark(&UpstreamName::new("a-repo"), 7),
             Some("2026-07-30T00:00:00Z")
         );
-        assert_eq!(store.comment_mark(&UpstreamName::new("other-repo"), 7), None);
+        assert_eq!(
+            store.comment_mark(&UpstreamName::new("other-repo"), 7),
+            None
+        );
     }
 
     #[test]
@@ -1234,7 +1238,10 @@ mod tests {
             subject.pull_state(&UpstreamName::new("a-repo"), 7),
             Some("MERGED")
         );
-        assert_eq!(subject.pull_state(&UpstreamName::new("other-repo"), 7), None);
+        assert_eq!(
+            subject.pull_state(&UpstreamName::new("other-repo"), 7),
+            None
+        );
     }
 
     #[test]

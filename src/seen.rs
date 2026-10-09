@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::commands::claim::Identity;
 use crate::commands::wip::workspace_for;
-use crate::ids::{RepoName, WorkspaceName};
+use crate::ids::{UpstreamName, WorkspaceName};
 use crate::jj::WorkspaceActivity;
 use crate::lock::{FileLock, LockWait};
 use crate::store::{Claim, OwnerKind, default_state_path};
@@ -27,7 +27,8 @@ pub struct Seen {
     /// A name only identifies a claimant in conjunction with its source.
     #[serde(default)]
     pub owners: BTreeMap<OwnerKind, BTreeMap<String, String>>,
-    /// `<repo>/<workspace-dir-name>` → newest RFC 3339 observation.
+    /// `<upstream>/<workspace-dir-name>` → newest RFC 3339 observation, where
+    /// `<upstream>` is the name the fork's claims are kept under.
     #[serde(default)]
     pub workspaces: BTreeMap<String, String>,
 }
@@ -44,10 +45,11 @@ pub enum LastSeen {
 ///
 /// The owner source is part of the observation key; OS-user identities are
 /// deliberately excluded because they would conflate every anonymous claimant.
-/// `repo` is the entry the caller already bound `cwd` to (dispatch binds once
-/// per invocation; the hook has its match); with it, the jj workspace `cwd` is
-/// inside contributes `<repo>/<workspace-dir-name>`.
-pub fn record_observation(repo: Option<&RepoName>, cwd: &Path, identity: &Identity) {
+/// `repo` is the fork the caller already bound `cwd` to, by the name its
+/// claims are kept under (dispatch binds once per invocation; the hook has its
+/// match); with it, the jj workspace `cwd` is inside contributes
+/// `<repo>/<workspace-dir-name>`, the key [`last_seen`] reads for a claim.
+pub fn record_observation(repo: Option<&UpstreamName>, cwd: &Path, identity: &Identity) {
     let owner =
         (identity.kind != OwnerKind::OsUser).then(|| (identity.kind, identity.owner.clone()));
     let workspace = workspace_key(repo, cwd);
@@ -137,7 +139,7 @@ fn seen_path() -> PathBuf {
     default_state_path().with_file_name("seen.json")
 }
 
-fn workspace_key(repo: Option<&RepoName>, cwd: &Path) -> Option<String> {
+fn workspace_key(repo: Option<&UpstreamName>, cwd: &Path) -> Option<String> {
     let repo = repo?;
     let workspace = cwd
         .ancestors()
@@ -206,7 +208,7 @@ mod tests {
     };
     use crate::commands::claim::Identity;
     use crate::config::test_support::{EnvironmentGuard, environment_lock};
-    use crate::ids::{RepoName, WorkspaceName};
+    use crate::ids::{UpstreamName, WorkspaceName};
     use crate::store::{Claim, OwnerKind, default_state_path};
 
     fn ts(raw: &str) -> jiff::Timestamp {
@@ -238,7 +240,7 @@ mod tests {
         // The caller binds; this only names the workspace `cwd` is inside.
         let home = tempfile::tempdir().expect("create home");
         let root = workspace(&home);
-        let repo = RepoName::new("a");
+        let repo = UpstreamName::new("a");
 
         assert_eq!(
             workspace_key(Some(&repo), &root.join("src")).as_deref(),
@@ -263,7 +265,7 @@ mod tests {
             kind: OwnerKind::HarnessSession,
         };
 
-        record_observation(Some(&RepoName::new("a")), &cwd, &identity);
+        record_observation(Some(&UpstreamName::new("a")), &cwd, &identity);
 
         let seen = load();
         assert!(seen.workspaces.contains_key("a/feat-x"), "was: {seen:?}");
@@ -385,7 +387,7 @@ mod tests {
         let cwd = workspace(&home);
 
         record_observation(
-            Some(&RepoName::new("a")),
+            Some(&UpstreamName::new("a")),
             &cwd,
             &Identity {
                 owner: "terminal-user".to_owned(),
@@ -411,10 +413,10 @@ mod tests {
             kind: OwnerKind::HarnessSession,
         };
 
-        record_observation(Some(&RepoName::new("a")), &cwd, &identity);
+        record_observation(Some(&UpstreamName::new("a")), &cwd, &identity);
         let path = default_state_path().with_file_name("seen.json");
         let first = std::fs::read_to_string(&path).expect("first observation persisted");
-        record_observation(Some(&RepoName::new("a")), &cwd, &identity);
+        record_observation(Some(&UpstreamName::new("a")), &cwd, &identity);
         let second = std::fs::read_to_string(&path).expect("second observation persisted");
 
         assert_eq!(first, second, "a fresh sighting must not rewrite seen.json");
@@ -449,7 +451,7 @@ mod tests {
         .expect("write stale observations");
 
         record_observation(
-            Some(&RepoName::new("a")),
+            Some(&UpstreamName::new("a")),
             &cwd,
             &Identity {
                 owner: "agent-one".to_owned(),

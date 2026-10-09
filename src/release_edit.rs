@@ -9,7 +9,7 @@ use knives::bind::Fork;
 use knives::cli::Exit;
 use knives::commands::release;
 use knives::forge::github::CliForge;
-use knives::ids::{BranchName, CommitId, ReleaseScheme, RepoName};
+use knives::ids::{BranchName, CommitId, ReleaseScheme, RepoName, UpstreamName};
 use knives::ledger::{Draft, Kind, Ledger};
 use knives::release_model::{
     MemberEvidence, MemberLookup, MemberSuccession, StackedHistoryContext, carried_from_tips,
@@ -89,9 +89,9 @@ struct EditContext<'a> {
     repo: &'a RepoName,
     opened: &'a knives::jj::Repo,
     release: &'a ReleaseInHand,
-    /// The entry the current directory is inside; the ledger event's author is
-    /// derived from it.
-    bound: Option<&'a RepoName>,
+    /// The fork the current directory is inside, by the name its claims are
+    /// kept under; the ledger event's author is derived from it.
+    bound: Option<&'a UpstreamName>,
     /// The release's last recorded parent set, from this repository's ledger.
     ///
     /// Ancestry and change ids cover a branch that grew or was rebased by jj. A
@@ -188,7 +188,7 @@ pub(crate) fn run_release_edit(
     fork: &Fork<'_>,
     extra_consumers: &[&std::path::Path],
     change: &ReleaseEdit,
-    bound: Option<&RepoName>,
+    bound: Option<&UpstreamName>,
 ) -> anyhow::Result<Exit> {
     let mut locals = extra_consumers
         .iter()
@@ -227,7 +227,7 @@ fn edit_release(
     forge: &dyn knives::consumer_pins::ConsumerPinSource,
     cache_root: Option<&std::path::Path>,
     heads: &knives::consumer_pins::ConsumerHeadMemo,
-    bound: Option<&RepoName>,
+    bound: Option<&UpstreamName>,
 ) -> anyhow::Result<Exit> {
     let repo = &fork.name;
     let entry = fork.entry;
@@ -384,7 +384,7 @@ pub(crate) fn record_edit_event(
     fork: &Fork<'_>,
     opened: &knives::jj::Repo,
     record: &EditRecord<'_>,
-    bound: Option<&RepoName>,
+    bound: Option<&UpstreamName>,
 ) -> anyhow::Result<()> {
     let parents: Vec<knives::ids::CommitId> = record
         .provenance

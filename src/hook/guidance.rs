@@ -7,6 +7,7 @@ use std::{
 
 use crate::commands::claim::{owner_kind_label, render_claim_line};
 use crate::config::GuidanceRoot;
+use crate::ids::UpstreamName;
 use crate::jj::WorkspaceActivity;
 use crate::seen::{self, Seen};
 use crate::store::Claim;
@@ -129,11 +130,12 @@ pub fn format_guidance(repo_name: &str, guidance: &Guidance, nonce: &str) -> Str
     format!("\n\n{header}\n{body}\n{footer}")
 }
 
-/// Returns the time-invariant digest of a repository's active claim roster.
-pub fn notice_digest(repo_name: &str, root: &Path, claims: &[Claim]) -> String {
+/// Returns the time-invariant digest of a fork's active claim roster: the
+/// claims kept under its upstream name `repo`.
+pub fn notice_digest(repo: &UpstreamName, root: &Path, claims: &[Claim]) -> String {
     let mut claims = claims
         .iter()
-        .filter(|claim| claim.repo == repo_name)
+        .filter(|claim| claim.repo == repo.as_str())
         .collect::<Vec<_>>();
     claims.sort_unstable_by(|left, right| {
         left.repo
@@ -142,7 +144,7 @@ pub fn notice_digest(repo_name: &str, root: &Path, claims: &[Claim]) -> String {
     });
 
     let mut hash = FNV_OFFSET_BASIS;
-    hash = fnv1a(hash, repo_name.as_bytes());
+    hash = fnv1a(hash, repo.as_str().as_bytes());
     hash = fnv1a(hash, b"\x1e");
     hash = fnv1a(hash, root.as_os_str().as_encoded_bytes());
     hash = fnv1a(hash, b"\x1e");
@@ -221,14 +223,15 @@ pub fn format_refusal(repo_name: &str, refusal: &str) -> String {
     .join("\n")
 }
 
-/// Returns active claim summaries for a repository.
+/// Returns active claim summaries for the fork whose claims are kept under
+/// its upstream name `repo`.
 ///
 /// Hooks never open a jj repository or walk operations — identity is read by
 /// git — so an empty operation stream is marked window-exhausted rather than
 /// claiming no activity.
 pub fn claim_lines(
     claims: &[Claim],
-    repo_name: &str,
+    repo: &UpstreamName,
     observations: &Seen,
     now: jiff::Timestamp,
 ) -> Vec<String> {
@@ -238,7 +241,7 @@ pub fn claim_lines(
     };
     claims
         .iter()
-        .filter(|claim| claim.repo == repo_name)
+        .filter(|claim| claim.repo == repo.as_str())
         .map(|claim| {
             render_claim_line(
                 &claim.branch,
@@ -319,6 +322,7 @@ mod tests {
         guidance_for, notice_digest,
     };
     use crate::config::GuidanceRoot;
+    use crate::ids::UpstreamName;
     use crate::seen::Seen;
     use crate::store::{Claim, OwnerKind};
 
@@ -476,7 +480,7 @@ mod tests {
         };
         let now = "2026-01-03T00:00:00Z".parse().expect("valid timestamp");
 
-        let rows = claim_lines(&claims, "r", &seen, now);
+        let rows = claim_lines(&claims, &UpstreamName::new("r"), &seen, now);
 
         assert_eq!(
             rows,
@@ -492,6 +496,7 @@ mod tests {
         // Rendering must continue to roll elapsed-time language while the
         // content identity remains strictly a function of persisted claims.
         let root = Path::new("/repos/beta");
+        let beta = UpstreamName::new("beta");
         let claims = vec![Claim {
             repo: "beta".to_owned(),
             branch: "feat/first".to_owned(),
@@ -504,20 +509,20 @@ mod tests {
         let seen = Seen::default();
         let early = claim_lines(
             &claims,
-            "beta",
+            &beta,
             &seen,
             "2026-01-01T01:00:00Z".parse().expect("valid timestamp"),
         );
         let late = claim_lines(
             &claims,
-            "beta",
+            &beta,
             &seen,
             "2026-01-01T03:00:00Z".parse().expect("valid timestamp"),
         );
 
         assert_ne!(early, late, "ages must roll for this test to bite");
-        let digest = notice_digest("beta", root, &claims);
-        assert_eq!(digest, notice_digest("beta", root, &claims));
+        let digest = notice_digest(&beta, root, &claims);
+        assert_eq!(digest, notice_digest(&beta, root, &claims));
 
         let mut grown = claims;
         grown.push(Claim {
@@ -530,11 +535,11 @@ mod tests {
             files: Vec::new(),
         });
         let expected = "03b4a0b08163a78c";
-        assert_eq!(notice_digest("beta", root, &grown), expected);
+        assert_eq!(notice_digest(&beta, root, &grown), expected);
         let mut reordered = grown.clone();
         reordered.reverse();
-        assert_eq!(notice_digest("beta", root, &reordered), expected);
-        assert_ne!(digest, notice_digest("beta", root, &grown));
+        assert_eq!(notice_digest(&beta, root, &reordered), expected);
+        assert_ne!(digest, notice_digest(&beta, root, &grown));
     }
 
     #[test]

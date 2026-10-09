@@ -10,7 +10,7 @@ use knives::bind::Fork;
 use knives::cli::Exit;
 use knives::commands::release;
 use knives::forge::github::CliForge;
-use knives::ids::{BookmarkRef, ReleaseScheme, RemoteName, RepoName};
+use knives::ids::{BookmarkRef, ReleaseScheme, RemoteName, RepoName, UpstreamName};
 use knives::ledger::{Draft, Kind, Ledger};
 use knives::release_model::{
     RecordedCut, StackedHistoryContext, carried_branches, last_recorded_cut, members_event_text,
@@ -36,7 +36,7 @@ pub(crate) fn run_release(
     fork: &Fork<'_>,
     extra_consumers: &[&std::path::Path],
     invocation: &ReleaseInvocation,
-    bound: Option<&RepoName>,
+    bound: Option<&UpstreamName>,
 ) -> anyhow::Result<Exit> {
     let repo = &fork.name;
     let entry = fork.entry;
@@ -183,8 +183,7 @@ pub(crate) fn run_release(
                         previous_ref.branch()
                     );
                 } else if matches!(scheme, ReleaseScheme::Fixed(_))
-                    && let previous_recorded =
-                        last_recorded_cut(&gate.ledger.entries()?, None)
+                    && let previous_recorded = last_recorded_cut(&gate.ledger.entries()?, None)
                     && previous_recorded
                         .as_ref()
                         .is_none_or(|recorded| recorded.commit != *published)
@@ -513,7 +512,7 @@ struct CompletedCut<'a> {
 fn record_cut_event(
     fork: &Fork<'_>,
     cut: &CompletedCut<'_>,
-    bound: Option<&RepoName>,
+    bound: Option<&UpstreamName>,
 ) -> anyhow::Result<()> {
     let entry = fork.entry;
     let opened = knives::jj::Repo::open(&fork.checkout.path)?;

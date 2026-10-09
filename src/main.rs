@@ -324,10 +324,11 @@ impl<'a> Ground<'a> {
         }
     }
 
-    /// The entry the current directory is inside, when it is inside one: what
-    /// `current_identity` derives a terminal user's name from.
-    fn bound(&self) -> Option<&RepoName> {
-        self.here.as_ref().ok().map(|fork| &fork.name)
+    /// The fork the current directory is inside, when it is inside one, by the
+    /// name its claims are kept under: what `current_identity` derives a
+    /// terminal user's name from, and what a sighting keys its workspace on.
+    fn bound(&self) -> Option<&UpstreamName> {
+        self.here.as_ref().ok().map(|fork| &fork.upstream)
     }
 
     /// The fork `name` is: the current directory's when it is that entry, else
@@ -531,7 +532,9 @@ fn run_audit(
                 report
             }
         };
-        report.problems.extend(pulled.problems_for(&chosen.upstream()));
+        report
+            .problems
+            .extend(pulled.problems_for(&chosen.upstream()));
         worst = worst.worst(audit::exit_for(&report));
         reports.push(report);
     }
@@ -554,7 +557,7 @@ fn dispatch_release(
     action: Option<ReleaseAction>,
     extra_consumers: &[&std::path::Path],
     output: Output,
-    bound: Option<&RepoName>,
+    bound: Option<&UpstreamName>,
 ) -> anyhow::Result<Exit> {
     match action {
         None => run_release(fork, extra_consumers, &ReleaseInvocation::Plan, bound),
@@ -617,12 +620,12 @@ fn dispatch_release(
     }
 }
 
-/// The ledger writer for a command acting on `fork`, from the entry the current
+/// The ledger writer for a command acting on `fork`, from the fork the current
 /// directory is `bound` to.
 ///
 /// The owner is resolved exactly as a claim's is, so one agent's events and its
 /// claims carry the same name and a reader can join them.
-fn scribe_for(fork: &Fork<'_>, bound: Option<&RepoName>) -> anyhow::Result<Scribe> {
+fn scribe_for(fork: &Fork<'_>, bound: Option<&UpstreamName>) -> anyhow::Result<Scribe> {
     Ok(Scribe::new(
         Ledger::for_repo(&fork.upstream),
         fork.upstream.clone(),
@@ -993,7 +996,9 @@ fn run_sync(
                 ..sync::Report::default()
             },
         };
-        report.problems.extend(pulled.problems_for(&chosen.upstream()));
+        report
+            .problems
+            .extend(pulled.problems_for(&chosen.upstream()));
         worst = worst.worst(sync::exit_for(&report));
         reports.push(report);
     }

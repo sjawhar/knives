@@ -1,0 +1,302 @@
+//! A claim is kept under its fork's upstream name, and every reader of the
+//! roster finds it there.
+//!
+//! The lab's other forks have a filesystem path for an upstream, which names
+//! no forge repository, so they are kept under their registry key and a reader
+//! that looked a claim up by that key would pass. These forks have a forge URL
+//! for an upstream, as every real fork does: the claim is kept under the URL's
+//! lowercase `<owner>/<name>`, and a reader that still asked by the registry
+//! key would find an empty roster — `status` showing no claims, and the hook
+//! telling an agent that nobody holds the branch it is about to take.
+
+#![allow(
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic,
+    reason = "a fixture or assertion that cannot proceed IS the test failure"
+)]
+
+#[path = "common/lab.rs"]
+mod lab;
+
+use std::io::Write as _;
+use std::path::Path;
+use std::process::{Command, Output, Stdio};
+
+use lab::Lab;
+use serde_json::{Value, json};
+
+/// The fork's upstream as its registry spells it, letter case and all.
+const UPSTREAM: &str = "https://forge.invalid/Maintainer/Demo";
+/// What the fork's claims are kept under: [`UPSTREAM`]'s lowercase `<owner>/<name>`.
+const KEPT_UNDER: &str = "maintainer/demo";
+
+/// A lab whose work checkout's `upstream` is [`UPSTREAM`], and a config home
+/// whose registry calls that fork `demo`.
+fn forge_fork() -> (Lab, tempfile::TempDir) {
+    let lab = Lab::new();
+    lab.upstream_at_forge_url(UPSTREAM);
+    let home = tempfile::tempdir().expect("create config home");
+    std::fs::write(
+        home.path().join("repos.toml"),
+        format!("[repos.demo]\nupstream = \"{UPSTREAM}\"\norigin = \"https://forge.invalid/acme/work.git\"\n"),
+    )
+    .expect("write registry");
+    (lab, home)
+}
+
+/// `knives <args>` from `cwd` as harness session `owner`, or as the terminal
+/// user `terminal-user` when `owner` is `None`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a fixture: which lab, which config home, where it runs, who runs it and what it runs are independent"
+)]
+fn knives_as(lab: &Lab, home: &Path, cwd: &Path, owner: Option<&str>, args: &[&str]) -> Output {
+    let mut command = lab::knives_command(cwd, home, lab.temp_path(), args);
+    command.env("USER", "terminal-user");
+    if let Some(owner) = owner {
+        command.env("KNIVES_OWNER", owner);
+    }
+    command.output().expect("run knives")
+}
+
+fn succeeded(output: &Output) -> &Output {
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output
+}
+
+/// `agent-one` claims `feat/gamma` on `demo` and gets its workspace.
+fn claim_gamma(lab: &Lab, home: &Path) {
+    succeeded(&knives_as(
+        lab,
+        home,
+        &lab.work,
+        Some("agent-one"),
+        &[
+            "--text",
+            "start",
+            "feat/gamma",
+            "--repo",
+            "demo",
+            "--why",
+            "port it",
+        ],
+    ));
+}
+
+/// The context Claude Code's `SessionStart` hook adds for a session started in `cwd`.
+fn session_start_notice(home: &Path, cwd: &Path) -> String {
+    let event = json!({
+        "session_id": "hook-session",
+        "cwd": cwd,
+        "hook_event_name": "SessionStart",
+        "source": "startup",
+    });
+    let mut child = Command::new(env!("CARGO_BIN_EXE_knives"))
+        .args(["hook", "claude-code"])
+        .env("KNIVES_CONFIG_HOME", home)
+        .env("HOME", home)
+        .env("JJ_CONFIG", "/dev/null")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn hook");
+    child
+        .stdin
+        .take()
+        .expect("hook stdin")
+        .write_all(event.to_string().as_bytes())
+        .expect("write hook input");
+    let output = child.wait_with_output().expect("wait for hook");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: Value = serde_json::from_str(&stdout).unwrap_or_else(|error| {
+        panic!(
+            "the hook emits JSON ({error}): {stdout}\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+    });
+    parsed["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .expect("additional context")
+        .to_owned()
+}
+
+#[test]
+fn a_claim_is_kept_under_the_forks_lowercase_upstream_name() {
+    // Given: a fork whose upstream is a forge URL.
+    let (lab, home) = forge_fork();
+
+    // When: a branch of it is claimed.
+    claim_gamma(&lab, home.path());
+
+    // Then: the state file keeps the claim under the upstream name, not the
+    // registry key: what every reader below must look it up by.
+    let state: Value = serde_json::from_str(
+        &std::fs::read_to_string(home.path().join("state.json")).expect("read state"),
+    )
+    .expect("state JSON");
+    let claim = &state["claims"][format!("{KEPT_UNDER}/feat/gamma")];
+    assert_eq!(claim["repo"], KEPT_UNDER, "state: {state}");
+    assert_eq!(claim["owner"], "agent-one", "state: {state}");
+}
+
+#[test]
+fn a_claimed_branch_is_on_the_status_roster() {
+    // Given: a claimed branch of a fork whose upstream is a forge URL.
+    let (lab, home) = forge_fork();
+    claim_gamma(&lab, home.path());
+
+    // When: status reports the fork.
+    let status = succeeded(&knives_as(
+        &lab,
+        home.path(),
+        &lab.work,
+        None,
+        &["--json", "status", "demo", "--no-github", "--no-landed"],
+    ))
+    .stdout
+    .clone();
+
+    // Then: the branch's row names who holds it.
+    let report: Value = serde_json::from_slice(&status).expect("status JSON");
+    let row = report["branches"]
+        .as_array()
+        .expect("branches")
+        .iter()
+        .find(|row| row["name"] == "feat/gamma")
+        .unwrap_or_else(|| panic!("no feat/gamma row: {report}"));
+    assert_eq!(row["claim"]["id"], "agent-one", "row: {row}");
+    assert_eq!(row["claim"]["why"], "port it", "row: {row}");
+}
+
+#[test]
+fn the_claude_code_notice_names_the_claimed_branch() {
+    // Given: a claimed branch of a fork whose upstream is a forge URL.
+    let (lab, home) = forge_fork();
+    claim_gamma(&lab, home.path());
+
+    // When: a Claude Code session starts in the fork.
+    let notice = session_start_notice(home.path(), &lab.work);
+
+    // Then: the notice names the claim instead of saying nobody holds a branch.
+    assert!(
+        notice.contains("feat/gamma (agent-one, harness-session, claimed "),
+        "notice: {notice}"
+    );
+    assert!(
+        !notice.contains("No branch is claimed here right now."),
+        "notice: {notice}"
+    );
+}
+
+#[test]
+fn a_terminal_in_the_fork_acts_as_its_sole_claimant() {
+    // Given: a fork whose only claim is agent-one's, held as a harness session.
+    let (lab, home) = forge_fork();
+    claim_gamma(&lab, home.path());
+
+    // When: a terminal with no harness session writes a note from inside the fork.
+    succeeded(&knives_as(
+        &lab,
+        home.path(),
+        &lab.work,
+        None,
+        &[
+            "--text",
+            "notch",
+            "-m",
+            "from the terminal",
+            "--repo",
+            "demo",
+        ],
+    ));
+
+    // Then: the note is written as the fork's sole claimant, not the OS user.
+    let read = succeeded(&knives_as(
+        &lab,
+        home.path(),
+        &lab.work,
+        None,
+        &["--json", "notch", "--repo", "demo"],
+    ))
+    .stdout
+    .clone();
+    let notches: Value = serde_json::from_slice(&read).expect("notch JSON");
+    let note = notches["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .find(|entry| entry["text"] == "from the terminal")
+        .unwrap_or_else(|| panic!("no note: {notches}"));
+    assert_eq!(note["owner"], "agent-one", "note: {note}");
+}
+
+#[test]
+fn a_sighting_inside_the_claimed_workspace_reaches_the_notice() {
+    // Given: a claimed branch with every earlier sighting forgotten, so the
+    // only evidence of activity is the one made below.
+    let (lab, home) = forge_fork();
+    claim_gamma(&lab, home.path());
+    std::fs::remove_file(home.path().join("seen.json")).expect("forget earlier sightings");
+
+    // When: a terminal runs knives inside the claim's workspace, which
+    // records a sighting of that workspace.
+    let workspace = lab.temp_path().join("feat-gamma");
+    succeeded(&knives_as(
+        &lab,
+        home.path(),
+        &workspace,
+        None,
+        &["--text", "repos"],
+    ));
+
+    // Then: the sighting is keyed where the notice looks for the claim's
+    // workspace, so the claim reads as seen.
+    let seen: Value = serde_json::from_str(
+        &std::fs::read_to_string(home.path().join("seen.json")).expect("read seen.json"),
+    )
+    .expect("seen JSON");
+    assert!(
+        seen["workspaces"][format!("{KEPT_UNDER}/feat-gamma")].is_string(),
+        "seen: {seen}"
+    );
+    let notice = session_start_notice(home.path(), &lab.work);
+    assert!(
+        notice.contains("feat/gamma (agent-one, harness-session, claimed ")
+            && notice.contains(" ago, last seen "),
+        "notice: {notice}"
+    );
+}
+
+#[test]
+fn a_claim_still_kept_under_the_registry_key_puts_the_refusal_in_the_notice() {
+    // Given: a state file an older knives wrote, keeping the fork's claim
+    // under its registry key.
+    let (lab, home) = forge_fork();
+    std::fs::write(
+        home.path().join("state.json"),
+        json!({"claims": {"demo/feat/gamma": {
+            "repo": "demo", "branch": "feat/gamma", "owner": "agent-one",
+            "why": "port it", "started": "2026-01-01T00:00:00Z", "files": []
+        }}})
+        .to_string(),
+    )
+    .expect("write state");
+
+    // When: a Claude Code session starts in the fork.
+    let notice = session_start_notice(home.path(), &lab.work);
+
+    // Then: the agent is told the claims cannot be read and how to fix it,
+    // rather than hearing nothing and taking the branch for free.
+    assert!(
+        notice.contains("do not assume a branch is free"),
+        "notice: {notice}"
+    );
+    assert!(notice.contains("knives ledger migrate"), "notice: {notice}");
+}

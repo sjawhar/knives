@@ -759,8 +759,8 @@ mod tests {
         report: &mut Report,
     ) -> Result<(), ForgeError> {
         let temp = tempfile::tempdir().expect("create test store");
-        let store =
-            Store::open(temp.path().join("state.json"), &[&fork.upstream]).expect("open test store");
+        let store = Store::open(temp.path().join("state.json"), &[&fork.upstream])
+            .expect("open test store");
         pull_head_findings(
             &audit_input(fork, &store, Some(forge), None),
             forge,
@@ -1102,8 +1102,8 @@ mod tests {
             ..FakeForge::default()
         };
         let temp = tempfile::tempdir().expect("create test cache");
-        let store =
-            Store::open(temp.path().join("state.json"), &[&fork.upstream]).expect("open test store");
+        let store = Store::open(temp.path().join("state.json"), &[&fork.upstream])
+            .expect("open test store");
         let mut report = Report::new("demo");
 
         add_open_pull_head_checks(
@@ -1132,8 +1132,8 @@ mod tests {
         let temp = tempfile::tempdir().expect("create test cache");
         let blocked_root = temp.path().join("blocked-cache-root");
         std::fs::write(&blocked_root, "not a directory").expect("block cache root");
-        let store =
-            Store::open(temp.path().join("state.json"), &[&fork.upstream]).expect("open test store");
+        let store = Store::open(temp.path().join("state.json"), &[&fork.upstream])
+            .expect("open test store");
         let mut report = Report::new("demo");
 
         add_open_pull_head_checks(
@@ -1160,8 +1160,8 @@ mod tests {
             fact: None,
         };
         let temp = tempfile::tempdir().expect("create test store");
-        let store =
-            Store::open(temp.path().join("state.json"), &[&fork.upstream]).expect("open test store");
+        let store = Store::open(temp.path().join("state.json"), &[&fork.upstream])
+            .expect("open test store");
         let mut report = Report::new("demo");
 
         add_open_pull_head_checks(

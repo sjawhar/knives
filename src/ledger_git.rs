@@ -1065,8 +1065,18 @@ mod tests {
             );
         }
         for name in [
-            "", "hawk", "metr/", "/hawk", "metr/hawk/x", "../hawk", "metr/..", "./hawk",
-            ".git/hawk", "metr/.GIT", "metr\\hawk/x", "metr/ha\\wk",
+            "",
+            "hawk",
+            "metr/",
+            "/hawk",
+            "metr/hawk/x",
+            "../hawk",
+            "metr/..",
+            "./hawk",
+            ".git/hawk",
+            "metr/.GIT",
+            "metr\\hawk/x",
+            "metr/ha\\wk",
         ] {
             assert!(
                 matches!(

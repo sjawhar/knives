@@ -359,14 +359,13 @@ impl Pulled {
             .destinations
             .iter()
             .find(|destination| destination.carries(fork))?;
-        let unsent = ledger_git::unsent(&destination.repository, &destination.remote).map(
-            |paths| {
+        let unsent =
+            ledger_git::unsent(&destination.repository, &destination.remote).map(|paths| {
                 paths
                     .iter()
                     .filter(|path| path.starts_with(fork.as_str()))
                     .count()
-            },
-        );
+            });
         let log = sweep_log(&self.root);
         let failed = log
             .exists()
@@ -540,7 +539,10 @@ mod tests {
     #[test]
     fn forks_with_no_machine_name_are_refused_with_the_command_that_names_one() {
         let (_home, root) = ledger_root();
-        git(&root.join(".git"), &["config", "knives.fork", "acme/a-repo"]);
+        git(
+            &root.join(".git"),
+            &["config", "knives.fork", "acme/a-repo"],
+        );
 
         let error = destinations(&root).unwrap_err().to_string();
 
@@ -581,7 +583,10 @@ mod tests {
         assert_eq!(destination.remote, "origin");
         assert_eq!(
             destination.repository.forks(),
-            &BTreeSet::from([UpstreamName::new("acme/a-repo"), UpstreamName::new("acme/b-repo")])
+            &BTreeSet::from([
+                UpstreamName::new("acme/a-repo"),
+                UpstreamName::new("acme/b-repo")
+            ])
         );
     }
 

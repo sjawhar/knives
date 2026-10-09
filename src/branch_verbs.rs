@@ -16,7 +16,7 @@ use knives::commands::claim::{
 };
 use knives::commands::start::{collides_with_checkout, possesses, workspace_path};
 use knives::config::Registry;
-use knives::ids::{BranchName, BranchTarget, RepoName, Requirement};
+use knives::ids::{BranchName, BranchTarget, Requirement, UpstreamName};
 use knives::jj::{Repo, WorkspaceIdentity, remove_prunable_worktree};
 use knives::ledger::Draft;
 use knives::statement::{Statement, StatementKind};
@@ -70,13 +70,13 @@ enum FinishClaimGate {
 /// Removing the directory loses no work: jj snapshots a working copy into a commit, so
 /// every change made there is already in the repository and reachable by change id. What
 /// does not survive is anything jj never tracked, which is what `--no-cleanup` is for.
-/// `bound` is the entry the current directory is inside, which names a terminal
-/// user acting from a fork's workspace.
+/// `bound` is the fork the current directory is inside, by the name its claims
+/// are kept under, which names a terminal user acting from a fork's workspace.
 pub(crate) fn run_finish(
     fork: &Fork<'_>,
     branch: &BranchName,
     options: &FinishOptions<'_>,
-    bound: Option<&RepoName>,
+    bound: Option<&UpstreamName>,
 ) -> anyhow::Result<Exit> {
     let target = &BranchTarget::new(fork.upstream.clone(), branch.clone());
     let checkout_path = &fork.checkout.path;
@@ -239,7 +239,7 @@ fn finish_claim_gate(
     target: &BranchTarget,
     store: &Store,
     options: &FinishOptions<'_>,
-    bound: Option<&RepoName>,
+    bound: Option<&UpstreamName>,
 ) -> anyhow::Result<FinishClaimGate> {
     let Some(claim) = store
         .claims(Some(&target.repo))
@@ -299,7 +299,7 @@ pub(crate) fn run_track(
     pr: Option<u64>,
     fork_only: bool,
     forget: bool,
-    bound: Option<&RepoName>,
+    bound: Option<&UpstreamName>,
 ) -> anyhow::Result<Exit> {
     let target = &BranchTarget::new(fork.upstream.clone(), branch.clone());
     // Opened for update to hold the lock while the statement is read and the next
@@ -386,7 +386,7 @@ pub(crate) fn run_depends(
     fork: &Fork<'_>,
     branch: &BranchName,
     on: &[String],
-    bound: Option<&RepoName>,
+    bound: Option<&UpstreamName>,
 ) -> anyhow::Result<Exit> {
     let target = &BranchTarget::new(fork.upstream.clone(), branch.clone());
     let mut requirements = Vec::new();

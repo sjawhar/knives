@@ -9,7 +9,7 @@
 // allow: SIZE_OK: claim coordination keeps identity-resolution behavior beside its tests.
 
 use crate::commands::hook::owner_for;
-use crate::ids::RepoName;
+use crate::ids::UpstreamName;
 use crate::store::{Claim, OwnerKind};
 
 /// A claimant and the source that established its name.
@@ -137,14 +137,15 @@ pub const HARNESS_SESSION_VARIABLES: [&str; 3] =
 /// Resolves the identity that should own a claim.
 ///
 /// A harness that names its session (`HARNESS_SESSION_VARIABLES`) is the
-/// identity. When none does, `repo` — the fork the caller already bound
-/// (dispatch binds the working directory once per invocation; a verb passes the
-/// fork it acts on) — can identify its active owner from knives state. The OS
-/// user is the fallback for a human at a terminal.
+/// identity. When none does, `repo` — the fork the caller already bound, by the
+/// name its claims are kept under (dispatch binds the working directory once
+/// per invocation; a verb passes the fork it acts on) — can identify its active
+/// owner from knives state. The OS user is the fallback for a human at a
+/// terminal.
 ///
 /// A blank harness variable is a harness bug, not an identity: every session of
 /// that harness would share one claim.
-pub fn current_identity(repo: Option<&RepoName>) -> anyhow::Result<Identity> {
+pub fn current_identity(repo: Option<&UpstreamName>) -> anyhow::Result<Identity> {
     if let Some(owner) = HARNESS_SESSION_VARIABLES.iter().find_map(|name| {
         std::env::var(name)
             .ok()
@@ -354,7 +355,7 @@ mod tests {
         environment.remove("OMP_SESSION_ID");
         environment.set("USER", "terminal-user");
 
-        let identity = current_identity(Some(&RepoName::new("repo"))).unwrap();
+        let identity = current_identity(Some(&UpstreamName::new("repo"))).unwrap();
 
         assert_eq!(identity.owner, "state-owner");
         assert_eq!(identity.kind, crate::store::OwnerKind::WorkspaceDerived);
@@ -381,7 +382,7 @@ mod tests {
         environment.remove("OMP_SESSION_ID");
         environment.set("USER", "state-owner");
 
-        let identity = current_identity(Some(&RepoName::new("repo"))).unwrap();
+        let identity = current_identity(Some(&UpstreamName::new("repo"))).unwrap();
 
         assert_eq!(identity.kind, crate::store::OwnerKind::OsUser);
     }

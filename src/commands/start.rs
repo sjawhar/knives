@@ -15,7 +15,7 @@ use crate::commands::wip::workspace_for;
 use crate::config::Role;
 use crate::detect::BookmarkTips;
 use crate::ids::{
-    BookmarkRef, BranchName, BranchTarget, CommitId, RemoteName, RepoName, WorkspaceName,
+    BookmarkRef, BranchName, BranchTarget, CommitId, RemoteName, UpstreamName, WorkspaceName,
 };
 use crate::jj::{
     Repo, WorkspaceIdentity, add_workspace, fetch_all, is_workspace_named,
@@ -117,8 +117,9 @@ struct StartContext<'a> {
     opened: Repo,
 }
 
-/// Claim `branch` and open its workspace. `bound` is the entry the current
-/// directory is inside, from which a terminal user's identity is derived.
+/// Claim `branch` and open its workspace. `bound` is the fork the current
+/// directory is inside, by the name its claims are kept under, from which a
+/// terminal user's identity is derived.
 #[allow(
     clippy::too_many_arguments,
     reason = "the fork, the branch, the reason, the override and the cwd binding are independent inputs"
@@ -128,7 +129,7 @@ pub fn run(
     branch: &BranchName,
     why: Option<&str>,
     force: bool,
-    bound: Option<&RepoName>,
+    bound: Option<&UpstreamName>,
 ) -> anyhow::Result<Exit> {
     let repo_name = &fork.name;
     let entry = fork.entry;
