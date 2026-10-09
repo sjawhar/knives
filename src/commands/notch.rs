@@ -305,8 +305,9 @@ fn verify(
 
 pub fn run(request: &Request<'_>, output: crate::cli::Output) -> anyhow::Result<Exit> {
     let repo = &request.fork.name;
+    let upstream = &request.fork.upstream;
     let path = &request.fork.checkout.path;
-    let ledger = Ledger::for_repo(repo);
+    let ledger = Ledger::for_repo(upstream);
     let report = match request.message {
         Some(text) => {
             // The store is read, never written: a notch changes no intent, and a
@@ -317,7 +318,7 @@ pub fn run(request: &Request<'_>, output: crate::cli::Output) -> anyhow::Result<
                 && request
                     .subject
                     .is_some_and(|subject| !subject.starts_with('#'));
-            let fork = [repo];
+            let fork = [upstream];
             let store = Store::open(
                 default_state_path(),
                 if asks_stated_pull { &fork } else { &[] },
@@ -331,13 +332,13 @@ pub fn run(request: &Request<'_>, output: crate::cli::Output) -> anyhow::Result<
                         .filter(|subject| !subject.starts_with('#'))
                         .and_then(|subject| {
                             store.tracked_pull(&BranchTarget::new(
-                                repo.clone(),
+                                upstream.clone(),
                                 BranchName::new(subject),
                             ))
                         })
                 });
             let owner = current_identity(request.bound)?.owner;
-            let scribe = Scribe::new(ledger, repo.clone(), path.clone(), owner);
+            let scribe = Scribe::new(ledger, upstream.clone(), path.clone(), owner);
             let written = scribe.record(&Draft {
                 subject: request.subject,
                 kind: Kind::Note,

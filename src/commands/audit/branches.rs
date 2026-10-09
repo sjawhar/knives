@@ -244,7 +244,7 @@ pub(super) fn add_branch_facts(
                     .cloned(),
                 input
                     .store
-                    .is_fork_only(&BranchTarget::new(fork.name.clone(), branch)),
+                    .is_fork_only(&BranchTarget::new(fork.upstream.clone(), branch)),
             )
         })
         .collect();

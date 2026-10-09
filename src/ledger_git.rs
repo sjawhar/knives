@@ -1,13 +1,14 @@
 //! Ledger entries between machines, through git, without git's index or a
 //! checkout.
 //!
-//! The ledger root, one directory per fork, is the working tree of one or
-//! more git repositories that git never stages into, checks out, or rewrites.
-//! Each [`Repository`] carries the forks it names and no others: an entry is
-//! about one fork, and the fork decides which remote may see it. Each machine
-//! commits the entries it wrote to its own ref, `refs/knives/<machine>`; a
-//! fetch copies every machine's ref to `refs/knives-remotes/<remote>/<machine>`;
-//! materialising writes the entries the directory lacks.
+//! The ledger root, one `<owner>/<name>` directory per fork, is the working
+//! tree of one or more git repositories that git never stages into, checks
+//! out, or rewrites. Each [`Repository`] carries the forks it names and no
+//! others: an entry is about one fork, and the fork decides which remote may
+//! see it. Each machine commits the entries it wrote to its own ref,
+//! `refs/knives/<machine>`; a fetch copies every machine's ref to
+//! `refs/knives-remotes/<remote>/<machine>`; materialising writes the entries
+//! the directory lacks.
 //!
 //! Only plumbing runs here. A repository has one `.git/index` and one lock on
 //! it, so staging entries with `git add` makes concurrent writers contend for
@@ -26,7 +27,7 @@ use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
-use crate::ids::{CommitId, RepoName};
+use crate::ids::{CommitId, UpstreamName};
 
 /// Each machine's own ref: `refs/knives/<machine>`.
 const OWN: &str = "refs/knives/";
@@ -52,17 +53,18 @@ pub struct MachineRef {
 pub struct Repository {
     git_dir: PathBuf,
     work_tree: PathBuf,
-    forks: BTreeSet<RepoName>,
+    forks: BTreeSet<UpstreamName>,
 }
 
 impl Repository {
     /// The repository at `git_dir` over the ledger root `work_tree`, carrying
-    /// `forks`. A fork name that is not one directory name in the root is
-    /// refused: it would reach entries outside that fork's directory.
+    /// `forks`. A fork name that is not exactly two directory names in the
+    /// root, `<owner>/<name>`, is refused: it would reach entries outside
+    /// that fork's directory, or inside another fork's.
     pub fn new(
         git_dir: &Path,
         work_tree: &Path,
-        forks: impl IntoIterator<Item = RepoName>,
+        forks: impl IntoIterator<Item = UpstreamName>,
     ) -> Result<Self, GitError> {
         let absolute = |path: &Path| {
             std::path::absolute(path).map_err(|source| GitError::Read {
@@ -88,19 +90,25 @@ impl Repository {
         &self.work_tree
     }
 
-    pub const fn forks(&self) -> &BTreeSet<RepoName> {
+    pub const fn forks(&self) -> &BTreeSet<UpstreamName> {
         &self.forks
     }
 
     /// Whether the entry at `path`, relative to the root, lies in the
-    /// directory of a fork this repository carries.
+    /// `<owner>/<name>` directory of a fork this repository carries.
     fn carries_entry(&self, path: &Path) -> bool {
         let mut components = path.components();
-        matches!(
-            (components.next(), components.next()),
-            (Some(Component::Normal(fork)), Some(_))
-                if self.forks.iter().any(|carried| fork == OsStr::new(carried.as_str()))
-        )
+        match (components.next(), components.next(), components.next()) {
+            (
+                Some(Component::Normal(owner)),
+                Some(Component::Normal(name)),
+                Some(Component::Normal(_)),
+            ) => self
+                .forks
+                .iter()
+                .any(|carried| Path::new(carried.as_str()) == Path::new(owner).join(name)),
+            _ => false,
+        }
     }
 
     /// `git` on this repository, run in the ledger root.
@@ -130,7 +138,8 @@ pub enum GitError {
     )]
     Name { role: &'static str, name: String },
     #[error(
-        "refusing fork name {name:?}: it must be one directory name in the ledger root, other than .git"
+        "refusing fork name {name:?}: it must be two directory names in the ledger root, \
+         <owner>/<name>, neither of them .git"
     )]
     Fork { name: String },
     #[error("running {invocation}: {source}")]
@@ -551,20 +560,30 @@ fn ref_component<'a>(role: &'static str, name: &'a str) -> Result<&'a str, GitEr
     }
 }
 
-/// `fork` when it names exactly one directory in the ledger root, as a
-/// registry key must ([`crate::config::load`]), and not a `.git`.
-fn fork_directory(fork: RepoName) -> Result<RepoName, GitError> {
-    let name = fork.as_str();
-    let plain = !name.is_empty()
-        && name != "."
-        && name != ".."
-        && !name.contains(['/', '\\'])
-        && !name.eq_ignore_ascii_case(".git");
-    if plain {
+/// `fork` when it names exactly two directories in the ledger root,
+/// `<owner>/<name>` as [`crate::config::RepoEntry::upstream_name`] spells a
+/// fork's repository, neither of them `.`, `..` or a `.git`.
+///
+/// A fork whose upstream is a filesystem path is kept under its one-component
+/// registry key, and names no repository a destination could share, so a
+/// name of one component is refused here as surely as one of three.
+fn fork_directory(fork: UpstreamName) -> Result<UpstreamName, GitError> {
+    let plain = |part: &str| {
+        !part.is_empty()
+            && part != "."
+            && part != ".."
+            && !part.contains('\\')
+            && !part.eq_ignore_ascii_case(".git")
+    };
+    let two = fork
+        .as_str()
+        .split_once('/')
+        .is_some_and(|(owner, name)| plain(owner) && plain(name) && !name.contains('/'));
+    if two {
         Ok(fork)
     } else {
         Err(GitError::Fork {
-            name: name.to_owned(),
+            name: fork.to_string(),
         })
     }
 }
@@ -1032,6 +1051,28 @@ mod tests {
         ] {
             assert!(
                 matches!(ref_component("machine", name), Err(GitError::Name { .. })),
+                "{name:?} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn a_fork_is_exactly_an_owner_and_a_name() {
+        for name in ["metr/hawk", "ukgovernmentbeis/inspect_ai", "a.b/c-d"] {
+            assert_eq!(
+                fork_directory(UpstreamName::new(name)).unwrap().as_str(),
+                name
+            );
+        }
+        for name in [
+            "", "hawk", "metr/", "/hawk", "metr/hawk/x", "../hawk", "metr/..", "./hawk",
+            ".git/hawk", "metr/.GIT", "metr\\hawk/x", "metr/ha\\wk",
+        ] {
+            assert!(
+                matches!(
+                    fork_directory(UpstreamName::new(name)),
+                    Err(GitError::Fork { .. })
+                ),
                 "{name:?} was accepted"
             );
         }

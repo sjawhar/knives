@@ -11,7 +11,7 @@ use crate::config::{RepoEntry, Role};
 use crate::detect::{BookmarkTips, Finding, FindingKind, Subject};
 use crate::forge::{Forge, PullRequest};
 use crate::ids::{
-    BookmarkRef, BranchName, BranchTarget, CommitId, RepoName, is_release_name, short_id,
+    BookmarkRef, BranchName, BranchTarget, CommitId, UpstreamName, is_release_name, short_id,
 };
 use crate::jj::{self, Repo};
 use crate::ledger::{Entry, Ledger};
@@ -128,7 +128,7 @@ pub fn gather(input: &AuditInput<'_>) -> Report {
         }
     };
     let requested: Vec<BranchName> = local.keys().cloned().collect();
-    let tracked = tracked(input.store, &fork.name, &requested);
+    let tracked = tracked(input.store, &fork.upstream, &requested);
     let rows = pushed::reconcile(&ReconcileInput {
         tips_local: &local,
         origin_refs: live.origin(),
@@ -141,7 +141,7 @@ pub fn gather(input: &AuditInput<'_>) -> Report {
     report.findings.extend(zombie_branches(&ZombieInput {
         entry,
         store: input.store,
-        repo: &fork.name,
+        repo: &fork.upstream,
         local: &local,
         live: &live,
         scheme: &scheme,
@@ -153,7 +153,7 @@ pub fn gather(input: &AuditInput<'_>) -> Report {
             published: live.release(),
             scheme: &scheme,
             publish_remote: entry.publish_remote(),
-            ledger: &Ledger::for_repo(&fork.name),
+            ledger: &Ledger::for_repo(&fork.upstream),
         },
     );
     add_misplaced_origin_release_refs(&mut report, live.origin(), &scheme, entry.publish_remote());
@@ -232,7 +232,11 @@ fn add_unconfigured_remote_refs(
     );
 }
 
-fn tracked(store: &Store, repo: &RepoName, branches: &[BranchName]) -> BTreeMap<BranchName, u64> {
+fn tracked(
+    store: &Store,
+    repo: &UpstreamName,
+    branches: &[BranchName],
+) -> BTreeMap<BranchName, u64> {
     branches
         .iter()
         .filter_map(|branch| {
@@ -266,7 +270,7 @@ const fn pushed_finding(verdict: &pushed::Verdict) -> bool {
 struct ZombieInput<'a> {
     entry: &'a RepoEntry,
     store: &'a Store,
-    repo: &'a RepoName,
+    repo: &'a UpstreamName,
     local: &'a BTreeMap<BranchName, CommitId>,
     live: &'a pushed::LiveRefs,
     scheme: &'a crate::ids::ReleaseScheme,
@@ -756,7 +760,7 @@ mod tests {
     ) -> Result<(), ForgeError> {
         let temp = tempfile::tempdir().expect("create test store");
         let store =
-            Store::open(temp.path().join("state.json"), &[&fork.name]).expect("open test store");
+            Store::open(temp.path().join("state.json"), &[&fork.upstream]).expect("open test store");
         pull_head_findings(
             &audit_input(fork, &store, Some(forge), None),
             forge,
@@ -1099,7 +1103,7 @@ mod tests {
         };
         let temp = tempfile::tempdir().expect("create test cache");
         let store =
-            Store::open(temp.path().join("state.json"), &[&fork.name]).expect("open test store");
+            Store::open(temp.path().join("state.json"), &[&fork.upstream]).expect("open test store");
         let mut report = Report::new("demo");
 
         add_open_pull_head_checks(
@@ -1129,7 +1133,7 @@ mod tests {
         let blocked_root = temp.path().join("blocked-cache-root");
         std::fs::write(&blocked_root, "not a directory").expect("block cache root");
         let store =
-            Store::open(temp.path().join("state.json"), &[&fork.name]).expect("open test store");
+            Store::open(temp.path().join("state.json"), &[&fork.upstream]).expect("open test store");
         let mut report = Report::new("demo");
 
         add_open_pull_head_checks(
@@ -1157,7 +1161,7 @@ mod tests {
         };
         let temp = tempfile::tempdir().expect("create test store");
         let store =
-            Store::open(temp.path().join("state.json"), &[&fork.name]).expect("open test store");
+            Store::open(temp.path().join("state.json"), &[&fork.upstream]).expect("open test store");
         let mut report = Report::new("demo");
 
         add_open_pull_head_checks(

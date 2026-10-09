@@ -166,7 +166,7 @@ pub fn gather(fork: &Fork<'_>, store: &Store, named: &[String]) -> Report {
         .iter()
         .filter_map(|branch| {
             store
-                .tracked_pull(&BranchTarget::new(repo.clone(), branch.clone()))
+                .tracked_pull(&BranchTarget::new(fork.upstream.clone(), branch.clone()))
                 .map(|number| (branch.clone(), number))
         })
         .collect();

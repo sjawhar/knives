@@ -15,7 +15,7 @@ use crate::forge::{
     ChecksSummary, Forge, PullDetails, PullIndex, PullRequest, PullSummary, index_pulls,
 };
 use crate::ids::{
-    BookmarkRef, BranchName, BranchTarget, CommitId, ReleaseScheme, RepoName, is_release_name,
+    BookmarkRef, BranchName, BranchTarget, CommitId, ReleaseScheme, UpstreamName, is_release_name,
     pull_number_from_bookmark, short_id,
 };
 use crate::jj::{JjError, Repo, probe_landed, repo_config_path, repo_immutable_heads};
@@ -757,7 +757,7 @@ fn fold_phase_outcome(
     timings.forge = phases.forge.duration;
     timings.probes = phases.probe.duration;
 
-    let name = &input.fork.name;
+    let name = &input.fork.upstream;
     let entry = input.fork.entry;
     let phase = std::time::Instant::now();
     let origin_phase = phases::origin_phase(
@@ -879,6 +879,7 @@ pub fn gather_timed(
     options: &Options<'_>,
 ) -> anyhow::Result<(Report, Timings)> {
     let name = &fork.name;
+    let upstream = &fork.upstream;
     let entry = fork.entry;
     let path = &fork.checkout.path;
     let started = std::time::Instant::now();
@@ -917,7 +918,7 @@ pub fn gather_timed(
         .map(|input| input.branch.clone())
         .collect();
     all_branches.extend(divergent_branches.keys().cloned());
-    let declared = phases::declared_numbers(name, &all_branches, store);
+    let declared = phases::declared_numbers(upstream, &all_branches, store);
     let notches = notches_from_ledger(options.ledger, &mut report);
     report.repo_notches = repo_notches(&notches);
     note_fetched_heads(&mut report, fetched_heads);

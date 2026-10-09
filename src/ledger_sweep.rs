@@ -20,7 +20,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
-use crate::ids::RepoName;
+use crate::ids::UpstreamName;
 use crate::ledger_git::{self, GitError, Repository};
 use crate::lock::{FileLock, LockError, LockWait};
 
@@ -66,11 +66,8 @@ impl Destination {
         self.repository.git_dir().join("knives-transport")
     }
 
-    fn carries(&self, fork: &str) -> bool {
-        self.repository
-            .forks()
-            .iter()
-            .any(|carried| carried.as_str() == fork)
+    fn carries(&self, fork: &UpstreamName) -> bool {
+        self.repository.forks().contains(fork)
     }
 
     fn describe(&self) -> String {
@@ -83,7 +80,7 @@ impl Destination {
 /// Provisional. Today the one candidate is the repository at `<root>/.git`,
 /// and what it carries is read from that repository's own git config:
 /// `knives.machine`, this machine's name among those sharing its remote, and
-/// `knives.fork`, once per fork it carries. `repos.toml` replaces this
+/// `knives.fork`, once per fork it carries, as its `<owner>/<name>`. `repos.toml` replaces this
 /// function: each fork's registry entry names the repository its ledger
 /// belongs to, and these git-config keys are then deleted, not kept beside it
 /// as a fallback, so that which forks a repository carries has one source.
@@ -115,7 +112,7 @@ pub fn destinations(root: &Path) -> Result<Vec<Destination>, SweepError> {
     for (key, value) in config {
         match key.as_str() {
             "knives.machine" => machine = Some(value),
-            "knives.fork" => forks.push(RepoName::new(value)),
+            "knives.fork" => forks.push(UpstreamName::new(value)),
             _ => {
                 return Err(refused(format!(
                     "sets {key}, which knives does not read; it reads knives.machine and \
@@ -345,28 +342,31 @@ fn record(root: &Path, problems: &[String]) -> Result<(), SweepError> {
 pub struct Pulled {
     root: PathBuf,
     destinations: Vec<Destination>,
-    problems: BTreeMap<RepoName, Vec<String>>,
+    problems: BTreeMap<UpstreamName, Vec<String>>,
 }
 
 impl Pulled {
     /// The problems a report about `fork` carries: a pull that failed, or
     /// destinations that could not be read.
-    pub fn problems_for(&self, fork: &str) -> Vec<String> {
-        self.problems
-            .get(&RepoName::new(fork))
-            .cloned()
-            .unwrap_or_default()
+    pub fn problems_for(&self, fork: &UpstreamName) -> Vec<String> {
+        self.problems.get(fork).cloned().unwrap_or_default()
     }
 
     /// How many of `fork`'s entries its remote does not have yet, and where
     /// the last sweep's failures are when it failed; `None` when neither.
-    pub fn backlog_for(&self, fork: &str) -> Option<String> {
+    pub fn backlog_for(&self, fork: &UpstreamName) -> Option<String> {
         let destination = self
             .destinations
             .iter()
             .find(|destination| destination.carries(fork))?;
-        let unsent = ledger_git::unsent(&destination.repository, &destination.remote)
-            .map(|paths| paths.iter().filter(|path| path.starts_with(fork)).count());
+        let unsent = ledger_git::unsent(&destination.repository, &destination.remote).map(
+            |paths| {
+                paths
+                    .iter()
+                    .filter(|path| path.starts_with(fork.as_str()))
+                    .count()
+            },
+        );
         let log = sweep_log(&self.root);
         let failed = log
             .exists()
@@ -395,7 +395,7 @@ impl Pulled {
 
 /// Pull the ledgers of `forks` from every destination that carries one,
 /// before a command decides something from them.
-pub fn pull(forks: &[&RepoName]) -> Pulled {
+pub fn pull(forks: &[&UpstreamName]) -> Pulled {
     pull_at(&crate::ledger::default_ledger_root(), forks)
 }
 
@@ -405,7 +405,7 @@ pub fn pull(forks: &[&RepoName]) -> Pulled {
 /// sweep reads what the sweep left rather than failing on it. A failure is a
 /// problem for every fork asked about that the destination carries, never an
 /// error: the command still answers from the entries this machine has.
-pub fn pull_at(root: &Path, forks: &[&RepoName]) -> Pulled {
+pub fn pull_at(root: &Path, forks: &[&UpstreamName]) -> Pulled {
     let mut pulled = Pulled {
         root: root.to_owned(),
         ..Pulled::default()
@@ -426,13 +426,13 @@ pub fn pull_at(root: &Path, forks: &[&RepoName]) -> Pulled {
             return pulled;
         }
     };
-    let asked: BTreeSet<&str> = forks.iter().map(|fork| fork.as_str()).collect();
+    let asked: BTreeSet<&UpstreamName> = forks.iter().copied().collect();
     for destination in found {
-        let carried: Vec<&RepoName> = destination
+        let carried: Vec<&UpstreamName> = destination
             .repository
             .forks()
             .iter()
-            .filter(|fork| asked.contains(fork.as_str()))
+            .filter(|fork| asked.contains(fork))
             .collect();
         if carried.is_empty() {
             continue;
@@ -540,7 +540,7 @@ mod tests {
     #[test]
     fn forks_with_no_machine_name_are_refused_with_the_command_that_names_one() {
         let (_home, root) = ledger_root();
-        git(&root.join(".git"), &["config", "knives.fork", "a-repo"]);
+        git(&root.join(".git"), &["config", "knives.fork", "acme/a-repo"]);
 
         let error = destinations(&root).unwrap_err().to_string();
 
@@ -570,8 +570,8 @@ mod tests {
         let (_home, root) = ledger_root();
         let git_dir = root.join(".git");
         git(&git_dir, &["config", "knives.machine", "alpha"]);
-        git(&git_dir, &["config", "--add", "knives.fork", "a-repo"]);
-        git(&git_dir, &["config", "--add", "knives.fork", "b-repo"]);
+        git(&git_dir, &["config", "--add", "knives.fork", "acme/a-repo"]);
+        git(&git_dir, &["config", "--add", "knives.fork", "acme/b-repo"]);
 
         let found = destinations(&root).unwrap();
 
@@ -581,7 +581,7 @@ mod tests {
         assert_eq!(destination.remote, "origin");
         assert_eq!(
             destination.repository.forks(),
-            &BTreeSet::from([RepoName::new("a-repo"), RepoName::new("b-repo")])
+            &BTreeSet::from([UpstreamName::new("acme/a-repo"), UpstreamName::new("acme/b-repo")])
         );
     }
 
@@ -596,10 +596,11 @@ mod tests {
             &["remote", "add", "origin", "/nonexistent/remote.git"],
         );
 
-        let pulled = pull_at(&root, &[&RepoName::new("a-repo")]);
+        let a_repo = UpstreamName::new("acme/a-repo");
+        let pulled = pull_at(&root, &[&a_repo]);
 
-        assert!(pulled.problems_for("a-repo").is_empty());
-        assert_eq!(pulled.backlog_for("a-repo"), None);
+        assert!(pulled.problems_for(&a_repo).is_empty());
+        assert_eq!(pulled.backlog_for(&a_repo), None);
     }
 
     #[test]
@@ -607,15 +608,19 @@ mod tests {
         let (_home, root) = ledger_root();
         let git_dir = root.join(".git");
         git(&git_dir, &["config", "knives.machine", "alpha"]);
-        git(&git_dir, &["config", "knives.fork", "a-repo"]);
+        git(&git_dir, &["config", "knives.fork", "acme/a-repo"]);
         git(
             &git_dir,
             &["remote", "add", "origin", "/nonexistent/remote.git"],
         );
 
-        let pulled = pull_at(&root, &[&RepoName::new("a-repo"), &RepoName::new("b-repo")]);
+        let (a_repo, b_repo) = (
+            UpstreamName::new("acme/a-repo"),
+            UpstreamName::new("acme/b-repo"),
+        );
+        let pulled = pull_at(&root, &[&a_repo, &b_repo]);
 
-        let problems = pulled.problems_for("a-repo");
+        let problems = pulled.problems_for(&a_repo);
         assert_eq!(problems.len(), 1, "{problems:?}");
         assert!(
             problems
@@ -623,6 +628,6 @@ mod tests {
                 .all(|problem| problem.contains("could not pull the ledger from origin")),
             "{problems:?}"
         );
-        assert!(pulled.problems_for("b-repo").is_empty());
+        assert!(pulled.problems_for(&b_repo).is_empty());
     }
 }

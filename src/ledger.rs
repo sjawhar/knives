@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use serde::{Deserialize, Serialize};
 
 use crate::config::default_config_path;
-use crate::ids::RepoName;
+use crate::ids::UpstreamName;
 use crate::statement::Statement;
 
 /// The directory holding every repository's ledger, beside `state.json`.
@@ -35,13 +35,25 @@ pub fn default_ledger_root() -> PathBuf {
     default_config_path().with_file_name("ledger")
 }
 
-/// Where a repository's ledger lives: a directory of entry files beside
-/// `state.json`.
+/// Where a fork's ledger lives: `<owner>/<name>/` of the repository it is a
+/// fork of ([`crate::config::RepoEntry::upstream_name`]), a directory of entry
+/// files beside `state.json`.
+///
+/// The name is lowercase, owner and repository both, and must stay so. GitHub
+/// treats an owner and a repository name case-insensitively, and so does
+/// knives everywhere it compares remotes ([`crate::remote_url::same_remote`]
+/// uses `eq_ignore_ascii_case`): two machines whose `repos.toml` spells
+/// `metr/hawk` and `METR/hawk` check out one repository. Spelled as written,
+/// they would file that repository's entries in two directories on a
+/// case-sensitive filesystem, each machine reading only its own half, and the
+/// ledger would diverge without a word. That divergence is what naming a
+/// ledger after its upstream repository exists to end; the capitals are not
+/// to come back for tidiness.
 ///
 /// Each entry is immutable, so concurrent writers never share a file and a git
 /// history over the directory is pure additions.
-pub fn default_ledger_path(repo: &RepoName) -> PathBuf {
-    default_ledger_root().join(repo.to_string())
+pub fn default_ledger_path(repo: &UpstreamName) -> PathBuf {
+    default_ledger_root().join(repo.as_str())
 }
 
 /// Set once this process has appended an entry; see [`appended`].
@@ -258,8 +270,8 @@ pub struct Ledger {
 }
 
 impl Ledger {
-    /// A repository's ledger at the default location.
-    pub fn for_repo(repo: &RepoName) -> Self {
+    /// A fork's ledger at the default location.
+    pub fn for_repo(repo: &UpstreamName) -> Self {
         Self::at(default_ledger_path(repo))
     }
 
@@ -564,7 +576,7 @@ impl<'a> Draft<'a> {
 #[derive(Debug)]
 pub struct Scribe {
     ledger: Ledger,
-    repo: RepoName,
+    repo: UpstreamName,
     /// The checkout whose refs anchor entries; none for a writer acting on the
     /// ledger alone.
     checkout: Option<PathBuf>,
@@ -572,7 +584,7 @@ pub struct Scribe {
 }
 
 impl Scribe {
-    pub const fn new(ledger: Ledger, repo: RepoName, path: PathBuf, owner: String) -> Self {
+    pub const fn new(ledger: Ledger, repo: UpstreamName, path: PathBuf, owner: String) -> Self {
         Self {
             ledger,
             repo,
@@ -583,7 +595,7 @@ impl Scribe {
 
     /// A writer with no checkout of the fork to ask, whose entries carry no
     /// anchor.
-    pub const fn unanchored(ledger: Ledger, repo: RepoName, owner: String) -> Self {
+    pub const fn unanchored(ledger: Ledger, repo: UpstreamName, owner: String) -> Self {
         Self {
             ledger,
             repo,
@@ -592,7 +604,7 @@ impl Scribe {
         }
     }
 
-    pub const fn repo(&self) -> &RepoName {
+    pub const fn repo(&self) -> &UpstreamName {
         &self.repo
     }
 
@@ -1005,14 +1017,18 @@ mod tests {
     }
 
     #[test]
-    fn a_repos_ledger_is_a_directory_beside_the_state_file() {
+    fn a_forks_ledger_is_its_upstream_directory_beside_the_state_file() {
         let _lock = crate::config::test_support::environment_lock();
         let environment =
             crate::config::test_support::EnvironmentGuard::capture(&["KNIVES_CONFIG_HOME"]);
         environment.set("KNIVES_CONFIG_HOME", "/tmp/knives-home");
+        let entry = crate::config::RepoEntry::new(
+            "https://github.com/METR/Hawk.git",
+            "https://github.com/ours/hawk.git",
+        );
         assert_eq!(
-            default_ledger_path(&RepoName::new("a-repo")),
-            std::path::PathBuf::from("/tmp/knives-home/ledger/a-repo")
+            default_ledger_path(&entry.upstream_name("h")),
+            std::path::PathBuf::from("/tmp/knives-home/ledger/metr/hawk")
         );
     }
 
@@ -1309,7 +1325,7 @@ mod tests {
     fn scribe(dir: &std::path::Path) -> Scribe {
         Scribe::new(
             Ledger::at(dir.join("ledger").join("a-repo")),
-            RepoName::new("a-repo"),
+            UpstreamName::new("a-repo"),
             dir.join("not-a-repository"),
             "ses_fff688".to_owned(),
         )
@@ -1385,7 +1401,7 @@ mod tests {
         std::fs::write(&path, "a file where the ledger directory should be").unwrap();
         let blocked = Scribe::new(
             Ledger::at(path),
-            RepoName::new("a-repo"),
+            UpstreamName::new("a-repo"),
             dir.path().to_owned(),
             "ses_fff688".to_owned(),
         )

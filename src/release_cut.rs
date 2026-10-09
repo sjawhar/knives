@@ -140,6 +140,7 @@ pub(crate) fn run_release(
         // record of a parent set that survives the bookmark moving, so every
         // subject is held against it before anything is recorded or published.
         let gate = CompositionGate {
+            ledger: Ledger::for_repo(&fork.upstream),
             opened: &opened,
             path,
             parents: &request.parents,
@@ -183,7 +184,7 @@ pub(crate) fn run_release(
                     );
                 } else if matches!(scheme, ReleaseScheme::Fixed(_))
                     && let previous_recorded =
-                        last_recorded_cut(&Ledger::for_repo(repo).entries()?, None)
+                        last_recorded_cut(&gate.ledger.entries()?, None)
                     && previous_recorded
                         .as_ref()
                         .is_none_or(|recorded| recorded.commit != *published)
@@ -374,6 +375,8 @@ fn report_cut_audit(repo: &RepoName, audit: &release::CutAudit) -> Option<Exit> 
 /// The composition gate's inputs: everything the recorded-member check reads
 /// beside the cut subject.
 struct CompositionGate<'a> {
+    /// The fork's ledger, where the previous cut's composition is recorded.
+    ledger: Ledger,
     opened: &'a knives::jj::Repo,
     path: &'a std::path::Path,
     parents: &'a [knives::ids::CommitId],
@@ -392,7 +395,7 @@ fn recorded_composition_check(
     gate: &CompositionGate<'_>,
     allow_drop: bool,
 ) -> anyhow::Result<Result<(Option<RecordedCut>, release::CompositionCheck), Exit>> {
-    let recorded = last_recorded_cut(&Ledger::for_repo(repo).entries()?, None);
+    let recorded = last_recorded_cut(&gate.ledger.entries()?, None);
     let check = match &recorded {
         Some(recorded) => release::uncarried_recorded_members(
             gate.opened,

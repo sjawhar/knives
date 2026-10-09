@@ -137,7 +137,7 @@ pub fn run(
         eprintln!("{repo_name}: {line}");
         return Ok(Exit::Usage);
     }
-    let mut store = Store::open_for_update(default_state_path(), &[repo_name])?;
+    let mut store = Store::open_for_update(default_state_path(), &[&fork.upstream])?;
     let cwd = std::env::current_dir()?;
     let destination = workspace_path(fork, branch);
     let in_claimed_workspace = possesses(&cwd, fork, branch);
@@ -179,7 +179,7 @@ pub fn run(
     }
     let held = context
         .store
-        .claims(Some(repo_name))
+        .claims(Some(&fork.upstream))
         .into_iter()
         .find(|claim| claim.branch == branch.as_str())
         .cloned();
@@ -292,8 +292,8 @@ fn resume_claim(
         "resumed"
     };
     Scribe::new(
-        Ledger::for_repo(&context.fork.name),
-        context.fork.name.clone(),
+        Ledger::for_repo(&context.fork.upstream),
+        context.fork.upstream.clone(),
         context.fork.checkout.path.clone(),
         context.identity.owner.clone(),
     )
@@ -301,7 +301,7 @@ fn resume_claim(
         Some(context.branch.as_str()),
         event.to_owned(),
         context.store.tracked_pull(&BranchTarget::new(
-            context.fork.name.clone(),
+            context.fork.upstream.clone(),
             context.branch.clone(),
         )),
     )?;
@@ -375,12 +375,12 @@ fn take_claim(context: &mut StartContext<'_>, reason: &str) -> anyhow::Result<Ex
 }
 
 fn record_claim(context: &mut StartContext<'_>, reason: &str, event: String) -> anyhow::Result<()> {
-    let target = BranchTarget::new(context.fork.name.clone(), context.branch.clone());
+    let target = BranchTarget::new(context.fork.upstream.clone(), context.branch.clone());
     let pull = context.store.tracked_pull(&target);
     let _ = context.store.claim(&target, &context.identity, reason);
     Scribe::new(
-        Ledger::for_repo(&context.fork.name),
-        context.fork.name.clone(),
+        Ledger::for_repo(&context.fork.upstream),
+        context.fork.upstream.clone(),
         context.fork.checkout.path.clone(),
         context.identity.owner.clone(),
     )

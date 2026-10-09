@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::commands::status::{BranchRow, ClaimCell, LastNotch, RepoNotches, Report, SeenWindow};
 use crate::detect::{Finding, FindingKind, Subject};
-use crate::ids::{BranchName, RepoName, WorkspaceName};
+use crate::ids::{BranchName, UpstreamName, WorkspaceName};
 use crate::jj::{MAX_ACTIVITY_OPS, Repo, WorkspaceActivity};
 use crate::ledger::{Entry as Notch, Ledger};
 use crate::seen::{LastSeen, Seen, last_seen};
@@ -66,7 +66,7 @@ pub(super) fn claim_last_seen(
 #[derive(Clone, Copy)]
 pub(super) struct ClaimFoldInput<'a> {
     pub(super) repo: &'a Repo,
-    pub(super) name: &'a RepoName,
+    pub(super) name: &'a UpstreamName,
     pub(super) store: &'a Store,
     pub(super) seen: &'a Seen,
     pub(super) tips: &'a crate::detect::BookmarkTips,

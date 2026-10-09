@@ -2,7 +2,7 @@ use super::{
     BTreeMap, BookmarkRef, BookmarkTips, BranchName, BranchRow, BranchState, BranchTarget,
     ChecksSummary, CommitId, Finding, FindingKind, JjError, LandedVerdict, LastNotch, Notch,
     OriginRelation, PriorPull, PullCell, PullDetails, PullIndex, PullRequest, PullSummary,
-    PushRelation, ReleaseScheme, Repo, RepoEntry, RepoName, Report, Store, Subject, fmt,
+    PushRelation, ReleaseScheme, Repo, RepoEntry, Report, Store, Subject, UpstreamName, fmt,
     is_release_name, pull_number_from_bookmark,
 };
 
@@ -439,7 +439,7 @@ pub(super) fn divergent_branches(
 pub(super) struct DivergentInput<'a, 'snapshot> {
     pub(super) branches: &'a [BranchName],
     pub(super) tips: &'a BookmarkTips,
-    pub(super) name: &'a RepoName,
+    pub(super) name: &'a UpstreamName,
     pub(super) store: &'a Store,
     pub(super) snapshot: Option<&'a crate::snapshot::CompletedSnapshot<'snapshot>>,
     pub(super) index: &'a PullIndex,
@@ -448,7 +448,7 @@ pub(super) struct DivergentInput<'a, 'snapshot> {
 }
 
 struct RowContext<'a, 'snapshot> {
-    name: &'a RepoName,
+    name: &'a UpstreamName,
     store: &'a Store,
     index: &'a PullIndex,
     snapshot: Option<&'a crate::snapshot::CompletedSnapshot<'snapshot>>,
@@ -607,7 +607,7 @@ fn record_origin_relation<E: fmt::Display>(
 
 /// Everything the maintained-branch row loop needs after the two concurrent phases end.
 pub(super) struct RowInput<'a, 'snapshot> {
-    pub(super) name: &'a RepoName,
+    pub(super) name: &'a UpstreamName,
     pub(super) store: &'a Store,
     pub(super) probe_inputs: Vec<ProbeInput>,
     pub(super) verdicts: Vec<Result<Option<LandedVerdict>, JjError>>,

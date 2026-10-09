@@ -184,13 +184,20 @@ impl RepoEntry {
         }
     }
 
-    /// The name this fork's ledger and state are kept under: `<owner>/<name>`
-    /// of its `upstream`, as the registry spells it, so every machine keys
-    /// them alike whatever its registry calls the fork. An `upstream` that is
-    /// not a forge URL (a filesystem path) names no repository another
-    /// machine could share, and the fork is kept under its registry `key`.
+    /// The name this fork's ledger directory and its state are kept under:
+    /// `<owner>/<name>` of its `upstream`, lowercased, so every machine keys
+    /// them alike whatever its registry calls the fork or however it spells
+    /// the owner. [`crate::ledger::default_ledger_path`] says why the case
+    /// goes.
+    ///
+    /// An `upstream` that is not a forge URL (a filesystem path) names no
+    /// repository another machine could share, and the fork is kept under its
+    /// registry `key`, as spelled.
     pub fn upstream_name(&self, key: &str) -> UpstreamName {
-        UpstreamName::new(crate::remote_url::remote_slug(&self.upstream).unwrap_or(key))
+        UpstreamName::new(
+            crate::remote_url::remote_slug(&self.upstream)
+                .map_or_else(|| key.to_owned(), str::to_ascii_lowercase),
+        )
     }
 
     /// The branch upstream treats as its trunk: what we fork from, measure
@@ -404,6 +411,21 @@ impl Registry {
             },
             |(key, entry)| Some((RepoName::new(key.as_str()), entry, entry.upstream_name(key))),
         )
+    }
+
+    /// Each registry key that is not the name its fork's ledger and state are
+    /// kept under, with that name: what an older knives, which kept them
+    /// under the registry key, left for `knives ledger migrate` to rename. A
+    /// fork whose upstream is a filesystem path is kept under its key still,
+    /// and is not listed.
+    pub fn former_names(&self) -> BTreeMap<String, UpstreamName> {
+        self.repos
+            .iter()
+            .filter_map(|(key, entry)| {
+                let upstream = entry.upstream_name(key);
+                (upstream.as_str() != key).then(|| (key.clone(), upstream))
+            })
+            .collect()
     }
 }
 

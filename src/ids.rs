@@ -42,7 +42,7 @@ string_id!(CommitId, "One concrete commit. A change may have several.");
 string_id!(RepoName, "A managed repo's name in the registry: the command-line shorthand.");
 string_id!(
     UpstreamName,
-    "The repository a fork is a fork of, as `<owner>/<name>`: what a fork's ledger directory and its state are kept under, so every machine keys them alike whatever its registry calls the fork. An upstream that is a filesystem path names no forge repository, and the fork's registry key is its name. See [`crate::config::RepoEntry::upstream_name`]."
+    "The repository a fork is a fork of, as lowercase `<owner>/<name>`: what a fork's ledger directory and its state are kept under, so every machine keys them alike whatever its registry calls the fork. An upstream that is a filesystem path names no forge repository, and the fork's registry key is its name. See [`crate::config::RepoEntry::upstream_name`]."
 );
 string_id!(
     RemoteName,

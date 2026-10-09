@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use crate::cli::{Exit, Output};
-use crate::ids::RepoName;
+use crate::ids::UpstreamName;
 use crate::ledger::{Draft, Ledger, Scribe, inline_human_text};
 use crate::ledger_sweep::{self, Swept, Tally};
 use crate::statement::{Statement, StatementKind, Statements};
@@ -133,11 +133,11 @@ pub struct Migrated {
 pub fn migrate(state_path: &Path, root: &Path, owner: &str) -> anyhow::Result<Migrated> {
     let mut store = Store::open_to_migrate(state_path.to_owned())?;
     let mut migrated = Migrated::default();
-    let mut by_repo: BTreeMap<RepoName, Vec<(String, LegacyStatement)>> = BTreeMap::new();
+    let mut by_repo: BTreeMap<UpstreamName, Vec<(String, LegacyStatement)>> = BTreeMap::new();
     for legacy in store.legacy_statements()? {
         match legacy.key.split_once('/') {
             Some((repo, branch)) if !repo.is_empty() && !branch.is_empty() => by_repo
-                .entry(RepoName::new(repo))
+                .entry(UpstreamName::new(repo))
                 .or_default()
                 .push((branch.to_owned(), legacy)),
             _ => migrated.problems.push(format!(

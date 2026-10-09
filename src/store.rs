@@ -14,14 +14,14 @@
 //! session working directories either: an agent launched elsewhere may need to
 //! change a fork.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::default_config_path;
-use crate::ids::{BranchTarget, RepoName, Requirement};
+use crate::config::{ConfigError, default_config_path};
+use crate::ids::{BranchTarget, Requirement, UpstreamName};
 use crate::ledger::{Ledger, LedgerError};
 use crate::lock::{FileLock, LockError, LockWait};
 use crate::statement::{Statement, StatementKind, Statements};
@@ -107,6 +107,73 @@ pub struct LegacyStatement {
     pub statement: Statement,
 }
 
+/// A state-file map whose keys name a fork.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StateMap {
+    /// `<repo>/<branch>`, and the claim's own `repo`.
+    Claims,
+    /// `<repo>#<number>`.
+    CommentMarks,
+    /// `<repo>#<number>`.
+    PullStates,
+    /// `<repo>/<number>`.
+    ForeignParents,
+    /// `<repo>/<file>`.
+    Conventions,
+    /// `<repo>`.
+    PullHeads,
+}
+
+impl std::fmt::Display for StateMap {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Claims => "claims",
+            Self::CommentMarks => "comment_marks",
+            Self::PullStates => "pull_states",
+            Self::ForeignParents => "foreign_parents",
+            Self::Conventions => "conventions",
+            Self::PullHeads => "pull_heads",
+        })
+    }
+}
+
+/// One state-file key that named a fork by the registry key an older knives
+/// kept it under, and the key `knives ledger migrate` moves it to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Renamed {
+    pub map: StateMap,
+    pub from: String,
+    pub to: String,
+}
+
+/// Each registry key an older knives kept a fork's ledger and state under,
+/// with the name they are kept under now
+/// ([`crate::config::Registry::former_names`]).
+pub type FormerNames = BTreeMap<String, UpstreamName>;
+
+/// `text`, a fork's name followed by `separator` and the rest, with a former
+/// name replaced by the name that fork is kept under now; `None` when `text`
+/// starts with no former name.
+///
+/// A text that already starts with a current name is left alone, whatever
+/// its first component reads: a registry key can spell another fork's owner
+/// (`openchamber` is `openchamber/openchamber`), and a migrated key must not
+/// be migrated again.
+pub fn renamed(former: &FormerNames, text: &str, separator: char) -> Option<String> {
+    let current = former.values().any(|now| {
+        text.strip_prefix(now.as_str())
+            .is_some_and(|rest| rest.starts_with(separator))
+    });
+    if current {
+        return None;
+    }
+    let (name, rest) = text.split_once(separator)?;
+    former
+        .get(name)
+        .map(|now| format!("{now}{separator}{rest}"))
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     #[error("reading {path}: {source}")]
@@ -131,6 +198,16 @@ pub enum StoreError {
         path.display()
     )]
     Unmigrated { path: PathBuf, maps: String },
+    #[error(
+        "{} still keeps forks under the registry keys an older knives named them by ({held}); \
+         this knives keeps a fork's ledger and state under its upstream repository, so it \
+         would report their claims, statements and pull request records as absent. Run \
+         `knives ledger migrate` once to move them",
+        path.display()
+    )]
+    FormerNames { path: PathBuf, held: String },
+    #[error(transparent)]
+    Registry(#[from] ConfigError),
     #[error(transparent)]
     Lock(#[from] LockError),
     #[error(transparent)]
@@ -148,7 +225,7 @@ pub struct Store {
     state: State,
     /// The live statements of each repository the store was opened for, read
     /// from its ledger once when the store opens.
-    statements: BTreeMap<RepoName, Statements>,
+    statements: BTreeMap<UpstreamName, Statements>,
     /// Present only for a store opened to be written. Held, not read: its whole
     /// job is to exist until this value is dropped.
     _lock: Option<FileLock>,
@@ -163,14 +240,14 @@ impl Store {
     /// Either open fails on a ledger it cannot read, as it does on a state file
     /// it cannot read: a statement the store could not read must not answer as
     /// no statement.
-    pub fn open(path: PathBuf, repos: &[&RepoName]) -> Result<Self, StoreError> {
+    pub fn open(path: PathBuf, repos: &[&UpstreamName]) -> Result<Self, StoreError> {
         Self::read(path, repos, None)?.migrated()
     }
 
     /// For a read-modify-write. Holds the lock until dropped, and waits the
     /// full claim-writer budget ([`LockWait::CLAIM`]) for another writer.
     /// `repos` as for [`Store::open`].
-    pub fn open_for_update(path: PathBuf, repos: &[&RepoName]) -> Result<Self, StoreError> {
+    pub fn open_for_update(path: PathBuf, repos: &[&UpstreamName]) -> Result<Self, StoreError> {
         let lock = FileLock::acquire(&path, LockWait::CLAIM)?;
         Self::read(path, repos, Some(lock))?.migrated()
     }
@@ -182,30 +259,63 @@ impl Store {
         Self::read(path, &[], Some(lock))
     }
 
-    /// Refuse a state file still holding the maps an older knives kept branch
-    /// statements in. This knives reads statements only from the ledger, so
-    /// such a file would report every stated pull request, fork-only branch,
-    /// supersession and dependency as absent, which reads exactly like a
-    /// clean slate. A refusal naming the command that fixes it is the only
-    /// honest answer.
+    /// Refuse a state file an older knives left: one still holding the maps
+    /// it kept branch statements in, or still keeping a fork under the
+    /// registry key it was known by before each fork was named after its
+    /// upstream repository. This knives reads statements only from the
+    /// ledger, and looks a fork up only by its upstream name, so such a file
+    /// would report stated pull requests, fork-only branches, supersessions,
+    /// dependencies and claims as absent, which reads exactly like a clean
+    /// slate. A refusal naming the command that fixes it is the only honest
+    /// answer.
+    ///
+    /// Which keys are former names is the registry's to say, so it is read
+    /// from `repos.toml` beside the state file, as the ledger is read from
+    /// beside it: a store opened anywhere else answers for what sits there.
     fn migrated(self) -> Result<Self, StoreError> {
         let held: Vec<&str> = LEGACY_STATEMENTS
             .into_iter()
             .filter(|name| self.state.extra.contains_key(*name))
             .collect();
+        if !held.is_empty() {
+            return Err(StoreError::Unmigrated {
+                path: self.path,
+                maps: held.join(", "),
+            });
+        }
+        let registry = crate::config::load(&self.path.with_file_name("repos.toml"))?;
+        let former = registry.former_names();
+        let root = self.path.with_file_name("ledger");
+        let maps: BTreeSet<StateMap> = self
+            .state
+            .renames(&former)
+            .into_iter()
+            .map(|renamed| renamed.map)
+            .collect();
+        let held: Vec<String> = maps
+            .iter()
+            .map(ToString::to_string)
+            .chain(
+                former
+                    .keys()
+                    .map(|name| root.join(name))
+                    .filter(|directory| directory.is_dir())
+                    .map(|directory| directory.display().to_string()),
+            )
+            .collect();
         if held.is_empty() {
             Ok(self)
         } else {
-            Err(StoreError::Unmigrated {
+            Err(StoreError::FormerNames {
                 path: self.path,
-                maps: held.join(", "),
+                held: held.join(", "),
             })
         }
     }
 
     fn read(
         path: PathBuf,
-        repos: &[&RepoName],
+        repos: &[&UpstreamName],
         lock: Option<FileLock>,
     ) -> Result<Self, StoreError> {
         let state = if path.exists() {
@@ -275,7 +385,7 @@ impl Store {
         self.state.claims.remove(&target.to_string()).is_some()
     }
 
-    pub fn claims(&self, repo: Option<&RepoName>) -> Vec<&Claim> {
+    pub fn claims(&self, repo: Option<&UpstreamName>) -> Vec<&Claim> {
         self.state
             .claims
             .values()
@@ -303,7 +413,7 @@ impl Store {
             .fork_only(target.branch.as_str())
     }
 
-    pub fn record_foreign_parent(&mut self, repo: &RepoName, number: u64, why: &str) {
+    pub fn record_foreign_parent(&mut self, repo: &UpstreamName, number: u64, why: &str) {
         let _ = self
             .state
             .foreign_parents
@@ -314,7 +424,7 @@ impl Store {
     ///
     /// A release parent can be any upstream pull request, including a
     /// maintainer's, so these are tracked even though no branch of ours matches.
-    pub fn foreign_parent_numbers(&self, repo: &RepoName) -> Vec<u64> {
+    pub fn foreign_parent_numbers(&self, repo: &UpstreamName) -> Vec<u64> {
         let prefix = format!("{repo}/");
         self.state
             .foreign_parents
@@ -359,7 +469,7 @@ impl Store {
         clippy::panic,
         reason = "a store asked about a repository it was not opened for is a knives bug; answering no statement would be the silent wrong report this exists to prevent"
     )]
-    fn stated_in(&self, repo: &RepoName) -> &Statements {
+    fn stated_in(&self, repo: &UpstreamName) -> &Statements {
         self.statements.get(repo).unwrap_or_else(|| {
             panic!(
                 "knives bug: asked about {repo}'s branch statements, but the store was opened without {repo}'s ledger"
@@ -367,21 +477,21 @@ impl Store {
         })
     }
 
-    pub fn convention_digest(&self, repo: &RepoName, file: &str) -> Option<&str> {
+    pub fn convention_digest(&self, repo: &UpstreamName, file: &str) -> Option<&str> {
         self.state
             .conventions
             .get(&format!("{repo}/{file}"))
             .map(String::as_str)
     }
 
-    pub fn record_convention_digest(&mut self, repo: &RepoName, file: &str, digest: &str) {
+    pub fn record_convention_digest(&mut self, repo: &UpstreamName, file: &str, digest: &str) {
         let _ = self
             .state
             .conventions
             .insert(format!("{repo}/{file}"), digest.to_owned());
     }
 
-    pub fn pull_heads(&self, repo: &RepoName) -> BTreeMap<String, String> {
+    pub fn pull_heads(&self, repo: &UpstreamName) -> BTreeMap<String, String> {
         self.state
             .pull_heads
             .get(repo.as_str())
@@ -389,7 +499,7 @@ impl Store {
             .unwrap_or_default()
     }
 
-    pub fn record_pull_head(&mut self, repo: &RepoName, number: u64, sha: &str) {
+    pub fn record_pull_head(&mut self, repo: &UpstreamName, number: u64, sha: &str) {
         let _ = self
             .state
             .pull_heads
@@ -401,7 +511,7 @@ impl Store {
     /// Record where the forge said a pull request stands. The parameter type is
     /// the invariant: a record is a forge state, never the transition sync
     /// classified from it.
-    pub fn record_pull_state(&mut self, repo: &RepoName, number: u64, state: ForgeState) {
+    pub fn record_pull_state(&mut self, repo: &UpstreamName, number: u64, state: ForgeState) {
         let _ = self
             .state
             .pull_states
@@ -409,28 +519,28 @@ impl Store {
     }
 
     /// Drop a record this version cannot read, so its problem is reported once.
-    pub fn forget_pull_state(&mut self, repo: &RepoName, number: u64) {
+    pub fn forget_pull_state(&mut self, repo: &UpstreamName, number: u64) {
         let _ = self.state.pull_states.remove(&format!("{repo}#{number}"));
     }
 
     /// The recorded state as the file spells it: `record_pull_state` writes a
     /// forge state, but a file an earlier version wrote may spell otherwise, and
     /// the reader decides what that means.
-    pub fn pull_state(&self, repo: &RepoName, number: u64) -> Option<&str> {
+    pub fn pull_state(&self, repo: &UpstreamName, number: u64) -> Option<&str> {
         self.state
             .pull_states
             .get(&format!("{repo}#{number}"))
             .map(String::as_str)
     }
 
-    pub fn record_comment_mark(&mut self, repo: &RepoName, number: u64, at: &str) {
+    pub fn record_comment_mark(&mut self, repo: &UpstreamName, number: u64, at: &str) {
         let _ = self
             .state
             .comment_marks
             .insert(format!("{repo}#{number}"), at.to_owned());
     }
 
-    pub fn comment_mark(&self, repo: &RepoName, number: u64) -> Option<&str> {
+    pub fn comment_mark(&self, repo: &UpstreamName, number: u64) -> Option<&str> {
         self.state
             .comment_marks
             .get(&format!("{repo}#{number}"))
@@ -504,19 +614,119 @@ impl Store {
             .retain(|name, _| !LEGACY_STATEMENTS.contains(&name.as_str()));
         self.state.extra.len() != before
     }
+
+    /// Move every key that names a fork by one of its `former` names, and
+    /// every claim's own `repo` with it, to the name that fork is kept under
+    /// now; each move made, and each refused because its new key is already
+    /// taken, in map order. A refused move leaves both keys as they were.
+    pub fn rename_forks(&mut self, former: &FormerNames) -> (Vec<Renamed>, Vec<Renamed>) {
+        self.state
+            .renames(former)
+            .into_iter()
+            .partition(|renamed| self.state.apply(renamed, former))
+    }
+}
+
+impl State {
+    /// Every key that names a fork by one of its `former` names, with the key
+    /// it moves to, in map order.
+    ///
+    /// A claim is renamed by the `repo` it records, not by parsing its key,
+    /// since a branch name may hold a `/`.
+    fn renames(&self, former: &FormerNames) -> Vec<Renamed> {
+        let keyed = |map: StateMap, keys: Vec<&String>, separator: char| {
+            keys.into_iter()
+                .filter_map(move |key| {
+                    Some(Renamed {
+                        map,
+                        from: key.clone(),
+                        to: renamed(former, key, separator)?,
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        let claims = self.claims.iter().filter_map(|(key, claim)| {
+            let now = former.get(claim.repo.as_str())?;
+            Some(Renamed {
+                map: StateMap::Claims,
+                from: key.clone(),
+                to: format!("{now}/{}", claim.branch),
+            })
+        });
+        let pull_heads = self.pull_heads.keys().filter_map(|key| {
+            Some(Renamed {
+                map: StateMap::PullHeads,
+                from: key.clone(),
+                to: former.get(key.as_str())?.to_string(),
+            })
+        });
+        claims
+            .chain(keyed(
+                StateMap::CommentMarks,
+                self.comment_marks.keys().collect(),
+                '#',
+            ))
+            .chain(keyed(
+                StateMap::PullStates,
+                self.pull_states.keys().collect(),
+                '#',
+            ))
+            .chain(keyed(
+                StateMap::ForeignParents,
+                self.foreign_parents.keys().collect(),
+                '/',
+            ))
+            .chain(keyed(
+                StateMap::Conventions,
+                self.conventions.keys().collect(),
+                '/',
+            ))
+            .chain(pull_heads)
+            .collect()
+    }
+
+    /// Move one value from `renamed.from` to `renamed.to`, the claim's own
+    /// `repo` with it; `false`, moving nothing, when `to` is already taken.
+    fn apply(&mut self, renamed: &Renamed, former: &FormerNames) -> bool {
+        fn rekey<V>(map: &mut BTreeMap<String, V>, renamed: &Renamed) -> bool {
+            if map.contains_key(&renamed.to) {
+                return false;
+            }
+            if let Some(value) = map.remove(&renamed.from) {
+                let _ = map.insert(renamed.to.clone(), value);
+            }
+            true
+        }
+        match renamed.map {
+            StateMap::Claims => {
+                let moved = rekey(&mut self.claims, renamed);
+                if moved && let Some(claim) = self.claims.get_mut(&renamed.to) {
+                    if let Some(now) = former.get(claim.repo.as_str()) {
+                        claim.repo = now.to_string();
+                    }
+                }
+                moved
+            }
+            StateMap::CommentMarks => rekey(&mut self.comment_marks, renamed),
+            StateMap::PullStates => rekey(&mut self.pull_states, renamed),
+            StateMap::ForeignParents => rekey(&mut self.foreign_parents, renamed),
+            StateMap::Conventions => rekey(&mut self.conventions, renamed),
+            StateMap::PullHeads => rekey(&mut self.pull_heads, renamed),
+        }
+    }
 }
 
 /// The live statements of each of `repos`, from its ledger beside the state file.
 ///
-/// `ledger/<repo>/` beside `state.json` is where
-/// [`crate::ledger::default_ledger_path`] puts each repository's ledger, so a
-/// store opened at the default path reads the default ledgers and one opened
+/// `ledger/<owner>/<name>/` beside `state.json` is where
+/// [`crate::ledger::default_ledger_path`] puts each fork's ledger, so a store
+/// opened at the default path reads the default ledgers and one opened
 /// anywhere else reads only what sits beside it. A repository nobody has
 /// stated anything about yet has no ledger, and so no statements.
 fn read_statements(
     root: &Path,
-    repos: &[&RepoName],
-) -> Result<BTreeMap<RepoName, Statements>, StoreError> {
+    repos: &[&UpstreamName],
+) -> Result<BTreeMap<UpstreamName, Statements>, StoreError> {
     repos
         .iter()
         .map(|repo| {
@@ -569,13 +779,13 @@ mod tests {
             .unwrap();
     }
 
-    fn repo() -> RepoName {
-        RepoName::new("a-repo")
+    fn repo() -> UpstreamName {
+        UpstreamName::new("a-repo")
     }
 
     fn target() -> BranchTarget {
         BranchTarget::new(
-            RepoName::new("a-repo"),
+            UpstreamName::new("a-repo"),
             crate::ids::BranchName::new("feat/alpha"),
         )
     }
@@ -646,7 +856,7 @@ mod tests {
         let mut subject = store(dir.path());
         let _ = subject.claim(
             &BranchTarget::new(
-                RepoName::new("one"),
+                UpstreamName::new("one"),
                 crate::ids::BranchName::new("feat/alpha"),
             ),
             &os_user("x"),
@@ -654,13 +864,13 @@ mod tests {
         );
         let _ = subject.claim(
             &BranchTarget::new(
-                RepoName::new("two"),
+                UpstreamName::new("two"),
                 crate::ids::BranchName::new("feat/alpha"),
             ),
             &os_user("y"),
             "w",
         );
-        let only = subject.claims(Some(&RepoName::new("one")));
+        let only = subject.claims(Some(&UpstreamName::new("one")));
         assert_eq!(only.len(), 1);
         assert_eq!(only[0].repo, "one");
     }
@@ -700,7 +910,7 @@ mod tests {
         );
 
         // When: the store opens for this repository and one with no ledger
-        let other = RepoName::new("other-repo");
+        let other = UpstreamName::new("other-repo");
         let subject = Store::open(dir.path().join("state.json"), &[&repo(), &other]).unwrap();
 
         // Then: each accessor answers from the ledger
@@ -714,7 +924,7 @@ mod tests {
                     number: 7
                 },
                 Requirement {
-                    repo: RepoName::new("sibling"),
+                    repo: UpstreamName::new("sibling"),
                     number: 49
                 },
             ]
@@ -740,7 +950,7 @@ mod tests {
         // report: a fork-only branch shown as one missing its pull request.
         let dir = tempfile::tempdir().unwrap();
         let _ = store(dir.path()).is_fork_only(&BranchTarget::new(
-            RepoName::new("other-repo"),
+            UpstreamName::new("other-repo"),
             BranchName::new("feat/alpha"),
         ));
     }
@@ -974,7 +1184,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut subject = store(dir.path());
         subject.record_foreign_parent(&repo(), 4677, "maintainer's fix, we carry it");
-        subject.record_foreign_parent(&RepoName::new("other"), 99, "unrelated");
+        subject.record_foreign_parent(&UpstreamName::new("other"), 99, "unrelated");
         assert_eq!(subject.foreign_parent_numbers(&repo()), [4677]);
     }
 
@@ -999,15 +1209,15 @@ mod tests {
         let path = dir.path().join("state.json");
         {
             let mut store = Store::open_for_update(path.clone(), &[]).unwrap();
-            store.record_comment_mark(&RepoName::new("a-repo"), 7, "2026-07-30T00:00:00Z");
+            store.record_comment_mark(&UpstreamName::new("a-repo"), 7, "2026-07-30T00:00:00Z");
             store.save().unwrap();
         }
         let store = Store::open(path, &[]).unwrap();
         assert_eq!(
-            store.comment_mark(&RepoName::new("a-repo"), 7),
+            store.comment_mark(&UpstreamName::new("a-repo"), 7),
             Some("2026-07-30T00:00:00Z")
         );
-        assert_eq!(store.comment_mark(&RepoName::new("other-repo"), 7), None);
+        assert_eq!(store.comment_mark(&UpstreamName::new("other-repo"), 7), None);
     }
 
     #[test]
@@ -1016,15 +1226,15 @@ mod tests {
         let path = dir.path().join("state.json");
         {
             let mut subject = Store::open_for_update(path.clone(), &[]).unwrap();
-            subject.record_pull_state(&RepoName::new("a-repo"), 7, ForgeState::Merged);
+            subject.record_pull_state(&UpstreamName::new("a-repo"), 7, ForgeState::Merged);
             subject.save().unwrap();
         }
         let subject = Store::open(path, &[]).unwrap();
         assert_eq!(
-            subject.pull_state(&RepoName::new("a-repo"), 7),
+            subject.pull_state(&UpstreamName::new("a-repo"), 7),
             Some("MERGED")
         );
-        assert_eq!(subject.pull_state(&RepoName::new("other-repo"), 7), None);
+        assert_eq!(subject.pull_state(&UpstreamName::new("other-repo"), 7), None);
     }
 
     #[test]

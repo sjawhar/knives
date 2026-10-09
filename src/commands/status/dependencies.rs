@@ -5,7 +5,7 @@ use crate::commands::status::{BranchRow, Options, Report, Timings};
 use crate::config::{Registry, RepoEntry};
 use crate::detect::{Finding, FindingKind, Subject};
 use crate::forge::{Forge, RepoIdentity};
-use crate::ids::{BranchName, BranchTarget, RepoName, Requirement};
+use crate::ids::{BranchName, BranchTarget, Requirement, UpstreamName};
 use crate::store::Store;
 
 /// The forge repository a sibling entry's pull requests live in, from its
@@ -60,8 +60,16 @@ impl DependencyResults<'_> {
     }
 }
 
+/// The required forks of `repo`'s branches, by the name each is kept under,
+/// with every requirement on it.
+///
+/// A requirement names its fork as it was written: by the repository's
+/// `<owner>/<name>` as `knives depends` records it now, or by the registry
+/// key an older knives recorded, which the registry still resolves.
+type Required<'a> = BTreeMap<UpstreamName, (&'a RepoEntry, Vec<(BranchName, Requirement)>)>;
+
 fn unmet_dependencies(
-    repo: &RepoName,
+    repo: &UpstreamName,
     branches: &[BranchRow],
     context: &DependencyContext<'_, '_>,
 ) -> (Vec<Finding>, Vec<String>) {
@@ -72,34 +80,32 @@ fn unmet_dependencies(
         forge,
         snapshot,
     } = *context;
-    let mut grouped: BTreeMap<RepoName, Vec<(BranchName, Requirement)>> = BTreeMap::new();
+    let mut findings = Vec::new();
+    let mut problems = Vec::new();
+    let mut grouped: Required<'_> = BTreeMap::new();
     for row in branches {
         let target = BranchTarget::new(repo.clone(), row.name.clone());
         for requirement in store.dependencies(&target) {
-            grouped
-                .entry(requirement.repo.clone())
-                .or_default()
-                .push((row.name.clone(), requirement));
+            match registry.resolve(requirement.repo.as_str()) {
+                Some((_, entry, upstream)) => grouped
+                    .entry(upstream)
+                    .or_insert_with(|| (entry, Vec::new()))
+                    .1
+                    .push((row.name.clone(), requirement)),
+                None => problems.push(format!(
+                    "{} requires {requirement}, whose repo is not in the registry",
+                    row.name
+                )),
+            }
         }
     }
 
-    let mut findings = Vec::new();
-    let mut problems = Vec::new();
     {
         let mut outcomes = DependencyResults {
             findings: &mut findings,
             problems: &mut problems,
         };
-        for (required_repo, requirements) in grouped {
-            let Some(entry) = registry.get(&required_repo) else {
-                for (branch, requirement) in requirements {
-                    outcomes.problems.push(format!(
-                        "{branch} requires {requirement}, whose repo is not in the registry"
-                    ));
-                }
-                continue;
-            };
-
+        for (required_repo, (entry, requirements)) in grouped {
             if required_repo == *repo {
                 let Some(snapshot) = snapshot else {
                     for (branch, requirement) in requirements {
@@ -174,7 +180,7 @@ fn unmet_dependencies(
 pub(super) struct DependencyInput<'a, 'forge, 'snapshot> {
     pub(super) report: &'a mut Report,
     pub(super) findings: &'a mut Vec<Finding>,
-    pub(super) name: &'a RepoName,
+    pub(super) name: &'a UpstreamName,
     pub(super) path: &'a Path,
     pub(super) store: &'a Store,
     pub(super) options: &'a Options<'forge>,

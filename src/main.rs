@@ -35,7 +35,7 @@ use knives::config::{
 };
 use knives::forge::Forge;
 use knives::forge::github::CliForge;
-use knives::ids::{BranchName, RepoName};
+use knives::ids::{BranchName, RepoName, UpstreamName};
 use knives::ledger::{Ledger, Scribe};
 use knives::store::{Store, default_state_path};
 use release_carries::{run_release_census, run_release_members, run_revision_carries};
@@ -484,10 +484,10 @@ fn run_consumers(
 
 /// Reconcile one fork's local bookmarks with the live refs on their owning remotes.
 fn run_pushed(fork: &Fork<'_>, branches: &[String], output: Output) -> anyhow::Result<Exit> {
-    let pulled = knives::ledger_sweep::pull(&[&fork.name]);
-    let store = Store::open(default_state_path(), &[&fork.name])?;
+    let pulled = knives::ledger_sweep::pull(&[&fork.upstream]);
+    let store = Store::open(default_state_path(), &[&fork.upstream])?;
     let mut report = pushed::gather(fork, &store, branches);
-    report.problems.extend(pulled.problems_for(&report.repo));
+    report.problems.extend(pulled.problems_for(&fork.upstream));
     if let Some(payload) = knives::cli::machine_payload(output, &report)? {
         println!("{payload}");
     } else {
@@ -531,7 +531,7 @@ fn run_audit(
                 report
             }
         };
-        report.problems.extend(pulled.problems_for(&report.repo));
+        report.problems.extend(pulled.problems_for(&chosen.upstream()));
         worst = worst.worst(audit::exit_for(&report));
         reports.push(report);
     }
@@ -624,8 +624,8 @@ fn dispatch_release(
 /// claims carry the same name and a reader can join them.
 fn scribe_for(fork: &Fork<'_>, bound: Option<&RepoName>) -> anyhow::Result<Scribe> {
     Ok(Scribe::new(
-        Ledger::for_repo(&fork.name),
-        fork.name.clone(),
+        Ledger::for_repo(&fork.upstream),
+        fork.upstream.clone(),
         fork.checkout.path.clone(),
         current_identity(bound)?.owner,
     ))
@@ -643,10 +643,13 @@ fn pulled_plan(
     fork: &Fork<'_>,
     consumers: &knives::commands::release::ConsumerInputs<'_>,
 ) -> anyhow::Result<knives::commands::release::Plan> {
-    let pulled = knives::ledger_sweep::pull(&[&fork.name]);
-    let mut plan =
-        knives::commands::release::plan(fork, consumers, &Ledger::for_repo(&fork.name).entries()?)?;
-    plan.problems.extend(pulled.problems_for(&plan.repo));
+    let pulled = knives::ledger_sweep::pull(&[&fork.upstream]);
+    let mut plan = knives::commands::release::plan(
+        fork,
+        consumers,
+        &Ledger::for_repo(&fork.upstream).entries()?,
+    )?;
+    plan.problems.extend(pulled.problems_for(&fork.upstream));
     Ok(plan)
 }
 
@@ -663,13 +666,23 @@ enum Selected<'a> {
     },
 }
 
+impl Selected<'_> {
+    /// What the entry's ledger and state are kept under, placed or not.
+    fn upstream(&self) -> UpstreamName {
+        match self {
+            Selected::Bound(fork) => fork.upstream.clone(),
+            Selected::Unplaced { name, entry, .. } => entry.upstream_name(name.as_str()),
+        }
+    }
+}
+
 /// The repositories among `chosen` that a verb will gather, and so whose branch
 /// statements it will ask the store about. An unplaced entry is never opened.
-fn placed<'s>(chosen: &'s [Selected<'_>]) -> Vec<&'s RepoName> {
+fn placed<'s>(chosen: &'s [Selected<'_>]) -> Vec<&'s UpstreamName> {
     chosen
         .iter()
         .filter_map(|chosen| match chosen {
-            Selected::Bound(fork) => Some(&fork.name),
+            Selected::Bound(fork) => Some(&fork.upstream),
             Selected::Unplaced { .. } => None,
         })
         .collect()
@@ -858,7 +871,7 @@ fn run_status(ground: Ground<'_>, view: StatusView<'_>) -> anyhow::Result<Exit> 
                         .iter()
                         .map(|chosen| {
                             status_row(chosen, |fork| {
-                                let ledger = Ledger::for_repo(&fork.name);
+                                let ledger = Ledger::for_repo(&fork.upstream);
                                 status::gather_timed(
                                     fork,
                                     store,
@@ -897,9 +910,10 @@ fn run_status(ground: Ground<'_>, view: StatusView<'_>) -> anyhow::Result<Exit> 
     // One document per invocation: an array under `--all`, the object otherwise.
     let mut worst = Exit::Ok;
     let mut reports = Vec::with_capacity(rows.len());
-    for (mut report, timings) in rows {
-        report.problems.extend(pulled.problems_for(&report.repo));
-        report.notes.extend(pulled.backlog_for(&report.repo));
+    for ((mut report, timings), chosen) in rows.into_iter().zip(&chosen) {
+        let upstream = chosen.upstream();
+        report.problems.extend(pulled.problems_for(&upstream));
+        report.notes.extend(pulled.backlog_for(&upstream));
         // stderr, so a timed run's stdout is still the report a script parses.
         if let Some(timings) = timings
             && knives::timing::enabled()
@@ -979,7 +993,7 @@ fn run_sync(
                 ..sync::Report::default()
             },
         };
-        report.problems.extend(pulled.problems_for(&report.repo));
+        report.problems.extend(pulled.problems_for(&chosen.upstream()));
         worst = worst.worst(sync::exit_for(&report));
         reports.push(report);
     }

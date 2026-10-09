@@ -78,7 +78,7 @@ pub(crate) fn run_finish(
     options: &FinishOptions<'_>,
     bound: Option<&RepoName>,
 ) -> anyhow::Result<Exit> {
-    let target = &BranchTarget::new(fork.name.clone(), branch.clone());
+    let target = &BranchTarget::new(fork.upstream.clone(), branch.clone());
     let checkout_path = &fork.checkout.path;
     // Without this, `finish` would forget the primary workspace and delete the
     // checkout itself.
@@ -86,7 +86,7 @@ pub(crate) fn run_finish(
         eprintln!("{}: {line}", fork.name);
         return Ok(Exit::Usage);
     }
-    let mut store = Store::open_for_update(default_state_path(), &[&fork.name])?;
+    let mut store = Store::open_for_update(default_state_path(), &[&fork.upstream])?;
     let workspace = knives::commands::wip::workspace_for(branch.as_str());
     let directory = workspace_path(fork, branch);
     let forced_release = match finish_claim_gate(fork, target, &store, options, bound)? {
@@ -301,11 +301,11 @@ pub(crate) fn run_track(
     forget: bool,
     bound: Option<&RepoName>,
 ) -> anyhow::Result<Exit> {
-    let target = &BranchTarget::new(fork.name.clone(), branch.clone());
+    let target = &BranchTarget::new(fork.upstream.clone(), branch.clone());
     // Opened for update to hold the lock while the statement is read and the next
     // one appended: a concurrent `track` then reads this one's statement rather
     // than the one before it. Nothing here writes the state file.
-    let store = Store::open_for_update(default_state_path(), &[&fork.name])?;
+    let store = Store::open_for_update(default_state_path(), &[&fork.upstream])?;
     // Read before the change, so a withdrawal is still filed under the number it
     // withdrew.
     let stated = store.tracked_pull(target);
@@ -388,28 +388,33 @@ pub(crate) fn run_depends(
     on: &[String],
     bound: Option<&RepoName>,
 ) -> anyhow::Result<Exit> {
-    let target = &BranchTarget::new(fork.name.clone(), branch.clone());
+    let target = &BranchTarget::new(fork.upstream.clone(), branch.clone());
     let mut requirements = Vec::new();
     for text in on {
-        let Some(requirement) = Requirement::parse(text) else {
+        let Some(written) = Requirement::parse(text) else {
             eprintln!("cannot read {text} as a requirement; write it as `<repo>#<number>`");
             return Ok(Exit::Usage);
         };
-        if registry.get(&requirement.repo).is_none() {
+        // Recorded under the required fork's repository name, whichever way it
+        // was typed, so the statement means the same fork on every machine.
+        let Some((_, _, upstream)) = registry.resolve(written.repo.as_str()) else {
             let known: Vec<String> = registry.names().map(|n| n.to_string()).collect();
             eprintln!(
                 "unknown repo {} in {text}; known: {}",
-                requirement.repo,
+                written.repo,
                 known.join(", ")
             );
             return Ok(Exit::Usage);
-        }
-        requirements.push(requirement);
+        };
+        requirements.push(Requirement {
+            repo: upstream,
+            number: written.number,
+        });
     }
     // Held while the list is read and the next statement appended, so two
     // concurrent `depends` each add to the other's list rather than racing.
     // Nothing here writes the state file.
-    let store = Store::open_for_update(default_state_path(), &[&fork.name])?;
+    let store = Store::open_for_update(default_state_path(), &[&fork.upstream])?;
     let required = with_requirements(&store.dependencies(target), &requirements);
     let pr = store.tracked_pull(target);
     let listed: Vec<String> = requirements.iter().map(ToString::to_string).collect();

@@ -45,7 +45,7 @@ pub(crate) fn run_release_members(
             cache_root: cache_root.as_deref(),
             heads: &heads,
         };
-        let plan = release::plan(fork, &consumers, &Ledger::for_repo(repo).entries()?)?;
+        let plan = release::plan(fork, &consumers, &Ledger::for_repo(&fork.upstream).entries()?)?;
         let Some(reference) = plan.release else {
             println!("{repo}: no release to inspect; cut one first");
             return Ok(Exit::Incomplete);
