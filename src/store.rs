@@ -152,6 +152,25 @@ pub struct Renamed {
 /// ([`crate::config::Registry::former_names`]).
 pub type FormerNames = BTreeMap<String, UpstreamName>;
 
+/// Whether `directory` holds a ledger entry file of its own.
+///
+/// That is a `*.md` regular file directly inside it, not inside a directory
+/// below it. Unreadable is taken as holding one, so a directory nobody could
+/// read is refused rather than passed as migrated.
+pub fn holds_entries(directory: &Path) -> bool {
+    let Ok(listing) = std::fs::read_dir(directory) else {
+        return directory.exists();
+    };
+    listing.into_iter().any(|dirent| {
+        dirent.is_err()
+            || dirent.is_ok_and(|dirent| {
+                dirent.file_type().is_ok_and(|kind| kind.is_file())
+                    && Path::new(&dirent.file_name()).extension()
+                        == Some(std::ffi::OsStr::new("md"))
+            })
+    })
+}
+
 /// `text`, a fork's name followed by `separator` and the rest, with a former
 /// name replaced by the name that fork is kept under now; `None` when `text`
 /// starts with no former name.
@@ -272,6 +291,9 @@ impl Store {
     /// Which keys are former names is the registry's to say, so it is read
     /// from `repos.toml` beside the state file, as the ledger is read from
     /// beside it: a store opened anywhere else answers for what sits there.
+    /// A former name's ledger directory is unmigrated while it holds an entry
+    /// file; one holding only other forks' directories is the owner directory
+    /// of their upstream names (`acme` beside `acme/demo`).
     fn migrated(self) -> Result<Self, StoreError> {
         let held: Vec<&str> = LEGACY_STATEMENTS
             .into_iter()
@@ -299,7 +321,7 @@ impl Store {
                 former
                     .keys()
                     .map(|name| root.join(name))
-                    .filter(|directory| directory.is_dir())
+                    .filter(|directory| holds_entries(directory))
                     .map(|directory| directory.display().to_string()),
             )
             .collect();

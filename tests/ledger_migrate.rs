@@ -280,3 +280,235 @@ fn an_unmigrated_state_file_is_refused_naming_the_command_and_opens_after_migrat
     let context = String::from_utf8_lossy(&claimed.stdout);
     assert!(context.contains("feat/claimed (agent-one"), "{context}");
 }
+
+/// A config home whose registry names two forks with forge upstreams: `demo`,
+/// kept under `acme/demo`, and `acme`, kept under `acme/acme`, whose registry
+/// key is the owner directory both now share.
+fn renaming_home() -> tempfile::TempDir {
+    let home = tempfile::tempdir().expect("config home");
+    std::fs::write(
+        home.path().join("repos.toml"),
+        "[repos.demo]\nupstream = \"https://forge.invalid/Acme/Demo\"\n\
+         origin = \"https://forge.invalid/ours/demo\"\n\n\
+         [repos.acme]\nupstream = \"https://forge.invalid/acme/acme.git\"\n\
+         origin = \"https://forge.invalid/ours/acme\"\n",
+    )
+    .expect("write registry");
+    home
+}
+
+/// One note in `home`'s ledger directory `fork`, written at `ts`; the path of
+/// its file.
+fn note(home: &Path, fork: &str, ts: &str, text: &str) -> std::path::PathBuf {
+    let ledger = Ledger::at(home.join("ledger").join(fork));
+    ledger
+        .append(&Entry {
+            ts: ts.to_owned(),
+            owner: "ses_older".to_owned(),
+            subject: None,
+            kind: knives::ledger::Kind::Note,
+            disposition: None,
+            statement: None,
+            text: text.to_owned(),
+            evidence: Vec::new(),
+            anchor: None,
+            pr: None,
+            parents: Vec::new(),
+        })
+        .expect("append a note");
+    let mut files: Vec<_> = std::fs::read_dir(home.join("ledger").join(fork))
+        .expect("read the ledger directory")
+        .map(|dirent| dirent.expect("dirent").path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "md"))
+        .collect();
+    files.sort();
+    files.pop().expect("the note's file")
+}
+
+/// A state file as a knives that kept forks under their registry keys left
+/// it, with every map that names a fork, and one legacy statement map.
+const ALIASED_STATE: &str = r#"{
+  "claims": {"demo/feat/x": {"repo": "demo", "branch": "feat/x", "owner": "agent-one",
+    "why": "porting", "started": "2026-01-01T00:00:00Z", "files": []}},
+  "comment_marks": {"demo#7": "2026-01-02T00:00:00Z"},
+  "pull_states": {"demo#7": "OPEN", "acme#3": "MERGED"},
+  "foreign_parents": {"demo/99": "a maintainer's fix"},
+  "conventions": {"demo/AGENTS.md": "abc", "acme/CONTRIBUTING.md": "def"},
+  "pull_heads": {"demo": {"7": "head-7"}},
+  "tracked_pulls": {"demo/feat/x": 7},
+  "dependencies": {"demo/feat/x": ["acme#3", "demo#8"]}
+}"#;
+
+/// Each `(from, to)` path a migration report says it moved.
+fn moved_paths(migrated: &serde_json::Value) -> Vec<(String, String)> {
+    migrated["moved"]
+        .as_array()
+        .expect("moved")
+        .iter()
+        .map(|moved| {
+            (
+                moved["from"].as_str().expect("from").to_owned(),
+                moved["to"].as_str().expect("to").to_owned(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn a_migration_moves_each_forks_ledger_and_state_keys_to_its_upstream_name() {
+    // Given: a state file and ledger an older knives left, keeping each fork
+    // under its registry key.
+    let home = renaming_home();
+    std::fs::write(home.path().join("state.json"), ALIASED_STATE).expect("write state");
+    let demo_note = note(home.path(), "demo", "2026-01-01T00:00:00Z", "about demo");
+    let acme_note = note(home.path(), "acme", "2026-01-01T00:00:01Z", "about acme");
+    let demo_bytes = std::fs::read(&demo_note).expect("read demo's note");
+    let acme_bytes = std::fs::read(&acme_note).expect("read acme's note");
+
+    // When: the migration runs.
+    let migrated = report(&migrate(home.path()));
+
+    // Then: each fork's ledger directory moved, byte for byte, to its
+    // upstream's `<owner>/<name>`, and the report names the old path.
+    let ledger = home.path().join("ledger");
+    let name = |path: &Path| path.file_name().expect("a file name").to_owned();
+    let moved_demo = ledger.join("acme/demo").join(name(&demo_note));
+    let moved_acme = ledger.join("acme/acme").join(name(&acme_note));
+    assert_eq!(
+        std::fs::read(&moved_demo).ok(),
+        Some(demo_bytes),
+        "{migrated}"
+    );
+    assert_eq!(
+        std::fs::read(&moved_acme).ok(),
+        Some(acme_bytes),
+        "{migrated}"
+    );
+    assert!(!ledger.join("demo").exists(), "{migrated}");
+    assert!(!acme_note.exists(), "{migrated}");
+    let moved = moved_paths(&migrated);
+    let path = |relative: &str| ledger.join(relative).display().to_string();
+    assert_eq!(
+        moved,
+        [
+            (path("acme"), path("acme/acme")),
+            (path("demo"), path("acme/demo"))
+        ],
+        "{migrated}"
+    );
+
+    // And: every state key that named a fork names its upstream now, each
+    // reported, and the legacy statements reached the moved ledger with the
+    // repository inside each requirement renamed.
+    let state: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(home.path().join("state.json")).expect("read state"),
+    )
+    .expect("parse state");
+    assert_eq!(
+        state["claims"]["acme/demo/feat/x"]["repo"], "acme/demo",
+        "{state}"
+    );
+    assert_eq!(
+        state["comment_marks"]["acme/demo#7"], "2026-01-02T00:00:00Z",
+        "{state}"
+    );
+    assert_eq!(state["pull_states"]["acme/demo#7"], "OPEN", "{state}");
+    assert_eq!(state["pull_states"]["acme/acme#3"], "MERGED", "{state}");
+    assert_eq!(
+        state["foreign_parents"]["acme/demo/99"], "a maintainer's fix",
+        "{state}"
+    );
+    assert_eq!(
+        state["conventions"]["acme/demo/AGENTS.md"], "abc",
+        "{state}"
+    );
+    assert_eq!(
+        state["conventions"]["acme/acme/CONTRIBUTING.md"], "def",
+        "{state}"
+    );
+    assert_eq!(state["pull_heads"]["acme/demo"]["7"], "head-7", "{state}");
+    assert_eq!(
+        migrated["renamed"].as_array().map(Vec::len),
+        Some(8),
+        "{migrated}"
+    );
+    assert_eq!(
+        statements(&entries(home.path(), "acme/demo")),
+        [
+            (
+                "feat/x".to_owned(),
+                StatementKind::Pull,
+                Some("7".to_owned())
+            ),
+            (
+                "feat/x".to_owned(),
+                StatementKind::Depends,
+                Some("acme/acme#3,acme/demo#8".to_owned())
+            ),
+        ]
+    );
+    // And: the migrated state file opens, though `ledger/acme` is still a
+    // directory: the owner directory `acme/acme` and `acme/demo` live in.
+    knives::store::Store::open(home.path().join("state.json"), &[])
+        .expect("a migrated state file opens");
+
+    // When: the migration runs again.
+    let state_before = std::fs::read(home.path().join("state.json")).expect("read state");
+    let again = report(&migrate(home.path()));
+
+    // Then: it moved, renamed and wrote nothing, and left the state file alone.
+    assert_eq!(again["moved"], serde_json::json!([]), "{again}");
+    assert_eq!(again["renamed"], serde_json::json!([]), "{again}");
+    assert_eq!(again["wrote"], 0, "{again}");
+    assert_eq!(
+        std::fs::read(home.path().join("state.json")).expect("read state"),
+        state_before
+    );
+}
+
+#[test]
+fn an_entry_already_at_its_new_name_is_not_moved_over() {
+    // Given: demo's ledger under its registry key, and its upstream directory
+    // already holding one of the same entries (pulled from a machine that
+    // migrated first) and a different file under another entry's name.
+    let home = renaming_home();
+    let kept = note(
+        home.path(),
+        "demo",
+        "2026-01-01T00:00:00Z",
+        "the same entry",
+    );
+    let clash = note(
+        home.path(),
+        "demo",
+        "2026-01-01T00:00:01Z",
+        "this machine's",
+    );
+    let upstream = home.path().join("ledger/acme/demo");
+    std::fs::create_dir_all(&upstream).expect("create the upstream directory");
+    let name = |path: &Path| path.file_name().expect("a file name").to_owned();
+    std::fs::copy(&kept, upstream.join(name(&kept))).expect("copy the shared entry");
+    std::fs::write(upstream.join(name(&clash)), "another machine's bytes\n")
+        .expect("write a clashing file");
+
+    // When: the migration runs.
+    let output = migrate(home.path());
+
+    // Then: the duplicate is dropped, the clash is left on both sides and
+    // reported, and the run is incomplete.
+    assert_eq!(output.status.code(), Some(3), "{output:?}");
+    let migrated: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON");
+    assert!(!kept.exists(), "{migrated}");
+    assert!(clash.exists(), "{migrated}");
+    assert_eq!(
+        std::fs::read_to_string(upstream.join(name(&clash))).expect("read the clash"),
+        "another machine's bytes\n"
+    );
+    let problems = migrated["problems"].as_array().expect("problems");
+    assert!(
+        problems.iter().any(|problem| problem
+            .as_str()
+            .is_some_and(|text| text.contains(&name(&clash).to_string_lossy().into_owned()))),
+        "{migrated}"
+    );
+}

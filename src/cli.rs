@@ -451,14 +451,18 @@ pub enum LedgerAction {
     /// `knives.fork` git config; with neither set, the ledger is not shared
     /// and this does nothing.
     Sweep,
-    /// Move the branch statements an older knives kept in `state.json` onto
-    /// the ledger, one statement entry each, then drop them from `state.json`.
+    /// Move what an older knives left onto what this one reads: each fork
+    /// kept under its registry key moves to its upstream's lowercase
+    /// `<owner>/<name>`, and the branch statements kept in `state.json` move
+    /// onto the ledger, one statement entry each, then leave `state.json`.
     ///
-    /// Existing entries are left as they are: an event's prose states nothing,
-    /// so nothing is read back out of it. A statement some entry about that
-    /// branch already makes, kind and value alike, is skipped, so a second run
-    /// writes nothing. `state.json` keeps every statement until all of them
-    /// reach the ledger.
+    /// A fork's ledger directory moves file by file, contents untouched, and
+    /// every `state.json` key naming it is renamed; each old path and key is
+    /// reported. Existing entries are left as they are: an event's prose
+    /// states nothing, so nothing is read back out of it. A statement some
+    /// entry about that branch already makes, kind and value alike, is
+    /// skipped, so a second run writes nothing. `state.json` keeps every
+    /// statement until all of them reach the ledger.
     Migrate,
 }
 
