@@ -150,3 +150,14 @@ beside the state file; a sweep that finds it held exits `0` at once, because the
 holder looks again before it stops. A failing sweep leaves its errors in
 `ledger-sweep.log` beside the state file, which exists only while the last sweep
 failed. Run `knives ledger sweep` by hand to see what one carries.
+
+A command that decides something from the ledger pulls it first: `status`,
+`sync`, `audit`, `pushed`, and the release plan, `cut`, `rebase`, `include`,
+`drop` and `advance`. A pull that fails is a problem on the report, naming the
+remote. A report still answers from the entries this machine has, and exits
+`3`. A release write refuses, because its drop guard checks against the newest
+recorded cut and a stale ledger would check against the wrong one. `status`
+also notes how many of a fork's entries the remote lacks, and names
+`ledger-sweep.log` when the last sweep failed. `notch`, `start`, `finish`,
+`track` and `depends` do not pull: they read a statement only to stamp their
+entry with a pull request number.

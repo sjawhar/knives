@@ -239,7 +239,7 @@ fn edit_release(
         cache_root,
         heads,
     };
-    let plan = release::plan(fork, &consumers, &Ledger::for_repo(repo).entries()?)?;
+    let plan = super::pulled_plan(fork, &consumers)?;
     if !plan.problems.is_empty() {
         println!("{}", release::render(&plan));
         println!(

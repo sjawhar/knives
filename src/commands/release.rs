@@ -196,6 +196,9 @@ pub struct Plan {
     pub parents: Vec<(CommitId, Vec<String>)>,
     pub stale: Vec<Finding>,
     pub pins: Vec<Pin>,
+    /// A consumer could not be consulted, so `pins` may lack the pin that
+    /// would change the verdict, and no verdict is given.
+    pub pins_unknown: bool,
     /// Informational: something worth saying that is not a failure.
     pub notes: Vec<String>,
     /// Could not answer. These, and only these, make the command exit non-zero
@@ -691,6 +694,7 @@ fn add_consumer_pins(
     // Every consumer, not one: they can sit on different releases, so a plan that saw only
     // the first would call a release unpinned while something else was frozen on it.
     let slug = repo_slug(fork.entry);
+    let consulted = plan.problems.len();
     for consumer in consumers.slugs {
         let scan = scan_consumer_slug_with_heads(
             consumers.forge,
@@ -717,6 +721,7 @@ fn add_consumer_pins(
                 .map(|problem| format!("{}: {problem}", consumer.display())),
         );
     }
+    plan.pins_unknown = plan.problems.len() > consulted;
 }
 
 /// What the plan says about local branches the release does not carry.
@@ -1104,7 +1109,9 @@ pub fn render(plan: &Plan) -> String {
     }
     // A consumer that could not be consulted may hold the pin the verdict would
     // deny; the census refuses the same no-pin claim after a failed scan.
-    lines.push(if plan.problems.is_empty() {
+    lines.push(if plan.pins_unknown {
+        "  pinned-ness unknown: a consumer could not be consulted (see above)".to_owned()
+    } else {
         match repair_effect(
             &plan.pins,
             BookmarkRef::parse(release).branch(),
@@ -1128,8 +1135,6 @@ pub fn render(plan: &Plan) -> String {
                 "  none of these pins is of this release: either is safe".to_owned()
             }
         }
-    } else {
-        "  pinned-ness unknown: a consumer could not be consulted (see above)".to_owned()
     });
     lines.push(
         "  planning by default. `knives release cut [name]` names a new cut of this \

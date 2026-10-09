@@ -5,9 +5,10 @@
     reason = "a fixture or assertion that cannot proceed IS the test failure"
 )]
 
-//! `knives ledger sweep` and the hand-off every write makes to it, through the
-//! real binary: a config home whose ledger root is a git repository sharing a
-//! bare remote, as a machine set up to share its ledger has.
+//! `knives ledger sweep`, the hand-off every write makes to it, and the pull
+//! a deciding command makes first, through the real binary: a config home
+//! whose ledger root is a git repository sharing a bare remote, as a machine
+//! set up to share its ledger has.
 
 #[path = "common/lab.rs"]
 mod lab;
@@ -395,4 +396,203 @@ fn a_burst_of_concurrent_writes_reaches_the_remote_without_a_failure() {
         .parse()
         .expect("a count");
     assert!(commits < WRITES, "{commits} commits for {WRITES} writes");
+}
+
+/// `knives <args>` from `lab`'s work checkout, as the machine whose config
+/// home is `home`.
+fn knives_on(lab: &lab::Lab, home: &Path, args: &[&str]) -> Output {
+    lab::knives_command(&lab.work, home, lab.temp_path(), args)
+        .env("KNIVES_OWNER", "ses_fff688")
+        .output()
+        .expect("run knives")
+}
+
+/// `status demo` as JSON, without the forge or landed probes.
+fn status_on(lab: &lab::Lab, home: &Path) -> (Option<i32>, serde_json::Value) {
+    let status = knives_on(
+        lab,
+        home,
+        &["--json", "status", "demo", "--no-github", "--no-landed"],
+    );
+    let report = serde_json::from_slice(&status.stdout).unwrap_or_else(|error| {
+        panic!(
+            "status emits JSON ({error}): {}\n{}",
+            String::from_utf8_lossy(&status.stdout),
+            String::from_utf8_lossy(&status.stderr)
+        )
+    });
+    (status.status.code(), report)
+}
+
+/// A second machine's config home: the same registry, nothing else yet.
+fn second_machine(first: &Path) -> tempfile::TempDir {
+    let home = tempfile::tempdir().expect("second config home");
+    std::fs::copy(first.join("repos.toml"), home.path().join("repos.toml"))
+        .expect("copy the registry");
+    home
+}
+
+#[test]
+fn a_statement_made_on_one_machine_shows_in_status_on_another_after_a_sweep() {
+    // Given: two machines sharing one ledger remote, each with its own config
+    // home and ledger, and a branch both can see.
+    let lab = lab::Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let (alpha, _consumer) = lab::release_test_home(&lab);
+    let beta = second_machine(alpha.path());
+    let (_remote_dir, remote) = bare_remote();
+    share(alpha.path(), "alpha", &remote, &["demo"]);
+    share(beta.path(), "beta", &remote, &["demo"]);
+
+    // When: alpha states the branch's pull request, and the sweep that write
+    // handed off has carried it to the remote.
+    let tracked = knives_on(
+        &lab,
+        alpha.path(),
+        &["--text", "track", "feat/alpha", "--pr", "1234"],
+    );
+    assert!(
+        tracked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&tracked.stderr)
+    );
+    wait_until("alpha's statement to reach the remote", || {
+        entries_on(&remote, "alpha") == 1
+    });
+    settle(alpha.path());
+    assert!(
+        !beta.path().join("ledger").join("demo").exists(),
+        "beta had alpha's entry before it asked"
+    );
+
+    // Then: beta's status, with no sync or sweep of its own, shows the
+    // statement on the branch's row, and reports no problem.
+    let (code, report) = status_on(&lab, beta.path());
+    assert_eq!(code, Some(0), "{report}");
+    let row = report["branches"]
+        .as_array()
+        .expect("branch rows")
+        .iter()
+        .find(|row| row["name"] == "feat/alpha")
+        .unwrap_or_else(|| panic!("no feat/alpha row: {report}"));
+    assert_eq!(row["pr"]["number"], 1234, "row was: {row}");
+    assert_eq!(row["pr"]["stated"], true, "row was: {row}");
+    assert!(report.get("problems").is_none(), "{report}");
+}
+
+#[test]
+fn a_status_that_cannot_pull_says_so_and_still_answers() {
+    // Given: a machine whose ledger remote cannot be reached.
+    let lab = lab::Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let (home, _consumer) = lab::release_test_home(&lab);
+    share(
+        home.path(),
+        "alpha",
+        Path::new("/nonexistent/ledger.git"),
+        &["demo"],
+    );
+
+    // When: status runs.
+    let (code, report) = status_on(&lab, home.path());
+
+    // Then: the failed pull is a problem, and the branches are still reported.
+    assert_eq!(code, Some(3), "{report}");
+    let problems = report["problems"].as_array().expect("problems");
+    assert!(
+        problems.iter().any(|problem| problem
+            .as_str()
+            .is_some_and(|text| text.contains("could not pull the ledger from origin"))),
+        "{report}"
+    );
+    assert!(
+        report["branches"]
+            .as_array()
+            .expect("branch rows")
+            .iter()
+            .any(|row| row["name"] == "feat/alpha"),
+        "{report}"
+    );
+}
+
+#[test]
+fn status_counts_entries_the_remote_lacks_and_names_a_failed_sweeps_log() {
+    // Given: a shared ledger with one entry no sweep has carried.
+    let lab = lab::Lab::new();
+    let (home, _consumer) = lab::release_test_home(&lab);
+    let (_remote_dir, remote) = bare_remote();
+    let root = share(home.path(), "alpha", &remote, &["demo"]);
+    append(&root, "demo", 1);
+
+    // When: status runs.
+    let (code, report) = status_on(&lab, home.path());
+
+    // Then: a note says one entry is not on the remote yet; nothing failed.
+    assert_eq!(code, Some(0), "{report}");
+    let notes = |report: &serde_json::Value| -> Vec<String> {
+        report["notes"]
+            .as_array()
+            .map(|notes| {
+                notes
+                    .iter()
+                    .filter_map(|note| note.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    assert!(
+        notes(&report)
+            .iter()
+            .any(|note| note.starts_with("1 ledger entry not yet on origin")),
+        "{report}"
+    );
+
+    // When: the last sweep failed, and status runs again.
+    let log = home.path().join("ledger-sweep.log");
+    std::fs::write(&log, "the last ledger sweep failed:\n").expect("write a sweep log");
+    let (code, report) = status_on(&lab, home.path());
+
+    // Then: the same note names where the failure is.
+    assert_eq!(code, Some(0), "{report}");
+    let named = format!("see {}", log.display());
+    assert!(
+        notes(&report)
+            .iter()
+            .any(|note| note.starts_with("1 ledger entry not yet on origin")
+                && note.contains(&named)),
+        "{report}"
+    );
+}
+
+#[test]
+fn a_release_cut_is_refused_when_the_ledger_cannot_be_pulled() {
+    // Given: a branch ready for a first cut, on a machine whose ledger remote
+    // cannot be reached.
+    let lab = lab::Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let (home, _consumer) = lab::release_test_home(&lab);
+    share(
+        home.path(),
+        "alpha",
+        Path::new("/nonexistent/ledger.git"),
+        &["demo"],
+    );
+
+    // When: the cut is asked for.
+    let cut = lab::knives_release(&lab, &home, &["cut", "release/2026-08-04"]);
+
+    // Then: it is refused as incomplete, saying why, and no release exists.
+    let stdout = String::from_utf8_lossy(&cut.stdout);
+    assert_eq!(cut.status.code(), Some(3), "{stdout}");
+    assert!(
+        stdout.contains("could not pull the ledger from origin"),
+        "{stdout}"
+    );
+    assert!(
+        knives::jj::Repo::open(&lab.work)
+            .expect("open the work checkout")
+            .resolve_commit("release/2026-08-04")
+            .is_err(),
+        "the cut was made anyway"
+    );
 }

@@ -324,7 +324,7 @@ fn release_plan_exit(
         cache_root,
         heads,
     };
-    let plan = release::plan(fork, &consumers, &Ledger::for_repo(&fork.name).entries()?)?;
+    let plan = super::pulled_plan(fork, &consumers)?;
     println!("{}", release::render(&plan));
     let mut exit = release::exit_for(&plan);
     if let Some(lag) = release::trunk_lag(opened, plan.release.as_deref(), &entry.upstream_trunk())

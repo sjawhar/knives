@@ -483,8 +483,10 @@ fn run_consumers(
 
 /// Reconcile one fork's local bookmarks with the live refs on their owning remotes.
 fn run_pushed(fork: &Fork<'_>, branches: &[String], output: Output) -> anyhow::Result<Exit> {
+    let pulled = knives::ledger_sweep::pull(&[&fork.name]);
     let store = Store::open(default_state_path(), &[&fork.name])?;
-    let report = pushed::gather(fork, &store, branches);
+    let mut report = pushed::gather(fork, &store, branches);
+    report.problems.extend(pulled.problems_for(&report.repo));
     if let Some(payload) = knives::cli::machine_payload(output, &report)? {
         println!("{payload}");
     } else {
@@ -504,7 +506,9 @@ fn run_audit(
         Ok(chosen) => chosen,
         Err(exit) => return Ok(exit),
     };
-    let store = Store::open(default_state_path(), &placed(&chosen))?;
+    let forks = placed(&chosen);
+    let pulled = knives::ledger_sweep::pull(&forks);
+    let store = Store::open(default_state_path(), &forks)?;
     let cli_forge = CliForge;
     let forge = use_forge.then_some(&cli_forge as &dyn Forge);
     let cache_root = knives::forge_cache::cache_root();
@@ -512,7 +516,7 @@ fn run_audit(
     let mut worst = Exit::Ok;
     let mut reports = Vec::with_capacity(chosen.len());
     for chosen in &chosen {
-        let report = match chosen {
+        let mut report = match chosen {
             Selected::Bound(fork) => audit::gather(&audit::AuditInput {
                 fork,
                 store: &store,
@@ -526,6 +530,7 @@ fn run_audit(
                 report
             }
         };
+        report.problems.extend(pulled.problems_for(&report.repo));
         worst = worst.worst(audit::exit_for(&report));
         reports.push(report);
     }
@@ -623,6 +628,25 @@ fn scribe_for(fork: &Fork<'_>, bound: Option<&RepoName>) -> anyhow::Result<Scrib
         fork.checkout.path.clone(),
         current_identity(bound)?.owner,
     ))
+}
+
+/// The release plan for `fork`, from a ledger pulled first: what a release
+/// command decides from.
+///
+/// A pull that fails is one of the plan's problems. The plan still answers
+/// from the entries this machine has, and a command that would write from it
+/// refuses, exactly as it does when a consumer could not be consulted: the
+/// drop guard checks a member against the newest recorded cut, and a stale
+/// ledger would check it against the wrong one.
+fn pulled_plan(
+    fork: &Fork<'_>,
+    consumers: &knives::commands::release::ConsumerInputs<'_>,
+) -> anyhow::Result<knives::commands::release::Plan> {
+    let pulled = knives::ledger_sweep::pull(&[&fork.name]);
+    let mut plan =
+        knives::commands::release::plan(fork, consumers, &Ledger::for_repo(&fork.name).entries()?)?;
+    plan.problems.extend(pulled.problems_for(&plan.repo));
+    Ok(plan)
 }
 
 /// One registry entry as a many-repo verb sees it after the scan.
@@ -805,7 +829,9 @@ fn run_status(ground: Ground<'_>, view: StatusView<'_>) -> anyhow::Result<Exit> 
         Ok(list) => list,
         Err(exit) => return Ok(exit),
     };
-    let store = Store::open(default_state_path(), &placed(&chosen))?;
+    let forks = placed(&chosen);
+    let pulled = knives::ledger_sweep::pull(&forks);
+    let store = Store::open(default_state_path(), &forks)?;
     let cli_forge = CliForge;
     let forge: Option<&dyn Forge> = if use_forge { Some(&cli_forge) } else { None };
     let cache_root = knives::forge_cache::cache_root();
@@ -870,7 +896,9 @@ fn run_status(ground: Ground<'_>, view: StatusView<'_>) -> anyhow::Result<Exit> 
     // One document per invocation: an array under `--all`, the object otherwise.
     let mut worst = Exit::Ok;
     let mut reports = Vec::with_capacity(rows.len());
-    for (report, timings) in rows {
+    for (mut report, timings) in rows {
+        report.problems.extend(pulled.problems_for(&report.repo));
+        report.notes.extend(pulled.backlog_for(&report.repo));
         // stderr, so a timed run's stdout is still the report a script parses.
         if let Some(timings) = timings
             && knives::timing::enabled()
@@ -915,7 +943,9 @@ fn run_sync(
         Ok(list) => list,
         Err(exit) => return Ok(exit),
     };
-    let mut store = Store::open_for_update(default_state_path(), &placed(&chosen))?;
+    let forks = placed(&chosen);
+    let pulled = knives::ledger_sweep::pull(&forks);
+    let mut store = Store::open_for_update(default_state_path(), &forks)?;
     let cli_forge = CliForge;
     let forge = use_forge.then_some(&cli_forge as &dyn Forge);
     let cache_root = knives::forge_cache::cache_root();
@@ -926,7 +956,7 @@ fn run_sync(
         // A repository that cannot be synced is still a row in the document,
         // carrying the error as a problem; the repositories before it already
         // fetched and wrote their events, and their rows are not lost to it.
-        let report = match chosen {
+        let mut report = match chosen {
             Selected::Bound(fork) => scribe_for(fork, bound.as_ref())
                 .and_then(|scribe| {
                     sync::sync_repo(sync::SyncInput {
@@ -948,6 +978,7 @@ fn run_sync(
                 ..sync::Report::default()
             },
         };
+        report.problems.extend(pulled.problems_for(&report.repo));
         worst = worst.worst(sync::exit_for(&report));
         reports.push(report);
     }

@@ -371,6 +371,28 @@ pub fn unpushed(repository: &Repository, remote: &str, machine: &str) -> Result<
     Ok(at(&reference).is_some_and(|own| at(&fetched) != Some(own)))
 }
 
+/// Every entry in the forks `repository` carries that `remote` lacks.
+///
+/// That is every entry written here that no copy of `remote`'s refs carries,
+/// committed or not. The copies are what the last [`fetch`] or this machine's
+/// own [`push`] saw, so the answer is as current as the last pull.
+pub fn unsent(repository: &Repository, remote: &str) -> Result<BTreeSet<PathBuf>, GitError> {
+    let remote = ref_component("remote", remote)?;
+    let namespace = format!("{FETCHED}{remote}/");
+    let mut sent = BTreeSet::new();
+    for (_, commit) in references(repository, &[&namespace])? {
+        sent.extend(
+            tree_items(repository, &commit)?
+                .into_iter()
+                .filter(|item| item.node.is_blob())
+                .map(|item| item.path),
+        );
+    }
+    let mut local = local_entries(repository)?;
+    local.retain(|path| !sent.contains(path));
+    Ok(local)
+}
+
 /// Every `knives.*` key in the repository at `git_dir`'s own config.
 ///
 /// Lowercased as git prints it, with its value, in file order: a key set

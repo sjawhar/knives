@@ -97,8 +97,10 @@ commit-shaped evidence and anchors against the repository as it is now.
 The ledger travels between machines once its directory is a git repository naming this machine
 (`knives.machine`) and the forks it shares (`knives.fork`, one per fork): every write starts
 `knives ledger sweep` in the background, which commits new entries to the machine's own ref,
-pulls every other machine's, and pushes. One sweep runs at a time and nothing ever rebases; the
-`using-knives` skill's ledger reference has the setup.
+pulls every other machine's, and pushes. One sweep runs at a time and nothing ever rebases. A
+command that decides from the ledger (`status`, `sync`, `audit`, `pushed`, the release verbs)
+pulls it first, and says so in its problems when it cannot. The `using-knives` skill's ledger
+reference has the setup.
 
 `knives status` carries the newest human note for each branch, preferring it over a newer machine
 event. Its compact notch cell prefixes a disposition, if any, and appends the count of entries it

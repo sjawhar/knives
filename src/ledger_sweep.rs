@@ -1,4 +1,5 @@
-//! Carrying the ledger between machines: the sweep a write hands off to.
+//! Carrying the ledger between machines: the sweep a write hands off to, and
+//! the pull a command runs before it decides something from the ledger.
 //!
 //! A write appends its entry and exits; [`hand_off`] starts `knives ledger
 //! sweep` detached, so no write waits on the network or on another writer.
@@ -7,7 +8,15 @@
 //! holder looks again before it lets go, so it carries whatever the second
 //! one would have, and a burst of writes costs one sweep. Waiting instead
 //! would put every writer of a burst back in line for one repository.
+//!
+//! A command that decides something from the ledger pulls first ([`pull`]),
+//! and decides only from a ledger it could pull, or says it could not. A
+//! report says so in its problems and still answers from the entries this
+//! machine has, because the person reading it sees the staleness there. A
+//! release write has nowhere to say so that would undo it, so the same
+//! problem refuses it.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -55,6 +64,13 @@ impl Destination {
     /// it is outside every fork's directory and no commit can carry it.
     fn transport_lock(&self) -> PathBuf {
         self.repository.git_dir().join("knives-transport")
+    }
+
+    fn carries(&self, fork: &str) -> bool {
+        self.repository
+            .forks()
+            .iter()
+            .any(|carried| carried.as_str() == fork)
     }
 
     fn describe(&self) -> String {
@@ -324,6 +340,128 @@ fn record(root: &Path, problems: &[String]) -> Result<(), SweepError> {
     std::fs::write(&log, text).map_err(|source| SweepError::Write { path: log, source })
 }
 
+/// What pulling the ledger before a decision found, per fork asked about.
+#[derive(Debug, Default)]
+pub struct Pulled {
+    root: PathBuf,
+    destinations: Vec<Destination>,
+    problems: BTreeMap<RepoName, Vec<String>>,
+}
+
+impl Pulled {
+    /// The problems a report about `fork` carries: a pull that failed, or
+    /// destinations that could not be read.
+    pub fn problems_for(&self, fork: &str) -> Vec<String> {
+        self.problems
+            .get(&RepoName::new(fork))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// How many of `fork`'s entries its remote does not have yet, and where
+    /// the last sweep's failures are when it failed; `None` when neither.
+    pub fn backlog_for(&self, fork: &str) -> Option<String> {
+        let destination = self
+            .destinations
+            .iter()
+            .find(|destination| destination.carries(fork))?;
+        let unsent = ledger_git::unsent(&destination.repository, &destination.remote)
+            .map(|paths| paths.iter().filter(|path| path.starts_with(fork)).count());
+        let log = sweep_log(&self.root);
+        let failed = log
+            .exists()
+            .then(|| format!("the last ledger sweep failed: see {}", log.display()));
+        let waiting = match unsent {
+            Ok(0) => None,
+            Ok(1) => Some(format!(
+                "1 ledger entry not yet on {}",
+                destination.describe()
+            )),
+            Ok(count) => Some(format!(
+                "{count} ledger entries not yet on {}",
+                destination.describe()
+            )),
+            Err(error) => Some(format!(
+                "could not count ledger entries not yet on {}: {error}",
+                destination.describe()
+            )),
+        };
+        match (waiting, failed) {
+            (Some(waiting), Some(failed)) => Some(format!("{waiting}; {failed}")),
+            (waiting, failed) => waiting.or(failed),
+        }
+    }
+}
+
+/// Pull the ledgers of `forks` from every destination that carries one,
+/// before a command decides something from them.
+pub fn pull(forks: &[&RepoName]) -> Pulled {
+    pull_at(&crate::ledger::default_ledger_root(), forks)
+}
+
+/// [`pull`] for the ledger at `root`.
+///
+/// Each destination's fetch waits for its transport lock, so a pull racing a
+/// sweep reads what the sweep left rather than failing on it. A failure is a
+/// problem for every fork asked about that the destination carries, never an
+/// error: the command still answers from the entries this machine has.
+pub fn pull_at(root: &Path, forks: &[&RepoName]) -> Pulled {
+    let mut pulled = Pulled {
+        root: root.to_owned(),
+        ..Pulled::default()
+    };
+    if forks.is_empty() {
+        return pulled;
+    }
+    let found = match destinations(root) {
+        Ok(found) => found,
+        Err(error) => {
+            for fork in forks {
+                pulled
+                    .problems
+                    .entry((*fork).clone())
+                    .or_default()
+                    .push(format!("could not pull the ledger: {error}"));
+            }
+            return pulled;
+        }
+    };
+    let asked: BTreeSet<&str> = forks.iter().map(|fork| fork.as_str()).collect();
+    for destination in found {
+        let carried: Vec<&RepoName> = destination
+            .repository
+            .forks()
+            .iter()
+            .filter(|fork| asked.contains(fork.as_str()))
+            .collect();
+        if carried.is_empty() {
+            continue;
+        }
+        if let Err(error) = pull_one(&destination) {
+            let problem = format!(
+                "could not pull the ledger from {}: {error}; this answers from the entries \
+                 this machine has",
+                destination.describe()
+            );
+            for fork in carried {
+                pulled
+                    .problems
+                    .entry(fork.clone())
+                    .or_default()
+                    .push(problem.clone());
+            }
+        }
+        pulled.destinations.push(destination);
+    }
+    pulled
+}
+
+fn pull_one(destination: &Destination) -> Result<usize, SweepError> {
+    let _transport = FileLock::acquire(&destination.transport_lock(), LockWait::TRANSPORT)?;
+    let refs = ledger_git::fetch(&destination.repository, &destination.remote)?;
+    Ok(ledger_git::materialise(&destination.repository, &refs)?)
+}
+
 /// Start `knives ledger sweep` detached, and return without waiting for it.
 ///
 /// Called once, as the process exits, by a command that appended an entry
@@ -362,7 +500,6 @@ pub fn hand_off() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeSet;
 
     fn git(git_dir: &Path, args: &[&str]) {
         let status = std::process::Command::new("git")
@@ -446,5 +583,46 @@ mod tests {
             destination.repository.forks(),
             &BTreeSet::from([RepoName::new("a-repo"), RepoName::new("b-repo")])
         );
+    }
+
+    #[test]
+    fn a_machine_name_with_no_fork_carries_nothing_and_a_pull_asks_no_remote() {
+        let (_home, root) = ledger_root();
+        let git_dir = root.join(".git");
+        git(&git_dir, &["config", "knives.machine", "alpha"]);
+        // A remote that cannot answer: a pull that tried it would fail.
+        git(
+            &git_dir,
+            &["remote", "add", "origin", "/nonexistent/remote.git"],
+        );
+
+        let pulled = pull_at(&root, &[&RepoName::new("a-repo")]);
+
+        assert!(pulled.problems_for("a-repo").is_empty());
+        assert_eq!(pulled.backlog_for("a-repo"), None);
+    }
+
+    #[test]
+    fn a_pull_that_fails_is_a_problem_for_the_forks_it_carries_only() {
+        let (_home, root) = ledger_root();
+        let git_dir = root.join(".git");
+        git(&git_dir, &["config", "knives.machine", "alpha"]);
+        git(&git_dir, &["config", "knives.fork", "a-repo"]);
+        git(
+            &git_dir,
+            &["remote", "add", "origin", "/nonexistent/remote.git"],
+        );
+
+        let pulled = pull_at(&root, &[&RepoName::new("a-repo"), &RepoName::new("b-repo")]);
+
+        let problems = pulled.problems_for("a-repo");
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems
+                .iter()
+                .all(|problem| problem.contains("could not pull the ledger from origin")),
+            "{problems:?}"
+        );
+        assert!(pulled.problems_for("b-repo").is_empty());
     }
 }
