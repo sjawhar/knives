@@ -274,29 +274,113 @@ fn a_sighting_inside_the_claimed_workspace_reaches_the_notice() {
     );
 }
 
-#[test]
-fn a_claim_still_kept_under_the_registry_key_puts_the_refusal_in_the_notice() {
-    // Given: a state file an older knives wrote, keeping the fork's claim
-    // under its registry key.
-    let (lab, home) = forge_fork();
-    std::fs::write(
-        home.path().join("state.json"),
-        json!({"claims": {"demo/feat/gamma": {
-            "repo": "demo", "branch": "feat/gamma", "owner": "agent-one",
-            "why": "port it", "started": "2026-01-01T00:00:00Z", "files": []
-        }}})
-        .to_string(),
+/// The fork's status report, from a status run as the terminal user.
+fn status_of_demo(lab: &Lab, home: &Path) -> Output {
+    knives_as(
+        lab,
+        home,
+        &lab.work,
+        None,
+        &["--json", "status", "demo", "--no-github", "--no-landed"],
     )
-    .expect("write state");
+}
 
-    // When: a Claude Code session starts in the fork.
-    let notice = session_start_notice(home.path(), &lab.work);
+/// Before `knives ledger migrate`, status and the Claude Code hook both refuse
+/// and name the command; after it, both open and show `agent-one`'s claim on
+/// `feat/gamma`.
+fn refused_until_migrated(lab: &Lab, home: &Path) {
+    // When: status runs, and a Claude Code session starts in the fork.
+    let refused = status_of_demo(lab, home);
+    let notice = session_start_notice(home, &lab.work);
 
-    // Then: the agent is told the claims cannot be read and how to fix it,
-    // rather than hearing nothing and taking the branch for free.
+    // Then: status exits incomplete naming the command verbatim, and the
+    // agent is told so in its context rather than shown an empty roster.
+    let errors = String::from_utf8_lossy(&refused.stderr);
+    assert_eq!(refused.status.code(), Some(3), "stderr: {errors}");
     assert!(
-        notice.contains("do not assume a branch is free"),
+        errors.contains("Run `knives ledger migrate`"),
+        "stderr: {errors}"
+    );
+    assert!(
+        notice.contains("Run `knives ledger migrate`")
+            && notice.contains("do not assume a branch is free"),
         "notice: {notice}"
     );
-    assert!(notice.contains("knives ledger migrate"), "notice: {notice}");
+    assert!(!notice.contains("No branch is claimed"), "notice: {notice}");
+
+    // When: the migration runs, and the same two run again.
+    succeeded(&knives_as(
+        lab,
+        home,
+        &lab.work,
+        Some("ses_migrate"),
+        &["--json", "ledger", "migrate"],
+    ));
+    let opened = succeeded(&status_of_demo(lab, home)).stdout.clone();
+    let notice = session_start_notice(home, &lab.work);
+
+    // Then: status opens with the claim on the branch's row, and the notice
+    // names it.
+    let report: Value = serde_json::from_slice(&opened).expect("status JSON");
+    let row = report["branches"]
+        .as_array()
+        .expect("branches")
+        .iter()
+        .find(|row| row["name"] == "feat/gamma")
+        .unwrap_or_else(|| panic!("no feat/gamma row: {report}"));
+    assert_eq!(row["claim"]["id"], "agent-one", "row: {row}");
+    assert!(
+        notice.contains("feat/gamma (agent-one, harness-session, claimed "),
+        "notice: {notice}"
+    );
+}
+
+#[test]
+fn a_claim_still_kept_under_the_registry_key_is_refused_until_migrated() {
+    // Given: a claimed branch whose claim the state file keeps under the
+    // fork's registry key, as an older knives wrote it.
+    let (lab, home) = forge_fork();
+    claim_gamma(&lab, home.path());
+    let path = home.path().join("state.json");
+    let mut state: Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("read state"))
+            .expect("state JSON");
+    let claims = state["claims"].as_object_mut().expect("claims");
+    let mut claim = claims
+        .remove(&format!("{KEPT_UNDER}/feat/gamma"))
+        .expect("the claim under the upstream name");
+    claim["repo"] = json!("demo");
+    claims.insert("demo/feat/gamma".to_owned(), claim);
+    std::fs::write(&path, state.to_string()).expect("write state");
+
+    refused_until_migrated(&lab, home.path());
+}
+
+#[test]
+fn a_ledger_still_kept_under_the_registry_key_is_refused_until_migrated() {
+    // Given: a claimed branch, and a ledger entry an older knives filed in
+    // the directory named for the fork's registry key.
+    let (lab, home) = forge_fork();
+    claim_gamma(&lab, home.path());
+    knives::ledger::Ledger::at(home.path().join("ledger").join("demo"))
+        .append(&knives::ledger::Entry {
+            ts: "2026-01-01T00:00:00Z".to_owned(),
+            owner: "ses_older".to_owned(),
+            subject: None,
+            kind: knives::ledger::Kind::Note,
+            disposition: None,
+            statement: None,
+            text: "written by an older knives".to_owned(),
+            evidence: Vec::new(),
+            anchor: None,
+            pr: None,
+            parents: Vec::new(),
+        })
+        .expect("append a note");
+
+    refused_until_migrated(&lab, home.path());
+    assert!(
+        !home.path().join("ledger/demo").exists(),
+        "the registry key's directory is gone after migrating"
+    );
 }
