@@ -918,7 +918,7 @@ pub fn gather_timed(
         .map(|input| input.branch.clone())
         .collect();
     all_branches.extend(divergent_branches.keys().cloned());
-    let declared = phases::declared_numbers(upstream, &all_branches, store);
+    let declared = phases::declared_numbers(upstream, &all_branches, store, options.registry);
     let notches = notches_from_ledger(options.ledger, &mut report);
     report.repo_notches = repo_notches(&notches);
     note_fetched_heads(&mut report, fetched_heads);

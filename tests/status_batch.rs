@@ -560,6 +560,70 @@ fn stated_pulls_and_dependencies_are_answered_from_the_one_batch() {
 }
 
 #[test]
+fn a_same_fork_dependency_written_by_its_registry_key_is_asked_in_the_one_batch() {
+    // Given: a fork whose upstream is a forge URL, kept under acme/demo, with
+    // a branch requiring two of its own pull requests: one as an older knives
+    // recorded it, by the registry key, and one as knives records it now, by
+    // the repository's name.
+    let lab = lab::Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let upstream = "https://forge.invalid/Acme/Demo";
+    lab.upstream_at_forge_url(upstream);
+    let entry = knives::config::RepoEntry::new(upstream, lab.work.display().to_string());
+    let fork = lab::lab_fork(&lab, "demo", &entry);
+    assert_eq!(fork.upstream.as_str(), "acme/demo");
+    let forge = knives::forge::fake::FakeForge {
+        vanished_states: BTreeMap::from([(43, "MERGED".to_owned()), (44, "OPEN".to_owned())]),
+        ..knives::forge::fake::FakeForge::default()
+    };
+    let state = tempfile::tempdir().expect("state directory");
+    lab::state_on_ledger(
+        state.path(),
+        fork.upstream.as_str(),
+        "feat/alpha",
+        StatementKind::Depends,
+        Some("demo#43,acme/demo#44"),
+    );
+    let store =
+        Store::open(state.path().join("state.json"), &[&fork.upstream]).expect("open store");
+    let registry = Registry {
+        repos: BTreeMap::from([("demo".to_owned(), entry.clone())]),
+        ..Registry::default()
+    };
+
+    // When: status gathers with the forge.
+    let report = status::gather(
+        &fork,
+        &store,
+        &knives::commands::status::Options {
+            probe: false,
+            forge: Some(&forge),
+            cache: None,
+            registry: Some(&registry),
+            ledger: None,
+            workers: 1,
+        },
+    )
+    .expect("gather");
+
+    // Then: both numbers were in the one batch, so each is answered: the
+    // merged one is met, the open one is an unmet dependency, and neither is
+    // a question the forge was never asked.
+    assert!(report.problems.is_empty(), "was: {report:?}");
+    let unmet: Vec<String> = report
+        .findings
+        .iter()
+        .filter(|group| group.kind == knives::detect::FindingKind::UnmetDependency)
+        .flat_map(|group| group.items.iter().map(|item| item.detail.clone()))
+        .collect();
+    assert_eq!(
+        unmet,
+        ["feat/alpha requires acme/demo#44, which is open"],
+        "was: {report:?}"
+    );
+}
+
+#[test]
 fn landed_verdicts_come_from_the_cache_when_the_key_matches() {
     let lab = lab::Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
