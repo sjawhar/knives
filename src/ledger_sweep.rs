@@ -96,94 +96,172 @@ impl Destinations {
     /// What a fork in [`Destinations::unreached`] is a problem for.
     fn unreached_problem(root: &Path, fork: &UpstreamName, ledger: &str) -> String {
         format!(
-            "{fork}: repos.toml says its ledger belongs to {ledger}, but {} is not a \
-             repository whose origin is {ledger}, so its entries travel to and from no other \
-             machine here",
-            root.join(".git").display()
+            "{fork}: repos.toml says its ledger belongs to {ledger}, but no git directory \
+             knives reads ({} and each one in {}) has {ledger} as its origin, so its entries \
+             travel to and from no other machine here",
+            root.join(".git").display(),
+            ledger_repositories(root).display()
         )
     }
 }
 
-/// Every destination the ledger at `root` travels through.
-///
-/// The one candidate is the repository at `<root>/.git`. It carries each
-/// fork whose `repos.toml` entry, read from beside `root`, names its
-/// `origin` as the repository the fork's ledger belongs to
-/// ([`crate::config::RepoEntry::ledger`]), and it commits as the machine its
-/// git config names, `knives.machine`, unique among the machines sharing
-/// that remote. The registry is the one source of which forks travel where;
-/// the repository's git config says only who this machine is.
-///
-/// A fork with no `ledger` is not shared. One whose `ledger` names a
-/// repository `<root>/.git` is not, because the root is no repository or
-/// its `origin` is another, is [`Destinations::unreached`]. No fork shared
-/// and no machine named is a ledger nobody set up to share: no destination,
-/// and nothing to report. A machine named with no fork shared is a
-/// destination that carries nothing. A `knives.*` key this does not read,
-/// or forks carried with no machine name, is refused, with the command that
-/// fixes it.
-pub fn destinations(root: &Path) -> Result<Destinations, SweepError> {
-    let registry = crate::config::load(&root.with_file_name("repos.toml"))?;
-    let git_dir = root.join(".git");
-    let present = git_dir.try_exists().map_err(|source| SweepError::Read {
-        path: git_dir.clone(),
+/// The directory beside the ledger root holding a git directory for each
+/// repository the ledger travels through besides the root's own `.git`.
+pub fn ledger_repositories(root: &Path) -> PathBuf {
+    root.with_file_name("ledger-repositories")
+}
+
+/// Every git directory the ledger at `root` may travel through: `<root>/.git`
+/// when it exists, then each directory in [`ledger_repositories`] (or
+/// symlink to one), in name order. Anything else there is refused: it is no
+/// repository, and passing over it would leave a fork carried nowhere
+/// without a word.
+fn candidates(root: &Path) -> Result<Vec<PathBuf>, SweepError> {
+    let mut found = Vec::new();
+    let own = root.join(".git");
+    if own.try_exists().map_err(|source| SweepError::Read {
+        path: own.clone(),
         source,
-    })?;
-    let refused = |detail: String| SweepError::Config {
-        git_dir: git_dir.clone(),
-        detail,
+    })? {
+        found.push(own);
+    }
+    let directory = ledger_repositories(root);
+    let unreadable = |path: &Path| {
+        let path = path.to_owned();
+        move |source| SweepError::Read { path, source }
     };
+    let listing = match std::fs::read_dir(&directory) {
+        Ok(listing) => listing,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(found),
+        Err(source) => return Err(unreadable(&directory)(source)),
+    };
+    let mut others = Vec::new();
+    for dirent in listing {
+        let path = dirent.map_err(unreadable(&directory))?.path();
+        if !std::fs::metadata(&path)
+            .map_err(unreadable(&path))?
+            .is_dir()
+        {
+            return Err(SweepError::Config {
+                git_dir: path,
+                detail: format!(
+                    "is not a git directory, and {} holds only the git directories the ledger \
+                     travels through",
+                    directory.display()
+                ),
+            });
+        }
+        others.push(path);
+    }
+    others.sort();
+    found.extend(others);
+    Ok(found)
+}
+
+/// `knives.machine` and `remote.origin.url` of the git directory `git_dir`,
+/// refusing a `knives.*` key nothing reads.
+fn identity(git_dir: &Path) -> Result<(Option<String>, Option<String>), SweepError> {
     let mut machine = None;
     let mut origin = None;
-    if present {
-        for (key, value) in
-            ledger_git::local_config(&git_dir, "^(knives\\..*|remote\\.origin\\.url)$")?
-        {
-            match key.as_str() {
-                "knives.machine" => machine = Some(value),
-                "remote.origin.url" => origin = Some(value),
-                _ => {
-                    return Err(refused(format!(
+    for (key, value) in ledger_git::local_config(git_dir, "^(knives\\..*|remote\\.origin\\.url)$")?
+    {
+        match key.as_str() {
+            "knives.machine" => machine = Some(value),
+            "remote.origin.url" => origin = Some(value),
+            _ => {
+                return Err(SweepError::Config {
+                    git_dir: git_dir.to_owned(),
+                    detail: format!(
                         "sets {key}, which knives does not read: it reads knives.machine, and \
                          which forks a repository carries is each repos.toml entry's `ledger`. \
                          Remove it: git --git-dir={} config --unset-all {key}",
                         git_dir.display()
-                    )));
-                }
+                    ),
+                });
             }
         }
     }
-    let slug = origin.as_deref().and_then(crate::remote_url::remote_slug);
-    let mut carried = Vec::new();
-    let mut unreached = BTreeMap::new();
-    for (key, entry) in &registry.repos {
-        let Some(ledger) = &entry.ledger else {
-            continue;
+    Ok((machine, origin))
+}
+
+/// Every destination the ledger at `root` travels through.
+///
+/// The candidates are the repository at `<root>/.git` and each git
+/// directory in [`ledger_repositories`], all over the one working tree
+/// `root`. Each carries every fork whose `repos.toml` entry, read from
+/// beside `root`, names its `origin` as the repository the fork's ledger
+/// belongs to ([`crate::config::RepoEntry::ledger`]), and commits as the
+/// machine its git config names, `knives.machine`, unique among the
+/// machines sharing that remote. The registry is the one source of which
+/// forks travel where; a repository's git config says only who this machine
+/// is there.
+///
+/// A fork with no `ledger` is not shared. One whose `ledger` no candidate's
+/// `origin` names is [`Destinations::unreached`]. No fork shared and no
+/// machine named is a ledger nobody set up to share: no destination, and
+/// nothing to report. A candidate naming a machine and carrying no fork is a
+/// destination that carries nothing. Refused, each with what fixes it: a
+/// `knives.*` key this does not read, forks carried with no machine name,
+/// and two candidates whose `origin` is one repository, since which of them
+/// a fork's entries go through would be a guess.
+pub fn destinations(root: &Path) -> Result<Destinations, SweepError> {
+    let registry = crate::config::load(&root.with_file_name("repos.toml"))?;
+    let mut found = Vec::new();
+    let mut carried_anywhere = BTreeSet::new();
+    let mut origins: BTreeMap<String, PathBuf> = BTreeMap::new();
+    for git_dir in candidates(root)? {
+        let refused = |detail: String| SweepError::Config {
+            git_dir: git_dir.clone(),
+            detail,
         };
-        if slug.is_some_and(|slug| entry.shares_ledger_with(slug)) {
-            carried.push(entry.upstream_name(key));
-        } else {
-            let _ = unreached.insert(entry.upstream_name(key), ledger.clone());
-        }
-    }
-    let found = match machine {
-        Some(machine) => vec![Destination {
-            repository: Repository::new(&git_dir, root, carried)?,
-            remote: REMOTE.to_owned(),
-            machine,
-        }],
-        None if carried.is_empty() => Vec::new(),
-        None => {
-            let names: Vec<String> = carried.iter().map(ToString::to_string).collect();
+        let (machine, origin) = identity(&git_dir)?;
+        let slug = origin.as_deref().and_then(crate::remote_url::remote_slug);
+        if let Some(slug) = slug
+            && let Some(first) = origins.insert(slug.to_ascii_lowercase(), git_dir.clone())
+        {
             return Err(refused(format!(
-                "carries the ledgers of {}, but names no machine, so nothing can be committed \
-                 as this one. Name this machine, uniquely among every machine sharing \
-                 {REMOTE}: git --git-dir={} config knives.machine <name>",
-                names.join(", "),
-                git_dir.display()
+                "has {slug} as its origin, as {} does, so which of them carries its forks would \
+                 be a guess. Keep one",
+                first.display()
             )));
         }
-    };
+        let carried: Vec<UpstreamName> = registry
+            .repos
+            .iter()
+            .filter(|(_, entry)| slug.is_some_and(|slug| entry.shares_ledger_with(slug)))
+            .map(|(key, entry)| entry.upstream_name(key))
+            .collect();
+        match machine {
+            Some(machine) => {
+                carried_anywhere.extend(carried.iter().cloned());
+                found.push(Destination {
+                    repository: Repository::new(&git_dir, root, carried)?,
+                    remote: REMOTE.to_owned(),
+                    machine,
+                });
+            }
+            None if carried.is_empty() => {}
+            None => {
+                let names: Vec<String> = carried.iter().map(ToString::to_string).collect();
+                return Err(refused(format!(
+                    "carries the ledgers of {}, but names no machine, so nothing can be \
+                     committed as this one. Name this machine, uniquely among every machine \
+                     sharing {REMOTE}: git --git-dir={} config knives.machine <name>",
+                    names.join(", "),
+                    git_dir.display()
+                )));
+            }
+        }
+    }
+    let unreached = registry
+        .repos
+        .iter()
+        .filter_map(|(key, entry)| {
+            let ledger = entry.ledger.as_ref()?;
+            let fork = entry.upstream_name(key);
+            (!carried_anywhere.contains(&fork)).then(|| (fork, ledger.clone()))
+        })
+        .collect();
     Ok(Destinations { found, unreached })
 }
 
@@ -727,6 +805,115 @@ mod tests {
                 UpstreamName::new("acme/b-repo")
             ])
         );
+    }
+
+    /// A git directory in [`ledger_repositories`] named `name`, over `root`,
+    /// whose `origin` is `url`, committing as `machine`.
+    fn second_repository(root: &Path, name: &str, url: &str, machine: &str) -> PathBuf {
+        let git_dir = ledger_repositories(root).join(name);
+        let status = std::process::Command::new("git")
+            .args(["init", "--quiet", "--bare"])
+            .arg(&git_dir)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        git(&git_dir, &["config", "core.bare", "false"]);
+        git(&git_dir, &["remote", "add", "origin", url]);
+        git(&git_dir, &["config", "knives.machine", machine]);
+        git_dir
+    }
+
+    #[test]
+    fn each_ledger_repository_is_a_destination_carrying_the_forks_that_name_it() {
+        // Given: the root's own repository for acme/ledger, a second git
+        // directory over the same root for a dot-named personal repository,
+        // and a fork naming each.
+        let (_home, root) = ledger_root();
+        registry(
+            &root,
+            &[
+                ("a-repo", Some("acme/ledger")),
+                ("b-repo", Some("someone/.knives-ledger")),
+                ("c-repo", None),
+            ],
+        );
+        origin_at(&root, "/nonexistent/remote.git");
+        git(&root.join(".git"), &["config", "knives.machine", "alpha"]);
+        let personal = second_repository(
+            &root,
+            "personal.git",
+            "https://forge.invalid/someone/.knives-ledger",
+            "alpha-personal",
+        );
+
+        // When: the destinations are read.
+        let found = destinations(&root).unwrap();
+
+        // Then: there are two, each carrying only the fork that names it,
+        // both over the one root, and no fork is unreached.
+        assert!(found.unreached.is_empty(), "{:?}", found.unreached);
+        let carried: Vec<(PathBuf, String, Vec<String>)> = found
+            .found
+            .iter()
+            .map(|destination| {
+                assert_eq!(
+                    destination.repository.work_tree(),
+                    std::path::absolute(&root).unwrap()
+                );
+                (
+                    destination.repository.git_dir().to_owned(),
+                    destination.machine.clone(),
+                    destination
+                        .repository
+                        .forks()
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            carried,
+            [
+                (
+                    std::path::absolute(root.join(".git")).unwrap(),
+                    "alpha".to_owned(),
+                    vec!["acme/a-repo".to_owned()]
+                ),
+                (
+                    std::path::absolute(&personal).unwrap(),
+                    "alpha-personal".to_owned(),
+                    vec!["acme/b-repo".to_owned()]
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn two_git_directories_with_one_origin_are_refused() {
+        let (_home, root) = ledger_root();
+        registry(&root, &[("a-repo", Some("acme/ledger"))]);
+        origin_at(&root, "/nonexistent/remote.git");
+        git(&root.join(".git"), &["config", "knives.machine", "alpha"]);
+        second_repository(&root, "again.git", LEDGER_URL, "alpha");
+
+        let error = destinations(&root).unwrap_err().to_string();
+
+        assert!(error.contains("again.git"), "was: {error}");
+        assert!(error.contains("as its origin, as"), "was: {error}");
+    }
+
+    #[test]
+    fn a_file_among_the_ledger_repositories_is_refused() {
+        let (_home, root) = ledger_root();
+        registry(&root, &[("a-repo", None)]);
+        std::fs::create_dir_all(ledger_repositories(&root)).unwrap();
+        std::fs::write(ledger_repositories(&root).join("stray"), "").unwrap();
+
+        let error = destinations(&root).unwrap_err().to_string();
+
+        assert!(error.contains("stray"), "was: {error}");
+        assert!(error.contains("is not a git directory"), "was: {error}");
     }
 
     #[test]

@@ -372,6 +372,79 @@ fn a_fork_whose_ledger_belongs_elsewhere_is_carried_nowhere_and_said_so() {
 }
 
 #[test]
+fn one_ledger_root_sweeps_each_fork_to_the_repository_it_names_and_no_other() {
+    // Given: one ledger root, two forks, one sharing its ledger with the
+    // company repository through the root's own `.git`, and one with a
+    // dot-named personal repository through a second git directory over
+    // the same root, and entries of both on disk.
+    let home = tempfile::tempdir().expect("config home");
+    std::fs::write(
+        home.path().join("repos.toml"),
+        format!(
+            "[repos.a-repo]\nupstream = \"https://forge.invalid/acme/a-repo\"\n\
+             origin = \"https://forge.invalid/ours/a-repo\"\nledger = \"{LEDGER}\"\n\n\
+             [repos.b-repo]\nupstream = \"https://forge.invalid/acme/b-repo\"\n\
+             origin = \"https://forge.invalid/ours/b-repo\"\n\
+             ledger = \"someone/.knives-ledger\"\n"
+        ),
+    )
+    .expect("write the registry");
+    let (_company_dir, company) = bare_remote();
+    let (_personal_dir, personal) = bare_remote();
+    let root = share(home.path(), "alpha", &company);
+    let personal_url = "https://forge.invalid/someone/.knives-ledger";
+    let second = home.path().join("ledger-repositories").join("personal.git");
+    lab::git_bare_repository(&second);
+    for args in [
+        vec!["config", "core.bare", "false"],
+        vec!["remote", "add", "origin", personal_url],
+        vec![
+            "config",
+            &format!("url.{}.insteadOf", personal.display()),
+            personal_url,
+        ],
+        vec!["config", "knives.machine", "alpha"],
+    ] {
+        assert!(
+            git_in(&second, &args).is_some(),
+            "git {args:?} in the second git directory"
+        );
+    }
+    append(&root, "acme/a-repo", 2);
+    append(&root, "acme/b-repo", 3);
+
+    // When: one sweep runs.
+    let swept = sweep(home.path());
+
+    // Then: it succeeded through both, each remote holds exactly its own
+    // fork's entries, and neither holds the other's.
+    let stdout = String::from_utf8_lossy(&swept.stdout);
+    assert!(swept.status.success(), "{stdout}");
+    let report: serde_json::Value = serde_json::from_str(&stdout).expect("a sweep report");
+    assert_eq!(
+        report["destinations"].as_array().map(Vec::len),
+        Some(2),
+        "{report}"
+    );
+    for (remote, fork, count) in [(&company, "acme/a-repo", 2), (&personal, "acme/b-repo", 3)] {
+        let listing = git_in(
+            remote,
+            &["ls-tree", "-r", "--name-only", "refs/knives/alpha"],
+        )
+        .expect("the machine's ref on the remote");
+        let entries: Vec<&str> = listing.lines().filter(|path| is_entry(path)).collect();
+        assert_eq!(entries.len(), count, "{}: {entries:?}", remote.display());
+        assert!(
+            entries
+                .iter()
+                .all(|path| path.starts_with(&format!("{fork}/"))),
+            "{} holds another fork's entries: {entries:?}",
+            remote.display()
+        );
+    }
+}
+
+#[test]
 fn a_write_hands_off_to_a_sweep_and_does_not_wait_for_it() {
     // Given: a managed fork on a machine that shares its ledger, with the
     // ledger repository's transport lock held, so any sweep stalls in its
