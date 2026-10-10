@@ -179,7 +179,10 @@ pub(crate) fn run_finish(
             format!("{shown} is not a workspace of {checkout}, left alone")
         }
     };
-    println!("{target}: claim {claim}; workspace {workspace} {registration}; {removal}");
+    println!(
+        "{}/{branch}: claim {claim}; workspace {workspace} {registration}; {removal}",
+        fork.name
+    );
     Ok(Exit::Ok)
 }
 
@@ -384,7 +387,7 @@ pub(crate) fn run_track(
         ..Draft::event(Some(branch.as_str()), text.clone(), stamped)
     })?;
     drop(store);
-    println!("{target} {}", spoken(&text));
+    println!("{}/{branch} {}", fork.name, spoken(&text));
     Ok(Exit::Ok)
 }
 
@@ -463,7 +466,7 @@ pub(crate) fn run_depends(
         )
     })?;
     drop(store);
-    println!("{target} now requires {}", listed.join(", "));
+    println!("{}/{branch} now requires {}", fork.name, listed.join(", "));
     Ok(Exit::Ok)
 }
 

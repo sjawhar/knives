@@ -116,9 +116,11 @@ pub fn short_id(id: &str) -> &str {
 ///
 /// These two always travel together: every claim, and every statement about a
 /// branch, is keyed by the pair, so the key is formatted in one place rather
-/// than by each caller.
-/// The repository is the fork's [`UpstreamName`], the name its state is kept
-/// under; a message for a person names the fork by its registry key instead.
+/// than by each caller ([`BranchTarget::key`]). The repository is the fork's
+/// [`UpstreamName`], the name its state is kept under. It has no `Display`: a
+/// message for a person names the fork by its registry key instead, and an
+/// upstream name followed by a branch name holding a `/` reads as another
+/// fork's branch.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
 pub struct BranchTarget {
     pub repo: UpstreamName,
@@ -129,11 +131,11 @@ impl BranchTarget {
     pub const fn new(repo: UpstreamName, branch: BranchName) -> Self {
         Self { repo, branch }
     }
-}
 
-impl fmt::Display for BranchTarget {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}/{}", self.repo, self.branch)
+    /// `<upstream name>/<branch>`: what the state file keys this branch's
+    /// claim by.
+    pub fn key(&self) -> String {
+        format!("{}/{}", self.repo, self.branch)
     }
 }
 

@@ -196,6 +196,44 @@ fn the_claude_code_notice_names_the_claimed_branch() {
 }
 
 #[test]
+fn track_depends_and_finish_name_the_fork_by_its_registry_key() {
+    // Given: a claimed branch of a fork the registry calls `demo`, kept under
+    // `maintainer/demo`.
+    let (lab, home) = forge_fork();
+    claim_gamma(&lab, home.path());
+    let said = |args: &[&str]| {
+        let output = succeeded(&knives_as(
+            &lab,
+            home.path(),
+            &lab.work,
+            Some("agent-one"),
+            args,
+        ))
+        .clone();
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+
+    // When: its pull request is stated, a dependency recorded, and the
+    // branch finished.
+    let tracked = said(&["--text", "track", "feat/gamma", "--pr", "9"]);
+    let depends = said(&["--text", "depends", "feat/gamma", "--on", "demo#3"]);
+    let finished = said(&["--text", "finish", "feat/gamma", "--repo", "demo"]);
+
+    // Then: each line a person reads names the fork as the registry does,
+    // `demo/<branch>`: a branch name may hold a `/`, so `maintainer/demo/…`
+    // would read as another fork's branch.
+    assert_eq!(tracked.trim_end(), "demo/feat/gamma is #9");
+    assert_eq!(
+        depends.trim_end(),
+        "demo/feat/gamma now requires maintainer/demo#3"
+    );
+    assert!(
+        finished.starts_with("demo/feat/gamma: claim released; "),
+        "{finished}"
+    );
+}
+
+#[test]
 fn a_terminal_in_the_fork_acts_as_its_sole_claimant() {
     // Given: a fork whose only claim is agent-one's, held as a harness session.
     let (lab, home) = forge_fork();

@@ -391,7 +391,7 @@ impl Store {
     }
 
     pub fn release_claim(&mut self, target: &BranchTarget) -> bool {
-        self.state.claims.remove(&target.to_string()).is_some()
+        self.state.claims.remove(&target.key()).is_some()
     }
 
     pub fn claims(&self, repo: Option<&UpstreamName>) -> Vec<&Claim> {
