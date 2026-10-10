@@ -170,7 +170,10 @@ pub struct Moved {
 ///
 /// The state file is held for update throughout, so no other writer saves
 /// over it between the read and the drop, and it is saved only when every
-/// statement reached the ledger. The ledger's sweep lock is held while its
+/// statement reached the ledger and is on disk: each written entry, and each
+/// directory up to the config home, is flushed first, so a crash between the
+/// save and the kernel's own writeback cannot lose a statement from both
+/// places. The ledger's sweep lock is held while its
 /// directories move, so no sweep commits a half-moved fork. The workspace
 /// sightings in `seen.json` beside the state file move last, under its own
 /// lock: a sidecar that cannot be read is a problem, but one that never
@@ -209,12 +212,21 @@ pub fn migrate(state_path: &Path, root: &Path, owner: &str) -> anyhow::Result<Mi
             )),
         }
     }
+    let mut written = Vec::new();
     for (repo, statements) in by_repo {
         let ledger = Ledger::at(root.join(repo.as_str()));
         let scribe = Scribe::unanchored(ledger, repo, owner.to_owned());
-        migrate_repo(&scribe, &statements, &mut migrated);
+        migrate_repo(&scribe, &statements, &mut migrated, &mut written);
     }
     migrated.statements_held = !migrated.problems.is_empty();
+    if !migrated.statements_held
+        && let Err(error) = flush(root, &written, &migrated.moved)
+    {
+        migrated.problems.push(format!(
+            "flushing the migrated entries to disk: {error}; state.json keeps every statement"
+        ));
+        migrated.statements_held = true;
+    }
     let dropped = !migrated.statements_held && store.drop_legacy_statements();
     if dropped || !migrated.renamed.is_empty() {
         store.save()?;
@@ -319,11 +331,47 @@ fn move_entries(from: &Path, to: &Path) -> std::io::Result<Vec<std::ffi::OsStrin
     Ok(clashes)
 }
 
-/// One repository's statements onto its ledger, read once.
+/// Flush to disk each entry in `written`, then every directory holding one or
+/// named in `moved`, and each directory above them up to the config home
+/// holding `root`: a file's data and a directory's new names reach the disk
+/// only on the kernel's own schedule otherwise, and the caller is about to
+/// drop the only other copy of what they hold.
+fn flush(root: &Path, written: &[PathBuf], moved: &[Moved]) -> std::io::Result<()> {
+    let home = root.parent().unwrap_or(root);
+    let mut directories = BTreeSet::new();
+    for path in written {
+        std::fs::File::open(path)?.sync_all()?;
+    }
+    let holding = written.iter().filter_map(|path| path.parent());
+    let named = moved
+        .iter()
+        .flat_map(|moved| [moved.from.as_path(), moved.to.as_path()]);
+    for directory in holding.chain(named) {
+        for directory in directory.ancestors() {
+            directories.insert(directory.to_owned());
+            if directory == home {
+                break;
+            }
+        }
+    }
+    for directory in directories {
+        match std::fs::File::open(&directory) {
+            Ok(handle) => handle.sync_all()?,
+            // A former name's directory is removed once emptied.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+/// One repository's statements onto its ledger, read once; each entry file
+/// written is added to `written`.
 fn migrate_repo(
     scribe: &Scribe,
     statements: &[(String, LegacyStatement)],
     migrated: &mut Migrated,
+    written: &mut Vec<PathBuf>,
 ) {
     let entries = match scribe.ledger().entries() {
         Ok(entries) => entries,
@@ -364,8 +412,11 @@ fn migrate_repo(
             statement: Some(legacy.statement.clone()),
             ..Draft::event(Some(branch), history(&legacy.statement), pr)
         };
-        match scribe.record(&draft) {
-            Ok(_) => migrated.wrote += 1,
+        match scribe.record_to(&draft) {
+            Ok((_, path)) => {
+                migrated.wrote += 1;
+                written.push(path);
+            }
             Err(error) => migrated
                 .problems
                 .push(format!("{}/{branch}: {error}", scribe.repo())),

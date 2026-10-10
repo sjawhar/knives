@@ -416,7 +416,7 @@ impl Ledger {
         }
     }
 
-    /// Write one entry as one new immutable file.
+    /// Write one entry as one new immutable file, returning its path.
     ///
     /// The entry is written to a temporary file before `persist_noclobber`
     /// atomically makes its final name visible. Two agents appending at the
@@ -424,7 +424,7 @@ impl Ledger {
     /// and no lock to hold. A filename collision — same nanosecond, same random
     /// suffix — errors loudly instead of retrying, because at that resolution a
     /// retry would paper over a broken clock or random source.
-    pub fn append(&self, entry: &Entry) -> Result<(), LedgerError> {
+    pub fn append(&self, entry: &Entry) -> Result<PathBuf, LedgerError> {
         self.migrated()?;
         let ts: jiff::Timestamp = entry.ts.parse().map_err(|_| LedgerError::Timestamp {
             path: self.path.clone(),
@@ -464,9 +464,9 @@ impl Ledger {
                 path: path.clone(),
                 source,
             })?;
-        persist_entry(temporary, path)?;
+        persist_entry(temporary, path.clone())?;
         APPENDED.store(true, Ordering::Relaxed);
-        Ok(())
+        Ok(path)
     }
 
     /// Every entry, oldest first: lexicographic filename order, which the
@@ -778,6 +778,11 @@ impl Scribe {
 
     /// Append `draft`, stamping the fields no caller supplies.
     pub fn record(&self, draft: &Draft<'_>) -> Result<Entry, LedgerError> {
+        self.record_to(draft).map(|(entry, _)| entry)
+    }
+
+    /// [`Scribe::record`], with the path of the file the entry was written to.
+    pub fn record_to(&self, draft: &Draft<'_>) -> Result<(Entry, PathBuf), LedgerError> {
         let entry = Entry {
             ts: monotonic_now().to_string(),
             owner: self.owner.clone(),
@@ -795,8 +800,8 @@ impl Scribe {
             pr: draft.pr,
             parents: draft.parents.clone(),
         };
-        self.ledger.append(&entry)?;
-        Ok(entry)
+        let path = self.ledger.append(&entry)?;
+        Ok((entry, path))
     }
 
     /// Record that this tool did something, as part of doing it.
