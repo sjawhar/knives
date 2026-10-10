@@ -15,7 +15,7 @@ use crate::hook::guidance::{
     format_refusal, guidance_for, mention_line, notice_digest,
 };
 use crate::hook::opencode::{self, Event as OpenCodeEvent, EventKind as OpenCodeEventKind};
-use crate::hook::resolve::{Managed, Match, argument_paths, match_checkout};
+use crate::hook::resolve::{Match, argument_paths, match_checkout};
 use crate::hook::state::{Envelope, SessionState};
 use crate::ids::UpstreamName;
 use crate::lock::LockError;
@@ -177,11 +177,7 @@ fn opencode_tool_after(event: &OpenCodeEvent, home: &Path) -> anyhow::Result<Str
     if let Some(context) = &context {
         unlocked.reconcile(context.turn, &context.guidance);
     }
-    let notice = notice_if_requested(
-        &repo,
-        matched.managed.as_ref().filter(|_| requested.notice),
-        &unlocked,
-    )?;
+    let notice = notice_if_requested(&repo, requested.notice.then_some(&matched), &unlocked)?;
     let guidance = (requested.guidance && matched.trusted && !unlocked.repo(&repo.root).guided)
         .then(|| guidance_for(&repo, &matched.candidate))
         .flatten();
@@ -477,23 +473,22 @@ fn session_start(event: &Event, home: &Path) -> anyhow::Result<Option<String>> {
     let Some(matched) = match_checkout(&[PathBuf::from(cwd)], &registry) else {
         return Ok(None);
     };
-    let Some(managed) = &matched.managed else {
-        return Ok(None);
-    };
-    crate::seen::record_observation(
-        Some(&managed.upstream),
-        Path::new(cwd),
-        &Identity {
-            owner: session_id.to_owned(),
-            kind: crate::store::OwnerKind::HarnessSession,
-        },
-    );
+    if let Some(managed) = &matched.managed {
+        crate::seen::record_observation(
+            Some(&managed.upstream),
+            Path::new(cwd),
+            &Identity {
+                owner: session_id.to_owned(),
+                kind: crate::store::OwnerKind::HarnessSession,
+            },
+        );
+    }
     let repo = guidance_root(&matched);
     if compact {
         return Ok(None);
     }
     let state = SessionState::load(home, CLAUDE_CODE, session_id);
-    let Some(notice) = notice_if_requested(&repo, Some(managed), &state)? else {
+    let Some(notice) = notice_if_requested(&repo, Some(&matched), &state)? else {
         return Ok(None);
     };
     let (notice, update) = notice.into_parts();
@@ -532,7 +527,7 @@ fn post_tool_use(event: &Event, home: &Path) -> anyhow::Result<Option<String>> {
     let repo = guidance_root(&matched);
     let state = SessionState::load(home, CLAUDE_CODE, session_id);
     let flags = state.repo(&repo.root);
-    let notice = notice_if_requested(&repo, matched.managed.as_ref(), &state)?;
+    let notice = notice_if_requested(&repo, Some(&matched), &state)?;
     let include_notice = notice.is_some();
     let include_guidance = matched.trusted
         && !flags.guided
@@ -671,8 +666,11 @@ impl NoticeStateUpdate {
     }
 }
 
-/// The notice for `repo`, the root of the managed fork `managed`, when one was
-/// asked for (`managed` is `None` when it was not) and the session lacks it.
+/// The notice for `repo`, the root `matched` was decided for, when one was
+/// asked for (`matched` is `None` when it was not) and the session lacks it:
+/// the claims notice for a managed fork, the disagreement for a checkout
+/// whose `upstream` disagrees with the registry ([`crate::bind::Disagreement`]),
+/// nothing for any other match.
 ///
 /// The roster is the claims kept under the fork's upstream name; the notice
 /// names the fork by its registry key.
@@ -683,27 +681,31 @@ impl NoticeStateUpdate {
 /// empty roster would tell the agent nobody holds the branch it is about to
 /// take. The refusal goes into the agent's context, not stderr, because the
 /// model never reads a hook's stderr; its digest is the refusal's, so it
-/// repeats once per session until the migration runs.
+/// repeats once per session until the migration runs. A disagreement is
+/// delivered the same way, for the same reason: knives will not say whose
+/// claims this checkout's are, and silence would read as "nobody's".
 fn notice_if_requested(
     repo: &GuidanceRoot,
-    managed: Option<&Managed>,
+    matched: Option<&Match>,
     state: &SessionState,
 ) -> anyhow::Result<Option<PreparedNotice>> {
-    let Some(managed) = managed else {
+    let Some(matched) = matched else {
         return Ok(None);
+    };
+    let Some(managed) = &matched.managed else {
+        return Ok(matched.disagrees.as_ref().and_then(|disagreement| {
+            refusal_notice(repo, "disagrees", &disagreement.to_string(), state)
+        }));
     };
     let store = match Store::open(default_state_path(), &[]) {
         Ok(store) => store,
         Err(error @ (StoreError::Unmigrated { .. } | StoreError::FormerNames { .. })) => {
-            let text = error.to_string();
-            let digest = format!("unmigrated:{}", body_digest(&text));
-            if state.notice_seen(&repo.root, &digest) {
-                return Ok(None);
-            }
-            return Ok(Some(PreparedNotice {
-                text: format_refusal(&repo.name, &text),
-                update: NoticeStateUpdate { digest },
-            }));
+            return Ok(refusal_notice(
+                repo,
+                "unmigrated",
+                &error.to_string(),
+                state,
+            ));
         }
         Err(error) => return Err(error.into()),
     };
@@ -716,6 +718,24 @@ fn notice_if_requested(
         text: format_notice_for(repo, &managed.upstream, &digest, &claims),
         update: NoticeStateUpdate { digest },
     }))
+}
+
+/// `text` in place of the claims notice ([`format_refusal`]), unless the
+/// session already holds it: its digest is `<kind>:` and the text's own.
+fn refusal_notice(
+    repo: &GuidanceRoot,
+    kind: &str,
+    text: &str,
+    state: &SessionState,
+) -> Option<PreparedNotice> {
+    let digest = format!("{kind}:{}", body_digest(text));
+    if state.notice_seen(&repo.root, &digest) {
+        return None;
+    }
+    Some(PreparedNotice {
+        text: format_refusal(&repo.name, text),
+        update: NoticeStateUpdate { digest },
+    })
 }
 
 fn format_notice_for(

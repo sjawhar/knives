@@ -667,6 +667,9 @@ fn a_claimed_checkout_whose_registry_upstream_was_renamed_is_not_silently_unmana
     // as every checkout made before the rename does.
     let (lab, home) = forge_fork();
     claim_gamma(&lab, home.path());
+    // The checkout's `origin` remote spells the registry's `origin`, as a
+    // real fork's does: that is what still ties it to `demo`.
+    lab.origin_at_forge_url("https://forge.invalid/acme/work.git");
     std::fs::write(
         home.path().join("repos.toml"),
         "[repos.demo]\nupstream = \"https://forge.invalid/Maintainer/Renamed-Demo\"\n\

@@ -799,6 +799,75 @@ fn resolve_prefers_the_bound_directory_then_the_scan_then_says_why_not() {
 }
 
 #[test]
+fn a_checkout_whose_upstream_disagrees_with_its_entry_is_named_by_here_scan_and_resolve() {
+    // Given: a checkout carrying `demo`'s origin while its upstream remote
+    // spells the repository's former name, and a stranger carrying neither.
+    let home = tempfile::tempdir().expect("home");
+    let renamed = home.path().join("demo/default");
+    jj_checkout(
+        &renamed,
+        &[
+            ("upstream", "https://forge.invalid/org/old-demo"),
+            ("origin", "git@forge.invalid:acme/demo.git"),
+        ],
+    );
+    let stranger = home.path().join("stranger");
+    jj_checkout(
+        &stranger,
+        &[
+            ("upstream", "https://forge.invalid/org/stranger"),
+            ("origin", "https://forge.invalid/acme/stranger"),
+        ],
+    );
+    let registry = registry(&[(
+        "demo",
+        RepoEntry::new(
+            "https://forge.invalid/org/demo",
+            "https://forge.invalid/acme/demo",
+        ),
+    )]);
+    let expected = bind::Disagreement {
+        root: renamed.canonicalize().expect("canonical"),
+        fork: RepoName::new("demo"),
+        registry: "https://forge.invalid/org/demo".to_owned(),
+        remote: "https://forge.invalid/org/old-demo".to_owned(),
+    };
+
+    // When / Then: standing inside it, `here` refuses it as a disagreement
+    // with `demo`, not as an unregistered fork.
+    assert_eq!(
+        bind::here(&registry, &renamed),
+        Err(Unbound::Disagrees(expected.clone()))
+    );
+    // The stranger is still only unregistered.
+    assert!(
+        matches!(
+            bind::here(&registry, &stranger),
+            Err(Unbound::Unregistered { .. })
+        ),
+        "{:?}",
+        bind::here(&registry, &stranger)
+    );
+
+    // And: the scan places nothing for `demo`, but keeps the disagreement.
+    let scan = bind::scan(&registry, home.path());
+    assert!(scan.found.is_empty(), "{:?}", scan.found);
+    assert_eq!(
+        scan.disagreements,
+        BTreeMap::from([(RepoName::new("demo"), vec![expected.clone()])])
+    );
+
+    // And: naming `demo` from elsewhere says it disagrees, not that it is absent.
+    assert_eq!(
+        bind::resolve(&registry, &RepoName::new("demo"), None, home.path()),
+        Err(Unresolved::Disagrees {
+            disagreements: vec![expected],
+            problems: Vec::new(),
+        })
+    );
+}
+
+#[test]
 fn a_repository_whose_remotes_cannot_be_read_is_an_error_naming_the_directory() {
     let lab = lab::Lab::new();
     let registry = registry(&[(

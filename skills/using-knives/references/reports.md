@@ -11,7 +11,10 @@ Lists every managed entry: where its checkout was found on this machine, its
 newest release and, for recorded consumer slugs, whether consumer trunks are
 pinned behind the newest cut. An unplaced entry reads `not on this machine`, has
 `path: null` and no release state. An ambiguous entry reads `ambiguous: 2
-checkouts` with a problem naming both paths.
+checkouts` with a problem naming both paths. An entry found only under an
+upstream remote that disagrees with `repos.toml` reads `upstream disagrees with
+repos.toml`, has `path: null`, and carries a problem naming the checkout, both
+spellings and the fix; it makes the command incomplete, exit `3`.
 
 An unreadable candidate checkout appears as a `?` problem while an entry remains
 unplaced, because it could be that entry's checkout. Once every entry is placed,

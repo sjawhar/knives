@@ -338,7 +338,10 @@ impl<'a> Ground<'a> {
     /// The current directory matters only when it bound to `name`. However it
     /// failed to bind — outside a repository, a git clone, a checkout whose
     /// remotes cannot be read — the verb was asked about `name`, and the scan
-    /// answers for it.
+    /// answers for it. When the scan finds no checkout of `name` but the
+    /// current directory carries its `origin` under a disagreeing `upstream`
+    /// (a checkout the scan does not reach), the refusal is that disagreement,
+    /// not "no checkout".
     fn named(&self, name: &str) -> Option<Fork<'a>> {
         let registry = self.registry;
         let name = RepoName::new(name);
@@ -346,6 +349,16 @@ impl<'a> Ground<'a> {
         match knives::bind::resolve(registry, &name, self.here.as_ref().ok(), &home) {
             Ok(fork) => Some(fork),
             Err(why) => {
+                let why = match (why, &self.here) {
+                    (
+                        knives::bind::Unresolved::Missing { problems, .. },
+                        Err(Unbound::Disagrees(disagreement)),
+                    ) if disagreement.fork == name => knives::bind::Unresolved::Disagrees {
+                        disagreements: vec![disagreement.clone()],
+                        problems,
+                    },
+                    (why, _) => why,
+                };
                 eprintln!("{}", why.message(&name, registry));
                 None
             }
@@ -402,6 +415,9 @@ impl<'a> Ground<'a> {
             match self.here {
                 Ok(fork) => return Ok(Ok(vec![Selected::Bound(fork)])),
                 Err(Unbound::Unreadable(error)) => return Err(error.into()),
+                Err(Unbound::Disagrees(disagreement)) => {
+                    return Ok(Ok(vec![Selected::disagreeing(registry, disagreement)?]));
+                }
                 Err(unbound @ (Unbound::GitOnly { .. } | Unbound::NotColocated { .. })) => {
                     eprintln!("{}", unbound.message(registry));
                     return Ok(Err(Exit::Usage));
@@ -430,6 +446,10 @@ impl<'a> Ground<'a> {
         match self.here {
             Ok(fork) => Ok(Ok(vec![Selected::Bound(fork)])),
             Err(Unbound::Unreadable(error)) => Err(error.into()),
+            Err(Unbound::Disagrees(disagreement)) => Ok(Ok(vec![Selected::disagreeing(
+                self.registry,
+                disagreement,
+            )?])),
             Err(unbound @ (Unbound::GitOnly { .. } | Unbound::NotColocated { .. })) => {
                 eprintln!("{}", unbound.message(self.registry));
                 Ok(Err(Exit::Usage))
@@ -677,13 +697,31 @@ enum Selected<'a> {
     },
 }
 
-impl Selected<'_> {
+impl<'a> Selected<'a> {
     /// What the entry's ledger and state are kept under, placed or not.
     fn upstream(&self) -> UpstreamName {
         match self {
             Selected::Bound(fork) => fork.upstream.clone(),
             Selected::Unplaced { name, entry, .. } => entry.upstream_name(name.as_str()),
         }
+    }
+
+    /// The row for the entry the current directory's checkout carries the
+    /// `origin` of while its `upstream` disagrees: unplaced, never opened,
+    /// its problem the disagreement in full.
+    fn disagreeing(
+        registry: &'a Registry,
+        disagreement: knives::bind::Disagreement,
+    ) -> anyhow::Result<Self> {
+        let entry = registry
+            .get(&disagreement.fork)
+            .ok_or_else(|| anyhow::anyhow!("{} is not in the registry", disagreement.fork))?;
+        let problem = disagreement.to_string();
+        Ok(Selected::Unplaced {
+            name: disagreement.fork,
+            entry,
+            problem,
+        })
     }
 }
 

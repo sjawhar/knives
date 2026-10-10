@@ -107,6 +107,15 @@ case, trailing slash and `.git` suffix do not matter. Standing inside it or a
 `start` workspace binds it. Origin/release mismatches do not prevent binding;
 status and repos note `origin remote is <X>; registry says <Y>` (or release).
 
+A checkout whose origin remote is an entry's but whose upstream remote matches
+no entry does not bind: one side was renamed and the other was not, and which
+spelling is right is yours to choose. Standing inside it, `status` reports the
+entry's row with the problem; `repos`, `status --all` and naming the repo report
+it in place of `not on this machine`; the session hook puts it in the agent's
+context in place of the claims notice. Each names the checkout, the entry, both
+upstream spellings and the two fixes: `git -C <checkout> remote set-url upstream
+<registry's>`, or `upstream = "<checkout's>"` under the entry in `repos.toml`.
+
 From elsewhere, naming a repo and sweeps scan HOME to depth three. `repos`
 **always** scans, including when invoked inside a checkout outside that scope.
 Two matching checkouts are refused with both paths; an absent one is not guessed.
@@ -146,9 +155,10 @@ print `could not read: <what>` once on stderr in every output format.
 A sweep omits a **definitely missing** entry, printing
 `knives: <name>: not on this machine` to stderr, and exits according to entries
 it did inspect. It does not promise a document row per registry entry.
-Ambiguous entries stay as problem rows. If scan errors could conceal a missing
-checkout, that entry also stays as a problem row; it is not treated as known
-absence. Status prefixes such a row's problem with `could not gather:`.
+Ambiguous entries stay as problem rows, and so do entries found only under a
+disagreeing upstream. If scan errors could conceal a missing checkout, that
+entry also stays as a problem row; it is not treated as known absence. Status
+prefixes such a row's problem with `could not gather:`.
 
 ## Trust is guidance injection, not fork access
 

@@ -549,6 +549,20 @@ impl Lab {
             ["remote", "set-url", "upstream", url],
         );
     }
+
+    /// Point the work checkout's `origin` remote at the forge URL `url`,
+    /// which git rewrites to the lab's origin repository when it fetches or
+    /// pushes: the spelling a real fork's `origin` remote and its registry
+    /// entry share.
+    pub(crate) fn origin_at_forge_url(&self, url: &str) {
+        let rewrite = format!("url.{}.insteadOf", self.temp_origin().display());
+        git(&self.work, &self.trunk, ["config", &rewrite, url]);
+        git(
+            &self.work,
+            &self.trunk,
+            ["remote", "set-url", "origin", url],
+        );
+    }
 }
 /// A registry entry for the lab's work checkout, which stands in for origin.
 pub fn lab_entry(lab: &Lab) -> knives::config::RepoEntry {

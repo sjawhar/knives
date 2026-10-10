@@ -211,6 +211,10 @@ A checkout is the entry whose `upstream` its own `upstream` remote matches; `.gi
 `/`, and letter case do not matter, and a value that is not a URL (a filesystem path) compares as
 its trimmed text. A checkout whose `origin` or `release` remote differs from the registry still
 binds, and `status` and `repos` carry a note saying so: `origin remote is <X>; registry says <Y>`.
+A checkout whose `origin` is an entry's but whose `upstream` matches no entry (the upstream was
+renamed in `repos.toml` or in the checkout, not both) does not bind: `status`, `repos`, a named
+verb and the session hook each name the fork, both spellings and the fix, `git remote set-url
+upstream` or the `repos.toml` edit, rather than reading the fork as absent.
 
 `knives start` opens a branch's workspace beside the checkout, named for the branch: the
 `<name>/default` layout, where the workspaces are `default`'s siblings. A checkout at `~/<name>`

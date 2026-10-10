@@ -29,17 +29,23 @@ pub struct Match {
     pub candidate: PathBuf,
     /// The registry entry, when the *checkout's* `upstream` matches one.
     pub managed: Option<Managed>,
+    /// When no entry's `upstream` matches but one's `origin` does: the
+    /// checkout of that entry under an `upstream` the registry disagrees
+    /// with, which the notice names instead of staying silent.
+    pub disagrees: Option<bind::Disagreement>,
     /// Whether `[trust]` grants guidance for this checkout (any remote, or `roots`).
     pub trusted: bool,
 }
 
 impl Match {
-    /// The registry name when managed, else `guidance_name(&self.root)`.
+    /// The registry name when managed, or when the checkout disagrees with an
+    /// entry; else `guidance_name(&self.root)`.
     pub fn name(&self) -> String {
-        self.managed.as_ref().map_or_else(
-            || guidance_name(&self.root),
-            |managed| managed.name.to_string(),
-        )
+        match (&self.managed, &self.disagrees) {
+            (Some(managed), _) => managed.name.to_string(),
+            (None, Some(disagreement)) => disagreement.fork.to_string(),
+            (None, None) => guidance_name(&self.root),
+        }
     }
 
     pub const fn is_managed(&self) -> bool {
@@ -97,7 +103,9 @@ fn existing_ancestor(path: &Path) -> Option<&Path> {
 /// tree with a `.jj` and no `.git` is not a repository to knives, and a `.jj`
 /// under a `.git` is that repository's content. Remotes that cannot be read
 /// are reported on stderr and contribute no facts; a `roots` rule is decided
-/// from the path alone, so it holds with no readable repository at all.
+/// from the path alone, so it holds with no readable repository at all. A
+/// checkout whose `upstream` matches no entry but whose `origin` is an
+/// entry's matches as that entry's [`bind::Disagreement`], unmanaged.
 pub fn match_checkout(paths: &[PathBuf], registry: &Registry) -> Option<Match> {
     for path in paths {
         let Some(candidate) = canonical_path(path) else {
@@ -111,19 +119,24 @@ pub fn match_checkout(paths: &[PathBuf], registry: &Registry) -> Option<Match> {
             eprintln!("knives hook: {error}");
             BTreeMap::new()
         });
-        let managed = remotes
-            .get("upstream")
+        let upstream = remotes.get("upstream");
+        let managed = upstream
             .and_then(|upstream| bind::entry_for(registry, upstream))
             .map(|(name, entry)| Managed {
                 upstream: entry.upstream_name(name.as_str()),
                 name,
             });
+        let disagrees = upstream.filter(|_| managed.is_none()).and_then(|upstream| {
+            bind::entry_by_origin(registry, &remotes)
+                .map(|entry| bind::Disagreement::new(root.clone(), entry, upstream))
+        });
         let trusted = under_root || registry.trust.grants_by_remotes(&remotes);
-        if managed.is_some() || trusted {
+        if managed.is_some() || disagrees.is_some() || trusted {
             return Some(Match {
                 root,
                 candidate,
                 managed,
+                disagrees,
                 trusted,
             });
         }
@@ -499,6 +512,56 @@ mod tests {
         assert!(both.is_managed());
         assert!(both.trusted);
         assert!(neither.is_none());
+    }
+
+    #[test]
+    fn a_checkout_with_an_entrys_origin_and_another_upstream_matches_as_a_disagreement() {
+        // Given: the registry's `tool` entry, and a checkout whose `origin` is
+        // that entry's but whose `upstream` remote still spells the
+        // repository's former name.
+        let dir = tempfile::tempdir().unwrap();
+        let renamed = dir.path().join("renamed");
+        git_repository(
+            &renamed,
+            &[
+                ("upstream", "https://forge.invalid/maintainer/old-tool"),
+                ("origin", "git@forge.invalid:ours/fork.git"),
+            ],
+        );
+        let registry = registry(
+            &[("tool", "https://forge.invalid/maintainer/tool")],
+            TrustRules::default(),
+        );
+
+        // When: a file in it is resolved.
+        let matched = match_checkout(&[renamed.join("file")], &registry)
+            .expect("a disagreeing checkout still matches");
+
+        // Then: it is not managed, but it names the entry, both upstream
+        // spellings, and the commands that make them agree.
+        assert!(!matched.is_managed());
+        assert_eq!(matched.name(), "tool");
+        let disagreement = matched.disagrees.expect("the disagreement");
+        assert_eq!(disagreement.fork, RepoName::new("tool"));
+        assert_eq!(
+            disagreement.registry,
+            "https://forge.invalid/maintainer/tool"
+        );
+        assert_eq!(
+            disagreement.remote,
+            "https://forge.invalid/maintainer/old-tool"
+        );
+        let text = disagreement.to_string();
+        assert!(
+            text.contains("remote set-url upstream https://forge.invalid/maintainer/tool"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "upstream = \"https://forge.invalid/maintainer/old-tool\" under [repos.tool]"
+            ),
+            "{text}"
+        );
     }
 
     #[test]
