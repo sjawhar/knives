@@ -307,7 +307,7 @@ pub fn run(request: &Request<'_>, output: crate::cli::Output) -> anyhow::Result<
     let repo = &request.fork.name;
     let upstream = &request.fork.upstream;
     let path = &request.fork.checkout.path;
-    let ledger = Ledger::for_repo(upstream);
+    let ledger = Ledger::for_fork(request.fork);
     let report = match request.message {
         Some(text) => {
             // The store is read, never written: a notch changes no intent, and a

@@ -293,7 +293,7 @@ fn resume_claim(
         "resumed"
     };
     Scribe::new(
-        Ledger::for_repo(&context.fork.upstream),
+        Ledger::for_fork(context.fork),
         context.fork.upstream.clone(),
         context.fork.checkout.path.clone(),
         context.identity.owner.clone(),
@@ -380,7 +380,7 @@ fn record_claim(context: &mut StartContext<'_>, reason: &str, event: String) -> 
     let pull = context.store.tracked_pull(&target);
     let _ = context.store.claim(&target, &context.identity, reason);
     Scribe::new(
-        Ledger::for_repo(&context.fork.upstream),
+        Ledger::for_fork(context.fork),
         context.fork.upstream.clone(),
         context.fork.checkout.path.clone(),
         context.identity.owner.clone(),

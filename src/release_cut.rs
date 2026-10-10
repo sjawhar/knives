@@ -140,7 +140,7 @@ pub(crate) fn run_release(
         // record of a parent set that survives the bookmark moving, so every
         // subject is held against it before anything is recorded or published.
         let gate = CompositionGate {
-            ledger: Ledger::for_repo(&fork.upstream),
+            ledger: Ledger::for_fork(fork),
             opened: &opened,
             path,
             parents: &request.parents,

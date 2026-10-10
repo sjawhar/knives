@@ -153,7 +153,7 @@ pub fn gather(input: &AuditInput<'_>) -> Report {
             published: live.release(),
             scheme: &scheme,
             publish_remote: entry.publish_remote(),
-            ledger: &Ledger::for_repo(&fork.upstream),
+            ledger: &Ledger::for_fork(fork),
         },
     );
     add_misplaced_origin_release_refs(&mut report, live.origin(), &scheme, entry.publish_remote());

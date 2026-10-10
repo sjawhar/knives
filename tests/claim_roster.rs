@@ -456,3 +456,99 @@ fn a_ledger_still_kept_under_the_registry_key_is_refused_until_migrated() {
         "the registry key's directory is gone after migrating"
     );
 }
+
+/// A note an older knives filed under `demo`, its registry key.
+fn note_under_the_registry_key(home: &Path) {
+    knives::ledger::Ledger::at(home.join("ledger").join("demo"))
+        .append(&knives::ledger::Entry {
+            ts: "2026-01-01T00:00:00Z".to_owned(),
+            owner: "ses_older".to_owned(),
+            email: None,
+            subject: None,
+            kind: knives::ledger::Kind::Note,
+            disposition: None,
+            statement: None,
+            text: "written by an older knives".to_owned(),
+            evidence: Vec::new(),
+            anchor: None,
+            pr: None,
+            parents: Vec::new(),
+        })
+        .expect("append a note");
+}
+
+#[test]
+fn notch_and_the_release_plan_refuse_a_ledger_still_under_the_registry_key() {
+    // Given: a ledger entry an older knives filed under the fork's registry
+    // key, and nothing yet under its upstream name.
+    let (lab, home) = forge_fork();
+    note_under_the_registry_key(home.path());
+    let readers: [&[&str]; 3] = [
+        &["--text", "notch", "--repo", "demo"],
+        &["--text", "notch", "--repo", "demo", "--pr", "1"],
+        &["--text", "release", "--repo", "demo"],
+    ];
+
+    // When: notch reads the fork's ledger, and the release plan is asked for,
+    // as an agent session would ask (no store read on the way).
+    for args in readers {
+        let refused = knives_as(&lab, home.path(), &lab.work, Some("agent-one"), args);
+
+        // Then: each exits incomplete naming the command, rather than reading
+        // an empty ledger as "no notches yet" or a plan with no recorded cut.
+        let errors = String::from_utf8_lossy(&refused.stderr);
+        assert_eq!(
+            refused.status.code(),
+            Some(3),
+            "{args:?}: stdout: {}\nstderr: {errors}",
+            String::from_utf8_lossy(&refused.stdout)
+        );
+        assert!(
+            errors.contains("Run `knives ledger migrate`") && errors.contains("ledger/demo"),
+            "{args:?}: {errors}"
+        );
+        assert!(
+            !String::from_utf8_lossy(&refused.stdout).contains("no notches yet"),
+            "{args:?}"
+        );
+    }
+
+    // When: the migration runs.
+    succeeded(&knives_as(
+        &lab,
+        home.path(),
+        &lab.work,
+        Some("ses_migrate"),
+        &["--json", "ledger", "migrate"],
+    ));
+
+    // Then: notch reads the entry under the fork's upstream name, and the
+    // release plan answers.
+    let read = succeeded(&knives_as(
+        &lab,
+        home.path(),
+        &lab.work,
+        Some("agent-one"),
+        &["--text", "notch", "--repo", "demo"],
+    ))
+    .stdout
+    .clone();
+    assert!(
+        String::from_utf8_lossy(&read).contains("written by an older knives"),
+        "{}",
+        String::from_utf8_lossy(&read)
+    );
+    let plan = knives_as(
+        &lab,
+        home.path(),
+        &lab.work,
+        Some("agent-one"),
+        &["--text", "release", "--repo", "demo"],
+    );
+    assert!(
+        !String::from_utf8_lossy(&plan.stderr).contains("knives ledger migrate"),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&plan.stdout),
+        String::from_utf8_lossy(&plan.stderr)
+    );
+}

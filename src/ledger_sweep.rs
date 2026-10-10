@@ -202,10 +202,24 @@ fn identity(git_dir: &Path) -> Result<(Option<String>, Option<String>), SweepErr
 /// nothing to report. A candidate naming a machine and carrying no fork is a
 /// destination that carries nothing. Refused, each with what fixes it: a
 /// `knives.*` key this does not read, forks carried with no machine name,
-/// and two candidates whose `origin` is one repository, since which of them
-/// a fork's entries go through would be a guess.
+/// two candidates whose `origin` is one repository, since which of them a
+/// fork's entries go through would be a guess, and a fork whose registry
+/// key's directory still holds the entries an older knives filed there
+/// ([`crate::ledger::LedgerError::FormerName`]), which no sweep would carry
+/// until `knives ledger migrate` moves them.
 pub fn destinations(root: &Path) -> Result<Destinations, SweepError> {
     let registry = crate::config::load(&root.with_file_name("repos.toml"))?;
+    if let Some((former, now)) = registry
+        .former_names()
+        .into_iter()
+        .find(|(former, _)| crate::ledger::holds_entries(&root.join(former)))
+    {
+        return Err(crate::ledger::LedgerError::FormerName {
+            path: root.join(now.as_str()),
+            former: root.join(former),
+        }
+        .into());
+    }
     let mut found = Vec::new();
     let mut carried_anywhere = BTreeSet::new();
     let mut origins: BTreeMap<String, PathBuf> = BTreeMap::new();

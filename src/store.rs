@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{ConfigError, default_config_path};
 use crate::ids::{BranchTarget, Requirement, UpstreamName};
-use crate::ledger::{Ledger, LedgerError};
+use crate::ledger::{Ledger, LedgerError, holds_entries};
 use crate::lock::{FileLock, LockError, LockWait};
 use crate::statement::{Statement, StatementKind, Statements};
 
@@ -151,25 +151,6 @@ pub struct Renamed {
 /// with the name they are kept under now
 /// ([`crate::config::Registry::former_names`]).
 pub type FormerNames = BTreeMap<String, UpstreamName>;
-
-/// Whether `directory` holds a ledger entry file of its own.
-///
-/// That is a `*.md` regular file directly inside it, not inside a directory
-/// below it. Unreadable is taken as holding one, so a directory nobody could
-/// read is refused rather than passed as migrated.
-pub fn holds_entries(directory: &Path) -> bool {
-    let Ok(listing) = std::fs::read_dir(directory) else {
-        return directory.exists();
-    };
-    listing.into_iter().any(|dirent| {
-        dirent.is_err()
-            || dirent.is_ok_and(|dirent| {
-                dirent.file_type().is_ok_and(|kind| kind.is_file())
-                    && Path::new(&dirent.file_name()).extension()
-                        == Some(std::ffi::OsStr::new("md"))
-            })
-    })
-}
 
 /// `text`, a fork's name followed by `separator` and the rest, with a former
 /// name replaced by the name that fork is kept under now; `None` when `text`

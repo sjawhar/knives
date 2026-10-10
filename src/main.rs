@@ -627,7 +627,7 @@ fn dispatch_release(
 /// claims carry the same name and a reader can join them.
 fn scribe_for(fork: &Fork<'_>, bound: Option<&UpstreamName>) -> anyhow::Result<Scribe> {
     Ok(Scribe::new(
-        Ledger::for_repo(&fork.upstream),
+        Ledger::for_fork(fork),
         fork.upstream.clone(),
         fork.checkout.path.clone(),
         current_identity(bound)?.owner,
@@ -647,11 +647,8 @@ fn pulled_plan(
     consumers: &knives::commands::release::ConsumerInputs<'_>,
 ) -> anyhow::Result<knives::commands::release::Plan> {
     let pulled = knives::ledger_sweep::pull(&[&fork.upstream]);
-    let mut plan = knives::commands::release::plan(
-        fork,
-        consumers,
-        &Ledger::for_repo(&fork.upstream).entries()?,
-    )?;
+    let mut plan =
+        knives::commands::release::plan(fork, consumers, &Ledger::for_fork(fork).entries()?)?;
     plan.problems.extend(pulled.problems_for(&fork.upstream));
     Ok(plan)
 }
@@ -874,7 +871,7 @@ fn run_status(ground: Ground<'_>, view: StatusView<'_>) -> anyhow::Result<Exit> 
                         .iter()
                         .map(|chosen| {
                             status_row(chosen, |fork| {
-                                let ledger = Ledger::for_repo(&fork.upstream);
+                                let ledger = Ledger::for_fork(fork);
                                 status::gather_timed(
                                     fork,
                                     store,

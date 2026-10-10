@@ -265,6 +265,14 @@ pub enum LedgerError {
     Timestamp { path: PathBuf, ts: String },
     #[error("{path} already exists: two writers drew the same nanosecond and suffix")]
     Collision { path: PathBuf },
+    #[error(
+        "{} still holds the entries an older knives filed under the fork's registry key; this \
+         knives reads the fork's ledger at {}, so it would read it as holding none of them. \
+         Run `knives ledger migrate` once to move them",
+        former.display(),
+        path.display()
+    )]
+    FormerName { path: PathBuf, former: PathBuf },
     #[error("serialising a ledger entry: {source}")]
     Serialise {
         #[from]
@@ -272,25 +280,73 @@ pub enum LedgerError {
     },
 }
 
+/// Whether `directory` holds a ledger entry file of its own.
+///
+/// That is a `*.md` regular file directly inside it, not inside a directory
+/// below it: a registry key can be the owner directory of other forks'
+/// upstream names (`acme` beside `acme/demo`). Unreadable is taken as
+/// holding one, so a directory nobody could read is refused rather than
+/// passed as migrated.
+pub fn holds_entries(directory: &Path) -> bool {
+    let Ok(listing) = std::fs::read_dir(directory) else {
+        return directory.exists();
+    };
+    listing.into_iter().any(|dirent| {
+        dirent.is_err()
+            || dirent.is_ok_and(|dirent| {
+                dirent.file_type().is_ok_and(|kind| kind.is_file())
+                    && Path::new(&dirent.file_name()).extension() == Some(OsStr::new("md"))
+            })
+    })
+}
+
 /// One repository's ledger directory.
 #[derive(Debug, Clone)]
 pub struct Ledger {
     path: PathBuf,
+    /// Where an older knives filed this fork's entries, under its registry
+    /// key, when that is not where they are now.
+    former: Option<PathBuf>,
 }
 
 impl Ledger {
-    /// A fork's ledger at the default location.
-    pub fn for_repo(repo: &UpstreamName) -> Self {
-        Self::at(default_ledger_path(repo))
+    /// A fork's ledger at the default location: the one place a command
+    /// acting on a fork resolves it.
+    ///
+    /// An older knives filed a fork's entries under its registry key, and
+    /// this one reads them under the fork's upstream name. Every read of a
+    /// ledger resolved here refuses while the registry key's directory still
+    /// holds entries ([`LedgerError::FormerName`]): read from the new
+    /// directory alone, it would answer "no notches yet", or find no
+    /// recorded cut for a release's drop guard to check against.
+    pub fn for_fork(fork: &crate::bind::Fork<'_>) -> Self {
+        let former = (fork.name.as_str() != fork.upstream.as_str())
+            .then(|| default_ledger_root().join(fork.name.as_str()));
+        Self {
+            path: default_ledger_path(&fork.upstream),
+            former,
+        }
     }
 
     /// At an exact path, for a test or for a caller with its own config home.
     pub const fn at(path: PathBuf) -> Self {
-        Self { path }
+        Self { path, former: None }
     }
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Refuse while the fork's registry-key directory still holds entries;
+    /// see [`Ledger::for_fork`].
+    fn migrated(&self) -> Result<(), LedgerError> {
+        match &self.former {
+            Some(former) if holds_entries(former) => Err(LedgerError::FormerName {
+                path: self.path.clone(),
+                former: former.clone(),
+            }),
+            _ => Ok(()),
+        }
     }
 
     /// Write one entry as one new immutable file.
@@ -302,6 +358,7 @@ impl Ledger {
     /// suffix — errors loudly instead of retrying, because at that resolution a
     /// retry would paper over a broken clock or random source.
     pub fn append(&self, entry: &Entry) -> Result<(), LedgerError> {
+        self.migrated()?;
         let ts: jiff::Timestamp = entry.ts.parse().map_err(|_| LedgerError::Timestamp {
             path: self.path.clone(),
             ts: entry.ts.clone(),
@@ -354,6 +411,7 @@ impl Ledger {
 
     /// [`Ledger::entries`], each beside the file it was read from.
     pub fn entry_files(&self) -> Result<Vec<(PathBuf, Entry)>, LedgerError> {
+        self.migrated()?;
         let listing = match std::fs::read_dir(&self.path) {
             Ok(listing) => listing,
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => {

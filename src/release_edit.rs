@@ -291,7 +291,7 @@ fn edit_release(
         return Ok(Exit::Incomplete);
     }
     let release = ReleaseInHand::read(&opened, entry, release_name)?;
-    let ledger = Ledger::for_repo(&fork.upstream).entries()?;
+    let ledger = Ledger::for_fork(fork).entries()?;
     let releases = knives::release_model::release_refs_by_commit(
         &opened.bookmark_tips()?,
         &entry.release_scheme(),

@@ -14,11 +14,11 @@ use std::path::{Path, PathBuf};
 
 use crate::cli::{Exit, Output};
 use crate::ids::{Requirement, UpstreamName};
-use crate::ledger::{Draft, Ledger, Scribe, inline_human_text};
+use crate::ledger::{Draft, Ledger, Scribe, holds_entries, inline_human_text};
 use crate::ledger_sweep::{self, Swept, Tally};
 use crate::lock::FileLock;
 use crate::statement::{Statement, StatementKind, Statements};
-use crate::store::{FormerNames, LegacyStatement, Renamed, Store, holds_entries, renamed};
+use crate::store::{FormerNames, LegacyStatement, Renamed, Store, renamed};
 
 /// What a sweep run by hand reports.
 #[derive(Debug, serde::Serialize)]
