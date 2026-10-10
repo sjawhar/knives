@@ -420,8 +420,11 @@ fn a_destination_with_forks_but_no_machine_name_fails_naming_the_fix() {
     // When: a sweep runs.
     let swept = sweep(home.path());
 
-    // Then: it fails, names the command that fixes it, and leaves that in the log.
+    // Then: it fails, says so in its outcome, names the command that fixes
+    // it, and leaves that in the log.
     assert_eq!(swept.status.code(), Some(3), "{swept:?}");
+    let report: serde_json::Value = serde_json::from_slice(&swept.stdout).expect("JSON");
+    assert_eq!(report["outcome"], "failed", "{report}");
     let fix = format!(
         "git --git-dir={} config knives.machine <name>",
         root.join(".git").display()

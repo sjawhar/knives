@@ -276,8 +276,10 @@ destination: {git_dir, remote, forks, commits, pulled, pushes, discarded, skippe
 ```
 
 `outcome` is `swept`; `busy` when another sweep holds the lock and carries this
-one's entries; or `not-shared` when no git directory names a machine and no
-fork sets `ledger`. Each destination is one git directory: `remote` is always
+one's entries; `not-shared` when no git directory names a machine and no fork
+sets `ledger`; or `failed` when the sweep could not start because where the
+ledger travels could not be read, which its `problems` say. Each destination
+is one git directory: `remote` is always
 `origin`, `forks` lists the upstream names it carries, and the counts cover the
 whole sweep: commits made, entries pulled in, pushes, and repeated transitions
 discarded. `skipped`, by `<owner>/<name>` directory, counts the entries other

@@ -21,13 +21,25 @@ use crate::lock::FileLock;
 use crate::statement::{Statement, StatementKind, Statements};
 use crate::store::{FormerNames, LegacyStatement, Renamed, Store, renamed};
 
+/// What became of a sweep run by hand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Outcome {
+    /// This sweep held the lock and passed over every destination.
+    Swept,
+    /// Another sweep holds the lock and carries this one's work.
+    Busy,
+    /// This machine's ledger has no repository to travel through.
+    NotShared,
+    /// The sweep could not start: where the ledger travels could not be
+    /// read, and its problems say why.
+    Failed,
+}
+
 /// What a sweep run by hand reports.
 #[derive(Debug, serde::Serialize)]
 pub struct Report {
-    /// `swept`, `busy` when another sweep holds the lock and carries this
-    /// one's work, or `not-shared` when this machine's ledger has no
-    /// repository to travel through.
-    pub outcome: &'static str,
+    pub outcome: Outcome,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub destinations: Vec<Tally>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -37,27 +49,16 @@ pub struct Report {
 /// Run one sweep of the ledger beside the registry and report it.
 pub fn run_sweep(output: Output) -> anyhow::Result<Exit> {
     let root = crate::ledger::default_ledger_root();
-    let report = match ledger_sweep::run(&root) {
-        Ok(Swept::NotShared) => Report {
-            outcome: "not-shared",
-            destinations: Vec::new(),
-            problems: Vec::new(),
-        },
-        Ok(Swept::Busy) => Report {
-            outcome: "busy",
-            destinations: Vec::new(),
-            problems: Vec::new(),
-        },
-        Ok(Swept::Ran { tallies, problems }) => Report {
-            outcome: "swept",
-            destinations: tallies,
-            problems,
-        },
-        Err(error) => Report {
-            outcome: "swept",
-            destinations: Vec::new(),
-            problems: vec![error.to_string()],
-        },
+    let (outcome, destinations, problems) = match ledger_sweep::run(&root) {
+        Ok(Swept::NotShared) => (Outcome::NotShared, Vec::new(), Vec::new()),
+        Ok(Swept::Busy) => (Outcome::Busy, Vec::new(), Vec::new()),
+        Ok(Swept::Ran { tallies, problems }) => (Outcome::Swept, tallies, problems),
+        Err(error) => (Outcome::Failed, Vec::new(), vec![error.to_string()]),
+    };
+    let report = Report {
+        outcome,
+        destinations,
+        problems,
     };
     if let Some(payload) = crate::cli::machine_payload(output, &report)? {
         println!("{payload}");
@@ -73,14 +74,15 @@ pub fn run_sweep(output: Output) -> anyhow::Result<Exit> {
 
 pub fn render(report: &Report) -> String {
     let mut lines = match report.outcome {
-        "not-shared" => vec![
+        Outcome::NotShared => vec![
             "ledger: not shared; this machine's ledger has no repository to travel through"
                 .to_owned(),
         ],
-        "busy" => {
+        Outcome::Busy => {
             vec!["ledger: another sweep is running and carries this one's entries".to_owned()]
         }
-        _ => report
+        Outcome::Failed => vec!["ledger: the sweep could not start".to_owned()],
+        Outcome::Swept => report
             .destinations
             .iter()
             .map(|tally| {
