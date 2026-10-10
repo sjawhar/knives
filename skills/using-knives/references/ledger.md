@@ -119,6 +119,8 @@ with TOML frontmatter between `+++` fences and a prose body. A write finishes a
 temporary file, then atomically persists it without replacement, and takes no
 lock: two writers never share a file. Filenames use compact UTC time plus a
 four-hex suffix; readers scan lexical filename order, which is chronological.
+Only a regular `*.md` file is an entry: every other file, and a symlink named
+like one, is passed over by every reader and never shared.
 
 An entry is never rewritten, and no rotation or retention policy applies. Two
 things remove an entry file: `knives ledger migrate` moving it into its fork's

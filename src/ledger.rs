@@ -499,12 +499,13 @@ impl Ledger {
     /// A ledger directory that does not exist yet is empty rather than an
     /// error: a repository nobody has notched is the normal case. An entry
     /// file that does not parse IS an error, because a ledger the tool cannot
-    /// read must not read as a ledger with nothing in it. Only `*.md` files
-    /// are entries: an editor's or a sync tool's droppings beside them are
-    /// ignored, not fatal. Each read parses the whole directory — O(all
-    /// history) — which is acceptable at observed scales; chronological
-    /// filenames leave a tail-read optimization open if `KNIVES_TIMING` shows
-    /// it is needed.
+    /// read must not read as a ledger with nothing in it. Only `*.md` regular
+    /// files are entries: an editor's or a sync tool's droppings beside them
+    /// are ignored, not fatal, and so is a symlink, which a sweep never
+    /// commits, so no other machine would read it. Each read parses the
+    /// whole directory — O(all history) — which is acceptable at observed
+    /// scales; chronological filenames leave a tail-read optimization open if
+    /// `KNIVES_TIMING` shows it is needed.
     pub fn entries(&self) -> Result<Vec<Entry>, LedgerError> {
         Ok(self
             .entry_files()?
@@ -540,13 +541,16 @@ impl Ledger {
         };
         let mut files = Vec::new();
         for dirent in listing {
-            let path = dirent
-                .map_err(|source| LedgerError::Read {
-                    path: self.path.clone(),
-                    source,
-                })?
-                .path();
-            if path.extension() == Some(OsStr::new("md")) {
+            let unreadable = |source| LedgerError::Read {
+                path: self.path.clone(),
+                source,
+            };
+            let dirent = dirent.map_err(unreadable)?;
+            let path = dirent.path();
+            // `file_type` does not follow a symlink: one stays a symlink.
+            if path.extension() == Some(OsStr::new("md"))
+                && dirent.file_type().map_err(unreadable)?.is_file()
+            {
                 files.push(path);
             }
         }
@@ -1423,6 +1427,26 @@ mod tests {
         let ledger = Ledger::at(path.clone());
         ledger.append(&entry(Some("feat/alpha"), "fine")).unwrap();
         let _temporary = tempfile::NamedTempFile::new_in(path).unwrap();
+
+        let read = ledger.entries().unwrap();
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0].text, "fine");
+    }
+
+    #[test]
+    fn a_symlink_named_like_an_entry_is_not_an_entry() {
+        // A sweep commits only regular files, so an entry read through a link
+        // would be one this machine reads and no other machine ever gets.
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = Ledger::at(dir.path().join("elsewhere"));
+        let linked = elsewhere
+            .append(&entry(Some("feat/alpha"), "linked"))
+            .unwrap();
+        let path = dir.path().join("a-repo");
+        let ledger = Ledger::at(path.clone());
+        ledger.append(&entry(Some("feat/alpha"), "fine")).unwrap();
+        std::os::unix::fs::symlink(&linked, path.join("20990101T000000.000000000Z-0000.md"))
+            .unwrap();
 
         let read = ledger.entries().unwrap();
         assert_eq!(read.len(), 1);
