@@ -1115,6 +1115,59 @@ fn status_names_the_peer_entries_a_machine_does_not_carry_the_fork_for() {
 }
 
 #[test]
+fn one_unreadable_entry_does_not_hold_back_the_rest_of_a_sweep() {
+    // Given: a repository carrying two forks, each with an entry to send,
+    // and one more entry in the first that does not parse.
+    let home = tempfile::tempdir().expect("config home");
+    std::fs::write(
+        home.path().join("repos.toml"),
+        format!(
+            "[repos.a-repo]\nupstream = \"https://forge.invalid/acme/a-repo\"\n\
+             origin = \"https://forge.invalid/ours/a-repo\"\nledger = \"{LEDGER}\"\n\n\
+             [repos.b-repo]\nupstream = \"https://forge.invalid/acme/b-repo\"\n\
+             origin = \"https://forge.invalid/ours/b-repo\"\nledger = \"{LEDGER}\"\n"
+        ),
+    )
+    .expect("write the registry");
+    let (_remote_dir, remote) = bare_remote();
+    let root = share(home.path(), "alpha", &remote);
+    append(&root, "acme/a-repo", 1);
+    append(&root, "acme/b-repo", 1);
+    let broken = root
+        .join("acme/a-repo")
+        .join("20261010T120000.000000000Z-0000.md");
+    std::fs::write(&broken, "not an entry\n").expect("write a broken entry");
+
+    // When: a sweep runs.
+    let swept = sweep(home.path());
+
+    // Then: the two good entries went out together, and the broken one is
+    // held back, named in the sweep's problems, where it can still be fixed.
+    let stdout = String::from_utf8_lossy(&swept.stdout);
+    assert_eq!(swept.status.code(), Some(3), "{stdout}");
+    assert_eq!(entries_on(&remote, "alpha"), 2, "{stdout}");
+    let report: serde_json::Value = serde_json::from_str(&stdout).expect("a sweep report");
+    assert_eq!(report["destinations"][0]["pushes"], 1, "{report}");
+    let problems = report["problems"].to_string();
+    assert!(
+        problems.contains(&broken.display().to_string()) && problems.contains("not sent"),
+        "{report}"
+    );
+
+    // When: the broken entry is removed, and the machine sweeps again.
+    std::fs::remove_file(&broken).expect("remove the broken entry");
+    let swept = sweep(home.path());
+
+    // Then: it succeeds, with nothing left behind.
+    assert!(
+        swept.status.success(),
+        "{}",
+        String::from_utf8_lossy(&swept.stdout)
+    );
+    assert!(!home.path().join("ledger-sweep.log").exists());
+}
+
+#[test]
 fn a_release_cut_is_refused_when_the_ledger_cannot_be_pulled() {
     // Given: a branch ready for a first cut, on a machine whose ledger remote
     // cannot be reached.

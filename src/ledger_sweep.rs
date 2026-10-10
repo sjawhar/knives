@@ -633,13 +633,19 @@ fn pass(destination: &Destination, tally: &mut Tally) -> Vec<String> {
         }
         Err(error) => failures.push(failed(error.into())),
     }
-    if let Err(error) = send(destination, tally) {
-        failures.push(failed(error));
+    match send(destination, tally) {
+        Ok(problems) => failures.extend(
+            problems
+                .into_iter()
+                .map(|problem| format!("{}: {problem}", destination.describe())),
+        ),
+        Err(error) => failures.push(failed(error)),
     }
     failures
 }
 
-/// Commit what is new and push what the remote lacks.
+/// Commit what is new and push what the remote lacks; what kept the
+/// repeated-transition check from reading something, each as a line.
 ///
 /// Before the commit, each transition event this machine wrote that repeats
 /// one a ref already carries goes
@@ -647,8 +653,17 @@ fn pass(destination: &Destination, tally: &mut Tally) -> Vec<String> {
 /// both synced after one merge each wrote `#N merged`, and the one that
 /// sweeps second commits none. Only an entry no ref carries is removed, so
 /// what any machine committed stays.
-fn send(destination: &Destination, tally: &mut Tally) -> Result<(), SweepError> {
+///
+/// That check reads every entry of each fork it carries, and what it cannot
+/// read holds back nothing else. A fork whose directory cannot be listed is
+/// left unchecked, and an entry that does not parse is left out of the
+/// check; either is a problem, and the rest is committed and pushed. An
+/// entry of this machine's own that does not parse is also left out of the
+/// commit: a peer that took it would fail every read of that fork, and a
+/// committed entry is never rewritten, while here it can still be fixed.
+fn send(destination: &Destination, tally: &mut Tally) -> Result<Vec<String>, SweepError> {
     let repository = &destination.repository;
+    let mut problems = Vec::new();
     let mut pending = ledger_git::pending(repository, &destination.machine)?;
     if !pending.added().is_empty() {
         let uncommitted: BTreeSet<PathBuf> = pending
@@ -657,12 +672,39 @@ fn send(destination: &Destination, tally: &mut Tally) -> Result<(), SweepError> 
             .map(|path| repository.work_tree().join(path))
             .collect();
         for fork in repository.forks() {
-            let entries = Ledger::at(repository.work_tree().join(fork.as_str())).entry_files()?;
+            let reads = match Ledger::at(repository.work_tree().join(fork.as_str())).entry_reads() {
+                Ok(reads) => reads,
+                Err(error) => {
+                    problems.push(format!("{fork}: repeated transitions not checked: {error}"));
+                    continue;
+                }
+            };
+            let mut entries = Vec::with_capacity(reads.len());
+            for (path, read) in reads {
+                match read {
+                    Ok(entry) => entries.push((path, entry)),
+                    Err(error) if uncommitted.contains(&path) => {
+                        if let Ok(relative) = path.strip_prefix(repository.work_tree()) {
+                            pending.forget(relative);
+                        }
+                        problems.push(format!(
+                            "{error}; not sent until it is fixed or removed, since every \
+                             machine that took it would fail to read {fork}'s ledger"
+                        ));
+                    }
+                    Err(error) => problems.push(format!(
+                        "{error}; left out of the check for repeated transitions"
+                    )),
+                }
+            }
             for path in crate::commands::sync::repeated_transitions(&entries, &uncommitted) {
-                std::fs::remove_file(path).map_err(|source| SweepError::Write {
-                    path: path.to_owned(),
-                    source,
-                })?;
+                if let Err(source) = std::fs::remove_file(path) {
+                    problems.push(format!(
+                        "{}: a repeated transition, not discarded: {source}",
+                        path.display()
+                    ));
+                    continue;
+                }
                 if let Ok(relative) = path.strip_prefix(repository.work_tree()) {
                     pending.forget(relative);
                 }
@@ -678,7 +720,7 @@ fn send(destination: &Destination, tally: &mut Tally) -> Result<(), SweepError> 
         ledger_git::push(repository, &destination.remote, &destination.machine)?;
         tally.pushes += 1;
     }
-    Ok(())
+    Ok(problems)
 }
 
 /// Whether any destination still being swept has an entry no ref carries.

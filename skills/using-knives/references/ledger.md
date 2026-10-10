@@ -257,7 +257,11 @@ fetches every machine's ref into `refs/knives-remotes/origin/<machine>` and
 writes in the entries this machine lacks, discards this machine's repeated
 transitions (below), commits what is new to `refs/knives/<machine>` (git
 plumbing only, never the index), and pushes that ref, which no other machine
-writes. A failed fetch does not stop the commit and push. A fetch or push still
+writes. A failed fetch does not stop the commit and push, and neither does an
+entry that does not parse: it is a problem naming the file, left out of the
+repeated-transition check, and, when it is this machine's own and not yet
+committed, left out of the commit too, since every machine that took it would
+fail to read that fork; the rest of the fork's entries go. A fetch or push still
 running after a minute is ended, and an HTTP transfer that stalls fails sooner,
 so a remote that stops answering is a failure like any other rather than a wait
 with no end. It passes again

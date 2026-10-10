@@ -491,6 +491,16 @@ impl Ledger {
 
     /// [`Ledger::entries`], each beside the file it was read from.
     pub fn entry_files(&self) -> Result<Vec<(PathBuf, Entry)>, LedgerError> {
+        self.entry_reads()?
+            .into_iter()
+            .map(|(path, read)| read.map(|entry| (path, entry)))
+            .collect()
+    }
+
+    /// Each entry file in name order, beside what reading it gave: for a
+    /// caller that has a use for the entries that do parse when one does
+    /// not. Only listing the directory fails the call.
+    pub fn entry_reads(&self) -> Result<Vec<EntryRead>, LedgerError> {
         self.migrated()?;
         let listing = match std::fs::read_dir(&self.path) {
             Ok(listing) => listing,
@@ -517,12 +527,18 @@ impl Ledger {
             }
         }
         files.sort();
-        files
+        Ok(files
             .into_iter()
-            .map(|path| parse_file(&path).map(|entry| (path, entry)))
-            .collect()
+            .map(|path| {
+                let read = parse_file(&path);
+                (path, read)
+            })
+            .collect())
     }
 }
+
+/// One entry file, beside what reading it gave ([`Ledger::entry_reads`]).
+pub type EntryRead = (PathBuf, Result<Entry, LedgerError>);
 
 /// Which entries a read wants.
 #[derive(Debug, Default, Clone, Copy)]
