@@ -1,6 +1,6 @@
 ---
 name: using-knives
-description: "Reference manual for the knives CLI, which reports and coordinates state across several forks of upstream repositories worked by several agents. Use when running any knives command, when interpreting what one printed, or when you need the detail behind it: what the upstream, origin and release remotes mean, how a branch is matched to a pull request and how to state one it cannot find, recording that one branch cannot land before another, planning and cutting releases, JSON output, and the OpenCode plugin's options. For the shorter question of what to do before touching a fork at all, use the fork-work skill."
+description: "Reference manual for the knives CLI, which reports and coordinates state across several forks of upstream repositories worked by several agents. Use when running any knives command, when interpreting what one printed, or when you need the detail behind it: what the upstream, origin and release remotes mean, how a branch is matched to a pull request and how to state one it cannot find, recording that one branch cannot land before another, planning and cutting releases, sharing the notch ledger between machines and migrating it after an upgrade, JSON output, and the OpenCode plugin's options. For the shorter question of what to do before touching a fork at all, use the fork-work skill."
 ---
 
 # The knives CLI
@@ -11,6 +11,17 @@ delete a branch, repair a ref, open a pull request, or declare work merge-ready.
 
 For what to do before touching a fork, use **fork-work**. This manual explains
 commands and their evidence; it does not replace that workflow.
+
+## After upgrading knives
+
+Run `knives ledger migrate` once on each machine. An older knives kept branch
+statements in `state.json` and kept each fork's ledger, state keys and
+workspace sightings under its registry key; this one reads statements only
+from the ledger, and a fork only under its upstream repository's lowercase
+`<owner>/<name>`. Until the migration moves them, commands that read the state
+file or a fork's ledger exit `3` naming it, and the hook puts that refusal in
+the agent's context instead of the claims notice. See
+[upgrading](references/ledger.md#upgrading-from-an-older-knives).
 
 ## Before acting
 
@@ -75,6 +86,7 @@ as an unconditional reading list.
 | Claim or release active work | `start <branch>`, `finish <branch>` | [Coordination](references/coordination.md) |
 | State PR association or a prerequisite | `track`, `depends` | [Coordination](references/coordination.md) |
 | Read or record decisions and evidence | `notch [SUBJECT]` | [Ledger](references/ledger.md) |
+| Carry the ledger between machines, or move what an older knives left | `ledger sweep`, `ledger migrate` | [Ledger](references/ledger.md) |
 | Plan, edit, cut, rebase or reap a release | `release` and its subcommands | [Releases](references/releases.md) |
 | Configure identity, trust or the plugin | `register`, registry/plugin settings | [Configuration](references/configuration.md) |
 
@@ -82,6 +94,8 @@ as an unconditional reading list.
 `track`, `depends`, ledger writes and release edits also mutate local state,
 and a ledger write hands its entry to a background sweep that pushes it when
 the ledger is [shared](references/ledger.md#sharing-between-machines).
+`status`, `sync`, `audit`, `pushed` and the release commands that read the
+ledger pull a shared ledger first, writing in the entries this machine lacks.
 `audit` and `pushed` report without repairing, deleting, pushing or opening PRs.
 Release planning is the default; release commands never push a release. Publication is a
 separate, intentional `jj git push --remote <publish-remote> --bookmark <name>`.

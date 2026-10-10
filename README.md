@@ -105,7 +105,8 @@ one in `~/.config/knives/ledger-repositories/`, one per repository the ledgers t
 Every write starts `knives ledger sweep` in the background, which commits new entries to the
 machine's own ref, pulls every other machine's, and pushes. One sweep runs at a time and nothing
 ever rebases. A command that decides from the ledger (`status`, `sync`, `audit`, `pushed`, the
-release verbs, `release members`) pulls it first, and says so in its problems when it cannot.
+release plan, cut and edits, `release members` without a `REF`) pulls it first, and says so in
+its problems when it cannot.
 When two machines both sync after one merge, the second does not record it again; only two that
 each commit it before either pulls keep both. The `using-knives` skill's ledger reference has the
 setup.

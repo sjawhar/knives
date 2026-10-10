@@ -1,7 +1,9 @@
 # Read-only reports
 
 Read this when running `repos`, `consumers`, `pushed`, `audit` or `pr`, or when
-consuming their machine output. These commands report facts, not remedies.
+consuming their machine output. These commands report facts, not remedies. The
+`knives ledger sweep` and `knives ledger migrate` reports are in the
+[ledger reference](ledger.md).
 
 ## `knives repos`
 
@@ -28,7 +30,7 @@ TOON and JSON share this document shape (`?` marks an optional field):
 
 ```text
 {repos: [{name, upstream_name, path, release_remote?, newest_release?, behind?,
-          notes?, problems?}], notes?, config_path}
+          notes?, problems?}], notes?, problems?, config_path}
 ```
 
 `name` is the registry key, what you type. `upstream_name` is what the fork's

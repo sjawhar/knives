@@ -77,8 +77,9 @@ command never edits consumer checkouts.
 
 **The registry names repositories, not directories.** A `[repos.*]` entry carries `upstream`,
 `origin`, and the optional `base`, `release`, `release_branch`, `test_count_command`,
-`consumers`, `workspaces`, and `forbidden` (identifiers an upstream-bound diff must not add; `audit`
-scans for them); there is no path field, and a file that still has one is refused
+`consumers`, `workspaces`, `forbidden` (identifiers an upstream-bound diff must not add; `audit`
+scans for them), and `ledger` (the repository the fork's ledger is shared through); there is no
+path field, and a file that still has one is refused
 on load with the entry named.
 A checkout is the entry whose `upstream` its own `upstream` remote matches, so an entry
 follows the repository to wherever it is cloned and a machine's layout is not configuration.
@@ -131,7 +132,7 @@ Local state is computed on demand. Store only what no amount of computing can re
 - why we carry a foreign PR as a release parent
 - supersession pointers, when one of our PRs closes in favour of another
 - **fork-only marks**: a branch we deliberately keep with no upstream PR. This should be the minority, but it is real, and it covers CI we want on our fork but not upstream. Without a mark, every such branch reads as an error in `knives status` forever. (2026-09-19: this mark predates Sami's ruling that "fork-only is not a real option" — a marked branch is an UPSTREAM member whose PR has not yet been opened, not a third destination.)
-- **what happened, and what was decided**: an append-only ledger per repo, beside the state
+- **what happened, and what was decided**: a ledger per fork, appended to and never rewritten, beside the state
   file. Everything above is current intent, rewritten whole on each change; `knives finish`
   deletes the one "why" the tool records. The ledger is the past tense: events this tool
   observed in its own commands, and judgments an agent asserted, each anchored to the
@@ -309,8 +310,10 @@ knives notch [SUBJECT]         read what happened here (bare: newest 20 human no
                                -m writes a note, --disposition requires --evidence
 knives ledger sweep            commit, pull and push the shared ledger; single-flight, and every
                                write starts one detached as it exits
-knives ledger migrate          move the branch statements an older knives kept in state.json onto
-                               the ledger, one statement entry each; a second run writes nothing
+knives ledger migrate          move what an older knives left onto what this one reads: the branch
+                               statements state.json kept, onto the ledger, and each fork's ledger
+                               directory, state keys and workspace sightings from its registry key
+                               to its upstream name; a second run changes nothing
 knives release [NAME]          plan, cut, edit or reap a release under the configured scheme
 knives release cut [NAME]      name a new cut of the composition in hand, verbatim (first cut: every branch); refuses to orphan commits or to silently drop members the previous cut's ledger event recorded ([--allow-drop] overrides both), and refuses a candidate with the same tree and the same parents as the previous cut on the publish remote; never pushes
 knives release reap            reap superseded dated release bookmarks everywhere locally and abandon their commits; all kept while the live cut carries conflicts

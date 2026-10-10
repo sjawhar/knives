@@ -102,7 +102,9 @@ Every planning/cut/edit verb reads registered `consumers` forge slugs and
 repeatable `--consumer <DIR>` ad-hoc scans. With neither, no pin is known: the
 plan says so, treats the release as unpinned, and verbs proceed. An install-based
 consumer may have no lockfile to register. A configured/passed unreadable
-consumer is a problem and blocks the verbs until readable.
+consumer is a problem and blocks the verbs until readable. So does a shared
+ledger the plan could not pull first, since the drop guard would check against
+a stale cut ([ledger](ledger.md#sharing-between-machines)).
 
 `include`, `drop`, `advance` and `rebase` share these incomplete (`3`) refusals:
 

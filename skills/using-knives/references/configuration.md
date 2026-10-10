@@ -81,12 +81,20 @@ roots = ["~/projects/company"]
   Absent/empty means no scan and no `forbidden` field. Audit reports hits, never
   blocks on them; no other command reads the list.
 - `ledger`: the `<owner>/<name>` of the repository this fork's ledger belongs
-  to, through which its entries travel between machines (the ledger reference
-  has the setup). Absent, the fork's ledger is not shared. Letter case and a
-  `.git` suffix do not matter. Refused when it is not `<owner>/<name>`, or when
-  the fork's `upstream` is a filesystem path. An older knives refuses a file
-  that sets it, as every entry refuses a field it does not know: upgrade every
-  machine that reads the file before adding it.
+  to, through which its entries travel between machines. The name may start
+  with a dot (`someone/.knives-ledger`); the owner may not. Letter case and a
+  `.git` suffix do not matter. Absent, the fork's ledger is not shared: it
+  stays on each machine that writes it. A machine carries the fork's entries
+  through the git directory over its ledger root whose `origin` is that
+  repository, `~/.config/knives/ledger/.git` or one in
+  `~/.config/knives/ledger-repositories/`, and which names the machine as
+  `knives.machine` in its git config; the
+  [ledger reference](ledger.md#sharing-between-machines) has the setup.
+  Refused when it is not `<owner>/<name>`, or when the fork's `upstream` is a
+  filesystem path, which names no repository another machine could share.
+  Every entry refuses a field it does not know, so an older knives refuses a
+  file that sets `ledger`: upgrade knives on every machine that reads the file
+  before adding it.
 
 ## How a checkout is found
 
