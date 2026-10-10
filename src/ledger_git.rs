@@ -26,6 +26,7 @@ use std::io::Write as _;
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::time::Duration;
 
 use crate::ids::{CommitId, UpstreamName};
 
@@ -33,6 +34,20 @@ use crate::ids::{CommitId, UpstreamName};
 const OWN: &str = "refs/knives/";
 /// Where a fetch leaves every machine's ref: `refs/knives-remotes/<remote>/<machine>`.
 const FETCHED: &str = "refs/knives-remotes/";
+
+/// How long one fetch or push may run, start to finish, before it is ended.
+///
+/// git waits with no limit of its own on a remote that takes the connection
+/// and sends nothing, a connect that never completes, or an ssh session gone
+/// quiet, and whatever waits on it waits too: a report, or a sweep holding
+/// the ledger's lock. Each machine's ref is a small tree of small files, so
+/// a minute is many times what a healthy fetch or push takes.
+const TRANSPORT_DEADLINE: Duration = Duration::from_secs(60);
+/// git abandons an HTTP transfer that runs below [`LOW_SPEED_BYTES`] bytes a
+/// second for [`LOW_SPEED_SECONDS`] seconds, so a remote that stops answering
+/// mid-transfer fails well before [`TRANSPORT_DEADLINE`].
+const LOW_SPEED_BYTES: &str = "1000";
+const LOW_SPEED_SECONDS: &str = "15";
 
 /// One machine's ref as a fetch found it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -168,6 +183,14 @@ pub enum GitError {
     Run {
         invocation: String,
         source: std::io::Error,
+    },
+    #[error(
+        "{invocation} was ended after {}s: the remote stopped answering",
+        deadline.as_secs()
+    )]
+    Deadline {
+        invocation: String,
+        deadline: Duration,
     },
     #[error("{invocation} failed: {stderr}")]
     Failed { invocation: String, stderr: String },
@@ -348,7 +371,7 @@ pub fn pending(repository: &Repository, machine: &str) -> Result<Pending, GitErr
 pub fn fetch(repository: &Repository, remote: &str) -> Result<Vec<MachineRef>, GitError> {
     let remote = ref_component("remote", remote)?;
     let namespace = format!("{FETCHED}{remote}/");
-    run(repository.git().args([
+    transport(repository.git().args([
         "fetch",
         "--quiet",
         "--no-tags",
@@ -399,7 +422,7 @@ pub fn push(repository: &Repository, remote: &str, machine: &str) -> Result<(), 
             Ok(())
         };
     };
-    run(repository.git().args([
+    transport(repository.git().args([
         "push",
         "--quiet",
         "--no-follow-tags",
@@ -1022,6 +1045,70 @@ fn run(command: &mut Command) -> Result<Vec<u8>, GitError> {
             invocation: invocation(command),
             source,
         })?;
+    succeeded(command, output)
+}
+
+/// [`run`] for a command that talks to a remote: one whose HTTP transfer
+/// stalls fails, and one still running at [`TRANSPORT_DEADLINE`] is ended.
+fn transport(command: &mut Command) -> Result<Vec<u8>, GitError> {
+    command
+        .env("GIT_HTTP_LOW_SPEED_LIMIT", LOW_SPEED_BYTES)
+        .env("GIT_HTTP_LOW_SPEED_TIME", LOW_SPEED_SECONDS);
+    run_until(command, TRANSPORT_DEADLINE)
+}
+
+/// [`run`], ending the command and every process it started once it has run
+/// for `deadline`.
+///
+/// The command runs in a process group of its own, so ending it reaches the
+/// helpers git starts for a transport (`git-remote-https`, `ssh`): they hold
+/// its output pipes, and ending git alone would leave the read of its output
+/// waiting on them. The same group keeps a Ctrl-C meant for knives from
+/// reaching git; a fetch or push left running that way still ends at its own
+/// low-speed limit or writes only the remote's copy of a ref.
+fn run_until(command: &mut Command, deadline: Duration) -> Result<Vec<u8>, GitError> {
+    use std::os::unix::process::CommandExt as _;
+    let child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .map_err(|source| GitError::Run {
+            invocation: invocation(command),
+            source,
+        })?;
+    let group = rustix::process::Pid::from_child(&child);
+    let (finished, waiting) = std::sync::mpsc::channel::<()>();
+    let (output, ended) = std::thread::scope(|scope| {
+        let watchdog = scope.spawn(move || {
+            let expired = matches!(
+                waiting.recv_timeout(deadline),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            );
+            if expired {
+                // Already gone is as good as ended.
+                let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+            }
+            expired
+        });
+        let output = child.wait_with_output();
+        drop(finished);
+        let ended = watchdog
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        (output, ended)
+    });
+    if ended {
+        return Err(GitError::Deadline {
+            invocation: invocation(command),
+            deadline,
+        });
+    }
+    let output = output.map_err(|source| GitError::Run {
+        invocation: invocation(command),
+        source,
+    })?;
     succeeded(command, output)
 }
 

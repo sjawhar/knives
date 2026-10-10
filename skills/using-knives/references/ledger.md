@@ -244,7 +244,10 @@ fetches every machine's ref into `refs/knives-remotes/origin/<machine>` and
 writes in the entries this machine lacks, discards this machine's repeated
 transitions (below), commits what is new to `refs/knives/<machine>` (git
 plumbing only, never the index), and pushes that ref, which no other machine
-writes. A failed fetch does not stop the commit and push. It passes again
+writes. A failed fetch does not stop the commit and push. A fetch or push still
+running after a minute is ended, and an HTTP transfer that stalls fails sooner,
+so a remote that stops answering is a failure like any other rather than a wait
+with no end. It passes again
 until a pass finds nothing new. A failing sweep leaves its errors in
 `ledger-sweep.log` beside the state file, which exists only while the last
 sweep failed. Run `knives ledger sweep` by hand to see what one carries; TOON

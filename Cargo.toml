@@ -38,6 +38,11 @@ clap = { version = "4", features = ["derive"] }
 # through jj-lib.
 futures-core = "0.3"
 jiff = "0.2"
+# Only `kill_process_group`: a ledger fetch or push that outlives its deadline
+# is killed with every helper it started (`git-remote-https`, `ssh`), which
+# `Child::kill` would leave holding its pipes. Already in the tree through
+# jj-lib and tempfile; this adds its safe `process` module.
+rustix = { version = "1", features = ["process"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"

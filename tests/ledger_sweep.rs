@@ -73,15 +73,32 @@ fn a_repo_home() -> tempfile::TempDir {
 /// Make `home`'s ledger root a repository whose `origin` is [`LEDGER_URL`],
 /// reached at `remote`, committing as `machine`; return the root.
 fn share(home: &Path, machine: &str, remote: &Path) -> PathBuf {
+    share_at(home, machine, remote.to_str().expect("utf-8"))
+}
+
+/// [`share`], with [`LEDGER_URL`] reached at the URL or path `reached`.
+fn share_at(home: &Path, machine: &str, reached: &str) -> PathBuf {
     let root = home.join("ledger");
     lab::git_repository(&root, &[("origin", LEDGER_URL)]);
-    let reached = remote.to_str().expect("utf-8");
     lab::git_output(
         &root,
         ["config", &format!("url.{reached}.insteadOf"), LEDGER_URL],
     );
     lab::git_output(&root, ["config", "knives.machine", machine]);
     root
+}
+
+/// The URL of a remote that takes every connection and never sends a byte.
+fn stalled_remote() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("a local address").port();
+    std::thread::spawn(move || {
+        // Collecting never finishes: each accepted stream is kept open,
+        // unanswered, until the test process exits.
+        let open: Vec<_> = listener.incoming().collect();
+        drop(open);
+    });
+    format!("http://127.0.0.1:{port}/acme/ledger")
 }
 
 /// A bare remote under a fresh directory.
@@ -734,6 +751,93 @@ fn a_status_that_cannot_pull_says_so_and_still_answers() {
             .any(|row| row["name"] == "feat/alpha"),
         "{report}"
     );
+}
+
+#[test]
+fn a_status_whose_ledger_remote_stalls_still_answers_within_a_bound() {
+    // Given: a machine whose ledger remote accepts the connection and never answers.
+    let lab = lab::Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let home = shared_home(&lab);
+    share_at(home.path(), "alpha", &stalled_remote());
+
+    // When: status runs.
+    let started = Instant::now();
+    let (code, report) = status_on(&lab, home.path());
+
+    // Then: it answers well inside a minute, with the stalled pull as a problem.
+    assert!(
+        started.elapsed() < Duration::from_secs(60),
+        "status hung for {:?}",
+        started.elapsed()
+    );
+    assert_eq!(code, Some(3), "{report}");
+    assert!(
+        report["problems"]
+            .as_array()
+            .expect("problems")
+            .iter()
+            .any(|problem| problem
+                .as_str()
+                .is_some_and(|text| text.contains("could not pull the ledger from origin"))),
+        "{report}"
+    );
+}
+
+#[test]
+fn a_sweep_whose_ledger_remote_stalls_gives_up_within_a_bound_and_lets_the_lock_go() {
+    // Given: a machine with an entry to send, whose ledger remote accepts the
+    // connection and never answers.
+    let home = a_repo_home();
+    let root = share_at(home.path(), "alpha", &stalled_remote());
+    append(&root, "acme/a-repo", 1);
+
+    // When: a sweep runs.
+    let started = Instant::now();
+    let swept = sweep(home.path());
+
+    // Then: it fails well inside a minute, says why, records it in the
+    // sweep log, and no longer holds the ledger's lock.
+    assert!(
+        started.elapsed() < Duration::from_secs(60),
+        "the sweep hung for {:?}",
+        started.elapsed()
+    );
+    let stdout = String::from_utf8_lossy(&swept.stdout);
+    assert_eq!(swept.status.code(), Some(3), "{stdout}");
+    assert!(stdout.contains("origin"), "{stdout}");
+    assert!(home.path().join("ledger-sweep.log").exists());
+    assert!(!held(&home.path().join("ledger.lock")));
+}
+
+#[test]
+fn a_handed_off_sweep_whose_ledger_remote_stalls_lets_the_lock_go_within_a_bound() {
+    // Given: a managed fork on a machine whose ledger remote accepts the
+    // connection and never answers.
+    let lab = lab::Lab::new();
+    let home = shared_home(&lab);
+    share_at(home.path(), "alpha", &stalled_remote());
+
+    // When: a note is written, handing off a sweep.
+    let wrote = knives_on(
+        &lab,
+        home.path(),
+        &["--text", "notch", "-m", "stalled", "--repo", "demo"],
+    );
+    assert!(
+        wrote.status.success(),
+        "{}",
+        String::from_utf8_lossy(&wrote.stderr)
+    );
+
+    // Then: within a minute the sweep has given up, recorded why in the
+    // sweep log, and let the ledger's lock go.
+    let log = home.path().join("ledger-sweep.log");
+    wait_until("the stalled sweep to give up", || {
+        log.exists() && !held(&home.path().join("ledger.lock"))
+    });
+    let recorded = std::fs::read_to_string(&log).expect("read the sweep log");
+    assert!(recorded.contains("origin"), "{recorded}");
 }
 
 #[test]
