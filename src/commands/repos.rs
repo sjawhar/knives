@@ -4,7 +4,7 @@
 //! maintained (the registry, and where each entry lives on this machine);
 //! `status` answers what state each branch of a repository is in. Conflating
 //! the two was an earlier mistake in this design.
-// allow: SIZE_OK: 1032 lines - release state, pin lag, gather and render for one report, with the pin-lag scenarios beside the private functions they exercise.
+// allow: SIZE_OK: 1193 lines - release state, pin lag, gather and render for one report, with the pin-lag scenarios beside the private functions they exercise.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
