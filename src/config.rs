@@ -847,17 +847,22 @@ fn checked_workspaces(
     Ok(Some(expand_registry_path(raw, config_home)))
 }
 
+/// `<owner>/<name>` as a forge spells a repository, and not a path.
+///
+/// A repository's name may start with `.` (`.github`, `.knives-ledger`); an
+/// owner's may not, and neither may be `.` or `..`, which only a path spells.
 fn is_forge_slug(value: &str) -> bool {
     let Some((owner, repository)) = value.split_once('/') else {
         return false;
     };
-    let has_path_syntax =
-        |segment: &str| segment.starts_with(['/', '~', '.']) || segment.contains('\\');
-    !owner.is_empty()
-        && !repository.is_empty()
-        && !repository.contains('/')
-        && !has_path_syntax(owner)
-        && !has_path_syntax(repository)
+    let has_path_syntax = |segment: &str| {
+        segment.is_empty()
+            || segment == "."
+            || segment == ".."
+            || segment.starts_with(['/', '~'])
+            || segment.contains(['/', '\\'])
+    };
+    !has_path_syntax(owner) && !owner.starts_with('.') && !has_path_syntax(repository)
 }
 
 #[cfg(test)]
@@ -1096,6 +1101,39 @@ release = "https://example.invalid/releases.git"
         assert!(!demo.shares_ledger_with("company/elsewhere"));
         assert_eq!(registry.repos["other"].ledger, None);
         assert!(!registry.repos["other"].shares_ledger_with("company/ledger"));
+    }
+
+    #[test]
+    fn a_ledger_repository_whose_name_starts_with_a_dot_loads() {
+        // Given: a fork sharing its ledger with a dot-named repository, as a
+        // personal ledger repository is named.
+        let dir = tempfile::tempdir().unwrap();
+        let text = "[repos.demo]\nupstream = \"https://forge.example/org/demo\"\n\
+                    origin = \"o\"\nledger = \"sjawhar/.knives-ledger\"\n";
+
+        // Then: it loads and names that repository.
+        let registry = load(&write(dir.path(), text)).unwrap();
+        assert!(registry.repos["demo"].shares_ledger_with("sjawhar/.knives-ledger"));
+
+        // And: `.` and `..`, which only a path spells, are still refused,
+        // as is an owner a path would spell.
+        for refused in [
+            "sjawhar/.",
+            "sjawhar/..",
+            "./ledger",
+            "../ledger",
+            ".hidden/ledger",
+        ] {
+            let text = format!(
+                "[repos.demo]\nupstream = \"https://forge.example/org/demo\"\n\
+                 origin = \"o\"\nledger = \"{refused}\"\n"
+            );
+            let error = load(&write(dir.path(), &text)).unwrap_err().to_string();
+            assert!(
+                error.contains(&format!("found \"{refused}\"")),
+                "{refused}: {error}"
+            );
+        }
     }
 
     #[test]
