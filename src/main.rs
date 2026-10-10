@@ -634,6 +634,17 @@ fn scribe_for(fork: &Fork<'_>, bound: Option<&UpstreamName>) -> anyhow::Result<S
     ))
 }
 
+/// `fork`'s ledger entries, read after pulling them from every destination
+/// that carries the fork, and the pull's problems: what a release command
+/// decides from.
+fn pulled_ledger(fork: &Fork<'_>) -> anyhow::Result<(Vec<knives::ledger::Entry>, Vec<String>)> {
+    let pulled = knives::ledger_sweep::pull(&[&fork.upstream]);
+    Ok((
+        Ledger::for_fork(fork).entries()?,
+        pulled.problems_for(&fork.upstream),
+    ))
+}
+
 /// The release plan for `fork`, from a ledger pulled first: what a release
 /// command decides from.
 ///
@@ -646,10 +657,9 @@ fn pulled_plan(
     fork: &Fork<'_>,
     consumers: &knives::commands::release::ConsumerInputs<'_>,
 ) -> anyhow::Result<knives::commands::release::Plan> {
-    let pulled = knives::ledger_sweep::pull(&[&fork.upstream]);
-    let mut plan =
-        knives::commands::release::plan(fork, consumers, &Ledger::for_fork(fork).entries()?)?;
-    plan.problems.extend(pulled.problems_for(&fork.upstream));
+    let (entries, problems) = pulled_ledger(fork)?;
+    let mut plan = knives::commands::release::plan(fork, consumers, &entries)?;
+    plan.problems.extend(problems);
     Ok(plan)
 }
 

@@ -17,12 +17,17 @@ use knives::commands::release;
 use knives::forge::Forge;
 use knives::forge::github::CliForge;
 use knives::jj::Repo;
-use knives::ledger::Ledger;
 
-use super::parallelism;
+use super::{parallelism, pulled_ledger};
 
 /// Inspect a release's direct parents and, on request, replay their content:
 /// the release `reference` names, or the one in hand.
+///
+/// With no `reference`, the release in hand is the plan's, from a ledger
+/// pulled first as every release command's is; a pull that failed is one of
+/// the report's problems. The plan's other problems (a consumer whose pins
+/// could not be read) are not: they are about the next cut, not about which
+/// release this is.
 pub(crate) fn run_release_members(
     fork: &Fork<'_>,
     reference: Option<&str>,
@@ -35,6 +40,7 @@ pub(crate) fn run_release_members(
     let forge = CliForge;
     let cache_root = knives::forge_cache::cache_root();
     let heads = knives::consumer_pins::ConsumerHeadMemo::default();
+    let mut pull_problems = Vec::new();
     let reference = if let Some(reference) = reference {
         std::borrow::Cow::Borrowed(reference)
     } else {
@@ -45,14 +51,20 @@ pub(crate) fn run_release_members(
             cache_root: cache_root.as_deref(),
             heads: &heads,
         };
-        let plan = release::plan(fork, &consumers, &Ledger::for_fork(fork).entries()?)?;
+        let (entries, problems) = pulled_ledger(fork)?;
+        let plan = release::plan(fork, &consumers, &entries)?;
         let Some(reference) = plan.release else {
             println!("{repo}: no release to inspect; cut one first");
+            for problem in &problems {
+                println!("!! {problem}");
+            }
             return Ok(Exit::Incomplete);
         };
+        pull_problems = problems;
         std::borrow::Cow::Owned(reference)
     };
-    let report = release::gather_members(&opened, fork, &reference, verify)?;
+    let mut report = release::gather_members(&opened, fork, &reference, verify)?;
+    report.problems.extend(pull_problems);
     let exit = members_exit(&report, verify);
     print_members(&report, output)?;
     Ok(exit)

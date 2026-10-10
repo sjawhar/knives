@@ -813,6 +813,50 @@ fn a_release_cut_is_refused_when_the_ledger_cannot_be_pulled() {
     );
 }
 
+#[test]
+fn release_members_pulls_first_and_says_when_it_could_not() {
+    // Given: a cut release, on a machine whose ledger remote then becomes
+    // unreachable.
+    let lab = lab::Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let home = shared_home(&lab);
+    let (_remote_dir, remote) = bare_remote();
+    let root = share(home.path(), "alpha", &remote);
+    let cut = lab::knives_release(&lab, &home, &["cut", "release/2026-08-04"]);
+    assert!(
+        cut.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cut.stdout)
+    );
+    settle(home.path());
+    let reached = remote.to_str().expect("utf-8");
+    lab::git_output(
+        &root,
+        ["config", "--unset-all", &format!("url.{reached}.insteadOf")],
+    );
+    lab::git_output(
+        &root,
+        [
+            "config",
+            "url./nonexistent/ledger.git.insteadOf",
+            LEDGER_URL,
+        ],
+    );
+
+    // When: members is asked about the release in hand.
+    let members = lab::knives_release(&lab, &home, &["members"]);
+
+    // Then: it still lists the release's parents, and the failed pull is a
+    // problem that makes the answer incomplete.
+    let stdout = String::from_utf8_lossy(&members.stdout);
+    assert_eq!(members.status.code(), Some(3), "{stdout}");
+    assert!(stdout.contains("release/2026-08-04"), "{stdout}");
+    assert!(
+        stdout.contains("could not pull the ledger from origin"),
+        "{stdout}"
+    );
+}
+
 /// The transition both machines see in these tests.
 const MERGED: &str = "#7 merged";
 
