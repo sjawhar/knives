@@ -240,6 +240,7 @@ fn dispatch() -> anyhow::Result<Exit> {
             notch::run(
                 &notch::Request {
                     fork: &fork,
+                    registry: ground.registry,
                     bound: ground.bound(),
                     subject: subject.as_deref(),
                     message: message.as_deref(),

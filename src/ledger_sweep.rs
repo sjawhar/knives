@@ -90,6 +90,10 @@ pub struct Destinations {
     /// to that no destination here is, with that `<owner>/<name>`: its
     /// entries travel to and from no other machine from this one.
     pub unreached: BTreeMap<UpstreamName, String>,
+    /// A problem for each directory under the root holding entries that no
+    /// fork is kept under ([`crate::ledger::unclaimed_problems`]): nothing
+    /// reads or carries them, so every sweep and every pull says so.
+    pub unclaimed: Vec<String>,
 }
 
 impl Destinations {
@@ -276,7 +280,11 @@ pub fn destinations(root: &Path) -> Result<Destinations, SweepError> {
             (!carried_anywhere.contains(&fork)).then(|| (fork, ledger.clone()))
         })
         .collect();
-    Ok(Destinations { found, unreached })
+    Ok(Destinations {
+        found,
+        unreached,
+        unclaimed: crate::ledger::unclaimed_problems(root, &registry),
+    })
 }
 
 /// Where the last sweep's failures are, and only while the last sweep failed.
@@ -367,17 +375,22 @@ pub fn run(root: &Path) -> Result<Swept, SweepError> {
 /// that found the lock taken and left, so either the holder takes the lock
 /// back for it, or the sweep that took the lock in between carries it.
 ///
-/// Each [`Destinations::unreached`] fork is one of the sweep's problems, so
-/// it is in the [`sweep_log`] until the ledger root is the repository its
-/// registry entry names.
+/// Each [`Destinations::unreached`] fork and each
+/// [`Destinations::unclaimed`] directory is one of the sweep's problems, so
+/// it is in the [`sweep_log`] until it is fixed.
 pub fn sweep(root: &Path, destinations: &Destinations) -> Result<Swept, SweepError> {
-    let Destinations { found, unreached } = destinations;
-    if found.is_empty() && unreached.is_empty() {
+    let Destinations {
+        found,
+        unreached,
+        unclaimed,
+    } = destinations;
+    if found.is_empty() && unreached.is_empty() && unclaimed.is_empty() {
         return Ok(Swept::NotShared);
     }
     let mut problems: Vec<String> = unreached
         .iter()
         .map(|(fork, ledger)| Destinations::unreached_problem(root, fork, ledger))
+        .chain(unclaimed.iter().cloned())
         .collect();
     let mut tallies: Vec<Tally> = found.iter().map(Tally::of).collect();
     let mut held = false;
@@ -587,7 +600,10 @@ pub fn pull(forks: &[&UpstreamName]) -> Pulled {
 /// problem for every fork asked about that the destination carries, never an
 /// error: the command still answers from the entries this machine has. So
 /// is a fork asked about whose registry entry names a repository its ledger
-/// belongs to that no destination here is ([`Destinations::unreached`]).
+/// belongs to that no destination here is ([`Destinations::unreached`]), and
+/// every directory of entries no fork is kept under
+/// ([`Destinations::unclaimed`]), which is a problem for each fork asked
+/// about: any of them may be the one reading its ledger without them.
 pub fn pull_at(root: &Path, forks: &[&UpstreamName]) -> Pulled {
     let mut pulled = Pulled {
         root: root.to_owned(),
@@ -596,7 +612,11 @@ pub fn pull_at(root: &Path, forks: &[&UpstreamName]) -> Pulled {
     if forks.is_empty() {
         return pulled;
     }
-    let Destinations { found, unreached } = match destinations(root) {
+    let Destinations {
+        found,
+        unreached,
+        unclaimed,
+    } = match destinations(root) {
         Ok(found) => found,
         Err(error) => {
             for fork in forks {
@@ -609,6 +629,13 @@ pub fn pull_at(root: &Path, forks: &[&UpstreamName]) -> Pulled {
             return pulled;
         }
     };
+    for fork in forks {
+        pulled
+            .problems
+            .entry((*fork).clone())
+            .or_default()
+            .extend(unclaimed.iter().cloned());
+    }
     let asked: BTreeSet<&UpstreamName> = forks.iter().copied().collect();
     for (fork, ledger) in &unreached {
         if asked.contains(fork) {

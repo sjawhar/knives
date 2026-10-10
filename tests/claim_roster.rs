@@ -552,3 +552,71 @@ fn notch_and_the_release_plan_refuse_a_ledger_still_under_the_registry_key() {
         String::from_utf8_lossy(&plan.stderr)
     );
 }
+
+#[test]
+fn a_ledger_no_registry_entry_keeps_is_reported_by_status_notch_and_the_sweep() {
+    // Given: entries filed under the fork's upstream name before its
+    // registry entry was pointed at another upstream (a renamed repository),
+    // so no fork is kept where they are now.
+    let (lab, home) = forge_fork();
+    knives::ledger::Ledger::at(home.path().join("ledger").join("maintainer/old-demo"))
+        .append(&knives::ledger::Entry {
+            ts: "2026-01-01T00:00:00Z".to_owned(),
+            owner: "ses_older".to_owned(),
+            email: None,
+            subject: None,
+            kind: knives::ledger::Kind::Note,
+            disposition: None,
+            statement: None,
+            text: "filed under the old upstream".to_owned(),
+            evidence: Vec::new(),
+            anchor: None,
+            pr: None,
+            parents: Vec::new(),
+        })
+        .expect("append a note");
+    let orphan = home.path().join("ledger").join("maintainer/old-demo");
+    let names_both_fixes = |text: &str| {
+        text.contains(&orphan.display().to_string())
+            && text.contains("upstream")
+            && text.contains("move")
+    };
+
+    // When / Then: notch's read exits incomplete naming the directory and
+    // both fixes, rather than reading as "no notches yet" and succeeding.
+    let read = knives_as(
+        &lab,
+        home.path(),
+        &lab.work,
+        Some("agent-one"),
+        &["--text", "notch", "--repo", "demo"],
+    );
+    let stdout = String::from_utf8_lossy(&read.stdout);
+    assert_eq!(read.status.code(), Some(3), "{stdout}");
+    assert!(names_both_fixes(&stdout), "{stdout}");
+
+    // And: status reports it among its problems.
+    let status = status_of_demo(&lab, home.path());
+    assert_eq!(status.status.code(), Some(3));
+    let report: Value = serde_json::from_slice(&status.stdout).expect("status JSON");
+    assert!(
+        report["problems"]
+            .as_array()
+            .expect("problems")
+            .iter()
+            .any(|problem| problem.as_str().is_some_and(names_both_fixes)),
+        "{report}"
+    );
+
+    // And: so does a sweep.
+    let swept = knives_as(
+        &lab,
+        home.path(),
+        &lab.work,
+        None,
+        &["--json", "ledger", "sweep"],
+    );
+    let stdout = String::from_utf8_lossy(&swept.stdout);
+    assert_eq!(swept.status.code(), Some(3), "{stdout}");
+    assert!(names_both_fixes(&stdout), "{stdout}");
+}

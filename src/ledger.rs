@@ -300,6 +300,73 @@ pub fn holds_entries(directory: &Path) -> bool {
     })
 }
 
+/// A problem line for each directory under `root` holding entries that no
+/// fork in `registry` is kept under.
+///
+/// A fork is kept under `<owner>/<name>` of its upstream, and under its
+/// registry key where an older knives kept it and a filesystem upstream
+/// keeps it still; [`holds_entries`] decides what holds entries.
+///
+/// Nothing reads such a directory. It is what a fork leaves behind when its
+/// `upstream` changes, or when two machines' registries spell one upstream
+/// as two repositories: the fork then reads its ledger, under the new name,
+/// as empty, and only this says where its entries went. A directory that
+/// cannot be listed is a problem too, rather than a ledger with none.
+pub fn unclaimed_problems(root: &Path, registry: &crate::config::Registry) -> Vec<String> {
+    let claimed: BTreeSet<String> = registry
+        .repos
+        .iter()
+        .flat_map(|(key, entry)| [key.clone(), entry.upstream_name(key).to_string()])
+        .collect();
+    let subdirectories = |directory: &Path| match std::fs::read_dir(directory) {
+        Ok(listing) => Ok(listing
+            .filter_map(|dirent| {
+                let dirent = dirent.ok()?;
+                let name = dirent.file_name().to_string_lossy().into_owned();
+                (dirent.file_type().is_ok_and(|kind| kind.is_dir())
+                    && !name.eq_ignore_ascii_case(".git"))
+                .then_some(name)
+            })
+            .collect::<Vec<_>>()),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(source) => Err(format!(
+            "could not list {} for ledger entries no fork is kept under: {source}",
+            directory.display()
+        )),
+    };
+    let unclaimed = |name: String| {
+        let directory = root.join(&name);
+        (!claimed.contains(&name) && holds_entries(&directory)).then(|| {
+            format!(
+                "{} holds ledger entries that no fork in repos.toml is kept under, so nothing \
+                 reads them, and the fork they belong to reads its ledger without them. Either \
+                 correct that fork's `upstream` in repos.toml to the repository they were filed \
+                 under, or move them into the directory of the fork they belong to, \
+                 {}/<owner>/<name>",
+                directory.display(),
+                root.display()
+            )
+        })
+    };
+    let owners = match subdirectories(root) {
+        Ok(owners) => owners,
+        Err(problem) => return vec![problem],
+    };
+    let mut problems = Vec::new();
+    for owner in owners {
+        match subdirectories(&root.join(&owner)) {
+            Ok(names) => problems.extend(
+                names
+                    .into_iter()
+                    .filter_map(|name| unclaimed(format!("{owner}/{name}"))),
+            ),
+            Err(problem) => problems.push(problem),
+        }
+        problems.extend(unclaimed(owner));
+    }
+    problems
+}
+
 /// One repository's ledger directory.
 #[derive(Debug, Clone)]
 pub struct Ledger {

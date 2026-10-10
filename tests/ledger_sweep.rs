@@ -376,14 +376,20 @@ fn a_sweep_reaches_the_remote_through_the_git_config_its_session_hands_it() {
 fn a_ledger_nobody_set_up_to_share_is_swept_as_nothing_and_touched_nowhere() {
     // Given: a config home whose ledger root is no repository at all, and
     // another whose repository names no machine, with a registry sharing no
-    // fork's ledger.
+    // fork's ledger and an entry of that fork's on disk.
     for initialised in [false, true] {
         let home = tempfile::tempdir().expect("config home");
+        std::fs::write(
+            home.path().join("repos.toml"),
+            "[repos.a-repo]\nupstream = \"https://forge.invalid/acme/a-repo\"\n\
+             origin = \"https://forge.invalid/ours/a-repo\"\n",
+        )
+        .expect("write the registry");
         let root = home.path().join("ledger");
         if initialised {
             lab::git_repository(&root, &[]);
         }
-        append(&root, "a-repo", 1);
+        append(&root, "acme/a-repo", 1);
 
         // When: a sweep runs.
         let swept = sweep(home.path());

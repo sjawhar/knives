@@ -199,6 +199,16 @@ nothing left to move changes nothing. TOON and JSON share its report:
 counts statement entries appended; `already`, statements the ledger already
 carried. Every field is present, empty or `0` when there was nothing to do.
 
+A fork is kept under its upstream's name, so a fork whose `upstream` changes,
+or one two machines' registries spell as two repositories, leaves its entries
+in a directory no fork is kept under, and reads its ledger without them. Each
+directory under `ledger/` that holds entries no registry entry keeps (by its
+upstream name or its registry key) is a problem naming the directory and the
+two fixes: correct that fork's `upstream` in `repos.toml`, or move the entries
+into the directory of the fork they belong to. Every command that pulls first
+([sharing](#sharing-between-machines)) carries it, so a report exits `3` and a
+write that replaces what it read refuses; so do a `notch` read and every sweep.
+
 ## Sharing between machines
 
 A fork's ledger travels between machines when its `repos.toml` entry names the
