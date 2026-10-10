@@ -59,8 +59,10 @@ owners = ["ours", "company"]
 roots = ["~/projects/company"]
 ```
 
-`upstream` and `origin` are required. Two entries cannot share upstream, and a
-`path` field is refused. Optional fields:
+`upstream` and `origin` are required. Two entries cannot share upstream, nor an
+upstream `<owner>/<name>` on different forges: a fork's ledger, claims and
+branch statements are kept under that name, which has no host, so the two would
+merge. A `path` field is refused. Optional fields:
 
 - `base`: upstream trunk used for branching, trunk probes and PR targets;
   defaults to `main`. Upstreams using another trunk, such as `dev`, state it here.

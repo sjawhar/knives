@@ -579,6 +579,7 @@ pub fn load(path: &Path) -> Result<Registry, ConfigError> {
         }
     }
     reject_shared_upstreams(&registry, path)?;
+    reject_shared_upstream_names(&registry, path)?;
     reject_tilde_paths_without_a_home(&registry, path)?;
     let config_home = path.parent().unwrap_or_else(|| Path::new(".")).to_owned();
     for (name, entry) in &mut registry.repos {
@@ -830,6 +831,30 @@ fn reject_shared_upstreams(registry: &Registry, path: &Path) -> Result<(), Confi
                 });
             }
         }
+    }
+    Ok(())
+}
+
+/// A fork's ledger directory, its claims and every statement about its
+/// branches are kept under [`RepoEntry::upstream_name`], which has no host:
+/// two forges can each hold an `<owner>/<name>`, and forks of both would
+/// read and write one ledger and one set of claims. The first pair by name
+/// is reported.
+fn reject_shared_upstream_names(registry: &Registry, path: &Path) -> Result<(), ConfigError> {
+    let mut kept: BTreeMap<UpstreamName, &String> = BTreeMap::new();
+    for (key, entry) in &registry.repos {
+        let upstream = entry.upstream_name(key);
+        if let Some(first) = kept.get(&upstream) {
+            return Err(ConfigError::Invalid {
+                path: path.to_owned(),
+                detail: format!(
+                    "[repos.{first}] and [repos.{key}] are both kept under {upstream}, so their \
+                     ledgers, claims and branch statements would merge; a fork is kept under \
+                     its upstream's <owner>/<name>, whatever forge holds it"
+                ),
+            });
+        }
+        kept.insert(upstream, key);
     }
     Ok(())
 }
@@ -1376,6 +1401,23 @@ release = "https://example.invalid/releases.git"
             error.contains(
                 "[repos.a] and [repos.b] share upstream https://forge.example/org/tool; identity must be unique"
             ),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn two_upstreams_with_one_owner_and_name_on_different_hosts_are_rejected() {
+        // Two forges can each hold an `acme/tool`; the ledger and the state
+        // keep a fork under `<owner>/<name>` alone, so both would read and
+        // write one ledger directory and one set of claims.
+        let dir = tempfile::tempdir().unwrap();
+        let text = "[repos.a]\nupstream = \"https://forge.example/Acme/Tool\"\n\
+                    origin = \"https://forge.example/ours/tool\"\n\
+                    [repos.b]\nupstream = \"git@other.example:acme/tool.git\"\n\
+                    origin = \"https://other.example/theirs/tool\"\n";
+        let error = load(&write(dir.path(), text)).unwrap_err().to_string();
+        assert!(
+            error.contains("[repos.a] and [repos.b] are both kept under acme/tool"),
             "{error}"
         );
     }
