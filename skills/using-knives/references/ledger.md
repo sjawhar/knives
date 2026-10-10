@@ -260,6 +260,16 @@ git --git-dir ~/.config/knives/ledger-repositories/<dir> config knives.machine <
 A machine joined only through `ledger-repositories` needs no `ledger/`
 directory yet: the first pull or sweep creates it before git runs there.
 
+A machine joins through a git directory in `ledger-repositories/`, as above;
+the dotfiles installer makes one for each repository a `ledger` names. A plain
+`git clone` of a ledger repository into `ledger/` is not a ledger: the
+repository's `main` holds a snapshot taken before this release, in the layout
+that kept each fork under its registry key, and knives reads only the
+machines' refs, `refs/knives/*`, never `main`. The sweep and every command
+that reads a fork's ledger refuse such a clone, naming a registry-key
+directory, until `knives ledger migrate` runs
+([upgrading](#upgrading-from-an-older-knives)).
+
 Each git directory carries the forks whose `ledger` names its `origin`, letter
 case and a `.git` suffix aside, and a fork's entries go through that one and
 nowhere else. A fork without `ledger` is not shared. A fork whose `ledger` no
