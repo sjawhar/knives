@@ -196,7 +196,10 @@ pub struct Moved {
 /// writes nothing. One the ledger states otherwise for that branch and kind
 /// is a problem and is not written: the ledger's is what every machine
 /// reads, and this state file's copy is older. A dependency an older knives
-/// recorded by a registry key is written under that fork's upstream name.
+/// recorded by a registry key is written under that fork's upstream name. A
+/// statement whose key names no fork the registry has is a problem and is
+/// written nowhere: a ledger directory no fork is kept under is one nothing
+/// reads.
 ///
 /// The state file is held for update throughout, so no other writer saves
 /// over it between the read and the drop, and it is saved only when every
@@ -223,7 +226,8 @@ pub fn migrate(
     } else {
         Store::open_to_migrate(state_path.to_owned())?
     };
-    let former = crate::config::load(&state_path.with_file_name("repos.toml"))?.former_names();
+    let registry = crate::config::load(&state_path.with_file_name("repos.toml"))?;
+    let former = registry.former_names();
     let mut migrated = Migrated {
         dry_run,
         ..Migrated::default()
@@ -242,24 +246,11 @@ pub fn migrate(
             refused.map, refused.from, refused.to
         )
     }));
-    let mut by_repo: BTreeMap<UpstreamName, Vec<(String, LegacyStatement)>> = BTreeMap::new();
-    for legacy in store.legacy_statements()? {
-        match legacy.key.split_once('/') {
-            Some((repo, branch)) if !repo.is_empty() && !branch.is_empty() => by_repo
-                .entry(
-                    former
-                        .get(repo)
-                        .cloned()
-                        .unwrap_or_else(|| UpstreamName::new(repo)),
-                )
-                .or_default()
-                .push((branch.to_owned(), with_current_names(legacy, &former))),
-            _ => migrated.problems.push(format!(
-                "{}: cannot read the key as <repo>/<branch>",
-                legacy.key
-            )),
-        }
-    }
+    let mut by_repo = by_fork(
+        store.legacy_statements()?,
+        &registry,
+        &mut migrated.problems,
+    );
     if !dry_run {
         let forks: Vec<&UpstreamName> = by_repo.keys().collect();
         let pulled = ledger_sweep::pull_at(root, &forks);
@@ -317,6 +308,57 @@ pub fn migrate(
     let contradicted = std::mem::take(&mut migrated.contradicted);
     migrated.problems.extend(contradicted);
     Ok(migrated)
+}
+
+/// Each of `statements` filed under the name its fork is kept under, its
+/// requirements renamed as [`with_current_names`] does; each one whose key
+/// cannot be read, or names no fork in `registry`, is a problem instead.
+///
+/// A key's fork is a registry key, an older knives' name for the fork. A
+/// key naming none is not taken as an upstream name: written there, its
+/// entries would sit in a directory no fork is kept under, which nothing
+/// reads, and the fork would be gone from the registry all the same.
+fn by_fork(
+    statements: Vec<LegacyStatement>,
+    registry: &crate::config::Registry,
+    problems: &mut Vec<String>,
+) -> BTreeMap<UpstreamName, Vec<(String, LegacyStatement)>> {
+    let former = registry.former_names();
+    let mut by_repo: BTreeMap<UpstreamName, Vec<(String, LegacyStatement)>> = BTreeMap::new();
+    for legacy in statements {
+        let Some((repo, branch)) = legacy
+            .key
+            .split_once('/')
+            .filter(|(repo, branch)| !repo.is_empty() && !branch.is_empty())
+        else {
+            problems.push(format!(
+                "{}: cannot read the key as <repo>/<branch>",
+                legacy.key
+            ));
+            continue;
+        };
+        let kept_under = former.get(repo).cloned().or_else(|| {
+            registry
+                .repos
+                .contains_key(repo)
+                .then(|| UpstreamName::new(repo))
+        });
+        match kept_under {
+            Some(upstream) => by_repo
+                .entry(upstream)
+                .or_default()
+                .push((branch.to_owned(), with_current_names(legacy, &former))),
+            None => problems.push(format!(
+                "{key} in state.json's {map}: no fork in repos.toml is named {repo}, so the \
+                 statement has no ledger to join and is not migrated. Either add the fork \
+                 back as [repos.{repo}] in repos.toml, or delete {key} from {map} in \
+                 state.json",
+                key = legacy.key,
+                map = legacy.map,
+            )),
+        }
+    }
+    by_repo
 }
 
 /// `legacy` with the repository of each requirement it states renamed from

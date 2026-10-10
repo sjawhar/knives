@@ -187,8 +187,11 @@ neither still answer: `repos`, `consumers`, `pr`, `register`, `gh`, and the
    statement the ledger already makes otherwise for that branch and kind
    (another machine migrated first, or stated it since) is a problem naming
    both values, and is not written: the ledger's is what every machine reads.
-   If this or an earlier step left a problem other than such a contradiction,
-   `state.json` keeps every statement.
+   A statement whose key names no fork in `repos.toml` is a problem naming
+   the key and both fixes, add the fork back to `repos.toml` or delete the key
+   from `state.json`, and is written nowhere. If this or an earlier step left
+   a problem other than such a contradiction, `state.json` keeps every
+   statement.
 4. Renames each `seen.json` sighting `<registry key>/<workspace>` to
    `<upstream name>/<workspace>`, keeping the later stamp where both exist. An
    unreadable `seen.json` is a problem, but does not hold back the statements.

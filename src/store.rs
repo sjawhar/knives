@@ -102,6 +102,8 @@ const LEGACY_STATEMENTS: [&str; 4] = ["tracked_pulls", "fork_only", "superseded"
 /// One branch statement an older knives kept in the state file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LegacyStatement {
+    /// The map that held it: one of [`LEGACY_STATEMENTS`].
+    pub map: &'static str,
     /// `<repo>/<branch>`, as the older knives keyed it.
     pub key: String,
     pub statement: Statement,
@@ -589,26 +591,33 @@ impl Store {
                     source,
                 }
             })?;
-        let stated = |key: String, kind: StatementKind, value: Option<String>| LegacyStatement {
+        let [pulls, fork_only, superseded, dependencies] = LEGACY_STATEMENTS;
+        let stated = |map, key: String, kind, value: Option<String>| LegacyStatement {
+            map,
             key,
             statement: Statement { kind, value },
         };
         Ok(legacy
             .tracked_pulls
             .into_iter()
-            .map(|(key, number)| stated(key, StatementKind::Pull, Some(number.to_string())))
+            .map(|(key, number)| stated(pulls, key, StatementKind::Pull, Some(number.to_string())))
             .chain(
                 legacy
                     .fork_only
                     .into_iter()
-                    .map(|(key, why)| stated(key, StatementKind::ForkOnly, Some(why))),
+                    .map(|(key, why)| stated(fork_only, key, StatementKind::ForkOnly, Some(why))),
             )
             .chain(legacy.superseded.into_iter().map(|(key, replacement)| {
-                stated(key, StatementKind::Superseded, Some(replacement))
+                stated(
+                    superseded,
+                    key,
+                    StatementKind::Superseded,
+                    Some(replacement),
+                )
             }))
             .chain(legacy.dependencies.into_iter().map(|(key, required)| {
                 let value = (!required.is_empty()).then(|| required.join(","));
-                stated(key, StatementKind::Depends, value)
+                stated(dependencies, key, StatementKind::Depends, value)
             }))
             .collect())
     }
@@ -1121,6 +1130,12 @@ mod tests {
         let mut subject = Store::open_to_migrate(path).unwrap();
 
         let stated = |key: &str, kind, value: Option<&str>| LegacyStatement {
+            map: match kind {
+                StatementKind::Pull => "tracked_pulls",
+                StatementKind::ForkOnly => "fork_only",
+                StatementKind::Superseded => "superseded",
+                _ => "dependencies",
+            },
             key: key.to_owned(),
             statement: Statement {
                 kind,

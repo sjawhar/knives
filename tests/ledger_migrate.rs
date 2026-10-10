@@ -28,6 +28,19 @@ const LEGACY_STATE: &str = r#"{
   "release_included": {"a-repo/feat/alpha": "stated"}
 }"#;
 
+/// A config home whose registry has the two forks [`LEGACY_STATE`] names,
+/// each with a filesystem upstream, so each is kept under its registry key.
+fn legacy_home() -> tempfile::TempDir {
+    let home = tempfile::tempdir().expect("config home");
+    std::fs::write(
+        home.path().join("repos.toml"),
+        "[repos.a-repo]\nupstream = \"/srv/a-repo\"\norigin = \"https://forge.invalid/ours/a-repo\"\n\n\
+         [repos.b-repo]\nupstream = \"/srv/b-repo\"\norigin = \"https://forge.invalid/ours/b-repo\"\n",
+    )
+    .expect("write registry");
+    home
+}
+
 fn migrate(home: &Path) -> Output {
     lab::knives_command(home, home, home, &["--json", "ledger", "migrate"])
         .env("KNIVES_OWNER", "ses_migrate")
@@ -68,7 +81,7 @@ fn a_second_migration_writes_nothing_and_leaves_one_entry_per_statement() {
     // a-repo's feat/alpha is an event whose prose reads like the statement but
     // states nothing; and b-repo's ledger already stating feat/beta's pull
     // request exactly as the state file does.
-    let home = tempfile::tempdir().expect("config home");
+    let home = legacy_home();
     std::fs::write(home.path().join("state.json"), LEGACY_STATE).expect("write state");
     Ledger::at(home.path().join("ledger").join("a-repo"))
         .append(&Entry {
@@ -173,7 +186,7 @@ fn a_second_migration_writes_nothing_and_leaves_one_entry_per_statement() {
 #[test]
 fn a_ledger_that_cannot_be_read_keeps_every_statement_in_the_state_file() {
     // Given: a state file with statements for a fork whose ledger is broken
-    let home = tempfile::tempdir().expect("config home");
+    let home = legacy_home();
     std::fs::write(home.path().join("state.json"), LEGACY_STATE).expect("write state");
     let broken = home.path().join("ledger").join("b-repo");
     std::fs::create_dir_all(&broken).expect("ledger directory");
@@ -614,10 +627,54 @@ fn a_state_key_whose_new_name_is_taken_is_left_and_holds_the_statements() {
 }
 
 #[test]
+fn a_statement_about_a_fork_the_registry_no_longer_has_is_held_and_written_nowhere() {
+    // Given: a registry that no longer has the fork `gone`, and a state file
+    // stating a pull request for a branch of it beside one of `demo`.
+    let home = renaming_home();
+    std::fs::write(
+        home.path().join("state.json"),
+        r#"{"tracked_pulls": {"gone/feat/y": 9, "demo/feat/x": 7}}"#,
+    )
+    .expect("write state");
+
+    // When: it migrates.
+    let out = migrate(home.path());
+
+    // Then: the statement about `gone` is a problem naming its key and both
+    // fixes, and is written nowhere; demo's is written; and the state file
+    // keeps its maps, so a run after either fix finishes the job.
+    assert_eq!(out.status.code(), Some(3), "{out:?}");
+    let migrated: serde_json::Value = serde_json::from_slice(&out.stdout).expect("JSON report");
+    assert_eq!(migrated["wrote"], 1, "{migrated}");
+    let problems = migrated["problems"].to_string();
+    assert!(
+        problems.contains("gone/feat/y")
+            && problems.contains("[repos.gone]")
+            && problems.contains("delete"),
+        "{migrated}"
+    );
+    assert!(!home.path().join("ledger/gone").exists(), "{migrated}");
+    assert_eq!(
+        statements(&entries(home.path(), "acme/demo")),
+        [(
+            "feat/x".to_owned(),
+            StatementKind::Pull,
+            Some("7".to_owned())
+        )]
+    );
+    let state: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(home.path().join("state.json")).expect("read state"),
+    )
+    .expect("state JSON");
+    assert_eq!(state["tracked_pulls"]["gone/feat/y"], 9, "{state}");
+    assert_eq!(state["tracked_pulls"]["demo/feat/x"], 7, "{state}");
+}
+
+#[test]
 fn a_statement_the_ledger_already_makes_otherwise_is_reported_and_not_written() {
     // Given: a second machine's state file stating feat/beta is #7, and a
     // ledger on which another machine has since stated #8 for it.
-    let home = tempfile::tempdir().expect("config home");
+    let home = legacy_home();
     std::fs::write(
         home.path().join("state.json"),
         r#"{"tracked_pulls": {"b-repo/feat/beta": 7, "b-repo/feat/gamma": 9}}"#,
