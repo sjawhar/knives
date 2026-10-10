@@ -434,6 +434,16 @@ impl Registry {
         )
     }
 
+    /// The fork kept under `upstream` ([`RepoEntry::upstream_name`]): how a
+    /// ledger statement names a fork, the one spelling every machine's
+    /// registry agrees on. A registry key is not looked up, since another
+    /// machine's registry may give it to another fork.
+    pub fn kept_under(&self, upstream: &UpstreamName) -> Option<&RepoEntry> {
+        self.repos
+            .iter()
+            .find_map(|(key, entry)| (entry.upstream_name(key) == *upstream).then_some(entry))
+    }
+
     /// Each registry key that is not the name its fork's ledger and state are
     /// kept under, with that name: what an older knives, which kept them
     /// under the registry key, left for `knives ledger migrate` to rename. A

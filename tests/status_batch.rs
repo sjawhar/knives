@@ -560,11 +560,12 @@ fn stated_pulls_and_dependencies_are_answered_from_the_one_batch() {
 }
 
 #[test]
-fn a_same_fork_dependency_written_by_its_registry_key_is_asked_in_the_one_batch() {
+fn a_dependency_on_a_fork_named_by_anything_but_its_upstream_name_is_a_problem() {
     // Given: a fork whose upstream is a forge URL, kept under acme/demo, with
-    // a branch requiring two of its own pull requests: one as an older knives
-    // recorded it, by the registry key, and one as knives records it now, by
-    // the repository's name.
+    // a branch requiring two of its own pull requests: one named by its
+    // registry key, which no machine's knives writes and which another
+    // machine's registry may give another fork, and one by the repository's
+    // name, as `knives depends` records it.
     let lab = lab::Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     let upstream = "https://forge.invalid/Acme/Demo";
@@ -573,7 +574,7 @@ fn a_same_fork_dependency_written_by_its_registry_key_is_asked_in_the_one_batch(
     let fork = lab::lab_fork(&lab, "demo", &entry);
     assert_eq!(fork.upstream.as_str(), "acme/demo");
     let forge = knives::forge::fake::FakeForge {
-        vanished_states: BTreeMap::from([(43, "MERGED".to_owned()), (44, "OPEN".to_owned())]),
+        vanished_states: BTreeMap::from([(43, "OPEN".to_owned()), (44, "OPEN".to_owned())]),
         ..knives::forge::fake::FakeForge::default()
     };
     let state = tempfile::tempdir().expect("state directory");
@@ -606,10 +607,16 @@ fn a_same_fork_dependency_written_by_its_registry_key_is_asked_in_the_one_batch(
     )
     .expect("gather");
 
-    // Then: both numbers were in the one batch, so each is answered: the
-    // merged one is met, the open one is an unmet dependency, and neither is
-    // a question the forge was never asked.
-    assert!(report.problems.is_empty(), "was: {report:?}");
+    // Then: the one named by the repository's name is asked and answered as
+    // unmet; the other is a problem naming the rule, never read as this fork's.
+    assert_eq!(
+        report.problems,
+        [
+            "feat/alpha requires demo#43, but no fork in the registry is kept under demo: a \
+             requirement names its fork by its upstream repository's <owner>/<name>"
+        ],
+        "was: {report:?}"
+    );
     let unmet: Vec<String> = report
         .findings
         .iter()

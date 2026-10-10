@@ -1,8 +1,8 @@
 use super::{
     BTreeMap, BTreeSet, BookmarkRef, BookmarkTips, BranchName, BranchTarget, CommitId, Finding,
-    FindingKind, Forge, JjError, LandedVerdict, Options, OriginRelation, Registry, Repo, RepoEntry,
-    Role, Store, Subject, UpstreamName, classify_landed, divergent_changes, double_checkout,
-    index_pulls, probe_landed,
+    FindingKind, Forge, JjError, LandedVerdict, Options, OriginRelation, Repo, RepoEntry, Role,
+    Store, Subject, UpstreamName, classify_landed, divergent_changes, double_checkout, index_pulls,
+    probe_landed,
 };
 
 use super::rows::pull_summary_for;
@@ -220,25 +220,13 @@ pub(super) fn conflicted_bookmark_findings(repo: &Repo) -> anyhow::Result<Vec<Fi
     Ok(findings)
 }
 /// Every number declared before discovery: stated pull requests and same-repository
-/// dependencies for both maintained and divergent branches.
-///
-/// A requirement names its fork as it was written, by the repository's
-/// `<owner>/<name>` or by the registry key an older knives recorded; the
-/// registry resolves either to the name `repo` is kept under, as
-/// [`super::dependencies`] does when it answers them. Without a registry only
-/// a requirement already spelled as `repo` is known to be this fork's.
+/// dependencies for both maintained and divergent branches. A requirement is
+/// this fork's when it names `repo`, the name the fork is kept under.
 pub(super) fn declared_numbers(
     repo: &UpstreamName,
     branches: &[BranchName],
     store: &Store,
-    registry: Option<&Registry>,
 ) -> Vec<u64> {
-    let same_fork = |written: &UpstreamName| {
-        written == repo
-            || registry
-                .and_then(|registry| registry.resolve(written.as_str()))
-                .is_some_and(|(_, _, upstream)| upstream == *repo)
-    };
     let mut numbers = BTreeSet::new();
     for branch in branches {
         let target = BranchTarget::new(repo.clone(), branch.clone());
@@ -249,7 +237,7 @@ pub(super) fn declared_numbers(
             store
                 .dependencies(&target)
                 .into_iter()
-                .filter(|requirement| same_fork(&requirement.repo))
+                .filter(|requirement| requirement.repo == *repo)
                 .map(|requirement| requirement.number),
         );
     }

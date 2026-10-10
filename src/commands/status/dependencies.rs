@@ -61,11 +61,8 @@ impl DependencyResults<'_> {
 }
 
 /// The required forks of `repo`'s branches, by the name each is kept under,
-/// with every requirement on it.
-///
-/// A requirement names its fork as it was written: by the repository's
-/// `<owner>/<name>` as `knives depends` records it now, or by the registry
-/// key an older knives recorded, which the registry still resolves.
+/// with every requirement on it. A requirement names its fork by that name
+/// and no other ([`crate::config::Registry::kept_under`]).
 type Required<'a> = BTreeMap<UpstreamName, (&'a RepoEntry, Vec<(BranchName, Requirement)>)>;
 
 fn unmet_dependencies(
@@ -86,15 +83,16 @@ fn unmet_dependencies(
     for row in branches {
         let target = BranchTarget::new(repo.clone(), row.name.clone());
         for requirement in store.dependencies(&target) {
-            match registry.resolve(requirement.repo.as_str()) {
-                Some((_, entry, upstream)) => grouped
-                    .entry(upstream)
+            match registry.kept_under(&requirement.repo) {
+                Some(entry) => grouped
+                    .entry(requirement.repo.clone())
                     .or_insert_with(|| (entry, Vec::new()))
                     .1
                     .push((row.name.clone(), requirement)),
                 None => problems.push(format!(
-                    "{} requires {requirement}, whose repo is not in the registry",
-                    row.name
+                    "{} requires {requirement}, but no fork in the registry is kept under {}: \
+                     a requirement names its fork by its upstream repository's <owner>/<name>",
+                    row.name, requirement.repo
                 )),
             }
         }
