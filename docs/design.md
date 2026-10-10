@@ -10,7 +10,7 @@ The motivating setup is seven forks of one upstream ecosystem, each carrying bet
 
 - Replacing `gh`. PR creation stays `gh pr create`. `fork` supplies facts.
 - Replacing `jj`. General VCS work stays in jj and `jj-agent-status`.
-- Cross-machine coordination.
+- Keeping machines in step. The ledger travels between machines through a git repository the registry names (`ledger`), and nothing else does: claims, sightings and pull request records stay on the machine that made them.
 - Judgment. Anything of the form "have you read and understood X" is a skill, not a CLI check.
 - Fixing agent laziness. A tool cannot make an agent add a missing API method instead of declaring it impossible.
 

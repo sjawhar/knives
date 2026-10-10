@@ -72,13 +72,17 @@ always safe: the next status run uses cold forge discovery and re-runs its lande
 One thing cannot be computed: why. `knives finish` deletes the claim that said why a branch
 exists, and after that the only honest answer to "what is this branch" is archaeology.
 
-So each repository has a ledger directory at `~/.config/knives/ledger/<repo>/`, beside the
-state file. Each entry is an immutable Markdown file with TOML frontmatter between `+++`
-fences and a prose body. A write is one atomic `create_new`; entries are never rewritten or
-deleted, and there is no lockfile. Every command that witnesses something
-writes to the ledger as part of doing it: claims taken and handed back, pull requests
-stated, dependencies recorded, the full parent set of every release cut, and each tracked
-pull request that merged, closed or advanced. Agents add their own judgments by hand:
+So each fork has a ledger directory at `~/.config/knives/ledger/<owner>/<name>/`, beside the
+state file, named for its upstream repository in lowercase so that every machine files it in
+the same place. Each entry is an immutable Markdown file with TOML frontmatter between `+++`
+fences and a prose body, carrying the writer's `git config user.email` when one is set. A write
+is one atomic no-clobber rename, and an entry is never rewritten. Outside `knives ledger
+migrate`, the one entry ever removed is a machine's own uncommitted repeat of a transition another
+machine already shared. Every command
+that witnesses something writes to the ledger as part of doing it: claims taken and handed back,
+pull requests stated, dependencies recorded, the full parent set of every release cut, and each
+tracked pull request that merged, closed, reopened or advanced. Agents add their own judgments by
+hand:
 
 ```
 knives notch '#1413' -m "split to a plugin; the original branch will not land" \
@@ -95,13 +99,21 @@ one count; `--events` reads their full chronology. `--verify` re-checks selected
 commit-shaped evidence and anchors against the repository as it is now.
 
 A fork's ledger travels between machines when its `repos.toml` entry names the repository its
-ledger belongs to (`ledger = "<owner>/<name>"`), and the ledger directory is a git repository
-whose `origin` is that repository and whose config names this machine (`knives.machine`): every
-write starts `knives ledger sweep` in the background, which commits new entries to the machine's
-own ref, pulls every other machine's, and pushes. One sweep runs at a time and nothing ever
-rebases. A command that decides from the ledger (`status`, `sync`, `audit`, `pushed`, the release
-verbs) pulls it first, and says so in its problems when it cannot. The `using-knives` skill's
-ledger reference has the setup.
+ledger belongs to (`ledger = "<owner>/<name>"`), and a git directory over the ledger root has that
+repository as its `origin` and names this machine (`knives.machine`): the root's own `.git`, or
+one in `~/.config/knives/ledger-repositories/`, one per repository the ledgers travel through.
+Every write starts `knives ledger sweep` in the background, which commits new entries to the
+machine's own ref, pulls every other machine's, and pushes. One sweep runs at a time and nothing
+ever rebases. A command that decides from the ledger (`status`, `sync`, `audit`, `pushed`, the
+release verbs, `release members`) pulls it first, and says so in its problems when it cannot.
+When two machines both sync after one merge, the second does not record it again; only two that
+each commit it before either pulls keep both. The `using-knives` skill's ledger reference has the
+setup.
+
+An older knives kept branch statements in `state.json` and filed each fork's ledger under its
+registry key. This one refuses such a state file or ledger, naming `knives ledger migrate`, which
+moves both once: every statement onto the ledger, and every directory, `state.json` key and
+workspace sighting to the fork's upstream name. A second run changes nothing.
 
 `knives status` carries the newest human note for each branch, preferring it over a newer machine
 event. Its compact notch cell prefixes a disposition, if any, and appends the count of entries it
@@ -217,11 +229,12 @@ that contains one; a branch stated `--fork-only` is exempt. Absent, no scan runs
 skill has the matching and load rules.
 
 `ledger` names, as `<owner>/<name>`, the repository a fork's ledger belongs to: the one that
-carries its entries between machines. Without it the fork's ledger stays on each machine that
-writes it. A fork whose `upstream` is a filesystem path names no repository another machine could
-share, so `ledger` is refused on it. An older knives refuses a `repos.toml` that sets `ledger`,
-because every entry refuses a field it does not know: upgrade knives on every machine that reads
-the file before adding it.
+carries its entries between machines. A repository name may start with a dot
+(`someone/.knives-ledger`). Without it the fork's ledger stays on each machine that writes it. A
+fork whose `upstream` is a filesystem path names no repository another machine could share, so
+`ledger` is refused on it. An older knives refuses a `repos.toml` that sets `ledger`, because
+every entry refuses a field it does not know: upgrade knives on every machine that reads the file
+before adding it.
 
 Every command takes its repo from the directory you are standing in, wherever that checkout
 lives. Name one only when you are somewhere else; knives then scans `~` three directories deep
@@ -246,7 +259,7 @@ reads `not on this machine`, and an entry with two is refused with both paths na
 | `knives depends` | record that a branch cannot land before another repo's pull request |
 | `knives notch [SUBJECT] [-m TEXT] [--disposition TOKEN]` | read the ledger or write a human note; dispositions require evidence, `--dispositions` reads terminal rulings, and `--verify` re-checks selected entries |
 | `knives ledger sweep` | commit, pull and push the shared ledger; every write starts one in the background |
-| `knives ledger migrate` | move the branch statements an older knives kept in `state.json` onto the ledger, one statement entry each; a second run writes nothing |
+| `knives ledger migrate` | move what an older knives left onto what this one reads: the branch statements `state.json` kept, one statement entry each, and every fork's ledger directory, state keys and workspace sightings from its registry key to its upstream name; a second run changes nothing |
 | `knives release` | plan a release, edit its membership, cut one, or reap superseded cuts |
 | `knives release members [REF] [--verify] [--carries REV] [--census] [--no-github]` | list a release's direct member parents, their holders and advances; `--verify` audits every member's content in the release; `--carries REV` asks whether REV's content is carried — by REF, or by every live release and upstream trunk; `--census` asks that of every maintained branch, conditionally checks superseded releases, and reports qualified orphans |
 | `knives register [DIR]` | print the registry entry for a checkout, or `already registered as <name>`; writes nothing |
@@ -367,7 +380,9 @@ It does not create pull requests. That is `gh pr create`.
 
 It does not replace jj. General version control stays where it is.
 
-It does not coordinate across machines.
+It does not keep machines in step on its own: it shares what agents recorded (the ledger) through
+a git repository you name, and nothing else. Claims, sightings and pull request records stay on
+the machine that made them.
 
 It does not judge. Anything of the form "have you read the contributing guide and does this
 change comply" is a question for a person or an agent, not a CLI, and the tool does not pretend
