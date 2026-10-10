@@ -851,7 +851,10 @@ fn checked_workspaces(
 ///
 /// A repository's name may start with `.` (`.github`, `.knives-ledger`); an
 /// owner's may not, and neither may be `.` or `..`, which only a path spells.
-fn is_forge_slug(value: &str) -> bool {
+/// The one rule for every slug the registry holds and every path made from
+/// one ([`crate::forge_cache::consumer_cache_path`]): a slug the registry
+/// takes and a cache then refuses is a consumer silently without one.
+pub(crate) fn is_forge_slug(value: &str) -> bool {
     let Some((owner, repository)) = value.split_once('/') else {
         return false;
     };
