@@ -363,6 +363,13 @@ impl Ledger {
             path: self.path.clone(),
             ts: entry.ts.clone(),
         })?;
+        // What every read would refuse is refused before it is written.
+        if let Some(statement) = &entry.statement {
+            statement.check().map_err(|detail| LedgerError::Parse {
+                path: self.path.clone(),
+                detail,
+            })?;
+        }
         let contents = format!(
             "+++\n{}+++\n{}\n",
             Frontmatter::of(entry).into_toml()?,
@@ -823,6 +830,14 @@ fn parse_file(path: &Path) -> Result<Entry, LedgerError> {
             ts: frontmatter.ts,
         });
     }
+    // So is a statement whose value its kind cannot hold: a reader skipping
+    // it would read an older statement, or a shorter list, as the live one.
+    if let Some(statement) = &frontmatter.statement {
+        statement.check().map_err(|detail| LedgerError::Parse {
+            path: path.to_owned(),
+            detail,
+        })?;
+    }
     Ok(frontmatter.into_entry(body))
 }
 
@@ -1103,6 +1118,75 @@ mod tests {
             matches!(&error, LedgerError::Timestamp { ts, .. } if ts == "last tuesday"),
             "was: {error}"
         );
+    }
+
+    #[test]
+    fn a_statement_whose_value_its_kind_cannot_hold_is_reported_rather_than_read_as_none() {
+        // A peer's or a hand's entry with a value its kind cannot hold must
+        // fail the read: read as no statement, a newest malformed `pull`
+        // would hide the valid one before it, and a `depends` list read
+        // without its unreadable requirements would be written back without
+        // them by the next `knives depends`. `superseded` and `fork-only`
+        // hold prose, so any text is theirs.
+        for (kind, value) in [
+            ("pull", "12a"),
+            ("pull", ""),
+            ("pull", "-3"),
+            ("depends", "acme/demo#7,acme/demo"),
+            ("depends", "acme/demo#seven"),
+            ("depends", "acme/demo#7,,sibling#49"),
+            ("depends", ""),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("a-repo");
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(
+                path.join("20260815T221403.000000000Z-0000.md"),
+                format!(
+                    "+++\nstatement = {{ kind = \"{kind}\", value = \"{value}\" }}\n\
+                     ts = \"2026-08-15T22:14:03Z\"\nowner = \"x\"\nsubject = \"feat/alpha\"\n\
+                     kind = \"event\"\n+++\nstated\n"
+                ),
+            )
+            .unwrap();
+
+            let error = Ledger::at(path).entries().unwrap_err();
+            assert!(
+                matches!(
+                    &error,
+                    LedgerError::Parse { path, detail }
+                        if path.ends_with("20260815T221403.000000000Z-0000.md")
+                            && detail.contains(kind)
+                ),
+                "{kind} = {value:?} was read, or failed otherwise: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_statement_value_knives_writes_reads_back() {
+        for (kind, value) in [
+            ("pull", "1234"),
+            ("depends", "acme/demo#7,sibling#49"),
+            ("superseded", "feat/alpha-v2"),
+            ("superseded", "main@upstream"),
+            ("fork-only", "stated with `knives track --fork-only`"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("a-repo");
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(
+                path.join("20260815T221403.000000000Z-0000.md"),
+                format!(
+                    "+++\nstatement = {{ kind = \"{kind}\", value = \"{value}\" }}\n\
+                     ts = \"2026-08-15T22:14:03Z\"\nowner = \"x\"\nsubject = \"feat/alpha\"\n\
+                     kind = \"event\"\n+++\nstated\n"
+                ),
+            )
+            .unwrap();
+            let read = Ledger::at(path).entries();
+            assert!(read.is_ok(), "{kind} = {value:?}: {read:?}");
+        }
     }
 
     #[test]

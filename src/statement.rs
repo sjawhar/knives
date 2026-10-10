@@ -16,6 +16,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::ids::Requirement;
 use crate::ledger::Entry;
 
 /// Which of the four statements an entry makes. Each kind fixes what
@@ -46,6 +47,39 @@ pub struct Statement {
     /// longer has a statement of this kind.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value: Option<String>,
+}
+
+impl Statement {
+    /// Refuse a value its kind cannot hold, saying what it must be.
+    ///
+    /// Checked as an entry file is read
+    /// ([`crate::ledger::Ledger::entries`]), beside its stamp, so a value
+    /// written by hand or by a peer that a reader would have to skip fails
+    /// the read instead: skipped, a newest malformed `pull` would hide the
+    /// valid one before it, and a `depends` list read without its unreadable
+    /// requirements would be written back without them by the next
+    /// `knives depends`. `fork-only` and `superseded` hold prose, so any text
+    /// is theirs; a forget holds nothing and is always well formed.
+    pub fn check(&self) -> Result<(), String> {
+        let Some(value) = self.value.as_deref() else {
+            return Ok(());
+        };
+        let wanted = match self.kind {
+            StatementKind::Pull => value
+                .parse::<u64>()
+                .is_err()
+                .then_some("a `pull` statement holds one pull request number, in decimal"),
+            StatementKind::Depends => value
+                .split(',')
+                .any(|text| Requirement::parse(text).is_none())
+                .then_some(
+                    "a `depends` statement holds every requirement as `<owner>/<name>#<number>`, \
+                     comma-joined",
+                ),
+            StatementKind::ForkOnly | StatementKind::Superseded => None,
+        };
+        wanted.map_or(Ok(()), |wanted| Err(format!("{wanted}; found {value:?}")))
+    }
 }
 
 /// The statements live in a ledger, per branch.
@@ -102,8 +136,8 @@ impl Statements {
         Self { live }
     }
 
-    /// The pull request stated for `branch`. A value that is not a decimal
-    /// number states none.
+    /// The pull request stated for `branch`. Every value read from an entry
+    /// file is a decimal number ([`Statement::check`]).
     pub fn pull(&self, branch: &str) -> Option<u64> {
         self.value(branch, StatementKind::Pull)?.parse().ok()
     }
@@ -119,13 +153,11 @@ impl Statements {
     }
 
     /// Everything `branch` is stated to need first, as `<repo>#<number>`.
+    /// Every part read from an entry file is one ([`Statement::check`]).
     pub fn depends(&self, branch: &str) -> Vec<String> {
         self.value(branch, StatementKind::Depends)
             .map_or_else(Vec::new, |list| {
-                list.split(',')
-                    .filter(|requirement| !requirement.is_empty())
-                    .map(str::to_owned)
-                    .collect()
+                list.split(',').map(str::to_owned).collect()
             })
     }
 

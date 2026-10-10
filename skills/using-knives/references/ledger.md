@@ -135,7 +135,10 @@ A command that reads branch statements (`status`, `audit`, `pushed`, `sync`,
 `track`, `depends`, `finish`, `start`, a `notch` note about a branch without
 `--pr`) reads the ledger of each fork it works on when it starts, and no
 other. An unreadable entry in one of those stops the command with exit `3`
-naming the file, rather than reading that ledger's statements as absent.
+naming the file, rather than reading that ledger's statements as absent. So
+does a statement whose value its kind cannot hold: a `pull` that is not a
+decimal number, or a `depends` part that is not `<owner>/<name>#<number>`.
+Skipped, it would let an older statement, or a shorter list, read as live.
 
 ## Upgrading from an older knives
 
