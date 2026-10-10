@@ -800,9 +800,20 @@ fn snapshot(home: &Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u
 #[test]
 fn a_dry_run_reports_what_a_migration_would_do_and_changes_nothing() {
     // Given: everything an older knives left: ledger directories and state
-    // keys under registry keys, workspace sightings, and statements.
+    // keys under registry keys, workspace sightings, and statements; and a
+    // statement about a third fork, whose ledger belongs to a repository no
+    // git directory on this machine has as its origin.
     let home = renaming_home();
-    std::fs::write(home.path().join("state.json"), ALIASED_STATE).expect("write state");
+    let registry = home.path().join("repos.toml");
+    let mut text = std::fs::read_to_string(&registry).expect("read registry");
+    text.push_str(
+        "\n[repos.tool]\nupstream = \"https://forge.invalid/acme/tool\"\n\
+         origin = \"https://forge.invalid/ours/tool\"\nledger = \"acme/ledger\"\n",
+    );
+    std::fs::write(&registry, text).expect("write registry");
+    let mut state: serde_json::Value = serde_json::from_str(ALIASED_STATE).expect("state JSON");
+    state["tracked_pulls"]["tool/feat/z"] = serde_json::json!(5);
+    std::fs::write(home.path().join("state.json"), state.to_string()).expect("write state");
     std::fs::write(home.path().join("seen.json"), ALIASED_SEEN).expect("write sightings");
     note(home.path(), "demo", "2026-01-01T00:00:00Z", "about demo");
     note(home.path(), "acme", "2026-01-01T00:00:01Z", "about acme");
@@ -826,11 +837,15 @@ fn a_dry_run_reports_what_a_migration_would_do_and_changes_nothing() {
         "{}",
         String::from_utf8_lossy(&dry.stdout)
     );
-    let would = report(&dry);
+    assert_eq!(dry.status.code(), Some(3), "{dry:?}");
+    let would: serde_json::Value = serde_json::from_slice(&dry.stdout).expect("JSON report");
     assert_eq!(would["dry_run"], true, "{would}");
 
-    // And: the real run then does exactly what the dry run said it would.
-    let did = report(&migrate(home.path()));
+    // And: the real run then does exactly what the dry run said it would,
+    // holding back the third fork's statement for the same reason.
+    let real = migrate(home.path());
+    assert_eq!(real.status.code(), Some(3), "{real:?}");
+    let did: serde_json::Value = serde_json::from_slice(&real.stdout).expect("JSON report");
     for field in [
         "moved",
         "renamed",
@@ -842,5 +857,66 @@ fn a_dry_run_reports_what_a_migration_would_do_and_changes_nothing() {
         assert_eq!(would[field], did[field], "{field}: {would} vs {did}");
     }
     assert_eq!(did["wrote"], 2, "{did}");
+    assert!(
+        did["problems"]
+            .to_string()
+            .contains("acme/tool: 1 statement(s) not migrated"),
+        "{did}"
+    );
     assert!(did.get("dry_run").is_none(), "{did}");
+}
+
+#[test]
+fn a_dry_run_holds_back_what_a_refused_ledger_setup_would() {
+    // Given: a statement for a fork whose ledger the root's repository
+    // carries, though that repository names no machine, which every pull
+    // refuses before it fetches.
+    let home = legacy_home();
+    std::fs::write(
+        home.path().join("repos.toml"),
+        "[repos.b-repo]\nupstream = \"https://forge.invalid/acme/b-repo\"\n\
+         origin = \"https://forge.invalid/ours/b-repo\"\nledger = \"acme/ledger\"\n",
+    )
+    .expect("write registry");
+    std::fs::write(
+        home.path().join("state.json"),
+        r#"{"tracked_pulls": {"b-repo/feat/beta": 7}}"#,
+    )
+    .expect("write state");
+    lab::git_repository(
+        &home.path().join("ledger"),
+        &[("origin", "https://forge.invalid/acme/ledger")],
+    );
+    let before = snapshot(home.path());
+
+    // When: a dry run, then the real run.
+    let dry = lab::knives_command(
+        home.path(),
+        home.path(),
+        home.path(),
+        &["--json", "ledger", "migrate", "--dry-run"],
+    )
+    .env("KNIVES_OWNER", "ses_migrate")
+    .output()
+    .expect("run knives ledger migrate --dry-run");
+    assert_eq!(snapshot(home.path()), before, "{dry:?}");
+    let real = migrate(home.path());
+
+    // Then: both hold the statement back with the same problem, naming the
+    // command that names this machine.
+    assert_eq!(dry.status.code(), Some(3), "{dry:?}");
+    assert_eq!(real.status.code(), Some(3), "{real:?}");
+    let would: serde_json::Value = serde_json::from_slice(&dry.stdout).expect("JSON report");
+    let did: serde_json::Value = serde_json::from_slice(&real.stdout).expect("JSON report");
+    assert_eq!(would["problems"], did["problems"], "{would} vs {did}");
+    assert_eq!(would["wrote"], 0, "{would}");
+    assert!(
+        did["problems"]
+            .to_string()
+            .contains("acme/b-repo: 1 statement(s) not migrated")
+            && did["problems"]
+                .to_string()
+                .contains("config knives.machine"),
+        "{did}"
+    );
 }

@@ -200,7 +200,12 @@ Any problem exits `3`, and a run after the fix finishes the job; a run with
 nothing left to move changes nothing. `knives ledger migrate --dry-run`
 reports the same, as what it would move, rename and write, and changes
 nothing: it takes no lock, pulls nothing and writes no file, so it counts
-from the ledger this machine has. TOON and JSON share its report:
+from the ledger this machine has. What it can tell without a fetch it holds
+back as the real run would, with the same problem: each fork whose `ledger`
+no git directory here has as its `origin`, and every fork when the sweep
+would refuse the setup ([sharing](#sharing-between-machines)). What the real
+run meets only when it fetches or writes, a dry run cannot see. TOON and
+JSON share its report:
 
 ```text
 {dry_run?, moved: [{from, to}], renamed: [{map, from, to}], sightings: [{from, to}],

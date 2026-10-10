@@ -214,7 +214,10 @@ pub struct Moved {
 ///
 /// A dry run takes no lock, pulls nothing and writes nothing, so it answers
 /// from the ledger this machine has: a statement another machine made that
-/// a pull would bring in is not counted.
+/// a pull would bring in is not counted. What it can know without a fetch,
+/// it holds back as the real run would: each fork whose ledger no git
+/// directory here reaches, or every fork when where the ledger travels
+/// cannot be read ([`ledger_sweep::unpullable`]).
 pub fn migrate(
     state_path: &Path,
     root: &Path,
@@ -251,21 +254,32 @@ pub fn migrate(
         &registry,
         &mut migrated.problems,
     );
-    if !dry_run {
-        let forks: Vec<&UpstreamName> = by_repo.keys().collect();
+    let forks: Vec<&UpstreamName> = by_repo.keys().collect();
+    let unpulled: BTreeMap<UpstreamName, Vec<String>> = if dry_run {
+        let moved: Vec<&Path> = migrated
+            .moved
+            .iter()
+            .map(|moved| moved.from.as_path())
+            .collect();
+        ledger_sweep::unpullable(root, &forks, &moved)
+    } else {
         let pulled = ledger_sweep::pull_at(root, &forks);
-        by_repo.retain(|repo, statements| {
-            let problems = pulled.failed_for(repo);
-            migrated.problems.extend(problems.iter().map(|problem| {
-                format!(
-                    "{repo}: {} statement(s) not migrated, since the ledger they would join \
-                         could not be pulled: {problem}",
-                    statements.len()
-                )
-            }));
-            problems.is_empty()
-        });
-    }
+        forks
+            .iter()
+            .map(|fork| ((*fork).clone(), pulled.failed_for(fork)))
+            .collect()
+    };
+    by_repo.retain(|repo, statements| {
+        let problems = unpulled.get(repo).map_or(&[][..], Vec::as_slice);
+        migrated.problems.extend(problems.iter().map(|problem| {
+            format!(
+                "{repo}: {} statement(s) not migrated, since the ledger they would join could \
+                 not be pulled: {problem}",
+                statements.len()
+            )
+        }));
+        problems.is_empty()
+    });
     for (repo, statements) in by_repo {
         let moved_in: Vec<PathBuf> = migrated
             .moved

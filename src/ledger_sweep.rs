@@ -20,7 +20,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
-use crate::config::ConfigError;
+use crate::config::{ConfigError, Registry};
 use crate::ids::UpstreamName;
 use crate::ledger::Ledger;
 use crate::ledger_git::{self, GitError, Repository};
@@ -224,15 +224,63 @@ fn identity(git_dir: &Path) -> Result<(Option<String>, Option<String>), SweepErr
 /// until `knives ledger migrate` moves them.
 pub fn destinations(root: &Path) -> Result<Destinations, SweepError> {
     let registry = crate::config::load(&root.with_file_name("repos.toml"))?;
+    refuse_unmigrated(root, &registry, &[])?;
+    let (carriers, unreached) = reach(root, &registry)?;
+    let found = carriers
+        .into_iter()
+        .map(|carrier| {
+            Ok(Destination {
+                repository: Repository::new(&carrier.git_dir, root, carrier.carried)?,
+                transport_lock: ledger_git::absolute_git_dir(&carrier.git_dir)?
+                    .join("knives-transport"),
+                machine: carrier.machine,
+            })
+        })
+        .collect::<Result<_, SweepError>>()?;
+    Ok(Destinations {
+        found,
+        unreached,
+        unclaimed: crate::ledger::unclaimed_problems(root, &registry),
+    })
+}
+
+/// Refuse the ledger at `root` while a fork's registry key's directory
+/// still holds the entries an older knives filed there, unless it is one of
+/// `moved`, which the caller is about to move.
+fn refuse_unmigrated(root: &Path, registry: &Registry, moved: &[&Path]) -> Result<(), SweepError> {
     let former_names = registry.former_names();
-    if let Some((former, now)) = crate::ledger::unmigrated(root, &former_names).next() {
-        return Err(crate::ledger::LedgerError::FormerName {
+    match crate::ledger::unmigrated(root, &former_names)
+        .find(|(former, _)| !moved.contains(&root.join(former).as_path()))
+    {
+        Some((former, now)) => Err(crate::ledger::LedgerError::FormerName {
             path: root.join(now.as_str()),
             former: root.join(former),
         }
-        .into());
+        .into()),
+        None => Ok(()),
     }
-    let mut found = Vec::new();
+}
+
+/// A candidate git directory that names this machine, with the forks it
+/// carries.
+struct Carrier {
+    git_dir: PathBuf,
+    machine: String,
+    carried: Vec<UpstreamName>,
+}
+
+/// Which candidate of [`destinations`] carries which forks, and which forks
+/// no candidate reaches ([`Destinations::unreached`]), with every refusal
+/// [`destinations`] makes but the unmigrated directory's.
+///
+/// Read from the registry and each candidate's own git config alone: no
+/// fetch, and nothing written, not even the ledger root a [`Repository`]
+/// creates.
+fn reach(
+    root: &Path,
+    registry: &Registry,
+) -> Result<(Vec<Carrier>, BTreeMap<UpstreamName, String>), SweepError> {
+    let mut carriers = Vec::new();
     let mut carried_anywhere = BTreeSet::new();
     let mut origins: BTreeMap<String, PathBuf> = BTreeMap::new();
     for git_dir in candidates(root)? {
@@ -260,11 +308,10 @@ pub fn destinations(root: &Path) -> Result<Destinations, SweepError> {
         match machine {
             Some(machine) => {
                 carried_anywhere.extend(carried.iter().cloned());
-                found.push(Destination {
-                    repository: Repository::new(&git_dir, root, carried)?,
+                carriers.push(Carrier {
+                    git_dir,
                     machine,
-                    transport_lock: ledger_git::absolute_git_dir(&git_dir)?
-                        .join("knives-transport"),
+                    carried,
                 });
             }
             None if carried.is_empty() => {}
@@ -289,11 +336,59 @@ pub fn destinations(root: &Path) -> Result<Destinations, SweepError> {
             (!carried_anywhere.contains(&fork)).then(|| (fork, ledger.clone()))
         })
         .collect();
-    Ok(Destinations {
-        found,
-        unreached,
-        unclaimed: crate::ledger::unclaimed_problems(root, &registry),
-    })
+    Ok((carriers, unreached))
+}
+
+/// What [`pull_at`] would find wrong with `forks` before it fetched.
+///
+/// For each of them, the problem [`Pulled::failed_for`] would give for a
+/// setup [`destinations`] refuses, or for a fork no git directory here
+/// reaches.
+///
+/// Read from the registry and each git directory's own config alone, with
+/// no fetch and nothing written, for a dry run that must say what a pull
+/// would hold back. `moved` are the directories an older knives filed
+/// entries in that the caller would move first, so they are not refused as
+/// unmigrated.
+pub fn unpullable(
+    root: &Path,
+    forks: &[&UpstreamName],
+    moved: &[&Path],
+) -> BTreeMap<UpstreamName, Vec<String>> {
+    if forks.is_empty() {
+        return BTreeMap::new();
+    }
+    let reached = crate::config::load(&root.with_file_name("repos.toml"))
+        .map_err(SweepError::from)
+        .and_then(|registry| {
+            refuse_unmigrated(root, &registry, moved)?;
+            let (carriers, unreached) = reach(root, &registry)?;
+            for carrier in &carriers {
+                ledger_git::absolute_git_dir(&carrier.git_dir)?;
+            }
+            Ok(unreached)
+        });
+    setup_problems(root, forks, reached.as_ref())
+}
+
+/// The problem each of `forks` has from where the ledger at `root` travels:
+/// every one of them, when that could not be read; else each fork no git
+/// directory reaches, as its `unreached` entry says.
+fn setup_problems(
+    root: &Path,
+    forks: &[&UpstreamName],
+    unreached: Result<&BTreeMap<UpstreamName, String>, &SweepError>,
+) -> BTreeMap<UpstreamName, Vec<String>> {
+    forks
+        .iter()
+        .filter_map(|fork| {
+            let problem = match unreached {
+                Err(error) => format!("could not pull the ledger: {error}"),
+                Ok(unreached) => Destinations::unreached_problem(root, fork, unreached.get(*fork)?),
+            };
+            Some(((*fork).clone(), vec![problem]))
+        })
+        .collect()
 }
 
 /// Where the last sweep's failures are, and only while the last sweep failed.
@@ -907,34 +1002,20 @@ pub fn pull_at(root: &Path, forks: &[&UpstreamName]) -> Pulled {
     if forks.is_empty() {
         return pulled;
     }
-    let Destinations {
-        found,
-        unreached,
-        unclaimed,
-    } = match destinations(root) {
-        Ok(found) => found,
-        Err(error) => {
-            for fork in forks {
-                pulled
-                    .problems
-                    .entry((*fork).clone())
-                    .or_default()
-                    .push(format!("could not pull the ledger: {error}"));
-            }
-            return pulled;
-        }
+    let reached = destinations(root);
+    pulled.problems = setup_problems(
+        root,
+        forks,
+        reached.as_ref().map(|reached| &reached.unreached),
+    );
+    let Ok(Destinations {
+        found, unclaimed, ..
+    }) = reached
+    else {
+        return pulled;
     };
     pulled.unclaimed = unclaimed;
     let asked: BTreeSet<&UpstreamName> = forks.iter().copied().collect();
-    for (fork, ledger) in &unreached {
-        if asked.contains(fork) {
-            pulled
-                .problems
-                .entry(fork.clone())
-                .or_default()
-                .push(Destinations::unreached_problem(root, fork, ledger));
-        }
-    }
     for destination in found {
         let carried: Vec<&UpstreamName> = destination
             .repository
