@@ -379,4 +379,61 @@ mod tests {
         assert_eq!(live.pull("feat/beta"), Some(4545));
         assert!(!live.fork_only("feat/beta"));
     }
+
+    #[test]
+    fn between_equal_stamps_the_later_entry_wins() {
+        // Given: two statements stamped the same instant, spelled two ways.
+        let first = stated(
+            "2026-08-15T22:14:03Z",
+            "feat/alpha",
+            StatementKind::Pull,
+            Some("1"),
+        );
+        let second = stated(
+            "2026-08-15T22:14:03.000Z",
+            "feat/alpha",
+            StatementKind::Pull,
+            Some("2"),
+        );
+
+        // When / Then: whichever comes later in the slice, the order entries
+        // are on disk, is live.
+        assert_eq!(
+            Statements::from_entries(&[first.clone(), second.clone()]).pull("feat/alpha"),
+            Some(2)
+        );
+        assert_eq!(
+            Statements::from_entries(&[second, first]).pull("feat/alpha"),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn a_stamp_that_does_not_parse_loses_to_every_one_that_does() {
+        // Given: a statement whose stamp does not parse, and an older-looking
+        // one whose stamp does.
+        let unparseable = stated("not a time", "feat/alpha", StatementKind::Pull, Some("9"));
+        let parsed = stated(
+            "1970-01-01T00:00:00Z",
+            "feat/alpha",
+            StatementKind::Pull,
+            Some("1"),
+        );
+
+        // When / Then: the parseable one is live in either order, and the
+        // unparseable one only when it is the sole statement.
+        for entries in [
+            [unparseable.clone(), parsed.clone()],
+            [parsed, unparseable.clone()],
+        ] {
+            assert_eq!(
+                Statements::from_entries(&entries).pull("feat/alpha"),
+                Some(1)
+            );
+        }
+        assert_eq!(
+            Statements::from_entries(&[unparseable]).pull("feat/alpha"),
+            Some(9)
+        );
+    }
 }
