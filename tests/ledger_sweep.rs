@@ -11,6 +11,8 @@
 //! root is a git repository with that repository as its `origin`, as a
 //! machine set up to share its ledger has.
 
+#[path = "common/forge_shim.rs"]
+mod forge_shim;
 #[path = "common/lab.rs"]
 mod lab;
 
@@ -666,4 +668,249 @@ fn a_release_cut_is_refused_when_the_ledger_cannot_be_pulled() {
             .is_err(),
         "the cut was made anyway"
     );
+}
+
+/// The transition both machines see in these tests.
+const MERGED: &str = "#7 merged";
+
+/// A fake forge reporting pull request #7, from `feat/alpha`, in `state`.
+fn forge_reporting(state: &str) -> tempfile::TempDir {
+    let shim = tempfile::tempdir().expect("forge shim directory");
+    forge_shim::install_snapshot_gh(
+        shim.path(),
+        &format!(
+            "[{}]",
+            forge_shim::pull_record(7, state, "feat/alpha", None)
+        ),
+        &[],
+    );
+    shim
+}
+
+/// `knives sync demo` on the machine whose config home is `home`, asking
+/// the forge `shim`, with a cache of its own so every run reads the forge.
+fn sync_on(lab: &lab::Lab, home: &Path, shim: &Path) -> Output {
+    let cache = tempfile::tempdir().expect("forge cache");
+    lab::knives_command(
+        &lab.work,
+        home,
+        lab.temp_path(),
+        &["--json", "sync", "demo"],
+    )
+    .env("KNIVES_OWNER", "ses_fff688")
+    .env("PATH", forge_shim::path_with_gh_shim(shim))
+    .env("XDG_CACHE_HOME", cache.path())
+    .output()
+    .expect("run knives sync")
+}
+
+/// How many entry files across every machine's ref on `remote` have a line
+/// reading exactly `text`, which holds no regular-expression syntax.
+fn recorded_on(remote: &Path, text: &str) -> usize {
+    let refs = git_in(
+        remote,
+        &["for-each-ref", "--format=%(refname)", "refs/knives/"],
+    )
+    .unwrap_or_default();
+    refs.lines()
+        .map(|reference| {
+            git_in(
+                remote,
+                &["grep", "-l", "-e", &format!("^{text}$"), reference],
+            )
+            .map_or(0, |files| files.lines().count())
+        })
+        .sum()
+}
+
+/// How many of the entries in `home`'s ledger of the lab fork read `text`.
+fn recorded_in(home: &Path, text: &str) -> usize {
+    Ledger::at(home.join("ledger").join(FORK))
+        .entries()
+        .expect("read the ledger")
+        .iter()
+        .filter(|entry| entry.text == text)
+        .count()
+}
+
+/// Two machines sharing the remote at `alpha_remote` and `beta_remote`,
+/// both of which have seen #7 open, so its merge is a transition to each.
+fn two_machines_that_saw_seven_open(
+    lab: &lab::Lab,
+    alpha_remote: &Path,
+    beta_remote: &Path,
+) -> (tempfile::TempDir, tempfile::TempDir) {
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let alpha = shared_home(lab);
+    let beta = second_machine(alpha.path());
+    share(alpha.path(), "alpha", alpha_remote);
+    share(beta.path(), "beta", beta_remote);
+    let open = forge_reporting("OPEN");
+    for home in [&alpha, &beta] {
+        let synced = sync_on(lab, home.path(), open.path());
+        assert!(
+            matches!(synced.status.code(), Some(0 | 3)),
+            "{}\n{}",
+            String::from_utf8_lossy(&synced.stdout),
+            String::from_utf8_lossy(&synced.stderr)
+        );
+        assert_eq!(
+            recorded_in(home.path(), MERGED),
+            0,
+            "a first sighting wrote an event"
+        );
+    }
+    (alpha, beta)
+}
+
+/// Hold `home`'s ledger lock, as a running sweep does, until dropped.
+fn hold_sweep_lock(home: &Path) -> File {
+    let file = File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(home.join("ledger.lock"))
+        .expect("open the ledger lock");
+    file.lock().expect("take the ledger lock");
+    file
+}
+
+#[test]
+fn a_second_machine_syncing_the_same_merge_writes_no_second_event() {
+    // Given: two machines sharing one ledger remote, both of which saw #7 open.
+    let lab = lab::Lab::new();
+    let (_remote_dir, remote) = bare_remote();
+    let (alpha, beta) = two_machines_that_saw_seven_open(&lab, &remote, &remote);
+
+    // When: the forge reports #7 merged, alpha syncs and its sweep carries
+    // the event, and then beta syncs with no sweep of its own able to run.
+    let merged = forge_reporting("MERGED");
+    let synced = sync_on(&lab, alpha.path(), merged.path());
+    assert_eq!(
+        synced.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&synced.stdout)
+    );
+    wait_until("alpha's event to reach the remote", || {
+        recorded_on(&remote, MERGED) == 1
+    });
+    settle(alpha.path());
+    let held = hold_sweep_lock(beta.path());
+    let synced = sync_on(&lab, beta.path(), merged.path());
+    assert_eq!(
+        synced.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&synced.stdout)
+    );
+
+    // Then: beta's sync pulled alpha's event and wrote none of its own, so
+    // no sweep had anything to discard.
+    assert_eq!(recorded_in(beta.path(), MERGED), 1);
+
+    // And: once beta sweeps, the remote has the merge once.
+    drop(held);
+    let swept = sweep(beta.path());
+    assert!(
+        swept.status.success(),
+        "{}",
+        String::from_utf8_lossy(&swept.stdout)
+    );
+    settle(beta.path());
+    assert_eq!(recorded_in(beta.path(), MERGED), 1);
+    assert_eq!(recorded_on(&remote, MERGED), 1);
+    assert_eq!(entries_on(&remote, "beta"), 0);
+}
+
+#[test]
+fn a_sweep_discards_its_own_uncommitted_repeat_of_a_transition_it_pulled() {
+    // Given: two machines that saw #7 open, and beta's sweep held off, so
+    // what beta writes stays uncommitted.
+    let lab = lab::Lab::new();
+    let (_remote_dir, remote) = bare_remote();
+    let (alpha, beta) = two_machines_that_saw_seven_open(&lab, &remote, &remote);
+    let held = hold_sweep_lock(beta.path());
+
+    // When: beta syncs the merge before alpha's event exists, then alpha
+    // syncs it and its sweep carries it, and then beta sweeps.
+    let merged = forge_reporting("MERGED");
+    let synced = sync_on(&lab, beta.path(), merged.path());
+    assert_eq!(
+        synced.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&synced.stdout)
+    );
+    assert_eq!(recorded_in(beta.path(), MERGED), 1, "beta wrote its own");
+    let synced = sync_on(&lab, alpha.path(), merged.path());
+    assert_eq!(
+        synced.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&synced.stdout)
+    );
+    wait_until("alpha's event to reach the remote", || {
+        recorded_on(&remote, MERGED) == 1
+    });
+    settle(alpha.path());
+    drop(held);
+    let swept = sweep(beta.path());
+    assert!(
+        swept.status.success(),
+        "{}",
+        String::from_utf8_lossy(&swept.stdout)
+    );
+    settle(beta.path());
+
+    // Then: beta's repeat is gone before any commit, it holds alpha's event
+    // alone, and the remote has the merge once.
+    assert_eq!(recorded_in(beta.path(), MERGED), 1);
+    assert_eq!(recorded_on(&remote, MERGED), 1);
+    assert_eq!(entries_on(&remote, "beta"), 0);
+}
+
+#[test]
+fn a_repeated_transition_two_machines_committed_is_never_removed() {
+    // Given: two machines that saw #7 open, neither able to reach the remote
+    // yet: each reaches it through a path that does not exist so far.
+    let lab = lab::Lab::new();
+    let (remote_dir, remote) = bare_remote();
+    let alpha_view = remote_dir.path().join("alpha-view.git");
+    let beta_view = remote_dir.path().join("beta-view.git");
+    let (alpha, beta) = two_machines_that_saw_seven_open(&lab, &alpha_view, &beta_view);
+
+    // When: each syncs the merge, and its sweep commits the event to its own
+    // ref but cannot push it.
+    let merged = forge_reporting("MERGED");
+    for (home, machine) in [(&alpha, "alpha"), (&beta, "beta")] {
+        let _ = sync_on(&lab, home.path(), merged.path());
+        let git_dir = home.path().join("ledger").join(".git");
+        wait_until("the event to be committed", || {
+            git_in(
+                &git_dir,
+                &["rev-parse", "--verify", &format!("refs/knives/{machine}")],
+            )
+            .is_some()
+        });
+        settle(home.path());
+    }
+    // And: the remote becomes reachable, and each machine sweeps until it
+    // has the other's.
+    std::os::unix::fs::symlink(&remote, &alpha_view).expect("link alpha's view");
+    std::os::unix::fs::symlink(&remote, &beta_view).expect("link beta's view");
+    for home in [&alpha, &beta, &alpha] {
+        let swept = sweep(home.path());
+        let stdout = String::from_utf8_lossy(&swept.stdout);
+        assert!(swept.status.success(), "{stdout}");
+        let report: serde_json::Value = serde_json::from_str(&stdout).expect("a sweep report");
+        assert_eq!(report["destinations"][0]["discarded"], 0, "{report}");
+        settle(home.path());
+    }
+
+    // Then: both committed events stay, on each machine and on the remote.
+    assert_eq!(recorded_in(alpha.path(), MERGED), 2);
+    assert_eq!(recorded_in(beta.path(), MERGED), 2);
+    assert_eq!(recorded_on(&remote, MERGED), 2);
 }

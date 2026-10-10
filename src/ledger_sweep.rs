@@ -22,6 +22,7 @@ use std::process::Stdio;
 
 use crate::config::ConfigError;
 use crate::ids::UpstreamName;
+use crate::ledger::Ledger;
 use crate::ledger_git::{self, GitError, Repository};
 use crate::lock::{FileLock, LockError, LockWait};
 
@@ -34,6 +35,8 @@ pub enum SweepError {
     Git(#[from] GitError),
     #[error(transparent)]
     Lock(#[from] LockError),
+    #[error(transparent)]
+    Ledger(#[from] crate::ledger::LedgerError),
     #[error(transparent)]
     Registry(#[from] ConfigError),
     #[error("{git_dir}: {detail}")]
@@ -198,6 +201,9 @@ pub struct Tally {
     pub commits: usize,
     pub pulled: usize,
     pub pushes: usize,
+    /// Transition events this machine wrote that repeated one another
+    /// machine had already committed, removed before the commit.
+    pub discarded: usize,
     #[serde(skip)]
     failed: bool,
 }
@@ -216,6 +222,7 @@ impl Tally {
             commits: 0,
             pulled: 0,
             pushes: 0,
+            discarded: 0,
             failed: false,
         }
     }
@@ -332,15 +339,43 @@ fn pass(destination: &Destination, tally: &mut Tally) -> Vec<String> {
         Err(error) => failures.push(failed(error.into())),
     }
     if let Err(error) = send(destination, tally) {
-        failures.push(failed(error.into()));
+        failures.push(failed(error));
     }
     failures
 }
 
 /// Commit what is new and push what the remote lacks.
-fn send(destination: &Destination, tally: &mut Tally) -> Result<(), GitError> {
+///
+/// Before the commit, each transition event this machine wrote that repeats
+/// one a ref already carries goes
+/// ([`crate::commands::sync::repeated_transitions`]): two machines that
+/// both synced after one merge each wrote `#N merged`, and the one that
+/// sweeps second commits none. Only an entry no ref carries is removed, so
+/// what any machine committed stays.
+fn send(destination: &Destination, tally: &mut Tally) -> Result<(), SweepError> {
     let repository = &destination.repository;
-    if ledger_git::commit_new_entries(repository, &destination.machine)?.is_some() {
+    let mut pending = ledger_git::pending(repository, &destination.machine)?;
+    if !pending.added().is_empty() {
+        let uncommitted: BTreeSet<PathBuf> = pending
+            .added()
+            .iter()
+            .map(|path| repository.work_tree().join(path))
+            .collect();
+        for fork in repository.forks() {
+            let entries = Ledger::at(repository.work_tree().join(fork.as_str())).entry_files()?;
+            for path in crate::commands::sync::repeated_transitions(&entries, &uncommitted) {
+                std::fs::remove_file(path).map_err(|source| SweepError::Write {
+                    path: path.to_owned(),
+                    source,
+                })?;
+                if let Ok(relative) = path.strip_prefix(repository.work_tree()) {
+                    pending.forget(relative);
+                }
+                tally.discarded += 1;
+            }
+        }
+    }
+    if ledger_git::commit_pending(repository, &destination.machine, pending)?.is_some() {
         tally.commits += 1;
     }
     if ledger_git::unpushed(repository, &destination.remote, &destination.machine)? {

@@ -345,6 +345,15 @@ impl Ledger {
     /// filenames leave a tail-read optimization open if `KNIVES_TIMING` shows
     /// it is needed.
     pub fn entries(&self) -> Result<Vec<Entry>, LedgerError> {
+        Ok(self
+            .entry_files()?
+            .into_iter()
+            .map(|(_, entry)| entry)
+            .collect())
+    }
+
+    /// [`Ledger::entries`], each beside the file it was read from.
+    pub fn entry_files(&self) -> Result<Vec<(PathBuf, Entry)>, LedgerError> {
         let listing = match std::fs::read_dir(&self.path) {
             Ok(listing) => listing,
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
@@ -370,7 +379,10 @@ impl Ledger {
             }
         }
         files.sort();
-        files.iter().map(|path| parse_file(path)).collect()
+        files
+            .into_iter()
+            .map(|path| parse_file(&path).map(|entry| (path, entry)))
+            .collect()
     }
 }
 

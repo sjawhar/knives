@@ -83,8 +83,14 @@ pub fn render(report: &Report) -> String {
             .destinations
             .iter()
             .map(|tally| {
+                let discarded = match tally.discarded {
+                    0 => String::new(),
+                    1 => ", 1 repeated transition discarded".to_owned(),
+                    count => format!(", {count} repeated transitions discarded"),
+                };
                 format!(
-                    "ledger: {} ({}): {} commit(s), {} push(es), {} entr{} pulled; carries {}",
+                    "ledger: {} ({}): {} commit(s), {} push(es), {} entr{} pulled{discarded}; \
+                     carries {}",
                     tally.remote,
                     tally.git_dir,
                     tally.commits,

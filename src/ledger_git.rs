@@ -202,12 +202,22 @@ pub fn commit_new_entries(
     repository: &Repository,
     machine: &str,
 ) -> Result<Option<CommitId>, GitError> {
+    commit_pending(repository, machine, pending(repository, machine)?)
+}
+
+/// Commit what `pending` found as `machine`; [`commit_new_entries`] when a
+/// caller has something to decide between the look and the commit.
+pub fn commit_pending(
+    repository: &Repository,
+    machine: &str,
+    pending: Pending,
+) -> Result<Option<CommitId>, GitError> {
     let Pending {
         reference,
         previous,
         base,
         added,
-    } = pending(repository, machine)?;
+    } = pending;
     if added.is_empty() {
         return Ok(None);
     }
@@ -230,14 +240,31 @@ pub fn has_new_entries(repository: &Repository, machine: &str) -> Result<bool, G
 }
 
 /// What a commit as one machine would start from and add.
-struct Pending {
+#[derive(Debug)]
+pub struct Pending {
     reference: String,
     previous: Option<CommitId>,
     base: Vec<TreeItem>,
     added: BTreeSet<PathBuf>,
 }
 
-fn pending(repository: &Repository, machine: &str) -> Result<Pending, GitError> {
+impl Pending {
+    /// Every entry, relative to the root, that no knives ref carries yet:
+    /// what this machine wrote and has not committed.
+    pub const fn added(&self) -> &BTreeSet<PathBuf> {
+        &self.added
+    }
+
+    /// Leave out an entry that is no longer on disk.
+    pub fn forget(&mut self, path: &Path) {
+        let _ = self.added.remove(path);
+    }
+}
+
+/// What a commit as `machine` would start from and add, as
+/// [`commit_new_entries`] describes, refused with [`GitError::NotOwn`] in
+/// the same case.
+pub fn pending(repository: &Repository, machine: &str) -> Result<Pending, GitError> {
     let reference = own_ref(machine)?;
     let mut previous = None;
     let mut base = Vec::new();

@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::path::{Path, PathBuf};
 
 use crate::bind::Fork;
 use crate::cli::Exit;
@@ -9,7 +10,7 @@ use crate::config::Role;
 use crate::forge::{Forge, PullFacts, PullSummary};
 use crate::ids::{BranchName, BranchTarget, short_id};
 use crate::jj::{fetch_all, fetch_pull_ref, pull_heads};
-use crate::ledger::Scribe;
+use crate::ledger::{Entry, Kind, Scribe};
 use crate::store::Store;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -302,6 +303,82 @@ fn transition_text(number: u64, state: PullState, head: &str) -> Option<String> 
     }
 }
 
+/// The pull request a transition event is about: the number its text names,
+/// for an event whose text is one [`transition_text`] writes. `None` for
+/// every other entry.
+fn transition_of(entry: &Entry) -> Option<u64> {
+    if entry.kind != Kind::Event {
+        return None;
+    }
+    let (number, what) = entry.text.strip_prefix('#')?.split_once(' ')?;
+    let number = number.parse().ok()?;
+    let transition = matches!(what, "merged" | "closed" | "reopened")
+        || what
+            .strip_prefix("advanced to ")
+            .is_some_and(|head| !head.is_empty() && !head.contains(char::is_whitespace));
+    transition.then_some(number)
+}
+
+/// Whether two transition events record the same transition: the same
+/// stated pull request and the same text.
+fn same_transition(one: &Entry, other: &Entry) -> bool {
+    one.pr == other.pr && one.text == other.text
+}
+
+/// Whether `entries`, in stamp order, already hold the transition of pull
+/// request `number` that `pr` and `text` describe: the newest transition
+/// recorded about it is that one.
+///
+/// Only the newest counts. A pull request closed, reopened and closed again
+/// closed twice, and the second close is a transition the first does not
+/// record; two machines that each saw the one merge saw one transition.
+fn holds_transition(entries: &[Entry], number: u64, pr: Option<u64>, text: &str) -> bool {
+    entries
+        .iter()
+        .rev()
+        .find(|entry| transition_of(entry) == Some(number))
+        .is_some_and(|newest| newest.pr == pr && newest.text == text)
+}
+
+/// The files of `entries` (a fork's, in stamp order) that repeat a
+/// transition another machine already committed, and that no ref carries
+/// yet (`uncommitted`): what a sweep discards after it pulls.
+///
+/// Each pull request's transition events, in stamp order, fall into runs of
+/// the same transition one after another, and a run is one transition
+/// however many machines recorded it. In a run holding a committed entry,
+/// every uncommitted entry is a repeat. A committed entry is never one: a
+/// ledger repository's history is pure additions, so a repeat two machines
+/// both committed stays. A run of uncommitted entries alone is this
+/// machine's own record, and stays whole.
+pub(crate) fn repeated_transitions<'a>(
+    entries: &'a [(PathBuf, Entry)],
+    uncommitted: &BTreeSet<PathBuf>,
+) -> Vec<&'a Path> {
+    let mut by_pull: BTreeMap<u64, Vec<(&Path, &Entry)>> = BTreeMap::new();
+    for (path, entry) in entries {
+        if let Some(number) = transition_of(entry) {
+            by_pull
+                .entry(number)
+                .or_default()
+                .push((path.as_path(), entry));
+        }
+    }
+    let mut repeated = Vec::new();
+    for transitions in by_pull.values() {
+        for run in transitions.chunk_by(|(_, one), (_, other)| same_transition(one, other)) {
+            if run.iter().any(|(path, _)| !uncommitted.contains(*path)) {
+                repeated.extend(
+                    run.iter()
+                        .map(|(path, _)| *path)
+                        .filter(|path| uncommitted.contains(*path)),
+                );
+            }
+        }
+    }
+    repeated
+}
+
 /// The classified state, the observed head, and the raw forge state for one
 /// tracked pull request.
 #[derive(Clone, Copy)]
@@ -316,31 +393,52 @@ struct PullTransition<'a> {
     forge_state: Option<ForgeState>,
 }
 
-/// Append an automatic event when the pull request's observed state changes.
-fn record_transition_event(
-    scribe: &Scribe,
-    store: &mut Store,
-    summaries: &[PullSummary],
-    transition: PullTransition<'_>,
-) -> Result<(), crate::ledger::LedgerError> {
-    if let Some(text) = transition_text(transition.number, transition.state, transition.head) {
-        let subject = summaries
-            .iter()
-            .find(|summary| summary.number == transition.number)
-            .map(|summary| summary.head_ref_name.clone());
-        let pr = subject
-            .as_deref()
-            .map(|branch| BranchTarget::new(scribe.repo().to_owned(), BranchName::new(branch)));
-        scribe.event(
-            subject.as_deref(),
-            text,
-            pr.and_then(|target| store.tracked_pull(&target)),
-        )?;
+/// Where one run's transition events go, and what the fork's ledger already
+/// records.
+///
+/// Every machine that syncs compares the forge with its own record, so two
+/// machines that both sync after one merge each see `#N merged`. The ledger
+/// is pulled before a sync decides, and an event another machine already
+/// recorded is not written again. The ledger is read at the first transition
+/// a run sees and kept current with each event it writes, so a run with no
+/// transition reads nothing.
+struct Transitions<'a> {
+    scribe: &'a Scribe,
+    history: Option<Vec<Entry>>,
+}
+
+impl Transitions<'_> {
+    /// Append an automatic event when the pull request's observed state
+    /// changes, unless the fork's ledger already holds that transition.
+    fn record(
+        &mut self,
+        store: &mut Store,
+        summaries: &[PullSummary],
+        transition: PullTransition<'_>,
+    ) -> Result<(), crate::ledger::LedgerError> {
+        let scribe = self.scribe;
+        if let Some(text) = transition_text(transition.number, transition.state, transition.head) {
+            let subject = summaries
+                .iter()
+                .find(|summary| summary.number == transition.number)
+                .map(|summary| summary.head_ref_name.clone());
+            let pr = subject
+                .as_deref()
+                .map(|branch| BranchTarget::new(scribe.repo().to_owned(), BranchName::new(branch)))
+                .and_then(|target| store.tracked_pull(&target));
+            let history = match &mut self.history {
+                Some(history) => history,
+                None => self.history.insert(scribe.ledger().entries()?),
+            };
+            if !holds_transition(history, transition.number, pr, &text) {
+                history.push(scribe.event(subject.as_deref(), text, pr)?);
+            }
+        }
+        if let Some(forge_state) = transition.forge_state {
+            store.record_pull_state(scribe.repo(), transition.number, forge_state);
+        }
+        Ok(())
     }
-    if let Some(forge_state) = transition.forge_state {
-        store.record_pull_state(scribe.repo(), transition.number, forge_state);
-    }
-    Ok(())
 }
 
 struct TrackingInput<'a, 'snapshot> {
@@ -378,6 +476,10 @@ fn record_tracked_pulls(
     report: &mut Report,
 ) -> Result<(), crate::ledger::LedgerError> {
     let mut legacy_records = Vec::new();
+    let mut transitions = Transitions {
+        scribe: input.scribe,
+        history: None,
+    };
     for (number, label) in input.tracked {
         let fact = input.snapshot.and_then(|snapshot| snapshot.fact(number));
         if input.snapshot.is_some() && fact.is_none() {
@@ -454,7 +556,7 @@ fn record_tracked_pulls(
             head: current,
             forge_state,
         };
-        record_transition_event(input.scribe, input.store, input.summaries, transition)?;
+        transitions.record(input.store, input.summaries, transition)?;
         report.rows.push(Row {
             number,
             label,
@@ -984,6 +1086,124 @@ mod tracking_tests {
         let foreign: BTreeSet<u64> = std::iter::once(4677).collect();
         let tracked = tracked_pull_requests(&[], &foreign, &BTreeMap::new());
         assert!(tracked[&4677].contains("foreign"));
+    }
+}
+
+#[cfg(test)]
+mod repeated_transition_tests {
+    use super::*;
+
+    fn event(text: &str, pr: Option<u64>) -> Entry {
+        Entry {
+            ts: "2026-10-10T00:00:00Z".to_owned(),
+            owner: "a-test".to_owned(),
+            email: None,
+            subject: Some("feat/alpha".to_owned()),
+            kind: Kind::Event,
+            disposition: None,
+            statement: None,
+            text: text.to_owned(),
+            evidence: Vec::new(),
+            anchor: None,
+            pr,
+            parents: Vec::new(),
+        }
+    }
+
+    fn files(texts: &[(&str, &str)]) -> Vec<(PathBuf, Entry)> {
+        texts
+            .iter()
+            .map(|(name, text)| (PathBuf::from(name), event(text, Some(632))))
+            .collect()
+    }
+
+    #[test]
+    fn only_a_transition_event_names_a_pull_request() {
+        assert_eq!(transition_of(&event("#632 merged", None)), Some(632));
+        assert_eq!(
+            transition_of(&event("#632 advanced to 0123456789ab", None)),
+            Some(632)
+        );
+        assert_eq!(transition_of(&event("#632 reopened", None)), Some(632));
+        // A note that happens to read like one is an agent's assertion, not
+        // a transition this tool observed.
+        let note = Entry {
+            kind: Kind::Note,
+            ..event("#632 merged", None)
+        };
+        assert_eq!(transition_of(&note), None);
+        assert_eq!(
+            transition_of(&event("#632 merged upstream too", None)),
+            None
+        );
+        assert_eq!(transition_of(&event("stated as #632", None)), None);
+    }
+
+    #[test]
+    fn the_ledger_holds_a_transition_only_when_it_is_the_newest_about_that_pull() {
+        let merged = event("#632 merged", Some(632));
+        let reopened = event("#632 reopened", Some(632));
+        let closed = event("#632 closed", Some(632));
+        assert!(holds_transition(
+            std::slice::from_ref(&merged),
+            632,
+            Some(632),
+            "#632 merged"
+        ));
+        // The same text stated against another pull request is not the same
+        // transition.
+        assert!(!holds_transition(
+            std::slice::from_ref(&merged),
+            632,
+            None,
+            "#632 merged"
+        ));
+        // Closed, reopened, closed again: the second close is a transition.
+        assert!(!holds_transition(
+            &[closed, reopened],
+            632,
+            Some(632),
+            "#632 closed"
+        ));
+        // Another pull request's events do not hide this one's.
+        assert!(holds_transition(
+            &[merged, event("#633 closed", Some(633))],
+            632,
+            Some(632),
+            "#632 merged"
+        ));
+    }
+
+    #[test]
+    fn an_uncommitted_repeat_of_a_committed_transition_is_discarded_and_nothing_committed_is() {
+        let entries = files(&[
+            ("a.md", "#632 merged"),
+            ("b.md", "#632 merged"),
+            ("c.md", "#632 merged"),
+        ]);
+        // b is committed (a peer's), a and c are this machine's.
+        let uncommitted = BTreeSet::from([PathBuf::from("a.md"), PathBuf::from("c.md")]);
+        assert_eq!(
+            repeated_transitions(&entries, &uncommitted),
+            [Path::new("a.md"), Path::new("c.md")]
+        );
+        // Two committed repeats stay: the history is pure additions.
+        let committed = BTreeSet::new();
+        assert!(repeated_transitions(&entries, &committed).is_empty());
+        // A run nobody committed is this machine's own record.
+        let all: BTreeSet<PathBuf> = entries.iter().map(|(path, _)| path.clone()).collect();
+        assert!(repeated_transitions(&entries, &all).is_empty());
+    }
+
+    #[test]
+    fn a_transition_separated_by_another_is_a_new_one() {
+        let entries = files(&[
+            ("a.md", "#632 closed"),
+            ("b.md", "#632 reopened"),
+            ("c.md", "#632 closed"),
+        ]);
+        let uncommitted = BTreeSet::from([PathBuf::from("c.md")]);
+        assert!(repeated_transitions(&entries, &uncommitted).is_empty());
     }
 }
 
