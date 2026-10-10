@@ -247,6 +247,9 @@ git --git-dir ~/.config/knives/ledger-repositories/<dir> remote add origin <anot
 git --git-dir ~/.config/knives/ledger-repositories/<dir> config knives.machine <name>
 ```
 
+A machine joined only through `ledger-repositories` needs no `ledger/`
+directory yet: the first pull or sweep creates it before git runs there.
+
 Each git directory carries the forks whose `ledger` names its `origin`, letter
 case and a `.git` suffix aside, and a fork's entries go through that one and
 nowhere else. A fork without `ledger` is not shared. A fork whose `ledger` no

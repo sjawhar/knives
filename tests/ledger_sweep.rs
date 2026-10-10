@@ -750,6 +750,83 @@ fn a_statement_made_on_one_machine_shows_in_status_on_another_after_a_sweep() {
     assert!(report.get("problems").is_none(), "{report}");
 }
 
+/// Join `home` to [`LEDGER`] as the dotfiles installer does on a new
+/// machine: a git directory in `ledger-repositories` whose work tree is the
+/// ledger root, which nothing has created yet, reaching [`LEDGER_URL`] at
+/// `remote` and committing as `machine`.
+fn join_as_the_installer_does(home: &Path, machine: &str, remote: &Path) {
+    let git_dir = home.join("ledger-repositories").join("acme--ledger.git");
+    lab::git_bare_repository(&git_dir);
+    let work_tree = home.join("ledger");
+    for args in [
+        vec!["config", "core.bare", "false"],
+        vec![
+            "config",
+            "core.worktree",
+            work_tree.to_str().expect("utf-8"),
+        ],
+        vec!["remote", "add", "origin", LEDGER_URL],
+        vec![
+            "config",
+            &format!("url.{}.insteadOf", remote.display()),
+            LEDGER_URL,
+        ],
+        vec!["config", "knives.machine", machine],
+    ] {
+        assert!(git_in(&git_dir, &args).is_some(), "git {args:?}");
+    }
+}
+
+#[test]
+fn a_new_machine_with_no_ledger_root_yet_pulls_what_another_stated() {
+    // Given: alpha's statement on the remote, and beta joined as the
+    // installer joins a new machine, with no ledger root at all.
+    let lab = lab::Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let alpha = shared_home(&lab);
+    let beta = second_machine(alpha.path());
+    let (_remote_dir, remote) = bare_remote();
+    share(alpha.path(), "alpha", &remote);
+    join_as_the_installer_does(beta.path(), "beta", &remote);
+    let tracked = knives_on(
+        &lab,
+        alpha.path(),
+        &["--text", "track", "feat/alpha", "--pr", "1234"],
+    );
+    assert!(
+        tracked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&tracked.stderr)
+    );
+    wait_until("alpha's statement to reach the remote", || {
+        entries_on(&remote, "alpha") == 1
+    });
+    settle(alpha.path());
+    assert!(!beta.path().join("ledger").exists());
+
+    // When: beta's status runs, pulling first.
+    let (code, report) = status_on(&lab, beta.path());
+
+    // Then: it pulled alpha's statement, and reports no problem.
+    assert_eq!(code, Some(0), "{report}");
+    let row = report["branches"]
+        .as_array()
+        .expect("branch rows")
+        .iter()
+        .find(|row| row["name"] == "feat/alpha")
+        .unwrap_or_else(|| panic!("no feat/alpha row: {report}"));
+    assert_eq!(row["pr"]["number"], 1234, "row was: {row}");
+    assert!(report.get("problems").is_none(), "{report}");
+
+    // And: beta's own sweep goes through the same git directory cleanly.
+    let swept = sweep(beta.path());
+    assert!(
+        swept.status.success(),
+        "{}",
+        String::from_utf8_lossy(&swept.stdout)
+    );
+}
+
 #[test]
 fn a_status_that_cannot_pull_says_so_and_still_answers() {
     // Given: a machine whose ledger remote cannot be reached.

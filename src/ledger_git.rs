@@ -88,6 +88,11 @@ impl Repository {
     /// `forks`. A fork name that is not exactly two directory names in the
     /// root, `<owner>/<name>`, is refused: it would reach entries outside
     /// that fork's directory, or inside another fork's.
+    ///
+    /// `work_tree` is created when it does not exist yet: every git call
+    /// runs in it ([`Repository::git`]), and a new machine joined only
+    /// through a git directory in `ledger-repositories` has no ledger root
+    /// until a pull writes one in, which no git call could otherwise reach.
     pub fn new(
         git_dir: &Path,
         work_tree: &Path,
@@ -99,13 +104,19 @@ impl Repository {
                 source,
             })
         };
+        let forks = forks
+            .into_iter()
+            .map(fork_directory)
+            .collect::<Result<_, _>>()?;
+        let work_tree = absolute(work_tree)?;
+        std::fs::create_dir_all(&work_tree).map_err(|source| GitError::Write {
+            path: work_tree.clone(),
+            source,
+        })?;
         Ok(Self {
             git_dir: absolute(git_dir)?,
-            work_tree: absolute(work_tree)?,
-            forks: forks
-                .into_iter()
-                .map(fork_directory)
-                .collect::<Result<_, _>>()?,
+            work_tree,
+            forks,
         })
     }
 
