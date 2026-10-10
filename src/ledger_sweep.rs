@@ -67,17 +67,20 @@ pub struct Destination {
     pub repository: Repository,
     pub remote: String,
     pub machine: String,
-}
-
-impl Destination {
     /// What every fetch, materialise and commit through this repository holds.
     ///
     /// Two fetches into one repository fail on each other's ref locks, and a
     /// commit that lists the root while a pull writes a peer's entries into
     /// it takes one of them for this machine's own. In the git directory, so
-    /// it is outside every fork's directory and no commit can carry it.
-    fn transport_lock(&self) -> PathBuf {
-        self.repository.git_dir().join("knives-transport")
+    /// it is outside every fork's directory and no commit can carry it: the
+    /// one a gitfile names, when the root's `.git` is one
+    /// ([`ledger_git::absolute_git_dir`]).
+    transport_lock: PathBuf,
+}
+
+impl Destination {
+    fn transport_lock(&self) -> &Path {
+        &self.transport_lock
     }
 
     fn carries(&self, fork: &UpstreamName) -> bool {
@@ -264,6 +267,8 @@ pub fn destinations(root: &Path) -> Result<Destinations, SweepError> {
                     repository: Repository::new(&git_dir, root, carried)?,
                     remote: REMOTE.to_owned(),
                     machine,
+                    transport_lock: ledger_git::absolute_git_dir(&git_dir)?
+                        .join("knives-transport"),
                 });
             }
             None if carried.is_empty() => {}
@@ -618,7 +623,7 @@ pub fn sweep(root: &Path, destinations: &Destinations) -> Result<Swept, SweepErr
 /// whether or not a peer's ref can be read.
 fn pass(destination: &Destination, tally: &mut Tally) -> Vec<String> {
     let failed = |error: SweepError| format!("{}: {error}", destination.describe());
-    let _transport = match FileLock::acquire(&destination.transport_lock(), LockWait::TRANSPORT) {
+    let _transport = match FileLock::acquire(destination.transport_lock(), LockWait::TRANSPORT) {
         Ok(lock) => lock,
         Err(error) => return vec![failed(error.into())],
     };
@@ -971,7 +976,7 @@ pub fn pull_at(root: &Path, forks: &[&UpstreamName]) -> Pulled {
 
 /// [`pull_held`] under the destination's transport lock.
 fn pull_one(destination: &Destination) -> (Option<ledger_git::Materialised>, Vec<SweepError>) {
-    match FileLock::acquire(&destination.transport_lock(), LockWait::TRANSPORT) {
+    match FileLock::acquire(destination.transport_lock(), LockWait::TRANSPORT) {
         Ok(_transport) => pull_held(destination),
         Err(error) => (None, vec![error.into()]),
     }

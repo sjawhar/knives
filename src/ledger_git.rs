@@ -488,6 +488,29 @@ pub fn unsent(repository: &Repository, remote: &str) -> Result<BTreeSet<PathBuf>
     Ok(local)
 }
 
+/// The git directory `git_dir` is, as an absolute path, with a gitfile followed.
+///
+/// A ledger root's `.git` is a file naming the real directory when the root
+/// is a linked worktree or was made with `git init --separate-git-dir`. git
+/// reads through a gitfile wherever `--git-dir` names one; a file of knives'
+/// own belongs in the directory it names.
+pub fn absolute_git_dir(git_dir: &Path) -> Result<PathBuf, GitError> {
+    use std::os::unix::ffi::OsStringExt as _;
+    let mut command = crate::bind::git_command();
+    command
+        .arg("--git-dir")
+        .arg(git_dir)
+        .args(["rev-parse", "--absolute-git-dir"]);
+    let mut answer = run(&mut command)?;
+    if answer.last() == Some(&b'\n') {
+        answer.pop();
+    }
+    if answer.is_empty() {
+        return Err(output_error(&command, "a git directory"));
+    }
+    Ok(PathBuf::from(OsString::from_vec(answer)))
+}
+
 /// Every key of the repository at `git_dir`'s own config that `pattern`, a
 /// `git config --get-regexp` pattern, matches.
 ///

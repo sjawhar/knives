@@ -1342,6 +1342,50 @@ fn a_sweep_refuses_a_ledger_still_kept_under_the_registry_key() {
 }
 
 #[test]
+fn a_ledger_root_whose_git_is_a_gitfile_sweeps_through_the_directory_it_names() {
+    // Given: a ledger root whose `.git` is a file naming a git directory
+    // elsewhere, as `git init --separate-git-dir` or a linked worktree
+    // leaves it, with an entry to send.
+    let home = a_repo_home();
+    let (_remote_dir, remote) = bare_remote();
+    let elsewhere = tempfile::tempdir().expect("a directory for the git directory");
+    let git_dir = elsewhere.path().join("ledger.git");
+    let root = home.path().join("ledger");
+    lab::git_output(
+        home.path(),
+        [
+            "init",
+            "--quiet",
+            "--separate-git-dir",
+            git_dir.to_str().expect("utf-8"),
+            root.to_str().expect("utf-8"),
+        ],
+    );
+    assert!(root.join(".git").is_file(), "the root's .git is a gitfile");
+    lab::git_output(&root, ["remote", "add", "origin", LEDGER_URL]);
+    lab::git_output(
+        &root,
+        [
+            "config",
+            &format!("url.{}.insteadOf", remote.display()),
+            LEDGER_URL,
+        ],
+    );
+    lab::git_output(&root, ["config", "knives.machine", "alpha"]);
+    append(&root, "acme/a-repo", 1);
+
+    // When: a sweep runs.
+    let swept = sweep(home.path());
+
+    // Then: it sent the entry, through the git directory the gitfile names,
+    // and took its transport lock there.
+    let stdout = String::from_utf8_lossy(&swept.stdout);
+    assert!(swept.status.success(), "{stdout}");
+    assert_eq!(entries_on(&remote, "alpha"), 1, "{stdout}");
+    assert!(git_dir.join("knives-transport.lock").is_file(), "{stdout}");
+}
+
+#[test]
 fn a_recreated_checkout_sweeping_as_an_existing_machine_is_refused_and_pushes_nothing() {
     // Given: alpha's entry on the remote, then a fresh checkout that names
     // itself alpha too, with an entry of its own.
