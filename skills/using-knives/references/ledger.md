@@ -59,7 +59,7 @@ treating it as a branch. `--evidence` repeats and requires `-m`.
 | `evidence` | Optional commit ids, `file:line`, `<repo>#<number>` or URLs, including other repositories. |
 | `anchor` | Automatic subject tip at write time; absent if it did not resolve. |
 | `pr` | Explicit write stamp, else tracked PR for the subject. |
-| `statement` | What `track`, `depends`, `finish --superseded-by` and `ledger migrate` stated about the branch: `{ kind, value }`, kind `pull`, `fork-only`, `superseded` or `depends` (the whole comma-joined requirement list). Per branch and kind, the entry with the greatest `ts` is live, whatever order entries arrived in; a statement with no value is a forget. An entry without the field states nothing, whatever its prose says. |
+| `statement` | What `track`, `depends`, `finish --superseded-by` and `ledger migrate` stated about the branch: `{ kind, value }`, kind `pull`, `fork-only`, `superseded` or `depends` (the whole comma-joined requirement list). Per branch and kind, the entry with the greatest `ts` is live, whatever order entries arrived in; a statement with no value is a forget. An entry without the field states nothing, whatever its prose says. A kind this knives does not know, written by a newer one, reads and states nothing; a field other than `kind` and `value` fails the read. |
 
 There are two kinds, not three. A disposition selects a class of note.
 `finish --superseded-by` and `start --why` record supersessions and parkings as

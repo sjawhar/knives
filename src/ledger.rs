@@ -363,9 +363,15 @@ impl Ledger {
             path: self.path.clone(),
             ts: entry.ts.clone(),
         })?;
-        // What every read would refuse is refused before it is written.
+        // What every read would refuse is refused before it is written, and
+        // so is a kind only a reader has: written, it would state nothing.
         if let Some(statement) = &entry.statement {
-            statement.check().map_err(|detail| LedgerError::Parse {
+            let refused = if statement.kind == crate::statement::StatementKind::Unknown {
+                Err("a statement of a kind this knives does not know states nothing".to_owned())
+            } else {
+                statement.check()
+            };
+            refused.map_err(|detail| LedgerError::Parse {
                 path: self.path.clone(),
                 detail,
             })?;
@@ -1187,6 +1193,63 @@ mod tests {
             let read = Ledger::at(path).entries();
             assert!(read.is_ok(), "{kind} = {value:?}: {read:?}");
         }
+    }
+
+    /// An entry file under `dir` stating `statement`, an inline table's body.
+    fn stating(dir: &Path, name: &str, ts: &str, statement: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            dir.join(name),
+            format!(
+                "+++\nstatement = {{ {statement} }}\nts = \"{ts}\"\nowner = \"x\"\n\
+                 subject = \"feat/alpha\"\nkind = \"event\"\n+++\nstated\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_statement_kind_a_newer_knives_writes_reads_and_states_nothing_here() {
+        // Given: a valid pull statement, and a newer one of a kind this
+        // knives does not know, as a peer running a newer knives would send.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a-repo");
+        stating(
+            &path,
+            "20260815T221403.000000000Z-0000.md",
+            "2026-08-15T22:14:03Z",
+            "kind = \"pull\", value = \"1234\"",
+        );
+        stating(
+            &path,
+            "20260815T221500.000000000Z-0000.md",
+            "2026-08-15T22:15:00Z",
+            "kind = \"blocks\", value = \"anything at all\"",
+        );
+
+        // Then: the ledger reads, and the unknown kind leaves the pull live.
+        let entries = Ledger::at(path).entries().unwrap();
+        assert_eq!(entries.len(), 2);
+        let live = crate::statement::Statements::from_entries(&entries);
+        assert_eq!(live.pull("feat/alpha"), Some(1234));
+    }
+
+    #[test]
+    fn a_misspelt_statement_field_is_reported_rather_than_read_as_a_forget() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a-repo");
+        stating(
+            &path,
+            "20260815T221403.000000000Z-0000.md",
+            "2026-08-15T22:14:03Z",
+            "kind = \"pull\", vaule = \"1234\"",
+        );
+
+        let error = Ledger::at(path).entries().unwrap_err();
+        assert!(
+            matches!(&error, LedgerError::Parse { detail, .. } if detail.contains("vaule")),
+            "was: {error}"
+        );
     }
 
     #[test]

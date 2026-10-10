@@ -34,13 +34,23 @@ pub enum StatementKind {
     /// comma-joined. One statement carries the whole list, so stating it again
     /// replaces the list rather than adding to it.
     Depends,
+    /// A kind a newer knives writes and this one does not know. Ledgers are
+    /// shared between machines that upgrade at different times, so an entry
+    /// stating one reads, and states nothing here, rather than making every
+    /// read of its fork fail. Never written ([`crate::ledger::Ledger::append`]
+    /// refuses it).
+    #[serde(other)]
+    Unknown,
 }
 
 /// One statement about an entry's subject.
 ///
 /// Written into an entry file as one inline table:
-/// `statement = { kind = "pull", value = "1234" }`.
+/// `statement = { kind = "pull", value = "1234" }`. Closed to other fields,
+/// unlike the entry around it: a misspelt `value` would otherwise read as a
+/// forget, and win when it is the newest.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Statement {
     pub kind: StatementKind,
     /// What [`StatementKind`] says it holds. `None` forgets: the subject no
@@ -76,7 +86,7 @@ impl Statement {
                     "a `depends` statement holds every requirement as `<owner>/<name>#<number>`, \
                      comma-joined",
                 ),
-            StatementKind::ForkOnly | StatementKind::Superseded => None,
+            StatementKind::ForkOnly | StatementKind::Superseded | StatementKind::Unknown => None,
         };
         wanted.map_or(Ok(()), |wanted| Err(format!("{wanted}; found {value:?}")))
     }
@@ -96,10 +106,11 @@ impl Statements {
     /// Per subject and kind the greatest `ts` wins, compared as instants rather
     /// than as text, where `…03.5Z` sorts before `…03Z`. Between equal stamps
     /// the later entry wins, as it does on disk. An entry without a subject is
-    /// about the repository, not a branch, and states nothing here. Every entry
-    /// [`crate::ledger::Ledger::entries`] returns has a parseable stamp; a
-    /// hand-built entry whose stamp does not parse orders before every one that
-    /// does.
+    /// about the repository, not a branch, and states nothing here; neither
+    /// does a kind this knives does not know ([`StatementKind::Unknown`]).
+    /// Every entry [`crate::ledger::Ledger::entries`] returns has a parseable
+    /// stamp; a hand-built entry whose stamp does not parse orders before
+    /// every one that does.
     pub fn from_entries(entries: &[Entry]) -> Self {
         type Newest<'a> = (Option<jiff::Timestamp>, Option<&'a str>);
         let mut newest: BTreeMap<&str, BTreeMap<StatementKind, Newest<'_>>> = BTreeMap::new();
@@ -108,6 +119,9 @@ impl Statements {
             else {
                 continue;
             };
+            if statement.kind == StatementKind::Unknown {
+                continue;
+            }
             let stated = (
                 entry.ts.parse::<jiff::Timestamp>().ok(),
                 statement.value.as_deref(),

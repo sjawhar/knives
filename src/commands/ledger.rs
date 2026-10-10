@@ -385,6 +385,8 @@ fn history(statement: &Statement) -> String {
         StatementKind::Superseded => format!("superseded by {value}"),
         StatementKind::Depends if value.is_empty() => "requires nothing".to_owned(),
         StatementKind::Depends => format!("requires {}", value.replace(',', ", ")),
+        // state.json held only the four kinds above; this arm is never taken.
+        StatementKind::Unknown => "a statement of a kind this knives does not know".to_owned(),
     };
     format!("migrated from state.json: {said}")
 }
