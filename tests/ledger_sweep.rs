@@ -1242,6 +1242,122 @@ fn release_members_pulls_first_and_says_when_it_could_not() {
     );
 }
 
+#[test]
+fn each_release_edit_is_refused_when_the_ledger_cannot_be_pulled() {
+    // Given: a cut release, on a machine whose ledger remote then becomes
+    // unreachable, and a branch that could be included.
+    let lab = lab::Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let home = shared_home(&lab);
+    let (_remote_dir, remote) = bare_remote();
+    let root = share(home.path(), "alpha", &remote);
+    let cut = lab::knives_release(&lab, &home, &["cut", "release/2026-08-04"]);
+    assert!(
+        cut.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cut.stdout)
+    );
+    settle(home.path());
+    let reached = remote.to_str().expect("utf-8");
+    lab::git_output(
+        &root,
+        ["config", "--unset-all", &format!("url.{reached}.insteadOf")],
+    );
+    lab::git_output(
+        &root,
+        [
+            "config",
+            "url./nonexistent/ledger.git.insteadOf",
+            LEDGER_URL,
+        ],
+    );
+    lab.branch("feat/gamma", "gamma.txt", "gamma\n");
+    let before = knives::jj::Repo::open(&lab.work)
+        .expect("open the work checkout")
+        .resolve_commit("release/2026-08-04")
+        .expect("the release");
+
+    // When / Then: every edit is refused as incomplete, says why, and leaves
+    // the release where it was.
+    for args in [
+        &["include", "feat/gamma"][..],
+        &["drop", "feat/alpha", "--why", "not this time"][..],
+        &["advance"][..],
+        &["rebase", "main@upstream"][..],
+    ] {
+        let edit = lab::knives_release(&lab, &home, args);
+        let stdout = String::from_utf8_lossy(&edit.stdout);
+        assert_eq!(edit.status.code(), Some(3), "{args:?}: {stdout}");
+        assert!(
+            stdout.contains("could not pull the ledger from origin"),
+            "{args:?}: {stdout}"
+        );
+        assert_eq!(
+            knives::jj::Repo::open(&lab.work)
+                .expect("open the work checkout")
+                .resolve_commit("release/2026-08-04")
+                .expect("the release"),
+            before,
+            "{args:?} moved the release"
+        );
+    }
+}
+
+#[test]
+fn a_sweep_refuses_a_ledger_still_kept_under_the_registry_key() {
+    // Given: a shared fork whose entries still sit under its registry key.
+    let home = a_repo_home();
+    let (_remote_dir, remote) = bare_remote();
+    let root = share(home.path(), "alpha", &remote);
+    append(&root, "a-repo", 1);
+
+    // When: a sweep runs.
+    let swept = sweep(home.path());
+
+    // Then: it fails naming the migration, sends nothing, and says so in its log.
+    let stdout = String::from_utf8_lossy(&swept.stdout);
+    assert_eq!(swept.status.code(), Some(3), "{stdout}");
+    assert!(stdout.contains("knives ledger migrate"), "{stdout}");
+    assert_eq!(entries_on(&remote, "alpha"), 0);
+    let log = std::fs::read_to_string(home.path().join("ledger-sweep.log")).expect("a log");
+    assert!(log.contains("knives ledger migrate"), "{log}");
+}
+
+#[test]
+fn a_recreated_checkout_sweeping_as_an_existing_machine_is_refused_and_pushes_nothing() {
+    // Given: alpha's entry on the remote, then a fresh checkout that names
+    // itself alpha too, with an entry of its own.
+    let home = a_repo_home();
+    let (_remote_dir, remote) = bare_remote();
+    let root = share(home.path(), "alpha", &remote);
+    append(&root, "acme/a-repo", 1);
+    assert!(sweep(home.path()).status.success());
+    let pushed = git_in(&remote, &["rev-parse", "refs/knives/alpha"]).expect("alpha's ref");
+    let again = a_repo_home();
+    let again_root = share(again.path(), "alpha", &remote);
+    append(&again_root, "acme/a-repo", 1);
+
+    // When: the fresh checkout sweeps.
+    let swept = sweep(again.path());
+
+    // Then: it refuses to write as alpha, and the remote's ref is untouched.
+    let stdout = String::from_utf8_lossy(&swept.stdout);
+    assert_eq!(swept.status.code(), Some(3), "{stdout}");
+    assert!(stdout.contains("refusing to write as alpha"), "{stdout}");
+    assert_eq!(
+        git_in(&remote, &["rev-parse", "refs/knives/alpha"]),
+        Some(pushed)
+    );
+    assert_eq!(
+        git_in(
+            &again_root.join(".git"),
+            &["rev-parse", "--verify", "refs/knives/alpha"]
+        ),
+        None,
+        "the fresh checkout started a history of its own as alpha"
+    );
+}
+
 /// The transition both machines see in these tests.
 const MERGED: &str = "#7 merged";
 

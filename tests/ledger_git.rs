@@ -494,6 +494,60 @@ fn a_peer_tree_that_is_not_ledger_entries_is_refused_and_nothing_is_written() {
     }
 }
 
+/// A commit whose tree holds one empty `100644` blob at the nested `path`,
+/// built one `mktree` per directory, as a hostile peer could build it.
+fn commit_nested(repository: &Path, path: &[&str]) -> knives::ids::CommitId {
+    let (file, directories) = path.split_last().expect("a path");
+    let mktree = |record: String| {
+        let output = std::process::Command::new("sh")
+            .args(["-c", &format!("printf '{record}\\0' | git mktree -z")])
+            .current_dir(repository)
+            .output()
+            .expect("run mktree");
+        assert!(output.status.success(), "mktree failed");
+        String::from_utf8(output.stdout)
+            .expect("utf-8 tree id")
+            .trim()
+            .to_owned()
+    };
+    let blob = lab::git_output(repository, ["hash-object", "-w", "/dev/null"]);
+    let mut tree = mktree(format!("100644 blob {blob}\\t{file}"));
+    for directory in directories.iter().rev() {
+        tree = mktree(format!("040000 tree {tree}\\t{directory}"));
+    }
+    knives::ids::CommitId::new(lab::git_output(
+        repository,
+        ["commit-tree", "--no-gpg-sign", "-m", "hostile", &tree],
+    ))
+}
+
+#[test]
+fn a_peer_tree_with_a_git_directory_inside_a_carried_fork_is_refused() {
+    // Given: a ref whose tree puts an entry-shaped file under a `.git`
+    // inside the fork this repository carries.
+    let (root, remote) = remote();
+    let beta = machine(root.path(), "beta", &remote);
+    for nested in [
+        &["acme", "a-repo", ".git", "x.md"][..],
+        &["acme", "a-repo", "sub", ".Git", "hooks", "x.md"][..],
+    ] {
+        let hostile = MachineRef {
+            machine: "mallory".to_owned(),
+            commit: commit_nested(&beta, nested),
+        };
+
+        // When / Then: materialise refuses it and writes nothing at all.
+        assert!(
+            matches!(
+                ledger_git::materialise(&repository(&beta), &[hostile]),
+                Err(GitError::NotAnEntry { .. })
+            ),
+            "{nested:?} was not refused"
+        );
+        assert!(!beta.join(REPO).exists(), "{nested:?} wrote into the fork");
+    }
+}
+
 #[test]
 fn a_repository_commits_and_materialises_only_the_forks_it_carries() {
     // Given: alpha's ledger root holds entries for two forks, and the

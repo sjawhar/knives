@@ -578,3 +578,37 @@ fn an_entry_already_at_its_new_name_is_not_moved_over() {
         "{migrated}"
     );
 }
+
+#[test]
+fn a_state_key_whose_new_name_is_taken_is_left_and_holds_the_statements() {
+    // Given: a state file holding one pull request's state under the
+    // registry key and under the upstream name both, and a stated pull.
+    let home = renaming_home();
+    std::fs::write(
+        home.path().join("state.json"),
+        r#"{
+  "pull_states": {"demo#7": "OPEN", "acme/demo#7": "MERGED"},
+  "tracked_pulls": {"demo/feat/x": 7}
+}"#,
+    )
+    .expect("write state");
+
+    // When: it migrates.
+    let out = migrate(home.path());
+
+    // Then: the taken key is a problem, neither value is overwritten, and
+    // state.json keeps its statement map, so a run after the fix finishes.
+    assert_eq!(out.status.code(), Some(3), "{out:?}");
+    let migrated: serde_json::Value = serde_json::from_slice(&out.stdout).expect("JSON report");
+    assert!(
+        migrated["problems"].to_string().contains("already there"),
+        "{migrated}"
+    );
+    let state: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(home.path().join("state.json")).expect("read state"),
+    )
+    .expect("state JSON");
+    assert_eq!(state["pull_states"]["demo#7"], "OPEN", "{state}");
+    assert_eq!(state["pull_states"]["acme/demo#7"], "MERGED", "{state}");
+    assert_eq!(state["tracked_pulls"]["demo/feat/x"], 7, "{state}");
+}
