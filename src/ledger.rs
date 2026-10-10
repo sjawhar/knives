@@ -324,6 +324,21 @@ pub fn holds_entries(directory: &Path) -> bool {
     })
 }
 
+/// Each `former` name whose directory under `root` still holds entries.
+///
+/// With the name its fork is kept under now, in name order ([`holds_entries`]
+/// decides what holds entries): an older knives' ledger directory that
+/// `knives ledger migrate` has not moved yet, and that every reader refuses
+/// on until it does.
+pub fn unmigrated<'a>(
+    root: &'a Path,
+    former: &'a crate::store::FormerNames,
+) -> impl Iterator<Item = (&'a String, &'a UpstreamName)> + 'a {
+    former
+        .iter()
+        .filter(move |(name, _)| holds_entries(&root.join(name)))
+}
+
 /// A problem line for each directory under `root` holding entries that no
 /// fork in `registry` is kept under.
 ///

@@ -147,7 +147,14 @@ fn commit_and_push(machine: &Path, name: &str) -> knives::ids::CommitId {
     let commit = commit_new_entries(&repository, name)
         .expect("commit new entries")
         .expect("there were new entries");
-    ledger_git::push(&repository, "origin", name).expect("push the machine's own ref");
+    assert!(
+        ledger_git::push(&repository, "origin", name).expect("push the machine's own ref"),
+        "a new commit was not sent"
+    );
+    assert!(
+        !ledger_git::push(&repository, "origin", name).expect("push again"),
+        "a commit the remote was last seen holding was sent again"
+    );
     commit
 }
 
@@ -436,7 +443,10 @@ fn a_push_of_any_ref_but_the_machines_own_is_refused() {
     ));
     // A machine that never committed and that the remote has never seen has
     // nothing to send.
-    ledger_git::push(&repository(&beta), "origin", "beta").expect("an empty push");
+    assert!(
+        !ledger_git::push(&repository(&beta), "origin", "beta").expect("an empty push"),
+        "a machine with no ref sent something"
+    );
     assert_eq!(knives_refs(&remote), format!("refs/knives/alpha {commit}"));
 }
 

@@ -410,7 +410,11 @@ pub fn fetched(repository: &Repository, remote: &str) -> Result<Vec<MachineRef>,
         .collect())
 }
 
-/// Push `refs/knives/<machine>` to the same name on `remote`, and nothing else.
+/// Push `refs/knives/<machine>` to `remote` when it is new there; whether it was.
+///
+/// The ref goes to the same name on `remote`, and nothing else, when it
+/// holds a commit `remote` was not last seen holding, by a [`fetch`] or by
+/// this machine's own push.
 ///
 /// This is the one place a ref leaves the machine, so it is where "a machine
 /// writes only its own ref" holds. The refspec is spelled from the machine name
@@ -420,44 +424,14 @@ pub fn fetched(repository: &Repository, remote: &str) -> Result<Vec<MachineRef>,
 /// `refs/knives/<machine>` exists here only if this checkout committed as that
 /// machine. A machine `remote` has but this checkout never committed as is a
 /// peer, and pushing it is refused; a machine neither side has has nothing to
-/// send, and the call succeeds having sent nothing. git rejecting the push
-/// means some other writer moved this machine's ref on `remote`.
+/// send, and neither does one `remote` was last seen holding at this commit,
+/// which is what a sweep with nothing new to commit finds. git rejecting the
+/// push means some other writer moved this machine's ref on `remote`.
 ///
 /// Once `remote` has taken the commit, it is recorded as `remote`'s copy,
-/// where [`fetch`] leaves copies, so [`unpushed`] knows it was sent without
+/// where [`fetch`] leaves copies, so the next call knows it was sent without
 /// asking the remote again.
-pub fn push(repository: &Repository, remote: &str, machine: &str) -> Result<(), GitError> {
-    let reference = own_ref(machine)?;
-    let remote = ref_component("remote", remote)?;
-    let fetched = format!("{FETCHED}{remote}/{machine}");
-    let found = references(repository, &[&reference, &fetched])?;
-    let Some((_, commit)) = found.iter().find(|(name, _)| *name == reference) else {
-        return if found.iter().any(|(name, _)| *name == fetched) {
-            Err(GitError::NotOwn {
-                machine: machine.to_owned(),
-                remote: remote.to_owned(),
-            })
-        } else {
-            Ok(())
-        };
-    };
-    transport(repository.git().args([
-        "push",
-        "--quiet",
-        "--no-follow-tags",
-        remote,
-        &format!("{reference}:{reference}"),
-    ]))?;
-    run(repository
-        .git()
-        .args(["update-ref", &fetched, commit.as_str()]))?;
-    Ok(())
-}
-
-/// Whether `refs/knives/<machine>` holds a commit `remote` was not last seen
-/// holding, by a [`fetch`] or by this machine's own [`push`]: what a sweep
-/// with nothing new to commit still has to send.
-pub fn unpushed(repository: &Repository, remote: &str, machine: &str) -> Result<bool, GitError> {
+pub fn push(repository: &Repository, remote: &str, machine: &str) -> Result<bool, GitError> {
     let reference = own_ref(machine)?;
     let remote = ref_component("remote", remote)?;
     let fetched = format!("{FETCHED}{remote}/{machine}");
@@ -468,7 +442,30 @@ pub fn unpushed(repository: &Repository, remote: &str, machine: &str) -> Result<
             .find(|(name, _)| name == wanted)
             .map(|(_, commit)| commit)
     };
-    Ok(at(&reference).is_some_and(|own| at(&fetched) != Some(own)))
+    let Some(commit) = at(&reference) else {
+        return if at(&fetched).is_some() {
+            Err(GitError::NotOwn {
+                machine: machine.to_owned(),
+                remote: remote.to_owned(),
+            })
+        } else {
+            Ok(false)
+        };
+    };
+    if at(&fetched) == Some(commit) {
+        return Ok(false);
+    }
+    transport(repository.git().args([
+        "push",
+        "--quiet",
+        "--no-follow-tags",
+        remote,
+        &format!("{reference}:{reference}"),
+    ]))?;
+    run(repository
+        .git()
+        .args(["update-ref", &fetched, commit.as_str()]))?;
+    Ok(true)
 }
 
 /// Every entry in the forks `repository` carries that `remote` lacks.

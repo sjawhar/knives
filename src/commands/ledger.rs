@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 
 use crate::cli::{Exit, Output};
 use crate::ids::{Requirement, UpstreamName};
-use crate::ledger::{Draft, Ledger, Scribe, holds_entries, inline_human_text};
+use crate::ledger::{Draft, Ledger, Scribe, inline_human_text, unmigrated};
 use crate::ledger_sweep::{self, Swept, Tally};
 use crate::lock::FileLock;
 use crate::statement::{Statement, StatementKind, Statements};
@@ -228,7 +228,7 @@ pub fn migrate(
         dry_run,
         ..Migrated::default()
     };
-    if former.keys().any(|name| holds_entries(&root.join(name))) {
+    if unmigrated(root, &former).next().is_some() {
         let _sweep = (!dry_run)
             .then(|| FileLock::acquire(root, crate::lock::LockWait::TRANSPORT))
             .transpose()?;
@@ -330,8 +330,8 @@ fn with_current_names(legacy: LegacyStatement, former: &FormerNames) -> LegacySt
             .split(',')
             .map(|written| {
                 Requirement::parse(written)
-                    .and_then(|requirement| former.get(requirement.repo.as_str()).map(|_| written))
-                    .and_then(|written| renamed(former, written, '#'))
+                    .filter(|requirement| former.contains_key(requirement.repo.as_str()))
+                    .and_then(|_| renamed(former, written, '#'))
                     .unwrap_or_else(|| written.to_owned())
             })
             .collect::<Vec<_>>()
@@ -355,11 +355,8 @@ fn with_current_names(legacy: LegacyStatement, former: &FormerNames) -> LegacySt
 /// `acme/demo`): its entry files are the regular files directly inside it,
 /// and the directories there are other forks', left alone.
 fn move_ledgers(root: &Path, former: &FormerNames, migrated: &mut Migrated) {
-    for (name, now) in former {
+    for (name, now) in unmigrated(root, former) {
         let from = root.join(name);
-        if !holds_entries(&from) {
-            continue;
-        }
         let to = root.join(now.as_str());
         match move_entries(&from, &to, migrated.dry_run) {
             Ok(clashes) if clashes.is_empty() => {

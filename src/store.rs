@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{ConfigError, default_config_path};
 use crate::ids::{BranchTarget, Requirement, UpstreamName};
-use crate::ledger::{Ledger, LedgerError, holds_entries};
+use crate::ledger::{Ledger, LedgerError, unmigrated};
 use crate::lock::{FileLock, LockError, LockWait};
 use crate::statement::{Statement, StatementKind, Statements};
 
@@ -307,11 +307,7 @@ impl Store {
             .iter()
             .map(ToString::to_string)
             .chain(
-                former
-                    .keys()
-                    .map(|name| root.join(name))
-                    .filter(|directory| holds_entries(directory))
-                    .map(|directory| directory.display().to_string()),
+                unmigrated(&root, &former).map(|(name, _)| root.join(name).display().to_string()),
             )
             .collect();
         if held.is_empty() {
@@ -631,10 +627,15 @@ impl Store {
     /// now; each move made, and each refused because its new key is already
     /// taken, in map order. A refused move leaves both keys as they were.
     pub fn rename_forks(&mut self, former: &FormerNames) -> (Vec<Renamed>, Vec<Renamed>) {
-        self.state
-            .renames(former)
-            .into_iter()
-            .partition(|renamed| self.state.apply(renamed, former))
+        let (mut moved, mut refused) = (Vec::new(), Vec::new());
+        for renamed in self.state.renames(former) {
+            if self.state.apply(&renamed, former) {
+                moved.push(renamed);
+            } else {
+                refused.push(renamed);
+            }
+        }
+        (moved, refused)
     }
 }
 

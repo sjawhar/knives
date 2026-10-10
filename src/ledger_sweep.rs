@@ -65,7 +65,6 @@ pub enum SweepError {
 #[derive(Debug, Clone)]
 pub struct Destination {
     pub repository: Repository,
-    pub remote: String,
     pub machine: String,
     /// What every fetch, materialise and commit through this repository holds.
     ///
@@ -88,7 +87,7 @@ impl Destination {
     }
 
     fn describe(&self) -> String {
-        format!("{} ({})", self.remote, self.repository.git_dir().display())
+        format!("{REMOTE} ({})", self.repository.git_dir().display())
     }
 }
 
@@ -178,11 +177,12 @@ fn candidates(root: &Path) -> Result<Vec<PathBuf>, SweepError> {
 fn identity(git_dir: &Path) -> Result<(Option<String>, Option<String>), SweepError> {
     let mut machine = None;
     let mut origin = None;
-    for (key, value) in ledger_git::local_config(git_dir, "^(knives\\..*|remote\\.origin\\.url)$")?
-    {
+    let pattern = format!("^(knives\\..*|remote\\.{REMOTE}\\.url)$");
+    let origin_key = format!("remote.{REMOTE}.url");
+    for (key, value) in ledger_git::local_config(git_dir, &pattern)? {
         match key.as_str() {
             "knives.machine" => machine = Some(value),
-            "remote.origin.url" => origin = Some(value),
+            _ if key == origin_key => origin = Some(value),
             _ => {
                 return Err(SweepError::Config {
                     git_dir: git_dir.to_owned(),
@@ -224,11 +224,8 @@ fn identity(git_dir: &Path) -> Result<(Option<String>, Option<String>), SweepErr
 /// until `knives ledger migrate` moves them.
 pub fn destinations(root: &Path) -> Result<Destinations, SweepError> {
     let registry = crate::config::load(&root.with_file_name("repos.toml"))?;
-    if let Some((former, now)) = registry
-        .former_names()
-        .into_iter()
-        .find(|(former, _)| crate::ledger::holds_entries(&root.join(former)))
-    {
+    let former_names = registry.former_names();
+    if let Some((former, now)) = crate::ledger::unmigrated(root, &former_names).next() {
         return Err(crate::ledger::LedgerError::FormerName {
             path: root.join(now.as_str()),
             former: root.join(former),
@@ -265,7 +262,6 @@ pub fn destinations(root: &Path) -> Result<Destinations, SweepError> {
                 carried_anywhere.extend(carried.iter().cloned());
                 found.push(Destination {
                     repository: Repository::new(&git_dir, root, carried)?,
-                    remote: REMOTE.to_owned(),
                     machine,
                     transport_lock: ledger_git::absolute_git_dir(&git_dir)?
                         .join("knives-transport"),
@@ -498,7 +494,7 @@ impl Tally {
     fn of(destination: &Destination) -> Self {
         Self {
             git_dir: destination.repository.git_dir().display().to_string(),
-            remote: destination.remote.clone(),
+            remote: REMOTE.to_owned(),
             forks: destination
                 .repository
                 .forks()
@@ -657,11 +653,11 @@ fn pass(destination: &Destination, tally: &mut Tally) -> Vec<String> {
 fn pull_held(destination: &Destination) -> (Option<ledger_git::Materialised>, Vec<SweepError>) {
     let repository = &destination.repository;
     let mut failures = Vec::new();
-    let refs = match ledger_git::fetch(repository, &destination.remote) {
+    let refs = match ledger_git::fetch(repository, REMOTE) {
         Ok(refs) => refs,
         Err(error) => {
             failures.push(error.into());
-            match ledger_git::fetched(repository, &destination.remote) {
+            match ledger_git::fetched(repository, REMOTE) {
                 Ok(refs) => refs,
                 Err(error) => {
                     failures.push(error.into());
@@ -751,8 +747,7 @@ fn send(destination: &Destination, tally: &mut Tally) -> Result<Vec<String>, Swe
     if ledger_git::commit_pending(repository, &destination.machine, pending)?.is_some() {
         tally.commits += 1;
     }
-    if ledger_git::unpushed(repository, &destination.remote, &destination.machine)? {
-        ledger_git::push(repository, &destination.remote, &destination.machine)?;
+    if ledger_git::push(repository, REMOTE, &destination.machine)? {
         tally.pushes += 1;
     }
     Ok(problems)
@@ -844,13 +839,12 @@ impl Pulled {
             .iter()
             .find(|destination| destination.carries(fork))
         {
-            let unsent =
-                ledger_git::unsent(&destination.repository, &destination.remote).map(|paths| {
-                    paths
-                        .iter()
-                        .filter(|path| path.starts_with(fork.as_str()))
-                        .count()
-                });
+            let unsent = ledger_git::unsent(&destination.repository, REMOTE).map(|paths| {
+                paths
+                    .iter()
+                    .filter(|path| path.starts_with(fork.as_str()))
+                    .count()
+            });
             let log = sweep_log(&self.root);
             let failed = log
                 .exists()
@@ -1139,7 +1133,6 @@ mod tests {
         assert_eq!(found.found.len(), 1);
         let destination = found.found.first().unwrap();
         assert_eq!(destination.machine, "alpha");
-        assert_eq!(destination.remote, "origin");
         assert_eq!(
             destination.repository.forks(),
             &BTreeSet::from([
