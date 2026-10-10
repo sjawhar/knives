@@ -124,14 +124,21 @@ pub struct Migrated {
     /// Each state-file key moved from a fork's registry key to its upstream
     /// name.
     pub renamed: Vec<Renamed>,
+    /// Each `seen.json` workspace sighting moved the same way.
+    pub sightings: Vec<crate::seen::RenamedSighting>,
     /// Statement entries this run appended to the ledger.
     pub wrote: usize,
     /// Statements the ledger already carried: an entry about that branch
     /// states that kind with that value.
     pub already: usize,
     /// What could not be migrated. The state file keeps every statement
-    /// while there is one, so a run after the fix finishes the job.
+    /// while a statement could not reach the ledger, so a run after the fix
+    /// finishes the job.
     pub problems: Vec<String>,
+    /// Whether the state file kept its statements because one of them could
+    /// not reach the ledger.
+    #[serde(skip)]
+    pub statements_held: bool,
 }
 
 /// One ledger directory a migration moved.
@@ -164,7 +171,10 @@ pub struct Moved {
 /// The state file is held for update throughout, so no other writer saves
 /// over it between the read and the drop, and it is saved only when every
 /// statement reached the ledger. The ledger's sweep lock is held while its
-/// directories move, so no sweep commits a half-moved fork.
+/// directories move, so no sweep commits a half-moved fork. The workspace
+/// sightings in `seen.json` beside the state file move last, under its own
+/// lock: a sidecar that cannot be read is a problem, but one that never
+/// holds the statements back.
 pub fn migrate(state_path: &Path, root: &Path, owner: &str) -> anyhow::Result<Migrated> {
     let mut store = Store::open_to_migrate(state_path.to_owned())?;
     let former = crate::config::load(&state_path.with_file_name("repos.toml"))?.former_names();
@@ -204,9 +214,17 @@ pub fn migrate(state_path: &Path, root: &Path, owner: &str) -> anyhow::Result<Mi
         let scribe = Scribe::unanchored(ledger, repo, owner.to_owned());
         migrate_repo(&scribe, &statements, &mut migrated);
     }
-    let dropped = migrated.problems.is_empty() && store.drop_legacy_statements();
+    migrated.statements_held = !migrated.problems.is_empty();
+    let dropped = !migrated.statements_held && store.drop_legacy_statements();
     if dropped || !migrated.renamed.is_empty() {
         store.save()?;
+    }
+    drop(store);
+    match crate::seen::rename_workspaces(&state_path.with_file_name("seen.json"), &former) {
+        Ok(sightings) => migrated.sightings = sightings,
+        Err(error) => migrated
+            .problems
+            .push(format!("workspace sightings not renamed: {error}")),
     }
     Ok(migrated)
 }
@@ -392,28 +410,32 @@ pub fn run_migrate(output: Output) -> anyhow::Result<Exit> {
 }
 
 pub fn render_migrated(migrated: &Migrated) -> String {
-    let mut lines: Vec<String> = migrated
-        .moved
-        .iter()
-        .map(|moved| {
-            format!(
-                "ledger: moved {} to {}",
-                moved.from.display(),
-                moved.to.display()
-            )
-        })
-        .chain(migrated.renamed.iter().map(|renamed| {
-            format!(
-                "state: renamed {} {} to {}",
-                renamed.map, renamed.from, renamed.to
-            )
-        }))
-        .collect();
+    let mut lines: Vec<String> =
+        migrated
+            .moved
+            .iter()
+            .map(|moved| {
+                format!(
+                    "ledger: moved {} to {}",
+                    moved.from.display(),
+                    moved.to.display()
+                )
+            })
+            .chain(migrated.renamed.iter().map(|renamed| {
+                format!(
+                    "state: renamed {} {} to {}",
+                    renamed.map, renamed.from, renamed.to
+                )
+            }))
+            .chain(migrated.sightings.iter().map(|renamed| {
+                format!("seen: renamed workspace {} to {}", renamed.from, renamed.to)
+            }))
+            .collect();
     lines.push(format!(
         "ledger: wrote {} statement(s); {} already on the ledger",
         migrated.wrote, migrated.already
     ));
-    if !migrated.problems.is_empty() {
+    if migrated.statements_held {
         lines.push(
             "ledger: state.json keeps its statements until every one migrates; run again \
              after fixing"

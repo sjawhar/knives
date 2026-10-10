@@ -341,6 +341,20 @@ const ALIASED_STATE: &str = r#"{
   "dependencies": {"demo/feat/x": ["acme#3", "demo#8"]}
 }"#;
 
+/// A sightings sidecar as the same knives left it: workspaces keyed by the
+/// registry key, one already under its upstream name (written by a newer
+/// knives after an older one), and one sighting under both, the upstream
+/// name's being the later.
+const ALIASED_SEEN: &str = r#"{
+  "owners": {"harness-session": {"agent-one": "2026-01-01T00:00:00Z"}},
+  "workspaces": {
+    "demo/feat-x": "2026-01-02T00:00:00Z",
+    "acme/demo/feat-x": "2026-01-05T00:00:00Z",
+    "demo/feat-y": "2026-01-04T00:00:00Z",
+    "acme/fix-z": "2026-01-03T00:00:00Z"
+  }
+}"#;
+
 /// Each `(from, to)` path a migration report says it moved.
 fn moved_paths(migrated: &serde_json::Value) -> Vec<(String, String)> {
     migrated["moved"]
@@ -362,6 +376,7 @@ fn a_migration_moves_each_forks_ledger_and_state_keys_to_its_upstream_name() {
     // under its registry key.
     let home = renaming_home();
     std::fs::write(home.path().join("state.json"), ALIASED_STATE).expect("write state");
+    std::fs::write(home.path().join("seen.json"), ALIASED_SEEN).expect("write sightings");
     let demo_note = note(home.path(), "demo", "2026-01-01T00:00:00Z", "about demo");
     let acme_note = note(home.path(), "acme", "2026-01-01T00:00:01Z", "about acme");
     let demo_bytes = std::fs::read(&demo_note).expect("read demo's note");
@@ -456,15 +471,64 @@ fn a_migration_moves_each_forks_ledger_and_state_keys_to_its_upstream_name() {
 
     // When: the migration runs again.
     let state_before = std::fs::read(home.path().join("state.json")).expect("read state");
+    let seen_before = std::fs::read(home.path().join("seen.json")).expect("read sightings");
     let again = report(&migrate(home.path()));
 
-    // Then: it moved, renamed and wrote nothing, and left the state file alone.
+    // Then: it moved, renamed and wrote nothing, and left both files alone.
     assert_eq!(again["moved"], serde_json::json!([]), "{again}");
     assert_eq!(again["renamed"], serde_json::json!([]), "{again}");
+    assert_eq!(again["sightings"], serde_json::json!([]), "{again}");
     assert_eq!(again["wrote"], 0, "{again}");
     assert_eq!(
         std::fs::read(home.path().join("state.json")).expect("read state"),
         state_before
+    );
+    assert_eq!(
+        std::fs::read(home.path().join("seen.json")).expect("read sightings"),
+        seen_before
+    );
+}
+
+#[test]
+fn a_migration_moves_each_workspace_sighting_to_the_forks_upstream_name() {
+    // Given: a sightings sidecar an older knives left, keying workspaces by
+    // each fork's registry key.
+    let home = renaming_home();
+    std::fs::write(home.path().join("seen.json"), ALIASED_SEEN).expect("write sightings");
+
+    // When: the migration runs.
+    let migrated = report(&migrate(home.path()));
+
+    // Then: each workspace sighting an older knives keyed by the registry
+    // key is under the upstream name, each reported; where both were there
+    // the later stays; one already under its upstream name is untouched, and
+    // so are the owner sightings.
+    let seen: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(home.path().join("seen.json")).expect("read sightings"),
+    )
+    .expect("parse sightings");
+    assert_eq!(
+        seen["workspaces"],
+        serde_json::json!({
+            "acme/demo/feat-x": "2026-01-05T00:00:00Z",
+            "acme/demo/feat-y": "2026-01-04T00:00:00Z",
+            "acme/acme/fix-z": "2026-01-03T00:00:00Z",
+        }),
+        "{seen}"
+    );
+    assert_eq!(
+        seen["owners"],
+        serde_json::json!({"harness-session": {"agent-one": "2026-01-01T00:00:00Z"}}),
+        "{seen}"
+    );
+    assert_eq!(
+        migrated["sightings"],
+        serde_json::json!([
+            {"from": "acme/fix-z", "to": "acme/acme/fix-z"},
+            {"from": "demo/feat-x", "to": "acme/demo/feat-x"},
+            {"from": "demo/feat-y", "to": "acme/demo/feat-y"},
+        ]),
+        "{migrated}"
     );
 }
 

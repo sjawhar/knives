@@ -102,6 +102,107 @@ pub fn load() -> Seen {
     read(&seen_path()).unwrap_or_default()
 }
 
+/// One workspace sighting `knives ledger migrate` moved from the registry key
+/// an older knives kept it under to the fork's upstream name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RenamedSighting {
+    pub from: String,
+    pub to: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SeenError {
+    #[error("reading {path}: {source}")]
+    Read {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("{path} is not a sightings file: {source}")]
+    Parse {
+        path: PathBuf,
+        source: serde_json::Error,
+    },
+    #[error("writing {path}")]
+    Write { path: PathBuf },
+    #[error(transparent)]
+    Lock(#[from] crate::lock::LockError),
+}
+
+/// Move each workspace sighting an older knives keyed by a fork's registry
+/// key to the fork's upstream name.
+///
+/// `<registry key>/<workspace>` becomes `<upstream name>/<workspace>`, the
+/// key [`last_seen`] reads, as [`crate::store::renamed`] decides for a
+/// state-file key; a key already under a current name is left alone.
+///
+/// Held under the sidecar's lock. Where the new key already holds a
+/// sighting, the later of the two is kept: both are observations of the one
+/// workspace, and [`last_seen`] takes the newest anyway. A sidecar that does
+/// not exist has nothing to rename; one that cannot be read is an error, not
+/// an empty file, so the migration says so.
+pub fn rename_workspaces(
+    path: &Path,
+    former: &crate::store::FormerNames,
+) -> Result<Vec<RenamedSighting>, SeenError> {
+    let _lock = FileLock::acquire(path, LockWait::CLAIM)?;
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(source) => {
+            return Err(SeenError::Read {
+                path: path.to_owned(),
+                source,
+            });
+        }
+    };
+    let mut seen: Seen = serde_json::from_str(&text).map_err(|source| SeenError::Parse {
+        path: path.to_owned(),
+        source,
+    })?;
+    let moves: Vec<RenamedSighting> = seen
+        .workspaces
+        .keys()
+        .filter_map(|key| {
+            crate::store::renamed(former, key, '/').map(|to| RenamedSighting {
+                from: key.clone(),
+                to,
+            })
+        })
+        .collect();
+    if moves.is_empty() {
+        return Ok(moves);
+    }
+    for moved in &moves {
+        let Some(at) = seen.workspaces.remove(&moved.from) else {
+            continue;
+        };
+        let kept = seen
+            .workspaces
+            .get(&moved.to)
+            .filter(|existing| newer(existing, &at))
+            .cloned()
+            .unwrap_or(at);
+        seen.workspaces.insert(moved.to.clone(), kept);
+    }
+    save(path, &seen).map_err(|()| SeenError::Write {
+        path: path.to_owned(),
+    })?;
+    Ok(moves)
+}
+
+/// Whether the RFC 3339 `one` is later than `other`; a stamp that does not
+/// parse is never the later one.
+fn newer(one: &str, other: &str) -> bool {
+    match (
+        one.parse::<jiff::Timestamp>(),
+        other.parse::<jiff::Timestamp>(),
+    ) {
+        (Ok(one), Ok(other)) => one > other,
+        (Ok(_), Err(_)) => true,
+        (Err(_), _) => false,
+    }
+}
+
 /// Returns the newest observation for a claim, or the honest coverage state
 /// when every observation stream is empty.
 pub fn last_seen(claim: &Claim, activity: &WorkspaceActivity, seen: &Seen) -> LastSeen {
