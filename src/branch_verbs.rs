@@ -426,7 +426,7 @@ pub(crate) fn run_depends(
         };
         // Recorded under the required fork's repository name, whichever way it
         // was typed, so the statement means the same fork on every machine.
-        let Some((_, _, upstream)) = registry.resolve(written.repo.as_str()) else {
+        let Some(upstream) = registry.resolve(written.repo.as_str()) else {
             let known: Vec<String> = registry.names().map(|n| n.to_string()).collect();
             eprintln!(
                 "unknown repo {} in {text}; known: {}",

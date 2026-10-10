@@ -132,21 +132,15 @@ impl Repository {
         &self.forks
     }
 
-    /// Whether the entry at `path`, relative to the root, lies in the
-    /// `<owner>/<name>` directory of a fork this repository carries.
+    /// Whether the entry at `path`, relative to the root and already checked
+    /// by [`check_entry`], lies below the `<owner>/<name>` directory of a fork
+    /// this repository carries. `strip_prefix` matches whole components, so
+    /// `acme/tool` never matches `acme/toolkit/…`.
     fn carries_entry(&self, path: &Path) -> bool {
-        let mut components = path.components();
-        match (components.next(), components.next(), components.next()) {
-            (
-                Some(Component::Normal(owner)),
-                Some(Component::Normal(name)),
-                Some(Component::Normal(_)),
-            ) => self
-                .forks
-                .iter()
-                .any(|carried| Path::new(carried.as_str()) == Path::new(owner).join(name)),
-            _ => false,
-        }
+        self.forks.iter().any(|fork| {
+            path.strip_prefix(fork.as_str())
+                .is_ok_and(|rest| rest.components().next().is_some())
+        })
     }
 
     /// `git` on this repository, run in the ledger root.

@@ -416,10 +416,9 @@ impl Registry {
         self.repos.keys().map(|name| RepoName::new(name.clone()))
     }
 
-    /// The fork `text` names, by its registry key or by its
-    /// [`RepoEntry::upstream_name`] in any letter case, with the name its
-    /// ledger and state are kept under.
-    pub fn resolve(&self, text: &str) -> Option<(RepoName, &RepoEntry, UpstreamName)> {
+    /// The name the fork `text` names is kept under: `text` is its registry
+    /// key, or its [`RepoEntry::upstream_name`] in any letter case.
+    pub fn resolve(&self, text: &str) -> Option<UpstreamName> {
         self.repos.get_key_value(text).map_or_else(
             || {
                 self.repos.iter().find_map(|(key, entry)| {
@@ -427,10 +426,10 @@ impl Registry {
                     upstream
                         .as_str()
                         .eq_ignore_ascii_case(text)
-                        .then(|| (RepoName::new(key.as_str()), entry, upstream))
+                        .then_some(upstream)
                 })
             },
-            |(key, entry)| Some((RepoName::new(key.as_str()), entry, entry.upstream_name(key))),
+            |(key, entry)| Some(entry.upstream_name(key)),
         )
     }
 
