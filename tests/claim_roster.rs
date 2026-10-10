@@ -658,3 +658,75 @@ fn a_ledger_no_registry_entry_keeps_is_reported_by_status_notch_and_the_sweep() 
     assert_eq!(swept.status.code(), Some(3), "{stdout}");
     assert!(names_both_fixes(&stdout), "{stdout}");
 }
+
+#[test]
+fn a_claimed_checkout_whose_registry_upstream_was_renamed_is_not_silently_unmanaged() {
+    // Given: a claimed branch of `demo`, and then the registry's upstream
+    // changed to the repository's new name (GitHub redirects the old one),
+    // while the checkout's own `upstream` remote still spells the old name,
+    // as every checkout made before the rename does.
+    let (lab, home) = forge_fork();
+    claim_gamma(&lab, home.path());
+    std::fs::write(
+        home.path().join("repos.toml"),
+        "[repos.demo]\nupstream = \"https://forge.invalid/Maintainer/Renamed-Demo\"\n\
+         origin = \"https://forge.invalid/acme/work.git\"\n",
+    )
+    .expect("rewrite registry");
+
+    // When: a Claude Code session starts in the checkout, and status runs
+    // from inside it.
+    let mut hook = Command::new(env!("CARGO_BIN_EXE_knives"))
+        .args(["hook", "claude-code"])
+        .env("KNIVES_CONFIG_HOME", home.path())
+        .env("HOME", home.path())
+        .env("JJ_CONFIG", "/dev/null")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn hook");
+    hook.stdin
+        .take()
+        .expect("hook stdin")
+        .write_all(
+            json!({
+                "session_id": "hook-session",
+                "cwd": &lab.work,
+                "hook_event_name": "SessionStart",
+                "source": "startup",
+            })
+            .to_string()
+            .as_bytes(),
+        )
+        .expect("write hook input");
+    let notice = String::from_utf8_lossy(&hook.wait_with_output().expect("wait for hook").stdout)
+        .into_owned();
+    let status = knives_as(
+        &lab,
+        home.path(),
+        &lab.work,
+        None,
+        &["--text", "status", "--no-github", "--no-landed"],
+    );
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&status.stdout),
+        String::from_utf8_lossy(&status.stderr)
+    );
+
+    // Then: neither reads the fork as absent. The checkout is still the
+    // fork, its claim is still held, and an agent told nothing would take a
+    // branch someone else holds. Either the checkout binds, and the claim
+    // shows, or each says that its upstream remote and the registry disagree.
+    let names_mismatch =
+        |text: &str| text.contains("Renamed-Demo") || text.contains("renamed-demo");
+    assert!(
+        notice.contains("feat/gamma") || names_mismatch(&notice),
+        "the hook neither shows the claim nor names the mismatch: {notice:?}"
+    );
+    assert!(
+        !said.contains("demo: not on this machine") || names_mismatch(&said),
+        "status reads a checkout it stands in as not on this machine: {said}"
+    );
+}

@@ -122,8 +122,11 @@ pub enum SeenError {
         path: PathBuf,
         source: serde_json::Error,
     },
-    #[error("writing {path}")]
-    Write { path: PathBuf },
+    #[error("writing {path}: {source}")]
+    Write {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     #[error(transparent)]
     Lock(#[from] crate::lock::LockError),
 }
@@ -164,8 +167,9 @@ pub fn rename_workspaces(
             .unwrap_or(at);
         seen.workspaces.insert(moved.to.clone(), kept);
     }
-    save(path, &seen).map_err(|()| SeenError::Write {
+    save(path, &seen).map_err(|source| SeenError::Write {
         path: path.to_owned(),
+        source,
     })?;
     Ok(moves)
 }
@@ -282,13 +286,13 @@ fn read(path: &Path) -> Result<Seen, ()> {
     }
 }
 
-fn save(path: &Path, seen: &Seen) -> Result<(), ()> {
+fn save(path: &Path, seen: &Seen) -> std::io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(parent).map_err(|_| ())?;
-    let mut temporary = tempfile::NamedTempFile::new_in(parent).map_err(|_| ())?;
-    serde_json::to_writer_pretty(&mut temporary, seen).map_err(|_| ())?;
-    temporary.write_all(b"\n").map_err(|_| ())?;
-    temporary.persist(path).map_err(|_| ())?;
+    std::fs::create_dir_all(parent)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    serde_json::to_writer_pretty(&mut temporary, seen)?;
+    temporary.write_all(b"\n")?;
+    temporary.persist(path).map_err(|error| error.error)?;
     Ok(())
 }
 
@@ -596,6 +600,41 @@ mod tests {
         assert!(
             !seen.workspaces.contains_key("a/stale-workspace"),
             "was: {seen:?}"
+        );
+    }
+
+    #[test]
+    fn a_sightings_rename_that_cannot_write_says_why() {
+        use std::os::unix::fs::PermissionsExt as _;
+        // Given: a sidecar holding a sighting under a former name, in a
+        // directory nothing new can be created in once its lock file exists.
+        let home = tempfile::tempdir().expect("create config home");
+        let path = home.path().join("seen.json");
+        std::fs::write(
+            &path,
+            r#"{"workspaces": {"demo/feat-x": "2026-01-01T00:00:00Z"}}"#,
+        )
+        .expect("write sightings");
+        std::fs::write(home.path().join("seen.lock"), "").expect("create the lock file");
+        let mode = |bits| std::fs::Permissions::from_mode(bits);
+        std::fs::set_permissions(home.path(), mode(0o555)).expect("make read-only");
+        if tempfile::NamedTempFile::new_in(home.path()).is_ok() {
+            // Root writes anywhere: nothing here can fail.
+            std::fs::set_permissions(home.path(), mode(0o755)).expect("restore");
+            return;
+        }
+        let former =
+            crate::store::FormerNames::from([("demo".to_owned(), UpstreamName::new("acme/demo"))]);
+
+        // When: the migration renames it.
+        let error = super::rename_workspaces(&path, &former);
+        std::fs::set_permissions(home.path(), mode(0o755)).expect("restore");
+
+        // Then: the error names the file and the cause.
+        let error = error.expect_err("the write fails").to_string();
+        assert!(
+            error.contains("seen.json") && error.contains("Permission denied"),
+            "was: {error}"
         );
     }
 }
