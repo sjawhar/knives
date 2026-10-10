@@ -336,7 +336,7 @@ pub fn pending(repository: &Repository, machine: &str) -> Result<Pending, GitErr
             carried.extend(
                 items
                     .iter()
-                    .filter(|item| item.node.is_blob())
+                    .filter(|item| item.mode.is_blob())
                     .map(|item| item.path.clone()),
             );
             base = items;
@@ -345,7 +345,7 @@ pub fn pending(repository: &Repository, machine: &str) -> Result<Pending, GitErr
             carried.extend(
                 items
                     .into_iter()
-                    .filter(|item| item.node.is_blob())
+                    .filter(|item| item.mode.is_blob())
                     .map(|item| item.path),
             );
         }
@@ -481,7 +481,7 @@ pub fn unsent(repository: &Repository, remote: &str) -> Result<BTreeSet<PathBuf>
         sent.extend(
             tree_items(repository, &commit)?
                 .into_iter()
-                .filter(|item| item.node.is_blob())
+                .filter(|item| item.mode.is_blob())
                 .map(|item| item.path),
         );
     }
@@ -573,7 +573,7 @@ pub fn materialise(repository: &Repository, refs: &[MachineRef]) -> Result<Mater
     let mut unread = BTreeSet::new();
     for machine_ref in refs {
         for item in tree_items(repository, &machine_ref.commit)? {
-            if item.node.is_tree() {
+            if item.mode == Mode::Tree {
                 continue;
             }
             check_entry(&machine_ref.commit, &item)?;
@@ -589,7 +589,7 @@ pub fn materialise(repository: &Repository, refs: &[MachineRef]) -> Result<Mater
                 continue;
             }
             if repository.carries_entry(&item.path) {
-                missing.insert(item.path, item.node.oid);
+                missing.insert(item.path, item.oid);
             } else {
                 unread.insert(item.path);
             }
@@ -610,7 +610,7 @@ pub fn materialise(repository: &Repository, refs: &[MachineRef]) -> Result<Mater
     }
     let mut input = Vec::new();
     for oid in missing.values() {
-        input.extend_from_slice(oid.as_bytes());
+        input.extend_from_slice(oid.as_str().as_bytes());
         input.push(b'\n');
     }
     let mut command = repository.git();
@@ -627,29 +627,85 @@ pub fn materialise(repository: &Repository, refs: &[MachineRef]) -> Result<Mater
     Ok(done)
 }
 
-/// A name in a tree, as `ls-tree` prints it and `mktree` reads it.
+/// A name in a tree being written ([`write_tree`]).
 #[derive(Debug)]
 struct Node {
-    mode: String,
-    kind: String,
-    oid: String,
+    mode: Mode,
+    /// What the base tree lists for it; `None` for a directory this commit
+    /// adds, which [`write_directory`] writes and so gives its id.
+    oid: Option<ObjectId>,
 }
 
-impl Node {
-    fn is_blob(&self) -> bool {
-        self.kind == "blob"
+/// A tree entry's mode, which fixes its object type: one of the five git
+/// writes, the only ones `ls-tree` prints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// `100644 blob`: a regular, non-executable file, the one an entry is.
+    File,
+    /// `100755 blob`.
+    Executable,
+    /// `120000 blob`.
+    Symlink,
+    /// `040000 tree`.
+    Tree,
+    /// `160000 commit`: a submodule.
+    Submodule,
+}
+
+impl Mode {
+    /// The mode `mode` and `kind` spell together, as `ls-tree` prints them;
+    /// `None` for any other mode, or a type that mode does not have.
+    fn parse(mode: &str, kind: &str) -> Option<Self> {
+        let parsed = match mode {
+            "100644" => Self::File,
+            "100755" => Self::Executable,
+            "120000" => Self::Symlink,
+            "040000" => Self::Tree,
+            "160000" => Self::Submodule,
+            _ => return None,
+        };
+        (parsed.spelled().1 == kind).then_some(parsed)
     }
 
-    fn is_tree(&self) -> bool {
-        self.kind == "tree"
+    /// The mode and type as `mktree` reads them.
+    const fn spelled(self) -> (&'static str, &'static str) {
+        match self {
+            Self::File => ("100644", "blob"),
+            Self::Executable => ("100755", "blob"),
+            Self::Symlink => ("120000", "blob"),
+            Self::Tree => ("040000", "tree"),
+            Self::Submodule => ("160000", "commit"),
+        }
+    }
+
+    const fn is_blob(self) -> bool {
+        matches!(self, Self::File | Self::Executable | Self::Symlink)
     }
 }
 
-/// One record of a recursive `ls-tree`: a node and its path from the root.
+/// A git object id in full, SHA-1 or SHA-256.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ObjectId(String);
+
+impl ObjectId {
+    /// `text` when it is a full object id: 40 or 64 hex digits.
+    fn parse(text: &str) -> Option<Self> {
+        (matches!(text.len(), 40 | 64) && text.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .then(|| Self(text.to_owned()))
+    }
+
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// One record of a recursive `ls-tree`, parsed where it is read
+/// ([`tree_item`]): a path from the root, its mode and its object.
 #[derive(Debug)]
 struct TreeItem {
     path: PathBuf,
-    node: Node,
+    mode: Mode,
+    oid: ObjectId,
 }
 
 /// Every directory of a tree being written, by path from the root (`""`
@@ -753,7 +809,7 @@ fn local_entries(repository: &Repository) -> Result<BTreeSet<PathBuf>, GitError>
 fn hash_objects(
     repository: &Repository,
     paths: &BTreeSet<PathBuf>,
-) -> Result<Vec<String>, GitError> {
+) -> Result<Vec<ObjectId>, GitError> {
     let mut input = Vec::new();
     for path in paths {
         push_quoted(&mut input, path);
@@ -799,15 +855,18 @@ fn push_quoted(out: &mut Vec<u8>, path: &Path) {
 fn write_tree(
     repository: &Repository,
     base: Vec<TreeItem>,
-    added: impl Iterator<Item = (PathBuf, String)>,
-) -> Result<String, GitError> {
+    added: impl Iterator<Item = (PathBuf, ObjectId)>,
+) -> Result<ObjectId, GitError> {
     let mut directories = Directories::new();
     for item in base {
         if let Some((parent, name)) = split(&item.path) {
-            directories
-                .entry(parent)
-                .or_default()
-                .insert(name, item.node);
+            directories.entry(parent).or_default().insert(
+                name,
+                Node {
+                    mode: item.mode,
+                    oid: Some(item.oid),
+                },
+            );
         }
     }
     let mut dirty = BTreeSet::from([PathBuf::new()]);
@@ -816,15 +875,14 @@ fn write_tree(
             continue;
         };
         let blob = Node {
-            mode: "100644".to_owned(),
-            kind: "blob".to_owned(),
-            oid,
+            mode: Mode::File,
+            oid: Some(oid),
         };
         let replaced = directories
             .entry(directory.clone())
             .or_default()
             .insert(name, blob);
-        if replaced.is_some_and(|node| node.is_tree()) {
+        if replaced.is_some_and(|node| node.mode == Mode::Tree) {
             return Err(GitError::Shape { path });
         }
         while let Some((parent, name)) = split(&directory) {
@@ -835,12 +893,11 @@ fn write_tree(
                 .entry(parent.clone())
                 .or_default()
                 .entry(name)
-                .or_insert_with(|| Node {
-                    mode: "040000".to_owned(),
-                    kind: "tree".to_owned(),
-                    oid: String::new(),
+                .or_insert(Node {
+                    mode: Mode::Tree,
+                    oid: None,
                 });
-            if !node.is_tree() {
+            if node.mode != Mode::Tree {
                 return Err(GitError::Shape { path: directory });
             }
             directory = parent;
@@ -855,22 +912,22 @@ fn write_directory(
     directories: &Directories,
     dirty: &BTreeSet<PathBuf>,
     directory: &Path,
-) -> Result<String, GitError> {
+) -> Result<ObjectId, GitError> {
     let mut input = Vec::new();
     for (name, node) in directories.get(directory).into_iter().flatten() {
         let path = directory.join(name);
         let rewritten;
-        let oid = if dirty.contains(&path) {
-            rewritten = write_directory(repository, directories, dirty, &path)?;
-            &rewritten
-        } else {
-            &node.oid
+        let oid = match &node.oid {
+            Some(oid) if !dirty.contains(&path) => oid,
+            _ => {
+                rewritten = write_directory(repository, directories, dirty, &path)?;
+                &rewritten
+            }
         };
-        for field in [node.mode.as_bytes(), b" ", node.kind.as_bytes(), b" "] {
-            input.extend_from_slice(field);
+        let (mode, kind) = node.mode.spelled();
+        for field in [mode, " ", kind, " ", oid.as_str(), "\t"] {
+            input.extend_from_slice(field.as_bytes());
         }
-        input.extend_from_slice(oid.as_bytes());
-        input.push(b'\t');
         input.extend_from_slice(name.as_bytes());
         input.push(0);
     }
@@ -898,7 +955,7 @@ fn split(path: &Path) -> Option<(PathBuf, OsString)> {
 fn commit_tree(
     repository: &Repository,
     machine: &str,
-    tree: &str,
+    tree: &ObjectId,
     parent: Option<&CommitId>,
 ) -> Result<CommitId, GitError> {
     let mut command = repository.git();
@@ -911,7 +968,7 @@ fn commit_tree(
     if let Some(parent) = parent {
         command.args(["-p", parent.as_str()]);
     }
-    command.arg(tree);
+    command.arg(tree.as_str());
     for (variable, value) in [
         ("GIT_AUTHOR_NAME", machine),
         ("GIT_AUTHOR_EMAIL", ""),
@@ -921,7 +978,7 @@ fn commit_tree(
         command.env(variable, value);
     }
     let answer = run(&mut command)?;
-    single_id(&command, &answer).map(CommitId::new)
+    single_id(&command, &answer).map(|id| CommitId::new(id.0))
 }
 
 /// Every ref `for-each-ref` matches against `patterns`, by full name, with the
@@ -945,7 +1002,8 @@ fn references(
             text.lines()
                 .map(|line| {
                     let (id, name) = line.split_once(' ')?;
-                    is_object_id(id).then(|| (name.to_owned(), CommitId::new(id)))
+                    let id = ObjectId::parse(id)?;
+                    Some((name.to_owned(), CommitId::new(id.0)))
                 })
                 .collect::<Option<Vec<_>>>()
         })
@@ -967,23 +1025,23 @@ fn tree_items(repository: &Repository, commit: &CommitId) -> Result<Vec<TreeItem
         .collect()
 }
 
-/// One `ls-tree -z` record: `<mode> <type> <id>\t<path>`.
+/// One `ls-tree -z` record, `<mode> <type> <id>\t<path>`, parsed: `None`
+/// for a mode git does not write, a type that mode does not have, or an id
+/// that is not one.
 fn tree_item(record: &[u8]) -> Option<TreeItem> {
     let tab = record.iter().position(|&byte| byte == b'\t')?;
     let (header, path) = record.split_at_checked(tab)?;
     let path = path.get(1..).filter(|path| !path.is_empty())?;
     let mut fields = std::str::from_utf8(header).ok()?.split(' ');
-    let node = Node {
-        mode: fields.next()?.to_owned(),
-        kind: fields.next()?.to_owned(),
-        oid: fields.next()?.to_owned(),
-    };
-    if fields.next().is_some() || !is_object_id(&node.oid) {
+    let mode = Mode::parse(fields.next()?, fields.next()?)?;
+    let oid = ObjectId::parse(fields.next()?)?;
+    if fields.next().is_some() {
         return None;
     }
     Some(TreeItem {
         path: PathBuf::from(OsStr::from_bytes(path)),
-        node,
+        mode,
+        oid,
     })
 }
 
@@ -991,7 +1049,7 @@ fn tree_item(record: &[u8]) -> Option<TreeItem> {
 /// writes one (a `100644` blob named `*.md`), or whose path leaves the ledger
 /// directory or enters a `.git`.
 fn check_entry(commit: &CommitId, item: &TreeItem) -> Result<(), GitError> {
-    let detail = if !item.node.is_blob() || item.node.mode != "100644" {
+    let detail = if item.mode != Mode::File {
         Some("not a regular, non-executable file")
     } else if item.path.extension() != Some(OsStr::new("md")) {
         Some("not named *.md")
@@ -1058,29 +1116,24 @@ fn write_entry(path: &Path, content: &[u8]) -> Result<bool, GitError> {
 }
 
 /// Object ids, one per line.
-fn object_ids(command: &Command, answer: &[u8]) -> Result<Vec<String>, GitError> {
+fn object_ids(command: &Command, answer: &[u8]) -> Result<Vec<ObjectId>, GitError> {
     std::str::from_utf8(answer)
         .ok()
         .and_then(|text| {
             text.lines()
-                .map(|line| is_object_id(line).then(|| line.to_owned()))
+                .map(ObjectId::parse)
                 .collect::<Option<Vec<_>>>()
         })
         .ok_or_else(|| output_error(command, "one object id per line"))
 }
 
 /// The one object id `command` printed.
-fn single_id(command: &Command, answer: &[u8]) -> Result<String, GitError> {
+fn single_id(command: &Command, answer: &[u8]) -> Result<ObjectId, GitError> {
     let mut ids = object_ids(command, answer)?;
     match (ids.pop(), ids.is_empty()) {
         (Some(id), true) => Ok(id),
         _ => Err(output_error(command, "exactly one object id")),
     }
-}
-
-/// A SHA-1 or SHA-256 object id in full.
-fn is_object_id(text: &str) -> bool {
-    matches!(text.len(), 40 | 64) && text.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 /// Run `command` to completion, returning its stdout when it exits zero.
@@ -1291,6 +1344,36 @@ mod tests {
         );
         assert!(batch_blobs(format!("{id} missing\n").as_bytes()).is_none());
         assert!(batch_blobs(format!("{id} blob 9\nabc\n").as_bytes()).is_none());
+    }
+
+    #[test]
+    fn a_tree_record_parses_only_as_a_mode_git_writes_with_its_own_type() {
+        let id = "a".repeat(40);
+        let record = |text: String| tree_item(text.as_bytes());
+        for (mode, kind, parsed) in [
+            ("100644", "blob", Mode::File),
+            ("100755", "blob", Mode::Executable),
+            ("120000", "blob", Mode::Symlink),
+            ("040000", "tree", Mode::Tree),
+            ("160000", "commit", Mode::Submodule),
+        ] {
+            let item = record(format!("{mode} {kind} {id}\tacme/x.md")).unwrap();
+            assert_eq!(item.mode, parsed);
+            assert_eq!(item.oid.as_str(), id);
+            assert_eq!(item.path, Path::new("acme/x.md"));
+            assert_eq!(parsed.spelled(), (mode, kind));
+        }
+        for text in [
+            format!("100644 tree {id}\tx"),
+            format!("040000 blob {id}\tx"),
+            format!("100664 blob {id}\tx"),
+            format!("100644 blob {}\tx", "a".repeat(39)),
+            format!("100644 blob {id} extra\tx"),
+            format!("100644 blob {id}\t"),
+            format!("100644 blob {id}"),
+        ] {
+            assert!(record(text.clone()).is_none(), "{text:?} parsed");
+        }
     }
 
     #[test]
