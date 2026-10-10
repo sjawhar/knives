@@ -669,7 +669,7 @@ fn own_ref(machine: &str) -> Result<String, GitError> {
 /// refused so a remote cannot read as an option to `git`. A `.lock` suffix is
 /// refused in any case, because a loose ref on a case-insensitive filesystem
 /// would collide with git's lock file for it.
-fn ref_component<'a>(role: &'static str, name: &'a str) -> Result<&'a str, GitError> {
+pub(crate) fn ref_component<'a>(role: &'static str, name: &'a str) -> Result<&'a str, GitError> {
     let malformed = name.is_empty()
         || name == "@"
         || name.starts_with(['.', '-'])

@@ -268,7 +268,9 @@ every pull that asks about it, says so as a problem. With no fork's `ledger`
 set, nothing is shared, and nothing says so as a problem. Refused, each naming
 the git directory and what fixes it: two git directories with one `origin`,
 since which of them carries a fork would be a guess; one that carries forks
-but names no machine; and any `knives.*` key other than `knives.machine`
+but names no machine; a `knives.machine` that is not one git ref name
+component (no `/`, no leading `-` or `.`, no `..`), since it spells the ref
+`refs/knives/<machine>`; and any `knives.*` key other than `knives.machine`
 (`destinations`, `src/ledger_sweep.rs`).
 
 Every command that appends an entry starts `knives ledger sweep` in the

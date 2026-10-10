@@ -173,26 +173,39 @@ fn candidates(root: &Path) -> Result<Vec<PathBuf>, SweepError> {
 }
 
 /// `knives.machine` and `remote.origin.url` of the git directory `git_dir`,
-/// refusing a `knives.*` key nothing reads.
+/// refusing a `knives.*` key nothing reads, and a machine name that cannot
+/// spell this machine's ref (`refs/knives/<machine>`) as one component, with
+/// the command that names it again: found only when a sweep commits, it
+/// would fail there instead.
 fn identity(git_dir: &Path) -> Result<(Option<String>, Option<String>), SweepError> {
     let mut machine = None;
     let mut origin = None;
     let pattern = format!("^(knives\\..*|remote\\.{REMOTE}\\.url)$");
     let origin_key = format!("remote.{REMOTE}.url");
+    let refused = |detail: String| SweepError::Config {
+        git_dir: git_dir.to_owned(),
+        detail,
+    };
     for (key, value) in ledger_git::local_config(git_dir, &pattern)? {
         match key.as_str() {
-            "knives.machine" => machine = Some(value),
+            "knives.machine" => {
+                if let Err(error) = ledger_git::ref_component("machine", &value) {
+                    return Err(refused(format!(
+                        "{error}. Name this machine again, uniquely among every machine sharing \
+                         {REMOTE}: git --git-dir={} config knives.machine <name>",
+                        git_dir.display()
+                    )));
+                }
+                machine = Some(value);
+            }
             _ if key == origin_key => origin = Some(value),
             _ => {
-                return Err(SweepError::Config {
-                    git_dir: git_dir.to_owned(),
-                    detail: format!(
-                        "sets {key}, which knives does not read: it reads knives.machine, and \
-                         which forks a repository carries is each repos.toml entry's `ledger`. \
-                         Remove it: git --git-dir={} config --unset-all {key}",
-                        git_dir.display()
-                    ),
-                });
+                return Err(refused(format!(
+                    "sets {key}, which knives does not read: it reads knives.machine, and \
+                     which forks a repository carries is each repos.toml entry's `ledger`. \
+                     Remove it: git --git-dir={} config --unset-all {key}",
+                    git_dir.display()
+                )));
             }
         }
     }
@@ -1171,6 +1184,31 @@ mod tests {
         let error = destinations(&root).unwrap_err().to_string();
 
         assert!(error.contains("acme/a-repo"), "was: {error}");
+        assert!(
+            error.contains(&format!(
+                "git --git-dir={} config knives.machine <name>",
+                root.join(".git").display()
+            )),
+            "was: {error}"
+        );
+    }
+
+    #[test]
+    fn a_machine_name_no_ref_can_spell_is_refused_with_the_command_that_names_one() {
+        // Given: a repository carrying a fork, naming this machine `dev/box`,
+        // which would nest under another machine's ref.
+        let (_home, root) = ledger_root();
+        registry(&root, &[("a-repo", Some("acme/ledger"))]);
+        origin_at(&root, "/nonexistent/remote.git");
+        git(&root.join(".git"), &["config", "knives.machine", "dev/box"]);
+
+        // When: where the ledger travels is read, as every sweep and pull does
+        // before it fetches.
+        let error = destinations(&root).unwrap_err().to_string();
+
+        // Then: it is refused there, naming the name and the command that
+        // sets another, rather than failing later mid-sweep.
+        assert!(error.contains("\"dev/box\""), "was: {error}");
         assert!(
             error.contains(&format!(
                 "git --git-dir={} config knives.machine <name>",
