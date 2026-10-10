@@ -495,6 +495,44 @@ fn a_ledger_still_kept_under_the_registry_key_is_refused_until_migrated() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn a_registry_key_directory_nobody_can_read_is_refused_as_unmigrated() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    // Given: an empty directory named for the fork's registry key, which
+    // status passes as migrated while it can be read.
+    let (lab, home) = forge_fork();
+    let former = home.path().join("ledger").join("demo");
+    std::fs::create_dir_all(&former).expect("create the registry key's directory");
+    succeeded(&status_of_demo(&lab, home.path()));
+
+    // When: nobody can read it, and status runs.
+    let mode = std::fs::Permissions::from_mode;
+    std::fs::set_permissions(&former, mode(0o000)).expect("chmod 000");
+    if std::fs::read_dir(&former).is_ok() {
+        // Root reads it anyway: nothing here can be unreadable.
+        std::fs::set_permissions(&former, mode(0o755)).expect("restore");
+        return;
+    }
+    let refused = status_of_demo(&lab, home.path());
+    std::fs::set_permissions(&former, mode(0o755)).expect("restore");
+
+    // Then: it is taken as still holding entries, not as migrated: status
+    // exits incomplete naming the migration.
+    let errors = String::from_utf8_lossy(&refused.stderr);
+    assert_eq!(
+        refused.status.code(),
+        Some(3),
+        "stdout: {}\nstderr: {errors}",
+        String::from_utf8_lossy(&refused.stdout)
+    );
+    assert!(
+        errors.contains("Run `knives ledger migrate`") && errors.contains("ledger/demo"),
+        "stderr: {errors}"
+    );
+}
+
 /// A note an older knives filed under `demo`, its registry key.
 fn note_under_the_registry_key(home: &Path) {
     knives::ledger::Ledger::at(home.join("ledger").join("demo"))
