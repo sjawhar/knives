@@ -178,7 +178,7 @@ fn entries_committed_on_one_machine_materialise_on_another_and_parse() {
 
     // When: beta fetches every machine's ref and materialises what it lacks.
     let found = ledger_git::fetch(&repository(&beta), "origin").expect("fetch");
-    let written = ledger_git::materialise(&repository(&beta), &found).expect("materialise");
+    let done = ledger_git::materialise(&repository(&beta), &found).expect("materialise");
 
     // Then: beta has both entry files under alpha's names, and they parse to
     // exactly the entries alpha wrote.
@@ -189,7 +189,8 @@ fn entries_committed_on_one_machine_materialise_on_another_and_parse() {
             commit: commit.clone(),
         }]
     );
-    assert_eq!(written, 2);
+    assert_eq!(done.written, 2);
+    assert!(done.skipped.is_empty(), "{done:?}");
     assert_eq!(file_names(&beta), file_names(&alpha));
     let entries = ledger(&beta).entries().expect("beta's ledger parses");
     assert_eq!(entries.len(), 2);
@@ -240,7 +241,9 @@ fn two_machines_exchange_entries_and_neither_ref_is_rewritten() {
     let found =
         ledger_git::fetch(&repository(&beta), "origin").expect("a fetch with no forced update");
     assert_eq!(
-        ledger_git::materialise(&repository(&beta), &found).expect("materialise"),
+        ledger_git::materialise(&repository(&beta), &found)
+            .expect("materialise")
+            .written,
         1
     );
 
@@ -319,7 +322,7 @@ fn a_reader_never_sees_a_partial_entry_while_materialise_writes() {
 
     // Then: every read parsed, and every entry any read saw was whole: one of
     // alpha's stamps with its full text, not a prefix that happened to parse.
-    assert_eq!(written.expect("materialise"), ENTRIES);
+    assert_eq!(written.expect("materialise").written, ENTRIES);
     let failures: Vec<_> = reads
         .iter()
         .filter_map(|read| read.as_ref().err())
@@ -532,10 +535,15 @@ fn a_repository_commits_and_materialises_only_the_forks_it_carries() {
     // When: a repository carrying only acme/a-repo fetches and materialises them.
     let only_repo = repository(&beta);
     let found = ledger_git::fetch(&only_repo, "origin").expect("fetch");
-    let written = ledger_git::materialise(&only_repo, &found).expect("materialise");
+    let done = ledger_git::materialise(&only_repo, &found).expect("materialise");
 
-    // Then: only acme/a-repo's entry is written; the other fork's directory never appears.
-    assert_eq!(written, 1);
+    // Then: only acme/a-repo's entry is written; the other fork's directory
+    // never appears, and its entry is counted as left unread.
+    assert_eq!(done.written, 1);
+    assert_eq!(
+        done.skipped,
+        std::collections::BTreeMap::from([(OTHER.to_owned(), 1)])
+    );
     assert_eq!(file_names(&beta).len(), 1);
     assert!(!beta.join(OTHER).exists(), "an uncarried fork was written");
 }

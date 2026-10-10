@@ -56,6 +56,18 @@ pub struct MachineRef {
     pub commit: CommitId,
 }
 
+/// What [`materialise`] did.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Materialised {
+    /// Entries written into the root.
+    pub written: usize,
+    /// Entries the refs carry that the root lacks, in a fork this repository
+    /// does not carry, by that fork's `<owner>/<name>` directory (or the
+    /// shallower directory holding one outside any): what other machines
+    /// sent that nothing here reads.
+    pub skipped: BTreeMap<String, usize>,
+}
+
 /// One git repository over the ledger root, and the forks it carries.
 ///
 /// Its git directory is named outright rather than discovered from the
@@ -515,7 +527,7 @@ pub fn local_config(git_dir: &Path, pattern: &str) -> Result<Vec<(String, String
 }
 
 /// Write every entry `refs` carry, in a fork `repository` carries, that the
-/// ledger root lacks, returning how many this call wrote.
+/// ledger root lacks.
 ///
 /// Each entry is written whole to a temporary name and renamed into place,
 /// never over a file already there; see [`write_entry`]. A tree item that is
@@ -523,18 +535,22 @@ pub fn local_config(git_dir: &Path, pattern: &str) -> Result<Vec<(String, String
 /// fails the whole call before anything is written, whichever fork it names:
 /// `mktree` accepts names like `..` and `.git`, so a peer's ref must be
 /// checked before it reaches the filesystem. An entry in a fork this
-/// repository does not carry is left out: it came through a remote that fork
-/// does not belong to, and written into the shared root it would be committed
-/// again by the repository that does carry the fork.
-pub fn materialise(repository: &Repository, refs: &[MachineRef]) -> Result<usize, GitError> {
+/// repository does not carry is left out, and counted in
+/// [`Materialised::skipped`]: it came through a remote that fork does not
+/// belong to here, and written into the shared root it would be committed
+/// again by the repository that does carry the fork. That is what two
+/// machines whose registries send one fork to different repositories do,
+/// and the count is how this machine says so.
+pub fn materialise(repository: &Repository, refs: &[MachineRef]) -> Result<Materialised, GitError> {
     let mut missing = BTreeMap::new();
+    let mut unread = BTreeSet::new();
     for machine_ref in refs {
         for item in tree_items(repository, &machine_ref.commit)? {
             if item.node.is_tree() {
                 continue;
             }
             check_entry(&machine_ref.commit, &item)?;
-            if !repository.carries_entry(&item.path) || missing.contains_key(&item.path) {
+            if missing.contains_key(&item.path) || unread.contains(&item.path) {
                 continue;
             }
             let path = repository.work_tree.join(&item.path);
@@ -542,13 +558,28 @@ pub fn materialise(repository: &Repository, refs: &[MachineRef]) -> Result<usize
                 path: path.clone(),
                 source,
             })?;
-            if !present {
+            if present {
+                continue;
+            }
+            if repository.carries_entry(&item.path) {
                 missing.insert(item.path, item.node.oid);
+            } else {
+                unread.insert(item.path);
             }
         }
     }
+    let mut done = Materialised::default();
+    for path in unread {
+        let fork: PathBuf = path.parent().into_iter().flatten().take(2).collect();
+        let fork = if fork.as_os_str().is_empty() {
+            ".".to_owned()
+        } else {
+            fork.display().to_string()
+        };
+        *done.skipped.entry(fork).or_default() += 1;
+    }
     if missing.is_empty() {
-        return Ok(0);
+        return Ok(done);
     }
     let mut input = Vec::new();
     for oid in missing.values() {
@@ -561,13 +592,12 @@ pub fn materialise(repository: &Repository, refs: &[MachineRef]) -> Result<usize
     let blobs = batch_blobs(&answer)
         .filter(|blobs| blobs.len() == missing.len())
         .ok_or_else(|| output_error(&command, "each requested blob, in order"))?;
-    let mut written = 0;
     for (relative, content) in missing.keys().zip(blobs) {
         if write_entry(&repository.work_tree.join(relative), content)? {
-            written += 1;
+            done.written += 1;
         }
     }
-    Ok(written)
+    Ok(done)
 }
 
 /// A name in a tree, as `ls-tree` prints it and `mktree` reads it.

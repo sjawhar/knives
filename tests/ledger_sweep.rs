@@ -1012,17 +1012,6 @@ fn status_counts_entries_the_remote_lacks_and_names_a_failed_sweeps_log() {
 
     // Then: a note says one entry is not on the remote yet; nothing failed.
     assert_eq!(code, Some(0), "{report}");
-    let notes = |report: &serde_json::Value| -> Vec<String> {
-        report["notes"]
-            .as_array()
-            .map(|notes| {
-                notes
-                    .iter()
-                    .filter_map(|note| note.as_str().map(str::to_owned))
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
     assert!(
         notes(&report)
             .iter()
@@ -1044,6 +1033,84 @@ fn status_counts_entries_the_remote_lacks_and_names_a_failed_sweeps_log() {
             .any(|note| note.starts_with("1 ledger entry not yet on origin")
                 && note.contains(&named)),
         "{report}"
+    );
+}
+
+/// The notes of a status report.
+fn notes(report: &serde_json::Value) -> Vec<String> {
+    report["notes"]
+        .as_array()
+        .map(|notes| {
+            notes
+                .iter()
+                .filter_map(|note| note.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[test]
+fn status_names_the_peer_entries_a_machine_does_not_carry_the_fork_for() {
+    // Given: alpha shares the lab fork's ledger with acme/ledger; beta
+    // shares acme/ledger too, for another fork, and keeps the lab fork's
+    // ledger to itself.
+    let lab = lab::Lab::new();
+    let alpha = shared_home(&lab);
+    let beta = second_machine(alpha.path());
+    let registry = beta.path().join("repos.toml");
+    let text = std::fs::read_to_string(&registry).expect("read the registry");
+    std::fs::write(
+        &registry,
+        format!(
+            "{}\n[repos.other]\nupstream = \"https://forge.invalid/acme/other\"\n\
+             origin = \"https://forge.invalid/ours/other\"\nledger = \"{LEDGER}\"\n",
+            text.replace(&format!("ledger = \"{LEDGER}\"\n"), "")
+        ),
+    )
+    .expect("write the registry");
+    let (_remote_dir, remote) = bare_remote();
+    share(alpha.path(), "alpha", &remote);
+    share(beta.path(), "beta", &remote);
+    let wrote = knives_on(
+        &lab,
+        alpha.path(),
+        &["--text", "notch", "-m", "from alpha", "--repo", "demo"],
+    );
+    assert!(
+        wrote.status.success(),
+        "{}",
+        String::from_utf8_lossy(&wrote.stderr)
+    );
+    wait_until("alpha's note to reach the remote", || {
+        entries_on(&remote, "alpha") == 1
+    });
+    settle(alpha.path());
+
+    // When: beta sweeps.
+    let swept = sweep(beta.path());
+
+    // Then: the sweep counts alpha's note as left unread, and writes none of it.
+    let stdout = String::from_utf8_lossy(&swept.stdout);
+    assert!(swept.status.success(), "{stdout}");
+    let report: serde_json::Value = serde_json::from_str(&stdout).expect("a sweep report");
+    assert_eq!(
+        report["destinations"][0]["skipped"],
+        serde_json::json!({ FORK: 1 }),
+        "{report}"
+    );
+    assert!(!beta.path().join("ledger").join(FORK).exists());
+
+    // And: beta's status of the lab fork says where that entry is and why
+    // it is not read, though no sweep's output reaches anyone.
+    let (code, status) = status_on(&lab, beta.path());
+    assert_eq!(code, Some(0), "{status}");
+    let through = format!(
+        "1 entry other machines sent through origin ({}) is not read here",
+        beta.path().join("ledger").join(".git").display()
+    );
+    assert!(
+        notes(&status).iter().any(|note| note.contains(&through)),
+        "{status}"
     );
 }
 
@@ -1318,6 +1385,66 @@ fn a_sweep_discards_its_own_uncommitted_repeat_of_a_transition_it_pulled() {
     assert_eq!(recorded_in(beta.path(), MERGED), 1);
     assert_eq!(recorded_on(&remote, MERGED), 1);
     assert_eq!(entries_on(&remote, "beta"), 0);
+}
+
+#[test]
+fn status_names_the_repeated_transitions_a_handed_off_sweep_discarded() {
+    // Given: two machines that saw #7 open, and beta's sweep held off while
+    // it syncs the merge, so its event stays uncommitted.
+    let lab = lab::Lab::new();
+    let (_remote_dir, remote) = bare_remote();
+    let (alpha, beta) = two_machines_that_saw_seven_open(&lab, &remote, &remote);
+    let held = hold_sweep_lock(beta.path());
+    let merged = forge_reporting("MERGED");
+    let synced = sync_on(&lab, beta.path(), merged.path());
+    assert_eq!(
+        synced.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&synced.stdout)
+    );
+    assert_eq!(recorded_in(beta.path(), MERGED), 1, "beta wrote its own");
+
+    // When: alpha's event reaches the remote first, and then a note beta
+    // writes hands off the sweep that discards beta's repeat, a sweep whose
+    // output goes nowhere.
+    let synced = sync_on(&lab, alpha.path(), merged.path());
+    assert_eq!(
+        synced.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&synced.stdout)
+    );
+    wait_until("alpha's event to reach the remote", || {
+        recorded_on(&remote, MERGED) == 1
+    });
+    settle(alpha.path());
+    drop(held);
+    let wrote = knives_on(
+        &lab,
+        beta.path(),
+        &["--text", "notch", "-m", "after the merge", "--repo", "demo"],
+    );
+    assert!(
+        wrote.status.success(),
+        "{}",
+        String::from_utf8_lossy(&wrote.stderr)
+    );
+    wait_until("beta's note to reach the remote", || {
+        entries_on(&remote, "beta") == 1
+    });
+    settle(beta.path());
+    assert_eq!(recorded_on(&remote, MERGED), 1);
+
+    // Then: beta's status says its sweep discarded the repeat.
+    let (code, report) = status_on(&lab, beta.path());
+    assert_eq!(code, Some(0), "{report}");
+    assert!(
+        notes(&report)
+            .iter()
+            .any(|note| note.contains("discarded 1 repeated transition")),
+        "{report}"
+    );
 }
 
 #[test]

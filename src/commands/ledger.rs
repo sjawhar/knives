@@ -10,6 +10,7 @@
 //! reports what it carried.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use crate::cli::{Exit, Output};
@@ -88,9 +89,16 @@ pub fn render(report: &Report) -> String {
                     1 => ", 1 repeated transition discarded".to_owned(),
                     count => format!(", {count} repeated transitions discarded"),
                 };
+                let skipped: String = tally.skipped.iter().flatten().fold(
+                    String::new(),
+                    |mut text, (fork, count)| {
+                        let _ = write!(text, ", {count} of {fork} left unread");
+                        text
+                    },
+                );
                 format!(
-                    "ledger: {} ({}): {} commit(s), {} push(es), {} entr{} pulled{discarded}; \
-                     carries {}",
+                    "ledger: {} ({}): {} commit(s), {} push(es), {} entr{} pulled{discarded}\
+                     {skipped}; carries {}",
                     tally.remote,
                     tally.git_dir,
                     tally.commits,

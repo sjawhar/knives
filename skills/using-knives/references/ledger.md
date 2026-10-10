@@ -268,7 +268,7 @@ and JSON share its report:
 
 ```text
 {outcome, destinations?, problems?}
-destination: {git_dir, remote, forks, commits, pulled, pushes, discarded}
+destination: {git_dir, remote, forks, commits, pulled, pushes, discarded, skipped?}
 ```
 
 `outcome` is `swept`; `busy` when another sweep holds the lock and carries this
@@ -276,7 +276,16 @@ one's entries; or `not-shared` when no git directory names a machine and no
 fork sets `ledger`. Each destination is one git directory: `remote` is always
 `origin`, `forks` lists the upstream names it carries, and the counts cover the
 whole sweep: commits made, entries pulled in, pushes, and repeated transitions
-discarded. Any problem exits `3`.
+discarded. `skipped`, by `<owner>/<name>` directory, counts the entries other
+machines sent through that repository for a fork it does not carry here, which
+this machine never writes in: what two machines whose registries send one fork
+to different repositories see. Any problem exits `3`.
+
+A sweep a write hands off prints to nowhere, so each sweep also keeps what it
+discarded and left unread in `ledger-sweep.json` beside the state file, and
+`status` reads it: the discards add up per fork, with when the newest went,
+and the skipped count per repository is what the last pull from it found. The
+file is removed once it holds nothing.
 
 Every machine that syncs compares the forge with its own record, so two that
 sync after one merge each see `#N merged`. `sync` pulls first, and writes no
@@ -303,8 +312,11 @@ written nothing: a `depends` statement replaces the whole list and a forget
 erases the statement before it, so built from a ledger missing another
 machine's newer statement, either would replace that statement on every
 machine. A forget with nothing stated after the pull writes no statement.
-`status` also notes how many of a fork's entries the remote lacks, and names
-`ledger-sweep.log` when the last sweep failed. `notch`, `start`, `finish`,
+`status` also notes how many of a fork's entries the remote lacks, names
+`ledger-sweep.log` when the last sweep failed, and says from
+`ledger-sweep.json` how many of the fork's entries other machines sent through
+a repository this one does not send it through, and how many repeated
+transitions sweeps here discarded. `notch`, `start`, `finish`,
 `track --pr` and `track --fork-only` do not pull: they replace nothing they
 read, and read a statement only to stamp their entry with a pull request
 number.

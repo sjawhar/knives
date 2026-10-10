@@ -51,6 +51,14 @@ pub enum SweepError {
         path: PathBuf,
         source: std::io::Error,
     },
+    #[error(
+        "{path} is not a sweep record this knives can read ({source}); remove it, and the \
+         next sweep writes it afresh"
+    )]
+    Record {
+        path: PathBuf,
+        source: serde_json::Error,
+    },
 }
 
 /// One repository the ledger travels through, and this machine's name there.
@@ -292,6 +300,162 @@ pub fn sweep_log(root: &Path) -> PathBuf {
     root.with_file_name("ledger-sweep.log")
 }
 
+/// Where sweeps keep what they did that nobody running them sees
+/// ([`Kept`]): a sweep a write hands off prints to nowhere.
+pub fn sweep_record(root: &Path) -> PathBuf {
+    root.with_file_name("ledger-sweep.json")
+}
+
+/// What sweeps did to this machine's ledger that `status` reports, since a
+/// sweep a write hands off has nowhere to say it ([`Pulled::backlog_for`]).
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Kept {
+    /// By fork: the repeated transitions every sweep so far has discarded.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    discarded: BTreeMap<String, Discards>,
+    /// By fork directory, then by destination: the entries other machines
+    /// sent through that destination that this machine does not read, as
+    /// the last sweep to pull from it found them.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    skipped: BTreeMap<String, BTreeMap<String, usize>>,
+}
+
+/// How many repeated transitions of one fork sweeps have discarded, and when
+/// the newest went.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Discards {
+    count: usize,
+    last: String,
+}
+
+impl Kept {
+    /// What `status` says about `fork` from this record.
+    fn notes_for(&self, fork: &UpstreamName) -> Vec<String> {
+        let mut notes: Vec<String> = self
+            .skipped
+            .get(fork.as_str())
+            .into_iter()
+            .flatten()
+            .map(|(through, &count)| {
+                let (entries, are) = if count == 1 {
+                    ("entry", "is")
+                } else {
+                    ("entries", "are")
+                };
+                format!(
+                    "{count} {entries} other machines sent through {through} {are} not read \
+                     here: this machine's repos.toml does not send {fork}'s ledger there"
+                )
+            })
+            .collect();
+        if let Some(discards) = self.discarded.get(fork.as_str()) {
+            notes.push(format!(
+                "sweeps here discarded {} repeated transition{} another machine had already \
+                 committed, the newest at {}",
+                discards.count,
+                if discards.count == 1 { "" } else { "s" },
+                discards.last
+            ));
+        }
+        notes
+    }
+
+    /// The [`sweep_record`] beside `root`; empty when there is none.
+    fn read(root: &Path) -> Result<Self, SweepError> {
+        let path = sweep_record(root);
+        match std::fs::read(&path) {
+            Ok(bytes) => {
+                serde_json::from_slice(&bytes).map_err(|source| SweepError::Record { path, source })
+            }
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(source) => Err(SweepError::Read { path, source }),
+        }
+    }
+
+    /// Replace the [`sweep_record`] beside `root` whole, or remove it when
+    /// there is nothing to keep.
+    fn write(&self, root: &Path) -> Result<(), SweepError> {
+        let path = sweep_record(root);
+        let unwritable = |source| SweepError::Write {
+            path: path.clone(),
+            source,
+        };
+        if self.discarded.is_empty() && self.skipped.is_empty() {
+            return match std::fs::remove_file(&path) {
+                Err(source) if source.kind() != std::io::ErrorKind::NotFound => {
+                    Err(unwritable(source))
+                }
+                _ => Ok(()),
+            };
+        }
+        let directory = path.parent().unwrap_or(root);
+        let mut temporary = tempfile::NamedTempFile::new_in(directory).map_err(unwritable)?;
+        serde_json::to_writer_pretty(&mut temporary, self)
+            .map_err(|error| unwritable(std::io::Error::other(error)))?;
+        temporary
+            .persist(&path)
+            .map_err(|error| unwritable(error.error))?;
+        Ok(())
+    }
+
+    /// Take `skipped`, what a pull through `through` just found, as all that
+    /// is skipped through it now.
+    fn pulled_through(&mut self, through: &str, skipped: &BTreeMap<String, usize>) {
+        for by in self.skipped.values_mut() {
+            by.remove(through);
+        }
+        for (fork, &count) in skipped {
+            self.skipped
+                .entry(fork.clone())
+                .or_default()
+                .insert(through.to_owned(), count);
+        }
+        self.skipped.retain(|_, by| !by.is_empty());
+    }
+}
+
+/// Fold what the passes since the last call did into the [`sweep_record`]
+/// beside `root`: each tally's discards are added to its fork's, and what
+/// each destination's pull found skipped replaces what was kept for it; a
+/// destination no longer here is dropped. Called with the lock held, so no
+/// other sweep's fold is lost. A discard stays in its tally to fold again
+/// until the record holding it is written.
+fn keep(
+    root: &Path,
+    destinations: &[Destination],
+    tallies: &mut [Tally],
+) -> Result<(), SweepError> {
+    let mut kept = Kept::read(root)?;
+    let now = jiff::Timestamp::now().to_string();
+    let mut present = BTreeSet::new();
+    for (destination, tally) in destinations.iter().zip(tallies.iter()) {
+        let through = destination.describe();
+        for (fork, &count) in &tally.unkept {
+            let discards = kept.discarded.entry(fork.clone()).or_insert(Discards {
+                count: 0,
+                last: String::new(),
+            });
+            discards.count += count;
+            discards.last.clone_from(&now);
+        }
+        if let Some(skipped) = &tally.skipped {
+            kept.pulled_through(&through, skipped);
+        }
+        present.insert(through);
+    }
+    for by in kept.skipped.values_mut() {
+        by.retain(|through, _| present.contains(through));
+    }
+    kept.skipped.retain(|_, by| !by.is_empty());
+    kept.write(root)?;
+    for tally in tallies {
+        tally.unkept.clear();
+    }
+    Ok(())
+}
+
 /// What one destination's passes did over one sweep.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Tally {
@@ -304,8 +468,25 @@ pub struct Tally {
     /// Transition events this machine wrote that repeated one another
     /// machine had already committed, removed before the commit.
     pub discarded: usize,
+    /// By the fork directory they are in, the entries other machines sent
+    /// through this repository that this machine does not read, because it
+    /// carries no such fork there; as the sweep's last pull found them, and
+    /// absent when none succeeded or it found none.
+    #[serde(skip_serializing_if = "skipped_nothing")]
+    pub skipped: Option<BTreeMap<String, usize>>,
+    /// By fork, the discards not yet in the [`sweep_record`].
+    #[serde(skip)]
+    unkept: BTreeMap<String, usize>,
     #[serde(skip)]
     failed: bool,
+}
+
+#[expect(
+    clippy::ref_option,
+    reason = "serde's skip_serializing_if hands the field over by reference"
+)]
+fn skipped_nothing(skipped: &Option<BTreeMap<String, usize>>) -> bool {
+    skipped.as_ref().is_none_or(BTreeMap::is_empty)
 }
 
 impl Tally {
@@ -323,6 +504,8 @@ impl Tally {
             pulled: 0,
             pushes: 0,
             discarded: 0,
+            skipped: None,
+            unkept: BTreeMap::new(),
             failed: false,
         }
     }
@@ -377,7 +560,8 @@ pub fn run(root: &Path) -> Result<Swept, SweepError> {
 ///
 /// Each [`Destinations::unreached`] fork and each
 /// [`Destinations::unclaimed`] directory is one of the sweep's problems, so
-/// it is in the [`sweep_log`] until it is fixed.
+/// it is in the [`sweep_log`] until it is fixed. What the passes discarded
+/// and left unread goes to the [`sweep_record`] before the lock is let go.
 pub fn sweep(root: &Path, destinations: &Destinations) -> Result<Swept, SweepError> {
     let Destinations {
         found,
@@ -407,6 +591,9 @@ pub fn sweep(root: &Path, destinations: &Destinations) -> Result<Swept, SweepErr
             if !anything_new(found, &mut tallies, &mut problems) {
                 break;
             }
+        }
+        if let Err(error) = keep(root, found, &mut tallies) {
+            problems.push(error.to_string());
         }
         record(root, &problems)?;
         drop(lock);
@@ -440,7 +627,10 @@ fn pass(destination: &Destination, tally: &mut Tally) -> Vec<String> {
     match ledger_git::fetch(repository, &destination.remote)
         .and_then(|refs| ledger_git::materialise(repository, &refs))
     {
-        Ok(written) => tally.pulled += written,
+        Ok(done) => {
+            tally.pulled += done.written;
+            tally.skipped = Some(done.skipped);
+        }
         Err(error) => failures.push(failed(error.into())),
     }
     if let Err(error) = send(destination, tally) {
@@ -477,6 +667,7 @@ fn send(destination: &Destination, tally: &mut Tally) -> Result<(), SweepError> 
                     pending.forget(relative);
                 }
                 tally.discarded += 1;
+                *tally.unkept.entry(fork.to_string()).or_default() += 1;
             }
         }
     }
@@ -538,6 +729,9 @@ pub struct Pulled {
     root: PathBuf,
     destinations: Vec<Destination>,
     problems: BTreeMap<UpstreamName, Vec<String>>,
+    /// By destination, what each pull that succeeded left unread
+    /// ([`ledger_git::Materialised::skipped`]).
+    skipped: BTreeMap<String, BTreeMap<String, usize>>,
 }
 
 impl Pulled {
@@ -547,43 +741,61 @@ impl Pulled {
         self.problems.get(fork).cloned().unwrap_or_default()
     }
 
-    /// How many of `fork`'s entries its remote does not have yet, and where
-    /// the last sweep's failures are when it failed; `None` when neither.
-    pub fn backlog_for(&self, fork: &UpstreamName) -> Option<String> {
-        let destination = self
+    /// What `status` notes about `fork`'s ledger beyond its problems: how
+    /// many of its entries its remote does not have yet, and where the last
+    /// sweep's failures are when it failed, as one line; then what no one
+    /// running a handed-off sweep sees, kept in the [`sweep_record`] and
+    /// brought up to date by this pull: entries other machines sent through
+    /// a repository this machine does not send the fork through, and
+    /// repeated transitions discarded.
+    pub fn backlog_for(&self, fork: &UpstreamName) -> Vec<String> {
+        let mut notes = Vec::new();
+        if let Some(destination) = self
             .destinations
             .iter()
-            .find(|destination| destination.carries(fork))?;
-        let unsent =
-            ledger_git::unsent(&destination.repository, &destination.remote).map(|paths| {
-                paths
-                    .iter()
-                    .filter(|path| path.starts_with(fork.as_str()))
-                    .count()
+            .find(|destination| destination.carries(fork))
+        {
+            let unsent =
+                ledger_git::unsent(&destination.repository, &destination.remote).map(|paths| {
+                    paths
+                        .iter()
+                        .filter(|path| path.starts_with(fork.as_str()))
+                        .count()
+                });
+            let log = sweep_log(&self.root);
+            let failed = log
+                .exists()
+                .then(|| format!("the last ledger sweep failed: see {}", log.display()));
+            let waiting = match unsent {
+                Ok(0) => None,
+                Ok(1) => Some(format!(
+                    "1 ledger entry not yet on {}",
+                    destination.describe()
+                )),
+                Ok(count) => Some(format!(
+                    "{count} ledger entries not yet on {}",
+                    destination.describe()
+                )),
+                Err(error) => Some(format!(
+                    "could not count ledger entries not yet on {}: {error}",
+                    destination.describe()
+                )),
+            };
+            notes.extend(match (waiting, failed) {
+                (Some(waiting), Some(failed)) => Some(format!("{waiting}; {failed}")),
+                (waiting, failed) => waiting.or(failed),
             });
-        let log = sweep_log(&self.root);
-        let failed = log
-            .exists()
-            .then(|| format!("the last ledger sweep failed: see {}", log.display()));
-        let waiting = match unsent {
-            Ok(0) => None,
-            Ok(1) => Some(format!(
-                "1 ledger entry not yet on {}",
-                destination.describe()
-            )),
-            Ok(count) => Some(format!(
-                "{count} ledger entries not yet on {}",
-                destination.describe()
-            )),
-            Err(error) => Some(format!(
-                "could not count ledger entries not yet on {}: {error}",
-                destination.describe()
-            )),
-        };
-        match (waiting, failed) {
-            (Some(waiting), Some(failed)) => Some(format!("{waiting}; {failed}")),
-            (waiting, failed) => waiting.or(failed),
         }
+        match Kept::read(&self.root) {
+            Ok(mut kept) => {
+                for (through, skipped) in &self.skipped {
+                    kept.pulled_through(through, skipped);
+                }
+                notes.extend(kept.notes_for(fork));
+            }
+            Err(error) => notes.push(error.to_string()),
+        }
+        notes
     }
 }
 
@@ -656,18 +868,23 @@ pub fn pull_at(root: &Path, forks: &[&UpstreamName]) -> Pulled {
         if carried.is_empty() {
             continue;
         }
-        if let Err(error) = pull_one(&destination) {
-            let problem = format!(
-                "could not pull the ledger from {}: {error}; this answers from the entries \
-                 this machine has",
-                destination.describe()
-            );
-            for fork in carried {
-                pulled
-                    .problems
-                    .entry(fork.clone())
-                    .or_default()
-                    .push(problem.clone());
+        match pull_one(&destination) {
+            Ok(done) => {
+                pulled.skipped.insert(destination.describe(), done.skipped);
+            }
+            Err(error) => {
+                let problem = format!(
+                    "could not pull the ledger from {}: {error}; this answers from the entries \
+                     this machine has",
+                    destination.describe()
+                );
+                for fork in carried {
+                    pulled
+                        .problems
+                        .entry(fork.clone())
+                        .or_default()
+                        .push(problem.clone());
+                }
             }
         }
         pulled.destinations.push(destination);
@@ -675,7 +892,7 @@ pub fn pull_at(root: &Path, forks: &[&UpstreamName]) -> Pulled {
     pulled
 }
 
-fn pull_one(destination: &Destination) -> Result<usize, SweepError> {
+fn pull_one(destination: &Destination) -> Result<ledger_git::Materialised, SweepError> {
     let _transport = FileLock::acquire(&destination.transport_lock(), LockWait::TRANSPORT)?;
     let refs = ledger_git::fetch(&destination.repository, &destination.remote)?;
     Ok(ledger_git::materialise(&destination.repository, &refs)?)
@@ -1011,7 +1228,7 @@ mod tests {
         let pulled = pull_at(&root, &[&a_repo]);
 
         assert!(pulled.problems_for(&a_repo).is_empty());
-        assert_eq!(pulled.backlog_for(&a_repo), None);
+        assert!(pulled.backlog_for(&a_repo).is_empty());
     }
 
     #[test]
