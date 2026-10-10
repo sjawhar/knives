@@ -286,6 +286,76 @@ fn a_sweep_with_nothing_new_does_nothing_and_succeeds() {
 }
 
 #[test]
+fn a_sweep_reaches_the_remote_through_the_git_config_its_session_hands_it() {
+    // Given: a machine whose ledger root names its origin by a URL only the
+    // session's own git configuration rewrites to where the remote is, as a
+    // session routes git to the identity it acts as with an `include.path`
+    // handed over in `GIT_CONFIG_COUNT` and its numbered pairs.
+    let home = a_repo_home();
+    let (_remote_dir, remote) = bare_remote();
+    let root = home.path().join("ledger");
+    lab::git_repository(&root, &[("origin", LEDGER_URL)]);
+    lab::git_output(&root, ["config", "knives.machine", "alpha"]);
+    let routes = home.path().join("routes.gitconfig");
+    std::fs::write(
+        &routes,
+        format!(
+            "[url \"{}\"]\n\tinsteadOf = {LEDGER_URL}\n",
+            remote.display()
+        ),
+    )
+    .expect("write the session's git config");
+    append(&root, "acme/a-repo", 1);
+    // An inherited GIT_DIR naming some other repository, as a git hook
+    // exports one, which the transport must still ignore.
+    let elsewhere = tempfile::tempdir().expect("another repository");
+    lab::git_repository(elsewhere.path(), &[]);
+    let sweep_as_session = |include: Option<&Path>| {
+        let mut command = lab::knives_command(
+            home.path(),
+            home.path(),
+            home.path(),
+            &["--json", "ledger", "sweep"],
+        );
+        command
+            .env_remove("GIT_CONFIG_COUNT")
+            .env_remove("GIT_CONFIG_KEY_0")
+            .env_remove("GIT_CONFIG_VALUE_0")
+            .env("GIT_DIR", elsewhere.path().join(".git"));
+        if let Some(include) = include {
+            command
+                .env("GIT_CONFIG_COUNT", "1")
+                .env("GIT_CONFIG_KEY_0", "include.path")
+                .env("GIT_CONFIG_VALUE_0", include);
+        }
+        command.output().expect("run knives ledger sweep")
+    };
+
+    // When: a sweep runs without that configuration.
+    let without = sweep_as_session(None);
+
+    // Then: it cannot reach the remote, which has nothing.
+    assert_eq!(
+        without.status.code(),
+        Some(3),
+        "{}",
+        String::from_utf8_lossy(&without.stdout)
+    );
+    assert_eq!(entries_on(&remote, "alpha"), 0);
+
+    // When: the session hands it over.
+    let with = sweep_as_session(Some(&routes));
+
+    // Then: the sweep reaches the remote through it and the entry is there.
+    assert!(
+        with.status.success(),
+        "{}",
+        String::from_utf8_lossy(&with.stdout)
+    );
+    assert_eq!(entries_on(&remote, "alpha"), 1);
+}
+
+#[test]
 fn a_ledger_nobody_set_up_to_share_is_swept_as_nothing_and_touched_nowhere() {
     // Given: a config home whose ledger root is no repository at all, and
     // another whose repository names no machine, with a registry sharing no

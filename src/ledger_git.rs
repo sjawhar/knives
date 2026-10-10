@@ -113,12 +113,24 @@ impl Repository {
 
     /// `git` on this repository, run in the ledger root.
     ///
-    /// `--git-dir` and `--work-tree` leave nothing to discovery. No terminal
-    /// prompt: a ledger command has nobody to answer one, whether it is a
-    /// sweep running detached or a pull a report is waiting on, and a
-    /// credential prompt would hold the ledger's lock until someone noticed.
+    /// `--git-dir` and `--work-tree` leave nothing to discovery, and
+    /// [`crate::bind::git_command`] scrubs an inherited `GIT_DIR` and its
+    /// companions. The configuration the environment carries as
+    /// `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_<n>` and `GIT_CONFIG_VALUE_<n>` is
+    /// kept: it is how a session routes git to the identity it acts as (an
+    /// `include.path` of credential and URL rules), and without it a fetch or
+    /// push falls back to whatever credential the user's own configuration
+    /// names, acting on the forge as that user. No terminal prompt: a ledger
+    /// command has nobody to answer one, whether it is a sweep running
+    /// detached or a pull a report is waiting on, and a credential prompt
+    /// would hold the ledger's lock until someone noticed.
     fn git(&self) -> Command {
         let mut command = crate::bind::git_command();
+        for (name, value) in std::env::vars_os() {
+            if carries_session_config(name.as_encoded_bytes()) {
+                command.env(name, value);
+            }
+        }
         command
             .arg("-C")
             .arg(&self.work_tree)
@@ -129,6 +141,16 @@ impl Repository {
             .env("GIT_TERMINAL_PROMPT", "0");
         command
     }
+}
+
+/// Whether the environment variable `name` is part of the configuration a
+/// session hands git as `GIT_CONFIG_COUNT` and its numbered pairs.
+fn carries_session_config(name: &[u8]) -> bool {
+    let numbered = |prefix: &[u8]| {
+        name.strip_prefix(prefix)
+            .is_some_and(|index| !index.is_empty() && index.iter().all(u8::is_ascii_digit))
+    };
+    name == b"GIT_CONFIG_COUNT" || numbered(b"GIT_CONFIG_KEY_") || numbered(b"GIT_CONFIG_VALUE_")
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1135,5 +1157,28 @@ mod tests {
         );
         assert!(batch_blobs(format!("{id} missing\n").as_bytes()).is_none());
         assert!(batch_blobs(format!("{id} blob 9\nabc\n").as_bytes()).is_none());
+    }
+
+    #[test]
+    fn only_the_numbered_config_a_session_hands_git_is_carried() {
+        for name in [
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_KEY_0",
+            "GIT_CONFIG_VALUE_12",
+        ] {
+            assert!(carries_session_config(name.as_bytes()), "{name}");
+        }
+        for name in [
+            "GIT_CONFIG_PARAMETERS",
+            "GIT_CONFIG_GLOBAL",
+            "GIT_CONFIG_SYSTEM",
+            "GIT_CONFIG_NOSYSTEM",
+            "GIT_CONFIG",
+            "GIT_CONFIG_KEY_",
+            "GIT_CONFIG_VALUE_x",
+            "GIT_DIR",
+        ] {
+            assert!(!carries_session_config(name.as_bytes()), "{name}");
+        }
     }
 }
