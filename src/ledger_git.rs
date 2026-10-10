@@ -235,9 +235,11 @@ pub enum GitError {
     NotOwn { machine: String, remote: String },
 }
 
-/// Commit every entry in the forks `repository` carries that no knives ref
-/// carries yet to `refs/knives/<machine>`, as a child of the commit that ref
-/// holds now.
+/// Commit what `pending` found as `machine` to `refs/knives/<machine>`, as
+/// a child of the commit that ref holds now.
+///
+/// That is every entry in the forks `repository` carries that no knives ref
+/// carries yet, less any the caller [`Pending::forget`]s in between.
 ///
 /// An entry is a `*.md` regular file anywhere under a carried fork's
 /// directory outside `.git`, the files [`crate::ledger::Ledger::entries`]
@@ -247,23 +249,9 @@ pub enum GitError {
 /// machine's own. `Ok(None)` when nothing is new, and the ref is then
 /// untouched.
 ///
-/// A remote that has `machine`'s ref when this checkout has none means the
-/// name is another machine's, or this checkout was recreated; either way a
-/// commit here would start a second history that the push then rejects, so
-/// the call refuses with [`GitError::NotOwn`] instead, as [`push`] does.
-///
-/// The ref moves by compare-and-swap against the value read at the start, so
+/// The ref moves by compare-and-swap against the value [`pending`] read, so
 /// a second writer for the same machine racing this one fails loudly rather
 /// than lose the other's commit.
-pub fn commit_new_entries(
-    repository: &Repository,
-    machine: &str,
-) -> Result<Option<CommitId>, GitError> {
-    commit_pending(repository, machine, pending(repository, machine)?)
-}
-
-/// Commit what `pending` found as `machine`; [`commit_new_entries`] when a
-/// caller has something to decide between the look and the commit.
 pub fn commit_pending(
     repository: &Repository,
     machine: &str,
@@ -290,8 +278,8 @@ pub fn commit_pending(
     Ok(Some(commit))
 }
 
-/// Whether [`commit_new_entries`] would commit anything now. It only reads,
-/// so it can run while another process holds the ledger's lock and commits.
+/// Whether [`commit_pending`] would commit anything now. It only reads, so
+/// it can run while another process holds the ledger's lock and commits.
 pub fn has_new_entries(repository: &Repository, machine: &str) -> Result<bool, GitError> {
     Ok(!pending(repository, machine)?.added.is_empty())
 }
@@ -318,9 +306,12 @@ impl Pending {
     }
 }
 
-/// What a commit as `machine` would start from and add, as
-/// [`commit_new_entries`] describes, refused with [`GitError::NotOwn`] in
-/// the same case.
+/// What a commit as `machine` would start from and add ([`commit_pending`]).
+///
+/// A remote that has `machine`'s ref when this checkout has none means the
+/// name is another machine's, or this checkout was recreated; either way a
+/// commit here would start a second history that the push then rejects, so
+/// the call refuses with [`GitError::NotOwn`] instead, as [`push`] does.
 pub fn pending(repository: &Repository, machine: &str) -> Result<Pending, GitError> {
     let reference = own_ref(machine)?;
     let mut previous = None;
@@ -409,7 +400,7 @@ pub fn fetch(repository: &Repository, remote: &str) -> Result<Vec<MachineRef>, G
 /// writes only its own ref" holds. The refspec is spelled from the machine name
 /// alone and never forced, and a name that could spell any other ref (a glob,
 /// a second refspec, a nested path) is refused before git runs. Only
-/// [`commit_new_entries`] writes under `refs/knives/`, so
+/// [`commit_pending`] writes under `refs/knives/`, so
 /// `refs/knives/<machine>` exists here only if this checkout committed as that
 /// machine. A machine `remote` has but this checkout never committed as is a
 /// peer, and pushing it is refused; a machine neither side has has nothing to
@@ -970,7 +961,7 @@ fn tree_item(record: &[u8]) -> Option<TreeItem> {
     })
 }
 
-/// Refuse a tree item that is not an entry file as [`commit_new_entries`]
+/// Refuse a tree item that is not an entry file as [`commit_pending`]
 /// writes one (a `100644` blob named `*.md`), or whose path leaves the ledger
 /// directory or enters a `.git`.
 fn check_entry(commit: &CommitId, item: &TreeItem) -> Result<(), GitError> {

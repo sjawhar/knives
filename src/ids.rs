@@ -114,9 +114,9 @@ pub fn short_id(id: &str) -> &str {
 
 /// A branch in a particular repo.
 ///
-/// These two always travel together: every claim, mark, and supersession is
-/// keyed by the pair. Passing them separately duplicated the key formatting
-/// across six store methods and pushed several signatures past four arguments.
+/// These two always travel together: every claim, and every statement about a
+/// branch, is keyed by the pair, so the key is formatted in one place rather
+/// than by each caller.
 /// The repository is the fork's [`UpstreamName`], the name its state is kept
 /// under; a message for a person names the fork by its registry key instead.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]

@@ -129,9 +129,22 @@ fn knives_refs(repository: &Path) -> String {
     )
 }
 
+/// Commit as `machine` everything new in `repository`, as a sweep does
+/// when it has nothing to leave out.
+fn commit_new_entries(
+    repository: &Repository,
+    machine: &str,
+) -> Result<Option<knives::ids::CommitId>, GitError> {
+    ledger_git::commit_pending(
+        repository,
+        machine,
+        ledger_git::pending(repository, machine)?,
+    )
+}
+
 fn commit_and_push(machine: &Path, name: &str) -> knives::ids::CommitId {
     let repository = repository(machine);
-    let commit = ledger_git::commit_new_entries(&repository, name)
+    let commit = commit_new_entries(&repository, name)
         .expect("commit new entries")
         .expect("there were new entries");
     ledger_git::push(&repository, "origin", name).expect("push the machine's own ref");
@@ -229,7 +242,7 @@ fn two_machines_exchange_entries_and_neither_ref_is_rewritten() {
     );
     for (machine, name) in [(&alpha, "alpha"), (&beta, "beta")] {
         assert_eq!(
-            ledger_git::commit_new_entries(&repository(machine), name).expect("commit"),
+            commit_new_entries(&repository(machine), name).expect("commit"),
             None,
             "{name} recommitted its peer's entries as its own"
         );
@@ -360,20 +373,20 @@ fn committing_with_nothing_new_returns_none_and_moves_no_ref() {
 
     // When / Then: there is nothing to commit, and no ref appears.
     assert_eq!(
-        ledger_git::commit_new_entries(&repository(&alpha), "alpha").expect("commit"),
+        commit_new_entries(&repository(&alpha), "alpha").expect("commit"),
         None
     );
     assert_eq!(knives_refs(&alpha), "");
 
     // Given: one entry, committed.
     append(&alpha, "ses_alpha", 1, 0);
-    let commit = ledger_git::commit_new_entries(&repository(&alpha), "alpha")
+    let commit = commit_new_entries(&repository(&alpha), "alpha")
         .expect("commit")
         .expect("one new entry");
 
     // When / Then: a second commit finds nothing new and leaves the ref alone.
     assert_eq!(
-        ledger_git::commit_new_entries(&repository(&alpha), "alpha").expect("commit"),
+        commit_new_entries(&repository(&alpha), "alpha").expect("commit"),
         None
     );
     assert_eq!(knives_refs(&alpha), format!("refs/knives/alpha {commit}"));
@@ -398,7 +411,7 @@ fn a_push_of_any_ref_but_the_machines_own_is_refused() {
     ));
     append(&beta, "ses_beta", 1, 0);
     assert!(matches!(
-        ledger_git::commit_new_entries(&repository(&beta), "alpha"),
+        commit_new_entries(&repository(&beta), "alpha"),
         Err(GitError::NotOwn { .. })
     ));
     assert_eq!(knives_refs(&beta), "");
@@ -493,12 +506,12 @@ fn a_repository_commits_and_materialises_only_the_forks_it_carries() {
 
     // When: it commits twice, the second time after both forks gained an
     // entry, and pushes.
-    ledger_git::commit_new_entries(&carried, "alpha")
+    commit_new_entries(&carried, "alpha")
         .expect("commit")
         .expect("acme/a-repo's entries are new");
     append_to(&alpha, REPO, "ses_alpha", 1);
     append_to(&alpha, OTHER, "ses_alpha", 1);
-    ledger_git::commit_new_entries(&carried, "alpha")
+    commit_new_entries(&carried, "alpha")
         .expect("commit")
         .expect("acme/a-repo's newest entry is new");
     ledger_git::push(&carried, "origin", "alpha").expect("push");
@@ -527,7 +540,7 @@ fn a_repository_commits_and_materialises_only_the_forks_it_carries() {
     append_to(&peer, REPO, "ses_peer", 1);
     append_to(&peer, OTHER, "ses_peer", 1);
     let both = carrying(&peer, &[REPO, OTHER]);
-    ledger_git::commit_new_entries(&both, "peer")
+    commit_new_entries(&both, "peer")
         .expect("commit")
         .expect("both forks' entries are new");
     ledger_git::push(&both, "origin", "peer").expect("push");
@@ -581,7 +594,7 @@ fn two_repositories_over_one_ledger_root_each_carry_their_own_forks_to_their_own
 
     // When: each commits as alpha and pushes to its own remote.
     for repository in [&first, &other] {
-        ledger_git::commit_new_entries(repository, "alpha")
+        commit_new_entries(repository, "alpha")
             .expect("commit")
             .expect("its fork's entries are new");
         ledger_git::push(repository, "origin", "alpha").expect("push");
@@ -646,10 +659,7 @@ fn a_repository_carrying_no_fork_commits_nothing() {
     append(&alpha, "ses_alpha", 2, 0);
     let nothing = carrying(&alpha, &[]);
 
-    assert_eq!(
-        ledger_git::commit_new_entries(&nothing, "alpha").expect("commit"),
-        None
-    );
+    assert_eq!(commit_new_entries(&nothing, "alpha").expect("commit"), None);
     assert!(!ledger_git::has_new_entries(&nothing, "alpha").expect("look"));
     assert_eq!(knives_refs(&alpha), "");
 }
