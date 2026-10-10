@@ -251,7 +251,8 @@ fn a_burst_of_concurrent_sweeps_makes_one_commit_and_no_error() {
     );
     assert_eq!(entries_on(&remote, "alpha"), 12);
     assert!(!home.path().join("ledger-sweep.log").exists());
-    // And: at least one sweep found the lock taken and left, rather than wait.
+    // And: each sweep either carried the burst or found it being carried.
+    // Which, and how many of each, is up to the scheduler.
     let outcomes: Vec<String> = outputs
         .iter()
         .map(|output| {
@@ -261,15 +262,32 @@ fn a_burst_of_concurrent_sweeps_makes_one_commit_and_no_error() {
         })
         .collect();
     assert!(
-        outcomes.iter().any(|outcome| outcome == "busy"),
-        "no sweep ever found another running: {outcomes:?}"
-    );
-    assert!(
         outcomes
             .iter()
             .all(|outcome| outcome == "busy" || outcome == "swept"),
         "{outcomes:?}"
     );
+}
+
+#[test]
+fn a_sweep_that_finds_the_lock_held_leaves_at_once_as_busy() {
+    // Given: a machine with an entry to send, and its ledger lock held, as
+    // a running sweep holds it.
+    let home = a_repo_home();
+    let (_remote_dir, remote) = bare_remote();
+    let root = share(home.path(), "alpha", &remote);
+    append(&root, "acme/a-repo", 1);
+    let held = hold_sweep_lock(home.path());
+
+    // When: a sweep runs.
+    let swept = sweep(home.path());
+
+    // Then: it succeeds as busy, having sent nothing for the holder to race.
+    assert!(swept.status.success(), "{swept:?}");
+    let report: serde_json::Value = serde_json::from_slice(&swept.stdout).expect("JSON");
+    assert_eq!(report["outcome"], "busy", "{report}");
+    assert_eq!(entries_on(&remote, "alpha"), 0);
+    drop(held);
 }
 
 #[test]
