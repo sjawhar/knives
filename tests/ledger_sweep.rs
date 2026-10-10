@@ -811,6 +811,158 @@ fn a_sweep_whose_ledger_remote_stalls_gives_up_within_a_bound_and_lets_the_lock_
 }
 
 #[test]
+fn a_dependency_stated_on_another_machine_survives_a_second_machines_depends() {
+    // Given: two machines sharing one ledger remote, and alpha's dependency
+    // on the remote, which beta has never pulled.
+    let lab = lab::Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let alpha = shared_home(&lab);
+    let beta = second_machine(alpha.path());
+    let (_remote_dir, remote) = bare_remote();
+    share(alpha.path(), "alpha", &remote);
+    share(beta.path(), "beta", &remote);
+    let stated = knives_on(
+        &lab,
+        alpha.path(),
+        &["--text", "depends", "feat/alpha", "--on", "demo#1"],
+    );
+    assert!(
+        stated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stated.stderr)
+    );
+    wait_until("alpha's statement to reach the remote", || {
+        entries_on(&remote, "alpha") == 1
+    });
+    settle(alpha.path());
+
+    // When: beta states another dependency of the same branch.
+    let stated = knives_on(
+        &lab,
+        beta.path(),
+        &["--text", "depends", "feat/alpha", "--on", "demo#2"],
+    );
+    assert!(
+        stated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stated.stderr)
+    );
+    settle(beta.path());
+
+    // Then: beta's statement, the newest, lists both.
+    let entries = Ledger::at(beta.path().join("ledger").join(FORK))
+        .entries()
+        .expect("read beta's ledger");
+    let live = knives::statement::Statements::from_entries(&entries);
+    assert_eq!(live.depends("feat/alpha"), ["acme/demo#1", "acme/demo#2"]);
+}
+
+#[test]
+fn a_forget_with_nothing_stated_leaves_a_peers_unsent_statement_standing() {
+    // Given: two machines sharing one ledger remote, and a pull request
+    // alpha stated whose sweep has not yet carried it.
+    let lab = lab::Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let alpha = shared_home(&lab);
+    let beta = second_machine(alpha.path());
+    let (_remote_dir, remote) = bare_remote();
+    share(alpha.path(), "alpha", &remote);
+    share(beta.path(), "beta", &remote);
+    let held = hold_sweep_lock(alpha.path());
+    let tracked = knives_on(
+        &lab,
+        alpha.path(),
+        &["--text", "track", "feat/alpha", "--pr", "1234"],
+    );
+    assert!(
+        tracked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&tracked.stderr)
+    );
+
+    // When: beta, which can see no statement, forgets one, and then alpha's
+    // statement reaches the remote.
+    let forgot = knives_on(
+        &lab,
+        beta.path(),
+        &["--text", "track", "feat/alpha", "--forget"],
+    );
+    assert!(
+        forgot.status.success(),
+        "{}",
+        String::from_utf8_lossy(&forgot.stderr)
+    );
+    settle(beta.path());
+    drop(held);
+    assert!(sweep(alpha.path()).status.success());
+    settle(alpha.path());
+
+    // Then: beta wrote no forget, so once it pulls, alpha's #1234 is live
+    // on beta too.
+    let entries = Ledger::at(beta.path().join("ledger").join(FORK))
+        .entries()
+        .expect("read beta's ledger");
+    assert!(
+        entries.iter().all(|entry| entry.statement.is_none()),
+        "{entries:?}"
+    );
+    let (code, report) = status_on(&lab, beta.path());
+    assert_eq!(code, Some(0), "{report}");
+    let row = report["branches"]
+        .as_array()
+        .expect("branch rows")
+        .iter()
+        .find(|row| row["name"] == "feat/alpha")
+        .unwrap_or_else(|| panic!("no feat/alpha row: {report}"));
+    assert_eq!(row["pr"]["number"], 1234, "row was: {row}");
+}
+
+#[test]
+fn a_depends_or_a_forget_is_refused_when_the_ledger_cannot_be_pulled() {
+    // Given: a machine whose ledger remote cannot be reached.
+    let lab = lab::Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let home = shared_home(&lab);
+    share(home.path(), "alpha", Path::new("/nonexistent/ledger.git"));
+
+    // When / Then: each write that replaces what it read is refused, says
+    // why, and writes nothing.
+    for args in [
+        &["--text", "depends", "feat/alpha", "--on", "demo#1"][..],
+        &["--text", "track", "feat/alpha", "--forget"][..],
+    ] {
+        let refused = knives_on(&lab, home.path(), args);
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        assert_eq!(refused.status.code(), Some(3), "{args:?}: {stderr}");
+        assert!(
+            stderr.contains("could not pull the ledger from origin"),
+            "{args:?}: {stderr}"
+        );
+        assert!(
+            Ledger::at(home.path().join("ledger").join(FORK))
+                .entries()
+                .expect("read the ledger")
+                .is_empty(),
+            "{args:?} wrote an entry"
+        );
+    }
+
+    // And: stating a pull request, which replaces nothing it read, still
+    // records.
+    let tracked = knives_on(
+        &lab,
+        home.path(),
+        &["--text", "track", "feat/alpha", "--pr", "7"],
+    );
+    assert!(
+        tracked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&tracked.stderr)
+    );
+    settle(home.path());
+}
+
+#[test]
 fn a_handed_off_sweep_whose_ledger_remote_stalls_lets_the_lock_go_within_a_bound() {
     // Given: a managed fork on a machine whose ledger remote accepts the
     // connection and never answers.

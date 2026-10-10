@@ -288,7 +288,34 @@ fn finish_claim_gate(
     }
 }
 
+/// Pull `fork`'s ledger before a write that replaces or erases what it read,
+/// and say why it will not write when the pull failed.
+///
+/// A `depends` statement replaces the whole list and a forget erases the
+/// statement before it, and the newest statement wins on every machine; built
+/// from a ledger missing another machine's newer statement, either would
+/// replace that statement everywhere, as a release write would check its drop
+/// guard against the wrong cut. So, like a release write, it refuses rather
+/// than write from what this machine happens to have.
+fn pulled_before_replacing(fork: &Fork<'_>, what: &str) -> bool {
+    let problems = knives::ledger_sweep::pull(&[&fork.upstream]).problems_for(&fork.upstream);
+    for problem in &problems {
+        eprintln!("!! {problem}");
+    }
+    if !problems.is_empty() {
+        eprintln!(
+            "{what} not recorded: it replaces what the ledger states, and another machine's \
+             newer statement may be among what could not be pulled"
+        );
+    }
+    problems.is_empty()
+}
+
 /// State or forget which pull request a branch belongs to.
+///
+/// A forget pulls first ([`pulled_before_replacing`]) and writes a statement
+/// only when one is stated: a forget of nothing would erase, everywhere, a
+/// statement another machine made that this one has not seen.
 #[allow(
     clippy::too_many_arguments,
     reason = "the fork, the branch, the three ways to state its pull request and the cwd binding are independent inputs"
@@ -302,6 +329,9 @@ pub(crate) fn run_track(
     bound: Option<&UpstreamName>,
 ) -> anyhow::Result<Exit> {
     let target = &BranchTarget::new(fork.upstream.clone(), branch.clone());
+    if forget && !pulled_before_replacing(fork, "the forget") {
+        return Ok(Exit::Incomplete);
+    }
     // Opened for update to hold the lock while the statement is read and the next
     // one appended: a concurrent `track` then reads this one's statement rather
     // than the one before it. Nothing here writes the state file.
@@ -318,24 +348,23 @@ pub(crate) fn run_track(
         (
             "stated as having no upstream pull request".to_owned(),
             stated,
-            Statement {
+            Some(Statement {
                 kind: StatementKind::ForkOnly,
                 value: Some("stated with `knives track --fork-only`".to_owned()),
-            },
+            }),
         )
     } else if forget {
-        (
-            if stated.is_some() {
-                "pull request statement forgotten".to_owned()
-            } else {
-                "no pull request statement to forget".to_owned()
-            },
-            stated,
-            Statement {
-                kind: StatementKind::Pull,
-                value: None,
-            },
-        )
+        match stated {
+            Some(_) => (
+                "pull request statement forgotten".to_owned(),
+                stated,
+                Some(Statement {
+                    kind: StatementKind::Pull,
+                    value: None,
+                }),
+            ),
+            None => ("no pull request statement to forget".to_owned(), None, None),
+        }
     } else {
         let Some(number) = pr else {
             eprintln!("give --pr <number>, or --forget");
@@ -344,14 +373,14 @@ pub(crate) fn run_track(
         (
             format!("stated as #{number}"),
             Some(number),
-            Statement {
+            Some(Statement {
                 kind: StatementKind::Pull,
                 value: Some(number.to_string()),
-            },
+            }),
         )
     };
     scribe_for(fork, bound)?.record(&Draft {
-        statement: Some(statement),
+        statement,
         ..Draft::event(Some(branch.as_str()), text.clone(), stamped)
     })?;
     drop(store);
@@ -411,9 +440,13 @@ pub(crate) fn run_depends(
             number: written.number,
         });
     }
+    if !pulled_before_replacing(fork, "the dependency") {
+        return Ok(Exit::Incomplete);
+    }
     // Held while the list is read and the next statement appended, so two
-    // concurrent `depends` each add to the other's list rather than racing.
-    // Nothing here writes the state file.
+    // concurrent `depends` on this machine each add to the other's list
+    // rather than racing; the pull above brought in what other machines
+    // stated. Nothing here writes the state file.
     let store = Store::open_for_update(default_state_path(), &[&fork.upstream])?;
     let required = with_requirements(&store.dependencies(target), &requirements);
     let pr = store.tracked_pull(target);

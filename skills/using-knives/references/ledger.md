@@ -279,16 +279,22 @@ two machines both committed stays (`repeated_transitions`,
 `src/commands/sync.rs`).
 
 A command that decides something from the ledger pulls it first: `status`,
-`sync`, `audit`, `pushed`, and each `release` command that reads the ledger:
-the plan, `cut`, `rebase`, `include`, `drop`, `advance`, and `members` without
-a `REF`, which reads it to name the release in hand. `members <REF>`,
-`--carries`, `--census` and `reap` read no ledger and pull nothing. A pull that
-fails, a fork whose `ledger` no git directory here reaches, and a setup the
-sweep refuses are each a problem on the report, naming what failed. A report
-still answers from the entries this machine has, and exits `3`. A release write
-refuses on any of them, because its drop guard checks against the newest
-recorded cut and a stale ledger would check against the wrong one. `status`
-also notes how many of a fork's entries the remote lacks, and names
+`sync`, `audit`, `pushed`, each `release` command that reads the ledger (the
+plan, `cut`, `rebase`, `include`, `drop`, `advance`, and `members` without a
+`REF`, which reads it to name the release in hand), `depends`, and `track
+--forget`. `members <REF>`, `--carries`, `--census` and `reap` read no ledger
+and pull nothing. A pull that fails, a fork whose `ledger` no git directory
+here reaches, and a setup the sweep refuses are each a problem on the report,
+naming what failed. A report still answers from the entries this machine has,
+and exits `3`. A release write refuses on any of them, because its drop guard
+checks against the newest recorded cut and a stale ledger would check against
+the wrong one. So do `depends` and `track --forget`, each exiting `3` having
+written nothing: a `depends` statement replaces the whole list and a forget
+erases the statement before it, so built from a ledger missing another
+machine's newer statement, either would replace that statement on every
+machine. A forget with nothing stated after the pull writes no statement.
+`status` also notes how many of a fork's entries the remote lacks, and names
 `ledger-sweep.log` when the last sweep failed. `notch`, `start`, `finish`,
-`track` and `depends` do not pull: they read a statement only to stamp their
-entry with a pull request number.
+`track --pr` and `track --fork-only` do not pull: they replace nothing they
+read, and read a statement only to stamp their entry with a pull request
+number.

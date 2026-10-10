@@ -151,3 +151,8 @@ across forks. Status reports dependencies not yet merged. Preserve their require
 content when editing a release: retaining a dependent while dropping its
 requirement can ship a broken composition. This is an explicit relationship,
 not a dependency inferred from similar branch names.
+
+`depends` and `track --forget` pull the shared ledger first and refuse, exit `3`,
+when the pull fails: each replaces what the ledger states for the branch, and
+another machine's newer statement may be what could not be pulled
+([sharing](ledger.md#sharing-between-machines)).
