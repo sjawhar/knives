@@ -622,17 +622,12 @@ fn pass(destination: &Destination, tally: &mut Tally) -> Vec<String> {
         Ok(lock) => lock,
         Err(error) => return vec![failed(error.into())],
     };
-    let repository = &destination.repository;
-    let mut failures = Vec::new();
-    match ledger_git::fetch(repository, &destination.remote)
-        .and_then(|refs| ledger_git::materialise(repository, &refs))
-    {
-        Ok(done) => {
-            tally.pulled += done.written;
-            tally.skipped = Some(done.skipped);
-        }
-        Err(error) => failures.push(failed(error.into())),
+    let (done, pulled) = pull_held(destination);
+    if let Some(done) = done {
+        tally.pulled += done.written;
+        tally.skipped = Some(done.skipped);
     }
+    let mut failures: Vec<String> = pulled.into_iter().map(failed).collect();
     match send(destination, tally) {
         Ok(problems) => failures.extend(
             problems
@@ -642,6 +637,41 @@ fn pass(destination: &Destination, tally: &mut Tally) -> Vec<String> {
         Err(error) => failures.push(failed(error)),
     }
     failures
+}
+
+/// Fetch every peer's ref and write in what the root lacks; what that
+/// wrote, when it could write, and each failure. The caller holds the
+/// destination's transport lock.
+///
+/// A failed fetch still writes in what the copies it fetched carry. git
+/// refuses only the ref that would move backward and takes every other
+/// machine's, so one peer whose ref was rewritten keeps out that peer's new
+/// entries alone, and says so, rather than every machine's, on every pull,
+/// until someone repairs it. A fetch that reached nothing leaves the copies
+/// as they were, which carry nothing the root lacks.
+fn pull_held(destination: &Destination) -> (Option<ledger_git::Materialised>, Vec<SweepError>) {
+    let repository = &destination.repository;
+    let mut failures = Vec::new();
+    let refs = match ledger_git::fetch(repository, &destination.remote) {
+        Ok(refs) => refs,
+        Err(error) => {
+            failures.push(error.into());
+            match ledger_git::fetched(repository, &destination.remote) {
+                Ok(refs) => refs,
+                Err(error) => {
+                    failures.push(error.into());
+                    return (None, failures);
+                }
+            }
+        }
+    };
+    match ledger_git::materialise(repository, &refs) {
+        Ok(done) => (Some(done), failures),
+        Err(error) => {
+            failures.push(error.into());
+            (None, failures)
+        }
+    }
 }
 
 /// Commit what is new and push what the remote lacks; what kept the
@@ -916,23 +946,22 @@ pub fn pull_at(root: &Path, forks: &[&UpstreamName]) -> Pulled {
         if carried.is_empty() {
             continue;
         }
-        match pull_one(&destination) {
-            Ok(done) => {
-                pulled.skipped.insert(destination.describe(), done.skipped);
-            }
-            Err(error) => {
-                let problem = format!(
-                    "could not pull the ledger from {}: {error}; this answers from the entries \
-                     this machine has",
-                    destination.describe()
-                );
-                for fork in carried {
-                    pulled
-                        .problems
-                        .entry(fork.clone())
-                        .or_default()
-                        .push(problem.clone());
-                }
+        let (done, failures) = pull_one(&destination);
+        if let Some(done) = done {
+            pulled.skipped.insert(destination.describe(), done.skipped);
+        }
+        for error in failures {
+            let problem = format!(
+                "could not pull the ledger from {}: {error}; this answers from the entries \
+                 this machine has",
+                destination.describe()
+            );
+            for fork in &carried {
+                pulled
+                    .problems
+                    .entry((*fork).clone())
+                    .or_default()
+                    .push(problem.clone());
             }
         }
         pulled.destinations.push(destination);
@@ -940,10 +969,12 @@ pub fn pull_at(root: &Path, forks: &[&UpstreamName]) -> Pulled {
     pulled
 }
 
-fn pull_one(destination: &Destination) -> Result<ledger_git::Materialised, SweepError> {
-    let _transport = FileLock::acquire(&destination.transport_lock(), LockWait::TRANSPORT)?;
-    let refs = ledger_git::fetch(&destination.repository, &destination.remote)?;
-    Ok(ledger_git::materialise(&destination.repository, &refs)?)
+/// [`pull_held`] under the destination's transport lock.
+fn pull_one(destination: &Destination) -> (Option<ledger_git::Materialised>, Vec<SweepError>) {
+    match FileLock::acquire(&destination.transport_lock(), LockWait::TRANSPORT) {
+        Ok(_transport) => pull_held(destination),
+        Err(error) => (None, vec![error.into()]),
+    }
 }
 
 /// Start `knives ledger sweep` detached, and return without waiting for it.

@@ -369,20 +369,31 @@ pub fn pending(repository: &Repository, machine: &str) -> Result<Pending, GitErr
 /// `remote` is a configured remote's name, because it names the namespace the
 /// copies live in. The refspec is not forced: a machine only ever moves its own
 /// ref forward, so a copy that would move backward means some writer rewrote
-/// history, and the fetch fails rather than follow it. `--prune` drops the copy
-/// of a ref the remote no longer has, so the report is the remote's refs now.
+/// history, and the fetch fails rather than follow it. git still takes every
+/// other machine's ref, so after a failed fetch [`fetched`] holds each copy
+/// it could update, and the refused one as an earlier fetch left it. Not
+/// `--quiet`: what git prints on its way to failing is the one place it names
+/// the ref it refused. `--prune` drops the copy of a ref the remote no longer
+/// has, so the report is the remote's refs now.
 pub fn fetch(repository: &Repository, remote: &str) -> Result<Vec<MachineRef>, GitError> {
     let remote = ref_component("remote", remote)?;
-    let namespace = format!("{FETCHED}{remote}/");
     transport(repository.git().args([
         "fetch",
-        "--quiet",
         "--no-tags",
         "--no-write-fetch-head",
         "--prune",
         remote,
-        &format!("{OWN}*:{namespace}*"),
+        &format!("{OWN}*:{FETCHED}{remote}/*"),
     ]))?;
+    fetched(repository, remote)
+}
+
+/// Every machine's ref as this repository's copy from `remote` holds it now,
+/// by machine name: what the last [`fetch`] took, or this machine's own
+/// [`push`] sent.
+pub fn fetched(repository: &Repository, remote: &str) -> Result<Vec<MachineRef>, GitError> {
+    let remote = ref_component("remote", remote)?;
+    let namespace = format!("{FETCHED}{remote}/");
     Ok(references(repository, &[&namespace])?
         .into_iter()
         .filter_map(|(name, commit)| {

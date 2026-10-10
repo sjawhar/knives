@@ -1376,6 +1376,65 @@ fn a_recreated_checkout_sweeping_as_an_existing_machine_is_refused_and_pushes_no
     );
 }
 
+#[test]
+fn a_peer_ref_that_moved_backward_keeps_out_only_that_machines_entries() {
+    // Given: three machines sharing one ledger remote. beta has fetched
+    // gamma's ref at its second commit, and then the remote's copy of
+    // gamma's ref was put back to its first, as a force-push or a deleted
+    // and re-pushed ref leaves it.
+    let lab = lab::Lab::new();
+    let alpha = shared_home(&lab);
+    let beta = second_machine(alpha.path());
+    let gamma = second_machine(alpha.path());
+    let (_remote_dir, remote) = bare_remote();
+    let alpha_root = share(alpha.path(), "alpha", &remote);
+    share(beta.path(), "beta", &remote);
+    let gamma_root = share(gamma.path(), "gamma", &remote);
+    append(&gamma_root, FORK, 1);
+    assert!(sweep(gamma.path()).status.success());
+    let first = git_in(&remote, &["rev-parse", "refs/knives/gamma"]).expect("gamma's ref");
+    append(&gamma_root, FORK, 1);
+    assert!(sweep(gamma.path()).status.success());
+    assert!(sweep(beta.path()).status.success());
+    git_in(&remote, &["update-ref", "refs/knives/gamma", &first]).expect("rewind gamma's ref");
+    let beta_entries = || {
+        Ledger::at(beta.path().join("ledger").join(FORK))
+            .entries()
+            .expect("beta's ledger")
+            .len()
+    };
+    assert_eq!(beta_entries(), 2);
+
+    // When: alpha sends an entry, and beta sweeps.
+    append(&alpha_root, FORK, 1);
+    assert!(sweep(alpha.path()).status.success());
+    let swept = sweep(beta.path());
+
+    // Then: the sweep fails naming gamma's ref, and writes in alpha's entry.
+    let stdout = String::from_utf8_lossy(&swept.stdout);
+    assert_eq!(swept.status.code(), Some(3), "{stdout}");
+    let report: serde_json::Value = serde_json::from_str(&stdout).expect("a sweep report");
+    assert!(
+        report["problems"].to_string().contains("refs/knives/gamma"),
+        "{report}"
+    );
+    assert_eq!(report["destinations"][0]["pulled"], 1, "{report}");
+    assert_eq!(beta_entries(), 3);
+
+    // When: alpha sends another, and beta's status pulls before it reports.
+    append(&alpha_root, FORK, 1);
+    assert!(sweep(alpha.path()).status.success());
+    let (code, status) = status_on(&lab, beta.path());
+
+    // Then: that pull writes it in too, and says what it could not fetch.
+    assert_eq!(code, Some(3), "{status}");
+    assert!(
+        status["problems"].to_string().contains("refs/knives/gamma"),
+        "{status}"
+    );
+    assert_eq!(beta_entries(), 4);
+}
+
 /// The transition both machines see in these tests.
 const MERGED: &str = "#7 merged";
 

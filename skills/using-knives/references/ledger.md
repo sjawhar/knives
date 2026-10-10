@@ -269,7 +269,11 @@ writes. A failed fetch does not stop the commit and push, and neither does an
 entry that does not parse: it is a problem naming the file, left out of the
 repeated-transition check, and, when it is this machine's own and not yet
 committed, left out of the commit too, since every machine that took it would
-fail to read that fork; the rest of the fork's entries go. A fetch or push still
+fail to read that fork; the rest of the fork's entries go. A machine's ref only
+moves forward, so a fetch refuses a peer's ref that moved backward on the
+remote (rewritten, or deleted and pushed again); it still takes every other
+machine's, and their entries are written in, while the refused ref is a problem
+naming it until someone restores it. A fetch or push still
 running after a minute is ended, and an HTTP transfer that stalls fails sooner,
 so a remote that stops answering is a failure like any other rather than a wait
 with no end. It passes again
