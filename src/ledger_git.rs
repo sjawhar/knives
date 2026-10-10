@@ -658,24 +658,14 @@ fn ref_component<'a>(role: &'static str, name: &'a str) -> Result<&'a str, GitEr
 
 /// `fork` when it names exactly two directories in the ledger root,
 /// `<owner>/<name>` as [`crate::config::RepoEntry::upstream_name`] spells a
-/// fork's repository, neither of them `.`, `..` or a `.git`.
+/// fork's repository ([`crate::ledger::is_fork_directory`]), neither of them
+/// `.`, `..` or a `.git`.
 ///
 /// A fork whose upstream is a filesystem path is kept under its one-component
 /// registry key, and names no repository a destination could share, so a
 /// name of one component is refused here as surely as one of three.
 fn fork_directory(fork: UpstreamName) -> Result<UpstreamName, GitError> {
-    let plain = |part: &str| {
-        !part.is_empty()
-            && part != "."
-            && part != ".."
-            && !part.contains('\\')
-            && !part.eq_ignore_ascii_case(".git")
-    };
-    let two = fork
-        .as_str()
-        .split_once('/')
-        .is_some_and(|(owner, name)| plain(owner) && plain(name) && !name.contains('/'));
-    if two {
+    if crate::ledger::is_fork_directory(fork.as_str()) {
         Ok(fork)
     } else {
         Err(GitError::Fork {

@@ -564,19 +564,15 @@ pub fn load(path: &Path) -> Result<Registry, ConfigError> {
             });
         }
     };
-    for name in registry.repos.keys() {
-        if name.is_empty()
-            || name == "."
-            || name == ".."
-            || Path::new(name).is_absolute()
-            || name.contains('/')
-            || name.contains('\\')
-        {
+    for (name, entry) in &registry.repos {
+        // A fork whose upstream is a filesystem path is kept under its key.
+        if !crate::ledger::is_ledger_component(name) {
             return Err(ConfigError::Invalid {
                 path: path.to_owned(),
                 detail: format!("repository key {name:?} is not a safe path component"),
             });
         }
+        checked_upstream_name(name, entry, path)?;
     }
     reject_shared_upstreams(&registry, path)?;
     reject_shared_upstream_names(&registry, path)?;
@@ -737,6 +733,29 @@ fn checked_ledger(name: &str, entry: &RepoEntry, path: &Path) -> Result<(), Conf
         ));
     }
     Ok(())
+}
+
+/// A fork whose upstream is a forge URL is kept under its `<owner>/<name>`
+/// ([`RepoEntry::upstream_name`]), so that name is a path below the ledger
+/// root: one that is not two plain directory names would put the fork's
+/// entries outside the root, or in the git directory over it. A path
+/// upstream is kept under its key, which [`load`] has already checked.
+fn checked_upstream_name(name: &str, entry: &RepoEntry, path: &Path) -> Result<(), ConfigError> {
+    let Some(slug) = crate::remote_url::remote_slug(&entry.upstream) else {
+        return Ok(());
+    };
+    if crate::ledger::is_fork_directory(slug) {
+        return Ok(());
+    }
+    Err(ConfigError::Invalid {
+        path: path.to_owned(),
+        detail: format!(
+            "[repos.{name}] upstream {} names the repository {slug:?}, and a fork is kept in \
+             the ledger directory <owner>/<name> of its upstream: neither may be empty, `.`, \
+             `..` or `.git`, or hold a `\\`",
+            entry.upstream
+        ),
+    })
 }
 
 /// A blank term is a substring of every line, so the scan would report every
@@ -947,6 +966,33 @@ release = "https://example.invalid/releases.git"
 
         let error = load(&write(dir.path(), text)).unwrap_err().to_string();
         assert!(error.contains("../escape"), "was: {error}");
+    }
+
+    #[test]
+    fn an_upstream_whose_name_leaves_the_ledger_root_is_rejected() {
+        // The ledger keeps a fork under its upstream's `<owner>/<name>`, so
+        // the URL spells a directory: `..` would leave the ledger root, and
+        // `.git` would reach into the git directory of the repository over it.
+        let dir = tempfile::tempdir().unwrap();
+        for upstream in [
+            "https://forge.example/../..",
+            "https://forge.example/acme/..",
+            "https://forge.example/.git/hooks",
+            "git@forge.example:acme/.GIT.git",
+            "https://forge.example/acme/back\\slash",
+        ] {
+            let text = format!("[repos.tool]\nupstream = \"{upstream}\"\norigin = \"o\"\n")
+                .replace('\\', "\\\\");
+            let error = load(&write(dir.path(), &text)).unwrap_err().to_string();
+            assert!(
+                error.contains("[repos.tool] upstream") && error.contains("ledger directory"),
+                "{upstream}: {error}"
+            );
+        }
+        // A repository name may still start with a dot, as a forge allows.
+        let text =
+            "[repos.tool]\nupstream = \"https://forge.example/acme/.github\"\norigin = \"o\"\n";
+        assert!(load(&write(dir.path(), text)).is_ok());
     }
 
     #[test]

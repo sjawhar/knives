@@ -56,6 +56,30 @@ pub fn default_ledger_path(repo: &UpstreamName) -> PathBuf {
     default_ledger_root().join(repo.as_str())
 }
 
+/// Whether `part` can be one directory name on the way to a fork's ledger.
+///
+/// Not empty, `.` or `..`, holding no `/` or `\`, and not a `.git` in any
+/// letter case, which is where the git directory over the root lives.
+pub fn is_ledger_component(part: &str) -> bool {
+    !part.is_empty()
+        && part != "."
+        && part != ".."
+        && !part.contains(['/', '\\'])
+        && !part.eq_ignore_ascii_case(".git")
+}
+
+/// Whether `name` is `<owner>/<name>`, each an [`is_ledger_component`].
+///
+/// That is the directory a fork whose upstream is a forge repository is
+/// kept under, and the one shape a ledger repository carries. The registry
+/// refuses an upstream whose name is not one, and so does
+/// [`crate::ledger_git::Repository::new`].
+pub fn is_fork_directory(name: &str) -> bool {
+    name.split_once('/').is_some_and(|(owner, repository)| {
+        is_ledger_component(owner) && is_ledger_component(repository)
+    })
+}
+
 /// Set once this process has appended an entry; see [`appended`].
 static APPENDED: AtomicBool = AtomicBool::new(false);
 
