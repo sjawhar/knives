@@ -145,30 +145,10 @@ pub fn rename_workspaces(
     former: &crate::store::FormerNames,
 ) -> Result<Vec<RenamedSighting>, SeenError> {
     let _lock = FileLock::acquire(path, LockWait::CLAIM)?;
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(source) => {
-            return Err(SeenError::Read {
-                path: path.to_owned(),
-                source,
-            });
-        }
+    let Some(mut seen) = read_to_migrate(path)? else {
+        return Ok(Vec::new());
     };
-    let mut seen: Seen = serde_json::from_str(&text).map_err(|source| SeenError::Parse {
-        path: path.to_owned(),
-        source,
-    })?;
-    let moves: Vec<RenamedSighting> = seen
-        .workspaces
-        .keys()
-        .filter_map(|key| {
-            crate::store::renamed(former, key, '/').map(|to| RenamedSighting {
-                from: key.clone(),
-                to,
-            })
-        })
-        .collect();
+    let moves = workspace_renames(&seen, former);
     if moves.is_empty() {
         return Ok(moves);
     }
@@ -188,6 +168,51 @@ pub fn rename_workspaces(
         path: path.to_owned(),
     })?;
     Ok(moves)
+}
+
+/// What [`rename_workspaces`] would move, read without the lock and written
+/// nowhere: for `knives ledger migrate --dry-run`.
+pub fn workspace_renames_at(
+    path: &Path,
+    former: &crate::store::FormerNames,
+) -> Result<Vec<RenamedSighting>, SeenError> {
+    Ok(read_to_migrate(path)?
+        .map(|seen| workspace_renames(&seen, former))
+        .unwrap_or_default())
+}
+
+/// The sidecar at `path`; `None` when there is none. One that cannot be read
+/// is an error, not an empty file, so the migration says so.
+fn read_to_migrate(path: &Path) -> Result<Option<Seen>, SeenError> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(SeenError::Read {
+                path: path.to_owned(),
+                source,
+            });
+        }
+    };
+    serde_json::from_str(&text)
+        .map(Some)
+        .map_err(|source| SeenError::Parse {
+            path: path.to_owned(),
+            source,
+        })
+}
+
+/// Each workspace sighting in `seen` keyed by a former name, with its key now.
+fn workspace_renames(seen: &Seen, former: &crate::store::FormerNames) -> Vec<RenamedSighting> {
+    seen.workspaces
+        .keys()
+        .filter_map(|key| {
+            crate::store::renamed(former, key, '/').map(|to| RenamedSighting {
+                from: key.clone(),
+                to,
+            })
+        })
+        .collect()
 }
 
 /// Whether the RFC 3339 `one` is later than `other`; a stamp that does not

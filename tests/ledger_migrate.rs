@@ -612,3 +612,178 @@ fn a_state_key_whose_new_name_is_taken_is_left_and_holds_the_statements() {
     assert_eq!(state["pull_states"]["acme/demo#7"], "MERGED", "{state}");
     assert_eq!(state["tracked_pulls"]["demo/feat/x"], 7, "{state}");
 }
+
+#[test]
+fn a_statement_the_ledger_already_makes_otherwise_is_reported_and_not_written() {
+    // Given: a second machine's state file stating feat/beta is #7, and a
+    // ledger on which another machine has since stated #8 for it.
+    let home = tempfile::tempdir().expect("config home");
+    std::fs::write(
+        home.path().join("state.json"),
+        r#"{"tracked_pulls": {"b-repo/feat/beta": 7, "b-repo/feat/gamma": 9}}"#,
+    )
+    .expect("write state");
+    lab::state_on_ledger(
+        home.path(),
+        "b-repo",
+        "feat/beta",
+        StatementKind::Pull,
+        Some("8"),
+    );
+
+    // When: it migrates.
+    let out = migrate(home.path());
+
+    // Then: the contradicted statement is a problem naming both values and
+    // is not written; the uncontested one is; and the state file drops its
+    // maps, since the ledger's statement is the one every machine reads.
+    assert_eq!(out.status.code(), Some(3), "{out:?}");
+    let migrated: serde_json::Value = serde_json::from_slice(&out.stdout).expect("JSON report");
+    assert_eq!(migrated["wrote"], 1, "{migrated}");
+    let problems = migrated["problems"].to_string();
+    assert!(
+        problems.contains("b-repo/feat/beta")
+            && problems.contains("\\\"8\\\"")
+            && problems.contains("\\\"7\\\""),
+        "{migrated}"
+    );
+    assert_eq!(
+        statements(&entries(home.path(), "b-repo")),
+        [
+            (
+                "feat/beta".to_owned(),
+                StatementKind::Pull,
+                Some("8".to_owned())
+            ),
+            (
+                "feat/gamma".to_owned(),
+                StatementKind::Pull,
+                Some("9".to_owned())
+            ),
+        ]
+    );
+    let state: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(home.path().join("state.json")).expect("read state"),
+    )
+    .expect("state JSON");
+    assert!(state.get("tracked_pulls").is_none(), "{state}");
+}
+
+#[test]
+fn a_migration_whose_ledger_cannot_be_pulled_writes_no_statement() {
+    // Given: a state file with a statement for a fork that shares its
+    // ledger, through a repository this machine cannot reach.
+    let home = tempfile::tempdir().expect("config home");
+    std::fs::write(
+        home.path().join("repos.toml"),
+        "[repos.b-repo]\nupstream = \"https://forge.invalid/acme/b-repo\"\n\
+         origin = \"https://forge.invalid/ours/b-repo\"\nledger = \"acme/ledger\"\n",
+    )
+    .expect("write registry");
+    std::fs::write(
+        home.path().join("state.json"),
+        r#"{"tracked_pulls": {"b-repo/feat/beta": 7}}"#,
+    )
+    .expect("write state");
+    let root = home.path().join("ledger");
+    lab::git_repository(&root, &[("origin", "https://forge.invalid/acme/ledger")]);
+    lab::git_output(
+        &root,
+        [
+            "config",
+            "url./nonexistent/ledger.git.insteadOf",
+            "https://forge.invalid/acme/ledger",
+        ],
+    );
+    lab::git_output(&root, ["config", "knives.machine", "alpha"]);
+
+    // When: it migrates.
+    let out = migrate(home.path());
+
+    // Then: it says it could not pull, writes nothing, and the state file
+    // keeps the statement for a run that can pull.
+    assert_eq!(out.status.code(), Some(3), "{out:?}");
+    let migrated: serde_json::Value = serde_json::from_slice(&out.stdout).expect("JSON report");
+    assert_eq!(migrated["wrote"], 0, "{migrated}");
+    assert!(
+        migrated["problems"]
+            .to_string()
+            .contains("could not pull the ledger from origin"),
+        "{migrated}"
+    );
+    assert!(entries(home.path(), "acme/b-repo").is_empty());
+    let state: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(home.path().join("state.json")).expect("read state"),
+    )
+    .expect("state JSON");
+    assert_eq!(state["tracked_pulls"]["b-repo/feat/beta"], 7, "{state}");
+}
+
+/// Every file under `home`, by path relative to it, with its bytes.
+fn snapshot(home: &Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+    let mut files = std::collections::BTreeMap::new();
+    let mut pending = vec![home.to_owned()];
+    while let Some(directory) = pending.pop() {
+        for dirent in std::fs::read_dir(&directory).expect("read a directory") {
+            let path = dirent.expect("dirent").path();
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                let bytes = std::fs::read(&path).expect("read a file");
+                files.insert(
+                    path.strip_prefix(home).expect("under home").to_owned(),
+                    bytes,
+                );
+            }
+        }
+    }
+    files
+}
+
+#[test]
+fn a_dry_run_reports_what_a_migration_would_do_and_changes_nothing() {
+    // Given: everything an older knives left: ledger directories and state
+    // keys under registry keys, workspace sightings, and statements.
+    let home = renaming_home();
+    std::fs::write(home.path().join("state.json"), ALIASED_STATE).expect("write state");
+    std::fs::write(home.path().join("seen.json"), ALIASED_SEEN).expect("write sightings");
+    note(home.path(), "demo", "2026-01-01T00:00:00Z", "about demo");
+    note(home.path(), "acme", "2026-01-01T00:00:01Z", "about acme");
+    let before = snapshot(home.path());
+
+    // When: a dry run asks what the migration would do.
+    let dry = lab::knives_command(
+        home.path(),
+        home.path(),
+        home.path(),
+        &["--json", "ledger", "migrate", "--dry-run"],
+    )
+    .env("KNIVES_OWNER", "ses_migrate")
+    .output()
+    .expect("run knives ledger migrate --dry-run");
+
+    // Then: not one file under the config home changed, appeared or went.
+    assert_eq!(
+        snapshot(home.path()),
+        before,
+        "{}",
+        String::from_utf8_lossy(&dry.stdout)
+    );
+    let would = report(&dry);
+    assert_eq!(would["dry_run"], true, "{would}");
+
+    // And: the real run then does exactly what the dry run said it would.
+    let did = report(&migrate(home.path()));
+    for field in [
+        "moved",
+        "renamed",
+        "sightings",
+        "wrote",
+        "already",
+        "problems",
+    ] {
+        assert_eq!(would[field], did[field], "{field}: {would} vs {did}");
+    }
+    assert_eq!(did["wrote"], 2, "{did}");
+    assert!(did.get("dry_run").is_none(), "{did}");
+}

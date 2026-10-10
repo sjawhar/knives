@@ -259,6 +259,14 @@ impl Store {
         Self::read(path, &[], Some(lock))
     }
 
+    /// The state file an older knives left, as [`Store::open_to_migrate`]
+    /// opens it but without its lock, for `knives ledger migrate --dry-run`:
+    /// a look that writes nothing, not even the lock file. A save is atomic,
+    /// so what it reads is one whole state file.
+    pub fn open_to_preview_migration(path: PathBuf) -> Result<Self, StoreError> {
+        Self::read(path, &[], None)
+    }
+
     /// Refuse a state file an older knives left: one still holding the maps
     /// it kept branch statements in, or still keeping a fork under the
     /// registry key it was known by before each fork was named after its

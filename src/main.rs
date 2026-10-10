@@ -256,7 +256,7 @@ fn dispatch() -> anyhow::Result<Exit> {
         }
         Command::Ledger { action } => match action {
             LedgerAction::Sweep => ledger::run_sweep(output),
-            LedgerAction::Migrate => ledger::run_migrate(output),
+            LedgerAction::Migrate { dry_run } => ledger::run_migrate(output, dry_run),
         },
         Command::Preflight { repo } => {
             let Some(fork) = grounded(&loaded)?.one_fork(repo.as_deref())? else {

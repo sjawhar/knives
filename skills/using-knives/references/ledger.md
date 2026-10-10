@@ -176,21 +176,29 @@ neither still answer: `repos`, `consumers`, `pr`, `register`, `gh`, and the
    `claims` (and each claim's `repo`), `comment_marks`, `pull_states`,
    `foreign_parents`, `conventions` and `pull_heads`. A key whose new name is
    taken is a problem, and both stay.
-3. Writes one statement entry per `state.json` statement (an event reading
-   `migrated from state.json: …`), recording each dependency's required fork
-   under its upstream name, then drops the four maps. It reads nothing out of
-   existing entries' prose, and it skips a statement some entry about that
-   branch already makes with the same kind and value. If this or an earlier
-   step left a problem, `state.json` keeps every statement.
+3. Pulls each fork's ledger, then writes one statement entry per `state.json`
+   statement (an event reading `migrated from state.json: …`), recording each
+   dependency's required fork under its upstream name, then drops the four
+   maps. It reads nothing out of existing entries' prose, and it skips a
+   statement some entry about that branch already makes with the same kind and
+   value. A fork whose pull fails has none of its statements written. A
+   statement the ledger already makes otherwise for that branch and kind
+   (another machine migrated first, or stated it since) is a problem naming
+   both values, and is not written: the ledger's is what every machine reads.
+   If this or an earlier step left a problem other than such a contradiction,
+   `state.json` keeps every statement.
 4. Renames each `seen.json` sighting `<registry key>/<workspace>` to
    `<upstream name>/<workspace>`, keeping the later stamp where both exist. An
    unreadable `seen.json` is a problem, but does not hold back the statements.
 
 Any problem exits `3`, and a run after the fix finishes the job; a run with
-nothing left to move changes nothing. TOON and JSON share its report:
+nothing left to move changes nothing. `knives ledger migrate --dry-run`
+reports the same, as what it would move, rename and write, and changes
+nothing: it takes no lock, pulls nothing and writes no file, so it counts
+from the ledger this machine has. TOON and JSON share its report:
 
 ```text
-{moved: [{from, to}], renamed: [{map, from, to}], sightings: [{from, to}],
+{dry_run?, moved: [{from, to}], renamed: [{map, from, to}], sightings: [{from, to}],
  wrote, already, problems}
 ```
 

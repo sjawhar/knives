@@ -43,6 +43,19 @@ pub enum StatementKind {
     Unknown,
 }
 
+impl std::fmt::Display for StatementKind {
+    /// The kind as an entry file spells it.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Pull => "pull",
+            Self::ForkOnly => "fork-only",
+            Self::Superseded => "superseded",
+            Self::Depends => "depends",
+            Self::Unknown => "unknown",
+        })
+    }
+}
+
 /// One statement about an entry's subject.
 ///
 /// Written into an entry file as one inline table:
@@ -175,8 +188,14 @@ impl Statements {
             })
     }
 
+    /// The live statement of `kind` about `branch`: `Some(None)` for a live
+    /// forget, `None` when none of that kind was ever made.
+    pub fn stated(&self, branch: &str, kind: StatementKind) -> Option<Option<&str>> {
+        self.live.get(branch)?.get(&kind).map(Option::as_deref)
+    }
+
     fn value(&self, branch: &str, kind: StatementKind) -> Option<&str> {
-        self.live.get(branch)?.get(&kind)?.as_deref()
+        self.stated(branch, kind).flatten()
     }
 }
 

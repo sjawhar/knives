@@ -125,9 +125,12 @@ pub fn render(report: &Report) -> String {
     lines.join("\n")
 }
 
-/// What a migration did.
+/// What a migration did, or under `--dry-run` would do.
 #[derive(Debug, Default, serde::Serialize)]
 pub struct Migrated {
+    /// Whether this is what a migration would do, with nothing changed.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub dry_run: bool,
     /// Each fork's ledger directory moved from its registry key to its
     /// upstream name, by path.
     pub moved: Vec<Moved>,
@@ -141,14 +144,24 @@ pub struct Migrated {
     /// Statements the ledger already carried: an entry about that branch
     /// states that kind with that value.
     pub already: usize,
-    /// What could not be migrated. The state file keeps every statement
-    /// while a statement could not reach the ledger, so a run after the fix
-    /// finishes the job.
+    /// What could not be migrated, and each statement the ledger already
+    /// states otherwise. The state file keeps every statement while one
+    /// could not reach the ledger, so a run after the fix finishes the job.
     pub problems: Vec<String>,
     /// Whether the state file kept its statements because one of them could
     /// not reach the ledger.
     #[serde(skip)]
     pub statements_held: bool,
+    /// Each entry file this run wrote, to flush before the state file drops
+    /// the statements.
+    #[serde(skip)]
+    written: Vec<PathBuf>,
+    /// Each statement not written because the ledger states otherwise: a
+    /// problem, but not one that holds the statements back, since the
+    /// ledger's is the statement every machine reads and a rerun would meet
+    /// the same one.
+    #[serde(skip)]
+    contradicted: Vec<String>,
 }
 
 /// One ledger directory a migration moved.
@@ -159,7 +172,7 @@ pub struct Moved {
 }
 
 /// Move what an older knives left at `state_path` and `root` onto what this
-/// one reads.
+/// one reads; with `dry_run`, only say what that would do.
 ///
 /// Every fork the state file and the ledger keep under a registry key an
 /// older knives named it by moves to its upstream name, as the registry
@@ -172,10 +185,17 @@ pub struct Moved {
 /// that migrated first) is the same entry, and the old copy goes; one with
 /// other bytes is a problem, and both stay for a person to look at.
 ///
-/// Nothing is parsed out of existing prose: an event reading `stated as #1234`
-/// states nothing, and only an entry's `statement` field is a statement. A
-/// statement some entry about that branch already makes, kind and value alike,
-/// is skipped, so a second run writes nothing. A dependency an older knives
+/// Before writing a fork's statements, its ledger is pulled
+/// ([`ledger_sweep::pull_at`]): another machine may have migrated, or
+/// stated something since, and every statement it writes is the newest. A
+/// fork whose pull fails has none of its statements written, and the state
+/// file keeps them. Nothing is parsed out of existing prose: an event
+/// reading `stated as #1234` states nothing, and only an entry's
+/// `statement` field is a statement. A statement some entry about that
+/// branch already makes, kind and value alike, is skipped, so a second run
+/// writes nothing. One the ledger states otherwise for that branch and kind
+/// is a problem and is not written: the ledger's is what every machine
+/// reads, and this state file's copy is older. A dependency an older knives
 /// recorded by a registry key is written under that fork's upstream name.
 ///
 /// The state file is held for update throughout, so no other writer saves
@@ -188,12 +208,30 @@ pub struct Moved {
 /// sightings in `seen.json` beside the state file move last, under its own
 /// lock: a sidecar that cannot be read is a problem, but one that never
 /// holds the statements back.
-pub fn migrate(state_path: &Path, root: &Path, owner: &str) -> anyhow::Result<Migrated> {
-    let mut store = Store::open_to_migrate(state_path.to_owned())?;
+///
+/// A dry run takes no lock, pulls nothing and writes nothing, so it answers
+/// from the ledger this machine has: a statement another machine made that
+/// a pull would bring in is not counted.
+pub fn migrate(
+    state_path: &Path,
+    root: &Path,
+    owner: &str,
+    dry_run: bool,
+) -> anyhow::Result<Migrated> {
+    let mut store = if dry_run {
+        Store::open_to_preview_migration(state_path.to_owned())?
+    } else {
+        Store::open_to_migrate(state_path.to_owned())?
+    };
     let former = crate::config::load(&state_path.with_file_name("repos.toml"))?.former_names();
-    let mut migrated = Migrated::default();
+    let mut migrated = Migrated {
+        dry_run,
+        ..Migrated::default()
+    };
     if former.keys().any(|name| holds_entries(&root.join(name))) {
-        let _sweep = FileLock::acquire(root, crate::lock::LockWait::TRANSPORT)?;
+        let _sweep = (!dry_run)
+            .then(|| FileLock::acquire(root, crate::lock::LockWait::TRANSPORT))
+            .transpose()?;
         move_ledgers(root, &former, &mut migrated);
     }
     let (renamed, refused) = store.rename_forks(&former);
@@ -222,32 +260,62 @@ pub fn migrate(state_path: &Path, root: &Path, owner: &str) -> anyhow::Result<Mi
             )),
         }
     }
-    let mut written = Vec::new();
+    if !dry_run {
+        let forks: Vec<&UpstreamName> = by_repo.keys().collect();
+        let pulled = ledger_sweep::pull_at(root, &forks);
+        by_repo.retain(|repo, statements| {
+            let problems = pulled.failed_for(repo);
+            migrated.problems.extend(problems.iter().map(|problem| {
+                format!(
+                    "{repo}: {} statement(s) not migrated, since the ledger they would join \
+                         could not be pulled: {problem}",
+                    statements.len()
+                )
+            }));
+            problems.is_empty()
+        });
+    }
     for (repo, statements) in by_repo {
+        let moved_in: Vec<PathBuf> = migrated
+            .moved
+            .iter()
+            .filter(|moved| dry_run && moved.to == root.join(repo.as_str()))
+            .map(|moved| moved.from.clone())
+            .collect();
         let ledger = Ledger::at(root.join(repo.as_str()));
         let scribe = Scribe::unanchored(ledger, repo, owner.to_owned());
-        migrate_repo(&scribe, &statements, &mut migrated, &mut written);
+        migrate_repo(&scribe, &moved_in, &statements, &mut migrated);
     }
     migrated.statements_held = !migrated.problems.is_empty();
-    if !migrated.statements_held
-        && let Err(error) = flush(root, &written, &migrated.moved)
-    {
-        migrated.problems.push(format!(
-            "flushing the migrated entries to disk: {error}; state.json keeps every statement"
-        ));
-        migrated.statements_held = true;
-    }
-    let dropped = !migrated.statements_held && store.drop_legacy_statements();
-    if dropped || !migrated.renamed.is_empty() {
-        store.save()?;
+    if !dry_run {
+        if !migrated.statements_held
+            && let Err(error) = flush(root, &migrated.written, &migrated.moved)
+        {
+            migrated.problems.push(format!(
+                "flushing the migrated entries to disk: {error}; state.json keeps every statement"
+            ));
+            migrated.statements_held = true;
+        }
+        let dropped = !migrated.statements_held && store.drop_legacy_statements();
+        if dropped || !migrated.renamed.is_empty() {
+            store.save()?;
+        }
     }
     drop(store);
-    match crate::seen::rename_workspaces(&state_path.with_file_name("seen.json"), &former) {
+    let seen = state_path.with_file_name("seen.json");
+    let sightings = if dry_run {
+        crate::seen::workspace_renames_at(&seen, &former)
+    } else {
+        crate::seen::rename_workspaces(&seen, &former)
+    };
+    match sightings {
         Ok(sightings) => migrated.sightings = sightings,
         Err(error) => migrated
             .problems
             .push(format!("workspace sightings not renamed: {error}")),
     }
+    let contradicted = std::mem::take(&mut migrated.contradicted);
+    migrated.problems.extend(contradicted);
     Ok(migrated)
 }
 
@@ -279,7 +347,8 @@ fn with_current_names(legacy: LegacyStatement, former: &FormerNames) -> LegacySt
 }
 
 /// Move each `<root>/<former name>/` entry file into `<root>/<upstream name>/`,
-/// recording each directory that moved and each file that could not.
+/// recording each directory that moved and each file that could not; under
+/// a dry run, record what would, and move nothing.
 ///
 /// Forks are moved in name order. A former name can be the owner directory
 /// another fork's upstream name now lives in (`acme` the fork beside
@@ -292,10 +361,12 @@ fn move_ledgers(root: &Path, former: &FormerNames, migrated: &mut Migrated) {
             continue;
         }
         let to = root.join(now.as_str());
-        match move_entries(&from, &to) {
+        match move_entries(&from, &to, migrated.dry_run) {
             Ok(clashes) if clashes.is_empty() => {
-                // Empty now unless it holds another fork's directory.
-                let _ = std::fs::remove_dir(&from);
+                if !migrated.dry_run {
+                    // Empty now unless it holds another fork's directory.
+                    let _ = std::fs::remove_dir(&from);
+                }
                 migrated.moved.push(Moved { from, to });
             }
             Ok(clashes) => migrated.problems.extend(clashes.into_iter().map(|file| {
@@ -316,8 +387,11 @@ fn move_ledgers(root: &Path, former: &FormerNames, migrated: &mut Migrated) {
 
 /// The regular files directly in `from` moved into `to`, created if absent;
 /// the names left behind because `to` holds a different file under them.
-fn move_entries(from: &Path, to: &Path) -> std::io::Result<Vec<std::ffi::OsString>> {
-    std::fs::create_dir_all(to)?;
+/// With `dry_run`, only the names that would be left behind.
+fn move_entries(from: &Path, to: &Path, dry_run: bool) -> std::io::Result<Vec<std::ffi::OsString>> {
+    if !dry_run {
+        std::fs::create_dir_all(to)?;
+    }
     let mut clashes = Vec::new();
     let mut files: Vec<_> = std::fs::read_dir(from)?
         .map(|dirent| dirent.map(|dirent| (dirent.file_name(), dirent.file_type())))
@@ -329,12 +403,12 @@ fn move_entries(from: &Path, to: &Path) -> std::io::Result<Vec<std::ffi::OsStrin
         }
         let (source, destination) = (from.join(&file), to.join(&file));
         if destination.exists() {
-            if std::fs::read(&source)? == std::fs::read(&destination)? {
-                std::fs::remove_file(&source)?;
-            } else {
+            if std::fs::read(&source)? != std::fs::read(&destination)? {
                 clashes.push(file);
+            } else if !dry_run {
+                std::fs::remove_file(&source)?;
             }
-        } else {
+        } else if !dry_run {
             std::fs::rename(&source, &destination)?;
         }
     }
@@ -376,15 +450,21 @@ fn flush(root: &Path, written: &[PathBuf], moved: &[Moved]) -> std::io::Result<(
 }
 
 /// One repository's statements onto its ledger, read once; each entry file
-/// written is added to `written`.
+/// written is kept in `migrated`. A dry run reads the ledger as the moves
+/// would leave it, the entries still in each directory of `moved_in` with
+/// its own, and writes nothing.
 fn migrate_repo(
     scribe: &Scribe,
+    moved_in: &[PathBuf],
     statements: &[(String, LegacyStatement)],
     migrated: &mut Migrated,
-    written: &mut Vec<PathBuf>,
 ) {
-    let entries = match scribe.ledger().entries() {
-        Ok(entries) => entries,
+    let read = std::iter::once(scribe.ledger().clone())
+        .chain(moved_in.iter().map(|path| Ledger::at(path.clone())))
+        .map(|ledger| ledger.entries())
+        .collect::<Result<Vec<_>, _>>();
+    let entries: Vec<_> = match read {
+        Ok(entries) => entries.into_iter().flatten().collect(),
         Err(error) => {
             migrated.problems.push(format!(
                 "{}: {} statement(s) not migrated: {error}",
@@ -414,6 +494,21 @@ fn migrate_repo(
             migrated.already += 1;
             continue;
         }
+        if let Some(stated) = live.stated(branch, legacy.statement.kind) {
+            migrated.contradicted.push(format!(
+                "{}/{branch}: state.json says {} {:?}, but the ledger already states {:?}; not \
+                 written, since the ledger's is what every machine reads",
+                scribe.repo(),
+                legacy.statement.kind,
+                legacy.statement.value.as_deref().unwrap_or_default(),
+                stated.unwrap_or_default()
+            ));
+            continue;
+        }
+        if migrated.dry_run {
+            migrated.wrote += 1;
+            continue;
+        }
         let pr = stated_pull
             .get(branch.as_str())
             .copied()
@@ -425,7 +520,7 @@ fn migrate_repo(
         match scribe.record_to(&draft) {
             Ok((_, path)) => {
                 migrated.wrote += 1;
-                written.push(path);
+                migrated.written.push(path);
             }
             Err(error) => migrated
                 .problems
@@ -452,13 +547,15 @@ fn history(statement: &Statement) -> String {
     format!("migrated from state.json: {said}")
 }
 
-/// Migrate the state file and ledger beside the registry, and report it.
-pub fn run_migrate(output: Output) -> anyhow::Result<Exit> {
+/// Migrate the state file and ledger beside the registry, or with `dry_run`
+/// say what that would do, and report it.
+pub fn run_migrate(output: Output, dry_run: bool) -> anyhow::Result<Exit> {
     let owner = crate::commands::claim::current_identity(None)?.owner;
     let migrated = migrate(
         &crate::store::default_state_path(),
         &crate::ledger::default_ledger_root(),
         &owner,
+        dry_run,
     )?;
     if let Some(payload) = crate::cli::machine_payload(output, &migrated)? {
         println!("{payload}");
@@ -473,31 +570,44 @@ pub fn run_migrate(output: Output) -> anyhow::Result<Exit> {
 }
 
 pub fn render_migrated(migrated: &Migrated) -> String {
-    let mut lines: Vec<String> =
-        migrated
-            .moved
-            .iter()
-            .map(|moved| {
-                format!(
-                    "ledger: moved {} to {}",
-                    moved.from.display(),
-                    moved.to.display()
-                )
-            })
-            .chain(migrated.renamed.iter().map(|renamed| {
-                format!(
-                    "state: renamed {} {} to {}",
-                    renamed.map, renamed.from, renamed.to
-                )
-            }))
-            .chain(migrated.sightings.iter().map(|renamed| {
-                format!("seen: renamed workspace {} to {}", renamed.from, renamed.to)
-            }))
-            .collect();
+    let (moved, renamed, wrote) = if migrated.dry_run {
+        ("would move", "would rename", "would write")
+    } else {
+        ("moved", "renamed", "wrote")
+    };
+    let mut lines: Vec<String> = migrated
+        .moved
+        .iter()
+        .map(|each| {
+            format!(
+                "ledger: {moved} {} to {}",
+                each.from.display(),
+                each.to.display()
+            )
+        })
+        .chain(
+            migrated
+                .renamed
+                .iter()
+                .map(|each| format!("state: {renamed} {} {} to {}", each.map, each.from, each.to)),
+        )
+        .chain(
+            migrated
+                .sightings
+                .iter()
+                .map(|each| format!("seen: {renamed} workspace {} to {}", each.from, each.to)),
+        )
+        .collect();
     lines.push(format!(
-        "ledger: wrote {} statement(s); {} already on the ledger",
+        "ledger: {wrote} {} statement(s); {} already on the ledger",
         migrated.wrote, migrated.already
     ));
+    if migrated.dry_run {
+        lines.push(
+            "ledger: a dry run: nothing was changed, and the ledger was not pulled first"
+                .to_owned(),
+        );
+    }
     if migrated.statements_held {
         lines.push(
             "ledger: state.json keeps its statements until every one migrates; run again \

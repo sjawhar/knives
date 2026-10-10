@@ -465,7 +465,17 @@ pub enum LedgerAction {
     /// entry about that branch already makes, kind and value alike, is
     /// skipped, so a second run writes nothing. `state.json` keeps every
     /// statement until all of them reach the ledger.
-    Migrate,
+    ///
+    /// Each fork's ledger is pulled first, and a fork whose pull fails has
+    /// none of its statements written. A statement the ledger already makes
+    /// otherwise for that branch is reported and not written: the ledger's is
+    /// what every machine reads.
+    Migrate {
+        /// Report what it would move, rename and write, and change nothing:
+        /// no lock, no pull, no write.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]

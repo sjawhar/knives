@@ -771,15 +771,27 @@ pub struct Pulled {
     root: PathBuf,
     destinations: Vec<Destination>,
     problems: BTreeMap<UpstreamName, Vec<String>>,
+    /// [`Destinations::unclaimed`]: a problem for every fork asked about.
+    unclaimed: Vec<String>,
     /// By destination, what each pull that succeeded left unread
     /// ([`ledger_git::Materialised::skipped`]).
     skipped: BTreeMap<String, BTreeMap<String, usize>>,
 }
 
 impl Pulled {
-    /// The problems a report about `fork` carries: a pull that failed, or
-    /// destinations that could not be read.
+    /// The problems a report about `fork` carries: a pull that failed,
+    /// destinations that could not be read, and directories of entries no
+    /// fork is kept under.
     pub fn problems_for(&self, fork: &UpstreamName) -> Vec<String> {
+        self.failed_for(fork)
+            .into_iter()
+            .chain(self.unclaimed.iter().cloned())
+            .collect()
+    }
+
+    /// [`Pulled::problems_for`] without the unclaimed directories: why
+    /// `fork`'s ledger here may lack what another machine has.
+    pub fn failed_for(&self, fork: &UpstreamName) -> Vec<String> {
         self.problems.get(fork).cloned().unwrap_or_default()
     }
 
@@ -883,13 +895,7 @@ pub fn pull_at(root: &Path, forks: &[&UpstreamName]) -> Pulled {
             return pulled;
         }
     };
-    for fork in forks {
-        pulled
-            .problems
-            .entry((*fork).clone())
-            .or_default()
-            .extend(unclaimed.iter().cloned());
-    }
+    pulled.unclaimed = unclaimed;
     let asked: BTreeSet<&UpstreamName> = forks.iter().copied().collect();
     for (fork, ledger) in &unreached {
         if asked.contains(fork) {
