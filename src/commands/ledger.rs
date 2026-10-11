@@ -300,11 +300,10 @@ pub fn migrate(
     owner: &str,
     dry_run: bool,
 ) -> anyhow::Result<Migrated> {
-    let mut store = if dry_run {
-        Store::open_to_preview_migration(state_path.to_owned())?
-    } else {
-        Store::open_to_migrate(state_path.to_owned())?
-    };
+    let lock = (!dry_run)
+        .then(|| FileLock::acquire(state_path, crate::lock::LockWait::CLAIM))
+        .transpose()?;
+    let mut store = Store::open_to_migrate(state_path.to_owned(), lock)?;
     let registry = registry?;
     let former = registry.former_names();
     let mut migrated = Migrated {
@@ -325,11 +324,80 @@ pub fn migrate(
             refused.map, refused.from, refused.to
         )
     }));
-    let mut by_repo = by_fork(
+    let by_repo = by_fork(
         store.legacy_statements()?,
         &registry,
         &mut migrated.problems,
     );
+    migrate_statements(root, &registry, owner, by_repo, &mut migrated);
+    migrated.statements_held = !migrated.problems.is_empty();
+    if !dry_run {
+        if !migrated.statements_held
+            && let Err(error) = flush(root, &migrated.written, &migrated.moved)
+        {
+            migrated.problems.push(format!(
+                "flushing the migrated entries to disk: {error}; state.json keeps every statement"
+            ));
+            migrated.statements_held = true;
+        }
+        let dropped = !migrated.statements_held && store.drop_legacy_statements();
+        if dropped || !migrated.renamed.is_empty() {
+            store.save()?;
+        }
+    }
+    drop(store);
+    let seen = state_path.with_file_name("seen.json");
+    let sightings = if dry_run {
+        crate::seen::plan_workspace_renames(&seen, &former).map(|plan| plan.moves)
+    } else {
+        crate::seen::rename_workspaces(&seen, &former)
+    };
+    match sightings {
+        Ok(sightings) => migrated.sightings = sightings,
+        Err(error) => migrated
+            .problems
+            .push(format!("workspace sightings not renamed: {error}")),
+    }
+    let contradicted = std::mem::take(&mut migrated.contradicted);
+    migrated.problems.extend(contradicted);
+    Ok(migrated)
+}
+
+/// Move each former name's entry files into the directory its fork is kept
+/// under now, or under a dry run only plan it, recording in `migrated` each
+/// directory that moved and each file that could not ([`plan_moves`]).
+fn move_ledgers(root: &Path, former: &FormerNames, migrated: &mut Migrated) {
+    for MovePlan { from, to, files } in plan_moves(root, former) {
+        let clashes = files.and_then(|files| {
+            if migrated.dry_run {
+                Ok(clashes_among(files))
+            } else {
+                apply_move(&from, &to, files)
+            }
+        });
+        record_move(from, to, clashes, migrated);
+    }
+}
+
+/// Write each fork's statements in `by_repo` onto its ledger, or under a
+/// dry run only count what would be written ([`plan_statements`]).
+///
+/// A real run pulls first, and a fork whose pull fails is held back; a dry
+/// run holds back each fork a pull would refuse before it fetched
+/// ([`ledger_sweep::unpullable`]), and reads each fork's ledger as the
+/// moves it planned would leave it.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the ledger root, the registry, the author, the statements and the report are independent inputs"
+)]
+fn migrate_statements(
+    root: &Path,
+    registry: &Registry,
+    owner: &str,
+    mut by_repo: BTreeMap<UpstreamName, Vec<(String, LegacyStatement)>>,
+    migrated: &mut Migrated,
+) {
+    let dry_run = migrated.dry_run;
     let forks: Vec<&UpstreamName> = by_repo.keys().collect();
     let unpulled: BTreeMap<UpstreamName, Vec<String>> = if dry_run {
         let moved: Vec<&Path> = migrated
@@ -337,9 +405,9 @@ pub fn migrate(
             .iter()
             .map(|moved| moved.from.as_path())
             .collect();
-        ledger_sweep::unpullable(root, &registry, &forks, &moved)
+        ledger_sweep::unpullable(root, registry, &forks, &moved)
     } else {
-        let pulled = ledger_sweep::pull_at(root, &registry, &forks);
+        let pulled = ledger_sweep::pull_at(root, registry, &forks);
         forks
             .iter()
             .map(|fork| ((*fork).clone(), pulled.failed_for(fork)))
@@ -365,39 +433,13 @@ pub fn migrate(
             .collect();
         let ledger = Ledger::at(root.join(repo.as_str()));
         let scribe = Scribe::unanchored(ledger, repo, owner.to_owned());
-        migrate_repo(&scribe, &moved_in, &statements, &mut migrated);
-    }
-    migrated.statements_held = !migrated.problems.is_empty();
-    if !dry_run {
-        if !migrated.statements_held
-            && let Err(error) = flush(root, &migrated.written, &migrated.moved)
-        {
-            migrated.problems.push(format!(
-                "flushing the migrated entries to disk: {error}; state.json keeps every statement"
-            ));
-            migrated.statements_held = true;
-        }
-        let dropped = !migrated.statements_held && store.drop_legacy_statements();
-        if dropped || !migrated.renamed.is_empty() {
-            store.save()?;
+        let writes = plan_statements(&scribe, &moved_in, &statements, migrated);
+        if dry_run {
+            migrated.wrote += writes.len();
+        } else {
+            write_statements(&scribe, writes, migrated);
         }
     }
-    drop(store);
-    let seen = state_path.with_file_name("seen.json");
-    let sightings = if dry_run {
-        crate::seen::workspace_renames_at(&seen, &former)
-    } else {
-        crate::seen::rename_workspaces(&seen, &former)
-    };
-    match sightings {
-        Ok(sightings) => migrated.sightings = sightings,
-        Err(error) => migrated
-            .problems
-            .push(format!("workspace sightings not renamed: {error}")),
-    }
-    let contradicted = std::mem::take(&mut migrated.contradicted);
-    migrated.problems.extend(contradicted);
-    Ok(migrated)
 }
 
 /// Each of `statements` filed under the name its fork is kept under, its
@@ -476,70 +518,130 @@ fn with_current_names(legacy: LegacyStatement, former: &FormerNames) -> LegacySt
     }
 }
 
-/// Move each `<root>/<former name>/` entry file into `<root>/<upstream name>/`,
-/// recording each directory that moved and each file that could not; under
-/// a dry run, record what would, and move nothing.
-///
-/// Forks are moved in name order. A former name can be the owner directory
-/// another fork's upstream name now lives in (`acme` the fork beside
-/// `acme/demo`): its entry files are the regular files directly inside it,
-/// and the directories there are other forks', left alone.
-fn move_ledgers(root: &Path, former: &FormerNames, migrated: &mut Migrated) {
-    for (name, now) in unmigrated(root, former) {
-        let from = root.join(name);
-        let to = root.join(now.as_str());
-        match move_entries(&from, &to, migrated.dry_run) {
-            Ok(clashes) if clashes.is_empty() => {
-                if !migrated.dry_run {
-                    // Empty now unless it holds another fork's directory.
-                    let _ = std::fs::remove_dir(&from);
-                }
-                migrated.moved.push(Moved { from, to });
-            }
-            Ok(clashes) => migrated.problems.extend(clashes.into_iter().map(|file| {
-                format!(
-                    "{}: not moved, because {} holds a different entry under that name",
-                    from.join(&file).display(),
-                    to.join(&file).display()
-                )
-            })),
-            Err(error) => migrated.problems.push(format!(
-                "moving {} to {}: {error}",
-                from.display(),
-                to.display()
-            )),
-        }
-    }
+/// What moving one former name's entry files into the directory its fork is
+/// kept under now would do ([`plan_moves`]).
+struct MovePlan {
+    from: PathBuf,
+    to: PathBuf,
+    /// Each regular file directly in `from`, in name order, with what `to`
+    /// holds under its name; or why `from` could not be read.
+    files: std::io::Result<Vec<(std::ffi::OsString, Placement)>>,
 }
 
-/// The regular files directly in `from` moved into `to`, created if absent;
-/// the names left behind because `to` holds a different file under them.
-/// With `dry_run`, only the names that would be left behind.
-fn move_entries(from: &Path, to: &Path, dry_run: bool) -> std::io::Result<Vec<std::ffi::OsString>> {
-    if !dry_run {
-        std::fs::create_dir_all(to)?;
-    }
-    let mut clashes = Vec::new();
+/// What a fork's directory holds under the name of an entry file moving in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Placement {
+    /// Nothing: the file moves in.
+    Free,
+    /// The same bytes, pulled from a machine that migrated first: the same
+    /// entry, so the old copy goes.
+    Same,
+    /// Other bytes: both stay for a person to look at.
+    Different,
+}
+
+/// How each `<root>/<former name>/` entry file would move into
+/// `<root>/<upstream name>/`, read and moved nowhere, in name order: each
+/// fork's plan is read when the iterator reaches it, so a real run reads a
+/// fork just before it moves it.
+///
+/// A former name can be the owner directory another fork's upstream name now
+/// lives in (`acme` the fork beside `acme/demo`): its entry files are the
+/// regular files directly inside it, and the directories there are other
+/// forks', left alone. Moving one fork's files writes only into its own
+/// upstream name's directory, which no other plan reads.
+fn plan_moves<'a>(root: &'a Path, former: &'a FormerNames) -> impl Iterator<Item = MovePlan> + 'a {
+    unmigrated(root, former).map(|(name, now)| {
+        let (from, to) = (root.join(name), root.join(now.as_str()));
+        let files = placements(&from, &to);
+        MovePlan { from, to, files }
+    })
+}
+
+/// Each regular file directly in `from`, in name order, with what `to`
+/// holds under its name.
+fn placements(from: &Path, to: &Path) -> std::io::Result<Vec<(std::ffi::OsString, Placement)>> {
     let mut files: Vec<_> = std::fs::read_dir(from)?
         .map(|dirent| dirent.map(|dirent| (dirent.file_name(), dirent.file_type())))
         .collect::<Result<_, _>>()?;
     files.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut placed = Vec::new();
     for (file, kind) in files {
         if !kind?.is_file() {
             continue;
         }
-        let (source, destination) = (from.join(&file), to.join(&file));
-        if destination.exists() {
-            if std::fs::read(&source)? != std::fs::read(&destination)? {
-                clashes.push(file);
-            } else if !dry_run {
-                std::fs::remove_file(&source)?;
-            }
-        } else if !dry_run {
-            std::fs::rename(&source, &destination)?;
+        let destination = to.join(&file);
+        let placement = if !destination.exists() {
+            Placement::Free
+        } else if std::fs::read(from.join(&file))? == std::fs::read(&destination)? {
+            Placement::Same
+        } else {
+            Placement::Different
+        };
+        placed.push((file, placement));
+    }
+    Ok(placed)
+}
+
+/// The names a planned move leaves behind, because `to` holds a different
+/// file under them.
+fn clashes_among(files: Vec<(std::ffi::OsString, Placement)>) -> Vec<std::ffi::OsString> {
+    files
+        .into_iter()
+        .filter(|(_, placement)| *placement == Placement::Different)
+        .map(|(file, _)| file)
+        .collect()
+}
+
+/// Carry out a planned move of `files` from `from` into `to`, created if
+/// absent; the names left behind ([`clashes_among`]). A move that leaves
+/// nothing behind removes `from`, empty now unless it holds another fork's
+/// directory.
+fn apply_move(
+    from: &Path,
+    to: &Path,
+    files: Vec<(std::ffi::OsString, Placement)>,
+) -> std::io::Result<Vec<std::ffi::OsString>> {
+    std::fs::create_dir_all(to)?;
+    let mut clashes = Vec::new();
+    for (file, placement) in files {
+        let source = from.join(&file);
+        match placement {
+            Placement::Free => std::fs::rename(&source, to.join(&file))?,
+            Placement::Same => std::fs::remove_file(&source)?,
+            Placement::Different => clashes.push(file),
         }
     }
+    if clashes.is_empty() {
+        let _ = std::fs::remove_dir(from);
+    }
     Ok(clashes)
+}
+
+/// Record in `migrated` what a move from `from` to `to` did, or under a dry
+/// run would do: the directory moved, each file left behind, or why it could
+/// not be moved.
+fn record_move(
+    from: PathBuf,
+    to: PathBuf,
+    clashes: std::io::Result<Vec<std::ffi::OsString>>,
+    migrated: &mut Migrated,
+) {
+    match clashes {
+        Ok(clashes) if clashes.is_empty() => migrated.moved.push(Moved { from, to }),
+        Ok(clashes) => migrated.problems.extend(clashes.into_iter().map(|file| {
+            format!(
+                "{}: not moved, because {} holds a different entry under that name",
+                from.join(&file).display(),
+                to.join(&file).display()
+            )
+        })),
+        Err(error) => migrated.problems.push(format!(
+            "moving {} to {}: {error}",
+            from.display(),
+            to.display()
+        )),
+    }
 }
 
 /// Flush to disk each entry in `written`, then every directory holding one or
@@ -576,16 +678,20 @@ fn flush(root: &Path, written: &[PathBuf], moved: &[Moved]) -> std::io::Result<(
     Ok(())
 }
 
-/// One repository's statements onto its ledger, read once; each entry file
-/// written is kept in `migrated`. A dry run reads the ledger as the moves
-/// would leave it, the entries still in each directory of `moved_in` with
-/// its own, and writes nothing.
-fn migrate_repo(
+/// One statement [`plan_statements`] decided to write: its branch, the
+/// statement, and the pull request its entry carries.
+type Write<'s> = (&'s str, &'s Statement, Option<u64>);
+
+/// Which of one repository's statements its ledger, read once, does not
+/// carry yet; each it already carries or contradicts is counted in
+/// `migrated`. A dry run reads the ledger as the moves would leave it, the
+/// entries still in each directory of `moved_in` with its own.
+fn plan_statements<'s>(
     scribe: &Scribe,
     moved_in: &[PathBuf],
-    statements: &[(String, LegacyStatement)],
+    statements: &'s [(String, LegacyStatement)],
     migrated: &mut Migrated,
-) {
+) -> Vec<Write<'s>> {
     // An entry or statement this knives reads only in part states nothing
     // here, so it neither carries nor contradicts a statement being moved;
     // every report of the fork names it.
@@ -601,7 +707,7 @@ fn migrate_repo(
                 scribe.repo(),
                 statements.len()
             ));
-            return;
+            return Vec::new();
         }
     };
     let carried: BTreeSet<(&str, &Statement)> = entries
@@ -619,6 +725,7 @@ fn migrate_repo(
         })
         .collect();
     let live = Statements::from_entries(&entries);
+    let mut writes = Vec::new();
     for (branch, legacy) in statements {
         if carried.contains(&(branch.as_str(), &legacy.statement)) {
             migrated.already += 1;
@@ -635,17 +742,22 @@ fn migrate_repo(
             ));
             continue;
         }
-        if migrated.dry_run {
-            migrated.wrote += 1;
-            continue;
-        }
         let pr = stated_pull
             .get(branch.as_str())
             .copied()
             .or_else(|| live.pull(branch));
+        writes.push((branch.as_str(), &legacy.statement, pr));
+    }
+    writes
+}
+
+/// Append one statement entry per planned write; each entry file written is
+/// kept in `migrated`, and each that could not be is a problem.
+fn write_statements(scribe: &Scribe, writes: Vec<Write<'_>>, migrated: &mut Migrated) {
+    for (branch, statement, pr) in writes {
         let draft = Draft {
-            statement: Some(legacy.statement.clone()),
-            ..Draft::event(Some(branch), history(&legacy.statement), pr)
+            statement: Some(statement.clone()),
+            ..Draft::event(Some(branch), history(statement), pr)
         };
         match scribe.record_to(&draft) {
             Ok((_, path)) => {

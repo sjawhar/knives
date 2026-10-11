@@ -148,41 +148,60 @@ pub fn rename_workspaces(
     former: &crate::config::FormerNames,
 ) -> Result<Vec<RenamedSighting>, SeenError> {
     let _lock = FileLock::acquire(path, LockWait::CLAIM)?;
-    let Some(mut seen) = read_to_migrate(path)? else {
-        return Ok(Vec::new());
-    };
-    let moves = workspace_renames(&seen, former);
-    if moves.is_empty() {
-        return Ok(moves);
-    }
-    for moved in &moves {
-        let Some(at) = seen.workspaces.remove(&moved.from) else {
-            continue;
-        };
-        let kept = seen
-            .workspaces
-            .get(&moved.to)
-            .filter(|existing| newer(existing, &at))
-            .cloned()
-            .unwrap_or(at);
-        seen.workspaces.insert(moved.to.clone(), kept);
-    }
-    save(path, &seen).map_err(|source| SeenError::Write {
-        path: path.to_owned(),
-        source,
-    })?;
-    Ok(moves)
+    plan_workspace_renames(path, former)?.apply(path)
 }
 
-/// What [`rename_workspaces`] would move, read without the lock and written
-/// nowhere: for `knives ledger migrate --dry-run`.
-pub fn workspace_renames_at(
+/// What [`rename_workspaces`] moves in the sidecar at `path`, read and
+/// written nowhere: a dry run reports [`SightingRenames::moves`], and a
+/// real one, holding the sidecar's lock, applies it.
+pub fn plan_workspace_renames(
     path: &Path,
     former: &crate::config::FormerNames,
-) -> Result<Vec<RenamedSighting>, SeenError> {
-    Ok(read_to_migrate(path)?
-        .map(|seen| workspace_renames(&seen, former))
-        .unwrap_or_default())
+) -> Result<SightingRenames, SeenError> {
+    let seen = read_to_migrate(path)?;
+    let moves = seen
+        .as_ref()
+        .map(|seen| workspace_renames(seen, former))
+        .unwrap_or_default();
+    Ok(SightingRenames { seen, moves })
+}
+
+/// The sidecar as [`plan_workspace_renames`] read it, with each sighting
+/// that moves.
+#[derive(Debug)]
+pub struct SightingRenames {
+    seen: Option<Seen>,
+    pub moves: Vec<RenamedSighting>,
+}
+
+impl SightingRenames {
+    /// Write the sidecar at `path` with every sighting in [`Self::moves`]
+    /// moved; the moves. Nothing is written when nothing moves.
+    fn apply(self, path: &Path) -> Result<Vec<RenamedSighting>, SeenError> {
+        let Some(mut seen) = self.seen else {
+            return Ok(Vec::new());
+        };
+        if self.moves.is_empty() {
+            return Ok(self.moves);
+        }
+        for moved in &self.moves {
+            let Some(at) = seen.workspaces.remove(&moved.from) else {
+                continue;
+            };
+            let kept = seen
+                .workspaces
+                .get(&moved.to)
+                .filter(|existing| newer(existing, &at))
+                .cloned()
+                .unwrap_or(at);
+            seen.workspaces.insert(moved.to.clone(), kept);
+        }
+        save(path, &seen).map_err(|source| SeenError::Write {
+            path: path.to_owned(),
+            source,
+        })?;
+        Ok(self.moves)
+    }
 }
 
 /// The sidecar at `path`; `None` when there is none. One that cannot be read

@@ -970,7 +970,7 @@ mod tests {
                 "was: {message}"
             );
         }
-        let mut migrating = Store::open_to_migrate(path.clone()).unwrap();
+        let mut migrating = Store::open_to_migrate(path.clone(), None).unwrap();
         assert!(migrating.drop_legacy_statements());
         migrating.save().unwrap();
         drop(migrating);

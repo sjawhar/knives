@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{State, Store, StoreError};
 use crate::config::FormerNames;
-use crate::lock::{FileLock, LockWait};
+use crate::lock::FileLock;
 use crate::statement::{Statement, StatementKind};
 
 /// The maps an older knives kept branch statements in, each keyed
@@ -94,19 +94,19 @@ pub fn renamed(former: &FormerNames, text: &str, separator: char) -> Option<Stri
 }
 
 impl Store {
-    /// [`Store::open_for_update`] for `knives ledger migrate` alone: it opens
-    /// the state file an older knives left, which every other open refuses.
-    pub fn open_to_migrate(path: PathBuf) -> Result<Self, StoreError> {
-        let lock = FileLock::acquire(&path, LockWait::CLAIM)?;
-        Self::read(path, &[], Some(lock))
-    }
-
-    /// The state file an older knives left, as [`Store::open_to_migrate`]
-    /// opens it but without its lock, for `knives ledger migrate --dry-run`:
-    /// a look that writes nothing, not even the lock file. A save is atomic,
-    /// so what it reads is one whole state file.
-    pub fn open_to_preview_migration(path: PathBuf) -> Result<Self, StoreError> {
-        Self::read(path, &[], None)
+    /// The state file an older knives left, which every other open refuses,
+    /// for `knives ledger migrate`.
+    ///
+    /// A real migration passes the lock it took on the state file, held until
+    /// the store drops, so no other writer saves over it between the read and
+    /// the save. A dry run passes none and saves nothing: a look that writes
+    /// nothing, not even the lock file. A save is atomic, so what it reads is
+    /// one whole state file.
+    pub(crate) fn open_to_migrate(
+        path: PathBuf,
+        lock: Option<FileLock>,
+    ) -> Result<Self, StoreError> {
+        Self::read(path, &[], lock)
     }
 
     /// Every branch statement an older knives kept in the state file, in map
@@ -304,7 +304,7 @@ mod tests {
             r#"{"tracked_pulls":{"a-repo/feat/alpha":4545},"fork_only":{"a-repo/ci":"why"},"superseded":{"a-repo/old":"feat/alpha"},"dependencies":{"a-repo/feat/alpha":["a-repo#7","b#9"],"a-repo/none":[]}}"#,
         )
         .unwrap();
-        let mut subject = Store::open_to_migrate(path).unwrap();
+        let mut subject = Store::open_to_migrate(path, None).unwrap();
 
         let stated = |key: &str, kind, value: Option<&str>| LegacyStatement {
             map: match kind {
@@ -345,7 +345,7 @@ mod tests {
         let path = dir.path().join("state.json");
         std::fs::write(&path, r#"{"tracked_pulls":{"a-repo/feat/alpha":"soon"}}"#).unwrap();
 
-        let error = Store::open_to_migrate(path)
+        let error = Store::open_to_migrate(path, None)
             .unwrap()
             .legacy_statements()
             .unwrap_err();
