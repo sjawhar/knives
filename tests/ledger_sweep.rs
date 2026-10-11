@@ -1556,6 +1556,135 @@ fn a_peer_ref_that_moved_backward_keeps_out_only_that_machines_entries() {
     assert_eq!(beta_entries(), 4);
 }
 
+/// Push to `remote`, as `machine`'s ref, one commit carrying `contents` at
+/// `path` under the ledger root: what a machine running another knives, or
+/// a broken one, could send.
+fn push_as_peer(remote: &Path, machine: &str, path: &str, contents: &str) {
+    let scratch = tempfile::tempdir().expect("peer checkout");
+    let root = scratch.path().join("peer");
+    lab::git_repository(&root, &[]);
+    let file = root.join(path);
+    std::fs::create_dir_all(file.parent().expect("an entry's directory")).expect("mkdir");
+    std::fs::write(&file, contents).expect("write the peer's entry");
+    lab::git_output(&root, ["add", "--all"]);
+    lab::git_output(
+        &root,
+        [
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--quiet",
+            "-m",
+            "peer",
+        ],
+    );
+    lab::git_output(
+        &root,
+        [
+            "push",
+            "--quiet",
+            remote.to_str().expect("utf-8"),
+            &format!("HEAD:refs/knives/{machine}"),
+        ],
+    );
+}
+
+/// The problems of a report, as one string to search.
+fn problems_of(report: &serde_json::Value) -> String {
+    report["problems"].to_string()
+}
+
+#[test]
+fn a_peer_entry_of_a_kind_this_knives_does_not_know_leaves_notch_and_status_readable() {
+    // Given: a machine sharing the lab fork's ledger, and a peer's ref on
+    // the remote carrying an entry of a kind a newer knives writes.
+    let lab = lab::Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let beta = shared_home(&lab);
+    let (_remote_dir, remote) = bare_remote();
+    share(beta.path(), "beta", &remote);
+    let name = "20261011T120000.000000000Z-0000.md";
+    push_as_peer(
+        &remote,
+        "alpha",
+        &format!("{FORK}/{name}"),
+        "+++\nts = \"2026-10-11T12:00:00Z\"\nowner = \"ses_peer\"\nsubject = \"feat/alpha\"\n\
+         kind = \"decision\"\n+++\nwe decided\n",
+    );
+    let on_disk = beta.path().join("ledger").join(FORK).join(name);
+
+    for round in ["the first pull", "a pull after the file was deleted"] {
+        // When: status pulls, then notch reads.
+        let (code, report) = status_on(&lab, beta.path());
+
+        // Then: status answers, with its branches, naming the entry as a
+        // problem.
+        assert_eq!(code, Some(3), "{round}: {report}");
+        assert!(problems_of(&report).contains(name), "{round}: {report}");
+        assert!(
+            report["branches"]
+                .as_array()
+                .expect("branch rows")
+                .iter()
+                .any(|row| row["name"] == "feat/alpha"),
+            "{round}: {report}"
+        );
+        assert!(on_disk.exists(), "{round}: the pull did not write it");
+        // And: notch reads too, naming it.
+        let notch = knives_on(&lab, beta.path(), &["--json", "notch"]);
+        let read: serde_json::Value = serde_json::from_slice(&notch.stdout).unwrap_or_else(|_| {
+            panic!(
+                "{round}: notch emits JSON: {}",
+                String::from_utf8_lossy(&notch.stderr)
+            )
+        });
+        assert_eq!(notch.status.code(), Some(3), "{round}: {read}");
+        assert!(problems_of(&read).contains(name), "{round}: {read}");
+
+        // And: deleting the local copy is no way out; the next pull writes
+        // it back.
+        std::fs::remove_file(&on_disk).expect("delete the local copy");
+    }
+}
+
+#[test]
+fn a_peer_entry_that_does_not_parse_is_kept_out_and_named_on_every_pull() {
+    // Given: a machine sharing the lab fork's ledger, and a peer's ref on
+    // the remote carrying a file no knives can read as an entry.
+    let lab = lab::Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let beta = shared_home(&lab);
+    let (_remote_dir, remote) = bare_remote();
+    share(beta.path(), "beta", &remote);
+    let path = format!("{FORK}/20261011T120000.000000000Z-dead.md");
+    push_as_peer(&remote, "alpha", &path, "not an entry\n");
+
+    for round in ["the first pull", "the next pull"] {
+        // When: status pulls.
+        let (code, report) = status_on(&lab, beta.path());
+
+        // Then: it answers, naming the peer and the file, and wrote nothing.
+        assert_eq!(code, Some(3), "{round}: {report}");
+        let problems = problems_of(&report);
+        assert!(
+            problems.contains(&path) && problems.contains("alpha"),
+            "{round}: {report}"
+        );
+        assert!(
+            !beta.path().join("ledger").join(&path).exists(),
+            "{round}: the unreadable entry was written"
+        );
+        // And: the ledger this machine has still reads.
+        let notch = knives_on(&lab, beta.path(), &["--json", "notch"]);
+        assert_eq!(
+            notch.status.code(),
+            Some(0),
+            "{round}: {}",
+            String::from_utf8_lossy(&notch.stderr)
+        );
+    }
+}
+
 /// The transition both machines see in these tests.
 const MERGED: &str = "#7 merged";
 
