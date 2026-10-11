@@ -18,7 +18,7 @@ use knives::forge::Forge;
 use knives::forge::github::CliForge;
 use knives::jj::Repo;
 
-use super::{parallelism, pulled_ledger};
+use super::parallelism;
 
 /// Inspect a release's direct parents and, on request, replay their content:
 /// the release `reference` names, or the one in hand.
@@ -56,7 +56,7 @@ pub(crate) fn run_release_members(
             cache_root: cache_root.as_deref(),
             heads: &heads,
         };
-        let (entries, problems) = pulled_ledger(fork, registry)?;
+        let (entries, problems) = release::pulled_ledger(fork, registry)?;
         let plan = release::plan(fork, &consumers, &entries)?;
         let Some(reference) = plan.release else {
             println!("{repo}: no release to inspect; cut one first");

@@ -240,7 +240,7 @@ fn edit_release(
         cache_root,
         heads,
     };
-    let plan = super::pulled_plan(fork, bound.registry, &consumers)?;
+    let plan = release::pulled_plan(fork, bound.registry, &consumers)?;
     if !plan.problems.is_empty() {
         println!("{}", release::render(&plan));
         println!(

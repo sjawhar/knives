@@ -1,4 +1,4 @@
-// allow: SIZE_OK: 2306 lines - entry type, storage, filters, and writer are one domain.
+// allow: SIZE_OK: 2435 lines - entry type, storage, filters, and writer are one domain.
 //! What agents did and decided here, in order, forever.
 //!
 //! [`crate::store`] holds current intent and is rewritten whole on every change:

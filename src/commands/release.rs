@@ -5,14 +5,14 @@
 //! decided. Planning is the default because everything else here writes: a cut
 //! names a composition, and `include`, `drop`, `advance` and `rebase` change
 //! one. Every one of them writes locally only, and none of them pushes.
-// allow: SIZE_OK: 2395 lines - the release lifecycle's plan, members, cut, edit, audit, reap, and rebase operations are one domain seam.
+// allow: SIZE_OK: 2594 lines - the release lifecycle's plan, members, cut, edit, audit, reap, and rebase operations, and the pull every one of them plans from, are one domain seam.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use crate::bind::Fork;
 use crate::cli::Exit;
-use crate::config::RepoEntry;
+use crate::config::{Registry, RepoEntry};
 use crate::consumer_pins::{
     ConsumerHeadMemo, ConsumerPinSource, scan_consumer_for, scan_consumer_slug_with_heads,
 };
@@ -24,7 +24,7 @@ use crate::ids::{
     strict_dated_release,
 };
 use crate::jj::{self, Repo};
-use crate::ledger::{Entry, RecordedParent};
+use crate::ledger::{Entry, Ledger, RecordedParent};
 use crate::pins::{Pin, PinKind};
 use crate::release_model::{
     BranchSuccessions, MemberEvidence, MemberSuccession, RecordedCut, StackedHistoryContext,
@@ -52,6 +52,42 @@ impl std::fmt::Debug for ConsumerInputs<'_> {
             .field("heads", self.heads)
             .finish()
     }
+}
+
+/// `fork`'s ledger entries, read after pulling them from every destination
+/// `registry` gives the fork.
+///
+/// With them, the pull's problems and each entry or statement the read could
+/// not fully read: what a release command decides from, so a write from it
+/// refuses on any of them.
+pub fn pulled_ledger(
+    fork: &Fork<'_>,
+    registry: &Registry,
+) -> anyhow::Result<(Vec<Entry>, Vec<String>)> {
+    let pulled = crate::ledger_sweep::pull(registry, &[&fork.upstream]);
+    let read = Ledger::for_fork(fork).read()?;
+    let mut problems = pulled.problems_for(&fork.upstream);
+    problems.extend(read.problems);
+    Ok((read.entries, problems))
+}
+
+/// The release plan for `fork`, from a ledger pulled first: what a release
+/// command decides from.
+///
+/// A pull that fails is one of the plan's problems. The plan still answers
+/// from the entries this machine has, and a command that would write from it
+/// refuses, exactly as it does when a consumer could not be consulted: the
+/// drop guard checks a member against the newest recorded cut, and a stale
+/// ledger would check it against the wrong one.
+pub fn pulled_plan(
+    fork: &Fork<'_>,
+    registry: &Registry,
+    consumers: &ConsumerInputs<'_>,
+) -> anyhow::Result<Plan> {
+    let (entries, problems) = pulled_ledger(fork, registry)?;
+    let mut plan = plan(fork, consumers, &entries)?;
+    plan.problems.extend(problems);
+    Ok(plan)
 }
 
 /// What repairing this release would actually reach.

@@ -329,7 +329,7 @@ fn release_plan_exit(
         cache_root,
         heads,
     };
-    let plan = super::pulled_plan(fork, registry, &consumers)?;
+    let plan = release::pulled_plan(fork, registry, &consumers)?;
     println!("{}", release::render(&plan));
     let mut exit = release::exit_for(&plan);
     if let Some(lag) = release::trunk_lag(opened, plan.release.as_deref(), &entry.upstream_trunk())

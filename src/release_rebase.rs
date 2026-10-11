@@ -15,7 +15,6 @@ use knives::forge::github::CliForge;
 use knives::ids::{ReleaseScheme, RepoName};
 use knives::release_model::{BranchSuccessions, carried_from_tips, trunk_positions};
 
-use super::pulled_plan;
 use super::release_edit::{EditRecord, record_edit_event, release_is_locally_movable};
 
 /// Rebase the whole composition onto an upstream commit: `jj rebase -b <release> -d <target>`.
@@ -63,7 +62,7 @@ pub(crate) fn run_rebase(
         cache_root,
         heads: &heads,
     };
-    let plan = pulled_plan(fork, bound.registry, &consumers)?;
+    let plan = release::pulled_plan(fork, bound.registry, &consumers)?;
     if !plan.problems.is_empty() {
         println!("{}", release::render(&plan));
         return Ok(Exit::Incomplete);

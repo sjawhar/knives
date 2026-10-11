@@ -47,6 +47,19 @@ impl Pulled {
         self.problems.get(fork).cloned().unwrap_or_default()
     }
 
+    /// [`Pulled::problems_for`], then each problem the read of `fork`'s
+    /// ledger into `store` found ([`crate::store::Store::ledger_problems`]):
+    /// what a command that reports from the store adds to its report.
+    pub fn problems_with_store(
+        &self,
+        store: &crate::store::Store,
+        fork: &UpstreamName,
+    ) -> Vec<String> {
+        let mut problems = self.problems_for(fork);
+        problems.extend_from_slice(store.ledger_problems(fork));
+        problems
+    }
+
     /// What `status` notes about each fork's ledger beyond its problems,
     /// worked out once for the whole pull: what each destination has that
     /// its remote does not yet ([`ledger_git::unsent`]), and the

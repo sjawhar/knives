@@ -771,21 +771,8 @@ fn two_repositories_over_one_ledger_root_each_carry_their_own_forks_to_their_own
     lab::git_bare_repository(&personal);
     let alpha = machine(root.path(), "alpha", &company);
     let second_git_dir = root.path().join("second.git");
-    lab::git_bare_repository(&second_git_dir);
-    let second = second_git_dir.to_str().expect("utf-8");
-    for args in [
-        vec!["config", "core.bare", "false"],
-        vec!["config", "core.worktree", alpha.to_str().expect("utf-8")],
-        vec!["remote", "add", "origin", personal.to_str().expect("utf-8")],
-    ] {
-        let mut with_git_dir = vec!["--git-dir", second];
-        with_git_dir.extend(args);
-        let status = std::process::Command::new("git")
-            .args(&with_git_dir)
-            .status()
-            .expect("run git");
-        assert!(status.success(), "git {with_git_dir:?} failed");
-    }
+    let personal_url = personal.to_str().expect("utf-8");
+    lab::join_ledger(&second_git_dir, &alpha, personal_url, &personal, "alpha");
     append_to(&alpha, REPO, "ses_alpha", 2);
     append_to(&alpha, OTHER, "ses_alpha", 3);
     let first = repository(&alpha);

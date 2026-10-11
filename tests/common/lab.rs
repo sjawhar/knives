@@ -831,6 +831,35 @@ pub fn bare_remote() -> (TempDir, PathBuf) {
     (root, remote)
 }
 
+/// Make a git directory at `git_dir` that joins the ledger as the dotfiles
+/// installer does on a machine: a non-bare repository whose work tree is the
+/// ledger root `work_tree`, whose `origin` is `url`, reached at `reached`,
+/// committing as `machine`. Nothing is created at `work_tree`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the git directory, the work tree, the URL, where it is reached and the machine are independent inputs"
+)]
+pub fn join_ledger(git_dir: &Path, work_tree: &Path, url: &str, reached: &Path, machine: &str) {
+    git_bare_repository(git_dir);
+    let work_tree = work_tree.to_str().expect("utf-8 path");
+    let instead_of = format!("url.{}.insteadOf", reached.display());
+    for args in [
+        ["config", "core.bare", "false"].as_slice(),
+        &["config", "core.worktree", work_tree],
+        &["remote", "add", "origin", url],
+        &["config", &instead_of, url],
+        &["config", "knives.machine", machine],
+    ] {
+        let status = std::process::Command::new("git")
+            .arg("--git-dir")
+            .arg(git_dir)
+            .args(args)
+            .status()
+            .expect("run git");
+        assert!(status.success(), "git {args:?} in {}", git_dir.display());
+    }
+}
+
 /// Whether `path` names a ledger entry file.
 pub fn is_entry(path: &str) -> bool {
     Path::new(path).extension() == Some(std::ffi::OsStr::new("md"))

@@ -655,23 +655,13 @@ fn one_ledger_root_sweeps_each_fork_to_the_repository_it_names_and_no_other() {
     let (_personal_dir, personal) = lab::bare_remote();
     let root = share(home.path(), "alpha", &company);
     let personal_url = "https://forge.invalid/someone/.knives-ledger";
-    let second = home.path().join("ledger-repositories").join("personal.git");
-    lab::git_bare_repository(&second);
-    for args in [
-        vec!["config", "core.bare", "false"],
-        vec!["remote", "add", "origin", personal_url],
-        vec![
-            "config",
-            &format!("url.{}.insteadOf", personal.display()),
-            personal_url,
-        ],
-        vec!["config", "knives.machine", "alpha"],
-    ] {
-        assert!(
-            git_in(&second, &args).is_some(),
-            "git {args:?} in the second git directory"
-        );
-    }
+    lab::join_ledger(
+        &home.path().join("ledger-repositories").join("personal.git"),
+        &root,
+        personal_url,
+        &personal,
+        "alpha",
+    );
     append(&root, "acme/a-repo", 2);
     append(&root, "acme/b-repo", 3);
 
@@ -903,26 +893,13 @@ fn a_statement_made_on_one_machine_shows_in_status_on_another_after_a_sweep() {
 /// ledger root, which nothing has created yet, reaching [`LEDGER_URL`] at
 /// `remote` and committing as `machine`.
 fn join_as_the_installer_does(home: &Path, machine: &str, remote: &Path) {
-    let git_dir = home.join("ledger-repositories").join("acme--ledger.git");
-    lab::git_bare_repository(&git_dir);
-    let work_tree = home.join("ledger");
-    for args in [
-        vec!["config", "core.bare", "false"],
-        vec![
-            "config",
-            "core.worktree",
-            work_tree.to_str().expect("utf-8"),
-        ],
-        vec!["remote", "add", "origin", LEDGER_URL],
-        vec![
-            "config",
-            &format!("url.{}.insteadOf", remote.display()),
-            LEDGER_URL,
-        ],
-        vec!["config", "knives.machine", machine],
-    ] {
-        assert!(git_in(&git_dir, &args).is_some(), "git {args:?}");
-    }
+    lab::join_ledger(
+        &home.join("ledger-repositories").join("acme--ledger.git"),
+        &home.join("ledger"),
+        LEDGER_URL,
+        remote,
+        machine,
+    );
 }
 
 #[test]
