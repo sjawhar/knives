@@ -241,6 +241,9 @@ into the directory of the fork they belong to. Every command that pulls first
 ([sharing](#sharing-between-machines)) carries it, so a report exits `3` and a
 write that replaces what it read refuses; so do a `notch` read and every sweep.
 
+An unclaimed ledger directory blocks writes on every fork. Retire a fork only
+after moving or deleting its directory.
+
 ## Sharing between machines
 
 A fork's ledger travels between machines when its `repos.toml` entry names the
