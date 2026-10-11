@@ -234,6 +234,10 @@ pub struct Store {
     /// Every entry of each of those ledgers this knives can read, oldest
     /// first, from that one read: what a report showing them answers from.
     entries: BTreeMap<UpstreamName, Vec<Entry>>,
+    /// Each of those ledgers that could not be read at all, with why: only a
+    /// store opened for a report of many forks keeps one
+    /// ([`Store::open_each`]); every other open fails on it.
+    unreadable: BTreeMap<UpstreamName, LedgerError>,
     /// Present only for a store opened to be written. Held, not read: its whole
     /// job is to exist until this value is dropped.
     _lock: Option<FileLock>,
@@ -249,7 +253,7 @@ impl Store {
     /// it cannot read: a statement the store could not read must not answer as
     /// no statement.
     pub fn open(path: PathBuf, repos: &[&UpstreamName]) -> Result<Self, StoreError> {
-        Self::read(path, repos, None)?.migrated()
+        Self::read(path, repos, None)?.migrated()?.all_read()
     }
 
     /// For a read-modify-write. Holds the lock until dropped, and waits the
@@ -257,7 +261,34 @@ impl Store {
     /// `repos` as for [`Store::open`].
     pub fn open_for_update(path: PathBuf, repos: &[&UpstreamName]) -> Result<Self, StoreError> {
         let lock = FileLock::acquire(&path, LockWait::CLAIM)?;
+        Self::read(path, repos, Some(lock))?.migrated()?.all_read()
+    }
+
+    /// [`Store::open`] for a report of many forks, each its own row: a
+    /// ledger it cannot read is kept for that fork ([`Store::unreadable`])
+    /// instead of failing the open, so one fork's broken ledger blanks no
+    /// other fork's row. Nothing about such a fork may be asked of the store;
+    /// its row is that it could not be read.
+    pub fn open_each(path: PathBuf, repos: &[&UpstreamName]) -> Result<Self, StoreError> {
+        Self::read(path, repos, None)?.migrated()
+    }
+
+    /// [`Store::open_for_update`] as [`Store::open_each`] opens a store.
+    pub fn open_each_for_update(
+        path: PathBuf,
+        repos: &[&UpstreamName],
+    ) -> Result<Self, StoreError> {
+        let lock = FileLock::acquire(&path, LockWait::CLAIM)?;
         Self::read(path, repos, Some(lock))?.migrated()
+    }
+
+    /// Refuse a store that could not read one of the ledgers it was opened
+    /// for, naming the first.
+    fn all_read(mut self) -> Result<Self, StoreError> {
+        match self.unreadable.pop_first() {
+            Some((_, error)) => Err(error.into()),
+            None => Ok(self),
+        }
     }
 
     /// [`Store::open_for_update`] for `knives ledger migrate` alone: it opens
@@ -345,14 +376,15 @@ impl Store {
         } else {
             State::default()
         };
-        let (statements, ledger_problems, entries) =
-            read_statements(&path.with_file_name("ledger"), repos)?;
+        let (statements, ledger_problems, entries, unreadable) =
+            read_statements(&path.with_file_name("ledger"), repos);
         Ok(Self {
             path,
             state,
             statements,
             ledger_problems,
             entries,
+            unreadable,
             _lock: lock,
         })
     }
@@ -503,6 +535,12 @@ impl Store {
     /// states.
     pub fn ledger_problems(&self, repo: &UpstreamName) -> &[String] {
         self.ledger_problems.get(repo).map_or(&[], Vec::as_slice)
+    }
+    /// Why `repo`'s ledger could not be read at all, for a store opened with
+    /// [`Store::open_each`]: that fork's report is this, and nothing else
+    /// about it may be asked of the store.
+    pub fn unreadable(&self, repo: &UpstreamName) -> Option<&LedgerError> {
+        self.unreadable.get(repo)
     }
 
     /// Every entry of `repo`'s ledger this knives can read, oldest first, as
@@ -789,35 +827,43 @@ impl State {
 }
 
 /// The live statements of each of `repos`, from its ledger beside the state
-/// file, what reading each ledger found it could read only in part, and the
-/// entries it read.
+/// file, what reading each ledger found it could read only in part, the
+/// entries it read, and each ledger that could not be read at all, with why.
 ///
 /// `ledger/<owner>/<name>/` beside `state.json` is where
 /// [`crate::ledger::default_ledger_path`] puts each fork's ledger, so a store
 /// opened at the default path reads the default ledgers and one opened
 /// anywhere else reads only what sits beside it. A repository nobody has
 /// stated anything about yet has no ledger, and so no statements.
-fn read_statements(root: &Path, repos: &[&UpstreamName]) -> Result<StatementsRead, StoreError> {
+fn read_statements(root: &Path, repos: &[&UpstreamName]) -> StatementsRead {
     let mut statements = BTreeMap::new();
     let mut problems = BTreeMap::new();
     let mut entries = BTreeMap::new();
+    let mut unreadable = BTreeMap::new();
     for repo in repos {
-        let read = Ledger::at(root.join(repo.as_str())).read()?;
+        let read = match Ledger::at(root.join(repo.as_str())).read() {
+            Ok(read) => read,
+            Err(error) => {
+                unreadable.insert((*repo).clone(), error);
+                continue;
+            }
+        };
         statements.insert((*repo).clone(), Statements::from_entries(&read.entries));
         if !read.problems.is_empty() {
             problems.insert((*repo).clone(), read.problems);
         }
         entries.insert((*repo).clone(), read.entries);
     }
-    Ok((statements, problems, entries))
+    (statements, problems, entries, unreadable)
 }
 
-/// [`read_statements`]' answer: statements, problems and entries, each by
-/// repository.
+/// [`read_statements`]' answer: statements, problems, entries and read
+/// failures, each by repository.
 type StatementsRead = (
     BTreeMap<UpstreamName, Statements>,
     BTreeMap<UpstreamName, Vec<String>>,
     BTreeMap<UpstreamName, Vec<Entry>>,
+    BTreeMap<UpstreamName, LedgerError>,
 );
 
 #[cfg(test)]

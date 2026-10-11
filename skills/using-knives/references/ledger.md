@@ -144,7 +144,10 @@ A command that reads branch statements (`status`, `audit`, `pushed`, `sync`,
 `track`, `depends`, `finish`, `start`, a `notch` note about a branch without
 `--pr`) reads the ledger of each fork it works on when it starts, and no
 other. An entry file that does not parse stops the command with exit `3`
-naming the file, rather than reading that ledger's statements as absent.
+naming the file, rather than reading that ledger's statements as absent. A
+`status`, `audit` or `sync` of several forks (`--all`, or a sweep from outside
+every checkout) makes that fork's row the problem `ledger unavailable: …`
+instead, exits `3`, and reports every other fork as it would alone.
 
 What a newer knives may write does not stop anything, because machines
 sharing a ledger, and sessions on one machine, run different versions. An

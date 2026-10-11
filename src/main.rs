@@ -533,7 +533,7 @@ fn run_audit(
     };
     let forks = placed(&chosen);
     let pulled = knives::ledger_sweep::pull(&forks);
-    let store = Store::open(default_state_path(), &forks)?;
+    let store = open_store_for(&chosen, &forks)?;
     let cli_forge = CliForge;
     let forge = use_forge.then_some(&cli_forge as &dyn Forge);
     let cache_root = knives::forge_cache::cache_root();
@@ -542,6 +542,13 @@ fn run_audit(
     let mut reports = Vec::with_capacity(chosen.len());
     for chosen in &chosen {
         let mut report = match chosen {
+            Selected::Bound(fork) if store.unreadable(&fork.upstream).is_some() => {
+                let mut report = audit::Report::new(fork.name.to_string());
+                report
+                    .problems
+                    .extend(unreadable_problem(&store, &fork.upstream));
+                report
+            }
             Selected::Bound(fork) => audit::gather(&audit::AuditInput {
                 fork,
                 store: &store,
@@ -753,6 +760,36 @@ fn placed<'s>(chosen: &'s [Selected<'_>]) -> Vec<&'s UpstreamName> {
         .collect()
 }
 
+/// The store a many-fork report reads: one fork's unreadable ledger is that
+/// fork's row ([`Store::open_each`]) when there is more than one row, and the
+/// command's failure when there is one, as every single-fork command fails.
+fn open_store_for(chosen: &[Selected<'_>], forks: &[&UpstreamName]) -> anyhow::Result<Store> {
+    Ok(if chosen.len() > 1 {
+        Store::open_each(default_state_path(), forks)?
+    } else {
+        Store::open(default_state_path(), forks)?
+    })
+}
+
+/// [`open_store_for`] for a report that writes the state file.
+fn open_store_for_update(
+    chosen: &[Selected<'_>],
+    forks: &[&UpstreamName],
+) -> anyhow::Result<Store> {
+    Ok(if chosen.len() > 1 {
+        Store::open_each_for_update(default_state_path(), forks)?
+    } else {
+        Store::open_for_update(default_state_path(), forks)?
+    })
+}
+
+/// The problem a fork's row carries when its ledger could not be read.
+fn unreadable_problem(store: &Store, upstream: &UpstreamName) -> Option<String> {
+    store
+        .unreadable(upstream)
+        .map(|error| format!("ledger unavailable: {error}"))
+}
+
 /// Every entry the scan of `home` placed, and what the scan could not read,
 /// for the caller to report once: each unplaced row carries only its own
 /// refusal, whether or not every entry was found.
@@ -910,7 +947,7 @@ fn run_status(ground: Ground<'_>, view: StatusView<'_>) -> anyhow::Result<Exit> 
     };
     let forks = placed(&chosen);
     let pulled = knives::ledger_sweep::pull(&forks);
-    let store = Store::open(default_state_path(), &forks)?;
+    let store = open_store_for(&chosen, &forks)?;
     let cli_forge = CliForge;
     let forge: Option<&dyn Forge> = if use_forge { Some(&cli_forge) } else { None };
     let cache_root = knives::forge_cache::cache_root();
@@ -936,6 +973,17 @@ fn run_status(ground: Ground<'_>, view: StatusView<'_>) -> anyhow::Result<Exit> 
                         .iter()
                         .map(|chosen| {
                             status_row(chosen, |fork| {
+                                if let Some(problem) = unreadable_problem(store, &fork.upstream) {
+                                    return Ok((
+                                        status::Report {
+                                            repo: fork.name.to_string(),
+                                            trunk: fork.entry.trunk().to_owned(),
+                                            problems: vec![problem],
+                                            ..status::Report::default()
+                                        },
+                                        status::Timings::default(),
+                                    ));
+                                }
                                 status::gather_timed(
                                     fork,
                                     store,
@@ -1023,7 +1071,7 @@ fn run_sync(
     };
     let forks = placed(&chosen);
     let pulled = knives::ledger_sweep::pull(&forks);
-    let mut store = Store::open_for_update(default_state_path(), &forks)?;
+    let mut store = open_store_for_update(&chosen, &forks)?;
     let cli_forge = CliForge;
     let forge = use_forge.then_some(&cli_forge as &dyn Forge);
     let cache_root = knives::forge_cache::cache_root();
@@ -1035,6 +1083,13 @@ fn run_sync(
         // carrying the error as a problem; the repositories before it already
         // fetched and wrote their events, and their rows are not lost to it.
         let mut report = match chosen {
+            Selected::Bound(fork) if store.unreadable(&fork.upstream).is_some() => sync::Report {
+                repo: fork.name.to_string(),
+                problems: unreadable_problem(&store, &fork.upstream)
+                    .into_iter()
+                    .collect(),
+                ..sync::Report::default()
+            },
             Selected::Bound(fork) => scribe_for(fork, bound.as_ref())
                 .and_then(|scribe| {
                     sync::sync_repo(sync::SyncInput {
