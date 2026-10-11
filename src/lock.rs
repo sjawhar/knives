@@ -41,6 +41,7 @@ impl LockWait {
     /// One minute, for a ledger repository's transport lock: a sweep's pass
     /// holds it across a fetch and a push, so a command pulling before it
     /// decides waits out one network round trip rather than failing on it.
+    /// A sweep run by hand waits as long for the ledger's own lock.
     pub(crate) const TRANSPORT: Self = Self {
         deadline: Duration::from_secs(60),
         floor: Duration::from_millis(20),
@@ -185,6 +186,21 @@ impl FileLock {
             Err(TryLockError::WouldBlock) => Ok(None),
             Err(TryLockError::Error(source)) => Err(LockError::Io { path, source }),
         }
+    }
+
+    /// [`Self::acquire`], with the holder it waited for: `None` when the
+    /// lock was free at once, else whom the lock file named as the wait
+    /// began. For a caller that reports having waited.
+    pub(crate) fn acquire_noting_holder(
+        target: &Path,
+        wait: LockWait,
+    ) -> Result<(Self, Option<LockHolder>), LockError> {
+        if let Some(lock) = Self::try_acquire(target)? {
+            return Ok((lock, None));
+        }
+        let path = target.with_extension("lock");
+        let holder = read_holder(&path).map_err(|source| LockError::Io { path, source })?;
+        Ok((Self::acquire(target, wait)?, Some(holder)))
     }
 
     /// Ours now: name ourselves for whoever waits on us. A write failure is
@@ -424,5 +440,35 @@ mod tests {
 
         drop(first);
         assert!(FileLock::try_acquire(&path).expect("try").is_some());
+    }
+
+    #[test]
+    fn a_wait_names_the_holder_it_waited_for_and_a_free_lock_names_none() {
+        let dir = tempfile::tempdir().expect("state dir");
+        let path = dir.path().join("ledger");
+        let (held, holder) = FileLock::acquire_noting_holder(&path, QUICK).expect("free lock");
+        assert!(holder.is_none(), "{holder:?}");
+        let (started, waiting) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            started.send(()).expect("say the wait started");
+            let patient = LockWait {
+                deadline: Duration::from_secs(10),
+                ..QUICK
+            };
+            FileLock::acquire_noting_holder(&path, patient).map(|(_, holder)| holder)
+        });
+        // The waiter tries the lock as soon as it starts; it is let go well
+        // after, so the try finds it held however the threads are scheduled.
+        waiting.recv().expect("the waiter started");
+        std::thread::sleep(Duration::from_millis(500));
+        drop(held);
+        let holder = waiter
+            .join()
+            .expect("waiter thread")
+            .expect("acquired after release");
+        assert_eq!(
+            holder.map(|holder| holder.pid),
+            Some(Some(std::process::id()))
+        );
     }
 }

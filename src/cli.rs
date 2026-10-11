@@ -444,14 +444,14 @@ pub enum LedgerAction {
     /// Commit new entries, pull every peer's, and push this machine's.
     ///
     /// Every command that writes an entry starts one in the background as it
-    /// exits, so this rarely needs typing. One sweep runs at a time: a sweep
-    /// that finds another running exits at once, successfully, because the
-    /// running one looks again before it stops. A fork's ledger travels when
-    /// its `repos.toml` entry names, as `ledger`, the repository its ledger
-    /// belongs to, and the ledger root is a git repository with that
-    /// repository as `origin` and this machine's name as `knives.machine`.
-    /// With no fork's `ledger` set, the ledger is not shared and this does
-    /// nothing.
+    /// exits, so this rarely needs typing. One sweep runs at a time: run by
+    /// hand, a sweep that finds another running waits for it, up to a minute,
+    /// then runs its own pass and reports that, with the sweep it waited for.
+    /// A fork's ledger travels when its `repos.toml` entry names, as
+    /// `ledger`, the repository its ledger belongs to, and the ledger root is
+    /// a git repository with that repository as `origin` and this machine's
+    /// name as `knives.machine`. With no fork's `ledger` set, the ledger is
+    /// not shared and this does nothing.
     Sweep,
     /// Move what an older knives left onto what this one reads: each fork
     /// kept under its registry key moves to its upstream's lowercase

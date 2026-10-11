@@ -3,11 +3,14 @@
 //!
 //! A write appends its entry and exits; [`hand_off`] starts `knives ledger
 //! sweep` detached, so no write waits on the network or on another writer.
-//! The sweep is single-flight. It takes the ledger's lock without waiting,
-//! and a sweep that finds the lock taken exits at once, successfully: the
-//! holder looks again before it lets go, so it carries whatever the second
-//! one would have, and a burst of writes costs one sweep. Waiting instead
-//! would put every writer of a burst back in line for one repository.
+//! The sweep is single-flight. The one a write hands off takes the ledger's
+//! lock without waiting, and exits at once, successfully, when it finds the
+//! lock taken: the holder looks again before it lets go, so it carries
+//! whatever the second one would have, and a burst of writes costs one
+//! sweep. Waiting instead would put every writer of a burst back in line for
+//! one repository. A sweep run by hand waits for the holder instead, then
+//! runs its own pass, because its caller reads its outcome: a holder's
+//! failure goes only to the [`sweep_log`].
 //!
 //! A command that decides something from the ledger pulls first ([`pull`]),
 //! and decides only from a ledger it could pull, or says it could not. A
@@ -24,7 +27,7 @@ use crate::config::{ConfigError, Registry};
 use crate::ids::UpstreamName;
 use crate::ledger::Ledger;
 use crate::ledger_git::{self, GitError, Repository};
-use crate::lock::{FileLock, LockError, LockWait};
+use crate::lock::{FileLock, LockError, LockHolder, LockWait};
 
 /// The remote every destination pushes to and pulls from.
 const REMOTE: &str = "origin";
@@ -684,24 +687,57 @@ pub enum Swept {
     /// No destination, and no fork the registry shares: this machine's
     /// ledger is not shared.
     NotShared,
-    /// Another sweep holds the lock, and carries what this one would have.
+    /// Another sweep holds the lock, and carries what this one would have:
+    /// the answer of a sweep that leaves when it finds the lock taken
+    /// ([`Contended::Leave`]).
     Busy,
     /// This sweep held the lock: each destination's tally, every failure,
-    /// and what it passed over without failing ([`Destinations::ignored`]).
+    /// what it passed over without failing ([`Destinations::ignored`]), and
+    /// the sweep it waited for first, if it did.
     Ran {
         tallies: Vec<Tally>,
         problems: Vec<String>,
         notes: Vec<String>,
+        waited: Option<Waited>,
     },
 }
 
-/// Sweep the ledger at `root` through every destination it has.
+/// What a sweep does when another holds the ledger's lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Contended {
+    /// Leave at once, as [`Swept::Busy`]: the sweep a write hands off, whose
+    /// output goes nowhere and whose work the holder carries.
+    Leave,
+    /// Wait for the holder, as long as a ledger repository's transport lock
+    /// is waited for, then run its own pass: a sweep run by hand, whose
+    /// caller reads its outcome and exit code.
+    Wait,
+}
+
+/// The sweep a sweep run by hand waited for before it ran.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Waited {
+    /// The pid the lock file named when the wait began; absent when it
+    /// named none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    /// How long this sweep waited, in whole seconds.
+    pub seconds: u64,
+}
+
+/// Set on the sweep [`hand_off`] starts, so that it leaves at once when it
+/// finds another sweep running ([`Contended::Leave`]). Not for anyone else
+/// to set.
+pub const HANDED_OFF: &str = "KNIVES_LEDGER_HANDED_OFF";
+
+/// Sweep the ledger at `root` through every destination it has, doing what
+/// `contended` says when another sweep holds the lock.
 ///
 /// A destination that cannot be read is a failed sweep: it is written to the
 /// [`sweep_log`] when no other sweep holds the lock, and returned.
-pub fn run(root: &Path) -> Result<Swept, SweepError> {
+pub fn run(root: &Path, contended: Contended) -> Result<Swept, SweepError> {
     match destinations(root) {
-        Ok(found) => sweep(root, &found),
+        Ok(found) => sweep(root, &found, contended),
         Err(error) => {
             if let Some(_lock) = FileLock::try_acquire(root)? {
                 record(root, &[error.to_string()])?;
@@ -713,8 +749,10 @@ pub fn run(root: &Path) -> Result<Swept, SweepError> {
 
 /// Commit, pull and push each of `destinations`, single-flight.
 ///
-/// The lock beside `root` is taken without waiting; finding it taken is
-/// [`Swept::Busy`]. The holder passes over every destination, looks again,
+/// The lock beside `root` is taken as `contended` says: without waiting,
+/// when finding it taken is [`Swept::Busy`], or after waiting for its
+/// holder, giving up as a failure if it is still held at the transport
+/// lock's deadline. The holder passes over every destination, looks again,
 /// and lets go only when a look finds nothing new. After letting go it looks
 /// once more: an entry written while it held the lock was handed to a sweep
 /// that found the lock taken and left, so either the holder takes the lock
@@ -726,7 +764,11 @@ pub fn run(root: &Path) -> Result<Swept, SweepError> {
 /// problems, so it is in the [`sweep_log`] until it is fixed. What the
 /// passes discarded and left unread goes to the [`sweep_record`] before the
 /// lock is let go.
-pub fn sweep(root: &Path, destinations: &Destinations) -> Result<Swept, SweepError> {
+pub fn sweep(
+    root: &Path,
+    destinations: &Destinations,
+    contended: Contended,
+) -> Result<Swept, SweepError> {
     let Destinations {
         found,
         unreached,
@@ -748,8 +790,20 @@ pub fn sweep(root: &Path, destinations: &Destinations) -> Result<Swept, SweepErr
             .flat_map(|tally| tally.unreadable.iter().cloned())
             .collect()
     };
+    let (mut next, waited) = match contended {
+        Contended::Leave => (FileLock::try_acquire(root)?, None),
+        Contended::Wait => {
+            let started = std::time::Instant::now();
+            let (lock, holder) = FileLock::acquire_noting_holder(root, LockWait::TRANSPORT)?;
+            let waited = holder.map(|holder: LockHolder| Waited {
+                pid: holder.pid,
+                seconds: started.elapsed().as_secs(),
+            });
+            (Some(lock), waited)
+        }
+    };
     let mut held = false;
-    while let Some(lock) = FileLock::try_acquire(root)? {
+    while let Some(lock) = next {
         held = true;
         loop {
             for (destination, tally) in found.iter().zip(&mut tallies) {
@@ -773,6 +827,7 @@ pub fn sweep(root: &Path, destinations: &Destinations) -> Result<Swept, SweepErr
         if !anything_new(found, &mut tallies, &mut problems) {
             break;
         }
+        next = FileLock::try_acquire(root)?;
     }
     Ok(if held {
         problems.extend(unreadable(&tallies));
@@ -780,6 +835,7 @@ pub fn sweep(root: &Path, destinations: &Destinations) -> Result<Swept, SweepErr
             tallies,
             problems,
             notes: ignored.clone(),
+            waited,
         }
     } else {
         Swept::Busy
@@ -1175,15 +1231,17 @@ fn pull_one(destination: &Destination) -> (Option<ledger_git::Materialised>, Vec
 /// ([`crate::ledger::appended`]). The entry is already on disk, so a sweep
 /// that never starts loses nothing: the next one carries it. The sweep's
 /// output goes nowhere, because the caller has stopped listening by the time
-/// it finishes; a sweep that fails says so in [`sweep_log`]. It runs in a
-/// process group of its own, so the Ctrl-C that stops the caller does not
-/// stop it mid-push.
+/// it finishes; a sweep that fails says so in [`sweep_log`]. It is marked
+/// [`HANDED_OFF`], so it leaves at once when another sweep holds the lock
+/// ([`Contended::Leave`]). It runs in a process group of its own, so the
+/// Ctrl-C that stops the caller does not stop it mid-push.
 pub fn hand_off() {
     use std::os::unix::process::CommandExt as _;
     let started = std::time::Instant::now();
     let spawned = std::env::current_exe().and_then(|executable| {
         std::process::Command::new(executable)
             .args(["ledger", "sweep"])
+            .env(HANDED_OFF, "1")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())

@@ -301,9 +301,12 @@ lists it under `notes`, each with the command that removes it, and nothing is
 refused for it.
 
 Every command that appends an entry starts `knives ledger sweep` in the
-background as it exits, without waiting for it. A sweep takes `ledger.lock`
+background as it exits, without waiting for it. That sweep takes `ledger.lock`
 beside the state file without waiting; one that finds it held exits `0` at
-once, because the holder looks again before it stops. The holder passes over
+once, because the holder looks again before it stops. A sweep run by hand
+waits for the holder instead, up to a minute, then runs its own pass, so what
+it reports and its exit code are its own: a failure of the sweep it waited
+for reaches only `ledger-sweep.log`. The holder passes over
 each git directory under that directory's own `knives-transport.lock`: it
 fetches every machine's ref into `refs/knives-remotes/origin/<machine>` and
 writes in the entries this machine lacks, discards this machine's repeated
@@ -327,14 +330,18 @@ sweep failed. Run `knives ledger sweep` by hand to see what one carries; TOON
 and JSON share its report:
 
 ```text
-{outcome, destinations?, problems?}
+{outcome, waited?, destinations?, problems?, notes?}
+waited: {pid?, seconds}
 destination: {git_dir, remote, forks, commits, pulled, pushes, discarded, skipped?}
 ```
 
-`outcome` is `swept`; `busy` when another sweep holds the lock and carries this
-one's entries; `not-shared` when no git directory names a machine and no fork
-sets `ledger`; or `failed` when the sweep could not start because where the
-ledger travels could not be read, which its `problems` say. Each destination
+`outcome` is `swept`; `busy`, only from the sweep a write hands off, when
+another sweep holds the lock and carries this one's entries; `not-shared` when
+no git directory names a machine and no fork sets `ledger`; or `failed` when
+the sweep could not start because where the ledger travels could not be read,
+or another sweep still held the lock after a minute, which its `problems` say.
+`waited` is present when the sweep found another running and waited for it:
+the pid `ledger.lock` named, and how long it waited. Each destination
 is one git directory: `remote` is always
 `origin`, `forks` lists the upstream names it carries, and the counts cover the
 whole sweep: commits made, entries pulled in, pushes, and repeated transitions

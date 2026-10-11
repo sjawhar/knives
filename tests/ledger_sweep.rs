@@ -251,8 +251,8 @@ fn a_burst_of_concurrent_sweeps_makes_one_commit_and_no_error() {
     );
     assert_eq!(entries_on(&remote, "alpha"), 12);
     assert!(!home.path().join("ledger-sweep.log").exists());
-    // And: each sweep either carried the burst or found it being carried.
-    // Which, and how many of each, is up to the scheduler.
+    // And: each sweep, run by hand, waited for the one before it and ran its
+    // own pass, so each reports that pass.
     let outcomes: Vec<String> = outputs
         .iter()
         .map(|output| {
@@ -262,15 +262,13 @@ fn a_burst_of_concurrent_sweeps_makes_one_commit_and_no_error() {
         })
         .collect();
     assert!(
-        outcomes
-            .iter()
-            .all(|outcome| outcome == "busy" || outcome == "swept"),
+        outcomes.iter().all(|outcome| outcome == "swept"),
         "{outcomes:?}"
     );
 }
 
 #[test]
-fn a_sweep_that_finds_the_lock_held_leaves_at_once_as_busy() {
+fn a_handed_off_sweep_that_finds_the_lock_held_leaves_at_once_as_busy() {
     // Given: a machine with an entry to send, and its ledger lock held, as
     // a running sweep holds it.
     let home = a_repo_home();
@@ -279,8 +277,16 @@ fn a_sweep_that_finds_the_lock_held_leaves_at_once_as_busy() {
     append(&root, "acme/a-repo", 1);
     let held = hold_sweep_lock(home.path());
 
-    // When: a sweep runs.
-    let swept = sweep(home.path());
+    // When: the sweep a write hands off runs.
+    let swept = lab::knives_command(
+        home.path(),
+        home.path(),
+        home.path(),
+        &["--json", "ledger", "sweep"],
+    )
+    .env(knives::ledger_sweep::HANDED_OFF, "1")
+    .output()
+    .expect("run the handed-off sweep");
 
     // Then: it succeeds as busy, having sent nothing for the holder to race.
     assert!(swept.status.success(), "{swept:?}");

@@ -7,7 +7,8 @@
 //!
 //! Every command that appends an entry starts one sweep detached as it exits
 //! ([`crate::ledger_sweep::hand_off`]), so it is rarely typed; run by hand it
-//! reports what it carried.
+//! waits for any sweep already running, then reports what its own pass
+//! carried.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -16,7 +17,7 @@ use std::path::{Path, PathBuf};
 use crate::cli::{Exit, Output};
 use crate::ids::{Requirement, UpstreamName};
 use crate::ledger::{Draft, Ledger, Scribe, inline_human_text, unmigrated};
-use crate::ledger_sweep::{self, Swept, Tally};
+use crate::ledger_sweep::{self, Contended, Swept, Tally, Waited};
 use crate::lock::FileLock;
 use crate::statement::{Statement, StatementKind, Statements};
 use crate::store::{FormerNames, LegacyStatement, Renamed, Store, renamed};
@@ -27,12 +28,14 @@ use crate::store::{FormerNames, LegacyStatement, Renamed, Store, renamed};
 pub enum Outcome {
     /// This sweep held the lock and passed over every destination.
     Swept,
-    /// Another sweep holds the lock and carries this one's work.
+    /// Another sweep holds the lock and carries this one's work: only the
+    /// sweep a write hands off answers this.
     Busy,
     /// This machine's ledger has no repository to travel through.
     NotShared,
     /// The sweep could not start: where the ledger travels could not be
-    /// read, and its problems say why.
+    /// read, or another sweep held the lock past the wait, and its problems
+    /// say why.
     Failed,
 }
 
@@ -40,6 +43,10 @@ pub enum Outcome {
 #[derive(Debug, serde::Serialize)]
 pub struct Report {
     pub outcome: Outcome,
+    /// The sweep this one waited for before its own pass: whom the lock
+    /// named, and for how long.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub waited: Option<Waited>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub destinations: Vec<Tally>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -51,28 +58,36 @@ pub struct Report {
 }
 
 /// Run one sweep of the ledger beside the registry and report it.
+///
+/// The sweep a write hands off ([`ledger_sweep::HANDED_OFF`]) leaves at once
+/// when another sweep holds the lock; any other waits for it, so that what
+/// it reports, and its exit code, is its own pass.
 pub fn run_sweep(output: Output) -> anyhow::Result<Exit> {
     let root = crate::ledger::default_ledger_root();
-    let (outcome, destinations, problems, notes) = match ledger_sweep::run(&root) {
-        Ok(Swept::NotShared) => (Outcome::NotShared, Vec::new(), Vec::new(), Vec::new()),
-        Ok(Swept::Busy) => (Outcome::Busy, Vec::new(), Vec::new(), Vec::new()),
+    let contended = if std::env::var_os(ledger_sweep::HANDED_OFF).is_some() {
+        Contended::Leave
+    } else {
+        Contended::Wait
+    };
+    let report = match ledger_sweep::run(&root, contended) {
+        Ok(Swept::NotShared) => Report::of(Outcome::NotShared),
+        Ok(Swept::Busy) => Report::of(Outcome::Busy),
         Ok(Swept::Ran {
             tallies,
             problems,
             notes,
-        }) => (Outcome::Swept, tallies, problems, notes),
-        Err(error) => (
-            Outcome::Failed,
-            Vec::new(),
-            vec![error.to_string()],
-            Vec::new(),
-        ),
-    };
-    let report = Report {
-        outcome,
-        destinations,
-        problems,
-        notes,
+            waited,
+        }) => Report {
+            waited,
+            destinations: tallies,
+            problems,
+            notes,
+            ..Report::of(Outcome::Swept)
+        },
+        Err(error) => Report {
+            problems: vec![error.to_string()],
+            ..Report::of(Outcome::Failed)
+        },
     };
     if let Some(payload) = crate::cli::machine_payload(output, &report)? {
         println!("{payload}");
@@ -84,6 +99,18 @@ pub fn run_sweep(output: Output) -> anyhow::Result<Exit> {
     } else {
         Exit::Incomplete
     })
+}
+
+impl Report {
+    const fn of(outcome: Outcome) -> Self {
+        Self {
+            outcome,
+            waited: None,
+            destinations: Vec::new(),
+            problems: Vec::new(),
+            notes: Vec::new(),
+        }
+    }
 }
 
 pub fn render(report: &Report) -> String {
@@ -130,6 +157,15 @@ pub fn render(report: &Report) -> String {
             })
             .collect(),
     };
+    if let Some(waited) = &report.waited {
+        let who = waited
+            .pid
+            .map_or_else(|| "another sweep".to_owned(), |pid| format!("sweep {pid}"));
+        lines.insert(
+            0,
+            format!("ledger: waited {}s for {who} to finish", waited.seconds),
+        );
+    }
     lines.extend(
         report
             .problems

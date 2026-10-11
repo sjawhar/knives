@@ -103,7 +103,8 @@ ledger belongs to (`ledger = "<owner>/<name>"`), and a git directory over the le
 repository as its `origin` and names this machine (`knives.machine`): the root's own `.git`, or
 one in `~/.config/knives/ledger-repositories/`, one per repository the ledgers travel through.
 Every write starts `knives ledger sweep` in the background, which commits new entries to the
-machine's own ref, pulls every other machine's, and pushes. One sweep runs at a time and nothing
+machine's own ref, pulls every other machine's, and pushes. One sweep runs at a time, a sweep run
+by hand waits for one already running and reports its own pass, and nothing
 ever rebases. A command that decides from the ledger (`status`, `sync`, `audit`, `pushed`, the
 release plan, cut and edits, `release members` without a `REF`) pulls it first, and says so in
 its problems when it cannot.
