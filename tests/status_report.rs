@@ -548,6 +548,7 @@ fn status_carries_each_branchs_newest_notch_in_json_and_in_text() {
             evidence: Vec::new(),
             pr: None,
             parents: Vec::new(),
+            replaces: None,
         })
         .expect("human note");
     scribe

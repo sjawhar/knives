@@ -478,6 +478,19 @@ impl Store {
         self.stated_in(&target.repo).pull(target.branch.as_str())
     }
 
+    /// The stamp of the live statement of `kind` about `target`, which a
+    /// statement replacing it is stamped after ([`crate::ledger::Draft::replaces`]).
+    /// Read from a store opened for update, it is the newest this machine
+    /// has while it holds the lock its writers take.
+    pub fn statement_stamp(
+        &self,
+        target: &BranchTarget,
+        kind: StatementKind,
+    ) -> Option<jiff::Timestamp> {
+        self.stated_in(&target.repo)
+            .stamp(target.branch.as_str(), kind)
+    }
+
     /// What reading `repo`'s ledger found it could read only in part: an
     /// entry of a kind this knives does not know, or a statement it cannot
     /// read ([`Ledger::read`]). A report about `repo` carries each as a

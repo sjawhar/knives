@@ -112,6 +112,9 @@ pub(crate) fn run_finish(
                 kind: StatementKind::Superseded,
                 value: Some(replacement.to_owned()),
             }),
+            replaces: options
+                .superseded_by
+                .and_then(|_| store.statement_stamp(target, StatementKind::Superseded)),
             ..Draft::event(Some(branch.as_str()), text, pr)
         })?;
     }
@@ -291,15 +294,19 @@ fn finish_claim_gate(
     }
 }
 
-/// Pull `fork`'s ledger before a write that replaces or erases what it read,
-/// and say why it will not write when the pull failed.
+/// Pull `fork`'s ledger before a write built from what it states, and say
+/// why it will not write when the pull failed.
 ///
-/// A `depends` statement replaces the whole list and a forget erases the
-/// statement before it, and the newest statement wins on every machine; built
-/// from a ledger missing another machine's newer statement, either would
-/// replace that statement everywhere, as a release write would check its drop
-/// guard against the wrong cut. So, like a release write, it refuses rather
-/// than write from what this machine happens to have.
+/// A forget erases the statement before it, and the newest statement wins on
+/// every machine, so built from a ledger missing another machine's newer
+/// statement it would erase that statement everywhere, as a release write
+/// would check its drop guard against the wrong cut. A `depends` statement
+/// erases nothing, since the live list is every requirement stated since the
+/// last forget, but it records that the branch must wait from what this
+/// machine last pulled, and says "now requires …" from it: from a ledger it
+/// knows is stale, that would tell the caller a list other machines may
+/// already have changed. So each refuses, like a release write, rather than
+/// write from what this machine happens to have.
 fn pulled_before_replacing(fork: &Fork<'_>, what: &str) -> bool {
     let problems = knives::ledger_sweep::pull(&[&fork.upstream]).problems_for(&fork.upstream);
     for problem in &problems {
@@ -307,8 +314,8 @@ fn pulled_before_replacing(fork: &Fork<'_>, what: &str) -> bool {
     }
     if !problems.is_empty() {
         eprintln!(
-            "{what} not recorded: it replaces what the ledger states, and another machine's \
-             newer statement may be among what could not be pulled"
+            "{what} not recorded: it is built from what the ledger states, and another \
+             machine's newer statement may be among what could not be pulled"
         );
     }
     problems.is_empty()
@@ -382,8 +389,12 @@ pub(crate) fn run_track(
             }),
         )
     };
+    let replaces = statement
+        .as_ref()
+        .and_then(|statement| store.statement_stamp(target, statement.kind));
     scribe_for(fork, bound)?.record(&Draft {
         statement,
+        replaces,
         ..Draft::event(Some(branch.as_str()), text.clone(), stamped)
     })?;
     drop(store);
@@ -459,6 +470,7 @@ pub(crate) fn run_depends(
             kind: StatementKind::Depends,
             value: Some(required.join(",")),
         }),
+        replaces: store.statement_stamp(target, StatementKind::Depends),
         ..Draft::event(
             Some(branch.as_str()),
             format!("requires {}", listed.join(", ")),
@@ -474,7 +486,8 @@ pub(crate) fn run_depends(
 ///
 /// Additive and deduplicated, so declaring the same requirement twice is not an
 /// error and re-running a script does not accumulate duplicates. The result is
-/// the whole list, because each `depends` statement replaces the one before.
+/// the whole list, so each entry reads on its own as everything the branch
+/// needed when it was written.
 fn with_requirements(required: &[Requirement], added: &[Requirement]) -> Vec<String> {
     let mut texts: Vec<String> = required.iter().map(ToString::to_string).collect();
     for requirement in added {

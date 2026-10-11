@@ -1,4 +1,4 @@
-// allow: SIZE_OK: 2092 lines - entry type, storage, filters, and writer are one domain.
+// allow: SIZE_OK: 2306 lines - entry type, storage, filters, and writer are one domain.
 //! What agents did and decided here, in order, forever.
 //!
 //! [`crate::store`] holds current intent and is rewritten whole on every change:
@@ -842,6 +842,11 @@ pub struct Draft<'a> {
     /// The parent set a release cut or edit leaves behind; empty for every
     /// other entry.
     pub parents: Vec<RecordedParent>,
+    /// The stamp of the live statement [`Draft::statement`] replaces, read
+    /// under the state lock ([`crate::statement::Statements::stamp`]). The
+    /// entry is stamped after it whatever this machine's clock says, so a
+    /// writer whose clock runs behind the one that made it still replaces it.
+    pub replaces: Option<jiff::Timestamp>,
 }
 
 impl<'a> Draft<'a> {
@@ -857,6 +862,7 @@ impl<'a> Draft<'a> {
             evidence: Vec::new(),
             pr,
             parents: Vec::new(),
+            replaces: None,
         }
     }
 }
@@ -917,7 +923,7 @@ impl Scribe {
     /// [`Scribe::record`], with the path of the file the entry was written to.
     pub fn record_to(&self, draft: &Draft<'_>) -> Result<(Entry, PathBuf), LedgerError> {
         let entry = Entry {
-            ts: monotonic_now().to_string(),
+            ts: monotonic_after(draft.replaces).to_string(),
             owner: self.owner.clone(),
             email: self
                 .email
@@ -1123,27 +1129,32 @@ fn split_fenced(rest: &str) -> Result<(Frontmatter, String), String> {
 }
 
 /// `Timestamp::now`, bumped to be strictly later than every stamp this process
-/// has handed out.
+/// has handed out, and than `after` when there is one.
 ///
 /// Two draws back-to-back can be equal on a coarse platform clock, and equal
 /// stamps would leave read order to the random filename suffix — the sync
 /// tests assert the order of entries one command writes, so that order must
 /// not be a coin toss. A clock that did not advance is nudged one nanosecond
 /// past the last stamp instead. Across processes the wall clock is the order,
-/// as it always was; the suffix and `create_new` cover genuinely concurrent
-/// writers.
-fn monotonic_now() -> jiff::Timestamp {
+/// as it always was, except that a statement is stamped after the one it
+/// replaces ([`Draft::replaces`]); the suffix and `create_new` cover
+/// genuinely concurrent writers.
+fn monotonic_after(after: Option<jiff::Timestamp>) -> jiff::Timestamp {
     static LAST: std::sync::Mutex<Option<jiff::Timestamp>> = std::sync::Mutex::new(None);
     let mut last = LAST
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let now = jiff::Timestamp::now();
-    let stamp = match *last {
-        Some(previous) if now <= previous => previous + jiff::SignedDuration::from_nanos(1),
-        _ => now,
-    };
+    let stamp = stamp_after(jiff::Timestamp::now(), (*last).max(after));
     *last = Some(stamp);
     stamp
+}
+
+/// `now`, or one nanosecond past `floor` when `now` is not later than it.
+fn stamp_after(now: jiff::Timestamp, floor: Option<jiff::Timestamp>) -> jiff::Timestamp {
+    match floor {
+        Some(floor) if now <= floor => floor + jiff::SignedDuration::from_nanos(1),
+        _ => now,
+    }
 }
 
 #[cfg(test)]
@@ -1739,7 +1750,7 @@ mod tests {
                         // Real writers draw from the monotonic scribe clock; these
                         // do too, so stamps are process-unique and a collision cannot happen.
                         let mut record = entry(Some("feat/alpha"), &format!("{writer}:{index}"));
-                        record.ts = monotonic_now().to_string();
+                        record.ts = monotonic_after(None).to_string();
                         ledger.append(&record).unwrap();
                     }
                 });
@@ -1882,12 +1893,29 @@ mod tests {
     fn stamps_drawn_back_to_back_strictly_advance() {
         // A tight loop outpaces the clock's real granularity somewhere; the
         // bump keeps every stamp strictly later than the one before anyway.
-        let mut previous = monotonic_now();
+        let mut previous = monotonic_after(None);
         for _ in 0..1000 {
-            let next = monotonic_now();
+            let next = monotonic_after(None);
             assert!(next > previous, "stamps must advance: {next} <= {previous}");
             previous = next;
         }
+    }
+
+    #[test]
+    fn a_stamp_is_later_than_the_statement_it_replaces_whatever_the_clock_says() {
+        // Given: this clock, and a live statement stamped five minutes past
+        // it, as a machine whose clock runs ahead stamps one.
+        let now: jiff::Timestamp = "2026-10-11T12:00:00Z".parse().unwrap();
+        let ahead = now + jiff::SignedDuration::from_mins(5);
+
+        // When / Then: what replaces it is stamped one nanosecond after it,
+        // and what replaces a statement from the past is stamped now.
+        assert_eq!(
+            stamp_after(now, Some(ahead)),
+            ahead + jiff::SignedDuration::from_nanos(1)
+        );
+        assert_eq!(stamp_after(now, Some(jiff::Timestamp::UNIX_EPOCH)), now);
+        assert_eq!(stamp_after(now, None), now);
     }
 
     #[test]
@@ -2015,6 +2043,7 @@ mod tests {
                 evidence: vec!["06d778b9".to_owned(), "a-repo#1157".to_owned()],
                 pr: None,
                 parents: Vec::new(),
+                replaces: None,
             })
             .unwrap();
 

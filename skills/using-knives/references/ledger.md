@@ -59,7 +59,7 @@ treating it as a branch. `--evidence` repeats and requires `-m`.
 | `evidence` | Optional commit ids, `file:line`, `<repo>#<number>` or URLs, including other repositories. |
 | `anchor` | Automatic subject tip at write time; absent if it did not resolve. |
 | `pr` | Explicit write stamp, else tracked PR for the subject. |
-| `statement` | What `track`, `depends`, `finish --superseded-by` and `ledger migrate` stated about the branch: `{ kind, value }`, kind `pull`, `fork-only`, `superseded` or `depends` (the whole comma-joined requirement list). Per branch and kind, the entry with the greatest `ts` is live, whatever order entries arrived in; a statement with no value is a forget. An entry without the field states nothing, whatever its prose says. A statement this knives cannot read in full (a kind it does not know, a field other than `kind` and `value`, or a value its kind cannot hold) states nothing, and every read names its file as a problem. |
+| `statement` | What `track`, `depends`, `finish --superseded-by` and `ledger migrate` stated about the branch: `{ kind, value }`, kind `pull`, `fork-only`, `superseded` or `depends` (the whole comma-joined requirement list the writer knew of). Per branch and kind, the entry with the greatest `ts` is live, whatever order entries arrived in; a statement with no value is a forget. A `depends` list is instead every requirement each `depends` statement since the newest `depends` forget names, so two machines that each add one keep both. A statement that replaces a live one is stamped after it, whatever the writer's clock says, so a machine whose clock runs behind still replaces what it read. An entry without the field states nothing, whatever its prose says. A statement this knives cannot read in full (a kind it does not know, a field other than `kind` and `value`, or a value its kind cannot hold) states nothing, and every read names its file as a problem. |
 
 There are two kinds, not three. A disposition selects a class of note.
 `finish --superseded-by` and `start --why` record supersessions and parkings as
@@ -370,15 +370,20 @@ naming what failed. A report still answers from the entries this machine has,
 and exits `3`. A release write refuses on any of them, because its drop guard
 checks against the newest recorded cut and a stale ledger would check against
 the wrong one. So do `depends` and `track --forget`, each exiting `3` having
-written nothing: a `depends` statement replaces the whole list and a forget
-erases the statement before it, so built from a ledger missing another
-machine's newer statement, either would replace that statement on every
-machine. A forget with nothing stated after the pull writes no statement.
+written nothing. A forget erases the statement before it, so built from a
+ledger missing another machine's newer statement, it would erase that
+statement on every machine. A `depends` erases nothing, since every
+requirement stated since the last forget stays live, but it records from what
+this machine last pulled that the branch must wait, and prints the whole list
+as `now requires …`: from a ledger it knows is stale, that list may be missing
+what other machines added. A forget with nothing stated after the pull writes
+no statement.
 `status` also notes how many of a fork's entries the remote lacks, names
 `ledger-sweep.log` when the last sweep failed, and says from
 `ledger-sweep.json` how many of the fork's entries other machines sent through
 a repository this one does not send it through, and how many repeated
 transitions sweeps here discarded. `notch`, `start`, `finish`,
-`track --pr` and `track --fork-only` do not pull: they replace nothing they
-read, and read a statement only to stamp their entry with a pull request
-number.
+`track --pr` and `track --fork-only` do not pull: they build nothing from
+what they read, and read a statement only to stamp their entry with a pull
+request number, and the live statement of the kind they state only to stamp
+theirs after it.

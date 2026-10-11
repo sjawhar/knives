@@ -354,6 +354,7 @@ pub fn run(request: &Request<'_>, output: crate::cli::Output) -> anyhow::Result<
                 evidence: request.evidence.to_vec(),
                 pr,
                 parents: Vec::new(),
+                replaces: None,
             })?;
             Report::Written {
                 repo: repo.to_string(),
