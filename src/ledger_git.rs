@@ -239,6 +239,20 @@ pub enum GitError {
     },
     #[error("{invocation} failed: {stderr}")]
     Failed { invocation: String, stderr: String },
+    #[error(
+        "git rejected this machine's ref {machine} on {remote} as non-fast-forward: another \
+         machine may be committing under the same name; give each machine a unique \
+         knives.machine with `git --git-dir={} config knives.machine <unique-name>` \
+         ({invocation} failed: {stderr})",
+        git_dir.display()
+    )]
+    MachineNameCollision {
+        machine: String,
+        remote: String,
+        git_dir: PathBuf,
+        invocation: String,
+        stderr: String,
+    },
     #[error("{invocation} did not answer with {expected}")]
     Output {
         invocation: String,
@@ -483,17 +497,39 @@ pub fn push(repository: &Repository, remote: &str, machine: &str) -> Result<bool
     if at(&fetched) == Some(commit) {
         return Ok(false);
     }
-    transport(repository.git().args([
+    match transport(repository.git().args([
         "push",
         "--quiet",
         "--no-follow-tags",
         remote,
         &format!("{reference}:{reference}"),
-    ]))?;
+    ])) {
+        Ok(_) => {}
+        Err(GitError::Failed { invocation, stderr })
+            if push_was_rejected_as_non_fast_forward(&stderr) =>
+        {
+            return Err(GitError::MachineNameCollision {
+                machine: machine.to_owned(),
+                remote: remote.to_owned(),
+                git_dir: repository.git_dir().to_owned(),
+                invocation,
+                stderr,
+            });
+        }
+        Err(error) => return Err(error),
+    }
     run(repository
         .git()
         .args(["update-ref", &fetched, commit.as_str()]))?;
     Ok(true)
+}
+
+/// Whether `git push` rejected its only ref because the remote had already
+/// moved it since this machine last fetched.
+fn push_was_rejected_as_non_fast_forward(stderr: &str) -> bool {
+    stderr.contains("non-fast-forward")
+        || stderr.contains("(fetch first)")
+        || (stderr.contains("failed to update ref") && stderr.contains("reference already exists"))
 }
 
 /// Every entry in the forks `repository` carries that `remote` lacks.

@@ -1680,6 +1680,85 @@ fn a_recreated_checkout_sweeping_as_an_existing_machine_is_refused_and_pushes_no
 }
 
 #[test]
+fn a_non_fast_forward_push_names_a_machine_name_collision() {
+    // Given: two config homes whose separate ledger repositories use the same
+    // machine name and each have an entry to commit.
+    let first = a_repo_home();
+    let second = a_repo_home();
+    let (_remote_dir, remote) = bare_remote();
+    let first_root = share(first.path(), "duplicate", &remote);
+    let second_root = share(second.path(), "duplicate", &remote);
+    append(&first_root, "acme/a-repo", 1);
+    append(&second_root, "acme/a-repo", 1);
+    let hook = remote.join("hooks").join("pre-receive");
+    std::fs::write(
+        &hook,
+        "#!/bin/sh\n\
+         waiting=\"$GIT_DIR/first-push-waiting\"\n\
+         release=\"$GIT_DIR/release-first-push\"\n\
+         if [ ! -e \"$waiting\" ]; then\n\
+           : > \"$waiting\"\n\
+           while [ ! -e \"$release\" ]; do sleep 0.01; done\n\
+         fi\n",
+    )
+    .expect("write the pre-receive hook");
+    std::fs::set_permissions(&hook, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+        .expect("make the pre-receive hook executable");
+
+    // When: the second machine commits, but its push pauses before the remote
+    // receives it. The first therefore commits and pushes an unrelated history
+    // under the same ref before the second push is released.
+    let second_sweep = lab::knives_command(
+        second.path(),
+        second.path(),
+        second.path(),
+        &["--json", "ledger", "sweep"],
+    )
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped())
+    .spawn()
+    .expect("start the second sweep");
+    wait_until("the second push to wait at the remote", || {
+        remote.join("first-push-waiting").exists()
+    });
+    assert!(
+        git_in(
+            &second_root.join(".git"),
+            &["rev-parse", "--verify", "refs/knives/duplicate"],
+        )
+        .is_some(),
+        "the second sweep did not commit before waiting to push"
+    );
+    let first_swept = sweep(first.path());
+    assert!(
+        first_swept.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first_swept.stdout)
+    );
+    std::fs::write(remote.join("release-first-push"), "").expect("release the second push");
+    let second_swept = second_sweep
+        .wait_with_output()
+        .expect("wait for the second sweep");
+
+    // Then: the second sweep identifies another machine using its name and
+    // tells the operator how to repair that configuration collision.
+    assert_eq!(
+        second_swept.status.code(),
+        Some(3),
+        "{}",
+        String::from_utf8_lossy(&second_swept.stdout)
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&second_swept.stdout).expect("a sweep report");
+    let problems = problems_of(&report);
+    assert!(
+        problems.contains("another machine may be committing under the same name")
+            && problems.contains("give each machine a unique knives.machine"),
+        "{report}"
+    );
+}
+
+#[test]
 fn a_peer_ref_that_moved_backward_keeps_out_only_that_machines_entries() {
     // Given: three machines sharing one ledger remote. beta has fetched
     // gamma's ref at its second commit, and then the remote's copy of

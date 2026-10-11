@@ -250,6 +250,10 @@ the ledger root has that repository as its `origin`. knives reads two places,
 each a git directory whose working tree is the ledger root,
 `~/.config/knives/ledger/`:
 
+A `ledger` field requires this machine to have read and write access to the
+named repository. Without both, its pull fails and every release write,
+`depends`, and `track --forget` refuses.
+
 - `~/.config/knives/ledger/.git`, the root's own repository, or the git
   directory it names when it is a gitfile (a linked worktree, or `git init
   --separate-git-dir`);
