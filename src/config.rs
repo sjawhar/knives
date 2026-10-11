@@ -444,7 +444,7 @@ impl Registry {
     /// under the registry key, left for `knives ledger migrate` to rename. A
     /// fork whose upstream is a filesystem path is kept under its key still,
     /// and is not listed.
-    pub fn former_names(&self) -> BTreeMap<String, UpstreamName> {
+    pub fn former_names(&self) -> FormerNames {
         self.repos
             .iter()
             .filter_map(|(key, entry)| {
@@ -454,6 +454,10 @@ impl Registry {
             .collect()
     }
 }
+
+/// Each registry key an older knives kept a fork's ledger and state under,
+/// with the name they are kept under now ([`Registry::former_names`]).
+pub type FormerNames = BTreeMap<String, UpstreamName>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {

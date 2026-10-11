@@ -368,7 +368,7 @@ pub fn holds_entries(directory: &Path) -> bool {
 /// on until it does.
 pub fn unmigrated<'a>(
     root: &'a Path,
-    former: &'a crate::store::FormerNames,
+    former: &'a crate::config::FormerNames,
 ) -> impl Iterator<Item = (&'a String, &'a UpstreamName)> + 'a {
     former
         .iter()

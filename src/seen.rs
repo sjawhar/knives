@@ -135,7 +135,7 @@ pub enum SeenError {
 /// key to the fork's upstream name.
 ///
 /// `<registry key>/<workspace>` becomes `<upstream name>/<workspace>`, the
-/// key [`last_seen`] reads, as [`crate::store::renamed`] decides for a
+/// key [`last_seen`] reads, as [`crate::store::migration::renamed`] decides for a
 /// state-file key; a key already under a current name is left alone.
 ///
 /// Held under the sidecar's lock. Where the new key already holds a
@@ -145,7 +145,7 @@ pub enum SeenError {
 /// an empty file, so the migration says so.
 pub fn rename_workspaces(
     path: &Path,
-    former: &crate::store::FormerNames,
+    former: &crate::config::FormerNames,
 ) -> Result<Vec<RenamedSighting>, SeenError> {
     let _lock = FileLock::acquire(path, LockWait::CLAIM)?;
     let Some(mut seen) = read_to_migrate(path)? else {
@@ -178,7 +178,7 @@ pub fn rename_workspaces(
 /// nowhere: for `knives ledger migrate --dry-run`.
 pub fn workspace_renames_at(
     path: &Path,
-    former: &crate::store::FormerNames,
+    former: &crate::config::FormerNames,
 ) -> Result<Vec<RenamedSighting>, SeenError> {
     Ok(read_to_migrate(path)?
         .map(|seen| workspace_renames(&seen, former))
@@ -207,11 +207,11 @@ fn read_to_migrate(path: &Path) -> Result<Option<Seen>, SeenError> {
 }
 
 /// Each workspace sighting in `seen` keyed by a former name, with its key now.
-fn workspace_renames(seen: &Seen, former: &crate::store::FormerNames) -> Vec<RenamedSighting> {
+fn workspace_renames(seen: &Seen, former: &crate::config::FormerNames) -> Vec<RenamedSighting> {
     seen.workspaces
         .keys()
         .filter_map(|key| {
-            crate::store::renamed(former, key, '/').map(|to| RenamedSighting {
+            crate::store::migration::renamed(former, key, '/').map(|to| RenamedSighting {
                 from: key.clone(),
                 to,
             })
@@ -624,7 +624,7 @@ mod tests {
             return;
         }
         let former =
-            crate::store::FormerNames::from([("demo".to_owned(), UpstreamName::new("acme/demo"))]);
+            crate::config::FormerNames::from([("demo".to_owned(), UpstreamName::new("acme/demo"))]);
 
         // When: the migration renames it.
         let error = super::rename_workspaces(&path, &former);

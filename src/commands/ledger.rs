@@ -15,12 +15,14 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use crate::cli::{Exit, Output};
+use crate::config::FormerNames;
 use crate::ids::{Requirement, UpstreamName};
 use crate::ledger::{Draft, Ledger, Scribe, inline_human_text, unmigrated};
 use crate::ledger_sweep::{self, Contended, Swept, Tally, Waited};
 use crate::lock::FileLock;
 use crate::statement::{Statement, StatementKind, Statements};
-use crate::store::{FormerNames, LegacyStatement, Renamed, Store, renamed};
+use crate::store::Store;
+use crate::store::migration::{LegacyStatement, Renamed, renamed};
 
 /// What became of a sweep run by hand.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
