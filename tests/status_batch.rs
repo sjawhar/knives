@@ -96,7 +96,6 @@ fn one_batch_answers_review_age_and_checks_for_every_branch_at_once() {
             forge: Some(&forge),
             cache: None,
             registry: None,
-            ledger: None,
             workers: 1,
         },
     )
@@ -157,7 +156,6 @@ fn a_measured_gather_reports_the_same_report_and_a_total_that_covers_its_phases(
         forge: None,
         cache: None,
         registry: None,
-        ledger: None,
         workers: 1,
     };
 
@@ -338,7 +336,6 @@ fn the_forge_is_asked_once_for_the_whole_report_with_one_entry_per_number() {
             forge: Some(&forge),
             cache: None,
             registry: None,
-            ledger: None,
             workers: 1,
         },
     )
@@ -405,7 +402,6 @@ fn a_failed_facts_batch_clears_review_and_check_cells() {
             forge: Some(&forge),
             cache: None,
             registry: None,
-            ledger: None,
             workers: 1,
         },
     )
@@ -462,7 +458,6 @@ fn a_consulted_false_report_carries_an_unanswered_stated_pull() {
             forge: Some(&forge),
             cache: None,
             registry: None,
-            ledger: None,
             workers: 1,
         },
     )
@@ -525,7 +520,6 @@ fn stated_pulls_and_dependencies_are_answered_from_the_one_batch() {
             forge: Some(&forge),
             cache: None,
             registry: Some(&registry),
-            ledger: None,
             workers: 1,
         },
     )
@@ -601,7 +595,6 @@ fn a_dependency_on_a_fork_named_by_anything_but_its_upstream_name_is_a_problem()
             forge: Some(&forge),
             cache: None,
             registry: Some(&registry),
-            ledger: None,
             workers: 1,
         },
     )
@@ -645,7 +638,6 @@ fn landed_verdicts_come_from_the_cache_when_the_key_matches() {
         forge: Some(&forge),
         cache: Some(cache.path()),
         registry: None,
-        ledger: None,
         workers: 1,
     };
 
@@ -716,7 +708,6 @@ fn a_probe_free_run_preserves_the_landed_section() {
         forge: Some(&forge),
         cache: Some(cache.path()),
         registry: None,
-        ledger: None,
         workers: 1,
     };
     let without_probe = || knives::commands::status::Options {
@@ -724,7 +715,6 @@ fn a_probe_free_run_preserves_the_landed_section() {
         forge: Some(&forge),
         cache: Some(cache.path()),
         registry: None,
-        ledger: None,
         workers: 1,
     };
 
@@ -774,7 +764,6 @@ fn an_unresolvable_trunk_fails_loudly_and_touches_no_landed_cache() {
         forge: Some(&forge),
         cache: Some(cache.path()),
         registry: None,
-        ledger: None,
         workers: 1,
     };
 
@@ -835,7 +824,6 @@ fn parallel_landed_probes_answer_exactly_what_serial_ones_did() {
         forge: None,
         cache: None,
         registry: None,
-        ledger: None,
         workers,
     };
 

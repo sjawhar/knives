@@ -426,6 +426,10 @@ impl Transitions<'_> {
                 .as_deref()
                 .map(|branch| BranchTarget::new(scribe.repo().to_owned(), BranchName::new(branch)))
                 .and_then(|target| store.tracked_pull(&target));
+            // Read here, not taken from the store's read at open: this runs
+            // after the forge calls, seconds later, and an entry a concurrent
+            // sweep delivered from a peer meanwhile is what stops this
+            // transition being written twice.
             let history = match &mut self.history {
                 Some(history) => history,
                 None => self.history.insert(scribe.ledger().entries()?),

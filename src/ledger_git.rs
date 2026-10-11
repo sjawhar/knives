@@ -423,11 +423,23 @@ impl Pending {
 /// the call refuses with [`GitError::NotOwn`] instead, as [`push`] does.
 pub fn pending(repository: &Repository, machine: &str) -> Result<Pending, GitError> {
     let reference = own_ref(machine)?;
-    let mut previous = None;
-    let mut base = Vec::new();
-    let mut carried = BTreeSet::new();
+    let refs = references(repository, &[OWN, FETCHED])?;
+    let previous = refs
+        .iter()
+        .find(|(name, _)| *name == reference)
+        .map(|(_, commit)| commit.clone());
+    let base = previous
+        .as_ref()
+        .map(|commit| tree_items(repository, commit))
+        .transpose()?
+        .unwrap_or_default();
+    let mut carried: BTreeSet<PathBuf> = base
+        .iter()
+        .filter(|item| item.mode.is_blob())
+        .map(|item| item.path.clone())
+        .collect();
     let mut fetched_copy = None;
-    for (name, commit) in references(repository, &[OWN, FETCHED])? {
+    for (name, commit) in refs {
         if let Some((remote, fetched)) = name
             .strip_prefix(FETCHED)
             .and_then(|rest| rest.split_once('/'))
@@ -435,24 +447,17 @@ pub fn pending(repository: &Repository, machine: &str) -> Result<Pending, GitErr
         {
             fetched_copy.get_or_insert_with(|| remote.to_owned());
         }
-        let items = tree_items(repository, &commit)?;
-        if name == reference {
-            carried.extend(
-                items
-                    .iter()
-                    .filter(|item| item.mode.is_blob())
-                    .map(|item| item.path.clone()),
-            );
-            base = items;
-            previous = Some(commit);
-        } else {
-            carried.extend(
-                items
-                    .into_iter()
-                    .filter(|item| item.mode.is_blob())
-                    .map(|item| item.path),
-            );
+        // This machine's own tree is listed once, above, whichever ref names
+        // its commit: in steady state the fetched copy of its ref does too.
+        if name == reference || previous.as_ref() == Some(&commit) {
+            continue;
         }
+        carried.extend(
+            tree_items(repository, &commit)?
+                .into_iter()
+                .filter(|item| item.mode.is_blob())
+                .map(|item| item.path),
+        );
     }
     if previous.is_none()
         && let Some(remote) = fetched_copy

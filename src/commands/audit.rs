@@ -14,7 +14,7 @@ use crate::ids::{
     BookmarkRef, BranchName, BranchTarget, CommitId, UpstreamName, is_release_name, short_id,
 };
 use crate::jj::{self, Repo};
-use crate::ledger::{Entry, Ledger};
+use crate::ledger::Entry;
 use crate::release_model::carried_from_tips;
 use crate::snapshot::{self, SnapshotConfig};
 use crate::store::Store;
@@ -153,7 +153,7 @@ pub fn gather(input: &AuditInput<'_>) -> Report {
             published: live.release(),
             scheme: &scheme,
             publish_remote: entry.publish_remote(),
-            ledger: &Ledger::for_fork(fork),
+            entries: input.store.ledger_entries(&fork.upstream),
         },
     );
     add_misplaced_origin_release_refs(&mut report, live.origin(), &scheme, entry.publish_remote());
@@ -356,7 +356,7 @@ struct ReleaseDriftScan<'a> {
     published: &'a BTreeMap<String, CommitId>,
     scheme: &'a crate::ids::ReleaseScheme,
     publish_remote: &'a str,
-    ledger: &'a Ledger,
+    entries: &'a [Entry],
 }
 
 struct ReleaseDrift<'a> {
@@ -372,17 +372,8 @@ fn add_release_drifts(report: &mut Report, scan: &ReleaseDriftScan<'_>) {
         published,
         scheme,
         publish_remote,
-        ledger,
+        entries,
     } = *scan;
-    let entries = match ledger.entries() {
-        Ok(entries) => entries,
-        Err(error) => {
-            report
-                .problems
-                .push(format!("could not read ledger: {error}"));
-            return;
-        }
-    };
     for (branch, current) in local
         .iter()
         .filter(|(branch, _)| is_release_name(branch, scheme))
@@ -390,7 +381,7 @@ fn add_release_drifts(report: &mut Report, scan: &ReleaseDriftScan<'_>) {
         add_release_drift(
             report,
             ReleaseDrift {
-                entries: &entries,
+                entries,
                 reference: BookmarkRef::Local(branch.clone()),
                 current,
                 source: "local",
@@ -408,7 +399,7 @@ fn add_release_drifts(report: &mut Report, scan: &ReleaseDriftScan<'_>) {
         add_release_drift(
             report,
             ReleaseDrift {
-                entries: &entries,
+                entries,
                 reference: BookmarkRef::Remote {
                     branch,
                     remote: crate::ids::RemoteName::new(publish_remote),
@@ -923,6 +914,7 @@ mod tests {
                 parents: Vec::new(),
             })
             .expect("record cut");
+        let entries = ledger.entries().expect("read the cut back");
         let mut report = Report::new("demo");
         let published = BTreeMap::from([(
             "refs/heads/release/2026-08-15".to_owned(),
@@ -936,7 +928,7 @@ mod tests {
                 published: &published,
                 scheme: &crate::ids::ReleaseScheme::Dated,
                 publish_remote: "release",
-                ledger: &ledger,
+                entries: &entries,
             },
         );
 

@@ -4,32 +4,9 @@ use crate::commands::status::{BranchRow, ClaimCell, LastNotch, RepoNotches, Repo
 use crate::detect::{Finding, FindingKind, Subject};
 use crate::ids::{BranchName, UpstreamName, WorkspaceName};
 use crate::jj::{MAX_ACTIVITY_OPS, Repo, WorkspaceActivity};
-use crate::ledger::{Entry as Notch, Ledger};
+use crate::ledger::Entry as Notch;
 use crate::seen::{LastSeen, Seen, last_seen};
 use crate::store::{Claim, Store};
-
-/// Every notch in this repository's ledger, read once for the whole report.
-///
-/// One local file read per repository rather than one per branch. A ledger that
-/// exists and cannot be read is an unanswered question rather than an absence:
-/// a report that quietly showed no breadcrumbs would say this fork's history was
-/// never written. So is an entry or a statement this knives reads only in part
-/// ([`Ledger::read`]): each is a problem naming its file.
-pub(super) fn notches_from_ledger(ledger: Option<&Ledger>, report: &mut Report) -> Vec<Notch> {
-    let Some(ledger) = ledger else {
-        return Vec::new();
-    };
-    match ledger.read() {
-        Ok(read) => {
-            report.problems.extend(read.problems);
-            read.entries
-        }
-        Err(error) => {
-            report.problems.push(format!("ledger unavailable: {error}"));
-            Vec::new()
-        }
-    }
-}
 
 pub(super) fn repo_notches(notches: &[Notch]) -> Option<RepoNotches> {
     let last = LastNotch::of(notches.iter().filter(|notch| notch.subject.is_none()))?;

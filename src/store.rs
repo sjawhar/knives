@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{ConfigError, default_config_path};
 use crate::ids::{BranchTarget, Requirement, UpstreamName};
-use crate::ledger::{Ledger, LedgerError, unmigrated};
+use crate::ledger::{Entry, Ledger, LedgerError, unmigrated};
 use crate::lock::{FileLock, LockError, LockWait};
 use crate::statement::{Statement, StatementKind, Statements};
 
@@ -231,6 +231,9 @@ pub struct Store {
     /// What reading each of those ledgers found it could read only in part
     /// ([`Ledger::read`]).
     ledger_problems: BTreeMap<UpstreamName, Vec<String>>,
+    /// Every entry of each of those ledgers this knives can read, oldest
+    /// first, from that one read: what a report showing them answers from.
+    entries: BTreeMap<UpstreamName, Vec<Entry>>,
     /// Present only for a store opened to be written. Held, not read: its whole
     /// job is to exist until this value is dropped.
     _lock: Option<FileLock>,
@@ -342,12 +345,14 @@ impl Store {
         } else {
             State::default()
         };
-        let (statements, ledger_problems) = read_statements(&path.with_file_name("ledger"), repos)?;
+        let (statements, ledger_problems, entries) =
+            read_statements(&path.with_file_name("ledger"), repos)?;
         Ok(Self {
             path,
             state,
             statements,
             ledger_problems,
+            entries,
             _lock: lock,
         })
     }
@@ -498,6 +503,25 @@ impl Store {
     /// states.
     pub fn ledger_problems(&self, repo: &UpstreamName) -> &[String] {
         self.ledger_problems.get(repo).map_or(&[], Vec::as_slice)
+    }
+
+    /// Every entry of `repo`'s ledger this knives can read, oldest first, as
+    /// the store read it when it opened ([`Ledger::read`]).
+    ///
+    /// # Panics
+    ///
+    /// When the store was not opened for `repo`, as asking it about a
+    /// statement there does.
+    #[allow(
+        clippy::panic,
+        reason = "a store asked about a repository it was not opened for is a knives bug; answering no entries would read as a ledger nobody wrote"
+    )]
+    pub fn ledger_entries(&self, repo: &UpstreamName) -> &[Entry] {
+        self.entries.get(repo).unwrap_or_else(|| {
+            panic!(
+                "knives bug: asked about {repo}'s ledger entries, but the store was opened without {repo}'s ledger"
+            )
+        })
     }
 
     #[allow(
@@ -765,7 +789,8 @@ impl State {
 }
 
 /// The live statements of each of `repos`, from its ledger beside the state
-/// file, and what reading each ledger found it could read only in part.
+/// file, what reading each ledger found it could read only in part, and the
+/// entries it read.
 ///
 /// `ledger/<owner>/<name>/` beside `state.json` is where
 /// [`crate::ledger::default_ledger_path`] puts each fork's ledger, so a store
@@ -775,20 +800,24 @@ impl State {
 fn read_statements(root: &Path, repos: &[&UpstreamName]) -> Result<StatementsRead, StoreError> {
     let mut statements = BTreeMap::new();
     let mut problems = BTreeMap::new();
+    let mut entries = BTreeMap::new();
     for repo in repos {
         let read = Ledger::at(root.join(repo.as_str())).read()?;
         statements.insert((*repo).clone(), Statements::from_entries(&read.entries));
         if !read.problems.is_empty() {
             problems.insert((*repo).clone(), read.problems);
         }
+        entries.insert((*repo).clone(), read.entries);
     }
-    Ok((statements, problems))
+    Ok((statements, problems, entries))
 }
 
-/// [`read_statements`]' answer: statements and problems, each by repository.
+/// [`read_statements`]' answer: statements, problems and entries, each by
+/// repository.
 type StatementsRead = (
     BTreeMap<UpstreamName, Statements>,
     BTreeMap<UpstreamName, Vec<String>>,
+    BTreeMap<UpstreamName, Vec<Entry>>,
 );
 
 #[cfg(test)]

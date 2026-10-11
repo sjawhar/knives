@@ -936,7 +936,6 @@ fn run_status(ground: Ground<'_>, view: StatusView<'_>) -> anyhow::Result<Exit> 
                         .iter()
                         .map(|chosen| {
                             status_row(chosen, |fork| {
-                                let ledger = Ledger::for_fork(fork);
                                 status::gather_timed(
                                     fork,
                                     store,
@@ -945,7 +944,6 @@ fn run_status(ground: Ground<'_>, view: StatusView<'_>) -> anyhow::Result<Exit> 
                                         forge,
                                         cache,
                                         registry: Some(registry),
-                                        ledger: Some(&ledger),
                                         workers: probe_workers,
                                     },
                                 )

@@ -22,6 +22,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::OnceLock;
 
 use crate::config::{ConfigError, Registry};
 use crate::ids::UpstreamName;
@@ -1037,11 +1038,17 @@ fn remove_if_present(path: PathBuf) -> Result<(), SweepError> {
     }
 }
 
+/// What a destination has that its remote does not yet
+/// ([`ledger_git::unsent`]), worked out for the whole destination at the
+/// first report that asks, or why it could not be.
+type Unsent = OnceLock<Result<BTreeSet<PathBuf>, String>>;
+
 /// What pulling the ledger before a decision found, per fork asked about.
 #[derive(Debug, Default)]
 pub struct Pulled {
     root: PathBuf,
-    destinations: Vec<Destination>,
+    /// Each destination pulled through, beside its [`Unsent`].
+    destinations: Vec<(Destination, Unsent)>,
     problems: BTreeMap<UpstreamName, Vec<String>>,
     /// [`Destinations::unclaimed`]: a problem for every fork asked about.
     unclaimed: Vec<String>,
@@ -1050,6 +1057,9 @@ pub struct Pulled {
     /// By destination, what each pull that succeeded left unread
     /// ([`ledger_git::Materialised::skipped`]).
     skipped: BTreeMap<String, BTreeMap<String, usize>>,
+    /// The [`sweep_record`] brought up to date by `skipped`, read at the
+    /// first report that asks.
+    kept: OnceLock<Result<Kept, String>>,
 }
 
 impl Pulled {
@@ -1079,17 +1089,23 @@ impl Pulled {
     /// directory sets that this knives passed over.
     pub fn backlog_for(&self, fork: &UpstreamName) -> Vec<String> {
         let mut notes = Vec::new();
-        if let Some(destination) = self
+        if let Some((destination, unsent)) = self
             .destinations
             .iter()
-            .find(|destination| destination.carries(fork))
+            .find(|(destination, _)| destination.carries(fork))
         {
-            let unsent = ledger_git::unsent(&destination.repository, REMOTE).map(|paths| {
-                paths
-                    .iter()
-                    .filter(|path| path.starts_with(fork.as_str()))
-                    .count()
-            });
+            let unsent = unsent
+                .get_or_init(|| {
+                    ledger_git::unsent(&destination.repository, REMOTE)
+                        .map_err(|error| error.to_string())
+                })
+                .as_ref()
+                .map(|paths| {
+                    paths
+                        .iter()
+                        .filter(|path| path.starts_with(fork.as_str()))
+                        .count()
+                });
             let log = sweep_log(&self.root);
             let failed = log
                 .exists()
@@ -1114,14 +1130,16 @@ impl Pulled {
                 (waiting, failed) => waiting.or(failed),
             });
         }
-        match Kept::read(&self.root) {
-            Ok(mut kept) => {
-                for (through, skipped) in &self.skipped {
-                    kept.pulled_through(through, skipped);
-                }
-                notes.extend(kept.notes_for(fork));
+        let kept = self.kept.get_or_init(|| {
+            let mut kept = Kept::read(&self.root).map_err(|error| error.to_string())?;
+            for (through, skipped) in &self.skipped {
+                kept.pulled_through(through, skipped);
             }
-            Err(error) => notes.push(error.to_string()),
+            Ok(kept)
+        });
+        match kept {
+            Ok(kept) => notes.extend(kept.notes_for(fork)),
+            Err(error) => notes.push(error.clone()),
         }
         notes.extend(self.ignored.iter().cloned());
         notes
@@ -1211,7 +1229,7 @@ pub fn pull_at(root: &Path, forks: &[&UpstreamName]) -> Pulled {
                     .push(problem.clone());
             }
         }
-        pulled.destinations.push(destination);
+        pulled.destinations.push((destination, OnceLock::new()));
     }
     pulled
 }

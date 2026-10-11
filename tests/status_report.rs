@@ -255,7 +255,6 @@ fn status_with_the_landed_probe_reports_a_merged_branch_and_leaves_no_trace() {
             forge: None,
             cache: None,
             registry: None,
-            ledger: None,
             workers: 1,
         },
     )
@@ -353,7 +352,6 @@ fn status_reports_branch_overlap_after_upstream_advances_without_landed_probe() 
             forge: None,
             cache: None,
             registry: None,
-            ledger: None,
             workers: 1,
         },
     )
@@ -397,7 +395,6 @@ fn status_reports_a_branch_carried_elsewhere() {
             forge: None,
             cache: None,
             registry: None,
-            ledger: None,
             workers: 1,
         },
     )
@@ -449,7 +446,6 @@ fn status_reports_a_carrier_for_a_closed_pull_request() {
             forge: Some(&forge),
             cache: None,
             registry: None,
-            ledger: None,
             workers: 1,
         },
     )
@@ -501,7 +497,6 @@ fn status_does_not_report_trunk_as_a_carrier_without_landed_probe() {
             forge: None,
             cache: None,
             registry: None,
-            ledger: None,
             workers: 1,
         },
     )
@@ -530,10 +525,8 @@ fn status_carries_each_branchs_newest_notch_in_json_and_in_text() {
         lab.work.display().to_string(),
     );
     let state = tempfile::tempdir().expect("state directory");
-    let store = Store::open(state.path().join("state.json"), &[&name]).expect("open store");
-    let ledger = knives::ledger::Ledger::at(state.path().join("demo"));
     let scribe = knives::ledger::Scribe::new(
-        ledger.clone(),
+        knives::ledger::Ledger::at(state.path().join("ledger").join("demo")),
         name.clone(),
         lab.work.clone(),
         "ses_fff688".to_owned(),
@@ -565,6 +558,7 @@ fn status_carries_each_branchs_newest_notch_in_json_and_in_text() {
             None,
         )
         .expect("other branch");
+    let store = Store::open(state.path().join("state.json"), &[&name]).expect("open store");
 
     // When: status gathers with the ledger available
     let report = status::gather(
@@ -575,7 +569,6 @@ fn status_carries_each_branchs_newest_notch_in_json_and_in_text() {
             forge: None,
             cache: None,
             registry: None,
-            ledger: Some(&ledger),
             workers: 1,
         },
     )
@@ -642,10 +635,8 @@ fn status_carries_repo_level_notches_in_json_and_text() {
     let name = knives::ids::UpstreamName::new("demo");
     let entry = lab_entry(&lab);
     let state = tempfile::tempdir().expect("state directory");
-    let store = Store::open(state.path().join("state.json"), &[&name]).expect("open store");
-    let ledger = knives::ledger::Ledger::at(state.path().join("demo"));
     let scribe = knives::ledger::Scribe::new(
-        ledger.clone(),
+        knives::ledger::Ledger::at(state.path().join("ledger").join("demo")),
         name.clone(),
         lab.work.clone(),
         "ses_fff688".to_owned(),
@@ -653,6 +644,7 @@ fn status_carries_repo_level_notches_in_json_and_text() {
     scribe
         .event(None, "release remote needs a refresh".to_owned(), None)
         .expect("repo-level notch");
+    let store = Store::open(state.path().join("state.json"), &[&name]).expect("open store");
 
     let report = status::gather(
         &lab::lab_fork(&lab, name.as_str(), &entry),
@@ -662,7 +654,6 @@ fn status_carries_repo_level_notches_in_json_and_text() {
             forge: None,
             cache: None,
             registry: None,
-            ledger: Some(&ledger),
             workers: 1,
         },
     )
@@ -709,7 +700,6 @@ fn status_reports_a_repo_level_immutable_heads_rule_that_differs_from_the_forks(
             forge: None,
             cache: None,
             registry: None,
-            ledger: None,
             workers: 1,
         },
     )
@@ -755,7 +745,6 @@ fn status_is_silent_about_the_forks_own_immutable_heads_rule() {
             forge: None,
             cache: None,
             registry: None,
-            ledger: None,
             workers: 1,
         },
     )

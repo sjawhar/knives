@@ -38,7 +38,6 @@ fn gather(
             forge: Some(forge),
             cache: None,
             registry: None,
-            ledger: None,
             workers: 1,
         },
     )
