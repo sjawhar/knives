@@ -1057,10 +1057,11 @@ fn run_status(ground: Ground<'_>, view: StatusView<'_>) -> anyhow::Result<Exit> 
     // One document per invocation: an array under `--all`, the object otherwise.
     let mut worst = Exit::Ok;
     let mut reports = Vec::with_capacity(rows.len());
+    let backlog = pulled.backlog();
     for ((mut report, timings), chosen) in rows.into_iter().zip(&chosen) {
         let upstream = chosen.upstream();
         report.problems.extend(pulled.problems_for(&upstream));
-        report.notes.extend(pulled.backlog_for(&upstream));
+        report.notes.extend(backlog.for_fork(&upstream));
         // stderr, so a timed run's stdout is still the report a script parses.
         if let Some(timings) = timings
             && knives::timing::enabled()

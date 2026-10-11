@@ -22,7 +22,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::OnceLock;
 
 use crate::config::{ConfigError, Registry};
 use crate::ids::UpstreamName;
@@ -458,7 +457,7 @@ pub fn sweep_record(root: &Path) -> PathBuf {
 }
 
 /// What sweeps did to this machine's ledger that `status` reports, since a
-/// sweep a write hands off has nowhere to say it ([`Pulled::backlog_for`]).
+/// sweep a write hands off has nowhere to say it ([`Pulled::backlog`]).
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Kept {
@@ -1064,17 +1063,12 @@ fn remove_if_present(path: PathBuf) -> Result<(), SweepError> {
     }
 }
 
-/// What a destination has that its remote does not yet
-/// ([`ledger_git::unsent`]), worked out for the whole destination at the
-/// first report that asks, or why it could not be.
-type Unsent = OnceLock<Result<BTreeSet<PathBuf>, String>>;
-
 /// What pulling the ledger before a decision found, per fork asked about.
 #[derive(Debug, Default)]
 pub struct Pulled {
     root: PathBuf,
-    /// Each destination pulled through, beside its [`Unsent`].
-    destinations: Vec<(Destination, Unsent)>,
+    /// Each destination pulled through.
+    destinations: Vec<Destination>,
     problems: BTreeMap<UpstreamName, Vec<String>>,
     /// [`Destinations::unclaimed`]: a problem for every fork asked about.
     unclaimed: Vec<String>,
@@ -1083,9 +1077,6 @@ pub struct Pulled {
     /// By destination, what each pull that succeeded left unread
     /// ([`ledger_git::Materialised::skipped`]).
     skipped: BTreeMap<String, BTreeMap<String, usize>>,
-    /// The [`sweep_record`] brought up to date by `skipped`, read at the
-    /// first report that asks.
-    kept: OnceLock<Result<Kept, String>>,
 }
 
 impl Pulled {
@@ -1105,6 +1096,50 @@ impl Pulled {
         self.problems.get(fork).cloned().unwrap_or_default()
     }
 
+    /// What `status` notes about each fork's ledger beyond its problems,
+    /// worked out once for the whole pull: what each destination has that
+    /// its remote does not yet ([`ledger_git::unsent`]), and the
+    /// [`sweep_record`] brought up to date by this pull ([`Backlog::for_fork`]).
+    pub fn backlog(&self) -> Backlog<'_> {
+        let unsent = self
+            .destinations
+            .iter()
+            .map(|destination| {
+                let unsent = ledger_git::unsent(&destination.repository, REMOTE)
+                    .map_err(|error| error.to_string());
+                (destination, unsent)
+            })
+            .collect();
+        let kept = Kept::read(&self.root)
+            .map(|mut kept| {
+                for (through, skipped) in &self.skipped {
+                    kept.pulled_through(through, skipped);
+                }
+                kept
+            })
+            .map_err(|error| error.to_string());
+        Backlog {
+            pulled: self,
+            unsent,
+            kept,
+        }
+    }
+}
+
+/// What a pull left to say about each fork's ledger beyond its problems
+/// ([`Pulled::backlog`]).
+#[derive(Debug)]
+pub struct Backlog<'a> {
+    pulled: &'a Pulled,
+    /// Each destination pulled through, with what it has that its remote
+    /// does not yet, or why that could not be counted.
+    unsent: Vec<(&'a Destination, Result<BTreeSet<PathBuf>, String>)>,
+    /// The [`sweep_record`] brought up to date by the pull's `skipped`, or
+    /// why it could not be read.
+    kept: Result<Kept, String>,
+}
+
+impl Backlog<'_> {
     /// What `status` notes about `fork`'s ledger beyond its problems: how
     /// many of its entries its remote does not have yet, and where the last
     /// sweep's failures are when it failed, as one line; then what no one
@@ -1113,26 +1148,20 @@ impl Pulled {
     /// a repository this machine does not send the fork through, and
     /// repeated transitions discarded; then each `knives.*` key a git
     /// directory sets that this knives passed over.
-    pub fn backlog_for(&self, fork: &UpstreamName) -> Vec<String> {
+    pub fn for_fork(&self, fork: &UpstreamName) -> Vec<String> {
         let mut notes = Vec::new();
         if let Some((destination, unsent)) = self
-            .destinations
+            .unsent
             .iter()
             .find(|(destination, _)| destination.carries(fork))
         {
-            let unsent = unsent
-                .get_or_init(|| {
-                    ledger_git::unsent(&destination.repository, REMOTE)
-                        .map_err(|error| error.to_string())
-                })
-                .as_ref()
-                .map(|paths| {
-                    paths
-                        .iter()
-                        .filter(|path| path.starts_with(fork.as_str()))
-                        .count()
-                });
-            let log = sweep_log(&self.root);
+            let unsent = unsent.as_ref().map(|paths| {
+                paths
+                    .iter()
+                    .filter(|path| path.starts_with(fork.as_str()))
+                    .count()
+            });
+            let log = sweep_log(&self.pulled.root);
             let failed = log
                 .exists()
                 .then(|| format!("the last ledger sweep failed: see {}", log.display()));
@@ -1156,18 +1185,11 @@ impl Pulled {
                 (waiting, failed) => waiting.or(failed),
             });
         }
-        let kept = self.kept.get_or_init(|| {
-            let mut kept = Kept::read(&self.root).map_err(|error| error.to_string())?;
-            for (through, skipped) in &self.skipped {
-                kept.pulled_through(through, skipped);
-            }
-            Ok(kept)
-        });
-        match kept {
+        match &self.kept {
             Ok(kept) => notes.extend(kept.notes_for(fork)),
             Err(error) => notes.push(error.clone()),
         }
-        notes.extend(self.ignored.iter().cloned());
+        notes.extend(self.pulled.ignored.iter().cloned());
         notes
     }
 }
@@ -1255,7 +1277,7 @@ pub fn pull_at(root: &Path, registry: &Registry, forks: &[&UpstreamName]) -> Pul
                     .push(problem.clone());
             }
         }
-        pulled.destinations.push((destination, OnceLock::new()));
+        pulled.destinations.push(destination);
     }
     pulled
 }
@@ -1642,7 +1664,7 @@ mod tests {
         let pulled = pull_at(&root, &loaded(&root), &[&a_repo]);
 
         assert!(pulled.problems_for(&a_repo).is_empty());
-        assert!(pulled.backlog_for(&a_repo).is_empty());
+        assert!(pulled.backlog().for_fork(&a_repo).is_empty());
     }
 
     #[test]
