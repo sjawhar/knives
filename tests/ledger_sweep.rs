@@ -291,6 +291,59 @@ fn a_sweep_that_finds_the_lock_held_leaves_at_once_as_busy() {
 }
 
 #[test]
+fn a_sweep_run_by_hand_while_another_holds_the_lock_waits_and_reports_its_own_failed_push() {
+    // Given: a machine with an entry to send, a ledger remote that refuses
+    // every push, and its ledger lock held by a process that names itself
+    // there, as a running sweep does.
+    let home = a_repo_home();
+    let (_remote_dir, remote) = bare_remote();
+    let hook = remote.join("hooks").join("pre-receive");
+    std::fs::write(
+        &hook,
+        "#!/bin/sh\necho 'push refused by the test' >&2\nexit 1\n",
+    )
+    .expect("write the pre-receive hook");
+    std::fs::set_permissions(&hook, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+        .expect("make the hook executable");
+    let root = share(home.path(), "alpha", &remote);
+    append(&root, "acme/a-repo", 1);
+    let mut held = hold_sweep_lock(home.path());
+    std::io::Write::write_all(&mut held, format!("{}\n", std::process::id()).as_bytes())
+        .expect("name the holder");
+
+    // When: a sweep is run by hand, and the holder lets go a moment later.
+    let mut child = lab::knives_command(
+        home.path(),
+        home.path(),
+        home.path(),
+        &["--json", "ledger", "sweep"],
+    )
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped())
+    .spawn()
+    .expect("start the sweep");
+    std::thread::sleep(Duration::from_secs(2));
+    let early = child.try_wait().expect("look at the sweep");
+    drop(held);
+    let swept = child.wait_with_output().expect("wait for the sweep");
+    let stdout = String::from_utf8_lossy(&swept.stdout);
+
+    // Then: it waited for the holder rather than leaving, ran its own pass,
+    // and reports that pass: swept, naming the sweep it waited for, with the
+    // refused push as a problem and exit 3.
+    assert!(early.is_none(), "the sweep left at once: {stdout}");
+    assert_eq!(swept.status.code(), Some(3), "{stdout}");
+    let report: serde_json::Value = serde_json::from_str(&stdout).expect("JSON");
+    assert_eq!(report["outcome"], "swept", "{report}");
+    assert_eq!(report["waited"]["pid"], std::process::id(), "{report}");
+    assert!(
+        problems_of(&report).contains("push refused by the test"),
+        "{report}"
+    );
+    assert_eq!(entries_on(&remote, "alpha"), 0);
+}
+
+#[test]
 fn a_sweep_with_nothing_new_does_nothing_and_succeeds() {
     // Given: a machine whose one entry is already swept.
     let home = a_repo_home();
