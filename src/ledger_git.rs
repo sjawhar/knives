@@ -1562,6 +1562,7 @@ mod tests {
             "acme/.GIT",
             "acme\\tool/x",
             "acme/to\\ol",
+            "ac\u{1b}me/tool",
         ] {
             assert!(
                 matches!(

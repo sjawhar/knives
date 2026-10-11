@@ -603,7 +603,7 @@ fn a_peer_tree_naming_what_no_knives_writes_is_refused_and_nothing_is_written() 
     // Given: peer refs carrying a valid entry under a file name holding
     // terminal control sequences, under names no knives writes, and under
     // an owner or repository directory no fork could be kept under (a `\`,
-    // which `commit_nested`'s printf reads as `\\`).
+    // which `commit_nested`'s printf reads as `\\`, or a control character).
     let (root, remote) = lab::bare_remote();
     let beta = machine(root.path(), "beta", &remote);
     let red = "20261011T120000.000000000Z-\u{1b}[31mRED\u{1b}[0m.md";
@@ -613,6 +613,8 @@ fn a_peer_tree_naming_what_no_knives_writes_is_refused_and_nothing_is_written() 
         ["acme", "a-repo", "20261011T120000.000000000Z-ABCD.md"],
         ["ac\\\\me", "a-repo", ENTRY_NAME],
         ["acme", "a\\\\repo", ENTRY_NAME],
+        ["\u{1b}]0;pwned\u{7}", "repo", ENTRY_NAME],
+        ["acme", "a\u{7f}repo", ENTRY_NAME],
     ] {
         let hostile = MachineRef {
             machine: "mallory".to_owned(),

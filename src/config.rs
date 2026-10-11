@@ -763,7 +763,7 @@ fn checked_upstream_name(name: &str, entry: &RepoEntry, path: &Path) -> Result<(
         detail: format!(
             "[repos.{name}] upstream {} names the repository {slug:?}, and a fork is kept in \
              the ledger directory <owner>/<name> of its upstream: neither may be empty, `.`, \
-             `..` or `.git`, or hold a `\\`",
+             `..` or `.git`, or hold a `\\` or a control character",
             entry.upstream
         ),
     })
@@ -1000,6 +1000,14 @@ release = "https://example.invalid/releases.git"
                 "{upstream}: {error}"
             );
         }
+        // TOML holds a control character only as an escape.
+        let text = "[repos.tool]\nupstream = \"https://forge.example/ac\\u001bme/tool\"\n\
+                    origin = \"o\"\n";
+        let error = load(&write(dir.path(), text)).unwrap_err().to_string();
+        assert!(
+            error.contains("[repos.tool] upstream") && error.contains("control character"),
+            "{error}"
+        );
         // A repository name may still start with a dot, as a forge allows.
         let text =
             "[repos.tool]\nupstream = \"https://forge.example/acme/.github\"\norigin = \"o\"\n";

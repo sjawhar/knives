@@ -1945,18 +1945,19 @@ fn push_as_peer(remote: &Path, machine: &str, path: &str, contents: &str) {
 }
 
 #[test]
-fn a_peer_directory_named_with_control_characters_reaches_the_terminal_escaped() {
+fn a_peer_directory_named_with_control_characters_is_refused_and_reaches_the_terminal_escaped() {
     // Given: a machine carrying one fork, and a peer's ref on the remote
     // carrying an entry, named as knives names one, under an owner
-    // directory whose name holds an OSC title-set sequence: a fork this
-    // machine does not carry, which a pull counts as left unread.
+    // directory whose name holds an OSC title-set sequence: a directory no
+    // fork can be kept under.
     let home = a_repo_home();
     let (_remote_dir, remote) = lab::bare_remote();
     share(home.path(), "alpha", &remote);
+    let owner = "\u{1b}]0;pwned\u{7}";
     push_as_peer(
         &remote,
         "mallory",
-        "\u{1b}]0;pwned\u{7}/repo/20261011T120000.000000000Z-0000.md",
+        &format!("{owner}/repo/20261011T120000.000000000Z-0000.md"),
         &peer_entry("from a peer"),
     );
 
@@ -1970,15 +1971,17 @@ fn a_peer_directory_named_with_control_characters_reaches_the_terminal_escaped()
     .output()
     .expect("run knives ledger sweep");
 
-    // Then: it counts the entry as left unread, with no control character
-    // in what it prints.
+    // Then: it refuses the peer's tree, writes nothing from it, and says
+    // so with no control character in what it prints.
     let stdout = String::from_utf8_lossy(&swept.stdout);
-    assert!(swept.status.success(), "{stdout:?}");
-    assert!(stdout.contains("left unread"), "{stdout:?}");
+    assert_eq!(swept.status.code(), Some(3), "{stdout:?}");
+    assert!(stdout.contains("which is not a ledger entry"), "{stdout:?}");
+    assert!(!stdout.contains("left unread"), "{stdout:?}");
     assert!(
         !stdout.contains('\u{1b}') && !stdout.contains('\u{7}'),
         "{stdout:?}"
     );
+    assert!(!home.path().join("ledger").join(owner).exists());
 }
 
 /// The problems of a report, as one string to search.

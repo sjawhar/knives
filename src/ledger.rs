@@ -58,13 +58,17 @@ pub fn default_ledger_path(repo: &UpstreamName) -> PathBuf {
 
 /// Whether `part` can be one directory name on the way to a fork's ledger.
 ///
-/// Not empty, `.` or `..`, holding no `/` or `\`, and not a `.git` in any
-/// letter case, which is where the git directory over the root lives.
+/// Not empty, `.` or `..`, holding no `/` or `\` and no control character,
+/// and not a `.git` in any letter case, which is where the git directory
+/// over the root lives. No forge names a repository or an owner with a
+/// control character; a name holding one comes only from a hand-built peer
+/// tree, and printed it would run in a reader's terminal.
 pub fn is_ledger_component(part: &str) -> bool {
     !part.is_empty()
         && part != "."
         && part != ".."
         && !part.contains(['/', '\\'])
+        && !part.chars().any(char::is_control)
         && !part.eq_ignore_ascii_case(".git")
 }
 

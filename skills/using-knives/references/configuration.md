@@ -63,8 +63,8 @@ roots = ["~/projects/company"]
 upstream `<owner>/<name>` on different forges: a fork's ledger, claims and
 branch statements are kept under that name, which has no host, so the two would
 merge. That name is a directory under the ledger, so an upstream whose owner or
-name is empty, `.`, `..` or `.git`, or holds a `\`, is refused. A `path` field
-is refused. Optional fields:
+name is empty, `.`, `..` or `.git`, or holds a `\` or a control character, is
+refused. A `path` field is refused. Optional fields:
 
 - `base`: upstream trunk used for branching, trunk probes and PR targets;
   defaults to `main`. Upstreams using another trunk, such as `dev`, state it here.
