@@ -28,6 +28,16 @@ const LEGACY_STATE: &str = r#"{
   "release_included": {"a-repo/feat/alpha": "stated"}
 }"#;
 
+/// `home`'s state file opened as the binary opens it, against `home`'s
+/// registry, for `repos`' statements.
+fn open_store(
+    home: &Path,
+    repos: &[&knives::ids::UpstreamName],
+) -> Result<knives::store::Store, knives::store::StoreError> {
+    let registry = knives::config::load(&home.join("repos.toml")).expect("load the registry");
+    knives::store::Store::open(home.join("state.json"), &registry.former_names(), repos)
+}
+
 /// A config home whose registry has the two forks [`LEGACY_STATE`] names,
 /// each with a filesystem upstream, so each is kept under its registry key.
 fn legacy_home() -> tempfile::TempDir {
@@ -166,8 +176,7 @@ fn a_second_migration_writes_nothing_and_leaves_one_entry_per_statement() {
     assert_eq!(alpha_depends.pr, Some(4545));
     assert_eq!(alpha_depends.owner, "ses_migrate");
     let repo = knives::ids::UpstreamName::new("a-repo");
-    let store = knives::store::Store::open(home.path().join("state.json"), &[&repo])
-        .expect("open the store");
+    let store = open_store(home.path(), &[&repo]).expect("open the store");
     let alpha = knives::ids::BranchTarget::new(repo, knives::ids::BranchName::new("feat/alpha"));
     assert_eq!(store.tracked_pull(&alpha), Some(4545));
     assert_eq!(store.dependencies(&alpha).len(), 2);
@@ -428,8 +437,7 @@ fn a_migration_moves_each_forks_ledger_and_state_keys_to_its_upstream_name() {
     );
     // And: the migrated state file opens, though `ledger/acme` is still a
     // directory: the owner directory `acme/acme` and `acme/demo` live in.
-    knives::store::Store::open(home.path().join("state.json"), &[])
-        .expect("a migrated state file opens");
+    open_store(home.path(), &[]).expect("a migrated state file opens");
 
     // When: the migration runs again.
     let state_before = std::fs::read(home.path().join("state.json")).expect("read state");

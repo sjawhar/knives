@@ -233,17 +233,17 @@ fn identity(git_dir: &Path) -> Result<Identity, SweepError> {
     Ok(found)
 }
 
-/// Every destination the ledger at `root` travels through.
+/// Every destination the ledger at `root` travels through, as `registry`
+/// says.
 ///
 /// The candidates are the repository at `<root>/.git` and each git
 /// directory in [`ledger_repositories`], all over the one working tree
-/// `root`. Each carries every fork whose `repos.toml` entry, read from
-/// beside `root`, names its `origin` as the repository the fork's ledger
-/// belongs to ([`crate::config::RepoEntry::ledger`]), and commits as the
-/// machine its git config names, `knives.machine`, unique among the
-/// machines sharing that remote. The registry is the one source of which
-/// forks travel where; a repository's git config says only who this machine
-/// is there.
+/// `root`. Each carries every fork whose `registry` entry names its `origin`
+/// as the repository the fork's ledger belongs to
+/// ([`crate::config::RepoEntry::ledger`]), and commits as the machine its
+/// git config names, `knives.machine`, unique among the machines sharing
+/// that remote. The registry is the one source of which forks travel where;
+/// a repository's git config says only who this machine is there.
 ///
 /// A fork with no `ledger` is not shared. One whose `ledger` no candidate's
 /// `origin` names is [`Destinations::unreached`]. No fork shared and no
@@ -256,10 +256,9 @@ fn identity(git_dir: &Path) -> Result<Identity, SweepError> {
 /// registry key's directory still holds the entries an older knives filed
 /// there ([`crate::ledger::LedgerError::FormerName`]), which no sweep would
 /// carry until `knives ledger migrate` moves them.
-pub fn destinations(root: &Path) -> Result<Destinations, SweepError> {
-    let registry = crate::config::load(&root.with_file_name("repos.toml"))?;
-    refuse_unmigrated(root, &registry, &[])?;
-    let reached = reach(root, &registry)?;
+pub fn destinations(root: &Path, registry: &Registry) -> Result<Destinations, SweepError> {
+    refuse_unmigrated(root, registry, &[])?;
+    let reached = reach(root, registry)?;
     let found = reached
         .carriers
         .into_iter()
@@ -275,7 +274,7 @@ pub fn destinations(root: &Path) -> Result<Destinations, SweepError> {
     Ok(Destinations {
         found,
         unreached: reached.unreached,
-        unclaimed: crate::ledger::unclaimed_problems(root, &registry),
+        unclaimed: crate::ledger::unclaimed_problems(root, registry),
         ignored: reached.ignored,
     })
 }
@@ -401,24 +400,22 @@ fn reach(root: &Path, registry: &Registry) -> Result<Reached, SweepError> {
 /// setup [`destinations`] refuses, or for a fork no git directory here
 /// reaches.
 ///
-/// Read from the registry and each git directory's own config alone, with
-/// no fetch and nothing written, for a dry run that must say what a pull
-/// would hold back. `moved` are the directories an older knives filed
-/// entries in that the caller would move first, so they are not refused as
-/// unmigrated.
+/// Read from `registry` and each git directory's own config alone, with no
+/// fetch and nothing written, for a dry run that must say what a pull would
+/// hold back. `moved` are the directories an older knives filed entries in
+/// that the caller would move first, so they are not refused as unmigrated.
 pub fn unpullable(
     root: &Path,
+    registry: &Registry,
     forks: &[&UpstreamName],
     moved: &[&Path],
 ) -> BTreeMap<UpstreamName, Vec<String>> {
     if forks.is_empty() {
         return BTreeMap::new();
     }
-    let reached = crate::config::load(&root.with_file_name("repos.toml"))
-        .map_err(SweepError::from)
-        .and_then(|registry| {
-            refuse_unmigrated(root, &registry, moved)?;
-            let reached = reach(root, &registry)?;
+    let reached = refuse_unmigrated(root, registry, moved)
+        .and_then(|()| reach(root, registry))
+        .and_then(|reached| {
             for carrier in &reached.carriers {
                 ledger_git::absolute_git_dir(&carrier.git_dir)?;
             }
@@ -731,13 +728,21 @@ pub struct Waited {
 /// to set.
 pub const HANDED_OFF: &str = "KNIVES_LEDGER_HANDED_OFF";
 
-/// Sweep the ledger at `root` through every destination it has, doing what
-/// `contended` says when another sweep holds the lock.
+/// Sweep the ledger at `root` through every destination `registry` gives
+/// it, doing what `contended` says when another sweep holds the lock.
 ///
-/// A destination that cannot be read is a failed sweep: it is written to the
-/// [`sweep_log`] when no other sweep holds the lock, and returned.
-pub fn run(root: &Path, contended: Contended) -> Result<Swept, SweepError> {
-    match destinations(root) {
+/// A registry that could not be read, or a destination that cannot be,
+/// is a failed sweep: it is written to the [`sweep_log`] when no other
+/// sweep holds the lock, and returned.
+pub fn run(
+    root: &Path,
+    registry: Result<Registry, ConfigError>,
+    contended: Contended,
+) -> Result<Swept, SweepError> {
+    match registry
+        .map_err(SweepError::from)
+        .and_then(|registry| destinations(root, &registry))
+    {
         Ok(found) => sweep(root, &found, contended),
         Err(error) => {
             if let Some(_lock) = FileLock::try_acquire(root)? {
@@ -1165,10 +1170,10 @@ impl Pulled {
     }
 }
 
-/// Pull the ledgers of `forks` from every destination that carries one,
+/// Pull the ledgers of `forks` from every destination `registry` gives one,
 /// before a command decides something from them.
-pub fn pull(forks: &[&UpstreamName]) -> Pulled {
-    pull_at(&crate::ledger::default_ledger_root(), forks)
+pub fn pull(registry: &Registry, forks: &[&UpstreamName]) -> Pulled {
+    pull_at(&crate::ledger::default_ledger_root(), registry, forks)
 }
 
 /// [`pull`] for the ledger at `root`.
@@ -1185,7 +1190,7 @@ pub fn pull(forks: &[&UpstreamName]) -> Pulled {
 /// directory of entries no fork is kept under ([`Destinations::unclaimed`]),
 /// which is a problem for each fork asked about: any of them may be the one
 /// reading its ledger without them.
-pub fn pull_at(root: &Path, forks: &[&UpstreamName]) -> Pulled {
+pub fn pull_at(root: &Path, registry: &Registry, forks: &[&UpstreamName]) -> Pulled {
     let mut pulled = Pulled {
         root: root.to_owned(),
         ..Pulled::default()
@@ -1193,7 +1198,7 @@ pub fn pull_at(root: &Path, forks: &[&UpstreamName]) -> Pulled {
     if forks.is_empty() {
         return pulled;
     }
-    let reached = destinations(root);
+    let reached = destinations(root, registry);
     pulled.problems = setup_problems(
         root,
         forks,
@@ -1344,6 +1349,12 @@ mod tests {
         std::fs::write(root.with_file_name("repos.toml"), text).unwrap();
     }
 
+    /// The registry beside `root`, as [`registry`] wrote it; empty when none
+    /// was written.
+    fn loaded(root: &Path) -> Registry {
+        crate::config::load(&root.with_file_name("repos.toml")).unwrap()
+    }
+
     /// Give `root`'s repository [`LEDGER_URL`] as its `origin`, which git
     /// reaches at `reached`.
     fn origin_at(root: &Path, reached: &str) {
@@ -1358,13 +1369,13 @@ mod tests {
     #[test]
     fn a_ledger_no_fork_shares_and_no_machine_names_is_not_shared() {
         let home = tempfile::tempdir().unwrap();
-        let missing = destinations(&home.path().join("ledger")).unwrap();
+        let missing = destinations(&home.path().join("ledger"), &Registry::default()).unwrap();
         assert!(missing.found.is_empty() && missing.unreached.is_empty());
 
         let (_home, root) = ledger_root();
         registry(&root, &[("a-repo", None)]);
         origin_at(&root, "/nonexistent/remote.git");
-        let unshared = destinations(&root).unwrap();
+        let unshared = destinations(&root, &loaded(&root)).unwrap();
         assert!(unshared.found.is_empty() && unshared.unreached.is_empty());
     }
 
@@ -1374,7 +1385,7 @@ mod tests {
         registry(&root, &[("a-repo", Some("acme/ledger"))]);
         origin_at(&root, "/nonexistent/remote.git");
 
-        let error = destinations(&root).unwrap_err().to_string();
+        let error = destinations(&root, &loaded(&root)).unwrap_err().to_string();
 
         assert!(error.contains("acme/a-repo"), "was: {error}");
         assert!(
@@ -1397,7 +1408,7 @@ mod tests {
 
         // When: where the ledger travels is read, as every sweep and pull does
         // before it fetches.
-        let error = destinations(&root).unwrap_err().to_string();
+        let error = destinations(&root, &loaded(&root)).unwrap_err().to_string();
 
         // Then: it is refused there, naming the name and the command that
         // sets another, rather than failing later mid-sweep.
@@ -1421,7 +1432,7 @@ mod tests {
             git(&root.join(".git"), &["config", "knives.machine", "alpha"]);
             git(&root.join(".git"), &["config", key, "a-repo"]);
 
-            let found = destinations(&root).unwrap();
+            let found = destinations(&root, &loaded(&root)).unwrap();
 
             assert!(
                 matches!(
@@ -1451,7 +1462,7 @@ mod tests {
         origin_at(&root, "/nonexistent/remote.git");
         git(&root.join(".git"), &["config", "knives.machine", "alpha"]);
 
-        let found = destinations(&root).unwrap();
+        let found = destinations(&root, &loaded(&root)).unwrap();
 
         assert!(found.unreached.is_empty(), "{:?}", found.unreached);
         assert_eq!(found.found.len(), 1);
@@ -1506,7 +1517,7 @@ mod tests {
         );
 
         // When: the destinations are read.
-        let found = destinations(&root).unwrap();
+        let found = destinations(&root, &loaded(&root)).unwrap();
 
         // Then: there are two, each carrying only the fork that names it,
         // both over the one root, and no fork is unreached.
@@ -1556,7 +1567,7 @@ mod tests {
         git(&root.join(".git"), &["config", "knives.machine", "alpha"]);
         second_repository(&root, "again.git", LEDGER_URL, "alpha");
 
-        let error = destinations(&root).unwrap_err().to_string();
+        let error = destinations(&root, &loaded(&root)).unwrap_err().to_string();
 
         assert!(error.contains("again.git"), "was: {error}");
         assert!(error.contains("as its origin, as"), "was: {error}");
@@ -1569,7 +1580,7 @@ mod tests {
         std::fs::create_dir_all(ledger_repositories(&root)).unwrap();
         std::fs::write(ledger_repositories(&root).join("stray"), "").unwrap();
 
-        let error = destinations(&root).unwrap_err().to_string();
+        let error = destinations(&root, &loaded(&root)).unwrap_err().to_string();
 
         assert!(error.contains("stray"), "was: {error}");
         assert!(error.contains("is not a git directory"), "was: {error}");
@@ -1593,7 +1604,7 @@ mod tests {
         // Then: the root carries neither fork, and names the one it should.
         let a_repo = UpstreamName::new("acme/a-repo");
         for (root, ledger) in [(&root, "acme/elsewhere"), (&unrepo, "acme/ledger")] {
-            let found = destinations(root).unwrap();
+            let found = destinations(root, &loaded(root)).unwrap();
             assert!(
                 found
                     .found
@@ -1607,7 +1618,7 @@ mod tests {
             );
 
             // And: a pull about it reports that its entries reach no machine.
-            let problems = pull_at(root, &[&a_repo]).problems_for(&a_repo);
+            let problems = pull_at(root, &loaded(root), &[&a_repo]).problems_for(&a_repo);
             assert_eq!(problems.len(), 1, "{problems:?}");
             let problem = problems.first().unwrap();
             assert!(
@@ -1626,7 +1637,7 @@ mod tests {
         origin_at(&root, "/nonexistent/remote.git");
 
         let a_repo = UpstreamName::new("acme/a-repo");
-        let pulled = pull_at(&root, &[&a_repo]);
+        let pulled = pull_at(&root, &loaded(&root), &[&a_repo]);
 
         assert!(pulled.problems_for(&a_repo).is_empty());
         assert!(pulled.backlog_for(&a_repo).is_empty());
@@ -1643,7 +1654,7 @@ mod tests {
             UpstreamName::new("acme/a-repo"),
             UpstreamName::new("acme/b-repo"),
         );
-        let pulled = pull_at(&root, &[&a_repo, &b_repo]);
+        let pulled = pull_at(&root, &loaded(&root), &[&a_repo, &b_repo]);
 
         let problems = pulled.problems_for(&a_repo);
         assert_eq!(problems.len(), 1, "{problems:?}");

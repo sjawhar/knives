@@ -8,10 +8,11 @@
 
 use knives::bind::Fork;
 use knives::cli::Exit;
+use knives::commands::claim::Bound;
 use knives::commands::release;
 use knives::forge::PullRequest;
 use knives::forge::github::CliForge;
-use knives::ids::{ReleaseScheme, RepoName, UpstreamName};
+use knives::ids::{ReleaseScheme, RepoName};
 use knives::release_model::{BranchSuccessions, carried_from_tips, trunk_positions};
 
 use super::pulled_plan;
@@ -41,7 +42,7 @@ pub(crate) fn run_rebase(
     no_drop: bool,
     extra_consumers: &[&std::path::Path],
     cache_root: Option<&std::path::Path>,
-    bound: Option<&UpstreamName>,
+    bound: Bound<'_>,
 ) -> anyhow::Result<Exit> {
     let repo = &fork.name;
     let entry = fork.entry;
@@ -62,7 +63,7 @@ pub(crate) fn run_rebase(
         cache_root,
         heads: &heads,
     };
-    let plan = pulled_plan(fork, &consumers)?;
+    let plan = pulled_plan(fork, bound.registry, &consumers)?;
     if !plan.problems.is_empty() {
         println!("{}", release::render(&plan));
         return Ok(Exit::Incomplete);
@@ -324,7 +325,7 @@ struct ExistingRebaseInput<'a> {
     release_commit: &'a knives::ids::CommitId,
     destination: &'a RebaseDestination,
     no_drop: bool,
-    bound: Option<&'a UpstreamName>,
+    bound: Bound<'a>,
 }
 
 fn existing_rebase_exit(input: ExistingRebaseInput<'_>) -> anyhow::Result<Option<Exit>> {
@@ -576,7 +577,7 @@ fn drop_landed_members(
     fork: &Fork<'_>,
     release_name: &str,
     destination: &RebaseDestination,
-    bound: Option<&UpstreamName>,
+    bound: Bound<'_>,
 ) -> anyhow::Result<Exit> {
     if destination.landed.is_empty() {
         return Ok(Exit::Ok);
@@ -667,7 +668,7 @@ struct RebasedRelease<'a> {
 fn report_rebased_release(
     fork: &Fork<'_>,
     rebased: &RebasedRelease<'_>,
-    bound: Option<&UpstreamName>,
+    bound: Bound<'_>,
 ) -> anyhow::Result<()> {
     let repo = &fork.name;
     let entry = fork.entry;

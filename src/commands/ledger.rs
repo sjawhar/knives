@@ -15,7 +15,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use crate::cli::{Exit, Output};
-use crate::config::FormerNames;
+use crate::config::{ConfigError, FormerNames, Registry};
 use crate::ids::{Requirement, UpstreamName};
 use crate::ledger::{Draft, Ledger, Scribe, inline_human_text, unmigrated};
 use crate::ledger_sweep::{self, Contended, Swept, Tally, Waited};
@@ -59,19 +59,21 @@ pub struct Report {
     pub notes: Vec<String>,
 }
 
-/// Run one sweep of the ledger beside the registry and report it.
+/// Run one sweep of the ledger beside the registry and report it, from the
+/// registry dispatch read (`loaded`): one that could not be read is a sweep
+/// that could not start.
 ///
 /// The sweep a write hands off ([`ledger_sweep::HANDED_OFF`]) leaves at once
 /// when another sweep holds the lock; any other waits for it, so that what
 /// it reports, and its exit code, is its own pass.
-pub fn run_sweep(output: Output) -> anyhow::Result<Exit> {
+pub fn run_sweep(output: Output, loaded: Result<Registry, ConfigError>) -> anyhow::Result<Exit> {
     let root = crate::ledger::default_ledger_root();
     let contended = if std::env::var_os(ledger_sweep::HANDED_OFF).is_some() {
         Contended::Leave
     } else {
         Contended::Wait
     };
-    let report = match ledger_sweep::run(&root, contended) {
+    let report = match ledger_sweep::run(&root, loaded, contended) {
         Ok(Swept::NotShared) => Report::of(Outcome::NotShared),
         Ok(Swept::Busy) => Report::of(Outcome::Busy),
         Ok(Swept::Ran {
@@ -284,9 +286,17 @@ pub struct Moved {
 /// it holds back as the real run would: each fork whose ledger no git
 /// directory here reaches, or every fork when where the ledger travels
 /// cannot be read ([`ledger_sweep::unpullable`]).
+///
+/// `registry` is what dispatch read; one that could not be read fails the
+/// migration once the state file is open, as reading it there did.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "where the state and the ledger are, the registry, the author and the dry run are independent inputs"
+)]
 pub fn migrate(
     state_path: &Path,
     root: &Path,
+    registry: Result<Registry, ConfigError>,
     owner: &str,
     dry_run: bool,
 ) -> anyhow::Result<Migrated> {
@@ -295,7 +305,7 @@ pub fn migrate(
     } else {
         Store::open_to_migrate(state_path.to_owned())?
     };
-    let registry = crate::config::load(&state_path.with_file_name("repos.toml"))?;
+    let registry = registry?;
     let former = registry.former_names();
     let mut migrated = Migrated {
         dry_run,
@@ -327,9 +337,9 @@ pub fn migrate(
             .iter()
             .map(|moved| moved.from.as_path())
             .collect();
-        ledger_sweep::unpullable(root, &forks, &moved)
+        ledger_sweep::unpullable(root, &registry, &forks, &moved)
     } else {
-        let pulled = ledger_sweep::pull_at(root, &forks);
+        let pulled = ledger_sweep::pull_at(root, &registry, &forks);
         forks
             .iter()
             .map(|fork| ((*fork).clone(), pulled.failed_for(fork)))
@@ -667,13 +677,18 @@ fn history(statement: &Statement) -> String {
     format!("migrated from state.json: {said}")
 }
 
-/// Migrate the state file and ledger beside the registry, or with `dry_run`
-/// say what that would do, and report it.
-pub fn run_migrate(output: Output, dry_run: bool) -> anyhow::Result<Exit> {
-    let owner = crate::commands::claim::current_identity(None)?.owner;
+/// Migrate the state file and ledger beside the registry dispatch read
+/// (`loaded`), or with `dry_run` say what that would do, and report it.
+pub fn run_migrate(
+    output: Output,
+    dry_run: bool,
+    loaded: Result<Registry, ConfigError>,
+) -> anyhow::Result<Exit> {
+    let owner = crate::commands::claim::identity_outside_a_fork().owner;
     let migrated = migrate(
         &crate::store::default_state_path(),
         &crate::ledger::default_ledger_root(),
+        loaded,
         &owner,
         dry_run,
     )?;

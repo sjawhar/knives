@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::{ConfigError, default_config_path};
+use crate::config::{FormerNames, default_config_path};
 use crate::ids::{BranchTarget, Requirement, UpstreamName};
 use crate::ledger::{Entry, Ledger, LedgerError, unmigrated};
 use crate::lock::{FileLock, LockError, LockWait};
@@ -132,8 +132,6 @@ pub enum StoreError {
     )]
     FormerNames { path: PathBuf, held: String },
     #[error(transparent)]
-    Registry(#[from] ConfigError),
-    #[error(transparent)]
     Lock(#[from] LockError),
     #[error(transparent)]
     Ledger(#[from] LedgerError),
@@ -173,22 +171,35 @@ struct ForkLedger {
 impl Store {
     /// Read-only. Cannot block another agent.
     ///
-    /// `repos` are the repositories whose branch statements the caller will ask
-    /// about, and only their ledgers are read: a ledger costs a read of its whole
+    /// `former` is what the caller's registry says each fork was once kept
+    /// under ([`crate::config::Registry::former_names`]), for the refusal of
+    /// a state file an older knives left ([`Store::migrated`]). `repos` are
+    /// the repositories whose branch statements the caller will ask about,
+    /// and only their ledgers are read: a ledger costs a read of its whole
     /// history, which a command about one fork must not pay for every other.
     /// Either open fails on a ledger it cannot read, as it does on a state file
     /// it cannot read: a statement the store could not read must not answer as
     /// no statement.
-    pub fn open(path: PathBuf, repos: &[&UpstreamName]) -> Result<Self, StoreError> {
-        Self::read(path, repos, None)?.migrated()?.all_read()
+    pub fn open(
+        path: PathBuf,
+        former: &FormerNames,
+        repos: &[&UpstreamName],
+    ) -> Result<Self, StoreError> {
+        Self::read(path, repos, None)?.migrated(former)?.all_read()
     }
 
     /// For a read-modify-write. Holds the lock until dropped, and waits the
     /// full claim-writer budget ([`LockWait::CLAIM`]) for another writer.
-    /// `repos` as for [`Store::open`].
-    pub fn open_for_update(path: PathBuf, repos: &[&UpstreamName]) -> Result<Self, StoreError> {
+    /// `former` and `repos` as for [`Store::open`].
+    pub fn open_for_update(
+        path: PathBuf,
+        former: &FormerNames,
+        repos: &[&UpstreamName],
+    ) -> Result<Self, StoreError> {
         let lock = FileLock::acquire(&path, LockWait::CLAIM)?;
-        Self::read(path, repos, Some(lock))?.migrated()?.all_read()
+        Self::read(path, repos, Some(lock))?
+            .migrated(former)?
+            .all_read()
     }
 
     /// [`Store::open`] for a report of many forks, each its own row: a
@@ -196,17 +207,22 @@ impl Store {
     /// instead of failing the open, so one fork's broken ledger blanks no
     /// other fork's row. Nothing about such a fork may be asked of the store;
     /// its row is that it could not be read.
-    pub fn open_each(path: PathBuf, repos: &[&UpstreamName]) -> Result<Self, StoreError> {
-        Self::read(path, repos, None)?.migrated()
+    pub fn open_each(
+        path: PathBuf,
+        former: &FormerNames,
+        repos: &[&UpstreamName],
+    ) -> Result<Self, StoreError> {
+        Self::read(path, repos, None)?.migrated(former)
     }
 
     /// [`Store::open_for_update`] as [`Store::open_each`] opens a store.
     pub fn open_each_for_update(
         path: PathBuf,
+        former: &FormerNames,
         repos: &[&UpstreamName],
     ) -> Result<Self, StoreError> {
         let lock = FileLock::acquire(&path, LockWait::CLAIM)?;
-        Self::read(path, repos, Some(lock))?.migrated()
+        Self::read(path, repos, Some(lock))?.migrated(former)
     }
 
     /// Refuse a store that could not read one of the ledgers it was opened
@@ -232,13 +248,15 @@ impl Store {
     /// slate. A refusal naming the command that fixes it is the only honest
     /// answer.
     ///
-    /// Which keys are former names is the registry's to say, so it is read
-    /// from `repos.toml` beside the state file, as the ledger is read from
-    /// beside it: a store opened anywhere else answers for what sits there.
-    /// A former name's ledger directory is unmigrated while it holds an entry
-    /// file; one holding only other forks' directories is the owner directory
-    /// of their upstream names (`acme` beside `acme/demo`).
-    fn migrated(self) -> Result<Self, StoreError> {
+    /// Which keys are former names is the registry's to say: `former` is
+    /// what the caller's registry says ([`crate::config::Registry::former_names`]),
+    /// the one it read once for the whole command. The ledger is read from
+    /// beside the state file, so a store opened anywhere else answers for
+    /// what sits there. A former name's ledger directory is unmigrated while
+    /// it holds an entry file; one holding only other forks' directories is
+    /// the owner directory of their upstream names (`acme` beside
+    /// `acme/demo`).
+    fn migrated(self, former: &FormerNames) -> Result<Self, StoreError> {
         let held: Vec<&str> = LEGACY_STATEMENTS
             .into_iter()
             .filter(|name| self.state.extra.contains_key(*name))
@@ -249,21 +267,17 @@ impl Store {
                 maps: held.join(", "),
             });
         }
-        let registry = crate::config::load(&self.path.with_file_name("repos.toml"))?;
-        let former = registry.former_names();
         let root = self.path.with_file_name("ledger");
         let maps: BTreeSet<StateMap> = self
             .state
-            .renames(&former)
+            .renames(former)
             .into_iter()
             .map(|renamed| renamed.map)
             .collect();
         let held: Vec<String> = maps
             .iter()
             .map(ToString::to_string)
-            .chain(
-                unmigrated(&root, &former).map(|(name, _)| root.join(name).display().to_string()),
-            )
+            .chain(unmigrated(&root, former).map(|(name, _)| root.join(name).display().to_string()))
             .collect();
         if held.is_empty() {
             Ok(self)
@@ -603,7 +617,12 @@ mod tests {
 
     /// A store over `dir`'s state file, open for `a-repo`'s statements.
     fn store(dir: &Path) -> Store {
-        Store::open(dir.join("state.json"), &[&repo()]).unwrap()
+        Store::open(
+            dir.join("state.json"),
+            &crate::config::FormerNames::new(),
+            &[&repo()],
+        )
+        .unwrap()
     }
 
     /// Append to `a-repo`'s ledger beside `dir`'s state file an event stating
@@ -660,7 +679,7 @@ mod tests {
             owner: "someone".to_owned(),
             kind: OwnerKind::HarnessSession,
         };
-        let mut first = Store::open(path.clone(), &[]).unwrap();
+        let mut first = Store::open(path.clone(), &crate::config::FormerNames::new(), &[]).unwrap();
         let _ = first.claim(&target(), &identity, "fixing the parser");
         first.save().unwrap();
 
@@ -670,7 +689,7 @@ mod tests {
             "state was: {text}"
         );
 
-        let reloaded = Store::open(path, &[]).unwrap();
+        let reloaded = Store::open(path, &crate::config::FormerNames::new(), &[]).unwrap();
         let claims = reloaded.claims(None);
         assert_eq!(claims.len(), 1);
         assert_eq!(claims[0].why, "fixing the parser");
@@ -688,7 +707,7 @@ mod tests {
         )
         .unwrap();
 
-        let store = Store::open(path, &[]).unwrap();
+        let store = Store::open(path, &crate::config::FormerNames::new(), &[]).unwrap();
         let claims = store.claims(None);
 
         assert_eq!(claims.len(), 1);
@@ -766,7 +785,12 @@ mod tests {
 
         // When: the store opens for this repository and one with no ledger
         let other = UpstreamName::new("other-repo");
-        let subject = Store::open(dir.path().join("state.json"), &[&repo(), &other]).unwrap();
+        let subject = Store::open(
+            dir.path().join("state.json"),
+            &crate::config::FormerNames::new(),
+            &[&repo(), &other],
+        )
+        .unwrap();
 
         // Then: each accessor answers from the ledger
         assert_eq!(subject.tracked_pull(&target()), Some(4545));
@@ -850,12 +874,14 @@ mod tests {
         .unwrap();
         let path = dir.path().join("state.json");
 
-        let read = Store::open(path.clone(), &[&repo()]).unwrap_err();
+        let read =
+            Store::open(path.clone(), &crate::config::FormerNames::new(), &[&repo()]).unwrap_err();
         assert!(
             matches!(read, StoreError::Ledger(LedgerError::Parse { .. })),
             "was: {read}"
         );
-        let write = Store::open_for_update(path, &[&repo()]).unwrap_err();
+        let write = Store::open_for_update(path, &crate::config::FormerNames::new(), &[&repo()])
+            .unwrap_err();
         assert!(matches!(write, StoreError::Ledger(_)), "was: {write}");
     }
 
@@ -880,7 +906,7 @@ mod tests {
         );
 
         assert_eq!(store(dir.path()).tracked_pull(&target()), Some(4545));
-        assert!(Store::open(dir.path().join("state.json"), &[]).is_ok());
+        assert!(Store::open(dir.path().join("state.json"), &FormerNames::new(), &[]).is_ok());
     }
 
     #[test]
@@ -902,7 +928,7 @@ mod tests {
         );
 
         assert_eq!(
-            Store::open(default_state_path(), &[&repo()])
+            Store::open(default_state_path(), &FormerNames::new(), &[&repo()])
                 .unwrap()
                 .tracked_pull(&target()),
             Some(1157),
@@ -926,8 +952,9 @@ mod tests {
         .unwrap();
 
         for error in [
-            Store::open(path.clone(), &[&repo()]).unwrap_err(),
-            Store::open_for_update(path.clone(), &[]).unwrap_err(),
+            Store::open(path.clone(), &crate::config::FormerNames::new(), &[&repo()]).unwrap_err(),
+            Store::open_for_update(path.clone(), &crate::config::FormerNames::new(), &[])
+                .unwrap_err(),
         ] {
             let message = error.to_string();
             assert!(
@@ -947,7 +974,7 @@ mod tests {
         assert!(migrating.drop_legacy_statements());
         migrating.save().unwrap();
         drop(migrating);
-        assert!(Store::open(path, &[&repo()]).is_ok());
+        assert!(Store::open(path, &FormerNames::new(), &[&repo()]).is_ok());
     }
 
     #[test]
@@ -957,7 +984,8 @@ mod tests {
         let path = dir.path().join("state.json");
         std::fs::write(&path, r#"{"claims":{},"from_the_future":{"k":"v"}}"#).unwrap();
         // When: an older binary loads, changes, and saves it
-        let mut subject = Store::open(path.clone(), &[]).unwrap();
+        let mut subject =
+            Store::open(path.clone(), &crate::config::FormerNames::new(), &[]).unwrap();
         let _ = subject.claim(&target(), &os_user("x"), "w");
         subject.save().unwrap();
         // Then: the unknown key is still there
@@ -1011,11 +1039,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.json");
         {
-            let mut store = Store::open_for_update(path.clone(), &[]).unwrap();
+            let mut store =
+                Store::open_for_update(path.clone(), &crate::config::FormerNames::new(), &[])
+                    .unwrap();
             store.record_comment_mark(&UpstreamName::new("a-repo"), 7, "2026-07-30T00:00:00Z");
             store.save().unwrap();
         }
-        let store = Store::open(path, &[]).unwrap();
+        let store = Store::open(path, &crate::config::FormerNames::new(), &[]).unwrap();
         assert_eq!(
             store.comment_mark(&UpstreamName::new("a-repo"), 7),
             Some("2026-07-30T00:00:00Z")
@@ -1031,11 +1061,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.json");
         {
-            let mut subject = Store::open_for_update(path.clone(), &[]).unwrap();
+            let mut subject =
+                Store::open_for_update(path.clone(), &crate::config::FormerNames::new(), &[])
+                    .unwrap();
             subject.record_pull_state(&UpstreamName::new("a-repo"), 7, ForgeState::Merged);
             subject.save().unwrap();
         }
-        let subject = Store::open(path, &[]).unwrap();
+        let subject = Store::open(path, &crate::config::FormerNames::new(), &[]).unwrap();
         assert_eq!(
             subject.pull_state(&UpstreamName::new("a-repo"), 7),
             Some("MERGED")
@@ -1051,13 +1083,14 @@ mod tests {
         // Reading cannot lose a write, so a held writer lock keeps out writers only.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.json");
-        let writer = Store::open_for_update(path.clone(), &[]).unwrap();
+        let writer =
+            Store::open_for_update(path.clone(), &crate::config::FormerNames::new(), &[]).unwrap();
 
-        assert!(Store::open(path.clone(), &[]).is_ok());
+        assert!(Store::open(path.clone(), &FormerNames::new(), &[]).is_ok());
 
         drop(writer);
         assert!(
-            Store::open_for_update(path, &[]).is_ok(),
+            Store::open_for_update(path, &FormerNames::new(), &[]).is_ok(),
             "the lock outlived its holder"
         );
     }

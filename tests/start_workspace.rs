@@ -239,8 +239,12 @@ fn a_forced_start_on_a_divergent_branch_refuses_before_seizing_the_claim() {
     lab.branch("feat/alpha", "feature.txt", "alpha\n");
     let (home, _consumer) = release_test_home(&lab);
     {
-        let mut store =
-            Store::open_for_update(home.path().join("state.json"), &[]).expect("open store");
+        let mut store = Store::open_for_update(
+            home.path().join("state.json"),
+            &knives::config::FormerNames::new(),
+            &[],
+        )
+        .expect("open store");
         let held = knives::commands::claim::Identity {
             owner: "other-agent".to_owned(),
             kind: OwnerKind::OsUser,
@@ -284,7 +288,12 @@ fn a_forced_start_on_a_divergent_branch_refuses_before_seizing_the_claim() {
         stderr.contains("feat/alpha is divergent (2 tips:"),
         "{stderr}"
     );
-    let store = Store::open(home.path().join("state.json"), &[]).expect("reopen store");
+    let store = Store::open(
+        home.path().join("state.json"),
+        &knives::config::FormerNames::new(),
+        &[],
+    )
+    .expect("reopen store");
     let claim = store
         .claims(Some(&knives::ids::UpstreamName::new("demo")))
         .into_iter()

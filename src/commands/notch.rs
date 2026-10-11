@@ -8,8 +8,8 @@
 
 use crate::bind::Fork;
 use crate::cli::Exit;
-use crate::commands::claim::current_identity;
-use crate::ids::{BranchName, BranchTarget, RepoName, UpstreamName, short_id};
+use crate::commands::claim::{Bound, current_identity};
+use crate::ids::{BranchName, BranchTarget, RepoName, short_id};
 use crate::ledger::{
     Draft, Entry, EntryClass, Filter, Kind, Ledger, LedgerError, Scribe, VerifyFlag,
     body_human_text, inline_human_text, select, verify_entries,
@@ -67,12 +67,11 @@ pub enum Report {
 #[derive(Debug)]
 pub struct Request<'a> {
     pub fork: &'a Fork<'a>,
-    /// The registry the fork was resolved from: a read checks the ledger
-    /// root for entries none of its forks is kept under.
-    pub registry: &'a crate::config::Registry,
-    /// The fork the current directory is inside, by the name its claims are
-    /// kept under; a write derives its author from it, a read never asks.
-    pub bound: Option<&'a UpstreamName>,
+    /// The registry the fork was resolved from, and the fork the current
+    /// directory is inside, by the name its claims are kept under: a read
+    /// checks the ledger root for entries none of the registry's forks is
+    /// kept under; a write derives its author from both.
+    pub bound: Bound<'a>,
     pub subject: Option<&'a str>,
     /// Present for a write, absent for a read.
     pub message: Option<&'a str>,
@@ -348,6 +347,7 @@ pub fn run(request: &Request<'_>, output: crate::cli::Output) -> anyhow::Result<
             let fork = [upstream];
             let store = Store::open(
                 default_state_path(),
+                &request.bound.registry.former_names(),
                 if asks_stated_pull { &fork } else { &[] },
             )?;
             let pr = request
@@ -388,7 +388,7 @@ pub fn run(request: &Request<'_>, output: crate::cli::Output) -> anyhow::Result<
             if let Report::Read { problems, .. } = &mut report {
                 problems.extend(crate::ledger::unclaimed_problems(
                     &crate::ledger::default_ledger_root(),
-                    request.registry,
+                    request.bound.registry,
                 ));
             }
             report
@@ -595,8 +595,10 @@ mod tests {
         let registry = crate::config::Registry::default();
         let request = Request {
             fork: &fork,
-            registry: &registry,
-            bound: None,
+            bound: Bound {
+                registry: &registry,
+                upstream: None,
+            },
             subject: Some("feat/alpha"),
             message: None,
             evidence: &[],

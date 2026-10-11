@@ -11,12 +11,11 @@ use std::path::Path;
 use knives::bind::Fork;
 use knives::cli::Exit;
 use knives::commands::claim::{
-    ClaimContext, ClaimDecision, current_identity, decide, last_seen_provenance,
+    Bound, ClaimContext, ClaimDecision, current_identity, decide, last_seen_provenance,
     render_claim_context,
 };
 use knives::commands::start::{collides_with_checkout, possesses, workspace_path};
-use knives::config::Registry;
-use knives::ids::{BranchName, BranchTarget, Requirement, UpstreamName};
+use knives::ids::{BranchName, BranchTarget, Requirement};
 use knives::jj::{Repo, WorkspaceIdentity, remove_prunable_worktree};
 use knives::ledger::Draft;
 use knives::statement::{Statement, StatementKind};
@@ -70,13 +69,14 @@ enum FinishClaimGate {
 /// Removing the directory loses no work: jj snapshots a working copy into a commit, so
 /// every change made there is already in the repository and reachable by change id. What
 /// does not survive is anything jj never tracked, which is what `--no-cleanup` is for.
-/// `bound` is the fork the current directory is inside, by the name its claims
-/// are kept under, which names a terminal user acting from a fork's workspace.
+/// `bound` is the registry and the fork the current directory is inside, by
+/// the name its claims are kept under, which names a terminal user acting
+/// from a fork's workspace.
 pub(crate) fn run_finish(
     fork: &Fork<'_>,
     branch: &BranchName,
     options: &FinishOptions<'_>,
-    bound: Option<&UpstreamName>,
+    bound: Bound<'_>,
 ) -> anyhow::Result<Exit> {
     let target = &BranchTarget::new(fork.upstream.clone(), branch.clone());
     let checkout_path = &fork.checkout.path;
@@ -86,7 +86,11 @@ pub(crate) fn run_finish(
         eprintln!("{}: {line}", fork.name);
         return Ok(Exit::Usage);
     }
-    let mut store = Store::open_for_update(default_state_path(), &[&fork.upstream])?;
+    let mut store = Store::open_for_update(
+        default_state_path(),
+        &bound.registry.former_names(),
+        &[&fork.upstream],
+    )?;
     let workspace = knives::commands::wip::workspace_for(branch.as_str());
     let directory = workspace_path(fork, branch);
     let forced_release = match finish_claim_gate(fork, target, &store, options, bound)? {
@@ -245,7 +249,7 @@ fn finish_claim_gate(
     target: &BranchTarget,
     store: &Store,
     options: &FinishOptions<'_>,
-    bound: Option<&UpstreamName>,
+    bound: Bound<'_>,
 ) -> anyhow::Result<FinishClaimGate> {
     let Some(claim) = store
         .claims(Some(&target.repo))
@@ -307,8 +311,9 @@ fn finish_claim_gate(
 /// knows is stale, that would tell the caller a list other machines may
 /// already have changed. So each refuses, like a release write, rather than
 /// write from what this machine happens to have.
-fn pulled_before_replacing(fork: &Fork<'_>, what: &str) -> bool {
-    let problems = knives::ledger_sweep::pull(&[&fork.upstream]).problems_for(&fork.upstream);
+fn pulled_before_replacing(fork: &Fork<'_>, bound: Bound<'_>, what: &str) -> bool {
+    let problems =
+        knives::ledger_sweep::pull(bound.registry, &[&fork.upstream]).problems_for(&fork.upstream);
     for problem in &problems {
         eprintln!("!! {}", knives::ledger::inline_human_text(problem));
     }
@@ -336,16 +341,20 @@ pub(crate) fn run_track(
     pr: Option<u64>,
     fork_only: bool,
     forget: bool,
-    bound: Option<&UpstreamName>,
+    bound: Bound<'_>,
 ) -> anyhow::Result<Exit> {
     let target = &BranchTarget::new(fork.upstream.clone(), branch.clone());
-    if forget && !pulled_before_replacing(fork, "the forget") {
+    if forget && !pulled_before_replacing(fork, bound, "the forget") {
         return Ok(Exit::Incomplete);
     }
     // Opened for update to hold the lock while the statement is read and the next
     // one appended: a concurrent `track` then reads this one's statement rather
     // than the one before it. Nothing here writes the state file.
-    let store = Store::open_for_update(default_state_path(), &[&fork.upstream])?;
+    let store = Store::open_for_update(
+        default_state_path(),
+        &bound.registry.former_names(),
+        &[&fork.upstream],
+    )?;
     // Read before the change, so a withdrawal is still filed under the number it
     // withdrew.
     let stated = store.tracked_pull(target);
@@ -420,17 +429,13 @@ fn spoken(text: &str) -> String {
 /// Requirements are validated against the registry, because a dependency on a repo
 /// knives does not manage is a typo, and a typo that records silently is worse than
 /// no dependency at all: it reads as satisfied forever.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the registry the requirements are checked against, the fork, the branch, the requirements and the cwd binding are independent inputs"
-)]
 pub(crate) fn run_depends(
-    registry: &Registry,
     fork: &Fork<'_>,
     branch: &BranchName,
     on: &[String],
-    bound: Option<&UpstreamName>,
+    bound: Bound<'_>,
 ) -> anyhow::Result<Exit> {
+    let registry = bound.registry;
     let target = &BranchTarget::new(fork.upstream.clone(), branch.clone());
     let mut requirements = Vec::new();
     for text in on {
@@ -454,14 +459,18 @@ pub(crate) fn run_depends(
             number: written.number,
         });
     }
-    if !pulled_before_replacing(fork, "the dependency") {
+    if !pulled_before_replacing(fork, bound, "the dependency") {
         return Ok(Exit::Incomplete);
     }
     // Held while the list is read and the next statement appended, so two
     // concurrent `depends` on this machine each add to the other's list
     // rather than racing; the pull above brought in what other machines
     // stated. Nothing here writes the state file.
-    let store = Store::open_for_update(default_state_path(), &[&fork.upstream])?;
+    let store = Store::open_for_update(
+        default_state_path(),
+        &registry.former_names(),
+        &[&fork.upstream],
+    )?;
     let required = with_requirements(&store.dependencies(target), &requirements);
     let pr = store.tracked_pull(target);
     let listed: Vec<String> = requirements.iter().map(ToString::to_string).collect();

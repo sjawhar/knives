@@ -113,8 +113,12 @@ fn starting_and_finishing_a_branch_leaves_its_reason_in_the_ledger() {
 /// A claim written straight into the store, so a `finish` test starts from a held
 /// branch without `start` putting its own event in the ledger first.
 fn hold_claim(home: &tempfile::TempDir, branch: &str) {
-    let mut store =
-        Store::open_for_update(home.path().join("state.json"), &[]).expect("open store");
+    let mut store = Store::open_for_update(
+        home.path().join("state.json"),
+        &knives::config::FormerNames::new(),
+        &[],
+    )
+    .expect("open store");
     let _ = store.claim(
         &knives::ids::BranchTarget::new(
             knives::ids::UpstreamName::new("demo"),
@@ -249,9 +253,13 @@ fn finish_releases_without_consulting_the_forge() {
         BranchName::new("feat/alpha"),
     );
     assert_eq!(
-        Store::open(home.path().join("state.json"), &[&target.repo])
-            .expect("reopen store")
-            .tracked_pull(&target),
+        Store::open(
+            home.path().join("state.json"),
+            &knives::config::FormerNames::new(),
+            &[&target.repo]
+        )
+        .expect("reopen store")
+        .tracked_pull(&target),
         Some(7),
         "the stated pull request did not survive the release"
     );

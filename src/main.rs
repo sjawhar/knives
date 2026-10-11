@@ -25,7 +25,7 @@ use branch_verbs::{FinishOptions, run_depends, run_finish, run_track};
 use clap::Parser as _;
 use knives::bind::{Fork, Unbound};
 use knives::cli::{Cli, Command, Exit, LedgerAction, Output, ReleaseAction};
-use knives::commands::claim::current_identity;
+use knives::commands::claim::{Bound, current_identity, identity_outside_a_fork};
 use knives::commands::{
     audit, consumers, hook, ledger, notch, pr, preflight, pushed, register, repos, start, status,
     sync,
@@ -73,7 +73,7 @@ fn dispatch() -> anyhow::Result<Exit> {
         // problem. `repos` still takes the sighting — asking what is
         // maintained from inside a fork is a sighting of it — but nothing
         // about it can fail the listing.
-        Command::Hook { harness } => Ok(hook::run(harness)),
+        Command::Hook { harness } => Ok(hook::run(harness, loaded)),
         Command::Register { repo } => register::run(repo, &loaded?),
         Command::Repos => {
             let _ = grounded(&loaded);
@@ -90,10 +90,11 @@ fn dispatch() -> anyhow::Result<Exit> {
             run_consumers(&fork, &consumer, output)
         }
         Command::Pushed { branches, repo } => {
-            let Some(fork) = grounded(&loaded)?.one_fork(repo.as_deref())? else {
+            let ground = grounded(&loaded)?;
+            let Some(fork) = ground.one_fork(repo.as_deref())? else {
                 return Ok(Exit::Usage);
             };
-            run_pushed(&fork, &branches, output)
+            run_pushed(ground.registry, &fork, &branches, output)
         }
         Command::Audit {
             repo,
@@ -213,7 +214,7 @@ fn dispatch() -> anyhow::Result<Exit> {
             else {
                 return Ok(Exit::Usage);
             };
-            run_depends(ground.registry, &fork, &branch, &on, ground.bound())
+            run_depends(&fork, &branch, &on, ground.bound())
         }
         Command::Notch {
             subject,
@@ -240,7 +241,6 @@ fn dispatch() -> anyhow::Result<Exit> {
             notch::run(
                 &notch::Request {
                     fork: &fork,
-                    registry: ground.registry,
                     bound: ground.bound(),
                     subject: subject.as_deref(),
                     message: message.as_deref(),
@@ -255,14 +255,15 @@ fn dispatch() -> anyhow::Result<Exit> {
             )
         }
         Command::Ledger { action } => match action {
-            LedgerAction::Sweep => ledger::run_sweep(output),
-            LedgerAction::Migrate { dry_run } => ledger::run_migrate(output, dry_run),
+            LedgerAction::Sweep => ledger::run_sweep(output, loaded),
+            LedgerAction::Migrate { dry_run } => ledger::run_migrate(output, dry_run, loaded),
         },
         Command::Preflight { repo } => {
-            let Some(fork) = grounded(&loaded)?.one_fork(repo.as_deref())? else {
+            let ground = grounded(&loaded)?;
+            let Some(fork) = ground.one_fork(repo.as_deref())? else {
                 return Ok(Exit::Usage);
             };
-            run_preflight(&fork)
+            run_preflight(ground.registry, &fork)
         }
         Command::Release {
             action,
@@ -301,8 +302,15 @@ fn grounded(loaded: &Result<Registry, ConfigError>) -> anyhow::Result<Ground<'_>
         (Err(error), _) => Err(anyhow::anyhow!("reading the current directory: {error}")),
         (Ok(_), Err(error)) => Err(anyhow::anyhow!("{error}")),
     };
-    let bound = ground.as_ref().ok().and_then(Ground::bound);
-    if let (Ok(cwd), Ok(identity)) = (&cwd, current_identity(bound)) {
+    let identity = ground.as_ref().map_or_else(
+        |_| Ok(identity_outside_a_fork()),
+        |ground| current_identity(ground.bound()),
+    );
+    let bound = ground
+        .as_ref()
+        .ok()
+        .and_then(|ground| ground.bound().upstream);
+    if let (Ok(cwd), Ok(identity)) = (&cwd, identity) {
         knives::seen::record_observation(bound, cwd, &identity);
     }
     ground
@@ -325,11 +333,15 @@ impl<'a> Ground<'a> {
         }
     }
 
-    /// The fork the current directory is inside, when it is inside one, by the
-    /// name its claims are kept under: what `current_identity` derives a
-    /// terminal user's name from, and what a sighting keys its workspace on.
-    fn bound(&self) -> Option<&UpstreamName> {
-        self.here.as_ref().ok().map(|fork| &fork.upstream)
+    /// The registry, and the fork the current directory is inside when it
+    /// is inside one, by the name its claims are kept under: what
+    /// `current_identity` derives a terminal user's name from, and what a
+    /// sighting keys its workspace on.
+    fn bound(&self) -> Bound<'_> {
+        Bound {
+            registry: self.registry,
+            upstream: self.here.as_ref().ok().map(|fork| &fork.upstream),
+        }
     }
 
     /// The fork `name` is: the current directory's when it is that entry, else
@@ -505,9 +517,18 @@ fn run_consumers(
 }
 
 /// Reconcile one fork's local bookmarks with the live refs on their owning remotes.
-fn run_pushed(fork: &Fork<'_>, branches: &[String], output: Output) -> anyhow::Result<Exit> {
-    let pulled = knives::ledger_sweep::pull(&[&fork.upstream]);
-    let store = Store::open(default_state_path(), &[&fork.upstream])?;
+fn run_pushed(
+    registry: &Registry,
+    fork: &Fork<'_>,
+    branches: &[String],
+    output: Output,
+) -> anyhow::Result<Exit> {
+    let pulled = knives::ledger_sweep::pull(registry, &[&fork.upstream]);
+    let store = Store::open(
+        default_state_path(),
+        &registry.former_names(),
+        &[&fork.upstream],
+    )?;
     let mut report = pushed::gather(fork, &store, branches);
     report
         .problems
@@ -527,13 +548,14 @@ fn run_audit(
     output: Output,
     use_forge: bool,
 ) -> anyhow::Result<Exit> {
+    let registry = ground.registry;
     let chosen = match ground.selected(scope)? {
         Ok(chosen) => chosen,
         Err(exit) => return Ok(exit),
     };
     let forks = placed(&chosen);
-    let pulled = knives::ledger_sweep::pull(&forks);
-    let store = open_store_for(&chosen, &forks)?;
+    let pulled = knives::ledger_sweep::pull(registry, &forks);
+    let store = open_store_for(registry, &chosen, &forks)?;
     let cli_forge = CliForge;
     let forge = use_forge.then_some(&cli_forge as &dyn Forge);
     let cache_root = knives::forge_cache::cache_root();
@@ -577,8 +599,9 @@ fn run_audit(
 
 /// Plan, curate or cut a release.
 ///
-/// `bound` is the entry the current directory is inside; an action that writes
-/// the ledger derives who is acting from it, the reports never ask.
+/// `bound` is the registry and the entry the current directory is inside;
+/// every action pulls the ledger through the registry's destinations, and
+/// one that writes the ledger derives who is acting from both.
 #[allow(
     clippy::too_many_arguments,
     reason = "the fork, the action, the extra consumers, the output format and the cwd binding are independent inputs"
@@ -588,7 +611,7 @@ fn dispatch_release(
     action: Option<ReleaseAction>,
     extra_consumers: &[&std::path::Path],
     output: Output,
-    bound: Option<&UpstreamName>,
+    bound: Bound<'_>,
 ) -> anyhow::Result<Exit> {
     match action {
         None => run_release(fork, extra_consumers, &ReleaseInvocation::Plan, bound),
@@ -623,7 +646,9 @@ fn dispatch_release(
                 (false, Some(revision)) => {
                     run_revision_carries(fork, revision, reference.as_deref(), output)
                 }
-                (false, None) => run_release_members(fork, reference.as_deref(), verify, output),
+                (false, None) => {
+                    run_release_members(fork, bound.registry, reference.as_deref(), verify, output)
+                }
             }
         }
         Some(ReleaseAction::Reap) => run_reap(fork),
@@ -656,7 +681,7 @@ fn dispatch_release(
 ///
 /// The owner is resolved exactly as a claim's is, so one agent's events and its
 /// claims carry the same name and a reader can join them.
-fn scribe_for(fork: &Fork<'_>, bound: Option<&UpstreamName>) -> anyhow::Result<Scribe> {
+fn scribe_for(fork: &Fork<'_>, bound: Bound<'_>) -> anyhow::Result<Scribe> {
     Ok(Scribe::new(
         Ledger::for_fork(fork),
         fork.upstream.clone(),
@@ -666,11 +691,14 @@ fn scribe_for(fork: &Fork<'_>, bound: Option<&UpstreamName>) -> anyhow::Result<S
 }
 
 /// `fork`'s ledger entries, read after pulling them from every destination
-/// that carries the fork, with the pull's problems and each entry or
+/// `registry` gives the fork, with the pull's problems and each entry or
 /// statement the read could not fully read: what a release command decides
 /// from, so a write from it refuses on any of them.
-fn pulled_ledger(fork: &Fork<'_>) -> anyhow::Result<(Vec<knives::ledger::Entry>, Vec<String>)> {
-    let pulled = knives::ledger_sweep::pull(&[&fork.upstream]);
+fn pulled_ledger(
+    fork: &Fork<'_>,
+    registry: &Registry,
+) -> anyhow::Result<(Vec<knives::ledger::Entry>, Vec<String>)> {
+    let pulled = knives::ledger_sweep::pull(registry, &[&fork.upstream]);
     let read = Ledger::for_fork(fork).read()?;
     let mut problems = pulled.problems_for(&fork.upstream);
     problems.extend(read.problems);
@@ -699,9 +727,10 @@ fn ledger_problems(
 /// ledger would check it against the wrong one.
 fn pulled_plan(
     fork: &Fork<'_>,
+    registry: &Registry,
     consumers: &knives::commands::release::ConsumerInputs<'_>,
 ) -> anyhow::Result<knives::commands::release::Plan> {
-    let (entries, problems) = pulled_ledger(fork)?;
+    let (entries, problems) = pulled_ledger(fork, registry)?;
     let mut plan = knives::commands::release::plan(fork, consumers, &entries)?;
     plan.problems.extend(problems);
     Ok(plan)
@@ -763,23 +792,30 @@ fn placed<'s>(chosen: &'s [Selected<'_>]) -> Vec<&'s UpstreamName> {
 /// The store a many-fork report reads: one fork's unreadable ledger is that
 /// fork's row ([`Store::open_each`]) when there is more than one row, and the
 /// command's failure when there is one, as every single-fork command fails.
-fn open_store_for(chosen: &[Selected<'_>], forks: &[&UpstreamName]) -> anyhow::Result<Store> {
+fn open_store_for(
+    registry: &Registry,
+    chosen: &[Selected<'_>],
+    forks: &[&UpstreamName],
+) -> anyhow::Result<Store> {
+    let former = registry.former_names();
     Ok(if chosen.len() > 1 {
-        Store::open_each(default_state_path(), forks)?
+        Store::open_each(default_state_path(), &former, forks)?
     } else {
-        Store::open(default_state_path(), forks)?
+        Store::open(default_state_path(), &former, forks)?
     })
 }
 
 /// [`open_store_for`] for a report that writes the state file.
 fn open_store_for_update(
+    registry: &Registry,
     chosen: &[Selected<'_>],
     forks: &[&UpstreamName],
 ) -> anyhow::Result<Store> {
+    let former = registry.former_names();
     Ok(if chosen.len() > 1 {
-        Store::open_each_for_update(default_state_path(), forks)?
+        Store::open_each_for_update(default_state_path(), &former, forks)?
     } else {
-        Store::open_for_update(default_state_path(), forks)?
+        Store::open_for_update(default_state_path(), &former, forks)?
     })
 }
 
@@ -946,8 +982,8 @@ fn run_status(ground: Ground<'_>, view: StatusView<'_>) -> anyhow::Result<Exit> 
         Err(exit) => return Ok(exit),
     };
     let forks = placed(&chosen);
-    let pulled = knives::ledger_sweep::pull(&forks);
-    let store = open_store_for(&chosen, &forks)?;
+    let pulled = knives::ledger_sweep::pull(registry, &forks);
+    let store = open_store_for(registry, &chosen, &forks)?;
     let cli_forge = CliForge;
     let forge: Option<&dyn Forge> = if use_forge { Some(&cli_forge) } else { None };
     let cache_root = knives::forge_cache::cache_root();
@@ -1042,9 +1078,9 @@ fn run_status(ground: Ground<'_>, view: StatusView<'_>) -> anyhow::Result<Exit> 
     Ok(worst)
 }
 
-fn run_preflight(fork: &Fork<'_>) -> anyhow::Result<Exit> {
+fn run_preflight(registry: &Registry, fork: &Fork<'_>) -> anyhow::Result<Exit> {
     // Convention digests and claims only: no branch statement is asked about.
-    let mut store = Store::open_for_update(default_state_path(), &[])?;
+    let mut store = Store::open_for_update(default_state_path(), &registry.former_names(), &[])?;
     let forge = CliForge;
     let cache_root = knives::forge_cache::cache_root();
     let report = preflight::gather(preflight::GatherInput {
@@ -1064,14 +1100,19 @@ fn run_sync(
     output: knives::cli::Output,
     use_forge: bool,
 ) -> anyhow::Result<Exit> {
-    let bound = ground.bound().cloned();
+    let registry = ground.registry;
+    let upstream = ground.bound().upstream.cloned();
     let chosen = match ground.sync_targets(scope)? {
         Ok(list) => list,
         Err(exit) => return Ok(exit),
     };
+    let bound = Bound {
+        registry,
+        upstream: upstream.as_ref(),
+    };
     let forks = placed(&chosen);
-    let pulled = knives::ledger_sweep::pull(&forks);
-    let mut store = open_store_for_update(&chosen, &forks)?;
+    let pulled = knives::ledger_sweep::pull(registry, &forks);
+    let mut store = open_store_for_update(registry, &chosen, &forks)?;
     let cli_forge = CliForge;
     let forge = use_forge.then_some(&cli_forge as &dyn Forge);
     let cache_root = knives::forge_cache::cache_root();
@@ -1090,7 +1131,7 @@ fn run_sync(
                     .collect(),
                 ..sync::Report::default()
             },
-            Selected::Bound(fork) => scribe_for(fork, bound.as_ref())
+            Selected::Bound(fork) => scribe_for(fork, bound)
                 .and_then(|scribe| {
                     sync::sync_repo(sync::SyncInput {
                         fork,

@@ -5,8 +5,8 @@ use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 
 use crate::cli::{Exit, HookHarness};
-use crate::commands::claim::Identity;
-use crate::config::{GuidanceRoot, Registry, default_config_path, load};
+use crate::commands::claim::{Bound, Identity};
+use crate::config::{ConfigError, GuidanceRoot, Registry, default_config_path};
 use crate::hook::claude_code::{
     Event, EventKind, POST_TOOL_USE_WIRE_NAME, SESSION_START_WIRE_NAME, response,
 };
@@ -87,11 +87,16 @@ fn arm_watchdog() {
     });
 }
 
-pub fn run(harness: HookHarness) -> Exit {
+/// Answer one harness event, from the registry dispatch read (`loaded`).
+///
+/// An event that needs the registry and finds it could not be read says why
+/// on stderr and answers nothing, as every other failure here does; one that
+/// never asks is not affected.
+pub fn run(harness: HookHarness, loaded: Result<Registry, ConfigError>) -> Exit {
     arm_watchdog();
     let result = match harness {
-        HookHarness::ClaudeCode => run_claude_code(),
-        HookHarness::Opencode => run_opencode(),
+        HookHarness::ClaudeCode => run_claude_code(loaded),
+        HookHarness::Opencode => run_opencode(loaded),
     };
     match result {
         Ok(Some(output)) => {
@@ -105,7 +110,7 @@ pub fn run(harness: HookHarness) -> Exit {
     Exit::Ok
 }
 
-fn run_opencode() -> anyhow::Result<Option<String>> {
+fn run_opencode(loaded: Result<Registry, ConfigError>) -> anyhow::Result<Option<String>> {
     let mut input = String::new();
     if let Err(error) = std::io::stdin().read_to_string(&mut input) {
         eprintln!("knives hook: {error:#}");
@@ -121,8 +126,8 @@ fn run_opencode() -> anyhow::Result<Option<String>> {
     let kind = event.kind();
     let home = config_home();
     let response = match kind {
-        OpenCodeEventKind::ToolExecuteAfter => opencode_tool_after(&event, &home),
-        OpenCodeEventKind::ChatSystem => opencode_chat_system(&event),
+        OpenCodeEventKind::ToolExecuteAfter => opencode_tool_after(&event, &home, loaded),
+        OpenCodeEventKind::ChatSystem => opencode_chat_system(&event, loaded),
         OpenCodeEventKind::ShellEnv => opencode_shell_env(&event),
         OpenCodeEventKind::Compacting => opencode_compacting(&event, &home),
         OpenCodeEventKind::Other => opencode::empty_response().map_err(Into::into),
@@ -146,15 +151,22 @@ fn empty_opencode_response(kind: OpenCodeEventKind) -> anyhow::Result<String> {
     .map_err(Into::into)
 }
 
-fn opencode_tool_after(event: &OpenCodeEvent, home: &Path) -> anyhow::Result<String> {
+fn opencode_tool_after(
+    event: &OpenCodeEvent,
+    home: &Path,
+    loaded: Result<Registry, ConfigError>,
+) -> anyhow::Result<String> {
     let Some(session_id) = event.session_id() else {
         return opencode::tool_response("").map_err(Into::into);
     };
-    let Some((registry, matched)) = relevant_tool_match(&ToolCall {
-        tool: event.tool(),
-        args: event.args(),
-        relevant: OPENCODE_RELEVANT_TOOLS,
-    })?
+    let Some((registry, matched)) = relevant_tool_match(
+        &ToolCall {
+            tool: event.tool(),
+            args: event.args(),
+            relevant: OPENCODE_RELEVANT_TOOLS,
+        },
+        loaded,
+    )?
     else {
         return opencode::tool_response("").map_err(Into::into);
     };
@@ -177,7 +189,12 @@ fn opencode_tool_after(event: &OpenCodeEvent, home: &Path) -> anyhow::Result<Str
     if let Some(context) = &context {
         unlocked.reconcile(context.turn, &context.guidance);
     }
-    let notice = notice_if_requested(&repo, requested.notice.then_some(&matched), &unlocked)?;
+    let notice = notice_if_requested(
+        &repo,
+        requested.notice.then_some(&matched),
+        &registry,
+        &unlocked,
+    )?;
     let guidance = (requested.guidance && matched.trusted && !unlocked.repo(&repo.root).guided)
         .then(|| guidance_for(&repo, &matched.candidate))
         .flatten();
@@ -369,11 +386,14 @@ impl Outstanding {
     }
 }
 
-fn opencode_chat_system(event: &OpenCodeEvent) -> anyhow::Result<String> {
+fn opencode_chat_system(
+    event: &OpenCodeEvent,
+    loaded: Result<Registry, ConfigError>,
+) -> anyhow::Result<String> {
     let Some(directory) = event.directory() else {
         return opencode::system_response("", &[]).map_err(Into::into);
     };
-    let registry = load(&default_config_path())?;
+    let registry = loaded?;
     let Some(matched) = match_checkout(&[PathBuf::from(directory)], &registry) else {
         return opencode::system_response("", &[]).map_err(Into::into);
     };
@@ -397,32 +417,32 @@ fn opencode_shell_env(event: &OpenCodeEvent) -> anyhow::Result<String> {
     opencode::environment_response(event.session_id()).map_err(Into::into)
 }
 
-/// The owner a claim from inside `repo` would carry when no harness names one:
-/// the store's current agent, else the sole claimant of that repository.
+/// The owner a claim from inside `bound` would carry when no harness names
+/// one: the store's current agent, else the sole claimant of that repository.
 ///
-/// `repo` is the fork the caller already bound the working directory to, by
+/// `bound` is the fork the caller already bound the working directory to, by
 /// the name its claims are kept under; a directory outside any managed fork,
 /// or whose remotes could not be read, is `None` and derives no owner. An
 /// OS-user claim names nobody in particular, so it seeds no derived owner:
 /// otherwise one anonymous claim would hand every later anonymous caller the
 /// same "derived" name, and they would resume each other's claims.
-pub(crate) fn owner_for(repo: Option<&UpstreamName>) -> anyhow::Result<Option<String>> {
+pub(crate) fn owner_for(bound: Bound<'_>) -> anyhow::Result<Option<String>> {
     if let Some(owner) = std::env::var("KNIVES_OWNER")
         .ok()
         .filter(|owner| !owner.trim().is_empty())
     {
         return Ok(Some(owner));
     }
-    let Some(repo) = repo else {
+    let Some(upstream) = bound.upstream else {
         return Ok(None);
     };
     // Claims and the current agent only: no branch statement is asked about.
-    let store = Store::open(default_state_path(), &[])?;
+    let store = Store::open(default_state_path(), &bound.registry.former_names(), &[])?;
     if let Some(owner) = store.current_agent() {
         return Ok(Some(owner.to_owned()));
     }
     let owners = store
-        .claims(Some(repo))
+        .claims(Some(upstream))
         .into_iter()
         .filter(|claim| claim.kind != OwnerKind::OsUser)
         .map(|claim| claim.owner.clone())
@@ -439,14 +459,14 @@ fn opencode_compacting(event: &OpenCodeEvent, home: &Path) -> anyhow::Result<Str
     opencode::empty_response().map_err(Into::into)
 }
 
-fn run_claude_code() -> anyhow::Result<Option<String>> {
+fn run_claude_code(loaded: Result<Registry, ConfigError>) -> anyhow::Result<Option<String>> {
     let mut input = String::new();
     std::io::stdin().read_to_string(&mut input)?;
     let event = Event::parse(&input)?;
     let home = config_home();
     match event.kind() {
-        EventKind::SessionStart => session_start(&event, &home),
-        EventKind::PostToolUse => post_tool_use(&event, &home),
+        EventKind::SessionStart => session_start(&event, &home, loaded),
+        EventKind::PostToolUse => post_tool_use(&event, &home, loaded),
         EventKind::PreCompact => pre_compact(&event, &home),
         EventKind::SessionEnd => {
             if let Some(session_id) = event.session_id() {
@@ -458,7 +478,11 @@ fn run_claude_code() -> anyhow::Result<Option<String>> {
     }
 }
 
-fn session_start(event: &Event, home: &Path) -> anyhow::Result<Option<String>> {
+fn session_start(
+    event: &Event,
+    home: &Path,
+    loaded: Result<Registry, ConfigError>,
+) -> anyhow::Result<Option<String>> {
     let Some(session_id) = event.session_id() else {
         return Ok(None);
     };
@@ -469,7 +493,7 @@ fn session_start(event: &Event, home: &Path) -> anyhow::Result<Option<String>> {
     let Some(cwd) = event.cwd() else {
         return Ok(None);
     };
-    let registry = load(&default_config_path())?;
+    let registry = loaded?;
     let Some(matched) = match_checkout(&[PathBuf::from(cwd)], &registry) else {
         return Ok(None);
     };
@@ -488,7 +512,7 @@ fn session_start(event: &Event, home: &Path) -> anyhow::Result<Option<String>> {
         return Ok(None);
     }
     let state = SessionState::load(home, CLAUDE_CODE, session_id);
-    let Some(notice) = notice_if_requested(&repo, Some(&matched), &state)? else {
+    let Some(notice) = notice_if_requested(&repo, Some(&matched), &registry, &state)? else {
         return Ok(None);
     };
     let (notice, update) = notice.into_parts();
@@ -500,15 +524,22 @@ fn session_start(event: &Event, home: &Path) -> anyhow::Result<Option<String>> {
         .map_err(Into::into)
 }
 
-fn post_tool_use(event: &Event, home: &Path) -> anyhow::Result<Option<String>> {
+fn post_tool_use(
+    event: &Event,
+    home: &Path,
+    loaded: Result<Registry, ConfigError>,
+) -> anyhow::Result<Option<String>> {
     let Some(session_id) = event.session_id() else {
         return Ok(None);
     };
-    let Some((registry, matched)) = relevant_tool_match(&ToolCall {
-        tool: event.tool_name(),
-        args: event.tool_input(),
-        relevant: RELEVANT_TOOLS,
-    })?
+    let Some((registry, matched)) = relevant_tool_match(
+        &ToolCall {
+            tool: event.tool_name(),
+            args: event.tool_input(),
+            relevant: RELEVANT_TOOLS,
+        },
+        loaded,
+    )?
     else {
         return Ok(None);
     };
@@ -527,7 +558,7 @@ fn post_tool_use(event: &Event, home: &Path) -> anyhow::Result<Option<String>> {
     let repo = guidance_root(&matched);
     let state = SessionState::load(home, CLAUDE_CODE, session_id);
     let flags = state.repo(&repo.root);
-    let notice = notice_if_requested(&repo, Some(&matched), &state)?;
+    let notice = notice_if_requested(&repo, Some(&matched), &registry, &state)?;
     let include_notice = notice.is_some();
     let include_guidance = matched.trusted
         && !flags.guided
@@ -587,9 +618,12 @@ struct ToolCall<'a> {
 }
 
 /// The touched-path match for a relevant tool call, with the registry it was
-/// decided against — loaded only once there is a path to decide, so a pathless
-/// call never touches (or fails on) the registry.
-fn relevant_tool_match(call: &ToolCall<'_>) -> anyhow::Result<Option<(Registry, Match)>> {
+/// decided against — taken from `loaded` only once there is a path to decide,
+/// so a pathless call never fails on a registry that could not be read.
+fn relevant_tool_match(
+    call: &ToolCall<'_>,
+    loaded: Result<Registry, ConfigError>,
+) -> anyhow::Result<Option<(Registry, Match)>> {
     let Some(tool) = call.tool else {
         return Ok(None);
     };
@@ -603,7 +637,7 @@ fn relevant_tool_match(call: &ToolCall<'_>) -> anyhow::Result<Option<(Registry, 
     if paths.is_empty() {
         return Ok(None);
     }
-    let registry = load(&default_config_path())?;
+    let registry = loaded?;
     let matched = match_checkout(&paths, &registry);
     Ok(matched.map(|matched| (registry, matched)))
 }
@@ -687,6 +721,7 @@ impl NoticeStateUpdate {
 fn notice_if_requested(
     repo: &GuidanceRoot,
     matched: Option<&Match>,
+    registry: &Registry,
     state: &SessionState,
 ) -> anyhow::Result<Option<PreparedNotice>> {
     let Some(matched) = matched else {
@@ -697,7 +732,7 @@ fn notice_if_requested(
             refusal_notice(repo, "disagrees", &disagreement.to_string(), state)
         }));
     };
-    let store = match Store::open(default_state_path(), &[]) {
+    let store = match Store::open(default_state_path(), &registry.former_names(), &[]) {
         Ok(store) => store,
         Err(error @ (StoreError::Unmigrated { .. } | StoreError::FormerNames { .. })) => {
             return Ok(refusal_notice(

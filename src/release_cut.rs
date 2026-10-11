@@ -8,9 +8,10 @@
 
 use knives::bind::Fork;
 use knives::cli::Exit;
+use knives::commands::claim::Bound;
 use knives::commands::release;
 use knives::forge::github::CliForge;
-use knives::ids::{BookmarkRef, ReleaseScheme, RemoteName, RepoName, UpstreamName};
+use knives::ids::{BookmarkRef, ReleaseScheme, RemoteName, RepoName};
 use knives::ledger::{Draft, Kind, Ledger};
 use knives::release_model::{
     RecordedCut, StackedHistoryContext, carried_branches, last_recorded_cut, members_event_text,
@@ -36,7 +37,7 @@ pub(crate) fn run_release(
     fork: &Fork<'_>,
     extra_consumers: &[&std::path::Path],
     invocation: &ReleaseInvocation,
-    bound: Option<&UpstreamName>,
+    bound: Bound<'_>,
 ) -> anyhow::Result<Exit> {
     let repo = &fork.name;
     let entry = fork.entry;
@@ -58,6 +59,7 @@ pub(crate) fn run_release(
     };
     let (mut worst, pins) = release_plan_exit(
         fork,
+        bound.registry,
         &locals,
         &opened,
         &forge,
@@ -312,6 +314,7 @@ fn requested_cut(
 )]
 fn release_plan_exit(
     fork: &Fork<'_>,
+    registry: &knives::config::Registry,
     locals: &[std::path::PathBuf],
     opened: &knives::jj::Repo,
     forge: &dyn knives::consumer_pins::ConsumerPinSource,
@@ -326,7 +329,7 @@ fn release_plan_exit(
         cache_root,
         heads,
     };
-    let plan = super::pulled_plan(fork, &consumers)?;
+    let plan = super::pulled_plan(fork, registry, &consumers)?;
     println!("{}", release::render(&plan));
     let mut exit = release::exit_for(&plan);
     if let Some(lag) = release::trunk_lag(opened, plan.release.as_deref(), &entry.upstream_trunk())
@@ -515,7 +518,7 @@ struct CompletedCut<'a> {
 fn record_cut_event(
     fork: &Fork<'_>,
     cut: &CompletedCut<'_>,
-    bound: Option<&UpstreamName>,
+    bound: Bound<'_>,
 ) -> anyhow::Result<()> {
     let entry = fork.entry;
     let opened = knives::jj::Repo::open(&fork.checkout.path)?;

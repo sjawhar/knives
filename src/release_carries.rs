@@ -28,8 +28,13 @@ use super::{parallelism, pulled_ledger};
 /// the report's problems. The plan's other problems (a consumer whose pins
 /// could not be read) are not: they are about the next cut, not about which
 /// release this is.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the fork, the registry its ledger is pulled through, the reference, the replay request and the output format are independent inputs"
+)]
 pub(crate) fn run_release_members(
     fork: &Fork<'_>,
+    registry: &knives::config::Registry,
     reference: Option<&str>,
     verify: bool,
     output: Output,
@@ -51,7 +56,7 @@ pub(crate) fn run_release_members(
             cache_root: cache_root.as_deref(),
             heads: &heads,
         };
-        let (entries, problems) = pulled_ledger(fork)?;
+        let (entries, problems) = pulled_ledger(fork, registry)?;
         let plan = release::plan(fork, &consumers, &entries)?;
         let Some(reference) = plan.release else {
             println!("{repo}: no release to inspect; cut one first");
