@@ -193,12 +193,10 @@ struct Identity {
 ///
 /// Refused, with the command that fixes it: a machine name that cannot spell
 /// this machine's ref (`refs/knives/<machine>`) as one component, found
-/// otherwise only when a sweep commits and failing there instead; and the
-/// retired `knives.fork`, which named the forks a repository carried before
-/// `repos.toml` did, so a machine that still sets it expects a sharing this
-/// knives does not do. Any other `knives.*` key is one a newer knives may
-/// read: it is reported and passed over, since machines sharing a ledger,
-/// and sessions on one machine, run different versions.
+/// otherwise only when a sweep commits and failing there instead. Any other
+/// `knives.*` key is one a newer knives may read: it is reported and passed
+/// over, since machines sharing a ledger, and sessions on one machine, run
+/// different versions.
 fn identity(git_dir: &Path) -> Result<Identity, SweepError> {
     let mut found = Identity {
         machine: None,
@@ -222,14 +220,6 @@ fn identity(git_dir: &Path) -> Result<Identity, SweepError> {
                     )));
                 }
                 found.machine = Some(value);
-            }
-            "knives.fork" => {
-                return Err(refused(format!(
-                    "sets {key}, which knives no longer reads: which forks a repository \
-                     carries is each repos.toml entry's `ledger`. Remove it: git --git-dir={} \
-                     config --unset-all {key}",
-                    git_dir.display()
-                )));
             }
             _ if key == origin_key => found.origin = Some(value),
             _ => found.ignored.push(format!(
@@ -259,8 +249,8 @@ fn identity(git_dir: &Path) -> Result<Identity, SweepError> {
 /// `origin` names is [`Destinations::unreached`]. No fork shared and no
 /// machine named is a ledger nobody set up to share: no destination, and
 /// nothing to report. A candidate naming a machine and carrying no fork is a
-/// destination that carries nothing. Refused, each with what fixes it: the
-/// retired `knives.fork` key ([`identity`]), forks carried with no machine
+/// destination that carries nothing. Refused, each with what fixes it: a
+/// machine name no ref can spell ([`identity`]), forks carried with no machine
 /// name, two candidates whose `origin` is one repository, since which of
 /// them a fork's entries go through would be a guess, and a fork whose
 /// registry key's directory still holds the entries an older knives filed
@@ -1425,32 +1415,24 @@ mod tests {
     fn a_knives_key_nothing_reads_is_reported_and_passed_over() {
         // A newer knives may read it, and machines sharing a ledger upgrade
         // at different times: refusing it would stop every pull and sweep.
-        let (_home, root) = ledger_root();
-        git(&root.join(".git"), &["config", "knives.machine", "alpha"]);
-        git(&root.join(".git"), &["config", "knives.forks", "a-repo"]);
+        // `knives.fork` gets the same note as any other.
+        for key in ["knives.forks", "knives.fork"] {
+            let (_home, root) = ledger_root();
+            git(&root.join(".git"), &["config", "knives.machine", "alpha"]);
+            git(&root.join(".git"), &["config", key, "a-repo"]);
 
-        let found = destinations(&root).unwrap();
+            let found = destinations(&root).unwrap();
 
-        assert!(
-            matches!(
-                found.ignored.as_slice(),
-                [line] if line.contains("knives.forks")
-                    && line.contains("--unset-all knives.forks")
-            ),
-            "{:?}",
-            found.ignored
-        );
-    }
-
-    #[test]
-    fn the_retired_knives_fork_key_is_refused_with_the_command_that_removes_it() {
-        let (_home, root) = ledger_root();
-        git(&root.join(".git"), &["config", "knives.machine", "alpha"]);
-        git(&root.join(".git"), &["config", "knives.fork", "a-repo"]);
-
-        let error = destinations(&root).unwrap_err().to_string();
-
-        assert!(error.contains("--unset-all knives.fork"), "was: {error}");
+            assert!(
+                matches!(
+                    found.ignored.as_slice(),
+                    [line] if line.contains(&format!("sets {key},"))
+                        && line.contains(&format!("--unset-all {key}"))
+                ),
+                "{key}: {:?}",
+                found.ignored
+            );
+        }
     }
 
     #[test]
