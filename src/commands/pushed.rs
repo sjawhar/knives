@@ -241,8 +241,16 @@ const fn is_finding(verdict: &Verdict) -> bool {
 /// Render each requested branch and all of its observed reconciliation facts.
 pub fn render(report: &Report) -> String {
     let mut lines = String::new();
+    // A problem can name a path from disk or another machine's ledger ref.
     for problem in &report.problems {
-        append_line(&mut lines, &format!("{}: PROBLEM: {problem}", report.repo));
+        append_line(
+            &mut lines,
+            &format!(
+                "{}: PROBLEM: {}",
+                report.repo,
+                crate::ledger::inline_human_text(problem)
+            ),
+        );
     }
     for row in &report.rows {
         append_line(&mut lines, &format!("{}: {}", report.repo, render_row(row)));

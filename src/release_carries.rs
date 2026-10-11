@@ -56,7 +56,7 @@ pub(crate) fn run_release_members(
         let Some(reference) = plan.release else {
             println!("{repo}: no release to inspect; cut one first");
             for problem in &problems {
-                println!("!! {problem}");
+                println!("!! {}", knives::ledger::inline_human_text(problem));
             }
             return Ok(Exit::Incomplete);
         };

@@ -592,6 +592,73 @@ fn a_peer_tree_nested_below_a_carried_fork_is_refused_and_nothing_is_written() {
     assert!(!beta.join(REPO).exists(), "{nested:?} wrote into the fork");
 }
 
+/// A file name [`knives::ledger::Ledger::append`] could have written.
+const ENTRY_NAME: &str = "20261011T120000.000000000Z-0000.md";
+
+#[test]
+fn a_peer_tree_naming_what_no_knives_writes_is_refused_and_nothing_is_written() {
+    // Given: peer refs carrying a valid entry under a file name holding
+    // terminal control sequences, under names no knives writes, and under
+    // an owner or repository directory no fork could be kept under (a `\`,
+    // which `commit_nested`'s printf reads as `\\`).
+    let (root, remote) = lab::bare_remote();
+    let beta = machine(root.path(), "beta", &remote);
+    let red = "20261011T120000.000000000Z-\u{1b}[31mRED\u{1b}[0m.md";
+    for nested in [
+        ["acme", "a-repo", red],
+        ["acme", "a-repo", "x.md"],
+        ["acme", "a-repo", "20261011T120000.000000000Z-ABCD.md"],
+        ["ac\\\\me", "a-repo", ENTRY_NAME],
+        ["acme", "a\\\\repo", ENTRY_NAME],
+    ] {
+        let hostile = MachineRef {
+            machine: "mallory".to_owned(),
+            commit: commit_nested(&beta, &nested, VALID_ENTRY.as_bytes()),
+        };
+
+        // When / Then: materialise refuses the whole tree and writes nothing.
+        let done = ledger_git::materialise(&repository(&beta), &[hostile]);
+        assert!(
+            matches!(done, Err(GitError::NotAnEntry { .. })),
+            "{nested:?} was not refused: {done:?}"
+        );
+        let written: Vec<_> = std::fs::read_dir(&beta)
+            .expect("read beta's ledger root")
+            .map(|dirent| dirent.expect("dirent").file_name())
+            .filter(|name| name != ".git")
+            .collect();
+        assert!(written.is_empty(), "{nested:?} wrote {written:?}");
+    }
+}
+
+#[test]
+fn a_machine_ref_carries_only_files_named_as_knives_names_an_entry() {
+    // Given: an entry, and copies of it in the fork's directory under a
+    // name no knives writes and under one holding a control sequence.
+    let (root, remote) = lab::bare_remote();
+    let beta = machine(root.path(), "beta", &remote);
+    append(&beta, "ses_beta", 1, 0);
+    let direct = file_names(&beta)
+        .into_iter()
+        .next()
+        .expect("one direct entry");
+    for name in ["notes.md", "20261011T120000.000000000Z-\u{1b}[2J.md"] {
+        std::fs::copy(beta.join(REPO).join(&direct), beta.join(REPO).join(name))
+            .expect("copy the entry");
+    }
+
+    // When: this machine commits its pending entries.
+    let repository = repository(&beta);
+    commit_new_entries(&repository, "beta")
+        .expect("commit pending entries")
+        .expect("the entry is pending");
+
+    // Then: only the entry is in the committed tree.
+    let paths = paths_ever_under(repository.git_dir(), "refs/knives/beta");
+    let entries: Vec<&String> = paths.iter().filter(|path| lab::is_entry(path)).collect();
+    assert_eq!(entries, [&format!("{REPO}/{direct}")], "{paths:?}");
+}
+
 #[test]
 fn a_machine_ref_carries_only_entries_directly_in_the_fork_directory() {
     // Given: a normal entry and a nested Markdown file beside it. Only the

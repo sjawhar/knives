@@ -716,8 +716,14 @@ pub fn render(report: &Report) -> String {
         .iter()
         .map(|note| format!("! {note}"))
         .collect();
-    // What could not be answered, so an exit of 3 never arrives unexplained.
-    lines.extend(report.problems.iter().map(|problem| format!("? {problem}")));
+    // What could not be answered, so an exit of 3 never arrives unexplained;
+    // a problem can name a path from disk or another machine's ledger ref.
+    lines.extend(
+        report
+            .problems
+            .iter()
+            .map(|problem| format!("? {}", crate::ledger::inline_human_text(problem))),
+    );
     if report.rows.is_empty() {
         lines.push(format!("{}: no tracked pull requests", report.repo));
         return lines.join("\n");

@@ -647,8 +647,13 @@ pub const fn exit_for(report: &Report) -> Exit {
 /// and the one deeper-history surface.
 pub fn render(report: &Report) -> String {
     let mut lines = format!("{}: audit", report.repo);
+    // A problem can name a path from disk or from another machine's ledger ref.
     for problem in &report.problems {
-        let _ = write!(lines, "\n  PROBLEM: {problem}");
+        let _ = write!(
+            lines,
+            "\n  PROBLEM: {}",
+            crate::ledger::inline_human_text(problem)
+        );
     }
     if !report.branches.is_empty() {
         lines.push_str("\n  branches:");

@@ -109,7 +109,10 @@ pub fn render(report: &Report) -> String {
             events,
             problems,
         } => {
-            let flagged = problems.iter().map(|problem| format!("!! {problem}"));
+            // A problem names a file from disk or another machine's ref.
+            let flagged = problems
+                .iter()
+                .map(|problem| format!("!! {}", inline_human_text(problem)));
             if entries.is_empty() && events.is_none() {
                 return std::iter::once(format!("{repo}  no notches yet"))
                     .chain(flagged)
@@ -450,6 +453,27 @@ mod tests {
         assert!(!text.contains('\u{1b}'), "was: {text:?}");
         assert!(!text.contains('\r'), "was: {text:?}");
         assert!(text.contains('\u{fffd}'), "was: {text:?}");
+    }
+
+    #[test]
+    fn human_rendering_escapes_control_characters_in_problems() {
+        // A problem names a file or a path that may have come from another
+        // machine's ref or from disk.
+        let problem = "…/acme/a-repo/x-\u{1b}]0;pwned\u{7}.md is not an entry".to_owned();
+        for entries in [Vec::new(), vec![entry(Some("feat/alpha"), Kind::Note, "a")]] {
+            let report = Report::Read {
+                repo: "a-repo".to_owned(),
+                matched: entries.len(),
+                entries,
+                events: None,
+                problems: vec![problem.clone()],
+            };
+
+            let text = render(&report);
+            assert!(!text.contains('\u{1b}'), "was: {text:?}");
+            assert!(!text.contains('\u{7}'), "was: {text:?}");
+            assert!(text.contains("!! "), "was: {text:?}");
+        }
     }
 
     #[test]

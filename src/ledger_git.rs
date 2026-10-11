@@ -122,7 +122,7 @@ impl std::fmt::Display for Conflict {
             f,
             "{} differs between {sources}, so a pull writes nothing there{}; every pull \
              checks it again",
-            self.path.display(),
+            crate::ledger::inline_human_text(&self.path.display().to_string()),
             if self.present {
                 " and leaves the file here as it is"
             } else {
@@ -144,6 +144,9 @@ pub struct Unreadable {
     pub detail: String,
 }
 
+/// Named with its detail escaped ([`crate::ledger::inline_human_text`]): the
+/// detail is what the parser said, which quotes the peer's own bytes, and
+/// every report that pulls carries it, whoever renders it.
 impl std::fmt::Display for Unreadable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -151,8 +154,8 @@ impl std::fmt::Display for Unreadable {
             "machine {}'s ref carries {}, which this knives cannot read: {}. It is not written \
              here, since every read of that fork would fail on it; every pull checks it again",
             self.machine,
-            self.path.display(),
-            self.detail
+            crate::ledger::inline_human_text(&self.path.display().to_string()),
+            crate::ledger::inline_human_text(&self.detail)
         )
     }
 }
@@ -979,8 +982,11 @@ fn fork_directory(fork: UpstreamName) -> Result<UpstreamName, GitError> {
     }
 }
 
-/// Every `*.md` regular file directly inside each fork `repository` carries,
-/// relative to the root. A fork with no directory yet has no entries.
+/// Every regular file named as an entry
+/// ([`crate::ledger::is_entry_file_name`]) directly inside each fork
+/// `repository` carries, relative to the root: what
+/// [`crate::ledger::Ledger::read`] reads, and nothing it reports as
+/// misnamed. A fork with no directory yet has no entries.
 fn local_entries(repository: &Repository) -> Result<BTreeSet<PathBuf>, GitError> {
     let mut found = BTreeSet::new();
     for fork in repository.forks() {
@@ -998,8 +1004,9 @@ fn local_entries(repository: &Repository) -> Result<BTreeSet<PathBuf>, GitError>
         for dirent in listing {
             let dirent = dirent.map_err(unreadable)?;
             let name = dirent.file_name();
-            let kind = dirent.file_type().map_err(unreadable)?;
-            if kind.is_file() && Path::new(&name).extension() == Some(OsStr::new("md")) {
+            if name.to_str().is_some_and(crate::ledger::is_entry_file_name)
+                && dirent.file_type().map_err(unreadable)?.is_file()
+            {
                 found.insert(relative.join(name));
             }
         }
@@ -1261,35 +1268,40 @@ fn tree_item(record: &[u8]) -> Option<TreeItem> {
 }
 
 /// Whether `path` has the one shape a ledger entry reader accepts:
-/// `<owner>/<repository>/<file>.md`, without a `.git` component.
+/// `<owner>/<repository>/<file>`, the owner and the repository each a
+/// directory a fork can be kept under ([`crate::ledger::is_ledger_component`]).
 fn entry_path(path: &Path) -> bool {
     let mut components = path.components();
-    matches!(
-        (
-            components.next(),
-            components.next(),
-            components.next(),
-            components.next()
-        ),
-        (
-            Some(Component::Normal(owner)),
-            Some(Component::Normal(repository)),
-            Some(Component::Normal(_)),
-            None
-        ) if !owner.eq_ignore_ascii_case(".git") && !repository.eq_ignore_ascii_case(".git")
-    )
+    let directory = |component: Option<Component<'_>>| match component {
+        Some(Component::Normal(name)) => name
+            .to_str()
+            .is_some_and(crate::ledger::is_ledger_component),
+        _ => false,
+    };
+    directory(components.next())
+        && directory(components.next())
+        && matches!(components.next(), Some(Component::Normal(_)))
+        && components.next().is_none()
 }
 
 /// Refuse a tree item that is not an entry file as [`commit_pending`]
-/// writes one (a `100644` blob named `<owner>/<repository>/<file>.md`), or
-/// whose path is not exactly that shape.
+/// writes one: a `100644` blob at `<owner>/<repository>/<file>`, its
+/// directories ones a fork can be kept under and its file named as
+/// [`crate::ledger::is_entry_file_name`] says. A name no knives writes,
+/// one holding a terminal control sequence among them, never reaches this
+/// machine's ledger.
 fn check_entry(commit: &CommitId, item: &TreeItem) -> Result<(), GitError> {
     let detail = if item.mode != Mode::File {
         Some("not a regular, non-executable file")
-    } else if item.path.extension() != Some(OsStr::new("md")) {
-        Some("not named *.md")
     } else if !entry_path(&item.path) {
         Some("not exactly <owner>/<repository>/<file>.md")
+    } else if !item
+        .path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .is_some_and(crate::ledger::is_entry_file_name)
+    {
+        Some("not named as knives names an entry, YYYYMMDDTHHMMSS.nnnnnnnnnZ-xxxx.md")
     } else {
         None
     };
@@ -1557,6 +1569,37 @@ mod tests {
                 ),
                 "{name:?} was accepted"
             );
+        }
+    }
+
+    #[test]
+    fn an_unwritten_peer_entry_is_named_with_no_control_character() {
+        // An unreadable entry's detail is what the parser said, which
+        // quotes the peer's own bytes; every report that pulls carries it.
+        let path = PathBuf::from("acme/a-repo/20261011T120000.000000000Z-0000.md");
+        let detail = crate::ledger::parse_bytes(&path, b"+++\nts = \"\x1b]0;pwned\x07\"\n+++\nx\n")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            detail.contains('\u{1b}'),
+            "the parser no longer quotes: {detail:?}"
+        );
+        let lines = [
+            Unreadable {
+                machine: "mallory".to_owned(),
+                path,
+                detail,
+            }
+            .to_string(),
+            Conflict {
+                path: PathBuf::from("acme/a-repo/x-\u{1b}[2J.md"),
+                machines: vec!["mallory".to_owned()],
+                present: true,
+            }
+            .to_string(),
+        ];
+        for line in lines {
+            assert!(!line.chars().any(|c| c.is_ascii_control()), "{line:?}");
         }
     }
 

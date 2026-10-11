@@ -132,10 +132,12 @@ pub fn render(report: &Report) -> String {
                     1 => ", 1 repeated transition discarded".to_owned(),
                     count => format!(", {count} repeated transitions discarded"),
                 };
+                // A skipped key is a directory name from another machine's ref.
                 let skipped: String = tally.skipped.iter().flatten().fold(
                     String::new(),
                     |mut text, (fork, count)| {
-                        let _ = write!(text, ", {count} of {fork} left unread");
+                        let _ =
+                            write!(text, ", {count} of {} left unread", inline_human_text(fork));
                         text
                     },
                 );
@@ -148,7 +150,7 @@ pub fn render(report: &Report) -> String {
                     "ledger: {} ({}): {} commit(s), {} push(es), {} entr{} pulled{discarded}\
                      {skipped}{unsent}; carries {}",
                     tally.remote,
-                    tally.git_dir,
+                    inline_human_text(&tally.git_dir),
                     tally.commits,
                     tally.pushes,
                     tally.pulled,
@@ -171,13 +173,19 @@ pub fn render(report: &Report) -> String {
             format!("ledger: waited {}s for {who} to finish", waited.seconds),
         );
     }
+    // Problems and notes name paths from disk and from other machines' refs.
     lines.extend(
         report
             .problems
             .iter()
-            .map(|problem| format!("!! {problem}")),
+            .map(|problem| format!("!! {}", inline_human_text(problem))),
     );
-    lines.extend(report.notes.iter().map(|note| format!("note: {note}")));
+    lines.extend(
+        report
+            .notes
+            .iter()
+            .map(|note| format!("note: {}", inline_human_text(note))),
+    );
     lines.join("\n")
 }
 
@@ -729,4 +737,26 @@ pub fn render_migrated(migrated: &Migrated) -> String {
             .map(|problem| format!("!! {}", inline_human_text(problem))),
     );
     lines.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_sweeps_problems_and_notes_render_with_control_characters_escaped() {
+        // Each can carry a name from another machine's ref or from disk.
+        let report = Report {
+            problems: vec!["…/x-\u{1b}]0;pwned\u{7}.md differs between refs".to_owned()],
+            notes: vec!["\u{1b}[2J sets knives.x".to_owned()],
+            ..Report::of(Outcome::Swept)
+        };
+
+        let text = render(&report);
+
+        assert!(!text.contains('\u{1b}'), "was: {text:?}");
+        assert!(!text.contains('\u{7}'), "was: {text:?}");
+        assert!(text.contains("!! "), "was: {text:?}");
+        assert!(text.contains("note: "), "was: {text:?}");
+    }
 }

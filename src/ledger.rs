@@ -312,6 +312,13 @@ pub enum LedgerError {
         path.display()
     )]
     Statement { path: PathBuf, detail: String },
+    #[error(
+        "{} is not named as knives names a ledger entry \
+         (YYYYMMDDTHHMMSS.nnnnnnnnnZ-xxxx.md), so no knives reads it or sends it to another \
+         machine; rename or remove it",
+        inline_human_text(&path.display().to_string())
+    )]
+    Misnamed { path: PathBuf },
     #[error("{path} already exists: two writers drew the same nanosecond and suffix")]
     Collision { path: PathBuf },
     #[error(
@@ -555,15 +562,25 @@ impl Ledger {
     /// does not know ([`Kind::Unknown`]) is left out, and a statement it
     /// cannot read states nothing, each a problem naming the file, so a
     /// machine running an older knives still reads every other entry. Only
-    /// `*.md` regular files are entries: an editor's or a sync tool's
-    /// droppings beside them are ignored, not fatal, and so is a symlink,
-    /// which a sweep never commits, so no other machine would read it. Each
-    /// read parses the whole directory — O(all history) — which is
-    /// acceptable at observed scales; chronological filenames leave a
-    /// tail-read optimization open if `KNIVES_TIMING` shows it is needed.
+    /// regular files named as [`is_entry_file_name`] says are entries. Any
+    /// other `*.md` file is a problem naming it, never read: no knives wrote
+    /// it, and no sweep sends it, so no other machine would read it either.
+    /// Anything else (an editor's or a sync tool's droppings, a symlink,
+    /// which a sweep never commits) is passed over. Each read parses the
+    /// whole directory — O(all history) — which is acceptable at observed
+    /// scales; chronological filenames leave a tail-read optimization open
+    /// if `KNIVES_TIMING` shows it is needed.
     pub fn read(&self) -> Result<Entries, LedgerError> {
-        let mut read = Entries::default();
-        for (path, parsed) in self.parsed()? {
+        let listed = self.listed()?;
+        let mut read = Entries {
+            problems: listed
+                .misnamed
+                .into_iter()
+                .map(|path| LedgerError::Misnamed { path }.to_string())
+                .collect(),
+            ..Entries::default()
+        };
+        for (path, parsed) in parse_files(listed.entries) {
             let (entry, problem) = parsed?;
             if entry.kind == Kind::Unknown {
                 read.problems
@@ -588,22 +605,23 @@ impl Ledger {
     /// caller that has a use for the entries that do parse when one does
     /// not. Only listing the directory fails the call. An entry of a kind
     /// this knives does not know is returned as one, and a statement it
-    /// cannot read as none; [`Ledger::read`] says so.
+    /// cannot read as none; [`Ledger::read`] says so. A `*.md` file not
+    /// named as an entry is not one, and is not returned.
     pub fn entry_reads(&self) -> Result<Vec<EntryRead>, LedgerError> {
-        Ok(self
-            .parsed()?
-            .into_iter()
+        Ok(parse_files(self.listed()?.entries)
             .map(|(path, parsed)| (path, parsed.map(|(entry, _)| entry)))
             .collect())
     }
 
-    /// Each entry file in name order, beside what [`parse_bytes`] made of it.
-    fn parsed(&self) -> Result<Vec<ParsedFile>, LedgerError> {
+    /// The regular `*.md` files directly in this ledger's directory, split
+    /// into those named as entries and the rest, each in name order.
+    fn listed(&self) -> Result<Listed, LedgerError> {
         self.migrated()?;
+        let mut listed = Listed::default();
         let listing = match std::fs::read_dir(&self.path) {
             Ok(listing) => listing,
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(Vec::new());
+                return Ok(listed);
             }
             Err(source) => {
                 return Err(LedgerError::Read {
@@ -612,7 +630,6 @@ impl Ledger {
                 });
             }
         };
-        let mut files = Vec::new();
         for dirent in listing {
             let unreadable = |source| LedgerError::Read {
                 path: self.path.clone(),
@@ -621,26 +638,43 @@ impl Ledger {
             let dirent = dirent.map_err(unreadable)?;
             let path = dirent.path();
             // `file_type` does not follow a symlink: one stays a symlink.
-            if path.extension() == Some(OsStr::new("md"))
-                && dirent.file_type().map_err(unreadable)?.is_file()
+            if path.extension() != Some(OsStr::new("md"))
+                || !dirent.file_type().map_err(unreadable)?.is_file()
             {
-                files.push(path);
+                continue;
+            }
+            if dirent.file_name().to_str().is_some_and(is_entry_file_name) {
+                listed.entries.push(path);
+            } else {
+                listed.misnamed.push(path);
             }
         }
-        files.sort();
-        Ok(files
-            .into_iter()
-            .map(|path| {
-                let parsed = std::fs::read(&path)
-                    .map_err(|source| LedgerError::Read {
-                        path: path.clone(),
-                        source,
-                    })
-                    .and_then(|bytes| parse_bytes(&path, &bytes));
-                (path, parsed)
-            })
-            .collect())
+        listed.entries.sort();
+        listed.misnamed.sort();
+        Ok(listed)
     }
+}
+
+/// What [`Ledger::listed`] found.
+#[derive(Debug, Default)]
+struct Listed {
+    /// Each file named as [`is_entry_file_name`] says.
+    entries: Vec<PathBuf>,
+    /// Each other regular `*.md` file.
+    misnamed: Vec<PathBuf>,
+}
+
+/// Each of `files`, in order, beside what [`parse_bytes`] made of it.
+fn parse_files(files: Vec<PathBuf>) -> impl Iterator<Item = ParsedFile> {
+    files.into_iter().map(|path| {
+        let parsed = std::fs::read(&path)
+            .map_err(|source| LedgerError::Read {
+                path: path.clone(),
+                source,
+            })
+            .and_then(|bytes| parse_bytes(&path, &bytes));
+        (path, parsed)
+    })
 }
 
 /// What [`Ledger::read`] found.
@@ -648,9 +682,10 @@ impl Ledger {
 pub struct Entries {
     /// Every entry this knives can read, oldest first.
     pub entries: Vec<Entry>,
-    /// One for each entry left out because its kind is one this knives does
-    /// not know, and each statement that states nothing because this knives
-    /// cannot read it, naming the file.
+    /// One for each `*.md` file not named as an entry, each entry left out
+    /// because its kind is one this knives does not know, and each statement
+    /// that states nothing because this knives cannot read it, naming the
+    /// file.
     pub problems: Vec<String>,
 }
 
@@ -1021,6 +1056,25 @@ fn entry_file_name(ts: jiff::Timestamp) -> String {
         ts.strftime("%Y%m%dT%H%M%S"),
         ts.subsec_nanosecond()
     )
+}
+
+/// Whether `name` is a file name [`entry_file_name`] writes:
+/// `YYYYMMDDTHHMMSS.nnnnnnnnnZ-xxxx.md`, digits where the stamp has them and
+/// four lowercase hex characters for the suffix.
+///
+/// The one definition of an entry file every side holds to: a read takes
+/// only these ([`Ledger::read`] names any other `*.md` as a problem), a
+/// sweep sends only these, and a pull refuses a peer's tree naming anything
+/// else, so a name no knives wrote, a terminal control sequence among them,
+/// never enters a ledger from another machine.
+pub fn is_entry_file_name(name: &str) -> bool {
+    const SHAPE: &[u8] = b"00000000T000000.000000000Z-xxxx.md";
+    name.len() == SHAPE.len()
+        && name.bytes().zip(SHAPE).all(|(byte, &shape)| match shape {
+            b'0' => byte.is_ascii_digit(),
+            b'x' => byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte),
+            _ => byte == shape,
+        })
 }
 
 /// An entry, and the problem with its statement when this knives cannot read
@@ -1662,6 +1716,72 @@ mod tests {
         let read = ledger.entries().unwrap();
         assert_eq!(read.len(), 1);
         assert_eq!(read[0].text, "fine");
+    }
+
+    #[test]
+    fn a_markdown_file_not_named_as_knives_names_an_entry_is_named_and_not_read() {
+        // Given: an entry, and two Markdown files beside it no knives wrote:
+        // one a hand might add, one whose name holds a control sequence.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a-repo");
+        let ledger = Ledger::at(path.clone());
+        ledger.append(&entry(Some("feat/alpha"), "fine")).unwrap();
+        let readable =
+            "+++\nts = \"2026-08-15T22:14:03Z\"\nowner = \"x\"\nkind = \"note\"\n+++\nstray\n";
+        std::fs::write(path.join("notes.md"), readable).unwrap();
+        std::fs::write(
+            path.join("20990101T000000.000000000Z-\u{1b}[2J.md"),
+            readable,
+        )
+        .unwrap();
+
+        // Then: the read gives the entry alone, and names each other file,
+        // with no control character left in what it says.
+        let read = ledger.read().unwrap();
+        assert_eq!(read.entries.len(), 1, "{:?}", read.entries);
+        assert_eq!(read.entries[0].text, "fine");
+        assert_eq!(read.problems.len(), 2, "{:?}", read.problems);
+        assert!(
+            read.problems
+                .iter()
+                .any(|problem| problem.contains("notes.md")),
+            "{:?}",
+            read.problems
+        );
+        assert!(
+            read.problems
+                .iter()
+                .all(|problem| !problem.chars().any(|c| c.is_ascii_control())),
+            "{:?}",
+            read.problems
+        );
+    }
+
+    #[test]
+    fn an_entry_file_name_is_exactly_what_a_write_names_one() {
+        let written = entry_file_name("2026-08-15T22:14:03.000000001Z".parse().unwrap());
+        assert!(is_entry_file_name(&written), "{written}");
+        for name in [
+            "20260815T221403.000000000Z-0000.md",
+            "20990101T000000.999999999Z-af09.md",
+        ] {
+            assert!(is_entry_file_name(name), "{name}");
+        }
+        for name in [
+            "notes.md",
+            "20260815T221403.000000000Z-ABCD.md",
+            "20260815T221403.000000000Z-000.md",
+            "20260815T221403.000000000Z-00000.md",
+            "20260815T221403.00000000Z-0000.md",
+            "20260815X221403.000000000Z-0000.md",
+            "20260815T221403.000000000Z-0000.MD",
+            "20260815T221403.000000000Z-0000.md.swp",
+            "2026081\u{1b}T221403.000000000Z-0000.md",
+            "20260815T221403.000000000Z-\u{1b}[2J.md",
+            "",
+        ] {
+            assert!(!is_entry_file_name(name), "{name:?}");
+        }
     }
 
     #[test]

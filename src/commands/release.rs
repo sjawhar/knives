@@ -1046,11 +1046,12 @@ pub fn render_members(report: &MembersReport) -> String {
         }
     }
     lines.extend(report.notes.iter().map(|note| format!("! {note}")));
+    // A problem can name a path from disk or another machine's ledger ref.
     lines.extend(
         report
             .problems
             .iter()
-            .map(|problem| format!("!! {problem}")),
+            .map(|problem| format!("!! {}", crate::ledger::inline_human_text(problem))),
     );
     lines.join("\n")
 }
@@ -1059,7 +1060,7 @@ pub fn render(plan: &Plan) -> String {
     let mut lines: Vec<String> = plan
         .problems
         .iter()
-        .map(|problem| format!("!! {problem}"))
+        .map(|problem| format!("!! {}", crate::ledger::inline_human_text(problem)))
         .chain(plan.notes.iter().map(|note| format!("! {note}")))
         .collect();
     let Some(release) = &plan.release else {

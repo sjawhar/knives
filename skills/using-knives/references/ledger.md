@@ -118,9 +118,13 @@ filesystem path is kept under its registry key. Each entry is one Markdown file
 with TOML frontmatter between `+++` fences and a prose body. A write finishes a
 temporary file, then atomically persists it without replacement, and takes no
 lock: two writers never share a file. Filenames use compact UTC time plus a
-four-hex suffix; readers scan lexical filename order, which is chronological.
-Only a regular `*.md` file is an entry: every other file, and a symlink named
-like one, is passed over by every reader and never shared.
+four-hex suffix, `YYYYMMDDTHHMMSS.nnnnnnnnnZ-xxxx.md` with the suffix in
+lowercase hex; readers scan lexical filename order, which is chronological.
+Only a regular file named exactly that way is an entry (`is_entry_file_name`,
+`src/ledger.rs`). Any other `*.md` file in a fork's directory is never read
+and never shared: every read names it as a problem, so the command exits `3`
+and keeps answering from the entries. Every other file, and a symlink named
+like an entry, is passed over by every reader and never shared.
 
 An entry is never rewritten, and no rotation or retention policy applies. Two
 things remove an entry file: `knives ledger migrate` moving it into its fork's
@@ -151,9 +155,11 @@ and keep answering from the rest; a release write refuses on it. Read
 anyway, a part of it could let an older statement, or a shorter list, read as
 live. No write of this knives produces either.
 
-A peer tree may name only regular `<owner>/<repository>/<file>.md` entries.
-Any other path, including an entry nested below its fork directory, refuses the
-whole pull before it writes anything. A shape-valid peer entry that does not
+A peer tree may name only regular `<owner>/<repository>/<file>` entries, the
+file named as an entry is and the owner and repository directories a fork can
+be kept under. Any other path, including an entry nested below its fork
+directory or a name holding a terminal control character, refuses the whole
+pull before it writes anything. A shape-valid peer entry that does not
 parse is left out and names the machine whose ref carries it and its path, as a
 problem of that fork's report and of the sweep; every pull checks it again, so a
 knives that can read it writes it then.
@@ -326,10 +332,11 @@ it reports and its exit code are its own: a failure of the sweep it waited
 for reaches only `ledger-sweep.log`. The holder passes over
 each git directory under that directory's own `knives-transport.lock`: it
 fetches every machine's ref into `refs/knives-remotes/origin/<machine>` and
-materialises only regular `<owner>/<repository>/<file>.md` entries the root
-lacks. A peer tree naming anything else is refused whole before writing. The
-sweep discards this machine's repeated transitions (below), commits what is new
-to `refs/knives/<machine>` (git plumbing only, never the index), and pushes that
+materialises only entries the root lacks, each a regular file named as an
+entry in a `<owner>/<repository>/` directory. A peer tree naming anything else
+is refused whole before writing. The sweep discards this machine's repeated
+transitions (below), commits what is new, only files named as entries, to
+`refs/knives/<machine>` (git plumbing only, never the index), and pushes that
 ref, which no other machine writes. A failed fetch does not stop the commit and
 push, and neither does an entry that does not parse: it is a problem naming the
 file, left out of the repeated-transition check, and, when it is this machine's

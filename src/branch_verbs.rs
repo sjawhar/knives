@@ -310,7 +310,7 @@ fn finish_claim_gate(
 fn pulled_before_replacing(fork: &Fork<'_>, what: &str) -> bool {
     let problems = knives::ledger_sweep::pull(&[&fork.upstream]).problems_for(&fork.upstream);
     for problem in &problems {
-        eprintln!("!! {problem}");
+        eprintln!("!! {}", knives::ledger::inline_human_text(problem));
     }
     if !problems.is_empty() {
         eprintln!(

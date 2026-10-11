@@ -1939,6 +1939,43 @@ fn push_as_peer(remote: &Path, machine: &str, path: &str, contents: &str) {
     );
 }
 
+#[test]
+fn a_peer_directory_named_with_control_characters_reaches_the_terminal_escaped() {
+    // Given: a machine carrying one fork, and a peer's ref on the remote
+    // carrying an entry, named as knives names one, under an owner
+    // directory whose name holds an OSC title-set sequence: a fork this
+    // machine does not carry, which a pull counts as left unread.
+    let home = a_repo_home();
+    let (_remote_dir, remote) = lab::bare_remote();
+    share(home.path(), "alpha", &remote);
+    push_as_peer(
+        &remote,
+        "mallory",
+        "\u{1b}]0;pwned\u{7}/repo/20261011T120000.000000000Z-0000.md",
+        &peer_entry("from a peer"),
+    );
+
+    // When: a sweep runs and renders for a person.
+    let swept = lab::knives_command(
+        home.path(),
+        home.path(),
+        home.path(),
+        &["--text", "ledger", "sweep"],
+    )
+    .output()
+    .expect("run knives ledger sweep");
+
+    // Then: it counts the entry as left unread, with no control character
+    // in what it prints.
+    let stdout = String::from_utf8_lossy(&swept.stdout);
+    assert!(swept.status.success(), "{stdout:?}");
+    assert!(stdout.contains("left unread"), "{stdout:?}");
+    assert!(
+        !stdout.contains('\u{1b}') && !stdout.contains('\u{7}'),
+        "{stdout:?}"
+    );
+}
+
 /// The problems of a report, as one string to search.
 fn problems_of(report: &serde_json::Value) -> String {
     report["problems"].to_string()
