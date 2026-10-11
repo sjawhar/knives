@@ -61,7 +61,9 @@ impl std::fmt::Display for StatementKind {
 /// Written into an entry file as one inline table:
 /// `statement = { kind = "pull", value = "1234" }`. Closed to other fields,
 /// unlike the entry around it: a misspelt `value` would otherwise read as a
-/// forget, and win when it is the newest.
+/// forget, and win when it is the newest. A table with a field this knives
+/// does not know states nothing, and the read names its file
+/// ([`crate::ledger::Ledger::read`]).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Statement {
@@ -75,14 +77,11 @@ pub struct Statement {
 impl Statement {
     /// Refuse a value its kind cannot hold, saying what it must be.
     ///
-    /// Checked as an entry file is read
-    /// ([`crate::ledger::Ledger::entries`]), beside its stamp, so a value
-    /// written by hand or by a peer that a reader would have to skip fails
-    /// the read instead: skipped, a newest malformed `pull` would hide the
-    /// valid one before it, and a `depends` list read without its unreadable
-    /// requirements would be written back without them by the next
-    /// `knives depends`. `fork-only` and `superseded` hold prose, so any text
-    /// is theirs; a forget holds nothing and is always well formed.
+    /// Checked as an entry file is read ([`crate::ledger::Ledger::read`]),
+    /// beside its stamp: a statement whose value its kind cannot hold states
+    /// nothing, and the read names its file, rather than a part of it being
+    /// read. `fork-only` and `superseded` hold prose, so any text is theirs;
+    /// a forget holds nothing and is always well formed.
     pub fn check(&self) -> Result<(), String> {
         let Some(value) = self.value.as_deref() else {
             return Ok(());

@@ -101,6 +101,13 @@ pub fn appended() -> bool {
 pub enum Kind {
     Event,
     Note,
+    /// A kind a newer knives writes and this one does not know. Ledgers are
+    /// shared between machines that upgrade at different times, so a file
+    /// of one parses, and [`Ledger::read`] leaves it out and names it as a
+    /// problem, rather than every read of its fork failing. Never written
+    /// ([`Ledger::append`] refuses it).
+    #[serde(other)]
+    Unknown,
 }
 
 impl std::fmt::Display for Kind {
@@ -108,6 +115,7 @@ impl std::fmt::Display for Kind {
         f.write_str(match self {
             Self::Event => "event",
             Self::Note => "note",
+            Self::Unknown => "unknown",
         })
     }
 }
@@ -197,6 +205,11 @@ pub struct RecordedParent {
 ///
 /// Kept separate from [`Entry`] deliberately: `Entry`'s serde is the `--json`
 /// report surface and must keep `text`; this is the file surface and must not.
+///
+/// The statement is read as any TOML value and checked on its own
+/// ([`read_statement`]), so one this knives cannot read costs that entry its
+/// statement rather than the whole file; it is written by
+/// [`Frontmatter::into_toml`] from the entry's own.
 #[derive(Debug, Serialize, Deserialize)]
 struct Frontmatter {
     ts: String,
@@ -208,8 +221,8 @@ struct Frontmatter {
     kind: Kind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     disposition: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    statement: Option<Statement>,
+    #[serde(default, skip_serializing)]
+    statement: Option<toml::Value>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     evidence: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -229,7 +242,7 @@ impl Frontmatter {
             subject: entry.subject.clone(),
             kind: entry.kind,
             disposition: entry.disposition.clone(),
-            statement: entry.statement.clone(),
+            statement: None,
             evidence: entry.evidence.clone(),
             anchor: entry.anchor.clone(),
             pr: entry.pr,
@@ -237,14 +250,14 @@ impl Frontmatter {
         }
     }
 
-    /// The frontmatter as TOML, with any statement as one inline table.
+    /// The frontmatter as TOML, with `statement` as one inline table.
     ///
     /// toml writes every nested struct as a `[section]`, never inline, so the
     /// statement is rendered on its own and put first: the first line of a
     /// document always belongs to its root table, whatever sections follow.
-    fn into_toml(mut self) -> Result<String, toml::ser::Error> {
+    fn into_toml(self, statement: Option<&Statement>) -> Result<String, toml::ser::Error> {
         let mut text = String::new();
-        if let Some(statement) = self.statement.take() {
+        if let Some(statement) = statement {
             text.push_str("statement = ");
             statement.serialize(toml::ser::ValueSerializer::new(&mut text))?;
             text.push('\n');
@@ -253,7 +266,7 @@ impl Frontmatter {
         Ok(text)
     }
 
-    fn into_entry(self, text: String) -> Entry {
+    fn into_entry(self, statement: Option<Statement>, text: String) -> Entry {
         Entry {
             ts: self.ts,
             owner: self.owner,
@@ -261,7 +274,7 @@ impl Frontmatter {
             subject: self.subject,
             kind: self.kind,
             disposition: self.disposition,
-            statement: self.statement,
+            statement,
             text,
             evidence: self.evidence,
             anchor: self.anchor,
@@ -287,6 +300,18 @@ pub enum LedgerError {
     Parse { path: PathBuf, detail: String },
     #[error("{path} has an unreadable timestamp `{ts}`")]
     Timestamp { path: PathBuf, ts: String },
+    #[error(
+        "{} is an entry of a kind this knives does not know, as a newer knives writes; every \
+         read here leaves it out until this machine's knives is upgraded",
+        path.display()
+    )]
+    UnknownKind { path: PathBuf },
+    #[error(
+        "{} makes a statement this knives cannot read ({detail}), so here it states nothing; \
+         a newer knives may have written it, or a hand may have written it wrong",
+        path.display()
+    )]
+    Statement { path: PathBuf, detail: String },
     #[error("{path} already exists: two writers drew the same nanosecond and suffix")]
     Collision { path: PathBuf },
     #[error(
@@ -469,22 +494,32 @@ impl Ledger {
             path: self.path.clone(),
             ts: entry.ts.clone(),
         })?;
-        // What every read would refuse is refused before it is written, and
-        // so is a kind only a reader has: written, it would state nothing.
-        if let Some(statement) = &entry.statement {
-            let refused = if statement.kind == crate::statement::StatementKind::Unknown {
-                Err("a statement of a kind this knives does not know states nothing".to_owned())
-            } else {
-                statement.check()
-            };
-            refused.map_err(|detail| LedgerError::Parse {
+        // What every read would leave out or refuse is refused before it is
+        // written: an entry or a statement of a kind only a reader has would
+        // state nothing, and a value its kind cannot hold would state nothing
+        // on every machine.
+        let refused = if entry.kind == Kind::Unknown {
+            Some("an entry of a kind this knives does not know is read by no one".to_owned())
+        } else {
+            entry.statement.as_ref().and_then(|statement| {
+                if statement.kind == crate::statement::StatementKind::Unknown {
+                    Some(
+                        "a statement of a kind this knives does not know states nothing".to_owned(),
+                    )
+                } else {
+                    statement.check().err()
+                }
+            })
+        };
+        if let Some(detail) = refused {
+            return Err(LedgerError::Parse {
                 path: self.path.clone(),
                 detail,
-            })?;
+            });
         }
         let contents = format!(
             "+++\n{}+++\n{}\n",
-            Frontmatter::of(entry).into_toml()?,
+            Frontmatter::of(entry).into_toml(entry.statement.as_ref())?,
             entry.text
         );
         std::fs::create_dir_all(&self.path).map_err(|source| LedgerError::Write {
@@ -508,39 +543,62 @@ impl Ledger {
         Ok(path)
     }
 
-    /// Every entry, oldest first: lexicographic filename order, which the
-    /// fixed-width stamp makes chronological order.
+    /// Every entry this knives can read, oldest first (lexicographic filename
+    /// order, which the fixed-width stamp makes chronological), and a
+    /// problem for each it reads only in part.
     ///
     /// A ledger directory that does not exist yet is empty rather than an
     /// error: a repository nobody has notched is the normal case. An entry
-    /// file that does not parse IS an error, because a ledger the tool cannot
-    /// read must not read as a ledger with nothing in it. Only `*.md` regular
-    /// files are entries: an editor's or a sync tool's droppings beside them
-    /// are ignored, not fatal, and so is a symlink, which a sweep never
-    /// commits, so no other machine would read it. Each read parses the
-    /// whole directory — O(all history) — which is acceptable at observed
-    /// scales; chronological filenames leave a tail-read optimization open if
-    /// `KNIVES_TIMING` shows it is needed.
-    pub fn entries(&self) -> Result<Vec<Entry>, LedgerError> {
-        Ok(self
-            .entry_files()?
-            .into_iter()
-            .map(|(_, entry)| entry)
-            .collect())
+    /// file that does not parse IS an error ([`parse_bytes`]), because a
+    /// ledger the tool cannot read must not read as a ledger with nothing in
+    /// it. What a newer knives may write is not: an entry of a kind this one
+    /// does not know ([`Kind::Unknown`]) is left out, and a statement it
+    /// cannot read states nothing, each a problem naming the file, so a
+    /// machine running an older knives still reads every other entry. Only
+    /// `*.md` regular files are entries: an editor's or a sync tool's
+    /// droppings beside them are ignored, not fatal, and so is a symlink,
+    /// which a sweep never commits, so no other machine would read it. Each
+    /// read parses the whole directory — O(all history) — which is
+    /// acceptable at observed scales; chronological filenames leave a
+    /// tail-read optimization open if `KNIVES_TIMING` shows it is needed.
+    pub fn read(&self) -> Result<Entries, LedgerError> {
+        let mut read = Entries::default();
+        for (path, parsed) in self.parsed()? {
+            let (entry, problem) = parsed?;
+            if entry.kind == Kind::Unknown {
+                read.problems
+                    .push(LedgerError::UnknownKind { path }.to_string());
+                continue;
+            }
+            read.problems
+                .extend(problem.map(|problem| problem.to_string()));
+            read.entries.push(entry);
+        }
+        Ok(read)
     }
 
-    /// [`Ledger::entries`], each beside the file it was read from.
-    pub fn entry_files(&self) -> Result<Vec<(PathBuf, Entry)>, LedgerError> {
-        self.entry_reads()?
-            .into_iter()
-            .map(|(path, read)| read.map(|entry| (path, entry)))
-            .collect()
+    /// [`Ledger::read`]'s entries alone, for a caller that has reported what
+    /// that read finds wrong already (a release write refuses on it before
+    /// it reads again), or a test that asserts the entries.
+    pub fn entries(&self) -> Result<Vec<Entry>, LedgerError> {
+        Ok(self.read()?.entries)
     }
 
     /// Each entry file in name order, beside what reading it gave: for a
     /// caller that has a use for the entries that do parse when one does
-    /// not. Only listing the directory fails the call.
+    /// not. Only listing the directory fails the call. An entry of a kind
+    /// this knives does not know is returned as one, and a statement it
+    /// cannot read as none; [`Ledger::read`] says so.
     pub fn entry_reads(&self) -> Result<Vec<EntryRead>, LedgerError> {
+        Ok(self
+            .parsed()?
+            .into_iter()
+            .map(|(path, parsed)| (path, parsed.map(|(entry, _)| entry)))
+            .collect())
+    }
+
+    /// Each entry file in name order, beside what [`parse_bytes`] made of it.
+    fn parsed(&self) -> Result<Vec<ParsedFile>, LedgerError> {
         self.migrated()?;
         let listing = match std::fs::read_dir(&self.path) {
             Ok(listing) => listing,
@@ -573,11 +631,27 @@ impl Ledger {
         Ok(files
             .into_iter()
             .map(|path| {
-                let read = parse_file(&path);
-                (path, read)
+                let parsed = std::fs::read(&path)
+                    .map_err(|source| LedgerError::Read {
+                        path: path.clone(),
+                        source,
+                    })
+                    .and_then(|bytes| parse_bytes(&path, &bytes));
+                (path, parsed)
             })
             .collect())
     }
+}
+
+/// What [`Ledger::read`] found.
+#[derive(Debug, Default)]
+pub struct Entries {
+    /// Every entry this knives can read, oldest first.
+    pub entries: Vec<Entry>,
+    /// One for each entry left out because its kind is one this knives does
+    /// not know, and each statement that states nothing because this knives
+    /// cannot read it, naming the file.
+    pub problems: Vec<String>,
 }
 
 /// One entry file, beside what reading it gave ([`Ledger::entry_reads`]).
@@ -943,11 +1017,23 @@ fn entry_file_name(ts: jiff::Timestamp) -> String {
     )
 }
 
-/// One entry file: TOML frontmatter between `+++` fences, then the text.
-fn parse_file(path: &Path) -> Result<Entry, LedgerError> {
-    let text = std::fs::read_to_string(path).map_err(|source| LedgerError::Read {
+/// An entry, and the problem with its statement when this knives cannot read
+/// it ([`read_statement`]).
+pub type Parsed = (Entry, Option<LedgerError>);
+
+/// One entry file, beside what [`parse_bytes`] made of it.
+type ParsedFile = (PathBuf, Result<Parsed, LedgerError>);
+
+/// One entry file's bytes: TOML frontmatter between `+++` fences, then the
+/// text.
+///
+/// `path` names the file in what goes wrong: a local read's own path, or
+/// where a pull would put a peer's ([`crate::ledger_git`]), which parses
+/// what it fetches with this before it writes it.
+pub fn parse_bytes(path: &Path, bytes: &[u8]) -> Result<Parsed, LedgerError> {
+    let text = std::str::from_utf8(bytes).map_err(|error| LedgerError::Parse {
         path: path.to_owned(),
-        source,
+        detail: format!("not UTF-8: {error}"),
     })?;
     let Some(rest) = text.strip_prefix("+++\n") else {
         return Err(LedgerError::Parse {
@@ -955,7 +1041,7 @@ fn parse_file(path: &Path) -> Result<Entry, LedgerError> {
             detail: "missing the opening +++ fence".to_owned(),
         });
     };
-    let (frontmatter, body) = split_fenced(rest).map_err(|detail| LedgerError::Parse {
+    let (mut frontmatter, body) = split_fenced(rest).map_err(|detail| LedgerError::Parse {
         path: path.to_owned(),
         detail,
     })?;
@@ -967,15 +1053,36 @@ fn parse_file(path: &Path) -> Result<Entry, LedgerError> {
             ts: frontmatter.ts,
         });
     }
-    // So is a statement whose value its kind cannot hold: a reader skipping
-    // it would read an older statement, or a shorter list, as the live one.
-    if let Some(statement) = &frontmatter.statement {
-        statement.check().map_err(|detail| LedgerError::Parse {
-            path: path.to_owned(),
-            detail,
-        })?;
+    let (statement, problem) = match frontmatter.statement.take().map(read_statement) {
+        None => (None, None),
+        Some(Ok(statement)) => (Some(statement), None),
+        Some(Err(detail)) => (
+            None,
+            Some(LedgerError::Statement {
+                path: path.to_owned(),
+                detail,
+            }),
+        ),
+    };
+    Ok((frontmatter.into_entry(statement, body), problem))
+}
+
+/// A `statement` table, when this knives can read every part of it: no field
+/// it does not know, a kind it knows, and a value that kind holds.
+///
+/// Anything less states nothing, rather than a part of it: a reader that took
+/// the parts it knows could read a newer knives' statement as a different one
+/// of its own, and one that skipped a value its kind cannot hold would read
+/// an older statement, or a shorter list, as the live one while saying so.
+fn read_statement(value: toml::Value) -> Result<Statement, String> {
+    let statement: Statement = value
+        .try_into()
+        .map_err(|error: toml::de::Error| error.message().trim_end().to_owned())?;
+    if statement.kind == crate::statement::StatementKind::Unknown {
+        return Err("its kind is one this knives does not know".to_owned());
     }
-    Ok(frontmatter.into_entry(body))
+    statement.check()?;
+    Ok(statement)
 }
 
 /// The frontmatter before the closing `+++` fence, and the body after it.
@@ -1258,13 +1365,12 @@ mod tests {
     }
 
     #[test]
-    fn a_statement_whose_value_its_kind_cannot_hold_is_reported_rather_than_read_as_none() {
-        // A peer's or a hand's entry with a value its kind cannot hold must
-        // fail the read: read as no statement, a newest malformed `pull`
-        // would hide the valid one before it, and a `depends` list read
-        // without its unreadable requirements would be written back without
-        // them by the next `knives depends`. `superseded` and `fork-only`
-        // hold prose, so any text is theirs.
+    fn a_statement_whose_value_its_kind_cannot_hold_states_nothing_and_is_named() {
+        // A peer's or a hand's entry with a value its kind cannot hold reads,
+        // stating nothing, and the read names it: failing the read would make
+        // the fork unreadable on every machine for good, since a committed
+        // entry is never rewritten. `superseded` and `fork-only` hold prose,
+        // so any text is theirs.
         for (kind, value) in [
             ("pull", "12a"),
             ("pull", ""),
@@ -1287,15 +1393,17 @@ mod tests {
             )
             .unwrap();
 
-            let error = Ledger::at(path).entries().unwrap_err();
+            let read = Ledger::at(path).read().unwrap();
+            assert_eq!(read.entries.len(), 1, "{kind} = {value:?}");
+            assert_eq!(read.entries[0].statement, None, "{kind} = {value:?}");
             assert!(
                 matches!(
-                    &error,
-                    LedgerError::Parse { path, detail }
-                        if path.ends_with("20260815T221403.000000000Z-0000.md")
-                            && detail.contains(kind)
+                    read.problems.as_slice(),
+                    [problem] if problem.contains("20260815T221403.000000000Z-0000.md")
+                        && problem.contains(kind)
                 ),
-                "{kind} = {value:?} was read, or failed otherwise: {error}"
+                "{kind} = {value:?}: {:?}",
+                read.problems
             );
         }
     }
@@ -1358,29 +1466,106 @@ mod tests {
             "kind = \"blocks\", value = \"anything at all\"",
         );
 
-        // Then: the ledger reads, and the unknown kind leaves the pull live.
-        let entries = Ledger::at(path).entries().unwrap();
-        assert_eq!(entries.len(), 2);
-        let live = crate::statement::Statements::from_entries(&entries);
+        // Then: the ledger reads, the unknown kind leaves the pull live, and
+        // the read names the file whose statement it could not read.
+        let read = Ledger::at(path).read().unwrap();
+        assert_eq!(read.entries.len(), 2);
+        let live = crate::statement::Statements::from_entries(&read.entries);
         assert_eq!(live.pull("feat/alpha"), Some(1234));
+        assert!(
+            matches!(
+                read.problems.as_slice(),
+                [problem] if problem.contains("20260815T221500.000000000Z-0000.md")
+            ),
+            "{:?}",
+            read.problems
+        );
     }
 
     #[test]
-    fn a_misspelt_statement_field_is_reported_rather_than_read_as_a_forget() {
+    fn a_misspelt_statement_field_states_nothing_and_is_named_rather_than_read_as_a_forget() {
+        // Given: a valid pull statement, then a newer one whose `value` is
+        // misspelt: read as a statement with no value, it would be a forget
+        // and win.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("a-repo");
         stating(
             &path,
             "20260815T221403.000000000Z-0000.md",
             "2026-08-15T22:14:03Z",
-            "kind = \"pull\", vaule = \"1234\"",
+            "kind = \"pull\", value = \"1234\"",
+        );
+        stating(
+            &path,
+            "20260815T221500.000000000Z-0000.md",
+            "2026-08-15T22:15:00Z",
+            "kind = \"pull\", vaule = \"99\"",
         );
 
-        let error = Ledger::at(path).entries().unwrap_err();
+        // Then: the misspelt statement states nothing, so the earlier pull
+        // stays live, and the read names the file and the field.
+        let read = Ledger::at(path).read().unwrap();
+        let live = crate::statement::Statements::from_entries(&read.entries);
+        assert_eq!(live.pull("feat/alpha"), Some(1234));
         assert!(
-            matches!(&error, LedgerError::Parse { detail, .. } if detail.contains("vaule")),
-            "was: {error}"
+            matches!(
+                read.problems.as_slice(),
+                [problem] if problem.contains("20260815T221500.000000000Z-0000.md")
+                    && problem.contains("vaule")
+            ),
+            "{:?}",
+            read.problems
         );
+    }
+
+    #[test]
+    fn an_entry_of_a_kind_a_newer_knives_writes_is_left_out_and_named() {
+        // Given: a note, and an entry of a kind this knives does not know.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a-repo");
+        let ledger = Ledger::at(path.clone());
+        ledger.append(&entry(Some("feat/alpha"), "a note")).unwrap();
+        std::fs::write(
+            path.join("20990101T000000.000000000Z-0000.md"),
+            "+++\nts = \"2099-01-01T00:00:00Z\"\nowner = \"x\"\nkind = \"decision\"\n+++\ndecided\n",
+        )
+        .unwrap();
+
+        // Then: the read gives the note alone, and names the other file.
+        let read = ledger.read().unwrap();
+        assert_eq!(read.entries.len(), 1);
+        assert_eq!(read.entries[0].text, "a note");
+        assert!(
+            matches!(
+                read.problems.as_slice(),
+                [problem] if problem.contains("20990101T000000.000000000Z-0000.md")
+            ),
+            "{:?}",
+            read.problems
+        );
+    }
+
+    #[test]
+    fn an_entry_or_statement_of_an_unknown_kind_cannot_be_written() {
+        // Either would state nothing on every machine that reads it.
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = Ledger::at(dir.path().join("a-repo"));
+        let unknown_entry = Entry {
+            kind: Kind::Unknown,
+            ..entry(Some("feat/alpha"), "a")
+        };
+        let unknown_statement = Entry {
+            statement: Some(Statement {
+                kind: crate::statement::StatementKind::Unknown,
+                value: Some("x".to_owned()),
+            }),
+            ..entry(Some("feat/alpha"), "a")
+        };
+        for bad in [unknown_entry, unknown_statement] {
+            let error = ledger.append(&bad).unwrap_err();
+            assert!(matches!(&error, LedgerError::Parse { .. }), "was: {error}");
+        }
+        assert!(!ledger.path().exists());
     }
 
     #[test]

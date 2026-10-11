@@ -39,9 +39,10 @@ pub enum Report {
         matched: usize,
         #[serde(skip_serializing_if = "Option::is_none")]
         events: Option<EventsFold>,
-        /// Each directory of entries no fork is kept under
-        /// ([`crate::ledger::unclaimed_problems`]): this fork's ledger may be
-        /// read without entries that belong to it.
+        /// Each entry or statement this knives reads only in part
+        /// ([`crate::ledger::Ledger::read`]), and each directory of entries
+        /// no fork is kept under ([`crate::ledger::unclaimed_problems`]):
+        /// this fork's ledger may be read without entries that belong to it.
         #[serde(skip_serializing_if = "Vec::is_empty")]
         problems: Vec<String>,
     },
@@ -210,7 +211,8 @@ fn read_filtered(
     repo: &RepoName,
     request: &Request<'_>,
 ) -> Result<Report, LedgerError> {
-    let entries = ledger.entries()?;
+    let read = ledger.read()?;
+    let (entries, problems) = (read.entries, read.problems);
     let bare = request.subject.is_none()
         && request.pr.is_none()
         && !request.events
@@ -236,7 +238,7 @@ fn read_filtered(
             entries: notes.into_iter().cloned().collect(),
             matched,
             events: events_fold(&events),
-            problems: Vec::new(),
+            problems,
         });
     }
 
@@ -265,7 +267,7 @@ fn read_filtered(
         entries: selected.into_iter().cloned().collect(),
         matched,
         events: None,
-        problems: Vec::new(),
+        problems,
     })
 }
 
@@ -362,10 +364,10 @@ pub fn run(request: &Request<'_>, output: crate::cli::Output) -> anyhow::Result<
         None => {
             let mut report = read_filtered(&ledger, repo, request)?;
             if let Report::Read { problems, .. } = &mut report {
-                *problems = crate::ledger::unclaimed_problems(
+                problems.extend(crate::ledger::unclaimed_problems(
                     &crate::ledger::default_ledger_root(),
                     request.registry,
-                );
+                ));
             }
             report
         }

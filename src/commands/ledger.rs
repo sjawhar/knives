@@ -44,21 +44,35 @@ pub struct Report {
     pub destinations: Vec<Tally>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub problems: Vec<String>,
+    /// What the sweep passed over without failing: each `knives.*` key a
+    /// git directory sets that this knives does not read.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
 }
 
 /// Run one sweep of the ledger beside the registry and report it.
 pub fn run_sweep(output: Output) -> anyhow::Result<Exit> {
     let root = crate::ledger::default_ledger_root();
-    let (outcome, destinations, problems) = match ledger_sweep::run(&root) {
-        Ok(Swept::NotShared) => (Outcome::NotShared, Vec::new(), Vec::new()),
-        Ok(Swept::Busy) => (Outcome::Busy, Vec::new(), Vec::new()),
-        Ok(Swept::Ran { tallies, problems }) => (Outcome::Swept, tallies, problems),
-        Err(error) => (Outcome::Failed, Vec::new(), vec![error.to_string()]),
+    let (outcome, destinations, problems, notes) = match ledger_sweep::run(&root) {
+        Ok(Swept::NotShared) => (Outcome::NotShared, Vec::new(), Vec::new(), Vec::new()),
+        Ok(Swept::Busy) => (Outcome::Busy, Vec::new(), Vec::new(), Vec::new()),
+        Ok(Swept::Ran {
+            tallies,
+            problems,
+            notes,
+        }) => (Outcome::Swept, tallies, problems, notes),
+        Err(error) => (
+            Outcome::Failed,
+            Vec::new(),
+            vec![error.to_string()],
+            Vec::new(),
+        ),
     };
     let report = Report {
         outcome,
         destinations,
         problems,
+        notes,
     };
     if let Some(payload) = crate::cli::machine_payload(output, &report)? {
         println!("{payload}");
@@ -122,6 +136,7 @@ pub fn render(report: &Report) -> String {
             .iter()
             .map(|problem| format!("!! {problem}")),
     );
+    lines.extend(report.notes.iter().map(|note| format!("note: {note}")));
     lines.join("\n")
 }
 

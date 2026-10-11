@@ -228,6 +228,9 @@ pub struct Store {
     /// The live statements of each repository the store was opened for, read
     /// from its ledger once when the store opens.
     statements: BTreeMap<UpstreamName, Statements>,
+    /// What reading each of those ledgers found it could read only in part
+    /// ([`Ledger::read`]).
+    ledger_problems: BTreeMap<UpstreamName, Vec<String>>,
     /// Present only for a store opened to be written. Held, not read: its whole
     /// job is to exist until this value is dropped.
     _lock: Option<FileLock>,
@@ -339,11 +342,12 @@ impl Store {
         } else {
             State::default()
         };
-        let statements = read_statements(&path.with_file_name("ledger"), repos)?;
+        let (statements, ledger_problems) = read_statements(&path.with_file_name("ledger"), repos)?;
         Ok(Self {
             path,
             state,
             statements,
+            ledger_problems,
             _lock: lock,
         })
     }
@@ -472,6 +476,15 @@ impl Store {
     /// superseded. A statement accepts any number in any state from any author.
     pub fn tracked_pull(&self, target: &BranchTarget) -> Option<u64> {
         self.stated_in(&target.repo).pull(target.branch.as_str())
+    }
+
+    /// What reading `repo`'s ledger found it could read only in part: an
+    /// entry of a kind this knives does not know, or a statement it cannot
+    /// read ([`Ledger::read`]). A report about `repo` carries each as a
+    /// problem, since what the statements answer may lack what that entry
+    /// states.
+    pub fn ledger_problems(&self, repo: &UpstreamName) -> &[String] {
+        self.ledger_problems.get(repo).map_or(&[], Vec::as_slice)
     }
 
     #[allow(
@@ -738,25 +751,32 @@ impl State {
     }
 }
 
-/// The live statements of each of `repos`, from its ledger beside the state file.
+/// The live statements of each of `repos`, from its ledger beside the state
+/// file, and what reading each ledger found it could read only in part.
 ///
 /// `ledger/<owner>/<name>/` beside `state.json` is where
 /// [`crate::ledger::default_ledger_path`] puts each fork's ledger, so a store
 /// opened at the default path reads the default ledgers and one opened
 /// anywhere else reads only what sits beside it. A repository nobody has
 /// stated anything about yet has no ledger, and so no statements.
-fn read_statements(
-    root: &Path,
-    repos: &[&UpstreamName],
-) -> Result<BTreeMap<UpstreamName, Statements>, StoreError> {
-    repos
-        .iter()
-        .map(|repo| {
-            let entries = Ledger::at(root.join(repo.as_str())).entries()?;
-            Ok(((*repo).clone(), Statements::from_entries(&entries)))
-        })
-        .collect()
+fn read_statements(root: &Path, repos: &[&UpstreamName]) -> Result<StatementsRead, StoreError> {
+    let mut statements = BTreeMap::new();
+    let mut problems = BTreeMap::new();
+    for repo in repos {
+        let read = Ledger::at(root.join(repo.as_str())).read()?;
+        statements.insert((*repo).clone(), Statements::from_entries(&read.entries));
+        if !read.problems.is_empty() {
+            problems.insert((*repo).clone(), read.problems);
+        }
+    }
+    Ok((statements, problems))
 }
+
+/// [`read_statements`]' answer: statements and problems, each by repository.
+type StatementsRead = (
+    BTreeMap<UpstreamName, Statements>,
+    BTreeMap<UpstreamName, Vec<String>>,
+);
 
 #[cfg(test)]
 mod tests {

@@ -59,7 +59,7 @@ treating it as a branch. `--evidence` repeats and requires `-m`.
 | `evidence` | Optional commit ids, `file:line`, `<repo>#<number>` or URLs, including other repositories. |
 | `anchor` | Automatic subject tip at write time; absent if it did not resolve. |
 | `pr` | Explicit write stamp, else tracked PR for the subject. |
-| `statement` | What `track`, `depends`, `finish --superseded-by` and `ledger migrate` stated about the branch: `{ kind, value }`, kind `pull`, `fork-only`, `superseded` or `depends` (the whole comma-joined requirement list). Per branch and kind, the entry with the greatest `ts` is live, whatever order entries arrived in; a statement with no value is a forget. An entry without the field states nothing, whatever its prose says. A kind this knives does not know, written by a newer one, reads and states nothing; a field other than `kind` and `value` fails the read. |
+| `statement` | What `track`, `depends`, `finish --superseded-by` and `ledger migrate` stated about the branch: `{ kind, value }`, kind `pull`, `fork-only`, `superseded` or `depends` (the whole comma-joined requirement list). Per branch and kind, the entry with the greatest `ts` is live, whatever order entries arrived in; a statement with no value is a forget. An entry without the field states nothing, whatever its prose says. A statement this knives cannot read in full (a kind it does not know, a field other than `kind` and `value`, or a value its kind cannot hold) states nothing, and every read names its file as a problem. |
 
 There are two kinds, not three. A disposition selects a class of note.
 `finish --superseded-by` and `start --why` record supersessions and parkings as
@@ -136,11 +136,25 @@ directory or entry. A repository with no ledger yet is different: exit `0` with
 A command that reads branch statements (`status`, `audit`, `pushed`, `sync`,
 `track`, `depends`, `finish`, `start`, a `notch` note about a branch without
 `--pr`) reads the ledger of each fork it works on when it starts, and no
-other. An unreadable entry in one of those stops the command with exit `3`
-naming the file, rather than reading that ledger's statements as absent. So
-does a statement whose value its kind cannot hold: a `pull` that is not a
-decimal number, or a `depends` part that is not `<owner>/<name>#<number>`.
-Skipped, it would let an older statement, or a shorter list, read as live.
+other. An entry file that does not parse stops the command with exit `3`
+naming the file, rather than reading that ledger's statements as absent.
+
+What a newer knives may write does not stop anything, because machines
+sharing a ledger, and sessions on one machine, run different versions. An
+entry of a `kind` this knives does not know is left out of every read, and a
+statement it cannot read in full states nothing: a kind it does not know, a
+field other than `kind` and `value`, or a value its kind cannot hold (a
+`pull` that is not a decimal number, a `depends` part that is not
+`<owner>/<name>#<number>`). Each is a problem naming the file in `status`,
+`notch`, `audit`, `pushed`, `sync` and every release command, which exit `3`
+and keep answering from the rest; a release write refuses on it. Read
+anyway, a part of it could let an older statement, or a shorter list, read as
+live. No write of this knives produces either.
+
+A peer's entry that does not parse is never written here: a pull leaves it
+out and names the machine whose ref carries it and its path, as a problem of
+that fork's report and of the sweep, and every pull checks it again, so a
+knives that can read it writes it then.
 
 ## Upgrading from an older knives
 
@@ -280,8 +294,11 @@ the git directory and what fixes it: two git directories with one `origin`,
 since which of them carries a fork would be a guess; one that carries forks
 but names no machine; a `knives.machine` that is not one git ref name
 component (no `/`, no leading `-` or `.`, no `..`), since it spells the ref
-`refs/knives/<machine>`; and any `knives.*` key other than `knives.machine`
-(`destinations`, `src/ledger_sweep.rs`).
+`refs/knives/<machine>`; and the retired `knives.fork`, with the command that
+removes it (`destinations`, `src/ledger_sweep.rs`). Any other `knives.*` key
+is one a newer knives may read: `status` notes it and `knives ledger sweep`
+lists it under `notes`, each with the command that removes it, and nothing is
+refused for it.
 
 Every command that appends an entry starts `knives ledger sweep` in the
 background as it exits, without waiting for it. A sweep takes `ledger.lock`

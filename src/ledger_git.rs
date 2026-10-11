@@ -66,6 +66,34 @@ pub struct Materialised {
     /// shallower directory holding one outside any): what other machines
     /// sent that nothing here reads.
     pub skipped: BTreeMap<String, usize>,
+    /// Entries the refs carry that the root lacks, in a fork this repository
+    /// carries, that do not parse as an entry, and so were not written.
+    pub unreadable: Vec<Unreadable>,
+}
+
+/// A peer's entry [`materialise`] did not write because it does not parse
+/// ([`crate::ledger::parse_bytes`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unreadable {
+    /// The machine whose ref carries it.
+    pub machine: String,
+    /// Where under the ledger root it would go.
+    pub path: PathBuf,
+    /// Why it does not parse.
+    pub detail: String,
+}
+
+impl std::fmt::Display for Unreadable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "machine {}'s ref carries {}, which this knives cannot read: {}. It is not written \
+             here, since every read of that fork would fail on it; every pull checks it again",
+            self.machine,
+            self.path.display(),
+            self.detail
+        )
+    }
 }
 
 /// One git repository over the ledger root, and the forks it carries.
@@ -554,7 +582,7 @@ pub fn local_config(git_dir: &Path, pattern: &str) -> Result<Vec<(String, String
 }
 
 /// Write every entry `refs` carry, in a fork `repository` carries, that the
-/// ledger root lacks.
+/// ledger root lacks and that parses.
 ///
 /// Each entry is written whole to a temporary name and renamed into place,
 /// never over a file already there; see [`write_entry`]. A tree item that is
@@ -568,8 +596,16 @@ pub fn local_config(git_dir: &Path, pattern: &str) -> Result<Vec<(String, String
 /// again by the repository that does carry the fork. That is what two
 /// machines whose registries send one fork to different repositories do,
 /// and the count is how this machine says so.
+///
+/// Each entry is parsed as a local read parses it
+/// ([`crate::ledger::parse_bytes`]) before it is written, and one that does
+/// not parse is left out and named in [`Materialised::unreadable`]: written,
+/// it would fail every read of its fork here, and a committed entry is never
+/// rewritten, so deleting it would only have the next pull write it back.
+/// Left out, it is checked again at every pull, so a knives that can read it
+/// writes it then.
 pub fn materialise(repository: &Repository, refs: &[MachineRef]) -> Result<Materialised, GitError> {
-    let mut missing = BTreeMap::new();
+    let mut missing: BTreeMap<PathBuf, (ObjectId, &str)> = BTreeMap::new();
     let mut unread = BTreeSet::new();
     for machine_ref in refs {
         for item in tree_items(repository, &machine_ref.commit)? {
@@ -589,7 +625,7 @@ pub fn materialise(repository: &Repository, refs: &[MachineRef]) -> Result<Mater
                 continue;
             }
             if repository.carries_entry(&item.path) {
-                missing.insert(item.path, item.oid);
+                missing.insert(item.path, (item.oid, machine_ref.machine.as_str()));
             } else {
                 unread.insert(item.path);
             }
@@ -609,7 +645,7 @@ pub fn materialise(repository: &Repository, refs: &[MachineRef]) -> Result<Mater
         return Ok(done);
     }
     let mut input = Vec::new();
-    for oid in missing.values() {
+    for (oid, _) in missing.values() {
         input.extend_from_slice(oid.as_str().as_bytes());
         input.push(b'\n');
     }
@@ -619,8 +655,17 @@ pub fn materialise(repository: &Repository, refs: &[MachineRef]) -> Result<Mater
     let blobs = batch_blobs(&answer)
         .filter(|blobs| blobs.len() == missing.len())
         .ok_or_else(|| output_error(&command, "each requested blob, in order"))?;
-    for (relative, content) in missing.keys().zip(blobs) {
-        if write_entry(&repository.work_tree.join(relative), content)? {
+    for ((relative, (_, machine)), content) in missing.iter().zip(blobs) {
+        let path = repository.work_tree.join(relative);
+        if let Err(error) = crate::ledger::parse_bytes(&path, content) {
+            done.unreadable.push(Unreadable {
+                machine: (*machine).to_owned(),
+                path: relative.clone(),
+                detail: error.to_string(),
+            });
+            continue;
+        }
+        if write_entry(&path, content)? {
             done.written += 1;
         }
     }

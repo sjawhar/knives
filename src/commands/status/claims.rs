@@ -13,13 +13,17 @@ use crate::store::{Claim, Store};
 /// One local file read per repository rather than one per branch. A ledger that
 /// exists and cannot be read is an unanswered question rather than an absence:
 /// a report that quietly showed no breadcrumbs would say this fork's history was
-/// never written.
+/// never written. So is an entry or a statement this knives reads only in part
+/// ([`Ledger::read`]): each is a problem naming its file.
 pub(super) fn notches_from_ledger(ledger: Option<&Ledger>, report: &mut Report) -> Vec<Notch> {
     let Some(ledger) = ledger else {
         return Vec::new();
     };
-    match ledger.entries() {
-        Ok(entries) => entries,
+    match ledger.read() {
+        Ok(read) => {
+            report.problems.extend(read.problems);
+            read.entries
+        }
         Err(error) => {
             report.problems.push(format!("ledger unavailable: {error}"));
             Vec::new()

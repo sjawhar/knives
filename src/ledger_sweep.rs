@@ -104,6 +104,10 @@ pub struct Destinations {
     /// fork is kept under ([`crate::ledger::unclaimed_problems`]): nothing
     /// reads or carries them, so every sweep and every pull says so.
     pub unclaimed: Vec<String>,
+    /// One line for each `knives.*` key a git directory sets that this
+    /// knives does not read ([`identity`]): a newer knives may, so it is
+    /// said, never refused.
+    pub ignored: Vec<String>,
 }
 
 impl Destinations {
@@ -172,14 +176,31 @@ fn candidates(root: &Path) -> Result<Vec<PathBuf>, SweepError> {
     Ok(found)
 }
 
-/// `knives.machine` and `remote.origin.url` of the git directory `git_dir`,
-/// refusing a `knives.*` key nothing reads, and a machine name that cannot
-/// spell this machine's ref (`refs/knives/<machine>`) as one component, with
-/// the command that names it again: found only when a sweep commits, it
-/// would fail there instead.
-fn identity(git_dir: &Path) -> Result<(Option<String>, Option<String>), SweepError> {
-    let mut machine = None;
-    let mut origin = None;
+/// What a git directory's own config says: `knives.machine`,
+/// `remote.origin.url`, and a line for each `knives.*` key this knives does
+/// not read.
+struct Identity {
+    machine: Option<String>,
+    origin: Option<String>,
+    ignored: Vec<String>,
+}
+
+/// [`Identity`] of the git directory `git_dir`.
+///
+/// Refused, with the command that fixes it: a machine name that cannot spell
+/// this machine's ref (`refs/knives/<machine>`) as one component, found
+/// otherwise only when a sweep commits and failing there instead; and the
+/// retired `knives.fork`, which named the forks a repository carried before
+/// `repos.toml` did, so a machine that still sets it expects a sharing this
+/// knives does not do. Any other `knives.*` key is one a newer knives may
+/// read: it is reported and passed over, since machines sharing a ledger,
+/// and sessions on one machine, run different versions.
+fn identity(git_dir: &Path) -> Result<Identity, SweepError> {
+    let mut found = Identity {
+        machine: None,
+        origin: None,
+        ignored: Vec::new(),
+    };
     let pattern = format!("^(knives\\..*|remote\\.{REMOTE}\\.url)$");
     let origin_key = format!("remote.{REMOTE}.url");
     let refused = |detail: String| SweepError::Config {
@@ -196,20 +217,26 @@ fn identity(git_dir: &Path) -> Result<(Option<String>, Option<String>), SweepErr
                         git_dir.display()
                     )));
                 }
-                machine = Some(value);
+                found.machine = Some(value);
             }
-            _ if key == origin_key => origin = Some(value),
-            _ => {
+            "knives.fork" => {
                 return Err(refused(format!(
-                    "sets {key}, which knives does not read: it reads knives.machine, and \
-                     which forks a repository carries is each repos.toml entry's `ledger`. \
-                     Remove it: git --git-dir={} config --unset-all {key}",
+                    "sets {key}, which knives no longer reads: which forks a repository \
+                     carries is each repos.toml entry's `ledger`. Remove it: git --git-dir={} \
+                     config --unset-all {key}",
                     git_dir.display()
                 )));
             }
+            _ if key == origin_key => found.origin = Some(value),
+            _ => found.ignored.push(format!(
+                "{} sets {key}, which this knives does not read; a newer knives may. If none \
+                 here sets it, remove it: git --git-dir={} config --unset-all {key}",
+                git_dir.display(),
+                git_dir.display()
+            )),
         }
     }
-    Ok((machine, origin))
+    Ok(found)
 }
 
 /// Every destination the ledger at `root` travels through.
@@ -228,18 +255,19 @@ fn identity(git_dir: &Path) -> Result<(Option<String>, Option<String>), SweepErr
 /// `origin` names is [`Destinations::unreached`]. No fork shared and no
 /// machine named is a ledger nobody set up to share: no destination, and
 /// nothing to report. A candidate naming a machine and carrying no fork is a
-/// destination that carries nothing. Refused, each with what fixes it: a
-/// `knives.*` key this does not read, forks carried with no machine name,
-/// two candidates whose `origin` is one repository, since which of them a
-/// fork's entries go through would be a guess, and a fork whose registry
-/// key's directory still holds the entries an older knives filed there
-/// ([`crate::ledger::LedgerError::FormerName`]), which no sweep would carry
-/// until `knives ledger migrate` moves them.
+/// destination that carries nothing. Refused, each with what fixes it: the
+/// retired `knives.fork` key ([`identity`]), forks carried with no machine
+/// name, two candidates whose `origin` is one repository, since which of
+/// them a fork's entries go through would be a guess, and a fork whose
+/// registry key's directory still holds the entries an older knives filed
+/// there ([`crate::ledger::LedgerError::FormerName`]), which no sweep would
+/// carry until `knives ledger migrate` moves them.
 pub fn destinations(root: &Path) -> Result<Destinations, SweepError> {
     let registry = crate::config::load(&root.with_file_name("repos.toml"))?;
     refuse_unmigrated(root, &registry, &[])?;
-    let (carriers, unreached) = reach(root, &registry)?;
-    let found = carriers
+    let reached = reach(root, &registry)?;
+    let found = reached
+        .carriers
         .into_iter()
         .map(|carrier| {
             Ok(Destination {
@@ -252,8 +280,9 @@ pub fn destinations(root: &Path) -> Result<Destinations, SweepError> {
         .collect::<Result<_, SweepError>>()?;
     Ok(Destinations {
         found,
-        unreached,
+        unreached: reached.unreached,
         unclaimed: crate::ledger::unclaimed_problems(root, &registry),
+        ignored: reached.ignored,
     })
 }
 
@@ -282,18 +311,26 @@ struct Carrier {
     carried: Vec<UpstreamName>,
 }
 
-/// Which candidate of [`destinations`] carries which forks, and which forks
-/// no candidate reaches ([`Destinations::unreached`]), with every refusal
-/// [`destinations`] makes but the unmigrated directory's.
+/// What [`reach`] found.
+struct Reached {
+    carriers: Vec<Carrier>,
+    /// [`Destinations::unreached`].
+    unreached: BTreeMap<UpstreamName, String>,
+    /// [`Destinations::ignored`].
+    ignored: Vec<String>,
+}
+
+/// Which candidate of [`destinations`] carries which forks, which forks no
+/// candidate reaches ([`Destinations::unreached`]), and the `knives.*` keys
+/// passed over, with every refusal [`destinations`] makes but the
+/// unmigrated directory's.
 ///
 /// Read from the registry and each candidate's own git config alone: no
 /// fetch, and nothing written, not even the ledger root a [`Repository`]
 /// creates.
-fn reach(
-    root: &Path,
-    registry: &Registry,
-) -> Result<(Vec<Carrier>, BTreeMap<UpstreamName, String>), SweepError> {
+fn reach(root: &Path, registry: &Registry) -> Result<Reached, SweepError> {
     let mut carriers = Vec::new();
+    let mut ignored = Vec::new();
     let mut carried_anywhere = BTreeSet::new();
     let mut origins: BTreeMap<String, PathBuf> = BTreeMap::new();
     for git_dir in candidates(root)? {
@@ -301,8 +338,12 @@ fn reach(
             git_dir: git_dir.clone(),
             detail,
         };
-        let (machine, origin) = identity(&git_dir)?;
-        let slug = origin.as_deref().and_then(crate::remote_url::remote_slug);
+        let found = identity(&git_dir)?;
+        ignored.extend(found.ignored);
+        let slug = found
+            .origin
+            .as_deref()
+            .and_then(crate::remote_url::remote_slug);
         if let Some(slug) = slug
             && let Some(first) = origins.insert(slug.to_ascii_lowercase(), git_dir.clone())
         {
@@ -318,7 +359,7 @@ fn reach(
             .filter(|(_, entry)| slug.is_some_and(|slug| entry.shares_ledger_with(slug)))
             .map(|(key, entry)| entry.upstream_name(key))
             .collect();
-        match machine {
+        match found.machine {
             Some(machine) => {
                 carried_anywhere.extend(carried.iter().cloned());
                 carriers.push(Carrier {
@@ -349,7 +390,11 @@ fn reach(
             (!carried_anywhere.contains(&fork)).then(|| (fork, ledger.clone()))
         })
         .collect();
-    Ok((carriers, unreached))
+    Ok(Reached {
+        carriers,
+        unreached,
+        ignored,
+    })
 }
 
 /// What [`pull_at`] would find wrong with `forks` before it fetched.
@@ -375,11 +420,11 @@ pub fn unpullable(
         .map_err(SweepError::from)
         .and_then(|registry| {
             refuse_unmigrated(root, &registry, moved)?;
-            let (carriers, unreached) = reach(root, &registry)?;
-            for carrier in &carriers {
+            let reached = reach(root, &registry)?;
+            for carrier in &reached.carriers {
                 ledger_git::absolute_git_dir(&carrier.git_dir)?;
             }
-            Ok(unreached)
+            Ok(reached.unreached)
         });
     setup_problems(root, forks, reached.as_ref())
 }
@@ -586,6 +631,11 @@ pub struct Tally {
     /// By fork, the discards not yet in the [`sweep_record`].
     #[serde(skip)]
     unkept: BTreeMap<String, usize>,
+    /// Each peer entry the sweep's last pull could not read
+    /// ([`ledger_git::Materialised::unreadable`]), as a problem: one of the
+    /// sweep's problems, never a failure of the pass.
+    #[serde(skip)]
+    unreadable: Vec<String>,
     #[serde(skip)]
     failed: bool,
 }
@@ -615,6 +665,7 @@ impl Tally {
             discarded: 0,
             skipped: None,
             unkept: BTreeMap::new(),
+            unreadable: Vec::new(),
             failed: false,
         }
     }
@@ -635,10 +686,12 @@ pub enum Swept {
     NotShared,
     /// Another sweep holds the lock, and carries what this one would have.
     Busy,
-    /// This sweep held the lock: each destination's tally, and every failure.
+    /// This sweep held the lock: each destination's tally, every failure,
+    /// and what it passed over without failing ([`Destinations::ignored`]).
     Ran {
         tallies: Vec<Tally>,
         problems: Vec<String>,
+        notes: Vec<String>,
     },
 }
 
@@ -667,15 +720,18 @@ pub fn run(root: &Path) -> Result<Swept, SweepError> {
 /// that found the lock taken and left, so either the holder takes the lock
 /// back for it, or the sweep that took the lock in between carries it.
 ///
-/// Each [`Destinations::unreached`] fork and each
-/// [`Destinations::unclaimed`] directory is one of the sweep's problems, so
-/// it is in the [`sweep_log`] until it is fixed. What the passes discarded
-/// and left unread goes to the [`sweep_record`] before the lock is let go.
+/// Each [`Destinations::unreached`] fork, each [`Destinations::unclaimed`]
+/// directory and each peer entry the last pull through a destination could
+/// not read ([`ledger_git::Materialised::unreadable`]) is one of the sweep's
+/// problems, so it is in the [`sweep_log`] until it is fixed. What the
+/// passes discarded and left unread goes to the [`sweep_record`] before the
+/// lock is let go.
 pub fn sweep(root: &Path, destinations: &Destinations) -> Result<Swept, SweepError> {
     let Destinations {
         found,
         unreached,
         unclaimed,
+        ignored,
     } = destinations;
     if found.is_empty() && unreached.is_empty() && unclaimed.is_empty() {
         return Ok(Swept::NotShared);
@@ -686,6 +742,12 @@ pub fn sweep(root: &Path, destinations: &Destinations) -> Result<Swept, SweepErr
         .chain(unclaimed.iter().cloned())
         .collect();
     let mut tallies: Vec<Tally> = found.iter().map(Tally::of).collect();
+    let unreadable = |tallies: &[Tally]| -> Vec<String> {
+        tallies
+            .iter()
+            .flat_map(|tally| tally.unreadable.iter().cloned())
+            .collect()
+    };
     let mut held = false;
     while let Some(lock) = FileLock::try_acquire(root)? {
         held = true;
@@ -704,14 +766,21 @@ pub fn sweep(root: &Path, destinations: &Destinations) -> Result<Swept, SweepErr
         if let Err(error) = keep(root, found, &mut tallies) {
             problems.push(error.to_string());
         }
-        record(root, &problems)?;
+        let mut recorded = problems.clone();
+        recorded.extend(unreadable(&tallies));
+        record(root, &recorded)?;
         drop(lock);
         if !anything_new(found, &mut tallies, &mut problems) {
             break;
         }
     }
     Ok(if held {
-        Swept::Ran { tallies, problems }
+        problems.extend(unreadable(&tallies));
+        Swept::Ran {
+            tallies,
+            problems,
+            notes: ignored.clone(),
+        }
     } else {
         Swept::Busy
     })
@@ -724,7 +793,10 @@ pub fn sweep(root: &Path, destinations: &Destinations) -> Result<Swept, SweepErr
 /// checkout that never committed as it is seen, and the commit refused,
 /// rather than a second history started and its push rejected. A failed
 /// pull does not stop the commit and push: this machine's entries leave
-/// whether or not a peer's ref can be read.
+/// whether or not a peer's ref can be read. Neither does a peer entry the
+/// pull could not read, which is kept in the tally rather than failing the
+/// pass: a destination that failed is not passed over again within the
+/// sweep, so an entry this machine wrote meanwhile would wait for the next.
 fn pass(destination: &Destination, tally: &mut Tally) -> Vec<String> {
     let failed = |error: SweepError| format!("{}: {error}", destination.describe());
     let _transport = match FileLock::acquire(destination.transport_lock(), LockWait::TRANSPORT) {
@@ -735,6 +807,11 @@ fn pass(destination: &Destination, tally: &mut Tally) -> Vec<String> {
     if let Some(done) = done {
         tally.pulled += done.written;
         tally.skipped = Some(done.skipped);
+        tally.unreadable = done
+            .unreadable
+            .iter()
+            .map(|unreadable| format!("{}: {unreadable}", destination.describe()))
+            .collect();
     }
     let mut failures: Vec<String> = pulled.into_iter().map(failed).collect();
     match send(destination, tally) {
@@ -911,6 +988,8 @@ pub struct Pulled {
     problems: BTreeMap<UpstreamName, Vec<String>>,
     /// [`Destinations::unclaimed`]: a problem for every fork asked about.
     unclaimed: Vec<String>,
+    /// [`Destinations::ignored`]: a note for every fork asked about.
+    ignored: Vec<String>,
     /// By destination, what each pull that succeeded left unread
     /// ([`ledger_git::Materialised::skipped`]).
     skipped: BTreeMap<String, BTreeMap<String, usize>>,
@@ -939,7 +1018,8 @@ impl Pulled {
     /// running a handed-off sweep sees, kept in the [`sweep_record`] and
     /// brought up to date by this pull: entries other machines sent through
     /// a repository this machine does not send the fork through, and
-    /// repeated transitions discarded.
+    /// repeated transitions discarded; then each `knives.*` key a git
+    /// directory sets that this knives passed over.
     pub fn backlog_for(&self, fork: &UpstreamName) -> Vec<String> {
         let mut notes = Vec::new();
         if let Some(destination) = self
@@ -986,6 +1066,7 @@ impl Pulled {
             }
             Err(error) => notes.push(error.to_string()),
         }
+        notes.extend(self.ignored.iter().cloned());
         notes
     }
 }
@@ -1002,11 +1083,13 @@ pub fn pull(forks: &[&UpstreamName]) -> Pulled {
 /// sweep reads what the sweep left rather than failing on it. A failure is a
 /// problem for every fork asked about that the destination carries, never an
 /// error: the command still answers from the entries this machine has. So
-/// is a fork asked about whose registry entry names a repository its ledger
-/// belongs to that no destination here is ([`Destinations::unreached`]), and
-/// every directory of entries no fork is kept under
-/// ([`Destinations::unclaimed`]), which is a problem for each fork asked
-/// about: any of them may be the one reading its ledger without them.
+/// is each peer entry the pull could not read
+/// ([`ledger_git::Materialised::unreadable`]), for the fork it is in; a fork
+/// asked about whose registry entry names a repository its ledger belongs
+/// to that no destination here is ([`Destinations::unreached`]); and every
+/// directory of entries no fork is kept under ([`Destinations::unclaimed`]),
+/// which is a problem for each fork asked about: any of them may be the one
+/// reading its ledger without them.
 pub fn pull_at(root: &Path, forks: &[&UpstreamName]) -> Pulled {
     let mut pulled = Pulled {
         root: root.to_owned(),
@@ -1022,12 +1105,16 @@ pub fn pull_at(root: &Path, forks: &[&UpstreamName]) -> Pulled {
         reached.as_ref().map(|reached| &reached.unreached),
     );
     let Ok(Destinations {
-        found, unclaimed, ..
+        found,
+        unclaimed,
+        ignored,
+        ..
     }) = reached
     else {
         return pulled;
     };
     pulled.unclaimed = unclaimed;
+    pulled.ignored = ignored;
     let asked: BTreeSet<&UpstreamName> = forks.iter().copied().collect();
     for destination in found {
         let carried: Vec<&UpstreamName> = destination
@@ -1041,6 +1128,18 @@ pub fn pull_at(root: &Path, forks: &[&UpstreamName]) -> Pulled {
         }
         let (done, failures) = pull_one(&destination);
         if let Some(done) = done {
+            for unreadable in &done.unreadable {
+                if let Some(fork) = carried
+                    .iter()
+                    .find(|fork| unreadable.path.starts_with(fork.as_str()))
+                {
+                    pulled
+                        .problems
+                        .entry((*fork).clone())
+                        .or_default()
+                        .push(format!("{}: {unreadable}", destination.describe()));
+                }
+            }
             pulled.skipped.insert(destination.describe(), done.skipped);
         }
         for error in failures {
@@ -1219,15 +1318,35 @@ mod tests {
     }
 
     #[test]
-    fn a_knives_key_nothing_reads_is_refused() {
+    fn a_knives_key_nothing_reads_is_reported_and_passed_over() {
+        // A newer knives may read it, and machines sharing a ledger upgrade
+        // at different times: refusing it would stop every pull and sweep.
         let (_home, root) = ledger_root();
         git(&root.join(".git"), &["config", "knives.machine", "alpha"]);
         git(&root.join(".git"), &["config", "knives.forks", "a-repo"]);
 
+        let found = destinations(&root).unwrap();
+
+        assert!(
+            matches!(
+                found.ignored.as_slice(),
+                [line] if line.contains("knives.forks")
+                    && line.contains("--unset-all knives.forks")
+            ),
+            "{:?}",
+            found.ignored
+        );
+    }
+
+    #[test]
+    fn the_retired_knives_fork_key_is_refused_with_the_command_that_removes_it() {
+        let (_home, root) = ledger_root();
+        git(&root.join(".git"), &["config", "knives.machine", "alpha"]);
+        git(&root.join(".git"), &["config", "knives.fork", "a-repo"]);
+
         let error = destinations(&root).unwrap_err().to_string();
 
-        assert!(error.contains("knives.forks"), "was: {error}");
-        assert!(error.contains("--unset-all knives.forks"), "was: {error}");
+        assert!(error.contains("--unset-all knives.fork"), "was: {error}");
     }
 
     #[test]

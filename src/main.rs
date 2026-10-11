@@ -510,6 +510,9 @@ fn run_pushed(fork: &Fork<'_>, branches: &[String], output: Output) -> anyhow::R
     let store = Store::open(default_state_path(), &[&fork.upstream])?;
     let mut report = pushed::gather(fork, &store, branches);
     report.problems.extend(pulled.problems_for(&fork.upstream));
+    report
+        .problems
+        .extend_from_slice(store.ledger_problems(&fork.upstream));
     if let Some(payload) = knives::cli::machine_payload(output, &report)? {
         println!("{payload}");
     } else {
@@ -553,9 +556,11 @@ fn run_audit(
                 report
             }
         };
+        let upstream = chosen.upstream();
+        report.problems.extend(pulled.problems_for(&upstream));
         report
             .problems
-            .extend(pulled.problems_for(&chosen.upstream()));
+            .extend_from_slice(store.ledger_problems(&upstream));
         worst = worst.worst(audit::exit_for(&report));
         reports.push(report);
     }
@@ -656,14 +661,15 @@ fn scribe_for(fork: &Fork<'_>, bound: Option<&UpstreamName>) -> anyhow::Result<S
 }
 
 /// `fork`'s ledger entries, read after pulling them from every destination
-/// that carries the fork, and the pull's problems: what a release command
-/// decides from.
+/// that carries the fork, with the pull's problems and each entry or
+/// statement the read could not fully read: what a release command decides
+/// from, so a write from it refuses on any of them.
 fn pulled_ledger(fork: &Fork<'_>) -> anyhow::Result<(Vec<knives::ledger::Entry>, Vec<String>)> {
     let pulled = knives::ledger_sweep::pull(&[&fork.upstream]);
-    Ok((
-        Ledger::for_fork(fork).entries()?,
-        pulled.problems_for(&fork.upstream),
-    ))
+    let read = Ledger::for_fork(fork).read()?;
+    let mut problems = pulled.problems_for(&fork.upstream);
+    problems.extend(read.problems);
+    Ok((read.entries, problems))
 }
 
 /// The release plan for `fork`, from a ledger pulled first: what a release
@@ -1042,9 +1048,11 @@ fn run_sync(
                 ..sync::Report::default()
             },
         };
+        let upstream = chosen.upstream();
+        report.problems.extend(pulled.problems_for(&upstream));
         report
             .problems
-            .extend(pulled.problems_for(&chosen.upstream()));
+            .extend_from_slice(store.ledger_problems(&upstream));
         worst = worst.worst(sync::exit_for(&report));
         reports.push(report);
     }
