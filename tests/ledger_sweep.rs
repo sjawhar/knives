@@ -101,14 +101,6 @@ fn stalled_remote() -> String {
     format!("http://127.0.0.1:{port}/acme/ledger")
 }
 
-/// A bare remote under a fresh directory.
-fn bare_remote() -> (tempfile::TempDir, PathBuf) {
-    let root = tempfile::tempdir().expect("remote directory");
-    let remote = root.path().join("ledger.git");
-    lab::git_bare_repository(&remote);
-    (root, remote)
-}
-
 fn append(root: &Path, fork: &str, count: usize) {
     let ledger = Ledger::at(root.join(fork));
     for index in 0..count {
@@ -163,13 +155,8 @@ fn entries_on(remote: &Path, machine: &str) -> usize {
         ],
     )
     .map_or(0, |listing| {
-        listing.lines().filter(|path| is_entry(path)).count()
+        listing.lines().filter(|path| lab::is_entry(path)).count()
     })
-}
-
-/// Whether `path` names a ledger entry file.
-fn is_entry(path: &str) -> bool {
-    Path::new(path).extension() == Some(std::ffi::OsStr::new("md"))
 }
 
 fn wait_until(what: &str, mut ready: impl FnMut() -> bool) {
@@ -208,7 +195,7 @@ fn a_burst_of_concurrent_sweeps_makes_one_commit_and_no_error() {
     // Given: twelve entries on a machine that shares its ledger.
     const SWEEPS: usize = 16;
     let home = a_repo_home();
-    let (_remote_dir, remote) = bare_remote();
+    let (_remote_dir, remote) = lab::bare_remote();
     let root = share(home.path(), "alpha", &remote);
     append(&root, "acme/a-repo", 12);
 
@@ -272,7 +259,7 @@ fn a_handed_off_sweep_that_finds_the_lock_held_leaves_at_once_as_busy() {
     // Given: a machine with an entry to send, and its ledger lock held, as
     // a running sweep holds it.
     let home = a_repo_home();
-    let (_remote_dir, remote) = bare_remote();
+    let (_remote_dir, remote) = lab::bare_remote();
     let root = share(home.path(), "alpha", &remote);
     append(&root, "acme/a-repo", 1);
     let held = hold_sweep_lock(home.path());
@@ -302,7 +289,7 @@ fn a_sweep_run_by_hand_while_another_holds_the_lock_waits_and_reports_its_own_fa
     // every push, and its ledger lock held by a process that names itself
     // there, as a running sweep does.
     let home = a_repo_home();
-    let (_remote_dir, remote) = bare_remote();
+    let (_remote_dir, remote) = lab::bare_remote();
     let hook = remote.join("hooks").join("pre-receive");
     std::fs::write(
         &hook,
@@ -353,7 +340,7 @@ fn a_sweep_run_by_hand_while_another_holds_the_lock_waits_and_reports_its_own_fa
 fn a_sweep_with_nothing_new_does_nothing_and_succeeds() {
     // Given: a machine whose one entry is already swept.
     let home = a_repo_home();
-    let (_remote_dir, remote) = bare_remote();
+    let (_remote_dir, remote) = lab::bare_remote();
     let root = share(home.path(), "alpha", &remote);
     append(&root, "acme/a-repo", 1);
     assert!(sweep(home.path()).status.success());
@@ -386,7 +373,7 @@ fn a_sweep_reaches_the_remote_through_the_git_config_its_session_hands_it() {
     // session routes git to the identity it acts as with an `include.path`
     // handed over in `GIT_CONFIG_COUNT` and its numbered pairs.
     let home = a_repo_home();
-    let (_remote_dir, remote) = bare_remote();
+    let (_remote_dir, remote) = lab::bare_remote();
     let root = home.path().join("ledger");
     lab::git_repository(&root, &[("origin", LEDGER_URL)]);
     lab::git_output(&root, ["config", "knives.machine", "alpha"]);
@@ -526,7 +513,7 @@ fn a_fork_whose_ledger_belongs_elsewhere_is_carried_nowhere_and_said_so() {
          origin = \"https://forge.invalid/ours/a-repo\"\nledger = \"acme/elsewhere\"\n",
     )
     .expect("write the registry");
-    let (_remote_dir, remote) = bare_remote();
+    let (_remote_dir, remote) = lab::bare_remote();
     let root = share(home.path(), "alpha", &remote);
     append(&root, "acme/a-repo", 1);
 
@@ -562,8 +549,8 @@ fn one_ledger_root_sweeps_each_fork_to_the_repository_it_names_and_no_other() {
         ),
     )
     .expect("write the registry");
-    let (_company_dir, company) = bare_remote();
-    let (_personal_dir, personal) = bare_remote();
+    let (_company_dir, company) = lab::bare_remote();
+    let (_personal_dir, personal) = lab::bare_remote();
     let root = share(home.path(), "alpha", &company);
     let personal_url = "https://forge.invalid/someone/.knives-ledger";
     let second = home.path().join("ledger-repositories").join("personal.git");
@@ -605,7 +592,7 @@ fn one_ledger_root_sweeps_each_fork_to_the_repository_it_names_and_no_other() {
             &["ls-tree", "-r", "--name-only", "refs/knives/alpha"],
         )
         .expect("the machine's ref on the remote");
-        let entries: Vec<&str> = listing.lines().filter(|path| is_entry(path)).collect();
+        let entries: Vec<&str> = listing.lines().filter(|path| lab::is_entry(path)).collect();
         assert_eq!(entries.len(), count, "{}: {entries:?}", remote.display());
         assert!(
             entries
@@ -624,7 +611,7 @@ fn a_write_hands_off_to_a_sweep_and_does_not_wait_for_it() {
     // first pass until the test lets go.
     let lab = lab::Lab::new();
     let home = shared_home(&lab);
-    let (_remote_dir, remote) = bare_remote();
+    let (_remote_dir, remote) = lab::bare_remote();
     let root = share(home.path(), "alpha", &remote);
     let transport = File::options()
         .read(true)
@@ -678,7 +665,7 @@ fn a_burst_of_concurrent_writes_reaches_the_remote_without_a_failure() {
     const WRITES: usize = 16;
     let lab = lab::Lab::new();
     let home = shared_home(&lab);
-    let (_remote_dir, remote) = bare_remote();
+    let (_remote_dir, remote) = lab::bare_remote();
     share(home.path(), "alpha", &remote);
 
     // When: sixteen notes are written at once, each handing off.
@@ -769,7 +756,7 @@ fn a_statement_made_on_one_machine_shows_in_status_on_another_after_a_sweep() {
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     let alpha = shared_home(&lab);
     let beta = second_machine(alpha.path());
-    let (_remote_dir, remote) = bare_remote();
+    let (_remote_dir, remote) = lab::bare_remote();
     share(alpha.path(), "alpha", &remote);
     share(beta.path(), "beta", &remote);
 
@@ -844,7 +831,7 @@ fn a_new_machine_with_no_ledger_root_yet_pulls_what_another_stated() {
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     let alpha = shared_home(&lab);
     let beta = second_machine(alpha.path());
-    let (_remote_dir, remote) = bare_remote();
+    let (_remote_dir, remote) = lab::bare_remote();
     share(alpha.path(), "alpha", &remote);
     join_as_the_installer_does(beta.path(), "beta", &remote);
     let tracked = knives_on(
@@ -981,7 +968,7 @@ fn a_dependency_stated_on_another_machine_survives_a_second_machines_depends() {
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     let alpha = shared_home(&lab);
     let beta = second_machine(alpha.path());
-    let (_remote_dir, remote) = bare_remote();
+    let (_remote_dir, remote) = lab::bare_remote();
     share(alpha.path(), "alpha", &remote);
     share(beta.path(), "beta", &remote);
     let stated = knives_on(
@@ -1028,7 +1015,7 @@ fn dependencies_two_machines_state_at_once_both_survive() {
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     let alpha = shared_home(&lab);
     let beta = second_machine(alpha.path());
-    let (_remote_dir, remote) = bare_remote();
+    let (_remote_dir, remote) = lab::bare_remote();
     share(alpha.path(), "alpha", &remote);
     share(beta.path(), "beta", &remote);
     let alpha_held = hold_sweep_lock(alpha.path());
@@ -1083,7 +1070,7 @@ fn a_track_from_a_machine_whose_clock_runs_behind_wins_over_the_statement_it_rep
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     let alpha = shared_home(&lab);
     let beta = second_machine(alpha.path());
-    let (_remote_dir, remote) = bare_remote();
+    let (_remote_dir, remote) = lab::bare_remote();
     let alpha_root = share(alpha.path(), "alpha", &remote);
     share(beta.path(), "beta", &remote);
     let ahead = jiff::Timestamp::now() + jiff::SignedDuration::from_mins(5);
@@ -1151,7 +1138,7 @@ fn a_forget_with_nothing_stated_leaves_a_peers_unsent_statement_standing() {
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     let alpha = shared_home(&lab);
     let beta = second_machine(alpha.path());
-    let (_remote_dir, remote) = bare_remote();
+    let (_remote_dir, remote) = lab::bare_remote();
     share(alpha.path(), "alpha", &remote);
     share(beta.path(), "beta", &remote);
     let held = hold_sweep_lock(alpha.path());
@@ -1283,7 +1270,7 @@ fn status_counts_entries_the_remote_lacks_and_names_a_failed_sweeps_log() {
     // Given: a shared ledger with one entry no sweep has carried.
     let lab = lab::Lab::new();
     let home = shared_home(&lab);
-    let (_remote_dir, remote) = bare_remote();
+    let (_remote_dir, remote) = lab::bare_remote();
     let root = share(home.path(), "alpha", &remote);
     append(&root, FORK, 1);
 
@@ -1348,7 +1335,7 @@ fn status_names_the_peer_entries_a_machine_does_not_carry_the_fork_for() {
         ),
     )
     .expect("write the registry");
-    let (_remote_dir, remote) = bare_remote();
+    let (_remote_dir, remote) = lab::bare_remote();
     share(alpha.path(), "alpha", &remote);
     share(beta.path(), "beta", &remote);
     let wrote = knives_on(
@@ -1409,7 +1396,7 @@ fn one_unreadable_entry_does_not_hold_back_the_rest_of_a_sweep() {
         ),
     )
     .expect("write the registry");
-    let (_remote_dir, remote) = bare_remote();
+    let (_remote_dir, remote) = lab::bare_remote();
     let root = share(home.path(), "alpha", &remote);
     append(&root, "acme/a-repo", 1);
     append(&root, "acme/b-repo", 1);
@@ -1482,7 +1469,7 @@ fn release_members_pulls_first_and_says_when_it_could_not() {
     let lab = lab::Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     let home = shared_home(&lab);
-    let (_remote_dir, remote) = bare_remote();
+    let (_remote_dir, remote) = lab::bare_remote();
     let root = share(home.path(), "alpha", &remote);
     let cut = lab::knives_release(&lab, &home, &["cut", "release/2026-08-04"]);
     assert!(
@@ -1526,7 +1513,7 @@ fn each_release_edit_is_refused_when_the_ledger_cannot_be_pulled() {
     let lab = lab::Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     let home = shared_home(&lab);
-    let (_remote_dir, remote) = bare_remote();
+    let (_remote_dir, remote) = lab::bare_remote();
     let root = share(home.path(), "alpha", &remote);
     let cut = lab::knives_release(&lab, &home, &["cut", "release/2026-08-04"]);
     assert!(
@@ -1584,7 +1571,7 @@ fn each_release_edit_is_refused_when_the_ledger_cannot_be_pulled() {
 fn a_sweep_refuses_a_ledger_still_kept_under_the_registry_key() {
     // Given: a shared fork whose entries still sit under its registry key.
     let home = a_repo_home();
-    let (_remote_dir, remote) = bare_remote();
+    let (_remote_dir, remote) = lab::bare_remote();
     let root = share(home.path(), "alpha", &remote);
     append(&root, "a-repo", 1);
 
@@ -1606,7 +1593,7 @@ fn a_ledger_root_whose_git_is_a_gitfile_sweeps_through_the_directory_it_names() 
     // elsewhere, as `git init --separate-git-dir` or a linked worktree
     // leaves it, with an entry to send.
     let home = a_repo_home();
-    let (_remote_dir, remote) = bare_remote();
+    let (_remote_dir, remote) = lab::bare_remote();
     let elsewhere = tempfile::tempdir().expect("a directory for the git directory");
     let git_dir = elsewhere.path().join("ledger.git");
     let root = home.path().join("ledger");
@@ -1649,7 +1636,7 @@ fn a_recreated_checkout_sweeping_as_an_existing_machine_is_refused_and_pushes_no
     // Given: alpha's entry on the remote, then a fresh checkout that names
     // itself alpha too, with an entry of its own.
     let home = a_repo_home();
-    let (_remote_dir, remote) = bare_remote();
+    let (_remote_dir, remote) = lab::bare_remote();
     let root = share(home.path(), "alpha", &remote);
     append(&root, "acme/a-repo", 1);
     assert!(sweep(home.path()).status.success());
@@ -1685,7 +1672,7 @@ fn a_non_fast_forward_push_names_a_machine_name_collision() {
     // machine name and each have an entry to commit.
     let first = a_repo_home();
     let second = a_repo_home();
-    let (_remote_dir, remote) = bare_remote();
+    let (_remote_dir, remote) = lab::bare_remote();
     let first_root = share(first.path(), "duplicate", &remote);
     let second_root = share(second.path(), "duplicate", &remote);
     append(&first_root, "acme/a-repo", 1);
@@ -1768,7 +1755,7 @@ fn a_peer_ref_that_moved_backward_keeps_out_only_that_machines_entries() {
     let alpha = shared_home(&lab);
     let beta = second_machine(alpha.path());
     let gamma = second_machine(alpha.path());
-    let (_remote_dir, remote) = bare_remote();
+    let (_remote_dir, remote) = lab::bare_remote();
     let alpha_root = share(alpha.path(), "alpha", &remote);
     share(beta.path(), "beta", &remote);
     let gamma_root = share(gamma.path(), "gamma", &remote);
@@ -1862,7 +1849,7 @@ fn a_peer_entry_of_a_kind_this_knives_does_not_know_leaves_notch_and_status_read
     let lab = lab::Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     let beta = shared_home(&lab);
-    let (_remote_dir, remote) = bare_remote();
+    let (_remote_dir, remote) = lab::bare_remote();
     share(beta.path(), "beta", &remote);
     let name = "20261011T120000.000000000Z-0000.md";
     push_as_peer(
@@ -1915,7 +1902,7 @@ fn a_peer_entry_that_does_not_parse_is_kept_out_and_named_on_every_pull() {
     let lab = lab::Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     let beta = shared_home(&lab);
-    let (_remote_dir, remote) = bare_remote();
+    let (_remote_dir, remote) = lab::bare_remote();
     share(beta.path(), "beta", &remote);
     let path = format!("{FORK}/20261011T120000.000000000Z-dead.md");
     push_as_peer(&remote, "alpha", &path, "not an entry\n");
@@ -1973,7 +1960,7 @@ fn two_peers_carrying_different_entries_at_one_path_write_neither_and_say_so() {
     let lab = lab::Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     let beta = shared_home(&lab);
-    let (_remote_dir, remote) = bare_remote();
+    let (_remote_dir, remote) = lab::bare_remote();
     share(beta.path(), "beta", &remote);
     let path = format!("{FORK}/20261011T120000.000000000Z-0000.md");
     push_as_peer(&remote, "alpha", &path, &peer_entry("alpha's account"));
@@ -2009,7 +1996,7 @@ fn a_peer_entry_that_differs_from_the_file_here_leaves_the_file_and_says_so() {
     let lab = lab::Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     let beta = shared_home(&lab);
-    let (_remote_dir, remote) = bare_remote();
+    let (_remote_dir, remote) = lab::bare_remote();
     share(beta.path(), "beta", &remote);
     let path = format!("{FORK}/20261011T120000.000000000Z-0000.md");
     let on_disk = beta.path().join("ledger").join(&path);
@@ -2040,7 +2027,7 @@ fn two_peers_carrying_the_same_entry_at_one_path_write_it_once_and_say_nothing()
     let lab = lab::Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     let beta = shared_home(&lab);
-    let (_remote_dir, remote) = bare_remote();
+    let (_remote_dir, remote) = lab::bare_remote();
     share(beta.path(), "beta", &remote);
     let path = format!("{FORK}/20261011T120000.000000000Z-0000.md");
     let entry = peer_entry("one account");
@@ -2176,7 +2163,7 @@ fn hold_sweep_lock(home: &Path) -> File {
 fn a_second_machine_syncing_the_same_merge_writes_no_second_event() {
     // Given: two machines sharing one ledger remote, both of which saw #7 open.
     let lab = lab::Lab::new();
-    let (_remote_dir, remote) = bare_remote();
+    let (_remote_dir, remote) = lab::bare_remote();
     let (alpha, beta) = two_machines_that_saw_seven_open(&lab, &remote, &remote);
 
     // When: the forge reports #7 merged, alpha syncs and its sweep carries
@@ -2225,7 +2212,7 @@ fn a_sweep_discards_its_own_uncommitted_repeat_of_a_transition_it_pulled() {
     // Given: two machines that saw #7 open, and beta's sweep held off, so
     // what beta writes stays uncommitted.
     let lab = lab::Lab::new();
-    let (_remote_dir, remote) = bare_remote();
+    let (_remote_dir, remote) = lab::bare_remote();
     let (alpha, beta) = two_machines_that_saw_seven_open(&lab, &remote, &remote);
     let held = hold_sweep_lock(beta.path());
 
@@ -2272,7 +2259,7 @@ fn status_names_the_repeated_transitions_a_handed_off_sweep_discarded() {
     // Given: two machines that saw #7 open, and beta's sweep held off while
     // it syncs the merge, so its event stays uncommitted.
     let lab = lab::Lab::new();
-    let (_remote_dir, remote) = bare_remote();
+    let (_remote_dir, remote) = lab::bare_remote();
     let (alpha, beta) = two_machines_that_saw_seven_open(&lab, &remote, &remote);
     let held = hold_sweep_lock(beta.path());
     let merged = forge_reporting("MERGED");
@@ -2332,7 +2319,7 @@ fn a_repeated_transition_two_machines_committed_is_never_removed() {
     // Given: two machines that saw #7 open, neither able to reach the remote
     // yet: each reaches it through a path that does not exist so far.
     let lab = lab::Lab::new();
-    let (remote_dir, remote) = bare_remote();
+    let (remote_dir, remote) = lab::bare_remote();
     let alpha_view = remote_dir.path().join("alpha-view.git");
     let beta_view = remote_dir.path().join("beta-view.git");
     let (alpha, beta) = two_machines_that_saw_seven_open(&lab, &alpha_view, &beta_view);

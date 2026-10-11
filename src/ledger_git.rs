@@ -62,9 +62,8 @@ pub struct Materialised {
     /// Entries written into the root.
     pub written: usize,
     /// Entries the refs carry that the root lacks, in a fork this repository
-    /// does not carry, by that fork's `<owner>/<name>` directory (or the
-    /// shallower directory holding one outside any): what other machines
-    /// sent that nothing here reads.
+    /// does not carry, by that fork's `<owner>/<name>` directory: what other
+    /// machines sent that nothing here reads.
     pub skipped: BTreeMap<String, usize>,
     /// Entries the refs carry that the root lacks, in a fork this repository
     /// carries, that do not parse as an entry, and so were not written.
@@ -736,13 +735,10 @@ pub fn materialise(repository: &Repository, refs: &[MachineRef]) -> Result<Mater
         if occupant(repository, &path)? != Occupant::Nothing {
             continue;
         }
-        let fork: PathBuf = path.parent().into_iter().flatten().take(2).collect();
-        let fork = if fork.as_os_str().is_empty() {
-            ".".to_owned()
-        } else {
-            fork.display().to_string()
-        };
-        *done.skipped.entry(fork).or_default() += 1;
+        // Rebuilt from its components, so a peer's tree that spells a `.`
+        // inside the path counts it under the fork directory it names.
+        let fork: PathBuf = path.parent().into_iter().flatten().collect();
+        *done.skipped.entry(fork.display().to_string()).or_default() += 1;
     }
     let mut missing: BTreeMap<PathBuf, (ObjectId, &str)> = BTreeMap::new();
     let mut here: Vec<(PathBuf, ObjectId, Vec<String>)> = Vec::new();

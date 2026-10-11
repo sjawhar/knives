@@ -822,6 +822,20 @@ pub fn git_bare_repository(root: &Path) {
     );
 }
 
+/// A bare remote at `ledger.git` under a fresh directory, which also holds
+/// whatever machines share it.
+pub fn bare_remote() -> (TempDir, PathBuf) {
+    let root = tempfile::tempdir().expect("remote directory");
+    let remote = root.path().join("ledger.git");
+    git_bare_repository(&remote);
+    (root, remote)
+}
+
+/// Whether `path` names a ledger entry file.
+pub fn is_entry(path: &str) -> bool {
+    Path::new(path).extension() == Some(std::ffi::OsStr::new("md"))
+}
+
 /// git's trimmed stdout in `directory`, with the lab's identity pinned as
 /// every lab git is; the command must succeed.
 pub fn git_output<const N: usize>(directory: &Path, args: [&str; N]) -> String {

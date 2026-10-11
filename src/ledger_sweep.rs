@@ -540,12 +540,7 @@ impl Kept {
             source,
         };
         if self.discarded.is_empty() && self.skipped.is_empty() {
-            return match std::fs::remove_file(&path) {
-                Err(source) if source.kind() != std::io::ErrorKind::NotFound => {
-                    Err(unwritable(source))
-                }
-                _ => Ok(()),
-            };
+            return remove_if_present(path);
         }
         let directory = path.parent().unwrap_or(root);
         let mut temporary = tempfile::NamedTempFile::new_in(directory).map_err(unwritable)?;
@@ -791,7 +786,7 @@ pub fn sweep(
             .flat_map(|tally| tally.unwritten.iter().cloned())
             .collect()
     };
-    let (mut next, waited) = match contended {
+    let (next, waited) = match contended {
         Contended::Leave => (FileLock::try_acquire(root)?, None),
         Contended::Wait => {
             let started = std::time::Instant::now();
@@ -803,9 +798,10 @@ pub fn sweep(
             (Some(lock), waited)
         }
     };
-    let mut held = false;
-    while let Some(lock) = next {
-        held = true;
+    let Some(mut lock) = next else {
+        return Ok(Swept::Busy);
+    };
+    loop {
         loop {
             for (destination, tally) in found.iter().zip(&mut tallies) {
                 if tally.active() {
@@ -828,18 +824,17 @@ pub fn sweep(
         if !anything_new(found, &mut tallies, &mut problems) {
             break;
         }
-        next = FileLock::try_acquire(root)?;
-    }
-    Ok(if held {
-        problems.extend(unwritten(&tallies));
-        Swept::Ran {
-            tallies,
-            problems,
-            notes: ignored.clone(),
-            waited,
+        match FileLock::try_acquire(root)? {
+            Some(again) => lock = again,
+            None => break,
         }
-    } else {
-        Swept::Busy
+    }
+    problems.extend(unwritten(&tallies));
+    Ok(Swept::Ran {
+        tallies,
+        problems,
+        notes: ignored.clone(),
+        waited,
     })
 }
 
@@ -1022,11 +1017,7 @@ fn anything_new(
 fn record(root: &Path, problems: &[String]) -> Result<(), SweepError> {
     let log = sweep_log(root);
     if problems.is_empty() {
-        return match std::fs::remove_file(&log) {
-            Ok(()) => Ok(()),
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(source) => Err(SweepError::Write { path: log, source }),
-        };
+        return remove_if_present(log);
     }
     let mut text = format!("{} the last ledger sweep failed:\n", jiff::Timestamp::now());
     for problem in problems {
@@ -1034,6 +1025,16 @@ fn record(root: &Path, problems: &[String]) -> Result<(), SweepError> {
         text.push('\n');
     }
     std::fs::write(&log, text).map_err(|source| SweepError::Write { path: log, source })
+}
+
+/// Remove `path`; one already gone is fine.
+fn remove_if_present(path: PathBuf) -> Result<(), SweepError> {
+    match std::fs::remove_file(&path) {
+        Err(source) if source.kind() != std::io::ErrorKind::NotFound => {
+            Err(SweepError::Write { path, source })
+        }
+        _ => Ok(()),
+    }
 }
 
 /// What pulling the ledger before a decision found, per fork asked about.

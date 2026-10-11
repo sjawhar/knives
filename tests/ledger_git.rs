@@ -39,14 +39,6 @@ kind = \"note\"
 peer entry
 ";
 
-/// A bare remote and a temporary directory to hold the machines that share it.
-fn remote() -> (tempfile::TempDir, PathBuf) {
-    let root = tempfile::tempdir().expect("lab directory");
-    let remote = root.path().join("ledger.git");
-    lab::git_bare_repository(&remote);
-    (root, remote)
-}
-
 /// One machine's ledger root: a git repository whose `origin` is `remote`,
 /// holding one directory per managed repo as the config home does.
 fn machine(root: &Path, name: &str, remote: &Path) -> PathBuf {
@@ -201,7 +193,7 @@ fn paths_ever_under(git_dir: &Path, reference: &str) -> BTreeSet<String> {
 #[test]
 fn entries_committed_on_one_machine_materialise_on_another_and_parse() {
     // Given: two entries written on alpha, committed to its ref and pushed.
-    let (root, remote) = remote();
+    let (root, remote) = lab::bare_remote();
     let alpha = machine(root.path(), "alpha", &remote);
     let beta = machine(root.path(), "beta", &remote);
     append(&alpha, "ses_alpha", 2, 0);
@@ -235,7 +227,7 @@ fn entries_committed_on_one_machine_materialise_on_another_and_parse() {
 #[test]
 fn two_machines_exchange_entries_and_neither_ref_is_rewritten() {
     // Given: alpha and beta each commit their own entries to their own ref.
-    let (root, remote) = remote();
+    let (root, remote) = lab::bare_remote();
     let alpha = machine(root.path(), "alpha", &remote);
     let beta = machine(root.path(), "beta", &remote);
     append(&alpha, "ses_alpha", 2, 0);
@@ -311,7 +303,7 @@ fn a_reader_never_sees_a_partial_entry_while_materialise_writes() {
     // rest are large enough that writing one is not instant.
     const ENTRIES: usize = 100;
     const READERS: usize = 4;
-    let (root, remote) = remote();
+    let (root, remote) = lab::bare_remote();
     let alpha = machine(root.path(), "alpha", &remote);
     let beta = machine(root.path(), "beta", &remote);
     append(&alpha, "ses_alpha", 1, 16 << 20);
@@ -386,7 +378,7 @@ fn a_reader_never_sees_a_partial_entry_while_materialise_writes() {
 #[test]
 fn committing_with_nothing_new_returns_none_and_moves_no_ref() {
     // Given: a machine whose ledger is empty.
-    let (root, remote) = remote();
+    let (root, remote) = lab::bare_remote();
     let alpha = machine(root.path(), "alpha", &remote);
 
     // When / Then: there is nothing to commit, and no ref appears.
@@ -413,7 +405,7 @@ fn committing_with_nothing_new_returns_none_and_moves_no_ref() {
 #[test]
 fn a_push_of_any_ref_but_the_machines_own_is_refused() {
     // Given: alpha pushed its ref, and beta fetched it without ever committing.
-    let (root, remote) = remote();
+    let (root, remote) = lab::bare_remote();
     let alpha = machine(root.path(), "alpha", &remote);
     let beta = machine(root.path(), "beta", &remote);
     append(&alpha, "ses_alpha", 1, 0);
@@ -483,7 +475,7 @@ fn commit_with(repository: &Path, name: &str, mode: &str) -> knives::ids::Commit
 fn a_peer_tree_that_is_not_ledger_entries_is_refused_and_nothing_is_written() {
     // Given: refs whose trees name a path outside the ledger, a `.git`, a
     // file that is not an entry, and an executable.
-    let (root, remote) = remote();
+    let (root, remote) = lab::bare_remote();
     let beta = machine(root.path(), "beta", &remote);
     for (name, mode) in [
         ("..", "100644"),
@@ -555,7 +547,7 @@ fn commit_nested(repository: &Path, path: &[&str], bytes: &[u8]) -> knives::ids:
 fn a_peer_tree_with_a_git_directory_inside_a_carried_fork_is_refused() {
     // Given: a ref whose tree puts an entry-shaped file under a `.git`
     // inside the fork this repository carries.
-    let (root, remote) = remote();
+    let (root, remote) = lab::bare_remote();
     let beta = machine(root.path(), "beta", &remote);
     for nested in [
         &["acme", "a-repo", ".git", "x.md"][..],
@@ -583,7 +575,7 @@ fn a_peer_tree_nested_below_a_carried_fork_is_refused_and_nothing_is_written() {
     // Given: a peer ref carrying a valid entry below a fork directory. A
     // reader cannot see this shape, so accepting it would create transport
     // data no command can use.
-    let (root, remote) = remote();
+    let (root, remote) = lab::bare_remote();
     let beta = machine(root.path(), "beta", &remote);
     let nested = ["acme", "a-repo", "subdir", "entry.md"];
     let hostile = MachineRef {
@@ -604,7 +596,7 @@ fn a_peer_tree_nested_below_a_carried_fork_is_refused_and_nothing_is_written() {
 fn a_machine_ref_carries_only_entries_directly_in_the_fork_directory() {
     // Given: a normal entry and a nested Markdown file beside it. Only the
     // direct file is a ledger entry, so only it belongs in the machine ref.
-    let (root, remote) = remote();
+    let (root, remote) = lab::bare_remote();
     let beta = machine(root.path(), "beta", &remote);
     append(&beta, "ses_beta", 1, 0);
     let direct = file_names(&beta)
@@ -634,7 +626,7 @@ fn a_machine_ref_carries_only_entries_directly_in_the_fork_directory() {
 fn a_repository_commits_and_materialises_only_the_forks_it_carries() {
     // Given: alpha's ledger root holds entries for two forks, and the
     // repository over it carries only one of them.
-    let (root, company) = remote();
+    let (root, company) = lab::bare_remote();
     let alpha = machine(root.path(), "alpha", &company);
     append_to(&alpha, REPO, "ses_alpha", 2);
     append_to(&alpha, OTHER, "ses_alpha", 2);
@@ -665,12 +657,12 @@ fn a_repository_commits_and_materialises_only_the_forks_it_carries() {
             "{} carries a fork it was not given: {paths:?}",
             git_dir.display()
         );
-        let carried_entries = paths.iter().filter(|path| is_entry(path)).count();
+        let carried_entries = paths.iter().filter(|path| lab::is_entry(path)).count();
         assert_eq!(carried_entries, 3, "{paths:?}");
     }
 
     // Given: a peer that carries both forks pushed entries for both.
-    let (peer_root, shared) = remote();
+    let (peer_root, shared) = lab::bare_remote();
     let peer = machine(peer_root.path(), "peer", &shared);
     let beta = machine(peer_root.path(), "beta", &shared);
     append_to(&peer, REPO, "ses_peer", 1);
@@ -702,7 +694,7 @@ fn two_repositories_over_one_ledger_root_each_carry_their_own_forks_to_their_own
     // Given: one ledger root, its own `.git` carrying acme/a-repo to one
     // remote, and a git directory elsewhere over the same root carrying
     // acme/other-repo to another.
-    let (root, company) = remote();
+    let (root, company) = lab::bare_remote();
     let personal = root.path().join("personal-remote.git");
     lab::git_bare_repository(&personal);
     let alpha = machine(root.path(), "alpha", &company);
@@ -740,7 +732,7 @@ fn two_repositories_over_one_ledger_root_each_carry_their_own_forks_to_their_own
     for (remote, fork, count) in [(&company, REPO, 2), (&personal, OTHER, 3)] {
         let entries: Vec<_> = paths_ever_under(remote, "refs/knives/alpha")
             .into_iter()
-            .filter(|path| is_entry(path))
+            .filter(|path| lab::is_entry(path))
             .collect();
         assert_eq!(entries.len(), count, "{}: {entries:?}", remote.display());
         assert!(
@@ -755,7 +747,7 @@ fn two_repositories_over_one_ledger_root_each_carry_their_own_forks_to_their_own
     assert_eq!(
         paths_ever_under(&alpha.join(".git"), "refs/knives/alpha")
             .iter()
-            .filter(|path| is_entry(path))
+            .filter(|path| lab::is_entry(path))
             .count(),
         2
     );
@@ -763,7 +755,7 @@ fn two_repositories_over_one_ledger_root_each_carry_their_own_forks_to_their_own
 
 #[test]
 fn a_fork_name_that_is_not_an_owner_and_a_name_is_refused() {
-    let (root, remote) = remote();
+    let (root, remote) = lab::bare_remote();
     let alpha = machine(root.path(), "alpha", &remote);
     for name in [
         "",
@@ -790,7 +782,7 @@ fn a_fork_name_that_is_not_an_owner_and_a_name_is_refused() {
 
 #[test]
 fn a_repository_carrying_no_fork_commits_nothing() {
-    let (root, remote) = remote();
+    let (root, remote) = lab::bare_remote();
     let alpha = machine(root.path(), "alpha", &remote);
     append(&alpha, "ses_alpha", 2, 0);
     let nothing = carrying(&alpha, &[]);
@@ -798,9 +790,4 @@ fn a_repository_carrying_no_fork_commits_nothing() {
     assert_eq!(commit_new_entries(&nothing, "alpha").expect("commit"), None);
     assert!(!ledger_git::has_new_entries(&nothing, "alpha").expect("look"));
     assert_eq!(knives_refs(&alpha), "");
-}
-
-/// Whether `path` names a ledger entry file.
-fn is_entry(path: &str) -> bool {
-    Path::new(path).extension() == Some(std::ffi::OsStr::new("md"))
 }
