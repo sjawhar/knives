@@ -348,8 +348,9 @@ fn reach(root: &Path, registry: &Registry) -> Result<Reached, SweepError> {
             .origin
             .as_deref()
             .and_then(crate::remote_url::remote_slug);
-        if let Some(slug) = slug
-            && let Some(first) = origins.insert(slug.to_ascii_lowercase(), git_dir.clone())
+        let kept = slug.map(crate::config::repository_slug);
+        if let (Some(slug), Some(kept)) = (slug, &kept)
+            && let Some(first) = origins.insert(kept.clone(), git_dir.clone())
         {
             return Err(refused(format!(
                 "has {slug} as its origin, as {} does, so which of them carries its forks would \
@@ -360,7 +361,10 @@ fn reach(root: &Path, registry: &Registry) -> Result<Reached, SweepError> {
         let carried: Vec<UpstreamName> = registry
             .repos
             .iter()
-            .filter(|(_, entry)| slug.is_some_and(|slug| entry.shares_ledger_with(slug)))
+            .filter(|(_, entry)| {
+                kept.as_deref()
+                    .is_some_and(|kept| entry.shares_ledger_with(kept))
+            })
             .map(|(key, entry)| entry.upstream_name(key))
             .collect();
         match found.machine {

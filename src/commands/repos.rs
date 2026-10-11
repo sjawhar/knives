@@ -284,6 +284,12 @@ pub struct RepoRow {
     /// that is a filesystem path. A `state.json` claim's `repo` is this, so
     /// a reader holding one finds its fork's row here.
     pub upstream_name: String,
+    /// The repository this fork's ledger belongs to
+    /// ([`crate::config::RepoEntry::ledger`]), in the one spelling the
+    /// registry keeps it as: lowercase `<owner>/<name>`, without `.git`.
+    /// Absent for a fork whose ledger is not shared.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ledger: Option<String>,
     /// Where the checkout was found under `$HOME`; `None` when it was not, or
     /// when more than one was, or when its `upstream` disagrees with the
     /// registry.
@@ -366,6 +372,7 @@ pub fn gather(input: &GatherInput<'_>) -> Report {
                 return RepoRow {
                     name: name.clone(),
                     upstream_name: entry.upstream_name(name).to_string(),
+                    ledger: entry.ledger.clone(),
                     path: None,
                     ambiguous: scan.duplicates.get(&repo_name).map_or(0, Vec::len),
                     disagrees: scan.disagreements.contains_key(&repo_name),
@@ -391,6 +398,7 @@ pub fn gather(input: &GatherInput<'_>) -> Report {
             RepoRow {
                 name: name.clone(),
                 upstream_name: fork.upstream.to_string(),
+                ledger: entry.ledger.clone(),
                 path: Some(fork.checkout.path.display().to_string()),
                 ambiguous: 0,
                 disagrees: false,

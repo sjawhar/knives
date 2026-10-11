@@ -51,7 +51,7 @@ fn host_and_path(remote: &str) -> Option<(&str, &str)> {
 }
 
 /// `path` without a trailing `.git` in any case.
-const fn without_git_suffix(path: &str) -> &str {
+pub(crate) const fn without_git_suffix(path: &str) -> &str {
     match path.split_at_checked(path.len().saturating_sub(4)) {
         Some((stem, suffix)) if suffix.eq_ignore_ascii_case(".git") => stem,
         _ => path,

@@ -87,9 +87,10 @@ is refused. Optional fields:
 - `ledger`: the `<owner>/<name>` of the repository this fork's ledger belongs
   to, through which its entries travel between machines. The name may start
   with a dot (`someone/.knives-ledger`); the owner may not. Letter case and a
-  `.git` suffix do not matter. Absent, the fork's ledger is not shared: it
-  stays on each machine that writes it. A machine carries the fork's entries
-  through the git directory over its ledger root whose `origin` is that
+  `.git` suffix do not matter: knives keeps the value lowercase and without the
+  suffix, the spelling `knives repos` reports. Absent, the fork's ledger is not
+  shared: it stays on each machine that writes it. A machine carries the fork's
+  entries through the git directory over its ledger root whose `origin` is that
   repository, `~/.config/knives/ledger/.git` or one in
   `~/.config/knives/ledger-repositories/`, and which names the machine as
   `knives.machine` in its git config; the

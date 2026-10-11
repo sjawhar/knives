@@ -32,8 +32,8 @@ a locked commit is behind when it is an ancestor of the branch tip.
 TOON and JSON share this document shape (`?` marks an optional field):
 
 ```text
-{repos: [{name, upstream_name, path, release_remote?, newest_release?, behind?,
-          notes?, problems?}], notes?, problems?, config_path}
+{repos: [{name, upstream_name, ledger?, path, release_remote?, newest_release?,
+          behind?, notes?, problems?}], notes?, problems?, config_path}
 ```
 
 `name` is the registry key, what you type. `upstream_name` is what the fork's
@@ -41,7 +41,12 @@ ledger, claims and state are kept under: its upstream's lowercase
 `<owner>/<name>`, or the registry key when the upstream is a filesystem path.
 A claim's `repo` in `state.json` is an `upstream_name`, so to find the checkout
 for a claim, match the claim's `repo` against `upstream_name`, never `name`.
-Every row carries it, placed or not.
+Every row carries it, placed or not. `ledger` is the repository the fork's
+ledger is shared through (`ledger` in `repos.toml`), lowercase and without a
+`.git` suffix however the registry spells it, so two rows naming one
+repository carry one value; it is absent for a fork whose ledger is not shared.
+`repos` reads only the registry and the checkouts, never the ledger or the
+state file, so it answers before `knives ledger migrate` has run.
 
 ## `knives consumers [FORK] [--consumer PATH]...`
 

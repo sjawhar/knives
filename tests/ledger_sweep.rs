@@ -532,6 +532,40 @@ fn a_fork_whose_ledger_belongs_elsewhere_is_carried_nowhere_and_said_so() {
 }
 
 #[test]
+fn a_ledger_spelled_with_capitals_or_an_uppercase_git_suffix_reaches_its_repository() {
+    for spelling in ["Acme/Ledger", "acme/ledger.GIT", "ACME/LEDGER.Git"] {
+        // Given: a registry naming the ledger repository with that
+        // spelling, a root whose origin is that repository, and an entry.
+        let home = tempfile::tempdir().expect("config home");
+        std::fs::write(
+            home.path().join("repos.toml"),
+            format!(
+                "[repos.a-repo]\nupstream = \"https://forge.invalid/acme/a-repo\"\n\
+                 origin = \"https://forge.invalid/ours/a-repo\"\nledger = \"{spelling}\"\n"
+            ),
+        )
+        .expect("write the registry");
+        let (_remote_dir, remote) = lab::bare_remote();
+        let root = share(home.path(), "alpha", &remote);
+        append(&root, "acme/a-repo", 1);
+
+        // When: a sweep runs.
+        let swept = sweep(home.path());
+
+        // Then: the fork is carried there, and its entry reached it.
+        let stdout = String::from_utf8_lossy(&swept.stdout);
+        assert!(swept.status.success(), "{spelling}: {stdout}");
+        let report: serde_json::Value = serde_json::from_str(&stdout).expect("JSON");
+        assert_eq!(
+            report["destinations"][0]["forks"],
+            serde_json::json!(["acme/a-repo"]),
+            "{spelling}: {report}"
+        );
+        assert_eq!(entries_on(&remote, "alpha"), 1, "{spelling}");
+    }
+}
+
+#[test]
 fn one_ledger_root_sweeps_each_fork_to_the_repository_it_names_and_no_other() {
     // Given: one ledger root, two forks, one sharing its ledger with the
     // company repository through the root's own `.git`, and one with a
