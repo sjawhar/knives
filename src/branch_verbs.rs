@@ -17,7 +17,7 @@ use knives::commands::claim::{
 use knives::commands::start::{collides_with_checkout, possesses, workspace_path};
 use knives::ids::{BranchName, BranchTarget, Requirement};
 use knives::jj::{Repo, WorkspaceIdentity, remove_prunable_worktree};
-use knives::ledger::Draft;
+use knives::ledger::{Draft, Stated};
 use knives::statement::{Statement, StatementKind};
 use knives::store::{Store, default_state_path};
 
@@ -112,13 +112,13 @@ pub(crate) fn run_finish(
         // `--superseded-by` always leaves provenance to carry it: the replacement
         // rides on the one entry that already names it.
         scribe_for(fork, bound)?.record(&Draft {
-            statement: options.superseded_by.map(|replacement| Statement {
-                kind: StatementKind::Superseded,
-                value: Some(replacement.to_owned()),
+            statement: options.superseded_by.map(|replacement| Stated {
+                statement: Statement {
+                    kind: StatementKind::Superseded,
+                    value: Some(replacement.to_owned()),
+                },
+                replaces: store.statement_stamp(target, StatementKind::Superseded),
             }),
-            replaces: options
-                .superseded_by
-                .and_then(|_| store.statement_stamp(target, StatementKind::Superseded)),
             ..Draft::event(Some(branch.as_str()), text, pr)
         })?;
     }
@@ -398,12 +398,12 @@ pub(crate) fn run_track(
             }),
         )
     };
-    let replaces = statement
-        .as_ref()
-        .and_then(|statement| store.statement_stamp(target, statement.kind));
+    let statement = statement.map(|statement| Stated {
+        replaces: store.statement_stamp(target, statement.kind),
+        statement,
+    });
     scribe_for(fork, bound)?.record(&Draft {
         statement,
-        replaces,
         ..Draft::event(Some(branch.as_str()), text.clone(), stamped)
     })?;
     drop(store);
@@ -475,11 +475,13 @@ pub(crate) fn run_depends(
     let pr = store.tracked_pull(target);
     let listed: Vec<String> = requirements.iter().map(ToString::to_string).collect();
     scribe_for(fork, bound)?.record(&Draft {
-        statement: Some(Statement {
-            kind: StatementKind::Depends,
-            value: Some(required.join(",")),
+        statement: Some(Stated {
+            statement: Statement {
+                kind: StatementKind::Depends,
+                value: Some(required.join(",")),
+            },
+            replaces: store.statement_stamp(target, StatementKind::Depends),
         }),
-        replaces: store.statement_stamp(target, StatementKind::Depends),
         ..Draft::event(
             Some(branch.as_str()),
             format!("requires {}", listed.join(", ")),

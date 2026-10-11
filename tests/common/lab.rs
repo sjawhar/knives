@@ -1007,9 +1007,12 @@ pub fn state_on_ledger(
         "a-test".to_owned(),
     )
     .record(&knives::ledger::Draft {
-        statement: Some(knives::statement::Statement {
-            kind,
-            value: value.map(str::to_owned),
+        statement: Some(knives::ledger::Stated {
+            statement: knives::statement::Statement {
+                kind,
+                value: value.map(str::to_owned),
+            },
+            replaces: None,
         }),
         ..knives::ledger::Draft::event(Some(branch), "stated".to_owned(), None)
     })

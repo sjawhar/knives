@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use crate::cli::{Exit, Output};
 use crate::config::{ConfigError, FormerNames, Registry};
 use crate::ids::{Requirement, UpstreamName};
-use crate::ledger::{Draft, Ledger, Scribe, inline_human_text, unmigrated};
+use crate::ledger::{Draft, Ledger, Scribe, Stated, inline_human_text, unmigrated};
 use crate::ledger_sweep::{self, Contended, Swept, Tally, Waited};
 use crate::lock::FileLock;
 use crate::statement::{Statement, StatementKind, Statements};
@@ -756,7 +756,10 @@ fn plan_statements<'s>(
 fn write_statements(scribe: &Scribe, writes: Vec<Write<'_>>, migrated: &mut Migrated) {
     for (branch, statement, pr) in writes {
         let draft = Draft {
-            statement: Some(statement.clone()),
+            statement: Some(Stated {
+                statement: statement.clone(),
+                replaces: None,
+            }),
             ..Draft::event(Some(branch), history(statement), pr)
         };
         match scribe.record_to(&draft) {

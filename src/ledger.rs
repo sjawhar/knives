@@ -866,7 +866,7 @@ pub struct Draft<'a> {
     /// A terminal ruling token when this note is a disposition.
     pub disposition: Option<String>,
     /// What the entry states about its subject, beside its prose.
-    pub statement: Option<Statement>,
+    pub statement: Option<Stated>,
     pub text: String,
     pub evidence: Vec<String>,
     /// The pull request stated for the subject, read from the store by the
@@ -876,10 +876,17 @@ pub struct Draft<'a> {
     /// The parent set a release cut or edit leaves behind; empty for every
     /// other entry.
     pub parents: Vec<RecordedParent>,
-    /// The stamp of the live statement [`Draft::statement`] replaces, read
-    /// under the state lock ([`crate::statement::Statements::stamp`]). The
-    /// entry is stamped after it whatever this machine's clock says, so a
-    /// writer whose clock runs behind the one that made it still replaces it.
+}
+
+/// A statement a [`Draft`] makes, with the stamp of the one it replaces.
+#[derive(Debug, Clone)]
+pub struct Stated {
+    pub statement: Statement,
+    /// The stamp of the live statement of the same kind about the subject,
+    /// read under the state lock ([`crate::statement::Statements::stamp`]).
+    /// The entry is stamped after it whatever this machine's clock says, so
+    /// a writer whose clock runs behind the one that made it still replaces
+    /// it.
     pub replaces: Option<jiff::Timestamp>,
 }
 
@@ -896,7 +903,6 @@ impl<'a> Draft<'a> {
             evidence: Vec::new(),
             pr,
             parents: Vec::new(),
-            replaces: None,
         }
     }
 }
@@ -957,7 +963,8 @@ impl Scribe {
     /// [`Scribe::record`], with the path of the file the entry was written to.
     pub fn record_to(&self, draft: &Draft<'_>) -> Result<(Entry, PathBuf), LedgerError> {
         let entry = Entry {
-            ts: monotonic_after(draft.replaces).to_string(),
+            ts: monotonic_after(draft.statement.as_ref().and_then(|stated| stated.replaces))
+                .to_string(),
             owner: self.owner.clone(),
             email: self
                 .email
@@ -966,7 +973,10 @@ impl Scribe {
             subject: draft.subject.map(str::to_owned),
             kind: draft.kind,
             disposition: draft.disposition.clone(),
-            statement: draft.statement.clone(),
+            statement: draft
+                .statement
+                .as_ref()
+                .map(|stated| stated.statement.clone()),
             text: draft.text.clone(),
             evidence: draft.evidence.clone(),
             anchor: self.anchor(draft.subject),
@@ -1190,7 +1200,7 @@ fn split_fenced(rest: &str) -> Result<(Frontmatter, String), String> {
 /// not be a coin toss. A clock that did not advance is nudged one nanosecond
 /// past the last stamp instead. Across processes the wall clock is the order,
 /// as it always was, except that a statement is stamped after the one it
-/// replaces ([`Draft::replaces`]); the suffix and `create_new` cover
+/// replaces ([`Stated::replaces`]); the suffix and `create_new` cover
 /// genuinely concurrent writers.
 fn monotonic_after(after: Option<jiff::Timestamp>) -> jiff::Timestamp {
     static LAST: std::sync::Mutex<Option<jiff::Timestamp>> = std::sync::Mutex::new(None);
@@ -2163,7 +2173,6 @@ mod tests {
                 evidence: vec!["06d778b9".to_owned(), "a-repo#1157".to_owned()],
                 pr: None,
                 parents: Vec::new(),
-                replaces: None,
             })
             .unwrap();
 

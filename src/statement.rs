@@ -251,7 +251,7 @@ impl Statements {
 
     /// The stamp of the live statement of `kind` about `branch`: a statement
     /// that replaces it is stamped after it, whatever the writer's clock
-    /// says ([`crate::ledger::Draft::replaces`]).
+    /// says ([`crate::ledger::Stated::replaces`]).
     pub fn stamp(&self, branch: &str, kind: StatementKind) -> Option<jiff::Timestamp> {
         self.live.get(branch)?.get(&kind)?.ts
     }

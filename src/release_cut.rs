@@ -579,7 +579,6 @@ fn record_cut_event(
         evidence,
         pr: None,
         parents: recorded_parents(&opened, entry, &parents)?,
-        replaces: None,
     })?;
     Ok(())
 }

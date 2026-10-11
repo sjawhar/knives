@@ -442,7 +442,7 @@ impl Store {
     }
 
     /// The stamp of the live statement of `kind` about `target`, which a
-    /// statement replacing it is stamped after ([`crate::ledger::Draft::replaces`]).
+    /// statement replacing it is stamped after ([`crate::ledger::Stated::replaces`]).
     /// Read from a store opened for update, it is the newest this machine
     /// has while it holds the lock its writers take.
     pub fn statement_stamp(

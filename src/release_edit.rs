@@ -409,7 +409,6 @@ pub(crate) fn record_edit_event(
             .collect(),
         pr: None,
         parents: recorded_parents(opened, fork.entry, &parents)?,
-        replaces: None,
     })?;
     Ok(())
 }
