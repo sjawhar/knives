@@ -28,6 +28,17 @@ const OTHER: &str = "acme/other-repo";
 /// The directory [`REPO`] and [`OTHER`] share.
 const OWNER: &str = "acme";
 
+/// One valid entry blob, built into hostile peer trees without granting the
+/// peer any local ledger-writing path.
+const VALID_ENTRY: &str = "\
++++
+ts = \"2026-10-08T12:00:00Z\"
+owner = \"ses_mallory\"
+kind = \"note\"
++++
+peer entry
+";
+
 /// A bare remote and a temporary directory to hold the machines that share it.
 fn remote() -> (tempfile::TempDir, PathBuf) {
     let root = tempfile::tempdir().expect("lab directory");
@@ -504,9 +515,9 @@ fn a_peer_tree_that_is_not_ledger_entries_is_refused_and_nothing_is_written() {
     }
 }
 
-/// A commit whose tree holds one empty `100644` blob at the nested `path`,
-/// built one `mktree` per directory, as a hostile peer could build it.
-fn commit_nested(repository: &Path, path: &[&str]) -> knives::ids::CommitId {
+/// A commit whose tree holds one `100644` blob at the nested `path`, built one
+/// `mktree` per directory, as a hostile or broken peer could build it.
+fn commit_nested(repository: &Path, path: &[&str], bytes: &[u8]) -> knives::ids::CommitId {
     let (file, directories) = path.split_last().expect("a path");
     let mktree = |record: String| {
         let output = std::process::Command::new("sh")
@@ -520,7 +531,16 @@ fn commit_nested(repository: &Path, path: &[&str]) -> knives::ids::CommitId {
             .trim()
             .to_owned()
     };
-    let blob = lab::git_output(repository, ["hash-object", "-w", "/dev/null"]);
+    let entry_blob = tempfile::NamedTempFile::new_in(repository).expect("create entry blob");
+    std::fs::write(entry_blob.path(), bytes).expect("write entry blob");
+    let blob = lab::git_output(
+        repository,
+        [
+            "hash-object",
+            "-w",
+            entry_blob.path().to_str().expect("utf-8 entry blob path"),
+        ],
+    );
     let mut tree = mktree(format!("100644 blob {blob}\\t{file}"));
     for directory in directories.iter().rev() {
         tree = mktree(format!("040000 tree {tree}\\t{directory}"));
@@ -543,7 +563,7 @@ fn a_peer_tree_with_a_git_directory_inside_a_carried_fork_is_refused() {
     ] {
         let hostile = MachineRef {
             machine: "mallory".to_owned(),
-            commit: commit_nested(&beta, nested),
+            commit: commit_nested(&beta, nested, b""),
         };
 
         // When / Then: materialise refuses it and writes nothing at all.
@@ -556,6 +576,58 @@ fn a_peer_tree_with_a_git_directory_inside_a_carried_fork_is_refused() {
         );
         assert!(!beta.join(REPO).exists(), "{nested:?} wrote into the fork");
     }
+}
+
+#[test]
+fn a_peer_tree_nested_below_a_carried_fork_is_refused_and_nothing_is_written() {
+    // Given: a peer ref carrying a valid entry below a fork directory. A
+    // reader cannot see this shape, so accepting it would create transport
+    // data no command can use.
+    let (root, remote) = remote();
+    let beta = machine(root.path(), "beta", &remote);
+    let nested = ["acme", "a-repo", "subdir", "entry.md"];
+    let hostile = MachineRef {
+        machine: "mallory".to_owned(),
+        commit: commit_nested(&beta, &nested, VALID_ENTRY.as_bytes()),
+    };
+
+    // When / Then: materialise refuses the peer's whole tree before it writes
+    // the invisible entry.
+    assert!(matches!(
+        ledger_git::materialise(&repository(&beta), &[hostile]),
+        Err(GitError::NotAnEntry { .. })
+    ));
+    assert!(!beta.join(REPO).exists(), "{nested:?} wrote into the fork");
+}
+
+#[test]
+fn a_machine_ref_carries_only_entries_directly_in_the_fork_directory() {
+    // Given: a normal entry and a nested Markdown file beside it. Only the
+    // direct file is a ledger entry, so only it belongs in the machine ref.
+    let (root, remote) = remote();
+    let beta = machine(root.path(), "beta", &remote);
+    append(&beta, "ses_beta", 1, 0);
+    let direct = file_names(&beta)
+        .into_iter()
+        .next()
+        .expect("one direct entry");
+    let nested = beta.join(REPO).join("subdir").join("entry.md");
+    std::fs::create_dir_all(nested.parent().expect("nested parent")).expect("create nested path");
+    std::fs::copy(beta.join(REPO).join(&direct), &nested).expect("copy valid entry");
+
+    // When: this machine commits its pending entries.
+    let repository = repository(&beta);
+    commit_new_entries(&repository, "beta")
+        .expect("commit pending entries")
+        .expect("a direct entry is pending");
+
+    // Then: only the direct entry appears in the committed tree.
+    let paths = paths_ever_under(repository.git_dir(), "refs/knives/beta");
+    assert!(paths.contains(&format!("{REPO}/{direct}")), "{paths:?}");
+    assert!(
+        !paths.contains(&format!("{REPO}/subdir/entry.md")),
+        "a nested non-entry was committed: {paths:?}"
+    );
 }
 
 #[test]

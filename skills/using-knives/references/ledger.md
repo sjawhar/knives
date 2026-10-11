@@ -151,9 +151,11 @@ and keep answering from the rest; a release write refuses on it. Read
 anyway, a part of it could let an older statement, or a shorter list, read as
 live. No write of this knives produces either.
 
-A peer's entry that does not parse is never written here: a pull leaves it
-out and names the machine whose ref carries it and its path, as a problem of
-that fork's report and of the sweep, and every pull checks it again, so a
+A peer tree may name only regular `<owner>/<repository>/<file>.md` entries.
+Any other path, including an entry nested below its fork directory, refuses the
+whole pull before it writes anything. A shape-valid peer entry that does not
+parse is left out and names the machine whose ref carries it and its path, as a
+problem of that fork's report and of the sweep; every pull checks it again, so a
 knives that can read it writes it then.
 
 ## Upgrading from an older knives
@@ -316,14 +318,16 @@ it reports and its exit code are its own: a failure of the sweep it waited
 for reaches only `ledger-sweep.log`. The holder passes over
 each git directory under that directory's own `knives-transport.lock`: it
 fetches every machine's ref into `refs/knives-remotes/origin/<machine>` and
-writes in the entries this machine lacks, discards this machine's repeated
-transitions (below), commits what is new to `refs/knives/<machine>` (git
-plumbing only, never the index), and pushes that ref, which no other machine
-writes. A failed fetch does not stop the commit and push, and neither does an
-entry that does not parse: it is a problem naming the file, left out of the
-repeated-transition check, and, when it is this machine's own and not yet
-committed, left out of the commit too, since every machine that took it would
-fail to read that fork; the rest of the fork's entries go. A machine's ref only
+materialises only regular `<owner>/<repository>/<file>.md` entries the root
+lacks. A peer tree naming anything else is refused whole before writing. The
+sweep discards this machine's repeated transitions (below), commits what is new
+to `refs/knives/<machine>` (git plumbing only, never the index), and pushes that
+ref, which no other machine writes. A failed fetch does not stop the commit and
+push, and neither does an entry that does not parse: it is a problem naming the
+file, left out of the repeated-transition check, and, when it is this machine's
+own and not yet committed, left out of the commit too, since every machine that
+took it would fail to read that fork; the rest of the fork's entries go. A
+machine's ref only
 moves forward, so a fetch refuses a peer's ref that moved backward on the
 remote (rewritten, or deleted and pushed again); it still takes every other
 machine's, and their entries are written in, while the refused ref is a problem

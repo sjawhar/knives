@@ -288,9 +288,10 @@ pub enum GitError {
 /// That is every entry in the forks `repository` carries that no knives ref
 /// carries yet, less any the caller [`Pending::forget`]s in between.
 ///
-/// An entry is a `*.md` regular file anywhere under a carried fork's
-/// directory outside `.git`, the files [`crate::ledger::Ledger::entries`]
-/// reads; no other fork's directory is read, however the root is shared.
+/// An entry is a regular `*.md` file directly inside a carried fork's
+/// `<owner>/<repository>/` directory, the files
+/// [`crate::ledger::Ledger::entries`] reads. No other fork's directory is
+/// read, however the root is shared.
 /// "Carried" counts every ref under `refs/knives/` and `refs/knives-remotes/`,
 /// so an entry materialised from a peer is not committed again as this
 /// machine's own. `Ok(None)` when nothing is new, and the ref is then
@@ -847,18 +848,13 @@ fn fork_directory(fork: UpstreamName) -> Result<UpstreamName, GitError> {
     }
 }
 
-/// Every `*.md` regular file under the directories of the forks `repository`
-/// carries, relative to the root, with every `.git` skipped. A fork with no
-/// directory yet has no entries.
+/// Every `*.md` regular file directly inside each fork `repository` carries,
+/// relative to the root. A fork with no directory yet has no entries.
 fn local_entries(repository: &Repository) -> Result<BTreeSet<PathBuf>, GitError> {
     let mut found = BTreeSet::new();
-    let mut pending: Vec<PathBuf> = repository
-        .forks
-        .iter()
-        .map(|fork| PathBuf::from(fork.as_str()))
-        .collect();
-    while let Some(relative) = pending.pop() {
-        let directory = repository.work_tree.join(&relative);
+    for fork in repository.forks() {
+        let relative = Path::new(fork.as_str());
+        let directory = repository.work_tree.join(relative);
         let unreadable = |source| GitError::Read {
             path: directory.clone(),
             source,
@@ -872,9 +868,7 @@ fn local_entries(repository: &Repository) -> Result<BTreeSet<PathBuf>, GitError>
             let dirent = dirent.map_err(unreadable)?;
             let name = dirent.file_name();
             let kind = dirent.file_type().map_err(unreadable)?;
-            if kind.is_dir() && name != ".git" {
-                pending.push(relative.join(name));
-            } else if kind.is_file() && Path::new(&name).extension() == Some(OsStr::new("md")) {
+            if kind.is_file() && Path::new(&name).extension() == Some(OsStr::new("md")) {
                 found.insert(relative.join(name));
             }
         }
@@ -1126,18 +1120,36 @@ fn tree_item(record: &[u8]) -> Option<TreeItem> {
     })
 }
 
+/// Whether `path` has the one shape a ledger entry reader accepts:
+/// `<owner>/<repository>/<file>.md`, without a `.git` component.
+fn entry_path(path: &Path) -> bool {
+    let mut components = path.components();
+    matches!(
+        (
+            components.next(),
+            components.next(),
+            components.next(),
+            components.next()
+        ),
+        (
+            Some(Component::Normal(owner)),
+            Some(Component::Normal(repository)),
+            Some(Component::Normal(_)),
+            None
+        ) if !owner.eq_ignore_ascii_case(".git") && !repository.eq_ignore_ascii_case(".git")
+    )
+}
+
 /// Refuse a tree item that is not an entry file as [`commit_pending`]
-/// writes one (a `100644` blob named `*.md`), or whose path leaves the ledger
-/// directory or enters a `.git`.
+/// writes one (a `100644` blob named `<owner>/<repository>/<file>.md`), or
+/// whose path is not exactly that shape.
 fn check_entry(commit: &CommitId, item: &TreeItem) -> Result<(), GitError> {
     let detail = if item.mode != Mode::File {
         Some("not a regular, non-executable file")
     } else if item.path.extension() != Some(OsStr::new("md")) {
         Some("not named *.md")
-    } else if !item.path.components().all(
-        |component| matches!(component, Component::Normal(name) if !name.eq_ignore_ascii_case(".git")),
-    ) {
-        Some("its path leaves the ledger directory or enters a .git")
+    } else if !entry_path(&item.path) {
+        Some("not exactly <owner>/<repository>/<file>.md")
     } else {
         None
     };
