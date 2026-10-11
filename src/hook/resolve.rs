@@ -21,7 +21,7 @@ pub struct Managed {
 
 /// A touched path inside a repository, and what the registry says about it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Match {
+pub struct Match<'a> {
     /// The nearest repository root containing the touched path (a jj workspace
     /// is its own root). Guidance walks this tree; session-state keys use it.
     pub root: PathBuf,
@@ -32,12 +32,12 @@ pub struct Match {
     /// When no entry's `upstream` matches but one's `origin` does: the
     /// checkout of that entry under an `upstream` the registry disagrees
     /// with, which the notice names instead of staying silent.
-    pub disagrees: Option<bind::Disagreement>,
+    pub disagrees: Option<bind::Disagreement<'a>>,
     /// Whether `[trust]` grants guidance for this checkout (any remote, or `roots`).
     pub trusted: bool,
 }
 
-impl Match {
+impl Match<'_> {
     /// The registry name when managed, or when the checkout disagrees with an
     /// entry; else `guidance_name(&self.root)`.
     pub fn name(&self) -> String {
@@ -106,7 +106,7 @@ fn existing_ancestor(path: &Path) -> Option<&Path> {
 /// from the path alone, so it holds with no readable repository at all. A
 /// checkout whose `upstream` matches no entry but whose `origin` is an
 /// entry's matches as that entry's [`bind::Disagreement`], unmanaged.
-pub fn match_checkout(paths: &[PathBuf], registry: &Registry) -> Option<Match> {
+pub fn match_checkout<'a>(paths: &[PathBuf], registry: &'a Registry) -> Option<Match<'a>> {
     for path in paths {
         let Some(candidate) = canonical_path(path) else {
             continue;
@@ -544,7 +544,7 @@ mod tests {
         let disagreement = matched.disagrees.expect("the disagreement");
         assert_eq!(disagreement.fork, RepoName::new("tool"));
         assert_eq!(
-            disagreement.registry,
+            disagreement.entry.upstream,
             "https://forge.invalid/maintainer/tool"
         );
         assert_eq!(

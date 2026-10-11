@@ -322,7 +322,7 @@ struct Ground<'a> {
     registry: &'a Registry,
     /// Exactly what `bind::here` said, so the verb reports a refusal as it
     /// always has, without asking the VCS again.
-    here: Result<Fork<'a>, Unbound>,
+    here: Result<Fork<'a>, Unbound<'a>>,
 }
 
 impl<'a> Ground<'a> {
@@ -345,32 +345,15 @@ impl<'a> Ground<'a> {
     }
 
     /// The fork `name` is: the current directory's when it is that entry, else
-    /// the scan's; `None` after printing why not (exit `Usage`).
-    ///
-    /// The current directory matters only when it bound to `name`. However it
-    /// failed to bind — outside a repository, a git clone, a checkout whose
-    /// remotes cannot be read — the verb was asked about `name`, and the scan
-    /// answers for it. When the scan finds no checkout of `name` but the
-    /// current directory carries its `origin` under a disagreeing `upstream`
-    /// (a checkout the scan does not reach), the refusal is that disagreement,
-    /// not "no checkout".
+    /// the scan's; `None` after printing why not (exit `Usage`). How the
+    /// current directory bound is [`knives::bind::resolve`]'s to weigh.
     fn named(&self, name: &str) -> Option<Fork<'a>> {
         let registry = self.registry;
         let name = RepoName::new(name);
         let home = scan_home()?;
-        match knives::bind::resolve(registry, &name, self.here.as_ref().ok(), &home) {
+        match knives::bind::resolve(registry, &name, &self.here, &home) {
             Ok(fork) => Some(fork),
             Err(why) => {
-                let why = match (why, &self.here) {
-                    (
-                        knives::bind::Unresolved::Missing { problems, .. },
-                        Err(Unbound::Disagrees(disagreement)),
-                    ) if disagreement.fork == name => knives::bind::Unresolved::Disagrees {
-                        disagreements: vec![disagreement.clone()],
-                        problems,
-                    },
-                    (why, _) => why,
-                };
                 eprintln!("{}", why.message(&name, registry));
                 None
             }
@@ -423,19 +406,10 @@ impl<'a> Ground<'a> {
                 .named(name)
                 .map_or(Err(Exit::Usage), |fork| Ok(vec![Selected::Bound(fork)])));
         }
-        if !scope.all {
-            match self.here {
-                Ok(fork) => return Ok(Ok(vec![Selected::Bound(fork)])),
-                Err(Unbound::Unreadable(error)) => return Err(error.into()),
-                Err(Unbound::Disagrees(disagreement)) => {
-                    return Ok(Ok(vec![Selected::disagreeing(registry, disagreement)?]));
-                }
-                Err(unbound @ (Unbound::GitOnly { .. } | Unbound::NotColocated { .. })) => {
-                    eprintln!("{}", unbound.message(registry));
-                    return Ok(Err(Exit::Usage));
-                }
-                Err(_) => {}
-            }
+        if !scope.all
+            && let Some(answer) = standing_row(self.here, registry)
+        {
+            return answer;
         }
         let Some(home) = scan_home() else {
             return Ok(Err(Exit::Usage));
@@ -455,22 +429,33 @@ impl<'a> Ground<'a> {
         if scope.requested.is_some() || scope.all {
             return self.selected(scope);
         }
-        match self.here {
-            Ok(fork) => Ok(Ok(vec![Selected::Bound(fork)])),
-            Err(Unbound::Unreadable(error)) => Err(error.into()),
-            Err(Unbound::Disagrees(disagreement)) => Ok(Ok(vec![Selected::disagreeing(
-                self.registry,
-                disagreement,
-            )?])),
-            Err(unbound @ (Unbound::GitOnly { .. } | Unbound::NotColocated { .. })) => {
-                eprintln!("{}", unbound.message(self.registry));
-                Ok(Err(Exit::Usage))
-            }
-            Err(_) => {
-                eprintln!("give a repo name, or --all");
-                Ok(Err(Exit::Usage))
-            }
+        standing_row(self.here, self.registry).unwrap_or_else(|| {
+            eprintln!("give a repo name, or --all");
+            Ok(Err(Exit::Usage))
+        })
+    }
+}
+
+/// The row a many-repo verb reports for the directory it stands in, when
+/// how it bound decides one: the fork it is inside; the disagreeing entry,
+/// as an unplaced row; a git clone or non-colocated checkout, refused
+/// (`Usage`); a checkout whose remotes cannot be read, an error. `None` when
+/// standing there names no entry, which each caller answers its own way.
+fn standing_row<'a>(
+    here: Result<Fork<'a>, Unbound<'a>>,
+    registry: &Registry,
+) -> Option<anyhow::Result<Result<Vec<Selected<'a>>, Exit>>> {
+    match here {
+        Ok(fork) => Some(Ok(Ok(vec![Selected::Bound(fork)]))),
+        Err(Unbound::Unreadable(error)) => Some(Err(error.into())),
+        Err(Unbound::Disagrees(disagreement)) => {
+            Some(Ok(Ok(vec![Selected::disagreeing(disagreement)])))
         }
+        Err(unbound @ (Unbound::GitOnly { .. } | Unbound::NotColocated { .. })) => {
+            eprintln!("{}", unbound.message(registry));
+            Some(Ok(Err(Exit::Usage)))
+        }
+        Err(_) => None,
     }
 }
 
@@ -761,19 +746,12 @@ impl<'a> Selected<'a> {
     /// The row for the entry the current directory's checkout carries the
     /// `origin` of while its `upstream` disagrees: unplaced, never opened,
     /// its problem the disagreement in full.
-    fn disagreeing(
-        registry: &'a Registry,
-        disagreement: knives::bind::Disagreement,
-    ) -> anyhow::Result<Self> {
-        let entry = registry
-            .get(&disagreement.fork)
-            .ok_or_else(|| anyhow::anyhow!("{} is not in the registry", disagreement.fork))?;
-        let problem = disagreement.to_string();
-        Ok(Selected::Unplaced {
+    fn disagreeing(disagreement: knives::bind::Disagreement<'a>) -> Self {
+        Selected::Unplaced {
+            problem: disagreement.to_string(),
             name: disagreement.fork,
-            entry,
-            problem,
-        })
+            entry: disagreement.entry,
+        }
     }
 }
 

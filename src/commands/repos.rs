@@ -725,7 +725,7 @@ mod tests {
         let disagreement = crate::bind::Disagreement {
             root: home.join("renamed/default"),
             fork: RepoName::new("renamed"),
-            registry: "https://forge.invalid/org/new".to_owned(),
+            entry: registry.get(&RepoName::new("renamed")).expect("renamed"),
             remote: "https://forge.invalid/org/old".to_owned(),
         };
         let scan = Scan {

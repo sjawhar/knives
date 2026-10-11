@@ -94,25 +94,26 @@ impl<'a> Fork<'a> {
 /// spelling is right is a person's choice, so knives names both and the fix
 /// rather than reading the checkout as absent.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Disagreement {
+pub struct Disagreement<'a> {
     pub root: PathBuf,
     /// The entry whose `origin` the checkout's `origin` remote is.
     pub fork: RepoName,
-    /// The entry's `upstream`, as the registry spells it.
-    pub registry: String,
+    /// That entry, whose `upstream` is the registry's spelling.
+    pub entry: &'a RepoEntry,
     /// The checkout's `upstream` remote, as it spells it.
     pub remote: String,
 }
 
-impl std::fmt::Display for Disagreement {
+impl std::fmt::Display for Disagreement<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let Self {
             root,
             fork,
-            registry,
+            entry,
             remote,
         } = self;
         let root = root.display();
+        let registry = &entry.upstream;
         write!(
             f,
             "{root} has {fork}'s origin, but its upstream remote is {remote} and repos.toml says \
@@ -124,15 +125,15 @@ impl std::fmt::Display for Disagreement {
     }
 }
 
-impl Disagreement {
+impl<'a> Disagreement<'a> {
     /// `root`'s disagreement with `entry`, the `(key, entry)` whose `origin`
     /// its `origin` remote is ([`entry_by_origin`]); `remote` is its
     /// `upstream` remote.
-    pub(crate) fn new(root: PathBuf, (key, entry): (&String, &RepoEntry), remote: &str) -> Self {
+    pub(crate) fn new(root: PathBuf, (key, entry): (&String, &'a RepoEntry), remote: &str) -> Self {
         Self {
             root,
             fork: RepoName::new(key.as_str()),
-            registry: entry.upstream.clone(),
+            entry,
             remote: remote.to_owned(),
         }
     }
@@ -161,7 +162,7 @@ pub enum BindError {
 
 /// Why `here` did not bind.
 #[derive(Debug, PartialEq, Eq)]
-pub enum Unbound {
+pub enum Unbound<'a> {
     /// No `.git` at or above the directory.
     NotInsideARepository,
     /// A git clone with no `.jj`: the hook binds those, fork verbs need jj.
@@ -175,12 +176,12 @@ pub enum Unbound {
     Unregistered { root: PathBuf, upstream: String },
     /// An entry's checkout by `origin` whose `upstream` remote names another
     /// repository than the entry's.
-    Disagrees(Disagreement),
+    Disagrees(Disagreement<'a>),
     /// A repository whose remotes could not be read.
     Unreadable(BindError),
 }
 
-impl Unbound {
+impl Unbound<'_> {
     /// The refusal. One that a repo name would fix ends with `; known: a, b`,
     /// the registry's names; a git clone, a disagreeing upstream or an
     /// unreadable repository is refused in its own words, since typing a name
@@ -224,7 +225,7 @@ impl Unbound {
 /// a checkout whose remotes could not be read is named beside the entry it
 /// may have been.
 #[derive(Debug, PartialEq, Eq)]
-pub enum Unresolved {
+pub enum Unresolved<'a> {
     Unknown,
     Missing {
         home: PathBuf,
@@ -239,12 +240,12 @@ pub enum Unresolved {
     /// `upstream`: the entry is here, under a spelling the registry disagrees
     /// with, not absent.
     Disagrees {
-        disagreements: Vec<Disagreement>,
+        disagreements: Vec<Disagreement<'a>>,
         problems: Vec<String>,
     },
 }
 
-impl Unresolved {
+impl Unresolved<'_> {
     /// `Unknown` renders `unknown repo <name>; known: a, b`, `Missing` renders
     /// `no checkout of <name> under <home>`, `Duplicate` renders
     /// `<name> has <n> checkouts under <home>: <paths>; knives will not choose`,
@@ -477,7 +478,7 @@ pub fn entry_for<'a>(registry: &'a Registry, upstream: &str) -> Option<(RepoName
 /// Or why there is none: a `.jj` nearer than any `.git` (a non-colocated
 /// checkout, or a `.jj` some tree carries), no `.git` above at all, or a
 /// `.git` with no `.jj` beside it (a plain git clone).
-pub fn verb_checkout(cwd: &Path) -> Result<PathBuf, Unbound> {
+pub fn verb_checkout<'a>(cwd: &Path) -> Result<PathBuf, Unbound<'a>> {
     if let Some(root) = jj_only_ancestor(cwd) {
         return Err(Unbound::NotColocated { root });
     }
@@ -507,7 +508,7 @@ fn jj_only_ancestor(path: &Path) -> Option<PathBuf> {
 /// are what the verb is about — no trust decision rests on them. A checkout
 /// whose `upstream` matches no entry but whose `origin` is an entry's is
 /// refused as [`Unbound::Disagrees`], not as unregistered.
-pub fn here<'a>(registry: &'a Registry, cwd: &Path) -> Result<Fork<'a>, Unbound> {
+pub fn here<'a>(registry: &'a Registry, cwd: &Path) -> Result<Fork<'a>, Unbound<'a>> {
     let root = verb_checkout(cwd)?;
     let remotes = remotes(&root).map_err(Unbound::Unreadable)?;
     let Some(upstream) = remotes.get("upstream") else {
@@ -544,19 +545,19 @@ pub struct Scan<'a> {
     /// Per entry, the checkouts that carry its `origin` under another
     /// `upstream` ([`Disagreement`]), sorted by path. They place nothing; they
     /// say why an entry no checkout binds is not absent.
-    pub disagreements: BTreeMap<RepoName, Vec<Disagreement>>,
+    pub disagreements: BTreeMap<RepoName, Vec<Disagreement<'a>>>,
     /// What could not be read: a checkout whose remotes failed, a directory
     /// whose listing failed. Never dropped; every report of the scan names them.
     pub problems: Vec<String>,
 }
 
-impl Scan<'_> {
+impl<'a> Scan<'a> {
     /// Why `name` is not in `found`: two checkouts, checkouts whose upstream
     /// disagrees with the registry, or none — carrying `problems`, the scan
     /// complaints the caller wants on this refusal. A named verb passes the
     /// scan's, since one of them may be the checkout it wanted; a sweep passes
     /// none and reports them once itself.
-    pub fn unplaced(&self, name: &RepoName, problems: Vec<String>) -> Unresolved {
+    pub fn unplaced(&self, name: &RepoName, problems: Vec<String>) -> Unresolved<'a> {
         if let Some(paths) = self.duplicates.get(name) {
             return Unresolved::Duplicate {
                 home: self.home.clone(),
@@ -728,20 +729,22 @@ fn checkouts_under(home: &Path, problems: &mut Vec<String>) -> Vec<PathBuf> {
 
 /// One named entry's fork: `here` when it is that entry, else the scan's.
 ///
-/// `here` is the fork the current directory is inside, bound once by the
-/// caller; a directory that did not bind is `None`, and how it failed is the
-/// caller's to report. The scan's problems ride on the refusal: one of them
-/// may be the checkout `name` wanted.
+/// `here` is how the current directory bound, once, by the caller. However
+/// it failed to bind, the scan answers for `name`; when the scan finds no
+/// checkout of `name` but the current directory carries its `origin` under
+/// a disagreeing `upstream` (a checkout the scan does not reach), the
+/// refusal is that disagreement, not "no checkout". The scan's problems
+/// ride on the refusal: one of them may be the checkout `name` wanted.
 pub fn resolve<'a>(
     registry: &'a Registry,
     name: &RepoName,
-    here: Option<&Fork<'a>>,
+    here: &Result<Fork<'a>, Unbound<'a>>,
     home: &Path,
-) -> Result<Fork<'a>, Unresolved> {
+) -> Result<Fork<'a>, Unresolved<'a>> {
     if registry.get(name).is_none() {
         return Err(Unresolved::Unknown);
     }
-    if let Some(fork) = here
+    if let Ok(fork) = here
         && fork.name == *name
     {
         return Ok(fork.clone());
@@ -751,7 +754,17 @@ pub fn resolve<'a>(
         return Ok(fork);
     }
     let problems = std::mem::take(&mut scan.problems);
-    Err(scan.unplaced(name, problems))
+    Err(match (scan.unplaced(name, problems), here) {
+        (Unresolved::Missing { problems, .. }, Err(Unbound::Disagrees(disagreement)))
+            if disagreement.fork == *name =>
+        {
+            Unresolved::Disagrees {
+                disagreements: vec![disagreement.clone()],
+                problems,
+            }
+        }
+        (why, _) => why,
+    })
 }
 
 #[cfg(test)]
@@ -1014,10 +1027,14 @@ mod tests {
             .message(&name, &registry),
             "tool has 2 checkouts under /home/x: /home/x/a, /home/x/b; knives will not choose"
         );
+        let entry = RepoEntry::new(
+            "https://forge.example/o/new",
+            "https://forge.example/me/new",
+        );
         let disagreement = Disagreement {
             root: PathBuf::from("/r"),
             fork: RepoName::new("tool"),
-            registry: "https://forge.example/o/new".to_owned(),
+            entry: &entry,
             remote: "https://forge.example/o/old".to_owned(),
         };
         let disagrees = "/r has tool's origin, but its upstream remote is \

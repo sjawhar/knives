@@ -159,7 +159,7 @@ fn opencode_tool_after(
     let Some(session_id) = event.session_id() else {
         return opencode::tool_response("").map_err(Into::into);
     };
-    let Some((registry, matched)) = relevant_tool_match(
+    let Some((registry, paths)) = relevant_tool_paths(
         &ToolCall {
             tool: event.tool(),
             args: event.args(),
@@ -168,6 +168,9 @@ fn opencode_tool_after(
         loaded,
     )?
     else {
+        return opencode::tool_response("").map_err(Into::into);
+    };
+    let Some(matched) = match_checkout(&paths, &registry) else {
         return opencode::tool_response("").map_err(Into::into);
     };
     if matched.is_managed()
@@ -532,7 +535,7 @@ fn post_tool_use(
     let Some(session_id) = event.session_id() else {
         return Ok(None);
     };
-    let Some((registry, matched)) = relevant_tool_match(
+    let Some((registry, paths)) = relevant_tool_paths(
         &ToolCall {
             tool: event.tool_name(),
             args: event.tool_input(),
@@ -541,6 +544,9 @@ fn post_tool_use(
         loaded,
     )?
     else {
+        return Ok(None);
+    };
+    let Some(matched) = match_checkout(&paths, &registry) else {
         return Ok(None);
     };
     if matched.is_managed()
@@ -617,13 +623,14 @@ struct ToolCall<'a> {
     relevant: &'a [&'a str],
 }
 
-/// The touched-path match for a relevant tool call, with the registry it was
-/// decided against — taken from `loaded` only once there is a path to decide,
-/// so a pathless call never fails on a registry that could not be read.
-fn relevant_tool_match(
+/// The paths a relevant tool call touched, with the registry they are to be
+/// matched against ([`match_checkout`]) — taken from `loaded` only once there
+/// is a path to decide, so a pathless call never fails on a registry that
+/// could not be read.
+fn relevant_tool_paths(
     call: &ToolCall<'_>,
     loaded: Result<Registry, ConfigError>,
-) -> anyhow::Result<Option<(Registry, Match)>> {
+) -> anyhow::Result<Option<(Registry, Vec<PathBuf>)>> {
     let Some(tool) = call.tool else {
         return Ok(None);
     };
@@ -637,9 +644,7 @@ fn relevant_tool_match(
     if paths.is_empty() {
         return Ok(None);
     }
-    let registry = loaded?;
-    let matched = match_checkout(&paths, &registry);
-    Ok(matched.map(|matched| (registry, matched)))
+    Ok(Some((loaded?, paths)))
 }
 
 /// The fork the event's working directory is inside, by the name its claims
@@ -652,7 +657,7 @@ fn standing_in(cwd: &str, registry: &Registry) -> Option<UpstreamName> {
 }
 
 /// What guidance and session state key on: the match's nearest root and name.
-fn guidance_root(matched: &Match) -> GuidanceRoot {
+fn guidance_root(matched: &Match<'_>) -> GuidanceRoot {
     GuidanceRoot {
         name: matched.name(),
         root: matched.root.clone(),
@@ -720,7 +725,7 @@ impl NoticeStateUpdate {
 /// claims this checkout's are, and silence would read as "nobody's".
 fn notice_if_requested(
     repo: &GuidanceRoot,
-    matched: Option<&Match>,
+    matched: Option<&Match<'_>>,
     registry: &Registry,
     state: &SessionState,
 ) -> anyhow::Result<Option<PreparedNotice>> {

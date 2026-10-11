@@ -30,11 +30,9 @@ fn registry(entries: &[(&str, RepoEntry)]) -> Registry {
     }
 }
 
-/// The fork the lab's work checkout is inside, bound against `registry` as a
-/// verb's `Ground` binds it once.
-fn here_at<'a>(registry: &'a Registry, cwd: &Path) -> Option<bind::Fork<'a>> {
-    bind::here(registry, cwd).ok()
-}
+/// How a directory outside every repository binds: what `resolve` is given
+/// when nothing bound, so the scan is the only source.
+const NOWHERE: Result<bind::Fork<'static>, Unbound<'static>> = Err(Unbound::NotInsideARepository);
 
 #[test]
 fn a_checkout_root_is_found_from_a_subdirectory_and_from_a_workspace() {
@@ -677,7 +675,8 @@ fn scan_names_a_checkout_whose_remotes_it_could_not_read_while_an_entry_is_unpla
     );
     // One line: jj's error, not its hints.
     assert!(!scan.problems[0].contains('\n'), "{:?}", scan.problems);
-    let why = bind::resolve(&registry, &RepoName::new("ghost"), None, &home).expect_err("unplaced");
+    let why =
+        bind::resolve(&registry, &RepoName::new("ghost"), &NOWHERE, &home).expect_err("unplaced");
     assert!(
         why.message(&RepoName::new("ghost"), &registry)
             .contains("; could not read: reading remotes of"),
@@ -763,8 +762,8 @@ fn resolve_prefers_the_bound_directory_then_the_scan_then_says_why_not() {
         ),
     ]);
 
-    let here = here_at(&registry, &lab.work);
-    let here = here.as_ref();
+    let here = bind::here(&registry, &lab.work);
+    let here = &here;
     let demo = bind::resolve(&registry, &RepoName::new("demo"), here, &home).expect("resolved");
     assert_eq!(
         demo.checkout.path,
@@ -793,7 +792,7 @@ fn resolve_prefers_the_bound_directory_then_the_scan_then_says_why_not() {
     assert_eq!(unknown, Unresolved::Unknown);
 
     // Nothing bound: the scan is the only source.
-    let scanned = bind::resolve(&registry, &RepoName::new("elsewhere"), None, &home)
+    let scanned = bind::resolve(&registry, &RepoName::new("elsewhere"), &NOWHERE, &home)
         .expect("resolved from the scan");
     assert_eq!(scanned.checkout.path, other.checkout.path);
 }
@@ -829,7 +828,7 @@ fn a_checkout_whose_upstream_disagrees_with_its_entry_is_named_by_here_scan_and_
     let expected = bind::Disagreement {
         root: renamed.canonicalize().expect("canonical"),
         fork: RepoName::new("demo"),
-        registry: "https://forge.invalid/org/demo".to_owned(),
+        entry: registry.get(&RepoName::new("demo")).expect("demo"),
         remote: "https://forge.invalid/org/old-demo".to_owned(),
     };
 
@@ -859,7 +858,23 @@ fn a_checkout_whose_upstream_disagrees_with_its_entry_is_named_by_here_scan_and_
 
     // And: naming `demo` from elsewhere says it disagrees, not that it is absent.
     assert_eq!(
-        bind::resolve(&registry, &RepoName::new("demo"), None, home.path()),
+        bind::resolve(&registry, &RepoName::new("demo"), &NOWHERE, home.path()),
+        Err(Unresolved::Disagrees {
+            disagreements: vec![expected.clone()],
+            problems: Vec::new(),
+        })
+    );
+
+    // And: standing in it, naming `demo` where the scan cannot reach it
+    // still says it disagrees, from how the directory bound.
+    let elsewhere = tempfile::tempdir().expect("an empty scan root");
+    assert_eq!(
+        bind::resolve(
+            &registry,
+            &RepoName::new("demo"),
+            &bind::here(&registry, &renamed),
+            elsewhere.path()
+        ),
         Err(Unresolved::Disagrees {
             disagreements: vec![expected],
             problems: Vec::new(),
