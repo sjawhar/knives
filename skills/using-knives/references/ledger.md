@@ -401,7 +401,7 @@ closes. When two machines each wrote it before either pulled, the one that
 sweeps second deletes its own uncommitted copy after its fetch and before its
 commit, counted in `discarded`. A committed entry is never deleted, so a repeat
 two machines both committed stays (`repeated_transitions`,
-`src/commands/sync.rs`).
+`src/ledger/transitions.rs`).
 
 A command that decides something from the ledger pulls it first: `status`,
 `sync`, `audit`, `pushed`, each `release` command that reads the ledger (the

@@ -30,6 +30,8 @@ use crate::config::default_config_path;
 use crate::ids::UpstreamName;
 use crate::statement::Statement;
 
+pub mod transitions;
+
 /// The directory holding every repository's ledger, beside `state.json`.
 pub fn default_ledger_root() -> PathBuf {
     default_config_path().with_file_name("ledger")

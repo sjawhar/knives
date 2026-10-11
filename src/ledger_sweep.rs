@@ -943,7 +943,7 @@ fn pull_held(destination: &Destination) -> (Option<ledger_git::Materialised>, Ve
 ///
 /// Before the commit, each transition event this machine wrote that repeats
 /// one a ref already carries goes
-/// ([`crate::commands::sync::repeated_transitions`]): two machines that
+/// ([`crate::ledger::transitions::repeated_transitions`]): two machines that
 /// both synced after one merge each wrote `#N merged`, and the one that
 /// sweeps second commits none. Only an entry no ref carries is removed, so
 /// what any machine committed stays.
@@ -991,7 +991,7 @@ fn send(destination: &Destination, tally: &mut Tally) -> Result<Vec<String>, Swe
                     )),
                 }
             }
-            for path in crate::commands::sync::repeated_transitions(&entries, &uncommitted) {
+            for path in crate::ledger::transitions::repeated_transitions(&entries, &uncommitted) {
                 if let Err(source) = std::fs::remove_file(path) {
                     problems.push(format!(
                         "{}: a repeated transition, not discarded: {source}",
