@@ -351,7 +351,8 @@ and JSON share its report:
 ```text
 {outcome, waited?, destinations?, problems?, notes?}
 waited: {pid?, seconds}
-destination: {git_dir, remote, forks, commits, pulled, pushes, discarded, skipped?}
+destination: {git_dir, remote, forks, commits, pulled, pushes, discarded, skipped?,
+              unsent?}
 ```
 
 `outcome` is `swept`; `busy`, only from the sweep a write hands off, when
@@ -367,7 +368,12 @@ whole sweep: commits made, entries pulled in, pushes, and repeated transitions
 discarded. `skipped`, by `<owner>/<name>` directory, counts the entries other
 machines sent through that repository for a fork it does not carry here, which
 this machine never writes in: what two machines whose registries send one fork
-to different repositories see. Any problem exits `3`.
+to different repositories see. `unsent` counts this machine's entries, in the
+forks that repository carries, that no ref fetched from it holds when the
+sweep ends: what a failed sweep leaves on this machine alone. It is `0` when
+everything reached the remote, or when there was nothing to send even though
+the remote could not be reached, and it is absent only when it could not be
+counted, which a problem says. Any problem exits `3`.
 
 A sweep a write hands off prints to nowhere, so each sweep also keeps what it
 discarded and left unread in `ledger-sweep.json` beside the state file, and

@@ -631,6 +631,13 @@ pub struct Tally {
     /// absent when none succeeded or it found none.
     #[serde(skip_serializing_if = "skipped_nothing")]
     pub skipped: Option<BTreeMap<String, usize>>,
+    /// How many of this machine's entries, in the forks this repository
+    /// carries, no fetched ref holds when the sweep ends
+    /// ([`ledger_git::unsent`]): what a failed sweep leaves on this machine
+    /// alone. `0` for a repository carrying no fork. Absent when it could
+    /// not be counted, which a problem says.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unsent: Option<usize>,
     /// By fork, the discards not yet in the [`sweep_record`].
     #[serde(skip)]
     unkept: BTreeMap<String, usize>,
@@ -668,6 +675,9 @@ impl Tally {
             pushes: 0,
             discarded: 0,
             skipped: None,
+            // A repository carrying no fork holds nothing of this machine's
+            // to send; [`sweep`] counts every other one when it ends.
+            unsent: destination.repository.forks().is_empty().then_some(0),
             unkept: BTreeMap::new(),
             unwritten: Vec::new(),
             failed: false,
@@ -835,6 +845,21 @@ pub fn sweep(
         }
     }
     problems.extend(unwritten(&tallies));
+    for (destination, tally) in found.iter().zip(&mut tallies) {
+        if destination.repository.forks().is_empty() {
+            continue;
+        }
+        tally.unsent = match ledger_git::unsent(&destination.repository, REMOTE) {
+            Ok(paths) => Some(paths.len()),
+            Err(error) => {
+                problems.push(format!(
+                    "{}: could not count the entries not yet sent: {error}",
+                    destination.describe()
+                ));
+                None
+            }
+        };
+    }
     Ok(Swept::Ran {
         tallies,
         problems,

@@ -139,9 +139,14 @@ pub fn render(report: &Report) -> String {
                         text
                     },
                 );
+                let unsent = match tally.unsent {
+                    Some(0) | None => String::new(),
+                    Some(1) => ", 1 entry not yet sent".to_owned(),
+                    Some(count) => format!(", {count} entries not yet sent"),
+                };
                 format!(
                     "ledger: {} ({}): {} commit(s), {} push(es), {} entr{} pulled{discarded}\
-                     {skipped}; carries {}",
+                     {skipped}{unsent}; carries {}",
                     tally.remote,
                     tally.git_dir,
                     tally.commits,

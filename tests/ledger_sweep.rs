@@ -336,6 +336,74 @@ fn a_sweep_run_by_hand_while_another_holds_the_lock_waits_and_reports_its_own_fa
     assert_eq!(entries_on(&remote, "alpha"), 0);
 }
 
+/// A bare remote whose every push is refused, with the directory holding it.
+fn refusing_remote() -> (tempfile::TempDir, PathBuf) {
+    let (remote_dir, remote) = lab::bare_remote();
+    let hook = remote.join("hooks").join("pre-receive");
+    std::fs::write(
+        &hook,
+        "#!/bin/sh\necho 'push refused by the test' >&2\nexit 1\n",
+    )
+    .expect("write the pre-receive hook");
+    std::fs::set_permissions(&hook, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+        .expect("make the hook executable");
+    (remote_dir, remote)
+}
+
+#[test]
+fn a_sweep_whose_push_is_refused_counts_the_entries_it_leaves_unsent() {
+    // Given: a machine with two entries to send, and a ledger remote that
+    // refuses every push.
+    let home = a_repo_home();
+    let (_remote_dir, remote) = refusing_remote();
+    let root = share(home.path(), "alpha", &remote);
+    append(&root, "acme/a-repo", 2);
+
+    // When: a sweep runs.
+    let (code, report) = sweep_report(home.path());
+
+    // Then: it fails, and says both entries are still on this machine alone.
+    assert_eq!(code, Some(3), "{report}");
+    assert_eq!(report["destinations"][0]["unsent"], 2, "{report}");
+    assert_eq!(entries_on(&remote, "alpha"), 0);
+}
+
+#[test]
+fn a_new_machine_whose_remote_cannot_be_reached_has_nothing_unsent() {
+    // Given: a machine joined as the installer joins one, with no entries
+    // and a ledger remote that cannot be reached.
+    let home = a_repo_home();
+    join_as_the_installer_does(home.path(), "alpha", Path::new("/nonexistent/ledger.git"));
+
+    // When: a sweep runs.
+    let (code, report) = sweep_report(home.path());
+
+    // Then: the failed fetch is a problem, and nothing is left unsent.
+    assert_eq!(code, Some(3), "{report}");
+    assert!(
+        problems_of(&report).contains("/nonexistent/ledger.git"),
+        "{report}"
+    );
+    assert_eq!(report["destinations"][0]["unsent"], 0, "{report}");
+}
+
+#[test]
+fn a_sweep_that_sends_everything_has_nothing_unsent() {
+    // Given: a machine with an entry to send and a remote that takes it.
+    let home = a_repo_home();
+    let (_remote_dir, remote) = lab::bare_remote();
+    let root = share(home.path(), "alpha", &remote);
+    append(&root, "acme/a-repo", 1);
+
+    // When: a sweep runs.
+    let (code, report) = sweep_report(home.path());
+
+    // Then: it sent it, and says nothing is left.
+    assert_eq!(code, Some(0), "{report}");
+    assert_eq!(report["destinations"][0]["unsent"], 0, "{report}");
+    assert_eq!(entries_on(&remote, "alpha"), 1);
+}
+
 #[test]
 fn a_sweep_with_nothing_new_does_nothing_and_succeeds() {
     // Given: a machine whose one entry is already swept.
