@@ -1103,8 +1103,9 @@ fn a_dependency_stated_on_another_machine_survives_a_second_machines_depends() {
 
     // Then: beta's statement, the newest, lists both.
     let entries = Ledger::at(beta.path().join("ledger").join(FORK))
-        .entries()
-        .expect("read beta's ledger");
+        .read()
+        .expect("read beta's ledger")
+        .entries;
     let live = knives::statement::Statements::from_entries(&entries);
     assert_eq!(live.depends("feat/alpha"), ["acme/demo#1", "acme/demo#2"]);
 }
@@ -1152,8 +1153,9 @@ fn dependencies_two_machines_state_at_once_both_survive() {
     // Then: both dependencies are live on both machines.
     for home in [&alpha, &beta] {
         let entries = Ledger::at(home.path().join("ledger").join(FORK))
-            .entries()
-            .expect("read the ledger");
+            .read()
+            .expect("read the ledger")
+            .entries;
         let live = knives::statement::Statements::from_entries(&entries);
         assert_eq!(
             live.depends("feat/alpha"),
@@ -1275,8 +1277,9 @@ fn a_forget_with_nothing_stated_leaves_a_peers_unsent_statement_standing() {
     // Then: beta wrote no forget, so once it pulls, alpha's #1234 is live
     // on beta too.
     let entries = Ledger::at(beta.path().join("ledger").join(FORK))
-        .entries()
-        .expect("read beta's ledger");
+        .read()
+        .expect("read beta's ledger")
+        .entries;
     assert!(
         entries.iter().all(|entry| entry.statement.is_none()),
         "{entries:?}"
@@ -1315,8 +1318,9 @@ fn a_depends_or_a_forget_is_refused_when_the_ledger_cannot_be_pulled() {
         );
         assert!(
             Ledger::at(home.path().join("ledger").join(FORK))
-                .entries()
+                .read()
                 .expect("read the ledger")
+                .entries
                 .is_empty(),
             "{args:?} wrote an entry"
         );
@@ -1870,8 +1874,9 @@ fn a_peer_ref_that_moved_backward_keeps_out_only_that_machines_entries() {
     git_in(&remote, &["update-ref", "refs/knives/gamma", &first]).expect("rewind gamma's ref");
     let beta_entries = || {
         Ledger::at(beta.path().join("ledger").join(FORK))
-            .entries()
+            .read()
             .expect("beta's ledger")
+            .entries
             .len()
     };
     assert_eq!(beta_entries(), 2);
@@ -2248,8 +2253,9 @@ fn recorded_on(remote: &Path, text: &str) -> usize {
 /// How many of the entries in `home`'s ledger of the lab fork read `text`.
 fn recorded_in(home: &Path, text: &str) -> usize {
     Ledger::at(home.join("ledger").join(FORK))
-        .entries()
+        .read()
         .expect("read the ledger")
+        .entries
         .iter()
         .filter(|entry| entry.text == text)
         .count()

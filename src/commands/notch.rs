@@ -55,6 +55,11 @@ pub enum Report {
         repo: String,
         checked: usize,
         flags: Vec<VerifyFlag>,
+        /// Each entry or statement the read under the check could read only
+        /// in part ([`crate::ledger::Ledger::read`]): an entry left out is
+        /// one whose evidence went unchecked.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        problems: Vec<String>,
     },
 }
 
@@ -84,24 +89,35 @@ pub fn render(report: &Report) -> String {
         Report::Written { repo, wrote } => wrote_line(repo, wrote),
         Report::Verified {
             repo,
-            checked: _,
             flags,
-        } if flags.is_empty() => format!("{repo}  no evidence flags"),
-        Report::Verified { repo, flags, .. } => flags
-            .iter()
-            .map(|flag| {
-                let subject = flag
-                    .subject
-                    .as_deref()
-                    .map_or_else(|| "(this repo)".to_owned(), inline_human_text);
-                format!(
-                    "{repo}  {}  {subject}  {}",
-                    flag.ts,
-                    inline_human_text(&flag.what)
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
+            problems,
+            ..
+        } => {
+            let mut lines: Vec<String> = if flags.is_empty() {
+                vec![format!("{repo}  no evidence flags")]
+            } else {
+                flags
+                    .iter()
+                    .map(|flag| {
+                        let subject = flag
+                            .subject
+                            .as_deref()
+                            .map_or_else(|| "(this repo)".to_owned(), inline_human_text);
+                        format!(
+                            "{repo}  {}  {subject}  {}",
+                            flag.ts,
+                            inline_human_text(&flag.what)
+                        )
+                    })
+                    .collect()
+            };
+            lines.extend(
+                problems
+                    .iter()
+                    .map(|problem| format!("!! {}", inline_human_text(problem))),
+            );
+            lines.join("\n")
+        }
         Report::Read {
             repo,
             entries,
@@ -280,7 +296,8 @@ fn verify(
     repo: &RepoName,
     request: &Request<'_>,
 ) -> anyhow::Result<Report> {
-    let entries = ledger.entries()?;
+    let read = ledger.read()?;
+    let entries = read.entries;
     let (selected, _) = select(
         &entries,
         &Filter {
@@ -309,6 +326,7 @@ fn verify(
         repo: repo.to_string(),
         checked: selected.len(),
         flags,
+        problems: read.problems,
     })
 }
 
@@ -381,9 +399,15 @@ pub fn run(request: &Request<'_>, output: crate::cli::Output) -> anyhow::Result<
     } else {
         println!("{}", render(&report));
     }
+    // A verify that left an entry out did not check it: incomplete, which
+    // outranks what it found, as [`Exit::worst`] ranks them.
     Ok(match &report {
+        Report::Read { problems, .. } | Report::Verified { problems, .. }
+            if !problems.is_empty() =>
+        {
+            Exit::Incomplete
+        }
         Report::Verified { flags, .. } if !flags.is_empty() => Exit::Findings,
-        Report::Read { problems, .. } if !problems.is_empty() => Exit::Incomplete,
         _ => Exit::Ok,
     })
 }

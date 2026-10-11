@@ -215,9 +215,12 @@ fn entries_committed_on_one_machine_materialise_on_another_and_parse() {
     assert_eq!(done.written, 2);
     assert!(done.skipped.is_empty(), "{done:?}");
     assert_eq!(file_names(&beta), file_names(&alpha));
-    let entries = ledger(&beta).entries().expect("beta's ledger parses");
+    let entries = ledger(&beta).read().expect("beta's ledger parses").entries;
     assert_eq!(entries.len(), 2);
-    assert_eq!(entries, ledger(&alpha).entries().expect("alpha's ledger"));
+    assert_eq!(
+        entries,
+        ledger(&alpha).read().expect("alpha's ledger").entries
+    );
     // No index was ever written on either side, so there was none to lock.
     assert!(!alpha.join(".git").join("index").exists());
     assert!(!beta.join(".git").join("index").exists());
@@ -247,8 +250,8 @@ fn two_machines_exchange_entries_and_neither_ref_is_rewritten() {
     assert_eq!(file_names(&alpha), file_names(&beta));
     assert_eq!(file_names(&alpha).len(), 5);
     assert_eq!(
-        ledger(&alpha).entries().expect("alpha's ledger"),
-        ledger(&beta).entries().expect("beta's ledger")
+        ledger(&alpha).read().expect("alpha's ledger").entries,
+        ledger(&beta).read().expect("beta's ledger").entries
     );
     for (machine, name) in [(&alpha, "alpha"), (&beta, "beta")] {
         assert_eq!(
@@ -309,7 +312,7 @@ fn a_reader_never_sees_a_partial_entry_while_materialise_writes() {
     append(&alpha, "ses_alpha", 1, 16 << 20);
     append(&alpha, "ses_alpha", ENTRIES - 1, 64 << 10);
     commit_and_push(&alpha, "alpha");
-    let written_by_alpha = ledger(&alpha).entries().expect("alpha's ledger");
+    let written_by_alpha = ledger(&alpha).read().expect("alpha's ledger").entries;
     let found = ledger_git::fetch(&repository(&beta), "origin").expect("fetch");
 
     // When: readers loop over beta's ledger while materialise writes into it,
@@ -323,8 +326,8 @@ fn a_reader_never_sees_a_partial_entry_while_materialise_writes() {
                 scope.spawn(|| {
                     let mut reads = Vec::new();
                     while !done.load(Ordering::Acquire) {
-                        reads.push(reader.entries().map(|entries| {
-                            entries
+                        reads.push(reader.read().map(|read| {
+                            read.entries
                                 .into_iter()
                                 .map(|entry| (entry.ts, entry.text.len()))
                                 .collect::<Vec<_>>()
@@ -370,7 +373,7 @@ fn a_reader_never_sees_a_partial_entry_while_materialise_writes() {
         reads.len()
     );
     assert_eq!(
-        ledger(&beta).entries().expect("final read"),
+        ledger(&beta).read().expect("final read").entries,
         written_by_alpha
     );
 }

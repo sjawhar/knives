@@ -919,7 +919,7 @@ mod tests {
                 parents: Vec::new(),
             })
             .expect("record cut");
-        let entries = ledger.entries().expect("read the cut back");
+        let entries = ledger.read().expect("read the cut back").entries;
         let mut report = Report::new("demo");
         let published = BTreeMap::from([(
             "refs/heads/release/2026-08-15".to_owned(),

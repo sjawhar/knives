@@ -291,7 +291,8 @@ fn edit_release(
         return Ok(Exit::Incomplete);
     }
     let release = ReleaseInHand::read(&opened, entry, release_name)?;
-    let ledger = Ledger::for_fork(fork).entries()?;
+    // The pulled plan refused on any problem this read finds.
+    let ledger = Ledger::for_fork(fork).read()?.entries;
     let releases = knives::release_model::release_refs_by_commit(
         &opened.bookmark_tips()?,
         &entry.release_scheme(),

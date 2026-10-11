@@ -183,7 +183,9 @@ pub(crate) fn run_release(
                         previous_ref.branch()
                     );
                 } else if matches!(scheme, ReleaseScheme::Fixed(_))
-                    && let previous_recorded = last_recorded_cut(&gate.ledger.entries()?, None)
+                    // The pulled plan refused on any problem this read finds.
+                    && let previous_recorded =
+                        last_recorded_cut(&gate.ledger.read()?.entries, None)
                     && previous_recorded
                         .as_ref()
                         .is_none_or(|recorded| recorded.commit != *published)
@@ -394,7 +396,8 @@ fn recorded_composition_check(
     gate: &CompositionGate<'_>,
     allow_drop: bool,
 ) -> anyhow::Result<Result<(Option<RecordedCut>, release::CompositionCheck), Exit>> {
-    let recorded = last_recorded_cut(&gate.ledger.entries()?, None);
+    // The pulled plan refused on any problem this read finds.
+    let recorded = last_recorded_cut(&gate.ledger.read()?.entries, None);
     let check = match &recorded {
         Some(recorded) => release::uncarried_recorded_members(
             gate.opened,

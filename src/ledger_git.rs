@@ -352,9 +352,10 @@ pub enum GitError {
 /// That is every entry in the forks `repository` carries that no knives ref
 /// carries yet, less any the caller [`Pending::forget`]s in between.
 ///
-/// An entry is a regular `*.md` file directly inside a carried fork's
+/// An entry is a regular file named as one
+/// ([`crate::ledger::is_entry_file_name`]) directly inside a carried fork's
 /// `<owner>/<repository>/` directory, the files
-/// [`crate::ledger::Ledger::entries`] reads. No other fork's directory is
+/// [`crate::ledger::Ledger::read`] reads. No other fork's directory is
 /// read, however the root is shared.
 /// "Carried" counts every ref under `refs/knives/` and `refs/knives-remotes/`,
 /// so an entry materialised from a peer is not committed again as this

@@ -188,7 +188,7 @@ fn sync_records_one_event_for_each_pull_request_that_moved() {
     assert_eq!(report.rows.len(), 4, "was: {report:?}");
 
     // Then: exactly the moved pulls are events, each under the tracked branch.
-    let entries = ledger.entries().expect("read ledger");
+    let entries = ledger.read().expect("read ledger").entries;
     let recorded: Vec<(Option<&str>, &str)> = entries
         .iter()
         .map(|entry| (entry.subject.as_deref(), entry.text.as_str()))
@@ -254,7 +254,7 @@ fn sync_records_a_settled_pull_request_once_across_repeated_runs() {
     .expect("second sync");
 
     // Then: its settled transition remains one fact, not one fact per sync run.
-    let entries = ledger.entries().expect("read ledger");
+    let entries = ledger.read().expect("read ledger").entries;
     assert_eq!(
         entries
             .iter()
@@ -314,7 +314,7 @@ fn sync_records_an_advanced_pull_request_then_its_merge() {
     .expect("merged sync");
 
     // Then: both distinct transitions remain in the ledger in observation order.
-    let entries = ledger.entries().expect("read ledger");
+    let entries = ledger.read().expect("read ledger").entries;
     assert_eq!(
         entries
             .iter()
@@ -374,7 +374,7 @@ fn sync_records_each_consecutive_advance() {
     .expect("second advance");
 
     // Then: both changed heads are recorded as distinct advances.
-    let entries = ledger.entries().expect("read ledger");
+    let entries = ledger.read().expect("read ledger").entries;
     assert_eq!(
         entries
             .iter()

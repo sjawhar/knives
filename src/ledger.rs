@@ -594,13 +594,6 @@ impl Ledger {
         Ok(read)
     }
 
-    /// [`Ledger::read`]'s entries alone, for a caller that has reported what
-    /// that read finds wrong already (a release write refuses on it before
-    /// it reads again), or a test that asserts the entries.
-    pub fn entries(&self) -> Result<Vec<Entry>, LedgerError> {
-        Ok(self.read()?.entries)
-    }
-
     /// Each entry file in name order, beside what reading it gave: for a
     /// caller that has a use for the entries that do parse when one does
     /// not. Only listing the directory fails the call. An entry of a kind
@@ -1276,7 +1269,7 @@ mod tests {
             ))
             .unwrap();
 
-        let read = ledger.entries().unwrap();
+        let read = ledger.read().unwrap().entries;
         assert_eq!(read.len(), 2);
         assert_eq!(read[0].text, "first");
         assert_eq!(read[1].text, "second");
@@ -1290,7 +1283,7 @@ mod tests {
         // A repository nobody has notched is the normal case, not a failure.
         let dir = tempfile::tempdir().unwrap();
         let ledger = Ledger::at(dir.path().join("never-written"));
-        assert!(ledger.entries().unwrap().is_empty());
+        assert!(ledger.read().unwrap().entries.is_empty());
     }
 
     #[test]
@@ -1303,7 +1296,7 @@ mod tests {
         std::fs::write(&blocked, "not a directory").unwrap();
         let ledger = Ledger::at(blocked.join("a-repo"));
 
-        let error = ledger.entries().unwrap_err();
+        let error = ledger.read().unwrap_err();
         assert!(
             matches!(&error, LedgerError::Read { path: actual, .. } if actual.as_path() == ledger.path()),
             "was: {error}"
@@ -1323,7 +1316,7 @@ mod tests {
         };
         ledger.append(&bare).unwrap();
 
-        let read = ledger.entries().unwrap();
+        let read = ledger.read().unwrap().entries;
         assert_eq!(read[0].subject, None);
         assert_eq!(read[0].anchor, None);
         assert_eq!(read[0].pr, None);
@@ -1349,7 +1342,7 @@ mod tests {
         )
         .unwrap();
 
-        let read = Ledger::at(path).entries().unwrap();
+        let read = Ledger::at(path).read().unwrap().entries;
         assert_eq!(read.len(), 1);
         assert_eq!(read[0].kind, Kind::Event);
         assert_eq!(read[0].text, "claimed");
@@ -1364,7 +1357,7 @@ mod tests {
         let ledger = Ledger::at(dir.path().join("a-repo"));
         let text = "parked\nby the owner\n+++\nthat line is prose, not a fence";
         ledger.append(&entry(Some("feat/alpha"), text)).unwrap();
-        assert_eq!(ledger.entries().unwrap()[0].text, text);
+        assert_eq!(ledger.read().unwrap().entries[0].text, text);
     }
 
     #[test]
@@ -1381,7 +1374,7 @@ mod tests {
             ..entry(Some("feat/alpha"), "promised a follow-up")
         };
         ledger.append(&sneaky).unwrap();
-        assert_eq!(ledger.entries().unwrap()[0], sneaky);
+        assert_eq!(ledger.read().unwrap().entries[0], sneaky);
     }
 
     #[test]
@@ -1400,7 +1393,7 @@ mod tests {
         )
         .unwrap();
 
-        let error = Ledger::at(path).entries().unwrap_err();
+        let error = Ledger::at(path).read().unwrap_err();
         assert!(
             matches!(
                 &error,
@@ -1422,7 +1415,7 @@ mod tests {
         )
         .unwrap();
 
-        let error = Ledger::at(path).entries().unwrap_err();
+        let error = Ledger::at(path).read().unwrap_err();
         assert!(
             matches!(&error, LedgerError::Timestamp { ts, .. } if ts == "last tuesday"),
             "was: {error}"
@@ -1494,7 +1487,7 @@ mod tests {
                 ),
             )
             .unwrap();
-            let read = Ledger::at(path).entries();
+            let read = Ledger::at(path).read().map(|read| read.entries);
             assert!(read.is_ok(), "{kind} = {value:?}: {read:?}");
         }
     }
@@ -1678,7 +1671,7 @@ mod tests {
             .unwrap();
         std::fs::write(path.join(".20990101.md.swp"), "junk").unwrap();
 
-        let read = Ledger::at(path).entries().unwrap();
+        let read = Ledger::at(path).read().unwrap().entries;
         assert_eq!(read.len(), 1);
         assert_eq!(read[0].text, "fine");
     }
@@ -1693,7 +1686,7 @@ mod tests {
         ledger.append(&entry(Some("feat/alpha"), "fine")).unwrap();
         let _temporary = tempfile::NamedTempFile::new_in(path).unwrap();
 
-        let read = ledger.entries().unwrap();
+        let read = ledger.read().unwrap().entries;
         assert_eq!(read.len(), 1);
         assert_eq!(read[0].text, "fine");
     }
@@ -1713,7 +1706,7 @@ mod tests {
         std::os::unix::fs::symlink(&linked, path.join("20990101T000000.000000000Z-0000.md"))
             .unwrap();
 
-        let read = ledger.entries().unwrap();
+        let read = ledger.read().unwrap().entries;
         assert_eq!(read.len(), 1);
         assert_eq!(read[0].text, "fine");
     }
@@ -1807,7 +1800,7 @@ mod tests {
             ))
             .unwrap();
 
-        let read = ledger.entries().unwrap();
+        let read = ledger.read().unwrap().entries;
         assert_eq!(read[0].text, "earlier");
         assert_eq!(read[1].text, "later");
 
@@ -1879,7 +1872,7 @@ mod tests {
 
         let files = std::fs::read_dir(&path).unwrap().count();
         assert_eq!(files, WRITERS * EACH, "every append is its own file");
-        let entries = Ledger::at(path).entries().unwrap();
+        let entries = Ledger::at(path).read().unwrap().entries;
         assert_eq!(entries.len(), WRITERS * EACH, "every file parses");
         for writer in 0..WRITERS {
             for index in 0..EACH {
@@ -2052,8 +2045,9 @@ mod tests {
         }
         let texts: Vec<String> = scribe
             .ledger
-            .entries()
+            .read()
             .unwrap()
+            .entries
             .into_iter()
             .map(|entry| entry.text)
             .collect();
@@ -2092,7 +2086,7 @@ mod tests {
             written.ts
         );
         // And: it is on disk, not just returned.
-        assert_eq!(scribe.ledger.entries().unwrap(), vec![written]);
+        assert_eq!(scribe.ledger.read().unwrap().entries, vec![written]);
     }
 
     #[test]
@@ -2125,7 +2119,7 @@ mod tests {
             text.contains("email = \"writer@example.test\""),
             "was: {text}"
         );
-        assert_eq!(scribe.ledger.entries().unwrap(), vec![written]);
+        assert_eq!(scribe.ledger.read().unwrap().entries, vec![written]);
 
         // And: an entry with no address writes no email field, and reads
         // back as none, as every entry written before the field does.
@@ -2135,7 +2129,7 @@ mod tests {
         plain.append(&bare).unwrap();
         let text = std::fs::read_to_string(only_file(plain.path())).unwrap();
         assert!(!text.contains("email"), "was: {text}");
-        assert_eq!(plain.entries().unwrap(), vec![bare]);
+        assert_eq!(plain.read().unwrap().entries, vec![bare]);
     }
 
     #[test]
@@ -2205,7 +2199,7 @@ mod tests {
             ..entry(Some("feat/alpha"), "split into a plugin")
         };
         ledger.append(&disposition).unwrap();
-        assert_eq!(ledger.entries().unwrap(), vec![disposition]);
+        assert_eq!(ledger.read().unwrap().entries, vec![disposition]);
 
         let plain_dir = tempfile::tempdir().unwrap();
         let plain = Ledger::at(plain_dir.path().join("a-repo"));
@@ -2231,7 +2225,7 @@ mod tests {
             ..entry(Some("feat/alpha"), "stated as #1234")
         };
         ledger.append(&stated).unwrap();
-        assert_eq!(ledger.entries().unwrap(), vec![stated]);
+        assert_eq!(ledger.read().unwrap().entries, vec![stated]);
         let text = std::fs::read_to_string(only_file(ledger.path())).unwrap();
         assert!(
             text.contains("\nstatement = { kind = \"pull\", value = \"1234\" }\n"),
@@ -2249,7 +2243,7 @@ mod tests {
             ..entry(Some("feat/alpha"), "pull request statement forgotten")
         };
         forget_ledger.append(&forget).unwrap();
-        assert_eq!(forget_ledger.entries().unwrap(), vec![forget]);
+        assert_eq!(forget_ledger.read().unwrap().entries, vec![forget]);
         let text = std::fs::read_to_string(only_file(forget_ledger.path())).unwrap();
         assert!(
             text.contains("\nstatement = { kind = \"pull\" }\n"),
@@ -2273,7 +2267,7 @@ mod tests {
             ..entry(Some("feat/alpha"), "superseded by feat/alpha-v2")
         };
         sectioned_ledger.append(&sectioned).unwrap();
-        assert_eq!(sectioned_ledger.entries().unwrap(), vec![sectioned]);
+        assert_eq!(sectioned_ledger.read().unwrap().entries, vec![sectioned]);
 
         let plain_dir = tempfile::tempdir().unwrap();
         let plain = Ledger::at(plain_dir.path().join("a-repo"));
@@ -2306,7 +2300,7 @@ mod tests {
             ..entry(Some("release/2026-08-04"), "cut release/2026-08-04")
         };
         ledger.append(&cut).unwrap();
-        assert_eq!(ledger.entries().unwrap(), vec![cut]);
+        assert_eq!(ledger.read().unwrap().entries, vec![cut]);
 
         let plain_dir = tempfile::tempdir().unwrap();
         let plain = Ledger::at(plain_dir.path().join("a-repo"));

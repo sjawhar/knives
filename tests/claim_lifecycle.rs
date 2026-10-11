@@ -837,8 +837,9 @@ fn forced_finish_with_supersession_writes_one_atomic_provenance_event() {
     // Then: one durable event proves both facts, so no second append can strand a false release.
     assert!(finished.status.success(), "{finished:?}");
     let entries = knives::ledger::Ledger::at(home.path().join("ledger").join("demo"))
-        .entries()
-        .expect("read ledger");
+        .read()
+        .expect("read ledger")
+        .entries;
     assert_eq!(entries.len(), 2, "was: {entries:?}");
     let event = &entries[1].text;
     assert!(

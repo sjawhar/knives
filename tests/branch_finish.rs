@@ -69,7 +69,7 @@ fn starting_and_finishing_a_branch_leaves_its_reason_in_the_ledger() {
     // base revision and does not create a bookmark, so only the Scribe may decide
     // whether a ref anchor exists; here it correctly records none.
     let ledger = knives::ledger::Ledger::at(home.path().join("ledger").join("demo"));
-    let entries = ledger.entries().expect("read ledger");
+    let entries = ledger.read().expect("read ledger").entries;
     assert_eq!(entries.len(), 1, "was: {entries:?}");
     assert_eq!(entries[0].kind, knives::ledger::Kind::Event);
     assert_eq!(entries[0].owner, "ses_fff688");
@@ -102,7 +102,7 @@ fn starting_and_finishing_a_branch_leaves_its_reason_in_the_ledger() {
     );
 
     // Then: the supersession is recorded as an event rather than only as state
-    let entries = ledger.entries().expect("read ledger");
+    let entries = ledger.read().expect("read ledger").entries;
     assert_eq!(entries.len(), 2, "was: {entries:?}");
     assert_eq!(
         entries[1].text,
@@ -256,8 +256,9 @@ fn finish_releases_without_consulting_the_forge() {
         "the stated pull request did not survive the release"
     );
     let entries = knives::ledger::Ledger::at(home.path().join("ledger").join("demo"))
-        .entries()
-        .expect("read ledger");
+        .read()
+        .expect("read ledger")
+        .entries;
     assert_eq!(
         entries.last().map(|entry| (entry.text.as_str(), entry.pr)),
         Some(("claim released", Some(7))),
@@ -485,8 +486,9 @@ fn finishing_a_held_branch_without_a_successor_records_only_the_release() {
     assert!(finished.status.success());
 
     let entries = knives::ledger::Ledger::at(home.path().join("ledger").join("demo"))
-        .entries()
-        .expect("read ledger");
+        .read()
+        .expect("read ledger")
+        .entries;
     assert_eq!(entries.len(), 1, "was: {entries:?}");
     assert_eq!(entries[0].text, "claim released");
     assert_eq!(entries[0].statement, None, "a plain release states nothing");
@@ -511,8 +513,9 @@ fn finishing_a_branch_nobody_held_records_no_release_that_never_happened() {
     );
 
     let entries = knives::ledger::Ledger::at(home.path().join("ledger").join("demo"))
-        .entries()
-        .expect("read ledger");
+        .read()
+        .expect("read ledger")
+        .entries;
     assert!(
         entries.is_empty(),
         "a release that never happened: {entries:?}"
@@ -536,8 +539,9 @@ fn finishing_an_unheld_branch_still_records_the_supersession_it_did_record() {
     assert!(finished.status.success());
 
     let entries = knives::ledger::Ledger::at(home.path().join("ledger").join("demo"))
-        .entries()
-        .expect("read ledger");
+        .read()
+        .expect("read ledger")
+        .entries;
     assert_eq!(entries.len(), 1, "was: {entries:?}");
     assert_eq!(entries[0].text, "superseded by feat/replacement");
     assert_eq!(
@@ -603,8 +607,9 @@ fn stating_a_pull_request_and_a_dependency_leaves_both_statements_in_the_ledger(
     // typed by the sibling's registry key is recorded under its repository's
     // `<owner>/<name>`, so it names the same fork on every machine.
     let entries = knives::ledger::Ledger::at(home.path().join("ledger").join("demo"))
-        .entries()
-        .expect("read ledger");
+        .read()
+        .expect("read ledger")
+        .entries;
     let texts: Vec<&str> = entries.iter().map(|entry| entry.text.as_str()).collect();
     assert_eq!(
         texts,
@@ -690,8 +695,9 @@ fn a_fork_only_statement_is_recorded_as_the_decision_it_is() {
     assert!(output.status.success());
 
     let entries = knives::ledger::Ledger::at(home.path().join("ledger").join("demo"))
-        .entries()
-        .expect("read ledger");
+        .read()
+        .expect("read ledger")
+        .entries;
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].text, "stated as having no upstream pull request");
     assert_eq!(
@@ -730,8 +736,9 @@ fn a_stated_pull_request_lives_on_the_ledger_and_status_shows_it() {
 
     // Then: one ledger entry says so in prose and states it as data
     let entries = knives::ledger::Ledger::at(home.path().join("ledger").join("demo"))
-        .entries()
-        .expect("read ledger");
+        .read()
+        .expect("read ledger")
+        .entries;
     assert_eq!(entries.len(), 1, "was: {entries:?}");
     assert_eq!(entries[0].text, "stated as #1234");
     assert_eq!(

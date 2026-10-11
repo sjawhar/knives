@@ -439,8 +439,9 @@ fn a_fixed_cut_with_a_published_unrecorded_composition_records_instead_of_refusi
     assert_eq!(commit_at(&lab, "integration"), published);
     assert_eq!(commit_at(&lab, "integration@origin"), published);
     let entries = knives::ledger::Ledger::at(home.path().join("ledger").join("demo"))
-        .entries()
-        .expect("read ledger");
+        .read()
+        .expect("read ledger")
+        .entries;
     let cut = entries
         .iter()
         .rev()
@@ -524,8 +525,9 @@ fn a_fixed_cut_records_a_published_composition_that_has_no_recorded_cut_yet() {
     );
     assert_eq!(commit_at(&lab, "integration@origin"), published);
     let entries = knives::ledger::Ledger::at(ledger_dir)
-        .entries()
-        .expect("read ledger");
+        .read()
+        .expect("read ledger")
+        .entries;
     let cut = entries
         .iter()
         .rev()

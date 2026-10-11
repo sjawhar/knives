@@ -574,9 +574,12 @@ fn migrate_repo(
     statements: &[(String, LegacyStatement)],
     migrated: &mut Migrated,
 ) {
+    // An entry or statement this knives reads only in part states nothing
+    // here, so it neither carries nor contradicts a statement being moved;
+    // every report of the fork names it.
     let read = std::iter::once(scribe.ledger().clone())
         .chain(moved_in.iter().map(|path| Ledger::at(path.clone())))
-        .map(|ledger| ledger.entries())
+        .map(|ledger| ledger.read().map(|read| read.entries))
         .collect::<Result<Vec<_>, _>>();
     let entries: Vec<_> = match read {
         Ok(entries) => entries.into_iter().flatten().collect(),

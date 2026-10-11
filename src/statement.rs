@@ -140,7 +140,7 @@ impl Statements {
     /// forget, or that forget when nothing is newer. An entry without a subject
     /// is about the repository, not a branch, and states nothing here; neither
     /// does a kind this knives does not know ([`StatementKind::Unknown`]).
-    /// Every entry [`crate::ledger::Ledger::entries`] returns has a parseable
+    /// Every entry [`crate::ledger::Ledger::read`] returns has a parseable
     /// stamp; a hand-built entry whose stamp does not parse orders before
     /// every one that does.
     pub fn from_entries(entries: &[Entry]) -> Self {

@@ -397,6 +397,54 @@ fn an_unreadable_ledger_is_incomplete_and_an_unknown_repo_is_usage() {
 }
 
 #[test]
+fn a_verify_past_an_entry_it_cannot_read_is_incomplete_and_names_it() {
+    // Given: a note, and an entry of a kind a newer knives writes.
+    let checkout = checkout();
+    let home = home();
+    let wrote = knives(
+        &home,
+        &checkout,
+        checkout.path(),
+        &["--text", "notch", "--repo", "a-repo", "-m", "a note"],
+    );
+    assert!(wrote.status.success(), "{}", stdout(&wrote));
+    let unknown = "20990101T000000.000000000Z-0000.md";
+    std::fs::write(
+        home.path().join("ledger").join(LEDGER).join(unknown),
+        "+++\nts = \"2099-01-01T00:00:00Z\"\nowner = \"x\"\nkind = \"verdict\"\n+++\nv\n",
+    )
+    .expect("an entry of an unknown kind");
+
+    for format in ["--json", "--text"] {
+        // When: the ledger's evidence is verified.
+        let verified = knives(
+            &home,
+            &checkout,
+            checkout.path(),
+            &[format, "notch", "--repo", "a-repo", "--verify"],
+        );
+
+        // Then: it did not check everything, and says which file it passed.
+        let out = stdout(&verified);
+        assert_eq!(verified.status.code(), Some(3), "{format}: {out}");
+        assert!(out.contains(unknown), "{format}: {out}");
+    }
+    let verified = knives(
+        &home,
+        &checkout,
+        checkout.path(),
+        &["--json", "notch", "--repo", "a-repo", "--verify"],
+    );
+    let report: serde_json::Value = serde_json::from_slice(&verified.stdout).expect("JSON");
+    assert_eq!(report["checked"], 1, "{report}");
+    assert_eq!(
+        report["problems"].as_array().map(Vec::len),
+        Some(1),
+        "{report}"
+    );
+}
+
+#[test]
 fn only_a_note_about_a_branch_reads_the_ledger_for_its_stated_pull_request() {
     // Given: a ledger holding a file that is not an entry
     let checkout = checkout();

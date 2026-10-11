@@ -69,8 +69,11 @@ An anchor preserves the decision's context. `notch --verify` tests selected
 commit-shaped evidence and anchors against visible commits and local bookmark
 tips. It flags missing evidence, vanished anchors and anchors that no longer
 match the local subject tip. It never edits an entry or invalidates its historical
-judgment automatically. Do not transcribe state a detector can compute: the
-ledger holds events and decisions, not another state cache.
+judgment automatically. An entry it cannot read (one of a kind this knives does
+not know, or a misnamed file) is checked by nothing, so the report names it under
+`problems` and exits `3`, which outranks the `1` a flag gives. Do not transcribe
+state a detector can compute: the ledger holds events and decisions, not another
+state cache.
 
 ## Automatic entries
 
@@ -150,8 +153,9 @@ statement it cannot read in full states nothing: a kind it does not know, a
 field other than `kind` and `value`, or a value its kind cannot hold (a
 `pull` that is not a decimal number, a `depends` part that is not
 `<owner>/<name>#<number>`). Each is a problem naming the file in `status`,
-`notch`, `audit`, `pushed`, `sync` and every release command, which exit `3`
-and keep answering from the rest; a release write refuses on it. Read
+`notch` (a read or `--verify`), `audit`, `pushed`, `sync` and every release
+command, which exit `3` and keep answering from the rest; a release write
+refuses on it. Read
 anyway, a part of it could let an older statement, or a shorter list, read as
 live. No write of this knives produces either.
 

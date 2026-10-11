@@ -429,10 +429,11 @@ impl Transitions<'_> {
             // Read here, not taken from the store's read at open: this runs
             // after the forge calls, seconds later, and an entry a concurrent
             // sweep delivered from a peer meanwhile is what stops this
-            // transition being written twice.
+            // transition being written twice. What this read finds wrong the
+            // report already carries, from the store's read of the same files.
             let history = match &mut self.history {
                 Some(history) => history,
-                None => self.history.insert(scribe.ledger().entries()?),
+                None => self.history.insert(scribe.ledger().read()?.entries),
             };
             if !holds_transition(history, transition.number, pr, &text) {
                 history.push(scribe.event(subject.as_deref(), text, pr)?);
@@ -1746,7 +1747,7 @@ mod comment_activity_tests {
             "was: {report:?}"
         );
         assert!(
-            ledger.entries().unwrap().is_empty(),
+            ledger.read().unwrap().entries.is_empty(),
             "a first sighting must not write a ledger event"
         );
         assert_eq!(store.pull_state(&repo_name, 42), Some("MERGED"));
@@ -1804,7 +1805,7 @@ mod comment_activity_tests {
             "was: {report:?}"
         );
         assert!(
-            ledger.entries().unwrap().is_empty(),
+            ledger.read().unwrap().entries.is_empty(),
             "a settled pull that repeats settled must not write a second event"
         );
     }
@@ -1861,7 +1862,7 @@ mod comment_activity_tests {
             Some(&PullState::Merged),
             "was: {report:?}"
         );
-        let events = ledger.entries().unwrap();
+        let events = ledger.read().unwrap().entries;
         assert_eq!(events.len(), 1, "was: {events:?}");
         assert_eq!(
             events.first().map(|event| event.text.as_str()),
@@ -2013,7 +2014,7 @@ mod comment_activity_tests {
         );
         assert_eq!(store.pull_state(&repo_name, 42), Some("CLOSED"));
         assert_eq!(store.pull_state(&repo_name, 43), Some("OPEN"));
-        let events = ledger.entries().unwrap();
+        let events = ledger.read().unwrap().entries;
         assert_eq!(
             events
                 .iter()
@@ -2064,7 +2065,7 @@ mod comment_activity_tests {
             "was: {report:?}"
         );
         assert_eq!(store.pull_state(&repo_name, 42), Some("MERGED"));
-        let events = ledger.entries().unwrap();
+        let events = ledger.read().unwrap().entries;
         assert_eq!(
             events.first().map(|event| event.text.as_str()),
             Some("#42 merged"),

@@ -60,8 +60,9 @@ fn report(output: &Output) -> serde_json::Value {
 
 fn entries(home: &Path, repo: &str) -> Vec<Entry> {
     Ledger::at(home.join("ledger").join(repo))
-        .entries()
+        .read()
         .expect("read the ledger")
+        .entries
 }
 
 /// Each statement entry in `entries` as `(subject, kind, value)`.
