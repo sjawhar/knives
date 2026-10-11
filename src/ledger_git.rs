@@ -69,6 +69,68 @@ pub struct Materialised {
     /// Entries the refs carry that the root lacks, in a fork this repository
     /// carries, that do not parse as an entry, and so were not written.
     pub unreadable: Vec<Unreadable>,
+    /// Paths in a fork this repository carries whose contents the refs, or
+    /// the refs and the file already here, do not agree on, and so where
+    /// nothing was written.
+    pub conflicts: Vec<Conflict>,
+}
+
+impl Materialised {
+    /// Each entry the refs carry in a fork this repository carries that
+    /// this pull did not write, with its path under the root, as a problem
+    /// to report: one that does not parse, and one whose contents disagree.
+    pub fn unwritten(&self) -> impl Iterator<Item = (&Path, String)> {
+        self.unreadable
+            .iter()
+            .map(|unreadable| (unreadable.path.as_path(), unreadable.to_string()))
+            .chain(
+                self.conflicts
+                    .iter()
+                    .map(|conflict| (conflict.path.as_path(), conflict.to_string())),
+            )
+    }
+}
+
+/// A path [`materialise`] wrote nothing at because what is there does not
+/// agree: two machines' refs carry different blobs at it, or a ref carries a
+/// blob the file already here does not hash to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Conflict {
+    /// Where under the ledger root it is.
+    pub path: PathBuf,
+    /// Every machine whose ref carries the path, whatever it holds there.
+    pub machines: Vec<String>,
+    /// Whether this machine has a file at the path, which is left as it is.
+    pub present: bool,
+}
+
+impl std::fmt::Display for Conflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut sources: Vec<String> = Vec::new();
+        if self.present {
+            sources.push("the file here".to_owned());
+        }
+        sources.extend(
+            self.machines
+                .iter()
+                .map(|machine| format!("{OWN}{machine}")),
+        );
+        let sources = match sources.split_last() {
+            Some((last, rest)) if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),
+            _ => sources.concat(),
+        };
+        write!(
+            f,
+            "{} differs between {sources}, so a pull writes nothing there{}; every pull \
+             checks it again",
+            self.path.display(),
+            if self.present {
+                " and leaves the file here as it is"
+            } else {
+                ""
+            }
+        )
+    }
 }
 
 /// A peer's entry [`materialise`] did not write because it does not parse
@@ -314,7 +376,7 @@ pub fn commit_pending(
     if added.is_empty() {
         return Ok(None);
     }
-    let blobs = hash_objects(repository, &added)?;
+    let blobs = hash_objects(repository, added.iter().map(PathBuf::as_path), true)?;
     let tree = write_tree(repository, base, added.into_iter().zip(blobs))?;
     let commit = commit_tree(repository, machine, &tree, previous.as_ref())?;
     run(repository.git().args([
@@ -619,7 +681,7 @@ pub fn local_config(git_dir: &Path, pattern: &str) -> Result<Vec<(String, String
 }
 
 /// Write every entry `refs` carry, in a fork `repository` carries, that the
-/// ledger root lacks and that parses.
+/// ledger root lacks, that every ref carrying it agrees on, and that parses.
 ///
 /// Each entry is written whole to a temporary name and renamed into place,
 /// never over a file already there; see [`write_entry`]. A tree item that is
@@ -641,35 +703,39 @@ pub fn local_config(git_dir: &Path, pattern: &str) -> Result<Vec<(String, String
 /// rewritten, so deleting it would only have the next pull write it back.
 /// Left out, it is checked again at every pull, so a knives that can read it
 /// writes it then.
+///
+/// Two refs carrying different blobs at one path, or a ref whose blob at a
+/// path differs from what is already there, write nothing at that path, and
+/// it is named with every machine whose ref carries it in
+/// [`Materialised::conflicts`]: otherwise whichever blob came first would
+/// win by the order the refs are listed in, and a file already there is
+/// never replaced. A regular file there is compared by the blob id git gives
+/// its exact bytes; anything else there differs from every blob. Two refs
+/// carrying one blob at a path carry one entry.
 pub fn materialise(repository: &Repository, refs: &[MachineRef]) -> Result<Materialised, GitError> {
-    let mut missing: BTreeMap<PathBuf, (ObjectId, &str)> = BTreeMap::new();
-    let mut unread = BTreeSet::new();
+    let mut carried: BTreeMap<PathBuf, Vec<(ObjectId, &str)>> = BTreeMap::new();
+    let mut uncarried = BTreeSet::new();
     for machine_ref in refs {
         for item in tree_items(repository, &machine_ref.commit)? {
             if item.mode == Mode::Tree {
                 continue;
             }
             check_entry(&machine_ref.commit, &item)?;
-            if missing.contains_key(&item.path) || unread.contains(&item.path) {
-                continue;
-            }
-            let path = repository.work_tree.join(&item.path);
-            let present = path.try_exists().map_err(|source| GitError::Read {
-                path: path.clone(),
-                source,
-            })?;
-            if present {
-                continue;
-            }
             if repository.carries_entry(&item.path) {
-                missing.insert(item.path, (item.oid, machine_ref.machine.as_str()));
+                carried
+                    .entry(item.path)
+                    .or_default()
+                    .push((item.oid, machine_ref.machine.as_str()));
             } else {
-                unread.insert(item.path);
+                uncarried.insert(item.path);
             }
         }
     }
     let mut done = Materialised::default();
-    for path in unread {
+    for path in uncarried {
+        if occupant(repository, &path)? != Occupant::Nothing {
+            continue;
+        }
         let fork: PathBuf = path.parent().into_iter().flatten().take(2).collect();
         let fork = if fork.as_os_str().is_empty() {
             ".".to_owned()
@@ -677,6 +743,41 @@ pub fn materialise(repository: &Repository, refs: &[MachineRef]) -> Result<Mater
             fork.display().to_string()
         };
         *done.skipped.entry(fork).or_default() += 1;
+    }
+    let mut missing: BTreeMap<PathBuf, (ObjectId, &str)> = BTreeMap::new();
+    let mut here: Vec<(PathBuf, ObjectId, Vec<String>)> = Vec::new();
+    for (path, carriers) in carried {
+        let Some((oid, machine)) = carriers.first() else {
+            continue;
+        };
+        let agreed = carriers.iter().all(|(other, _)| other == oid);
+        match (agreed, occupant(repository, &path)?) {
+            (true, Occupant::Nothing) => {
+                missing.insert(path, (oid.clone(), *machine));
+            }
+            (true, Occupant::File) => here.push((path, oid.clone(), machines(&carriers))),
+            (_, occupant) => done.conflicts.push(Conflict {
+                path,
+                machines: machines(&carriers),
+                present: occupant != Occupant::Nothing,
+            }),
+        }
+    }
+    if !here.is_empty() {
+        let ids = hash_objects(
+            repository,
+            here.iter().map(|(path, _, _)| path.as_path()),
+            false,
+        )?;
+        for ((path, oid, machines), id) in here.into_iter().zip(ids) {
+            if id != oid {
+                done.conflicts.push(Conflict {
+                    path,
+                    machines,
+                    present: true,
+                });
+            }
+        }
     }
     if missing.is_empty() {
         return Ok(done);
@@ -707,6 +808,35 @@ pub fn materialise(repository: &Repository, refs: &[MachineRef]) -> Result<Mater
         }
     }
     Ok(done)
+}
+
+/// The machines whose refs carry a path, in the order the refs are listed.
+fn machines(carriers: &[(ObjectId, &str)]) -> Vec<String> {
+    carriers
+        .iter()
+        .map(|(_, machine)| (*machine).to_owned())
+        .collect()
+}
+
+/// What is at an entry's path in the ledger root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Occupant {
+    Nothing,
+    /// A regular file, which may hold the very entry a ref carries.
+    File,
+    /// A directory, a symlink or anything else: never an entry.
+    Other,
+}
+
+/// What is at `relative` under `repository`'s root, a symlink not followed.
+fn occupant(repository: &Repository, relative: &Path) -> Result<Occupant, GitError> {
+    let path = repository.work_tree.join(relative);
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.is_file() => Ok(Occupant::File),
+        Ok(_) => Ok(Occupant::Other),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(Occupant::Nothing),
+        Err(source) => Err(GitError::Read { path, source }),
+    }
 }
 
 /// A name in a tree being written ([`write_tree`]).
@@ -876,25 +1006,34 @@ fn local_entries(repository: &Repository) -> Result<BTreeSet<PathBuf>, GitError>
     Ok(found)
 }
 
-/// Write each file at `paths` (relative to `repo_dir`) into the object store,
-/// returning the blob ids in the same order.
+/// The blob id of each file at `paths` (relative to the root), in the same
+/// order, written into the object store when `write` is set.
 ///
 /// `--no-filters`, so a blob is the file's exact bytes whatever
-/// `.gitattributes` says, and a peer materialises it byte for byte.
-fn hash_objects(
+/// `.gitattributes` says, and a peer materialises it byte for byte; a file
+/// compared against a peer's blob is hashed the same way, so the same bytes
+/// give the same id.
+fn hash_objects<'a>(
     repository: &Repository,
-    paths: &BTreeSet<PathBuf>,
+    paths: impl IntoIterator<Item = &'a Path>,
+    write: bool,
 ) -> Result<Vec<ObjectId>, GitError> {
     let mut input = Vec::new();
+    let mut count = 0;
     for path in paths {
         push_quoted(&mut input, path);
         input.push(b'\n');
+        count += 1;
     }
     let mut command = repository.git();
-    command.args(["hash-object", "-w", "--no-filters", "--stdin-paths"]);
+    command.arg("hash-object");
+    if write {
+        command.arg("-w");
+    }
+    command.args(["--no-filters", "--stdin-paths"]);
     let answer = run_with_input(&mut command, &input)?;
     let ids = object_ids(&command, &answer)?;
-    if ids.len() == paths.len() {
+    if ids.len() == count {
         Ok(ids)
     } else {
         Err(output_error(&command, "one blob id per path"))

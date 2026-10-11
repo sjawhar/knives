@@ -634,11 +634,12 @@ pub struct Tally {
     /// By fork, the discards not yet in the [`sweep_record`].
     #[serde(skip)]
     unkept: BTreeMap<String, usize>,
-    /// Each peer entry the sweep's last pull could not read
-    /// ([`ledger_git::Materialised::unreadable`]), as a problem: one of the
-    /// sweep's problems, never a failure of the pass.
+    /// Each peer entry the sweep's last pull did not write
+    /// ([`ledger_git::Materialised::unwritten`]): one it could not read, or
+    /// one whose contents disagree. A problem of the sweep, never a failure
+    /// of the pass.
     #[serde(skip)]
-    unreadable: Vec<String>,
+    unwritten: Vec<String>,
     #[serde(skip)]
     failed: bool,
 }
@@ -668,7 +669,7 @@ impl Tally {
             discarded: 0,
             skipped: None,
             unkept: BTreeMap::new(),
-            unreadable: Vec::new(),
+            unwritten: Vec::new(),
             failed: false,
         }
     }
@@ -759,8 +760,8 @@ pub fn run(root: &Path, contended: Contended) -> Result<Swept, SweepError> {
 /// back for it, or the sweep that took the lock in between carries it.
 ///
 /// Each [`Destinations::unreached`] fork, each [`Destinations::unclaimed`]
-/// directory and each peer entry the last pull through a destination could
-/// not read ([`ledger_git::Materialised::unreadable`]) is one of the sweep's
+/// directory and each peer entry the last pull through a destination did not
+/// write ([`ledger_git::Materialised::unwritten`]) is one of the sweep's
 /// problems, so it is in the [`sweep_log`] until it is fixed. What the
 /// passes discarded and left unread goes to the [`sweep_record`] before the
 /// lock is let go.
@@ -784,10 +785,10 @@ pub fn sweep(
         .chain(unclaimed.iter().cloned())
         .collect();
     let mut tallies: Vec<Tally> = found.iter().map(Tally::of).collect();
-    let unreadable = |tallies: &[Tally]| -> Vec<String> {
+    let unwritten = |tallies: &[Tally]| -> Vec<String> {
         tallies
             .iter()
-            .flat_map(|tally| tally.unreadable.iter().cloned())
+            .flat_map(|tally| tally.unwritten.iter().cloned())
             .collect()
     };
     let (mut next, waited) = match contended {
@@ -821,7 +822,7 @@ pub fn sweep(
             problems.push(error.to_string());
         }
         let mut recorded = problems.clone();
-        recorded.extend(unreadable(&tallies));
+        recorded.extend(unwritten(&tallies));
         record(root, &recorded)?;
         drop(lock);
         if !anything_new(found, &mut tallies, &mut problems) {
@@ -830,7 +831,7 @@ pub fn sweep(
         next = FileLock::try_acquire(root)?;
     }
     Ok(if held {
-        problems.extend(unreadable(&tallies));
+        problems.extend(unwritten(&tallies));
         Swept::Ran {
             tallies,
             problems,
@@ -862,12 +863,11 @@ fn pass(destination: &Destination, tally: &mut Tally) -> Vec<String> {
     let (done, pulled) = pull_held(destination);
     if let Some(done) = done {
         tally.pulled += done.written;
-        tally.skipped = Some(done.skipped);
-        tally.unreadable = done
-            .unreadable
-            .iter()
-            .map(|unreadable| format!("{}: {unreadable}", destination.describe()))
+        tally.unwritten = done
+            .unwritten()
+            .map(|(_, problem)| format!("{}: {problem}", destination.describe()))
             .collect();
+        tally.skipped = Some(done.skipped);
     }
     let mut failures: Vec<String> = pulled.into_iter().map(failed).collect();
     match send(destination, tally) {
@@ -1139,8 +1139,9 @@ pub fn pull(forks: &[&UpstreamName]) -> Pulled {
 /// sweep reads what the sweep left rather than failing on it. A failure is a
 /// problem for every fork asked about that the destination carries, never an
 /// error: the command still answers from the entries this machine has. So
-/// is each peer entry the pull could not read
-/// ([`ledger_git::Materialised::unreadable`]), for the fork it is in; a fork
+/// is each peer entry the pull did not write, because it could not read it
+/// or its contents disagree ([`ledger_git::Materialised::unwritten`]), for
+/// the fork it is in; a fork
 /// asked about whose registry entry names a repository its ledger belongs
 /// to that no destination here is ([`Destinations::unreached`]); and every
 /// directory of entries no fork is kept under ([`Destinations::unclaimed`]),
@@ -1184,16 +1185,13 @@ pub fn pull_at(root: &Path, forks: &[&UpstreamName]) -> Pulled {
         }
         let (done, failures) = pull_one(&destination);
         if let Some(done) = done {
-            for unreadable in &done.unreadable {
-                if let Some(fork) = carried
-                    .iter()
-                    .find(|fork| unreadable.path.starts_with(fork.as_str()))
-                {
+            for (path, problem) in done.unwritten() {
+                if let Some(fork) = carried.iter().find(|fork| path.starts_with(fork.as_str())) {
                     pulled
                         .problems
                         .entry((*fork).clone())
                         .or_default()
-                        .push(format!("{}: {unreadable}", destination.describe()));
+                        .push(format!("{}: {problem}", destination.describe()));
                 }
             }
             pulled.skipped.insert(destination.describe(), done.skipped);

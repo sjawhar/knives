@@ -158,6 +158,14 @@ parse is left out and names the machine whose ref carries it and its path, as a
 problem of that fork's report and of the sweep; every pull checks it again, so a
 knives that can read it writes it then.
 
+A pull also writes nothing at a path whose contents do not agree: two
+machines' refs carrying different blobs there, or a ref carrying a blob that
+differs from the file already here. It names the path and every
+`refs/knives/<machine>` that carries it, as a problem in the same places, and
+leaves a file already here as it is. A file here is compared by the git blob id
+of its exact bytes, so the same contents on every side is no problem, and
+neither are two refs carrying the same blob.
+
 ## Upgrading from an older knives
 
 An older knives kept branch statements in `state.json` (`tracked_pulls`,

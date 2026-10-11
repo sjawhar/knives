@@ -1946,6 +1946,126 @@ fn a_peer_entry_that_does_not_parse_is_kept_out_and_named_on_every_pull() {
     }
 }
 
+/// A valid entry about the lab fork's `feat/alpha` reading `text`, as a peer
+/// would send it.
+fn peer_entry(text: &str) -> String {
+    format!(
+        "+++\nts = \"2026-10-11T12:00:00Z\"\nowner = \"ses_peer\"\nsubject = \"feat/alpha\"\n\
+         kind = \"note\"\n+++\n{text}\n"
+    )
+}
+
+/// `home`'s sweep report, with its exit code.
+fn sweep_report(home: &Path) -> (Option<i32>, serde_json::Value) {
+    let swept = sweep(home);
+    let report = serde_json::from_slice(&swept.stdout).unwrap_or_else(|error| {
+        panic!(
+            "the sweep emits JSON ({error}): {}",
+            String::from_utf8_lossy(&swept.stderr)
+        )
+    });
+    (swept.status.code(), report)
+}
+
+#[test]
+fn two_peers_carrying_different_entries_at_one_path_write_neither_and_say_so() {
+    // Given: two peers' refs carry different entries under one file name.
+    let lab = lab::Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let beta = shared_home(&lab);
+    let (_remote_dir, remote) = bare_remote();
+    share(beta.path(), "beta", &remote);
+    let path = format!("{FORK}/20261011T120000.000000000Z-0000.md");
+    push_as_peer(&remote, "alpha", &path, &peer_entry("alpha's account"));
+    push_as_peer(&remote, "gamma", &path, &peer_entry("gamma's account"));
+    let on_disk = beta.path().join("ledger").join(&path);
+
+    // When: status pulls.
+    let (code, report) = status_on(&lab, beta.path());
+
+    // Then: neither entry is written, and the problem names the path and
+    // both refs that carry it.
+    assert_eq!(code, Some(3), "{report}");
+    let problems = problems_of(&report);
+    for named in [path.as_str(), "refs/knives/alpha", "refs/knives/gamma"] {
+        assert!(problems.contains(named), "{named} not named: {report}");
+    }
+    assert!(!on_disk.exists(), "one peer's entry was written");
+
+    // And: the sweep reports it too, and still writes neither.
+    let (code, report) = sweep_report(beta.path());
+    assert_eq!(code, Some(3), "{report}");
+    let problems = problems_of(&report);
+    for named in [path.as_str(), "refs/knives/alpha", "refs/knives/gamma"] {
+        assert!(problems.contains(named), "{named} not named: {report}");
+    }
+    assert!(!on_disk.exists(), "the sweep wrote one peer's entry");
+}
+
+#[test]
+fn a_peer_entry_that_differs_from_the_file_here_leaves_the_file_and_says_so() {
+    // Given: this machine has a file at an entry path, and a peer's ref
+    // carries different contents at that path.
+    let lab = lab::Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let beta = shared_home(&lab);
+    let (_remote_dir, remote) = bare_remote();
+    share(beta.path(), "beta", &remote);
+    let path = format!("{FORK}/20261011T120000.000000000Z-0000.md");
+    let on_disk = beta.path().join("ledger").join(&path);
+    std::fs::create_dir_all(on_disk.parent().expect("the fork's directory")).expect("mkdir");
+    let ours = peer_entry("this machine's account");
+    std::fs::write(&on_disk, &ours).expect("write this machine's file");
+    push_as_peer(&remote, "alpha", &path, &peer_entry("alpha's account"));
+
+    // When: status pulls.
+    let (code, report) = status_on(&lab, beta.path());
+
+    // Then: the mismatch is a problem naming the path and the ref, and the
+    // file here is left exactly as it was.
+    assert_eq!(code, Some(3), "{report}");
+    let problems = problems_of(&report);
+    for named in [path.as_str(), "refs/knives/alpha"] {
+        assert!(problems.contains(named), "{named} not named: {report}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(&on_disk).expect("read this machine's file"),
+        ours
+    );
+}
+
+#[test]
+fn two_peers_carrying_the_same_entry_at_one_path_write_it_once_and_say_nothing() {
+    // Given: two peers' refs carry the identical entry under one file name.
+    let lab = lab::Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let beta = shared_home(&lab);
+    let (_remote_dir, remote) = bare_remote();
+    share(beta.path(), "beta", &remote);
+    let path = format!("{FORK}/20261011T120000.000000000Z-0000.md");
+    let entry = peer_entry("one account");
+    push_as_peer(&remote, "alpha", &path, &entry);
+    push_as_peer(&remote, "gamma", &path, &entry);
+    let on_disk = beta.path().join("ledger").join(&path);
+
+    for round in [
+        "the first pull, which writes it",
+        "the next pull, which finds it here",
+    ] {
+        // When: status pulls.
+        let (code, report) = status_on(&lab, beta.path());
+
+        // Then: the one entry is here, and nothing is a problem.
+        assert_eq!(code, Some(0), "{round}: {report}");
+        assert!(!problems_of(&report).contains(&path), "{round}: {report}");
+        assert_eq!(
+            std::fs::read_to_string(&on_disk).expect("the entry was written"),
+            entry,
+            "{round}"
+        );
+    }
+}
+
 /// The transition both machines see in these tests.
 const MERGED: &str = "#7 merged";
 
