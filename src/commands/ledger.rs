@@ -402,12 +402,10 @@ fn by_fork(
             ));
             continue;
         };
-        let kept_under = former.get(repo).cloned().or_else(|| {
-            registry
-                .repos
-                .contains_key(repo)
-                .then(|| UpstreamName::new(repo))
-        });
+        let kept_under = registry
+            .repos
+            .get(repo)
+            .map(|entry| entry.upstream_name(repo));
         match kept_under {
             Some(upstream) => by_repo
                 .entry(upstream)

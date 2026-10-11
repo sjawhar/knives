@@ -921,6 +921,57 @@ pub fn knives(lab: &Lab, home: &tempfile::TempDir, args: &[&str]) -> std::proces
         .expect("run knives")
 }
 
+/// What Claude Code's `SessionStart` hook prints for session `session_id`
+/// started in `cwd`, against the registry in `home`.
+///
+/// Not built on [`knives_command`], which also sets the working directory and
+/// removes `KNIVES_OWNER`, a variable the hook reads.
+pub fn session_start(home: &Path, cwd: &Path, session_id: &str) -> std::process::Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_knives"))
+        .args(["hook", "claude-code"])
+        .env("KNIVES_CONFIG_HOME", home)
+        .env("HOME", home)
+        .env("JJ_CONFIG", "/dev/null")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn hook");
+    let event = serde_json::json!({
+        "session_id": session_id,
+        "hook_event_name": "SessionStart",
+        "source": "startup",
+        "cwd": cwd,
+    });
+    std::io::Write::write_all(
+        &mut child.stdin.take().expect("hook stdin"),
+        event.to_string().as_bytes(),
+    )
+    .expect("write hook input");
+    child.wait_with_output().expect("wait for hook")
+}
+
+/// One note an older knives filed in `home`'s ledger directory `fork`,
+/// written at `ts`; the path of its file.
+pub fn note(home: &Path, fork: &str, ts: &str, text: &str) -> PathBuf {
+    knives::ledger::Ledger::at(home.join("ledger").join(fork))
+        .append(&knives::ledger::Entry {
+            ts: ts.to_owned(),
+            owner: "ses_older".to_owned(),
+            email: None,
+            subject: None,
+            kind: knives::ledger::Kind::Note,
+            disposition: None,
+            statement: None,
+            text: text.to_owned(),
+            evidence: Vec::new(),
+            anchor: None,
+            pr: None,
+            parents: Vec::new(),
+        })
+        .expect("append a note")
+}
+
 /// State `kind` about `branch` on `repo`'s ledger in the config home `home`,
 /// through the same scribe `track`, `depends` and `finish --superseded-by`
 /// write with. A store opened afterwards at `home/state.json` answers for it.

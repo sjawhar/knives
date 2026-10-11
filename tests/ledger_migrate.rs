@@ -237,30 +237,7 @@ fn an_unmigrated_state_file_is_refused_naming_the_command_and_opens_after_migrat
         .output()
         .expect("run knives status")
     };
-    let hook = |cwd: &Path| {
-        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_knives"))
-            .args(["hook", "claude-code"])
-            .env("KNIVES_CONFIG_HOME", home.path())
-            .env("HOME", home.path())
-            .env("JJ_CONFIG", "/dev/null")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .expect("spawn hook");
-        let event = serde_json::json!({
-            "session_id": "migrate-test",
-            "hook_event_name": "SessionStart",
-            "source": "startup",
-            "cwd": cwd,
-        });
-        std::io::Write::write_all(
-            &mut child.stdin.take().expect("stdin"),
-            event.to_string().as_bytes(),
-        )
-        .expect("write event");
-        child.wait_with_output().expect("wait for hook")
-    };
+    let hook = |cwd: &Path| lab::session_start(home.path(), cwd, "migrate-test");
 
     // When: status runs, and an agent session starts in the fork.
     let refused = status();
@@ -309,35 +286,6 @@ fn renaming_home() -> tempfile::TempDir {
     )
     .expect("write registry");
     home
-}
-
-/// One note in `home`'s ledger directory `fork`, written at `ts`; the path of
-/// its file.
-fn note(home: &Path, fork: &str, ts: &str, text: &str) -> std::path::PathBuf {
-    let ledger = Ledger::at(home.join("ledger").join(fork));
-    ledger
-        .append(&Entry {
-            ts: ts.to_owned(),
-            owner: "ses_older".to_owned(),
-            email: None,
-            subject: None,
-            kind: knives::ledger::Kind::Note,
-            disposition: None,
-            statement: None,
-            text: text.to_owned(),
-            evidence: Vec::new(),
-            anchor: None,
-            pr: None,
-            parents: Vec::new(),
-        })
-        .expect("append a note");
-    let mut files: Vec<_> = std::fs::read_dir(home.join("ledger").join(fork))
-        .expect("read the ledger directory")
-        .map(|dirent| dirent.expect("dirent").path())
-        .filter(|path| path.extension().is_some_and(|extension| extension == "md"))
-        .collect();
-    files.sort();
-    files.pop().expect("the note's file")
 }
 
 /// A state file as a knives that kept forks under their registry keys left
@@ -390,8 +338,8 @@ fn a_migration_moves_each_forks_ledger_and_state_keys_to_its_upstream_name() {
     let home = renaming_home();
     std::fs::write(home.path().join("state.json"), ALIASED_STATE).expect("write state");
     std::fs::write(home.path().join("seen.json"), ALIASED_SEEN).expect("write sightings");
-    let demo_note = note(home.path(), "demo", "2026-01-01T00:00:00Z", "about demo");
-    let acme_note = note(home.path(), "acme", "2026-01-01T00:00:01Z", "about acme");
+    let demo_note = lab::note(home.path(), "demo", "2026-01-01T00:00:00Z", "about demo");
+    let acme_note = lab::note(home.path(), "acme", "2026-01-01T00:00:01Z", "about acme");
     let demo_bytes = std::fs::read(&demo_note).expect("read demo's note");
     let acme_bytes = std::fs::read(&acme_note).expect("read acme's note");
 
@@ -551,13 +499,13 @@ fn an_entry_already_at_its_new_name_is_not_moved_over() {
     // already holding one of the same entries (pulled from a machine that
     // migrated first) and a different file under another entry's name.
     let home = renaming_home();
-    let kept = note(
+    let kept = lab::note(
         home.path(),
         "demo",
         "2026-01-01T00:00:00Z",
         "the same entry",
     );
-    let clash = note(
+    let clash = lab::note(
         home.path(),
         "demo",
         "2026-01-01T00:00:01Z",
@@ -815,8 +763,8 @@ fn a_dry_run_reports_what_a_migration_would_do_and_changes_nothing() {
     state["tracked_pulls"]["tool/feat/z"] = serde_json::json!(5);
     std::fs::write(home.path().join("state.json"), state.to_string()).expect("write state");
     std::fs::write(home.path().join("seen.json"), ALIASED_SEEN).expect("write sightings");
-    note(home.path(), "demo", "2026-01-01T00:00:00Z", "about demo");
-    note(home.path(), "acme", "2026-01-01T00:00:01Z", "about acme");
+    lab::note(home.path(), "demo", "2026-01-01T00:00:00Z", "about demo");
+    lab::note(home.path(), "acme", "2026-01-01T00:00:01Z", "about acme");
     let before = snapshot(home.path());
 
     // When: a dry run asks what the migration would do.

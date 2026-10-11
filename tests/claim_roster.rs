@@ -19,9 +19,8 @@
 #[path = "common/lab.rs"]
 mod lab;
 
-use std::io::Write as _;
 use std::path::Path;
-use std::process::{Command, Output, Stdio};
+use std::process::Output;
 
 use lab::Lab;
 use serde_json::{Value, json};
@@ -91,29 +90,7 @@ fn claim_gamma(lab: &Lab, home: &Path) {
 
 /// The context Claude Code's `SessionStart` hook adds for a session started in `cwd`.
 fn session_start_notice(home: &Path, cwd: &Path) -> String {
-    let event = json!({
-        "session_id": "hook-session",
-        "cwd": cwd,
-        "hook_event_name": "SessionStart",
-        "source": "startup",
-    });
-    let mut child = Command::new(env!("CARGO_BIN_EXE_knives"))
-        .args(["hook", "claude-code"])
-        .env("KNIVES_CONFIG_HOME", home)
-        .env("HOME", home)
-        .env("JJ_CONFIG", "/dev/null")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn hook");
-    child
-        .stdin
-        .take()
-        .expect("hook stdin")
-        .write_all(event.to_string().as_bytes())
-        .expect("write hook input");
-    let output = child.wait_with_output().expect("wait for hook");
+    let output = lab::session_start(home, cwd, "hook-session");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let parsed: Value = serde_json::from_str(&stdout).unwrap_or_else(|error| {
         panic!(
@@ -471,22 +448,12 @@ fn a_ledger_still_kept_under_the_registry_key_is_refused_until_migrated() {
     // the directory named for the fork's registry key.
     let (lab, home) = forge_fork();
     claim_gamma(&lab, home.path());
-    knives::ledger::Ledger::at(home.path().join("ledger").join("demo"))
-        .append(&knives::ledger::Entry {
-            ts: "2026-01-01T00:00:00Z".to_owned(),
-            owner: "ses_older".to_owned(),
-            email: None,
-            subject: None,
-            kind: knives::ledger::Kind::Note,
-            disposition: None,
-            statement: None,
-            text: "written by an older knives".to_owned(),
-            evidence: Vec::new(),
-            anchor: None,
-            pr: None,
-            parents: Vec::new(),
-        })
-        .expect("append a note");
+    lab::note(
+        home.path(),
+        "demo",
+        "2026-01-01T00:00:00Z",
+        "written by an older knives",
+    );
 
     refused_until_migrated(&lab, home.path());
     assert!(
@@ -533,32 +500,17 @@ fn a_registry_key_directory_nobody_can_read_is_refused_as_unmigrated() {
     );
 }
 
-/// A note an older knives filed under `demo`, its registry key.
-fn note_under_the_registry_key(home: &Path) {
-    knives::ledger::Ledger::at(home.join("ledger").join("demo"))
-        .append(&knives::ledger::Entry {
-            ts: "2026-01-01T00:00:00Z".to_owned(),
-            owner: "ses_older".to_owned(),
-            email: None,
-            subject: None,
-            kind: knives::ledger::Kind::Note,
-            disposition: None,
-            statement: None,
-            text: "written by an older knives".to_owned(),
-            evidence: Vec::new(),
-            anchor: None,
-            pr: None,
-            parents: Vec::new(),
-        })
-        .expect("append a note");
-}
-
 #[test]
 fn notch_and_the_release_plan_refuse_a_ledger_still_under_the_registry_key() {
     // Given: a ledger entry an older knives filed under the fork's registry
     // key, and nothing yet under its upstream name.
     let (lab, home) = forge_fork();
-    note_under_the_registry_key(home.path());
+    lab::note(
+        home.path(),
+        "demo",
+        "2026-01-01T00:00:00Z",
+        "written by an older knives",
+    );
     let readers: [&[&str]; 3] = [
         &["--text", "notch", "--repo", "demo"],
         &["--text", "notch", "--repo", "demo", "--pr", "1"],
@@ -635,22 +587,12 @@ fn a_ledger_no_registry_entry_keeps_is_reported_by_status_notch_and_the_sweep() 
     // registry entry was pointed at another upstream (a renamed repository),
     // so no fork is kept where they are now.
     let (lab, home) = forge_fork();
-    knives::ledger::Ledger::at(home.path().join("ledger").join("maintainer/old-demo"))
-        .append(&knives::ledger::Entry {
-            ts: "2026-01-01T00:00:00Z".to_owned(),
-            owner: "ses_older".to_owned(),
-            email: None,
-            subject: None,
-            kind: knives::ledger::Kind::Note,
-            disposition: None,
-            statement: None,
-            text: "filed under the old upstream".to_owned(),
-            evidence: Vec::new(),
-            anchor: None,
-            pr: None,
-            parents: Vec::new(),
-        })
-        .expect("append a note");
+    lab::note(
+        home.path(),
+        "maintainer/old-demo",
+        "2026-01-01T00:00:00Z",
+        "filed under the old upstream",
+    );
     let orphan = home.path().join("ledger").join("maintainer/old-demo");
     let names_both_fixes = |text: &str| {
         text.contains(&orphan.display().to_string())
@@ -717,32 +659,9 @@ fn a_claimed_checkout_whose_registry_upstream_was_renamed_is_not_silently_unmana
 
     // When: a Claude Code session starts in the checkout, and status runs
     // from inside it.
-    let mut hook = Command::new(env!("CARGO_BIN_EXE_knives"))
-        .args(["hook", "claude-code"])
-        .env("KNIVES_CONFIG_HOME", home.path())
-        .env("HOME", home.path())
-        .env("JJ_CONFIG", "/dev/null")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn hook");
-    hook.stdin
-        .take()
-        .expect("hook stdin")
-        .write_all(
-            json!({
-                "session_id": "hook-session",
-                "cwd": &lab.work,
-                "hook_event_name": "SessionStart",
-                "source": "startup",
-            })
-            .to_string()
-            .as_bytes(),
-        )
-        .expect("write hook input");
-    let notice = String::from_utf8_lossy(&hook.wait_with_output().expect("wait for hook").stdout)
-        .into_owned();
+    let notice =
+        String::from_utf8_lossy(&lab::session_start(home.path(), &lab.work, "hook-session").stdout)
+            .into_owned();
     let status = knives_as(
         &lab,
         home.path(),
