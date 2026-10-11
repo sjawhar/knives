@@ -962,6 +962,129 @@ fn a_dependency_stated_on_another_machine_survives_a_second_machines_depends() {
 }
 
 #[test]
+fn dependencies_two_machines_state_at_once_both_survive() {
+    // Given: two machines sharing one ledger remote, each with its sweep held
+    // off, so neither has the other's statement when it states its own.
+    let lab = lab::Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let alpha = shared_home(&lab);
+    let beta = second_machine(alpha.path());
+    let (_remote_dir, remote) = bare_remote();
+    share(alpha.path(), "alpha", &remote);
+    share(beta.path(), "beta", &remote);
+    let alpha_held = hold_sweep_lock(alpha.path());
+    let beta_held = hold_sweep_lock(beta.path());
+
+    // When: each states a different dependency of the same branch, and then
+    // each sweeps until it has the other's.
+    for (home, on) in [(&alpha, "demo#1"), (&beta, "demo#2")] {
+        let stated = knives_on(
+            &lab,
+            home.path(),
+            &["--text", "depends", "feat/alpha", "--on", on],
+        );
+        assert!(
+            stated.status.success(),
+            "{}",
+            String::from_utf8_lossy(&stated.stderr)
+        );
+    }
+    drop(alpha_held);
+    drop(beta_held);
+    for home in [&alpha, &beta, &alpha] {
+        let swept = sweep(home.path());
+        assert!(
+            swept.status.success(),
+            "{}",
+            String::from_utf8_lossy(&swept.stdout)
+        );
+        settle(home.path());
+    }
+
+    // Then: both dependencies are live on both machines.
+    for home in [&alpha, &beta] {
+        let entries = Ledger::at(home.path().join("ledger").join(FORK))
+            .entries()
+            .expect("read the ledger");
+        let live = knives::statement::Statements::from_entries(&entries);
+        assert_eq!(
+            live.depends("feat/alpha"),
+            ["acme/demo#1", "acme/demo#2"],
+            "{entries:?}"
+        );
+    }
+}
+
+#[test]
+fn a_track_from_a_machine_whose_clock_runs_behind_wins_over_the_statement_it_replaced() {
+    // Given: two machines sharing one ledger remote, and alpha's statement of
+    // #12 on it, stamped five minutes after beta's clock, as alpha stamps it
+    // when beta's clock runs five minutes behind alpha's.
+    let lab = lab::Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let alpha = shared_home(&lab);
+    let beta = second_machine(alpha.path());
+    let (_remote_dir, remote) = bare_remote();
+    let alpha_root = share(alpha.path(), "alpha", &remote);
+    share(beta.path(), "beta", &remote);
+    let ahead = jiff::Timestamp::now() + jiff::SignedDuration::from_mins(5);
+    Ledger::at(alpha_root.join(FORK))
+        .append(&Entry {
+            ts: ahead.to_string(),
+            owner: "ses_alpha".to_owned(),
+            email: None,
+            subject: Some("feat/alpha".to_owned()),
+            kind: Kind::Event,
+            disposition: None,
+            statement: Some(knives::statement::Statement {
+                kind: knives::statement::StatementKind::Pull,
+                value: Some("12".to_owned()),
+            }),
+            text: "stated as #12".to_owned(),
+            evidence: Vec::new(),
+            anchor: None,
+            pr: Some(12),
+            parents: Vec::new(),
+        })
+        .expect("append alpha's statement");
+    assert!(sweep(alpha.path()).status.success());
+    let pr_on = |home: &Path| {
+        let (code, report) = status_on(&lab, home);
+        assert_eq!(code, Some(0), "{report}");
+        let row = report["branches"]
+            .as_array()
+            .expect("branch rows")
+            .iter()
+            .find(|row| row["name"] == "feat/alpha")
+            .unwrap_or_else(|| panic!("no feat/alpha row: {report}"))
+            .clone();
+        row["pr"]["number"].clone()
+    };
+    assert_eq!(pr_on(beta.path()), 12, "beta did not pull alpha's #12");
+
+    // When: beta states #13, replacing the #12 it read, and its sweep
+    // carries the statement to the remote.
+    let tracked = knives_on(
+        &lab,
+        beta.path(),
+        &["--text", "track", "feat/alpha", "--pr", "13"],
+    );
+    assert!(
+        tracked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&tracked.stderr)
+    );
+    wait_until("beta's statement to reach the remote", || {
+        entries_on(&remote, "beta") == 1
+    });
+    settle(beta.path());
+
+    // Then: #13 is live on beta, and on alpha once it pulls.
+    assert_eq!(pr_on(beta.path()), 13);
+    assert_eq!(pr_on(alpha.path()), 13);
+}
+
+#[test]
 fn a_forget_with_nothing_stated_leaves_a_peers_unsent_statement_standing() {
     // Given: two machines sharing one ledger remote, and a pull request
     // alpha stated whose sweep has not yet carried it.
