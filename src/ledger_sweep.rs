@@ -257,7 +257,17 @@ fn identity(git_dir: &Path) -> Result<Identity, SweepError> {
 /// there ([`crate::ledger::LedgerError::FormerName`]), which no sweep would
 /// carry until `knives ledger migrate` moves them.
 pub fn destinations(root: &Path, registry: &Registry) -> Result<Destinations, SweepError> {
-    refuse_unmigrated(root, registry, &[])?;
+    destinations_moving(root, registry, &[])
+}
+
+/// [`destinations`], but not refusing the unmigrated directories in `moved`,
+/// which the caller is about to move.
+fn destinations_moving(
+    root: &Path,
+    registry: &Registry,
+    moved: &[&Path],
+) -> Result<Destinations, SweepError> {
+    refuse_unmigrated(root, registry, moved)?;
     let reached = reach(root, registry)?;
     let found = reached
         .carriers
@@ -319,8 +329,7 @@ struct Reached {
 /// unmigrated directory's.
 ///
 /// Read from the registry and each candidate's own git config alone: no
-/// fetch, and nothing written, not even the ledger root a [`Repository`]
-/// creates.
+/// fetch, and nothing written.
 fn reach(root: &Path, registry: &Registry) -> Result<Reached, SweepError> {
     let mut carriers = Vec::new();
     let mut ignored = Vec::new();
@@ -413,15 +422,8 @@ pub fn unpullable(
     if forks.is_empty() {
         return BTreeMap::new();
     }
-    let reached = refuse_unmigrated(root, registry, moved)
-        .and_then(|()| reach(root, registry))
-        .and_then(|reached| {
-            for carrier in &reached.carriers {
-                ledger_git::absolute_git_dir(&carrier.git_dir)?;
-            }
-            Ok(reached.unreached)
-        });
-    setup_problems(root, forks, reached.as_ref())
+    let found = destinations_moving(root, registry, moved);
+    setup_problems(root, forks, found.as_ref().map(|found| &found.unreached))
 }
 
 /// The problem each of `forks` has from where the ledger at `root` travels:

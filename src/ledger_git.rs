@@ -181,10 +181,8 @@ impl Repository {
     /// root, `<owner>/<name>`, is refused: it would reach entries outside
     /// that fork's directory, or inside another fork's.
     ///
-    /// `work_tree` is created when it does not exist yet: every git call
-    /// runs in it ([`Repository::git`]), and a new machine joined only
-    /// through a git directory in `ledger-repositories` has no ledger root
-    /// until a pull writes one in, which no git call could otherwise reach.
+    /// Nothing is written: a ledger root that does not exist yet is one
+    /// with no entries, and a pull creates each directory it writes into.
     pub fn new(
         git_dir: &Path,
         work_tree: &Path,
@@ -200,14 +198,9 @@ impl Repository {
             .into_iter()
             .map(fork_directory)
             .collect::<Result<_, _>>()?;
-        let work_tree = absolute(work_tree)?;
-        std::fs::create_dir_all(&work_tree).map_err(|source| GitError::Write {
-            path: work_tree.clone(),
-            source,
-        })?;
         Ok(Self {
             git_dir: absolute(git_dir)?,
-            work_tree,
+            work_tree: absolute(work_tree)?,
             forks,
         })
     }
@@ -235,7 +228,7 @@ impl Repository {
         })
     }
 
-    /// `git` on this repository, run in the ledger root.
+    /// `git` on this repository.
     ///
     /// `--git-dir` and `--work-tree` leave nothing to discovery, and
     /// [`crate::bind::git_command`] scrubs an inherited `GIT_DIR` and its
@@ -256,8 +249,6 @@ impl Repository {
             }
         }
         command
-            .arg("-C")
-            .arg(&self.work_tree)
             .arg("--git-dir")
             .arg(&self.git_dir)
             .arg("--work-tree")
@@ -1021,7 +1012,8 @@ fn local_entries(repository: &Repository) -> Result<BTreeSet<PathBuf>, GitError>
 /// `--no-filters`, so a blob is the file's exact bytes whatever
 /// `.gitattributes` says, and a peer materialises it byte for byte; a file
 /// compared against a peer's blob is hashed the same way, so the same bytes
-/// give the same id.
+/// give the same id. Each path is handed to git under the root, so it reads
+/// the same file whatever directory git runs in.
 fn hash_objects<'a>(
     repository: &Repository,
     paths: impl IntoIterator<Item = &'a Path>,
@@ -1030,7 +1022,7 @@ fn hash_objects<'a>(
     let mut input = Vec::new();
     let mut count = 0;
     for path in paths {
-        push_quoted(&mut input, path);
+        push_quoted(&mut input, &repository.work_tree.join(path));
         input.push(b'\n');
         count += 1;
     }

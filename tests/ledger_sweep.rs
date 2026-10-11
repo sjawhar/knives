@@ -976,6 +976,28 @@ fn a_new_machine_with_no_ledger_root_yet_pulls_what_another_stated() {
 }
 
 #[test]
+fn a_status_with_nothing_to_pull_leaves_a_missing_ledger_root_missing() {
+    // Given: a machine joined as the installer joins one, with no ledger
+    // root, sharing with a remote that carries nothing yet.
+    let lab = lab::Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let alpha = shared_home(&lab);
+    let beta = second_machine(alpha.path());
+    let (_remote_dir, remote) = lab::bare_remote();
+    join_as_the_installer_does(beta.path(), "beta", &remote);
+    assert!(!beta.path().join("ledger").exists());
+
+    // When: beta's status runs, pulling first.
+    let (code, report) = status_on(&lab, beta.path());
+
+    // Then: it answers with no problem, and wrote no ledger root: a read
+    // creates nothing, and a pull with nothing to write writes nothing.
+    assert_eq!(code, Some(0), "{report}");
+    assert!(report.get("problems").is_none(), "{report}");
+    assert!(!beta.path().join("ledger").exists());
+}
+
+#[test]
 fn a_status_that_cannot_pull_says_so_and_still_answers() {
     // Given: a machine whose ledger remote cannot be reached.
     let lab = lab::Lab::new();
