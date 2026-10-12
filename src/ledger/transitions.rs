@@ -190,10 +190,13 @@ mod tests {
         );
         // Two committed repeats stay: the history is pure additions.
         let committed = BTreeSet::new();
-        assert!(repeated_transitions(&entries, &committed).is_empty());
+        assert_eq!(
+            repeated_transitions(&entries, &committed),
+            Vec::<&Path>::new()
+        );
         // A run nobody committed is this machine's own record.
         let all: BTreeSet<PathBuf> = entries.iter().map(|(path, _)| path.clone()).collect();
-        assert!(repeated_transitions(&entries, &all).is_empty());
+        assert_eq!(repeated_transitions(&entries, &all), Vec::<&Path>::new());
     }
 
     #[test]
@@ -204,6 +207,9 @@ mod tests {
             ("c.md", "#632 closed"),
         ]);
         let uncommitted = BTreeSet::from([PathBuf::from("c.md")]);
-        assert!(repeated_transitions(&entries, &uncommitted).is_empty());
+        assert_eq!(
+            repeated_transitions(&entries, &uncommitted),
+            Vec::<&Path>::new()
+        );
     }
 }

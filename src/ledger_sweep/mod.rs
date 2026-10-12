@@ -947,8 +947,8 @@ mod tests {
         let a_repo = UpstreamName::new("acme/a-repo");
         let pulled = pull_at(&root, &loaded(&root), &[&a_repo]);
 
-        assert!(pulled.problems_for(&a_repo).is_empty());
-        assert!(pulled.backlog().for_fork(&a_repo).is_empty());
+        assert_eq!(pulled.problems_for(&a_repo), Vec::<String>::new());
+        assert_eq!(pulled.backlog().for_fork(&a_repo), Vec::<String>::new());
     }
 
     #[test]
@@ -972,6 +972,6 @@ mod tests {
                 .all(|problem| problem.contains("could not pull the ledger from origin")),
             "{problems:?}"
         );
-        assert!(pulled.problems_for(&b_repo).is_empty());
+        assert_eq!(pulled.problems_for(&b_repo), Vec::<String>::new());
     }
 }

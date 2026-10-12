@@ -376,7 +376,7 @@ mod tests {
         assert_eq!(alone.pull("feat/alpha"), None);
         assert!(!alone.fork_only("feat/alpha"));
         assert_eq!(alone.superseded_by("feat/alpha"), None);
-        assert!(alone.depends("feat/alpha").is_empty());
+        assert_eq!(alone.depends("feat/alpha"), Vec::<String>::new());
     }
 
     #[test]
@@ -422,7 +422,7 @@ mod tests {
         // And: a forget drops everything stated before it, and only that.
         let forgotten = [first.clone(), concurrent.clone(), forget.clone()];
         let live = Statements::from_entries(&forgotten);
-        assert!(live.depends("feat/alpha").is_empty());
+        assert_eq!(live.depends("feat/alpha"), Vec::<String>::new());
         assert_eq!(
             live.stated("feat/alpha", StatementKind::Depends),
             Some(None)

@@ -725,7 +725,7 @@ fn a_migration_whose_ledger_cannot_be_pulled_writes_no_statement() {
             .contains("could not pull the ledger from origin"),
         "{migrated}"
     );
-    assert!(entries(home.path(), "acme/b-repo").is_empty());
+    assert_eq!(entries(home.path(), "acme/b-repo"), Vec::<Entry>::new());
     let state: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(home.path().join("state.json")).expect("read state"),
     )

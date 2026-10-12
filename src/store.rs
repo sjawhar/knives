@@ -816,7 +816,7 @@ mod tests {
         let elsewhere = BranchTarget::new(other, BranchName::new("feat/alpha"));
         assert_eq!(subject.tracked_pull(&elsewhere), None);
         assert_eq!(subject.superseded_by(&elsewhere), None);
-        assert!(subject.dependencies(&elsewhere).is_empty());
+        assert_eq!(subject.dependencies(&elsewhere), Vec::<Requirement>::new());
         assert!(!subject.is_fork_only(&elsewhere));
     }
 

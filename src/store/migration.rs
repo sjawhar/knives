@@ -335,7 +335,10 @@ mod tests {
         );
 
         assert!(subject.drop_legacy_statements());
-        assert!(subject.legacy_statements().unwrap().is_empty());
+        assert_eq!(
+            subject.legacy_statements().unwrap(),
+            Vec::<LegacyStatement>::new()
+        );
         assert!(!subject.drop_legacy_statements());
     }
 
