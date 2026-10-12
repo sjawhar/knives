@@ -581,11 +581,18 @@ pub fn push(repository: &Repository, remote: &str, machine: &str) -> Result<bool
 }
 
 /// Whether `git push` rejected its only ref because the remote had already
-/// moved it since this machine last fetched.
+/// moved it since this machine last fetched, or another push created it first.
+///
+/// git words a lost create race differently by version: 2.43 marks the ref
+/// `(failed to update ref)` under the remote's `cannot lock ref '<ref>':
+/// reference already exists`, and newer versions mark it `(reference already
+/// exists)` itself. Any other `[remote rejected]` reason, such as a declining
+/// hook or a stale lock file, is a plain failure.
 fn push_was_rejected_as_non_fast_forward(stderr: &str) -> bool {
-    stderr.contains("non-fast-forward")
-        || stderr.contains("(fetch first)")
-        || (stderr.contains("failed to update ref") && stderr.contains("reference already exists"))
+    let lost_create_race = (stderr.contains("reference already exists")
+        && (stderr.contains("failed to update ref") || stderr.contains("cannot lock ref")))
+        || (stderr.contains("[remote rejected]") && stderr.contains("(reference already exists)"));
+    stderr.contains("non-fast-forward") || stderr.contains("(fetch first)") || lost_create_race
 }
 
 /// Every entry in the forks `repository` carries that `remote` lacks.
@@ -1100,6 +1107,95 @@ mod tests {
             "GIT_DIR",
         ] {
             assert!(!carries_session_config(name.as_bytes()), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_push_racing_another_machine_to_the_ref_is_a_collision_in_every_git_wording() {
+        // Each is git's stderr for one push of this machine's only ref, as
+        // `transport` hands it over: trimmed, the remote's lines padded.
+        let collisions = [
+            (
+                "git 2.43, a racing create",
+                concat!(
+                    "remote: error: cannot lock ref 'refs/knives/duplicate': reference already exists        \n",
+                    "To /tmp/.tmpXd6kG5/ledger.git\n",
+                    " ! [remote rejected] refs/knives/duplicate -> refs/knives/duplicate (failed to update ref)\n",
+                    "error: failed to push some refs to '/tmp/.tmpXd6kG5/ledger.git'",
+                ),
+            ),
+            (
+                "newer git, a racing create",
+                concat!(
+                    "remote: error: cannot lock ref 'refs/knives/duplicate': reference already exists        \n",
+                    "To /tmp/.tmpXYvBbh/ledger.git\n",
+                    " ! [remote rejected] refs/knives/duplicate -> refs/knives/duplicate (reference already exists)\n",
+                    "error: failed to push some refs to '/tmp/.tmpXYvBbh/ledger.git'",
+                ),
+            ),
+            (
+                "newer git's status line alone, as a remote that relays no error line leaves it",
+                concat!(
+                    "To /tmp/.tmpXYvBbh/ledger.git\n",
+                    " ! [remote rejected] refs/knives/duplicate -> refs/knives/duplicate (reference already exists)\n",
+                    "error: failed to push some refs to '/tmp/.tmpXYvBbh/ledger.git'",
+                ),
+            ),
+            (
+                "a ref the remote moved before this machine fetched it",
+                concat!(
+                    "To /tmp/kt-push-forms.DcNKZS/remote.git\n",
+                    " ! [rejected]        refs/knives/m -> refs/knives/m (fetch first)\n",
+                    "error: failed to push some refs to '/tmp/kt-push-forms.DcNKZS/remote.git'",
+                ),
+            ),
+            (
+                "a ref the remote moved after this machine fetched it",
+                concat!(
+                    "To /tmp/kt-push-forms.DcNKZS/remote.git\n",
+                    " ! [rejected]        refs/knives/m -> refs/knives/m (non-fast-forward)\n",
+                    "error: failed to push some refs to '/tmp/kt-push-forms.DcNKZS/remote.git'",
+                ),
+            ),
+        ];
+        for (case, stderr) in collisions {
+            assert!(
+                push_was_rejected_as_non_fast_forward(stderr),
+                "{case}: {stderr}"
+            );
+        }
+
+        let failures = [
+            (
+                "a hook declining the push",
+                concat!(
+                    "remote: ledger pushes are frozen        \n",
+                    "To /tmp/kt-push-forms.DcNKZS/remote.git\n",
+                    " ! [remote rejected] refs/knives/m -> refs/knives/m (pre-receive hook declined)\n",
+                    "error: failed to push some refs to '/tmp/kt-push-forms.DcNKZS/remote.git'",
+                ),
+            ),
+            (
+                "a lock file a crashed process left on the remote",
+                concat!(
+                    "remote: error: cannot lock ref 'refs/knives/m': Unable to create '/tmp/kt-push-forms.DcNKZS/remote.git/./refs/knives/m.lock': File exists.        \n",
+                    "remote: \n",
+                    "remote: Another git process seems to be running in this repository, e.g.        \n",
+                    "remote: an editor opened by 'git commit'. Please make sure all processes        \n",
+                    "remote: are terminated then try again. If it still fails, a git process        \n",
+                    "remote: may have crashed in this repository earlier:        \n",
+                    "remote: remove the file manually to continue.        \n",
+                    "To /tmp/kt-push-forms.DcNKZS/remote.git\n",
+                    " ! [remote rejected] refs/knives/m -> refs/knives/m (failed to update ref)\n",
+                    "error: failed to push some refs to '/tmp/kt-push-forms.DcNKZS/remote.git'",
+                ),
+            ),
+        ];
+        for (case, stderr) in failures {
+            assert!(
+                !push_was_rejected_as_non_fast_forward(stderr),
+                "{case}: {stderr}"
+            );
         }
     }
 }
