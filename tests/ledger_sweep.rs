@@ -975,6 +975,76 @@ fn a_status_with_nothing_to_pull_leaves_a_missing_ledger_root_missing() {
 }
 
 #[test]
+fn a_finish_run_from_inside_the_workspace_it_removes_still_sends_its_release() {
+    // Given: a machine joined as the installer joins one, and a branch it
+    // started into a workspace, whose claim the start's sweep has carried.
+    let lab = lab::Lab::new();
+    let home = shared_home(&lab);
+    let (_remote_dir, remote) = lab::bare_remote();
+    join_as_the_installer_does(home.path(), "alpha", &remote);
+    let started = knives_on(
+        &lab,
+        home.path(),
+        &[
+            "--text",
+            "start",
+            "feat/gamma",
+            "--repo",
+            "demo",
+            "--why",
+            "port it",
+        ],
+    );
+    assert!(
+        started.status.success(),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let workspace = lab.temp_path().join("feat-gamma");
+    assert!(
+        workspace.is_dir(),
+        "no workspace at {}",
+        workspace.display()
+    );
+    wait_until("the claim to reach the remote", || {
+        entries_on(&remote, "alpha") == 1
+    });
+    settle(home.path());
+
+    // When: the branch is finished from inside that workspace, which the
+    // finish removes before it hands off its sweep.
+    let finished = lab::knives_command(
+        &workspace,
+        home.path(),
+        lab.temp_path(),
+        &["--text", "finish", "feat/gamma", "--repo", "demo"],
+    )
+    .env("KNIVES_OWNER", "ses_fff688")
+    .output()
+    .expect("run knives finish");
+    assert!(
+        finished.status.success(),
+        "{}",
+        String::from_utf8_lossy(&finished.stderr)
+    );
+    assert!(!workspace.exists(), "the workspace survived the finish");
+
+    // Then: the sweep it handed off carries the release to the remote, and
+    // leaves no failure behind.
+    let log = home.path().join("ledger-sweep.log");
+    wait_until("the handed-off sweep to carry the release or fail", || {
+        recorded_on(&remote, "claim released") == 1 || log.exists()
+    });
+    settle(home.path());
+    assert!(
+        !log.exists(),
+        "the handed-off sweep failed: {}",
+        std::fs::read_to_string(&log).unwrap_or_default()
+    );
+    assert_eq!(recorded_on(&remote, "claim released"), 1);
+}
+
+#[test]
 fn a_status_that_cannot_pull_says_so_and_still_answers() {
     // Given: a machine whose ledger remote cannot be reached.
     let lab = lab::Lab::new();

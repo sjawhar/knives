@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use crate::cli::{Exit, HookHarness};
 use crate::commands::claim::{Bound, Identity};
-use crate::config::{ConfigError, GuidanceRoot, Registry, default_config_path};
+use crate::config::{ConfigError, GuidanceRoot, Registry, default_config_home};
 use crate::hook::claude_code::{
     Event, EventKind, POST_TOOL_USE_WIRE_NAME, SESSION_START_WIRE_NAME, response,
 };
@@ -124,7 +124,7 @@ fn run_opencode(loaded: Result<Registry, ConfigError>) -> anyhow::Result<Option<
         }
     };
     let kind = event.kind();
-    let home = config_home();
+    let home = default_config_home();
     let response = match kind {
         OpenCodeEventKind::ToolExecuteAfter => opencode_tool_after(&event, &home, loaded),
         OpenCodeEventKind::ChatSystem => opencode_chat_system(&event, loaded),
@@ -466,7 +466,7 @@ fn run_claude_code(loaded: Result<Registry, ConfigError>) -> anyhow::Result<Opti
     let mut input = String::new();
     std::io::stdin().read_to_string(&mut input)?;
     let event = Event::parse(&input)?;
-    let home = config_home();
+    let home = default_config_home();
     match event.kind() {
         EventKind::SessionStart => session_start(&event, &home, loaded),
         EventKind::PostToolUse => post_tool_use(&event, &home, loaded),
@@ -676,12 +676,6 @@ fn pre_compact(event: &Event, home: &Path) -> anyhow::Result<Option<String>> {
 /// still counts through its nearest existing ancestor.
 fn contains_cwd(root: &Path, cwd: &str) -> bool {
     crate::hook::resolve::nearest_root(Path::new(cwd)).as_deref() == Some(root)
-}
-
-fn config_home() -> PathBuf {
-    default_config_path()
-        .parent()
-        .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
 }
 
 struct PreparedNotice {

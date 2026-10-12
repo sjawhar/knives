@@ -575,12 +575,21 @@ fn remove_if_present(path: PathBuf) -> Result<(), SweepError> {
 /// [`HANDED_OFF`], so it leaves at once when another sweep holds the lock
 /// ([`Contended::Leave`]). It runs in a process group of its own, so the
 /// Ctrl-C that stops the caller does not stop it mid-push.
+///
+/// It runs in the config home, which holds the ledger and everything the
+/// sweep keeps beside it, rather than in the caller's directory: `finish`
+/// run from inside the workspace it removes hands off from a directory that
+/// no longer exists, where every git command the sweep runs would fail. The
+/// home is named to it as an absolute path, since a relative one would mean
+/// another directory from there.
 pub fn hand_off() {
     use std::os::unix::process::CommandExt as _;
     let started = std::time::Instant::now();
-    let spawned = std::env::current_exe().and_then(|executable| {
-        std::process::Command::new(executable)
+    let spawned = std::path::absolute(crate::config::default_config_home()).and_then(|home| {
+        std::process::Command::new(std::env::current_exe()?)
             .args(["ledger", "sweep"])
+            .current_dir(&home)
+            .env("KNIVES_CONFIG_HOME", &home)
             .env(HANDED_OFF, "1")
             .stdin(Stdio::null())
             .stdout(Stdio::null())

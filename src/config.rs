@@ -507,15 +507,15 @@ pub fn home_dir() -> Option<PathBuf> {
 /// What the scan callers print when [`home_dir`] is `None`.
 pub const NO_HOME: &str = "HOME is not set; knives scans $HOME for checkouts";
 
-/// Where the registry lives.
+/// The directory holding the registry, the state file and the ledger.
 ///
 /// `KNIVES_CONFIG_HOME` wins over `XDG_CONFIG_HOME` so this tool can be pointed
 /// elsewhere without moving every other tool's config too. Redirecting
 /// `XDG_CONFIG_HOME` to isolate this tool also hides the forge CLI's
 /// credentials, which turns a working setup into an authentication failure.
-pub fn default_config_path() -> PathBuf {
+pub fn default_config_home() -> PathBuf {
     if let Ok(home) = std::env::var("KNIVES_CONFIG_HOME") {
-        return PathBuf::from(home).join("repos.toml");
+        return PathBuf::from(home);
     }
     let base = std::env::var("XDG_CONFIG_HOME").map_or_else(
         |_| {
@@ -528,7 +528,12 @@ pub fn default_config_path() -> PathBuf {
         },
         PathBuf::from,
     );
-    base.join("knives").join("repos.toml")
+    base.join("knives")
+}
+
+/// Where the registry lives, in [`default_config_home`].
+pub fn default_config_path() -> PathBuf {
+    default_config_home().join("repos.toml")
 }
 
 /// Read the registry. A missing file is an empty registry, which the commands
