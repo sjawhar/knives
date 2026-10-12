@@ -694,7 +694,7 @@ mod tests {
         assert_eq!(claims.len(), 1);
         assert_eq!(claims[0].why, "fixing the parser");
         assert_eq!(claims[0].kind, OwnerKind::HarnessSession);
-        assert!(!claims[0].started.is_empty());
+        assert_ne!(claims[0].started, "");
     }
 
     #[test]
@@ -721,7 +721,7 @@ mod tests {
         let _ = subject.claim(&target(), &os_user("someone"), "w");
         assert!(subject.release_claim(&target()));
         assert!(!subject.release_claim(&target()));
-        assert!(subject.claims(None).is_empty());
+        assert_eq!(subject.claims(None), Vec::<&Claim>::new());
     }
 
     #[test]

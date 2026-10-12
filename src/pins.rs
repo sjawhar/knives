@@ -343,14 +343,14 @@ mod tests {
 
     #[test]
     fn a_line_merely_mentioning_releases_is_not_a_pin() {
-        assert!(
+        assert_eq!(
             scan(
                 "README.md",
                 "See release/ for details",
                 &crate::ids::ReleaseScheme::Dated,
             )
-            .pins
-            .is_empty()
+            .pins,
+            Vec::<Pin>::new()
         );
     }
 
@@ -400,10 +400,9 @@ mod tests {
         use crate::ids::{BranchName, ReleaseScheme};
 
         let fixed = ReleaseScheme::Fixed(BranchName::new("integration"));
-        assert!(
-            scan("pyproject.toml", "mode = \"reintegration\"", &fixed)
-                .pins
-                .is_empty()
+        assert_eq!(
+            scan("pyproject.toml", "mode = \"reintegration\"", &fixed).pins,
+            Vec::<Pin>::new()
         );
     }
 
@@ -423,7 +422,7 @@ mod tests {
             &crate::ids::ReleaseScheme::Dated,
         );
 
-        assert!(scanned.pins.is_empty());
+        assert_eq!(scanned.pins, Vec::<Pin>::new());
         let problems = scanned
             .problems
             .iter()

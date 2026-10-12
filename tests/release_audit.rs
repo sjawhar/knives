@@ -608,10 +608,9 @@ fn an_incremental_recut_preserves_the_previous_cuts_conflict_resolutions() {
         lab.revision(&lab.work, cut.as_str(), "description"),
         request.message().trim_end()
     );
-    assert!(
-        knives::jj::conflicted_files(&lab.work, cut.as_str())
-            .expect("list conflicts")
-            .is_empty()
+    assert_eq!(
+        knives::jj::conflicted_files(&lab.work, cut.as_str()).expect("list conflicts"),
+        Vec::<String>::new()
     );
 }
 

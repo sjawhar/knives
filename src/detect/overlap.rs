@@ -96,6 +96,6 @@ mod tests {
         // When: overlaps are detected
         let findings = branch_overlaps(&touching);
         // Then: neither file is reported
-        assert!(findings.is_empty());
+        assert_eq!(findings, Vec::<Finding>::new());
     }
 }

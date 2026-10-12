@@ -2086,7 +2086,7 @@ mod cut_tests {
     fn the_default_workspace_is_never_reaped() {
         // Reaping it would delete the checkout the operator is standing in.
         let workspaces = vec!["default".to_owned()];
-        assert!(workspaces_to_clean(&workspaces, &[]).is_empty());
+        assert_eq!(workspaces_to_clean(&workspaces, &[]), Vec::<String>::new());
     }
 
     fn cut_event(subject: &str, created: &str, members: &[&str]) -> Entry {
@@ -2326,7 +2326,7 @@ mod consumer_scope_tests {
                 dir.path().display()
             )]
         );
-        assert!(ours.problems.is_empty());
+        assert_eq!(ours.problems, Vec::<String>::new());
 
         let unscoped = scan_consumer_for(dir.path(), None, &ReleaseScheme::Dated);
         assert_eq!(unscoped.pins.len(), 2, "without a slug, every pin is kept");
@@ -2587,8 +2587,8 @@ mod members_tests {
             gather_members(&opened, &fork, "release/2026-08-30", false).expect("gather members");
 
         assert_eq!(members.members.len(), 1);
-        assert!(members.members[0].held_by.is_empty());
-        assert!(members.members[0].advanced.is_empty());
+        assert_eq!(members.members[0].held_by, Vec::<String>::new());
+        assert_eq!(members.members[0].advanced, Vec::<String>::new());
         assert!(render_members(&members).contains("bare commit — nothing holds it"));
     }
 }

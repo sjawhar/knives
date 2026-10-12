@@ -143,5 +143,5 @@ fn repos_without_a_home_directory_refuses_rather_than_scanning_the_root() {
         stderr.trim(),
         "HOME is not set; knives scans $HOME for checkouts"
     );
-    assert!(output.stdout.is_empty());
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "");
 }

@@ -286,7 +286,7 @@ fn compact_session_start_in_a_managed_workspace_records_passive_observations() {
     let mut compact = event("session-start", &repos.beta, None);
     compact["source"] = json!("compact");
 
-    assert!(run_hook(repos.home.path(), &compact).is_empty());
+    assert_eq!(run_hook(repos.home.path(), &compact), "");
 
     let seen: Value = serde_json::from_str(
         &std::fs::read_to_string(repos.home.path().join("seen.json"))
@@ -558,7 +558,7 @@ fn compaction_resets_the_budget() {
     let first = run_hook(repos.home.path(), &read);
 
     // When: Claude Code compacts its context and reads that repository again.
-    assert!(run_hook(repos.home.path(), &compact).is_empty());
+    assert_eq!(run_hook(repos.home.path(), &compact), "");
     let second = run_hook(repos.home.path(), &read);
 
     // Then: both reads receive the full foreign guidance.
@@ -576,7 +576,7 @@ fn session_end_deletes_the_state_file() {
     let _ = run_hook(repos.home.path(), &start);
 
     // When: Claude Code ends the session.
-    assert!(run_hook(repos.home.path(), &end).is_empty());
+    assert_eq!(run_hook(repos.home.path(), &end), "");
 
     // Then: no session state remains for the session.
     let sessions = repos.home.path().join("hook-sessions");

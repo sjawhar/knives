@@ -948,7 +948,7 @@ mod tests {
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].role, TargetRole::UpstreamTrunk);
         assert_eq!(targets[0].commit, CommitId::new("trunk"));
-        assert!(targets[0].refs.is_empty());
+        assert_eq!(targets[0].refs, Vec::<BookmarkRef>::new());
     }
 
     #[test]

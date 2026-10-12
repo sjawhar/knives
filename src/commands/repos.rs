@@ -772,7 +772,7 @@ mod tests {
             cache_root: None,
             heads: &ConsumerHeadMemo::default(),
         });
-        assert!(report.repos[0].problems.is_empty());
+        assert_eq!(report.repos[0].problems, Vec::<String>::new());
         assert!(
             render(&report).contains("? cannot read /home/someone/locked: denied"),
             "{}",

@@ -256,7 +256,7 @@ mod tests {
     use super::{ConsumerHeadMemo, scan_consumer_slug_with_heads};
     use crate::forge::{ConsumerHead, fake::FakeForge};
     use crate::ids::ReleaseScheme;
-    use crate::pins::PIN_FILES;
+    use crate::pins::{PIN_FILES, Pin};
 
     const CONSUMER: &str = "acme/consumer";
     const REPOSITORY: &str = "tool";
@@ -389,7 +389,7 @@ mod tests {
             &ConsumerHeadMemo::default(),
         );
 
-        assert!(scan.pins.is_empty());
+        assert_eq!(scan.pins, Vec::<Pin>::new());
         assert_eq!(scan.notes, Vec::<String>::new());
         assert_eq!(scan.problems.len(), 1);
     }

@@ -104,7 +104,7 @@ mod tests {
 
     #[test]
     fn agreeing_release_refs_are_not_a_disagreement() {
-        assert!(
+        assert_eq!(
             same_name_disagreements(
                 &tips(vec![
                     (local("release/2026-08-30"), "aaaaaaaa"),
@@ -112,14 +112,14 @@ mod tests {
                 ]),
                 &ReleaseScheme::Dated,
                 "origin",
-            )
-            .is_empty()
+            ),
+            Vec::<(BranchName, Vec<(BookmarkRef, CommitId)>)>::new()
         );
     }
 
     #[test]
     fn a_release_ref_on_an_untrusted_remote_never_counts() {
-        assert!(
+        assert_eq!(
             same_name_disagreements(
                 &tips(vec![
                     (local("release/2026-08-30"), "aaaaaaaa"),
@@ -128,8 +128,8 @@ mod tests {
                 ]),
                 &ReleaseScheme::Dated,
                 "origin",
-            )
-            .is_empty()
+            ),
+            Vec::<(BranchName, Vec<(BookmarkRef, CommitId)>)>::new()
         );
     }
 
