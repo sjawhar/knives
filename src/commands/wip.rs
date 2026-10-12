@@ -67,7 +67,10 @@ mod tests {
 
     #[test]
     fn a_file_only_one_claim_touches_is_not_a_finding() {
-        assert!(overlaps(&touching(&[("src/x.rs", &["one on r/a"])])).is_empty());
+        assert_eq!(
+            overlaps(&touching(&[("src/x.rs", &["one on r/a"])])),
+            Vec::<Finding>::new()
+        );
     }
 
     #[test]

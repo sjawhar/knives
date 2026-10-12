@@ -778,7 +778,7 @@ mod tests {
         // A repository nobody has notched is the normal case, not a failure.
         let dir = tempfile::tempdir().unwrap();
         let ledger = Ledger::at(dir.path().join("never-written"));
-        assert!(ledger.entries().unwrap().is_empty());
+        assert_eq!(ledger.entries().unwrap(), Vec::<Entry>::new());
     }
 
     #[test]

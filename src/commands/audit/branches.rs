@@ -792,7 +792,10 @@ mod tests {
             template.missing_from("## overview\nfix\n"),
             ["Approach".to_owned()]
         );
-        assert!(template.missing_from("# Overview\n# Approach\n").is_empty());
+        assert_eq!(
+            template.missing_from("# Overview\n# Approach\n"),
+            Vec::<String>::new()
+        );
     }
 
     #[test]

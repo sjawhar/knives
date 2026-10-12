@@ -849,8 +849,8 @@ release = "https://example.invalid/releases.git"
 
         let without = "[repos.demo]\nupstream = \"u\"\norigin = \"o\"\n";
         let registry = load(&write(dir.path(), without)).unwrap();
-        assert!(registry.repos["demo"].forbidden.is_empty());
-        assert!(RepoEntry::new("u", "o").forbidden.is_empty());
+        assert_eq!(registry.repos["demo"].forbidden, Vec::<String>::new());
+        assert_eq!(RepoEntry::new("u", "o").forbidden, Vec::<String>::new());
     }
 
     #[test]
