@@ -322,10 +322,10 @@ mod tests {
                 .expect("configured timeline"),
             vec![event]
         );
-        assert!(
+        assert_eq!(
             fake.pull_timeline(Path::new("/tmp"), &target, 8)
-                .expect("unconfigured timeline")
-                .is_empty()
+                .expect("unconfigured timeline"),
+            Vec::<TimelineEvent>::new()
         );
     }
 }

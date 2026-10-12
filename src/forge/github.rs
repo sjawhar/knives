@@ -1823,7 +1823,7 @@ printf '{}'
                 "Dependabot".to_owned()
             ]
         );
-        assert!(checks.hard_failure_names().is_empty());
+        assert_eq!(checks.hard_failure_names(), Vec::<String>::new());
         assert!(checks.failing() && !checks.has_hard_failure());
     }
 

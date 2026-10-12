@@ -1190,7 +1190,10 @@ mod tests {
         let ledger = crate::ledger::Ledger::at(path);
         let mut report = Report::default();
 
-        assert!(notches_from_ledger(Some(&ledger), &mut report).is_empty());
+        assert_eq!(
+            notches_from_ledger(Some(&ledger), &mut report),
+            Vec::<Notch>::new()
+        );
         assert_eq!(exit_for(&report), Exit::Incomplete);
     }
 

@@ -106,7 +106,7 @@ fn a_consumer_checkout_parked_behind_its_origin_does_not_produce_a_false_behind(
         "the stale checkout is annotated, not silently trusted: {:?}",
         scan.notes
     );
-    assert!(scan.problems.is_empty());
+    assert_eq!(scan.problems, Vec::<String>::new());
 }
 
 #[test]
@@ -127,7 +127,7 @@ fn a_dev_trunk_consumer_checkout_uses_its_origin_head_pin() {
         "the origin default branch is preserved: {:?}",
         scan.notes
     );
-    assert!(scan.problems.is_empty());
+    assert_eq!(scan.problems, Vec::<String>::new());
 }
 
 #[test]
@@ -152,7 +152,7 @@ fn a_consumer_without_an_origin_remote_uses_its_current_working_copy_pin() {
             consumer.display()
         )]
     );
-    assert!(scan.problems.is_empty());
+    assert_eq!(scan.problems, Vec::<String>::new());
 }
 #[test]
 fn consumers_reports_stale_and_behind_locks() {
