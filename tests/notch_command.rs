@@ -15,6 +15,9 @@ use std::path::Path;
 use std::process::Output;
 
 const UPSTREAM: &str = "https://forge.invalid/org/work.git";
+/// Where `a-repo`'s ledger lives: [`UPSTREAM`]'s `<owner>/<name>`, not the
+/// registry key, which a store refuses as a name an older knives used.
+const LEDGER: &str = "org/work";
 
 /// A config home with one managed repo, `a-repo`, known by its upstream.
 fn home() -> tempfile::TempDir {
@@ -255,11 +258,13 @@ fn a_write_pr_stamps_the_entry_and_a_pr_read_finds_it() {
 fn a_write_without_pr_uses_the_tracked_pull_stamp() {
     let checkout = checkout();
     let home = home();
-    std::fs::write(
-        home.path().join("state.json"),
-        r#"{"tracked_pulls":{"a-repo/feat/alpha":1157}}"#,
-    )
-    .expect("seed tracked pull");
+    lab::state_on_ledger(
+        home.path(),
+        LEDGER,
+        "feat/alpha",
+        knives::statement::StatementKind::Pull,
+        Some("1157"),
+    );
 
     let wrote = knives(
         &home,
@@ -284,11 +289,13 @@ fn a_write_without_pr_uses_the_tracked_pull_stamp() {
 fn a_subject_read_shows_that_refs_chronology_and_a_bare_read_windows_the_repo() {
     let checkout = checkout();
     let home = home();
-    std::fs::write(
-        home.path().join("state.json"),
-        r#"{"tracked_pulls":{"a-repo/feat/alpha":1157}}"#,
-    )
-    .expect("seed tracked pull");
+    lab::state_on_ledger(
+        home.path(),
+        LEDGER,
+        "feat/alpha",
+        knives::statement::StatementKind::Pull,
+        Some("1157"),
+    );
 
     for index in 0..42 {
         let text = format!("entry {index}");
@@ -314,6 +321,7 @@ fn a_subject_read_shows_that_refs_chronology_and_a_bare_read_windows_the_repo() 
         &["--json", "notch", "--repo", "a-repo"],
     );
     let parsed: serde_json::Value = serde_json::from_slice(&bare.stdout).expect("JSON");
+    // A bare read windows to the newest 20 notes and says how many it did not show.
     assert_eq!(parsed["matched"], 42);
     assert_eq!(parsed["entries"].as_array().expect("array").len(), 20);
     assert_eq!(parsed["entries"][0]["text"], "entry 22");
@@ -325,9 +333,10 @@ fn a_subject_read_shows_that_refs_chronology_and_a_bare_read_windows_the_repo() 
         checkout.path(),
         &["--json", "notch", "feat/alpha", "--repo", "a-repo"],
     );
+    // The statement event is part of feat/alpha's chronology too.
     let parsed: serde_json::Value = serde_json::from_slice(&subject.stdout).expect("JSON");
-    assert_eq!(parsed["matched"], 21);
-    assert_eq!(parsed["entries"].as_array().expect("array").len(), 21);
+    assert_eq!(parsed["matched"], 22);
+    assert_eq!(parsed["entries"].as_array().expect("array").len(), 22);
 
     // A pull-request read is not windowed either: it is that pull request's
     // whole chronology.
@@ -337,6 +346,8 @@ fn a_subject_read_shows_that_refs_chronology_and_a_bare_read_windows_the_repo() 
         checkout.path(),
         &["--json", "notch", "--pr", "1157", "--repo", "a-repo"],
     );
+    // The statement event itself is unstamped, so the pull request's chronology
+    // is the 21 notes it stamped.
     let parsed: serde_json::Value = serde_json::from_slice(&pull_request.stdout).expect("JSON");
     assert_eq!(parsed["matched"], 21);
     assert_eq!(parsed["entries"].as_array().expect("array").len(), 21);
@@ -348,7 +359,7 @@ fn an_unreadable_ledger_is_incomplete_and_an_unknown_repo_is_usage() {
     let home = home();
 
     // Given: a ledger directory holding a file that is not an entry
-    let ledger = home.path().join("ledger").join("a-repo");
+    let ledger = home.path().join("ledger").join(LEDGER);
     std::fs::create_dir_all(&ledger).expect("ledger directory");
     std::fs::write(
         ledger.join("20260815T221403.000000000Z-0000.md"),
@@ -382,6 +393,128 @@ fn an_unreadable_ledger_is_incomplete_and_an_unknown_repo_is_usage() {
         String::from_utf8_lossy(&unknown.stderr).contains("a-repo"),
         "was: {}",
         String::from_utf8_lossy(&unknown.stderr)
+    );
+}
+
+#[test]
+fn a_verify_past_an_entry_it_cannot_read_is_incomplete_and_names_it() {
+    // Given: a note, and an entry of a kind a newer knives writes.
+    let checkout = checkout();
+    let home = home();
+    let wrote = knives(
+        &home,
+        &checkout,
+        checkout.path(),
+        &["--text", "notch", "--repo", "a-repo", "-m", "a note"],
+    );
+    assert!(wrote.status.success(), "{}", stdout(&wrote));
+    let unknown = "20990101T000000.000000000Z-0000.md";
+    std::fs::write(
+        home.path().join("ledger").join(LEDGER).join(unknown),
+        "+++\nts = \"2099-01-01T00:00:00Z\"\nowner = \"x\"\nkind = \"verdict\"\n+++\nv\n",
+    )
+    .expect("an entry of an unknown kind");
+
+    for format in ["--json", "--text"] {
+        // When: the ledger's evidence is verified.
+        let verified = knives(
+            &home,
+            &checkout,
+            checkout.path(),
+            &[format, "notch", "--repo", "a-repo", "--verify"],
+        );
+
+        // Then: it did not check everything, and says which file it passed.
+        let out = stdout(&verified);
+        assert_eq!(verified.status.code(), Some(3), "{format}: {out}");
+        assert!(out.contains(unknown), "{format}: {out}");
+    }
+    let verified = knives(
+        &home,
+        &checkout,
+        checkout.path(),
+        &["--json", "notch", "--repo", "a-repo", "--verify"],
+    );
+    let report: serde_json::Value = serde_json::from_slice(&verified.stdout).expect("JSON");
+    assert_eq!(report["checked"], 1, "{report}");
+    assert_eq!(
+        report["problems"].as_array().map(Vec::len),
+        Some(1),
+        "{report}"
+    );
+}
+
+#[test]
+fn only_a_note_about_a_branch_reads_the_ledger_for_its_stated_pull_request() {
+    // Given: a ledger holding a file that is not an entry
+    let checkout = checkout();
+    let home = home();
+    let ledger = home.path().join("ledger").join(LEDGER);
+    std::fs::create_dir_all(&ledger).expect("ledger directory");
+    std::fs::write(
+        ledger.join("20260815T221403.000000000Z-0000.md"),
+        "not a ledger entry at all\n",
+    )
+    .expect("corrupt entry");
+    let write = |args: &[&str]| knives(&home, &checkout, checkout.path(), args);
+
+    // When / Then: a note that asks nothing about a branch's statements is an
+    // append, and an append reads no entry
+    for args in [
+        &[
+            "--text",
+            "notch",
+            "--repo",
+            "a-repo",
+            "-m",
+            "about the fork",
+        ][..],
+        &[
+            "--text",
+            "notch",
+            "#1157",
+            "--repo",
+            "a-repo",
+            "-m",
+            "about a pull request",
+        ][..],
+        &[
+            "--text",
+            "notch",
+            "feat/alpha",
+            "--pr",
+            "1157",
+            "--repo",
+            "a-repo",
+            "-m",
+            "numbered",
+        ][..],
+    ] {
+        let written = write(args);
+        assert_eq!(
+            written.status.code(),
+            Some(0),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&written.stderr)
+        );
+    }
+
+    // And: a note about a branch with no number asks for its stated pull
+    // request, so it cannot answer and says which file stopped it
+    let branch = write(&[
+        "--text",
+        "notch",
+        "feat/alpha",
+        "--repo",
+        "a-repo",
+        "-m",
+        "about a branch",
+    ]);
+    assert_eq!(branch.status.code(), Some(3));
+    assert!(
+        String::from_utf8_lossy(&branch.stderr).contains("0000.md"),
+        "the error must name the entry file; was: {}",
+        String::from_utf8_lossy(&branch.stderr)
     );
 }
 

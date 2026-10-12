@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::RepoName;
+use crate::ids::{RepoName, UpstreamName};
 
 #[cfg(test)]
 #[allow(
@@ -157,6 +157,13 @@ pub struct RepoEntry {
     /// branches stated `--fork-only` are exempt. Case-insensitive substrings.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub forbidden: Vec<String>,
+    /// The `<owner>/<name>` of the repository this fork's ledger belongs to:
+    /// what carries its entries between machines. A machine shares the fork's
+    /// ledger through the git repository at its ledger root whose `origin` is
+    /// that repository ([`crate::ledger_sweep::destinations`]). Absent, the
+    /// fork's ledger is not shared and stays on each machine that writes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ledger: Option<String>,
 }
 
 impl RepoEntry {
@@ -172,6 +179,7 @@ impl RepoEntry {
             consumers: Vec::new(),
             workspaces: None,
             forbidden: Vec::new(),
+            ledger: None,
         }
     }
 
@@ -182,6 +190,22 @@ impl RepoEntry {
             Role::Origin => &self.origin,
             Role::Release => self.release.as_deref().unwrap_or(&self.origin),
         }
+    }
+
+    /// The name this fork's ledger directory and its state are kept under:
+    /// `<owner>/<name>` of its `upstream`, lowercased, so every machine keys
+    /// them alike whatever its registry calls the fork or however it spells
+    /// the owner. [`crate::ledger::default_ledger_path`] says why the case
+    /// goes.
+    ///
+    /// An `upstream` that is not a forge URL (a filesystem path) names no
+    /// repository another machine could share, and the fork is kept under its
+    /// registry `key`, as spelled.
+    pub fn upstream_name(&self, key: &str) -> UpstreamName {
+        UpstreamName::new(
+            crate::remote_url::remote_slug(&self.upstream)
+                .map_or_else(|| key.to_owned(), str::to_ascii_lowercase),
+        )
     }
 
     /// The branch upstream treats as its trunk: what we fork from, measure
@@ -282,6 +306,15 @@ impl RepoEntry {
             "origin"
         }
     }
+
+    /// Whether [`RepoEntry::ledger`] names the repository `slug`, an
+    /// `<owner>/<name>` spelled as its [`repository_slug`]: letter case and
+    /// a `.git` suffix do not matter, as they do not for any repository
+    /// knives compares, and [`load`] keeps the ledger in that spelling too.
+    /// `false` for a fork whose ledger is not shared.
+    pub fn shares_ledger_with(&self, slug: &str) -> bool {
+        self.ledger.as_deref() == Some(slug)
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -378,7 +411,53 @@ impl Registry {
     pub fn names(&self) -> impl Iterator<Item = RepoName> + '_ {
         self.repos.keys().map(|name| RepoName::new(name.clone()))
     }
+
+    /// The name the fork `text` names is kept under: `text` is its registry
+    /// key, or its [`RepoEntry::upstream_name`] in any letter case.
+    pub fn resolve(&self, text: &str) -> Option<UpstreamName> {
+        self.repos.get_key_value(text).map_or_else(
+            || {
+                self.repos.iter().find_map(|(key, entry)| {
+                    let upstream = entry.upstream_name(key);
+                    upstream
+                        .as_str()
+                        .eq_ignore_ascii_case(text)
+                        .then_some(upstream)
+                })
+            },
+            |(key, entry)| Some(entry.upstream_name(key)),
+        )
+    }
+
+    /// The fork kept under `upstream` ([`RepoEntry::upstream_name`]): how a
+    /// ledger statement names a fork, the one spelling every machine's
+    /// registry agrees on. A registry key is not looked up, since another
+    /// machine's registry may give it to another fork.
+    pub fn kept_under(&self, upstream: &UpstreamName) -> Option<&RepoEntry> {
+        self.repos
+            .iter()
+            .find_map(|(key, entry)| (entry.upstream_name(key) == *upstream).then_some(entry))
+    }
+
+    /// Each registry key that is not the name its fork's ledger and state are
+    /// kept under, with that name: what an older knives, which kept them
+    /// under the registry key, left for `knives ledger migrate` to rename. A
+    /// fork whose upstream is a filesystem path is kept under its key still,
+    /// and is not listed.
+    pub fn former_names(&self) -> FormerNames {
+        self.repos
+            .iter()
+            .filter_map(|(key, entry)| {
+                let upstream = entry.upstream_name(key);
+                (upstream.as_str() != key).then(|| (key.clone(), upstream))
+            })
+            .collect()
+    }
 }
+
+/// Each registry key an older knives kept a fork's ledger and state under,
+/// with the name they are kept under now ([`Registry::former_names`]).
+pub type FormerNames = BTreeMap<String, UpstreamName>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -428,15 +507,15 @@ pub fn home_dir() -> Option<PathBuf> {
 /// What the scan callers print when [`home_dir`] is `None`.
 pub const NO_HOME: &str = "HOME is not set; knives scans $HOME for checkouts";
 
-/// Where the registry lives.
+/// The directory holding the registry, the state file and the ledger.
 ///
 /// `KNIVES_CONFIG_HOME` wins over `XDG_CONFIG_HOME` so this tool can be pointed
 /// elsewhere without moving every other tool's config too. Redirecting
 /// `XDG_CONFIG_HOME` to isolate this tool also hides the forge CLI's
 /// credentials, which turns a working setup into an authentication failure.
-pub fn default_config_path() -> PathBuf {
+pub fn default_config_home() -> PathBuf {
     if let Ok(home) = std::env::var("KNIVES_CONFIG_HOME") {
-        return PathBuf::from(home).join("repos.toml");
+        return PathBuf::from(home);
     }
     let base = std::env::var("XDG_CONFIG_HOME").map_or_else(
         |_| {
@@ -449,7 +528,12 @@ pub fn default_config_path() -> PathBuf {
         },
         PathBuf::from,
     );
-    base.join("knives").join("repos.toml")
+    base.join("knives")
+}
+
+/// Where the registry lives, in [`default_config_home`].
+pub fn default_config_path() -> PathBuf {
+    default_config_home().join("repos.toml")
 }
 
 /// Read the registry. A missing file is an empty registry, which the commands
@@ -484,21 +568,18 @@ pub fn load(path: &Path) -> Result<Registry, ConfigError> {
             });
         }
     };
-    for name in registry.repos.keys() {
-        if name.is_empty()
-            || name == "."
-            || name == ".."
-            || Path::new(name).is_absolute()
-            || name.contains('/')
-            || name.contains('\\')
-        {
+    for (name, entry) in &registry.repos {
+        // A fork whose upstream is a filesystem path is kept under its key.
+        if !crate::ledger::is_ledger_component(name) {
             return Err(ConfigError::Invalid {
                 path: path.to_owned(),
                 detail: format!("repository key {name:?} is not a safe path component"),
             });
         }
+        checked_upstream_name(name, entry, path)?;
     }
     reject_shared_upstreams(&registry, path)?;
+    reject_shared_upstream_names(&registry, path)?;
     reject_tilde_paths_without_a_home(&registry, path)?;
     let config_home = path.parent().unwrap_or_else(|| Path::new(".")).to_owned();
     for (name, entry) in &mut registry.repos {
@@ -532,6 +613,7 @@ pub fn load(path: &Path) -> Result<Registry, ConfigError> {
             }
         }
         checked_forbidden(name, &entry.forbidden, path)?;
+        entry.ledger = checked_ledger(name, entry, path)?;
     }
     for slug in &registry.trust.repos {
         if !is_forge_slug(slug) {
@@ -625,6 +707,75 @@ fn checked_release_branch(entry: &RepoEntry, path: &Path) -> Result<(), ConfigEr
         });
     }
     Ok(())
+}
+
+/// A `ledger` names a repository, so it is `<owner>/<name>`, before and after
+/// [`repository_slug`] makes it the one spelling it is kept as. A fork whose
+/// upstream is a filesystem path is kept under its registry key, which names
+/// no repository another machine checks out, so its ledger has nothing to be
+/// shared as.
+fn checked_ledger(
+    name: &str,
+    entry: &RepoEntry,
+    path: &Path,
+) -> Result<Option<String>, ConfigError> {
+    let Some(ledger) = entry.ledger.as_deref() else {
+        return Ok(None);
+    };
+    let invalid = |detail: String| {
+        Err(ConfigError::Invalid {
+            path: path.to_owned(),
+            detail,
+        })
+    };
+    let kept = repository_slug(ledger);
+    if !is_forge_slug(ledger) || !is_forge_slug(&kept) {
+        return invalid(format!(
+            "[repos.{name}] ledger names the repository its ledger belongs to as \
+             \"<owner>/<name>\"; found \"{ledger}\""
+        ));
+    }
+    if crate::remote_url::remote_slug(&entry.upstream).is_none() {
+        return invalid(format!(
+            "[repos.{name}] sets ledger, but its upstream {} is not a forge URL, so its \
+             ledger is kept under the registry key and no other machine can share it",
+            entry.upstream
+        ));
+    }
+    Ok(Some(kept))
+}
+
+/// The one spelling of the repository `slug`, an `<owner>/<name>`: lowercase,
+/// without a `.git` suffix in any case, the two things that do not matter to
+/// a forge or to any repository knives compares
+/// ([`crate::remote_url::same_remote`]). What [`load`] keeps a
+/// [`RepoEntry::ledger`] as, and what a repository's `origin` is compared to
+/// it as ([`RepoEntry::shares_ledger_with`]).
+pub(crate) fn repository_slug(slug: &str) -> String {
+    crate::remote_url::without_git_suffix(slug).to_ascii_lowercase()
+}
+
+/// A fork whose upstream is a forge URL is kept under its `<owner>/<name>`
+/// ([`RepoEntry::upstream_name`]), so that name is a path below the ledger
+/// root: one that is not two plain directory names would put the fork's
+/// entries outside the root, or in the git directory over it. A path
+/// upstream is kept under its key, which [`load`] has already checked.
+fn checked_upstream_name(name: &str, entry: &RepoEntry, path: &Path) -> Result<(), ConfigError> {
+    let Some(slug) = crate::remote_url::remote_slug(&entry.upstream) else {
+        return Ok(());
+    };
+    if crate::ledger::is_fork_directory(slug) {
+        return Ok(());
+    }
+    Err(ConfigError::Invalid {
+        path: path.to_owned(),
+        detail: format!(
+            "[repos.{name}] upstream {} names the repository {slug:?}, and a fork is kept in \
+             the ledger directory <owner>/<name> of its upstream: neither may be empty, `.`, \
+             `..` or `.git`, or hold a `\\` or a control character",
+            entry.upstream
+        ),
+    })
 }
 
 /// A blank term is a substring of every line, so the scan would report every
@@ -723,6 +874,30 @@ fn reject_shared_upstreams(registry: &Registry, path: &Path) -> Result<(), Confi
     Ok(())
 }
 
+/// A fork's ledger directory, its claims and every statement about its
+/// branches are kept under [`RepoEntry::upstream_name`], which has no host:
+/// two forges can each hold an `<owner>/<name>`, and forks of both would
+/// read and write one ledger and one set of claims. The first pair by name
+/// is reported.
+fn reject_shared_upstream_names(registry: &Registry, path: &Path) -> Result<(), ConfigError> {
+    let mut kept: BTreeMap<UpstreamName, &String> = BTreeMap::new();
+    for (key, entry) in &registry.repos {
+        let upstream = entry.upstream_name(key);
+        if let Some(first) = kept.get(&upstream) {
+            return Err(ConfigError::Invalid {
+                path: path.to_owned(),
+                detail: format!(
+                    "[repos.{first}] and [repos.{key}] are both kept under {upstream}, so their \
+                     ledgers, claims and branch statements would merge; a fork is kept under \
+                     its upstream's <owner>/<name>, whatever forge holds it"
+                ),
+            });
+        }
+        kept.insert(upstream, key);
+    }
+    Ok(())
+}
+
 /// An entry's `workspaces`, expanded like every registry path and checked.
 ///
 /// Empty would resolve to the config home itself, putting every branch workspace
@@ -746,17 +921,25 @@ fn checked_workspaces(
     Ok(Some(expand_registry_path(raw, config_home)))
 }
 
-fn is_forge_slug(value: &str) -> bool {
+/// `<owner>/<name>` as a forge spells a repository, and not a path.
+///
+/// A repository's name may start with `.` (`.github`, `.knives-ledger`); an
+/// owner's may not, and neither may be `.` or `..`, which only a path spells.
+/// The one rule for every slug the registry holds and every path made from
+/// one ([`crate::forge_cache::consumer_cache_path`]): a slug the registry
+/// takes and a cache then refuses is a consumer silently without one.
+pub(crate) fn is_forge_slug(value: &str) -> bool {
     let Some((owner, repository)) = value.split_once('/') else {
         return false;
     };
-    let has_path_syntax =
-        |segment: &str| segment.starts_with(['/', '~', '.']) || segment.contains('\\');
-    !owner.is_empty()
-        && !repository.is_empty()
-        && !repository.contains('/')
-        && !has_path_syntax(owner)
-        && !has_path_syntax(repository)
+    let has_path_syntax = |segment: &str| {
+        segment.is_empty()
+            || segment == "."
+            || segment == ".."
+            || segment.starts_with(['/', '~'])
+            || segment.contains(['/', '\\'])
+    };
+    !has_path_syntax(owner) && !owner.starts_with('.') && !has_path_syntax(repository)
 }
 
 #[cfg(test)]
@@ -803,6 +986,41 @@ release = "https://example.invalid/releases.git"
 
         let error = load(&write(dir.path(), text)).unwrap_err().to_string();
         assert!(error.contains("../escape"), "was: {error}");
+    }
+
+    #[test]
+    fn an_upstream_whose_name_leaves_the_ledger_root_is_rejected() {
+        // The ledger keeps a fork under its upstream's `<owner>/<name>`, so
+        // the URL spells a directory: `..` would leave the ledger root, and
+        // `.git` would reach into the git directory of the repository over it.
+        let dir = tempfile::tempdir().unwrap();
+        for upstream in [
+            "https://forge.example/../..",
+            "https://forge.example/acme/..",
+            "https://forge.example/.git/hooks",
+            "git@forge.example:acme/.GIT.git",
+            "https://forge.example/acme/back\\slash",
+        ] {
+            let text = format!("[repos.tool]\nupstream = \"{upstream}\"\norigin = \"o\"\n")
+                .replace('\\', "\\\\");
+            let error = load(&write(dir.path(), &text)).unwrap_err().to_string();
+            assert!(
+                error.contains("[repos.tool] upstream") && error.contains("ledger directory"),
+                "{upstream}: {error}"
+            );
+        }
+        // TOML holds a control character only as an escape.
+        let text = "[repos.tool]\nupstream = \"https://forge.example/ac\\u001bme/tool\"\n\
+                    origin = \"o\"\n";
+        let error = load(&write(dir.path(), text)).unwrap_err().to_string();
+        assert!(
+            error.contains("[repos.tool] upstream") && error.contains("control character"),
+            "{error}"
+        );
+        // A repository name may still start with a dot, as a forge allows.
+        let text =
+            "[repos.tool]\nupstream = \"https://forge.example/acme/.github\"\norigin = \"o\"\n";
+        assert!(load(&write(dir.path(), text)).is_ok());
     }
 
     #[test]
@@ -980,6 +1198,96 @@ release = "https://example.invalid/releases.git"
         // Then: it fails at parse time, naming the field, not later at query time
         let message = result.unwrap_err().to_string();
         assert!(message.contains("upstream"), "message was: {message}");
+    }
+
+    #[test]
+    fn a_ledger_names_the_repository_a_forks_ledger_belongs_to() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = "[repos.demo]\nupstream = \"https://forge.example/org/demo\"\n\
+                    origin = \"o\"\nledger = \"Company/Ledger.git\"\n\n\
+                    [repos.shouted]\nupstream = \"https://forge.example/org/shouted\"\n\
+                    origin = \"q\"\nledger = \"company/ledger.GIT\"\n\n\
+                    [repos.other]\nupstream = \"https://forge.example/org/other\"\norigin = \"p\"\n";
+        let registry = load(&write(dir.path(), text)).unwrap();
+        // Every spelling of one repository is kept as one value: lowercase,
+        // with a `.git` suffix in any case gone.
+        for name in ["demo", "shouted"] {
+            let entry = &registry.repos[name];
+            assert_eq!(entry.ledger.as_deref(), Some("company/ledger"), "{name}");
+            assert!(entry.shares_ledger_with("company/ledger"), "{name}");
+            assert!(!entry.shares_ledger_with("company/elsewhere"), "{name}");
+        }
+        assert_eq!(registry.repos["other"].ledger, None);
+        assert!(!registry.repos["other"].shares_ledger_with("company/ledger"));
+    }
+
+    #[test]
+    fn a_ledger_that_is_only_a_git_suffix_is_refused() {
+        // `acme/.GIT` passes as a name, but without its suffix it names no
+        // repository.
+        let dir = tempfile::tempdir().unwrap();
+        let text = "[repos.demo]\nupstream = \"https://forge.example/org/demo\"\n\
+                    origin = \"o\"\nledger = \"acme/.GIT\"\n";
+        let error = load(&write(dir.path(), text)).unwrap_err().to_string();
+        assert!(error.contains("found \"acme/.GIT\""), "was: {error}");
+    }
+
+    #[test]
+    fn a_ledger_repository_whose_name_starts_with_a_dot_loads() {
+        // Given: a fork sharing its ledger with a dot-named repository, as a
+        // personal ledger repository is named.
+        let dir = tempfile::tempdir().unwrap();
+        let text = "[repos.demo]\nupstream = \"https://forge.example/org/demo\"\n\
+                    origin = \"o\"\nledger = \"sjawhar/.knives-ledger\"\n";
+
+        // Then: it loads and names that repository.
+        let registry = load(&write(dir.path(), text)).unwrap();
+        assert!(registry.repos["demo"].shares_ledger_with("sjawhar/.knives-ledger"));
+
+        // And: `.` and `..`, which only a path spells, are still refused,
+        // as is an owner a path would spell.
+        for refused in [
+            "sjawhar/.",
+            "sjawhar/..",
+            "./ledger",
+            "../ledger",
+            ".hidden/ledger",
+        ] {
+            let text = format!(
+                "[repos.demo]\nupstream = \"https://forge.example/org/demo\"\n\
+                 origin = \"o\"\nledger = \"{refused}\"\n"
+            );
+            let error = load(&write(dir.path(), &text)).unwrap_err().to_string();
+            assert!(
+                error.contains(&format!("found \"{refused}\"")),
+                "{refused}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_ledger_that_is_not_a_repository_or_has_no_forge_upstream_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let not_a_slug = "[repos.demo]\nupstream = \"https://forge.example/org/demo\"\n\
+                          origin = \"o\"\nledger = \"~/ledger\"\n";
+        let error = load(&write(dir.path(), not_a_slug))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("[repos.demo] ledger names the repository")
+                && error.contains("found \"~/ledger\""),
+            "was: {error}"
+        );
+
+        let path_upstream = "[repos.demo]\nupstream = \"/srv/upstream\"\n\
+                             origin = \"o\"\nledger = \"company/ledger\"\n";
+        let error = load(&write(dir.path(), path_upstream))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("[repos.demo] sets ledger, but its upstream /srv/upstream"),
+            "was: {error}"
+        );
     }
 
     #[test]
@@ -1184,6 +1492,23 @@ release = "https://example.invalid/releases.git"
             error.contains(
                 "[repos.a] and [repos.b] share upstream https://forge.example/org/tool; identity must be unique"
             ),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn two_upstreams_with_one_owner_and_name_on_different_hosts_are_rejected() {
+        // Two forges can each hold an `acme/tool`; the ledger and the state
+        // keep a fork under `<owner>/<name>` alone, so both would read and
+        // write one ledger directory and one set of claims.
+        let dir = tempfile::tempdir().unwrap();
+        let text = "[repos.a]\nupstream = \"https://forge.example/Acme/Tool\"\n\
+                    origin = \"https://forge.example/ours/tool\"\n\
+                    [repos.b]\nupstream = \"git@other.example:acme/tool.git\"\n\
+                    origin = \"https://other.example/theirs/tool\"\n";
+        let error = load(&write(dir.path(), text)).unwrap_err().to_string();
+        assert!(
+            error.contains("[repos.a] and [repos.b] are both kept under acme/tool"),
             "{error}"
         );
     }

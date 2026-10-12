@@ -194,13 +194,11 @@ pub struct ConsumerCache {
     pub files: std::collections::BTreeMap<String, String>,
 }
 
-/// `<root>/consumers/<owner>/<repo>.json`.
+/// `<root>/consumers/<owner>/<repo>.json`, for a slug the registry takes as a
+/// consumer ([`crate::config::is_forge_slug`]).
 pub fn consumer_cache_path(root: &std::path::Path, slug: &str) -> Option<std::path::PathBuf> {
     let (owner, repository) = slug.split_once('/')?;
-    let path_syntax = |segment: &str| {
-        segment.is_empty() || segment.starts_with(['/', '~', '.']) || segment.contains('\\')
-    };
-    (!path_syntax(owner) && !path_syntax(repository) && !repository.contains('/')).then(|| {
+    crate::config::is_forge_slug(slug).then(|| {
         root.join("consumers")
             .join(owner)
             .join(format!("{repository}.json"))
@@ -333,8 +331,33 @@ mod tests {
         );
         assert!(
             consumer_cache_path(directory.path(), "../repo").is_none()
-                && consumer_cache_path(directory.path(), "owner/.repo").is_none()
+                && consumer_cache_path(directory.path(), ".owner/repo").is_none()
+                && consumer_cache_path(directory.path(), "owner/..").is_none()
                 && consumer_cache_path(directory.path(), "owner/repo/extra").is_none()
+        );
+        // A dot-named repository, which the registry takes as a consumer,
+        // has a cache too, rather than silently going without one.
+        let dotted = "org/.github";
+        let registry = tempfile::tempdir().expect("registry directory");
+        let registry_path = registry.path().join("repos.toml");
+        std::fs::write(
+            &registry_path,
+            format!(
+                "[repos.demo]\nupstream = \"https://forge.example/org/demo\"\n\
+                 origin = \"o\"\nconsumers = [\"{dotted}\"]\n"
+            ),
+        )
+        .expect("write registry");
+        assert!(crate::config::load(&registry_path).is_ok());
+        assert_eq!(
+            consumer_cache_path(directory.path(), dotted),
+            Some(
+                directory
+                    .path()
+                    .join("consumers")
+                    .join("org")
+                    .join(".github.json")
+            )
         );
         let cache = consumer_cache(slug);
 

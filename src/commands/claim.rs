@@ -9,8 +9,22 @@
 // allow: SIZE_OK: claim coordination keeps identity-resolution behavior beside its tests.
 
 use crate::commands::hook::owner_for;
-use crate::ids::RepoName;
+use crate::config::Registry;
+use crate::ids::UpstreamName;
 use crate::store::{Claim, OwnerKind};
+
+/// The registry the current directory was bound against, and the fork it is
+/// inside, by the name its claims are kept under, when it is inside one.
+///
+/// Together they name, from the claims in knives state, who is acting there.
+/// The registry also says which names a state file an older knives left still
+/// keeps forks under, and such a file is refused rather than read
+/// ([`crate::store::Store::open`]).
+#[derive(Debug, Clone, Copy)]
+pub struct Bound<'a> {
+    pub registry: &'a Registry,
+    pub upstream: Option<&'a UpstreamName>,
+}
 
 /// A claimant and the source that established its name.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,34 +151,56 @@ pub const HARNESS_SESSION_VARIABLES: [&str; 3] =
 /// Resolves the identity that should own a claim.
 ///
 /// A harness that names its session (`HARNESS_SESSION_VARIABLES`) is the
-/// identity. When none does, `repo` — the fork the caller already bound
-/// (dispatch binds the working directory once per invocation; a verb passes the
-/// fork it acts on) — can identify its active owner from knives state. The OS
-/// user is the fallback for a human at a terminal.
+/// identity. When none does, `bound` — the fork the caller already bound, by
+/// the name its claims are kept under (dispatch binds the working directory
+/// once per invocation; a verb passes the fork it acts on) — can identify its
+/// active owner from knives state. The OS user is the fallback for a human at a
+/// terminal.
 ///
 /// A blank harness variable is a harness bug, not an identity: every session of
 /// that harness would share one claim.
-pub fn current_identity(repo: Option<&RepoName>) -> anyhow::Result<Identity> {
-    if let Some(owner) = HARNESS_SESSION_VARIABLES.iter().find_map(|name| {
-        std::env::var(name)
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-    }) {
-        return Ok(Identity {
-            owner,
-            kind: OwnerKind::HarnessSession,
-        });
+pub fn current_identity(bound: Bound<'_>) -> anyhow::Result<Identity> {
+    if let Some(identity) = harness_identity() {
+        return Ok(identity);
     }
-    if let Some(owner) = owner_for(repo)? {
+    if let Some(owner) = owner_for(bound)? {
         return Ok(Identity {
             owner,
             kind: OwnerKind::WorkspaceDerived,
         });
     }
-    Ok(Identity {
+    Ok(os_user())
+}
+
+/// [`current_identity`] for a caller standing in no fork.
+///
+/// No claim in knives state can name it: the harness's session, else the OS
+/// user. What a caller that has no registry to bind against, or no fork to
+/// act on, is.
+pub fn identity_outside_a_fork() -> Identity {
+    harness_identity().unwrap_or_else(os_user)
+}
+
+/// The session a harness names (`HARNESS_SESSION_VARIABLES`), if one does.
+fn harness_identity() -> Option<Identity> {
+    HARNESS_SESSION_VARIABLES
+        .iter()
+        .find_map(|name| {
+            std::env::var(name)
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
+        .map(|owner| Identity {
+            owner,
+            kind: OwnerKind::HarnessSession,
+        })
+}
+
+fn os_user() -> Identity {
+    Identity {
         owner: std::env::var("USER").unwrap_or_else(|_| "unknown".to_owned()),
         kind: OwnerKind::OsUser,
-    })
+    }
 }
 
 #[cfg(test)]
@@ -215,7 +251,11 @@ mod tests {
         environment.remove("OMP_SESSION_ID");
         environment.set("USER", "terminal-user");
 
-        let identity = current_identity(None).unwrap();
+        let identity = current_identity(Bound {
+            registry: &Registry::default(),
+            upstream: None,
+        })
+        .unwrap();
 
         assert_eq!(identity.owner, "terminal-user");
         assert_eq!(identity.kind, crate::store::OwnerKind::OsUser);
@@ -231,7 +271,11 @@ mod tests {
             "USER",
         ]);
         environment.set("KNIVES_OWNER", "agent-one");
-        let identity = current_identity(None).unwrap();
+        let identity = current_identity(Bound {
+            registry: &Registry::default(),
+            upstream: None,
+        })
+        .unwrap();
 
         assert_eq!(identity.owner, "agent-one");
         assert_eq!(identity.kind, crate::store::OwnerKind::HarnessSession);
@@ -250,7 +294,11 @@ mod tests {
         environment.set("CLAUDE_CODE_SESSION_ID", "abc-123");
         environment.set("USER", "terminal-user");
 
-        let identity = current_identity(None).unwrap();
+        let identity = current_identity(Bound {
+            registry: &Registry::default(),
+            upstream: None,
+        })
+        .unwrap();
 
         assert_eq!(identity.owner, "abc-123");
         assert_eq!(identity.kind, crate::store::OwnerKind::HarnessSession);
@@ -273,7 +321,11 @@ mod tests {
         environment.set("OMP_SESSION_ID", "01a0-session");
         environment.set("USER", "terminal-user");
 
-        let identity = current_identity(None).unwrap();
+        let identity = current_identity(Bound {
+            registry: &Registry::default(),
+            upstream: None,
+        })
+        .unwrap();
 
         assert_eq!(identity.owner, "01a0-session");
         assert_eq!(identity.kind, crate::store::OwnerKind::HarnessSession);
@@ -296,7 +348,11 @@ mod tests {
         environment.remove("OMP_SESSION_ID");
         environment.set("USER", "terminal-user");
 
-        let identity = current_identity(None).unwrap();
+        let identity = current_identity(Bound {
+            registry: &Registry::default(),
+            upstream: None,
+        })
+        .unwrap();
 
         assert_eq!(identity.owner, "terminal-user");
         assert_eq!(identity.kind, crate::store::OwnerKind::OsUser);
@@ -318,7 +374,11 @@ mod tests {
         environment.remove("CLAUDE_CODE_SESSION_ID");
         environment.remove("OMP_SESSION_ID");
         environment.set("USER", "terminal-user");
-        let identity = current_identity(None).unwrap();
+        let identity = current_identity(Bound {
+            registry: &Registry::default(),
+            upstream: None,
+        })
+        .unwrap();
 
         assert_eq!(identity.owner, "terminal-user");
         assert_eq!(identity.kind, crate::store::OwnerKind::OsUser);
@@ -354,7 +414,11 @@ mod tests {
         environment.remove("OMP_SESSION_ID");
         environment.set("USER", "terminal-user");
 
-        let identity = current_identity(Some(&RepoName::new("repo"))).unwrap();
+        let identity = current_identity(Bound {
+            registry: &Registry::default(),
+            upstream: Some(&UpstreamName::new("repo")),
+        })
+        .unwrap();
 
         assert_eq!(identity.owner, "state-owner");
         assert_eq!(identity.kind, crate::store::OwnerKind::WorkspaceDerived);
@@ -381,7 +445,11 @@ mod tests {
         environment.remove("OMP_SESSION_ID");
         environment.set("USER", "state-owner");
 
-        let identity = current_identity(Some(&RepoName::new("repo"))).unwrap();
+        let identity = current_identity(Bound {
+            registry: &Registry::default(),
+            upstream: Some(&UpstreamName::new("repo")),
+        })
+        .unwrap();
 
         assert_eq!(identity.kind, crate::store::OwnerKind::OsUser);
     }
@@ -407,7 +475,11 @@ mod tests {
         environment.remove("OMP_SESSION_ID");
         environment.set("USER", "terminal-user");
 
-        let identity = current_identity(None).unwrap();
+        let identity = current_identity(Bound {
+            registry: &Registry::default(),
+            upstream: None,
+        })
+        .unwrap();
 
         assert_eq!(identity.owner, "terminal-user");
         assert_eq!(identity.kind, crate::store::OwnerKind::OsUser);

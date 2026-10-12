@@ -45,6 +45,7 @@ base = "main"
 release = "https://forge.example/company/libcore"
 consumers = ["company/workbench"]
 forbidden = ["acme-corp", "internal.example"]
+ledger = "company/knives-ledger"
 
 [repos.tool]
 upstream = "https://forge.example/org/tool"
@@ -58,8 +59,12 @@ owners = ["ours", "company"]
 roots = ["~/projects/company"]
 ```
 
-`upstream` and `origin` are required. Two entries cannot share upstream, and a
-`path` field is refused. Optional fields:
+`upstream` and `origin` are required. Two entries cannot share upstream, nor an
+upstream `<owner>/<name>` on different forges: a fork's ledger, claims and
+branch statements are kept under that name, which has no host, so the two would
+merge. That name is a directory under the ledger, so an upstream whose owner or
+name is empty, `.`, `..` or `.git`, or holds a `\` or a control character, is
+refused. A `path` field is refused. Optional fields:
 
 - `base`: upstream trunk used for branching, trunk probes and PR targets;
   defaults to `main`. Upstreams using another trunk, such as `dev`, state it here.
@@ -79,6 +84,22 @@ roots = ["~/projects/company"]
   Blank terms or case-insensitive duplicates are refused with the entry named.
   Absent/empty means no scan and no `forbidden` field. Audit reports hits, never
   blocks on them; no other command reads the list.
+- `ledger`: the `<owner>/<name>` of the repository this fork's ledger belongs
+  to, through which its entries travel between machines. The name may start
+  with a dot (`someone/.knives-ledger`); the owner may not. Letter case and a
+  `.git` suffix do not matter: knives keeps the value lowercase and without the
+  suffix, the spelling `knives repos` reports. Absent, the fork's ledger is not
+  shared: it stays on each machine that writes it. A machine carries the fork's
+  entries through the git directory over its ledger root whose `origin` is that
+  repository, `~/.config/knives/ledger/.git` or one in
+  `~/.config/knives/ledger-repositories/`, and which names the machine as
+  `knives.machine` in its git config; the
+  [ledger reference](ledger.md#sharing-between-machines) has the setup.
+  Refused when it is not `<owner>/<name>`, or when the fork's `upstream` is a
+  filesystem path, which names no repository another machine could share.
+  Every entry refuses a field it does not know, so an older knives refuses a
+  file that sets `ledger`: upgrade knives on every machine that reads the file
+  before adding it.
 
 ## How a checkout is found
 
@@ -86,6 +107,15 @@ The entry is identified by its upstream matching the checkout's upstream remote;
 case, trailing slash and `.git` suffix do not matter. Standing inside it or a
 `start` workspace binds it. Origin/release mismatches do not prevent binding;
 status and repos note `origin remote is <X>; registry says <Y>` (or release).
+
+A checkout whose origin remote is an entry's but whose upstream remote matches
+no entry does not bind: one side was renamed and the other was not, and which
+spelling is right is yours to choose. Standing inside it, `status` reports the
+entry's row with the problem; `repos`, `status --all` and naming the repo report
+it in place of `not on this machine`; the session hook puts it in the agent's
+context in place of the claims notice. Each names the checkout, the entry, both
+upstream spellings and the two fixes: `git -C <checkout> remote set-url upstream
+<registry's>`, or `upstream = "<checkout's>"` under the entry in `repos.toml`.
 
 From elsewhere, naming a repo and sweeps scan HOME to depth three. `repos`
 **always** scans, including when invoked inside a checkout outside that scope.
@@ -126,9 +156,10 @@ print `could not read: <what>` once on stderr in every output format.
 A sweep omits a **definitely missing** entry, printing
 `knives: <name>: not on this machine` to stderr, and exits according to entries
 it did inspect. It does not promise a document row per registry entry.
-Ambiguous entries stay as problem rows. If scan errors could conceal a missing
-checkout, that entry also stays as a problem row; it is not treated as known
-absence. Status prefixes such a row's problem with `could not gather:`.
+Ambiguous entries stay as problem rows, and so do entries found only under a
+disagreeing upstream. If scan errors could conceal a missing checkout, that
+entry also stays as a problem row; it is not treated as known absence. Status
+prefixes such a row's problem with `could not gather:`.
 
 ## Trust is guidance injection, not fork access
 

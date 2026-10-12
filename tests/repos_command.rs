@@ -77,6 +77,54 @@ fn repos_json_lists_every_entry_with_a_null_path_for_one_not_on_this_machine() {
 }
 
 #[test]
+fn repos_json_reports_each_ledger_as_one_spelling_before_the_ledger_is_migrated() {
+    // Given: a registry sharing one fork's ledger, spelled with capitals
+    // and an uppercase `.git`, and one fork not sharing it; and a config
+    // home an older knives left, which every ledger reader refuses until
+    // `knives ledger migrate` runs: statements in the state file, and a
+    // note filed under the registry key.
+    let home = tempfile::tempdir().expect("config home");
+    std::fs::write(
+        home.path().join("repos.toml"),
+        format!(
+            "[repos.tool]\nupstream = \"{TOOL}\"\norigin = \"https://forge.invalid/acme/tool\"\n\
+             ledger = \"Acme/Ledger.GIT\"\n\n\
+             [repos.ghost]\nupstream = \"https://forge.invalid/org/ghost\"\n\
+             origin = \"https://forge.invalid/acme/ghost\"\n"
+        ),
+    )
+    .expect("registry");
+    std::fs::write(
+        home.path().join("state.json"),
+        r#"{"claims": {}, "tracked_pulls": {"tool/feat/alpha": 12}}"#,
+    )
+    .expect("an older knives' state file");
+    lab::note(
+        home.path(),
+        "tool",
+        "2026-01-01T00:00:00Z",
+        "written by an older knives",
+    );
+    let scan_home = tempfile::tempdir().expect("scan home");
+
+    // When: the listing runs, as the installer runs it before `migrate`.
+    let output = repos(&home, scan_home.path(), &["--json", "repos"]);
+
+    // Then: it answers, with its JSON on stdout, and each row that sets a
+    // ledger carries it lowercase and without its suffix; the other row
+    // carries none.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stdout}\n{stderr}");
+    let report: Value = serde_json::from_str(&stdout).expect("json document");
+    let rows = report["repos"].as_array().expect("rows");
+    assert_eq!(rows[0]["name"], "ghost", "{report}");
+    assert!(rows[0].get("ledger").is_none(), "{report}");
+    assert_eq!(rows[1]["name"], "tool", "{report}");
+    assert_eq!(rows[1]["ledger"], "acme/ledger", "{report}");
+}
+
+#[test]
 fn repos_without_a_home_directory_refuses_rather_than_scanning_the_root() {
     let home = home();
     let outside = tempfile::tempdir().expect("outside");

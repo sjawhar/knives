@@ -1,7 +1,7 @@
 use super::{
     BTreeMap, BTreeSet, BookmarkRef, BookmarkTips, BranchName, BranchTarget, CommitId, Finding,
-    FindingKind, Forge, JjError, LandedVerdict, Options, OriginRelation, Repo, RepoEntry, RepoName,
-    Role, Store, Subject, classify_landed, divergent_changes, double_checkout, index_pulls,
+    FindingKind, Forge, JjError, LandedVerdict, Options, OriginRelation, Repo, RepoEntry, Role,
+    Store, Subject, UpstreamName, classify_landed, divergent_changes, double_checkout, index_pulls,
     probe_landed,
 };
 
@@ -220,9 +220,10 @@ pub(super) fn conflicted_bookmark_findings(repo: &Repo) -> anyhow::Result<Vec<Fi
     Ok(findings)
 }
 /// Every number declared before discovery: stated pull requests and same-repository
-/// dependencies for both maintained and divergent branches.
+/// dependencies for both maintained and divergent branches. A requirement is
+/// this fork's when it names `repo`, the name the fork is kept under.
 pub(super) fn declared_numbers(
-    repo: &RepoName,
+    repo: &UpstreamName,
     branches: &[BranchName],
     store: &Store,
 ) -> Vec<u64> {
@@ -613,8 +614,13 @@ mod tests {
             8,
             "the current open pull request is primary"
         );
-        let store = Store::open(cache.path().join("state.json")).expect("open state");
-        let repo = RepoName::new("test-repo");
+        let repo = UpstreamName::new("test-repo");
+        let store = Store::open(
+            cache.path().join("state.json"),
+            &crate::config::FormerNames::new(),
+            &[&repo],
+        )
+        .expect("open state");
         let mut report = Report::default();
         branch_rows(
             RowInput {

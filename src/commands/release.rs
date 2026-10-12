@@ -5,14 +5,14 @@
 //! decided. Planning is the default because everything else here writes: a cut
 //! names a composition, and `include`, `drop`, `advance` and `rebase` change
 //! one. Every one of them writes locally only, and none of them pushes.
-// allow: SIZE_OK: 2395 lines - the release lifecycle's plan, members, cut, edit, audit, reap, and rebase operations are one domain seam.
+// allow: SIZE_OK: 2594 lines - the release lifecycle's plan, members, cut, edit, audit, reap, and rebase operations, and the pull every one of them plans from, are one domain seam.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use crate::bind::Fork;
 use crate::cli::Exit;
-use crate::config::RepoEntry;
+use crate::config::{Registry, RepoEntry};
 use crate::consumer_pins::{
     ConsumerHeadMemo, ConsumerPinSource, scan_consumer_for, scan_consumer_slug_with_heads,
 };
@@ -24,7 +24,7 @@ use crate::ids::{
     strict_dated_release,
 };
 use crate::jj::{self, Repo};
-use crate::ledger::{Entry, RecordedParent};
+use crate::ledger::{Entry, Ledger, RecordedParent};
 use crate::pins::{Pin, PinKind};
 use crate::release_model::{
     BranchSuccessions, MemberEvidence, MemberSuccession, RecordedCut, StackedHistoryContext,
@@ -52,6 +52,42 @@ impl std::fmt::Debug for ConsumerInputs<'_> {
             .field("heads", self.heads)
             .finish()
     }
+}
+
+/// `fork`'s ledger entries, read after pulling them from every destination
+/// `registry` gives the fork.
+///
+/// With them, the pull's problems and each entry or statement the read could
+/// not fully read: what a release command decides from, so a write from it
+/// refuses on any of them.
+pub fn pulled_ledger(
+    fork: &Fork<'_>,
+    registry: &Registry,
+) -> anyhow::Result<(Vec<Entry>, Vec<String>)> {
+    let pulled = crate::ledger_sweep::pull(registry, &[&fork.upstream]);
+    let read = Ledger::for_fork(fork).read()?;
+    let mut problems = pulled.problems_for(&fork.upstream);
+    problems.extend(read.problems);
+    Ok((read.entries, problems))
+}
+
+/// The release plan for `fork`, from a ledger pulled first: what a release
+/// command decides from.
+///
+/// A pull that fails is one of the plan's problems. The plan still answers
+/// from the entries this machine has, and a command that would write from it
+/// refuses, exactly as it does when a consumer could not be consulted: the
+/// drop guard checks a member against the newest recorded cut, and a stale
+/// ledger would check it against the wrong one.
+pub fn pulled_plan(
+    fork: &Fork<'_>,
+    registry: &Registry,
+    consumers: &ConsumerInputs<'_>,
+) -> anyhow::Result<Plan> {
+    let (entries, problems) = pulled_ledger(fork, registry)?;
+    let mut plan = plan(fork, consumers, &entries)?;
+    plan.problems.extend(problems);
+    Ok(plan)
 }
 
 /// What repairing this release would actually reach.
@@ -196,6 +232,9 @@ pub struct Plan {
     pub parents: Vec<(CommitId, Vec<String>)>,
     pub stale: Vec<Finding>,
     pub pins: Vec<Pin>,
+    /// A consumer could not be consulted, so `pins` may lack the pin that
+    /// would change the verdict, and no verdict is given.
+    pub pins_unknown: bool,
     /// Informational: something worth saying that is not a failure.
     pub notes: Vec<String>,
     /// Could not answer. These, and only these, make the command exit non-zero
@@ -691,6 +730,7 @@ fn add_consumer_pins(
     // Every consumer, not one: they can sit on different releases, so a plan that saw only
     // the first would call a release unpinned while something else was frozen on it.
     let slug = repo_slug(fork.entry);
+    let consulted = plan.problems.len();
     for consumer in consumers.slugs {
         let scan = scan_consumer_slug_with_heads(
             consumers.forge,
@@ -717,6 +757,7 @@ fn add_consumer_pins(
                 .map(|problem| format!("{}: {problem}", consumer.display())),
         );
     }
+    plan.pins_unknown = plan.problems.len() > consulted;
 }
 
 /// What the plan says about local branches the release does not carry.
@@ -1041,11 +1082,12 @@ pub fn render_members(report: &MembersReport) -> String {
         }
     }
     lines.extend(report.notes.iter().map(|note| format!("! {note}")));
+    // A problem can name a path from disk or another machine's ledger ref.
     lines.extend(
         report
             .problems
             .iter()
-            .map(|problem| format!("!! {problem}")),
+            .map(|problem| format!("!! {}", crate::ledger::inline_human_text(problem))),
     );
     lines.join("\n")
 }
@@ -1054,7 +1096,7 @@ pub fn render(plan: &Plan) -> String {
     let mut lines: Vec<String> = plan
         .problems
         .iter()
-        .map(|problem| format!("!! {problem}"))
+        .map(|problem| format!("!! {}", crate::ledger::inline_human_text(problem)))
         .chain(plan.notes.iter().map(|note| format!("! {note}")))
         .collect();
     let Some(release) = &plan.release else {
@@ -1104,7 +1146,9 @@ pub fn render(plan: &Plan) -> String {
     }
     // A consumer that could not be consulted may hold the pin the verdict would
     // deny; the census refuses the same no-pin claim after a failed scan.
-    lines.push(if plan.problems.is_empty() {
+    lines.push(if plan.pins_unknown {
+        "  pinned-ness unknown: a consumer could not be consulted (see above)".to_owned()
+    } else {
         match repair_effect(
             &plan.pins,
             BookmarkRef::parse(release).branch(),
@@ -1128,8 +1172,6 @@ pub fn render(plan: &Plan) -> String {
                 "  none of these pins is of this release: either is safe".to_owned()
             }
         }
-    } else {
-        "  pinned-ness unknown: a consumer could not be consulted (see above)".to_owned()
     });
     lines.push(
         "  planning by default. `knives release cut [name]` names a new cut of this \
@@ -2053,9 +2095,11 @@ mod cut_tests {
         Entry {
             ts: "2026-08-15T00:00:00Z".to_owned(),
             owner: "an-agent".to_owned(),
+            email: None,
             subject: Some(subject.to_owned()),
             kind: Kind::Event,
             disposition: None,
+            statement: None,
             text: format!(
                 "cut {subject} as {created} with {} parent(s)",
                 members.len()

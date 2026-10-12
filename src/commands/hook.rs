@@ -5,21 +5,21 @@ use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 
 use crate::cli::{Exit, HookHarness};
-use crate::commands::claim::Identity;
-use crate::config::{GuidanceRoot, Registry, default_config_path, load};
+use crate::commands::claim::{Bound, Identity};
+use crate::config::{ConfigError, GuidanceRoot, Registry, default_config_home};
 use crate::hook::claude_code::{
     Event, EventKind, POST_TOOL_USE_WIRE_NAME, SESSION_START_WIRE_NAME, response,
 };
 use crate::hook::guidance::{
     Guidance, body_digest, claim_lines, envelope_nonce, format_guidance, format_notice,
-    guidance_for, mention_line, notice_digest,
+    format_refusal, guidance_for, mention_line, notice_digest,
 };
 use crate::hook::opencode::{self, Event as OpenCodeEvent, EventKind as OpenCodeEventKind};
 use crate::hook::resolve::{Match, argument_paths, match_checkout};
 use crate::hook::state::{Envelope, SessionState};
-use crate::ids::RepoName;
+use crate::ids::UpstreamName;
 use crate::lock::LockError;
-use crate::store::{OwnerKind, Store, default_state_path};
+use crate::store::{OwnerKind, Store, StoreError, default_state_path};
 
 const CLAUDE_CODE: &str = "claude-code";
 const OPENCODE: &str = "opencode";
@@ -87,11 +87,16 @@ fn arm_watchdog() {
     });
 }
 
-pub fn run(harness: HookHarness) -> Exit {
+/// Answer one harness event, from the registry dispatch read (`loaded`).
+///
+/// An event that needs the registry and finds it could not be read says why
+/// on stderr and answers nothing, as every other failure here does; one that
+/// never asks is not affected.
+pub fn run(harness: HookHarness, loaded: Result<Registry, ConfigError>) -> Exit {
     arm_watchdog();
     let result = match harness {
-        HookHarness::ClaudeCode => run_claude_code(),
-        HookHarness::Opencode => run_opencode(),
+        HookHarness::ClaudeCode => run_claude_code(loaded),
+        HookHarness::Opencode => run_opencode(loaded),
     };
     match result {
         Ok(Some(output)) => {
@@ -105,7 +110,7 @@ pub fn run(harness: HookHarness) -> Exit {
     Exit::Ok
 }
 
-fn run_opencode() -> anyhow::Result<Option<String>> {
+fn run_opencode(loaded: Result<Registry, ConfigError>) -> anyhow::Result<Option<String>> {
     let mut input = String::new();
     if let Err(error) = std::io::stdin().read_to_string(&mut input) {
         eprintln!("knives hook: {error:#}");
@@ -119,10 +124,10 @@ fn run_opencode() -> anyhow::Result<Option<String>> {
         }
     };
     let kind = event.kind();
-    let home = config_home();
+    let home = default_config_home();
     let response = match kind {
-        OpenCodeEventKind::ToolExecuteAfter => opencode_tool_after(&event, &home),
-        OpenCodeEventKind::ChatSystem => opencode_chat_system(&event),
+        OpenCodeEventKind::ToolExecuteAfter => opencode_tool_after(&event, &home, loaded),
+        OpenCodeEventKind::ChatSystem => opencode_chat_system(&event, loaded),
         OpenCodeEventKind::ShellEnv => opencode_shell_env(&event),
         OpenCodeEventKind::Compacting => opencode_compacting(&event, &home),
         OpenCodeEventKind::Other => opencode::empty_response().map_err(Into::into),
@@ -146,16 +151,26 @@ fn empty_opencode_response(kind: OpenCodeEventKind) -> anyhow::Result<String> {
     .map_err(Into::into)
 }
 
-fn opencode_tool_after(event: &OpenCodeEvent, home: &Path) -> anyhow::Result<String> {
+fn opencode_tool_after(
+    event: &OpenCodeEvent,
+    home: &Path,
+    loaded: Result<Registry, ConfigError>,
+) -> anyhow::Result<String> {
     let Some(session_id) = event.session_id() else {
         return opencode::tool_response("").map_err(Into::into);
     };
-    let Some((registry, matched)) = relevant_tool_match(&ToolCall {
-        tool: event.tool(),
-        args: event.args(),
-        relevant: OPENCODE_RELEVANT_TOOLS,
-    })?
+    let Some((registry, paths)) = relevant_tool_paths(
+        &ToolCall {
+            tool: event.tool(),
+            args: event.args(),
+            relevant: OPENCODE_RELEVANT_TOOLS,
+        },
+        loaded,
+    )?
     else {
+        return opencode::tool_response("").map_err(Into::into);
+    };
+    let Some(matched) = match_checkout(&paths, &registry) else {
         return opencode::tool_response("").map_err(Into::into);
     };
     if matched.is_managed()
@@ -177,7 +192,12 @@ fn opencode_tool_after(event: &OpenCodeEvent, home: &Path) -> anyhow::Result<Str
     if let Some(context) = &context {
         unlocked.reconcile(context.turn, &context.guidance);
     }
-    let notice = notice_if_requested(&repo, &unlocked, requested.notice && matched.is_managed())?;
+    let notice = notice_if_requested(
+        &repo,
+        requested.notice.then_some(&matched),
+        &registry,
+        &unlocked,
+    )?;
     let guidance = (requested.guidance && matched.trusted && !unlocked.repo(&repo.root).guided)
         .then(|| guidance_for(&repo, &matched.candidate))
         .flatten();
@@ -369,11 +389,14 @@ impl Outstanding {
     }
 }
 
-fn opencode_chat_system(event: &OpenCodeEvent) -> anyhow::Result<String> {
+fn opencode_chat_system(
+    event: &OpenCodeEvent,
+    loaded: Result<Registry, ConfigError>,
+) -> anyhow::Result<String> {
     let Some(directory) = event.directory() else {
         return opencode::system_response("", &[]).map_err(Into::into);
     };
-    let registry = load(&default_config_path())?;
+    let registry = loaded?;
     let Some(matched) = match_checkout(&[PathBuf::from(directory)], &registry) else {
         return opencode::system_response("", &[]).map_err(Into::into);
     };
@@ -397,33 +420,34 @@ fn opencode_shell_env(event: &OpenCodeEvent) -> anyhow::Result<String> {
     opencode::environment_response(event.session_id()).map_err(Into::into)
 }
 
-/// The owner a claim from inside `repo` would carry when no harness names one:
-/// the store's current agent, else the sole claimant of that repository.
+/// The owner a claim from inside `bound` would carry when no harness names
+/// one: the store's current agent, else the sole claimant of that repository.
 ///
-/// `repo` is the entry the caller already bound the working directory to; a
-/// directory outside any managed fork, or whose remotes could not be read, is
-/// `None` and derives no owner. An OS-user claim names nobody in particular, so
-/// it seeds no derived owner: otherwise one anonymous claim would hand every
-/// later anonymous caller the same "derived" name, and they would resume each
-/// other's claims.
-pub(crate) fn owner_for(repo: Option<&RepoName>) -> anyhow::Result<Option<String>> {
+/// `bound` is the fork the caller already bound the working directory to, by
+/// the name its claims are kept under; a directory outside any managed fork,
+/// or whose remotes could not be read, is `None` and derives no owner. An
+/// OS-user claim names nobody in particular, so it seeds no derived owner:
+/// otherwise one anonymous claim would hand every later anonymous caller the
+/// same "derived" name, and they would resume each other's claims.
+pub(crate) fn owner_for(bound: Bound<'_>) -> anyhow::Result<Option<String>> {
     if let Some(owner) = std::env::var("KNIVES_OWNER")
         .ok()
         .filter(|owner| !owner.trim().is_empty())
     {
         return Ok(Some(owner));
     }
-    let Some(repo) = repo else {
+    let Some(upstream) = bound.upstream else {
         return Ok(None);
     };
-    let store = Store::open(default_state_path())?;
+    // Claims and the current agent only: no branch statement is asked about.
+    let store = Store::open(default_state_path(), &bound.registry.former_names(), &[])?;
     if let Some(owner) = store.current_agent() {
         return Ok(Some(owner.to_owned()));
     }
     let owners = store
-        .claims(None)
+        .claims(Some(upstream))
         .into_iter()
-        .filter(|claim| claim.repo == repo.as_str() && claim.kind != OwnerKind::OsUser)
+        .filter(|claim| claim.kind != OwnerKind::OsUser)
         .map(|claim| claim.owner.clone())
         .collect::<BTreeSet<_>>();
     Ok((owners.len() == 1)
@@ -438,14 +462,14 @@ fn opencode_compacting(event: &OpenCodeEvent, home: &Path) -> anyhow::Result<Str
     opencode::empty_response().map_err(Into::into)
 }
 
-fn run_claude_code() -> anyhow::Result<Option<String>> {
+fn run_claude_code(loaded: Result<Registry, ConfigError>) -> anyhow::Result<Option<String>> {
     let mut input = String::new();
     std::io::stdin().read_to_string(&mut input)?;
     let event = Event::parse(&input)?;
-    let home = config_home();
+    let home = default_config_home();
     match event.kind() {
-        EventKind::SessionStart => session_start(&event, &home),
-        EventKind::PostToolUse => post_tool_use(&event, &home),
+        EventKind::SessionStart => session_start(&event, &home, loaded),
+        EventKind::PostToolUse => post_tool_use(&event, &home, loaded),
         EventKind::PreCompact => pre_compact(&event, &home),
         EventKind::SessionEnd => {
             if let Some(session_id) = event.session_id() {
@@ -457,7 +481,11 @@ fn run_claude_code() -> anyhow::Result<Option<String>> {
     }
 }
 
-fn session_start(event: &Event, home: &Path) -> anyhow::Result<Option<String>> {
+fn session_start(
+    event: &Event,
+    home: &Path,
+    loaded: Result<Registry, ConfigError>,
+) -> anyhow::Result<Option<String>> {
     let Some(session_id) = event.session_id() else {
         return Ok(None);
     };
@@ -468,27 +496,26 @@ fn session_start(event: &Event, home: &Path) -> anyhow::Result<Option<String>> {
     let Some(cwd) = event.cwd() else {
         return Ok(None);
     };
-    let registry = load(&default_config_path())?;
+    let registry = loaded?;
     let Some(matched) = match_checkout(&[PathBuf::from(cwd)], &registry) else {
         return Ok(None);
     };
-    let Some(managed) = &matched.managed else {
-        return Ok(None);
-    };
-    crate::seen::record_observation(
-        Some(managed),
-        Path::new(cwd),
-        &Identity {
-            owner: session_id.to_owned(),
-            kind: crate::store::OwnerKind::HarnessSession,
-        },
-    );
+    if let Some(managed) = &matched.managed {
+        crate::seen::record_observation(
+            Some(&managed.upstream),
+            Path::new(cwd),
+            &Identity {
+                owner: session_id.to_owned(),
+                kind: crate::store::OwnerKind::HarnessSession,
+            },
+        );
+    }
     let repo = guidance_root(&matched);
     if compact {
         return Ok(None);
     }
     let state = SessionState::load(home, CLAUDE_CODE, session_id);
-    let Some(notice) = notice_if_requested(&repo, &state, true)? else {
+    let Some(notice) = notice_if_requested(&repo, Some(&matched), &registry, &state)? else {
         return Ok(None);
     };
     let (notice, update) = notice.into_parts();
@@ -500,16 +527,26 @@ fn session_start(event: &Event, home: &Path) -> anyhow::Result<Option<String>> {
         .map_err(Into::into)
 }
 
-fn post_tool_use(event: &Event, home: &Path) -> anyhow::Result<Option<String>> {
+fn post_tool_use(
+    event: &Event,
+    home: &Path,
+    loaded: Result<Registry, ConfigError>,
+) -> anyhow::Result<Option<String>> {
     let Some(session_id) = event.session_id() else {
         return Ok(None);
     };
-    let Some((registry, matched)) = relevant_tool_match(&ToolCall {
-        tool: event.tool_name(),
-        args: event.tool_input(),
-        relevant: RELEVANT_TOOLS,
-    })?
+    let Some((registry, paths)) = relevant_tool_paths(
+        &ToolCall {
+            tool: event.tool_name(),
+            args: event.tool_input(),
+            relevant: RELEVANT_TOOLS,
+        },
+        loaded,
+    )?
     else {
+        return Ok(None);
+    };
+    let Some(matched) = match_checkout(&paths, &registry) else {
         return Ok(None);
     };
     if matched.is_managed()
@@ -527,7 +564,7 @@ fn post_tool_use(event: &Event, home: &Path) -> anyhow::Result<Option<String>> {
     let repo = guidance_root(&matched);
     let state = SessionState::load(home, CLAUDE_CODE, session_id);
     let flags = state.repo(&repo.root);
-    let notice = notice_if_requested(&repo, &state, matched.is_managed())?;
+    let notice = notice_if_requested(&repo, Some(&matched), &registry, &state)?;
     let include_notice = notice.is_some();
     let include_guidance = matched.trusted
         && !flags.guided
@@ -586,10 +623,14 @@ struct ToolCall<'a> {
     relevant: &'a [&'a str],
 }
 
-/// The touched-path match for a relevant tool call, with the registry it was
-/// decided against — loaded only once there is a path to decide, so a pathless
-/// call never touches (or fails on) the registry.
-fn relevant_tool_match(call: &ToolCall<'_>) -> anyhow::Result<Option<(Registry, Match)>> {
+/// The paths a relevant tool call touched, with the registry they are to be
+/// matched against ([`match_checkout`]) — taken from `loaded` only once there
+/// is a path to decide, so a pathless call never fails on a registry that
+/// could not be read.
+fn relevant_tool_paths(
+    call: &ToolCall<'_>,
+    loaded: Result<Registry, ConfigError>,
+) -> anyhow::Result<Option<(Registry, Vec<PathBuf>)>> {
     let Some(tool) = call.tool else {
         return Ok(None);
     };
@@ -603,20 +644,20 @@ fn relevant_tool_match(call: &ToolCall<'_>) -> anyhow::Result<Option<(Registry, 
     if paths.is_empty() {
         return Ok(None);
     }
-    let registry = load(&default_config_path())?;
-    let matched = match_checkout(&paths, &registry);
-    Ok(matched.map(|matched| (registry, matched)))
+    Ok(Some((loaded?, paths)))
 }
 
-/// The entry the event's working directory is inside: what a sighting keys its
-/// workspace on. The touched path may be in another repository; the workspace
-/// is the cwd's.
-fn standing_in(cwd: &str, registry: &Registry) -> Option<RepoName> {
-    match_checkout(&[PathBuf::from(cwd)], registry).and_then(|matched| matched.managed)
+/// The fork the event's working directory is inside, by the name its claims
+/// are kept under: what a sighting keys its workspace on. The touched path may
+/// be in another repository; the workspace is the cwd's.
+fn standing_in(cwd: &str, registry: &Registry) -> Option<UpstreamName> {
+    match_checkout(&[PathBuf::from(cwd)], registry)
+        .and_then(|matched| matched.managed)
+        .map(|managed| managed.upstream)
 }
 
 /// What guidance and session state key on: the match's nearest root and name.
-fn guidance_root(matched: &Match) -> GuidanceRoot {
+fn guidance_root(matched: &Match<'_>) -> GuidanceRoot {
     GuidanceRoot {
         name: matched.name(),
         root: matched.root.clone(),
@@ -635,12 +676,6 @@ fn pre_compact(event: &Event, home: &Path) -> anyhow::Result<Option<String>> {
 /// still counts through its nearest existing ancestor.
 fn contains_cwd(root: &Path, cwd: &str) -> bool {
     crate::hook::resolve::nearest_root(Path::new(cwd)).as_deref() == Some(root)
-}
-
-fn config_home() -> PathBuf {
-    default_config_path()
-        .parent()
-        .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
 }
 
 struct PreparedNotice {
@@ -664,29 +699,87 @@ impl NoticeStateUpdate {
     }
 }
 
+/// The notice for `repo`, the root `matched` was decided for, when one was
+/// asked for (`matched` is `None` when it was not) and the session lacks it:
+/// the claims notice for a managed fork, the disagreement for a checkout
+/// whose `upstream` disagrees with the registry ([`crate::bind::Disagreement`]),
+/// nothing for any other match.
+///
+/// The roster is the claims kept under the fork's upstream name; the notice
+/// names the fork by its registry key.
+///
+/// A state file this knives refuses to read ([`StoreError::Unmigrated`], or
+/// [`StoreError::FormerNames`] for one still keeping forks under their registry
+/// keys) is the notice instead: the claims it holds cannot be read, and an
+/// empty roster would tell the agent nobody holds the branch it is about to
+/// take. The refusal goes into the agent's context, not stderr, because the
+/// model never reads a hook's stderr; its digest is the refusal's, so it
+/// repeats once per session until the migration runs. A disagreement is
+/// delivered the same way, for the same reason: knives will not say whose
+/// claims this checkout's are, and silence would read as "nobody's".
 fn notice_if_requested(
     repo: &GuidanceRoot,
+    matched: Option<&Match<'_>>,
+    registry: &Registry,
     state: &SessionState,
-    requested: bool,
 ) -> anyhow::Result<Option<PreparedNotice>> {
-    if !requested {
+    let Some(matched) = matched else {
         return Ok(None);
-    }
-    let store = Store::open(default_state_path())?;
+    };
+    let Some(managed) = &matched.managed else {
+        return Ok(matched.disagrees.as_ref().and_then(|disagreement| {
+            refusal_notice(repo, "disagrees", &disagreement.to_string(), state)
+        }));
+    };
+    let store = match Store::open(default_state_path(), &registry.former_names(), &[]) {
+        Ok(store) => store,
+        Err(error @ (StoreError::Unmigrated { .. } | StoreError::FormerNames { .. })) => {
+            return Ok(refusal_notice(
+                repo,
+                "unmigrated",
+                &error.to_string(),
+                state,
+            ));
+        }
+        Err(error) => return Err(error.into()),
+    };
     let claims = all_claims(&store);
-    let digest = notice_digest(&repo.name, &repo.root, &claims);
+    let digest = notice_digest(&managed.upstream, &repo.root, &claims);
     if state.notice_seen(&repo.root, &digest) {
         return Ok(None);
     }
     Ok(Some(PreparedNotice {
-        text: format_notice_for(repo, &digest, &claims),
+        text: format_notice_for(repo, &managed.upstream, &digest, &claims),
         update: NoticeStateUpdate { digest },
     }))
 }
 
-fn format_notice_for(repo: &GuidanceRoot, digest: &str, claims: &[crate::store::Claim]) -> String {
+/// `text` in place of the claims notice ([`format_refusal`]), unless the
+/// session already holds it: its digest is `<kind>:` and the text's own.
+fn refusal_notice(
+    repo: &GuidanceRoot,
+    kind: &str,
+    text: &str,
+    state: &SessionState,
+) -> Option<PreparedNotice> {
+    let digest = format!("{kind}:{}", body_digest(text));
+    if state.notice_seen(&repo.root, &digest) {
+        return None;
+    }
+    Some(PreparedNotice {
+        text: format_refusal(&repo.name, text),
+        update: NoticeStateUpdate { digest },
+    })
+}
+
+fn format_notice_for(
+    repo: &GuidanceRoot,
+    upstream: &UpstreamName,
+    digest: &str,
+    claims: &[crate::store::Claim],
+) -> String {
     let observations = crate::seen::load();
-    let visible_claims = claim_lines(claims, &repo.name, &observations, jiff::Timestamp::now());
+    let visible_claims = claim_lines(claims, upstream, &observations, jiff::Timestamp::now());
     format_notice(&repo.name, &repo.root, &visible_claims, digest)
 }
 

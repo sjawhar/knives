@@ -1,7 +1,9 @@
 # Read-only reports
 
 Read this when running `repos`, `consumers`, `pushed`, `audit` or `pr`, or when
-consuming their machine output. These commands report facts, not remedies.
+consuming their machine output. These commands report facts, not remedies. The
+`knives ledger sweep` and `knives ledger migrate` reports are in the
+[ledger reference](ledger.md).
 
 ## `knives repos`
 
@@ -9,7 +11,10 @@ Lists every managed entry: where its checkout was found on this machine, its
 newest release and, for recorded consumer slugs, whether consumer trunks are
 pinned behind the newest cut. An unplaced entry reads `not on this machine`, has
 `path: null` and no release state. An ambiguous entry reads `ambiguous: 2
-checkouts` with a problem naming both paths.
+checkouts` with a problem naming both paths. An entry found only under an
+upstream remote that disagrees with `repos.toml` reads `upstream disagrees with
+repos.toml`, has `path: null`, and carries a problem naming the checkout, both
+spellings and the fix; it makes the command incomplete, exit `3`.
 
 An unreadable candidate checkout appears as a `?` problem while an entry remains
 unplaced, because it could be that entry's checkout. Once every entry is placed,
@@ -27,9 +32,21 @@ a locked commit is behind when it is an ancestor of the branch tip.
 TOON and JSON share this document shape (`?` marks an optional field):
 
 ```text
-{repos: [{name, path, release_remote?, newest_release?, behind?,
-          notes?, problems?}], notes?, config_path}
+{repos: [{name, upstream_name, ledger?, path, release_remote?, newest_release?,
+          behind?, notes?, problems?}], notes?, problems?, config_path}
 ```
+
+`name` is the registry key, what you type. `upstream_name` is what the fork's
+ledger, claims and state are kept under: its upstream's lowercase
+`<owner>/<name>`, or the registry key when the upstream is a filesystem path.
+A claim's `repo` in `state.json` is an `upstream_name`, so to find the checkout
+for a claim, match the claim's `repo` against `upstream_name`, never `name`.
+Every row carries it, placed or not. `ledger` is the repository the fork's
+ledger is shared through (`ledger` in `repos.toml`), lowercase and without a
+`.git` suffix however the registry spells it, so two rows naming one
+repository carry one value; it is absent for a fork whose ledger is not shared.
+`repos` reads only the registry and the checkouts, never the ledger or the
+state file, so it answers before `knives ledger migrate` has run.
 
 ## `knives consumers [FORK] [--consumer PATH]...`
 

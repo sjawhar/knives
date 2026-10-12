@@ -3,20 +3,22 @@
 //! `finish` hands a claimed branch back and removes its workspace; `track`
 //! states which pull request a branch belongs to, overriding inference;
 //! `depends` records that a branch cannot land before something else does.
-//! Each is one state write with its ledger event.
+//! Each records one ledger event, and a statement rides on that event;
+//! `finish` also writes the released claim to the state file.
 
 use std::path::Path;
 
 use knives::bind::Fork;
 use knives::cli::Exit;
 use knives::commands::claim::{
-    ClaimContext, ClaimDecision, current_identity, decide, last_seen_provenance,
+    Bound, ClaimContext, ClaimDecision, current_identity, decide, last_seen_provenance,
     render_claim_context,
 };
 use knives::commands::start::{collides_with_checkout, possesses, workspace_path};
-use knives::config::Registry;
-use knives::ids::{BranchName, BranchTarget, RepoName, Requirement};
+use knives::ids::{BranchName, BranchTarget, Requirement};
 use knives::jj::{Repo, WorkspaceIdentity, remove_prunable_worktree};
+use knives::ledger::{Draft, Stated};
+use knives::statement::{Statement, StatementKind};
 use knives::store::{Store, default_state_path};
 
 use super::scribe_for;
@@ -67,15 +69,16 @@ enum FinishClaimGate {
 /// Removing the directory loses no work: jj snapshots a working copy into a commit, so
 /// every change made there is already in the repository and reachable by change id. What
 /// does not survive is anything jj never tracked, which is what `--no-cleanup` is for.
-/// `bound` is the entry the current directory is inside, which names a terminal
-/// user acting from a fork's workspace.
+/// `bound` is the registry and the fork the current directory is inside, by
+/// the name its claims are kept under, which names a terminal user acting
+/// from a fork's workspace.
 pub(crate) fn run_finish(
     fork: &Fork<'_>,
     branch: &BranchName,
     options: &FinishOptions<'_>,
-    bound: Option<&RepoName>,
+    bound: Bound<'_>,
 ) -> anyhow::Result<Exit> {
-    let target = &BranchTarget::new(fork.name.clone(), branch.clone());
+    let target = &BranchTarget::new(fork.upstream.clone(), branch.clone());
     let checkout_path = &fork.checkout.path;
     // Without this, `finish` would forget the primary workspace and delete the
     // checkout itself.
@@ -83,7 +86,11 @@ pub(crate) fn run_finish(
         eprintln!("{}: {line}", fork.name);
         return Ok(Exit::Usage);
     }
-    let mut store = Store::open_for_update(default_state_path())?;
+    let mut store = Store::open_for_update(
+        default_state_path(),
+        &bound.registry.former_names(),
+        &[&fork.upstream],
+    )?;
     let workspace = knives::commands::wip::workspace_for(branch.as_str());
     let directory = workspace_path(fork, branch);
     let forced_release = match finish_claim_gate(fork, target, &store, options, bound)? {
@@ -91,9 +98,6 @@ pub(crate) fn run_finish(
         FinishClaimGate::Refuse => return Ok(Exit::Usage),
     };
     let had = store.release_claim(target);
-    if let Some(new) = options.superseded_by {
-        store.supersede(target, new);
-    }
     let pr = store.tracked_pull(target);
     // Persist the immutable explanation before the mutable claim state. A failed
     // append then leaves the old claim in place instead of silently releasing or
@@ -105,7 +109,18 @@ pub(crate) fn run_finish(
         })
         .or_else(|| release_event(had, options.superseded_by));
     if let Some(text) = provenance {
-        scribe_for(fork, bound)?.event(Some(branch.as_str()), text, pr)?;
+        // `--superseded-by` always leaves provenance to carry it: the replacement
+        // rides on the one entry that already names it.
+        scribe_for(fork, bound)?.record(&Draft {
+            statement: options.superseded_by.map(|replacement| Stated {
+                statement: Statement {
+                    kind: StatementKind::Superseded,
+                    value: Some(replacement.to_owned()),
+                },
+                replaces: store.statement_stamp(target, StatementKind::Superseded),
+            }),
+            ..Draft::event(Some(branch.as_str()), text, pr)
+        })?;
     }
     store.save()?;
     // The claim is recorded; nothing below touches the store, and removing a
@@ -171,7 +186,10 @@ pub(crate) fn run_finish(
             format!("{shown} is not a workspace of {checkout}, left alone")
         }
     };
-    println!("{target}: claim {claim}; workspace {workspace} {registration}; {removal}");
+    println!(
+        "{}/{branch}: claim {claim}; workspace {workspace} {registration}; {removal}",
+        fork.name
+    );
     Ok(Exit::Ok)
 }
 
@@ -231,7 +249,7 @@ fn finish_claim_gate(
     target: &BranchTarget,
     store: &Store,
     options: &FinishOptions<'_>,
-    bound: Option<&RepoName>,
+    bound: Bound<'_>,
 ) -> anyhow::Result<FinishClaimGate> {
     let Some(claim) = store
         .claims(Some(&target.repo))
@@ -280,7 +298,39 @@ fn finish_claim_gate(
     }
 }
 
+/// Pull `fork`'s ledger before a write built from what it states, and say
+/// why it will not write when the pull failed.
+///
+/// A forget erases the statement before it, and the newest statement wins on
+/// every machine, so built from a ledger missing another machine's newer
+/// statement it would erase that statement everywhere, as a release write
+/// would check its drop guard against the wrong cut. A `depends` statement
+/// erases nothing, since the live list is every requirement stated since the
+/// last forget, but it records that the branch must wait from what this
+/// machine last pulled, and says "now requires …" from it: from a ledger it
+/// knows is stale, that would tell the caller a list other machines may
+/// already have changed. So each refuses, like a release write, rather than
+/// write from what this machine happens to have.
+fn pulled_before_replacing(fork: &Fork<'_>, bound: Bound<'_>, what: &str) -> bool {
+    let problems =
+        knives::ledger_sweep::pull(bound.registry, &[&fork.upstream]).problems_for(&fork.upstream);
+    for problem in &problems {
+        eprintln!("!! {}", knives::ledger::inline_human_text(problem));
+    }
+    if !problems.is_empty() {
+        eprintln!(
+            "{what} not recorded: it is built from what the ledger states, and another \
+             machine's newer statement may be among what could not be pulled"
+        );
+    }
+    problems.is_empty()
+}
+
 /// State or forget which pull request a branch belongs to.
+///
+/// A forget pulls first ([`pulled_before_replacing`]) and writes a statement
+/// only when one is stated: a forget of nothing would erase, everywhere, a
+/// statement another machine made that this one has not seen.
 #[allow(
     clippy::too_many_arguments,
     reason = "the fork, the branch, the three ways to state its pull request and the cwd binding are independent inputs"
@@ -291,10 +341,20 @@ pub(crate) fn run_track(
     pr: Option<u64>,
     fork_only: bool,
     forget: bool,
-    bound: Option<&RepoName>,
+    bound: Bound<'_>,
 ) -> anyhow::Result<Exit> {
-    let target = &BranchTarget::new(fork.name.clone(), branch.clone());
-    let mut store = Store::open_for_update(default_state_path())?;
+    let target = &BranchTarget::new(fork.upstream.clone(), branch.clone());
+    if forget && !pulled_before_replacing(fork, bound, "the forget") {
+        return Ok(Exit::Incomplete);
+    }
+    // Opened for update to hold the lock while the statement is read and the next
+    // one appended: a concurrent `track` then reads this one's statement rather
+    // than the one before it. Nothing here writes the state file.
+    let store = Store::open_for_update(
+        default_state_path(),
+        &bound.registry.former_names(),
+        &[&fork.upstream],
+    )?;
     // Read before the change, so a withdrawal is still filed under the number it
     // withdrew.
     let stated = store.tracked_pull(target);
@@ -303,33 +363,51 @@ pub(crate) fn run_track(
     // one `knives notch --pr <n>` most needs to find, and stamping the prior
     // value there — usually nothing — would hide it from the only filter the
     // field exists for.
-    let (text, stamped) = if fork_only {
-        store.mark_fork_only(target, "stated with `knives track --fork-only`");
+    let (text, stamped, statement) = if fork_only {
         (
             "stated as having no upstream pull request".to_owned(),
             stated,
+            Some(Statement {
+                kind: StatementKind::ForkOnly,
+                value: Some("stated with `knives track --fork-only`".to_owned()),
+            }),
         )
     } else if forget {
-        let had = store.untrack_pull(target);
-        (
-            if had {
-                "pull request statement forgotten".to_owned()
-            } else {
-                "no pull request statement to forget".to_owned()
-            },
-            stated,
-        )
+        match stated {
+            Some(_) => (
+                "pull request statement forgotten".to_owned(),
+                stated,
+                Some(Statement {
+                    kind: StatementKind::Pull,
+                    value: None,
+                }),
+            ),
+            None => ("no pull request statement to forget".to_owned(), None, None),
+        }
     } else {
         let Some(number) = pr else {
             eprintln!("give --pr <number>, or --forget");
             return Ok(Exit::Usage);
         };
-        store.track_pull(target, number);
-        (format!("stated as #{number}"), Some(number))
+        (
+            format!("stated as #{number}"),
+            Some(number),
+            Some(Statement {
+                kind: StatementKind::Pull,
+                value: Some(number.to_string()),
+            }),
+        )
     };
-    store.save()?;
-    scribe_for(fork, bound)?.event(Some(branch.as_str()), text.clone(), stamped)?;
-    println!("{target} {}", spoken(&text));
+    let statement = statement.map(|statement| Stated {
+        replaces: store.statement_stamp(target, statement.kind),
+        statement,
+    });
+    scribe_for(fork, bound)?.record(&Draft {
+        statement,
+        ..Draft::event(Some(branch.as_str()), text.clone(), stamped)
+    })?;
+    drop(store);
+    println!("{}/{branch} {}", fork.name, spoken(&text));
     Ok(Exit::Ok)
 }
 
@@ -351,52 +429,92 @@ fn spoken(text: &str) -> String {
 /// Requirements are validated against the registry, because a dependency on a repo
 /// knives does not manage is a typo, and a typo that records silently is worse than
 /// no dependency at all: it reads as satisfied forever.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the registry the requirements are checked against, the fork, the branch, the requirements and the cwd binding are independent inputs"
-)]
 pub(crate) fn run_depends(
-    registry: &Registry,
     fork: &Fork<'_>,
     branch: &BranchName,
     on: &[String],
-    bound: Option<&RepoName>,
+    bound: Bound<'_>,
 ) -> anyhow::Result<Exit> {
-    let target = &BranchTarget::new(fork.name.clone(), branch.clone());
+    let registry = bound.registry;
+    let target = &BranchTarget::new(fork.upstream.clone(), branch.clone());
     let mut requirements = Vec::new();
     for text in on {
-        let Some(requirement) = Requirement::parse(text) else {
+        let Some(written) = Requirement::parse(text) else {
             eprintln!("cannot read {text} as a requirement; write it as `<repo>#<number>`");
             return Ok(Exit::Usage);
         };
-        if registry.get(&requirement.repo).is_none() {
+        // Recorded under the required fork's repository name, whichever way it
+        // was typed, so the statement means the same fork on every machine.
+        let Some(upstream) = registry.resolve(written.repo.as_str()) else {
             let known: Vec<String> = registry.names().map(|n| n.to_string()).collect();
             eprintln!(
                 "unknown repo {} in {text}; known: {}",
-                requirement.repo,
+                written.repo,
                 known.join(", ")
             );
             return Ok(Exit::Usage);
-        }
-        requirements.push(requirement);
+        };
+        requirements.push(Requirement {
+            repo: upstream,
+            number: written.number,
+        });
     }
-    let mut store = Store::open_for_update(default_state_path())?;
-    store.add_dependencies(target, &requirements);
-    let pr = store.tracked_pull(target);
-    store.save()?;
-    let listed: Vec<String> = requirements.iter().map(ToString::to_string).collect();
-    scribe_for(fork, bound)?.event(
-        Some(branch.as_str()),
-        format!("requires {}", listed.join(", ")),
-        pr,
+    if !pulled_before_replacing(fork, bound, "the dependency") {
+        return Ok(Exit::Incomplete);
+    }
+    // Held while the list is read and the next statement appended, so two
+    // concurrent `depends` on this machine each add to the other's list
+    // rather than racing; the pull above brought in what other machines
+    // stated. Nothing here writes the state file.
+    let store = Store::open_for_update(
+        default_state_path(),
+        &registry.former_names(),
+        &[&fork.upstream],
     )?;
-    println!("{target} now requires {}", listed.join(", "));
+    let required = with_requirements(&store.dependencies(target), &requirements);
+    let pr = store.tracked_pull(target);
+    let listed: Vec<String> = requirements.iter().map(ToString::to_string).collect();
+    scribe_for(fork, bound)?.record(&Draft {
+        statement: Some(Stated {
+            statement: Statement {
+                kind: StatementKind::Depends,
+                value: Some(required.join(",")),
+            },
+            replaces: store.statement_stamp(target, StatementKind::Depends),
+        }),
+        ..Draft::event(
+            Some(branch.as_str()),
+            format!("requires {}", listed.join(", ")),
+            pr,
+        )
+    })?;
+    drop(store);
+    println!("{}/{branch} now requires {}", fork.name, listed.join(", "));
     Ok(Exit::Ok)
+}
+
+/// Everything a branch requires once `added` joins what it already `required`.
+///
+/// Additive and deduplicated, so declaring the same requirement twice is not an
+/// error and re-running a script does not accumulate duplicates. The result is
+/// the whole list, so each entry reads on its own as everything the branch
+/// needed when it was written.
+fn with_requirements(required: &[Requirement], added: &[Requirement]) -> Vec<String> {
+    let mut texts: Vec<String> = required.iter().map(ToString::to_string).collect();
+    for requirement in added {
+        let text = requirement.to_string();
+        if !texts.contains(&text) {
+            texts.push(text);
+        }
+    }
+    texts.sort();
+    texts
 }
 
 #[cfg(test)]
 mod tests {
-    use super::spoken;
+    use super::{spoken, with_requirements};
+    use knives::ids::Requirement;
 
     #[test]
     fn track_prose_preserves_the_established_human_output() {
@@ -417,5 +535,17 @@ mod tests {
         ] {
             assert_eq!(spoken(event), expected);
         }
+    }
+
+    #[test]
+    fn requirements_join_what_was_already_required_without_duplicates() {
+        let parse = |text: &str| Requirement::parse(text).expect("a requirement");
+        assert_eq!(
+            with_requirements(
+                &[parse("sibling#49"), parse("other#7")],
+                &[parse("sibling#49"), parse("another#3")],
+            ),
+            ["another#3", "other#7", "sibling#49"]
+        );
     }
 }

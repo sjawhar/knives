@@ -412,6 +412,12 @@ pub enum Command {
         #[arg(long)]
         consumer: Vec<PathBuf>,
     },
+    /// Carry this machine's ledger to the machines that share it, or move what
+    /// an older knives kept in `state.json` onto it.
+    Ledger {
+        #[command(subcommand)]
+        action: LedgerAction,
+    },
     /// Run the real gh with fork-aware fixes applied. Plumbing for the gh shim.
     ///
     /// Three fixes, in order: export a GitHub-App token for the repo the
@@ -431,6 +437,45 @@ pub enum Command {
 pub enum HookHarness {
     ClaudeCode,
     Opencode,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum LedgerAction {
+    /// Commit new entries, pull every peer's, and push this machine's.
+    ///
+    /// Every command that writes an entry starts one in the background as it
+    /// exits, so this rarely needs typing. One sweep runs at a time: run by
+    /// hand, a sweep that finds another running waits for it, up to a minute,
+    /// then runs its own pass and reports that, with the sweep it waited for.
+    /// A fork's ledger travels when its `repos.toml` entry names, as
+    /// `ledger`, the repository its ledger belongs to, and the ledger root is
+    /// a git repository with that repository as `origin` and this machine's
+    /// name as `knives.machine`. With no fork's `ledger` set, the ledger is
+    /// not shared and this does nothing.
+    Sweep,
+    /// Move what an older knives left onto what this one reads: each fork
+    /// kept under its registry key moves to its upstream's lowercase
+    /// `<owner>/<name>`, and the branch statements kept in `state.json` move
+    /// onto the ledger, one statement entry each, then leave `state.json`.
+    ///
+    /// A fork's ledger directory moves file by file, contents untouched, and
+    /// every `state.json` key naming it is renamed; each old path and key is
+    /// reported. Existing entries are left as they are: an event's prose
+    /// states nothing, so nothing is read back out of it. A statement some
+    /// entry about that branch already makes, kind and value alike, is
+    /// skipped, so a second run writes nothing. `state.json` keeps every
+    /// statement until all of them reach the ledger.
+    ///
+    /// Each fork's ledger is pulled first, and a fork whose pull fails has
+    /// none of its statements written. A statement the ledger already makes
+    /// otherwise for that branch is reported and not written: the ledger's is
+    /// what every machine reads.
+    Migrate {
+        /// Report what it would move, rename and write, and change nothing:
+        /// no lock, no pull, no write.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -677,6 +722,8 @@ mod tests {
             vec!["knives", "notch", "feat/alpha", "-m", "superseded"],
             vec!["knives", "notch", "--pr", "1157"],
             vec!["knives", "notch", "release/2026-08-15", "--repo", "a-repo"],
+            vec!["knives", "ledger", "sweep"],
+            vec!["knives", "ledger", "migrate"],
             vec!["knives", "gh", "--", "pr", "list"],
         ];
         // When / Then: each parses

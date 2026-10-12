@@ -1,0 +1,897 @@
+//! `knives ledger sweep` and `knives ledger migrate`.
+//!
+//! `sweep` commits, pulls and pushes this machine's ledger. `migrate` moves
+//! what an older knives kept in the state file onto the ledger, and every
+//! fork from the registry key an older knives named it by to its upstream
+//! repository's name.
+//!
+//! Every command that appends an entry starts one sweep detached as it exits
+//! ([`crate::ledger_sweep::hand_off`]), so it is rarely typed; run by hand it
+//! waits for any sweep already running, then reports what its own pass
+//! carried.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
+use std::path::{Path, PathBuf};
+
+use crate::cli::{Exit, Output};
+use crate::config::{ConfigError, FormerNames, Registry};
+use crate::ids::{Requirement, UpstreamName};
+use crate::ledger::{Draft, Ledger, Scribe, Stated, inline_human_text, unmigrated};
+use crate::ledger_sweep::{self, Contended, Swept, Tally, Waited};
+use crate::lock::FileLock;
+use crate::statement::{Statement, StatementKind, Statements};
+use crate::store::Store;
+use crate::store::migration::{LegacyStatement, Renamed, renamed};
+
+/// What became of a sweep run by hand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Outcome {
+    /// This sweep held the lock and passed over every destination.
+    Swept,
+    /// Another sweep holds the lock and carries this one's work: only the
+    /// sweep a write hands off answers this.
+    Busy,
+    /// This machine's ledger has no repository to travel through.
+    NotShared,
+    /// The sweep could not start: where the ledger travels could not be
+    /// read, or another sweep held the lock past the wait, and its problems
+    /// say why.
+    Failed,
+}
+
+/// What a sweep run by hand reports.
+#[derive(Debug, serde::Serialize)]
+pub struct Report {
+    pub outcome: Outcome,
+    /// The sweep this one waited for before its own pass: whom the lock
+    /// named, and for how long.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub waited: Option<Waited>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub destinations: Vec<Tally>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub problems: Vec<String>,
+    /// What the sweep passed over without failing: each `knives.*` key a
+    /// git directory sets that this knives does not read.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
+}
+
+/// Run one sweep of the ledger beside the registry and report it, from the
+/// registry dispatch read (`loaded`): one that could not be read is a sweep
+/// that could not start.
+///
+/// The sweep a write hands off ([`ledger_sweep::HANDED_OFF`]) leaves at once
+/// when another sweep holds the lock; any other waits for it, so that what
+/// it reports, and its exit code, is its own pass.
+pub fn run_sweep(output: Output, loaded: Result<Registry, ConfigError>) -> anyhow::Result<Exit> {
+    let root = crate::ledger::default_ledger_root();
+    let contended = if std::env::var_os(ledger_sweep::HANDED_OFF).is_some() {
+        Contended::Leave
+    } else {
+        Contended::Wait
+    };
+    let report = match ledger_sweep::run(&root, loaded, contended) {
+        Ok(Swept::NotShared) => Report::of(Outcome::NotShared),
+        Ok(Swept::Busy) => Report::of(Outcome::Busy),
+        Ok(Swept::Ran {
+            tallies,
+            problems,
+            notes,
+            waited,
+        }) => Report {
+            waited,
+            destinations: tallies,
+            problems,
+            notes,
+            ..Report::of(Outcome::Swept)
+        },
+        Err(error) => Report {
+            problems: vec![error.to_string()],
+            ..Report::of(Outcome::Failed)
+        },
+    };
+    if let Some(payload) = crate::cli::machine_payload(output, &report)? {
+        println!("{payload}");
+    } else {
+        println!("{}", render(&report));
+    }
+    Ok(if report.problems.is_empty() {
+        Exit::Ok
+    } else {
+        Exit::Incomplete
+    })
+}
+
+impl Report {
+    const fn of(outcome: Outcome) -> Self {
+        Self {
+            outcome,
+            waited: None,
+            destinations: Vec::new(),
+            problems: Vec::new(),
+            notes: Vec::new(),
+        }
+    }
+}
+
+pub fn render(report: &Report) -> String {
+    let mut lines = match report.outcome {
+        Outcome::NotShared => vec![
+            "ledger: not shared; this machine's ledger has no repository to travel through"
+                .to_owned(),
+        ],
+        Outcome::Busy => {
+            vec!["ledger: another sweep is running and carries this one's entries".to_owned()]
+        }
+        Outcome::Failed => vec!["ledger: the sweep could not start".to_owned()],
+        Outcome::Swept => report
+            .destinations
+            .iter()
+            .map(|tally| {
+                let discarded = match tally.discarded {
+                    0 => String::new(),
+                    1 => ", 1 repeated transition discarded".to_owned(),
+                    count => format!(", {count} repeated transitions discarded"),
+                };
+                // A skipped key is a directory name from another machine's ref.
+                let skipped: String = tally.skipped.iter().flatten().fold(
+                    String::new(),
+                    |mut text, (fork, count)| {
+                        let _ =
+                            write!(text, ", {count} of {} left unread", inline_human_text(fork));
+                        text
+                    },
+                );
+                let unsent = match tally.unsent {
+                    Some(0) | None => String::new(),
+                    Some(1) => ", 1 entry not yet sent".to_owned(),
+                    Some(count) => format!(", {count} entries not yet sent"),
+                };
+                format!(
+                    "ledger: {} ({}): {} commit(s), {} push(es), {} entr{} pulled{discarded}\
+                     {skipped}{unsent}; carries {}",
+                    tally.remote,
+                    inline_human_text(&tally.git_dir),
+                    tally.commits,
+                    tally.pushes,
+                    tally.pulled,
+                    if tally.pulled == 1 { "y" } else { "ies" },
+                    if tally.forks.is_empty() {
+                        "no fork".to_owned()
+                    } else {
+                        tally.forks.join(", ")
+                    }
+                )
+            })
+            .collect(),
+    };
+    if let Some(waited) = &report.waited {
+        let who = waited
+            .pid
+            .map_or_else(|| "another sweep".to_owned(), |pid| format!("sweep {pid}"));
+        lines.insert(
+            0,
+            format!("ledger: waited {}s for {who} to finish", waited.seconds),
+        );
+    }
+    // Problems and notes name paths from disk and from other machines' refs.
+    lines.extend(
+        report
+            .problems
+            .iter()
+            .map(|problem| format!("!! {}", inline_human_text(problem))),
+    );
+    lines.extend(
+        report
+            .notes
+            .iter()
+            .map(|note| format!("note: {}", inline_human_text(note))),
+    );
+    lines.join("\n")
+}
+
+/// What a migration did, or under `--dry-run` would do.
+#[derive(Debug, Default, serde::Serialize)]
+pub struct Migrated {
+    /// Whether this is what a migration would do, with nothing changed.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub dry_run: bool,
+    /// Each fork's ledger directory moved from its registry key to its
+    /// upstream name, by path.
+    pub moved: Vec<Moved>,
+    /// Each state-file key moved from a fork's registry key to its upstream
+    /// name.
+    pub renamed: Vec<Renamed>,
+    /// Each `seen.json` workspace sighting moved the same way.
+    pub sightings: Vec<crate::seen::RenamedSighting>,
+    /// Statement entries this run appended to the ledger.
+    pub wrote: usize,
+    /// Statements the ledger already carried: an entry about that branch
+    /// states that kind with that value.
+    pub already: usize,
+    /// What could not be migrated, and each statement the ledger already
+    /// states otherwise. The state file keeps every statement while one
+    /// could not reach the ledger, so a run after the fix finishes the job.
+    pub problems: Vec<String>,
+    /// Whether the state file kept its statements because one of them could
+    /// not reach the ledger.
+    #[serde(skip)]
+    pub statements_held: bool,
+    /// Each entry file this run wrote, to flush before the state file drops
+    /// the statements.
+    #[serde(skip)]
+    written: Vec<PathBuf>,
+    /// Each statement not written because the ledger states otherwise: a
+    /// problem, but not one that holds the statements back, since the
+    /// ledger's is the statement every machine reads and a rerun would meet
+    /// the same one.
+    #[serde(skip)]
+    contradicted: Vec<String>,
+}
+
+/// One ledger directory a migration moved.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Moved {
+    pub from: PathBuf,
+    pub to: PathBuf,
+}
+
+/// Move what an older knives left at `state_path` and `root` onto what this
+/// one reads; with `dry_run`, only say what that would do.
+///
+/// Every fork the state file and the ledger keep under a registry key an
+/// older knives named it by moves to its upstream name, as the registry
+/// beside the state file says; then every branch statement the state file
+/// holds moves onto the ledger, one statement entry each, written as
+/// `owner`, and the four maps that held them are dropped.
+///
+/// A fork's ledger directory is moved file by file, contents untouched. An
+/// entry already at its new name with the same bytes (pulled from a machine
+/// that migrated first) is the same entry, and the old copy goes; one with
+/// other bytes is a problem, and both stay for a person to look at.
+///
+/// Before writing a fork's statements, its ledger is pulled
+/// ([`ledger_sweep::pull_at`]): another machine may have migrated, or
+/// stated something since, and every statement it writes is the newest. A
+/// fork whose pull fails has none of its statements written, and the state
+/// file keeps them. Nothing is parsed out of existing prose: an event
+/// reading `stated as #1234` states nothing, and only an entry's
+/// `statement` field is a statement. A statement some entry about that
+/// branch already makes, kind and value alike, is skipped, so a second run
+/// writes nothing. One the ledger states otherwise for that branch and kind
+/// is a problem and is not written: the ledger's is what every machine
+/// reads, and this state file's copy is older. A dependency an older knives
+/// recorded by a registry key is written under that fork's upstream name. A
+/// statement whose key names no fork the registry has is a problem and is
+/// written nowhere: a ledger directory no fork is kept under is one nothing
+/// reads.
+///
+/// The state file is held for update throughout, so no other writer saves
+/// over it between the read and the drop, and it is saved only when every
+/// statement reached the ledger and is on disk: each written entry, and each
+/// directory up to the config home, is flushed first, so a crash between the
+/// save and the kernel's own writeback cannot lose a statement from both
+/// places. The ledger's sweep lock is held while its
+/// directories move, so no sweep commits a half-moved fork. The workspace
+/// sightings in `seen.json` beside the state file move last, under its own
+/// lock: a sidecar that cannot be read is a problem, but one that never
+/// holds the statements back.
+///
+/// A dry run takes no lock, pulls nothing and writes nothing, so it answers
+/// from the ledger this machine has: a statement another machine made that
+/// a pull would bring in is not counted. What it can know without a fetch,
+/// it holds back as the real run would: each fork whose ledger no git
+/// directory here reaches, or every fork when where the ledger travels
+/// cannot be read ([`ledger_sweep::unpullable`]).
+///
+/// `registry` is what dispatch read; one that could not be read fails the
+/// migration once the state file is open, as reading it there did.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "where the state and the ledger are, the registry, the author and the dry run are independent inputs"
+)]
+pub fn migrate(
+    state_path: &Path,
+    root: &Path,
+    registry: Result<Registry, ConfigError>,
+    owner: &str,
+    dry_run: bool,
+) -> anyhow::Result<Migrated> {
+    let lock = (!dry_run)
+        .then(|| FileLock::acquire(state_path, crate::lock::LockWait::CLAIM))
+        .transpose()?;
+    let mut store = Store::open_to_migrate(state_path.to_owned(), lock)?;
+    let registry = registry?;
+    let former = registry.former_names();
+    let mut migrated = Migrated {
+        dry_run,
+        ..Migrated::default()
+    };
+    if unmigrated(root, &former).next().is_some() {
+        let _sweep = (!dry_run)
+            .then(|| FileLock::acquire(root, crate::lock::LockWait::TRANSPORT))
+            .transpose()?;
+        move_ledgers(root, &former, &mut migrated);
+    }
+    let (renamed, refused) = store.rename_forks(&former);
+    migrated.renamed = renamed;
+    migrated.problems.extend(refused.iter().map(|refused| {
+        format!(
+            "{} {}: not moved to {}, which is already there",
+            refused.map, refused.from, refused.to
+        )
+    }));
+    let by_repo = by_fork(
+        store.legacy_statements()?,
+        &registry,
+        &mut migrated.problems,
+    );
+    migrate_statements(root, &registry, owner, by_repo, &mut migrated);
+    migrated.statements_held = !migrated.problems.is_empty();
+    if !dry_run {
+        if !migrated.statements_held
+            && let Err(error) = flush(root, &migrated.written, &migrated.moved)
+        {
+            migrated.problems.push(format!(
+                "flushing the migrated entries to disk: {error}; state.json keeps every statement"
+            ));
+            migrated.statements_held = true;
+        }
+        let dropped = !migrated.statements_held && store.drop_legacy_statements();
+        if dropped || !migrated.renamed.is_empty() {
+            store.save()?;
+        }
+    }
+    drop(store);
+    let seen = state_path.with_file_name("seen.json");
+    let sightings = if dry_run {
+        crate::seen::plan_workspace_renames(&seen, &former).map(|plan| plan.moves)
+    } else {
+        crate::seen::rename_workspaces(&seen, &former)
+    };
+    match sightings {
+        Ok(sightings) => migrated.sightings = sightings,
+        Err(error) => migrated
+            .problems
+            .push(format!("workspace sightings not renamed: {error}")),
+    }
+    let contradicted = std::mem::take(&mut migrated.contradicted);
+    migrated.problems.extend(contradicted);
+    Ok(migrated)
+}
+
+/// Move each former name's entry files into the directory its fork is kept
+/// under now, or under a dry run only plan it, recording in `migrated` each
+/// directory that moved and each file that could not ([`plan_moves`]).
+fn move_ledgers(root: &Path, former: &FormerNames, migrated: &mut Migrated) {
+    for MovePlan { from, to, files } in plan_moves(root, former) {
+        let clashes = files.and_then(|files| {
+            if migrated.dry_run {
+                Ok(clashes_among(files))
+            } else {
+                apply_move(&from, &to, files)
+            }
+        });
+        record_move(from, to, clashes, migrated);
+    }
+}
+
+/// Write each fork's statements in `by_repo` onto its ledger, or under a
+/// dry run only count what would be written ([`plan_statements`]).
+///
+/// A real run pulls first, and a fork whose pull fails is held back; a dry
+/// run holds back each fork a pull would refuse before it fetched
+/// ([`ledger_sweep::unpullable`]), and reads each fork's ledger as the
+/// moves it planned would leave it.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the ledger root, the registry, the author, the statements and the report are independent inputs"
+)]
+fn migrate_statements(
+    root: &Path,
+    registry: &Registry,
+    owner: &str,
+    mut by_repo: BTreeMap<UpstreamName, Vec<(String, LegacyStatement)>>,
+    migrated: &mut Migrated,
+) {
+    let dry_run = migrated.dry_run;
+    let forks: Vec<&UpstreamName> = by_repo.keys().collect();
+    let unpulled: BTreeMap<UpstreamName, Vec<String>> = if dry_run {
+        let moved: Vec<&Path> = migrated
+            .moved
+            .iter()
+            .map(|moved| moved.from.as_path())
+            .collect();
+        ledger_sweep::unpullable(root, registry, &forks, &moved)
+    } else {
+        let pulled = ledger_sweep::pull_at(root, registry, &forks);
+        forks
+            .iter()
+            .map(|fork| ((*fork).clone(), pulled.failed_for(fork)))
+            .collect()
+    };
+    by_repo.retain(|repo, statements| {
+        let problems = unpulled.get(repo).map_or(&[][..], Vec::as_slice);
+        migrated.problems.extend(problems.iter().map(|problem| {
+            format!(
+                "{repo}: {} statement(s) not migrated, since the ledger they would join could \
+                 not be pulled: {problem}",
+                statements.len()
+            )
+        }));
+        problems.is_empty()
+    });
+    for (repo, statements) in by_repo {
+        let moved_in: Vec<PathBuf> = migrated
+            .moved
+            .iter()
+            .filter(|moved| dry_run && moved.to == root.join(repo.as_str()))
+            .map(|moved| moved.from.clone())
+            .collect();
+        let ledger = Ledger::at(root.join(repo.as_str()));
+        let scribe = Scribe::unanchored(ledger, repo, owner.to_owned());
+        let writes = plan_statements(&scribe, &moved_in, &statements, migrated);
+        if dry_run {
+            migrated.wrote += writes.len();
+        } else {
+            write_statements(&scribe, writes, migrated);
+        }
+    }
+}
+
+/// Each of `statements` filed under the name its fork is kept under, its
+/// requirements renamed as [`with_current_names`] does; each one whose key
+/// cannot be read, or names no fork in `registry`, is a problem instead.
+///
+/// A key's fork is a registry key, an older knives' name for the fork. A
+/// key naming none is not taken as an upstream name: written there, its
+/// entries would sit in a directory no fork is kept under, which nothing
+/// reads, and the fork would be gone from the registry all the same.
+fn by_fork(
+    statements: Vec<LegacyStatement>,
+    registry: &crate::config::Registry,
+    problems: &mut Vec<String>,
+) -> BTreeMap<UpstreamName, Vec<(String, LegacyStatement)>> {
+    let former = registry.former_names();
+    let mut by_repo: BTreeMap<UpstreamName, Vec<(String, LegacyStatement)>> = BTreeMap::new();
+    for legacy in statements {
+        let Some((repo, branch)) = legacy
+            .key
+            .split_once('/')
+            .filter(|(repo, branch)| !repo.is_empty() && !branch.is_empty())
+        else {
+            problems.push(format!(
+                "{}: cannot read the key as <repo>/<branch>",
+                legacy.key
+            ));
+            continue;
+        };
+        let kept_under = registry
+            .repos
+            .get(repo)
+            .map(|entry| entry.upstream_name(repo));
+        match kept_under {
+            Some(upstream) => by_repo
+                .entry(upstream)
+                .or_default()
+                .push((branch.to_owned(), with_current_names(legacy, &former))),
+            None => problems.push(format!(
+                "{key} in state.json's {map}: no fork in repos.toml is named {repo}, so the \
+                 statement has no ledger to join and is not migrated. Either add the fork \
+                 back as [repos.{repo}] in repos.toml, or delete {key} from {map} in \
+                 state.json",
+                key = legacy.key,
+                map = legacy.map,
+            )),
+        }
+    }
+    by_repo
+}
+
+/// `legacy` with the repository of each requirement it states renamed from
+/// a former name to the one its fork is kept under now.
+fn with_current_names(legacy: LegacyStatement, former: &FormerNames) -> LegacyStatement {
+    if legacy.statement.kind != StatementKind::Depends {
+        return legacy;
+    }
+    let value = legacy.statement.value.as_deref().map(|value| {
+        value
+            .split(',')
+            .map(|written| {
+                Requirement::parse(written)
+                    .filter(|requirement| former.contains_key(requirement.repo.as_str()))
+                    .and_then(|_| renamed(former, written, '#'))
+                    .unwrap_or_else(|| written.to_owned())
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    });
+    LegacyStatement {
+        statement: Statement {
+            kind: legacy.statement.kind,
+            value,
+        },
+        ..legacy
+    }
+}
+
+/// What moving one former name's entry files into the directory its fork is
+/// kept under now would do ([`plan_moves`]).
+struct MovePlan {
+    from: PathBuf,
+    to: PathBuf,
+    /// Each regular file directly in `from`, in name order, with what `to`
+    /// holds under its name; or why `from` could not be read.
+    files: std::io::Result<Vec<(std::ffi::OsString, Placement)>>,
+}
+
+/// What a fork's directory holds under the name of an entry file moving in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Placement {
+    /// Nothing: the file moves in.
+    Free,
+    /// The same bytes, pulled from a machine that migrated first: the same
+    /// entry, so the old copy goes.
+    Same,
+    /// Other bytes: both stay for a person to look at.
+    Different,
+}
+
+/// How each `<root>/<former name>/` entry file would move into
+/// `<root>/<upstream name>/`, read and moved nowhere, in name order: each
+/// fork's plan is read when the iterator reaches it, so a real run reads a
+/// fork just before it moves it.
+///
+/// A former name can be the owner directory another fork's upstream name now
+/// lives in (`acme` the fork beside `acme/demo`): its entry files are the
+/// regular files directly inside it, and the directories there are other
+/// forks', left alone. Moving one fork's files writes only into its own
+/// upstream name's directory, which no other plan reads.
+fn plan_moves<'a>(root: &'a Path, former: &'a FormerNames) -> impl Iterator<Item = MovePlan> + 'a {
+    unmigrated(root, former).map(|(name, now)| {
+        let (from, to) = (root.join(name), root.join(now.as_str()));
+        let files = placements(&from, &to);
+        MovePlan { from, to, files }
+    })
+}
+
+/// Each regular file directly in `from`, in name order, with what `to`
+/// holds under its name.
+fn placements(from: &Path, to: &Path) -> std::io::Result<Vec<(std::ffi::OsString, Placement)>> {
+    let mut files: Vec<_> = std::fs::read_dir(from)?
+        .map(|dirent| dirent.map(|dirent| (dirent.file_name(), dirent.file_type())))
+        .collect::<Result<_, _>>()?;
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut placed = Vec::new();
+    for (file, kind) in files {
+        if !kind?.is_file() {
+            continue;
+        }
+        let destination = to.join(&file);
+        let placement = if !destination.exists() {
+            Placement::Free
+        } else if std::fs::read(from.join(&file))? == std::fs::read(&destination)? {
+            Placement::Same
+        } else {
+            Placement::Different
+        };
+        placed.push((file, placement));
+    }
+    Ok(placed)
+}
+
+/// The names a planned move leaves behind, because `to` holds a different
+/// file under them.
+fn clashes_among(files: Vec<(std::ffi::OsString, Placement)>) -> Vec<std::ffi::OsString> {
+    files
+        .into_iter()
+        .filter(|(_, placement)| *placement == Placement::Different)
+        .map(|(file, _)| file)
+        .collect()
+}
+
+/// Carry out a planned move of `files` from `from` into `to`, created if
+/// absent; the names left behind ([`clashes_among`]). A move that leaves
+/// nothing behind removes `from`, empty now unless it holds another fork's
+/// directory.
+fn apply_move(
+    from: &Path,
+    to: &Path,
+    files: Vec<(std::ffi::OsString, Placement)>,
+) -> std::io::Result<Vec<std::ffi::OsString>> {
+    std::fs::create_dir_all(to)?;
+    let mut clashes = Vec::new();
+    for (file, placement) in files {
+        let source = from.join(&file);
+        match placement {
+            Placement::Free => std::fs::rename(&source, to.join(&file))?,
+            Placement::Same => std::fs::remove_file(&source)?,
+            Placement::Different => clashes.push(file),
+        }
+    }
+    if clashes.is_empty() {
+        let _ = std::fs::remove_dir(from);
+    }
+    Ok(clashes)
+}
+
+/// Record in `migrated` what a move from `from` to `to` did, or under a dry
+/// run would do: the directory moved, each file left behind, or why it could
+/// not be moved.
+fn record_move(
+    from: PathBuf,
+    to: PathBuf,
+    clashes: std::io::Result<Vec<std::ffi::OsString>>,
+    migrated: &mut Migrated,
+) {
+    match clashes {
+        Ok(clashes) if clashes.is_empty() => migrated.moved.push(Moved { from, to }),
+        Ok(clashes) => migrated.problems.extend(clashes.into_iter().map(|file| {
+            format!(
+                "{}: not moved, because {} holds a different entry under that name",
+                from.join(&file).display(),
+                to.join(&file).display()
+            )
+        })),
+        Err(error) => migrated.problems.push(format!(
+            "moving {} to {}: {error}",
+            from.display(),
+            to.display()
+        )),
+    }
+}
+
+/// Flush to disk each entry in `written`, then every directory holding one or
+/// named in `moved`, and each directory above them up to the config home
+/// holding `root`: a file's data and a directory's new names reach the disk
+/// only on the kernel's own schedule otherwise, and the caller is about to
+/// drop the only other copy of what they hold.
+fn flush(root: &Path, written: &[PathBuf], moved: &[Moved]) -> std::io::Result<()> {
+    let home = root.parent().unwrap_or(root);
+    let mut directories = BTreeSet::new();
+    for path in written {
+        std::fs::File::open(path)?.sync_all()?;
+    }
+    let holding = written.iter().filter_map(|path| path.parent());
+    let named = moved
+        .iter()
+        .flat_map(|moved| [moved.from.as_path(), moved.to.as_path()]);
+    for directory in holding.chain(named) {
+        for directory in directory.ancestors() {
+            directories.insert(directory.to_owned());
+            if directory == home {
+                break;
+            }
+        }
+    }
+    for directory in directories {
+        match std::fs::File::open(&directory) {
+            Ok(handle) => handle.sync_all()?,
+            // A former name's directory is removed once emptied.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+/// One statement [`plan_statements`] decided to write: its branch, the
+/// statement, and the pull request its entry carries.
+type Write<'s> = (&'s str, &'s Statement, Option<u64>);
+
+/// Which of one repository's statements its ledger, read once, does not
+/// carry yet; each it already carries or contradicts is counted in
+/// `migrated`. A dry run reads the ledger as the moves would leave it, the
+/// entries still in each directory of `moved_in` with its own.
+fn plan_statements<'s>(
+    scribe: &Scribe,
+    moved_in: &[PathBuf],
+    statements: &'s [(String, LegacyStatement)],
+    migrated: &mut Migrated,
+) -> Vec<Write<'s>> {
+    // An entry or statement this knives reads only in part states nothing
+    // here, so it neither carries nor contradicts a statement being moved;
+    // every report of the fork names it.
+    let read = std::iter::once(scribe.ledger().clone())
+        .chain(moved_in.iter().map(|path| Ledger::at(path.clone())))
+        .map(|ledger| ledger.read().map(|read| read.entries))
+        .collect::<Result<Vec<_>, _>>();
+    let entries: Vec<_> = match read {
+        Ok(entries) => entries.into_iter().flatten().collect(),
+        Err(error) => {
+            migrated.problems.push(format!(
+                "{}: {} statement(s) not migrated: {error}",
+                scribe.repo(),
+                statements.len()
+            ));
+            return Vec::new();
+        }
+    };
+    let carried: BTreeSet<(&str, &Statement)> = entries
+        .iter()
+        .filter_map(|entry| Some((entry.subject.as_deref()?, entry.statement.as_ref()?)))
+        .collect();
+    let stated_pull: BTreeMap<&str, u64> = statements
+        .iter()
+        .filter(|(_, legacy)| legacy.statement.kind == StatementKind::Pull)
+        .filter_map(|(branch, legacy)| {
+            Some((
+                branch.as_str(),
+                legacy.statement.value.as_deref()?.parse().ok()?,
+            ))
+        })
+        .collect();
+    let live = Statements::from_entries(&entries);
+    let mut writes = Vec::new();
+    for (branch, legacy) in statements {
+        if carried.contains(&(branch.as_str(), &legacy.statement)) {
+            migrated.already += 1;
+            continue;
+        }
+        if let Some(stated) = live.stated(branch, legacy.statement.kind) {
+            migrated.contradicted.push(format!(
+                "{}/{branch}: state.json says {} {:?}, but the ledger already states {:?}; not \
+                 written, since the ledger's is what every machine reads",
+                scribe.repo(),
+                legacy.statement.kind,
+                legacy.statement.value.as_deref().unwrap_or_default(),
+                stated.unwrap_or_default()
+            ));
+            continue;
+        }
+        let pr = stated_pull
+            .get(branch.as_str())
+            .copied()
+            .or_else(|| live.pull(branch));
+        writes.push((branch.as_str(), &legacy.statement, pr));
+    }
+    writes
+}
+
+/// Append one statement entry per planned write; each entry file written is
+/// kept in `migrated`, and each that could not be is a problem.
+fn write_statements(scribe: &Scribe, writes: Vec<Write<'_>>, migrated: &mut Migrated) {
+    for (branch, statement, pr) in writes {
+        let draft = Draft {
+            statement: Some(Stated {
+                statement: statement.clone(),
+                replaces: None,
+            }),
+            ..Draft::event(Some(branch), history(statement), pr)
+        };
+        match scribe.record_to(&draft) {
+            Ok((_, path)) => {
+                migrated.wrote += 1;
+                migrated.written.push(path);
+            }
+            Err(error) => migrated
+                .problems
+                .push(format!("{}/{branch}: {error}", scribe.repo())),
+        }
+    }
+}
+
+/// The prose a migrated statement's entry carries: history for a reader,
+/// never read back as the statement.
+fn history(statement: &Statement) -> String {
+    let value = statement.value.as_deref().unwrap_or_default();
+    let said = match statement.kind {
+        StatementKind::Pull => format!("stated as #{value}"),
+        StatementKind::ForkOnly => {
+            format!("stated as having no upstream pull request ({value})")
+        }
+        StatementKind::Superseded => format!("superseded by {value}"),
+        StatementKind::Depends if value.is_empty() => "requires nothing".to_owned(),
+        StatementKind::Depends => format!("requires {}", value.replace(',', ", ")),
+        // state.json held only the four kinds above; this arm is never taken.
+        StatementKind::Unknown => "a statement of a kind this knives does not know".to_owned(),
+    };
+    format!("migrated from state.json: {said}")
+}
+
+/// Migrate the state file and ledger beside the registry dispatch read
+/// (`loaded`), or with `dry_run` say what that would do, and report it.
+pub fn run_migrate(
+    output: Output,
+    dry_run: bool,
+    loaded: Result<Registry, ConfigError>,
+) -> anyhow::Result<Exit> {
+    let owner = crate::commands::claim::identity_outside_a_fork().owner;
+    let migrated = migrate(
+        &crate::store::default_state_path(),
+        &crate::ledger::default_ledger_root(),
+        loaded,
+        &owner,
+        dry_run,
+    )?;
+    if let Some(payload) = crate::cli::machine_payload(output, &migrated)? {
+        println!("{payload}");
+    } else {
+        println!("{}", render_migrated(&migrated));
+    }
+    Ok(if migrated.problems.is_empty() {
+        Exit::Ok
+    } else {
+        Exit::Incomplete
+    })
+}
+
+pub fn render_migrated(migrated: &Migrated) -> String {
+    let (moved, renamed, wrote) = if migrated.dry_run {
+        ("would move", "would rename", "would write")
+    } else {
+        ("moved", "renamed", "wrote")
+    };
+    let mut lines: Vec<String> = migrated
+        .moved
+        .iter()
+        .map(|each| {
+            format!(
+                "ledger: {moved} {} to {}",
+                each.from.display(),
+                each.to.display()
+            )
+        })
+        .chain(
+            migrated
+                .renamed
+                .iter()
+                .map(|each| format!("state: {renamed} {} {} to {}", each.map, each.from, each.to)),
+        )
+        .chain(
+            migrated
+                .sightings
+                .iter()
+                .map(|each| format!("seen: {renamed} workspace {} to {}", each.from, each.to)),
+        )
+        .collect();
+    lines.push(format!(
+        "ledger: {wrote} {} statement(s); {} already on the ledger",
+        migrated.wrote, migrated.already
+    ));
+    if migrated.dry_run {
+        lines.push(
+            "ledger: a dry run: nothing was changed, and the ledger was not pulled first"
+                .to_owned(),
+        );
+    }
+    if migrated.statements_held {
+        lines.push(
+            "ledger: state.json keeps its statements until every one migrates; run again \
+             after fixing"
+                .to_owned(),
+        );
+    }
+    lines.extend(
+        migrated
+            .problems
+            .iter()
+            .map(|problem| format!("!! {}", inline_human_text(problem))),
+    );
+    lines.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_sweeps_problems_and_notes_render_with_control_characters_escaped() {
+        // Each can carry a name from another machine's ref or from disk.
+        let report = Report {
+            problems: vec!["…/x-\u{1b}]0;pwned\u{7}.md differs between refs".to_owned()],
+            notes: vec!["\u{1b}[2J sets knives.x".to_owned()],
+            ..Report::of(Outcome::Swept)
+        };
+
+        let text = render(&report);
+
+        assert!(!text.contains('\u{1b}'), "was: {text:?}");
+        assert!(!text.contains('\u{7}'), "was: {text:?}");
+        assert!(text.contains("!! "), "was: {text:?}");
+        assert!(text.contains("note: "), "was: {text:?}");
+    }
+}

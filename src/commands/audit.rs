@@ -11,10 +11,10 @@ use crate::config::{RepoEntry, Role};
 use crate::detect::{BookmarkTips, Finding, FindingKind, Subject};
 use crate::forge::{Forge, PullRequest};
 use crate::ids::{
-    BookmarkRef, BranchName, BranchTarget, CommitId, RepoName, is_release_name, short_id,
+    BookmarkRef, BranchName, BranchTarget, CommitId, UpstreamName, is_release_name, short_id,
 };
 use crate::jj::{self, Repo};
-use crate::ledger::{Entry, Ledger};
+use crate::ledger::Entry;
 use crate::release_model::carried_from_tips;
 use crate::snapshot::{self, SnapshotConfig};
 use crate::store::Store;
@@ -128,7 +128,7 @@ pub fn gather(input: &AuditInput<'_>) -> Report {
         }
     };
     let requested: Vec<BranchName> = local.keys().cloned().collect();
-    let tracked = tracked(input.store, &fork.name, &requested);
+    let tracked = tracked(input.store, &fork.upstream, &requested);
     let rows = pushed::reconcile(&ReconcileInput {
         tips_local: &local,
         origin_refs: live.origin(),
@@ -141,7 +141,7 @@ pub fn gather(input: &AuditInput<'_>) -> Report {
     report.findings.extend(zombie_branches(&ZombieInput {
         entry,
         store: input.store,
-        repo: &fork.name,
+        repo: &fork.upstream,
         local: &local,
         live: &live,
         scheme: &scheme,
@@ -153,7 +153,7 @@ pub fn gather(input: &AuditInput<'_>) -> Report {
             published: live.release(),
             scheme: &scheme,
             publish_remote: entry.publish_remote(),
-            ledger: &Ledger::for_repo(&fork.name),
+            entries: input.store.ledger_entries(&fork.upstream),
         },
     );
     add_misplaced_origin_release_refs(&mut report, live.origin(), &scheme, entry.publish_remote());
@@ -232,7 +232,11 @@ fn add_unconfigured_remote_refs(
     );
 }
 
-fn tracked(store: &Store, repo: &RepoName, branches: &[BranchName]) -> BTreeMap<BranchName, u64> {
+fn tracked(
+    store: &Store,
+    repo: &UpstreamName,
+    branches: &[BranchName],
+) -> BTreeMap<BranchName, u64> {
     branches
         .iter()
         .filter_map(|branch| {
@@ -266,7 +270,7 @@ const fn pushed_finding(verdict: &pushed::Verdict) -> bool {
 struct ZombieInput<'a> {
     entry: &'a RepoEntry,
     store: &'a Store,
-    repo: &'a RepoName,
+    repo: &'a UpstreamName,
     local: &'a BTreeMap<BranchName, CommitId>,
     live: &'a pushed::LiveRefs,
     scheme: &'a crate::ids::ReleaseScheme,
@@ -352,7 +356,7 @@ struct ReleaseDriftScan<'a> {
     published: &'a BTreeMap<String, CommitId>,
     scheme: &'a crate::ids::ReleaseScheme,
     publish_remote: &'a str,
-    ledger: &'a Ledger,
+    entries: &'a [Entry],
 }
 
 struct ReleaseDrift<'a> {
@@ -368,17 +372,8 @@ fn add_release_drifts(report: &mut Report, scan: &ReleaseDriftScan<'_>) {
         published,
         scheme,
         publish_remote,
-        ledger,
+        entries,
     } = *scan;
-    let entries = match ledger.entries() {
-        Ok(entries) => entries,
-        Err(error) => {
-            report
-                .problems
-                .push(format!("could not read ledger: {error}"));
-            return;
-        }
-    };
     for (branch, current) in local
         .iter()
         .filter(|(branch, _)| is_release_name(branch, scheme))
@@ -386,7 +381,7 @@ fn add_release_drifts(report: &mut Report, scan: &ReleaseDriftScan<'_>) {
         add_release_drift(
             report,
             ReleaseDrift {
-                entries: &entries,
+                entries,
                 reference: BookmarkRef::Local(branch.clone()),
                 current,
                 source: "local",
@@ -404,7 +399,7 @@ fn add_release_drifts(report: &mut Report, scan: &ReleaseDriftScan<'_>) {
         add_release_drift(
             report,
             ReleaseDrift {
-                entries: &entries,
+                entries,
                 reference: BookmarkRef::Remote {
                     branch,
                     remote: crate::ids::RemoteName::new(publish_remote),
@@ -652,8 +647,13 @@ pub const fn exit_for(report: &Report) -> Exit {
 /// and the one deeper-history surface.
 pub fn render(report: &Report) -> String {
     let mut lines = format!("{}: audit", report.repo);
+    // A problem can name a path from disk or from another machine's ledger ref.
     for problem in &report.problems {
-        let _ = write!(lines, "\n  PROBLEM: {problem}");
+        let _ = write!(
+            lines,
+            "\n  PROBLEM: {}",
+            crate::ledger::inline_human_text(problem)
+        );
     }
     if !report.branches.is_empty() {
         lines.push_str("\n  branches:");
@@ -755,7 +755,12 @@ mod tests {
         report: &mut Report,
     ) -> Result<(), ForgeError> {
         let temp = tempfile::tempdir().expect("create test store");
-        let store = Store::open(temp.path().join("state.json")).expect("open test store");
+        let store = Store::open(
+            temp.path().join("state.json"),
+            &crate::config::FormerNames::new(),
+            &[&fork.upstream],
+        )
+        .expect("open test store");
         pull_head_findings(
             &audit_input(fork, &store, Some(forge), None),
             forge,
@@ -865,9 +870,11 @@ mod tests {
             Entry {
                 ts: "2026-08-15T00:00:00Z".to_owned(),
                 owner: "test".to_owned(),
+                email: None,
                 subject: Some("release/2026-08-15".to_owned()),
                 kind: Kind::Event,
                 disposition: None,
+                statement: None,
                 text: "cut release/2026-08-15 as aaaaaaaaaaaa with 1 parent(s)".to_owned(),
                 evidence: vec!["aaaaaaaaaaaa".to_owned(), "member0000000".to_owned()],
                 anchor: None,
@@ -877,9 +884,11 @@ mod tests {
             Entry {
                 ts: "2026-08-16T00:00:00Z".to_owned(),
                 owner: "test".to_owned(),
+                email: None,
                 subject: Some("release/2026-08-15".to_owned()),
                 kind: Kind::Note,
                 disposition: Some("ruled-out".to_owned()),
+                statement: None,
                 text: "later disposition".to_owned(),
                 evidence: vec!["bbbbbbbbbbbb".to_owned()],
                 anchor: None,
@@ -902,9 +911,11 @@ mod tests {
             .append(&Entry {
                 ts: "2026-08-15T00:00:00Z".to_owned(),
                 owner: "test".to_owned(),
+                email: None,
                 subject: Some("release/2026-08-15".to_owned()),
                 kind: Kind::Event,
                 disposition: None,
+                statement: None,
                 text: "cut release/2026-08-15 as aaaaaaaaaaaa with 1 parent(s)".to_owned(),
                 evidence: vec!["aaaaaaaaaaaa".to_owned(), "bbbbbbbbbbbb".to_owned()],
                 anchor: None,
@@ -912,6 +923,7 @@ mod tests {
                 parents: Vec::new(),
             })
             .expect("record cut");
+        let entries = ledger.read().expect("read the cut back").entries;
         let mut report = Report::new("demo");
         let published = BTreeMap::from([(
             "refs/heads/release/2026-08-15".to_owned(),
@@ -925,7 +937,7 @@ mod tests {
                 published: &published,
                 scheme: &crate::ids::ReleaseScheme::Dated,
                 publish_remote: "release",
-                ledger: &ledger,
+                entries: &entries,
             },
         );
 
@@ -1094,7 +1106,12 @@ mod tests {
             ..FakeForge::default()
         };
         let temp = tempfile::tempdir().expect("create test cache");
-        let store = Store::open(temp.path().join("state.json")).expect("open test store");
+        let store = Store::open(
+            temp.path().join("state.json"),
+            &crate::config::FormerNames::new(),
+            &[&fork.upstream],
+        )
+        .expect("open test store");
         let mut report = Report::new("demo");
 
         add_open_pull_head_checks(
@@ -1123,7 +1140,12 @@ mod tests {
         let temp = tempfile::tempdir().expect("create test cache");
         let blocked_root = temp.path().join("blocked-cache-root");
         std::fs::write(&blocked_root, "not a directory").expect("block cache root");
-        let store = Store::open(temp.path().join("state.json")).expect("open test store");
+        let store = Store::open(
+            temp.path().join("state.json"),
+            &crate::config::FormerNames::new(),
+            &[&fork.upstream],
+        )
+        .expect("open test store");
         let mut report = Report::new("demo");
 
         add_open_pull_head_checks(
@@ -1150,7 +1172,12 @@ mod tests {
             fact: None,
         };
         let temp = tempfile::tempdir().expect("create test store");
-        let store = Store::open(temp.path().join("state.json")).expect("open test store");
+        let store = Store::open(
+            temp.path().join("state.json"),
+            &crate::config::FormerNames::new(),
+            &[&fork.upstream],
+        )
+        .expect("open test store");
         let mut report = Report::new("demo");
 
         add_open_pull_head_checks(

@@ -4,7 +4,7 @@
 //! maintained (the registry, and where each entry lives on this machine);
 //! `status` answers what state each branch of a repository is in. Conflating
 //! the two was an earlier mistake in this design.
-// allow: SIZE_OK: 1032 lines - release state, pin lag, gather and render for one report, with the pin-lag scenarios beside the private functions they exercise.
+// allow: SIZE_OK: 1193 lines - release state, pin lag, gather and render for one report, with the pin-lag scenarios beside the private functions they exercise.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -278,13 +278,31 @@ pub struct Report {
 #[derive(Debug, serde::Serialize)]
 pub struct RepoRow {
     pub name: String,
+    /// What this fork's ledger, claims and state are kept under
+    /// ([`crate::config::RepoEntry::upstream_name`]): the lowercase
+    /// `<owner>/<name>` of its upstream, or the registry key for an upstream
+    /// that is a filesystem path. A `state.json` claim's `repo` is this, so
+    /// a reader holding one finds its fork's row here.
+    pub upstream_name: String,
+    /// The repository this fork's ledger belongs to
+    /// ([`crate::config::RepoEntry::ledger`]), in the one spelling the
+    /// registry keeps it as: lowercase `<owner>/<name>`, without `.git`.
+    /// Absent for a fork whose ledger is not shared.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ledger: Option<String>,
     /// Where the checkout was found under `$HOME`; `None` when it was not, or
-    /// when more than one was.
+    /// when more than one was, or when its `upstream` disagrees with the
+    /// registry.
     pub path: Option<String>,
     /// How many checkouts the scan found when it found more than one; the
     /// problem names them. Rendering only: JSON says `path: null` and the problem.
     #[serde(skip)]
     pub ambiguous: usize,
+    /// Whether the scan found checkouts carrying this entry's `origin` under
+    /// another `upstream`; the problem names each. Rendering only, as
+    /// `ambiguous` is.
+    #[serde(skip)]
+    pub disagrees: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub release_remote: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -322,9 +340,10 @@ impl std::fmt::Debug for GatherInput<'_> {
 /// Collects release state and consumer pin lag for every registry entry.
 ///
 /// Every entry is a row. One the scan found carries its checkout path, remote
-/// notes, and pin lag; one found twice carries the refusal as a problem; one
-/// not found carries neither, and renders as not on this machine. What the
-/// scan could not read is reported once, on the listing.
+/// notes, and pin lag; one found twice, or found only under an `upstream` the
+/// registry disagrees with, carries the refusal as a problem; one not found
+/// carries neither, and renders as not on this machine. What the scan could
+/// not read is reported once, on the listing.
 pub fn gather(input: &GatherInput<'_>) -> Report {
     let GatherInput {
         registry,
@@ -345,13 +364,18 @@ pub fn gather(input: &GatherInput<'_>) -> Report {
             let repo_name = RepoName::new(name.as_str());
             let Some(fork) = scan.found.get(&repo_name) else {
                 let problems = match scan.unplaced(&repo_name, Vec::new()) {
-                    why @ Unresolved::Duplicate { .. } => vec![why.message(&repo_name, registry)],
+                    why @ (Unresolved::Duplicate { .. } | Unresolved::Disagrees { .. }) => {
+                        vec![why.message(&repo_name, registry)]
+                    }
                     Unresolved::Missing { .. } | Unresolved::Unknown => Vec::new(),
                 };
                 return RepoRow {
                     name: name.clone(),
+                    upstream_name: entry.upstream_name(name).to_string(),
+                    ledger: entry.ledger.clone(),
                     path: None,
                     ambiguous: scan.duplicates.get(&repo_name).map_or(0, Vec::len),
+                    disagrees: scan.disagreements.contains_key(&repo_name),
                     release_remote,
                     newest_release: None,
                     behind: None,
@@ -373,8 +397,11 @@ pub fn gather(input: &GatherInput<'_>) -> Report {
             notes.extend(pin_lag.notes);
             RepoRow {
                 name: name.clone(),
+                upstream_name: fork.upstream.to_string(),
+                ledger: entry.ledger.clone(),
                 path: Some(fork.checkout.path.display().to_string()),
                 ambiguous: 0,
+                disagrees: false,
                 release_remote,
                 newest_release: newest.cloned(),
                 behind: pin_lag.lag,
@@ -420,6 +447,7 @@ pub fn render(report: &Report) -> String {
     for repo in &report.repos {
         let location = match (&repo.path, repo.ambiguous) {
             (Some(path), _) => path.clone(),
+            (None, 0) if repo.disagrees => "upstream disagrees with repos.toml".to_owned(),
             (None, 0) => "not on this machine".to_owned(),
             (None, count) => format!("ambiguous: {count} checkouts"),
         };
@@ -684,6 +712,45 @@ mod tests {
             "{rendered}"
         );
         assert_eq!(rendered.matches("broken").count(), 1, "{rendered}");
+        assert_eq!(exit_for(&report), Exit::Incomplete);
+    }
+
+    #[test]
+    fn an_entry_found_only_under_a_disagreeing_upstream_is_not_absent() {
+        // The scan found a checkout carrying `renamed`'s origin under another
+        // upstream: the row says so and names the fix, rather than reading
+        // `not on this machine`.
+        let registry = registry(&[("renamed", None)]);
+        let home = Path::new("/home/someone");
+        let disagreement = crate::bind::Disagreement {
+            root: home.join("renamed/default"),
+            fork: RepoName::new("renamed"),
+            entry: registry.get(&RepoName::new("renamed")).expect("renamed"),
+            remote: "https://forge.invalid/org/old".to_owned(),
+        };
+        let scan = Scan {
+            home: home.to_owned(),
+            disagreements: BTreeMap::from([(RepoName::new("renamed"), vec![disagreement.clone()])]),
+            ..Scan::default()
+        };
+        let report = gather(&GatherInput {
+            registry: &registry,
+            scan: &scan,
+            releases: &BTreeMap::new(),
+            config_path: Path::new("/tmp/repos.toml"),
+            forge: &FakeForge::default(),
+            cache_root: None,
+            heads: &ConsumerHeadMemo::default(),
+        });
+
+        assert_eq!(report.repos[0].path, None);
+        assert_eq!(report.repos[0].problems, vec![disagreement.to_string()]);
+        let rendered = render(&report);
+        assert!(
+            rendered.starts_with("renamed  upstream disagrees with repos.toml"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("not on this machine"), "{rendered}");
         assert_eq!(exit_for(&report), Exit::Incomplete);
     }
 

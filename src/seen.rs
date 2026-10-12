@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::commands::claim::Identity;
 use crate::commands::wip::workspace_for;
-use crate::ids::{RepoName, WorkspaceName};
+use crate::ids::{UpstreamName, WorkspaceName};
 use crate::jj::WorkspaceActivity;
 use crate::lock::{FileLock, LockWait};
 use crate::store::{Claim, OwnerKind, default_state_path};
@@ -27,7 +27,8 @@ pub struct Seen {
     /// A name only identifies a claimant in conjunction with its source.
     #[serde(default)]
     pub owners: BTreeMap<OwnerKind, BTreeMap<String, String>>,
-    /// `<repo>/<workspace-dir-name>` → newest RFC 3339 observation.
+    /// `<upstream>/<workspace-dir-name>` → newest RFC 3339 observation, where
+    /// `<upstream>` is the name the fork's claims are kept under.
     #[serde(default)]
     pub workspaces: BTreeMap<String, String>,
 }
@@ -44,10 +45,11 @@ pub enum LastSeen {
 ///
 /// The owner source is part of the observation key; OS-user identities are
 /// deliberately excluded because they would conflate every anonymous claimant.
-/// `repo` is the entry the caller already bound `cwd` to (dispatch binds once
-/// per invocation; the hook has its match); with it, the jj workspace `cwd` is
-/// inside contributes `<repo>/<workspace-dir-name>`.
-pub fn record_observation(repo: Option<&RepoName>, cwd: &Path, identity: &Identity) {
+/// `repo` is the fork the caller already bound `cwd` to, by the name its
+/// claims are kept under (dispatch binds once per invocation; the hook has its
+/// match); with it, the jj workspace `cwd` is inside contributes
+/// `<repo>/<workspace-dir-name>`, the key [`last_seen`] reads for a claim.
+pub fn record_observation(repo: Option<&UpstreamName>, cwd: &Path, identity: &Identity) {
     let owner =
         (identity.kind != OwnerKind::OsUser).then(|| (identity.kind, identity.owner.clone()));
     let workspace = workspace_key(repo, cwd);
@@ -100,6 +102,155 @@ pub fn load() -> Seen {
     read(&seen_path()).unwrap_or_default()
 }
 
+/// One workspace sighting `knives ledger migrate` moved from the registry key
+/// an older knives kept it under to the fork's upstream name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RenamedSighting {
+    pub from: String,
+    pub to: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SeenError {
+    #[error("reading {path}: {source}")]
+    Read {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("{path} is not a sightings file: {source}")]
+    Parse {
+        path: PathBuf,
+        source: serde_json::Error,
+    },
+    #[error("writing {path}: {source}")]
+    Write {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error(transparent)]
+    Lock(#[from] crate::lock::LockError),
+}
+
+/// Move each workspace sighting an older knives keyed by a fork's registry
+/// key to the fork's upstream name.
+///
+/// `<registry key>/<workspace>` becomes `<upstream name>/<workspace>`, the
+/// key [`last_seen`] reads, as [`crate::store::migration::renamed`] decides for a
+/// state-file key; a key already under a current name is left alone.
+///
+/// Held under the sidecar's lock. Where the new key already holds a
+/// sighting, the later of the two is kept: both are observations of the one
+/// workspace, and [`last_seen`] takes the newest anyway. A sidecar that does
+/// not exist has nothing to rename; one that cannot be read is an error, not
+/// an empty file, so the migration says so.
+pub fn rename_workspaces(
+    path: &Path,
+    former: &crate::config::FormerNames,
+) -> Result<Vec<RenamedSighting>, SeenError> {
+    let _lock = FileLock::acquire(path, LockWait::CLAIM)?;
+    plan_workspace_renames(path, former)?.apply(path)
+}
+
+/// What [`rename_workspaces`] moves in the sidecar at `path`, read and
+/// written nowhere: a dry run reports [`SightingRenames::moves`], and a
+/// real one, holding the sidecar's lock, applies it.
+pub fn plan_workspace_renames(
+    path: &Path,
+    former: &crate::config::FormerNames,
+) -> Result<SightingRenames, SeenError> {
+    let seen = read_to_migrate(path)?;
+    let moves = seen
+        .as_ref()
+        .map(|seen| workspace_renames(seen, former))
+        .unwrap_or_default();
+    Ok(SightingRenames { seen, moves })
+}
+
+/// The sidecar as [`plan_workspace_renames`] read it, with each sighting
+/// that moves.
+#[derive(Debug)]
+pub struct SightingRenames {
+    seen: Option<Seen>,
+    pub moves: Vec<RenamedSighting>,
+}
+
+impl SightingRenames {
+    /// Write the sidecar at `path` with every sighting in [`Self::moves`]
+    /// moved; the moves. Nothing is written when nothing moves.
+    fn apply(self, path: &Path) -> Result<Vec<RenamedSighting>, SeenError> {
+        let Some(mut seen) = self.seen else {
+            return Ok(Vec::new());
+        };
+        if self.moves.is_empty() {
+            return Ok(self.moves);
+        }
+        for moved in &self.moves {
+            let Some(at) = seen.workspaces.remove(&moved.from) else {
+                continue;
+            };
+            let kept = seen
+                .workspaces
+                .get(&moved.to)
+                .filter(|existing| newer(existing, &at))
+                .cloned()
+                .unwrap_or(at);
+            seen.workspaces.insert(moved.to.clone(), kept);
+        }
+        save(path, &seen).map_err(|source| SeenError::Write {
+            path: path.to_owned(),
+            source,
+        })?;
+        Ok(self.moves)
+    }
+}
+
+/// The sidecar at `path`; `None` when there is none. One that cannot be read
+/// is an error, not an empty file, so the migration says so.
+fn read_to_migrate(path: &Path) -> Result<Option<Seen>, SeenError> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(SeenError::Read {
+                path: path.to_owned(),
+                source,
+            });
+        }
+    };
+    serde_json::from_str(&text)
+        .map(Some)
+        .map_err(|source| SeenError::Parse {
+            path: path.to_owned(),
+            source,
+        })
+}
+
+/// Each workspace sighting in `seen` keyed by a former name, with its key now.
+fn workspace_renames(seen: &Seen, former: &crate::config::FormerNames) -> Vec<RenamedSighting> {
+    seen.workspaces
+        .keys()
+        .filter_map(|key| {
+            crate::store::migration::renamed(former, key, '/').map(|to| RenamedSighting {
+                from: key.clone(),
+                to,
+            })
+        })
+        .collect()
+}
+
+/// Whether the RFC 3339 `one` is later than `other`; a stamp that does not
+/// parse is never the later one.
+fn newer(one: &str, other: &str) -> bool {
+    match (
+        one.parse::<jiff::Timestamp>(),
+        other.parse::<jiff::Timestamp>(),
+    ) {
+        (Ok(one), Ok(other)) => one > other,
+        (Ok(_), Err(_)) => true,
+        (Err(_), _) => false,
+    }
+}
+
 /// Returns the newest observation for a claim, or the honest coverage state
 /// when every observation stream is empty.
 pub fn last_seen(claim: &Claim, activity: &WorkspaceActivity, seen: &Seen) -> LastSeen {
@@ -137,7 +288,7 @@ fn seen_path() -> PathBuf {
     default_state_path().with_file_name("seen.json")
 }
 
-fn workspace_key(repo: Option<&RepoName>, cwd: &Path) -> Option<String> {
+fn workspace_key(repo: Option<&UpstreamName>, cwd: &Path) -> Option<String> {
     let repo = repo?;
     let workspace = cwd
         .ancestors()
@@ -154,13 +305,13 @@ fn read(path: &Path) -> Result<Seen, ()> {
     }
 }
 
-fn save(path: &Path, seen: &Seen) -> Result<(), ()> {
+fn save(path: &Path, seen: &Seen) -> std::io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(parent).map_err(|_| ())?;
-    let mut temporary = tempfile::NamedTempFile::new_in(parent).map_err(|_| ())?;
-    serde_json::to_writer_pretty(&mut temporary, seen).map_err(|_| ())?;
-    temporary.write_all(b"\n").map_err(|_| ())?;
-    temporary.persist(path).map_err(|_| ())?;
+    std::fs::create_dir_all(parent)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    serde_json::to_writer_pretty(&mut temporary, seen)?;
+    temporary.write_all(b"\n")?;
+    temporary.persist(path).map_err(|error| error.error)?;
     Ok(())
 }
 
@@ -206,7 +357,7 @@ mod tests {
     };
     use crate::commands::claim::Identity;
     use crate::config::test_support::{EnvironmentGuard, environment_lock};
-    use crate::ids::{RepoName, WorkspaceName};
+    use crate::ids::{UpstreamName, WorkspaceName};
     use crate::store::{Claim, OwnerKind, default_state_path};
 
     fn ts(raw: &str) -> jiff::Timestamp {
@@ -238,7 +389,7 @@ mod tests {
         // The caller binds; this only names the workspace `cwd` is inside.
         let home = tempfile::tempdir().expect("create home");
         let root = workspace(&home);
-        let repo = RepoName::new("a");
+        let repo = UpstreamName::new("a");
 
         assert_eq!(
             workspace_key(Some(&repo), &root.join("src")).as_deref(),
@@ -263,7 +414,7 @@ mod tests {
             kind: OwnerKind::HarnessSession,
         };
 
-        record_observation(Some(&RepoName::new("a")), &cwd, &identity);
+        record_observation(Some(&UpstreamName::new("a")), &cwd, &identity);
 
         let seen = load();
         assert!(seen.workspaces.contains_key("a/feat-x"), "was: {seen:?}");
@@ -385,7 +536,7 @@ mod tests {
         let cwd = workspace(&home);
 
         record_observation(
-            Some(&RepoName::new("a")),
+            Some(&UpstreamName::new("a")),
             &cwd,
             &Identity {
                 owner: "terminal-user".to_owned(),
@@ -411,10 +562,10 @@ mod tests {
             kind: OwnerKind::HarnessSession,
         };
 
-        record_observation(Some(&RepoName::new("a")), &cwd, &identity);
+        record_observation(Some(&UpstreamName::new("a")), &cwd, &identity);
         let path = default_state_path().with_file_name("seen.json");
         let first = std::fs::read_to_string(&path).expect("first observation persisted");
-        record_observation(Some(&RepoName::new("a")), &cwd, &identity);
+        record_observation(Some(&UpstreamName::new("a")), &cwd, &identity);
         let second = std::fs::read_to_string(&path).expect("second observation persisted");
 
         assert_eq!(first, second, "a fresh sighting must not rewrite seen.json");
@@ -449,7 +600,7 @@ mod tests {
         .expect("write stale observations");
 
         record_observation(
-            Some(&RepoName::new("a")),
+            Some(&UpstreamName::new("a")),
             &cwd,
             &Identity {
                 owner: "agent-one".to_owned(),
@@ -468,6 +619,41 @@ mod tests {
         assert!(
             !seen.workspaces.contains_key("a/stale-workspace"),
             "was: {seen:?}"
+        );
+    }
+
+    #[test]
+    fn a_sightings_rename_that_cannot_write_says_why() {
+        use std::os::unix::fs::PermissionsExt as _;
+        // Given: a sidecar holding a sighting under a former name, in a
+        // directory nothing new can be created in once its lock file exists.
+        let home = tempfile::tempdir().expect("create config home");
+        let path = home.path().join("seen.json");
+        std::fs::write(
+            &path,
+            r#"{"workspaces": {"demo/feat-x": "2026-01-01T00:00:00Z"}}"#,
+        )
+        .expect("write sightings");
+        std::fs::write(home.path().join("seen.lock"), "").expect("create the lock file");
+        let mode = |bits| std::fs::Permissions::from_mode(bits);
+        std::fs::set_permissions(home.path(), mode(0o555)).expect("make read-only");
+        if tempfile::NamedTempFile::new_in(home.path()).is_ok() {
+            // Root writes anywhere: nothing here can fail.
+            std::fs::set_permissions(home.path(), mode(0o755)).expect("restore");
+            return;
+        }
+        let former =
+            crate::config::FormerNames::from([("demo".to_owned(), UpstreamName::new("acme/demo"))]);
+
+        // When: the migration renames it.
+        let error = super::rename_workspaces(&path, &former);
+        std::fs::set_permissions(home.path(), mode(0o755)).expect("restore");
+
+        // Then: the error names the file and the cause.
+        let error = error.expect_err("the write fails").to_string();
+        assert!(
+            error.contains("seen.json") && error.contains("Permission denied"),
+            "was: {error}"
         );
     }
 }

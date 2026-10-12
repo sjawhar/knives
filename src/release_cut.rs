@@ -8,6 +8,7 @@
 
 use knives::bind::Fork;
 use knives::cli::Exit;
+use knives::commands::claim::Bound;
 use knives::commands::release;
 use knives::forge::github::CliForge;
 use knives::ids::{BookmarkRef, ReleaseScheme, RemoteName, RepoName};
@@ -36,7 +37,7 @@ pub(crate) fn run_release(
     fork: &Fork<'_>,
     extra_consumers: &[&std::path::Path],
     invocation: &ReleaseInvocation,
-    bound: Option<&RepoName>,
+    bound: Bound<'_>,
 ) -> anyhow::Result<Exit> {
     let repo = &fork.name;
     let entry = fork.entry;
@@ -58,6 +59,7 @@ pub(crate) fn run_release(
     };
     let (mut worst, pins) = release_plan_exit(
         fork,
+        bound.registry,
         &locals,
         &opened,
         &forge,
@@ -140,6 +142,7 @@ pub(crate) fn run_release(
         // record of a parent set that survives the bookmark moving, so every
         // subject is held against it before anything is recorded or published.
         let gate = CompositionGate {
+            ledger: Ledger::for_fork(fork),
             opened: &opened,
             path,
             parents: &request.parents,
@@ -182,8 +185,9 @@ pub(crate) fn run_release(
                         previous_ref.branch()
                     );
                 } else if matches!(scheme, ReleaseScheme::Fixed(_))
+                    // The pulled plan refused on any problem this read finds.
                     && let previous_recorded =
-                        last_recorded_cut(&Ledger::for_repo(repo).entries()?, None)
+                        last_recorded_cut(&gate.ledger.read()?.entries, None)
                     && previous_recorded
                         .as_ref()
                         .is_none_or(|recorded| recorded.commit != *published)
@@ -310,6 +314,7 @@ fn requested_cut(
 )]
 fn release_plan_exit(
     fork: &Fork<'_>,
+    registry: &knives::config::Registry,
     locals: &[std::path::PathBuf],
     opened: &knives::jj::Repo,
     forge: &dyn knives::consumer_pins::ConsumerPinSource,
@@ -324,7 +329,7 @@ fn release_plan_exit(
         cache_root,
         heads,
     };
-    let plan = release::plan(fork, &consumers, &Ledger::for_repo(&fork.name).entries()?)?;
+    let plan = release::pulled_plan(fork, registry, &consumers)?;
     println!("{}", release::render(&plan));
     let mut exit = release::exit_for(&plan);
     if let Some(lag) = release::trunk_lag(opened, plan.release.as_deref(), &entry.upstream_trunk())
@@ -374,6 +379,8 @@ fn report_cut_audit(repo: &RepoName, audit: &release::CutAudit) -> Option<Exit> 
 /// The composition gate's inputs: everything the recorded-member check reads
 /// beside the cut subject.
 struct CompositionGate<'a> {
+    /// The fork's ledger, where the previous cut's composition is recorded.
+    ledger: Ledger,
     opened: &'a knives::jj::Repo,
     path: &'a std::path::Path,
     parents: &'a [knives::ids::CommitId],
@@ -392,7 +399,8 @@ fn recorded_composition_check(
     gate: &CompositionGate<'_>,
     allow_drop: bool,
 ) -> anyhow::Result<Result<(Option<RecordedCut>, release::CompositionCheck), Exit>> {
-    let recorded = last_recorded_cut(&Ledger::for_repo(repo).entries()?, None);
+    // The pulled plan refused on any problem this read finds.
+    let recorded = last_recorded_cut(&gate.ledger.read()?.entries, None);
     let check = match &recorded {
         Some(recorded) => release::uncarried_recorded_members(
             gate.opened,
@@ -510,7 +518,7 @@ struct CompletedCut<'a> {
 fn record_cut_event(
     fork: &Fork<'_>,
     cut: &CompletedCut<'_>,
-    bound: Option<&RepoName>,
+    bound: Bound<'_>,
 ) -> anyhow::Result<()> {
     let entry = fork.entry;
     let opened = knives::jj::Repo::open(&fork.checkout.path)?;
@@ -560,6 +568,7 @@ fn record_cut_event(
         subject: Some(cut.name),
         kind: Kind::Event,
         disposition: None,
+        statement: None,
         text: format!(
             "cut {} as {} (change {}) with {} parent(s): {members_text}{delta}",
             cut.name,

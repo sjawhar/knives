@@ -21,14 +21,17 @@ It is absent under `--no-github` (text: `unknown`). A transition is not the
 current state: `new` can describe a merged PR. Forge state wins over head
 movement, so a PR that merged and moved head is `merged`.
 
-Only transitions write ledger events, with first sightings silent. A run without
+Only transitions write ledger events. First sightings are silent, and so is a
+transition the fork's ledger already holds as that PR's newest, which another
+machine recorded ([ledger](ledger.md#sharing-between-machines)). A run without
 the forge does not overwrite forge-backed state. `--all` emits one array of
 per-repository reports. Bare `sync` selects the managed checkout you are in;
 outside one, it asks for a repository name or `--all`, rather than sweeping by
 accident. `--no-github` skips PR/comment lookups, retaining local fetch and head
 checks.
 
-Last observed forge states are stored as `pull_states`, keyed `<repo>#<number>`.
+Last observed forge states are stored as `pull_states`, keyed
+`<owner>/<name>#<number>` by the fork's upstream name.
 Legacy transition spellings (`new`, `advanced`, `unchanged`) are read as open;
 a forge-backed sync replaces them and reports that correction once. An unknown
 spelling is a problem, exit `3`; the row is still classified/recorded and the
@@ -41,7 +44,7 @@ note `#<n> has comment activity newer than the last sync`. This is informational
 exit `0`; a comment query failure is a problem, exit `3`.
 
 The query costs one extra forge call per open tracked PR. `comment_marks`, keyed
-`<repo>#<number>`, advances only forward. First observation records a silent mark
+the same way, advances only forward. First observation records a silent mark
 to avoid old-activity noise. Edits to existing comments are invisible because
 forge `createdAt` does not change.
 
@@ -148,3 +151,9 @@ across forks. Status reports dependencies not yet merged. Preserve their require
 content when editing a release: retaining a dependent while dropping its
 requirement can ship a broken composition. This is an explicit relationship,
 not a dependency inferred from similar branch names.
+
+`depends` and `track --forget` pull the shared ledger first and refuse, exit `3`,
+when the pull fails: a forget erases what the ledger states for the branch, and
+a `depends` records, from what this machine last pulled, the list the branch
+waits on; another machine's newer statement may be what could not be pulled
+([sharing](ledger.md#sharing-between-machines)).

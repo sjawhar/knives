@@ -7,6 +7,7 @@
 
 use knives::bind::Fork;
 use knives::cli::Exit;
+use knives::commands::claim::Bound;
 use knives::commands::release;
 use knives::forge::github::CliForge;
 use knives::ids::{BranchName, CommitId, ReleaseScheme, RepoName};
@@ -89,9 +90,9 @@ struct EditContext<'a> {
     repo: &'a RepoName,
     opened: &'a knives::jj::Repo,
     release: &'a ReleaseInHand,
-    /// The entry the current directory is inside; the ledger event's author is
-    /// derived from it.
-    bound: Option<&'a RepoName>,
+    /// The fork the current directory is inside, by the name its claims are
+    /// kept under; the ledger event's author is derived from it.
+    bound: Bound<'a>,
     /// The release's last recorded parent set, from this repository's ledger.
     ///
     /// Ancestry and change ids cover a branch that grew or was rebased by jj. A
@@ -188,7 +189,7 @@ pub(crate) fn run_release_edit(
     fork: &Fork<'_>,
     extra_consumers: &[&std::path::Path],
     change: &ReleaseEdit,
-    bound: Option<&RepoName>,
+    bound: Bound<'_>,
 ) -> anyhow::Result<Exit> {
     let mut locals = extra_consumers
         .iter()
@@ -227,7 +228,7 @@ fn edit_release(
     forge: &dyn knives::consumer_pins::ConsumerPinSource,
     cache_root: Option<&std::path::Path>,
     heads: &knives::consumer_pins::ConsumerHeadMemo,
-    bound: Option<&RepoName>,
+    bound: Bound<'_>,
 ) -> anyhow::Result<Exit> {
     let repo = &fork.name;
     let entry = fork.entry;
@@ -239,7 +240,7 @@ fn edit_release(
         cache_root,
         heads,
     };
-    let plan = release::plan(fork, &consumers, &Ledger::for_repo(repo).entries()?)?;
+    let plan = release::pulled_plan(fork, bound.registry, &consumers)?;
     if !plan.problems.is_empty() {
         println!("{}", release::render(&plan));
         println!(
@@ -291,7 +292,8 @@ fn edit_release(
         return Ok(Exit::Incomplete);
     }
     let release = ReleaseInHand::read(&opened, entry, release_name)?;
-    let ledger = Ledger::for_repo(repo).entries()?;
+    // The pulled plan refused on any problem this read finds.
+    let ledger = Ledger::for_fork(fork).read()?.entries;
     let releases = knives::release_model::release_refs_by_commit(
         &opened.bookmark_tips()?,
         &entry.release_scheme(),
@@ -384,7 +386,7 @@ pub(crate) fn record_edit_event(
     fork: &Fork<'_>,
     opened: &knives::jj::Repo,
     record: &EditRecord<'_>,
-    bound: Option<&RepoName>,
+    bound: Bound<'_>,
 ) -> anyhow::Result<()> {
     let parents: Vec<knives::ids::CommitId> = record
         .provenance
@@ -395,6 +397,7 @@ pub(crate) fn record_edit_event(
         subject: Some(record.release),
         kind: Kind::Event,
         disposition: None,
+        statement: None,
         text: format!(
             "edited {}: {}; parents: {}",
             record.release,

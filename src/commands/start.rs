@@ -7,16 +7,14 @@ use std::path::{Path, PathBuf};
 use crate::bind::Fork;
 use crate::cli::Exit;
 use crate::commands::claim::{
-    ClaimContext, ClaimDecision, Identity, current_identity, decide, last_seen_provenance,
+    Bound, ClaimContext, ClaimDecision, Identity, current_identity, decide, last_seen_provenance,
     render_claim_context,
 };
 use crate::commands::release::shared_base;
 use crate::commands::wip::workspace_for;
 use crate::config::Role;
 use crate::detect::BookmarkTips;
-use crate::ids::{
-    BookmarkRef, BranchName, BranchTarget, CommitId, RemoteName, RepoName, WorkspaceName,
-};
+use crate::ids::{BookmarkRef, BranchName, BranchTarget, CommitId, RemoteName, WorkspaceName};
 use crate::jj::{
     Repo, WorkspaceIdentity, add_workspace, fetch_all, is_workspace_named,
     remove_prunable_worktree, repo_immutable_heads, set_repo_immutable_heads, user_immutable_heads,
@@ -117,8 +115,9 @@ struct StartContext<'a> {
     opened: Repo,
 }
 
-/// Claim `branch` and open its workspace. `bound` is the entry the current
-/// directory is inside, from which a terminal user's identity is derived.
+/// Claim `branch` and open its workspace. `bound` is the registry and the
+/// fork the current directory is inside, by the name its claims are kept
+/// under, from which a terminal user's identity is derived.
 #[allow(
     clippy::too_many_arguments,
     reason = "the fork, the branch, the reason, the override and the cwd binding are independent inputs"
@@ -128,7 +127,7 @@ pub fn run(
     branch: &BranchName,
     why: Option<&str>,
     force: bool,
-    bound: Option<&RepoName>,
+    bound: Bound<'_>,
 ) -> anyhow::Result<Exit> {
     let repo_name = &fork.name;
     let entry = fork.entry;
@@ -137,7 +136,11 @@ pub fn run(
         eprintln!("{repo_name}: {line}");
         return Ok(Exit::Usage);
     }
-    let mut store = Store::open_for_update(default_state_path())?;
+    let mut store = Store::open_for_update(
+        default_state_path(),
+        &bound.registry.former_names(),
+        &[&fork.upstream],
+    )?;
     let cwd = std::env::current_dir()?;
     let destination = workspace_path(fork, branch);
     let in_claimed_workspace = possesses(&cwd, fork, branch);
@@ -179,7 +182,7 @@ pub fn run(
     }
     let held = context
         .store
-        .claims(Some(repo_name))
+        .claims(Some(&fork.upstream))
         .into_iter()
         .find(|claim| claim.branch == branch.as_str())
         .cloned();
@@ -292,8 +295,8 @@ fn resume_claim(
         "resumed"
     };
     Scribe::new(
-        Ledger::for_repo(&context.fork.name),
-        context.fork.name.clone(),
+        Ledger::for_fork(context.fork),
+        context.fork.upstream.clone(),
         context.fork.checkout.path.clone(),
         context.identity.owner.clone(),
     )
@@ -301,7 +304,7 @@ fn resume_claim(
         Some(context.branch.as_str()),
         event.to_owned(),
         context.store.tracked_pull(&BranchTarget::new(
-            context.fork.name.clone(),
+            context.fork.upstream.clone(),
             context.branch.clone(),
         )),
     )?;
@@ -375,12 +378,12 @@ fn take_claim(context: &mut StartContext<'_>, reason: &str) -> anyhow::Result<Ex
 }
 
 fn record_claim(context: &mut StartContext<'_>, reason: &str, event: String) -> anyhow::Result<()> {
-    let target = BranchTarget::new(context.fork.name.clone(), context.branch.clone());
+    let target = BranchTarget::new(context.fork.upstream.clone(), context.branch.clone());
     let pull = context.store.tracked_pull(&target);
     let _ = context.store.claim(&target, &context.identity, reason);
     Scribe::new(
-        Ledger::for_repo(&context.fork.name),
-        context.fork.name.clone(),
+        Ledger::for_fork(context.fork),
+        context.fork.upstream.clone(),
         context.fork.checkout.path.clone(),
         context.identity.owner.clone(),
     )

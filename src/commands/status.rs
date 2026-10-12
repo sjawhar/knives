@@ -15,11 +15,11 @@ use crate::forge::{
     ChecksSummary, Forge, PullDetails, PullIndex, PullRequest, PullSummary, index_pulls,
 };
 use crate::ids::{
-    BookmarkRef, BranchName, BranchTarget, CommitId, ReleaseScheme, RepoName, is_release_name,
+    BookmarkRef, BranchName, BranchTarget, CommitId, ReleaseScheme, UpstreamName, is_release_name,
     pull_number_from_bookmark, short_id,
 };
 use crate::jj::{JjError, Repo, probe_landed, repo_config_path, repo_immutable_heads};
-use crate::ledger::{Entry as Notch, Ledger};
+use crate::ledger::Entry as Notch;
 use crate::store::Store;
 
 mod claims;
@@ -31,7 +31,7 @@ mod releases;
 pub mod render;
 mod rows;
 
-use claims::{ClaimFoldInput, fold_claims, notches_from_ledger, repo_notches};
+use claims::{ClaimFoldInput, fold_claims, repo_notches};
 use dependencies::{DependencyInput, add_dependency_findings};
 use overlap::{CarriedFindingInput, add_branch_overlap_findings, carried_findings};
 use releases::{ReleaseInput, add_releases};
@@ -379,8 +379,6 @@ pub struct Options<'a> {
     pub cache: Option<&'a std::path::Path>,
     /// Needed because a branch's requirements may name other managed repos.
     pub registry: Option<&'a Registry>,
-    /// This repository's ledger, for the per-branch breadcrumb. `None` reads none.
-    pub ledger: Option<&'a Ledger>,
     /// How many threads the landed probes may use. `1` is serial.
     ///
     /// Set below the machine's parallelism when several repositories are gathered
@@ -757,7 +755,7 @@ fn fold_phase_outcome(
     timings.forge = phases.forge.duration;
     timings.probes = phases.probe.duration;
 
-    let name = &input.fork.name;
+    let name = &input.fork.upstream;
     let entry = input.fork.entry;
     let phase = std::time::Instant::now();
     let origin_phase = phases::origin_phase(
@@ -879,6 +877,7 @@ pub fn gather_timed(
     options: &Options<'_>,
 ) -> anyhow::Result<(Report, Timings)> {
     let name = &fork.name;
+    let upstream = &fork.upstream;
     let entry = fork.entry;
     let path = &fork.checkout.path;
     let started = std::time::Instant::now();
@@ -917,9 +916,14 @@ pub fn gather_timed(
         .map(|input| input.branch.clone())
         .collect();
     all_branches.extend(divergent_branches.keys().cloned());
-    let declared = phases::declared_numbers(name, &all_branches, store);
-    let notches = notches_from_ledger(options.ledger, &mut report);
-    report.repo_notches = repo_notches(&notches);
+    let declared = phases::declared_numbers(upstream, &all_branches, store);
+    // Each entry or statement the store's read of the ledger could read only
+    // in part is a problem naming its file ([`crate::ledger::Ledger::read`]).
+    report
+        .problems
+        .extend_from_slice(store.ledger_problems(upstream));
+    let notches = store.ledger_entries(upstream);
+    report.repo_notches = repo_notches(notches);
     note_fetched_heads(&mut report, fetched_heads);
     add_immutable_heads_finding(&mut report, &mut findings, entry, path);
     timings.setup = phase.elapsed();
@@ -963,7 +967,7 @@ pub fn gather_timed(
             store,
             options,
             tips: &tips,
-            notches: &notches,
+            notches,
             divergent_branches: &divergent_branches,
             probe_ran,
             trunk_commit: trunk_commit.as_ref(),
@@ -1178,26 +1182,6 @@ mod tests {
     }
 
     #[test]
-    fn a_ledger_that_cannot_be_read_is_an_unanswered_question_not_an_absence() {
-        let dir = tempfile::tempdir().expect("temporary directory");
-        let path = dir.path().join("a-repo");
-        std::fs::create_dir_all(&path).expect("ledger directory");
-        std::fs::write(
-            path.join("20260815T221403.000000000Z-0000.md"),
-            "not a ledger entry at all\n",
-        )
-        .expect("corrupt ledger");
-        let ledger = crate::ledger::Ledger::at(path);
-        let mut report = Report::default();
-
-        assert_eq!(
-            notches_from_ledger(Some(&ledger), &mut report),
-            Vec::<Notch>::new()
-        );
-        assert_eq!(exit_for(&report), Exit::Incomplete);
-    }
-
-    #[test]
     fn activity_errors_keep_sidecar_observations_and_mark_unsighted_claims_within_window() {
         let claim = crate::store::Claim {
             repo: "demo".to_owned(),
@@ -1235,9 +1219,11 @@ mod tests {
         let note = Notch {
             ts: "2026-08-15T22:14:01Z".to_owned(),
             owner: "ses_fff688".to_owned(),
+            email: None,
             subject: Some("feat/alpha".to_owned()),
             kind: crate::ledger::Kind::Note,
             disposition: Some("ruled-out".to_owned()),
+            statement: None,
             text: format!("first\n{}", "x".repeat(140)),
             evidence: Vec::new(),
             anchor: None,

@@ -91,7 +91,7 @@ fn notice_nonce(addition: &str) -> &str {
 
 fn claim(branch: &str) -> Value {
     json!({
-        "repo": "beta",
+        "repo": "maintainer/beta",
         "branch": branch,
         "owner": "agent-one",
         "why": "porting",
@@ -135,8 +135,8 @@ impl Repositories {
                       origin = \"https://forge.invalid/ours/beta\"\n\n\
                       [trust]\nowners = [\"ours\"]\nrepos = [\"company/trusted\"]\n";
         std::fs::write(home.path().join("repos.toml"), config).expect("write registry");
-        let state = json!({"claims": {"beta/feat/claimed": {
-            "repo": "beta", "branch": "feat/claimed", "owner": "agent-one",
+        let state = json!({"claims": {"maintainer/beta/feat/claimed": {
+            "repo": "maintainer/beta", "branch": "feat/claimed", "owner": "agent-one",
             "why": "porting", "started": "2026-01-01T00:00:00Z", "files": []
         }}});
         std::fs::write(home.path().join("state.json"), state.to_string()).expect("write state");
@@ -247,8 +247,8 @@ fn a_roster_change_re_emits_the_notice() {
 
     let first = run_hook(repos.home.path(), &event);
     repos.write_state(&json!({"claims": {
-        "beta/feat/claimed": claim("feat/claimed"),
-        "beta/feat/new": claim("feat/new")
+        "maintainer/beta/feat/claimed": claim("feat/claimed"),
+        "maintainer/beta/feat/new": claim("feat/new")
     }}));
     let second = run_hook(repos.home.path(), &event);
 
@@ -307,7 +307,7 @@ fn tool_after_in_a_managed_workspace_records_event_identity_and_cwd() {
         "was: {seen}"
     );
     assert!(
-        seen["workspaces"]["beta/beta"]
+        seen["workspaces"]["maintainer/beta/beta"]
             .as_str()
             .is_some_and(|timestamp| timestamp.parse::<jiff::Timestamp>().is_ok()),
         "was: {seen}"
@@ -983,12 +983,12 @@ fn shell_env_returns_no_owner_for_distinct_claim_owners() {
     // Given: a managed root with claims held by two different owners.
     let repos = Repositories::new();
     repos.write_state(&json!({"claims": {
-        "beta/feat/one": {
-            "repo": "beta", "branch": "feat/one", "owner": "agent-one",
+        "maintainer/beta/feat/one": {
+            "repo": "maintainer/beta", "branch": "feat/one", "owner": "agent-one",
             "why": "one", "started": "2026-01-01T00:00:00Z", "files": []
         },
-        "beta/feat/two": {
-            "repo": "beta", "branch": "feat/two", "owner": "agent-two",
+        "maintainer/beta/feat/two": {
+            "repo": "maintainer/beta", "branch": "feat/two", "owner": "agent-two",
             "why": "two", "started": "2026-01-01T00:00:00Z", "files": []
         }
     }}));

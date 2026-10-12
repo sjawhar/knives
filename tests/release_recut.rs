@@ -50,8 +50,9 @@ fn a_release_cut_records_its_whole_parent_set_under_the_release_name() {
     // Then: the release ref is the subject, every member is named, and their
     // commit ids remain evidence for a reader to verify later.
     let entries = knives::ledger::Ledger::at(home.path().join("ledger").join("demo"))
-        .entries()
-        .expect("read ledger");
+        .read()
+        .expect("read ledger")
+        .entries;
     let cut = entries
         .iter()
         .find(|entry| entry.subject.as_deref() == Some("release/2026-08-15"))
@@ -80,8 +81,9 @@ fn a_release_cut_records_its_whole_parent_set_under_the_release_name() {
         String::from_utf8_lossy(&second.stderr)
     );
     let entries = knives::ledger::Ledger::at(home.path().join("ledger").join("demo"))
-        .entries()
-        .expect("read ledger");
+        .read()
+        .expect("read ledger")
+        .entries;
     let second_cut = entries
         .iter()
         .find(|entry| entry.subject.as_deref() == Some("release/2026-08-16"))
@@ -145,8 +147,9 @@ fn a_cut_that_omits_a_recorded_member_is_refused_until_the_drop_is_stated() {
         String::from_utf8_lossy(&allowed.stderr)
     );
     let entries = knives::ledger::Ledger::at(home.path().join("ledger").join("demo"))
-        .entries()
-        .expect("read ledger");
+        .read()
+        .expect("read ledger")
+        .entries;
     let event = entries
         .iter()
         .find(|entry| entry.subject.as_deref() == Some("release/2026-08-05"))
@@ -192,8 +195,9 @@ fn a_drop_between_cuts_is_restated_at_the_next_cut() {
     let stdout = String::from_utf8_lossy(&allowed.stdout);
     assert!(stdout.contains("cut release/2026-08-05 as"), "{stdout}");
     let entries = knives::ledger::Ledger::at(home.path().join("ledger").join("demo"))
-        .entries()
-        .expect("read ledger");
+        .read()
+        .expect("read ledger")
+        .entries;
     let event = entries
         .iter()
         .find(|entry| entry.subject.as_deref() == Some("release/2026-08-05"))
@@ -238,8 +242,9 @@ fn a_recorded_member_that_landed_upstream_is_carried_not_dropped() {
         String::from_utf8_lossy(&output.stderr)
     );
     let entries = knives::ledger::Ledger::at(home.path().join("ledger").join("demo"))
-        .entries()
-        .expect("read ledger");
+        .read()
+        .expect("read ledger")
+        .entries;
     let event = entries
         .iter()
         .find(|entry| entry.subject.as_deref() == Some("release/2026-08-05"))
@@ -306,8 +311,9 @@ fn a_recorded_member_rebased_and_adapted_is_carried_not_dropped() {
         "the new cut must carry the rewritten member"
     );
     let entries = knives::ledger::Ledger::at(home.path().join("ledger").join("demo"))
-        .entries()
-        .expect("read ledger");
+        .read()
+        .expect("read ledger")
+        .entries;
     let event = entries
         .iter()
         .find(|entry| entry.subject.as_deref() == Some("release/2026-08-05"))
@@ -444,8 +450,9 @@ fn an_unverified_member_stays_in_the_recorded_composition() {
     assert!(stdout.contains("cut release/2026-08-05 as"), "{stdout}");
     assert!(stdout.contains("carry check inconclusive"), "{stdout}");
     let entries = knives::ledger::Ledger::at(home.path().join("ledger").join("demo"))
-        .entries()
-        .expect("read ledger");
+        .read()
+        .expect("read ledger")
+        .entries;
     let event = entries
         .iter()
         .find(|entry| entry.subject.as_deref() == Some("release/2026-08-05"))

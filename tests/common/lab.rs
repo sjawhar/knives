@@ -531,6 +531,38 @@ impl Lab {
             )
         }
     }
+
+    /// Point the work checkout's `upstream` remote at the forge URL `url`,
+    /// which git rewrites to the lab's upstream repository when it fetches.
+    ///
+    /// Every other lab fork's upstream is a filesystem path, which names no
+    /// forge repository, so its claims, sightings and ledger are kept under
+    /// its registry key and a reader keyed by that key looks right. A fork
+    /// whose upstream is a forge URL, as every real one is, is kept under
+    /// the URL's lowercase `<owner>/<name>` instead.
+    pub(crate) fn upstream_at_forge_url(&self, url: &str) {
+        let rewrite = format!("url.{}.insteadOf", self.upstream.display());
+        git(&self.work, &self.trunk, ["config", &rewrite, url]);
+        git(
+            &self.work,
+            &self.trunk,
+            ["remote", "set-url", "upstream", url],
+        );
+    }
+
+    /// Point the work checkout's `origin` remote at the forge URL `url`,
+    /// which git rewrites to the lab's origin repository when it fetches or
+    /// pushes: the spelling a real fork's `origin` remote and its registry
+    /// entry share.
+    pub(crate) fn origin_at_forge_url(&self, url: &str) {
+        let rewrite = format!("url.{}.insteadOf", self.temp_origin().display());
+        git(&self.work, &self.trunk, ["config", &rewrite, url]);
+        git(
+            &self.work,
+            &self.trunk,
+            ["remote", "set-url", "origin", url],
+        );
+    }
 }
 /// A registry entry for the lab's work checkout, which stands in for origin.
 pub fn lab_entry(lab: &Lab) -> knives::config::RepoEntry {
@@ -549,6 +581,7 @@ pub fn lab_fork<'a>(
 ) -> knives::bind::Fork<'a> {
     knives::bind::Fork {
         name: knives::ids::RepoName::new(name),
+        upstream: entry.upstream_name(name),
         entry,
         checkout: knives::bind::Checkout {
             path: lab.work.clone(),
@@ -704,8 +737,17 @@ pub fn knives_release(lab: &Lab, home: &tempfile::TempDir, args: &[&str]) -> std
 }
 
 fn git<const N: usize>(directory: &Path, trunk: &str, args: [&str; N]) {
-    let status = Command::new("git")
+    let status = git_command(directory, trunk)
         .args(args)
+        .status()
+        .expect("run git");
+    assert!(status.success(), "git command failed");
+}
+
+/// `git` in `directory` with the lab's identity and initial branch pinned.
+fn git_command(directory: &Path, trunk: &str) -> Command {
+    let mut command = Command::new("git");
+    command
         .current_dir(directory)
         .env("GIT_AUTHOR_NAME", "Knives Lab")
         .env("GIT_AUTHOR_EMAIL", "knives-lab@example.test")
@@ -717,10 +759,8 @@ fn git<const N: usize>(directory: &Path, trunk: &str, args: [&str; N]) {
         // locally, red in CI, which is exactly the difference a test harness must avoid.
         .env("GIT_CONFIG_COUNT", "1")
         .env("GIT_CONFIG_KEY_0", "init.defaultBranch")
-        .env("GIT_CONFIG_VALUE_0", trunk)
-        .status()
-        .expect("run git");
-    assert!(status.success(), "git command failed");
+        .env("GIT_CONFIG_VALUE_0", trunk);
+    command
 }
 
 fn configure_jj_repo_identity(directory: &Path) {
@@ -764,6 +804,83 @@ pub fn git_repository(root: &Path, remotes: &[(&str, &str)]) {
     for (name, url) in remotes {
         git(root, "main", ["remote", "add", name, url]);
     }
+}
+
+/// `git init --bare` at `root`: the shape of a remote several machines share.
+pub fn git_bare_repository(root: &Path) {
+    let parent = root.parent().expect("repository path has a parent");
+    std::fs::create_dir_all(parent).expect("create repository parent");
+    git(
+        parent,
+        "main",
+        [
+            "init",
+            "--quiet",
+            "--bare",
+            root.to_str().expect("utf-8 path"),
+        ],
+    );
+}
+
+/// A bare remote at `ledger.git` under a fresh directory, which also holds
+/// whatever machines share it.
+pub fn bare_remote() -> (TempDir, PathBuf) {
+    let root = tempfile::tempdir().expect("remote directory");
+    let remote = root.path().join("ledger.git");
+    git_bare_repository(&remote);
+    (root, remote)
+}
+
+/// Make a git directory at `git_dir` that joins the ledger as the dotfiles
+/// installer does on a machine: a non-bare repository whose work tree is the
+/// ledger root `work_tree`, whose `origin` is `url`, reached at `reached`,
+/// committing as `machine`. Nothing is created at `work_tree`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the git directory, the work tree, the URL, where it is reached and the machine are independent inputs"
+)]
+pub fn join_ledger(git_dir: &Path, work_tree: &Path, url: &str, reached: &Path, machine: &str) {
+    git_bare_repository(git_dir);
+    let work_tree = work_tree.to_str().expect("utf-8 path");
+    let instead_of = format!("url.{}.insteadOf", reached.display());
+    for args in [
+        ["config", "core.bare", "false"].as_slice(),
+        &["config", "core.worktree", work_tree],
+        &["remote", "add", "origin", url],
+        &["config", &instead_of, url],
+        &["config", "knives.machine", machine],
+    ] {
+        let status = std::process::Command::new("git")
+            .arg("--git-dir")
+            .arg(git_dir)
+            .args(args)
+            .status()
+            .expect("run git");
+        assert!(status.success(), "git {args:?} in {}", git_dir.display());
+    }
+}
+
+/// Whether `path` names a ledger entry file.
+pub fn is_entry(path: &str) -> bool {
+    Path::new(path).extension() == Some(std::ffi::OsStr::new("md"))
+}
+
+/// git's trimmed stdout in `directory`, with the lab's identity pinned as
+/// every lab git is; the command must succeed.
+pub fn git_output<const N: usize>(directory: &Path, args: [&str; N]) -> String {
+    let output = git_command(directory, "main")
+        .args(args)
+        .output()
+        .expect("run git");
+    assert!(
+        output.status.success(),
+        "git command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("utf-8 git output")
+        .trim()
+        .to_owned()
 }
 
 /// A colocated jj checkout with the given remotes: what the scan looks for.
@@ -845,6 +962,90 @@ pub fn knives(lab: &Lab, home: &tempfile::TempDir, args: &[&str]) -> std::proces
     knives_command(&lab.work, home.path(), lab.temp_path(), args)
         .output()
         .expect("run knives")
+}
+
+/// What Claude Code's `SessionStart` hook prints for session `session_id`
+/// started in `cwd`, against the registry in `home`.
+///
+/// Not built on [`knives_command`], which also sets the working directory and
+/// removes `KNIVES_OWNER`, a variable the hook reads.
+pub fn session_start(home: &Path, cwd: &Path, session_id: &str) -> std::process::Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_knives"))
+        .args(["hook", "claude-code"])
+        .env("KNIVES_CONFIG_HOME", home)
+        .env("HOME", home)
+        .env("JJ_CONFIG", "/dev/null")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn hook");
+    let event = serde_json::json!({
+        "session_id": session_id,
+        "hook_event_name": "SessionStart",
+        "source": "startup",
+        "cwd": cwd,
+    });
+    std::io::Write::write_all(
+        &mut child.stdin.take().expect("hook stdin"),
+        event.to_string().as_bytes(),
+    )
+    .expect("write hook input");
+    child.wait_with_output().expect("wait for hook")
+}
+
+/// One note an older knives filed in `home`'s ledger directory `fork`,
+/// written at `ts`; the path of its file.
+pub fn note(home: &Path, fork: &str, ts: &str, text: &str) -> PathBuf {
+    knives::ledger::Ledger::at(home.join("ledger").join(fork))
+        .append(&knives::ledger::Entry {
+            ts: ts.to_owned(),
+            owner: "ses_older".to_owned(),
+            email: None,
+            subject: None,
+            kind: knives::ledger::Kind::Note,
+            disposition: None,
+            statement: None,
+            text: text.to_owned(),
+            evidence: Vec::new(),
+            anchor: None,
+            pr: None,
+            parents: Vec::new(),
+        })
+        .expect("append a note")
+}
+
+/// State `kind` about `branch` on `repo`'s ledger in the config home `home`,
+/// through the same scribe `track`, `depends` and `finish --superseded-by`
+/// write with. A store opened afterwards at `home/state.json` answers for it.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a fixture: where the ledger is, whose it is, and the one statement it writes are independent"
+)]
+pub fn state_on_ledger(
+    home: &Path,
+    repo: &str,
+    branch: &str,
+    kind: knives::statement::StatementKind,
+    value: Option<&str>,
+) {
+    knives::ledger::Scribe::new(
+        knives::ledger::Ledger::at(home.join("ledger").join(repo)),
+        knives::ids::UpstreamName::new(repo),
+        home.to_owned(),
+        "a-test".to_owned(),
+    )
+    .record(&knives::ledger::Draft {
+        statement: Some(knives::ledger::Stated {
+            statement: knives::statement::Statement {
+                kind,
+                value: value.map(str::to_owned),
+            },
+            replaces: None,
+        }),
+        ..knives::ledger::Draft::event(Some(branch), "stated".to_owned(), None)
+    })
+    .expect("state on the ledger");
 }
 
 fn jj_output<const N: usize>(directory: &Path, args: [&str; N]) -> String {

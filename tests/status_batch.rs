@@ -28,6 +28,7 @@ use knives::forge::{
 };
 use knives::ids::BranchName;
 use knives::jj::Repo;
+use knives::statement::StatementKind;
 use knives::store::Store;
 use lab::{extend_branch, lab_entry, without_forge_elapsed};
 use pulls::pull_request_with_head;
@@ -80,7 +81,12 @@ fn one_batch_answers_review_age_and_checks_for_every_branch_at_once() {
         ..knives::forge::fake::FakeForge::default()
     };
     let state = tempfile::tempdir().expect("state directory");
-    let store = Store::open(state.path().join("state.json")).expect("open store");
+    let store = Store::open(
+        state.path().join("state.json"),
+        &knives::config::FormerNames::new(),
+        &[&knives::ids::UpstreamName::new("demo")],
+    )
+    .expect("open store");
 
     // When: status gathers
     let report = status::gather(
@@ -91,7 +97,6 @@ fn one_batch_answers_review_age_and_checks_for_every_branch_at_once() {
             forge: Some(&forge),
             cache: None,
             registry: None,
-            ledger: None,
             workers: 1,
         },
     )
@@ -143,16 +148,20 @@ fn a_measured_gather_reports_the_same_report_and_a_total_that_covers_its_phases(
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     lab.branch("feat/beta", "beta.txt", "beta\n");
     lab.octopus("release/2026-08-15", "feat/alpha", "feat/beta");
-    let name = knives::ids::RepoName::new("demo");
+    let name = knives::ids::UpstreamName::new("demo");
     let entry = lab_entry(&lab);
     let state = tempfile::tempdir().expect("state directory");
-    let store = Store::open(state.path().join("state.json")).expect("open store");
+    let store = Store::open(
+        state.path().join("state.json"),
+        &knives::config::FormerNames::new(),
+        &[&name],
+    )
+    .expect("open store");
     let options = || knives::commands::status::Options {
         probe: true,
         forge: None,
         cache: None,
         registry: None,
-        ledger: None,
         workers: 1,
     };
 
@@ -319,7 +328,12 @@ fn the_forge_is_asked_once_for_the_whole_report_with_one_entry_per_number() {
         asked: std::sync::Mutex::new(Vec::new()),
     };
     let state = tempfile::tempdir().expect("state directory");
-    let store = Store::open(state.path().join("state.json")).expect("open store");
+    let store = Store::open(
+        state.path().join("state.json"),
+        &knives::config::FormerNames::new(),
+        &[&knives::ids::UpstreamName::new("demo")],
+    )
+    .expect("open store");
 
     let report = status::gather(
         &lab::lab_fork(&lab, "demo", &lab_entry(&lab)),
@@ -329,7 +343,6 @@ fn the_forge_is_asked_once_for_the_whole_report_with_one_entry_per_number() {
             forge: Some(&forge),
             cache: None,
             registry: None,
-            ledger: None,
             workers: 1,
         },
     )
@@ -382,7 +395,12 @@ fn a_failed_facts_batch_clears_review_and_check_cells() {
         ..knives::forge::fake::FakeForge::default()
     };
     let state = tempfile::tempdir().expect("state directory");
-    let store = Store::open(state.path().join("state.json")).expect("open store");
+    let store = Store::open(
+        state.path().join("state.json"),
+        &knives::config::FormerNames::new(),
+        &[&knives::ids::UpstreamName::new("demo")],
+    )
+    .expect("open store");
 
     let report = status::gather(
         &lab::lab_fork(&lab, "demo", &lab_entry(&lab)),
@@ -392,7 +410,6 @@ fn a_failed_facts_batch_clears_review_and_check_cells() {
             forge: Some(&forge),
             cache: None,
             registry: None,
-            ledger: None,
             workers: 1,
         },
     )
@@ -422,8 +439,7 @@ fn a_failed_facts_batch_clears_review_and_check_cells() {
 fn a_consulted_false_report_carries_an_unanswered_stated_pull() {
     let lab = lab::Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
-    let name = knives::ids::RepoName::new("demo");
-    let target = knives::ids::BranchTarget::new(name.clone(), BranchName::new("feat/alpha"));
+    let name = knives::ids::UpstreamName::new("demo");
     let forge = knives::forge::fake::FakeForge {
         pull_requests: BTreeMap::from([(
             BranchName::new("feat/alpha"),
@@ -433,8 +449,19 @@ fn a_consulted_false_report_carries_an_unanswered_stated_pull() {
         ..knives::forge::fake::FakeForge::default()
     };
     let state = tempfile::tempdir().expect("state directory");
-    let mut store = Store::open_for_update(state.path().join("state.json")).expect("open store");
-    store.track_pull(&target, 42);
+    lab::state_on_ledger(
+        state.path(),
+        name.as_str(),
+        "feat/alpha",
+        StatementKind::Pull,
+        Some("42"),
+    );
+    let store = Store::open(
+        state.path().join("state.json"),
+        &knives::config::FormerNames::new(),
+        &[&name],
+    )
+    .expect("open store");
 
     let report = status::gather(
         &lab::lab_fork(&lab, name.as_str(), &lab_entry(&lab)),
@@ -444,7 +471,6 @@ fn a_consulted_false_report_carries_an_unanswered_stated_pull() {
             forge: Some(&forge),
             cache: None,
             registry: None,
-            ledger: None,
             workers: 1,
         },
     )
@@ -469,8 +495,7 @@ fn a_consulted_false_report_carries_an_unanswered_stated_pull() {
 fn stated_pulls_and_dependencies_are_answered_from_the_one_batch() {
     let lab = lab::Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
-    let name = knives::ids::RepoName::new("demo");
-    let target = knives::ids::BranchTarget::new(name.clone(), BranchName::new("feat/alpha"));
+    let name = knives::ids::UpstreamName::new("demo");
     let forge = knives::forge::fake::FakeForge {
         pull_requests: BTreeMap::from([(
             BranchName::new("feat/alpha"),
@@ -480,15 +505,26 @@ fn stated_pulls_and_dependencies_are_answered_from_the_one_batch() {
         ..knives::forge::fake::FakeForge::default()
     };
     let state = tempfile::tempdir().expect("state directory");
-    let mut store = Store::open_for_update(state.path().join("state.json")).expect("open store");
-    store.track_pull(&target, 42);
-    store.add_dependencies(
-        &target,
-        &[knives::ids::Requirement {
-            repo: name.clone(),
-            number: 43,
-        }],
+    lab::state_on_ledger(
+        state.path(),
+        name.as_str(),
+        "feat/alpha",
+        StatementKind::Pull,
+        Some("42"),
     );
+    lab::state_on_ledger(
+        state.path(),
+        name.as_str(),
+        "feat/alpha",
+        StatementKind::Depends,
+        Some(&format!("{name}#43")),
+    );
+    let store = Store::open(
+        state.path().join("state.json"),
+        &knives::config::FormerNames::new(),
+        &[&name],
+    )
+    .expect("open store");
     let registry = Registry {
         repos: BTreeMap::from([("demo".to_owned(), lab_entry(&lab))]),
         ..Registry::default()
@@ -502,7 +538,6 @@ fn stated_pulls_and_dependencies_are_answered_from_the_one_batch() {
             forge: Some(&forge),
             cache: None,
             registry: Some(&registry),
-            ledger: None,
             workers: 1,
         },
     )
@@ -537,21 +572,99 @@ fn stated_pulls_and_dependencies_are_answered_from_the_one_batch() {
 }
 
 #[test]
+fn a_dependency_on_a_fork_named_by_anything_but_its_upstream_name_is_a_problem() {
+    // Given: a fork whose upstream is a forge URL, kept under acme/demo, with
+    // a branch requiring two of its own pull requests: one named by its
+    // registry key, which no machine's knives writes and which another
+    // machine's registry may give another fork, and one by the repository's
+    // name, as `knives depends` records it.
+    let lab = lab::Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let upstream = "https://forge.invalid/Acme/Demo";
+    lab.upstream_at_forge_url(upstream);
+    let entry = knives::config::RepoEntry::new(upstream, lab.work.display().to_string());
+    let fork = lab::lab_fork(&lab, "demo", &entry);
+    assert_eq!(fork.upstream.as_str(), "acme/demo");
+    let forge = knives::forge::fake::FakeForge {
+        vanished_states: BTreeMap::from([(43, "OPEN".to_owned()), (44, "OPEN".to_owned())]),
+        ..knives::forge::fake::FakeForge::default()
+    };
+    let state = tempfile::tempdir().expect("state directory");
+    lab::state_on_ledger(
+        state.path(),
+        fork.upstream.as_str(),
+        "feat/alpha",
+        StatementKind::Depends,
+        Some("demo#43,acme/demo#44"),
+    );
+    let store = Store::open(
+        state.path().join("state.json"),
+        &knives::config::FormerNames::new(),
+        &[&fork.upstream],
+    )
+    .expect("open store");
+    let registry = Registry {
+        repos: BTreeMap::from([("demo".to_owned(), entry.clone())]),
+        ..Registry::default()
+    };
+
+    // When: status gathers with the forge.
+    let report = status::gather(
+        &fork,
+        &store,
+        &knives::commands::status::Options {
+            probe: false,
+            forge: Some(&forge),
+            cache: None,
+            registry: Some(&registry),
+            workers: 1,
+        },
+    )
+    .expect("gather");
+
+    // Then: the one named by the repository's name is asked and answered as
+    // unmet; the other is a problem naming the rule, never read as this fork's.
+    assert_eq!(
+        report.problems,
+        [
+            "feat/alpha requires demo#43, but no fork in the registry is kept under demo: a \
+             requirement names its fork by its upstream repository's <owner>/<name>"
+        ],
+        "was: {report:?}"
+    );
+    let unmet: Vec<String> = report
+        .findings
+        .iter()
+        .filter(|group| group.kind == knives::detect::FindingKind::UnmetDependency)
+        .flat_map(|group| group.items.iter().map(|item| item.detail.clone()))
+        .collect();
+    assert_eq!(
+        unmet,
+        ["feat/alpha requires acme/demo#44, which is open"],
+        "was: {report:?}"
+    );
+}
+
+#[test]
 fn landed_verdicts_come_from_the_cache_when_the_key_matches() {
     let lab = lab::Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
-    let name = knives::ids::RepoName::new("demo");
+    let name = knives::ids::UpstreamName::new("demo");
     let entry = lab_entry(&lab);
     let forge = knives::forge::fake::FakeForge::default();
     let state = tempfile::tempdir().expect("state directory");
     let cache = tempfile::tempdir().expect("cache directory");
-    let store = Store::open(state.path().join("state.json")).expect("open store");
+    let store = Store::open(
+        state.path().join("state.json"),
+        &knives::config::FormerNames::new(),
+        &[&name],
+    )
+    .expect("open store");
     let options = || knives::commands::status::Options {
         probe: true,
         forge: Some(&forge),
         cache: Some(cache.path()),
         registry: None,
-        ledger: None,
         workers: 1,
     };
 
@@ -611,18 +724,22 @@ fn landed_verdicts_come_from_the_cache_when_the_key_matches() {
 fn a_probe_free_run_preserves_the_landed_section() {
     let lab = lab::Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
-    let name = knives::ids::RepoName::new("demo");
+    let name = knives::ids::UpstreamName::new("demo");
     let entry = lab_entry(&lab);
     let forge = knives::forge::fake::FakeForge::default();
     let state = tempfile::tempdir().expect("state directory");
     let cache = tempfile::tempdir().expect("cache directory");
-    let store = Store::open(state.path().join("state.json")).expect("open store");
+    let store = Store::open(
+        state.path().join("state.json"),
+        &knives::config::FormerNames::new(),
+        &[&name],
+    )
+    .expect("open store");
     let with_probe = || knives::commands::status::Options {
         probe: true,
         forge: Some(&forge),
         cache: Some(cache.path()),
         registry: None,
-        ledger: None,
         workers: 1,
     };
     let without_probe = || knives::commands::status::Options {
@@ -630,7 +747,6 @@ fn a_probe_free_run_preserves_the_landed_section() {
         forge: Some(&forge),
         cache: Some(cache.path()),
         registry: None,
-        ledger: None,
         workers: 1,
     };
 
@@ -669,18 +785,22 @@ fn a_probe_free_run_preserves_the_landed_section() {
 fn an_unresolvable_trunk_fails_loudly_and_touches_no_landed_cache() {
     let lab = lab::Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
-    let name = knives::ids::RepoName::new("demo");
+    let name = knives::ids::UpstreamName::new("demo");
     let entry = lab_entry(&lab);
     let forge = knives::forge::fake::FakeForge::default();
     let state = tempfile::tempdir().expect("state directory");
     let cache = tempfile::tempdir().expect("cache directory");
-    let store = Store::open(state.path().join("state.json")).expect("open store");
+    let store = Store::open(
+        state.path().join("state.json"),
+        &knives::config::FormerNames::new(),
+        &[&name],
+    )
+    .expect("open store");
     let options = || knives::commands::status::Options {
         probe: true,
         forge: Some(&forge),
         cache: Some(cache.path()),
         registry: None,
-        ledger: None,
         workers: 1,
     };
 
@@ -734,16 +854,20 @@ fn parallel_landed_probes_answer_exactly_what_serial_ones_did() {
     lab.fetch_work();
     let entry = lab_entry(&lab);
     let state = tempfile::tempdir().expect("state directory");
-    let store = Store::open(state.path().join("state.json")).expect("open store");
+    let name = knives::ids::UpstreamName::new("demo");
+    let store = Store::open(
+        state.path().join("state.json"),
+        &knives::config::FormerNames::new(),
+        &[&name],
+    )
+    .expect("open store");
     let options = |workers: usize| knives::commands::status::Options {
         probe: true,
         forge: None,
         cache: None,
         registry: None,
-        ledger: None,
         workers,
     };
-    let name = knives::ids::RepoName::new("demo");
 
     // When: the same repository is gathered serially and on several threads
     let serial = status::gather(
