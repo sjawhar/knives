@@ -229,6 +229,54 @@ fn outside_jj_repo_arguments_pass_through_untouched() {
 }
 
 #[test]
+fn no_target_repository_says_so_before_gh_runs() {
+    // Given: a directory with no remote, no -R flag, and a fake gh that fails.
+    let scratch = tempfile::tempdir().expect("scratch");
+    let (dir, log) = fake_gh_exiting(3);
+
+    // When: knives invokes gh on a call that names no repository.
+    let output = knives_cmd(scratch.path())
+        .args(["gh", "--", "issue", "list", "--limit", "1"])
+        .current_dir(scratch.path())
+        .env_remove("GH_TOKEN")
+        .env_remove("GH_REPO")
+        .env("KNIVES_REAL_GH", dir.path().join("gh"))
+        .env("FAKE_GH_LOG", &log)
+        .output()
+        .expect("run knives gh");
+
+    // Then: one stderr line names the cause and remedy, and gh's status is kept.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("knives gh: no target repository"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("pass -R <owner>/<repo>"), "{stderr}");
+    assert_eq!(output.status.code(), Some(3));
+}
+
+#[test]
+fn a_resolved_owner_prints_no_target_hint() {
+    // Given: a call naming its repository with -R.
+    let scratch = tempfile::tempdir().expect("scratch");
+    let (dir, log) = fake_gh();
+
+    // When: knives invokes gh.
+    let output = knives_cmd(scratch.path())
+        .args(["gh", "--", "pr", "view", "1", "-R", "acme/widgets"])
+        .current_dir(scratch.path())
+        .env_remove("GH_TOKEN")
+        .env("KNIVES_REAL_GH", dir.path().join("gh"))
+        .env("FAKE_GH_LOG", &log)
+        .output()
+        .expect("run knives gh");
+
+    // Then: no no-target line is printed.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("no target repository"), "{stderr}");
+}
+
+#[test]
 fn a_git_failure_inside_a_checkout_is_reported_not_fallen_through() {
     // Given: a worktree whose admin registration was pruned away — the cwd is a
     // checkout, and every git read in it fails fatally.
