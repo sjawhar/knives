@@ -1715,6 +1715,13 @@ mod tests {
             "view",
             &args(&["pr", "view", "--json", "x", "--"])
         ));
+        // The subcommand only after `--` is not the subcommand; a value flag
+        // right before `--` takes `--` as its value, so the next word is positional.
+        assert!(!has_positional_target("view", &args(&["pr", "--", "view"])));
+        assert!(has_positional_target(
+            "view",
+            &args(&["pr", "view", "--json", "--", "123"])
+        ));
     }
 
     #[test]
