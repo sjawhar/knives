@@ -527,7 +527,6 @@ fn a_double_dash_taken_as_a_flag_value_does_not_end_the_owner_scan() {
         "--title",
         "-T",
         "--label",
-        "-l",
         "--reason",
         "--head",
         "--base",

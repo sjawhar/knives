@@ -293,7 +293,9 @@ pub(crate) fn has_positional_target(subcommand: &str, args: &[String]) -> bool {
                 if takes_value(argument)
                     || matches!(
                         (subcommand, argument.as_str()),
-                        ("checks", "-i") | ("edit", "-m" | "-p")
+                        ("checks", "-i")
+                            | ("edit", "-m" | "-p")
+                            | (_, "--json" | "-t" | "--template")
                     )
                 {
                     previous_was_value_flag = true;
@@ -628,18 +630,17 @@ pub(crate) fn owner_from_api_args(args: &[String]) -> Option<String> {
 
 /// Flags that take their value as the next argument when written without `=`,
 /// in every gh command that has them. gh (pflag) reads that next argument as the
-/// value even when it is `--`. Short flags that are boolean in some command
-/// (`-c`, `-r`, `-m`, `-p`, `-i`, `--comment`) are absent: listing them would
-/// swallow a real terminator after `gh pr merge -r`.
+/// value even when it is `--`. Only flags that take a value in every gh command
+/// that has them are listed: a flag that is boolean somewhere (`-c`, `-r`, `-m`,
+/// `-p`, `-i`, `-l`, `-t`, `--json`, `--template`, `--status`, `--user`,
+/// `--comment`) would swallow a real terminator there. `has_positional_target`
+/// adds the PR subcommands' own readings of those.
 const VALUE_FLAGS: &[&str] = &[
     "-R",
     "--repo",
     "--owner",
     "-q",
     "--jq",
-    "-t",
-    "--template",
-    "--json",
     "-b",
     "--body",
     "-F",
@@ -652,7 +653,6 @@ const VALUE_FLAGS: &[&str] = &[
     "--match-head-commit",
     "--author-email",
     "-A",
-    "-l",
     "--label",
     "--milestone",
     "--project",
@@ -683,8 +683,6 @@ const VALUE_FLAGS: &[&str] = &[
     "--ref",
     "--workflow",
     "--event",
-    "--status",
-    "--user",
     "--team",
     "--commenter",
 ];
@@ -1783,6 +1781,30 @@ mod tests {
         assert!(!has_positional_target(
             "checks",
             &args(&["pr", "checks", "-i", "5"])
+        ));
+        // Flags boolean in some other command (`issue develop -l`, `workflow run
+        // --json`, `secret set --user`, `auth status -t`, `repo edit --template`,
+        // `codespace create --status`) never swallow a real terminator.
+        for (command, flag) in [
+            (["issue", "develop"], "-l"),
+            (["workflow", "run"], "--json"),
+            (["secret", "set"], "--user"),
+            (["auth", "status"], "-t"),
+            (["repo", "edit"], "--template"),
+            (["codespace", "create"], "--status"),
+        ] {
+            let mut words = command.to_vec();
+            words.extend([flag, "--", "-R", "acme/w"]);
+            assert_eq!(repo_flag(&args(&words)), None, "{command:?} {flag}");
+        }
+        // `pr view` still reads its own value flags.
+        assert!(!has_positional_target(
+            "view",
+            &args(&["pr", "view", "--json", "x"])
+        ));
+        assert!(!has_positional_target(
+            "view",
+            &args(&["pr", "view", "-t", "tpl"])
         ));
     }
 
