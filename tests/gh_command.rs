@@ -415,6 +415,42 @@ fn valueless_resolved_marker_stops_remote_token_routing() {
 }
 
 #[test]
+fn gh_search_owner_and_repo_flags_route_the_token_and_print_no_hint() {
+    // Given: a scratch directory with no remote and a helper that mints per owner.
+    let scratch = tempfile::tempdir().expect("scratch");
+    let helper_dir = fake_app_token();
+    let gitconfig = token_config(helper_dir.path(), "fallback");
+    for (flags, token) in [
+        (["--owner", "acme"], "GH_TOKEN=tok-acme"),
+        (["--owner=acme", "--limit=1"], "GH_TOKEN=tok-acme"),
+        (["--repo", "acme/widgets"], "GH_TOKEN=tok-acme"),
+    ] {
+        let (dir, log) = fake_gh();
+
+        // When: knives invokes gh search naming its target by flag.
+        let output = knives_cmd(helper_dir.path())
+            .args(["gh", "--", "search", "issues"])
+            .args(flags)
+            .arg("grader")
+            .current_dir(scratch.path())
+            .env_remove("GH_TOKEN")
+            .env_remove("GH_REPO")
+            .env("KNIVES_REAL_GH", dir.path().join("gh"))
+            .env("FAKE_GH_LOG", &log)
+            .env("PATH", helper_path(helper_dir.path()))
+            .env("GIT_CONFIG_GLOBAL", &gitconfig)
+            .output()
+            .expect("run knives gh");
+
+        // Then: the owner's token is used and no no-target line is printed.
+        let recorded = fs::read_to_string(&log).expect("fake gh ran");
+        assert!(recorded.contains(token), "{flags:?}: {recorded}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!stderr.contains("no target repository"), "{stderr}");
+    }
+}
+
+#[test]
 fn gh_exit_code_is_propagated() {
     // Given: a gh executable that exits with a nonzero code.
     let scratch = tempfile::tempdir().expect("scratch");
