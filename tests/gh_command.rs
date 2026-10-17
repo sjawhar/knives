@@ -451,6 +451,71 @@ fn gh_search_owner_and_repo_flags_route_the_token_and_print_no_hint() {
 }
 
 #[test]
+fn owner_flags_after_the_double_dash_terminator_are_search_terms_not_routing() {
+    // Given: a scratch directory with no remote and a helper that mints per owner.
+    let scratch = tempfile::tempdir().expect("scratch");
+    let helper_dir = fake_app_token();
+    let gitconfig = token_config(helper_dir.path(), "fallback");
+    let spellings: [&[&str]; 6] = [
+        &["--owner", "acme"],
+        &["--owner=acme"],
+        &["-R", "acme/widgets"],
+        &["-R=acme/widgets"],
+        &["--repo", "acme/widgets"],
+        &["--repo=acme/widgets"],
+    ];
+    let run = |args: Vec<&str>| {
+        let (dir, log) = fake_gh();
+        let output = knives_cmd(helper_dir.path())
+            .args(["gh", "--"])
+            .args(args)
+            .current_dir(scratch.path())
+            .env_remove("GH_TOKEN")
+            .env_remove("GH_REPO")
+            .env("KNIVES_REAL_GH", dir.path().join("gh"))
+            .env("FAKE_GH_LOG", &log)
+            .env("PATH", helper_path(helper_dir.path()))
+            .env("GIT_CONFIG_GLOBAL", &gitconfig)
+            .output()
+            .expect("run knives gh");
+        let recorded = fs::read_to_string(&log).expect("fake gh ran");
+        (
+            recorded,
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    };
+    for spelling in spellings {
+        // When: the flag spelling follows `--`, where gh reads it as a search term.
+        let mut after = vec!["search", "issues", "--"];
+        after.extend(spelling);
+        let (recorded, stderr) = run(after);
+
+        // Then: nothing routes, and the no-target line says so.
+        assert!(
+            recorded.contains("GH_TOKEN=unset"),
+            "{spelling:?}: {recorded}"
+        );
+        assert!(
+            stderr.contains("no target repository"),
+            "{spelling:?}: {stderr}"
+        );
+
+        // When: the same spelling precedes `--`.
+        let mut before = vec!["search", "issues"];
+        before.extend(spelling);
+        before.extend(["--", "grader"]);
+        let (recorded, stderr) = run(before);
+
+        // Then: it still routes to acme.
+        assert!(
+            recorded.contains("GH_TOKEN=tok-acme"),
+            "{spelling:?}: {recorded}"
+        );
+        assert!(!stderr.contains("no target repository"), "{stderr}");
+    }
+}
+
+#[test]
 fn gh_exit_code_is_propagated() {
     // Given: a gh executable that exits with a nonzero code.
     let scratch = tempfile::tempdir().expect("scratch");

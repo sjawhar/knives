@@ -633,6 +633,7 @@ pub(crate) fn owner_from_api_args(args: &[String]) -> Option<String> {
     // accept `owner:"acme'`, while we require matching quotes (mismatched quotes are
     // invalid GraphQL); its sequential prefix stripping maps `repos/orgs/foo` to
     // `foo`, while we yield `orgs` (those apparent path owners are GitHub-reserved).
+    let args = before_terminator(args);
     let joined = args.join(" ");
     // LEFTMOST match wins across BOTH patterns — the shim's single alternation
     // regex returns the first match in the text, so a query naming
@@ -652,9 +653,18 @@ pub(crate) fn owner_from_api_args(args: &[String]) -> Option<String> {
     }
 }
 
+/// The arguments gh parses as flags: everything before the first `--`, after
+/// which gh takes every word as a positional (a search term, say). Owner scans
+/// read flags only, so a search for the words `--owner acme` routes nowhere.
+fn before_terminator(args: &[String]) -> &[String] {
+    let end = args.iter().position(|a| a == "--").unwrap_or(args.len());
+    args.get(..end).unwrap_or(args)
+}
+
 /// The first `--owner` value of a `gh search` call (`--owner x` or `--owner=x`)
 /// when it is owner-shaped. `--repo` is read by `repo_flag`.
 fn search_owner_flag(args: &[String]) -> Option<String> {
+    let args = before_terminator(args);
     let mut index = 1;
     while let Some(argument) = args.get(index) {
         let value = if argument == "--owner" {
@@ -723,6 +733,7 @@ fn gh_repo_environment() -> Option<String> {
 
 /// The value of the first explicit repository flag (shim lines 137-150).
 pub(crate) fn repo_flag(args: &[String]) -> Option<String> {
+    let args = before_terminator(args);
     let mut index = 0;
     while let Some(argument) = args.get(index) {
         match argument.as_str() {
@@ -1329,6 +1340,41 @@ mod tests {
             ]))
             .as_deref(),
             Some("b")
+        );
+    }
+
+    #[test]
+    fn api_owner_scans_stop_at_the_terminator_but_the_endpoint_does_not() {
+        let args = |a: &[&str]| a.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        let query = "query=query($owner:String!){repository(owner:$owner,name:\"x\"){id}}";
+        assert_eq!(
+            owner_from_api_args(&args(&["api", "graphql", "-f", query, "-f", "owner=acme"])),
+            Some("acme".to_owned())
+        );
+        assert_eq!(
+            owner_from_api_args(&args(&[
+                "api",
+                "graphql",
+                "-f",
+                query,
+                "--",
+                "-f",
+                "owner=acme"
+            ])),
+            None
+        );
+        assert_eq!(
+            owner_from_api_args(&args(&[
+                "api",
+                "graphql",
+                "--",
+                "repository(owner:\"acme\")"
+            ])),
+            None
+        );
+        assert_eq!(
+            owner_from_api_args(&args(&["api", "--", "repos/acme/x"])),
+            Some("acme".to_owned())
         );
     }
 
