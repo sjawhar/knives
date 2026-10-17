@@ -101,6 +101,12 @@ pub fn run(args: &[String]) -> anyhow::Result<std::convert::Infallible> {
                 std::process::exit(1);
             }
         };
+        if resolved.is_none() {
+            eprintln!(
+                "knives gh: no target repository (no -R/--repo flag, no owner in the api path, and no GitHub remote in {}); pass -R <owner>/<repo>, or run from a checkout of it. Setting GH_TOKEN bypasses App routing.",
+                cwd.display()
+            );
+        }
         match resolved.as_deref().map(mint_token) {
             Some(Mint::Token(token)) => Some(token),
             Some(Mint::Refused(code)) => std::process::exit(code),
