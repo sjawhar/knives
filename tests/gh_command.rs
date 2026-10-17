@@ -516,6 +516,64 @@ fn owner_flags_after_the_double_dash_terminator_are_search_terms_not_routing() {
 }
 
 #[test]
+fn a_double_dash_taken_as_a_flag_value_does_not_end_the_owner_scan() {
+    // Given: a scratch directory with no remote and a helper that mints per owner.
+    let scratch = tempfile::tempdir().expect("scratch");
+    let helper_dir = fake_app_token();
+    let gitconfig = token_config(helper_dir.path(), "fallback");
+    for flag in [
+        "--body",
+        "-b",
+        "--title",
+        "-T",
+        "--label",
+        "-l",
+        "--reason",
+        "--head",
+        "--base",
+        "--assignee",
+        "--milestone",
+        "--notes",
+        "--limit",
+        "-L",
+        "--search",
+        "--owner",
+    ] {
+        let (dir, log) = fake_gh();
+
+        // When: `--` directly follows a value-taking flag (gh reads it as the value)
+        // and a -R follows.
+        let output = knives_cmd(helper_dir.path())
+            .args([
+                "gh",
+                "--",
+                "pr",
+                "comment",
+                "5",
+                flag,
+                "--",
+                "-R",
+                "acme/widgets",
+            ])
+            .current_dir(scratch.path())
+            .env_remove("GH_TOKEN")
+            .env_remove("GH_REPO")
+            .env("KNIVES_REAL_GH", dir.path().join("gh"))
+            .env("FAKE_GH_LOG", &log)
+            .env("PATH", helper_path(helper_dir.path()))
+            .env("GIT_CONFIG_GLOBAL", &gitconfig)
+            .output()
+            .expect("run knives gh");
+
+        // Then: the -R after it still routes to acme.
+        let recorded = fs::read_to_string(&log).expect("fake gh ran");
+        assert!(recorded.contains("GH_TOKEN=tok-acme"), "{flag}: {recorded}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!stderr.contains("no target repository"), "{flag}: {stderr}");
+    }
+}
+
+#[test]
 fn gh_exit_code_is_propagated() {
     // Given: a gh executable that exits with a nonzero code.
     let scratch = tempfile::tempdir().expect("scratch");

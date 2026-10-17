@@ -290,44 +290,7 @@ pub(crate) fn has_positional_target(subcommand: &str, args: &[String]) -> bool {
         }
         if found_subcommand {
             if argument.starts_with('-') {
-                if !argument.contains('=')
-                    && matches!(
-                        argument.as_str(),
-                        "-R" | "--repo"
-                            | "-q"
-                            | "--jq"
-                            | "-t"
-                            | "--template"
-                            | "--json"
-                            | "-b"
-                            | "--body"
-                            | "-F"
-                            | "--body-file"
-                            | "--branch"
-                            | "-c"
-                            | "--comment"
-                            | "-r"
-                            | "--reason"
-                            | "--color"
-                            | "-i"
-                            | "--interval"
-                            | "--subject"
-                            | "--match-head-commit"
-                            | "--author-email"
-                            | "-A"
-                            | "-l"
-                            | "--label"
-                            | "-m"
-                            | "--milestone"
-                            | "-p"
-                            | "--project"
-                            | "--reviewer"
-                            | "--assignee"
-                            | "-T"
-                            | "--title"
-                            | "--recover"
-                    )
-                {
+                if takes_value(argument) {
                     previous_was_value_flag = true;
                 }
                 continue;
@@ -658,12 +621,84 @@ pub(crate) fn owner_from_api_args(args: &[String]) -> Option<String> {
     }
 }
 
-/// The arguments gh parses as flags: everything before the first `--`, after
-/// which gh takes every word as a positional (a search term, say). Owner scans
-/// read flags only, so a search for the words `--owner acme` routes nowhere.
+/// Flags that take their value as the next argument when written without `=`.
+/// gh (pflag) reads that next argument as the value even when it is `--`.
+const VALUE_FLAGS: &[&str] = &[
+    "-R",
+    "--repo",
+    "--owner",
+    "-q",
+    "--jq",
+    "-t",
+    "--template",
+    "--json",
+    "-b",
+    "--body",
+    "-F",
+    "--body-file",
+    "--branch",
+    "-c",
+    "--comment",
+    "-r",
+    "--reason",
+    "--color",
+    "-i",
+    "--interval",
+    "--subject",
+    "--match-head-commit",
+    "--author-email",
+    "-A",
+    "-l",
+    "--label",
+    "-m",
+    "--milestone",
+    "-p",
+    "--project",
+    "--reviewer",
+    "--assignee",
+    "-T",
+    "--title",
+    "--recover",
+    "--notes",
+    "--notes-file",
+    "--head",
+    "-H",
+    "--base",
+    "-B",
+    "--limit",
+    "-L",
+    "--search",
+    "-S",
+    "--author",
+    "--method",
+    "-X",
+    "--hostname",
+    "--field",
+    "--raw-field",
+    "--header",
+    "--input",
+    "--cache",
+];
+
+fn takes_value(flag: &str) -> bool {
+    VALUE_FLAGS.contains(&flag)
+}
+
+/// The arguments gh parses as flags: everything before the first `--` that
+/// gh takes as a terminator. After it gh reads every word as a positional (a
+/// search term, say), so owner scans read flags only and a search for the words
+/// `--owner acme` routes nowhere. A `--` directly after a value-taking flag
+/// without `=` is that flag's value, not a terminator: `--body -- -R acme/x`
+/// still targets acme/x.
 fn before_terminator(args: &[String]) -> &[String] {
-    let end = args.iter().position(|a| a == "--").unwrap_or(args.len());
-    args.get(..end).unwrap_or(args)
+    let mut index = 0;
+    while let Some(argument) = args.get(index) {
+        if argument == "--" {
+            return args.get(..index).unwrap_or(args);
+        }
+        index += if takes_value(argument) { 2 } else { 1 };
+    }
+    args
 }
 
 /// The first `--owner` value of a `gh search` call (`--owner x` or `--owner=x`)
@@ -1687,6 +1722,37 @@ mod tests {
                 remotes: &remotes,
             }),
             Some(format!("https://{host}/alpha/repository.git"))
+        );
+    }
+
+    #[test]
+    fn a_double_dash_that_is_a_flag_value_does_not_terminate_the_scans() {
+        let args = |a: &[&str]| a.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        // gh reads `--` after a value flag written without `=` as its value.
+        assert_eq!(
+            repo_flag(&args(&[
+                "pr", "comment", "5", "--body", "--", "-R", "acme/w"
+            ])),
+            Some("acme/w".to_owned())
+        );
+        assert_eq!(
+            owner_from_api_args(&args(&[
+                "search", "issues", "--title", "--", "--owner", "acme"
+            ])),
+            Some("acme".to_owned())
+        );
+        assert!(has_head_flag(&args(&[
+            "pr", "create", "--title", "--", "--head", "x"
+        ])));
+        // `--body=--` is one argument; the bare `--` after it still terminates.
+        assert_eq!(
+            repo_flag(&args(&["pr", "comment", "--body=--", "--", "-R", "acme/w"])),
+            None
+        );
+        // A boolean flag does not take `--` as a value.
+        assert_eq!(
+            repo_flag(&args(&["pr", "comment", "--web", "--", "-R", "acme/w"])),
+            None
         );
     }
 
