@@ -290,7 +290,12 @@ pub(crate) fn has_positional_target(subcommand: &str, args: &[String]) -> bool {
         }
         if found_subcommand {
             if argument.starts_with('-') {
-                if takes_value(argument) {
+                if takes_value(argument)
+                    || matches!(
+                        (subcommand, argument.as_str()),
+                        ("checks", "-i") | ("edit", "-m" | "-p")
+                    )
+                {
                     previous_was_value_flag = true;
                 }
                 continue;
@@ -621,8 +626,11 @@ pub(crate) fn owner_from_api_args(args: &[String]) -> Option<String> {
     }
 }
 
-/// Flags that take their value as the next argument when written without `=`.
-/// gh (pflag) reads that next argument as the value even when it is `--`.
+/// Flags that take their value as the next argument when written without `=`,
+/// in every gh command that has them. gh (pflag) reads that next argument as the
+/// value even when it is `--`. Short flags that are boolean in some command
+/// (`-c`, `-r`, `-m`, `-p`, `-i`, `--comment`) are absent: listing them would
+/// swallow a real terminator after `gh pr merge -r`.
 const VALUE_FLAGS: &[&str] = &[
     "-R",
     "--repo",
@@ -637,12 +645,8 @@ const VALUE_FLAGS: &[&str] = &[
     "-F",
     "--body-file",
     "--branch",
-    "-c",
-    "--comment",
-    "-r",
     "--reason",
     "--color",
-    "-i",
     "--interval",
     "--subject",
     "--match-head-commit",
@@ -650,9 +654,7 @@ const VALUE_FLAGS: &[&str] = &[
     "-A",
     "-l",
     "--label",
-    "-m",
     "--milestone",
-    "-p",
     "--project",
     "--reviewer",
     "--assignee",
@@ -678,6 +680,13 @@ const VALUE_FLAGS: &[&str] = &[
     "--header",
     "--input",
     "--cache",
+    "--ref",
+    "--workflow",
+    "--event",
+    "--status",
+    "--user",
+    "--team",
+    "--commenter",
 ];
 
 fn takes_value(flag: &str) -> bool {
@@ -1754,6 +1763,27 @@ mod tests {
             repo_flag(&args(&["pr", "comment", "--web", "--", "-R", "acme/w"])),
             None
         );
+        // Short flags that are boolean in some commands never swallow the next word.
+        for (subcommand, flag) in [("merge", "-r"), ("merge", "-m"), ("view", "-c")] {
+            assert!(
+                has_positional_target(subcommand, &args(&["pr", subcommand, flag, "123"])),
+                "{subcommand} {flag}"
+            );
+            assert_eq!(
+                repo_flag(&args(&["pr", subcommand, flag, "--", "-R", "acme/w"])),
+                None,
+                "{subcommand} {flag}"
+            );
+        }
+        // Where they do take a value, the value is not the target.
+        assert!(!has_positional_target(
+            "edit",
+            &args(&["pr", "edit", "-m", "v1"])
+        ));
+        assert!(!has_positional_target(
+            "checks",
+            &args(&["pr", "checks", "-i", "5"])
+        ));
     }
 
     #[test]
