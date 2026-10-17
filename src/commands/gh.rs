@@ -599,7 +599,7 @@ pub(crate) fn mint_token(target_url: &str) -> Mint {
         .map_or(Mint::Unrouted, Mint::Token)
 }
 
-/// The owner a `gh api` invocation targets, or None when it carries no signal.
+/// The owner a `gh api` or `gh search` invocation targets, or None when it carries no signal.
 ///
 /// These invocations often run outside the target repo's checkout and carry no
 /// -R, so remote-based resolution would route the token to the wrong owner —
@@ -607,6 +607,9 @@ pub(crate) fn mint_token(target_url: &str) -> Mint {
 /// GraphQL mutations genuinely have no signal; `gh-app-token` honors
 /// `GH_APP_OWNER` for those, which is out of knives' hands.
 pub(crate) fn owner_from_api_args(args: &[String]) -> Option<String> {
+    if args.first().map(String::as_str) == Some("search") {
+        return search_owner_flag(args);
+    }
     if args.first().map(String::as_str) != Some("api") {
         return None;
     }
@@ -647,6 +650,24 @@ pub(crate) fn owner_from_api_args(args: &[String]) -> Option<String> {
         Some((_, GraphqlValue::Variable(name))) => field_argument(args, &name),
         None => None,
     }
+}
+
+/// The first `--owner` value of a `gh search` call (`--owner x` or `--owner=x`)
+/// when it is owner-shaped. `--repo` is read by `repo_flag`.
+fn search_owner_flag(args: &[String]) -> Option<String> {
+    let mut index = 1;
+    while let Some(argument) = args.get(index) {
+        let value = if argument == "--owner" {
+            args.get(index + 1).map(String::as_str)
+        } else {
+            argument.strip_prefix("--owner=")
+        };
+        if let Some(value) = value {
+            return is_owner_shaped(value).then(|| value.to_owned());
+        }
+        index += 1;
+    }
+    None
 }
 
 /// The value bound to GraphQL variable `name` by a `gh api` field argument, in
