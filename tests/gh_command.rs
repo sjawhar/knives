@@ -892,6 +892,70 @@ fn pr_create_appends_bookmark_as_head() {
     assert_eq!(lines[5], "feat/alpha");
 }
 
+/// Runs `knives gh -- <args>` from a jj working copy on bookmark `feat/alpha` and
+/// returns the arguments the fake gh received (its log minus the trailing probes).
+fn gh_args_seen_on_a_bookmark(args: &[&str]) -> Vec<String> {
+    let lab = lab::Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.jj_work(["edit", "feat/alpha"]);
+    let (dir, log) = fake_gh();
+    let output = knives_cmd(dir.path())
+        .args(["gh", "--"])
+        .args(args)
+        .current_dir(&lab.work)
+        .env("KNIVES_REAL_GH", dir.path().join("gh"))
+        .env("FAKE_GH_LOG", &log)
+        .output()
+        .expect("run knives gh");
+    assert!(output.status.success(), "{:?}", output.stderr);
+    let recorded = fs::read_to_string(&log).expect("fake gh ran");
+    recorded
+        .lines()
+        .take_while(|line| !line.starts_with("GH_TOKEN="))
+        .map(str::to_owned)
+        .collect()
+}
+
+#[test]
+fn a_pr_command_after_the_terminator_is_a_search_term_not_a_subcommand() {
+    // Given/When: gh search whose terms after `--` read `pr view`.
+    let seen = gh_args_seen_on_a_bookmark(&["search", "issues", "--", "pr", "view"]);
+
+    // Then: no bookmark is injected.
+    assert_eq!(seen, ["search", "issues", "--", "pr", "view"]);
+}
+
+#[test]
+fn a_positional_after_the_terminator_is_the_pr_target() {
+    // Given/When: `pr view` whose target follows `--`.
+    let seen = gh_args_seen_on_a_bookmark(&["pr", "view", "--", "123"]);
+
+    // Then: no bookmark is injected next to the explicit target.
+    assert_eq!(seen, ["pr", "view", "--", "123"]);
+}
+
+#[test]
+fn a_head_word_after_the_terminator_is_not_the_head_flag() {
+    // Given/When: `pr create` with `--head` only after `--`.
+    let seen = gh_args_seen_on_a_bookmark(&["pr", "create", "--title", "A", "--", "--head", "x"]);
+
+    // Then: the bookmark's --head lands before the terminator.
+    assert_eq!(
+        seen,
+        [
+            "pr",
+            "create",
+            "--title",
+            "A",
+            "--head",
+            "feat/alpha",
+            "--",
+            "--head",
+            "x"
+        ]
+    );
+}
+
 #[test]
 fn pr_create_does_not_duplicate_explicit_head() {
     // Given: a jj working copy and an explicit --head.

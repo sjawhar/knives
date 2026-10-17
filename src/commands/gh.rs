@@ -143,8 +143,10 @@ pub fn run(args: &[String]) -> anyhow::Result<std::convert::Infallible> {
                 die_no_bookmark();
             };
             let mut arguments = args.to_vec();
-            arguments.push("--head".to_owned());
-            arguments.push(bookmark.to_owned());
+            // Before a `--` terminator: after it gh reads every word as a positional.
+            let end = before_terminator(args).len();
+            arguments.insert(end, bookmark.to_owned());
+            arguments.insert(end, "--head".to_owned());
             arguments
         }
         "view" | "checks" | "diff" | "merge" | "checkout" | "edit" | "comment" | "ready"
@@ -264,7 +266,7 @@ pub(crate) fn current_bookmark(cwd: &Path) -> Option<String> {
 /// The `gh pr <subcommand>` this invocation is, skipping flags (shim lines 308-329).
 pub(crate) fn pr_subcommand(args: &[String]) -> Option<(String, usize)> {
     let mut found_pr = false;
-    for (index, argument) in args.iter().enumerate() {
+    for (index, argument) in before_terminator(args).iter().enumerate() {
         if found_pr {
             if !argument.starts_with('-') {
                 return Some((argument.clone(), index));
@@ -278,9 +280,10 @@ pub(crate) fn pr_subcommand(args: &[String]) -> Option<(String, usize)> {
 
 /// Whether a positional target follows `subcommand` (shim lines 343-384).
 pub(crate) fn has_positional_target(subcommand: &str, args: &[String]) -> bool {
+    let flags = before_terminator(args);
     let mut found_subcommand = false;
     let mut previous_was_value_flag = false;
-    for argument in args {
+    for argument in flags {
         if previous_was_value_flag {
             previous_was_value_flag = false;
             continue;
@@ -335,12 +338,14 @@ pub(crate) fn has_positional_target(subcommand: &str, args: &[String]) -> bool {
             found_subcommand = true;
         }
     }
-    false
+    // Words after `--` are positionals: a target when the subcommand came first.
+    found_subcommand && args.len() > flags.len() + 1
 }
 
 /// Whether the caller already supplied `--head` (shim lines 332-339).
 pub(crate) fn has_head_flag(args: &[String]) -> bool {
-    args.iter()
+    before_terminator(args)
+        .iter()
         .any(|argument| argument == "--head" || argument.starts_with("--head="))
 }
 
@@ -1683,6 +1688,40 @@ mod tests {
             }),
             Some(format!("https://{host}/alpha/repository.git"))
         );
+    }
+
+    #[test]
+    fn the_pr_scans_stop_at_the_terminator() {
+        let args = |a: &[&str]| a.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        assert_eq!(
+            pr_subcommand(&args(&["search", "issues", "--", "pr", "view"])),
+            None
+        );
+        assert_eq!(
+            pr_subcommand(&args(&["pr", "--", "view"])),
+            None,
+            "words after `--` are never the subcommand"
+        );
+        assert!(!has_head_flag(&args(&[
+            "pr", "create", "--", "--head", "x"
+        ])));
+        assert!(has_head_flag(&args(&["pr", "create", "--head", "x", "--"])));
+        assert!(has_positional_target(
+            "view",
+            &args(&["pr", "view", "--", "123"])
+        ));
+        assert!(!has_positional_target("view", &args(&["pr", "view", "--"])));
+        assert!(!has_positional_target(
+            "view",
+            &args(&["pr", "view", "--json", "x", "--"])
+        ));
+        // The subcommand only after `--` is not the subcommand; a value flag
+        // right before `--` takes `--` as its value, so the next word is positional.
+        assert!(!has_positional_target("view", &args(&["pr", "--", "view"])));
+        assert!(has_positional_target(
+            "view",
+            &args(&["pr", "view", "--json", "--", "123"])
+        ));
     }
 
     #[test]
