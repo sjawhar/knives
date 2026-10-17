@@ -1344,6 +1344,41 @@ mod tests {
     }
 
     #[test]
+    fn api_owner_scans_stop_at_the_terminator_but_the_endpoint_does_not() {
+        let args = |a: &[&str]| a.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        let query = "query=query($owner:String!){repository(owner:$owner,name:\"x\"){id}}";
+        assert_eq!(
+            owner_from_api_args(&args(&["api", "graphql", "-f", query, "-f", "owner=acme"])),
+            Some("acme".to_owned())
+        );
+        assert_eq!(
+            owner_from_api_args(&args(&[
+                "api",
+                "graphql",
+                "-f",
+                query,
+                "--",
+                "-f",
+                "owner=acme"
+            ])),
+            None
+        );
+        assert_eq!(
+            owner_from_api_args(&args(&[
+                "api",
+                "graphql",
+                "--",
+                "repository(owner:\"acme\")"
+            ])),
+            None
+        );
+        assert_eq!(
+            owner_from_api_args(&args(&["api", "--", "repos/acme/x"])),
+            Some("acme".to_owned())
+        );
+    }
+
+    #[test]
     fn a_variable_bound_graphql_owner_resolves_through_its_field_argument() {
         // knives' own forge queries bind the target as `-f owner=… -f name=…`
         // and reference `$owner` in the query, so the query text alone names no
