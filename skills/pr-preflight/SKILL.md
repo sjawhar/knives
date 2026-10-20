@@ -19,7 +19,7 @@ Complete `fork-work`'s challenge before implementation; Check 7 verifies the `pl
 
 ## Step 1: Obtain Programmatic Facts
 
-Run the preflight command for the target repository. It needs a jj checkout with an `upstream` remote. A plain git clone of a fork has neither, so add the upstream (the repository named by the fork's `upstream_name` in `knives repos`) and colocate first:
+Run the preflight command for the target repository. It needs a jj checkout with an `upstream` remote. A plain git clone of a fork has neither, so add the upstream (the `upstream` URL of the fork's entry in the knives registry, `repos.toml`) and colocate first:
 
 ```bash
 git remote add upstream <upstream clone URL>   # only when there is no upstream remote
