@@ -19,10 +19,11 @@ Complete `fork-work`'s challenge before implementation; Check 7 verifies the `pl
 
 ## Step 1: Obtain Programmatic Facts
 
-Run the preflight command for the target repository. It needs a jj checkout, so in a plain git clone run `jj git init --colocate` first:
+Run the preflight command for the target repository. It needs a jj checkout with an `upstream` remote. A plain git clone of a fork has neither, so add the upstream (the fork's `upstream_name` in `knives repos`) and colocate first:
 
 ```bash
-jj git init --colocate   # plain git clone only
+git remote add upstream https://github.com/<upstream_name>.git   # plain git clone only
+jj git init --colocate                                            # plain git clone only
 knives preflight
 ```
 
