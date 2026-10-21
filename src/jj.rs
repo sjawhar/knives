@@ -1641,7 +1641,8 @@ pub struct ReleaseWrite<'a> {
     pub message: Option<&'a str>,
     /// Point this bookmark at the written commit, sideways moves allowed —
     /// callers that pass one have already established the move is safe (see
-    /// [`set_bookmark_anywhere`]).
+    /// [`set_bookmark_anywhere`]). When it named the source, the write replaces
+    /// the source, which is abandoned once nothing else rests on it.
     pub bookmark: Option<&'a str>,
     /// The operation-log description, `knives: …` by convention.
     pub operation: &'a str,
@@ -1666,29 +1667,80 @@ pub struct ReleaseWrite<'a> {
 /// workspace on top of the release merge unless flagged off; a jj-lib write
 /// cannot make that mistake, and it reports the created commit directly
 /// instead of through parsed human-facing output.
+///
+/// A duplicate moved under the name its source carried replaces that source,
+/// which would otherwise stay behind as a head no bookmark names. It is
+/// abandoned in the same operation when nothing else rests on it: see
+/// [`rests_on`].
 pub fn write_release(repo: &Path, write: &ReleaseWrite<'_>) -> Result<CommitId, JjError> {
     validate_parents(write.source, write.parents)?;
     let repo = Repo::open(repo)?;
     let (parent_commits, parent_ids) = resolved_parents(&repo, write.parents)?;
     let mut tx = repo.repo.start_transaction();
-    let written = if let Some(source) = write.source {
+    let (written, source) = if let Some(source) = write.source {
         let source = repo.commit(source.as_str())?;
-        duplicated_release(&mut tx, (&source, write.message), &parent_ids)?
+        let written = duplicated_release(&mut tx, (&source, write.message), &parent_ids)?;
+        (written, Some(source))
     } else {
-        merged_release(
+        let written = merged_release(
             &mut tx,
             (&parent_commits, parent_ids),
             write.message.unwrap_or_default(),
-        )?
+        )?;
+        (written, None)
     };
     if let Some(name) = write.bookmark {
-        tx.repo_mut().set_local_bookmark_target(
-            JjRefName::new(name),
-            RefTarget::normal(written.id().clone()),
-        );
+        let name = JjRefName::new(name);
+        let replaced = source.filter(|source| {
+            repo.repo
+                .view()
+                .get_local_bookmark(name)
+                .added_ids()
+                .any(|id| id == source.id())
+        });
+        tx.repo_mut()
+            .set_local_bookmark_target(name, RefTarget::normal(written.id().clone()));
+        if let Some(replaced) = replaced
+            && !rests_on(&repo, tx.repo(), &replaced)?
+        {
+            tx.repo_mut().record_abandoned_commit(&replaced);
+        }
     }
     commit_mutation(&repo, tx, write.operation)?;
     Ok(commit_id(written.id()))
+}
+
+/// Whether anything but the moved name still rests on a replaced release
+/// commit, judged in `view_repo` — the write's transaction, the name already
+/// moved: a bookmark or tag on it, local or on any remote, a workspace with it
+/// checked out, a visible descendant, or anything jj's default rule pins
+/// ([`assert_mutable`]). A commit someone else can still reach by name is
+/// theirs to keep. The colocated git view (`@git`) is no remote: it still
+/// shows the moved name at the source until this operation exports refs.
+fn rests_on(
+    repo: &Repo,
+    view_repo: &dyn jj_lib::repo::Repo,
+    commit: &jj_lib::commit::Commit,
+) -> Result<bool, JjError> {
+    let id = commit.id();
+    let view = view_repo.view();
+    let points_here = |local: &RefTarget, remotes: &[(&JjRemoteName, &RemoteRef)]| {
+        local.added_ids().any(|target| target == id)
+            || remotes.iter().any(|(remote, remote_ref)| {
+                *remote != jj_lib::git::REMOTE_NAME_FOR_LOCAL_GIT_REPO
+                    && remote_ref.target.added_ids().any(|target| target == id)
+            })
+    };
+    let named = view
+        .bookmarks()
+        .any(|(_, targets)| points_here(targets.local_target, &targets.remote_refs))
+        || view
+            .tags()
+            .any(|(_, targets)| points_here(targets.local_target, &targets.remote_refs))
+        || view.wc_commit_ids().values().any(|wc| wc == id);
+    Ok(named
+        || !repo.descendants_of(id)?.is_empty()
+        || assert_mutable(view_repo, std::slice::from_ref(commit)).is_err())
 }
 
 /// Refuse an empty or repeated parent set before anything is written.

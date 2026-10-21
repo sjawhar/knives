@@ -449,12 +449,13 @@ fn add_release_drift(report: &mut Report, drift: ReleaseDrift<'_>) {
         source,
     } = drift;
     let branch = reference.branch();
-    match recorded_commit(entries, branch.as_str()) {
-        Some(recorded) if !same_commit(recorded.as_str(), current.as_str()) => {
+    match crate::release_model::last_recorded_write(entries, branch.as_str()) {
+        Some(recorded) if !same_commit(recorded.commit.as_str(), current.as_str()) => {
             let detail = format!(
-                "{source} {branch} is at {} but its newest recorded cut names {}",
+                "{source} {branch} is at {} but its newest recorded {} names {}",
                 current.short(),
-                recorded.short(),
+                recorded.kind,
+                recorded.commit.short(),
             );
             report.findings.push(Finding::new(
                 FindingKind::ReleaseDrift,
@@ -463,9 +464,9 @@ fn add_release_drift(report: &mut Report, drift: ReleaseDrift<'_>) {
             ));
         }
         Some(_) => {}
-        None => report
-            .notes
-            .push(format!("{source} {branch} has no recorded cut event")),
+        None => report.notes.push(format!(
+            "{source} {branch} has no recorded cut or edit event"
+        )),
     }
 }
 
@@ -499,10 +500,6 @@ fn add_misplaced_origin_release_refs(
             ),
         ));
     }
-}
-
-fn recorded_commit(entries: &[Entry], subject: &str) -> Option<CommitId> {
-    crate::release_model::last_recorded_cut(entries, Some(subject)).map(|cut| cut.commit)
 }
 
 fn same_commit(recorded: &str, current: &str) -> bool {
@@ -717,7 +714,7 @@ mod tests {
     use super::{
         AuditInput, LocalFacts, ReleaseDriftScan, Report, add_misplaced_origin_release_refs,
         add_open_pull_head_checks, add_release_drifts, exit_for, pull_head_findings,
-        pull_position_findings, recorded_commit, same_commit,
+        pull_position_findings, same_commit,
     };
     use crate::bind::Fork;
     use crate::cli::Exit;
@@ -729,6 +726,7 @@ mod tests {
     };
     use crate::ids::{BookmarkRef, BranchName, CommitId};
     use crate::ledger::{Entry, Kind, Ledger};
+    use crate::release_model::{RecordedWrite, RecordedWriteKind, last_recorded_write};
     use crate::store::Store;
     use std::collections::BTreeMap;
     use std::path::Path;
@@ -928,8 +926,70 @@ mod tests {
         ];
 
         assert_eq!(
-            recorded_commit(&entries, "release/2026-08-15"),
-            Some(CommitId::new("aaaaaaaaaaaa"))
+            last_recorded_write(&entries, "release/2026-08-15"),
+            Some(RecordedWrite {
+                kind: RecordedWriteKind::Cut,
+                commit: CommitId::new("aaaaaaaaaaaa"),
+            })
+        );
+    }
+
+    #[test]
+    fn a_later_edit_event_is_the_baseline_a_release_is_held_against() {
+        let event = |ts: &str, text: &str, commit: &str| Entry {
+            ts: ts.to_owned(),
+            owner: "test".to_owned(),
+            email: None,
+            subject: Some("release/2026-08-15".to_owned()),
+            kind: Kind::Event,
+            disposition: None,
+            statement: None,
+            text: text.to_owned(),
+            evidence: vec![commit.to_owned(), "member0000000".to_owned()],
+            anchor: None,
+            pr: None,
+            parents: Vec::new(),
+        };
+        let entries = vec![
+            event(
+                "2026-08-15T00:00:00Z",
+                "cut release/2026-08-15 as aaaaaaaaaaaa with 2 parent(s)",
+                "aaaaaaaaaaaa",
+            ),
+            // The event an older knives wrote, before edits recorded a change id.
+            event(
+                "2026-08-16T00:00:00Z",
+                "edited release/2026-08-15: dropped feat/beta: not ready; parents: feat/alpha@m",
+                "bbbbbbbbbbbb",
+            ),
+        ];
+        let published = BTreeMap::new();
+        let schemes = [crate::ids::ReleaseScheme::Dated];
+        let drift_at = |commit: &str| {
+            let local =
+                BTreeMap::from([(BranchName::new("release/2026-08-15"), CommitId::new(commit))]);
+            let mut report = Report::new("demo");
+            add_release_drifts(
+                &mut report,
+                &ReleaseDriftScan {
+                    local: &local,
+                    published: &published,
+                    schemes: &schemes,
+                    publish_remote: "release",
+                    entries: &entries,
+                },
+            );
+            report.findings
+        };
+
+        let edited = drift_at("bbbbbbbbbbbb000000000000000000000000000000");
+        assert!(edited.is_empty(), "{edited:?}");
+        let cut = drift_at("aaaaaaaaaaaa000000000000000000000000000000");
+        let finding = cut.first().expect("one release-drift finding");
+        assert_eq!(
+            finding.detail,
+            "local release/2026-08-15 is at aaaaaaaaaaaa but its newest recorded edit names \
+             bbbbbbbbbbbb"
         );
     }
 

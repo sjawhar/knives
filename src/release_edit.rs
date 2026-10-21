@@ -417,7 +417,9 @@ pub(crate) struct EditRecord<'a> {
 
 /// The edit's parent set goes to the ledger the way a cut's does, so a later
 /// `advance` or `include` can still tell which parent is which branch after a
-/// rebase that left no ancestry or change id behind.
+/// rebase that left no ancestry or change id behind. Like a cut event, it names
+/// the written commit, its change id and its parents, and the commit leads the
+/// evidence: it is the position `audit` holds the release against.
 pub(crate) fn record_edit_event(
     fork: &Fork<'_>,
     opened: &knives::jj::Repo,
@@ -429,14 +431,20 @@ pub(crate) fn record_edit_event(
         .iter()
         .map(|(_, commit)| commit.clone())
         .collect();
+    // `opened` predates the write, so it cannot read the new commit.
+    let change =
+        knives::jj::Repo::open(&fork.checkout.path)?.change_id_of(record.created.as_str())?;
     scribe_for(fork, bound)?.record(&Draft {
         subject: Some(record.release),
         kind: Kind::Event,
         disposition: None,
         statement: None,
         text: format!(
-            "edited {}: {}; parents: {}",
+            "edited {} as {} (change {}) with {} parent(s): {}; parents: {}",
             record.release,
+            record.created.short(),
+            change.short(),
+            parents.len(),
             record.delta,
             members_event_text(record.provenance)
         ),

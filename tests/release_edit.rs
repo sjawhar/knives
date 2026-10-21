@@ -6,7 +6,9 @@
 //! ancestry, and content that survives through another member stays quiet.
 //! Refused before any cut, when the upstream trunk cannot resolve, when the
 //! release is held only as a remote ref, or when every pin of this release is
-//! frozen — a pin frozen on an older release does not count.
+//! frozen — a pin frozen on an older release does not count. A dropped
+//! release audits as knives' own edit, not drift, and the cut it replaced is
+//! abandoned unless a bookmark or remote ref still names it.
 
 #![allow(
     clippy::expect_used,
@@ -731,4 +733,180 @@ fn an_edit_refuses_a_release_held_only_as_a_remote_ref() {
         before,
         "the remote-only release was edited anyway"
     );
+}
+
+/// `knives --json audit demo --no-github`, parsed. The release homes name an
+/// unreachable origin so consumer pins match it; the audit reads live remote
+/// refs first and reports nothing else when they fail, so it runs against the
+/// lab's own origin, with the same ledger.
+fn audit_report(lab: &Lab, home: &tempfile::TempDir) -> serde_json::Value {
+    std::fs::write(
+        home.path().join("repos.toml"),
+        format!(
+            "[repos.demo]\nupstream = \"{}\"\norigin = \"{}\"\n",
+            lab.upstream.display(),
+            lab.temp_origin().display(),
+        ),
+    )
+    .expect("point the registry at the lab's origin");
+    let output = lab::knives(lab, home, &["--json", "audit", "demo", "--no-github"]);
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+            panic!(
+                "audit emits JSON ({error}): {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+        });
+    assert_eq!(
+        report["problems"],
+        serde_json::json!(["open pull-head reconciliation was skipped (--no-github)"]),
+        "the audit must have read everything but pull heads: {report}"
+    );
+    report
+}
+
+/// The audit findings of `kind`.
+fn findings<'a>(report: &'a serde_json::Value, kind: &str) -> Vec<&'a serde_json::Value> {
+    report["findings"]
+        .as_array()
+        .expect("findings")
+        .iter()
+        .filter(|finding| finding["kind"] == kind)
+        .collect()
+}
+
+/// Whether `commit` is still a visible commit of the work checkout.
+fn is_visible(lab: &Lab, commit: &knives::ids::CommitId) -> bool {
+    knives::jj::commits_matching(&lab.work, "all()")
+        .expect("list visible commits")
+        .contains(commit)
+}
+
+/// Drop beta from a release cut from alpha and beta, asserting the drop worked.
+fn drop_beta(lab: &Lab, home: &tempfile::TempDir) {
+    let output = knives_release(lab, home, &["drop", "feat/beta", "--why", "not ready"]);
+    assert!(
+        output.status.success(),
+        "drop failed: {}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn a_dropped_release_audits_clean_and_leaves_no_anonymous_head() {
+    // Given: a release cut from alpha and beta, then beta dropped. The drop
+    // writes a new commit under the name, so the cut event no longer names
+    // the release, and the cut commit it replaced has nothing left on it.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let (home, _consumer) = home_after_first_cut(&lab);
+    let cut = commit_at(&lab, "release/2026-08-04");
+    drop_beta(&lab, &home);
+    let edited = commit_at(&lab, "release/2026-08-04");
+
+    // When: the fork is audited.
+    let report = audit_report(&lab, &home);
+
+    // Then: the release is exactly what knives wrote, so it is not drift; the
+    // replaced cut is abandoned, so it is no anonymous head; and the edit event
+    // names the new commit's change id beside its commit id, as a cut does.
+    assert!(findings(&report, "release-drift").is_empty(), "{report}");
+    assert!(findings(&report, "orphan-commit").is_empty(), "{report}");
+    assert!(!is_visible(&lab, &cut), "the replaced cut is still visible");
+    let change = Repo::open(&lab.work)
+        .expect("open")
+        .change_id_of(edited.as_str())
+        .expect("change id of the edited release");
+    let entries = knives::ledger::Ledger::at(home.path().join("ledger").join("demo"))
+        .read()
+        .expect("read ledger")
+        .entries;
+    let event = entries
+        .iter()
+        .rev()
+        .find(|entry| entry.text.starts_with("edited release/2026-08-04"))
+        .unwrap_or_else(|| panic!("no edit event: {entries:?}"));
+    assert!(
+        event.text.starts_with(&format!(
+            "edited release/2026-08-04 as {} (change {}) with 1 parent(s): dropped feat/beta",
+            edited.short(),
+            change.short()
+        )),
+        "{}",
+        event.text
+    );
+    assert_eq!(
+        event.evidence.first().map(String::as_str),
+        Some(edited.as_str())
+    );
+}
+
+#[test]
+fn a_release_moved_by_hand_after_a_drop_is_still_drift() {
+    // Given: a cut, a drop, then the release bookmark moved sideways by hand.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let (home, _consumer) = home_after_first_cut(&lab);
+    drop_beta(&lab, &home);
+    let edited = commit_at(&lab, "release/2026-08-04");
+    knives::jj::set_bookmark_anywhere(&lab.work, "release/2026-08-04", "feat/alpha")
+        .expect("move the release sideways");
+    lab.jj_work(["workspace", "update-stale"]);
+
+    // When: the fork is audited.
+    let report = audit_report(&lab, &home);
+
+    // Then: the release is neither the cut nor the edit knives wrote: drift,
+    // held against the edit.
+    let drift = findings(&report, "release-drift");
+    assert_eq!(drift.len(), 1, "{report}");
+    assert_eq!(
+        drift[0]["detail"],
+        format!(
+            "local release/2026-08-04 is at {} but its newest recorded edit names {}",
+            commit_at(&lab, "feat/alpha").short(),
+            edited.short()
+        ),
+        "{report}"
+    );
+}
+
+#[test]
+fn a_drop_keeps_the_replaced_cut_while_another_bookmark_names_it() {
+    // Given: a cut with a second bookmark on it, then a drop.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let (home, _consumer) = home_after_first_cut(&lab);
+    let cut = commit_at(&lab, "release/2026-08-04");
+    lab.jj_work(["bookmark", "create", "keep/cut", "-r", cut.as_str()]);
+
+    // When: beta is dropped.
+    drop_beta(&lab, &home);
+
+    // Then: the replaced cut stays, still named by the other bookmark.
+    assert!(is_visible(&lab, &cut), "a bookmarked cut was abandoned");
+    assert_eq!(commit_at(&lab, "keep/cut"), cut);
+}
+
+#[test]
+fn a_drop_keeps_the_replaced_cut_while_a_remote_ref_names_it() {
+    // Given: a cut pushed to origin, then a drop of the local release.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let (home, _consumer) = home_after_first_cut(&lab);
+    let cut = commit_at(&lab, "release/2026-08-04");
+    lab.push_branch("release/2026-08-04");
+
+    // When: beta is dropped.
+    drop_beta(&lab, &home);
+
+    // Then: the published cut stays visible under its remote ref.
+    assert!(is_visible(&lab, &cut), "a published cut was abandoned");
+    assert_eq!(commit_at(&lab, "release/2026-08-04@origin"), cut);
 }
