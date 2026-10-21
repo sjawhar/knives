@@ -81,7 +81,7 @@ jj rebase -s '<release-or-keep-ref>..<branch>' -d <trunk>@upstream
 - A fixed release has a **ledger-recording** path instead. It applies when the last cut event is missing or names a different commit than the published branch. Then `cut` audits that published composition, runs the composition and drop checks, and records that commit as the cut. It makes no commit and pushes nothing. Weak evidence can still give findings. When the ledger already records that commit, an identical cut is refused.
 - A member rewritten to the same content is a new parent, so it is a new composition. The comparison is with the published copy. An unpushed previous cut is not compared.
 
-Cut and edit events keep full parent commits, every bookmark on them, and the cut change id, in the [ledger](ledger.md). Use that evidence, not the current bookmark names, to find lost members.
+Cut and edit events keep full parent commits, every bookmark on them, and the commit and change id each wrote, in the [ledger](ledger.md). Use that evidence, not the current bookmark names, to find lost members.
 
 ## Editing members
 
@@ -90,6 +90,7 @@ Cut and edit events keep full parent commits, every bookmark on them, and the cu
 - **`advance [<branch>...] [--from <old-sha>]`** moves named branches exactly. Bare, it moves every member whose branch moved. Ancestry matches growth, and the change id past trunk matches a jj rewrite. Parents that trunk reaches have no unique successor, and `rebase` retires them.
 - A named branch with no ancestry or change-id match can match by the `branch@commit` record of the last event. The output says so, because a reused name would move the member onto unrelated content.
 - Bare advance refuses when one branch would replace more than one parent. A stacked integration branch does not prove that it replaced them. `--from` names the exact parent to replace and needs exactly one named branch. Use it when no record of the parent exists. Neither form advances onto a tip that trunk reaches.
+- Each edit writes a new commit under the release name and abandons the commit it replaced, so no anonymous head stays, and says so. The old commit stays, with a note naming why, when another bookmark, a tag, a remote ref other than the release's own tracked ref on its publish remote, a workspace working copy on it or above it, or any other descendant rests on it. A working copy parked on the release keeps it because rewriting that working copy would leave its workspace stale; the audit does not report it as an anonymous head while the working copy is there. Every later edit of the name, and the reap that forgets the name, also abandons each earlier commit the ledger records under it that is now a visible head nothing rests on (no publish-ref exception here), such as one left behind when that working copy moved on, and says so. An edit that leaves the release with conflicts abandons no earlier commit: they are the record of the last resolution, as with reap. The publish remote keeps the old commit until you push.
 
 ## `knives release rebase [REF]`
 
