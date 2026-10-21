@@ -164,6 +164,22 @@ fn freezes_commit(pin: &Pin, commit: &CommitId) -> bool {
     abbreviates(&pin.reference) || pin.locked.as_deref().is_some_and(abbreviates)
 }
 
+/// `name`, unless it is a series' own prefix, such as `release/9.2` on an entry
+/// with series 9.2: git cannot hold that ref beside `release/9.2/<date>`.
+pub fn clear_of_series_prefixes(entry: &RepoEntry, name: String) -> Result<String, String> {
+    match entry
+        .series
+        .keys()
+        .find(|series| name == format!("{}{series}", crate::ids::RELEASE_PREFIX))
+    {
+        Some(series) => Err(format!(
+            "{name} is the prefix of series {series}'s cuts ({name}/YYYY-MM-DD[.N]); git cannot \
+             hold both, so name the cut by date"
+        )),
+        None => Ok(name),
+    }
+}
+
 /// The name a cut takes.
 ///
 /// A dated name must be one this series owns: a name another series owns,
@@ -459,7 +475,7 @@ pub fn superseded_cuts_of_every_series(
         .all_series()
         .iter()
         .flat_map(|series| {
-            superseded_dated_releases(tips, &series.release_scheme(), entry.publish_remote())
+            superseded_dated_releases(tips, &series.dated_scheme(), entry.publish_remote())
         })
         .map(|(reference, _)| reference)
         .collect()

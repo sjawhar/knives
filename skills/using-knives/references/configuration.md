@@ -92,7 +92,11 @@ refused. A `path` field is refused. Optional fields:
   and the default trunk, and cannot sit under `release/`. A branch belongs to
   the series whose base it forks from latest: a cut composes only its series'
   branches, and `include`/`advance` refuse a branch of another series or of
-  none, saying which. An entry without `series` behaves exactly as before.
+  none, saying which. Every series' base must resolve, or every release verb
+  refuses. The name must also be a valid git ref segment (no space, `~`, `^`,
+  `:`, `?`, `*`, `[`, `\`, `..` or `@{`). An entry without `series` keeps its
+  behaviour, except that a multi-segment `release/x/y` ref is no longer read as
+  one of its dated cuts or pins.
 - `consumers`: forge `owner/repo` slugs whose trunks pin releases. Cached by
   consumer commit; ad-hoc local paths belong in `--consumer PATH`, not this list.
 - `workspaces`: parent directory for `start` workspaces and `finish` cleanup.

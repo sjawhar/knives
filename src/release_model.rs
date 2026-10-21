@@ -135,26 +135,34 @@ pub enum SeriesFit {
 /// series: composing it into one would carry whichever base it really stands
 /// on into the other.
 ///
-/// A base that does not resolve (not fetched) takes no part; a tip that fits
-/// nothing says which bases were missing.
+/// Every series' base takes part. A base that does not resolve, or that has no
+/// single fork point with the tip, fits the tip to no series: deciding among
+/// the remaining bases would assign the branch by elimination, and a 9.2
+/// branch whose base was not fetched would then fit the default series. A
+/// base that is an ancestor of another base ties for every branch forked at
+/// or below it, so such branches fit no series either.
 pub fn series_fit(
     repo: &Repo,
     entry: &RepoEntry,
     tip: &CommitId,
 ) -> Result<SeriesFit, jj::JjError> {
     let mut points: Vec<(Option<String>, String, CommitId)> = Vec::new();
-    let mut unresolved = Vec::new();
+    let mut unplaced = Vec::new();
     for series in entry.all_series() {
         let base = series.trunk_ref();
         let Ok(base_tip) = repo.resolve_commit(&base) else {
-            unresolved.push(base);
+            unplaced.push(format!("{base} does not resolve"));
             continue;
         };
         let Some(point) = repo.common_ancestor(std::slice::from_ref(tip), &base_tip)? else {
+            unplaced.push(format!("it has no single fork point with {base}"));
             continue;
         };
         let name = series.selected_series.as_ref().map(ToString::to_string);
         points.push((name, series.series_label(), point));
+    }
+    if !unplaced.is_empty() {
+        return Ok(SeriesFit::None(unplaced.join("; ")));
     }
     let mut latest = None;
     for (index, candidate) in points.iter().enumerate() {
@@ -173,19 +181,14 @@ pub fn series_fit(
         }
     }
     let Some((name, label, _)) = latest else {
-        let mut why = format!(
+        return Ok(SeriesFit::None(format!(
             "it does not fork from one series' base later than from every other ({})",
             points
                 .iter()
                 .map(|(_, label, point)| format!("{label} at {}", point.short()))
                 .collect::<Vec<_>>()
                 .join(", ")
-        );
-        if !unresolved.is_empty() {
-            why.push_str("; unresolved: ");
-            why.push_str(&unresolved.join(", "));
-        }
-        return Ok(SeriesFit::None(why));
+        )));
     };
     let selected = entry.selected_series.as_ref().map(ToString::to_string);
     Ok(if *name == selected {
@@ -193,6 +196,24 @@ pub fn series_fit(
     } else {
         SeriesFit::Other(label.clone())
     })
+}
+
+/// Every declared base of an entry with named series that does not resolve in
+/// `repo`, as `<base>@<remote>`. Empty for an entry without named series.
+///
+/// Membership needs every base: with one missing, its series' branches would
+/// fit whichever series is left, so every release verb refuses until it is
+/// fetched or the registry names the remote it lives on.
+pub fn unresolved_bases(repo: &Repo, entry: &RepoEntry) -> Vec<String> {
+    if entry.series.is_empty() {
+        return Vec::new();
+    }
+    entry
+        .all_series()
+        .iter()
+        .map(RepoEntry::trunk_ref)
+        .filter(|base| repo.resolve_commit(base).is_err())
+        .collect()
 }
 
 /// A series' member branches, and a line for each that fits no series.

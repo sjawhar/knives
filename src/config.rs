@@ -328,6 +328,17 @@ impl RepoEntry {
             })
     }
 
+    /// The dated cuts the selected series owns, which the reaper and the
+    /// superseded-cut readers enumerate. A fixed entry's default series still
+    /// owns `release/YYYY-MM-DD[.N]`: those are its leftover dated cuts from
+    /// before it moved to a fixed branch, and they are reaped as on any entry.
+    pub fn dated_scheme(&self) -> ReleaseScheme {
+        match self.release_scheme() {
+            ReleaseScheme::Fixed(_) => ReleaseScheme::Dated,
+            scheme => scheme,
+        }
+    }
+
     /// Every release series of this entry: the default one first, then each
     /// named series in name order. Each is the entry as that series selects it.
     pub fn all_series(&self) -> Vec<Self> {
@@ -889,6 +900,13 @@ fn checked_series(entry: &RepoEntry, path: &Path) -> Result<(), ConfigError> {
                 crate::ids::RELEASE_PREFIX
             )));
         }
+        if let Some(why) = ref_segment_flaw(name) {
+            return Err(invalid(format!(
+                "series {name:?} cannot name a git ref ({why}); its cuts are named \
+                 {}{name}/YYYY-MM-DD[.N]",
+                crate::ids::RELEASE_PREFIX
+            )));
+        }
         if crate::ids::ReleaseScheme::Dated
             .dated_cut(&format!("{}{name}", crate::ids::RELEASE_PREFIX))
             .is_some()
@@ -922,6 +940,42 @@ fn checked_series(entry: &RepoEntry, path: &Path) -> Result<(), ConfigError> {
         }
     }
     Ok(())
+}
+
+/// Why `segment` cannot be one component of a git ref, by git's
+/// `check-ref-format` rules; `None` when it can.
+fn ref_segment_flaw(segment: &str) -> Option<&'static str> {
+    if segment.starts_with('.') {
+        return Some("it starts with '.'");
+    }
+    if segment.ends_with('.') {
+        return Some("it ends with '.'");
+    }
+    if segment.strip_suffix(".lock").is_some() {
+        return Some("it ends with '.lock'");
+    }
+    if segment.contains("..") {
+        return Some("it contains '..'");
+    }
+    if segment.contains("@{") {
+        return Some("it contains '@{'");
+    }
+    if segment == "@" {
+        return Some("it is '@'");
+    }
+    if segment
+        .chars()
+        .any(|c| c.is_ascii_control() || c == '\u{7f}')
+    {
+        return Some("it contains a control character");
+    }
+    if segment
+        .chars()
+        .any(|c| matches!(c, ' ' | '~' | '^' | ':' | '?' | '*' | '[' | '\\'))
+    {
+        return Some("it contains one of space ~ ^ : ? * [ \\");
+    }
+    None
 }
 
 /// A `ledger` names a repository, so it is `<owner>/<name>`, before and after

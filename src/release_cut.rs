@@ -53,7 +53,7 @@ pub(crate) fn run_release(
     let heads = knives::consumer_pins::ConsumerHeadMemo::default();
     let opened = knives::jj::Repo::open(path)?;
     let scheme = entry.release_scheme();
-    let (cut_name, allow_drop) = match requested_cut(invocation, &scheme) {
+    let (cut_name, allow_drop) = match requested_cut(invocation, &scheme, entry) {
         Ok(request) => request,
         Err(exit) => return Ok(exit),
     };
@@ -309,11 +309,14 @@ pub(crate) fn run_release(
 fn requested_cut(
     invocation: &ReleaseInvocation,
     scheme: &knives::ids::ReleaseScheme,
+    entry: &knives::config::RepoEntry,
 ) -> Result<(Option<String>, bool), Exit> {
     match invocation {
         ReleaseInvocation::Plan => Ok((None, false)),
         ReleaseInvocation::Cut { name, allow_drop } => {
-            match release::cut_name(scheme, name.as_deref()) {
+            match release::cut_name(scheme, name.as_deref())
+                .and_then(|name| release::clear_of_series_prefixes(entry, name))
+            {
                 Ok(name) => Ok((Some(name), *allow_drop)),
                 Err(message) => {
                     eprintln!("{message}");
@@ -766,7 +769,7 @@ fn reap_after_cut(fork: &Fork<'_>) -> anyhow::Result<Exit> {
     let report = release::reap_superseded(
         path,
         &reopened,
-        &fork.entry.release_scheme(),
+        &fork.entry.dated_scheme(),
         fork.entry.publish_remote(),
     )?;
     print_reap(fork.name.as_str(), &report);
@@ -780,7 +783,7 @@ pub(crate) fn run_reap(fork: &Fork<'_>) -> anyhow::Result<Exit> {
     let report = release::reap_superseded(
         path,
         &opened,
-        &fork.entry.release_scheme(),
+        &fork.entry.dated_scheme(),
         fork.entry.publish_remote(),
     )?;
     print_reap(fork.name.as_str(), &report);

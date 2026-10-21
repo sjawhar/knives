@@ -287,6 +287,21 @@ fn dispatch() -> anyhow::Result<Exit> {
                 Some(entry) => knives::bind::Fork { entry, ..fork },
                 None => fork,
             };
+            // Membership needs every series' base; one missing would hand its
+            // branches to whichever series is left, so nothing proceeds.
+            let unresolved = knives::release_model::unresolved_bases(
+                &knives::jj::Repo::open(&fork.checkout.path)?,
+                fork.entry,
+            );
+            if !unresolved.is_empty() {
+                println!(
+                    "{}: release series base {} does not resolve; fetch it, or set the series' \
+                     base_remote to the remote that holds it, before any release verb",
+                    fork.name,
+                    unresolved.join(", ")
+                );
+                return Ok(Exit::Incomplete);
+            }
             let extra: Vec<&std::path::Path> =
                 consumer.iter().map(std::path::PathBuf::as_path).collect();
             dispatch_release(&fork, action, &extra, output, ground.bound())
