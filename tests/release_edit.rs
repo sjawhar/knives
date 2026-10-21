@@ -1042,7 +1042,6 @@ fn jj_in_work(lab: &Lab, args: &[&str]) -> std::process::Output {
     std::process::Command::new("jj")
         .args(args)
         .current_dir(&lab.work)
-        .env("JJ_CONFIG", "/dev/null")
         .env("JJ_USER", "Knives Lab")
         .env("JJ_EMAIL", "knives-lab@example.test")
         .output()
