@@ -16,7 +16,9 @@ use knives::commands::claim::{
 };
 use knives::commands::start::{collides_with_checkout, possesses, workspace_path};
 use knives::ids::{BranchName, BranchTarget, Requirement};
-use knives::jj::{Repo, WorkspaceIdentity, remove_finished_worktree};
+use knives::jj::{
+    Repo, StaleRegistration, WorkspaceIdentity, path_occupant, remove_finished_worktree,
+};
 use knives::ledger::{Draft, Stated};
 use knives::statement::{Statement, StatementKind};
 use knives::store::{Store, default_state_path};
@@ -196,11 +198,18 @@ pub(crate) fn run_finish(
 /// The Git side of a workspace whose directory is now gone: `jj workspace
 /// forget` unlinks the worktree it registered, but a directory that vanished
 /// before the forget leaves git's `.git/worktrees/<name>` entry behind, locked
-/// or prunable, and the next `start` at that path would fail on it.
+/// or prunable, and the next `start` at that path would fail on it. One that
+/// stays because something else now sits at the path is named, with what is
+/// there, so the failing `start` is not a surprise.
 fn stale_worktree_note(checkout: &Path, directory: &Path) -> String {
     match remove_finished_worktree(checkout, directory) {
-        Ok(true) => "; stale Git worktree registration removed".to_owned(),
-        Ok(false) => String::new(),
+        Ok(StaleRegistration::Removed) => "; stale Git worktree registration removed".to_owned(),
+        Ok(StaleRegistration::None | StaleRegistration::Locked) => String::new(),
+        Ok(StaleRegistration::Occupied) => format!(
+            "; {} is {}, so its stale Git worktree registration was not cleared",
+            directory.display(),
+            path_occupant(directory)
+        ),
         Err(error) => format!("; Git worktree registration not cleared ({error})"),
     }
 }

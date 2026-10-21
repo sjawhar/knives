@@ -897,3 +897,48 @@ fn finishing_a_workspace_whose_directory_vanished_clears_its_locked_git_registra
     // its path as "a missing but locked worktree".
     assert_finish_clears_a_vanished_registration("feat/gamma", true);
 }
+
+#[test]
+fn finishing_a_workspace_replaced_by_a_dangling_symlink_says_its_registration_stays() {
+    // Given: the workspace directory was replaced by a symbolic link to nowhere.
+    // git will not remove a registration whose path it cannot validate, so the
+    // registration stays, locked or not, and the next `start` there fails.
+    for lock in [false, true] {
+        let lab = lab::Lab::new();
+        let (home, _consumer) = release_test_home(&lab);
+        let workspace = start_claim_for_finish(&lab, &home, "ses_fff688", "feat/gamma");
+        let _ = git_worktree(&lab.work, "unlock", &[], &workspace);
+        if lock {
+            let locked = git_worktree(&lab.work, "lock", &["--reason", "test lock"], &workspace);
+            assert!(locked.status.success());
+        }
+        let registered = format!(
+            "worktree {}",
+            workspace.canonicalize().expect("workspace path").display()
+        );
+        std::fs::remove_dir_all(&workspace).expect("remove the workspace directory");
+        let nowhere = lab.temp_path().join("nowhere");
+        std::os::unix::fs::symlink(&nowhere, &workspace).expect("link the path to nowhere");
+
+        let finished = knives_finish(&lab, &home, &["feat/gamma"]);
+
+        // Then: finish names what is there and that the registration stayed
+        let stdout = String::from_utf8_lossy(&finished.stdout);
+        assert!(finished.status.success(), "lock={lock}: {stdout}");
+        let expected = format!(
+            "{} is a dangling symbolic link to {}, so its stale Git worktree registration was \
+             not cleared",
+            workspace.display(),
+            nowhere.display()
+        );
+        assert!(stdout.contains(&expected), "lock={lock}: {stdout}");
+        assert!(
+            git_worktrees(&lab.work).contains(&registered),
+            "lock={lock}: the registration was removed"
+        );
+        assert!(
+            std::fs::symlink_metadata(&workspace).is_ok(),
+            "lock={lock}: finish removed the link"
+        );
+    }
+}

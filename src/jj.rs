@@ -1323,23 +1323,40 @@ pub fn remove_prunable_worktree(
 /// `finish` ends is not live, and git would otherwise keep its registration,
 /// so the next `start` at that path fails on "a missing but locked worktree".
 /// The lock is overridden whatever its reason. Only the registration at
-/// `destination` is touched, and only while nothing is at that path. Says
-/// whether a registration was removed.
-pub fn remove_finished_worktree(checkout: &Path, destination: &Path) -> Result<bool, JjError> {
+/// `destination` is touched, and only while nothing is at that path.
+pub fn remove_finished_worktree(
+    checkout: &Path,
+    destination: &Path,
+) -> Result<StaleRegistration, JjError> {
     remove_stale_worktree(checkout, destination, StaleLock::Cleared)
-        .map(|found| matches!(found, StaleRegistration::Removed))
 }
 
 /// What became of the Git worktree registration at a workspace path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StaleRegistration {
-    /// None was registered there, or something (even a dangling symbolic link)
-    /// is at its path.
+    /// None was registered there, or its directory is present.
     None,
     /// The registration's directory was gone, and the registration is removed.
     Removed,
     /// The registration is locked and nothing is at its path; it was kept.
     Locked,
+    /// The registration's working tree is gone, but something that is not a
+    /// directory — a dangling symbolic link, a file — is at its path. Kept:
+    /// git will not remove a registration whose path it cannot validate, and
+    /// what is there is not knives' to delete. [`path_occupant`] names it.
+    Occupied,
+}
+
+/// What is at `path`, for a message about a path that holds something other
+/// than a directory: `a dangling symbolic link to <target>`, or `a file`.
+pub fn path_occupant(path: &Path) -> String {
+    match std::fs::read_link(path) {
+        Ok(target) if !path.exists() => {
+            format!("a dangling symbolic link to {}", target.display())
+        }
+        Ok(target) => format!("a symbolic link to {}", target.display()),
+        Err(_) => "a file".to_owned(),
+    }
 }
 
 /// What [`remove_stale_worktree`] does with a locked registration whose
@@ -1375,6 +1392,9 @@ fn remove_stale_worktree(
         std::fs::symlink_metadata(destination),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound
     );
+    if (prunable || locked) && !vanished && !destination.is_dir() {
+        return Ok(StaleRegistration::Occupied);
+    }
     let shown = path(destination);
     if locked && vanished {
         match stale_lock {

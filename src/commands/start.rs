@@ -17,8 +17,8 @@ use crate::detect::BookmarkTips;
 use crate::ids::{BookmarkRef, BranchName, BranchTarget, CommitId, RemoteName, WorkspaceName};
 use crate::jj::{
     Repo, StaleRegistration, WorkspaceIdentity, add_workspace, fetch_all, forget_workspace,
-    is_workspace_named, remove_finished_worktree, remove_prunable_worktree, repo_immutable_heads,
-    set_repo_immutable_heads, user_immutable_heads, workspace_identity,
+    is_workspace_named, path_occupant, remove_finished_worktree, remove_prunable_worktree,
+    repo_immutable_heads, set_repo_immutable_heads, user_immutable_heads, workspace_identity,
 };
 use crate::ledger::{Ledger, Scribe};
 use crate::release_model::newest_release;
@@ -510,6 +510,11 @@ enum Leftovers {
 fn clear_vanished_workspace(context: &StartContext<'_>) -> anyhow::Result<()> {
     let checkout = &context.fork.checkout.path;
     let shown = context.destination.display();
+    // Nothing is forgotten while something sits at the path: `add` would fail
+    // on it, and the forget could not be taken back.
+    if std::fs::symlink_metadata(&context.destination).is_ok() {
+        return refuse_occupied(context);
+    }
     let registered = context
         .opened
         .workspaces()?
@@ -522,10 +527,24 @@ fn clear_vanished_workspace(context: &StartContext<'_>) -> anyhow::Result<()> {
             context.workspace
         );
     }
-    if remove_finished_worktree(checkout, &context.destination)? {
-        println!("removed a stale Git worktree registration at {shown} (its directory was gone)");
+    match remove_finished_worktree(checkout, &context.destination)? {
+        StaleRegistration::Removed => println!(
+            "removed a stale Git worktree registration at {shown} (its directory was gone)"
+        ),
+        StaleRegistration::Occupied => refuse_occupied(context)?,
+        StaleRegistration::None | StaleRegistration::Locked => {}
     }
     Ok(())
+}
+
+/// The refusal for a workspace path that holds something other than a
+/// directory: a stale Git registration there stays, and `add` would fail on it.
+fn refuse_occupied(context: &StartContext<'_>) -> anyhow::Result<()> {
+    anyhow::bail!(
+        "{} is {}, not a workspace directory; move it aside and start again",
+        context.destination.display(),
+        path_occupant(&context.destination)
+    )
 }
 
 /// Where a new workspace's working copy was put, or why it was not.
@@ -625,6 +644,7 @@ fn create_workspace(
                 context.destination.display(),
                 context.branch
             ),
+            StaleRegistration::Occupied => refuse_occupied(context)?,
         },
     }
     add_workspace(
