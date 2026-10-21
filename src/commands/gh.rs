@@ -2,7 +2,7 @@
 //!
 //! This command executes `gh` directly, so the usual render/run split does not apply:
 //! there is no knives result to render.
-// allow: SIZE_OK: 1886 lines - single passthrough pipeline; splitting would separate resolution steps that read as one procedure.
+// allow: SIZE_OK: 2329 lines - single passthrough pipeline; splitting would separate resolution steps that read as one procedure.
 use std::collections::BTreeMap;
 use std::io::Read as _;
 use std::os::unix::{
@@ -103,7 +103,7 @@ pub fn run(args: &[String]) -> anyhow::Result<std::convert::Infallible> {
         };
         if let (None, Some(remedy)) = (&resolved, no_target_remedy(args)) {
             eprintln!(
-                "knives gh: no target repository (no -R/--repo flag, no owner in the api path, and no GitHub remote in {}); {remedy} Setting GH_TOKEN bypasses App routing.",
+                "knives gh: no target repository (no -R/--repo flag, no <owner>/<repo> argument, no owner in the api path, and no GitHub remote in {}); {remedy} Setting GH_TOKEN bypasses App routing.",
                 cwd.display()
             );
         }
@@ -215,6 +215,9 @@ fn no_target_remedy(args: &[String]) -> Option<&'static str> {
         | (Some("agent-task"), Some("create" | "view")) => {
             "pass -R <owner>/<repo>, or run from a checkout of it."
         }
+        (Some("repo"), Some(subcommand)) if repo_value_flags(subcommand).is_some() => {
+            "name the repository as <owner>/<repo> (gh repo view <owner>/<repo>, gh repo clone <owner>/<repo>)."
+        }
         (Some("gist" | "ssh-key" | "gpg-key" | "org" | "status"), _) => {
             "no repository routes this command, an App token cannot run it, and agent sessions have no ambient login."
         }
@@ -222,7 +225,7 @@ fn no_target_remedy(args: &[String]) -> Option<&'static str> {
             "gh api takes no -R: put the owner in the path (gh api repos/<owner>/<repo>, gh api 'orgs/<org>/repos?per_page=100' --paginate), or set GH_REPO=<owner>/<repo>."
         }
         (Some("repo"), _) => {
-            "gh repo takes no -R here: set GH_REPO and name the repository or owner (GH_REPO=<owner>/<repo> gh repo view <owner>/<repo>, GH_REPO=<owner>/<repo> gh repo list <owner>), or use gh api repos/<owner>/<repo>, gh api 'orgs/<org>/repos?per_page=100' --paginate, or git clone https://<host>/<owner>/<repo>."
+            "gh repo takes no -R here: set GH_REPO and name the owner (GH_REPO=<owner>/<repo> gh repo list <owner>), or use gh api repos/<owner>/<repo> or gh api 'orgs/<org>/repos?per_page=100' --paginate."
         }
         _ => {
             "this command takes no -R: set GH_REPO=<owner>/<repo>, and name the repository where the command takes one."
@@ -462,13 +465,8 @@ pub(crate) fn normalize_url(url: &str) -> Option<String> {
         return None;
     }
     let mut url = url.to_owned();
-    // SSH scp-form git@host:owner/repo -> https://host/owner/repo
-    if let Some(rest) = url.strip_prefix("git@")
-        && let Some((host, path)) = rest.split_once(':')
-        && !host.is_empty()
-        && !path.is_empty()
-    {
-        url = format!("https://{host}/{path}");
+    if let Some(https) = scp_url(&url) {
+        url = https;
     }
     if let Some(rest) = url.strip_prefix("ssh://git@") {
         url = format!("https://{rest}");
@@ -483,12 +481,27 @@ pub(crate) fn normalize_url(url: &str) -> Option<String> {
     Some(url)
 }
 
-/// An https URL from a gh repo spec: URL, host/owner/repo, or owner/repo (lines 59-73).
+/// An scp-form `[user@]host:owner/repo` as `https://host/owner/repo`, read the
+/// way git (and gh's clone) read it: no `://`, and no `/` before the first `:`.
+fn scp_url(url: &str) -> Option<String> {
+    if url.contains("://") {
+        return None;
+    }
+    let (user_host, path) = url.split_once(':')?;
+    let host = user_host
+        .rsplit_once('@')
+        .map_or(user_host, |(_, host)| host);
+    (!host.is_empty() && !user_host.contains('/') && !path.is_empty())
+        .then(|| format!("https://{host}/{path}"))
+}
+
+/// An https URL from a gh repo spec: URL, scp-form `[user@]host:owner/repo`,
+/// host/owner/repo, or owner/repo (lines 59-73).
 pub(crate) fn url_from_spec(spec: &str) -> Option<String> {
     if spec.is_empty() {
         return None;
     }
-    if spec.contains("://") {
+    if spec.contains("://") || scp_url(spec).is_some() {
         return normalize_url(spec);
     }
     let slashes = spec.matches('/').count();
@@ -813,14 +826,137 @@ fn is_owner_shaped(value: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
-/// The repository a command targets when its arguments carry no `-R`: gh's own
-/// `GH_REPO` override, applied whenever it is set and `-R` is absent, inside a
+/// The repository a command targets when its arguments name none (no `-R`, no
+/// `gh repo` repository positional): gh's own `GH_REPO` override, inside a
 /// checkout or not (shim parity has no equivalent; the shim predates scripts
 /// that target by environment).
 fn gh_repo_environment() -> Option<String> {
     std::env::var("GH_REPO")
         .ok()
         .filter(|spec| !spec.is_empty())
+}
+
+/// The flags that take a value in each `gh repo` subcommand whose first
+/// positional is the repository it acts on (gh 2.98 `--help`, the hidden
+/// `garden` and `credits` included), or None for the other subcommands:
+/// `rename`'s positional is the new name and `list`'s an owner.
+fn repo_value_flags(subcommand: &str) -> Option<&'static [&'static str]> {
+    Some(match subcommand {
+        "view" => &["-b", "--branch", "-q", "--jq", "--json", "-t", "--template"],
+        "clone" => &["-u", "--upstream-remote-name"],
+        "fork" => &["--fork-name", "--org", "--remote-name"],
+        "edit" => &[
+            "--add-topic",
+            "--default-branch",
+            "-d",
+            "--description",
+            "-h",
+            "--homepage",
+            "--remove-topic",
+            "--squash-merge-commit-message",
+            "--visibility",
+        ],
+        "sync" => &["-b", "--branch", "-s", "--source"],
+        "delete" | "archive" | "unarchive" | "set-default" | "garden" | "credits" => &[],
+        _ => return None,
+    })
+}
+
+/// A `gh repo view|clone|fork|…` call: one of the subcommands whose first
+/// positional is the repository it acts on. gh rejects `-R` on all of them, so
+/// a `-R` or `--repo=` word there is some flag's value and never the target.
+struct RepoSubcommand<'a> {
+    /// The subcommand's index in the arguments.
+    at: usize,
+    name: &'a str,
+    value_flags: &'static [&'static str],
+}
+
+/// The `gh repo` subcommand this call is, when it is one that takes a
+/// repository positional.
+fn repo_subcommand(args: &[String]) -> Option<RepoSubcommand<'_>> {
+    let mut words = before_terminator(args)
+        .iter()
+        .enumerate()
+        .filter(|(_, argument)| !argument.starts_with('-'));
+    if words.next().map(|(_, word)| word.as_str()) != Some("repo") {
+        return None;
+    }
+    let (at, name) = words.next()?;
+    Some(RepoSubcommand {
+        at,
+        name,
+        value_flags: repo_value_flags(name)?,
+    })
+}
+
+/// The target a [`RepoSubcommand`] call names, if any: its first positional,
+/// the repository gh acts on whatever the checkout or `GH_REPO` says. gh reads
+/// the first word after `--` as that positional too (`gh repo view --
+/// acme/widgets`). A bare name is a repository of the caller's own account,
+/// whose owner knives cannot know, so only a spec with an owner counts.
+/// `gh repo fork --org ORG` creates the fork in ORG, so ORG is its target, by
+/// owner alone as a `gh api` path owner is.
+fn repo_subcommand_target(args: &[String], subcommand: &RepoSubcommand<'_>) -> Option<String> {
+    let mut positional = None;
+    let mut org = None;
+    let mut rest = args.iter().skip(subcommand.at + 1);
+    while let Some(argument) = rest.next() {
+        if argument == "--" {
+            positional = positional.or_else(|| rest.next());
+            break;
+        }
+        if subcommand.name == "fork" {
+            // pflag keeps the last value of a repeated string flag.
+            if argument == "--org" {
+                org = rest.next().map(String::as_str);
+                continue;
+            }
+            if let Some(value) = argument.strip_prefix("--org=") {
+                org = Some(value);
+                continue;
+            }
+        }
+        if leaves_value_to_next(subcommand.value_flags, argument) {
+            rest.next();
+        } else if !argument.starts_with('-') {
+            positional = positional.or(Some(argument));
+        }
+    }
+    if let Some(org) = org.filter(|org| is_owner_shaped(org)) {
+        return Some(format!("{org}/gh-api"));
+    }
+    positional.filter(|spec| spec.contains('/')).cloned()
+}
+
+/// Whether `argument` takes the next argument as its value: one of
+/// `value_flags` written alone, or a cluster of short flags (`-wb main`) whose
+/// first value-taking letter is its last. A value letter inside the cluster
+/// takes the rest of it as its value (`-bmain`), as pflag reads it.
+fn leaves_value_to_next(value_flags: &[&str], argument: &str) -> bool {
+    if value_flags.contains(&argument) {
+        return true;
+    }
+    let Some(letters) = argument
+        .strip_prefix('-')
+        .filter(|letters| !letters.starts_with('-'))
+    else {
+        return false;
+    };
+    letters
+        .char_indices()
+        .map(|(index, letter)| {
+            (
+                index + letter.len_utf8(),
+                &letters[index..index + letter.len_utf8()],
+            )
+        })
+        .find(|(_, letter)| {
+            value_flags
+                .iter()
+                .any(|flag| flag.strip_prefix('-') == Some(*letter))
+        })
+        .is_some_and(|(end, _)| end == letters.len())
 }
 
 /// The value of the first explicit repository flag (shim lines 137-150).
@@ -854,8 +990,9 @@ pub(crate) fn repo_flag(args: &[String]) -> Option<String> {
 ///
 /// Errs when routing needs git and the invocation sits inside a checkout whose
 /// git cannot be read — a broken worktree registration, say. Arguments that
-/// name the target themselves (`-R`, `GH_REPO`, a `gh api` owner) read no git
-/// and still resolve. The caller reports git's own words and stops: resolving
+/// name the target themselves (`-R`, a `gh repo` repository positional,
+/// `GH_REPO`, a `gh api` owner) read no git and still resolve. The caller
+/// reports git's own words and stops: resolving
 /// such a checkout to "no target" would run gh on ambient auth, which an agent
 /// session does not have, so the agent would see gh's login error instead of
 /// git's.
@@ -864,7 +1001,12 @@ pub(crate) fn resolve_target_url(
     cwd: &Path,
 ) -> Result<Option<String>, crate::bind::BindError> {
     let api_owner = owner_from_api_args(args);
-    let repo_spec = repo_flag(args).or_else(gh_repo_environment);
+    let repo_spec = repo_subcommand(args)
+        .map_or_else(
+            || repo_flag(args),
+            |subcommand| repo_subcommand_target(args, &subcommand),
+        )
+        .or_else(gh_repo_environment);
     let needs_git_inputs = api_owner.is_none() && repo_spec.is_none();
     let resolved_remote = needs_git_inputs.then(|| gh_resolved_remote(cwd)).flatten();
     let registry = needs_git_inputs
@@ -1154,6 +1296,19 @@ mod tests {
             url_from_spec(&format!("https://{host}/acme/work.git")).unwrap(),
             format!("https://{host}/acme/work.git")
         );
+        // So does an scp-form remote with any user or none, which gh's clone takes
+        // as a repository argument.
+        for spec in [
+            format!("git@{host}:acme/work.git"),
+            format!("alice@{host}:acme/work"),
+            format!("{host}:acme/work"),
+        ] {
+            assert_eq!(
+                url_from_spec(&spec).unwrap(),
+                format!("https://{host}/acme/work.git"),
+                "{spec}"
+            );
+        }
         assert_eq!(url_from_spec(""), None);
     }
 
