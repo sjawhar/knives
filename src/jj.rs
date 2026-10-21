@@ -25,6 +25,7 @@ use jj_lib::settings::UserSettings;
 use jj_lib::transaction::Transaction;
 use jj_lib::working_copy::WorkingCopy as _;
 use jj_lib::workspace::Workspace;
+use jj_lib::workspace_store::{SimpleWorkspaceStore, WorkspaceStore as _, WorkspaceStoreError};
 use thiserror::Error;
 
 use crate::detect::landed::RebaseOutcome;
@@ -1392,7 +1393,10 @@ fn remove_stale_worktree(
         std::fs::symlink_metadata(destination),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound
     );
-    if (prunable || locked) && !vanished && !destination.is_dir() {
+    // A registration whose path holds something other than a directory has no
+    // working tree there, whether or not this git calls it prunable (older ones
+    // look at the path itself, which a dangling link occupies).
+    if !vanished && !destination.is_dir() {
         return Ok(StaleRegistration::Occupied);
     }
     let shown = path(destination);
@@ -2983,32 +2987,58 @@ pub fn forget_workspace(repo: &Path, name: &str) -> Result<(), JjError> {
 }
 
 /// Where jj recorded workspace `name` of `repo`, or `None` when that is
-/// `destination` itself (compared through symbolic links above it).
+/// `destination` itself.
+///
+/// Paths compare through symbolic links above them. Errs when jj recorded no
+/// path for the name (a workspace made before jj recorded them).
 ///
 /// A workspace name is the repository's, not a path's: a same-named workspace
 /// can live elsewhere (an old `workspaces` root, one added by hand), and
 /// forgetting the name for a vanished directory at `destination` would take
-/// that live one over. `jj workspace root --name` prints the recorded path
-/// even when its directory is gone.
+/// that live one over. Read from the repository's workspace store in process:
+/// jj stores the path relative to `.jj/repo`, and the `jj workspace root` of
+/// the pinned jj refuses to answer once that directory is gone.
 pub fn workspace_recorded_elsewhere(
     repo: &Path,
     name: &str,
     destination: &Path,
 ) -> Result<Option<PathBuf>, JjError> {
-    let recorded = command(
-        "jj",
-        [
-            "--repository",
-            &path(repo),
-            "--ignore-working-copy",
-            "workspace",
-            "root",
-            "--name",
-            name,
-        ],
-    )?;
-    let recorded = PathBuf::from(recorded.trim_end_matches('\n'));
+    let repo_dir = repo.join(".jj/repo");
+    let no_record = || JjError::Open {
+        path: repo_dir.display().to_string(),
+        detail: format!("Workspace has no recorded path: {name}"),
+    };
+    // Loading a store that does not exist creates an empty one; this only reads.
+    if !repo_dir.join("workspace_store").join("index").is_file() {
+        return Err(no_record());
+    }
+    let store_error = |error: WorkspaceStoreError| JjError::Open {
+        path: repo_dir.display().to_string(),
+        detail: error.to_string(),
+    };
+    let recorded = SimpleWorkspaceStore::load(&repo_dir)
+        .map_err(store_error)?
+        .get_workspace_path(jj_lib::ref_name::WorkspaceName::new(name))
+        .map_err(store_error)?
+        .ok_or_else(no_record)?;
+    let recorded = lexically_normal(&repo_dir.join(recorded));
     Ok((comparable_path(&recorded) != comparable_path(destination)).then_some(recorded))
+}
+
+/// `path` with `.` and `..` components resolved as written, without touching
+/// the file system: the directory a recorded path names may be gone.
+fn lexically_normal(path: &Path) -> PathBuf {
+    let mut normal = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normal.pop();
+            }
+            other => normal.push(other),
+        }
+    }
+    normal
 }
 
 /// Run a command with a revision checked out, and return its output.

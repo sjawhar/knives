@@ -919,7 +919,11 @@ fn finishing_a_workspace_replaced_by_a_dangling_symlink_says_its_registration_st
             workspace.display(),
             nowhere.display()
         );
-        assert!(stdout.contains(&expected), "lock={lock}: {stdout}");
+        assert!(
+            stdout.contains(&expected),
+            "lock={lock}: {stdout}\n{}",
+            git_worktrees(&lab.work)
+        );
         assert!(
             git_worktrees(&lab.work).contains(&registered),
             "lock={lock}: the registration was removed"

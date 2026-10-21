@@ -654,7 +654,16 @@ fn start_keeps_a_locked_git_registration_whose_directory_is_gone() {
 fn assert_the_printed_rebuild_recreates_a_vanished_workspace(lock: bool) {
     let lab = Lab::new();
     let (home, _consumer) = release_test_home(&lab);
-    let started = knives_start(&lab, &home, "feat/alpha");
+    // One named owner throughout, so the second start resumes its own claim
+    // wherever the suite runs (an anonymous identity never matches itself).
+    let start = |extra: &[&str]| {
+        start_command(&lab, &home, "feat/alpha")
+            .args(extra)
+            .env("KNIVES_OWNER", "ses_fff688")
+            .output()
+            .expect("run knives start")
+    };
+    let started = start(&[]);
     assert!(
         started.status.success(),
         "{}",
@@ -681,19 +690,20 @@ fn assert_the_printed_rebuild_recreates_a_vanished_workspace(lock: bool) {
     std::fs::remove_dir_all(&workspace).expect("remove the workspace directory by hand");
 
     // Given: the resumed start names the rebuild
-    let resumed = knives_start(&lab, &home, "feat/alpha");
+    let resumed = start(&[]);
     let stdout = String::from_utf8_lossy(&resumed.stdout);
-    assert!(resumed.status.success(), "{stdout}");
+    assert!(
+        resumed.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&resumed.stderr)
+    );
     assert!(
         stdout.contains("`knives start feat/alpha --force --why \"…\"` rebuilds it"),
         "{stdout}"
     );
 
     // When: it is run
-    let rebuilt = start_command(&lab, &home, "feat/alpha")
-        .arg("--force")
-        .output()
-        .expect("run the rebuild");
+    let rebuilt = start(&["--force"]);
 
     // Then: the workspace is back at its path
     let stdout = String::from_utf8_lossy(&rebuilt.stdout);
