@@ -1,109 +1,68 @@
 # Read-only reports
 
-Read this when running `repos`, `consumers`, `pushed`, `audit` or `pr`, or when
-consuming their machine output. These commands report facts, not remedies. The
-`knives ledger sweep` and `knives ledger migrate` reports are in the
-[ledger reference](ledger.md).
+For `repos`, `consumers`, `pushed`, `audit`, `pr` and their machine output. They report facts, not remedies. `ledger sweep` and `ledger migrate` are in [ledger](ledger.md).
 
 ## `knives repos`
 
-Lists every managed entry: where its checkout was found on this machine, its
-newest release and, for recorded consumer slugs, whether consumer trunks are
-pinned behind the newest cut. An unplaced entry reads `not on this machine`, has
-`path: null` and no release state. An ambiguous entry reads `ambiguous: 2
-checkouts` with a problem naming both paths. An entry found only under an
-upstream remote that disagrees with `repos.toml` reads `upstream disagrees with
-repos.toml`, has `path: null`, and carries a problem naming the checkout, both
-spellings and the fix; it makes the command incomplete, exit `3`.
+Lists every entry: where its checkout is on this machine, its newest release, and whether recorded consumer trunks pin behind the newest cut.
 
-An unreadable candidate checkout appears as a `?` problem while an entry remains
-unplaced, because it could be that entry's checkout. Once every entry is placed,
-that candidate problem is dropped. An ambiguous entry or `?` line makes the
-command incomplete, exit `3`. For scan boundaries and sweep behavior, see
-[configuration](configuration.md).
+| Row | Shape | Exit |
+|---|---|---|
+| unplaced | `not on this machine`, `path: null`, no release state | — |
+| ambiguous | `ambiguous: 2 checkouts`, with a problem that names both paths | `3` |
+| upstream disagrees | `upstream disagrees with repos.toml`, `path: null`, with a problem that names the checkout, both spellings and the remedy | `3` |
+| unreadable candidate | a `?` problem while an entry is unplaced, dropped when all are placed | `3` |
 
-Registered consumers are read by forge slug at their repository trunk, cached by
-commit. Forge failure leaves cache-backed pins explicitly labeled and the result
-incomplete. `repos` reads registered slugs only; ad-hoc `--consumer PATH` scans
-belong to `consumers` and `release` and never persist the path. Under a fixed
-release scheme, a branch-name pin without a locked commit is current by definition;
-a locked commit is behind when it is an ancestor of the branch tip.
-
-TOON and JSON share this document shape (`?` marks an optional field):
+- Consumers are read by forge slug at their trunk, cached by commit. A forge failure labels cache-backed pins, and the result is incomplete.
+- `repos` reads only registered slugs. `--consumer PATH` belongs to `consumers` and `release`, and knives never saves the path.
+- Under a fixed release scheme, a branch-name pin with no locked commit is current. A locked commit is behind when it is an ancestor of the branch tip.
+- Scan rules: [configuration](configuration.md).
 
 ```text
 {repos: [{name, upstream_name, ledger?, path, release_remote?, newest_release?,
           behind?, notes?, problems?}], notes?, problems?, config_path}
 ```
 
-`name` is the registry key, what you type. `upstream_name` is what the fork's
-ledger, claims and state are kept under: its upstream's lowercase
-`<owner>/<name>`, or the registry key when the upstream is a filesystem path.
-A claim's `repo` in `state.json` is an `upstream_name`, so to find the checkout
-for a claim, match the claim's `repo` against `upstream_name`, never `name`.
-Every row carries it, placed or not. `ledger` is the repository the fork's
-ledger is shared through (`ledger` in `repos.toml`), lowercase and without a
-`.git` suffix however the registry spells it, so two rows naming one
-repository carry one value; it is absent for a fork whose ledger is not shared.
-`repos` reads only the registry and the checkouts, never the ledger or the
-state file, so it answers before `knives ledger migrate` has run.
+- `name` is the registry key that you type.
+- `upstream_name` is where the fork's ledger, claims and state are kept: the lowercase upstream `<owner>/<name>`, or the key when upstream is a path. Every row has it.
+- A claim `repo` in `state.json` is an `upstream_name`. To find the checkout of a claim, match it against `upstream_name`, never `name`.
+- `ledger` is the shared ledger repository, lowercase, with no `.git`. It is absent when the ledger is not shared.
+- `repos` reads only the registry and checkouts, never the ledger or state file. Thus it works before `knives ledger migrate`.
 
 ## `knives consumers [FORK] [--consumer PATH]...`
 
-Checks every registered forge consumer plus repeatable ad-hoc local scans against
-the newest release on the **live publish remote**. It compares the local release
-view with that remote and reports differences without editing consumers.
+Checks registered forge consumers and ad-hoc local scans against the newest release on the **live publish remote**. It reports where the local view differs, and never edits a consumer.
 
-- Unavailable forge, including cache-backed results: incomplete.
+- Forge unavailable, also with cache-backed results: incomplete.
 - Missing local path: an unanswered problem.
-- Reachable consumer that does not pin this fork: a note.
-- Stale frozen locks, older/unknown release names and disagreement among
-  consumers: reported pin state.
-- A pin outside the release scheme, such as a consumer's own tag or branch:
-  `off-scheme`, a fact, not “does not pin” and not a finding.
+- A reachable consumer that does not pin this fork: a note.
+- Frozen locks, older or unknown names, and consumers that disagree: pin state.
+- A pin outside the release scheme (its own tag or branch): `off-scheme`. This is a fact. It is not "does not pin", and not a finding.
 
 ## `knives pushed [BRANCH]... [--repo REPO]`
 
-Compares local bookmark tips with live owning refs, not stale tracking refs.
-Release names use the publish remote; ordinary branches and PR heads use only
-origin. A matching feature name on release or a release name on origin does not
-substitute for its owning remote. Without a separate publish remote, the release
-role reads origin.
+Compares local tips with live owning refs, not tracking refs. Release names use the publish remote (origin when there is no separate one). Branches and PR heads use only origin. A name on the other remote does not count.
 
-Named refs are checked even without local bookmarks, exposing remote-only
-branches after a silent local deletion. With no names, the local bookmarks form
-the requested set. The report is `{repo, rows, problems?}`; each row is
-`{branch, local?, verdicts}`. Verdicts are:
+Named refs are checked even with no local bookmark, which shows remote-only branches after a silent local removal. With no names, all local bookmarks are checked. The report is `{repo, rows, problems?}`, and a row is `{branch, local?, verdicts}`.
 
-| Verdict | Observed comparison |
-|---|---|
-| `in-sync` | Local and live owning tip match. |
-| `not-on-remote` | Local exists; its owning remote has no ref. |
-| `differs` | Both exist at different commits; includes `remote_commit`. |
-| `remote-only` | No local bookmark; owning remote has it. |
-| `gone-everywhere` | Neither local nor owning remote has it. |
-| `pull-head-differs` | A tracked origin pull head differs from the local tip. |
+| Verdict | Meaning | Finding |
+|---|---|---|
+| `in-sync` | Local and owning tip match. | no |
+| `not-on-remote` | Local exists. The owning remote has no ref. | yes |
+| `differs` | Different commits. Includes `remote_commit`. | yes |
+| `remote-only` | No local bookmark. The owning remote has it. | yes |
+| `gone-everywhere` | Neither has it. | no |
+| `pull-head-differs` | A tracked origin pull head differs from the local tip. | yes |
 
-Missing, different, remote-only and differing tracked pull heads are findings.
-`gone-everywhere` is not a finding. An unreadable live remote is incomplete,
-not observed absence. Nothing repairs refs or pushes.
+An unreadable remote is incomplete, not absence. Nothing changes refs or pushes.
 
 ## `knives audit [REPO] [--all] [--no-github]`
 
-Read-only reconciliation of remote drift, open pull heads, zombie remote
-branches, release-cut evidence and anonymous heads. `--all` applies it to every
-locatable managed repository; see [scan coverage](configuration.md).
+A read-only check of remote drift, open pull heads, zombie remote branches, release-cut evidence and anonymous heads. `--all` checks every locatable repository ([scan](configuration.md)).
 
-Each local bookmark that is neither trunk nor a release name and has one target
-gets a `branches` fact row. A divergent branch gets no row, but a problem:
-`bookmark <name> is divergent (<n> targets); no row`. A divergent release-name
-bookmark gets `release <name> is divergent (<n> targets)`; recorded-cut drift is
-unread until resolved. Either is exit `3`. A divergent trunk belongs to status's
-`divergence` finding, not audit's.
-
-The report includes the upstream trunk's PR template once:
-`template: {file, headings}`. It is `null` when there is no template or no forge
-was asked. A branch row has this shape:
+- Each local bookmark with one target that is not trunk or a release name has a `branches` row.
+- A divergent branch has no row, but the problem `bookmark <name> is divergent (<n> targets); no row`. A divergent release name has `release <name> is divergent (<n> targets)`, and cut drift stays unread until it is resolved. Both exit `3`. A divergent trunk is the `divergence` finding of status.
+- `template: {file, headings}` appears once: the PR template of upstream trunk. It is `null` with no template or no forge.
 
 ```jsonc
 {
@@ -137,55 +96,28 @@ was asked. A branch row has this shape:
 }
 ```
 
-### Interpret missing, null and observed values field by field
+### Missing, null and observed values
 
-- `tip` is the local bookmark's commit. `origin_tip` is the live origin tip;
-  it and `tip_matches_origin` are `null` when origin has no branch ref. That is
-  observed ref absence, with no tip comparison possible, not a failed forge read.
-- `fork_only` is the explicit `track --fork-only` statement.
-- `pull` is absent when no **open** PR was answered for the branch. Absence does
-  not by itself prove no PR exists: the forge might have been skipped, the pull
-  might be settled, or a lookup might be unanswered. Read the problems and scope.
-- `head` is the PR's head commit; `head_matches_tip` compares it with local tip.
-- `mergeable` and `merge_state_status` are the forge's words. `null` means it has
-  not computed them; `UNKNOWN` is not an affirmative mergeability observation.
-- `review_decision: null` means the forge reports no decision, not approval.
-- `checks.total` counts reported head checks, `pending` those with no conclusion,
-  and `conclusions` groups upper-case forge conclusions. `ACTION_REQUIRED` means
-  a workflow is held for maintainer approval; that workflow ran nothing.
-  `total: 0` means no check runs, not passing checks. `checks: null` means the
-  forge answered a pull without its checks field; the GitHub forge does not do so.
-- `unresolved_review_threads: 0` is an observed zero. `null` means the forge did
-  not answer **or its thread list exceeded one page**; GitHub reads the first
-  100 and leaves the count unanswered if another page exists. This alone does
-  not fail the batch, so exit `0` does not turn that unknown into zero.
-- `template_missing` lists template headings absent from the PR body, matched
-  case-insensitively. HTML comments and fenced blocks contribute no headings.
-  An empty list means none missing; `null` means no trunk template or unanswered
-  body, not a checked complete body.
-- `forbidden` lists added diff lines containing configured forbidden terms as
-  case-insensitive substrings. Empty means no hits in a performed scan. Absent
-  means no terms configured, fork-only exemption, or an unreadable diff; the last
-  has a problem naming the branch. It is not interchangeable with empty.
+| Field | Read it as |
+|---|---|
+| `tip` | The local bookmark's commit. |
+| `origin_tip`, `tip_matches_origin` `null` | Origin has no branch ref. This is observed absence, not a failed read. |
+| `fork_only` | The `track --fork-only` statement. |
+| `pull` absent | No **open** PR answered. This does not prove that no PR exists: the forge was skipped, the PR settled, or a lookup got no answer. Read the problems. |
+| `head` | The PR's head commit. |
+| `head_matches_tip` | The PR head compared with the local tip. |
+| `mergeable`, `merge_state_status` `null` | The forge has not computed them. `UNKNOWN` is not a mergeability observation. |
+| `review_decision: null` | No decision. Not approval. |
+| `checks` | `total` counts head checks, `pending` those without a conclusion, `conclusions` groups forge words. `ACTION_REQUIRED` is held for maintainer approval and ran nothing. `total: 0` means no checks ran, not passing. `null` is a pull answered without checks, which GitHub never does. |
+| `unresolved_review_threads` | `0` is an observed zero. `null` means no answer **or more than one page** (GitHub reads 100). It does not fail the batch, so exit `0` does not make it zero. |
+| `template_missing` | Template headings absent from the PR body, in any case. HTML comments and fenced blocks add no headings. `[]` means none missing. `null` means no template or no body answer. |
+| `forbidden` | `[]` means the scan ran with no hits. Absent means no terms, fork-only, or an unreadable diff (that last one has a problem). Never read absent as empty. |
 
-The forbidden scan measures only additions from
-`fork_point(<trunk>@upstream | <branch>)` to the branch. With no shared history,
-the root is the fork point and the whole tree counts as added. An unresolved
-upstream trunk produces one problem and omits every row's `forbidden` field.
-
-Rows are observations and never move the exit code. Findings and problems do;
-an unreadable diff or template is a problem and exit `3`. `--no-github` leaves
-all pulls absent, template null, and adds the problem
-`open pull-head reconciliation was skipped (--no-github)`.
-
-Text renders a `branches:` block: branch, short tip, origin `same`/`differs`/
-`absent`, optional fork-only, PR state and head comparison, check totals and
-conclusions, unresolved threads, missing headings and forbidden hits.
-A `-` is a display placeholder, not an observed zero. Use JSON/TOON for fields.
+- The forbidden scan reads only additions from `fork_point(<trunk>@upstream | <branch>)`. With no shared history, the root is the fork point and the whole tree counts. An unresolved upstream trunk gives one problem and drops every `forbidden` field.
+- Rows never move the exit. Findings and problems do. An unreadable diff or template is a problem, exit `3`.
+- `--no-github` gives no pulls, `template: null`, and the problem `open pull-head reconciliation was skipped (--no-github)`.
+- Text has a `branches:` block. A `-` there is a placeholder, not zero. Use JSON or TOON for fields.
 
 ## `knives pr NUMBER [--repo REPO] [--timeline]`
 
-Reads one PR's current state. `--timeline` adds a separate, on-demand bounded
-forge event-log read: force pushes with before/after commit and tree ids,
-deletion/restoration, closure/reopening and merge events. This is history for
-that PR, not an audit repair path.
+The current state of one PR. `--timeline` adds a bounded forge event log: force pushes with commit and tree ids, delete and restore, close and reopen, merge. This is history, not a way to change refs.

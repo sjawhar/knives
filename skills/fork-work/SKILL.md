@@ -1,231 +1,111 @@
 ---
 name: fork-work
-description: Check knives before working in a repository we maintain a fork of, and red-team placement before starting a branch there. Make sure to use this skill whenever you are about to start a new branch (`knives start`) in such a repository, or to change, fix, implement, refactor or test anything in it, and equally when you are only reading or investigating one — tracing how it works, finding where something is implemented, reviewing its history. Also use it before cloning or re-cloning one of these projects or making any scratch or temporary checkout of it, and when asked which branch to use, whether another agent is working somewhere, or how to get a working copy. These repositories are shared with other agents and coordinated by the knives CLI, so improvising a checkout costs real work; consult this first even when the request sounds like ordinary coding or plain code reading.
+description: Use when you are about to work in, read or investigate a repository that can be a fork managed by knives. Use it before `knives start`, before any change, fix, refactor or test there, and before you clone, re-clone or make a scratch checkout of one. Use it when asked which branch to use, whether another agent works somewhere, or how to get a working copy. This applies even to ordinary coding or code reading.
 ---
 
-# About to work in a fork
+# Working in a managed fork
 
-> **Where a change lives comes before whether it goes upstream.** A managed fork is a product the consumer repository uses; the consumer repository is where its own deployment's operating policy lives — lifetimes and reaping of jobs, caps, quotas, schedules, alerting, node sizing, who-may-do-what defaults. The default home for anything policy-shaped is the consumer's own infrastructure (its own scheduled jobs and janitors, a config value the library already exposes); a fork member is for a defect in the library's own machinery or a capability nothing outside the library can provide (a missing field, an endpoint), which is also what makes it upstream-bound. The test, applied by the author here and again by the release owner at include time: *if the fork were replaced by upstream main tomorrow, would anyone but us miss this?* No means it belongs in the consumer. When the fork genuinely looks like the right home for something policy-shaped, that is itself a missing library capability, not a standing exception: the question to the owner is what belongs upstream and how the fork carries it there meanwhile, never whether the fork can keep it without going upstream. The case that made this a rule: a fixed creation-time lifetime cap on every job, built into the fork's own janitor as a fork member from a duration study and pinned into production with a PR body that named neither the number nor that only one deployment carried it; the same behavior was a scheduled job in the consumer's own cluster against the library's API. There is one question, not two: this callout asks *fork or consumer*; the callout below asks when a fork member's upstream PR opens, never whether one does — a fork member that never goes upstream is not an option (see the ruling below). The reflex both guard against: fixing at the point of mechanism (the janitor code lives in the fork, so the cap went in the fork) instead of the point of ownership (the policy is the consumer's).
+## 1. Find out if it is a managed fork
 
-> **Upstream PRs are a placement judgment, not a permission.** Before opening one, write down whether the fork member is upstream material: a defect any user of the library would hit, fixed with evidence (a reproduction or red→green test), is upstream material; a knob the library already exposes or a change only we want was never fork work at all — that is CONSUMER, no branch — and an unproven fix needs the evidence before it counts, not a standing exemption from going upstream. That answer is recorded in the `placement:` notch and the PR body — nobody is asked and no approval is awaited (Sami, 2026-09-16: "I didn't ask to be in the loop for every upstream interaction"). The default for every fix is a fork member, and using it takes exactly as long as making it (single signed commit on the release's shared base → pushed to the fork remote → `knives notch` → tip + red→green evidence handed to whoever holds the release claim, who includes it in the release in hand (cutting the next dated name first, right then, when every consumer pin of that release is frozen on a revision, as agent-c's `rev = "release/…"` pins are) and publishes; no claim held, you do the same yourself → the consumer pins the published name and deploys, the same line of work). The upstream PR, when the verdict is UPSTREAM, opens alongside and gates none of that (Sami, 2026-09-25: "The time it takes to start using a fork change is exactly equal to the time it takes to make it. There is no extra overhead"). Once an upstream PR is open, its lifecycle — review rounds, body edits, rebases, the close — is the owning session's own work, never parked on a human.
+Do this before you read code too: a conclusion from the wrong copy is wrong, and nothing tells you.
 
-## Stop and find out where you are
+- Run `knives repos`. Listed (the repository you are in, or will clone): a managed fork. Other agents share it, it has an upstream, and a working copy exists. Not listed: this skill does not apply.
+- `not on this machine` is a scan miss, not proof of absence. The scan covers `~` three levels deep, only jj checkouts, and skips dot-directories and symlinks. Before you clone, look deeper or elsewhere: `cd` into a possible checkout and run `knives status`. Every command except `knives repos` binds the checkout you stand in.
+- A row that names two checkouts is a refusal. Do not choose between them. Ask.
+- Must be managed but not registered: run `knives register` in it, and give the snippet to the human to paste into `repos.toml`. Never edit `repos.toml`. `already registered as <name>` means the list has it under that name.
 
-Reading counts, not just writing. Investigating how one of these projects works is the
-moment you most want to know that a fork exists, that it carries changes upstream does not
-have, and that another agent may be mid-change in it — because conclusions drawn from the
-wrong copy are wrong quietly.
+## 2. Read the status and the notches
 
-```
-knives repos
-```
+- Run `knives status` in the repository, with no argument. It shows each branch, its PR and PR state, whether it is in the upstream trunk, and the claims of other agents. It shows facts. The judgment is yours.
+- Read the claims before you touch anything. Another agent holds your branch: that is a collision. Find it now, not after one of you loses work.
+- `knives notch` shows recent claims, stated PRs, dependencies, releases and notes. Before you touch a branch you do not understand, run `knives notch <branch>`. The reason for an odd branch is usually one line there.
+- Each entry carries the branch tip of its time. An entry at a commit that the branch moved past is a reason to check again, not a conclusion.
+- The workflow that wrote a note's prefixes defines them. A note that says it is open is open.
+- Record a decision worth keeping before you continue: superseded, parked by the owner, a promise to a reviewer, a PR moved to another branch. Cite a commit or `file:line`, because claims without one were the false ones:
+  `knives notch <branch> -m "what you decided and why" --evidence <commit-or-ref>`
 
-If the repository you are in, or the one you were about to clone, is in that list, it is
-a managed fork. It is shared with other agents, it has an upstream you may be
-contributing to, and there is already a right way to get a working copy of it.
+## 3. Challenge the placement before `knives start`
 
-A row reading `not on this machine` is a scan miss, not proof of absence: the scan of `~`
-found no checkout here (three levels deep, jj checkouts only, dot-directories and symlinks
-skipped). Check deeper or elsewhere before cloning — every command except `knives repos`
-binds a checkout as soon as you stand inside it, wherever it is, so `cd` into the suspected
-directory and run `knives status`. A row naming two checkouts is a refusal: knives will not
-choose between them, and neither should you without asking.
+**Ownership test.** The author applies it here. The release owner applies it again at include time. *If the fork were replaced by upstream main tomorrow, would anyone but us miss this?* No: it belongs in the consumer.
 
-If it is not in that list, this skill does not apply — carry on normally. If a repository should be managed but is unregistered, run `knives register` inside it and hand the snippet to the human to paste into `repos.toml`; `already registered as <name>` means it is in the list under that name. Do not edit `repos.toml` yourself.
+- The consumer owns its deployment's operating policy: job lifetimes and reaping, caps, quotas, schedules, alerting, node sizing, who-may-do-what defaults. Put policy in its infrastructure: its scheduled jobs and janitors, or a config value the library already exposes.
+- A fork member is for a defect in the library's own machinery. It is also for a capability nothing outside the library can give: a missing field, an endpoint, a knob that keeps upstream's default. That makes it upstream-bound.
+- Fix where the policy has its owner, not where the mechanism is. Code in the fork does not put its policy in the fork.
+- The fork looks like the right home for policy: that is a missing library capability. Ask the owner what goes upstream and how the fork carries it until then, never whether the fork can keep it without upstream.
 
-## Then find out what is going on in it
+**Challenge.** Before you make a branch, dispatch a fresh-context subagent. Knives records its verdict but does not judge or spawn. Brief it to argue that the change does not belong in the fork. The consumer's config, IaC or code gets the effect, or any user hits the defect. Give it the facts for answers 1 and 2 below. It returns one verdict with its reasoning:
 
-```
-knives status
-```
+| Verdict | When | Do |
+|---|---|---|
+| CONSUMER | The consumer gets the effect, a knob the library already exposes, or a change only we want. | No branch. Make the config value, stack transformation or consumer-side job. |
+| UPSTREAM | Fork-member material (above), with the proof of answer 3. | A fork member on the release's shared base that also goes upstream (§4). |
 
-Run it from inside the repository; it needs no argument. It reports every branch, its
-pull request and that pull request's state, whether the branch is in the upstream trunk,
-and which branches other agents are holding right now. It reports facts and does not tell
-you what to do; the judgment is yours.
+- There is no third verdict. Never offer or record "fork-only", "not upstream-bound" or "a fork member that never goes upstream".
+- Read-only investigation is exempt. A green gate, a plausible patch or a peer's "go" does not establish ownership. Placement is not a question for the human.
+- Ownership not established: investigate. Never relabel an unsupported bug as "hardening". An unproven fix needs its evidence (a reproduction or a red→green test) before it counts.
+- Reuse a valid `placement:` notch. Check it again when the evidence or scope changes.
+- Record the verdict as the branch's first `placement:` notch. For a CONSUMER verdict with no branch, or a standing rule, the repository is the subject:
+  `knives notch <branch> -m "placement: verdict: CONSUMER|UPSTREAM; proposer <id>; red-teamer <id>; <four answers>" --evidence <revision-or-url>`
+  1. The observed failure or missing capability and its revision, not an inherited summary or counter.
+  2. Our config, caller or open feature branch, or upstream: chosen after you check the real launch path, installed version, options and lifecycle or recovery mechanisms.
+  3. Bug: a minimal reproduction on unmodified upstream at a cited revision, without our fork checkout or application patches. Feature: the general extension case that keeps upstream defaults.
+  4. Why upstream review, CI, rebase and maintenance are worth it.
 
-Read the claims before you touch anything. If another agent holds the branch you were
-about to work on, that is a collision, and the cost of discovering it later is their work
-or yours.
+**A member that changes runtime behavior** (anything a production operator notices):
 
-## Then read the notches
+- Its `placement:` notch **and** its commit body state why it does not live in the consumer. That is the ownership test's answer, or the owner's ruling that put it in the fork. They state the recorded decision it implements (the ruling's id or link), or that it implements none and is a defect fix with red→green evidence.
+- Build the ruling's exact words. "Idle" ruled and "from creation" built is the whole behavior, not a nuance.
+- With neither statement, the release owner calls it `neither` and does not compose it (`maintaining-fork-release` step 5).
+- The consumer's pin PR lists each production behavior change it carries, in plain numbers, and which deployments carry it, under `## Production behavior delta`. This is disclosure, not a gate.
 
-```
-knives notch
-```
+## 4. Ship the fork member, and open the upstream PR alongside
 
-What agents did and decided here lately: claims taken and handed back, pull requests
-stated, dependencies recorded, releases cut, and whatever anyone thought worth writing
-down. Before you touch a branch you do not understand, ask about that branch:
+- An upstream PR is a placement judgment, not a permission. The UPSTREAM `placement:` notch and the PR body are the written judgment. Ask nobody. Wait for no approval.
+- The default for every fix is a fork member. To use it takes as long as to make it, in the same line of work:
+  1. Push one signed commit on the release's shared base to the fork remote. Run `knives notch`.
+  2. Give the tip and red→green evidence to the release-claim holder, who includes it in the release in hand and publishes. Every consumer pin of that release frozen on a revision (such as `rev = "release/…"`): the holder first cuts the next dated name, immediately. Nobody holds the claim: do this yourself.
+  3. The consumer pins the published name and deploys. The fork member carries the change until upstream ships it.
+- The release owner's process opens the upstream PR after the notch records the verdict, from a signed commit with an `Omp-Session` trailer. It gates nothing: not the release, the pin or the deploy. Never wait for upstream review or "the next cut".
+- The include-time ownership test checks placement. It is not a review that the fix waits in.
+- After the upstream PR opens, its review rounds, body edits, rebases and close are the owning session's work. Never park them on a human.
 
-```
-knives notch <branch>
-```
+## 5. Get your workspace with `knives start`
 
-Every entry carries the branch's tip at the time it was written. That is the part to read
-carefully: an entry saying "superseded by #1157" at a commit the branch has since moved
-past is a reason to re-check, not a conclusion to inherit. A weird branch nobody can
-explain is exactly what this answers, and the reason it exists is usually one line long.
+- `knives start <branch> --why "what you are doing"` claims the branch and makes a jj workspace. An existing branch: on its tip, with `@` an empty child. A new branch: on the release's shared base (the upstream trunk when no release exists), so it composes without a rebase.
+- A `start` that pauses waits for another agent's claim lock. Let it. A refusal names the holder. `using-knives` has the messages.
+- As soon as your active work stops, also to wait for something external such as PR review, run `knives finish <branch>`. It returns the claim and removes the workspace. Nothing is lost: jj keeps the work as a commit by change id, and the branch, bookmark and open PR stay.
 
-When you make a call worth remembering — this is superseded, the owner parked it, you
-promised a reviewer something, you re-homed a pull request onto another branch — record it
-before you move on:
+## 6. Never improvise
 
-```
-knives notch <branch> -m "what you decided and why" --evidence <commit-or-ref>
-```
+| Never | Do |
+|---|---|
+| Cut a new release name for an unpinned release | Edit the current release in place with `knives release`, and push the moved ref. A PR branch that names it is not a pin. Only a consumer's `main` is. |
+| Clone again, into `/tmp` or anywhere | Use the existing checkout. A second one's bookmarks diverge. |
+| Make a scratch or temporary checkout | `knives start`: a workspace that other agents see. |
+| Make a branch in a managed fork's default workspace | `knives start`. Another agent can be there, and your own workspace never inherits a release merge as parent. In your own projects, branch normally. |
+| Build a branch on a release merge | A PR from it asks the maintainer to review the whole fork. `knives status` and `knives preflight` show `stacked-history` only after a PR opens, so run the §7 gate at every PR state. |
+| `jj duplicate` a branch | The release cannot match its new commit ids. `knives release advance --from` is the recovery, not the plan. |
+| Keep two copies of a branch ("release-lineage", "sibling") | One branch is the release member and the PR head. It does not compose: move the release, not the branch. |
+| `jj op restore` | It also discards the operations of other agents. |
+| Push to `upstream` | Open a pull request. |
 
-Cite something. Every audit claim that survived review cited a commit or a `file:line`;
-every false one did not.
+## 7. Bidirectional gate before a raw rebase
 
-A branch's notes may carry a workflow's own prefixes; the workflow that wrote them defines
-them, and a note that says it is open is open.
+Run it before any `jj rebase -b`, `-s` or `-r` of a branch. When a release ref has ever been pushed, a raw rebase of an entangled branch is unsafe in both directions.
 
-## Red-team placement before `knives start`
+1. **Scheme check.** Get `newest_release` from `knives status` or `knives repos`, and set `RELEASE_REFS` for this repository's scheme:
+   - `release/YYYY-MM-DD[.N]` (dated, the default, no `release_branch`): `bookmarks(glob:"release/*") | remote_bookmarks(glob:"release/*")`. The glob also catches an older cut not yet reaped.
+   - Named release series (`[repos.<name>.series.<series>]`, each on its own base) cut `release/<series>/YYYY-MM-DD[.N]`. `status` and `repos` never show them: read them with `knives release --series <series>`. The dated glob above covers every series' cuts.
+   - Any other name, such as `integration` (fixed: the one `release_branch` under `[repos.<name>]` in `repos.toml`, never with the prefix `release/`): `bookmarks(exact:"<name>") | remote_bookmarks(exact:"<name>")`. The dated glob never matches it, so the dated term hides a fixed-scheme member.
+2. Run `jj log -r '(::<branch> | <branch>::) & (RELEASE_REFS | bookmarks(glob:"keep/*") | remote_bookmarks(glob:"keep/*"))'`. Use this fork's retention convention if it is not `keep/*`. Do not add `~ ::trunk()`: a release or keep ref is never an ancestor of its trunk.
+3. **Empty:** the branch is alone. Use `jj rebase -b <branch> -d <trunk>@upstream`. It keeps the change ids, so `knives release advance <branch>` follows.
+4. **Branch is a parent of the merge** (`<branch>:: & (...)` names it): it feeds a member's content into the release. Run `knives release members`. It shows only the release in hand (`src/release_carries.rs::run_release_members`), not a retained older cut (`reap_superseded` in `src/commands/release.rs`).
+   - Listed: move it only with `knives release rebase`. It rebases all members and the merge together and replays recorded conflict resolutions.
+   - Not listed: a retained release needs its exact commit, kept for local descendants or because a pin is frozen on it. The pin's name is the old `release/<date>` name until it is reaped, then a retention bookmark such as `keep/…`. `-b` and `-s` rewrite that commit and, on push, force-move the ref with no error. `-r` silently drops the branch as that release's parent. Use none of them. Get the release owner's sign-off, or wait until its last local descendant goes and `knives release reap` retires it.
+5. **Branch descends from the merge** (`::<branch> & (...)` names it): `stacked-history`.
+   - Merge ever pushed: `jj rebase -s '<release-or-keep-ref>..<branch>' -d <trunk>@upstream`. The range excludes the merge, so it moves only the branch's own commits and keeps the merge's commit id. Never `-b`: the destination does not contain the merge yet, so `-b` takes the merge as a root and rewrites that ref, retained or current.
+   - Merge never pushed anywhere: plain `-b` is harmless, because nothing outside pins the old commit.
 
-Before creating a branch in a managed fork, dispatch a fresh-context subagent whose brief is to argue that the change does **not** belong in the fork: that the consumer can get the effect from its own configuration, IaC or code (the ownership test at the top of this skill), or that it is a library defect any user would hit and so belongs upstream. Give it the observed failure or missing capability with its revision, the real launch path and installed version, and the library's existing options and recovery mechanisms; it returns one of two verdicts with its reasoning. This is a subagent you dispatch, not a knives command — knives records the verdict, it does not judge or spawn anything. There is no third verdict: "fork-only", "not upstream-bound" and "a fork member that never goes upstream" are not options to offer or record (Sami, 2026-09-19: "Why do you keep suggesting this over and over again? How many times do I have to say 'fork-only is not a real option'?!").
+## More detail
 
-- **CONSUMER** — no branch. Implement the config value, stack transformation or consumer-side job instead.
-- **UPSTREAM** — a fork member on the release's shared base that also goes upstream: a defect in the library's own machinery or a capability nothing outside the library can provide (a missing field, an endpoint, or a knob with upstream's default preserved), with a minimal reproduction on unmodified upstream at a cited revision (or, for a feature, the general extension case preserving upstream defaults). The fork member carries the change for the consumer from the moment its release is published — the consumer pins the release name and deploys in the same line of work as the fix — and until upstream ships it; its upstream PR is part of the same work — opened by the release owner's process, after the verdict is notched, from a signed commit with an Omp-Session trailer — and runs alongside: neither its opening, its review nor its merge gates the release, the consumer's pin or the deploy. There is no waiting on upstream review or on "the next cut": when the release's pins are frozen the next dated name is cut right then, by whoever holds the claim, not queued for later (Sami, 2026-09-25, after an agent quoted days for a fix because its upstream PR had to be reviewed first: "The time it takes to start using a fork change is exactly equal to the time it takes to make it. There is no extra overhead"); the release owner's include-time ownership test still applies, as a check on placement, not a review the fix waits in.
-
-Read-only investigation is exempt. A green gate, plausible patch or peer's "go" establishes no ownership. This is not a question for the human: a `placement:` notch that concludes UPSTREAM is the written judgment the callout at the top of this skill asks for, and the PR is opened on that judgment, not on anyone's go.
-
-Record the verdict as the branch's first `placement:` notch with `--evidence`, naming proposer and red-teamer (repository subject when the verdict is CONSUMER and no branch exists, or for a standing rule):
-
-```
-knives notch <branch> -m "placement: verdict: CONSUMER|UPSTREAM; proposer <id>; red-teamer <id>; <four answers>" --evidence <revision-or-url>
-```
-
-- Cite the observed failure or missing capability and revision, not an inherited summary or counter.
-- Choose our configuration, caller or open feature branch, versus upstream, after checking the real launch path, installed version, options and existing lifecycle/recovery mechanisms.
-- For a bug, give a minimal reproduction on unmodified upstream at a cited revision, without our fork checkout or application patches; for a feature, establish the general extension case preserving upstream defaults.
-- Explain why upstream review, CI, rebase and maintenance are worthwhile.
-
-A fork member that changes runtime behavior — anything a production operator would notice — states, in its `placement:` notch **and** in its commit body, why it does not live in the consumer (the ownership test's answer, or the owner's ruling that put it in the fork) and which recorded decision it implements (the ruling's id or link), or that it implements none and is a defect fix carried by red→green evidence. The implementation matches the ruling's words: the member behind the rule above cited a ruling that said warn after twelve hours idle and reclaim after twenty-four, and built a kill at twelve hours from creation with no warning — "idle" against "from creation" is not a nuance, it is the whole behavior. A member carrying neither statement is `neither` to the release owner and is not composed (`maintaining-fork-release` step 5). The consumer's pin PR then states every production behavior change the pin carries, in plain numbers, under `## Production behavior delta` — disclosure, so the reviewer sees the policy, not a gate.
-
-Ownership unestablished: investigate, never relabel unsupported bugs as "hardening". Reuse a valid `placement:` notch; recheck when evidence or scope changes.
-
-## Get your own working copy the managed way
-
-```
-knives start <branch> --why "what you are doing"
-```
-
-This claims the branch and creates a jj workspace for it: on the branch's own tip when the
-branch already exists (your `@` is an empty child of it), or on the release's shared base
-(the fetched upstream trunk when no release exists) for a new branch, so it composes into
-the release without forcing a rebase. A `start` that pauses is waiting for another agent's
-knives command to release the claim lock; let it. A refusal names the holder — the
-`using-knives` skill has the messages. As soon as your active work there stops —
-including when it now waits on something external, such as a pull request in review:
-
-```
-knives finish <branch>
-```
-
-Which hands the claim back and removes the workspace so another agent can pick the branch
-up. Nothing is lost — jj snapshots a working copy into a commit, so the work is in the
-repository and reachable by change id, and the branch, its bookmark, and any open pull
-request all survive the release.
-
-## What not to do instead
-
-These are the improvisations that cost work in a shared repository, and every one of them
-has a knives command that does the same job safely:
-
-- **Do not cut a new release name for an unpinned release.** Edit the current release in
-  place through `knives release` and push the moved release ref. A PR branch that references
-  the name is not a pin; only a consumer's `main` is.
-- **Do not clone the repository again**, into `/tmp` or anywhere else. There is already a
-  checkout, and a second one has its own bookmarks that will diverge from the first.
-- **Do not create a scratch or temporary checkout** to "just try something". Use
-  `knives start` and get a real workspace that other agents can see you are using.
-- **Do not start a branch in the default workspace of a managed fork.** Another agent may
-  be working there. `knives start` gives you your own workspace, based where the section
-  above says, so you never inherit a release merge as a parent by accident. This is about
-  these shared forks specifically; branching normally in your own projects is fine.
-- **The sanctioned moves.** A branch that needs a newer base can be entangled with a release in
-  two different, opposite directions, and a raw `jj rebase -b`/`-s`/`-r` handles neither safely
-  once that release ref has ever been pushed. First establish the release-ref term for *this*
-  repo's scheme — `knives status` (or `knives repos`) names the `newest_release`; a value
-  shaped `release/YYYY-MM-DD[.N]` means the dated scheme (the default, no `release_branch` set
-  in `repos.toml`), named release series (`[repos.<name>.series.<series>]`, each on its own base) cut
-  `release/<series>/YYYY-MM-DD[.N]`, which `status` and `repos` never show: read them with
-  `knives release --series <series>` (the dated glob below covers every series' cuts), and any other
-  exact name (for example `integration`) *is* the fixed
-  scheme's one release branch, configured as that repo's `repos.toml` `[repos.<name>]
-  release_branch = "<name>"` and never present under a second concurrent or differently-named
-  instance — a fixed name cannot start with `release/` (the config loader refuses that), so the
-  dated glob below never matches it, which is exactly how a fixed-scheme member goes undetected
-  if you use the dated term unconditionally. Build `RELEASE_REFS` accordingly: dated —
-  `bookmarks(glob:"release/*") | remote_bookmarks(glob:"release/*")` (the glob, not just the
-  named newest release, so a not-yet-reaped older dated cut is still caught); fixed —
-  `bookmarks(exact:"<name>") | remote_bookmarks(exact:"<name>")` naming the one configured
-  branch (no glob needed: a fixed release never has a second, differently-named instance to
-  also catch). Then run the bidirectional gate: `jj log -r '(::<branch> | <branch>::) &
-  (RELEASE_REFS | bookmarks(glob:"keep/*") | remote_bookmarks(glob:"keep/*"))'` — substituting
-  `RELEASE_REFS` and this fork's actual retention-bookmark convention if it differs from
-  `keep/*` (a `~ ::trunk()` exclusion is unnecessary and was checked — a release/keep ref can
-  never be an ancestor of the trunk it was cut from, so it never intersects `::trunk()`).
-  Empty: the branch is genuinely lone, and `jj rebase -b <branch> -d <trunk>@upstream` is
-  correct, keeping its change ids so `knives release advance <branch>` follows it. Non-empty:
-  which direction the hit is in decides the remedy, and the two are opposite operations:
-  1. **The branch is a parent of the release/keep merge** (`jj log -r '<branch>:: & (...)'`
-     names it) — the branch feeds a member's content into the release. Bare `knives release
-     members` alone does not settle this: it answers only direct membership in the release *in
-     hand* (`src/release_carries.rs::run_release_members` resolves just
-     `release::plan(...).release`), never a *retained* superseded dated release — one kept
-     because it still has local descendants, or because a consumer or some other pin is still
-     frozen on it, under whatever name that pin uses: the old dated `release/<date>` name itself
-     if it has not been reaped yet, or a separate retention bookmark such as `keep/…` if the
-     name has been reaped but something else still pins the commit (`reap_superseded`,
-     `src/commands/release.rs`). Run `knives release members` too: named there — a direct member
-     of the release in hand — moves only with `knives release rebase`, never independently: it
-     rebases every member and the release merge together, replaying recorded conflict
-     resolutions, so the composition stays whole. Not named there — release ancestry with no
-     *current* membership — the branch is entangled with a release something else still depends
-     on for its exact commit identity. Do not `-b`, `-s`, or `-r` it: every one of them either
-     rewrites the retained release's commit (`-b`/`-s` — verified: silently moved and, on push,
-     force-moved a retained `keep/…` ref with no confirmation and no error) or silently drops
-     the branch as that release's parent, corrupting its recorded membership with no conflict
-     and no warning (`-r` — verified the same way; it is not a safer partial move here, it is a
-     different failure). Treat it like `stacked-history`: stop and get the release owner's
-     sign-off before touching it, or wait for the retained cut to lose its last local descendant
-     so `knives release reap` retires it and the query goes empty on its own.
-  2. **The branch descends from the release/keep merge** (`jj log -r '::<branch> & (...)'`
-     names it) — someone built new work on top of a cut instead of the trunk (`stacked-history`,
-     below). `jj rebase -b <branch> -d <trunk>@upstream` is *not* the fix here once that merge
-     has ever been pushed: `-b`'s root computation includes the merge itself, since it is not
-     yet reachable from the new destination, so it silently rewrites the very release/keep ref
-     this check just found — verified against both a *retained* cut and a still-current, pushed
-     one; the mechanism is graph-topological (whether the destination already contains the
-     commit), not release-state-aware, so `-b` is equally destructive against either. The safe
-     move rebases only the branch's own commits and never the merge: `jj rebase -s
-     '<release-or-keep-ref>..<branch>' -d <trunk>@upstream` — verified to leave the merge's
-     commit id byte-identical while cleanly relocating one or several commits stacked on top of
-     it. Only when the found merge has never been pushed anywhere (a local-only, still-in-hand
-     cut nobody else can see) is plain `-b` harmless, since nothing external pins the old
-     commit.
-  Never `jj duplicate` a branch: it mints new commit ids the release cannot match to the branch
-  (`knives release advance --from` is the repair, not the plan). Never keep two copies of a
-  branch — a "release-lineage" or "sibling" branch carrying a pull request's content on an
-  older base so the release can carry it while the pull request branch is rebased for the
-  maintainer. One branch is both the release member and the pull request head; if it does not
-  compose into the release, the release is behind: move the release, do not fork the branch.
-- **Do not build a branch on top of a release merge.** A branch whose history carries a
-  release cut carries every member of that cut, and a pull request from it asks the
-  maintainer to review the whole fork. `knives status` and `knives preflight` report it as
-  `stacked-history` — but only once the branch has an open pull request; a pre-PR branch gets
-  no such warning, so run the bidirectional gate above regardless of PR state. Case 2 above is
-  the remedy for this direction — a bare `-b` is the destructive operation, not the fix, once
-  the merge underneath has been pushed.
-- **Do not `jj op restore`.** It discards other agents' operations along with your own
-  mistake.
-- **Do not push to `upstream`.** Contributions go through a pull request.
-
-## Where the detail lives
-
-This is the on-ramp. For the rest of the CLI — what the three remotes mean, stating a
-pull request that inference cannot find, recording that one branch cannot land before
-another, planning and cutting releases, JSON output — read the `using-knives` skill. The
-per-pull-request and sweep workflows are `maintaining-fork-pr` and `maintaining-fork-release`.
+`using-knives`: the three remotes, stating a PR that inference cannot find, recording that one branch cannot land before another, releases, JSON output. `maintaining-fork-pr`: one PR. `maintaining-fork-release`: the release sweep.

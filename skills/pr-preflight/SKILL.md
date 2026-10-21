@@ -1,111 +1,80 @@
 ---
 name: pr-preflight
-description: Pre-PR contribution judgment gate for upstream repositories. Use when opening a PR, contributing upstream, doing a pre-PR check, preparing to run gh pr create, or contributing to a fork.
+description: Use when opening or preparing a PR against an upstream repository or a fork, contributing upstream, or before you run gh pr create.
 ---
 
 # Upstream PR Preflight Gate
 
-> **Where a change lives comes before whether it goes upstream.** A managed fork is a product the consumer repository uses; the consumer is where its own deployment's operating policy lives — lifetimes and reaping of jobs, caps, quotas, schedules, alerting, node sizing, who-may-do-what defaults — and is the default home for anything policy-shaped. A fork member is for a defect in the library's own machinery or a capability nothing outside the library can provide, which is also what makes it upstream-bound. `fork-work` carries the test (*if the fork were replaced by upstream main tomorrow, would anyone but us miss this?* No means the consumer): when the fork genuinely looks like the right home for something policy-shaped, that is itself a missing library capability, not a standing exception — the question to the owner is what belongs upstream and how the fork carries it there meanwhile, never whether the fork can keep it without going upstream. A change that belongs in the consumer has no branch in the fork and no upstream PR. There is one question, not two: this callout asks *fork or consumer*; the callout below asks when a fork member's upstream PR opens, never whether one does — a fork member that never goes upstream is not an option.
+## Placement comes first
 
-> **Upstream PRs are a placement judgment, not a permission.** Before opening one, write down whether the fork member is upstream material: a defect any user of the library would hit, fixed with evidence (a reproduction or red→green test), is upstream material; a knob the library already exposes or a change only we want was never fork work at all — that is CONSUMER, no branch — and an unproven fix needs the evidence before it counts, not a standing exemption from going upstream. That answer is recorded in the `placement:` notch and the PR body — nobody is asked and no approval is awaited (Sami, 2026-09-16: "I didn't ask to be in the loop for every upstream interaction"). A fix is CONSUMER (no branch) or UPSTREAM: a fork member that carries the change for the consumer from the moment its release is published, and until upstream ships it (single signed commit on the release's shared base → pushed to the fork remote → `knives notch` → tip + red→green evidence handed to whoever holds the release claim, who includes it in the release in hand (cutting the next dated name first, right then, when every consumer pin of that release is frozen on a revision, as agent-c's `rev = "release/…"` pins are) and publishes; no claim held, you do the same yourself → the consumer pins the published name and deploys). The upstream PR is part of the same work and opens alongside; it gates none of those steps (Sami, 2026-09-25: "The time it takes to start using a fork change is exactly equal to the time it takes to make it. There is no extra overhead"). Once an upstream PR is open, its lifecycle — review rounds, body edits, rebases, the close — is the owning session's own work, never parked on a human.
+- Decide where the change lives before whether it goes upstream. Apply `fork-work`'s test: if upstream main replaced the fork tomorrow, would anyone but us miss this? No means the consumer.
+- The consumer holds its deployment's operating policy (job lifetimes and reaping, caps, quotas, schedules, alerting, node sizing, who-may-do-what defaults). It is the default home for anything policy-shaped.
+- A fork member is for a defect in the library's own machinery, or a capability nothing outside the library can provide. That makes it upstream-bound.
+- A policy-shaped change that seems to need the fork is a missing library capability, not a standing exception. Ask the owner what goes upstream and how the fork carries it meanwhile. Never ask whether the fork can keep it without going upstream.
+- A fix is CONSUMER or UPSTREAM:
+  - CONSUMER: a knob the library already exposes, or a change only we want. No fork branch, no upstream PR.
+  - UPSTREAM: a defect any library user would hit, fixed with evidence (a reproduction or a red→green test). An unproven fix needs that evidence first. It gets no exemption from going upstream.
+- Every fork member gets an upstream PR. The only question is when it opens.
+- Write the placement answer in the `placement:` notch and the PR body. It is a judgment, not a permission: ask nobody, wait for no approval.
+- Never open an upstream PR without this gate and that written answer.
+- Complete `fork-work`'s challenge before implementation. Check 7 verifies the notch before publication.
 
-## Overview
+## A fork member ships at once
 
-Opening a pull request against an upstream repository requires adhering to that project's specific contribution guidelines. The `knives` CLI provides programmatic facts through `knives preflight`. The agent provides the human judgment to evaluate compliance before executing `gh pr create`.
+The member carries the change for the consumer from release publication until upstream ships it. The upstream PR opens alongside and gates none of these steps:
 
-Never open an upstream PR without walking this gate, and never without the written answer to whether the change belongs upstream at all (the callout above). The gate and that written judgment are what make a PR opened in Sami's name defensible; neither is a permission to ask him for.
+1. Make one signed commit on the release's shared base. Push it to the fork remote.
+2. Record it with `knives notch`.
+3. Give the tip and the red→green evidence to the release claim holder, who adds it to the release in hand and publishes. If every consumer pin of that release is frozen on a revision, they first cut the next dated release name, right then.
+4. If nobody holds the release claim, do the handoff in item 3 yourself.
+5. The consumer pins the published name and deploys.
 
-Complete `fork-work`'s challenge before implementation; Check 7 verifies the `placement:` notch before publication.
+The owning session does the open PR's review rounds, body edits, rebases and close. Never park them on a human.
 
-## Step 1: Obtain Programmatic Facts
+## Step 1: Get Programmatic Facts
 
-Run the preflight command for the target repository. It needs a jj checkout with an `upstream` remote. A plain git clone of a fork has neither, so add the upstream (the `upstream` URL of the fork's entry in the knives registry, `repos.toml`) and colocate first:
+`knives preflight` needs a jj checkout with an `upstream` remote. Run it in your `knives start` workspace (`fork-work`). Never run `jj git init` in a plain git clone: a clone that gets file contents on demand breaks jj partway. When the checkout has no `upstream` remote, add the fork's `upstream` URL from the knives registry (`repos.toml`):
 
 ```bash
 git remote add upstream <upstream clone URL>   # only when there is no upstream remote
-jj git init --colocate                          # plain git clone only
 knives preflight
 ```
 
-Read the command output to identify three categories of facts:
-1. Convention files present: `AGENTS.md`, `CONTRIBUTING.md`, and PR template files, including whether they changed since last seen.
-2. Open PR accounting: current open PR count and repository policy cap limits.
-3. Branch status: whether the branch is claimed, stale, landed, or divergent.
-
-`knives preflight` supplies the facts. You supply the judgment.
+From the output, get the convention files (`AGENTS.md`, `CONTRIBUTING.md`, PR template) and if they changed since last seen. Get the open PR count and cap, and the branch status (claimed, stale, landed, divergent). The command reports. You judge.
 
 ## Step 2: Verification Checklist
 
-Walk each check sequentially. Each check specifies what facts to verify, what evidence satisfies it, and what remediation action to take if the check fails.
+Do the checks in order. Each needs evidence.
 
-### Check 1: Branch State Integrity
-- **Verification**: Verify that the branch status reported by `knives preflight` is active and clean.
-- **Evidence**: Output showing the branch is not stale, landed, or divergent.
-- **If Failed**:
-  - *Landed*: Do not open a PR. Close or delete the local branch because the changes already exist upstream.
-  - *Stale*: Rebase the branch onto the latest upstream default branch and re-test all changes.
-  - *Divergent*: Reconcile local and remote commit history, resolve conflicts, and ensure a single canonical branch tip exists before proceeding.
-
-### Check 2: Open PR Limits and Branch Claims
-- **Verification**: Verify our open PR count against the target repo is below the repo policy cap, and that the branch is claimed by your current workspace.
-- **Evidence**: Current open PR count is strictly less than the repository limit, and claim status matches your active workspace.
-- **If Failed**:
-  - *Cap Reached*: Do not open a new PR. Review open PRs against the target repo. Folding the fix into an existing open PR is the owning session's own judgment and work, under the same placement question as any upstream change: fold it when it belongs there; otherwise the upstream PR opens when the cap frees — the member rides the release meanwhile (the callout at the top of this skill), never a standing fork member.
-  - *Unclaimed or Claimed Elsewhere*: Claim the branch in your active workspace before making commits or submitting work.
-
-### Check 3: Policy File Review
-- **Verification**: Locate and read the target repository's convention files (`AGENTS.md`, `CONTRIBUTING.md`, and `.github/PULL_REQUEST_TEMPLATE.md` or equivalent).
-- **Evidence**: Direct reading of all convention files present in the target repository.
-- **If Failed**:
-  - *Files Unread*: Read each convention file completely using file reading tools. Do not assume default standards or skip reading repository policies.
-
-### Check 4: Issue Reference Requirement
-- **Verification**: Check `CONTRIBUTING.md` and the PR template to determine if the target repository requires linking an open issue in the PR description.
-- **Evidence**: Valid issue reference (such as "Fixes #123" or "Closes #123") included in the draft PR description.
-- **If Failed**:
-  - *Reference Missing*: Find the upstream issue ID corresponding to this work. If no issue exists and repository policy requires one, search existing open issues or open an issue first. Include the required issue link in the PR body.
-
-### Check 5: AI Authorship Disclosure
-- **Verification**: Check repository policies to determine if the target project requires disclosing AI assistance or automated authoring.
-- **Evidence**: Explicit AI authorship disclosure statement included in the PR description or commit message when required.
-- **If Failed**:
-  - *Disclosure Missing*: Add the required disclosure notice (for example, "Authored with AI assistance") to the PR description before submitting.
-
-### Check 6: Scope and Package Routing
-- **Verification**: Check repository rules to verify whether the proposed change targets the correct package or directory structure. Verify if feature additions are restricted from core packages and routed to plugin or extension packages.
-- **Evidence**: Modified file paths match the permitted contribution locations for the given change type.
-- **If Failed**:
-  - *Incorrect Routing*: Refactor and relocate the changes to the permitted package, directory, or extension location defined by upstream policy.
-
-### Check 7: `placement:` notch
-- **Verification**: Challenger differs from proposer; evidence covers the published diff.
-- **Evidence**: The `placement:` notch, read with `knives notch <branch>` (repository subject for standing rules). For a member that changes runtime behavior, the notch and the commit body also carry the ownership answer and the ruling it implements (`fork-work`).
-- **If Failed**:
-  - *Missing*: No PR; return to `fork-work`'s challenge.
-  - *Stale*: Re-run the challenge.
+| # | Check | Evidence | If it fails |
+|---|---|---|---|
+| 1 | Branch state | `knives preflight` shows the branch is not stale, landed or divergent | Landed: no PR. Close or delete the local branch. Stale: rebase onto the latest upstream default branch and re-test. Divergent: reconcile local and remote history to one canonical tip. |
+| 2 | PR cap and claim | Our open PR count is strictly below the cap. Your workspace holds the claim. | Cap reached: no new PR. Fold the fix into an open PR only if it belongs there. That call is the owning session's own judgment and work. Otherwise open it when the cap frees. The member rides the release meanwhile, never as a standing fork member. Unclaimed or claimed elsewhere: claim it before you commit or open the PR. |
+| 3 | Policy files | You read every convention file in full (`AGENTS.md`, `CONTRIBUTING.md`, `.github/PULL_REQUEST_TEMPLATE.md` or equivalent) | Read them. Do not assume default standards. |
+| 4 | Issue reference | If policy requires an issue, the draft body links it ("Fixes #123") | Find the upstream issue. If none exists and policy requires one, search open issues, else open one first. Include the required issue link in the PR body. |
+| 5 | AI disclosure | If policy requires it, the PR body or commit discloses AI assistance | Add the notice (for example "Authored with AI assistance"). |
+| 6 | Package routing | Changed paths are where repo rules allow this change type (for example, features in plugin packages, not core) | Move the change to the permitted location. |
+| 7 | `placement:` notch | `knives notch <branch>` (repository subject for standing rules) shows it. The challenger is not the proposer. Its evidence covers the published diff. A runtime-behavior change also carries the ownership answer and its ruling in the notch and commit body (`fork-work`). | Missing: no PR. Return to `fork-work`'s challenge. Stale: re-run the challenge. |
 
 ## Step 3: Record What You Promised
 
-A pull request review is a conversation with a person who will not be here next session,
-and a promise made in a review thread is invisible to the next agent. Before opening the
-pull request, and again after every review round that leaves you owing something, record
-it:
+The next agent cannot see a promise in a review thread. Before you open the PR, and after each review round that leaves you owing something, record it:
 
 ```bash
 knives notch <branch> -m "promised the maintainer we would split the config change out" \
   --evidence <repo>#<number>
 ```
 
-Promises belong in notches, not in a session that ends. `knives notch <branch>` before you
-answer a review is how you find out what you already owe. Which review threads are still
-unanswered is a different question, derived from the forge, and not this.
+- Before you answer a review, run `knives notch <branch>` to see what you owe.
+- Unanswered threads come from the forge, not from notches.
 
 ## Step 4: Execution
 
-When all seven checks pass with verified evidence and the placement judgment is written down (Check 7's notch, restated in the PR body), proceed with opening the pull request. Every later push or edit to it is the owning session's own work under the same placement question — not a new permission:
+When all seven checks pass and the PR body restates Check 7's placement answer, open the PR:
 
 ```bash
 gh pr create --title "..." --body "..."
 ```
 
-Ensure the title and body follow the target repository template, including all required issue links and policy disclosures.
+- Follow the repo's template, with every required issue link and disclosure.
+- Later pushes and edits are the owning session's work under the same placement question, not a new permission.
