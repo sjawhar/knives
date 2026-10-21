@@ -16,7 +16,7 @@ use knives::ids::{ReleaseScheme, RepoName};
 use knives::release_model::{BranchSuccessions, carried_from_tips, trunk_positions};
 
 use super::release_edit::{
-    EditRecord, record_edit_event, release_is_locally_movable, report_replaced,
+    EditRecord, earlier_writes, record_edit_event, release_is_locally_movable, report_replaced,
 };
 
 /// Rebase the whole composition onto an upstream commit: `jj rebase -b <release> -d <target>`.
@@ -226,6 +226,7 @@ fn shed_stale_bases(
             message: None,
             bookmark: Some(release_name),
             publish_remote: Some(fork.entry.publish_remote()),
+            earlier: &earlier_writes(fork, release_name)?,
             operation: &format!("knives: {release_name}: shed {shed} stale base parent(s)"),
         },
     )?;
@@ -634,6 +635,7 @@ fn drop_landed_members(
             message: Some(&message),
             bookmark: Some(release_name),
             publish_remote: Some(entry.publish_remote()),
+            earlier: &earlier_writes(fork, release_name)?,
             operation: &format!("knives: {release_name}: {delta}"),
         },
     )?;

@@ -804,6 +804,7 @@ fn cutting_a_release_does_not_move_another_agents_working_copy() {
             message: Some("release: test"),
             bookmark: None,
             publish_remote: None,
+            earlier: &[],
             operation: "knives: cut release: test",
         },
     )
@@ -839,6 +840,7 @@ fn a_release_write_with_no_parents_is_refused_rather_than_done_in_place() {
             message: None,
             bookmark: None,
             publish_remote: None,
+            earlier: &[],
             operation: "knives: an empty edit",
         },
     )

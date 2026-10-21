@@ -1095,6 +1095,79 @@ fn a_working_copy_parked_on_the_release_keeps_the_replaced_cut_and_stays_fresh()
     assert!(findings(&report, "orphan-commit").is_empty(), "{report}");
 }
 
+/// A cut kept by a parked working copy at the drop, then left behind when the
+/// working copy moves onto the new release: an anonymous head until the next
+/// release write. Returns the lab, its home and the kept cut.
+fn cut_left_behind_by_a_parked_working_copy() -> (Lab, tempfile::TempDir, knives::ids::CommitId) {
+    let (lab, home, _consumer) = two_branch_cut();
+    let cut = commit_at(&lab, "release/2026-08-04");
+    lab.jj_work(["new", "release/2026-08-04"]);
+    drop_beta(&lab, &home);
+    lab.jj_work(["new", "release/2026-08-04"]);
+    assert!(is_visible(&lab, &cut), "the parked cut was not kept");
+    let report = audit_report(&lab, &home);
+    assert_eq!(
+        findings(&report, "orphan-commit").len(),
+        1,
+        "the left-behind cut is no anonymous head: {report}"
+    );
+    (lab, home, cut)
+}
+
+#[test]
+fn the_next_edit_abandons_a_cut_a_working_copy_left_behind() {
+    // Given: a cut kept for a parked working copy that has since moved on.
+    let (lab, home, cut) = cut_left_behind_by_a_parked_working_copy();
+    lab.branch("feat/gamma", "gamma.txt", "gamma\n");
+
+    // When: the release is edited again.
+    let output = knives_release(&lab, &home, &["include", "feat/gamma"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}");
+
+    // Then: the left-behind cut is abandoned, said so, and no orphan remains.
+    assert!(
+        !is_visible(&lab, &cut),
+        "the left-behind cut is still visible"
+    );
+    assert!(
+        stdout.contains(&format!(
+            "demo: abandoned {}, an earlier release/2026-08-04 commit nothing rests on any more",
+            cut.short()
+        )),
+        "{stdout}"
+    );
+    let report = audit_report(&lab, &home);
+    assert!(findings(&report, "orphan-commit").is_empty(), "{report}");
+}
+
+#[test]
+fn the_next_cut_abandons_a_cut_a_working_copy_left_behind() {
+    // Given: a cut kept for a parked working copy that has since moved on.
+    let (lab, home, cut) = cut_left_behind_by_a_parked_working_copy();
+    lab.jj_work(["new", "main"]);
+
+    // When: the next cut reaps the old name.
+    let output = knives_release(&lab, &home, &["cut", "release/2026-08-05", "--allow-drop"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}");
+
+    // Then: the reap also abandons the left-behind cut of the reaped name.
+    assert!(
+        !is_visible(&lab, &cut),
+        "the left-behind cut is still visible"
+    );
+    assert!(
+        stdout.contains(&format!(
+            "demo: abandoned {}, an earlier release/2026-08-04 commit nothing rests on any more",
+            cut.short()
+        )),
+        "{stdout}"
+    );
+    let report = audit_report(&lab, &home);
+    assert!(findings(&report, "orphan-commit").is_empty(), "{report}");
+}
+
 #[test]
 fn a_drop_keeps_the_replaced_cut_while_work_rests_on_it() {
     // Given: a commit with work on top of the cut.

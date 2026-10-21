@@ -574,6 +574,7 @@ fn committed_cut_fixture(
             message: Some(&request.message()),
             bookmark: None,
             publish_remote: None,
+            earlier: &[],
             operation: &format!("knives: cut {} (fixture)", request.name),
         },
     )

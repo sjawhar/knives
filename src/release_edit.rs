@@ -381,6 +381,7 @@ fn apply_edit(
             message: Some(&message),
             bookmark: Some(&release.name),
             publish_remote: Some(entry.publish_remote()),
+            earlier: &earlier_writes(fork, &release.name)?,
             operation: &format!("knives: {}: {delta}", release.name),
         },
     )?;
@@ -417,18 +418,42 @@ pub(crate) fn report_replaced(
     release: &str,
     written: &knives::jj::ReleaseWritten,
 ) {
-    let Some(replaced) = &written.replaced else {
-        return;
-    };
-    let old = replaced.commit.short();
-    match &replaced.kept {
-        None => println!("{repo}: abandoned {old}, the {release} commit this write replaced"),
-        Some(reason) => {
-            println!(
+    if let Some(replaced) = &written.replaced {
+        let old = replaced.commit.short();
+        match &replaced.kept {
+            None => println!("{repo}: abandoned {old}, the {release} commit this write replaced"),
+            Some(reason) => println!(
                 "{repo}: note: kept {old}, the {release} commit this write replaced: {reason}"
-            );
+            ),
         }
     }
+    report_abandoned_earlier(repo, release, &written.abandoned_earlier);
+}
+
+/// One line per earlier write of `release` abandoned because nothing rests on
+/// it any more.
+pub(crate) fn report_abandoned_earlier(
+    repo: &RepoName,
+    release: &str,
+    abandoned: &[knives::ids::CommitId],
+) {
+    for commit in abandoned {
+        println!(
+            "{repo}: abandoned {}, an earlier {release} commit nothing rests on any more",
+            commit.short()
+        );
+    }
+}
+
+/// The commits the fork's ledger records knives writing under `release`.
+pub(crate) fn earlier_writes(
+    fork: &Fork<'_>,
+    release: &str,
+) -> anyhow::Result<Vec<knives::ids::CommitId>> {
+    let entries = Ledger::for_fork(fork).read()?.entries;
+    Ok(knives::release_model::recorded_writes(&entries, release)
+        .map(|write| write.commit)
+        .collect())
 }
 
 /// What one release edit wrote: the name, the delta, the new merge with its

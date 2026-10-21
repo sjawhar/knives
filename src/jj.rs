@@ -1659,6 +1659,11 @@ pub struct ReleaseWrite<'a> {
     /// is the published position the next push replaces, so it does not keep
     /// a replaced source.
     pub publish_remote: Option<&'a str>,
+    /// Commits earlier writes put under the bookmark, as the ledger records
+    /// them. Each one that is a visible head nothing rests on — a replaced
+    /// commit once kept for a working copy that has since moved on — is
+    /// abandoned in the same operation. Unknown ones are skipped.
+    pub earlier: &'a [CommitId],
     /// The operation-log description, `knives: …` by convention.
     pub operation: &'a str,
 }
@@ -1671,6 +1676,9 @@ pub struct ReleaseWritten {
     pub change: ChangeId,
     /// The source the bookmark moved off, when it named the source.
     pub replaced: Option<ReplacedRelease>,
+    /// Earlier writes of the name ([`ReleaseWrite::earlier`]) abandoned here:
+    /// visible heads nothing rests on any more.
+    pub abandoned_earlier: Vec<CommitId>,
 }
 
 /// The commit a release write replaced under its name.
@@ -1724,6 +1732,7 @@ pub fn write_release(repo: &Path, write: &ReleaseWrite<'_>) -> Result<ReleaseWri
         (written, None)
     };
     let mut replaced = None;
+    let mut abandoned_earlier = Vec::new();
     if let Some(name) = write.bookmark {
         let ref_name = JjRefName::new(name);
         let source = source.filter(|source| {
@@ -1735,11 +1744,11 @@ pub fn write_release(repo: &Path, write: &ReleaseWrite<'_>) -> Result<ReleaseWri
         });
         tx.repo_mut()
             .set_local_bookmark_target(ref_name, RefTarget::normal(written.id().clone()));
+        let moved = MovedName {
+            name,
+            publish_remote: write.publish_remote,
+        };
         if let Some(source) = source {
-            let moved = MovedName {
-                name,
-                publish_remote: write.publish_remote,
-            };
             let kept = what_keeps(&repo, tx.repo(), &source, &moved)?;
             if kept.is_none() {
                 tx.repo_mut().record_abandoned_commit(&source);
@@ -1749,12 +1758,21 @@ pub fn write_release(repo: &Path, write: &ReleaseWrite<'_>) -> Result<ReleaseWri
                 kept,
             });
         }
+        let written_id = commit_id(written.id());
+        for stray in unheld_heads(&repo, tx.repo(), write.earlier, &moved)? {
+            let stray_id = commit_id(stray.id());
+            if stray_id != written_id && write.source != Some(&stray_id) {
+                tx.repo_mut().record_abandoned_commit(&stray);
+                abandoned_earlier.push(stray_id);
+            }
+        }
     }
     commit_mutation(&repo, tx, write.operation)?;
     Ok(ReleaseWritten {
         commit: commit_id(written.id()),
         change: ChangeId::new(written.change_id().to_string()),
         replaced,
+        abandoned_earlier,
     })
 }
 
@@ -1762,6 +1780,59 @@ pub fn write_release(repo: &Path, write: &ReleaseWrite<'_>) -> Result<ReleaseWri
 struct MovedName<'a> {
     name: &'a str,
     publish_remote: Option<&'a str>,
+}
+
+/// Which of `candidates` are visible heads nothing rests on ([`what_keeps`]),
+/// judged in `view_repo`. A candidate this repository cannot resolve (a write
+/// another machine made, or one already gone) is skipped, and so is one that
+/// is hidden or has descendants.
+fn unheld_heads(
+    repo: &Repo,
+    view_repo: &dyn jj_lib::repo::Repo,
+    candidates: &[CommitId],
+    moved: &MovedName<'_>,
+) -> Result<Vec<jj_lib::commit::Commit>, JjError> {
+    let heads = repo.repo.view().heads();
+    let mut unheld: Vec<jj_lib::commit::Commit> = Vec::new();
+    for candidate in candidates {
+        let Ok(commit) = repo.commit(candidate.as_str()) else {
+            continue;
+        };
+        if !heads.contains(commit.id()) || unheld.iter().any(|seen| seen.id() == commit.id()) {
+            continue;
+        }
+        if what_keeps(repo, view_repo, &commit, moved)?.is_none() {
+            unheld.push(commit);
+        }
+    }
+    Ok(unheld)
+}
+
+/// Abandon the unheld heads among `candidates`, as ONE described operation.
+///
+/// The candidates are commits the ledger says knives wrote under release
+/// names now forgotten; one is abandoned when it is a visible head nothing
+/// rests on ([`unheld_heads`]). Returns the abandoned ones.
+pub fn abandon_unheld_writes(
+    repo: &Path,
+    candidates: &[CommitId],
+    operation: &str,
+) -> Result<Vec<CommitId>, JjError> {
+    let repo = Repo::open(repo)?;
+    let moved = MovedName {
+        name: "",
+        publish_remote: None,
+    };
+    let mut tx = repo.repo.start_transaction();
+    let unheld = unheld_heads(&repo, tx.repo(), candidates, &moved)?;
+    if unheld.is_empty() {
+        return Ok(Vec::new());
+    }
+    for commit in &unheld {
+        tx.repo_mut().record_abandoned_commit(commit);
+    }
+    commit_mutation(&repo, tx, operation)?;
+    Ok(unheld.iter().map(|commit| commit_id(commit.id())).collect())
 }
 
 /// Why a replaced release commit must stay, judged in `view_repo` — the
