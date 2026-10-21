@@ -930,3 +930,53 @@ fn finishing_a_workspace_replaced_by_a_dangling_symlink_says_its_registration_st
         );
     }
 }
+
+#[test]
+fn finishing_keeps_a_same_named_workspace_registered_elsewhere() {
+    // Given: the branch's directory is gone, and its workspace name now lives at
+    // another path Q (an old `workspaces` root, or one added by hand)
+    let lab = lab::Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let workspace = start_claim_for_finish(&lab, &home, "ses_fff688", "feat/gamma");
+    knives::jj::forget_workspace(&lab.work, "feat-gamma").expect("forget the workspace");
+    std::fs::remove_dir_all(&workspace).expect("remove the workspace directory");
+    let elsewhere = lab.temp_path().join("other-root").join("feat-gamma");
+    knives::jj::add_workspace(&lab.work, "feat-gamma", &elsewhere, "main@upstream")
+        .expect("add the same name elsewhere");
+    let recorded = || {
+        let output = Command::new("jj")
+            .args([
+                "--ignore-working-copy",
+                "workspace",
+                "root",
+                "--name",
+                "feat-gamma",
+            ])
+            .current_dir(&lab.work)
+            .output()
+            .expect("jj workspace root");
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    };
+    let before = recorded();
+
+    let finished = knives_finish(&lab, &home, &["feat/gamma"]);
+
+    // Then: the claim is released, the name is not forgotten, and Q is intact
+    let stdout = String::from_utf8_lossy(&finished.stdout);
+    assert!(finished.status.success(), "{stdout}");
+    assert!(
+        stdout.contains(&format!(
+            "workspace feat-gamma not forgotten (it is registered at {before}; finish or forget \
+             it there)"
+        )),
+        "{stdout}"
+    );
+    assert_eq!(recorded(), before);
+    assert!(
+        git_worktrees(&lab.work).contains(&format!("worktree {before}")),
+        "{}",
+        git_worktrees(&lab.work)
+    );
+    assert!(elsewhere.join(".jj").is_dir());
+}

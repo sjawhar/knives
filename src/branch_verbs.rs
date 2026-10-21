@@ -6,7 +6,7 @@
 //! Each records one ledger event, and a statement rides on that event;
 //! `finish` also writes the released claim to the state file.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use knives::bind::Fork;
 use knives::cli::Exit;
@@ -137,7 +137,7 @@ pub(crate) fn run_finish(
     let identity = directory
         .exists()
         .then(|| knives::jj::workspace_identity(&directory, checkout_path));
-    let registration = release_registration(checkout_path, &workspace);
+    let registration = release_registration(checkout_path, &workspace, &directory);
     let shown = directory.display();
     let checkout = checkout_path.display();
     let removal = match identity {
@@ -149,7 +149,11 @@ pub(crate) fn run_finish(
             // A registration that could not be forgotten keeps its directory: with
             // the directory gone, every later `start` dies on jj's "already exists",
             // `--force` included, where a retried `finish` would have cleaned up.
-            let removable = options.cleanup && !matches!(registration, Registration::Failed(_));
+            let removable = options.cleanup
+                && !matches!(
+                    registration,
+                    Registration::Failed(_) | Registration::Elsewhere(_)
+                );
             if removable {
                 // Safe because jj already snapshotted the working copy into a commit:
                 // the work is in the repository and reachable by change id. Untracked
@@ -220,6 +224,9 @@ enum Registration {
     /// jj never knew the name; `jj workspace forget` would have exited 0 anyway,
     /// and saying "forgotten" would let a reader believe a registration was cleared.
     NotRegistered,
+    /// jj recorded the name at another path, where a same-named workspace is
+    /// live; forgetting the name would take that one over, so it is kept.
+    Elsewhere(PathBuf),
     /// The forget failed, or the checkout could not be opened to ask. Reported,
     /// not an error: the claim is already released by the time this runs, and the
     /// ownership decision never needed the checkout.
@@ -231,20 +238,29 @@ impl std::fmt::Display for Registration {
         match self {
             Self::Forgotten => f.write_str("forgotten"),
             Self::NotRegistered => f.write_str("was not registered"),
+            Self::Elsewhere(path) => write!(
+                f,
+                "not forgotten (it is registered at {}; finish or forget it there)",
+                path.display()
+            ),
             Self::Failed(detail) => write!(f, "not forgotten ({detail})"),
         }
     }
 }
 
-fn release_registration(checkout: &Path, workspace: &str) -> Registration {
+fn release_registration(checkout: &Path, workspace: &str, directory: &Path) -> Registration {
     match Repo::open(checkout).and_then(|repo| repo.workspaces()) {
         Err(error) => Registration::Failed(error.to_string()),
         Ok(names) if !names.iter().any(|(name, _)| name.as_str() == workspace) => {
             Registration::NotRegistered
         }
-        Ok(_) => match knives::jj::forget_workspace(checkout, workspace) {
-            Ok(()) => Registration::Forgotten,
+        Ok(_) => match knives::jj::workspace_recorded_elsewhere(checkout, workspace, directory) {
             Err(error) => Registration::Failed(error.to_string()),
+            Ok(Some(elsewhere)) => Registration::Elsewhere(elsewhere),
+            Ok(None) => match knives::jj::forget_workspace(checkout, workspace) {
+                Ok(()) => Registration::Forgotten,
+                Err(error) => Registration::Failed(error.to_string()),
+            },
         },
     }
 }

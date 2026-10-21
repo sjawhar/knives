@@ -19,6 +19,7 @@ use crate::jj::{
     Repo, StaleRegistration, WorkspaceIdentity, add_workspace, fetch_all, forget_workspace,
     is_workspace_named, path_occupant, remove_finished_worktree, remove_prunable_worktree,
     repo_immutable_heads, set_repo_immutable_heads, user_immutable_heads, workspace_identity,
+    workspace_recorded_elsewhere,
 };
 use crate::ledger::{Ledger, Scribe};
 use crate::release_model::newest_release;
@@ -521,6 +522,19 @@ fn clear_vanished_workspace(context: &StartContext<'_>) -> anyhow::Result<()> {
         .iter()
         .any(|(name, _)| *name == context.workspace);
     if registered {
+        // The name is the repository's: a same-named workspace jj recorded at
+        // another path is live there, and forgetting it would take it over.
+        if let Some(elsewhere) = workspace_recorded_elsewhere(
+            checkout,
+            context.workspace.as_str(),
+            &context.destination,
+        )? {
+            anyhow::bail!(
+                "workspace {} is registered at {}, not {shown}; finish or forget it there",
+                context.workspace,
+                elsewhere.display()
+            );
+        }
         forget_workspace(checkout, context.workspace.as_str())?;
         println!(
             "forgot workspace {} (its directory at {shown} was gone)",

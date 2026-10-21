@@ -719,6 +719,62 @@ fn the_printed_rebuild_recreates_a_vanished_workspace_whose_registration_is_lock
     assert_the_printed_rebuild_recreates_a_vanished_workspace(true);
 }
 
+/// Where jj recorded workspace `name` of the lab's work checkout.
+fn recorded_workspace_root(lab: &Lab, name: &str) -> String {
+    let output = Command::new("jj")
+        .args(["--ignore-working-copy", "workspace", "root", "--name", name])
+        .current_dir(&lab.work)
+        .output()
+        .expect("jj workspace root");
+    assert!(output.status.success(), "{output:?}");
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
+#[test]
+fn the_printed_rebuild_refuses_a_same_named_workspace_registered_elsewhere() {
+    // Given: the branch's directory is gone, and its workspace name now lives at
+    // another path Q (an old `workspaces` root, or one added by hand)
+    let lab = Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let started = knives_start(&lab, &home, "feat/alpha");
+    assert!(started.status.success(), "{started:?}");
+    let workspace = lab.work.parent().expect("parent").join("feat-alpha");
+    knives::jj::forget_workspace(&lab.work, "feat-alpha").expect("forget the workspace");
+    std::fs::remove_dir_all(&workspace).expect("remove the workspace directory");
+    let elsewhere = lab.temp_path().join("other-root").join("feat-alpha");
+    knives::jj::add_workspace(&lab.work, "feat-alpha", &elsewhere, "main@upstream")
+        .expect("add the same name elsewhere");
+    let recorded = recorded_workspace_root(&lab, "feat-alpha");
+
+    // When: the rebuild the resumed start prints is run
+    let rebuilt = start_command(&lab, &home, "feat/alpha")
+        .arg("--force")
+        .output()
+        .expect("run the rebuild");
+
+    // Then: it refuses, names both paths, and the workspace at Q is untouched
+    let stderr = String::from_utf8_lossy(&rebuilt.stderr);
+    assert!(!rebuilt.status.success(), "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "workspace feat-alpha is registered at {recorded}, not {}; finish or forget it there",
+            workspace.display()
+        )),
+        "{stderr}"
+    );
+    assert_eq!(recorded_workspace_root(&lab, "feat-alpha"), recorded);
+    assert!(
+        git_worktrees(&lab.work).contains(&format!("worktree {recorded}")),
+        "{}",
+        git_worktrees(&lab.work)
+    );
+    assert!(elsewhere.join(".jj").is_dir());
+    assert!(
+        !workspace.exists(),
+        "the rebuild created the workspace anyway"
+    );
+}
+
 #[test]
 fn a_failed_workspace_add_leaves_no_empty_directory() {
     // jj creates the destination before git registers it as a worktree; when

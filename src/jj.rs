@@ -2982,6 +2982,35 @@ pub fn forget_workspace(repo: &Path, name: &str) -> Result<(), JjError> {
     Ok(())
 }
 
+/// Where jj recorded workspace `name` of `repo`, or `None` when that is
+/// `destination` itself (compared through symbolic links above it).
+///
+/// A workspace name is the repository's, not a path's: a same-named workspace
+/// can live elsewhere (an old `workspaces` root, one added by hand), and
+/// forgetting the name for a vanished directory at `destination` would take
+/// that live one over. `jj workspace root --name` prints the recorded path
+/// even when its directory is gone.
+pub fn workspace_recorded_elsewhere(
+    repo: &Path,
+    name: &str,
+    destination: &Path,
+) -> Result<Option<PathBuf>, JjError> {
+    let recorded = command(
+        "jj",
+        [
+            "--repository",
+            &path(repo),
+            "--ignore-working-copy",
+            "workspace",
+            "root",
+            "--name",
+            name,
+        ],
+    )?;
+    let recorded = PathBuf::from(recorded.trim_end_matches('\n'));
+    Ok((comparable_path(&recorded) != comparable_path(destination)).then_some(recorded))
+}
+
 /// Run a command with a revision checked out, and return its output.
 ///
 /// A temporary workspace rather than moving `@`: these repositories are worked
