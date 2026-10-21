@@ -33,11 +33,10 @@ The owning session does the open PR's review rounds, body edits, rebases and clo
 
 ## Step 1: Get Programmatic Facts
 
-`knives preflight` needs a jj checkout with an `upstream` remote. In a plain git clone, add the remote (the fork's `upstream` URL in the knives registry, `repos.toml`) and colocate:
+`knives preflight` needs a jj checkout with an `upstream` remote. Run it in your `knives start` workspace (`fork-work`). Never run `jj git init` in a plain git clone: a clone that gets file contents on demand breaks jj partway. When the checkout has no `upstream` remote, add the fork's `upstream` URL from the knives registry (`repos.toml`):
 
 ```bash
 git remote add upstream <upstream clone URL>   # only when there is no upstream remote
-jj git init --colocate                          # plain git clone only
 knives preflight
 ```
 

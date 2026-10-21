@@ -159,6 +159,7 @@ Do this step when the request includes releases, upstream debt or consumption. P
 
      ```sh
      jj new '<release>-' -m guard                                   # fresh automerge of the release's parents
+     guard=$(jj log -r @ --no-graph -T commit_id)                   # save its id: the restores below need it
      jj diff --from @ --to <release> --name-only | sort > delta      # the recorded resolution delta
      jj resolve -r @ --list | awk '{print $1}' | sort > conflicted   # the paths that genuinely conflict
      comm -23 delta conflicted                                       # must print nothing, or only recorded semantic conflicts

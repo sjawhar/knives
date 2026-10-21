@@ -79,7 +79,7 @@ Inference matches branches to PR heads from our repository copies, and reads a `
 
 ```text
 knives track <branch> --pr 4545    # any number, state or author
-knives track <branch> --fork-only # deliberately no upstream PR
+knives track <branch> --fork-only # legacy statement: placement never records fork-only (fork-work §3)
 knives track <branch> --forget    # back to inference
 knives depends <branch> --on <repo>#<number>
 ```
