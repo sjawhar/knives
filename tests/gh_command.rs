@@ -262,7 +262,7 @@ fn no_target_advice_names_r_only_for_commands_that_take_it() {
     let (dir, log) = fake_gh();
     let takes = "pass -R <owner>/<repo>";
     let account = "an App token cannot run it, and agent sessions have no ambient login";
-    let cases: [(&[&str], &str, bool); 15] = [
+    let cases: [(&[&str], &str, bool); 16] = [
         (&["api", "user"], "gh api repos/<owner>/<repo>", false),
         (
             &["repo", "view"],
@@ -284,6 +284,7 @@ fn no_target_advice_names_r_only_for_commands_that_take_it() {
             "orgs/<org>/repos?per_page=100' --paginate",
             false,
         ),
+        (&["extension", "list"], "set GH_REPO=<owner>/<repo>", false),
         (&["gist", "list"], account, false),
         (&["ssh-key", "list"], account, false),
         (&["discussion", "list"], takes, true),
@@ -331,7 +332,7 @@ fn local_commands_print_no_target_line() {
     let cases: [&[&str]; 4] = [
         &["alias", "list"],
         &["--version"],
-        &["extension", "list"],
+        &["skill", "list"],
         &["attestation", "trusted-root"],
     ];
     for arguments in cases {

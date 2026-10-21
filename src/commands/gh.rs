@@ -187,8 +187,8 @@ pub fn run(args: &[String]) -> anyhow::Result<std::convert::Infallible> {
 }
 
 /// What names a repository for this command when nothing routed it, or None for
-/// a local command that never calls the GitHub API and so needs no target. Only
-/// the commands in the first arm take `-R`; gh rejects it elsewhere as an unknown
+/// a local command that runs with no login and so needs no target. Only
+/// the commands in the `-R` arm take `-R`; gh rejects it elsewhere as an unknown
 /// flag. Account-wide commands have no repository to route by, and an App token
 /// cannot run them, so they get no `GH_REPO` advice: following it would fail, or
 /// fall back to a personal token.
@@ -199,7 +199,7 @@ fn no_target_remedy(args: &[String]) -> Option<&'static str> {
         .map(String::as_str);
     let remedy = match (words.next(), words.next()) {
         (None | Some("alias" | "config" | "completion" | "licenses" | "help"), _)
-        | (Some("extension" | "skill"), Some("list"))
+        | (Some("skill"), Some("list"))
         | (Some("attestation"), Some("trusted-root")) => return None,
         (
             Some(
