@@ -256,6 +256,109 @@ fn no_target_repository_says_so_before_gh_runs() {
 }
 
 #[test]
+fn no_target_advice_names_r_only_for_commands_that_take_it() {
+    // Given: a directory with no remote, and commands with and without -R.
+    let scratch = tempfile::tempdir().expect("scratch");
+    let (dir, log) = fake_gh();
+    let takes = "pass -R <owner>/<repo>";
+    let account = "an App token cannot run it, and agent sessions have no ambient login";
+    let cases: [(&[&str], &str, bool); 16] = [
+        (&["api", "user"], "gh api repos/<owner>/<repo>", false),
+        (
+            &["repo", "view"],
+            "GH_REPO=<owner>/<repo> gh repo view",
+            false,
+        ),
+        (
+            &["repo", "clone", "x"],
+            "git clone https://<host>/<owner>/<repo>",
+            false,
+        ),
+        (
+            &["repo", "list"],
+            "GH_REPO=<owner>/<repo> gh repo list <owner>",
+            false,
+        ),
+        (
+            &["repo", "list"],
+            "orgs/<org>/repos?per_page=100' --paginate",
+            false,
+        ),
+        (&["extension", "list"], "set GH_REPO=<owner>/<repo>", false),
+        (&["gist", "list"], account, false),
+        (&["ssh-key", "list"], account, false),
+        (&["discussion", "list"], takes, true),
+        (&["search", "issues", "x"], takes, true),
+        (&["codespace", "list"], takes, true),
+        (&["repo", "read-file", "x"], takes, true),
+        (&["repo", "rename", "y"], takes, true),
+        (&["repo", "autolink", "list"], takes, true),
+        (&["repo", "deploy-key", "list"], takes, true),
+        (&["workflow", "list"], takes, true),
+    ];
+    for (arguments, advice, takes_r) in cases {
+        // When: knives invokes gh on a call that names no repository.
+        let output = knives_cmd(scratch.path())
+            .arg("gh")
+            .arg("--")
+            .args(arguments)
+            .current_dir(scratch.path())
+            .env_remove("GH_TOKEN")
+            .env_remove("GH_REPO")
+            .env("KNIVES_REAL_GH", dir.path().join("gh"))
+            .env("FAKE_GH_LOG", &log)
+            .output()
+            .expect("run knives gh");
+
+        // Then: the advice names a spelling that command accepts.
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(advice), "{arguments:?}: {stderr}");
+        assert_eq!(
+            stderr.contains("pass -R"),
+            takes_r,
+            "{arguments:?}: {stderr}"
+        );
+        if advice == account {
+            assert!(!stderr.contains("GH_REPO"), "{arguments:?}: {stderr}");
+        }
+    }
+}
+
+#[test]
+fn local_commands_print_no_target_line() {
+    // Given: a directory with no remote, and commands that never call the API.
+    let scratch = tempfile::tempdir().expect("scratch");
+    let (dir, log) = fake_gh();
+    let cases: [&[&str]; 4] = [
+        &["alias", "list"],
+        &["--version"],
+        &["skill", "list"],
+        &["attestation", "trusted-root"],
+    ];
+    for arguments in cases {
+        // When: knives invokes gh on one.
+        let output = knives_cmd(scratch.path())
+            .arg("gh")
+            .arg("--")
+            .args(arguments)
+            .current_dir(scratch.path())
+            .env_remove("GH_TOKEN")
+            .env_remove("GH_REPO")
+            .env("KNIVES_REAL_GH", dir.path().join("gh"))
+            .env("FAKE_GH_LOG", &log)
+            .output()
+            .expect("run knives gh");
+
+        // Then: no no-target line is printed.
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains("no target repository"),
+            "{arguments:?}: {stderr}"
+        );
+    }
+}
+
+#[test]
 fn a_resolved_owner_prints_no_target_hint() {
     // Given: a call naming its repository with -R.
     let scratch = tempfile::tempdir().expect("scratch");

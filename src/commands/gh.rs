@@ -101,9 +101,9 @@ pub fn run(args: &[String]) -> anyhow::Result<std::convert::Infallible> {
                 std::process::exit(1);
             }
         };
-        if resolved.is_none() {
+        if let (None, Some(remedy)) = (&resolved, no_target_remedy(args)) {
             eprintln!(
-                "knives gh: no target repository (no -R/--repo flag, no owner in the api path, and no GitHub remote in {}); pass -R <owner>/<repo>, or run from a checkout of it. Setting GH_TOKEN bypasses App routing.",
+                "knives gh: no target repository (no -R/--repo flag, no owner in the api path, and no GitHub remote in {}); {remedy} Setting GH_TOKEN bypasses App routing.",
                 cwd.display()
             );
         }
@@ -184,6 +184,51 @@ pub fn run(args: &[String]) -> anyhow::Result<std::convert::Infallible> {
         gh_exit_code(&mut gh)
     };
     std::process::exit(exit_code);
+}
+
+/// What names a repository for this command when nothing routed it, or None for
+/// a local command that runs with no login and so needs no target. Only
+/// the commands in the `-R` arm take `-R`; gh rejects it elsewhere as an unknown
+/// flag. Account-wide commands have no repository to route by, and an App token
+/// cannot run them, so they get no `GH_REPO` advice: following it would fail, or
+/// fall back to a personal token.
+fn no_target_remedy(args: &[String]) -> Option<&'static str> {
+    let mut words = before_terminator(args)
+        .iter()
+        .filter(|argument| !argument.starts_with('-'))
+        .map(String::as_str);
+    let remedy = match (words.next(), words.next()) {
+        (None | Some("alias" | "config" | "completion" | "licenses" | "help"), _)
+        | (Some("skill"), Some("list"))
+        | (Some("attestation"), Some("trusted-root")) => return None,
+        (
+            Some(
+                "pr" | "issue" | "release" | "run" | "workflow" | "label" | "cache" | "secret"
+                | "variable" | "ruleset" | "browse" | "codespace" | "discussion",
+            ),
+            _,
+        )
+        | (Some("repo"), Some("autolink" | "deploy-key" | "rename" | "read-file" | "read-dir"))
+        | (Some("search"), Some("issues" | "prs" | "code" | "commits"))
+        | (Some("attestation"), Some("download" | "verify"))
+        | (Some("project"), Some("link" | "unlink"))
+        | (Some("agent-task"), Some("create" | "view")) => {
+            "pass -R <owner>/<repo>, or run from a checkout of it."
+        }
+        (Some("gist" | "ssh-key" | "gpg-key" | "org" | "status"), _) => {
+            "no repository routes this command, an App token cannot run it, and agent sessions have no ambient login."
+        }
+        (Some("api"), _) => {
+            "gh api takes no -R: put the owner in the path (gh api repos/<owner>/<repo>, gh api 'orgs/<org>/repos?per_page=100' --paginate), or set GH_REPO=<owner>/<repo>."
+        }
+        (Some("repo"), _) => {
+            "gh repo takes no -R here: set GH_REPO and name the repository or owner (GH_REPO=<owner>/<repo> gh repo view <owner>/<repo>, GH_REPO=<owner>/<repo> gh repo list <owner>), or use gh api repos/<owner>/<repo>, gh api 'orgs/<org>/repos?per_page=100' --paginate, or git clone https://<host>/<owner>/<repo>."
+        }
+        _ => {
+            "this command takes no -R: set GH_REPO=<owner>/<repo>, and name the repository where the command takes one."
+        }
+    };
+    Some(remedy)
 }
 
 /// Waits for gh while preserving its interactive terminal ownership and exit code.
