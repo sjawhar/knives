@@ -35,9 +35,9 @@ fn isolate_jj_config() {
 }
 
 /// Runs the installed `jj` — the binary whose on-disk format knives must agree
-/// with — and returns stdout. `JJ_CONFIG` is emptied as in `tests/common/lab.rs`:
-/// a developer's own config (commit signing, attribution layers) must not
-/// reach the fixture.
+/// with — and returns stdout. The constructor above empties `JJ_CONFIG`: a
+/// developer's own config (commit signing, attribution layers) must not reach
+/// the fixture.
 fn jj(cwd: &Path, args: &[&str]) -> String {
     let output = Command::new("jj")
         .args([
@@ -52,7 +52,6 @@ fn jj(cwd: &Path, args: &[&str]) -> String {
         ])
         .args(args)
         .current_dir(cwd)
-        .env("JJ_CONFIG", "/dev/null")
         .output()
         .expect("spawn jj");
     assert!(

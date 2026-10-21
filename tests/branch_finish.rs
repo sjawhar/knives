@@ -56,7 +56,6 @@ fn starting_and_finishing_a_branch_leaves_its_reason_in_the_ledger() {
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
         .env("HOME", lab.temp_path())
-        .env("JJ_CONFIG", "/dev/null")
         .env("KNIVES_OWNER", "ses_fff688")
         .output()
         .expect("run start");
@@ -92,7 +91,6 @@ fn starting_and_finishing_a_branch_leaves_its_reason_in_the_ledger() {
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
         .env("HOME", lab.temp_path())
-        .env("JJ_CONFIG", "/dev/null")
         .env("KNIVES_OWNER", "ses_fff688")
         .output()
         .expect("run finish");
@@ -153,7 +151,6 @@ fn start_claim_for_finish(
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
         .env("HOME", lab.temp_path())
-        .env("JJ_CONFIG", "/dev/null")
         .env("KNIVES_OWNER", owner)
         .output()
         .expect("start held branch");
@@ -177,7 +174,6 @@ fn knives_finish(lab: &lab::Lab, home: &tempfile::TempDir, args: &[&str]) -> std
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
         .env("HOME", lab.temp_path())
-        .env("JJ_CONFIG", "/dev/null")
         .env("KNIVES_OWNER", "ses_fff688")
         .output()
         .expect("run finish")
@@ -199,7 +195,6 @@ fn knives_finish_with_failing_forge(
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
         .env("HOME", lab.temp_path())
-        .env("JJ_CONFIG", "/dev/null")
         .env("KNIVES_OWNER", "ses_fff688")
         .env("XDG_CACHE_HOME", shim.path().join("cache"))
         .env("PATH", path_with_gh_shim(shim.path()))
@@ -321,7 +316,6 @@ fn finish_refuses_to_release_anothers_claim_without_force() {
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
         .env("HOME", lab.temp_path())
-        .env("JJ_CONFIG", "/dev/null")
         .env("KNIVES_OWNER", "agent-two")
         .output()
         .expect("finish another agent's claim");
@@ -372,7 +366,6 @@ fn finish_force_releases_and_records_provenance() {
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
         .env("HOME", lab.temp_path())
-        .env("JJ_CONFIG", "/dev/null")
         .env("KNIVES_OWNER", "agent-two")
         .output()
         .expect("force finish another agent's claim");
@@ -404,7 +397,6 @@ fn finish_force_releases_and_records_provenance() {
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
         .env("HOME", lab.temp_path())
-        .env("JJ_CONFIG", "/dev/null")
         .env("KNIVES_OWNER", "agent-two")
         .output()
         .expect("read forced-release events");
@@ -443,7 +435,6 @@ fn finish_force_requires_why() {
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
         .env("HOME", lab.temp_path())
-        .env("JJ_CONFIG", "/dev/null")
         .output()
         .expect("parse forced finish");
 
@@ -468,7 +459,6 @@ fn finish_by_possession_still_releases() {
         .current_dir(&workspace)
         .env("KNIVES_CONFIG_HOME", home.path())
         .env("HOME", lab.temp_path())
-        .env("JJ_CONFIG", "/dev/null")
         .env_remove("KNIVES_OWNER")
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .env_remove("OMP_SESSION_ID")
@@ -582,7 +572,6 @@ fn stating_a_pull_request_and_a_dependency_leaves_both_statements_in_the_ledger(
             .current_dir(&lab.work)
             .env("KNIVES_CONFIG_HOME", home.path())
             .env("HOME", lab.temp_path())
-            .env("JJ_CONFIG", "/dev/null")
             .env("KNIVES_OWNER", "ses_fff688")
             .output()
             .expect("run knives")
@@ -697,7 +686,6 @@ fn a_fork_only_statement_is_recorded_as_the_decision_it_is() {
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
         .env("HOME", lab.temp_path())
-        .env("JJ_CONFIG", "/dev/null")
         .env("KNIVES_OWNER", "ses_fff688")
         .output()
         .expect("run track");

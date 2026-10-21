@@ -667,7 +667,6 @@ pub fn operation_ids(repo: &std::path::Path) -> Vec<String> {
             "id ++ \"\\n\"",
         ])
         .current_dir(repo)
-        .env("JJ_CONFIG", "/dev/null")
         .env("JJ_USER", "Knives Lab")
         .env("JJ_EMAIL", "knives-lab@example.test")
         .output()
@@ -712,8 +711,7 @@ pub fn release_command(
     command
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
-        .env("HOME", lab.temp_path())
-        .env("JJ_CONFIG", "/dev/null");
+        .env("HOME", lab.temp_path());
     command
 }
 
@@ -725,8 +723,7 @@ pub fn start_command(lab: &Lab, home: &tempfile::TempDir, branch: &str) -> Comma
         .args(["--text", "start", branch, "--repo", "demo", "--why", "test"])
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
-        .env("HOME", lab.temp_path())
-        .env("JJ_CONFIG", "/dev/null");
+        .env("HOME", lab.temp_path());
     command
 }
 
@@ -796,7 +793,6 @@ pub fn jj<const N: usize>(directory: &Path, args: [&str; N]) {
     let status = Command::new("jj")
         .args(args)
         .current_dir(directory)
-        .env("JJ_CONFIG", "/dev/null")
         .env("JJ_USER", "Knives Lab")
         .env("JJ_EMAIL", "knives-lab@example.test")
         .status()
@@ -957,8 +953,7 @@ pub fn knives_command(cwd: &Path, config_home: &Path, scan_home: &Path, args: &[
         .args(args)
         .current_dir(cwd)
         .env("KNIVES_CONFIG_HOME", config_home)
-        .env("HOME", scan_home)
-        .env("JJ_CONFIG", "/dev/null");
+        .env("HOME", scan_home);
     for name in knives::commands::claim::HARNESS_SESSION_VARIABLES {
         command.env_remove(name);
     }
@@ -982,7 +977,6 @@ pub fn session_start(home: &Path, cwd: &Path, session_id: &str) -> std::process:
         .args(["hook", "claude-code"])
         .env("KNIVES_CONFIG_HOME", home)
         .env("HOME", home)
-        .env("JJ_CONFIG", "/dev/null")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -1060,7 +1054,6 @@ fn jj_output<const N: usize>(directory: &Path, args: [&str; N]) -> String {
     let output = Command::new("jj")
         .args(args)
         .current_dir(directory)
-        .env("JJ_CONFIG", "/dev/null")
         .env("JJ_USER", "Knives Lab")
         .env("JJ_EMAIL", "knives-lab@example.test")
         .output()
@@ -1130,7 +1123,6 @@ pub fn newest_operation_description(repo: &Path) -> String {
             "description",
         ])
         .current_dir(repo)
-        .env("JJ_CONFIG", "/dev/null")
         .env("JJ_USER", "Knives Lab")
         .env("JJ_EMAIL", "knives-lab@example.test")
         .output()
@@ -1159,7 +1151,6 @@ pub fn file_at_revision(lab: &Lab, revision: &str, file: &str) -> String {
             revision,
             &format!("root:{file}"),
         ])
-        .env("JJ_CONFIG", "/dev/null")
         .output()
         .expect("show revision file");
     assert!(

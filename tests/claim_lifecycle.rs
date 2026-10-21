@@ -48,7 +48,6 @@ fn start_resumes_the_same_harness_sessions_claim_without_mutating_it() {
             .current_dir(&lab.work)
             .env("KNIVES_CONFIG_HOME", home.path())
             .env("HOME", lab.temp_path())
-            .env("JJ_CONFIG", "/dev/null")
             .env("KNIVES_OWNER", "agent-one")
             .output()
             .expect("run start")
@@ -119,7 +118,6 @@ fn start_refuses_two_anonymous_owners_with_the_same_name() {
             .current_dir(outside.path())
             .env("KNIVES_CONFIG_HOME", home.path())
             .env("HOME", lab.temp_path())
-            .env("JJ_CONFIG", "/dev/null")
             .env_remove("KNIVES_OWNER")
             .env_remove("CLAUDE_CODE_SESSION_ID")
             .env_remove("OMP_SESSION_ID")
@@ -173,7 +171,6 @@ fn start_refuses_another_harness_session_and_names_the_holder() {
             .current_dir(&lab.work)
             .env("KNIVES_CONFIG_HOME", home.path())
             .env("HOME", lab.temp_path())
-            .env("JJ_CONFIG", "/dev/null")
             .env("KNIVES_OWNER", owner)
             .output()
             .expect("run start")
@@ -235,7 +232,6 @@ fn start_from_inside_the_claimed_workspace_resumes_by_possession() {
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
         .env("HOME", lab.temp_path())
-        .env("JJ_CONFIG", "/dev/null")
         .env("KNIVES_OWNER", "agent-one")
         .output()
         .expect("first start");
@@ -251,7 +247,6 @@ fn start_from_inside_the_claimed_workspace_resumes_by_possession() {
         .current_dir(&workspace)
         .env("KNIVES_CONFIG_HOME", home.path())
         .env("HOME", lab.temp_path())
-        .env("JJ_CONFIG", "/dev/null")
         .env_remove("KNIVES_OWNER")
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .env_remove("OMP_SESSION_ID")
@@ -281,7 +276,6 @@ fn start_from_inside_the_claimed_workspace_resumes_by_possession() {
         .current_dir(&workspace)
         .env("KNIVES_CONFIG_HOME", home.path())
         .env("HOME", lab.temp_path())
-        .env("JJ_CONFIG", "/dev/null")
         .env("KNIVES_OWNER", "agent-one")
         .output()
         .expect("read events");
@@ -309,7 +303,6 @@ fn start_force_seizes_and_records_the_previous_owner() {
             .current_dir(&lab.work)
             .env("KNIVES_CONFIG_HOME", home.path())
             .env("HOME", lab.temp_path())
-            .env("JJ_CONFIG", "/dev/null")
             .env("KNIVES_OWNER", owner)
             .output()
             .expect("run start")
@@ -414,7 +407,6 @@ fn start_adopts_an_existing_workspace_for_an_unclaimed_branch() {
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
         .env("HOME", lab.temp_path())
-        .env("JJ_CONFIG", "/dev/null")
         .env("KNIVES_OWNER", "agent-one")
         .output()
         .expect("adopt workspace");
@@ -458,7 +450,6 @@ fn start_adopts_a_no_cleanup_forgotten_workspace_without_resetting_it() {
             .current_dir(&lab.work)
             .env("KNIVES_CONFIG_HOME", home.path())
             .env("HOME", lab.temp_path())
-            .env("JJ_CONFIG", "/dev/null")
             .env("KNIVES_OWNER", "agent-one")
             .output()
             .expect("run start")
@@ -486,7 +477,6 @@ fn start_adopts_a_no_cleanup_forgotten_workspace_without_resetting_it() {
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
         .env("HOME", lab.temp_path())
-        .env("JJ_CONFIG", "/dev/null")
         .env("KNIVES_OWNER", "agent-one")
         .output()
         .expect("finish without cleanup");
@@ -559,7 +549,6 @@ fn start_refuses_a_same_named_workspace_from_another_repository() {
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
         .env("HOME", lab.temp_path())
-        .env("JJ_CONFIG", "/dev/null")
         .env("KNIVES_OWNER", "agent-one")
         .output()
         .expect("start against foreign workspace");
@@ -619,7 +608,6 @@ fn start_resume_reports_a_missing_workspace_without_rebuilding_it() {
             .current_dir(&lab.work)
             .env("KNIVES_CONFIG_HOME", home.path())
             .env("HOME", lab.temp_path())
-            .env("JJ_CONFIG", "/dev/null")
             .env("KNIVES_OWNER", "agent-one")
             .output()
             .expect("run start")
@@ -660,7 +648,6 @@ fn force_claim_does_not_save_state_when_its_provenance_cannot_be_appended() {
             .current_dir(&lab.work)
             .env("KNIVES_CONFIG_HOME", home.path())
             .env("HOME", lab.temp_path())
-            .env("JJ_CONFIG", "/dev/null")
             .env("KNIVES_OWNER", owner)
             .output()
             .expect("run start")
@@ -738,7 +725,6 @@ fn force_finish_does_not_save_state_when_its_provenance_cannot_be_appended() {
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
         .env("HOME", lab.temp_path())
-        .env("JJ_CONFIG", "/dev/null")
         .env("KNIVES_OWNER", "agent-one")
         .output()
         .expect("start claim");
@@ -765,7 +751,6 @@ fn force_finish_does_not_save_state_when_its_provenance_cannot_be_appended() {
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
         .env("HOME", lab.temp_path())
-        .env("JJ_CONFIG", "/dev/null")
         .env("KNIVES_OWNER", "agent-two")
         .output()
         .expect("force finish");
@@ -805,7 +790,6 @@ fn forced_finish_with_supersession_writes_one_atomic_provenance_event() {
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
         .env("HOME", lab.temp_path())
-        .env("JJ_CONFIG", "/dev/null")
         .env("KNIVES_OWNER", "agent-one")
         .output()
         .expect("start claim");
@@ -829,7 +813,6 @@ fn forced_finish_with_supersession_writes_one_atomic_provenance_event() {
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
         .env("HOME", lab.temp_path())
-        .env("JJ_CONFIG", "/dev/null")
         .env("KNIVES_OWNER", "agent-two")
         .output()
         .expect("force finish");
@@ -886,7 +869,6 @@ fn start_refuses_a_forgotten_same_repo_workspace_with_a_different_name_before_re
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
         .env("HOME", lab.temp_path())
-        .env("JJ_CONFIG", "/dev/null")
         .env("KNIVES_OWNER", "agent-one")
         .output()
         .expect("start against another branch workspace");
@@ -934,7 +916,6 @@ fn start_refuses_a_malformed_foreign_workspace_before_loading_it() {
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
         .env("HOME", lab.temp_path())
-        .env("JJ_CONFIG", "/dev/null")
         .env("KNIVES_OWNER", "agent-one")
         .output()
         .expect("start against malformed foreign workspace");
@@ -974,7 +955,6 @@ fn start_force_without_why_is_a_usage_error() {
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
         .env("HOME", lab.temp_path())
-        .env("JJ_CONFIG", "/dev/null")
         .output()
         .expect("parse start");
 
@@ -1004,7 +984,6 @@ fn cli_dispatch_records_an_observation_before_running_the_command() {
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
         .env("HOME", lab.temp_path())
-        .env("JJ_CONFIG", "/dev/null")
         .env("KNIVES_OWNER", "agent-one")
         .output()
         .expect("run knives");
