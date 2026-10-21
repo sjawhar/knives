@@ -63,6 +63,8 @@ the agent's context instead of the claims notice. See
   never hand-composed bookmarks. `--allow-drop` states an intentional content
   drop; it is not a generic way past a refusal. Read the pin gates and cut
   evidence in [releases](references/releases.md) before any release mutation.
+  A fork with named release series (one per base, e.g. 9.3 and 9.2) needs
+  `knives release --series <name>` to act on any series but the default.
 - **Before a raw branch rebase, use fork-work's bidirectional ancestry check:**
   does the branch parent a release/keep merge, or descend from one? Bare
   `release members` sees only the release in hand, not retained older cuts.

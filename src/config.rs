@@ -198,6 +198,10 @@ impl BaseRemote {
         }
     }
 
+    #[expect(
+        clippy::trivially_copy_pass_by_ref,
+        reason = "serde's skip_serializing_if passes the field by reference"
+    )]
     const fn is_upstream(&self) -> bool {
         matches!(self, Self::Upstream)
     }

@@ -91,6 +91,20 @@ members.
 with `release cut NAME`, when the in-place edit pin gate requires a new name.
 Do not hand-compose a release bookmark and then advance it.
 
+**Named series:** an entry with `[repos.<name>.series.<series>]` tables carries
+one dated line per base. The default series is the entry's own `base` and its
+`release/YYYY-MM-DD[.N]` cuts; series `<series>` cuts
+`release/<series>/YYYY-MM-DD[.N]` on its own base. Every release verb takes
+`--series <series>` (`knives release --series 9.2 cut release/9.2/2026-10-20`)
+and then sees only that series' cuts, base, ledger baseline, reap set and
+consumer pins (`refs/heads/release/<series>/*`); without it, the default series.
+A branch belongs to the series whose base it forks from latest. The first cut
+composes only that series' branches, the plan lists only them, and `include` or
+`advance` of a branch from another series is refused with the series it fits; a
+branch that fits no series (it forks from two bases at the same point, or a base
+it would need is not fetched) is refused with the fork points. `audit` checks
+drift for every series' cuts.
+
 **Fixed scheme:** `release_branch = "<name>"` means cuts advance that branch in
 place through jj's internal allow-backwards mechanism. Use `release cut` without
 a name; a dated name is refused. The cut uses the local composition in hand,

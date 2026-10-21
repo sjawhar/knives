@@ -126,8 +126,9 @@ pub enum SeriesFit {
     None(String),
 }
 
-/// The series a branch tip belongs to: the one whose base it forks from
-/// latest. A branch of series 9.2 forks from `v9.2+typewise-isomorphism` at
+/// The series a branch tip belongs to: the one whose base it forks from latest.
+///
+/// A branch of series 9.2 forks from that series' base (say `v9.2+ours`) at
 /// or after that base's tip, and from the default trunk only where the two
 /// bases split, so its fork point with 9.2's base descends from its fork point
 /// with every other base. A tip whose fork points tie or criss-cross fits no
@@ -194,16 +195,20 @@ pub fn series_fit(
     })
 }
 
-/// The branches of `carried` that belong to the selected series, and a line
-/// for each that fits no series. Another series' branches are left out
-/// silently: they are that series' members, and so is every series' base,
-/// which members fork from and never are. An entry without named series
-/// keeps every branch, so nothing changes for it.
+/// A series' member branches, and a line for each that fits no series.
+pub type SeriesMembers = (Vec<(String, CommitId)>, Vec<String>);
+
+/// The branches of `carried` that belong to the selected series.
+///
+/// Each branch that fits no series yields a line saying why. Another series'
+/// branches are left out silently: they are that series' members, and so is
+/// every series' base, which members fork from and never are. An entry
+/// without named series keeps every branch, so nothing changes for it.
 pub fn series_members(
     repo: &Repo,
     entry: &RepoEntry,
     carried: Vec<(String, CommitId)>,
-) -> Result<(Vec<(String, CommitId)>, Vec<String>), jj::JjError> {
+) -> Result<SeriesMembers, jj::JjError> {
     if entry.series.is_empty() {
         return Ok((carried, Vec::new()));
     }
@@ -769,9 +774,10 @@ pub fn last_recorded_cut(entries: &[Entry], subject: Option<&str>) -> Option<Rec
     })
 }
 
-/// The newest structural cut event of the series `entry` selects: the
-/// baseline a cut of that series is held against. An entry without named
-/// series reads every cut event, as it always has; with them, another
+/// The newest structural cut event of the series `entry` selects.
+///
+/// It is the baseline a cut of that series is held against. An entry without
+/// named series reads every cut event, as it always has; with them, another
 /// series' cut never stands in as this series' previous composition.
 pub fn last_series_cut(entries: &[Entry], entry: &RepoEntry) -> Option<RecordedCut> {
     if entry.series.is_empty() {

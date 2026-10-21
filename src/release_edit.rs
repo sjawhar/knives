@@ -13,8 +13,9 @@ use knives::forge::github::CliForge;
 use knives::ids::{BranchName, CommitId, ReleaseScheme, RepoName};
 use knives::ledger::{Draft, Kind, Ledger};
 use knives::release_model::{
-    MemberEvidence, MemberLookup, MemberSuccession, StackedHistoryContext, carried_from_tips,
-    last_recorded_parents, member_parents, members_event_text, trunk_positions,
+    MemberEvidence, MemberLookup, MemberSuccession, SeriesFit, StackedHistoryContext,
+    carried_from_tips, last_recorded_parents, member_parents, members_event_text, series_fit,
+    trunk_positions,
 };
 
 use super::scribe_for;
@@ -90,6 +91,8 @@ struct EditContext<'a> {
     repo: &'a RepoName,
     opened: &'a knives::jj::Repo,
     release: &'a ReleaseInHand,
+    /// The registry entry, bound to the series this command acts on.
+    entry: &'a knives::config::RepoEntry,
     /// The fork the current directory is inside, by the name its claims are
     /// kept under; the ledger event's author is derived from it.
     bound: Bound<'a>,
@@ -108,6 +111,38 @@ struct EditContext<'a> {
 }
 
 impl EditContext<'_> {
+    /// Refuse, saying why, a branch that belongs to another release series or
+    /// to none; `false` for a member of the selected series. An entry without
+    /// named series has one series, so every branch belongs to it.
+    fn refuse_if_other_series(
+        &self,
+        branch: &str,
+        tip: &knives::ids::CommitId,
+        before: &str,
+    ) -> anyhow::Result<bool> {
+        if self.entry.series.is_empty() {
+            return Ok(false);
+        }
+        match series_fit(self.opened, self.entry, tip)? {
+            SeriesFit::Selected => Ok(false),
+            SeriesFit::Other(label) => {
+                println!(
+                    "{}: {branch} forks from the base of release series {label}, not {}'s; \
+                     refusing {before}: `knives release --series <name>` acts on its series",
+                    self.repo, self.release.name
+                );
+                Ok(true)
+            }
+            SeriesFit::None(why) => {
+                println!(
+                    "{}: {branch} belongs to no release series: {why}; refusing {before}",
+                    self.repo
+                );
+                Ok(true)
+            }
+        }
+    }
+
     /// Refuse a branch whose history past the trunk carries a merge, saying so;
     /// `false` for a linear one.
     ///
@@ -303,6 +338,7 @@ fn edit_release(
         repo,
         opened: &opened,
         release: &release,
+        entry,
         recorded: last_recorded_parents(&ledger, &release.name),
         bound,
         stacked: StackedHistoryContext {
@@ -509,6 +545,9 @@ fn include_edit(
         );
         return Ok(EditOutcome::Settled(Exit::Incomplete));
     }
+    if context.refuse_if_other_series(target, &tip, "including it")? {
+        return Ok(EditOutcome::Settled(Exit::Incomplete));
+    }
     if context.refuse_if_stacked(target, &tip, "including it")? {
         return Ok(EditOutcome::Settled(Exit::Incomplete));
     }
@@ -635,6 +674,14 @@ fn advance_edit(
 ) -> anyhow::Result<EditOutcome> {
     let tips = context.opened.bookmark_tips()?;
     let carried = carried_from_tips(&tips, entry.trunk(), &entry.release_scheme());
+    // A bare advance considers only the selected series' branches: another
+    // series' branch never succeeds one of this release's members, and one
+    // that fits no series is refused when named, not guessed about here.
+    let carried = if from.is_none() && branches.is_empty() {
+        knives::release_model::series_members(context.opened, entry, carried)?.0
+    } else {
+        carried
+    };
     let outcome = if let Some(from) = from {
         let [branch] = branches else {
             println!(
@@ -822,6 +869,9 @@ fn advance_named_members(
             );
             return Ok(None);
         }
+        if context.refuse_if_other_series(branch.as_str(), &tip, "advancing onto it")? {
+            return Ok(None);
+        }
         if context.refuse_if_stacked(branch.as_str(), &tip, "advancing onto it")? {
             return Ok(None);
         }
@@ -919,6 +969,9 @@ fn advance_named_member_from(
              work nobody included and put the cut in its own ancestry",
             release.name
         );
+        return Ok(None);
+    }
+    if context.refuse_if_other_series(branch.as_str(), &tip, "advancing onto it")? {
         return Ok(None);
     }
     if context.refuse_if_stacked(branch.as_str(), &tip, "advancing onto it")? {

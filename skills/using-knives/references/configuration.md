@@ -19,7 +19,9 @@ separate release remote has it.
 Prints a paste-ready `[repos.<name>]` TOML entry to stdout, instructions to stderr.
 Default DIR is the current directory; any subdirectory or `start` workspace of a
 checkout works. If its upstream is already registered, prints `already registered
-as <name>` and exits `0`: one upstream cannot identify two entries.
+as <name>` and exits `0`: one upstream cannot identify two entries. A fork that
+releases on more than one base is still one entry: declare the extra bases as
+release series (below), not as a second entry.
 
 The caller/human pastes the snippet into `repos.toml`, replacing any existing
 section of that name rather than appending a duplicate. Registry edits take
@@ -53,6 +55,15 @@ origin = "https://forge.example/ours/tool"
 release_branch = "integration"
 workspaces = "~/.worktrees/tool"
 
+[repos.prover]
+upstream = "https://forge.example/org/prover"
+origin = "https://forge.example/ours/prover"
+base = "v9.3"
+
+[repos.prover.series."9.2"]
+base = "v9.2+ours"
+base_remote = "origin"
+
 [trust]
 repos = ["company/workbench"]
 owners = ["ours", "company"]
@@ -70,7 +81,18 @@ refused. A `path` field is refused. Optional fields:
   defaults to `main`. Upstreams using another trunk, such as `dev`, state it here.
 - `release`: distinct publish URL; defaults to origin.
 - `release_branch`: fixed release name instead of dated cuts. Cannot be empty,
-  equal to base, or under the `release/` prefix.
+  equal to base, or under the `release/` prefix. Cannot be combined with `series`.
+- `series.<name>`: a named release series with its own `base`, beside the
+  default series (the entry's own `base`, cutting `release/YYYY-MM-DD[.N]`). A
+  named series cuts `release/<name>/YYYY-MM-DD[.N]`; select it with
+  `knives release --series <name> …`. `base_remote` (`upstream`, the default,
+  or `origin`) says which remote holds the base; a base pinned on the fork, such
+  as a frozen version branch, uses `origin`. The name is one `/`-free segment
+  and cannot look like a date; each series' base must differ from every other's
+  and the default trunk, and cannot sit under `release/`. A branch belongs to
+  the series whose base it forks from latest: a cut composes only its series'
+  branches, and `include`/`advance` refuse a branch of another series or of
+  none, saying which. An entry without `series` behaves exactly as before.
 - `consumers`: forge `owner/repo` slugs whose trunks pin releases. Cached by
   consumer commit; ad-hoc local paths belong in `--consumer PATH`, not this list.
 - `workspaces`: parent directory for `start` workspaces and `finish` cleanup.

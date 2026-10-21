@@ -151,7 +151,7 @@ pub fn gather(input: &AuditInput<'_>) -> Report {
         &ReleaseDriftScan {
             local: &local,
             published: live.release(),
-            scheme: &scheme,
+            schemes: &release_schemes(entry),
             publish_remote: entry.publish_remote(),
             entries: input.store.ledger_entries(&fork.upstream),
         },
@@ -354,9 +354,19 @@ fn release_zombies(
 struct ReleaseDriftScan<'a> {
     local: &'a BTreeMap<BranchName, CommitId>,
     published: &'a BTreeMap<String, CommitId>,
-    scheme: &'a crate::ids::ReleaseScheme,
+    schemes: &'a [crate::ids::ReleaseScheme],
     publish_remote: &'a str,
     entries: &'a [Entry],
+}
+
+/// Every series' release scheme: each series' cuts are recorded in the same
+/// ledger, so drift is checked for all of them, not only the default's.
+fn release_schemes(entry: &RepoEntry) -> Vec<crate::ids::ReleaseScheme> {
+    entry
+        .all_series()
+        .iter()
+        .map(RepoEntry::release_scheme)
+        .collect()
 }
 
 struct ReleaseDrift<'a> {
@@ -370,13 +380,13 @@ fn add_release_drifts(report: &mut Report, scan: &ReleaseDriftScan<'_>) {
     let ReleaseDriftScan {
         local,
         published,
-        scheme,
+        schemes,
         publish_remote,
         entries,
     } = *scan;
     for (branch, current) in local
         .iter()
-        .filter(|(branch, _)| is_release_name(branch, scheme))
+        .filter(|(branch, _)| schemes.iter().any(|scheme| is_release_name(branch, scheme)))
     {
         add_release_drift(
             report,
@@ -393,7 +403,10 @@ fn add_release_drifts(report: &mut Report, scan: &ReleaseDriftScan<'_>) {
             continue;
         };
         let branch = BranchName::new(name);
-        if !is_release_name(&branch, scheme) {
+        if !schemes
+            .iter()
+            .any(|scheme| is_release_name(&branch, scheme))
+        {
             continue;
         }
         add_release_drift(
@@ -935,7 +948,7 @@ mod tests {
             &ReleaseDriftScan {
                 local: &BTreeMap::new(),
                 published: &published,
-                scheme: &crate::ids::ReleaseScheme::Dated,
+                schemes: &[crate::ids::ReleaseScheme::Dated],
                 publish_remote: "release",
                 entries: &entries,
             },

@@ -164,9 +164,11 @@ fn freezes_commit(pin: &Pin, commit: &CommitId) -> bool {
     abbreviates(&pin.reference) || pin.locked.as_deref().is_some_and(abbreviates)
 }
 
-/// The name a cut takes. A dated name must be one this series owns: a name
-/// another series owns, such as `release/9.2/<date>` cut from the default
-/// series, would be that series' newest cut, carrying this series' members.
+/// The name a cut takes.
+///
+/// A dated name must be one this series owns: a name another series owns,
+/// such as `release/9.2/<date>` cut from the default series, would be that
+/// series' newest cut, carrying this series' members.
 pub fn cut_name(scheme: &ReleaseScheme, requested: Option<&str>) -> Result<String, String> {
     match (scheme, requested) {
         (ReleaseScheme::Dated | ReleaseScheme::Series(_), Some(name)) if scheme.owns(name) => {
@@ -646,6 +648,23 @@ fn live_dated_release(
         .map(|(reference, commit)| (reference.branch().clone(), commit.clone()))
 }
 
+/// The plan's note for a series with no cut yet.
+fn no_cut_yet(scheme: &ReleaseScheme) -> String {
+    match scheme {
+        ReleaseScheme::Dated => {
+            "no dated release found; the first cut has nothing to repair".to_owned()
+        }
+        ReleaseScheme::Series(series) => {
+            format!("series {series} has no cut yet; the first cut has nothing to repair")
+        }
+        ReleaseScheme::Fixed(fixed) => {
+            format!(
+                "fixed release branch {fixed} has no cut yet; the first cut has nothing to repair"
+            )
+        }
+    }
+}
+
 /// The release in hand and what it does not carry.
 ///
 /// `ledger` is this repository's ledger, read by the caller: the last recorded
@@ -674,17 +693,7 @@ pub fn plan(
     let newest = newest_release(&tips, &scheme, publish_remote);
 
     let Some((reference, commit)) = newest else {
-        plan.notes.push(match &scheme {
-            ReleaseScheme::Dated => {
-                "no dated release found; the first cut has nothing to repair".to_owned()
-            }
-            ReleaseScheme::Series(series) => format!(
-                "series {series} has no cut yet; the first cut has nothing to repair"
-            ),
-            ReleaseScheme::Fixed(fixed) => {
-                format!("fixed release branch {fixed} has no cut yet; the first cut has nothing to repair")
-            }
-        });
+        plan.notes.push(no_cut_yet(&scheme));
         return Ok(plan);
     };
     plan.release = Some(reference.to_string());
@@ -741,6 +750,14 @@ pub fn plan(
         }
     }
     plan.stale = stale_parents(&member_parents, &tips);
+    // Only the selected series' branches are candidates; one that fits no
+    // series is named with the reason, since every verb would refuse it.
+    let (series_branches, unfit) = crate::release_model::series_members(
+        &repo,
+        entry,
+        carried_from_tips(&tips, entry.trunk(), &scheme),
+    )?;
+    plan.notes.extend(unfit);
     plan.notes.extend(local_branch_notes(&LocalBranchNotes {
         repo: &repo,
         reference: &reference.to_string(),
@@ -748,7 +765,7 @@ pub fn plan(
         parents: &parents,
         trunks: &trunks,
         stacked: stacked_context,
-        branches: &carried_from_tips(&tips, entry.trunk(), &scheme),
+        branches: &series_branches,
         recorded: last_recorded_parents(ledger, &reference.to_string()),
     })?);
     plan.parents = parents

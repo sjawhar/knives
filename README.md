@@ -192,6 +192,15 @@ origin = "https://forge.example/ours/tool"
 release_branch = "integration"        # optional: fixed release branch instead of dated cuts
 workspaces = "~/.worktrees/tool"      # optional: where `knives start` opens branch workspaces
 
+[repos.prover]
+upstream = "https://forge.example/org/prover"
+origin = "https://forge.example/ours/prover"
+base = "v9.3"                         # the default series: cuts release/YYYY-MM-DD[.N]
+
+[repos.prover.series."9.2"]             # optional: a second release series, cuts release/9.2/YYYY-MM-DD[.N]
+base = "v9.2+ours"    #   its own base; `knives release --series 9.2 ...` acts on it
+base_remote = "origin"                #   optional: the remote holding the base (defaults to upstream)
+
 [trust]
 repos = ["company/workbench"]         # repositories whose AGENTS.md is injected, by identity
 owners = ["ours", "company"]          # every repository under these owners

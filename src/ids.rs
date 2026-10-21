@@ -298,9 +298,11 @@ pub fn is_release_name(branch: &BranchName, scheme: &ReleaseScheme) -> bool {
     }
 }
 
-/// Whether `name` is a dated cut of any series of a fork: the default series'
-/// `release/YYYY-MM-DD[.N]` or a named series' `release/<series>/YYYY-MM-DD[.N]`.
-/// Every series' cut is a release commit, never an orphan of another's.
+/// Whether `name` is a dated cut of any series of a fork.
+///
+/// That is the default series' `release/YYYY-MM-DD[.N]` or a named series'
+/// `release/<series>/YYYY-MM-DD[.N]`. Every series' cut is a release commit,
+/// never an orphan of another's.
 pub fn any_dated_cut(name: &str) -> bool {
     ReleaseScheme::Dated.dated_cut(name).is_some()
         || name
