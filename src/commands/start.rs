@@ -16,9 +16,9 @@ use crate::config::Role;
 use crate::detect::BookmarkTips;
 use crate::ids::{BookmarkRef, BranchName, BranchTarget, CommitId, RemoteName, WorkspaceName};
 use crate::jj::{
-    Repo, StaleRegistration, WorkspaceIdentity, add_workspace, fetch_all, is_workspace_named,
-    remove_prunable_worktree, repo_immutable_heads, set_repo_immutable_heads, user_immutable_heads,
-    workspace_identity,
+    Repo, StaleRegistration, WorkspaceIdentity, add_workspace, fetch_all, forget_workspace,
+    is_workspace_named, remove_finished_worktree, remove_prunable_worktree, repo_immutable_heads,
+    set_repo_immutable_heads, user_immutable_heads, workspace_identity,
 };
 use crate::ledger::{Ledger, Scribe};
 use crate::release_model::newest_release;
@@ -354,7 +354,7 @@ fn take_claim(context: &mut StartContext<'_>, reason: &str) -> anyhow::Result<Ex
         return Ok(Exit::Ok);
     }
 
-    let (base_revision, base_label) = match create_workspace(context)? {
+    let (base_revision, base_label) = match create_workspace(context, Leftovers::Keep)? {
         WorkspaceBase::Created { revision, label } => (revision, label),
         WorkspaceBase::Divergent(tips) => {
             // Nothing was claimed: the agent picks a tip and starts again.
@@ -480,7 +480,7 @@ fn workspace_notice(
             workspace_change(&context.opened, &context.workspace)?,
         )));
     }
-    Ok(match create_workspace(context)? {
+    Ok(match create_workspace(context, Leftovers::Clear)? {
         WorkspaceBase::Created { revision, label } => Ok(format!(
             "created missing workspace {} at {} based on {revision} ({label})",
             context.destination.display(),
@@ -491,6 +491,41 @@ fn workspace_notice(
         )),
         WorkspaceBase::Divergent(tips) => Err(divergent_refusal_line(context.branch, &tips)),
     })
+}
+
+/// What [`create_workspace`] does with what a workspace whose directory vanished
+/// left behind at the branch's name and path.
+#[derive(Clone, Copy)]
+enum Leftovers {
+    /// A plain `start`: remove a prunable Git registration, and refuse on a
+    /// locked one, which cannot be told apart from another machine's live
+    /// workspace in a shared store.
+    Keep,
+    /// A seized or forced claim, whose `--why` takes the workspace over: forget
+    /// jj's registration of the name, then remove git's of the path, locked or
+    /// not, so the rebuild's `add` can reuse both.
+    Clear,
+}
+
+fn clear_vanished_workspace(context: &StartContext<'_>) -> anyhow::Result<()> {
+    let checkout = &context.fork.checkout.path;
+    let shown = context.destination.display();
+    let registered = context
+        .opened
+        .workspaces()?
+        .iter()
+        .any(|(name, _)| *name == context.workspace);
+    if registered {
+        forget_workspace(checkout, context.workspace.as_str())?;
+        println!(
+            "forgot workspace {} (its directory at {shown} was gone)",
+            context.workspace
+        );
+    }
+    if remove_finished_worktree(checkout, &context.destination)? {
+        println!("removed a stale Git worktree registration at {shown} (its directory was gone)");
+    }
+    Ok(())
 }
 
 /// Where a new workspace's working copy was put, or why it was not.
@@ -528,7 +563,10 @@ fn divergent_refusal_line(branch: &BranchName, tips: &[CommitId]) -> String {
 /// forks from; without a release, the fetched upstream trunk. Never the current
 /// `@`: an agent in a release workspace could otherwise run `jj new` and
 /// silently inherit the release merge as a parent.
-fn create_workspace(context: &StartContext<'_>) -> anyhow::Result<WorkspaceBase> {
+fn create_workspace(
+    context: &StartContext<'_>,
+    leftovers: Leftovers,
+) -> anyhow::Result<WorkspaceBase> {
     let entry = context.fork.entry;
     let checkout = &context.fork.checkout.path;
     fetch_all(checkout)?;
@@ -572,21 +610,22 @@ fn create_workspace(context: &StartContext<'_>) -> anyhow::Result<WorkspaceBase>
         }
     };
     // A registration whose directory is gone would make `add` fail on git's
-    // "already registered" and leave an empty directory at the path. A locked
-    // one stays: from here it cannot be told apart from another machine's live
-    // workspace in a shared store, so the branch's own `finish` clears it.
-    match remove_prunable_worktree(checkout, &context.destination)? {
-        StaleRegistration::None => {}
-        StaleRegistration::Removed => println!(
-            "removed a stale Git worktree registration at {} (its directory was gone)",
-            context.destination.display()
-        ),
-        StaleRegistration::Locked => anyhow::bail!(
-            "a locked Git worktree registration at {} has no directory there; if it is this \
-             branch's and no other machine has it open, `knives finish {}` clears it",
-            context.destination.display(),
-            context.branch
-        ),
+    // "already registered" and leave an empty directory at the path.
+    match leftovers {
+        Leftovers::Clear => clear_vanished_workspace(context)?,
+        Leftovers::Keep => match remove_prunable_worktree(checkout, &context.destination)? {
+            StaleRegistration::None => {}
+            StaleRegistration::Removed => println!(
+                "removed a stale Git worktree registration at {} (its directory was gone)",
+                context.destination.display()
+            ),
+            StaleRegistration::Locked => anyhow::bail!(
+                "a locked Git worktree registration at {} has no directory there; if it is \
+                 this branch's and no other machine has it open, `knives finish {}` clears it",
+                context.destination.display(),
+                context.branch
+            ),
+        },
     }
     add_workspace(
         checkout,

@@ -648,6 +648,78 @@ fn start_keeps_a_locked_git_registration_whose_directory_is_gone() {
     assert!(!workspace.exists(), "start left something at the path");
 }
 
+/// Starts `feat/alpha`, removes its workspace directory by hand, then follows
+/// the rebuild the resumed `start` prints. `lock` locks the Git registration
+/// first, as a wrapper guarding live workspaces does; without it the
+/// registration is unlocked whatever a wrapper on PATH did on add.
+fn assert_the_printed_rebuild_recreates_a_vanished_workspace(lock: bool) {
+    let lab = Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let started = knives_start(&lab, &home, "feat/alpha");
+    assert!(
+        started.status.success(),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let workspace = lab.work.parent().expect("parent").join("feat-alpha");
+    let worktree = |args: &[&str]| {
+        Command::new("git")
+            .arg("worktree")
+            .args(args)
+            .arg(&workspace)
+            .current_dir(&lab.work)
+            .output()
+            .expect("git worktree")
+    };
+    let _ = worktree(&["unlock"]);
+    if lock {
+        assert!(
+            worktree(&["lock", "--reason", "test lock"])
+                .status
+                .success()
+        );
+    }
+    std::fs::remove_dir_all(&workspace).expect("remove the workspace directory by hand");
+
+    // Given: the resumed start names the rebuild
+    let resumed = knives_start(&lab, &home, "feat/alpha");
+    let stdout = String::from_utf8_lossy(&resumed.stdout);
+    assert!(resumed.status.success(), "{stdout}");
+    assert!(
+        stdout.contains("`knives start feat/alpha --force --why \"…\"` rebuilds it"),
+        "{stdout}"
+    );
+
+    // When: it is run
+    let rebuilt = start_command(&lab, &home, "feat/alpha")
+        .arg("--force")
+        .output()
+        .expect("run the rebuild");
+
+    // Then: the workspace is back at its path
+    let stdout = String::from_utf8_lossy(&rebuilt.stdout);
+    assert!(
+        rebuilt.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&rebuilt.stderr)
+    );
+    assert!(stdout.contains("created missing workspace"), "{stdout}");
+    assert!(
+        workspace.join(".jj").is_dir(),
+        "the workspace was not rebuilt"
+    );
+}
+
+#[test]
+fn the_printed_rebuild_recreates_a_vanished_workspace() {
+    assert_the_printed_rebuild_recreates_a_vanished_workspace(false);
+}
+
+#[test]
+fn the_printed_rebuild_recreates_a_vanished_workspace_whose_registration_is_locked() {
+    assert_the_printed_rebuild_recreates_a_vanished_workspace(true);
+}
+
 #[test]
 fn a_failed_workspace_add_leaves_no_empty_directory() {
     // jj creates the destination before git registers it as a worktree; when
