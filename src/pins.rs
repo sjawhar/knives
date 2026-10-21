@@ -107,7 +107,7 @@ pub fn scan(file: &str, text: &str, scheme: &ReleaseScheme) -> PinScan {
         // false negative on the exact question this command exists to answer.
         let decoded = line.replace("%2F", "/").replace("%2f", "/");
         let start = match scheme {
-            ReleaseScheme::Dated => decoded.find("release/"),
+            ReleaseScheme::Dated | ReleaseScheme::Series(_) => decoded.find("release/"),
             ReleaseScheme::Fixed(name) => {
                 decoded.match_indices(name.as_str()).find_map(|(start, _)| {
                     let preceding = decoded[..start].chars().next_back();
@@ -138,8 +138,11 @@ pub fn scan(file: &str, text: &str, scheme: &ReleaseScheme) -> PinScan {
             .chars()
             .take_while(|c| !c.is_whitespace() && !matches!(c, '"' | '\'' | ',' | '#' | ')'))
             .collect();
+        // A pin on another series' cut is off this series' scheme: comparing it
+        // with this series' newest cut would call it lagging a release it
+        // never followed.
         let is_valid = match scheme {
-            ReleaseScheme::Dated => reference.len() > "release/".len(),
+            ReleaseScheme::Dated | ReleaseScheme::Series(_) => scheme.owns(&reference),
             ReleaseScheme::Fixed(name) => reference == name.as_str(),
         };
         if !is_valid {

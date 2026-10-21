@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{RepoName, UpstreamName};
+use crate::ids::{ReleaseScheme, RepoName, SeriesName, UpstreamName};
 
 #[cfg(test)]
 #[allow(
@@ -164,6 +164,59 @@ pub struct RepoEntry {
     /// fork's ledger is not shared and stays on each machine that writes it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ledger: Option<String>,
+    /// Named release series beside the default one, keyed by series name. The
+    /// entry's own `base` is the default series; each named series has its own
+    /// base and its own dated cuts, `release/<series>/YYYY-MM-DD[.N]`, so one
+    /// fork can carry releases on two bases at once. Absent, the fork has the
+    /// default series only.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub series: BTreeMap<String, SeriesEntry>,
+    /// The series the release verbs act on: set by [`RepoEntry::for_series`]
+    /// for one command, never read from or written to the registry. `None`
+    /// is the default series, and every reader that is not a release verb
+    /// sees that.
+    #[serde(skip)]
+    pub selected_series: Option<SeriesName>,
+}
+
+/// Which remote holds a series' base branch.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BaseRemote {
+    /// Upstream's own branch, as the entry's `base` is.
+    #[default]
+    Upstream,
+    /// A branch of our fork, such as a frozen backport line upstream does not have.
+    Origin,
+}
+
+impl BaseRemote {
+    pub const fn role(self) -> Role {
+        match self {
+            Self::Upstream => Role::Upstream,
+            Self::Origin => Role::Origin,
+        }
+    }
+
+    #[expect(
+        clippy::trivially_copy_pass_by_ref,
+        reason = "serde's skip_serializing_if passes the field by reference"
+    )]
+    const fn is_upstream(&self) -> bool {
+        matches!(self, Self::Upstream)
+    }
+}
+
+/// One named release series: its base, and where that base lives.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SeriesEntry {
+    /// The branch this series' members fork from and its cuts are measured
+    /// against, as the entry's `base` is for the default series.
+    pub base: String,
+    /// The remote holding `base`. Defaults to upstream.
+    #[serde(default, skip_serializing_if = "BaseRemote::is_upstream")]
+    pub base_remote: BaseRemote,
 }
 
 impl RepoEntry {
@@ -180,7 +233,36 @@ impl RepoEntry {
             workspaces: None,
             forbidden: Vec::new(),
             ledger: None,
+            series: BTreeMap::new(),
+            selected_series: None,
         }
+    }
+
+    /// This entry with `series` selected for the release verbs: its base is
+    /// the trunk they measure against, and its cuts are the releases they
+    /// act on. The error names the series the entry has.
+    pub fn for_series(&self, series: &str) -> Result<Self, String> {
+        if !self.series.contains_key(series) {
+            let known: Vec<&str> = self.series.keys().map(String::as_str).collect();
+            return Err(if known.is_empty() {
+                format!("no release series {series:?}: this entry has only its default series")
+            } else {
+                format!(
+                    "no release series {series:?}: this entry has the default series and {}",
+                    known.join(", ")
+                )
+            });
+        }
+        Ok(Self {
+            selected_series: Some(SeriesName::new(series)),
+            ..self.clone()
+        })
+    }
+
+    /// The selected series and its entry, or `None` for the default series.
+    fn selected(&self) -> Option<(&SeriesName, &SeriesEntry)> {
+        let name = self.selected_series.as_ref()?;
+        self.series.get(name.as_str()).map(|series| (name, series))
     }
 
     /// The remote for a role. Total: every role resolves.
@@ -212,25 +294,92 @@ impl RepoEntry {
     /// landed against, and target pull requests at. One field, not two, because
     /// no repo we manage has ever split them; `base` keeps its name for
     /// compatibility with existing registries.
+    ///
+    /// With a series selected ([`RepoEntry::for_series`]) it is that series'
+    /// base instead: everything a release verb measures against the trunk, it
+    /// measures against the series' base.
     pub fn trunk(&self) -> &str {
+        self.selected()
+            .map_or_else(|| self.default_trunk(), |(_, series)| series.base.as_str())
+    }
+
+    /// The default series' trunk, whichever series is selected.
+    pub fn default_trunk(&self) -> &str {
         self.base.as_deref().unwrap_or("main")
     }
 
-    /// How releases are named, derived from `release_branch`.
-    pub fn release_scheme(&self) -> crate::ids::ReleaseScheme {
+    /// The remote [`RepoEntry::trunk`] is read from: upstream, unless the
+    /// selected series' base is a branch of our fork.
+    pub fn trunk_remote(&self) -> Role {
+        self.selected()
+            .map_or(Role::Upstream, |(_, series)| series.base_remote.role())
+    }
+
+    /// How releases are named: the selected series' dated cuts, else derived
+    /// from `release_branch`.
+    pub fn release_scheme(&self) -> ReleaseScheme {
+        if let Some((name, _)) = self.selected() {
+            return ReleaseScheme::Series(name.clone());
+        }
         self.release_branch
             .as_deref()
-            .map_or(crate::ids::ReleaseScheme::Dated, |name| {
-                crate::ids::ReleaseScheme::Fixed(crate::ids::BranchName::new(name))
+            .map_or(ReleaseScheme::Dated, |name| {
+                ReleaseScheme::Fixed(crate::ids::BranchName::new(name))
             })
     }
 
-    /// The upstream remote's view of the trunk, e.g. `dev@upstream`.
+    /// The dated cuts the selected series owns, which the reaper and the
+    /// superseded-cut readers enumerate. A fixed entry's default series still
+    /// owns `release/YYYY-MM-DD[.N]`: those are its leftover dated cuts from
+    /// before it moved to a fixed branch, and they are reaped as on any entry.
+    pub fn dated_scheme(&self) -> ReleaseScheme {
+        match self.release_scheme() {
+            ReleaseScheme::Fixed(_) => ReleaseScheme::Dated,
+            scheme => scheme,
+        }
+    }
+
+    /// Every release series of this entry: the default one first, then each
+    /// named series in name order. Each is the entry as that series selects it.
+    pub fn all_series(&self) -> Vec<Self> {
+        let default = Self {
+            selected_series: None,
+            ..self.clone()
+        };
+        std::iter::once(default)
+            .chain(self.series.keys().map(|name| Self {
+                selected_series: Some(SeriesName::new(name.as_str())),
+                ..self.clone()
+            }))
+            .collect()
+    }
+
+    /// The selected series as a person reads it: `series 9.2 (base
+    /// v9.2+typewise-isomorphism@origin)`, or `default series (base v9.3@upstream)`.
+    pub fn series_label(&self) -> String {
+        let base = self.trunk_ref();
+        self.selected_series.as_ref().map_or_else(
+            || format!("default series (base {base})"),
+            |name| format!("series {name} (base {base})"),
+        )
+    }
+
+    /// The trunk's remote view, e.g. `dev@upstream`, or a series' base on the
+    /// remote that holds it.
     ///
     /// Every landed probe and fork point measures against this, never the local
-    /// trunk: our fork's trunk answers about the wrong repository.
-    pub fn upstream_trunk(&self) -> String {
-        format!("{}@{}", self.trunk(), Role::Upstream)
+    /// trunk: our fork's trunk answers about the wrong repository. A series
+    /// whose base is our fork's branch measures against that branch on origin.
+    pub fn trunk_ref(&self) -> String {
+        format!("{}@{}", self.trunk(), self.trunk_remote())
+    }
+
+    /// Every series' base by name: the default trunk, then each named series'
+    /// base. None of them is ever a member branch of any series.
+    pub fn bases(&self) -> Vec<&str> {
+        std::iter::once(self.default_trunk())
+            .chain(self.series.values().map(|series| series.base.as_str()))
+            .collect()
     }
 
     /// The `immutable_heads()` this fork runs under: jj's `trunk()`, the trunk by
@@ -264,14 +413,24 @@ impl RepoEntry {
     /// this into the repository's jj config; knives' own in-process rewrites keep
     /// jj's default pins (`jj::assert_mutable`).
     pub fn immutable_heads(&self) -> String {
-        let trunk = self.trunk();
+        let trunk = self.default_trunk();
         let mut remotes = vec![Role::Upstream, Role::Origin];
         if self.has_split_release() {
             remotes.push(Role::Release);
         }
+        // A named series' base is pinned on the remote that holds it, for the
+        // same reason as the trunk: a release rebase of that series rebuilds
+        // its members, never the base they stand on.
         let pinned: Vec<String> = remotes
             .iter()
             .map(|remote| format!("remote_bookmarks(exact:\"{trunk}\", exact:\"{remote}\")"))
+            .chain(self.series.values().map(|series| {
+                format!(
+                    "remote_bookmarks(exact:\"{}\", exact:\"{}\")",
+                    series.base,
+                    series.base_remote.role()
+                )
+            }))
             .collect();
         format!(
             "trunk() | {} | remote_tags(remote=exact:\"{}\")",
@@ -600,6 +759,7 @@ pub fn load(path: &Path) -> Result<Registry, ConfigError> {
             }
         }
         checked_release_branch(entry, path)?;
+        checked_series(entry, path)?;
         for consumer in &entry.consumers {
             if !is_forge_slug(consumer) {
                 return Err(ConfigError::Invalid {
@@ -707,6 +867,115 @@ fn checked_release_branch(entry: &RepoEntry, path: &Path) -> Result<(), ConfigEr
         });
     }
     Ok(())
+}
+
+/// A named series is one path segment, so its cuts `release/<series>/<date>`
+/// are told apart from the default series' `release/<date>` and from every
+/// other series' by shape alone. Its base is a branch distinct from every other
+/// series' base, the default trunk included: a member belongs to the series
+/// whose base it descends from, and two series on one base would claim the
+/// same members. A fixed release branch is one release, not a series of dated
+/// cuts, so the two do not combine.
+fn checked_series(entry: &RepoEntry, path: &Path) -> Result<(), ConfigError> {
+    let invalid = |detail: String| ConfigError::Invalid {
+        path: path.to_owned(),
+        detail,
+    };
+    if entry.series.is_empty() {
+        return Ok(());
+    }
+    if let Some(fixed) = entry.release_branch.as_deref() {
+        return Err(invalid(format!(
+            "release_branch {fixed:?} and [series] do not combine: a fixed release branch is \
+             one release, and a series is a line of dated cuts"
+        )));
+    }
+    let mut bases: BTreeMap<&str, String> = BTreeMap::new();
+    bases.insert(entry.default_trunk(), "the default series".to_owned());
+    for (name, series) in &entry.series {
+        if name.contains('/') || crate::ids::BranchName::parse(name).is_err() {
+            return Err(invalid(format!(
+                "series {name:?} is not one branch-name segment; its cuts are named \
+                 {}{name}/YYYY-MM-DD[.N]",
+                crate::ids::RELEASE_PREFIX
+            )));
+        }
+        if let Some(why) = ref_segment_flaw(name) {
+            return Err(invalid(format!(
+                "series {name:?} cannot name a git ref ({why}); its cuts are named \
+                 {}{name}/YYYY-MM-DD[.N]",
+                crate::ids::RELEASE_PREFIX
+            )));
+        }
+        if crate::ids::ReleaseScheme::Dated
+            .dated_cut(&format!("{}{name}", crate::ids::RELEASE_PREFIX))
+            .is_some()
+        {
+            return Err(invalid(format!(
+                "series {name:?} is shaped like a dated cut; git cannot hold both \
+                 {prefix}{name} and {prefix}{name}/<date>, so name the series for its base",
+                prefix = crate::ids::RELEASE_PREFIX
+            )));
+        }
+        if crate::ids::BranchName::parse(&series.base).is_err() {
+            return Err(invalid(format!(
+                "series {name:?} base {:?} is not a branch name",
+                series.base
+            )));
+        }
+        if series.base.starts_with(crate::ids::RELEASE_PREFIX) {
+            return Err(invalid(format!(
+                "series {name:?} base {:?} sits in the dated {} namespace; a base is a branch \
+                 the series' members fork from, never a release",
+                series.base,
+                crate::ids::RELEASE_PREFIX
+            )));
+        }
+        if let Some(other) = bases.insert(series.base.as_str(), format!("series {name:?}")) {
+            return Err(invalid(format!(
+                "series {name:?} base {:?} is also the base of {other}; each series needs its \
+                 own base, because a member belongs to the series whose base it descends from",
+                series.base
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Why `segment` cannot be one component of a git ref, by git's
+/// `check-ref-format` rules; `None` when it can.
+fn ref_segment_flaw(segment: &str) -> Option<&'static str> {
+    if segment.starts_with('.') {
+        return Some("it starts with '.'");
+    }
+    if segment.ends_with('.') {
+        return Some("it ends with '.'");
+    }
+    if segment.strip_suffix(".lock").is_some() {
+        return Some("it ends with '.lock'");
+    }
+    if segment.contains("..") {
+        return Some("it contains '..'");
+    }
+    if segment.contains("@{") {
+        return Some("it contains '@{'");
+    }
+    if segment == "@" {
+        return Some("it is '@'");
+    }
+    if segment
+        .chars()
+        .any(|c| c.is_ascii_control() || c == '\u{7f}')
+    {
+        return Some("it contains a control character");
+    }
+    if segment
+        .chars()
+        .any(|c| matches!(c, ' ' | '~' | '^' | ':' | '?' | '*' | '[' | '\\'))
+    {
+        return Some("it contains one of space ~ ^ : ? * [ \\");
+    }
+    None
 }
 
 /// A `ledger` names a repository, so it is `<owner>/<name>`, before and after
@@ -1149,13 +1418,13 @@ release = "https://example.invalid/releases.git"
         let plain = "[repos.demo]\nupstream = \"u\"\norigin = \"o\"\n";
         let registry = load(&write(dir.path(), plain)).unwrap();
         assert_eq!(registry.repos["demo"].trunk(), "main");
-        assert_eq!(registry.repos["demo"].upstream_trunk(), "main@upstream");
+        assert_eq!(registry.repos["demo"].trunk_ref(), "main@upstream");
 
         let stated = "[repos.demo]\nupstream = \"u\"\norigin = \"o\"\n\
                       base = \"dev\"\n";
         let registry = load(&write(dir.path(), stated)).unwrap();
         assert_eq!(registry.repos["demo"].trunk(), "dev");
-        assert_eq!(registry.repos["demo"].upstream_trunk(), "dev@upstream");
+        assert_eq!(registry.repos["demo"].trunk_ref(), "dev@upstream");
         assert_eq!(registry.repos["demo"].default_base(), "dev");
     }
 

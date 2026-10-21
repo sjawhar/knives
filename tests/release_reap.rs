@@ -141,8 +141,13 @@ fn reap_removes_superseded_cuts_and_keeps_the_newest() {
 
     // When: the workspace is reaped.
     let repo = Repo::open(&lab.work).expect("open");
-    let report =
-        knives::commands::release::reap_superseded(&lab.work, &repo, "origin").expect("reap");
+    let report = knives::commands::release::reap_superseded(
+        &lab.work,
+        &repo,
+        &knives::ids::ReleaseScheme::Dated,
+        "origin",
+    )
+    .expect("reap");
 
     // Then: the older cut is gone in every form, the newest survives.
     assert_eq!(report.reaped, vec!["release/2026-08-04".to_owned()]);
@@ -174,8 +179,13 @@ fn reap_refuses_a_cut_that_has_local_descendants() {
     lab.octopus("release/2026-08-05", "feat/alpha", "feat/beta");
 
     let repo = Repo::open(&lab.work).expect("open");
-    let report =
-        knives::commands::release::reap_superseded(&lab.work, &repo, "origin").expect("reap");
+    let report = knives::commands::release::reap_superseded(
+        &lab.work,
+        &repo,
+        &knives::ids::ReleaseScheme::Dated,
+        "origin",
+    )
+    .expect("reap");
 
     // Then: nothing reaped; the reason names the descendant.
     assert!(report.reaped.is_empty(), "reaped: {:?}", report.reaped);
@@ -322,8 +332,13 @@ fn a_second_workspaces_parked_working_copy_does_not_block_reaping() {
 
     // When: reaped.
     let repo = Repo::open(&lab.work).expect("open");
-    let report =
-        knives::commands::release::reap_superseded(&lab.work, &repo, "origin").expect("reap");
+    let report = knives::commands::release::reap_superseded(
+        &lab.work,
+        &repo,
+        &knives::ids::ReleaseScheme::Dated,
+        "origin",
+    )
+    .expect("reap");
 
     // Then: the parked working copy does not block — the clause this pins.
     assert_eq!(
@@ -370,8 +385,13 @@ fn reap_reaps_when_another_remote_bookmark_pins_the_cut() {
 
     // When: reaped.
     let repo = Repo::open(&lab.work).expect("open");
-    let report =
-        knives::commands::release::reap_superseded(&lab.work, &repo, "origin").expect("reap");
+    let report = knives::commands::release::reap_superseded(
+        &lab.work,
+        &repo,
+        &knives::ids::ReleaseScheme::Dated,
+        "origin",
+    )
+    .expect("reap");
 
     // Then: the tracked remote pin is mutable, so the dated cut is reaped.
     assert_eq!(
@@ -458,8 +478,13 @@ fn an_untracked_remote_pin_makes_abandon_refuse_and_lands_in_forgotten_only() {
 
     // When: the workspace is reaped.
     let repo = Repo::open(&lab.work).expect("open");
-    let report =
-        knives::commands::release::reap_superseded(&lab.work, &repo, "origin").expect("reap");
+    let report = knives::commands::release::reap_superseded(
+        &lab.work,
+        &repo,
+        &knives::ids::ReleaseScheme::Dated,
+        "origin",
+    )
+    .expect("reap");
 
     // Then: refs are forgotten, the commit is kept with its pin named, reaped
     // does not overstate, and a pinned commit is not a note-worthy failure.
@@ -535,8 +560,13 @@ fn a_refused_first_name_does_not_stop_reaping_later_names() {
 
     // When: the workspace is reaped.
     let repo = Repo::open(&lab.work).expect("open");
-    let report =
-        knives::commands::release::reap_superseded(&lab.work, &repo, "origin").expect("reap");
+    let report = knives::commands::release::reap_superseded(
+        &lab.work,
+        &repo,
+        &knives::ids::ReleaseScheme::Dated,
+        "origin",
+    )
+    .expect("reap");
 
     // Then: the pinned first name is kept without stopping the second.
     assert_eq!(report.forgotten_only.len(), 1, "{report:?}");
@@ -561,8 +591,13 @@ fn reaping_is_one_operation_described_for_the_op_log() {
 
     // When: reaped.
     let repo = Repo::open(&lab.work).expect("open");
-    let report =
-        knives::commands::release::reap_superseded(&lab.work, &repo, "origin").expect("reap");
+    let report = knives::commands::release::reap_superseded(
+        &lab.work,
+        &repo,
+        &knives::ids::ReleaseScheme::Dated,
+        "origin",
+    )
+    .expect("reap");
     assert_eq!(report.reaped, vec!["release/2026-08-04".to_owned()]);
 
     // Then: the whole reap is ONE operation, described as knives' own act.
@@ -591,7 +626,13 @@ fn reap_clears_a_ref_the_next_fetch_rematerialized() {
         lab.jj_work(["git", "push", "--remote", "origin", "--bookmark", name]);
     }
     let repo = Repo::open(&lab.work).expect("open");
-    knives::commands::release::reap_superseded(&lab.work, &repo, "origin").expect("first reap");
+    knives::commands::release::reap_superseded(
+        &lab.work,
+        &repo,
+        &knives::ids::ReleaseScheme::Dated,
+        "origin",
+    )
+    .expect("first reap");
     lab.fetch_work();
     let tips = Repo::open(&lab.work)
         .expect("reopen")
@@ -605,8 +646,13 @@ fn reap_clears_a_ref_the_next_fetch_rematerialized() {
 
     // When: reaped again (idempotence is the contract).
     let repo = Repo::open(&lab.work).expect("reopen for second reap");
-    let report = knives::commands::release::reap_superseded(&lab.work, &repo, "origin")
-        .expect("second reap");
+    let report = knives::commands::release::reap_superseded(
+        &lab.work,
+        &repo,
+        &knives::ids::ReleaseScheme::Dated,
+        "origin",
+    )
+    .expect("second reap");
 
     // Then: gone again.
     assert_eq!(report.reaped, vec!["release/2026-08-04".to_owned()]);

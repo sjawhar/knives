@@ -144,7 +144,7 @@ pub(crate) fn run_revision_carries(
             return Ok(Exit::Incomplete);
         }
     };
-    let trunk_name = entry.upstream_trunk();
+    let trunk_name = entry.trunk_ref();
     let trunk = match opened.resolve_commit(&trunk_name) {
         Ok(trunk) => trunk,
         Err(error) => {

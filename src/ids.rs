@@ -56,6 +56,10 @@ string_id!(
     "A bookmark name with no remote qualifier and no decoration."
 );
 string_id!(WorkspaceName, "A jj workspace.");
+string_id!(
+    SeriesName,
+    "A named release series of one fork: a line of dated cuts on its own base, alongside the entry's default series. One path segment, checked when the registry loads."
+);
 
 impl ChangeId {
     /// The prefix this program shows; see [`short_id`].
@@ -164,14 +168,15 @@ pub const RELEASE_PREFIX: &str = "release/";
 /// a misplaced branch, rather than a release, in a split-release repository.
 /// `upstream` remains somebody else's cut, while `git` is jj's internal tracking
 /// view rather than a remote.
-/// Naming is scheme-dependent: dated releases share a prefix, while fixed releases
-/// are the one configured branch.
+/// Naming is scheme-dependent: a dated series owns its own cuts
+/// ([`ReleaseScheme::owns`]), so another series' cut is never this one's
+/// release, while a fixed release is the one configured branch.
 pub fn is_our_release(
     reference: &BookmarkRef,
     scheme: &ReleaseScheme,
     publish_remote: &str,
 ) -> bool {
-    if !is_release_name(reference.branch(), scheme) {
+    if !scheme.owns(reference.branch().as_str()) {
         return false;
     }
     match reference {
@@ -184,49 +189,140 @@ pub fn is_our_release(
 ///
 /// Derived from configuration and matched exhaustively at every release-aware
 /// site, so the compiler forces each of them — including ones added later — to
-/// answer "what does this mean when the release is one fixed branch?".
+/// answer "what does this mean when the release is one fixed branch?", and
+/// "what does this mean for a named series?".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReleaseScheme {
-    /// Dated `release/YYYY-MM-DD[.n]` cuts. The default, and the historical behavior.
+    /// Dated `release/YYYY-MM-DD[.n]` cuts of the entry's default series. The
+    /// default, and the historical behavior.
     Dated,
+    /// Dated `release/<series>/YYYY-MM-DD[.n]` cuts of a named series, which
+    /// has its own base. Every dated rule applies; only the names differ.
+    Series(SeriesName),
     /// One integration branch that is rebuilt and advanced in place. The branch's
     /// previous position plays the role of the previous release.
     Fixed(BranchName),
 }
 
+impl ReleaseScheme {
+    /// What follows this series' prefix in `name`, when `name` is one of its
+    /// dated cuts in any shape: `2026-08-05.2` of `release/2026-08-05.2`, or
+    /// of `release/9.2/2026-08-05.2` in series `9.2`.
+    ///
+    /// One `/`-free segment, so the default series never reads a named
+    /// series' `release/9.2/2026-10-21` as its own: before series existed,
+    /// that name ordered as `("9", 0)`, after every date, and would have been
+    /// the default series' newest cut.
+    fn dated_suffix<'a>(&self, name: &'a str) -> Option<&'a str> {
+        let rest = match self {
+            Self::Dated => name.strip_prefix(RELEASE_PREFIX)?,
+            Self::Series(series) => name
+                .strip_prefix(RELEASE_PREFIX)?
+                .strip_prefix(series.as_str())?
+                .strip_prefix('/')?,
+            Self::Fixed(_) => return None,
+        };
+        (!rest.is_empty() && !rest.contains('/')).then_some(rest)
+    }
+
+    /// Whether `name` is one of this scheme's own releases: a cut of this
+    /// series, or the fixed branch. Narrower than [`is_release_name`], which
+    /// answers whether a name is a release of any series of the fork.
+    pub fn owns(&self, name: &str) -> bool {
+        match self {
+            Self::Fixed(fixed) => name == fixed.as_str(),
+            Self::Dated | Self::Series(_) => self.dated_suffix(name).is_some(),
+        }
+    }
+
+    /// The ordering key of one of this series' dated cuts, numeric suffixes
+    /// compared numerically. Lenient: any name the series owns has one.
+    /// `None` for a name the series does not own, and always under `Fixed`.
+    pub fn cut_order(&self, name: &str) -> Option<(String, u32)> {
+        let rest = self.dated_suffix(name)?;
+        Some(match rest.split_once('.') {
+            Some((date, suffix)) => (date.to_owned(), suffix.parse().unwrap_or(0)),
+            None => (rest.to_owned(), 0),
+        })
+    }
+
+    /// Parse `release/[<series>/]YYYY-MM-DD[.N]`, the one shape this series'
+    /// dated cuts take.
+    ///
+    /// Stricter than [`Self::cut_order`] on purpose: the reaper enumerates
+    /// release refs on any remote, where upstream's own `release/0.3.190` style
+    /// branches also live, and a prefix test would hand those to `bookmark
+    /// forget`. Returns the `(date, suffix)` ordering key so "newest" is one
+    /// `max_by_key` away. The suffix follows `u32::from_str` semantics rather
+    /// than strict digits, so leading `+` signs and zeroes parse; every such
+    /// name is still ours by shape, leaving the reap safety property unaffected.
+    pub fn dated_cut(&self, name: &str) -> Option<(String, u32)> {
+        let bare = self.dated_suffix(name)?;
+        let (date, suffix) = match bare.split_once('.') {
+            Some((date, suffix)) => (date, suffix.parse::<u32>().ok()?),
+            None => (bare, 0),
+        };
+        let bytes = date.as_bytes();
+        let dated = bytes.len() == 10
+            && bytes.get(4) == Some(&b'-')
+            && bytes.get(7) == Some(&b'-')
+            && date
+                .bytes()
+                .enumerate()
+                .all(|(i, b)| matches!(i, 4 | 7) || b.is_ascii_digit());
+        dated.then(|| (date.to_owned(), suffix))
+    }
+
+    /// The name shape this scheme's cuts take, for a message.
+    pub fn cut_shape(&self) -> String {
+        match self {
+            Self::Dated => format!("{RELEASE_PREFIX}YYYY-MM-DD[.N]"),
+            Self::Series(series) => format!("{RELEASE_PREFIX}{series}/YYYY-MM-DD[.N]"),
+            Self::Fixed(fixed) => fixed.to_string(),
+        }
+    }
+}
+
 /// Whether a branch name is a release under this scheme: the dated prefix, or the
 /// one fixed integration branch.
+///
+/// Every dated series shares the prefix, so a cut of any series is a release
+/// to every other: never a member branch. Which series owns a cut is
+/// [`ReleaseScheme::owns`].
 pub fn is_release_name(branch: &BranchName, scheme: &ReleaseScheme) -> bool {
     match scheme {
-        ReleaseScheme::Dated => branch.as_str().starts_with(RELEASE_PREFIX),
+        ReleaseScheme::Dated | ReleaseScheme::Series(_) => {
+            branch.as_str().starts_with(RELEASE_PREFIX)
+        }
         ReleaseScheme::Fixed(name) => branch == name,
     }
 }
 
-/// Parse `release/YYYY-MM-DD[.N]`, the one shape our dated cuts take.
+/// Whether `name` is a dated cut of any series of a fork.
 ///
-/// Stricter than [`is_release_name`] on purpose: the reaper enumerates release
-/// refs on any remote, where upstream's own `release/0.3.190` style branches
-/// also live, and a prefix test would hand those to `bookmark forget`. Returns
-/// the `(date, suffix)` ordering key so "newest" is one `max_by_key` away.
-/// The suffix follows `u32::from_str` semantics rather than strict digits, so
-/// leading `+` signs and zeroes parse; every such name is still ours by shape,
-/// leaving the reap safety property unaffected.
-pub fn strict_dated_release(name: &str) -> Option<(String, u32)> {
-    let bare = name.strip_prefix(RELEASE_PREFIX)?;
-    let (date, suffix) = match bare.split_once('.') {
-        Some((date, suffix)) => (date, suffix.parse::<u32>().ok()?),
-        None => (bare, 0),
-    };
-    let bytes = date.as_bytes();
-    let dated = bytes.len() == 10
-        && bytes.get(4) == Some(&b'-')
-        && bytes.get(7) == Some(&b'-')
-        && date
-            .bytes()
-            .enumerate()
-            .all(|(i, b)| matches!(i, 4 | 7) || b.is_ascii_digit());
-    dated.then(|| (date.to_owned(), suffix))
+/// That is the default series' `release/YYYY-MM-DD[.N]` or a named series'
+/// `release/<series>/YYYY-MM-DD[.N]`. Every series' cut is a release commit,
+/// never an orphan of another's.
+pub fn any_dated_cut(name: &str) -> bool {
+    ReleaseScheme::Dated.dated_cut(name).is_some()
+        || name
+            .strip_prefix(RELEASE_PREFIX)
+            .and_then(|rest| rest.split_once('/'))
+            .is_some_and(|(series, _)| {
+                ReleaseScheme::Series(SeriesName::new(series))
+                    .dated_cut(name)
+                    .is_some()
+            })
+}
+
+/// Whether `reference` is one of our dated cuts, of any series: [`any_dated_cut`]
+/// behind the trust boundary [`is_our_release`] draws.
+pub fn is_our_dated_cut(reference: &BookmarkRef, publish_remote: &str) -> bool {
+    any_dated_cut(reference.branch().as_str())
+        && match reference {
+            BookmarkRef::Local(_) => true,
+            BookmarkRef::Remote { remote, .. } => remote.as_str() == publish_remote,
+        }
 }
 
 impl BookmarkRef {
@@ -395,25 +491,57 @@ mod tests {
 
     #[test]
     fn only_our_dated_shape_parses_as_a_dated_release() {
-        use super::strict_dated_release;
+        let dated = ReleaseScheme::Dated;
         // Ours, with and without a same-day suffix.
         assert_eq!(
-            strict_dated_release("release/2026-08-05"),
+            dated.dated_cut("release/2026-08-05"),
             Some(("2026-08-05".to_owned(), 0))
         );
         assert_eq!(
-            strict_dated_release("release/2026-08-05.2"),
+            dated.dated_cut("release/2026-08-05.2"),
             Some(("2026-08-05".to_owned(), 2))
         );
         // Upstream's semver release branches are NOT ours to reap.
-        assert_eq!(strict_dated_release("release/0.3.190"), None);
+        assert_eq!(dated.dated_cut("release/0.3.190"), None);
         // Shape violations.
-        assert_eq!(strict_dated_release("release/"), None);
-        assert_eq!(strict_dated_release("release/2026-8-5"), None);
-        assert_eq!(strict_dated_release("release/2026-08-05."), None);
-        assert_eq!(strict_dated_release("release/2026-08-05.x"), None);
-        assert_eq!(strict_dated_release("release/2026-08-05.1.2"), None);
-        assert_eq!(strict_dated_release("feat/2026-08-05"), None);
+        assert_eq!(dated.dated_cut("release/"), None);
+        assert_eq!(dated.dated_cut("release/2026-8-5"), None);
+        assert_eq!(dated.dated_cut("release/2026-08-05."), None);
+        assert_eq!(dated.dated_cut("release/2026-08-05.x"), None);
+        assert_eq!(dated.dated_cut("release/2026-08-05.1.2"), None);
+        assert_eq!(dated.dated_cut("feat/2026-08-05"), None);
+    }
+
+    #[test]
+    fn each_series_owns_only_its_own_cuts() {
+        let dated = ReleaseScheme::Dated;
+        let old = ReleaseScheme::Series(SeriesName::new("9.2"));
+        // Given: a cut of the default series and one of series 9.2.
+        let default_cut = "release/2026-10-20";
+        let series_cut = "release/9.2/2026-10-21.1";
+        // Then: each series parses its own cut and never the other's, so a
+        // 9.2 cut is never the default series' newest, nor the reverse.
+        assert_eq!(
+            dated.dated_cut(default_cut),
+            Some(("2026-10-20".to_owned(), 0))
+        );
+        assert_eq!(dated.dated_cut(series_cut), None);
+        assert_eq!(dated.cut_order(series_cut), None);
+        assert!(!dated.owns(series_cut));
+        assert_eq!(
+            old.dated_cut(series_cut),
+            Some(("2026-10-21".to_owned(), 1))
+        );
+        assert_eq!(old.dated_cut(default_cut), None);
+        assert!(!old.owns(default_cut));
+        assert!(!old.owns("release/9.20/2026-10-21"));
+        assert!(!old.owns("release/9.2/x/2026-10-21"));
+        // And: both are releases of the fork, so neither is ever a member branch.
+        assert!(is_release_name(&BranchName::new(series_cut), &dated));
+        assert!(is_release_name(&BranchName::new(default_cut), &old));
+        assert!(any_dated_cut(default_cut) && any_dated_cut(series_cut));
+        assert!(!any_dated_cut("release/0.3.190") && !any_dated_cut("release/9.2/0.3.190"));
+        assert_eq!(old.cut_shape(), "release/9.2/YYYY-MM-DD[.N]");
     }
 
     use super::*;

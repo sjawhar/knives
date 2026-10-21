@@ -149,7 +149,7 @@ pub fn run(
         fork,
         branch,
         identity: current_identity(bound)?,
-        upstream_trunk: entry.upstream_trunk(),
+        upstream_trunk: entry.trunk_ref(),
         workspace: WorkspaceName::new(workspace_for(branch.as_str())),
         opened: Repo::open(checkout)?,
         destination,

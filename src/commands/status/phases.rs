@@ -431,7 +431,7 @@ pub(super) struct RepositoryHealth {
 pub(super) fn repository_health(
     path: &std::path::Path,
     tips: &BookmarkTips,
-    publish_remote: &str,
+    entry: &crate::config::RepoEntry,
 ) -> anyhow::Result<RepositoryHealth> {
     let health_phase = std::time::Instant::now();
     let repo = Repo::open(path)?;
@@ -441,11 +441,7 @@ pub(super) fn repository_health(
         problems.push(stale);
     }
     findings.extend(double_checkout(&repo.workspaces()?));
-    let ignored: std::collections::BTreeSet<crate::ids::BookmarkRef> =
-        crate::commands::release::superseded_dated_releases(tips, publish_remote)
-            .into_iter()
-            .map(|(reference, _)| reference)
-            .collect();
+    let ignored = crate::commands::release::superseded_cuts_of_every_series(tips, entry);
     let phase = std::time::Instant::now();
     let changes = repo.divergent_changes(&ignored)?;
     let divergent_duration = phase.elapsed();
@@ -513,7 +509,7 @@ pub(super) fn run_status_phases<'snapshot>(
         declared,
         forge_started,
     } = input;
-    let upstream_trunk = entry.upstream_trunk();
+    let upstream_trunk = entry.trunk_ref();
     let context = ProbeContext {
         path,
         options,

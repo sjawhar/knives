@@ -151,12 +151,13 @@ pub fn gather(input: &AuditInput<'_>) -> Report {
         &ReleaseDriftScan {
             local: &local,
             published: live.release(),
-            scheme: &scheme,
+            schemes: &release_schemes(entry),
             publish_remote: entry.publish_remote(),
             entries: input.store.ledger_entries(&fork.upstream),
         },
     );
     add_misplaced_origin_release_refs(&mut report, live.origin(), &scheme, entry.publish_remote());
+    add_unfit_branches(&mut report, &opened, entry, &carried);
     add_orphan_commits(&mut report, &opened, path);
     let template = template_for_pulls(&mut report, input);
     add_branch_facts(
@@ -191,7 +192,7 @@ fn template_for_pulls(report: &mut Report, input: &AuditInput<'_>) -> Option<Tem
     read_template(&input.fork.checkout.path, entry).unwrap_or_else(|error| {
         report.problems.push(format!(
             "could not read the pull-request template at {}: {error}",
-            entry.upstream_trunk()
+            entry.trunk_ref()
         ));
         None
     })
@@ -354,9 +355,35 @@ fn release_zombies(
 struct ReleaseDriftScan<'a> {
     local: &'a BTreeMap<BranchName, CommitId>,
     published: &'a BTreeMap<String, CommitId>,
-    scheme: &'a crate::ids::ReleaseScheme,
+    schemes: &'a [crate::ids::ReleaseScheme],
     publish_remote: &'a str,
     entries: &'a [Entry],
+}
+
+/// A note for each branch that fits no release series of an entry that has
+/// named series: every release verb refuses it, so audit says so up front.
+fn add_unfit_branches(
+    report: &mut Report,
+    opened: &Repo,
+    entry: &RepoEntry,
+    carried: &[(String, CommitId)],
+) {
+    match crate::release_model::series_members(opened, entry, carried.to_vec()) {
+        Ok((_, unfit)) => report.notes.extend(unfit),
+        Err(error) => report.problems.push(format!(
+            "could not place branches in release series: {error}"
+        )),
+    }
+}
+
+/// Every series' release scheme: each series' cuts are recorded in the same
+/// ledger, so drift is checked for all of them, not only the default's.
+fn release_schemes(entry: &RepoEntry) -> Vec<crate::ids::ReleaseScheme> {
+    entry
+        .all_series()
+        .iter()
+        .map(RepoEntry::release_scheme)
+        .collect()
 }
 
 struct ReleaseDrift<'a> {
@@ -370,13 +397,13 @@ fn add_release_drifts(report: &mut Report, scan: &ReleaseDriftScan<'_>) {
     let ReleaseDriftScan {
         local,
         published,
-        scheme,
+        schemes,
         publish_remote,
         entries,
     } = *scan;
     for (branch, current) in local
         .iter()
-        .filter(|(branch, _)| is_release_name(branch, scheme))
+        .filter(|(branch, _)| schemes.iter().any(|scheme| is_release_name(branch, scheme)))
     {
         add_release_drift(
             report,
@@ -393,7 +420,10 @@ fn add_release_drifts(report: &mut Report, scan: &ReleaseDriftScan<'_>) {
             continue;
         };
         let branch = BranchName::new(name);
-        if !is_release_name(&branch, scheme) {
+        if !schemes
+            .iter()
+            .any(|scheme| is_release_name(&branch, scheme))
+        {
             continue;
         }
         add_release_drift(
@@ -935,7 +965,7 @@ mod tests {
             &ReleaseDriftScan {
                 local: &BTreeMap::new(),
                 published: &published,
-                scheme: &crate::ids::ReleaseScheme::Dated,
+                schemes: &[crate::ids::ReleaseScheme::Dated],
                 publish_remote: "release",
                 entries: &entries,
             },

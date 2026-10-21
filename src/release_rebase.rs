@@ -171,7 +171,7 @@ fn frozen_rebase_exit(
         return None;
     }
     match scheme {
-        ReleaseScheme::Dated => println!(
+        ReleaseScheme::Dated | ReleaseScheme::Series(_) => println!(
             "{repo}: every pin of {release_name} is frozen, so moving it would reach \
              nobody; cut a new dated release instead"
         ),
@@ -394,7 +394,7 @@ fn merged_rebase_target(
 ) -> anyhow::Result<Option<RebaseDestination>> {
     let repo = &fork.name;
     let entry = fork.entry;
-    let trunk = entry.upstream_trunk();
+    let trunk = entry.trunk_ref();
     let forge = CliForge;
     let opened_snapshot = match knives::snapshot::open(knives::snapshot::SnapshotConfig {
         forge: &forge,

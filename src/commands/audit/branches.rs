@@ -175,7 +175,7 @@ pub(super) fn read_template(
     path: &Path,
     entry: &RepoEntry,
 ) -> Result<Option<Template>, jj::JjError> {
-    let trunk = entry.upstream_trunk();
+    let trunk = entry.trunk_ref();
     for file in &crate::commands::preflight::PULL_REQUEST_TEMPLATES {
         if let Some(text) = jj::file_text(path, &trunk, file)? {
             return Ok(Some(Template {
@@ -289,7 +289,7 @@ fn add_forbidden_scans(
 ) {
     let fork = input.fork;
     let entry = fork.entry;
-    let upstream_trunk = entry.upstream_trunk();
+    let upstream_trunk = entry.trunk_ref();
     if let Err(error) = opened.resolve_commit(&upstream_trunk) {
         report.problems.push(format!(
             "upstream trunk {upstream_trunk} cannot be resolved; forbidden scans skipped: {error}"
@@ -332,7 +332,7 @@ fn forbidden_scans(
     if branches.is_empty() {
         return BTreeMap::new();
     }
-    let upstream_trunk = entry.upstream_trunk();
+    let upstream_trunk = entry.trunk_ref();
     let upstream_trunk = upstream_trunk.as_str();
     let workers = workers.min(MAX_SCAN_WORKERS).clamp(1, branches.len());
     let chunk = branches.len().div_ceil(workers);

@@ -626,6 +626,7 @@ fn settle_rows_after_phases(
         trunk: entry.trunk(),
         scheme: &scheme,
         publish_remote: entry.publish_remote(),
+        has_series: !entry.series.is_empty(),
     })?);
     let trunks = crate::release_model::trunk_positions(input.repo, entry)?;
     if !trunks.is_empty() {
@@ -931,10 +932,10 @@ pub fn gather_timed(
     let forge_started = std::time::Instant::now();
     let opened = open_forge_or_note(&mut report, fork, options);
     let opened_ref = opened.as_ref();
-    let trunk_commit = repo.resolve_commit(&entry.upstream_trunk()).ok();
+    let trunk_commit = repo.resolve_commit(&entry.trunk_ref()).ok();
     let probe_ran = options.probe && trunk_commit.is_some();
     let (mut phases, health) = std::thread::scope(|scope| {
-        let health = scope.spawn(|| phases::repository_health(path, &tips, entry.publish_remote()));
+        let health = scope.spawn(|| phases::repository_health(path, &tips, entry));
         let phases = phases::run_status_phases(phases::StatusPhaseInput {
             entry,
             path,

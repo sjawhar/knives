@@ -149,7 +149,10 @@ has a knives command that does the same job safely:
   once that release ref has ever been pushed. First establish the release-ref term for *this*
   repo's scheme — `knives status` (or `knives repos`) names the `newest_release`; a value
   shaped `release/YYYY-MM-DD[.N]` means the dated scheme (the default, no `release_branch` set
-  in `repos.toml`), and any other exact name (for example `integration`) *is* the fixed
+  in `repos.toml`), named release series (`[repos.<name>.series.<series>]`, each on its own base) cut
+  `release/<series>/YYYY-MM-DD[.N]`, which `status` and `repos` never show: read them with
+  `knives release --series <series>` (the dated glob below covers every series' cuts), and any other
+  exact name (for example `integration`) *is* the fixed
   scheme's one release branch, configured as that repo's `repos.toml` `[repos.<name>]
   release_branch = "<name>"` and never present under a second concurrent or differently-named
   instance — a fixed name cannot start with `release/` (the config loader refuses that), so the

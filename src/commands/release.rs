@@ -20,8 +20,8 @@ use crate::detect::{
     BookmarkTips, Finding, FindingKind, RebaseOutcome, ReleaseParent, Subject, stale_parents,
 };
 use crate::ids::{
-    BookmarkRef, BranchName, CommitId, ReleaseScheme, RemoteName, is_our_release, is_release_name,
-    strict_dated_release,
+    BookmarkRef, BranchName, CommitId, ReleaseScheme, RemoteName, is_our_dated_cut, is_our_release,
+    is_release_name,
 };
 use crate::jj::{self, Repo};
 use crate::ledger::{Entry, Ledger, RecordedParent};
@@ -164,12 +164,41 @@ fn freezes_commit(pin: &Pin, commit: &CommitId) -> bool {
     abbreviates(&pin.reference) || pin.locked.as_deref().is_some_and(abbreviates)
 }
 
+/// `name`, unless it is a series' own prefix, such as `release/9.2` on an entry
+/// with series 9.2: git cannot hold that ref beside `release/9.2/<date>`.
+pub fn clear_of_series_prefixes(entry: &RepoEntry, name: String) -> Result<String, String> {
+    match entry
+        .series
+        .keys()
+        .find(|series| name == format!("{}{series}", crate::ids::RELEASE_PREFIX))
+    {
+        Some(series) => Err(format!(
+            "{name} is the prefix of series {series}'s cuts ({name}/YYYY-MM-DD[.N]); git cannot \
+             hold both, so name the cut by date"
+        )),
+        None => Ok(name),
+    }
+}
+
+/// The name a cut takes.
+///
+/// A dated name must be one this series owns: a name another series owns,
+/// such as `release/9.2/<date>` cut from the default series, would be that
+/// series' newest cut, carrying this series' members.
 pub fn cut_name(scheme: &ReleaseScheme, requested: Option<&str>) -> Result<String, String> {
     match (scheme, requested) {
-        (ReleaseScheme::Dated, Some(name)) => Ok(name.to_owned()),
-        (ReleaseScheme::Dated, None) => {
-            Err("a dated release cut needs a name, e.g. release/2026-08-03".to_owned())
+        (ReleaseScheme::Dated | ReleaseScheme::Series(_), Some(name)) if scheme.owns(name) => {
+            Ok(name.to_owned())
         }
+        (ReleaseScheme::Dated | ReleaseScheme::Series(_), Some(name)) => Err(format!(
+            "{name} is not a cut of this series; its cuts are named {}, e.g. {}",
+            scheme.cut_shape(),
+            scheme.cut_shape().replace("YYYY-MM-DD[.N]", "2026-08-03")
+        )),
+        (ReleaseScheme::Dated | ReleaseScheme::Series(_), None) => Err(format!(
+            "a dated release cut needs a name, e.g. {}",
+            scheme.cut_shape().replace("YYYY-MM-DD[.N]", "2026-08-03")
+        )),
         (ReleaseScheme::Fixed(fixed), Some(name)) if name != fixed.as_str() => Err(format!(
             "this repo cuts the fixed release branch {fixed}; drop the name or use {fixed}"
         )),
@@ -216,6 +245,23 @@ mod scheme_tests {
         // A stray dated name under the fixed scheme would silently fork the
         // naming; refusing is the only answer that cannot lose a cut.
         assert!(cut_name(&fixed, Some("release/2026-08-03")).is_err());
+    }
+
+    #[test]
+    fn a_cut_name_must_belong_to_the_series_it_is_cut_from() {
+        let dated = ReleaseScheme::Dated;
+        let old = ReleaseScheme::Series(crate::ids::SeriesName::new("9.2"));
+        // A series cut takes the series' own shape.
+        assert_eq!(
+            cut_name(&old, Some("release/9.2/2026-10-21")).unwrap(),
+            "release/9.2/2026-10-21"
+        );
+        // Neither series takes the other's name: each would become the other
+        // series' newest cut.
+        assert!(cut_name(&old, Some("release/2026-10-21")).is_err());
+        assert!(cut_name(&dated, Some("release/9.2/2026-10-21")).is_err());
+        let error = cut_name(&old, None).unwrap_err();
+        assert!(error.contains("release/9.2/2026-08-03"), "{error}");
     }
 }
 
@@ -340,7 +386,7 @@ pub fn cut_keepers(
         }
     }
     keep.extend(repo.parent_commits(previous.as_str())?);
-    keep.push(repo.resolve_commit(&entry.upstream_trunk())?);
+    keep.push(repo.resolve_commit(&entry.trunk_ref())?);
     Ok(keep)
 }
 
@@ -395,17 +441,15 @@ pub fn orphaned_commits(
     crate::jj::commits_matching(repo_path, &revset)
 }
 
-/// Commit identities currently named by our strict dated release references.
+/// Commit identities currently named by our strict dated release references,
+/// of every series: another series' cut is never an orphan of this one.
 ///
 /// This shares the release-name trust boundary used by reap: local, `origin`,
 /// and `release` refs count; names merely resembling a release on other
 /// remotes do not. Callers subtract these ids rather than trusting descriptions.
 pub fn our_dated_release_commits(tips: &BookmarkTips, publish_remote: &str) -> BTreeSet<CommitId> {
     tips.iter()
-        .filter(|(reference, _)| {
-            is_our_release(reference, &ReleaseScheme::Dated, publish_remote)
-                && strict_dated_release(reference.branch().as_str()).is_some()
-        })
+        .filter(|(reference, _)| is_our_dated_cut(reference, publish_remote))
         .map(|(_, commit)| commit.clone())
         .collect()
 }
@@ -421,23 +465,42 @@ fn ours_to_reap(reference: &BookmarkRef) -> bool {
     )
 }
 
-/// Every ref of every superseded dated cut, on any remote that is ours.
+/// Every superseded cut of every series of `entry`: what a report that looks
+/// at the whole fork, rather than one series, treats as frozen history.
+pub fn superseded_cuts_of_every_series(
+    tips: &BookmarkTips,
+    entry: &RepoEntry,
+) -> BTreeSet<BookmarkRef> {
+    entry
+        .all_series()
+        .iter()
+        .flat_map(|series| {
+            superseded_dated_releases(tips, &series.dated_scheme(), entry.publish_remote())
+        })
+        .map(|(reference, _)| reference)
+        .collect()
+}
+
+/// Every ref of every superseded dated cut of `scheme`'s series, on any
+/// remote that is ours.
 ///
-/// Superseded means "not the newest dated name voted by a local, `origin`, or
-/// `release` ref". The broader output excludes `upstream` and jj's `git`
-/// tracking view, but keeps historical refs on every other remote for cleanup.
-/// [`crate::ids::strict_dated_release`] keeps upstream-style semver names out
-/// even on our remotes.
+/// Superseded means "not the newest dated name of this series voted by a
+/// local, `origin`, or `release` ref". The broader output excludes `upstream`
+/// and jj's `git` tracking view, but keeps historical refs on every other
+/// remote for cleanup. [`ReleaseScheme::dated_cut`] keeps upstream-style
+/// semver names out even on our remotes, and keeps every other series' cuts
+/// out: each series' newest cut is live whatever the others' dates.
 pub fn superseded_dated_releases(
     tips: &BookmarkTips,
+    scheme: &ReleaseScheme,
     publish_remote: &str,
 ) -> Vec<(BookmarkRef, CommitId)> {
     let newest = tips
         .keys()
         // The vote is an allowlist, so someone else's cut cannot reap ours;
         // output remains broader to clean up our historical odd-remote refs.
-        .filter(|reference| is_our_release(reference, &ReleaseScheme::Dated, publish_remote))
-        .filter_map(|reference| strict_dated_release(reference.branch().as_str()))
+        .filter(|reference| is_our_release(reference, scheme, publish_remote))
+        .filter_map(|reference| scheme.dated_cut(reference.branch().as_str()))
         .max();
     let Some(newest) = newest else {
         return Vec::new();
@@ -446,7 +509,8 @@ pub fn superseded_dated_releases(
         .iter()
         .filter(|(reference, _)| {
             ours_to_reap(reference)
-                && strict_dated_release(reference.branch().as_str())
+                && scheme
+                    .dated_cut(reference.branch().as_str())
                     .is_some_and(|parsed| parsed != newest)
         })
         .map(|(reference, commit)| (reference.clone(), commit.clone()))
@@ -498,18 +562,19 @@ pub struct ReapReport {
 pub fn reap_superseded(
     repo_path: &Path,
     repo: &Repo,
+    scheme: &ReleaseScheme,
     publish_remote: &str,
 ) -> anyhow::Result<ReapReport> {
     let tips = repo.bookmark_tips()?;
     let mut by_name = std::collections::BTreeMap::<String, Vec<CommitId>>::default();
-    for (reference, commit) in superseded_dated_releases(&tips, publish_remote) {
+    for (reference, commit) in superseded_dated_releases(&tips, scheme, publish_remote) {
         let targets = by_name.entry(reference.branch().to_string()).or_default();
         if !targets.contains(&commit) {
             targets.push(commit);
         }
     }
     if !by_name.is_empty()
-        && let Some((live, commit)) = live_dated_release(&tips, publish_remote)
+        && let Some((live, commit)) = live_dated_release(&tips, scheme, publish_remote)
         && !crate::jj::conflicted_files(repo_path, commit.as_str())?.is_empty()
     {
         return Ok(ReapReport {
@@ -580,19 +645,40 @@ pub fn reap_superseded(
 /// The newest dated cut's branch name — unqualified, unlike
 /// [`previous_release_for_cut`]'s — and its live commit: the local ref when
 /// present, otherwise whichever of our remotes carries it.
-fn live_dated_release(tips: &BookmarkTips, publish_remote: &str) -> Option<(BranchName, CommitId)> {
+fn live_dated_release(
+    tips: &BookmarkTips,
+    scheme: &ReleaseScheme,
+    publish_remote: &str,
+) -> Option<(BranchName, CommitId)> {
     let newest = tips
         .keys()
-        .filter(|reference| is_our_release(reference, &ReleaseScheme::Dated, publish_remote))
-        .filter_map(|reference| strict_dated_release(reference.branch().as_str()))
+        .filter(|reference| is_our_release(reference, scheme, publish_remote))
+        .filter_map(|reference| scheme.dated_cut(reference.branch().as_str()))
         .max()?;
     tips.iter()
         .filter(|(reference, _)| {
-            is_our_release(reference, &ReleaseScheme::Dated, publish_remote)
-                && strict_dated_release(reference.branch().as_str()).as_ref() == Some(&newest)
+            is_our_release(reference, scheme, publish_remote)
+                && scheme.dated_cut(reference.branch().as_str()).as_ref() == Some(&newest)
         })
         .max_by_key(|(reference, _)| u8::from(reference.is_local()))
         .map(|(reference, commit)| (reference.branch().clone(), commit.clone()))
+}
+
+/// The plan's note for a series with no cut yet.
+fn no_cut_yet(scheme: &ReleaseScheme) -> String {
+    match scheme {
+        ReleaseScheme::Dated => {
+            "no dated release found; the first cut has nothing to repair".to_owned()
+        }
+        ReleaseScheme::Series(series) => {
+            format!("series {series} has no cut yet; the first cut has nothing to repair")
+        }
+        ReleaseScheme::Fixed(fixed) => {
+            format!(
+                "fixed release branch {fixed} has no cut yet; the first cut has nothing to repair"
+            )
+        }
+    }
 }
 
 /// The release in hand and what it does not carry.
@@ -623,14 +709,7 @@ pub fn plan(
     let newest = newest_release(&tips, &scheme, publish_remote);
 
     let Some((reference, commit)) = newest else {
-        plan.notes.push(match scheme {
-            ReleaseScheme::Dated => {
-                "no dated release found; the first cut has nothing to repair".to_owned()
-            }
-            ReleaseScheme::Fixed(fixed) => {
-                format!("fixed release branch {fixed} has no cut yet; the first cut has nothing to repair")
-            }
-        });
+        plan.notes.push(no_cut_yet(&scheme));
         return Ok(plan);
     };
     plan.release = Some(reference.to_string());
@@ -642,7 +721,7 @@ pub fn plan(
         .cloned();
 
     let parents = repo.parents_of(commit.as_str())?;
-    let trunk_tip = repo.resolve_commit(&entry.upstream_trunk()).ok();
+    let trunk_tip = repo.resolve_commit(&entry.trunk_ref()).ok();
     let trunks = trunk_positions(&repo, entry)?;
     let base = match &trunk_tip {
         Some(trunk) => shared_base(&repo, &commit, trunk)?,
@@ -687,6 +766,14 @@ pub fn plan(
         }
     }
     plan.stale = stale_parents(&member_parents, &tips);
+    // Only the selected series' branches are candidates; one that fits no
+    // series is named with the reason, since every verb would refuse it.
+    let (series_branches, unfit) = crate::release_model::series_members(
+        &repo,
+        entry,
+        carried_from_tips(&tips, entry.trunk(), &scheme),
+    )?;
+    plan.notes.extend(unfit);
     plan.notes.extend(local_branch_notes(&LocalBranchNotes {
         repo: &repo,
         reference: &reference.to_string(),
@@ -694,7 +781,7 @@ pub fn plan(
         parents: &parents,
         trunks: &trunks,
         stacked: stacked_context,
-        branches: &carried_from_tips(&tips, entry.trunk(), &scheme),
+        branches: &series_branches,
         recorded: last_recorded_parents(ledger, &reference.to_string()),
     })?);
     plan.parents = parents
@@ -966,7 +1053,7 @@ pub fn gather_members(
     let entry = fork.entry;
     let commit = opened.resolve_commit(name)?;
     let parents = opened.parents_of(commit.as_str())?;
-    let trunk_name = entry.upstream_trunk();
+    let trunk_name = entry.trunk_ref();
     let mut problems = Vec::new();
     let trunk = match opened.resolve_commit(&trunk_name) {
         Ok(trunk) => Some(trunk),
@@ -1240,7 +1327,7 @@ mod reap_enumeration_tests {
         .into_iter()
         .collect();
 
-        let superseded = superseded_dated_releases(&tips, "release");
+        let superseded = superseded_dated_releases(&tips, &ReleaseScheme::Dated, "release");
         let names: Vec<String> = superseded.iter().map(|(r, _)| r.to_string()).collect();
 
         // Then: only the older dated name, on every remote except upstream and git.
@@ -1267,7 +1354,7 @@ mod reap_enumeration_tests {
         ]
         .into_iter()
         .collect();
-        let names: Vec<String> = superseded_dated_releases(&tips, "release")
+        let names: Vec<String> = superseded_dated_releases(&tips, &ReleaseScheme::Dated, "release")
             .iter()
             .map(|(r, _)| r.to_string())
             .collect();
@@ -1287,7 +1374,7 @@ mod reap_enumeration_tests {
         ]
         .into_iter()
         .collect();
-        let names: Vec<String> = superseded_dated_releases(&tips, "release")
+        let names: Vec<String> = superseded_dated_releases(&tips, &ReleaseScheme::Dated, "release")
             .iter()
             .map(|(r, _)| r.to_string())
             .collect();
@@ -1308,7 +1395,7 @@ mod reap_enumeration_tests {
         .collect();
 
         // When: the reaper candidates are enumerated.
-        let names: Vec<String> = superseded_dated_releases(&tips, "release")
+        let names: Vec<String> = superseded_dated_releases(&tips, &ReleaseScheme::Dated, "release")
             .iter()
             .map(|(r, _)| r.to_string())
             .collect();
@@ -1334,11 +1421,40 @@ mod reap_enumeration_tests {
         ]
         .into_iter()
         .collect();
-        let names: Vec<String> = superseded_dated_releases(&tips, "release")
+        let names: Vec<String> = superseded_dated_releases(&tips, &ReleaseScheme::Dated, "release")
             .iter()
             .map(|(r, _)| r.to_string())
             .collect();
         assert_eq!(names, vec!["release/2026-08-04".to_owned()]);
+    }
+
+    #[test]
+    fn each_series_reaps_only_its_own_superseded_cuts() {
+        // Given: two default-series cuts and two series-9.2 cuts, the 9.2 ones
+        // dated later than every default cut.
+        let tips: BookmarkTips = [
+            local("release/2026-10-19", "aaa"),
+            local("release/2026-10-20", "bbb"),
+            local("release/9.2/2026-10-21", "ccc"),
+            local("release/9.2/2026-10-22", "ddd"),
+        ]
+        .into_iter()
+        .collect();
+        let names = |scheme: &ReleaseScheme| -> Vec<String> {
+            superseded_dated_releases(&tips, scheme, "origin")
+                .iter()
+                .map(|(r, _)| r.to_string())
+                .collect()
+        };
+        // Then: each series keeps its own newest cut live; neither series'
+        // later dates supersede the other's.
+        assert_eq!(names(&ReleaseScheme::Dated), vec!["release/2026-10-19"]);
+        assert_eq!(
+            names(&ReleaseScheme::Series(crate::ids::SeriesName::new("9.2"))),
+            vec!["release/9.2/2026-10-21"]
+        );
+        // And: every series' cut is a release commit, never an orphan.
+        assert_eq!(our_dated_release_commits(&tips, "origin").len(), 4);
     }
 }
 
@@ -1642,7 +1758,7 @@ pub fn parent_sources(
 ) -> anyhow::Result<Vec<(String, CommitId)>> {
     let tips = repo.bookmark_tips()?;
     let carried = carried_from_tips(&tips, entry.trunk(), scheme);
-    let trunk_tip = repo.resolve_commit(&entry.upstream_trunk()).ok();
+    let trunk_tip = repo.resolve_commit(&entry.trunk_ref()).ok();
     let mut sources = Vec::new();
     for commit in parents {
         let named = carried
@@ -1654,7 +1770,7 @@ pub fn parent_sources(
         } else if let Some(trunk) = &trunk_tip
             && repo.is_ancestor(commit, trunk)?
         {
-            entry.upstream_trunk()
+            entry.trunk_ref()
         } else {
             commit.short().to_owned()
         };
@@ -1764,7 +1880,7 @@ pub fn publish_cut(
     scheme: &ReleaseScheme,
 ) -> anyhow::Result<CommitId> {
     let motion = match scheme {
-        ReleaseScheme::Dated => jj::BookmarkMotion::ForwardOnly,
+        ReleaseScheme::Dated | ReleaseScheme::Series(_) => jj::BookmarkMotion::ForwardOnly,
         ReleaseScheme::Fixed(_) => jj::BookmarkMotion::Anywhere,
     };
     Ok(candidate.publish((name, motion), &format!("knives: cut {name}"))?)

@@ -17,7 +17,7 @@ use crate::consumer_pins::{ConsumerHeadMemo, ConsumerPinSource, scan_consumer_sl
 use crate::ids::RepoName;
 use crate::ids::{BookmarkRef, BranchName, ReleaseScheme, RemoteName, is_our_release};
 use crate::jj::Repo;
-use crate::release_model::{release_order, repo_slug};
+use crate::release_model::repo_slug;
 
 /// Cached release lookup for one repo, computed once and shared across every
 /// consumer's pin-lag comparison for that repo.
@@ -34,10 +34,10 @@ pub struct ReleaseState {
 fn newest_release(tips: &crate::detect::BookmarkTips, entry: &RepoEntry) -> Option<String> {
     let scheme = entry.release_scheme();
     match &scheme {
-        ReleaseScheme::Dated => tips
+        ReleaseScheme::Dated | ReleaseScheme::Series(_) => tips
             .keys()
             .filter(|reference| is_our_release(reference, &scheme, entry.publish_remote()))
-            .max_by_key(|reference| release_order(reference.branch().as_str()))
+            .max_by_key(|reference| scheme.cut_order(reference.branch().as_str()))
             .map(ToString::to_string),
         ReleaseScheme::Fixed(branch) => {
             let local = BookmarkRef::Local(branch.clone());
@@ -100,7 +100,9 @@ pub fn pin_lag(
 ) -> PinLag {
     let scheme = fork.entry.release_scheme();
     match &scheme {
-        ReleaseScheme::Dated => dated_pin_lag(fork, newest, &scheme, forge, cache_root, heads),
+        ReleaseScheme::Dated | ReleaseScheme::Series(_) => {
+            dated_pin_lag(fork, newest, &scheme, forge, cache_root, heads)
+        }
         ReleaseScheme::Fixed(fixed) => {
             fixed_pin_lag(fork, repo, fixed, &scheme, forge, cache_root, heads)
         }
