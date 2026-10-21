@@ -795,6 +795,64 @@ pub fn last_recorded_cut(entries: &[Entry], subject: Option<&str>) -> Option<Rec
     })
 }
 
+/// Which of knives' own writes a ledger event records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordedWriteKind {
+    Cut,
+    Edit,
+}
+
+impl std::fmt::Display for RecordedWriteKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Cut => "cut",
+            Self::Edit => "edit",
+        })
+    }
+}
+
+/// The commit a cut or edit event says knives wrote under a release name.
+#[derive(Debug, PartialEq, Eq)]
+pub struct RecordedWrite {
+    pub kind: RecordedWriteKind,
+    pub commit: CommitId,
+}
+
+/// Every commit knives itself put under `release`, newest first: what each cut
+/// event or edit event (`include`, `drop`, `advance`, `rebase`) records first
+/// in its evidence.
+///
+/// An edit writes a new commit under the same name, so a release that equals
+/// its last edit is knives' own work, not drift, and a publish remote at an
+/// earlier write is knives' own work an edit has not been pushed over. The
+/// composition gate does not read this: it holds a new cut against
+/// [`last_recorded_cut`], so a member an edit dropped is still restated at the
+/// next cut.
+pub fn recorded_writes<'a>(
+    entries: &'a [Entry],
+    release: &'a str,
+) -> impl Iterator<Item = RecordedWrite> + 'a {
+    entries.iter().rev().filter_map(move |entry| {
+        if entry.kind != Kind::Event || entry.subject.as_deref() != Some(release) {
+            return None;
+        }
+        if let Some(cut) = last_recorded_cut(std::slice::from_ref(entry), None) {
+            return Some(RecordedWrite {
+                kind: RecordedWriteKind::Cut,
+                commit: cut.commit,
+            });
+        }
+        let rest = entry.text.strip_prefix("edited ")?.strip_prefix(release)?;
+        if !(rest.starts_with(':') || rest.starts_with(' ')) {
+            return None;
+        }
+        Some(RecordedWrite {
+            kind: RecordedWriteKind::Edit,
+            commit: CommitId::new(entry.evidence.first()?.as_str()),
+        })
+    })
+}
+
 /// The newest structural cut event of the series `entry` selects.
 ///
 /// It is the baseline a cut of that series is held against. An entry without

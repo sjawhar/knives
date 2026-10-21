@@ -469,8 +469,8 @@ enum DropDisposition {
 /// audit's are: a conflicted replay onto a conflicted cut subject answers
 /// nothing either way. A member the cut subject does not carry refuses the cut,
 /// the previous cut's ledger event is the only surviving record of the
-/// composition — every edit moves the bookmark, and the next cut reaps the
-/// superseded commit. A refused candidate was never published and a refused
+/// composition — every edit moves the bookmark and abandons the commit it
+/// replaced. A refused candidate was never published and a refused
 /// record leaves origin as it was, so nothing is abandoned and nothing needs
 /// cleanup.
 fn report_uncarried_cut(
@@ -773,7 +773,34 @@ fn reap_after_cut(fork: &Fork<'_>) -> anyhow::Result<Exit> {
         fork.entry.publish_remote(),
     )?;
     print_reap(fork.name.as_str(), &report);
+    abandon_reaped_writes(fork, &report)?;
     Ok(reap_exit(&report))
+}
+
+/// Abandon the earlier writes of each name the reap just forgot — commits the
+/// ledger records knives writing under it — that are visible heads nothing
+/// rests on: a replaced commit once kept for a working copy that has since
+/// moved on would otherwise stay an anonymous head for good.
+fn abandon_reaped_writes(
+    fork: &Fork<'_>,
+    report: &knives::commands::release::ReapReport,
+) -> anyhow::Result<()> {
+    let names: Vec<&str> = report
+        .reaped
+        .iter()
+        .chain(report.forgotten_only.iter().map(|(name, _)| name))
+        .map(String::as_str)
+        .collect();
+    for name in names {
+        let earlier = super::release_edit::earlier_writes(fork, name)?;
+        let abandoned = knives::jj::abandon_unheld_writes(
+            &fork.checkout.path,
+            &earlier,
+            &format!("knives: {name}: abandon earlier writes nothing rests on"),
+        )?;
+        super::release_edit::report_abandoned_earlier(&fork.name, name, &abandoned);
+    }
+    Ok(())
 }
 
 /// Reap superseded dated cuts on demand.
@@ -787,6 +814,7 @@ pub(crate) fn run_reap(fork: &Fork<'_>) -> anyhow::Result<Exit> {
         fork.entry.publish_remote(),
     )?;
     print_reap(fork.name.as_str(), &report);
+    abandon_reaped_writes(fork, &report)?;
     Ok(reap_exit(&report))
 }
 

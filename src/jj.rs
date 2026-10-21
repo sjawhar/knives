@@ -793,6 +793,17 @@ impl Repo {
         ))
     }
 
+    /// Whether `current` is `recorded` rewritten without changing what it is:
+    /// the same change id, the same parents and the same tree. `jj sign` and
+    /// `jj metaedit` make such a rewrite, under a new commit id. `recorded` may
+    /// be hidden; it is read by id.
+    pub fn is_metadata_rewrite(&self, recorded: &str, current: &str) -> Result<bool, JjError> {
+        let (recorded, current) = (self.commit(recorded)?, self.commit(current)?);
+        Ok(recorded.change_id() == current.change_id()
+            && recorded.parent_ids() == current.parent_ids()
+            && recorded.tree_ids() == current.tree_ids())
+    }
+
     /// The visible commits that share `revision`'s change id, other than
     /// `revision` itself: what a `jj rebase` (or a resolved conflict) left in
     /// the commit's place. Empty for a commit whose change was never rewritten
@@ -1734,10 +1745,42 @@ pub struct ReleaseWrite<'a> {
     pub message: Option<&'a str>,
     /// Point this bookmark at the written commit, sideways moves allowed —
     /// callers that pass one have already established the move is safe (see
-    /// [`set_bookmark_anywhere`]).
+    /// [`set_bookmark_anywhere`]). When it named the source, the write replaces
+    /// the source, which is abandoned once nothing else rests on it.
     pub bookmark: Option<&'a str>,
+    /// The remote the bookmark publishes to. Its tracked ref of the bookmark
+    /// is the published position the next push replaces, so it does not keep
+    /// a replaced source.
+    pub publish_remote: Option<&'a str>,
+    /// Commits earlier writes put under the bookmark, as the ledger records
+    /// them. Each one that is a visible head nothing rests on — a replaced
+    /// commit once kept for a working copy that has since moved on — is
+    /// abandoned in the same operation, unless the written commit carries
+    /// conflicts. Unknown ones are skipped.
+    pub earlier: &'a [CommitId],
     /// The operation-log description, `knives: …` by convention.
     pub operation: &'a str,
+}
+
+/// What a release write made, and what became of the commit it replaced.
+#[derive(Debug)]
+pub struct ReleaseWritten {
+    pub commit: CommitId,
+    /// The written commit's change id, which the edit event records.
+    pub change: ChangeId,
+    /// The source the bookmark moved off, when it named the source.
+    pub replaced: Option<ReplacedRelease>,
+    /// Earlier writes of the name ([`ReleaseWrite::earlier`]) abandoned here:
+    /// visible heads nothing rests on any more.
+    pub abandoned_earlier: Vec<CommitId>,
+}
+
+/// The commit a release write replaced under its name.
+#[derive(Debug)]
+pub struct ReplacedRelease {
+    pub commit: CommitId,
+    /// Why it stays; `None` when it was abandoned.
+    pub kept: Option<String>,
 }
 
 /// Write a release commit — and optionally its bookmark — as ONE operation.
@@ -1759,29 +1802,222 @@ pub struct ReleaseWrite<'a> {
 /// workspace on top of the release merge unless flagged off; a jj-lib write
 /// cannot make that mistake, and it reports the created commit directly
 /// instead of through parsed human-facing output.
-pub fn write_release(repo: &Path, write: &ReleaseWrite<'_>) -> Result<CommitId, JjError> {
+///
+/// A duplicate moved under the name its source carried replaces that source,
+/// which would otherwise stay behind as a head no bookmark names. It is
+/// abandoned in the same operation unless something else rests on it
+/// ([`what_keeps`]) — a working copy on it or above it among them, since
+/// rewriting that from here would leave the workspace stale.
+pub fn write_release(repo: &Path, write: &ReleaseWrite<'_>) -> Result<ReleaseWritten, JjError> {
     validate_parents(write.source, write.parents)?;
     let repo = Repo::open(repo)?;
     let (parent_commits, parent_ids) = resolved_parents(&repo, write.parents)?;
     let mut tx = repo.repo.start_transaction();
-    let written = if let Some(source) = write.source {
+    let (written, source) = if let Some(source) = write.source {
         let source = repo.commit(source.as_str())?;
-        duplicated_release(&mut tx, (&source, write.message), &parent_ids)?
+        let written = duplicated_release(&mut tx, (&source, write.message), &parent_ids)?;
+        (written, Some(source))
     } else {
-        merged_release(
+        let written = merged_release(
             &mut tx,
             (&parent_commits, parent_ids),
             write.message.unwrap_or_default(),
-        )?
+        )?;
+        (written, None)
     };
+    let mut replaced = None;
+    let mut abandoned_earlier = Vec::new();
     if let Some(name) = write.bookmark {
-        tx.repo_mut().set_local_bookmark_target(
-            JjRefName::new(name),
-            RefTarget::normal(written.id().clone()),
-        );
+        let ref_name = JjRefName::new(name);
+        let source = source.filter(|source| {
+            repo.repo
+                .view()
+                .get_local_bookmark(ref_name)
+                .added_ids()
+                .any(|id| id == source.id())
+        });
+        tx.repo_mut()
+            .set_local_bookmark_target(ref_name, RefTarget::normal(written.id().clone()));
+        let moved = MovedName {
+            name,
+            publish_remote: write.publish_remote,
+        };
+        if let Some(source) = source {
+            let kept = what_keeps(&repo, tx.repo(), &source, &moved)?;
+            if kept.is_none() {
+                tx.repo_mut().record_abandoned_commit(&source);
+            }
+            replaced = Some(ReplacedRelease {
+                commit: commit_id(source.id()),
+                kept,
+            });
+        }
+        // A stray is no published position this push replaces, so it gets no
+        // publish-ref exemption. While the written release carries conflicts,
+        // earlier writes are the record of their last resolution (on a fixed
+        // branch, the superseded cuts), so none is swept: reap's rule.
+        let stray_rules = MovedName {
+            name,
+            publish_remote: None,
+        };
+        let written_id = commit_id(written.id());
+        let strays = if written.has_conflict() {
+            Vec::new()
+        } else {
+            unheld_heads(&repo, tx.repo(), write.earlier, &stray_rules)?
+        };
+        for stray in strays {
+            let stray_id = commit_id(stray.id());
+            if stray_id != written_id
+                && write.source != Some(&stray_id)
+                && !write.parents.contains(&stray_id)
+            {
+                tx.repo_mut().record_abandoned_commit(&stray);
+                abandoned_earlier.push(stray_id);
+            }
+        }
     }
     commit_mutation(&repo, tx, write.operation)?;
-    Ok(commit_id(written.id()))
+    Ok(ReleaseWritten {
+        commit: commit_id(written.id()),
+        change: ChangeId::new(written.change_id().to_string()),
+        replaced,
+        abandoned_earlier,
+    })
+}
+
+/// The bookmark a release write moved, and where it publishes.
+struct MovedName<'a> {
+    name: &'a str,
+    publish_remote: Option<&'a str>,
+}
+
+/// Which of `candidates` are visible heads nothing rests on ([`what_keeps`]),
+/// judged in `view_repo`. A candidate this repository cannot resolve (a write
+/// another machine made, or one already gone) is skipped, and so is one that
+/// is hidden or has descendants.
+fn unheld_heads(
+    repo: &Repo,
+    view_repo: &dyn jj_lib::repo::Repo,
+    candidates: &[CommitId],
+    moved: &MovedName<'_>,
+) -> Result<Vec<jj_lib::commit::Commit>, JjError> {
+    let heads = repo.repo.view().heads();
+    let mut unheld: Vec<jj_lib::commit::Commit> = Vec::new();
+    for candidate in candidates {
+        let Ok(commit) = repo.commit(candidate.as_str()) else {
+            continue;
+        };
+        if !heads.contains(commit.id()) || unheld.iter().any(|seen| seen.id() == commit.id()) {
+            continue;
+        }
+        if what_keeps(repo, view_repo, &commit, moved)?.is_none() {
+            unheld.push(commit);
+        }
+    }
+    Ok(unheld)
+}
+
+/// Abandon the unheld heads among `candidates`, as ONE described operation.
+///
+/// The candidates are commits the ledger says knives wrote under release
+/// names now forgotten; one is abandoned when it is a visible head nothing
+/// rests on ([`unheld_heads`]). Returns the abandoned ones.
+pub fn abandon_unheld_writes(
+    repo: &Path,
+    candidates: &[CommitId],
+    operation: &str,
+) -> Result<Vec<CommitId>, JjError> {
+    let repo = Repo::open(repo)?;
+    let moved = MovedName {
+        name: "",
+        publish_remote: None,
+    };
+    let mut tx = repo.repo.start_transaction();
+    let unheld = unheld_heads(&repo, tx.repo(), candidates, &moved)?;
+    if unheld.is_empty() {
+        return Ok(Vec::new());
+    }
+    for commit in &unheld {
+        tx.repo_mut().record_abandoned_commit(commit);
+    }
+    commit_mutation(&repo, tx, operation)?;
+    Ok(unheld.iter().map(|commit| commit_id(commit.id())).collect())
+}
+
+/// Why a replaced release commit must stay, judged in `view_repo` — the
+/// write's transaction, the name already moved — or `None` when nothing else
+/// rests on it.
+///
+/// It stays for a bookmark or tag on it, local or on any remote; a workspace
+/// with it checked out; any visible descendant, a parked working copy
+/// included (the same rule as [`abandon_tagged_copies`]: rewriting a working
+/// copy from here leaves its workspace stale); or anything jj's default rule
+/// pins ([`assert_mutable`]). A commit someone else can still reach by name is
+/// theirs to keep. Two refs do not count: the colocated git view (`@git`),
+/// which shows the moved name at the source until this operation exports
+/// refs, and the moved name's tracked ref on its publish remote, the published
+/// position the next push replaces.
+fn what_keeps(
+    repo: &Repo,
+    view_repo: &dyn jj_lib::repo::Repo,
+    commit: &jj_lib::commit::Commit,
+    moved: &MovedName<'_>,
+) -> Result<Option<String>, JjError> {
+    let id = commit.id();
+    let view = view_repo.view();
+    let mut reasons = Vec::new();
+    let mut named = Vec::new();
+    for (name, targets) in view.bookmarks() {
+        if targets.local_target.added_ids().any(|target| target == id) {
+            reasons.push(format!("bookmark {} points at it", name.as_str()));
+        }
+        for (remote, remote_ref) in &targets.remote_refs {
+            let published_position = name.as_str() == moved.name
+                && moved.publish_remote == Some(remote.as_str())
+                && remote_ref.is_tracked();
+            if *remote != jj_lib::git::REMOTE_NAME_FOR_LOCAL_GIT_REPO
+                && !published_position
+                && remote_ref.target.added_ids().any(|target| target == id)
+            {
+                named.push(format!("{}@{}", name.as_str(), remote.as_str()));
+            }
+        }
+    }
+    for (name, targets) in view.tags() {
+        let remotes = targets
+            .remote_refs
+            .iter()
+            .filter(|(remote, _)| *remote != jj_lib::git::REMOTE_NAME_FOR_LOCAL_GIT_REPO);
+        if targets.local_target.added_ids().any(|target| target == id)
+            || remotes
+                .clone()
+                .any(|(_, remote_ref)| remote_ref.target.added_ids().any(|target| target == id))
+        {
+            named.push(format!("tag {}", name.as_str()));
+        }
+    }
+    if !named.is_empty() {
+        reasons.push(format!("{} names it", named.join(", ")));
+    }
+    let workspaces = checked_out_by(repo, id);
+    if !workspaces.is_empty() {
+        reasons.push(format!(
+            "it is the working copy of {}",
+            workspaces.join(", ")
+        ));
+    }
+    let descendants = repo.descendants_of(id)?;
+    if !descendants.is_empty() {
+        reasons.push(descendants_that_stay(
+            repo,
+            &descendants.iter().collect::<Vec<_>>(),
+        )?);
+    }
+    if let Err(error) = assert_mutable(view_repo, std::slice::from_ref(commit)) {
+        reasons.push(error.to_string());
+    }
+    Ok((!reasons.is_empty()).then(|| reasons.join("; ")))
 }
 
 /// Refuse an empty or repeated parent set before anything is written.

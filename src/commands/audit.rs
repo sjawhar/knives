@@ -154,6 +154,7 @@ pub fn gather(input: &AuditInput<'_>) -> Report {
             schemes: &release_schemes(entry),
             publish_remote: entry.publish_remote(),
             entries: input.store.ledger_entries(&fork.upstream),
+            is_metadata_rewrite: &|recorded, current| opened.is_metadata_rewrite(recorded, current),
         },
     );
     add_misplaced_origin_release_refs(&mut report, live.origin(), &scheme, entry.publish_remote());
@@ -358,6 +359,7 @@ struct ReleaseDriftScan<'a> {
     schemes: &'a [crate::ids::ReleaseScheme],
     publish_remote: &'a str,
     entries: &'a [Entry],
+    is_metadata_rewrite: &'a MetadataRewrite<'a>,
 }
 
 /// A note for each branch that fits no release series of an entry that has
@@ -390,8 +392,30 @@ struct ReleaseDrift<'a> {
     entries: &'a [Entry],
     reference: BookmarkRef,
     current: &'a CommitId,
-    source: &'a str,
+    source: DriftSource,
+    is_metadata_rewrite: &'a MetadataRewrite<'a>,
 }
+
+/// Which copy of a release name a drift check reads.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DriftSource {
+    Local,
+    /// The live publish remote, which keeps an earlier write until it is pushed.
+    PublishRemote,
+}
+
+impl std::fmt::Display for DriftSource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Local => "local",
+            Self::PublishRemote => "publish remote",
+        })
+    }
+}
+
+/// Whether the second commit is the first one re-signed or metaedited:
+/// [`Repo::is_metadata_rewrite`], behind a seam the unit tests can answer.
+type MetadataRewrite<'a> = dyn Fn(&str, &str) -> Result<bool, jj::JjError> + 'a;
 
 fn add_release_drifts(report: &mut Report, scan: &ReleaseDriftScan<'_>) {
     let ReleaseDriftScan {
@@ -400,6 +424,7 @@ fn add_release_drifts(report: &mut Report, scan: &ReleaseDriftScan<'_>) {
         schemes,
         publish_remote,
         entries,
+        is_metadata_rewrite,
     } = *scan;
     for (branch, current) in local
         .iter()
@@ -411,7 +436,8 @@ fn add_release_drifts(report: &mut Report, scan: &ReleaseDriftScan<'_>) {
                 entries,
                 reference: BookmarkRef::Local(branch.clone()),
                 current,
-                source: "local",
+                source: DriftSource::Local,
+                is_metadata_rewrite,
             },
         );
     }
@@ -435,38 +461,106 @@ fn add_release_drifts(report: &mut Report, scan: &ReleaseDriftScan<'_>) {
                     remote: crate::ids::RemoteName::new(publish_remote),
                 },
                 current,
-                source: "publish remote",
+                source: DriftSource::PublishRemote,
+                is_metadata_rewrite,
             },
         );
     }
 }
 
+/// Hold one release ref against the commits knives wrote under its name.
+///
+/// At the newest write it is silent. A commit with that write's change id,
+/// parents and tree is the write re-signed or metaedited — routine before a
+/// push, since knives writes unsigned commits. The publish remote at any
+/// earlier write of the name (or a re-signed copy of one) is knives' own work
+/// that a newer write has not been pushed over yet. Both are notes. Anything
+/// else is drift, a local name at an earlier write included: it is not what
+/// knives last wrote, whether it was moved back or the newer write came from
+/// another machine and is not fetched here.
+///
+/// Only the newest write must be readable: an older one whose commit never
+/// reached this machine — the ledger is shared — is skipped.
 fn add_release_drift(report: &mut Report, drift: ReleaseDrift<'_>) {
     let ReleaseDrift {
         entries,
         reference,
         current,
         source,
+        is_metadata_rewrite,
     } = drift;
     let branch = reference.branch();
-    match recorded_commit(entries, branch.as_str()) {
-        Some(recorded) if !same_commit(recorded.as_str(), current.as_str()) => {
-            let detail = format!(
-                "{source} {branch} is at {} but its newest recorded cut names {}",
+    let writes: Vec<_> = crate::release_model::recorded_writes(entries, branch.as_str()).collect();
+    let Some(newest) = writes.first() else {
+        report.notes.push(format!(
+            "{source} {branch} has no recorded cut or edit event"
+        ));
+        return;
+    };
+    let accepted = if source == DriftSource::PublishRemote {
+        writes.len()
+    } else {
+        1
+    };
+    let candidates = writes.iter().take(accepted).enumerate();
+    let mut unreadable = None;
+    let matched = candidates
+        .clone()
+        .find(|(_, write)| same_commit(write.commit.as_str(), current.as_str()))
+        .map(|(position, write)| (position, write, false))
+        .or_else(|| {
+            candidates.clone().find_map(|(position, write)| {
+                match is_metadata_rewrite(write.commit.as_str(), current.as_str()) {
+                    Ok(rewritten) => rewritten.then_some((position, write, true)),
+                    Err(error) => {
+                        if position == 0 {
+                            unreadable = Some(error);
+                        }
+                        None
+                    }
+                }
+            })
+        });
+    let (newest_kind, newest_commit) = (newest.kind, newest.commit.short());
+    if let Some((position, write, rewritten)) = matched {
+        let how = if rewritten {
+            " re-signed or metaedited (same change, parents and tree)"
+        } else {
+            ""
+        };
+        match position {
+            0 if !rewritten => {}
+            0 => report.notes.push(format!(
+                "{source} {branch} is at {}, the recorded {} {}{how}",
                 current.short(),
-                recorded.short(),
-            );
-            report.findings.push(Finding::new(
-                FindingKind::ReleaseDrift,
-                Subject::Bookmark(reference),
-                detail,
-            ));
+                write.kind,
+                write.commit.short(),
+            )),
+            _ => report.notes.push(format!(
+                "{source} {branch} is at {}, the earlier recorded {} {}{how}; the newest \
+                 recorded {newest_kind} names {newest_commit}",
+                current.short(),
+                write.kind,
+                write.commit.short(),
+            )),
         }
-        Some(_) => {}
-        None => report
-            .notes
-            .push(format!("{source} {branch} has no recorded cut event")),
+        return;
     }
+    if let Some(error) = unreadable {
+        report.problems.push(format!(
+            "could not compare {source} {branch} at {} with its recorded writes: {error}",
+            current.short(),
+        ));
+    }
+    let detail = format!(
+        "{source} {branch} is at {} but its newest recorded {newest_kind} names {newest_commit}",
+        current.short(),
+    );
+    report.findings.push(Finding::new(
+        FindingKind::ReleaseDrift,
+        Subject::Bookmark(reference),
+        detail,
+    ));
 }
 
 fn add_misplaced_origin_release_refs(
@@ -499,10 +593,6 @@ fn add_misplaced_origin_release_refs(
             ),
         ));
     }
-}
-
-fn recorded_commit(entries: &[Entry], subject: &str) -> Option<CommitId> {
-    crate::release_model::last_recorded_cut(entries, Some(subject)).map(|cut| cut.commit)
 }
 
 fn same_commit(recorded: &str, current: &str) -> bool {
@@ -715,9 +805,9 @@ pub fn render(report: &Report) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AuditInput, LocalFacts, ReleaseDriftScan, Report, add_misplaced_origin_release_refs,
-        add_open_pull_head_checks, add_release_drifts, exit_for, pull_head_findings,
-        pull_position_findings, recorded_commit, same_commit,
+        AuditInput, LocalFacts, MetadataRewrite, ReleaseDriftScan, Report,
+        add_misplaced_origin_release_refs, add_open_pull_head_checks, add_release_drifts, exit_for,
+        pull_head_findings, pull_position_findings, same_commit,
     };
     use crate::bind::Fork;
     use crate::cli::Exit;
@@ -729,6 +819,7 @@ mod tests {
     };
     use crate::ids::{BookmarkRef, BranchName, CommitId};
     use crate::ledger::{Entry, Kind, Ledger};
+    use crate::release_model::{RecordedWrite, RecordedWriteKind, recorded_writes};
     use crate::store::Store;
     use std::collections::BTreeMap;
     use std::path::Path;
@@ -928,9 +1019,220 @@ mod tests {
         ];
 
         assert_eq!(
-            recorded_commit(&entries, "release/2026-08-15"),
-            Some(CommitId::new("aaaaaaaaaaaa"))
+            recorded_writes(&entries, "release/2026-08-15").collect::<Vec<_>>(),
+            [RecordedWrite {
+                kind: RecordedWriteKind::Cut,
+                commit: CommitId::new("aaaaaaaaaaaa"),
+            }]
         );
+    }
+
+    #[test]
+    fn a_later_edit_event_is_the_baseline_a_release_is_held_against() {
+        let event = |ts: &str, text: &str, commit: &str| Entry {
+            ts: ts.to_owned(),
+            owner: "test".to_owned(),
+            email: None,
+            subject: Some("release/2026-08-15".to_owned()),
+            kind: Kind::Event,
+            disposition: None,
+            statement: None,
+            text: text.to_owned(),
+            evidence: vec![commit.to_owned(), "member0000000".to_owned()],
+            anchor: None,
+            pr: None,
+            parents: Vec::new(),
+        };
+        let entries = vec![
+            event(
+                "2026-08-15T00:00:00Z",
+                "cut release/2026-08-15 as aaaaaaaaaaaa with 2 parent(s)",
+                "aaaaaaaaaaaa",
+            ),
+            // The event an older knives wrote, before edits recorded a change id.
+            event(
+                "2026-08-16T00:00:00Z",
+                "edited release/2026-08-15: dropped feat/beta: not ready; parents: feat/alpha@m",
+                "bbbbbbbbbbbb",
+            ),
+        ];
+        let schemes = [crate::ids::ReleaseScheme::Dated];
+        // The local name and the publish remote, both at `commit`.
+        let drift_at = |commit: &str, rewrite: &MetadataRewrite<'_>| {
+            let local =
+                BTreeMap::from([(BranchName::new("release/2026-08-15"), CommitId::new(commit))]);
+            let published = BTreeMap::from([(
+                "refs/heads/release/2026-08-15".to_owned(),
+                CommitId::new(commit),
+            )]);
+            let mut report = Report::new("demo");
+            add_release_drifts(
+                &mut report,
+                &ReleaseDriftScan {
+                    local: &local,
+                    published: &published,
+                    schemes: &schemes,
+                    publish_remote: "release",
+                    entries: &entries,
+                    is_metadata_rewrite: rewrite,
+                },
+            );
+            report
+        };
+        let unrelated = |_: &str, _: &str| -> Result<bool, crate::jj::JjError> { Ok(false) };
+
+        let edited = drift_at("bbbbbbbbbbbb000000000000000000000000000000", &unrelated);
+        assert!(edited.findings.is_empty(), "{edited:?}");
+        assert!(edited.notes.is_empty(), "{edited:?}");
+        // The cut the edit replaced: on the publish remote, the edit is not
+        // pushed yet; locally, the name was moved back after the edit.
+        let cut = drift_at("aaaaaaaaaaaa000000000000000000000000000000", &unrelated);
+        assert_eq!(
+            cut.notes,
+            [
+                "publish remote release/2026-08-15 is at aaaaaaaaaaaa, the earlier recorded cut \
+                 aaaaaaaaaaaa; the newest recorded edit names bbbbbbbbbbbb"
+            ]
+        );
+        assert_eq!(cut.findings.len(), 1, "{cut:?}");
+        assert_eq!(
+            cut.findings.first().map(|finding| finding.detail.as_str()),
+            Some(
+                "local release/2026-08-15 is at aaaaaaaaaaaa but its newest recorded edit names \
+                 bbbbbbbbbbbb"
+            )
+        );
+        let elsewhere = drift_at("dddddddddddd000000000000000000000000000000", &unrelated);
+        assert_eq!(elsewhere.findings.len(), 2, "{elsewhere:?}");
+    }
+
+    #[test]
+    fn an_unreadable_older_write_is_skipped_and_an_unreadable_newest_is_a_problem() {
+        let event = |text: &str, commit: &str| Entry {
+            ts: "2026-08-15T00:00:00Z".to_owned(),
+            owner: "test".to_owned(),
+            email: None,
+            subject: Some("release/2026-08-15".to_owned()),
+            kind: Kind::Event,
+            disposition: None,
+            statement: None,
+            text: text.to_owned(),
+            evidence: vec![commit.to_owned(), "member0000000".to_owned()],
+            anchor: None,
+            pr: None,
+            parents: Vec::new(),
+        };
+        let entries = vec![
+            event(
+                "cut release/2026-08-15 as aaaaaaaaaaaa with 2 parent(s)",
+                "aaaaaaaaaaaa",
+            ),
+            event(
+                "edited release/2026-08-15 as bbbbbbbbbbbb: x",
+                "bbbbbbbbbbbb",
+            ),
+        ];
+        let local = BTreeMap::new();
+        let schemes = [crate::ids::ReleaseScheme::Dated];
+        let published = BTreeMap::from([(
+            "refs/heads/release/2026-08-15".to_owned(),
+            CommitId::new("dddddddddddd000000000000000000000000000000"),
+        )]);
+        let audit = |unreadable: &'static str| {
+            let mut report = Report::new("demo");
+            add_release_drifts(
+                &mut report,
+                &ReleaseDriftScan {
+                    local: &local,
+                    published: &published,
+                    schemes: &schemes,
+                    publish_remote: "release",
+                    entries: &entries,
+                    is_metadata_rewrite: &|recorded, _| {
+                        if recorded == unreadable {
+                            Err(crate::jj::JjError::Revision {
+                                revision: recorded.to_owned(),
+                                detail: "not found".to_owned(),
+                            })
+                        } else {
+                            Ok(false)
+                        }
+                    },
+                },
+            );
+            report
+        };
+
+        let older = audit("aaaaaaaaaaaa");
+        assert_eq!(older.findings.len(), 1, "{older:?}");
+        assert!(older.problems.is_empty(), "{older:?}");
+        let newest = audit("bbbbbbbbbbbb");
+        assert_eq!(newest.findings.len(), 1, "{newest:?}");
+        assert_eq!(newest.problems.len(), 1, "{newest:?}");
+    }
+
+    #[test]
+    fn a_re_signed_copy_of_the_recorded_write_is_a_note_and_an_unreadable_one_a_problem() {
+        let entries = vec![Entry {
+            ts: "2026-08-16T00:00:00Z".to_owned(),
+            owner: "test".to_owned(),
+            email: None,
+            subject: Some("release/2026-08-15".to_owned()),
+            kind: Kind::Event,
+            disposition: None,
+            statement: None,
+            text: "edited release/2026-08-15 as bbbbbbbbbbbb (change zzzz) with 1 parent(s): \
+                   dropped feat/beta: x; parents: feat/alpha@m"
+                .to_owned(),
+            evidence: vec!["bbbbbbbbbbbb".to_owned(), "member0000000".to_owned()],
+            anchor: None,
+            pr: None,
+            parents: Vec::new(),
+        }];
+        let local = BTreeMap::from([(
+            BranchName::new("release/2026-08-15"),
+            CommitId::new("cccccccccccc000000000000000000000000000000"),
+        )]);
+        let published = BTreeMap::new();
+        let schemes = [crate::ids::ReleaseScheme::Dated];
+        let audit = |rewrite: &MetadataRewrite<'_>| {
+            let mut report = Report::new("demo");
+            add_release_drifts(
+                &mut report,
+                &ReleaseDriftScan {
+                    local: &local,
+                    published: &published,
+                    schemes: &schemes,
+                    publish_remote: "release",
+                    entries: &entries,
+                    is_metadata_rewrite: rewrite,
+                },
+            );
+            report
+        };
+
+        let signed = audit(&|recorded, current| {
+            assert_eq!(recorded, "bbbbbbbbbbbb");
+            assert_eq!(current, "cccccccccccc000000000000000000000000000000");
+            Ok(true)
+        });
+        assert!(signed.findings.is_empty(), "{signed:?}");
+        assert_eq!(
+            signed.notes,
+            [
+                "local release/2026-08-15 is at cccccccccccc, the recorded edit bbbbbbbbbbbb \
+              re-signed or metaedited (same change, parents and tree)"
+            ]
+        );
+
+        let unreadable = audit(&|_, _| {
+            Err(crate::jj::JjError::Revision {
+                revision: "bbbbbbbbbbbb".to_owned(),
+                detail: "not found".to_owned(),
+            })
+        });
+        assert_eq!(unreadable.findings.len(), 1, "{unreadable:?}");
+        assert_eq!(unreadable.problems.len(), 1, "{unreadable:?}");
     }
 
     #[test]
@@ -968,6 +1270,7 @@ mod tests {
                 schemes: &[crate::ids::ReleaseScheme::Dated],
                 publish_remote: "release",
                 entries: &entries,
+                is_metadata_rewrite: &|_, _| Ok(false),
             },
         );
 

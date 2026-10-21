@@ -373,23 +373,27 @@ fn apply_edit(
     let entry = fork.entry;
     let provenance = release::parent_sources(opened, entry, &entry.release_scheme(), new_parents)?;
     let message = release::composition_message(&release.name, &provenance, delta);
-    let created = knives::jj::write_release(
+    let written = knives::jj::write_release(
         &fork.checkout.path,
         &knives::jj::ReleaseWrite {
             source: Some(&release.commit),
             parents: new_parents,
             message: Some(&message),
             bookmark: Some(&release.name),
+            publish_remote: Some(entry.publish_remote()),
+            earlier: &earlier_writes(fork, &release.name)?,
             operation: &format!("knives: {}: {delta}", release.name),
         },
     )?;
+    let created = &written.commit;
     record_edit_event(
         fork,
         opened,
         &EditRecord {
             release: &release.name,
             delta,
-            created: &created,
+            created,
+            change: &written.change,
             provenance: &provenance,
         },
         context.bound,
@@ -399,6 +403,7 @@ fn apply_edit(
         release.name,
         new_parents.len()
     );
+    report_replaced(repo, &release.name, &written);
     match knives::jj::conflicted_files(&fork.checkout.path, created.as_str()) {
         Ok(files) => println!("{}", release::conflict_guidance(&files)),
         Err(error) => println!("  could not list conflicts: {error}"),
@@ -406,18 +411,66 @@ fn apply_edit(
     Ok(Exit::Ok)
 }
 
-/// What one release edit wrote: the name, the delta, the new merge and its
-/// parent set with the branch each parent came from.
+/// One line on the commit a release write replaced under `release`: abandoned,
+/// or kept with what rests on it. Silent when the write replaced nothing.
+pub(crate) fn report_replaced(
+    repo: &RepoName,
+    release: &str,
+    written: &knives::jj::ReleaseWritten,
+) {
+    if let Some(replaced) = &written.replaced {
+        let old = replaced.commit.short();
+        match &replaced.kept {
+            None => println!("{repo}: abandoned {old}, the {release} commit this write replaced"),
+            Some(reason) => println!(
+                "{repo}: note: kept {old}, the {release} commit this write replaced: {reason}"
+            ),
+        }
+    }
+    report_abandoned_earlier(repo, release, &written.abandoned_earlier);
+}
+
+/// One line per earlier write of `release` abandoned because nothing rests on
+/// it any more.
+pub(crate) fn report_abandoned_earlier(
+    repo: &RepoName,
+    release: &str,
+    abandoned: &[knives::ids::CommitId],
+) {
+    for commit in abandoned {
+        println!(
+            "{repo}: abandoned {}, an earlier {release} commit nothing rests on any more",
+            commit.short()
+        );
+    }
+}
+
+/// The commits the fork's ledger records knives writing under `release`.
+pub(crate) fn earlier_writes(
+    fork: &Fork<'_>,
+    release: &str,
+) -> anyhow::Result<Vec<knives::ids::CommitId>> {
+    let entries = Ledger::for_fork(fork).read()?.entries;
+    Ok(knives::release_model::recorded_writes(&entries, release)
+        .map(|write| write.commit)
+        .collect())
+}
+
+/// What one release edit wrote: the name, the delta, the new merge with its
+/// change id, and its parent set with the branch each parent came from.
 pub(crate) struct EditRecord<'a> {
     pub(crate) release: &'a str,
     pub(crate) delta: &'a str,
     pub(crate) created: &'a knives::ids::CommitId,
+    pub(crate) change: &'a knives::ids::ChangeId,
     pub(crate) provenance: &'a [(String, knives::ids::CommitId)],
 }
 
 /// The edit's parent set goes to the ledger the way a cut's does, so a later
 /// `advance` or `include` can still tell which parent is which branch after a
-/// rebase that left no ancestry or change id behind.
+/// rebase that left no ancestry or change id behind. Like a cut event, it names
+/// the written commit, its change id and its parents, and the commit leads the
+/// evidence: it is the position `audit` holds the release against.
 pub(crate) fn record_edit_event(
     fork: &Fork<'_>,
     opened: &knives::jj::Repo,
@@ -435,8 +488,11 @@ pub(crate) fn record_edit_event(
         disposition: None,
         statement: None,
         text: format!(
-            "edited {}: {}; parents: {}",
+            "edited {} as {} (change {}) with {} parent(s): {}; parents: {}",
             record.release,
+            record.created.short(),
+            record.change.short(),
+            parents.len(),
             record.delta,
             members_event_text(record.provenance)
         ),

@@ -15,7 +15,9 @@ use knives::forge::github::CliForge;
 use knives::ids::{ReleaseScheme, RepoName};
 use knives::release_model::{BranchSuccessions, carried_from_tips, trunk_positions};
 
-use super::release_edit::{EditRecord, record_edit_event, release_is_locally_movable};
+use super::release_edit::{
+    EditRecord, earlier_writes, record_edit_event, release_is_locally_movable, report_replaced,
+};
 
 /// Rebase the whole composition onto an upstream commit: `jj rebase -b <release> -d <target>`.
 ///
@@ -133,7 +135,7 @@ pub(crate) fn run_rebase(
         println!("{repo}: {release_name} has no member parents to move; nothing to rebase");
         return Ok(Exit::Incomplete);
     }
-    shed_stale_bases(path, (&release_name, &release_commit), &members, shed)?;
+    shed_stale_bases(fork, (&release_name, &release_commit), &members, shed)?;
     let tagged = knives::jj::tagged_commits_a_rebase_copies(path, &release_name, &onto)?;
     knives::jj::rebase_branch_onto(path, &release_name, &onto)?;
     report_rebased_release(
@@ -208,7 +210,7 @@ fn stale_rule_exit(fork: &Fork<'_>) -> anyhow::Result<Option<Exit>> {
 
 /// Rewrite the release to its member parents only, shedding stale bases.
 fn shed_stale_bases(
-    path: &std::path::Path,
+    fork: &Fork<'_>,
     (release_name, release_commit): (&str, &knives::ids::CommitId),
     members: &[knives::ids::CommitId],
     shed: usize,
@@ -216,16 +218,19 @@ fn shed_stale_bases(
     if shed == 0 {
         return Ok(());
     }
-    knives::jj::write_release(
-        path,
+    let written = knives::jj::write_release(
+        &fork.checkout.path,
         &knives::jj::ReleaseWrite {
             source: Some(release_commit),
             parents: members,
             message: None,
             bookmark: Some(release_name),
+            publish_remote: Some(fork.entry.publish_remote()),
+            earlier: &earlier_writes(fork, release_name)?,
             operation: &format!("knives: {release_name}: shed {shed} stale base parent(s)"),
         },
     )?;
+    report_replaced(&fork.name, release_name, &written);
     Ok(())
 }
 
@@ -622,16 +627,19 @@ fn drop_landed_members(
     let provenance = release::parent_sources(&opened, entry, &entry.release_scheme(), &kept)?;
     let delta = deltas.join("; ");
     let message = release::composition_message(release_name, &provenance, &delta);
-    let created = knives::jj::write_release(
+    let written = knives::jj::write_release(
         path,
         &knives::jj::ReleaseWrite {
             source: Some(&release),
             parents: &kept,
             message: Some(&message),
             bookmark: Some(release_name),
+            publish_remote: Some(entry.publish_remote()),
+            earlier: &earlier_writes(fork, release_name)?,
             operation: &format!("knives: {release_name}: {delta}"),
         },
     )?;
+    let created = written.commit.clone();
     record_edit_event(
         fork,
         &opened,
@@ -639,6 +647,7 @@ fn drop_landed_members(
             release: release_name,
             delta: &delta,
             created: &created,
+            change: &written.change,
             provenance: &provenance,
         },
         bound,
@@ -647,6 +656,7 @@ fn drop_landed_members(
         "{repo}: {release_name} now has {} parent(s): {delta}",
         kept.len()
     );
+    report_replaced(repo, release_name, &written);
     match knives::jj::conflicted_files(path, created.as_str()) {
         Ok(files) => println!("{}", release::conflict_guidance(&files)),
         Err(error) => println!("  could not list conflicts: {error}"),
@@ -689,6 +699,8 @@ fn report_rebased_release(
     // last (branch, commit) pairing for the release would name commits no
     // longer among its parents, and the next edit could not tell a rebuilt
     // branch from a stranger.
+    // `describe` keeps the change id the rebased release already had.
+    let change = reopened.change_id_of(created.as_str())?;
     record_edit_event(
         fork,
         &reopened,
@@ -696,6 +708,7 @@ fn report_rebased_release(
             release: rebased.name,
             delta: &delta,
             created: &described,
+            change: &change,
             provenance: &provenance,
         },
         bound,
