@@ -924,9 +924,12 @@ fn finishing_a_workspace_replaced_by_a_dangling_symlink_says_its_registration_st
             "lock={lock}: {stdout}\n{}",
             git_worktrees(&lab.work)
         );
+        // Newer git lists the registration under the link's target.
+        let after = git_worktrees(&lab.work);
         assert!(
-            git_worktrees(&lab.work).contains(&registered),
-            "lock={lock}: the registration was removed"
+            after.contains(&registered)
+                || after.contains(&format!("worktree {}", nowhere.display())),
+            "lock={lock}: the registration was removed:\n{after}"
         );
         assert!(
             std::fs::symlink_metadata(&workspace).is_ok(),

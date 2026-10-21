@@ -1375,13 +1375,21 @@ fn remove_stale_worktree(
 ) -> Result<StaleRegistration, JjError> {
     let checkout = path(checkout);
     let listing = command("git", ["-C", &checkout, "worktree", "list", "--porcelain"])?;
-    let wanted = comparable_path(destination);
+    // Newer git lists a worktree whose path is now a symbolic link under the
+    // link's target, so the target names the registration at `destination` too.
+    let mut wanted = vec![comparable_path(destination)];
+    if let Ok(target) = std::fs::read_link(destination) {
+        let target = destination
+            .parent()
+            .map_or_else(|| target.clone(), |parent| parent.join(&target));
+        wanted.push(comparable_path(&lexically_normal(&target)));
+    }
     let Some(entry) = listing.split("\n\n").find(|entry| {
         entry
             .lines()
             .next()
             .and_then(|line| line.strip_prefix("worktree "))
-            .is_some_and(|registered| comparable_path(Path::new(registered)) == wanted)
+            .is_some_and(|registered| wanted.contains(&comparable_path(Path::new(registered))))
     }) else {
         return Ok(StaleRegistration::None);
     };
@@ -1394,8 +1402,7 @@ fn remove_stale_worktree(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound
     );
     // A registration whose path holds something other than a directory has no
-    // working tree there, whether or not this git calls it prunable (older ones
-    // look at the path itself, which a dangling link occupies).
+    // working tree there, whatever git says of it.
     if !vanished && !destination.is_dir() {
         return Ok(StaleRegistration::Occupied);
     }
