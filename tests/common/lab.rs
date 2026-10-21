@@ -16,22 +16,30 @@ use std::process::Command;
 
 use tempfile::TempDir;
 
-/// Point every jj in this test process at a config home under cargo's target
-/// directory, before `main` runs.
+/// Give every jj in this test process a hermetic configuration, before `main`
+/// runs: a config home under cargo's target directory, and no user config file.
 ///
 /// jj resolves a repository's config to `$XDG_CONFIG_HOME/jj/repos/<config-id>/`
 /// and creates that directory on first contact; left unset, every lab repository
-/// leaves one in the developer's real `~/.config`. Per-spawn `.env()` is not
-/// enough: tests also call knives in-process, and the jj it spawns inherits the
-/// test process's own environment. One variable for the whole process keeps the
-/// lab's jj, the knives binary, and in-process knives agreeing on where a
-/// repository's config (identity, `immutable_heads()`) lives.
+/// leaves one in the developer's real `~/.config`. `JJ_CONFIG` names the user
+/// config files and replaces the rest; inherited from an agent session, its
+/// overlays (an `immutable_heads()` that walls the session's own commits, say)
+/// change what the lab's jj may rewrite, so it is pointed at `/dev/null`.
+/// Per-spawn `.env()` is not enough: tests also call knives in-process, and the
+/// jj it spawns inherits the test process's own environment. One setting for
+/// the whole process keeps the lab's jj, the knives binary, and in-process
+/// knives agreeing on where a repository's config (identity,
+/// `immutable_heads()`) lives; a test that wants a user config still sets
+/// `JJ_CONFIG` on its own command.
 #[ctor::ctor(unsafe)]
-fn isolate_jj_config_home() {
+fn isolate_jj_config() {
     let xdg = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("xdg");
     // SAFETY: a constructor runs before `main`, hence before libtest spawns its
     // first thread; nothing can read the environment concurrently.
-    unsafe { std::env::set_var("XDG_CONFIG_HOME", xdg) }
+    unsafe {
+        std::env::set_var("XDG_CONFIG_HOME", xdg);
+        std::env::set_var("JJ_CONFIG", "/dev/null");
+    }
 }
 
 pub struct Lab {

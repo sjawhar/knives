@@ -21,13 +21,17 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Same process-wide jj config isolation as `tests/common/lab.rs`, for the
-/// same reason: jj mints per-repository config directories on first contact.
+/// same reasons: jj mints per-repository config directories on first contact,
+/// and an inherited `JJ_CONFIG` would reach the jj knives spawns in-process.
 #[ctor::ctor(unsafe)]
-fn isolate_jj_config_home() {
+fn isolate_jj_config() {
     let xdg = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("xdg");
     // SAFETY: a constructor runs before `main`, hence before libtest spawns its
     // first thread; nothing can read the environment concurrently.
-    unsafe { std::env::set_var("XDG_CONFIG_HOME", xdg) }
+    unsafe {
+        std::env::set_var("XDG_CONFIG_HOME", xdg);
+        std::env::set_var("JJ_CONFIG", "/dev/null");
+    }
 }
 
 /// Runs the installed `jj` — the binary whose on-disk format knives must agree
