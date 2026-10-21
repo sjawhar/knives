@@ -7,7 +7,7 @@
 
 #[path = "common/lab.rs"]
 mod lab;
-// allow: SIZE_OK: 1699 lines - real-binary gh passthrough scenarios share one fixture and process harness.
+// allow: SIZE_OK: 1769 lines - real-binary gh passthrough scenarios share one fixture and process harness.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
@@ -563,7 +563,7 @@ fn acme_widgets_positional_calls() -> Vec<Vec<String>> {
     let host_spec = format!("{host}/acme/widgets");
     let bare_scp = format!("{host}:acme/widgets");
     let user_scp = format!("alice@{host}:acme/widgets");
-    let calls: [&[&str]; 21] = [
+    let calls: [&[&str]; 23] = [
         &["repo", "view", "acme/widgets", "--json", "name"],
         &["repo", "view", "--json", "name", "acme/widgets"],
         &["repo", "view", "-b", "main", &url],
@@ -587,6 +587,15 @@ fn acme_widgets_positional_calls() -> Vec<Vec<String>> {
         &["repo", "clone", "--", "acme/widgets", "dir"],
         &["repo", "fork", "--fork-name", "gadgets", "acme/widgets"],
         &["repo", "edit", "-h", "https://x.example", "acme/widgets"],
+        // gh rejects -R here, so these are -d's value, not a target.
+        &["repo", "edit", "acme/widgets", "-d", "--repo=rival/y"],
+        &[
+            "repo",
+            "edit",
+            "--description",
+            "-R=rival/y",
+            "acme/widgets",
+        ],
         &["repo", "delete", "--yes", "acme/widgets"],
         &["repo", "archive", "-y", "acme/widgets"],
         &["repo", "unarchive", "-y", "acme/widgets"],
@@ -677,6 +686,67 @@ fn a_repository_positional_beats_gh_repo_and_the_checkout_remote() {
             recorded.contains("GH_TOKEN=tok-acme"),
             "{arguments:?}: {recorded}"
         );
+    }
+}
+
+#[test]
+fn gh_repo_fork_with_an_org_routes_by_that_org() {
+    // Given: a scratch directory with no remote, a checkout whose origin is another
+    // owner's, and a helper that mints per owner.
+    let scratch = tempfile::tempdir().expect("scratch");
+    let lab = lab::Lab::new();
+    let host = concat!("github", ".com");
+    git_config(
+        &lab.work,
+        &["remote.origin.url", &format!("https://{host}/other/thing")],
+    );
+    let helper_dir = fake_app_token();
+    let gitconfig = token_config(helper_dir.path(), "fallback");
+    let calls: [&[&str]; 4] = [
+        &["repo", "fork", "acme/widgets", "--org", "partner"],
+        &["repo", "fork", "--org=partner", "acme/widgets", "--clone"],
+        &[
+            "repo",
+            "fork",
+            "--org",
+            "first",
+            "--org",
+            "partner",
+            "acme/widgets",
+        ],
+        &["repo", "fork", "--org", "partner"],
+    ];
+    for (cwd, gh_repo) in [
+        (scratch.path(), None),
+        (lab.work.as_path(), Some("elsewhere/x")),
+    ] {
+        for arguments in calls {
+            let (dir, log) = fake_gh();
+
+            // When: the fork is created in the partner organization.
+            let mut command = knives_cmd(helper_dir.path());
+            command
+                .args(["gh", "--"])
+                .args(arguments)
+                .current_dir(cwd)
+                .env_remove("GH_REPO")
+                .env("KNIVES_REAL_GH", dir.path().join("gh"))
+                .env("FAKE_GH_LOG", &log)
+                .env("PATH", helper_path(helper_dir.path()))
+                .env("GIT_CONFIG_GLOBAL", &gitconfig);
+            if let Some(spec) = gh_repo {
+                command.env("GH_REPO", spec);
+            }
+            let output = command.output().expect("run knives gh");
+
+            // Then: the token is the organization's, which owns what gh creates.
+            assert!(output.status.success(), "{arguments:?}: {output:?}");
+            let recorded = fs::read_to_string(&log).expect("fake gh ran");
+            assert!(
+                recorded.contains("GH_TOKEN=tok-partner"),
+                "{arguments:?} in {cwd:?}: {recorded}"
+            );
+        }
     }
 }
 

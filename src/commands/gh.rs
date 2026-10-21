@@ -2,7 +2,7 @@
 //!
 //! This command executes `gh` directly, so the usual render/run split does not apply:
 //! there is no knives result to render.
-// allow: SIZE_OK: 2292 lines - single passthrough pipeline; splitting would separate resolution steps that read as one procedure.
+// allow: SIZE_OK: 2329 lines - single passthrough pipeline; splitting would separate resolution steps that read as one procedure.
 use std::collections::BTreeMap;
 use std::io::Read as _;
 use std::os::unix::{
@@ -862,13 +862,19 @@ fn repo_value_flags(subcommand: &str) -> Option<&'static [&'static str]> {
     })
 }
 
-/// The repository a `gh repo view|clone|fork|…` call names as its first
-/// positional, which is the repository gh acts on whatever the checkout or
-/// `GH_REPO` says. gh reads the first word after `--` as that positional too
-/// (`gh repo view -- acme/widgets`). A bare name is a repository of the
-/// caller's own account, whose owner knives cannot know, so only a spec with an
-/// owner counts.
-fn repo_positional(args: &[String]) -> Option<String> {
+/// A `gh repo view|clone|fork|…` call: one of the subcommands whose first
+/// positional is the repository it acts on. gh rejects `-R` on all of them, so
+/// a `-R` or `--repo=` word there is some flag's value and never the target.
+struct RepoSubcommand<'a> {
+    /// The subcommand's index in the arguments.
+    at: usize,
+    name: &'a str,
+    value_flags: &'static [&'static str],
+}
+
+/// The `gh repo` subcommand this call is, when it is one that takes a
+/// repository positional.
+fn repo_subcommand(args: &[String]) -> Option<RepoSubcommand<'_>> {
     let mut words = before_terminator(args)
         .iter()
         .enumerate()
@@ -876,23 +882,51 @@ fn repo_positional(args: &[String]) -> Option<String> {
     if words.next().map(|(_, word)| word.as_str()) != Some("repo") {
         return None;
     }
-    let (at, subcommand) = words.next()?;
-    let value_flags = repo_value_flags(subcommand)?;
-    let mut rest = args.get(at + 1..)?.iter();
+    let (at, name) = words.next()?;
+    Some(RepoSubcommand {
+        at,
+        name,
+        value_flags: repo_value_flags(name)?,
+    })
+}
+
+/// The target a [`RepoSubcommand`] call names, if any: its first positional,
+/// the repository gh acts on whatever the checkout or `GH_REPO` says. gh reads
+/// the first word after `--` as that positional too (`gh repo view --
+/// acme/widgets`). A bare name is a repository of the caller's own account,
+/// whose owner knives cannot know, so only a spec with an owner counts.
+/// `gh repo fork --org ORG` creates the fork in ORG, so ORG is its target, by
+/// owner alone as a `gh api` path owner is.
+fn repo_subcommand_target(args: &[String], subcommand: &RepoSubcommand<'_>) -> Option<String> {
+    let mut positional = None;
+    let mut org = None;
+    let mut rest = args.iter().skip(subcommand.at + 1);
     while let Some(argument) = rest.next() {
-        let positional = if argument == "--" {
-            rest.next()?
-        } else if leaves_value_to_next(value_flags, argument) {
+        if argument == "--" {
+            positional = positional.or_else(|| rest.next());
+            break;
+        }
+        if subcommand.name == "fork" {
+            // pflag keeps the last value of a repeated string flag.
+            if argument == "--org" {
+                org = rest.next().map(String::as_str);
+                continue;
+            }
+            if let Some(value) = argument.strip_prefix("--org=") {
+                org = Some(value);
+                continue;
+            }
+        }
+        if leaves_value_to_next(subcommand.value_flags, argument) {
             rest.next();
-            continue;
-        } else if argument.starts_with('-') {
-            continue;
-        } else {
-            argument
-        };
-        return positional.contains('/').then(|| positional.clone());
+        } else if !argument.starts_with('-') {
+            positional = positional.or(Some(argument));
+        }
     }
-    None
+    if let Some(org) = org.filter(|org| is_owner_shaped(org)) {
+        return Some(format!("{org}/gh-api"));
+    }
+    positional.filter(|spec| spec.contains('/')).cloned()
 }
 
 /// Whether `argument` takes the next argument as its value: one of
@@ -967,8 +1001,11 @@ pub(crate) fn resolve_target_url(
     cwd: &Path,
 ) -> Result<Option<String>, crate::bind::BindError> {
     let api_owner = owner_from_api_args(args);
-    let repo_spec = repo_flag(args)
-        .or_else(|| repo_positional(args))
+    let repo_spec = repo_subcommand(args)
+        .map_or_else(
+            || repo_flag(args),
+            |subcommand| repo_subcommand_target(args, &subcommand),
+        )
         .or_else(gh_repo_environment);
     let needs_git_inputs = api_owner.is_none() && repo_spec.is_none();
     let resolved_remote = needs_git_inputs.then(|| gh_resolved_remote(cwd)).flatten();
