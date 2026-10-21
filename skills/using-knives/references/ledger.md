@@ -152,7 +152,7 @@ git --git-dir ~/.config/knives/ledger-repositories/<dir> config knives.machine <
 ```
 
 - A machine that joins only through `ledger-repositories` needs no `ledger/` yet. The first pull or sweep makes it.
-- Join through `ledger-repositories/`. The dotfiles installer makes one for each repository that a `ledger` names.
+- Join through `ledger-repositories/`: make one git directory there, as above, for each repository that a `ledger` names.
 - A plain `git clone` of a ledger repository into `ledger/` is not a ledger. Its `main` is an old snapshot in the registry-key layout, and knives reads only `refs/knives/*`. The sweep and every ledger read refuse such a clone, naming a registry-key directory, until `knives ledger migrate` runs ([upgrading](#upgrading-from-an-older-knives)).
 
 Routing:

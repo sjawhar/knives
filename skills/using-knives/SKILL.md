@@ -22,7 +22,7 @@ Run `knives ledger migrate` once on each machine. Until the migration moves the 
 - **Keep dependencies.** `depends <branch> --on <repo>#<number>` says the branch cannot merge before that PR. Never keep a dependent and drop its requirement: the release cannot work. A status report does not authorize discarding either.
 - **One branch is both release member and PR head.** It is linear past the shared release base. Never make a second "release-lineage" or sibling copy so that it composes. Moving the release base is an intentional release operation.
 - **Change releases explicitly.** Make release names only with `release cut`, never by hand. `--allow-drop` states an intended drop. It is not a way past a refusal. Before any release change, read the pin gates and cut evidence in [releases](references/releases.md).
-- **Before a raw branch rebase**, do the two-way ancestry check from fork-work. Is the branch a parent of a release/keep merge, or does it descend from one? Bare `release members` sees only the release in hand. Keep published merge ids, because a broad `jj rebase -b` can rewrite them. Read the [rebase rules](references/releases.md) first.
+- **Before a raw branch rebase**, run fork-work's bidirectional gate (§7). Is the branch a parent of a release/keep merge, or does it descend from one? Bare `release members` sees only the release in hand. Keep published merge ids, because a broad `jj rebase -b` can rewrite them. Read the [rebase rules](references/releases.md) first.
 
 ## Commands
 

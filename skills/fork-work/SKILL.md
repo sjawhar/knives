@@ -56,7 +56,7 @@ Do this before you read code too: a conclusion from the wrong copy is wrong, and
 - Its `placement:` notch **and** its commit body state why it does not live in the consumer. That is the ownership test's answer, or the owner's ruling that put it in the fork. They state the recorded decision it implements (the ruling's id or link), or that it implements none and is a defect fix with red→green evidence.
 - Build the ruling's exact words. "Idle" ruled and "from creation" built is the whole behavior, not a nuance.
 - With neither statement, the release owner calls it `neither` and does not compose it (`maintaining-fork-release` step 5).
-- The consumer's pin PR lists each production behavior change it carries, in plain numbers, under `## Production behavior delta`. This is disclosure, not a gate.
+- The consumer's pin PR lists each production behavior change it carries, in plain numbers, and which deployments carry it, under `## Production behavior delta`. This is disclosure, not a gate.
 
 ## 4. Ship the fork member, and open the upstream PR alongside
 

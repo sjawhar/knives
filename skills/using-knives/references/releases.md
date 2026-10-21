@@ -19,7 +19,7 @@ Read before you plan, edit, cut, rebase or reap a release, or read membership or
 
 ### Raw rebase and retained releases
 
-`advance` and `rebase` change only the release in hand. A raw `jj rebase -b`, `-s` or `-r` can reach older release/keep merges. Those still pin member commits for consumers or for conflict evidence. Before a rebase by hand, do the two-way check from **fork-work**:
+`advance` and `rebase` change only the release in hand. A raw `jj rebase -b`, `-s` or `-r` can reach older release/keep merges. Those still pin member commits for consumers or for conflict evidence. Before a rebase by hand, run the bidirectional gate from **fork-work** (§7):
 
 1. Is the branch a parent of any release/keep merge?
 2. Does it descend from any release/keep merge?
@@ -28,7 +28,7 @@ Bare `release members` answers neither for older releases. It sees only the curr
 
 - A member must carry no merge past known trunk positions: `<trunk>@upstream`, `<trunk>@origin` and local trunk. A branch built on a release merge carries all parents of that merge.
 - `include`, `advance` and the first `cut` refuse such `stacked-history`. Planning reports existing stacked members. A merge that a trunk position reaches belongs to trunk. If every local view lags the branch base, the detail says that these can be upstream merges. `sync` fetches them.
-- After that merge was pushed anywhere, `jj rebase -b <branch> -d <trunk>` is not the remedy, because it rewrites the merge. Rebase only the branch's own commits, from the ref that the ancestry check found:
+- After that merge was pushed anywhere, `jj rebase -b <branch> -d <trunk>` is not the remedy, because it rewrites the merge. Rebase only the branch's own commits, from the ref that the gate found:
 
 ```text
 jj rebase -s '<release-or-keep-ref>..<branch>' -d <trunk>@upstream

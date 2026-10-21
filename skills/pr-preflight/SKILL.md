@@ -25,8 +25,8 @@ The member carries the change for the consumer from release publication until up
 
 1. Make one signed commit on the release's shared base. Push it to the fork remote.
 2. Record it with `knives notch`.
-3. Give the tip and the red→green evidence to the release claim holder, who adds it to the release in hand and publishes. If every consumer pin of that release is frozen on a revision, they first cut the next dated release name.
-4. If nobody holds the release claim, do step 3 yourself.
+3. Give the tip and the red→green evidence to the release claim holder, who adds it to the release in hand and publishes. If every consumer pin of that release is frozen on a revision, they first cut the next dated release name, right then.
+4. If nobody holds the release claim, do the handoff in item 3 yourself.
 5. The consumer pins the published name and deploys.
 
 The owning session does the open PR's review rounds, body edits, rebases and close. Never park them on a human.
@@ -50,7 +50,7 @@ Do the checks in order. Each needs evidence.
 | # | Check | Evidence | If it fails |
 |---|---|---|---|
 | 1 | Branch state | `knives preflight` shows the branch is not stale, landed or divergent | Landed: no PR. Close or delete the local branch. Stale: rebase onto the latest upstream default branch and re-test. Divergent: reconcile local and remote history to one canonical tip. |
-| 2 | PR cap and claim | Our open PR count is strictly below the cap. Your workspace holds the claim. | Cap reached: no new PR. Fold the fix into an open PR only if it belongs there. Otherwise open it when the cap frees. The member rides the release meanwhile, never as a standing fork member. Unclaimed or claimed elsewhere: claim it before you commit or open the PR. |
+| 2 | PR cap and claim | Our open PR count is strictly below the cap. Your workspace holds the claim. | Cap reached: no new PR. Fold the fix into an open PR only if it belongs there. That call is the owning session's own judgment and work. Otherwise open it when the cap frees. The member rides the release meanwhile, never as a standing fork member. Unclaimed or claimed elsewhere: claim it before you commit or open the PR. |
 | 3 | Policy files | You read every convention file in full (`AGENTS.md`, `CONTRIBUTING.md`, `.github/PULL_REQUEST_TEMPLATE.md` or equivalent) | Read them. Do not assume default standards. |
 | 4 | Issue reference | If policy requires an issue, the draft body links it ("Fixes #123") | Find the upstream issue. If none exists and policy requires one, search open issues, else open one first. Include the required issue link in the PR body. |
 | 5 | AI disclosure | If policy requires it, the PR body or commit discloses AI assistance | Add the notice (for example "Authored with AI assistance"). |

@@ -16,7 +16,7 @@ description: Use when you own one existing fork pull request through to merge or
   - A maintainer resolved each resolved thread. Reopen one only if the head broke what it settled.
   - Each comment goes to a maintainer's inbox. It is noise unless it moves the PR.
   - A stale but harmless body sentence is not worth a publish.
-- Answer a maintainer's design question yourself. Read the thread, diff and chain and form a position. Implement it, or state it on the thread with your reasons. Never send it up as a "Sami decision" without your position.
+- Answer a maintainer's design question yourself. Read the thread, diff and chain and form a position. Implement it, or state it on the thread with your reasons. Never send it up as a human decision without your position.
 - A `decision:` notch must show all three:
   1. You read the whole chain for the branch and the release, and no note answers it. Quote the closest note and say why not.
   2. Your recommendation and its evidence.

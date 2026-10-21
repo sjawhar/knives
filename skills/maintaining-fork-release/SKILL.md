@@ -185,7 +185,7 @@ Do this step when the request includes releases, upstream debt or consumption. P
    - Do the consumer pin, build and deployment that the goal requires. Never deploy when excluded, and never bypass credentials or approvals.
    - Verify the final resolved revision, and the running revision where required, and exercise the behavior there. Verify again after a relevant change.
    - Record `record:` and `verify:` on the release with candidate, published and consumed commits, and gate and runtime evidence.
-   - **The pin PR body discloses the delta** under `## Production behavior delta`. For each member that the release adds or moves, state what production does differently, in plain numbers. Mark upstream-pending members. Write `none` when nothing changes.
+   - **The pin PR body discloses the delta** under `## Production behavior delta`. For each member that the release adds or moves, state what production does differently, in plain numbers, and which deployments carry it. Mark upstream-pending members. Write `none` when nothing changes.
    - Write the delta from the member classification and notches, not from the release title. It is disclosure, not a gate.
 
 When a real external prerequisite blocks publication or consumption, finish other work, record the exact blocker and report the stage **blocked**. Do not report it ready with a follow-up.
@@ -205,7 +205,7 @@ Decide ordinary membership, naming, rehome and compatible-repair questions from 
 - Never report a skipped gate, an unstarted workflow or a unit suite as end-to-end verification.
 - Each cell cites a notch or saved observation:
 
-  `<repo>#<n>: CI <head-specific run conclusions/pending> / review comments <unresolved, dispositions> / thermonuclear <fresh-context verdict> / e2e <actual surface evidence or not run> / forbidden <remaining hits>`
+  `<repo>#<n>: CI <head-specific run conclusions/pending> / review comments <unresolved, dispositions> / review <fresh-context verdict> / e2e <actual surface evidence or not run> / forbidden <remaining hits>`
 
   `<repo>/<release>: composition <verified|blocked> / published <revision|not published> / consumers <resolved revisions|blocked> / runtime <evidence|not run>`
 

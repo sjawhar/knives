@@ -81,7 +81,7 @@ Every entry refuses unknown fields. Thus an older knives refuses a file that set
 - The scan selects a `.git` directory beside a real `.jj` directory. It skips dot-directories, follows no symlinks, and stops below a `.jj`. A plain Git repository is not managed and does not hide forks under it.
 - The scan does not select workspaces (a `.git` file). They bind when you stand inside. It skips non-colocated `.jj` silently, and a fork verb inside one refuses.
 - A checkout deeper than three or outside HOME binds when you stand inside it, for every command except `repos`. With HOME unset, the exit is `2` with `HOME is not set; knives scans $HOME for checkouts`. knives never scans `/`.
-- knives needs colocated jj, at the jj build that the fleet's tool config names, which matches the embedded jj-lib. Workspace `.git` files come from jj colocated worktree support (after 0.45.0, jj-vcs/jj#9941). `jj workspace add` makes one from a colocated workspace with `git.colocate` true, or with `--colocate`. This does not authorize a change to shared tool versions.
+- knives needs colocated jj, at the jj version that matches its embedded jj-lib. Workspace `.git` files come from jj colocated worktree support (after 0.45.0, jj-vcs/jj#9941). `jj workspace add` makes one from a colocated workspace with `git.colocate` true, or with `--colocate`. This does not authorize a change to shared tool versions.
 
 ### Missing, ambiguous and unreadable results
 
