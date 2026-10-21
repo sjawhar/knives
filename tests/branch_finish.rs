@@ -823,16 +823,16 @@ fn git_worktree(
 
 /// Finishes `branch` after its workspace directory was removed by hand, then
 /// asserts git no longer registers anything at that path and `start` succeeds
-/// there again. `lock` first locks the registration, as a tool guarding live
-/// workspaces from prunes does; git never calls a locked one prunable.
+/// there again. `lock` locks the registration first, as a tool guarding live
+/// workspaces from prunes does, and git never calls a locked one prunable;
+/// without it the registration is unlocked, whatever a wrapper on PATH did on
+/// add, so each case holds with or without such a wrapper.
 fn assert_finish_clears_a_vanished_registration(branch: &str, lock: bool) {
     let lab = lab::Lab::new();
     let (home, _consumer) = release_test_home(&lab);
     let workspace = start_claim_for_finish(&lab, &home, "ses_fff688", branch);
+    let _ = git_worktree(&lab.work, "unlock", &[], &workspace);
     if lock {
-        // A wrapper on PATH may have locked it on add already; replace that
-        // lock with one of this test's, so the case holds without the wrapper.
-        let _ = git_worktree(&lab.work, "unlock", &[], &workspace);
         let locked = git_worktree(&lab.work, "lock", &["--reason", "test lock"], &workspace);
         assert!(
             locked.status.success(),
@@ -844,8 +844,13 @@ fn assert_finish_clears_a_vanished_registration(branch: &str, lock: bool) {
         "worktree {}",
         workspace.canonicalize().expect("workspace path").display()
     );
-    assert!(git_worktrees(&lab.work).contains(&registered));
     std::fs::remove_dir_all(&workspace).expect("remove the workspace directory by hand");
+    let before = git_worktrees(&lab.work);
+    let stale = if lock { "locked test lock" } else { "prunable" };
+    assert!(
+        before.contains(&registered) && before.contains(stale),
+        "fixture is not a {stale} registration:\n{before}"
+    );
 
     let finished = knives_finish(&lab, &home, &[branch]);
 

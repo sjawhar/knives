@@ -201,7 +201,7 @@ fn stale_worktree_note(checkout: &Path, directory: &Path) -> String {
     match remove_finished_worktree(checkout, directory) {
         Ok(true) => "; stale Git worktree registration removed".to_owned(),
         Ok(false) => String::new(),
-        Err(error) => format!("; Git worktree registration not checked ({error})"),
+        Err(error) => format!("; Git worktree registration not cleared ({error})"),
     }
 }
 

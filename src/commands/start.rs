@@ -16,7 +16,7 @@ use crate::config::Role;
 use crate::detect::BookmarkTips;
 use crate::ids::{BookmarkRef, BranchName, BranchTarget, CommitId, RemoteName, WorkspaceName};
 use crate::jj::{
-    Repo, WorkspaceIdentity, add_workspace, fetch_all, is_workspace_named,
+    Repo, StaleRegistration, WorkspaceIdentity, add_workspace, fetch_all, is_workspace_named,
     remove_prunable_worktree, repo_immutable_heads, set_repo_immutable_heads, user_immutable_heads,
     workspace_identity,
 };
@@ -572,12 +572,21 @@ fn create_workspace(context: &StartContext<'_>) -> anyhow::Result<WorkspaceBase>
         }
     };
     // A registration whose directory is gone would make `add` fail on git's
-    // "already registered" and leave an empty directory at the path.
-    if remove_prunable_worktree(checkout, &context.destination)? {
-        println!(
+    // "already registered" and leave an empty directory at the path. A locked
+    // one stays: from here it cannot be told apart from another machine's live
+    // workspace in a shared store, so the branch's own `finish` clears it.
+    match remove_prunable_worktree(checkout, &context.destination)? {
+        StaleRegistration::None => {}
+        StaleRegistration::Removed => println!(
             "removed a stale Git worktree registration at {} (its directory was gone)",
             context.destination.display()
-        );
+        ),
+        StaleRegistration::Locked => anyhow::bail!(
+            "a locked Git worktree registration at {} has no directory there; if it is this \
+             branch's, `knives finish {}` clears it",
+            context.destination.display(),
+            context.branch
+        ),
     }
     add_workspace(
         checkout,

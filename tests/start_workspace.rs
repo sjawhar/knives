@@ -606,6 +606,49 @@ fn start_clears_a_prunable_git_registration_at_its_path() {
 }
 
 #[test]
+fn start_keeps_a_locked_git_registration_whose_directory_is_gone() {
+    // Given: a locked registration at the branch's workspace path with nothing
+    // there. From one machine another's live workspace in a shared store looks
+    // exactly like this, which is what the lock protects.
+    let lab = Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let workspace = lab.work.parent().expect("parent").join("feat-alpha");
+    knives::jj::add_workspace(&lab.work, "feat-alpha", &workspace, "main@upstream")
+        .expect("add the workspace");
+    let worktree = |args: &[&str]| {
+        Command::new("git")
+            .arg("worktree")
+            .args(args)
+            .arg(&workspace)
+            .current_dir(&lab.work)
+            .output()
+            .expect("git worktree")
+    };
+    let _ = worktree(&["unlock"]);
+    assert!(
+        worktree(&["lock", "--reason", "test lock"])
+            .status
+            .success()
+    );
+    std::fs::remove_dir_all(&workspace).expect("remove the directory first");
+    knives::jj::forget_workspace(&lab.work, "feat-alpha").expect("forget the workspace");
+
+    let output = knives_start(&lab, &home, "feat/alpha");
+
+    // Then: start refuses, names `finish`, and the registration stays locked
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("locked Git worktree registration")
+            && stderr.contains("knives finish feat/alpha"),
+        "{stderr}"
+    );
+    let after = git_worktrees(&lab.work);
+    assert!(after.contains("locked test lock"), "{after}");
+    assert!(!workspace.exists(), "start left something at the path");
+}
+
+#[test]
 fn a_failed_workspace_add_leaves_no_empty_directory() {
     // jj creates the destination before git registers it as a worktree; when
     // git refuses (a stale registration at the path), the empty directory used

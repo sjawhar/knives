@@ -1298,16 +1298,21 @@ fn is_empty_directory(directory: &Path) -> bool {
 }
 
 /// Removes the Git worktree registration at `destination` when git itself
-/// reports it `prunable` — its working tree is gone — and says whether it did.
+/// reports it `prunable` — its working tree is gone — and says what it found.
 ///
 /// A colocated `jj workspace add` registers the new directory as a Git worktree
 /// under `.git/worktrees/<name>` and `jj workspace forget` unregisters it. A
 /// directory removed before the forget (by hand, or by a jj that did not
 /// unlink) leaves the registration behind, and the next `add` at that path
 /// fails on it. Only a prunable registration is touched: `git worktree remove`
-/// on a live one would delete its directory, and a locked one is left alone,
-/// since git never calls a locked registration prunable.
-pub fn remove_prunable_worktree(checkout: &Path, destination: &Path) -> Result<bool, JjError> {
+/// on a live one would delete its directory. A locked registration is never
+/// prunable and stays; with nothing at its path it is reported
+/// [`StaleRegistration::Locked`], since the path may be another machine's live
+/// workspace in a shared store.
+pub fn remove_prunable_worktree(
+    checkout: &Path,
+    destination: &Path,
+) -> Result<StaleRegistration, JjError> {
     remove_stale_worktree(checkout, destination, StaleLock::Kept)
 }
 
@@ -1317,10 +1322,23 @@ pub fn remove_prunable_worktree(checkout: &Path, destination: &Path) -> Result<b
 /// A lock keeps another tool's prune off a live workspace; the workspace
 /// `finish` ends is not live, and git would otherwise keep its registration,
 /// so the next `start` at that path fails on "a missing but locked worktree".
-/// Only the registration at `destination` is touched, and only while nothing
-/// is at that path.
+/// The lock is overridden whatever its reason. Only the registration at
+/// `destination` is touched, and only while nothing is at that path. Says
+/// whether a registration was removed.
 pub fn remove_finished_worktree(checkout: &Path, destination: &Path) -> Result<bool, JjError> {
     remove_stale_worktree(checkout, destination, StaleLock::Cleared)
+        .map(|found| matches!(found, StaleRegistration::Removed))
+}
+
+/// What became of the Git worktree registration at a workspace path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StaleRegistration {
+    /// None was registered there, or the registered directory is present.
+    None,
+    /// The registration's directory was gone, and the registration is removed.
+    Removed,
+    /// The registration is locked and nothing is at its path; it was kept.
+    Locked,
 }
 
 /// What [`remove_stale_worktree`] does with a locked registration whose
@@ -1335,7 +1353,7 @@ fn remove_stale_worktree(
     checkout: &Path,
     destination: &Path,
     stale_lock: StaleLock,
-) -> Result<bool, JjError> {
+) -> Result<StaleRegistration, JjError> {
     let checkout = path(checkout);
     let listing = command("git", ["-C", &checkout, "worktree", "list", "--porcelain"])?;
     let wanted = comparable_path(destination);
@@ -1346,7 +1364,7 @@ fn remove_stale_worktree(
             .and_then(|line| line.strip_prefix("worktree "))
             .is_some_and(|registered| comparable_path(Path::new(registered)) == wanted)
     }) else {
-        return Ok(false);
+        return Ok(StaleRegistration::None);
     };
     let prunable = entry.lines().any(|line| line.starts_with("prunable"));
     let locked = entry
@@ -1357,13 +1375,18 @@ fn remove_stale_worktree(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound
     );
     let shown = path(destination);
-    if locked && vanished && matches!(stale_lock, StaleLock::Cleared) {
-        command("git", ["-C", &checkout, "worktree", "unlock", &shown])?;
+    if locked && vanished {
+        match stale_lock {
+            StaleLock::Kept => return Ok(StaleRegistration::Locked),
+            StaleLock::Cleared => {
+                command("git", ["-C", &checkout, "worktree", "unlock", &shown])?;
+            }
+        }
     } else if !prunable {
-        return Ok(false);
+        return Ok(StaleRegistration::None);
     }
     command("git", ["-C", &checkout, "worktree", "remove", &shown])?;
-    Ok(true)
+    Ok(StaleRegistration::Removed)
 }
 
 /// `directory` with its parent resolved through symbolic links, so a path
