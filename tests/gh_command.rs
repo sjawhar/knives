@@ -261,7 +261,8 @@ fn no_target_advice_names_r_only_for_commands_that_take_it() {
     let scratch = tempfile::tempdir().expect("scratch");
     let (dir, log) = fake_gh();
     let takes = "pass -R <owner>/<repo>";
-    let cases: [(&[&str], &str, bool); 10] = [
+    let account = "no repository routes this command";
+    let cases: [(&[&str], &str, bool); 15] = [
         (&["api", "user"], "gh api repos/<owner>/<repo>", false),
         (
             &["repo", "view"],
@@ -283,7 +284,12 @@ fn no_target_advice_names_r_only_for_commands_that_take_it() {
             "orgs/<org>/repos?per_page=100' --paginate",
             false,
         ),
-        (&["gist", "list"], "set GH_REPO=<owner>/<repo>", false),
+        (&["gist", "list"], account, false),
+        (&["ssh-key", "list"], account, false),
+        (&["discussion", "list"], takes, true),
+        (&["search", "issues", "x"], takes, true),
+        (&["codespace", "list"], takes, true),
+        (&["repo", "read-file", "x"], takes, true),
         (&["repo", "rename", "y"], takes, true),
         (&["repo", "autolink", "list"], takes, true),
         (&["repo", "deploy-key", "list"], takes, true),
@@ -311,6 +317,9 @@ fn no_target_advice_names_r_only_for_commands_that_take_it() {
             takes_r,
             "{arguments:?}: {stderr}"
         );
+        if advice == account {
+            assert!(!stderr.contains("GH_REPO"), "{arguments:?}: {stderr}");
+        }
     }
 }
 

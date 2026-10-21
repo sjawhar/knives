@@ -188,9 +188,10 @@ pub fn run(args: &[String]) -> anyhow::Result<std::convert::Infallible> {
 }
 
 /// What names a repository for this command when nothing routed it. Only the
-/// families below take `-R`; gh rejects it elsewhere as an unknown flag, so other
-/// commands get the spellings that do route: an owner in the api path, `GH_REPO`,
-/// or a plain git clone.
+/// commands in the first arm take `-R`; gh rejects it elsewhere as an unknown
+/// flag. Account-wide and local commands have no repository to route by, and an
+/// App token cannot run them, so they get no `GH_REPO` advice: following it would
+/// fail, or fall back to a personal token.
 fn no_target_remedy(args: &[String]) -> &'static str {
     let mut words = before_terminator(args)
         .iter()
@@ -200,12 +201,26 @@ fn no_target_remedy(args: &[String]) -> &'static str {
         (
             Some(
                 "pr" | "issue" | "release" | "run" | "workflow" | "label" | "cache" | "secret"
-                | "variable" | "ruleset" | "browse",
+                | "variable" | "ruleset" | "browse" | "codespace" | "discussion",
             ),
             _,
         )
-        | (Some("repo"), Some("autolink" | "deploy-key" | "rename")) => {
+        | (Some("repo"), Some("autolink" | "deploy-key" | "rename" | "read-file" | "read-dir"))
+        | (Some("search"), Some("issues" | "prs" | "code" | "commits"))
+        | (Some("attestation"), Some("download" | "verify"))
+        | (Some("project"), Some("link" | "unlink"))
+        | (Some("agent-task"), Some("create" | "view")) => {
             "pass -R <owner>/<repo>, or run from a checkout of it."
+        }
+        (
+            None
+            | Some(
+                "gist" | "ssh-key" | "gpg-key" | "org" | "status" | "alias" | "config"
+                | "completion",
+            ),
+            _,
+        ) => {
+            "no repository routes this command, an App token cannot run it, and there is no ambient login."
         }
         (Some("api"), _) => {
             "gh api takes no -R: put the owner in the path (gh api repos/<owner>/<repo>, gh api 'orgs/<org>/repos?per_page=100' --paginate), or set GH_REPO=<owner>/<repo>."
