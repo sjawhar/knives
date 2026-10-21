@@ -888,6 +888,34 @@ fn a_release_moved_by_hand_after_a_drop_is_still_drift() {
 }
 
 #[test]
+fn a_local_release_moved_back_to_the_cut_after_a_drop_is_drift() {
+    // Given: a cut, a drop, then the drop undone: the local name is back at
+    // the cut while the ledger's newest record is the edit.
+    let (lab, home, _consumer) = two_branch_cut();
+    let cut = commit_at(&lab, "release/2026-08-04");
+    drop_beta(&lab, &home);
+    let edited = commit_at(&lab, "release/2026-08-04");
+    lab.jj_work(["undo"]);
+    assert_eq!(commit_at(&lab, "release/2026-08-04"), cut);
+
+    // When: the fork is audited.
+    let report = audit_report(&lab, &home);
+
+    // Then: drift, held against the edit.
+    let drift = findings(&report, "release-drift");
+    assert_eq!(drift.len(), 1, "{report}");
+    assert_eq!(
+        drift[0]["detail"],
+        format!(
+            "local release/2026-08-04 is at {} but its newest recorded edit names {}",
+            cut.short(),
+            edited.short()
+        ),
+        "{report}"
+    );
+}
+
+#[test]
 fn a_re_signed_edit_is_a_note_and_a_changed_tree_is_drift() {
     // Given: a cut and a drop, then the release rewritten the way `jj sign`
     // rewrites it: a new commit id, the same change, parents and tree.

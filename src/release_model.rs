@@ -823,8 +823,8 @@ pub struct RecordedWrite {
 /// in its evidence.
 ///
 /// An edit writes a new commit under the same name, so a release that equals
-/// its last edit is knives' own work, not drift, and one at an earlier write
-/// is knives' own work not yet replaced there (an edit not pushed yet). The
+/// its last edit is knives' own work, not drift, and a publish remote at an
+/// earlier write is knives' own work an edit has not been pushed over. The
 /// composition gate does not read this: it holds a new cut against
 /// [`last_recorded_cut`], so a member an edit dropped is still restated at the
 /// next cut.
