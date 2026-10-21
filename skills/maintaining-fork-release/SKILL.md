@@ -166,10 +166,10 @@ Do this step when the request includes releases, upstream debt or consumption. P
      jj abandon @                                                    # drop the guard commit
      ```
 
-   - For each printed path, put the automerge content back (`jj restore --from <guard> --into <release> <path>`). Then resolve only the conflicted paths again, hunk by hunk.
+   - For each printed path, put the automerge content back (`jj restore --from "$guard" --into <release> <path>`). Then resolve only the conflicted paths again, hunk by hunk.
    - Never resolve a release conflict with `jj restore --from <one parent>` of a whole file.
    - The exception is a **semantic conflict**: the members merge cleanly, but the composition fails a gate. Repair it on the release commit, never on a member, because a member must stay valid alone.
-   - Record a semantic conflict in the release notch: path, the two members, the gate error and the hunk verbatim. `jj diff --from <guard> --to <release> -- <path>` must be byte-equal to that hunk. Any other printed path is a defect.
+   - Record a semantic conflict in the release notch: path, the two members, the gate error and the hunk verbatim. `jj diff --from "$guard" --to <release> -- <path>` must be byte-equal to that hunk. Any other printed path is a defect.
    - For a pure restructure, require tree identity with the verified reference. Otherwise, account for the exact intended delta.
    - Run **absolute consumer capability contracts**. Comparisons to the previous cut and all structural gates accept a stated drop as expected.
    - Find the contract tests: search the consumer's test trees for the pinned package's name and for the symbols the pin exposes.

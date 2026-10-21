@@ -29,7 +29,7 @@ jj -R <checkout> --ignore-working-copy log -r '<candidate>..<parent>' --no-graph
 - `<fork>` is the parent's own fork point, moved up to any commit of its series that a staying member sits on.
 - Never use a newer upstream head or the other parents of the old release as `<fork>`. Content from two leaving parents then looks carried by each and disappears from both diffs.
 - When `<fork>` names several heads, diff from their merge in git's object store. Never select one head by hand.
-- Build this fork-base merge in git's object store, never as a jj commit. Every agent's `jj log` shows a scratch jj merge, a crash leaves it, and `knives audit` does not report it. (The step 5.3 resolution-delta guard is the one jj merge the sweep makes, and it is abandoned at once.)
+- Build this fork-base merge in git's object store, never as a jj commit. Every agent's `jj log` shows a scratch jj merge, a crash leaves it, and `knives audit` does not report it. (The step 5.3 resolution-delta guard is the one jj merge this workflow makes, and it is abandoned at once.)
 
 ```sh
 g="git --git-dir=$(jj -R <checkout> git root)"
