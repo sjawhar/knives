@@ -256,24 +256,40 @@ fn no_target_repository_says_so_before_gh_runs() {
 }
 
 #[test]
-fn no_target_advice_skips_r_for_commands_that_reject_it() {
-    // Given: a directory with no remote, and commands whose gh rejects -R.
+fn no_target_advice_names_r_only_for_commands_that_take_it() {
+    // Given: a directory with no remote, and commands with and without -R.
     let scratch = tempfile::tempdir().expect("scratch");
     let (dir, log) = fake_gh();
-    let cases: [(&[&str], &str); 5] = [
-        (&["api", "user"], "gh api repos/<owner>/<repo>"),
-        (&["repo", "view"], "GH_REPO=<owner>/<repo> gh repo view"),
+    let takes = "pass -R <owner>/<repo>";
+    let cases: [(&[&str], &str, bool); 10] = [
+        (&["api", "user"], "gh api repos/<owner>/<repo>", false),
+        (
+            &["repo", "view"],
+            "GH_REPO=<owner>/<repo> gh repo view",
+            false,
+        ),
         (
             &["repo", "clone", "x"],
             "git clone https://<host>/<owner>/<repo>",
+            false,
+        ),
+        (
+            &["repo", "list"],
+            "GH_REPO=<owner>/<repo> gh repo list <owner>",
+            false,
         ),
         (
             &["repo", "list"],
             "orgs/<org>/repos?per_page=100' --paginate",
+            false,
         ),
-        (&["repo", "rename", "y"], "pass -R <owner>/<repo>"),
+        (&["gist", "list"], "set GH_REPO=<owner>/<repo>", false),
+        (&["repo", "rename", "y"], takes, true),
+        (&["repo", "autolink", "list"], takes, true),
+        (&["repo", "deploy-key", "list"], takes, true),
+        (&["workflow", "list"], takes, true),
     ];
-    for (arguments, advice) in cases {
+    for (arguments, advice, takes_r) in cases {
         // When: knives invokes gh on a call that names no repository.
         let output = knives_cmd(scratch.path())
             .arg("gh")
@@ -290,7 +306,6 @@ fn no_target_advice_skips_r_for_commands_that_reject_it() {
         // Then: the advice names a spelling that command accepts.
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(stderr.contains(advice), "{arguments:?}: {stderr}");
-        let takes_r = arguments.get(1) == Some(&"rename");
         assert_eq!(
             stderr.contains("pass -R"),
             takes_r,

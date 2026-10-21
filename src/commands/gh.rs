@@ -187,9 +187,9 @@ pub fn run(args: &[String]) -> anyhow::Result<std::convert::Infallible> {
     std::process::exit(exit_code);
 }
 
-/// What names a repository for this command when nothing routed it. `gh api` and
-/// most `gh repo` subcommands reject `-R` as an unknown flag, so for them the
-/// advice names the spellings that do route: an owner in the api path, `GH_REPO`,
+/// What names a repository for this command when nothing routed it. Only the
+/// families below take `-R`; gh rejects it elsewhere as an unknown flag, so other
+/// commands get the spellings that do route: an owner in the api path, `GH_REPO`,
 /// or a plain git clone.
 fn no_target_remedy(args: &[String]) -> &'static str {
     let mut words = before_terminator(args)
@@ -197,15 +197,25 @@ fn no_target_remedy(args: &[String]) -> &'static str {
         .filter(|argument| !argument.starts_with('-'))
         .map(String::as_str);
     match (words.next(), words.next()) {
+        (
+            Some(
+                "pr" | "issue" | "release" | "run" | "workflow" | "label" | "cache" | "secret"
+                | "variable" | "ruleset" | "browse",
+            ),
+            _,
+        )
+        | (Some("repo"), Some("autolink" | "deploy-key" | "rename")) => {
+            "pass -R <owner>/<repo>, or run from a checkout of it."
+        }
         (Some("api"), _) => {
             "gh api takes no -R: put the owner in the path (gh api repos/<owner>/<repo>, gh api 'orgs/<org>/repos?per_page=100' --paginate), or set GH_REPO=<owner>/<repo>."
         }
-        (Some("repo"), subcommand)
-            if !matches!(subcommand, Some("autolink" | "deploy-key" | "rename")) =>
-        {
-            "gh repo takes no -R here: set GH_REPO and name the repository (GH_REPO=<owner>/<repo> gh repo view <owner>/<repo>), or use gh api repos/<owner>/<repo>, gh api 'orgs/<org>/repos?per_page=100' --paginate, or git clone https://<host>/<owner>/<repo>."
+        (Some("repo"), _) => {
+            "gh repo takes no -R here: set GH_REPO and name the repository or owner (GH_REPO=<owner>/<repo> gh repo view <owner>/<repo>, GH_REPO=<owner>/<repo> gh repo list <owner>), or use gh api repos/<owner>/<repo>, gh api 'orgs/<org>/repos?per_page=100' --paginate, or git clone https://<host>/<owner>/<repo>."
         }
-        _ => "pass -R <owner>/<repo>, or run from a checkout of it.",
+        _ => {
+            "this command takes no -R: set GH_REPO=<owner>/<repo>, and name the repository where the command takes one."
+        }
     }
 }
 
