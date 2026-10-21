@@ -7,7 +7,7 @@
 
 #[path = "common/lab.rs"]
 mod lab;
-// allow: SIZE_OK: 1667 lines - real-binary gh passthrough scenarios share one fixture and process harness.
+// allow: SIZE_OK: 1695 lines - real-binary gh passthrough scenarios share one fixture and process harness.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
@@ -554,20 +554,22 @@ fn gh_search_owner_and_repo_flags_route_the_token_and_print_no_hint() {
     }
 }
 
-#[test]
-fn a_repository_positional_routes_gh_repo_outside_a_checkout() {
-    // Given: a scratch directory with no remote and a helper that mints per owner.
-    let scratch = tempfile::tempdir().expect("scratch");
-    let helper_dir = fake_app_token();
-    let gitconfig = token_config(helper_dir.path(), "fallback");
+/// `gh repo` calls whose repository positional is acme/widgets, in each spelling
+/// gh 2.98 reads as that repository.
+fn acme_widgets_positional_calls() -> Vec<Vec<String>> {
     let host = concat!("github", ".com");
     let url = format!("https://{host}/acme/widgets");
+    let scp = format!("git@{host}:acme/widgets.git");
     let host_spec = format!("{host}/acme/widgets");
-    let cases: [&[&str]; 10] = [
+    let calls: [&[&str]; 19] = [
         &["repo", "view", "acme/widgets", "--json", "name"],
         &["repo", "view", "--json", "name", "acme/widgets"],
         &["repo", "view", "-b", "main", &url],
+        &["repo", "view", "-wb", "main", "acme/widgets"],
+        &["repo", "view", "-bmain", "acme/widgets"],
+        &["repo", "view", "--", "acme/widgets"],
         &["repo", "clone", "acme/widgets"],
+        &["repo", "clone", &scp],
         &[
             "repo",
             "clone",
@@ -578,19 +580,36 @@ fn a_repository_positional_routes_gh_repo_outside_a_checkout() {
             "--",
             "--depth=1",
         ],
-        &["repo", "fork", "--org", "other", "acme/widgets"],
+        &["repo", "clone", "--", "acme/widgets", "dir"],
+        &["repo", "fork", "--fork-name", "gadgets", "acme/widgets"],
         &["repo", "edit", "-h", "https://x.example", "acme/widgets"],
+        &["repo", "delete", "--yes", "acme/widgets"],
         &["repo", "archive", "-y", "acme/widgets"],
+        &["repo", "unarchive", "-y", "acme/widgets"],
         &["repo", "sync", "-s", "other/source", "acme/widgets"],
         &["repo", "set-default", "acme/widgets"],
+        &["repo", "garden", "acme/widgets"],
+        &["repo", "credits", "-s", "acme/widgets"],
     ];
-    for arguments in cases {
+    calls
+        .iter()
+        .map(|call| call.iter().map(|word| (*word).to_owned()).collect())
+        .collect()
+}
+
+#[test]
+fn a_repository_positional_routes_gh_repo_outside_a_checkout() {
+    // Given: a scratch directory with no remote and a helper that mints per owner.
+    let scratch = tempfile::tempdir().expect("scratch");
+    let helper_dir = fake_app_token();
+    let gitconfig = token_config(helper_dir.path(), "fallback");
+    for arguments in acme_widgets_positional_calls() {
         let (dir, log) = fake_gh();
 
         // When: knives invokes a gh repo subcommand that names its repository.
         let output = knives_cmd(helper_dir.path())
             .args(["gh", "--"])
-            .args(arguments)
+            .args(&arguments)
             .current_dir(scratch.path())
             .env_remove("GH_REPO")
             .env("KNIVES_REAL_GH", dir.path().join("gh"))
@@ -631,24 +650,30 @@ fn a_repository_positional_beats_gh_repo_and_the_checkout_remote() {
     );
     let helper_dir = fake_app_token();
     let gitconfig = token_config(helper_dir.path(), "fallback");
-    let (dir, log) = fake_gh();
+    for arguments in acme_widgets_positional_calls() {
+        let (dir, log) = fake_gh();
 
-    // When: gh repo view names acme/widgets, the repository gh itself will read.
-    let output = knives_cmd(helper_dir.path())
-        .args(["gh", "--", "repo", "view", "acme/widgets"])
-        .current_dir(&lab.work)
-        .env("GH_REPO", "elsewhere/thing")
-        .env("KNIVES_REAL_GH", dir.path().join("gh"))
-        .env("FAKE_GH_LOG", &log)
-        .env("PATH", helper_path(helper_dir.path()))
-        .env("GIT_CONFIG_GLOBAL", &gitconfig)
-        .output()
-        .expect("run knives gh");
+        // When: the call names acme/widgets, the repository gh itself acts on.
+        let output = knives_cmd(helper_dir.path())
+            .args(["gh", "--"])
+            .args(&arguments)
+            .current_dir(&lab.work)
+            .env("GH_REPO", "elsewhere/thing")
+            .env("KNIVES_REAL_GH", dir.path().join("gh"))
+            .env("FAKE_GH_LOG", &log)
+            .env("PATH", helper_path(helper_dir.path()))
+            .env("GIT_CONFIG_GLOBAL", &gitconfig)
+            .output()
+            .expect("run knives gh");
 
-    // Then: the token is acme's.
-    assert!(output.status.success(), "{output:?}");
-    let recorded = fs::read_to_string(&log).expect("fake gh ran");
-    assert!(recorded.contains("GH_TOKEN=tok-acme"), "{recorded}");
+        // Then: the token is acme's.
+        assert!(output.status.success(), "{arguments:?}: {output:?}");
+        let recorded = fs::read_to_string(&log).expect("fake gh ran");
+        assert!(
+            recorded.contains("GH_TOKEN=tok-acme"),
+            "{arguments:?}: {recorded}"
+        );
+    }
 }
 
 #[test]
@@ -658,12 +683,15 @@ fn a_bare_or_renamed_repository_positional_does_not_route() {
     let helper_dir = fake_app_token();
     let gitconfig = token_config(helper_dir.path(), "fallback");
     // A bare name is a repository of the caller's own account, which knives cannot
-    // name; `rename`'s positional is the new name; `--json` takes the next word as
-    // its value; `list` names an owner, not a repository.
+    // name; `rename`'s positional is the new name; `--json` and the `b` ending a
+    // short-flag cluster take the next word as their value; `list` names an owner,
+    // not a repository.
     for arguments in [
         &["repo", "clone", "widgets"][..],
+        &["repo", "view", "--", "widgets"],
         &["repo", "rename", "acme/widgets"],
         &["repo", "view", "--json", "acme/widgets"],
+        &["repo", "view", "-wb", "acme/widgets"],
         &["repo", "list", "acme/widgets"],
     ] {
         let (dir, log) = fake_gh();
