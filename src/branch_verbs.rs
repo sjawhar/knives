@@ -6,7 +6,7 @@
 //! Each records one ledger event, and a statement rides on that event;
 //! `finish` also writes the released claim to the state file.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use knives::bind::Fork;
 use knives::cli::Exit;
@@ -16,7 +16,9 @@ use knives::commands::claim::{
 };
 use knives::commands::start::{collides_with_checkout, possesses, workspace_path};
 use knives::ids::{BranchName, BranchTarget, Requirement};
-use knives::jj::{Repo, WorkspaceIdentity, remove_prunable_worktree};
+use knives::jj::{
+    Repo, StaleRegistration, WorkspaceIdentity, path_occupant, remove_finished_worktree,
+};
 use knives::ledger::{Draft, Stated};
 use knives::statement::{Statement, StatementKind};
 use knives::store::{Store, default_state_path};
@@ -135,7 +137,14 @@ pub(crate) fn run_finish(
     let identity = directory
         .exists()
         .then(|| knives::jj::workspace_identity(&directory, checkout_path));
-    let registration = release_registration(checkout_path, &workspace);
+    // When the workspace at the path is this branch's own, the directory is the
+    // evidence: jj's record of where it lives can be missing (made before jj
+    // recorded paths) or stale (moved by hand).
+    let present = matches!(
+        &identity,
+        Some(WorkspaceIdentity::Ours(name)) if name.as_str() == workspace
+    );
+    let registration = release_registration(checkout_path, &workspace, &directory, present);
     let shown = directory.display();
     let checkout = checkout_path.display();
     let removal = match identity {
@@ -147,7 +156,11 @@ pub(crate) fn run_finish(
             // A registration that could not be forgotten keeps its directory: with
             // the directory gone, every later `start` dies on jj's "already exists",
             // `--force` included, where a retried `finish` would have cleaned up.
-            let removable = options.cleanup && !matches!(registration, Registration::Failed(_));
+            let removable = options.cleanup
+                && !matches!(
+                    registration,
+                    Registration::Failed(_) | Registration::Elsewhere(_)
+                );
             if removable {
                 // Safe because jj already snapshotted the working copy into a commit:
                 // the work is in the repository and reachable by change id. Untracked
@@ -195,13 +208,20 @@ pub(crate) fn run_finish(
 
 /// The Git side of a workspace whose directory is now gone: `jj workspace
 /// forget` unlinks the worktree it registered, but a directory that vanished
-/// before the forget leaves git's `.git/worktrees/<name>` entry behind, and the
-/// next `start` at that path would fail on it.
+/// before the forget leaves git's `.git/worktrees/<name>` entry behind, locked
+/// or prunable, and the next `start` at that path would fail on it. One that
+/// stays because something else now sits at the path is named, with what is
+/// there, so the failing `start` is not a surprise.
 fn stale_worktree_note(checkout: &Path, directory: &Path) -> String {
-    match remove_prunable_worktree(checkout, directory) {
-        Ok(true) => "; stale Git worktree registration removed".to_owned(),
-        Ok(false) => String::new(),
-        Err(error) => format!("; Git worktree registration not checked ({error})"),
+    match remove_finished_worktree(checkout, directory) {
+        Ok(StaleRegistration::Removed) => "; stale Git worktree registration removed".to_owned(),
+        Ok(StaleRegistration::None | StaleRegistration::Locked) => String::new(),
+        Ok(StaleRegistration::Occupied) => format!(
+            "; {} is {}, so its stale Git worktree registration was not cleared",
+            directory.display(),
+            path_occupant(directory)
+        ),
+        Err(error) => format!("; Git worktree registration not cleared ({error})"),
     }
 }
 
@@ -211,6 +231,9 @@ enum Registration {
     /// jj never knew the name; `jj workspace forget` would have exited 0 anyway,
     /// and saying "forgotten" would let a reader believe a registration was cleared.
     NotRegistered,
+    /// jj recorded the name at another path, where a same-named workspace is
+    /// live; forgetting the name would take that one over, so it is kept.
+    Elsewhere(PathBuf),
     /// The forget failed, or the checkout could not be opened to ask. Reported,
     /// not an error: the claim is already released by the time this runs, and the
     /// ownership decision never needed the checkout.
@@ -222,21 +245,46 @@ impl std::fmt::Display for Registration {
         match self {
             Self::Forgotten => f.write_str("forgotten"),
             Self::NotRegistered => f.write_str("was not registered"),
+            Self::Elsewhere(path) => write!(
+                f,
+                "not forgotten (it is registered at {}; finish or forget it there)",
+                path.display()
+            ),
             Self::Failed(detail) => write!(f, "not forgotten ({detail})"),
         }
     }
 }
 
-fn release_registration(checkout: &Path, workspace: &str) -> Registration {
+/// Forgets `workspace` in jj. Unless `present` — this branch's workspace sits
+/// at `directory` — the name is forgotten only where jj recorded it at
+/// `directory`: elsewhere it is a live same-named workspace, and a record jj
+/// cannot give is not proof either way.
+fn release_registration(
+    checkout: &Path,
+    workspace: &str,
+    directory: &Path,
+    present: bool,
+) -> Registration {
     match Repo::open(checkout).and_then(|repo| repo.workspaces()) {
         Err(error) => Registration::Failed(error.to_string()),
         Ok(names) if !names.iter().any(|(name, _)| name.as_str() == workspace) => {
             Registration::NotRegistered
         }
-        Ok(_) => match knives::jj::forget_workspace(checkout, workspace) {
-            Ok(()) => Registration::Forgotten,
-            Err(error) => Registration::Failed(error.to_string()),
-        },
+        Ok(_) => {
+            let elsewhere = if present {
+                Ok(None)
+            } else {
+                knives::jj::workspace_recorded_elsewhere(checkout, workspace, directory)
+            };
+            match elsewhere {
+                Err(error) => Registration::Failed(error.to_string()),
+                Ok(Some(elsewhere)) => Registration::Elsewhere(elsewhere),
+                Ok(None) => match knives::jj::forget_workspace(checkout, workspace) {
+                    Ok(()) => Registration::Forgotten,
+                    Err(error) => Registration::Failed(error.to_string()),
+                },
+            }
+        }
     }
 }
 

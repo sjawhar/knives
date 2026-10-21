@@ -68,7 +68,6 @@ fn status_all_reports_every_repo_in_registry_order() {
         .current_dir(elsewhere.path())
         .env("KNIVES_CONFIG_HOME", home.path())
         .env("HOME", first.temp_path())
-        .env("JJ_CONFIG", "/dev/null")
         .env("KNIVES_TIMING", "1")
         .output()
         .expect("run status --all");
@@ -101,7 +100,6 @@ fn status_all_reports_every_repo_in_registry_order() {
             .current_dir(elsewhere.path())
             .env("KNIVES_CONFIG_HOME", home.path())
             .env("HOME", first.temp_path())
-            .env("JJ_CONFIG", "/dev/null")
             .output()
             .expect("run status for one repo");
         String::from_utf8_lossy(&output.stdout)
@@ -232,7 +230,6 @@ fn status_and_plan_report_a_double_cut() {
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
         .env("HOME", lab.temp_path())
-        .env("JJ_CONFIG", "/dev/null")
         .output()
         .expect("run status");
     let plan = knives_release(&lab, &home, &[]);
@@ -295,7 +292,6 @@ fn status_and_plan_report_a_double_cut() {
         .current_dir(&rebuilt.work)
         .env("KNIVES_CONFIG_HOME", rebuilt_home.path())
         .env("HOME", rebuilt.temp_path())
-        .env("JJ_CONFIG", "/dev/null")
         .output()
         .expect("run rebuilt status");
     let rebuilt_plan = knives_release(&rebuilt, &rebuilt_home, &[]);
@@ -403,7 +399,6 @@ fn status_reports_empty_diff_and_deleted_head_from_completed_facts() {
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
         .env("HOME", lab.temp_path())
-        .env("JJ_CONFIG", "/dev/null")
         .env("XDG_CACHE_HOME", shim.path().join("cache"))
         .env("PATH", path_with_gh_shim(shim.path()))
         .output()

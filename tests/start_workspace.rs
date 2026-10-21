@@ -275,7 +275,6 @@ fn a_forced_start_on_a_divergent_branch_refuses_before_seizing_the_claim() {
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
         .env("HOME", lab.temp_path())
-        .env("JJ_CONFIG", "/dev/null")
         .output()
         .expect("run forced start");
 
@@ -570,6 +569,13 @@ fn start_clears_a_prunable_git_registration_at_its_path() {
     let workspace = lab.work.parent().expect("parent").join("feat-alpha");
     knives::jj::add_workspace(&lab.work, "feat-alpha", &workspace, "main@upstream")
         .expect("add the workspace");
+    // A wrapper on PATH may lock every worktree it adds, and git never calls a
+    // locked registration prunable; this case is the unlocked one.
+    let _ = Command::new("git")
+        .args(["worktree", "unlock"])
+        .arg(&workspace)
+        .current_dir(&lab.work)
+        .output();
     std::fs::remove_dir_all(&workspace).expect("remove the directory first");
     knives::jj::forget_workspace(&lab.work, "feat-alpha").expect("forget the workspace");
     let before = git_worktrees(&lab.work);
@@ -596,6 +602,187 @@ fn start_clears_a_prunable_git_registration_at_its_path() {
     );
     let after = git_worktrees(&lab.work);
     assert!(!after.contains("prunable"), "{after}");
+}
+
+#[test]
+fn start_keeps_a_locked_git_registration_whose_directory_is_gone() {
+    // Given: a locked registration at the branch's workspace path with nothing
+    // there. From one machine another's live workspace in a shared store looks
+    // exactly like this, which is what the lock protects.
+    let lab = Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let workspace = lab.work.parent().expect("parent").join("feat-alpha");
+    knives::jj::add_workspace(&lab.work, "feat-alpha", &workspace, "main@upstream")
+        .expect("add the workspace");
+    let worktree = |args: &[&str]| {
+        Command::new("git")
+            .arg("worktree")
+            .args(args)
+            .arg(&workspace)
+            .current_dir(&lab.work)
+            .output()
+            .expect("git worktree")
+    };
+    let _ = worktree(&["unlock"]);
+    assert!(
+        worktree(&["lock", "--reason", "test lock"])
+            .status
+            .success()
+    );
+    std::fs::remove_dir_all(&workspace).expect("remove the directory first");
+    knives::jj::forget_workspace(&lab.work, "feat-alpha").expect("forget the workspace");
+
+    let output = knives_start(&lab, &home, "feat/alpha");
+
+    // Then: start refuses, names `finish`, and the registration stays locked
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("locked Git worktree registration")
+            && stderr.contains("knives finish feat/alpha"),
+        "{stderr}"
+    );
+    let after = git_worktrees(&lab.work);
+    assert!(after.contains("locked test lock"), "{after}");
+    assert!(!workspace.exists(), "start left something at the path");
+}
+
+/// Starts `feat/alpha`, removes its workspace directory by hand, then follows
+/// the rebuild the resumed `start` prints. `lock` locks the Git registration
+/// first, as a wrapper guarding live workspaces does; without it the
+/// registration is unlocked whatever a wrapper on PATH did on add.
+fn assert_the_printed_rebuild_recreates_a_vanished_workspace(lock: bool) {
+    let lab = Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    // One named owner throughout, so the second start resumes its own claim
+    // wherever the suite runs (an anonymous identity never matches itself).
+    let start = |extra: &[&str]| {
+        start_command(&lab, &home, "feat/alpha")
+            .args(extra)
+            .env("KNIVES_OWNER", "ses_fff688")
+            .output()
+            .expect("run knives start")
+    };
+    let started = start(&[]);
+    assert!(
+        started.status.success(),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let workspace = lab.work.parent().expect("parent").join("feat-alpha");
+    let worktree = |args: &[&str]| {
+        Command::new("git")
+            .arg("worktree")
+            .args(args)
+            .arg(&workspace)
+            .current_dir(&lab.work)
+            .output()
+            .expect("git worktree")
+    };
+    let _ = worktree(&["unlock"]);
+    if lock {
+        assert!(
+            worktree(&["lock", "--reason", "test lock"])
+                .status
+                .success()
+        );
+    }
+    std::fs::remove_dir_all(&workspace).expect("remove the workspace directory by hand");
+
+    // Given: the resumed start names the rebuild
+    let resumed = start(&[]);
+    let stdout = String::from_utf8_lossy(&resumed.stdout);
+    assert!(
+        resumed.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    assert!(
+        stdout.contains("`knives start feat/alpha --force --why \"…\"` rebuilds it"),
+        "{stdout}"
+    );
+
+    // When: it is run
+    let rebuilt = start(&["--force"]);
+
+    // Then: the workspace is back at its path
+    let stdout = String::from_utf8_lossy(&rebuilt.stdout);
+    assert!(
+        rebuilt.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&rebuilt.stderr)
+    );
+    assert!(stdout.contains("created missing workspace"), "{stdout}");
+    assert!(
+        workspace.join(".jj").is_dir(),
+        "the workspace was not rebuilt"
+    );
+}
+
+#[test]
+fn the_printed_rebuild_recreates_a_vanished_workspace() {
+    assert_the_printed_rebuild_recreates_a_vanished_workspace(false);
+}
+
+#[test]
+fn the_printed_rebuild_recreates_a_vanished_workspace_whose_registration_is_locked() {
+    assert_the_printed_rebuild_recreates_a_vanished_workspace(true);
+}
+
+/// Where jj recorded workspace `name` of the lab's work checkout.
+fn recorded_workspace_root(lab: &Lab, name: &str) -> String {
+    let output = Command::new("jj")
+        .args(["--ignore-working-copy", "workspace", "root", "--name", name])
+        .current_dir(&lab.work)
+        .output()
+        .expect("jj workspace root");
+    assert!(output.status.success(), "{output:?}");
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
+#[test]
+fn the_printed_rebuild_refuses_a_same_named_workspace_registered_elsewhere() {
+    // Given: the branch's directory is gone, and its workspace name now lives at
+    // another path Q (an old `workspaces` root, or one added by hand)
+    let lab = Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let started = knives_start(&lab, &home, "feat/alpha");
+    assert!(started.status.success(), "{started:?}");
+    let workspace = lab.work.parent().expect("parent").join("feat-alpha");
+    knives::jj::forget_workspace(&lab.work, "feat-alpha").expect("forget the workspace");
+    std::fs::remove_dir_all(&workspace).expect("remove the workspace directory");
+    let elsewhere = lab.temp_path().join("other-root").join("feat-alpha");
+    knives::jj::add_workspace(&lab.work, "feat-alpha", &elsewhere, "main@upstream")
+        .expect("add the same name elsewhere");
+    let recorded = recorded_workspace_root(&lab, "feat-alpha");
+
+    // When: the rebuild the resumed start prints is run
+    let rebuilt = start_command(&lab, &home, "feat/alpha")
+        .arg("--force")
+        .output()
+        .expect("run the rebuild");
+
+    // Then: it refuses, names both paths, and the workspace at Q is untouched
+    let stderr = String::from_utf8_lossy(&rebuilt.stderr);
+    assert!(!rebuilt.status.success(), "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "workspace feat-alpha is registered at {recorded}, not {}; finish or forget it there",
+            workspace.display()
+        )),
+        "{stderr}"
+    );
+    assert_eq!(recorded_workspace_root(&lab, "feat-alpha"), recorded);
+    assert!(
+        git_worktrees(&lab.work).contains(&format!("worktree {recorded}")),
+        "{}",
+        git_worktrees(&lab.work)
+    );
+    assert!(elsewhere.join(".jj").is_dir());
+    assert!(
+        !workspace.exists(),
+        "the rebuild created the workspace anyway"
+    );
 }
 
 #[test]

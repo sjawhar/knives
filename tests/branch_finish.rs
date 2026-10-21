@@ -25,7 +25,8 @@ use knives::statement::{Statement, StatementKind};
 use knives::store::{OwnerKind, Store};
 use lab::{Lab, knives_start, release_test_home};
 use serde_json::Value;
-use std::process::Command;
+use std::path::Path;
+use std::process::{Command, Output};
 
 /// The statement an entry is expected to carry.
 fn stating(kind: StatementKind, value: Option<&str>) -> Statement {
@@ -55,7 +56,6 @@ fn starting_and_finishing_a_branch_leaves_its_reason_in_the_ledger() {
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
         .env("HOME", lab.temp_path())
-        .env("JJ_CONFIG", "/dev/null")
         .env("KNIVES_OWNER", "ses_fff688")
         .output()
         .expect("run start");
@@ -91,7 +91,6 @@ fn starting_and_finishing_a_branch_leaves_its_reason_in_the_ledger() {
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
         .env("HOME", lab.temp_path())
-        .env("JJ_CONFIG", "/dev/null")
         .env("KNIVES_OWNER", "ses_fff688")
         .output()
         .expect("run finish");
@@ -152,7 +151,6 @@ fn start_claim_for_finish(
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
         .env("HOME", lab.temp_path())
-        .env("JJ_CONFIG", "/dev/null")
         .env("KNIVES_OWNER", owner)
         .output()
         .expect("start held branch");
@@ -176,7 +174,6 @@ fn knives_finish(lab: &lab::Lab, home: &tempfile::TempDir, args: &[&str]) -> std
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
         .env("HOME", lab.temp_path())
-        .env("JJ_CONFIG", "/dev/null")
         .env("KNIVES_OWNER", "ses_fff688")
         .output()
         .expect("run finish")
@@ -198,7 +195,6 @@ fn knives_finish_with_failing_forge(
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
         .env("HOME", lab.temp_path())
-        .env("JJ_CONFIG", "/dev/null")
         .env("KNIVES_OWNER", "ses_fff688")
         .env("XDG_CACHE_HOME", shim.path().join("cache"))
         .env("PATH", path_with_gh_shim(shim.path()))
@@ -320,7 +316,6 @@ fn finish_refuses_to_release_anothers_claim_without_force() {
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
         .env("HOME", lab.temp_path())
-        .env("JJ_CONFIG", "/dev/null")
         .env("KNIVES_OWNER", "agent-two")
         .output()
         .expect("finish another agent's claim");
@@ -371,7 +366,6 @@ fn finish_force_releases_and_records_provenance() {
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
         .env("HOME", lab.temp_path())
-        .env("JJ_CONFIG", "/dev/null")
         .env("KNIVES_OWNER", "agent-two")
         .output()
         .expect("force finish another agent's claim");
@@ -403,7 +397,6 @@ fn finish_force_releases_and_records_provenance() {
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
         .env("HOME", lab.temp_path())
-        .env("JJ_CONFIG", "/dev/null")
         .env("KNIVES_OWNER", "agent-two")
         .output()
         .expect("read forced-release events");
@@ -442,7 +435,6 @@ fn finish_force_requires_why() {
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
         .env("HOME", lab.temp_path())
-        .env("JJ_CONFIG", "/dev/null")
         .output()
         .expect("parse forced finish");
 
@@ -467,7 +459,6 @@ fn finish_by_possession_still_releases() {
         .current_dir(&workspace)
         .env("KNIVES_CONFIG_HOME", home.path())
         .env("HOME", lab.temp_path())
-        .env("JJ_CONFIG", "/dev/null")
         .env_remove("KNIVES_OWNER")
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .env_remove("OMP_SESSION_ID")
@@ -581,7 +572,6 @@ fn stating_a_pull_request_and_a_dependency_leaves_both_statements_in_the_ledger(
             .current_dir(&lab.work)
             .env("KNIVES_CONFIG_HOME", home.path())
             .env("HOME", lab.temp_path())
-            .env("JJ_CONFIG", "/dev/null")
             .env("KNIVES_OWNER", "ses_fff688")
             .output()
             .expect("run knives")
@@ -696,7 +686,6 @@ fn a_fork_only_statement_is_recorded_as_the_decision_it_is() {
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
         .env("HOME", lab.temp_path())
-        .env("JJ_CONFIG", "/dev/null")
         .env("KNIVES_OWNER", "ses_fff688")
         .output()
         .expect("run track");
@@ -794,7 +783,7 @@ fn a_stated_pull_request_lives_on_the_ledger_and_status_shows_it() {
 }
 
 /// Git's registrations of a checkout's worktrees, one `worktree <path>` block
-/// per entry, `prunable` marked where the working tree is gone.
+/// per entry, `prunable` or `locked` marked where git says so.
 fn git_worktrees(checkout: &std::path::Path) -> String {
     let output = Command::new("git")
         .args(["worktree", "list", "--porcelain"])
@@ -804,18 +793,54 @@ fn git_worktrees(checkout: &std::path::Path) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
-#[test]
-fn finishing_a_workspace_whose_directory_vanished_clears_its_git_registration() {
-    // Given: a started branch whose workspace directory was removed by hand.
-    // `jj workspace forget` unlinks a worktree that is still on disk; with the
-    // directory already gone, git keeps the registration and reports it
-    // prunable, and the next `start` at that path fails on it.
+/// Runs `git worktree <verb> <workspace>` in the checkout.
+fn git_worktree(
+    checkout: &std::path::Path,
+    verb: &str,
+    extra: &[&str],
+    workspace: &Path,
+) -> Output {
+    Command::new("git")
+        .args(["worktree", verb])
+        .args(extra)
+        .arg(workspace)
+        .current_dir(checkout)
+        .output()
+        .expect("git worktree")
+}
+
+/// Finishes `branch` after its workspace directory was removed by hand, then
+/// asserts git no longer registers anything at that path and `start` succeeds
+/// there again. `lock` locks the registration first, as a tool guarding live
+/// workspaces from prunes does, and git never calls a locked one prunable;
+/// without it the registration is unlocked, whatever a wrapper on PATH did on
+/// add, so each case holds with or without such a wrapper.
+fn assert_finish_clears_a_vanished_registration(branch: &str, lock: bool) {
     let lab = lab::Lab::new();
     let (home, _consumer) = release_test_home(&lab);
-    let workspace = start_claim_for_finish(&lab, &home, "ses_fff688", "feat/gamma");
+    let workspace = start_claim_for_finish(&lab, &home, "ses_fff688", branch);
+    let _ = git_worktree(&lab.work, "unlock", &[], &workspace);
+    if lock {
+        let locked = git_worktree(&lab.work, "lock", &["--reason", "test lock"], &workspace);
+        assert!(
+            locked.status.success(),
+            "{}",
+            String::from_utf8_lossy(&locked.stderr)
+        );
+    }
+    let registered = format!(
+        "worktree {}",
+        workspace.canonicalize().expect("workspace path").display()
+    );
     std::fs::remove_dir_all(&workspace).expect("remove the workspace directory by hand");
+    let before = git_worktrees(&lab.work);
+    let stale = if lock { "locked test lock" } else { "prunable" };
+    assert!(
+        before.contains(&registered) && before.contains(stale),
+        "fixture is not a {stale} registration:\n{before}"
+    );
 
-    let finished = knives_finish(&lab, &home, &["feat/gamma"]);
+    let finished = knives_finish(&lab, &home, &[branch]);
 
     let stdout = String::from_utf8_lossy(&finished.stdout);
     assert!(
@@ -829,11 +854,11 @@ fn finishing_a_workspace_whose_directory_vanished_clears_its_git_registration() 
     );
     let registrations = git_worktrees(&lab.work);
     assert!(
-        !registrations.contains("prunable"),
-        "a prunable registration survived finish:\n{registrations}"
+        !registrations.contains(&registered),
+        "a registration at the workspace path survived finish:\n{registrations}"
     );
     // And: the branch can be started again at the same path.
-    let restarted = knives_start(&lab, &home, "feat/gamma");
+    let restarted = knives_start(&lab, &home, branch);
     assert!(
         restarted.status.success(),
         "{}\n{}",
@@ -843,5 +868,213 @@ fn finishing_a_workspace_whose_directory_vanished_clears_its_git_registration() 
     assert!(
         workspace.join(".jj").is_dir(),
         "the workspace was not recreated"
+    );
+}
+
+#[test]
+fn finishing_a_workspace_whose_directory_vanished_clears_its_git_registration() {
+    // `jj workspace forget` unlinks a worktree that is still on disk; with the
+    // directory already gone, git keeps the registration, and the next `start`
+    // at that path fails on it.
+    assert_finish_clears_a_vanished_registration("feat/gamma", false);
+}
+
+#[test]
+fn finishing_a_workspace_whose_directory_vanished_clears_its_locked_git_registration() {
+    // A locked registration is never prunable; git refuses the next `add` at
+    // its path as "a missing but locked worktree".
+    assert_finish_clears_a_vanished_registration("feat/gamma", true);
+}
+
+#[test]
+fn finishing_a_workspace_replaced_by_a_dangling_symlink_says_its_registration_stays() {
+    // Given: the workspace directory was replaced by a symbolic link to nowhere.
+    // git will not remove a registration whose path it cannot validate, so the
+    // registration stays, locked or not, and the next `start` there fails.
+    for lock in [false, true] {
+        let lab = lab::Lab::new();
+        let (home, _consumer) = release_test_home(&lab);
+        let workspace = start_claim_for_finish(&lab, &home, "ses_fff688", "feat/gamma");
+        let _ = git_worktree(&lab.work, "unlock", &[], &workspace);
+        if lock {
+            let locked = git_worktree(&lab.work, "lock", &["--reason", "test lock"], &workspace);
+            assert!(locked.status.success());
+        }
+        let registered = format!(
+            "worktree {}",
+            workspace.canonicalize().expect("workspace path").display()
+        );
+        std::fs::remove_dir_all(&workspace).expect("remove the workspace directory");
+        let nowhere = lab.temp_path().join("nowhere");
+        std::os::unix::fs::symlink(&nowhere, &workspace).expect("link the path to nowhere");
+
+        let finished = knives_finish(&lab, &home, &["feat/gamma"]);
+
+        // Then: finish names what is there and that the registration stayed
+        let stdout = String::from_utf8_lossy(&finished.stdout);
+        assert!(finished.status.success(), "lock={lock}: {stdout}");
+        let expected = format!(
+            "{} is a dangling symbolic link to {}, so its stale Git worktree registration was \
+             not cleared",
+            workspace.display(),
+            nowhere.display()
+        );
+        assert!(
+            stdout.contains(&expected),
+            "lock={lock}: {stdout}\n{}",
+            git_worktrees(&lab.work)
+        );
+        // Newer git lists the registration under the link's target.
+        let after = git_worktrees(&lab.work);
+        assert!(
+            after.contains(&registered)
+                || after.contains(&format!("worktree {}", nowhere.display())),
+            "lock={lock}: the registration was removed:\n{after}"
+        );
+        assert!(
+            std::fs::symlink_metadata(&workspace).is_ok(),
+            "lock={lock}: finish removed the link"
+        );
+    }
+}
+
+#[test]
+fn finishing_keeps_a_same_named_workspace_registered_elsewhere() {
+    // Given: the branch's directory is gone, and its workspace name now lives at
+    // another path Q (an old `workspaces` root, or one added by hand)
+    let lab = lab::Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let workspace = start_claim_for_finish(&lab, &home, "ses_fff688", "feat/gamma");
+    knives::jj::forget_workspace(&lab.work, "feat-gamma").expect("forget the workspace");
+    std::fs::remove_dir_all(&workspace).expect("remove the workspace directory");
+    let elsewhere = lab.temp_path().join("other-root").join("feat-gamma");
+    knives::jj::add_workspace(&lab.work, "feat-gamma", &elsewhere, "main@upstream")
+        .expect("add the same name elsewhere");
+    let recorded = || {
+        let output = Command::new("jj")
+            .args([
+                "--ignore-working-copy",
+                "workspace",
+                "root",
+                "--name",
+                "feat-gamma",
+            ])
+            .current_dir(&lab.work)
+            .output()
+            .expect("jj workspace root");
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    };
+    let before = recorded();
+
+    let finished = knives_finish(&lab, &home, &["feat/gamma"]);
+
+    // Then: the claim is released, the name is not forgotten, and Q is intact
+    let stdout = String::from_utf8_lossy(&finished.stdout);
+    assert!(finished.status.success(), "{stdout}");
+    assert!(
+        stdout.contains(&format!(
+            "workspace feat-gamma not forgotten (it is registered at {before}; finish or forget \
+             it there)"
+        )),
+        "{stdout}"
+    );
+    assert_eq!(recorded(), before);
+    assert!(
+        git_worktrees(&lab.work).contains(&format!("worktree {before}")),
+        "{}",
+        git_worktrees(&lab.work)
+    );
+    assert!(elsewhere.join(".jj").is_dir());
+}
+
+/// Finishes `feat/gamma` whose workspace sits at its path P, and asserts the
+/// name is forgotten and P removed, whatever jj recorded about where it lives.
+fn assert_finish_forgets_the_workspace_at_its_path(lab: &lab::Lab, home: &tempfile::TempDir) {
+    let workspace = lab.work.parent().expect("parent").join("feat-gamma");
+    assert!(
+        workspace.join(".jj").is_dir(),
+        "fixture has no workspace at P"
+    );
+
+    let finished = knives_finish(lab, home, &["feat/gamma"]);
+
+    let stdout = String::from_utf8_lossy(&finished.stdout);
+    assert!(finished.status.success(), "{stdout}");
+    assert!(
+        stdout.contains("workspace feat-gamma forgotten")
+            && stdout.contains(&format!("{} removed", workspace.display())),
+        "{stdout}"
+    );
+    assert!(!workspace.exists(), "the workspace directory survived");
+    let names = Command::new("jj")
+        .args(["--ignore-working-copy", "workspace", "list"])
+        .current_dir(&lab.work)
+        .output()
+        .expect("jj workspace list");
+    let names = String::from_utf8_lossy(&names.stdout);
+    assert!(!names.contains("feat-gamma"), "{names}");
+}
+
+#[test]
+fn finishing_forgets_a_workspace_at_its_path_that_jj_recorded_no_path_for() {
+    // Given: a workspace made before jj recorded workspace paths, so
+    // `jj workspace root --name` has no answer, sitting at the branch's path
+    let lab = lab::Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    start_claim_for_finish(&lab, &home, "ses_fff688", "feat/gamma");
+    let store = lab.work.join(".jj/repo/workspace_store");
+    assert!(store.exists(), "no workspace store at {}", store.display());
+    if store.is_dir() {
+        std::fs::remove_dir_all(&store).expect("remove the workspace store");
+    } else {
+        std::fs::remove_file(&store).expect("remove the workspace store");
+    }
+
+    assert_finish_forgets_the_workspace_at_its_path(&lab, &home);
+}
+
+#[test]
+fn finishing_forgets_a_workspace_moved_by_hand_to_its_path() {
+    // Given: jj recorded the workspace at Q, and it was then moved by hand to
+    // the branch's path P
+    let lab = lab::Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let workspace = start_claim_for_finish(&lab, &home, "ses_fff688", "feat/gamma");
+    knives::jj::forget_workspace(&lab.work, "feat-gamma").expect("forget the workspace");
+    let _ = std::fs::remove_dir_all(&workspace);
+    // A sibling of P: jj points a workspace at its repository by relative path,
+    // which a move to another depth would break.
+    let elsewhere = lab.work.parent().expect("parent").join("feat-gamma-old");
+    knives::jj::add_workspace(&lab.work, "feat-gamma", &elsewhere, "main@upstream")
+        .expect("add the workspace at Q");
+    std::fs::rename(&elsewhere, &workspace).expect("move the workspace to P");
+
+    assert_finish_forgets_the_workspace_at_its_path(&lab, &home);
+}
+
+#[test]
+fn finishing_keeps_a_vanished_workspace_jj_recorded_no_path_for() {
+    // Given: nothing at the branch's path, and jj cannot say where the name
+    // lives, so it may be a live same-named workspace elsewhere
+    let lab = lab::Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let workspace = start_claim_for_finish(&lab, &home, "ses_fff688", "feat/gamma");
+    let store = lab.work.join(".jj/repo/workspace_store");
+    if store.is_dir() {
+        std::fs::remove_dir_all(&store).expect("remove the workspace store");
+    } else {
+        std::fs::remove_file(&store).expect("remove the workspace store");
+    }
+    std::fs::remove_dir_all(&workspace).expect("remove the workspace directory");
+
+    let finished = knives_finish(&lab, &home, &["feat/gamma"]);
+
+    let stdout = String::from_utf8_lossy(&finished.stdout);
+    assert!(finished.status.success(), "{stdout}");
+    assert!(
+        stdout.contains("workspace feat-gamma not forgotten (")
+            && stdout.contains("Workspace has no recorded path"),
+        "{stdout}"
     );
 }

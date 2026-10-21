@@ -241,7 +241,6 @@ fn release_reap_keeps_a_commit_an_untracked_remote_pin_holds_and_exits_clean() {
     let status = Command::new("jj")
         .args(["git", "fetch", "--remote", "origin"])
         .current_dir(&lab.second)
-        .env("JJ_CONFIG", "/dev/null")
         .env("JJ_USER", "Knives Lab")
         .env("JJ_EMAIL", "knives-lab@example.test")
         .status()
@@ -256,7 +255,6 @@ fn release_reap_keeps_a_commit_an_untracked_remote_pin_holds_and_exits_clean() {
             "release/2026-08-04@origin",
         ])
         .current_dir(&lab.second)
-        .env("JJ_CONFIG", "/dev/null")
         .env("JJ_USER", "Knives Lab")
         .env("JJ_EMAIL", "knives-lab@example.test")
         .status()
@@ -272,7 +270,6 @@ fn release_reap_keeps_a_commit_an_untracked_remote_pin_holds_and_exits_clean() {
             "keep/pin",
         ])
         .current_dir(&lab.second)
-        .env("JJ_CONFIG", "/dev/null")
         .env("JJ_USER", "Knives Lab")
         .env("JJ_EMAIL", "knives-lab@example.test")
         .status()
@@ -437,7 +434,6 @@ fn an_untracked_remote_pin_makes_abandon_refuse_and_lands_in_forgotten_only() {
     let status = Command::new("jj")
         .args(["git", "fetch", "--remote", "origin"])
         .current_dir(&lab.second)
-        .env("JJ_CONFIG", "/dev/null")
         .env("JJ_USER", "Knives Lab")
         .env("JJ_EMAIL", "knives-lab@example.test")
         .status()
@@ -452,7 +448,6 @@ fn an_untracked_remote_pin_makes_abandon_refuse_and_lands_in_forgotten_only() {
             "release/2026-08-04@origin",
         ])
         .current_dir(&lab.second)
-        .env("JJ_CONFIG", "/dev/null")
         .env("JJ_USER", "Knives Lab")
         .env("JJ_EMAIL", "knives-lab@example.test")
         .status()
@@ -468,7 +463,6 @@ fn an_untracked_remote_pin_makes_abandon_refuse_and_lands_in_forgotten_only() {
             "keep/pin",
         ])
         .current_dir(&lab.second)
-        .env("JJ_CONFIG", "/dev/null")
         .env("JJ_USER", "Knives Lab")
         .env("JJ_EMAIL", "knives-lab@example.test")
         .status()
@@ -519,7 +513,6 @@ fn a_refused_first_name_does_not_stop_reaping_later_names() {
     let status = Command::new("jj")
         .args(["git", "fetch", "--remote", "origin"])
         .current_dir(&lab.second)
-        .env("JJ_CONFIG", "/dev/null")
         .env("JJ_USER", "Knives Lab")
         .env("JJ_EMAIL", "knives-lab@example.test")
         .status()
@@ -534,7 +527,6 @@ fn a_refused_first_name_does_not_stop_reaping_later_names() {
             "release/2026-08-04@origin",
         ])
         .current_dir(&lab.second)
-        .env("JJ_CONFIG", "/dev/null")
         .env("JJ_USER", "Knives Lab")
         .env("JJ_EMAIL", "knives-lab@example.test")
         .status()
@@ -550,7 +542,6 @@ fn a_refused_first_name_does_not_stop_reaping_later_names() {
             "keep/pin",
         ])
         .current_dir(&lab.second)
-        .env("JJ_CONFIG", "/dev/null")
         .env("JJ_USER", "Knives Lab")
         .env("JJ_EMAIL", "knives-lab@example.test")
         .status()

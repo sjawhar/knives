@@ -25,6 +25,7 @@ use jj_lib::settings::UserSettings;
 use jj_lib::transaction::Transaction;
 use jj_lib::working_copy::WorkingCopy as _;
 use jj_lib::workspace::Workspace;
+use jj_lib::workspace_store::{SimpleWorkspaceStore, WorkspaceStore as _, WorkspaceStoreError};
 use thiserror::Error;
 
 use crate::detect::landed::RebaseOutcome;
@@ -1309,34 +1310,126 @@ fn is_empty_directory(directory: &Path) -> bool {
 }
 
 /// Removes the Git worktree registration at `destination` when git itself
-/// reports it `prunable` — its working tree is gone — and says whether it did.
+/// reports it `prunable` — its working tree is gone — and says what it found.
 ///
 /// A colocated `jj workspace add` registers the new directory as a Git worktree
 /// under `.git/worktrees/<name>` and `jj workspace forget` unregisters it. A
 /// directory removed before the forget (by hand, or by a jj that did not
 /// unlink) leaves the registration behind, and the next `add` at that path
 /// fails on it. Only a prunable registration is touched: `git worktree remove`
-/// on a live one would delete its directory.
-pub fn remove_prunable_worktree(checkout: &Path, destination: &Path) -> Result<bool, JjError> {
+/// on a live one would delete its directory. A locked registration is never
+/// prunable and stays; with nothing at its path it is reported
+/// [`StaleRegistration::Locked`], since the path may be another machine's live
+/// workspace in a shared store.
+pub fn remove_prunable_worktree(
+    checkout: &Path,
+    destination: &Path,
+) -> Result<StaleRegistration, JjError> {
+    remove_stale_worktree(checkout, destination, StaleLock::Kept)
+}
+
+/// [`remove_prunable_worktree`] for a workspace being finished, which also
+/// unlocks and removes a locked registration whose directory is gone.
+///
+/// A lock keeps another tool's prune off a live workspace; the workspace
+/// `finish` ends is not live, and git would otherwise keep its registration,
+/// so the next `start` at that path fails on "a missing but locked worktree".
+/// The lock is overridden whatever its reason. Only the registration at
+/// `destination` is touched, and only while nothing is at that path.
+pub fn remove_finished_worktree(
+    checkout: &Path,
+    destination: &Path,
+) -> Result<StaleRegistration, JjError> {
+    remove_stale_worktree(checkout, destination, StaleLock::Cleared)
+}
+
+/// What became of the Git worktree registration at a workspace path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StaleRegistration {
+    /// None was registered there, or its directory is present.
+    None,
+    /// The registration's directory was gone, and the registration is removed.
+    Removed,
+    /// The registration is locked and nothing is at its path; it was kept.
+    Locked,
+    /// The registration's working tree is gone, but something that is not a
+    /// directory — a dangling symbolic link, a file — is at its path. Kept:
+    /// git will not remove a registration whose path it cannot validate, and
+    /// what is there is not knives' to delete. [`path_occupant`] names it.
+    Occupied,
+}
+
+/// What is at `path`, for a message about a path that holds something other
+/// than a directory: `a dangling symbolic link to <target>`, or `a file`.
+pub fn path_occupant(path: &Path) -> String {
+    match std::fs::read_link(path) {
+        Ok(target) if !path.exists() => {
+            format!("a dangling symbolic link to {}", target.display())
+        }
+        Ok(target) => format!("a symbolic link to {}", target.display()),
+        Err(_) => "a file".to_owned(),
+    }
+}
+
+/// What [`remove_stale_worktree`] does with a locked registration whose
+/// directory is gone.
+#[derive(Clone, Copy)]
+enum StaleLock {
+    Kept,
+    Cleared,
+}
+
+fn remove_stale_worktree(
+    checkout: &Path,
+    destination: &Path,
+    stale_lock: StaleLock,
+) -> Result<StaleRegistration, JjError> {
     let checkout = path(checkout);
     let listing = command("git", ["-C", &checkout, "worktree", "list", "--porcelain"])?;
-    let wanted = comparable_path(destination);
-    let prunable = listing.split("\n\n").any(|entry| {
-        let mut lines = entry.lines();
-        let registered = lines
+    // Newer git lists a worktree whose path is now a symbolic link under the
+    // link's target, so the target names the registration at `destination` too.
+    let mut wanted = vec![comparable_path(destination)];
+    if let Ok(target) = std::fs::read_link(destination) {
+        let target = destination
+            .parent()
+            .map_or_else(|| target.clone(), |parent| parent.join(&target));
+        wanted.push(comparable_path(&lexically_normal(&target)));
+    }
+    let Some(entry) = listing.split("\n\n").find(|entry| {
+        entry
+            .lines()
             .next()
             .and_then(|line| line.strip_prefix("worktree "))
-            .map(|registered| comparable_path(Path::new(registered)));
-        registered == Some(wanted.clone()) && lines.any(|line| line.starts_with("prunable"))
-    });
-    if !prunable {
-        return Ok(false);
+            .is_some_and(|registered| wanted.contains(&comparable_path(Path::new(registered))))
+    }) else {
+        return Ok(StaleRegistration::None);
+    };
+    let prunable = entry.lines().any(|line| line.starts_with("prunable"));
+    let locked = entry
+        .lines()
+        .any(|line| line == "locked" || line.starts_with("locked "));
+    let vanished = matches!(
+        std::fs::symlink_metadata(destination),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    );
+    // A registration whose path holds something other than a directory has no
+    // working tree there, whatever git says of it.
+    if !vanished && !destination.is_dir() {
+        return Ok(StaleRegistration::Occupied);
     }
-    command(
-        "git",
-        ["-C", &checkout, "worktree", "remove", &path(destination)],
-    )?;
-    Ok(true)
+    let shown = path(destination);
+    if locked && vanished {
+        match stale_lock {
+            StaleLock::Kept => return Ok(StaleRegistration::Locked),
+            StaleLock::Cleared => {
+                command("git", ["-C", &checkout, "worktree", "unlock", &shown])?;
+            }
+        }
+    } else if !prunable {
+        return Ok(StaleRegistration::None);
+    }
+    command("git", ["-C", &checkout, "worktree", "remove", &shown])?;
+    Ok(StaleRegistration::Removed)
 }
 
 /// `directory` with its parent resolved through symbolic links, so a path
@@ -3134,6 +3227,61 @@ pub fn forget_workspace(repo: &Path, name: &str) -> Result<(), JjError> {
         ],
     )?;
     Ok(())
+}
+
+/// Where jj recorded workspace `name` of `repo`, or `None` when that is
+/// `destination` itself.
+///
+/// Paths compare through symbolic links above them. Errs when jj recorded no
+/// path for the name (a workspace made before jj recorded them).
+///
+/// A workspace name is the repository's, not a path's: a same-named workspace
+/// can live elsewhere (an old `workspaces` root, one added by hand), and
+/// forgetting the name for a vanished directory at `destination` would take
+/// that live one over. Read from the repository's workspace store in process:
+/// jj stores the path relative to `.jj/repo`, and the `jj workspace root` of
+/// the pinned jj refuses to answer once that directory is gone.
+pub fn workspace_recorded_elsewhere(
+    repo: &Path,
+    name: &str,
+    destination: &Path,
+) -> Result<Option<PathBuf>, JjError> {
+    let repo_dir = repo.join(".jj/repo");
+    let no_record = || JjError::Open {
+        path: repo_dir.display().to_string(),
+        detail: format!("Workspace has no recorded path: {name}"),
+    };
+    // Loading a store that does not exist creates an empty one; this only reads.
+    if !repo_dir.join("workspace_store").join("index").is_file() {
+        return Err(no_record());
+    }
+    let store_error = |error: WorkspaceStoreError| JjError::Open {
+        path: repo_dir.display().to_string(),
+        detail: error.to_string(),
+    };
+    let recorded = SimpleWorkspaceStore::load(&repo_dir)
+        .map_err(store_error)?
+        .get_workspace_path(jj_lib::ref_name::WorkspaceName::new(name))
+        .map_err(store_error)?
+        .ok_or_else(no_record)?;
+    let recorded = lexically_normal(&repo_dir.join(recorded));
+    Ok((comparable_path(&recorded) != comparable_path(destination)).then_some(recorded))
+}
+
+/// `path` with `.` and `..` components resolved as written, without touching
+/// the file system: the directory a recorded path names may be gone.
+fn lexically_normal(path: &Path) -> PathBuf {
+    let mut normal = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normal.pop();
+            }
+            other => normal.push(other),
+        }
+    }
+    normal
 }
 
 /// Run a command with a revision checked out, and return its output.

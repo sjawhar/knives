@@ -84,7 +84,6 @@ fn knives_env(command: &mut Command, scratch: &Path) {
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("KNIVES_CONFIG_HOME", scratch)
         .env("HOME", scratch)
-        .env("JJ_CONFIG", "/dev/null")
         .env("KNIVES_GH_SHIM_DEPTH", "1")
         .env_remove("GH_TOKEN");
 }
@@ -990,7 +989,6 @@ fn registered_fork_roles_beat_nonstandard_remote_names() {
         .env("FAKE_GH_LOG", &log)
         .env("KNIVES_CONFIG_HOME", config_home.path())
         .env("HOME", lab.temp_path())
-        .env("JJ_CONFIG", "/dev/null")
         .env("PATH", helper_path(helper_dir.path()))
         .env("GIT_CONFIG_GLOBAL", &gitconfig)
         .output()

@@ -16,22 +16,30 @@ use std::process::Command;
 
 use tempfile::TempDir;
 
-/// Point every jj in this test process at a config home under cargo's target
-/// directory, before `main` runs.
+/// Give every jj in this test process a hermetic configuration, before `main`
+/// runs: a config home under cargo's target directory, and no user config file.
 ///
 /// jj resolves a repository's config to `$XDG_CONFIG_HOME/jj/repos/<config-id>/`
 /// and creates that directory on first contact; left unset, every lab repository
-/// leaves one in the developer's real `~/.config`. Per-spawn `.env()` is not
-/// enough: tests also call knives in-process, and the jj it spawns inherits the
-/// test process's own environment. One variable for the whole process keeps the
-/// lab's jj, the knives binary, and in-process knives agreeing on where a
-/// repository's config (identity, `immutable_heads()`) lives.
+/// leaves one in the developer's real `~/.config`. `JJ_CONFIG` names the user
+/// config files and replaces the rest; inherited from an agent session, its
+/// overlays (an `immutable_heads()` that walls the session's own commits, say)
+/// change what the lab's jj may rewrite, so it is pointed at `/dev/null`.
+/// Per-spawn `.env()` is not enough: tests also call knives in-process, and the
+/// jj it spawns inherits the test process's own environment. One setting for
+/// the whole process keeps the lab's jj, the knives binary, and in-process
+/// knives agreeing on where a repository's config (identity,
+/// `immutable_heads()`) lives; a test that wants a user config still sets
+/// `JJ_CONFIG` on its own command.
 #[ctor::ctor(unsafe)]
-fn isolate_jj_config_home() {
+fn isolate_jj_config() {
     let xdg = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("xdg");
     // SAFETY: a constructor runs before `main`, hence before libtest spawns its
     // first thread; nothing can read the environment concurrently.
-    unsafe { std::env::set_var("XDG_CONFIG_HOME", xdg) }
+    unsafe {
+        std::env::set_var("XDG_CONFIG_HOME", xdg);
+        std::env::set_var("JJ_CONFIG", "/dev/null");
+    }
 }
 
 pub struct Lab {
@@ -659,7 +667,6 @@ pub fn operation_ids(repo: &std::path::Path) -> Vec<String> {
             "id ++ \"\\n\"",
         ])
         .current_dir(repo)
-        .env("JJ_CONFIG", "/dev/null")
         .env("JJ_USER", "Knives Lab")
         .env("JJ_EMAIL", "knives-lab@example.test")
         .output()
@@ -704,8 +711,7 @@ pub fn release_command(
     command
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
-        .env("HOME", lab.temp_path())
-        .env("JJ_CONFIG", "/dev/null");
+        .env("HOME", lab.temp_path());
     command
 }
 
@@ -717,8 +723,7 @@ pub fn start_command(lab: &Lab, home: &tempfile::TempDir, branch: &str) -> Comma
         .args(["--text", "start", branch, "--repo", "demo", "--why", "test"])
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
-        .env("HOME", lab.temp_path())
-        .env("JJ_CONFIG", "/dev/null");
+        .env("HOME", lab.temp_path());
     command
 }
 
@@ -788,7 +793,6 @@ pub fn jj<const N: usize>(directory: &Path, args: [&str; N]) {
     let status = Command::new("jj")
         .args(args)
         .current_dir(directory)
-        .env("JJ_CONFIG", "/dev/null")
         .env("JJ_USER", "Knives Lab")
         .env("JJ_EMAIL", "knives-lab@example.test")
         .status()
@@ -949,8 +953,7 @@ pub fn knives_command(cwd: &Path, config_home: &Path, scan_home: &Path, args: &[
         .args(args)
         .current_dir(cwd)
         .env("KNIVES_CONFIG_HOME", config_home)
-        .env("HOME", scan_home)
-        .env("JJ_CONFIG", "/dev/null");
+        .env("HOME", scan_home);
     for name in knives::commands::claim::HARNESS_SESSION_VARIABLES {
         command.env_remove(name);
     }
@@ -974,7 +977,6 @@ pub fn session_start(home: &Path, cwd: &Path, session_id: &str) -> std::process:
         .args(["hook", "claude-code"])
         .env("KNIVES_CONFIG_HOME", home)
         .env("HOME", home)
-        .env("JJ_CONFIG", "/dev/null")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -1052,7 +1054,6 @@ fn jj_output<const N: usize>(directory: &Path, args: [&str; N]) -> String {
     let output = Command::new("jj")
         .args(args)
         .current_dir(directory)
-        .env("JJ_CONFIG", "/dev/null")
         .env("JJ_USER", "Knives Lab")
         .env("JJ_EMAIL", "knives-lab@example.test")
         .output()
@@ -1122,7 +1123,6 @@ pub fn newest_operation_description(repo: &Path) -> String {
             "description",
         ])
         .current_dir(repo)
-        .env("JJ_CONFIG", "/dev/null")
         .env("JJ_USER", "Knives Lab")
         .env("JJ_EMAIL", "knives-lab@example.test")
         .output()
@@ -1151,7 +1151,6 @@ pub fn file_at_revision(lab: &Lab, revision: &str, file: &str) -> String {
             revision,
             &format!("root:{file}"),
         ])
-        .env("JJ_CONFIG", "/dev/null")
         .output()
         .expect("show revision file");
     assert!(

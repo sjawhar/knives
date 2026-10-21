@@ -45,10 +45,7 @@ fn event(name: &str, cwd: &Path, path: Option<&Path>) -> Value {
 fn hook_command(home: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_knives"));
     command.args(["hook", "claude-code"]);
-    command
-        .env("KNIVES_CONFIG_HOME", home)
-        .env("HOME", home)
-        .env("JJ_CONFIG", "/dev/null");
+    command.env("KNIVES_CONFIG_HOME", home).env("HOME", home);
     command
 }
 
@@ -475,8 +472,7 @@ fn a_hook_whose_own_working_directory_has_vanished_still_answers() {
             ])
             .current_dir(vanishing.path())
             .env("KNIVES_CONFIG_HOME", repos.home.path())
-            .env("HOME", repos.home.path())
-            .env("JJ_CONFIG", "/dev/null");
+            .env("HOME", repos.home.path());
         let answer = run_command_input(command, &event.to_string());
         assert!(
             !vanishing.path().exists(),

@@ -517,7 +517,6 @@ fn divergence_with_only_ignored_head_keeps_copies_vouched_by_live_heads() {
     let status = Command::new("jj")
         .args(["edit", "--ignore-immutable", "feat/alpha"])
         .current_dir(&lab.second)
-        .env("JJ_CONFIG", "/dev/null")
         .env("JJ_USER", "Knives Lab")
         .env("JJ_EMAIL", "knives-lab@example.test")
         .status()
@@ -527,7 +526,6 @@ fn divergence_with_only_ignored_head_keeps_copies_vouched_by_live_heads() {
     let status = Command::new("jj")
         .args(["bookmark", "create", "release/2024-01-01", "-r", "@"])
         .current_dir(&lab.second)
-        .env("JJ_CONFIG", "/dev/null")
         .env("JJ_USER", "Knives Lab")
         .env("JJ_EMAIL", "knives-lab@example.test")
         .status()
@@ -543,7 +541,6 @@ fn divergence_with_only_ignored_head_keeps_copies_vouched_by_live_heads() {
             "release/2024-01-01",
         ])
         .current_dir(&lab.second)
-        .env("JJ_CONFIG", "/dev/null")
         .env("JJ_USER", "Knives Lab")
         .env("JJ_EMAIL", "knives-lab@example.test")
         .status()

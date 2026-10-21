@@ -187,7 +187,6 @@ fn consumers_reports_stale_and_behind_locks() {
             .current_dir(&lab.work)
             .env("KNIVES_CONFIG_HOME", home.path())
             .env("HOME", lab.temp_path())
-            .env("JJ_CONFIG", "/dev/null")
             .output()
             .expect("run consumers")
     };
@@ -242,7 +241,6 @@ fn consumers_reports_a_missing_local_path_as_incomplete() {
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
         .env("HOME", lab.temp_path())
-        .env("JJ_CONFIG", "/dev/null")
         .output()
         .expect("run consumers");
 
@@ -288,7 +286,6 @@ fn consumers_leaves_pins_unclassified_when_live_release_refs_fail() {
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
         .env("HOME", lab.temp_path())
-        .env("JJ_CONFIG", "/dev/null")
         .output()
         .expect("run consumers");
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -330,7 +327,6 @@ fn consumers_reports_an_unreadable_pin_file_as_incomplete() {
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
         .env("HOME", lab.temp_path())
-        .env("JJ_CONFIG", "/dev/null")
         .output()
         .expect("run consumers");
     let stdout = String::from_utf8_lossy(&output.stdout);

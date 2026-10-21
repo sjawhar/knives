@@ -31,7 +31,6 @@ fn run_hook_input_with_owner(
         .args(["hook", "opencode"])
         .env("KNIVES_CONFIG_HOME", home)
         .env("HOME", home)
-        .env("JJ_CONFIG", "/dev/null")
         .env_remove("KNIVES_OWNER")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -510,7 +509,6 @@ fn concurrent_tool_calls_inject_the_guidance_once() {
                 .args(["hook", "opencode"])
                 .env("KNIVES_CONFIG_HOME", repos.home.path())
                 .env("HOME", repos.home.path())
-                .env("JJ_CONFIG", "/dev/null")
                 .env_remove("KNIVES_OWNER")
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
@@ -1050,7 +1048,6 @@ fn unreadable_stdin_returns_an_empty_response_without_failing() {
         .args(["hook", "opencode"])
         .env("KNIVES_CONFIG_HOME", home.path())
         .env("HOME", home.path())
-        .env("JJ_CONFIG", "/dev/null")
         .stdin(Stdio::from(stdin))
         .output()
         .expect("run hook");
