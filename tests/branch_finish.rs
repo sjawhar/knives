@@ -980,3 +980,94 @@ fn finishing_keeps_a_same_named_workspace_registered_elsewhere() {
     );
     assert!(elsewhere.join(".jj").is_dir());
 }
+
+/// Finishes `feat/gamma` whose workspace sits at its path P, and asserts the
+/// name is forgotten and P removed, whatever jj recorded about where it lives.
+fn assert_finish_forgets_the_workspace_at_its_path(lab: &lab::Lab, home: &tempfile::TempDir) {
+    let workspace = lab.work.parent().expect("parent").join("feat-gamma");
+    assert!(
+        workspace.join(".jj").is_dir(),
+        "fixture has no workspace at P"
+    );
+
+    let finished = knives_finish(lab, home, &["feat/gamma"]);
+
+    let stdout = String::from_utf8_lossy(&finished.stdout);
+    assert!(finished.status.success(), "{stdout}");
+    assert!(
+        stdout.contains("workspace feat-gamma forgotten")
+            && stdout.contains(&format!("{} removed", workspace.display())),
+        "{stdout}"
+    );
+    assert!(!workspace.exists(), "the workspace directory survived");
+    let names = Command::new("jj")
+        .args(["--ignore-working-copy", "workspace", "list"])
+        .current_dir(&lab.work)
+        .output()
+        .expect("jj workspace list");
+    let names = String::from_utf8_lossy(&names.stdout);
+    assert!(!names.contains("feat-gamma"), "{names}");
+}
+
+#[test]
+fn finishing_forgets_a_workspace_at_its_path_that_jj_recorded_no_path_for() {
+    // Given: a workspace made before jj recorded workspace paths, so
+    // `jj workspace root --name` has no answer, sitting at the branch's path
+    let lab = lab::Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    start_claim_for_finish(&lab, &home, "ses_fff688", "feat/gamma");
+    let store = lab.work.join(".jj/repo/workspace_store");
+    assert!(store.exists(), "no workspace store at {}", store.display());
+    if store.is_dir() {
+        std::fs::remove_dir_all(&store).expect("remove the workspace store");
+    } else {
+        std::fs::remove_file(&store).expect("remove the workspace store");
+    }
+
+    assert_finish_forgets_the_workspace_at_its_path(&lab, &home);
+}
+
+#[test]
+fn finishing_forgets_a_workspace_moved_by_hand_to_its_path() {
+    // Given: jj recorded the workspace at Q, and it was then moved by hand to
+    // the branch's path P
+    let lab = lab::Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let workspace = start_claim_for_finish(&lab, &home, "ses_fff688", "feat/gamma");
+    knives::jj::forget_workspace(&lab.work, "feat-gamma").expect("forget the workspace");
+    let _ = std::fs::remove_dir_all(&workspace);
+    // A sibling of P: jj points a workspace at its repository by relative path,
+    // which a move to another depth would break.
+    let elsewhere = lab.work.parent().expect("parent").join("feat-gamma-old");
+    knives::jj::add_workspace(&lab.work, "feat-gamma", &elsewhere, "main@upstream")
+        .expect("add the workspace at Q");
+    std::fs::rename(&elsewhere, &workspace).expect("move the workspace to P");
+
+    assert_finish_forgets_the_workspace_at_its_path(&lab, &home);
+}
+
+#[test]
+fn finishing_keeps_a_vanished_workspace_jj_recorded_no_path_for() {
+    // Given: nothing at the branch's path, and jj cannot say where the name
+    // lives, so it may be a live same-named workspace elsewhere
+    let lab = lab::Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let workspace = start_claim_for_finish(&lab, &home, "ses_fff688", "feat/gamma");
+    let store = lab.work.join(".jj/repo/workspace_store");
+    if store.is_dir() {
+        std::fs::remove_dir_all(&store).expect("remove the workspace store");
+    } else {
+        std::fs::remove_file(&store).expect("remove the workspace store");
+    }
+    std::fs::remove_dir_all(&workspace).expect("remove the workspace directory");
+
+    let finished = knives_finish(&lab, &home, &["feat/gamma"]);
+
+    let stdout = String::from_utf8_lossy(&finished.stdout);
+    assert!(finished.status.success(), "{stdout}");
+    assert!(
+        stdout.contains("workspace feat-gamma not forgotten (")
+            && stdout.contains("Workspace has no recorded path"),
+        "{stdout}"
+    );
+}

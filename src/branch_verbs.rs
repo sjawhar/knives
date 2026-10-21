@@ -137,7 +137,14 @@ pub(crate) fn run_finish(
     let identity = directory
         .exists()
         .then(|| knives::jj::workspace_identity(&directory, checkout_path));
-    let registration = release_registration(checkout_path, &workspace, &directory);
+    // When the workspace at the path is this branch's own, the directory is the
+    // evidence: jj's record of where it lives can be missing (made before jj
+    // recorded paths) or stale (moved by hand).
+    let present = matches!(
+        &identity,
+        Some(WorkspaceIdentity::Ours(name)) if name.as_str() == workspace
+    );
+    let registration = release_registration(checkout_path, &workspace, &directory, present);
     let shown = directory.display();
     let checkout = checkout_path.display();
     let removal = match identity {
@@ -248,20 +255,36 @@ impl std::fmt::Display for Registration {
     }
 }
 
-fn release_registration(checkout: &Path, workspace: &str, directory: &Path) -> Registration {
+/// Forgets `workspace` in jj. Unless `present` — this branch's workspace sits
+/// at `directory` — the name is forgotten only where jj recorded it at
+/// `directory`: elsewhere it is a live same-named workspace, and a record jj
+/// cannot give is not proof either way.
+fn release_registration(
+    checkout: &Path,
+    workspace: &str,
+    directory: &Path,
+    present: bool,
+) -> Registration {
     match Repo::open(checkout).and_then(|repo| repo.workspaces()) {
         Err(error) => Registration::Failed(error.to_string()),
         Ok(names) if !names.iter().any(|(name, _)| name.as_str() == workspace) => {
             Registration::NotRegistered
         }
-        Ok(_) => match knives::jj::workspace_recorded_elsewhere(checkout, workspace, directory) {
-            Err(error) => Registration::Failed(error.to_string()),
-            Ok(Some(elsewhere)) => Registration::Elsewhere(elsewhere),
-            Ok(None) => match knives::jj::forget_workspace(checkout, workspace) {
-                Ok(()) => Registration::Forgotten,
+        Ok(_) => {
+            let elsewhere = if present {
+                Ok(None)
+            } else {
+                knives::jj::workspace_recorded_elsewhere(checkout, workspace, directory)
+            };
+            match elsewhere {
                 Err(error) => Registration::Failed(error.to_string()),
-            },
-        },
+                Ok(Some(elsewhere)) => Registration::Elsewhere(elsewhere),
+                Ok(None) => match knives::jj::forget_workspace(checkout, workspace) {
+                    Ok(()) => Registration::Forgotten,
+                    Err(error) => Registration::Failed(error.to_string()),
+                },
+            }
+        }
     }
 }
 
