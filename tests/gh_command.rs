@@ -7,7 +7,7 @@
 
 #[path = "common/lab.rs"]
 mod lab;
-// allow: SIZE_OK: 1695 lines - real-binary gh passthrough scenarios share one fixture and process harness.
+// allow: SIZE_OK: 1699 lines - real-binary gh passthrough scenarios share one fixture and process harness.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
@@ -561,7 +561,9 @@ fn acme_widgets_positional_calls() -> Vec<Vec<String>> {
     let url = format!("https://{host}/acme/widgets");
     let scp = format!("git@{host}:acme/widgets.git");
     let host_spec = format!("{host}/acme/widgets");
-    let calls: [&[&str]; 19] = [
+    let bare_scp = format!("{host}:acme/widgets");
+    let user_scp = format!("alice@{host}:acme/widgets");
+    let calls: [&[&str]; 21] = [
         &["repo", "view", "acme/widgets", "--json", "name"],
         &["repo", "view", "--json", "name", "acme/widgets"],
         &["repo", "view", "-b", "main", &url],
@@ -570,6 +572,8 @@ fn acme_widgets_positional_calls() -> Vec<Vec<String>> {
         &["repo", "view", "--", "acme/widgets"],
         &["repo", "clone", "acme/widgets"],
         &["repo", "clone", &scp],
+        &["repo", "clone", &bare_scp],
+        &["repo", "clone", &user_scp],
         &[
             "repo",
             "clone",

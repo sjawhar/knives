@@ -2,7 +2,7 @@
 //!
 //! This command executes `gh` directly, so the usual render/run split does not apply:
 //! there is no knives result to render.
-// allow: SIZE_OK: 2275 lines - single passthrough pipeline; splitting would separate resolution steps that read as one procedure.
+// allow: SIZE_OK: 2292 lines - single passthrough pipeline; splitting would separate resolution steps that read as one procedure.
 use std::collections::BTreeMap;
 use std::io::Read as _;
 use std::os::unix::{
@@ -465,13 +465,8 @@ pub(crate) fn normalize_url(url: &str) -> Option<String> {
         return None;
     }
     let mut url = url.to_owned();
-    // SSH scp-form git@host:owner/repo -> https://host/owner/repo
-    if let Some(rest) = url.strip_prefix("git@")
-        && let Some((host, path)) = rest.split_once(':')
-        && !host.is_empty()
-        && !path.is_empty()
-    {
-        url = format!("https://{host}/{path}");
+    if let Some(https) = scp_url(&url) {
+        url = https;
     }
     if let Some(rest) = url.strip_prefix("ssh://git@") {
         url = format!("https://{rest}");
@@ -486,13 +481,27 @@ pub(crate) fn normalize_url(url: &str) -> Option<String> {
     Some(url)
 }
 
-/// An https URL from a gh repo spec: URL, scp-form `git@host:owner/repo`,
+/// An scp-form `[user@]host:owner/repo` as `https://host/owner/repo`, read the
+/// way git (and gh's clone) read it: no `://`, and no `/` before the first `:`.
+fn scp_url(url: &str) -> Option<String> {
+    if url.contains("://") {
+        return None;
+    }
+    let (user_host, path) = url.split_once(':')?;
+    let host = user_host
+        .rsplit_once('@')
+        .map_or(user_host, |(_, host)| host);
+    (!host.is_empty() && !user_host.contains('/') && !path.is_empty())
+        .then(|| format!("https://{host}/{path}"))
+}
+
+/// An https URL from a gh repo spec: URL, scp-form `[user@]host:owner/repo`,
 /// host/owner/repo, or owner/repo (lines 59-73).
 pub(crate) fn url_from_spec(spec: &str) -> Option<String> {
     if spec.is_empty() {
         return None;
     }
-    if spec.contains("://") || spec.starts_with("git@") {
+    if spec.contains("://") || scp_url(spec).is_some() {
         return normalize_url(spec);
     }
     let slashes = spec.matches('/').count();
@@ -1250,11 +1259,19 @@ mod tests {
             url_from_spec(&format!("https://{host}/acme/work.git")).unwrap(),
             format!("https://{host}/acme/work.git")
         );
-        // So does an scp-form remote, which gh takes as a repository argument.
-        assert_eq!(
-            url_from_spec(&format!("git@{host}:acme/work.git")).unwrap(),
-            format!("https://{host}/acme/work.git")
-        );
+        // So does an scp-form remote with any user or none, which gh's clone takes
+        // as a repository argument.
+        for spec in [
+            format!("git@{host}:acme/work.git"),
+            format!("alice@{host}:acme/work"),
+            format!("{host}:acme/work"),
+        ] {
+            assert_eq!(
+                url_from_spec(&spec).unwrap(),
+                format!("https://{host}/acme/work.git"),
+                "{spec}"
+            );
+        }
         assert_eq!(url_from_spec(""), None);
     }
 
