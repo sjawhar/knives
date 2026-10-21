@@ -1333,7 +1333,8 @@ pub fn remove_finished_worktree(checkout: &Path, destination: &Path) -> Result<b
 /// What became of the Git worktree registration at a workspace path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StaleRegistration {
-    /// None was registered there, or the registered directory is present.
+    /// None was registered there, or something (even a dangling symbolic link)
+    /// is at its path.
     None,
     /// The registration's directory was gone, and the registration is removed.
     Removed,

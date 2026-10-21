@@ -583,7 +583,7 @@ fn create_workspace(context: &StartContext<'_>) -> anyhow::Result<WorkspaceBase>
         ),
         StaleRegistration::Locked => anyhow::bail!(
             "a locked Git worktree registration at {} has no directory there; if it is this \
-             branch's, `knives finish {}` clears it",
+             branch's and no other machine has it open, `knives finish {}` clears it",
             context.destination.display(),
             context.branch
         ),
