@@ -62,7 +62,7 @@ A read-only check of remote drift, open pull heads, zombie remote branches, rele
 
 - Each local bookmark with one target that is not trunk or a release name has a `branches` row.
 - A divergent branch has no row, but the problem `bookmark <name> is divergent (<n> targets); no row`. A divergent release name has `release <name> is divergent (<n> targets)`, and cut drift stays unread until it is resolved. Both exit `3`. A divergent trunk is the `divergence` finding of status.
-- `release-drift` holds each local and published release name against the newest cut or edit event for it in the [ledger](ledger.md), and the commit that event names. A release at the commit of its last `include`, `drop`, `advance` or `rebase` is the work of knives, not drift. A release name with no such event has a note.
+- `release-drift` holds each local and published release name against the commits that the cut and edit events for it name in the [ledger](ledger.md). A release at the commit of its last cut, `include`, `drop`, `advance` or `rebase` is the work of knives, not drift. A commit with the same change id, parents and tree as a recorded one is that commit signed or metaedited: a note, not drift. A release at an earlier recorded commit, such as the publish remote before you push an edit, is also a note. When a commit cannot be read here, that is a problem, and the drift finding stays. A release name with no such event has a note.
 - `template: {file, headings}` appears once: the PR template of upstream trunk. It is `null` with no template or no forge.
 
 ```jsonc

@@ -573,9 +573,11 @@ fn committed_cut_fixture(
             parents: &request.parents,
             message: Some(&request.message()),
             bookmark: None,
+            publish_remote: None,
             operation: &format!("knives: cut {} (fixture)", request.name),
         },
     )
+    .map(|written| written.commit)
 }
 
 /// The commit each parent of a named release sits at right now.

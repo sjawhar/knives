@@ -818,16 +818,21 @@ pub struct RecordedWrite {
     pub commit: CommitId,
 }
 
-/// The newest commit knives itself put under `release`: what the last cut
+/// Every commit knives itself put under `release`, newest first: what each cut
 /// event or edit event (`include`, `drop`, `advance`, `rebase`) records first
 /// in its evidence.
 ///
 /// An edit writes a new commit under the same name, so a release that equals
-/// its last edit is knives' own work, not drift. The composition gate does not
-/// read this: it holds a new cut against [`last_recorded_cut`], so a member an
-/// edit dropped is still restated at the next cut.
-pub fn last_recorded_write(entries: &[Entry], release: &str) -> Option<RecordedWrite> {
-    entries.iter().rev().find_map(|entry| {
+/// its last edit is knives' own work, not drift, and one at an earlier write
+/// is knives' own work not yet replaced there (an edit not pushed yet). The
+/// composition gate does not read this: it holds a new cut against
+/// [`last_recorded_cut`], so a member an edit dropped is still restated at the
+/// next cut.
+pub fn recorded_writes<'a>(
+    entries: &'a [Entry],
+    release: &'a str,
+) -> impl Iterator<Item = RecordedWrite> + 'a {
+    entries.iter().rev().filter_map(move |entry| {
         if entry.kind != Kind::Event || entry.subject.as_deref() != Some(release) {
             return None;
         }

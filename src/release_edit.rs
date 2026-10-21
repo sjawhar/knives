@@ -373,23 +373,25 @@ fn apply_edit(
     let entry = fork.entry;
     let provenance = release::parent_sources(opened, entry, &entry.release_scheme(), new_parents)?;
     let message = release::composition_message(&release.name, &provenance, delta);
-    let created = knives::jj::write_release(
+    let written = knives::jj::write_release(
         &fork.checkout.path,
         &knives::jj::ReleaseWrite {
             source: Some(&release.commit),
             parents: new_parents,
             message: Some(&message),
             bookmark: Some(&release.name),
+            publish_remote: Some(entry.publish_remote()),
             operation: &format!("knives: {}: {delta}", release.name),
         },
     )?;
+    let created = &written.commit;
     record_edit_event(
         fork,
         opened,
         &EditRecord {
             release: &release.name,
             delta,
-            created: &created,
+            created,
             provenance: &provenance,
         },
         context.bound,
@@ -399,11 +401,33 @@ fn apply_edit(
         release.name,
         new_parents.len()
     );
+    report_replaced(repo, &release.name, &written);
     match knives::jj::conflicted_files(&fork.checkout.path, created.as_str()) {
         Ok(files) => println!("{}", release::conflict_guidance(&files)),
         Err(error) => println!("  could not list conflicts: {error}"),
     }
     Ok(Exit::Ok)
+}
+
+/// One line on the commit a release write replaced under `release`: abandoned,
+/// or kept with what rests on it. Silent when the write replaced nothing.
+pub(crate) fn report_replaced(
+    repo: &RepoName,
+    release: &str,
+    written: &knives::jj::ReleaseWritten,
+) {
+    let Some(replaced) = &written.replaced else {
+        return;
+    };
+    let old = replaced.commit.short();
+    match &replaced.kept {
+        None => println!("{repo}: abandoned {old}, the {release} commit this write replaced"),
+        Some(reason) => {
+            println!(
+                "{repo}: note: kept {old}, the {release} commit this write replaced: {reason}"
+            );
+        }
+    }
 }
 
 /// What one release edit wrote: the name, the delta, the new merge and its

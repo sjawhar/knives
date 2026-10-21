@@ -469,8 +469,8 @@ enum DropDisposition {
 /// audit's are: a conflicted replay onto a conflicted cut subject answers
 /// nothing either way. A member the cut subject does not carry refuses the cut,
 /// the previous cut's ledger event is the only surviving record of the
-/// composition — every edit moves the bookmark, and the next cut reaps the
-/// superseded commit. A refused candidate was never published and a refused
+/// composition — every edit moves the bookmark and abandons the commit it
+/// replaced. A refused candidate was never published and a refused
 /// record leaves origin as it was, so nothing is abandoned and nothing needs
 /// cleanup.
 fn report_uncarried_cut(

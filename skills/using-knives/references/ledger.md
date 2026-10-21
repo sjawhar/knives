@@ -72,7 +72,7 @@ A command records an event that it sees. A failed ledger write fails the command
 | `track --pr/--fork-only/--forget` | The changed statement. |
 | `depends --on` | `requires <owner>/<name>#<number>`, by upstream name, however `--on` spelled it. |
 | `release cut` | The full parent set, the cut change id beside the commit id, and the carried-parent delta from the prior cut. |
-| `release include/drop/advance/rebase` | `edited <release> as <commit> (change <id>) with <n> parent(s): <delta>; parents: …`. `audit` holds the release against the newest cut or edit event. |
+| `release include/drop/advance/rebase` | `edited <release> as <commit> (change <id>) with <n> parent(s): <delta>; parents: …`. `audit` holds the release against the commits its cut and edit events name. |
 | `sync` | Tracked PRs that merged, closed, reopened or advanced. First sightings are silent. So is a transition that the ledger already holds as the newest for that PR ([sharing](#sharing-between-machines)). |
 
 - Cut and edit events carry `parents` frontmatter: the full commit of each parent and **every** local bookmark on it. This lets a later `advance` or `include` find a member after a rebuild outside jj or an upstream merge. All names are kept, so the bookmark of another agent cannot hide the member name.

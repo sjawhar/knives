@@ -698,10 +698,12 @@ fn a_foreign_pull_request_can_be_fetched_and_carried_as_a_release_parent() {
             parents: &[trunk, fetched],
             message: Some("release: with a foreign PR"),
             bookmark: None,
+            publish_remote: None,
             operation: "knives: cut with a foreign PR",
         },
     )
-    .expect("merge");
+    .expect("merge")
+    .commit;
     let parents = knives::jj::Repo::open(&lab.second)
         .expect("open")
         .parents_of(merge.as_str())

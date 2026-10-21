@@ -297,7 +297,7 @@ knives consumers [FORK] [--consumer PATH]...
 knives pushed [BRANCH]... [--repo REPO]
                                compare local tips with the live remote refs that own them
 knives audit [REPO] [--all] [--no-github]
-                               reconcile remote refs, open pull heads, recorded cuts, and
+                               reconcile remote refs, open pull heads, recorded cuts and edits, and
                                anonymous heads, with one row of facts per maintained branch;
                                reports only, never repairs
 knives sync [REPO|--all]       fetch all remotes and tracked pull/N/head refs; classify each
@@ -345,8 +345,8 @@ It reports equal, missing, differing, and remote-only branch states, including a
 deleted locally while its remote ref remained. It changes neither remote nor local state.
 
 `knives audit` applies that same reconciliation across a repository (or every registry entry with
-`--all`), then checks open pull heads unless `--no-github`, zombie remote branches, recorded
-release-cut evidence, and anonymous heads. Its findings identify the observed drift; it never
+`--all`), then checks open pull heads unless `--no-github`, zombie remote branches, each release
+against the commits its recorded cuts and edits name, and anonymous heads. Its findings identify the observed drift; it never
 repairs, deletes, pushes, or opens a pull request. Per-pull history remains the separate,
 on-demand `knives pr <n> --timeline` read.
 
