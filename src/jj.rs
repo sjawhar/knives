@@ -1662,7 +1662,8 @@ pub struct ReleaseWrite<'a> {
     /// Commits earlier writes put under the bookmark, as the ledger records
     /// them. Each one that is a visible head nothing rests on — a replaced
     /// commit once kept for a working copy that has since moved on — is
-    /// abandoned in the same operation. Unknown ones are skipped.
+    /// abandoned in the same operation, unless the written commit carries
+    /// conflicts. Unknown ones are skipped.
     pub earlier: &'a [CommitId],
     /// The operation-log description, `knives: …` by convention.
     pub operation: &'a str,
@@ -1758,10 +1759,26 @@ pub fn write_release(repo: &Path, write: &ReleaseWrite<'_>) -> Result<ReleaseWri
                 kept,
             });
         }
+        // A stray is no published position this push replaces, so it gets no
+        // publish-ref exemption. While the written release carries conflicts,
+        // earlier writes are the record of their last resolution (on a fixed
+        // branch, the superseded cuts), so none is swept: reap's rule.
+        let stray_rules = MovedName {
+            name,
+            publish_remote: None,
+        };
         let written_id = commit_id(written.id());
-        for stray in unheld_heads(&repo, tx.repo(), write.earlier, &moved)? {
+        let strays = if written.has_conflict() {
+            Vec::new()
+        } else {
+            unheld_heads(&repo, tx.repo(), write.earlier, &stray_rules)?
+        };
+        for stray in strays {
             let stray_id = commit_id(stray.id());
-            if stray_id != written_id && write.source != Some(&stray_id) {
+            if stray_id != written_id
+                && write.source != Some(&stray_id)
+                && !write.parents.contains(&stray_id)
+            {
                 tx.repo_mut().record_abandoned_commit(&stray);
                 abandoned_earlier.push(stray_id);
             }

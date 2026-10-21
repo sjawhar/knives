@@ -1115,6 +1115,33 @@ fn cut_left_behind_by_a_parked_working_copy() -> (Lab, tempfile::TempDir, knives
 }
 
 #[test]
+fn the_sweep_keeps_a_left_behind_cut_a_bookmark_or_another_remote_ref_names() {
+    for named_by in ["bookmark", "remote ref"] {
+        // Given: a left-behind cut named by another bookmark, or by a remote
+        // ref of another name.
+        let (lab, home, cut) = cut_left_behind_by_a_parked_working_copy();
+        lab.jj_work(["bookmark", "create", "keep/cut", "-r", cut.as_str()]);
+        if named_by == "remote ref" {
+            lab.push_branch("keep/cut");
+            lab.jj_work(["bookmark", "forget", "keep/cut"]);
+        }
+        lab.branch("feat/gamma", "gamma.txt", "gamma\n");
+
+        // When: the release is edited again.
+        let output = knives_release(&lab, &home, &["include", "feat/gamma"]);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "{named_by}: {stdout}");
+
+        // Then: the cut stays.
+        assert!(is_visible(&lab, &cut), "{named_by}: a named cut was swept");
+        assert!(
+            !stdout.contains("an earlier release/2026-08-04 commit"),
+            "{named_by}: {stdout}"
+        );
+    }
+}
+
+#[test]
 fn the_next_edit_abandons_a_cut_a_working_copy_left_behind() {
     // Given: a cut kept for a parked working copy that has since moved on.
     let (lab, home, cut) = cut_left_behind_by_a_parked_working_copy();
