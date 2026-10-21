@@ -7,7 +7,7 @@
 
 #[path = "common/lab.rs"]
 mod lab;
-// allow: SIZE_OK: 1113 lines - real-binary gh passthrough scenarios share one fixture and process harness.
+// allow: SIZE_OK: 1667 lines - real-binary gh passthrough scenarios share one fixture and process harness.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
@@ -261,18 +261,19 @@ fn no_target_advice_names_r_only_for_commands_that_take_it() {
     let (dir, log) = fake_gh();
     let takes = "pass -R <owner>/<repo>";
     let account = "an App token cannot run it, and agent sessions have no ambient login";
-    let cases: [(&[&str], &str, bool); 16] = [
+    let named = "name the repository as <owner>/<repo>";
+    let cases: [(&[&str], &str, bool); 25] = [
         (&["api", "user"], "gh api repos/<owner>/<repo>", false),
-        (
-            &["repo", "view"],
-            "GH_REPO=<owner>/<repo> gh repo view",
-            false,
-        ),
-        (
-            &["repo", "clone", "x"],
-            "git clone https://<host>/<owner>/<repo>",
-            false,
-        ),
+        (&["repo", "view"], named, false),
+        (&["repo", "view", "--json", "name"], named, false),
+        (&["repo", "clone", "x"], named, false),
+        (&["repo", "fork"], named, false),
+        (&["repo", "edit"], named, false),
+        (&["repo", "delete"], named, false),
+        (&["repo", "archive"], named, false),
+        (&["repo", "unarchive"], named, false),
+        (&["repo", "sync"], named, false),
+        (&["repo", "set-default"], named, false),
         (
             &["repo", "list"],
             "GH_REPO=<owner>/<repo> gh repo list <owner>",
@@ -291,6 +292,7 @@ fn no_target_advice_names_r_only_for_commands_that_take_it() {
         (&["codespace", "list"], takes, true),
         (&["repo", "read-file", "x"], takes, true),
         (&["repo", "rename", "y"], takes, true),
+        (&["repo", "rename", "acme/y"], takes, true),
         (&["repo", "autolink", "list"], takes, true),
         (&["repo", "deploy-key", "list"], takes, true),
         (&["workflow", "list"], takes, true),
@@ -317,7 +319,7 @@ fn no_target_advice_names_r_only_for_commands_that_take_it() {
             takes_r,
             "{arguments:?}: {stderr}"
         );
-        if advice == account {
+        if advice == account || advice == named {
             assert!(!stderr.contains("GH_REPO"), "{arguments:?}: {stderr}");
         }
     }
@@ -549,6 +551,147 @@ fn gh_search_owner_and_repo_flags_route_the_token_and_print_no_hint() {
         assert!(recorded.contains(token), "{flags:?}: {recorded}");
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(!stderr.contains("no target repository"), "{stderr}");
+    }
+}
+
+#[test]
+fn a_repository_positional_routes_gh_repo_outside_a_checkout() {
+    // Given: a scratch directory with no remote and a helper that mints per owner.
+    let scratch = tempfile::tempdir().expect("scratch");
+    let helper_dir = fake_app_token();
+    let gitconfig = token_config(helper_dir.path(), "fallback");
+    let host = concat!("github", ".com");
+    let url = format!("https://{host}/acme/widgets");
+    let host_spec = format!("{host}/acme/widgets");
+    let cases: [&[&str]; 10] = [
+        &["repo", "view", "acme/widgets", "--json", "name"],
+        &["repo", "view", "--json", "name", "acme/widgets"],
+        &["repo", "view", "-b", "main", &url],
+        &["repo", "clone", "acme/widgets"],
+        &[
+            "repo",
+            "clone",
+            "-u",
+            "up",
+            &host_spec,
+            "dir",
+            "--",
+            "--depth=1",
+        ],
+        &["repo", "fork", "--org", "other", "acme/widgets"],
+        &["repo", "edit", "-h", "https://x.example", "acme/widgets"],
+        &["repo", "archive", "-y", "acme/widgets"],
+        &["repo", "sync", "-s", "other/source", "acme/widgets"],
+        &["repo", "set-default", "acme/widgets"],
+    ];
+    for arguments in cases {
+        let (dir, log) = fake_gh();
+
+        // When: knives invokes a gh repo subcommand that names its repository.
+        let output = knives_cmd(helper_dir.path())
+            .args(["gh", "--"])
+            .args(arguments)
+            .current_dir(scratch.path())
+            .env_remove("GH_REPO")
+            .env("KNIVES_REAL_GH", dir.path().join("gh"))
+            .env("FAKE_GH_LOG", &log)
+            .env("PATH", helper_path(helper_dir.path()))
+            .env("GIT_CONFIG_GLOBAL", &gitconfig)
+            .output()
+            .expect("run knives gh");
+
+        // Then: the named owner's token is used, gh sees the arguments unchanged,
+        // and no no-target line is printed.
+        let recorded = fs::read_to_string(&log).expect("fake gh ran");
+        assert!(
+            recorded.contains("GH_TOKEN=tok-acme"),
+            "{arguments:?}: {recorded}"
+        );
+        assert!(
+            recorded.starts_with(&format!("{}\n", arguments.join("\n"))),
+            "{arguments:?}: {recorded}"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains("no target repository"),
+            "{arguments:?}: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn a_repository_positional_beats_gh_repo_and_the_checkout_remote() {
+    // Given: a checkout whose origin is another owner's, GH_REPO naming a third, and
+    // a helper that mints per owner.
+    let lab = lab::Lab::new();
+    let host = concat!("github", ".com");
+    git_config(
+        &lab.work,
+        &["remote.origin.url", &format!("https://{host}/other/thing")],
+    );
+    let helper_dir = fake_app_token();
+    let gitconfig = token_config(helper_dir.path(), "fallback");
+    let (dir, log) = fake_gh();
+
+    // When: gh repo view names acme/widgets, the repository gh itself will read.
+    let output = knives_cmd(helper_dir.path())
+        .args(["gh", "--", "repo", "view", "acme/widgets"])
+        .current_dir(&lab.work)
+        .env("GH_REPO", "elsewhere/thing")
+        .env("KNIVES_REAL_GH", dir.path().join("gh"))
+        .env("FAKE_GH_LOG", &log)
+        .env("PATH", helper_path(helper_dir.path()))
+        .env("GIT_CONFIG_GLOBAL", &gitconfig)
+        .output()
+        .expect("run knives gh");
+
+    // Then: the token is acme's.
+    assert!(output.status.success(), "{output:?}");
+    let recorded = fs::read_to_string(&log).expect("fake gh ran");
+    assert!(recorded.contains("GH_TOKEN=tok-acme"), "{recorded}");
+}
+
+#[test]
+fn a_bare_or_renamed_repository_positional_does_not_route() {
+    // Given: a scratch directory with no remote and a helper that mints per owner.
+    let scratch = tempfile::tempdir().expect("scratch");
+    let helper_dir = fake_app_token();
+    let gitconfig = token_config(helper_dir.path(), "fallback");
+    // A bare name is a repository of the caller's own account, which knives cannot
+    // name; `rename`'s positional is the new name; `--json` takes the next word as
+    // its value; `list` names an owner, not a repository.
+    for arguments in [
+        &["repo", "clone", "widgets"][..],
+        &["repo", "rename", "acme/widgets"],
+        &["repo", "view", "--json", "acme/widgets"],
+        &["repo", "list", "acme/widgets"],
+    ] {
+        let (dir, log) = fake_gh();
+
+        // When: knives invokes it.
+        let output = knives_cmd(helper_dir.path())
+            .args(["gh", "--"])
+            .args(arguments)
+            .current_dir(scratch.path())
+            .env_remove("GH_REPO")
+            .env("KNIVES_REAL_GH", dir.path().join("gh"))
+            .env("FAKE_GH_LOG", &log)
+            .env("PATH", helper_path(helper_dir.path()))
+            .env("GIT_CONFIG_GLOBAL", &gitconfig)
+            .output()
+            .expect("run knives gh");
+
+        // Then: nothing routes, so no token is minted and the no-target line prints.
+        let recorded = fs::read_to_string(&log).expect("fake gh ran");
+        assert!(
+            recorded.contains("GH_TOKEN=unset"),
+            "{arguments:?}: {recorded}"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("no target repository"),
+            "{arguments:?}: {stderr}"
+        );
     }
 }
 

@@ -2,7 +2,7 @@
 //!
 //! This command executes `gh` directly, so the usual render/run split does not apply:
 //! there is no knives result to render.
-// allow: SIZE_OK: 1886 lines - single passthrough pipeline; splitting would separate resolution steps that read as one procedure.
+// allow: SIZE_OK: 2231 lines - single passthrough pipeline; splitting would separate resolution steps that read as one procedure.
 use std::collections::BTreeMap;
 use std::io::Read as _;
 use std::os::unix::{
@@ -215,6 +215,9 @@ fn no_target_remedy(args: &[String]) -> Option<&'static str> {
         | (Some("agent-task"), Some("create" | "view")) => {
             "pass -R <owner>/<repo>, or run from a checkout of it."
         }
+        (Some("repo"), Some(subcommand)) if repo_value_flags(subcommand).is_some() => {
+            "name the repository as <owner>/<repo> (gh repo view <owner>/<repo>, gh repo clone <owner>/<repo>), or run from a checkout of it."
+        }
         (Some("gist" | "ssh-key" | "gpg-key" | "org" | "status"), _) => {
             "no repository routes this command, an App token cannot run it, and agent sessions have no ambient login."
         }
@@ -222,7 +225,7 @@ fn no_target_remedy(args: &[String]) -> Option<&'static str> {
             "gh api takes no -R: put the owner in the path (gh api repos/<owner>/<repo>, gh api 'orgs/<org>/repos?per_page=100' --paginate), or set GH_REPO=<owner>/<repo>."
         }
         (Some("repo"), _) => {
-            "gh repo takes no -R here: set GH_REPO and name the repository or owner (GH_REPO=<owner>/<repo> gh repo view <owner>/<repo>, GH_REPO=<owner>/<repo> gh repo list <owner>), or use gh api repos/<owner>/<repo>, gh api 'orgs/<org>/repos?per_page=100' --paginate, or git clone https://<host>/<owner>/<repo>."
+            "gh repo takes no -R here: set GH_REPO and name the owner (GH_REPO=<owner>/<repo> gh repo list <owner>), or use gh api repos/<owner>/<repo> or gh api 'orgs/<org>/repos?per_page=100' --paginate."
         }
         _ => {
             "this command takes no -R: set GH_REPO=<owner>/<repo>, and name the repository where the command takes one."
@@ -813,14 +816,65 @@ fn is_owner_shaped(value: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
-/// The repository a command targets when its arguments carry no `-R`: gh's own
-/// `GH_REPO` override, applied whenever it is set and `-R` is absent, inside a
+/// The repository a command targets when its arguments name none (no `-R`, no
+/// `gh repo` repository positional): gh's own `GH_REPO` override, inside a
 /// checkout or not (shim parity has no equivalent; the shim predates scripts
 /// that target by environment).
 fn gh_repo_environment() -> Option<String> {
     std::env::var("GH_REPO")
         .ok()
         .filter(|spec| !spec.is_empty())
+}
+
+/// The flags that take a value in each `gh repo` subcommand whose first
+/// positional is the repository it acts on (gh 2.98 `--help`), or None for the
+/// other subcommands: `rename`'s positional is the new name and `list`'s an owner.
+fn repo_value_flags(subcommand: &str) -> Option<&'static [&'static str]> {
+    Some(match subcommand {
+        "view" => &["-b", "--branch", "-q", "--jq", "--json", "-t", "--template"],
+        "clone" => &["-u", "--upstream-remote-name"],
+        "fork" => &["--fork-name", "--org", "--remote-name"],
+        "edit" => &[
+            "--add-topic",
+            "--default-branch",
+            "-d",
+            "--description",
+            "-h",
+            "--homepage",
+            "--remove-topic",
+            "--squash-merge-commit-message",
+            "--visibility",
+        ],
+        "sync" => &["-b", "--branch", "-s", "--source"],
+        "delete" | "archive" | "unarchive" | "set-default" => &[],
+        _ => return None,
+    })
+}
+
+/// The repository a `gh repo view|clone|fork|…` call names as its first
+/// positional, which is the repository gh acts on whatever the checkout or
+/// `GH_REPO` says. A bare name is a repository of the caller's own account,
+/// whose owner knives cannot know, so only a spec with an owner counts.
+fn repo_positional(args: &[String]) -> Option<String> {
+    let args = before_terminator(args);
+    let mut words = args
+        .iter()
+        .enumerate()
+        .filter(|(_, argument)| !argument.starts_with('-'));
+    if words.next().map(|(_, word)| word.as_str()) != Some("repo") {
+        return None;
+    }
+    let (at, subcommand) = words.next()?;
+    let value_flags = repo_value_flags(subcommand)?;
+    let mut rest = args.get(at + 1..)?.iter();
+    while let Some(argument) = rest.next() {
+        if value_flags.contains(&argument.as_str()) {
+            rest.next();
+        } else if !argument.starts_with('-') {
+            return argument.contains('/').then(|| argument.clone());
+        }
+    }
+    None
 }
 
 /// The value of the first explicit repository flag (shim lines 137-150).
@@ -854,8 +908,9 @@ pub(crate) fn repo_flag(args: &[String]) -> Option<String> {
 ///
 /// Errs when routing needs git and the invocation sits inside a checkout whose
 /// git cannot be read — a broken worktree registration, say. Arguments that
-/// name the target themselves (`-R`, `GH_REPO`, a `gh api` owner) read no git
-/// and still resolve. The caller reports git's own words and stops: resolving
+/// name the target themselves (`-R`, a `gh repo` repository positional,
+/// `GH_REPO`, a `gh api` owner) read no git and still resolve. The caller
+/// reports git's own words and stops: resolving
 /// such a checkout to "no target" would run gh on ambient auth, which an agent
 /// session does not have, so the agent would see gh's login error instead of
 /// git's.
@@ -864,7 +919,9 @@ pub(crate) fn resolve_target_url(
     cwd: &Path,
 ) -> Result<Option<String>, crate::bind::BindError> {
     let api_owner = owner_from_api_args(args);
-    let repo_spec = repo_flag(args).or_else(gh_repo_environment);
+    let repo_spec = repo_flag(args)
+        .or_else(|| repo_positional(args))
+        .or_else(gh_repo_environment);
     let needs_git_inputs = api_owner.is_none() && repo_spec.is_none();
     let resolved_remote = needs_git_inputs.then(|| gh_resolved_remote(cwd)).flatten();
     let registry = needs_git_inputs
