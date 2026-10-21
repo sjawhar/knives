@@ -256,6 +256,50 @@ fn no_target_repository_says_so_before_gh_runs() {
 }
 
 #[test]
+fn no_target_advice_skips_r_for_commands_that_reject_it() {
+    // Given: a directory with no remote, and commands whose gh rejects -R.
+    let scratch = tempfile::tempdir().expect("scratch");
+    let (dir, log) = fake_gh();
+    let cases: [(&[&str], &str); 5] = [
+        (&["api", "user"], "gh api repos/<owner>/<repo>"),
+        (&["repo", "view"], "GH_REPO=<owner>/<repo> gh repo view"),
+        (
+            &["repo", "clone", "x"],
+            "git clone https://<host>/<owner>/<repo>",
+        ),
+        (
+            &["repo", "list"],
+            "orgs/<org>/repos?per_page=100' --paginate",
+        ),
+        (&["repo", "rename", "y"], "pass -R <owner>/<repo>"),
+    ];
+    for (arguments, advice) in cases {
+        // When: knives invokes gh on a call that names no repository.
+        let output = knives_cmd(scratch.path())
+            .arg("gh")
+            .arg("--")
+            .args(arguments)
+            .current_dir(scratch.path())
+            .env_remove("GH_TOKEN")
+            .env_remove("GH_REPO")
+            .env("KNIVES_REAL_GH", dir.path().join("gh"))
+            .env("FAKE_GH_LOG", &log)
+            .output()
+            .expect("run knives gh");
+
+        // Then: the advice names a spelling that command accepts.
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(advice), "{arguments:?}: {stderr}");
+        let takes_r = arguments.get(1) == Some(&"rename");
+        assert_eq!(
+            stderr.contains("pass -R"),
+            takes_r,
+            "{arguments:?}: {stderr}"
+        );
+    }
+}
+
+#[test]
 fn a_resolved_owner_prints_no_target_hint() {
     // Given: a call naming its repository with -R.
     let scratch = tempfile::tempdir().expect("scratch");

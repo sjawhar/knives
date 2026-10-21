@@ -103,8 +103,9 @@ pub fn run(args: &[String]) -> anyhow::Result<std::convert::Infallible> {
         };
         if resolved.is_none() {
             eprintln!(
-                "knives gh: no target repository (no -R/--repo flag, no owner in the api path, and no GitHub remote in {}); pass -R <owner>/<repo>, or run from a checkout of it. Setting GH_TOKEN bypasses App routing.",
-                cwd.display()
+                "knives gh: no target repository (no -R/--repo flag, no owner in the api path, and no GitHub remote in {}); {} Setting GH_TOKEN bypasses App routing.",
+                cwd.display(),
+                no_target_remedy(args)
             );
         }
         match resolved.as_deref().map(mint_token) {
@@ -184,6 +185,28 @@ pub fn run(args: &[String]) -> anyhow::Result<std::convert::Infallible> {
         gh_exit_code(&mut gh)
     };
     std::process::exit(exit_code);
+}
+
+/// What names a repository for this command when nothing routed it. `gh api` and
+/// most `gh repo` subcommands reject `-R` as an unknown flag, so for them the
+/// advice names the spellings that do route: an owner in the api path, `GH_REPO`,
+/// or a plain git clone.
+fn no_target_remedy(args: &[String]) -> &'static str {
+    let mut words = before_terminator(args)
+        .iter()
+        .filter(|argument| !argument.starts_with('-'))
+        .map(String::as_str);
+    match (words.next(), words.next()) {
+        (Some("api"), _) => {
+            "gh api takes no -R: put the owner in the path (gh api repos/<owner>/<repo>, gh api 'orgs/<org>/repos?per_page=100' --paginate), or set GH_REPO=<owner>/<repo>."
+        }
+        (Some("repo"), subcommand)
+            if !matches!(subcommand, Some("autolink" | "deploy-key" | "rename")) =>
+        {
+            "gh repo takes no -R here: set GH_REPO and name the repository (GH_REPO=<owner>/<repo> gh repo view <owner>/<repo>), or use gh api repos/<owner>/<repo>, gh api 'orgs/<org>/repos?per_page=100' --paginate, or git clone https://<host>/<owner>/<repo>."
+        }
+        _ => "pass -R <owner>/<repo>, or run from a checkout of it.",
+    }
 }
 
 /// Waits for gh while preserving its interactive terminal ownership and exit code.
