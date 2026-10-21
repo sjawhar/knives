@@ -1,43 +1,27 @@
 # Registry, checkout identity and plugin
 
-Read this for repository binding, `knives register`, scan failures or registry,
-trust and plugin options. No knives command edits `repos.toml`.
+For repository binding, `knives register`, scan failures, and registry, trust or plugin options. No knives command edits `repos.toml`.
 
 ## The three remotes
 
-- `upstream`: repository we contribute to, only through a PR.
-- `origin`: our fork, holding ordinary pushed branches and PR heads.
-- `release`: optional distinct publication location for internal consumption.
-  If absent or explicitly equal to origin, the publish remote is `origin`.
+- `upstream` takes our work only through a PR.
+- `origin` is our fork, with ordinary branches and PR heads.
+- `release` is an optional separate publish location. When it is absent or equal to origin, publish to `origin`.
 
-Remote roles are not interchangeable. Reports can compare local release state
-with the live publish remote; origin's matching release ref does not prove a
-separate release remote has it.
+Roles do not substitute. A release ref on origin does not prove that a separate release remote has it.
 
 ## `knives register [DIR]`
 
-Prints a paste-ready `[repos.<name>]` TOML entry to stdout, instructions to stderr.
-Default DIR is the current directory; any subdirectory or `start` workspace of a
-checkout works. If its upstream is already registered, prints `already registered
-as <name>` and exits `0`: one upstream cannot identify two entries. A fork that
-releases on more than one base is still one entry: declare the extra bases as
-release series (below), not as a second entry.
+Prints a `[repos.<name>]` TOML entry to stdout, with instructions on stderr. DIR defaults to the current directory. A subdirectory or `start` workspace also works. An upstream that is already registered prints `already registered as <name>`, exit `0`.
 
-The caller/human pastes the snippet into `repos.toml`, replacing any existing
-section of that name rather than appending a duplicate. Registry edits take
-effect at the next hook event/tool call; no daemon or service restart is needed.
-
-Requires the `upstream` and `origin` remotes; `release` is optional. A missing
-required remote refusal names available remotes. A plain Git clone with no jj
-store is refused (the hook binds those; fork verbs do not), as is non-colocated
-jj (`.jj` without `.git`). An untracked remote resembling another fork of the
-same upstream, compared case-insensitively by host/owner/slug, produces a warning:
-origin must identify our own fork.
+- Paste the entry into `repos.toml`. Replace any section of that name, and never add a duplicate. It takes effect at the next hook event. Nothing needs a restart.
+- It needs the `upstream` and `origin` remotes. The refusal names the remotes it found.
+- It refuses a plain Git clone with no jj store (the hook binds those, fork verbs do not). It also refuses non-colocated jj (`.jj` without `.git`).
+- An untracked remote that looks like another fork of the same upstream (host, owner, slug, any case) gives a warning. Origin must be our own fork.
 
 ## Registry fields
 
-`~/.config/knives/repos.toml` names repository identities and trust rules, not
-checkout paths. `workspaces` and trust roots have their own path meanings.
+`~/.config/knives/repos.toml` holds repository identities and trust rules, not checkout paths. Only `workspaces` and trust `roots` name paths, each with its own meaning.
 
 ```toml
 [repos.libcore]
@@ -70,163 +54,67 @@ owners = ["ours", "company"]
 roots = ["~/projects/company"]
 ```
 
-`upstream` and `origin` are required. Two entries cannot share upstream, nor an
-upstream `<owner>/<name>` on different forges: a fork's ledger, claims and
-branch statements are kept under that name, which has no host, so the two would
-merge. That name is a directory under the ledger, so an upstream whose owner or
-name is empty, `.`, `..` or `.git`, or holds a `\` or a control character, is
-refused. A `path` field is refused. Optional fields:
+`upstream` and `origin` are required. knives refuses these:
 
-- `base`: upstream trunk used for branching, trunk probes and PR targets;
-  defaults to `main`. Upstreams using another trunk, such as `dev`, state it here.
-- `release`: distinct publish URL; defaults to origin.
-- `release_branch`: fixed release name instead of dated cuts. Cannot be empty,
-  equal to base, or under the `release/` prefix. Cannot be combined with `series`.
-- `series.<name>`: a named release series with its own `base`, beside the
-  default series (the entry's own `base`, cutting `release/YYYY-MM-DD[.N]`). A
-  named series cuts `release/<name>/YYYY-MM-DD[.N]`; select it with
-  `knives release --series <name> …`. `base_remote` (`upstream`, the default,
-  or `origin`) says which remote holds the base; a base pinned on the fork, such
-  as a frozen version branch, uses `origin`. The name is one `/`-free segment
-  and cannot look like a date; each series' base must differ from every other's
-  and the default trunk, and cannot sit under `release/`. A branch belongs to
-  the series whose base it forks from latest: a cut composes only its series'
-  branches, and `include`/`advance` refuse a branch of another series or of
-  none, saying which. Every series' base must resolve, or every release verb
-  refuses. The name must also be a valid git ref segment (no space, `~`, `^`,
-  `:`, `?`, `*`, `[`, `\`, `..` or `@{`). An entry without `series` keeps its
-  behaviour, except that a multi-segment `release/x/y` ref is no longer read as
-  one of its dated cuts or pins.
-- `consumers`: forge `owner/repo` slugs whose trunks pin releases. Cached by
-  consumer commit; ad-hoc local paths belong in `--consumer PATH`, not this list.
-- `workspaces`: parent directory for `start` workspaces and `finish` cleanup.
-  Default is beside the checkout, fitting `<name>/default` with sibling
-  workspaces. Set it for a checkout at `~/<name>` to avoid putting branches
-  directly in home. `~` expands; relative values resolve from the config
-  directory, so write `~/…`. `start` and `finish` refuse a value inside checkout.
-- `forbidden`: identifiers an upstream-bound diff must not add, such as our
-  organization, product or hosts. Audit scans case-insensitive substrings on
-  added lines since the upstream fork point. Fork-only branches are exempt.
-  Blank terms or case-insensitive duplicates are refused with the entry named.
-  Absent/empty means no scan and no `forbidden` field. Audit reports hits, never
-  blocks on them; no other command reads the list.
-- `ledger`: the `<owner>/<name>` of the repository this fork's ledger belongs
-  to, through which its entries travel between machines. The name may start
-  with a dot (`someone/.knives-ledger`); the owner may not. Letter case and a
-  `.git` suffix do not matter: knives keeps the value lowercase and without the
-  suffix, the spelling `knives repos` reports. Absent, the fork's ledger is not
-  shared: it stays on each machine that writes it. A machine carries the fork's
-  entries through the git directory over its ledger root whose `origin` is that
-  repository, `~/.config/knives/ledger/.git` or one in
-  `~/.config/knives/ledger-repositories/`, and which names the machine as
-  `knives.machine` in its git config; the
-  [ledger reference](ledger.md#sharing-between-machines) has the setup.
-  Refused when it is not `<owner>/<name>`, or when the fork's `upstream` is a
-  filesystem path, which names no repository another machine could share.
-  Every entry refuses a field it does not know, so an older knives refuses a
-  file that sets `ledger`: upgrade knives on every machine that reads the file
-  before adding it.
+- two entries with one upstream, or one upstream `<owner>/<name>` on two forges. The fork's ledger, claims and statements are kept under that name, which has no host.
+- an owner or name that is empty, `.`, `..` or `.git`, or that holds `\` or a control character.
+- a `path` field.
+
+| Field | Meaning |
+|---|---|
+| `base` | Upstream trunk for branching, trunk probes and PR targets. Default `main`. Set it for another trunk, such as `dev`. |
+| `release` | Separate publish URL. Default: origin. |
+| `release_branch` | Fixed release name instead of dated cuts. Not empty, not `base`, not under `release/`. |
+| `consumers` | Forge `owner/repo` slugs whose trunks pin releases, cached by consumer commit. Local paths go in `--consumer PATH`. |
+| `workspaces` | Parent directory of `start` workspaces and of `finish` cleanup. Default: beside the checkout, which fits `<name>/default`. Set it for a checkout at `~/<name>`. `~` expands. A relative value resolves from the config directory, so write `~/…`. `start` and `finish` refuse a value inside the checkout. |
+| `forbidden` | Terms that an upstream-bound diff must not add (our org, product, hosts). Audit scans added lines since the upstream fork point for case-insensitive substrings. Fork-only branches are exempt. Blank terms and case-insensitive duplicates are refused, with the entry named. Absent or empty: no scan and no field. Audit reports hits and never blocks. Nothing else reads it. |
+| `ledger` | `<owner>/<name>` of the repository the fork's ledger travels through. The name can start with a dot (`someone/.knives-ledger`), the owner cannot. Case and `.git` do not matter. knives keeps it lowercase without the suffix, as `knives repos` shows. Absent: the ledger stays on each machine. Refused when it is not `<owner>/<name>`, or when `upstream` is a filesystem path. Setup: [sharing](ledger.md#sharing-between-machines). |
+
+Every entry refuses unknown fields. Thus an older knives refuses a file that sets `ledger`. Upgrade knives on every machine that reads the file before you add it.
 
 ## How a checkout is found
 
-The entry is identified by its upstream matching the checkout's upstream remote;
-case, trailing slash and `.git` suffix do not matter. Standing inside it or a
-`start` workspace binds it. Origin/release mismatches do not prevent binding;
-status and repos note `origin remote is <X>; registry says <Y>` (or release).
+- An entry binds to a checkout whose `upstream` remote matches it. Case, a trailing slash and `.git` do not matter. Standing in the checkout or a `start` workspace binds it.
+- An origin or release mismatch still binds. Status and repos note `origin remote is <X>; registry says <Y>` (or the same for release).
+- When origin matches an entry but upstream matches none, nothing binds. One side was renamed, and you choose which spelling is right. `status` inside the checkout shows the entry row with the problem. `repos`, `status --all` and a named repo show it in place of `not on this machine`. The hook puts it in context in place of the claims notice. Each names the checkout, the entry, both upstream spellings and the two fixes: `git -C <checkout> remote set-url upstream <registry's>`, or `upstream = "<checkout's>"` in `repos.toml`.
+- From elsewhere, a named repo and sweeps scan HOME to depth three. `repos` **always** scans, even inside a checkout outside that scope. Two matches are refused with both paths. An absent checkout is never guessed.
+- The scan selects a `.git` directory beside a real `.jj` directory. It skips dot-directories, follows no symlinks, and stops below a `.jj`. A plain Git repository is not managed and does not hide forks under it.
+- The scan does not select workspaces (a `.git` file). They bind when you stand inside. It skips non-colocated `.jj` silently, and a fork verb inside one refuses.
+- A checkout deeper than three or outside HOME binds when you stand inside it, for every command except `repos`. With HOME unset, the exit is `2` with `HOME is not set; knives scans $HOME for checkouts`. knives never scans `/`.
+- knives needs colocated jj, at the jj build that the fleet's tool config names, which matches the embedded jj-lib. Workspace `.git` files come from jj colocated worktree support (after 0.45.0, jj-vcs/jj#9941). `jj workspace add` makes one from a colocated workspace with `git.colocate` true, or with `--colocate`. This does not authorize a change to shared tool versions.
 
-A checkout whose origin remote is an entry's but whose upstream remote matches
-no entry does not bind: one side was renamed and the other was not, and which
-spelling is right is yours to choose. Standing inside it, `status` reports the
-entry's row with the problem; `repos`, `status --all` and naming the repo report
-it in place of `not on this machine`; the session hook puts it in the agent's
-context in place of the claims notice. Each names the checkout, the entry, both
-upstream spellings and the two fixes: `git -C <checkout> remote set-url upstream
-<registry's>`, or `upstream = "<checkout's>"` under the entry in `repos.toml`.
+### Missing, ambiguous and unreadable results
 
-From elsewhere, naming a repo and sweeps scan HOME to depth three. `repos`
-**always** scans, including when invoked inside a checkout outside that scope.
-Two matching checkouts are refused with both paths; an absent one is not guessed.
-
-The scan:
-
-- Selects a `.git` directory beside a real `.jj` directory.
-- Skips dot-prefixed directories, follows no symlinks and does not descend below
-  a `.jj`. A plain Git repository is not a managed checkout and does not hide
-  forks beneath it.
-- Does not select workspaces with a `.git` file; they bind when you stand inside.
-- Passes over non-colocated `.jj` without `.git` in silence. A fork verb run
-  inside one refuses, explaining that knives reads a checkout through Git.
-
-A deeper-than-three or outside-HOME checkout binds when you stand inside, for
-every command except scan-only `repos`. HOME must be set: otherwise usage exit
-`2`, `HOME is not set; knives scans $HOME for checkouts`, never a scan of `/`.
-
-Knives needs colocated jj and the jj build named by the fleet's tool config,
-matching the embedded jj-lib. Workspace `.git` files come from jj's colocated
-Git-worktree support (after 0.45.0, jj-vcs/jj#9941). `jj workspace add` supplies
-one by default from a colocated workspace with `git.colocate` true; `--colocate`
-forces it. This manual does not authorize changing shared tool versions.
-
-### Missing, ambiguous and unreadable scan results
-
-`repos` lists every registry entry: unplaced ones have no release state;
-ambiguous/unreadable candidates are problems. An unreadable checkout's remotes
-are reported while an entry remains unplaced because it may be that checkout.
-Once every entry is placed, that candidate error is dropped. A directory the
-scan could not list is always reported.
-
-A named repo's refusal appends `; could not read: <what>` for scan errors.
-`repos` uses `?` problem lines; `status --all`, `sync --all` and `audit --all`
-print `could not read: <what>` once on stderr in every output format.
-
-A sweep omits a **definitely missing** entry, printing
-`knives: <name>: not on this machine` to stderr, and exits according to entries
-it did inspect. It does not promise a document row per registry entry.
-Ambiguous entries stay as problem rows, and so do entries found only under a
-disagreeing upstream. If scan errors could conceal a missing checkout, that
-entry also stays as a problem row; it is not treated as known absence. Status
-prefixes such a row's problem with `could not gather:`.
+- `repos` lists every entry. An unplaced entry has no release state. Ambiguous or unreadable candidates are problems.
+- An unreadable checkout stays in the report while any entry is unplaced, because it can be that entry. It is dropped when all entries are placed. A directory the scan could not list is always reported.
+- A named repo's refusal adds `; could not read: <what>`. `repos` prints `?` lines. `status --all`, `sync --all` and `audit --all` print `could not read: <what>` once on stderr, in every output format.
+- A sweep leaves out a **definitely missing** entry, with `knives: <name>: not on this machine` on stderr. It exits by the entries it inspected and does not promise one row per entry.
+- These stay as problem rows: ambiguous entries, entries found only under a disagreeing upstream, and entries that scan errors could hide. Status starts such a problem with `could not gather:`.
 
 ## Trust is guidance injection, not fork access
 
-A managed fork entry grants no trust. To inject its instructions, add a trust
-rule independently:
+A fork entry grants no trust. Add a trust rule separately:
 
-- `repos`: forge slugs; any checkout remote naming that repository matches.
-  Non-slug values are refused.
-- `owners`: forge organization/user names; any checkout remote under one matches.
-- `roots`: directory subtrees containing trusted repositories.
+- `repos`: forge slugs. Any checkout remote that names the repository matches. Non-slugs are refused.
+- `owners`: forge users or orgs. Any remote under one matches.
+- `roots`: directory subtrees.
 
-**Security boundary:** repo/owner matches are based on self-declared remote URLs,
-not forge-authenticated identity. A checkout declaring a trusted remote matches.
-Prefer roots when uncertain. Knives reads only the candidate checkout's local
-Git config, not user/system config or environment overrides such as `GIT_DIR`,
-`GIT_WORK_TREE` and any `GIT_CONFIG_*`.
+**Security boundary:** repo and owner rules match self-declared remote URLs, not forge identity. A checkout that declares a trusted remote matches. Prefer `roots` when unsure. knives reads only the local Git config of the checkout. It never reads user or system config, or `GIT_DIR`, `GIT_WORK_TREE` and `GIT_CONFIG_*`.
 
-Identity starts at the nearest `.git`, a marker Git refuses to deliver as cloned
-content. A `.jj` of any shape can be committed as content, so `.jj` without `.git`
-is not a repository identity; `.jj` beneath `.git` is that repository's content
-and receives its verdict. A nested repository cannot borrow an enclosing
-checkout's identity; a cloned tree has its own `.git` and remotes. Identity
-resolution never runs jj, so it cannot write into another checkout.
-A checkout with no remotes matches only via roots.
-
-Trust permits **guidance-as-data injection only**, never fork-command access.
+- Identity starts at the nearest `.git`, which Git does not clone as content. A `.jj` can be content, so `.jj` without `.git` is not an identity. A `.jj` under `.git` gets that repository's verdict.
+- A nested repository never borrows an outer identity. Identity never runs jj, so it cannot write into another checkout. A checkout with no remotes matches only by `roots`.
+- Trust allows **guidance-as-data injection only**, never fork-command access.
 
 ## OpenCode plugin
 
-Ships alongside the CLI. Once per repository per session, when a call first
-names a file in a registered repository, the plugin announces that the fork is
-managed/shared and names claims. It appends trusted repository instructions as
-**data**; a fork entry alone brings the notice, not guidance. An instruction file whose text the
-session already holds is left out: one its system prompt carries (under oh-my-pi, whose adapter
-passes the prompt along, that includes the session's own `AGENTS.md`), or the same text injected
-earlier in the session from any checkout, until compaction. Under oh-my-pi, "held" also means
-still in the model's context: when shake, pruning or compaction removes an injected block, the
-next call touching that repository injects it again, once. It supplies `KNIVES_OWNER` to shell
-environments.
+Ships with the CLI. A call can first name a file in a registered repository. Then, once per repository per session, the plugin says that the fork is managed and shared, and names claims.
 
-The entry in `opencode.json` has three options, all defaulting on:
+- It appends trusted repository instructions as **data**. A fork entry alone gives the notice, not guidance.
+- It skips an instruction file that the session already holds, until compaction. That is a file in its system prompt (under oh-my-pi, also the session's own `AGENTS.md`). It is also a file injected earlier in the session from any checkout.
+- Under oh-my-pi, when shake, pruning or compaction removes an injected block, the next call to that repository injects it again, once.
+- It sets `KNIVES_OWNER` in shells.
+
+In `opencode.json`, all options default on:
 
 ```jsonc
 "plugin": [
