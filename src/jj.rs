@@ -767,7 +767,9 @@ impl Repo {
             // `@git` is jj's internal git-tracking view rather than a remote, and is
             // excluded everywhere else in this codebase for the same reason.
             // A fetched head is our own pull request, not someone else carrying the work.
+            // Another series' cut carries that series' members by construction too.
             if is_our_release(&reference, scheme, publish_remote)
+                || crate::ids::is_our_dated_cut(&reference, publish_remote)
                 || reference.is_git_view()
                 || pull_number_from_bookmark(reference.branch().as_str()).is_some()
             {

@@ -411,6 +411,12 @@ pub enum Command {
         /// by several things sitting on different releases.
         #[arg(long)]
         consumer: Vec<PathBuf>,
+        /// The release series to act on, one of the entry's `[repos.<name>.series]`.
+        /// Omitted, the default series: the entry's own `base` and its
+        /// `release/YYYY-MM-DD[.N]` cuts. Every subcommand sees only that
+        /// series' cuts and the branches that fork from its base.
+        #[arg(long, global = true)]
+        series: Option<String>,
     },
     /// Carry this machine's ledger to the machines that share it, or move what
     /// an older knives kept in `state.json` onto it.

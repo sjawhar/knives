@@ -322,7 +322,7 @@ fn a_fixed_release_branch_is_cut_in_place_and_its_previous_position_is_the_old_c
     let carried = knives::release_model::carried_branches(&opened, entry.trunk(), &scheme)
         .expect("carried branches");
     let trunk = opened
-        .resolve_commit(&entry.upstream_trunk())
+        .resolve_commit(&entry.trunk_ref())
         .expect("upstream trunk");
     let mut parents = vec![trunk];
     parents.extend(carried.into_iter().map(|(_, commit)| commit));
@@ -357,7 +357,7 @@ fn a_fixed_release_branch_is_cut_in_place_and_its_previous_position_is_the_old_c
     let carried = knives::release_model::carried_branches(&opened, entry.trunk(), &scheme)
         .expect("carried branches for second cut");
     let trunk = opened
-        .resolve_commit(&entry.upstream_trunk())
+        .resolve_commit(&entry.trunk_ref())
         .expect("upstream trunk for second cut");
     let mut parents = vec![trunk];
     parents.extend(carried.into_iter().map(|(_, commit)| commit));
@@ -585,7 +585,7 @@ fn plan_for_a_fixed_release_ignores_a_non_publish_remote() {
     let carried = knives::release_model::carried_branches(&opened, entry.trunk(), &scheme)
         .expect("carried branches");
     let trunk = opened
-        .resolve_commit(&entry.upstream_trunk())
+        .resolve_commit(&entry.trunk_ref())
         .expect("upstream trunk");
     let mut parents = vec![trunk];
     parents.extend(carried.into_iter().map(|(_, commit)| commit));

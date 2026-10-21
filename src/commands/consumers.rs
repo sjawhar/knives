@@ -10,7 +10,7 @@ use crate::config::{RepoEntry, Role};
 use crate::consumer_pins::{
     ConsumerHeadMemo, ConsumerPinSource, scan_consumer_for, scan_consumer_slug_with_heads,
 };
-use crate::ids::{CommitId, ReleaseScheme, short_id, strict_dated_release};
+use crate::ids::{CommitId, ReleaseScheme, short_id};
 use crate::jj::{self, Repo};
 use crate::pins::{Pin, PinVerdict};
 use crate::release_model::{ConsumerScan, newest_release, repo_slug};
@@ -236,6 +236,7 @@ fn local_positions(
 fn release_pattern(scheme: &ReleaseScheme) -> String {
     match scheme {
         ReleaseScheme::Dated => "refs/heads/release/*".to_owned(),
+        ReleaseScheme::Series(series) => format!("refs/heads/release/{series}/*"),
         ReleaseScheme::Fixed(name) => format!("refs/heads/{name}"),
     }
 }
@@ -245,11 +246,11 @@ fn newest_live(
     scheme: &ReleaseScheme,
 ) -> Option<(String, CommitId)> {
     match scheme {
-        ReleaseScheme::Dated => refs
+        ReleaseScheme::Dated | ReleaseScheme::Series(_) => refs
             .iter()
             .filter_map(|(full, commit)| {
                 let name = full.strip_prefix("refs/heads/")?;
-                strict_dated_release(name).map(|order| (order, name, commit))
+                scheme.dated_cut(name).map(|order| (order, name, commit))
             })
             .max_by_key(|(order, _, _)| order.clone())
             .map(|(_, name, commit)| (name.to_owned(), commit.clone())),

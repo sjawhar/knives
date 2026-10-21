@@ -269,10 +269,23 @@ fn dispatch() -> anyhow::Result<Exit> {
             action,
             repo,
             consumer,
+            series,
         } => {
             let ground = grounded(&loaded)?;
             let Some(fork) = ground.one_fork(repo.as_deref())? else {
                 return Ok(Exit::Usage);
+            };
+            let selected = match series.as_deref().map(|name| fork.entry.for_series(name)) {
+                None => None,
+                Some(Ok(entry)) => Some(entry),
+                Some(Err(message)) => {
+                    eprintln!("{}: {message}", fork.name);
+                    return Ok(Exit::Usage);
+                }
+            };
+            let fork = match &selected {
+                Some(entry) => knives::bind::Fork { entry, ..fork },
+                None => fork,
             };
             let extra: Vec<&std::path::Path> =
                 consumer.iter().map(std::path::PathBuf::as_path).collect();

@@ -191,7 +191,7 @@ fn template_for_pulls(report: &mut Report, input: &AuditInput<'_>) -> Option<Tem
     read_template(&input.fork.checkout.path, entry).unwrap_or_else(|error| {
         report.problems.push(format!(
             "could not read the pull-request template at {}: {error}",
-            entry.upstream_trunk()
+            entry.trunk_ref()
         ));
         None
     })

@@ -264,7 +264,7 @@ fn edit_release(
     ) == release::RepairEffect::NewDatedName
     {
         match entry.release_scheme() {
-            ReleaseScheme::Dated => println!(
+            ReleaseScheme::Dated | ReleaseScheme::Series(_) => println!(
                 "{repo}: every pin of {release_name} is frozen, so editing it would reach \
                  nobody; cut a new dated release first"
             ),
@@ -280,11 +280,11 @@ fn edit_release(
     // unresolvable trunk would make every base look like a member — include
     // would refuse for the wrong reason, and drop or advance could touch the
     // base, which is `rebase`'s domain.
-    if opened.resolve_commit(&entry.upstream_trunk()).is_err() {
+    if opened.resolve_commit(&entry.trunk_ref()).is_err() {
         println!(
             "{repo}: cannot resolve {}; release edits classify parents against the upstream \
              trunk, so fetch upstream first",
-            entry.upstream_trunk()
+            entry.trunk_ref()
         );
         return Ok(Exit::Incomplete);
     }

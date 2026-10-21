@@ -69,7 +69,7 @@ pub(super) fn add_branch_overlap_findings(
     let path = &fork.checkout.path;
     let started = std::time::Instant::now();
     let rows = &report.branches;
-    let upstream_trunk = entry.upstream_trunk();
+    let upstream_trunk = entry.trunk_ref();
     let outcomes: Vec<BranchOverlapOutcome> = if rows.is_empty() {
         Vec::new()
     } else {

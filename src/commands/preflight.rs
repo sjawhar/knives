@@ -317,11 +317,7 @@ fn branch_states_with_findings(
     let repo = Repo::open(&fork.checkout.path)?;
     let tips = repo.bookmark_tips()?;
     let scheme = entry.release_scheme();
-    let ignored: BTreeSet<crate::ids::BookmarkRef> =
-        crate::commands::release::superseded_dated_releases(&tips, entry.publish_remote())
-            .into_iter()
-            .map(|(reference, _)| reference)
-            .collect();
+    let ignored = crate::commands::release::superseded_cuts_of_every_series(&tips, entry);
     let divergent: std::collections::BTreeSet<String> =
         divergent_changes(&repo.divergent_changes(&ignored)?)
             .into_iter()
