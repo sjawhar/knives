@@ -95,6 +95,7 @@ Run it before any `jj rebase -b`, `-s` or `-r` of a branch. When a release ref h
 
 1. **Scheme check.** Get `newest_release` from `knives status` or `knives repos`, and set `RELEASE_REFS` for this repository's scheme:
    - `release/YYYY-MM-DD[.N]` (dated, the default, no `release_branch`): `bookmarks(glob:"release/*") | remote_bookmarks(glob:"release/*")`. The glob also catches an older cut not yet reaped.
+   - Named release series (`[repos.<name>.series.<series>]`, each on its own base) cut `release/<series>/YYYY-MM-DD[.N]`. `status` and `repos` never show them: read them with `knives release --series <series>`. The dated glob above covers every series' cuts.
    - Any other name, such as `integration` (fixed: the one `release_branch` under `[repos.<name>]` in `repos.toml`, never with the prefix `release/`): `bookmarks(exact:"<name>") | remote_bookmarks(exact:"<name>")`. The dated glob never matches it, so the dated term hides a fixed-scheme member.
 2. Run `jj log -r '(::<branch> | <branch>::) & (RELEASE_REFS | bookmarks(glob:"keep/*") | remote_bookmarks(glob:"keep/*"))'`. Use this fork's retention convention if it is not `keep/*`. Do not add `~ ::trunk()`: a release or keep ref is never an ancestor of its trunk.
 3. **Empty:** the branch is alone. Use `jj rebase -b <branch> -d <trunk>@upstream`. It keeps the change ids, so `knives release advance <branch>` follows.

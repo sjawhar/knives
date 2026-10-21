@@ -12,7 +12,7 @@ Roles do not substitute. A release ref on origin does not prove that a separate 
 
 ## `knives register [DIR]`
 
-Prints a `[repos.<name>]` TOML entry to stdout, with instructions on stderr. DIR defaults to the current directory. A subdirectory or `start` workspace also works. An upstream that is already registered prints `already registered as <name>`, exit `0`.
+Prints a `[repos.<name>]` TOML entry to stdout, with instructions on stderr. DIR defaults to the current directory. A subdirectory or `start` workspace also works. An upstream that is already registered prints `already registered as <name>`, exit `0`. A fork that releases on more than one base is still one entry. Declare the extra bases as release series (below), not as a second entry.
 
 - Paste the entry into `repos.toml`. Replace any section of that name, and never add a duplicate. It takes effect at the next hook event. Nothing needs a restart.
 - It needs the `upstream` and `origin` remotes. The refusal names the remotes it found.
@@ -64,7 +64,8 @@ roots = ["~/projects/company"]
 |---|---|
 | `base` | Upstream trunk for branching, trunk probes and PR targets. Default `main`. Set it for another trunk, such as `dev`. |
 | `release` | Separate publish URL. Default: origin. |
-| `release_branch` | Fixed release name instead of dated cuts. Not empty, not `base`, not under `release/`. |
+| `release_branch` | Fixed release name instead of dated cuts. Not empty, not `base`, not under `release/`. Not combined with `series`. |
+| `series.<name>` | A named release series with its own `base`. The default series is the entry's own `base`, which cuts `release/YYYY-MM-DD[.N]`. A named series cuts `release/<name>/YYYY-MM-DD[.N]`. Select it with `knives release --series <name> …`. `base_remote` (`upstream`, the default, or `origin`) names the remote that holds the base. A base pinned on the fork, such as a frozen version branch, uses `origin`. The name is one `/`-free segment that does not look like a date. It is a valid git ref segment (no space, `~`, `^`, `:`, `?`, `*`, `[`, `\\`, `..` or `@{`). Each series' base differs from every other base and from the default trunk, and is not under `release/`. A branch belongs to the series whose base it forks from latest. A cut composes only its series' branches, and `include` or `advance` refuses a branch of another series or of none, and says which. Every series' base must resolve, or every release verb refuses. An entry without `series` keeps its behavior, except that a multi-segment `release/x/y` ref is no longer read as one of its dated cuts or pins. |
 | `consumers` | Forge `owner/repo` slugs whose trunks pin releases, cached by consumer commit. Local paths go in `--consumer PATH`. |
 | `workspaces` | Parent directory of `start` workspaces and of `finish` cleanup. Default: beside the checkout, which fits `<name>/default`. Set it for a checkout at `~/<name>`. `~` expands. A relative value resolves from the config directory, so write `~/…`. `start` and `finish` refuse a value inside the checkout. |
 | `forbidden` | Terms that an upstream-bound diff must not add (our org, product, hosts). Audit scans added lines since the upstream fork point for case-insensitive substrings. Fork-only branches are exempt. Blank terms and case-insensitive duplicates are refused, with the entry named. Absent or empty: no scan and no field. Audit reports hits and never blocks. Nothing else reads it. |
