@@ -66,7 +66,7 @@ With no readable pid, it says `holder unknown, lock written 73s ago`. The sighti
 
 ## `knives finish <branch>`
 
-Releases the claim and removes the workspace. It forgets the workspace in jj, removes the directory, and clears the stale Git worktree registration. `start` also clears a stale registration at its own path.
+Releases the claim and removes the workspace. It forgets the workspace in jj, removes the directory, and clears the stale Git worktree registration, unlocking it first if it is locked. `start` also clears a stale registration at its own path, but leaves a locked one alone.
 
 - Finish when active work stops, also for a wait such as review. A claim means "working here now".
 - The branch, bookmark and PR stay. jj already put tracked files into a commit that its change id reaches. `--no-cleanup` keeps the directory for untracked files (build output, `.env`).

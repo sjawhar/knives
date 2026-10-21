@@ -570,6 +570,13 @@ fn start_clears_a_prunable_git_registration_at_its_path() {
     let workspace = lab.work.parent().expect("parent").join("feat-alpha");
     knives::jj::add_workspace(&lab.work, "feat-alpha", &workspace, "main@upstream")
         .expect("add the workspace");
+    // A wrapper on PATH may lock every worktree it adds, and git never calls a
+    // locked registration prunable; this case is the unlocked one.
+    let _ = Command::new("git")
+        .args(["worktree", "unlock"])
+        .arg(&workspace)
+        .current_dir(&lab.work)
+        .output();
     std::fs::remove_dir_all(&workspace).expect("remove the directory first");
     knives::jj::forget_workspace(&lab.work, "feat-alpha").expect("forget the workspace");
     let before = git_worktrees(&lab.work);

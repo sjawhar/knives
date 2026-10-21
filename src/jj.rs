@@ -1305,26 +1305,64 @@ fn is_empty_directory(directory: &Path) -> bool {
 /// directory removed before the forget (by hand, or by a jj that did not
 /// unlink) leaves the registration behind, and the next `add` at that path
 /// fails on it. Only a prunable registration is touched: `git worktree remove`
-/// on a live one would delete its directory.
+/// on a live one would delete its directory, and a locked one is left alone,
+/// since git never calls a locked registration prunable.
 pub fn remove_prunable_worktree(checkout: &Path, destination: &Path) -> Result<bool, JjError> {
+    remove_stale_worktree(checkout, destination, StaleLock::Kept)
+}
+
+/// [`remove_prunable_worktree`] for a workspace being finished, which also
+/// unlocks and removes a locked registration whose directory is gone.
+///
+/// A lock keeps another tool's prune off a live workspace; the workspace
+/// `finish` ends is not live, and git would otherwise keep its registration,
+/// so the next `start` at that path fails on "a missing but locked worktree".
+/// Only the registration at `destination` is touched, and only while nothing
+/// is at that path.
+pub fn remove_finished_worktree(checkout: &Path, destination: &Path) -> Result<bool, JjError> {
+    remove_stale_worktree(checkout, destination, StaleLock::Cleared)
+}
+
+/// What [`remove_stale_worktree`] does with a locked registration whose
+/// directory is gone.
+#[derive(Clone, Copy)]
+enum StaleLock {
+    Kept,
+    Cleared,
+}
+
+fn remove_stale_worktree(
+    checkout: &Path,
+    destination: &Path,
+    stale_lock: StaleLock,
+) -> Result<bool, JjError> {
     let checkout = path(checkout);
     let listing = command("git", ["-C", &checkout, "worktree", "list", "--porcelain"])?;
     let wanted = comparable_path(destination);
-    let prunable = listing.split("\n\n").any(|entry| {
-        let mut lines = entry.lines();
-        let registered = lines
+    let Some(entry) = listing.split("\n\n").find(|entry| {
+        entry
+            .lines()
             .next()
             .and_then(|line| line.strip_prefix("worktree "))
-            .map(|registered| comparable_path(Path::new(registered)));
-        registered == Some(wanted.clone()) && lines.any(|line| line.starts_with("prunable"))
-    });
-    if !prunable {
+            .is_some_and(|registered| comparable_path(Path::new(registered)) == wanted)
+    }) else {
+        return Ok(false);
+    };
+    let prunable = entry.lines().any(|line| line.starts_with("prunable"));
+    let locked = entry
+        .lines()
+        .any(|line| line == "locked" || line.starts_with("locked "));
+    let vanished = matches!(
+        std::fs::symlink_metadata(destination),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    );
+    let shown = path(destination);
+    if locked && vanished && matches!(stale_lock, StaleLock::Cleared) {
+        command("git", ["-C", &checkout, "worktree", "unlock", &shown])?;
+    } else if !prunable {
         return Ok(false);
     }
-    command(
-        "git",
-        ["-C", &checkout, "worktree", "remove", &path(destination)],
-    )?;
+    command("git", ["-C", &checkout, "worktree", "remove", &shown])?;
     Ok(true)
 }
 

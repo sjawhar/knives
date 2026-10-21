@@ -25,7 +25,8 @@ use knives::statement::{Statement, StatementKind};
 use knives::store::{OwnerKind, Store};
 use lab::{Lab, knives_start, release_test_home};
 use serde_json::Value;
-use std::process::Command;
+use std::path::Path;
+use std::process::{Command, Output};
 
 /// The statement an entry is expected to carry.
 fn stating(kind: StatementKind, value: Option<&str>) -> Statement {
@@ -794,7 +795,7 @@ fn a_stated_pull_request_lives_on_the_ledger_and_status_shows_it() {
 }
 
 /// Git's registrations of a checkout's worktrees, one `worktree <path>` block
-/// per entry, `prunable` marked where the working tree is gone.
+/// per entry, `prunable` or `locked` marked where git says so.
 fn git_worktrees(checkout: &std::path::Path) -> String {
     let output = Command::new("git")
         .args(["worktree", "list", "--porcelain"])
@@ -804,18 +805,49 @@ fn git_worktrees(checkout: &std::path::Path) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
-#[test]
-fn finishing_a_workspace_whose_directory_vanished_clears_its_git_registration() {
-    // Given: a started branch whose workspace directory was removed by hand.
-    // `jj workspace forget` unlinks a worktree that is still on disk; with the
-    // directory already gone, git keeps the registration and reports it
-    // prunable, and the next `start` at that path fails on it.
+/// Runs `git worktree <verb> <workspace>` in the checkout.
+fn git_worktree(
+    checkout: &std::path::Path,
+    verb: &str,
+    extra: &[&str],
+    workspace: &Path,
+) -> Output {
+    Command::new("git")
+        .args(["worktree", verb])
+        .args(extra)
+        .arg(workspace)
+        .current_dir(checkout)
+        .output()
+        .expect("git worktree")
+}
+
+/// Finishes `branch` after its workspace directory was removed by hand, then
+/// asserts git no longer registers anything at that path and `start` succeeds
+/// there again. `lock` first locks the registration, as a tool guarding live
+/// workspaces from prunes does; git never calls a locked one prunable.
+fn assert_finish_clears_a_vanished_registration(branch: &str, lock: bool) {
     let lab = lab::Lab::new();
     let (home, _consumer) = release_test_home(&lab);
-    let workspace = start_claim_for_finish(&lab, &home, "ses_fff688", "feat/gamma");
+    let workspace = start_claim_for_finish(&lab, &home, "ses_fff688", branch);
+    if lock {
+        // A wrapper on PATH may have locked it on add already; replace that
+        // lock with one of this test's, so the case holds without the wrapper.
+        let _ = git_worktree(&lab.work, "unlock", &[], &workspace);
+        let locked = git_worktree(&lab.work, "lock", &["--reason", "test lock"], &workspace);
+        assert!(
+            locked.status.success(),
+            "{}",
+            String::from_utf8_lossy(&locked.stderr)
+        );
+    }
+    let registered = format!(
+        "worktree {}",
+        workspace.canonicalize().expect("workspace path").display()
+    );
+    assert!(git_worktrees(&lab.work).contains(&registered));
     std::fs::remove_dir_all(&workspace).expect("remove the workspace directory by hand");
 
-    let finished = knives_finish(&lab, &home, &["feat/gamma"]);
+    let finished = knives_finish(&lab, &home, &[branch]);
 
     let stdout = String::from_utf8_lossy(&finished.stdout);
     assert!(
@@ -829,11 +861,11 @@ fn finishing_a_workspace_whose_directory_vanished_clears_its_git_registration() 
     );
     let registrations = git_worktrees(&lab.work);
     assert!(
-        !registrations.contains("prunable"),
-        "a prunable registration survived finish:\n{registrations}"
+        !registrations.contains(&registered),
+        "a registration at the workspace path survived finish:\n{registrations}"
     );
     // And: the branch can be started again at the same path.
-    let restarted = knives_start(&lab, &home, "feat/gamma");
+    let restarted = knives_start(&lab, &home, branch);
     assert!(
         restarted.status.success(),
         "{}\n{}",
@@ -844,4 +876,19 @@ fn finishing_a_workspace_whose_directory_vanished_clears_its_git_registration() 
         workspace.join(".jj").is_dir(),
         "the workspace was not recreated"
     );
+}
+
+#[test]
+fn finishing_a_workspace_whose_directory_vanished_clears_its_git_registration() {
+    // `jj workspace forget` unlinks a worktree that is still on disk; with the
+    // directory already gone, git keeps the registration, and the next `start`
+    // at that path fails on it.
+    assert_finish_clears_a_vanished_registration("feat/gamma", false);
+}
+
+#[test]
+fn finishing_a_workspace_whose_directory_vanished_clears_its_locked_git_registration() {
+    // A locked registration is never prunable; git refuses the next `add` at
+    // its path as "a missing but locked worktree".
+    assert_finish_clears_a_vanished_registration("feat/gamma", true);
 }

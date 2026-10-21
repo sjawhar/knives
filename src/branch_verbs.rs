@@ -16,7 +16,7 @@ use knives::commands::claim::{
 };
 use knives::commands::start::{collides_with_checkout, possesses, workspace_path};
 use knives::ids::{BranchName, BranchTarget, Requirement};
-use knives::jj::{Repo, WorkspaceIdentity, remove_prunable_worktree};
+use knives::jj::{Repo, WorkspaceIdentity, remove_finished_worktree};
 use knives::ledger::{Draft, Stated};
 use knives::statement::{Statement, StatementKind};
 use knives::store::{Store, default_state_path};
@@ -195,10 +195,10 @@ pub(crate) fn run_finish(
 
 /// The Git side of a workspace whose directory is now gone: `jj workspace
 /// forget` unlinks the worktree it registered, but a directory that vanished
-/// before the forget leaves git's `.git/worktrees/<name>` entry behind, and the
-/// next `start` at that path would fail on it.
+/// before the forget leaves git's `.git/worktrees/<name>` entry behind, locked
+/// or prunable, and the next `start` at that path would fail on it.
 fn stale_worktree_note(checkout: &Path, directory: &Path) -> String {
-    match remove_prunable_worktree(checkout, directory) {
+    match remove_finished_worktree(checkout, directory) {
         Ok(true) => "; stale Git worktree registration removed".to_owned(),
         Ok(false) => String::new(),
         Err(error) => format!("; Git worktree registration not checked ({error})"),
