@@ -14,6 +14,11 @@ pub(super) struct CarriedFindingInput<'a> {
     pub(super) trunk: &'a str,
     pub(super) scheme: &'a ReleaseScheme,
     pub(super) publish_remote: &'a str,
+    /// The entry declares named series: every series' dated cut carries its
+    /// own members by construction, so none is reported as a carrier. An entry
+    /// without series skips only its own scheme's releases, as it always has,
+    /// so a fixed entry's leftover dated cuts are still named.
+    pub(super) has_series: bool,
 }
 
 /// Reports branches carried by another branch, excluding the configured trunk.
@@ -25,6 +30,7 @@ pub(super) fn carried_findings(input: CarriedFindingInput<'_>) -> anyhow::Result
         trunk,
         scheme,
         publish_remote,
+        has_series,
     } = input;
     let mut findings = Vec::new();
     for row in &report.branches {
@@ -38,7 +44,9 @@ pub(super) fn carried_findings(input: CarriedFindingInput<'_>) -> anyhow::Result
             .branches_containing(tip, scheme, publish_remote)?
             .into_iter()
             .filter(|reference| {
-                reference.branch() != &row.name && reference.branch().as_str() != trunk
+                reference.branch() != &row.name
+                    && reference.branch().as_str() != trunk
+                    && !(has_series && crate::ids::is_our_dated_cut(reference, publish_remote))
             })
             .collect::<Vec<_>>();
         if let Some(finding) = crate::detect::superseded::carried_elsewhere(&row.name, &carriers) {

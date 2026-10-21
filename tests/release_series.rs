@@ -581,3 +581,39 @@ fn a_plain_entry_does_not_count_a_multi_segment_release_ref_as_a_cut() {
     assert!(out.contains("demo: release/2026-08-04"), "{out}");
     assert!(!out.contains("demo: release/x/y"), "{out}");
 }
+
+#[test]
+fn a_fixed_entry_still_reports_a_branch_its_leftover_dated_cuts_carry() {
+    // Given: a fixed-scheme entry with no series, and two leftover dated cuts
+    // carrying feat/alpha, the newer one also published to origin.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    lab.octopus("release/2026-08-04", "feat/alpha", "feat/beta");
+    lab.octopus("release/2026-08-05", "feat/alpha", "feat/beta");
+    lab.push_branch("release/2026-08-05");
+    let home = tempfile::tempdir().expect("create config home");
+    std::fs::write(
+        home.path().join("repos.toml"),
+        format!(
+            "[repos.demo]\nupstream = \"{}\"\norigin = \"{}\"\nrelease_branch = \"integration\"\n",
+            lab.upstream.display(),
+            lab.temp_origin().display(),
+        ),
+    )
+    .expect("write registry");
+
+    // When: status reports the fork.
+    let status = lab::knives(&lab, &home, &["--json", "status", "demo"]);
+
+    // Then: as on main, the dated cuts are named as carrying the branch; they
+    // are not the fixed scheme's releases.
+    let out = text(&status);
+    assert!(
+        out.contains(
+            "feat/alpha's tip is also reachable from release/2026-08-04, release/2026-08-05, \
+             release/2026-08-05@origin"
+        ),
+        "{out}"
+    );
+}

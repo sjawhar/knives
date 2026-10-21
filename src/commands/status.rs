@@ -626,6 +626,7 @@ fn settle_rows_after_phases(
         trunk: entry.trunk(),
         scheme: &scheme,
         publish_remote: entry.publish_remote(),
+        has_series: !entry.series.is_empty(),
     })?);
     let trunks = crate::release_model::trunk_positions(input.repo, entry)?;
     if !trunks.is_empty() {
