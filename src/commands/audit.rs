@@ -157,6 +157,7 @@ pub fn gather(input: &AuditInput<'_>) -> Report {
         },
     );
     add_misplaced_origin_release_refs(&mut report, live.origin(), &scheme, entry.publish_remote());
+    add_unfit_branches(&mut report, &opened, entry, &carried);
     add_orphan_commits(&mut report, &opened, path);
     let template = template_for_pulls(&mut report, input);
     add_branch_facts(
@@ -357,6 +358,22 @@ struct ReleaseDriftScan<'a> {
     schemes: &'a [crate::ids::ReleaseScheme],
     publish_remote: &'a str,
     entries: &'a [Entry],
+}
+
+/// A note for each branch that fits no release series of an entry that has
+/// named series: every release verb refuses it, so audit says so up front.
+fn add_unfit_branches(
+    report: &mut Report,
+    opened: &Repo,
+    entry: &RepoEntry,
+    carried: &[(String, CommitId)],
+) {
+    match crate::release_model::series_members(opened, entry, carried.to_vec()) {
+        Ok((_, unfit)) => report.notes.extend(unfit),
+        Err(error) => report.problems.push(format!(
+            "could not place branches in release series: {error}"
+        )),
+    }
 }
 
 /// Every series' release scheme: each series' cuts are recorded in the same

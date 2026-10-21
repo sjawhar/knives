@@ -103,7 +103,7 @@ composes only that series' branches, the plan lists only them, and `include` or
 `advance` of a branch from another series is refused with the series it fits; a
 branch that fits no series (it forks from two bases at the same point, or a base
 it would need is not fetched) is refused with the fork points. `audit` checks
-drift for every series' cuts.
+drift for every series' cuts and notes each branch that fits no series.
 
 **Fixed scheme:** `release_branch = "<name>"` means cuts advance that branch in
 place through jj's internal allow-backwards mechanism. Use `release cut` without

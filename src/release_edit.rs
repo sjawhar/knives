@@ -127,7 +127,7 @@ impl EditContext<'_> {
             SeriesFit::Selected => Ok(false),
             SeriesFit::Other(label) => {
                 println!(
-                    "{}: {branch} forks from the base of release series {label}, not {}'s; \
+                    "{}: {branch} forks from the base of the {label}, not {}'s; \
                      refusing {before}: `knives release --series <name>` acts on its series",
                     self.repo, self.release.name
                 );

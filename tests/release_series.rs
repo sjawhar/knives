@@ -158,12 +158,71 @@ fn including_another_series_branch_is_refused() {
     let out = text(&include);
     assert!(!include.status.success(), "{out}");
     assert!(
-        out.contains("forks from the base of release series"),
+        out.contains("feat/new forks from the base of the default series"),
         "{out}"
     );
     assert_eq!(
         release_parents(&lab, "release/old/2026-08-04"),
         vec![commit_at(&lab, "fix/old")]
+    );
+}
+
+#[test]
+fn advancing_onto_another_series_branch_is_refused() {
+    // Given: series `old` has cut, and a default-series branch exists.
+    let lab = two_base_lab();
+    branch_on(&lab, "old@upstream", "fix/old", "old-fix.txt");
+    branch_on(&lab, "main@upstream", "feat/new", "new.txt");
+    let home = series_home(&lab, "");
+    let cut = knives_release(
+        &lab,
+        &home,
+        &["--series", "old", "cut", "release/old/2026-08-04"],
+    );
+    assert!(cut.status.success(), "{}", text(&cut));
+
+    // When: the `old` release is asked to advance onto the default-series branch.
+    let advance = knives_release(&lab, &home, &["--series", "old", "advance", "feat/new"]);
+
+    // Then: it is refused, naming the series the branch fits.
+    let out = text(&advance);
+    assert!(!advance.status.success(), "{out}");
+    assert!(
+        out.contains("feat/new forks from the base of the default series"),
+        "{out}"
+    );
+    assert_eq!(
+        release_parents(&lab, "release/old/2026-08-04"),
+        vec![commit_at(&lab, "fix/old")]
+    );
+}
+
+#[test]
+fn audit_names_a_branch_that_fits_no_series() {
+    // Given: a branch forked where the two bases split.
+    let lab = two_base_lab();
+    lab.branch("feat/stray", "stray.txt", "stray\n");
+    // Audit reads live refs, so the registry names the lab's real origin.
+    let home = tempfile::tempdir().expect("create config home");
+    std::fs::write(
+        home.path().join("repos.toml"),
+        format!(
+            "[repos.demo]\nupstream = \"{}\"\norigin = \"{}\"\n\n\
+             [repos.demo.series.old]\nbase = \"old\"\n",
+            lab.upstream.display(),
+            lab.temp_origin().display(),
+        ),
+    )
+    .expect("write registry");
+
+    // When: the fork is audited.
+    let audit = lab::knives(&lab, &home, &["--text", "audit", "demo", "--no-github"]);
+
+    // Then: the report names it and why.
+    let out = text(&audit);
+    assert!(
+        out.contains("feat/stray belongs to no release series"),
+        "{out}"
     );
 }
 
