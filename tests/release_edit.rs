@@ -1036,20 +1036,113 @@ fn a_published_cut_edited_then_pushed_leaves_no_anonymous_head() {
     assert!(findings(&report, "orphan-commit").is_empty(), "{report}");
 }
 
+/// `jj <args>` in the work checkout with the lab's identity, run to completion
+/// whatever its exit.
+fn jj_in_work(lab: &Lab, args: &[&str]) -> std::process::Output {
+    std::process::Command::new("jj")
+        .args(args)
+        .current_dir(&lab.work)
+        .env("JJ_CONFIG", "/dev/null")
+        .env("JJ_USER", "Knives Lab")
+        .env("JJ_EMAIL", "knives-lab@example.test")
+        .output()
+        .expect("run jj")
+}
+
 #[test]
-fn a_working_copy_parked_on_the_replaced_cut_follows_the_release() {
-    // Given: the work checkout's working copy parked, empty, on the cut.
+fn a_working_copy_parked_on_the_release_keeps_the_replaced_cut_and_stays_fresh() {
+    // Given: the work checkout's working copy parked, empty, on the cut, with
+    // a file jj has not snapshotted yet.
     let (lab, home, _consumer) = two_branch_cut();
     let cut = commit_at(&lab, "release/2026-08-04");
     lab.jj_work(["new", "release/2026-08-04"]);
+    std::fs::write(lab.work.join("unsnapshotted.txt"), "mine\n").expect("write a file");
 
     // When: beta is dropped.
-    drop_beta(&lab, &home);
+    let dropped = drop_beta(&lab, &home);
 
-    // Then: the cut is abandoned and the working copy sits on the new release.
-    assert!(!is_visible(&lab, &cut), "the replaced cut is still visible");
+    // Then: the cut stays under the working copy, the drop says why, and the
+    // workspace is not stale: the next jj command snapshots the file in place.
+    assert!(is_visible(&lab, &cut), "the parked cut was abandoned");
+    assert!(
+        dropped.contains(&format!(
+            "demo: note: kept {}, the release/2026-08-04",
+            cut.short()
+        )) && dropped.contains("the working copy of default"),
+        "{dropped}"
+    );
+    let status = jj_in_work(&lab, &["status"]);
+    assert!(
+        status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&status.stdout).contains("unsnapshotted.txt"),
+        "{}",
+        String::from_utf8_lossy(&status.stdout)
+    );
+    assert!(lab.work.join("unsnapshotted.txt").exists());
+    assert!(
+        lab.work.join("beta.txt").exists(),
+        "the cut's content left disk"
+    );
     assert_eq!(
         knives::jj::commits_matching(&lab.work, "@-").expect("parent of @"),
-        [commit_at(&lab, "release/2026-08-04")]
+        [cut]
+    );
+    let report = audit_report(&lab, &home);
+    assert!(findings(&report, "orphan-commit").is_empty(), "{report}");
+}
+
+#[test]
+fn a_drop_keeps_the_replaced_cut_while_work_rests_on_it() {
+    // Given: a commit with work on top of the cut.
+    let (lab, home, _consumer) = two_branch_cut();
+    let cut = commit_at(&lab, "release/2026-08-04");
+    lab.jj_work(["new", "release/2026-08-04", "-m", "work on the release"]);
+    std::fs::write(lab.work.join("work.txt"), "work\n").expect("write work");
+    lab.jj_work(["new"]);
+
+    // When: beta is dropped.
+    let dropped = drop_beta(&lab, &home);
+
+    // Then: the cut and the work on it stay.
+    assert!(
+        is_visible(&lab, &cut),
+        "a cut with work on it was abandoned"
+    );
+    assert!(
+        dropped.contains(&format!(
+            "demo: note: kept {}, the release/2026-08-04",
+            cut.short()
+        )) && dropped.contains("it has descendants"),
+        "{dropped}"
+    );
+}
+
+#[test]
+fn a_drop_keeps_the_replaced_cut_while_an_untracked_publish_ref_names_it() {
+    // Given: a published cut whose remote ref is not tracked: someone else's
+    // position, not the one this checkout's next push replaces.
+    let (lab, home, _consumer) = two_branch_cut();
+    let cut = commit_at(&lab, "release/2026-08-04");
+    lab.push_branch("release/2026-08-04");
+    lab.jj_work(["bookmark", "untrack", "release/2026-08-04@origin"]);
+
+    // When: beta is dropped.
+    let dropped = drop_beta(&lab, &home);
+
+    // Then: the cut stays, named by that ref.
+    assert!(
+        is_visible(&lab, &cut),
+        "a cut an untracked ref names was abandoned"
+    );
+    assert!(
+        dropped.contains(&format!(
+            "demo: note: kept {}, the release/2026-08-04",
+            cut.short()
+        )) && dropped.contains("release/2026-08-04@origin names it"),
+        "{dropped}"
     );
 }

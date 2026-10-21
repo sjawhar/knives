@@ -645,6 +645,7 @@ fn drop_landed_members(
             release: release_name,
             delta: &delta,
             created: &created,
+            change: &written.change,
             provenance: &provenance,
         },
         bound,
@@ -696,6 +697,8 @@ fn report_rebased_release(
     // last (branch, commit) pairing for the release would name commits no
     // longer among its parents, and the next edit could not tell a rebuilt
     // branch from a stranger.
+    // `describe` keeps the change id the rebased release already had.
+    let change = reopened.change_id_of(created.as_str())?;
     record_edit_event(
         fork,
         &reopened,
@@ -703,6 +706,7 @@ fn report_rebased_release(
             release: rebased.name,
             delta: &delta,
             created: &described,
+            change: &change,
             provenance: &provenance,
         },
         bound,

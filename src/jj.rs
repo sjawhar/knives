@@ -1667,6 +1667,8 @@ pub struct ReleaseWrite<'a> {
 #[derive(Debug)]
 pub struct ReleaseWritten {
     pub commit: CommitId,
+    /// The written commit's change id, which the edit event records.
+    pub change: ChangeId,
     /// The source the bookmark moved off, when it named the source.
     pub replaced: Option<ReplacedRelease>,
 }
@@ -1700,10 +1702,10 @@ pub struct ReplacedRelease {
 /// instead of through parsed human-facing output.
 ///
 /// A duplicate moved under the name its source carried replaces that source,
-/// which would otherwise stay behind as a head no bookmark names. In the same
-/// operation it is recorded as rewritten into the written commit — hidden,
-/// with any parked working copy on it following the release — unless
-/// something else rests on it ([`what_keeps`]).
+/// which would otherwise stay behind as a head no bookmark names. It is
+/// abandoned in the same operation unless something else rests on it
+/// ([`what_keeps`]) — a working copy on it or above it among them, since
+/// rewriting that from here would leave the workspace stale.
 pub fn write_release(repo: &Path, write: &ReleaseWrite<'_>) -> Result<ReleaseWritten, JjError> {
     validate_parents(write.source, write.parents)?;
     let repo = Repo::open(repo)?;
@@ -1740,8 +1742,7 @@ pub fn write_release(repo: &Path, write: &ReleaseWrite<'_>) -> Result<ReleaseWri
             };
             let kept = what_keeps(&repo, tx.repo(), &source, &moved)?;
             if kept.is_none() {
-                tx.repo_mut()
-                    .set_rewritten_commit(source.id().clone(), written.id().clone());
+                tx.repo_mut().record_abandoned_commit(&source);
             }
             replaced = Some(ReplacedRelease {
                 commit: commit_id(source.id()),
@@ -1752,6 +1753,7 @@ pub fn write_release(repo: &Path, write: &ReleaseWrite<'_>) -> Result<ReleaseWri
     commit_mutation(&repo, tx, write.operation)?;
     Ok(ReleaseWritten {
         commit: commit_id(written.id()),
+        change: ChangeId::new(written.change_id().to_string()),
         replaced,
     })
 }
@@ -1767,13 +1769,14 @@ struct MovedName<'a> {
 /// rests on it.
 ///
 /// It stays for a bookmark or tag on it, local or on any remote; a workspace
-/// with it checked out; a visible descendant that is not an empty, undescribed
-/// commit (a parked working copy, which follows the release as reap lets it);
-/// or anything jj's default rule pins ([`assert_mutable`]). A commit someone
-/// else can still reach by name is theirs to keep. Two refs do not count: the
-/// colocated git view (`@git`), which shows the moved name at the source until
-/// this operation exports refs, and the moved name's tracked ref on its
-/// publish remote, the published position the next push replaces.
+/// with it checked out; any visible descendant, a parked working copy
+/// included (the same rule as [`abandon_tagged_copies`]: rewriting a working
+/// copy from here leaves its workspace stale); or anything jj's default rule
+/// pins ([`assert_mutable`]). A commit someone else can still reach by name is
+/// theirs to keep. Two refs do not count: the colocated git view (`@git`),
+/// which shows the moved name at the source until this operation exports
+/// refs, and the moved name's tracked ref on its publish remote, the published
+/// position the next push replaces.
 fn what_keeps(
     repo: &Repo,
     view_repo: &dyn jj_lib::repo::Repo,
@@ -1823,23 +1826,11 @@ fn what_keeps(
             workspaces.join(", ")
         ));
     }
-    let mut staying = Vec::new();
-    for descendant in repo.descendants_of(id)? {
-        let child = repo
-            .repo
-            .store()
-            .get_commit(&descendant)
-            .map_err(|error| store_error(&error))?;
-        let parked = child.description().is_empty()
-            && block_on(child.is_empty(repo.repo.as_ref())).map_err(|error| store_error(&error))?;
-        if !parked {
-            staying.push(descendant);
-        }
-    }
-    if !staying.is_empty() {
+    let descendants = repo.descendants_of(id)?;
+    if !descendants.is_empty() {
         reasons.push(descendants_that_stay(
             repo,
-            &staying.iter().collect::<Vec<_>>(),
+            &descendants.iter().collect::<Vec<_>>(),
         )?);
     }
     if let Err(error) = assert_mutable(view_repo, std::slice::from_ref(commit)) {

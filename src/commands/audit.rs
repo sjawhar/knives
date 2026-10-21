@@ -472,10 +472,12 @@ fn add_release_drifts(report: &mut Report, scan: &ReleaseDriftScan<'_>) {
 ///
 /// At the newest write it is silent. A commit with that write's change id,
 /// parents and tree is the write re-signed or metaedited — routine before a
-/// push, since knives writes unsigned commits. The publish remote at an earlier
-/// write (or a re-signed copy of one) is knives' own work an edit has not been
-/// pushed over yet. Both are notes. Anything else is drift: a local name back
-/// at an earlier write was moved there after knives wrote the newer one.
+/// push, since knives writes unsigned commits. The publish remote at any
+/// earlier write of the name (or a re-signed copy of one) is knives' own work
+/// that a newer write has not been pushed over yet. Both are notes. Anything
+/// else is drift, a local name at an earlier write included: it is not what
+/// knives last wrote, whether it was moved back or the newer write came from
+/// another machine and is not fetched here.
 ///
 /// Only the newest write must be readable: an older one whose commit never
 /// reached this machine — the ledger is shared — is skipped.

@@ -392,6 +392,7 @@ fn apply_edit(
             release: &release.name,
             delta,
             created,
+            change: &written.change,
             provenance: &provenance,
         },
         context.bound,
@@ -430,12 +431,13 @@ pub(crate) fn report_replaced(
     }
 }
 
-/// What one release edit wrote: the name, the delta, the new merge and its
-/// parent set with the branch each parent came from.
+/// What one release edit wrote: the name, the delta, the new merge with its
+/// change id, and its parent set with the branch each parent came from.
 pub(crate) struct EditRecord<'a> {
     pub(crate) release: &'a str,
     pub(crate) delta: &'a str,
     pub(crate) created: &'a knives::ids::CommitId,
+    pub(crate) change: &'a knives::ids::ChangeId,
     pub(crate) provenance: &'a [(String, knives::ids::CommitId)],
 }
 
@@ -455,9 +457,6 @@ pub(crate) fn record_edit_event(
         .iter()
         .map(|(_, commit)| commit.clone())
         .collect();
-    // `opened` predates the write, so it cannot read the new commit.
-    let change =
-        knives::jj::Repo::open(&fork.checkout.path)?.change_id_of(record.created.as_str())?;
     scribe_for(fork, bound)?.record(&Draft {
         subject: Some(record.release),
         kind: Kind::Event,
@@ -467,7 +466,7 @@ pub(crate) fn record_edit_event(
             "edited {} as {} (change {}) with {} parent(s): {}; parents: {}",
             record.release,
             record.created.short(),
-            change.short(),
+            record.change.short(),
             parents.len(),
             record.delta,
             members_event_text(record.provenance)
