@@ -201,8 +201,43 @@ static GH_PROCESS_SEMAPHORE: GhProcessSemaphore =
 
 impl CliForge {
     fn run(repo: &Path, args: &[&str]) -> Result<String, ForgeError> {
+        let output = Self::output(repo, args)?;
+        if output.status.success() {
+            // Valid UTF-8, the usual reply, keeps gh's buffer rather than a copy.
+            return Ok(String::from_utf8(output.stdout).unwrap_or_else(|invalid| {
+                String::from_utf8_lossy(invalid.as_bytes()).into_owned()
+            }));
+        }
+        Err(Self::failure(repo, args, &output, None))
+    }
+
+    /// Runs one `gh api graphql` call and reads its reply with `parse`.
+    ///
+    /// gh exits 1 whenever the reply carries `errors`, and still prints the
+    /// reply: a field the token may not read comes back null and named in
+    /// `errors`, beside every field it may. So such a reply still goes to
+    /// `parse`, which judges each error. After a non-zero exit, any other
+    /// output, or a reply `parse` refuses, is the call's own failure, with gh's
+    /// stderr and the refusal.
+    fn graphql<T>(
+        repo: &Path,
+        args: &[&str],
+        parse: impl FnOnce(&str) -> Result<T, ForgeError>,
+    ) -> Result<T, ForgeError> {
+        let output = Self::output(repo, args)?;
+        let reply = String::from_utf8_lossy(&output.stdout);
+        if output.status.success() {
+            return parse(&reply);
+        }
+        if !names_errors(&reply) {
+            return Err(Self::failure(repo, args, &output, None));
+        }
+        parse(&reply).map_err(|refusal| Self::failure(repo, args, &output, Some(&refusal)))
+    }
+
+    fn output(repo: &Path, args: &[&str]) -> Result<std::process::Output, ForgeError> {
         let started = std::time::Instant::now();
-        // This permit must span `output()`: it is a cap on live `gh` children,
+        // This permit must span `Command::output()`: it is a cap on live `gh` children,
         // so releasing it after spawning would allow running processes to exceed
         // the global limit. Callers acquire it before their scoped threads join.
         let permit = GH_PROCESS_SEMAPHORE.acquire();
@@ -214,23 +249,49 @@ impl CliForge {
                 crate::timing::call_line(started.elapsed(), repo, args)
             );
         }
-        if output.status.success() {
-            return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
-        }
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        Err(ForgeError::Command {
+        Ok(output)
+    }
+
+    /// `refusal` is why knives took no answer from the reply gh printed.
+    fn failure(
+        repo: &Path,
+        args: &[&str],
+        output: &std::process::Output,
+        refusal: Option<&ForgeError>,
+    ) -> ForgeError {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // Without the stderr an authentication failure reads only as "exit
+        // status 4", which cost real diagnosis time.
+        let stderr = match stderr.trim() {
+            "" => "no stderr",
+            stderr => stderr,
+        };
+        ForgeError::Command {
             command: format!("gh {}", args.join(" ")),
             dir: repo.display().to_string(),
             code: output.status.code().unwrap_or(-1),
-            // Without the stderr an authentication failure reads only as "exit
-            // status 4", which cost real diagnosis time.
-            stderr: if stderr.is_empty() {
-                "no stderr".to_owned()
-            } else {
-                stderr
-            },
-        })
+            // gh's stderr names every error in the reply, the tolerated ones
+            // too; the refusal names the one that kept it from being an answer.
+            stderr: refusal.map_or_else(
+                || stderr.to_owned(),
+                |refusal| format!("{stderr}\nknives refused the reply: {refusal}"),
+            ),
+        }
     }
+}
+
+/// The `errors` of a GraphQL reply and nothing else.
+#[derive(Deserialize)]
+struct ReplyErrors {
+    #[serde(default)]
+    errors: Vec<serde::de::IgnoredAny>,
+}
+
+/// Whether `reply` is a GraphQL reply naming at least one error. gh exits 1
+/// after printing such a reply, and after printing an HTTP failure's body
+/// (`{"message":"Bad credentials"}`), which names none and is no answer.
+fn names_errors(reply: &str) -> bool {
+    serde_json::from_str::<ReplyErrors>(reply).is_ok_and(|reply| !reply.errors.is_empty())
 }
 
 fn joined_forge_call<T>(
@@ -294,11 +355,11 @@ impl Forge for CliForge {
         let owner = format!("owner={owner}");
         let name = format!("name={name}");
         let query = format!("query={}", sweep_query());
-        let payload = Self::run(
+        Self::graphql(
             repo,
             &["api", "graphql", "-f", &owner, "-f", &name, "-f", &query],
-        )?;
-        parse_sweep(&payload)
+            parse_sweep,
+        )
     }
 
     fn pull_facts(
@@ -322,11 +383,11 @@ impl Forge for CliForge {
                     let name = &name;
                     scope.spawn(move || {
                         let query = format!("query={}", pull_facts_query(chunk));
-                        let payload = Self::run(
+                        Self::graphql(
                             repo,
                             &["api", "graphql", "-f", owner, "-f", name, "-f", &query],
-                        )?;
-                        parse_pull_facts(&payload, chunk)
+                            |reply| parse_pull_facts(reply, chunk),
+                        )
                     })
                 })
                 .collect::<Vec<_>>();
@@ -351,11 +412,11 @@ impl Forge for CliForge {
         let query = format!("query={}", pull_timeline_query(number));
         std::thread::scope(|scope| {
             let worker = scope.spawn(|| {
-                let payload = Self::run(
+                Self::graphql(
                     repo,
                     &["api", "graphql", "-f", &owner, "-f", &name, "-f", &query],
-                )?;
-                parse_pull_timeline(&payload, number)
+                    |reply| parse_pull_timeline(reply, number),
+                )
             });
             joined_forge_call(worker.join())
         })
@@ -372,11 +433,11 @@ impl ConsumerPinSource for CliForge {
         let owner = format!("owner={owner}");
         let name = format!("name={name}");
         let query = format!("query={}", consumer_head_query());
-        let payload = Self::run(
+        Self::graphql(
             repo,
             &["api", "graphql", "-f", &owner, "-f", &name, "-f", &query],
-        )?;
-        parse_consumer_head(&payload)
+            parse_consumer_head,
+        )
     }
 
     fn file_at(
@@ -447,8 +508,9 @@ pub const fn sweep_query() -> &'static str {
 /// Full I2 fact row per aliased number.
 ///
 /// It has every summary field plus merge state, review timeline, check rollup,
-/// check suites, and the newest comment (`sync`). Alias names are not
-/// load-bearing; the parser keys on the repeated `number`.
+/// check suites, and the newest comment (`sync`). Each number is asked under
+/// its alias, `p<number>`: the parser keys rows on the repeated `number`, and
+/// matches the forge's errors, which name the alias, against the asked ones.
 ///
 /// Check suites are asked for beside the rollup because the rollup omits a
 /// workflow the forge never started: a fork pull request awaiting a
@@ -458,7 +520,10 @@ pub const fn sweep_query() -> &'static str {
 pub fn pull_facts_query(numbers: &[u64]) -> String {
     let fields: String = numbers
         .iter()
-        .map(|number| format!("p{number}: pullRequest(number: {number}) {{ ...facts }}"))
+        .map(|&number| {
+            let alias = FactsAlias(number);
+            format!("{alias}: pullRequest(number: {number}) {{ ...facts }}")
+        })
         .collect::<Vec<_>>()
         .join(" ");
     format!(
@@ -480,6 +545,32 @@ pub fn pull_facts_query(numbers: &[u64]) -> String {
          workflowRun {{ workflow {{ name }} }} }} }} }} }} }} \
          comments(last: 1) {{ nodes {{ createdAt }} }} }}"
     )
+}
+
+/// The response key a number's fact row is asked under, and errors name:
+/// written `p<number>`.
+struct FactsAlias(u64);
+
+impl FactsAlias {
+    /// The asked number whose alias `key` is, read without writing out each
+    /// asked alias. Only the spelling `Display` writes counts: `p07` is no
+    /// alias of 7.
+    fn asked(key: &str, asked: &[u64]) -> Option<u64> {
+        let digits = key.strip_prefix('p')?;
+        if !digits.bytes().all(|byte| byte.is_ascii_digit())
+            || (digits.len() > 1 && digits.starts_with('0'))
+        {
+            return None;
+        }
+        let number = digits.parse().ok()?;
+        asked.contains(&number).then_some(number)
+    }
+}
+
+impl std::fmt::Display for FactsAlias {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "p{}", self.0)
+    }
 }
 
 /// Drop later duplicate summary rows, keeping the forge's freshest-first order.
@@ -625,6 +716,28 @@ struct QueryFailure {
     path: Vec<serde_json::Value>,
 }
 
+impl QueryFailure {
+    /// The forge's message, and the field it names when it names one. The
+    /// facts batch tolerates some fields' errors and not others, and the same
+    /// message (a SAML refusal) can name either.
+    fn described(&self) -> String {
+        if self.path.is_empty() {
+            return self.message.clone();
+        }
+        let path = self
+            .path
+            .iter()
+            .map(|segment| {
+                segment
+                    .as_str()
+                    .map_or_else(|| segment.to_string(), str::to_owned)
+            })
+            .collect::<Vec<_>>()
+            .join(".");
+        format!("{} (at {path})", self.message)
+    }
+}
+
 #[derive(Deserialize)]
 struct IdentityPayload {
     #[serde(rename = "nameWithOwner")]
@@ -708,11 +821,12 @@ struct HeadRefNode {
     name: String,
 }
 
-/// Distinguishes an omitted legacy field from an answered null head ref.
+/// Distinguishes an unanswered head ref from an answered null one.
 #[derive(Debug, Default, Clone, Copy)]
 enum HeadRef {
+    /// An old payload omitted the field, or the forge refused it.
     #[default]
-    Missing,
+    Unanswered,
     Present,
     Deleted,
 }
@@ -739,7 +853,8 @@ struct FactsPayload {
     deletions: Option<u64>,
     #[serde(default, rename = "changedFiles")]
     changed_files: Option<u64>,
-    /// Missing means an old payload; null means a deleted remote head ref.
+    /// Unanswered for an old payload or a refusal (`parse_pull_facts`); null
+    /// means a deleted remote head ref.
     #[serde(default, rename = "headRef")]
     head_ref: HeadRef,
     #[serde(default)]
@@ -948,10 +1063,34 @@ fn is_tolerable_not_found(failure: &QueryFailure, asked: &[u64]) -> bool {
     let [repository, alias] = failure.path.as_slice() else {
         return false;
     };
-    let (Some(repository), Some(alias)) = (repository.as_str(), alias.as_str()) else {
+    let (Some("repository"), Some(alias)) = (repository.as_str(), alias.as_str()) else {
         return false;
     };
-    repository == "repository" && asked.iter().any(|number| alias == format!("p{number}"))
+    FactsAlias::asked(alias, asked).is_some()
+}
+
+/// The asked number whose `headRef`, and nothing else, `failure` refused.
+///
+/// The head ref is read through the head repository, which can refuse a token
+/// the base repository accepts: for a branch in a fork whose organization
+/// enforces SAML, the forge nulls `headRef` and names it in `errors`
+/// (`FORBIDDEN`, `saml_failure`). Whatever the error's type, an error at that
+/// nullable field nulls it alone, so that one field goes unanswered and the
+/// rest of the row stands.
+fn refused_head_ref(failure: &QueryFailure, asked: &[u64]) -> Option<u64> {
+    let [repository, alias, field] = failure.path.as_slice() else {
+        return None;
+    };
+    let (Some("repository"), Some(alias), Some("headRef")) =
+        (repository.as_str(), alias.as_str(), field.as_str())
+    else {
+        return None;
+    };
+    FactsAlias::asked(alias, asked)
+}
+
+fn is_tolerable(failure: &QueryFailure, asked: &[u64]) -> bool {
+    is_tolerable_not_found(failure, asked) || refused_head_ref(failure, asked).is_some()
 }
 
 /// A tip is empty only when its tree is identical to its sole parent's tree.
@@ -1053,7 +1192,7 @@ fn facts_from(payload: FactsPayload) -> Result<PullFacts, ForgeError> {
         _ => None,
     };
     let head_ref_deleted = match payload.head_ref {
-        HeadRef::Missing => None,
+        HeadRef::Unanswered => None,
         HeadRef::Present => Some(false),
         HeadRef::Deleted => Some(true),
     };
@@ -1111,29 +1250,35 @@ pub fn parse_pull_facts(
     payload: &str,
     asked: &[u64],
 ) -> Result<BTreeMap<u64, PullFacts>, ForgeError> {
-    let envelope: FactsEnvelope = serde_json::from_str(payload)?;
-    if envelope
-        .errors
-        .iter()
-        .any(|failure| !is_tolerable_not_found(failure, asked))
-    {
+    let FactsEnvelope { data, errors } = serde_json::from_str(payload)?;
+    if errors.iter().any(|failure| !is_tolerable(failure, asked)) {
         return Err(ForgeError::Query {
-            detail: envelope
-                .errors
+            detail: errors
                 .iter()
-                .filter(|failure| !is_tolerable_not_found(failure, asked))
-                .map(|failure| failure.message.clone())
+                .filter(|failure| !is_tolerable(failure, asked))
+                .map(QueryFailure::described)
                 .collect::<Vec<_>>()
                 .join("; "),
         });
     }
-    let Some(repository) = envelope.data.and_then(|data| data.repository) else {
+    let Some(repository) = data.and_then(|data| data.repository) else {
         return Err(ForgeError::Query {
             detail: "the reply carried neither errors nor a repository".to_owned(),
         });
     };
+    let refused_head_refs: Vec<u64> = errors
+        .iter()
+        .filter_map(|failure| refused_head_ref(failure, asked))
+        .collect();
     let mut facts = BTreeMap::new();
-    for payload in repository.into_values().flatten() {
+    for (alias, payload) in repository {
+        let Some(mut payload) = payload else {
+            continue;
+        };
+        if FactsAlias::asked(&alias, &refused_head_refs).is_some() {
+            // The null beside the refusal is no answer, never a deleted ref.
+            payload.head_ref = HeadRef::Unanswered;
+        }
         let number = payload.pull.number;
         let _ = facts.insert(number, facts_from(payload)?);
     }
@@ -1250,6 +1395,23 @@ mod tests {
     use std::io::{Read as _, Write as _};
     use std::os::unix::fs::PermissionsExt as _;
 
+    /// Writes `script` as an executable `gh` in `directory` and puts that
+    /// directory first on `PATH`.
+    fn install_fake_gh(environment: &EnvironmentGuard, directory: &Path, script: &str) {
+        let gh = directory.join("gh");
+        fs::write(&gh, script).expect("write fake gh");
+        fs::set_permissions(&gh, fs::Permissions::from_mode(0o755))
+            .expect("make fake gh executable");
+        environment.set(
+            "PATH",
+            &format!(
+                "{}:{}",
+                directory.display(),
+                std::env::var("PATH").expect("read PATH")
+            ),
+        );
+    }
+
     struct FakeGhGate {
         directory: tempfile::TempDir,
         entered: std::path::PathBuf,
@@ -1260,7 +1422,6 @@ mod tests {
     impl FakeGhGate {
         fn new(environment: &EnvironmentGuard) -> Self {
             let directory = tempfile::tempdir().expect("temporary fake gh directory");
-            let gh = directory.path().join("gh");
             let lock = directory.path().join("lock");
             let current = directory.path().join("current");
             let max = directory.path().join("max");
@@ -1275,8 +1436,9 @@ mod tests {
                     .expect("create fake gh synchronization fifo");
                 assert!(status.success(), "create fake gh synchronization fifo");
             }
-            fs::write(
-                &gh,
+            install_fake_gh(
+                environment,
+                directory.path(),
                 r#"#!/bin/sh
 set -eu
 lock_counter() {
@@ -1306,17 +1468,6 @@ printf '%s\n' "$((active - 1))" > "$FAKE_GH_CURRENT"
 unlock_counter
 printf '{}'
 "#,
-            )
-            .expect("write fake gh");
-            fs::set_permissions(&gh, fs::Permissions::from_mode(0o755))
-                .expect("make fake gh executable");
-            environment.set(
-                "PATH",
-                &format!(
-                    "{}:{}",
-                    directory.path().display(),
-                    std::env::var("PATH").expect("read PATH")
-                ),
             );
             environment.set("FAKE_GH_LOCK", lock.to_str().expect("utf-8 lock path"));
             environment.set(
@@ -1881,6 +2032,430 @@ printf '{}'
             .expect_err("only asked NOT_FOUND aliases are tolerated");
         assert!(matches!(error, ForgeError::Query { .. }), "was: {error}");
         assert!(error.to_string().contains("rate limited"), "was: {error}");
+    }
+
+    /// The reply a token gets for a pull request whose head branch lives in a
+    /// fork owned by an organization that enforces SAML for that token: the base
+    /// repository answers every field, the head repository refuses `headRef`,
+    /// which comes back null and named in `errors`. Recorded shape, names
+    /// scrubbed (rocq-prover/rocq#22608 under a `public_repo` token, 2026-10-23).
+    const SAML_REFUSED_HEAD_REF: &str = r#"{"data":{"repository":{
+        "p7":{"number":7,"state":"OPEN","headRefName":"feat/sso","headRefOid":"aa",
+        "updatedAt":"2026-10-23T00:00:00Z","headRepositoryOwner":{"login":"sso-org"},
+        "additions":3,"deletions":1,"changedFiles":2,"headRef":null,"body":"why"},
+        "p8":{"number":8,"state":"OPEN","headRefName":"feat/open","headRefOid":"bb",
+        "updatedAt":"2026-10-23T00:00:00Z","headRef":{"name":"feat/open"}}}},
+        "errors":[{"type":"FORBIDDEN","path":["repository","p7","headRef"],
+        "extensions":{"saml_failure":true,"ip_allow_list_failure":false},
+        "locations":[{"line":1,"column":240}],
+        "message":"Resource protected by organization SAML enforcement. You must grant your Personal Access token access to this organization."}]}"#;
+
+    #[test]
+    fn a_head_ref_the_token_may_not_read_is_unanswered_and_the_row_stands() {
+        let facts = parse_pull_facts(SAML_REFUSED_HEAD_REF, &[7, 8])
+            .expect("a refused head ref is one unanswered field, not a failed batch");
+
+        let refused = &facts[&7];
+        assert_eq!(
+            refused.details.head_ref_deleted, None,
+            "the null beside the refusal is no answer: read as deleted, it raises a false incident"
+        );
+        assert_eq!(refused.pull.head_ref_name, "feat/sso");
+        assert_eq!(
+            refused.details.diff,
+            Some(crate::forge::DiffTotals {
+                additions: 3,
+                deletions: 1,
+                changed_files: 2
+            })
+        );
+        assert_eq!(refused.details.body.as_deref(), Some("why"));
+        assert_eq!(
+            facts[&8].details.head_ref_deleted,
+            Some(false),
+            "the refusal names one alias, not the batch"
+        );
+    }
+
+    /// One live chunk holds both tolerated errors and two null head refs that
+    /// mean different things: the refused one is no answer, the one no error
+    /// names is a deleted ref. Recorded shape, names scrubbed (rocq-prover/rocq
+    /// #22608, #1 and #999999 asked together, 2026-10-23).
+    #[test]
+    fn a_refused_head_ref_a_deleted_one_and_an_unknown_number_read_apart_in_one_reply() {
+        let payload = r#"{"data":{"repository":{
+            "p7":{"number":7,"state":"OPEN","headRefName":"feat/sso","headRefOid":"aa",
+            "updatedAt":"2026-10-23T00:00:00Z","headRepositoryOwner":{"login":"sso-org"},
+            "headRef":null},
+            "p1":{"number":1,"state":"CLOSED","headRefName":"fix/old","headRefOid":"bb",
+            "updatedAt":"2011-10-13T12:19:58Z","headRepositoryOwner":{"login":"someone"},
+            "headRef":null},
+            "p300":null}},
+            "errors":[{"type":"NOT_FOUND","path":["repository","p300"],
+            "message":"Could not resolve to a PullRequest with the number of 300."},
+            {"type":"FORBIDDEN","path":["repository","p7","headRef"],
+            "extensions":{"saml_failure":true,"ip_allow_list_failure":false},
+            "message":"Resource protected by organization SAML enforcement."}]}"#;
+
+        let facts = parse_pull_facts(payload, &[7, 1, 300])
+            .expect("both tolerated errors in one reply leave every other row standing");
+
+        assert_eq!(
+            facts[&7].details.head_ref_deleted, None,
+            "the null beside the refusal is no answer"
+        );
+        assert_eq!(
+            facts[&1].details.head_ref_deleted,
+            Some(true),
+            "a null no error names is a deleted ref, whatever else the reply refused"
+        );
+        assert!(!facts.contains_key(&300), "an unknown number is absent");
+    }
+
+    #[test]
+    fn a_tolerated_refusal_does_not_excuse_an_error_beside_it() {
+        let payload = r#"{"data":{"repository":{
+            "p7":{"number":7,"state":"OPEN","headRefName":"feat/sso","headRefOid":"aa",
+            "updatedAt":"2026-10-23T00:00:00Z","headRef":null,"body":null}}},
+            "errors":[{"type":"FORBIDDEN","path":["repository","p7","headRef"],
+            "message":"head ref refused"},
+            {"type":"FORBIDDEN","path":["repository","p7","body"],"message":"body refused"}]}"#;
+
+        let error = parse_pull_facts(payload, &[7])
+            .expect_err("an error that is not tolerated fails the batch beside one that is");
+
+        assert!(matches!(error, ForgeError::Query { .. }), "was: {error}");
+        let detail = error.to_string();
+        assert!(detail.contains("body refused"), "was: {detail}");
+        assert!(
+            !detail.contains("head ref refused"),
+            "the tolerated refusal is not why the batch failed: {detail}"
+        );
+    }
+
+    #[test]
+    fn a_refusal_of_anything_but_an_asked_head_ref_fails_the_whole_batch() {
+        for path in [
+            r#"["repository","p7","body"]"#,
+            r#"["repository","p7"]"#,
+            r#"["repository","p9","headRef"]"#,
+            r#"["repository","p7","headRef","name"]"#,
+            r#"["viewer","p7","headRef"]"#,
+        ] {
+            let payload = format!(
+                r#"{{"data":{{"repository":{{"p7":{{"number":7,"state":"OPEN",
+                "headRefName":"feat/a","headRefOid":"aa","updatedAt":"2026-08-01T00:00:00Z",
+                "headRef":null}}}}}},"errors":[{{"type":"FORBIDDEN","path":{path},
+                "message":"forbidden"}}]}}"#
+            );
+
+            let error = parse_pull_facts(&payload, &[7])
+                .expect_err("only an asked alias's own headRef may go unanswered");
+
+            assert!(
+                matches!(error, ForgeError::Query { .. }),
+                "{path} was: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn any_error_at_exactly_an_asked_head_ref_leaves_it_unanswered() {
+        // Whatever the forge calls the failure, a null head ref it names in
+        // `errors` is no answer; only a null no error names is a deleted ref.
+        for kind in [r#""type":"INTERNAL","#, ""] {
+            let payload = format!(
+                r#"{{"data":{{"repository":{{"p7":{{"number":7,"state":"OPEN",
+                "headRefName":"feat/a","headRefOid":"aa","updatedAt":"2026-08-01T00:00:00Z",
+                "headRef":null}}}}}},"errors":[{{{kind}"path":["repository","p7","headRef"],
+                "message":"head ref unavailable"}}]}}"#
+            );
+
+            let facts = parse_pull_facts(&payload, &[7])
+                .expect("an error at an asked alias's headRef leaves the row standing");
+
+            assert_eq!(facts[&7].details.head_ref_deleted, None, "{kind}");
+        }
+    }
+
+    #[test]
+    fn a_facts_alias_reads_back_as_its_asked_number_and_only_as_written() {
+        for number in [0, 7, 300, u64::MAX] {
+            let alias = FactsAlias(number).to_string();
+            assert_eq!(
+                FactsAlias::asked(&alias, &[number]),
+                Some(number),
+                "{alias}"
+            );
+            assert_eq!(
+                FactsAlias::asked(&alias, &[]),
+                None,
+                "{alias} was not asked"
+            );
+        }
+        for key in ["p07", "p+7", "p", "7", "q7", "p7 ", "p18446744073709551616"] {
+            assert_eq!(
+                FactsAlias::asked(key, &[0, 7]),
+                None,
+                "{key} is no alias the query writes"
+            );
+        }
+    }
+
+    /// A `gh` first on `PATH` that prints `reply` on stdout and `complaint` on
+    /// stderr, then exits 1: what `gh api` does when it fails.
+    fn replying_gh(
+        environment: &EnvironmentGuard,
+        reply: &str,
+        complaint: &str,
+    ) -> tempfile::TempDir {
+        let directory = tempfile::tempdir().expect("temporary fake gh directory");
+        let reply_path = directory.path().join("reply");
+        let complaint_path = directory.path().join("complaint");
+        fs::write(&reply_path, reply).expect("write fake gh reply");
+        fs::write(&complaint_path, complaint).expect("write fake gh complaint");
+        install_fake_gh(
+            environment,
+            directory.path(),
+            &format!(
+                "#!/bin/sh\ncat '{}'\ncat '{}' >&2\nexit 1\n",
+                reply_path.display(),
+                complaint_path.display()
+            ),
+        );
+        directory
+    }
+
+    fn upstream() -> RepoIdentity {
+        RepoIdentity {
+            name_with_owner: "our-org/upstream".to_owned(),
+            id: "R_upstream".to_owned(),
+        }
+    }
+
+    /// The stderr `CliForge` reports for a reply its parser refused with
+    /// `detail`, after `gh_stderr`.
+    fn refused_stderr(gh_stderr: &str, detail: &str) -> String {
+        let refusal = ForgeError::Query {
+            detail: detail.to_owned(),
+        };
+        format!("{gh_stderr}\nknives refused the reply: {refusal}")
+    }
+
+    /// Whether `error` is gh's exit 1 reported with exactly `expected` as stderr.
+    fn is_exit_one_with(error: &ForgeError, expected: &str) -> bool {
+        matches!(error, ForgeError::Command { code: 1, stderr, .. } if stderr == expected)
+    }
+
+    /// A facts reply refusing `body`, which no parser tolerates.
+    const BODY_REFUSED: &str = r#"{"data":{"repository":{"p7":{"number":7,"state":"OPEN",
+        "headRefName":"feat/a","headRefOid":"aa","updatedAt":"2026-08-01T00:00:00Z","body":null}}},
+        "errors":[{"type":"FORBIDDEN","path":["repository","p7","body"],
+        "message":"body forbidden"}]}"#;
+
+    /// What the facts parser says of `BODY_REFUSED`: the message and its field.
+    const BODY_REFUSED_DETAIL: &str = "body forbidden (at repository.p7.body)";
+
+    #[test]
+    fn cli_forge_reads_the_facts_gh_prints_beside_a_head_ref_refusal() {
+        // `gh api graphql` exits 1 whenever the reply carries `errors`, and still
+        // prints the reply. That exit alone must not discard every answer the
+        // forge gave: status read it as "pull request state unavailable".
+        let _environment = environment_lock();
+        let environment = EnvironmentGuard::capture(&["PATH"]);
+        let gh = replying_gh(
+            &environment,
+            SAML_REFUSED_HEAD_REF,
+            "gh: Resource protected by organization SAML enforcement.",
+        );
+
+        let facts = CliForge
+            .pull_facts(gh.path(), &upstream(), &[7, 8])
+            .expect("the reply is read past gh's exit");
+
+        assert_eq!(facts[&7].details.head_ref_deleted, None);
+        assert_eq!(facts[&8].details.head_ref_deleted, Some(false));
+    }
+
+    #[test]
+    fn cli_forge_reads_the_facts_gh_prints_beside_an_unknown_number() {
+        // The same exit for a number the forge does not know: the asked alias
+        // is absent and every other row stands.
+        let _environment = environment_lock();
+        let environment = EnvironmentGuard::capture(&["PATH"]);
+        let gh = replying_gh(
+            &environment,
+            r#"{"data":{"repository":{"p7":{"number":7,"state":"OPEN","headRefName":"feat/a",
+            "headRefOid":"aa","updatedAt":"2026-08-01T00:00:00Z"},"p300":null}},
+            "errors":[{"type":"NOT_FOUND","path":["repository","p300"],
+            "message":"Could not resolve to a PullRequest with the number of 300."}]}"#,
+            "gh: Could not resolve to a PullRequest with the number of 300.",
+        );
+
+        let facts = CliForge
+            .pull_facts(gh.path(), &upstream(), &[7, 300])
+            .expect("an unknown asked number is absent, not a failed batch");
+
+        assert!(facts.contains_key(&7));
+        assert!(!facts.contains_key(&300));
+    }
+
+    #[test]
+    fn cli_forge_keeps_the_command_failure_and_names_the_refusal_for_a_refused_body() {
+        // A reply the parser refuses keeps the command's failure, gh's stderr,
+        // and the refusal beside it.
+        let _environment = environment_lock();
+        let environment = EnvironmentGuard::capture(&["PATH"]);
+        let gh = replying_gh(&environment, BODY_REFUSED, "gh: body forbidden");
+
+        let error = CliForge
+            .pull_facts(gh.path(), &upstream(), &[7])
+            .expect_err("a refusal of anything but headRef fails the batch");
+
+        assert!(
+            is_exit_one_with(
+                &error,
+                &refused_stderr("gh: body forbidden", BODY_REFUSED_DETAIL)
+            ),
+            "was: {error}"
+        );
+    }
+
+    #[test]
+    fn cli_forge_keeps_gh_stderr_alone_for_a_failure_that_printed_no_graphql_reply() {
+        let _environment = environment_lock();
+        let environment = EnvironmentGuard::capture(&["PATH"]);
+        let gh = replying_gh(
+            &environment,
+            r#"{"message":"Bad credentials","status":"401"}"#,
+            "gh: Bad credentials (HTTP 401)",
+        );
+
+        let error = CliForge
+            .pull_facts(gh.path(), &upstream(), &[7])
+            .expect_err("a failure that printed no GraphQL reply stays the command's");
+
+        assert!(
+            is_exit_one_with(&error, "gh: Bad credentials (HTTP 401)"),
+            "was: {error}"
+        );
+    }
+
+    #[test]
+    fn cli_forge_keeps_the_command_failure_beside_a_reply_naming_no_errors() {
+        // Only a reply naming errors explains gh's exit 1. One naming none is no
+        // answer, however whole its data looks, and holds no refusal to report.
+        let _environment = environment_lock();
+        let environment = EnvironmentGuard::capture(&["PATH"]);
+        for errors in [r#""errors":[]"#, r#""errors":null"#] {
+            let gh = replying_gh(
+                &environment,
+                &format!(
+                    r#"{{"data":{{"repository":{{"p7":{{"number":7,"state":"OPEN",
+                    "headRefName":"feat/a","headRefOid":"aa",
+                    "updatedAt":"2026-08-01T00:00:00Z"}}}}}},{errors}}}"#
+                ),
+                "gh: something went wrong",
+            );
+
+            let error = CliForge
+                .pull_facts(gh.path(), &upstream(), &[7])
+                .expect_err("gh's exit stands when the reply names no error");
+
+            assert!(
+                is_exit_one_with(&error, "gh: something went wrong"),
+                "{errors} was: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn cli_forge_says_no_stderr_where_gh_wrote_none() {
+        // gh can fail without a word on stderr: the failure says so, and still
+        // names the refusal when knives refused the reply.
+        let _environment = environment_lock();
+        let environment = EnvironmentGuard::capture(&["PATH"]);
+        let gh = replying_gh(&environment, BODY_REFUSED, "");
+
+        let error = CliForge
+            .pull_facts(gh.path(), &upstream(), &[7])
+            .expect_err("a refusal of anything but headRef fails the batch");
+
+        assert!(
+            is_exit_one_with(&error, &refused_stderr("no stderr", BODY_REFUSED_DETAIL)),
+            "was: {error}"
+        );
+
+        let gh = replying_gh(
+            &environment,
+            r#"{"message":"Bad credentials","status":"401"}"#,
+            "",
+        );
+
+        let error = CliForge
+            .pull_facts(gh.path(), &upstream(), &[7])
+            .expect_err("a failure that printed no GraphQL reply stays the command's");
+
+        assert!(is_exit_one_with(&error, "no stderr"), "was: {error}");
+    }
+
+    #[test]
+    fn cli_forge_keeps_the_command_failure_for_sweep_timeline_and_consumer_replies_with_errors() {
+        // These parsers tolerate no error, so gh's exit 1 stays each call's
+        // failure, with the refusal beside gh's stderr.
+        let _environment = environment_lock();
+        let environment = EnvironmentGuard::capture(&["PATH"]);
+
+        let saml = "Resource protected by organization SAML enforcement.";
+        let gh = replying_gh(
+            &environment,
+            &format!(
+                r#"{{"data":{{"repository":null}},"errors":[{{"type":"FORBIDDEN",
+                "path":["repository"],"message":"{saml}"}}]}}"#
+            ),
+            &format!("gh: {saml}"),
+        );
+        let error = CliForge
+            .sweep(gh.path(), &upstream())
+            .expect_err("a sweep reply with errors is no answer");
+        assert!(
+            is_exit_one_with(&error, &refused_stderr(&format!("gh: {saml}"), saml)),
+            "sweep was: {error}"
+        );
+
+        let missing = "Could not resolve to a PullRequest with the number of 7.";
+        let gh = replying_gh(
+            &environment,
+            &format!(
+                r#"{{"data":{{"repository":{{"pullRequest":null}}}},"errors":[{{"type":"NOT_FOUND",
+                "path":["repository","pullRequest"],"message":"{missing}"}}]}}"#
+            ),
+            &format!("gh: {missing}"),
+        );
+        let error = CliForge
+            .pull_timeline(gh.path(), &upstream(), 7)
+            .expect_err("a timeline reply with errors is no answer");
+        assert!(
+            is_exit_one_with(&error, &refused_stderr(&format!("gh: {missing}"), missing)),
+            "timeline was: {error}"
+        );
+
+        let unknown = "Could not resolve to a Repository with the name 'our-org/consumer'.";
+        let gh = replying_gh(
+            &environment,
+            &format!(
+                r#"{{"data":{{"repository":null}},"errors":[{{"type":"NOT_FOUND",
+                "path":["repository"],"message":"{unknown}"}}]}}"#
+            ),
+            &format!("gh: {unknown}"),
+        );
+        let error = CliForge
+            .consumer_head(gh.path(), "our-org/consumer")
+            .expect_err("a consumer-head reply with errors is no answer");
+        assert!(
+            is_exit_one_with(&error, &refused_stderr(&format!("gh: {unknown}"), unknown)),
+            "consumer head was: {error}"
+        );
     }
 
     #[test]

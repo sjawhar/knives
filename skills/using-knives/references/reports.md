@@ -122,3 +122,5 @@ A read-only check of remote drift, open pull heads, zombie remote branches, rele
 ## `knives pr NUMBER [--repo REPO] [--timeline]`
 
 The current state of one PR. `--timeline` adds a bounded forge event log: force pushes with commit and tree ids, delete and restore, close and reopen, merge. This is history, not a way to change refs.
+
+`head_ref_deleted: true` is the `[deleted-head-ref]` flag. Absent means the forge gave no answer, not `false`, as when a head repository refuses the token (a fork whose organization enforces SAML). That refusal does not fail the PR's other fields.
