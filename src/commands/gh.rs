@@ -2,7 +2,7 @@
 //!
 //! This command executes `gh` directly, so the usual render/run split does not apply:
 //! there is no knives result to render.
-// allow: SIZE_OK: 2619 lines - single passthrough pipeline; splitting would separate resolution steps that read as one procedure.
+// allow: SIZE_OK: 2708 lines - single passthrough pipeline; splitting would separate resolution steps that read as one procedure.
 use std::collections::BTreeMap;
 use std::io::Read as _;
 use std::os::unix::{
@@ -84,18 +84,24 @@ pub fn run(args: &[String]) -> anyhow::Result<std::convert::Infallible> {
         // Verbatim, and before the PR scanner: `gh auth token --hostname pr --user view`
         // would otherwise read as `gh pr view` and die on a bookmark it never needed.
         gh.args(args);
-        std::process::exit(gh_exit_code(&mut gh));
+        std::process::exit(gh_exit_code(&mut gh, None));
     }
     let cwd = std::env::current_dir()?;
-    if std::env::var_os("GH_TOKEN").is_none()
-        && let Some(token) = routed_token(args, &cwd)
+    // The target a watching call re-mints for when it outlives its token; only a
+    // token knives minted can be renewed, never an inherited GH_TOKEN.
+    let renew = if std::env::var_os("GH_TOKEN").is_none()
+        && let Some((token, target)) = routed_token(args, &cwd)
     {
         gh.env("GH_TOKEN", token);
-    }
+        is_watch(args).then_some(target)
+    } else {
+        None
+    };
+    let renew = renew.as_deref();
 
     let Some((subcommand, _)) = pr_subcommand(args) else {
         gh.args(args);
-        std::process::exit(gh_exit_code(&mut gh));
+        std::process::exit(gh_exit_code(&mut gh, renew));
     };
     // Unlike the shim, non-PR calls bypass this read-only probe: only PR calls use
     // its result, so delaying it preserves gh arguments while avoiding needless work.
@@ -109,7 +115,7 @@ pub fn run(args: &[String]) -> anyhow::Result<std::convert::Infallible> {
         .is_ok_and(|status| status.success());
     if !in_jj_repo {
         gh.args(args);
-        std::process::exit(gh_exit_code(&mut gh));
+        std::process::exit(gh_exit_code(&mut gh, renew));
     }
 
     let bookmark = current_bookmark(&cwd);
@@ -157,14 +163,15 @@ pub fn run(args: &[String]) -> anyhow::Result<std::convert::Infallible> {
             "_JJ_BOOKMARK",
             bookmark.as_deref().unwrap_or(DETACHED_BOOKMARK),
         );
-        gh_exit_code(&mut gh)
+        gh_exit_code(&mut gh, renew)
     };
     std::process::exit(exit_code);
 }
 
-/// The App token this call runs with, or None to leave gh on its own auth.
-/// Exits instead when the checkout's git cannot be read or the helper refuses.
-fn routed_token(args: &[String], cwd: &Path) -> Option<String> {
+/// The App token this call runs with and the target it was minted for, or None
+/// to leave gh on its own auth. Exits instead when the checkout's git cannot be
+/// read or the helper refuses.
+fn routed_token(args: &[String], cwd: &Path) -> Option<(String, String)> {
     let resolved = match resolve_target_url(args, cwd) {
         Ok(resolved) => resolved,
         Err(error) => {
@@ -182,8 +189,9 @@ fn routed_token(args: &[String], cwd: &Path) -> Option<String> {
             cwd.display()
         );
     }
-    match mint_token(resolved.as_deref()?, required_token_lifetime(args)) {
-        Mint::Token(token) => Some(token),
+    let target = resolved?;
+    match mint_token(&target, required_token_lifetime(args)) {
+        Mint::Token(token) => Some((token, target)),
         Mint::Refused(code) => std::process::exit(code),
         Mint::Unrouted => None,
     }
@@ -238,20 +246,91 @@ fn no_target_remedy(args: &[String]) -> Option<&'static str> {
 }
 
 /// Waits for gh while preserving its interactive terminal ownership and exit code.
-fn gh_exit_code(gh: &mut Command) -> i32 {
+///
+/// A watching call whose token knives minted for `renew` outlives no token:
+/// gh reads `GH_TOKEN` once, and an installation token lives an hour. So that
+/// call runs for [`WATCH_RESTART_AFTER`] at most; then knives ends it, mints a
+/// fresh token, says so in one stderr line, and runs the same command again.
+/// The last run's status is the call's, so `--exit-status` and gh's own exit
+/// codes are kept.
+fn gh_exit_code(gh: &mut Command, renew: Option<&str>) -> i32 {
     gh.stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .map_or_else(
-            |_| {
-                // This maps every spawn failure to 127; unlike bash, it does not
-                // distinguish an inaccessible executable with exit code 126.
-                eprintln!("knives gh: real gh not found");
-                127
-            },
-            exit_code,
-        )
+        .stderr(Stdio::inherit());
+    let Some(target) = renew else {
+        return gh.status().map_or_else(|_| gh_not_found(), exit_code);
+    };
+    let after = watch_restart_after();
+    loop {
+        if let Some(code) = exit_code_within(gh, after) {
+            return code;
+        }
+        eprintln!(
+            "knives gh: the watch ran {}s on one App token; running it again on a fresh one",
+            after.as_secs()
+        );
+        match mint_token(target, WATCH_TOKEN_LIFETIME) {
+            Mint::Token(token) => {
+                gh.env("GH_TOKEN", token);
+            }
+            Mint::Refused(code) => return code,
+            Mint::Unrouted => {
+                eprintln!("knives gh: gh-app-token no longer answers for {target}");
+                return 1;
+            }
+        }
+    }
+}
+
+/// gh's exit code, or None when it was still running after `after` and knives
+/// ended it (SIGTERM: gh keeps no state a restart needs, and unlike SIGINT it
+/// cannot pass for gh's own exit 1).
+fn exit_code_within(gh: &mut Command, after: std::time::Duration) -> Option<i32> {
+    let Ok(mut child) = gh.spawn() else {
+        return Some(gh_not_found());
+    };
+    let pid = rustix::process::Pid::from_child(&child);
+    let (finished, waiting) = std::sync::mpsc::channel::<()>();
+    let (status, ended) = std::thread::scope(|scope| {
+        let watchdog = scope.spawn(move || {
+            let expired = matches!(
+                waiting.recv_timeout(after),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            );
+            // Already gone is as good as ended; its own status then decides.
+            expired && rustix::process::kill_process(pid, rustix::process::Signal::TERM).is_ok()
+        });
+        let status = child.wait();
+        drop(finished);
+        let ended = watchdog
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        (status, ended)
+    });
+    let Ok(status) = status else {
+        return Some(gh_not_found());
+    };
+    let terminated = status.signal() == Some(rustix::process::Signal::TERM.as_raw());
+    (!(ended && terminated)).then(|| exit_code(status))
+}
+
+/// This maps every spawn failure to 127; unlike bash, it does not distinguish
+/// an inaccessible executable with exit code 126.
+fn gh_not_found() -> i32 {
+    eprintln!("knives gh: real gh not found");
+    127
+}
+
+/// How long one run of a watching call may use its token:
+/// [`WATCH_RESTART_AFTER`], or `KNIVES_GH_WATCH_RESTART_SECS` when set (tests
+/// and a smoke check use a few seconds).
+fn watch_restart_after() -> std::time::Duration {
+    std::time::Duration::from_secs(
+        std::env::var("KNIVES_GH_WATCH_RESTART_SECS")
+            .ok()
+            .and_then(|seconds| seconds.parse().ok())
+            .unwrap_or(WATCH_RESTART_AFTER),
+    )
 }
 
 /// The shell's view of a child's status: its exit code, or 128 + the signal that killed it.
@@ -584,26 +663,34 @@ const CALL_TOKEN_LIFETIME: u64 = 30 * 60;
 /// ran 25-40 minutes.
 const WATCH_TOKEN_LIFETIME: u64 = 60 * 60;
 
+/// Seconds a watching call runs on one token before knives restarts it on a
+/// fresh one: five minutes short of [`WATCH_TOKEN_LIFETIME`], so a token the
+/// helper minted a moment before gh started is still valid at the restart.
+const WATCH_RESTART_AFTER: u64 = WATCH_TOKEN_LIFETIME - 5 * 60;
+
 /// The variable that tells `gh-app-token` how many seconds the token it returns
 /// must stay valid; it mints afresh rather than reuse a cached token with less.
 const MIN_LIFETIME_ENV: &str = "GH_APP_TOKEN_MIN_LIFETIME";
 
 /// How long this call's token must stay valid: [`WATCH_TOKEN_LIFETIME`] for a
-/// call that watches until something finishes (`gh run watch`, `gh pr checks
-/// --watch`, `gh agent-task create|view --follow`), [`CALL_TOKEN_LIFETIME`] for
-/// every other.
+/// call that watches, [`CALL_TOKEN_LIFETIME`] for every other.
 fn required_token_lifetime(args: &[String]) -> u64 {
+    if is_watch(args) {
+        WATCH_TOKEN_LIFETIME
+    } else {
+        CALL_TOKEN_LIFETIME
+    }
+}
+
+/// Whether this call watches until something finishes: `gh run watch`, `gh pr
+/// checks --watch`, `gh agent-task create|view --follow`.
+fn is_watch(args: &[String]) -> bool {
     let flags = before_terminator(args);
-    let watches = match command_words(args) {
+    match command_words(args) {
         Some(("run", _, "watch")) => true,
         Some(("pr", _, "checks")) => bool_flag_set(flags, "--watch"),
         Some(("agent-task", _, "create" | "view")) => bool_flag_set(flags, "--follow"),
         _ => false,
-    };
-    if watches {
-        WATCH_TOKEN_LIFETIME
-    } else {
-        CALL_TOKEN_LIFETIME
     }
 }
 
@@ -1565,6 +1652,8 @@ mod tests {
         // fresh installation token lives exactly the hour a watch asks for.
         const { assert!(CALL_TOKEN_LIFETIME > 5 * 60) };
         assert_eq!(WATCH_TOKEN_LIFETIME, 60 * 60);
+        // A watch restarts on a fresh token five minutes before its token expires.
+        assert_eq!(WATCH_RESTART_AFTER, 55 * 60);
     }
 
     #[test]

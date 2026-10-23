@@ -7,7 +7,7 @@
 
 #[path = "common/lab.rs"]
 mod lab;
-// allow: SIZE_OK: 1965 lines - real-binary gh passthrough scenarios share one fixture and process harness.
+// allow: SIZE_OK: 2059 lines - real-binary gh passthrough scenarios share one fixture and process harness.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
@@ -1962,4 +1962,98 @@ exit 127
             .count(),
         1
     );
+}
+
+/// A fake gh that records each run's token and arguments in `$FAKE_DIR/calls`,
+/// watches (sleeps three seconds, then exits 0) on its first run, and on any
+/// later run exits 3 at once, as `gh run watch --exit-status` does for a failed
+/// run. A helper that answers `tok-1`, `tok-2`, … one per mint.
+fn watching_fakes() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("fake dir");
+    let gh = dir.path().join("gh");
+    fs::write(
+        &gh,
+        "#!/bin/sh\nn=$(($(cat \"$FAKE_DIR/gh-runs\" 2>/dev/null || echo 0) + 1))\necho \"$n\" > \"$FAKE_DIR/gh-runs\"\nprintf '%s %s\\n' \"$GH_TOKEN\" \"$*\" >> \"$FAKE_DIR/calls\"\n[ \"$n\" -gt 1 ] && exit 3\nexec sleep 3\n",
+    )
+    .expect("write watching fake gh");
+    let helper = dir.path().join("gh-app-token");
+    fs::write(
+        &helper,
+        "#!/bin/sh\ncat > /dev/null\nn=$(($(cat \"$FAKE_DIR/mints\" 2>/dev/null || echo 0) + 1))\necho \"$n\" > \"$FAKE_DIR/mints\"\nprintf 'username=x-access-token\\npassword=tok-%s\\n' \"$n\"\n",
+    )
+    .expect("write counting gh-app-token");
+    for script in [&gh, &helper] {
+        fs::set_permissions(script, fs::Permissions::from_mode(0o755)).expect("chmod fake");
+    }
+    token_config(dir.path(), "agent");
+    dir
+}
+
+/// Runs `arguments` through knives with the [`watching_fakes`], restarting a
+/// watch after one second; returns knives' output and the runs gh recorded.
+fn run_watching(
+    arguments: &[&str],
+    inherited_token: Option<&str>,
+) -> (std::process::Output, String) {
+    let fakes = watching_fakes();
+    let scratch = tempfile::tempdir().expect("scratch");
+    let mut command = knives_cmd(fakes.path());
+    command
+        .args(["gh", "--"])
+        .args(arguments)
+        .current_dir(scratch.path())
+        .env("KNIVES_REAL_GH", fakes.path().join("gh"))
+        .env("KNIVES_GH_WATCH_RESTART_SECS", "1")
+        .env("FAKE_DIR", fakes.path())
+        .env("PATH", helper_path(fakes.path()));
+    if let Some(token) = inherited_token {
+        command.env("GH_TOKEN", token);
+    }
+    let output = command.output().expect("run knives gh");
+    let calls = fs::read_to_string(fakes.path().join("calls")).expect("fake gh ran");
+    (output, calls)
+}
+
+#[test]
+fn a_watch_that_outlives_its_run_window_runs_again_on_a_fresh_token() {
+    // Given/When: a watch still running when its window (here one second) ends.
+    let (output, calls) = run_watching(
+        &["run", "watch", "9", "-R", "acme/widgets", "--exit-status"],
+        None,
+    );
+
+    // Then: knives ended it, ran the same command on a newly minted token, said so
+    // once, and exits with the last run's own status.
+    assert_eq!(
+        calls,
+        "tok-1 run watch 9 -R acme/widgets --exit-status\ntok-2 run watch 9 -R acme/widgets --exit-status\n"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr.matches("running it again on a fresh one").count(),
+        1,
+        "{stderr}"
+    );
+    assert_eq!(output.status.code(), Some(3), "{stderr}");
+}
+
+#[test]
+fn only_a_watch_on_a_token_knives_minted_is_restarted() {
+    for (arguments, inherited) in [
+        // Not a watch: it runs to its end however long it takes.
+        (&["run", "view", "9", "-R", "acme/widgets"][..], None),
+        (&["pr", "checks", "7", "-R", "acme/widgets"], None),
+        // A watch on an inherited GH_TOKEN: knives cannot renew a token it did not mint.
+        (
+            &["run", "watch", "9", "-R", "acme/widgets"],
+            Some("ghs_inherited"),
+        ),
+    ] {
+        // When: the call runs past the one-second window.
+        let (output, calls) = run_watching(arguments, inherited);
+
+        // Then: gh ran once, to its own end.
+        assert_eq!(calls.lines().count(), 1, "{arguments:?}: {calls}");
+        assert_eq!(output.status.code(), Some(0), "{arguments:?}: {output:?}");
+    }
 }
