@@ -7,7 +7,7 @@
 
 #[path = "common/lab.rs"]
 mod lab;
-// allow: SIZE_OK: 1769 lines - real-binary gh passthrough scenarios share one fixture and process harness.
+// allow: SIZE_OK: 1964 lines - real-binary gh passthrough scenarios share one fixture and process harness.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
@@ -684,6 +684,201 @@ fn a_repository_positional_beats_gh_repo_and_the_checkout_remote() {
         let recorded = fs::read_to_string(&log).expect("fake gh ran");
         assert!(
             recorded.contains("GH_TOKEN=tok-acme"),
+            "{arguments:?}: {recorded}"
+        );
+    }
+}
+
+/// `gh pr`, `gh issue` and `gh agent-task view` calls whose selector is a URL
+/// of acme/widgets, which gh 2.98 acts on whatever `-R` or the checkout say.
+fn acme_widgets_selector_url_calls() -> Vec<Vec<String>> {
+    let host = concat!("github", ".com");
+    let pull = format!("https://{host}/acme/widgets/pull/2112");
+    let files = format!("https://www.{host}/acme/widgets/pull/2112/files");
+    let issue = format!("https://{host}/acme/widgets/issues/9");
+    let calls: [&[&str]; 11] = [
+        &["pr", "view", &pull, "--json", "state"],
+        &["pr", "view", "--json", "state", &pull],
+        &["pr", "checks", &pull, "--watch"],
+        &["pr", "diff", &files],
+        &["pr", "comment", &pull, "--body", "hi"],
+        &["pr", "merge", "--squash", &pull],
+        &["pr", "view", "--", &pull],
+        &["issue", "view", &issue],
+        &["issue", "comment", &pull, "-b", "hi"],
+        &["issue", "close", &issue],
+        &["agent-task", "view", &pull],
+    ];
+    calls
+        .iter()
+        .map(|call| call.iter().map(|word| (*word).to_owned()).collect())
+        .collect()
+}
+
+#[test]
+fn a_selector_url_routes_gh_pr_and_issue_outside_a_checkout() {
+    // Given: a scratch directory with no remote and a helper that mints per owner.
+    let scratch = tempfile::tempdir().expect("scratch");
+    let helper_dir = fake_app_token();
+    let gitconfig = token_config(helper_dir.path(), "fallback");
+    for arguments in acme_widgets_selector_url_calls() {
+        let (dir, log) = fake_gh();
+
+        // When: knives invokes a gh call whose selector is a URL.
+        let output = knives_cmd(helper_dir.path())
+            .args(["gh", "--"])
+            .args(&arguments)
+            .current_dir(scratch.path())
+            .env_remove("GH_REPO")
+            .env("KNIVES_REAL_GH", dir.path().join("gh"))
+            .env("FAKE_GH_LOG", &log)
+            .env("PATH", helper_path(helper_dir.path()))
+            .env("GIT_CONFIG_GLOBAL", &gitconfig)
+            .output()
+            .expect("run knives gh");
+
+        // Then: the URL owner's token is used, gh sees the arguments unchanged,
+        // and no no-target line is printed.
+        let recorded = fs::read_to_string(&log).expect("fake gh ran");
+        assert!(
+            recorded.contains("GH_TOKEN=tok-acme"),
+            "{arguments:?}: {recorded}"
+        );
+        assert!(
+            recorded.starts_with(&format!("{}\n", arguments.join("\n"))),
+            "{arguments:?}: {recorded}"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains("no target repository"),
+            "{arguments:?}: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn a_selector_url_beats_the_repo_flag_gh_repo_and_the_checkout_remote() {
+    // Given: a checkout whose origin is another owner's, GH_REPO naming a third,
+    // and a helper that mints per owner.
+    let lab = lab::Lab::new();
+    let host = concat!("github", ".com");
+    git_config(
+        &lab.work,
+        &["remote.origin.url", &format!("https://{host}/other/thing")],
+    );
+    let helper_dir = fake_app_token();
+    let gitconfig = token_config(helper_dir.path(), "fallback");
+    for mut arguments in acme_widgets_selector_url_calls() {
+        arguments.extend(["-R".to_owned(), "rival/y".to_owned()]);
+        let (dir, log) = fake_gh();
+
+        // When: the call also passes -R for a rival, as gh ignores for a URL.
+        let output = knives_cmd(helper_dir.path())
+            .args(["gh", "--"])
+            .args(&arguments)
+            .current_dir(&lab.work)
+            .env("GH_REPO", "elsewhere/thing")
+            .env("KNIVES_REAL_GH", dir.path().join("gh"))
+            .env("FAKE_GH_LOG", &log)
+            .env("PATH", helper_path(helper_dir.path()))
+            .env("GIT_CONFIG_GLOBAL", &gitconfig)
+            .output()
+            .expect("run knives gh");
+
+        // Then: the token is acme's, the repository gh acts on.
+        assert!(output.status.success(), "{arguments:?}: {output:?}");
+        let recorded = fs::read_to_string(&log).expect("fake gh ran");
+        assert!(
+            recorded.contains("GH_TOKEN=tok-acme"),
+            "{arguments:?}: {recorded}"
+        );
+    }
+}
+
+#[test]
+fn a_url_that_is_not_a_selector_does_not_route() {
+    // Given: a scratch directory with no remote and a helper that mints per owner.
+    let scratch = tempfile::tempdir().expect("scratch");
+    let helper_dir = fake_app_token();
+    let gitconfig = token_config(helper_dir.path(), "fallback");
+    let host = concat!("github", ".com");
+    let pull = format!("https://{host}/acme/widgets/pull/2112");
+    let run = format!("https://{host}/acme/widgets/actions/runs/9");
+    let other_host = "https://forge.example/acme/widgets/pull/2112".to_owned();
+    for arguments in [
+        &["pr", "comment", "5", "--body", &pull][..],
+        &["pr", "view", &other_host],
+        &["issue", "list", "--search", &pull],
+        &["run", "view", &run],
+        &["search", "prs", &pull],
+    ] {
+        let (dir, log) = fake_gh();
+
+        // When: the URL is a flag value, another host's, or where gh reads no URL.
+        knives_cmd(helper_dir.path())
+            .args(["gh", "--"])
+            .args(arguments)
+            .current_dir(scratch.path())
+            .env_remove("GH_REPO")
+            .env("KNIVES_REAL_GH", dir.path().join("gh"))
+            .env("FAKE_GH_LOG", &log)
+            .env("PATH", helper_path(helper_dir.path()))
+            .env("GIT_CONFIG_GLOBAL", &gitconfig)
+            .output()
+            .expect("run knives gh");
+
+        // Then: no token is minted for the URL's owner.
+        let recorded = fs::read_to_string(&log).expect("fake gh ran");
+        assert!(
+            !recorded.contains("GH_TOKEN=tok-acme"),
+            "{arguments:?}: {recorded}"
+        );
+    }
+}
+
+#[test]
+fn a_watching_call_asks_the_helper_for_a_fresh_tokens_hour() {
+    // Given: a helper that answers with the lifetime knives asked it for.
+    let scratch = tempfile::tempdir().expect("scratch");
+    let helper_dir = tempfile::tempdir().expect("fake helper dir");
+    let helper = helper_dir.path().join("gh-app-token");
+    fs::write(
+        &helper,
+        "#!/bin/sh\ncat > /dev/null\nlifetime=\"$GH_APP_TOKEN_MIN_LIFETIME\"\n[ -n \"$lifetime\" ] || lifetime=unset\nprintf 'username=x-access-token\\npassword=life-%s\\n' \"$lifetime\"\n",
+    )
+    .expect("write lifetime-echoing gh-app-token");
+    fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).expect("chmod helper");
+    let gitconfig = token_config(helper_dir.path(), "agent");
+    for (arguments, lifetime) in [
+        (
+            &["run", "watch", "39834746929", "--exit-status"][..],
+            "3600",
+        ),
+        (&["pr", "checks", "7", "--watch"], "3600"),
+        (&["run", "view", "39834746929"], "1800"),
+        (&["pr", "checks", "7"], "1800"),
+    ] {
+        let (dir, log) = fake_gh();
+
+        // When: knives runs the call for a named repository.
+        knives_cmd(helper_dir.path())
+            .args(["gh", "--"])
+            .args(arguments)
+            .args(["-R", "acme/widgets"])
+            .current_dir(scratch.path())
+            .env_remove("GH_APP_TOKEN_MIN_LIFETIME")
+            .env("KNIVES_REAL_GH", dir.path().join("gh"))
+            .env("FAKE_GH_LOG", &log)
+            .env("PATH", helper_path(helper_dir.path()))
+            .env("GIT_CONFIG_GLOBAL", &gitconfig)
+            .output()
+            .expect("run knives gh");
+
+        // Then: a watch asks for the hour a fresh token lives; any other call for
+        // half an hour, more than the five minutes a cached token may have left.
+        let recorded = fs::read_to_string(&log).expect("fake gh ran");
+        assert!(
+            recorded.contains(&format!("GH_TOKEN=life-{lifetime}\n")),
             "{arguments:?}: {recorded}"
         );
     }

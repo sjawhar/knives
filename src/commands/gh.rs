@@ -2,7 +2,7 @@
 //!
 //! This command executes `gh` directly, so the usual render/run split does not apply:
 //! there is no knives result to render.
-// allow: SIZE_OK: 2329 lines - single passthrough pipeline; splitting would separate resolution steps that read as one procedure.
+// allow: SIZE_OK: 2589 lines - single passthrough pipeline; splitting would separate resolution steps that read as one procedure.
 use std::collections::BTreeMap;
 use std::io::Read as _;
 use std::os::unix::{
@@ -87,33 +87,9 @@ pub fn run(args: &[String]) -> anyhow::Result<std::convert::Infallible> {
         std::process::exit(gh_exit_code(&mut gh));
     }
     let cwd = std::env::current_dir()?;
-    let token = if std::env::var_os("GH_TOKEN").is_some() {
-        None
-    } else {
-        let resolved = match resolve_target_url(args, &cwd) {
-            Ok(resolved) => resolved,
-            Err(error) => {
-                // A checkout whose git is broken is not an unrouted target:
-                // falling through would run gh on ambient auth, and an agent
-                // session has none, so the agent would see gh's login error
-                // instead of git's.
-                eprintln!("knives gh: {error}");
-                std::process::exit(1);
-            }
-        };
-        if let (None, Some(remedy)) = (&resolved, no_target_remedy(args)) {
-            eprintln!(
-                "knives gh: no target repository (no -R/--repo flag, no <owner>/<repo> argument, no owner in the api path, and no GitHub remote in {}); {remedy} Setting GH_TOKEN bypasses App routing.",
-                cwd.display()
-            );
-        }
-        match resolved.as_deref().map(mint_token) {
-            Some(Mint::Token(token)) => Some(token),
-            Some(Mint::Refused(code)) => std::process::exit(code),
-            Some(Mint::Unrouted) | None => None,
-        }
-    };
-    if let Some(token) = token {
+    if std::env::var_os("GH_TOKEN").is_none()
+        && let Some(token) = routed_token(args, &cwd)
+    {
         gh.env("GH_TOKEN", token);
     }
 
@@ -184,6 +160,33 @@ pub fn run(args: &[String]) -> anyhow::Result<std::convert::Infallible> {
         gh_exit_code(&mut gh)
     };
     std::process::exit(exit_code);
+}
+
+/// The App token this call runs with, or None to leave gh on its own auth.
+/// Exits instead when the checkout's git cannot be read or the helper refuses.
+fn routed_token(args: &[String], cwd: &Path) -> Option<String> {
+    let resolved = match resolve_target_url(args, cwd) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            // A checkout whose git is broken is not an unrouted target:
+            // falling through would run gh on ambient auth, and an agent
+            // session has none, so the agent would see gh's login error
+            // instead of git's.
+            eprintln!("knives gh: {error}");
+            std::process::exit(1);
+        }
+    };
+    if let (None, Some(remedy)) = (&resolved, no_target_remedy(args)) {
+        eprintln!(
+            "knives gh: no target repository (no -R/--repo flag, no <owner>/<repo> argument, no owner in the api path, and no GitHub remote in {}); {remedy} Setting GH_TOKEN bypasses App routing.",
+            cwd.display()
+        );
+    }
+    match mint_token(resolved.as_deref()?, required_token_lifetime(args)) {
+        Mint::Token(token) => Some(token),
+        Mint::Refused(code) => std::process::exit(code),
+        Mint::Unrouted => None,
+    }
 }
 
 /// What names a repository for this command when nothing routed it, or None for
@@ -328,6 +331,13 @@ pub(crate) fn pr_subcommand(args: &[String]) -> Option<(String, usize)> {
 
 /// Whether a positional target follows `subcommand` (shim lines 343-384).
 pub(crate) fn has_positional_target(subcommand: &str, args: &[String]) -> bool {
+    first_positional(subcommand, args).is_some()
+}
+
+/// The first positional after `subcommand`, skipping flags and the values of
+/// the flags that take one, or the first word after `--` when the subcommand
+/// came before it.
+fn first_positional<'a>(subcommand: &str, args: &'a [String]) -> Option<&'a str> {
     let flags = before_terminator(args);
     let mut found_subcommand = false;
     let mut previous_was_value_flag = false;
@@ -350,14 +360,17 @@ pub(crate) fn has_positional_target(subcommand: &str, args: &[String]) -> bool {
                 }
                 continue;
             }
-            return true;
+            return Some(argument);
         }
         if argument == subcommand {
             found_subcommand = true;
         }
     }
     // Words after `--` are positionals: a target when the subcommand came first.
-    found_subcommand && args.len() > flags.len() + 1
+    found_subcommand
+        .then(|| args.get(flags.len() + 1))
+        .flatten()
+        .map(String::as_str)
 }
 
 /// Whether the caller already supplied `--head` (shim lines 332-339).
@@ -543,6 +556,63 @@ pub(crate) fn is_auth_command(args: &[String]) -> bool {
     args.first().map(String::as_str) == Some("auth")
 }
 
+/// Seconds the token an ordinary gh call starts with must stay valid. gh reads
+/// `GH_TOKEN` once and holds it for the whole call, so a token about to expire
+/// fails the call partway with `HTTP 401: Bad credentials`; half an hour covers
+/// a large `gh run download` or a paginated `gh api` sweep.
+const CALL_TOKEN_LIFETIME: u64 = 30 * 60;
+
+/// Seconds a watching call's token must stay valid: a fresh installation
+/// token's whole hour, since a watch runs as long as the thing it watches.
+/// 2026-10-22: `gh run watch` was handed a cached token with twelve minutes
+/// left and died with 401 after 720 s, while watches handed fresher tokens
+/// ran 25-40 minutes.
+const WATCH_TOKEN_LIFETIME: u64 = 60 * 60;
+
+/// The variable that tells `gh-app-token` how many seconds the token it returns
+/// must stay valid; it mints afresh rather than reuse a cached token with less.
+const MIN_LIFETIME_ENV: &str = "GH_APP_TOKEN_MIN_LIFETIME";
+
+/// How long this call's token must stay valid: [`WATCH_TOKEN_LIFETIME`] for a
+/// call that watches until something finishes (`gh run watch`, `gh pr checks
+/// --watch`, `gh agent-task create|view --follow`), [`CALL_TOKEN_LIFETIME`] for
+/// every other.
+fn required_token_lifetime(args: &[String]) -> u64 {
+    let flags = before_terminator(args);
+    let mut words = flags
+        .iter()
+        .filter(|argument| !argument.starts_with('-'))
+        .map(String::as_str);
+    let watches = match (words.next(), words.next()) {
+        (Some("run"), Some("watch")) => true,
+        (Some("pr"), Some("checks")) => bool_flag_set(flags, "--watch"),
+        (Some("agent-task"), Some("create" | "view")) => bool_flag_set(flags, "--follow"),
+        _ => false,
+    };
+    if watches {
+        WATCH_TOKEN_LIFETIME
+    } else {
+        CALL_TOKEN_LIFETIME
+    }
+}
+
+/// Whether boolean flag `name` ends up set, as pflag reads it: the last of
+/// `--name` and `--name=<bool>` wins.
+fn bool_flag_set(flags: &[String], name: &str) -> bool {
+    flags.iter().fold(false, |set, flag| {
+        if flag == name {
+            true
+        } else if let Some(value) = flag
+            .strip_prefix(name)
+            .and_then(|rest| rest.strip_prefix('='))
+        {
+            matches!(value, "1" | "t" | "T" | "true" | "TRUE" | "True")
+        } else {
+            set
+        }
+    })
+}
+
 /// Asks git's routed credential helper for the token gh should run with.
 ///
 /// Reads git's own credential config and speaks the credential-helper protocol
@@ -561,7 +631,11 @@ pub(crate) fn is_auth_command(args: &[String]) -> bool {
 /// password on a failing path. Only an exit-0 UTF-8 answer with no password is
 /// [`Mint::Unrouted`], like a host no helper is configured for; an exit-0 answer
 /// knives cannot read is a refusal, not a fall-through to gh's own auth.
-pub(crate) fn mint_token(target_url: &str) -> Mint {
+///
+/// The helper is told how long the token must stay valid (`min_lifetime`
+/// seconds, through [`MIN_LIFETIME_ENV`]): it caches tokens and would otherwise
+/// hand out one with as little as five minutes left.
+pub(crate) fn mint_token(target_url: &str, min_lifetime: u64) -> Mint {
     let Some(path) = credential_path(target_url) else {
         return Mint::Unrouted;
     };
@@ -589,6 +663,7 @@ pub(crate) fn mint_token(target_url: &str) -> Mint {
     let request = format!("protocol=https\nhost={DEFAULT_HOST}\npath={path}\n\n");
     let mut child = match Command::new("gh-app-token")
         .args([profile, "get"])
+        .env(MIN_LIFETIME_ENV, min_lifetime.to_string())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -984,15 +1059,69 @@ pub(crate) fn repo_flag(args: &[String]) -> Option<String> {
     None
 }
 
+/// The `<owner>/<repo>` a `gh pr`, `gh issue` or `gh agent-task view` selector
+/// URL names (`gh pr view https://<DEFAULT_HOST>/acme/widgets/pull/7`). gh acts on
+/// the URL's repository whatever `-R`, `GH_REPO` or the checkout say (gh 2.98:
+/// `pr/shared/finder.go` `ParseURL`, `issue/shared/lookup.go`
+/// `tryParseIssueFromURL`). `gh run` and `gh workflow` take numeric ids, never
+/// URLs, so they have no such selector.
+fn selector_url_target(args: &[String]) -> Option<String> {
+    let mut words = before_terminator(args)
+        .iter()
+        .filter(|argument| !argument.starts_with('-'))
+        .map(String::as_str);
+    let (group, subcommand) = (words.next()?, words.next()?);
+    let kinds: &[&str] = match (group, subcommand) {
+        ("pr", _) | ("agent-task", "view") => &["pull"],
+        ("issue", _) => &["issues", "pull"],
+        _ => return None,
+    };
+    github_selector_repo(first_positional(subcommand, args)?, kinds)
+}
+
+/// The `<owner>/<repo>` of an http(s) URL on the App's host whose path is
+/// `/<owner>/<repo>/<kind>/<number>…` for one of `kinds`, read as gh reads it:
+/// userinfo and port dropped, the host lowercased without `www.`, the number
+/// only a leading run of digits. Another host's URL routes nothing: the App's
+/// routes cover the default host alone.
+fn github_selector_repo(selector: &str, kinds: &[&str]) -> Option<String> {
+    let rest = selector
+        .strip_prefix("https://")
+        .or_else(|| selector.strip_prefix("http://"))?;
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, path) = rest.split_at(end);
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    let host = host.split_once(':').map_or(host, |(host, _)| host);
+    let host = host.to_ascii_lowercase();
+    if host.strip_prefix("www.").unwrap_or(&host) != DEFAULT_HOST {
+        return None;
+    }
+    let path = path.split(['?', '#']).next().unwrap_or_default();
+    let mut segments = path.strip_prefix('/')?.split('/');
+    let (owner, repo, kind, number) = (
+        segments.next()?,
+        segments.next()?,
+        segments.next()?,
+        segments.next()?,
+    );
+    (!owner.is_empty()
+        && !repo.is_empty()
+        && kinds.contains(&kind)
+        && number.starts_with(|character: char| character.is_ascii_digit()))
+    .then(|| format!("{owner}/{repo}"))
+}
+
 /// The https URL targeted by this invocation (shim lines 75-179), or `Ok(None)`
 /// when nothing routes (outside any repository, or a repository with no usable
 /// remote).
 ///
 /// Errs when routing needs git and the invocation sits inside a checkout whose
 /// git cannot be read — a broken worktree registration, say. Arguments that
-/// name the target themselves (`-R`, a `gh repo` repository positional,
-/// `GH_REPO`, a `gh api` owner) read no git and still resolve. The caller
-/// reports git's own words and stops: resolving
+/// name the target themselves (a PR or issue selector URL, `-R`, a `gh repo`
+/// repository positional, `GH_REPO`, a `gh api` owner) read no git and still
+/// resolve. The caller reports git's own words and stops: resolving
 /// such a checkout to "no target" would run gh on ambient auth, which an agent
 /// session does not have, so the agent would see gh's login error instead of
 /// git's.
@@ -1001,11 +1130,13 @@ pub(crate) fn resolve_target_url(
     cwd: &Path,
 ) -> Result<Option<String>, crate::bind::BindError> {
     let api_owner = owner_from_api_args(args);
-    let repo_spec = repo_subcommand(args)
-        .map_or_else(
-            || repo_flag(args),
-            |subcommand| repo_subcommand_target(args, &subcommand),
-        )
+    let repo_spec = selector_url_target(args)
+        .or_else(|| {
+            repo_subcommand(args).map_or_else(
+                || repo_flag(args),
+                |subcommand| repo_subcommand_target(args, &subcommand),
+            )
+        })
         .or_else(gh_repo_environment);
     let needs_git_inputs = api_owner.is_none() && repo_spec.is_none();
     let resolved_remote = needs_git_inputs.then(|| gh_resolved_remote(cwd)).flatten();
@@ -1348,7 +1479,12 @@ mod tests {
                 ("GIT_CONFIG_NOSYSTEM", "1"),
                 ("GIT_CONFIG_COUNT", "0"),
             ],
-            || mint_token(&format!("https://{host}/acme/work.git")),
+            || {
+                mint_token(
+                    &format!("https://{host}/acme/work.git"),
+                    CALL_TOKEN_LIFETIME,
+                )
+            },
         );
         (dir, mint)
     }
@@ -1358,14 +1494,133 @@ mod tests {
         // Given: a fake gh-app-token that echoes a password when fed a path.
         // When: minting for a target under the routed host.
         let (dir, mint) = mint_through(
-            "#!/bin/sh\ncat > \"$0.request\"\nprintf 'username=x-access-token\\npassword=tok-%s\\n' \"$1\"\n",
+            "#!/bin/sh\ncat > \"$0.request\"\nprintf '%s' \"$GH_APP_TOKEN_MIN_LIFETIME\" > \"$0.lifetime\"\nprintf 'username=x-access-token\\npassword=tok-%s\\n' \"$1\"\n",
         );
 
-        // Then: the token comes back and the helper saw the credential request.
+        // Then: the token comes back, the helper saw the credential request, and
+        // it was told how long the token must stay valid.
         assert_eq!(mint, Mint::Token("tok-acme".to_owned()));
         let request = std::fs::read_to_string(dir.path().join("gh-app-token.request"))
             .expect("request captured");
         assert!(request.contains("path=acme/work.git"), "{request}");
+        let lifetime = std::fs::read_to_string(dir.path().join("gh-app-token.lifetime"))
+            .expect("lifetime captured");
+        assert_eq!(lifetime, CALL_TOKEN_LIFETIME.to_string());
+    }
+
+    #[test]
+    fn a_watching_call_needs_a_fresh_tokens_hour_and_any_other_half_an_hour() {
+        let args = |a: &[&str]| a.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        for watching in [
+            &["run", "watch", "123"][..],
+            &["run", "watch", "-R", "acme/widgets", "123", "--exit-status"],
+            &["pr", "checks", "7", "--watch"],
+            &["pr", "checks", "--watch=true", "--fail-fast"],
+            &["pr", "checks", "--watch=false", "--watch"],
+            &["agent-task", "view", "--follow"],
+            &["agent-task", "create", "do it", "--follow"],
+        ] {
+            assert_eq!(
+                required_token_lifetime(&args(watching)),
+                WATCH_TOKEN_LIFETIME,
+                "{watching:?}"
+            );
+        }
+        for ordinary in [
+            &["run", "view", "123"][..],
+            &["pr", "checks", "7"],
+            &["pr", "checks", "--watch", "--watch=false"],
+            &["pr", "view", "--watch"],
+            &["api", "repos/acme/widgets"],
+            &["search", "issues", "--", "run", "watch"],
+            &["pr", "checks", "--", "--watch"],
+        ] {
+            assert_eq!(
+                required_token_lifetime(&args(ordinary)),
+                CALL_TOKEN_LIFETIME,
+                "{ordinary:?}"
+            );
+        }
+        // A watch outlives the five minutes a cached token may have left, and a
+        // fresh installation token lives exactly the hour a watch asks for.
+        const { assert!(CALL_TOKEN_LIFETIME > 5 * 60) };
+        assert_eq!(WATCH_TOKEN_LIFETIME, 60 * 60);
+    }
+
+    #[test]
+    fn a_selector_url_names_its_repository_as_gh_reads_it() {
+        let host = concat!("github", ".com");
+        let pull: &[&str] = &["pull"];
+        let issue: &[&str] = &["issues", "pull"];
+        for (selector, kinds, expected) in [
+            (
+                format!("https://{host}/acme/widgets/pull/7"),
+                pull,
+                Some("acme/widgets"),
+            ),
+            (
+                format!("https://{host}/acme/widgets/pull/7/files"),
+                pull,
+                Some("acme/widgets"),
+            ),
+            (
+                format!("http://{host}/acme/widgets/pull/7#top"),
+                pull,
+                Some("acme/widgets"),
+            ),
+            (
+                format!("https://www.{host}/acme/widgets/pull/7"),
+                pull,
+                Some("acme/widgets"),
+            ),
+            (
+                format!(
+                    "https://{}:443/acme/widgets/pull/7?x=1",
+                    host.to_ascii_uppercase()
+                ),
+                pull,
+                Some("acme/widgets"),
+            ),
+            (
+                format!("https://bot@{host}/acme/widgets/pull/7"),
+                pull,
+                Some("acme/widgets"),
+            ),
+            (
+                format!("https://{host}/acme/widgets/issues/3"),
+                issue,
+                Some("acme/widgets"),
+            ),
+            (
+                format!("https://{host}/acme/widgets/pull/3"),
+                issue,
+                Some("acme/widgets"),
+            ),
+            (format!("https://{host}/acme/widgets/issues/3"), pull, None),
+            (format!("https://{host}/acme/widgets/pull/"), pull, None),
+            (format!("https://{host}/acme/widgets/pull/x7"), pull, None),
+            (
+                format!("https://{host}/acme/widgets/actions/runs/9"),
+                issue,
+                None,
+            ),
+            (format!("https://{host}/acme/widgets"), pull, None),
+            (format!("https://{host}//widgets/pull/7"), pull, None),
+            (
+                "https://forge.example/acme/widgets/pull/7".to_owned(),
+                pull,
+                None,
+            ),
+            (format!("ssh://{host}/acme/widgets/pull/7"), pull, None),
+            (format!("{host}/acme/widgets/pull/7"), pull, None),
+            ("7".to_owned(), pull, None),
+        ] {
+            assert_eq!(
+                github_selector_repo(&selector, kinds).as_deref(),
+                expected,
+                "{selector}"
+            );
+        }
     }
 
     #[test]
@@ -1442,7 +1697,12 @@ mod tests {
                 ("GIT_CONFIG_NOSYSTEM", "1"),
                 ("GIT_CONFIG_COUNT", "0"),
             ],
-            || mint_token(&format!("https://{host}/acme/work.git")),
+            || {
+                mint_token(
+                    &format!("https://{host}/acme/work.git"),
+                    CALL_TOKEN_LIFETIME,
+                )
+            },
         );
 
         // Then: nothing is routed, so gh runs on its own auth.
