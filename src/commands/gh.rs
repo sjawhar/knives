@@ -2,7 +2,7 @@
 //!
 //! This command executes `gh` directly, so the usual render/run split does not apply:
 //! there is no knives result to render.
-// allow: SIZE_OK: 2708 lines - single passthrough pipeline; splitting would separate resolution steps that read as one procedure.
+// allow: SIZE_OK: 2746 lines - single passthrough pipeline; splitting would separate resolution steps that read as one procedure.
 use std::collections::BTreeMap;
 use std::io::Read as _;
 use std::os::unix::{
@@ -93,7 +93,7 @@ pub fn run(args: &[String]) -> anyhow::Result<std::convert::Infallible> {
         && let Some((token, target)) = routed_token(args, &cwd)
     {
         gh.env("GH_TOKEN", token);
-        is_watch(args).then_some(target)
+        restarts_on_fresh_token(args).then_some(target)
     } else {
         None
     };
@@ -265,31 +265,41 @@ fn gh_exit_code(gh: &mut Command, renew: Option<&str>) -> i32 {
         if let Some(code) = exit_code_within(gh, after) {
             return code;
         }
-        eprintln!(
-            "knives gh: the watch ran {}s on one App token; running it again on a fresh one",
-            after.as_secs()
-        );
+        leave_alternate_screen();
         match mint_token(target, WATCH_TOKEN_LIFETIME) {
             Mint::Token(token) => {
                 gh.env("GH_TOKEN", token);
             }
             Mint::Refused(code) => return code,
             Mint::Unrouted => {
-                eprintln!("knives gh: gh-app-token no longer answers for {target}");
+                eprintln!(
+                    "knives gh: the watch outlived its App token and gh-app-token no longer answers for {target}"
+                );
                 return 1;
             }
         }
+        eprintln!(
+            "knives gh: the watch ran {}s on one App token; running it again on a fresh one",
+            after.as_secs()
+        );
     }
 }
 
 /// gh's exit code, or None when it was still running after `after` and knives
 /// ended it (SIGTERM: gh keeps no state a restart needs, and unlike SIGINT it
-/// cannot pass for gh's own exit 1).
+/// cannot pass for gh's own exit 1). The signal goes through a pidfd, so it
+/// can only reach this gh, never a process that took its pid after it exited.
 fn exit_code_within(gh: &mut Command, after: std::time::Duration) -> Option<i32> {
     let Ok(mut child) = gh.spawn() else {
         return Some(gh_not_found());
     };
-    let pid = rustix::process::Pid::from_child(&child);
+    // Opened before anything reaps the child, so it names this process. Without
+    // one (a kernel before 5.3) the watch runs to its end as it did before.
+    let pidfd = rustix::process::pidfd_open(
+        rustix::process::Pid::from_child(&child),
+        rustix::process::PidfdFlags::empty(),
+    )
+    .ok();
     let (finished, waiting) = std::sync::mpsc::channel::<()>();
     let (status, ended) = std::thread::scope(|scope| {
         let watchdog = scope.spawn(move || {
@@ -298,7 +308,10 @@ fn exit_code_within(gh: &mut Command, after: std::time::Duration) -> Option<i32>
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout)
             );
             // Already gone is as good as ended; its own status then decides.
-            expired && rustix::process::kill_process(pid, rustix::process::Signal::TERM).is_ok()
+            expired
+                && pidfd.is_some_and(|pidfd| {
+                    rustix::process::pidfd_send_signal(pidfd, rustix::process::Signal::TERM).is_ok()
+                })
         });
         let status = child.wait();
         drop(finished);
@@ -314,6 +327,19 @@ fn exit_code_within(gh: &mut Command, after: std::time::Duration) -> Option<i32>
     (!(ended && terminated)).then(|| exit_code(status))
 }
 
+/// Leaves the alternate screen a terminated gh left the terminal in: gh enters
+/// it for a watch on a terminal and leaves it only on its own exit or SIGINT.
+/// Only on a terminal, where leaving a screen not entered does nothing; a
+/// redirected stdout gets no control bytes.
+fn leave_alternate_screen() {
+    use std::io::{IsTerminal as _, Write as _};
+    let mut stdout = std::io::stdout();
+    if stdout.is_terminal() {
+        let _ = stdout.write_all(b"\x1b[?1049l");
+        let _ = stdout.flush();
+    }
+}
+
 /// This maps every spawn failure to 127; unlike bash, it does not distinguish
 /// an inaccessible executable with exit code 126.
 fn gh_not_found() -> i32 {
@@ -322,13 +348,14 @@ fn gh_not_found() -> i32 {
 }
 
 /// How long one run of a watching call may use its token:
-/// [`WATCH_RESTART_AFTER`], or `KNIVES_GH_WATCH_RESTART_SECS` when set (tests
+/// [`WATCH_RESTART_AFTER`], or a positive `KNIVES_GH_WATCH_RESTART_SECS` (tests
 /// and a smoke check use a few seconds).
 fn watch_restart_after() -> std::time::Duration {
     std::time::Duration::from_secs(
         std::env::var("KNIVES_GH_WATCH_RESTART_SECS")
             .ok()
             .and_then(|seconds| seconds.parse().ok())
+            .filter(|seconds| *seconds > 0)
             .unwrap_or(WATCH_RESTART_AFTER),
     )
 }
@@ -692,6 +719,17 @@ fn is_watch(args: &[String]) -> bool {
         Some(("agent-task", _, "create" | "view")) => bool_flag_set(flags, "--follow"),
         _ => false,
     }
+}
+
+/// Whether a watch may be ended and run again on a fresh token: one whose
+/// rerun repeats nothing but the waiting, `gh run watch` and `gh pr checks
+/// --watch`, each of which shows the current state afresh. Never `gh
+/// agent-task … --follow`: rerunning `create` submits a second task (gh 2.98
+/// `agent-task/create/create.go` creates before it follows), and a rerun `view`
+/// prints the whole session log again, since gh keeps its place in the log
+/// only in memory (`agent-task/shared/log.go`).
+fn restarts_on_fresh_token(args: &[String]) -> bool {
+    is_watch(args) && !matches!(command_words(args), Some(("agent-task", _, _)))
 }
 
 /// Whether boolean flag `name` ends up set, as pflag reads it: the last of

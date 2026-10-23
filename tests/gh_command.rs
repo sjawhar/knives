@@ -7,7 +7,7 @@
 
 #[path = "common/lab.rs"]
 mod lab;
-// allow: SIZE_OK: 2059 lines - real-binary gh passthrough scenarios share one fixture and process harness.
+// allow: SIZE_OK: 2154 lines - real-binary gh passthrough scenarios share one fixture and process harness.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
@@ -1964,22 +1964,24 @@ exit 127
     );
 }
 
-/// A fake gh that records each run's token and arguments in `$FAKE_DIR/calls`,
-/// watches (sleeps three seconds, then exits 0) on its first run, and on any
-/// later run exits 3 at once, as `gh run watch --exit-status` does for a failed
-/// run. A helper that answers `tok-1`, `tok-2`, … one per mint.
+/// A fake gh that records each run's token and arguments in `$FAKE_DIR/calls`
+/// and the branch git reports to it in `$FAKE_DIR/branches`; it watches (sleeps
+/// three seconds, then exits 0) on its first run and on any later run exits at
+/// once with `$FAKE_EXIT`, gh's own status for the watch's end. A helper that
+/// answers `tok-1`, `tok-2`, … one per mint, and refuses as gh-app-token does
+/// once it has minted `$FAKE_MINT_LIMIT` tokens.
 fn watching_fakes() -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("fake dir");
     let gh = dir.path().join("gh");
     fs::write(
         &gh,
-        "#!/bin/sh\nn=$(($(cat \"$FAKE_DIR/gh-runs\" 2>/dev/null || echo 0) + 1))\necho \"$n\" > \"$FAKE_DIR/gh-runs\"\nprintf '%s %s\\n' \"$GH_TOKEN\" \"$*\" >> \"$FAKE_DIR/calls\"\n[ \"$n\" -gt 1 ] && exit 3\nexec sleep 3\n",
+        "#!/bin/sh\nn=$(($(cat \"$FAKE_DIR/gh-runs\" 2>/dev/null || echo 0) + 1))\necho \"$n\" > \"$FAKE_DIR/gh-runs\"\nprintf '%s %s\\n' \"$GH_TOKEN\" \"$*\" >> \"$FAKE_DIR/calls\"\ngit symbolic-ref --short HEAD >> \"$FAKE_DIR/branches\" 2>/dev/null\nif [ \"$n\" -gt 1 ]; then exit \"$FAKE_EXIT\"; fi\nexec sleep 3\n",
     )
     .expect("write watching fake gh");
     let helper = dir.path().join("gh-app-token");
     fs::write(
         &helper,
-        "#!/bin/sh\ncat > /dev/null\nn=$(($(cat \"$FAKE_DIR/mints\" 2>/dev/null || echo 0) + 1))\necho \"$n\" > \"$FAKE_DIR/mints\"\nprintf 'username=x-access-token\\npassword=tok-%s\\n' \"$n\"\n",
+        "#!/bin/sh\ncat > /dev/null\nn=$(($(cat \"$FAKE_DIR/mints\" 2>/dev/null || echo 0) + 1))\necho \"$n\" > \"$FAKE_DIR/mints\"\nif [ -n \"$FAKE_MINT_LIMIT\" ] && [ \"$n\" -gt \"$FAKE_MINT_LIMIT\" ]; then echo 'gh-app-token: GitHub API 502' >&2; echo quit=1; exit 1; fi\nprintf 'username=x-access-token\\npassword=tok-%s\\n' \"$n\"\n",
     )
     .expect("write counting gh-app-token");
     for script in [&gh, &helper] {
@@ -1989,71 +1991,164 @@ fn watching_fakes() -> tempfile::TempDir {
     dir
 }
 
-/// Runs `arguments` through knives with the [`watching_fakes`], restarting a
-/// watch after one second; returns knives' output and the runs gh recorded.
-fn run_watching(
-    arguments: &[&str],
-    inherited_token: Option<&str>,
-) -> (std::process::Output, String) {
+/// What a call through the [`watching_fakes`] left: knives' output, the runs
+/// gh recorded, and the branches git reported to them.
+struct Watched {
+    output: std::process::Output,
+    calls: String,
+    branches: String,
+}
+
+/// Runs `arguments` through knives in `cwd` (a scratch directory when None)
+/// with the [`watching_fakes`] and `env`, restarting a watch after one second.
+fn run_watching(arguments: &[&str], cwd: Option<&Path>, env: &[(&str, &str)]) -> Watched {
     let fakes = watching_fakes();
     let scratch = tempfile::tempdir().expect("scratch");
-    let mut command = knives_cmd(fakes.path());
-    command
+    let output = knives_cmd(fakes.path())
         .args(["gh", "--"])
         .args(arguments)
-        .current_dir(scratch.path())
+        .current_dir(cwd.unwrap_or_else(|| scratch.path()))
         .env("KNIVES_REAL_GH", fakes.path().join("gh"))
         .env("KNIVES_GH_WATCH_RESTART_SECS", "1")
         .env("FAKE_DIR", fakes.path())
-        .env("PATH", helper_path(fakes.path()));
-    if let Some(token) = inherited_token {
-        command.env("GH_TOKEN", token);
+        .env("FAKE_EXIT", "1")
+        .env("PATH", helper_path(fakes.path()))
+        .envs(env.iter().copied())
+        .output()
+        .expect("run knives gh");
+    let read = |name: &str| fs::read_to_string(fakes.path().join(name)).unwrap_or_default();
+    Watched {
+        output,
+        calls: read("calls"),
+        branches: read("branches"),
     }
-    let output = command.output().expect("run knives gh");
-    let calls = fs::read_to_string(fakes.path().join("calls")).expect("fake gh ran");
-    (output, calls)
 }
 
 #[test]
 fn a_watch_that_outlives_its_run_window_runs_again_on_a_fresh_token() {
-    // Given/When: a watch still running when its window (here one second) ends.
-    let (output, calls) = run_watching(
+    // Given/When: a watch still running when its window (here one second) ends,
+    // whose rerun ends as `gh run watch --exit-status` does for a failed run.
+    let watched = run_watching(
         &["run", "watch", "9", "-R", "acme/widgets", "--exit-status"],
         None,
+        &[],
     );
 
     // Then: knives ended it, ran the same command on a newly minted token, said so
     // once, and exits with the last run's own status.
     assert_eq!(
-        calls,
+        watched.calls,
         "tok-1 run watch 9 -R acme/widgets --exit-status\ntok-2 run watch 9 -R acme/widgets --exit-status\n"
     );
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = String::from_utf8_lossy(&watched.output.stderr);
     assert_eq!(
         stderr.matches("running it again on a fresh one").count(),
         1,
         "{stderr}"
     );
-    assert_eq!(output.status.code(), Some(3), "{stderr}");
+    assert_eq!(watched.output.status.code(), Some(1), "{stderr}");
 }
 
 #[test]
-fn only_a_watch_on_a_token_knives_minted_is_restarted() {
-    for (arguments, inherited) in [
+fn a_restarted_pr_checks_watch_keeps_the_bookmark_and_gh_s_pending_status() {
+    // Given: a jj checkout on a bookmarked change, where knives names the PR by
+    // its bookmark and answers gh's HEAD reads through its git wrapper.
+    let lab = lab::Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.jj_work(["edit", "feat/alpha"]);
+
+    // When: `gh pr checks --watch` outlives its window and its rerun ends with
+    // gh's exit 8, checks still pending.
+    let watched = run_watching(
+        &["pr", "checks", "--watch", "-R", "acme/widgets"],
+        Some(&lab.work),
+        &[("FAKE_EXIT", "8")],
+    );
+
+    // Then: both runs got the bookmark and the wrapper's branch, and the call
+    // exits 8.
+    assert_eq!(
+        watched.calls,
+        "tok-1 pr checks feat/alpha --watch -R acme/widgets\ntok-2 pr checks feat/alpha --watch -R acme/widgets\n"
+    );
+    assert_eq!(watched.branches, "feat/alpha\nfeat/alpha\n");
+    assert_eq!(
+        watched.output.status.code(),
+        Some(8),
+        "{:?}",
+        watched.output
+    );
+}
+
+#[test]
+fn a_refused_renewal_ends_the_watch_with_the_helpers_reason() {
+    // Given/When: a watch outlives its window, and the helper then refuses.
+    let watched = run_watching(
+        &["run", "watch", "9", "-R", "acme/widgets"],
+        None,
+        &[("FAKE_MINT_LIMIT", "1")],
+    );
+
+    // Then: gh is not run again, the helper's reason and exit stand, and no line
+    // claims a restart.
+    assert_eq!(watched.calls, "tok-1 run watch 9 -R acme/widgets\n");
+    let stderr = String::from_utf8_lossy(&watched.output.stderr);
+    assert!(stderr.contains("gh-app-token: GitHub API 502"), "{stderr}");
+    assert!(!stderr.contains("running it again"), "{stderr}");
+    assert_eq!(watched.output.status.code(), Some(1), "{stderr}");
+}
+
+#[test]
+fn only_a_rerunnable_watch_on_a_token_knives_minted_is_restarted() {
+    for (arguments, env) in [
         // Not a watch: it runs to its end however long it takes.
-        (&["run", "view", "9", "-R", "acme/widgets"][..], None),
-        (&["pr", "checks", "7", "-R", "acme/widgets"], None),
+        (&["run", "view", "9", "-R", "acme/widgets"][..], &[][..]),
+        (&["pr", "checks", "7", "-R", "acme/widgets"], &[]),
+        // A rerun would submit a second task, or print the whole log again.
+        (
+            &[
+                "agent-task",
+                "create",
+                "do it",
+                "--follow",
+                "-R",
+                "acme/widgets",
+            ],
+            &[],
+        ),
+        (
+            &[
+                "agent-task",
+                "view",
+                "1",
+                "--log",
+                "--follow",
+                "-R",
+                "acme/widgets",
+            ],
+            &[],
+        ),
         // A watch on an inherited GH_TOKEN: knives cannot renew a token it did not mint.
         (
             &["run", "watch", "9", "-R", "acme/widgets"],
-            Some("ghs_inherited"),
+            &[("GH_TOKEN", "ghs_inherited")],
         ),
     ] {
         // When: the call runs past the one-second window.
-        let (output, calls) = run_watching(arguments, inherited);
+        let watched = run_watching(arguments, None, env);
 
         // Then: gh ran once, to its own end.
-        assert_eq!(calls.lines().count(), 1, "{arguments:?}: {calls}");
-        assert_eq!(output.status.code(), Some(0), "{arguments:?}: {output:?}");
+        assert_eq!(
+            watched.calls.lines().count(),
+            1,
+            "{arguments:?}: {}",
+            watched.calls
+        );
+        assert_eq!(
+            watched.output.status.code(),
+            Some(0),
+            "{arguments:?}: {:?}",
+            watched.output
+        );
     }
 }
