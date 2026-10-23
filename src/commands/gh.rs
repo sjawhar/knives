@@ -2,7 +2,7 @@
 //!
 //! This command executes `gh` directly, so the usual render/run split does not apply:
 //! there is no knives result to render.
-// allow: SIZE_OK: 2589 lines - single passthrough pipeline; splitting would separate resolution steps that read as one procedure.
+// allow: SIZE_OK: 2619 lines - single passthrough pipeline; splitting would separate resolution steps that read as one procedure.
 use std::collections::BTreeMap;
 use std::io::Read as _;
 use std::os::unix::{
@@ -331,46 +331,61 @@ pub(crate) fn pr_subcommand(args: &[String]) -> Option<(String, usize)> {
 
 /// Whether a positional target follows `subcommand` (shim lines 343-384).
 pub(crate) fn has_positional_target(subcommand: &str, args: &[String]) -> bool {
-    first_positional(subcommand, args).is_some()
+    before_terminator(args)
+        .iter()
+        .position(|argument| argument == subcommand)
+        .and_then(|at| positional_after(args, at))
+        .is_some()
 }
 
-/// The first positional after `subcommand`, skipping flags and the values of
-/// the flags that take one, or the first word after `--` when the subcommand
-/// came before it.
-fn first_positional<'a>(subcommand: &str, args: &'a [String]) -> Option<&'a str> {
+/// The first positional after the subcommand at index `at`, skipping flags and
+/// the values of the flags that take one, or the first word after `--`.
+fn positional_after(args: &[String], at: usize) -> Option<&str> {
     let flags = before_terminator(args);
-    let mut found_subcommand = false;
+    let subcommand = flags.get(at)?.as_str();
     let mut previous_was_value_flag = false;
-    for argument in flags {
-        if previous_was_value_flag {
-            previous_was_value_flag = false;
+    for argument in flags.iter().skip(at + 1) {
+        if std::mem::take(&mut previous_was_value_flag) {
             continue;
         }
-        if found_subcommand {
-            if argument.starts_with('-') {
-                if takes_value(argument)
-                    || matches!(
-                        (subcommand, argument.as_str()),
-                        ("checks", "-i")
-                            | ("edit", "-m" | "-p")
-                            | (_, "--json" | "-t" | "--template")
-                    )
-                {
-                    previous_was_value_flag = true;
-                }
-                continue;
-            }
+        if !argument.starts_with('-') {
             return Some(argument);
         }
-        if argument == subcommand {
-            found_subcommand = true;
-        }
+        previous_was_value_flag = takes_value(argument)
+            || matches!(
+                (subcommand, argument.as_str()),
+                ("checks", "-i") | ("edit", "-m" | "-p") | (_, "--json" | "-t" | "--template")
+            );
     }
-    // Words after `--` are positionals: a target when the subcommand came first.
-    found_subcommand
-        .then(|| args.get(flags.len() + 1))
-        .flatten()
-        .map(String::as_str)
+    // Words after `--` are positionals.
+    args.get(flags.len() + 1).map(String::as_str)
+}
+
+/// The command group and subcommand a call names, with the subcommand's index:
+/// its first two words that are neither flags nor a flag's value (`gh -R
+/// acme/widgets pr view` is `pr view`). gh's aliases of `agent-task`
+/// (`agent-tasks`, `agent`, `agents`) read as it.
+fn command_words(args: &[String]) -> Option<(&str, usize, &str)> {
+    let mut group = None;
+    let mut previous_was_value_flag = false;
+    for (index, argument) in before_terminator(args).iter().enumerate() {
+        if std::mem::take(&mut previous_was_value_flag) {
+            continue;
+        }
+        if argument.starts_with('-') {
+            previous_was_value_flag = takes_value(argument);
+            continue;
+        }
+        let Some(group) = group else {
+            group = Some(match argument.as_str() {
+                "agent-tasks" | "agent" | "agents" => "agent-task",
+                word => word,
+            });
+            continue;
+        };
+        return Some((group, index, argument.as_str()));
+    }
+    None
 }
 
 /// Whether the caller already supplied `--head` (shim lines 332-339).
@@ -579,14 +594,10 @@ const MIN_LIFETIME_ENV: &str = "GH_APP_TOKEN_MIN_LIFETIME";
 /// every other.
 fn required_token_lifetime(args: &[String]) -> u64 {
     let flags = before_terminator(args);
-    let mut words = flags
-        .iter()
-        .filter(|argument| !argument.starts_with('-'))
-        .map(String::as_str);
-    let watches = match (words.next(), words.next()) {
-        (Some("run"), Some("watch")) => true,
-        (Some("pr"), Some("checks")) => bool_flag_set(flags, "--watch"),
-        (Some("agent-task"), Some("create" | "view")) => bool_flag_set(flags, "--follow"),
+    let watches = match command_words(args) {
+        Some(("run", _, "watch")) => true,
+        Some(("pr", _, "checks")) => bool_flag_set(flags, "--watch"),
+        Some(("agent-task", _, "create" | "view")) => bool_flag_set(flags, "--follow"),
         _ => false,
     };
     if watches {
@@ -597,18 +608,20 @@ fn required_token_lifetime(args: &[String]) -> u64 {
 }
 
 /// Whether boolean flag `name` ends up set, as pflag reads it: the last of
-/// `--name` and `--name=<bool>` wins.
+/// `--name` and `--name=<bool>` wins, with `strconv.ParseBool`'s spellings (gh
+/// rejects any other value, so it leaves the flag as it was).
 fn bool_flag_set(flags: &[String], name: &str) -> bool {
     flags.iter().fold(false, |set, flag| {
         if flag == name {
-            true
-        } else if let Some(value) = flag
+            return true;
+        }
+        match flag
             .strip_prefix(name)
             .and_then(|rest| rest.strip_prefix('='))
         {
-            matches!(value, "1" | "t" | "T" | "true" | "TRUE" | "True")
-        } else {
-            set
+            Some("1" | "t" | "T" | "true" | "TRUE" | "True") => true,
+            Some("0" | "f" | "F" | "false" | "FALSE" | "False") => false,
+            _ => set,
         }
     })
 }
@@ -1066,28 +1079,26 @@ pub(crate) fn repo_flag(args: &[String]) -> Option<String> {
 /// `tryParseIssueFromURL`). `gh run` and `gh workflow` take numeric ids, never
 /// URLs, so they have no such selector.
 fn selector_url_target(args: &[String]) -> Option<String> {
-    let mut words = before_terminator(args)
-        .iter()
-        .filter(|argument| !argument.starts_with('-'))
-        .map(String::as_str);
-    let (group, subcommand) = (words.next()?, words.next()?);
+    let (group, at, subcommand) = command_words(args)?;
     let kinds: &[&str] = match (group, subcommand) {
         ("pr", _) | ("agent-task", "view") => &["pull"],
         ("issue", _) => &["issues", "pull"],
         _ => return None,
     };
-    github_selector_repo(first_positional(subcommand, args)?, kinds)
+    github_selector_repo(positional_after(args, at)?, kinds)
 }
 
 /// The `<owner>/<repo>` of an http(s) URL on the App's host whose path is
-/// `/<owner>/<repo>/<kind>/<number>…` for one of `kinds`, read as gh reads it:
-/// userinfo and port dropped, the host lowercased without `www.`, the number
-/// only a leading run of digits. Another host's URL routes nothing: the App's
-/// routes cover the default host alone.
+/// `/<owner>/<repo>/<kind>/<number>…` for one of `kinds`, read as gh reads it
+/// (Go's `url.Parse`, then gh's own host normalization): the scheme in any
+/// case, userinfo and port dropped, the host lowercased without `www.`, the
+/// number only a leading run of digits. Another host's URL routes nothing: the
+/// App's routes cover the default host alone.
 fn github_selector_repo(selector: &str, kinds: &[&str]) -> Option<String> {
-    let rest = selector
-        .strip_prefix("https://")
-        .or_else(|| selector.strip_prefix("http://"))?;
+    let (scheme, rest) = selector.split_once("://")?;
+    if !scheme.eq_ignore_ascii_case("https") && !scheme.eq_ignore_ascii_case("http") {
+        return None;
+    }
     let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let (authority, path) = rest.split_at(end);
     let host = authority
@@ -1517,8 +1528,14 @@ mod tests {
             &["pr", "checks", "7", "--watch"],
             &["pr", "checks", "--watch=true", "--fail-fast"],
             &["pr", "checks", "--watch=false", "--watch"],
+            &["pr", "checks", "--watch=0", "--watch=T"],
             &["agent-task", "view", "--follow"],
             &["agent-task", "create", "do it", "--follow"],
+            &["agent", "view", "1", "--log", "--follow"],
+            &["agents", "view", "--follow"],
+            &["agent-tasks", "view", "--follow"],
+            &["-R", "acme/widgets", "run", "watch", "123"],
+            &["--repo", "acme/widgets", "pr", "checks", "--watch"],
         ] {
             assert_eq!(
                 required_token_lifetime(&args(watching)),
@@ -1530,6 +1547,9 @@ mod tests {
             &["run", "view", "123"][..],
             &["pr", "checks", "7"],
             &["pr", "checks", "--watch", "--watch=false"],
+            &["pr", "checks", "--watch", "--watch=0"],
+            &["pr", "checks", "--watch", "--watch=F"],
+            &["-R", "run", "pr", "view", "watch"],
             &["pr", "view", "--watch"],
             &["api", "repos/acme/widgets"],
             &["search", "issues", "--", "run", "watch"],
@@ -1614,6 +1634,16 @@ mod tests {
             (format!("ssh://{host}/acme/widgets/pull/7"), pull, None),
             (format!("{host}/acme/widgets/pull/7"), pull, None),
             ("7".to_owned(), pull, None),
+            (
+                format!("HTTPS://{host}/acme/widgets/pull/7"),
+                pull,
+                Some("acme/widgets"),
+            ),
+            (
+                format!("Http://{host}/acme/widgets/issues/7"),
+                issue,
+                Some("acme/widgets"),
+            ),
         ] {
             assert_eq!(
                 github_selector_repo(&selector, kinds).as_deref(),

@@ -7,7 +7,7 @@
 
 #[path = "common/lab.rs"]
 mod lab;
-// allow: SIZE_OK: 1964 lines - real-binary gh passthrough scenarios share one fixture and process harness.
+// allow: SIZE_OK: 1965 lines - real-binary gh passthrough scenarios share one fixture and process harness.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
@@ -696,8 +696,9 @@ fn acme_widgets_selector_url_calls() -> Vec<Vec<String>> {
     let pull = format!("https://{host}/acme/widgets/pull/2112");
     let files = format!("https://www.{host}/acme/widgets/pull/2112/files");
     let issue = format!("https://{host}/acme/widgets/issues/9");
-    let calls: [&[&str]; 11] = [
+    let calls: [&[&str]; 12] = [
         &["pr", "view", &pull, "--json", "state"],
+        &["-R", "rival/y", "pr", "view", &pull],
         &["pr", "view", "--json", "state", &pull],
         &["pr", "checks", &pull, "--watch"],
         &["pr", "diff", &files],
