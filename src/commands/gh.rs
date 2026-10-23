@@ -2,7 +2,7 @@
 //!
 //! This command executes `gh` directly, so the usual render/run split does not apply:
 //! there is no knives result to render.
-// allow: SIZE_OK: 2746 lines - single passthrough pipeline; splitting would separate resolution steps that read as one procedure.
+// allow: SIZE_OK: 2741 lines - single passthrough pipeline; splitting would separate resolution steps that read as one procedure.
 use std::collections::BTreeMap;
 use std::io::Read as _;
 use std::os::unix::{
@@ -285,46 +285,39 @@ fn gh_exit_code(gh: &mut Command, renew: Option<&str>) -> i32 {
     }
 }
 
+/// How often a watching gh is checked for its exit: the most a watch's own end
+/// is delayed in reaching the caller.
+const WATCH_POLL: std::time::Duration = std::time::Duration::from_millis(200);
+
 /// gh's exit code, or None when it was still running after `after` and knives
 /// ended it (SIGTERM: gh keeps no state a restart needs, and unlike SIGINT it
-/// cannot pass for gh's own exit 1). The signal goes through a pidfd, so it
-/// can only reach this gh, never a process that took its pid after it exited.
+/// cannot pass for gh's own exit 1). One owner checks, signals and reaps, so
+/// the signal can only reach this gh: until `try_wait` reaps it, its pid is
+/// held, and no other thread can reap it in between.
 fn exit_code_within(gh: &mut Command, after: std::time::Duration) -> Option<i32> {
     let Ok(mut child) = gh.spawn() else {
         return Some(gh_not_found());
     };
-    // Opened before anything reaps the child, so it names this process. Without
-    // one (a kernel before 5.3) the watch runs to its end as it did before.
-    let pidfd = rustix::process::pidfd_open(
-        rustix::process::Pid::from_child(&child),
-        rustix::process::PidfdFlags::empty(),
-    )
-    .ok();
-    let (finished, waiting) = std::sync::mpsc::channel::<()>();
-    let (status, ended) = std::thread::scope(|scope| {
-        let watchdog = scope.spawn(move || {
-            let expired = matches!(
-                waiting.recv_timeout(after),
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-            );
-            // Already gone is as good as ended; its own status then decides.
-            expired
-                && pidfd.is_some_and(|pidfd| {
-                    rustix::process::pidfd_send_signal(pidfd, rustix::process::Signal::TERM).is_ok()
-                })
-        });
-        let status = child.wait();
-        drop(finished);
-        let ended = watchdog
-            .join()
-            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-        (status, ended)
-    });
-    let Ok(status) = status else {
-        return Some(gh_not_found());
+    let deadline = std::time::Instant::now() + after;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() < deadline => std::thread::sleep(WATCH_POLL),
+            Ok(None) => {
+                let pid = rustix::process::Pid::from_child(&child);
+                // Unreaped, so the pid is still this gh's; if it ended just now,
+                // its own status decides below.
+                let _ = rustix::process::kill_process(pid, rustix::process::Signal::TERM);
+                let Ok(status) = child.wait() else {
+                    return Some(gh_not_found());
+                };
+                let terminated = status.signal() == Some(rustix::process::Signal::TERM.as_raw());
+                return (!terminated).then(|| exit_code(status));
+            }
+            Err(_) => return Some(gh_not_found()),
+        }
     };
-    let terminated = status.signal() == Some(rustix::process::Signal::TERM.as_raw());
-    (!(ended && terminated)).then(|| exit_code(status))
+    Some(exit_code(status))
 }
 
 /// Leaves the alternate screen a terminated gh left the terminal in: gh enters
@@ -724,10 +717,12 @@ fn is_watch(args: &[String]) -> bool {
 /// Whether a watch may be ended and run again on a fresh token: one whose
 /// rerun repeats nothing but the waiting, `gh run watch` and `gh pr checks
 /// --watch`, each of which shows the current state afresh. Never `gh
-/// agent-task … --follow`: rerunning `create` submits a second task (gh 2.98
-/// `agent-task/create/create.go` creates before it follows), and a rerun `view`
-/// prints the whole session log again, since gh keeps its place in the log
-/// only in memory (`agent-task/shared/log.go`).
+/// agent-task … --follow`: gh refuses every agent-task command on any token
+/// but a device-flow OAuth login (gh 2.98 `agent-task/agent_task.go`
+/// `requireOAuthToken`: an App token in `GH_TOKEN` fails before anything
+/// runs), so no App-token follow ever reaches an hour; and a rerun would be
+/// wrong anyway, since `create` submits a second task and `view` prints the
+/// whole session log again (gh keeps its place in the log only in memory).
 fn restarts_on_fresh_token(args: &[String]) -> bool {
     is_watch(args) && !matches!(command_words(args), Some(("agent-task", _, _)))
 }
