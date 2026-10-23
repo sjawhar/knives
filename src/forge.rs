@@ -273,6 +273,8 @@ pub struct PullDetails {
     /// Whether the head ref no longer exists on the forge. GitHub keeps
     /// `headRefName` as text after a delete; the `headRef` object goes null —
     /// that null is the "open pull request with a deleted head" incident signal.
+    /// `None` means the forge did not answer: an old payload, or a head
+    /// repository that refused the token (an organization enforcing SAML).
     pub head_ref_deleted: Option<bool>,
     /// Whether the newest commit's tree equals its one parent tree: a tip that a
     /// rebase or duplicate emptied while the branch reads healthy.
@@ -535,7 +537,9 @@ pub trait Forge: Send + Sync {
     fn sweep(&self, repo: &Path, target: &RepoIdentity) -> Result<SweepPage, ForgeError>;
 
     /// The live batch: full fact rows by number. Numbers the forge answers
-    /// `NOT_FOUND` for are absent from the map; any other failure is an error.
+    /// `NOT_FOUND` for are absent from the map; a head ref the head repository
+    /// refuses leaves that row's `head_ref_deleted` unanswered and the row
+    /// stands; any other failure is an error.
     fn pull_facts(
         &self,
         repo: &Path,

@@ -19,7 +19,10 @@ mod lab;
 #[path = "common/pulls.rs"]
 mod pulls;
 
-use forge_shim::{install_snapshot_gh, path_with_gh_shim, pull_record_with_fields};
+use forge_shim::{
+    install_snapshot_gh, install_snapshot_gh_refusing_head_refs, path_with_gh_shim,
+    pull_record_with_fields,
+};
 use knives::commands::status;
 use knives::config::RepoEntry;
 use knives::ids::BranchName;
@@ -419,6 +422,56 @@ fn status_reports_empty_diff_and_deleted_head_from_completed_facts() {
         stdout.contains("forge did not report mergeable"),
         "stdout: {stdout}"
     );
+}
+
+#[test]
+fn status_reads_the_facts_beside_a_head_ref_the_token_may_not_read() {
+    // Given: an open branch pull whose head lives in a fork whose organization
+    // enforces SAML against the token: the facts reply answers every field but
+    // nulls `headRef`, names that refusal in `errors`, and gh exits 1.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let (home, _consumer) = release_test_home(&lab);
+    let pulls = format!(
+        "[{}]",
+        pull_record_with_fields(
+            7,
+            "OPEN",
+            "feat/alpha",
+            r#","additions":1,"deletions":0,"changedFiles":1,"mergeable":"MERGEABLE","mergeStateStatus":"CLEAN""#,
+        )
+    );
+    let shim = tempfile::tempdir().expect("create forge shim directory");
+    install_snapshot_gh_refusing_head_refs(shim.path(), &pulls, &[7]);
+
+    // When: the real status binary reads that batch
+    let output = Command::new(env!("CARGO_BIN_EXE_knives"))
+        .args(["--text", "status", "demo", "--no-landed"])
+        .current_dir(&lab.work)
+        .env("KNIVES_CONFIG_HOME", home.path())
+        .env("HOME", lab.temp_path())
+        .env("XDG_CACHE_HOME", shim.path().join("cache"))
+        .env("PATH", path_with_gh_shim(shim.path()))
+        .output()
+        .expect("run status with a forge shim");
+
+    // Then: the batch stands, so status is complete and every merge fact is
+    // answered, and the null beside the refusal raises no deleted-head-ref.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let answered = [knives::cli::Exit::Ok, knives::cli::Exit::Findings]
+        .map(|exit| Some(i32::from(exit.code())));
+    assert!(
+        answered.contains(&output.status.code()),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(stdout.contains("forge consulted"), "stdout: {stdout}");
+    assert!(
+        !stdout.contains("pull request state unavailable"),
+        "stdout: {stdout}"
+    );
+    assert!(!stdout.contains("forge did not report"), "stdout: {stdout}");
+    assert!(!stdout.contains("deleted-head-ref"), "stdout: {stdout}");
 }
 
 #[test]

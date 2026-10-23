@@ -22,6 +22,7 @@ pub fn install_snapshot_gh(shim: &Path, pulls: &str, withheld_facts: &[u64]) {
         SnapshotGhOptions {
             withheld_facts,
             timeline_nodes: None,
+            refused_head_refs: &[],
         },
     );
 }
@@ -34,6 +35,28 @@ pub fn install_snapshot_gh_with_timeline(shim: &Path, pulls: &str, timeline_node
         SnapshotGhOptions {
             withheld_facts: &[],
             timeline_nodes,
+            refused_head_refs: &[],
+        },
+    );
+}
+
+/// What the forge says, in `errors` and on gh's stderr, when the head
+/// repository's organization enforces SAML against the token.
+const SAML_REFUSAL: &str = "Resource protected by organization SAML enforcement. \
+     You must grant your Personal Access token access to this organization.";
+
+/// Install the snapshot shim with the head ref of each number in
+/// `refused_head_refs` refused the way a fork whose organization enforces SAML
+/// refuses the token: the facts reply nulls that `headRef`, names it in
+/// `errors`, and gh exits 1 after printing the reply.
+pub fn install_snapshot_gh_refusing_head_refs(shim: &Path, pulls: &str, refused_head_refs: &[u64]) {
+    install_snapshot_gh_configured(
+        shim,
+        pulls,
+        SnapshotGhOptions {
+            withheld_facts: &[],
+            timeline_nodes: None,
+            refused_head_refs,
         },
     );
 }
@@ -42,12 +65,14 @@ pub fn install_snapshot_gh_with_timeline(shim: &Path, pulls: &str, timeline_node
 struct SnapshotGhOptions<'a> {
     withheld_facts: &'a [u64],
     timeline_nodes: Option<&'a str>,
+    refused_head_refs: &'a [u64],
 }
 
 fn install_snapshot_gh_configured(shim: &Path, pulls: &str, options: SnapshotGhOptions<'_>) {
     let SnapshotGhOptions {
         withheld_facts,
         timeline_nodes,
+        refused_head_refs,
     } = options;
     let pulls: Vec<serde_json::Value> =
         serde_json::from_str(pulls).expect("parse fake pull request payload");
@@ -61,18 +86,21 @@ fn install_snapshot_gh_configured(shim: &Path, pulls: &str, options: SnapshotGhO
             })
         })
         .collect::<Vec<_>>();
-    let mut fact_rows = serde_json::Map::new();
-    for pull in &pulls {
-        let number = pull["number"].as_u64().expect("pull request number");
-        if !withheld_facts.contains(&number) {
-            let _ = fact_rows.insert(format!("p{number}"), pull.clone());
-        }
-    }
+    let facts_reply = facts_reply(&pulls, withheld_facts, refused_head_refs);
     let identity = shim.join("identity.json");
     let list = shim.join("pulls.json");
     let sweep = shim.join("sweep.json");
     let facts_payload = shim.join("facts.json");
     let timeline_payload = shim.join("timeline.json");
+    // gh exits 1 whenever the reply names errors, after printing it.
+    let facts_answer = if facts_reply.get("errors").is_none() {
+        format!("cat \"{}\"", facts_payload.display())
+    } else {
+        format!(
+            "cat \"{}\"; echo \"gh: {SAML_REFUSAL}\" >&2; exit 1",
+            facts_payload.display()
+        )
+    };
     std::fs::write(
         &identity,
         serde_json::to_vec(&serde_json::json!({
@@ -104,10 +132,7 @@ fn install_snapshot_gh_configured(shim: &Path, pulls: &str, options: SnapshotGhO
     .expect("write sweep payload");
     std::fs::write(
         &facts_payload,
-        serde_json::to_vec(&serde_json::json!({
-            "data": {"repository": fact_rows},
-        }))
-        .expect("serialize facts payload"),
+        serde_json::to_vec(&facts_reply).expect("serialize facts payload"),
     )
     .expect("write facts payload");
     write_timeline_payload(&timeline_payload, timeline_nodes);
@@ -121,7 +146,7 @@ fn install_snapshot_gh_configured(shim: &Path, pulls: &str, options: SnapshotGhO
              *\" api graphql \"*)\n\
                case \"$*\" in\n\
                  *\"timelineItems\"*) cat \"{}\" ;;\n\
-                 *\"pullRequest(number:\"*) cat \"{}\" ;;\n\
+                 *\"pullRequest(number:\"*) {} ;;\n\
                  *\"orderBy: {{field: UPDATED_AT\"*) cat \"{}\" ;;\n\
                  *) echo \"unexpected GraphQL invocation: $*\" >&2; exit 1 ;;\n\
                esac ;;\n\
@@ -130,11 +155,47 @@ fn install_snapshot_gh_configured(shim: &Path, pulls: &str, options: SnapshotGhO
             identity.display(),
             list.display(),
             timeline_payload.display(),
-            facts_payload.display(),
+            facts_answer,
             sweep.display(),
         ),
     );
 }
+
+/// The by-number facts reply: one row per pull not withheld, each refused head
+/// ref nulled and named in `errors`.
+fn facts_reply(
+    pulls: &[serde_json::Value],
+    withheld_facts: &[u64],
+    refused_head_refs: &[u64],
+) -> serde_json::Value {
+    let mut fact_rows = serde_json::Map::new();
+    let mut fact_errors = Vec::new();
+    for pull in pulls {
+        let number = pull["number"].as_u64().expect("pull request number");
+        if !withheld_facts.contains(&number) {
+            let alias = format!("p{number}");
+            let mut row = pull.clone();
+            if refused_head_refs.contains(&number) {
+                row["headRef"] = serde_json::Value::Null;
+                fact_errors.push(serde_json::json!({
+                    "type": "FORBIDDEN",
+                    "path": ["repository", &alias, "headRef"],
+                    "extensions": {"saml_failure": true, "ip_allow_list_failure": false},
+                    "message": SAML_REFUSAL,
+                }));
+            }
+            let _ = fact_rows.insert(alias, row);
+        }
+    }
+    let mut reply = serde_json::json!({
+        "data": {"repository": fact_rows},
+    });
+    if !fact_errors.is_empty() {
+        reply["errors"] = serde_json::Value::Array(fact_errors);
+    }
+    reply
+}
+
 fn write_timeline_payload(path: &Path, timeline_nodes: Option<&str>) {
     let timeline_nodes: Vec<serde_json::Value> = timeline_nodes.map_or_else(Vec::new, |nodes| {
         serde_json::from_str(nodes).expect("parse fake timeline payload")

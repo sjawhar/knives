@@ -187,7 +187,10 @@ For an open pull request, the same answered live fields drive three present-stat
 `knives status` and bracketed `knives pr` flags. `empty-diff` requires answered zero additions,
 deletions, and changed-file count; `deleted-head-ref` requires an answered null head-ref object;
 and `empty-tip-commit` requires the newest tip tree to equal its sole parent tree. Unanswered
-fields are silent: absence is not evidence of an incident.
+fields are silent: absence is not evidence of an incident. The head-ref object is read through
+the head repository, which can refuse a token the base repository accepts (a fork whose
+organization enforces SAML): the forge then nulls it and names that field in `errors`. knives
+reads such a null as unanswered, not as an answered null, and the rest of the batch stands.
 
 `knives pr NUMBER --timeline` issues one on-demand, bounded `last: 100` query for that pull
 request's head-ref and state events. It reports force pushes, deletion and restoration, closure,
