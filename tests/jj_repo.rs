@@ -1,7 +1,8 @@
 //! The jj layer's answers, read from a real repository.
 //!
 //! Workspaces resolve to their repo and attribute their moves; a local branch is
-//! ahead of, behind or diverged from origin; ancestry answers both ways; carriers
+//! ahead of, behind or diverged from origin; ancestry answers both ways; a trunk
+//! a branch merged into itself is not a merge the branch carries; carriers
 //! exclude release cuts, git-tracking refs and fetched pull heads; bookmark tips
 //! keep local and remote distinct; divergence is reported once per rewrite and
 //! only where a live head vouches for it; refs and changed files read without
@@ -245,6 +246,39 @@ fn ancestry_is_answered_in_both_directions() {
         !repo
             .is_ancestor(&tip, &base)
             .expect("tip is not behind base")
+    );
+}
+
+#[test]
+fn a_branch_that_merged_the_trunk_into_itself_carries_no_merge() {
+    // Given: a branch forked from the trunk that later pulled a newer trunk
+    // into itself — the one shape whose merge has a parent the trunk reaches
+    let lab = lab::Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.advance_upstream("upstream advance\n");
+    lab.jj_work([
+        "new",
+        "feat/alpha",
+        "main@upstream",
+        "-m",
+        "pull the trunk in",
+    ]);
+    lab.jj_work(["bookmark", "set", "feat/alpha", "-r", "@"]);
+    lab.jj_work(["new"]);
+    let repo = Repo::open(&lab.work).expect("open");
+    let trunk = repo.resolve_commit("main@upstream").expect("trunk tip");
+    let tip = repo.resolve_commit("feat/alpha").expect("branch tip");
+
+    // When: the merges its history carries past the trunk are counted
+    let merges = repo
+        .merges_between(std::slice::from_ref(&trunk), &tip)
+        .expect("merges between the trunk and the branch");
+
+    // Then: none. Only one of that merge's parents is work the trunk lacks,
+    // so the branch carries nothing but its own line.
+    assert!(
+        merges.is_empty(),
+        "a branch that merged the trunk into itself was read as carrying a merge: {merges:?}"
     );
 }
 

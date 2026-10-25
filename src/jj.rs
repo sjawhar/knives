@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -19,8 +19,8 @@ use jj_lib::object_id::ObjectId as _;
 use jj_lib::op_store::{RefTarget, RemoteRef};
 use jj_lib::ref_name::{RefName as JjRefName, RemoteName as JjRemoteName};
 use jj_lib::repo::{MutableRepo, ReadonlyRepo, Repo as _, RepoLoader};
-use jj_lib::revset::{SymbolResolver, walk_revs};
-use jj_lib::rewrite::{duplicate_commits, merge_commit_trees, rebase_commit};
+use jj_lib::revset::{ResolvedRevsetExpression, RevsetEvaluationError, SymbolResolver, walk_revs};
+use jj_lib::rewrite::{CommitRewriter, duplicate_commits, merge_commit_trees, rebase_commit};
 use jj_lib::settings::UserSettings;
 use jj_lib::transaction::Transaction;
 use jj_lib::working_copy::WorkingCopy as _;
@@ -68,8 +68,6 @@ pub enum JjError {
     },
     #[error("could not run `{program}`: {detail}")]
     Process { program: String, detail: String },
-    #[error("probe did not create exactly one root commit")]
-    ProbeRoot,
     #[error("the landed probe for `{branch}` panicked")]
     ProbePanic { branch: String },
     #[error("could not parse command output: {detail}")]
@@ -655,16 +653,6 @@ impl Repo {
         })
     }
 
-    /// Whether any of `bases` reaches `id`.
-    fn reaches_any(&self, id: &JjCommitId, bases: &[JjCommitId]) -> Result<bool, JjError> {
-        for base in bases {
-            if self.backend_is_ancestor(id, base)? {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-
     /// [`Self::is_ancestor`] by backend id, saving the hex round-trip.
     fn backend_is_ancestor(
         &self,
@@ -679,13 +667,42 @@ impl Repo {
         })
     }
 
+    /// Every commit a revset expression evaluates to, in no particular order.
+    ///
+    /// One evaluation answers membership for a whole set. The alternative, an
+    /// ancestry query per commit, walks back from each base through the index
+    /// until it reaches that commit's generation, which on a branch forked far
+    /// behind the trunk can be a large part of the trunk — once per commit in
+    /// the range.
+    fn revset_ids(
+        &self,
+        expression: Arc<ResolvedRevsetExpression>,
+        revision: &str,
+    ) -> Result<HashSet<JjCommitId>, JjError> {
+        let revision_error = |error: RevsetEvaluationError| JjError::Revision {
+            revision: revision.to_owned(),
+            detail: error.to_string(),
+        };
+        let revset = expression
+            .evaluate(self.repo.as_ref())
+            .map_err(revision_error)?;
+        collect_stream(revset.stream())
+            .into_iter()
+            .collect::<Result<_, _>>()
+            .map_err(revision_error)
+    }
+
     /// Commits reachable from `tip` but not from any of `bases` — `bases..tip` —
-    /// children before parents: the order [`duplicate_commits`] requires.
+    /// children before parents: the order [`replay_range`] replays in reverse.
+    /// The range is evaluated once and the walk only orders it.
     fn range_newest_first(
         &self,
         bases: &[JjCommitId],
         tip: &JjCommitId,
     ) -> Result<Vec<JjCommitId>, JjError> {
+        let range = ResolvedRevsetExpression::commits(bases.to_vec())
+            .range(&ResolvedRevsetExpression::commit(tip.clone()));
+        let in_range = self.revset_ids(range, &tip.hex())?;
         let mut oldest_first = Vec::new();
         let mut visited = BTreeSet::new();
         let mut stack = vec![(tip.clone(), false)];
@@ -694,7 +711,7 @@ impl Repo {
                 oldest_first.push(id);
                 continue;
             }
-            if visited.contains(&id) || self.reaches_any(&id, bases)? {
+            if visited.contains(&id) || !in_range.contains(&id) {
                 continue;
             }
             visited.insert(id.clone());
@@ -747,13 +764,18 @@ impl Repo {
     /// Answers where work went when it was not merged: a maintainer building their own
     /// branch on our commits leaves the branch itself untouched, so the only trace is that
     /// its tip is reachable from somewhere else.
+    ///
+    /// One evaluation answers for every bookmark: of the tips asked about,
+    /// `commit::tips` holds exactly those that descend from `commit`. A fork
+    /// carries every upstream branch as a bookmark, so an ancestry query per tip
+    /// would walk the history once per bookmark, for every branch probed.
     pub fn branches_containing(
         &self,
         commit: &CommitId,
         scheme: &ReleaseScheme,
         publish_remote: &str,
     ) -> Result<Vec<BookmarkRef>, JjError> {
-        let mut found = Vec::new();
+        let mut candidates = Vec::new();
         for (reference, tip) in self.bookmark_tips()? {
             if &tip == commit {
                 continue;
@@ -774,11 +796,27 @@ impl Repo {
             {
                 continue;
             }
-            if self.is_ancestor(commit, &tip)? {
-                found.push(reference);
-            }
+            let tip = JjCommitId::try_from_hex(tip.as_str()).ok_or_else(|| JjError::Revision {
+                revision: reference.to_string(),
+                detail: "bookmark tip is not a hex commit id".to_owned(),
+            })?;
+            candidates.push((reference, tip));
         }
-        Ok(found)
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+        let root = self.commit(commit.as_str())?.id().clone();
+        let tips = candidates.iter().map(|(_, tip)| tip.clone()).collect();
+        let descendants = self.revset_ids(
+            ResolvedRevsetExpression::commit(root)
+                .dag_range_to(&ResolvedRevsetExpression::commits(tips)),
+            commit.as_str(),
+        )?;
+        Ok(candidates
+            .into_iter()
+            .filter(|(_, tip)| descendants.contains(tip))
+            .map(|(reference, _)| reference)
+            .collect())
     }
 
     pub fn resolve_commit(&self, revision: &str) -> Result<CommitId, JjError> {
@@ -840,7 +878,7 @@ impl Repo {
             revision: id.to_string(),
             detail: error.to_string(),
         };
-        let revset = jj_lib::revset::ResolvedRevsetExpression::commits(vec![id.clone()])
+        let revset = ResolvedRevsetExpression::commits(vec![id.clone()])
             .descendants()
             .evaluate(self.repo.as_ref())
             .map_err(|error| revision_error(&error))?;
@@ -871,19 +909,23 @@ impl Repo {
             .iter()
             .map(|base| Ok(self.commit(base.as_str())?.id().clone()))
             .collect::<Result<Vec<_>, JjError>>()?;
-        let mut merges = Vec::new();
-        for commit in self.commits_between(&bases, tip)? {
-            let mut beyond_base = 0usize;
-            for parent in commit.parent_ids() {
-                if !self.reaches_any(parent, &bases)? {
-                    beyond_base += 1;
-                }
-            }
-            if beyond_base > 1 {
-                merges.push(commit_id(commit.id()));
-            }
-        }
-        Ok(merges)
+        let commits = self.commits_between(&bases, tip)?;
+        // Every parent of a commit in the range is reachable from the tip, so it
+        // is beyond every base exactly when it is in the range.
+        let in_range: HashSet<&JjCommitId> =
+            commits.iter().map(jj_lib::commit::Commit::id).collect();
+        Ok(commits
+            .iter()
+            .filter(|commit| {
+                commit
+                    .parent_ids()
+                    .iter()
+                    .filter(|parent| in_range.contains(parent))
+                    .count()
+                    > 1
+            })
+            .map(|commit| commit_id(commit.id()))
+            .collect())
     }
 
     /// The commits of `bases..tip`, newest first.
@@ -1036,7 +1078,11 @@ fn ls_remote_args<'a>(remote_url: &'a str, patterns: &[&'a str]) -> Vec<&'a str>
     args
 }
 
-/// Replays a branch onto `onto` as a dropped-transaction read: nothing is written.
+/// Replays a branch onto `onto` as a dropped-transaction read.
+///
+/// No operation records it and no bookmark of the repository's own moves. Each
+/// replay does stay in the commit store, under the internal ref jj gives every
+/// commit it writes, until a `jj util gc` collects what no head reaches.
 pub fn probe_landed(
     repo: &Path,
     branch: &BranchName,
@@ -1124,9 +1170,8 @@ pub fn probe_net_diff(
 /// Replays `base..revision` onto a target and classifies the resulting content.
 ///
 /// A read, not a mutation, in the same dropped-transaction style as
-/// [`probe_net_diff`]. [`duplicate_commits`] is the code `jj duplicate -r
-/// <range> -d <onto>` itself runs, so replay semantics are unchanged from the
-/// porcelain implementation this replaces.
+/// [`probe_net_diff`]. Each commit is placed where `jj duplicate -r <range> -d
+/// <onto>` puts it, by the rewrite that command runs (see [`replay_range`]).
 pub fn probe_revision(
     repo: &Path,
     base: &str,
@@ -1144,31 +1189,70 @@ pub fn probe_revision(
         return Ok(RebaseOutcome::Empty);
     }
     let mut tx = repo.repo.start_transaction();
-    let stats = block_on(duplicate_commits(
-        tx.repo_mut(),
-        &targets,
-        &std::collections::HashMap::new(),
-        std::slice::from_ref(onto.id()),
-        &[],
-    ))
-    .map_err(|error| store_error(&error))?;
-    // Every duplicated commit, not just the first. A branch of several commits
-    // duplicates as several, and judging the branch by one of them answers a
-    // different question.
-    let mut conflicted = false;
-    let mut all_empty = true;
-    for replayed in stats.duplicated_commits.values() {
-        conflicted = conflicted || replayed.has_conflict();
-        all_empty = all_empty
-            && block_on(replayed.is_empty(tx.repo())).map_err(|error| store_error(&error))?;
-    }
+    let outcome = replay_range(tx.repo_mut(), &targets, onto.id())?;
     drop(tx);
-    if stats.duplicated_commits.is_empty() {
-        return Err(JjError::ProbeRoot);
+    Ok(outcome)
+}
+
+/// Replays `targets` — a `base..tip` range, children before parents — onto
+/// `onto`, parents first, and classifies what the replays hold.
+///
+/// Placement is `jj duplicate`'s: a commit none of whose parents is in the
+/// range goes onto `onto`, and every other commit onto the replays of its
+/// in-range parents. That is exactly what `duplicate_commits` computes for a
+/// `base..tip` range, since no parent outside such a range has an ancestor
+/// inside it.
+///
+/// Every replay counts, not just the first: a branch of several commits
+/// replays as several, and judging it by one of them answers a different
+/// question. The first conflicted replay ends the replay, because it already
+/// decides the outcome and because replaying past it does not scale: a commit
+/// replayed onto a conflicted parent carries that conflict with its own change
+/// added, so down a long branch the unresolved conflict can grow, and the later
+/// replays then cost far more than the first. On the branches measured for this
+/// change, replaying the whole range never finished.
+fn replay_range(
+    mut_repo: &mut MutableRepo,
+    targets: &[JjCommitId],
+    onto: &JjCommitId,
+) -> Result<RebaseOutcome, JjError> {
+    let mut replays: HashMap<&JjCommitId, JjCommitId> = HashMap::new();
+    let mut all_empty = true;
+    for original in targets.iter().rev() {
+        let commit = mut_repo
+            .store()
+            .get_commit(original)
+            .map_err(|error| store_error(&error))?;
+        let mut parents = Vec::new();
+        for parent in commit.parent_ids() {
+            if let Some(replayed) = replays.get(parent)
+                && !parents.contains(replayed)
+            {
+                parents.push(replayed.clone());
+            }
+        }
+        if parents.is_empty() {
+            parents.push(onto.clone());
+        }
+        let rewriter = CommitRewriter::new(mut_repo, commit, parents);
+        let replayed = block_on(async {
+            rewriter
+                .rebase()
+                .await?
+                .clear_rewrite_source()
+                .generate_new_change_id()
+                .write()
+                .await
+        })
+        .map_err(|error| store_error(&error))?;
+        if replayed.has_conflict() {
+            return Ok(RebaseOutcome::Conflicted);
+        }
+        all_empty = all_empty
+            && block_on(replayed.is_empty(mut_repo)).map_err(|error| store_error(&error))?;
+        let _ = replays.insert(original, replayed.id().clone());
     }
-    Ok(if conflicted {
-        RebaseOutcome::Conflicted
-    } else if all_empty {
+    Ok(if all_empty {
         RebaseOutcome::Empty
     } else {
         RebaseOutcome::CleanNonEmpty
@@ -2084,7 +2168,7 @@ fn duplicated_release(
     (source, message): (&jj_lib::commit::Commit, Option<&str>),
     parent_ids: &[JjCommitId],
 ) -> Result<jj_lib::commit::Commit, JjError> {
-    let mut descriptions = std::collections::HashMap::new();
+    let mut descriptions = HashMap::new();
     if let Some(message) = message {
         descriptions.insert(source.id().clone(), message.to_owned());
     }
