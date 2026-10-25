@@ -322,7 +322,7 @@ fn a_fixed_release_branch_is_cut_in_place_and_its_previous_position_is_the_old_c
     let carried = knives::release_model::carried_branches(&opened, entry.trunk(), &scheme)
         .expect("carried branches");
     let trunk = opened
-        .resolve_commit(&entry.upstream_trunk())
+        .resolve_commit(&entry.trunk_ref())
         .expect("upstream trunk");
     let mut parents = vec![trunk];
     parents.extend(carried.into_iter().map(|(_, commit)| commit));
@@ -357,7 +357,7 @@ fn a_fixed_release_branch_is_cut_in_place_and_its_previous_position_is_the_old_c
     let carried = knives::release_model::carried_branches(&opened, entry.trunk(), &scheme)
         .expect("carried branches for second cut");
     let trunk = opened
-        .resolve_commit(&entry.upstream_trunk())
+        .resolve_commit(&entry.trunk_ref())
         .expect("upstream trunk for second cut");
     let mut parents = vec![trunk];
     parents.extend(carried.into_iter().map(|(_, commit)| commit));
@@ -439,8 +439,9 @@ fn a_fixed_cut_with_a_published_unrecorded_composition_records_instead_of_refusi
     assert_eq!(commit_at(&lab, "integration"), published);
     assert_eq!(commit_at(&lab, "integration@origin"), published);
     let entries = knives::ledger::Ledger::at(home.path().join("ledger").join("demo"))
-        .entries()
-        .expect("read ledger");
+        .read()
+        .expect("read ledger")
+        .entries;
     let cut = entries
         .iter()
         .rev()
@@ -524,8 +525,9 @@ fn a_fixed_cut_records_a_published_composition_that_has_no_recorded_cut_yet() {
     );
     assert_eq!(commit_at(&lab, "integration@origin"), published);
     let entries = knives::ledger::Ledger::at(ledger_dir)
-        .entries()
-        .expect("read ledger");
+        .read()
+        .expect("read ledger")
+        .entries;
     let cut = entries
         .iter()
         .rev()
@@ -583,7 +585,7 @@ fn plan_for_a_fixed_release_ignores_a_non_publish_remote() {
     let carried = knives::release_model::carried_branches(&opened, entry.trunk(), &scheme)
         .expect("carried branches");
     let trunk = opened
-        .resolve_commit(&entry.upstream_trunk())
+        .resolve_commit(&entry.trunk_ref())
         .expect("upstream trunk");
     let mut parents = vec![trunk];
     parents.extend(carried.into_iter().map(|(_, commit)| commit));

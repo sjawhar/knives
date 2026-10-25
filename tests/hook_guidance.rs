@@ -9,8 +9,10 @@ use std::path::{Path, PathBuf};
 use knives::{
     config::GuidanceRoot,
     hook::guidance::{
-        Guidance, InstructionFile, claim_lines, format_guidance, format_notice, guidance_for,
+        Guidance, InstructionFile, claim_lines, envelope_nonce, format_guidance, format_notice,
+        guidance_for,
     },
+    ids::UpstreamName,
     seen::Seen,
     store::{Claim, OwnerKind},
 };
@@ -52,7 +54,10 @@ fn guidance_format_matches_the_plugin_prose_exactly() {
     };
 
     // When: the formatter produces an injection envelope.
-    let actual = normalize_nonce(&format_guidance("example-repo", &guidance), "guidance");
+    let actual = normalize_nonce(
+        &format_guidance("example-repo", &guidance, &envelope_nonce()),
+        "guidance",
+    );
 
     // Then: every non-nonce byte equals the TypeScript formatter's text.
     assert_eq!(
@@ -167,7 +172,7 @@ fn claim_lines_filter_the_repo_and_render_claim_provenance() {
     let now = "2026-08-03T00:00:00Z".parse().expect("valid timestamp");
 
     // When: lines are rendered for `repo`.
-    let lines = claim_lines(&claims, "repo", &Seen::default(), now);
+    let lines = claim_lines(&claims, &UpstreamName::new("repo"), &Seen::default(), now);
 
     // Then: only matching claims remain with explicit ownership provenance.
     assert_eq!(

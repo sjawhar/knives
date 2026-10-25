@@ -108,7 +108,7 @@ mod tests {
     fn no_finding_when_every_parent_holds_its_bookmark() {
         let parents = [parent("0700338c", vec![local("feat/beta")])];
         let tips = tips(vec![(local("feat/beta"), "0700338c")]);
-        assert!(stale_parents(&parents, &tips).is_empty());
+        assert_eq!(stale_parents(&parents, &tips), Vec::<Finding>::new());
     }
 
     #[test]
@@ -138,7 +138,7 @@ mod tests {
         // remote refs as never-holding reported every such parent as stale.
         let parents = [parent("72193319", vec![remote("release/dated", "origin")])];
         let tips = tips(vec![(remote("release/dated", "origin"), "72193319")]);
-        assert!(stale_parents(&parents, &tips).is_empty());
+        assert_eq!(stale_parents(&parents, &tips), Vec::<Finding>::new());
     }
 
     #[test]

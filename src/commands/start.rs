@@ -7,20 +7,19 @@ use std::path::{Path, PathBuf};
 use crate::bind::Fork;
 use crate::cli::Exit;
 use crate::commands::claim::{
-    ClaimContext, ClaimDecision, Identity, current_identity, decide, last_seen_provenance,
+    Bound, ClaimContext, ClaimDecision, Identity, current_identity, decide, last_seen_provenance,
     render_claim_context,
 };
 use crate::commands::release::shared_base;
 use crate::commands::wip::workspace_for;
 use crate::config::Role;
 use crate::detect::BookmarkTips;
-use crate::ids::{
-    BookmarkRef, BranchName, BranchTarget, CommitId, RemoteName, RepoName, WorkspaceName,
-};
+use crate::ids::{BookmarkRef, BranchName, BranchTarget, CommitId, RemoteName, WorkspaceName};
 use crate::jj::{
-    Repo, WorkspaceIdentity, add_workspace, fetch_all, is_workspace_named,
-    remove_prunable_worktree, repo_immutable_heads, set_repo_immutable_heads, user_immutable_heads,
-    workspace_identity,
+    Repo, StaleRegistration, WorkspaceIdentity, add_workspace, fetch_all, forget_workspace,
+    is_workspace_named, path_occupant, remove_finished_worktree, remove_prunable_worktree,
+    repo_immutable_heads, set_repo_immutable_heads, user_immutable_heads, workspace_identity,
+    workspace_recorded_elsewhere,
 };
 use crate::ledger::{Ledger, Scribe};
 use crate::release_model::newest_release;
@@ -117,8 +116,9 @@ struct StartContext<'a> {
     opened: Repo,
 }
 
-/// Claim `branch` and open its workspace. `bound` is the entry the current
-/// directory is inside, from which a terminal user's identity is derived.
+/// Claim `branch` and open its workspace. `bound` is the registry and the
+/// fork the current directory is inside, by the name its claims are kept
+/// under, from which a terminal user's identity is derived.
 #[allow(
     clippy::too_many_arguments,
     reason = "the fork, the branch, the reason, the override and the cwd binding are independent inputs"
@@ -128,7 +128,7 @@ pub fn run(
     branch: &BranchName,
     why: Option<&str>,
     force: bool,
-    bound: Option<&RepoName>,
+    bound: Bound<'_>,
 ) -> anyhow::Result<Exit> {
     let repo_name = &fork.name;
     let entry = fork.entry;
@@ -137,7 +137,11 @@ pub fn run(
         eprintln!("{repo_name}: {line}");
         return Ok(Exit::Usage);
     }
-    let mut store = Store::open_for_update(default_state_path())?;
+    let mut store = Store::open_for_update(
+        default_state_path(),
+        &bound.registry.former_names(),
+        &[&fork.upstream],
+    )?;
     let cwd = std::env::current_dir()?;
     let destination = workspace_path(fork, branch);
     let in_claimed_workspace = possesses(&cwd, fork, branch);
@@ -146,7 +150,7 @@ pub fn run(
         fork,
         branch,
         identity: current_identity(bound)?,
-        upstream_trunk: entry.upstream_trunk(),
+        upstream_trunk: entry.trunk_ref(),
         workspace: WorkspaceName::new(workspace_for(branch.as_str())),
         opened: Repo::open(checkout)?,
         destination,
@@ -179,7 +183,7 @@ pub fn run(
     }
     let held = context
         .store
-        .claims(Some(repo_name))
+        .claims(Some(&fork.upstream))
         .into_iter()
         .find(|claim| claim.branch == branch.as_str())
         .cloned();
@@ -292,8 +296,8 @@ fn resume_claim(
         "resumed"
     };
     Scribe::new(
-        Ledger::for_repo(&context.fork.name),
-        context.fork.name.clone(),
+        Ledger::for_fork(context.fork),
+        context.fork.upstream.clone(),
         context.fork.checkout.path.clone(),
         context.identity.owner.clone(),
     )
@@ -301,7 +305,7 @@ fn resume_claim(
         Some(context.branch.as_str()),
         event.to_owned(),
         context.store.tracked_pull(&BranchTarget::new(
-            context.fork.name.clone(),
+            context.fork.upstream.clone(),
             context.branch.clone(),
         )),
     )?;
@@ -351,7 +355,7 @@ fn take_claim(context: &mut StartContext<'_>, reason: &str) -> anyhow::Result<Ex
         return Ok(Exit::Ok);
     }
 
-    let (base_revision, base_label) = match create_workspace(context)? {
+    let (base_revision, base_label) = match create_workspace(context, Leftovers::Keep)? {
         WorkspaceBase::Created { revision, label } => (revision, label),
         WorkspaceBase::Divergent(tips) => {
             // Nothing was claimed: the agent picks a tip and starts again.
@@ -375,12 +379,12 @@ fn take_claim(context: &mut StartContext<'_>, reason: &str) -> anyhow::Result<Ex
 }
 
 fn record_claim(context: &mut StartContext<'_>, reason: &str, event: String) -> anyhow::Result<()> {
-    let target = BranchTarget::new(context.fork.name.clone(), context.branch.clone());
+    let target = BranchTarget::new(context.fork.upstream.clone(), context.branch.clone());
     let pull = context.store.tracked_pull(&target);
     let _ = context.store.claim(&target, &context.identity, reason);
     Scribe::new(
-        Ledger::for_repo(&context.fork.name),
-        context.fork.name.clone(),
+        Ledger::for_fork(context.fork),
+        context.fork.upstream.clone(),
         context.fork.checkout.path.clone(),
         context.identity.owner.clone(),
     )
@@ -477,7 +481,7 @@ fn workspace_notice(
             workspace_change(&context.opened, &context.workspace)?,
         )));
     }
-    Ok(match create_workspace(context)? {
+    Ok(match create_workspace(context, Leftovers::Clear)? {
         WorkspaceBase::Created { revision, label } => Ok(format!(
             "created missing workspace {} at {} based on {revision} ({label})",
             context.destination.display(),
@@ -488,6 +492,73 @@ fn workspace_notice(
         )),
         WorkspaceBase::Divergent(tips) => Err(divergent_refusal_line(context.branch, &tips)),
     })
+}
+
+/// What [`create_workspace`] does with what a workspace whose directory vanished
+/// left behind at the branch's name and path.
+#[derive(Clone, Copy)]
+enum Leftovers {
+    /// A plain `start`: remove a prunable Git registration, and refuse on a
+    /// locked one, which cannot be told apart from another machine's live
+    /// workspace in a shared store.
+    Keep,
+    /// A seized or forced claim, whose `--why` takes the workspace over: forget
+    /// jj's registration of the name, then remove git's of the path, locked or
+    /// not, so the rebuild's `add` can reuse both.
+    Clear,
+}
+
+fn clear_vanished_workspace(context: &StartContext<'_>) -> anyhow::Result<()> {
+    let checkout = &context.fork.checkout.path;
+    let shown = context.destination.display();
+    // Nothing is forgotten while something sits at the path: `add` would fail
+    // on it, and the forget could not be taken back.
+    if std::fs::symlink_metadata(&context.destination).is_ok() {
+        return refuse_occupied(context);
+    }
+    let registered = context
+        .opened
+        .workspaces()?
+        .iter()
+        .any(|(name, _)| *name == context.workspace);
+    if registered {
+        // The name is the repository's: a same-named workspace jj recorded at
+        // another path is live there, and forgetting it would take it over.
+        if let Some(elsewhere) = workspace_recorded_elsewhere(
+            checkout,
+            context.workspace.as_str(),
+            &context.destination,
+        )? {
+            anyhow::bail!(
+                "workspace {} is registered at {}, not {shown}; finish or forget it there",
+                context.workspace,
+                elsewhere.display()
+            );
+        }
+        forget_workspace(checkout, context.workspace.as_str())?;
+        println!(
+            "forgot workspace {} (its directory at {shown} was gone)",
+            context.workspace
+        );
+    }
+    match remove_finished_worktree(checkout, &context.destination)? {
+        StaleRegistration::Removed => println!(
+            "removed a stale Git worktree registration at {shown} (its directory was gone)"
+        ),
+        StaleRegistration::Occupied => refuse_occupied(context)?,
+        StaleRegistration::None | StaleRegistration::Locked => {}
+    }
+    Ok(())
+}
+
+/// The refusal for a workspace path that holds something other than a
+/// directory: a stale Git registration there stays, and `add` would fail on it.
+fn refuse_occupied(context: &StartContext<'_>) -> anyhow::Result<()> {
+    anyhow::bail!(
+        "{} is {}, not a workspace directory; move it aside and start again",
+        context.destination.display(),
+        path_occupant(&context.destination)
+    )
 }
 
 /// Where a new workspace's working copy was put, or why it was not.
@@ -525,7 +596,10 @@ fn divergent_refusal_line(branch: &BranchName, tips: &[CommitId]) -> String {
 /// forks from; without a release, the fetched upstream trunk. Never the current
 /// `@`: an agent in a release workspace could otherwise run `jj new` and
 /// silently inherit the release merge as a parent.
-fn create_workspace(context: &StartContext<'_>) -> anyhow::Result<WorkspaceBase> {
+fn create_workspace(
+    context: &StartContext<'_>,
+    leftovers: Leftovers,
+) -> anyhow::Result<WorkspaceBase> {
     let entry = context.fork.entry;
     let checkout = &context.fork.checkout.path;
     fetch_all(checkout)?;
@@ -570,11 +644,22 @@ fn create_workspace(context: &StartContext<'_>) -> anyhow::Result<WorkspaceBase>
     };
     // A registration whose directory is gone would make `add` fail on git's
     // "already registered" and leave an empty directory at the path.
-    if remove_prunable_worktree(checkout, &context.destination)? {
-        println!(
-            "removed a stale Git worktree registration at {} (its directory was gone)",
-            context.destination.display()
-        );
+    match leftovers {
+        Leftovers::Clear => clear_vanished_workspace(context)?,
+        Leftovers::Keep => match remove_prunable_worktree(checkout, &context.destination)? {
+            StaleRegistration::None => {}
+            StaleRegistration::Removed => println!(
+                "removed a stale Git worktree registration at {} (its directory was gone)",
+                context.destination.display()
+            ),
+            StaleRegistration::Locked => anyhow::bail!(
+                "a locked Git worktree registration at {} has no directory there; if it is \
+                 this branch's and no other machine has it open, `knives finish {}` clears it",
+                context.destination.display(),
+                context.branch
+            ),
+            StaleRegistration::Occupied => refuse_occupied(context)?,
+        },
     }
     add_workspace(
         checkout,

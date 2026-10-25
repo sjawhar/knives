@@ -29,7 +29,7 @@ use std::collections::BTreeMap;
 fn sync_fails_closed_when_the_facts_batch_fails() {
     let lab = lab::Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
-    let name = knives::ids::RepoName::new("demo");
+    let name = knives::ids::UpstreamName::new("demo");
     let entry = lab_entry(&lab);
     let fork = lab::lab_fork(&lab, "demo", &entry);
     let forge = knives::forge::fake::FakeForge {
@@ -41,7 +41,12 @@ fn sync_fails_closed_when_the_facts_batch_fails() {
         ..knives::forge::fake::FakeForge::default()
     };
     let state = tempfile::tempdir().expect("state directory");
-    let mut store = Store::open_for_update(state.path().join("state.json")).expect("store");
+    let mut store = Store::open_for_update(
+        state.path().join("state.json"),
+        &knives::config::FormerNames::new(),
+        &[&name],
+    )
+    .expect("store");
     let scribe = knives::ledger::Scribe::new(
         knives::ledger::Ledger::at(state.path().join("ledger")),
         name,
@@ -75,7 +80,7 @@ fn a_listed_state_wins_and_a_vanished_number_is_answered_by_the_batch() {
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     lab.publish_pull("feat/alpha", 42);
     lab.publish_pull("feat/alpha", 43);
-    let name = knives::ids::RepoName::new("demo");
+    let name = knives::ids::UpstreamName::new("demo");
     let entry = lab_entry(&lab);
     let fork = lab::lab_fork(&lab, "demo", &entry);
     let forge = knives::forge::fake::FakeForge {
@@ -87,7 +92,12 @@ fn a_listed_state_wins_and_a_vanished_number_is_answered_by_the_batch() {
         ..knives::forge::fake::FakeForge::default()
     };
     let state = tempfile::tempdir().expect("state directory");
-    let mut store = Store::open_for_update(state.path().join("state.json")).expect("store");
+    let mut store = Store::open_for_update(
+        state.path().join("state.json"),
+        &knives::config::FormerNames::new(),
+        &[&name],
+    )
+    .expect("store");
     store.record_pull_head(&name, 43, "previous");
     let scribe = knives::ledger::Scribe::new(
         knives::ledger::Ledger::at(state.path().join("ledger")),
@@ -131,7 +141,7 @@ fn sync_records_one_event_for_each_pull_request_that_moved() {
     // Given: three tracked pull requests that moved and one that did not.
     let lab = lab::Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
-    let name = knives::ids::RepoName::new("demo");
+    let name = knives::ids::UpstreamName::new("demo");
     let entry = RepoEntry::new(
         lab.upstream.display().to_string(),
         lab.work.display().to_string(),
@@ -158,7 +168,12 @@ fn sync_records_one_event_for_each_pull_request_that_moved() {
         ..knives::forge::fake::FakeForge::default()
     };
     let state = tempfile::tempdir().expect("state directory");
-    let mut store = Store::open_for_update(state.path().join("state.json")).expect("open store");
+    let mut store = Store::open_for_update(
+        state.path().join("state.json"),
+        &knives::config::FormerNames::new(),
+        &[&name],
+    )
+    .expect("open store");
     // Every one of them was seen before: a first sighting is recorded silently,
     // whatever the forge already did to it, so only prior sightings can move.
     store.record_pull_head(&name, 10, "head-10");
@@ -185,7 +200,7 @@ fn sync_records_one_event_for_each_pull_request_that_moved() {
     assert_eq!(report.rows.len(), 4, "was: {report:?}");
 
     // Then: exactly the moved pulls are events, each under the tracked branch.
-    let entries = ledger.entries().expect("read ledger");
+    let entries = ledger.read().expect("read ledger").entries;
     let recorded: Vec<(Option<&str>, &str)> = entries
         .iter()
         .map(|entry| (entry.subject.as_deref(), entry.text.as_str()))
@@ -213,7 +228,7 @@ fn sync_records_a_settled_pull_request_once_across_repeated_runs() {
     // Given: a merged pull request that remains listed by the forge.
     let lab = lab::Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
-    let name = knives::ids::RepoName::new("demo");
+    let name = knives::ids::UpstreamName::new("demo");
     let entry = lab_entry(&lab);
     let fork = lab::lab_fork(&lab, "demo", &entry);
     let forge = knives::forge::fake::FakeForge {
@@ -224,7 +239,12 @@ fn sync_records_a_settled_pull_request_once_across_repeated_runs() {
         ..knives::forge::fake::FakeForge::default()
     };
     let state = tempfile::tempdir().expect("state directory");
-    let mut store = Store::open_for_update(state.path().join("state.json")).expect("open store");
+    let mut store = Store::open_for_update(
+        state.path().join("state.json"),
+        &knives::config::FormerNames::new(),
+        &[&name],
+    )
+    .expect("open store");
     // Seen while open, so the merge is a transition rather than a first sighting.
     store.record_pull_head(&name, 10, "head-10");
     let ledger = knives::ledger::Ledger::at(state.path().join("demo"));
@@ -250,7 +270,7 @@ fn sync_records_a_settled_pull_request_once_across_repeated_runs() {
     .expect("second sync");
 
     // Then: its settled transition remains one fact, not one fact per sync run.
-    let entries = ledger.entries().expect("read ledger");
+    let entries = ledger.read().expect("read ledger").entries;
     assert_eq!(
         entries
             .iter()
@@ -266,7 +286,7 @@ fn sync_records_an_advanced_pull_request_then_its_merge() {
     // Given: a tracked pull request whose head advanced before the forge reports it merged.
     let lab = lab::Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
-    let name = knives::ids::RepoName::new("demo");
+    let name = knives::ids::UpstreamName::new("demo");
     let entry = lab_entry(&lab);
     let fork = lab::lab_fork(&lab, "demo", &entry);
     let advanced = knives::forge::fake::FakeForge {
@@ -284,7 +304,12 @@ fn sync_records_an_advanced_pull_request_then_its_merge() {
         ..knives::forge::fake::FakeForge::default()
     };
     let state = tempfile::tempdir().expect("state directory");
-    let mut store = Store::open_for_update(state.path().join("state.json")).expect("open store");
+    let mut store = Store::open_for_update(
+        state.path().join("state.json"),
+        &knives::config::FormerNames::new(),
+        &[&name],
+    )
+    .expect("open store");
     store.record_pull_head(&name, 12, "older");
     let ledger = knives::ledger::Ledger::at(state.path().join("demo"));
     let scribe =
@@ -309,7 +334,7 @@ fn sync_records_an_advanced_pull_request_then_its_merge() {
     .expect("merged sync");
 
     // Then: both distinct transitions remain in the ledger in observation order.
-    let entries = ledger.entries().expect("read ledger");
+    let entries = ledger.read().expect("read ledger").entries;
     assert_eq!(
         entries
             .iter()
@@ -325,7 +350,7 @@ fn sync_records_each_consecutive_advance() {
     // Given: an open pull request whose head changes twice between sync runs.
     let lab = lab::Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
-    let name = knives::ids::RepoName::new("demo");
+    let name = knives::ids::UpstreamName::new("demo");
     let entry = lab_entry(&lab);
     let fork = lab::lab_fork(&lab, "demo", &entry);
     let first_advance = knives::forge::fake::FakeForge {
@@ -343,7 +368,12 @@ fn sync_records_each_consecutive_advance() {
         ..knives::forge::fake::FakeForge::default()
     };
     let state = tempfile::tempdir().expect("state directory");
-    let mut store = Store::open_for_update(state.path().join("state.json")).expect("open store");
+    let mut store = Store::open_for_update(
+        state.path().join("state.json"),
+        &knives::config::FormerNames::new(),
+        &[&name],
+    )
+    .expect("open store");
     store.record_pull_head(&name, 12, "head-a");
     let ledger = knives::ledger::Ledger::at(state.path().join("demo"));
     let scribe =
@@ -368,7 +398,7 @@ fn sync_records_each_consecutive_advance() {
     .expect("second advance");
 
     // Then: both changed heads are recorded as distinct advances.
-    let entries = ledger.entries().expect("read ledger");
+    let entries = ledger.read().expect("read ledger").entries;
     assert_eq!(
         entries
             .iter()

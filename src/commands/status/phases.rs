@@ -1,7 +1,7 @@
 use super::{
     BTreeMap, BTreeSet, BookmarkRef, BookmarkTips, BranchName, BranchTarget, CommitId, Finding,
-    FindingKind, Forge, JjError, LandedVerdict, Options, OriginRelation, Repo, RepoEntry, RepoName,
-    Role, Store, Subject, classify_landed, divergent_changes, double_checkout, index_pulls,
+    FindingKind, Forge, JjError, LandedVerdict, Options, OriginRelation, Repo, RepoEntry, Role,
+    Store, Subject, UpstreamName, classify_landed, divergent_changes, double_checkout, index_pulls,
     probe_landed,
 };
 
@@ -220,9 +220,10 @@ pub(super) fn conflicted_bookmark_findings(repo: &Repo) -> anyhow::Result<Vec<Fi
     Ok(findings)
 }
 /// Every number declared before discovery: stated pull requests and same-repository
-/// dependencies for both maintained and divergent branches.
+/// dependencies for both maintained and divergent branches. A requirement is
+/// this fork's when it names `repo`, the name the fork is kept under.
 pub(super) fn declared_numbers(
-    repo: &RepoName,
+    repo: &UpstreamName,
     branches: &[BranchName],
     store: &Store,
 ) -> Vec<u64> {
@@ -430,7 +431,7 @@ pub(super) struct RepositoryHealth {
 pub(super) fn repository_health(
     path: &std::path::Path,
     tips: &BookmarkTips,
-    publish_remote: &str,
+    entry: &crate::config::RepoEntry,
 ) -> anyhow::Result<RepositoryHealth> {
     let health_phase = std::time::Instant::now();
     let repo = Repo::open(path)?;
@@ -440,11 +441,7 @@ pub(super) fn repository_health(
         problems.push(stale);
     }
     findings.extend(double_checkout(&repo.workspaces()?));
-    let ignored: std::collections::BTreeSet<crate::ids::BookmarkRef> =
-        crate::commands::release::superseded_dated_releases(tips, publish_remote)
-            .into_iter()
-            .map(|(reference, _)| reference)
-            .collect();
+    let ignored = crate::commands::release::superseded_cuts_of_every_series(tips, entry);
     let phase = std::time::Instant::now();
     let changes = repo.divergent_changes(&ignored)?;
     let divergent_duration = phase.elapsed();
@@ -512,7 +509,7 @@ pub(super) fn run_status_phases<'snapshot>(
         declared,
         forge_started,
     } = input;
-    let upstream_trunk = entry.upstream_trunk();
+    let upstream_trunk = entry.trunk_ref();
     let context = ProbeContext {
         path,
         options,
@@ -613,8 +610,13 @@ mod tests {
             8,
             "the current open pull request is primary"
         );
-        let store = Store::open(cache.path().join("state.json")).expect("open state");
-        let repo = RepoName::new("test-repo");
+        let repo = UpstreamName::new("test-repo");
+        let store = Store::open(
+            cache.path().join("state.json"),
+            &crate::config::FormerNames::new(),
+            &[&repo],
+        )
+        .expect("open state");
         let mut report = Report::default();
         branch_rows(
             RowInput {

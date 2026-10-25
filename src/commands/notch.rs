@@ -8,7 +8,7 @@
 
 use crate::bind::Fork;
 use crate::cli::Exit;
-use crate::commands::claim::current_identity;
+use crate::commands::claim::{Bound, current_identity};
 use crate::ids::{BranchName, BranchTarget, RepoName, short_id};
 use crate::ledger::{
     Draft, Entry, EntryClass, Filter, Kind, Ledger, LedgerError, Scribe, VerifyFlag,
@@ -39,6 +39,12 @@ pub enum Report {
         matched: usize,
         #[serde(skip_serializing_if = "Option::is_none")]
         events: Option<EventsFold>,
+        /// Each entry or statement this knives reads only in part
+        /// ([`crate::ledger::Ledger::read`]), and each directory of entries
+        /// no fork is kept under ([`crate::ledger::unclaimed_problems`]):
+        /// this fork's ledger may be read without entries that belong to it.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        problems: Vec<String>,
     },
     Written {
         #[serde(skip)]
@@ -49,6 +55,11 @@ pub enum Report {
         repo: String,
         checked: usize,
         flags: Vec<VerifyFlag>,
+        /// Each entry or statement the read under the check could read only
+        /// in part ([`crate::ledger::Ledger::read`]): an entry left out is
+        /// one whose evidence went unchecked.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        problems: Vec<String>,
     },
 }
 
@@ -56,9 +67,11 @@ pub enum Report {
 #[derive(Debug)]
 pub struct Request<'a> {
     pub fork: &'a Fork<'a>,
-    /// The entry the current directory is inside; a write derives its author
-    /// from it, a read never asks.
-    pub bound: Option<&'a RepoName>,
+    /// The registry the fork was resolved from, and the fork the current
+    /// directory is inside, by the name its claims are kept under: a read
+    /// checks the ledger root for entries none of the registry's forks is
+    /// kept under; a write derives its author from both.
+    pub bound: Bound<'a>,
     pub subject: Option<&'a str>,
     /// Present for a write, absent for a read.
     pub message: Option<&'a str>,
@@ -70,49 +83,56 @@ pub struct Request<'a> {
     pub verify: bool,
 }
 
-/// Entries for one repository, filtered.
-pub fn read(ledger: &Ledger, repo: &RepoName, filter: &Filter<'_>) -> Result<Report, LedgerError> {
-    let entries = ledger.entries()?;
-    let (selected, matched) = select(&entries, filter);
-    Ok(Report::Read {
-        repo: repo.to_string(),
-        entries: selected.into_iter().cloned().collect(),
-        matched,
-        events: None,
-    })
-}
-
 pub fn render(report: &Report) -> String {
     match report {
         Report::Written { repo, wrote } => wrote_line(repo, wrote),
         Report::Verified {
             repo,
-            checked: _,
             flags,
-        } if flags.is_empty() => format!("{repo}  no evidence flags"),
-        Report::Verified { repo, flags, .. } => flags
-            .iter()
-            .map(|flag| {
-                let subject = flag
-                    .subject
-                    .as_deref()
-                    .map_or_else(|| "(this repo)".to_owned(), inline_human_text);
-                format!(
-                    "{repo}  {}  {subject}  {}",
-                    flag.ts,
-                    inline_human_text(&flag.what)
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
+            problems,
+            ..
+        } => {
+            let mut lines: Vec<String> = if flags.is_empty() {
+                vec![format!("{repo}  no evidence flags")]
+            } else {
+                flags
+                    .iter()
+                    .map(|flag| {
+                        let subject = flag
+                            .subject
+                            .as_deref()
+                            .map_or_else(|| "(this repo)".to_owned(), inline_human_text);
+                        format!(
+                            "{repo}  {}  {subject}  {}",
+                            flag.ts,
+                            inline_human_text(&flag.what)
+                        )
+                    })
+                    .collect()
+            };
+            lines.extend(
+                problems
+                    .iter()
+                    .map(|problem| format!("!! {}", inline_human_text(problem))),
+            );
+            lines.join("\n")
+        }
         Report::Read {
             repo,
             entries,
             matched,
             events,
+            problems,
         } => {
+            // A problem names a file from disk or another machine's ref.
+            let flagged = problems
+                .iter()
+                .map(|problem| format!("!! {}", inline_human_text(problem)));
             if entries.is_empty() && events.is_none() {
-                return format!("{repo}  no notches yet");
+                return std::iter::once(format!("{repo}  no notches yet"))
+                    .chain(flagged)
+                    .collect::<Vec<_>>()
+                    .join("\n");
             }
             let mut lines = vec![format!("{repo}  {matched} notch(es)")];
             if *matched > entries.len() {
@@ -150,6 +170,7 @@ pub fn render(report: &Report) -> String {
                     inline_human_text(&events.newest_text)
                 ));
             }
+            lines.extend(flagged);
             lines.join("\n")
         }
     }
@@ -208,7 +229,8 @@ fn read_filtered(
     repo: &RepoName,
     request: &Request<'_>,
 ) -> Result<Report, LedgerError> {
-    let entries = ledger.entries()?;
+    let read = ledger.read()?;
+    let (entries, problems) = (read.entries, read.problems);
     let bare = request.subject.is_none()
         && request.pr.is_none()
         && !request.events
@@ -234,6 +256,7 @@ fn read_filtered(
             entries: notes.into_iter().cloned().collect(),
             matched,
             events: events_fold(&events),
+            problems,
         });
     }
 
@@ -262,6 +285,7 @@ fn read_filtered(
         entries: selected.into_iter().cloned().collect(),
         matched,
         events: None,
+        problems,
     })
 }
 
@@ -271,7 +295,8 @@ fn verify(
     repo: &RepoName,
     request: &Request<'_>,
 ) -> anyhow::Result<Report> {
-    let entries = ledger.entries()?;
+    let read = ledger.read()?;
+    let entries = read.entries;
     let (selected, _) = select(
         &entries,
         &Filter {
@@ -300,18 +325,31 @@ fn verify(
         repo: repo.to_string(),
         checked: selected.len(),
         flags,
+        problems: read.problems,
     })
 }
 
 pub fn run(request: &Request<'_>, output: crate::cli::Output) -> anyhow::Result<Exit> {
     let repo = &request.fork.name;
+    let upstream = &request.fork.upstream;
     let path = &request.fork.checkout.path;
-    let ledger = Ledger::for_repo(repo);
+    let ledger = Ledger::for_fork(request.fork);
     let report = match request.message {
         Some(text) => {
             // The store is read, never written: a notch changes no intent, and a
-            // ledger append needs no store lock.
-            let store = Store::open(default_state_path())?;
+            // ledger append needs no store lock. Only a note about a branch, with
+            // no number given, asks it for the branch's stated pull request, so
+            // only that note reads the fork's ledger.
+            let asks_stated_pull = request.pr.is_none()
+                && request
+                    .subject
+                    .is_some_and(|subject| !subject.starts_with('#'));
+            let fork = [upstream];
+            let store = Store::open(
+                default_state_path(),
+                &request.bound.registry.former_names(),
+                if asks_stated_pull { &fork } else { &[] },
+            )?;
             let pr = request
                 .pr
                 .or_else(|| pr_subject(request.subject))
@@ -321,17 +359,18 @@ pub fn run(request: &Request<'_>, output: crate::cli::Output) -> anyhow::Result<
                         .filter(|subject| !subject.starts_with('#'))
                         .and_then(|subject| {
                             store.tracked_pull(&BranchTarget::new(
-                                repo.clone(),
+                                upstream.clone(),
                                 BranchName::new(subject),
                             ))
                         })
                 });
             let owner = current_identity(request.bound)?.owner;
-            let scribe = Scribe::new(ledger, repo.clone(), path.clone(), owner);
+            let scribe = Scribe::new(ledger, upstream.clone(), path.clone(), owner);
             let written = scribe.record(&Draft {
                 subject: request.subject,
                 kind: Kind::Note,
                 disposition: request.disposition.map(str::to_owned),
+                statement: None,
                 text: text.to_owned(),
                 evidence: request.evidence.to_vec(),
                 pr,
@@ -343,18 +382,33 @@ pub fn run(request: &Request<'_>, output: crate::cli::Output) -> anyhow::Result<
             }
         }
         None if request.verify => verify(&ledger, path, repo, request)?,
-        None => read_filtered(&ledger, repo, request)?,
+        None => {
+            let mut report = read_filtered(&ledger, repo, request)?;
+            if let Report::Read { problems, .. } = &mut report {
+                problems.extend(crate::ledger::unclaimed_problems(
+                    &crate::ledger::default_ledger_root(),
+                    request.bound.registry,
+                ));
+            }
+            report
+        }
     };
     if let Some(payload) = crate::cli::machine_payload(output, &report)? {
         println!("{payload}");
     } else {
         println!("{}", render(&report));
     }
-    Ok(
-        matches!(&report, Report::Verified { flags, .. } if !flags.is_empty())
-            .then_some(Exit::Findings)
-            .unwrap_or(Exit::Ok),
-    )
+    // A verify that left an entry out did not check it: incomplete, which
+    // outranks what it found, as [`Exit::worst`] ranks them.
+    Ok(match &report {
+        Report::Read { problems, .. } | Report::Verified { problems, .. }
+            if !problems.is_empty() =>
+        {
+            Exit::Incomplete
+        }
+        Report::Verified { flags, .. } if !flags.is_empty() => Exit::Findings,
+        _ => Exit::Ok,
+    })
 }
 
 #[cfg(test)]
@@ -369,9 +423,11 @@ mod tests {
         Entry {
             ts: "2026-08-15T22:14:03Z".to_owned(),
             owner: "ses_fff688".to_owned(),
+            email: None,
             subject: subject.map(str::to_owned),
             kind,
             disposition: None,
+            statement: None,
             text: text.to_owned(),
             evidence: Vec::new(),
             anchor: Some("6c42fe71aaaaaaaa".to_owned()),
@@ -391,6 +447,7 @@ mod tests {
             )],
             matched: 1,
             events: None,
+            problems: Vec::new(),
         };
         let text = render(&report);
         assert!(text.contains("feat/log-queue"), "was: {text}");
@@ -412,12 +469,34 @@ mod tests {
             }],
             matched: 1,
             events: None,
+            problems: Vec::new(),
         };
 
         let text = render(&report);
         assert!(!text.contains('\u{1b}'), "was: {text:?}");
         assert!(!text.contains('\r'), "was: {text:?}");
         assert!(text.contains('\u{fffd}'), "was: {text:?}");
+    }
+
+    #[test]
+    fn human_rendering_escapes_control_characters_in_problems() {
+        // A problem names a file or a path that may have come from another
+        // machine's ref or from disk.
+        let problem = "…/acme/a-repo/x-\u{1b}]0;pwned\u{7}.md is not an entry".to_owned();
+        for entries in [Vec::new(), vec![entry(Some("feat/alpha"), Kind::Note, "a")]] {
+            let report = Report::Read {
+                repo: "a-repo".to_owned(),
+                matched: entries.len(),
+                entries,
+                events: None,
+                problems: vec![problem.clone()],
+            };
+
+            let text = render(&report);
+            assert!(!text.contains('\u{1b}'), "was: {text:?}");
+            assert!(!text.contains('\u{7}'), "was: {text:?}");
+            assert!(text.contains("!! "), "was: {text:?}");
+        }
     }
 
     #[test]
@@ -431,6 +510,7 @@ mod tests {
             )],
             matched: 1,
             events: None,
+            problems: Vec::new(),
         };
 
         let text = render(&report);
@@ -449,6 +529,7 @@ mod tests {
             entries: vec![entry(Some("feat/alpha"), Kind::Event, "claimed")],
             matched: 57,
             events: None,
+            problems: Vec::new(),
         };
         assert!(
             render(&report).contains("showing the newest 1 of 57"),
@@ -464,6 +545,7 @@ mod tests {
             entries: Vec::new(),
             matched: 0,
             events: None,
+            problems: Vec::new(),
         };
         assert_eq!(render(&report), "a-repo  no notches yet");
     }
@@ -477,9 +559,11 @@ mod tests {
                 .append(&Entry {
                     ts: format!("2026-08-15T22:14:{second:02}Z"),
                     owner: "test".to_owned(),
+                    email: None,
                     subject: Some("feat/alpha".to_owned()),
                     kind: Kind::Event,
                     disposition: None,
+                    statement: None,
                     text: format!("event {second}"),
                     evidence: Vec::new(),
                     anchor: None,
@@ -492,9 +576,11 @@ mod tests {
             .append(&Entry {
                 ts: "2026-08-15T22:15:00Z".to_owned(),
                 owner: "test".to_owned(),
+                email: None,
                 subject: Some("feat/alpha".to_owned()),
                 kind: Kind::Note,
                 disposition: None,
+                statement: None,
                 text: "human note".to_owned(),
                 evidence: Vec::new(),
                 anchor: None,
@@ -505,9 +591,13 @@ mod tests {
         let repo = RepoName::new("demo");
         let entry = crate::config::RepoEntry::new(String::new(), String::new());
         let fork = crate::bind::Fork::at("demo", &entry, directory.path());
+        let registry = crate::config::Registry::default();
         let request = Request {
             fork: &fork,
-            bound: None,
+            bound: Bound {
+                registry: &registry,
+                upstream: None,
+            },
             subject: Some("feat/alpha"),
             message: None,
             evidence: &[],

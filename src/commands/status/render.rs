@@ -1,6 +1,7 @@
 use std::fmt::Write as _;
 
 use crate::ids::short_id;
+use crate::ledger::inline_human_text;
 
 use super::{
     BranchRow, BranchState, FindingGroup, LastNotch, PushRelation, RepoNotches, Report, SeenWindow,
@@ -247,12 +248,13 @@ pub fn render(report: &Report, verbose: bool) -> String {
         "{}  trunk {}  release {release}  forge {consulted} ({}ms)",
         report.repo, report.trunk, report.forge.elapsed_ms
     )];
+    // Problems and notes name paths from disk and from other machines' refs.
     if !report.problems.is_empty() {
         lines.push(format!("  UNANSWERED  {}", report.problems.len()));
         lines.extend(report.problems.iter().map(|problem| {
             format!(
                 "    {}",
-                problem.split_whitespace().collect::<Vec<_>>().join(" ")
+                inline_human_text(&problem.split_whitespace().collect::<Vec<_>>().join(" "))
             )
         }));
     }
@@ -277,7 +279,12 @@ pub fn render(report: &Report, verbose: bool) -> String {
     }
     if !report.notes.is_empty() {
         lines.push(format!("  notes       {}", report.notes.len()));
-        lines.extend(report.notes.iter().map(|note| format!("    {note}")));
+        lines.extend(
+            report
+                .notes
+                .iter()
+                .map(|note| format!("    {}", inline_human_text(note))),
+        );
     }
     lines.join("\n")
 }
@@ -346,6 +353,25 @@ mod tests {
             rendered.find("UNANSWERED") < rendered.find("branches"),
             "was: {rendered}"
         );
+    }
+
+    #[test]
+    fn problems_and_notes_render_with_control_characters_escaped() {
+        // Both carry names from another machine's ref or from disk.
+        let report = Report {
+            repo: "demo".to_owned(),
+            trunk: "main".to_owned(),
+            problems: vec!["…/x-\u{1b}]0;pwned\u{7}.md is not an entry".to_owned()],
+            notes: vec!["1 entry of \u{1b}[2Jacme/x is not read here".to_owned()],
+            ..Report::default()
+        };
+
+        let rendered = render(&report, false);
+
+        assert!(!rendered.contains('\u{1b}'), "was: {rendered:?}");
+        assert!(!rendered.contains('\u{7}'), "was: {rendered:?}");
+        assert!(rendered.contains("UNANSWERED"), "was: {rendered:?}");
+        assert!(rendered.contains("notes"), "was: {rendered:?}");
     }
 
     #[test]

@@ -60,7 +60,7 @@ mod tests {
     #[test]
     fn no_finding_when_each_change_has_one_commit() {
         let rows = [row("aaaa", "1111"), row("bbbb", "2222")];
-        assert!(divergent_changes(&rows).is_empty());
+        assert_eq!(divergent_changes(&rows), Vec::<Finding>::new());
     }
 
     #[test]

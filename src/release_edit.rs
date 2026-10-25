@@ -7,13 +7,15 @@
 
 use knives::bind::Fork;
 use knives::cli::Exit;
+use knives::commands::claim::Bound;
 use knives::commands::release;
 use knives::forge::github::CliForge;
 use knives::ids::{BranchName, CommitId, ReleaseScheme, RepoName};
 use knives::ledger::{Draft, Kind, Ledger};
 use knives::release_model::{
-    MemberEvidence, MemberLookup, MemberSuccession, StackedHistoryContext, carried_from_tips,
-    last_recorded_parents, member_parents, members_event_text, trunk_positions,
+    MemberEvidence, MemberLookup, MemberSuccession, SeriesFit, StackedHistoryContext,
+    carried_from_tips, last_recorded_parents, member_parents, members_event_text, series_fit,
+    trunk_positions,
 };
 
 use super::scribe_for;
@@ -89,9 +91,11 @@ struct EditContext<'a> {
     repo: &'a RepoName,
     opened: &'a knives::jj::Repo,
     release: &'a ReleaseInHand,
-    /// The entry the current directory is inside; the ledger event's author is
-    /// derived from it.
-    bound: Option<&'a RepoName>,
+    /// The registry entry, bound to the series this command acts on.
+    entry: &'a knives::config::RepoEntry,
+    /// The fork the current directory is inside, by the name its claims are
+    /// kept under; the ledger event's author is derived from it.
+    bound: Bound<'a>,
     /// The release's last recorded parent set, from this repository's ledger.
     ///
     /// Ancestry and change ids cover a branch that grew or was rebased by jj. A
@@ -107,6 +111,38 @@ struct EditContext<'a> {
 }
 
 impl EditContext<'_> {
+    /// Refuse, saying why, a branch that belongs to another release series or
+    /// to none; `false` for a member of the selected series. An entry without
+    /// named series has one series, so every branch belongs to it.
+    fn refuse_if_other_series(
+        &self,
+        branch: &str,
+        tip: &knives::ids::CommitId,
+        before: &str,
+    ) -> anyhow::Result<bool> {
+        if self.entry.series.is_empty() {
+            return Ok(false);
+        }
+        match series_fit(self.opened, self.entry, tip)? {
+            SeriesFit::Selected => Ok(false),
+            SeriesFit::Other(label) => {
+                println!(
+                    "{}: {branch} forks from the base of the {label}, not {}'s; \
+                     refusing {before}: `knives release --series <name>` acts on its series",
+                    self.repo, self.release.name
+                );
+                Ok(true)
+            }
+            SeriesFit::None(why) => {
+                println!(
+                    "{}: {branch} belongs to no release series: {why}; refusing {before}",
+                    self.repo
+                );
+                Ok(true)
+            }
+        }
+    }
+
     /// Refuse a branch whose history past the trunk carries a merge, saying so;
     /// `false` for a linear one.
     ///
@@ -188,7 +224,7 @@ pub(crate) fn run_release_edit(
     fork: &Fork<'_>,
     extra_consumers: &[&std::path::Path],
     change: &ReleaseEdit,
-    bound: Option<&RepoName>,
+    bound: Bound<'_>,
 ) -> anyhow::Result<Exit> {
     let mut locals = extra_consumers
         .iter()
@@ -227,7 +263,7 @@ fn edit_release(
     forge: &dyn knives::consumer_pins::ConsumerPinSource,
     cache_root: Option<&std::path::Path>,
     heads: &knives::consumer_pins::ConsumerHeadMemo,
-    bound: Option<&RepoName>,
+    bound: Bound<'_>,
 ) -> anyhow::Result<Exit> {
     let repo = &fork.name;
     let entry = fork.entry;
@@ -239,7 +275,7 @@ fn edit_release(
         cache_root,
         heads,
     };
-    let plan = release::plan(fork, &consumers, &Ledger::for_repo(repo).entries()?)?;
+    let plan = release::pulled_plan(fork, bound.registry, &consumers)?;
     if !plan.problems.is_empty() {
         println!("{}", release::render(&plan));
         println!(
@@ -263,7 +299,7 @@ fn edit_release(
     ) == release::RepairEffect::NewDatedName
     {
         match entry.release_scheme() {
-            ReleaseScheme::Dated => println!(
+            ReleaseScheme::Dated | ReleaseScheme::Series(_) => println!(
                 "{repo}: every pin of {release_name} is frozen, so editing it would reach \
                  nobody; cut a new dated release first"
             ),
@@ -279,11 +315,11 @@ fn edit_release(
     // unresolvable trunk would make every base look like a member — include
     // would refuse for the wrong reason, and drop or advance could touch the
     // base, which is `rebase`'s domain.
-    if opened.resolve_commit(&entry.upstream_trunk()).is_err() {
+    if opened.resolve_commit(&entry.trunk_ref()).is_err() {
         println!(
             "{repo}: cannot resolve {}; release edits classify parents against the upstream \
              trunk, so fetch upstream first",
-            entry.upstream_trunk()
+            entry.trunk_ref()
         );
         return Ok(Exit::Incomplete);
     }
@@ -291,7 +327,8 @@ fn edit_release(
         return Ok(Exit::Incomplete);
     }
     let release = ReleaseInHand::read(&opened, entry, release_name)?;
-    let ledger = Ledger::for_repo(repo).entries()?;
+    // The pulled plan refused on any problem this read finds.
+    let ledger = Ledger::for_fork(fork).read()?.entries;
     let releases = knives::release_model::release_refs_by_commit(
         &opened.bookmark_tips()?,
         &entry.release_scheme(),
@@ -301,6 +338,7 @@ fn edit_release(
         repo,
         opened: &opened,
         release: &release,
+        entry,
         recorded: last_recorded_parents(&ledger, &release.name),
         bound,
         stacked: StackedHistoryContext {
@@ -335,23 +373,27 @@ fn apply_edit(
     let entry = fork.entry;
     let provenance = release::parent_sources(opened, entry, &entry.release_scheme(), new_parents)?;
     let message = release::composition_message(&release.name, &provenance, delta);
-    let created = knives::jj::write_release(
+    let written = knives::jj::write_release(
         &fork.checkout.path,
         &knives::jj::ReleaseWrite {
             source: Some(&release.commit),
             parents: new_parents,
             message: Some(&message),
             bookmark: Some(&release.name),
+            publish_remote: Some(entry.publish_remote()),
+            earlier: &earlier_writes(fork, &release.name)?,
             operation: &format!("knives: {}: {delta}", release.name),
         },
     )?;
+    let created = &written.commit;
     record_edit_event(
         fork,
         opened,
         &EditRecord {
             release: &release.name,
             delta,
-            created: &created,
+            created,
+            change: &written.change,
             provenance: &provenance,
         },
         context.bound,
@@ -361,6 +403,7 @@ fn apply_edit(
         release.name,
         new_parents.len()
     );
+    report_replaced(repo, &release.name, &written);
     match knives::jj::conflicted_files(&fork.checkout.path, created.as_str()) {
         Ok(files) => println!("{}", release::conflict_guidance(&files)),
         Err(error) => println!("  could not list conflicts: {error}"),
@@ -368,23 +411,71 @@ fn apply_edit(
     Ok(Exit::Ok)
 }
 
-/// What one release edit wrote: the name, the delta, the new merge and its
-/// parent set with the branch each parent came from.
+/// One line on the commit a release write replaced under `release`: abandoned,
+/// or kept with what rests on it. Silent when the write replaced nothing.
+pub(crate) fn report_replaced(
+    repo: &RepoName,
+    release: &str,
+    written: &knives::jj::ReleaseWritten,
+) {
+    if let Some(replaced) = &written.replaced {
+        let old = replaced.commit.short();
+        match &replaced.kept {
+            None => println!("{repo}: abandoned {old}, the {release} commit this write replaced"),
+            Some(reason) => println!(
+                "{repo}: note: kept {old}, the {release} commit this write replaced: {reason}"
+            ),
+        }
+    }
+    report_abandoned_earlier(repo, release, &written.abandoned_earlier);
+}
+
+/// One line per earlier write of `release` abandoned because nothing rests on
+/// it any more.
+pub(crate) fn report_abandoned_earlier(
+    repo: &RepoName,
+    release: &str,
+    abandoned: &[knives::ids::CommitId],
+) {
+    for commit in abandoned {
+        println!(
+            "{repo}: abandoned {}, an earlier {release} commit nothing rests on any more",
+            commit.short()
+        );
+    }
+}
+
+/// The commits the fork's ledger records knives writing under `release`.
+pub(crate) fn earlier_writes(
+    fork: &Fork<'_>,
+    release: &str,
+) -> anyhow::Result<Vec<knives::ids::CommitId>> {
+    let entries = Ledger::for_fork(fork).read()?.entries;
+    Ok(knives::release_model::recorded_writes(&entries, release)
+        .map(|write| write.commit)
+        .collect())
+}
+
+/// What one release edit wrote: the name, the delta, the new merge with its
+/// change id, and its parent set with the branch each parent came from.
 pub(crate) struct EditRecord<'a> {
     pub(crate) release: &'a str,
     pub(crate) delta: &'a str,
     pub(crate) created: &'a knives::ids::CommitId,
+    pub(crate) change: &'a knives::ids::ChangeId,
     pub(crate) provenance: &'a [(String, knives::ids::CommitId)],
 }
 
 /// The edit's parent set goes to the ledger the way a cut's does, so a later
 /// `advance` or `include` can still tell which parent is which branch after a
-/// rebase that left no ancestry or change id behind.
+/// rebase that left no ancestry or change id behind. Like a cut event, it names
+/// the written commit, its change id and its parents, and the commit leads the
+/// evidence: it is the position `audit` holds the release against.
 pub(crate) fn record_edit_event(
     fork: &Fork<'_>,
     opened: &knives::jj::Repo,
     record: &EditRecord<'_>,
-    bound: Option<&RepoName>,
+    bound: Bound<'_>,
 ) -> anyhow::Result<()> {
     let parents: Vec<knives::ids::CommitId> = record
         .provenance
@@ -395,9 +486,13 @@ pub(crate) fn record_edit_event(
         subject: Some(record.release),
         kind: Kind::Event,
         disposition: None,
+        statement: None,
         text: format!(
-            "edited {}: {}; parents: {}",
+            "edited {} as {} (change {}) with {} parent(s): {}; parents: {}",
             record.release,
+            record.created.short(),
+            record.change.short(),
+            parents.len(),
             record.delta,
             members_event_text(record.provenance)
         ),
@@ -504,6 +599,9 @@ fn include_edit(
              upstream through its members' bases, never as a parent",
             release.name
         );
+        return Ok(EditOutcome::Settled(Exit::Incomplete));
+    }
+    if context.refuse_if_other_series(target, &tip, "including it")? {
         return Ok(EditOutcome::Settled(Exit::Incomplete));
     }
     if context.refuse_if_stacked(target, &tip, "including it")? {
@@ -632,6 +730,14 @@ fn advance_edit(
 ) -> anyhow::Result<EditOutcome> {
     let tips = context.opened.bookmark_tips()?;
     let carried = carried_from_tips(&tips, entry.trunk(), &entry.release_scheme());
+    // A bare advance considers only the selected series' branches: another
+    // series' branch never succeeds one of this release's members, and one
+    // that fits no series is refused when named, not guessed about here.
+    let carried = if from.is_none() && branches.is_empty() {
+        knives::release_model::series_members(context.opened, entry, carried)?.0
+    } else {
+        carried
+    };
     let outcome = if let Some(from) = from {
         let [branch] = branches else {
             println!(
@@ -819,6 +925,9 @@ fn advance_named_members(
             );
             return Ok(None);
         }
+        if context.refuse_if_other_series(branch.as_str(), &tip, "advancing onto it")? {
+            return Ok(None);
+        }
         if context.refuse_if_stacked(branch.as_str(), &tip, "advancing onto it")? {
             return Ok(None);
         }
@@ -916,6 +1025,9 @@ fn advance_named_member_from(
              work nobody included and put the cut in its own ancestry",
             release.name
         );
+        return Ok(None);
+    }
+    if context.refuse_if_other_series(branch.as_str(), &tip, "advancing onto it")? {
         return Ok(None);
     }
     if context.refuse_if_stacked(branch.as_str(), &tip, "advancing onto it")? {

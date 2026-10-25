@@ -38,7 +38,7 @@ fn a_new_workspace_is_based_on_the_upstream_trunk_not_the_current_change() {
 
     // Given: the working copy is parked on the release merge, the dangerous spot
     let parked = lab.revision(&lab.work, "@", "change_id.short(8)");
-    assert!(!parked.trim().is_empty());
+    assert_ne!(parked.trim(), "");
 
     // When: a workspace is opened the way `knives start` opens one
     let destination = lab.work.parent().expect("parent").join("feat-gamma");
@@ -239,14 +239,19 @@ fn a_forced_start_on_a_divergent_branch_refuses_before_seizing_the_claim() {
     lab.branch("feat/alpha", "feature.txt", "alpha\n");
     let (home, _consumer) = release_test_home(&lab);
     {
-        let mut store = Store::open_for_update(home.path().join("state.json")).expect("open store");
+        let mut store = Store::open_for_update(
+            home.path().join("state.json"),
+            &knives::config::FormerNames::new(),
+            &[],
+        )
+        .expect("open store");
         let held = knives::commands::claim::Identity {
             owner: "other-agent".to_owned(),
             kind: OwnerKind::OsUser,
         };
         let _ = store.claim(
             &knives::ids::BranchTarget::new(
-                knives::ids::RepoName::new("demo"),
+                knives::ids::UpstreamName::new("demo"),
                 BranchName::new("feat/alpha"),
             ),
             &held,
@@ -270,7 +275,6 @@ fn a_forced_start_on_a_divergent_branch_refuses_before_seizing_the_claim() {
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
         .env("HOME", lab.temp_path())
-        .env("JJ_CONFIG", "/dev/null")
         .output()
         .expect("run forced start");
 
@@ -283,9 +287,14 @@ fn a_forced_start_on_a_divergent_branch_refuses_before_seizing_the_claim() {
         stderr.contains("feat/alpha is divergent (2 tips:"),
         "{stderr}"
     );
-    let store = Store::open(home.path().join("state.json")).expect("reopen store");
+    let store = Store::open(
+        home.path().join("state.json"),
+        &knives::config::FormerNames::new(),
+        &[],
+    )
+    .expect("reopen store");
     let claim = store
-        .claims(Some(&knives::ids::RepoName::new("demo")))
+        .claims(Some(&knives::ids::UpstreamName::new("demo")))
         .into_iter()
         .find(|claim| claim.branch == "feat/alpha")
         .expect("the claim is still held");
@@ -365,7 +374,7 @@ fn start_makes_a_branch_pinned_only_by_an_untracked_remote_ref_rebasable() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains(
-            "jj immutable_heads() written to demo's repository config: trunk() | tags() | remote_bookmarks(exact:\"main\", exact:\"upstream\") | remote_bookmarks(exact:\"main\", exact:\"origin\")"
+            "jj immutable_heads() written to demo's repository config: trunk() | remote_bookmarks(exact:\"main\", exact:\"upstream\") | remote_bookmarks(exact:\"main\", exact:\"origin\") | remote_tags(remote=exact:\"upstream\")"
         ),
         "the rule write must be disclosed: {stdout}"
     );
@@ -389,6 +398,48 @@ fn start_makes_a_branch_pinned_only_by_an_untracked_remote_ref_rebasable() {
         !String::from_utf8_lossy(&again.stdout).contains("immutable_heads()"),
         "a stated rule is written once: {}",
         String::from_utf8_lossy(&again.stdout)
+    );
+}
+
+#[test]
+fn start_keeps_upstreams_tags_immutable_and_leaves_the_forks_own_rewritable() {
+    // Given: a tag upstream published off its trunk, as most of the upstream
+    // tags oh-my-pi fetched are, and the fork's own release tag, pushed to
+    // origin as the fork's build publishes it
+    let lab = Lab::new();
+    lab.upstream_branch("v0.x", "maintenance.txt", "maintenance\n");
+    lab.upstream_tag("v0.9.1", "v0.x");
+    lab.branch("feat/ours", "ours.txt", "ours\n");
+    lab.jj_work(["tag", "set", "v1.0.0-fork.1", "-r", "feat/ours"]);
+    lab.jj_work([
+        "git",
+        "push",
+        "--remote",
+        "origin",
+        "--tag",
+        "v1.0.0-fork.1",
+    ]);
+    assert_eq!(
+        lab.revision(&lab.work, "v0.9.1 & ::main@upstream", "commit_id"),
+        "",
+        "the upstream tag must sit off the upstream trunk or the test proves nothing"
+    );
+    let (home, _consumer) = release_test_home(&lab);
+
+    // When: the fork's rule is written
+    let output = knives_start(&lab, &home, "feat/gamma");
+
+    // Then: upstream's tag stays immutable wherever it sits; ours is rewritable
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        lab.revision(&lab.work, "v0.9.1", "immutable"),
+        "true",
+        "a tag upstream published must stay immutable off its trunk too"
+    );
+    assert_eq!(
+        lab.revision(&lab.work, "v1.0.0-fork.1", "immutable"),
+        "false",
+        "the fork's own release tag must not pin the commits beneath it"
     );
 }
 
@@ -432,7 +483,8 @@ fn start_leaves_a_repo_level_immutable_heads_rule_a_human_set() {
 #[test]
 fn start_refreshes_the_rule_it_wrote_when_the_entry_moves_on() {
     // Given: knives' own earlier write — recognisable by its `doc` — stating a
-    // rule this entry no longer produces, as after a registry change
+    // rule this entry no longer produces: the one knives wrote while tags were
+    // still pinned, which every fork started before the change carries
     let lab = Lab::new();
     lab.jj_work([
         "config",
@@ -440,7 +492,11 @@ fn start_refreshes_the_rule_it_wrote_when_the_entry_moves_on() {
         "--repo",
         "revset-aliases.\"immutable_heads()\"",
         &format!(
-            "{{ definition = \"trunk() | tags()\", doc = \"{}\" }}",
+            "{{ definition = {}, doc = \"{}\" }}",
+            toml::Value::String(
+                "trunk() | tags() | remote_bookmarks(exact:\"main\", exact:\"upstream\") | remote_bookmarks(exact:\"main\", exact:\"origin\")"
+                    .to_owned()
+            ),
             knives::jj::KNIVES_IMMUTABLE_HEADS_DOC
         ),
     ]);
@@ -454,7 +510,7 @@ fn start_refreshes_the_rule_it_wrote_when_the_entry_moves_on() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains(
-            "jj immutable_heads() refreshed in demo's repository config: trunk() | tags() | remote_bookmarks(exact:\"main\", exact:\"upstream\") | remote_bookmarks(exact:\"main\", exact:\"origin\")"
+            "jj immutable_heads() refreshed in demo's repository config: trunk() | remote_bookmarks(exact:\"main\", exact:\"upstream\") | remote_bookmarks(exact:\"main\", exact:\"origin\") | remote_tags(remote=exact:\"upstream\")"
         ),
         "was: {stdout}"
     );
@@ -513,6 +569,13 @@ fn start_clears_a_prunable_git_registration_at_its_path() {
     let workspace = lab.work.parent().expect("parent").join("feat-alpha");
     knives::jj::add_workspace(&lab.work, "feat-alpha", &workspace, "main@upstream")
         .expect("add the workspace");
+    // A wrapper on PATH may lock every worktree it adds, and git never calls a
+    // locked registration prunable; this case is the unlocked one.
+    let _ = Command::new("git")
+        .args(["worktree", "unlock"])
+        .arg(&workspace)
+        .current_dir(&lab.work)
+        .output();
     std::fs::remove_dir_all(&workspace).expect("remove the directory first");
     knives::jj::forget_workspace(&lab.work, "feat-alpha").expect("forget the workspace");
     let before = git_worktrees(&lab.work);
@@ -539,6 +602,187 @@ fn start_clears_a_prunable_git_registration_at_its_path() {
     );
     let after = git_worktrees(&lab.work);
     assert!(!after.contains("prunable"), "{after}");
+}
+
+#[test]
+fn start_keeps_a_locked_git_registration_whose_directory_is_gone() {
+    // Given: a locked registration at the branch's workspace path with nothing
+    // there. From one machine another's live workspace in a shared store looks
+    // exactly like this, which is what the lock protects.
+    let lab = Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let workspace = lab.work.parent().expect("parent").join("feat-alpha");
+    knives::jj::add_workspace(&lab.work, "feat-alpha", &workspace, "main@upstream")
+        .expect("add the workspace");
+    let worktree = |args: &[&str]| {
+        Command::new("git")
+            .arg("worktree")
+            .args(args)
+            .arg(&workspace)
+            .current_dir(&lab.work)
+            .output()
+            .expect("git worktree")
+    };
+    let _ = worktree(&["unlock"]);
+    assert!(
+        worktree(&["lock", "--reason", "test lock"])
+            .status
+            .success()
+    );
+    std::fs::remove_dir_all(&workspace).expect("remove the directory first");
+    knives::jj::forget_workspace(&lab.work, "feat-alpha").expect("forget the workspace");
+
+    let output = knives_start(&lab, &home, "feat/alpha");
+
+    // Then: start refuses, names `finish`, and the registration stays locked
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("locked Git worktree registration")
+            && stderr.contains("knives finish feat/alpha"),
+        "{stderr}"
+    );
+    let after = git_worktrees(&lab.work);
+    assert!(after.contains("locked test lock"), "{after}");
+    assert!(!workspace.exists(), "start left something at the path");
+}
+
+/// Starts `feat/alpha`, removes its workspace directory by hand, then follows
+/// the rebuild the resumed `start` prints. `lock` locks the Git registration
+/// first, as a wrapper guarding live workspaces does; without it the
+/// registration is unlocked whatever a wrapper on PATH did on add.
+fn assert_the_printed_rebuild_recreates_a_vanished_workspace(lock: bool) {
+    let lab = Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    // One named owner throughout, so the second start resumes its own claim
+    // wherever the suite runs (an anonymous identity never matches itself).
+    let start = |extra: &[&str]| {
+        start_command(&lab, &home, "feat/alpha")
+            .args(extra)
+            .env("KNIVES_OWNER", "ses_fff688")
+            .output()
+            .expect("run knives start")
+    };
+    let started = start(&[]);
+    assert!(
+        started.status.success(),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let workspace = lab.work.parent().expect("parent").join("feat-alpha");
+    let worktree = |args: &[&str]| {
+        Command::new("git")
+            .arg("worktree")
+            .args(args)
+            .arg(&workspace)
+            .current_dir(&lab.work)
+            .output()
+            .expect("git worktree")
+    };
+    let _ = worktree(&["unlock"]);
+    if lock {
+        assert!(
+            worktree(&["lock", "--reason", "test lock"])
+                .status
+                .success()
+        );
+    }
+    std::fs::remove_dir_all(&workspace).expect("remove the workspace directory by hand");
+
+    // Given: the resumed start names the rebuild
+    let resumed = start(&[]);
+    let stdout = String::from_utf8_lossy(&resumed.stdout);
+    assert!(
+        resumed.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    assert!(
+        stdout.contains("`knives start feat/alpha --force --why \"…\"` rebuilds it"),
+        "{stdout}"
+    );
+
+    // When: it is run
+    let rebuilt = start(&["--force"]);
+
+    // Then: the workspace is back at its path
+    let stdout = String::from_utf8_lossy(&rebuilt.stdout);
+    assert!(
+        rebuilt.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&rebuilt.stderr)
+    );
+    assert!(stdout.contains("created missing workspace"), "{stdout}");
+    assert!(
+        workspace.join(".jj").is_dir(),
+        "the workspace was not rebuilt"
+    );
+}
+
+#[test]
+fn the_printed_rebuild_recreates_a_vanished_workspace() {
+    assert_the_printed_rebuild_recreates_a_vanished_workspace(false);
+}
+
+#[test]
+fn the_printed_rebuild_recreates_a_vanished_workspace_whose_registration_is_locked() {
+    assert_the_printed_rebuild_recreates_a_vanished_workspace(true);
+}
+
+/// Where jj recorded workspace `name` of the lab's work checkout.
+fn recorded_workspace_root(lab: &Lab, name: &str) -> String {
+    let output = Command::new("jj")
+        .args(["--ignore-working-copy", "workspace", "root", "--name", name])
+        .current_dir(&lab.work)
+        .output()
+        .expect("jj workspace root");
+    assert!(output.status.success(), "{output:?}");
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
+#[test]
+fn the_printed_rebuild_refuses_a_same_named_workspace_registered_elsewhere() {
+    // Given: the branch's directory is gone, and its workspace name now lives at
+    // another path Q (an old `workspaces` root, or one added by hand)
+    let lab = Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let started = knives_start(&lab, &home, "feat/alpha");
+    assert!(started.status.success(), "{started:?}");
+    let workspace = lab.work.parent().expect("parent").join("feat-alpha");
+    knives::jj::forget_workspace(&lab.work, "feat-alpha").expect("forget the workspace");
+    std::fs::remove_dir_all(&workspace).expect("remove the workspace directory");
+    let elsewhere = lab.temp_path().join("other-root").join("feat-alpha");
+    knives::jj::add_workspace(&lab.work, "feat-alpha", &elsewhere, "main@upstream")
+        .expect("add the same name elsewhere");
+    let recorded = recorded_workspace_root(&lab, "feat-alpha");
+
+    // When: the rebuild the resumed start prints is run
+    let rebuilt = start_command(&lab, &home, "feat/alpha")
+        .arg("--force")
+        .output()
+        .expect("run the rebuild");
+
+    // Then: it refuses, names both paths, and the workspace at Q is untouched
+    let stderr = String::from_utf8_lossy(&rebuilt.stderr);
+    assert!(!rebuilt.status.success(), "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "workspace feat-alpha is registered at {recorded}, not {}; finish or forget it there",
+            workspace.display()
+        )),
+        "{stderr}"
+    );
+    assert_eq!(recorded_workspace_root(&lab, "feat-alpha"), recorded);
+    assert!(
+        git_worktrees(&lab.work).contains(&format!("worktree {recorded}")),
+        "{}",
+        git_worktrees(&lab.work)
+    );
+    assert!(elsewhere.join(".jj").is_dir());
+    assert!(
+        !workspace.exists(),
+        "the rebuild created the workspace anyway"
+    );
 }
 
 #[test]

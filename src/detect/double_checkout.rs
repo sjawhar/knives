@@ -53,7 +53,7 @@ mod tests {
         // Given: two workspaces on distinct changes
         let rows = [row("default", "aaaaaaaa"), row("other", "bbbbbbbb")];
         // When / Then: nothing to report
-        assert!(double_checkout(&rows).is_empty());
+        assert_eq!(double_checkout(&rows), Vec::<Finding>::new());
     }
 
     #[test]

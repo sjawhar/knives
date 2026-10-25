@@ -1,4 +1,4 @@
-// allow: SIZE_OK: 1490 lines - entry type, storage, filters, and writer are one domain.
+// allow: SIZE_OK: 2435 lines - entry type, storage, filters, and writer are one domain.
 //! What agents did and decided here, in order, forever.
 //!
 //! [`crate::store`] holds current intent and is rewritten whole on every change:
@@ -22,22 +22,77 @@ use std::ffi::OsStr;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
 use crate::config::default_config_path;
-use crate::ids::RepoName;
+use crate::ids::UpstreamName;
+use crate::statement::Statement;
 
-/// Where a repository's ledger lives: a directory of entry files beside
-/// `state.json`.
+pub mod transitions;
+
+/// The directory holding every repository's ledger, beside `state.json`.
+pub fn default_ledger_root() -> PathBuf {
+    default_config_path().with_file_name("ledger")
+}
+
+/// Where a fork's ledger lives: `<owner>/<name>/` of the repository it is a
+/// fork of ([`crate::config::RepoEntry::upstream_name`]), a directory of entry
+/// files beside `state.json`.
+///
+/// The name is lowercase, owner and repository both, and must stay so. GitHub
+/// treats an owner and a repository name case-insensitively, and so does
+/// knives everywhere it compares remotes ([`crate::remote_url::same_remote`]
+/// uses `eq_ignore_ascii_case`): two machines whose `repos.toml` spells
+/// `acme/tool` and `Acme/Tool` check out one repository. Spelled as written,
+/// they would file that repository's entries in two directories on a
+/// case-sensitive filesystem, each machine reading only its own half, and the
+/// ledger would diverge without a word. That divergence is what naming a
+/// ledger after its upstream repository exists to end; the capitals are not
+/// to come back for tidiness.
 ///
 /// Each entry is immutable, so concurrent writers never share a file and a git
 /// history over the directory is pure additions.
-pub fn default_ledger_path(repo: &RepoName) -> PathBuf {
-    default_config_path()
-        .with_file_name("ledger")
-        .join(repo.to_string())
+pub fn default_ledger_path(repo: &UpstreamName) -> PathBuf {
+    default_ledger_root().join(repo.as_str())
+}
+
+/// Whether `part` can be one directory name on the way to a fork's ledger.
+///
+/// Not empty, `.` or `..`, holding no `/` or `\` and no control character,
+/// and not a `.git` in any letter case, which is where the git directory
+/// over the root lives. No forge names a repository or an owner with a
+/// control character; a name holding one comes only from a hand-built peer
+/// tree, and printed it would run in a reader's terminal.
+pub fn is_ledger_component(part: &str) -> bool {
+    !part.is_empty()
+        && part != "."
+        && part != ".."
+        && !part.contains(['/', '\\'])
+        && !part.chars().any(char::is_control)
+        && !part.eq_ignore_ascii_case(".git")
+}
+
+/// Whether `name` is `<owner>/<name>`, each an [`is_ledger_component`].
+///
+/// That is the directory a fork whose upstream is a forge repository is
+/// kept under, and the one shape a ledger repository carries. The registry
+/// refuses an upstream whose name is not one, and so does
+/// [`crate::ledger_git::Repository::new`].
+pub fn is_fork_directory(name: &str) -> bool {
+    name.split_once('/').is_some_and(|(owner, repository)| {
+        is_ledger_component(owner) && is_ledger_component(repository)
+    })
+}
+
+/// Set once this process has appended an entry; see [`appended`].
+static APPENDED: AtomicBool = AtomicBool::new(false);
+
+/// Whether this process has appended an entry to any ledger, so that it has
+/// something to hand to [`crate::ledger_sweep::hand_off`] before it exits.
+pub fn appended() -> bool {
+    APPENDED.load(Ordering::Relaxed)
 }
 
 /// Who put an entry there.
@@ -52,6 +107,13 @@ pub fn default_ledger_path(repo: &RepoName) -> PathBuf {
 pub enum Kind {
     Event,
     Note,
+    /// A kind a newer knives writes and this one does not know. Ledgers are
+    /// shared between machines that upgrade at different times, so a file
+    /// of one parses, and [`Ledger::read`] leaves it out and names it as a
+    /// problem, rather than every read of its fork failing. Never written
+    /// ([`Ledger::append`] refuses it).
+    #[serde(other)]
+    Unknown,
 }
 
 impl std::fmt::Display for Kind {
@@ -59,6 +121,7 @@ impl std::fmt::Display for Kind {
         f.write_str(match self {
             Self::Event => "event",
             Self::Note => "note",
+            Self::Unknown => "unknown",
         })
     }
 }
@@ -87,6 +150,11 @@ pub struct Entry {
     pub ts: String,
     /// Resolved exactly as a claim's owner is.
     pub owner: String,
+    /// The writer's `git config user.email` where it wrote, so a reader can
+    /// tell whose machine an `owner` was: absent when none was configured,
+    /// and on every entry written before knives recorded it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
     /// The ref this is about — a branch or a release name. Absent for an entry
     /// about the repository itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -97,6 +165,11 @@ pub struct Entry {
     /// unknown frontmatter keys are the ledger's compatible extension point.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disposition: Option<String>,
+    /// A statement about the subject that knives cannot infer — its pull
+    /// request, that it has none upstream, what superseded it, what it needs
+    /// first. Only this field states anything: an event's prose never does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub statement: Option<Statement>,
     pub text: String,
     /// Free strings backing the entry: commit ids, `file:line`, `<repo>#<number>`,
     /// URLs, and they may name other repositories. Every audit claim that
@@ -109,8 +182,8 @@ pub struct Entry {
     /// no anchor; a tip that has moved tells the reader to re-verify.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchor: Option<String>,
-    /// The pull request stated for the subject, from `tracked_pulls` only. Never
-    /// a forge call: this is a write path.
+    /// The pull request stated for the subject, from its live `pull` statement
+    /// only. Never a forge call: this is a write path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pr: Option<u64>,
     /// The parent set a release cut or edit left behind, one item per parent
@@ -138,15 +211,24 @@ pub struct RecordedParent {
 ///
 /// Kept separate from [`Entry`] deliberately: `Entry`'s serde is the `--json`
 /// report surface and must keep `text`; this is the file surface and must not.
+///
+/// The statement is read as any TOML value and checked on its own
+/// ([`read_statement`]), so one this knives cannot read costs that entry its
+/// statement rather than the whole file; it is written by
+/// [`Frontmatter::into_toml`] from the entry's own.
 #[derive(Debug, Serialize, Deserialize)]
 struct Frontmatter {
     ts: String,
     owner: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    email: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     subject: Option<String>,
     kind: Kind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     disposition: Option<String>,
+    #[serde(default, skip_serializing)]
+    statement: Option<toml::Value>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     evidence: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -162,9 +244,11 @@ impl Frontmatter {
         Self {
             ts: entry.ts.clone(),
             owner: entry.owner.clone(),
+            email: entry.email.clone(),
             subject: entry.subject.clone(),
             kind: entry.kind,
             disposition: entry.disposition.clone(),
+            statement: None,
             evidence: entry.evidence.clone(),
             anchor: entry.anchor.clone(),
             pr: entry.pr,
@@ -172,13 +256,31 @@ impl Frontmatter {
         }
     }
 
-    fn into_entry(self, text: String) -> Entry {
+    /// The frontmatter as TOML, with `statement` as one inline table.
+    ///
+    /// toml writes every nested struct as a `[section]`, never inline, so the
+    /// statement is rendered on its own and put first: the first line of a
+    /// document always belongs to its root table, whatever sections follow.
+    fn into_toml(self, statement: Option<&Statement>) -> Result<String, toml::ser::Error> {
+        let mut text = String::new();
+        if let Some(statement) = statement {
+            text.push_str("statement = ");
+            statement.serialize(toml::ser::ValueSerializer::new(&mut text))?;
+            text.push('\n');
+        }
+        text.push_str(&toml::to_string(&self)?);
+        Ok(text)
+    }
+
+    fn into_entry(self, statement: Option<Statement>, text: String) -> Entry {
         Entry {
             ts: self.ts,
             owner: self.owner,
+            email: self.email,
             subject: self.subject,
             kind: self.kind,
             disposition: self.disposition,
+            statement,
             text,
             evidence: self.evidence,
             anchor: self.anchor,
@@ -204,8 +306,35 @@ pub enum LedgerError {
     Parse { path: PathBuf, detail: String },
     #[error("{path} has an unreadable timestamp `{ts}`")]
     Timestamp { path: PathBuf, ts: String },
+    #[error(
+        "{} is an entry of a kind this knives does not know, as a newer knives writes; every \
+         read here leaves it out until this machine's knives is upgraded",
+        path.display()
+    )]
+    UnknownKind { path: PathBuf },
+    #[error(
+        "{} makes a statement this knives cannot read ({detail}), so here it states nothing; \
+         a newer knives may have written it, or a hand may have written it wrong",
+        path.display()
+    )]
+    Statement { path: PathBuf, detail: String },
+    #[error(
+        "{} is not named as knives names a ledger entry \
+         (YYYYMMDDTHHMMSS.nnnnnnnnnZ-xxxx.md), so no knives reads it or sends it to another \
+         machine; rename or remove it",
+        inline_human_text(&path.display().to_string())
+    )]
+    Misnamed { path: PathBuf },
     #[error("{path} already exists: two writers drew the same nanosecond and suffix")]
     Collision { path: PathBuf },
+    #[error(
+        "{} still holds the entries an older knives filed under the fork's registry key; this \
+         knives reads the fork's ledger at {}, so it would read it as holding none of them. \
+         Run `knives ledger migrate` once to move them",
+        former.display(),
+        path.display()
+    )]
+    FormerName { path: PathBuf, former: PathBuf },
     #[error("serialising a ledger entry: {source}")]
     Serialise {
         #[from]
@@ -213,28 +342,158 @@ pub enum LedgerError {
     },
 }
 
+/// Whether `directory` holds a ledger entry file of its own.
+///
+/// That is a `*.md` regular file directly inside it, not inside a directory
+/// below it: a registry key can be the owner directory of other forks'
+/// upstream names (`acme` beside `acme/demo`). Unreadable is taken as
+/// holding one, so a directory nobody could read is refused rather than
+/// passed as migrated.
+pub fn holds_entries(directory: &Path) -> bool {
+    let Ok(listing) = std::fs::read_dir(directory) else {
+        return directory.exists();
+    };
+    listing.into_iter().any(|dirent| {
+        dirent.is_err()
+            || dirent.is_ok_and(|dirent| {
+                dirent.file_type().is_ok_and(|kind| kind.is_file())
+                    && Path::new(&dirent.file_name()).extension() == Some(OsStr::new("md"))
+            })
+    })
+}
+
+/// Each `former` name whose directory under `root` still holds entries.
+///
+/// With the name its fork is kept under now, in name order ([`holds_entries`]
+/// decides what holds entries): an older knives' ledger directory that
+/// `knives ledger migrate` has not moved yet, and that every reader refuses
+/// on until it does.
+pub fn unmigrated<'a>(
+    root: &'a Path,
+    former: &'a crate::config::FormerNames,
+) -> impl Iterator<Item = (&'a String, &'a UpstreamName)> + 'a {
+    former
+        .iter()
+        .filter(move |(name, _)| holds_entries(&root.join(name)))
+}
+
+/// A problem line for each directory under `root` holding entries that no
+/// fork in `registry` is kept under.
+///
+/// A fork is kept under `<owner>/<name>` of its upstream, and under its
+/// registry key where an older knives kept it and a filesystem upstream
+/// keeps it still; [`holds_entries`] decides what holds entries.
+///
+/// Nothing reads such a directory. It is what a fork leaves behind when its
+/// `upstream` changes, or when two machines' registries spell one upstream
+/// as two repositories: the fork then reads its ledger, under the new name,
+/// as empty, and only this says where its entries went. A directory that
+/// cannot be listed is a problem too, rather than a ledger with none.
+pub fn unclaimed_problems(root: &Path, registry: &crate::config::Registry) -> Vec<String> {
+    let claimed: BTreeSet<String> = registry
+        .repos
+        .iter()
+        .flat_map(|(key, entry)| [key.clone(), entry.upstream_name(key).to_string()])
+        .collect();
+    let subdirectories = |directory: &Path| match std::fs::read_dir(directory) {
+        Ok(listing) => Ok(listing
+            .filter_map(|dirent| {
+                let dirent = dirent.ok()?;
+                let name = dirent.file_name().to_string_lossy().into_owned();
+                (dirent.file_type().is_ok_and(|kind| kind.is_dir())
+                    && !name.eq_ignore_ascii_case(".git"))
+                .then_some(name)
+            })
+            .collect::<Vec<_>>()),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(source) => Err(format!(
+            "could not list {} for ledger entries no fork is kept under: {source}",
+            directory.display()
+        )),
+    };
+    let unclaimed = |name: String| {
+        let directory = root.join(&name);
+        (!claimed.contains(&name) && holds_entries(&directory)).then(|| {
+            format!(
+                "{} holds ledger entries that no fork in repos.toml is kept under, so nothing \
+                 reads them, and the fork they belong to reads its ledger without them. Either \
+                 correct that fork's `upstream` in repos.toml to the repository they were filed \
+                 under, or move them into the directory of the fork they belong to, \
+                 {}/<owner>/<name>",
+                directory.display(),
+                root.display()
+            )
+        })
+    };
+    let owners = match subdirectories(root) {
+        Ok(owners) => owners,
+        Err(problem) => return vec![problem],
+    };
+    let mut problems = Vec::new();
+    for owner in owners {
+        match subdirectories(&root.join(&owner)) {
+            Ok(names) => problems.extend(
+                names
+                    .into_iter()
+                    .filter_map(|name| unclaimed(format!("{owner}/{name}"))),
+            ),
+            Err(problem) => problems.push(problem),
+        }
+        problems.extend(unclaimed(owner));
+    }
+    problems
+}
+
 /// One repository's ledger directory.
 #[derive(Debug, Clone)]
 pub struct Ledger {
     path: PathBuf,
+    /// Where an older knives filed this fork's entries, under its registry
+    /// key, when that is not where they are now.
+    former: Option<PathBuf>,
 }
 
 impl Ledger {
-    /// A repository's ledger at the default location.
-    pub fn for_repo(repo: &RepoName) -> Self {
-        Self::at(default_ledger_path(repo))
+    /// A fork's ledger at the default location: the one place a command
+    /// acting on a fork resolves it.
+    ///
+    /// An older knives filed a fork's entries under its registry key, and
+    /// this one reads them under the fork's upstream name. Every read of a
+    /// ledger resolved here refuses while the registry key's directory still
+    /// holds entries ([`LedgerError::FormerName`]): read from the new
+    /// directory alone, it would answer "no notches yet", or find no
+    /// recorded cut for a release's drop guard to check against.
+    pub fn for_fork(fork: &crate::bind::Fork<'_>) -> Self {
+        let former = (fork.name.as_str() != fork.upstream.as_str())
+            .then(|| default_ledger_root().join(fork.name.as_str()));
+        Self {
+            path: default_ledger_path(&fork.upstream),
+            former,
+        }
     }
 
     /// At an exact path, for a test or for a caller with its own config home.
     pub const fn at(path: PathBuf) -> Self {
-        Self { path }
+        Self { path, former: None }
     }
 
     pub fn path(&self) -> &Path {
         &self.path
     }
 
-    /// Write one entry as one new immutable file.
+    /// Refuse while the fork's registry-key directory still holds entries;
+    /// see [`Ledger::for_fork`].
+    fn migrated(&self) -> Result<(), LedgerError> {
+        match &self.former {
+            Some(former) if holds_entries(former) => Err(LedgerError::FormerName {
+                path: self.path.clone(),
+                former: former.clone(),
+            }),
+            _ => Ok(()),
+        }
+    }
+
+    /// Write one entry as one new immutable file, returning its path.
     ///
     /// The entry is written to a temporary file before `persist_noclobber`
     /// atomically makes its final name visible. Two agents appending at the
@@ -242,14 +501,38 @@ impl Ledger {
     /// and no lock to hold. A filename collision — same nanosecond, same random
     /// suffix — errors loudly instead of retrying, because at that resolution a
     /// retry would paper over a broken clock or random source.
-    pub fn append(&self, entry: &Entry) -> Result<(), LedgerError> {
+    pub fn append(&self, entry: &Entry) -> Result<PathBuf, LedgerError> {
+        self.migrated()?;
         let ts: jiff::Timestamp = entry.ts.parse().map_err(|_| LedgerError::Timestamp {
             path: self.path.clone(),
             ts: entry.ts.clone(),
         })?;
+        // What every read would leave out or refuse is refused before it is
+        // written: an entry or a statement of a kind only a reader has would
+        // state nothing, and a value its kind cannot hold would state nothing
+        // on every machine.
+        let refused = if entry.kind == Kind::Unknown {
+            Some("an entry of a kind this knives does not know is read by no one".to_owned())
+        } else {
+            entry.statement.as_ref().and_then(|statement| {
+                if statement.kind == crate::statement::StatementKind::Unknown {
+                    Some(
+                        "a statement of a kind this knives does not know states nothing".to_owned(),
+                    )
+                } else {
+                    statement.check().err()
+                }
+            })
+        };
+        if let Some(detail) = refused {
+            return Err(LedgerError::Parse {
+                path: self.path.clone(),
+                detail,
+            });
+        }
         let contents = format!(
             "+++\n{}+++\n{}\n",
-            toml::to_string(&Frontmatter::of(entry))?,
+            Frontmatter::of(entry).into_toml(entry.statement.as_ref())?,
             entry.text
         );
         std::fs::create_dir_all(&self.path).map_err(|source| LedgerError::Write {
@@ -268,26 +551,76 @@ impl Ledger {
                 path: path.clone(),
                 source,
             })?;
-        persist_entry(temporary, path)
+        persist_entry(temporary, path.clone())?;
+        APPENDED.store(true, Ordering::Relaxed);
+        Ok(path)
     }
 
-    /// Every entry, oldest first: lexicographic filename order, which the
-    /// fixed-width stamp makes chronological order.
+    /// Every entry this knives can read, oldest first (lexicographic filename
+    /// order, which the fixed-width stamp makes chronological), and a
+    /// problem for each it reads only in part.
     ///
     /// A ledger directory that does not exist yet is empty rather than an
     /// error: a repository nobody has notched is the normal case. An entry
-    /// file that does not parse IS an error, because a ledger the tool cannot
-    /// read must not read as a ledger with nothing in it. Only `*.md` files
-    /// are entries: an editor's or a sync tool's droppings beside them are
-    /// ignored, not fatal. Each read parses the whole directory — O(all
-    /// history) — which is acceptable at observed scales; chronological
-    /// filenames leave a tail-read optimization open if `KNIVES_TIMING` shows
-    /// it is needed.
-    pub fn entries(&self) -> Result<Vec<Entry>, LedgerError> {
+    /// file that does not parse IS an error ([`parse_bytes`]), because a
+    /// ledger the tool cannot read must not read as a ledger with nothing in
+    /// it. What a newer knives may write is not: an entry of a kind this one
+    /// does not know ([`Kind::Unknown`]) is left out, and a statement it
+    /// cannot read states nothing, each a problem naming the file, so a
+    /// machine running an older knives still reads every other entry. Only
+    /// regular files named as [`is_entry_file_name`] says are entries. Any
+    /// other `*.md` file is a problem naming it, never read: no knives wrote
+    /// it, and no sweep sends it, so no other machine would read it either.
+    /// Anything else (an editor's or a sync tool's droppings, a symlink,
+    /// which a sweep never commits) is passed over. Each read parses the
+    /// whole directory — O(all history) — which is acceptable at observed
+    /// scales; chronological filenames leave a tail-read optimization open
+    /// if `KNIVES_TIMING` shows it is needed.
+    pub fn read(&self) -> Result<Entries, LedgerError> {
+        let listed = self.listed()?;
+        let mut read = Entries {
+            problems: listed
+                .misnamed
+                .into_iter()
+                .map(|path| LedgerError::Misnamed { path }.to_string())
+                .collect(),
+            ..Entries::default()
+        };
+        for (path, parsed) in parse_files(listed.entries) {
+            let (entry, problem) = parsed?;
+            if entry.kind == Kind::Unknown {
+                read.problems
+                    .push(LedgerError::UnknownKind { path }.to_string());
+                continue;
+            }
+            read.problems
+                .extend(problem.map(|problem| problem.to_string()));
+            read.entries.push(entry);
+        }
+        Ok(read)
+    }
+
+    /// Each entry file in name order, beside what reading it gave: for a
+    /// caller that has a use for the entries that do parse when one does
+    /// not. Only listing the directory fails the call. An entry of a kind
+    /// this knives does not know is returned as one, and a statement it
+    /// cannot read as none; [`Ledger::read`] says so. A `*.md` file not
+    /// named as an entry is not one, and is not returned.
+    pub fn entry_reads(&self) -> Result<Vec<EntryRead>, LedgerError> {
+        Ok(parse_files(self.listed()?.entries)
+            .map(|(path, parsed)| (path, parsed.map(|(entry, _)| entry)))
+            .collect())
+    }
+
+    /// The regular `*.md` files directly in this ledger's directory, split
+    /// into those named as entries and the rest, each in name order.
+    fn listed(&self) -> Result<Listed, LedgerError> {
+        self.migrated()?;
+        let mut listed = Listed::default();
         let listing = match std::fs::read_dir(&self.path) {
             Ok(listing) => listing,
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(Vec::new());
+                return Ok(listed);
             }
             Err(source) => {
                 return Err(LedgerError::Read {
@@ -296,22 +629,67 @@ impl Ledger {
                 });
             }
         };
-        let mut files = Vec::new();
         for dirent in listing {
-            let path = dirent
-                .map_err(|source| LedgerError::Read {
-                    path: self.path.clone(),
-                    source,
-                })?
-                .path();
-            if path.extension() == Some(OsStr::new("md")) {
-                files.push(path);
+            let unreadable = |source| LedgerError::Read {
+                path: self.path.clone(),
+                source,
+            };
+            let dirent = dirent.map_err(unreadable)?;
+            let path = dirent.path();
+            // `file_type` does not follow a symlink: one stays a symlink.
+            if path.extension() != Some(OsStr::new("md"))
+                || !dirent.file_type().map_err(unreadable)?.is_file()
+            {
+                continue;
+            }
+            if dirent.file_name().to_str().is_some_and(is_entry_file_name) {
+                listed.entries.push(path);
+            } else {
+                listed.misnamed.push(path);
             }
         }
-        files.sort();
-        files.iter().map(|path| parse_file(path)).collect()
+        listed.entries.sort();
+        listed.misnamed.sort();
+        Ok(listed)
     }
 }
+
+/// What [`Ledger::listed`] found.
+#[derive(Debug, Default)]
+struct Listed {
+    /// Each file named as [`is_entry_file_name`] says.
+    entries: Vec<PathBuf>,
+    /// Each other regular `*.md` file.
+    misnamed: Vec<PathBuf>,
+}
+
+/// Each of `files`, in order, beside what [`parse_bytes`] made of it.
+fn parse_files(files: Vec<PathBuf>) -> impl Iterator<Item = ParsedFile> {
+    files.into_iter().map(|path| {
+        let parsed = std::fs::read(&path)
+            .map_err(|source| LedgerError::Read {
+                path: path.clone(),
+                source,
+            })
+            .and_then(|bytes| parse_bytes(&path, &bytes));
+        (path, parsed)
+    })
+}
+
+/// What [`Ledger::read`] found.
+#[derive(Debug, Default)]
+pub struct Entries {
+    /// Every entry this knives can read, oldest first.
+    pub entries: Vec<Entry>,
+    /// One for each `*.md` file not named as an entry, each entry left out
+    /// because its kind is one this knives does not know, and each statement
+    /// that states nothing because this knives cannot read it, naming the
+    /// file.
+    pub problems: Vec<String>,
+}
+
+/// One entry file, beside what reading it gave ([`Ledger::entry_reads`]).
+pub type EntryRead = (PathBuf, Result<Entry, LedgerError>);
 
 /// Which entries a read wants.
 #[derive(Debug, Default, Clone, Copy)]
@@ -487,6 +865,8 @@ pub struct Draft<'a> {
     pub kind: Kind,
     /// A terminal ruling token when this note is a disposition.
     pub disposition: Option<String>,
+    /// What the entry states about its subject, beside its prose.
+    pub statement: Option<Stated>,
     pub text: String,
     pub evidence: Vec<String>,
     /// The pull request stated for the subject, read from the store by the
@@ -498,6 +878,35 @@ pub struct Draft<'a> {
     pub parents: Vec<RecordedParent>,
 }
 
+/// A statement a [`Draft`] makes, with the stamp of the one it replaces.
+#[derive(Debug, Clone)]
+pub struct Stated {
+    pub statement: Statement,
+    /// The stamp of the live statement of the same kind about the subject,
+    /// read under the state lock ([`crate::statement::Statements::stamp`]).
+    /// The entry is stamped after it whatever this machine's clock says, so
+    /// a writer whose clock runs behind the one that made it still replaces
+    /// it.
+    pub replaces: Option<jiff::Timestamp>,
+}
+
+impl<'a> Draft<'a> {
+    /// An event: something this tool did, recorded as part of doing it. It
+    /// states nothing until the caller sets [`Draft::statement`].
+    pub const fn event(subject: Option<&'a str>, text: String, pr: Option<u64>) -> Self {
+        Self {
+            subject,
+            kind: Kind::Event,
+            disposition: None,
+            statement: None,
+            text,
+            evidence: Vec::new(),
+            pr,
+            parents: Vec::new(),
+        }
+    }
+}
+
 /// Where automatic events go, and who is writing them.
 ///
 /// Bound once per command rather than threaded as four arguments: every event a
@@ -505,42 +914,77 @@ pub struct Draft<'a> {
 #[derive(Debug)]
 pub struct Scribe {
     ledger: Ledger,
-    repo: RepoName,
-    /// The checkout whose refs anchor entries.
-    path: PathBuf,
+    repo: UpstreamName,
+    /// The checkout whose refs anchor entries; none for a writer acting on the
+    /// ledger alone.
+    checkout: Option<PathBuf>,
     owner: String,
+    /// The writer's `git config user.email`, asked once, at the first entry:
+    /// a command that writes nothing never asks.
+    email: std::sync::OnceLock<Option<String>>,
 }
 
 impl Scribe {
-    pub const fn new(ledger: Ledger, repo: RepoName, path: PathBuf, owner: String) -> Self {
+    pub const fn new(ledger: Ledger, repo: UpstreamName, path: PathBuf, owner: String) -> Self {
         Self {
             ledger,
             repo,
-            path,
+            checkout: Some(path),
             owner,
+            email: std::sync::OnceLock::new(),
         }
     }
 
-    pub const fn repo(&self) -> &RepoName {
+    /// A writer with no checkout of the fork to ask, whose entries carry no
+    /// anchor.
+    pub const fn unanchored(ledger: Ledger, repo: UpstreamName, owner: String) -> Self {
+        Self {
+            ledger,
+            repo,
+            checkout: None,
+            owner,
+            email: std::sync::OnceLock::new(),
+        }
+    }
+
+    pub const fn repo(&self) -> &UpstreamName {
         &self.repo
+    }
+
+    pub const fn ledger(&self) -> &Ledger {
+        &self.ledger
     }
 
     /// Append `draft`, stamping the fields no caller supplies.
     pub fn record(&self, draft: &Draft<'_>) -> Result<Entry, LedgerError> {
+        self.record_to(draft).map(|(entry, _)| entry)
+    }
+
+    /// [`Scribe::record`], with the path of the file the entry was written to.
+    pub fn record_to(&self, draft: &Draft<'_>) -> Result<(Entry, PathBuf), LedgerError> {
         let entry = Entry {
-            ts: monotonic_now().to_string(),
+            ts: monotonic_after(draft.statement.as_ref().and_then(|stated| stated.replaces))
+                .to_string(),
             owner: self.owner.clone(),
+            email: self
+                .email
+                .get_or_init(|| git_user_email(self.checkout.as_deref()))
+                .clone(),
             subject: draft.subject.map(str::to_owned),
             kind: draft.kind,
             disposition: draft.disposition.clone(),
+            statement: draft
+                .statement
+                .as_ref()
+                .map(|stated| stated.statement.clone()),
             text: draft.text.clone(),
             evidence: draft.evidence.clone(),
             anchor: self.anchor(draft.subject),
             pr: draft.pr,
             parents: draft.parents.clone(),
         };
-        self.ledger.append(&entry)?;
-        Ok(entry)
+        let path = self.ledger.append(&entry)?;
+        Ok((entry, path))
     }
 
     /// Record that this tool did something, as part of doing it.
@@ -550,15 +994,7 @@ impl Scribe {
         text: String,
         pr: Option<u64>,
     ) -> Result<Entry, LedgerError> {
-        self.record(&Draft {
-            subject,
-            kind: Kind::Event,
-            disposition: None,
-            text,
-            evidence: Vec::new(),
-            pr,
-            parents: Vec::new(),
-        })
+        self.record(&Draft::event(subject, text, pr))
     }
 
     /// The subject's tip now, or nothing when it does not resolve.
@@ -568,12 +1004,30 @@ impl Scribe {
     /// none of them is a reason to lose the entry.
     fn anchor(&self, subject: Option<&str>) -> Option<String> {
         let subject = subject?;
-        crate::jj::Repo::open(&self.path)
+        crate::jj::Repo::open(self.checkout.as_ref()?)
             .ok()?
             .resolve_commit(subject)
             .ok()
             .map(|commit| commit.as_str().to_owned())
     }
+}
+
+/// `git config user.email` where the writer writes: in the fork's checkout,
+/// where a repository's own identity overrides the user's, or where the
+/// command runs when there is no checkout. `None` when git reports none, or
+/// an empty one: an entry carries the address git would commit as, or no
+/// address, never a guess.
+fn git_user_email(checkout: Option<&Path>) -> Option<String> {
+    let mut command = checkout.map_or_else(crate::bind::git_command, crate::bind::git);
+    let output = command
+        .args(["config", "--get", "user.email"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|output| output.status.success())?;
+    let email = String::from_utf8(output.stdout).ok()?;
+    let email = email.trim();
+    (!email.is_empty()).then(|| email.to_owned())
 }
 
 /// Make a completed temporary entry visible without replacing an existing one.
@@ -613,11 +1067,42 @@ fn entry_file_name(ts: jiff::Timestamp) -> String {
     )
 }
 
-/// One entry file: TOML frontmatter between `+++` fences, then the text.
-fn parse_file(path: &Path) -> Result<Entry, LedgerError> {
-    let text = std::fs::read_to_string(path).map_err(|source| LedgerError::Read {
+/// Whether `name` is a file name [`entry_file_name`] writes:
+/// `YYYYMMDDTHHMMSS.nnnnnnnnnZ-xxxx.md`, digits where the stamp has them and
+/// four lowercase hex characters for the suffix.
+///
+/// The one definition of an entry file every side holds to: a read takes
+/// only these ([`Ledger::read`] names any other `*.md` as a problem), a
+/// sweep sends only these, and a pull refuses a peer's tree naming anything
+/// else, so a name no knives wrote, a terminal control sequence among them,
+/// never enters a ledger from another machine.
+pub fn is_entry_file_name(name: &str) -> bool {
+    const SHAPE: &[u8] = b"00000000T000000.000000000Z-xxxx.md";
+    name.len() == SHAPE.len()
+        && name.bytes().zip(SHAPE).all(|(byte, &shape)| match shape {
+            b'0' => byte.is_ascii_digit(),
+            b'x' => byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte),
+            _ => byte == shape,
+        })
+}
+
+/// An entry, and the problem with its statement when this knives cannot read
+/// it ([`read_statement`]).
+pub type Parsed = (Entry, Option<LedgerError>);
+
+/// One entry file, beside what [`parse_bytes`] made of it.
+type ParsedFile = (PathBuf, Result<Parsed, LedgerError>);
+
+/// One entry file's bytes: TOML frontmatter between `+++` fences, then the
+/// text.
+///
+/// `path` names the file in what goes wrong: a local read's own path, or
+/// where a pull would put a peer's ([`crate::ledger_git`]), which parses
+/// what it fetches with this before it writes it.
+pub fn parse_bytes(path: &Path, bytes: &[u8]) -> Result<Parsed, LedgerError> {
+    let text = std::str::from_utf8(bytes).map_err(|error| LedgerError::Parse {
         path: path.to_owned(),
-        source,
+        detail: format!("not UTF-8: {error}"),
     })?;
     let Some(rest) = text.strip_prefix("+++\n") else {
         return Err(LedgerError::Parse {
@@ -625,7 +1110,7 @@ fn parse_file(path: &Path) -> Result<Entry, LedgerError> {
             detail: "missing the opening +++ fence".to_owned(),
         });
     };
-    let (frontmatter, body) = split_fenced(rest).map_err(|detail| LedgerError::Parse {
+    let (mut frontmatter, body) = split_fenced(rest).map_err(|detail| LedgerError::Parse {
         path: path.to_owned(),
         detail,
     })?;
@@ -637,7 +1122,36 @@ fn parse_file(path: &Path) -> Result<Entry, LedgerError> {
             ts: frontmatter.ts,
         });
     }
-    Ok(frontmatter.into_entry(body))
+    let (statement, problem) = match frontmatter.statement.take().map(read_statement) {
+        None => (None, None),
+        Some(Ok(statement)) => (Some(statement), None),
+        Some(Err(detail)) => (
+            None,
+            Some(LedgerError::Statement {
+                path: path.to_owned(),
+                detail,
+            }),
+        ),
+    };
+    Ok((frontmatter.into_entry(statement, body), problem))
+}
+
+/// A `statement` table, when this knives can read every part of it: no field
+/// it does not know, a kind it knows, and a value that kind holds.
+///
+/// Anything less states nothing, rather than a part of it: a reader that took
+/// the parts it knows could read a newer knives' statement as a different one
+/// of its own, and one that skipped a value its kind cannot hold would read
+/// an older statement, or a shorter list, as the live one while saying so.
+fn read_statement(value: toml::Value) -> Result<Statement, String> {
+    let statement: Statement = value
+        .try_into()
+        .map_err(|error: toml::de::Error| error.message().trim_end().to_owned())?;
+    if statement.kind == crate::statement::StatementKind::Unknown {
+        return Err("its kind is one this knives does not know".to_owned());
+    }
+    statement.check()?;
+    Ok(statement)
 }
 
 /// The frontmatter before the closing `+++` fence, and the body after it.
@@ -678,27 +1192,32 @@ fn split_fenced(rest: &str) -> Result<(Frontmatter, String), String> {
 }
 
 /// `Timestamp::now`, bumped to be strictly later than every stamp this process
-/// has handed out.
+/// has handed out, and than `after` when there is one.
 ///
 /// Two draws back-to-back can be equal on a coarse platform clock, and equal
 /// stamps would leave read order to the random filename suffix — the sync
 /// tests assert the order of entries one command writes, so that order must
 /// not be a coin toss. A clock that did not advance is nudged one nanosecond
 /// past the last stamp instead. Across processes the wall clock is the order,
-/// as it always was; the suffix and `create_new` cover genuinely concurrent
-/// writers.
-fn monotonic_now() -> jiff::Timestamp {
+/// as it always was, except that a statement is stamped after the one it
+/// replaces ([`Stated::replaces`]); the suffix and `create_new` cover
+/// genuinely concurrent writers.
+fn monotonic_after(after: Option<jiff::Timestamp>) -> jiff::Timestamp {
     static LAST: std::sync::Mutex<Option<jiff::Timestamp>> = std::sync::Mutex::new(None);
     let mut last = LAST
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let now = jiff::Timestamp::now();
-    let stamp = match *last {
-        Some(previous) if now <= previous => previous + jiff::SignedDuration::from_nanos(1),
-        _ => now,
-    };
+    let stamp = stamp_after(jiff::Timestamp::now(), (*last).max(after));
     *last = Some(stamp);
     stamp
+}
+
+/// `now`, or one nanosecond past `floor` when `now` is not later than it.
+fn stamp_after(now: jiff::Timestamp, floor: Option<jiff::Timestamp>) -> jiff::Timestamp {
+    match floor {
+        Some(floor) if now <= floor => floor + jiff::SignedDuration::from_nanos(1),
+        _ => now,
+    }
 }
 
 #[cfg(test)]
@@ -714,6 +1233,7 @@ mod tests {
         Entry {
             ts: "2026-08-15T22:14:03Z".to_owned(),
             owner: "ses_fff688".to_owned(),
+            email: None,
             subject: subject.map(str::to_owned),
             kind: Kind::Note,
             text: text.to_owned(),
@@ -722,6 +1242,7 @@ mod tests {
             pr: None,
             parents: Vec::new(),
             disposition: None,
+            statement: None,
         }
     }
     fn entry_at(ts: &str, subject: Option<&str>, text: &str) -> Entry {
@@ -764,7 +1285,7 @@ mod tests {
             ))
             .unwrap();
 
-        let read = ledger.entries().unwrap();
+        let read = ledger.read().unwrap().entries;
         assert_eq!(read.len(), 2);
         assert_eq!(read[0].text, "first");
         assert_eq!(read[1].text, "second");
@@ -778,7 +1299,7 @@ mod tests {
         // A repository nobody has notched is the normal case, not a failure.
         let dir = tempfile::tempdir().unwrap();
         let ledger = Ledger::at(dir.path().join("never-written"));
-        assert!(ledger.entries().unwrap().is_empty());
+        assert_eq!(ledger.read().unwrap().entries, Vec::<Entry>::new());
     }
 
     #[test]
@@ -791,7 +1312,7 @@ mod tests {
         std::fs::write(&blocked, "not a directory").unwrap();
         let ledger = Ledger::at(blocked.join("a-repo"));
 
-        let error = ledger.entries().unwrap_err();
+        let error = ledger.read().unwrap_err();
         assert!(
             matches!(&error, LedgerError::Read { path: actual, .. } if actual.as_path() == ledger.path()),
             "was: {error}"
@@ -811,7 +1332,7 @@ mod tests {
         };
         ledger.append(&bare).unwrap();
 
-        let read = ledger.entries().unwrap();
+        let read = ledger.read().unwrap().entries;
         assert_eq!(read[0].subject, None);
         assert_eq!(read[0].anchor, None);
         assert_eq!(read[0].pr, None);
@@ -837,7 +1358,7 @@ mod tests {
         )
         .unwrap();
 
-        let read = Ledger::at(path).entries().unwrap();
+        let read = Ledger::at(path).read().unwrap().entries;
         assert_eq!(read.len(), 1);
         assert_eq!(read[0].kind, Kind::Event);
         assert_eq!(read[0].text, "claimed");
@@ -852,7 +1373,7 @@ mod tests {
         let ledger = Ledger::at(dir.path().join("a-repo"));
         let text = "parked\nby the owner\n+++\nthat line is prose, not a fence";
         ledger.append(&entry(Some("feat/alpha"), text)).unwrap();
-        assert_eq!(ledger.entries().unwrap()[0].text, text);
+        assert_eq!(ledger.read().unwrap().entries[0].text, text);
     }
 
     #[test]
@@ -869,7 +1390,7 @@ mod tests {
             ..entry(Some("feat/alpha"), "promised a follow-up")
         };
         ledger.append(&sneaky).unwrap();
-        assert_eq!(ledger.entries().unwrap()[0], sneaky);
+        assert_eq!(ledger.read().unwrap().entries[0], sneaky);
     }
 
     #[test]
@@ -888,7 +1409,7 @@ mod tests {
         )
         .unwrap();
 
-        let error = Ledger::at(path).entries().unwrap_err();
+        let error = Ledger::at(path).read().unwrap_err();
         assert!(
             matches!(
                 &error,
@@ -910,11 +1431,215 @@ mod tests {
         )
         .unwrap();
 
-        let error = Ledger::at(path).entries().unwrap_err();
+        let error = Ledger::at(path).read().unwrap_err();
         assert!(
             matches!(&error, LedgerError::Timestamp { ts, .. } if ts == "last tuesday"),
             "was: {error}"
         );
+    }
+
+    #[test]
+    fn a_statement_whose_value_its_kind_cannot_hold_states_nothing_and_is_named() {
+        // A peer's or a hand's entry with a value its kind cannot hold reads,
+        // stating nothing, and the read names it: failing the read would make
+        // the fork unreadable on every machine for good, since a committed
+        // entry is never rewritten. `superseded` and `fork-only` hold prose,
+        // so any text is theirs.
+        for (kind, value) in [
+            ("pull", "12a"),
+            ("pull", ""),
+            ("pull", "-3"),
+            ("depends", "acme/demo#7,acme/demo"),
+            ("depends", "acme/demo#seven"),
+            ("depends", "acme/demo#7,,sibling#49"),
+            ("depends", ""),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("a-repo");
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(
+                path.join("20260815T221403.000000000Z-0000.md"),
+                format!(
+                    "+++\nstatement = {{ kind = \"{kind}\", value = \"{value}\" }}\n\
+                     ts = \"2026-08-15T22:14:03Z\"\nowner = \"x\"\nsubject = \"feat/alpha\"\n\
+                     kind = \"event\"\n+++\nstated\n"
+                ),
+            )
+            .unwrap();
+
+            let read = Ledger::at(path).read().unwrap();
+            assert_eq!(read.entries.len(), 1, "{kind} = {value:?}");
+            assert_eq!(read.entries[0].statement, None, "{kind} = {value:?}");
+            assert!(
+                matches!(
+                    read.problems.as_slice(),
+                    [problem] if problem.contains("20260815T221403.000000000Z-0000.md")
+                        && problem.contains(kind)
+                ),
+                "{kind} = {value:?}: {:?}",
+                read.problems
+            );
+        }
+    }
+
+    #[test]
+    fn every_statement_value_knives_writes_reads_back() {
+        for (kind, value) in [
+            ("pull", "1234"),
+            ("depends", "acme/demo#7,sibling#49"),
+            ("superseded", "feat/alpha-v2"),
+            ("superseded", "main@upstream"),
+            ("fork-only", "stated with `knives track --fork-only`"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("a-repo");
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(
+                path.join("20260815T221403.000000000Z-0000.md"),
+                format!(
+                    "+++\nstatement = {{ kind = \"{kind}\", value = \"{value}\" }}\n\
+                     ts = \"2026-08-15T22:14:03Z\"\nowner = \"x\"\nsubject = \"feat/alpha\"\n\
+                     kind = \"event\"\n+++\nstated\n"
+                ),
+            )
+            .unwrap();
+            let read = Ledger::at(path).read().map(|read| read.entries);
+            assert!(read.is_ok(), "{kind} = {value:?}: {read:?}");
+        }
+    }
+
+    /// An entry file under `dir` stating `statement`, an inline table's body.
+    fn stating(dir: &Path, name: &str, ts: &str, statement: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            dir.join(name),
+            format!(
+                "+++\nstatement = {{ {statement} }}\nts = \"{ts}\"\nowner = \"x\"\n\
+                 subject = \"feat/alpha\"\nkind = \"event\"\n+++\nstated\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_statement_kind_a_newer_knives_writes_reads_and_states_nothing_here() {
+        // Given: a valid pull statement, and a newer one of a kind this
+        // knives does not know, as a peer running a newer knives would send.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a-repo");
+        stating(
+            &path,
+            "20260815T221403.000000000Z-0000.md",
+            "2026-08-15T22:14:03Z",
+            "kind = \"pull\", value = \"1234\"",
+        );
+        stating(
+            &path,
+            "20260815T221500.000000000Z-0000.md",
+            "2026-08-15T22:15:00Z",
+            "kind = \"blocks\", value = \"anything at all\"",
+        );
+
+        // Then: the ledger reads, the unknown kind leaves the pull live, and
+        // the read names the file whose statement it could not read.
+        let read = Ledger::at(path).read().unwrap();
+        assert_eq!(read.entries.len(), 2);
+        let live = crate::statement::Statements::from_entries(&read.entries);
+        assert_eq!(live.pull("feat/alpha"), Some(1234));
+        assert!(
+            matches!(
+                read.problems.as_slice(),
+                [problem] if problem.contains("20260815T221500.000000000Z-0000.md")
+            ),
+            "{:?}",
+            read.problems
+        );
+    }
+
+    #[test]
+    fn a_misspelt_statement_field_states_nothing_and_is_named_rather_than_read_as_a_forget() {
+        // Given: a valid pull statement, then a newer one whose `value` is
+        // misspelt: read as a statement with no value, it would be a forget
+        // and win.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a-repo");
+        stating(
+            &path,
+            "20260815T221403.000000000Z-0000.md",
+            "2026-08-15T22:14:03Z",
+            "kind = \"pull\", value = \"1234\"",
+        );
+        stating(
+            &path,
+            "20260815T221500.000000000Z-0000.md",
+            "2026-08-15T22:15:00Z",
+            "kind = \"pull\", vaule = \"99\"",
+        );
+
+        // Then: the misspelt statement states nothing, so the earlier pull
+        // stays live, and the read names the file and the field.
+        let read = Ledger::at(path).read().unwrap();
+        let live = crate::statement::Statements::from_entries(&read.entries);
+        assert_eq!(live.pull("feat/alpha"), Some(1234));
+        assert!(
+            matches!(
+                read.problems.as_slice(),
+                [problem] if problem.contains("20260815T221500.000000000Z-0000.md")
+                    && problem.contains("vaule")
+            ),
+            "{:?}",
+            read.problems
+        );
+    }
+
+    #[test]
+    fn an_entry_of_a_kind_a_newer_knives_writes_is_left_out_and_named() {
+        // Given: a note, and an entry of a kind this knives does not know.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a-repo");
+        let ledger = Ledger::at(path.clone());
+        ledger.append(&entry(Some("feat/alpha"), "a note")).unwrap();
+        std::fs::write(
+            path.join("20990101T000000.000000000Z-0000.md"),
+            "+++\nts = \"2099-01-01T00:00:00Z\"\nowner = \"x\"\nkind = \"decision\"\n+++\ndecided\n",
+        )
+        .unwrap();
+
+        // Then: the read gives the note alone, and names the other file.
+        let read = ledger.read().unwrap();
+        assert_eq!(read.entries.len(), 1);
+        assert_eq!(read.entries[0].text, "a note");
+        assert!(
+            matches!(
+                read.problems.as_slice(),
+                [problem] if problem.contains("20990101T000000.000000000Z-0000.md")
+            ),
+            "{:?}",
+            read.problems
+        );
+    }
+
+    #[test]
+    fn an_entry_or_statement_of_an_unknown_kind_cannot_be_written() {
+        // Either would state nothing on every machine that reads it.
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = Ledger::at(dir.path().join("a-repo"));
+        let unknown_entry = Entry {
+            kind: Kind::Unknown,
+            ..entry(Some("feat/alpha"), "a")
+        };
+        let unknown_statement = Entry {
+            statement: Some(Statement {
+                kind: crate::statement::StatementKind::Unknown,
+                value: Some("x".to_owned()),
+            }),
+            ..entry(Some("feat/alpha"), "a")
+        };
+        for bad in [unknown_entry, unknown_statement] {
+            let error = ledger.append(&bad).unwrap_err();
+            assert!(matches!(&error, LedgerError::Parse { .. }), "was: {error}");
+        }
+        assert!(!ledger.path().exists());
     }
 
     #[test]
@@ -936,14 +1661,18 @@ mod tests {
     }
 
     #[test]
-    fn a_repos_ledger_is_a_directory_beside_the_state_file() {
+    fn a_forks_ledger_is_its_upstream_directory_beside_the_state_file() {
         let _lock = crate::config::test_support::environment_lock();
         let environment =
             crate::config::test_support::EnvironmentGuard::capture(&["KNIVES_CONFIG_HOME"]);
         environment.set("KNIVES_CONFIG_HOME", "/tmp/knives-home");
+        let entry = crate::config::RepoEntry::new(
+            "https://forge.invalid/Acme/Tool.git",
+            "https://forge.invalid/ours/tool.git",
+        );
         assert_eq!(
-            default_ledger_path(&RepoName::new("a-repo")),
-            std::path::PathBuf::from("/tmp/knives-home/ledger/a-repo")
+            default_ledger_path(&entry.upstream_name("t")),
+            std::path::PathBuf::from("/tmp/knives-home/ledger/acme/tool")
         );
     }
 
@@ -958,7 +1687,7 @@ mod tests {
             .unwrap();
         std::fs::write(path.join(".20990101.md.swp"), "junk").unwrap();
 
-        let read = Ledger::at(path).entries().unwrap();
+        let read = Ledger::at(path).read().unwrap().entries;
         assert_eq!(read.len(), 1);
         assert_eq!(read[0].text, "fine");
     }
@@ -973,9 +1702,95 @@ mod tests {
         ledger.append(&entry(Some("feat/alpha"), "fine")).unwrap();
         let _temporary = tempfile::NamedTempFile::new_in(path).unwrap();
 
-        let read = ledger.entries().unwrap();
+        let read = ledger.read().unwrap().entries;
         assert_eq!(read.len(), 1);
         assert_eq!(read[0].text, "fine");
+    }
+
+    #[test]
+    fn a_symlink_named_like_an_entry_is_not_an_entry() {
+        // A sweep commits only regular files, so an entry read through a link
+        // would be one this machine reads and no other machine ever gets.
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = Ledger::at(dir.path().join("elsewhere"));
+        let linked = elsewhere
+            .append(&entry(Some("feat/alpha"), "linked"))
+            .unwrap();
+        let path = dir.path().join("a-repo");
+        let ledger = Ledger::at(path.clone());
+        ledger.append(&entry(Some("feat/alpha"), "fine")).unwrap();
+        std::os::unix::fs::symlink(&linked, path.join("20990101T000000.000000000Z-0000.md"))
+            .unwrap();
+
+        let read = ledger.read().unwrap().entries;
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0].text, "fine");
+    }
+
+    #[test]
+    fn a_markdown_file_not_named_as_knives_names_an_entry_is_named_and_not_read() {
+        // Given: an entry, and two Markdown files beside it no knives wrote:
+        // one a hand might add, one whose name holds a control sequence.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a-repo");
+        let ledger = Ledger::at(path.clone());
+        ledger.append(&entry(Some("feat/alpha"), "fine")).unwrap();
+        let readable =
+            "+++\nts = \"2026-08-15T22:14:03Z\"\nowner = \"x\"\nkind = \"note\"\n+++\nstray\n";
+        std::fs::write(path.join("notes.md"), readable).unwrap();
+        std::fs::write(
+            path.join("20990101T000000.000000000Z-\u{1b}[2J.md"),
+            readable,
+        )
+        .unwrap();
+
+        // Then: the read gives the entry alone, and names each other file,
+        // with no control character left in what it says.
+        let read = ledger.read().unwrap();
+        assert_eq!(read.entries.len(), 1, "{:?}", read.entries);
+        assert_eq!(read.entries[0].text, "fine");
+        assert_eq!(read.problems.len(), 2, "{:?}", read.problems);
+        assert!(
+            read.problems
+                .iter()
+                .any(|problem| problem.contains("notes.md")),
+            "{:?}",
+            read.problems
+        );
+        assert!(
+            read.problems
+                .iter()
+                .all(|problem| !problem.chars().any(|c| c.is_ascii_control())),
+            "{:?}",
+            read.problems
+        );
+    }
+
+    #[test]
+    fn an_entry_file_name_is_exactly_what_a_write_names_one() {
+        let written = entry_file_name("2026-08-15T22:14:03.000000001Z".parse().unwrap());
+        assert!(is_entry_file_name(&written), "{written}");
+        for name in [
+            "20260815T221403.000000000Z-0000.md",
+            "20990101T000000.999999999Z-af09.md",
+        ] {
+            assert!(is_entry_file_name(name), "{name}");
+        }
+        for name in [
+            "notes.md",
+            "20260815T221403.000000000Z-ABCD.md",
+            "20260815T221403.000000000Z-000.md",
+            "20260815T221403.000000000Z-00000.md",
+            "20260815T221403.00000000Z-0000.md",
+            "20260815X221403.000000000Z-0000.md",
+            "20260815T221403.000000000Z-0000.MD",
+            "20260815T221403.000000000Z-0000.md.swp",
+            "2026081\u{1b}T221403.000000000Z-0000.md",
+            "20260815T221403.000000000Z-\u{1b}[2J.md",
+            "",
+        ] {
+            assert!(!is_entry_file_name(name), "{name:?}");
+        }
     }
 
     #[test]
@@ -1001,7 +1816,7 @@ mod tests {
             ))
             .unwrap();
 
-        let read = ledger.entries().unwrap();
+        let read = ledger.read().unwrap().entries;
         assert_eq!(read[0].text, "earlier");
         assert_eq!(read[1].text, "later");
 
@@ -1064,7 +1879,7 @@ mod tests {
                         // Real writers draw from the monotonic scribe clock; these
                         // do too, so stamps are process-unique and a collision cannot happen.
                         let mut record = entry(Some("feat/alpha"), &format!("{writer}:{index}"));
-                        record.ts = monotonic_now().to_string();
+                        record.ts = monotonic_after(None).to_string();
                         ledger.append(&record).unwrap();
                     }
                 });
@@ -1073,7 +1888,7 @@ mod tests {
 
         let files = std::fs::read_dir(&path).unwrap().count();
         assert_eq!(files, WRITERS * EACH, "every append is its own file");
-        let entries = Ledger::at(path).entries().unwrap();
+        let entries = Ledger::at(path).read().unwrap().entries;
         assert_eq!(entries.len(), WRITERS * EACH, "every file parses");
         for writer in 0..WRITERS {
             for index in 0..EACH {
@@ -1207,12 +2022,29 @@ mod tests {
     fn stamps_drawn_back_to_back_strictly_advance() {
         // A tight loop outpaces the clock's real granularity somewhere; the
         // bump keeps every stamp strictly later than the one before anyway.
-        let mut previous = monotonic_now();
+        let mut previous = monotonic_after(None);
         for _ in 0..1000 {
-            let next = monotonic_now();
+            let next = monotonic_after(None);
             assert!(next > previous, "stamps must advance: {next} <= {previous}");
             previous = next;
         }
+    }
+
+    #[test]
+    fn a_stamp_is_later_than_the_statement_it_replaces_whatever_the_clock_says() {
+        // Given: this clock, and a live statement stamped five minutes past
+        // it, as a machine whose clock runs ahead stamps one.
+        let now: jiff::Timestamp = "2026-10-11T12:00:00Z".parse().unwrap();
+        let ahead = now + jiff::SignedDuration::from_mins(5);
+
+        // When / Then: what replaces it is stamped one nanosecond after it,
+        // and what replaces a statement from the past is stamped now.
+        assert_eq!(
+            stamp_after(now, Some(ahead)),
+            ahead + jiff::SignedDuration::from_nanos(1)
+        );
+        assert_eq!(stamp_after(now, Some(jiff::Timestamp::UNIX_EPOCH)), now);
+        assert_eq!(stamp_after(now, None), now);
     }
 
     #[test]
@@ -1229,8 +2061,9 @@ mod tests {
         }
         let texts: Vec<String> = scribe
             .ledger
-            .entries()
+            .read()
             .unwrap()
+            .entries
             .into_iter()
             .map(|entry| entry.text)
             .collect();
@@ -1240,7 +2073,7 @@ mod tests {
     fn scribe(dir: &std::path::Path) -> Scribe {
         Scribe::new(
             Ledger::at(dir.join("ledger").join("a-repo")),
-            RepoName::new("a-repo"),
+            UpstreamName::new("a-repo"),
             dir.join("not-a-repository"),
             "ses_fff688".to_owned(),
         )
@@ -1269,7 +2102,50 @@ mod tests {
             written.ts
         );
         // And: it is on disk, not just returned.
-        assert_eq!(scribe.ledger.entries().unwrap(), vec![written]);
+        assert_eq!(scribe.ledger.read().unwrap().entries, vec![written]);
+    }
+
+    #[test]
+    fn an_entry_carries_the_writers_git_email_and_none_when_git_has_none() {
+        // Given: a checkout whose own config names its committer.
+        let dir = tempfile::tempdir().unwrap();
+        let checkout = dir.path().join("checkout");
+        std::fs::create_dir_all(&checkout).unwrap();
+        for args in [
+            &["init", "--quiet"][..],
+            &["config", "user.email", "writer@example.test"][..],
+        ] {
+            let status = crate::bind::git(&checkout).args(args).status().unwrap();
+            assert!(status.success(), "git {args:?}");
+        }
+        let scribe = Scribe::new(
+            Ledger::at(dir.path().join("ledger").join("a-repo")),
+            UpstreamName::new("a-repo"),
+            checkout,
+            "ses_fff688".to_owned(),
+        );
+
+        // When: it writes an entry.
+        let written = scribe.event(None, "noted".to_owned(), None).unwrap();
+
+        // Then: the entry carries that address, on disk as in the report.
+        assert_eq!(written.email.as_deref(), Some("writer@example.test"));
+        let text = std::fs::read_to_string(only_file(scribe.ledger.path())).unwrap();
+        assert!(
+            text.contains("email = \"writer@example.test\""),
+            "was: {text}"
+        );
+        assert_eq!(scribe.ledger.read().unwrap().entries, vec![written]);
+
+        // And: an entry with no address writes no email field, and reads
+        // back as none, as every entry written before the field does.
+        let plain_dir = tempfile::tempdir().unwrap();
+        let plain = Ledger::at(plain_dir.path().join("a-repo"));
+        let bare = entry(None, "no address");
+        plain.append(&bare).unwrap();
+        let text = std::fs::read_to_string(only_file(plain.path())).unwrap();
+        assert!(!text.contains("email"), "was: {text}");
+        assert_eq!(plain.read().unwrap().entries, vec![bare]);
     }
 
     #[test]
@@ -1292,6 +2168,7 @@ mod tests {
                 subject: None,
                 kind: Kind::Note,
                 disposition: None,
+                statement: None,
                 text: "the release remote is out of date".to_owned(),
                 evidence: vec!["06d778b9".to_owned(), "a-repo#1157".to_owned()],
                 pr: None,
@@ -1315,7 +2192,7 @@ mod tests {
         std::fs::write(&path, "a file where the ledger directory should be").unwrap();
         let blocked = Scribe::new(
             Ledger::at(path),
-            RepoName::new("a-repo"),
+            UpstreamName::new("a-repo"),
             dir.path().to_owned(),
             "ses_fff688".to_owned(),
         )
@@ -1337,7 +2214,7 @@ mod tests {
             ..entry(Some("feat/alpha"), "split into a plugin")
         };
         ledger.append(&disposition).unwrap();
-        assert_eq!(ledger.entries().unwrap(), vec![disposition]);
+        assert_eq!(ledger.read().unwrap().entries, vec![disposition]);
 
         let plain_dir = tempfile::tempdir().unwrap();
         let plain = Ledger::at(plain_dir.path().join("a-repo"));
@@ -1346,6 +2223,74 @@ mod tests {
             .unwrap();
         let text = std::fs::read_to_string(only_file(plain.path())).unwrap();
         assert!(!text.contains("disposition"), "was: {text}");
+    }
+
+    #[test]
+    fn a_statement_round_trips_as_an_inline_table_and_an_entry_without_one_stays_clean() {
+        // The statement is one machine-readable line in the file, and a forget
+        // (no value) must come back as a forget rather than as no statement.
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = Ledger::at(dir.path().join("a-repo"));
+        let stated = Entry {
+            kind: Kind::Event,
+            statement: Some(Statement {
+                kind: crate::statement::StatementKind::Pull,
+                value: Some("1234".to_owned()),
+            }),
+            ..entry(Some("feat/alpha"), "stated as #1234")
+        };
+        ledger.append(&stated).unwrap();
+        assert_eq!(ledger.read().unwrap().entries, vec![stated]);
+        let text = std::fs::read_to_string(only_file(ledger.path())).unwrap();
+        assert!(
+            text.contains("\nstatement = { kind = \"pull\", value = \"1234\" }\n"),
+            "was: {text}"
+        );
+
+        let forget_dir = tempfile::tempdir().unwrap();
+        let forget_ledger = Ledger::at(forget_dir.path().join("a-repo"));
+        let forget = Entry {
+            kind: Kind::Event,
+            statement: Some(Statement {
+                kind: crate::statement::StatementKind::Pull,
+                value: None,
+            }),
+            ..entry(Some("feat/alpha"), "pull request statement forgotten")
+        };
+        forget_ledger.append(&forget).unwrap();
+        assert_eq!(forget_ledger.read().unwrap().entries, vec![forget]);
+        let text = std::fs::read_to_string(only_file(forget_ledger.path())).unwrap();
+        assert!(
+            text.contains("\nstatement = { kind = \"pull\" }\n"),
+            "was: {text}"
+        );
+
+        // And: beside a field toml writes as a section, the statement still
+        // reads back as the entry's own rather than as part of the section.
+        let sectioned_dir = tempfile::tempdir().unwrap();
+        let sectioned_ledger = Ledger::at(sectioned_dir.path().join("a-repo"));
+        let sectioned = Entry {
+            kind: Kind::Event,
+            statement: Some(Statement {
+                kind: crate::statement::StatementKind::Superseded,
+                value: Some("feat/alpha-v2".to_owned()),
+            }),
+            parents: vec![RecordedParent {
+                commit: "a".repeat(40),
+                branches: vec!["feat/alpha".to_owned()],
+            }],
+            ..entry(Some("feat/alpha"), "superseded by feat/alpha-v2")
+        };
+        sectioned_ledger.append(&sectioned).unwrap();
+        assert_eq!(sectioned_ledger.read().unwrap().entries, vec![sectioned]);
+
+        let plain_dir = tempfile::tempdir().unwrap();
+        let plain = Ledger::at(plain_dir.path().join("a-repo"));
+        plain
+            .append(&entry(Some("feat/beta"), "still investigating"))
+            .unwrap();
+        let text = std::fs::read_to_string(only_file(plain.path())).unwrap();
+        assert!(!text.contains("statement"), "was: {text}");
     }
 
     #[test]
@@ -1370,7 +2315,7 @@ mod tests {
             ..entry(Some("release/2026-08-04"), "cut release/2026-08-04")
         };
         ledger.append(&cut).unwrap();
-        assert_eq!(ledger.entries().unwrap(), vec![cut]);
+        assert_eq!(ledger.read().unwrap().entries, vec![cut]);
 
         let plain_dir = tempfile::tempdir().unwrap();
         let plain = Ledger::at(plain_dir.path().join("a-repo"));

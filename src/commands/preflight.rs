@@ -202,11 +202,11 @@ pub fn gather(input: GatherInput<'_>) -> Report {
         forge,
         cache,
     } = input;
-    let name = &fork.name;
+    let upstream = &fork.upstream;
     let entry = fork.entry;
     let checkout = &fork.checkout.path;
     let mut report = Report {
-        repo: name.to_string(),
+        repo: fork.name.to_string(),
         ..Report::default()
     };
 
@@ -219,7 +219,7 @@ pub fn gather(input: GatherInput<'_>) -> Report {
             continue;
         };
         let current = digest(&content);
-        let state = match store.convention_digest(name, file) {
+        let state = match store.convention_digest(upstream, file) {
             None => Convention::FirstSeen {
                 file: (*file).to_owned(),
             },
@@ -231,7 +231,7 @@ pub fn gather(input: GatherInput<'_>) -> Report {
             },
         };
         report.conventions.push(state);
-        store.record_convention_digest(name, file, &current);
+        store.record_convention_digest(upstream, file, &current);
 
         if file.eq_ignore_ascii_case("CONTRIBUTING.md") {
             report.stated_cap = stated_pull_request_cap(&content);
@@ -282,7 +282,7 @@ pub fn gather(input: GatherInput<'_>) -> Report {
             .push(format!("open pull request count unavailable: {error}")),
     }
 
-    let claims = store.claims(Some(name));
+    let claims = store.claims(Some(upstream));
     report.claimed_branches = claims.iter().map(|claim| claim.branch.clone()).collect();
 
     // The spec asks for claimed, stale, landed, or divergent. Everything but
@@ -317,11 +317,7 @@ fn branch_states_with_findings(
     let repo = Repo::open(&fork.checkout.path)?;
     let tips = repo.bookmark_tips()?;
     let scheme = entry.release_scheme();
-    let ignored: BTreeSet<crate::ids::BookmarkRef> =
-        crate::commands::release::superseded_dated_releases(&tips, entry.publish_remote())
-            .into_iter()
-            .map(|(reference, _)| reference)
-            .collect();
+    let ignored = crate::commands::release::superseded_cuts_of_every_series(&tips, entry);
     let divergent: std::collections::BTreeSet<String> =
         divergent_changes(&repo.divergent_changes(&ignored)?)
             .into_iter()

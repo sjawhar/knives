@@ -4,7 +4,7 @@ use crate::detect::{BookmarkTips, Finding, Subject};
 use crate::ids::{BookmarkRef, CommitId, ReleaseScheme, is_our_release};
 use crate::jj::Repo;
 use crate::release_model::{
-    BranchSuccessions, carried_from_tips, double_cut_findings, release_order, trunk_positions,
+    BranchSuccessions, carried_from_tips, double_cut_findings, trunk_positions,
 };
 
 /// Which releases are worth checking for stale parents.
@@ -26,7 +26,7 @@ pub(super) fn releases_to_scan(
     publish_remote: &str,
 ) -> (Vec<(BookmarkRef, CommitId)>, usize) {
     match scheme {
-        ReleaseScheme::Dated => {
+        ReleaseScheme::Dated | ReleaseScheme::Series(_) => {
             let all: Vec<(&BookmarkRef, &CommitId)> = tips
                 .iter()
                 .filter(|(reference, _)| is_our_release(reference, scheme, publish_remote))
@@ -35,7 +35,7 @@ pub(super) fn releases_to_scan(
             let newest = |local: bool| {
                 all.iter()
                     .filter(|(reference, _)| reference.is_local() == local)
-                    .max_by_key(|(reference, _)| release_order(reference.branch().as_str()))
+                    .max_by_key(|(reference, _)| scheme.cut_order(reference.branch().as_str()))
                     .map(|(reference, _)| (*reference).clone())
             };
             // Only the newest cut on each side. Every local release a fork ever cut used to

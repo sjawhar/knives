@@ -10,7 +10,7 @@ The motivating setup is seven forks of one upstream ecosystem, each carrying bet
 
 - Replacing `gh`. PR creation stays `gh pr create`. `fork` supplies facts.
 - Replacing `jj`. General VCS work stays in jj and `jj-agent-status`.
-- Cross-machine coordination.
+- Keeping machines in step. The ledger travels between machines through a git repository the registry names (`ledger`), and nothing else does: claims, sightings and pull request records stay on the machine that made them.
 - Judgment. Anything of the form "have you read and understood X" is a skill, not a CLI check.
 - Fixing agent laziness. A tool cannot make an agent add a missing API method instead of declaring it impossible.
 
@@ -46,6 +46,8 @@ Most repos need two roles. A third exists only when branches and releases must l
 
 **Two release schemes.** `release_branch` configures an optional fixed release branch name (`ReleaseScheme::Fixed`). When absent, the repository uses dated releases (`ReleaseScheme::Dated`, e.g. `release/YYYY-MM-DD`). Parse-time validation rejects an empty `release_branch`, a name matching trunk, or a name in the `release/` namespace.
 
+**Named release series.** One fork can release on several bases at once (upstream's `v9.3`, and a frozen `v9.2+ours` branch kept on the fork). `[repos.<name>.series.<series>]` declares a series with its own `base` and `base_remote`; the entry's own `base` stays the default series, so an entry without series is unchanged. A series cuts `release/<series>/YYYY-MM-DD[.N]` (`ReleaseScheme::Series`), whose parser requires exactly one segment after the series prefix: under a plain prefix parse `release/9.2/<date>` would have ordered after every date and become the default series' newest cut. `--series` rebinds the entry (`RepoEntry::for_series`), so `trunk()` and `release_scheme()` follow the selected series in every release verb; `immutable_heads()` always pins the default trunk and every series' base, whichever is selected. A fixed-scheme entry's default series still reaps its leftover `release/YYYY-MM-DD` cuts (`RepoEntry::dated_scheme`). A branch belongs to the series whose base it forks from latest (`release_model::series_fit`: that series' fork point strictly descends from every other's); ties (including every branch at or below a base that is an ancestor of another base) and criss-crosses fit nothing and are refused with the fork points. Membership never works by elimination: with named series, a declared base that does not resolve stops every release verb (exit 3, the base named), and a base with no single fork point with a tip fits that tip to no series. Verbs outside `release` (audit's forbidden scan, status's overlap and landed probes, `start`) still measure every branch against the default base. Cuts, the plan's candidates, `include` and `advance` take only the selected series' branches; `audit` checks drift for every series' cuts and notes each branch that fits no series. Series names are one `/`-free segment that does not look like a date (git cannot hold `release/X` and `release/X/<date>` together), bases are unique and outside `release/`, and series do not combine with `release_branch`.
+
 **Verified:** splitting the roles across two remotes works with no mirroring step. A branch pushed only to the branch remote, made a parent of a release octopus pushed only to the release remote, was fully resolvable from a fresh repo fetching only the release ref. The push carries parent commits as objects.
 
 Release parents are **upstream PR refs, not necessarily our branches**. `git fetch upstream pull/N/head` costs 0.48s and needs no fork. Carrying a maintainer's PR instead of ours, or a PR that was never ours, is the same operation as carrying our own.
@@ -77,8 +79,9 @@ command never edits consumer checkouts.
 
 **The registry names repositories, not directories.** A `[repos.*]` entry carries `upstream`,
 `origin`, and the optional `base`, `release`, `release_branch`, `test_count_command`,
-`consumers`, `workspaces`, and `forbidden` (identifiers an upstream-bound diff must not add; `audit`
-scans for them); there is no path field, and a file that still has one is refused
+`consumers`, `workspaces`, `forbidden` (identifiers an upstream-bound diff must not add; `audit`
+scans for them), and `ledger` (the repository the fork's ledger is shared through); there is no
+path field, and a file that still has one is refused
 on load with the entry named.
 A checkout is the entry whose `upstream` its own `upstream` remote matches, so an entry
 follows the repository to wherever it is cloned and a machine's layout is not configuration.
@@ -129,13 +132,19 @@ Local state is computed on demand. Store only what no amount of computing can re
 
 - who is working on what, and why (the repo cannot know this; and it cannot be inferred from session working directories either, since an agent launched elsewhere may need to change a fork)
 - why we carry a foreign PR as a release parent
-- supersession pointers, when one of our PRs closes in favour of another
-- **fork-only marks**: a branch we deliberately keep with no upstream PR. This should be the minority, but it is real, and it covers CI we want on our fork but not upstream. Without a mark, every such branch reads as an error in `knives status` forever. (2026-09-19: this mark predates Sami's ruling that "fork-only is not a real option" — a marked branch is an UPSTREAM member whose PR has not yet been opened, not a third destination.)
-- **what happened, and what was decided**: an append-only ledger per repo, beside the state
-  file. Everything above is current intent, rewritten whole on each change; `knives finish`
+- **what happened, and what was decided**: a ledger per fork, appended to and never rewritten, beside the state
+  file. The two items above are current intent, rewritten whole on each change; `knives finish`
   deletes the one "why" the tool records. The ledger is the past tense: events this tool
   observed in its own commands, and judgments an agent asserted, each anchored to the
   subject's tip at write time.
+- **branch statements**, on that ledger: a branch's stated pull request, its supersession
+  pointer when one of our PRs closes in favour of another, its dependencies, and a
+  **fork-only mark** for a branch we deliberately keep with no upstream PR yet. Without a mark,
+  every such branch reads as an error in `knives status` forever. (2026-09-19: this mark
+  predates Sami's ruling that "fork-only is not a real option" — a marked branch is an UPSTREAM
+  member whose PR has not yet been opened, not a third destination.) Each is an entry carrying
+  a `statement` field, never rewritten: per branch and kind, the newest `ts` is live, and
+  stating it again, or forgetting it, is a newer entry.
 
 A disposition is a terminal, past-tense human ruling: `merged-elsewhere`, `withdrawn`, or
 `ruled-out`. It is an optional ledger field on a note, not a third kind and not derived state. A
@@ -178,7 +187,10 @@ For an open pull request, the same answered live fields drive three present-stat
 `knives status` and bracketed `knives pr` flags. `empty-diff` requires answered zero additions,
 deletions, and changed-file count; `deleted-head-ref` requires an answered null head-ref object;
 and `empty-tip-commit` requires the newest tip tree to equal its sole parent tree. Unanswered
-fields are silent: absence is not evidence of an incident.
+fields are silent: absence is not evidence of an incident. The head-ref object is read through
+the head repository, which can refuse a token the base repository accepts (a fork whose
+organization enforces SAML): the forge then nulls it and names that field in `errors`. knives
+reads such a null as unanswered, not as an answered null, and the rest of the batch stands.
 
 `knives pr NUMBER --timeline` issues one on-demand, bounded `last: 100` query for that pull
 request's head-ref and state events. It reports force pushes, deletion and restoration, closure,
@@ -245,7 +257,7 @@ Authorship- and PR-number-agnostic, which matters because our work sometimes lan
 
 **10. Orphaned claim (`orphaned-claim`).** Rests on the claim store against `Repo::bookmark_tips` and `Repo::workspaces`: a claim on a branch that no bookmark on any remote and no workspace names. `finish` releases a claim; a bookmark deleted around it leaves the claim behind as a row with no tip and nothing to say why.
 
-**11. Immutable-heads rule (`immutable-heads-rule`).** Rests on `jj::repo_immutable_heads`: the `revset-aliases."immutable_heads()"` the repository's own jj config states, read by asking jj (`jj config list --repo`) rather than re-discovering its config files. The rule a managed fork runs under is `RepoEntry::immutable_heads()` — jj's `trunk()`, tags, and the trunk by name on every remote knives knows: `trunk() | tags() | remote_bookmarks(exact:"<trunk>", exact:"upstream") | remote_bookmarks(exact:"<trunk>", exact:"origin")`, plus the `release` remote when one is configured — named outright because `jj git clone` pins `trunk()` to `<trunk>@origin` and the default alias picks whichever trunk-named ref is newest. jj's default adds `untracked_remote_bookmarks()`, and in a fork that pin walls every member tip beneath a superseded release ref a fetch re-materialized, or beneath another fork's pull request head, while protecting nothing — no local rewrite reaches a remote. `knives start` writes the rule where none is stated, in jj's table form with a `doc` naming knives as the writer, and refreshes its own write when the entry's rule changes; a rule a human stated is never overwritten. Any stated rule that differs is reported with the config file as subject and both rules in the detail — the detail says which of the two cases it is. Absence is not reported, because `start` resolves it.
+**11. Immutable-heads rule (`immutable-heads-rule`).** Rests on `jj::repo_immutable_heads`: the `revset-aliases."immutable_heads()"` the repository's own jj config states, read by asking jj (`jj config list --repo`) rather than re-discovering its config files. The rule a managed fork runs under is `RepoEntry::immutable_heads()` — jj's `trunk()`, the trunk by name on every remote knives knows, and every tag fetched from upstream: `trunk() | remote_bookmarks(exact:"<trunk>", exact:"upstream") | remote_bookmarks(exact:"<trunk>", exact:"origin") | remote_tags(remote=exact:"upstream")`, with the `release` remote's trunk added when one is configured — the trunks named outright because `jj git clone` pins `trunk()` to `<trunk>@origin` and the default alias picks whichever trunk-named ref is newest. jj's default adds `untracked_remote_bookmarks()`, and in a fork that pin walls every member tip beneath a superseded release ref a fetch re-materialized, or beneath another fork's pull request head, while protecting nothing — no local rewrite reaches a remote. It adds `tags()` too, and every release a fork publishes is tagged, so a tag on a release merge froze every member commit beneath it and refused `knives release rebase`. A rewrite moves bookmarks, never tags: the tag keeps naming the published original, locally and so on the remote. Upstream's tags stay pinned by where they were fetched from, `remote_tags(remote=exact:"upstream")`, not by a naming convention. Ancestry through `<trunk>@upstream` does not cover them: in oh-my-pi, 457 of the tags fetched from upstream sit off its trunk. Every other tag is the fork's own, its published releases and its `keep/*` retention tags alike, and all of them are rewritable. `knives release rebase` abandons the untagged copies its rebase makes of any of them (below). `knives start` writes the rule where none is stated, in jj's table form with a `doc` naming knives as the writer, and refreshes its own write when the entry's rule changes; a rule a human stated is never overwritten. Any stated rule that differs is reported with the config file as subject and both rules in the detail — the detail says which of the two cases it is. Absence is not reported, because `start` resolves it.
 
 ### Reproduced in the lab
 
@@ -288,7 +300,7 @@ knives consumers [FORK] [--consumer PATH]...
 knives pushed [BRANCH]... [--repo REPO]
                                compare local tips with the live remote refs that own them
 knives audit [REPO] [--all] [--no-github]
-                               reconcile remote refs, open pull heads, recorded cuts, and
+                               reconcile remote refs, open pull heads, recorded cuts and edits, and
                                anonymous heads, with one row of facts per maintained branch;
                                reports only, never repairs
 knives sync [REPO|--all]       fetch all remotes and tracked pull/N/head refs; classify each
@@ -307,6 +319,12 @@ knives depends BRANCH --on R#N  record that a branch cannot land before somethin
 knives notch [SUBJECT]         read what happened here (bare: newest 20 human notes plus a
                                folded machine-event count; a subject: its whole chronology);
                                -m writes a note, --disposition requires --evidence
+knives ledger sweep            commit, pull and push the shared ledger; single-flight, and every
+                               write starts one detached as it exits
+knives ledger migrate          move what an older knives left onto what this one reads: the branch
+                               statements state.json kept, onto the ledger, and each fork's ledger
+                               directory, state keys and workspace sightings from its registry key
+                               to its upstream name; a second run changes nothing
 knives release [NAME]          plan, cut, edit or reap a release under the configured scheme
 knives release cut [NAME]      name a new cut of the composition in hand, verbatim (first cut: every branch); refuses to orphan commits or to silently drop members the previous cut's ledger event recorded ([--allow-drop] overrides both), and refuses a candidate with the same tree and the same parents as the previous cut on the publish remote; never pushes
 knives release reap            reap superseded dated release bookmarks everywhere locally and abandon their commits; all kept while the live cut carries conflicts
@@ -330,8 +348,8 @@ It reports equal, missing, differing, and remote-only branch states, including a
 deleted locally while its remote ref remained. It changes neither remote nor local state.
 
 `knives audit` applies that same reconciliation across a repository (or every registry entry with
-`--all`), then checks open pull heads unless `--no-github`, zombie remote branches, recorded
-release-cut evidence, and anonymous heads. Its findings identify the observed drift; it never
+`--all`), then checks open pull heads unless `--no-github`, zombie remote branches, each release
+against the commits its recorded cuts and edits name, and anonymous heads. Its findings identify the observed drift; it never
 repairs, deletes, pushes, or opens a pull request. Per-pull history remains the separate,
 on-demand `knives pr <n> --timeline` read.
 
@@ -389,6 +407,8 @@ Workspaces are effectively free: 0.15 to 0.55s to create, because tracked conten
 Every claim writer (`start`, `finish`, `track`, `depends`, …) takes one lock on the claim store and waits for it with growing, jittered pauses, so a wave of concurrently dispatched `start`s serialises instead of failing; the `using-knives` skill states the lock's mechanism, the wait budget, the pause figures and the refusal messages. The lock is the kernel's advisory lock on `state.lock` (`File::try_lock`, `flock` on Linux), held by the open handle and gone with the holder's process. The file is never unlinked: it is the inode every waiter locks, and a path delete after an unlock would put two waiters on two inodes, each holding "the" lock. A knives that takes this path by exclusive create and unlinks it on drop reads the persistent file as always held, and holds no OS lock while it runs, so this binary acquires beside it and its unlink leaves the two on two inodes; the two binaries must not run concurrently on one machine, hooks included. The holder writes its pid into the file after acquiring; a refusal names it. `start` holds the lock across `fetch_all` and workspace creation, so a wave of N concurrent `start`s waits about N times one start's hold. The sidecar locks — sightings, the hook's session state — wait a fraction of the claim budget: a stale one must never stall a hook event.
 
 `knives start` also states the fork's `immutable_heads()` (detector 11 has the rule and why) in the repository's own jj config when that config states none, refreshes the one it wrote earlier when the entry's rule has changed, and says so on stdout — naming a user-level rule the write now shadows, when there is one. knives' own library-side rewrites (`describe`, `abandon`, reap) keep jj's default pin set on purpose: a rebase may move a member out from under a stale ref; knives never rewrites what a remote still names.
+
+`knives release rebase` runs `jj rebase -b <release> -d <target>`, which rewrites every descendant of the moved members, including earlier published releases that rest on them but are no longer ancestors of the release in hand. Their tags stay on the originals, which keep their commit ids, and the rebase leaves an untagged copy of each with the original's change id; the tagged original is hidden by the rewrite, still named by its tag. That covers every tagged commit the rebase copies, fork releases and `keep/*` retention tags alike, since upstream's tags are immutable and a rebase that would copy one refuses. Before the rebase the command records the tagged commits in `roots(<target>..<release>)::` that are not ancestors of the release; afterwards it finds each one's copy (same change id, not the original, descended from the target) and abandons it in one operation, `knives: <release>: abandon rebased copies of tagged releases`, through the same `assert_mutable` gate as every other in-process rewrite. A copy with a local bookmark or a workspace's working copy on it, or a descendant that is not itself a copy being abandoned, is somebody's work: it stays, and the report names it and what rests on it. Copies stacked on each other, a retention tag on a commit built on an old release, go together, children first. Before any of this the command refuses, naming `knives start` as the refresh, when the checkout's config still states a rule an earlier `knives start` wrote that is no longer the fork's: the tag-pinning rule would make the rebase fail with jj's bare "is immutable".
 
 A branch that does get rebased onto a newer trunk (a maintainer asks for it) is still its own member: `advance`, `include` and `drop` match a member to its branch by change id as well as ancestry (`MemberSuccession`), and fall back to the parent set the release's last cut or edit event recorded — a `parents` field naming every bookmark at each parent (`release_model::member_parents`), which is what answers for a branch rebased outside jj or landed upstream, where the repository itself no longer can. Reading a rebased branch as a stranger to its release is what led agents to keep a second "release-lineage" copy of each pull request branch. One branch, on the shared base, rebased only when someone decides to; the release follows.
 

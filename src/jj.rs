@@ -25,6 +25,7 @@ use jj_lib::settings::UserSettings;
 use jj_lib::transaction::Transaction;
 use jj_lib::working_copy::WorkingCopy as _;
 use jj_lib::workspace::Workspace;
+use jj_lib::workspace_store::{SimpleWorkspaceStore, WorkspaceStore as _, WorkspaceStoreError};
 use thiserror::Error;
 
 use crate::detect::landed::RebaseOutcome;
@@ -827,6 +828,17 @@ impl Repo {
         ))
     }
 
+    /// Whether `current` is `recorded` rewritten without changing what it is:
+    /// the same change id, the same parents and the same tree. `jj sign` and
+    /// `jj metaedit` make such a rewrite, under a new commit id. `recorded` may
+    /// be hidden; it is read by id.
+    pub fn is_metadata_rewrite(&self, recorded: &str, current: &str) -> Result<bool, JjError> {
+        let (recorded, current) = (self.commit(recorded)?, self.commit(current)?);
+        Ok(recorded.change_id() == current.change_id()
+            && recorded.parent_ids() == current.parent_ids()
+            && recorded.tree_ids() == current.tree_ids())
+    }
+
     /// The visible commits that share `revision`'s change id, other than
     /// `revision` itself: what a `jj rebase` (or a resolved conflict) left in
     /// the commit's place. Empty for a commit whose change was never rewritten
@@ -855,6 +867,23 @@ impl Repo {
             .filter(|id| id != commit.id())
             .map(|id| commit_id(&id))
             .collect())
+    }
+
+    /// The visible descendants of `id`, itself excluded.
+    fn descendants_of(&self, id: &JjCommitId) -> Result<Vec<JjCommitId>, JjError> {
+        let revision_error = |error: &dyn std::fmt::Display| JjError::Revision {
+            revision: id.to_string(),
+            detail: error.to_string(),
+        };
+        let revset = jj_lib::revset::ResolvedRevsetExpression::commits(vec![id.clone()])
+            .descendants()
+            .evaluate(self.repo.as_ref())
+            .map_err(|error| revision_error(&error))?;
+        collect_stream(revset.stream())
+            .into_iter()
+            .filter(|descendant| descendant.as_ref().map_or(true, |found| found != id))
+            .map(|descendant| descendant.map_err(|error| revision_error(&error)))
+            .collect()
     }
 
     /// Merge commits reachable from `tip` but not from any of `bases` that join
@@ -1358,34 +1387,126 @@ fn is_empty_directory(directory: &Path) -> bool {
 }
 
 /// Removes the Git worktree registration at `destination` when git itself
-/// reports it `prunable` — its working tree is gone — and says whether it did.
+/// reports it `prunable` — its working tree is gone — and says what it found.
 ///
 /// A colocated `jj workspace add` registers the new directory as a Git worktree
 /// under `.git/worktrees/<name>` and `jj workspace forget` unregisters it. A
 /// directory removed before the forget (by hand, or by a jj that did not
 /// unlink) leaves the registration behind, and the next `add` at that path
 /// fails on it. Only a prunable registration is touched: `git worktree remove`
-/// on a live one would delete its directory.
-pub fn remove_prunable_worktree(checkout: &Path, destination: &Path) -> Result<bool, JjError> {
+/// on a live one would delete its directory. A locked registration is never
+/// prunable and stays; with nothing at its path it is reported
+/// [`StaleRegistration::Locked`], since the path may be another machine's live
+/// workspace in a shared store.
+pub fn remove_prunable_worktree(
+    checkout: &Path,
+    destination: &Path,
+) -> Result<StaleRegistration, JjError> {
+    remove_stale_worktree(checkout, destination, StaleLock::Kept)
+}
+
+/// [`remove_prunable_worktree`] for a workspace being finished, which also
+/// unlocks and removes a locked registration whose directory is gone.
+///
+/// A lock keeps another tool's prune off a live workspace; the workspace
+/// `finish` ends is not live, and git would otherwise keep its registration,
+/// so the next `start` at that path fails on "a missing but locked worktree".
+/// The lock is overridden whatever its reason. Only the registration at
+/// `destination` is touched, and only while nothing is at that path.
+pub fn remove_finished_worktree(
+    checkout: &Path,
+    destination: &Path,
+) -> Result<StaleRegistration, JjError> {
+    remove_stale_worktree(checkout, destination, StaleLock::Cleared)
+}
+
+/// What became of the Git worktree registration at a workspace path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StaleRegistration {
+    /// None was registered there, or its directory is present.
+    None,
+    /// The registration's directory was gone, and the registration is removed.
+    Removed,
+    /// The registration is locked and nothing is at its path; it was kept.
+    Locked,
+    /// The registration's working tree is gone, but something that is not a
+    /// directory — a dangling symbolic link, a file — is at its path. Kept:
+    /// git will not remove a registration whose path it cannot validate, and
+    /// what is there is not knives' to delete. [`path_occupant`] names it.
+    Occupied,
+}
+
+/// What is at `path`, for a message about a path that holds something other
+/// than a directory: `a dangling symbolic link to <target>`, or `a file`.
+pub fn path_occupant(path: &Path) -> String {
+    match std::fs::read_link(path) {
+        Ok(target) if !path.exists() => {
+            format!("a dangling symbolic link to {}", target.display())
+        }
+        Ok(target) => format!("a symbolic link to {}", target.display()),
+        Err(_) => "a file".to_owned(),
+    }
+}
+
+/// What [`remove_stale_worktree`] does with a locked registration whose
+/// directory is gone.
+#[derive(Clone, Copy)]
+enum StaleLock {
+    Kept,
+    Cleared,
+}
+
+fn remove_stale_worktree(
+    checkout: &Path,
+    destination: &Path,
+    stale_lock: StaleLock,
+) -> Result<StaleRegistration, JjError> {
     let checkout = path(checkout);
     let listing = command("git", ["-C", &checkout, "worktree", "list", "--porcelain"])?;
-    let wanted = comparable_path(destination);
-    let prunable = listing.split("\n\n").any(|entry| {
-        let mut lines = entry.lines();
-        let registered = lines
+    // Newer git lists a worktree whose path is now a symbolic link under the
+    // link's target, so the target names the registration at `destination` too.
+    let mut wanted = vec![comparable_path(destination)];
+    if let Ok(target) = std::fs::read_link(destination) {
+        let target = destination
+            .parent()
+            .map_or_else(|| target.clone(), |parent| parent.join(&target));
+        wanted.push(comparable_path(&lexically_normal(&target)));
+    }
+    let Some(entry) = listing.split("\n\n").find(|entry| {
+        entry
+            .lines()
             .next()
             .and_then(|line| line.strip_prefix("worktree "))
-            .map(|registered| comparable_path(Path::new(registered)));
-        registered == Some(wanted.clone()) && lines.any(|line| line.starts_with("prunable"))
-    });
-    if !prunable {
-        return Ok(false);
+            .is_some_and(|registered| wanted.contains(&comparable_path(Path::new(registered))))
+    }) else {
+        return Ok(StaleRegistration::None);
+    };
+    let prunable = entry.lines().any(|line| line.starts_with("prunable"));
+    let locked = entry
+        .lines()
+        .any(|line| line == "locked" || line.starts_with("locked "));
+    let vanished = matches!(
+        std::fs::symlink_metadata(destination),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    );
+    // A registration whose path holds something other than a directory has no
+    // working tree there, whatever git says of it.
+    if !vanished && !destination.is_dir() {
+        return Ok(StaleRegistration::Occupied);
     }
-    command(
-        "git",
-        ["-C", &checkout, "worktree", "remove", &path(destination)],
-    )?;
-    Ok(true)
+    let shown = path(destination);
+    if locked && vanished {
+        match stale_lock {
+            StaleLock::Kept => return Ok(StaleRegistration::Locked),
+            StaleLock::Cleared => {
+                command("git", ["-C", &checkout, "worktree", "unlock", &shown])?;
+            }
+        }
+    } else if !prunable {
+        return Ok(StaleRegistration::None);
+    }
+    command("git", ["-C", &checkout, "worktree", "remove", &shown])?;
+    Ok(StaleRegistration::Removed)
 }
 
 /// `directory` with its parent resolved through symbolic links, so a path
@@ -1701,10 +1822,42 @@ pub struct ReleaseWrite<'a> {
     pub message: Option<&'a str>,
     /// Point this bookmark at the written commit, sideways moves allowed —
     /// callers that pass one have already established the move is safe (see
-    /// [`set_bookmark_anywhere`]).
+    /// [`set_bookmark_anywhere`]). When it named the source, the write replaces
+    /// the source, which is abandoned once nothing else rests on it.
     pub bookmark: Option<&'a str>,
+    /// The remote the bookmark publishes to. Its tracked ref of the bookmark
+    /// is the published position the next push replaces, so it does not keep
+    /// a replaced source.
+    pub publish_remote: Option<&'a str>,
+    /// Commits earlier writes put under the bookmark, as the ledger records
+    /// them. Each one that is a visible head nothing rests on — a replaced
+    /// commit once kept for a working copy that has since moved on — is
+    /// abandoned in the same operation, unless the written commit carries
+    /// conflicts. Unknown ones are skipped.
+    pub earlier: &'a [CommitId],
     /// The operation-log description, `knives: …` by convention.
     pub operation: &'a str,
+}
+
+/// What a release write made, and what became of the commit it replaced.
+#[derive(Debug)]
+pub struct ReleaseWritten {
+    pub commit: CommitId,
+    /// The written commit's change id, which the edit event records.
+    pub change: ChangeId,
+    /// The source the bookmark moved off, when it named the source.
+    pub replaced: Option<ReplacedRelease>,
+    /// Earlier writes of the name ([`ReleaseWrite::earlier`]) abandoned here:
+    /// visible heads nothing rests on any more.
+    pub abandoned_earlier: Vec<CommitId>,
+}
+
+/// The commit a release write replaced under its name.
+#[derive(Debug)]
+pub struct ReplacedRelease {
+    pub commit: CommitId,
+    /// Why it stays; `None` when it was abandoned.
+    pub kept: Option<String>,
 }
 
 /// Write a release commit — and optionally its bookmark — as ONE operation.
@@ -1726,29 +1879,222 @@ pub struct ReleaseWrite<'a> {
 /// workspace on top of the release merge unless flagged off; a jj-lib write
 /// cannot make that mistake, and it reports the created commit directly
 /// instead of through parsed human-facing output.
-pub fn write_release(repo: &Path, write: &ReleaseWrite<'_>) -> Result<CommitId, JjError> {
+///
+/// A duplicate moved under the name its source carried replaces that source,
+/// which would otherwise stay behind as a head no bookmark names. It is
+/// abandoned in the same operation unless something else rests on it
+/// ([`what_keeps`]) — a working copy on it or above it among them, since
+/// rewriting that from here would leave the workspace stale.
+pub fn write_release(repo: &Path, write: &ReleaseWrite<'_>) -> Result<ReleaseWritten, JjError> {
     validate_parents(write.source, write.parents)?;
     let repo = Repo::open(repo)?;
     let (parent_commits, parent_ids) = resolved_parents(&repo, write.parents)?;
     let mut tx = repo.repo.start_transaction();
-    let written = if let Some(source) = write.source {
+    let (written, source) = if let Some(source) = write.source {
         let source = repo.commit(source.as_str())?;
-        duplicated_release(&mut tx, (&source, write.message), &parent_ids)?
+        let written = duplicated_release(&mut tx, (&source, write.message), &parent_ids)?;
+        (written, Some(source))
     } else {
-        merged_release(
+        let written = merged_release(
             &mut tx,
             (&parent_commits, parent_ids),
             write.message.unwrap_or_default(),
-        )?
+        )?;
+        (written, None)
     };
+    let mut replaced = None;
+    let mut abandoned_earlier = Vec::new();
     if let Some(name) = write.bookmark {
-        tx.repo_mut().set_local_bookmark_target(
-            JjRefName::new(name),
-            RefTarget::normal(written.id().clone()),
-        );
+        let ref_name = JjRefName::new(name);
+        let source = source.filter(|source| {
+            repo.repo
+                .view()
+                .get_local_bookmark(ref_name)
+                .added_ids()
+                .any(|id| id == source.id())
+        });
+        tx.repo_mut()
+            .set_local_bookmark_target(ref_name, RefTarget::normal(written.id().clone()));
+        let moved = MovedName {
+            name,
+            publish_remote: write.publish_remote,
+        };
+        if let Some(source) = source {
+            let kept = what_keeps(&repo, tx.repo(), &source, &moved)?;
+            if kept.is_none() {
+                tx.repo_mut().record_abandoned_commit(&source);
+            }
+            replaced = Some(ReplacedRelease {
+                commit: commit_id(source.id()),
+                kept,
+            });
+        }
+        // A stray is no published position this push replaces, so it gets no
+        // publish-ref exemption. While the written release carries conflicts,
+        // earlier writes are the record of their last resolution (on a fixed
+        // branch, the superseded cuts), so none is swept: reap's rule.
+        let stray_rules = MovedName {
+            name,
+            publish_remote: None,
+        };
+        let written_id = commit_id(written.id());
+        let strays = if written.has_conflict() {
+            Vec::new()
+        } else {
+            unheld_heads(&repo, tx.repo(), write.earlier, &stray_rules)?
+        };
+        for stray in strays {
+            let stray_id = commit_id(stray.id());
+            if stray_id != written_id
+                && write.source != Some(&stray_id)
+                && !write.parents.contains(&stray_id)
+            {
+                tx.repo_mut().record_abandoned_commit(&stray);
+                abandoned_earlier.push(stray_id);
+            }
+        }
     }
     commit_mutation(&repo, tx, write.operation)?;
-    Ok(commit_id(written.id()))
+    Ok(ReleaseWritten {
+        commit: commit_id(written.id()),
+        change: ChangeId::new(written.change_id().to_string()),
+        replaced,
+        abandoned_earlier,
+    })
+}
+
+/// The bookmark a release write moved, and where it publishes.
+struct MovedName<'a> {
+    name: &'a str,
+    publish_remote: Option<&'a str>,
+}
+
+/// Which of `candidates` are visible heads nothing rests on ([`what_keeps`]),
+/// judged in `view_repo`. A candidate this repository cannot resolve (a write
+/// another machine made, or one already gone) is skipped, and so is one that
+/// is hidden or has descendants.
+fn unheld_heads(
+    repo: &Repo,
+    view_repo: &dyn jj_lib::repo::Repo,
+    candidates: &[CommitId],
+    moved: &MovedName<'_>,
+) -> Result<Vec<jj_lib::commit::Commit>, JjError> {
+    let heads = repo.repo.view().heads();
+    let mut unheld: Vec<jj_lib::commit::Commit> = Vec::new();
+    for candidate in candidates {
+        let Ok(commit) = repo.commit(candidate.as_str()) else {
+            continue;
+        };
+        if !heads.contains(commit.id()) || unheld.iter().any(|seen| seen.id() == commit.id()) {
+            continue;
+        }
+        if what_keeps(repo, view_repo, &commit, moved)?.is_none() {
+            unheld.push(commit);
+        }
+    }
+    Ok(unheld)
+}
+
+/// Abandon the unheld heads among `candidates`, as ONE described operation.
+///
+/// The candidates are commits the ledger says knives wrote under release
+/// names now forgotten; one is abandoned when it is a visible head nothing
+/// rests on ([`unheld_heads`]). Returns the abandoned ones.
+pub fn abandon_unheld_writes(
+    repo: &Path,
+    candidates: &[CommitId],
+    operation: &str,
+) -> Result<Vec<CommitId>, JjError> {
+    let repo = Repo::open(repo)?;
+    let moved = MovedName {
+        name: "",
+        publish_remote: None,
+    };
+    let mut tx = repo.repo.start_transaction();
+    let unheld = unheld_heads(&repo, tx.repo(), candidates, &moved)?;
+    if unheld.is_empty() {
+        return Ok(Vec::new());
+    }
+    for commit in &unheld {
+        tx.repo_mut().record_abandoned_commit(commit);
+    }
+    commit_mutation(&repo, tx, operation)?;
+    Ok(unheld.iter().map(|commit| commit_id(commit.id())).collect())
+}
+
+/// Why a replaced release commit must stay, judged in `view_repo` — the
+/// write's transaction, the name already moved — or `None` when nothing else
+/// rests on it.
+///
+/// It stays for a bookmark or tag on it, local or on any remote; a workspace
+/// with it checked out; any visible descendant, a parked working copy
+/// included (the same rule as [`abandon_tagged_copies`]: rewriting a working
+/// copy from here leaves its workspace stale); or anything jj's default rule
+/// pins ([`assert_mutable`]). A commit someone else can still reach by name is
+/// theirs to keep. Two refs do not count: the colocated git view (`@git`),
+/// which shows the moved name at the source until this operation exports
+/// refs, and the moved name's tracked ref on its publish remote, the published
+/// position the next push replaces.
+fn what_keeps(
+    repo: &Repo,
+    view_repo: &dyn jj_lib::repo::Repo,
+    commit: &jj_lib::commit::Commit,
+    moved: &MovedName<'_>,
+) -> Result<Option<String>, JjError> {
+    let id = commit.id();
+    let view = view_repo.view();
+    let mut reasons = Vec::new();
+    let mut named = Vec::new();
+    for (name, targets) in view.bookmarks() {
+        if targets.local_target.added_ids().any(|target| target == id) {
+            reasons.push(format!("bookmark {} points at it", name.as_str()));
+        }
+        for (remote, remote_ref) in &targets.remote_refs {
+            let published_position = name.as_str() == moved.name
+                && moved.publish_remote == Some(remote.as_str())
+                && remote_ref.is_tracked();
+            if *remote != jj_lib::git::REMOTE_NAME_FOR_LOCAL_GIT_REPO
+                && !published_position
+                && remote_ref.target.added_ids().any(|target| target == id)
+            {
+                named.push(format!("{}@{}", name.as_str(), remote.as_str()));
+            }
+        }
+    }
+    for (name, targets) in view.tags() {
+        let remotes = targets
+            .remote_refs
+            .iter()
+            .filter(|(remote, _)| *remote != jj_lib::git::REMOTE_NAME_FOR_LOCAL_GIT_REPO);
+        if targets.local_target.added_ids().any(|target| target == id)
+            || remotes
+                .clone()
+                .any(|(_, remote_ref)| remote_ref.target.added_ids().any(|target| target == id))
+        {
+            named.push(format!("tag {}", name.as_str()));
+        }
+    }
+    if !named.is_empty() {
+        reasons.push(format!("{} names it", named.join(", ")));
+    }
+    let workspaces = checked_out_by(repo, id);
+    if !workspaces.is_empty() {
+        reasons.push(format!(
+            "it is the working copy of {}",
+            workspaces.join(", ")
+        ));
+    }
+    let descendants = repo.descendants_of(id)?;
+    if !descendants.is_empty() {
+        reasons.push(descendants_that_stay(
+            repo,
+            &descendants.iter().collect::<Vec<_>>(),
+        )?);
+    }
+    if let Err(error) = assert_mutable(view_repo, std::slice::from_ref(commit)) {
+        reasons.push(error.to_string());
+    }
+    Ok((!reasons.is_empty()).then(|| reasons.join("; ")))
 }
 
 /// Refuse an empty or repeated parent set before anything is written.
@@ -2667,6 +3013,222 @@ pub fn abandon_commits(repo: &Path, commits: &[CommitId], operation: &str) -> Re
     commit_mutation(&repo, tx, operation)
 }
 
+/// The tagged commits `jj rebase -b <rev> -d <dest>` will copy rather than move.
+///
+/// Those are the visible tagged commits in `roots(dest..rev)::` that are not
+/// ancestors of `rev`: in a fork, earlier published releases resting on member
+/// commits.
+///
+/// A rewrite moves bookmarks, never tags, so each tagged original stays where
+/// it is under its tag and the rebase leaves an untagged copy with the same
+/// change id beside it: what [`abandon_tagged_copies`] cleans up. Ask before
+/// the rebase; afterwards the originals are no longer on the moved branch.
+pub fn tagged_commits_a_rebase_copies(
+    repo: &Path,
+    rev: &str,
+    dest: &CommitId,
+) -> Result<Vec<CommitId>, JjError> {
+    commits_matching(
+        repo,
+        &format!(
+            "(roots({dest}..({rev}))::) & tags() ~ ::({rev})",
+            dest = dest.as_str()
+        ),
+    )
+}
+
+/// A rebase's copy of a tagged commit, and what became of it.
+#[derive(Debug)]
+pub struct TaggedCopy {
+    /// The tagged original, which keeps its commit id.
+    pub original: CommitId,
+    /// The tags on the original.
+    pub tags: Vec<String>,
+    /// The untagged copy the rebase made: same change id, descended from the target.
+    pub copy: CommitId,
+    /// Why the copy was left in place; `None` when it was abandoned.
+    pub kept: Option<String>,
+}
+
+/// Abandon the copies a rebase onto `dest` made of `originals`, as ONE
+/// described operation.
+///
+/// A copy is a visible commit sharing an original's change id that descends
+/// from `dest`. It is abandoned only when nothing rests on it: no local
+/// bookmark, no workspace's working copy, nothing jj's default rule pins
+/// ([`assert_mutable`]), and no descendant that stays — a descendant that is
+/// itself a copy being abandoned does not count, so tagged commits stacked on
+/// each other go together, children first. Otherwise the copy stays, and
+/// [`TaggedCopy::kept`] says why: a commit someone built on, or checked out, is
+/// theirs to decide about. The originals, their tags and every remote ref are
+/// untouched.
+pub fn abandon_tagged_copies(
+    repo: &Path,
+    originals: &[CommitId],
+    dest: &CommitId,
+    operation: &str,
+) -> Result<Vec<TaggedCopy>, JjError> {
+    struct Found {
+        original: CommitId,
+        tags: Vec<String>,
+        commit: jj_lib::commit::Commit,
+        /// Why it stays whatever happens to its descendants.
+        held: Option<String>,
+        descendants: Vec<JjCommitId>,
+    }
+    if originals.is_empty() {
+        return Ok(Vec::new());
+    }
+    let repo = Repo::open(repo)?;
+    let dest = repo.commit(dest.as_str())?.id().clone();
+    let mut found = Vec::new();
+    for original in originals {
+        let original_id = repo.commit(original.as_str())?.id().clone();
+        let tags: Vec<String> = repo
+            .repo
+            .view()
+            .local_tags()
+            .filter(|(_, target)| target.added_ids().any(|id| id == &original_id))
+            .map(|(name, _)| name.as_str().to_owned())
+            .collect();
+        for copy in repo.rewrites_of(original.as_str())? {
+            let commit = repo.commit(copy.as_str())?;
+            if !repo.backend_is_ancestor(&dest, commit.id())? {
+                continue;
+            }
+            let held = match what_holds(&repo, commit.id()) {
+                Some(reason) => Some(reason),
+                None => assert_mutable(repo.repo.as_ref(), std::slice::from_ref(&commit))
+                    .err()
+                    .map(|error| error.to_string()),
+            };
+            let descendants = repo.descendants_of(commit.id())?;
+            found.push(Found {
+                original: original.clone(),
+                tags: tags.clone(),
+                commit,
+                held,
+                descendants,
+            });
+        }
+    }
+    // Children first: a copy goes once everything resting on it goes too.
+    let mut abandoned: BTreeSet<JjCommitId> = BTreeSet::new();
+    loop {
+        let before = abandoned.len();
+        for copy in &found {
+            if copy.held.is_none()
+                && copy
+                    .descendants
+                    .iter()
+                    .all(|descendant| abandoned.contains(descendant))
+            {
+                abandoned.insert(copy.commit.id().clone());
+            }
+        }
+        if abandoned.len() == before {
+            break;
+        }
+    }
+    let mut copies = Vec::with_capacity(found.len());
+    for copy in &found {
+        let kept = if abandoned.contains(copy.commit.id()) {
+            None
+        } else {
+            let staying: Vec<&JjCommitId> = copy
+                .descendants
+                .iter()
+                .filter(|descendant| !abandoned.contains(*descendant))
+                .collect();
+            let mut reasons: Vec<String> = copy.held.iter().cloned().collect();
+            if !staying.is_empty() {
+                reasons.push(descendants_that_stay(&repo, &staying)?);
+            }
+            Some(reasons.join("; "))
+        };
+        copies.push(TaggedCopy {
+            original: copy.original.clone(),
+            tags: copy.tags.clone(),
+            copy: commit_id(copy.commit.id()),
+            kept,
+        });
+    }
+    if !abandoned.is_empty() {
+        let mut tx = repo.repo.start_transaction();
+        for copy in found
+            .iter()
+            .filter(|copy| abandoned.contains(copy.commit.id()))
+        {
+            tx.repo_mut().record_abandoned_commit(&copy.commit);
+        }
+        commit_mutation(&repo, tx, operation)?;
+    }
+    Ok(copies)
+}
+
+/// The workspaces with `id` checked out.
+fn checked_out_by(repo: &Repo, id: &JjCommitId) -> Vec<String> {
+    repo.repo
+        .view()
+        .wc_commit_ids()
+        .iter()
+        .filter(|(_, wc)| *wc == id)
+        .map(|(name, _)| name.as_str().to_owned())
+        .collect()
+}
+
+/// Workspaces with `id` checked out and local bookmarks on it, as one
+/// sentence, or `None` when there are neither.
+fn what_holds(repo: &Repo, id: &JjCommitId) -> Option<String> {
+    let mut reasons = Vec::new();
+    let workspaces = checked_out_by(repo, id);
+    if !workspaces.is_empty() {
+        reasons.push(format!(
+            "it is the working copy of {}",
+            workspaces.join(", ")
+        ));
+    }
+    let bookmarks: Vec<&str> = repo
+        .repo
+        .view()
+        .local_bookmarks_for_commit(id)
+        .map(|(name, _)| name.as_str())
+        .collect();
+    if !bookmarks.is_empty() {
+        reasons.push(format!("bookmark {} points at it", bookmarks.join(", ")));
+    }
+    (!reasons.is_empty()).then(|| reasons.join("; "))
+}
+
+/// "it has descendants, whose heads are …": the newest of `staying`, each
+/// with the workspaces that have it checked out.
+fn descendants_that_stay(repo: &Repo, staying: &[&JjCommitId]) -> Result<String, JjError> {
+    let mut heads = Vec::new();
+    for candidate in staying {
+        let mut is_head = true;
+        for other in staying {
+            if other != candidate && repo.backend_is_ancestor(candidate, other)? {
+                is_head = false;
+                break;
+            }
+        }
+        if is_head {
+            let short = short_id(&candidate.to_string()).to_owned();
+            let workspaces = checked_out_by(repo, candidate);
+            heads.push(if workspaces.is_empty() {
+                short
+            } else {
+                format!("{short}, the working copy of {}", workspaces.join(", "))
+            });
+        }
+    }
+    heads.sort();
+    Ok(format!(
+        "it has descendants, whose heads are {}",
+        heads.join("; ")
+    ))
+}
+
 /// The git repository jj keeps its objects in.
 fn backing_git_dir(repo: &Path) -> Result<PathBuf, JjError> {
     let store = repo.join(".jj/repo/store");
@@ -2742,6 +3304,61 @@ pub fn forget_workspace(repo: &Path, name: &str) -> Result<(), JjError> {
         ],
     )?;
     Ok(())
+}
+
+/// Where jj recorded workspace `name` of `repo`, or `None` when that is
+/// `destination` itself.
+///
+/// Paths compare through symbolic links above them. Errs when jj recorded no
+/// path for the name (a workspace made before jj recorded them).
+///
+/// A workspace name is the repository's, not a path's: a same-named workspace
+/// can live elsewhere (an old `workspaces` root, one added by hand), and
+/// forgetting the name for a vanished directory at `destination` would take
+/// that live one over. Read from the repository's workspace store in process:
+/// jj stores the path relative to `.jj/repo`, and the `jj workspace root` of
+/// the pinned jj refuses to answer once that directory is gone.
+pub fn workspace_recorded_elsewhere(
+    repo: &Path,
+    name: &str,
+    destination: &Path,
+) -> Result<Option<PathBuf>, JjError> {
+    let repo_dir = repo.join(".jj/repo");
+    let no_record = || JjError::Open {
+        path: repo_dir.display().to_string(),
+        detail: format!("Workspace has no recorded path: {name}"),
+    };
+    // Loading a store that does not exist creates an empty one; this only reads.
+    if !repo_dir.join("workspace_store").join("index").is_file() {
+        return Err(no_record());
+    }
+    let store_error = |error: WorkspaceStoreError| JjError::Open {
+        path: repo_dir.display().to_string(),
+        detail: error.to_string(),
+    };
+    let recorded = SimpleWorkspaceStore::load(&repo_dir)
+        .map_err(store_error)?
+        .get_workspace_path(jj_lib::ref_name::WorkspaceName::new(name))
+        .map_err(store_error)?
+        .ok_or_else(no_record)?;
+    let recorded = lexically_normal(&repo_dir.join(recorded));
+    Ok((comparable_path(&recorded) != comparable_path(destination)).then_some(recorded))
+}
+
+/// `path` with `.` and `..` components resolved as written, without touching
+/// the file system: the directory a recorded path names may be gone.
+fn lexically_normal(path: &Path) -> PathBuf {
+    let mut normal = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normal.pop();
+            }
+            other => normal.push(other),
+        }
+    }
+    normal
 }
 
 /// Run a command with a revision checked out, and return its output.

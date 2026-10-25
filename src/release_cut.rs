@@ -8,13 +8,14 @@
 
 use knives::bind::Fork;
 use knives::cli::Exit;
+use knives::commands::claim::Bound;
 use knives::commands::release;
 use knives::forge::github::CliForge;
 use knives::ids::{BookmarkRef, ReleaseScheme, RemoteName, RepoName};
 use knives::ledger::{Draft, Kind, Ledger};
 use knives::release_model::{
-    RecordedCut, StackedHistoryContext, carried_branches, last_recorded_cut, members_event_text,
-    previous_release_for_cut, release_order, trunk_positions,
+    RecordedCut, StackedHistoryContext, carried_branches, last_series_cut, members_event_text,
+    previous_release_for_cut, series_members, trunk_positions,
 };
 
 use super::release_edit::recorded_parents;
@@ -36,7 +37,7 @@ pub(crate) fn run_release(
     fork: &Fork<'_>,
     extra_consumers: &[&std::path::Path],
     invocation: &ReleaseInvocation,
-    bound: Option<&RepoName>,
+    bound: Bound<'_>,
 ) -> anyhow::Result<Exit> {
     let repo = &fork.name;
     let entry = fork.entry;
@@ -52,12 +53,13 @@ pub(crate) fn run_release(
     let heads = knives::consumer_pins::ConsumerHeadMemo::default();
     let opened = knives::jj::Repo::open(path)?;
     let scheme = entry.release_scheme();
-    let (cut_name, allow_drop) = match requested_cut(invocation, &scheme) {
+    let (cut_name, allow_drop) = match requested_cut(invocation, &scheme, entry) {
         Ok(request) => request,
         Err(exit) => return Ok(exit),
     };
     let (mut worst, pins) = release_plan_exit(
         fork,
+        bound.registry,
         &locals,
         &opened,
         &forge,
@@ -69,7 +71,7 @@ pub(crate) fn run_release(
     }
 
     if let Some(name) = cut_name {
-        let trunk_name = entry.upstream_trunk();
+        let trunk_name = entry.trunk_ref();
         let trunk = opened.resolve_commit(&trunk_name)?;
         if let Some(orphaned) = check_orphan_commits_before_cut(&opened, fork)?
             && let Some(exit) = report_orphaned_cut(repo, &orphaned, allow_drop)
@@ -84,8 +86,8 @@ pub(crate) fn run_release(
         // name would be created and taken straight back as superseded in the
         // same command, reported as a success that left nothing behind.
         if let Some((previous_ref, _)) = &previous
-            && matches!(scheme, ReleaseScheme::Dated)
-            && release_order(&name) <= release_order(previous_ref.branch().as_str())
+            && matches!(scheme, ReleaseScheme::Dated | ReleaseScheme::Series(_))
+            && scheme.cut_order(&name) <= scheme.cut_order(previous_ref.branch().as_str())
         {
             println!(
                 "{repo}: refusing to cut {name}: {} is the newest release, so a dated cut takes a name that sorts after it (the reap after a cut keeps only the newest name)",
@@ -107,11 +109,29 @@ pub(crate) fn run_release(
                 release::shared_base(&opened, previous, &trunk)?.unwrap_or_else(|| trunk.clone());
             (carried, members, base)
         } else {
-            let carried = carried_branches(&opened, entry.trunk(), &scheme)?;
+            // The first cut of a series composes only that series' branches:
+            // a branch on another series' base would carry that base in.
+            let (carried, unfit) = series_members(
+                &opened,
+                entry,
+                carried_branches(&opened, entry.trunk(), &scheme)?,
+            )?;
+            if !unfit.is_empty() {
+                for line in &unfit {
+                    println!("{repo}: {line}");
+                }
+                println!(
+                    "{repo}: refusing the first cut of the {}: rebase each branch above onto \
+                     one series' base, or remove its bookmark",
+                    entry.series_label()
+                );
+                return Ok(Exit::Incomplete);
+            }
             if carried.is_empty() {
                 println!(
                     "{repo}: no branches to cut; a release is a flat merge of feature \
-                     and fix branches, and there are none"
+                     and fix branches, and the {} has none",
+                    entry.series_label()
                 );
                 return Ok(Exit::Incomplete);
             }
@@ -140,6 +160,8 @@ pub(crate) fn run_release(
         // record of a parent set that survives the bookmark moving, so every
         // subject is held against it before anything is recorded or published.
         let gate = CompositionGate {
+            ledger: Ledger::for_fork(fork),
+            entry,
             opened: &opened,
             path,
             parents: &request.parents,
@@ -171,9 +193,10 @@ pub(crate) fn run_release(
             if let Some(published) = published
                 && candidate.matches(published.as_str())?
             {
-                let frozen_previous = matches!(scheme, ReleaseScheme::Dated)
-                    && release::repair_effect(&pins, previous_ref.branch(), Some(published))
-                        == release::RepairEffect::NewDatedName;
+                let frozen_previous =
+                    matches!(scheme, ReleaseScheme::Dated | ReleaseScheme::Series(_))
+                        && release::repair_effect(&pins, previous_ref.branch(), Some(published))
+                            == release::RepairEffect::NewDatedName;
                 if frozen_previous {
                     println!(
                         "{repo}: {name} starts identical to {}@{publish_remote} ({}); every pin of {} is frozen, so this new name is the composition to edit — `include`, `advance`, `drop` or `rebase` it before pushing",
@@ -182,8 +205,9 @@ pub(crate) fn run_release(
                         previous_ref.branch()
                     );
                 } else if matches!(scheme, ReleaseScheme::Fixed(_))
+                    // The pulled plan refused on any problem this read finds.
                     && let previous_recorded =
-                        last_recorded_cut(&Ledger::for_repo(repo).entries()?, None)
+                        last_series_cut(&gate.ledger.read()?.entries, entry)
                     && previous_recorded
                         .as_ref()
                         .is_none_or(|recorded| recorded.commit != *published)
@@ -285,11 +309,14 @@ pub(crate) fn run_release(
 fn requested_cut(
     invocation: &ReleaseInvocation,
     scheme: &knives::ids::ReleaseScheme,
+    entry: &knives::config::RepoEntry,
 ) -> Result<(Option<String>, bool), Exit> {
     match invocation {
         ReleaseInvocation::Plan => Ok((None, false)),
         ReleaseInvocation::Cut { name, allow_drop } => {
-            match release::cut_name(scheme, name.as_deref()) {
+            match release::cut_name(scheme, name.as_deref())
+                .and_then(|name| release::clear_of_series_prefixes(entry, name))
+            {
                 Ok(name) => Ok((Some(name), *allow_drop)),
                 Err(message) => {
                     eprintln!("{message}");
@@ -310,6 +337,7 @@ fn requested_cut(
 )]
 fn release_plan_exit(
     fork: &Fork<'_>,
+    registry: &knives::config::Registry,
     locals: &[std::path::PathBuf],
     opened: &knives::jj::Repo,
     forge: &dyn knives::consumer_pins::ConsumerPinSource,
@@ -324,11 +352,10 @@ fn release_plan_exit(
         cache_root,
         heads,
     };
-    let plan = release::plan(fork, &consumers, &Ledger::for_repo(&fork.name).entries()?)?;
+    let plan = release::pulled_plan(fork, registry, &consumers)?;
     println!("{}", release::render(&plan));
     let mut exit = release::exit_for(&plan);
-    if let Some(lag) = release::trunk_lag(opened, plan.release.as_deref(), &entry.upstream_trunk())
-    {
+    if let Some(lag) = release::trunk_lag(opened, plan.release.as_deref(), &entry.trunk_ref()) {
         println!("  !! {lag}");
         exit = exit.worst(Exit::Findings);
     }
@@ -374,6 +401,11 @@ fn report_cut_audit(repo: &RepoName, audit: &release::CutAudit) -> Option<Exit> 
 /// The composition gate's inputs: everything the recorded-member check reads
 /// beside the cut subject.
 struct CompositionGate<'a> {
+    /// The fork's ledger, where the previous cut's composition is recorded.
+    ledger: Ledger,
+    /// The entry as the cut's series selects it: only that series' cuts are
+    /// its previous composition.
+    entry: &'a knives::config::RepoEntry,
     opened: &'a knives::jj::Repo,
     path: &'a std::path::Path,
     parents: &'a [knives::ids::CommitId],
@@ -392,7 +424,8 @@ fn recorded_composition_check(
     gate: &CompositionGate<'_>,
     allow_drop: bool,
 ) -> anyhow::Result<Result<(Option<RecordedCut>, release::CompositionCheck), Exit>> {
-    let recorded = last_recorded_cut(&Ledger::for_repo(repo).entries()?, None);
+    // The pulled plan refused on any problem this read finds.
+    let recorded = last_series_cut(&gate.ledger.read()?.entries, gate.entry);
     let check = match &recorded {
         Some(recorded) => release::uncarried_recorded_members(
             gate.opened,
@@ -436,8 +469,8 @@ enum DropDisposition {
 /// audit's are: a conflicted replay onto a conflicted cut subject answers
 /// nothing either way. A member the cut subject does not carry refuses the cut,
 /// the previous cut's ledger event is the only surviving record of the
-/// composition — every edit moves the bookmark, and the next cut reaps the
-/// superseded commit. A refused candidate was never published and a refused
+/// composition — every edit moves the bookmark and abandons the commit it
+/// replaced. A refused candidate was never published and a refused
 /// record leaves origin as it was, so nothing is abandoned and nothing needs
 /// cleanup.
 fn report_uncarried_cut(
@@ -510,7 +543,7 @@ struct CompletedCut<'a> {
 fn record_cut_event(
     fork: &Fork<'_>,
     cut: &CompletedCut<'_>,
-    bound: Option<&RepoName>,
+    bound: Bound<'_>,
 ) -> anyhow::Result<()> {
     let entry = fork.entry;
     let opened = knives::jj::Repo::open(&fork.checkout.path)?;
@@ -560,6 +593,7 @@ fn record_cut_event(
         subject: Some(cut.name),
         kind: Kind::Event,
         disposition: None,
+        statement: None,
         text: format!(
             "cut {} as {} (change {}) with {} parent(s): {members_text}{delta}",
             cut.name,
@@ -732,17 +766,55 @@ fn refuse_stacked_first_cut(
 fn reap_after_cut(fork: &Fork<'_>) -> anyhow::Result<Exit> {
     let path = &fork.checkout.path;
     let reopened = knives::jj::Repo::open(path)?;
-    let report = release::reap_superseded(path, &reopened, fork.entry.publish_remote())?;
+    let report = release::reap_superseded(
+        path,
+        &reopened,
+        &fork.entry.dated_scheme(),
+        fork.entry.publish_remote(),
+    )?;
     print_reap(fork.name.as_str(), &report);
+    abandon_reaped_writes(fork, &report)?;
     Ok(reap_exit(&report))
+}
+
+/// Abandon the earlier writes of each name the reap just forgot — commits the
+/// ledger records knives writing under it — that are visible heads nothing
+/// rests on: a replaced commit once kept for a working copy that has since
+/// moved on would otherwise stay an anonymous head for good.
+fn abandon_reaped_writes(
+    fork: &Fork<'_>,
+    report: &knives::commands::release::ReapReport,
+) -> anyhow::Result<()> {
+    let names: Vec<&str> = report
+        .reaped
+        .iter()
+        .chain(report.forgotten_only.iter().map(|(name, _)| name))
+        .map(String::as_str)
+        .collect();
+    for name in names {
+        let earlier = super::release_edit::earlier_writes(fork, name)?;
+        let abandoned = knives::jj::abandon_unheld_writes(
+            &fork.checkout.path,
+            &earlier,
+            &format!("knives: {name}: abandon earlier writes nothing rests on"),
+        )?;
+        super::release_edit::report_abandoned_earlier(&fork.name, name, &abandoned);
+    }
+    Ok(())
 }
 
 /// Reap superseded dated cuts on demand.
 pub(crate) fn run_reap(fork: &Fork<'_>) -> anyhow::Result<Exit> {
     let path = &fork.checkout.path;
     let opened = knives::jj::Repo::open(path)?;
-    let report = release::reap_superseded(path, &opened, fork.entry.publish_remote())?;
+    let report = release::reap_superseded(
+        path,
+        &opened,
+        &fork.entry.dated_scheme(),
+        fork.entry.publish_remote(),
+    )?;
     print_reap(fork.name.as_str(), &report);
+    abandon_reaped_writes(fork, &report)?;
     Ok(reap_exit(&report))
 }
 

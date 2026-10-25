@@ -2,7 +2,7 @@
 //!
 //! This command executes `gh` directly, so the usual render/run split does not apply:
 //! there is no knives result to render.
-// allow: SIZE_OK: 1657 lines - single passthrough pipeline; splitting would separate resolution steps that read as one procedure.
+// allow: SIZE_OK: 2741 lines - single passthrough pipeline; splitting would separate resolution steps that read as one procedure.
 use std::collections::BTreeMap;
 use std::io::Read as _;
 use std::os::unix::{
@@ -41,21 +41,20 @@ case "$1" in
         ;;
 esac
 # Pass through every other invocation so gh's writes use the real git unchanged.
-# Unlike the shim, do not use an inherited wrapper-dir variable: stacked gh shims
-# overwrite it, causing wrappers to select each other forever. Skip the current wrapper.
-_self_dir="$(cd "$(dirname "$0")" && pwd)"
-_after_self=false
-IFS=':' read -ra _path_dirs <<< "$PATH"
-for _d in "${_path_dirs[@]}"; do
-    if [[ "$_d" == "$_self_dir" ]]; then
-        _after_self=true
-        continue
-    fi
-    [[ "$_after_self" == true ]] || continue
-    [[ -x "$_d/git" ]] && exec "$_d/git" "$@"
-done
-echo "error: git not found" >&2
-exit 127
+# The next git gets the PATH tail past this directory, not the full PATH: a shim
+# below that finds "the real git" by scanning the whole PATH for content would
+# otherwise pick this wrapper and exec back here forever. This directory comes
+# from $0, not an inherited wrapper-dir variable: stacked gh shims overwrite
+# that, and the wrappers then select each other forever.
+_self_dir="${0%/*}"
+_path=":$PATH:"
+_tail="${_path#*:"$_self_dir":}"
+# Not on PATH, or last on it: an empty PATH would send bash's search to the cwd.
+if [[ "$_tail" == "$_path" || -z "$_tail" ]]; then
+    echo "error: no git past $_self_dir on PATH" >&2
+    exit 127
+fi
+PATH="${_tail%:}" exec git "$@"
 "#;
 
 const DETACHED_BOOKMARK: &str = "__jj_detached__";
@@ -85,36 +84,24 @@ pub fn run(args: &[String]) -> anyhow::Result<std::convert::Infallible> {
         // Verbatim, and before the PR scanner: `gh auth token --hostname pr --user view`
         // would otherwise read as `gh pr view` and die on a bookmark it never needed.
         gh.args(args);
-        std::process::exit(gh_exit_code(&mut gh));
+        std::process::exit(gh_exit_code(&mut gh, None));
     }
     let cwd = std::env::current_dir()?;
-    let token = if std::env::var_os("GH_TOKEN").is_some() {
-        None
-    } else {
-        let resolved = match resolve_target_url(args, &cwd) {
-            Ok(resolved) => resolved,
-            Err(error) => {
-                // A checkout whose git is broken is not an unrouted target:
-                // falling through would run gh on ambient auth, and an agent
-                // session has none, so the agent would see gh's login error
-                // instead of git's.
-                eprintln!("knives gh: {error}");
-                std::process::exit(1);
-            }
-        };
-        match resolved.as_deref().map(mint_token) {
-            Some(Mint::Token(token)) => Some(token),
-            Some(Mint::Refused(code)) => std::process::exit(code),
-            Some(Mint::Unrouted) | None => None,
-        }
-    };
-    if let Some(token) = token {
+    // The target a watching call re-mints for when it outlives its token; only a
+    // token knives minted can be renewed, never an inherited GH_TOKEN.
+    let renew = if std::env::var_os("GH_TOKEN").is_none()
+        && let Some((token, target)) = routed_token(args, &cwd)
+    {
         gh.env("GH_TOKEN", token);
-    }
+        restarts_on_fresh_token(args).then_some(target)
+    } else {
+        None
+    };
+    let renew = renew.as_deref();
 
     let Some((subcommand, _)) = pr_subcommand(args) else {
         gh.args(args);
-        std::process::exit(gh_exit_code(&mut gh));
+        std::process::exit(gh_exit_code(&mut gh, renew));
     };
     // Unlike the shim, non-PR calls bypass this read-only probe: only PR calls use
     // its result, so delaying it preserves gh arguments while avoiding needless work.
@@ -128,7 +115,7 @@ pub fn run(args: &[String]) -> anyhow::Result<std::convert::Infallible> {
         .is_ok_and(|status| status.success());
     if !in_jj_repo {
         gh.args(args);
-        std::process::exit(gh_exit_code(&mut gh));
+        std::process::exit(gh_exit_code(&mut gh, renew));
     }
 
     let bookmark = current_bookmark(&cwd);
@@ -138,8 +125,10 @@ pub fn run(args: &[String]) -> anyhow::Result<std::convert::Infallible> {
                 die_no_bookmark();
             };
             let mut arguments = args.to_vec();
-            arguments.push("--head".to_owned());
-            arguments.push(bookmark.to_owned());
+            // Before a `--` terminator: after it gh reads every word as a positional.
+            let end = before_terminator(args).len();
+            arguments.insert(end, bookmark.to_owned());
+            arguments.insert(end, "--head".to_owned());
             arguments
         }
         "view" | "checks" | "diff" | "merge" | "checkout" | "edit" | "comment" | "ready"
@@ -159,33 +148,209 @@ pub fn run(args: &[String]) -> anyhow::Result<std::convert::Infallible> {
         let git = wrapper.path().join("git");
         std::fs::write(&git, GIT_WRAPPER)?;
         std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755))?;
-        let mut path = wrapper.path().as_os_str().to_os_string();
+        // The wrapper finds its own PATH entry by string comparison with `${0%/*}`, and
+        // gh (Go's `exec.LookPath`) hands it a lexically cleaned `$0`; a TMPDIR spelled
+        // `/tmp//` or `/tmp/./` would otherwise never match. Collecting the components
+        // is that same cleaning.
+        let mut path = wrapper
+            .path()
+            .components()
+            .collect::<PathBuf>()
+            .into_os_string();
         path.push(":");
         path.push(std::env::var_os("PATH").unwrap_or_default());
         gh.args(&arguments).env("PATH", path).env(
             "_JJ_BOOKMARK",
             bookmark.as_deref().unwrap_or(DETACHED_BOOKMARK),
         );
-        gh_exit_code(&mut gh)
+        gh_exit_code(&mut gh, renew)
     };
     std::process::exit(exit_code);
 }
 
+/// The App token this call runs with and the target it was minted for, or None
+/// to leave gh on its own auth. Exits instead when the checkout's git cannot be
+/// read or the helper refuses.
+fn routed_token(args: &[String], cwd: &Path) -> Option<(String, String)> {
+    let resolved = match resolve_target_url(args, cwd) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            // A checkout whose git is broken is not an unrouted target:
+            // falling through would run gh on ambient auth, and an agent
+            // session has none, so the agent would see gh's login error
+            // instead of git's.
+            eprintln!("knives gh: {error}");
+            std::process::exit(1);
+        }
+    };
+    if let (None, Some(remedy)) = (&resolved, no_target_remedy(args)) {
+        eprintln!(
+            "knives gh: no target repository (no -R/--repo flag, no <owner>/<repo> argument, no owner in the api path, and no GitHub remote in {}); {remedy} Setting GH_TOKEN bypasses App routing.",
+            cwd.display()
+        );
+    }
+    let target = resolved?;
+    match mint_token(&target, required_token_lifetime(args)) {
+        Mint::Token(token) => Some((token, target)),
+        Mint::Refused(code) => std::process::exit(code),
+        Mint::Unrouted => None,
+    }
+}
+
+/// What names a repository for this command when nothing routed it, or None for
+/// a local command that runs with no login and so needs no target. Only
+/// the commands in the `-R` arm take `-R`; gh rejects it elsewhere as an unknown
+/// flag. Account-wide commands have no repository to route by, and an App token
+/// cannot run them, so they get no `GH_REPO` advice: following it would fail, or
+/// fall back to a personal token.
+fn no_target_remedy(args: &[String]) -> Option<&'static str> {
+    let mut words = before_terminator(args)
+        .iter()
+        .filter(|argument| !argument.starts_with('-'))
+        .map(String::as_str);
+    let remedy = match (words.next(), words.next()) {
+        (None | Some("alias" | "config" | "completion" | "licenses" | "help"), _)
+        | (Some("skill"), Some("list"))
+        | (Some("attestation"), Some("trusted-root")) => return None,
+        (
+            Some(
+                "pr" | "issue" | "release" | "run" | "workflow" | "label" | "cache" | "secret"
+                | "variable" | "ruleset" | "browse" | "codespace" | "discussion",
+            ),
+            _,
+        )
+        | (Some("repo"), Some("autolink" | "deploy-key" | "rename" | "read-file" | "read-dir"))
+        | (Some("search"), Some("issues" | "prs" | "code" | "commits"))
+        | (Some("attestation"), Some("download" | "verify"))
+        | (Some("project"), Some("link" | "unlink"))
+        | (Some("agent-task"), Some("create" | "view")) => {
+            "pass -R <owner>/<repo>, or run from a checkout of it."
+        }
+        (Some("repo"), Some(subcommand)) if repo_value_flags(subcommand).is_some() => {
+            "name the repository as <owner>/<repo> (gh repo view <owner>/<repo>, gh repo clone <owner>/<repo>)."
+        }
+        (Some("gist" | "ssh-key" | "gpg-key" | "org" | "status"), _) => {
+            "no repository routes this command, an App token cannot run it, and agent sessions have no ambient login."
+        }
+        (Some("api"), _) => {
+            "gh api takes no -R: put the owner in the path (gh api repos/<owner>/<repo>, gh api 'orgs/<org>/repos?per_page=100' --paginate), or set GH_REPO=<owner>/<repo>."
+        }
+        (Some("repo"), _) => {
+            "gh repo takes no -R here: set GH_REPO and name the owner (GH_REPO=<owner>/<repo> gh repo list <owner>), or use gh api repos/<owner>/<repo> or gh api 'orgs/<org>/repos?per_page=100' --paginate."
+        }
+        _ => {
+            "this command takes no -R: set GH_REPO=<owner>/<repo>, and name the repository where the command takes one."
+        }
+    };
+    Some(remedy)
+}
+
 /// Waits for gh while preserving its interactive terminal ownership and exit code.
-fn gh_exit_code(gh: &mut Command) -> i32 {
+///
+/// A watching call whose token knives minted for `renew` outlives no token:
+/// gh reads `GH_TOKEN` once, and an installation token lives an hour. So that
+/// call runs for [`WATCH_RESTART_AFTER`] at most; then knives ends it, mints a
+/// fresh token, says so in one stderr line, and runs the same command again.
+/// The last run's status is the call's, so `--exit-status` and gh's own exit
+/// codes are kept.
+fn gh_exit_code(gh: &mut Command, renew: Option<&str>) -> i32 {
     gh.stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .map_or_else(
-            |_| {
-                // This maps every spawn failure to 127; unlike bash, it does not
-                // distinguish an inaccessible executable with exit code 126.
-                eprintln!("knives gh: real gh not found");
-                127
-            },
-            exit_code,
-        )
+        .stderr(Stdio::inherit());
+    let Some(target) = renew else {
+        return gh.status().map_or_else(|_| gh_not_found(), exit_code);
+    };
+    let after = watch_restart_after();
+    loop {
+        if let Some(code) = exit_code_within(gh, after) {
+            return code;
+        }
+        leave_alternate_screen();
+        match mint_token(target, WATCH_TOKEN_LIFETIME) {
+            Mint::Token(token) => {
+                gh.env("GH_TOKEN", token);
+            }
+            Mint::Refused(code) => return code,
+            Mint::Unrouted => {
+                eprintln!(
+                    "knives gh: the watch outlived its App token and gh-app-token no longer answers for {target}"
+                );
+                return 1;
+            }
+        }
+        eprintln!(
+            "knives gh: the watch ran {}s on one App token; running it again on a fresh one",
+            after.as_secs()
+        );
+    }
+}
+
+/// How often a watching gh is checked for its exit: the most a watch's own end
+/// is delayed in reaching the caller.
+const WATCH_POLL: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// gh's exit code, or None when it was still running after `after` and knives
+/// ended it (SIGTERM: gh keeps no state a restart needs, and unlike SIGINT it
+/// cannot pass for gh's own exit 1). One owner checks, signals and reaps, so
+/// the signal can only reach this gh: until `try_wait` reaps it, its pid is
+/// held, and no other thread can reap it in between.
+fn exit_code_within(gh: &mut Command, after: std::time::Duration) -> Option<i32> {
+    let Ok(mut child) = gh.spawn() else {
+        return Some(gh_not_found());
+    };
+    let deadline = std::time::Instant::now() + after;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() < deadline => std::thread::sleep(WATCH_POLL),
+            Ok(None) => {
+                let pid = rustix::process::Pid::from_child(&child);
+                // Unreaped, so the pid is still this gh's; if it ended just now,
+                // its own status decides below.
+                let _ = rustix::process::kill_process(pid, rustix::process::Signal::TERM);
+                let Ok(status) = child.wait() else {
+                    return Some(gh_not_found());
+                };
+                let terminated = status.signal() == Some(rustix::process::Signal::TERM.as_raw());
+                return (!terminated).then(|| exit_code(status));
+            }
+            Err(_) => return Some(gh_not_found()),
+        }
+    };
+    Some(exit_code(status))
+}
+
+/// Leaves the alternate screen a terminated gh left the terminal in: gh enters
+/// it for a watch on a terminal and leaves it only on its own exit or SIGINT.
+/// Only on a terminal, where leaving a screen not entered does nothing; a
+/// redirected stdout gets no control bytes.
+fn leave_alternate_screen() {
+    use std::io::{IsTerminal as _, Write as _};
+    let mut stdout = std::io::stdout();
+    if stdout.is_terminal() {
+        let _ = stdout.write_all(b"\x1b[?1049l");
+        let _ = stdout.flush();
+    }
+}
+
+/// This maps every spawn failure to 127; unlike bash, it does not distinguish
+/// an inaccessible executable with exit code 126.
+fn gh_not_found() -> i32 {
+    eprintln!("knives gh: real gh not found");
+    127
+}
+
+/// How long one run of a watching call may use its token:
+/// [`WATCH_RESTART_AFTER`], or a positive `KNIVES_GH_WATCH_RESTART_SECS` (tests
+/// and a smoke check use a few seconds).
+fn watch_restart_after() -> std::time::Duration {
+    std::time::Duration::from_secs(
+        std::env::var("KNIVES_GH_WATCH_RESTART_SECS")
+            .ok()
+            .and_then(|seconds| seconds.parse().ok())
+            .filter(|seconds| *seconds > 0)
+            .unwrap_or(WATCH_RESTART_AFTER),
+    )
 }
 
 /// The shell's view of a child's status: its exit code, or 128 + the signal that killed it.
@@ -214,6 +379,11 @@ fn die_no_bookmark() -> ! {
 /// `--ignore-working-copy`: bookmarks ride on `@` through a snapshot, so the answer
 /// is the same without one, and a snapshot would take the repository-wide jj lock.
 /// A `git checkout` made behind jj's back is not seen until the next jj command.
+///
+/// Names only: rendering the bookmark objects themselves appends jj's status marks
+/// (`feat/x*` for a bookmark ahead of its remote, `feat/x??` for a conflicted one), and
+/// the charset check below would then read a real bookmark as none. Local bookmarks
+/// only: a remote-only `feat/x@origin` on `@` is not a head gh can name.
 pub(crate) fn current_bookmark(cwd: &Path) -> Option<String> {
     let output = Command::new("jj")
         .current_dir(cwd)
@@ -224,7 +394,7 @@ pub(crate) fn current_bookmark(cwd: &Path) -> Option<String> {
             "@",
             "--no-graph",
             "-T",
-            "self.bookmarks()",
+            r#"local_bookmarks.map(|bookmark| bookmark.name()).join(" ")"#,
         ])
         .output()
         .ok()?;
@@ -246,7 +416,7 @@ pub(crate) fn current_bookmark(cwd: &Path) -> Option<String> {
 /// The `gh pr <subcommand>` this invocation is, skipping flags (shim lines 308-329).
 pub(crate) fn pr_subcommand(args: &[String]) -> Option<(String, usize)> {
     let mut found_pr = false;
-    for (index, argument) in args.iter().enumerate() {
+    for (index, argument) in before_terminator(args).iter().enumerate() {
         if found_pr {
             if !argument.starts_with('-') {
                 return Some((argument.clone(), index));
@@ -260,69 +430,67 @@ pub(crate) fn pr_subcommand(args: &[String]) -> Option<(String, usize)> {
 
 /// Whether a positional target follows `subcommand` (shim lines 343-384).
 pub(crate) fn has_positional_target(subcommand: &str, args: &[String]) -> bool {
-    let mut found_subcommand = false;
+    before_terminator(args)
+        .iter()
+        .position(|argument| argument == subcommand)
+        .and_then(|at| positional_after(args, at))
+        .is_some()
+}
+
+/// The first positional after the subcommand at index `at`, skipping flags and
+/// the values of the flags that take one, or the first word after `--`.
+fn positional_after(args: &[String], at: usize) -> Option<&str> {
+    let flags = before_terminator(args);
+    let subcommand = flags.get(at)?.as_str();
     let mut previous_was_value_flag = false;
-    for argument in args {
-        if previous_was_value_flag {
-            previous_was_value_flag = false;
+    for argument in flags.iter().skip(at + 1) {
+        if std::mem::take(&mut previous_was_value_flag) {
             continue;
         }
-        if found_subcommand {
-            if argument.starts_with('-') {
-                if !argument.contains('=')
-                    && matches!(
-                        argument.as_str(),
-                        "-R" | "--repo"
-                            | "-q"
-                            | "--jq"
-                            | "-t"
-                            | "--template"
-                            | "--json"
-                            | "-b"
-                            | "--body"
-                            | "-F"
-                            | "--body-file"
-                            | "--branch"
-                            | "-c"
-                            | "--comment"
-                            | "-r"
-                            | "--reason"
-                            | "--color"
-                            | "-i"
-                            | "--interval"
-                            | "--subject"
-                            | "--match-head-commit"
-                            | "--author-email"
-                            | "-A"
-                            | "-l"
-                            | "--label"
-                            | "-m"
-                            | "--milestone"
-                            | "-p"
-                            | "--project"
-                            | "--reviewer"
-                            | "--assignee"
-                            | "-T"
-                            | "--title"
-                            | "--recover"
-                    )
-                {
-                    previous_was_value_flag = true;
-                }
-                continue;
-            }
-            return true;
+        if !argument.starts_with('-') {
+            return Some(argument);
         }
-        if argument == subcommand {
-            found_subcommand = true;
-        }
+        previous_was_value_flag = takes_value(argument)
+            || matches!(
+                (subcommand, argument.as_str()),
+                ("checks", "-i") | ("edit", "-m" | "-p") | (_, "--json" | "-t" | "--template")
+            );
     }
-    false
+    // Words after `--` are positionals.
+    args.get(flags.len() + 1).map(String::as_str)
+}
+
+/// The command group and subcommand a call names, with the subcommand's index:
+/// its first two words that are neither flags nor a flag's value (`gh -R
+/// acme/widgets pr view` is `pr view`). gh's aliases of `agent-task`
+/// (`agent-tasks`, `agent`, `agents`) read as it.
+fn command_words(args: &[String]) -> Option<(&str, usize, &str)> {
+    let mut group = None;
+    let mut previous_was_value_flag = false;
+    for (index, argument) in before_terminator(args).iter().enumerate() {
+        if std::mem::take(&mut previous_was_value_flag) {
+            continue;
+        }
+        if argument.starts_with('-') {
+            previous_was_value_flag = takes_value(argument);
+            continue;
+        }
+        let Some(group) = group else {
+            group = Some(match argument.as_str() {
+                "agent-tasks" | "agent" | "agents" => "agent-task",
+                word => word,
+            });
+            continue;
+        };
+        return Some((group, index, argument.as_str()));
+    }
+    None
 }
 
 /// Whether the caller already supplied `--head` (shim lines 332-339).
 pub(crate) fn has_head_flag(args: &[String]) -> bool {
-    args.iter()
+    before_terminator(args)
+        .iter()
         .any(|argument| argument == "--head" || argument.starts_with("--head="))
 }
 
@@ -424,13 +592,8 @@ pub(crate) fn normalize_url(url: &str) -> Option<String> {
         return None;
     }
     let mut url = url.to_owned();
-    // SSH scp-form git@host:owner/repo -> https://host/owner/repo
-    if let Some(rest) = url.strip_prefix("git@")
-        && let Some((host, path)) = rest.split_once(':')
-        && !host.is_empty()
-        && !path.is_empty()
-    {
-        url = format!("https://{host}/{path}");
+    if let Some(https) = scp_url(&url) {
+        url = https;
     }
     if let Some(rest) = url.strip_prefix("ssh://git@") {
         url = format!("https://{rest}");
@@ -445,12 +608,27 @@ pub(crate) fn normalize_url(url: &str) -> Option<String> {
     Some(url)
 }
 
-/// An https URL from a gh repo spec: URL, host/owner/repo, or owner/repo (lines 59-73).
+/// An scp-form `[user@]host:owner/repo` as `https://host/owner/repo`, read the
+/// way git (and gh's clone) read it: no `://`, and no `/` before the first `:`.
+fn scp_url(url: &str) -> Option<String> {
+    if url.contains("://") {
+        return None;
+    }
+    let (user_host, path) = url.split_once(':')?;
+    let host = user_host
+        .rsplit_once('@')
+        .map_or(user_host, |(_, host)| host);
+    (!host.is_empty() && !user_host.contains('/') && !path.is_empty())
+        .then(|| format!("https://{host}/{path}"))
+}
+
+/// An https URL from a gh repo spec: URL, scp-form `[user@]host:owner/repo`,
+/// host/owner/repo, or owner/repo (lines 59-73).
 pub(crate) fn url_from_spec(spec: &str) -> Option<String> {
     if spec.is_empty() {
         return None;
     }
-    if spec.contains("://") {
+    if spec.contains("://") || scp_url(spec).is_some() {
         return normalize_url(spec);
     }
     let slashes = spec.matches('/').count();
@@ -492,6 +670,82 @@ pub(crate) fn is_auth_command(args: &[String]) -> bool {
     args.first().map(String::as_str) == Some("auth")
 }
 
+/// Seconds the token an ordinary gh call starts with must stay valid. gh reads
+/// `GH_TOKEN` once and holds it for the whole call, so a token about to expire
+/// fails the call partway with `HTTP 401: Bad credentials`; half an hour covers
+/// a large `gh run download` or a paginated `gh api` sweep.
+const CALL_TOKEN_LIFETIME: u64 = 30 * 60;
+
+/// Seconds a watching call's token must stay valid: a fresh installation
+/// token's whole hour, since a watch runs as long as the thing it watches.
+/// 2026-10-22: `gh run watch` was handed a cached token with twelve minutes
+/// left and died with 401 after 720 s, while watches handed fresher tokens
+/// ran 25-40 minutes.
+const WATCH_TOKEN_LIFETIME: u64 = 60 * 60;
+
+/// Seconds a watching call runs on one token before knives restarts it on a
+/// fresh one: five minutes short of [`WATCH_TOKEN_LIFETIME`], so a token the
+/// helper minted a moment before gh started is still valid at the restart.
+const WATCH_RESTART_AFTER: u64 = WATCH_TOKEN_LIFETIME - 5 * 60;
+
+/// The variable that tells `gh-app-token` how many seconds the token it returns
+/// must stay valid; it mints afresh rather than reuse a cached token with less.
+const MIN_LIFETIME_ENV: &str = "GH_APP_TOKEN_MIN_LIFETIME";
+
+/// How long this call's token must stay valid: [`WATCH_TOKEN_LIFETIME`] for a
+/// call that watches, [`CALL_TOKEN_LIFETIME`] for every other.
+fn required_token_lifetime(args: &[String]) -> u64 {
+    if is_watch(args) {
+        WATCH_TOKEN_LIFETIME
+    } else {
+        CALL_TOKEN_LIFETIME
+    }
+}
+
+/// Whether this call watches until something finishes: `gh run watch`, `gh pr
+/// checks --watch`, `gh agent-task create|view --follow`.
+fn is_watch(args: &[String]) -> bool {
+    let flags = before_terminator(args);
+    match command_words(args) {
+        Some(("run", _, "watch")) => true,
+        Some(("pr", _, "checks")) => bool_flag_set(flags, "--watch"),
+        Some(("agent-task", _, "create" | "view")) => bool_flag_set(flags, "--follow"),
+        _ => false,
+    }
+}
+
+/// Whether a watch may be ended and run again on a fresh token: one whose
+/// rerun repeats nothing but the waiting, `gh run watch` and `gh pr checks
+/// --watch`, each of which shows the current state afresh. Never `gh
+/// agent-task … --follow`: gh refuses every agent-task command on any token
+/// but a device-flow OAuth login (gh 2.98 `agent-task/agent_task.go`
+/// `requireOAuthToken`: an App token in `GH_TOKEN` fails before anything
+/// runs), so no App-token follow ever reaches an hour; and a rerun would be
+/// wrong anyway, since `create` submits a second task and `view` prints the
+/// whole session log again (gh keeps its place in the log only in memory).
+fn restarts_on_fresh_token(args: &[String]) -> bool {
+    is_watch(args) && !matches!(command_words(args), Some(("agent-task", _, _)))
+}
+
+/// Whether boolean flag `name` ends up set, as pflag reads it: the last of
+/// `--name` and `--name=<bool>` wins, with `strconv.ParseBool`'s spellings (gh
+/// rejects any other value, so it leaves the flag as it was).
+fn bool_flag_set(flags: &[String], name: &str) -> bool {
+    flags.iter().fold(false, |set, flag| {
+        if flag == name {
+            return true;
+        }
+        match flag
+            .strip_prefix(name)
+            .and_then(|rest| rest.strip_prefix('='))
+        {
+            Some("1" | "t" | "T" | "true" | "TRUE" | "True") => true,
+            Some("0" | "f" | "F" | "false" | "FALSE" | "False") => false,
+            _ => set,
+        }
+    })
+}
+
 /// Asks git's routed credential helper for the token gh should run with.
 ///
 /// Reads git's own credential config and speaks the credential-helper protocol
@@ -510,7 +764,11 @@ pub(crate) fn is_auth_command(args: &[String]) -> bool {
 /// password on a failing path. Only an exit-0 UTF-8 answer with no password is
 /// [`Mint::Unrouted`], like a host no helper is configured for; an exit-0 answer
 /// knives cannot read is a refusal, not a fall-through to gh's own auth.
-pub(crate) fn mint_token(target_url: &str) -> Mint {
+///
+/// The helper is told how long the token must stay valid (`min_lifetime`
+/// seconds, through [`MIN_LIFETIME_ENV`]): it caches tokens and would otherwise
+/// hand out one with as little as five minutes left.
+pub(crate) fn mint_token(target_url: &str, min_lifetime: u64) -> Mint {
     let Some(path) = credential_path(target_url) else {
         return Mint::Unrouted;
     };
@@ -538,6 +796,7 @@ pub(crate) fn mint_token(target_url: &str) -> Mint {
     let request = format!("protocol=https\nhost={DEFAULT_HOST}\npath={path}\n\n");
     let mut child = match Command::new("gh-app-token")
         .args([profile, "get"])
+        .env(MIN_LIFETIME_ENV, min_lifetime.to_string())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -581,7 +840,7 @@ pub(crate) fn mint_token(target_url: &str) -> Mint {
         .map_or(Mint::Unrouted, Mint::Token)
 }
 
-/// The owner a `gh api` invocation targets, or None when it carries no signal.
+/// The owner a `gh api` or `gh search` invocation targets, or None when it carries no signal.
 ///
 /// These invocations often run outside the target repo's checkout and carry no
 /// -R, so remote-based resolution would route the token to the wrong owner —
@@ -589,6 +848,9 @@ pub(crate) fn mint_token(target_url: &str) -> Mint {
 /// GraphQL mutations genuinely have no signal; `gh-app-token` honors
 /// `GH_APP_OWNER` for those, which is out of knives' hands.
 pub(crate) fn owner_from_api_args(args: &[String]) -> Option<String> {
+    if args.first().map(String::as_str) == Some("search") {
+        return search_owner_flag(args);
+    }
     if args.first().map(String::as_str) != Some("api") {
         return None;
     }
@@ -612,6 +874,7 @@ pub(crate) fn owner_from_api_args(args: &[String]) -> Option<String> {
     // accept `owner:"acme'`, while we require matching quotes (mismatched quotes are
     // invalid GraphQL); its sequential prefix stripping maps `repos/orgs/foo` to
     // `foo`, while we yield `orgs` (those apparent path owners are GitHub-reserved).
+    let args = before_terminator(args);
     let joined = args.join(" ");
     // LEFTMOST match wins across BOTH patterns — the shim's single alternation
     // regex returns the first match in the text, so a query naming
@@ -629,6 +892,105 @@ pub(crate) fn owner_from_api_args(args: &[String]) -> Option<String> {
         Some((_, GraphqlValue::Variable(name))) => field_argument(args, &name),
         None => None,
     }
+}
+
+/// Flags that take their value as the next argument when written without `=`,
+/// in every gh command that has them. gh (pflag) reads that next argument as the
+/// value even when it is `--`. Only flags that take a value in every gh command
+/// that has them are listed: a flag that is boolean somewhere (`-c`, `-r`, `-m`,
+/// `-p`, `-i`, `-l`, `-t`, `--json`, `--template`, `--status`, `--user`,
+/// `--comment`) would swallow a real terminator there. `has_positional_target`
+/// adds the PR subcommands' own readings of those.
+const VALUE_FLAGS: &[&str] = &[
+    "-R",
+    "--repo",
+    "--owner",
+    "-q",
+    "--jq",
+    "-b",
+    "--body",
+    "-F",
+    "--body-file",
+    "--branch",
+    "--reason",
+    "--color",
+    "--interval",
+    "--subject",
+    "--match-head-commit",
+    "--author-email",
+    "-A",
+    "--label",
+    "--milestone",
+    "--project",
+    "--reviewer",
+    "--assignee",
+    "-T",
+    "--title",
+    "--recover",
+    "--notes",
+    "--notes-file",
+    "--head",
+    "-H",
+    "--base",
+    "-B",
+    "--limit",
+    "-L",
+    "--search",
+    "-S",
+    "--author",
+    "--method",
+    "-X",
+    "--hostname",
+    "--field",
+    "--raw-field",
+    "--header",
+    "--input",
+    "--cache",
+    "--ref",
+    "--workflow",
+    "--event",
+    "--team",
+    "--commenter",
+];
+
+fn takes_value(flag: &str) -> bool {
+    VALUE_FLAGS.contains(&flag)
+}
+
+/// The arguments gh parses as flags: everything before the first `--` that
+/// gh takes as a terminator. After it gh reads every word as a positional (a
+/// search term, say), so owner scans read flags only and a search for the words
+/// `--owner acme` routes nowhere. A `--` directly after a value-taking flag
+/// without `=` is that flag's value, not a terminator: `--body -- -R acme/x`
+/// still targets acme/x.
+fn before_terminator(args: &[String]) -> &[String] {
+    let mut index = 0;
+    while let Some(argument) = args.get(index) {
+        if argument == "--" {
+            return args.get(..index).unwrap_or(args);
+        }
+        index += if takes_value(argument) { 2 } else { 1 };
+    }
+    args
+}
+
+/// The first `--owner` value of a `gh search` call (`--owner x` or `--owner=x`)
+/// when it is owner-shaped. `--repo` is read by `repo_flag`.
+fn search_owner_flag(args: &[String]) -> Option<String> {
+    let args = before_terminator(args);
+    let mut index = 1;
+    while let Some(argument) = args.get(index) {
+        let value = if argument == "--owner" {
+            args.get(index + 1).map(String::as_str)
+        } else {
+            argument.strip_prefix("--owner=")
+        };
+        if let Some(value) = value {
+            return is_owner_shaped(value).then(|| value.to_owned());
+        }
+        index += 1;
+    }
+    None
 }
 
 /// The value bound to GraphQL variable `name` by a `gh api` field argument, in
@@ -672,8 +1034,8 @@ fn is_owner_shaped(value: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
-/// The repository a command targets when its arguments carry no `-R`: gh's own
-/// `GH_REPO` override, applied whenever it is set and `-R` is absent, inside a
+/// The repository a command targets when its arguments name none (no `-R`, no
+/// `gh repo` repository positional): gh's own `GH_REPO` override, inside a
 /// checkout or not (shim parity has no equivalent; the shim predates scripts
 /// that target by environment).
 fn gh_repo_environment() -> Option<String> {
@@ -682,8 +1044,132 @@ fn gh_repo_environment() -> Option<String> {
         .filter(|spec| !spec.is_empty())
 }
 
+/// The flags that take a value in each `gh repo` subcommand whose first
+/// positional is the repository it acts on (gh 2.98 `--help`, the hidden
+/// `garden` and `credits` included), or None for the other subcommands:
+/// `rename`'s positional is the new name and `list`'s an owner.
+fn repo_value_flags(subcommand: &str) -> Option<&'static [&'static str]> {
+    Some(match subcommand {
+        "view" => &["-b", "--branch", "-q", "--jq", "--json", "-t", "--template"],
+        "clone" => &["-u", "--upstream-remote-name"],
+        "fork" => &["--fork-name", "--org", "--remote-name"],
+        "edit" => &[
+            "--add-topic",
+            "--default-branch",
+            "-d",
+            "--description",
+            "-h",
+            "--homepage",
+            "--remove-topic",
+            "--squash-merge-commit-message",
+            "--visibility",
+        ],
+        "sync" => &["-b", "--branch", "-s", "--source"],
+        "delete" | "archive" | "unarchive" | "set-default" | "garden" | "credits" => &[],
+        _ => return None,
+    })
+}
+
+/// A `gh repo view|clone|fork|…` call: one of the subcommands whose first
+/// positional is the repository it acts on. gh rejects `-R` on all of them, so
+/// a `-R` or `--repo=` word there is some flag's value and never the target.
+struct RepoSubcommand<'a> {
+    /// The subcommand's index in the arguments.
+    at: usize,
+    name: &'a str,
+    value_flags: &'static [&'static str],
+}
+
+/// The `gh repo` subcommand this call is, when it is one that takes a
+/// repository positional.
+fn repo_subcommand(args: &[String]) -> Option<RepoSubcommand<'_>> {
+    let mut words = before_terminator(args)
+        .iter()
+        .enumerate()
+        .filter(|(_, argument)| !argument.starts_with('-'));
+    if words.next().map(|(_, word)| word.as_str()) != Some("repo") {
+        return None;
+    }
+    let (at, name) = words.next()?;
+    Some(RepoSubcommand {
+        at,
+        name,
+        value_flags: repo_value_flags(name)?,
+    })
+}
+
+/// The target a [`RepoSubcommand`] call names, if any: its first positional,
+/// the repository gh acts on whatever the checkout or `GH_REPO` says. gh reads
+/// the first word after `--` as that positional too (`gh repo view --
+/// acme/widgets`). A bare name is a repository of the caller's own account,
+/// whose owner knives cannot know, so only a spec with an owner counts.
+/// `gh repo fork --org ORG` creates the fork in ORG, so ORG is its target, by
+/// owner alone as a `gh api` path owner is.
+fn repo_subcommand_target(args: &[String], subcommand: &RepoSubcommand<'_>) -> Option<String> {
+    let mut positional = None;
+    let mut org = None;
+    let mut rest = args.iter().skip(subcommand.at + 1);
+    while let Some(argument) = rest.next() {
+        if argument == "--" {
+            positional = positional.or_else(|| rest.next());
+            break;
+        }
+        if subcommand.name == "fork" {
+            // pflag keeps the last value of a repeated string flag.
+            if argument == "--org" {
+                org = rest.next().map(String::as_str);
+                continue;
+            }
+            if let Some(value) = argument.strip_prefix("--org=") {
+                org = Some(value);
+                continue;
+            }
+        }
+        if leaves_value_to_next(subcommand.value_flags, argument) {
+            rest.next();
+        } else if !argument.starts_with('-') {
+            positional = positional.or(Some(argument));
+        }
+    }
+    if let Some(org) = org.filter(|org| is_owner_shaped(org)) {
+        return Some(format!("{org}/gh-api"));
+    }
+    positional.filter(|spec| spec.contains('/')).cloned()
+}
+
+/// Whether `argument` takes the next argument as its value: one of
+/// `value_flags` written alone, or a cluster of short flags (`-wb main`) whose
+/// first value-taking letter is its last. A value letter inside the cluster
+/// takes the rest of it as its value (`-bmain`), as pflag reads it.
+fn leaves_value_to_next(value_flags: &[&str], argument: &str) -> bool {
+    if value_flags.contains(&argument) {
+        return true;
+    }
+    let Some(letters) = argument
+        .strip_prefix('-')
+        .filter(|letters| !letters.starts_with('-'))
+    else {
+        return false;
+    };
+    letters
+        .char_indices()
+        .map(|(index, letter)| {
+            (
+                index + letter.len_utf8(),
+                &letters[index..index + letter.len_utf8()],
+            )
+        })
+        .find(|(_, letter)| {
+            value_flags
+                .iter()
+                .any(|flag| flag.strip_prefix('-') == Some(*letter))
+        })
+        .is_some_and(|(end, _)| end == letters.len())
+}
+
 /// The value of the first explicit repository flag (shim lines 137-150).
 pub(crate) fn repo_flag(args: &[String]) -> Option<String> {
+    let args = before_terminator(args);
     let mut index = 0;
     while let Some(argument) = args.get(index) {
         match argument.as_str() {
@@ -706,14 +1192,67 @@ pub(crate) fn repo_flag(args: &[String]) -> Option<String> {
     None
 }
 
+/// The `<owner>/<repo>` a `gh pr`, `gh issue` or `gh agent-task view` selector
+/// URL names (`gh pr view https://<DEFAULT_HOST>/acme/widgets/pull/7`). gh acts on
+/// the URL's repository whatever `-R`, `GH_REPO` or the checkout say (gh 2.98:
+/// `pr/shared/finder.go` `ParseURL`, `issue/shared/lookup.go`
+/// `tryParseIssueFromURL`). `gh run` and `gh workflow` take numeric ids, never
+/// URLs, so they have no such selector.
+fn selector_url_target(args: &[String]) -> Option<String> {
+    let (group, at, subcommand) = command_words(args)?;
+    let kinds: &[&str] = match (group, subcommand) {
+        ("pr", _) | ("agent-task", "view") => &["pull"],
+        ("issue", _) => &["issues", "pull"],
+        _ => return None,
+    };
+    github_selector_repo(positional_after(args, at)?, kinds)
+}
+
+/// The `<owner>/<repo>` of an http(s) URL on the App's host whose path is
+/// `/<owner>/<repo>/<kind>/<number>…` for one of `kinds`, read as gh reads it
+/// (Go's `url.Parse`, then gh's own host normalization): the scheme in any
+/// case, userinfo and port dropped, the host lowercased without `www.`, the
+/// number only a leading run of digits. Another host's URL routes nothing: the
+/// App's routes cover the default host alone.
+fn github_selector_repo(selector: &str, kinds: &[&str]) -> Option<String> {
+    let (scheme, rest) = selector.split_once("://")?;
+    if !scheme.eq_ignore_ascii_case("https") && !scheme.eq_ignore_ascii_case("http") {
+        return None;
+    }
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, path) = rest.split_at(end);
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    let host = host.split_once(':').map_or(host, |(host, _)| host);
+    let host = host.to_ascii_lowercase();
+    if host.strip_prefix("www.").unwrap_or(&host) != DEFAULT_HOST {
+        return None;
+    }
+    let path = path.split(['?', '#']).next().unwrap_or_default();
+    let mut segments = path.strip_prefix('/')?.split('/');
+    let (owner, repo, kind, number) = (
+        segments.next()?,
+        segments.next()?,
+        segments.next()?,
+        segments.next()?,
+    );
+    (!owner.is_empty()
+        && !repo.is_empty()
+        && kinds.contains(&kind)
+        && number.starts_with(|character: char| character.is_ascii_digit()))
+    .then(|| format!("{owner}/{repo}"))
+}
+
 /// The https URL targeted by this invocation (shim lines 75-179), or `Ok(None)`
 /// when nothing routes (outside any repository, or a repository with no usable
 /// remote).
 ///
 /// Errs when routing needs git and the invocation sits inside a checkout whose
 /// git cannot be read — a broken worktree registration, say. Arguments that
-/// name the target themselves (`-R`, `GH_REPO`, a `gh api` owner) read no git
-/// and still resolve. The caller reports git's own words and stops: resolving
+/// name the target themselves (a PR or issue selector URL, `-R`, a `gh repo`
+/// repository positional, `GH_REPO`, a `gh api` owner) read no git and still
+/// resolve. The caller reports git's own words and stops: resolving
 /// such a checkout to "no target" would run gh on ambient auth, which an agent
 /// session does not have, so the agent would see gh's login error instead of
 /// git's.
@@ -722,7 +1261,14 @@ pub(crate) fn resolve_target_url(
     cwd: &Path,
 ) -> Result<Option<String>, crate::bind::BindError> {
     let api_owner = owner_from_api_args(args);
-    let repo_spec = repo_flag(args).or_else(gh_repo_environment);
+    let repo_spec = selector_url_target(args)
+        .or_else(|| {
+            repo_subcommand(args).map_or_else(
+                || repo_flag(args),
+                |subcommand| repo_subcommand_target(args, &subcommand),
+            )
+        })
+        .or_else(gh_repo_environment);
     let needs_git_inputs = api_owner.is_none() && repo_spec.is_none();
     let resolved_remote = needs_git_inputs.then(|| gh_resolved_remote(cwd)).flatten();
     let registry = needs_git_inputs
@@ -1012,6 +1558,19 @@ mod tests {
             url_from_spec(&format!("https://{host}/acme/work.git")).unwrap(),
             format!("https://{host}/acme/work.git")
         );
+        // So does an scp-form remote with any user or none, which gh's clone takes
+        // as a repository argument.
+        for spec in [
+            format!("git@{host}:acme/work.git"),
+            format!("alice@{host}:acme/work"),
+            format!("{host}:acme/work"),
+        ] {
+            assert_eq!(
+                url_from_spec(&spec).unwrap(),
+                format!("https://{host}/acme/work.git"),
+                "{spec}"
+            );
+        }
         assert_eq!(url_from_spec(""), None);
     }
 
@@ -1051,7 +1610,12 @@ mod tests {
                 ("GIT_CONFIG_NOSYSTEM", "1"),
                 ("GIT_CONFIG_COUNT", "0"),
             ],
-            || mint_token(&format!("https://{host}/acme/work.git")),
+            || {
+                mint_token(
+                    &format!("https://{host}/acme/work.git"),
+                    CALL_TOKEN_LIFETIME,
+                )
+            },
         );
         (dir, mint)
     }
@@ -1061,14 +1625,154 @@ mod tests {
         // Given: a fake gh-app-token that echoes a password when fed a path.
         // When: minting for a target under the routed host.
         let (dir, mint) = mint_through(
-            "#!/bin/sh\ncat > \"$0.request\"\nprintf 'username=x-access-token\\npassword=tok-%s\\n' \"$1\"\n",
+            "#!/bin/sh\ncat > \"$0.request\"\nprintf '%s' \"$GH_APP_TOKEN_MIN_LIFETIME\" > \"$0.lifetime\"\nprintf 'username=x-access-token\\npassword=tok-%s\\n' \"$1\"\n",
         );
 
-        // Then: the token comes back and the helper saw the credential request.
+        // Then: the token comes back, the helper saw the credential request, and
+        // it was told how long the token must stay valid.
         assert_eq!(mint, Mint::Token("tok-acme".to_owned()));
         let request = std::fs::read_to_string(dir.path().join("gh-app-token.request"))
             .expect("request captured");
         assert!(request.contains("path=acme/work.git"), "{request}");
+        let lifetime = std::fs::read_to_string(dir.path().join("gh-app-token.lifetime"))
+            .expect("lifetime captured");
+        assert_eq!(lifetime, CALL_TOKEN_LIFETIME.to_string());
+    }
+
+    #[test]
+    fn a_watching_call_needs_a_fresh_tokens_hour_and_any_other_half_an_hour() {
+        let args = |a: &[&str]| a.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        for watching in [
+            &["run", "watch", "123"][..],
+            &["run", "watch", "-R", "acme/widgets", "123", "--exit-status"],
+            &["pr", "checks", "7", "--watch"],
+            &["pr", "checks", "--watch=true", "--fail-fast"],
+            &["pr", "checks", "--watch=false", "--watch"],
+            &["pr", "checks", "--watch=0", "--watch=T"],
+            &["agent-task", "view", "--follow"],
+            &["agent-task", "create", "do it", "--follow"],
+            &["agent", "view", "1", "--log", "--follow"],
+            &["agents", "view", "--follow"],
+            &["agent-tasks", "view", "--follow"],
+            &["-R", "acme/widgets", "run", "watch", "123"],
+            &["--repo", "acme/widgets", "pr", "checks", "--watch"],
+        ] {
+            assert_eq!(
+                required_token_lifetime(&args(watching)),
+                WATCH_TOKEN_LIFETIME,
+                "{watching:?}"
+            );
+        }
+        for ordinary in [
+            &["run", "view", "123"][..],
+            &["pr", "checks", "7"],
+            &["pr", "checks", "--watch", "--watch=false"],
+            &["pr", "checks", "--watch", "--watch=0"],
+            &["pr", "checks", "--watch", "--watch=F"],
+            &["-R", "run", "pr", "view", "watch"],
+            &["pr", "view", "--watch"],
+            &["api", "repos/acme/widgets"],
+            &["search", "issues", "--", "run", "watch"],
+            &["pr", "checks", "--", "--watch"],
+        ] {
+            assert_eq!(
+                required_token_lifetime(&args(ordinary)),
+                CALL_TOKEN_LIFETIME,
+                "{ordinary:?}"
+            );
+        }
+        // A watch outlives the five minutes a cached token may have left, and a
+        // fresh installation token lives exactly the hour a watch asks for.
+        const { assert!(CALL_TOKEN_LIFETIME > 5 * 60) };
+        assert_eq!(WATCH_TOKEN_LIFETIME, 60 * 60);
+        // A watch restarts on a fresh token five minutes before its token expires.
+        assert_eq!(WATCH_RESTART_AFTER, 55 * 60);
+    }
+
+    #[test]
+    fn a_selector_url_names_its_repository_as_gh_reads_it() {
+        let host = concat!("github", ".com");
+        let pull: &[&str] = &["pull"];
+        let issue: &[&str] = &["issues", "pull"];
+        for (selector, kinds, expected) in [
+            (
+                format!("https://{host}/acme/widgets/pull/7"),
+                pull,
+                Some("acme/widgets"),
+            ),
+            (
+                format!("https://{host}/acme/widgets/pull/7/files"),
+                pull,
+                Some("acme/widgets"),
+            ),
+            (
+                format!("http://{host}/acme/widgets/pull/7#top"),
+                pull,
+                Some("acme/widgets"),
+            ),
+            (
+                format!("https://www.{host}/acme/widgets/pull/7"),
+                pull,
+                Some("acme/widgets"),
+            ),
+            (
+                format!(
+                    "https://{}:443/acme/widgets/pull/7?x=1",
+                    host.to_ascii_uppercase()
+                ),
+                pull,
+                Some("acme/widgets"),
+            ),
+            (
+                format!("https://bot@{host}/acme/widgets/pull/7"),
+                pull,
+                Some("acme/widgets"),
+            ),
+            (
+                format!("https://{host}/acme/widgets/issues/3"),
+                issue,
+                Some("acme/widgets"),
+            ),
+            (
+                format!("https://{host}/acme/widgets/pull/3"),
+                issue,
+                Some("acme/widgets"),
+            ),
+            (format!("https://{host}/acme/widgets/issues/3"), pull, None),
+            (format!("https://{host}/acme/widgets/pull/"), pull, None),
+            (format!("https://{host}/acme/widgets/pull/x7"), pull, None),
+            (
+                format!("https://{host}/acme/widgets/actions/runs/9"),
+                issue,
+                None,
+            ),
+            (format!("https://{host}/acme/widgets"), pull, None),
+            (format!("https://{host}//widgets/pull/7"), pull, None),
+            (
+                "https://forge.example/acme/widgets/pull/7".to_owned(),
+                pull,
+                None,
+            ),
+            (format!("ssh://{host}/acme/widgets/pull/7"), pull, None),
+            (format!("{host}/acme/widgets/pull/7"), pull, None),
+            ("7".to_owned(), pull, None),
+            (
+                format!("HTTPS://{host}/acme/widgets/pull/7"),
+                pull,
+                Some("acme/widgets"),
+            ),
+            (
+                format!("Http://{host}/acme/widgets/issues/7"),
+                issue,
+                Some("acme/widgets"),
+            ),
+        ] {
+            assert_eq!(
+                github_selector_repo(&selector, kinds).as_deref(),
+                expected,
+                "{selector}"
+            );
+        }
     }
 
     #[test]
@@ -1145,7 +1849,12 @@ mod tests {
                 ("GIT_CONFIG_NOSYSTEM", "1"),
                 ("GIT_CONFIG_COUNT", "0"),
             ],
-            || mint_token(&format!("https://{host}/acme/work.git")),
+            || {
+                mint_token(
+                    &format!("https://{host}/acme/work.git"),
+                    CALL_TOKEN_LIFETIME,
+                )
+            },
         );
 
         // Then: nothing is routed, so gh runs on its own auth.
@@ -1290,6 +1999,41 @@ mod tests {
             ]))
             .as_deref(),
             Some("b")
+        );
+    }
+
+    #[test]
+    fn api_owner_scans_stop_at_the_terminator_but_the_endpoint_does_not() {
+        let args = |a: &[&str]| a.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        let query = "query=query($owner:String!){repository(owner:$owner,name:\"x\"){id}}";
+        assert_eq!(
+            owner_from_api_args(&args(&["api", "graphql", "-f", query, "-f", "owner=acme"])),
+            Some("acme".to_owned())
+        );
+        assert_eq!(
+            owner_from_api_args(&args(&[
+                "api",
+                "graphql",
+                "-f",
+                query,
+                "--",
+                "-f",
+                "owner=acme"
+            ])),
+            None
+        );
+        assert_eq!(
+            owner_from_api_args(&args(&[
+                "api",
+                "graphql",
+                "--",
+                "repository(owner:\"acme\")"
+            ])),
+            None
+        );
+        assert_eq!(
+            owner_from_api_args(&args(&["api", "--", "repos/acme/x"])),
+            Some("acme".to_owned())
         );
     }
 
@@ -1598,6 +2342,116 @@ mod tests {
             }),
             Some(format!("https://{host}/alpha/repository.git"))
         );
+    }
+
+    #[test]
+    fn a_double_dash_that_is_a_flag_value_does_not_terminate_the_scans() {
+        let args = |a: &[&str]| a.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        // gh reads `--` after a value flag written without `=` as its value.
+        assert_eq!(
+            repo_flag(&args(&[
+                "pr", "comment", "5", "--body", "--", "-R", "acme/w"
+            ])),
+            Some("acme/w".to_owned())
+        );
+        assert_eq!(
+            owner_from_api_args(&args(&[
+                "search", "issues", "--title", "--", "--owner", "acme"
+            ])),
+            Some("acme".to_owned())
+        );
+        assert!(has_head_flag(&args(&[
+            "pr", "create", "--title", "--", "--head", "x"
+        ])));
+        // `--body=--` is one argument; the bare `--` after it still terminates.
+        assert_eq!(
+            repo_flag(&args(&["pr", "comment", "--body=--", "--", "-R", "acme/w"])),
+            None
+        );
+        // A boolean flag does not take `--` as a value.
+        assert_eq!(
+            repo_flag(&args(&["pr", "comment", "--web", "--", "-R", "acme/w"])),
+            None
+        );
+        // Short flags that are boolean in some commands never swallow the next word.
+        for (subcommand, flag) in [("merge", "-r"), ("merge", "-m"), ("view", "-c")] {
+            assert!(
+                has_positional_target(subcommand, &args(&["pr", subcommand, flag, "123"])),
+                "{subcommand} {flag}"
+            );
+            assert_eq!(
+                repo_flag(&args(&["pr", subcommand, flag, "--", "-R", "acme/w"])),
+                None,
+                "{subcommand} {flag}"
+            );
+        }
+        // Where they do take a value, the value is not the target.
+        assert!(!has_positional_target(
+            "edit",
+            &args(&["pr", "edit", "-m", "v1"])
+        ));
+        assert!(!has_positional_target(
+            "checks",
+            &args(&["pr", "checks", "-i", "5"])
+        ));
+        // Flags boolean in some other command (`issue develop -l`, `workflow run
+        // --json`, `secret set --user`, `auth status -t`, `repo edit --template`,
+        // `codespace create --status`) never swallow a real terminator.
+        for (command, flag) in [
+            (["issue", "develop"], "-l"),
+            (["workflow", "run"], "--json"),
+            (["secret", "set"], "--user"),
+            (["auth", "status"], "-t"),
+            (["repo", "edit"], "--template"),
+            (["codespace", "create"], "--status"),
+        ] {
+            let mut words = command.to_vec();
+            words.extend([flag, "--", "-R", "acme/w"]);
+            assert_eq!(repo_flag(&args(&words)), None, "{command:?} {flag}");
+        }
+        // `pr view` still reads its own value flags.
+        assert!(!has_positional_target(
+            "view",
+            &args(&["pr", "view", "--json", "x"])
+        ));
+        assert!(!has_positional_target(
+            "view",
+            &args(&["pr", "view", "-t", "tpl"])
+        ));
+    }
+
+    #[test]
+    fn the_pr_scans_stop_at_the_terminator() {
+        let args = |a: &[&str]| a.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        assert_eq!(
+            pr_subcommand(&args(&["search", "issues", "--", "pr", "view"])),
+            None
+        );
+        assert_eq!(
+            pr_subcommand(&args(&["pr", "--", "view"])),
+            None,
+            "words after `--` are never the subcommand"
+        );
+        assert!(!has_head_flag(&args(&[
+            "pr", "create", "--", "--head", "x"
+        ])));
+        assert!(has_head_flag(&args(&["pr", "create", "--head", "x", "--"])));
+        assert!(has_positional_target(
+            "view",
+            &args(&["pr", "view", "--", "123"])
+        ));
+        assert!(!has_positional_target("view", &args(&["pr", "view", "--"])));
+        assert!(!has_positional_target(
+            "view",
+            &args(&["pr", "view", "--json", "x", "--"])
+        ));
+        // The subcommand only after `--` is not the subcommand; a value flag
+        // right before `--` takes `--` as its value, so the next word is positional.
+        assert!(!has_positional_target("view", &args(&["pr", "--", "view"])));
+        assert!(has_positional_target(
+            "view",
+            &args(&["pr", "view", "--json", "--", "123"])
+        ));
     }
 
     #[test]

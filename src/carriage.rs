@@ -21,9 +21,7 @@ use crate::bind::Fork;
 use crate::config::Role;
 use crate::detect::{BookmarkTips, RebaseOutcome};
 use crate::forge::{Forge, index_pulls};
-use crate::ids::{
-    BookmarkRef, BranchName, CommitId, ReleaseScheme, is_our_release, strict_dated_release,
-};
+use crate::ids::{BookmarkRef, BranchName, CommitId, ReleaseScheme, is_our_release};
 use crate::jj::Repo;
 use crate::release_model;
 use crate::snapshot::{self, SnapshotConfig};
@@ -159,7 +157,7 @@ pub fn census(
     let entry = fork.entry;
     let path = &fork.checkout.path;
     let repo = Repo::open(path)?;
-    let trunk_name = entry.upstream_trunk();
+    let trunk_name = entry.trunk_ref();
     let trunk = repo.resolve_commit(&trunk_name)?;
     let tips = repo.bookmark_tips()?;
     let trunk_branch = entry.trunk();
@@ -645,8 +643,9 @@ fn render_check(check: &TargetCheck, indent: &str) -> String {
 /// release refs (grouped, so one name at two commits is two targets), plus the
 /// upstream trunk.
 ///
-/// Live/superseded comes from `strict_dated_release` ordering; under a fixed
-/// scheme every release ref of the configured name is Live.
+/// Live/superseded comes from [`ReleaseScheme::dated_cut`] ordering within the
+/// scheme's series; under a fixed scheme every release ref of the configured
+/// name is Live.
 pub fn targets(
     tips: &BookmarkTips,
     scheme: &ReleaseScheme,
@@ -654,10 +653,10 @@ pub fn targets(
     publish_remote: &str,
 ) -> Vec<Target> {
     let newest_release = match scheme {
-        ReleaseScheme::Dated => tips
+        ReleaseScheme::Dated | ReleaseScheme::Series(_) => tips
             .keys()
             .filter(|reference| is_our_release(reference, scheme, publish_remote))
-            .filter_map(|reference| strict_dated_release(reference.branch().as_str()))
+            .filter_map(|reference| scheme.dated_cut(reference.branch().as_str()))
             .max(),
         ReleaseScheme::Fixed(_) => None,
     };
@@ -668,9 +667,9 @@ pub fn targets(
         .iter()
         .filter(|(reference, _)| is_our_release(reference, scheme, publish_remote))
     {
-        let dated_name = strict_dated_release(reference.branch().as_str());
+        let dated_name = scheme.dated_cut(reference.branch().as_str());
         let role = match scheme {
-            ReleaseScheme::Dated
+            ReleaseScheme::Dated | ReleaseScheme::Series(_)
                 if matches!(
                     (dated_name.as_ref(), newest_release.as_ref()),
                     (Some(dated_name), Some(newest_release)) if dated_name == newest_release
@@ -678,7 +677,7 @@ pub fn targets(
             {
                 TargetRole::LiveRelease
             }
-            ReleaseScheme::Dated => TargetRole::SupersededRelease,
+            ReleaseScheme::Dated | ReleaseScheme::Series(_) => TargetRole::SupersededRelease,
             ReleaseScheme::Fixed(_) => TargetRole::LiveRelease,
         };
         let entry = grouped.entry(commit.clone()).or_insert_with(|| {
@@ -948,7 +947,7 @@ mod tests {
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].role, TargetRole::UpstreamTrunk);
         assert_eq!(targets[0].commit, CommitId::new("trunk"));
-        assert!(targets[0].refs.is_empty());
+        assert_eq!(targets[0].refs, Vec::<BookmarkRef>::new());
     }
 
     #[test]

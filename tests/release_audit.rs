@@ -573,9 +573,12 @@ fn committed_cut_fixture(
             parents: &request.parents,
             message: Some(&request.message()),
             bookmark: None,
+            publish_remote: None,
+            earlier: &[],
             operation: &format!("knives: cut {} (fixture)", request.name),
         },
     )
+    .map(|written| written.commit)
 }
 
 /// The commit each parent of a named release sits at right now.
@@ -608,10 +611,9 @@ fn an_incremental_recut_preserves_the_previous_cuts_conflict_resolutions() {
         lab.revision(&lab.work, cut.as_str(), "description"),
         request.message().trim_end()
     );
-    assert!(
-        knives::jj::conflicted_files(&lab.work, cut.as_str())
-            .expect("list conflicts")
-            .is_empty()
+    assert_eq!(
+        knives::jj::conflicted_files(&lab.work, cut.as_str()).expect("list conflicts"),
+        Vec::<String>::new()
     );
 }
 

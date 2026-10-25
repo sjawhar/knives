@@ -9,8 +9,7 @@ use std::path::Path;
 use crate::config::{RepoEntry, Role};
 use crate::detect::{BookmarkTips, Finding, FindingKind, Subject};
 use crate::ids::{
-    BookmarkRef, BranchName, CommitId, RELEASE_PREFIX, ReleaseScheme, RemoteName, is_our_release,
-    is_release_name,
+    BookmarkRef, BranchName, CommitId, ReleaseScheme, RemoteName, is_our_release, is_release_name,
 };
 use crate::jj::{self, Repo};
 use crate::ledger::{Entry, Kind, RecordedParent};
@@ -116,6 +115,142 @@ pub fn carried_from_tips(
         .collect()
 }
 
+/// Which series a branch belongs to, among an entry's series.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SeriesFit {
+    /// The series this command acts on.
+    Selected,
+    /// Another series, named as a person reads it ([`RepoEntry::series_label`]).
+    Other(String),
+    /// No series: why, for the refusal.
+    None(String),
+}
+
+/// The series a branch tip belongs to: the one whose base it forks from latest.
+///
+/// A branch of series 9.2 forks from that series' base (say `v9.2+ours`) at
+/// or after that base's tip, and from the default trunk only where the two
+/// bases split, so its fork point with 9.2's base descends from its fork point
+/// with every other base. A tip whose fork points tie or criss-cross fits no
+/// series: composing it into one would carry whichever base it really stands
+/// on into the other.
+///
+/// Every series' base takes part. A base that does not resolve, or that has no
+/// single fork point with the tip, fits the tip to no series: deciding among
+/// the remaining bases would assign the branch by elimination, and a 9.2
+/// branch whose base was not fetched would then fit the default series. A
+/// base that is an ancestor of another base ties for every branch forked at
+/// or below it, so such branches fit no series either.
+pub fn series_fit(
+    repo: &Repo,
+    entry: &RepoEntry,
+    tip: &CommitId,
+) -> Result<SeriesFit, jj::JjError> {
+    let mut points: Vec<(Option<String>, String, CommitId)> = Vec::new();
+    let mut unplaced = Vec::new();
+    for series in entry.all_series() {
+        let base = series.trunk_ref();
+        let Ok(base_tip) = repo.resolve_commit(&base) else {
+            unplaced.push(format!("{base} does not resolve"));
+            continue;
+        };
+        let Some(point) = repo.common_ancestor(std::slice::from_ref(tip), &base_tip)? else {
+            unplaced.push(format!("it has no single fork point with {base}"));
+            continue;
+        };
+        let name = series.selected_series.as_ref().map(ToString::to_string);
+        points.push((name, series.series_label(), point));
+    }
+    if !unplaced.is_empty() {
+        return Ok(SeriesFit::None(unplaced.join("; ")));
+    }
+    let mut latest = None;
+    for (index, candidate) in points.iter().enumerate() {
+        let mut above_every_other = true;
+        for (other_index, other) in points.iter().enumerate() {
+            if other_index != index
+                && (other.2 == candidate.2 || !repo.is_ancestor(&other.2, &candidate.2)?)
+            {
+                above_every_other = false;
+                break;
+            }
+        }
+        if above_every_other {
+            latest = Some(candidate);
+            break;
+        }
+    }
+    let Some((name, label, _)) = latest else {
+        return Ok(SeriesFit::None(format!(
+            "it does not fork from one series' base later than from every other ({})",
+            points
+                .iter()
+                .map(|(_, label, point)| format!("{label} at {}", point.short()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    };
+    let selected = entry.selected_series.as_ref().map(ToString::to_string);
+    Ok(if *name == selected {
+        SeriesFit::Selected
+    } else {
+        SeriesFit::Other(label.clone())
+    })
+}
+
+/// Every declared base of an entry with named series that does not resolve in
+/// `repo`, as `<base>@<remote>`. Empty for an entry without named series.
+///
+/// Membership needs every base: with one missing, its series' branches would
+/// fit whichever series is left, so every release verb refuses until it is
+/// fetched or the registry names the remote it lives on.
+pub fn unresolved_bases(repo: &Repo, entry: &RepoEntry) -> Vec<String> {
+    if entry.series.is_empty() {
+        return Vec::new();
+    }
+    entry
+        .all_series()
+        .iter()
+        .map(RepoEntry::trunk_ref)
+        .filter(|base| repo.resolve_commit(base).is_err())
+        .collect()
+}
+
+/// A series' member branches, and a line for each that fits no series.
+pub type SeriesMembers = (Vec<(String, CommitId)>, Vec<String>);
+
+/// The branches of `carried` that belong to the selected series.
+///
+/// Each branch that fits no series yields a line saying why. Another series'
+/// branches are left out silently: they are that series' members, and so is
+/// every series' base, which members fork from and never are. An entry
+/// without named series keeps every branch, so nothing changes for it.
+pub fn series_members(
+    repo: &Repo,
+    entry: &RepoEntry,
+    carried: Vec<(String, CommitId)>,
+) -> Result<SeriesMembers, jj::JjError> {
+    if entry.series.is_empty() {
+        return Ok((carried, Vec::new()));
+    }
+    let bases = entry.bases();
+    let mut members = Vec::new();
+    let mut unfit = Vec::new();
+    for (branch, tip) in carried {
+        if bases.contains(&branch.as_str()) {
+            continue;
+        }
+        match series_fit(repo, entry, &tip)? {
+            SeriesFit::Selected => members.push((branch, tip)),
+            SeriesFit::Other(_) => {}
+            SeriesFit::None(why) => {
+                unfit.push(format!("{branch} belongs to no release series: {why}"));
+            }
+        }
+    }
+    Ok((members, unfit))
+}
+
 /// Every position the trunk is known at: the upstream view first, then our
 /// fork's, then the local bookmark. Deduplicated, in that order.
 ///
@@ -155,12 +290,12 @@ pub fn newest_release(
     publish_remote: &str,
 ) -> Option<(BookmarkRef, CommitId)> {
     match scheme {
-        ReleaseScheme::Dated => tips
+        ReleaseScheme::Dated | ReleaseScheme::Series(_) => tips
             .iter()
             .filter(|(reference, _)| is_our_release(reference, scheme, publish_remote))
             .max_by_key(|(reference, _)| {
                 (
-                    release_order(reference.branch().as_str()),
+                    scheme.cut_order(reference.branch().as_str()),
                     u8::from(reference.is_local()),
                 )
             })
@@ -175,15 +310,6 @@ pub fn newest_release(
             })
             .max_by_key(|(reference, _)| u8::from(reference.is_local()))
             .map(|(reference, commit)| (reference.clone(), commit.clone())),
-    }
-}
-
-/// Order a dated release name so numeric suffixes compare numerically.
-pub fn release_order(name: &str) -> (String, u32) {
-    let bare = name.strip_prefix(RELEASE_PREFIX).unwrap_or(name);
-    match bare.split_once('.') {
-        Some((date, suffix)) => (date.to_owned(), suffix.parse().unwrap_or(0)),
-        None => (bare.to_owned(), 0),
     }
 }
 
@@ -667,4 +793,84 @@ pub fn last_recorded_cut(entries: &[Entry], subject: Option<&str>) -> Option<Rec
                 .collect(),
         })
     })
+}
+
+/// Which of knives' own writes a ledger event records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordedWriteKind {
+    Cut,
+    Edit,
+}
+
+impl std::fmt::Display for RecordedWriteKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Cut => "cut",
+            Self::Edit => "edit",
+        })
+    }
+}
+
+/// The commit a cut or edit event says knives wrote under a release name.
+#[derive(Debug, PartialEq, Eq)]
+pub struct RecordedWrite {
+    pub kind: RecordedWriteKind,
+    pub commit: CommitId,
+}
+
+/// Every commit knives itself put under `release`, newest first: what each cut
+/// event or edit event (`include`, `drop`, `advance`, `rebase`) records first
+/// in its evidence.
+///
+/// An edit writes a new commit under the same name, so a release that equals
+/// its last edit is knives' own work, not drift, and a publish remote at an
+/// earlier write is knives' own work an edit has not been pushed over. The
+/// composition gate does not read this: it holds a new cut against
+/// [`last_recorded_cut`], so a member an edit dropped is still restated at the
+/// next cut.
+pub fn recorded_writes<'a>(
+    entries: &'a [Entry],
+    release: &'a str,
+) -> impl Iterator<Item = RecordedWrite> + 'a {
+    entries.iter().rev().filter_map(move |entry| {
+        if entry.kind != Kind::Event || entry.subject.as_deref() != Some(release) {
+            return None;
+        }
+        if let Some(cut) = last_recorded_cut(std::slice::from_ref(entry), None) {
+            return Some(RecordedWrite {
+                kind: RecordedWriteKind::Cut,
+                commit: cut.commit,
+            });
+        }
+        let rest = entry.text.strip_prefix("edited ")?.strip_prefix(release)?;
+        if !(rest.starts_with(':') || rest.starts_with(' ')) {
+            return None;
+        }
+        Some(RecordedWrite {
+            kind: RecordedWriteKind::Edit,
+            commit: CommitId::new(entry.evidence.first()?.as_str()),
+        })
+    })
+}
+
+/// The newest structural cut event of the series `entry` selects.
+///
+/// It is the baseline a cut of that series is held against. An entry without
+/// named series reads every cut event, as it always has; with them, another
+/// series' cut never stands in as this series' previous composition.
+pub fn last_series_cut(entries: &[Entry], entry: &RepoEntry) -> Option<RecordedCut> {
+    if entry.series.is_empty() {
+        return last_recorded_cut(entries, None);
+    }
+    let scheme = entry.release_scheme();
+    entries
+        .iter()
+        .rev()
+        .filter(|recorded| {
+            recorded
+                .subject
+                .as_deref()
+                .is_some_and(|subject| scheme.owns(subject))
+        })
+        .find_map(|recorded| last_recorded_cut(std::slice::from_ref(recorded), None))
 }

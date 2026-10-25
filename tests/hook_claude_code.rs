@@ -45,10 +45,7 @@ fn event(name: &str, cwd: &Path, path: Option<&Path>) -> Value {
 fn hook_command(home: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_knives"));
     command.args(["hook", "claude-code"]);
-    command
-        .env("KNIVES_CONFIG_HOME", home)
-        .env("HOME", home)
-        .env("JJ_CONFIG", "/dev/null");
+    command.env("KNIVES_CONFIG_HOME", home).env("HOME", home);
     command
 }
 
@@ -146,8 +143,8 @@ impl Repositories {
              origin = \"https://forge.invalid/ours/beta\"\n\n{trust}"
         );
         std::fs::write(self.home.path().join("repos.toml"), config).expect("write registry");
-        let state = json!({"claims": {"beta/feat/claimed": {
-            "repo": "beta",
+        let state = json!({"claims": {"maintainer/beta/feat/claimed": {
+            "repo": "maintainer/beta",
             "branch": "feat/claimed",
             "owner": "agent-one",
             "why": "porting",
@@ -224,16 +221,16 @@ fn session_start_reemits_a_notice_when_the_roster_changes() {
 
     let _ = run_hook(repos.home.path(), &start);
     repos.write_state(&json!({"claims": {
-        "beta/feat/claimed": {
-            "repo": "beta",
+        "maintainer/beta/feat/claimed": {
+            "repo": "maintainer/beta",
             "branch": "feat/claimed",
             "owner": "agent-one",
             "why": "porting",
             "started": "2026-01-01T00:00:00Z",
             "files": []
         },
-        "beta/feat/new": {
-            "repo": "beta",
+        "maintainer/beta/feat/new": {
+            "repo": "maintainer/beta",
             "branch": "feat/new",
             "owner": "agent-two",
             "why": "reviewing",
@@ -271,7 +268,7 @@ fn session_start_in_a_managed_workspace_records_passive_observations() {
         "was: {seen}"
     );
     assert!(
-        seen["workspaces"]["beta/beta"]
+        seen["workspaces"]["maintainer/beta/beta"]
             .as_str()
             .is_some_and(|timestamp| timestamp.parse::<jiff::Timestamp>().is_ok()),
         "was: {seen}"
@@ -286,7 +283,7 @@ fn compact_session_start_in_a_managed_workspace_records_passive_observations() {
     let mut compact = event("session-start", &repos.beta, None);
     compact["source"] = json!("compact");
 
-    assert!(run_hook(repos.home.path(), &compact).is_empty());
+    assert_eq!(run_hook(repos.home.path(), &compact), "");
 
     let seen: Value = serde_json::from_str(
         &std::fs::read_to_string(repos.home.path().join("seen.json"))
@@ -300,7 +297,7 @@ fn compact_session_start_in_a_managed_workspace_records_passive_observations() {
         "was: {seen}"
     );
     assert!(
-        seen["workspaces"]["beta/beta"]
+        seen["workspaces"]["maintainer/beta/beta"]
             .as_str()
             .is_some_and(|timestamp| timestamp.parse::<jiff::Timestamp>().is_ok()),
         "was: {seen}"
@@ -397,16 +394,16 @@ fn post_tool_use_reemits_a_notice_when_the_roster_changes() {
 
     let _ = run_hook(repos.home.path(), &read);
     repos.write_state(&json!({"claims": {
-        "beta/feat/claimed": {
-            "repo": "beta",
+        "maintainer/beta/feat/claimed": {
+            "repo": "maintainer/beta",
             "branch": "feat/claimed",
             "owner": "agent-one",
             "why": "porting",
             "started": "2026-01-01T00:00:00Z",
             "files": []
         },
-        "beta/feat/new": {
-            "repo": "beta",
+        "maintainer/beta/feat/new": {
+            "repo": "maintainer/beta",
             "branch": "feat/new",
             "owner": "agent-two",
             "why": "reviewing",
@@ -447,7 +444,7 @@ fn post_tool_use_in_a_managed_workspace_records_event_identity_and_cwd() {
         "was: {seen}"
     );
     assert!(
-        seen["workspaces"]["alpha/alpha"]
+        seen["workspaces"]["maintainer/alpha/alpha"]
             .as_str()
             .is_some_and(|timestamp| timestamp.parse::<jiff::Timestamp>().is_ok()),
         "was: {seen}"
@@ -475,8 +472,7 @@ fn a_hook_whose_own_working_directory_has_vanished_still_answers() {
             ])
             .current_dir(vanishing.path())
             .env("KNIVES_CONFIG_HOME", repos.home.path())
-            .env("HOME", repos.home.path())
-            .env("JJ_CONFIG", "/dev/null");
+            .env("HOME", repos.home.path());
         let answer = run_command_input(command, &event.to_string());
         assert!(
             !vanishing.path().exists(),
@@ -558,7 +554,7 @@ fn compaction_resets_the_budget() {
     let first = run_hook(repos.home.path(), &read);
 
     // When: Claude Code compacts its context and reads that repository again.
-    assert!(run_hook(repos.home.path(), &compact).is_empty());
+    assert_eq!(run_hook(repos.home.path(), &compact), "");
     let second = run_hook(repos.home.path(), &read);
 
     // Then: both reads receive the full foreign guidance.
@@ -576,7 +572,7 @@ fn session_end_deletes_the_state_file() {
     let _ = run_hook(repos.home.path(), &start);
 
     // When: Claude Code ends the session.
-    assert!(run_hook(repos.home.path(), &end).is_empty());
+    assert_eq!(run_hook(repos.home.path(), &end), "");
 
     // Then: no session state remains for the session.
     let sessions = repos.home.path().join("hook-sessions");

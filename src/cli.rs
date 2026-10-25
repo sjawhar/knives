@@ -272,11 +272,13 @@ pub enum Command {
     /// Claiming a branch and opening a workspace for it were two commands for no
     /// reason: starting work on a branch is one act. `finish` is its inverse.
     ///
-    /// Also states the fork's `immutable_heads()` — jj's trunk, tags, and the trunk
-    /// by name on every knives remote — in the repository's jj config when that
-    /// config states none, and says so on stdout. jj's default pins every commit beneath an untracked
-    /// remote ref, which in a fork is a superseded release cut or another fork's
-    /// pull request head walling `jj rebase`; a stated rule is left alone.
+    /// Also states the fork's `immutable_heads()` — jj's trunk, the trunk by name
+    /// on every knives remote, and every tag fetched from upstream — in the
+    /// repository's jj config when that config states none, and says so on
+    /// stdout. jj's default pins every commit beneath an untracked remote ref or
+    /// any tag, which in a fork is a superseded release cut, another fork's pull
+    /// request head, or the fork's own tagged release walling `jj rebase`; a
+    /// stated rule is left alone.
     Start {
         branch: String,
         /// Registry name. Defaults to the repo you are standing in.
@@ -409,6 +411,18 @@ pub enum Command {
         /// by several things sitting on different releases.
         #[arg(long)]
         consumer: Vec<PathBuf>,
+        /// The release series to act on, one of the entry's `[repos.<name>.series]`.
+        /// Omitted, the default series: the entry's own `base` and its
+        /// `release/YYYY-MM-DD[.N]` cuts. Every subcommand sees only that
+        /// series' cuts and the branches that fork from its base.
+        #[arg(long, global = true)]
+        series: Option<String>,
+    },
+    /// Carry this machine's ledger to the machines that share it, or move what
+    /// an older knives kept in `state.json` onto it.
+    Ledger {
+        #[command(subcommand)]
+        action: LedgerAction,
     },
     /// Run the real gh with fork-aware fixes applied. Plumbing for the gh shim.
     ///
@@ -432,6 +446,45 @@ pub enum HookHarness {
 }
 
 #[derive(Debug, Subcommand)]
+pub enum LedgerAction {
+    /// Commit new entries, pull every peer's, and push this machine's.
+    ///
+    /// Every command that writes an entry starts one in the background as it
+    /// exits, so this rarely needs typing. One sweep runs at a time: run by
+    /// hand, a sweep that finds another running waits for it, up to a minute,
+    /// then runs its own pass and reports that, with the sweep it waited for.
+    /// A fork's ledger travels when its `repos.toml` entry names, as
+    /// `ledger`, the repository its ledger belongs to, and the ledger root is
+    /// a git repository with that repository as `origin` and this machine's
+    /// name as `knives.machine`. With no fork's `ledger` set, the ledger is
+    /// not shared and this does nothing.
+    Sweep,
+    /// Move what an older knives left onto what this one reads: each fork
+    /// kept under its registry key moves to its upstream's lowercase
+    /// `<owner>/<name>`, and the branch statements kept in `state.json` move
+    /// onto the ledger, one statement entry each, then leave `state.json`.
+    ///
+    /// A fork's ledger directory moves file by file, contents untouched, and
+    /// every `state.json` key naming it is renamed; each old path and key is
+    /// reported. Existing entries are left as they are: an event's prose
+    /// states nothing, so nothing is read back out of it. A statement some
+    /// entry about that branch already makes, kind and value alike, is
+    /// skipped, so a second run writes nothing. `state.json` keeps every
+    /// statement until all of them reach the ledger.
+    ///
+    /// Each fork's ledger is pulled first, and a fork whose pull fails has
+    /// none of its statements written. A statement the ledger already makes
+    /// otherwise for that branch is reported and not written: the ledger's is
+    /// what every machine reads.
+    Migrate {
+        /// Report what it would move, rename and write, and change nothing:
+        /// no lock, no pull, no write.
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 pub enum ReleaseAction {
     /// Name a new cut of the composition in hand, verbatim. Never pushes.
     Cut {
@@ -447,12 +500,17 @@ pub enum ReleaseAction {
     ///
     /// Every member branch's commits move onto the target and the release
     /// merge moves with them, bookmarks and workspaces following; recorded
-    /// conflict resolutions replay as ordinary rebase semantics. The base is
-    /// never a release parent — this is how the members change theirs. Bare,
-    /// it targets the first upstream trunk commit that contains every merged
-    /// pull request, then drops the members whose landed branches carry
-    /// nothing more; with nothing merged there is no default, and which commit
-    /// to move onto is a decision — a cut does not make it for you.
+    /// conflict resolutions replay as ordinary rebase semantics. Earlier
+    /// published releases resting on the members keep their tags and commit
+    /// ids; the untagged copies the rebase makes of them are abandoned, except
+    /// one something rests on, which is kept and named. A stale rule an
+    /// earlier `knives start` wrote refuses first, naming `start` as the
+    /// refresh. The base is never a release parent — this is how the members
+    /// change theirs. Bare, it targets the first upstream trunk commit that
+    /// contains every merged pull request, then drops the members whose landed
+    /// branches carry nothing more; with nothing merged there is no default,
+    /// and which commit to move onto is a decision — a cut does not make it
+    /// for you.
     Rebase {
         /// The rebase target. Bare, the first upstream trunk commit containing
         /// every merged pull request; required when nothing has merged.
@@ -544,8 +602,8 @@ pub enum ReleaseAction {
     ///
     /// Runs automatically after every cut; exists standalone for pre-knives repos carrying
     /// years of historical refs. A later fetch re-materializes forgotten refs as untracked;
-    /// re-run to clear them. Under the fork's `immutable_heads()` (trunk and tags, with the
-    /// trunk named on every knives remote, which `knives start` writes) those refs pin nothing
+    /// re-run to clear them. Under the fork's `immutable_heads()` (the trunk, named on every
+    /// knives remote, and upstream's tags, which `knives start` writes) those refs pin nothing
     /// for `jj rebase`, so reaping is tidiness, never an unlock.
     ///
     /// Keeps every superseded cut while the live one still carries conflicts: the previous
@@ -670,6 +728,8 @@ mod tests {
             vec!["knives", "notch", "feat/alpha", "-m", "superseded"],
             vec!["knives", "notch", "--pr", "1157"],
             vec!["knives", "notch", "release/2026-08-15", "--repo", "a-repo"],
+            vec!["knives", "ledger", "sweep"],
+            vec!["knives", "ledger", "migrate"],
             vec!["knives", "gh", "--", "pr", "list"],
         ];
         // When / Then: each parses

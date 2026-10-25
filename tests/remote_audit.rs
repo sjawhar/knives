@@ -13,7 +13,7 @@ mod pulls;
 use knives::commands::audit;
 use knives::forge::fake::FakeForge;
 use knives::forge::{CheckRun, ChecksSummary, PullRequest};
-use knives::ids::{BookmarkRef, BranchName, BranchTarget, RemoteName, RepoName};
+use knives::ids::{BookmarkRef, BranchName, RemoteName};
 use knives::jj::Repo;
 use knives::store::Store;
 use lab::{Lab, commit_at, lab_entry};
@@ -65,7 +65,6 @@ fn knives_cmd(
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
         .env("HOME", lab.temp_path())
-        .env("JJ_CONFIG", "/dev/null")
         .env("KNIVES_OWNER", "test-owner")
         .output()
         .unwrap_or_else(|error| panic!("run knives {subcommand}: {error}"))
@@ -81,7 +80,7 @@ fn knives_audit(lab: &Lab, home: &tempfile::TempDir, args: &[&str]) -> std::proc
     knives_cmd(lab, home, "audit", args)
 }
 
-/// The audit gathered over `entry` with `forge` and a store that marks
+/// The audit gathered over `entry` with `forge` and a store that states
 /// `fork_only` as fork-only and nothing else.
 fn gather_with(
     lab: &Lab,
@@ -91,13 +90,21 @@ fn gather_with(
 ) -> audit::Report {
     let fork = lab::lab_fork(lab, "demo", entry);
     let state = tempfile::tempdir().expect("state");
-    let mut store = Store::open_for_update(state.path().join("state.json")).expect("store");
     for branch in fork_only {
-        store.mark_fork_only(
-            &BranchTarget::new(RepoName::new("demo"), BranchName::new(*branch)),
-            "test",
+        lab::state_on_ledger(
+            state.path(),
+            "demo",
+            branch,
+            knives::statement::StatementKind::ForkOnly,
+            Some("test"),
         );
     }
+    let store = Store::open(
+        state.path().join("state.json"),
+        &knives::config::FormerNames::new(),
+        &[&fork.upstream],
+    )
+    .expect("store");
     audit::gather(&audit::AuditInput {
         fork: &fork,
         store: &store,
@@ -154,7 +161,6 @@ fn current_operation(lab: &Lab) -> String {
     let output = Command::new("jj")
         .args(["op", "log", "--no-graph", "-T", "id ++ \"\\n\""])
         .current_dir(&lab.work)
-        .env("JJ_CONFIG", "/dev/null")
         .env("JJ_USER", "Knives Lab")
         .env("JJ_EMAIL", "knives-lab@example.test")
         .output()
@@ -187,7 +193,6 @@ fn fetch_remote_at_operation(lab: &Lab, operation: &str, remote: &str) {
     let output = Command::new("jj")
         .args(["--at-op", operation, "git", "fetch", "--remote", remote])
         .current_dir(&lab.work)
-        .env("JJ_CONFIG", "/dev/null")
         .env("JJ_USER", "Knives Lab")
         .env("JJ_EMAIL", "knives-lab@example.test")
         .output()
@@ -291,7 +296,6 @@ fn pushed_compares_a_tracked_pull_head() {
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
         .env("HOME", lab.temp_path())
-        .env("JJ_CONFIG", "/dev/null")
         .env("KNIVES_OWNER", "test-owner")
         .output()
         .expect("track pull");
@@ -647,7 +651,6 @@ fn audit_reports_release_drift_from_the_recorded_cut() {
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
         .env("HOME", lab.temp_path())
-        .env("JJ_CONFIG", "/dev/null")
         .env("KNIVES_OWNER", "test-owner")
         .output()
         .expect("cut release");

@@ -72,13 +72,17 @@ always safe: the next status run uses cold forge discovery and re-runs its lande
 One thing cannot be computed: why. `knives finish` deletes the claim that said why a branch
 exists, and after that the only honest answer to "what is this branch" is archaeology.
 
-So each repository has a ledger directory at `~/.config/knives/ledger/<repo>/`, beside the
-state file. Each entry is an immutable Markdown file with TOML frontmatter between `+++`
-fences and a prose body. A write is one atomic `create_new`; entries are never rewritten or
-deleted, and there is no lockfile. Every command that witnesses something
-writes to the ledger as part of doing it: claims taken and handed back, pull requests
-stated, dependencies recorded, the full parent set of every release cut, and each tracked
-pull request that merged, closed or advanced. Agents add their own judgments by hand:
+So each fork has a ledger directory at `~/.config/knives/ledger/<owner>/<name>/`, beside the
+state file, named for its upstream repository in lowercase so that every machine files it in
+the same place. Each entry is an immutable Markdown file with TOML frontmatter between `+++`
+fences and a prose body, carrying the writer's `git config user.email` when one is set. A write
+is one atomic no-clobber rename, and an entry is never rewritten. Outside `knives ledger
+migrate`, the one entry ever removed is a machine's own uncommitted repeat of a transition another
+machine already shared. Every command
+that witnesses something writes to the ledger as part of doing it: claims taken and handed back,
+pull requests stated, dependencies recorded, the full parent set of every release cut, and each
+tracked pull request that merged, closed, reopened or advanced. Agents add their own judgments by
+hand:
 
 ```
 knives notch '#1413' -m "split to a plugin; the original branch will not land" \
@@ -94,6 +98,25 @@ fictional branch. Bare `knives notch` shows the newest human notes and folds mac
 one count; `--events` reads their full chronology. `--verify` re-checks selected
 commit-shaped evidence and anchors against the repository as it is now.
 
+A fork's ledger travels between machines when its `repos.toml` entry names the repository its
+ledger belongs to (`ledger = "<owner>/<name>"`), and a git directory over the ledger root has that
+repository as its `origin` and names this machine (`knives.machine`): the root's own `.git`, or
+one in `~/.config/knives/ledger-repositories/`, one per repository the ledgers travel through.
+Every write starts `knives ledger sweep` in the background, which commits new entries to the
+machine's own ref, pulls every other machine's, and pushes. One sweep runs at a time, a sweep run
+by hand waits for one already running and reports its own pass, and nothing
+ever rebases. A command that decides from the ledger (`status`, `sync`, `audit`, `pushed`, the
+release plan, cut and edits, `release members` without a `REF`) pulls it first, and says so in
+its problems when it cannot.
+When two machines both sync after one merge, the second does not record it again; only two that
+each commit it before either pulls keep both. The `using-knives` skill's ledger reference has the
+setup.
+
+An older knives kept branch statements in `state.json` and filed each fork's ledger under its
+registry key. This one refuses such a state file or ledger, naming `knives ledger migrate`, which
+moves both once: every statement onto the ledger, and every directory, `state.json` key and
+workspace sighting to the fork's upstream name. A second run changes nothing.
+
 `knives status` carries the newest human note for each branch, preferring it over a newer machine
 event. Its compact notch cell prefixes a disposition, if any, and appends the count of entries it
 masks, so the question "what is this weird branch" is usually answered before you ask it.
@@ -103,9 +126,9 @@ masks, so the question "what is this weird branch" is usually answered before yo
 knives reads a checkout's identity through git, so a jj workspace must carry a `.git` file beside
 its `.jj`. `jj workspace add` writes one when it creates a Git worktree for the workspace, which
 it does by default when the workspace it runs from is colocated and `git.colocate` is `true`
-(jj-vcs/jj#9941, after 0.45.0; `--colocate` forces it, `--no-colocate` opts out). Install the jj
-build your fleet's tool configuration names: it has to be that new, and its on-disk repo format
-has to match the `jj-lib` this knives build embeds (see `Cargo.toml`). Then download the knives
+(jj-vcs/jj#9941, after 0.45.0; `--colocate` forces it, `--no-colocate` opts out). Install a jj
+build at least that new, whose on-disk repo format matches the `jj-lib` this knives build
+embeds (see `Cargo.toml`). Then download the knives
 release archive for your platform and put `bin/` on your `PATH`:
 
 ```
@@ -161,12 +184,22 @@ base = "main"                         # optional: upstream's trunk (defaults to 
 release = "https://forge.example/company/libcore"   # optional: where releases publish
 consumers = ["company/workbench"]     # optional: forge slugs that pin this repo's releases
 forbidden = ["acme-corp", "internal.example"]   # optional: identifiers an upstream-bound diff must not add
+ledger = "company/knives-ledger"      # optional: the repository this fork's ledger is shared through
 
 [repos.tool]
 upstream = "https://forge.example/org/tool"
 origin = "https://forge.example/ours/tool"
 release_branch = "integration"        # optional: fixed release branch instead of dated cuts
 workspaces = "~/.worktrees/tool"      # optional: where `knives start` opens branch workspaces
+
+[repos.prover]
+upstream = "https://forge.example/org/prover"
+origin = "https://forge.example/ours/prover"
+base = "v9.3"                         # the default series: cuts release/YYYY-MM-DD[.N]
+
+[repos.prover.series."9.2"]             # optional: a second release series, cuts release/9.2/YYYY-MM-DD[.N]
+base = "v9.2+ours"    #   its own base; `knives release --series 9.2 ...` acts on it
+base_remote = "origin"                #   optional: the remote holding the base (defaults to upstream)
 
 [trust]
 repos = ["company/workbench"]         # repositories whose AGENTS.md is injected, by identity
@@ -188,6 +221,10 @@ A checkout is the entry whose `upstream` its own `upstream` remote matches; `.gi
 `/`, and letter case do not matter, and a value that is not a URL (a filesystem path) compares as
 its trimmed text. A checkout whose `origin` or `release` remote differs from the registry still
 binds, and `status` and `repos` carry a note saying so: `origin remote is <X>; registry says <Y>`.
+A checkout whose `origin` is an entry's but whose `upstream` matches no entry (the upstream was
+renamed in `repos.toml` or in the checkout, not both) does not bind: `status`, `repos`, a named
+verb and the session hook each name the fork, both spellings and the fix, `git remote set-url
+upstream` or the `repos.toml` edit, rather than reading the fork as absent.
 
 `knives start` opens a branch's workspace beside the checkout, named for the branch: the
 `<name>/default` layout, where the workspaces are `default`'s siblings. A checkout at `~/<name>`
@@ -206,6 +243,14 @@ hosts. `knives audit` reports every line a branch adds over its fork point with 
 that contains one; a branch stated `--fork-only` is exempt. Absent, no scan runs. The `using-knives`
 skill has the matching and load rules.
 
+`ledger` names, as `<owner>/<name>`, the repository a fork's ledger belongs to: the one that
+carries its entries between machines. A repository name may start with a dot
+(`someone/.knives-ledger`). Without it the fork's ledger stays on each machine that writes it. A
+fork whose `upstream` is a filesystem path names no repository another machine could share, so
+`ledger` is refused on it. An older knives refuses a `repos.toml` that sets `ledger`, because
+every entry refuses a field it does not know: upgrade knives on every machine that reads the file
+before adding it.
+
 Every command takes its repo from the directory you are standing in, wherever that checkout
 lives. Name one only when you are somewhere else; knives then scans `~` three directories deep
 for jj checkouts, as `knives repos` and `status --all` always do. An entry with no checkout found
@@ -218,16 +263,18 @@ reads `not on this machine`, and an entry with two is refused with both paths na
 | `knives repos` | what is managed, where each checkout was found (or `not on this machine`), the newest release each has cut, and whether registered forge consumers pin it |
 | `knives consumers [FORK] [--consumer PATH]...` | compare registered forge consumers and ad-hoc local scans with the newest release on the live publish remote; reports only |
 | `knives pushed [BRANCH]... [--repo REPO]` | compare local branches with the live remote refs that own them; reports only |
-| `knives audit [REPO] [--all] [--no-github]` | reconcile remote refs, open pull heads, recorded cuts, and anonymous heads, with one row of facts per maintained branch (the `using-knives` skill has the fields); reports only and never repairs |
+| `knives audit [REPO] [--all] [--no-github]` | reconcile remote refs, open pull heads, recorded cuts and edits, and anonymous heads, with one row of facts per maintained branch (the `using-knives` skill has the fields); reports only and never repairs |
 | `knives status` | the main report |
 | `knives pr NUMBER [--repo REPO] [--timeline]` | one pull request's live state; `--timeline` adds its bounded forge event log |
 | `knives sync` | fetch, then classify what happened to each tracked pull request |
 | `knives preflight` | the facts to check before contributing upstream |
-| `knives start` | take a branch and get your own workspace: on its tip, or on the release's shared base for a new one; waits for the claim lock, and a refusal names the holder (the `using-knives` skill has the lock's mechanism, wait and messages); states the fork's `immutable_heads()` (trunk and tags, with the trunk named on every knives remote) in the repo's jj config where none is stated |
+| `knives start` | take a branch and get your own workspace: on its tip, or on the release's shared base for a new one; waits for the claim lock, and a refusal names the holder (the `using-knives` skill has the lock's mechanism, wait and messages); states the fork's `immutable_heads()` (the trunk, named on every knives remote, and every tag fetched from upstream; the fork's own release tags stay rewritable) in the repo's jj config where none is stated, and refreshes the one it wrote earlier |
 | `knives finish` | hand a branch back so another agent can pick it up; its bookmark and any open pull request survive |
 | `knives track` | state which pull request a branch belongs to, when inference cannot find it |
 | `knives depends` | record that a branch cannot land before another repo's pull request |
 | `knives notch [SUBJECT] [-m TEXT] [--disposition TOKEN]` | read the ledger or write a human note; dispositions require evidence, `--dispositions` reads terminal rulings, and `--verify` re-checks selected entries |
+| `knives ledger sweep` | commit, pull and push the shared ledger; every write starts one in the background |
+| `knives ledger migrate` | move what an older knives left onto what this one reads: the branch statements `state.json` kept, one statement entry each, and every fork's ledger directory, state keys and workspace sightings from its registry key to its upstream name; a second run changes nothing |
 | `knives release` | plan a release, edit its membership, cut one, or reap superseded cuts |
 | `knives release members [REF] [--verify] [--carries REV] [--census] [--no-github]` | list a release's direct member parents, their holders and advances; `--verify` audits every member's content in the release; `--carries REV` asks whether REV's content is carried — by REF, or by every live release and upstream trunk; `--census` asks that of every maintained branch, conditionally checks superseded releases, and reports qualified orphans |
 | `knives register [DIR]` | print the registry entry for a checkout, or `already registered as <name>`; writes nothing |
@@ -252,9 +299,10 @@ standard error for every forge call. Timing is diagnostic output and does not ch
 `knives gh -- <args...>` absorbs the fork-routing logic of the `gh` bash shim:
 
 * **Shim re-entry**: invoked with the `knives-gh-shim` first on PATH and no `KNIVES_GH_SHIM_DEPTH` marker, `knives gh` hands the call to that shim verbatim and does nothing else. The shim applies its agent-session rules (no keyring login, the App routing include) and re-enters knives with the depth marker and `KNIVES_REAL_GH` set, so a direct `knives gh` never runs gh on the user's own login where `gh` would not. The depth marker decides, not `KNIVES_REAL_GH`: a hand-set override with the shim on PATH still re-enters it, so the override is not a way around the shim.
-* **Target resolution**: `-R` passthrough, `gh repo set-default` markers, remote preference, and `gh api` owner extraction.
-* **Token export**: queries git credential config for `gh-app-token`, asks it over the credential-helper protocol, and exports `GH_TOKEN` for the child process. The helper's stderr is relayed; when it exits non-zero, answers `quit=1`, or answers something that is not UTF-8, `knives gh` exits with that code (1 for the last two) instead of running gh. Only an exit-0 answer with no password leaves gh on its own auth.
-* **Detached HEAD compensation**: injects the active jj bookmark into `gh pr` subcommands when git reports no symbolic HEAD.
+* **Target resolution**: the repository of a `gh pr`, `gh issue` or `gh agent-task view` selector URL (`gh pr view https://<host>/<owner>/<repo>/pull/<n>`, `.../issues/<n>`; gh acts on that repository whatever `-R` says, so it comes first), `-R` passthrough, the repository a `gh repo view|clone|fork|edit|delete|archive|unarchive|sync|set-default` call names (`gh repo view <owner>/<repo>`, also after `--`; `gh repo fork --org <org>` routes by the organization it creates the fork in), `GH_REPO`, `gh repo set-default` markers, remote preference, and `gh api` owner extraction.
+* **Token export**: queries git credential config for `gh-app-token`, asks it over the credential-helper protocol, and exports `GH_TOKEN` for the child process. The helper's stderr is relayed; when it exits non-zero, answers `quit=1`, or answers something that is not UTF-8, `knives gh` exits with that code (1 for the last two) instead of running gh. Only an exit-0 answer with no password leaves gh on its own auth. gh holds that token for the whole call, so knives tells the helper, through `GH_APP_TOKEN_MIN_LIFETIME`, how many seconds it must stay valid: a fresh installation token's full hour for a call that watches (`gh run watch`, `gh pr checks --watch`, `gh agent-task create|view --follow`), half an hour for any other. The helper mints afresh rather than hand out a cached token with less life left.
+* **Watch restarts**: `gh run watch` and `gh pr checks --watch` on a token knives minted run for 55 minutes at most, since gh cannot take a new token mid-call. Still watching then, gh is ended (SIGTERM), the terminal is taken out of gh's alternate screen, a fresh token is minted, one stderr line says so, and the same command runs again; the last run's exit status is the call's, so `--exit-status` and `pr checks`' exit 8 keep their meaning. `gh agent-task … --follow` is never restarted: gh runs agent-task commands only on a device-flow OAuth login, never an App token, and a rerun `create` would submit a second task. Neither is a watch on an inherited `GH_TOKEN`. A positive `KNIVES_GH_WATCH_RESTART_SECS` overrides the 55 minutes (for tests).
+* **Detached HEAD compensation**: inside a jj checkout, where git's HEAD is detached, `gh pr` subcommands get the active jj bookmark injected as their target when the call names none. Those `gh pr` calls run gh with a `git` wrapper first on its PATH that answers HEAD reads (`symbolic-ref HEAD`, `rev-parse --abbrev-ref HEAD`, `branch --show-current`) with that bookmark, or `__jj_detached__` when the working copy has none; every other git invocation goes to the next `git` past the wrapper on PATH, and that git runs with PATH cut to the entries after the wrapper, so a shim below it that scans PATH for the real git cannot pick the wrapper and exec back into it.
 
 The `--` delimiter is required. All arguments after `--` are passed to `gh` verbatim.
 
@@ -289,7 +337,7 @@ Before cutting, the orphan gate verifies that no commits exist reachable only fr
 
 Before the content audit runs, a cut with the same tree and the same parents as the previous cut on the publish remote is refused: a new name would ship nothing and only ask consumers to re-pin. The one exception is a dated release every consumer pins by revision: the edit verbs refuse it (editing in place would reach nobody) and say to cut a new dated release, so a verbatim cut under a name that sorts after it is allowed and says why, and the edits then apply to the new, unpinned name. A fixed release branch (which has no other name to take) stays refused. Before either comparison, a dated name that does not sort after the newest release is refused outright: the reap after a dated cut keeps only the newest name, so such a cut would be created and taken straight back in the same command. A member rewritten with the same content is a new parent, so a cut of it is a new composition. A previous cut not yet pushed has no consumer to protect and is not compared.
 
-A second pre-publish gate holds the candidate against the previous cut's ledger event — the only record of a parent set that survives the release bookmark moving, since every edit relocates the name and the next cut reaps the superseded commit. A recorded member whose content the candidate does not carry (not a parent, not an ancestor of one, and its net diff absent from the candidate tree) refuses the cut and is named; a member that landed upstream and entered the candidate through its base passes without comment. `--allow-drop` states the drop is intended, and the new cut's ledger event then records exactly which members were dropped.
+A second pre-publish gate holds the candidate against the previous cut's ledger event — the only record of a parent set that survives the release bookmark moving, since every edit relocates the name and abandons the commit it replaced unless something else rests on it. A recorded member whose content the candidate does not carry (not a parent, not an ancestor of one, and its net diff absent from the candidate tree) refuses the cut and is named; a member that landed upstream and entered the candidate through its base passes without comment. `--allow-drop` states the drop is intended, and the new cut's ledger event then records exactly which members were dropped.
 
 `knives release cut` audits a candidate merge built in a scratch transaction that is never committed. The audit replays each member's net diff, measured from the members' fork point with the upstream trunk, against the candidate cut tree to ensure no carried content was lost in an auto-merge or lockfile resolution, and checks for unexplained diff drift against the previous release. Divergence the previous release already carried is a recorded conflict resolution: it is reported as carried forward, never refused — the audit charges a cut only with divergence it introduces. A failed audit writes nothing at all — the candidate simply evaporates — and a passing one publishes the creation and naming of the release as a single operation, after verifying the published tree is identical to the audited one.
 
@@ -313,6 +361,20 @@ Claude Code adds guidance when a relevant tool call reaches a foreign repository
 add separate guidance for the session repository because Claude Code already loads that
 repository's `CLAUDE.md`.
 
+The OpenCode hook, which the oh-my-pi extension (`omp/`) also drives, leaves out any instruction
+file whose text the session already holds: one the session's system prompt carries, and the same
+text injected earlier in the session from any checkout, until compaction clears that record. Only
+oh-my-pi shows the hook its system prompt, so only there is the session's own `AGENTS.md` never
+injected a second time. Parallel tool calls claim guidance under one lock, so one of them injects
+it.
+
+oh-my-pi also shows the hook which of the guidance blocks it injected are still in the tool
+results the model sees. omp's shake and its pruning of superseded reads rewrite those results in
+place, and a compaction summarizes them away; none of these reliably reaches the hook as an event.
+A block counts as held while the context shows it. Once it does not, its guidance is due again,
+once, on the next call that touches that repository. A block from a call of the current turn
+counts as held until the turn is over, since the context does not show that turn's results yet.
+
 The boundary that made the gap is a security control, so both adapters re-establish an equivalent
 one rather than removing it. The `[trust]` rules are the allowlist: only a repository they name —
 by identity, owner, or directory — contributes guidance, and a fork entry alone contributes the
@@ -334,7 +396,9 @@ It does not create pull requests. That is `gh pr create`.
 
 It does not replace jj. General version control stays where it is.
 
-It does not coordinate across machines.
+It does not keep machines in step on its own: it shares what agents recorded (the ledger) through
+a git repository you name, and nothing else. Claims, sightings and pull request records stay on
+the machine that made them.
 
 It does not judge. Anything of the form "have you read the contributing guide and does this
 change comply" is a question for a person or an agent, not a CLI, and the tool does not pretend

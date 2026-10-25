@@ -20,7 +20,22 @@ mod lab;
 use knives::jj::Repo;
 use lab::{Lab, operation_ids, release_test_home};
 use serde_json::Value;
+use std::os::unix::fs::PermissionsExt as _;
+use std::path::Path;
 use std::process::Command;
+
+/// Make the ledger directory `ledger` readable and unwritable, so a store
+/// open reads it and only an append fails; `false` when this user writes it
+/// anyway (root ignores modes), and the caller has nothing to test.
+fn unwritable(ledger: &Path) -> bool {
+    std::fs::set_permissions(ledger, std::fs::Permissions::from_mode(0o555)).expect("chmod");
+    if tempfile::NamedTempFile::new_in(ledger).is_ok() {
+        std::fs::set_permissions(ledger, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        return false;
+    }
+    true
+}
+
 #[test]
 fn start_resumes_the_same_harness_sessions_claim_without_mutating_it() {
     // A second invocation from the same harness session must acknowledge the
@@ -33,7 +48,6 @@ fn start_resumes_the_same_harness_sessions_claim_without_mutating_it() {
             .current_dir(&lab.work)
             .env("KNIVES_CONFIG_HOME", home.path())
             .env("HOME", lab.temp_path())
-            .env("JJ_CONFIG", "/dev/null")
             .env("KNIVES_OWNER", "agent-one")
             .output()
             .expect("run start")
@@ -104,7 +118,6 @@ fn start_refuses_two_anonymous_owners_with_the_same_name() {
             .current_dir(outside.path())
             .env("KNIVES_CONFIG_HOME", home.path())
             .env("HOME", lab.temp_path())
-            .env("JJ_CONFIG", "/dev/null")
             .env_remove("KNIVES_OWNER")
             .env_remove("CLAUDE_CODE_SESSION_ID")
             .env_remove("OMP_SESSION_ID")
@@ -158,7 +171,6 @@ fn start_refuses_another_harness_session_and_names_the_holder() {
             .current_dir(&lab.work)
             .env("KNIVES_CONFIG_HOME", home.path())
             .env("HOME", lab.temp_path())
-            .env("JJ_CONFIG", "/dev/null")
             .env("KNIVES_OWNER", owner)
             .output()
             .expect("run start")
@@ -220,7 +232,6 @@ fn start_from_inside_the_claimed_workspace_resumes_by_possession() {
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
         .env("HOME", lab.temp_path())
-        .env("JJ_CONFIG", "/dev/null")
         .env("KNIVES_OWNER", "agent-one")
         .output()
         .expect("first start");
@@ -236,7 +247,6 @@ fn start_from_inside_the_claimed_workspace_resumes_by_possession() {
         .current_dir(&workspace)
         .env("KNIVES_CONFIG_HOME", home.path())
         .env("HOME", lab.temp_path())
-        .env("JJ_CONFIG", "/dev/null")
         .env_remove("KNIVES_OWNER")
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .env_remove("OMP_SESSION_ID")
@@ -266,7 +276,6 @@ fn start_from_inside_the_claimed_workspace_resumes_by_possession() {
         .current_dir(&workspace)
         .env("KNIVES_CONFIG_HOME", home.path())
         .env("HOME", lab.temp_path())
-        .env("JJ_CONFIG", "/dev/null")
         .env("KNIVES_OWNER", "agent-one")
         .output()
         .expect("read events");
@@ -294,7 +303,6 @@ fn start_force_seizes_and_records_the_previous_owner() {
             .current_dir(&lab.work)
             .env("KNIVES_CONFIG_HOME", home.path())
             .env("HOME", lab.temp_path())
-            .env("JJ_CONFIG", "/dev/null")
             .env("KNIVES_OWNER", owner)
             .output()
             .expect("run start")
@@ -399,7 +407,6 @@ fn start_adopts_an_existing_workspace_for_an_unclaimed_branch() {
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
         .env("HOME", lab.temp_path())
-        .env("JJ_CONFIG", "/dev/null")
         .env("KNIVES_OWNER", "agent-one")
         .output()
         .expect("adopt workspace");
@@ -443,7 +450,6 @@ fn start_adopts_a_no_cleanup_forgotten_workspace_without_resetting_it() {
             .current_dir(&lab.work)
             .env("KNIVES_CONFIG_HOME", home.path())
             .env("HOME", lab.temp_path())
-            .env("JJ_CONFIG", "/dev/null")
             .env("KNIVES_OWNER", "agent-one")
             .output()
             .expect("run start")
@@ -471,7 +477,6 @@ fn start_adopts_a_no_cleanup_forgotten_workspace_without_resetting_it() {
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
         .env("HOME", lab.temp_path())
-        .env("JJ_CONFIG", "/dev/null")
         .env("KNIVES_OWNER", "agent-one")
         .output()
         .expect("finish without cleanup");
@@ -544,7 +549,6 @@ fn start_refuses_a_same_named_workspace_from_another_repository() {
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
         .env("HOME", lab.temp_path())
-        .env("JJ_CONFIG", "/dev/null")
         .env("KNIVES_OWNER", "agent-one")
         .output()
         .expect("start against foreign workspace");
@@ -604,7 +608,6 @@ fn start_resume_reports_a_missing_workspace_without_rebuilding_it() {
             .current_dir(&lab.work)
             .env("KNIVES_CONFIG_HOME", home.path())
             .env("HOME", lab.temp_path())
-            .env("JJ_CONFIG", "/dev/null")
             .env("KNIVES_OWNER", "agent-one")
             .output()
             .expect("run start")
@@ -635,7 +638,8 @@ fn start_resume_reports_a_missing_workspace_without_rebuilding_it() {
 
 #[test]
 fn force_claim_does_not_save_state_when_its_provenance_cannot_be_appended() {
-    // Given: a held claim and a ledger path deliberately made unwritable as a directory.
+    // Given: a held claim and a ledger directory the store can read but no
+    // entry can be written into.
     let lab = lab::Lab::new();
     let (home, _consumer) = release_test_home(&lab);
     let run = |owner: &str, args: &[&str]| {
@@ -644,7 +648,6 @@ fn force_claim_does_not_save_state_when_its_provenance_cannot_be_appended() {
             .current_dir(&lab.work)
             .env("KNIVES_CONFIG_HOME", home.path())
             .env("HOME", lab.temp_path())
-            .env("JJ_CONFIG", "/dev/null")
             .env("KNIVES_OWNER", owner)
             .output()
             .expect("run start")
@@ -663,9 +666,13 @@ fn force_claim_does_not_save_state_when_its_provenance_cannot_be_appended() {
     );
     assert!(first.status.success(), "{first:?}");
     let state_before = std::fs::read(home.path().join("state.json")).expect("read state");
-    let ledger = home.path().join("ledger");
-    std::fs::rename(&ledger, home.path().join("ledger-backup")).expect("move ledger aside");
-    std::fs::write(&ledger, "not a directory").expect("block ledger append");
+    // Block the append, not the read: the store reads the fork's ledger when
+    // it opens, and a ledger it cannot read would stop the command there,
+    // before the append this test is about.
+    let ledger = home.path().join("ledger").join("demo");
+    if !unwritable(&ledger) {
+        return;
+    }
 
     // When: another owner forces the claim but its provenance write fails.
     let forced = run(
@@ -681,11 +688,18 @@ fn force_claim_does_not_save_state_when_its_provenance_cannot_be_appended() {
             "rescue stalled work",
         ],
     );
+    std::fs::set_permissions(&ledger, std::fs::Permissions::from_mode(0o755)).expect("chmod");
 
-    // Then: the forced claim never becomes current without its event.
+    // Then: the append is what failed, and the forced claim never becomes
+    // current without its event.
     assert!(
         !forced.status.success(),
         "force unexpectedly succeeded: {forced:?}"
+    );
+    let stderr = String::from_utf8_lossy(&forced.stderr);
+    assert!(
+        stderr.contains(&format!("writing {}", ledger.display())),
+        "the command failed somewhere other than the append: {stderr}"
     );
     assert_eq!(
         std::fs::read(home.path().join("state.json")).expect("read state"),
@@ -711,15 +725,16 @@ fn force_finish_does_not_save_state_when_its_provenance_cannot_be_appended() {
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
         .env("HOME", lab.temp_path())
-        .env("JJ_CONFIG", "/dev/null")
         .env("KNIVES_OWNER", "agent-one")
         .output()
         .expect("start claim");
     assert!(start.status.success(), "{start:?}");
     let state_before = std::fs::read(home.path().join("state.json")).expect("read state");
-    let ledger = home.path().join("ledger");
-    std::fs::rename(&ledger, home.path().join("ledger-backup")).expect("move ledger aside");
-    std::fs::write(&ledger, "not a directory").expect("block ledger append");
+    // Block the append, not the read, as above.
+    let ledger = home.path().join("ledger").join("demo");
+    if !unwritable(&ledger) {
+        return;
+    }
 
     let finished = Command::new(env!("CARGO_BIN_EXE_knives"))
         .args([
@@ -736,14 +751,19 @@ fn force_finish_does_not_save_state_when_its_provenance_cannot_be_appended() {
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
         .env("HOME", lab.temp_path())
-        .env("JJ_CONFIG", "/dev/null")
         .env("KNIVES_OWNER", "agent-two")
         .output()
         .expect("force finish");
+    std::fs::set_permissions(&ledger, std::fs::Permissions::from_mode(0o755)).expect("chmod");
 
     assert!(
         !finished.status.success(),
         "finish unexpectedly succeeded: {finished:?}"
+    );
+    let stderr = String::from_utf8_lossy(&finished.stderr);
+    assert!(
+        stderr.contains(&format!("writing {}", ledger.display())),
+        "the command failed somewhere other than the append: {stderr}"
     );
     assert_eq!(
         std::fs::read(home.path().join("state.json")).expect("read state"),
@@ -770,7 +790,6 @@ fn forced_finish_with_supersession_writes_one_atomic_provenance_event() {
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
         .env("HOME", lab.temp_path())
-        .env("JJ_CONFIG", "/dev/null")
         .env("KNIVES_OWNER", "agent-one")
         .output()
         .expect("start claim");
@@ -794,7 +813,6 @@ fn forced_finish_with_supersession_writes_one_atomic_provenance_event() {
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
         .env("HOME", lab.temp_path())
-        .env("JJ_CONFIG", "/dev/null")
         .env("KNIVES_OWNER", "agent-two")
         .output()
         .expect("force finish");
@@ -802,8 +820,9 @@ fn forced_finish_with_supersession_writes_one_atomic_provenance_event() {
     // Then: one durable event proves both facts, so no second append can strand a false release.
     assert!(finished.status.success(), "{finished:?}");
     let entries = knives::ledger::Ledger::at(home.path().join("ledger").join("demo"))
-        .entries()
-        .expect("read ledger");
+        .read()
+        .expect("read ledger")
+        .entries;
     assert_eq!(entries.len(), 2, "was: {entries:?}");
     let event = &entries[1].text;
     assert!(
@@ -814,6 +833,14 @@ fn forced_finish_with_supersession_writes_one_atomic_provenance_event() {
     assert!(
         event.contains("superseded by feat/replacement"),
         "event: {event}"
+    );
+    assert_eq!(
+        entries[1].statement,
+        Some(knives::statement::Statement {
+            kind: knives::statement::StatementKind::Superseded,
+            value: Some("feat/replacement".to_owned()),
+        }),
+        "the forced release's one event carries the supersession"
     );
 }
 
@@ -842,7 +869,6 @@ fn start_refuses_a_forgotten_same_repo_workspace_with_a_different_name_before_re
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
         .env("HOME", lab.temp_path())
-        .env("JJ_CONFIG", "/dev/null")
         .env("KNIVES_OWNER", "agent-one")
         .output()
         .expect("start against another branch workspace");
@@ -890,7 +916,6 @@ fn start_refuses_a_malformed_foreign_workspace_before_loading_it() {
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
         .env("HOME", lab.temp_path())
-        .env("JJ_CONFIG", "/dev/null")
         .env("KNIVES_OWNER", "agent-one")
         .output()
         .expect("start against malformed foreign workspace");
@@ -930,7 +955,6 @@ fn start_force_without_why_is_a_usage_error() {
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
         .env("HOME", lab.temp_path())
-        .env("JJ_CONFIG", "/dev/null")
         .output()
         .expect("parse start");
 
@@ -960,7 +984,6 @@ fn cli_dispatch_records_an_observation_before_running_the_command() {
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
         .env("HOME", lab.temp_path())
-        .env("JJ_CONFIG", "/dev/null")
         .env("KNIVES_OWNER", "agent-one")
         .output()
         .expect("run knives");
