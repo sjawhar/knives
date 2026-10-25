@@ -403,11 +403,11 @@ fn the_probe_never_abandons_a_commit_it_did_not_create() {
 fn a_branch_that_conflicts_at_its_first_commit_is_judged_without_replaying_the_rest() {
     // Replaying a commit onto a conflicted parent carries the parent's conflict
     // forward with this commit's change added to it, so down a long branch whose
-    // first replay conflicts the unresolved conflict grows and the later replays
-    // cost far more than the first: on a 1,328-commit branch forked 31,332
-    // commits behind the trunk, a `knives status` that replayed the whole range
-    // was still running when it was killed at 900 s. The first conflict already
-    // decides the verdict, so nothing past it is replayed.
+    // first replay conflicts the unresolved conflict can grow, and the later
+    // replays then cost far more than the first: on a 1,328-commit branch forked
+    // 31,332 commits behind the trunk, a `knives status` that replayed the whole
+    // range was still running when it was killed at 900 s. The first conflict
+    // already decides the verdict, so nothing past it is replayed.
     // Given: upstream adds a file, and a twelve-commit branch writes its own
     // version of it in every commit
     let lab = Lab::new();
@@ -478,21 +478,25 @@ fn each_commit_is_replayed_onto_the_replay_of_its_parent() {
 #[test]
 fn a_merge_is_replayed_onto_the_replays_of_every_parent_in_the_range() {
     // Given: two branches merged into one, and a commit past that merge which
-    // rewrites the file only the second branch added
+    // rewrites the file each branch added
     let lab = Lab::new();
     lab.advance_upstream("advance\n");
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     lab.branch("feat/beta", "beta.txt", "beta\n");
     lab.octopus("feat/pair", "feat/alpha", "feat/beta");
-    extend_branch(&lab, "feat/pair", "beta.txt", "beta rewritten\n");
+    lab.jj_work(["new", "feat/pair", "-m", "rewrite both files"]);
+    std::fs::write(lab.work.join("alpha.txt"), "alpha rewritten\n").expect("rewrite alpha");
+    std::fs::write(lab.work.join("beta.txt"), "beta rewritten\n").expect("rewrite beta");
+    lab.jj_work(["bookmark", "set", "feat/pair", "-r", "@"]);
+    lab.jj_work(["new"]);
 
     // When: the branch is probed against the trunk
     let outcome = probe_landed(&lab.work, &BranchName::new("feat/pair"), "main@upstream")
         .expect("probe landed");
 
     // Then: it replays clean. The merge lands on the replays of both branches,
-    // so the commit past it finds the second branch's file; drop either parent
-    // and that commit edits a file its parent does not have, and conflicts.
+    // so the commit past it finds both files; drop either parent's replay and
+    // that commit rewrites a file its own parent does not have, and conflicts.
     assert_eq!(outcome, RebaseOutcome::CleanNonEmpty);
 }
 

@@ -670,9 +670,10 @@ impl Repo {
     /// Every commit a revset expression evaluates to, in no particular order.
     ///
     /// One evaluation answers membership for a whole set. The alternative, an
-    /// ancestry query per commit, walks back from each base until it reaches
-    /// that commit's generation, which on a branch forked far behind the trunk
-    /// is every trunk commit since the fork.
+    /// ancestry query per commit, walks back from each base through the index
+    /// until it reaches that commit's generation, which on a branch forked far
+    /// behind the trunk can be a large part of the trunk — once per commit in
+    /// the range.
     fn revset_ids(
         &self,
         expression: Arc<ResolvedRevsetExpression>,
@@ -1077,10 +1078,11 @@ fn ls_remote_args<'a>(remote_url: &'a str, patterns: &[&'a str]) -> Vec<&'a str>
     args
 }
 
-/// Replays a branch onto `onto` as a dropped-transaction read: no operation
-/// records it and no bookmark of the repository's own moves. Each replay does
-/// stay in the commit store, under the internal ref jj gives every commit it
-/// writes, until a `jj util gc` collects what no head reaches.
+/// Replays a branch onto `onto` as a dropped-transaction read.
+///
+/// No operation records it and no bookmark of the repository's own moves. Each
+/// replay does stay in the commit store, under the internal ref jj gives every
+/// commit it writes, until a `jj util gc` collects what no head reaches.
 pub fn probe_landed(
     repo: &Path,
     branch: &BranchName,
@@ -1206,8 +1208,9 @@ pub fn probe_revision(
 /// question. The first conflicted replay ends the replay, because it already
 /// decides the outcome and because replaying past it does not scale: a commit
 /// replayed onto a conflicted parent carries that conflict with its own change
-/// added, so down a long branch the unresolved conflict grows and the later
-/// replays cost far more than the first.
+/// added, so down a long branch the unresolved conflict can grow, and the later
+/// replays then cost far more than the first. On the branches measured for this
+/// change, replaying the whole range never finished.
 fn replay_range(
     mut_repo: &mut MutableRepo,
     targets: &[JjCommitId],
