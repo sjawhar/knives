@@ -1736,7 +1736,7 @@ dependencies = [
 
 [[package]]
 name = "knives"
-version = "3.1.8"
+version = "3.1.9"
 dependencies = [
  "anyhow",
  "clap",
