@@ -344,16 +344,19 @@ fn the_range_probe_cleans_up_every_scratch_commit() {
     lab.octopus("feat/pair", "feat/alpha", "feat/beta");
     let before = lab.revision(&lab.work, "all()", "commit_id ++ \"\\n\"");
 
-    // When: the landed-range probe cleans up the commits it replayed.
+    // When: the landed-range probe replays the octopus range in a transaction
+    // it drops.
     let outcome = knives::jj::probe_landed(
         &lab.work,
         &knives::ids::BranchName::new("feat/pair"),
         "main",
-    );
-    assert!(
-        outcome.is_ok(),
-        "an octopus range must be probed, not refused: {outcome:?}"
-    );
+    )
+    .expect("an octopus range must be probed, not refused");
+
+    // Then: the two branch commits replay with content, and the merge of their
+    // replays adds nothing of its own — a verdict every replay feeds, not only
+    // the last one, which is empty here.
+    assert_eq!(outcome, RebaseOutcome::CleanNonEmpty);
 
     // Then: enumerating every visible commit finds no scratch-chain residue.
     let after = lab.revision(&lab.work, "all()", "commit_id ++ \"\\n\"");
@@ -400,10 +403,11 @@ fn the_probe_never_abandons_a_commit_it_did_not_create() {
 fn a_branch_that_conflicts_at_its_first_commit_is_judged_without_replaying_the_rest() {
     // Replaying a commit onto a conflicted parent carries the parent's conflict
     // forward with this commit's change added to it, so down a long branch whose
-    // first replay conflicts the unresolved conflict accumulates terms and each
-    // replay costs more than the last: a branch of a thousand commits forked far
-    // behind the trunk keeps `knives status` busy for over an hour. The first
-    // conflict already decides the verdict, so nothing past it is replayed.
+    // first replay conflicts the unresolved conflict grows and the later replays
+    // cost far more than the first: on a 1,328-commit branch forked 31,332
+    // commits behind the trunk, a `knives status` that replayed the whole range
+    // was still running when it was killed at 900 s. The first conflict already
+    // decides the verdict, so nothing past it is replayed.
     // Given: upstream adds a file, and a twelve-commit branch writes its own
     // version of it in every commit
     let lab = Lab::new();
@@ -468,5 +472,44 @@ fn each_commit_is_replayed_onto_the_replay_of_its_parent() {
     // Then: it replays clean. The second commit lands on the replay of the
     // first, which has the file; replayed onto the trunk itself it would edit
     // a file the trunk does not have, and conflict.
+    assert_eq!(outcome, RebaseOutcome::CleanNonEmpty);
+}
+
+#[test]
+fn a_merge_is_replayed_onto_the_replays_of_every_parent_in_the_range() {
+    // Given: two branches merged into one, and a commit past that merge which
+    // rewrites the file only the second branch added
+    let lab = Lab::new();
+    lab.advance_upstream("advance\n");
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    lab.octopus("feat/pair", "feat/alpha", "feat/beta");
+    extend_branch(&lab, "feat/pair", "beta.txt", "beta rewritten\n");
+
+    // When: the branch is probed against the trunk
+    let outcome = probe_landed(&lab.work, &BranchName::new("feat/pair"), "main@upstream")
+        .expect("probe landed");
+
+    // Then: it replays clean. The merge lands on the replays of both branches,
+    // so the commit past it finds the second branch's file; drop either parent
+    // and that commit edits a file its parent does not have, and conflicts.
+    assert_eq!(outcome, RebaseOutcome::CleanNonEmpty);
+}
+
+#[test]
+fn an_empty_commit_at_the_tip_does_not_make_a_branch_read_as_landed() {
+    // The verdict is `Empty` — the branch landed, delete it — only when every
+    // replay is empty. Given: a branch that adds a file and then re-states it
+    // in a second commit, which changes nothing and so replays empty
+    let lab = Lab::new();
+    lab.advance_upstream("advance\n");
+    lab.branch("feat/tail", "added.txt", "ours\n");
+    extend_branch(&lab, "feat/tail", "added.txt", "ours\n");
+
+    // When: the branch is probed against the trunk
+    let outcome = probe_landed(&lab.work, &BranchName::new("feat/tail"), "main@upstream")
+        .expect("probe landed");
+
+    // Then: the first replay's content decides it, not the empty last one
     assert_eq!(outcome, RebaseOutcome::CleanNonEmpty);
 }

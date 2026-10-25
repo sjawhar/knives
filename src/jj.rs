@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -670,13 +670,14 @@ impl Repo {
     /// Every commit a revset expression evaluates to, in no particular order.
     ///
     /// One evaluation answers membership for a whole set. The alternative, an
-    /// ancestry query per commit, walks the history under that commit each time,
-    /// which on a branch forked far behind the trunk is most of the trunk.
+    /// ancestry query per commit, walks back from each base until it reaches
+    /// that commit's generation, which on a branch forked far behind the trunk
+    /// is every trunk commit since the fork.
     fn revset_ids(
         &self,
         expression: Arc<ResolvedRevsetExpression>,
         revision: &str,
-    ) -> Result<std::collections::HashSet<JjCommitId>, JjError> {
+    ) -> Result<HashSet<JjCommitId>, JjError> {
         let revision_error = |error: RevsetEvaluationError| JjError::Revision {
             revision: revision.to_owned(),
             detail: error.to_string(),
@@ -763,9 +764,10 @@ impl Repo {
     /// branch on our commits leaves the branch itself untouched, so the only trace is that
     /// its tip is reachable from somewhere else.
     ///
-    /// One evaluation answers for every bookmark: `commit::tips` holds exactly the
-    /// tips that descend from `commit`. A fork carries every upstream branch as a
-    /// bookmark, so an ancestry query per tip would be a thousand walks per branch.
+    /// One evaluation answers for every bookmark: of the tips asked about,
+    /// `commit::tips` holds exactly those that descend from `commit`. A fork
+    /// carries every upstream branch as a bookmark, so an ancestry query per tip
+    /// would walk the history once per bookmark, for every branch probed.
     pub fn branches_containing(
         &self,
         commit: &CommitId,
@@ -875,7 +877,7 @@ impl Repo {
             revision: id.to_string(),
             detail: error.to_string(),
         };
-        let revset = jj_lib::revset::ResolvedRevsetExpression::commits(vec![id.clone()])
+        let revset = ResolvedRevsetExpression::commits(vec![id.clone()])
             .descendants()
             .evaluate(self.repo.as_ref())
             .map_err(|error| revision_error(&error))?;
@@ -909,7 +911,7 @@ impl Repo {
         let commits = self.commits_between(&bases, tip)?;
         // Every parent of a commit in the range is reachable from the tip, so it
         // is beyond every base exactly when it is in the range.
-        let in_range: std::collections::HashSet<&JjCommitId> =
+        let in_range: HashSet<&JjCommitId> =
             commits.iter().map(jj_lib::commit::Commit::id).collect();
         Ok(commits
             .iter()
@@ -1075,7 +1077,10 @@ fn ls_remote_args<'a>(remote_url: &'a str, patterns: &[&'a str]) -> Vec<&'a str>
     args
 }
 
-/// Replays a branch onto `onto` as a dropped-transaction read: nothing is written.
+/// Replays a branch onto `onto` as a dropped-transaction read: no operation
+/// records it and no bookmark of the repository's own moves. Each replay does
+/// stay in the commit store, under the internal ref jj gives every commit it
+/// writes, until a `jj util gc` collects what no head reaches.
 pub fn probe_landed(
     repo: &Path,
     branch: &BranchName,
@@ -1201,15 +1206,14 @@ pub fn probe_revision(
 /// question. The first conflicted replay ends the replay, because it already
 /// decides the outcome and because replaying past it does not scale: a commit
 /// replayed onto a conflicted parent carries that conflict with its own change
-/// added, so down a long branch the unresolved conflict accumulates terms and
-/// each replay costs more than the one before.
+/// added, so down a long branch the unresolved conflict grows and the later
+/// replays cost far more than the first.
 fn replay_range(
     mut_repo: &mut MutableRepo,
     targets: &[JjCommitId],
     onto: &JjCommitId,
 ) -> Result<RebaseOutcome, JjError> {
-    let mut replays: std::collections::HashMap<&JjCommitId, JjCommitId> =
-        std::collections::HashMap::new();
+    let mut replays: HashMap<&JjCommitId, JjCommitId> = HashMap::new();
     let mut all_empty = true;
     for original in targets.iter().rev() {
         let commit = mut_repo
@@ -2161,7 +2165,7 @@ fn duplicated_release(
     (source, message): (&jj_lib::commit::Commit, Option<&str>),
     parent_ids: &[JjCommitId],
 ) -> Result<jj_lib::commit::Commit, JjError> {
-    let mut descriptions = std::collections::HashMap::new();
+    let mut descriptions = HashMap::new();
     if let Some(message) = message {
         descriptions.insert(source.id().clone(), message.to_owned());
     }
