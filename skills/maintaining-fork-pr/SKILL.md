@@ -110,7 +110,7 @@ knives preflight
 
 ## 4. Repair and exercise the candidate
 
-- Append one reviewable repair commit per finding on your `@`. Never rewrite a branch commit or a shared descendant. Describe only your commits. The only sanctioned ancestry changes are the lone-branch rehome, the orchestrator's release-wide rebase, the same-content recovery, and a squash or rebase a maintainer asks for, which follows step 3's rules for a rehome. Never restore the shared operation log.
+- Append one reviewable repair commit per finding on your `@`. Never rewrite a branch commit or a shared descendant. Describe only your commits. The only sanctioned ancestry changes are the lone-branch rehome, the orchestrator's release-wide rebase, the same-content recovery, and a squash or rebase a maintainer asks for, which follows [references/rehome.md](references/rehome.md). Never restore the shared operation log.
 - Each repair records the failure (red) and the result after the repair (green) under the same conditions, with commands, output and commits. If a claim does not reproduce, investigate its premise. Never fake a pass or quietly weaken a gate. Judge pre-sweep changes against their fork point where that applies.
 - In the claimed workspace, run each applicable gate and each distinct test command in the PR body. Do not trust old counts. Then exercise the changed public behavior.
 - Keep separate evidence for static analysis, unit/integration tests and **end-to-end behavior on the real surface**. A unit suite is not e2e. If runtime proof belongs to the orchestrator's consumer environment, name the behavior and candidate to test. It stays unverified until the proof comes.
@@ -141,8 +141,8 @@ knives preflight
 
 ## 6. Independent review, push and publish
 
-- Write `<per-PR-scratch>/reviewer-packet.md` as [references/reviewer-packet.md](references/reviewer-packet.md) says and send it to the orchestrator. Before any push or publish, the reviewers get it for the same candidate: a fresh-context reviewer, and the `thermonuclear-deep-review` and `thermonuclear-code-quality` agents where the harness defines them. Each verdict names the candidate head. All run because a defect a maintainer finds costs them our work and us their trust.
-- Wait up to 30 minutes. An acknowledgement is not a verdict. On timeout, write `decision: reviewer verdict outstanding; repair commits <ids>; bookmark not moved` with evidence and hand back. The orchestrator, not the human, gets the verdict and resumes you.
+- Write `<per-PR-scratch>/reviewer-packet.md` as [references/reviewer-packet.md](references/reviewer-packet.md) says and send it to the orchestrator. Before any push or publish, the orchestrator starts the reviewers on it for the same candidate: a fresh-context reviewer, and the `thermonuclear-deep-review` and `thermonuclear-code-quality` agents where the harness defines them. Each verdict names the candidate head. All run because a defect a maintainer finds costs them our work and us their trust.
+- Wait up to 30 minutes. An acknowledgement is not a verdict. On timeout, write `handback: reviewer verdict outstanding; repair commits <ids>; bookmark not moved` with evidence and hand back. The orchestrator, not the human, gets the verdict and resumes you.
 - Drift is any of these:
   - the local bookmark is not the expected branch tip
   - the remote is not the original PR head
@@ -151,7 +151,7 @@ knives preflight
 
   A reviewed candidate ahead of the bookmark is not drift. Another branch that moves is not drift. Confirm these identities before you publish and after each command that can rewrite generated files.
 - A PASS does not cover gate-generated files. Make a new candidate through step 4 and send a fresh packet.
-- Paste each verdict verbatim into a `verify:` notch. Return a malformed verdict for clarification. A FAIL, or a blocking finding from either thermonuclear reviewer, blocks publication: repair the code or body, or resolve the drift. A `placement` FAIL goes back to the `fork-work` challenge first. Then refresh the packet for a new review. A verdict on an old tree never approves a new candidate.
+- Paste the fresh-context reviewer's verdict verbatim into a `verify:` notch. Record each thermonuclear verdict there as PASS or FAIL, with the reviewer's own text pasted verbatim beneath it: those reviewers keep their own format, and a blocking finding is a FAIL. Return a malformed verdict for clarification. A FAIL blocks publication: repair the code or body, or resolve the drift. A `placement` FAIL goes back to the `fork-work` challenge first. Then refresh the packet for a new review. A verdict on an old tree never approves a new candidate.
 - After every reviewer passes, and after you confirm the identities and the tree:
 
   ```sh

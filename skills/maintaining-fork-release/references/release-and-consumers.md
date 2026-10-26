@@ -14,7 +14,7 @@ Read this before you change, cut or publish a release or a consumer pin (step 5)
      - `upstream-pending, placement <notch anchor or commit>`: its `placement:` notch and commit body record the UPSTREAM verdict and the defect or capability gap. They also record the reproduction or red→green test that its upstream PR opens from.
      - `neither`.
    - Drop a `neither` member (`drop --why`) or return it to its author. Never compose it.
-   - The classification is disclosure, not a gate. An `upstream-pending` member ships when the release is gated and published. The consumer pins it without a wait for the upstream PR.
+   - A valid classification (`upstream-PR`, `upstream-pending`) is disclosure, not a gate. An `upstream-pending` member ships when the release is gated and published. The consumer pins it without a wait for the upstream PR.
    - Apply the ownership test of `fork-work` again: *if upstream main replaced the fork tomorrow, would anyone but us miss this?*
    - Operating policy (job lifetimes and reaping, caps, quotas, schedules, alerting) lives in the consumer. A fork member repairs the library's own machinery or adds a capability that nothing outside the library can give.
    - A policy-shaped member is a missing capability (UPSTREAM, with its PR in the same work) or CONSUMER work, which is `neither`. There is no third class.
@@ -25,11 +25,12 @@ Read this before you change, cut or publish a release or a consumer pin (step 5)
    - Before you publish, run the **resolution-delta guard**. Each later `cut`, `advance` and `rebase` carries a recorded resolution forward. Thus a whole-file restore from one parent silently reverts the content of the other parents in that file.
 
      ```sh
+     t=$(mktemp -d)                                                 # scratch outside the checkout, so jj does not snapshot it into the guard
      jj new '<release>-' -m guard                                   # fresh automerge of the release's parents
-     guard=$(jj log -r @ --no-graph -T commit_id)                   # save its id: the restores below need it
-     jj diff --from @ --to <release> --name-only | sort > delta      # the recorded resolution delta
-     jj resolve -r @ --list | awk '{print $1}' | sort > conflicted   # the paths that genuinely conflict
-     comm -23 delta conflicted                                       # must print nothing, or only recorded semantic conflicts
+     guard=$(jj log -r @ --no-graph -T commit_id)                   # save its id: the restores below need it, and jj resolves an abandoned commit by id
+     jj diff --from @ --to <release> --name-only | sort > "$t/delta"      # the recorded resolution delta
+     jj resolve -r @ --list | awk '{print $1}' | sort > "$t/conflicted"   # the paths that genuinely conflict
+     comm -23 "$t/delta" "$t/conflicted"                            # must print nothing, or only recorded semantic conflicts
      jj abandon @                                                    # drop the guard commit
      ```
 
