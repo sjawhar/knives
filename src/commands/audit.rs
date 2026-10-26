@@ -471,13 +471,14 @@ fn add_release_drifts(report: &mut Report, scan: &ReleaseDriftScan<'_>) {
 /// Hold one release ref against the commits knives wrote under its name.
 ///
 /// At the newest write it is silent. A commit with that write's change id,
-/// parents and tree is the write re-signed or metaedited — routine before a
-/// push, since knives writes unsigned commits. The publish remote at any
-/// earlier write of the name (or a re-signed copy of one) is knives' own work
-/// that a newer write has not been pushed over yet. Both are notes. Anything
-/// else is drift, a local name at an earlier write included: it is not what
-/// knives last wrote, whether it was moved back or the newer write came from
-/// another machine and is not fetched here.
+/// parents and tree is the write re-signed or metaedited: signed by a push
+/// under `git.sign-on-push`, written by a knives that did not yet sign as the
+/// user's jj does, or edited by hand since. The publish remote at any earlier
+/// write of the name (or a re-signed copy of one) is knives' own work that a
+/// newer write has not been pushed over yet. Both are notes. Anything else is
+/// drift, a local name at an earlier write included: it is not what knives
+/// last wrote, whether it was moved back or the newer write came from another
+/// machine and is not fetched here.
 ///
 /// Only the newest write must be readable: an older one whose commit never
 /// reached this machine — the ledger is shared — is skipped.

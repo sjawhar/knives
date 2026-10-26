@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
 use futures_core::Stream as _;
-use jj_lib::backend::CommitId as JjCommitId;
-use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
+use jj_lib::backend::{BackendError, CommitId as JjCommitId};
+use jj_lib::config::{ConfigLayer, ConfigResolutionContext, ConfigSource, StackedConfig};
 use jj_lib::default_backend_factories::{
     default_backend_factories, default_working_copy_factories,
 };
@@ -16,9 +16,11 @@ use jj_lib::matchers::EverythingMatcher;
 use jj_lib::merge::Merge;
 use jj_lib::merged_tree::MergedTree;
 use jj_lib::object_id::ObjectId as _;
+use jj_lib::op_heads_store;
 use jj_lib::op_store::{RefTarget, RemoteRef};
+use jj_lib::operation::Operation;
 use jj_lib::ref_name::{RefName as JjRefName, RemoteName as JjRemoteName};
-use jj_lib::repo::{MutableRepo, ReadonlyRepo, Repo as _, RepoLoader};
+use jj_lib::repo::{MutableRepo, ReadonlyRepo, Repo as _, RepoLoader, RepoLoaderError};
 use jj_lib::revset::{ResolvedRevsetExpression, RevsetEvaluationError, SymbolResolver, walk_revs};
 use jj_lib::rewrite::{CommitRewriter, duplicate_commits, merge_commit_trees, rebase_commit};
 use jj_lib::settings::UserSettings;
@@ -164,9 +166,65 @@ impl Repo {
         ))
     }
 
+    /// Open the repository at its head operation to read it, or to build
+    /// scratch commits that are dropped: signing stays off ([`Signing::Off`]).
     pub fn open(path: &Path) -> Result<Self, JjError> {
-        let settings = repo_settings(path)?;
-        let loader = RepoLoader::init_from_file_system(
+        Self::load(path, Signing::Off, None)
+    }
+
+    /// Open the repository at its head operation for a transaction that will
+    /// be committed: the commits it writes are signed as the user's jj would
+    /// sign them ([`Signing::AsUser`]).
+    fn open_to_write(path: &Path) -> Result<Self, JjError> {
+        Self::load(path, Signing::AsUser, None)
+    }
+
+    /// This repository at the same operation, opened for a transaction that
+    /// will be committed (see [`Repo::open_to_write`]).
+    fn to_write(&self) -> Result<Self, JjError> {
+        Self::load(&self.path, Signing::AsUser, Some(self.repo.operation()))
+    }
+
+    fn load(path: &Path, signing: Signing, at: Option<&Operation>) -> Result<Self, JjError> {
+        let open_error = |detail: String| JjError::Open {
+            path: path.display().to_string(),
+            detail,
+        };
+        let loader = Self::loader(path, signing)?;
+        let operation = at
+            .cloned()
+            .map_or_else(|| Self::head_operation(path, &loader), Ok)
+            .map_err(|error| open_error(error.to_string()))?;
+        let repo =
+            block_on(loader.load_at(&operation)).map_err(|error| open_error(error.to_string()))?;
+        Ok(Self {
+            repo,
+            path: path.to_owned(),
+        })
+    }
+
+    /// The head operation, as `RepoLoader::load_at_head` resolves it, except
+    /// that divergent operations are merged by a loader that signs: the merge
+    /// rebases commits and publishes them, whatever the load is for, and the
+    /// jj CLI, which loads with the user's signing settings, signs them.
+    fn head_operation(path: &Path, loader: &RepoLoader) -> Result<Operation, RepoLoaderError> {
+        block_on(op_heads_store::resolve_op_heads(
+            loader.op_heads_store().as_ref(),
+            loader.op_store(),
+            async |op_heads| -> Result<Operation, RepoLoaderError> {
+                let writer = Self::loader(path, Signing::AsUser)
+                    .map_err(|error| BackendError::Other(Box::new(error)))?;
+                let (merged, _) = writer
+                    .merge_operations(op_heads, None, Some("reconcile divergent operations"), [])
+                    .await?;
+                Ok(merged.operation().clone())
+            },
+        ))
+    }
+
+    fn loader(path: &Path, signing: Signing) -> Result<RepoLoader, JjError> {
+        let settings = repo_settings(path, signing)?;
+        RepoLoader::init_from_file_system(
             &settings,
             &path.join(".jj/repo"),
             &default_backend_factories(),
@@ -174,14 +232,6 @@ impl Repo {
         .map_err(|error| JjError::Open {
             path: path.display().to_string(),
             detail: error.to_string(),
-        })?;
-        let repo = block_on(loader.load_at_head()).map_err(|error| JjError::Open {
-            path: path.display().to_string(),
-            detail: error.to_string(),
-        })?;
-        Ok(Self {
-            repo,
-            path: path.to_owned(),
         })
     }
 
@@ -231,7 +281,7 @@ impl Repo {
             });
         }
 
-        let settings = repo_settings(destination)?;
+        let settings = repo_settings(destination, Signing::Off)?;
         let mut workspace = Workspace::load(
             &settings,
             destination,
@@ -1333,7 +1383,7 @@ pub fn is_workspace_named(directory: &Path, checkout: &Path, name: &WorkspaceNam
 
 /// The workspace name a directory's working-copy state records.
 fn workspace_name_at(directory: &Path) -> Result<WorkspaceName, JjError> {
-    let settings = repo_settings(directory)?;
+    let settings = repo_settings(directory, Signing::Off)?;
     let workspace = Workspace::load(
         &settings,
         directory,
@@ -1894,7 +1944,7 @@ pub struct ReplacedRelease {
 /// rewriting that from here would leave the workspace stale.
 pub fn write_release(repo: &Path, write: &ReleaseWrite<'_>) -> Result<ReleaseWritten, JjError> {
     validate_parents(write.source, write.parents)?;
-    let repo = Repo::open(repo)?;
+    let repo = Repo::open_to_write(repo)?;
     let (parent_commits, parent_ids) = resolved_parents(&repo, write.parents)?;
     let mut tx = repo.repo.start_transaction();
     let (written, source) = if let Some(source) = write.source {
@@ -2012,7 +2062,7 @@ pub fn abandon_unheld_writes(
     candidates: &[CommitId],
     operation: &str,
 ) -> Result<Vec<CommitId>, JjError> {
-    let repo = Repo::open(repo)?;
+    let repo = Repo::open_to_write(repo)?;
     let moved = MovedName {
         name: "",
         publish_remote: None,
@@ -2350,6 +2400,7 @@ impl Candidate {
         // The audited scratch — candidate and probe leftovers — evaporates
         // before anything real is written.
         drop(tx);
+        let repo = repo.to_write()?;
         let mut tx = repo.repo.start_transaction();
         let written = spec_commit(&repo, &mut tx, &spec)?;
         if written.tree_ids() != audited.tree_ids() {
@@ -2498,100 +2549,212 @@ fn commit_mutation(repo: &Repo, tx: Transaction, description: &str) -> Result<()
     Ok(())
 }
 
-/// jj's stock configuration, plus the writer identity resolved the way the jj
-/// CLI resolves it: `JJ_USER`/`JJ_EMAIL`, then the repository's own
-/// `.jj/repo/config.toml`, then the user file (`$JJ_CONFIG` when set,
-/// otherwise `$XDG_CONFIG_HOME/jj/config.toml`, `~/.config/jj/config.toml`,
-/// `~/.jjconfig.toml`). Only `user.name` and `user.email` are read: every
-/// behavioral setting of knives' own in-process jj deliberately stays at jj's
-/// defaults (#18), but a commit written with an empty author could never be
-/// pushed. The one setting knives states for the *checkout* — the fork's
-/// `immutable_heads()`, written by `start` into the repository's own config for
-/// the jj CLI ([`crate::config::RepoEntry::immutable_heads`]) — is not read here: in-process rewrites
-/// keep jj's default pins ([`assert_mutable`]).
-fn repo_settings(path: &Path) -> Result<UserSettings, JjError> {
+/// Whether the commits a loaded repository writes are signed.
+#[derive(Clone, Copy, Debug)]
+enum Signing {
+    /// jj's default: nothing is signed. For reads and for scratch
+    /// transactions that are never committed, such as the landed probes and a
+    /// cut's audit candidate: nothing they write is ever published, and a
+    /// signature per throwaway commit would run the signing program once per
+    /// replayed commit, and fail every read where no key is reachable. The one
+    /// write a load itself publishes, the merge of divergent operations, still
+    /// signs ([`Repo::head_operation`]).
+    Off,
+    /// The user's own `signing` settings. For a transaction that is committed.
+    AsUser,
+}
+
+/// jj's stock configuration, plus the writer identity (`user.*`) and, with
+/// [`Signing::AsUser`], the commit-signing settings (`signing.*`), taken from
+/// the configuration a jj CLI process started here would resolve for this
+/// workspace ([`resolved_jj_config`]).
+///
+/// Every behavioral setting of knives' own in-process jj deliberately stays at
+/// jj's defaults (#18), with two exceptions, each because the commit could not
+/// be published without it: `user.name` and `user.email`, since a commit with
+/// an empty author could never be pushed; and the whole `signing` table
+/// (`behavior`, `backend`, `key`, `backends.*`), since a commit the user's
+/// signing policy requires but knives wrote unsigned is refused by a branch
+/// that requires signatures or shows Unverified, and re-signing it by hand
+/// changes its id. Each resolved layer keeps its source and precedence, so jj
+/// merges these tables key by key as it would. jj-lib signs as it writes:
+/// `RepoLoader::init_from_file_system` builds the store's signer from these
+/// settings, and every commit builder's write applies `signing.behavior` to the
+/// commit it writes. The one setting knives states for the *checkout* — the
+/// fork's `immutable_heads()`, written by `start` into the repository's own
+/// config for the jj CLI ([`crate::config::RepoEntry::immutable_heads`]) — is
+/// not read here: in-process rewrites keep jj's default pins
+/// ([`assert_mutable`]).
+fn repo_settings(path: &Path, signing: Signing) -> Result<UserSettings, JjError> {
     let open_error = |detail: String| JjError::Open {
         path: path.display().to_string(),
         detail,
     };
+    let resolved = resolved_jj_config(path)?;
+    let tables: &[&str] = match signing {
+        Signing::Off => &["user"],
+        Signing::AsUser => &["user", "signing"],
+    };
     let mut config = StackedConfig::with_defaults();
-    let (name, email) = resolved_identity(path)?;
-    let mut lines = Vec::new();
-    if let Some(name) = name {
-        lines.push(format!("user.name = {}", toml_string(&name)));
-    }
-    if let Some(email) = email {
-        lines.push(format!("user.email = {}", toml_string(&email)));
-    }
-    if !lines.is_empty() {
-        let layer = ConfigLayer::parse(ConfigSource::User, &lines.join("\n"))
-            .map_err(|error| open_error(error.to_string()))?;
-        config.add_layer(layer);
+    for layer in resolved.layers() {
+        let mut kept = ConfigLayer::empty(layer.source);
+        for table in tables {
+            if let Some(item) = layer.data.get(table) {
+                kept.data.insert(table, item.clone());
+            }
+        }
+        if !kept.is_empty() {
+            config.add_layer(kept);
+        }
     }
     UserSettings::from_config(config).map_err(|error| open_error(error.to_string()))
 }
 
-/// A string as a quoted, escaped TOML literal.
-fn toml_string(value: &str) -> String {
-    toml::Value::String(value.to_owned()).to_string()
-}
-
-/// The identity the jj CLI would write with, by its precedence.
-fn resolved_identity(repo_path: &Path) -> Result<(Option<String>, Option<String>), JjError> {
-    let mut name = identity_var("JJ_USER");
-    let mut email = identity_var("JJ_EMAIL");
-    for file in identity_files(repo_path)? {
-        if name.is_some() && email.is_some() {
-            break;
-        }
-        let (file_name, file_email) = file_identity(&file)?;
-        name = name.or(file_name);
-        email = email.or(file_email);
-    }
-    Ok((name, email))
-}
-
-fn identity_var(key: &str) -> Option<String> {
-    std::env::var(key).ok().filter(|value| !value.is_empty())
-}
-
-/// Identity sources after the environment, highest precedence first.
-fn identity_files(repo_path: &Path) -> Result<Vec<PathBuf>, JjError> {
-    let mut files = repo_config_files(repo_path)?;
-    if let Ok(paths) = std::env::var("JJ_CONFIG") {
-        // Like jj, `JJ_CONFIG` replaces the user files entirely.
-        files.extend(std::env::split_paths(&paths));
-        return Ok(files);
-    }
-    if let Some(home) = config_home() {
-        files.push(home.join("jj/config.toml"));
-    }
-    if let Ok(home) = std::env::var("HOME")
-        && !home.is_empty()
-    {
-        files.push(PathBuf::from(home).join(".jjconfig.toml"));
-    }
-    Ok(files)
-}
-
-/// Where this repository's own jj config may live, newest convention first.
+/// The configuration a jj CLI process started in this environment would
+/// resolve for the workspace at `workspace`, defaults and command-line
+/// arguments aside. It follows jj-cli 0.45/0.46 `cli/src/config.rs` (identical
+/// in both for these parts) and `cli/src/cli_util.rs`:
 ///
-/// A non-default workspace's `.jj/repo` is a pointer to the real repository
-/// directory; `Repo::repository_store_path` resolves it the way jj does.
-fn repo_config_files(repo_path: &Path) -> Result<Vec<PathBuf>, JjError> {
-    let repo_dir = Repo::repository_store_path(repo_path)?;
-    let mut files = Vec::new();
-    // Newer jj keeps per-repo config under the user config directory, keyed by
-    // the repository's `config-id`.
-    if let Ok(id) = std::fs::read_to_string(repo_dir.join("config-id"))
-        && !id.trim().is_empty()
-        && let Some(home) = config_home()
-    {
-        files.push(home.join("jj/repos").join(id.trim()).join("config.toml"));
+/// - Layers, lowest precedence first (`config_from_environment`): system
+///   (`/etc/jj/config.toml`, then `/etc/jj/conf.d/*.toml`, only while
+///   `$JJ_CONFIG` is unset; `resolve_system`), user, repo, workspace, then the
+///   `JJ_USER`/`JJ_EMAIL` overrides (`env_overrides_layer`).
+/// - User files (`resolve_user`): each `$JJ_CONFIG` entry in order, a later one
+///   winning, a directory contributing its `*.toml` files in sorted order;
+///   otherwise `~/.jjconfig.toml`, then `<config dir>/jj/config.toml`, then
+///   `<config dir>/jj/conf.d/*.toml`, where the config dir is an absolute
+///   `$XDG_CONFIG_HOME`, else `~/.config` (etcetera's XDG strategy). A path
+///   that does not exist is skipped; one that cannot parse is an error.
+/// - Repo and workspace files: the per-id file under `<config dir>/jj/repos/`
+///   (`workspaces/`) that the store's `config-id` (the workspace's
+///   `.jj/workspace-config-id`) names, else the legacy `.jj/repo/config.toml`
+///   (`.jj/workspace-config.toml`), read where jj's `SecureConfig` finds them.
+///   jj also migrates or copies those files on first contact; knives only
+///   reads, and jj's copy holds the same content.
+/// - Scopes are resolved by jj-lib's own `jj_lib::config::resolve` with the
+///   context `ConfigEnv::resolve_config` fills: the canonical home directory,
+///   the repository path (`<workspace root>/.jj/repo`, or the canonical store
+///   a secondary workspace's pointer names, as `DefaultWorkspaceLoader` reads
+///   it), the canonical workspace root, the hostname, every UTF-8 environment
+///   variable, and no command name — so `--when.commands` scopes never apply.
+fn resolved_jj_config(workspace: &Path) -> Result<StackedConfig, JjError> {
+    let config_error = |detail: String| JjError::Open {
+        path: workspace.display().to_string(),
+        detail,
+    };
+    let jj_config = std::env::var("JJ_CONFIG").ok();
+    let raw_home = std::env::home_dir();
+    let home = raw_home
+        .as_ref()
+        .map(|home| home.canonicalize().unwrap_or_else(|_| home.clone()));
+    let config_dir = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|dir| dir.is_absolute())
+        .or_else(|| raw_home.map(|home| home.join(".config")));
+    let root_config_dir = config_dir.as_ref().map(|dir| dir.join("jj"));
+    let workspace_root = workspace
+        .canonicalize()
+        .map_err(|error| config_error(error.to_string()))?;
+    let jj_dir = workspace_root.join(".jj");
+    let repo_path = if jj_dir.join("repo").is_file() {
+        Repo::repository_store_path(&workspace_root)?
+    } else {
+        jj_dir.join("repo")
+    };
+
+    let mut files: Vec<(ConfigSource, PathBuf)> = Vec::new();
+    if let Some(paths) = &jj_config {
+        files.extend(
+            std::env::split_paths(paths)
+                .filter(|path| !path.as_os_str().is_empty())
+                .map(|path| (ConfigSource::User, path)),
+        );
+    } else {
+        files.push((ConfigSource::System, PathBuf::from("/etc/jj/config.toml")));
+        files.push((ConfigSource::System, PathBuf::from("/etc/jj/conf.d")));
+        if let Some(home) = &home {
+            files.push((ConfigSource::User, home.join(".jjconfig.toml")));
+        }
+        if let Some(root) = &root_config_dir {
+            files.push((ConfigSource::User, root.join("config.toml")));
+            files.push((ConfigSource::User, root.join("conf.d")));
+        }
     }
-    // Older jj kept it inside the repository.
-    files.push(repo_dir.join("config.toml"));
-    Ok(files)
+    if let Some(root) = &root_config_dir {
+        let repo = secure_config_file(&repo_path, ("config-id", "config.toml"), root, "repos")?;
+        files.push((ConfigSource::Repo, repo));
+        let own = secure_config_file(
+            &jj_dir,
+            ("workspace-config-id", "workspace-config.toml"),
+            root,
+            "workspaces",
+        )?;
+        files.push((ConfigSource::Workspace, own));
+    }
+
+    let mut raw = StackedConfig::empty();
+    for (source, path) in files {
+        if !path.exists() {
+            continue;
+        }
+        if path.is_dir() {
+            raw.load_dir(source, &path)
+        } else {
+            raw.load_file(source, path)
+        }
+        .map_err(|error| config_error(error.to_string()))?;
+    }
+    let mut overrides = ConfigLayer::empty(ConfigSource::EnvOverrides);
+    for (variable, key) in [("JJ_USER", "user.name"), ("JJ_EMAIL", "user.email")] {
+        if let Ok(value) = std::env::var(variable) {
+            overrides
+                .set_value(key, value)
+                .map_err(|error| config_error(error.to_string()))?;
+        }
+    }
+    raw.add_layer(overrides);
+
+    let uname = rustix::system::uname();
+    let environment: HashMap<String, String> = std::env::vars_os()
+        .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
+        .collect();
+    let context = ConfigResolutionContext {
+        home_dir: home.as_deref(),
+        repo_path: Some(&repo_path),
+        workspace_path: Some(&workspace_root),
+        command: None,
+        hostname: uname.nodename().to_str().unwrap_or(""),
+        environment: &environment,
+    };
+    jj_lib::config::resolve(&raw, &context).map_err(|error| config_error(error.to_string()))
+}
+
+/// The repo or workspace config file jj's `SecureConfig` reads for the
+/// directory `dir` (`.jj/repo` or `.jj`): the file under `root/kind/` its id
+/// file names, else the legacy file inside `dir`. A malformed id is an error,
+/// as it is to jj.
+fn secure_config_file(
+    dir: &Path,
+    (id_name, legacy_name): (&str, &str),
+    root: &Path,
+    kind: &str,
+) -> Result<PathBuf, JjError> {
+    let id_path = dir.join(id_name);
+    match std::fs::read_to_string(&id_path) {
+        Ok(id) => {
+            if id.len() != 20 || !id.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Err(JjError::Parse {
+                    detail: format!("{}: malformed config id", id_path.display()),
+                });
+            }
+            Ok(root.join(kind).join(id).join("config.toml"))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(dir.join(legacy_name)),
+        Err(error) => Err(JjError::Open {
+            path: id_path.display().to_string(),
+            detail: error.to_string(),
+        }),
+    }
 }
 
 const IMMUTABLE_HEADS_KEY: &str = "revset-aliases.\"immutable_heads()\"";
@@ -2725,43 +2888,9 @@ pub fn set_repo_immutable_heads(repo: &Path, rule: &str) -> Result<(), JjError> 
     Ok(())
 }
 
-/// `$XDG_CONFIG_HOME`, else `~/.config` — the directory jj's user config lives under.
-fn config_home() -> Option<PathBuf> {
-    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME")
-        && !xdg.is_empty()
-    {
-        return Some(PathBuf::from(xdg));
-    }
-    std::env::var("HOME")
-        .ok()
-        .filter(|home| !home.is_empty())
-        .map(|home| PathBuf::from(home).join(".config"))
-}
-
-/// `user.name` and `user.email` from one jj config file. An absent or
-/// unreadable file is not a source; a file that exists but cannot parse is an
-/// error — quietly writing anonymous commits because a config file is broken
-/// would surface much later, as an unpushable release.
-fn file_identity(file: &Path) -> Result<(Option<String>, Option<String>), JjError> {
-    let Ok(text) = std::fs::read_to_string(file) else {
-        return Ok((None, None));
-    };
-    let table: toml::Table = text
-        .parse()
-        .map_err(|error: toml::de::Error| JjError::Parse {
-            detail: format!("{}: {error}", file.display()),
-        })?;
-    let Some(toml::Value::Table(user)) = table.get("user") else {
-        return Ok((None, None));
-    };
-    Ok((table_string(user, "name"), table_string(user, "email")))
-}
-
-fn table_string(table: &toml::Table, key: &str) -> Option<String> {
-    match table.get(key) {
-        Some(toml::Value::String(value)) => Some(value.clone()),
-        _ => None,
-    }
+/// A string as a quoted, escaped TOML literal.
+fn toml_string(value: &str) -> String {
+    toml::Value::String(value.to_owned()).to_string()
 }
 
 /// Rebase a whole branch onto `dest`: `jj rebase -b rev -d dest`.
@@ -2797,7 +2926,7 @@ pub fn describe_commit(
     message: &str,
     operation: &str,
 ) -> Result<CommitId, JjError> {
-    let repo = Repo::open(repo)?;
+    let repo = Repo::open_to_write(repo)?;
     let target = repo.commit(commit.as_str())?;
     assert_mutable(repo.repo.as_ref(), std::slice::from_ref(&target))?;
     let mut tx = repo.repo.start_transaction();
@@ -2846,7 +2975,7 @@ fn move_bookmark(
     (name, revision): (&str, &str),
     motion: BookmarkMotion,
 ) -> Result<(), JjError> {
-    let repo = Repo::open(repo)?;
+    let repo = Repo::open_to_write(repo)?;
     let target = repo.commit(revision)?;
     guard_bookmark_motion(repo.repo.as_ref(), (name, target.id()), motion)?;
     let mut tx = repo.repo.start_transaction();
@@ -2942,7 +3071,7 @@ pub fn forget_and_abandon(
     entries: &[(String, Vec<CommitId>)],
     operation: &str,
 ) -> Result<ReapWrite, JjError> {
-    let repo = Repo::open(repo)?;
+    let repo = Repo::open_to_write(repo)?;
     let mut tx = repo.repo.start_transaction();
     let mut outcome = ReapWrite {
         abandoned: Vec::new(),
@@ -3007,7 +3136,7 @@ pub fn abandon_commits(repo: &Path, commits: &[CommitId], operation: &str) -> Re
     if commits.is_empty() {
         return Ok(());
     }
-    let repo = Repo::open(repo)?;
+    let repo = Repo::open_to_write(repo)?;
     let targets: Vec<jj_lib::commit::Commit> = commits
         .iter()
         .map(|commit| repo.commit(commit.as_str()))
@@ -3086,7 +3215,7 @@ pub fn abandon_tagged_copies(
     if originals.is_empty() {
         return Ok(Vec::new());
     }
-    let repo = Repo::open(repo)?;
+    let repo = Repo::open_to_write(repo)?;
     let dest = repo.commit(dest.as_str())?.id().clone();
     let mut found = Vec::new();
     for original in originals {
