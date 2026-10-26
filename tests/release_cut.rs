@@ -272,6 +272,68 @@ fn a_read_that_reconciles_divergent_operations_signs_what_it_rebases() {
 }
 
 #[test]
+fn a_cut_is_written_with_the_identity_scoped_to_its_repository() {
+    // Given: identity stated only in the user file, the way a per-project
+    // identity usually is: a default, a `[[--scope]]` for this repository (by a
+    // `~` path) that changes the email, and one for another path that changes
+    // the name. The repository's own config states no identity.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let (home, _consumer) = release_test_home(&lab);
+    let unsigned = std::path::Path::new("/dev/null");
+    work_jj(&lab, unsigned, &["config", "unset", "--repo", "user.name"]);
+    work_jj(&lab, unsigned, &["config", "unset", "--repo", "user.email"]);
+    // jj matches the canonical repository path, so `~` must be canonical too.
+    let user_home = lab.temp_path().canonicalize().expect("canonical lab dir");
+    let config = lab.temp_path().join("scoped.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "user.name = \"Default Name\"\n\
+             user.email = \"default@example.test\"\n\n\
+             [[--scope]]\n--when.repositories = [\"~/work\"]\n\
+             [--scope.user]\nemail = \"scoped@example.test\"\n\n\
+             [[--scope]]\n--when.repositories = ['{}']\n\
+             [--scope.user]\nname = \"Elsewhere\"\n",
+            user_home.join("second").display()
+        ),
+    )
+    .expect("write scoped config");
+
+    // When: knives cuts the release under that config.
+    let output = release_command(
+        &lab,
+        &home,
+        ReleaseOutput::Text,
+        &["cut", "release/2026-08-04"],
+    )
+    .env("JJ_CONFIG", &config)
+    .env("HOME", &user_home)
+    .env_remove("JJ_USER")
+    .env_remove("JJ_EMAIL")
+    .output()
+    .expect("run knives release cut");
+    assert!(output.status.success(), "{output:?}");
+
+    // Then: the cut carries this repository's scoped email and the default
+    // name; the other path's scope did not apply.
+    let author = work_jj(
+        &lab,
+        unsigned,
+        &[
+            "log",
+            "--no-graph",
+            "-r",
+            "release/2026-08-04",
+            "-T",
+            "author.name() ++ \" <\" ++ author.email() ++ \">\"",
+        ],
+    );
+    assert_eq!(author, "Default Name <scoped@example.test>");
+}
+
+#[test]
 fn a_release_plan_reads_nothing_about_who_is_asking() {
     // Given: a state file nobody can read. Resolving who is acting reads it (a
     // terminal user inside a fork is named by the fork's claims); a plan writes

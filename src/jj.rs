@@ -2569,9 +2569,16 @@ enum Signing {
 /// variables the jj CLI reads them from: `JJ_USER`/`JJ_EMAIL`, then the
 /// repository's own config, then the user files (`$JJ_CONFIG` when set, later
 /// paths first, as jj ranks them; otherwise `$XDG_CONFIG_HOME/jj/config.toml`,
-/// `~/.config/jj/config.toml`, `~/.jjconfig.toml`). Not read: `conf.d`
-/// directories and directories named in `$JJ_CONFIG`, `/etc/jj`, the workspace
-/// layer and `[[--scope]]` tables.
+/// `~/.config/jj/config.toml`, `~/.jjconfig.toml`). Within each file,
+/// `[[--scope]]` tables (and a file-level `--when`) apply as jj applies them
+/// when their only condition is `--when.repositories`: a listed path (`~`
+/// expanded) matches when the repository's store, `<main workspace>/.jj/repo`,
+/// lies under it, and an active scope ranks above the table it sits in. Scopes
+/// with any other condition (`environments`, `commands`, `hostnames`,
+/// `platforms`, `workspaces`) are not read: they describe the invoking
+/// command or machine, not the repository. Also not read: `conf.d`
+/// directories and directories named in `$JJ_CONFIG`, `/etc/jj`, and the
+/// workspace layer.
 ///
 /// Every behavioral setting of knives' own in-process jj deliberately stays at
 /// jj's defaults (#18), with two exceptions, each because the commit could not
@@ -2648,12 +2655,14 @@ fn identity_var(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|value| !value.is_empty())
 }
 
-/// The jj config files knives reads settings from, parsed, highest precedence
-/// first. An absent or unreadable file is not a source; a file that exists but
-/// cannot parse is an error — quietly writing anonymous or unsigned commits
-/// because a config file is broken would surface much later, as an unpushable
-/// release.
+/// The jj config layers knives reads settings from, highest precedence first:
+/// each file's top-level table and its active repository scopes
+/// ([`file_layers`]). An absent or unreadable file is not a source; a file that
+/// exists but cannot parse is an error — quietly writing anonymous or unsigned
+/// commits because a config file is broken would surface much later, as an
+/// unpushable release.
 fn config_files(repo_path: &Path) -> Result<Vec<(ConfigSource, toml::Table)>, JjError> {
+    let store = Repo::repository_store_path(repo_path)?;
     let mut files: Vec<(ConfigSource, PathBuf)> = repo_config_files(repo_path)?
         .into_iter()
         .map(|file| (ConfigSource::Repo, file))
@@ -2668,13 +2677,8 @@ fn config_files(repo_path: &Path) -> Result<Vec<(ConfigSource, toml::Table)>, Jj
         if let Some(home) = config_home() {
             files.push((ConfigSource::User, home.join("jj/config.toml")));
         }
-        if let Ok(home) = std::env::var("HOME")
-            && !home.is_empty()
-        {
-            files.push((
-                ConfigSource::User,
-                PathBuf::from(home).join(".jjconfig.toml"),
-            ));
+        if let Some(home) = home_dir() {
+            files.push((ConfigSource::User, home.join(".jjconfig.toml")));
         }
     }
     let mut tables = Vec::new();
@@ -2682,14 +2686,91 @@ fn config_files(repo_path: &Path) -> Result<Vec<(ConfigSource, toml::Table)>, Jj
         let Ok(text) = std::fs::read_to_string(&file) else {
             continue;
         };
+        let parse_error = |detail: String| JjError::Parse {
+            detail: format!("{}: {detail}", file.display()),
+        };
         let table: toml::Table = text
             .parse()
-            .map_err(|error: toml::de::Error| JjError::Parse {
-                detail: format!("{}: {error}", file.display()),
-            })?;
-        tables.push((source, table));
+            .map_err(|error: toml::de::Error| parse_error(error.to_string()))?;
+        let mut layers = Vec::new();
+        file_layers(table, &store, &mut layers).map_err(parse_error)?;
+        tables.extend(layers.into_iter().rev().map(|layer| (source, layer)));
     }
     Ok(tables)
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+}
+
+/// One config table's layers, lowest precedence first, appended to `layers`:
+/// nothing when its `--when` does not hold for this repository, otherwise the
+/// table without its scopes, then each `[[--scope]]` table's own layers in
+/// order — the order jj's resolver stacks them in.
+fn file_layers(
+    mut table: toml::Table,
+    store: &Path,
+    layers: &mut Vec<toml::Table>,
+) -> Result<(), String> {
+    if !scope_applies(table.remove("--when"), store)? {
+        return Ok(());
+    }
+    let scopes = table.remove("--scope");
+    layers.push(table);
+    match scopes {
+        None => {}
+        Some(toml::Value::Array(scopes)) => {
+            for scope in scopes {
+                let toml::Value::Table(scope) = scope else {
+                    return Err("`--scope` must be an array of tables".to_owned());
+                };
+                file_layers(scope, store, layers)?;
+            }
+        }
+        Some(_) => return Err("`--scope` must be an array of tables".to_owned()),
+    }
+    Ok(())
+}
+
+/// Whether a `--when` condition holds for the repository whose store is
+/// `store`. No condition holds. A condition naming anything but
+/// `repositories` is treated as not holding: knives cannot judge it the way
+/// the invoking jj command would.
+fn scope_applies(condition: Option<toml::Value>, store: &Path) -> Result<bool, String> {
+    let Some(condition) = condition else {
+        return Ok(true);
+    };
+    let toml::Value::Table(condition) = condition else {
+        return Err("`--when` must be a table".to_owned());
+    };
+    if condition.keys().any(|key| key != "repositories") {
+        return Ok(false);
+    }
+    let Some(repositories) = condition.get("repositories") else {
+        return Ok(true);
+    };
+    let toml::Value::Array(repositories) = repositories else {
+        return Err("`--when.repositories` must be an array of paths".to_owned());
+    };
+    for repository in repositories {
+        let toml::Value::String(repository) = repository else {
+            return Err("`--when.repositories` must be an array of paths".to_owned());
+        };
+        let base = Path::new(repository);
+        let base = match base.strip_prefix("~") {
+            Ok(tail) => match home_dir() {
+                Some(home) => home.join(tail),
+                None => continue,
+            },
+            Err(_) => base.to_owned(),
+        };
+        if store.starts_with(&base) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Where this repository's own jj config may live, newest convention first.
