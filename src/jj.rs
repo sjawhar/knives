@@ -2498,14 +2498,21 @@ fn commit_mutation(repo: &Repo, tx: Transaction, description: &str) -> Result<()
     Ok(())
 }
 
-/// jj's stock configuration, plus the writer identity resolved the way the jj
-/// CLI resolves it: `JJ_USER`/`JJ_EMAIL`, then the repository's own
-/// `.jj/repo/config.toml`, then the user file (`$JJ_CONFIG` when set,
-/// otherwise `$XDG_CONFIG_HOME/jj/config.toml`, `~/.config/jj/config.toml`,
-/// `~/.jjconfig.toml`). Only `user.name` and `user.email` are read: every
-/// behavioral setting of knives' own in-process jj deliberately stays at jj's
-/// defaults (#18), but a commit written with an empty author could never be
-/// pushed. The one setting knives states for the *checkout* — the fork's
+/// jj's stock configuration, plus the writer identity and the commit-signing
+/// settings resolved the way the jj CLI resolves them: `JJ_USER`/`JJ_EMAIL`,
+/// then the repository's own `.jj/repo/config.toml`, then the user file
+/// (`$JJ_CONFIG` when set, otherwise `$XDG_CONFIG_HOME/jj/config.toml`,
+/// `~/.config/jj/config.toml`, `~/.jjconfig.toml`). Every behavioral setting of
+/// knives' own in-process jj deliberately stays at jj's defaults (#18), with
+/// two exceptions, each because the commit could not be published without it:
+/// `user.name` and `user.email`, since a commit with an empty author could
+/// never be pushed; and the whole `signing` table (`behavior`, `backend`,
+/// `key`, `backends.*`), since a commit the user's signing policy requires but
+/// knives wrote unsigned is refused by a branch that requires signatures or
+/// shows Unverified, and re-signing it by hand changes its id. jj-lib signs as
+/// it writes: the store's signer comes from these settings when the repository
+/// loads, and each commit builder applies `signing.behavior` to the commit it
+/// writes. The one setting knives states for the *checkout* — the fork's
 /// `immutable_heads()`, written by `start` into the repository's own config for
 /// the jj CLI ([`crate::config::RepoEntry::immutable_heads`]) — is not read here: in-process rewrites
 /// keep jj's default pins ([`assert_mutable`]).
@@ -2515,7 +2522,21 @@ fn repo_settings(path: &Path) -> Result<UserSettings, JjError> {
         detail,
     };
     let mut config = StackedConfig::with_defaults();
-    let (name, email) = resolved_identity(path)?;
+    let files = config_files(path)?;
+    // Lowest precedence first: jj merges tables key by key across its layers,
+    // so a repository's `signing.behavior` overrides the user file's while the
+    // user file's `signing.key` still applies.
+    for (source, table) in files.iter().rev() {
+        let Some(signing) = table.get("signing") else {
+            continue;
+        };
+        let mut layer = toml::Table::new();
+        layer.insert("signing".to_owned(), signing.clone());
+        let layer = ConfigLayer::parse(*source, &layer.to_string())
+            .map_err(|error| open_error(error.to_string()))?;
+        config.add_layer(layer);
+    }
+    let (name, email) = resolved_identity(&files);
     let mut lines = Vec::new();
     if let Some(name) = name {
         lines.push(format!("user.name = {}", toml_string(&name)));
@@ -2537,41 +2558,62 @@ fn toml_string(value: &str) -> String {
 }
 
 /// The identity the jj CLI would write with, by its precedence.
-fn resolved_identity(repo_path: &Path) -> Result<(Option<String>, Option<String>), JjError> {
+fn resolved_identity(files: &[(ConfigSource, toml::Table)]) -> (Option<String>, Option<String>) {
     let mut name = identity_var("JJ_USER");
     let mut email = identity_var("JJ_EMAIL");
-    for file in identity_files(repo_path)? {
-        if name.is_some() && email.is_some() {
-            break;
-        }
-        let (file_name, file_email) = file_identity(&file)?;
-        name = name.or(file_name);
-        email = email.or(file_email);
+    for (_, table) in files {
+        let Some(toml::Value::Table(user)) = table.get("user") else {
+            continue;
+        };
+        name = name.or_else(|| table_string(user, "name"));
+        email = email.or_else(|| table_string(user, "email"));
     }
-    Ok((name, email))
+    (name, email)
 }
 
 fn identity_var(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|value| !value.is_empty())
 }
 
-/// Identity sources after the environment, highest precedence first.
-fn identity_files(repo_path: &Path) -> Result<Vec<PathBuf>, JjError> {
-    let mut files = repo_config_files(repo_path)?;
+/// The jj config files knives reads settings from, parsed, highest precedence
+/// first. An absent or unreadable file is not a source; a file that exists but
+/// cannot parse is an error — quietly writing anonymous or unsigned commits
+/// because a config file is broken would surface much later, as an unpushable
+/// release.
+fn config_files(repo_path: &Path) -> Result<Vec<(ConfigSource, toml::Table)>, JjError> {
+    let mut files: Vec<(ConfigSource, PathBuf)> = repo_config_files(repo_path)?
+        .into_iter()
+        .map(|file| (ConfigSource::Repo, file))
+        .collect();
     if let Ok(paths) = std::env::var("JJ_CONFIG") {
         // Like jj, `JJ_CONFIG` replaces the user files entirely.
-        files.extend(std::env::split_paths(&paths));
-        return Ok(files);
+        files.extend(std::env::split_paths(&paths).map(|file| (ConfigSource::User, file)));
+    } else {
+        if let Some(home) = config_home() {
+            files.push((ConfigSource::User, home.join("jj/config.toml")));
+        }
+        if let Ok(home) = std::env::var("HOME")
+            && !home.is_empty()
+        {
+            files.push((
+                ConfigSource::User,
+                PathBuf::from(home).join(".jjconfig.toml"),
+            ));
+        }
     }
-    if let Some(home) = config_home() {
-        files.push(home.join("jj/config.toml"));
+    let mut tables = Vec::new();
+    for (source, file) in files {
+        let Ok(text) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+        let table: toml::Table = text
+            .parse()
+            .map_err(|error: toml::de::Error| JjError::Parse {
+                detail: format!("{}: {error}", file.display()),
+            })?;
+        tables.push((source, table));
     }
-    if let Ok(home) = std::env::var("HOME")
-        && !home.is_empty()
-    {
-        files.push(PathBuf::from(home).join(".jjconfig.toml"));
-    }
-    Ok(files)
+    Ok(tables)
 }
 
 /// Where this repository's own jj config may live, newest convention first.
@@ -2736,25 +2778,6 @@ fn config_home() -> Option<PathBuf> {
         .ok()
         .filter(|home| !home.is_empty())
         .map(|home| PathBuf::from(home).join(".config"))
-}
-
-/// `user.name` and `user.email` from one jj config file. An absent or
-/// unreadable file is not a source; a file that exists but cannot parse is an
-/// error — quietly writing anonymous commits because a config file is broken
-/// would surface much later, as an unpushable release.
-fn file_identity(file: &Path) -> Result<(Option<String>, Option<String>), JjError> {
-    let Ok(text) = std::fs::read_to_string(file) else {
-        return Ok((None, None));
-    };
-    let table: toml::Table = text
-        .parse()
-        .map_err(|error: toml::de::Error| JjError::Parse {
-            detail: format!("{}: {error}", file.display()),
-        })?;
-    let Some(toml::Value::Table(user)) = table.get("user") else {
-        return Ok((None, None));
-    };
-    Ok((table_string(user, "name"), table_string(user, "email")))
 }
 
 fn table_string(table: &toml::Table, key: &str) -> Option<String> {

@@ -79,6 +79,105 @@ fn release_plan_exits_with_findings_when_the_current_release_lags_the_upstream_t
     assert_eq!(output.status.code(), Some(1), "stdout: {text}");
 }
 
+/// A user jj config that signs the user's own commits with a fresh ssh key, the
+/// way a signing policy is usually stated, and trusts that key for verification.
+fn ssh_signing_config(directory: &std::path::Path) -> std::path::PathBuf {
+    let key = directory.join("signing-key");
+    let generated = std::process::Command::new("ssh-keygen")
+        .args(["-q", "-t", "ed25519", "-N", "", "-C", "knives-test", "-f"])
+        .arg(&key)
+        .status()
+        .expect("run ssh-keygen");
+    assert!(generated.success(), "ssh-keygen failed");
+    let public = std::fs::read_to_string(key.with_extension("pub")).expect("read public key");
+    let allowed = directory.join("allowed-signers");
+    std::fs::write(&allowed, format!("knives-lab@example.test {public}"))
+        .expect("write allowed signers");
+    let config = directory.join("signing.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "[signing]\nbehavior = \"own\"\nbackend = \"ssh\"\nkey = '{}'\n\n\
+             [signing.backends.ssh]\nallowed-signers = '{}'\n",
+            key.with_extension("pub").display(),
+            allowed.display(),
+        ),
+    )
+    .expect("write signing config");
+    config
+}
+
+/// The release commit's signature as jj verifies it under `jj_config`, or
+/// `unsigned`.
+fn release_signature(lab: &Lab, jj_config: &std::path::Path) -> String {
+    let output = std::process::Command::new("jj")
+        .args([
+            "--ignore-working-copy",
+            "log",
+            "--no-graph",
+            "-r",
+            "release/2026-08-04",
+            "-T",
+            "if(signature, signature.status(), \"unsigned\")",
+        ])
+        .current_dir(lab.work_path())
+        .env("JJ_CONFIG", jj_config)
+        .output()
+        .expect("run jj log");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
+#[test]
+fn a_cut_is_signed_as_the_users_jj_would_sign_it() {
+    // Given: a user jj config that signs the user's own commits with an ssh
+    // key. A cut written unsigned under that policy shows Unverified, and
+    // re-signing it by hand changes the id the audit knows the cut by.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let (home, _consumer) = release_test_home(&lab);
+    let config = ssh_signing_config(lab.temp_path());
+
+    // When: knives cuts the release under that config.
+    let output = release_command(
+        &lab,
+        &home,
+        ReleaseOutput::Text,
+        &["cut", "release/2026-08-04"],
+    )
+    .env("JJ_CONFIG", &config)
+    .output()
+    .expect("run knives release cut");
+    assert!(output.status.success(), "{output:?}");
+
+    // Then: the cut carries a signature that verifies against that key.
+    assert_eq!(release_signature(&lab, &config), "good");
+}
+
+#[test]
+fn a_cut_without_a_signing_policy_stays_unsigned() {
+    // Given: no signing configuration anywhere (the lab's user config is empty).
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let (home, _consumer) = release_test_home(&lab);
+
+    // When: knives cuts the release.
+    let output = knives_release(&lab, &home, &["cut", "release/2026-08-04"]);
+    assert!(output.status.success(), "{output:?}");
+
+    // Then: the cut is written as before, with no signature.
+    assert_eq!(
+        release_signature(&lab, std::path::Path::new("/dev/null")),
+        "unsigned"
+    );
+}
+
 #[test]
 fn a_release_plan_reads_nothing_about_who_is_asking() {
     // Given: a state file nobody can read. Resolving who is acting reads it (a
