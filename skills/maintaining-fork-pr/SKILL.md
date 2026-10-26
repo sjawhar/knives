@@ -5,6 +5,8 @@ description: Use when you own one existing fork pull request through to merge or
 
 # Owning one fork pull request
 
+If this skill disagrees with the code, a command's output or its `--help`, follow those and say which line of this skill is wrong.
+
 - You own one PR end to end, under one branch claim. The orchestrator owns the release and consumer outcome.
 - Handback ends your work in the workspace. It does not make the release ready. It does not end the duty for pending CI and maintainer obligations.
 
@@ -17,12 +19,7 @@ description: Use when you own one existing fork pull request through to merge or
   - Each comment goes to a maintainer's inbox. It is noise unless it moves the PR.
   - A stale but harmless body sentence is not worth a publish.
 - Answer a maintainer's design question yourself. Read the thread, diff and chain and form a position. Implement it, or state it on the thread with your reasons. Never send it up as a human decision without your position.
-- A `decision:` notch must show all three:
-  1. You read the whole chain for the branch and the release, and no note answers it. Quote the closest note and say why not.
-  2. Your recommendation and its evidence.
-  3. The choice needs authority you lack (money, an upstream commitment, removing what the maintainer of record asked for), not confidence you lack.
-
-  A `decision:` that fails one is your own work not yet done. If a note answers it, cite it, apply it and continue. Never ask the human twice.
+- Before you write a `decision:` notch, read [references/decision-notch.md](references/decision-notch.md): the three things the notch must show, because one that fails them is your own work not yet done.
 
 ## 1. Read `knives notch`, then claim
 
@@ -42,9 +39,7 @@ knives start <branch> --repo <repo> --why '<PR number>: <work being owned>'
 - Run Knives reads as written, without `--json`. Your own reading and a JSON final report are direct reads. Use `--json` only when executed code does a real filter, calculation or join, and keep that consumer in the evidence. `jq .` or a `.json` file name is not a reason. If output is clipped, page the full captured output. JSON does not recover it.
 - The claim is yours by its `why` text and workspace, not by a shared OS user. Enter the workspace that `start` prints and confirm your row. `@` starts as an empty child of the branch.
 - A claim-lock wait is normal. Send a refusal that names another holder to the orchestrator. Never force a takeover. A quiet `seen` does not prove the holder is dead.
-- A divergent bookmark stops `start`: compare the tips with `jj -R <path> --ignore-working-copy diff --from <a> --to <b>` (path from `knives repos`).
-  - Same content, one tip is the live PR's origin ref: apply only the same-content recovery that the refusal prints, then retry.
-  - Else: record the tips and ask the orchestrator. Never pick by recency.
+- A divergent bookmark stops `start`: follow [references/divergent-bookmark.md](references/divergent-bookmark.md), because picking a tip by recency can lose the live PR's commits.
 - Keep drafts, logs and packets in the per-PR scratch path (for example `<run>/<repo>/pr-<number>/`), not in the workspace. PR numbers alone are not unique across repos. The workspace snapshots into `@`.
 
 **Done when:** you read the inherited obligations, and your row shows your claim and workspace.
@@ -95,7 +90,7 @@ knives preflight
   - to repair
   - declined, with a reason for upstream
   - leave alone, with the reason (a real disposition, not a gap)
-  - decision needed, only after the three conditions
+  - decision needed, only after the three conditions in [references/decision-notch.md](references/decision-notch.md)
   - unverifiable, with the external prerequisite
 - Get release membership from the parents in `release members`. An advanced branch can succeed an older released parent.
 - Write the recon notch:
@@ -109,13 +104,7 @@ knives preflight
 ## 3. Rehome only when needed
 
 - Rehome only if the PR conflicts, a maintainer asks, or verification requires newer trunk behavior. A mergeable PR behind trunk is not a reason.
-- Run the `fork-work` bidirectional gate first.
-- Lone branch (gate clean): `jj rebase -b <branch> -d <trunk>@upstream`.
-- Descends from a pushed release/keep merge (`stacked-history`): this rehome is yours, with no hand-back. Run `jj rebase -s '<release-or-keep-ref>..<branch>' -d <trunk>@upstream`. A bare `-b` rewrites the merge.
-- A direct release member: record `rehome needed: parent of <release>` and hand back. The orchestrator changes the release only after all member claims are released.
-- An ancestor of a release/keep merge that is not a current member: record `rehome needed: ancestor of retained release <name/ref>` and hand back. Never `-b`, `-s` or `-r` it.
-- Never duplicate a feature branch or build a release-lineage copy.
-- After the rehome, record the old and new commits and update the expected tip. Make sure that the patch and a conflict-free ancestry stay. A trunk-context-only diff does not replace exercising the code. Push only after candidate review.
+- Before you rehome, or squash or rebase because a maintainer asks, read [references/rehome.md](references/rehome.md): which rebase each branch shape takes, and when you record `rehome needed` and hand back instead, because a wrong rebase rewrites a release merge.
 
 **Done when:** no rehome was needed, or a `rehome:` notch records its effect and new expected tip, with both commits as evidence.
 
@@ -152,13 +141,7 @@ knives preflight
 
 ## 6. Independent review, push and publish
 
-- Write `<per-PR-scratch>/reviewer-packet.md` and send it to the orchestrator. Before any push or publish, the reviewers get it for the same candidate: a fresh-context reviewer, and the `thermonuclear-deep-review` and `thermonuclear-code-quality` agents where the harness defines them. Each verdict names the candidate head. All run because a defect a maintainer finds costs them our work and us their trust. The packet contains:
-  - Repo, PR, branch, original PR head, expected branch tip, candidate head and claimed workspace.
-  - The `placement:` notch. The reviewer challenges its evidence, not only whether the patch passes.
-  - The full fork-point-to-candidate diff and commit list. The recon notch, inherited notch context and working list.
-  - Draft body and replies, configured scan terms, exact gate commands and full log paths.
-  - Reviewer rules: examine the **whole diff** yourself for correctness, security and regressions, also when the owner reports no repairs. Confirm every recon and inherited obligation, the scope of each repair, body truth, red/green evidence and remaining forbidden hits. Reproduce applicable claims, not only the owner's logs. Make no commit, notch, bookmark or forge change. Report any gate-generated change, never fold it in.
-  - Required first-line verdict: `PASS (no repairs)`, `PASS per fix (k/k)`, or `FAIL: fix|body|drift|placement`. Then evidence per question and any new finding. A question with no object says `none`.
+- Write `<per-PR-scratch>/reviewer-packet.md` as [references/reviewer-packet.md](references/reviewer-packet.md) says and send it to the orchestrator. Before any push or publish, the reviewers get it for the same candidate: a fresh-context reviewer, and the `thermonuclear-deep-review` and `thermonuclear-code-quality` agents where the harness defines them. Each verdict names the candidate head. All run because a defect a maintainer finds costs them our work and us their trust.
 - Wait up to 30 minutes. An acknowledgement is not a verdict. On timeout, write `decision: reviewer verdict outstanding; repair commits <ids>; bookmark not moved` with evidence and hand back. The orchestrator, not the human, gets the verdict and resumes you.
 - Drift is any of these:
   - the local bookmark is not the expected branch tip
@@ -204,9 +187,6 @@ knives preflight
 
 ## Cross-scope questions and interruptions
 
-- Take placement, membership, compatible repair and coordination questions to the orchestrator with evidence and your recommendation. It decides within the approved goal. Apply recorded choices. Never make the human choose again.
-- Only missing authority, a real change in direction, or an unresolved conflict with user intent goes to the human. Send it as a worked question: the ask, the record, what you would do and why, and what changes if they choose otherwise. A maintainer's design question is never one of these.
 - Never change defaults or take out functionality against the approved goal to make a gate pass.
-- Get new external credentials through the existing approval mechanism. Never go around a denial or timeout.
 - Finish independent reachable work while a dependency waits.
-- If another actor reparents your branch, update the stale workspace once. Record the old and new tips and the reparented repair commits. Do not push. Give the orchestrator the pending candidate and hand back if necessary. It picks the head from content evidence and resumes you. Then run review and the affected tests again. An old-tree PASS never survives a rebase, even one with no textual conflicts.
+- Read [references/cross-scope.md](references/cross-scope.md) when a question reaches past your PR (placement, membership, a compatible repair, coordination, or something only the human can decide), when you need a new external credential, or when another actor reparents your branch, because each has one owner and one route.
