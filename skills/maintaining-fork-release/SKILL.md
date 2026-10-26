@@ -62,7 +62,7 @@ You own the requested outcome, not only the dispatched PRs.
 
 - Give each PR one `maintaining-fork-pr` owner, end to end. Keep at most eight owners active, and dispatch at most eight at a time.
 - See each start's claim or refusal before the next batch. Claim-lock waits are normal. Free the slot on handback, but stay responsible for the PR until merge or reassignment.
-- **Owners and the step 4 reviewer run on a strong model, never the default fast tier**. A fast model works the steps as a checklist: it posts replies nobody needed and reopens settled threads and decisions.
+- **Owners and the step 4 reviewers run on a strong model, never the default fast tier**. A fast model works the steps as a checklist: it posts replies nobody needed and reopens settled threads and decisions.
 - Before the first dispatch, find the model of the generic task agent. If it is fast, select a strong agent or model override and name it in the dispatch record. Only read-only recon that an owner judges again can use a fast tier.
 - Respect a claim held outside this sweep. Report its `why` text and continue other work. A quiet `seen` field does not prove the holder died.
 - If an owner stops, find its state through coordination and its claim and workspace. Then use the supported claim-recovery procedure. Never force a claim or restore the shared jj operation log.
@@ -93,9 +93,9 @@ Release-only members:
 - When an owner sends its packet path, verify its repo/PR identity, original PR head, expected head and candidate head against the dispatch.
 - Send a packet back to recon when it has no `placement:` notch or uses approval or tests in place of evidence.
 - Send it back when its PR evidence is a first page or truncated. Comments, reviews, threads, CI runs and workflow runs must be complete for the judged head. A `null` thread count, elided output or `first:100` with more pages is incomplete.
-- Dispatch a fresh-context reviewer with the packet unedited. The verdict is `PASS (no repairs)`, `PASS per fix (k/k)` or `FAIL: fix|body|drift|placement`, with evidence for each question.
-- The reviewer examines the **whole PR diff**, not only the owner's findings, even when recon found nothing.
-- Relay the verdict verbatim within 20 minutes. Do not use your judgment in its place or soften a FAIL. Send a malformed verdict back to the reviewer.
+- Dispatch the reviewers `maintaining-fork-pr` step 6 names, each fresh and each with the packet unedited. The fresh-context reviewer's verdict is `PASS (no repairs)`, `PASS per fix (k/k)` or `FAIL: fix|body|drift|placement`, with evidence for each question.
+- Each reviewer examines the **whole PR diff**, not only the owner's findings, even when recon found nothing.
+- Relay each verdict verbatim within 20 minutes. Do not use your judgment in its place or soften a FAIL. Send a malformed verdict back to the reviewer.
 - After 30 minutes, the owner records `decision: reviewer verdict outstanding; repair commits <ids>; bookmark not moved` and hands back. Then the verdict is your work, not the human's. Get it and resume the owner at verification, with its original, expected and candidate revisions.
 
 ### Notches are the handback record

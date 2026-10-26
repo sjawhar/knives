@@ -121,7 +121,7 @@ knives preflight
 
 ## 4. Repair and exercise the candidate
 
-- Append one reviewable repair commit per finding on your `@`. Never rewrite a branch commit or a shared descendant. Describe only your commits. The only sanctioned ancestry changes are the lone-branch rehome, the orchestrator's release-wide rebase and the same-content recovery. Never restore the shared operation log.
+- Append one reviewable repair commit per finding on your `@`. Never rewrite a branch commit or a shared descendant. Describe only your commits. The only sanctioned ancestry changes are the lone-branch rehome, the orchestrator's release-wide rebase, the same-content recovery, and a squash or rebase a maintainer asks for, which follows step 3's rules for a rehome. Never restore the shared operation log.
 - Each repair records the failure (red) and the result after the repair (green) under the same conditions, with commands, output and commits. If a claim does not reproduce, investigate its premise. Never fake a pass or quietly weaken a gate. Judge pre-sweep changes against their fork point where that applies.
 - In the claimed workspace, run each applicable gate and each distinct test command in the PR body. Do not trust old counts. Then exercise the changed public behavior.
 - Keep separate evidence for static analysis, unit/integration tests and **end-to-end behavior on the real surface**. A unit suite is not e2e. If runtime proof belongs to the orchestrator's consumer environment, name the behavior and candidate to test. It stays unverified until the proof comes.
@@ -146,13 +146,13 @@ knives preflight
 - Each remaining forbidden-term or private-detail hit needs a reason. An unexplained hit blocks publication.
 - Use `pr-preflight` only for what applies to an open PR: policy files, issue references, AI disclosure, scope and package routing, promise recording. Its open-PR cap does not apply here. Its claim and status facts inform ownership and drift.
 - Never open an issue or PR only to satisfy a template. Find the existing issue, or escalate the missing authority. Format and naming choices inside the policy are yours.
-- Follow the user's outbound-prose and disclosure rules and the upstream policy. Keep internal people, hosts, tooling, notch contents and coordination out of upstream prose. Write evidence in the repository's terms.
+- Follow the user's outbound-prose and disclosure rules and the upstream policy. Draft in the first person, as the user who opens the PR, with no AI header where the user's rules say so, because the maintainer reads the text as theirs. A disclosure the upstream policy requires (`pr-preflight` check 5) still goes in, in its form. Keep internal people, hosts, tooling, notch contents and coordination out of upstream prose. Write evidence in the repository's terms.
 
 **Done when:** the body and replies are true of the exact candidate, and inherited obligations are answered or honestly outstanding.
 
 ## 6. Independent review, push and publish
 
-- Write `<per-PR-scratch>/reviewer-packet.md` and send it to the orchestrator for a fresh-context reviewer. The packet contains:
+- Write `<per-PR-scratch>/reviewer-packet.md` and send it to the orchestrator. Before any push or publish, the reviewers get it for the same candidate: a fresh-context reviewer, and the `thermonuclear-deep-review` and `thermonuclear-code-quality` agents where the harness defines them. Each verdict names the candidate head. All run because a defect a maintainer finds costs them our work and us their trust. The packet contains:
   - Repo, PR, branch, original PR head, expected branch tip, candidate head and claimed workspace.
   - The `placement:` notch. The reviewer challenges its evidence, not only whether the patch passes.
   - The full fork-point-to-candidate diff and commit list. The recon notch, inherited notch context and working list.
@@ -168,17 +168,17 @@ knives preflight
 
   A reviewed candidate ahead of the bookmark is not drift. Another branch that moves is not drift. Confirm these identities before you publish and after each command that can rewrite generated files.
 - A PASS does not cover gate-generated files. Make a new candidate through step 4 and send a fresh packet.
-- Paste the verdict verbatim into a `verify:` notch. Return a malformed verdict for clarification. A FAIL blocks publication: repair the code or body, or resolve the drift. A `placement` FAIL goes back to the `fork-work` challenge first. Then refresh the packet for a new review. A verdict on an old tree never approves a new candidate.
-- After PASS, and after you confirm the identities and the tree:
+- Paste each verdict verbatim into a `verify:` notch. Return a malformed verdict for clarification. A FAIL, or a blocking finding from either thermonuclear reviewer, blocks publication: repair the code or body, or resolve the drift. A `placement` FAIL goes back to the `fork-work` challenge first. Then refresh the packet for a new review. A verdict on an old tree never approves a new candidate.
+- After every reviewer passes, and after you confirm the identities and the tree:
 
   ```sh
   jj bookmark set <branch> -r <candidate>
   jj git push --remote origin -b <branch>
   ```
 
-- Use the PR-head remote if it is not `origin`. `knives pushed <branch>` and a fresh `knives pr <number>` must show that the remote branch and the live PR carry the candidate. With no repairs and no rehome, do not push.
+- Use the PR-head remote if it is not `origin`. `knives pushed <branch>` and a fresh `knives pr <number>` must show that the remote branch and the live PR carry the candidate. With no repair, rehome or requested squash, do not push.
 - Read the workflow runs on the published head again, all pages. A failure is repair work. Pending runs need a real watcher, yours or one the orchestrator explicitly keeps after handback. Never sample once and forget. `action_required` is unrun. It is not a cue to ask upstream for approval. Keep missing runtime evidence explicit.
-- Write `verify:` with the verbatim verdict and the original-to-published commits (or no push). Add each gate's last result and log path, real-surface evidence separately, and CI conclusions and pending runs on that head. A pass at another commit does not count.
+- Write `verify:` with the verbatim verdicts and the original-to-published commits (or no push). Add each gate's last result and log path, real-surface evidence separately, and CI conclusions and pending runs on that head. A pass at another commit does not count.
 - Publish only the exact text that review approved, after the candidate is on the PR. Prose you edit after review needs a refreshed packet. Skip a body that has no change from the live one. Post the necessary replies and request re-review where due and permitted. If you cannot request it, record that limit. Save each reply URL.
 - Write the record notch, with only evidence arguments that exist:
 
