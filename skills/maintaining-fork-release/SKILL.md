@@ -81,7 +81,7 @@ Each dispatch holds, in order:
 Release-only members:
 
 - Handle them yourself with the same claim, evidence and independent-review discipline. Do not invent PR numbers or open PRs to fill the inventory.
-- Claim a named branch before anyone edits it. Carry, drop or classify an anonymous member from release evidence and notches. Do not make a branch for it.
+- Claim a named branch before anyone edits it. Carry, drop or classify an anonymous member (a release parent no branch names) from release evidence and notches. Do not make a branch for it. Before a drop, follow [references/drop-sweep.md](references/drop-sweep.md).
 - Give a bounded branch implementation to one owner only when the requested scope authorizes it.
 - Classify with evidence: supplied upstream, still proposed upstream, downstream configuration, or obsolete. Record reason and disposition with `knives notch <branch> -m ... --evidence ...`, or on the release or repo subject for an anonymous member.
 - Do not include an open PR in a release automatically. A branch with no upstream PR yet still needs one.
@@ -98,7 +98,7 @@ Release-only members:
 - Dispatch the reviewers `maintaining-fork-pr` step 6 names, each fresh and each with the packet unedited. The fresh-context reviewer's verdict is `PASS (no repairs)`, `PASS per fix (k/k)` or `FAIL: fix|body|drift|placement`, with evidence for each question.
 - Each reviewer examines the **whole PR diff**, not only the owner's findings, even when recon found nothing.
 - Relay each verdict verbatim within 20 minutes. Do not use your judgment in its place or soften a FAIL. Send a malformed verdict back to the reviewer.
-- After 30 minutes, the owner records `decision: reviewer verdict outstanding; repair commits <ids>; bookmark not moved` and hands back. Then the verdict is your work, not the human's. Get it and resume the owner at verification, with its original, expected and candidate revisions.
+- After 30 minutes, the owner records `handback: reviewer verdict outstanding; repair commits <ids>; bookmark not moved` and hands back. Then the verdict is your work, not the human's. Get it and resume the owner at verification, with its original, expected and candidate revisions.
 
 ### Notches are the handback record
 
