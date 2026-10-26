@@ -93,7 +93,7 @@ Release-only members:
 - When an owner sends its packet path, verify its repo/PR identity, original PR head, expected head and candidate head against the dispatch.
 - Send a packet back to recon when it has no `placement:` notch or uses approval or tests in place of evidence.
 - Send it back when its PR evidence is a first page or truncated. Comments, reviews, threads, CI runs and workflow runs must be complete for the judged head. A `null` thread count, elided output or `first:100` with more pages is incomplete.
-- Dispatch the three reviewers `maintaining-fork-pr` step 6 names, each fresh and each with the packet unedited. The fresh-context reviewer's verdict is `PASS (no repairs)`, `PASS per fix (k/k)` or `FAIL: fix|body|drift|placement`, with evidence for each question.
+- Dispatch the reviewers `maintaining-fork-pr` step 6 names, each fresh and each with the packet unedited. The fresh-context reviewer's verdict is `PASS (no repairs)`, `PASS per fix (k/k)` or `FAIL: fix|body|drift|placement`, with evidence for each question.
 - Each reviewer examines the **whole PR diff**, not only the owner's findings, even when recon found nothing.
 - Relay each verdict verbatim within 20 minutes. Do not use your judgment in its place or soften a FAIL. Send a malformed verdict back to the reviewer.
 - After 30 minutes, the owner records `decision: reviewer verdict outstanding; repair commits <ids>; bookmark not moved` and hands back. Then the verdict is your work, not the human's. Get it and resume the owner at verification, with its original, expected and candidate revisions.
