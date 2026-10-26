@@ -7,7 +7,7 @@ use std::task::{Context, Poll, Waker};
 
 use futures_core::Stream as _;
 use jj_lib::backend::{BackendError, CommitId as JjCommitId};
-use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
+use jj_lib::config::{ConfigLayer, ConfigResolutionContext, ConfigSource, StackedConfig};
 use jj_lib::default_backend_factories::{
     default_backend_factories, default_working_copy_factories,
 };
@@ -2564,21 +2564,10 @@ enum Signing {
     AsUser,
 }
 
-/// jj's stock configuration, plus the writer identity and, with
-/// [`Signing::AsUser`], the commit-signing settings, read from the files and
-/// variables the jj CLI reads them from: `JJ_USER`/`JJ_EMAIL`, then the
-/// repository's own config, then the user files (`$JJ_CONFIG` when set, later
-/// paths first, as jj ranks them; otherwise `$XDG_CONFIG_HOME/jj/config.toml`,
-/// `~/.config/jj/config.toml`, `~/.jjconfig.toml`). Within each file,
-/// `[[--scope]]` tables (and a file-level `--when`) apply as jj applies them
-/// when their only condition is `--when.repositories`: a listed path (`~`
-/// expanded) matches when the repository's store, `<main workspace>/.jj/repo`,
-/// lies under it, and an active scope ranks above the table it sits in. Scopes
-/// with any other condition (`environments`, `commands`, `hostnames`,
-/// `platforms`, `workspaces`) are not read: they describe the invoking
-/// command or machine, not the repository. Also not read: `conf.d`
-/// directories and directories named in `$JJ_CONFIG`, `/etc/jj`, and the
-/// workspace layer.
+/// jj's stock configuration, plus the writer identity (`user.*`) and, with
+/// [`Signing::AsUser`], the commit-signing settings (`signing.*`), taken from
+/// the configuration a jj CLI process started here would resolve for this
+/// workspace ([`resolved_jj_config`]).
 ///
 /// Every behavioral setting of knives' own in-process jj deliberately stays at
 /// jj's defaults (#18), with two exceptions, each because the commit could not
@@ -2587,210 +2576,185 @@ enum Signing {
 /// (`behavior`, `backend`, `key`, `backends.*`), since a commit the user's
 /// signing policy requires but knives wrote unsigned is refused by a branch
 /// that requires signatures or shows Unverified, and re-signing it by hand
-/// changes its id. jj-lib signs as it writes: `RepoLoader::init_from_file_system`
-/// builds the store's signer from these settings, and every commit builder's
-/// write applies `signing.behavior` to the commit it writes. The one setting
-/// knives states for the *checkout* — the fork's `immutable_heads()`, written
-/// by `start` into the repository's own config for the jj CLI
-/// ([`crate::config::RepoEntry::immutable_heads`]) — is not read here:
-/// in-process rewrites keep jj's default pins ([`assert_mutable`]).
+/// changes its id. Each resolved layer keeps its source and precedence, so jj
+/// merges these tables key by key as it would. jj-lib signs as it writes:
+/// `RepoLoader::init_from_file_system` builds the store's signer from these
+/// settings, and every commit builder's write applies `signing.behavior` to the
+/// commit it writes. The one setting knives states for the *checkout* — the
+/// fork's `immutable_heads()`, written by `start` into the repository's own
+/// config for the jj CLI ([`crate::config::RepoEntry::immutable_heads`]) — is
+/// not read here: in-process rewrites keep jj's default pins
+/// ([`assert_mutable`]).
 fn repo_settings(path: &Path, signing: Signing) -> Result<UserSettings, JjError> {
     let open_error = |detail: String| JjError::Open {
         path: path.display().to_string(),
         detail,
     };
+    let resolved = resolved_jj_config(path)?;
+    let tables: &[&str] = match signing {
+        Signing::Off => &["user"],
+        Signing::AsUser => &["user", "signing"],
+    };
     let mut config = StackedConfig::with_defaults();
-    let files = config_files(path)?;
-    if matches!(signing, Signing::AsUser) {
-        // Lowest precedence first: jj merges tables key by key across its
-        // layers, so a repository's `signing.behavior` overrides the user
-        // file's while the user file's `signing.key` still applies.
-        for (source, table) in files.iter().rev() {
-            let Some(signing) = table.get("signing") else {
-                continue;
-            };
-            let mut layer = toml::Table::new();
-            layer.insert("signing".to_owned(), signing.clone());
-            let layer = ConfigLayer::parse(*source, &layer.to_string())
-                .map_err(|error| open_error(error.to_string()))?;
-            config.add_layer(layer);
+    for layer in resolved.layers() {
+        let mut kept = ConfigLayer::empty(layer.source);
+        for table in tables {
+            if let Some(item) = layer.data.get(table) {
+                kept.data.insert(table, item.clone());
+            }
         }
-    }
-    let (name, email) = resolved_identity(&files);
-    let mut lines = Vec::new();
-    if let Some(name) = name {
-        lines.push(format!("user.name = {}", toml_string(&name)));
-    }
-    if let Some(email) = email {
-        lines.push(format!("user.email = {}", toml_string(&email)));
-    }
-    if !lines.is_empty() {
-        let layer = ConfigLayer::parse(ConfigSource::User, &lines.join("\n"))
-            .map_err(|error| open_error(error.to_string()))?;
-        config.add_layer(layer);
+        if !kept.is_empty() {
+            config.add_layer(kept);
+        }
     }
     UserSettings::from_config(config).map_err(|error| open_error(error.to_string()))
 }
 
-/// A string as a quoted, escaped TOML literal.
-fn toml_string(value: &str) -> String {
-    toml::Value::String(value.to_owned()).to_string()
-}
-
-/// The identity the jj CLI would write with, by its precedence.
-fn resolved_identity(files: &[(ConfigSource, toml::Table)]) -> (Option<String>, Option<String>) {
-    let mut name = identity_var("JJ_USER");
-    let mut email = identity_var("JJ_EMAIL");
-    for (_, table) in files {
-        let Some(toml::Value::Table(user)) = table.get("user") else {
-            continue;
-        };
-        name = name.or_else(|| table_string(user, "name"));
-        email = email.or_else(|| table_string(user, "email"));
-    }
-    (name, email)
-}
-
-fn identity_var(key: &str) -> Option<String> {
-    std::env::var(key).ok().filter(|value| !value.is_empty())
-}
-
-/// The jj config layers knives reads settings from, highest precedence first:
-/// each file's top-level table and its active repository scopes
-/// ([`file_layers`]). An absent or unreadable file is not a source; a file that
-/// exists but cannot parse is an error — quietly writing anonymous or unsigned
-/// commits because a config file is broken would surface much later, as an
-/// unpushable release.
-fn config_files(repo_path: &Path) -> Result<Vec<(ConfigSource, toml::Table)>, JjError> {
-    let store = Repo::repository_store_path(repo_path)?;
-    let mut files: Vec<(ConfigSource, PathBuf)> = repo_config_files(repo_path)?
-        .into_iter()
-        .map(|file| (ConfigSource::Repo, file))
-        .collect();
-    if let Some(paths) = std::env::var_os("JJ_CONFIG") {
-        // Like jj, `JJ_CONFIG` replaces the user files entirely, and a later
-        // path overrides an earlier one.
-        let mut paths: Vec<PathBuf> = std::env::split_paths(&paths).collect();
-        paths.reverse();
-        files.extend(paths.into_iter().map(|file| (ConfigSource::User, file)));
+/// The configuration a jj CLI process started in this environment would
+/// resolve for the workspace at `workspace`, defaults and command-line
+/// arguments aside. It follows jj-cli 0.45/0.46 `cli/src/config.rs` (identical
+/// in both for these parts) and `cli/src/cli_util.rs`:
+///
+/// - Layers, lowest precedence first (`config_from_environment`): system
+///   (`/etc/jj/config.toml`, then `/etc/jj/conf.d/*.toml`, only while
+///   `$JJ_CONFIG` is unset; `resolve_system`), user, repo, workspace, then the
+///   `JJ_USER`/`JJ_EMAIL` overrides (`env_overrides_layer`).
+/// - User files (`resolve_user`): each `$JJ_CONFIG` entry in order, a later one
+///   winning, a directory contributing its `*.toml` files in sorted order;
+///   otherwise `~/.jjconfig.toml`, then `<config dir>/jj/config.toml`, then
+///   `<config dir>/jj/conf.d/*.toml`, where the config dir is an absolute
+///   `$XDG_CONFIG_HOME`, else `~/.config` (etcetera's XDG strategy). A path
+///   that does not exist is skipped; one that cannot parse is an error.
+/// - Repo and workspace files: the per-id file under `<config dir>/jj/repos/`
+///   (`workspaces/`) that the store's `config-id` (the workspace's
+///   `.jj/workspace-config-id`) names, else the legacy `.jj/repo/config.toml`
+///   (`.jj/workspace-config.toml`), read where jj's `SecureConfig` finds them.
+///   jj also migrates or copies those files on first contact; knives only
+///   reads, and jj's copy holds the same content.
+/// - Scopes are resolved by jj-lib's own `jj_lib::config::resolve` with the
+///   context `ConfigEnv::resolve_config` fills: the canonical home directory,
+///   the repository path (`<workspace root>/.jj/repo`, or the canonical store
+///   a secondary workspace's pointer names, as `DefaultWorkspaceLoader` reads
+///   it), the canonical workspace root, the hostname, every UTF-8 environment
+///   variable, and no command name — so `--when.commands` scopes never apply.
+fn resolved_jj_config(workspace: &Path) -> Result<StackedConfig, JjError> {
+    let config_error = |detail: String| JjError::Open {
+        path: workspace.display().to_string(),
+        detail,
+    };
+    let jj_config = std::env::var("JJ_CONFIG").ok();
+    let raw_home = std::env::home_dir();
+    let home = raw_home
+        .as_ref()
+        .map(|home| home.canonicalize().unwrap_or_else(|_| home.clone()));
+    let config_dir = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|dir| dir.is_absolute())
+        .or_else(|| raw_home.map(|home| home.join(".config")));
+    let root_config_dir = config_dir.as_ref().map(|dir| dir.join("jj"));
+    let workspace_root = workspace
+        .canonicalize()
+        .map_err(|error| config_error(error.to_string()))?;
+    let jj_dir = workspace_root.join(".jj");
+    let repo_path = if jj_dir.join("repo").is_file() {
+        Repo::repository_store_path(&workspace_root)?
     } else {
-        if let Some(home) = config_home() {
-            files.push((ConfigSource::User, home.join("jj/config.toml")));
-        }
-        if let Some(home) = home_dir() {
+        jj_dir.join("repo")
+    };
+
+    let mut files: Vec<(ConfigSource, PathBuf)> = Vec::new();
+    if let Some(paths) = &jj_config {
+        files.extend(
+            std::env::split_paths(paths)
+                .filter(|path| !path.as_os_str().is_empty())
+                .map(|path| (ConfigSource::User, path)),
+        );
+    } else {
+        files.push((ConfigSource::System, PathBuf::from("/etc/jj/config.toml")));
+        files.push((ConfigSource::System, PathBuf::from("/etc/jj/conf.d")));
+        if let Some(home) = &home {
             files.push((ConfigSource::User, home.join(".jjconfig.toml")));
         }
+        if let Some(root) = &root_config_dir {
+            files.push((ConfigSource::User, root.join("config.toml")));
+            files.push((ConfigSource::User, root.join("conf.d")));
+        }
     }
-    let mut tables = Vec::new();
-    for (source, file) in files {
-        let Ok(text) = std::fs::read_to_string(&file) else {
+    if let Some(root) = &root_config_dir {
+        let repo = secure_config_file(&repo_path, ("config-id", "config.toml"), root, "repos")?;
+        files.push((ConfigSource::Repo, repo));
+        let own = secure_config_file(
+            &jj_dir,
+            ("workspace-config-id", "workspace-config.toml"),
+            root,
+            "workspaces",
+        )?;
+        files.push((ConfigSource::Workspace, own));
+    }
+
+    let mut raw = StackedConfig::empty();
+    for (source, path) in files {
+        if !path.exists() {
             continue;
-        };
-        let parse_error = |detail: String| JjError::Parse {
-            detail: format!("{}: {detail}", file.display()),
-        };
-        let table: toml::Table = text
-            .parse()
-            .map_err(|error: toml::de::Error| parse_error(error.to_string()))?;
-        let mut layers = Vec::new();
-        file_layers(table, &store, &mut layers).map_err(parse_error)?;
-        tables.extend(layers.into_iter().rev().map(|layer| (source, layer)));
+        }
+        if path.is_dir() {
+            raw.load_dir(source, &path)
+        } else {
+            raw.load_file(source, path)
+        }
+        .map_err(|error| config_error(error.to_string()))?;
     }
-    Ok(tables)
+    let mut overrides = ConfigLayer::empty(ConfigSource::EnvOverrides);
+    for (variable, key) in [("JJ_USER", "user.name"), ("JJ_EMAIL", "user.email")] {
+        if let Ok(value) = std::env::var(variable) {
+            overrides
+                .set_value(key, value)
+                .map_err(|error| config_error(error.to_string()))?;
+        }
+    }
+    raw.add_layer(overrides);
+
+    let uname = rustix::system::uname();
+    let environment: HashMap<String, String> = std::env::vars_os()
+        .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
+        .collect();
+    let context = ConfigResolutionContext {
+        home_dir: home.as_deref(),
+        repo_path: Some(&repo_path),
+        workspace_path: Some(&workspace_root),
+        command: None,
+        hostname: uname.nodename().to_str().unwrap_or(""),
+        environment: &environment,
+    };
+    jj_lib::config::resolve(&raw, &context).map_err(|error| config_error(error.to_string()))
 }
 
-fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .filter(|home| !home.is_empty())
-        .map(PathBuf::from)
-}
-
-/// One config table's layers, lowest precedence first, appended to `layers`:
-/// nothing when its `--when` does not hold for this repository, otherwise the
-/// table without its scopes, then each `[[--scope]]` table's own layers in
-/// order — the order jj's resolver stacks them in.
-fn file_layers(
-    mut table: toml::Table,
-    store: &Path,
-    layers: &mut Vec<toml::Table>,
-) -> Result<(), String> {
-    if !scope_applies(table.remove("--when"), store)? {
-        return Ok(());
-    }
-    let scopes = table.remove("--scope");
-    layers.push(table);
-    match scopes {
-        None => {}
-        Some(toml::Value::Array(scopes)) => {
-            for scope in scopes {
-                let toml::Value::Table(scope) = scope else {
-                    return Err("`--scope` must be an array of tables".to_owned());
-                };
-                file_layers(scope, store, layers)?;
+/// The repo or workspace config file jj's `SecureConfig` reads for the
+/// directory `dir` (`.jj/repo` or `.jj`): the file under `root/kind/` its id
+/// file names, else the legacy file inside `dir`. A malformed id is an error,
+/// as it is to jj.
+fn secure_config_file(
+    dir: &Path,
+    (id_name, legacy_name): (&str, &str),
+    root: &Path,
+    kind: &str,
+) -> Result<PathBuf, JjError> {
+    let id_path = dir.join(id_name);
+    match std::fs::read_to_string(&id_path) {
+        Ok(id) => {
+            if id.len() != 20 || !id.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Err(JjError::Parse {
+                    detail: format!("{}: malformed config id", id_path.display()),
+                });
             }
+            Ok(root.join(kind).join(id).join("config.toml"))
         }
-        Some(_) => return Err("`--scope` must be an array of tables".to_owned()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(dir.join(legacy_name)),
+        Err(error) => Err(JjError::Open {
+            path: id_path.display().to_string(),
+            detail: error.to_string(),
+        }),
     }
-    Ok(())
-}
-
-/// Whether a `--when` condition holds for the repository whose store is
-/// `store`. No condition holds. A condition naming anything but
-/// `repositories` is treated as not holding: knives cannot judge it the way
-/// the invoking jj command would.
-fn scope_applies(condition: Option<toml::Value>, store: &Path) -> Result<bool, String> {
-    let Some(condition) = condition else {
-        return Ok(true);
-    };
-    let toml::Value::Table(condition) = condition else {
-        return Err("`--when` must be a table".to_owned());
-    };
-    if condition.keys().any(|key| key != "repositories") {
-        return Ok(false);
-    }
-    let Some(repositories) = condition.get("repositories") else {
-        return Ok(true);
-    };
-    let toml::Value::Array(repositories) = repositories else {
-        return Err("`--when.repositories` must be an array of paths".to_owned());
-    };
-    for repository in repositories {
-        let toml::Value::String(repository) = repository else {
-            return Err("`--when.repositories` must be an array of paths".to_owned());
-        };
-        let base = Path::new(repository);
-        let base = match base.strip_prefix("~") {
-            Ok(tail) => match home_dir() {
-                Some(home) => home.join(tail),
-                None => continue,
-            },
-            Err(_) => base.to_owned(),
-        };
-        if store.starts_with(&base) {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-/// Where this repository's own jj config may live, newest convention first.
-///
-/// A non-default workspace's `.jj/repo` is a pointer to the real repository
-/// directory; `Repo::repository_store_path` resolves it the way jj does.
-fn repo_config_files(repo_path: &Path) -> Result<Vec<PathBuf>, JjError> {
-    let repo_dir = Repo::repository_store_path(repo_path)?;
-    let mut files = Vec::new();
-    // Newer jj keeps per-repo config under the user config directory, keyed by
-    // the repository's `config-id`.
-    if let Ok(id) = std::fs::read_to_string(repo_dir.join("config-id"))
-        && !id.trim().is_empty()
-        && let Some(home) = config_home()
-    {
-        files.push(home.join("jj/repos").join(id.trim()).join("config.toml"));
-    }
-    // Older jj kept it inside the repository.
-    files.push(repo_dir.join("config.toml"));
-    Ok(files)
 }
 
 const IMMUTABLE_HEADS_KEY: &str = "revset-aliases.\"immutable_heads()\"";
@@ -2924,24 +2888,9 @@ pub fn set_repo_immutable_heads(repo: &Path, rule: &str) -> Result<(), JjError> 
     Ok(())
 }
 
-/// `$XDG_CONFIG_HOME`, else `~/.config` — the directory jj's user config lives under.
-fn config_home() -> Option<PathBuf> {
-    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME")
-        && !xdg.is_empty()
-    {
-        return Some(PathBuf::from(xdg));
-    }
-    std::env::var("HOME")
-        .ok()
-        .filter(|home| !home.is_empty())
-        .map(|home| PathBuf::from(home).join(".config"))
-}
-
-fn table_string(table: &toml::Table, key: &str) -> Option<String> {
-    match table.get(key) {
-        Some(toml::Value::String(value)) => Some(value.clone()),
-        _ => None,
-    }
+/// A string as a quoted, escaped TOML literal.
+fn toml_string(value: &str) -> String {
+    toml::Value::String(value.to_owned()).to_string()
 }
 
 /// Rebase a whole branch onto `dest`: `jj rebase -b rev -d dest`.

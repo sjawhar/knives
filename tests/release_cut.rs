@@ -82,11 +82,15 @@ fn release_plan_exits_with_findings_when_the_current_release_lags_the_upstream_t
 /// The files of a user jj config that signs the user's own commits with a
 /// fresh ssh key, the way a signing policy is usually stated.
 struct SigningConfig {
-    /// The user config file, for `JJ_CONFIG`.
+    /// The user config file, for `JJ_CONFIG`: the policy at the top level.
     config: std::path::PathBuf,
     /// One line per `ssh-keygen -Y sign` run: the signing program is a wrapper
     /// that records each signature before it runs the real `ssh-keygen`.
     signatures: std::path::PathBuf,
+    directory: std::path::PathBuf,
+    public_key: std::path::PathBuf,
+    program: std::path::PathBuf,
+    allowed: std::path::PathBuf,
 }
 
 impl SigningConfig {
@@ -99,7 +103,8 @@ impl SigningConfig {
             .status()
             .expect("run ssh-keygen");
         assert!(generated.success(), "ssh-keygen failed");
-        let public = std::fs::read_to_string(key.with_extension("pub")).expect("read public key");
+        let public_key = key.with_extension("pub");
+        let public = std::fs::read_to_string(&public_key).expect("read public key");
         let allowed = directory.join("allowed-signers");
         std::fs::write(&allowed, format!("knives-lab@example.test {public}"))
             .expect("write allowed signers");
@@ -117,19 +122,44 @@ impl SigningConfig {
         .expect("write signing program");
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
             .expect("make signing program executable");
-        let config = directory.join("signing.toml");
+        let mut signing = Self {
+            config: directory.join("signing.toml"),
+            signatures,
+            directory: directory.to_owned(),
+            public_key,
+            program,
+            allowed,
+        };
+        signing.config = signing.write("signing.toml", &signing.public_key);
+        signing
+    }
+
+    /// A user config file `name` stating this policy with `key`, its tables
+    /// after `preamble` and named under `table` (`signing`, or
+    /// `--scope.signing` inside a `[[--scope]]` the preamble opens).
+    fn write_with(
+        &self,
+        name: &str,
+        (preamble, table): (&str, &str),
+        key: &std::path::Path,
+    ) -> std::path::PathBuf {
+        let config = self.directory.join(name);
         std::fs::write(
             &config,
             format!(
-                "[signing]\nbehavior = \"own\"\nbackend = \"ssh\"\nkey = '{}'\n\n\
-                 [signing.backends.ssh]\nprogram = '{}'\nallowed-signers = '{}'\n",
-                key.with_extension("pub").display(),
-                program.display(),
-                allowed.display(),
+                "{preamble}[{table}]\nbehavior = \"own\"\nbackend = \"ssh\"\nkey = '{}'\n\n\
+                 [{table}.backends.ssh]\nprogram = '{}'\nallowed-signers = '{}'\n",
+                key.display(),
+                self.program.display(),
+                self.allowed.display(),
             ),
         )
         .expect("write signing config");
-        Self { config, signatures }
+        config
+    }
+
+    fn write(&self, name: &str, key: &std::path::Path) -> std::path::PathBuf {
+        self.write_with(name, ("", "signing"), key)
     }
 
     /// How many signatures were made.
@@ -331,6 +361,143 @@ fn a_cut_is_written_with_the_identity_scoped_to_its_repository() {
         ],
     );
     assert_eq!(author, "Default Name <scoped@example.test>");
+}
+
+/// The release commit's author email, read under no user config.
+fn release_author_email(lab: &Lab) -> String {
+    work_jj(
+        lab,
+        std::path::Path::new("/dev/null"),
+        &[
+            "log",
+            "--no-graph",
+            "-r",
+            "release/2026-08-04",
+            "-T",
+            "author.email()",
+        ],
+    )
+}
+
+#[test]
+fn a_later_jj_config_path_overrides_an_earlier_one() {
+    // Given: identity stated only in two `JJ_CONFIG` files, both setting
+    // `user.email`. jj loads the paths in order, so the later one wins.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let (home, _consumer) = release_test_home(&lab);
+    let unsigned = std::path::Path::new("/dev/null");
+    work_jj(&lab, unsigned, &["config", "unset", "--repo", "user.name"]);
+    work_jj(&lab, unsigned, &["config", "unset", "--repo", "user.email"]);
+    let first = lab.temp_path().join("first.toml");
+    let second = lab.temp_path().join("second.toml");
+    std::fs::write(
+        &first,
+        "user.name = \"First\"\nuser.email = \"first@example.test\"\n",
+    )
+    .expect("write first config");
+    std::fs::write(&second, "user.email = \"second@example.test\"\n").expect("write second config");
+    let paths = std::env::join_paths([&first, &second]).expect("join JJ_CONFIG");
+
+    // When: knives cuts the release under `JJ_CONFIG=first:second`.
+    let output = release_command(
+        &lab,
+        &home,
+        ReleaseOutput::Text,
+        &["cut", "release/2026-08-04"],
+    )
+    .env("JJ_CONFIG", &paths)
+    .env_remove("JJ_USER")
+    .env_remove("JJ_EMAIL")
+    .output()
+    .expect("run knives release cut");
+    assert!(output.status.success(), "{output:?}");
+
+    // Then: the cut carries the second file's email.
+    assert_eq!(release_author_email(&lab), "second@example.test");
+}
+
+#[test]
+fn a_cut_is_signed_by_a_signing_policy_scoped_to_the_environment() {
+    // Given: the signing policy stated only inside a `[[--scope]]` that holds
+    // when an environment variable is set — a condition jj judges for every
+    // command, knives' own in-process writes included.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let (home, _consumer) = release_test_home(&lab);
+    let signing = SigningConfig::new(lab.temp_path());
+    let scoped = signing.write_with(
+        "scoped-signing.toml",
+        (
+            "[[--scope]]\n--when.environments = [\"KNIVES_TEST_SIGNING\"]\n",
+            "--scope.signing",
+        ),
+        &signing.public_key,
+    );
+
+    // When: knives cuts the release with that variable set.
+    let output = release_command(
+        &lab,
+        &home,
+        ReleaseOutput::Text,
+        &["cut", "release/2026-08-04"],
+    )
+    .env("JJ_CONFIG", &scoped)
+    .env("KNIVES_TEST_SIGNING", "1")
+    .output()
+    .expect("run knives release cut");
+    assert!(output.status.success(), "{output:?}");
+
+    // Then: the scope applied, and the cut is signed with its key.
+    assert_eq!(signing.signature_count(), 1, "{output:?}");
+    assert_eq!(release_signature(&lab, &signing.config), "good");
+}
+
+#[test]
+fn a_cut_whose_signing_key_cannot_be_reached_fails_and_publishes_nothing() {
+    // Given: a signing policy whose key file does not exist. Writing the cut
+    // unsigned would be the silent failure this policy exists to prevent.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let (home, _consumer) = release_test_home(&lab);
+    let signing = SigningConfig::new(lab.temp_path());
+    let broken = signing.write("broken.toml", &lab.temp_path().join("missing-key.pub"));
+    let operations_before = operation_ids(&lab.work);
+
+    // When: knives cuts the release under that policy.
+    let output = release_command(
+        &lab,
+        &home,
+        ReleaseOutput::Text,
+        &["cut", "release/2026-08-04"],
+    )
+    .env("JJ_CONFIG", &broken)
+    .output()
+    .expect("run knives release cut");
+
+    // Then: the cut fails, and nothing reached the repository: no new
+    // operation, and no release bookmark.
+    assert!(!output.status.success(), "{output:?}");
+    assert_eq!(operation_ids(&lab.work), operations_before, "{output:?}");
+    assert_eq!(
+        work_jj(
+            &lab,
+            std::path::Path::new("/dev/null"),
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                "present(release/2026-08-04)",
+                "-T",
+                "commit_id"
+            ],
+        ),
+        "",
+        "{output:?}"
+    );
 }
 
 #[test]
