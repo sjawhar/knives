@@ -152,7 +152,7 @@ knives preflight
 
 ## 6. Independent review, push and publish
 
-- Write `<per-PR-scratch>/reviewer-packet.md` and send it to the orchestrator. Before any push or publish, three reviewers get it for the same candidate: a fresh-context reviewer, and the `thermonuclear-deep-review` and `thermonuclear-code-quality` agents where the harness defines them. Each verdict names the candidate head. All run because a defect a maintainer finds costs them our work and us their trust. The packet contains:
+- Write `<per-PR-scratch>/reviewer-packet.md` and send it to the orchestrator. Before any push or publish, the reviewers get it for the same candidate: a fresh-context reviewer, and the `thermonuclear-deep-review` and `thermonuclear-code-quality` agents where the harness defines them. Each verdict names the candidate head. All run because a defect a maintainer finds costs them our work and us their trust. The packet contains:
   - Repo, PR, branch, original PR head, expected branch tip, candidate head and claimed workspace.
   - The `placement:` notch. The reviewer challenges its evidence, not only whether the patch passes.
   - The full fork-point-to-candidate diff and commit list. The recon notch, inherited notch context and working list.
