@@ -1,11 +1,11 @@
 //! `knives release reap`: superseded dated cuts disappear, and what keeps one.
 //!
 //! The newest cut stays. A superseded one goes unless a workspace's working
-//! copy or other local descendant rests on it, an untracked remote pin holds it
-//! or it carries the resolution of a conflicted live cut, each said plainly and
-//! none stopping the reap of later names; a forgotten and abandoned release
-//! stays on the remote. One operation in the op log, and a ref the next fetch
-//! rematerialises is cleared again.
+//! copy or other local descendant rests on it, an untracked remote pin or a
+//! local bookmark of another name holds it, or it carries the resolution of a
+//! conflicted live cut, each said plainly and none stopping the reap of later
+//! names; a forgotten and abandoned release stays on the remote. One operation
+//! in the op log, and a ref the next fetch rematerialises is cleared again.
 
 #![allow(
     clippy::expect_used,
@@ -495,9 +495,11 @@ fn is_visible(lab: &Lab, commit: &knives::ids::CommitId) -> bool {
 
 #[test]
 fn reap_reaps_when_another_remote_bookmark_pins_the_cut() {
-    // Given: a non-dated origin bookmark created and pushed from work itself.
-    // Fetch returns this pin as TRACKED, so it is the mutable contrast to the
-    // untracked-pin sibling test.
+    // Given: a non-dated origin bookmark created and pushed from work itself,
+    // then deleted locally so only its remote ref names the cut. Fetch returns
+    // this pin as TRACKED, so it is the mutable contrast to the untracked-pin
+    // sibling test; a local bookmark of another name keeps the commit (the
+    // local-bookmark sibling test).
     let lab = lab::Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     lab.branch("feat/beta", "beta.txt", "beta\n");
@@ -513,6 +515,7 @@ fn reap_reaps_when_another_remote_bookmark_pins_the_cut() {
         "keep/pin",
     ]);
     lab.fetch_work();
+    lab.jj_work(["bookmark", "delete", "keep/pin"]);
     let tips = Repo::open(&lab.work)
         .expect("open fixture")
         .bookmark_tips()
@@ -561,6 +564,61 @@ fn reap_reaps_when_another_remote_bookmark_pins_the_cut() {
             )
         }),
         "reaping must leave keep/pin@origin alone"
+    );
+}
+
+#[test]
+fn a_local_bookmark_of_another_name_keeps_the_commit_and_stays_where_it_was() {
+    // Given: a retention bookmark on the superseded cut, made locally. jj's
+    // default rule does not pin a local bookmark, and abandoning the cut would
+    // move the bookmark onto the merge's parents, one conflict side each.
+    let lab = lab::Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    lab.octopus("release/2026-08-04", "feat/alpha", "feat/beta");
+    lab.octopus("release/2026-08-05", "feat/alpha", "feat/beta");
+    lab.jj_work(["bookmark", "create", "keep/pin", "-r", "release/2026-08-04"]);
+    let cut = commit_at(&lab, "release/2026-08-04");
+
+    // When: reaped.
+    let repo = Repo::open(&lab.work).expect("open");
+    let report = knives::commands::release::reap_superseded(
+        &lab.work,
+        &repo,
+        &knives::ids::ReleaseScheme::Dated,
+        "origin",
+    )
+    .expect("reap");
+
+    // Then: the release name is forgotten, the commit stays under the
+    // bookmark, which still names it alone, and the reason names it.
+    assert!(report.reaped.is_empty(), "{report:?}");
+    assert_eq!(
+        report.forgotten_only,
+        vec![(
+            "release/2026-08-04".to_owned(),
+            format!("{} still pinned by bookmark keep/pin", cut.short())
+        )],
+        "{report:?}"
+    );
+    assert!(report.notes.is_empty(), "{report:?}");
+    assert!(is_visible(&lab, &cut), "the bookmarked cut was abandoned");
+    let tips = Repo::open(&lab.work)
+        .expect("reopen")
+        .bookmark_tips()
+        .expect("remaining tips");
+    assert_eq!(
+        tips.get(&BookmarkRef::Local(knives::ids::BranchName::new(
+            "keep/pin"
+        ))),
+        Some(&cut),
+        "{tips:?}"
+    );
+    assert!(
+        !tips
+            .keys()
+            .any(|reference| reference.branch().as_str() == "release/2026-08-04"),
+        "{tips:?}"
     );
 }
 

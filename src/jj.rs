@@ -76,6 +76,8 @@ pub enum JjError {
     Parse { detail: String },
     #[error("commit {commit} is immutable: pinned by {pin}")]
     Immutable { commit: String, pin: String },
+    #[error("commit {commit} is still named by bookmark {bookmark}")]
+    Bookmarked { commit: String, bookmark: String },
 }
 
 /// Bound the passive operation walk so status stays proportional to current work.
@@ -3085,9 +3087,10 @@ pub struct ReapWrite {
 /// cut's own re-materialized `@origin` ref keeps it immutable, and forgetting
 /// (unlike deleting) erases local knowledge only — nothing changes on any
 /// remote. A commit still immutable AFTER its refs are forgotten (an untracked
-/// remote pin someone else pushed, a trunk, a tag) refuses its abandon and is
-/// reported without stopping later names — the porcelain forget/abandon
-/// sequence this replaces behaved the same way, in two operations per name.
+/// remote pin someone else pushed, a trunk, a tag), or still named by a local
+/// bookmark of a name not being reaped, refuses its abandon and is reported
+/// without stopping later names — the porcelain forget/abandon sequence this
+/// replaces behaved the same way, in two operations per name.
 pub fn forget_and_abandon(
     repo: &Path,
     entries: &[(String, Vec<CommitId>)],
@@ -3107,7 +3110,9 @@ pub fn forget_and_abandon(
             .collect::<Result<_, _>>()?;
         // Gate against the transaction's view: the refs just forgotten no
         // longer pin, exactly as they no longer pinned the porcelain abandon.
-        match assert_mutable(tx.repo(), &commits) {
+        match assert_mutable(tx.repo(), &commits)
+            .and_then(|()| assert_unbookmarked(tx.repo(), &commits, entries))
+        {
             Ok(()) => {
                 for commit in &commits {
                     tx.repo_mut().record_abandoned_commit(commit);
@@ -3119,6 +3124,33 @@ pub fn forget_and_abandon(
     }
     commit_mutation(&repo, tx, operation)?;
     Ok(outcome)
+}
+
+/// Refuse to abandon a commit that a local bookmark still names, other than a
+/// bookmark of a name in `reaped`.
+///
+/// jj moves a local bookmark off an abandoned commit onto its parents, so a
+/// bookmark kept on a release merge (a `keep/…` retention name) would come out
+/// conflicted, one side per member. jj's default rule does not pin a local
+/// bookmark, so [`assert_mutable`] lets it through.
+fn assert_unbookmarked(
+    repo: &dyn jj_lib::repo::Repo,
+    targets: &[jj_lib::commit::Commit],
+    reaped: &[(String, Vec<CommitId>)],
+) -> Result<(), JjError> {
+    for target in targets {
+        if let Some((bookmark, _)) = repo
+            .view()
+            .local_bookmarks_for_commit(target.id())
+            .find(|(bookmark, _)| !reaped.iter().any(|(name, _)| name == bookmark.as_str()))
+        {
+            return Err(JjError::Bookmarked {
+                commit: short_id(&target.id().to_string()).to_owned(),
+                bookmark: bookmark.as_str().to_owned(),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Forget a bookmark and its remote-tracking refs in the transaction's view:

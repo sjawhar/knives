@@ -528,11 +528,11 @@ pub struct ReapReport {
     /// amendment: reaped must not overstate).
     pub reaped: Vec<String>,
     /// Refs forgotten but the commit kept, with why: still pinned by a ref
-    /// outside the enumeration — a tag, an untracked remote bookmark — so jj
-    /// would not abandon it. The expected outcome for a tagged release, not a
-    /// failure: the name is gone and the commit stays reachable by its pin.
-    /// Nothing else lands here; an abandon that failed for another reason is a
-    /// note.
+    /// outside the enumeration — a tag, an untracked remote bookmark, a local
+    /// bookmark of another name — so it is not abandoned. The expected outcome
+    /// for a tagged or retained release, not a failure: the name is gone and
+    /// the commit stays reachable by its pin. Nothing else lands here; an
+    /// abandon that failed for another reason is a note.
     pub forgotten_only: Vec<(String, String)>,
     /// (name, reason) pairs that were deliberately left alone.
     pub kept: Vec<(String, String)>,
@@ -628,6 +628,12 @@ pub fn reap_superseded(
                 crate::jj::JjError::Immutable { commit, pin } => report
                     .forgotten_only
                     .push((name, format!("{commit} still pinned by {pin}"))),
+                crate::jj::JjError::Bookmarked { commit, bookmark } => {
+                    report.forgotten_only.push((
+                        name,
+                        format!("{commit} still pinned by bookmark {bookmark}"),
+                    ));
+                }
                 other => report.notes.push(format!(
                     "{name}: refs forgotten, commit not abandoned: {other}"
                 )),
