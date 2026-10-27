@@ -429,7 +429,14 @@ fn a_git_failure_inside_a_checkout_is_reported_not_fallen_through() {
         stderr.starts_with("knives gh: reading remotes of"),
         "{stderr}"
     );
-    assert!(stderr.contains("not a git repository"), "{stderr}");
+    // git words this failure two ways: git 2.43 says "not a git repository",
+    // and the GitHub runners' git (2026-10-27) says "gitfile does not point to
+    // a valid repository".
+    assert!(
+        stderr.contains("not a git repository")
+            || stderr.contains("gitfile does not point to a valid repository"),
+        "{stderr}"
+    );
     assert!(
         !log.exists(),
         "gh must not run on its own auth when git fails in a checkout"
