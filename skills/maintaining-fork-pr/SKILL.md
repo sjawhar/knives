@@ -104,7 +104,7 @@ knives preflight
 ## 3. Rehome only when needed
 
 - Rehome only if the PR conflicts, a maintainer asks, or verification requires newer trunk behavior. A mergeable PR behind trunk is not a reason.
-- Before you rehome, or squash or rebase because a maintainer asks, read [references/rehome.md](references/rehome.md): which rebase each branch shape takes, and when you record `rehome needed` and hand back instead, because a wrong rebase rewrites a release merge. Never duplicate a feature branch or build a release-lineage copy in place of a rehome.
+- Before you rehome, or squash or rebase because a maintainer asks, read [references/rehome.md](references/rehome.md): which rebase each branch shape takes, and when you record `rehome needed` and hand back instead, because a wrong rebase rewrites a release merge. Never duplicate a feature branch or build a release-lineage copy.
 
 **Done when:** no rehome was needed, or a `rehome:` notch records its effect and new expected tip, with both commits as evidence.
 
