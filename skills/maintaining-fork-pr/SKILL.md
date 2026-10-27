@@ -135,7 +135,7 @@ knives preflight
 - Each remaining forbidden-term or private-detail hit needs a reason. An unexplained hit blocks publication.
 - Use `pr-preflight` only for what applies to an open PR: policy files, issue references, AI disclosure, scope and package routing, promise recording. Its open-PR cap does not apply here. Its claim and status facts inform ownership and drift.
 - Never open an issue or PR only to satisfy a template. Find the existing issue, or escalate the missing authority. Format and naming choices inside the policy are yours.
-- Follow the user's outbound-prose and disclosure rules and the upstream policy. Draft in the first person, as the user who opens the PR, with no AI header where the user's rules say so, because the maintainer reads the text as theirs. A disclosure the upstream policy requires (`pr-preflight` check 5) still goes in, in its form. Keep internal people, hosts, tooling, notch contents and coordination out of upstream prose. Write evidence in the repository's terms.
+- Follow the user's outbound-prose and disclosure rules and the upstream policy. Draft in the first person, as the user who opens the PR, with the disclosure line those rules give, because the maintainer reads the text as theirs. A disclosure the upstream policy requires (`pr-preflight` check 5) still goes in, in its form. Keep internal people, hosts, tooling, notch contents and coordination out of upstream prose. Write evidence in the repository's terms.
 
 **Done when:** the body and replies are true of the exact candidate, and inherited obligations are answered or honestly outstanding.
 
