@@ -174,6 +174,11 @@ impl Repo {
         Self::load(path, Signing::Off, None)
     }
 
+    /// The checkout this repository was opened from.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     /// Open the repository at its head operation for a transaction that will
     /// be committed: the commits it writes are signed as the user's jj would
     /// sign them ([`Signing::AsUser`]).
@@ -946,7 +951,7 @@ impl Repo {
     /// visible descendant, a working copy parked on it included whether it is
     /// empty or not. Abandoning a commit rebases whatever rests on it onto its
     /// parents. For a working copy that is a rewrite from outside its
-    /// workspace, which leaves the workspace stale, and on a release merge's
+    /// workspace, which can leave the workspace stale, and on a release merge's
     /// parents the rewritten copy is a fresh merge that can carry conflicts
     /// the release had resolved. A release edit ([`write_release`]) and the
     /// reap of a superseded cut both keep a commit by this one rule.

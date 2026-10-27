@@ -145,10 +145,10 @@ fn reap_removes_superseded_cuts_and_keeps_the_newest() {
     // When: the workspace is reaped.
     let repo = Repo::open(&lab.work).expect("open");
     let report = knives::commands::release::reap_superseded(
-        &lab.work,
         &repo,
         &knives::ids::ReleaseScheme::Dated,
         "origin",
+        &[],
     )
     .expect("reap");
 
@@ -183,10 +183,10 @@ fn reap_refuses_a_cut_that_has_local_descendants() {
 
     let repo = Repo::open(&lab.work).expect("open");
     let report = knives::commands::release::reap_superseded(
-        &lab.work,
         &repo,
         &knives::ids::ReleaseScheme::Dated,
         "origin",
+        &[],
     )
     .expect("reap");
 
@@ -335,10 +335,10 @@ fn a_second_workspaces_parked_working_copy_keeps_the_superseded_cut() {
     // When: reaped.
     let repo = Repo::open(&lab.work).expect("open");
     let report = knives::commands::release::reap_superseded(
-        &lab.work,
         &repo,
         &knives::ids::ReleaseScheme::Dated,
         "origin",
+        &[],
     )
     .expect("reap");
 
@@ -516,10 +516,10 @@ fn a_superseded_cut_a_workspace_has_checked_out_is_kept() {
     // When: reaped.
     let repo = Repo::open(&lab.work).expect("open");
     let report = knives::commands::release::reap_superseded(
-        &lab.work,
         &repo,
         &knives::ids::ReleaseScheme::Dated,
         "origin",
+        &[],
     )
     .expect("reap");
 
@@ -563,10 +563,10 @@ fn two_superseded_names_on_one_commit_are_reaped_together() {
     // When: reaped.
     let repo = Repo::open(&lab.work).expect("open");
     let report = knives::commands::release::reap_superseded(
-        &lab.work,
         &repo,
         &knives::ids::ReleaseScheme::Dated,
         "origin",
+        &[],
     )
     .expect("reap");
 
@@ -628,6 +628,78 @@ fn a_cut_keeps_a_superseded_cut_a_retention_bookmark_names_and_exits_clean() {
     assert_eq!(commit_at(&lab, "keep/2026-08-04"), cut);
 }
 
+#[test]
+fn a_cut_keeps_a_superseded_name_whose_earlier_write_a_working_copy_rests_on() {
+    // Given: an unpushed cut, a second workspace parked on it, and an include
+    // that writes a new commit under the name and keeps the first one for that
+    // working copy. No ref names the first commit any more; the ledger does.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let (home, _consumer) = release_test_home(&lab);
+    let first = knives_release(&lab, &home, &["cut", "release/2026-08-04"]);
+    assert!(first.status.success(), "{first:?}");
+    let first_write = commit_at(&lab, "release/2026-08-04");
+    let other_workspace = lab.temp_path().join("other-ws");
+    lab.jj_work([
+        "workspace",
+        "add",
+        "--name",
+        "other",
+        "--revision",
+        "release/2026-08-04",
+        other_workspace.to_str().expect("utf-8 path"),
+    ]);
+    let parked = lab.revision(&lab.work, "other@", "commit_id");
+    lab.branch("feat/gamma", "gamma.txt", "gamma\n");
+    let included = knives_release(&lab, &home, &["include", "feat/gamma"]);
+    assert!(included.status.success(), "{included:?}");
+    assert_ne!(commit_at(&lab, "release/2026-08-04"), first_write);
+    assert!(is_visible(&lab, &first_write), "the include abandoned it");
+
+    // When: the next cut reaps the superseded name.
+    let output = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
+
+    // Then: the name is kept, the reason names the earlier write and the
+    // working copy, the run exits 1, and the working copy is untouched.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(&format!(
+            "demo: kept release/2026-08-04: {}, an earlier release/2026-08-04 commit: it has descendants, whose heads are {}, the working copy of other\n",
+            first_write.short(),
+            knives::ids::CommitId::new(parked.as_str()).short()
+        )),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert!(
+        is_visible(&lab, &first_write),
+        "the earlier write was abandoned"
+    );
+    assert_eq!(lab.revision(&lab.work, "other@", "commit_id"), parked);
+
+    // And: once the workspace is forgotten, the reap retires the name and both
+    // of its commits.
+    lab.jj_work(["workspace", "forget", "other"]);
+    let reap = knives_release(&lab, &home, &["reap"]);
+    let reap_stdout = String::from_utf8_lossy(&reap.stdout);
+    assert!(reap.status.success(), "{reap_stdout}");
+    assert!(
+        reap_stdout.contains(
+            "demo: reaped release/2026-08-04 (refs forgotten everywhere, commit abandoned; remote untouched)\n"
+        ) && reap_stdout.contains(&format!(
+            "demo: abandoned {}, an earlier release/2026-08-04 commit nothing rests on any more\n",
+            first_write.short()
+        )),
+        "{reap_stdout}"
+    );
+    assert!(
+        !is_visible(&lab, &first_write),
+        "the earlier write stayed visible"
+    );
+}
+
 /// Whether `commit` is visible in the work checkout. Naming a hidden commit in
 /// a revset resurrects it, so visibility is membership of `all()`.
 fn is_visible(lab: &Lab, commit: &knives::ids::CommitId) -> bool {
@@ -677,10 +749,10 @@ fn reap_reaps_when_another_remote_bookmark_pins_the_cut() {
     // When: reaped.
     let repo = Repo::open(&lab.work).expect("open");
     let report = knives::commands::release::reap_superseded(
-        &lab.work,
         &repo,
         &knives::ids::ReleaseScheme::Dated,
         "origin",
+        &[],
     )
     .expect("reap");
 
@@ -726,10 +798,10 @@ fn a_local_bookmark_of_another_name_keeps_the_commit_and_stays_where_it_was() {
     // When: reaped.
     let repo = Repo::open(&lab.work).expect("open");
     let report = knives::commands::release::reap_superseded(
-        &lab.work,
         &repo,
         &knives::ids::ReleaseScheme::Dated,
         "origin",
+        &[],
     )
     .expect("reap");
 
@@ -822,10 +894,10 @@ fn an_untracked_remote_pin_makes_abandon_refuse_and_lands_in_forgotten_only() {
     // When: the workspace is reaped.
     let repo = Repo::open(&lab.work).expect("open");
     let report = knives::commands::release::reap_superseded(
-        &lab.work,
         &repo,
         &knives::ids::ReleaseScheme::Dated,
         "origin",
+        &[],
     )
     .expect("reap");
 
@@ -901,10 +973,10 @@ fn a_refused_first_name_does_not_stop_reaping_later_names() {
     // When: the workspace is reaped.
     let repo = Repo::open(&lab.work).expect("open");
     let report = knives::commands::release::reap_superseded(
-        &lab.work,
         &repo,
         &knives::ids::ReleaseScheme::Dated,
         "origin",
+        &[],
     )
     .expect("reap");
 
@@ -932,10 +1004,10 @@ fn reaping_is_one_operation_described_for_the_op_log() {
     // When: reaped.
     let repo = Repo::open(&lab.work).expect("open");
     let report = knives::commands::release::reap_superseded(
-        &lab.work,
         &repo,
         &knives::ids::ReleaseScheme::Dated,
         "origin",
+        &[],
     )
     .expect("reap");
     assert_eq!(report.reaped, vec!["release/2026-08-04".to_owned()]);
@@ -967,10 +1039,10 @@ fn reap_clears_a_ref_the_next_fetch_rematerialized() {
     }
     let repo = Repo::open(&lab.work).expect("open");
     knives::commands::release::reap_superseded(
-        &lab.work,
         &repo,
         &knives::ids::ReleaseScheme::Dated,
         "origin",
+        &[],
     )
     .expect("first reap");
     lab.fetch_work();
@@ -987,10 +1059,10 @@ fn reap_clears_a_ref_the_next_fetch_rematerialized() {
     // When: reaped again (idempotence is the contract).
     let repo = Repo::open(&lab.work).expect("reopen for second reap");
     let report = knives::commands::release::reap_superseded(
-        &lab.work,
         &repo,
         &knives::ids::ReleaseScheme::Dated,
         "origin",
+        &[],
     )
     .expect("second reap");
 

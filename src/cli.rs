@@ -608,6 +608,13 @@ pub enum ReleaseAction {
     ///
     /// Keeps every superseded cut while the live one still carries conflicts: the previous
     /// cut is the only record of how they were last resolved.
+    ///
+    /// Keeps a superseded cut, refs and all, while something rests on it: a workspace's
+    /// working copy on it or above it, empty or not, or any other descendant, the cut itself
+    /// or a commit an edit wrote under its name. Exits 1 and names what rests on it; the
+    /// next reap after that moves on retires it. A cut a tag, an untracked remote bookmark or
+    /// a local bookmark of another name (`keep/…`) still names has its refs forgotten and its
+    /// commit kept, exit 0.
     Reap,
 }
 

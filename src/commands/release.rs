@@ -558,21 +558,25 @@ pub struct ReapReport {
 /// rebase each of them onto the cut's parents: stacked work can come out
 /// conflicted, and a parked working copy becomes a fresh merge of the members,
 /// conflicted where the cut had resolved them, rewritten from outside its
-/// workspace, which is left stale. The kept name keeps its refs, so a later
+/// workspace, which can be left stale. The kept name keeps its refs, so a later
 /// reap retires it once nothing rests on it: jj drops an empty, undescribed
 /// working copy when it moves on, and one with changes stays a descendant until
-/// it is rebased off the cut.
+/// it is rebased off the cut. The commits `ledger` records knives writing under
+/// a name count as that name's cut: an edit keeps the commit it replaced for
+/// what rests on it, and once no ref names that commit, its name is the only
+/// thing that retires it.
 ///
 /// Never touches a remote. A later fetch re-materializes forgotten refs as
 /// untracked (jj keeps no memory of forgetting); that is expected, harmless to
 /// the default log, and cleared by the next reap. Correctness never depends on
 /// reaping having run: the divergence detector ignores these refs regardless.
 pub fn reap_superseded(
-    repo_path: &Path,
     repo: &Repo,
     scheme: &ReleaseScheme,
     publish_remote: &str,
+    ledger: &[Entry],
 ) -> anyhow::Result<ReapReport> {
+    let repo_path = repo.path();
     let tips = repo.bookmark_tips()?;
     let mut by_name = std::collections::BTreeMap::<String, Vec<CommitId>>::default();
     for (reference, commit) in superseded_dated_releases(&tips, scheme, publish_remote) {
@@ -615,6 +619,25 @@ pub fn reap_superseded(
         for target in &targets {
             if let Some(reason) = repo.what_rests_on(target)? {
                 report.kept.push((name.clone(), reason));
+                continue 'names;
+            }
+        }
+        // An edit that replaced a commit of this name kept it for what rests
+        // on it; once no ref names it, this name is all that will retire it.
+        for earlier in crate::release_model::recorded_writes(ledger, &name)
+            .map(|write| write.commit)
+            .filter(|commit| !targets.contains(commit))
+        {
+            // A write this repository does not hold (another machine's) has
+            // nothing resting on it here.
+            let Ok(rests) = repo.what_rests_on(&earlier) else {
+                continue;
+            };
+            if let Some(reason) = rests {
+                report.kept.push((
+                    name.clone(),
+                    format!("{}, an earlier {name} commit: {reason}", earlier.short()),
+                ));
                 continue 'names;
             }
         }
