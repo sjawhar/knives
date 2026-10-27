@@ -528,11 +528,11 @@ pub struct ReapReport {
     /// amendment: reaped must not overstate).
     pub reaped: Vec<String>,
     /// Refs forgotten but the commit kept, with why: still pinned by a ref
-    /// outside the enumeration — a tag, an untracked remote bookmark — so jj
-    /// would not abandon it. The expected outcome for a tagged release, not a
-    /// failure: the name is gone and the commit stays reachable by its pin.
-    /// Nothing else lands here; an abandon that failed for another reason is a
-    /// note.
+    /// outside the enumeration — a tag, an untracked remote bookmark, a local
+    /// bookmark of another name — so it is not abandoned. The expected outcome
+    /// for a tagged or retained release, not a failure: the name is gone and
+    /// the commit stays reachable by its pin. Nothing else lands here; an
+    /// abandon that failed for another reason is a note.
     pub forgotten_only: Vec<(String, String)>,
     /// (name, reason) pairs that were deliberately left alone.
     pub kept: Vec<(String, String)>,
@@ -545,26 +545,38 @@ pub struct ReapReport {
 /// The newest dated name never appears in the enumeration, and the
 /// `previous_position` seam is `Fixed`-scheme-only while dated names are the
 /// only thing enumerated, so neither needs a runtime gate here. Two things do:
-/// a cut with local descendants is someone's stacked work (#4's third loss
-/// mode) and is refused with the descendants named; and while the live cut
-/// still carries conflicts, every superseded cut is kept, because the previous
-/// cut is the only record of how those conflicts were last resolved — reaping
-/// it while the successor is unsettled destroys the record exactly when an
-/// abandon-and-recut would need it.
+/// a cut that anything rests on is kept with what rests on it named, by the
+/// rule a release edit keeps the commit it replaced by
+/// ([`Repo::what_rests_on`]); and while the live cut still carries conflicts,
+/// every superseded cut is kept, because the previous cut is the only record of
+/// how those conflicts were last resolved — reaping it while the successor is
+/// unsettled destroys the record exactly when an abandon-and-recut would need
+/// it.
 ///
-/// Parked workspace working copies — empty, undescribed — do not block: they sit
-/// on release merges as a matter of course and jj rebases them harmlessly.
+/// What rests on a cut is stacked work (#4's third loss mode), or a workspace's
+/// working copy on it or above it, empty or not. Abandoning the cut would
+/// rebase each of them onto the cut's parents: stacked work can come out
+/// conflicted, and a parked working copy becomes a fresh merge of the members,
+/// conflicted where the cut had resolved them, rewritten from outside its
+/// workspace, which can be left stale. The kept name keeps its refs, so a later
+/// reap retires it once nothing rests on it: jj drops an empty, undescribed
+/// working copy when it moves on, and one with changes stays a descendant until
+/// it is rebased off the cut. The commits `ledger` records knives writing under
+/// a name count as that name's cut: an edit keeps the commit it replaced for
+/// what rests on it, and once no ref names that commit, its name is the only
+/// thing that retires it.
 ///
 /// Never touches a remote. A later fetch re-materializes forgotten refs as
 /// untracked (jj keeps no memory of forgetting); that is expected, harmless to
 /// the default log, and cleared by the next reap. Correctness never depends on
 /// reaping having run: the divergence detector ignores these refs regardless.
 pub fn reap_superseded(
-    repo_path: &Path,
     repo: &Repo,
     scheme: &ReleaseScheme,
     publish_remote: &str,
+    ledger: &[Entry],
 ) -> anyhow::Result<ReapReport> {
+    let repo_path = repo.path();
     let tips = repo.bookmark_tips()?;
     let mut by_name = std::collections::BTreeMap::<String, Vec<CommitId>>::default();
     for (reference, commit) in superseded_dated_releases(&tips, scheme, publish_remote) {
@@ -605,18 +617,26 @@ pub fn reap_superseded(
     let mut entries: Vec<(String, Vec<CommitId>)> = Vec::new();
     'names: for (name, targets) in by_name {
         for target in &targets {
-            let descendants = crate::jj::commits_matching(
-                repo_path,
-                &format!(
-                    "(descendants({id}) ~ {id}) ~ (empty() & description(exact:\"\"))",
-                    id = target.as_str()
-                ),
-            )?;
-            if !descendants.is_empty() {
-                let sample: Vec<&str> = descendants.iter().take(3).map(CommitId::short).collect();
+            if let Some(reason) = repo.what_rests_on(target)? {
+                report.kept.push((name.clone(), reason));
+                continue 'names;
+            }
+        }
+        // An edit that replaced a commit of this name kept it for what rests
+        // on it; once no ref names it, this name is all that will retire it.
+        for earlier in crate::release_model::recorded_writes(ledger, &name)
+            .map(|write| write.commit)
+            .filter(|commit| !targets.contains(commit))
+        {
+            // A write this repository does not hold (another machine's) has
+            // nothing resting on it here; any other failure is reported.
+            if repo.resolve_commit(earlier.as_str()).is_err() {
+                continue;
+            }
+            if let Some(reason) = repo.what_rests_on(&earlier)? {
                 report.kept.push((
                     name.clone(),
-                    format!("has local descendant(s): {}", sample.join(", ")),
+                    format!("{}, an earlier {name} commit: {reason}", earlier.short()),
                 ));
                 continue 'names;
             }
@@ -633,6 +653,12 @@ pub fn reap_superseded(
                 crate::jj::JjError::Immutable { commit, pin } => report
                     .forgotten_only
                     .push((name, format!("{commit} still pinned by {pin}"))),
+                crate::jj::JjError::Bookmarked { commit, bookmark } => {
+                    report.forgotten_only.push((
+                        name,
+                        format!("{commit} still pinned by bookmark {bookmark}"),
+                    ));
+                }
                 other => report.notes.push(format!(
                     "{name}: refs forgotten, commit not abandoned: {other}"
                 )),

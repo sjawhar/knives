@@ -107,8 +107,8 @@ Cut and edit events keep full parent commits, every bookmark on them, and the co
 Forgets superseded dated refs locally and on tracking remotes, then abandons their merges. It also runs after a dated cut. **No remote repository changes.** A fetch can bring tracking refs back.
 
 - While the live cut has unresolved conflicts, every superseded cut stays as the resolution record.
-- A cut pinned outside release refs (a tag, an untracked remote bookmark) has its refs forgotten and its commit kept, with the pin named. Exit `0`, which is normal for a tagged release.
-- A superseded cut with local descendants (stacked work) stays untouched. Exit `1`.
+- A cut pinned outside release refs (a tag, an untracked remote bookmark, a local bookmark of another name such as `keep/…`) has its refs forgotten and its commit kept, with the pin named. Exit `0`, which is normal for a tagged or retained release.
+- A superseded cut that something rests on stays untouched, its refs too, and the output names what rests on it. Exit `1`. That is a workspace working copy on it or above it, empty or not, or any other descendant, on the cut or on a commit an edit wrote under its name: the rule an edit uses to keep the commit it replaced. Abandoning the cut would rewrite each of them onto the cut's parents, which can leave a working copy's workspace stale and make it a conflicted merge. A cut made from the workspace that sits on the previous cut keeps that cut too. Move your own empty working copy (`jj new <live cut>`, which drops it), then run `knives release reap`. A working copy with changes stays a descendant until it is rebased off the cut. Another workspace's working copy is its owner's to move.
 
 ## `knives release members`
 

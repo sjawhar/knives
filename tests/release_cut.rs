@@ -1083,11 +1083,14 @@ fn a_fresh_cut_carries_every_branch_and_nothing_else() {
 
 #[test]
 fn cutting_a_release_reaps_the_superseded_one() {
-    // Given: an existing cut and a consumer following it by branch.
+    // Given: an existing cut and a consumer following it by branch, with the
+    // work checkout's working copy moved off the cut (a working copy on it
+    // keeps it: tests/release_reap.rs).
     let lab = Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     lab.branch("feat/beta", "beta.txt", "beta\n");
     lab.octopus("release/2026-08-04", "feat/alpha", "feat/beta");
+    lab.jj_work(["new", "main"]);
     let (home, _consumer) = release_test_home(&lab);
 
     // When: a newer release is cut through the binary.

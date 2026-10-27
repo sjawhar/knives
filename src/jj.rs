@@ -76,6 +76,8 @@ pub enum JjError {
     Parse { detail: String },
     #[error("commit {commit} is immutable: pinned by {pin}")]
     Immutable { commit: String, pin: String },
+    #[error("commit {commit} is still named by bookmark {bookmark}")]
+    Bookmarked { commit: String, bookmark: String },
 }
 
 /// Bound the passive operation walk so status stays proportional to current work.
@@ -170,6 +172,11 @@ impl Repo {
     /// scratch commits that are dropped: signing stays off ([`Signing::Off`]).
     pub fn open(path: &Path) -> Result<Self, JjError> {
         Self::load(path, Signing::Off, None)
+    }
+
+    /// The checkout this repository was opened from.
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     /// Open the repository at its head operation for a transaction that will
@@ -937,6 +944,42 @@ impl Repo {
             .filter(|descendant| descendant.as_ref().map_or(true, |found| found != id))
             .map(|descendant| descendant.map_err(|error| revision_error(&error)))
             .collect()
+    }
+
+    /// Why `commit` must not be abandoned because something rests on it, or
+    /// `None` when nothing does: a workspace has it checked out, or it has any
+    /// visible descendant, a working copy parked on it included whether it is
+    /// empty or not. Abandoning a commit rebases whatever rests on it onto its
+    /// parents. For a working copy that is a rewrite from outside its
+    /// workspace, which can leave the workspace stale, and on a release merge's
+    /// parents the rewritten copy is a fresh merge that can carry conflicts
+    /// the release had resolved. A release edit ([`write_release`]) and the
+    /// reap of a superseded cut both keep a commit by this one rule.
+    pub fn what_rests_on(&self, commit: &CommitId) -> Result<Option<String>, JjError> {
+        let commit = self.commit(commit.as_str())?;
+        let reasons = self.rests_on(commit.id())?;
+        Ok((!reasons.is_empty()).then(|| reasons.join("; ")))
+    }
+
+    /// The reasons of [`Repo::what_rests_on`], one per kind of thing resting
+    /// on `id`.
+    fn rests_on(&self, id: &JjCommitId) -> Result<Vec<String>, JjError> {
+        let mut reasons = Vec::new();
+        let workspaces = checked_out_by(self, id);
+        if !workspaces.is_empty() {
+            reasons.push(format!(
+                "it is the working copy of {}",
+                workspaces.join(", ")
+            ));
+        }
+        let descendants = self.descendants_of(id)?;
+        if !descendants.is_empty() {
+            reasons.push(descendants_that_stay(
+                self,
+                &descendants.iter().collect::<Vec<_>>(),
+            )?);
+        }
+        Ok(reasons)
     }
 
     /// Merge commits reachable from `tip` but not from any of `bases` that join
@@ -2083,15 +2126,14 @@ pub fn abandon_unheld_writes(
 /// write's transaction, the name already moved — or `None` when nothing else
 /// rests on it.
 ///
-/// It stays for a bookmark or tag on it, local or on any remote; a workspace
-/// with it checked out; any visible descendant, a parked working copy
-/// included (the same rule as [`abandon_tagged_copies`]: rewriting a working
-/// copy from here leaves its workspace stale); or anything jj's default rule
-/// pins ([`assert_mutable`]). A commit someone else can still reach by name is
-/// theirs to keep. Two refs do not count: the colocated git view (`@git`),
-/// which shows the moved name at the source until this operation exports
-/// refs, and the moved name's tracked ref on its publish remote, the published
-/// position the next push replaces.
+/// It stays for a bookmark or tag on it, local or on any remote; for anything
+/// that rests on it ([`Repo::what_rests_on`]: a workspace with it checked out,
+/// or any visible descendant, a parked working copy included); or for anything
+/// jj's default rule pins ([`assert_mutable`]). A commit someone else can still
+/// reach by name is theirs to keep. Two refs do not count: the colocated git
+/// view (`@git`), which shows the moved name at the source until this
+/// operation exports refs, and the moved name's tracked ref on its publish
+/// remote, the published position the next push replaces.
 fn what_keeps(
     repo: &Repo,
     view_repo: &dyn jj_lib::repo::Repo,
@@ -2134,20 +2176,7 @@ fn what_keeps(
     if !named.is_empty() {
         reasons.push(format!("{} names it", named.join(", ")));
     }
-    let workspaces = checked_out_by(repo, id);
-    if !workspaces.is_empty() {
-        reasons.push(format!(
-            "it is the working copy of {}",
-            workspaces.join(", ")
-        ));
-    }
-    let descendants = repo.descendants_of(id)?;
-    if !descendants.is_empty() {
-        reasons.push(descendants_that_stay(
-            repo,
-            &descendants.iter().collect::<Vec<_>>(),
-        )?);
-    }
+    reasons.extend(repo.rests_on(id)?);
     if let Err(error) = assert_mutable(view_repo, std::slice::from_ref(commit)) {
         reasons.push(error.to_string());
     }
@@ -3063,9 +3092,11 @@ pub struct ReapWrite {
 /// cut's own re-materialized `@origin` ref keeps it immutable, and forgetting
 /// (unlike deleting) erases local knowledge only — nothing changes on any
 /// remote. A commit still immutable AFTER its refs are forgotten (an untracked
-/// remote pin someone else pushed, a trunk, a tag) refuses its abandon and is
-/// reported without stopping later names — the porcelain forget/abandon
-/// sequence this replaces behaved the same way, in two operations per name.
+/// remote pin someone else pushed, a trunk, a tag), or still named by a local
+/// bookmark of a name not being reaped, refuses its abandon and is reported
+/// without stopping later names. The porcelain forget/abandon sequence this
+/// replaces refused an immutable commit the same way, in two operations per
+/// name; `jj abandon` does not refuse a commit a bookmark names.
 pub fn forget_and_abandon(
     repo: &Path,
     entries: &[(String, Vec<CommitId>)],
@@ -3085,7 +3116,9 @@ pub fn forget_and_abandon(
             .collect::<Result<_, _>>()?;
         // Gate against the transaction's view: the refs just forgotten no
         // longer pin, exactly as they no longer pinned the porcelain abandon.
-        match assert_mutable(tx.repo(), &commits) {
+        match assert_mutable(tx.repo(), &commits)
+            .and_then(|()| assert_unbookmarked(tx.repo(), &commits, entries))
+        {
             Ok(()) => {
                 for commit in &commits {
                     tx.repo_mut().record_abandoned_commit(commit);
@@ -3097,6 +3130,33 @@ pub fn forget_and_abandon(
     }
     commit_mutation(&repo, tx, operation)?;
     Ok(outcome)
+}
+
+/// Refuse to abandon a commit that a local bookmark still names, other than a
+/// bookmark of a name in `reaped`.
+///
+/// jj moves a local bookmark off an abandoned commit onto its parents, so a
+/// bookmark kept on a release merge (a `keep/…` retention name) would come out
+/// conflicted, one side per member. jj's default rule does not pin a local
+/// bookmark, so [`assert_mutable`] lets it through.
+fn assert_unbookmarked(
+    repo: &dyn jj_lib::repo::Repo,
+    targets: &[jj_lib::commit::Commit],
+    reaped: &[(String, Vec<CommitId>)],
+) -> Result<(), JjError> {
+    for target in targets {
+        if let Some((bookmark, _)) = repo
+            .view()
+            .local_bookmarks_for_commit(target.id())
+            .find(|(bookmark, _)| !reaped.iter().any(|(name, _)| name == bookmark.as_str()))
+        {
+            return Err(JjError::Bookmarked {
+                commit: short_id(&target.id().to_string()).to_owned(),
+                bookmark: bookmark.as_str().to_owned(),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Forget a bookmark and its remote-tracking refs in the transaction's view:

@@ -764,17 +764,7 @@ fn refuse_stacked_first_cut(
 /// handle predates the cut and reads stale tips, under which the superseded cut
 /// is still the newest dated name and nothing is reaped at all.
 fn reap_after_cut(fork: &Fork<'_>) -> anyhow::Result<Exit> {
-    let path = &fork.checkout.path;
-    let reopened = knives::jj::Repo::open(path)?;
-    let report = release::reap_superseded(
-        path,
-        &reopened,
-        &fork.entry.dated_scheme(),
-        fork.entry.publish_remote(),
-    )?;
-    print_reap(fork.name.as_str(), &report);
-    abandon_reaped_writes(fork, &report)?;
-    Ok(reap_exit(&report))
+    reap(fork)
 }
 
 /// Abandon the earlier writes of each name the reap just forgot — commits the
@@ -784,6 +774,7 @@ fn reap_after_cut(fork: &Fork<'_>) -> anyhow::Result<Exit> {
 fn abandon_reaped_writes(
     fork: &Fork<'_>,
     report: &knives::commands::release::ReapReport,
+    ledger: &[knives::ledger::Entry],
 ) -> anyhow::Result<()> {
     let names: Vec<&str> = report
         .reaped
@@ -792,7 +783,10 @@ fn abandon_reaped_writes(
         .map(String::as_str)
         .collect();
     for name in names {
-        let earlier = super::release_edit::earlier_writes(fork, name)?;
+        let earlier: Vec<knives::ids::CommitId> =
+            knives::release_model::recorded_writes(ledger, name)
+                .map(|write| write.commit)
+                .collect();
         let abandoned = knives::jj::abandon_unheld_writes(
             &fork.checkout.path,
             &earlier,
@@ -805,25 +799,33 @@ fn abandon_reaped_writes(
 
 /// Reap superseded dated cuts on demand.
 pub(crate) fn run_reap(fork: &Fork<'_>) -> anyhow::Result<Exit> {
+    reap(fork)
+}
+
+/// The reap both callers run, on the repository as it is now. The ledger's
+/// earlier writes of each name count for the keep rule and are cleaned up
+/// after it.
+fn reap(fork: &Fork<'_>) -> anyhow::Result<Exit> {
     let path = &fork.checkout.path;
     let opened = knives::jj::Repo::open(path)?;
+    let ledger = Ledger::for_fork(fork).read()?.entries;
     let report = release::reap_superseded(
-        path,
         &opened,
         &fork.entry.dated_scheme(),
         fork.entry.publish_remote(),
+        &ledger,
     )?;
     print_reap(fork.name.as_str(), &report);
-    abandon_reaped_writes(fork, &report)?;
+    abandon_reaped_writes(fork, &report, &ledger)?;
     Ok(reap_exit(&report))
 }
 
-/// Return a finding when reaping leaves work behind — a cut with descendants
-/// is someone's stacked work — or could not finish. A commit kept because a
-/// tag or someone else's bookmark still pins it is neither: every ref knives
-/// owns is gone and the commit stays on purpose, so there is nothing to act on,
-/// and a cut whose reap met one must not exit non-zero for as long as the tag
-/// exists.
+/// Return a finding when reaping leaves a cut behind because something rests
+/// on it — someone's stacked work, or a workspace's working copy — or could not
+/// finish. A commit kept because a tag or another bookmark still pins it is
+/// neither: every ref knives owns is gone and the commit stays on purpose, so
+/// there is nothing to act on, and a cut whose reap met one must not exit
+/// non-zero for as long as the pin exists.
 const fn reap_exit(report: &knives::commands::release::ReapReport) -> Exit {
     if report.kept.is_empty() && report.notes.is_empty() {
         Exit::Ok
