@@ -179,6 +179,19 @@ impl Repo {
         &self.path
     }
 
+    /// Whether `commit` is visible: an ancestor of one of the view's heads. A
+    /// hidden (abandoned) commit still resolves by id, so resolving says
+    /// nothing about this.
+    pub fn is_visible(&self, commit: &CommitId) -> Result<bool, JjError> {
+        let id = self.commit(commit.as_str())?.id().clone();
+        for head in self.repo.view().heads() {
+            if self.backend_is_ancestor(&id, head)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Open the repository at its head operation for a transaction that will
     /// be committed: the commits it writes are signed as the user's jj would
     /// sign them ([`Signing::AsUser`]).

@@ -536,7 +536,8 @@ pub struct ReapReport {
     pub forgotten_only: Vec<(String, String)>,
     /// (name, reason) pairs that were deliberately left alone.
     pub kept: Vec<(String, String)>,
-    /// Non-fatal notes: an abandon that failed for a reason other than a pin.
+    /// Non-fatal notes: an abandon that failed for a reason other than a pin,
+    /// and a cleanup of a reaped name's earlier writes that failed.
     pub notes: Vec<String>,
 }
 
@@ -624,15 +625,10 @@ pub fn reap_superseded(
         }
         // An edit that replaced a commit of this name kept it for what rests
         // on it; once no ref names it, this name is all that will retire it.
-        for earlier in crate::release_model::recorded_writes(ledger, &name)
-            .map(|write| write.commit)
+        for earlier in earlier_writes(repo, ledger, &name)?
+            .into_iter()
             .filter(|commit| !targets.contains(commit))
         {
-            // A write this repository does not hold (another machine's) has
-            // nothing resting on it here; any other failure is reported.
-            if repo.resolve_commit(earlier.as_str()).is_err() {
-                continue;
-            }
             if let Some(reason) = repo.what_rests_on(&earlier)? {
                 report.kept.push((
                     name.clone(),
@@ -666,6 +662,33 @@ pub fn reap_superseded(
         }
     }
     Ok(report)
+}
+
+/// The commits the ledger records knives writing under `name` that this
+/// repository holds, with every visible rewrite of each.
+///
+/// A `jj rebase` or `jj describe` that moved a kept write (and the working copy
+/// on it) left the recorded id hidden and the commit that matters under a new
+/// one. A write this repository does not hold (another machine's) is left out;
+/// any other failure is an error.
+pub fn earlier_writes(
+    repo: &Repo,
+    ledger: &[Entry],
+    name: &str,
+) -> Result<Vec<CommitId>, crate::jj::JjError> {
+    let mut writes = Vec::new();
+    for recorded in crate::release_model::recorded_writes(ledger, name).map(|write| write.commit) {
+        if repo.resolve_commit(recorded.as_str()).is_err() {
+            continue;
+        }
+        for commit in std::iter::once(recorded.clone()).chain(repo.rewrites_of(recorded.as_str())?)
+        {
+            if !writes.contains(&commit) {
+                writes.push(commit);
+            }
+        }
+    }
+    Ok(writes)
 }
 
 /// The newest dated cut's branch name — unqualified, unlike
@@ -1843,16 +1866,32 @@ pub struct AuditContext<'a> {
     pub trunk: &'a CommitId,
 }
 
-/// Workspaces with no branch left among `branches`.
+/// Workspaces knives made for a branch that is gone and that nobody holds.
 ///
-/// They are cheap to create, which is why they accumulate; nothing else reaps
-/// them. What counts as "left" is the caller's list, so a cut can decide
-/// whether a branch it did not carry still has a bookmark holding it.
-pub fn workspaces_to_clean(workspaces: &[String], branches: &[String]) -> Vec<String> {
-    let kept: Vec<String> = branches.iter().map(|b| b.replace('/', "-")).collect();
+/// A workspace is named when its name is the workspace of a branch `recorded`
+/// (the branches the fork's ledger names: knives started or noted them), and
+/// no branch in `live` maps to it: every bookmark name, local or on any remote,
+/// and every branch a live claim holds. A workspace knives never made, a held
+/// one (a `knives start` of a release whose name a reap forgot), and the
+/// default workspace are never named: telling someone to forget another
+/// agent's workspace can destroy its work.
+pub fn workspaces_to_clean(
+    workspaces: &[String],
+    recorded: &[String],
+    live: &[String],
+) -> Vec<String> {
+    let flat = |branches: &[String]| -> BTreeSet<String> {
+        branches
+            .iter()
+            .map(|branch| crate::commands::wip::workspace_for(branch))
+            .collect()
+    };
+    let (recorded, live) = (flat(recorded), flat(live));
     workspaces
         .iter()
-        .filter(|name| name.as_str() != "default" && !kept.contains(name))
+        .filter(|name| {
+            name.as_str() != "default" && recorded.contains(*name) && !live.contains(*name)
+        })
         .cloned()
         .collect()
 }
@@ -2211,24 +2250,35 @@ mod cut_tests {
     }
 
     #[test]
-    fn workspaces_for_dropped_branches_are_identified() {
+    fn a_recorded_branchs_workspace_with_nothing_left_is_identified() {
         let workspaces = vec![
             "default".to_owned(),
             "feat-alpha".to_owned(),
             "feat-beta".to_owned(),
         ];
-        let carried = vec!["feat/beta".to_owned()];
+        let recorded = vec!["feat/alpha".to_owned(), "feat/beta".to_owned()];
+        let live = vec!["feat/beta".to_owned()];
         assert_eq!(
-            workspaces_to_clean(&workspaces, &carried),
+            workspaces_to_clean(&workspaces, &recorded, &live),
             vec!["feat-alpha".to_owned()]
         );
     }
 
     #[test]
-    fn the_default_workspace_is_never_reaped() {
-        // Reaping it would delete the checkout the operator is standing in.
-        let workspaces = vec!["default".to_owned()];
-        assert_eq!(workspaces_to_clean(&workspaces, &[]), Vec::<String>::new());
+    fn a_workspace_knives_never_recorded_or_something_holds_is_never_named() {
+        // Naming the default workspace would delete the checkout the operator
+        // stands in; naming a held or foreign one, another agent's work.
+        let workspaces = vec![
+            "default".to_owned(),
+            "scratch".to_owned(),
+            "release-2026-08-04".to_owned(),
+        ];
+        let recorded = vec!["default".to_owned(), "release/2026-08-04".to_owned()];
+        let live = vec!["release/2026-08-04".to_owned()];
+        assert_eq!(
+            workspaces_to_clean(&workspaces, &recorded, &live),
+            Vec::<String>::new()
+        );
     }
 
     fn cut_event(subject: &str, created: &str, members: &[&str]) -> Entry {

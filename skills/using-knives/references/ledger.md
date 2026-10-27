@@ -210,7 +210,7 @@ destination: {git_dir, remote, forks, commits, pulled, pushes, discarded, skippe
 
 - Pull first: `status`, `sync`, `audit`, `pushed`, `depends`, `track --forget`, and release commands that read the ledger. Those are the plan, `cut`, `rebase`, `include`, `drop`, `advance`, and `members` without `REF` (it reads the ledger to name the release in hand).
 - Read no ledger and pull nothing: `members <REF>`, `--carries`, `--census`.
-- `reap` pulls nothing and reads the local ledger: the commits it records knives writing under each superseded name count for the keep rule and are cleaned up after it.
+- `reap` pulls nothing and reads the local ledger: the commits it records knives writing under each superseded name, and their rewrites, count for the keep rule and are cleaned up after it. A `cut` reads the ledger, too, to name the workspaces left from branches it records.
 - No pull: `notch`, `start`, `finish`, `track --pr`, `track --fork-only`. They build nothing from what they read. They read a statement only to stamp their entry with a PR number, and to stamp theirs after the live one.
 - A failed pull, a `ledger` that no local git directory reaches, and a refused setup are each a problem that names the cause. Reports still answer from local entries, and exit `3`.
 - Release writes refuse on these problems, because the drop guard checks the newest recorded cut, and a stale ledger gives the wrong one.

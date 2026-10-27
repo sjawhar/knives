@@ -231,6 +231,50 @@ fn release_reap_returns_findings_when_a_superseded_cut_is_kept() {
 }
 
 #[test]
+fn release_reap_json_prints_one_json_document() {
+    // Given: one superseded cut a stacked commit keeps, one that goes.
+    let lab = lab::Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    lab.octopus("release/2026-08-03", "feat/alpha", "feat/beta");
+    lab.octopus("release/2026-08-04", "feat/alpha", "feat/beta");
+    lab.jj_work(["new", "release/2026-08-04", "-m", "stacked work"]);
+    lab.jj_work(["new", "main@origin"]);
+    lab.octopus("release/2026-08-05", "feat/alpha", "feat/beta");
+    lab.jj_work(["new", "main@origin"]);
+    let (home, _consumer) = release_test_home(&lab);
+
+    // When: reaped with `--json`.
+    let output = lab::release_command(&lab, &home, lab::ReleaseOutput::Json, &["reap"])
+        .output()
+        .expect("run knives release reap --json");
+
+    // Then: stdout is one JSON document naming both outcomes, and the exit is
+    // the kept cut's finding.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let report: serde_json::Value =
+        serde_json::from_str(&stdout).unwrap_or_else(|error| panic!("{error}: {stdout}"));
+    assert_eq!(report["repo"], "demo", "{report}");
+    assert_eq!(
+        report["reaped"],
+        serde_json::json!(["release/2026-08-03"]),
+        "{report}"
+    );
+    assert_eq!(report["kept"].as_array().map(Vec::len), Some(1), "{report}");
+    assert_eq!(report["kept"][0]["name"], "release/2026-08-04", "{report}");
+    for empty in ["forgotten_only", "notes", "abandoned_earlier"] {
+        assert_eq!(report[empty], serde_json::json!([]), "{empty}: {report}");
+    }
+    assert!(
+        report["kept"][0]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.starts_with("it has descendants")),
+        "{report}"
+    );
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+}
+
+#[test]
 fn release_reap_keeps_a_commit_an_untracked_remote_pin_holds_and_exits_clean() {
     // Given: an untracked remote pin still holds a superseded dated cut immutable.
     let lab = Lab::new();
@@ -698,6 +742,82 @@ fn a_cut_keeps_a_superseded_name_whose_earlier_write_a_working_copy_rests_on() {
         !is_visible(&lab, &first_write),
         "the earlier write stayed visible"
     );
+}
+
+#[test]
+fn a_cut_keeps_a_superseded_name_whose_rewritten_earlier_write_a_working_copy_rests_on() {
+    // Given: an earlier write of the name kept for another workspace's working
+    // copy, then rewritten (described), so the ledger's id is hidden and the
+    // working copy rests on the rewrite.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let (home, _consumer) = release_test_home(&lab);
+    let first = knives_release(&lab, &home, &["cut", "release/2026-08-04"]);
+    assert!(first.status.success(), "{first:?}");
+    let first_write = commit_at(&lab, "release/2026-08-04");
+    let other_workspace = lab.temp_path().join("other-ws");
+    lab.jj_work([
+        "workspace",
+        "add",
+        "--name",
+        "other",
+        "--revision",
+        "release/2026-08-04",
+        other_workspace.to_str().expect("utf-8 path"),
+    ]);
+    lab.branch("feat/gamma", "gamma.txt", "gamma\n");
+    let included = knives_release(&lab, &home, &["include", "feat/gamma"]);
+    assert!(included.status.success(), "{included:?}");
+    lab.jj_work([
+        "describe",
+        "-r",
+        first_write.as_str(),
+        "-m",
+        "release: rewritten by hand",
+    ]);
+    let rewrite = knives::ids::CommitId::new(lab.revision(&lab.work, "other@-", "commit_id"));
+    assert_ne!(rewrite, first_write, "the describe did not rewrite it");
+    let parked = lab.revision(&lab.work, "other@", "commit_id");
+
+    // When: the next cut reaps the superseded name.
+    let output = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
+
+    // Then: the name is kept for the rewrite, and the working copy is untouched.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(&format!(
+            "demo: kept release/2026-08-04: {}, an earlier release/2026-08-04 commit: ",
+            rewrite.short()
+        )),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert!(is_visible(&lab, &rewrite), "the rewrite was abandoned");
+    assert_eq!(lab.revision(&lab.work, "other@", "commit_id"), parked);
+
+    // And: once the workspace is forgotten, the reap retires the name and
+    // abandons the rewrite, and its JSON names it.
+    lab.jj_work(["workspace", "forget", "other"]);
+    let reap = lab::release_command(&lab, &home, lab::ReleaseOutput::Json, &["reap"])
+        .output()
+        .expect("run knives release reap --json");
+    let reap_stdout = String::from_utf8_lossy(&reap.stdout);
+    let report: serde_json::Value =
+        serde_json::from_str(&reap_stdout).unwrap_or_else(|error| panic!("{error}: {reap_stdout}"));
+    assert_eq!(
+        report["reaped"],
+        serde_json::json!(["release/2026-08-04"]),
+        "{report}"
+    );
+    assert_eq!(
+        report["abandoned_earlier"],
+        serde_json::json!([{"name": "release/2026-08-04", "commit": rewrite.as_str()}]),
+        "{report}"
+    );
+    assert!(reap.status.success(), "{reap_stdout}");
+    assert!(!is_visible(&lab, &rewrite), "the rewrite stayed visible");
 }
 
 /// Whether `commit` is visible in the work checkout. Naming a hidden commit in
