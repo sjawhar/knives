@@ -17,7 +17,7 @@ If this skill disagrees with the code, a command's output or its `--help`, follo
   - CONSUMER: a knob the library already exposes, or a change only we want. No fork branch, no upstream PR.
   - UPSTREAM: a defect any library user would hit, fixed with evidence (a reproduction or a red→green test). An unproven fix needs that evidence first. It gets no exemption from going upstream.
 - Every fork member gets an upstream PR. The only question is when it opens.
-- Write the placement answer in the `placement:` notch and the PR body. It is a judgment, not a permission: ask nobody, wait for no approval.
+- Write the placement answer in the `placement:` notch, not the PR body: it is our reasoning about our fork, and an upstream maintainer reads every sentence of the body as a claim about the change. It is a judgment, not a permission: ask nobody, wait for no approval.
 - Never open an upstream PR without this gate and that written answer.
 - Complete `fork-work`'s challenge before implementation. Check 7 verifies the notch before publication.
 
@@ -55,7 +55,7 @@ Do the checks in order. Each needs evidence.
 | 2 | PR cap and claim | Our open PR count is strictly below the cap. Your workspace holds the claim. | Cap reached: no new PR. Fold the fix into an open PR only if it belongs there. That call is the owning session's own judgment and work. Otherwise open it when the cap frees. The member rides the release meanwhile, never as a standing fork member. Unclaimed or claimed elsewhere: claim it before you commit or open the PR. |
 | 3 | Policy files | You read every convention file in full (`AGENTS.md`, `CONTRIBUTING.md`, `.github/PULL_REQUEST_TEMPLATE.md` or equivalent) | Read them. Do not assume default standards. |
 | 4 | Issue reference | If policy requires an issue, the draft body links it ("Fixes #123") | Find the upstream issue. If none exists and policy requires one, search open issues, else open one first. Include the required issue link in the PR body. |
-| 5 | AI disclosure | If policy requires it, the PR body or commit discloses AI assistance | Add the notice (for example "Authored with AI assistance"). |
+| 5 | AI disclosure | If policy requires it, the PR body or commit discloses AI assistance in the project's own wording | Add the notice the policy asks for, claiming no human review that did not happen. |
 | 6 | Package routing | Changed paths are where repo rules allow this change type (for example, features in plugin packages, not core) | Move the change to the permitted location. |
 | 7 | `placement:` notch | `knives notch <branch>` (repository subject for standing rules) shows it. The challenger is not the proposer. Its evidence covers the published diff. A runtime-behavior change also carries the ownership answer and its ruling in the notch and commit body (`fork-work`). | Missing: no PR. Return to `fork-work`'s challenge. Stale: re-run the challenge. |
 
@@ -73,7 +73,7 @@ knives notch <branch> -m "promised the maintainer we would split the config chan
 
 ## Step 4: Execution
 
-When all seven checks pass and the PR body restates Check 7's placement answer, open the PR:
+When all seven checks pass, open the PR:
 
 ```bash
 gh pr create --title "..." --body "..."
