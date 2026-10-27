@@ -728,11 +728,9 @@ fn a_cut_refuses_when_release_like_described_work_lives_only_in_the_release_line
     ]);
     std::fs::write(lab.work_path().join("hotfix.txt"), "fix\n").expect("write hotfix");
     lab.jj_work(["new"]); // park @ off the hotfix so it snapshots as its own commit
-    let stacked = lab.revision(
-        lab.work_path(),
-        "description(glob:\"hotfix*\")",
-        "commit_id",
-    );
+    // The working copy now sits on the hotfix, so the hotfix is `@-`.
+    let stacked = lab.revision(lab.work_path(), "@-", "commit_id");
+    assert_eq!(stacked.len(), 40, "{stacked:?}");
     let (home, _consumer) = release_test_home(&lab);
 
     // When: a newer cut is attempted without acknowledgement.
@@ -780,6 +778,17 @@ fn a_cut_refuses_when_release_like_described_work_lives_only_in_the_release_line
         tips.keys()
             .any(|reference| reference.branch().as_str() == "release/2026-08-05"),
         "the acknowledged cut must create the requested release"
+    );
+    // And: the drop is reported after the reap. The hotfix rests on the old
+    // cut, so the reap keeps that cut and nothing is dropped.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("dropping"), "{stdout}");
+    assert!(
+        stdout.contains(&format!(
+            "demo: --allow-drop: nothing dropped: the 1 commit(s) the cut does not carry are still visible: {}\n",
+            &stacked[..12]
+        )),
+        "{stdout}"
     );
 }
 

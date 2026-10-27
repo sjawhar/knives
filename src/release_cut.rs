@@ -73,8 +73,9 @@ pub(crate) fn run_release(
     if let Some(name) = cut_name {
         let trunk_name = entry.trunk_ref();
         let trunk = opened.resolve_commit(&trunk_name)?;
-        if let Some(orphaned) = check_orphan_commits_before_cut(&opened, fork)?
-            && let Some(exit) = report_orphaned_cut(repo, &orphaned, allow_drop)
+        let orphaned = check_orphan_commits_before_cut(&opened, fork)?;
+        if let Some(orphaned) = &orphaned
+            && let Some(exit) = report_orphaned_cut(repo, orphaned, allow_drop)
         {
             return Ok(exit);
         }
@@ -233,12 +234,12 @@ pub(crate) fn run_release(
                     let completed = CompletedCut {
                         name: &name,
                         request: &request,
-                        carried: &carried,
                         created: published,
                         audit: &audit,
                         scheme: &scheme,
                         recorded: recorded.as_ref(),
                         check: &check,
+                        stated_drop: None,
                     };
                     record_cut_event(fork, &completed, bound)?;
                     match &previous_recorded {
@@ -293,15 +294,15 @@ pub(crate) fn run_release(
         let completed = CompletedCut {
             name: &name,
             request: &request,
-            carried: &carried,
             created: &created,
             audit: &audit,
             scheme: &scheme,
             recorded: recorded.as_ref(),
             check: &check,
+            stated_drop: orphaned.as_ref(),
         };
         record_cut_event(fork, &completed, bound)?;
-        worst = worst.worst(report_completed_cut(fork, &opened, &completed)?);
+        worst = worst.worst(report_completed_cut(fork, &opened, &completed, bound)?);
     }
     Ok(worst)
 }
@@ -524,12 +525,13 @@ fn report_uncarried_cut(
 struct CompletedCut<'a> {
     name: &'a str,
     request: &'a release::Cut,
-    carried: &'a [(String, knives::ids::CommitId)],
     created: &'a knives::ids::CommitId,
     audit: &'a release::CutAudit,
     scheme: &'a ReleaseScheme,
     recorded: Option<&'a RecordedCut>,
     check: &'a release::CompositionCheck,
+    /// What `--allow-drop` let the cut go ahead without, said after the reap.
+    stated_drop: Option<&'a OrphanedLineage>,
 }
 
 /// Record which branches and commits became a published release cut.
@@ -612,6 +614,7 @@ fn report_completed_cut(
     fork: &Fork<'_>,
     opened: &knives::jj::Repo,
     cut: &CompletedCut<'_>,
+    bound: Bound<'_>,
 ) -> anyhow::Result<Exit> {
     let entry = fork.entry;
     let mut post_cut_exit =
@@ -643,30 +646,79 @@ fn report_completed_cut(
         .into_iter()
         .map(|(workspace, _)| workspace.to_string())
         .collect();
-    // A branch that still exists locally is not dropped, merely not carried;
-    // only a workspace whose branch is gone entirely is left-behind cruft.
-    let mut carried_names: Vec<String> = cut
-        .carried
-        .iter()
-        .map(|(branch, _)| branch.clone())
+    // Only a workspace knives made for a branch that is gone everywhere and
+    // that no live claim holds is left-behind cruft: any other is someone's.
+    let recorded: Vec<String> = Ledger::for_fork(fork)
+        .read()?
+        .entries
+        .into_iter()
+        .filter_map(|entry| entry.subject)
         .collect();
-    carried_names.extend(
-        carried_branches(opened, entry.trunk(), &entry.release_scheme())?
-            .into_iter()
-            .map(|(branch, _)| branch),
+    let mut live: Vec<String> = opened
+        .bookmark_tips()?
+        .into_keys()
+        .map(|reference| reference.branch().to_string())
+        .collect();
+    live.extend(
+        knives::store::Store::open(
+            knives::store::default_state_path(),
+            &bound.registry.former_names(),
+            &[],
+        )?
+        .claims(Some(&fork.upstream))
+        .into_iter()
+        .map(|claim| claim.branch.clone()),
     );
-    let orphans = release::workspaces_to_clean(&present, &carried_names);
+    let orphans = release::workspaces_to_clean(&present, &recorded, &live);
     if orphans.is_empty() {
-        println!("  every workspace still has a branch");
+        println!("  no workspace belongs to a branch that no longer exists");
     } else {
         println!(
             "  {} workspace(s) belong to branches that no longer exist: {}",
             orphans.len(),
             orphans.join(", ")
         );
-        println!("  remove with `jj workspace forget <name>` once you have checked them");
+        println!(
+            "  no bookmark or live claim holds them; remove with `jj workspace forget <name>` \
+             once you have checked them"
+        );
     }
-    Ok(post_cut_exit.worst(reap_after_cut(fork)?))
+    let exit = post_cut_exit.worst(reap_after_cut(fork)?);
+    if let Some(orphaned) = cut.stated_drop {
+        report_stated_drop(fork, orphaned)?;
+    }
+    Ok(exit)
+}
+
+/// Say what an `--allow-drop` cut dropped, judged after the reap: a commit the
+/// cut does not carry is dropped only when it is no longer visible. The keep
+/// rule usually keeps the superseded cut they rest on, and with it them.
+fn report_stated_drop(fork: &Fork<'_>, orphaned: &OrphanedLineage) -> anyhow::Result<()> {
+    let repo = knives::jj::Repo::open(&fork.checkout.path)?;
+    let mut dropped = Vec::new();
+    let mut still = Vec::new();
+    for commit in &orphaned.commits {
+        if repo.is_visible(commit)? {
+            still.push(commit.short());
+        } else {
+            dropped.push(commit.short());
+        }
+    }
+    let name = &fork.name;
+    if dropped.is_empty() {
+        println!(
+            "{name}: --allow-drop: nothing dropped: the {} commit(s) the cut does not carry are still visible: {}",
+            still.len(),
+            still.join(", ")
+        );
+    } else {
+        println!(
+            "{name}: --allow-drop: dropped {} commit(s) the cut does not carry: {}",
+            dropped.len(),
+            dropped.join(", ")
+        );
+    }
+    Ok(())
 }
 
 struct OrphanedLineage {
@@ -681,8 +733,10 @@ fn report_orphaned_cut(
 ) -> Option<Exit> {
     if allow_drop {
         println!(
-            "{repo}: --allow-drop: dropping {} commit(s) from the old lineage",
-            orphaned.commits.len()
+            "{repo}: --allow-drop: cutting without {} commit(s) reachable only from {} or its \
+             descendants; what is dropped is said after the reap",
+            orphaned.commits.len(),
+            orphaned.previous
         );
         return None;
     }
@@ -764,48 +818,69 @@ fn refuse_stacked_first_cut(
 /// handle predates the cut and reads stale tips, under which the superseded cut
 /// is still the newest dated name and nothing is reaped at all.
 fn reap_after_cut(fork: &Fork<'_>) -> anyhow::Result<Exit> {
-    reap(fork)
+    let reaped = reap(fork)?;
+    print_reap(&fork.name, &reaped);
+    Ok(reap_exit(&reaped.report))
 }
 
 /// Abandon the earlier writes of each name the reap just forgot — commits the
-/// ledger records knives writing under it — that are visible heads nothing
-/// rests on: a replaced commit once kept for a working copy that has since
-/// moved on would otherwise stay an anonymous head for good.
+/// ledger records knives writing under it, and their visible rewrites — that
+/// are visible heads nothing rests on: a replaced commit once kept for a
+/// working copy that has since moved on would otherwise stay an anonymous head
+/// for good. Returns each abandoned commit with its name.
 fn abandon_reaped_writes(
     fork: &Fork<'_>,
     report: &knives::commands::release::ReapReport,
     ledger: &[knives::ledger::Entry],
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<(String, knives::ids::CommitId)>> {
     let names: Vec<&str> = report
         .reaped
         .iter()
         .chain(report.forgotten_only.iter().map(|(name, _)| name))
         .map(String::as_str)
         .collect();
+    let mut abandoned_earlier = Vec::new();
+    if names.is_empty() {
+        return Ok(abandoned_earlier);
+    }
+    let reopened = knives::jj::Repo::open(&fork.checkout.path)?;
     for name in names {
-        let earlier: Vec<knives::ids::CommitId> =
-            knives::release_model::recorded_writes(ledger, name)
-                .map(|write| write.commit)
-                .collect();
+        let earlier = release::earlier_writes(&reopened, ledger, name)?;
         let abandoned = knives::jj::abandon_unheld_writes(
             &fork.checkout.path,
             &earlier,
             &format!("knives: {name}: abandon earlier writes nothing rests on"),
         )?;
-        super::release_edit::report_abandoned_earlier(&fork.name, name, &abandoned);
+        abandoned_earlier.extend(
+            abandoned
+                .into_iter()
+                .map(|commit| (name.to_owned(), commit)),
+        );
     }
-    Ok(())
+    Ok(abandoned_earlier)
 }
 
-/// Reap superseded dated cuts on demand.
-pub(crate) fn run_reap(fork: &Fork<'_>) -> anyhow::Result<Exit> {
-    reap(fork)
+/// Reap superseded dated cuts on demand, in the chosen output.
+pub(crate) fn run_reap(fork: &Fork<'_>, output: knives::cli::Output) -> anyhow::Result<Exit> {
+    let reaped = reap(fork)?;
+    if let Some(payload) = knives::cli::machine_payload(output, &ReapPayload::of(fork, &reaped))? {
+        println!("{payload}");
+    } else {
+        print_reap(&fork.name, &reaped);
+    }
+    Ok(reap_exit(&reaped.report))
+}
+
+/// What one reap did: the report, and the earlier writes it abandoned after.
+struct Reaped {
+    report: knives::commands::release::ReapReport,
+    abandoned_earlier: Vec<(String, knives::ids::CommitId)>,
 }
 
 /// The reap both callers run, on the repository as it is now. The ledger's
 /// earlier writes of each name count for the keep rule and are cleaned up
 /// after it.
-fn reap(fork: &Fork<'_>) -> anyhow::Result<Exit> {
+fn reap(fork: &Fork<'_>) -> anyhow::Result<Reaped> {
     let path = &fork.checkout.path;
     let opened = knives::jj::Repo::open(path)?;
     let ledger = Ledger::for_fork(fork).read()?.entries;
@@ -815,9 +890,67 @@ fn reap(fork: &Fork<'_>) -> anyhow::Result<Exit> {
         fork.entry.publish_remote(),
         &ledger,
     )?;
-    print_reap(fork.name.as_str(), &report);
-    abandon_reaped_writes(fork, &report, &ledger)?;
-    Ok(reap_exit(&report))
+    let abandoned_earlier = abandon_reaped_writes(fork, &report, &ledger)?;
+    Ok(Reaped {
+        report,
+        abandoned_earlier,
+    })
+}
+
+/// A reap in its machine encoding: the same facts as the prose, by field.
+#[derive(serde::Serialize)]
+struct ReapPayload {
+    repo: String,
+    /// Names whose refs were forgotten and commits abandoned.
+    reaped: Vec<String>,
+    /// Names whose refs were forgotten while a pin kept the commit.
+    forgotten_only: Vec<NamedReason>,
+    /// Names left untouched, with why.
+    kept: Vec<NamedReason>,
+    notes: Vec<String>,
+    /// Earlier writes of a reaped name abandoned because nothing rests on them.
+    abandoned_earlier: Vec<AbandonedWrite>,
+}
+
+#[derive(serde::Serialize)]
+struct NamedReason {
+    name: String,
+    reason: String,
+}
+
+#[derive(serde::Serialize)]
+struct AbandonedWrite {
+    name: String,
+    commit: String,
+}
+
+impl ReapPayload {
+    fn of(fork: &Fork<'_>, reaped: &Reaped) -> Self {
+        let named = |pairs: &[(String, String)]| -> Vec<NamedReason> {
+            pairs
+                .iter()
+                .map(|(name, reason)| NamedReason {
+                    name: name.clone(),
+                    reason: reason.clone(),
+                })
+                .collect()
+        };
+        Self {
+            repo: fork.name.to_string(),
+            reaped: reaped.report.reaped.clone(),
+            forgotten_only: named(&reaped.report.forgotten_only),
+            kept: named(&reaped.report.kept),
+            notes: reaped.report.notes.clone(),
+            abandoned_earlier: reaped
+                .abandoned_earlier
+                .iter()
+                .map(|(name, commit)| AbandonedWrite {
+                    name: name.clone(),
+                    commit: commit.as_str().to_owned(),
+                })
+                .collect(),
+        }
+    }
 }
 
 /// Return a finding when reaping leaves a cut behind because something rests
@@ -834,7 +967,8 @@ const fn reap_exit(report: &knives::commands::release::ReapReport) -> Exit {
     }
 }
 
-fn print_reap(repo: &str, report: &knives::commands::release::ReapReport) {
+fn print_reap(repo: &RepoName, reaped: &Reaped) {
+    let report = &reaped.report;
     if report.reaped.is_empty() && report.forgotten_only.is_empty() && report.kept.is_empty() {
         println!("{repo}: nothing to reap");
     }
@@ -851,6 +985,9 @@ fn print_reap(repo: &str, report: &knives::commands::release::ReapReport) {
     }
     for note in &report.notes {
         println!("{repo}: ! {note}");
+    }
+    for (name, commit) in &reaped.abandoned_earlier {
+        super::release_edit::report_abandoned_earlier(repo, name, std::slice::from_ref(commit));
     }
 }
 

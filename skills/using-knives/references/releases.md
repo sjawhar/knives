@@ -64,11 +64,12 @@ jj rebase -s '<release-or-keep-ref>..<branch>' -d <trunk>@upstream
 - A normal cut carries the composition in hand: previous parents **verbatim by commit id**, even if a member bookmark is now divergent. It adds no branches and advances no members. Only the first cut, with no composition, starts from every branch.
 - The cut audits the candidate first. The net diff of each member, from the members' fork point with upstream trunk, must be in the cut tree. Divergence that the prior release carried (a recorded resolution) is reported as carried forward.
 - A failed audit writes no cut. A pass makes and names the release in one operation, except for the fixed recording path below.
+- A cut lists a workspace to remove only when the ledger names its branch, no bookmark of that branch is left locally or on any remote, and no live claim holds it. It never lists the default workspace, a workspace knives did not make, or a `knives start` workspace whose release a reap forgot.
 
 ### Gates
 
 1. A dated name must sort after the newest release. A reused name, an older date or an older suffix is refused before the build, exit `3`, because reap keeps only the newest name.
-2. The orphan gate refuses to strand commits that only the previous lineage reaches. `--allow-drop` states the intended exception.
+2. The orphan gate refuses to strand commits that only the previous lineage reaches. `--allow-drop` states the intended exception. After the reap, the cut says what it dropped: a commit it does not carry counts as dropped only when it is no longer visible. Such commits rest on the previous cut, so the reap usually keeps that cut and drops nothing.
 3. Before the content audit, knives compares the candidate with the previous published cut. The **same tree and parents** is refused as identical, exit `3`, except as below. New members come through `include`, new tips through `advance`, and a new base through `rebase`, not through a new name.
 4. The composition gate reads the ledger event of the previous cut, which survives a moved bookmark. Each recorded member must be a parent or an ancestor of a member or the base. Otherwise it needs a reachable rewrite of its change id, or its net diff in the candidate tree. A member that came through upstream base passes.
 5. A missing member refuses the cut, however it was lost: a merge rebuilt by hand, a moved bookmark, or a `drop` since the last cut. A recorded commit that does not resolve counts as dropped.
@@ -104,11 +105,11 @@ Cut and edit events keep full parent commits, every bookmark on them, and the co
 
 ## `knives release reap`
 
-Forgets superseded dated refs locally and on tracking remotes, then abandons their merges. It also runs after a dated cut. **No remote repository changes.** A fetch can bring tracking refs back.
+Forgets superseded dated refs locally and on tracking remotes, then abandons their merges. It also runs after a dated cut. **No remote repository changes.** A fetch can bring tracking refs back. Standalone `reap` prints one JSON or TOON document (`repo`, `reaped`, `forgotten_only`, `kept`, `notes`, `abandoned_earlier`) under `--json` or for an agent; the reap inside a cut prints prose with the cut.
 
 - While the live cut has unresolved conflicts, every superseded cut stays as the resolution record.
 - A cut pinned outside release refs (a tag, an untracked remote bookmark, a local bookmark of another name such as `keep/…`) has its refs forgotten and its commit kept, with the pin named. Exit `0`, which is normal for a tagged or retained release.
-- A superseded cut that something rests on stays untouched, its refs too, and the output names what rests on it. Exit `1`. That is a workspace working copy on it or above it, empty or not, or any other descendant, on the cut or on a commit an edit wrote under its name: the rule an edit uses to keep the commit it replaced. Abandoning the cut would rewrite each of them onto the cut's parents, which can leave a working copy's workspace stale and make it a conflicted merge. A cut made from the workspace that sits on the previous cut keeps that cut too. Move your own empty working copy (`jj new <live cut>`, which drops it), then run `knives release reap`. A working copy with changes stays a descendant until it is rebased off the cut. Another workspace's working copy is its owner's to move.
+- A superseded cut that something rests on stays untouched, its refs too, and the output names what rests on it. Exit `1`. That is a workspace working copy on it or above it, empty or not, or any other descendant, on the cut, on a commit an edit wrote under its name, or on a rewrite of either: the rule an edit uses to keep the commit it replaced. Abandoning the cut would rewrite each of them onto the cut's parents, which can leave a working copy's workspace stale and make it a conflicted merge. A cut made from the workspace that sits on the previous cut keeps that cut too. Move your own empty working copy (`jj new <live cut>`, which drops it), then run `knives release reap`. A working copy with changes stays a descendant until it is rebased off the cut. Another workspace's working copy is its owner's to move.
 
 ## `knives release members`
 

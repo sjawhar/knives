@@ -486,7 +486,7 @@ fn dispatch_release(
                 }
             }
         }
-        Some(ReleaseAction::Reap) => run_reap(fork),
+        Some(ReleaseAction::Reap) => run_reap(fork, output),
         Some(ReleaseAction::Include { branch, why }) => run_release_edit(
             fork,
             extra_consumers,

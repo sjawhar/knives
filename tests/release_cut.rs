@@ -1789,3 +1789,94 @@ fn a_fixed_scheme_cut_carries_the_local_release_in_hand() {
         "the cut lost a member it started with: {parents:?}\n{stdout}"
     );
 }
+
+/// The cut's line naming workspaces to forget, or `None` when it names none.
+fn workspaces_to_forget(stdout: &str) -> Option<String> {
+    stdout
+        .lines()
+        .find(|line| line.contains("belong to branches that no longer exist"))
+        .map(str::to_owned)
+}
+
+#[test]
+fn a_cut_never_names_a_workspace_a_live_claim_holds_or_knives_never_made() {
+    // Given: a cut, an agent holding it through `knives start` (a claim and a
+    // workspace named after the release), and a workspace knives never made.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let (home, _consumer) = release_test_home(&lab);
+    let first = knives_release(&lab, &home, &["cut", "release/2026-08-04"]);
+    assert!(first.status.success(), "{first:?}");
+    let started = lab::knives_start(&lab, &home, "release/2026-08-04");
+    assert!(started.status.success(), "{started:?}");
+    let scratch = lab.temp_path().join("scratch-ws");
+    lab.jj_work([
+        "workspace",
+        "add",
+        "--name",
+        "scratch",
+        "--revision",
+        "main@origin",
+        scratch.to_str().expect("utf-8 path"),
+    ]);
+
+    // When: the next cut forgets the held release's name in its reap.
+    let output = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
+
+    // Then: it tells nobody to forget either workspace.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("cut release/2026-08-05 as "), "{stdout}");
+    assert_eq!(workspaces_to_forget(&stdout), None, "{stdout}");
+}
+
+#[test]
+fn a_cut_names_the_workspace_of_a_recorded_branch_that_is_gone() {
+    // Given: a branch knives recorded in the ledger, its workspace, then the
+    // branch deleted, with no claim on it.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let (home, _consumer) = release_test_home(&lab);
+    let first = knives_release(&lab, &home, &["cut", "release/2026-08-04"]);
+    assert!(first.status.success(), "{first:?}");
+    lab.branch("feat/gamma", "gamma.txt", "gamma\n");
+    let gamma = commit_at(&lab, "feat/gamma");
+    let noted = lab::knives(
+        &lab,
+        &home,
+        &[
+            "notch",
+            "feat/gamma",
+            "-m",
+            "abandoned experiment",
+            "--evidence",
+            gamma.as_str(),
+            "--repo",
+            "demo",
+        ],
+    );
+    assert!(noted.status.success(), "{noted:?}");
+    let leftover = lab.temp_path().join("feat-gamma-ws");
+    lab.jj_work([
+        "workspace",
+        "add",
+        "--name",
+        "feat-gamma",
+        "--revision",
+        "feat/gamma",
+        leftover.to_str().expect("utf-8 path"),
+    ]);
+    lab.jj_work(["bookmark", "delete", "feat/gamma"]);
+
+    // When: the next cut runs.
+    let output = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
+
+    // Then: that workspace, and only it, is named.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        workspaces_to_forget(&stdout).as_deref(),
+        Some("  1 workspace(s) belong to branches that no longer exist: feat-gamma"),
+        "{stdout}"
+    );
+}
