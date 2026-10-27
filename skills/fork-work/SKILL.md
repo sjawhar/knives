@@ -62,7 +62,7 @@ Do this before you read code too: a conclusion from the wrong copy is wrong, and
 
 ## 4. Ship the fork member, and open the upstream PR alongside
 
-- An upstream PR is a placement judgment, not a permission. The UPSTREAM `placement:` notch and the PR body are the written judgment. Ask nobody. Wait for no approval.
+- An upstream PR is a placement judgment, not a permission. The UPSTREAM `placement:` notch is the written judgment; the PR body describes the change for the maintainer, not our placement reasoning. Ask nobody. Wait for no approval.
 - The default for every fix is a fork member. To use it takes as long as to make it, in the same line of work:
   1. Push one signed commit on the release's shared base to the fork remote. Run `knives notch`.
   2. Give the tip and red→green evidence to the release-claim holder, who includes it in the release in hand and publishes. Every consumer pin of that release frozen on a revision (such as `rev = "release/…"`): the holder first cuts the next dated name, immediately. Nobody holds the claim: do this yourself.
