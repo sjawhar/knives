@@ -629,11 +629,11 @@ pub fn reap_superseded(
             .filter(|commit| !targets.contains(commit))
         {
             // A write this repository does not hold (another machine's) has
-            // nothing resting on it here.
-            let Ok(rests) = repo.what_rests_on(&earlier) else {
+            // nothing resting on it here; any other failure is reported.
+            if repo.resolve_commit(earlier.as_str()).is_err() {
                 continue;
-            };
-            if let Some(reason) = rests {
+            }
+            if let Some(reason) = repo.what_rests_on(&earlier)? {
                 report.kept.push((
                     name.clone(),
                     format!("{}, an earlier {name} commit: {reason}", earlier.short()),
