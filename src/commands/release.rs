@@ -536,7 +536,8 @@ pub struct ReapReport {
     pub forgotten_only: Vec<(String, String)>,
     /// (name, reason) pairs that were deliberately left alone.
     pub kept: Vec<(String, String)>,
-    /// Non-fatal notes: an abandon that failed for a reason other than a pin.
+    /// Non-fatal notes: an abandon that failed for a reason other than a pin,
+    /// and a cleanup of a reaped name's earlier writes that failed.
     pub notes: Vec<String>,
 }
 

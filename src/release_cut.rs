@@ -753,7 +753,7 @@ fn report_orphaned_cut(
     if allow_drop {
         println!(
             "{repo}: --allow-drop: cutting without {} commit(s) reachable only from {} or its \
-             descendants; what is dropped is said after the reap",
+             descendants; what is dropped is said once the cut is done",
             orphaned.commits.len(),
             orphaned.previous
         );
@@ -941,6 +941,8 @@ struct ReapPayload {
     forgotten_only: Vec<NamedReason>,
     /// Names left untouched, with why.
     kept: Vec<NamedReason>,
+    /// Abandons that failed for a reason other than a pin, and failed cleanups
+    /// of a reaped name's earlier writes.
     notes: Vec<String>,
     /// Earlier writes of a reaped name abandoned because nothing rests on them.
     abandoned_earlier: Vec<AbandonedWrite>,
