@@ -818,12 +818,12 @@ pub(crate) fn run_reap(fork: &Fork<'_>) -> anyhow::Result<Exit> {
     Ok(reap_exit(&report))
 }
 
-/// Return a finding when reaping leaves work behind — a cut with descendants
-/// is someone's stacked work — or could not finish. A commit kept because a
-/// tag or someone else's bookmark still pins it is neither: every ref knives
-/// owns is gone and the commit stays on purpose, so there is nothing to act on,
-/// and a cut whose reap met one must not exit non-zero for as long as the tag
-/// exists.
+/// Return a finding when reaping leaves a cut behind because something rests
+/// on it — someone's stacked work, or a workspace's working copy — or could not
+/// finish. A commit kept because a tag or another bookmark still pins it is
+/// neither: every ref knives owns is gone and the commit stays on purpose, so
+/// there is nothing to act on, and a cut whose reap met one must not exit
+/// non-zero for as long as the pin exists.
 const fn reap_exit(report: &knives::commands::release::ReapReport) -> Exit {
     if report.kept.is_empty() && report.notes.is_empty() {
         Exit::Ok

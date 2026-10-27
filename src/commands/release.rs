@@ -558,8 +558,10 @@ pub struct ReapReport {
 /// rebase each of them onto the cut's parents: stacked work can come out
 /// conflicted, and a parked working copy becomes a fresh merge of the members,
 /// conflicted where the cut had resolved them, rewritten from outside its
-/// workspace, which is left stale. The kept name keeps its refs, so the next
-/// reap after the working copy moves on finishes it.
+/// workspace, which is left stale. The kept name keeps its refs, so a later
+/// reap retires it once nothing rests on it: jj drops an empty, undescribed
+/// working copy when it moves on, and one with changes stays a descendant until
+/// it is rebased off the cut.
 ///
 /// Never touches a remote. A later fetch re-materializes forgotten refs as
 /// untracked (jj keeps no memory of forgetting); that is expected, harmless to

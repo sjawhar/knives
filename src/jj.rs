@@ -3089,8 +3089,9 @@ pub struct ReapWrite {
 /// remote. A commit still immutable AFTER its refs are forgotten (an untracked
 /// remote pin someone else pushed, a trunk, a tag), or still named by a local
 /// bookmark of a name not being reaped, refuses its abandon and is reported
-/// without stopping later names — the porcelain forget/abandon sequence this
-/// replaces behaved the same way, in two operations per name.
+/// without stopping later names. The porcelain forget/abandon sequence this
+/// replaces refused an immutable commit the same way, in two operations per
+/// name; `jj abandon` does not refuse a commit a bookmark names.
 pub fn forget_and_abandon(
     repo: &Path,
     entries: &[(String, Vec<CommitId>)],

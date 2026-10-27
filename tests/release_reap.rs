@@ -395,6 +395,8 @@ fn a_cut_keeps_the_superseded_cut_another_workspaces_empty_working_copy_sits_on(
         is_visible(&lab, &cut),
         "the include abandoned the cut under the other working copy"
     );
+    assert_ne!(commit_at(&lab, "release/2026-08-04"), cut);
+    assert_eq!(commit_at(&lab, "release/2026-08-04@origin"), cut);
 
     // When: the next cut reaps the superseded name.
     let output = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
@@ -408,8 +410,10 @@ fn a_cut_keeps_the_superseded_cut_another_workspaces_empty_working_copy_sits_on(
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        stdout.contains("demo: kept release/2026-08-04: ")
-            && stdout.contains("the working copy of other"),
+        stdout.contains(&format!(
+            "demo: kept release/2026-08-04: it has descendants, whose heads are {}, the working copy of other\n",
+            knives::ids::CommitId::new(parked.as_str()).short()
+        )),
         "{stdout}"
     );
     assert!(!stdout.contains("reaped release/2026-08-04"), "{stdout}");
@@ -459,8 +463,10 @@ fn a_cut_keeps_the_superseded_cut_its_own_working_copy_sits_on_until_that_moves(
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains("cut release/2026-08-05 as ")
-            && stdout.contains("demo: kept release/2026-08-04: ")
-            && stdout.contains("the working copy of default"),
+            && stdout.contains(&format!(
+                "demo: kept release/2026-08-04: it has descendants, whose heads are {}, the working copy of default\n",
+                knives::ids::CommitId::new(parked.as_str()).short()
+            )),
         "{stdout}\n{}",
         String::from_utf8_lossy(&output.stderr)
     );
@@ -483,6 +489,143 @@ fn a_cut_keeps_the_superseded_cut_its_own_working_copy_sits_on_until_that_moves(
         "{reap_stdout}"
     );
     assert!(!is_visible(&lab, &cut), "the reaped cut stayed visible");
+}
+
+#[test]
+fn a_superseded_cut_a_workspace_has_checked_out_is_kept() {
+    // Given: a second workspace editing the superseded cut itself (`jj edit`),
+    // so the cut is its working-copy commit rather than the parent of one.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    lab.octopus("release/2026-08-04", "feat/alpha", "feat/beta");
+    let cut = commit_at(&lab, "release/2026-08-04");
+    let editing_workspace = lab.temp_path().join("editing-ws");
+    lab.jj_work([
+        "workspace",
+        "add",
+        "--name",
+        "editing",
+        "--revision",
+        "release/2026-08-04",
+        editing_workspace.to_str().expect("utf-8 path"),
+    ]);
+    lab::jj(&editing_workspace, ["edit", "release/2026-08-04"]);
+    lab.octopus("release/2026-08-05", "feat/alpha", "feat/beta");
+
+    // When: reaped.
+    let repo = Repo::open(&lab.work).expect("open");
+    let report = knives::commands::release::reap_superseded(
+        &lab.work,
+        &repo,
+        &knives::ids::ReleaseScheme::Dated,
+        "origin",
+    )
+    .expect("reap");
+
+    // Then: the cut stays as that workspace's working copy, and the reason
+    // names it.
+    assert!(report.reaped.is_empty(), "{report:?}");
+    assert_eq!(
+        report.kept,
+        vec![(
+            "release/2026-08-04".to_owned(),
+            "it is the working copy of editing".to_owned()
+        )],
+        "{report:?}"
+    );
+    assert!(is_visible(&lab, &cut), "the checked-out cut was abandoned");
+    assert_eq!(
+        lab.revision(&lab.work, "editing@", "commit_id"),
+        cut.as_str()
+    );
+}
+
+#[test]
+fn two_superseded_names_on_one_commit_are_reaped_together() {
+    // Given: two superseded dated names on one commit. Both are forgotten in
+    // the reap's one operation, so neither's bookmark pins the commit against
+    // the other's abandon.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    lab.octopus("release/2026-08-04", "feat/alpha", "feat/beta");
+    lab.jj_work([
+        "bookmark",
+        "create",
+        "release/2026-08-04.1",
+        "-r",
+        "release/2026-08-04",
+    ]);
+    let cut = commit_at(&lab, "release/2026-08-04");
+    lab.octopus("release/2026-08-05", "feat/alpha", "feat/beta");
+
+    // When: reaped.
+    let repo = Repo::open(&lab.work).expect("open");
+    let report = knives::commands::release::reap_superseded(
+        &lab.work,
+        &repo,
+        &knives::ids::ReleaseScheme::Dated,
+        "origin",
+    )
+    .expect("reap");
+
+    // Then: both names are reaped and the commit is gone.
+    assert_eq!(
+        report.reaped,
+        vec![
+            "release/2026-08-04".to_owned(),
+            "release/2026-08-04.1".to_owned()
+        ],
+        "{report:?}"
+    );
+    assert!(
+        report.forgotten_only.is_empty() && report.kept.is_empty() && report.notes.is_empty(),
+        "{report:?}"
+    );
+    assert!(!is_visible(&lab, &cut), "the reaped cut stayed visible");
+}
+
+#[test]
+fn a_cut_keeps_a_superseded_cut_a_retention_bookmark_names_and_exits_clean() {
+    // Given: a cut knives wrote, so its ledger records the commit as an earlier
+    // write of the name, and a retention bookmark on it.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let (home, _consumer) = release_test_home(&lab);
+    let first = knives_release(&lab, &home, &["cut", "release/2026-08-04"]);
+    assert!(first.status.success(), "{first:?}");
+    let cut = commit_at(&lab, "release/2026-08-04");
+    lab.jj_work([
+        "bookmark",
+        "create",
+        "keep/2026-08-04",
+        "-r",
+        "release/2026-08-04",
+    ]);
+
+    // When: the next cut reaps the superseded name.
+    let output = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
+
+    // Then: the name is forgotten and the commit stays under the bookmark,
+    // untouched by the cleanup of the name's earlier writes; the run exits 0.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(&format!(
+            "demo: reaped release/2026-08-04 (refs forgotten everywhere; commit kept, {} still pinned by bookmark keep/2026-08-04)\n",
+            cut.short()
+        )),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !stdout.contains("an earlier release/2026-08-04 commit"),
+        "{stdout}"
+    );
+    assert!(output.status.success(), "{stdout}");
+    assert!(is_visible(&lab, &cut), "the bookmarked cut was abandoned");
+    assert_eq!(commit_at(&lab, "keep/2026-08-04"), cut);
 }
 
 /// Whether `commit` is visible in the work checkout. Naming a hidden commit in
