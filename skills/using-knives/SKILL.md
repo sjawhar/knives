@@ -5,6 +5,8 @@ description: "Use when running any knives command or reading its output. Also us
 
 # The knives CLI
 
+If this skill disagrees with the code, a command's output or its `--help`, follow those and say which line of this skill is wrong.
+
 knives reports fork state and shows who owns what. A finding is a fact to investigate. It is not an instruction to remove a branch, repair a ref, open a PR, or call work merge-ready. For what to do before touching a fork, use **fork-work**. Flags: `knives <command> --help`.
 
 ## After an upgrade

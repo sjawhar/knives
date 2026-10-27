@@ -5,6 +5,8 @@ description: Use when opening or preparing a PR against an upstream repository o
 
 # Upstream PR Preflight Gate
 
+If this skill disagrees with the code, a command's output or its `--help`, follow those and say which line of this skill is wrong.
+
 ## Placement comes first
 
 - Decide where the change lives before whether it goes upstream. Apply `fork-work`'s test: if upstream main replaced the fork tomorrow, would anyone but us miss this? No means the consumer.
@@ -29,7 +31,7 @@ The member carries the change for the consumer from release publication until up
 4. If nobody holds the release claim, do the handoff in item 3 yourself.
 5. The consumer pins the published name and deploys.
 
-The owning session does the open PR's review rounds, body edits, rebases and close. Never park them on a human.
+The owning session does the open PR's review rounds, body edits, rebases and close. Never park them on a human. The one exception is text the user's own rules send to them first: batch it into one ask, which is approval, not parking.
 
 ## Step 1: Get Programmatic Facts
 

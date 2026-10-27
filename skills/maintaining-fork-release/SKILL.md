@@ -5,6 +5,8 @@ description: Use when asked to maintain a set of fork pull requests, address ups
 
 # Maintaining fork pull requests and releases
 
+If this skill disagrees with the code, a command's output or its `--help`, follow those and say which line of this skill is wrong.
+
 You own the requested outcome, not only the dispatched PRs.
 
 - A PR-only request ends at verified PR maintenance. Do not turn it into a release or deployment change.
@@ -69,7 +71,7 @@ You own the requested outcome, not only the dispatched PRs.
 
 Each dispatch holds, in order:
 
-1. The whole shipped `maintaining-fork-pr` skill.
+1. The whole shipped `maintaining-fork-pr` skill, its `references/` files included.
 2. Registry name, upstream slug, PR number and URL, branch, and its current status row as captured. For a release-member branch, also the member row and parent commit. The owner gets the PR head from the forge. It reports original PR head, expected branch/bookmark head and candidate head as separate revisions.
 3. The relevant `knives notch` history: promises, decisions, membership evidence and open obligations. Give full entries or a readable saved path, never your summary. The owner refreshes it before it acts.
 4. Upstream and project guidance with source paths, and recorded publication constraints. The owner derives the gates from current repository files. Also the registry's configured `forbidden` terms and outbound-prose rules. If none are configured, say so and invent none. An empty list is not a privacy waiver.
@@ -79,7 +81,7 @@ Each dispatch holds, in order:
 Release-only members:
 
 - Handle them yourself with the same claim, evidence and independent-review discipline. Do not invent PR numbers or open PRs to fill the inventory.
-- Claim a named branch before anyone edits it. Carry, drop or classify an anonymous member from release evidence and notches. Do not make a branch for it.
+- Claim a named branch before anyone edits it. Carry, drop or classify an anonymous member (a release parent no branch names) from release evidence and notches. Do not make a branch for it. Before a drop, follow [references/drop-sweep.md](references/drop-sweep.md).
 - Give a bounded branch implementation to one owner only when the requested scope authorizes it.
 - Classify with evidence: supplied upstream, still proposed upstream, downstream configuration, or obsolete. Record reason and disposition with `knives notch <branch> -m ... --evidence ...`, or on the release or repo subject for an anonymous member.
 - Do not include an open PR in a release automatically. A branch with no upstream PR yet still needs one.
@@ -96,7 +98,7 @@ Release-only members:
 - Dispatch the reviewers `maintaining-fork-pr` step 6 names, each fresh and each with the packet unedited. The fresh-context reviewer's verdict is `PASS (no repairs)`, `PASS per fix (k/k)` or `FAIL: fix|body|drift|placement`, with evidence for each question.
 - Each reviewer examines the **whole PR diff**, not only the owner's findings, even when recon found nothing.
 - Relay each verdict verbatim within 20 minutes. Do not use your judgment in its place or soften a FAIL. Send a malformed verdict back to the reviewer.
-- After 30 minutes, the owner records `decision: reviewer verdict outstanding; repair commits <ids>; bookmark not moved` and hands back. Then the verdict is your work, not the human's. Get it and resume the owner at verification, with its original, expected and candidate revisions.
+- After 30 minutes, the owner records `handback: reviewer verdict outstanding; repair commits <ids>; bookmark not moved` and hands back. Then the verdict is your work, not the human's. Get it and resume the owner at verification, with its original, expected and candidate revisions.
 
 ### Notches are the handback record
 
@@ -135,59 +137,7 @@ You are the last filter before a question reaches the maintainer of record. Befo
 
 Do this step when the request includes releases, upstream debt or consumption. PR-only scope does not authorize release edits or deployment.
 
-1. **Reconcile intended content.** Read the release and member notches again. Run `knives release --repo <repo>`, `knives release --repo <repo> members --census` and `knives consumers <repo>`.
-   - For each maintained delta, record if the release must carry it, inherits it upstream, excludes it deliberately, or needs repair.
-   - Prove carriage with `members <target> --carries <revision>`. A merged upstream PR or a source-text match is not proof. Investigate a conflicted probe. Do not drop it automatically.
-2. **Compose the intended release** with `release advance`, `include`, `drop --why`, `rebase` and `cut`, under the integration barrier.
-   - Advance repaired members to verified heads. Include an unreleased PR only when it is intended and ready to ship.
-   - Read the real consumer pins before you select an in-place edit or a new cut. A consumer frozen on an older release does not block an edit of the current one.
-   - When the tool refuses because every pin of the edited release is frozen, cut a new release. Make no parallel lineage and no forced ref move. Keep required old refs reachable. Never cut an identical release only for a new name.
-   - **Classify each member in the release notch before you compose it**, as one of:
-     - `upstream-PR <url>`: an open or merged upstream PR carries it.
-     - `upstream-pending, placement <notch anchor or commit>`: its `placement:` notch and commit body record the UPSTREAM verdict and the defect or capability gap. They also record the reproduction or red→green test that its upstream PR opens from.
-     - `neither`.
-   - Drop a `neither` member (`drop --why`) or return it to its author. Never compose it.
-   - The classification is disclosure, not a gate. An `upstream-pending` member ships when the release is gated and published. The consumer pins it without a wait for the upstream PR.
-   - Apply the ownership test of `fork-work` again: *if upstream main replaced the fork tomorrow, would anyone but us miss this?*
-   - Operating policy (job lifetimes and reaping, caps, quotas, schedules, alerting) lives in the consumer. A fork member repairs the library's own machinery or adds a capability that nothing outside the library can give.
-   - A policy-shaped member is a missing capability (UPSTREAM, with its PR in the same work) or CONSUMER work, which is `neither`. There is no third class.
-   - **Sweep each parent that leaves the candidate, line by line, before you cut or publish.** Read and follow [drop sweep](references/drop-sweep.md) before any parent leaves. Sweep all of them, not only those a reviewer named.
-   - Do not make a drop whose sweep is not finished. Keep the parent or its rebuild.
-   - A heading, `--why`, `--allow-drop`, the drop note or a quiet orphan gate says nothing about the content behind a parent. A member's own content can be superseded while a line that reaches the release only through it is not.
-3. **Verify the composed candidate.** Run all applicable gates and exercise the changed public surface on the candidate. Verify every member and integration resolution.
-   - Before you publish, run the **resolution-delta guard**. Each later `cut`, `advance` and `rebase` carries a recorded resolution forward. Thus a whole-file restore from one parent silently reverts the content of the other parents in that file.
-
-     ```sh
-     jj new '<release>-' -m guard                                   # fresh automerge of the release's parents
-     guard=$(jj log -r @ --no-graph -T commit_id)                   # save its id: the restores below need it
-     jj diff --from @ --to <release> --name-only | sort > delta      # the recorded resolution delta
-     jj resolve -r @ --list | awk '{print $1}' | sort > conflicted   # the paths that genuinely conflict
-     comm -23 delta conflicted                                       # must print nothing, or only recorded semantic conflicts
-     jj abandon @                                                    # drop the guard commit
-     ```
-
-   - For each printed path, put the automerge content back (`jj restore --from "$guard" --into <release> <path>`). Then resolve only the conflicted paths again, hunk by hunk.
-   - Never resolve a release conflict with `jj restore --from <one parent>` of a whole file.
-   - The exception is a **semantic conflict**: the members merge cleanly, but the composition fails a gate. Repair it on the release commit, never on a member, because a member must stay valid alone.
-   - Record a semantic conflict in the release notch: path, the two members, the gate error and the hunk verbatim. `jj diff --from "$guard" --to <release> -- <path>` must be byte-equal to that hunk. Any other printed path is a defect.
-   - For a pure restructure, require tree identity with the verified reference. Otherwise, account for the exact intended delta.
-   - Run **absolute consumer capability contracts**. Comparisons to the previous cut and all structural gates accept a stated drop as expected.
-   - Find the contract tests: search the consumer's test trees for the pinned package's name and for the symbols the pin exposes.
-   - Run the static tests with the candidate in place of the pin (a `file://` pin, relocked). Live tests need a deployment. Before publish, run them only on a dev stack deployed from the candidate. Otherwise, run them on the pin after publish.
-   - A required capability recorded in `knives notch` and lost earlier is a defect to repair, not a baseline.
-   - **Judge test failures against a control, not against zero**. Run the same command in the same environment on a pristine export of the target trunk that the suite can run in. Never use a fork workspace. For example, use `git archive <target> | tar -x` and install dependencies.
-   - Compare failure sets by test name, not chunk label. A candidate-only failure counts when it occurs in isolation on the candidate and not on the control. A test file only the candidate has counts when it fails deterministically in isolation.
-   - A scrubbed run (`env -i`, no ambient credentials, plain `TERM`) is a cheap first test.
-4. **Verify the consumer chain.** Identify consumer trunk pins, resolved lock commits, build inputs, submodule or binary artifacts, and intermediate packages that inject their own dependencies.
-   - A direct pin does not control a runner's separately installed version. Verify the whole chain against the candidate.
-   - Use the project's deployment and verification guidance, not an unrelated upstream dev environment. Local gates, a changed lockfile, a published branch and deployed behavior are separate evidence.
-5. **Publish and consume deliberately.** A local cut or edit is not published. A published ref is not consumed until the authoritative consumer resolves it.
-   - Publish to the registry's publish remote (`release`, otherwise `origin`). Verify the remote ref with `knives pushed`.
-   - Do the consumer pin, build and deployment that the goal requires. Never deploy when excluded, and never bypass credentials or approvals.
-   - Verify the final resolved revision, and the running revision where required, and exercise the behavior there. Verify again after a relevant change.
-   - Record `record:` and `verify:` on the release with candidate, published and consumed commits, and gate and runtime evidence.
-   - **The pin PR body discloses the delta** under `## Production behavior delta`. For each member that the release adds or moves, state what production does differently, in plain numbers, and which deployments carry it. Mark upstream-pending members. Write `none` when nothing changes.
-   - Write the delta from the member classification and notches, not from the release title. It is disclosure, not a gate.
+Read and follow [references/release-and-consumers.md](references/release-and-consumers.md) whenever you do this step. Its five steps (reconcile intended content, compose the intended release, verify the composed candidate, verify the consumer chain, publish and consume deliberately) each hold checks that a release skipping them ships without.
 
 When a real external prerequisite blocks publication or consumption, finish other work, record the exact blocker and report the stage **blocked**. Do not report it ready with a follow-up.
 

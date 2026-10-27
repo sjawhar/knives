@@ -5,6 +5,8 @@ description: Use when you are about to work in, read or investigate a repository
 
 # Working in a managed fork
 
+If this skill disagrees with the code, a command's output or its `--help`, follow those and say which line of this skill is wrong.
+
 ## 1. Find out if it is a managed fork
 
 Do this before you read code too: a conclusion from the wrong copy is wrong, and nothing tells you.
@@ -67,7 +69,7 @@ Do this before you read code too: a conclusion from the wrong copy is wrong, and
   3. The consumer pins the published name and deploys. The fork member carries the change until upstream ships it.
 - The release owner's process opens the upstream PR after the notch records the verdict, from a signed commit with an `Omp-Session` trailer. It gates nothing: not the release, the pin or the deploy. Never wait for upstream review or "the next cut".
 - The include-time ownership test checks placement. It is not a review that the fix waits in.
-- After the upstream PR opens, its review rounds, body edits, rebases and close are the owning session's work. Never park them on a human.
+- After the upstream PR opens, its review rounds, body edits, rebases and close are the owning session's work. Never park them on a human. The one exception is text the user's own rules send to them first: batch it into one ask, which is approval, not parking.
 
 ## 5. Get your workspace with `knives start`
 
