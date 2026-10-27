@@ -5,6 +5,8 @@ description: Use when opening or preparing a PR against an upstream repository o
 
 # Upstream PR Preflight Gate
 
+If this skill disagrees with the code, a command's output or its `--help`, follow those and say which line of this skill is wrong.
+
 ## Placement comes first
 
 - Decide where the change lives before whether it goes upstream. Apply `fork-work`'s test: if upstream main replaced the fork tomorrow, would anyone but us miss this? No means the consumer.

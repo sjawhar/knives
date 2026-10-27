@@ -5,6 +5,8 @@ description: Use when you are about to work in, read or investigate a repository
 
 # Working in a managed fork
 
+If this skill disagrees with the code, a command's output or its `--help`, follow those and say which line of this skill is wrong.
+
 ## 1. Find out if it is a managed fork
 
 Do this before you read code too: a conclusion from the wrong copy is wrong, and nothing tells you.
