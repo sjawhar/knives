@@ -1,6 +1,6 @@
 # The reviewer packet
 
-Read this before you write `<per-PR-scratch>/reviewer-packet.md` (step 6). An orchestrator reads it before it relays a packet.
+Read this before you write `<per-PR-scratch>/reviewer-packet.md` (step 6).
 
 The packet contains:
 

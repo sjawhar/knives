@@ -1,6 +1,6 @@
 # Finishing release and consumer verification
 
-Read this before you change, cut or publish a release or a consumer pin (step 5). Do the five steps in order.
+Read this whenever you do step 5. Do the five steps in order.
 
 1. **Reconcile intended content.** Read the release and member notches again. Run `knives release --repo <repo>`, `knives release --repo <repo> members --census` and `knives consumers <repo>`.
    - For each maintained delta, record if the release must carry it, inherits it upstream, excludes it deliberately, or needs repair.
