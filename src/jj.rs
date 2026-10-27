@@ -939,6 +939,42 @@ impl Repo {
             .collect()
     }
 
+    /// Why `commit` must not be abandoned because something rests on it, or
+    /// `None` when nothing does: a workspace has it checked out, or it has any
+    /// visible descendant, a working copy parked on it included whether it is
+    /// empty or not. Abandoning a commit rebases whatever rests on it onto its
+    /// parents. For a working copy that is a rewrite from outside its
+    /// workspace, which leaves the workspace stale, and on a release merge's
+    /// parents the rewritten copy is a fresh merge that can carry conflicts
+    /// the release had resolved. A release edit ([`write_release`]) and the
+    /// reap of a superseded cut both keep a commit by this one rule.
+    pub fn what_rests_on(&self, commit: &CommitId) -> Result<Option<String>, JjError> {
+        let commit = self.commit(commit.as_str())?;
+        let reasons = self.rests_on(commit.id())?;
+        Ok((!reasons.is_empty()).then(|| reasons.join("; ")))
+    }
+
+    /// The reasons of [`Repo::what_rests_on`], one per kind of thing resting
+    /// on `id`.
+    fn rests_on(&self, id: &JjCommitId) -> Result<Vec<String>, JjError> {
+        let mut reasons = Vec::new();
+        let workspaces = checked_out_by(self, id);
+        if !workspaces.is_empty() {
+            reasons.push(format!(
+                "it is the working copy of {}",
+                workspaces.join(", ")
+            ));
+        }
+        let descendants = self.descendants_of(id)?;
+        if !descendants.is_empty() {
+            reasons.push(descendants_that_stay(
+                self,
+                &descendants.iter().collect::<Vec<_>>(),
+            )?);
+        }
+        Ok(reasons)
+    }
+
     /// Merge commits reachable from `tip` but not from any of `bases` that join
     /// two or more lines none of the bases has, newest first.
     ///
@@ -2083,15 +2119,14 @@ pub fn abandon_unheld_writes(
 /// write's transaction, the name already moved — or `None` when nothing else
 /// rests on it.
 ///
-/// It stays for a bookmark or tag on it, local or on any remote; a workspace
-/// with it checked out; any visible descendant, a parked working copy
-/// included (the same rule as [`abandon_tagged_copies`]: rewriting a working
-/// copy from here leaves its workspace stale); or anything jj's default rule
-/// pins ([`assert_mutable`]). A commit someone else can still reach by name is
-/// theirs to keep. Two refs do not count: the colocated git view (`@git`),
-/// which shows the moved name at the source until this operation exports
-/// refs, and the moved name's tracked ref on its publish remote, the published
-/// position the next push replaces.
+/// It stays for a bookmark or tag on it, local or on any remote; for anything
+/// that rests on it ([`Repo::what_rests_on`]: a workspace with it checked out,
+/// or any visible descendant, a parked working copy included); or for anything
+/// jj's default rule pins ([`assert_mutable`]). A commit someone else can still
+/// reach by name is theirs to keep. Two refs do not count: the colocated git
+/// view (`@git`), which shows the moved name at the source until this
+/// operation exports refs, and the moved name's tracked ref on its publish
+/// remote, the published position the next push replaces.
 fn what_keeps(
     repo: &Repo,
     view_repo: &dyn jj_lib::repo::Repo,
@@ -2134,20 +2169,7 @@ fn what_keeps(
     if !named.is_empty() {
         reasons.push(format!("{} names it", named.join(", ")));
     }
-    let workspaces = checked_out_by(repo, id);
-    if !workspaces.is_empty() {
-        reasons.push(format!(
-            "it is the working copy of {}",
-            workspaces.join(", ")
-        ));
-    }
-    let descendants = repo.descendants_of(id)?;
-    if !descendants.is_empty() {
-        reasons.push(descendants_that_stay(
-            repo,
-            &descendants.iter().collect::<Vec<_>>(),
-        )?);
-    }
+    reasons.extend(repo.rests_on(id)?);
     if let Err(error) = assert_mutable(view_repo, std::slice::from_ref(commit)) {
         reasons.push(error.to_string());
     }

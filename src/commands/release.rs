@@ -545,15 +545,21 @@ pub struct ReapReport {
 /// The newest dated name never appears in the enumeration, and the
 /// `previous_position` seam is `Fixed`-scheme-only while dated names are the
 /// only thing enumerated, so neither needs a runtime gate here. Two things do:
-/// a cut with local descendants is someone's stacked work (#4's third loss
-/// mode) and is refused with the descendants named; and while the live cut
-/// still carries conflicts, every superseded cut is kept, because the previous
-/// cut is the only record of how those conflicts were last resolved — reaping
-/// it while the successor is unsettled destroys the record exactly when an
-/// abandon-and-recut would need it.
+/// a cut that anything rests on is kept with what rests on it named, by the
+/// rule a release edit keeps the commit it replaced by
+/// ([`Repo::what_rests_on`]); and while the live cut still carries conflicts,
+/// every superseded cut is kept, because the previous cut is the only record of
+/// how those conflicts were last resolved — reaping it while the successor is
+/// unsettled destroys the record exactly when an abandon-and-recut would need
+/// it.
 ///
-/// Parked workspace working copies — empty, undescribed — do not block: they sit
-/// on release merges as a matter of course and jj rebases them harmlessly.
+/// What rests on a cut is stacked work (#4's third loss mode), or a workspace's
+/// working copy on it or above it, empty or not. Abandoning the cut would
+/// rebase each of them onto the cut's parents: stacked work can come out
+/// conflicted, and a parked working copy becomes a fresh merge of the members,
+/// conflicted where the cut had resolved them, rewritten from outside its
+/// workspace, which is left stale. The kept name keeps its refs, so the next
+/// reap after the working copy moves on finishes it.
 ///
 /// Never touches a remote. A later fetch re-materializes forgotten refs as
 /// untracked (jj keeps no memory of forgetting); that is expected, harmless to
@@ -605,19 +611,8 @@ pub fn reap_superseded(
     let mut entries: Vec<(String, Vec<CommitId>)> = Vec::new();
     'names: for (name, targets) in by_name {
         for target in &targets {
-            let descendants = crate::jj::commits_matching(
-                repo_path,
-                &format!(
-                    "(descendants({id}) ~ {id}) ~ (empty() & description(exact:\"\"))",
-                    id = target.as_str()
-                ),
-            )?;
-            if !descendants.is_empty() {
-                let sample: Vec<&str> = descendants.iter().take(3).map(CommitId::short).collect();
-                report.kept.push((
-                    name.clone(),
-                    format!("has local descendant(s): {}", sample.join(", ")),
-                ));
+            if let Some(reason) = repo.what_rests_on(target)? {
+                report.kept.push((name.clone(), reason));
                 continue 'names;
             }
         }
