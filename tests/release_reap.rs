@@ -260,7 +260,11 @@ fn release_reap_json_prints_one_json_document() {
         serde_json::json!(["release/2026-08-03"]),
         "{report}"
     );
+    assert_eq!(report["kept"].as_array().map(Vec::len), Some(1), "{report}");
     assert_eq!(report["kept"][0]["name"], "release/2026-08-04", "{report}");
+    for empty in ["forgotten_only", "notes", "abandoned_earlier"] {
+        assert_eq!(report[empty], serde_json::json!([]), "{empty}: {report}");
+    }
     assert!(
         report["kept"][0]["reason"]
             .as_str()
@@ -792,6 +796,28 @@ fn a_cut_keeps_a_superseded_name_whose_rewritten_earlier_write_a_working_copy_re
     assert_eq!(output.status.code(), Some(1), "{stdout}");
     assert!(is_visible(&lab, &rewrite), "the rewrite was abandoned");
     assert_eq!(lab.revision(&lab.work, "other@", "commit_id"), parked);
+
+    // And: once the workspace is forgotten, the reap retires the name and
+    // abandons the rewrite, and its JSON names it.
+    lab.jj_work(["workspace", "forget", "other"]);
+    let reap = lab::release_command(&lab, &home, lab::ReleaseOutput::Json, &["reap"])
+        .output()
+        .expect("run knives release reap --json");
+    let reap_stdout = String::from_utf8_lossy(&reap.stdout);
+    let report: serde_json::Value =
+        serde_json::from_str(&reap_stdout).unwrap_or_else(|error| panic!("{error}: {reap_stdout}"));
+    assert_eq!(
+        report["reaped"],
+        serde_json::json!(["release/2026-08-04"]),
+        "{report}"
+    );
+    assert_eq!(
+        report["abandoned_earlier"],
+        serde_json::json!([{"name": "release/2026-08-04", "commit": rewrite.as_str()}]),
+        "{report}"
+    );
+    assert!(reap.status.success(), "{reap_stdout}");
+    assert!(!is_visible(&lab, &rewrite), "the rewrite stayed visible");
 }
 
 /// Whether `commit` is visible in the work checkout. Naming a hidden commit in

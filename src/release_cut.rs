@@ -254,6 +254,9 @@ pub(crate) fn run_release(
                             published.short()
                         ),
                     }
+                    if let Some(orphaned) = &orphaned {
+                        report_stated_drop(fork, orphaned)?;
+                    }
                     if !audit.inconclusive.is_empty() || !check.inconclusive.is_empty() {
                         worst = worst.worst(Exit::Findings);
                     }
@@ -660,28 +663,44 @@ fn report_completed_cut(
         .map(|reference| reference.branch().to_string())
         .collect();
     live.extend(
-        knives::store::Store::open(
-            knives::store::default_state_path(),
-            &bound.registry.former_names(),
-            &[],
-        )?
-        .claims(Some(&fork.upstream))
-        .into_iter()
-        .map(|claim| claim.branch.clone()),
+        opened
+            .conflicted_bookmarks()?
+            .into_iter()
+            .map(|(reference, _)| reference.branch().to_string()),
     );
-    let orphans = release::workspaces_to_clean(&present, &recorded, &live);
-    if orphans.is_empty() {
-        println!("  no workspace belongs to a branch that no longer exists");
-    } else {
-        println!(
-            "  {} workspace(s) belong to branches that no longer exist: {}",
-            orphans.len(),
-            orphans.join(", ")
-        );
-        println!(
-            "  no bookmark or live claim holds them; remove with `jj workspace forget <name>` \
-             once you have checked them"
-        );
+    // The cut is already published and recorded: a state file that cannot be
+    // read names no workspace rather than stopping the reap.
+    let claims = knives::store::Store::open(
+        knives::store::default_state_path(),
+        &bound.registry.former_names(),
+        &[],
+    );
+    match claims {
+        Err(error) => {
+            println!("  could not read claims, so no workspace is named for removal: {error}");
+        }
+        Ok(store) => {
+            live.extend(
+                store
+                    .claims(Some(&fork.upstream))
+                    .into_iter()
+                    .map(|claim| claim.branch.clone()),
+            );
+            let orphans = release::workspaces_to_clean(&present, &recorded, &live);
+            if orphans.is_empty() {
+                println!("  no workspace belongs to a branch that no longer exists");
+            } else {
+                println!(
+                    "  {} workspace(s) belong to branches that no longer exist: {}",
+                    orphans.len(),
+                    orphans.join(", ")
+                );
+                println!(
+                    "  no bookmark or live claim holds them; remove with `jj workspace forget \
+                     <name>` once you have checked them"
+                );
+            }
+        }
     }
     let exit = post_cut_exit.worst(reap_after_cut(fork)?);
     if let Some(orphaned) = cut.stated_drop {
@@ -827,12 +846,14 @@ fn reap_after_cut(fork: &Fork<'_>) -> anyhow::Result<Exit> {
 /// ledger records knives writing under it, and their visible rewrites — that
 /// are visible heads nothing rests on: a replaced commit once kept for a
 /// working copy that has since moved on would otherwise stay an anonymous head
-/// for good. Returns each abandoned commit with its name.
+/// for good. Returns each abandoned commit with its name, and a note for each
+/// name whose cleanup failed: the reap itself is already committed, so its
+/// report must still reach the operator.
 fn abandon_reaped_writes(
     fork: &Fork<'_>,
     report: &knives::commands::release::ReapReport,
     ledger: &[knives::ledger::Entry],
-) -> anyhow::Result<Vec<(String, knives::ids::CommitId)>> {
+) -> (Vec<(String, knives::ids::CommitId)>, Vec<String>) {
     let names: Vec<&str> = report
         .reaped
         .iter()
@@ -840,24 +861,35 @@ fn abandon_reaped_writes(
         .map(String::as_str)
         .collect();
     let mut abandoned_earlier = Vec::new();
+    let mut notes = Vec::new();
     if names.is_empty() {
-        return Ok(abandoned_earlier);
+        return (abandoned_earlier, notes);
     }
-    let reopened = knives::jj::Repo::open(&fork.checkout.path)?;
+    let reopened = match knives::jj::Repo::open(&fork.checkout.path) {
+        Ok(reopened) => reopened,
+        Err(error) => {
+            notes.push(format!("earlier writes not cleaned up: {error}"));
+            return (abandoned_earlier, notes);
+        }
+    };
     for name in names {
-        let earlier = release::earlier_writes(&reopened, ledger, name)?;
-        let abandoned = knives::jj::abandon_unheld_writes(
-            &fork.checkout.path,
-            &earlier,
-            &format!("knives: {name}: abandon earlier writes nothing rests on"),
-        )?;
-        abandoned_earlier.extend(
-            abandoned
-                .into_iter()
-                .map(|commit| (name.to_owned(), commit)),
-        );
+        let abandoned = release::earlier_writes(&reopened, ledger, name).and_then(|earlier| {
+            knives::jj::abandon_unheld_writes(
+                &fork.checkout.path,
+                &earlier,
+                &format!("knives: {name}: abandon earlier writes nothing rests on"),
+            )
+        });
+        match abandoned {
+            Ok(abandoned) => abandoned_earlier.extend(
+                abandoned
+                    .into_iter()
+                    .map(|commit| (name.to_owned(), commit)),
+            ),
+            Err(error) => notes.push(format!("{name}: earlier writes not cleaned up: {error}")),
+        }
     }
-    Ok(abandoned_earlier)
+    (abandoned_earlier, notes)
 }
 
 /// Reap superseded dated cuts on demand, in the chosen output.
@@ -890,7 +922,9 @@ fn reap(fork: &Fork<'_>) -> anyhow::Result<Reaped> {
         fork.entry.publish_remote(),
         &ledger,
     )?;
-    let abandoned_earlier = abandon_reaped_writes(fork, &report, &ledger)?;
+    let (abandoned_earlier, notes) = abandon_reaped_writes(fork, &report, &ledger);
+    let mut report = report;
+    report.notes.extend(notes);
     Ok(Reaped {
         report,
         abandoned_earlier,

@@ -1821,12 +1821,46 @@ fn a_cut_never_names_a_workspace_a_live_claim_holds_or_knives_never_made() {
         scratch.to_str().expect("utf-8 path"),
     ]);
 
-    // When: the next cut forgets the held release's name in its reap.
+    // When: the next cut runs (its reap keeps the held release).
     let output = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
 
     // Then: it tells nobody to forget either workspace.
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("cut release/2026-08-05 as "), "{stdout}");
+    assert!(
+        stdout.contains("  no workspace belongs to a branch that no longer exists\n"),
+        "{stdout}"
+    );
+    assert_eq!(workspaces_to_forget(&stdout), None, "{stdout}");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+}
+
+#[test]
+fn a_cut_never_names_a_workspace_only_a_live_claim_holds() {
+    // Given: a branch an agent holds through `knives start` (a claim, a ledger
+    // entry and workspace `feat-gamma`), whose bookmark is then deleted, so only
+    // the claim says the workspace is in use.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let (home, _consumer) = release_test_home(&lab);
+    let first = knives_release(&lab, &home, &["cut", "release/2026-08-04"]);
+    assert!(first.status.success(), "{first:?}");
+    lab.branch("feat/gamma", "gamma.txt", "gamma\n");
+    let started = lab::knives_start(&lab, &home, "feat/gamma");
+    assert!(started.status.success(), "{started:?}");
+    lab.jj_work(["bookmark", "delete", "feat/gamma"]);
+
+    // When: the next cut runs.
+    let output = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
+
+    // Then: the held workspace is not named.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("  no workspace belongs to a branch that no longer exists\n"),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert_eq!(workspaces_to_forget(&stdout), None, "{stdout}");
 }
 
