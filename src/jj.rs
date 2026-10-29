@@ -1034,6 +1034,109 @@ impl Repo {
             .collect())
     }
 
+    /// The tags naming `commit`, local or on any remote but jj's git view,
+    /// sorted and each once.
+    pub fn tags_on(&self, commit: &CommitId) -> Result<Vec<String>, JjError> {
+        let id = self.commit(commit.as_str())?.id().clone();
+        let mut names = BTreeSet::new();
+        for (name, targets) in self.repo.view().tags() {
+            let on_remote = targets
+                .remote_refs
+                .iter()
+                .filter(|(remote, _)| *remote != jj_lib::git::REMOTE_NAME_FOR_LOCAL_GIT_REPO)
+                .any(|(_, remote_ref)| remote_ref.target.added_ids().any(|target| *target == id));
+            if on_remote || targets.local_target.added_ids().any(|target| *target == id) {
+                names.insert(name.as_str().to_owned());
+            }
+        }
+        Ok(names.into_iter().collect())
+    }
+
+    /// Merge commits of `bases..tip` that bring, through a parent other than
+    /// their first, a commit no base has: a side line the branch carries in.
+    ///
+    /// With the release's members among `bases`, a merge whose side parents
+    /// the release already carries brings nothing but the branch's own line
+    /// (its first parent); one whose side parent is in the range carries that
+    /// line's commits as the branch's own content.
+    pub fn merges_with_side_lines(
+        &self,
+        bases: &[CommitId],
+        tip: &CommitId,
+    ) -> Result<Vec<CommitId>, JjError> {
+        let bases = bases
+            .iter()
+            .map(|base| Ok(self.commit(base.as_str())?.id().clone()))
+            .collect::<Result<Vec<_>, JjError>>()?;
+        let commits = self.commits_between(&bases, tip)?;
+        let in_range: HashSet<&JjCommitId> =
+            commits.iter().map(jj_lib::commit::Commit::id).collect();
+        Ok(commits
+            .iter()
+            .filter(|commit| {
+                commit
+                    .parent_ids()
+                    .iter()
+                    .skip(1)
+                    .any(|parent| in_range.contains(parent))
+            })
+            .map(|commit| commit_id(commit.id()))
+            .collect())
+    }
+
+    /// The commits of `bases..tip`, newest first: what `tip` brings that no
+    /// base already has.
+    pub fn commit_ids_between(
+        &self,
+        bases: &[CommitId],
+        tip: &CommitId,
+    ) -> Result<Vec<CommitId>, JjError> {
+        let bases = bases
+            .iter()
+            .map(|base| Ok(self.commit(base.as_str())?.id().clone()))
+            .collect::<Result<Vec<_>, JjError>>()?;
+        let tip = self.commit(tip.as_str())?.id().clone();
+        Ok(self
+            .range_newest_first(&bases, &tip)?
+            .iter()
+            .map(commit_id)
+            .collect())
+    }
+
+    /// A commit other than `commit` with exactly its tree, reachable from one
+    /// of `heads` and not from `base`, newest first per head; `None` when there
+    /// is none.
+    ///
+    /// A history rebuilt outside jj — recreated to strip trailers, say —
+    /// carries the same trees under new commits that share no ancestry or
+    /// change id with the old ones. Its tip tree is the member's content.
+    pub fn same_tree_between(
+        &self,
+        commit: &CommitId,
+        base: &CommitId,
+        heads: &[CommitId],
+    ) -> Result<Option<CommitId>, JjError> {
+        let wanted = self.commit(commit.as_str())?;
+        let base = self.commit(base.as_str())?.id().clone();
+        for head in heads {
+            let head = self.commit(head.as_str())?.id().clone();
+            for id in self.range_newest_first(std::slice::from_ref(&base), &head)? {
+                if &id == wanted.id() {
+                    continue;
+                }
+                let candidate = self
+                    .repo
+                    .store()
+                    .get_commit(&id)
+                    .map_err(|error| store_error(&error))?;
+                if candidate.tree_ids() == wanted.tree_ids() {
+                    return Ok(Some(commit_id(&id)));
+                }
+            }
+        }
+        Ok(None)
+    }
+
     /// The commits of `bases..tip`, newest first.
     fn commits_between(
         &self,
@@ -3257,6 +3360,47 @@ pub struct TaggedCopy {
     pub copy: CommitId,
     /// Why the copy was left in place; `None` when it was abandoned.
     pub kept: Option<String>,
+}
+
+/// Put each local bookmark of `targets` back on its commit where something
+/// moved it, as ONE described operation; returns those put back.
+///
+/// `jj rebase -b` rewrites every descendant of the commits it moves, and the
+/// bookmarks on them follow: an earlier release resting on a member would end
+/// up on a rewritten copy, and pushing that name would move what was
+/// published. A bookmark no longer present is left absent.
+pub fn restore_local_bookmarks(
+    repo: &Path,
+    targets: &[(String, CommitId)],
+    operation: &str,
+) -> Result<Vec<(String, CommitId)>, JjError> {
+    let repo = Repo::open_to_write(repo)?;
+    let mut moved = Vec::new();
+    for (name, commit) in targets {
+        let current = repo.repo.view().get_local_bookmark(JjRefName::new(name));
+        if current.is_absent() {
+            continue;
+        }
+        let wanted = repo.commit(commit.as_str())?;
+        if current.as_normal() != Some(wanted.id()) {
+            moved.push((name.clone(), wanted));
+        }
+    }
+    if moved.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut tx = repo.repo.start_transaction();
+    for (name, commit) in &moved {
+        tx.repo_mut().set_local_bookmark_target(
+            JjRefName::new(name),
+            RefTarget::normal(commit.id().clone()),
+        );
+    }
+    commit_mutation(&repo, tx, operation)?;
+    Ok(moved
+        .into_iter()
+        .map(|(name, commit)| (name, commit_id(commit.id())))
+        .collect())
 }
 
 /// Abandon the copies a rebase onto `dest` made of `originals`, as ONE

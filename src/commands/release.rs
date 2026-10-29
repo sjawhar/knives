@@ -24,12 +24,13 @@ use crate::ids::{
     is_release_name,
 };
 use crate::jj::{self, Repo};
-use crate::ledger::{Entry, Ledger, RecordedParent};
+use crate::ledger::{Entry, Kind, Ledger, RecordedParent};
 use crate::pins::{Pin, PinKind};
 use crate::release_model::{
-    BranchSuccessions, MemberEvidence, MemberSuccession, RecordedCut, StackedHistoryContext,
-    carried_from_tips, double_cut_findings, last_recorded_parents, member_parents, newest_release,
-    release_refs_by_commit, repo_slug, stacked_history, trunk_positions,
+    BranchSuccessions, MemberEvidence, MemberHistory, MemberSuccession, RecordedCut,
+    StackedHistoryContext, carried_from_tips, double_cut_findings, last_recorded_parents,
+    member_history, member_parents, newest_release, release_refs_by_commit, repo_slug,
+    stacked_history, trunk_positions,
 };
 
 /// Registered forge consumers and explicitly requested local checkout scans.
@@ -162,6 +163,72 @@ fn freezes_commit(pin: &Pin, commit: &CommitId) -> bool {
                 .is_some_and(|prefix| prefix.eq_ignore_ascii_case(candidate))
     };
     abbreviates(&pin.reference) || pin.locked.as_deref().is_some_and(abbreviates)
+}
+
+/// A dated release at its local and publish-remote positions, asked whether
+/// it is published ([`published_release`]).
+#[derive(Debug, Clone, Copy)]
+pub struct ReleaseAt<'a> {
+    pub scheme: &'a ReleaseScheme,
+    pub name: &'a str,
+    pub commits: &'a [Option<&'a CommitId>],
+}
+
+/// What marks a dated release published, rendered for a human, or `None`.
+///
+/// A tag names one of its commits, or a `record:` note on the release names
+/// one. A forge release leaves a tag, and the release owner's `record:` note
+/// says where it was published, whichever reached this machine first. An edit
+/// moves the release's name, and a push of the moved name would move what
+/// consumers were told was published: every edit verb refuses such a release,
+/// and a cut under a new dated name may start identical to it. A fixed release
+/// branch moves forward by design and leaves its published positions to their
+/// tags, so nothing marks it here.
+pub fn published_release(
+    repo: &Repo,
+    ledger: &[Entry],
+    release: ReleaseAt<'_>,
+) -> Result<Option<String>, crate::jj::JjError> {
+    let ReleaseAt {
+        scheme,
+        name: release,
+        commits,
+    } = release;
+    if matches!(scheme, ReleaseScheme::Fixed(_)) {
+        return Ok(None);
+    }
+    let mut seen: Vec<&CommitId> = Vec::new();
+    for commit in commits.iter().flatten() {
+        if seen.contains(commit) {
+            continue;
+        }
+        seen.push(commit);
+        if let Some(tag) = repo.tags_on(commit)?.first() {
+            return Ok(Some(format!("tag {tag} names {}", commit.short())));
+        }
+    }
+    let recorded = ledger.iter().rev().find_map(|entry| {
+        let is_record = entry.kind == Kind::Note
+            && entry.subject.as_deref() == Some(release)
+            && entry.text.trim_start().starts_with("record:");
+        if !is_record {
+            return None;
+        }
+        seen.iter().copied().find(|commit| {
+            entry.evidence.iter().any(|evidence| {
+                let evidence = evidence.trim();
+                evidence.len() >= 7
+                    && evidence
+                        .chars()
+                        .all(|character| character.is_ascii_hexdigit())
+                    && commit
+                        .as_str()
+                        .get(..evidence.len())
+                        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(evidence))
+            })
+        })
+    });
+    Ok(recorded.map(|commit| format!("a record: note names {}", commit.short())))
 }
 
 /// `name`, unless it is a series' own prefix, such as `release/9.2` on an entry
@@ -713,6 +780,46 @@ fn live_dated_release(
         .map(|(reference, commit)| (reference.branch().clone(), commit.clone()))
 }
 
+/// Each member's history measured against the others: a merge whose side
+/// lines another member carries is that member's content, not this one's, and
+/// is noted; a merge carrying a line no other member has is a finding.
+fn member_histories(
+    context: StackedHistoryContext<'_>,
+    parents: &[ReleaseParent],
+    member_parents: &[ReleaseParent],
+    plan: &mut Plan,
+) -> anyhow::Result<()> {
+    for parent in member_parents {
+        let others: Vec<CommitId> = parents
+            .iter()
+            .filter(|other| other.commit != parent.commit)
+            .map(|other| other.commit.clone())
+            .collect();
+        let label = parent_label(parent);
+        match member_history(
+            StackedHistoryContext {
+                carried: &others,
+                ..context
+            },
+            &label,
+            &parent.commit,
+        )? {
+            MemberHistory::Linear => {}
+            MemberHistory::CarriedMerges { merges, .. } => plan.notes.push(format!(
+                "member {label} carries merge(s) {} whose side lines the other members already \
+                 carry",
+                merges
+                    .iter()
+                    .map(CommitId::short)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+            MemberHistory::Stacked(finding) => plan.base_findings.push(finding),
+        }
+    }
+    Ok(())
+}
+
 /// The plan's note for a series with no cut yet.
 fn no_cut_yet(scheme: &ReleaseScheme) -> String {
     match scheme {
@@ -801,18 +908,15 @@ pub fn plan(
         }
     }
     let releases = release_refs_by_commit(&tips, &scheme, publish_remote);
+    let in_hand = [commit.clone()];
     let stacked_context = (!trunks.is_empty()).then_some(StackedHistoryContext {
         repo: &repo,
         trunks: &trunks,
         releases: &releases,
+        carried: &in_hand,
     });
     if let Some(context) = stacked_context {
-        for parent in &member_parents {
-            if let Some(finding) = stacked_history(context, &parent_label(parent), &parent.commit)?
-            {
-                plan.base_findings.push(finding);
-            }
-        }
+        member_histories(context, &parents, &member_parents, &mut plan)?;
     }
     plan.stale = stale_parents(&member_parents, &tips);
     // Only the selected series' branches are candidates; one that fits no
@@ -2098,6 +2202,9 @@ pub struct CompositionCheck {
     /// Members whose replay conflicted while the candidate itself is
     /// conflicted: unanswerable either way, exactly as the audit reports it.
     pub inconclusive: Vec<Unverified>,
+    /// Recorded members carried by another commit with exactly their tree,
+    /// reachable from a parent: the member rendered for a human, and the twin.
+    pub twins: Vec<(String, CommitId)>,
 }
 
 /// What the composition gate compares: the cut's parents against the members
@@ -2125,14 +2232,17 @@ pub struct CompositionDelta<'a> {
 /// rewritten — `jj rebase` keeps the change id and mints a new commit — is
 /// carried when a rewrite is reachable from a parent or the base, the same
 /// succession `advance` recognises; the recorded commit itself is never an
-/// ancestor again after a rebase. The content replay accounts for one that
-/// landed upstream as a squash — the same measure [`audit_cut`] applies to
-/// current members, taken from the member's own fork point so a moved base is
-/// never charged to the member. A member the trunk reaches but the cut subject
-/// does not is dropped without a replay: its fork point degenerates to the
-/// member itself, and that replay would read empty without consulting the cut
-/// subject at all. A recorded commit this repository cannot resolve counts as
-/// dropped: unverifiable must not read as carried.
+/// ancestor again after a rebase. A member recreated outside jj with exactly
+/// its tree is carried when that twin is reachable from a parent past the base
+/// ([`Repo::same_tree_between`]), and the twin is named. The content replay
+/// accounts for one that landed upstream as a squash — the same measure
+/// [`audit_cut`] applies to current members, taken from the member's own fork
+/// point so a moved base is never charged to the member. A member the trunk
+/// reaches but the cut subject does not is dropped without a replay: its fork
+/// point degenerates to the member itself, and that replay would read empty
+/// without consulting the cut subject at all. A recorded commit this
+/// repository cannot resolve counts as dropped: unverifiable must not read as
+/// carried.
 pub fn uncarried_recorded_members(
     repo: &Repo,
     path: &Path,
@@ -2163,6 +2273,12 @@ pub fn uncarried_recorded_members(
             }
         }
         if rewritten {
+            continue;
+        }
+        if let Some(twin) = repo.same_tree_between(member, delta.base, delta.parents)? {
+            check
+                .twins
+                .push((recorded_member_name(member, delta.tips), twin));
             continue;
         }
         if repo.is_ancestor(member, delta.trunk)? {

@@ -923,3 +923,61 @@ fn a_verbatim_cut_carries_a_member_whose_bookmark_is_divergent() {
         "the released copy was not carried"
     );
 }
+
+#[test]
+fn a_recorded_member_recreated_with_an_identical_tree_is_carried() {
+    // Given: a cut recording feat/alpha, then alpha recreated as feat/alpha2:
+    // a new commit with alpha's exact tree and no ancestry or change id back to
+    // it (a history rebuilt to strip trailers, say). An edit moves the member
+    // onto it by `--from`, and a later edit advances it past a commit that
+    // changes alpha's file, so replaying alpha's diff onto the cut conflicts.
+    let lab = lab::Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let (home, _consumer) = home_after_first_cut(&lab);
+    let alpha = commit_at(&lab, "feat/alpha");
+    lab.branch("feat/alpha2", "alpha.txt", "alpha\n");
+    let twin = commit_at(&lab, "feat/alpha2");
+    assert_ne!(twin, alpha);
+    let tree = |commit: &knives::ids::CommitId| {
+        let output = std::process::Command::new("git")
+            .args(["rev-parse", &format!("{}^{{tree}}", commit.as_str())])
+            .current_dir(&lab.work)
+            .output()
+            .expect("git rev-parse");
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    };
+    assert_ne!(tree(&alpha), "");
+    assert_eq!(tree(&twin), tree(&alpha));
+    let moved = knives_release(
+        &lab,
+        &home,
+        &["advance", "feat/alpha2", "--from", alpha.as_str()],
+    );
+    assert!(moved.status.success(), "{moved:?}");
+    lab::extend_branch(&lab, "feat/alpha2", "alpha.txt", "alpha\nmore\n");
+    let advanced = knives_release(&lab, &home, &["advance", "feat/alpha2"]);
+    assert!(advanced.status.success(), "{advanced:?}");
+
+    // When: the next cut is held against the recorded composition.
+    let output = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
+
+    // Then: alpha is carried by its identical-tree twin, said so, and the cut
+    // lands without --allow-drop.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(&format!(
+            "demo: feat/alpha@{} is carried by {}, which has the same tree\n",
+            alpha.short(),
+            twin.short()
+        )),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("cut release/2026-08-05 as "),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!stdout.contains("refusing to cut"), "{stdout}");
+}

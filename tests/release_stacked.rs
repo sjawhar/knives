@@ -16,7 +16,7 @@
 #[path = "common/lab.rs"]
 mod lab;
 
-use lab::{Lab, knives_release, release_test_home};
+use lab::{Lab, commit_at, knives_release, release_parents, release_test_home};
 
 #[test]
 fn a_member_built_on_a_prior_release_is_reported_stacked() {
@@ -154,4 +154,103 @@ fn the_first_cut_refuses_a_branch_whose_history_carries_a_merge() {
         repo.resolve_commit("release/2026-08-04").is_err(),
         "the cut must not have been published"
     );
+}
+
+/// A first cut of `feat/alpha` and `feat/beta`, then `feat/gamma`: a merge of
+/// `feat/alpha` and `other`, then gamma's own commit. Returns the lab, its
+/// home, the merge and gamma's tip.
+fn a_member_merging(
+    other: &str,
+) -> (
+    Lab,
+    tempfile::TempDir,
+    knives::ids::CommitId,
+    knives::ids::CommitId,
+) {
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let (home, _consumer) = release_test_home(&lab);
+    let first = knives_release(&lab, &home, &["cut", "release/2026-08-04"]);
+    assert!(first.status.success(), "{first:?}");
+    if other == "feat/delta" {
+        lab.branch("feat/delta", "delta.txt", "delta\n");
+    }
+    lab.jj_work([
+        "new",
+        "feat/alpha",
+        other,
+        "-m",
+        "merge alpha and another line",
+    ]);
+    let merge = knives::ids::CommitId::new(lab.revision(&lab.work, "@", "commit_id"));
+    lab.jj_work(["new", "-m", "feat/gamma"]);
+    std::fs::write(lab.work.join("gamma.txt"), "gamma\n").expect("write gamma");
+    lab.jj_work(["bookmark", "create", "feat/gamma", "-r", "@"]);
+    lab.jj_work(["new", "main@origin"]);
+    let gamma = commit_at(&lab, "feat/gamma");
+    (lab, home, merge, gamma)
+}
+
+#[test]
+fn a_member_whose_merge_joins_lines_the_release_carries_is_included() {
+    // Given: feat/gamma, whose history starts with a merge of two members the
+    // release already carries: everything it brings past the release is its own.
+    let (lab, home, merge, gamma) = a_member_merging("feat/beta");
+    let alpha = commit_at(&lab, "feat/alpha");
+    let beta = commit_at(&lab, "feat/beta");
+
+    // When: it is included.
+    let output = knives_release(&lab, &home, &["include", "feat/gamma"]);
+
+    // Then: it becomes a parent beside the members it builds on, and the
+    // output names the merge.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}");
+    assert!(
+        stdout.contains(&format!(
+            "demo: feat/gamma's history carries merge(s) {} whose other lines \
+             release/2026-08-04 already carries; it brings only its own 2 commit(s)\n",
+            merge.short()
+        )),
+        "{stdout}"
+    );
+    let parents = release_parents(&lab, "release/2026-08-04");
+    assert_eq!(parents.len(), 3, "{parents:?}");
+    for member in [&alpha, &beta, &gamma] {
+        assert!(parents.contains(member), "{parents:?}");
+    }
+
+    // And: the plan reports no stacked member.
+    let plan = knives_release(&lab, &home, &[]);
+    let text = String::from_utf8_lossy(&plan.stdout);
+    assert!(text.contains("3 parent(s), flat"), "{text}");
+    assert!(!text.contains("carries 1 merge commit(s)"), "{text}");
+}
+
+#[test]
+fn a_member_whose_merge_brings_a_line_the_release_lacks_is_refused_with_its_commits() {
+    // Given: feat/gamma, whose merge joins alpha with feat/delta, a branch the
+    // release does not carry.
+    let (lab, home, merge, gamma) = a_member_merging("feat/delta");
+    let delta = commit_at(&lab, "feat/delta");
+    let before = release_parents(&lab, "release/2026-08-04");
+
+    // When: it is included.
+    let output = knives_release(&lab, &home, &["include", "feat/gamma"]);
+
+    // Then: refused, listing every commit it would bring that the release
+    // lacks, and nothing changes.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(3), "{stdout}");
+    assert!(
+        stdout.contains(&format!(
+            "it brings 3 commit(s) the release does not carry: {}, {}, {}",
+            gamma.short(),
+            merge.short(),
+            delta.short()
+        )),
+        "{stdout}"
+    );
+    assert_eq!(release_parents(&lab, "release/2026-08-04"), before);
 }

@@ -198,15 +198,18 @@ fn a_bare_advance_skips_a_branch_that_merges_several_members() {
 
     let output = knives_release(&lab, &home, &["advance"]);
 
-    // Then: a branch whose history carries a merge of two members is not a
-    // candidate at all — it is stacked history, named as such — and nothing
-    // moves. The release is left exactly as it was.
+    // Then: a branch whose history merges two members is not a candidate for
+    // a bare advance, which would read it as the successor of each; it is
+    // named, with the verbs that take it by name, and nothing moves. The
+    // release is left exactly as it was.
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success(), "{stdout}");
     assert!(
-        stdout.contains("feat/consolidated's history past the trunk carries 1 merge")
-            && stdout.contains("rebase it off the trunk before advancing onto it"),
-        "the stacked branch must be named and skipped: {stdout}"
+        stdout.contains(
+            "demo: feat/consolidated's history carries merges of lines release/2026-08-04 \
+             already carries; a bare advance leaves it alone: advance or include it by name\n"
+        ),
+        "the merging branch must be named and skipped: {stdout}"
     );
     assert_eq!(
         release_parents(&lab, "release/2026-08-04"),

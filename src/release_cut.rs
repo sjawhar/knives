@@ -177,15 +177,16 @@ pub(crate) fn run_release(
         // the candidate is a duplicate of the in-hand previous release, so their
         // trees and parents always match locally.
         //
-        // The one exception is a previous release every consumer pins by
-        // revision: `include`, `drop`, `advance` and `rebase` all refuse to edit
-        // it, because the edit would reach nobody, and send the operator here.
-        // A verbatim cut under a new dated name is then the only editable
-        // composition, so it is allowed and says why; the edits and the re-pin
-        // follow it. The name has to be genuinely new: a fixed branch has no
-        // other name to take (a dated name that does not sort after the previous
-        // cut was refused above).
-        if let Some((previous_ref, _)) = &previous {
+        // Two exceptions: a previous release every consumer pins by revision,
+        // and a published one (a tag or a `record:` note names its commit).
+        // `include`, `drop`, `advance` and `rebase` all refuse to edit either —
+        // the edit would reach nobody, or move what was published — and send
+        // the operator here. A verbatim cut under a new dated name is then the
+        // only editable composition, so it is allowed and says why; the edits
+        // and the re-pin follow it. The name has to be genuinely new: a fixed
+        // branch has no other name to take (a dated name that does not sort
+        // after the previous cut was refused above).
+        if let Some((previous_ref, previous_tip)) = &previous {
             let publish_remote = entry.publish_remote();
             let published = tips.get(&BookmarkRef::Remote {
                 branch: previous_ref.branch().clone(),
@@ -198,9 +199,25 @@ pub(crate) fn run_release(
                     matches!(scheme, ReleaseScheme::Dated | ReleaseScheme::Series(_))
                         && release::repair_effect(&pins, previous_ref.branch(), Some(published))
                             == release::RepairEffect::NewDatedName;
+                let published_previous = release::published_release(
+                    &opened,
+                    &gate.ledger.read()?.entries,
+                    release::ReleaseAt {
+                        scheme: &scheme,
+                        name: previous_ref.branch().as_str(),
+                        commits: &[Some(published), Some(previous_tip)],
+                    },
+                )?;
                 if frozen_previous {
                     println!(
                         "{repo}: {name} starts identical to {}@{publish_remote} ({}); every pin of {} is frozen, so this new name is the composition to edit — `include`, `advance`, `drop` or `rebase` it before pushing",
+                        previous_ref.branch(),
+                        published.short(),
+                        previous_ref.branch()
+                    );
+                } else if let Some(evidence) = published_previous {
+                    println!(
+                        "{repo}: {name} starts identical to {}@{publish_remote} ({}); {} is published ({evidence}), so this new name is the composition to edit — `include`, `advance`, `drop` or `rebase` it before pushing",
                         previous_ref.branch(),
                         published.short(),
                         previous_ref.branch()
@@ -484,6 +501,12 @@ fn report_uncarried_cut(
     on_drop: DropDisposition,
 ) -> Option<Exit> {
     let recorded = recorded?;
+    for (member, twin) in &check.twins {
+        println!(
+            "{repo}: {member} is carried by {}, which has the same tree",
+            twin.short()
+        );
+    }
     for member in &check.inconclusive {
         println!(
             "  {}: recorded by the {} cut; carry check inconclusive (replay conflicted; \
@@ -816,6 +839,7 @@ fn refuse_stacked_first_cut(
         repo: opened,
         trunks: &trunks,
         releases: &releases,
+        carried: &[],
     };
     let mut refused = false;
     for (branch, tip) in carried {

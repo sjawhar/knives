@@ -16,7 +16,8 @@ use knives::ids::{ReleaseScheme, RepoName};
 use knives::release_model::{BranchSuccessions, carried_from_tips, trunk_positions};
 
 use super::release_edit::{
-    EditRecord, earlier_writes, record_edit_event, release_is_locally_movable, report_replaced,
+    EditRecord, earlier_writes, published_refusal, record_edit_event, release_is_locally_movable,
+    report_replaced,
 };
 
 /// Rebase the whole composition onto an upstream commit: `jj rebase -b <release> -d <target>`.
@@ -115,6 +116,20 @@ pub(crate) fn run_rebase(
     ) {
         return Ok(exit);
     }
+    let ledger = knives::ledger::Ledger::for_fork(fork).read()?.entries;
+    if let Some(refusal) = published_refusal(
+        &opened,
+        &ledger,
+        release::ReleaseAt {
+            scheme: &scheme,
+            name: &release_name,
+            commits: &[Some(&release_commit), plan.published.as_ref()],
+        },
+        ("rebasing", "rebase"),
+    )? {
+        println!("{repo}: {refusal}");
+        return Ok(Exit::Incomplete);
+    }
     let context = RebaseContext {
         repo,
         entry,
@@ -136,8 +151,33 @@ pub(crate) fn run_rebase(
         return Ok(Exit::Incomplete);
     }
     shed_stale_bases(fork, (&release_name, &release_commit), &members, shed)?;
+    // Every other release name stays where it is: the rebase rewrites each
+    // descendant of a moved member, earlier release merges among them.
+    let other_releases: Vec<(String, knives::ids::CommitId)> = opened
+        .bookmark_tips()?
+        .into_iter()
+        .filter_map(|(reference, commit)| match reference {
+            knives::ids::BookmarkRef::Local(branch)
+                if branch.as_str() != release_name && scheme.owns(branch.as_str()) =>
+            {
+                Some((branch.to_string(), commit))
+            }
+            knives::ids::BookmarkRef::Local(_) | knives::ids::BookmarkRef::Remote { .. } => None,
+        })
+        .collect();
     let tagged = knives::jj::tagged_commits_a_rebase_copies(path, &release_name, &onto)?;
     knives::jj::rebase_branch_onto(path, &release_name, &onto)?;
+    let restored = knives::jj::restore_local_bookmarks(
+        path,
+        &other_releases,
+        &format!("knives: {release_name}: keep every other release where it was"),
+    )?;
+    for (name, commit) in &restored {
+        println!(
+            "{repo}: {name} stays at {}: a rebase moves only the release in hand and its members",
+            commit.short()
+        );
+    }
     report_rebased_release(
         fork,
         &RebasedRelease {
@@ -150,13 +190,19 @@ pub(crate) fn run_rebase(
     )?;
     // After the provenance is recorded, so a failed cleanup cannot leave the
     // rebased release described with its pre-rebase parents.
+    let mut originals = tagged;
+    for (_, commit) in &restored {
+        if !originals.contains(commit) {
+            originals.push(commit.clone());
+        }
+    }
     let copies = knives::jj::abandon_tagged_copies(
         path,
-        &tagged,
+        &originals,
         &onto,
-        &format!("knives: {release_name}: abandon rebased copies of tagged releases"),
+        &format!("knives: {release_name}: abandon rebased copies of earlier releases"),
     )?;
-    report_tagged_copies(repo, &copies);
+    report_tagged_copies(repo, &copies, &restored);
     if no_drop {
         return Ok(Exit::Ok);
     }
@@ -732,18 +778,30 @@ fn report_rebased_release(
     Ok(())
 }
 
-/// One line per copy the rebase made of an earlier tagged release: abandoned,
-/// or kept with a note naming what rests on it.
-fn report_tagged_copies(repo: &RepoName, copies: &[knives::jj::TaggedCopy]) {
+/// One line per copy the rebase made of an earlier release — tagged, or named
+/// by a release bookmark put back on it: abandoned, or kept with a note naming
+/// what rests on it.
+fn report_tagged_copies(
+    repo: &RepoName,
+    copies: &[knives::jj::TaggedCopy],
+    restored: &[(String, knives::ids::CommitId)],
+) {
     for copy in copies {
+        let mut names: Vec<String> = copy.tags.iter().map(|tag| format!("tag {tag}")).collect();
+        names.extend(
+            restored
+                .iter()
+                .filter(|(_, commit)| *commit == copy.original)
+                .map(|(name, _)| name.clone()),
+        );
         let of = format!(
-            "the rebased copy of {} (tag {})",
+            "the rebased copy of {} ({})",
             copy.original.short(),
-            copy.tags.join(", ")
+            names.join(", ")
         );
         match &copy.kept {
             None => println!(
-                "{repo}: abandoned {}, {of}; the tag still names the original",
+                "{repo}: abandoned {}, {of}; the original keeps its name",
                 copy.copy.short()
             ),
             Some(reason) => println!("{repo}: note: kept {}, {of}: {reason}", copy.copy.short()),

@@ -13,9 +13,9 @@ use knives::forge::github::CliForge;
 use knives::ids::{BranchName, CommitId, ReleaseScheme, RepoName};
 use knives::ledger::{Draft, Kind, Ledger};
 use knives::release_model::{
-    MemberEvidence, MemberLookup, MemberSuccession, SeriesFit, StackedHistoryContext,
-    carried_from_tips, last_recorded_parents, member_parents, members_event_text, series_fit,
-    trunk_positions,
+    MemberEvidence, MemberHistory, MemberLookup, MemberSuccession, SeriesFit,
+    StackedHistoryContext, carried_from_tips, last_recorded_parents, member_history,
+    member_parents, members_event_text, series_fit, trunk_positions,
 };
 
 use super::scribe_for;
@@ -143,29 +143,45 @@ impl EditContext<'_> {
         }
     }
 
-    /// Refuse a branch whose history past the trunk carries a merge, saying so;
-    /// `false` for a linear one.
+    /// Refuse, saying why, a branch whose history past the trunk carries more
+    /// than its own line: `None` after refusing. Otherwise whether its history
+    /// carries merges whose side lines the release in hand already carries,
+    /// said once when it does.
     ///
     /// Membership is the parent set, and a parent that carries a release merge
     /// carries every member of that release: the cut is not flat however many
     /// parents it lists, and the plan would report the member the moment it got
     /// in. Refusing here is what keeps the plan from pointing at an `include`
-    /// it would then flag.
-    fn refuse_if_stacked(
+    /// it would then flag. A merge of lines the release already carries brings
+    /// nothing but the branch's own commits ([`member_history`]), so it is
+    /// admitted and named.
+    fn admit_history(
         &self,
         branch: &str,
         tip: &knives::ids::CommitId,
         before: &str,
-    ) -> anyhow::Result<bool> {
-        let Some(stacked) = knives::release_model::stacked_history(self.stacked, branch, tip)?
-        else {
-            return Ok(false);
-        };
-        println!(
-            "{}: {}; rebase it off the trunk before {before}",
-            self.repo, stacked.detail
-        );
-        Ok(true)
+    ) -> anyhow::Result<Option<bool>> {
+        match member_history(self.stacked, branch, tip)? {
+            MemberHistory::Linear => Ok(Some(false)),
+            MemberHistory::CarriedMerges { merges, own } => {
+                let listed: Vec<&str> = merges.iter().map(knives::ids::CommitId::short).collect();
+                println!(
+                    "{}: {branch}'s history carries merge(s) {} whose other lines {} already \
+                     carries; it brings only its own {own} commit(s)",
+                    self.repo,
+                    listed.join(", "),
+                    self.release.name
+                );
+                Ok(Some(true))
+            }
+            MemberHistory::Stacked(stacked) => {
+                println!(
+                    "{}: {}; rebase it off the trunk before {before}",
+                    self.repo, stacked.detail
+                );
+                Ok(None)
+            }
+        }
     }
 
     /// Which current parents `branch`, at `tip`, continues, and on what evidence.
@@ -246,6 +262,59 @@ pub(crate) fn run_release_edit(
     )
 }
 
+/// Why a published dated release must not move ([`release::published_release`]),
+/// as the line to print after the repo name, or `None`. `verb` is the gerund
+/// and the imperative of the move refused.
+pub(crate) fn published_refusal(
+    opened: &knives::jj::Repo,
+    ledger: &[knives::ledger::Entry],
+    release: release::ReleaseAt<'_>,
+    (doing, todo): (&str, &str),
+) -> anyhow::Result<Option<String>> {
+    Ok(
+        release::published_release(opened, ledger, release)?.map(|evidence| {
+            format!(
+                "{} is published ({evidence}); {doing} it would move a published release: cut a \
+                 new dated release first, then {todo} that",
+                release.name
+            )
+        }),
+    )
+}
+
+/// Refuse, saying so, an edit of a release every pin of which is frozen:
+/// `true` after refusing. Follows from who pins it, exactly as for a rebase: a
+/// consumer that follows the branch sees the edit, one frozen on a revision
+/// does not. The way out differs by scheme, because a fixed branch cannot take
+/// a dated name.
+fn refuse_if_frozen(
+    repo: &RepoName,
+    scheme: &ReleaseScheme,
+    plan: &release::Plan,
+    release_name: &str,
+) -> bool {
+    if release::repair_effect(
+        &plan.pins,
+        knives::ids::BookmarkRef::parse(release_name).branch(),
+        plan.published.as_ref(),
+    ) != release::RepairEffect::NewDatedName
+    {
+        return false;
+    }
+    match scheme {
+        ReleaseScheme::Dated | ReleaseScheme::Series(_) => println!(
+            "{repo}: every pin of {release_name} is frozen, so editing it would reach nobody; \
+             cut a new dated release first"
+        ),
+        ReleaseScheme::Fixed(_) => println!(
+            "{repo}: every pin of {release_name} is frozen, so editing the fixed branch would \
+             reach nobody; update the frozen consumer pins, or change the release scheme before \
+             editing it (fixed branches cannot reach revision pins)"
+        ),
+    }
+    true
+}
+
 /// Edit the release in hand: one change, nothing else moves.
 ///
 /// The whole command is the jj sequence agents fumble — duplicate the release
@@ -289,26 +358,7 @@ fn edit_release(
         println!("{repo}: no release to edit; cut one first");
         return Ok(Exit::Incomplete);
     };
-    // Follows from who pins it, exactly as for a rebase: a consumer that follows
-    // the branch sees the edit, one frozen on a revision does not. The way out
-    // differs by scheme, because a fixed branch cannot take a dated name.
-    if release::repair_effect(
-        &plan.pins,
-        knives::ids::BookmarkRef::parse(&release_name).branch(),
-        plan.published.as_ref(),
-    ) == release::RepairEffect::NewDatedName
-    {
-        match entry.release_scheme() {
-            ReleaseScheme::Dated | ReleaseScheme::Series(_) => println!(
-                "{repo}: every pin of {release_name} is frozen, so editing it would reach \
-                 nobody; cut a new dated release first"
-            ),
-            ReleaseScheme::Fixed(_) => println!(
-                "{repo}: every pin of {release_name} is frozen, so editing the fixed branch \
-                 would reach nobody; update the frozen consumer pins, or change the release \
-                 scheme before editing it (fixed branches cannot reach revision pins)"
-            ),
-        }
+    if refuse_if_frozen(repo, &entry.release_scheme(), &plan, &release_name) {
         return Ok(Exit::Incomplete);
     }
     // Fail closed: parents are classified against the upstream trunk, and an
@@ -329,11 +379,25 @@ fn edit_release(
     let release = ReleaseInHand::read(&opened, entry, release_name)?;
     // The pulled plan refused on any problem this read finds.
     let ledger = Ledger::for_fork(fork).read()?.entries;
+    if let Some(refusal) = published_refusal(
+        &opened,
+        &ledger,
+        release::ReleaseAt {
+            scheme: &entry.release_scheme(),
+            name: &release.name,
+            commits: &[Some(&release.commit), plan.published.as_ref()],
+        },
+        ("editing", "edit"),
+    )? {
+        println!("{repo}: {refusal}");
+        return Ok(Exit::Incomplete);
+    }
     let releases = knives::release_model::release_refs_by_commit(
         &opened.bookmark_tips()?,
         &entry.release_scheme(),
         entry.publish_remote(),
     );
+    let in_hand = [release.commit.clone()];
     let context = EditContext {
         repo,
         opened: &opened,
@@ -345,6 +409,7 @@ fn edit_release(
             repo: &opened,
             trunks: &release.trunk_tips,
             releases: &releases,
+            carried: &in_hand,
         },
     };
     let outcome = match change {
@@ -604,14 +669,26 @@ fn include_edit(
     if context.refuse_if_other_series(target, &tip, "including it")? {
         return Ok(EditOutcome::Settled(Exit::Incomplete));
     }
-    if context.refuse_if_stacked(target, &tip, "including it")? {
+    let Some(merged) = context.admit_history(target, &tip, "including it")? else {
         return Ok(EditOutcome::Settled(Exit::Incomplete));
-    }
+    };
     let lookup = context.member_parents(target, &tip)?;
     if context.refuse_if_trunk_has(target, &tip, lookup.parents.first())? {
         return Ok(EditOutcome::Settled(Exit::Incomplete));
     }
-    if let Some(parent) = lookup.parents.first() {
+    // A branch that merges several members is a new member built on them, not
+    // a later state of any one of them: they stay, and it joins beside them.
+    let integrates =
+        merged && lookup.evidence == MemberEvidence::Succession && lookup.parents.len() > 1;
+    if integrates {
+        let listed: Vec<&str> = lookup.parents.iter().map(CommitId::short).collect();
+        println!(
+            "{repo}: {target} builds on {} members of {} ({}), which stay members",
+            lookup.parents.len(),
+            release.name,
+            listed.join(", ")
+        );
+    } else if let Some(parent) = lookup.parents.first() {
         // Moving a member is its own decision, and including it again would
         // carry it twice; say which situation the record describes.
         let parent = parent.short();
@@ -802,8 +879,27 @@ fn advance_every_member(
         if opened.is_ancestor(&release.commit, tip)? {
             continue;
         }
-        if context.refuse_if_stacked(branch, tip, "advancing onto it")? {
-            continue;
+        match member_history(context.stacked, branch, tip)? {
+            MemberHistory::Linear => {}
+            // Admitted when named; a bare advance would read a branch that
+            // merges several members as the successor of each.
+            MemberHistory::CarriedMerges { .. } => {
+                if !release.parents.contains(tip) {
+                    println!(
+                        "{repo}: {branch}'s history carries merges of lines {} already \
+                         carries; a bare advance leaves it alone: advance or include it by name",
+                        release.name
+                    );
+                }
+                continue;
+            }
+            MemberHistory::Stacked(stacked) => {
+                println!(
+                    "{repo}: {}; rebase it off the trunk before advancing onto it",
+                    stacked.detail
+                );
+                continue;
+            }
         }
         off_release.push((branch.clone(), tip.clone()));
     }
@@ -928,7 +1024,10 @@ fn advance_named_members(
         if context.refuse_if_other_series(branch.as_str(), &tip, "advancing onto it")? {
             return Ok(None);
         }
-        if context.refuse_if_stacked(branch.as_str(), &tip, "advancing onto it")? {
+        if context
+            .admit_history(branch.as_str(), &tip, "advancing onto it")?
+            .is_none()
+        {
             return Ok(None);
         }
         // Matched by commit rather than by position, so no index invariant has to
@@ -1030,7 +1129,10 @@ fn advance_named_member_from(
     if context.refuse_if_other_series(branch.as_str(), &tip, "advancing onto it")? {
         return Ok(None);
     }
-    if context.refuse_if_stacked(branch.as_str(), &tip, "advancing onto it")? {
+    if context
+        .admit_history(branch.as_str(), &tip, "advancing onto it")?
+        .is_none()
+    {
         return Ok(None);
     }
     if context.refuse_if_trunk_has(branch.as_str(), &tip, Some(old))? {

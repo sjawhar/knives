@@ -28,6 +28,7 @@ Bare `release members` answers neither for older releases. It sees only the curr
 
 - A member must carry no merge past known trunk positions: `<trunk>@upstream`, `<trunk>@origin` and local trunk. A branch built on a release merge carries all parents of that merge.
 - `include`, `advance` and the first `cut` refuse such `stacked-history`. Planning reports existing stacked members. A merge that a trunk position reaches belongs to trunk. If every local view lags the branch base, the detail says that these can be upstream merges. `sync` fetches them.
+- The exception: a merge whose side parents (every parent after the first) the release in hand already carries, and that no release ref names. The branch then brings only its own line (`git rev-list <branch> ^<release>`). `include` and a named `advance` take it and name the merge; the plan measures each member against the others and notes it. `include` adds a branch that merges several members beside them, which stay members. A bare `advance` leaves such a branch alone. A merge whose side parent the release lacks still refuses, and the refusal lists every commit the branch would bring.
 - After that merge was pushed anywhere, `jj rebase -b <branch> -d <trunk>` is not the remedy, because it rewrites the merge. Rebase only the branch's own commits, from the ref that the gate found:
 
 ```text
@@ -71,14 +72,15 @@ jj rebase -s '<release-or-keep-ref>..<branch>' -d <trunk>@upstream
 1. A dated name must sort after the newest release. A reused name, an older date or an older suffix is refused before the build, exit `3`, because reap keeps only the newest name.
 2. The orphan gate refuses to strand commits that only the previous lineage reaches. `--allow-drop` states the intended exception. After the reap, the cut says what it dropped: a commit it does not carry counts as dropped only when it is no longer visible. Such commits rest on the previous cut, so the reap usually keeps that cut and drops nothing.
 3. Before the content audit, knives compares the candidate with the previous published cut. The **same tree and parents** is refused as identical, exit `3`, except as below. New members come through `include`, new tips through `advance`, and a new base through `rebase`, not through a new name.
-4. The composition gate reads the ledger event of the previous cut, which survives a moved bookmark. Each recorded member must be a parent or an ancestor of a member or the base. Otherwise it needs a reachable rewrite of its change id, or its net diff in the candidate tree. A member that came through upstream base passes.
+4. The composition gate reads the ledger event of the previous cut, which survives a moved bookmark. Each recorded member must be a parent or an ancestor of a member or the base. Otherwise it needs a reachable rewrite of its change id, a commit with exactly its tree reachable from a parent (a history recreated outside jj; the cut names the twin), or its net diff in the candidate tree. A member that came through upstream base passes.
 5. A missing member refuses the cut, however it was lost: a merge rebuilt by hand, a moved bookmark, or a `drop` since the last cut. A recorded commit that does not resolve counts as dropped.
 
 `--allow-drop` states that the drop is intended. It is not a remedy for a refusal. The new cut event names the dropped members. Keep the reason and its dependency effects.
 
 ### Identical-cut exceptions
 
-- When **every pin of the previous dated release is frozen**, a new later dated name can start identical, exit `0`. It says to `include`, `advance`, `drop` or `rebase` **before you push**. It is the composition to edit, not identical content to publish.
+- When **every pin of the previous dated release is frozen**, or the previous dated release is **published**, a new later dated name can start identical, exit `0`. It says to `include`, `advance`, `drop` or `rebase` **before you push**. It is the composition to edit, not identical content to publish.
+- A dated release is published when a tag names its local or publish-remote commit, or a `record:` note on the release names that commit. `include`, `drop`, `advance` and `rebase` refuse a published release, exit `3`, and name what marks it: cut a new dated name first, then edit that.
 - A fixed release has a **ledger-recording** path instead. It applies when the last cut event is missing or names a different commit than the published branch. Then `cut` audits that published composition, runs the composition and drop checks, and records that commit as the cut. It makes no commit and pushes nothing. Weak evidence can still give findings. When the ledger already records that commit, an identical cut is refused.
 - A member rewritten to the same content is a new parent, so it is a new composition. The comparison is with the published copy. An unpushed previous cut is not compared.
 
@@ -95,10 +97,10 @@ Cut and edit events keep full parent commits, every bookmark on them, and the co
 
 ## `knives release rebase [REF]`
 
-- Moves members and the release merge onto the target. Bookmarks and workspaces follow, and recorded resolutions replay. It does not authorize a broad raw rebase.
+- Moves members and the release merge onto the target. Member bookmarks and workspaces follow, and recorded resolutions replay. Every other release name stays on its commit, and the output says so. It does not authorize a broad raw rebase.
 - Bare, it targets the first upstream trunk commit that holds the merge commits of all our PRs that **merged, not closed**. With none merged, there is no default, so give a commit.
 - A merge commit missing from local trunk refuses until `sync`. An outdated knives immutability rule refuses before any move and names `start <branch>` to refresh it.
-- Earlier published releases keep their tags and commit ids. Untagged copies from the rebase are abandoned together and reported. A copy stays when a bookmark, a workspace working copy, or a descendant outside the set rests on it. A note says why. Copies stacked only on each other go together.
+- Earlier releases keep their tags, names and commit ids. The rebase's copies of them that nothing rests on are abandoned together and reported. A copy stays when a bookmark, a workspace working copy, or a descendant outside the set rests on it. A note says why. Copies stacked only on each other go together.
 - After a bare rebase, also a no-op, members with merged PRs and no work past the target are removed, with the reason recorded. `--no-drop` keeps them. A branch with later work stays and says so.
 - An unheld stale parent refuses, exit `3`. The refusal names its continuing branch and `advance`, or `drop` when none continues. A legacy trunk parent is shed, because base is not membership.
 - When every member merged, rebase refuses to leave trunk as the only parent. A drop of the last parent also refuses. Reap the composition or include new work.

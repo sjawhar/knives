@@ -1219,3 +1219,40 @@ fn a_rebase_refuses_under_the_tag_pinning_rule_an_earlier_knives_start_wrote() {
     );
     assert_eq!(copies_of(&lab, &tagged), Vec::<String>::new());
 }
+
+#[test]
+fn a_rebase_leaves_every_other_release_where_it_was() {
+    // Given: two releases of the same members, the older still named, and an
+    // advanced upstream. `jj rebase -b` rewrites every descendant of the moved
+    // members, the older release merge among them.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    lab.octopus("release/2026-08-04", "feat/alpha", "feat/beta");
+    lab.octopus("release/2026-08-05", "feat/alpha", "feat/beta");
+    let older = commit_at(&lab, "release/2026-08-04");
+    let (home, _consumer) = release_test_home(&lab);
+    lab.advance_upstream("advance\n");
+
+    // When: the release in hand is rebased.
+    let output = knives_release(&lab, &home, &["rebase", "main@upstream"]);
+
+    // Then: the older release still names its commit, said so, and its
+    // rewritten copy, which nothing rests on, is gone.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(commit_at(&lab, "release/2026-08-04"), older, "{stdout}");
+    assert!(
+        stdout.contains(&format!(
+            "demo: release/2026-08-04 stays at {}: a rebase moves only the release in hand and \
+             its members\n",
+            older.short()
+        )),
+        "{stdout}"
+    );
+    assert_eq!(copies_of(&lab, &older), Vec::<String>::new(), "{stdout}");
+}

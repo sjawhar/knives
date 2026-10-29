@@ -641,6 +641,7 @@ fn settle_rows_after_phases(
                 repo: input.repo,
                 trunks: &trunks,
                 releases: &releases,
+                carried: &[],
             },
             input.tips,
         )?);
