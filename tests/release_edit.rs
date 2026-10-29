@@ -1245,3 +1245,185 @@ fn a_drop_keeps_the_replaced_cut_while_an_untracked_publish_ref_names_it() {
         "{dropped}"
     );
 }
+
+/// How a release is marked published in the tests below.
+#[derive(Clone, Copy, Debug)]
+enum Published {
+    /// A tag names the release commit, as a forge release leaves one.
+    Tag,
+    /// A `record:` note on the release names its commit.
+    RecordNote,
+}
+
+/// A pushed cut of alpha and beta, marked published, and `feat/gamma` ready to
+/// include. Returns the lab, its home and the published commit.
+fn published_cut(published: Published) -> (Lab, tempfile::TempDir, knives::ids::CommitId) {
+    let (lab, home, _consumer) = two_branch_cut();
+    lab.push_branch("release/2026-08-04");
+    let cut = commit_at(&lab, "release/2026-08-04");
+    match published {
+        Published::Tag => lab.jj_work(["tag", "set", "v1.0.0", "-r", "release/2026-08-04"]),
+        Published::RecordNote => {
+            let noted = lab::knives(
+                &lab,
+                &home,
+                &[
+                    "notch",
+                    "release/2026-08-04",
+                    "-m",
+                    "record: published as v1.0.0",
+                    "--evidence",
+                    cut.as_str(),
+                    "--repo",
+                    "demo",
+                ],
+            );
+            assert!(noted.status.success(), "{noted:?}");
+        }
+    }
+    lab.branch("feat/gamma", "gamma.txt", "gamma\n");
+    (lab, home, cut)
+}
+
+/// What the published-release refusal and the identical-cut note say marks it.
+fn published_evidence(published: Published, cut: &knives::ids::CommitId) -> String {
+    match published {
+        Published::Tag => format!("tag v1.0.0 names {}", cut.short()),
+        Published::RecordNote => format!("a record: published note names {}", cut.short()),
+    }
+}
+
+#[test]
+fn an_edit_refuses_to_move_a_published_release() {
+    for published in [Published::Tag, Published::RecordNote] {
+        // Given: a published release in hand.
+        let (lab, home, cut) = published_cut(published);
+
+        // When: it is edited.
+        let output = knives_release(&lab, &home, &["include", "feat/gamma"]);
+
+        // Then: refused, saying what marks it published and the way forward;
+        // its bookmark stays where it was published.
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(output.status.code(), Some(3), "{published:?}: {stdout}");
+        assert!(
+            stdout.contains(&format!(
+                "demo: release/2026-08-04 is published ({}); editing it would move a published \
+                 release: cut a new dated release first, then edit that\n",
+                published_evidence(published, &cut)
+            )),
+            "{published:?}: {stdout}"
+        );
+        assert_eq!(commit_at(&lab, "release/2026-08-04"), cut, "{published:?}");
+    }
+}
+
+#[test]
+fn a_published_release_is_cut_identical_under_a_new_name_which_the_edit_then_moves() {
+    for published in [Published::Tag, Published::RecordNote] {
+        // Given: a published release in hand.
+        let (lab, home, cut) = published_cut(published);
+
+        // When: a new dated name is cut from it unchanged, then edited.
+        let next = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
+        let included = knives_release(&lab, &home, &["include", "feat/gamma"]);
+
+        // Then: the identical cut is allowed and says why; its reap retires the
+        // published name locally (the tag keeps a tagged commit); and the edit
+        // moves the new name only.
+        let next_stdout = String::from_utf8_lossy(&next.stdout);
+        assert!(
+            next.status.success()
+                && next_stdout.contains(&format!(
+                    "demo: release/2026-08-05 starts identical to release/2026-08-04@origin ({}); \
+                     release/2026-08-04 is published ({}), so this new name is the composition \
+                     to edit",
+                    cut.short(),
+                    published_evidence(published, &cut)
+                ))
+                && next_stdout.contains("demo: reaped release/2026-08-04 ("),
+            "{published:?}: {next_stdout}"
+        );
+        let included_stdout = String::from_utf8_lossy(&included.stdout);
+        assert!(
+            included.status.success()
+                && included_stdout.contains("demo: release/2026-08-05 now has 3 parent(s)"),
+            "{published:?}: {included_stdout}"
+        );
+        if matches!(published, Published::Tag) {
+            assert_eq!(commit_at(&lab, "v1.0.0"), cut, "{published:?}");
+        }
+    }
+}
+
+#[test]
+fn a_release_published_only_at_its_pushed_position_is_refused() {
+    // Given: a pushed cut, tagged only as pushed, then the local name moved by
+    // an edit before the tag appeared.
+    let (lab, home, _consumer) = two_branch_cut();
+    lab.push_branch("release/2026-08-04");
+    let pushed = commit_at(&lab, "release/2026-08-04");
+    lab.branch("feat/gamma", "gamma.txt", "gamma\n");
+    let included = knives_release(&lab, &home, &["include", "feat/gamma"]);
+    assert!(included.status.success(), "{included:?}");
+    lab.jj_work(["tag", "set", "v1.0.0", "-r", pushed.as_str()]);
+    lab.branch("feat/delta", "delta.txt", "delta\n");
+    let local = commit_at(&lab, "release/2026-08-04");
+
+    // When: edited again.
+    let output = knives_release(&lab, &home, &["include", "feat/delta"]);
+
+    // Then: refused for the published position, and nothing moves.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(3), "{stdout}");
+    assert!(
+        stdout.contains(&format!(
+            "release/2026-08-04 is published (tag v1.0.0 names {})",
+            pushed.short()
+        )),
+        "{stdout}"
+    );
+    assert_eq!(commit_at(&lab, "release/2026-08-04"), local);
+}
+
+#[test]
+fn a_record_note_that_does_not_mark_this_commit_published_does_not_block_an_edit() {
+    // Given: a `record: published` note naming an older commit, and a
+    // `record:` row of another kind naming the release in hand.
+    let (lab, home, _consumer) = two_branch_cut();
+    let cut = commit_at(&lab, "release/2026-08-04");
+    for (text, evidence) in [
+        (
+            "record: published as v0.9.0",
+            "0123456789abcdef0123456789abcdef01234567",
+        ),
+        ("record: drop sweep verdict, carried", cut.as_str()),
+    ] {
+        let noted = lab::knives(
+            &lab,
+            &home,
+            &[
+                "notch",
+                "release/2026-08-04",
+                "-m",
+                text,
+                "--evidence",
+                evidence,
+                "--repo",
+                "demo",
+            ],
+        );
+        assert!(noted.status.success(), "{noted:?}");
+    }
+    lab.branch("feat/gamma", "gamma.txt", "gamma\n");
+
+    // When: edited.
+    let output = knives_release(&lab, &home, &["include", "feat/gamma"]);
+
+    // Then: the edit goes ahead.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("release/2026-08-04 now has 3 parent(s)"),
+        "{stdout}"
+    );
+}

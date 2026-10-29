@@ -1219,3 +1219,96 @@ fn a_rebase_refuses_under_the_tag_pinning_rule_an_earlier_knives_start_wrote() {
     );
     assert_eq!(copies_of(&lab, &tagged), Vec::<String>::new());
 }
+
+/// Two releases of the same members, the older pushed when `push_older`, and an
+/// advanced upstream. `jj rebase -b` rewrites every descendant of the moved
+/// members, the older release merge among them.
+fn two_releases_then_rebase(push_older: bool) -> (Lab, knives::ids::CommitId, String) {
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    lab.octopus("release/2026-08-04", "feat/alpha", "feat/beta");
+    if push_older {
+        lab.push_branch("release/2026-08-04");
+    }
+    lab.octopus("release/2026-08-05", "feat/alpha", "feat/beta");
+    let older = commit_at(&lab, "release/2026-08-04");
+    let (home, _consumer) = release_test_home(&lab);
+    lab.advance_upstream("advance\n");
+    let output = knives_release(&lab, &home, &["rebase", "main@upstream"]);
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(
+        output.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    (lab, older, stdout)
+}
+
+#[test]
+fn a_rebase_leaves_a_pushed_older_release_where_it_was() {
+    // Given/When: a pushed older release, then the release in hand rebased.
+    let (lab, older, stdout) = two_releases_then_rebase(true);
+
+    // Then: the older release still names its commit, said so, and its
+    // rewritten copy, which nothing rests on, is gone.
+    assert_eq!(commit_at(&lab, "release/2026-08-04"), older, "{stdout}");
+    assert!(
+        stdout.contains(&format!(
+            "demo: release/2026-08-04 stays at {}: it is pushed or published, and a rebase \
+             moves only the release in hand and its members\n",
+            older.short()
+        )),
+        "{stdout}"
+    );
+    assert_eq!(copies_of(&lab, &older), Vec::<String>::new(), "{stdout}");
+}
+
+#[test]
+fn a_rebase_takes_a_never_pushed_older_release_along() {
+    // Given/When: an older release nobody pushed, then the release in hand
+    // rebased.
+    let (lab, older, stdout) = two_releases_then_rebase(false);
+
+    // Then: the name follows its rewrite, said so, and the old members do not
+    // come back beside their rebased copies.
+    assert_ne!(commit_at(&lab, "release/2026-08-04"), older, "{stdout}");
+    assert!(
+        stdout.contains(
+            "demo: release/2026-08-04 follows the rebase: it was never pushed or published\n"
+        ),
+        "{stdout}"
+    );
+    let divergent = knives::jj::commits_matching(&lab.work, "divergent()").expect("divergent");
+    assert!(divergent.is_empty(), "{divergent:?}\n{stdout}");
+}
+
+#[test]
+fn a_rebase_refuses_a_published_release() {
+    // Given: a pushed release a tag names, and an advanced upstream.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    lab.octopus("release/2026-08-04", "feat/alpha", "feat/beta");
+    lab.push_branch("release/2026-08-04");
+    lab.jj_work(["tag", "set", "v1.0.0", "-r", "release/2026-08-04"]);
+    let cut = commit_at(&lab, "release/2026-08-04");
+    let (home, _consumer) = release_test_home(&lab);
+    lab.advance_upstream("advance\n");
+
+    // When: it is rebased.
+    let output = knives_release(&lab, &home, &["rebase", "main@upstream"]);
+
+    // Then: refused, naming the tag and the way forward; nothing moves.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(3), "{stdout}");
+    assert!(
+        stdout.contains(&format!(
+            "demo: release/2026-08-04 is published (tag v1.0.0 names {}); rebasing it would \
+             move a published release: cut a new dated release first, then rebase that\n",
+            cut.short()
+        )),
+        "{stdout}"
+    );
+    assert_eq!(commit_at(&lab, "release/2026-08-04"), cut);
+}

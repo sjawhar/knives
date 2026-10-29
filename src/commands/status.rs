@@ -641,6 +641,9 @@ fn settle_rows_after_phases(
                 repo: input.repo,
                 trunks: &trunks,
                 releases: &releases,
+                carried: &[],
+                written: &std::collections::BTreeSet::new(),
+                replaced: None,
             },
             input.tips,
         )?);

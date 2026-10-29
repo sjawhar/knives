@@ -392,6 +392,9 @@ fn branch_states_with_findings(
             repo: &repo,
             trunks: &trunks,
             releases: &releases,
+            carried: &[],
+            written: &std::collections::BTreeSet::new(),
+            replaced: None,
         };
         for (branch, tip) in crate::release_model::carried_from_tips(&tips, entry.trunk(), &scheme)
         {

@@ -8,7 +8,7 @@ Read this whenever you do step 5. Do the five steps in order.
 2. **Compose the intended release** with `release advance`, `include`, `drop --why`, `rebase` and `cut`, under the integration barrier.
    - Advance repaired members to verified heads. Include an unreleased PR only when it is intended and ready to ship.
    - Read the real consumer pins before you select an in-place edit or a new cut. A consumer frozen on an older release does not block an edit of the current one.
-   - When the tool refuses because every pin of the edited release is frozen, cut a new release. Make no parallel lineage and no forced ref move. Keep required old refs reachable. Never cut an identical release only for a new name.
+   - When the tool refuses because every pin of the edited release is frozen, or because the release is published (a tag or a `record: published` note names its commit), cut a new release. Make no parallel lineage and no forced ref move. Keep required old refs reachable. Never cut an identical release only for a new name, except to edit a frozen or published release: that identical cut is the composition you then edit.
    - **Classify each member in the release notch before you compose it**, as one of:
      - `upstream-PR <url>`: an open or merged upstream PR carries it.
      - `upstream-pending, placement <notch anchor or commit>`: its `placement:` notch and commit body record the UPSTREAM verdict and the defect or capability gap. They also record the reproduction or red→green test that its upstream PR opens from.
