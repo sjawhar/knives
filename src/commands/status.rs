@@ -643,6 +643,7 @@ fn settle_rows_after_phases(
                 releases: &releases,
                 carried: &[],
                 written: &std::collections::BTreeSet::new(),
+                replaced: None,
             },
             input.tips,
         )?);

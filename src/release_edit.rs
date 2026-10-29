@@ -172,6 +172,7 @@ impl EditContext<'_> {
             .collect();
         let context = StackedHistoryContext {
             carried: &carried,
+            replaced: replacing.first(),
             ..self.stacked
         };
         match member_history(context, branch, tip)? {
@@ -552,6 +553,7 @@ fn edit_release(
             releases: &releases,
             carried: &release.parents,
             written: &written,
+            replaced: None,
         },
     };
     let outcome = match change {

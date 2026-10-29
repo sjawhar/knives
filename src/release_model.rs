@@ -354,6 +354,10 @@ pub struct StackedHistoryContext<'a> {
     /// release name ([`recorded_release_changes`]): an earlier write no ref
     /// names any more is still a release cut. Read only with `carried`.
     pub written: &'a BTreeSet<crate::ids::ChangeId>,
+    /// The member the branch would replace, left out of `carried` for the
+    /// merge measure and counted when the commits the branch brings are
+    /// listed, so the list holds only what the release would gain.
+    pub replaced: Option<&'a CommitId>,
 }
 
 /// Change ids of every commit the ledger records knives writing under one of
@@ -476,7 +480,9 @@ pub fn member_history(
     bases.extend(context.carried.iter().cloned());
     let (uncarried, brought) = if named.is_empty() && !context.carried.is_empty() {
         let uncarried = context.repo.merges_with_side_lines(&bases, tip)?;
-        let brought = context.repo.commit_ids_between(&bases, tip)?;
+        let mut brought_bases = bases.clone();
+        brought_bases.extend(context.replaced.cloned());
+        let brought = context.repo.commit_ids_between(&brought_bases, tip)?;
         if uncarried.is_empty() {
             return Ok(MemberHistory::CarriedMerges {
                 merges,
@@ -963,6 +969,7 @@ pub fn carries_member_line(
     member_history(
         StackedHistoryContext {
             carried: &others,
+            replaced: Some(member),
             ..context
         },
         branch,

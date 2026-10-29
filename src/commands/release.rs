@@ -922,6 +922,7 @@ pub fn plan(
         releases: &releases,
         carried: &in_hand,
         written: &written,
+        replaced: None,
     });
     if let Some(context) = stacked_context {
         member_histories(context, &parents, &member_parents, &mut plan)?;
@@ -1024,32 +1025,20 @@ struct LocalBranchNotes<'a> {
     recorded: &'a [RecordedParent],
 }
 
-/// Whether `branch`'s history carries merges the release already carries
-/// (`Ok(true)`), none (`Ok(false)`), or more than its own line: `Err` with the
-/// note to print. Without `others` it is measured against the release in hand,
-/// as `include` measures it; with them (the members an `advance` would not
-/// replace), against those, as that `advance` measures it.
+/// Whether `branch`'s history carries merges the release in hand already
+/// carries (`Ok(true)`), none (`Ok(false)`), or more than its own line: `Err`
+/// with the note to print, as `include` measures it.
 fn branch_history_note(
     stacked: Option<StackedHistoryContext<'_>>,
-    others: Option<&[CommitId]>,
     branch: &str,
     tip: &CommitId,
 ) -> anyhow::Result<Result<bool, String>> {
     let Some(context) = stacked else {
         return Ok(Ok(false));
     };
-    let (context, before) = others.map_or((context, "including it"), |others| {
-        (
-            StackedHistoryContext {
-                carried: others,
-                ..context
-            },
-            "advancing onto it",
-        )
-    });
     Ok(match member_history(context, branch, tip)? {
         MemberHistory::Stacked(stacked) => Err(format!(
-            "{}; rebase it off the trunk before {before}",
+            "{}; rebase it off the trunk before including it",
             stacked.detail
         )),
         MemberHistory::CarriedMerges { .. } => Ok(true),
@@ -1082,12 +1071,15 @@ fn merge_branch_verdict(
     let Some(replaced) = crate::release_model::replaced_member(recorded, lookup, branch) else {
         return Ok(Ok(false));
     };
-    let others: Vec<CommitId> = parents
-        .iter()
-        .filter(|parent| *parent != replaced)
-        .cloned()
-        .collect();
-    Ok(branch_history_note(stacked, Some(&others), branch, tip)?.map(|_| false))
+    Ok(
+        match crate::release_model::carries_member_line(members, replaced, (branch, tip))? {
+            MemberHistory::Stacked(stacked) => Err(format!(
+                "{}; rebase it off the trunk before advancing onto it",
+                stacked.detail
+            )),
+            MemberHistory::CarriedMerges { .. } | MemberHistory::Linear => Ok(false),
+        },
+    )
 }
 
 /// One note per local branch a cut will not carry: membership is the release's
@@ -1129,7 +1121,7 @@ fn local_branch_notes(input: &LocalBranchNotes<'_>) -> anyhow::Result<Vec<String
             ));
             continue;
         }
-        let merged = match branch_history_note(stacked, None, branch, tip)? {
+        let merged = match branch_history_note(stacked, branch, tip)? {
             Ok(merged) => merged,
             Err(note) => {
                 notes.push(note);

@@ -841,6 +841,7 @@ fn refuse_stacked_first_cut(
         releases: &releases,
         carried: &[],
         written: &std::collections::BTreeSet::new(),
+        replaced: None,
     };
     let mut refused = false;
     for (branch, tip) in carried {

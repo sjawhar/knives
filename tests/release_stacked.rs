@@ -293,7 +293,7 @@ fn a_named_advance_takes_a_member_whose_merge_brings_an_older_commit_of_another_
     assert!(
         stdout.contains(&format!(
             "demo: feat/alpha's history carries merge(s) {} whose other lines \
-             release/2026-08-04 already carries; it brings only its own 3 commit(s)\n",
+             release/2026-08-04 already carries; it brings only its own 2 commit(s)\n",
             merge.short()
         )),
         "{stdout}"
@@ -570,6 +570,9 @@ fn a_member_that_merged_its_own_old_tip_back_in_is_refused_as_stacked_everywhere
             !stdout.contains("it by name") && !stdout.contains("`knives release advance"),
             "{stdout}"
         );
+        // The old tip is a release parent, so it is not among what the branch
+        // would bring.
+        assert!(!stdout.contains(old.short()), "{stdout}");
     }
     assert_eq!(release_parents(&lab, "release/2026-08-04"), before);
 }
