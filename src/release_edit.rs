@@ -14,8 +14,8 @@ use knives::ids::{BranchName, CommitId, ReleaseScheme, RepoName};
 use knives::ledger::{Draft, Kind, Ledger};
 use knives::release_model::{
     MemberEvidence, MemberHistory, MemberLookup, MemberSuccession, SeriesFit,
-    StackedHistoryContext, carried_from_tips, last_recorded_parents, member_history,
-    member_parents, members_event_text, series_fit, trunk_positions,
+    StackedHistoryContext, carried_from_tips, carries_member_line, last_recorded_parents,
+    member_history, member_parents, members_event_text, series_fit, trunk_positions,
 };
 
 use super::scribe_for;
@@ -245,12 +245,26 @@ impl EditContext<'_> {
             MemberHistory::CarriedMerges { .. } => {
                 if !release.parents.contains(tip) {
                     let lookup = self.member_parents(branch, tip)?;
-                    let verb =
-                        if lookup.parents.len() == 1 && !self.integrates(branch, tip, &lookup)? {
-                            "advance"
-                        } else {
-                            "include"
-                        };
+                    let replaced = (!self.integrates(branch, tip, &lookup)?)
+                        .then(|| {
+                            knives::release_model::replaced_member(self.recorded, &lookup, branch)
+                        })
+                        .flatten();
+                    if let Some(member) = replaced
+                        && let MemberHistory::Stacked(stacked) =
+                            carries_member_line(self.stacked, member, (branch, tip))?
+                    {
+                        println!(
+                            "{repo}: {}; rebase it off the trunk before advancing onto it",
+                            stacked.detail
+                        );
+                        return Ok(false);
+                    }
+                    let verb = if replaced.is_some() {
+                        "advance"
+                    } else {
+                        "include"
+                    };
                     println!(
                         "{repo}: {branch}'s history carries merges of lines {} already \
                          carries; a bare advance leaves it alone: {verb} it by name",
@@ -816,7 +830,22 @@ fn include_edit(
             release.name,
             listed.join(", ")
         );
-    } else if let Some(parent) = lookup.parents.first() {
+    } else if let Some(parent) =
+        knives::release_model::replaced_member(context.recorded, &lookup, target)
+            .or_else(|| lookup.parents.first())
+    {
+        // A successor that carries its member's line past the other members
+        // (its own earlier tip merged back in) is refused by `advance` too.
+        if merged
+            && let MemberHistory::Stacked(stacked) =
+                carries_member_line(context.stacked, parent, (target, &tip))?
+        {
+            println!(
+                "{repo}: {}; rebase it off the trunk before advancing onto it",
+                stacked.detail
+            );
+            return Ok(EditOutcome::Settled(Exit::Incomplete));
+        }
         // Moving a member is its own decision, and including it again would
         // carry it twice; say which situation the record describes.
         let parent = parent.short();
@@ -1136,8 +1165,12 @@ fn advance_named_members(
         let Some(lookup) = context.named_advance_lookup(branch.as_str(), &tip)? else {
             return Ok(None);
         };
-        match lookup.parents.as_slice() {
-            [] => {
+        // One member it continues, or among several the one recorded under
+        // this branch's own name: the others it merged stay.
+        let replaced =
+            knives::release_model::replaced_member(context.recorded, &lookup, branch.as_str());
+        match (lookup.parents.as_slice(), replaced) {
+            ([], _) => {
                 println!(
                     "{repo}: {} carries no parent of {branch}; `knives release include \
                      {branch}` adds it",
@@ -1145,7 +1178,7 @@ fn advance_named_members(
                 );
                 return Ok(None);
             }
-            [parent] => {
+            (_, Some(parent)) => {
                 // Measured against the members it does not replace, as the plan
                 // measures it once it is in.
                 if context
@@ -1163,7 +1196,7 @@ fn advance_named_members(
                 }
                 moved.push(branch.to_string());
             }
-            many => {
+            (many, None) => {
                 let listed: Vec<&str> = many.iter().map(CommitId::short).collect();
                 println!(
                     "{repo}: {branch} descends from {} parents of {} ({}); drop and \

@@ -478,3 +478,98 @@ fn a_bare_advance_sends_a_merge_branch_that_continues_no_member_to_include() {
         "{stdout}"
     );
 }
+
+#[test]
+fn a_member_grown_by_merging_another_member_advances_in_place() {
+    // Given: a release of alpha (a1) and beta (b2), then feat/alpha grown by a
+    // merge with feat/beta and one commit of its own.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let (home, _consumer) = release_test_home(&lab);
+    let first = knives_release(&lab, &home, &["cut", "release/2026-08-04"]);
+    assert!(first.status.success(), "{first:?}");
+    let beta = commit_at(&lab, "feat/beta");
+    lab.jj_work([
+        "new",
+        "feat/alpha",
+        "feat/beta",
+        "-m",
+        "merge beta into alpha",
+    ]);
+    lab.jj_work(["new", "-m", "alpha more"]);
+    std::fs::write(lab.work.join("alpha.txt"), "alpha\nmore\n").expect("write alpha");
+    lab.jj_work(["bookmark", "set", "feat/alpha", "-r", "@"]);
+    lab.jj_work(["new", "main@origin"]);
+    let alpha = commit_at(&lab, "feat/alpha");
+
+    // When: a bare advance, an include, then a named advance.
+    let bare = knives_release(&lab, &home, &["advance"]);
+    let included = knives_release(&lab, &home, &["include", "feat/alpha"]);
+    let advanced = knives_release(&lab, &home, &["advance", "feat/alpha"]);
+
+    // Then: the first two point at advance, which replaces alpha's member and
+    // keeps beta: exactly [alpha's tip, beta].
+    let bare_stdout = String::from_utf8_lossy(&bare.stdout);
+    assert!(
+        bare_stdout.contains("a bare advance leaves it alone: advance it by name"),
+        "{bare_stdout}"
+    );
+    let included_stdout = String::from_utf8_lossy(&included.stdout);
+    assert_eq!(included.status.code(), Some(3), "{included_stdout}");
+    assert!(
+        included_stdout.contains("`knives release advance feat/alpha`"),
+        "{included_stdout}"
+    );
+    let advanced_stdout = String::from_utf8_lossy(&advanced.stdout);
+    assert!(advanced.status.success(), "{advanced_stdout}");
+    let mut parents = release_parents(&lab, "release/2026-08-04");
+    parents.sort();
+    let mut expected = vec![alpha, beta];
+    expected.sort();
+    assert_eq!(parents, expected, "{advanced_stdout}");
+}
+
+#[test]
+fn a_member_that_merged_its_own_old_tip_back_in_is_refused_as_stacked_everywhere() {
+    // Given: a release of alpha (a1) and beta, then feat/alpha rebuilt as a new
+    // commit on the trunk, merged with a1, plus one more commit.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let (home, _consumer) = release_test_home(&lab);
+    let first = knives_release(&lab, &home, &["cut", "release/2026-08-04"]);
+    assert!(first.status.success(), "{first:?}");
+    let old = commit_at(&lab, "feat/alpha");
+    lab.jj_work(["new", "main@origin", "-m", "alpha rebuilt"]);
+    std::fs::write(lab.work.join("alpha2.txt"), "alpha2\n").expect("write alpha2");
+    lab.jj_work(["new", "@", old.as_str(), "-m", "merge old alpha back in"]);
+    lab.jj_work(["new", "-m", "alpha more"]);
+    std::fs::write(lab.work.join("alpha.txt"), "alpha\nmore\n").expect("write alpha");
+    lab.jj_work(["bookmark", "set", "feat/alpha", "-r", "@"]);
+    lab.jj_work(["new", "main@origin"]);
+    let before = release_parents(&lab, "release/2026-08-04");
+
+    // When: a bare advance, an include, then a named advance.
+    let runs = [
+        knives_release(&lab, &home, &["advance"]),
+        knives_release(&lab, &home, &["include", "feat/alpha"]),
+        knives_release(&lab, &home, &["advance", "feat/alpha"]),
+    ];
+
+    // Then: each says it carries its old tip's line and to rebase it off the
+    // trunk; none points at a verb that would refuse it; nothing moves.
+    for run in &runs {
+        let stdout = String::from_utf8_lossy(&run.stdout);
+        assert!(
+            stdout.contains("branch feat/alpha's history past the trunk carries")
+                && stdout.contains("rebase it off the trunk before advancing onto it"),
+            "{stdout}"
+        );
+        assert!(
+            !stdout.contains("it by name") && !stdout.contains("`knives release advance"),
+            "{stdout}"
+        );
+    }
+    assert_eq!(release_parents(&lab, "release/2026-08-04"), before);
+}

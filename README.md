@@ -330,8 +330,9 @@ history carries a release merge (one a release ref names, or one the ledger reco
 writing), or a merge bringing in a line the rest of the release lacks, is reported as
 `stacked-history`, and the plan stops calling the cut `flat`. A merge whose side parents the
 release already carries brings nothing but the member's own line: `include` takes such a
-branch, beside the members it merges, a named `advance` takes one that continues a single
-member, and both name the merge.
+branch beside the members it merges, a named `advance` takes one that continues a member
+(the one the last event recorded under its name, keeping the others it merged), and both
+name the merge.
 
 `knives release members --carries REVISION` compares the revision with every live release and the
 upstream trunk; `knives release members TARGET --carries REVISION` asks exactly one target;

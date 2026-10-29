@@ -1079,7 +1079,7 @@ fn merge_branch_verdict(
     if crate::release_model::integrates(members, recorded, lookup, (branch, tip))? {
         return Ok(Ok(true));
     }
-    let [replaced] = lookup.parents.as_slice() else {
+    let Some(replaced) = crate::release_model::replaced_member(recorded, lookup, branch) else {
         return Ok(Ok(false));
     };
     let others: Vec<CommitId> = parents

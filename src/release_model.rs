@@ -877,18 +877,48 @@ pub fn last_recorded_parents<'a>(entries: &'a [Entry], release: &str) -> &'a [Re
         .unwrap_or_default()
 }
 
+/// The member a successor of `branch` replaces, or `None`.
+///
+/// The one member `lookup` found, or, among several, the one the last event
+/// recorded under this branch's own name (`recorded`). `None` when there is
+/// none, or the members are ambiguous.
+pub fn replaced_member<'a>(
+    recorded: &[RecordedParent],
+    lookup: &'a MemberLookup,
+    branch: &str,
+) -> Option<&'a CommitId> {
+    match lookup.parents.as_slice() {
+        [] => None,
+        [member] => Some(member),
+        many => {
+            let mut own = many
+                .iter()
+                .filter(|member| recorded_under(recorded, member, branch));
+            match (own.next(), own.next()) {
+                (Some(member), None) => Some(member),
+                _ => None,
+            }
+        }
+    }
+}
+
+/// Whether the last event recorded `member` under the bookmark `branch`.
+fn recorded_under(recorded: &[RecordedParent], member: &CommitId, branch: &str) -> bool {
+    recorded.iter().any(|parent| {
+        parent.commit == member.as_str() && parent.branches.iter().any(|name| name == branch)
+    })
+}
+
 /// Whether a merge branch builds on the members it descends from, and so
 /// joins beside them through `include`, rather than continuing one of them.
 ///
 /// The branch's history carries merges the release already carries, and
-/// `lookup` found its members by succession.
-///
-/// Several such members: it merges them. One: it merges that member when it
-/// was not recorded under this branch's own name in the last event
-/// (`recorded`) and, measured against the other members, its history carries
-/// that member's line ([`MemberHistory::Stacked`]). A branch that merged its
-/// own earlier tip back in (a pull after a rebase) is that member's successor,
-/// and `advance` judges it.
+/// `lookup` found its members by succession. A branch one of whose members
+/// the last event recorded under its own name continues that member, however
+/// many others it merged: `advance` replaces that one and measures it against
+/// the rest. Otherwise, several members: it merges them. One: it merges that
+/// member when, measured against the other members, its history carries that
+/// member's line ([`MemberHistory::Stacked`]).
 pub fn integrates(
     context: StackedHistoryContext<'_>,
     recorded: &[RecordedParent],
@@ -896,6 +926,10 @@ pub fn integrates(
     (branch, tip): (&str, &CommitId),
 ) -> Result<bool, jj::JjError> {
     if lookup.evidence != MemberEvidence::Succession
+        || lookup
+            .parents
+            .iter()
+            .any(|member| recorded_under(recorded, member, branch))
         || !matches!(
             member_history(context, branch, tip)?,
             MemberHistory::CarriedMerges { .. }
@@ -905,34 +939,35 @@ pub fn integrates(
     }
     match lookup.parents.as_slice() {
         [] => Ok(false),
-        [member] => {
-            let own = recorded.iter().any(|parent| {
-                parent.commit == member.as_str()
-                    && parent.branches.iter().any(|name| name == branch)
-            });
-            if own {
-                return Ok(false);
-            }
-            let others: Vec<CommitId> = context
-                .carried
-                .iter()
-                .filter(|parent| *parent != member)
-                .cloned()
-                .collect();
-            Ok(matches!(
-                member_history(
-                    StackedHistoryContext {
-                        carried: &others,
-                        ..context
-                    },
-                    branch,
-                    tip
-                )?,
-                MemberHistory::Stacked(_)
-            ))
-        }
+        [member] => Ok(matches!(
+            carries_member_line(context, member, (branch, tip))?,
+            MemberHistory::Stacked(_)
+        )),
         _ => Ok(true),
     }
+}
+
+/// `tip`'s history measured against the members other than `member`, as an
+/// `advance` that replaces `member` measures it.
+pub fn carries_member_line(
+    context: StackedHistoryContext<'_>,
+    member: &CommitId,
+    (branch, tip): (&str, &CommitId),
+) -> Result<MemberHistory, jj::JjError> {
+    let others: Vec<CommitId> = context
+        .carried
+        .iter()
+        .filter(|parent| *parent != member)
+        .cloned()
+        .collect();
+    member_history(
+        StackedHistoryContext {
+            carried: &others,
+            ..context
+        },
+        branch,
+        tip,
+    )
 }
 
 /// The newest structural cut event, optionally scoped to a release name.
