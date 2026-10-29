@@ -1,10 +1,11 @@
 //! `knives release rebase`: move the whole composition onto an upstream commit.
 //!
-//! One ordered gate sequence — frozen pins, stale bases, the target's
-//! provenance, the landed members a bare rebase sheds — around one
-//! `jj rebase -b <release> -d <target>`, with the cleanup of the copies it
-//! makes of earlier tagged releases and the report of what moved. The cut
-//! lives in `release_cut`; the membership verbs in `release_edit`.
+//! One ordered gate sequence — frozen pins, a published release in hand, stale
+//! bases, the target's provenance, the landed members a bare rebase sheds —
+//! around one `jj rebase -b <release> -d <target>`, with the restore of every
+//! other pushed or published release name, the cleanup of the copies it makes
+//! of earlier releases, and the report of what moved. The cut lives in
+//! `release_cut`; the membership verbs in `release_edit`.
 
 use knives::bind::Fork;
 use knives::cli::Exit;
@@ -23,13 +24,15 @@ use super::release_edit::{
 /// Rebase the whole composition onto an upstream commit: `jj rebase -b <release> -d <target>`.
 ///
 /// Every member branch's commits move onto the target and the release merge
-/// moves with them, bookmarks following their rewritten commits — recorded
-/// conflict resolutions replay as ordinary rebase semantics. The upstream base
-/// is never a release parent; this is how the release's members change theirs.
-/// A cut deliberately does not do this: which upstream commit to move onto,
-/// and whether to move at all, is a judgment. Earlier published releases
-/// resting on member commits keep their tags and commit ids; the untagged
-/// copies the rebase makes of them are abandoned unless something rests on
+/// moves with them, member bookmarks following their rewritten commits —
+/// recorded conflict resolutions replay as ordinary rebase semantics. The
+/// upstream base is never a release parent; this is how the release's members
+/// change theirs. A cut deliberately does not do this: which upstream commit to
+/// move onto, and whether to move at all, is a judgment. A published release in
+/// hand is refused ([`release::published_release`]). Every other release name
+/// that is pushed or published is put back on its commit, and one never pushed
+/// follows its rewrite; earlier releases keep their tags and commit ids, and
+/// the copies the rebase makes of them are abandoned unless something rests on
 /// them. After a bare rebase, members whose pull requests landed and carry
 /// nothing more are dropped — the work reaches the release through its new
 /// base — unless `--no-drop` keeps them.
@@ -92,17 +95,8 @@ pub(crate) fn run_rebase(
     let onto = destination.onto.clone();
     let reference = destination.reference.clone();
     let release_commit = opened.resolve_commit(&release_name)?;
-    if let Some(exit) = existing_rebase_exit(ExistingRebaseInput {
-        opened: &opened,
-        fork,
-        release_name: &release_name,
-        release_commit: &release_commit,
-        destination: &destination,
-        no_drop,
-        bound,
-    })? {
-        return Ok(exit);
-    }
+    // Both gates come before the already-contains path: it can still drop
+    // landed members, which moves the release name.
     let scheme = entry.release_scheme();
     if let Some(exit) = frozen_rebase_exit(
         repo,
@@ -130,6 +124,17 @@ pub(crate) fn run_rebase(
         println!("{repo}: {refusal}");
         return Ok(Exit::Incomplete);
     }
+    if let Some(exit) = existing_rebase_exit(ExistingRebaseInput {
+        opened: &opened,
+        fork,
+        release_name: &release_name,
+        release_commit: &release_commit,
+        destination: &destination,
+        no_drop,
+        bound,
+    })? {
+        return Ok(exit);
+    }
     let context = RebaseContext {
         repo,
         entry,
@@ -151,32 +156,61 @@ pub(crate) fn run_rebase(
         return Ok(Exit::Incomplete);
     }
     shed_stale_bases(fork, (&release_name, &release_commit), &members, shed)?;
-    // Every other release name stays where it is: the rebase rewrites each
-    // descendant of a moved member, earlier release merges among them.
-    let other_releases: Vec<(String, knives::ids::CommitId)> = opened
-        .bookmark_tips()?
-        .into_iter()
-        .filter_map(|(reference, commit)| match reference {
-            knives::ids::BookmarkRef::Local(branch)
-                if branch.as_str() != release_name && scheme.owns(branch.as_str()) =>
-            {
-                Some((branch.to_string(), commit))
-            }
-            knives::ids::BookmarkRef::Local(_) | knives::ids::BookmarkRef::Remote { .. } => None,
-        })
-        .collect();
+    // A pushed or published release name stays where it is: the rebase
+    // rewrites each descendant of a moved member, earlier release merges among
+    // them, and a push of the moved name would move what consumers were given.
+    // A name never pushed follows its rewrite: nothing outside this repository
+    // names it, and putting it back would make the old member commits visible
+    // beside their rebased copies, divergent.
+    let tips = opened.bookmark_tips()?;
+    let publish_remote = knives::ids::RemoteName::new(entry.publish_remote());
+    let mut kept_releases: Vec<(String, knives::ids::CommitId)> = Vec::new();
+    let mut followers: Vec<String> = Vec::new();
+    for (reference, commit) in &tips {
+        let knives::ids::BookmarkRef::Local(branch) = reference else {
+            continue;
+        };
+        if branch.as_str() == release_name || !scheme.owns(branch.as_str()) {
+            continue;
+        }
+        let pushed = tips.get(&knives::ids::BookmarkRef::Remote {
+            branch: branch.clone(),
+            remote: publish_remote.clone(),
+        }) == Some(commit);
+        let published = release::published_release(
+            &opened,
+            &ledger,
+            release::ReleaseAt {
+                scheme: &scheme,
+                name: branch.as_str(),
+                commits: &[Some(commit)],
+            },
+        )?
+        .is_some();
+        if pushed || published {
+            kept_releases.push((branch.to_string(), commit.clone()));
+        } else if members.iter().try_fold(false, |found, member| {
+            Ok::<bool, knives::jj::JjError>(found || opened.is_ancestor(member, commit)?)
+        })? {
+            followers.push(branch.to_string());
+        }
+    }
     let tagged = knives::jj::tagged_commits_a_rebase_copies(path, &release_name, &onto)?;
     knives::jj::rebase_branch_onto(path, &release_name, &onto)?;
     let restored = knives::jj::restore_local_bookmarks(
         path,
-        &other_releases,
-        &format!("knives: {release_name}: keep every other release where it was"),
+        &kept_releases,
+        &format!("knives: {release_name}: keep every pushed release where it was"),
     )?;
     for (name, commit) in &restored {
         println!(
-            "{repo}: {name} stays at {}: a rebase moves only the release in hand and its members",
+            "{repo}: {name} stays at {}: it is pushed or published, and a rebase moves only the \
+             release in hand and its members",
             commit.short()
         );
+    }
+    for name in &followers {
+        println!("{repo}: {name} follows the rebase: it was never pushed or published");
     }
     report_rebased_release(
         fork,

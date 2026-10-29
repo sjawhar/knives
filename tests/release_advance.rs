@@ -200,14 +200,14 @@ fn a_bare_advance_skips_a_branch_that_merges_several_members() {
 
     // Then: a branch whose history merges two members is not a candidate for
     // a bare advance, which would read it as the successor of each; it is
-    // named, with the verbs that take it by name, and nothing moves. The
-    // release is left exactly as it was.
+    // named, with the verb that takes it by name (`include`, beside the members
+    // it merges), and nothing moves. The release is left exactly as it was.
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success(), "{stdout}");
     assert!(
         stdout.contains(
             "demo: feat/consolidated's history carries merges of lines release/2026-08-04 \
-             already carries; a bare advance leaves it alone: advance or include it by name\n"
+             already carries; a bare advance leaves it alone: include it by name\n"
         ),
         "the merging branch must be named and skipped: {stdout}"
     );

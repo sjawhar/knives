@@ -926,11 +926,18 @@ fn a_verbatim_cut_carries_a_member_whose_bookmark_is_divergent() {
 
 #[test]
 fn a_recorded_member_recreated_with_an_identical_tree_is_carried() {
-    // Given: a cut recording feat/alpha, then alpha recreated as feat/alpha2:
-    // a new commit with alpha's exact tree and no ancestry or change id back to
-    // it (a history rebuilt to strip trailers, say). An edit moves the member
-    // onto it by `--from`, and a later edit advances it past a commit that
-    // changes alpha's file, so replaying alpha's diff onto the cut conflicts.
+    for grown in [true, false] {
+        recreated_member_is_carried(grown);
+    }
+}
+
+/// A cut recording feat/alpha, then alpha recreated as feat/alpha2: a new
+/// commit with alpha's exact tree and no ancestry or change id back to it (a
+/// history rebuilt to strip trailers, say). An edit moves the member onto it by
+/// `--from`; when `grown`, a later edit advances it past a commit that changes
+/// alpha's file, so replaying alpha's diff onto the cut conflicts (the r12
+/// shape), else the twin is the parent itself (the r11 shape).
+fn recreated_member_is_carried(grown: bool) {
     let lab = lab::Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     lab.branch("feat/beta", "beta.txt", "beta\n");
@@ -955,9 +962,11 @@ fn a_recorded_member_recreated_with_an_identical_tree_is_carried() {
         &["advance", "feat/alpha2", "--from", alpha.as_str()],
     );
     assert!(moved.status.success(), "{moved:?}");
-    lab::extend_branch(&lab, "feat/alpha2", "alpha.txt", "alpha\nmore\n");
-    let advanced = knives_release(&lab, &home, &["advance", "feat/alpha2"]);
-    assert!(advanced.status.success(), "{advanced:?}");
+    if grown {
+        lab::extend_branch(&lab, "feat/alpha2", "alpha.txt", "alpha\nmore\n");
+        let advanced = knives_release(&lab, &home, &["advance", "feat/alpha2"]);
+        assert!(advanced.status.success(), "{advanced:?}");
+    }
 
     // When: the next cut is held against the recorded composition.
     let output = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
@@ -971,13 +980,16 @@ fn a_recorded_member_recreated_with_an_identical_tree_is_carried() {
             alpha.short(),
             twin.short()
         )),
-        "{stdout}\n{}",
+        "grown={grown}: {stdout}\n{}",
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
         stdout.contains("cut release/2026-08-05 as "),
-        "{stdout}\n{}",
+        "grown={grown}: {stdout}\n{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(!stdout.contains("refusing to cut"), "{stdout}");
+    assert!(
+        !stdout.contains("refusing to cut"),
+        "grown={grown}: {stdout}"
+    );
 }

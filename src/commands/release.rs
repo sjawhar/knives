@@ -29,8 +29,8 @@ use crate::pins::{Pin, PinKind};
 use crate::release_model::{
     BranchSuccessions, MemberEvidence, MemberHistory, MemberSuccession, RecordedCut,
     StackedHistoryContext, carried_from_tips, double_cut_findings, last_recorded_parents,
-    member_history, member_parents, newest_release, release_refs_by_commit, repo_slug,
-    stacked_history, trunk_positions,
+    member_history, member_parents, newest_release, recorded_release_changes,
+    release_refs_by_commit, repo_slug, trunk_positions,
 };
 
 /// Registered forge consumers and explicitly requested local checkout scans.
@@ -176,14 +176,16 @@ pub struct ReleaseAt<'a> {
 
 /// What marks a dated release published, rendered for a human, or `None`.
 ///
-/// A tag names one of its commits, or a `record:` note on the release names
-/// one. A forge release leaves a tag, and the release owner's `record:` note
-/// says where it was published, whichever reached this machine first. An edit
-/// moves the release's name, and a push of the moved name would move what
-/// consumers were told was published: every edit verb refuses such a release,
-/// and a cut under a new dated name may start identical to it. A fixed release
-/// branch moves forward by design and leaves its published positions to their
-/// tags, so nothing marks it here.
+/// A tag names one of its commits, or a `record: published …` note on the
+/// release names one in its evidence. A forge release leaves a tag, and the
+/// release owner's `record: published …` note says where it was published,
+/// whichever reached this machine first. Other `record:` rows (a drop sweep's
+/// verdicts on a candidate, say) do not count. An edit moves the release's
+/// name, and a push of the moved name would move what consumers were told was
+/// published: every edit verb refuses such a release, and a cut under a new
+/// dated name may start identical to it. A fixed release branch moves forward
+/// by design and leaves its published positions to their tags, so nothing
+/// marks it here.
 pub fn published_release(
     repo: &Repo,
     ledger: &[Entry],
@@ -210,7 +212,11 @@ pub fn published_release(
     let recorded = ledger.iter().rev().find_map(|entry| {
         let is_record = entry.kind == Kind::Note
             && entry.subject.as_deref() == Some(release)
-            && entry.text.trim_start().starts_with("record:");
+            && entry
+                .text
+                .trim_start()
+                .strip_prefix("record:")
+                .is_some_and(|rest| rest.trim_start().starts_with("published"));
         if !is_record {
             return None;
         }
@@ -228,7 +234,7 @@ pub fn published_release(
             })
         })
     });
-    Ok(recorded.map(|commit| format!("a record: note names {}", commit.short())))
+    Ok(recorded.map(|commit| format!("a record: published note names {}", commit.short())))
 }
 
 /// `name`, unless it is a series' own prefix, such as `release/9.2` on an entry
@@ -909,11 +915,13 @@ pub fn plan(
     }
     let releases = release_refs_by_commit(&tips, &scheme, publish_remote);
     let in_hand = [commit.clone()];
+    let written = recorded_release_changes(&repo, ledger, &scheme);
     let stacked_context = (!trunks.is_empty()).then_some(StackedHistoryContext {
         repo: &repo,
         trunks: &trunks,
         releases: &releases,
         carried: &in_hand,
+        written: &written,
     });
     if let Some(context) = stacked_context {
         member_histories(context, &parents, &member_parents, &mut plan)?;
@@ -1016,6 +1024,39 @@ struct LocalBranchNotes<'a> {
     recorded: &'a [RecordedParent],
 }
 
+/// Whether `branch`'s history carries merges the release already carries
+/// (`Ok(true)`), none (`Ok(false)`), or more than its own line: `Err` with the
+/// note to print. Without `others` it is measured against the release in hand,
+/// as `include` measures it; with them (the members an `advance` would not
+/// replace), against those, as that `advance` measures it.
+fn branch_history_note(
+    stacked: Option<StackedHistoryContext<'_>>,
+    others: Option<&[CommitId]>,
+    branch: &str,
+    tip: &CommitId,
+) -> anyhow::Result<Result<bool, String>> {
+    let Some(context) = stacked else {
+        return Ok(Ok(false));
+    };
+    let (context, before) = others.map_or((context, "including it"), |others| {
+        (
+            StackedHistoryContext {
+                carried: others,
+                ..context
+            },
+            "advancing onto it",
+        )
+    });
+    Ok(match member_history(context, branch, tip)? {
+        MemberHistory::Stacked(stacked) => Err(format!(
+            "{}; rebase it off the trunk before {before}",
+            stacked.detail
+        )),
+        MemberHistory::CarriedMerges { .. } => Ok(true),
+        MemberHistory::Linear => Ok(false),
+    })
+}
+
 /// One note per local branch a cut will not carry: membership is the release's
 /// parent set, and a branch joins or moves only through a stated `include` or
 /// `advance`. Saying so is what keeps "it exists locally" from silently
@@ -1055,17 +1096,33 @@ fn local_branch_notes(input: &LocalBranchNotes<'_>) -> anyhow::Result<Vec<String
             ));
             continue;
         }
-        if let Some(context) = stacked
-            && let Some(stacked) = stacked_history(context, branch, tip)?
-        {
-            notes.push(format!(
-                "{}; rebase it off the trunk before including it",
-                stacked.detail
-            ));
-            continue;
-        }
+        let merged = match branch_history_note(stacked, None, branch, tip)? {
+            Ok(merged) => merged,
+            Err(note) => {
+                notes.push(note);
+                continue;
+            }
+        };
         let succession = MemberSuccession::of(repo, trunks, tip)?;
         let lookup = member_parents(&succession, &parents, recorded, branch)?;
+        // A merge branch is measured, as the edit that takes it measures it,
+        // against the members it would not replace.
+        let others: Option<Vec<CommitId>> = match lookup.parents.as_slice() {
+            [replaced] if merged => Some(
+                parents
+                    .iter()
+                    .filter(|parent| *parent != replaced)
+                    .cloned()
+                    .collect(),
+            ),
+            _ => None,
+        };
+        if let Some(others) = &others
+            && let Err(note) = branch_history_note(stacked, Some(others), branch, tip)?
+        {
+            notes.push(note);
+            continue;
+        }
         if succession.tip_landed()? {
             notes.push(lookup.parents.first().map_or_else(
                 || {
@@ -1089,6 +1146,13 @@ fn local_branch_notes(input: &LocalBranchNotes<'_>) -> anyhow::Result<Vec<String
         notes.push(match (lookup.parents.first(), lookup.evidence) {
             (None, _) => {
                 format!("{branch} is not in {reference}; `knives release include {branch}` adds it")
+            }
+            (Some(_), MemberEvidence::Succession) if merged && lookup.parents.len() > 1 => {
+                format!(
+                    "{branch} merges {} members of {reference} and builds on them; `knives \
+                     release include {branch}` adds it beside them",
+                    lookup.parents.len()
+                )
             }
             (Some(_), MemberEvidence::Succession) => format!(
                 "{branch} has advanced past its parent in {reference}; \

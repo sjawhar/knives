@@ -345,10 +345,36 @@ pub struct StackedHistoryContext<'a> {
     /// when it joins lines none of them reaches.
     pub trunks: &'a [CommitId],
     pub releases: &'a BTreeMap<CommitId, Vec<BookmarkRef>>,
-    /// Commits whose history the release already carries: the release in
-    /// hand for an edit, the other members for a member of it. Empty where a
-    /// branch stands alone (a first cut, a pull request).
+    /// Commits whose history the release already carries: the release's
+    /// members for an edit (less any it replaces), the other members for a
+    /// member of it. Empty where a branch stands alone (a first cut, a pull
+    /// request).
     pub carried: &'a [CommitId],
+    /// Change ids of the commits the ledger records knives writing under a
+    /// release name ([`recorded_release_changes`]): an earlier write no ref
+    /// names any more is still a release cut. Read only with `carried`.
+    pub written: &'a BTreeSet<crate::ids::ChangeId>,
+}
+
+/// Change ids of every commit the ledger records knives writing under one of
+/// `scheme`'s release names (cut and edit events), as far as this repository
+/// holds them; a rewrite keeps its change id.
+pub fn recorded_release_changes(
+    repo: &Repo,
+    entries: &[Entry],
+    scheme: &ReleaseScheme,
+) -> BTreeSet<crate::ids::ChangeId> {
+    let names: BTreeSet<&str> = entries
+        .iter()
+        .filter(|entry| entry.kind == Kind::Event)
+        .filter_map(|entry| entry.subject.as_deref())
+        .filter(|subject| scheme.owns(subject))
+        .collect();
+    names
+        .into_iter()
+        .flat_map(|name| recorded_writes(entries, name))
+        .filter_map(|write| repo.change_id_of(write.commit.as_str()).ok())
+        .collect()
 }
 
 impl std::fmt::Debug for StackedHistoryContext<'_> {
@@ -421,7 +447,7 @@ pub fn member_history(
     if merges.is_empty() {
         return Ok(MemberHistory::Linear);
     }
-    let named: Vec<String> = merges
+    let mut named: Vec<String> = merges
         .iter()
         .filter_map(|merge| {
             context.releases.get(merge).map(|refs| {
@@ -430,6 +456,22 @@ pub fn member_history(
             })
         })
         .collect();
+    if !context.carried.is_empty() {
+        for merge in merges
+            .iter()
+            .filter(|merge| !context.releases.contains_key(*merge))
+        {
+            if context
+                .written
+                .contains(&context.repo.change_id_of(merge.as_str())?)
+            {
+                named.push(format!(
+                    "an earlier release write the ledger records ({})",
+                    merge.short()
+                ));
+            }
+        }
+    }
     let mut bases: Vec<CommitId> = context.trunks.to_vec();
     bases.extend(context.carried.iter().cloned());
     let (uncarried, brought) = if named.is_empty() && !context.carried.is_empty() {

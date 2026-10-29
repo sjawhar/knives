@@ -145,8 +145,10 @@ impl EditContext<'_> {
 
     /// Refuse, saying why, a branch whose history past the trunk carries more
     /// than its own line: `None` after refusing. Otherwise whether its history
-    /// carries merges whose side lines the release in hand already carries,
-    /// said once when it does.
+    /// carries merges whose side lines the release's other members already
+    /// carry, said once when it does. `replacing` are the parents the branch
+    /// would replace: they do not count as carried, exactly as the plan
+    /// measures a member against the others once it is in.
     ///
     /// Membership is the parent set, and a parent that carries a release merge
     /// carries every member of that release: the cut is not flat however many
@@ -159,9 +161,20 @@ impl EditContext<'_> {
         &self,
         branch: &str,
         tip: &knives::ids::CommitId,
-        before: &str,
+        (before, replacing): (&str, &[knives::ids::CommitId]),
     ) -> anyhow::Result<Option<bool>> {
-        match member_history(self.stacked, branch, tip)? {
+        let carried: Vec<knives::ids::CommitId> = self
+            .stacked
+            .carried
+            .iter()
+            .filter(|parent| !replacing.contains(parent))
+            .cloned()
+            .collect();
+        let context = StackedHistoryContext {
+            carried: &carried,
+            ..self.stacked
+        };
+        match member_history(context, branch, tip)? {
             MemberHistory::Linear => Ok(Some(false)),
             MemberHistory::CarriedMerges { merges, own } => {
                 let listed: Vec<&str> = merges.iter().map(knives::ids::CommitId::short).collect();
@@ -397,7 +410,8 @@ fn edit_release(
         &entry.release_scheme(),
         entry.publish_remote(),
     );
-    let in_hand = [release.commit.clone()];
+    let written =
+        knives::release_model::recorded_release_changes(&opened, &ledger, &entry.release_scheme());
     let context = EditContext {
         repo,
         opened: &opened,
@@ -409,7 +423,8 @@ fn edit_release(
             repo: &opened,
             trunks: &release.trunk_tips,
             releases: &releases,
-            carried: &in_hand,
+            carried: &release.parents,
+            written: &written,
         },
     };
     let outcome = match change {
@@ -669,7 +684,7 @@ fn include_edit(
     if context.refuse_if_other_series(target, &tip, "including it")? {
         return Ok(EditOutcome::Settled(Exit::Incomplete));
     }
-    let Some(merged) = context.admit_history(target, &tip, "including it")? else {
+    let Some(merged) = context.admit_history(target, &tip, ("including it", &[]))? else {
         return Ok(EditOutcome::Settled(Exit::Incomplete));
     };
     let lookup = context.member_parents(target, &tip)?;
@@ -885,9 +900,15 @@ fn advance_every_member(
             // merges several members as the successor of each.
             MemberHistory::CarriedMerges { .. } => {
                 if !release.parents.contains(tip) {
+                    let lookup = context.member_parents(branch, tip)?;
+                    let verb = if lookup.parents.len() > 1 {
+                        "include"
+                    } else {
+                        "advance"
+                    };
                     println!(
                         "{repo}: {branch}'s history carries merges of lines {} already \
-                         carries; a bare advance leaves it alone: advance or include it by name",
+                         carries; a bare advance leaves it alone: {verb} it by name",
                         release.name
                     );
                 }
@@ -1024,12 +1045,6 @@ fn advance_named_members(
         if context.refuse_if_other_series(branch.as_str(), &tip, "advancing onto it")? {
             return Ok(None);
         }
-        if context
-            .admit_history(branch.as_str(), &tip, "advancing onto it")?
-            .is_none()
-        {
-            return Ok(None);
-        }
         // Matched by commit rather than by position, so no index invariant has to
         // hold and the count and the listing below cannot disagree. Succession
         // covers a grown branch and a rebased one alike; the last cut or edit's
@@ -1064,6 +1079,18 @@ fn advance_named_members(
                 return Ok(None);
             }
             [parent] => {
+                // Measured against the members it does not replace, as the plan
+                // measures it once it is in.
+                if context
+                    .admit_history(
+                        branch.as_str(),
+                        &tip,
+                        ("advancing onto it", std::slice::from_ref(parent)),
+                    )?
+                    .is_none()
+                {
+                    return Ok(None);
+                }
                 for slot in parents.iter_mut().filter(|slot| **slot == *parent) {
                     *slot = tip.clone();
                 }
@@ -1130,7 +1157,11 @@ fn advance_named_member_from(
         return Ok(None);
     }
     if context
-        .admit_history(branch.as_str(), &tip, "advancing onto it")?
+        .admit_history(
+            branch.as_str(),
+            &tip,
+            ("advancing onto it", std::slice::from_ref(old)),
+        )?
         .is_none()
     {
         return Ok(None);

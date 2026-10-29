@@ -28,7 +28,7 @@ Bare `release members` answers neither for older releases. It sees only the curr
 
 - A member must carry no merge past known trunk positions: `<trunk>@upstream`, `<trunk>@origin` and local trunk. A branch built on a release merge carries all parents of that merge.
 - `include`, `advance` and the first `cut` refuse such `stacked-history`. Planning reports existing stacked members. A merge that a trunk position reaches belongs to trunk. If every local view lags the branch base, the detail says that these can be upstream merges. `sync` fetches them.
-- The exception: a merge whose side parents (every parent after the first) the release in hand already carries, and that no release ref names. The branch then brings only its own line (`git rev-list <branch> ^<release>`). `include` and a named `advance` take it and name the merge; the plan measures each member against the others and notes it. `include` adds a branch that merges several members beside them, which stay members. A bare `advance` leaves such a branch alone. A merge whose side parent the release lacks still refuses, and the refusal lists every commit the branch would bring.
+- The exception: a merge whose side parents (every parent after the first) the release's other members already carry, and that is no release cut: no release ref names it, and the ledger records no knives write of a release with its change id. The branch then brings only its own line (`git rev-list <branch> ^<release>`). `include` takes it beside the members it merges, which stay members. A named `advance` takes one that continues a single member. Both name the merge. The plan measures each member against the others and notes it, and points a branch that merges several members at `include`. A bare `advance` leaves such a branch alone. A merge whose side parent the release lacks still refuses, and the refusal lists every commit the branch would bring.
 - After that merge was pushed anywhere, `jj rebase -b <branch> -d <trunk>` is not the remedy, because it rewrites the merge. Rebase only the branch's own commits, from the ref that the gate found:
 
 ```text
@@ -80,7 +80,7 @@ jj rebase -s '<release-or-keep-ref>..<branch>' -d <trunk>@upstream
 ### Identical-cut exceptions
 
 - When **every pin of the previous dated release is frozen**, or the previous dated release is **published**, a new later dated name can start identical, exit `0`. It says to `include`, `advance`, `drop` or `rebase` **before you push**. It is the composition to edit, not identical content to publish.
-- A dated release is published when a tag names its local or publish-remote commit, or a `record:` note on the release names that commit. `include`, `drop`, `advance` and `rebase` refuse a published release, exit `3`, and name what marks it: cut a new dated name first, then edit that.
+- A dated release is published when a tag names its local or publish-remote commit, or a `record: published …` note on the release names that commit in its evidence. Other `record:` rows do not count. `include`, `drop`, `advance` and `rebase` refuse a published release, exit `3`, and name what marks it: cut a new dated name first, then edit that.
 - A fixed release has a **ledger-recording** path instead. It applies when the last cut event is missing or names a different commit than the published branch. Then `cut` audits that published composition, runs the composition and drop checks, and records that commit as the cut. It makes no commit and pushes nothing. Weak evidence can still give findings. When the ledger already records that commit, an identical cut is refused.
 - A member rewritten to the same content is a new parent, so it is a new composition. The comparison is with the published copy. An unpushed previous cut is not compared.
 
@@ -97,7 +97,7 @@ Cut and edit events keep full parent commits, every bookmark on them, and the co
 
 ## `knives release rebase [REF]`
 
-- Moves members and the release merge onto the target. Member bookmarks and workspaces follow, and recorded resolutions replay. Every other release name stays on its commit, and the output says so. It does not authorize a broad raw rebase.
+- Moves members and the release merge onto the target. Member bookmarks and workspaces follow, and recorded resolutions replay. Every other release name that is pushed or published stays on its commit, and the output says so. One never pushed follows its rewrite, also said. It does not authorize a broad raw rebase.
 - Bare, it targets the first upstream trunk commit that holds the merge commits of all our PRs that **merged, not closed**. With none merged, there is no default, so give a commit.
 - A merge commit missing from local trunk refuses until `sync`. An outdated knives immutability rule refuses before any move and names `start <branch>` to refresh it.
 - Earlier releases keep their tags, names and commit ids. The rebase's copies of them that nothing rests on are abandoned together and reported. A copy stays when a bookmark, a workspace working copy, or a descendant outside the set rests on it. A note says why. Copies stacked only on each other go together.
