@@ -1057,6 +1057,39 @@ fn branch_history_note(
     })
 }
 
+/// For a branch whose history carries merges the release already carries:
+/// whether it builds on the members it descends from (`Ok(true)`, `include`
+/// adds it beside them, the rule the edit applies), continues one member
+/// (`Ok(false)`), or, continuing one, carries that member's line too (`Err`
+/// with the note): measured, as `advance` measures it, against the members it
+/// would not replace.
+fn merge_branch_verdict(
+    stacked: Option<StackedHistoryContext<'_>>,
+    parents: &[CommitId],
+    recorded: &[RecordedParent],
+    (lookup, branch, tip): (&crate::release_model::MemberLookup, &str, &CommitId),
+) -> anyhow::Result<Result<bool, String>> {
+    let Some(context) = stacked else {
+        return Ok(Ok(false));
+    };
+    let members = StackedHistoryContext {
+        carried: parents,
+        ..context
+    };
+    if crate::release_model::integrates(members, recorded, lookup, (branch, tip))? {
+        return Ok(Ok(true));
+    }
+    let [replaced] = lookup.parents.as_slice() else {
+        return Ok(Ok(false));
+    };
+    let others: Vec<CommitId> = parents
+        .iter()
+        .filter(|parent| *parent != replaced)
+        .cloned()
+        .collect();
+    Ok(branch_history_note(stacked, Some(&others), branch, tip)?.map(|_| false))
+}
+
 /// One note per local branch a cut will not carry: membership is the release's
 /// parent set, and a branch joins or moves only through a stated `include` or
 /// `advance`. Saying so is what keeps "it exists locally" from silently
@@ -1105,24 +1138,17 @@ fn local_branch_notes(input: &LocalBranchNotes<'_>) -> anyhow::Result<Vec<String
         };
         let succession = MemberSuccession::of(repo, trunks, tip)?;
         let lookup = member_parents(&succession, &parents, recorded, branch)?;
-        // A merge branch is measured, as the edit that takes it measures it,
-        // against the members it would not replace.
-        let others: Option<Vec<CommitId>> = match lookup.parents.as_slice() {
-            [replaced] if merged => Some(
-                parents
-                    .iter()
-                    .filter(|parent| *parent != replaced)
-                    .cloned()
-                    .collect(),
-            ),
-            _ => None,
+        let integrates = if merged {
+            match merge_branch_verdict(stacked, &parents, recorded, (&lookup, branch, tip))? {
+                Ok(integrates) => integrates,
+                Err(note) => {
+                    notes.push(note);
+                    continue;
+                }
+            }
+        } else {
+            false
         };
-        if let Some(others) = &others
-            && let Err(note) = branch_history_note(stacked, Some(others), branch, tip)?
-        {
-            notes.push(note);
-            continue;
-        }
         if succession.tip_landed()? {
             notes.push(lookup.parents.first().map_or_else(
                 || {
@@ -1147,13 +1173,11 @@ fn local_branch_notes(input: &LocalBranchNotes<'_>) -> anyhow::Result<Vec<String
             (None, _) => {
                 format!("{branch} is not in {reference}; `knives release include {branch}` adds it")
             }
-            (Some(_), MemberEvidence::Succession) if merged && lookup.parents.len() > 1 => {
-                format!(
-                    "{branch} merges {} members of {reference} and builds on them; `knives \
-                     release include {branch}` adds it beside them",
-                    lookup.parents.len()
-                )
-            }
+            (Some(_), MemberEvidence::Succession) if integrates => format!(
+                "{branch} merges {} member(s) of {reference} and builds on them; `knives \
+                 release include {branch}` adds it beside them",
+                lookup.parents.len()
+            ),
             (Some(_), MemberEvidence::Succession) => format!(
                 "{branch} has advanced past its parent in {reference}; \
                  `knives release advance {branch}` moves it"

@@ -354,3 +354,127 @@ fn a_branch_built_on_an_earlier_write_of_the_release_is_refused() {
     );
     assert_eq!(release_parents(&lab, "release/2026-08-04"), before);
 }
+
+#[test]
+fn a_named_advance_refuses_a_branch_on_an_older_release_before_reading_its_parents() {
+    // Given: two releases of alpha and beta, and fix/x built on the older one.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    lab.octopus("release/2026-08-04", "feat/alpha", "feat/beta");
+    lab.octopus("release/2026-08-05", "feat/alpha", "feat/beta");
+    lab.jj_work([
+        "new",
+        "release/2026-08-04",
+        "-m",
+        "fix on the older release",
+    ]);
+    std::fs::write(lab.work.join("fix.txt"), "fix\n").expect("write fix");
+    lab.jj_work(["bookmark", "create", "fix/x", "-r", "@"]);
+    lab.jj_work(["new", "main@origin"]);
+    let (home, _consumer) = release_test_home(&lab);
+    let before = release_parents(&lab, "release/2026-08-05");
+
+    // When: it is advanced by name.
+    let output = knives_release(&lab, &home, &["advance", "fix/x"]);
+
+    // Then: refused as stacked on the older release, not sent to drop and
+    // include, which would refuse it too.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(3), "{stdout}");
+    assert!(
+        stdout.contains("releases in that history: release/2026-08-04")
+            && stdout.contains("rebase it off the trunk before advancing onto it"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("drop and include"), "{stdout}");
+    assert_eq!(release_parents(&lab, "release/2026-08-05"), before);
+}
+
+#[test]
+fn a_branch_merging_one_member_is_sent_to_include_which_adds_it_beside_that_member() {
+    // Given: feat/c, which merges member feat/beta into its own line.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let (home, _consumer) = release_test_home(&lab);
+    let first = knives_release(&lab, &home, &["cut", "release/2026-08-04"]);
+    assert!(first.status.success(), "{first:?}");
+    lab.branch("feat/c", "c.txt", "c\n");
+    lab.jj_work(["new", "feat/c", "feat/beta", "-m", "merge beta into c"]);
+    lab.jj_work(["new", "-m", "c more"]);
+    std::fs::write(lab.work.join("c.txt"), "c\nmore\n").expect("write c");
+    lab.jj_work(["bookmark", "set", "feat/c", "-r", "@"]);
+    lab.jj_work(["new", "main@origin"]);
+    let tip = commit_at(&lab, "feat/c");
+    let beta = commit_at(&lab, "feat/beta");
+
+    // When: a bare advance, a named advance, then an include.
+    let bare = knives_release(&lab, &home, &["advance"]);
+    let named = knives_release(&lab, &home, &["advance", "feat/c"]);
+    let included = knives_release(&lab, &home, &["include", "feat/c"]);
+
+    // Then: both advances point at include, which adds it beside beta.
+    let bare_stdout = String::from_utf8_lossy(&bare.stdout);
+    assert!(
+        bare_stdout.contains("a bare advance leaves it alone: include it by name"),
+        "{bare_stdout}"
+    );
+    let named_stdout = String::from_utf8_lossy(&named.stdout);
+    assert_eq!(named.status.code(), Some(3), "{named_stdout}");
+    assert!(
+        named_stdout.contains(&format!(
+            "demo: feat/c merges 1 member(s) of release/2026-08-04 ({}) and builds on them; \
+             `knives release include feat/c` adds it beside them\n",
+            beta.short()
+        )),
+        "{named_stdout}"
+    );
+    let included_stdout = String::from_utf8_lossy(&included.stdout);
+    assert!(included.status.success(), "{included_stdout}");
+    let parents = release_parents(&lab, "release/2026-08-04");
+    assert_eq!(parents.len(), 3, "{parents:?}");
+    assert!(
+        parents.contains(&tip) && parents.contains(&beta),
+        "{parents:?}"
+    );
+}
+
+#[test]
+fn a_bare_advance_sends_a_merge_branch_that_continues_no_member_to_include() {
+    // Given: beta with b1 then b2, a release carrying b2, and feat/n: a new
+    // line merged with b1, then one more commit; it continues no member.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let b1 = commit_at(&lab, "feat/beta");
+    lab::extend_branch(&lab, "feat/beta", "beta.txt", "beta\nmore\n");
+    let (home, _consumer) = release_test_home(&lab);
+    let first = knives_release(&lab, &home, &["cut", "release/2026-08-04"]);
+    assert!(first.status.success(), "{first:?}");
+    lab.branch("feat/n", "n.txt", "n\n");
+    lab.jj_work([
+        "new",
+        "feat/n",
+        b1.as_str(),
+        "-m",
+        "merge beta's first commit",
+    ]);
+    lab.jj_work(["new", "-m", "n more"]);
+    std::fs::write(lab.work.join("n.txt"), "n\nmore\n").expect("write n");
+    lab.jj_work(["bookmark", "set", "feat/n", "-r", "@"]);
+    lab.jj_work(["new", "main@origin"]);
+
+    // When: a bare advance runs.
+    let output = knives_release(&lab, &home, &["advance"]);
+
+    // Then: it names include, the verb that takes the branch.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(
+            "demo: feat/n's history carries merges of lines release/2026-08-04 already carries; \
+             a bare advance leaves it alone: include it by name\n"
+        ),
+        "{stdout}"
+    );
+}

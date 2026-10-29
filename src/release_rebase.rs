@@ -31,8 +31,9 @@ use super::release_edit::{
 /// move onto, and whether to move at all, is a judgment. A published release in
 /// hand is refused ([`release::published_release`]). Every other release name
 /// that is pushed or published is put back on its commit, and one never pushed
-/// follows its rewrite; earlier releases keep their tags and commit ids, and
-/// the copies the rebase makes of them are abandoned unless something rests on
+/// follows its rewrite; tags stay where they were, and the copies the rebase
+/// makes of pushed, published or tagged releases are abandoned unless something
+/// rests on
 /// them. After a bare rebase, members whose pull requests landed and carry
 /// nothing more are dropped — the work reaches the release through its new
 /// base — unless `--no-drop` keeps them.

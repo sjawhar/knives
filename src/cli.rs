@@ -504,9 +504,10 @@ pub enum ReleaseAction {
     /// published release in hand (a tag, or a `record: published` note, names
     /// its commit) is refused: cut a new dated release first. Every other
     /// release name that is pushed or published stays on its commit, and one
-    /// never pushed follows its rewrite. Earlier releases resting on the
-    /// members keep their tags and commit ids; the copies the rebase makes of
-    /// them are abandoned, except one something rests on, which is kept and
+    /// never pushed follows its rewrite. Pushed or published earlier releases
+    /// keep their names and commit ids, and every tag stays; the copies the
+    /// rebase makes of them are abandoned, except one something rests on,
+    /// which is kept and
     /// named. A stale rule an earlier `knives start` wrote refuses first,
     /// naming `start` as the refresh. The base is never a release parent —
     /// this is how the members

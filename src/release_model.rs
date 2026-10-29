@@ -877,6 +877,64 @@ pub fn last_recorded_parents<'a>(entries: &'a [Entry], release: &str) -> &'a [Re
         .unwrap_or_default()
 }
 
+/// Whether a merge branch builds on the members it descends from, and so
+/// joins beside them through `include`, rather than continuing one of them.
+///
+/// The branch's history carries merges the release already carries, and
+/// `lookup` found its members by succession.
+///
+/// Several such members: it merges them. One: it merges that member when it
+/// was not recorded under this branch's own name in the last event
+/// (`recorded`) and, measured against the other members, its history carries
+/// that member's line ([`MemberHistory::Stacked`]). A branch that merged its
+/// own earlier tip back in (a pull after a rebase) is that member's successor,
+/// and `advance` judges it.
+pub fn integrates(
+    context: StackedHistoryContext<'_>,
+    recorded: &[RecordedParent],
+    lookup: &MemberLookup,
+    (branch, tip): (&str, &CommitId),
+) -> Result<bool, jj::JjError> {
+    if lookup.evidence != MemberEvidence::Succession
+        || !matches!(
+            member_history(context, branch, tip)?,
+            MemberHistory::CarriedMerges { .. }
+        )
+    {
+        return Ok(false);
+    }
+    match lookup.parents.as_slice() {
+        [] => Ok(false),
+        [member] => {
+            let own = recorded.iter().any(|parent| {
+                parent.commit == member.as_str()
+                    && parent.branches.iter().any(|name| name == branch)
+            });
+            if own {
+                return Ok(false);
+            }
+            let others: Vec<CommitId> = context
+                .carried
+                .iter()
+                .filter(|parent| *parent != member)
+                .cloned()
+                .collect();
+            Ok(matches!(
+                member_history(
+                    StackedHistoryContext {
+                        carried: &others,
+                        ..context
+                    },
+                    branch,
+                    tip
+                )?,
+                MemberHistory::Stacked(_)
+            ))
+        }
+        _ => Ok(true),
+    }
+}
+
 /// The newest structural cut event, optionally scoped to a release name.
 pub fn last_recorded_cut(entries: &[Entry], subject: Option<&str>) -> Option<RecordedCut> {
     entries.iter().rev().find_map(|entry| {

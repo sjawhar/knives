@@ -212,6 +212,119 @@ impl EditContext<'_> {
         )?)
     }
 
+    /// Whether `branch`, at `tip`, builds on the members it descends from and
+    /// so joins beside them through `include`
+    /// ([`knives::release_model::integrates`]).
+    fn integrates(
+        &self,
+        branch: &str,
+        tip: &knives::ids::CommitId,
+        lookup: &MemberLookup,
+    ) -> anyhow::Result<bool> {
+        Ok(knives::release_model::integrates(
+            self.stacked,
+            self.recorded,
+            lookup,
+            (branch, tip),
+        )?)
+    }
+
+    /// Whether a bare `advance` takes `branch`, at `tip`, as a candidate. A
+    /// branch carrying more than its own line is refused, and one whose merges
+    /// the release already carries is left to the verb named for it: a bare
+    /// advance would read a branch that merges several members as the
+    /// successor of each.
+    fn bare_advance_candidate(
+        &self,
+        branch: &str,
+        tip: &knives::ids::CommitId,
+    ) -> anyhow::Result<bool> {
+        let (repo, release) = (self.repo, self.release);
+        match member_history(self.stacked, branch, tip)? {
+            MemberHistory::Linear => Ok(true),
+            MemberHistory::CarriedMerges { .. } => {
+                if !release.parents.contains(tip) {
+                    let lookup = self.member_parents(branch, tip)?;
+                    let verb =
+                        if lookup.parents.len() == 1 && !self.integrates(branch, tip, &lookup)? {
+                            "advance"
+                        } else {
+                            "include"
+                        };
+                    println!(
+                        "{repo}: {branch}'s history carries merges of lines {} already \
+                         carries; a bare advance leaves it alone: {verb} it by name",
+                        release.name
+                    );
+                }
+                Ok(false)
+            }
+            MemberHistory::Stacked(stacked) => {
+                println!(
+                    "{repo}: {}; rebase it off the trunk before advancing onto it",
+                    stacked.detail
+                );
+                Ok(false)
+            }
+        }
+    }
+
+    /// The members a named `advance` of `branch`, at `tip`, would move, or
+    /// `None` after refusing and saying why.
+    ///
+    /// A branch carrying more than its own line is refused before anything
+    /// reads its parents, so no message points at a verb that would refuse it
+    /// too; one that builds on the members it merges is sent to `include`.
+    /// Matched by commit rather than by position, so no index invariant has to
+    /// hold. Succession covers a grown branch and a rebased one alike; the last
+    /// cut or edit's record covers a branch rebased outside jj or landed
+    /// upstream, where nothing but the name the record wrote down ties them.
+    /// Said out loud in both cases, since a bookmark name reused for unrelated
+    /// work would be moved onto that member.
+    fn named_advance_lookup(
+        &self,
+        branch: &str,
+        tip: &knives::ids::CommitId,
+    ) -> anyhow::Result<Option<MemberLookup>> {
+        let (repo, release) = (self.repo, self.release);
+        if let MemberHistory::Stacked(stacked) = member_history(self.stacked, branch, tip)? {
+            println!(
+                "{repo}: {}; rebase it off the trunk before advancing onto it",
+                stacked.detail
+            );
+            return Ok(None);
+        }
+        let lookup = self.member_parents(branch, tip)?;
+        if self.refuse_if_trunk_has(branch, tip, lookup.parents.first())? {
+            return Ok(None);
+        }
+        match (lookup.parents.first(), lookup.evidence) {
+            (Some(recorded), MemberEvidence::Record) => println!(
+                "{repo}: {branch} matched {} by the last cut or edit record only; nothing in \
+                 the repository ties them (no ancestry, no shared change id)",
+                recorded.short()
+            ),
+            (Some(recorded), MemberEvidence::LandedRecord) => println!(
+                "{repo}: {branch} matched {} by the last cut or edit record; that parent has \
+                 landed upstream, so the branch's tip continues it only by name",
+                recorded.short()
+            ),
+            (_, MemberEvidence::Succession) | (None, _) => {}
+        }
+        if self.integrates(branch, tip, &lookup)? {
+            let listed: Vec<&str> = lookup.parents.iter().map(CommitId::short).collect();
+            println!(
+                "{repo}: {branch} merges {} member(s) of {} ({}) and builds on them; `knives \
+                 release include {branch}` adds it beside them",
+                lookup.parents.len(),
+                release.name,
+                listed.join(", ")
+            );
+            return Ok(None);
+        }
+        Ok(Some(lookup))
+    }
+
     /// Refuse, saying why, a tip the trunk already reaches.
     ///
     /// A commit the trunk has is a base, never a member: taken as a parent it
@@ -691,14 +804,14 @@ fn include_edit(
     if context.refuse_if_trunk_has(target, &tip, lookup.parents.first())? {
         return Ok(EditOutcome::Settled(Exit::Incomplete));
     }
-    // A branch that merges several members is a new member built on them, not
-    // a later state of any one of them: they stay, and it joins beside them.
-    let integrates =
-        merged && lookup.evidence == MemberEvidence::Succession && lookup.parents.len() > 1;
+    // A branch that merges the members it descends from is a new member built
+    // on them, not a later state of any one of them: they stay, and it joins
+    // beside them.
+    let integrates = merged && context.integrates(target, &tip, &lookup)?;
     if integrates {
         let listed: Vec<&str> = lookup.parents.iter().map(CommitId::short).collect();
         println!(
-            "{repo}: {target} builds on {} members of {} ({}), which stay members",
+            "{repo}: {target} builds on {} member(s) of {} ({}), which stay members",
             lookup.parents.len(),
             release.name,
             listed.join(", ")
@@ -894,33 +1007,8 @@ fn advance_every_member(
         if opened.is_ancestor(&release.commit, tip)? {
             continue;
         }
-        match member_history(context.stacked, branch, tip)? {
-            MemberHistory::Linear => {}
-            // Admitted when named; a bare advance would read a branch that
-            // merges several members as the successor of each.
-            MemberHistory::CarriedMerges { .. } => {
-                if !release.parents.contains(tip) {
-                    let lookup = context.member_parents(branch, tip)?;
-                    let verb = if lookup.parents.len() > 1 {
-                        "include"
-                    } else {
-                        "advance"
-                    };
-                    println!(
-                        "{repo}: {branch}'s history carries merges of lines {} already \
-                         carries; a bare advance leaves it alone: {verb} it by name",
-                        release.name
-                    );
-                }
-                continue;
-            }
-            MemberHistory::Stacked(stacked) => {
-                println!(
-                    "{repo}: {}; rebase it off the trunk before advancing onto it",
-                    stacked.detail
-                );
-                continue;
-            }
+        if !context.bare_advance_candidate(branch, tip)? {
+            continue;
         }
         off_release.push((branch.clone(), tip.clone()));
     }
@@ -1045,30 +1133,9 @@ fn advance_named_members(
         if context.refuse_if_other_series(branch.as_str(), &tip, "advancing onto it")? {
             return Ok(None);
         }
-        // Matched by commit rather than by position, so no index invariant has to
-        // hold and the count and the listing below cannot disagree. Succession
-        // covers a grown branch and a rebased one alike; the last cut or edit's
-        // record covers a branch rebased outside jj or landed upstream, where
-        // nothing but the name the record wrote down ties them. Said out loud
-        // in both cases, since a bookmark name reused for unrelated work would
-        // be moved onto that member.
-        let lookup = context.member_parents(branch.as_str(), &tip)?;
-        if context.refuse_if_trunk_has(branch.as_str(), &tip, lookup.parents.first())? {
+        let Some(lookup) = context.named_advance_lookup(branch.as_str(), &tip)? else {
             return Ok(None);
-        }
-        match (lookup.parents.first(), lookup.evidence) {
-            (Some(recorded), MemberEvidence::Record) => println!(
-                "{repo}: {branch} matched {} by the last cut or edit record only; nothing in \
-                 the repository ties them (no ancestry, no shared change id)",
-                recorded.short()
-            ),
-            (Some(recorded), MemberEvidence::LandedRecord) => println!(
-                "{repo}: {branch} matched {} by the last cut or edit record; that parent has \
-                 landed upstream, so the branch's tip continues it only by name",
-                recorded.short()
-            ),
-            (_, MemberEvidence::Succession) | (None, _) => {}
-        }
+        };
         match lookup.parents.as_slice() {
             [] => {
                 println!(
