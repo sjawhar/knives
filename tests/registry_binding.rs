@@ -967,7 +967,14 @@ fn a_workspace_whose_checkout_was_deleted_reports_its_vcs_s_own_error_about_the_
         stderr.contains(&format!("reading remotes of {}: ", canonical.display())),
         "{stderr}"
     );
-    assert!(stderr.contains("not a git repository"), "{stderr}");
+    // git words this failure two ways: git 2.43 says "not a git repository",
+    // and the GitHub runners' git says "gitfile does not point to a valid
+    // repository" (tests/gh_command.rs checks the same pair).
+    assert!(
+        stderr.contains("not a git repository")
+            || stderr.contains("gitfile does not point to a valid repository"),
+        "{stderr}"
+    );
     assert!(
         !stderr.contains("neither a jj nor a git repository"),
         "{stderr}"
