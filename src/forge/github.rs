@@ -1441,13 +1441,17 @@ mod tests {
                 directory.path(),
                 r#"#!/bin/sh
 set -eu
+# The lock is a file the shell creates with O_EXCL (noclobber), not a
+# directory from mkdir: on the ubuntu-26.04 runners (uutils coreutils) the
+# mkdir lock let two processes hold it at once, so one's rmdir found the
+# directory gone, and this test failed or hung there while it passed on 24.04.
 lock_counter() {
-    while ! mkdir "$FAKE_GH_LOCK" 2>/dev/null; do
+    until (set -C; : > "$FAKE_GH_LOCK") 2>/dev/null; do
         :
     done
 }
 unlock_counter() {
-    rmdir "$FAKE_GH_LOCK"
+    rm "$FAKE_GH_LOCK"
 }
 lock_counter
 active=$(cat "$FAKE_GH_CURRENT")
