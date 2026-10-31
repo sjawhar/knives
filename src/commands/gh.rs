@@ -2,7 +2,7 @@
 //!
 //! This command executes `gh` directly, so the usual render/run split does not apply:
 //! there is no knives result to render.
-// allow: SIZE_OK: 2741 lines - single passthrough pipeline; splitting would separate resolution steps that read as one procedure.
+// allow: SIZE_OK: 2788 lines - single passthrough pipeline; splitting would separate resolution steps that read as one procedure.
 use std::collections::BTreeMap;
 use std::io::Read as _;
 use std::os::unix::{
@@ -1453,6 +1453,53 @@ fn graphql_field(text: &str, keyword: &str, field: &str) -> Option<(usize, Graph
         search = &search[at + keyword.len()..];
     }
     None
+}
+
+/// The pure routing functions, for the `gh_routing` fuzz target
+/// (`fuzz/fuzz_targets/gh_routing.rs`), which checks their properties on every
+/// argument list. Built only under `cargo fuzz` (`--cfg fuzzing`): the
+/// functions stay private to every shipped build.
+#[cfg(fuzzing)]
+pub mod fuzzing {
+    pub fn repo_flag(args: &[String]) -> Option<String> {
+        super::repo_flag(args)
+    }
+
+    pub fn owner_from_api_args(args: &[String]) -> Option<String> {
+        super::owner_from_api_args(args)
+    }
+
+    pub fn selector_url_target(args: &[String]) -> Option<String> {
+        super::selector_url_target(args)
+    }
+
+    pub fn url_from_spec(spec: &str) -> Option<String> {
+        super::url_from_spec(spec)
+    }
+
+    pub fn normalize_url(url: &str) -> Option<String> {
+        super::normalize_url(url)
+    }
+
+    pub fn before_terminator(args: &[String]) -> &[String] {
+        super::before_terminator(args)
+    }
+
+    pub fn command_words(args: &[String]) -> Option<(&str, usize, &str)> {
+        super::command_words(args)
+    }
+
+    pub fn positional_after(args: &[String], at: usize) -> Option<&str> {
+        super::positional_after(args, at)
+    }
+
+    pub fn is_owner_shaped(value: &str) -> bool {
+        super::is_owner_shaped(value)
+    }
+
+    pub fn takes_value(flag: &str) -> bool {
+        super::takes_value(flag)
+    }
 }
 
 #[cfg(test)]

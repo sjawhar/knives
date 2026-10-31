@@ -81,6 +81,9 @@ elided_lifetimes_in_paths = "warn"
 non_ascii_idents = "deny"
 trivial_numeric_casts = "warn"
 unused_lifetimes = "warn"
+# `cargo fuzz` builds with `--cfg fuzzing`, which compiles the `gh_routing`
+# fuzz target's entry points (`commands::gh::fuzzing`).
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
 
 [lints.clippy]
 all = { level = "deny", priority = -1 }
