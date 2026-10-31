@@ -183,9 +183,12 @@ fn routing_names_one_owner(args: &[String]) {
 }
 
 /// `gh search` routes by its `--owner` flag: `--owner X` or `--owner=X` right
-/// after `search` names owner X for every login X, whatever follows.
+/// after `search` names owner X for every login X, whatever follows; and so
+/// does `--owner X` after other flags and their values, whatever those values
+/// are (`gh search issues --label --owner --owner acme` filters by `acme`,
+/// with the label `--owner`).
 ///
-/// Guards #115.
+/// Guards #115, and the search scan's reading of flag values.
 fn search_routes_by_its_owner_flag(args: &[String]) {
     let Some((owner, rest)) = args.split_first() else {
         return;
@@ -193,14 +196,33 @@ fn search_routes_by_its_owner_flag(args: &[String]) {
     if !is_owner_shaped(owner) {
         return;
     }
-    for flag in [
-        vec!["--owner".to_owned(), owner.clone()],
-        vec![format!("--owner={owner}")],
-    ] {
-        let call: Vec<String> = std::iter::once("search".to_owned())
+    let leading = |flag: Vec<String>| -> Vec<String> {
+        std::iter::once("search".to_owned())
             .chain(flag)
             .chain(rest.iter().cloned())
-            .collect();
+            .collect()
+    };
+    // Each word of the rest becomes another flag's value, a `--flag=value`
+    // word, or sits beside a boolean flag, before the owner flag.
+    let trailing = ["search".to_owned(), "issues".to_owned()]
+        .into_iter()
+        .chain(
+            rest.iter()
+                .enumerate()
+                .flat_map(|(index, value)| match index % 4 {
+                    0 => vec!["--label".to_owned(), value.clone()],
+                    1 => vec!["-L".to_owned(), value.clone()],
+                    2 => vec![format!("--sort={value}")],
+                    _ => vec!["--web".to_owned()],
+                }),
+        )
+        .chain(["--owner".to_owned(), owner.clone()])
+        .collect();
+    for call in [
+        leading(vec!["--owner".to_owned(), owner.clone()]),
+        leading(vec![format!("--owner={owner}")]),
+        trailing,
+    ] {
         assert_eq!(
             owner_from_api_args(&call),
             Some(Named::Target(owner.clone())),

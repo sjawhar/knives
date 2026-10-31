@@ -2,7 +2,7 @@
 //!
 //! This command executes `gh` directly, so the usual render/run split does not apply:
 //! there is no knives result to render.
-// allow: SIZE_OK: 2987 lines - single passthrough pipeline; splitting would separate resolution steps that read as one procedure.
+// allow: SIZE_OK: 3100 lines - single passthrough pipeline; splitting would separate resolution steps that read as one procedure.
 use std::collections::BTreeMap;
 use std::io::Read as _;
 use std::os::unix::{
@@ -1074,21 +1074,96 @@ fn before_terminator(args: &[String]) -> &[String] {
     args
 }
 
+/// The flags that take a value in the `gh search` subcommands (gh 2.98 `gh
+/// search code|commits|issues|prs|repos --help`). None is boolean in another
+/// search subcommand, so their union reads every one of them.
+const SEARCH_VALUE_FLAGS: &[&str] = &[
+    "--extension",
+    "--filename",
+    "-q",
+    "--jq",
+    "--json",
+    "--language",
+    "-L",
+    "--limit",
+    "--match",
+    "--owner",
+    "-R",
+    "--repo",
+    "--size",
+    "-t",
+    "--template",
+    "--author",
+    "--author-date",
+    "--author-email",
+    "--author-name",
+    "--committer",
+    "--committer-date",
+    "--committer-email",
+    "--committer-name",
+    "--hash",
+    "--order",
+    "--parent",
+    "--sort",
+    "--tree",
+    "--visibility",
+    "--app",
+    "--assignee",
+    "--closed",
+    "--commenter",
+    "--comments",
+    "--created",
+    "--interactions",
+    "--involves",
+    "--label",
+    "--mentions",
+    "--milestone",
+    "--project",
+    "--reactions",
+    "--search-type",
+    "--state",
+    "--team-mentions",
+    "--updated",
+    "-B",
+    "--base",
+    "--checks",
+    "-H",
+    "--head",
+    "--merged-at",
+    "--review",
+    "--review-requested",
+    "--reviewed-by",
+    "--followers",
+    "--forks",
+    "--good-first-issues",
+    "--help-wanted-issues",
+    "--include-forks",
+    "--license",
+    "--number-topics",
+    "--stars",
+    "--topic",
+];
+
 /// The first `--owner` value of a `gh search` call (`--owner x` or `--owner=x`)
-/// when it is owner-shaped. `--repo` is read by `repo_flag`.
+/// when it is owner-shaped. `--repo` is read by `repo_flag`. A word that is
+/// another flag's value is no flag, as gh reads it: `gh search issues --label
+/// --owner acme` searches for `acme` with the label `--owner`, by no owner.
 fn search_owner_flag(args: &[String]) -> Option<String> {
-    let args = before_terminator(args);
-    let mut index = 1;
-    while let Some(argument) = args.get(index) {
+    let mut words = before_terminator(args).iter().skip(1);
+    while let Some(argument) = words.next() {
         let value = if argument == "--owner" {
-            args.get(index + 1).map(String::as_str)
+            words.next().map(String::as_str)
+        } else if let Some(value) = argument.strip_prefix("--owner=") {
+            Some(value)
         } else {
-            argument.strip_prefix("--owner=")
+            if takes_value(argument) || leaves_value_to_next(SEARCH_VALUE_FLAGS, argument) {
+                words.next();
+            }
+            None
         };
         if let Some(value) = value {
             return is_owner_shaped(value).then(|| value.to_owned());
         }
-        index += 1;
     }
     None
 }
@@ -2149,6 +2224,44 @@ mod tests {
             ])),
             target("acme/x")
         );
+    }
+
+    #[test]
+    fn a_search_owner_flag_that_is_another_flags_value_routes_nothing() {
+        let args = |a: &[&str]| a.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        // gh 2.98: `gh search issues --label --owner acme --web` opens
+        // `q=acme+label:--owner`: `--owner` is the label, and no owner filters.
+        assert_eq!(
+            owner_from_api_args(&args(&["search", "issues", "--label", "--owner", "acme"])),
+            None
+        );
+        assert_eq!(
+            owner_from_api_args(&args(&[
+                "search",
+                "prs",
+                "--review-requested",
+                "--owner=rival",
+                "--owner",
+                "acme"
+            ])),
+            target("acme")
+        );
+        // gh 2.98: `gh search issues -L 5 --owner acme --web` filters `user:acme`.
+        for flags in [
+            &["-L", "5"][..],
+            &["-wL", "5"],
+            &["--web"],
+            &["--sort=created"],
+        ] {
+            let mut words = vec!["search", "issues"];
+            words.extend(flags);
+            words.extend(["--owner", "acme"]);
+            assert_eq!(
+                owner_from_api_args(&args(&words)),
+                target("acme"),
+                "{words:?}"
+            );
+        }
     }
 
     #[test]
