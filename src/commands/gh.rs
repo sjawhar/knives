@@ -2,7 +2,7 @@
 //!
 //! This command executes `gh` directly, so the usual render/run split does not apply:
 //! there is no knives result to render.
-// allow: SIZE_OK: 3135 lines - single passthrough pipeline; splitting would separate resolution steps that read as one procedure.
+// allow: SIZE_OK: 3147 lines - single passthrough pipeline; splitting would separate resolution steps that read as one procedure.
 use std::collections::BTreeMap;
 use std::io::Read as _;
 use std::os::unix::{
@@ -851,20 +851,32 @@ pub(crate) fn mint_token(target_url: &str, min_lifetime: u64) -> Mint {
         .map_or(Mint::Unrouted, Mint::Token)
 }
 
-/// What a call's arguments name as its target.
-#[derive(Debug, PartialEq, Eq)]
-pub enum Named {
-    /// The owner, repository spec or URL to route by. Its owner is a GitHub
-    /// login, and the spec routes to that owner.
-    Target(String),
-    /// A target knives does not route: its owner is no GitHub login, or its
-    /// spec routes to another owner than the one gh acts on. `gh api
-    /// repos/a:b/x` and `-R a:b/x` act on owner `a:b`, while `a:b/x` reads as
-    /// an scp-form spec for host `a` and so routes to owner `b`. A token for
-    /// any other owner is the wrong one, so knives mints none, no later source
-    /// stands in for the target, and gh runs on its own auth.
-    Refused,
+/// [`Named`]'s home: a private module, so the type is public only through the
+/// `cfg(fuzzing)` module that the `gh_routing` fuzz target calls.
+mod named {
+    /// What a call's arguments name as its target.
+    #[derive(Debug, PartialEq, Eq)]
+    #[cfg_attr(
+        not(fuzzing),
+        allow(
+            unreachable_pub,
+            reason = "public only through the cfg(fuzzing) module"
+        )
+    )]
+    pub enum Named {
+        /// The owner, repository spec or URL to route by. Its owner is a
+        /// GitHub login, and the spec routes to that owner.
+        Target(String),
+        /// A target knives does not route: its owner is no GitHub login, or
+        /// its spec routes to another owner than the one gh acts on. `gh api
+        /// repos/a:b/x` and `-R a:b/x` act on owner `a:b`, while `a:b/x` reads
+        /// as an scp-form spec for host `a` and so routes to owner `b`. A token
+        /// for any other owner is the wrong one, so knives mints none, no later
+        /// source stands in for the target, and gh runs on its own auth.
+        Refused,
+    }
 }
+use named::Named;
 
 impl Named {
     /// An owner as a target: itself when it is a login.
@@ -1682,7 +1694,7 @@ fn graphql_field(text: &str, keyword: &str, field: &str) -> Option<(usize, Graph
 /// functions stay private to every shipped build.
 #[cfg(fuzzing)]
 pub mod fuzzing {
-    pub use super::Named;
+    pub use super::named::Named;
 
     pub fn repo_flag(args: &[String]) -> Option<Named> {
         super::repo_flag(args)
