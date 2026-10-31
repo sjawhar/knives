@@ -2,7 +2,7 @@
 //!
 //! This command executes `gh` directly, so the usual render/run split does not apply:
 //! there is no knives result to render.
-// allow: SIZE_OK: 3120 lines - single passthrough pipeline; splitting would separate resolution steps that read as one procedure.
+// allow: SIZE_OK: 3135 lines - single passthrough pipeline; splitting would separate resolution steps that read as one procedure.
 use std::collections::BTreeMap;
 use std::io::Read as _;
 use std::os::unix::{
@@ -922,13 +922,21 @@ const GH_URL_PREFIXES: [&str; 7] = [
 
 /// The OWNER of a `-R` or `GH_REPO` value gh reads as a URL: the first path
 /// segment after the host of `scheme://host/OWNER/…`, or after the `:` of
-/// `git@host:OWNER/…`. A URL with no host (`ssh:owner/repo`) names none: gh
-/// refuses it ("no hostname detected").
+/// `git@host:OWNER/…`. A URL with a missing or empty host names no owner, as
+/// gh refuses it ("no hostname detected"): `ssh:owner/repo`,
+/// `https:///owner/repo`, `ssh://git@/owner/repo`, `git@:owner/repo`.
 fn url_owner(spec: &str) -> Option<&str> {
-    let path = match spec.strip_prefix("git@") {
-        Some(rest) => rest.split_once(':')?.1,
-        None => spec.split_once("://")?.1.split_once('/')?.1,
+    let (authority, path) = match spec.strip_prefix("git@") {
+        Some(rest) => rest.split_once(':')?,
+        None => spec.split_once("://")?.1.split_once('/')?,
     };
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    let host = host.split_once(':').map_or(host, |(host, _)| host);
+    if host.is_empty() {
+        return None;
+    }
     path.split('/').next()
 }
 
@@ -2199,13 +2207,19 @@ mod tests {
         let host = concat!("github", ".com");
         // gh reads `-R a:b/x` and `-R <host>:acme/work` as OWNER `a:b` and
         // `<host>:acme`, while url_from_spec reads them as scp form; gh refuses
-        // a URL with no host (`ssh:acme/work`), which url_from_spec reads as
-        // scp form for host `ssh` (the gh_routing fuzz target found it).
+        // a URL with no host (`ssh:acme/work`, `https:///acme/work`,
+        // `ssh://git@/acme/work`: "no hostname detected"), which url_from_spec
+        // reads with an empty host or as scp form for host `ssh` (the
+        // gh_routing fuzz target found the scp case).
         for spec in [
             "a:b/x".to_owned(),
             format!("{host}:acme/work"),
             "ssh:acme/work".to_owned(),
             "https:acme/work".to_owned(),
+            "https:///acme/work".to_owned(),
+            "ssh://git@/acme/work".to_owned(),
+            "git@:acme/work".to_owned(),
+            "https://bot@:443/acme/work".to_owned(),
             "a b/x".to_owned(),
             "acme//".to_owned(),
             String::new(),
@@ -2220,6 +2234,7 @@ mod tests {
             "acme/work".to_owned(),
             format!("{host}/acme/work"),
             format!("https://{host}/acme/work"),
+            format!("https://bot@{host}:443/acme/work"),
             format!("git@{host}:acme/work"),
         ] {
             assert_eq!(
