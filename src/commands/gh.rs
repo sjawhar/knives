@@ -2,7 +2,7 @@
 //!
 //! This command executes `gh` directly, so the usual render/run split does not apply:
 //! there is no knives result to render.
-// allow: SIZE_OK: 3100 lines - single passthrough pipeline; splitting would separate resolution steps that read as one procedure.
+// allow: SIZE_OK: 3120 lines - single passthrough pipeline; splitting would separate resolution steps that read as one procedure.
 use std::collections::BTreeMap;
 use std::io::Read as _;
 use std::os::unix::{
@@ -880,11 +880,15 @@ impl Named {
     /// from it is a login and is the owner it routes to.
     fn repository(spec: String) -> Self {
         let routed = routed_owner(&spec);
-        let gh_reads_routed_owner = GH_URL_PREFIXES
+        let named = if GH_URL_PREFIXES
             .iter()
             .any(|prefix| spec.starts_with(prefix))
-            || full_name_owner(&spec) == routed.as_deref();
-        if gh_reads_routed_owner && routed.as_deref().is_some_and(is_owner_shaped) {
+        {
+            url_owner(&spec)
+        } else {
+            full_name_owner(&spec)
+        };
+        if named.is_some_and(is_owner_shaped) && named == routed.as_deref() {
             Self::Target(spec)
         } else {
             Self::Refused
@@ -915,6 +919,18 @@ const GH_URL_PREFIXES: [&str; 7] = [
     "git+https:",
     "https:",
 ];
+
+/// The OWNER of a `-R` or `GH_REPO` value gh reads as a URL: the first path
+/// segment after the host of `scheme://host/OWNER/…`, or after the `:` of
+/// `git@host:OWNER/…`. A URL with no host (`ssh:owner/repo`) names none: gh
+/// refuses it ("no hostname detected").
+fn url_owner(spec: &str) -> Option<&str> {
+    let path = match spec.strip_prefix("git@") {
+        Some(rest) => rest.split_once(':')?.1,
+        None => spec.split_once("://")?.1.split_once('/')?.1,
+    };
+    path.split('/').next()
+}
 
 /// The OWNER of a `[HOST/]OWNER/REPO` value, as gh reads `-R` and `GH_REPO`
 /// (gh 2.98 `ghrepo.FromFullName`): two or three `/`-separated parts, none
@@ -2182,10 +2198,14 @@ mod tests {
         let args = |a: &[&str]| a.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
         let host = concat!("github", ".com");
         // gh reads `-R a:b/x` and `-R <host>:acme/work` as OWNER `a:b` and
-        // `<host>:acme`, while url_from_spec reads them as scp form.
+        // `<host>:acme`, while url_from_spec reads them as scp form; gh refuses
+        // a URL with no host (`ssh:acme/work`), which url_from_spec reads as
+        // scp form for host `ssh` (the gh_routing fuzz target found it).
         for spec in [
             "a:b/x".to_owned(),
             format!("{host}:acme/work"),
+            "ssh:acme/work".to_owned(),
+            "https:acme/work".to_owned(),
             "a b/x".to_owned(),
             "acme//".to_owned(),
             String::new(),
