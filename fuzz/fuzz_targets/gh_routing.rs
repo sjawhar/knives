@@ -48,8 +48,11 @@ fuzz_target!(|data: &[u8]| {
 /// the arguments that holds no `--` except as the value of a value-taking
 /// flag, cut only at a `--` that gh takes as the terminator.
 ///
-/// Guards #118 (`gh pr comment 5 --body -- -R acme/w` still targets acme/w),
-/// and the cut that #116 and #117 stop their scans at.
+/// Guards #118: its revert fails this property alone. In a full run,
+/// `search_routes_by_its_owner_flag` and
+/// `a_selector_url_routes_to_its_repository` fail first on it, since they
+/// build calls that put a `--` after a value flag. The reverts of #116 and
+/// #117 leave `before_terminator` as it is, so this property does not see them.
 fn terminator_ends_the_flags(args: &[String]) {
     let flags = before_terminator(args);
     assert!(
@@ -77,7 +80,7 @@ fn terminator_ends_the_flags(args: &[String]) {
 /// repository flag nor the owner, except a `gh api` endpoint path, which gh
 /// reads as a positional wherever it sits (`gh api -- repos/acme/x`).
 ///
-/// Guards #116.
+/// Guards #116: its revert fails this property first.
 fn owner_scans_read_flags_only(args: &[String]) {
     let flags = before_terminator(args);
     let Some(through_terminator) = args.get(..=flags.len()) else {
@@ -103,7 +106,7 @@ fn owner_scans_read_flags_only(args: &[String]) {
 /// after `--` (`gh pr view -- 123`). A word after `--` is never a subcommand
 /// with a positional of its own.
 ///
-/// Guards #117.
+/// Guards #117: its revert fails this property first.
 fn subcommand_scans_stop_at_the_terminator(args: &[String]) {
     let flags = before_terminator(args);
     let words = command_words(args);
@@ -140,9 +143,9 @@ fn subcommand_scans_stop_at_the_terminator(args: &[String]) {
 /// `repo_flag` names routes to. That spec is a repository flag's value among
 /// the flags.
 ///
-/// Guards the login rule, and #116's `repo_flag` half (a value after the
-/// terminator is no flag's value). `None` names no owner, so this property
-/// cannot see a revert that stops a function from naming one (#115, #127).
+/// Guards the login rule, and #116's `repo_flag` half: that half's revert
+/// fails this property alone. It cannot see a revert that makes a function
+/// name nothing (#115, #127): `None` names no owner.
 fn routing_names_one_owner(args: &[String]) {
     if let Some(Named::Target(owner)) = owner_from_api_args(args) {
         assert!(
@@ -188,7 +191,8 @@ fn routing_names_one_owner(args: &[String]) {
 /// are (`gh search issues --label --owner --owner acme` filters by `acme`,
 /// with the label `--owner`).
 ///
-/// Guards #115, and the search scan's reading of flag values.
+/// Guards #115 (its revert fails this property first) and the search scan's
+/// reading of flag values.
 fn search_routes_by_its_owner_flag(args: &[String]) {
     let Some((owner, rest)) = args.split_first() else {
         return;
@@ -237,7 +241,8 @@ fn search_routes_by_its_owner_flag(args: &[String]) {
 /// subcommand, also after a leading `-R <value>`, which gh reads before the
 /// command words. An owner segment that is no login refuses the call.
 ///
-/// Guards #127, and the login rule for selector URLs.
+/// Guards #127 (its revert, and the revert of its command-word reading, fail
+/// this property first), and the login rule for selector URLs.
 fn a_selector_url_routes_to_its_repository(args: &[String]) {
     let is_segment = |word: &str| !word.is_empty() && !word.contains(['/', '?', '#']);
     let [owner, repository, rest @ ..] = args else {
@@ -274,7 +279,9 @@ fn a_selector_url_routes_to_its_repository(args: &[String]) {
 /// it, routes to `https://host/path` with a `.git` suffix, both as a
 /// repository spec (`gh repo clone host:owner/repo`) and as a remote URL.
 ///
-/// Guards #126.
+/// Guards #126's scp reading: its revert fails this property first. #126's
+/// repository positional (`repo_subcommand_target`) is outside the functions
+/// this target calls.
 fn an_scp_spec_routes_to_its_host(args: &[String]) {
     let [host, path, rest @ ..] = args else {
         return;
@@ -318,8 +325,10 @@ fn an_scp_spec_routes_to_its_host(args: &[String]) {
 /// form with no path, which names no repository) becomes `host:.git`, which
 /// then reads as scp form.
 ///
-/// Guards #126: an scp reading that fires on its own output (one that missed
-/// a `://`) breaks the fixed point.
+/// Guards the canonical form itself, against a mutation of the scp reading:
+/// with `scp_url`'s `://` check removed, this property fails alone. It does
+/// not catch #126's revert (alone it finds nothing in 1,000,000 runs of it);
+/// `an_scp_spec_routes_to_its_host` does.
 fn normalized_urls_are_fixed_points(args: &[String]) {
     for word in args {
         let bare_scp_host = word.find(':').is_some_and(|colon| colon + 1 == word.len());
