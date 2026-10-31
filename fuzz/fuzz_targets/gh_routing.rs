@@ -12,11 +12,13 @@
 //! the `--` terminator; #117 stops PR subcommand scans at the `--` terminator;
 //! #118 reads `--` after a value flag as its value, not a terminator; #126
 //! routes `gh repo` subcommands by their repository positional, scp-form specs
-//! included; #127 routes by a PR or issue selector URL.
+//! included; #127 routes by a PR or issue selector URL. "The login rule" is
+//! the fix that refuses a target whose owner is no GitHub login (`gh api
+//! repos/a:b/x` routed to owner `b`).
 #![no_main]
 
 use knives::commands::gh::fuzzing::{
-    before_terminator, command_words, is_owner_shaped, normalize_url, owner_from_api_args,
+    Named, before_terminator, command_words, is_owner_shaped, normalize_url, owner_from_api_args,
     positional_after, repo_flag, selector_url_target, takes_value, url_from_spec,
 };
 use libfuzzer_sys::fuzz_target;
@@ -39,6 +41,7 @@ fuzz_target!(|data: &[u8]| {
     a_selector_url_routes_to_its_repository(&args);
     an_scp_spec_routes_to_its_host(&args);
     normalized_urls_are_fixed_points(&args);
+    a_target_naming_no_login_routes_nothing(&args);
 });
 
 /// `before_terminator` keeps exactly the words gh parses as flags: a prefix of
@@ -131,36 +134,33 @@ fn subcommand_scans_stop_at_the_terminator(args: &[String]) {
     }
 }
 
-/// Each routing function names at most one owner. `owner_from_api_args`
-/// names one path segment, login-shaped whenever it comes from a search's
-/// `--owner` or a GraphQL query (a REST endpoint's path segment is passed on as
-/// gh will send it); `selector_url_target` names one `<owner>/<repo>`;
-/// `repo_flag` names the value of a repository flag among the flags.
+/// Each routing function names at most one owner, and that owner is a GitHub
+/// login: the owner `owner_from_api_args` names, the `<owner>` of the one
+/// `<owner>/<repo>` `selector_url_target` names, and the owner that the spec
+/// `repo_flag` names routes to. That spec is a repository flag's value among
+/// the flags.
 ///
-/// Guards #115 (a search names a login), #116 (the repository flag is a flag)
-/// and #127 (a selector URL names one repository).
+/// Guards the login rule, and #116's `repo_flag` half (a value after the
+/// terminator is no flag's value). `None` names no owner, so this property
+/// cannot see a revert that stops a function from naming one (#115, #127).
 fn routing_names_one_owner(args: &[String]) {
-    if let Some(owner) = owner_from_api_args(args) {
+    if let Some(Named::Target(owner)) = owner_from_api_args(args) {
         assert!(
-            !owner.is_empty() && !owner.contains(['/', '?', '{']),
-            "owner {owner:?} is not one path segment: {args:?}"
-        );
-        assert!(
-            is_api_with_endpoint(args) || is_owner_shaped(&owner),
+            is_owner_shaped(&owner),
             "owner {owner:?} is not a login: {args:?}"
         );
     }
-    if let Some(target) = selector_url_target(args) {
+    if let Some(Named::Target(target)) = selector_url_target(args) {
         let one_repository = !target.contains(['?', '#'])
             && target.split_once('/').is_some_and(|(owner, repository)| {
-                !owner.is_empty() && !repository.is_empty() && !repository.contains('/')
+                is_owner_shaped(owner) && !repository.is_empty() && !repository.contains('/')
             });
         assert!(
             one_repository,
-            "selector target {target:?} is not one <owner>/<repo>: {args:?}"
+            "selector target {target:?} is not one <login>/<repo>: {args:?}"
         );
     }
-    if let Some(spec) = repo_flag(args) {
+    if let Some(Named::Target(spec)) = repo_flag(args) {
         let flags = before_terminator(args);
         let flagged = flags.iter().enumerate().any(|(index, word)| {
             if word == "-R" || word == "--repo" {
@@ -174,6 +174,10 @@ fn routing_names_one_owner(args: &[String]) {
         assert!(
             flagged,
             "repository {spec:?} is no repository flag's value: {args:?}"
+        );
+        assert!(
+            routed_owner(&spec).as_deref().is_some_and(is_owner_shaped),
+            "repository {spec:?} routes to no login: {args:?}"
         );
     }
 }
@@ -198,8 +202,8 @@ fn search_routes_by_its_owner_flag(args: &[String]) {
             .chain(rest.iter().cloned())
             .collect();
         assert_eq!(
-            owner_from_api_args(&call).as_deref(),
-            Some(owner.as_str()),
+            owner_from_api_args(&call),
+            Some(Named::Target(owner.clone())),
             "{call:?}"
         );
     }
@@ -207,11 +211,11 @@ fn search_routes_by_its_owner_flag(args: &[String]) {
 
 /// A `gh pr` or `gh issue` selector URL routes the call to the URL's
 /// repository: `gh pr <subcommand> https://<host>/<owner>/<repo>/pull/7`
-/// targets `<owner>/<repo>` for every owner and repository segment and every
+/// targets `<owner>/<repo>` for every login and repository segment and every
 /// subcommand, also after a leading `-R <value>`, which gh reads before the
-/// command words.
+/// command words. An owner segment that is no login refuses the call.
 ///
-/// Guards #127.
+/// Guards #127, and the login rule for selector URLs.
 fn a_selector_url_routes_to_its_repository(args: &[String]) {
     let is_segment = |word: &str| !word.is_empty() && !word.contains(['/', '?', '#']);
     let [owner, repository, rest @ ..] = args else {
@@ -225,7 +229,13 @@ fn a_selector_url_routes_to_its_repository(args: &[String]) {
         .filter(|word| !word.starts_with('-'))
         .map_or("view", String::as_str);
     let flag_value = rest.get(1).map_or("x", String::as_str);
-    let expected = format!("{owner}/{repository}");
+    let expected = || {
+        Some(if is_owner_shaped(owner) {
+            Named::Target(format!("{owner}/{repository}"))
+        } else {
+            Named::Refused
+        })
+    };
     for (group, kind) in [("pr", "pull"), ("issue", "issues"), ("issue", "pull")] {
         let selector = format!("https://{HOST}/{owner}/{repository}/{kind}/7");
         for call in [
@@ -233,11 +243,7 @@ fn a_selector_url_routes_to_its_repository(args: &[String]) {
             vec!["-R", flag_value, group, subcommand, selector.as_str()],
         ] {
             let call: Vec<String> = call.into_iter().map(str::to_owned).collect();
-            assert_eq!(
-                selector_url_target(&call).as_deref(),
-                Some(expected.as_str()),
-                "{call:?}"
-            );
+            assert_eq!(selector_url_target(&call), expected(), "{call:?}");
         }
     }
 }
@@ -302,6 +308,58 @@ fn normalized_urls_are_fixed_points(args: &[String]) {
             assert_eq!(normalize_url(&url).as_ref(), Some(&url), "spec {word:?}");
         }
     }
+}
+
+/// A target whose owner is no GitHub login routes nothing, and is refused, so
+/// no later source (`GH_REPO`, the checkout) stands in for it: `gh api
+/// repos/<o>/<r>` and `-R <o>/<r>` name owner `<o>`, which routes when it is
+/// a login and is refused otherwise.
+///
+/// Guards the login rule.
+fn a_target_naming_no_login_routes_nothing(args: &[String]) {
+    let [owner, repository, ..] = args else {
+        return;
+    };
+    if owner.is_empty()
+        || owner.contains(['/', '?', '{'])
+        || repository.is_empty()
+        || repository.contains('/')
+    {
+        return;
+    }
+    let login = is_owner_shaped(owner);
+    let endpoint = vec!["api".to_owned(), format!("repos/{owner}/{repository}")];
+    let expected = if login {
+        Named::Target(owner.clone())
+    } else {
+        Named::Refused
+    };
+    assert_eq!(
+        owner_from_api_args(&endpoint),
+        Some(expected),
+        "{endpoint:?}"
+    );
+    let spec = format!("{owner}/{repository}");
+    let flag = vec![
+        "pr".to_owned(),
+        "list".to_owned(),
+        "-R".to_owned(),
+        spec.clone(),
+    ];
+    let expected = if login {
+        Named::Target(spec)
+    } else {
+        Named::Refused
+    };
+    assert_eq!(repo_flag(&flag), Some(expected), "{flag:?}");
+}
+
+/// The owner a spec routes to: the first path segment of the URL
+/// `url_from_spec` builds, which the credential request names.
+fn routed_owner(spec: &str) -> Option<String> {
+    let url = url_from_spec(spec)?;
+    let (_, path) = url.strip_prefix("https://")?.split_once('/')?;
+    path.split('/').next().map(str::to_owned)
 }
 
 /// Whether this is a `gh api` call naming a REST endpoint whose path carries
