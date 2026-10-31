@@ -335,7 +335,9 @@ fn normalized_urls_are_fixed_points(args: &[String]) {
 /// A target whose owner is no GitHub login routes nothing, and is refused, so
 /// no later source (`GH_REPO`, the checkout) stands in for it: `gh api
 /// repos/<o>/<r>` and `-R <o>/<r>` name owner `<o>`, which routes when it is
-/// a login and is refused otherwise.
+/// a login and is refused otherwise. A `-R` value that starts like a URL
+/// (`git@`, `https:`, …) is a URL to gh, whose owner sits elsewhere; the
+/// owner property checks those.
 ///
 /// Guards the login rule.
 fn a_target_naming_no_login_routes_nothing(args: &[String]) {
@@ -362,6 +364,12 @@ fn a_target_naming_no_login_routes_nothing(args: &[String]) {
         "{endpoint:?}"
     );
     let spec = format!("{owner}/{repository}");
+    if GH_URL_PREFIXES
+        .iter()
+        .any(|prefix| spec.starts_with(prefix))
+    {
+        return;
+    }
     let flag = vec![
         "pr".to_owned(),
         "list".to_owned(),
@@ -375,6 +383,18 @@ fn a_target_naming_no_login_routes_nothing(args: &[String]) {
     };
     assert_eq!(repo_flag(&flag), Some(expected), "{flag:?}");
 }
+
+/// The prefixes that make gh read a `-R` value as a URL (gh 2.98, measured
+/// with `gh browse -R <value> -n`).
+const GH_URL_PREFIXES: [&str; 7] = [
+    "git@",
+    "ssh:",
+    "git+ssh:",
+    "git:",
+    "http:",
+    "git+https:",
+    "https:",
+];
 
 /// The owner a spec routes to: the first path segment of the URL
 /// `url_from_spec` builds, which the credential request names.
