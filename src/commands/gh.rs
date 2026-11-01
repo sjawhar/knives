@@ -2,7 +2,7 @@
 //!
 //! This command executes `gh` directly, so the usual render/run split does not apply:
 //! there is no knives result to render.
-// allow: SIZE_OK: 2741 lines - single passthrough pipeline; splitting would separate resolution steps that read as one procedure.
+// allow: SIZE_OK: 3147 lines - single passthrough pipeline; splitting would separate resolution steps that read as one procedure.
 use std::collections::BTreeMap;
 use std::io::Read as _;
 use std::os::unix::{
@@ -183,13 +183,24 @@ fn routed_token(args: &[String], cwd: &Path) -> Option<(String, String)> {
             std::process::exit(1);
         }
     };
-    if let (None, Some(remedy)) = (&resolved, no_target_remedy(args)) {
-        eprintln!(
-            "knives gh: no target repository (no -R/--repo flag, no <owner>/<repo> argument, no owner in the api path, and no GitHub remote in {}); {remedy} Setting GH_TOKEN bypasses App routing.",
-            cwd.display()
-        );
-    }
-    let target = resolved?;
+    let target = match resolved {
+        Some(Named::Target(target)) => target,
+        Some(Named::Refused) => {
+            eprintln!(
+                "knives gh: the target's owner is no GitHub login, so no App token routes this call; gh runs on its own auth."
+            );
+            return None;
+        }
+        None => {
+            if let Some(remedy) = no_target_remedy(args) {
+                eprintln!(
+                    "knives gh: no target repository (no -R/--repo flag, no <owner>/<repo> argument, no owner in the api path, and no GitHub remote in {}); {remedy} Setting GH_TOKEN bypasses App routing.",
+                    cwd.display()
+                );
+            }
+            return None;
+        }
+    };
     match mint_token(&target, required_token_lifetime(args)) {
         Mint::Token(token) => Some((token, target)),
         Mint::Refused(code) => std::process::exit(code),
@@ -840,16 +851,141 @@ pub(crate) fn mint_token(target_url: &str, min_lifetime: u64) -> Mint {
         .map_or(Mint::Unrouted, Mint::Token)
 }
 
+/// [`Named`]'s home: a private module, so the type is public only through the
+/// `cfg(fuzzing)` module that the `gh_routing` fuzz target calls.
+mod named {
+    /// What a call's arguments name as its target.
+    #[derive(Debug, PartialEq, Eq)]
+    #[cfg_attr(
+        not(fuzzing),
+        allow(
+            unreachable_pub,
+            reason = "public only through the cfg(fuzzing) module"
+        )
+    )]
+    pub enum Named {
+        /// The owner, repository spec or URL to route by. Its owner is a
+        /// GitHub login, and the spec routes to that owner.
+        Target(String),
+        /// A target knives does not route: its owner is no GitHub login, or
+        /// its spec routes to another owner than the one gh acts on. `gh api
+        /// repos/a:b/x` and `-R a:b/x` act on owner `a:b`, while `a:b/x` reads
+        /// as an scp-form spec for host `a` and so routes to owner `b`. A token
+        /// for any other owner is the wrong one, so knives mints none, no later
+        /// source stands in for the target, and gh runs on its own auth.
+        Refused,
+    }
+}
+use named::Named;
+
+impl Named {
+    /// An owner as a target: itself when it is a login.
+    fn owner(owner: &str) -> Self {
+        if is_owner_shaped(owner) {
+            Self::Target(owner.to_owned())
+        } else {
+            Self::Refused
+        }
+    }
+
+    /// A `-R` or `GH_REPO` value as a target: itself when the owner gh reads
+    /// from it is a login and is the owner it routes to.
+    fn repository(spec: String) -> Self {
+        let routed = routed_owner(&spec);
+        let named = if GH_URL_PREFIXES
+            .iter()
+            .any(|prefix| spec.starts_with(prefix))
+        {
+            url_owner(&spec)
+        } else {
+            full_name_owner(&spec)
+        };
+        if named.is_some_and(is_owner_shaped) && named == routed.as_deref() {
+            Self::Target(spec)
+        } else {
+            Self::Refused
+        }
+    }
+
+    /// A `gh repo` repository positional as a target, read the way
+    /// `url_from_spec` reads it (scp form included): itself when the owner it
+    /// routes to is a login.
+    fn routed(spec: String) -> Self {
+        if routed_owner(&spec).as_deref().is_some_and(is_owner_shaped) {
+            Self::Target(spec)
+        } else {
+            Self::Refused
+        }
+    }
+}
+
+/// The prefixes that make gh read a `-R` or `GH_REPO` value as a URL (gh 2.98
+/// `git.IsURL`, measured with `gh browse -R <value> -n`). `HTTPS://` and
+/// `host:owner/repo` are not among them: gh reads those as `[HOST/]OWNER/REPO`.
+const GH_URL_PREFIXES: [&str; 7] = [
+    "git@",
+    "ssh:",
+    "git+ssh:",
+    "git:",
+    "http:",
+    "git+https:",
+    "https:",
+];
+
+/// The OWNER of a `-R` or `GH_REPO` value gh reads as a URL: the first path
+/// segment after the host of `scheme://host/OWNER/…`, or after the `:` of
+/// `git@host:OWNER/…`. A URL with a missing or empty host names no owner, as
+/// gh refuses it ("no hostname detected"): `ssh:owner/repo`,
+/// `https:///owner/repo`, `ssh://git@/owner/repo`, `git@:owner/repo`.
+fn url_owner(spec: &str) -> Option<&str> {
+    let (authority, path) = match spec.strip_prefix("git@") {
+        Some(rest) => rest.split_once(':')?,
+        None => spec.split_once("://")?.1.split_once('/')?,
+    };
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    let host = host.split_once(':').map_or(host, |(host, _)| host);
+    if host.is_empty() {
+        return None;
+    }
+    path.split('/').next()
+}
+
+/// The OWNER of a `[HOST/]OWNER/REPO` value, as gh reads `-R` and `GH_REPO`
+/// (gh 2.98 `ghrepo.FromFullName`): two or three `/`-separated parts, none
+/// empty. gh refuses any other shape.
+fn full_name_owner(spec: &str) -> Option<&str> {
+    let mut parts = spec.splitn(4, '/');
+    let parts = [parts.next(), parts.next(), parts.next(), parts.next()];
+    if parts.iter().flatten().any(|part| part.is_empty()) {
+        return None;
+    }
+    match parts {
+        [Some(owner), Some(_), None, None] | [Some(_), Some(owner), Some(_), None] => Some(owner),
+        _ => None,
+    }
+}
+
+/// The owner a spec routes to: the first path segment of the URL
+/// `url_from_spec` builds, which the credential request names.
+fn routed_owner(spec: &str) -> Option<String> {
+    let url = url_from_spec(spec)?;
+    let owner = credential_path(&url)?.split('/').next()?;
+    Some(owner.to_owned())
+}
+
 /// The owner a `gh api` or `gh search` invocation targets, or None when it carries no signal.
 ///
 /// These invocations often run outside the target repo's checkout and carry no
 /// -R, so remote-based resolution would route the token to the wrong owner —
 /// that is the failure this exists for (shim lines 80-86). Pure node-id
 /// GraphQL mutations genuinely have no signal; `gh-app-token` honors
-/// `GH_APP_OWNER` for those, which is out of knives' hands.
-pub(crate) fn owner_from_api_args(args: &[String]) -> Option<String> {
+/// `GH_APP_OWNER` for those, which is out of knives' hands. An endpoint path
+/// owner that is no login is [`Named::Refused`].
+pub(crate) fn owner_from_api_args(args: &[String]) -> Option<Named> {
     if args.first().map(String::as_str) == Some("search") {
-        return search_owner_flag(args);
+        return search_owner_flag(args).map(Named::Target);
     }
     if args.first().map(String::as_str) != Some("api") {
         return None;
@@ -864,7 +1000,7 @@ pub(crate) fn owner_from_api_args(args: &[String]) -> Option<String> {
                 let owner = rest.split('/').next().unwrap_or("");
                 let owner = owner.split('?').next().unwrap_or("");
                 if !owner.is_empty() && !owner.contains('{') {
-                    return Some(owner.to_owned());
+                    return Some(Named::owner(owner));
                 }
                 return None;
             }
@@ -885,11 +1021,11 @@ pub(crate) fn owner_from_api_args(args: &[String]) -> Option<String> {
         .filter_map(|(keyword, field)| graphql_field(&joined, keyword, field))
         .min_by_key(|(offset, _)| *offset);
     match candidates {
-        Some((_, GraphqlValue::Literal(owner))) => Some(owner),
+        Some((_, GraphqlValue::Literal(owner))) => Some(Named::Target(owner)),
         // The query names the owner through a variable; its value travels as a
         // separate `-f owner=acme` field argument (how knives' own forge queries
         // and gh's documentation write it).
-        Some((_, GraphqlValue::Variable(name))) => field_argument(args, &name),
+        Some((_, GraphqlValue::Variable(name))) => field_argument(args, &name).map(Named::Target),
         None => None,
     }
 }
@@ -974,21 +1110,96 @@ fn before_terminator(args: &[String]) -> &[String] {
     args
 }
 
+/// The flags that take a value in the `gh search` subcommands (gh 2.98 `gh
+/// search code|commits|issues|prs|repos --help`). None is boolean in another
+/// search subcommand, so their union reads every one of them.
+const SEARCH_VALUE_FLAGS: &[&str] = &[
+    "--extension",
+    "--filename",
+    "-q",
+    "--jq",
+    "--json",
+    "--language",
+    "-L",
+    "--limit",
+    "--match",
+    "--owner",
+    "-R",
+    "--repo",
+    "--size",
+    "-t",
+    "--template",
+    "--author",
+    "--author-date",
+    "--author-email",
+    "--author-name",
+    "--committer",
+    "--committer-date",
+    "--committer-email",
+    "--committer-name",
+    "--hash",
+    "--order",
+    "--parent",
+    "--sort",
+    "--tree",
+    "--visibility",
+    "--app",
+    "--assignee",
+    "--closed",
+    "--commenter",
+    "--comments",
+    "--created",
+    "--interactions",
+    "--involves",
+    "--label",
+    "--mentions",
+    "--milestone",
+    "--project",
+    "--reactions",
+    "--search-type",
+    "--state",
+    "--team-mentions",
+    "--updated",
+    "-B",
+    "--base",
+    "--checks",
+    "-H",
+    "--head",
+    "--merged-at",
+    "--review",
+    "--review-requested",
+    "--reviewed-by",
+    "--followers",
+    "--forks",
+    "--good-first-issues",
+    "--help-wanted-issues",
+    "--include-forks",
+    "--license",
+    "--number-topics",
+    "--stars",
+    "--topic",
+];
+
 /// The first `--owner` value of a `gh search` call (`--owner x` or `--owner=x`)
-/// when it is owner-shaped. `--repo` is read by `repo_flag`.
+/// when it is owner-shaped. `--repo` is read by `repo_flag`. A word that is
+/// another flag's value is no flag, as gh reads it: `gh search issues --label
+/// --owner acme` searches for `acme` with the label `--owner`, by no owner.
 fn search_owner_flag(args: &[String]) -> Option<String> {
-    let args = before_terminator(args);
-    let mut index = 1;
-    while let Some(argument) = args.get(index) {
+    let mut words = before_terminator(args).iter().skip(1);
+    while let Some(argument) = words.next() {
         let value = if argument == "--owner" {
-            args.get(index + 1).map(String::as_str)
+            words.next().map(String::as_str)
+        } else if let Some(value) = argument.strip_prefix("--owner=") {
+            Some(value)
         } else {
-            argument.strip_prefix("--owner=")
+            if takes_value(argument) || leaves_value_to_next(SEARCH_VALUE_FLAGS, argument) {
+                words.next();
+            }
+            None
         };
         if let Some(value) = value {
             return is_owner_shaped(value).then(|| value.to_owned());
         }
-        index += 1;
     }
     None
 }
@@ -1104,8 +1315,9 @@ fn repo_subcommand(args: &[String]) -> Option<RepoSubcommand<'_>> {
 /// acme/widgets`). A bare name is a repository of the caller's own account,
 /// whose owner knives cannot know, so only a spec with an owner counts.
 /// `gh repo fork --org ORG` creates the fork in ORG, so ORG is its target, by
-/// owner alone as a `gh api` path owner is.
-fn repo_subcommand_target(args: &[String], subcommand: &RepoSubcommand<'_>) -> Option<String> {
+/// owner alone as a `gh api` path owner is. A spec whose owner is no login is
+/// [`Named::Refused`].
+fn repo_subcommand_target(args: &[String], subcommand: &RepoSubcommand<'_>) -> Option<Named> {
     let mut positional = None;
     let mut org = None;
     let mut rest = args.iter().skip(subcommand.at + 1);
@@ -1132,9 +1344,11 @@ fn repo_subcommand_target(args: &[String], subcommand: &RepoSubcommand<'_>) -> O
         }
     }
     if let Some(org) = org.filter(|org| is_owner_shaped(org)) {
-        return Some(format!("{org}/gh-api"));
+        return Some(Named::Target(format!("{org}/gh-api")));
     }
-    positional.filter(|spec| spec.contains('/')).cloned()
+    positional
+        .filter(|spec| spec.contains('/'))
+        .map(|spec| Named::routed(spec.clone()))
 }
 
 /// Whether `argument` takes the next argument as its value: one of
@@ -1167,8 +1381,9 @@ fn leaves_value_to_next(value_flags: &[&str], argument: &str) -> bool {
         .is_some_and(|(end, _)| end == letters.len())
 }
 
-/// The value of the first explicit repository flag (shim lines 137-150).
-pub(crate) fn repo_flag(args: &[String]) -> Option<String> {
+/// The value of the first explicit repository flag (shim lines 137-150), as
+/// [`Named::repository`] reads it.
+pub(crate) fn repo_flag(args: &[String]) -> Option<Named> {
     let args = before_terminator(args);
     let mut index = 0;
     while let Some(argument) = args.get(index) {
@@ -1176,14 +1391,14 @@ pub(crate) fn repo_flag(args: &[String]) -> Option<String> {
             "-R" | "--repo" => {
                 // A missing value means this flag is necessarily last, so ending
                 // the scan is equivalent to the shim falling through.
-                return args.get(index + 1).cloned();
+                return args.get(index + 1).cloned().map(Named::repository);
             }
             _ => {
                 if let Some(repo) = argument
                     .strip_prefix("--repo=")
                     .or_else(|| argument.strip_prefix("-R="))
                 {
-                    return Some(repo.to_owned());
+                    return Some(Named::repository(repo.to_owned()));
                 }
             }
         }
@@ -1197,15 +1412,22 @@ pub(crate) fn repo_flag(args: &[String]) -> Option<String> {
 /// the URL's repository whatever `-R`, `GH_REPO` or the checkout say (gh 2.98:
 /// `pr/shared/finder.go` `ParseURL`, `issue/shared/lookup.go`
 /// `tryParseIssueFromURL`). `gh run` and `gh workflow` take numeric ids, never
-/// URLs, so they have no such selector.
-fn selector_url_target(args: &[String]) -> Option<String> {
+/// URLs, so they have no such selector. A URL whose owner is no login is
+/// [`Named::Refused`].
+fn selector_url_target(args: &[String]) -> Option<Named> {
     let (group, at, subcommand) = command_words(args)?;
     let kinds: &[&str] = match (group, subcommand) {
         ("pr", _) | ("agent-task", "view") => &["pull"],
         ("issue", _) => &["issues", "pull"],
         _ => return None,
     };
-    github_selector_repo(positional_after(args, at)?, kinds)
+    let repository = github_selector_repo(positional_after(args, at)?, kinds)?;
+    let owner = repository.split('/').next().unwrap_or_default();
+    Some(if is_owner_shaped(owner) {
+        Named::Target(repository)
+    } else {
+        Named::Refused
+    })
 }
 
 /// The `<owner>/<repo>` of an http(s) URL on the App's host whose path is
@@ -1244,9 +1466,10 @@ fn github_selector_repo(selector: &str, kinds: &[&str]) -> Option<String> {
     .then(|| format!("{owner}/{repo}"))
 }
 
-/// The https URL targeted by this invocation (shim lines 75-179), or `Ok(None)`
-/// when nothing routes (outside any repository, or a repository with no usable
-/// remote).
+/// The https URL targeted by this invocation (shim lines 75-179), as
+/// [`Named::Target`]; [`Named::Refused`] when the arguments name a target whose
+/// owner is no login; or `Ok(None)` when nothing routes (outside any
+/// repository, or a repository with no usable remote).
 ///
 /// Errs when routing needs git and the invocation sits inside a checkout whose
 /// git cannot be read — a broken worktree registration, say. Arguments that
@@ -1259,8 +1482,7 @@ fn github_selector_repo(selector: &str, kinds: &[&str]) -> Option<String> {
 pub(crate) fn resolve_target_url(
     args: &[String],
     cwd: &Path,
-) -> Result<Option<String>, crate::bind::BindError> {
-    let api_owner = owner_from_api_args(args);
+) -> Result<Option<Named>, crate::bind::BindError> {
     let repo_spec = selector_url_target(args)
         .or_else(|| {
             repo_subcommand(args).map_or_else(
@@ -1268,7 +1490,17 @@ pub(crate) fn resolve_target_url(
                 |subcommand| repo_subcommand_target(args, &subcommand),
             )
         })
-        .or_else(gh_repo_environment);
+        .or_else(|| gh_repo_environment().map(Named::repository));
+    // The first target the arguments name decides. One whose owner is no login
+    // routes nothing, and no later source stands in for it.
+    let (api_owner, repo_spec) = match (owner_from_api_args(args), repo_spec) {
+        (Some(Named::Refused), _) | (None, Some(Named::Refused)) => {
+            return Ok(Some(Named::Refused));
+        }
+        (Some(Named::Target(owner)), _) => (Some(owner), None),
+        (None, Some(Named::Target(spec))) => (None, Some(spec)),
+        (None, None) => (None, None),
+    };
     let needs_git_inputs = api_owner.is_none() && repo_spec.is_none();
     let resolved_remote = needs_git_inputs.then(|| gh_resolved_remote(cwd)).flatten();
     let registry = needs_git_inputs
@@ -1309,7 +1541,8 @@ pub(crate) fn resolve_target_url(
         }),
         registered_entry,
         remotes: &remotes,
-    }))
+    })
+    .map(Named::Target))
 }
 
 /// A `gh-resolved` marker owned after parsing git config at the process boundary.
@@ -1455,6 +1688,55 @@ fn graphql_field(text: &str, keyword: &str, field: &str) -> Option<(usize, Graph
     None
 }
 
+/// The pure routing functions, for the `gh_routing` fuzz target
+/// (`fuzz/fuzz_targets/gh_routing.rs`), which checks their properties on every
+/// argument list. Built only under `cargo fuzz` (`--cfg fuzzing`): the
+/// functions stay private to every shipped build.
+#[cfg(fuzzing)]
+pub mod fuzzing {
+    pub use super::named::Named;
+
+    pub fn repo_flag(args: &[String]) -> Option<Named> {
+        super::repo_flag(args)
+    }
+
+    pub fn owner_from_api_args(args: &[String]) -> Option<Named> {
+        super::owner_from_api_args(args)
+    }
+
+    pub fn selector_url_target(args: &[String]) -> Option<Named> {
+        super::selector_url_target(args)
+    }
+
+    pub fn url_from_spec(spec: &str) -> Option<String> {
+        super::url_from_spec(spec)
+    }
+
+    pub fn normalize_url(url: &str) -> Option<String> {
+        super::normalize_url(url)
+    }
+
+    pub fn before_terminator(args: &[String]) -> &[String] {
+        super::before_terminator(args)
+    }
+
+    pub fn command_words(args: &[String]) -> Option<(&str, usize, &str)> {
+        super::command_words(args)
+    }
+
+    pub fn positional_after(args: &[String], at: usize) -> Option<&str> {
+        super::positional_after(args, at)
+    }
+
+    pub fn is_owner_shaped(value: &str) -> bool {
+        super::is_owner_shaped(value)
+    }
+
+    pub fn takes_value(flag: &str) -> bool {
+        super::takes_value(flag)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -1464,6 +1746,15 @@ mod tests {
 
     use super::*;
     use std::collections::BTreeMap;
+
+    /// The routing functions' answer for a target they route by.
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "the routing functions answer an Option, and the assertions compare to one"
+    )]
+    fn target(value: &str) -> Option<Named> {
+        Some(Named::Target(value.to_owned()))
+    }
 
     fn with_env<T>(vars: &[(&'static str, &str)], run: impl FnOnce() -> T) -> T {
         let _lock = crate::config::test_support::environment_lock();
@@ -1865,21 +2156,21 @@ mod tests {
     fn rest_paths_yield_their_owner_segment() {
         let args = |a: &[&str]| a.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
         assert_eq!(
-            owner_from_api_args(&args(&["api", "repos/acme/work/pulls"])).as_deref(),
-            Some("acme")
+            owner_from_api_args(&args(&["api", "repos/acme/work/pulls"])),
+            target("acme")
         );
         assert_eq!(
-            owner_from_api_args(&args(&["api", "/orgs/acme/teams"])).as_deref(),
-            Some("acme")
+            owner_from_api_args(&args(&["api", "/orgs/acme/teams"])),
+            target("acme")
         );
         assert_eq!(
-            owner_from_api_args(&args(&["api", "users/someone"])).as_deref(),
-            Some("someone")
+            owner_from_api_args(&args(&["api", "users/someone"])),
+            target("someone")
         );
         // Query strings on bare segments are stripped (shim line 99).
         assert_eq!(
-            owner_from_api_args(&args(&["api", "orgs/acme?page=2"])).as_deref(),
-            Some("acme")
+            owner_from_api_args(&args(&["api", "orgs/acme?page=2"])),
+            target("acme")
         );
         // Placeholders expand from the current repo: no owner signal (line 101).
         assert_eq!(
@@ -1888,8 +2179,8 @@ mod tests {
         );
         // Flags are skipped while scanning for the path (line 92).
         assert_eq!(
-            owner_from_api_args(&args(&["api", "-X", "POST", "repos/acme/work/issues"])).as_deref(),
-            Some("acme")
+            owner_from_api_args(&args(&["api", "-X", "POST", "repos/acme/work/issues"])),
+            target("acme")
         );
         assert_eq!(owner_from_api_args(&args(&["api", "repos/"])), None);
         assert_eq!(owner_from_api_args(&args(&["api", "orgs/?page=2"])), None);
@@ -1897,6 +2188,127 @@ mod tests {
             owner_from_api_args(&args(&["pr", "list", "repos/acme/work"])),
             None
         );
+    }
+
+    #[test]
+    fn an_endpoint_owner_that_is_no_login_routes_nothing() {
+        // Given: `gh api repos/a:b/x`. gh acts on owner `a:b`, while `a:b/gh-api`
+        // reads as an scp-form spec for host `a`, which routed it to owner `b`.
+        let args = |a: &[&str]| a.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        let call = args(&["api", "repos/a:b/x"]);
+        let scratch = tempfile::tempdir().expect("scratch");
+
+        // When: resolving its target with GH_REPO set, outside any checkout.
+        let resolved = with_env(&[("GH_REPO", "acme/work")], || {
+            resolve_target_url(&call, scratch.path())
+        });
+
+        // Then: the call is refused, and GH_REPO does not stand in for it.
+        assert_eq!(owner_from_api_args(&call), Some(Named::Refused));
+        assert_eq!(resolved, Ok(Some(Named::Refused)));
+        // A login in the same place still routes.
+        assert_eq!(
+            owner_from_api_args(&args(&["api", "repos/a-b/x"])),
+            target("a-b")
+        );
+    }
+
+    #[test]
+    fn a_repository_flag_or_selector_naming_no_login_routes_nothing() {
+        let args = |a: &[&str]| a.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        let host = concat!("github", ".com");
+        // gh reads `-R a:b/x` and `-R <host>:acme/work` as OWNER `a:b` and
+        // `<host>:acme`, while url_from_spec reads them as scp form; gh refuses
+        // a URL with no host (`ssh:acme/work`, `https:///acme/work`,
+        // `ssh://git@/acme/work`: "no hostname detected"), which url_from_spec
+        // reads with an empty host or as scp form for host `ssh` (the
+        // gh_routing fuzz target found the scp case).
+        for spec in [
+            "a:b/x".to_owned(),
+            format!("{host}:acme/work"),
+            "ssh:acme/work".to_owned(),
+            "https:acme/work".to_owned(),
+            "https:///acme/work".to_owned(),
+            "ssh://git@/acme/work".to_owned(),
+            "git@:acme/work".to_owned(),
+            "https://bot@:443/acme/work".to_owned(),
+            "a b/x".to_owned(),
+            "acme//".to_owned(),
+            String::new(),
+        ] {
+            assert_eq!(
+                repo_flag(&args(&["pr", "list", "-R", &spec])),
+                Some(Named::Refused),
+                "{spec}"
+            );
+        }
+        for spec in [
+            "acme/work".to_owned(),
+            format!("{host}/acme/work"),
+            format!("https://{host}/acme/work"),
+            format!("https://bot@{host}:443/acme/work"),
+            format!("git@{host}:acme/work"),
+        ] {
+            assert_eq!(
+                repo_flag(&args(&["pr", "list", "-R", &spec])),
+                target(&spec),
+                "{spec}"
+            );
+        }
+        assert_eq!(
+            selector_url_target(&args(&[
+                "pr",
+                "view",
+                &format!("https://{host}/a:b/x/pull/1")
+            ])),
+            Some(Named::Refused)
+        );
+        assert_eq!(
+            selector_url_target(&args(&[
+                "pr",
+                "view",
+                &format!("https://{host}/acme/x/pull/1")
+            ])),
+            target("acme/x")
+        );
+    }
+
+    #[test]
+    fn a_search_owner_flag_that_is_another_flags_value_routes_nothing() {
+        let args = |a: &[&str]| a.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        // gh 2.98: `gh search issues --label --owner acme --web` opens
+        // `q=acme+label:--owner`: `--owner` is the label, and no owner filters.
+        assert_eq!(
+            owner_from_api_args(&args(&["search", "issues", "--label", "--owner", "acme"])),
+            None
+        );
+        assert_eq!(
+            owner_from_api_args(&args(&[
+                "search",
+                "prs",
+                "--review-requested",
+                "--owner=rival",
+                "--owner",
+                "acme"
+            ])),
+            target("acme")
+        );
+        // gh 2.98: `gh search issues -L 5 --owner acme --web` filters `user:acme`.
+        for flags in [
+            &["-L", "5"][..],
+            &["-wL", "5"],
+            &["--web"],
+            &["--sort=created"],
+        ] {
+            let mut words = vec!["search", "issues"];
+            words.extend(flags);
+            words.extend(["--owner", "acme"]);
+            assert_eq!(
+                owner_from_api_args(&args(&words)),
+                target("acme"),
+                "{words:?}"
+            );
+        }
     }
 
     #[test]
@@ -1922,9 +2334,8 @@ mod tests {
                 "graphql",
                 "-f",
                 r#"query=query { repository(owner: "acme", name: "work") { id } }"#,
-            ]))
-            .as_deref(),
-            Some("acme")
+            ])),
+            target("acme")
         );
         assert_eq!(
             owner_from_api_args(&args(&[
@@ -1932,9 +2343,8 @@ mod tests {
                 "graphql",
                 "-f",
                 "query=query { organization(login: 'acme') { id } }",
-            ]))
-            .as_deref(),
-            Some("acme")
+            ])),
+            target("acme")
         );
         // Pure node-id mutations carry no owner signal (line 84).
         assert_eq!(
@@ -1952,9 +2362,8 @@ mod tests {
                 "graphql",
                 "-f",
                 r#"query=query { repository (owner: "x") { id } }"#,
-            ]))
-            .as_deref(),
-            Some("x")
+            ])),
+            target("x")
         );
         assert_eq!(
             owner_from_api_args(&args(&[
@@ -1978,9 +2387,8 @@ mod tests {
                 "graphql",
                 "-f",
                 r#"query=query { organization(login: "first") { id } repository(owner: "second", name: "x") { id } }"#,
-            ]))
-            .as_deref(),
-            Some("first")
+            ])),
+            target("first")
         );
     }
 
@@ -1996,9 +2404,8 @@ mod tests {
                 "graphql",
                 "-f",
                 r#"query=query { repository(name: "x", owner: "a") { id } organization(login: "b") { id } }"#,
-            ]))
-            .as_deref(),
-            Some("b")
+            ])),
+            target("b")
         );
     }
 
@@ -2008,7 +2415,7 @@ mod tests {
         let query = "query=query($owner:String!){repository(owner:$owner,name:\"x\"){id}}";
         assert_eq!(
             owner_from_api_args(&args(&["api", "graphql", "-f", query, "-f", "owner=acme"])),
-            Some("acme".to_owned())
+            target("acme")
         );
         assert_eq!(
             owner_from_api_args(&args(&[
@@ -2033,7 +2440,7 @@ mod tests {
         );
         assert_eq!(
             owner_from_api_args(&args(&["api", "--", "repos/acme/x"])),
-            Some("acme".to_owned())
+            target("acme")
         );
     }
 
@@ -2070,8 +2477,8 @@ mod tests {
             vec!["api", "graphql", "-f", query, "-f", "owner=acme"],
         ] {
             assert_eq!(
-                owner_from_api_args(&args(&argv)).as_deref(),
-                Some("acme"),
+                owner_from_api_args(&args(&argv)),
+                target("acme"),
                 "argv {argv:?}"
             );
         }
@@ -2113,9 +2520,8 @@ mod tests {
                 "org=first",
                 "-f",
                 r#"query=query($org: String!) { organization(login: $org) { id } repository(owner: "second", name: "x") { id } }"#,
-            ]))
-            .as_deref(),
-            Some("first")
+            ])),
+            target("first")
         );
     }
 
@@ -2129,23 +2535,23 @@ mod tests {
         with_env(&[("GH_REPO", "acme/work")], || {
             assert_eq!(
                 resolve_target_url(&args(&["pr", "list"]), scratch.path()),
-                Ok(Some(format!("https://{host}/acme/work.git")))
+                Ok(target(&format!("https://{host}/acme/work.git")))
             );
             assert_eq!(
                 resolve_target_url(
                     &args(&["api", "repos/{owner}/{repo}/pulls"]),
                     scratch.path()
                 ),
-                Ok(Some(format!("https://{host}/acme/work.git")))
+                Ok(target(&format!("https://{host}/acme/work.git")))
             );
             assert_eq!(
                 resolve_target_url(&args(&["pr", "list", "-R", "other/repo"]), scratch.path()),
-                Ok(Some(format!("https://{host}/other/repo.git")))
+                Ok(target(&format!("https://{host}/other/repo.git")))
             );
             // A path literal is the request's real target and still wins.
             assert_eq!(
                 resolve_target_url(&args(&["api", "repos/literal/repo/pulls"]), scratch.path()),
-                Ok(Some(format!("https://{host}/literal/gh-api.git")))
+                Ok(target(&format!("https://{host}/literal/gh-api.git")))
             );
         });
         with_env(&[("GH_REPO", "")], || {
@@ -2166,8 +2572,8 @@ mod tests {
             vec!["pr", "list", "-R=acme/work"],
         ] {
             assert_eq!(
-                repo_flag(&args(&argv)).as_deref(),
-                Some("acme/work"),
+                repo_flag(&args(&argv)),
+                target("acme/work"),
                 "spelling {argv:?}"
             );
         }
@@ -2352,13 +2758,13 @@ mod tests {
             repo_flag(&args(&[
                 "pr", "comment", "5", "--body", "--", "-R", "acme/w"
             ])),
-            Some("acme/w".to_owned())
+            target("acme/w")
         );
         assert_eq!(
             owner_from_api_args(&args(&[
                 "search", "issues", "--title", "--", "--owner", "acme"
             ])),
-            Some("acme".to_owned())
+            target("acme")
         );
         assert!(has_head_flag(&args(&[
             "pr", "create", "--title", "--", "--head", "x"

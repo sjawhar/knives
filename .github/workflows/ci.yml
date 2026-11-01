@@ -34,6 +34,26 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets --all-features --workspace -- -D warnings
 
+  # The fuzz target (fuzz/fuzz_targets/gh_routing.rs) and the
+  # `commands::gh::fuzzing` module it calls compile only under `--cfg fuzzing`,
+  # which no other job sets, and fuzz/ is not a workspace member. Linting them
+  # here keeps a change to a routing function from breaking the fuzz build
+  # unseen. Stable compiles them; only running the fuzzer needs nightly
+  # (`cargo +nightly fuzz run gh_routing`).
+  fuzz-target:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - run: cargo clippy --manifest-path fuzz/Cargo.toml --locked --bins -- -D warnings
+        env:
+          RUSTFLAGS: --cfg fuzzing
+
   test:
     runs-on: ubuntu-latest
     steps:

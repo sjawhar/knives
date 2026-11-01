@@ -7,7 +7,7 @@
 
 #[path = "common/lab.rs"]
 mod lab;
-// allow: SIZE_OK: 2154 lines - real-binary gh passthrough scenarios share one fixture and process harness.
+// allow: SIZE_OK: 2214 lines - real-binary gh passthrough scenarios share one fixture and process harness.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
@@ -692,6 +692,59 @@ fn a_repository_positional_beats_gh_repo_and_the_checkout_remote() {
         assert!(
             recorded.contains("GH_TOKEN=tok-acme"),
             "{arguments:?}: {recorded}"
+        );
+    }
+}
+
+#[test]
+fn a_target_whose_owner_is_no_login_runs_gh_on_its_own_auth() {
+    // Given: a checkout whose origin is acme's, GH_REPO naming acme too, and a
+    // helper that mints per owner.
+    let lab = lab::Lab::new();
+    let host = concat!("github", ".com");
+    git_config(
+        &lab.work,
+        &["remote.origin.url", &format!("https://{host}/acme/widgets")],
+    );
+    let helper_dir = fake_app_token();
+    let gitconfig = token_config(helper_dir.path(), "fallback");
+    let bare_scp = format!("{host}:acme/widgets");
+    let selector = format!("https://{host}/a:b/x/pull/1");
+    let calls: [&[&str]; 4] = [
+        &["api", "repos/a:b/x"],
+        &["pr", "list", "-R", "a:b/x"],
+        &["pr", "list", "-R", &bare_scp],
+        &["pr", "view", &selector],
+    ];
+    for arguments in calls {
+        let (dir, log) = fake_gh();
+
+        // When: the call names a target gh reads with an owner that is no login
+        // (`a:b`, `<host>:acme`).
+        let output = knives_cmd(helper_dir.path())
+            .args(["gh", "--"])
+            .args(arguments)
+            .current_dir(&lab.work)
+            .env_remove("GH_TOKEN")
+            .env("GH_REPO", "acme/widgets")
+            .env("KNIVES_REAL_GH", dir.path().join("gh"))
+            .env("FAKE_GH_LOG", &log)
+            .env("PATH", helper_path(helper_dir.path()))
+            .env("GIT_CONFIG_GLOBAL", &gitconfig)
+            .output()
+            .expect("run knives gh");
+
+        // Then: gh runs with no token, neither `b`'s nor GH_REPO's nor the
+        // checkout's, and stderr says why.
+        let recorded = fs::read_to_string(&log).expect("fake gh ran");
+        assert!(
+            recorded.contains("GH_TOKEN=unset"),
+            "{arguments:?}: {recorded}"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("no GitHub login"),
+            "{arguments:?}: {stderr}"
         );
     }
 }
