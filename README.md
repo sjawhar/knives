@@ -243,6 +243,18 @@ hosts. `knives audit` reports every line a branch adds over its fork point with 
 that contains one; a branch stated `--fork-only` is exempt. Absent, no scan runs. The `using-knives`
 skill has the matching and load rules.
 
+Values you do not want in a shared registry (internal names for `forbidden`, private consumer
+slugs) go in an optional `repos.local.toml` beside `repos.toml`. It holds only `[repos.<name>]`
+tables, each with `forbidden` and/or `consumers`, for entries `repos.toml` already has; its lists
+are appended to that entry's and checked as one, so a term in both files is a duplicate. Any other
+key or table, or an entry `repos.toml` lacks, is refused with the overlay named:
+
+```toml
+[repos.libcore]
+forbidden = ["acme-corp"]
+consumers = ["an-org/a-consumer"]
+```
+
 `ledger` names, as `<owner>/<name>`, the repository a fork's ledger belongs to: the one that
 carries its entries between machines. A repository name may start with a dot
 (`someone/.knives-ledger`). Without it the fork's ledger stays on each machine that writes it. A

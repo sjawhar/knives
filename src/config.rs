@@ -695,11 +695,16 @@ pub fn default_config_path() -> PathBuf {
     default_config_home().join("repos.toml")
 }
 
-/// Read the registry. A missing file is an empty registry, which the commands
-/// surface explicitly rather than treating as "nothing to do".
+/// Read the registry and its private overlay.
+///
+/// The values of [`LOCAL_OVERLAY`], beside the registry, are added to the
+/// entries it names. A missing registry is an empty registry, which the
+/// commands surface explicitly rather than treating as "nothing to do".
 pub fn load(path: &Path) -> Result<Registry, ConfigError> {
     if !path.exists() {
-        return Ok(Registry::default());
+        let mut registry = Registry::default();
+        apply_local_overlay(&mut registry, path)?;
+        return Ok(registry);
     }
     let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
         path: path.to_owned(),
@@ -760,21 +765,11 @@ pub fn load(path: &Path) -> Result<Registry, ConfigError> {
         }
         checked_release_branch(entry, path)?;
         checked_series(entry, path)?;
-        for consumer in &entry.consumers {
-            if !is_forge_slug(consumer) {
-                return Err(ConfigError::Invalid {
-                    path: path.to_owned(),
-                    detail: format!(
-                        "repos.toml: [repos.{name}] consumers now takes forge slugs \
-                         (\"<owner>/<repo>\"); found \"{consumer}\". Scan a local checkout \
-                         with --consumer <path> instead."
-                    ),
-                });
-            }
-        }
+        checked_consumers(name, &entry.consumers, path)?;
         checked_forbidden(name, &entry.forbidden, path)?;
         entry.ledger = checked_ledger(name, entry, path)?;
     }
+    apply_local_overlay(&mut registry, path)?;
     for slug in &registry.trust.repos {
         if !is_forge_slug(slug) {
             return Err(ConfigError::Invalid {
@@ -789,6 +784,84 @@ pub fn load(path: &Path) -> Result<Registry, ConfigError> {
         *root = expand_registry_path(root, &config_home);
     }
     Ok(registry)
+}
+
+/// The file beside the registry that holds the values a shared registry should
+/// not carry: internal names for `forbidden`, private consumer slugs.
+pub const LOCAL_OVERLAY: &str = "repos.local.toml";
+
+/// [`LOCAL_OVERLAY`]: only `forbidden` and `consumers`, and only for entries
+/// the registry already has.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LocalOverlay {
+    #[serde(default)]
+    repos: BTreeMap<String, LocalEntry>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LocalEntry {
+    #[serde(default)]
+    forbidden: Vec<String>,
+    #[serde(default)]
+    consumers: Vec<String>,
+}
+
+/// Append each [`LOCAL_OVERLAY`] list to its registry entry's, then check the
+/// merged lists as the registry's own are checked, naming the overlay file. An
+/// absent overlay changes nothing.
+fn apply_local_overlay(registry: &mut Registry, path: &Path) -> Result<(), ConfigError> {
+    let local = path.with_file_name(LOCAL_OVERLAY);
+    if !local.exists() {
+        return Ok(());
+    }
+    let text = std::fs::read_to_string(&local).map_err(|source| ConfigError::Read {
+        path: local.clone(),
+        source,
+    })?;
+    let overlay: LocalOverlay = toml::from_str(&text).map_err(|source| ConfigError::Parse {
+        path: local.clone(),
+        source: Box::new(source),
+    })?;
+    for (name, extra) in overlay.repos {
+        let Some(entry) = registry.repos.get_mut(&name) else {
+            return Err(ConfigError::Invalid {
+                detail: format!(
+                    "[repos.{name}] is not an entry of {}; an overlay only adds to an entry \
+                     the registry already has",
+                    path.display()
+                ),
+                path: local,
+            });
+        };
+        entry.forbidden.extend(extra.forbidden);
+        entry.consumers.extend(extra.consumers);
+        checked_consumers(&name, &entry.consumers, &local)?;
+        checked_forbidden(&name, &entry.forbidden, &local)?;
+    }
+    Ok(())
+}
+
+/// `consumers` once took checkout paths; a path now names its replacement.
+fn checked_consumers(name: &str, consumers: &[String], path: &Path) -> Result<(), ConfigError> {
+    let file = path.file_name().map_or_else(
+        || path.display().to_string(),
+        |file| file.to_string_lossy().into_owned(),
+    );
+    for consumer in consumers {
+        if !is_forge_slug(consumer) {
+            return Err(ConfigError::Invalid {
+                path: path.to_owned(),
+                detail: format!(
+                    "{file}: [repos.{name}] consumers now takes forge slugs \
+                     (\"<owner>/<repo>\"); found \"{consumer}\". Scan a local checkout \
+                     with --consumer <path> instead."
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// A `~` in `workspaces` or `[trust] roots` expands through [`home_dir`]. With
@@ -1589,6 +1662,100 @@ release = "https://example.invalid/releases.git"
         let error = load(&write(dir.path(), text)).unwrap_err().to_string();
         assert!(error.contains("forge slugs"), "was: {error}");
         assert!(error.contains("--consumer"), "was: {error}");
+    }
+
+    const OVERLAY_BASE: &str = "[repos.demo]\nupstream = \"u\"\norigin = \"o\"\n\
+                                forbidden = [\"widgets-inc\"]\n\
+                                consumers = [\"an-org/a-consumer\"]\n";
+
+    /// Write `registry` as `repos.toml` and `overlay` as `repos.local.toml`
+    /// beside it, and load the registry.
+    fn load_with_overlay(registry: &str, overlay: &str) -> Result<Registry, ConfigError> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(dir.path(), registry);
+        std::fs::write(dir.path().join(LOCAL_OVERLAY), overlay).unwrap();
+        load(&path)
+    }
+
+    #[test]
+    fn an_absent_local_overlay_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = load(&write(dir.path(), OVERLAY_BASE)).unwrap();
+        assert_eq!(registry.repos["demo"].forbidden, ["widgets-inc"]);
+        assert_eq!(registry.repos["demo"].consumers, ["an-org/a-consumer"]);
+    }
+
+    #[test]
+    fn a_local_overlay_appends_forbidden_terms() {
+        let registry =
+            load_with_overlay(OVERLAY_BASE, "[repos.demo]\nforbidden = [\"acme-corp\"]\n").unwrap();
+        assert_eq!(
+            registry.repos["demo"].forbidden,
+            ["widgets-inc", "acme-corp"]
+        );
+        assert_eq!(registry.repos["demo"].consumers, ["an-org/a-consumer"]);
+    }
+
+    #[test]
+    fn a_local_overlay_appends_consumers() {
+        let registry = load_with_overlay(
+            OVERLAY_BASE,
+            "[repos.demo]\nconsumers = [\"another-org/b-consumer\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            registry.repos["demo"].consumers,
+            ["an-org/a-consumer", "another-org/b-consumer"]
+        );
+        assert_eq!(registry.repos["demo"].forbidden, ["widgets-inc"]);
+    }
+
+    #[test]
+    fn a_local_overlay_naming_no_registry_entry_is_refused_naming_both_files() {
+        let error = load_with_overlay(OVERLAY_BASE, "[repos.other]\nforbidden = [\"acme-corp\"]\n")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(LOCAL_OVERLAY), "was: {error}");
+        assert!(error.contains("repos.toml"), "was: {error}");
+        assert!(error.contains("[repos.other]"), "was: {error}");
+    }
+
+    #[test]
+    fn a_local_overlay_key_or_table_other_than_forbidden_and_consumers_is_refused() {
+        for overlay in [
+            "[repos.demo]\nupstream = \"x\"\n",
+            "[trust]\nowners = [\"an-org\"]\n",
+        ] {
+            let error = load_with_overlay(OVERLAY_BASE, overlay)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(LOCAL_OVERLAY), "was: {error}");
+            assert!(error.contains("unknown field"), "was: {error}");
+        }
+    }
+
+    #[test]
+    fn a_forbidden_term_in_both_files_is_refused_as_a_duplicate() {
+        let error = load_with_overlay(
+            OVERLAY_BASE,
+            "[repos.demo]\nforbidden = [\"Widgets-Inc\"]\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains(LOCAL_OVERLAY), "was: {error}");
+        assert!(error.contains("\"Widgets-Inc\" twice"), "was: {error}");
+    }
+
+    #[test]
+    fn a_local_overlay_consumer_that_is_not_a_slug_is_refused() {
+        let error = load_with_overlay(
+            OVERLAY_BASE,
+            "[repos.demo]\nconsumers = [\"~/one/default\"]\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains(LOCAL_OVERLAY), "was: {error}");
+        assert!(error.contains("forge slugs"), "was: {error}");
     }
 
     #[test]

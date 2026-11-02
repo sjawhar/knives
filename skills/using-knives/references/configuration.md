@@ -73,6 +73,8 @@ roots = ["~/projects/company"]
 
 Every entry refuses unknown fields. Thus an older knives refuses a file that sets `ledger`. Upgrade knives on every machine that reads the file before you add it.
 
+An optional `repos.local.toml` beside `repos.toml` keeps private values out of a shared registry. It holds only `[repos.<name>]` tables with `forbidden` and/or `consumers`, for entries that `repos.toml` has. Its lists are appended to the entry's lists and checked together, so a term in both files is a duplicate. knives refuses any other key or table, and an entry that `repos.toml` lacks, and names the overlay. Absent: no change.
+
 ## How a checkout is found
 
 - An entry binds to a checkout whose `upstream` remote matches it. Case, a trailing slash and `.git` do not matter. Standing in the checkout or a `start` workspace binds it.
