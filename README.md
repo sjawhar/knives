@@ -57,7 +57,8 @@ somebody else's branch, and cross-fork dependencies that have not merged yet.
 
 `knives sync` fetches every remote, discovers tracked pull requests from the forge snapshot,
 then classifies each as new, unchanged, advanced, merged, or closed and reports comment activity
-since the last run.
+since the last run. When another fetch of the same clone wins a ref update, the remote fetch and
+each carried foreign pull-request fetch are retried up to two more times after short jittered waits.
 
 ## What it remembers
 

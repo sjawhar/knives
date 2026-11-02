@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
+use std::time::Duration;
 
 use futures_core::Stream as _;
 use jj_lib::backend::{BackendError, CommitId as JjCommitId};
@@ -1218,6 +1219,9 @@ impl Repo {
 }
 
 /// Fetches every configured remote through jj porcelain because fetch updates git-backed remote state.
+///
+/// Concurrent fetches of one shared clone can lose a ref-update race. Those
+/// failures are retried by [`fetch_command`]; every other failure returns at once.
 pub fn fetch_all(repo: &Path) -> Result<(), JjError> {
     let repo = path(repo);
     // `--ignore-working-copy` is not an optimisation here, it is what makes the
@@ -1226,9 +1230,9 @@ pub fn fetch_all(repo: &Path) -> Result<(), JjError> {
     // since this workspace last looked, which is the normal state of affairs
     // when several agents share a checkout. Fetching updates refs; it has no
     // business touching, or being blocked by, someone else's working copy.
-    command(
+    fetch_command(
         "jj",
-        [
+        &[
             "--repository",
             &repo,
             "--ignore-working-copy",
@@ -1933,6 +1937,54 @@ fn changed_files_for_diff_args(repo: &Path, diff_args: &[&str]) -> Result<Vec<St
 /// Array form, for the common fixed-shape invocation.
 fn command<const N: usize>(program: &str, args: [&str; N]) -> Result<String, JjError> {
     command_args(program, &args)
+}
+
+/// How many times one fetch may run when another writer wins its ref update.
+const FETCH_ATTEMPTS: u8 = 3;
+/// The linear retry step. Each wait adds up to one more step of jitter.
+const FETCH_RETRY_STEP_MILLIS: u64 = 100;
+
+/// Run a fetch, retrying only a ref-update race from another fetch.
+///
+/// A fetch is idempotent: the next attempt updates whatever refs the winning
+/// writer left behind. Every other error returns unchanged on its first attempt.
+fn fetch_command(program: &str, args: &[&str]) -> Result<String, JjError> {
+    for retry in 1..FETCH_ATTEMPTS {
+        match command_args(program, args) {
+            Err(JjError::Command { stderr, .. }) if is_ref_update_race(&stderr) => {
+                std::thread::sleep(fetch_retry_pause(retry));
+            }
+            result => return result,
+        }
+    }
+    command_args(program, args).map_err(|error| match error {
+        JjError::Command {
+            program,
+            status,
+            stderr,
+        } if is_ref_update_race(&stderr) => JjError::Command {
+            program,
+            status,
+            stderr: format!(
+                "{stderr}\nfetch was retried {} times after ref-update races",
+                FETCH_ATTEMPTS - 1
+            ),
+        },
+        error => error,
+    })
+}
+
+fn is_ref_update_race(stderr: &str) -> bool {
+    stderr.contains("Failed to update refs")
+        || stderr.contains("cannot lock ref")
+        || (stderr.contains("Unable to create '") && stderr.contains(".lock': File exists"))
+}
+
+fn fetch_retry_pause(retry: u8) -> Duration {
+    Duration::from_millis(
+        FETCH_RETRY_STEP_MILLIS * u64::from(retry)
+            + crate::lock::random_u64() % FETCH_RETRY_STEP_MILLIS,
+    )
 }
 
 /// Runs a dynamically shaped command and returns both output streams on success.
@@ -3608,14 +3660,16 @@ fn backing_git_dir(repo: &Path) -> Result<PathBuf, JjError> {
 /// the commit remains unresolvable. Fetching into a branch-shaped ref and then
 /// importing does work, and the result is usable as a parent.
 ///
-/// This writes a local bookmark. It never writes to a remote.
+/// This writes a local bookmark. It never writes to a remote. The git fetch
+/// uses [`fetch_command`], so a concurrent sync of the same pull request can
+/// lose a ref-update race without failing the carried-parent fetch.
 pub fn fetch_pull_ref(repo: &Path, remote_url: &str, number: u64) -> Result<CommitId, JjError> {
     let git_dir = backing_git_dir(repo)?;
     let refspec = format!("refs/pull/{number}/head:refs/heads/pull/{number}");
     let git_dir_arg = git_dir.display().to_string();
-    let _ = command(
+    let _ = fetch_command(
         "git",
-        ["--git-dir", &git_dir_arg, "fetch", remote_url, &refspec],
+        &["--git-dir", &git_dir_arg, "fetch", remote_url, &refspec],
     )?;
     let _ = command(
         "jj",
@@ -3779,7 +3833,231 @@ pub fn conflicted_files(repo: &Path, revision: &str) -> Result<Vec<String>, JjEr
 
 #[cfg(test)]
 mod tests {
-    use super::ls_remote_args;
+    #![allow(
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic,
+        reason = "a failed fixture setup or assertion is the test failure"
+    )]
+
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::path::Path;
+
+    use super::{CommitId, JjError, fetch_all, fetch_pull_ref, fetch_retry_pause, ls_remote_args};
+    use crate::config::test_support::{EnvironmentGuard, environment_lock};
+
+    const FAKE_COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    /// Run one fetch through its normal command layer with fake `git` and `jj`
+    /// binaries. Each fetch invocation fails with `stderr`, suffixed with
+    /// ` (attempt N)` so the last error is told from earlier ones, until
+    /// `successful_attempt`; other commands answer just enough for the caller's
+    /// post-fetch work. The environment lock makes PATH replacement safe while
+    /// spawns resolve them.
+    fn fetch_against_fake_programs<T>(
+        stderr: &str,
+        successful_attempt: u8,
+        fetch: impl FnOnce(&Path) -> T,
+    ) -> (T, u8) {
+        let _lock = environment_lock();
+        let directory = tempfile::tempdir().expect("create fake command directory");
+        let bin = directory.path().join("bin");
+        fs::create_dir(&bin).expect("create fake command bin");
+        let counter = directory.path().join("fetch-attempts");
+        let complaint = directory.path().join("fetch-stderr");
+        fs::write(&complaint, stderr).expect("write fake fetch stderr");
+        let script = format!(
+            r#"#!/bin/sh
+case " $* " in
+    *" fetch "*)
+        attempts="$(cat "$KNIVES_FETCH_RETRY_COUNTER" 2>/dev/null || printf 0)"
+        attempts=$((attempts + 1))
+        printf '%s\n' "$attempts" > "$KNIVES_FETCH_RETRY_COUNTER"
+        if [ "$attempts" -lt {successful_attempt} ]; then
+            printf '%s (attempt %s)\n' "$(cat "$KNIVES_FETCH_RETRY_COMPLAINT")" "$attempts" >&2
+            exit 1
+        fi
+        ;;
+    *" log "*)
+        printf '%s\n' '{FAKE_COMMIT}'
+        ;;
+esac
+"#,
+        );
+        for program in ["git", "jj"] {
+            let path = bin.join(program);
+            fs::write(&path, &script).expect("write fake command");
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
+                .expect("make fake command executable");
+        }
+
+        let environment = EnvironmentGuard::capture(&[
+            "PATH",
+            "KNIVES_FETCH_RETRY_COUNTER",
+            "KNIVES_FETCH_RETRY_COMPLAINT",
+        ]);
+        environment.set(
+            "PATH",
+            &format!(
+                "{}:{}",
+                bin.display(),
+                std::env::var("PATH").expect("read PATH")
+            ),
+        );
+        environment.set(
+            "KNIVES_FETCH_RETRY_COUNTER",
+            counter.to_str().expect("counter path is UTF-8"),
+        );
+        environment.set(
+            "KNIVES_FETCH_RETRY_COMPLAINT",
+            complaint.to_str().expect("complaint path is UTF-8"),
+        );
+
+        let result = fetch(directory.path());
+        let attempts = fs::read_to_string(counter)
+            .expect("read fake fetch invocation count")
+            .trim()
+            .parse()
+            .expect("fetch invocation count is an integer");
+        (result, attempts)
+    }
+
+    fn fetch_all_against_fake_jj(
+        stderr: &str,
+        successful_attempt: u8,
+    ) -> (Result<(), JjError>, u8) {
+        fetch_against_fake_programs(stderr, successful_attempt, |_| {
+            fetch_all(Path::new("/not/a/repository"))
+        })
+    }
+
+    fn fetch_pull_ref_against_fake_git(
+        stderr: &str,
+        successful_attempt: u8,
+    ) -> (Result<CommitId, JjError>, u8) {
+        fetch_against_fake_programs(stderr, successful_attempt, |repo| {
+            let store = repo.join(".jj/repo/store");
+            fs::create_dir_all(&store).expect("create fake jj store");
+            fs::write(store.join("git_target"), "../../../.git").expect("write fake git target");
+            fetch_pull_ref(repo, "https://example.invalid/acme/tool.git", 42)
+        })
+    }
+
+    const RACES: [&str; 3] = [
+        "Error: Failed to update refs: refs/remotes/upstream/main",
+        "fatal: cannot lock ref 'refs/remotes/upstream/main': is at abc but expected def",
+        "fatal: Unable to create '/repo/refs/remotes/upstream/main.lock': File exists",
+    ];
+
+    /// An unrelated failure, and a lock-file failure that is not contention.
+    const NON_RACES: [&str; 2] = [
+        "fatal: authentication failed",
+        "fatal: Unable to create '/repo/refs/remotes/upstream/main.lock': Permission denied",
+    ];
+
+    fn command_stderr(error: JjError, program: &str) -> String {
+        match error {
+            JjError::Command {
+                program: failed,
+                status,
+                stderr,
+            } => {
+                assert_eq!(failed, program);
+                assert_eq!(status, "exit status: 1");
+                stderr
+            }
+            other => panic!("expected a command error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fetch_all_retries_each_ref_update_race_spelling() {
+        for stderr in RACES {
+            let (result, attempts) = fetch_all_against_fake_jj(stderr, 3);
+
+            result.expect("retryable ref-update race succeeds on the third attempt");
+            assert_eq!(attempts, 3, "diagnostic was: {stderr}");
+        }
+    }
+
+    #[test]
+    fn fetch_all_returns_nonrace_errors_unchanged_without_retrying() {
+        for stderr in NON_RACES {
+            let (result, attempts) = fetch_all_against_fake_jj(stderr, u8::MAX);
+
+            let error = result.expect_err("non-race fetch failure is returned");
+            assert_eq!(attempts, 1, "diagnostic was: {stderr}");
+            assert_eq!(command_stderr(error, "jj"), format!("{stderr} (attempt 1)"));
+        }
+    }
+
+    #[test]
+    fn fetch_all_returns_the_last_race_error_and_its_retry_count() {
+        let (result, attempts) = fetch_all_against_fake_jj(RACES[0], u8::MAX);
+
+        let error = result.expect_err("persistent ref-update race fails");
+        assert_eq!(attempts, 3);
+        assert_eq!(
+            command_stderr(error, "jj"),
+            format!(
+                "{} (attempt 3)\nfetch was retried 2 times after ref-update races",
+                RACES[0]
+            )
+        );
+    }
+
+    #[test]
+    fn fetch_pull_ref_retries_each_ref_update_race_spelling() {
+        for stderr in RACES {
+            let (result, attempts) = fetch_pull_ref_against_fake_git(stderr, 3);
+
+            assert_eq!(
+                result.expect("pull-ref fetch succeeds on the third attempt"),
+                CommitId::new(FAKE_COMMIT)
+            );
+            assert_eq!(attempts, 3, "diagnostic was: {stderr}");
+        }
+    }
+
+    #[test]
+    fn fetch_pull_ref_returns_nonrace_errors_unchanged_without_retrying() {
+        for stderr in NON_RACES {
+            let (result, attempts) = fetch_pull_ref_against_fake_git(stderr, u8::MAX);
+
+            let error = result.expect_err("non-race fetch failure is returned");
+            assert_eq!(attempts, 1, "diagnostic was: {stderr}");
+            assert_eq!(
+                command_stderr(error, "git"),
+                format!("{stderr} (attempt 1)")
+            );
+        }
+    }
+
+    #[test]
+    fn fetch_pull_ref_returns_the_last_race_error_and_its_retry_count() {
+        let (result, attempts) = fetch_pull_ref_against_fake_git(RACES[1], u8::MAX);
+
+        let error = result.expect_err("persistent ref-update race fails");
+        assert_eq!(attempts, 3);
+        assert_eq!(
+            command_stderr(error, "git"),
+            format!(
+                "{} (attempt 3)\nfetch was retried 2 times after ref-update races",
+                RACES[1]
+            )
+        );
+    }
+
+    #[test]
+    fn fetch_retry_pauses_grow_by_one_step_with_up_to_one_step_of_jitter() {
+        for _ in 0..64 {
+            let first = fetch_retry_pause(1).as_millis();
+            let second = fetch_retry_pause(2).as_millis();
+            assert!((100..200).contains(&first), "first pause was {first} ms");
+            assert!((200..300).contains(&second), "second pause was {second} ms");
+        }
+    }
 
     #[test]
     fn ls_remote_always_terminates_option_parsing_before_the_remote_url() {

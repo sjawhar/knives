@@ -178,7 +178,7 @@ Routing:
 - It repeats until a pass finds nothing new.
 - A failed fetch does not stop the commit and push. An entry that does not parse is a problem that names the file. It is left out of the repeat check. An uncommitted entry of this machine that does not parse is also left out of the commit. Otherwise every machine that took it could not read that fork. The other entries of the fork go.
 - A machine ref only moves forward. The fetch refuses a peer ref that moved backward (rewritten, or removed and pushed again). It is a problem until someone restores it. The refs of other machines still come in.
-- A fetch or push that runs over a minute is stopped. A stalled HTTP transfer fails sooner.
+- A fetch or push that runs over a minute is stopped. A stalled HTTP transfer fails sooner. A ledger fetch that hits a ref lock is not retried, because the transport lock already serialises knives ledger fetches and a retry would hold that lock past the minute promised to a waiting command.
 - `ledger-sweep.log` beside the state file holds the errors, and exists only while the last sweep failed. Run `knives ledger sweep` to see what one carries:
 
 ```text

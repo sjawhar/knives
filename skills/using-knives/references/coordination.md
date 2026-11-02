@@ -4,7 +4,7 @@ Read before `sync`, `preflight`, `start`, `finish`, `track` or `depends`. These 
 
 ## `knives sync [REPO|--all]`
 
-Fetches every remote and tracked PR head. Then it classifies the change of each tracked PR **since the last sync**:
+Fetches every remote and tracked PR head. When another fetch of the same clone wins a ref update, each fetch is retried up to two more times after short jittered waits. Then it classifies the change of each tracked PR **since the last sync**:
 
 | Transition | Meaning |
 |---|---|
@@ -36,7 +36,7 @@ Reports upstream contribution facts: convention files, changes to them since las
 
 Claims the branch and opens a jj workspace.
 
-- An existing branch (local, or on `origin` or the publish remote after fetch) continues from its tip. Workspace `@` is an empty child of the tip. When ready, run `jj bookmark set <branch> -r @`, or squash into the branch.
+- An existing branch (local, or on `origin` or the publish remote after fetch) continues from its tip. A fetch that loses a ref-update race to another fetch of the same clone is retried up to two more times. Workspace `@` is an empty child of the tip. When ready, run `jj bookmark set <branch> -r @`, or squash into the branch.
 - A name only on upstream is the branch of someone else. Our branch of that name is new.
 - A new branch starts on the shared release base, or on fetched upstream trunk when no release exists. It never starts on `@`, because a release merge brings in its other members. Moving the release to newer upstream is `knives release rebase`.
 - A divergent bookmark has no single tip. `start` refuses and names the tips.
