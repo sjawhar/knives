@@ -48,7 +48,8 @@ Claims the branch and opens a jj workspace.
 - `start`, `finish`, `track`, `depends` and `sync` hold the lock of the fork they act on (`fork-locks/<upstream>.lock` beside `state.json`) while they work. Another of these commands on the same fork waits up to one minute for it. Pauses start at 20 ms and double to 2 s, with jitter. A paused `start` can be in a queue. A command on another fork does not wait.
 - The write to `state.json` takes `state.lock` only for that write. It also waits up to one minute.
 - The OS advisory lock on a lock file ends with its process, also on SIGKILL, Ctrl-C or panic. **Never remove a lock file.** A held lock belongs to a running process.
-- If a claim changed while a command ran (an older knives, or a hand edit), the save writes nothing and the command exits `3`. Run it again.
+- If a claim changed while a command ran (an older knives, or a hand edit), the save writes nothing to `state.json` and the command exits `3`. The workspace and the ledger event that the command made before the save stay. Run `knives status` before you run the command again.
+- A knives older than the fork locks takes only `state.lock`. Do not run it at the same time as this one.
 - When the one-minute wait runs out, the command exits `3` and names the holder:
 
 ```text

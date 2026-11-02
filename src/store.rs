@@ -132,8 +132,9 @@ pub enum StoreError {
     )]
     FormerNames { path: PathBuf, held: String },
     #[error(
-        "the claim on {key} changed while this command ran ({now}); nothing was written to {}. \
-         Run the command again to decide from the claim as it is now",
+        "the claim on {key} changed while this command ran ({now}); nothing was written to {}, \
+         but what the command did before (a workspace, a ledger event) stays. Read `knives \
+         status`, then run the command again to decide from the claim as it is now",
         path.display()
     )]
     ClaimMoved {
@@ -682,7 +683,7 @@ impl Store {
 /// lock is `fork-locks/<upstream>.lock` beside the state file: it guards the
 /// fork's records in the state file and its ledger statements, and nothing
 /// else.
-fn lock_forks(path: &Path, repos: &[&UpstreamName]) -> Result<Vec<FileLock>, LockError> {
+pub(crate) fn lock_forks(path: &Path, repos: &[&UpstreamName]) -> Result<Vec<FileLock>, LockError> {
     let ordered: BTreeSet<&UpstreamName> = repos.iter().copied().collect();
     ordered
         .into_iter()

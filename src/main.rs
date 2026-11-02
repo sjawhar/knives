@@ -857,16 +857,23 @@ fn run_sync(
                         };
                         (report, Some(store))
                     }
-                    // Another writer kept this fork past the wait: this row
-                    // could not be synced, and the next one may be.
-                    Err(StoreError::Lock(error @ LockError::Held { .. })) => (
-                        sync::Report {
-                            repo: fork.name.to_string(),
-                            problems: vec![format!("could not sync: {error}")],
-                            ..sync::Report::default()
-                        },
-                        None,
-                    ),
+                    // A fork whose store could not be opened is that fork's
+                    // row when there are others: the forks before it already
+                    // synced and wrote, and their rows are not lost to it.
+                    // Another writer keeping the fork past the wait is such a
+                    // row even alone; the next run may sync it.
+                    Err(error)
+                        if many || matches!(error, StoreError::Lock(LockError::Held { .. })) =>
+                    {
+                        (
+                            sync::Report {
+                                repo: fork.name.to_string(),
+                                problems: vec![format!("could not sync: {error}")],
+                                ..sync::Report::default()
+                            },
+                            None,
+                        )
+                    }
                     Err(error) => return Err(error.into()),
                 }
             }
